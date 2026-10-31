@@ -4886,9 +4886,9 @@ static bool run_prefetch_router(ggml_backend_t gpu, ggml_backend_t cpu) {
 
 // Exercise actual copies, selected publication, retirement, and same-graph reuse.
 static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
-        ggml_tensor * weights, log_capture & capture, bool device_mode, ggml_tensor * gate_weights = nullptr) {
+        ggml_tensor * weights, log_capture & capture, bool device_mode, ggml_tensor * gate_weights = nullptr,
+        ggml_tensor * const * whole_banks = nullptr) {
     configure_cache(nullptr, "8");
-    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
     set_env("GGML_MOE_CACHE_DEVICE", device_mode ? "1" : nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", device_mode ? "1" : nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_FUSED", gate_weights ? "1" : nullptr);
@@ -4903,19 +4903,55 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         return false;
     }
     api.prefetch_configure(session, 1);
-    ggml_moe_cache_tensor_desc descriptors[2] = {};
-    const int banks = gate_weights ? 2 : 1;
+    // Whole-expert warm needs all three banks and at least 64 complete experts.
+    // Expand the tiny source fixture so the 4 MiB plan leaves the last expert cold.
+    ggml_tensor expanded[3];
+    ggml_tensor * described[3];
+    ggml_backend_buffer_t expanded_buffer = nullptr;
+    if (whole_banks) {
+        std::copy(whole_banks, whole_banks + 3, described);
+    } else {
+        const size_t bytes = ggml_row_size(weights->type, weights->ne[0]) * weights->ne[1];
+        const int64_t experts = 512;
+        expanded_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 3 * experts * bytes);
+        if (!expanded_buffer) {
+            api.session_destroy(session);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(expanded_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        auto * data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(expanded_buffer));
+        for (int bank = 0; bank < 3; ++bank) {
+            const auto * source = bank == 1 && gate_weights ? gate_weights : weights;
+            expanded[bank] = *source;
+            expanded[bank].buffer = expanded_buffer;
+            expanded[bank].data = data + bank * experts * bytes;
+            expanded[bank].ne[2] = experts;
+            expanded[bank].nb[2] = bytes;
+            expanded[bank].nb[3] = bytes * experts;
+            for (int64_t e = 0; e < experts; ++e) {
+                memcpy(static_cast<uint8_t *>(expanded[bank].data) + e * bytes,
+                        static_cast<const uint8_t *>(source->data) + (e % source->ne[2]) * source->nb[2], bytes);
+            }
+            described[bank] = &expanded[bank];
+        }
+    }
+    weights = described[0];
+    if (gate_weights) { gate_weights = described[1]; }
+    ggml_moe_cache_tensor_desc descriptors[3] = {};
+    const int banks = 3;
+    const char * names[] = {"blk.1.ffn_up_exps.weight", "blk.1.ffn_gate_exps.weight", "blk.1.ffn_down_exps.weight"};
     for (int i = 0; i < banks; ++i) {
-        auto * w = i ? gate_weights : weights;
-        descriptors[i] = {i ? "blk.1.ffn_gate_exps.weight" : "blk.1.ffn_up_exps.weight", w->data,
+        const auto * w = described[i];
+        descriptors[i] = {names[i], w->data,
             w->nb[2], w->ne[0], w->ne[1], w->ne[2], (int32_t) w->type};
     }
     std::vector<uint64_t> usage(weights->ne[2], 0);
     for (int i = 0; i < 8; ++i) {
         usage[i] = 100;
     }
-    const uint64_t * counts[] = {usage.data(), usage.data()};
-    bool ok = api.warm(session, descriptors, counts, banks) == 8 * banks;
+    const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
+    const auto warmed = api.warm(session, descriptors, counts, banks);
+    bool ok = warmed >= 64 * banks && warmed < weights->ne[2] * banks;
     if (device_mode) {
         ok &= api.device_prepare(session, descriptors, banks) == 1;
     }
@@ -4929,7 +4965,8 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     auto host_buffer = ggml_backend_alloc_ctx_tensors(host, cpu);
     auto card_buffer = ggml_backend_alloc_ctx_tensors(card, gpu);
     std::vector<float> values(weights->ne[0], 0.125f);
-    const int32_t route[] = {63, 63};
+    const int32_t cold = weights->ne[2] - 1;
+    const int32_t route[] = {cold, cold};
     ggml_backend_tensor_set(host_acts, values.data(), 0, values.size() * sizeof(float));
     ggml_backend_tensor_set(card_acts, values.data(), 0, values.size() * sizeof(float));
     ggml_backend_tensor_set(host_ids, route, 0, sizeof(route));
@@ -4962,7 +4999,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         api.prefetch_observe(session, 1, nullptr, 0);
         api.prefetch_observe(session, 0, nullptr, 0);
-        const int32_t ranked[] = {0, 63}; // Resident expert must not be copied.
+        const int32_t ranked[] = {0, cold}; // Resident expert must not be copied.
         api.prefetch(session, descriptors, banks, ranked, 2, 0, 1, 0);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         bool completed = true;
@@ -4973,7 +5010,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
                 // Planning can promote a queued prediction to demand. Finish this
                 // bank before promoting another, which would preempt its copy.
                 bank_completed = direct_plan_one(desc.name, desc.data, desc.expert_size,
-                        desc.n_in, desc.n_out, desc.type, desc.n_expert, 63) == 1;
+                        desc.n_in, desc.n_out, desc.type, desc.n_expert, cold) == 1;
                 if (!bank_completed) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
@@ -5023,6 +5060,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     ggml_backend_buffer_free(host_buffer);
     ggml_free(card);
     ggml_free(host);
+    if (expanded_buffer) { ggml_backend_buffer_free(expanded_buffer); }
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_FUSED", nullptr);
@@ -7776,14 +7814,16 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_tensor * weights, ggml_tensor * gate, test_graph & graph,
         const std::vector<float> & reference, log_capture & capture) {
     const ggml_tensor original = *weights, gate_original = *gate;
-    const size_t bytes = weights->nb[2], stride = 3 * bytes;
-    const size_t arena_size = stride * (size_t)weights->ne[2];
+    const size_t bytes = weights->nb[2], stride = 4 * bytes;
+    const int64_t experts = 512;
+    const size_t arena_size = stride * experts;
     auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), arena_size);
     auto * arena = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer));
     memset(arena, 0xa5, arena_size);
-    for (int64_t e = 0; e < weights->ne[2]; ++e) {
-        memcpy(arena + e * stride, (const char *)weights->data + e * bytes, bytes);
-        memcpy(arena + e * stride + bytes, (const char *)gate->data + e * bytes, bytes);
+    for (int64_t e = 0; e < experts; ++e) {
+        memcpy(arena + e * stride, (const char *)weights->data + (e % weights->ne[2]) * bytes, bytes);
+        memcpy(arena + e * stride + bytes, (const char *)gate->data + (e % gate->ne[2]) * bytes, bytes);
+        memcpy(arena + e * stride + 2 * bytes, arena + e * stride, bytes);
     }
     ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     weights->buffer = gate->buffer = buffer;
@@ -7805,13 +7845,19 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
     const bool registered = pin && unpin && pin(arena, arena_size);
     ok &= registered;
     if (registered) {
+        weights->ne[2] = gate->ne[2] = experts;
+        weights->nb[3] = gate->nb[3] = stride * experts;
+        ggml_tensor down = *weights;
+        down.data = arena + 2 * bytes;
+        ggml_set_name(&down, "blk.1.ffn_down_exps.weight");
+        ggml_tensor * whole_banks[] = {weights, gate, &down};
         ok &= run_device_tables_case(gpu, cpu, weights, capture);
         // The second projection starts inside the same registered allocation.
         ok &= run_device_tables_case(gpu, cpu, gate, capture);
         // Actual padded tensors, pinned by the model owner: all paths must copy and consume.
-        ok &= run_prefetch_staging(gpu, cpu, weights, capture, false);
-        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true);
-        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, gate);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, false, nullptr, whole_banks);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, nullptr, whole_banks);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, gate, whole_banks);
         unsigned int flags = 0;
         // Cache/table teardown must leave the model-owned registration alive.
         ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;
@@ -7819,8 +7865,8 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
         unpin(arena);
     }
 #endif
-    for (int64_t e = 0; e < weights->ne[2]; ++e) {
-        for (size_t i = 2 * bytes; i < stride; ++i) { ok &= arena[e * stride + i] == 0xa5; }
+    for (int64_t e = 0; e < experts; ++e) {
+        for (size_t i = 3 * bytes; i < stride; ++i) { ok &= arena[e * stride + i] == 0xa5; }
     }
     *weights = original;
     *gate = gate_original;
@@ -8430,6 +8476,24 @@ int main(int argc, char ** argv) {
 
     if (argc == 2 && strcmp(argv[1], "--device-tables-only") == 0) {
         const bool ok = provider_is_cuda && run_device_tables(gpu, cpu, weights, capture);
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_quantize_free();
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        ggml_log_set(nullptr, nullptr);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--device-prefetch-only") == 0) {
+        bool ok = provider_is_cuda;
+        if (provider_is_cuda) {
+            ok &= run_arena_stride(gpu, cpu, weights, gate_weights, graph, reference, capture);
+            ok &= run_prefetch_staging(gpu, cpu, weights, capture, false);
+            ok &= run_prefetch_staging(gpu, cpu, weights, capture, true);
+            ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, gate_weights);
+        }
         free_graph(graph);
         ggml_backend_buffer_free(static_buffer);
         ggml_free(static_ctx);
