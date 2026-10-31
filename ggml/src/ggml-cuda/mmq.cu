@@ -165,6 +165,30 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+// fork AIPFIX (LLAMA_MOE_COLD_SKIP): routes whose skip value is >= 0 are computed by another call (the hot bank).
+// They get the out-of-range expert n_experts, so the ids helper gives them no compact row, and a zero output row.
+// Unused compact rows sit past the last expert: skipped token slots point their inverse map at the last row,
+// and the forward map of the unused rows reads source row 0.
+static __global__ void mmq_route_skip(
+        const int32_t * __restrict__ ids, const int si1, const float * __restrict__ skip, int32_t * __restrict__ ids_out,
+        int32_t * __restrict__ ids_src1, float * __restrict__ dst, const int n_expert_used, const int n_experts,
+        const int64_t ne0, const int64_t s1, const int64_t s2, const int src1_fill) {
+    const int i   = blockIdx.x;
+    const int it  = i / n_expert_used;
+    const int iex = i % n_expert_used;
+    const bool skipped = skip[i] >= 0.0f;
+    if (threadIdx.x == 0) {
+        ids_out[i]  = skipped ? n_experts : ids[(int64_t) it*si1 + iex];
+        ids_src1[i] = src1_fill;
+    }
+    if (skipped) {
+        float * row = dst + it*s2 + iex*s1;
+        for (int64_t j = threadIdx.x; j < ne0; j += blockDim.x) {
+            row[j] = 0.0f;
+        }
+    }
+}
+
 static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst, bool convrot, ggml_tensor * paired_dst) {
@@ -332,10 +356,24 @@ static void ggml_cuda_mul_mat_q_impl(
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
-        const int si1  = ids->nb[1] / ggml_element_size(ids);
+        int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
+        const int32_t * ids_d = (const int32_t *) ids->data;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        const ggml_tensor * route_skip = dst->src[3];
+        ggml_cuda_pool_alloc<int32_t> ids_skip(ctx.pool());
+        if (route_skip && !paired_dst && route_skip->type == GGML_TYPE_F32 && ggml_is_contiguous(route_skip) &&
+                route_skip->ne[0] == 1 && ggml_nelements(route_skip) == ne_get_rows) {
+            ids_skip.alloc(ne_get_rows);
+            mmq_route_skip<<<ne_get_rows, 128, 0, stream>>>(ids_d, si1, (const float *) route_skip->data, ids_skip.get(),
+                ids_src1.get(), dst_d, n_expert_used, ne02, ne0, s1, s2, dedup_bcast ? ne_get_rows - 1 : 0);
+            CUDA_CHECK(cudaGetLastError());
+            ids_d = ids_skip.get();
+            si1   = n_expert_used;
+            ctx.fusion_stats.mmq_route_skip++;
+        }
+
+        ggml_cuda_launch_mm_ids_helper(ids_d, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream, &ctx.pool());
         CUDA_CHECK(cudaGetLastError());
     }

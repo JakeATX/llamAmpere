@@ -58,6 +58,8 @@ struct idmap {
     const int * tiles;   // per token tile: active index, first pair of the tile (relative to off)
     int64_t     nb02;    // bytes per expert
     const char * direct_ids = nullptr;
+    const float * direct_map = nullptr; // logical expert -> bank slot
+    int direct_map_size = 0;
     int64_t direct_nb0 = 0, direct_nb1 = 0;
     int direct_n_used = 0, direct_ne11 = 0, direct_n_expert = 0;
     const float * direct_x = nullptr;
@@ -942,15 +944,25 @@ constexpr __host__ __device__ int64_t mmvr_toff(int c) { return (int64_t) c*WARP
 template <int LAY, int WARPS>
 constexpr __host__ __device__ int64_t mmvr_soff(int c) { return (int64_t) c*WARPS*u_bytes<LAY>(); }
 
-template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false>
-static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
+struct mmvr_group {
+    int n;
+    int rows[MMV_ID_BN];
+    int cols[MMV_ID_BN];
+};
+
+template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false, bool SPW = false, bool GROUPED = false>
+static __device__ __forceinline__ void mmvr_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
-        float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm) {
+        float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm,
+        const mmvr_group * group = nullptr, int bx = -1) {
     static_assert(!SINGLE_N || !ID || DIRECT, "single-column dense or direct scope");
     constexpr int KR = lay_rate<LAY>();
     static_assert(SPLITS == 1 || (!ID && WARPS == 4 && (KT == 5120 || KT == 17408)), "small split scope");
     static_assert(!FUSED_X || DIRECT, "fused activation needs direct ids");
-    static_assert(KR == 2 || KR == 3, "mmvr: rates 2 and 3");
+    static_assert(KR == 2 || KR == 3 || KR == 4, "mmvr: rates 2, 3 and 4");
+    static_assert(!SPW || (ID && DIRECT && SPLITS == 1 && !FUSED_X), "slab-per-warp scope");
+    static_assert(!GROUPED || (SPW && !SINGLE_N), "grouped slab-per-warp scope");
+    constexpr int CW = SPW ? 1 : WARPS;
     static_assert(STAGES % 2 == 0, "mmvr: even stages (activation double buffer)");
     static_assert(WARPS >= 2 && (WARPS & (WARPS - 1)) == 0 && WARPS <= 16, "mmvr warps");
     constexpr bool PERM = KR == 2;
@@ -962,7 +974,14 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
     extern __shared__ __align__(16) uint8_t smem[];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
-    const int slab = blockIdx.x;
+    // bx overrides the slab block index (paired launches stack two projections along x).
+    const int bxi = bx >= 0 ? bx : (int) blockIdx.x;
+    const int slab = SPW ? bxi*WARPS + warp : bxi;
+    if constexpr (SPW) {
+        if (slab >= M/16) {
+            return;
+        }
+    }
     const int nk = K/RQ4_CHUNK;
     const int XSN = K >> (7 + XSH);
     const int * prow = nullptr;
@@ -972,17 +991,25 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         static_assert(ID, "mmvr direct ids");
         const int u = blockIdx.y;
         const int tok = blockIdx.z;
-        const int e = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + tok*idm.direct_nb1);
+        const int native = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + tok*idm.direct_nb1);
+        const int e = idm.direct_map ?
+                (native >= 0 && native < idm.direct_map_size ? (int) idm.direct_map[native] : -1) : native;
         if (e < 0 || e >= idm.direct_n_expert) {
-            if (idm.direct_zero && threadIdx.x < 16) {
+            if (idm.direct_zero && (SPW ? lane < 16 : threadIdx.x < 16)) {
                 const int64_t col = (int64_t) tok*idm.direct_n_used + u;
-                Y[col*ldy + slab*16 + threadIdx.x] = 0.0f;
+                Y[col*ldy + slab*16 + (SPW ? lane : (int) threadIdx.x)] = 0.0f;
             }
             return;
         }
         W += (int64_t) e*idm.nb02;
         direct_row = tok*idm.direct_ne11 + (idm.direct_ne11 == 1 ? 0 : u);
-        N = 1;
+        if constexpr (GROUPED) {
+            N = group->n;
+            prow = group->rows;
+            pcol = group->cols;
+        } else {
+            N = 1;
+        }
     } else if constexpr (ID) {
         if ((int) blockIdx.y >= idm.hdr[1]) {
             return;
@@ -995,28 +1022,30 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         pcol = idm.cols + o;
     }
     auto xrow = [&](int c) -> int64_t {
-        if constexpr (DIRECT) { return direct_row; }
+        if constexpr (GROUPED) { return prow[c]; }
+        else if constexpr (DIRECT) { return direct_row; }
         else if constexpr (ID) { return prow[c]; }
         else { return c; }
     };
+    const int kw = SPW ? 0 : warp;
     const uint8_t * ws = W + (int64_t) slab*slab_bytes_l<LAY>(K);
-    // first chunk (kc = warp) of this warp
-    const uint8_t * gt = ws + (int64_t) warp*u_bytes<LAY>() + U_SC;
-    const uint8_t * gs = ws + (int64_t) warp*u_bytes<LAY>();
+    // first chunk of this warp
+    const uint8_t * gt = ws + (int64_t) kw*u_bytes<LAY>() + U_SC;
+    const uint8_t * gs = ws + (int64_t) kw*u_bytes<LAY>();
     uint8_t * ring = smem + warp*STAGES*ST;
 
     const bool has_n = g < N;
-    const int8_t * xr = Xq + (has_n ? xrow(g) : xrow(0))*K + warp*RQ4_CHUNK + (PERM ? 64*(t & 1) + 4*(t >> 1) : t*32);
+    const int8_t * xr = Xq + (has_n ? xrow(g) : xrow(0))*K + kw*RQ4_CHUNK + (PERM ? 64*(t & 1) + 4*(t >> 1) : t*32);
     const float * xf = FUSED_X ? idm.direct_x + (int64_t) direct_row*K + (warp >> XSH)*(128 << XSH) : nullptr;
     const int  ns = lane - 16;
     const bool sok = lane >= 16 && lane < 24 && ns < N;
-    const float * xsr = Xs + (sok ? xrow(ns) : 0)*XSN + (warp >> XSH);
+    const float * xsr = Xs + (sok ? xrow(ns) : 0)*XSN + (kw >> XSH);
     constexpr int XS_STEP = WARPS >> XSH;       // scale index stride per chunk of a warp (WARPS even)
 
     // Split boundaries are whole chunk pairs per warp.
     const int group_begin = SPLITS > 1 ? ((KT/(RQ4_CHUNK*WARPS*2))*(int) blockIdx.z/SPLITS)*2 : 0;
     const int group_end = SPLITS > 1 ? ((KT/(RQ4_CHUNK*WARPS*2))*((int) blockIdx.z + 1)/SPLITS)*2 : 0;
-    const int nmy = SPLITS > 1 ? group_end - group_begin :
+    const int nmy = SPW ? nk : SPLITS > 1 ? group_end - group_begin :
                    KT > 0 && (KT/RQ4_CHUNK) % WARPS == 0 ? KT/(RQ4_CHUNK*WARPS) :
                    KT > 0 ? KT/(RQ4_CHUNK*WARPS) + (warp < (KT/RQ4_CHUNK) % WARPS) :
                             (nk - warp + WARPS - 1)/WARPS;
@@ -1031,7 +1060,7 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
     // load the chunk c chunks past the current base into stage s
     auto load = [&](const uint8_t * bt, const uint8_t * bs, const float * bx, int c, int s) {
         uint8_t * st = ring + s*ST;
-        const uint8_t * tiles = bt + mmvr_toff<LAY, WARPS>(c);
+        const uint8_t * tiles = bt + mmvr_toff<LAY, CW>(c);
         constexpr int CHP = CHB/16;
 #pragma unroll
         for (int r = 0; r < (CHP + 31)/32; ++r) {
@@ -1041,8 +1070,8 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         }
         const bool weight_scale = lane < 8;
         const bool activation_scale = !FUSED_X && lane >= 16 && lane < 24;
-        const void * src = weight_scale ? (const void *) (bs + mmvr_soff<LAY, WARPS>(c) + lane*4)
-                                       : sok ? (const void *) (bx + c*XS_STEP) : (const void *) Xs;
+        const void * src = weight_scale ? (const void *) (bs + mmvr_soff<LAY, CW>(c) + lane*4)
+                                       : sok ? (const void *) (bx + (SPW ? (c >> XSH) : c*XS_STEP)) : (const void *) Xs;
         cp_async4_guard(st + OSC + lane*4, src, weight_scale || sok, weight_scale || activation_scale);
     };
     // activations of chunk c past the base: PERM = 8 words (h0[j] = b0 of IMMA j, h1[j] = b1), else 2 x 16 B
@@ -1052,7 +1081,7 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
             return;
         }
         d = 0.0f;
-        const int8_t * p = bx + (int64_t) c*WARPS*RQ4_CHUNK;
+        const int8_t * p = bx + (int64_t) c*CW*RQ4_CHUNK;
         if constexpr (PERM) {
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -1155,66 +1184,93 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
                 compute(s, (s & 1) ? xb : xa, (s & 1) ? db : da);
             }
         }
-        gt  += mmvr_toff<LAY, WARPS>(STAGES);
-        gs  += mmvr_soff<LAY, WARPS>(STAGES);
-        xsr += STAGES*XS_STEP;
-        xr  += (int64_t) STAGES*WARPS*RQ4_CHUNK;
+        gt  += mmvr_toff<LAY, CW>(STAGES);
+        gs  += mmvr_soff<LAY, CW>(STAGES);
+        xsr += SPW ? (STAGES >> XSH) : STAGES*XS_STEP;
+        xr  += (int64_t) STAGES*CW*RQ4_CHUNK;
         if constexpr (FUSED_X) xf += STAGES*WARPS*RQ4_CHUNK;
     };
     if constexpr (LOOP_UNROLL > 1) {
 #pragma unroll LOOP_UNROLL
-        for (int i0 = 0; i0 < (SPLITS > 1 ? nmy : KT > 0 ? (KT/RQ4_CHUNK + WARPS - 1)/WARPS : nmy); i0 += STAGES) {
+        for (int i0 = 0; i0 < (SPLITS > 1 ? nmy : KT > 0 ? (KT/RQ4_CHUNK + CW - 1)/CW : nmy); i0 += STAGES) {
             step(i0);
         }
     } else {
-        for (int i0 = 0; i0 < (SPLITS > 1 ? nmy : KT > 0 ? (KT/RQ4_CHUNK + WARPS - 1)/WARPS : nmy); i0 += STAGES) {
+        for (int i0 = 0; i0 < (SPLITS > 1 ? nmy : KT > 0 ? (KT/RQ4_CHUNK + CW - 1)/CW : nmy); i0 += STAGES) {
             step(i0);
         }
     }
     cp_async_wait<0>();
 
-    constexpr bool compact = SINGLE_N && DIRECT;
-    __shared__ float red[WARPS - 1][SINGLE_N ? 2 : 4][compact ? 8 : 32];
-    const int red_lane = compact ? g : lane;
-    if (warp > 0 && (!compact || t == 0)) {
-#pragma unroll
-        for (int i = 0; i < (SINGLE_N ? 2 : 4); ++i) {
-            red[warp - 1][i][red_lane] = acc[SINGLE_N ? 2*i : i];
+    if constexpr (SPW) {
+        const int r = slab*16 + g;
+        if constexpr (GROUPED) {
+            // Each MMA column retains the direct SPW K order; only its input/output row changes.
+            const int c = 2*t;
+            if (c < N) {
+                Y[(int64_t) pcol[c]*ldy + r]     = acc[0];
+                Y[(int64_t) pcol[c]*ldy + r + 8] = acc[2];
+            }
+            if (c + 1 < N) {
+                Y[(int64_t) pcol[c + 1]*ldy + r]     = acc[1];
+                Y[(int64_t) pcol[c + 1]*ldy + r + 8] = acc[3];
+            }
+        } else if (t == 0) {
+            const int64_t col = (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
+            Y[col*ldy + r]     = acc[0];
+            Y[col*ldy + r + 8] = acc[2];
         }
-    }
-    __syncthreads();
-    if (warp == 0 && (!compact || t == 0)) {
-#pragma unroll
-        for (int w = 0; w < WARPS - 1; ++w) {
-#pragma unroll
+    } else {
+        constexpr bool compact = SINGLE_N && DIRECT;
+        __shared__ float red[WARPS - 1][SINGLE_N ? 2 : 4][compact ? 8 : 32];
+        const int red_lane = compact ? g : lane;
+        if (warp > 0 && (!compact || t == 0)) {
+    #pragma unroll
             for (int i = 0; i < (SINGLE_N ? 2 : 4); ++i) {
-                acc[SINGLE_N ? 2*i : i] += red[w][i][red_lane];
+                red[warp - 1][i][red_lane] = acc[SINGLE_N ? 2*i : i];
             }
         }
-        const int r = slab*16 + g;
-        const int c = 2*t;
-        auto ycol = [&](int cc) -> int64_t {
-            if constexpr (DIRECT) { return blockIdx.z*idm.direct_n_used + blockIdx.y; }
-            else if constexpr (ID) { return pcol[cc]; }
-            else { return cc; }
-        };
-        if (c < (SINGLE_N ? 1 : N)) {
-            const int64_t y = ycol(c);
-            Y[y*ldy + r]     = acc[0];
-            Y[y*ldy + r + 8] = acc[2];
-        }
-        if constexpr (!SINGLE_N) {
-            if (c + 1 < N) {
-                const int64_t y = ycol(c + 1);
-                Y[y*ldy + r]     = acc[1];
-                Y[y*ldy + r + 8] = acc[3];
+        __syncthreads();
+        if (warp == 0 && (!compact || t == 0)) {
+    #pragma unroll
+            for (int w = 0; w < WARPS - 1; ++w) {
+    #pragma unroll
+                for (int i = 0; i < (SINGLE_N ? 2 : 4); ++i) {
+                    acc[SINGLE_N ? 2*i : i] += red[w][i][red_lane];
+                }
+            }
+            const int r = slab*16 + g;
+            const int c = 2*t;
+            auto ycol = [&](int cc) -> int64_t {
+                if constexpr (DIRECT) { return blockIdx.z*idm.direct_n_used + blockIdx.y; }
+                else if constexpr (ID) { return pcol[cc]; }
+                else { return cc; }
+            };
+            if (c < (SINGLE_N ? 1 : N)) {
+                const int64_t y = ycol(c);
+                Y[y*ldy + r]     = acc[0];
+                Y[y*ldy + r + 8] = acc[2];
+            }
+            if constexpr (!SINGLE_N) {
+                if (c + 1 < N) {
+                    const int64_t y = ycol(c + 1);
+                    Y[y*ldy + r]     = acc[1];
+                    Y[y*ldy + r + 8] = acc[3];
+                }
             }
         }
     }
     (void) M;
 }
 
-template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false>
+template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false, bool SPW = false>
+static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
+        const uint8_t * W, const int8_t * Xq, const float * Xs,
+        float * Y, int64_t ldy, int M, int N, int K, const idmap idm) {
+    mmvr_body<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>(W, Xq, Xs, Y, ldy, M, N, K, idm);
+}
+
+template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false, bool SPW = false>
 static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, float * Y, int64_t ldy,
                         int M, int N, int K, cudaStream_t stream, const idmap & idm = idmap{}, int max_experts = 1) {
     constexpr int smem = WARPS*STAGES*mmv_stage_bytes<true, LAY>();
@@ -1222,27 +1278,27 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
     int dev = 0;
     CUDA_CHECK_AI4K(cudaGetDevice(&dev));
     if (!attr_set[dev & 63]) {
-        CUDA_CHECK_AI4K(cudaFuncSetAttribute(mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        CUDA_CHECK_AI4K(cudaFuncSetAttribute(mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         attr_set[dev & 63] = true;
     }
     // Direct routing has one slot and token per block; separate dimensions avoid device-side integer division.
-    const dim3 grid(M/16, DIRECT ? idm.direct_n_used : ID ? max_experts : 1,
+    const dim3 grid(SPW ? (M/16 + WARPS - 1)/WARPS : M/16, DIRECT ? idm.direct_n_used : ID ? max_experts : 1,
                     DIRECT ? max_experts/idm.direct_n_used : SPLITS);
     static const bool report = getenv("GGML_CUDA_AI23_RESOURCE") && atoi(getenv("GGML_CUDA_AI23_RESOURCE"));
     static bool reported[64] = {};
     if (report && !reported[dev & 63]) {
         cudaFuncAttributes attr;
         int blocks = 0, reserved = 0, sm_shared = 0;
-        CUDA_CHECK_AI4K(cudaFuncGetAttributes(&attr, mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N>));
-        CUDA_CHECK_AI4K(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N>, WARPS*32, smem));
+        CUDA_CHECK_AI4K(cudaFuncGetAttributes(&attr, mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>));
+        CUDA_CHECK_AI4K(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>, WARPS*32, smem));
         CUDA_CHECK_AI4K(cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev));
         CUDA_CHECK_AI4K(cudaDeviceGetAttribute(&sm_shared, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
-        fprintf(stderr, "AI23 MMVR resource LAY=%d XSH=%d ID=%d KT=%d ST=%d WARPS=%d MINB=%d DIRECT=%d FUSED_X=%d SPLITS=%d UNROLL=%d SINGLE_N=%d REG=%d STATIC_SHARED=%zu DYNAMIC_SHARED=%d RESERVED_SHARED=%d SM_SHARED=%d LOCAL=%zu ACTIVE_BLOCKS=%d GRID=%u,%u,%u\n",
-                LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N,
+        fprintf(stderr, "AI23 MMVR resource LAY=%d XSH=%d ID=%d KT=%d ST=%d WARPS=%d MINB=%d DIRECT=%d FUSED_X=%d SPLITS=%d UNROLL=%d SINGLE_N=%d SPW=%d REG=%d STATIC_SHARED=%zu DYNAMIC_SHARED=%d RESERVED_SHARED=%d SM_SHARED=%d LOCAL=%zu ACTIVE_BLOCKS=%d GRID=%u,%u,%u\n",
+                LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW,
                 attr.numRegs, attr.sharedSizeBytes, smem, reserved, sm_shared, attr.localSizeBytes, blocks, grid.x, grid.y, grid.z);
         reported[dev & 63] = true;
     }
-    mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N><<<grid, WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm);
+    mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW><<<grid, WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1250,12 +1306,12 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
 // sign bits), int8-quantize with one fp32 scale per (token, 128 K) at s[tok*(K/128) + block], bytes in the same fragment
 // order as rq4::quantize_act inside a 128 chunk. One half-warp per (token, 128 block); 4 warps = 8 blocks per CTA.
 template <bool SWAP8 = false, bool XPERM = false>
-static __global__ void __launch_bounds__(128) quantize_act128(
-        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N) {
+static __device__ __forceinline__ void quantize_act128_body(
+        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
+        int bx, int tok) {
     const int lane = threadIdx.x & 31;
     const int l    = lane & 15;
-    const int cb   = (blockIdx.x*4 + (threadIdx.x >> 5))*2 + (lane >> 4);
-    const int tok  = blockIdx.y;
+    const int cb   = (bx*4 + (threadIdx.x >> 5))*2 + (lane >> 4);
     const bool live = cb*128 < K && tok < N;   // the whole warp runs the shuffles; dead half-warps only skip I/O
     float v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     if (live) {
@@ -1326,6 +1382,12 @@ static __global__ void __launch_bounds__(128) quantize_act128(
     if (l == 0) {
         s[(int64_t) tok*(K/128) + cb] = d;
     }
+}
+
+template <bool SWAP8 = false, bool XPERM = false>
+static __global__ void __launch_bounds__(128) quantize_act128(
+        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N) {
+    quantize_act128_body<SWAP8, XPERM>(x, sx, q, s, K, N, blockIdx.x, blockIdx.y);
 }
 
 template <bool SWAP8 = false, bool XPERM = false>

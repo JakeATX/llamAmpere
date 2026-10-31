@@ -1970,6 +1970,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+    if (moe_route_skip && !ggml_exl3_bits(w->type) && ggml_nelements(moe_route_skip) == res->ne[1]*res->ne[2]) {
+        res->src[3] = moe_route_skip; // a backend that ignores it computes those routes (their weight is zero)
+    }
 
     // fork: native CPU experts use logical IDs for both compressed weights and side vectors.
     const char * cpu_exl3 = getenv("GGML_CPU_EXL3");
@@ -2649,6 +2652,47 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * slot = ggml_reshape_3d(ctx0,
                 ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.hot_map, 1, n_expert), sel_flat), 1, n_expert_used, n_tokens);
         cb(slot, "ffn_moe_hot_slot", il);
+        static const bool mixed_enabled = [] {
+            const char * value = getenv("LLAMA_MOE_BANK_MIXED");
+            return !value || atoi(value) != 0;
+        }();
+        if (mixed_enabled && !b1_routing && n_tokens <= 8 &&
+                !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) != 0) &&
+                type_op == LLM_FFN_SILU && il >= 0 && hparams.swiglu_clamp_exp[il] <= 1e-6f &&
+                loras->empty() && (!hadamard_rotations || hadamard_rotations->empty()) &&
+                up_exps && gate_exps && down_exps && !gate_up_exps &&
+                !up_exps_b && !gate_exps_b && !down_exps_b &&
+                !up_exps_s && !gate_exps_s && !down_exps_s &&
+                (hot.up->type == GGML_TYPE_AIT2_U || hot.up->type == GGML_TYPE_AIT3_U) &&
+                (hot.gate->type == GGML_TYPE_AIT2_U || hot.gate->type == GGML_TYPE_AIT3_U) &&
+                (hot.down->type == GGML_TYPE_AIT2_U || hot.down->type == GGML_TYPE_AIT3_U ||
+                 (hot.down->type == GGML_TYPE_IQ4_NL && down_exps->type == GGML_TYPE_IQ4_NL))) {
+            ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, nullptr, il);
+            // fork: slot-cache IDs have a different domain from the bank map; retain the old path there.
+            if (!slots) {
+                ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+                ggml_build_forward_expand(gf, x);
+                ggml_tensor * hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, slot, n_expert_used, n_tokens), GGML_TYPE_I32);
+                ggml_tensor * cold_mask = ggml_reshape_3d(ctx0,
+                        ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, hot_ids, GGML_TYPE_F32), -1.0f, -0.5f)),
+                        1, n_expert_used, n_tokens);
+                ggml_build_forward_expand(gf, cold_mask);
+                auto mixed_mm = [&](ggml_tensor * hw, ggml_tensor * cw, ggml_tensor * x) {
+                    ggml_tensor * h = build_lora_mm_id(hw, x, hot_ids);
+                    ggml_tensor * c = build_lora_mm_id(cw, x, selected_experts);
+                    return ggml_add(ctx0, h, ggml_mul(ctx0, c, cold_mask));
+                };
+                ggml_tensor * up = mixed_mm(hot.up, up_exps, x);
+                ggml_tensor * gate = mixed_mm(hot.gate, gate_exps, x);
+                x = ggml_swiglu_split(ctx0, gate, up);
+                ggml_tensor * experts = mixed_mm(hot.down, down_exps, x);
+                ggml_tensor * weighted = ggml_mul(ctx0, experts, weights);
+                ggml_tensor * sum = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, weighted, 1, 0, 2, 3)));
+                ggml_tensor * out = ggml_reshape_2d(ctx0, sum, n_embd, n_tokens);
+                cb(out, "ffn_moe_out", il);
+                return out;
+            }
+        }
         ggml_tensor * mask  = ggml_step(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 0.5f)); // 1 = hot, 0 = cold
         ggml_tensor * w_hot  = ggml_mul(ctx0, weights, mask);
         ggml_tensor * w_cold = ggml_sub(ctx0, weights, w_hot);
@@ -2713,10 +2757,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             w_cold  = weights;
         }
         moe_weights_override = w_cold;
+        // prompt batches: the cold GEMMs leave out the hot routes (zero weight here, computed by the hot call)
+        // instead of running them against the zero-filled bank holes. LLAMA_MOE_COLD_SKIP=0 opts out.
+        static const bool cold_skip = [] {
+            const char * value = getenv("LLAMA_MOE_COLD_SKIP");
+            return !value || atoi(value) != 0;
+        }();
+        if (cold_skip && hot_dbg == 0 && !b1_routing && n_tokens > 8) {
+            moe_route_skip = slot;
+        }
         ggml_tensor * out_cold = build_moe_ffn(cur, gate_inp, nullptr,
                 up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
                 n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
                 logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, cold_ids);
+        moe_route_skip = nullptr;
         GGML_ASSERT(moe_weights_override == nullptr);
         moe_defer_reduce = false;
         if (joint_reduce) {
