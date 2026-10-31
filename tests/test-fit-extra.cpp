@@ -13,6 +13,7 @@
 #include <iterator>
 #include <new>
 #include <string>
+#include <utility>
 
 #ifdef __linux__
 #include <unistd.h>
@@ -230,6 +231,9 @@ static void test_ngram_checkpoint_load_quotas() {
             max_entries, params.load_max_continuations_dynamic) && from_disk && delta.empty() &&
             live.count(hot) && live.at(hot).at(1) == 11,
             "second checkpoint still saves new learning instead of failing LOAD_LIMIT");
+    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
+            max_entries, params.load_max_continuations_dynamic) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == live,
+            "second key-limited checkpoint reloads with the same quotas");
 
     // Unlimited controls reproduce the old oversized output, then the bounded reader refuses it.
     delta = {{common_ngram(&token, 1), {{2, 3}, {3, 3}, {4, 3}}}};
@@ -266,7 +270,98 @@ static void test_ngram_checkpoint_load_quotas() {
     delta = live;
     expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err, &from_disk, 0, 0) &&
             from_disk && live.empty() && delta.empty(), "zero-quota output stays reloadable at the next checkpoint");
+    const std::pair<uint64_t, uint64_t> zero_quotas[] = {{0, UINT64_MAX}, {UINT64_MAX, 0}};
+    for (const auto limits : zero_quotas) {
+        fs::remove(params.lookup_cache_dynamic);
+        live = {{hot, {{1, 1}}}};
+        delta = live;
+        expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err, nullptr,
+                limits.first, limits.second) && live.empty() && delta.empty(), "each zero quota independently clears saved output");
+        expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
+                limits.first, limits.second) == COMMON_NGRAM_CACHE_LOAD_OK && loaded.empty(), "each independent zero-quota output reloads");
+    }
     fs::remove_all(dir);
+}
+
+static void test_ngram_live_successor_budget() {
+    const llama_token a_token = 1;
+    const llama_token b_token = 2;
+    const common_ngram a(&a_token, 1);
+    const common_ngram b(&b_token, 1);
+    const auto successors = [](const common_ngram_cache & cache) {
+        uint64_t result = 0;
+        for (const auto & entry : cache) {
+            result += entry.second.size();
+        }
+        return result;
+    };
+    common_ngram_cache live = {{a, {{2, 10}}}};
+    common_ngram_cache_limits limits(live, 2, 3);
+    common_ngram_cache delta;
+    std::vector<llama_token> tokens = {1, 2, 1, 3, 1, 4, 1, 2};
+    common_ngram_cache unlimited = live;
+    common_ngram_cache_update(unlimited, 1, 1, tokens, tokens.size(), false);
+    common_ngram_cache_update(live, 1, 1, tokens, tokens.size(), false, 0, nullptr, &limits);
+    common_ngram_cache_update(delta, 1, 1, tokens, tokens.size(), false, 0, &live);
+    expect(live.size() == 2 && successors(live) == 3 && limits.continuations_left == 0,
+            "live admission consumes one credit per new successor and enforces the entry cap");
+    expect(live.at(a).at(2) == 12 && live.at(a).at(3) == 1 && live.at(a).count(4) == 0,
+            "exhausted successor budget retains increments for known pairs");
+    expect(unlimited.at(a).count(4) && unlimited.size() > live.size(), "unlimited update reproduces unbounded successor growth");
+    expect(delta.at(a).at(2) == 2 && delta.at(a).at(3) == 1 && delta.at(a).count(4) == 0,
+            "writeback delta rejects successors refused by live admission");
+
+    const common_ngram_cache before = live;
+    std::vector<llama_token> rejected = {8, 9, 10};
+    allocation_probe::largest = 0;
+    allocation_probe::active = true;
+    common_ngram_cache_update(live, 1, 1, rejected, rejected.size(), false, 0, nullptr, &limits);
+    allocation_probe::active = false;
+    expect(live == before && allocation_probe::largest == 0, "rejected live pairs allocate no map nodes");
+    for (const uint64_t cap : {uint64_t(0), uint64_t(1), UINT64_MAX}) {
+        common_ngram_cache warm = before;
+        common_ngram_cache_limits exhausted(warm, 2, cap);
+        expect(exhausted.continuations_left == (cap == UINT64_MAX ? UINT64_MAX : 0),
+                "warm-cache credit saturates without unsigned wrap and preserves unlimited mode");
+    }
+    const std::pair<uint64_t, uint64_t> zero_quotas[] = {{0, UINT64_MAX}, {UINT64_MAX, 0}};
+    for (const auto caps : zero_quotas) {
+        common_ngram_cache empty;
+        common_ngram_cache_limits zero(empty, caps.first, caps.second);
+        common_ngram_cache_update(empty, 1, 1, tokens, tokens.size(), false, 0, nullptr, &zero);
+        expect(empty.empty(), "either zero live quota refuses a cold cache");
+    }
+
+    // An external checkpoint fills the budget before the live delta is collected.
+    common_ngram_cache saved = {{a, {{2, 20}}}, {b, {{1, 30}, {3, 40}}}};
+    delta = {{a, {{2, 2}, {3, 1}}}, {b, {{1, 1}}}};
+    common_ngram_cache_refresh(live, saved, delta, 0, 2, 3);
+    expect(successors(live) == 3 && live.at(a).at(2) == 22 && live.at(b).at(1) == 31 && !live.at(a).count(3),
+            "checkpoint collection caps successors but still merges retained counts");
+    expect(delta.at(a).size() == 1 && delta.at(a).at(2) == 2 && delta.at(b).at(1) == 1,
+            "collection retires only delta successors absent from the new live cache");
+    limits = common_ngram_cache_limits(live, 2, 3);
+    common_ngram_cache_update(live, 1, 1, tokens, tokens.size(), false, 0, nullptr, &limits);
+    expect(successors(live) == 3 && live.at(a).at(2) == 24 && limits.continuations_left == 0,
+            "next request uses refreshed credit and still learns retained pairs");
+
+    common_ngram_cache add = {{a, {{2, 1}, {3, 1}, {4, 1}}}, {b, {{1, 1}}}};
+    common_ngram_cache merged;
+    limits = common_ngram_cache_limits(merged, 1, 2);
+    common_ngram_cache_merge(merged, add, 0, &limits);
+    expect(merged.size() == 1 && successors(merged) <= 2 && limits.continuations_left == 2 - successors(merged),
+            "bounded merge handles both partial new parts and entry limits");
+    common_ngram_cache large_part = {{a, {{2, 1}, {3, 1}, {4, 1}}}};
+    merged.clear();
+    limits = common_ngram_cache_limits(merged, 1, 2);
+    common_ngram_cache_merge(merged, large_part, 0, &limits);
+    expect(merged.size() == 1 && successors(merged) == 2 && limits.continuations_left == 0,
+            "one new part is clipped before inserting excess successor nodes");
+    common_ngram_cache all;
+    common_ngram_cache_limits unlimited_limits;
+    common_ngram_cache_merge(all, add, 0, &unlimited_limits);
+    expect(all == add && unlimited_limits.continuations_left == UINT64_MAX,
+            "default unlimited merge preserves every pair and count");
 }
 
 static void test_ngram_stream_save() {
@@ -772,6 +867,7 @@ static void test_ram_prompt_fit() {
 int main() {
     test_ngram_ram_load_fit();
     test_ngram_checkpoint_load_quotas();
+    test_ngram_live_successor_budget();
     test_ngram_stream_save();
     test_ngram_load_limits();
     test_ngram_live_limit();

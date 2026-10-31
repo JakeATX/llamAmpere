@@ -420,6 +420,7 @@ struct common_params_speculative_ngram_cache {
     int32_t max_ngrams_dynamic    = 1000000; // live dynamic n-gram key limit; saves also prune by utility (0 = unlimited)
     bool max_ngrams_dynamic_explicit = false;
 
+    // Automatic load quotas also bound live dynamic growth.
     uint64_t load_max_entries_static        = UINT64_MAX;
     uint64_t load_max_continuations_static  = UINT64_MAX;
     uint64_t load_max_entries_dynamic       = UINT64_MAX;

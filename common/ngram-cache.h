@@ -61,6 +61,14 @@ typedef std::unordered_map<llama_token, int32_t> common_ngram_cache_part;
 // n-gram -> empirical distribution of following tokens
 typedef std::unordered_map<common_ngram, common_ngram_cache_part, common_ngram_hash_function> common_ngram_cache;
 
+struct common_ngram_cache_limits {
+    uint64_t max_entries = UINT64_MAX;
+    uint64_t continuations_left = UINT64_MAX;
+
+    common_ngram_cache_limits() = default;
+    common_ngram_cache_limits(const common_ngram_cache & cache, uint64_t entries, uint64_t continuations);
+};
+
 
 // Update an ngram cache with tokens.
 // ngram_cache:         the cache to modify.
@@ -69,13 +77,14 @@ typedef std::unordered_map<common_ngram, common_ngram_cache_part, common_ngram_h
 // nnew:                how many new tokens have been appended to inp_data since the last call to this function.
 // print_progress:      whether to print progress to stderr.
 // n_max:               stop adding keys at this size; existing keys still learn, no pruning (0 = unlimited).
-// admitted:            if set, learn only keys already in this cache (used for the live writeback delta).
+// admitted:            if set, learn only (key, token) pairs already in this cache (used for the live writeback delta).
+// limits:              optional entry cap and remaining successor credit; reset after replacing the cache.
 //
 // In order to get correct results inp_data can ONLY BE APPENDED TO.
 // Changes in the middle need a complete rebuild.
 void common_ngram_cache_update(
     common_ngram_cache & ngram_cache, int ngram_min, int ngram_max, std::vector<llama_token> & inp_data, int nnew, bool print_progress, size_t n_max = 0,
-    const common_ngram_cache * admitted = nullptr);
+    const common_ngram_cache * admitted = nullptr, common_ngram_cache_limits * limits = nullptr);
 
 // Try to draft tokens from ngram caches.
 // inp:                the tokens generated so far.
@@ -190,7 +199,9 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename);
 // ngram_cache_target: the ngram cache to which to add the information from ngram_cache_add.
 // ngram_cache_add:    the ngram cache to add to ngram_cache_target.
 // n_max:              stop adding keys at this size; existing keys still merge, no pruning (0 = unlimited).
-void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add, size_t n_max = 0);
+void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add, size_t n_max = 0,
+    common_ngram_cache_limits * limits = nullptr);
 
-// Collect a saved cache and live delta; drop delta keys that the bounded result did not retain.
-void common_ngram_cache_refresh(common_ngram_cache & live, common_ngram_cache & saved, common_ngram_cache & delta, size_t n_max);
+// Collect a saved cache and live delta; drop delta pairs that the bounded result did not retain.
+void common_ngram_cache_refresh(common_ngram_cache & live, common_ngram_cache & saved, common_ngram_cache & delta, size_t n_max,
+    uint64_t max_entries = UINT64_MAX, uint64_t max_continuations = UINT64_MAX);

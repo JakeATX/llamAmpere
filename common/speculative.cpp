@@ -3573,6 +3573,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     // shared across all sequences
     common_ngram_cache ngram_cache_dynamic;
     common_ngram_cache ngram_cache_static;
+    common_ngram_cache_limits limits_dynamic;
 
     // writeback of the dynamic cache, see sync() and checkpoint_poll()
     bool               save_dynamic = false; // params.save_dynamic and a path to write to
@@ -3715,6 +3716,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             }
         }
 
+        limits_dynamic = common_ngram_cache_limits(ngram_cache_dynamic,
+                this->params.load_max_entries_dynamic, this->params.load_max_continuations_dynamic);
         t_last_sync_ms = ggml_time_ms();
     }
 
@@ -3856,14 +3859,17 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             file_present = true;
 
             try {
-                // Keep new counts only for keys retained by the bounded saved cache.
-                common_ngram_cache_refresh(ngram_cache_dynamic, ckpt_cache, ngram_cache_delta, n_max_dynamic);
+                // Keep new counts only for pairs retained by the bounded saved cache.
+                common_ngram_cache_refresh(ngram_cache_dynamic, ckpt_cache, ngram_cache_delta, n_max_dynamic,
+                        params.load_max_entries_dynamic, params.load_max_continuations_dynamic);
             } catch (const std::exception & e) {
                 // out of memory during the merge: keep the current in-memory cache (it contains the delta
                 // that was just written, and the live one), and let the worker free the half-merged copy
                 SPC_WRN("dynamic lookup cache saved, but the in-memory cache was not refreshed from it: %s\n", e.what());
             }
 
+            limits_dynamic = common_ngram_cache_limits(ngram_cache_dynamic,
+                    params.load_max_entries_dynamic, params.load_max_continuations_dynamic);
             SPC_INF("dynamic lookup cache saved (checkpoint): %s, %zu n-grams, %.1f ms\n",
                     params.lookup_cache_dynamic.c_str(), ngram_cache_dynamic.size(), ckpt_t_us / 1000.0);
 
@@ -3978,7 +3984,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
             if (save_dynamic) {
                 // the dynamic cache learns from every sequence; the delta is what sync() writes back
-                common_ngram_cache_update(ngram_cache_dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false, n_max_dynamic);
+                common_ngram_cache_update(ngram_cache_dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false, n_max_dynamic, nullptr, &limits_dynamic);
                 common_ngram_cache_update(ngram_cache_delta,   LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false, n_max_dynamic, &ngram_cache_dynamic);
             }
 

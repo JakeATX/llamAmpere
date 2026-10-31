@@ -27,9 +27,18 @@
 #include <unistd.h>
 #endif
 
+common_ngram_cache_limits::common_ngram_cache_limits(const common_ngram_cache & cache, uint64_t entries, uint64_t continuations)
+    : max_entries(entries), continuations_left(continuations) {
+    if (continuations != UINT64_MAX) {
+        for (const auto & entry : cache) {
+            continuations_left -= std::min(continuations_left, uint64_t(entry.second.size()));
+        }
+    }
+}
+
 void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, int ngram_max,
                               std::vector<llama_token> & inp, int nnew, bool print_progress, size_t n_max,
-                              const common_ngram_cache * admitted) {
+                              const common_ngram_cache * admitted, common_ngram_cache_limits * limits) {
     const int64_t t_start_ms = ggml_time_ms();
     const int64_t inp_size = inp.size();
 
@@ -42,22 +51,35 @@ void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, 
             const int64_t ngram_start = i - ngram_size;
             common_ngram ngram(&inp[ngram_start], ngram_size);
             const llama_token token = inp[i];
-            if (admitted && admitted->find(ngram) == admitted->end()) {
-                continue;
+            if (admitted) {
+                const auto accepted = admitted->find(ngram);
+                if (accepted == admitted->end() || accepted->second.find(token) == accepted->second.end()) {
+                    continue;
+                }
             }
 
             common_ngram_cache::iterator part_it = ngram_cache.find(ngram);
             if (part_it == ngram_cache.end()) {
-                if (n_max > 0 && ngram_cache.size() >= n_max) {
+                if ((n_max > 0 && ngram_cache.size() >= n_max) ||
+                    (limits && (ngram_cache.size() >= limits->max_entries || limits->continuations_left == 0))) {
                     continue;
                 }
                 common_ngram_cache_part part;
                 part.emplace(token, 1);
                 ngram_cache.emplace(ngram, part);
+                if (limits && limits->continuations_left != UINT64_MAX) {
+                    --limits->continuations_left;
+                }
             } else {
                 common_ngram_cache_part::iterator token_count_it = part_it->second.find(token);
                 if (token_count_it == part_it->second.end()) {
+                    if (limits && limits->continuations_left == 0) {
+                        continue;
+                    }
                     part_it->second.emplace(token, 1);
+                    if (limits && limits->continuations_left != UINT64_MAX) {
+                        --limits->continuations_left;
+                    }
                 } else {
                     token_count_it->second++;
                 }
@@ -939,17 +961,34 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename) {
     return ngram_cache;
 }
 
-void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add, size_t n_max) {
+void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add, size_t n_max,
+        common_ngram_cache_limits * limits) {
     for (const auto & ngram_part : ngram_cache_add) {
         const common_ngram & ngram = ngram_part.first;
         const common_ngram_cache_part & part = ngram_part.second;
 
         common_ngram_cache::iterator part_merged_it = ngram_cache_target.find(ngram);
         if (part_merged_it == ngram_cache_target.end()) {
-            if (n_max > 0 && ngram_cache_target.size() >= n_max) {
+            if ((n_max > 0 && ngram_cache_target.size() >= n_max) ||
+                (limits && (ngram_cache_target.size() >= limits->max_entries || limits->continuations_left == 0))) {
                 continue;
             }
-            ngram_cache_target.emplace(ngram, part);
+            if (!limits || part.size() <= limits->continuations_left) {
+                ngram_cache_target.emplace(ngram, part);
+                if (limits && limits->continuations_left != UINT64_MAX) {
+                    limits->continuations_left -= part.size();
+                }
+            } else {
+                common_ngram_cache_part bounded;
+                for (const auto & token_count : part) {
+                    if (bounded.size() == limits->continuations_left) {
+                        break;
+                    }
+                    bounded.insert(token_count);
+                }
+                ngram_cache_target.emplace(ngram, std::move(bounded));
+                limits->continuations_left = 0;
+            }
             continue;
         }
 
@@ -960,7 +999,13 @@ void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ng
 
             common_ngram_cache_part::iterator token_count_merged_it = part_merged_it->second.find(token);
             if (token_count_merged_it == part_merged_it->second.end()) {
+                if (limits && limits->continuations_left == 0) {
+                    continue;
+                }
                 part_merged_it->second.emplace(token, count);
+                if (limits && limits->continuations_left != UINT64_MAX) {
+                    --limits->continuations_left;
+                }
                 continue;
             }
 
@@ -969,12 +1014,24 @@ void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ng
     }
 }
 
-void common_ngram_cache_refresh(common_ngram_cache & live, common_ngram_cache & saved, common_ngram_cache & delta, size_t n_max) {
+void common_ngram_cache_refresh(common_ngram_cache & live, common_ngram_cache & saved, common_ngram_cache & delta, size_t n_max,
+        uint64_t max_entries, uint64_t max_continuations) {
     GGML_ASSERT(&live != &saved && &live != &delta && &saved != &delta);
-    common_ngram_cache_merge(saved, delta, n_max);
+    common_ngram_cache_limits limits(saved, max_entries, max_continuations);
+    common_ngram_cache_merge(saved, delta, n_max, &limits);
     live.swap(saved);
     for (auto it = delta.begin(); it != delta.end();) {
-        if (live.find(it->first) == live.end()) {
+        const auto retained = live.find(it->first);
+        if (retained != live.end()) {
+            for (auto token = it->second.begin(); token != it->second.end();) {
+                if (retained->second.find(token->first) == retained->second.end()) {
+                    token = it->second.erase(token);
+                } else {
+                    ++token;
+                }
+            }
+        }
+        if (retained == live.end() || it->second.empty()) {
             it = delta.erase(it);
         } else {
             ++it;
