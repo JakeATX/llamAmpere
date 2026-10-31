@@ -1001,31 +1001,30 @@ void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n
         return;
     }
     const uint64_t n = std::min<uint64_t>(n_tokens, toks.size() - a);
-    float * out = decode_buf(n*hp.ple_n_heads*ne0, dst); // sized here: the thread must not reallocate
-    dec_thread = std::thread([this, a, n, n_prev, out]() {
-        const auto & hp = model->hparams;
-        const uint64_t nh = hp.ple_n_heads;
-        dec_rows.resize(n*nh);
-        // inside the call every predecessor is a call token, oldest first as the graph input takes them
-        for (uint64_t i = 0; i < n; ++i) {
-            llama_ple_hash_rows(hp, toks[a + i], toks.data() + a + i - n_prev, dec_rows.data() + i*nh);
-        }
-        if (model->params.fit_ram) {
-            std::vector<uintptr_t> pages;
-            for (int32_t row : dec_rows) {
-                const uintptr_t first = (uintptr_t) ple->data + (size_t) row*row_size;
-                const uintptr_t last = first + row_size - 1;
-                for (uintptr_t page = first/4096; page <= last/4096; ++page) {
-                    pages.push_back(page);
-                }
-            }
-            std::sort(pages.begin(), pages.end());
-            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-            if (fit_pages(pages.size()) != pages.size()) {
-                dec_rows.clear();
-                return;
+    const uint64_t nh = hp.ple_n_heads;
+    dec_rows.resize(n*nh);
+    for (uint64_t i = 0; i < n; ++i) {
+        llama_ple_hash_rows(hp, toks[a + i], toks.data() + a + i - n_prev, dec_rows.data() + i*nh);
+    }
+    if (model->params.fit_ram) {
+        std::vector<uintptr_t> pages;
+        for (int32_t row : dec_rows) {
+            const uintptr_t first = (uintptr_t) ple->data + (size_t) row*row_size;
+            const uintptr_t last = first + row_size - 1;
+            for (uintptr_t page = first/4096; page <= last/4096; ++page) {
+                pages.push_back(page);
             }
         }
+        std::sort(pages.begin(), pages.end());
+        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+        if (fit_pages(pages.size()) != pages.size()) {
+            dec_rows.clear();
+            return;
+        }
+    }
+    // Reserve the pages before growing the optional output or starting its thread.
+    float * out = decode_buf(n*nh*ne0, dst);
+    dec_thread = std::thread([this, a, out]() {
         decode_into(dec_rows.data(), dec_rows.size(), out);
         dec_t0 = a;
     });

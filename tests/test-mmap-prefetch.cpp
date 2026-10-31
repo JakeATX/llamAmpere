@@ -22,7 +22,17 @@ struct advice_call {
 };
 
 static std::atomic<size_t> fake_available{16ull << 30};
-size_t llama_moe_arena::available_memory() { return fake_available.load(); }
+extern "C" size_t __wrap__ZN15llama_moe_arena16available_memoryEv() { return fake_available.load(); }
+
+static bool force_cold = false, fail_populate = false;
+static size_t cold_checks = 0;
+extern "C" int __real_mincore(void *, size_t, unsigned char *);
+extern "C" int __wrap_mincore(void * addr, size_t bytes, unsigned char * resident) {
+    if (!force_cold) { return __real_mincore(addr, bytes, resident); }
+    std::fill(resident, resident + (bytes + 4095)/4096, 0);
+    ++cold_checks;
+    return 0;
+}
 
 static int mapped_flags;
 static int failures = 0;
@@ -59,6 +69,9 @@ extern "C" int __wrap_madvise(void * addr, size_t size, int kind) {
             || kind == MADV_POPULATE_READ
 #endif
     ) { mapped_advice_bytes.fetch_add(size); }
+#if defined(MADV_POPULATE_READ)
+    if (kind == MADV_POPULATE_READ && fail_populate) { return -1; }
+#endif
     return 0;
 }
 
@@ -78,7 +91,7 @@ static void test_ple_readers() {
     void * data = mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, fd, 0);
     if (data == MAP_FAILED) { std::abort(); }
     auto * buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
-    ggml_context * ctx = ggml_init({8*ggml_tensor_overhead(), nullptr, true});
+    ggml_context * ctx = ggml_init({12*ggml_tensor_overhead(), nullptr, true});
     auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, page/sizeof(float), rows);
     table->data = data;
     table->buffer = buffer;
@@ -160,10 +173,69 @@ static void test_ple_readers() {
             pf->stop();
             expect(model.prefetch_remaining == 0, "production PLE reader reduces its quota on low or unknown RAM");
         }
+        // The readers spend one page; verification must charge its separate cold rows.
+        fake_available = 16ull << 30;
+        const llama_token repeated[] = {0, 0, 0};
+        const int32_t cold_rows[] = {5, 7, 9};
+        for (const char * verify : {"1", "2"}) {
+            setenv("LLAMA_PLE_PF_VERIFY", verify, 1);
+            for (size_t credit : {size_t(0), page, 3*page}) {
+                if (mprotect(data, bytes, PROT_NONE) || mprotect(data, page, PROT_READ)) { std::abort(); }
+                for (size_t i = 0; i < credit/page; ++i) {
+                    if (mprotect(static_cast<char *>(data) + cold_rows[i]*page, page, PROT_READ)) { std::abort(); }
+                }
+                model.prefetch_remaining = page + credit;
+                auto check = llama_ple_prefetch::create(model, 3);
+                if (!check) { std::abort(); }
+                force_cold = fail_populate = true;
+                cold_checks = 0;
+                mapped_advice_bytes = 0;
+                check->hint(repeated, 3, 0);
+                expect(check->consume(3, cold_rows, 3), "actual consume verifies nonnull cold row indices");
+                check->stop();
+                force_cold = fail_populate = false;
+                expect(cold_checks > 0, "verification actually checked synthetic cold pages");
+                size_t expected_advice = credit;
+#if !defined(MADV_POPULATE_READ)
+                if (verify[0] == '2') { expected_advice = 0; }
+#endif
+                expect(mapped_advice_bytes == expected_advice && model.prefetch_remaining == 0,
+                        "cold verification reads only credited pages in both advice and synchronous modes");
+            }
+        }
+        // Positive but short credit must not decode the protected next rows.
+        setenv("LLAMA_PLE_PF_VERIFY", "0", 1);
+        setenv("LLAMA_PLE_PF_MODE", "pread", 1);
+        setenv("LLAMA_PLE_DECODE", "1", 1);
+        setenv("LLAMA_PLE_DECODE_PINNED", "0", 1);
+        const int32_t current_rows[] = {0, 1};
+        for (size_t credit : {page, 2*page}) {
+            if (mprotect(data, bytes, PROT_NONE) || mprotect(data, 2*page, PROT_READ) ||
+                    (credit == 2*page && mprotect(static_cast<char *>(data) + 2*page, 2*page, PROT_READ))) { std::abort(); }
+            model.prefetch_remaining = 4*page + credit;
+            auto ahead = llama_ple_prefetch::create(model, 2);
+            if (!ahead || !ahead->decode_enabled()) { std::abort(); }
+            ahead->hint(tokens.data(), 4, 0);
+            expect(ahead->consume(2, nullptr, 0) && model.prefetch_remaining == credit,
+                    "production pread leaves an exact positive decode-ahead balance");
+            std::vector<float> values(2*page/sizeof(float), 1.0f);
+            auto * target = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, page/sizeof(float), 2);
+            auto * target_buffer = ggml_backend_cpu_buffer_from_ptr(values.data(), 2*page);
+            target->data = values.data();
+            target->buffer = target_buffer;
+            ahead->gather(2, current_rows, 2, target);
+            ahead->stop();
+            expect(model.prefetch_remaining == 0, "short or exact decode-ahead spends only the available page credit");
+            expect(std::all_of(values.begin(), values.end(), [](float value) { return value == 0.0f; }),
+                    "current demand output stays exact with short or exact next-ubatch credit");
+            ggml_backend_buffer_free(target_buffer);
+        }
+        setenv("LLAMA_PLE_PF_MODE", "fault", 1);
+        setenv("LLAMA_PLE_PF_VERIFY", "2", 1);
         // A demand gather remains usable; the next optional decode must not read row one.
         fake_available = 16ull << 30;
         model.prefetch_remaining = 0;
-        if (mprotect(data, page, PROT_READ)) { std::abort(); }
+        if (mprotect(data, bytes, PROT_NONE) || mprotect(data, page, PROT_READ)) { std::abort(); }
         setenv("LLAMA_PLE_DECODE", "1", 1);
         setenv("LLAMA_PLE_DECODE_PINNED", "0", 1);
         auto pf = llama_ple_prefetch::create(model, 1);
