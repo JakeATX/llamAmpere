@@ -95,12 +95,28 @@ uint64_t server_eval_cache::total_bytes() const {
 int server_eval_cache::find(const llama_tokens & tokens, size_t n_min) const {
     int    best   = -1;
     size_t best_n = n_min;
+    const size_t n_text = tokens.size() - std::count(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL);
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto & et = entries[i].tokens;
-        if (et.size() <= best_n || et.size() > tokens.size()) {
+        if (et.size() <= best_n || et.size() > n_text) {
             continue;
         }
-        if (std::equal(et.begin(), et.end(), tokens.begin())) {
+        bool matches = true;
+        if (n_text == tokens.size()) {
+            matches = std::equal(et.begin(), et.end(), tokens.begin());
+        } else {
+            size_t pos = 0;
+            for (llama_token token : et) {
+                while (pos < tokens.size() && tokens[pos] == LLAMA_TOKEN_NULL) {
+                    ++pos;
+                }
+                if (pos == tokens.size() || tokens[pos++] != token) {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if (matches) {
             best   = (int) i;
             best_n = et.size();
         }

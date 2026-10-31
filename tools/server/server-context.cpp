@@ -2980,13 +2980,9 @@ private:
             SRV_WRN("slot %d: eval cache: restore token buffer exceeds the current RAM fit budget; using fresh prefill\n", slot.id);
             return;
         }
-        int idx;
-        size_t n_prompt_tokens;
-        {
-            const llama_tokens tokens = task.tokens.get_text_tokens();
-            n_prompt_tokens = tokens.size();
-            idx = eval_cache->find(tokens, have);
-        }
+        const llama_tokens & tokens = task.tokens.get_tokens();
+        const size_t n_prompt_tokens = tokens.size() - std::count(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL);
+        const int idx = eval_cache->find(tokens, have);
         if (idx < 0) {
             return;
         }

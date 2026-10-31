@@ -68,7 +68,7 @@ struct server_eval_cache {
 
     uint64_t total_bytes() const;
 
-    // the longest entry whose tokens are all a prefix of `tokens` and longer than `n_min`; -1 = none
+    // The longest entry that prefixes the non-null tokens and is longer than `n_min`; -1 = none.
     int find(const llama_tokens & tokens, size_t n_min) const;
 
     std::string path_hdr(const std::string & id) const;

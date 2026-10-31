@@ -181,6 +181,22 @@ static void test_open_and_roundtrip(const std::string & root) {
         // exact length match is a prefix
         CHECK(ec.find(seq(1, 100), 0) == i_long);
 
+        for (size_t length : {size_t(0), size_t(49), size_t(50), size_t(60), size_t(100), size_t(120)}) {
+            llama_tokens marked = seq(1, length);
+            marked.insert(marked.begin(), LLAMA_TOKEN_NULL);
+            marked.insert(marked.begin() + marked.size() / 2, LLAMA_TOKEN_NULL);
+            marked.push_back(LLAMA_TOKEN_NULL);
+            server_tokens request(std::move(marked), false);
+            const llama_tokens filtered = request.get_text_tokens();
+            for (size_t minimum : {size_t(0), size_t(49), size_t(50), size_t(99), size_t(100), SIZE_MAX}) {
+                CHECK(ec.find(request.get_tokens(), minimum) == ec.find(filtered, minimum));
+            }
+        }
+        llama_tokens mismatch = seq(1, 120);
+        mismatch[10] = 999999;
+        mismatch.insert(mismatch.begin() + 5, LLAMA_TOKEN_NULL);
+        CHECK(ec.find(mismatch, 0) == -1);
+
         // header round trip
         server_eval_cache_record rec;
         CHECK(ec.read_header(id_long, rec, err));
@@ -313,6 +329,19 @@ static void test_record_restore_budget(const std::string & root) {
     const server_tokens & borrowed_view = borrowed;
     CHECK(borrowed.size() > 0 && &borrowed_view[0] != ec.entries.front().tokens.data());
     CHECK(ec.entries.front().tokens == tokens);
+
+    allocation_probe::start(payload);
+    const int direct_match = ec.find(borrowed.get_tokens(), 0);
+    const size_t lookup_copies = allocation_probe::stop();
+    CHECK(direct_match == 0 && lookup_copies == 0 && allocation_probe::largest == 0);
+    llama_tokens marked = tokens;
+    marked.insert(marked.begin(), LLAMA_TOKEN_NULL);
+    marked.insert(marked.begin() + marked.size() / 2, LLAMA_TOKEN_NULL);
+    marked.push_back(LLAMA_TOKEN_NULL);
+    allocation_probe::start(payload);
+    const int marked_match = ec.find(marked, 0);
+    const size_t marked_copies = allocation_probe::stop();
+    CHECK(marked_match == direct_match && marked_copies == 0 && allocation_probe::largest == 0);
 
     const llama_token * owned_data = rec.tokens.data();
     allocation_probe::start(payload);
