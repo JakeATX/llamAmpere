@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -468,7 +469,8 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
 }
 
 bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
-        const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err) {
+        const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err,
+        int64_t checkpoint_tokens) {
     if (!writable) {
         err = "the eval cache is read-only (start the server with --eval-cache-build to add entries)";
         return false;
@@ -508,7 +510,8 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
     const uint32_t version = EVAL_CACHE_FORMAT_VERSION;
     const uint32_t klen    = (uint32_t) key.size();
     const uint64_t ntok    = tokens.size();
-    const uint32_t nckpt   = (uint32_t) checkpoints.size();
+    const uint32_t nckpt   = (uint32_t) std::count_if(checkpoints.begin(), checkpoints.end(),
+            [checkpoint_tokens](const common_prompt_checkpoint & c) { return c.n_tokens <= checkpoint_tokens; });
     const uint8_t  hd      = has_dft ? 1 : 0;
 
     put(EVC_MAGIC, 4);
@@ -520,6 +523,9 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
     put(tokens.data(), tokens.size() * sizeof(llama_token));
     put(&nckpt, sizeof(nckpt));
     for (const auto & c : checkpoints) {
+        if (c.n_tokens > checkpoint_tokens) {
+            continue;
+        }
         const int64_t n    = c.n_tokens;
         const int32_t pmin = c.pos_min;
         const int32_t pmax = c.pos_max;

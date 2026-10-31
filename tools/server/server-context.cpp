@@ -3060,18 +3060,14 @@ private:
         }
 
         // checkpoints the prompt has so far, so that a restored prompt makes the same checkpoint and batch decisions
-        std::list<common_prompt_checkpoint> ckpts;
-        for (const auto & c : slot.prompt.checkpoints) {
-            if (c.n_tokens <= n_tokens) {
-                ckpts.push_back(c);
-            }
-        }
+        const size_t n_checkpoints = std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                [n_tokens](const common_prompt_checkpoint & c) { return c.n_tokens <= n_tokens; });
         std::vector<uint8_t> spec_state;
         common_speculative_get_state(spec.get(), slot.id, spec_state);
 
         std::string out_id;
         std::string err;
-        if (!eval_cache->add(tokens, ckpts, spec_state, has_dft, out_id, err)) {
+        if (!eval_cache->add(tokens, slot.prompt.checkpoints, spec_state, has_dft, out_id, err, n_tokens)) {
             SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());
             return false;
         }
@@ -3083,7 +3079,7 @@ private:
             }
         }
         SLT_INF(slot, "eval cache: stored entry %s, %" PRId64 " tokens, %zu checkpoints, %.3f MiB in %.2f ms\n",
-                out_id.c_str(), n_tokens, ckpts.size(), bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
+                out_id.c_str(), n_tokens, n_checkpoints, bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
         return true;
     }
 

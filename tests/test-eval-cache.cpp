@@ -437,6 +437,65 @@ static void test_streamed_header(const std::string & root) {
 #endif
 }
 
+static void test_borrowed_checkpoints(const std::string & root) {
+    server_eval_cache ec;
+    std::string err, id;
+    CHECK(ec.open(root + "/borrowed", KEY_A, true, err));
+    const llama_tokens tokens = seq(1, 8);
+    const std::vector<uint8_t> spec = {41, 42};
+    const size_t payload = 1u << 20;
+    std::list<common_prompt_checkpoint> checkpoints;
+    // Deliberately unordered: selection must not stop at the first excluded entry.
+    for (const int64_t n : {5, 10, 7, 11}) {
+        checkpoints.push_back(ckpt(n, (int) n));
+        checkpoints.back().data_tgt.assign(payload, (uint8_t) n);
+        checkpoints.back().data_dft.assign(payload, (uint8_t) (n + 1));
+        checkpoints.back().data_spec.assign(payload, (uint8_t) (n + 2));
+    }
+    CHECK(add_entry(ec, tokens, {}, spec, true, id));
+    auto header_bytes = [&]() {
+        std::ifstream f(ec.path_hdr(id), std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    };
+    for (const int64_t limit : {int64_t(0), int64_t(5), int64_t(7), INT64_MAX}) {
+        // Reproduce the old caller's deep-copy selection as a positive allocation control.
+        std::list<common_prompt_checkpoint> selected;
+        allocation_probe::start(payload);
+        for (const auto & c : checkpoints) {
+            if (c.n_tokens <= limit) {
+                selected.push_back(c);
+            }
+        }
+        const size_t copies = allocation_probe::stop();
+        CHECK(copies == 3 * selected.size());
+        CHECK(ec.add(tokens, selected, spec, true, id, err));
+        const std::string expected = header_bytes();
+
+        allocation_probe::start(payload);
+        const bool saved = ec.add(tokens, checkpoints, spec, true, id, err, limit);
+        const size_t borrowed_copies = allocation_probe::stop();
+        CHECK(saved && borrowed_copies == 0 && allocation_probe::largest < payload);
+        CHECK(header_bytes() == expected);
+        server_eval_cache_record rec;
+        CHECK(ec.read_header(id, rec, err));
+        CHECK(rec.tokens == tokens && rec.spec == spec && rec.has_dft);
+        CHECK(rec.checkpoints.size() == selected.size());
+        auto actual = rec.checkpoints.begin();
+        for (const auto & c : selected) {
+            if (actual == rec.checkpoints.end()) {
+                break;
+            }
+            CHECK(actual->n_tokens == c.n_tokens && actual->pos_min == c.pos_min && actual->pos_max == c.pos_max);
+            CHECK(actual->data_tgt == c.data_tgt && actual->data_dft == c.data_dft && actual->data_spec == c.data_spec);
+            ++actual;
+        }
+    }
+    // Legacy callers that omit the cutoff still save all checkpoints.
+    CHECK(ec.add(tokens, checkpoints, spec, true, id, err));
+    server_eval_cache_record rec;
+    CHECK(ec.read_header(id, rec, err) && rec.checkpoints.size() == checkpoints.size());
+}
+
 static void test_streamed_index(const std::string & root) {
     using json = nlohmann::ordered_json;
     server_eval_cache ec;
@@ -668,6 +727,7 @@ int main() {
     test_record_ram_budget(root);
     test_record_allocations(root);
     test_streamed_header(root);
+    test_borrowed_checkpoints(root);
     test_streamed_index(root);
     test_index_ram_budget(root);
     test_index_version(root);

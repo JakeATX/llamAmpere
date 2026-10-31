@@ -78,9 +78,11 @@ struct server_eval_cache {
     bool read_header(const std::string & id, server_eval_cache_record & out, std::string & err,
                      uint64_t ram_bytes = UINT64_MAX) const;
 
-    // write the header of a new entry, then add it to the index (the state files must already be in place)
+    // Write directly from existing checkpoints up to checkpoint_tokens, preserving their order.
+    // The state files must already be in place. Inputs remain borrowed until this call returns.
     bool add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
-             const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err);
+             const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err,
+             int64_t checkpoint_tokens = INT64_MAX);
 
     static std::string entry_id(const llama_tokens & tokens);
 
