@@ -58,6 +58,8 @@ struct idmap {
     const int * tiles;   // per token tile: active index, first pair of the tile (relative to off)
     int64_t     nb02;    // bytes per expert
     const char * direct_ids = nullptr;
+    const float * direct_map = nullptr; // logical expert -> bank slot
+    int direct_map_size = 0;
     int64_t direct_nb0 = 0, direct_nb1 = 0;
     int direct_n_used = 0, direct_ne11 = 0, direct_n_expert = 0;
     const float * direct_x = nullptr;
@@ -972,7 +974,9 @@ static __device__ __forceinline__ void mmvr_body(
         static_assert(ID, "mmvr direct ids");
         const int u = blockIdx.y;
         const int tok = blockIdx.z;
-        const int e = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + tok*idm.direct_nb1);
+        const int native = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + tok*idm.direct_nb1);
+        const int e = idm.direct_map ?
+                (native >= 0 && native < idm.direct_map_size ? (int) idm.direct_map[native] : -1) : native;
         if (e < 0 || e >= idm.direct_n_expert) {
             if (idm.direct_zero && threadIdx.x < 16) {
                 const int64_t col = (int64_t) tok*idm.direct_n_used + u;

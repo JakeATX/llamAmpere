@@ -6932,6 +6932,28 @@ static bool ggml_cuda_match_moe_bank_mixed(const ggml_cgraph * graph, int i) {
     return add->src[0] == h && add->src[1] == mul && mul->src[0] == c && ggml_cuda_moe_mixed_base(add) == c;
 }
 
+static bool ggml_cuda_match_moe_bank_routing(const ggml_cgraph * graph, int i) {
+    if (i + 14 > graph->n_nodes || !ggml_cuda_match_moe_bank_mixed(graph, i + 10)) { return false; }
+    const ggml_op ops[] = { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+        GGML_OP_RESHAPE, GGML_OP_CPY, GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_RESHAPE,
+        GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_ADD };
+    const int outputs[] = { i + 5, i + 9, i + 13 };
+    if (!ggml_can_fuse_subgraph(graph, i, 14, ops, outputs, 3)) { return false; }
+    const ggml_tensor * copy = graph->nodes[i], * rows = graph->nodes[i + 2];
+    const ggml_tensor * map = rows->src[0], * hot = graph->nodes[i + 10], * cold = graph->nodes[i + 11];
+    if (copy->src[0] != cold->src[2] || rows->src[1] != graph->nodes[i + 1] ||
+            hot->src[2] != graph->nodes[i + 5] || graph->nodes[i + 12]->src[1] != graph->nodes[i + 9] ||
+            !map || map->type != GGML_TYPE_F32 || !ggml_is_contiguous(map) ||
+            map->ne[0] != 1 || map->ne[1] != cold->src[0]->ne[2] || map->ne[2] != 1 || map->ne[3] != 1 ||
+            hot->src[1]->ne[1] != 1 || ggml_ai4_rate(hot->src[0]->type) == 0) {
+        return false;
+    }
+    for (int j : { 1, 3, 4, 5, 6, 7, 8, 9 }) {
+        if (graph->nodes[i + j]->src[0] != graph->nodes[i + j - 1]) { return false; }
+    }
+    return true;
+}
+
 static bool ggml_cuda_match_moe_bank_joint(const ggml_cgraph * graph, int i, ggml_cuda_moe_bank_joint_match & m) {
     static const bool enabled = [] {
         const char * value = getenv("LLAMA_MOE_BANK_JOINT_REDUCE");
@@ -9377,6 +9399,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_SSM_CONV && ggml_cuda_try_gdn_conv_norm(*cuda_ctx, cgraph, i)) {
         return 7;
     }
+    if (node->op == GGML_OP_CONT && cuda_ctx->stream_context().concurrent_events.empty() &&
+            GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_AMPERE &&
+            ggml_cuda_match_moe_bank_routing(cgraph, i)) {
+        const int outputs[] = { i + 5, i + 9, i + 13 };
+        ggml_tensor * bank = cgraph->nodes[i + 10], * base = cgraph->nodes[i + 11];
+        ggml_tensor * dst = cgraph->nodes[i + 13], * mask = cgraph->nodes[i + 9];
+        const ggml_tensor * map = cgraph->nodes[i + 2]->src[0];
+        if (!ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[cuda_ctx->device].cc, bank->src[0]->type) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 14, outputs, 3)) {
+            if (ggml_cuda_moe_cache_mixed_compute(*cuda_ctx, bank, base, dst, map, mask)) {
+                cuda_ctx->fusion_stats.moe_bank_mixed++;
+                cuda_ctx->fusion_stats.moe_bank_routing++;
+                return 13;
+            }
+            if (ggml_backend_buffer_is_cuda(base->src[0]->buffer)) {
+                ggml_cuda_mul_mat_id_mixed(*cuda_ctx, bank, base, dst, nullptr, nullptr, nullptr, nullptr, map, mask);
+                cuda_ctx->fusion_stats.moe_bank_mixed++;
+                cuda_ctx->fusion_stats.moe_bank_routing++;
+                return 13;
+            }
+        }
+    }
     if (node->op == GGML_OP_MUL_MAT_ID) {
         const int output = i + 3;
         if (cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_match_moe_bank_mixed(cgraph, i) &&
@@ -11266,6 +11311,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (ggml_cuda_match_moe_bank_routing(cgraph, i)) {
+                ggml_tensor * dst = cgraph->nodes[i + 13];
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], dst);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 2]->src[0], dst);
+                for (int k : { i + 10, i + 11 }) {
+                    for (int s = 0; s < 3; ++s) {
+                        params->add_alloc_dep(params->user_data, cgraph->nodes[k]->src[s], dst);
+                    }
+                }
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 9], dst);
+                i += 13;
+                continue;
+            }
             if (ggml_cuda_match_moe_bank_mixed(cgraph, i)) {
                 for (int k : { i, i + 1 }) {
                     for (int s = 0; s < 3; ++s) {
@@ -12780,6 +12838,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "nemotron_moe") == 0) {
         return ctx->fusion_stats.nemotron_moe;
+    }
+    if (strcmp(name, "moe_bank_routing") == 0) {
+        return ctx->fusion_stats.moe_bank_routing;
     }
     if (strcmp(name, "moe_bank_mixed") == 0) {
         return ctx->fusion_stats.moe_bank_mixed;

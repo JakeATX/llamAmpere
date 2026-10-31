@@ -2667,6 +2667,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, nullptr, il);
             // fork: slot-cache IDs have a different domain from the bank map; retain the old path there.
             if (!slots) {
+                ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+                ggml_build_forward_expand(gf, x);
                 ggml_tensor * hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, slot, n_expert_used, n_tokens), GGML_TYPE_I32);
                 ggml_tensor * cold_mask = ggml_reshape_3d(ctx0,
                         ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, hot_ids, GGML_TYPE_F32), -1.0f, -0.5f)),
@@ -2677,7 +2679,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     ggml_tensor * c = build_lora_mm_id(cw, x, selected_experts);
                     return ggml_add(ctx0, h, ggml_mul(ctx0, c, cold_mask));
                 };
-                ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
                 ggml_tensor * up = mixed_mm(hot.up, up_exps, x);
                 ggml_tensor * gate = mixed_mm(hot.gate, gate_exps, x);
                 x = ggml_swiglu_split(ctx0, gate, up);

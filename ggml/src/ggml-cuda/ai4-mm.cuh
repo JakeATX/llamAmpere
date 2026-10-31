@@ -20,4 +20,5 @@ bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor *
 const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined);
 void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8 = nullptr,
-        const void * const * table = nullptr, const uint8_t * skip = nullptr, const uint8_t * resident = nullptr);
+        const void * const * table = nullptr, const uint8_t * skip = nullptr, const uint8_t * resident = nullptr,
+        const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr);

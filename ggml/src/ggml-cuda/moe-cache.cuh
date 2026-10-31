@@ -235,7 +235,7 @@ void ggml_cuda_moe_cache_device_graph_record(int device, bool captured, const gg
 bool ggml_cuda_moe_cache_device_supports(const ggml_tensor * op, int device);
 bool ggml_cuda_moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op);
 bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
-        ggml_tensor * base, ggml_tensor * dst);
+        ggml_tensor * base, ggml_tensor * dst, const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr);
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
         ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu);
 // fork PREFETCHFIX (GGML_MOE_PREFETCH_ASYNC): turns a "moe_prefetch-<src>-<target>" id list into

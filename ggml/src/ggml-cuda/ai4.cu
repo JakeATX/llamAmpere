@@ -1388,9 +1388,17 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
         ggml_type bank_type, const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
         const int32_t * ids, int64_t ids_stride, int n_expert, const block_q8_1 * x,
-        const uint8_t * skip, const uint8_t * resident, bool trace) {
+        const uint8_t * skip, const uint8_t * resident, char * route_ids, size_t route_ids_stride,
+        float * route_mask, bool trace) {
     const int u = blockIdx.y, t = blockIdx.z;
-    const int h = *(const int32_t *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
+    const int native = *(const int32_t *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
+    const int h = idm.direct_map ?
+            (native >= 0 && native < idm.direct_map_size ? (int) idm.direct_map[native] : -1) : native;
+    // Other slabs resolve the map themselves; these stores serve later projections.
+    if (route_ids && blockIdx.x == 0 && threadIdx.x == 0) {
+        *(int32_t *) (route_ids + t*route_ids_stride + u*sizeof(int32_t)) = h;
+        route_mask[t*idm.direct_n_used + u] = h < 0 ? 1.0f : 0.0f;
+    }
     const bool hot = h >= 0 && h < idm.direct_n_expert;
     if (hot && bank_type != GGML_TYPE_IQ4_NL) {
         ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N>(W, q, s, Y, M, M, 1, K, idm);
@@ -1481,7 +1489,8 @@ const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined) {
 
 void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8,
-        const void * const * table, const uint8_t * skip, const uint8_t * resident) {
+        const void * const * table, const uint8_t * skip, const uint8_t * resident,
+        const ggml_tensor * route_map, ggml_tensor * route_mask) {
     GGML_ASSERT(ggml_cuda_moe_mixed_supported(bank, base));
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
     const int K = (int) x->ne[0], M = (int) w->ne[1];
@@ -1507,6 +1516,17 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     idm.nb02 = w->nb[2]; idm.direct_ids = (const char *) ids->data;
     idm.direct_nb0 = ids->nb[0]; idm.direct_nb1 = ids->nb[1];
     idm.direct_n_used = (int) ids->ne[0]; idm.direct_ne11 = (int) x->ne[1]; idm.direct_n_expert = (int) w->ne[2];
+    GGML_ASSERT((route_map == nullptr) == (route_mask == nullptr));
+    if (route_map) {
+        GGML_ASSERT(route_map->type == GGML_TYPE_F32 && ggml_is_contiguous(route_map));
+        GGML_ASSERT(ggml_nelements(route_map) == cw->ne[2]);
+        GGML_ASSERT(route_mask->type == GGML_TYPE_F32 && ggml_is_contiguous(route_mask));
+        GGML_ASSERT(ggml_nelements(route_mask) == ggml_nelements(ids));
+        idm.direct_ids = (const char *) ci->data;
+        idm.direct_nb0 = ci->nb[0]; idm.direct_nb1 = ci->nb[1];
+        idm.direct_map = (const float *) route_map->data;
+        idm.direct_map_size = (int) cw->ne[2];
+    }
     const dim3 grid(M/16, ids->ne[0], ids->ne[1]);
     static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
     const int cfg = ai4_mmvr_cfg();
@@ -1517,7 +1537,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     moe_mixed_mmv<L, XSH, KT, WARPS, SINGLE><<<grid, WARPS*32, WARPS*2*ai4k::mmv_stage_bytes<true, L>(), ctx.stream()>>>( \
             (const uint8_t *) w->data, q.get(), s.get(), (float *) dst->data, M, K, idm, \
             w->type, (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
-            ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, trace > 1)
+            ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
+            route_map ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr, trace > 1)
 #define MOE_MIXED_SINGLE(L, XSH, KT, WARPS) \
     if (single) { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, true); } \
     else        { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, false); }
@@ -1540,8 +1561,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     if (trace) {
-        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d\n",
-                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr);
+        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d\n",
+                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr);
     }
 }
 #undef MOE_MIXED_TYPES

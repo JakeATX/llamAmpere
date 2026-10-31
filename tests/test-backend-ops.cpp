@@ -11953,6 +11953,83 @@ struct test_moe_bank_mixed : public test_case {
     }
 };
 
+struct test_moe_bank_routing : public test_moe_bank_mixed {
+    const bool strided_ids;
+    ggml_tensor * native_ids = nullptr;
+    ggml_tensor * map = nullptr;
+    ggml_tensor * bank_ids = nullptr;
+    ggml_tensor * cold_mask = nullptr;
+    ggml_tensor * result = nullptr;
+    test_moe_bank_routing(int width, bool strided_ids) :
+        test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_IQ3_XXS, width, 2, 1, false, false, 2560, 640),
+        strided_ids(strided_ids) {}
+    std::string vars() override { return test_moe_bank_mixed::vars() + "," + VAR_TO_STR(strided_ids); }
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_ROUTING"; }
+    const char * required_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return !enabled || atoi(enabled) ? "moe_bank_routing" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return enabled && !atoi(enabled) ? "moe_bank_routing" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, 1, width);
+        native_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided_ids ? 6 : 4, width);
+        ggml_tensor * ids = strided_ids ? ggml_view_2d(ctx, native_ids, 4, width, native_ids->nb[1], 0) : native_ids;
+        map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 4);
+        ggml_build_forward_expand(gf, ids);
+        ggml_build_forward_expand(gf, x);
+        ggml_tensor * flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ids), 4*width, 1);
+        ggml_tensor * slot = ggml_reshape_3d(ctx, ggml_get_rows(ctx, map, flat), 1, 4, width);
+        bank_ids = ggml_cast(ctx, ggml_reshape_2d(ctx, slot, 4, width), GGML_TYPE_I32);
+        cold_mask = ggml_reshape_3d(ctx,
+                ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, bank_ids, GGML_TYPE_F32), -1.0f, -0.5f)), 1, 4, width);
+        ggml_set_output(bank_ids);
+        ggml_set_output(cold_mask);
+        ggml_build_forward_expand(gf, cold_mask);
+        ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, bank_ids);
+        ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ids);
+        result = ggml_add(ctx, h, ggml_mul(ctx, c, cold_mask));
+        return result;
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { bank_ids, cold_mask, result }; }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_moe_bank_mixed::initialize_tensors(ctx);
+        const float values[] = { 3.0f, -1.0f, 0.0f, -1.0f };
+        ggml_backend_tensor_set(map, values, 0, sizeof(values));
+        std::vector<int32_t> ids(ggml_nelements(native_ids), 2);
+        for (int t = 0; t < width; ++t) {
+            for (int e = 0; e < 4; ++e) { ids[t*native_ids->ne[0] + e] = (e + t)%4; }
+        }
+        ggml_backend_tensor_set(native_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+        std::vector<int32_t> stale_ids(4*width, -73);
+        std::vector<float> stale_mask(4*width, 9.0f);
+        ggml_backend_tensor_set(bank_ids, stale_ids.data(), 0, stale_ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(cold_mask, stale_mask.data(), 0, stale_mask.size()*sizeof(float));
+    }
+    bool verify_backend_result(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        std::vector<int32_t> ids(4*width);
+        std::vector<float> mask(4*width);
+        ggml_backend_tensor_get(bank_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_get(cold_mask, mask.data(), 0, mask.size()*sizeof(float));
+        const int32_t slots[] = { 3, -1, 0, -1 };
+        for (int t = 0; t < width; ++t) {
+            for (int e = 0; e < 4; ++e) {
+                const int slot = slots[(e + t)%4];
+                if (ids[t*4 + e] != slot || mask[t*4 + e] != (slot < 0 ? 1.0f : 0.0f)) {
+                    printf("mixed routing did not materialize bank IDs and mask ");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+};
+
 struct test_moe_bank_mixed_reduce : public test_moe_bank_mixed {
     ggml_tensor * mixed_result = nullptr;
     ggml_tensor * reference_result = nullptr;
@@ -18977,6 +19054,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int width : { 1, 4, 5, 8 }) {
+        for (bool strided_ids : { false, true }) {
+            test_cases.emplace_back(new test_moe_bank_routing(width, strided_ids));
+        }
         test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_Q2_0,
                 width, 2, 4, false, true, 640, 2560));
         for (int mode : { 0, 1, 2 }) {
