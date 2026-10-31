@@ -1801,7 +1801,7 @@ size_t server_prompt_cache::size() const {
             continue;
         }
         for (const size_t part : {state.data.main.capacity(), state.data.drft.capacity(), state.data.spec.capacity(),
-                state.prompt.tokens.get_tokens().capacity() * sizeof(llama_token), state.prompt.lora_scales.capacity() * sizeof(float),
+                state.prompt.tokens.capacity() * sizeof(llama_token), state.prompt.lora_scales.capacity() * sizeof(float),
                 sizeof(server_prompt_cache_state) + 2 * sizeof(void *)}) {
             res = server_prompt_ram_add(res, part);
         }

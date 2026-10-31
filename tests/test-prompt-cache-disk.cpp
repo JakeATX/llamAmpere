@@ -873,6 +873,30 @@ static void test_fit_ram(const std::string & root) {
         CHECK(retained.states.size() == 1 && retained.size() <= retained.limit_size);
     }
 
+    // A loaded projector marks even text-only prompts as multimodal-capable.
+    // Automatic RAM accounting must not use the text-only get_tokens accessor.
+    server_prompt_cache projector(16, 0);
+    projector.fit_ram = true;
+    projector.spare_max_n = 0;
+    projector.available_ram = []() { return 6 * GiB; };
+    projector.disk = make_tier(root + "/fit-projector", "k", 0);
+    server_prompt text;
+    text.tokens = server_tokens(llama_tokens{41, 42, 43}, true);
+    CHECK(text.tokens.has_mtmd && !text.tokens.has_media());
+    auto * text_entry = projector.alloc(text, MiB, 0);
+    CHECK(text_entry != nullptr);
+    if (text_entry) {
+        CHECK(text_entry->prompt.tokens.has_mtmd);
+        const size_t token_bytes = text_entry->prompt.tokens.capacity() * sizeof(llama_token);
+        CHECK(token_bytes >= 3 * sizeof(llama_token));
+        CHECK(projector.size() >= MiB + token_bytes);
+        projector.flush_to_disk();
+        CHECK(projector.disk.n_match() == 1);
+        server_prompt_disk_record restored;
+        CHECK(projector.disk.read(projector.disk.entries.begin(), restored, projector.disk_read_budget()));
+        CHECK(restored.tokens == text.tokens.get_text_tokens() && restored.main.size() == MiB);
+    }
+
     // The live floor can stop a sub-limit save after RAM use grows.
     pc->available_ram = []() { return 5 * GiB + MiB; };
     server_prompt q;

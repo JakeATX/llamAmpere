@@ -234,6 +234,9 @@ public:
 
     size_t size() const { return tokens.size(); }
 
+    // Backing token storage, also valid when a projector is loaded.
+    size_t capacity() const { return tokens.capacity(); }
+
     bool empty() const { return tokens.empty(); }
 
     // true when this prompt actually holds image/audio chunks; has_mtmd only says the server has a projector
