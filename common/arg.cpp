@@ -3569,13 +3569,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
                 );
             }
-            if (split_arg.size() == 1) {
-                std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), std::stoull(split_arg[0]) * 1024*1024);
+            std::vector<size_t> targets;
+            for (const std::string & part : split_arg) {
+                if (part.empty() || part.find_first_not_of("0123456789") != std::string::npos) {
+                    throw std::invalid_argument("fit target must be a nonnegative whole number of MiB");
+                }
+                const uint64_t mib = std::stoull(part);
+                if (mib > std::min<uint64_t>(SIZE_MAX, INT64_MAX) / (1024 * 1024)) {
+                    throw std::invalid_argument("fit target exceeds the supported size");
+                }
+                targets.push_back(size_t(mib) * 1024 * 1024);
+            }
+            if (targets.size() == 1) {
+                std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), targets[0]);
                 params.fit_params_target_explicit = true;
                 return;
             }
-            for (size_t i = 0; i < split_arg.size(); i++) {
-                params.fit_params_target[i] = std::stoull(split_arg[i]) * 1024*1024;
+            for (size_t i = 0; i < targets.size(); i++) {
+                params.fit_params_target[i] = targets[i];
             }
             params.fit_params_target_explicit = true;
         }

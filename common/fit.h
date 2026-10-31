@@ -108,6 +108,7 @@ enum common_params_fit_status {
 
 // fork: classify measured allocations before treating requested margins as a proven fit.
 common_params_fit_status common_fit_vram_margin_status(int64_t free_bytes, size_t used_bytes, size_t margin_bytes);
+int64_t common_fit_vram_margin_surplus(int64_t free_bytes, const std::vector<int64_t> & margins);
 
 // fork: require a proven fit with the device floor left on every device.
 bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins, size_t floor = 300u * 1024 * 1024);

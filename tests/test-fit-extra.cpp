@@ -1234,6 +1234,13 @@ static void test_vram_fit_floor() {
     const auto status = dir / "card0-DP-1" / "status";
     std::ofstream(status) << "disconnected\n";
     expect(common_fit_vram_floor_detect(dir.string(), false) == 300 * MiB, "disconnected display uses headless floor");
+    fs::create_directories(dir / "card1-HDMI-A-1");
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "disconnected plus missing connector status keeps the unknown display floor");
+    std::ofstream(dir / "card1-HDMI-A-1" / "status") << "disconnected\n";
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 300 * MiB, "all known disconnected connectors allow the headless floor");
+    fs::remove(status);
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "missing status on the other connector also keeps the unknown floor");
+    std::ofstream(status) << "disconnected\n";
     expect(common_fit_vram_floor_detect(dir.string(), true) == 800 * MiB, "display session keeps larger floor even without a connector");
     fs::create_directories(dir / "card1-HDMI-A-1");
     std::ofstream(dir / "card1-HDMI-A-1" / "status") << "connected\n";
@@ -1297,11 +1304,59 @@ static void test_vram_fit_floor() {
         expect(common_fit_vram_targets(params, 300 * MiB) == targets, "parsed explicit target is preserved by automatic fit");
         expect(params.fit_params_target[0] == (value == single ? 1024 * MiB : 0), "parsed explicit margin retains its requested bytes");
     }
+    const uint64_t max_mib = std::min<uint64_t>(SIZE_MAX, INT64_MAX) / MiB;
+    for (const std::string & value : {std::to_string(max_mib), "0," + std::to_string(max_mib)}) {
+        common_params params;
+        std::vector<char> input(value.begin(), value.end());
+        input.push_back('\0');
+        char * argv[] = {program, option, input.data()};
+        expect(common_params_parse(3, argv, params, LLAMA_EXAMPLE_SERVER), "largest supported scalar or vector target parses without wrapping");
+        expect(params.fit_params_target[value[0] == '0' ? 1 : 0] == max_mib * MiB, "largest fit target retains its byte value");
+    }
+    for (const std::string & value : {std::to_string(max_mib + 1), std::string("17592186044416"),
+            std::string("0,17592186044416"), std::string("18446744073709551616"), std::string("-1"), std::string("12x")}) {
+        common_params params;
+        const auto before = params.fit_params_target;
+        std::vector<char> input(value.begin(), value.end());
+        input.push_back('\0');
+        char * argv[] = {program, option, input.data()};
+        expect(!common_params_parse(3, argv, params, LLAMA_EXAMPLE_SERVER), "parser rejects oversized or malformed fit targets before multiplication");
+        expect(params.fit_params_target == before && !params.fit_params_target_explicit, "invalid vector targets do not partially change the fit request");
+    }
+    expect(common_fit_vram_margin_surplus(4096 * MiB, {300 * MiB, 800 * MiB}) == 2996 * MiB, "aggregate fit surplus subtracts every device margin");
+    expect(common_fit_vram_margin_surplus(-1, {INT64_MAX - 1}) == -INT64_MAX, "largest negatable deficit keeps its exact value");
+    expect(common_fit_vram_margin_surplus(INT64_MAX, {INT64_MAX}) == 0, "exact largest aggregate boundary is valid");
+    for (const auto & margins : std::vector<std::vector<int64_t>>{{INT64_MAX, INT64_MAX}, {INT64_MAX, 1}, {-1}}) {
+        bool rejected = false;
+        try {
+            common_fit_vram_margin_surplus(-1, margins);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        expect(rejected, "production aggregate accounting rejects overflow and negative margins");
+    }
+    if (SIZE_MAX > UINT32_MAX) {
+        common_params params;
+        char large[] = "8796093022207,8796093022207";
+        char * argv[] = {program, option, large};
+        expect(common_params_parse(3, argv, params, LLAMA_EXAMPLE_SERVER), "large per-device margins remain individually representable");
+        bool rejected = false;
+        try {
+            common_fit_vram_margin_surplus(24ll << 30,
+                {int64_t(params.fit_params_target[0]), int64_t(params.fit_params_target[1])});
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        expect(rejected, "parsed two-device targets cannot overflow the production aggregate subtraction");
+    }
     common_set_env("LLAMA_ARG_FIT_TARGET", "1024");
     common_params from_env;
     char * argv[] = {program};
     expect(common_params_parse(1, argv, from_env, LLAMA_EXAMPLE_SERVER) && from_env.fit_params_target_explicit, "environment fit target is an explicit override");
     expect(common_fit_vram_targets(from_env, 300 * MiB)[0] == 1024 * MiB, "environment target preserves stock-size request");
+    common_set_env("LLAMA_ARG_FIT_TARGET", "17592186044416");
+    common_params bad_env;
+    expect(!common_params_parse(1, argv, bad_env, LLAMA_EXAMPLE_SERVER), "environment target uses the same checked conversion as the CLI");
     common_set_env("LLAMA_ARG_FIT_TARGET", old_target);
 }
 

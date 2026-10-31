@@ -107,6 +107,10 @@ size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_s
             return safe;
         }
         if (!exists) {
+            const std::string name = it->path().filename().string();
+            if (name.compare(0, 4, "card") == 0 && name.find('-') != std::string::npos) {
+                return safe;
+            }
             continue;
         }
         std::ifstream file(path);
@@ -209,6 +213,17 @@ class common_params_fit_exception : public std::runtime_error {
 class common_params_fit_no_room : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+int64_t common_fit_vram_margin_surplus(int64_t free_bytes, const std::vector<int64_t> & margins) {
+    for (int64_t margin : margins) {
+        // Keep the deficit negatable for logging and context reduction.
+        if (margin < 0 || free_bytes < -INT64_MAX + margin) {
+            throw common_params_fit_exception("requested free memory margins exceed the supported total size");
+        }
+        free_bytes -= margin;
+    }
+    return free_bytes;
+}
 
 const char * common_moe_cache_tensor_override_pattern() {
     return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.";
@@ -949,14 +964,7 @@ static void common_params_fit_impl(
     // step 2: try reducing memory use by reducing the context size
 
     {
-        int64_t global_surplus = sum_projected_free;
-        if (nd == 0) {
-            global_surplus -= margins[0];
-        } else {
-            for (size_t id = 0; id < nd; id++) {
-                global_surplus -= margins[id];
-            }
-        }
+        const int64_t global_surplus = common_fit_vram_margin_surplus(sum_projected_free, margins);
         if (global_surplus < 0) {
             if (nd <= 1) {
                 LOG_TRC("%s: cannot meet free memory target of %" PRId64 " MiB, need to reduce device memory by %" PRId64 " MiB\n",
@@ -968,14 +976,7 @@ static void common_params_fit_impl(
             }
             if (n_ctx_auto) {
                 if (n_ctx_max > n_ctx_min_total) {
-                    int64_t sum_used_target = sum_free;
-                    if (nd == 0) {
-                        sum_used_target -= margins[0];
-                    } else {
-                        for (size_t id = 0; id < nd; id++) {
-                            sum_used_target -= margins[id];
-                        }
-                    }
+                    int64_t sum_used_target = common_fit_vram_margin_surplus(sum_free, margins);
                     if (nd > 1) {
                         // for multiple devices we need to be more conservative in terms of how much context we think can fit:
                         //   - for dense models only whole layers can be assigned to devices
@@ -983,7 +984,12 @@ static void common_params_fit_impl(
                         //   - on average we expect a waste of 0.5 layers/tensors per device
                         //   - use slightly more than the expected average for nd devices to be safe
                         const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
-                        sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
+                        if (model_per_layer < 0 || nd >= uint64_t(INT64_MAX) ||
+                            model_per_layer > INT64_MAX / (int64_t(nd) + 1)) {
+                            throw common_params_fit_exception("device memory accounting exceeds the supported total size");
+                        }
+                        sum_used_target = common_fit_vram_margin_surplus(sum_used_target,
+                            {(int64_t(nd) + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6)});
                     }
 
                     int64_t sum_projected_used_min_ctx = 0;
@@ -1016,11 +1022,16 @@ static void common_params_fit_impl(
                             for (int it = 0; nd == 1 && it < 8; it++) {
                                 dmds_t dmds_chk = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
                                 add_extra_memory(dmds_chk);
-                                const int64_t deficit = margins[0] - (dmds_chk[0].free - int64_t(dmds_chk[0].mb.total()));
+                                if (dmds_chk[0].mb.total() > INT64_MAX) {
+                                    throw common_params_fit_exception("device memory accounting exceeds the supported size");
+                                }
+                                const int64_t deficit = -common_fit_vram_margin_surplus(dmds_chk[0].free,
+                                    {int64_t(dmds_chk[0].mb.total()), margins[0]});
                                 if (deficit <= 0 || cparams->n_ctx <= n_ctx_min_total) {
                                     break;
                                 }
-                                const int64_t step = std::max<int64_t>(align, (deficit + std::max<int64_t>(bytes_per_ctx, 1) - 1) / std::max<int64_t>(bytes_per_ctx, 1));
+                                const int64_t step = std::min<int64_t>(cparams->n_ctx,
+                                    std::max<int64_t>(align, 1 + (deficit - 1) / std::max<int64_t>(bytes_per_ctx, 1)));
                                 const uint32_t n_ctx_prev = cparams->n_ctx;
                                 cparams->n_ctx = (uint32_t) std::max<int64_t>(int64_t(cparams->n_ctx) - (step + align - 1) / align * align, n_ctx_min_total);
                                 LOG_TRC("%s: context size %" PRIu32 " is projected %" PRId64 " MiB over the target -> reduced to %" PRIu32 "\n",
@@ -1277,8 +1288,14 @@ static void common_params_fit_impl(
         add_extra_memory(dmds_cpu_moe);
 
         for (size_t id = 0; id < nd; id++) {
+            if (dmds_cpu_moe[id].free < 0 || (global_surplus_cpu_moe > 0 &&
+                dmds_cpu_moe[id].free > INT64_MAX - global_surplus_cpu_moe) ||
+                dmds_cpu_moe[id].mb.total() > INT64_MAX) {
+                throw common_params_fit_exception("device memory accounting exceeds the supported total size");
+            }
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
-            global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
+            global_surplus_cpu_moe = common_fit_vram_margin_surplus(global_surplus_cpu_moe,
+                {int64_t(dmds_cpu_moe[id].mb.total()), margins[id]});
         }
 
         if (global_surplus_cpu_moe > 0) {
