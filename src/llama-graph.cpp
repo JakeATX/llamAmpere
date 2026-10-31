@@ -1970,6 +1970,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+    if (moe_route_skip && !ggml_exl3_bits(w->type) && ggml_nelements(moe_route_skip) == res->ne[1]*res->ne[2]) {
+        res->src[3] = moe_route_skip; // a backend that ignores it computes those routes (their weight is zero)
+    }
 
     // fork: native CPU experts use logical IDs for both compressed weights and side vectors.
     const char * cpu_exl3 = getenv("GGML_CPU_EXL3");
@@ -2754,10 +2757,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             w_cold  = weights;
         }
         moe_weights_override = w_cold;
+        // prompt batches: the cold GEMMs leave out the hot routes (zero weight here, computed by the hot call)
+        // instead of running them against the zero-filled bank holes. LLAMA_MOE_COLD_SKIP=0 opts out.
+        static const bool cold_skip = [] {
+            const char * value = getenv("LLAMA_MOE_COLD_SKIP");
+            return !value || atoi(value) != 0;
+        }();
+        if (cold_skip && hot_dbg == 0 && !b1_routing && n_tokens > 8) {
+            moe_route_skip = slot;
+        }
         ggml_tensor * out_cold = build_moe_ffn(cur, gate_inp, nullptr,
                 up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
                 n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
                 logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, cold_ids);
+        moe_route_skip = nullptr;
         GGML_ASSERT(moe_weights_override == nullptr);
         moe_defer_reduce = false;
         if (joint_reduce) {

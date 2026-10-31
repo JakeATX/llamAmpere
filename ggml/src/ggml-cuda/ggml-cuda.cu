@@ -12885,6 +12885,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "q8_cache_hits") == 0) {
         return ctx->fusion_stats.q8_cache_hits;
     }
+    if (strcmp(name, "mmq_route_skip") == 0) {
+        return ctx->fusion_stats.mmq_route_skip;
+    }
     if (strcmp(name, "mmq_prefill") == 0) {
         return ctx->fusion_stats.mmq_prefill;
     }

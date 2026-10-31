@@ -8660,6 +8660,73 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// MUL_MAT_ID with a per-route skip value in src[3] (>= 0: another call computes the route), as the cold bank
+// call of a prompt batch with a hot bank. A backend may leave those routes out (zero rows) or compute them; the
+// routes are compared after the cold mask, so both are correct. Some tokens skip every route, some none.
+struct test_mul_mat_id_route_skip : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool b; // broadcast b matrix (gate/up), else one row per route (down)
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_ROUTE_SKIP";
+    }
+
+    // the skipped rows differ before the mask; only the masked output is defined
+    bool run_whole_graph() override { return true; }
+
+    const char * required_fusion() override { return "mmq_route_skip"; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_route_skip(ggml_type type_a = GGML_TYPE_IQ3_XXS, int n_mats = 32, int n_used = 10, bool b = true,
+            int64_t m = 128, int64_t n = 64, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        ggml_set_name(x, "b");
+        ggml_tensor * skip = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(skip, "skip");
+        ggml_tensor * mm = ggml_mul_mat_id(ctx, as, x, ids);
+        mm->src[3] = skip;
+        ggml_tensor * cold = ggml_step(ctx, ggml_scale_bias(ctx, skip, -1.0f, -0.5f)); // 1 where skip < 0
+        ggml_tensor * out = ggml_mul(ctx, mm, cold);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        std::default_random_engine rng(1234);
+        ggml_tensor * skip = ggml_get_tensor(ctx, "skip");
+        std::vector<float> v(ggml_nelements(skip));
+        for (int64_t t = 0; t < n; ++t) {
+            for (int64_t i = 0; i < n_used; ++i) {
+                const bool hot = t % 7 == 3 ? true : t % 7 == 5 ? false : rng() % 2 == 0;
+                v[t*n_used + i] = hot ? (float) (rng() % 4) : -1.0f;
+            }
+        }
+        ggml_backend_tensor_set(skip, v.data(), 0, ggml_nbytes(skip));
+    }
+};
+
 struct test_mul_mat_id_ai4 : public test_mul_mat_id {
     const bool dup;
     const bool initialize_all;
@@ -19264,6 +19331,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_IQ4_NL }) {
             test_cases.emplace_back(new test_moe_bank_mixed_reduce(bank, width));
+        }
+    }
+
+    for (ggml_type type_a : { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q4_K }) {
+        for (bool b : { true, false }) {
+            for (int n : { 9, 64, 600 }) {
+                test_cases.emplace_back(new test_mul_mat_id_route_skip(type_a, 32, 10, b, 128, n, 256));
+            }
         }
     }
 
