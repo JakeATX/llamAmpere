@@ -1834,7 +1834,7 @@ bool server_prompt_cache::holds(const server_prompt_cache_state * state) const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
-        std::list<common_prompt_checkpoint> * hand_over, size_t state_size_spec) {
+        std::list<common_prompt_checkpoint> * hand_over, std::vector<uint8_t> state_data_spec) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1860,6 +1860,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size_all += ckpt.size();
     }
 
+    const size_t state_size_spec = fit_ram ? state_data_spec.capacity() : state_data_spec.size();
     size_t state_size_new = 0;
     for (const size_t part : {state_size_tgt, state_size_dft, state_size_spec, checkpoints_ram_size}) {
         if (part > SIZE_MAX - state_size_new) {
@@ -1898,7 +1899,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                 staging.prompt.lora_scales = prompt.lora_scales;
                 staging.data.main.resize(state_size_tgt);
                 staging.data.drft.resize(state_size_dft);
-                staging.data.spec.resize(state_size_spec);
+                staging.data.spec = std::move(state_data_spec);
             } catch (const std::bad_alloc & e) {
                 SRV_ERR("failed to allocate memory for the staged prompt state: %s\n", e.what());
                 staging = server_prompt_cache_state();
@@ -1946,7 +1947,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
-    std::vector<uint8_t> state_data_spec;
     std::list<common_prompt_checkpoint> checkpoints_ram;
 
     // check if we can allocate enough memory for the new state
@@ -1959,7 +1959,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
         state_data_tgt = take_buffer(state_size_tgt);
         state_data_dft = take_buffer(state_size_dft);
-        state_data_spec.resize(state_size_spec);
         trim_spare(state_size_new);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());

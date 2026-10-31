@@ -738,9 +738,8 @@ static void test_mtmd_text_only_spills(const std::string & root) {
     p.tokens = server_tokens(make_entry(3, 300, 0).tokens, /* has_mtmd = */ true);
     CHECK(p.tokens.has_mtmd && !p.tokens.has_media());
 
-    auto * e = pc.alloc(p, 1*MiB, 0, nullptr, 31);
+    auto * e = pc.alloc(p, 1*MiB, 0, nullptr, std::vector<uint8_t>(31, 42));
     CHECK(e != nullptr && e->prompt.tokens.has_mtmd);
-    e->data.spec.assign(31, 42);
     CHECK(e->size() == 1*MiB + 31);
     pc.flush_to_disk();
     CHECK(pc.disk.n_match() == 1);
@@ -752,9 +751,8 @@ static void test_mtmd_text_only_spills(const std::string & root) {
     server_prompt q;
     q.tokens = server_tokens(make_entry(4, 300, 0).tokens, /* has_mtmd = */ true);
     pc.limit_size = 1*MiB;
-    auto * st = pc.alloc(q, 2*MiB, 0, nullptr, 17);
+    auto * st = pc.alloc(q, 2*MiB, 0, nullptr, std::vector<uint8_t>(17, 7));
     CHECK(st != nullptr && pc.staging_pending);
-    st->data.spec.assign(17, 7);
     pc.update();
     CHECK(!pc.staging_pending && pc.disk.n_match() == 2);
     CHECK(pc.disk.read(find_entry(pc.disk, q.tokens.get_text_tokens()), record));
@@ -851,6 +849,58 @@ static void test_disk_lookup_ram(const std::string & root) {
     server_prompt_disk_record record;
     CHECK(cache.disk.read(cache.disk.entries.begin(), record));
     CHECK(same(record, data));
+}
+
+static void test_owned_spec_state(const std::string & root) {
+    const size_t payload = 8 * MiB;
+    for (const bool fit : {false, true}) {
+        for (const uint64_t gib : {16, 32, 64, 128}) {
+            server_prompt_cache pc(16, 1024);
+            pc.fit_ram = fit;
+            pc.available_ram = [gib]() { return gib * GiB; };
+            pc.disk = make_tier(root + "/owned-spec-" + std::to_string(fit) + "-" + std::to_string(gib), "k", 0);
+            server_prompt p;
+            p.tokens = server_tokens(llama_tokens{31, 32}, false);
+            std::vector<uint8_t> spec(payload, 91);
+            const uint8_t * storage = spec.data();
+            allocation_probe::bytes = payload;
+            allocation_probe::hits = 0;
+            allocation_probe::active = true;
+            auto * entry = pc.alloc(p, MiB, 0, nullptr, std::move(spec));
+            allocation_probe::active = false;
+            CHECK(allocation_probe::hits == 0);
+            CHECK(entry != nullptr);
+            if (!entry) {
+                continue;
+            }
+            CHECK(entry->data.spec.data() == storage && entry->data.spec.size() == payload);
+            CHECK(std::all_of(entry->data.spec.begin(), entry->data.spec.end(), [](uint8_t b) { return b == 91; }));
+            pc.flush_to_disk();
+            CHECK(pc.disk.n_match() == 1);
+            if (pc.disk.entries.empty()) {
+                continue;
+            }
+            server_prompt_disk_record rec;
+            CHECK(pc.disk.read(pc.disk.entries.begin(), rec));
+            CHECK(rec.tokens == p.tokens.get_text_tokens() && rec.spec == entry->data.spec);
+        }
+    }
+
+    // Moving a short vector still transfers its full backing storage.
+    server_prompt_cache pc(16, 1024);
+    pc.fit_ram = true;
+    pc.available_ram = []() { return 16 * GiB; };
+    server_prompt p;
+    p.tokens = server_tokens(llama_tokens{31, 32}, false);
+    std::vector<uint8_t> spec(1, 91);
+    spec.reserve(17 * MiB);
+    CHECK(pc.alloc(p, MiB, 0, nullptr, std::move(spec)) == nullptr);
+    CHECK(pc.states.empty() && !pc.staging_pending);
+    spec = std::vector<uint8_t>(1, 91);
+    spec.reserve(7 * MiB);
+    auto * entry = pc.alloc(p, 8 * MiB, 0, nullptr, std::move(spec));
+    CHECK(entry && entry->data.spec.size() == 1 && entry->data.spec[0] == 91);
+    CHECK(pc.size() >= 15 * MiB && pc.size() <= pc.limit_size);
 }
 
 static void test_fit_ram(const std::string & root) {
@@ -1013,6 +1063,7 @@ int main() {
     test_ram_ckpt_keep();
     test_mtmd_text_only_spills(root);
     test_lora_scales(root);
+    test_owned_spec_state(root);
     test_fit_ram(root);
     test_disk_lookup_ram(root);
 

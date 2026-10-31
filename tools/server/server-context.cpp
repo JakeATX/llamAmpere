@@ -812,12 +812,10 @@ struct server_slot {
 
         const int64_t t_start = ggml_time_us();
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, hand_over_ckpts ? &prompt.checkpoints : nullptr, spec_state.size());
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, hand_over_ckpts ? &prompt.checkpoints : nullptr, std::move(spec_state));
         if (cur == nullptr) {
             return nullptr;
         }
-
-        cur->data.spec = std::move(spec_state);
 
         const int64_t t_alloc = ggml_time_us();
 
