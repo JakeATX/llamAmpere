@@ -28,7 +28,7 @@
 #endif
 
 void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, int ngram_max,
-                              std::vector<llama_token> & inp, int nnew, bool print_progress) {
+                              std::vector<llama_token> & inp, int nnew, bool print_progress, size_t n_max) {
     const int64_t t_start_ms = ggml_time_ms();
     const int64_t inp_size = inp.size();
 
@@ -44,6 +44,9 @@ void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, 
 
             common_ngram_cache::iterator part_it = ngram_cache.find(ngram);
             if (part_it == ngram_cache.end()) {
+                if (n_max > 0 && ngram_cache.size() >= n_max) {
+                    continue;
+                }
                 common_ngram_cache_part part;
                 part.emplace(token, 1);
                 ngram_cache.emplace(ngram, part);
@@ -869,13 +872,16 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename) {
     return ngram_cache;
 }
 
-void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add) {
-    for (std::pair<common_ngram, common_ngram_cache_part> ngram_part : ngram_cache_add) {
-        const common_ngram      ngram = ngram_part.first;
-        common_ngram_cache_part  part = ngram_part.second;
+void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add, size_t n_max) {
+    for (const auto & ngram_part : ngram_cache_add) {
+        const common_ngram & ngram = ngram_part.first;
+        const common_ngram_cache_part & part = ngram_part.second;
 
         common_ngram_cache::iterator part_merged_it = ngram_cache_target.find(ngram);
         if (part_merged_it == ngram_cache_target.end()) {
+            if (n_max > 0 && ngram_cache_target.size() >= n_max) {
+                continue;
+            }
             ngram_cache_target.emplace(ngram, part);
             continue;
         }

@@ -417,7 +417,7 @@ struct common_params_speculative_ngram_cache {
 
     bool    save_dynamic          = false;   // write the dynamic cache back to lookup_cache_dynamic (checkpoints and shutdown)
     int32_t save_dynamic_interval = 300;     // seconds between checkpoints of the dynamic cache (0 = only at shutdown)
-    int32_t max_ngrams_dynamic    = 1000000; // n-grams kept in the dynamic cache when saving, lowest utility evicted (0 = unlimited)
+    int32_t max_ngrams_dynamic    = 1000000; // live dynamic n-gram key limit; saves also prune by utility (0 = unlimited)
 
     // identity of the target vocab, stored in saved cache files and checked at load (0 = unknown, no check)
     uint32_t vocab_n_tokens = 0;

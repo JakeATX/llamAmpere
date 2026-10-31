@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "ngram-cache.h"
 #include "../src/llama-moe-arena.h"
 #include "../src/llama-b1.h"
 
@@ -15,6 +16,52 @@ static void expect(bool condition, const char * message) {
         std::fprintf(stderr, "FAIL: %s\n", message);
         failures++;
     }
+}
+
+static void test_ngram_live_limit() {
+    std::vector<llama_token> tokens;
+    for (llama_token token = 0; token < 4096; ++token) {
+        tokens.push_back(token);
+    }
+    common_ngram_cache unlimited;
+    common_ngram_cache limited;
+    common_ngram_cache explicit_unlimited;
+    common_ngram_cache_update(unlimited, 1, 4, tokens, tokens.size(), false);
+    common_ngram_cache_update(explicit_unlimited, 1, 4, tokens, tokens.size(), false, 0);
+    common_ngram_cache_update(limited, 1, 4, tokens, tokens.size(), false, 8);
+    expect(unlimited.size() > 16000, "unlimited positive control learns the complete long sequence");
+    expect(unlimited == explicit_unlimited, "zero key limit preserves the default update result");
+    expect(limited.size() == 8, "live update stops at the key limit within a long batch");
+    for (const auto & entry : limited) {
+        expect(entry.second == unlimited.at(entry.first), "retained keys keep the same learned counts");
+    }
+
+    std::vector<llama_token> repeat = {0, 1, 0, 1};
+    common_ngram zero(repeat.data(), 1);
+    common_ngram one(repeat.data() + 1, 1);
+    common_ngram_cache_update(limited, 1, 1, repeat, repeat.size(), false, 8);
+    expect(limited.size() == 8 && limited.at(zero).at(1) == 3,
+            "a full cache still learns an existing successor");
+    expect(limited.at(one).at(0) == 1, "a full cache still learns a new successor for a retained key");
+    const auto before = limited;
+    std::vector<llama_token> more = {9000, 9001, 9002};
+    common_ngram_cache_update(limited, 1, 4, more, more.size(), false, 8);
+    expect(limited == before, "full-cache rejection leaves all entries unchanged");
+
+    const auto source_before = unlimited;
+    common_ngram_cache_merge(limited, unlimited, 8);
+    expect(limited.size() == 8 && limited.at(zero).at(1) == 4,
+            "checkpoint collection merges retained counts without new keys");
+    expect(limited.at(one).at(0) == 1, "checkpoint collection preserves other retained successors");
+    common_ngram_cache collected;
+    common_ngram_cache_merge(collected, unlimited, 8);
+    expect(collected.size() == 8, "checkpoint collection also caps an initially empty cache");
+    for (const auto & entry : collected) {
+        expect(entry.second == unlimited.at(entry.first), "capped merge keeps complete source counts");
+    }
+    common_ngram_cache_merge(collected, unlimited, 0);
+    expect(collected.size() == unlimited.size(), "zero key limit keeps unlimited merge behavior");
+    expect(unlimited == source_before, "bounded and unlimited merges leave the source unchanged");
 }
 
 static void test_ram_fit() {
@@ -252,6 +299,7 @@ static void test_ram_prompt_fit() {
 }
 
 int main() {
+    test_ngram_live_limit();
     test_ram_fit();
     test_ram_prompt_fit();
     test_ram_eval_fit();

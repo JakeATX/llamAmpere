@@ -164,7 +164,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
 | `--lookup-cache-dynamic-save` | write the dynamic lookup cache back to the file given by --lookup-cache-dynamic, so lookup decoding starts warm on the next run; the file then contains n-grams of the served conversations (default: false) |
 | `--lookup-cache-dynamic-save-interval N` | seconds between checkpoints of the dynamic lookup cache, written in the background, 0 = only at shutdown (default: 300) |
-| `--lookup-cache-dynamic-max-ngrams N` | maximum number of n-grams kept in the dynamic lookup cache when it is saved, the least useful ones are evicted, 0 = unlimited (default: 1000000) |
+| `--lookup-cache-dynamic-max-ngrams N` | maximum n-gram keys learned in the live dynamic lookup cache and kept when saving; full caches still update existing keys, saves evict by utility, 0 = unlimited (default: 1000000) |
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |

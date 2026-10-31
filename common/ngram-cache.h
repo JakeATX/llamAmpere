@@ -68,11 +68,12 @@ typedef std::unordered_map<common_ngram, common_ngram_cache_part, common_ngram_h
 // inp_data:            the token sequence with which to update ngram_cache.
 // nnew:                how many new tokens have been appended to inp_data since the last call to this function.
 // print_progress:      whether to print progress to stderr.
+// n_max:               stop adding keys at this size; existing keys still learn, no pruning (0 = unlimited).
 //
 // In order to get correct results inp_data can ONLY BE APPENDED TO.
 // Changes in the middle need a complete rebuild.
 void common_ngram_cache_update(
-    common_ngram_cache & ngram_cache, int ngram_min, int ngram_max, std::vector<llama_token> & inp_data, int nnew, bool print_progress);
+    common_ngram_cache & ngram_cache, int ngram_min, int ngram_max, std::vector<llama_token> & inp_data, int nnew, bool print_progress, size_t n_max = 0);
 
 // Try to draft tokens from ngram caches.
 // inp:                the tokens generated so far.
@@ -180,4 +181,5 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename);
 // Merge two ngram caches, counts of shared (n-gram, token) pairs are summed.
 // ngram_cache_target: the ngram cache to which to add the information from ngram_cache_add.
 // ngram_cache_add:    the ngram cache to add to ngram_cache_target.
-void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add);
+// n_max:              stop adding keys at this size; existing keys still merge, no pruning (0 = unlimited).
+void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add, size_t n_max = 0);

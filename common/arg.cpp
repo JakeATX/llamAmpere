@@ -1802,7 +1802,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lookup-cache-dynamic-max-ngrams"}, "N",
-        string_format("maximum number of n-grams kept in the dynamic lookup cache when it is saved, the least useful ones are evicted, 0 = unlimited (default: %d)", params.speculative.ngram_cache.max_ngrams_dynamic),
+        string_format("maximum n-gram keys learned in the live dynamic lookup cache and kept when saving; full caches still update existing keys, saves evict by utility, 0 = unlimited (default: %d)", params.speculative.ngram_cache.max_ngrams_dynamic),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("lookup cache max ngrams must be >= 0");
