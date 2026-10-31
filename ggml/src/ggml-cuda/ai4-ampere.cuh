@@ -59,6 +59,7 @@ static __global__ void __launch_bounds__(WARPS*32, 1) ampere_mmv(
     static_assert(WARPS == 2 || WARPS == 4 || WARPS == 8, "ai4 narrow warps");
     static_assert(LAY == LAY_AIT4_U || lay_rate<LAY>() == 2 || lay_rate<LAY>() == 3, "ai4 narrow layout");
     static_assert(!PERM || lay_rate<LAY>() == 2, "whole-row rate-2 decode");
+    static_assert(!lay_pair<LAY>(), "pair-table layout: no table fill in the narrow kernel");
     static_assert(!XPERM || (PERM && !ID), "permuted dense activation scratch");
     const int K = KT > 0 ? KT : Kr;
     constexpr int NTI = BN/8;

@@ -696,6 +696,7 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
 static int ai4_lay_of(ggml_type t) {
     switch (t) {
         case GGML_TYPE_AIT2_U: return ai4k::LAY_AIT2_U;
+        case GGML_TYPE_AIT2P_U: return ai4k::LAY_AIT2P_U;
         case GGML_TYPE_AIT3_U: return ai4k::LAY_AIT3_U;
         case GGML_TYPE_AIT4_U: return ai4k::LAY_AIT4_U;
         case GGML_TYPE_AIT5_U: return ai4k::LAY_AIT5_U;
@@ -742,6 +743,24 @@ static void ai23_split_width(const uint8_t * W, const int8_t * q, const float * 
     else { ai23_split_tile<64, LAY, XSH>(W, q, s, partial, M, N, K, splits, tile, stream); }
 }
 
+// AIT2P_U dense: mmvr (N <= 8) or the default GEMM; the other rate-2 variants decode the trellis only.
+template <int XSH>
+static void ai2p_mm_kernels(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K, cudaStream_t stream) {
+    constexpr int L = ai4k::LAY_AIT2P_U;
+    if (N <= 8) {
+        const ai4k::idmap idm{};
+        if (ai4_mmvr_kt()) {
+            if (ai4_mmvr_go<L, XSH, false,  640>(W, q, s, Y, M, N, K, stream, idm, 1)) return;
+            if (ai4_mmvr_go<L, XSH, false, 2560>(W, q, s, Y, M, N, K, stream, idm, 1)) return;
+        }
+        ai4_mmvr_go<L, XSH, false, 0>(W, q, s, Y, M, N, K, stream, idm, 1);
+    } else if (N >= ai4_bn128_min()) {
+        ai23_launch_gemm<128, 3, 4, L, XSH>(W, q, s, Y, M, M, N, K, stream);
+    } else {
+        ai23_launch_gemm<64, 3, 4, L, XSH>(W, q, s, Y, M, M, N, K, stream);
+    }
+}
+
 // W4A8 fast path: rotate+quantize the activations, then the AI+ decode-to-IMMA kernels
 static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const uint8_t * W, const float * X, float * Y,
                             int M, int N, int K) {
@@ -749,6 +768,12 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     const int xsh = K % 256 == 0 ? 1 : 0;
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) N*K);
     ggml_cuda_pool_alloc<float>  s(ctx.pool(), (size_t) N*(K >> (7 + xsh)));
+    if (t == GGML_TYPE_AIT2P_U) {
+        ai4_quantize_x(X, N, K, xsh, q.get(), s.get(), stream);
+        if (xsh) { ai2p_mm_kernels<1>(W, q.get(), s.get(), Y, M, N, K, stream); }
+        else     { ai2p_mm_kernels<0>(W, q.get(), s.get(), Y, M, N, K, stream); }
+        return;
+    }
     const ai23_dense_policy policy = ai23_dense_config(M, N, K, ai4_ampere_sms(ctx), ggml_ai4_rate(t));
     const int tile = policy.tile;
     const bool swap8 = (ggml_ai4_rate(t) == 2 || ggml_ai4_rate(t) == 3) && N > 8 && N <= 64 && (tile == 22 || tile == 23 || tile == 25 || tile == 27);
@@ -836,10 +861,7 @@ static bool ai4_ref_only_type(ggml_type t) {
     if (t == GGML_TYPE_AIT5_U) {
         return v;
     }
-    if (t == GGML_TYPE_AIT2P_U) {
-        return true;   // pair-table decode only in the reconstruct reference so far
-    }
-    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) {
+    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT2P_U || t == GGML_TYPE_AIT3_U) {
         return !ai4_ai23_fast();
     }
     return false;
@@ -851,7 +873,7 @@ static bool ai4_ref_only_type(ggml_type t) {
 // Default (unset or 1) keeps the reference path for MUL_MAT_ID; dense MUL_MAT keeps ai4_ref_only_type.
 static bool ai4_id_ref_only_type(ggml_type t) {
     static const bool id_ref = ai4_env_int("GGML_CUDA_AI23_ID_REF", nullptr, 1) != 0;
-    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) {
+    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT2P_U || t == GGML_TYPE_AIT3_U) {
         return id_ref && ai4_ref_only_type(t);
     }
     return ai4_ref_only_type(t);
@@ -1316,6 +1338,7 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
             else     { ai4_mm_id_kernels<L, 0>(W, q.get(), s.get(), Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
             break;
         AI4_MMID_U(ai4k::LAY_AIT2_U)
+        AI4_MMID_U(ai4k::LAY_AIT2P_U)
         AI4_MMID_U(ai4k::LAY_AIT3_U)
         AI4_MMID_U(ai4k::LAY_AIT4_U)
         AI4_MMID_U(ai4k::LAY_AIT5_U)
@@ -1753,7 +1776,7 @@ bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor *
         return false;
     }
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
-    if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT3_U && w->type != GGML_TYPE_IQ4_NL) ||
+    if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT2P_U && w->type != GGML_TYPE_AIT3_U && w->type != GGML_TYPE_IQ4_NL) ||
             (w->type == GGML_TYPE_IQ4_NL ? cw->type != GGML_TYPE_IQ4_NL : !ggml_cuda_ai4_supported(bank)) ||
             w->ne[3] != 1 || !ggml_is_contiguous(w) ||
             x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] <= 0 || x->ne[0] > 65536 || x->ne[0] % 128 ||
@@ -2055,6 +2078,16 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         MOE_MIXED_WARPS(GGML_TYPE_Q2_0, ai4k::LAY_AIT2_U, 0, 640);
     } else if (w->type == GGML_TYPE_AIT2_U) {
         MOE_MIXED_SHAPE(ai4k::LAY_AIT2_U);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2P_U && cw->type == GGML_TYPE_IQ2_XXS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_XXS, ai4k::LAY_AIT2P_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2P_U && cw->type == GGML_TYPE_IQ2_XS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_XS, ai4k::LAY_AIT2P_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2P_U && cw->type == GGML_TYPE_IQ2_S) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_S, ai4k::LAY_AIT2P_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 640 && M == 2560 && w->type == GGML_TYPE_AIT2P_U && cw->type == GGML_TYPE_Q2_0) {
+        MOE_MIXED_WARPS(GGML_TYPE_Q2_0, ai4k::LAY_AIT2P_U, 0, 640);
+    } else if (w->type == GGML_TYPE_AIT2P_U) {
+        MOE_MIXED_SHAPE(ai4k::LAY_AIT2P_U);
     } else {
         MOE_MIXED_SHAPE(ai4k::LAY_AIT3_U);
     }

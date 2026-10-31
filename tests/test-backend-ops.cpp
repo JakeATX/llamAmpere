@@ -19335,6 +19335,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_IQ2_XS, 4, 2, 4, true));
+    // AIT2P_U bank on the production expert shapes and base types (specialized and generic mixed launches).
+    for (int width : { 1, 4, 5, 8 }) {
+        for (int mode : { 0, 1, 2 }) {
+            for (ggml_type base : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+                test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2P_U, base, width, mode, 1, false, true, 2560, 640));
+            }
+            test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2P_U, GGML_TYPE_Q2_0, width, mode, 4, false, true, 640, 2560));
+            test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2P_U, GGML_TYPE_Q4_0, width, mode, 4));
+        }
+        test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT2P_U, width));
+        test_cases.emplace_back(new test_moe_bank_mixed_reduce(GGML_TYPE_AIT2P_U, width));
+        for (int channels : { 1, 4 }) {
+            test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT2P_U, width, GGML_TYPE_IQ4_NL, 2, channels, 2560, 640, true, false));
+        }
+    }
     test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_F32, 4, 2, 4));
     for (int width : { 1, 4, 8 }) {
         for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
