@@ -90,6 +90,18 @@ size_t common_fit_vram_floor(bool display_attached) {
     return (display_attached ? 800u : 300u) * size_t(1024 * 1024);
 }
 
+uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit) {
+    if (!fit) {
+        return UINT64_MAX;
+    }
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests = {};
+    // Other optional caches can still grow into their shares after this read.
+    for (auto & request : requests) {
+        request.bytes = UINT64_MAX;
+    }
+    return common_fit_ram_plan(available, requests).bytes[COMMON_FIT_RAM_EVAL];
+}
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {

@@ -37,6 +37,8 @@ common_fit_ram_result common_fit_ram_plan(uint64_t available,
 
 size_t common_fit_vram_floor(bool display_attached);
 
+uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit);
+
 // Resolve the server prompt cache only after model, contexts and draft have loaded.
 // Positive/zero limits and the explicit half-free setting keep their meaning.
 int32_t common_fit_prompt_cache_ram_mib(uint64_t total, uint64_t available,

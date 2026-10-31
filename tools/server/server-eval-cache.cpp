@@ -67,7 +67,7 @@ struct evc_reader {
     template <typename T> bool val(T & v) { return bytes(&v, sizeof(T)); }
     bool blob(std::vector<uint8_t> & v) {
         uint64_t n = 0;
-        if (!val(n) || n > remaining || n > EVC_MAX_BLOB) {
+        if (!val(n) || n > remaining || n > EVC_MAX_BLOB || n > SIZE_MAX) {
             ok = false;
             return false;
         }
@@ -121,7 +121,7 @@ int server_eval_cache::find(const llama_tokens & tokens, size_t n_min) const {
 
 // parse the header up to the token list; `full` also reads checkpoints + speculative state and verifies the checksum
 static bool evc_parse(const std::string & file, uint64_t key_hash, const std::string & key, bool full,
-        server_eval_cache_record & out, std::string & err) {
+        server_eval_cache_record & out, std::string & err, uint64_t ram_bytes = UINT64_MAX) {
     evc_reader r;
     r.f.open(file, std::ios::binary);
     if (!r.f) {
@@ -134,6 +134,14 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
         err = "cannot stat " + file;
         return false;
     }
+    // File bytes cover all blob payloads. Charge list nodes and allocator slack separately.
+    const uint64_t fixed_bytes = sizeof(server_eval_cache_record) + sizeof(evc_reader) + 65536;
+    const uint64_t file_bytes = r.remaining;
+    if (fixed_bytes > ram_bytes || file_bytes > ram_bytes - fixed_bytes) {
+        err = "eval cache record exceeds the RAM fit budget; using fresh prefill";
+        return false;
+    }
+    const uint64_t extra_bytes = ram_bytes - fixed_bytes - file_bytes;
 
     char     magic[4];
     uint32_t version = 0;
@@ -147,7 +155,7 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
         err = file + string_format(" has format version %u, this server reads version %d", version, EVAL_CACHE_FORMAT_VERSION);
         return false;
     }
-    if (!r.val(khash) || !r.val(klen) || klen > EVC_MAX_KEY_LEN) {
+    if (!r.val(khash) || !r.val(klen) || klen > EVC_MAX_KEY_LEN || klen > r.remaining) {
         err = file + " has a truncated header";
         return false;
     }
@@ -162,7 +170,8 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
     }
 
     uint64_t n_tokens = 0;
-    if (!r.val(n_tokens) || n_tokens > EVC_MAX_N_TOKENS || n_tokens == 0) {
+    if (!r.val(n_tokens) || n_tokens > EVC_MAX_N_TOKENS || n_tokens == 0 ||
+            n_tokens > SIZE_MAX / sizeof(llama_token) || n_tokens > r.remaining / sizeof(llama_token)) {
         err = file + " has a bad token count";
         return false;
     }
@@ -179,6 +188,11 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
     uint32_t n_ckpt = 0;
     if (!r.val(n_ckpt) || n_ckpt > EVC_MAX_N_CKPT) {
         err = file + " is truncated";
+        return false;
+    }
+    const uint64_t checkpoint_bytes = sizeof(common_prompt_checkpoint) + 2 * sizeof(void *) + 3 * 64;
+    if (n_ckpt > extra_bytes / checkpoint_bytes) {
+        err = "eval cache checkpoints exceed the RAM fit budget; using fresh prefill";
         return false;
     }
     out.checkpoints.clear();
@@ -213,8 +227,14 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
     return true;
 }
 
-bool server_eval_cache::read_header(const std::string & id, server_eval_cache_record & out, std::string & err) const {
-    return evc_parse(path_hdr(id), key_hash, key, true, out, err);
+bool server_eval_cache::read_header(const std::string & id, server_eval_cache_record & out, std::string & err,
+        uint64_t ram_bytes) const {
+    out = {};
+    if (!evc_parse(path_hdr(id), key_hash, key, true, out, err, ram_bytes)) {
+        out = {};
+        return false;
+    }
+    return true;
 }
 
 bool server_eval_cache::write_index(std::string & err) const {

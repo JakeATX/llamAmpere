@@ -171,6 +171,24 @@ static void test_ram_fit() {
     expect(common_fit_vram_floor(true) == 800 * MiB, "display VRAM floor is 800 MiB");
 }
 
+static void test_ram_eval_fit() {
+    constexpr uint64_t GiB = 1ull << 30;
+    constexpr uint64_t MiB = 1ull << 20;
+    for (uint64_t host_gib : {16, 32, 64, 128}) {
+        const uint64_t available = (host_gib - 6) * GiB;
+        const uint64_t budget_mib = ((available - 5 * GiB) / MiB) * 4 / 5;
+        const uint64_t actual = common_fit_eval_cache_ram_bytes(available, true);
+        expect(actual == budget_mib * 5 / 100 * MiB, "eval read keeps its share without borrowing future cache growth");
+        expect(actual <= available - 5 * GiB, "eval read preserves the RAM floor");
+    }
+    for (uint64_t available : {uint64_t(0), 4 * GiB, 5 * GiB, 5 * GiB + MiB - 1}) {
+        expect(common_fit_eval_cache_ram_bytes(available, true) == 0, "low or unknown RAM disables eval record reads");
+        expect(common_fit_eval_cache_ram_bytes(available, false) == UINT64_MAX, "fit off keeps prior eval read limits");
+    }
+    expect(common_fit_eval_cache_ram_bytes(UINT64_MAX, true) < UINT64_MAX / 20,
+            "extreme available RAM cannot overflow eval quota");
+}
+
 static void test_ram_prompt_fit() {
     constexpr uint64_t GiB = 1ull << 30;
     std::string why;
@@ -214,6 +232,7 @@ static void test_ram_prompt_fit() {
 int main() {
     test_ram_fit();
     test_ram_prompt_fit();
+    test_ram_eval_fit();
     constexpr size_t MiB = 1024*1024;
 
     // Qwen3.5 27B MTP draft with f16 KV, 4 sequences, unified KV: one nextn layer of 4 KV heads x 256 dims,

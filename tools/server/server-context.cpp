@@ -2961,7 +2961,12 @@ private:
 
         server_eval_cache_record rec;
         std::string err;
-        if (!eval_cache->read_header(e.id, rec, err)) {
+        uint64_t total_ram = 0, available_ram = 0;
+        if (params_base.fit_params) {
+            common_host_memory(total_ram, available_ram);
+        }
+        const uint64_t record_budget = common_fit_eval_cache_ram_bytes(available_ram, params_base.fit_params);
+        if (!eval_cache->read_header(e.id, rec, err, record_budget)) {
             SRV_WRN("slot %d: eval cache: entry %s unusable: %s\n", slot.id, e.id.c_str(), err.c_str());
             return;
         }

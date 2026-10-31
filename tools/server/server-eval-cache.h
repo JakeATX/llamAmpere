@@ -74,7 +74,8 @@ struct server_eval_cache {
     std::string path_dft(const std::string & id) const;
 
     // read an entry header (tokens, checkpoints, speculative state); verifies key and checksum
-    bool read_header(const std::string & id, server_eval_cache_record & out, std::string & err) const;
+    bool read_header(const std::string & id, server_eval_cache_record & out, std::string & err,
+                     uint64_t ram_bytes = UINT64_MAX) const;
 
     // write the header of a new entry, then add it to the index (the state files must already be in place)
     bool add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,

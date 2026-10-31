@@ -6,6 +6,7 @@
 #include "server-eval-cache.h"
 
 #include "common.h"
+#include "fit.h"
 #include "log.h"
 
 #include <cstdio>
@@ -168,6 +169,42 @@ static void test_open_and_roundtrip(const std::string & root) {
     }
 }
 
+static void test_record_ram_budget(const std::string & root) {
+    server_eval_cache ec;
+    std::string err, id;
+    CHECK(ec.open(root + "/ram", KEY_A, true, err));
+    std::list<common_prompt_checkpoint> checkpoints(128);
+    CHECK(add_entry(ec, seq(1, 100), checkpoints, {1, 2, 3}, false, id));
+    const uint64_t file_bytes = fs::file_size(ec.path_hdr(id));
+    server_eval_cache_record rec;
+    CHECK(ec.read_header(id, rec, err));
+    CHECK(rec.checkpoints.size() == 128);
+    CHECK(!ec.read_header(id, rec, err, 0));
+    CHECK(err.find("RAM fit budget") != std::string::npos);
+    CHECK(rec.tokens.empty() && rec.checkpoints.empty() && rec.spec.empty());
+    CHECK(!ec.read_header(id, rec, err, file_bytes - 1));
+    CHECK(!ec.read_header(id, rec, err, file_bytes + 65536 + 4096));
+    CHECK(err.find("checkpoints exceed") != std::string::npos);
+    CHECK(rec.tokens.empty() && rec.checkpoints.empty() && rec.spec.empty());
+    CHECK(ec.read_header(id, rec, err, file_bytes + 1024 * 1024));
+    CHECK(rec.tokens == seq(1, 100) && rec.checkpoints.size() == 128);
+    CHECK(rec.spec == std::vector<uint8_t>({1, 2, 3}));
+    for (uint64_t host_gib : {16, 32, 64, 128}) {
+        const uint64_t budget = common_fit_eval_cache_ram_bytes((host_gib - 6) << 30, true);
+        CHECK(ec.read_header(id, rec, err, budget));
+    }
+    CHECK(!ec.read_header(id, rec, err, common_fit_eval_cache_ram_bytes(5ull << 30, true)));
+    CHECK(ec.read_header(id, rec, err, common_fit_eval_cache_ram_bytes(0, false)));
+
+    // A sparse header must be rejected before token or checkpoint allocation.
+    fs::resize_file(ec.path_hdr(id), 1ull << 36);
+    CHECK(!ec.read_header(id, rec, err, 1024 * 1024));
+    CHECK(err.find("RAM fit budget") != std::string::npos);
+    CHECK(rec.tokens.empty() && rec.checkpoints.empty() && rec.spec.empty());
+    fs::resize_file(ec.path_hdr(id), file_bytes);
+    CHECK(ec.read_header(id, rec, err));
+}
+
 static void test_corruption(const std::string & root) {
     const std::string dir = root + "/b";
     std::string err;
@@ -270,6 +307,7 @@ int main() {
 
     test_open_and_roundtrip(root);
     test_corruption(root);
+    test_record_ram_budget(root);
     test_index_version(root);
 
     std::error_code ec;
