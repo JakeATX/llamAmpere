@@ -22,11 +22,13 @@
 namespace allocation_probe {
 static thread_local bool active = false;
 static thread_local size_t largest = 0;
+static thread_local size_t total = 0;
 }
 
 void * operator new(size_t n) {
     if (allocation_probe::active) {
         allocation_probe::largest = std::max(allocation_probe::largest, n);
+        allocation_probe::total += n;
     }
     if (void * p = std::malloc(n ? n : 1)) {
         return p;
@@ -214,22 +216,23 @@ static void test_ngram_checkpoint_load_quotas() {
     expect(common_ngram_cache_save_file(live, params.lookup_cache_dynamic, vocab, err), "seed exact-quota checkpoint");
     const llama_token token = llama_token(max_entries);
     const common_ngram hot(&token, 1);
-    common_ngram_cache delta = {{hot, {{1, 10}}}};
+    const common_ngram retained = live.begin()->first;
+    common_ngram_cache delta = {{hot, {{1, 10}}}, {retained, {{1, 2}}}};
     common_ngram_cache_merge(live, delta);
     bool from_disk = false;
     expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 1000000, vocab, err, &from_disk,
             max_entries, params.load_max_continuations_dynamic) && from_disk && delta.empty() &&
-            live.size() == max_entries && live.count(hot) && live.at(hot).at(1) == 10,
-            "first checkpoint keeps high-utility learning within automatic load quota");
+            live.size() == max_entries && !live.count(hot) && live.at(retained).at(1) == 3,
+            "first checkpoint bounds new nodes but retains count learning at the automatic load quota");
     common_ngram_cache loaded;
     expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
             max_entries, params.load_max_continuations_dynamic) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == live,
             "first checkpoint is reloadable under the same RAM plan");
-    delta = {{hot, {{1, 1}}}};
+    delta = {{retained, {{1, 1}}}};
     common_ngram_cache_merge(live, delta);
     expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 1000000, vocab, err, &from_disk,
             max_entries, params.load_max_continuations_dynamic) && from_disk && delta.empty() &&
-            live.count(hot) && live.at(hot).at(1) == 11,
+            live.at(retained).at(1) == 4,
             "second checkpoint still saves new learning instead of failing LOAD_LIMIT");
     expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
             max_entries, params.load_max_continuations_dynamic) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == live,
@@ -240,7 +243,7 @@ static void test_ngram_checkpoint_load_quotas() {
     common_ngram_cache_merge(live, delta);
     expect(common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err),
             "explicit unlimited checkpoint preserves prior behavior");
-    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err, max_entries, max_entries) ==
+    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err, UINT64_MAX, max_entries) ==
             COMMON_NGRAM_CACHE_LOAD_LIMIT, "unlimited output is a positive control for continuation overflow");
     fs::remove(params.lookup_cache_dynamic);
     const llama_token other_token = 0;
@@ -280,6 +283,68 @@ static void test_ngram_checkpoint_load_quotas() {
         expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
                 limits.first, limits.second) == COMMON_NGRAM_CACHE_LOAD_OK && loaded.empty(), "each independent zero-quota output reloads");
     }
+    fs::remove_all(dir);
+}
+
+static void test_ngram_checkpoint_merge_allocations() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("test-ngram-merge-fit-" + std::to_string(ggml_time_us()));
+    const bool created = fs::create_directory(dir);
+    expect(created, "create private checkpoint allocation test directory");
+    if (!created) {
+        return;
+    }
+    const std::string path = (dir / "dynamic").string();
+    const common_ngram_cache_vocab_id vocab = {100000, 123};
+    const llama_token token = 0;
+    const common_ngram key(&token, 1);
+    const common_ngram_cache seed = {{key, {{1, 10}}}};
+    common_ngram_cache source;
+    for (llama_token t = 0; t < 64; ++t) {
+        auto & part = source[common_ngram(&t, 1)];
+        for (llama_token next = 1000; next < 1256; ++next) {
+            part.emplace(next, 1);
+        }
+    }
+    source[key].emplace(1, 3);
+    std::string err;
+    size_t bounded_max_bytes = 0;
+    for (int mode = 0; mode < 3; ++mode) {
+        fs::remove(path);
+        if (mode == 0) {
+            expect(common_ngram_cache_save_file(seed, path, vocab, err), "seed full checkpoint allocation control");
+        } else if (mode == 2) {
+            std::ofstream corrupt(path, std::ios::binary);
+            corrupt << "bad";
+        }
+        common_ngram_cache live = source;
+        common_ngram_cache delta = source;
+        bool from_disk = false;
+        allocation_probe::total = 0;
+        allocation_probe::active = true;
+        const bool ok = common_ngram_cache_sync_file(path, live, delta, 0, vocab, err, &from_disk, 1, 1);
+        allocation_probe::active = false;
+        const size_t allocated = allocation_probe::total;
+        bounded_max_bytes = std::max(bounded_max_bytes, allocated);
+        expect(ok && delta.empty() && live.size() == 1 && live.begin()->second.size() == 1 && from_disk == (mode == 0),
+                "loaded, missing and corrupt checkpoints bound merge nodes before publication");
+        expect(allocated < 128 * 1024, "bounded checkpoint allocates less than 128 KiB despite 16385 proposed pairs");
+        if (mode == 0) {
+            expect(live == common_ngram_cache({{key, {{1, 13}}}}), "full saved quota still learns retained counts exactly once");
+        }
+        common_ngram_cache reloaded;
+        expect(common_ngram_cache_load_file(path, reloaded, vocab, err, 1, 1) == COMMON_NGRAM_CACHE_LOAD_OK && reloaded == live,
+                "bounded merge output reloads under the same quotas");
+    }
+    fs::remove(path);
+    common_ngram_cache live = source;
+    common_ngram_cache delta = source;
+    allocation_probe::total = 0;
+    allocation_probe::active = true;
+    const bool ok = common_ngram_cache_sync_file(path, live, delta, 0, vocab, err);
+    allocation_probe::active = false;
+    expect(ok && delta.empty() && live == source && allocation_probe::total > 2 * bounded_max_bytes,
+            "unlimited positive control retains all pairs and shows the old full-copy allocation cost");
     fs::remove_all(dir);
 }
 
@@ -867,6 +932,7 @@ static void test_ram_prompt_fit() {
 int main() {
     test_ngram_ram_load_fit();
     test_ngram_checkpoint_load_quotas();
+    test_ngram_checkpoint_merge_allocations();
     test_ngram_live_successor_budget();
     test_ngram_stream_save();
     test_ngram_load_limits();

@@ -906,7 +906,10 @@ bool common_ngram_cache_sync_file(
         }
     }
 
-    if (loaded) {
+    if (max_entries != UINT64_MAX || max_continuations != UINT64_MAX) {
+        common_ngram_cache_limits limits(merged, max_entries, max_continuations);
+        common_ngram_cache_merge(merged, loaded ? ngram_cache_delta : ngram_cache, 0, &limits);
+    } else if (loaded) {
         common_ngram_cache_merge(merged, ngram_cache_delta);
     } else {
         merged = ngram_cache;

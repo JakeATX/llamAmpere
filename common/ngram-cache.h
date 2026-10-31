@@ -173,6 +173,7 @@ void common_ngram_cache_prune(common_ngram_cache & ngram_cache, size_t n_max);
 // prunes to n_max, writes the result atomically and, on success, replaces ngram_cache with the merged
 // result and clears ngram_cache_delta. The result also fits the load quotas; whole n-grams are
 // dropped in map order if their continuations exceed the remaining continuation quota.
+// Finite load quotas also bound merge allocations; existing file pairs keep priority over new pairs.
 // If the file is missing or corrupt, ngram_cache (which must already contain the delta) is written instead.
 // A file that exceeds the load quotas, belongs to another vocab or uses a newer format is never overwritten: the sync fails.
 // ngram_cache and ngram_cache_delta must be distinct objects.
