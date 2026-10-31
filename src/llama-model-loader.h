@@ -130,6 +130,7 @@ struct llama_model_loader {
     llama_fver  fver;
 
     llama_mmaps mappings;
+    size_t prefetch_remaining = SIZE_MAX;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;

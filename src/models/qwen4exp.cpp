@@ -2487,7 +2487,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         // [PLEPF] the context already reads this call's pages ahead: wait for this ubatch's instead
         const bool covered = pf && pf->consume((uint32_t) n_tokens, idx.data(), idx.size());
         if (prefetch && !covered) {
-            llama_prefetch_rows(ple, idx.data(), idx.size());
+            llama_prefetch_rows(ple, idx.data(), idx.size(), model.params.fit_ram ? &model.prefetch_remaining : nullptr);
         }
     }
 

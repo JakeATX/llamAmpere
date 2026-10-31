@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -97,6 +98,6 @@ struct llama_memory_range {
 using llama_memory_ranges = std::vector<llama_memory_range>;
 
 // Prefetch the host pages covering these memory ranges.
-void llama_prefetch(llama_memory_ranges mr);
+void llama_prefetch(llama_memory_ranges mr, std::atomic<size_t> * remaining = nullptr, uint64_t available = 0);
 
 size_t llama_path_max();

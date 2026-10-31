@@ -906,7 +906,7 @@ const bool llama_mlock::SUPPORTED = true;
 const bool llama_mlock::SUPPORTED = false;
 #endif
 
-void llama_prefetch(llama_memory_ranges mr) {
+void llama_prefetch(llama_memory_ranges mr, std::atomic<size_t> * remaining, uint64_t available) {
 #if defined(__linux__) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
     if (mr.empty()) {
         return;
@@ -932,6 +932,14 @@ void llama_prefetch(llama_memory_ranges mr) {
     }
 
     const size_t page = (size_t) page_size;
+    if (remaining) {
+        const size_t safe = llama_mmap_prefetch_budget(available);
+        size_t current = remaining->load(std::memory_order_relaxed);
+        while (current > safe && !remaining->compare_exchange_weak(current, safe, std::memory_order_relaxed)) {}
+        if (current == SIZE_MAX) {
+            LLAMA_LOG_INFO("RAM fit: later page prefetch limited to %zu MiB to leave 5 GiB free and reserve RAM for other caches\n", safe >> 20);
+        }
+    }
     std::sort(mr.begin(), mr.end(), [](const llama_memory_range & a, const llama_memory_range & b) {
         return (uintptr_t) a.addr < (uintptr_t) b.addr;
     });
@@ -940,7 +948,7 @@ void llama_prefetch(llama_memory_ranges mr) {
 #if defined(_WIN32)
     // collect the mr and prefetch them in one call, so the reads can be issued concurrently
     std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-    auto prefetch = [&]() {
+    auto issue = [&]() {
         entries.push_back({ (PVOID) begin, (SIZE_T) (end - begin) });
         return true;
     };
@@ -957,7 +965,7 @@ void llama_prefetch(llama_memory_ranges mr) {
         return n;
     }();
     std::vector<std::pair<uintptr_t, uintptr_t>> merged;
-    auto prefetch = [&]() {
+    auto issue = [&]() {
         if (n_threads > 1) {
             merged.emplace_back(begin, end);
             return true;
@@ -969,11 +977,26 @@ void llama_prefetch(llama_memory_ranges mr) {
         return true;
     };
 #endif
+    auto prefetch = [&]() {
+        if (remaining) {
+            size_t current = remaining->load(std::memory_order_relaxed);
+            size_t bytes;
+            do {
+                bytes = std::min(end - begin, current - current % page);
+            } while (!remaining->compare_exchange_weak(current, current - bytes, std::memory_order_relaxed));
+            if (bytes == 0) { return true; }
+            end = begin + bytes;
+        }
+        return issue();
+    };
     for (const auto & range : mr) {
         if (!range.addr || range.size == 0) {
             continue;
         }
         const uintptr_t pointer = (uintptr_t) range.addr;
+        if (range.size > UINTPTR_MAX - pointer || pointer + range.size > UINTPTR_MAX - (page - 1)) {
+            continue; // Invalid advice must not wrap to unrelated memory.
+        }
         const uintptr_t first = pointer / page * page;
         const uintptr_t last = (pointer + range.size + page - 1) / page * page;
         if (end && first > end) {
@@ -1025,6 +1048,8 @@ void llama_prefetch(llama_memory_ranges mr) {
 #endif
 #else
     GGML_UNUSED(mr);
+    GGML_UNUSED(remaining);
+    GGML_UNUSED(available);
 #endif
 }
 

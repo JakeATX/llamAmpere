@@ -2,7 +2,10 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
+#include <mutex>
+#include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -15,6 +18,7 @@ struct advice_call {
 static int mapped_flags;
 static int failures = 0;
 static std::vector<advice_call> advice;
+static std::mutex advice_mutex;
 
 extern "C" void * __real_mmap(void *, size_t, int, int, int, off_t);
 extern "C" void * __wrap_mmap(void * addr, size_t size, int prot, int flags, int fd, off_t offset) {
@@ -23,6 +27,13 @@ extern "C" void * __wrap_mmap(void * addr, size_t size, int prot, int flags, int
 }
 
 extern "C" int __wrap_posix_madvise(void * addr, size_t size, int kind) {
+    std::lock_guard<std::mutex> lock(advice_mutex);
+    advice.push_back({addr, size, kind});
+    return 0;
+}
+
+extern "C" int __wrap_madvise(void * addr, size_t size, int kind) {
+    std::lock_guard<std::mutex> lock(advice_mutex);
     advice.push_back({addr, size, kind});
     return 0;
 }
@@ -35,6 +46,7 @@ static void expect(bool ok, const char * message) {
 }
 
 int main() {
+    setenv("LLAMA_PREFETCH_THREADS", "4", 1);
     constexpr uint64_t GiB = 1ull << 30;
     constexpr size_t MiB = 1u << 20;
     for (uint64_t host : {16, 32, 64, 128}) {
@@ -121,8 +133,70 @@ int main() {
             expect(shard == 0 ? advised == bytes.size() : advised == 0, "next shard cannot reuse first shard's page-rounded quota");
         }
         expect(state.calls == 2 && state.mapped && state.remaining == 0, "policy runs after each actual mmap and shares one budget");
+        advice.clear();
+        llama_mmap mapping(&file, 0);
+        std::atomic<size_t> later{state.remaining};
+        llama_prefetch({{mapping.addr(), bytes.size()}}, &later, 128 * GiB);
+        expect(advice.empty() && later == 0, "model handoff cannot reuse quota already spent during mapping");
+    }
+    {
+        llama_file file(temporary);
+        llama_mmap mapping(&file, 0);
+        auto * base = static_cast<char *>(mapping.addr());
+        auto total = [&]() {
+            size_t bytes = 0;
+            for (const auto & call : advice) {
+                if (call.kind == MADV_WILLNEED) {
+                    const uintptr_t start = uintptr_t(call.addr);
+                    expect(start >= uintptr_t(base) && start <= uintptr_t(base) + mapping.size(), "later advice belongs to this mapping");
+                    expect(call.size <= uintptr_t(base) + mapping.size() - start, "later advice does not cross the mapping");
+                    expect(start % page == 0 && call.size % page == 0, "later advice accounts for whole pages");
+                    bytes += call.size;
+                }
+            }
+            return bytes;
+        };
+        advice.clear();
+        std::atomic<size_t> quota{3 * page};
+        llama_prefetch({{base + 8 * page + 1, page}, {base + 1, page}, {base + page, page}}, &quota, 16 * GiB);
+        expect(total() == 3 * page && quota == 0, "sorted overlapping and sparse rows share one exact physical-page quota");
+        llama_prefetch({{base, 8 * page}}, &quota, 128 * GiB);
+        expect(total() == 3 * page && quota == 0, "later calls and higher free RAM cannot refill spent quota");
+        advice.clear();
+        quota = 2 * page;
+        llama_prefetch({{base, page}}, &quota, 16 * GiB);
+        llama_prefetch({{base + 4 * page, 4 * page}}, &quota, 16 * GiB);
+        expect(total() == 2 * page && quota == 0, "separate ubatches cannot reuse a prior call's quota");
+        for (uint64_t available : {uint64_t(0), 4 * GiB, 5 * GiB}) {
+            advice.clear();
+            quota = SIZE_MAX;
+            llama_prefetch({{base, 4 * page}}, &quota, available);
+            expect(total() == 0 && quota == 0, "unknown or low current RAM stops later advice before any syscall");
+        }
+        advice.clear();
+        llama_prefetch({{base, 4 * page}});
+        expect(total() == 4 * page, "fit-off keeps legacy unlimited advice");
+        for (uint64_t host : {16, 32, 64, 128}) {
+            advice.clear();
+            quota = SIZE_MAX;
+            const uint64_t available = (host - 6) * GiB;
+            const size_t expected = size_t(((host - 11) * 1024 * 4 / 5) / 10) * MiB;
+            llama_prefetch({{base, page}}, &quota, available);
+            expect(total() == page && quota == expected - page, "later quota uses the independent fake-host budget before its first syscall");
+        }
+        advice.clear();
+        quota = 3 * page;
+        auto read_ahead = [&]() { llama_prefetch({{base, 4 * page}}, &quota, 16 * GiB); };
+        std::thread first(read_ahead), second(read_ahead);
+        first.join();
+        second.join();
+        expect(total() == 3 * page && quota == 0, "concurrent contexts cannot double spend the model quota");
+        advice.clear();
+        llama_prefetch({{reinterpret_cast<void *>(UINTPTR_MAX - 1), 16}});
+        expect(advice.empty(), "overflowing ranges cannot issue advice to unrelated memory");
+        expect(base[0] == char(0x5a) && base[bytes.size() - 1] == char(0x5a), "capping optional read-ahead preserves all model bytes");
     }
     std::fclose(temporary);
-    std::printf("%s mmap prefetch: 28 baseline syscall cases + shared-quota callbacks + fake RAM hosts; no model or GPU\n", failures ? "FAIL" : "PASS");
+    std::printf("%s mmap prefetch: baseline syscalls + shared startup/later quotas + concurrent contexts + fake RAM hosts; no model or GPU\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

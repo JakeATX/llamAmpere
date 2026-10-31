@@ -1686,7 +1686,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool private_dense, bool fit_ram) {
-    size_t prefetch_remaining = SIZE_MAX;
+    prefetch_remaining = SIZE_MAX;
     const auto fit_prefetch = [](size_t requested, void * data) noexcept -> size_t {
         auto & remaining = *static_cast<size_t *>(data);
         size_t safe = 0;
