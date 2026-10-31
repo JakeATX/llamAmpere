@@ -1930,12 +1930,16 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             (pair->glu->src[0]->data == dst->data) != (pair->glu->src[0]->data == pair->dst->data)));
     const int xsh = K % 256 == 0 ? 1 : 0;
     const size_t rows = (size_t) x->ne[1]*x->ne[2];
+    // q8 is taken from the pool before q and s on every path: the pool frees in reverse order of allocation.
+    ggml_cuda_pool_alloc<char> q8(ctx.pool());
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool());
     ggml_cuda_pool_alloc<float> s(ctx.pool());
     GGML_ASSERT((act_ai_q == nullptr) == (act_ai_s == nullptr));
-    ggml_cuda_pool_alloc<char> q8(ctx.pool());
+    if (!act_q8) {
+        q8.alloc(rows*(GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1)*sizeof(block_q8_1));
+    }
     if (!act_ai_q && !act_q8) {
-        char * p = q8.alloc(rows*(GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1)*sizeof(block_q8_1));
+        char * p = q8.get();
         if (ggml_cuda_moe_mixed_quantize_dual(ctx, bank, x, p, cw->type, q, s)) {
             act_ai_q = q.get();
             act_ai_s = s.get();
@@ -1949,7 +1953,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     }
     if (!act_q8) {
         const int padded = GGML_PAD(K, MATRIX_ROW_PADDING);
-        char * p = q8.get() ? q8.get() : q8.alloc(rows*(padded/QK8_1)*sizeof(block_q8_1));
+        char * p = q8.get();
         quantize_row_q8_1_cuda((const float *) x->data, nullptr, p, cw->type, K,
                 x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
                 padded, x->ne[1], x->ne[2], 1, ctx.stream());
