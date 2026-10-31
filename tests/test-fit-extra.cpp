@@ -1,6 +1,7 @@
 #include "fit.h"
 #include "common.h"
 #include "ngram-cache.h"
+#include "speculative.h"
 #include "../src/llama-moe-arena.h"
 #include "../src/llama-b1.h"
 
@@ -115,7 +116,7 @@ static void test_ngram_ram_load_fit() {
     common_fit_ngram_cache_load_limits(128 * GiB, true, params);
     expect(params.max_ngrams_dynamic == 0 && params.load_max_entries_dynamic == UINT64_MAX &&
             params.load_max_continuations_dynamic == UINT64_MAX && params.load_max_entries_static > both_entries,
-            "explicit unlimited dynamic size wins and only the static file uses the automatic quota");
+            "explicit unlimited dynamic size wins while the static file and context stay automatic");
     params.max_ngrams_dynamic = 17;
     common_fit_ngram_cache_load_limits(0, true, params);
     expect(params.max_ngrams_dynamic == 17 && params.load_max_entries_dynamic == UINT64_MAX &&
@@ -188,6 +189,109 @@ static void test_ngram_ram_load_fit() {
             params.load_max_entries_dynamic, params.load_max_continuations_dynamic) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == source,
             "the same file still loads with fit off");
     fs::remove_all(dir);
+}
+
+static void test_ngram_context_fit() {
+    constexpr uint64_t GiB = 1ull << 30;
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests = {};
+    for (auto & request : requests) {
+        request.bytes = UINT64_MAX;
+    }
+    uint64_t previous = 0;
+    for (uint64_t ram : {16ull, 32ull, 64ull, 128ull}) {
+        common_params_speculative_ngram_cache params;
+        params.lookup_cache_static = "static";
+        params.lookup_cache_dynamic = "dynamic";
+        common_fit_ngram_cache_load_limits(ram * GiB, true, params, 4);
+        expect(params.max_entries_context > previous &&
+                params.max_entries_context == params.load_max_entries_static &&
+                params.max_entries_context == params.load_max_entries_dynamic &&
+                params.max_continuations_context == params.load_max_continuations_dynamic,
+                "RAM lookup share is split across both files and all four slots");
+        const uint64_t estimate = params.max_entries_context * 512 + params.max_continuations_context * 128;
+        expect(estimate * 6 <= common_fit_ram_plan(ram * GiB, requests).bytes[COMMON_FIT_RAM_NGRAM],
+                "all file and slot count estimates together stay within the ngram share");
+        previous = params.max_entries_context;
+    }
+
+    common_params_speculative_ngram_cache params;
+    common_fit_ngram_cache_load_limits(16 * GiB, true, params, 1);
+    const uint64_t single = params.max_entries_context;
+    common_fit_ngram_cache_load_limits(16 * GiB, true, params, 4);
+    expect(params.max_entries_context > 0 && params.max_entries_context < single / 3 &&
+            params.load_max_entries_dynamic == UINT64_MAX && params.load_max_entries_static == UINT64_MAX,
+            "context-only lookup fitting scales with slots without loading files");
+    params.max_ngrams_dynamic_explicit = true;
+    params.lookup_cache_dynamic = "dynamic";
+    common_fit_ngram_cache_load_limits(16 * GiB, true, params, 4);
+    expect(params.load_max_entries_dynamic == UINT64_MAX && params.max_entries_context < single / 3,
+            "explicit dynamic size does not remove automatic context admission");
+    for (uint64_t available : std::array<uint64_t, 3>{0, 4 * GiB, 5 * GiB}) {
+        common_fit_ngram_cache_load_limits(available, true, params, 4);
+        expect(params.max_entries_context == 0 && params.max_continuations_context == 0,
+                "low or unknown RAM disables new automatic context pairs");
+    }
+    common_fit_ngram_cache_load_limits(0, false, params, 4);
+    expect(params.max_entries_context == UINT64_MAX && params.max_continuations_context == UINT64_MAX,
+            "fit off resets both context quotas");
+    common_fit_ngram_cache_load_limits(UINT64_MAX, true, params, UINT32_MAX);
+    expect(params.max_entries_context < single && params.max_continuations_context < UINT64_MAX,
+            "extreme available RAM and slot counts do not overflow quota arithmetic");
+}
+
+static void test_ngram_context_admission() {
+    common_params_speculative params;
+    params.types = {COMMON_SPECULATIVE_TYPE_NGRAM_CACHE};
+    params.ngram_cache.max_entries_context = 1;
+    params.ngram_cache.max_continuations_context = 1;
+    common_speculative_ptr spec(common_speculative_init(params, 2));
+    expect(spec != nullptr, "context-only production lookup drafter initializes without a model");
+    if (!spec) {
+        return;
+    }
+    const auto draft = [&](llama_seq_id seq, const llama_tokens & prompt, llama_tokens & result) {
+        result.clear();
+        common_speculative_begin(spec.get(), seq, prompt);
+        auto & dp = common_speculative_get_draft_params(spec.get(), seq);
+        dp.drafting = true;
+        dp.id_last = prompt.back();
+        dp.prompt = &prompt;
+        dp.result = &result;
+        dp.n_max = 8;
+        common_speculative_draft(spec.get());
+    };
+    llama_tokens prompt(20, 7), result;
+    draft(0, prompt, result);
+    expect(!result.empty() && std::all_of(result.begin(), result.end(), [](llama_token t) { return t == 7; }),
+            "retained context pair can draft at capacity");
+    llama_tokens other(20, 9);
+    draft(1, other, result);
+    expect(!result.empty() && result.front() == 9, "slots have independent context credit");
+    prompt.assign(12, 11);
+    draft(0, prompt, result);
+    expect(!result.empty() && result.front() == 11, "shortened prompt resets context and successor credit");
+
+    const auto allocated = [&](uint64_t entries, uint64_t continuations) {
+        params.ngram_cache.max_entries_context = entries;
+        params.ngram_cache.max_continuations_context = continuations;
+        spec.reset(common_speculative_init(params, 2));
+        llama_tokens large(4097);
+        for (size_t i = 0; i < large.size(); ++i) {
+            large[i] = llama_token(i + 100);
+        }
+        result.clear();
+        allocation_probe::total = 0;
+        allocation_probe::active = true;
+        draft(0, large, result);
+        allocation_probe::active = false;
+        return allocation_probe::total;
+    };
+    const size_t bounded = allocated(1, 1);
+    expect(bounded < 131072, "long production context draft admits only its bounded map nodes");
+    expect(allocated(0, UINT64_MAX) < 131072 && allocated(UINT64_MAX, 0) < 131072,
+            "either zero context quota prevents map growth");
+    expect(allocated(UINT64_MAX, UINT64_MAX) > bounded * 2,
+            "unlimited positive control allocates the long context's map nodes");
 }
 
 static void test_ngram_checkpoint_load_quotas() {
@@ -435,6 +539,14 @@ static void test_ngram_worker_fallback() {
             !err.empty() && cache == seed && delta == source, "failed worker write preserves result and retry delta");
     std::ifstream saved(path, std::ios::binary);
     expect(std::vector<char>(std::istreambuf_iterator<char>(saved), {}) == bytes_before, "failed worker write preserves the old file");
+    saved.close();
+    expect(fs::remove(tmp), "remove worker temporary-file blocker");
+    expect(common_ngram_cache_sync_file(path, cache, delta, 0, vocab, err, nullptr, 1, 1, true) &&
+            delta.empty() && cache.size() == 1 && cache.at(key).at(1) == 13,
+            "retry writes the retained worker count exactly once");
+    common_ngram_cache reloaded;
+    expect(common_ngram_cache_load_file(path, reloaded, vocab, err, 1, 1) == COMMON_NGRAM_CACHE_LOAD_OK &&
+            reloaded == cache, "successful worker retry reloads with the same exact count");
 #endif
     fs::remove_all(dir);
 }
@@ -1022,6 +1134,8 @@ static void test_ram_prompt_fit() {
 
 int main() {
     test_ngram_ram_load_fit();
+    test_ngram_context_fit();
+    test_ngram_context_admission();
     test_ngram_checkpoint_load_quotas();
     test_ngram_checkpoint_merge_allocations();
     test_ngram_worker_fallback();

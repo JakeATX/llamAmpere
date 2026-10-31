@@ -40,7 +40,7 @@ size_t common_fit_vram_floor(bool display_attached);
 uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit);
 
 struct common_params_speculative_ngram_cache;
-void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_params_speculative_ngram_cache & params);
+void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_params_speculative_ngram_cache & params, uint32_t n_seq = 1);
 
 bool common_fit_eval_cache_save_fits(uint64_t available, bool fit, uint64_t n_tokens, uint64_t spec_bytes);
 

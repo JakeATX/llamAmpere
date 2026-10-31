@@ -420,11 +420,13 @@ struct common_params_speculative_ngram_cache {
     int32_t max_ngrams_dynamic    = 1000000; // live dynamic n-gram key limit; saves also prune by utility (0 = unlimited)
     bool max_ngrams_dynamic_explicit = false;
 
-    // Automatic load quotas also bound live dynamic growth.
+    // Automatic count quotas bound file loads, live dynamic growth and each slot's context cache.
     uint64_t load_max_entries_static        = UINT64_MAX;
     uint64_t load_max_continuations_static  = UINT64_MAX;
     uint64_t load_max_entries_dynamic       = UINT64_MAX;
     uint64_t load_max_continuations_dynamic = UINT64_MAX;
+    uint64_t max_entries_context            = UINT64_MAX;
+    uint64_t max_continuations_context      = UINT64_MAX;
 
     // identity of the target vocab, stored in saved cache files and checked at load (0 = unknown, no check)
     uint32_t vocab_n_tokens = 0;

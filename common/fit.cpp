@@ -114,12 +114,13 @@ bool common_fit_eval_cache_save_fits(uint64_t available, bool fit, uint64_t n_to
     return n_tokens <= (budget - scratch - spec_bytes) / sizeof(llama_token);
 }
 
-void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_params_speculative_ngram_cache & params) {
+void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_params_speculative_ngram_cache & params, uint32_t n_seq) {
     params.load_max_entries_static = params.load_max_continuations_static = UINT64_MAX;
     params.load_max_entries_dynamic = params.load_max_continuations_dynamic = UINT64_MAX;
+    params.max_entries_context = params.max_continuations_context = UINT64_MAX;
     const bool use_static = !params.lookup_cache_static.empty();
     const bool use_dynamic = !params.lookup_cache_dynamic.empty() && !params.max_ngrams_dynamic_explicit;
-    const unsigned count = unsigned(use_static) + unsigned(use_dynamic);
+    const uint64_t count = uint64_t(use_static) + uint64_t(use_dynamic) + n_seq;
     if (!fit || count == 0) {
         return;
     }
@@ -132,6 +133,8 @@ void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_par
     // Count admission estimates map overhead; this is not allocator byte accounting.
     const uint64_t entries = payload / 2 / 512;
     const uint64_t continuations = payload / 2 / 128;
+    params.max_entries_context = n_seq > 0 ? entries : 0;
+    params.max_continuations_context = n_seq > 0 ? continuations : 0;
     if (use_static) {
         params.load_max_entries_static = entries;
         params.load_max_continuations_static = continuations;

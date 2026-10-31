@@ -2391,7 +2391,9 @@ private:
             }
 
             if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                if (!params_base.speculative.ngram_cache.lookup_cache_static.empty() ||
+                if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                            COMMON_SPECULATIVE_TYPE_NGRAM_CACHE) != params_base.speculative.types.end() ||
+                    !params_base.speculative.ngram_cache.lookup_cache_static.empty() ||
                     !params_base.speculative.ngram_cache.lookup_cache_dynamic.empty()) {
                     // identity of the target vocab, so that a lookup cache file built for another model is refused
                     const auto vocab_id = common_ngram_cache_get_vocab_id(vocab);
@@ -2402,15 +2404,11 @@ private:
                         common_host_memory(total_ram, available_ram);
                     }
                     auto & cache_params = params_base.speculative.ngram_cache;
-                    common_fit_ngram_cache_load_limits(available_ram, params_base.fit_params, cache_params);
+                    common_fit_ngram_cache_load_limits(available_ram, params_base.fit_params, cache_params, params_base.n_parallel);
                     if (params_base.fit_params) {
-                        const bool auto_load = !cache_params.lookup_cache_static.empty() ||
-                            (!cache_params.lookup_cache_dynamic.empty() && !cache_params.max_ngrams_dynamic_explicit);
-                        if (auto_load) {
-                            SRV_INF("%s", available_ram <= (5ull << 30) ?
-                                "available RAM is low or unknown; automatic lookup loads accept only empty files to retain system headroom\n" :
-                                "automatic lookup loads use count limits from RAM above 5 GiB; files over the limits are skipped\n");
-                        }
+                        SRV_INF("%s", available_ram <= (5ull << 30) ?
+                            "available RAM is low or unknown; automatic lookup caches cannot add entries to retain system headroom\n" :
+                            "automatic lookup caches share RAM count limits across files and slots; files over the limits are skipped\n");
                         if (cache_params.max_ngrams_dynamic_explicit && !cache_params.lookup_cache_dynamic.empty()) {
                             SRV_WRN("%s", "explicit dynamic lookup size bypasses RAM load fitting; the 5 GiB floor cannot be guaranteed\n");
                         }

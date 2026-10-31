@@ -3628,6 +3628,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         size_t cache_size = 0; // number of tokens of the sequence in ngram_cache_context
 
         common_ngram_cache ngram_cache_context;
+        common_ngram_cache_limits limits_context;
     };
 
     std::vector<seq_info> sinfos;
@@ -3658,6 +3659,10 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
 
         sinfos.resize(n_seq);
+        for (auto & sinfo : sinfos) {
+            sinfo.limits_context = common_ngram_cache_limits(sinfo.ngram_cache_context,
+                    this->params.max_entries_context, this->params.max_continuations_context);
+        }
 
         vocab_id.n_tokens = this->params.vocab_n_tokens;
         vocab_id.hash     = this->params.vocab_hash;
@@ -3952,6 +3957,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             // The context cache can only be appended to (see common_ngram_cache_update), so it is rebuilt from
             // scratch at the next draft.
             sinfo.ngram_cache_context.clear();
+            sinfo.limits_context = common_ngram_cache_limits(sinfo.ngram_cache_context,
+                    params.max_entries_context, params.max_continuations_context);
             sinfo.cache_size = 0;
         }
 
@@ -3979,7 +3986,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             // the boundary between the already cached tokens and the new ones are counted as well.
             const int nnew = (int) (inp.size() - sinfo.cache_size);
 
-            common_ngram_cache_update(sinfo.ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false);
+            common_ngram_cache_update(sinfo.ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false,
+                    0, nullptr, &sinfo.limits_context);
 
             if (save_dynamic) {
                 // the dynamic cache learns from every sequence; the delta is what sync() writes back
