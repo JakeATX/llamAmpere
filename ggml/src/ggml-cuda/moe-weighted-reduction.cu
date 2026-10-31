@@ -2,8 +2,9 @@
 
 static __global__ void moe_mixed_reduction_f32(const float * experts, const float * weights,
         const int32_t * bank_ids, size_t ids_stride, float * dst, int n_embd, int n_used, bool tree) {
-    const int lane = threadIdx.x;
-    const int col = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int col = blockIdx.x*4 + (threadIdx.x >> 5);
+    if (col >= n_embd) { return; }
     const int token = blockIdx.y;
     const int64_t first = int64_t(token)*n_used;
     float hot = 0.0f, cold = 0.0f;
@@ -32,8 +33,8 @@ void ggml_cuda_op_moe_mixed_reduction(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(bank_ids->type == GGML_TYPE_I32 && bank_ids->nb[0] == sizeof(int32_t));
     GGML_ASSERT(experts->ne[1] <= 32 && ggml_is_contiguous(experts) && ggml_is_contiguous(weights));
     static const bool small = getenv("LLAMA_MOE_SMALL_REDUCE") && atoi(getenv("LLAMA_MOE_SMALL_REDUCE"));
-    const dim3 blocks(experts->ne[0], experts->ne[2]);
-    moe_mixed_reduction_f32<<<blocks, 32, 0, ctx.stream()>>>(
+    const dim3 blocks((experts->ne[0] + 3)/4, experts->ne[2]);
+    moe_mixed_reduction_f32<<<blocks, 128, 0, ctx.stream()>>>(
             (const float *) experts->data, (const float *) weights->data, (const int32_t *) bank_ids->data,
             bank_ids->nb[1]/sizeof(int32_t), (float *) dst->data, experts->ne[0], experts->ne[1], small || experts->ne[2] == 1);
     CUDA_CHECK(cudaGetLastError());
