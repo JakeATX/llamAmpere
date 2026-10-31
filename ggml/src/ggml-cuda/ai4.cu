@@ -1510,19 +1510,35 @@ static __device__ __forceinline__ void moe_mixed_group(const ai4k::idmap & idm, 
     __syncthreads();
 }
 
+// Paired launch: blocks at x >= gridDim.x/2 compute this second projection (W == nullptr: unpaired).
+struct moe_mixed_second {
+    const uint8_t * W;
+    float * Y;
+    const char * base;
+    const void * const * table;
+    const uint8_t * skip;
+    const uint8_t * resident;
+};
+
 template <ggml_type BASE, bool IQ4_BANK, int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW, int STAGES>
 static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
         const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
         const int32_t * ids, int64_t ids_stride, int n_expert, const block_q8_1 * x,
         const uint8_t * skip, const uint8_t * resident, char * route_ids, size_t route_ids_stride,
-        float * route_mask, int phase) {
+        float * route_mask, int phase, const moe_mixed_second second) {
     const int u = blockIdx.y, t = blockIdx.z;
+    int bx = blockIdx.x;
+    if (second.W && bx >= (int) gridDim.x/2) {
+        bx -= gridDim.x/2;
+        W = second.W; Y = second.Y; base = second.base; table = second.table;
+        skip = second.skip; resident = second.resident; route_ids = nullptr;
+    }
     const int native = *(const int32_t *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
     const int h = idm.direct_map ?
             (native >= 0 && native < idm.direct_map_size ? (int) idm.direct_map[native] : -1) : native;
     // Other slabs resolve the map themselves; these stores serve later projections.
-    if (route_ids && blockIdx.x == 0 && threadIdx.x == 0) {
+    if (route_ids && bx == 0 && threadIdx.x == 0) {
         *(int32_t *) (route_ids + t*route_ids_stride + u*sizeof(int32_t)) = h;
         route_mask[t*idm.direct_n_used + u] = h < 0 ? 1.0f : 0.0f;
     }
@@ -1542,15 +1558,15 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
                 if (group.n == 0) {
                     return;
                 }
-                ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(W, q, s, Y, M, M, 1, K, idm, &group);
+                ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(W, q, s, Y, M, M, 1, K, idm, &group, bx);
             } else {
-                ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, false>(W, q, s, Y, M, M, 1, K, idm);
+                ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, false>(W, q, s, Y, M, M, 1, K, idm, nullptr, bx);
             }
             return;
         }
     }
     constexpr int slabs = SPW ? WARPS : 1;
-    const int row0 = blockIdx.x*16*slabs;
+    const int row0 = bx*16*slabs;
     float * out = Y + ((int64_t) t*idm.direct_n_used + u)*M + row0;
     if (!hot && (h >= 0 || e < 0 || e >= n_expert || (skip && skip[e] && (!resident || !resident[e])))) {
         if (threadIdx.x < 16*slabs && row0 + threadIdx.x < M) {
@@ -1625,6 +1641,24 @@ bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor *
     }
 }
 
+bool ggml_cuda_moe_mixed_pair_enabled() {
+    static const bool v = ai4_env_int("GGML_MOE_BANK_MIXED_PAIR", nullptr, 1) != 0;
+    return v;
+}
+
+bool ggml_cuda_moe_mixed_pair_supported(const ggml_tensor * bank, const ggml_tensor * base,
+        const ggml_tensor * bank2, const ggml_tensor * base2) {
+    if (!ggml_cuda_moe_mixed_supported(bank, base) || !ggml_cuda_moe_mixed_supported(bank2, base2)) {
+        return false;
+    }
+    const ggml_tensor * w = bank->src[0], * w2 = bank2->src[0], * cw = base->src[0], * cw2 = base2->src[0];
+    return w->type != GGML_TYPE_IQ4_NL && w2->type == w->type && cw2->type == cw->type &&
+            ggml_are_same_shape(w, w2) && ggml_are_same_stride(w, w2) &&
+            ggml_are_same_shape(cw, cw2) && ggml_are_same_stride(cw, cw2) &&
+            bank2->src[1] == bank->src[1] && bank2->src[2] == bank->src[2] && base2->src[2] == base->src[2] &&
+            ggml_are_same_shape(bank, bank2);
+}
+
 const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined) {
     if (!joined || joined->op != GGML_OP_ADD || !joined->src[0] || !joined->src[1]) { return nullptr; }
     const ggml_tensor * hot = joined->src[0], * mul = joined->src[1];
@@ -1662,9 +1696,12 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8,
         const void * const * table, const uint8_t * skip, const uint8_t * resident,
         const ggml_tensor * route_map, ggml_tensor * route_mask,
-        const int8_t * act_ai_q, const float * act_ai_s, int phase) {
+        const int8_t * act_ai_q, const float * act_ai_s, int phase, const ggml_cuda_moe_mixed_pair * pair) {
     GGML_ASSERT(ggml_cuda_moe_mixed_supported(bank, base));
     GGML_ASSERT(phase >= 0 && phase <= 2 && (phase == 0 || resident));
+    GGML_ASSERT(!pair || (ggml_cuda_moe_mixed_pair_supported(bank, base, pair->bank, pair->base) &&
+            (table == nullptr) == (pair->table == nullptr) && (phase == 0 || pair->resident) &&
+            pair->dst->type == GGML_TYPE_F32 && ggml_is_contiguous(pair->dst) && ggml_are_same_shape(pair->dst, dst)));
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
     const int K = (int) x->ne[0], M = (int) w->ne[1];
     const int xsh = K % 256 == 0 ? 1 : 0;
@@ -1702,7 +1739,12 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         idm.direct_map_size = (int) cw->ne[2];
     }
     const bool spw = w->type != GGML_TYPE_IQ4_NL && ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
-    const dim3 grid(spw ? (M/16 + 3)/4 : M/16, ids->ne[0], ids->ne[1]);
+    const dim3 grid((spw ? (M/16 + 3)/4 : M/16)*(pair ? 2 : 1), ids->ne[0], ids->ne[1]);
+    moe_mixed_second second{};
+    if (pair) {
+        second = { (const uint8_t *) pair->bank->src[0]->data, (float *) pair->dst->data,
+                   (const char *) pair->base->src[0]->data, pair->table, pair->skip, pair->resident };
+    }
     static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
     const int cfg = ai4_mmvr_cfg();
     const bool iq4_hot_single = w->type == GGML_TYPE_IQ4_NL && ids->ne[1] == 1;
@@ -1720,7 +1762,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             (const uint8_t *) w->data, act_ai_q, act_ai_s, (float *) dst->data, M, K, idm, \
             (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
             ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
-            route_map && phase != 2 ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr, phase)
+            route_map && phase != 2 ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr, phase, second)
 #define MOE_MIXED_SINGLE(T, L, XSH, KT, WARPS) \
     if (single) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, true, false, 2); } \
     else        { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, false, false, 2); }
@@ -1763,8 +1805,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     if (trace) {
-        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d\n",
-                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase);
+        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d pair=%d\n",
+                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase, pair != nullptr);
     }
 }
 #undef MOE_MIXED_TYPES

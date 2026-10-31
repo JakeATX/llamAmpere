@@ -12158,6 +12158,37 @@ struct test_moe_bank_routing : public test_moe_bank_mixed {
     }
 };
 
+// Routed up then gate over the same routes: CUDA computes both projections in one paired launch.
+struct test_moe_bank_pair : public test_moe_bank_routing {
+    ggml_tensor * up_result = nullptr;
+    test_moe_bank_pair(int width, bool strided_ids) : test_moe_bank_routing(width, strided_ids) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_PAIR"; }
+    const char * required_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        const char * pair = getenv("GGML_MOE_BANK_MIXED_PAIR");
+        return direct_mmvq_width() && (!enabled || atoi(enabled)) && (!pair || atoi(pair)) ? "moe_bank_pair" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        const char * pair = getenv("GGML_MOE_BANK_MIXED_PAIR");
+        return (enabled && !atoi(enabled)) || (pair && !atoi(pair)) ? "moe_bank_pair" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        up_result = test_moe_bank_routing::build_graph(ctx);
+        ggml_tensor * x = up_result->src[0]->src[1];
+        ggml_tensor * ids = up_result->src[1]->src[0]->src[2];
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
+        ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, bank_ids);
+        ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ids);
+        ggml_tensor * gate = ggml_add(ctx, h, ggml_mul(ctx, c, cold_mask));
+        ggml_set_output(up_result);
+        result = ggml_swiglu_split(ctx, gate, up_result);
+        return result;
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { bank_ids, cold_mask, up_result, result }; }
+};
+
 struct test_moe_bank_mixed_reduce : public test_moe_bank_mixed {
     ggml_tensor * mixed_result = nullptr;
     ggml_tensor * reference_result = nullptr;
@@ -19212,6 +19243,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (bool strided_ids : { false, true }) {
             test_cases.emplace_back(new test_moe_bank_routing(width, strided_ids));
+            test_cases.emplace_back(new test_moe_bank_pair(width, strided_ids));
         }
         test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_Q2_0,
                 width, 2, 4, false, true, 640, 2560));

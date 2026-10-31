@@ -11893,6 +11893,82 @@ bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context & ctx, const gg
     return moe_cache_device_compute(ctx, &output, bank, route_map, route_mask);
 }
 
+// fork AIPFIX (GGML_MOE_BANK_MIXED_PAIR): up and gate share the activation quantizers, the copy wait and one
+// mixed launch per phase; every route of each projection runs the same per-route code as separate launches.
+bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * bank, ggml_tensor * base, ggml_tensor * dst,
+        const ggml_tensor * bank2, ggml_tensor * base2, ggml_tensor * dst2,
+        const ggml_tensor * route_map, ggml_tensor * route_mask) {
+    if (!ggml_cuda_moe_mixed_pair_supported(bank, base, bank2, base2) ||
+            g_session_stack.empty() || !g_session_stack.back().active) {
+        return false;
+    }
+    auto & session = *g_session_stack.back().active;
+    if (!moe_cache_device_op_fits(session, base, ctx.device) || !moe_cache_device_op_fits(session, base2, ctx.device)) {
+        return false;
+    }
+#if !defined(GGML_USE_HIP)
+    if (!session.devices.empty() && session.devices[0]->table_prefetch_prepared) {
+        return false;
+    }
+#endif
+    const auto & first = session.device_tables.at(base->src[0]->data);
+    const auto & second = session.device_tables.at(base2->src[0]->data);
+    const ggml_tensor * a = base->src[1];
+    const ggml_tensor * ids = base->src[2];
+    if (first.mj_layer < 0 || first.mj_layer != second.mj_layer || first.desc.type != second.desc.type ||
+            first.mj_kind < 0 || first.mj_kind > 1 || second.mj_kind < 0 || second.mj_kind > 1 ||
+            first.mj_kind == second.mj_kind) {
+        return false;
+    }
+    // A declined begin has no side effects; the caller then runs both projections separately.
+    if (!moe_hf_begin(ctx, session, first, a, ids)) {
+        return false;
+    }
+    GGML_ASSERT(moe_hf_begin(ctx, session, second, a, ids));
+    session.device_dispatches.fetch_add(2, std::memory_order_relaxed);
+    moe_cache_swap_note_stream(session, ctx);
+    if (session.device_expert_counts) {
+        const int n = (int)(ids->ne[0] * ids->ne[1]);
+        for (const auto * table : {&first, &second}) {
+            if (moe_plan_count_take(session, *table, ids)) { continue; }
+            moe_cache_count_routes<<<(n + 127) / 128, 128, 0, ctx.stream()>>>(
+                    (const int32_t *)ids->data, table->hot, session.device_route_counts,
+                    session.device_expert_counts + table->count_offset, n, table->desc.n_expert,
+                    (int)ids->ne[0], (int)(ids->nb[1] / sizeof(int32_t)));
+        }
+    }
+    ggml_cuda_pool_alloc<char> q8(ctx.pool());
+    char * quantized = moe_quantize_act(ctx, a, (ggml_type) first.desc.type, true, q8);
+    ggml_cuda_pool_alloc<int8_t> bank_q(ctx.pool());
+    ggml_cuda_pool_alloc<float> bank_s(ctx.pool());
+    ggml_cuda_moe_mixed_quantize_x(ctx, bank, bank_q, bank_s);
+    ggml_tensor op = *base;
+    op.data = dst->data;
+    ggml_tensor op2 = *base2;
+    op2.data = dst2->data;
+    const bool cs = session.cs_layer >= 0 && session.cs_layer == first.mj_layer;
+    const bool tail = moe_tail_active(session, first);
+    auto skip_of = [&](const moe_cache_device_table & table) -> const uint8_t * {
+        return cs ? g_cs_mask + (size_t) table.mj_kind*g_hf_experts :
+                tail ? g_tail_mask + (size_t) table.mj_kind*g_hf_experts : nullptr;
+    };
+    const bool split = moe_mixed_hit_first();
+    if (split) {
+        const ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot };
+        ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, &op, quantized, first.device, nullptr, first.hot,
+                route_map, route_mask, bank_q.get(), bank_s.get(), 1, &resident);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    const void * const * eff = moe_hf_wait(ctx, session, first);
+    const void * const * eff2 = moe_hf_wait(ctx, session, second);
+    const ggml_cuda_moe_mixed_pair rest = { bank2, base2, &op2, eff2, skip_of(second), second.hot };
+    ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, &op, quantized, eff, skip_of(first), first.hot,
+            route_map, route_mask, bank_q.get(), bank_s.get(), split ? 2 : 0, &rest);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // fork: one activation quantization and one MMV retain both exact expert projections.
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
         ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu) {

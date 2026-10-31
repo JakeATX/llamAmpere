@@ -954,7 +954,7 @@ template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int 
 static __device__ __forceinline__ void mmvr_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
         float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm,
-        const mmvr_group * group = nullptr) {
+        const mmvr_group * group = nullptr, int bx = -1) {
     static_assert(!SINGLE_N || !ID || DIRECT, "single-column dense or direct scope");
     constexpr int KR = lay_rate<LAY>();
     static_assert(SPLITS == 1 || (!ID && WARPS == 4 && (KT == 5120 || KT == 17408)), "small split scope");
@@ -974,7 +974,9 @@ static __device__ __forceinline__ void mmvr_body(
     extern __shared__ __align__(16) uint8_t smem[];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
-    const int slab = SPW ? (int) blockIdx.x*WARPS + warp : (int) blockIdx.x;
+    // bx overrides the slab block index (paired launches stack two projections along x).
+    const int bxi = bx >= 0 ? bx : (int) blockIdx.x;
+    const int slab = SPW ? bxi*WARPS + warp : bxi;
     if constexpr (SPW) {
         if (slab >= M/16) {
             return;

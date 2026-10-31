@@ -6966,6 +6966,14 @@ static bool ggml_cuda_match_moe_bank_routing(const ggml_cgraph * graph, int i) {
     return true;
 }
 
+// Routed up group followed by the gate group over the same activations, routes and cold mask: one paired launch.
+static bool ggml_cuda_match_moe_bank_pair(const ggml_cgraph * graph, int i) {
+    return ggml_cuda_match_moe_bank_routing(graph, i) && ggml_cuda_match_moe_bank_mixed(graph, i + 14) &&
+            graph->nodes[i + 16]->src[1] == graph->nodes[i + 9] &&
+            ggml_cuda_moe_mixed_pair_supported(graph->nodes[i + 10], graph->nodes[i + 11],
+                    graph->nodes[i + 14], graph->nodes[i + 15]);
+}
+
 static bool ggml_cuda_match_moe_bank_joint(const ggml_cgraph * graph, int i, ggml_cuda_moe_bank_joint_match & m) {
     static const bool enabled = [] {
         const char * value = getenv("LLAMA_MOE_BANK_JOINT_REDUCE");
@@ -9423,6 +9431,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const ggml_tensor * map = cgraph->nodes[i + 2]->src[0];
         if (!ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[cuda_ctx->device].cc, bank->src[0]->type) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 14, outputs, 3)) {
+            const int pair_outputs[] = { i + 5, i + 9, i + 13, i + 17 };
+            if (ggml_cuda_moe_mixed_pair_enabled() && ggml_cuda_match_moe_bank_pair(cgraph, i) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 18, pair_outputs, 4)) {
+                ggml_tensor * bank2 = cgraph->nodes[i + 14], * base2 = cgraph->nodes[i + 15], * dst2 = cgraph->nodes[i + 17];
+                bool done = ggml_cuda_moe_cache_mixed_pair_compute(*cuda_ctx, bank, base, dst, bank2, base2, dst2, map, mask);
+                if (!done && ggml_backend_buffer_is_cuda(base->src[0]->buffer) &&
+                        ggml_backend_buffer_is_cuda(base2->src[0]->buffer) &&
+                        base->ne[2] <= get_mmvq_mmid_max_batch(base->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                    const ggml_cuda_moe_mixed_pair pair = { bank2, base2, dst2, nullptr, nullptr, nullptr };
+                    ggml_cuda_mul_mat_id_mixed(*cuda_ctx, bank, base, dst, nullptr, nullptr, nullptr, nullptr, map, mask,
+                            nullptr, nullptr, 0, &pair);
+                    done = true;
+                }
+                if (done) {
+                    cuda_ctx->fusion_stats.moe_bank_mixed += 2;
+                    cuda_ctx->fusion_stats.moe_bank_routing++;
+                    cuda_ctx->fusion_stats.moe_bank_pair++;
+                    return 17;
+                }
+            }
             if (ggml_cuda_moe_cache_mixed_compute(*cuda_ctx, bank, base, dst, map, mask)) {
                 cuda_ctx->fusion_stats.moe_bank_mixed++;
                 cuda_ctx->fusion_stats.moe_bank_routing++;
@@ -11331,16 +11359,24 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (ggml_cuda_match_moe_bank_routing(cgraph, i)) {
-                ggml_tensor * dst = cgraph->nodes[i + 13];
-                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], dst);
-                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 2]->src[0], dst);
-                for (int k : { i + 10, i + 11 }) {
-                    for (int s = 0; s < 3; ++s) {
-                        params->add_alloc_dep(params->user_data, cgraph->nodes[k]->src[s], dst);
+                // A paired launch also writes the gate output while it reads the routing inputs.
+                const bool pair = ggml_cuda_match_moe_bank_pair(cgraph, i);
+                for (ggml_tensor * dst : { cgraph->nodes[i + 13], pair ? cgraph->nodes[i + 17] : nullptr }) {
+                    if (!dst) { continue; }
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], dst);
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i + 2]->src[0], dst);
+                    for (int k : { i + 10, i + 11, i + 14, i + 15 }) {
+                        if (k >= i + 14 && !pair) { continue; }
+                        for (int s = 0; s < 3; ++s) {
+                            params->add_alloc_dep(params->user_data, cgraph->nodes[k]->src[s], dst);
+                        }
                     }
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i + 9], dst);
                 }
-                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 9], dst);
-                i += 13;
+                if (pair) {
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i + 13], cgraph->nodes[i + 17]);
+                }
+                i += pair ? 17 : 13;
                 continue;
             }
             if (ggml_cuda_match_moe_bank_mixed(cgraph, i)) {
@@ -12863,6 +12899,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "moe_bank_routing") == 0) {
         return ctx->fusion_stats.moe_bank_routing;
+    }
+    if (strcmp(name, "moe_bank_pair") == 0) {
+        return ctx->fusion_stats.moe_bank_pair;
     }
     if (strcmp(name, "moe_bank_mixed") == 0) {
         return ctx->fusion_stats.moe_bank_mixed;
