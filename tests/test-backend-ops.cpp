@@ -18903,7 +18903,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
-        for (ggml_type base : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S }) {
+        for (ggml_type base : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS }) {
             for (int width : { 1, 4, 8 }) {
                 for (int mode : { 0, 1, 2 }) {
                     for (int channels : { 1, 4 }) {

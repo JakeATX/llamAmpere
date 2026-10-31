@@ -1333,7 +1333,7 @@ static __global__ void __launch_bounds__(128, 4) moe_mixed_mmv(
         const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
         const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
         const int32_t * ids, int64_t ids_stride, int n_expert, const block_q8_1 * x,
-        const uint8_t * skip, const uint8_t * resident) {
+        const uint8_t * skip, const uint8_t * resident, bool trace) {
     const int u = blockIdx.y, t = blockIdx.z;
     const int h = *(const int32_t *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
     if (h >= 0 && h < idm.direct_n_expert) {
@@ -1357,6 +1357,10 @@ static __global__ void __launch_bounds__(128, 4) moe_mixed_mmv(
         MOE_MIXED_TYPES(MOE_MIXED_CASE)
 #undef MOE_MIXED_CASE
         default: __trap();
+    }
+    if (trace && type == GGML_TYPE_IQ3_XXS && table && blockIdx.x == 0 && threadIdx.x == 0) {
+        printf("[moe-bank-mixed] base-computed base=iq3_xxs table=1 width=%d expert=%d route=%d token=%d\n",
+                (int) gridDim.z, e, u, t);
     }
 }
 
@@ -1432,16 +1436,16 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     idm.direct_nb0 = ids->nb[0]; idm.direct_nb1 = ids->nb[1];
     idm.direct_n_used = (int) ids->ne[0]; idm.direct_ne11 = (int) x->ne[1]; idm.direct_n_expert = (int) w->ne[2];
     const dim3 grid(M/16, ids->ne[0], ids->ne[1]);
+    static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
 #define MOE_MIXED_LAUNCH(L) \
     moe_mixed_mmv<L><<<grid, 128, 4*2*ai4k::mmv_stage_bytes<true, L>(), ctx.stream()>>>( \
             (const uint8_t *) w->data, q.get(), s.get(), (float *) dst->data, M, K, idm, \
             (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
-            ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident)
+            ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, trace > 1)
     if (w->type == GGML_TYPE_AIT2_U) { MOE_MIXED_LAUNCH(ai4k::LAY_AIT2_U); }
     else { MOE_MIXED_LAUNCH(ai4k::LAY_AIT3_U); }
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
-    static const bool trace = getenv("GGML_MOE_BANK_MIXED_TRACE") && atoi(getenv("GGML_MOE_BANK_MIXED_TRACE"));
     if (trace) {
         fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d\n",
                 K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr);
