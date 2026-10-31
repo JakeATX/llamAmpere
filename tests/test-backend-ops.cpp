@@ -15698,6 +15698,34 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     }
 }
 
+// AIT2P_U (unit bytes, AIT2P pair-table levels) at the Flash-Next expert shapes: gate/up K 2560 x M 640 (H256, broadcast
+// src1), down K 640 x M 2560 (H128); decode / MTP-verify widths 1-8, then prompt widths; MUL_MAT_ID on a 221-expert bank
+// stack top 10 with repeated and skipped ids. Also small shapes and partial row tiles.
+static void add_ait2pu_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    const ggml_type t = GGML_TYPE_AIT2P_U;
+    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33, 64, 65, 512, 600}) {
+        cases.emplace_back(new test_mul_mat_ai4(640,  n, 2560, t));
+        cases.emplace_back(new test_mul_mat_ai4(2560, n, 640,  t));
+    }
+    for (int64_t n : {1, 5, 9, 130}) {
+        cases.emplace_back(new test_mul_mat_ai4(16,  n, 128,  t));
+        cases.emplace_back(new test_mul_mat_ai4(48,  n, 384,  t));
+        cases.emplace_back(new test_mul_mat_ai4(400, n, 3072, t));
+    }
+    for (int skip : {0, 1}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 64, 512}) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 221, 10, true,  640,  n, 2560, false, false, skip));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 221, 10, false, 2560, n, 640,  false, false, skip));
+        }
+    }
+    for (int n : {1, 4, 8, 9, 33}) {
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2560, true));
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 640,  true));
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 32, n, 384, true, false, 1));
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, true, 48, n, 256, false, false, 1));
+    }
+}
+
 // AI+ expert bank (Flash-Next hot bank) MUL_MAT_ID: every AI+ unit type at the expert shapes (gate/up 640 x 2560 with a
 // broadcast src1, down 2560 x 640 H128), a 221-expert stack, top 10, decode / MTP-verify widths 1-8 and prompt widths,
 // with and without skipped (-1 / out-of-stack) ids. The prompt widths run the GEMM-ID kernels (BN64 / BN128).
@@ -15839,6 +15867,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     add_ai23_cases(test_cases);
     add_ai_bank_cases(test_cases);
+    add_ait2pu_cases(test_cases);
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int64_t n : {1, 9, 512}) {
@@ -19818,7 +19847,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 640, 2560 }, { 2560, 640 } }) {
                 const bool broadcast = mk.second == 2560;
                 for (int64_t n : { 1, 2, 3, 4, 5, 6, 512, 2048, 12288 }) {
-                    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+                    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U }) {
                         for (int ne : { 221, 512 }) {
                             test_cases.emplace_back(new test_mul_mat_id_ai4(t, ne, 10, broadcast, mk.first, n, mk.second, false, true));
                         }

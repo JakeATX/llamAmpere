@@ -836,6 +836,9 @@ static bool ai4_ref_only_type(ggml_type t) {
     if (t == GGML_TYPE_AIT5_U) {
         return v;
     }
+    if (t == GGML_TYPE_AIT2P_U) {
+        return true;   // pair-table decode only in the reconstruct reference so far
+    }
     if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) {
         return !ai4_ai23_fast();
     }

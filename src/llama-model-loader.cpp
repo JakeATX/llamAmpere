@@ -965,6 +965,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q6_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q6_CR;   break;
             case GGML_TYPE_AIT5_U:
             case GGML_TYPE_AIT2_U:
+            case GGML_TYPE_AIT2P_U:
             case GGML_TYPE_AIT3_U:
             case GGML_TYPE_AIT4_U:
             case GGML_TYPE_AIT2:
