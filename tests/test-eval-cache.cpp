@@ -269,6 +269,43 @@ static void test_record_ram_budget(const std::string & root) {
     CHECK(ec.read_header(id, rec, err));
 }
 
+static void test_record_restore_budget(const std::string & root) {
+    server_eval_cache ec;
+    std::string err, id;
+    CHECK(ec.open(root + "/restore-budget", KEY_A, true, err));
+    const uint64_t available = (5ull << 30) + (128ull << 20);
+    const uint64_t budget = common_fit_eval_cache_ram_bytes(available, true);
+    const size_t payload = 1u << 20;
+    const llama_tokens tokens = seq(1, payload / sizeof(llama_token));
+    const std::vector<uint8_t> large_spec(budget - 65536 - payload - 4096, 7);
+    CHECK(add_entry(ec, tokens, {}, large_spec, false, id));
+    const auto file_bytes = fs::file_size(ec.path_hdr(id));
+    server_eval_cache_record rec;
+    CHECK(ec.read_header(id, rec, err, budget));
+    CHECK(rec.tokens == tokens && rec.spec == large_spec);
+    const uint64_t record_budget = common_fit_eval_cache_load_bytes(available, true, tokens.size());
+    CHECK(record_budget == budget - payload);
+    allocation_probe::start(payload);
+    const bool rejected = !ec.read_header(id, rec, err, record_budget);
+    const size_t allocations = allocation_probe::stop();
+    CHECK(rejected && allocations == 0);
+    CHECK(err.find("RAM fit budget") != std::string::npos);
+    CHECK(rec.tokens.empty() && rec.checkpoints.empty() && rec.spec.empty());
+    CHECK(fs::file_size(ec.path_hdr(id)) == file_bytes);
+    CHECK(ec.read_header(id, rec, err));
+    CHECK(rec.tokens == tokens && rec.spec == large_spec);
+
+    const std::vector<uint8_t> small_spec = {3, 4, 5};
+    CHECK(add_entry(ec, tokens, {}, small_spec, false, id));
+    CHECK(ec.read_header(id, rec, err, record_budget));
+    CHECK(rec.tokens == tokens && rec.spec == small_spec);
+    for (uint64_t host_gib : {16, 32, 64, 128}) {
+        CHECK(ec.read_header(id, rec, err, common_fit_eval_cache_load_bytes((host_gib - 6) << 30, true, tokens.size())));
+    }
+    CHECK(!ec.read_header(id, rec, err, common_fit_eval_cache_load_bytes(5ull << 30, true, tokens.size())));
+    CHECK(ec.read_header(id, rec, err, common_fit_eval_cache_load_bytes(0, false, tokens.size())));
+}
+
 static void test_record_allocations(const std::string & root) {
     server_eval_cache ec;
     std::string err, id;
@@ -842,6 +879,7 @@ int main() {
     test_open_and_roundtrip(root);
     test_corruption(root);
     test_record_ram_budget(root);
+    test_record_restore_budget(root);
     test_record_allocations(root);
     test_streamed_header(root);
     test_borrowed_checkpoints(root);

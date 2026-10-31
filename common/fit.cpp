@@ -149,6 +149,18 @@ uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit) {
     return common_fit_ram_plan(available, requests).bytes[COMMON_FIT_RAM_EVAL];
 }
 
+uint64_t common_fit_eval_cache_load_bytes(uint64_t available, bool fit, uint64_t n_tokens) {
+    if (!fit) {
+        return UINT64_MAX;
+    }
+    const uint64_t budget = common_fit_eval_cache_ram_bytes(available, true);
+    if (n_tokens > budget / sizeof(llama_token)) {
+        return 0;
+    }
+    // The request copy is released before reading; restore needs one token buffer beside the record.
+    return budget - n_tokens * sizeof(llama_token);
+}
+
 bool common_fit_eval_cache_save_fits(uint64_t available, bool fit, uint64_t n_tokens, uint64_t spec_bytes) {
     if (!fit) {
         return true;
@@ -227,6 +239,16 @@ int64_t common_fit_vram_margin_surplus(int64_t free_bytes, const std::vector<int
 
 const char * common_moe_cache_tensor_override_pattern() {
     return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.";
+}
+
+uint32_t common_fit_vram_layer_step(uint32_t delta, int64_t low, int64_t high, int64_t target) {
+    if (delta <= 1 || low < 0 || low > target || target >= high) {
+        throw common_params_fit_exception("layer placement cannot meet the requested free memory margin");
+    }
+    // This is only a guess; both measured bounds stay authoritative. Avoid an overflowing integer product.
+    const double fraction = double(target - low) / double(high - low);
+    const uint32_t step = uint32_t(double(delta) * fraction);
+    return std::max(uint32_t(1), std::min(step, delta - 1));
 }
 
 struct common_moe_cache_fit_pool {
@@ -1217,6 +1239,9 @@ static void common_params_fit_impl(
         std::vector<int64_t> ret;
         ret.reserve(nd);
         for (size_t id = 0; id < nd; id++) {
+            if (dmd_nl[id].mb.total() > INT64_MAX) {
+                throw common_params_fit_exception("device memory use exceeds the supported total size");
+            }
             ret.push_back(dmd_nl[id].mb.total());
         }
         return ret;
@@ -1358,9 +1383,7 @@ static void common_params_fit_impl(
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
-                    step_size = std::max(step_size, uint32_t(1));
-                    step_size = std::min(step_size, delta - 1);
+                    const uint32_t step_size = common_fit_vram_layer_step(delta, mem[id], mem_high[id], targets[id]);
 
                     std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
                     ngl_per_device_test[id].n_layer += step_size;

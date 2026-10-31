@@ -2971,8 +2971,22 @@ private:
     // covers more than the slot can already reuse. The slot's previous content goes to the prompt cache first.
     void eval_cache_load(server_slot & slot, const server_task & task) {
         const size_t have = eval_cache_slot_reuse(slot, task.tokens);
-        const llama_tokens tokens = task.tokens.get_text_tokens();
-        const int idx = eval_cache->find(tokens, have);
+        uint64_t total_ram = 0, available_ram = 0;
+        if (params_base.fit_params) {
+            common_host_memory(total_ram, available_ram);
+        }
+        const uint64_t record_budget = common_fit_eval_cache_load_bytes(available_ram, params_base.fit_params, task.tokens.size());
+        if (record_budget == 0) {
+            SRV_WRN("slot %d: eval cache: restore token buffer exceeds the current RAM fit budget; using fresh prefill\n", slot.id);
+            return;
+        }
+        int idx;
+        size_t n_prompt_tokens;
+        {
+            const llama_tokens tokens = task.tokens.get_text_tokens();
+            n_prompt_tokens = tokens.size();
+            idx = eval_cache->find(tokens, have);
+        }
         if (idx < 0) {
             return;
         }
@@ -2982,11 +2996,6 @@ private:
 
         server_eval_cache_record rec;
         std::string err;
-        uint64_t total_ram = 0, available_ram = 0;
-        if (params_base.fit_params) {
-            common_host_memory(total_ram, available_ram);
-        }
-        const uint64_t record_budget = common_fit_eval_cache_ram_bytes(available_ram, params_base.fit_params);
         if (!eval_cache->read_header(e.id, rec, err, record_budget)) {
             SRV_WRN("slot %d: eval cache: entry %s unusable: %s\n", slot.id, e.id.c_str(), err.c_str());
             return;
@@ -3039,7 +3048,7 @@ private:
         n_eval_cache_tokens += e.tokens.size();
 
         SRV_INF("slot %d: eval cache: restored entry %s, %zu of %zu prompt tokens (slot could reuse %zu), %.3f MiB in %.2f ms\n",
-                slot.id, e.id.c_str(), e.tokens.size(), tokens.size(), have, e.bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
+                slot.id, e.id.c_str(), e.tokens.size(), n_prompt_tokens, have, e.bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
     }
 
     // [EVALFLAG] builder: store the slot's state (the first n_tokens prompt tokens, already decoded) as an entry

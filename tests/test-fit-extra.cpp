@@ -1161,6 +1161,32 @@ static void test_ram_eval_fit() {
     for (uint64_t host_gib : {16, 32, 64, 128}) {
         const uint64_t available = (host_gib - 6) * GiB;
         const uint64_t budget = common_fit_eval_cache_ram_bytes(available, true);
+        expect(common_fit_eval_cache_load_bytes(available, true, 100000) == budget - 100000 * sizeof(llama_token),
+                "eval restore reserves a token buffer beside the parsed record");
+        const uint64_t max_tokens = budget / sizeof(llama_token);
+        expect(common_fit_eval_cache_load_bytes(available, true, max_tokens) == 0 &&
+                common_fit_eval_cache_load_bytes(available, true, max_tokens + 1) == 0,
+                "a full or oversized token buffer leaves no room for an eval record");
+        expect(common_fit_eval_cache_load_bytes(available, true, max_tokens - 1) == sizeof(llama_token),
+                "restore token reservation keeps the exact boundary");
+        expect(common_fit_eval_cache_load_bytes(available, true, UINT64_MAX) == 0,
+                "restore token count cannot overflow byte admission");
+        expect(common_fit_eval_cache_load_bytes(available, true, 0) == budget,
+                "an empty request reserves no token storage");
+    }
+    for (uint64_t available : {uint64_t(0), 4 * GiB, 5 * GiB, 5 * GiB + MiB - 1}) {
+        expect(common_fit_eval_cache_load_bytes(available, true, 0) == 0 &&
+                common_fit_eval_cache_load_bytes(available, true, 1) == 0,
+                "low or unknown RAM refuses restore before request extraction");
+        expect(common_fit_eval_cache_load_bytes(available, false, UINT64_MAX) == UINT64_MAX,
+                "fit off keeps prior restore admission without token arithmetic");
+    }
+    expect(common_fit_eval_cache_load_bytes(UINT64_MAX, true, UINT64_MAX) == 0,
+            "extreme RAM and token counts cannot wrap restore admission");
+
+    for (uint64_t host_gib : {16, 32, 64, 128}) {
+        const uint64_t available = (host_gib - 6) * GiB;
+        const uint64_t budget = common_fit_eval_cache_ram_bytes(available, true);
         const uint64_t n_tokens = 100000;
         const uint64_t spec_bytes = budget - 65536 - n_tokens * sizeof(llama_token);
         expect(common_fit_eval_cache_save_fits(available, true, n_tokens, spec_bytes),
@@ -1360,7 +1386,39 @@ static void test_vram_fit_floor() {
     common_set_env("LLAMA_ARG_FIT_TARGET", old_target);
 }
 
+static void test_vram_layer_step() {
+    constexpr int64_t GiB = 1ll << 30;
+    expect(common_fit_vram_layer_step(49, GiB, 16 * GiB, 7 * GiB) == 19,
+            "layer interpolation keeps a normal measured placement guess");
+    expect(common_fit_vram_layer_step(49, GiB, 16 * GiB, GiB) == 1,
+            "an exact zero-layer target still advances by one layer");
+    expect(common_fit_vram_layer_step(UINT32_MAX, 0, INT64_MAX, INT64_MAX - 1) == UINT32_MAX - 1,
+            "large valid interpolation bounds cannot overflow the layer product");
+    expect(common_fit_vram_layer_step(49, INT64_MAX - 2, INT64_MAX, INT64_MAX - 1) == 24,
+            "nearby large memory bounds retain their difference before floating conversion");
+    for (uint32_t delta : {uint32_t(0), uint32_t(1), uint32_t(49)}) {
+        bool rejected = false;
+        try {
+            common_fit_vram_layer_step(delta, GiB, 16 * GiB, 23 * GiB - int64_t(8796093022207ull << 20));
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        expect(rejected, "reported large margin is rejected before interpolating a zero-layer deficit");
+    }
+    for (const auto & bounds : std::vector<std::vector<int64_t>>{{-1, 16 * GiB, 7 * GiB},
+            {8 * GiB, 16 * GiB, 7 * GiB}, {GiB, GiB, GiB}, {GiB, 16 * GiB, 16 * GiB}}) {
+        bool rejected = false;
+        try {
+            common_fit_vram_layer_step(49, bounds[0], bounds[1], bounds[2]);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        expect(rejected, "invalid measured interpolation bounds fail before arithmetic");
+    }
+}
+
 int main() {
+    test_vram_layer_step();
     test_vram_fit_floor();
     test_ngram_ram_load_fit();
     test_ngram_context_fit();

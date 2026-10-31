@@ -41,6 +41,7 @@ struct common_params;
 std::vector<size_t> common_fit_vram_targets(const common_params & params, size_t floor);
 
 uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit);
+uint64_t common_fit_eval_cache_load_bytes(uint64_t available, bool fit, uint64_t n_tokens);
 
 struct common_params_speculative_ngram_cache;
 void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_params_speculative_ngram_cache & params, uint32_t n_seq = 1);
@@ -109,6 +110,7 @@ enum common_params_fit_status {
 // fork: classify measured allocations before treating requested margins as a proven fit.
 common_params_fit_status common_fit_vram_margin_status(int64_t free_bytes, size_t used_bytes, size_t margin_bytes);
 int64_t common_fit_vram_margin_surplus(int64_t free_bytes, const std::vector<int64_t> & margins);
+uint32_t common_fit_vram_layer_step(uint32_t delta, int64_t low, int64_t high, int64_t target);
 
 // fork: require a proven fit with the device floor left on every device.
 bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins, size_t floor = 300u * 1024 * 1024);
