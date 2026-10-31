@@ -117,6 +117,15 @@ static int moe_miss_list_mode() {
     }();
     return mode;
 }
+// fork AIPFIX (GGML_MOE_BANK_MIXED_HITFIRST, default 1): split banked mixed GEMVs around the copy wait.
+static bool moe_mixed_hit_first() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_MOE_BANK_MIXED_HITFIRST");
+        return !e || atoi(e) != 0;
+    }();
+    return v;
+}
+
 // fork MOEGAP DOWNONE: GGML_MOE_DOWN_ONE=1|check. On a hit-first layer the down projection waits for its copy
 // first and then computes every route the card owns in ONE launch over the effective table (resident experts at
 // their cache address, staged ones at their copy), instead of a hit pass and a miss pass. The down copy is normally
@@ -11779,11 +11788,19 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
         // The down projection uses one pass only when no tail rows need zeroing.
         const int one = table.mj_kind == 2 && !tail ? moe_down_one_mode() : 0;
         if (bank) {
+            const uint8_t * mixed_skip = cs ? g_cs_mask + (size_t) table.mj_kind*g_hf_experts :
+                    tail ? g_tail_mask + (size_t) table.mj_kind*g_hf_experts : nullptr;
+            // fork AIPFIX: bank and resident routes run before the copy wait, as the hit pass does;
+            // the resident table equals the effective one for those experts.
+            const bool split = moe_mixed_hit_first();
+            if (split) {
+                ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, table.device, nullptr, table.hot,
+                        route_map, route_mask, bank_q.get(), bank_s.get(), 1);
+                CUDA_CHECK(cudaGetLastError());
+            }
             eff = moe_hf_wait(ctx, session, table);
-            ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, eff,
-                    cs ? g_cs_mask + (size_t) table.mj_kind*g_hf_experts :
-                    tail ? g_tail_mask + (size_t) table.mj_kind*g_hf_experts : nullptr, table.hot, route_map, route_mask,
-                    bank_q.get(), bank_s.get());
+            ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, eff, mixed_skip, table.hot, route_map, route_mask,
+                    bank_q.get(), bank_s.get(), split ? 2 : 0);
         } else if (one != 0) {
             eff = moe_hf_wait(ctx, session, table);
             const int64_t count = op->ne[0] * ids->ne[0] * ids->ne[1];

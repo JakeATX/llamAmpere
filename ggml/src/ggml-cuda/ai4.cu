@@ -1515,7 +1515,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
         const int32_t * ids, int64_t ids_stride, int n_expert, const block_q8_1 * x,
         const uint8_t * skip, const uint8_t * resident, char * route_ids, size_t route_ids_stride,
-        float * route_mask) {
+        float * route_mask, int phase) {
     const int u = blockIdx.y, t = blockIdx.z;
     const int native = *(const int32_t *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
     const int h = idm.direct_map ?
@@ -1526,6 +1526,13 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         route_mask[t*idm.direct_n_used + u] = h < 0 ? 1.0f : 0.0f;
     }
     const bool hot = h >= 0 && h < idm.direct_n_expert;
+    // Hit-first split: phase 1 runs before the copy wait (bank and resident routes),
+    // phase 2 after it (all other routes); each route is written by exactly one phase.
+    const int e = ids[t*ids_stride + u];
+    const bool res = phase != 0 && !hot && h < 0 && e >= 0 && e < n_expert && resident[e];
+    if ((phase == 1 && !hot && !res) || (phase == 2 && (hot || res))) {
+        return;
+    }
     if constexpr (!IQ4_BANK) {
         if (hot) {
             if constexpr (SPW) {
@@ -1544,7 +1551,6 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
     constexpr int slabs = SPW ? WARPS : 1;
     const int row0 = blockIdx.x*16*slabs;
     float * out = Y + ((int64_t) t*idm.direct_n_used + u)*M + row0;
-    const int e = ids[t*ids_stride + u];
     if (!hot && (h >= 0 || e < 0 || e >= n_expert || (skip && skip[e] && (!resident || !resident[e])))) {
         if (threadIdx.x < 16*slabs && row0 + threadIdx.x < M) {
             out[threadIdx.x] = 0.0f;
@@ -1655,8 +1661,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8,
         const void * const * table, const uint8_t * skip, const uint8_t * resident,
         const ggml_tensor * route_map, ggml_tensor * route_mask,
-        const int8_t * act_ai_q, const float * act_ai_s) {
+        const int8_t * act_ai_q, const float * act_ai_s, int phase) {
     GGML_ASSERT(ggml_cuda_moe_mixed_supported(bank, base));
+    GGML_ASSERT(phase >= 0 && phase <= 2 && (phase == 0 || resident));
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
     const int K = (int) x->ne[0], M = (int) w->ne[1];
     const int xsh = K % 256 == 0 ? 1 : 0;
@@ -1707,7 +1714,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             (const uint8_t *) w->data, act_ai_q, act_ai_s, (float *) dst->data, M, K, idm, \
             (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
             ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
-            route_map ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr)
+            route_map && phase != 2 ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr, phase)
 #define MOE_MIXED_SINGLE(T, L, XSH, KT, WARPS) \
     if (single) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, true, false); } \
     else        { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, false, false); }
@@ -1748,8 +1755,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     if (trace) {
-        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d\n",
-                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw);
+        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d\n",
+                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase);
     }
 }
 #undef MOE_MIXED_TYPES

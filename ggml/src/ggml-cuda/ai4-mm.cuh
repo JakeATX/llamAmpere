@@ -25,4 +25,4 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8 = nullptr,
         const void * const * table = nullptr, const uint8_t * skip = nullptr, const uint8_t * resident = nullptr,
         const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr,
-        const int8_t * act_ai_q = nullptr, const float * act_ai_s = nullptr);
+        const int8_t * act_ai_q = nullptr, const float * act_ai_s = nullptr, int phase = 0);
