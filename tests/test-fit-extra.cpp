@@ -1195,6 +1195,9 @@ static void test_ram_eval_fit() {
                 "one byte over the live save quota is refused before either copy");
         expect(!common_fit_eval_cache_save_fits(available, true, n_tokens + 1, spec_bytes),
                 "the token copy is charged along with the speculative state");
+        expect(common_fit_eval_cache_save_fits(available, true, 1024, 0) &&
+                !common_fit_eval_cache_save_fits(available, true, budget / sizeof(llama_token) + 1, 0),
+                "a saved prefix can fit while the full slot token copy cannot");
         expect(!common_fit_eval_cache_save_fits(available, true, UINT64_MAX, 0) &&
                 !common_fit_eval_cache_save_fits(available, true, 0, UINT64_MAX),
                 "hostile copy sizes cannot wrap save admission arithmetic");

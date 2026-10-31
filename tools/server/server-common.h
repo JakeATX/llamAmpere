@@ -224,7 +224,7 @@ public:
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
 
-    llama_tokens get_text_tokens() const;
+    llama_tokens get_text_tokens(size_t n_max = SIZE_MAX) const;
 
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);

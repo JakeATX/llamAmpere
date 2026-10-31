@@ -343,6 +343,32 @@ static void test_record_restore_budget(const std::string & root) {
     const size_t marked_copies = allocation_probe::stop();
     CHECK(marked_match == direct_match && marked_copies == 0 && allocation_probe::largest == 0);
 
+    server_tokens marked_source(std::move(marked), false);
+    allocation_probe::start(marked_source.size() * sizeof(llama_token));
+    const llama_tokens full_text = marked_source.get_text_tokens();
+    const size_t full_copies = allocation_probe::stop();
+    CHECK(full_copies == 1 && full_text == tokens);
+    const size_t prefix_count = 1024;
+    allocation_probe::start(prefix_count * sizeof(llama_token));
+    const llama_tokens prefix_text = marked_source.get_text_tokens(prefix_count);
+    const size_t prefix_copies = allocation_probe::stop();
+    CHECK(prefix_copies == 1 && allocation_probe::largest == prefix_count * sizeof(llama_token));
+    CHECK(prefix_text == llama_tokens(tokens.begin(), tokens.begin() + prefix_count));
+    allocation_probe::start(0);
+    const llama_tokens empty_text = marked_source.get_text_tokens(0);
+    allocation_probe::stop();
+    CHECK(empty_text.empty() && allocation_probe::largest == 0);
+    CHECK(marked_source.get_text_tokens(SIZE_MAX) == full_text);
+    CHECK(marked_source.get_text_tokens(marked_source.size() + 1) == full_text);
+    server_tokens all_null(llama_tokens(4, LLAMA_TOKEN_NULL), false);
+    CHECK(all_null.get_text_tokens(2).empty());
+    CHECK(server_tokens().get_text_tokens(2).empty());
+    std::string prefix_id;
+    CHECK(add_entry(ec, prefix_text, {}, small_spec, false, prefix_id));
+    CHECK(ec.read_header(prefix_id, rec, err, record_budget));
+    CHECK(rec.tokens == prefix_text && rec.spec == small_spec);
+    CHECK(ec.read_header(id, rec, err, record_budget));
+
     const llama_token * owned_data = rec.tokens.data();
     allocation_probe::start(payload);
     server_tokens restored(std::move(rec.tokens), false);

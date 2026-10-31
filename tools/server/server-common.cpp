@@ -685,10 +685,13 @@ server_tokens server_tokens::deserialize(const llama_tokens & packed, bool has_m
     return result;
 }
 
-llama_tokens server_tokens::get_text_tokens() const {
+llama_tokens server_tokens::get_text_tokens(size_t n_max) const {
     llama_tokens res;
-    res.reserve(tokens.size());
+    res.reserve(std::min(tokens.size(), n_max));
     for (llama_token t : tokens) {
+        if (res.size() == n_max) {
+            break;
+        }
         if (t != LLAMA_TOKEN_NULL) {
             res.push_back(t);
         }

@@ -3056,14 +3056,13 @@ private:
         if (params_base.fit_params) {
             common_host_memory(total_ram, available_ram);
         }
-        // get_text_tokens() reserves the whole slot, even when only a prefix is saved.
         if (n_tokens < 0 || uint64_t(n_tokens) > slot.prompt.tokens.size() || spec_bytes == SIZE_MAX ||
-                !common_fit_eval_cache_save_fits(available_ram, params_base.fit_params, slot.prompt.tokens.size(), spec_bytes)) {
+                !common_fit_eval_cache_save_fits(available_ram, params_base.fit_params, uint64_t(n_tokens), spec_bytes)) {
             SLT_ERR(slot, "eval cache: entry was not saved because its temporary copies exceed the current RAM fit budget or its size is invalid\n");
             return false;
         }
 
-        llama_tokens tokens = slot.prompt.tokens.get_text_tokens();
+        llama_tokens tokens = slot.prompt.tokens.get_text_tokens(size_t(n_tokens));
         if (uint64_t(n_tokens) > tokens.size()) {
             SLT_ERR(slot, "eval cache: entry has fewer text tokens than requested\n");
             return false;
