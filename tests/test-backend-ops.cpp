@@ -11953,6 +11953,43 @@ struct test_moe_bank_mixed : public test_case {
     }
 };
 
+struct test_moe_bank_mixed_exact : public test_moe_bank_mixed {
+    ggml_tensor * mixed_result = nullptr;
+    ggml_tensor * reference_result = nullptr;
+    test_moe_bank_mixed_exact(ggml_type bank_type, int width) :
+        test_moe_bank_mixed(bank_type, GGML_TYPE_IQ4_NL, width, 1, 4, false, false, 640, 2560) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED_EXACT"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        mixed_result = test_moe_bank_mixed::build_graph(ctx);
+        ggml_set_output(mixed_result);
+        ggml_build_forward_expand(gf, mixed_result);
+        ggml_tensor * h = mixed_result->src[0], * c = mixed_result->src[1]->src[0];
+        ggml_tensor * hot = ggml_mul_mat_id(ctx, h->src[0], h->src[1], h->src[2]);
+        ggml_set_output(hot);
+        ggml_build_forward_expand(gf, hot);
+        ggml_tensor * cold = ggml_mul_mat_id(ctx, c->src[0], c->src[1], c->src[2]);
+        reference_result = ggml_add(ctx, hot, ggml_mul(ctx, cold, mixed_result->src[1]->src[1]));
+        ggml_set_output(reference_result);
+        return reference_result;
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { mixed_result, reference_result }; }
+    bool verify_backend_result(ggml_backend_t backend) override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        const char * disabled = getenv("GGML_CUDA_DISABLE_FUSION");
+        if ((enabled && !atoi(enabled)) || (disabled && atoi(disabled))) { return true; }
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count")) { return true; }
+        std::vector<uint32_t> actual(ggml_nelements(mixed_result)), expected(actual.size());
+        ggml_backend_tensor_get(mixed_result, actual.data(), 0, actual.size()*sizeof(uint32_t));
+        ggml_backend_tensor_get(reference_result, expected.data(), 0, expected.size()*sizeof(uint32_t));
+        if (actual != expected) {
+            printf("mixed hot projection differs from native projection ");
+            return false;
+        }
+        return true;
+    }
+};
+
 struct test_moe_bank_routing : public test_moe_bank_mixed {
     const bool strided_ids;
     ggml_tensor * native_ids = nullptr;
@@ -19054,6 +19091,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int width : { 1, 4, 5, 8 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_IQ4_NL }) {
+            test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width));
+        }
         for (bool strided_ids : { false, true }) {
             test_cases.emplace_back(new test_moe_bank_routing(width, strided_ids));
         }

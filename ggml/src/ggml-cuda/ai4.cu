@@ -1419,6 +1419,40 @@ static __device__ __forceinline__ void moe_mixed_down_rows(const char * w, const
     }
 }
 
+// A one-token IQ4_NL bank uses generic MMVQ: merge four K partitions before the lane butterfly.
+static __device__ __forceinline__ void moe_mixed_iq4_hot_single(
+        const char * w, const block_q8_1 * x, float * y, int K) {
+    constexpr int qk = ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk;
+    constexpr int qi = ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qi;
+    constexpr int vdr = moe_mixed_dot<GGML_TYPE_IQ4_NL>::vdr;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float sum[16] = {};
+    for (int k = tid/(qi/vdr); k < K/qk; k += 128*vdr/qi) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            sum[r] += moe_mixed_dot<GGML_TYPE_IQ4_NL>::dot(
+                    w, x + k*(qk/QK8_1), r*(K/qk) + k, vdr*(tid%(qi/vdr)));
+        }
+    }
+    extern __shared__ __align__(16) uint8_t smem[];
+    float (*partial)[16][32] = (float (*)[16][32]) smem;
+    if (warp > 0) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) { partial[warp - 1][r][lane] = sum[r]; }
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+#pragma unroll
+            for (int p = 0; p < 3; ++p) { sum[r] += partial[p][r][lane]; }
+            sum[r] = warp_reduce_sum<32>(sum[r]);
+            if (lane == 0) { y[r] = sum[r]; }
+        }
+    }
+    __syncthreads(); // another slab may reuse partial in this block
+}
+
 template <int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW>
 static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
@@ -1459,6 +1493,12 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
     for (int slab = 0; slab < slabs && row0 + slab*16 < M; ++slab) {
         const char * sw = w + (size_t) slab*16*row_stride;
         float * sy = out + slab*16;
+        if constexpr (WARPS == 4) {
+            if (hot && bank_type == GGML_TYPE_IQ4_NL && gridDim.z == 1) {
+                moe_mixed_iq4_hot_single(sw, x, sy, K);
+                continue;
+            }
+        }
         switch (hot ? bank_type : type) {
 #define MOE_MIXED_CASE(T, F, V) case T: \
         if constexpr (T == GGML_TYPE_Q2_0 || T == GGML_TYPE_IQ4_NL) { \
@@ -1574,11 +1614,13 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     const dim3 grid(spw ? (M/16 + 3)/4 : M/16, ids->ne[0], ids->ne[1]);
     static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
     const int cfg = ai4_mmvr_cfg();
-    const bool two_warps = cfg == 212 || (cfg == 0 && ids->ne[1] > 1 && K >= 1024);
+    const bool iq4_hot_single = w->type == GGML_TYPE_IQ4_NL && ids->ne[1] == 1;
+    const size_t iq4_smem = iq4_hot_single ? 3*16*32*sizeof(float) : 0;
+    const bool two_warps = !iq4_hot_single && (cfg == 212 || (cfg == 0 && ids->ne[1] > 1 && K >= 1024));
     static const bool single = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0 ||
                                ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
 #define MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, SINGLE, SPW) \
-    moe_mixed_mmv<L, XSH, KT, WARPS, SINGLE, SPW><<<grid, WARPS*32, WARPS*2*ai4k::mmv_stage_bytes<true, L>(), ctx.stream()>>>( \
+    moe_mixed_mmv<L, XSH, KT, WARPS, SINGLE, SPW><<<grid, WARPS*32, std::max((size_t) (WARPS*2*ai4k::mmv_stage_bytes<true, L>()), iq4_smem), ctx.stream()>>>( \
             (const uint8_t *) w->data, q.get(), s.get(), (float *) dst->data, M, K, idm, \
             w->type, (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
             ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
