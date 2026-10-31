@@ -1415,11 +1415,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
 
         bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        common_speculative_apply_mtp_sampling_default(params);
         const bool any_mtp = adaptive_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-        if (any_mtp && !params.sampling.spec_lossy_explicit) {
-            params.sampling.spec_lossy = true;
-            LOG_INF("FYI: mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling\n");
-        }
         // mb-MTP with no depth flags: adaptive depth 3..5 (as --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3
         // --spec-draft-n-max 5); an explicit --spec-draft-n-max or --spec-draft-n-min-adaptive keeps the user's depth
         if (any_mtp && params.sampling.spec_lossy &&
@@ -1436,7 +1433,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (params.speculative.draft.depth_policy == "cdepth" && !adaptive_mtp) {
             throw std::invalid_argument("error: --spec-depth-policy cdepth needs --spec-type draft-mtp-adaptive");
         }
-
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());

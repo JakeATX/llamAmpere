@@ -113,7 +113,8 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 // n_accepted_ctrl >= 0 caps what the adaptive depth controller sees (mode-biased MTP passes the exact rule's count, so
 // the depth choices, and with them the work per round, stay those of exact acceptance); -1 = n_accepted.
-void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted, int32_t n_accepted_ctrl = -1);
+// n_drafted keeps the attempted width across a checkpoint restore (-1 uses the drafter's current state).
+void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted, int32_t n_accepted_ctrl = -1, int32_t n_drafted = -1);
 
 // target top-1 probabilities (request-matched) of the tokens one verify round committed; feeds the CDEPTH history.
 // Call once per verify round, not for the re-decode after a checkpoint restore. Unknown entries are negative.
