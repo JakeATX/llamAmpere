@@ -12073,6 +12073,14 @@ struct test_moe_bank_mixed_reduce : public test_moe_bank_mixed {
     test_moe_bank_mixed_reduce(ggml_type bank_type, int width) :
         test_moe_bank_mixed(bank_type, GGML_TYPE_IQ4_NL, width, 2, 4, false, false, 640, 2560) {}
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED_REDUCE"; }
+    const char * required_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return !enabled || atoi(enabled) ? "moe_bank_mixed_reduce" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return enabled && !atoi(enabled) ? "moe_bank_mixed_reduce" : nullptr;
+    }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * experts = test_moe_bank_mixed::build_graph(ctx);
         ggml_tensor * cold_mask = experts->src[1]->src[1];
@@ -12108,7 +12116,24 @@ struct test_moe_bank_mixed_reduce : public test_moe_bank_mixed {
         ggml_backend_tensor_get(mixed_result, actual.data(), 0, actual.size()*sizeof(uint32_t));
         ggml_backend_tensor_get(reference_result, expected.data(), 0, expected.size()*sizeof(uint32_t));
         if (actual != expected) {
-            printf("mixed reduction differs from separate bank sums ");
+            size_t first = actual.size(), count = 0;
+            double max_abs = 0.0;
+            uint32_t max_ulp = 0;
+            auto ordered = [](uint32_t bits) { return bits & 0x80000000u ? ~bits : bits ^ 0x80000000u; };
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (actual[i] == expected[i]) { continue; }
+                if (first == actual.size()) { first = i; }
+                ++count;
+                float a, b;
+                memcpy(&a, &actual[i], sizeof(a)); memcpy(&b, &expected[i], sizeof(b));
+                max_abs = std::max(max_abs, std::abs(double(a) - double(b)));
+                const uint32_t oa = ordered(actual[i]), ob = ordered(expected[i]);
+                max_ulp = std::max(max_ulp, oa > ob ? oa - ob : ob - oa);
+            }
+            float a, b;
+            memcpy(&a, &actual[first], sizeof(a)); memcpy(&b, &expected[first], sizeof(b));
+            printf("mixed reduction differs: first=%zu actual=%.9g/%08x expected=%.9g/%08x count=%zu max_abs=%.9g max_ulp=%u ",
+                    first, a, actual[first], b, expected[first], count, max_abs, max_ulp);
             return false;
         }
         return true;
