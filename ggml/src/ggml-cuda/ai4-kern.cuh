@@ -944,16 +944,24 @@ constexpr __host__ __device__ int64_t mmvr_toff(int c) { return (int64_t) c*WARP
 template <int LAY, int WARPS>
 constexpr __host__ __device__ int64_t mmvr_soff(int c) { return (int64_t) c*WARPS*u_bytes<LAY>(); }
 
-template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false, bool SPW = false>
+struct mmvr_group {
+    int n;
+    int rows[MMV_ID_BN];
+    int cols[MMV_ID_BN];
+};
+
+template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false, bool SPW = false, bool GROUPED = false>
 static __device__ __forceinline__ void mmvr_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
-        float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm) {
+        float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm,
+        const mmvr_group * group = nullptr) {
     static_assert(!SINGLE_N || !ID || DIRECT, "single-column dense or direct scope");
     constexpr int KR = lay_rate<LAY>();
     static_assert(SPLITS == 1 || (!ID && WARPS == 4 && (KT == 5120 || KT == 17408)), "small split scope");
     static_assert(!FUSED_X || DIRECT, "fused activation needs direct ids");
     static_assert(KR == 2 || KR == 3 || KR == 4, "mmvr: rates 2, 3 and 4");
     static_assert(!SPW || (ID && DIRECT && SPLITS == 1 && !FUSED_X), "slab-per-warp scope");
+    static_assert(!GROUPED || (SPW && !SINGLE_N), "grouped slab-per-warp scope");
     constexpr int CW = SPW ? 1 : WARPS;
     static_assert(STAGES % 2 == 0, "mmvr: even stages (activation double buffer)");
     static_assert(WARPS >= 2 && (WARPS & (WARPS - 1)) == 0 && WARPS <= 16, "mmvr warps");
@@ -993,7 +1001,13 @@ static __device__ __forceinline__ void mmvr_body(
         }
         W += (int64_t) e*idm.nb02;
         direct_row = tok*idm.direct_ne11 + (idm.direct_ne11 == 1 ? 0 : u);
-        N = 1;
+        if constexpr (GROUPED) {
+            N = group->n;
+            prow = group->rows;
+            pcol = group->cols;
+        } else {
+            N = 1;
+        }
     } else if constexpr (ID) {
         if ((int) blockIdx.y >= idm.hdr[1]) {
             return;
@@ -1006,7 +1020,8 @@ static __device__ __forceinline__ void mmvr_body(
         pcol = idm.cols + o;
     }
     auto xrow = [&](int c) -> int64_t {
-        if constexpr (DIRECT) { return direct_row; }
+        if constexpr (GROUPED) { return prow[c]; }
+        else if constexpr (DIRECT) { return direct_row; }
         else if constexpr (ID) { return prow[c]; }
         else { return c; }
     };
@@ -1187,7 +1202,18 @@ static __device__ __forceinline__ void mmvr_body(
 
     if constexpr (SPW) {
         const int r = slab*16 + g;
-        if (t == 0) {
+        if constexpr (GROUPED) {
+            // Each MMA column retains the direct SPW K order; only its input/output row changes.
+            const int c = 2*t;
+            if (c < N) {
+                Y[(int64_t) pcol[c]*ldy + r]     = acc[0];
+                Y[(int64_t) pcol[c]*ldy + r + 8] = acc[2];
+            }
+            if (c + 1 < N) {
+                Y[(int64_t) pcol[c + 1]*ldy + r]     = acc[1];
+                Y[(int64_t) pcol[c + 1]*ldy + r + 8] = acc[3];
+            }
+        } else if (t == 0) {
             const int64_t col = (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
             Y[col*ldy + r]     = acc[0];
             Y[col*ldy + r + 8] = acc[2];

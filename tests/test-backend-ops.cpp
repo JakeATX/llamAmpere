@@ -11898,12 +11898,15 @@ struct test_moe_bank_mixed : public test_case {
     const ggml_type bank_type, base_type;
     const int width, mode, channels;
     const bool extra_reader, reduce;
-    const int n_in, n_out;
+    const int n_in, n_out, n_used;
     test_moe_bank_mixed(ggml_type bank_type, ggml_type base_type, int width, int mode, int channels,
-            bool extra_reader = false, bool reduce = false, int n_in = 256, int n_out = 32) :
+            bool extra_reader = false, bool reduce = false, int n_in = 256, int n_out = 32, int n_used = 4) :
         bank_type(bank_type), base_type(base_type), width(width), mode(mode), channels(channels),
-        extra_reader(extra_reader), reduce(reduce), n_in(n_in), n_out(n_out) {}
-    std::string vars() override { return VARS_TO_STR9(bank_type, base_type, width, mode, channels, extra_reader, reduce, n_in, n_out); }
+        extra_reader(extra_reader), reduce(reduce), n_in(n_in), n_out(n_out), n_used(n_used) {}
+    std::string vars() override {
+        return VARS_TO_STR9(bank_type, base_type, width, mode, channels, extra_reader, reduce, n_in, n_out) +
+                "," + VAR_TO_STR(n_used);
+    }
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -11931,17 +11934,17 @@ struct test_moe_bank_mixed : public test_case {
         ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
         ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, channels, width);
-        ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
-        ggml_tensor * ci = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
+        ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, width);
+        ggml_tensor * ci = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, width);
         ggml_set_name(hi, "mixed_bank_ids"); ggml_set_name(ci, "mixed_base_ids");
         ggml_tensor * mask = ggml_reshape_3d(ctx,
-                ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, hi, GGML_TYPE_F32), -1.0f, -0.5f)), 1, 4, width);
+                ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, hi, GGML_TYPE_F32), -1.0f, -0.5f)), 1, n_used, width);
         ggml_build_forward_expand(gf, mask);
         ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, hi);
         ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ci);
         ggml_tensor * out = ggml_add(ctx, h, ggml_mul(ctx, c, mask));
         if (reduce) {
-            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 4, width);
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, width);
             out = ggml_reshape_2d(ctx, ggml_sum_rows(ctx,
                     ggml_cont(ctx, ggml_permute(ctx, ggml_mul(ctx, out, weights), 1, 0, 2, 3))), n_out, width);
         }
@@ -11951,10 +11954,10 @@ struct test_moe_bank_mixed : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32 && t->op == GGML_OP_NONE) {
                 const bool bank = strcmp(t->name, "mixed_bank_ids") == 0;
-                std::vector<int32_t> values(4*width);
-                for (int j = 0; j < 4*width; ++j) {
+                std::vector<int32_t> values(n_used*width);
+                for (int j = 0; j < n_used*width; ++j) {
                     const bool hot = mode == 1 || (mode == 2 && (j%3) != 0);
-                    values[j] = bank ? (hot ? (j*3 + j/4)%4 : -1) : (j + j/4)%4;
+                    values[j] = bank ? (hot ? (j*3 + j/n_used)%4 : -1) : (j + j/n_used)%4;
                 }
                 ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
             } else if (is_ai4_family(t->type)) {
@@ -11967,14 +11970,50 @@ struct test_moe_bank_mixed : public test_case {
 };
 
 struct test_moe_bank_mixed_exact : public test_moe_bank_mixed {
+    const bool repeated_routes, mapped_routes;
     ggml_tensor * mixed_result = nullptr;
     ggml_tensor * reference_result = nullptr;
+    ggml_tensor * native_ids = nullptr;
+    ggml_tensor * route_map = nullptr;
+    std::vector<int32_t> expected_ids;
+    std::vector<float> expected_mask;
     test_moe_bank_mixed_exact(ggml_type bank_type, int width, ggml_type base_type = GGML_TYPE_IQ4_NL,
-            int mode = 1, int channels = 4, int n_in = 640, int n_out = 2560) :
-        test_moe_bank_mixed(bank_type, base_type, width, mode, channels, false, false, n_in, n_out) {}
+            int mode = 1, int channels = 4, int n_in = 640, int n_out = 2560,
+            bool repeated_routes = false, bool mapped_routes = false, int n_used = 4) :
+        test_moe_bank_mixed(bank_type, base_type, width, mode, channels, false, false, n_in, n_out, n_used),
+        repeated_routes(repeated_routes), mapped_routes(mapped_routes) {}
+    std::string vars() override {
+        return test_moe_bank_mixed::vars() + "," + VAR_TO_STR(repeated_routes) + "," + VAR_TO_STR(mapped_routes);
+    }
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED_EXACT"; }
+    const char * required_fusion() override {
+        const char * required = test_moe_bank_mixed::required_fusion();
+        return mapped_routes && required ? "moe_bank_routing" : required;
+    }
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        mixed_result = test_moe_bank_mixed::build_graph(ctx);
+        if (mapped_routes) {
+            ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
+            ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, channels, width);
+            native_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used + 2, width);
+            ggml_set_name(native_ids, "mixed_base_ids");
+            ggml_tensor * ids = ggml_view_2d(ctx, native_ids, n_used, width, native_ids->nb[1], 0);
+            route_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 4);
+            ggml_build_forward_expand(gf, ids);
+            ggml_build_forward_expand(gf, x);
+            ggml_tensor * flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ids), n_used*width, 1);
+            ggml_tensor * slot = ggml_reshape_3d(ctx, ggml_get_rows(ctx, route_map, flat), 1, n_used, width);
+            ggml_tensor * hi = ggml_cast(ctx, ggml_reshape_2d(ctx, slot, n_used, width), GGML_TYPE_I32);
+            ggml_tensor * mask = ggml_reshape_3d(ctx,
+                    ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, hi, GGML_TYPE_F32), -1.0f, -0.5f)), 1, n_used, width);
+            ggml_set_output(hi);
+            ggml_set_output(mask);
+            ggml_build_forward_expand(gf, mask);
+            mixed_result = ggml_add(ctx, ggml_mul_mat_id(ctx, hw, x, hi),
+                    ggml_mul(ctx, ggml_mul_mat_id(ctx, cw, x, ids), mask));
+        } else {
+            mixed_result = test_moe_bank_mixed::build_graph(ctx);
+        }
         ggml_set_output(mixed_result);
         ggml_build_forward_expand(gf, mixed_result);
         ggml_tensor * h = mixed_result->src[0], * c = mixed_result->src[1]->src[0];
@@ -11985,6 +12024,34 @@ struct test_moe_bank_mixed_exact : public test_moe_bank_mixed {
         reference_result = ggml_add(ctx, hot, ggml_mul(ctx, cold, mixed_result->src[1]->src[1]));
         ggml_set_output(reference_result);
         return reference_result;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_moe_bank_mixed::initialize_tensors(ctx);
+        if (!repeated_routes) { return; }
+        // The all-hot case has n_used*width occurrences of one bank slot. Mixed cases
+        // interleave cold routes and a second hot slot, including odd final groups.
+        const float map[] = { 2.0f, -1.0f, 0.0f, 3.0f };
+        std::vector<int32_t> native(n_used*width);
+        expected_ids.resize(n_used*width);
+        expected_mask.resize(n_used*width);
+        for (int j = 0; j < n_used*width; ++j) {
+            native[j] = mode == 1 ? 0 : j%5 == 0 ? 1 : j%7 == 0 ? 2 : 0;
+            expected_ids[j] = (int32_t) map[native[j]];
+            expected_mask[j] = expected_ids[j] < 0 ? 1.0f : 0.0f;
+        }
+        if (mapped_routes) {
+            ggml_backend_tensor_set(route_map, map, 0, sizeof(map));
+            std::vector<int32_t> storage((n_used + 2)*width, 3);
+            for (int t = 0; t < width; ++t) {
+                std::copy_n(native.data() + n_used*t, n_used, storage.data() + (n_used + 2)*t);
+            }
+            ggml_backend_tensor_set(native_ids, storage.data(), 0, storage.size()*sizeof(int32_t));
+        } else {
+            ggml_tensor * hi = mixed_result->src[0]->src[2];
+            ggml_tensor * ci = mixed_result->src[1]->src[0]->src[2];
+            ggml_backend_tensor_set(hi, expected_ids.data(), 0, expected_ids.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(ci, native.data(), 0, native.size()*sizeof(int32_t));
+        }
     }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { mixed_result, reference_result }; }
     bool verify_backend_result(ggml_backend_t backend) override {
@@ -11999,6 +12066,16 @@ struct test_moe_bank_mixed_exact : public test_moe_bank_mixed {
         if (actual != expected) {
             printf("mixed projection differs from native projection ");
             return false;
+        }
+        if (mapped_routes) {
+            std::vector<int32_t> ids(expected_ids.size());
+            std::vector<float> mask(expected_mask.size());
+            ggml_backend_tensor_get(mixed_result->src[0]->src[2], ids.data(), 0, ids.size()*sizeof(int32_t));
+            ggml_backend_tensor_get(mixed_result->src[1]->src[1], mask.data(), 0, mask.size()*sizeof(float));
+            if (ids != expected_ids || mask != expected_mask) {
+                printf("grouped routing metadata differs from native map ");
+                return false;
+            }
         }
         return true;
     }
@@ -19144,6 +19221,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_IQ4_NL }) {
             test_cases.emplace_back(new test_moe_bank_mixed_reduce(bank, width));
+        }
+    }
+
+    // Explicit repeated routes exercise SPW columns, same-token duplicates, owners at
+    // ranks 8/16/24, raw-map routing, odd group tails, and the last partial output CTA.
+    for (int width : { 4, 5, 8 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+            for (int channels : { 1, 4 }) {
+                for (bool mapped : { false, true }) {
+                    if (mapped && channels != 1) { continue; } // routing-prefix fusion is an up/gate path
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, GGML_TYPE_IQ4_NL,
+                            1, channels, 640, 80, true, mapped));
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, GGML_TYPE_IQ4_NL,
+                            2, channels, 2560, 640, true, mapped));
+                }
+            }
+        }
+    }
+    // Production top-k10 crosses ballot chunks at both 32 and 64 routes.
+    for (int width : { 5, 8 }) {
+        for (int channels : { 1, 10 }) {
+            for (bool mapped : { false, true }) {
+                if (mapped && channels != 1) { continue; }
+                for (int mode : { 1, 2 }) {
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT2_U, width,
+                            GGML_TYPE_IQ4_NL, mode, channels, 640, 80, true, mapped, 10));
+                }
+            }
         }
     }
 

@@ -1453,6 +1453,62 @@ static __device__ __forceinline__ void moe_mixed_iq4_hot_single(
     __syncthreads(); // another slab may reuse partial in this block
 }
 
+// Each eighth occurrence owns the following <=8 matching routes. Scan immutable inputs,
+// including the native-ID map on the first projection, never another CTA's route_ids stores.
+static __device__ __forceinline__ void moe_mixed_group(const ai4k::idmap & idm, int h, ai4k::mmvr_group & group) {
+    if (gridDim.z == 1) {
+        // Decode top-k IDs are normally unique; duplicates remain independent, as before.
+        if (threadIdx.x == 0) {
+            group.n = 1;
+            group.rows[0] = blockIdx.y % idm.direct_ne11;
+            group.cols[0] = blockIdx.y;
+        }
+        __syncthreads();
+        return;
+    }
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        const int own = (int) blockIdx.z*idm.direct_n_used + blockIdx.y;
+        const int routes = (int) gridDim.z*idm.direct_n_used;
+        const unsigned lower_lanes = (1u << lane) - 1u;
+        int before = 0, count = 0;
+        for (int first = 0; first < routes; first += 32) {
+            const int route = first + lane;
+            int slot = -1;
+            if (route < routes) {
+                const int u = route % idm.direct_n_used, t = route / idm.direct_n_used;
+                const int native = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
+                slot = idm.direct_map ?
+                        (native >= 0 && native < idm.direct_map_size ? (int) idm.direct_map[native] : -1) : native;
+            }
+            const unsigned matches = __ballot_sync(0xffffffffu, slot == h);
+            const unsigned prior = __ballot_sync(0xffffffffu, slot == h && route < own);
+            before += __popc(prior);
+            if (first + 32 <= own) {
+                continue;
+            }
+            if (before % ai4k::MMV_ID_BN != 0) {
+                break;
+            }
+            const unsigned following = matches & ~prior;
+            const int index = count + __popc(following & lower_lanes);
+            if ((following & (1u << lane)) && index < ai4k::MMV_ID_BN) {
+                const int u = route % idm.direct_n_used, t = route / idm.direct_n_used;
+                group.rows[index] = t*idm.direct_ne11 + u % idm.direct_ne11;
+                group.cols[index] = route;
+            }
+            count += __popc(following);
+            if (count >= ai4k::MMV_ID_BN) {
+                break;
+            }
+        }
+        if (lane == 0) {
+            group.n = min(count, ai4k::MMV_ID_BN);
+        }
+    }
+    __syncthreads();
+}
+
 template <ggml_type BASE, bool IQ4_BANK, int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW>
 static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
@@ -1472,7 +1528,16 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
     const bool hot = h >= 0 && h < idm.direct_n_expert;
     if constexpr (!IQ4_BANK) {
         if (hot) {
-            ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, SPW>(W, q, s, Y, M, M, 1, K, idm);
+            if constexpr (SPW) {
+                __shared__ ai4k::mmvr_group group;
+                moe_mixed_group(idm, h, group);
+                if (group.n == 0) {
+                    return;
+                }
+                ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(W, q, s, Y, M, M, 1, K, idm, &group);
+            } else {
+                ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, false>(W, q, s, Y, M, M, 1, K, idm);
+            }
             return;
         }
     }
