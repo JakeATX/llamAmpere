@@ -1225,7 +1225,12 @@ static void test_vram_fit_floor() {
     constexpr size_t MiB = 1024 * 1024;
     namespace fs = std::filesystem;
     const auto dir = fs::temp_directory_path() / ("test-vram-fit-" + std::to_string(ggml_time_us()));
+    fs::create_directories(dir);
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "empty DRM inventory cannot prove headless operation");
+    fs::create_directories(dir / "card0");
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "card without connector status keeps the unknown display floor");
     fs::create_directories(dir / "card0-DP-1");
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "connector without status cannot prove headless operation");
     const auto status = dir / "card0-DP-1" / "status";
     std::ofstream(status) << "disconnected\n";
     expect(common_fit_vram_floor_detect(dir.string(), false) == 300 * MiB, "disconnected display uses headless floor");
@@ -1242,6 +1247,12 @@ static void test_vram_fit_floor() {
     expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "missing DRM inventory keeps larger floor");
 
     for (size_t floor : {300 * MiB, 800 * MiB}) {
+        for (size_t headroom : {size_t(0), floor - 1, floor, floor + 1}) {
+            const auto status = common_fit_vram_margin_status(1024 * MiB, 1024 * MiB - headroom, floor);
+            const bool fits = headroom >= floor;
+            expect((status == COMMON_PARAMS_FIT_STATUS_SUCCESS) == fits, "zero-layer buffers must leave the requested margin before fit succeeds");
+            expect(common_fit_verify_compact_safe(status, {floor}, floor) == fits, "compact verify must reject actual positive headroom below its requested floor");
+        }
         common_params params;
         const auto automatic = common_fit_vram_targets(params, floor);
         expect(std::all_of(automatic.begin(), automatic.end(),
@@ -1263,6 +1274,11 @@ static void test_vram_fit_floor() {
         expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_FAILURE, {floor}, floor), "failed fit cannot enable compact verify");
         expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {}, floor), "empty fit cannot enable compact verify");
     }
+    expect(common_fit_vram_margin_status(1024 * MiB, 1024 * MiB + 1, 0) == COMMON_PARAMS_FIT_STATUS_NO_ROOM, "buffers exceeding free bytes remain a hard no-room result");
+    expect(common_fit_vram_margin_status(-1, 0, 0) == COMMON_PARAMS_FIT_STATUS_NO_ROOM, "negative free bytes cannot fit");
+    expect(common_fit_vram_margin_status(INT64_MAX, SIZE_MAX, 0) == COMMON_PARAMS_FIT_STATUS_NO_ROOM, "large buffer sizes cannot wrap the headroom subtraction");
+    expect(common_fit_vram_margin_status(INT64_MAX, 0, SIZE_MAX) == COMMON_PARAMS_FIT_STATUS_FAILURE, "large requested margins cannot wrap into a successful fit");
+    expect(common_fit_vram_margin_status(1024 * MiB, 1024 * MiB, 0) == COMMON_PARAMS_FIT_STATUS_SUCCESS, "explicit zero margin accepts the exact allocation boundary");
     expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {300 * MiB}, 800 * MiB), "display floor disables compact verify with an explicit headless margin");
     expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {1}, 0), "compact verify retains its minimum safety floor");
 

@@ -99,6 +99,7 @@ size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_s
     }
     std::error_code ec;
     std::filesystem::directory_iterator it(drm_root, ec), end;
+    bool connector_seen = false;
     for (; !ec && it != end; it.increment(ec)) {
         const auto path = it->path() / "status";
         const bool exists = std::filesystem::exists(path, ec);
@@ -113,8 +114,9 @@ size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_s
         if (!(file >> status) || status != "disconnected") {
             return safe;
         }
+        connector_seen = true;
     }
-    return ec ? safe : common_fit_vram_floor(false);
+    return ec || !connector_seen ? safe : common_fit_vram_floor(false);
 }
 
 std::vector<size_t> common_fit_vram_targets(const common_params & params, size_t floor) {
@@ -254,6 +256,8 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
         common_moe_cache_fit_device & device = result.devices[device_index];
         device.free_bytes = std::min(device.free_bytes, input.free_bytes);
         device.compute_capability = std::min(device.compute_capability, input.compute_capability);
+        // fork: the fit floor and cache reserve protect the same free device memory.
+        device.reserve_bytes = std::max(device.reserve_bytes, std::max(reserve_bytes, input.margin_bytes));
         if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
             result.reason = "device memory accounting overflowed";
             LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
@@ -269,10 +273,10 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
 
     for (common_moe_cache_fit_device & device : result.devices) {
         const int64_t projected_free = device.free_bytes - device.used_bytes;
-        if (projected_free <= 0 || (uint64_t)projected_free <= reserve_bytes) {
+        if (projected_free <= 0 || (uint64_t)projected_free <= device.reserve_bytes) {
             continue;
         }
-        device.cache_bytes = (size_t)projected_free - reserve_bytes;
+        device.cache_bytes = (size_t)projected_free - device.reserve_bytes;
         if (budget_bytes > 0) {
             device.cache_bytes = std::min(device.cache_bytes, budget_bytes);
         }
@@ -430,7 +434,7 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
             return result;
         }
         device_inputs.push_back({caps.physical_device, caps.compute_capability,
-                memory[index].free - margins[index], memory[index].mb.total()});
+                memory[index].free, memory[index].mb.total(), (size_t) margins[index]});
         min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
     }
 
@@ -675,6 +679,14 @@ common_fit_extra_memory common_fit_extra_memory_at(
     return ret;
 }
 
+common_params_fit_status common_fit_vram_margin_status(int64_t free_bytes, size_t used_bytes, size_t margin_bytes) {
+    if (free_bytes < 0 || used_bytes > (uint64_t)free_bytes) {
+        return COMMON_PARAMS_FIT_STATUS_NO_ROOM;
+    }
+    return (uint64_t)free_bytes - used_bytes >= margin_bytes ?
+        COMMON_PARAMS_FIT_STATUS_SUCCESS : COMMON_PARAMS_FIT_STATUS_FAILURE;
+}
+
 bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins, size_t floor) {
     if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || margins.empty()) {
         return false;
@@ -839,6 +851,11 @@ static void common_params_fit_impl(
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
+    for (size_t id = 0; id < std::max(size_t(1), nd); id++) {
+        if (margins_s[id] > INT64_MAX) {
+            throw common_params_fit_exception("requested free memory margin exceeds the supported size");
+        }
+    }
     if (nd == 0) {
         margins.push_back(margins_s[0]);
     } else {
@@ -1009,8 +1026,14 @@ static void common_params_fit_impl(
                                 LOG_TRC("%s: context size %" PRIu32 " is projected %" PRId64 " MiB over the target -> reduced to %" PRIu32 "\n",
                                     __func__, n_ctx_prev, deficit/MiB, cparams->n_ctx);
                             }
-                            LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
-                            return;
+                            dmds_t dmds_chk = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                            add_extra_memory(dmds_chk);
+                            const auto & memory = nd == 0 ? dmds_chk.back() : dmds_chk[0];
+                            const int64_t free_bytes = nd == 0 ? memory.total : memory.free;
+                            if (common_fit_vram_margin_status(free_bytes, memory.mb.total(), margins_s[0]) == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                                LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
+                                return;
+                            }
                         }
                         LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
                     } else {
@@ -1357,6 +1380,10 @@ static void common_params_fit_impl(
             throw common_params_fit_no_room(dev_names[id] + " would need " + std::to_string(mem[id]/MiB) +
                 " MiB with every layer's weights in system memory, but has " + std::to_string(dmds_full[id].free/MiB) +
                 " MiB free: the compute buffers and caches alone do not fit (a draft or MTP model counts too); lower -ub, -b or -c");
+        }
+        // fork: positive headroom can still miss the requested floor with no GPU layers.
+        if (common_fit_vram_margin_status(dmds_full[id].free, mem[id], margins_s[id]) != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            throw common_params_fit_exception(dev_names[id] + " cannot leave the requested free memory margin; lower -ub, -b or -c");
         }
     }
 

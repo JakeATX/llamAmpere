@@ -61,6 +61,7 @@ struct common_moe_cache_fit_device_input {
     int compute_capability = 0;
     int64_t free_bytes = 0;
     size_t used_bytes = 0;
+    size_t margin_bytes = 0;
 };
 
 struct common_moe_cache_fit_shape_input {
@@ -77,6 +78,7 @@ struct common_moe_cache_fit_device {
     int compute_capability = 0;
     int64_t free_bytes = 0;
     int64_t used_bytes = 0;
+    size_t reserve_bytes = 0;
     size_t cache_bytes = 0;
 };
 
@@ -103,6 +105,9 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
     COMMON_PARAMS_FIT_STATUS_NO_ROOM = 3, // no allocation can fit, even with every layer's weights in system memory
 };
+
+// fork: classify measured allocations before treating requested margins as a proven fit.
+common_params_fit_status common_fit_vram_margin_status(int64_t free_bytes, size_t used_bytes, size_t margin_bytes);
 
 // fork: require a proven fit with the device floor left on every device.
 bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins, size_t floor = 300u * 1024 * 1024);
