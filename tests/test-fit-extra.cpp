@@ -10,7 +10,32 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <new>
 #include <string>
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
+
+namespace allocation_probe {
+static thread_local bool active = false;
+static thread_local size_t largest = 0;
+}
+
+void * operator new(size_t n) {
+    if (allocation_probe::active) {
+        allocation_probe::largest = std::max(allocation_probe::largest, n);
+    }
+    if (void * p = std::malloc(n ? n : 1)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void operator delete(void * p) noexcept { std::free(p); }
+void operator delete(void * p, size_t) noexcept { std::free(p); }
+void * operator new[](size_t n) { return ::operator new(n); }
+void operator delete[](void * p) noexcept { ::operator delete(p); }
+void operator delete[](void * p, size_t) noexcept { ::operator delete(p); }
 
 static int failures = 0;
 
@@ -19,6 +44,115 @@ static void expect(bool condition, const char * message) {
         std::fprintf(stderr, "FAIL: %s\n", message);
         failures++;
     }
+}
+
+static std::vector<char> ngram_old_file_bytes(const common_ngram_cache & cache, common_ngram_cache_vocab_id vocab) {
+    std::vector<char> payload;
+    uint64_t n_ngrams = 0;
+    const auto append = [](std::vector<char> & dst, const void * data, size_t size) {
+        const char * bytes = static_cast<const char *>(data);
+        dst.insert(dst.end(), bytes, bytes + size);
+    };
+    for (const auto & item : cache) {
+        int32_t n_tokens = 0;
+        for (const auto & token : item.second) {
+            n_tokens += token.second > 0;
+        }
+        if (!n_tokens) {
+            continue;
+        }
+        append(payload, item.first.tokens, sizeof(item.first.tokens));
+        append(payload, &n_tokens, sizeof(n_tokens));
+        for (const auto & token : item.second) {
+            if (token.second > 0) {
+                append(payload, &token.first, sizeof(token.first));
+                append(payload, &token.second, sizeof(token.second));
+            }
+        }
+        ++n_ngrams;
+    }
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char byte : payload) {
+        hash = (hash ^ byte) * 1099511628211ULL;
+    }
+    std::vector<char> result = {'L', 'N', 'G', 'C'};
+    const uint32_t version = 2;
+    const uint64_t size = payload.size();
+    append(result, &version, sizeof(version));
+    append(result, &vocab.n_tokens, sizeof(vocab.n_tokens));
+    append(result, &vocab.hash, sizeof(vocab.hash));
+    append(result, &n_ngrams, sizeof(n_ngrams));
+    append(result, &size, sizeof(size));
+    append(result, &hash, sizeof(hash));
+    result.insert(result.end(), payload.begin(), payload.end());
+    return result;
+}
+
+static void test_ngram_stream_save() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("test-ngram-stream-fit-" + std::to_string(ggml_time_us()));
+    const bool created = fs::create_directory(dir);
+    expect(created, "create private lookup stream test directory");
+    if (!created) {
+        return;
+    }
+    const std::string path = (dir / "cache").string();
+    const common_ngram_cache_vocab_id vocab = {100000, 123};
+    const auto read = [&]() {
+        std::ifstream file(path, std::ios::binary);
+        return std::vector<char>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    };
+    std::string err;
+    common_ngram_cache cache;
+    for (int n : {0, 1, 8192}) {
+        cache.clear();
+        common_ngram_cache filtered;
+        for (llama_token token = 1; token <= n; ++token) {
+            const common_ngram key(&token, 1);
+            cache[key] = {{0, token}, {1, 0}, {2, -1}};
+            filtered[key] = {{0, token}};
+        }
+        const llama_token skipped = 90000;
+        cache[common_ngram(&skipped, 1)] = {{0, 0}};
+        const llama_token empty_key[2] = {90000, 90001};
+        cache[common_ngram(empty_key, 2)] = {};
+        const auto before = cache;
+        allocation_probe::largest = 0;
+        allocation_probe::active = true;
+        const auto expected = ngram_old_file_bytes(cache, vocab);
+        allocation_probe::active = false;
+        if (n == 8192) {
+            expect(allocation_probe::largest > 65536, "old full-payload control allocates above 64 KiB");
+        }
+        allocation_probe::largest = 0;
+        allocation_probe::active = true;
+        const bool saved = common_ngram_cache_save_file(cache, path, vocab, err);
+        allocation_probe::active = false;
+        expect(saved, "streamed lookup save succeeds");
+        expect(allocation_probe::largest < 65536, "streamed lookup save has no allocation above 64 KiB");
+        expect(cache == before && read() == expected, "streamed save preserves source and complete prior-format bytes");
+        common_ngram_cache loaded;
+        expect(common_ngram_cache_load_file(path, loaded, vocab, err) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == filtered,
+                "streamed hash and size reload all positive counts, skipping empty or nonpositive parts");
+    }
+#ifdef __linux__
+    const auto before = read();
+    const std::string tmp = path + ".tmp." + std::to_string(getpid());
+    expect(fs::create_directory(tmp), "block temporary-file creation");
+    expect(!common_ngram_cache_save_file(cache, path, vocab, err) && !err.empty() && read() == before,
+            "failed temporary open preserves the complete old file");
+    fs::remove(tmp);
+    std::error_code ec;
+    fs::create_symlink("/dev/full", tmp, ec);
+    expect(!ec, "create a write-failure fixture");
+    if (!ec) {
+        expect(!common_ngram_cache_save_file(cache, path, vocab, err) && !err.empty() && read() == before,
+                "failed streamed write preserves the complete old file");
+        expect(fs::symlink_status(tmp, ec).type() == fs::file_type::not_found,
+                "failed write removes its temporary name");
+    }
+#endif
+    fs::remove_all(dir);
 }
 
 static void test_ngram_load_limits() {
@@ -455,6 +589,7 @@ static void test_ram_prompt_fit() {
 }
 
 int main() {
+    test_ngram_stream_save();
     test_ngram_load_limits();
     test_ngram_live_limit();
     test_ngram_delta_admission();

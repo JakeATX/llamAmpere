@@ -573,40 +573,56 @@ bool common_ngram_cache_save_file(
         const common_ngram_cache_vocab_id & vocab_id, std::string & err) {
     err.clear();
 
-    // serialize the payload in memory first, so the hash and the sizes are known before anything is written
-    std::vector<char> payload;
     uint64_t n_ngrams = 0;
-    for (const auto & item : ngram_cache) {
-        const common_ngram & ngram = item.first;
-        const common_ngram_cache_part & part = item.second;
-        if (part.empty()) {
-            continue; // never written: the reader rejects n-grams without continuations
-        }
+    uint64_t payload_size = 0;
+    uint64_t payload_hash = COMMON_NGRAM_CACHE_FNV_INIT;
 
-        int32_t n_tokens = 0;
-        for (const auto & token_count : part) {
-            if (token_count.second > 0) {
-                ++n_tokens;
+    // Count and hash first, then write the same const maps without a full payload copy.
+    const auto emit_payload = [&](std::ostream * file) {
+        const auto put = [&](const void * data, size_t size) {
+            if (file) {
+                return bool(file->write(static_cast<const char *>(data), size));
             }
-        }
-        if (n_tokens == 0) {
-            continue;
-        }
-
-        common_ngram_cache_put(payload, ngram.tokens, sizeof(ngram.tokens));
-        common_ngram_cache_put(payload, n_tokens);
-        for (const auto & token_count : part) {
-            if (token_count.second <= 0) {
+            if (size > UINT64_MAX - payload_size) {
+                err = "lookup cache payload is too large";
+                return false;
+            }
+            payload_size += size;
+            payload_hash = common_ngram_cache_fnv1a(payload_hash, data, size);
+            return true;
+        };
+        for (const auto & item : ngram_cache) {
+            int32_t n_tokens = 0;
+            for (const auto & token_count : item.second) {
+                if (token_count.second > 0) {
+                    if (n_tokens == COMMON_NGRAM_CACHE_MAX_PART) {
+                        err = "lookup cache has too many continuations in one n-gram";
+                        return false;
+                    }
+                    ++n_tokens;
+                }
+            }
+            if (n_tokens == 0) {
                 continue;
             }
-            common_ngram_cache_put(payload, token_count.first);
-            common_ngram_cache_put(payload, token_count.second);
+            if (!put(item.first.tokens, sizeof(item.first.tokens)) || !put(&n_tokens, sizeof(n_tokens))) {
+                return false;
+            }
+            for (const auto & token_count : item.second) {
+                if (token_count.second > 0 &&
+                        (!put(&token_count.first, sizeof(token_count.first)) || !put(&token_count.second, sizeof(token_count.second)))) {
+                    return false;
+                }
+            }
+            if (!file) {
+                ++n_ngrams;
+            }
         }
-        ++n_ngrams;
+        return true;
+    };
+    if (!emit_payload(nullptr)) {
+        return false;
     }
-
-    const uint64_t payload_size = payload.size();
-    const uint64_t payload_hash = common_ngram_cache_fnv1a(COMMON_NGRAM_CACHE_FNV_INIT, payload.data(), payload.size());
 
     std::vector<char> header;
     common_ngram_cache_put(header, COMMON_NGRAM_CACHE_MAGIC, sizeof(COMMON_NGRAM_CACHE_MAGIC));
@@ -633,9 +649,12 @@ bool common_ngram_cache_save_file(
             err = "cannot create " + filename_tmp;
             return false;
         }
-        file.write(header.data(),  header.size());
-        file.write(payload.data(), payload.size());
+        file.write(header.data(), header.size());
+        if (!file || !emit_payload(&file)) {
+            err = "write to " + filename_tmp + " failed";
+        }
         file.flush();
+        file.close();
         if (!file) {
             err = "write to " + filename_tmp + " failed";
         }
