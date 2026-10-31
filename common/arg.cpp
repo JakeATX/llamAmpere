@@ -3556,7 +3556,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
-            "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),
+            "single value is broadcast across all devices; automatic: 300 MiB headless, 800 MiB with a display or unknown display state"),
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 
@@ -3571,11 +3571,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             if (split_arg.size() == 1) {
                 std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), std::stoull(split_arg[0]) * 1024*1024);
+                params.fit_params_target_explicit = true;
                 return;
             }
             for (size_t i = 0; i < split_arg.size(); i++) {
                 params.fit_params_target[i] = std::stoull(split_arg[i]) * 1024*1024;
             }
+            params.fit_params_target_explicit = true;
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
     add_opt(common_arg(

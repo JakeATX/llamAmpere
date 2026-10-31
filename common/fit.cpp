@@ -12,6 +12,8 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -88,6 +90,45 @@ int32_t common_fit_prompt_cache_ram_mib(uint64_t total, uint64_t available,
 
 size_t common_fit_vram_floor(bool display_attached) {
     return (display_attached ? 800u : 300u) * size_t(1024 * 1024);
+}
+
+size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_session) {
+    const size_t safe = common_fit_vram_floor(true);
+    if (display_session) {
+        return safe;
+    }
+    std::error_code ec;
+    std::filesystem::directory_iterator it(drm_root, ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const auto path = it->path() / "status";
+        const bool exists = std::filesystem::exists(path, ec);
+        if (ec) {
+            return safe;
+        }
+        if (!exists) {
+            continue;
+        }
+        std::ifstream file(path);
+        std::string status;
+        if (!(file >> status) || status != "disconnected") {
+            return safe;
+        }
+    }
+    return ec ? safe : common_fit_vram_floor(false);
+}
+
+std::vector<size_t> common_fit_vram_targets(const common_params & params, size_t floor) {
+    auto targets = params.fit_params_target;
+    if ((!params.fit_params && !params.n_cpu_moe_auto) || params.fit_params_target_explicit) {
+        return targets;
+    }
+    // fork: retain programmatic overrides that differ from the stock margin.
+    for (size_t & target : targets) {
+        if (target == size_t(1024) * 1024 * 1024) {
+            target = floor;
+        }
+    }
+    return targets;
 }
 
 uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit) {
@@ -634,12 +675,12 @@ common_fit_extra_memory common_fit_extra_memory_at(
     return ret;
 }
 
-bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins) {
+bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins, size_t floor) {
     if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || margins.empty()) {
         return false;
     }
     for (size_t margin : margins) {
-        if (margin < 300u * 1024 * 1024) {
+        if (margin < std::max(floor, common_fit_vram_floor(false))) {
             return false;
         }
     }

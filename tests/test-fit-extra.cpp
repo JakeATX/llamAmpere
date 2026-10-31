@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "arg.h"
 #include "common.h"
 #include "ngram-cache.h"
 #include "speculative.h"
@@ -1220,7 +1221,76 @@ static void test_ram_prompt_fit() {
             "fit off keeps prior tier and half-available clamp");
 }
 
+static void test_vram_fit_floor() {
+    constexpr size_t MiB = 1024 * 1024;
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("test-vram-fit-" + std::to_string(ggml_time_us()));
+    fs::create_directories(dir / "card0-DP-1");
+    const auto status = dir / "card0-DP-1" / "status";
+    std::ofstream(status) << "disconnected\n";
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 300 * MiB, "disconnected display uses headless floor");
+    expect(common_fit_vram_floor_detect(dir.string(), true) == 800 * MiB, "display session keeps larger floor even without a connector");
+    fs::create_directories(dir / "card1-HDMI-A-1");
+    std::ofstream(dir / "card1-HDMI-A-1" / "status") << "connected\n";
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "any connected display keeps larger floor for multi-device fit");
+    fs::remove_all(dir / "card1-HDMI-A-1");
+    for (const std::string text : {"unknown\n", "bad\n", ""}) {
+        std::ofstream(status) << text;
+        expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "unknown or unreadable connector state keeps larger floor");
+    }
+    fs::remove_all(dir);
+    expect(common_fit_vram_floor_detect(dir.string(), false) == 800 * MiB, "missing DRM inventory keeps larger floor");
+
+    for (size_t floor : {300 * MiB, 800 * MiB}) {
+        common_params params;
+        const auto automatic = common_fit_vram_targets(params, floor);
+        expect(std::all_of(automatic.begin(), automatic.end(),
+            [floor](size_t margin) { return margin == floor; }), "automatic fit uses detected floor on every device");
+        expect(params.fit_params_target[0] == 1024 * MiB, "automatic resolution does not overwrite the request reused by a later model load");
+        params.fit_params_target = {0, 128 * MiB, 1024 * MiB};
+        params.fit_params_target_explicit = true;
+        const auto explicit_targets = params.fit_params_target;
+        expect(common_fit_vram_targets(params, floor) == explicit_targets, "explicit zero, small and stock-size margins all win");
+        params.fit_params_target_explicit = false;
+        expect(common_fit_vram_targets(params, floor) == std::vector<size_t>({0, 128 * MiB, floor}), "programmatic nondefault margins stay unchanged");
+        params.fit_params_target = {1024 * MiB};
+        params.fit_params = false;
+        expect(common_fit_vram_targets(params, floor)[0] == 1024 * MiB, "fit off keeps prior margins");
+        params.n_cpu_moe_auto = true;
+        expect(common_fit_vram_targets(params, floor)[0] == floor, "explicit automatic expert placement still uses memory fit");
+        expect(common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {floor}, floor), "compact verify accepts fitted floor");
+        expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {floor, floor - 1}, floor), "compact verify rejects one device below its floor");
+        expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_FAILURE, {floor}, floor), "failed fit cannot enable compact verify");
+        expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {}, floor), "empty fit cannot enable compact verify");
+    }
+    expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {300 * MiB}, 800 * MiB), "display floor disables compact verify with an explicit headless margin");
+    expect(!common_fit_verify_compact_safe(COMMON_PARAMS_FIT_STATUS_SUCCESS, {1}, 0), "compact verify retains its minimum safety floor");
+
+    const std::string old_target = common_get_env("LLAMA_ARG_FIT_TARGET");
+    common_set_env("LLAMA_ARG_FIT_TARGET", "");
+    char program[] = "test-fit-extra";
+    char option[] = "--fit-target";
+    char single[] = "1024";
+    char multi[] = "0,512";
+    for (char * value : {single, multi}) {
+        common_params params;
+        char * argv[] = {program, option, value};
+        const bool parsed = common_params_parse(3, argv, params, LLAMA_EXAMPLE_SERVER);
+        expect(parsed && params.fit_params_target_explicit, "fit-target parser marks explicit scalar and vector margins");
+        const auto targets = params.fit_params_target;
+        expect(common_fit_vram_targets(params, 300 * MiB) == targets, "parsed explicit target is preserved by automatic fit");
+        expect(params.fit_params_target[0] == (value == single ? 1024 * MiB : 0), "parsed explicit margin retains its requested bytes");
+    }
+    common_set_env("LLAMA_ARG_FIT_TARGET", "1024");
+    common_params from_env;
+    char * argv[] = {program};
+    expect(common_params_parse(1, argv, from_env, LLAMA_EXAMPLE_SERVER) && from_env.fit_params_target_explicit, "environment fit target is an explicit override");
+    expect(common_fit_vram_targets(from_env, 300 * MiB)[0] == 1024 * MiB, "environment target preserves stock-size request");
+    common_set_env("LLAMA_ARG_FIT_TARGET", old_target);
+}
+
 int main() {
+    test_vram_fit_floor();
     test_ngram_ram_load_fit();
     test_ngram_context_fit();
     test_ngram_checkpoint_fit();

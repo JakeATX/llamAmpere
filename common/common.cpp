@@ -1387,6 +1387,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
     }
     if (common_params_should_fit_device_memory(params) || ncmoe_auto) {
+        // fork: unknown display state keeps the larger floor on all devices.
+        size_t vram_floor = common_fit_vram_floor(true);
+#if defined(__linux__)
+        vram_floor = common_fit_vram_floor_detect("/sys/class/drm",
+            !common_get_env("DISPLAY").empty() || !common_get_env("WAYLAND_DISPLAY").empty());
+#endif
+        auto fit_targets = common_fit_vram_targets(params, vram_floor);
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         // Snapshot the pre-fit state so a failed fit can be rolled back to a
@@ -1446,11 +1453,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             ncmoe_auto ? nullptr : &params.moe_cache,
-            params.fit_params_target.data(),
+            fit_targets.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-        verify_compact_fit_safe = common_fit_verify_compact_safe(fit_status, params.fit_params_target);
+        verify_compact_fit_safe = common_fit_verify_compact_safe(fit_status, fit_targets, vram_floor);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
             throw std::runtime_error(
                 "failed to fit parameters to device memory (hard error); retry with -fit off");

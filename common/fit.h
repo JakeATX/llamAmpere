@@ -36,6 +36,9 @@ common_fit_ram_result common_fit_ram_plan(uint64_t available,
         const std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> & requests);
 
 size_t common_fit_vram_floor(bool display_attached);
+size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_session);
+struct common_params;
+std::vector<size_t> common_fit_vram_targets(const common_params & params, size_t floor);
 
 uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit);
 
@@ -101,8 +104,8 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_NO_ROOM = 3, // no allocation can fit, even with every layer's weights in system memory
 };
 
-// fork: require a proven fit with at least 300 MiB left on every device.
-bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins);
+// fork: require a proven fit with the device floor left on every device.
+bool common_fit_verify_compact_safe(common_params_fit_status status, const std::vector<size_t> & margins, size_t floor = 300u * 1024 * 1024);
 
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
