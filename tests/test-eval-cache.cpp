@@ -4,11 +4,13 @@
 //   (naming the differing field), the format-version check, and skipping of corrupt / incomplete entries.
 
 #include "server-eval-cache.h"
+#include "server-prompt-cache-disk.h"
 
 #include "common.h"
 #include "fit.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -29,10 +31,11 @@ static thread_local bool active = false;
 static thread_local size_t bytes = 0;
 static thread_local size_t hits = 0;
 static thread_local size_t last = 0;
+static thread_local size_t largest = 0;
 
 static void start(size_t size) {
     bytes = size;
-    hits = last = 0;
+    hits = last = largest = 0;
     active = true;
 }
 static size_t stop() {
@@ -45,6 +48,7 @@ static size_t stop() {
 void * operator new(size_t n) {
     if (allocation_probe::active) {
         allocation_probe::last = n;
+        allocation_probe::largest = std::max(allocation_probe::largest, n);
         allocation_probe::hits += n == allocation_probe::bytes;
     }
     if (void * p = std::malloc(n ? n : 1)) {
@@ -319,6 +323,108 @@ static void test_record_allocations(const std::string & root) {
     CHECK(rec.tokens.empty() && rec.checkpoints.empty() && rec.spec.empty());
 }
 
+static void test_streamed_header(const std::string & root) {
+    server_eval_cache ec;
+    std::string err, id;
+    CHECK(ec.open(root + "/stream", KEY_A, true, err));
+    const llama_tokens tokens = {4, 5};
+    const std::list<common_prompt_checkpoint> checkpoints = {ckpt(2, 3)};
+    const std::vector<uint8_t> spec = {7, 8, 9};
+    CHECK(add_entry(ec, tokens, checkpoints, spec, true, id));
+
+    // Encode the existing wire layout in memory as a byte-for-byte control.
+    std::vector<uint8_t> expected;
+    uint64_t hash = 0xcbf29ce484222325ull;
+    auto put = [&](const void * p, size_t n) {
+        const auto * bytes = static_cast<const uint8_t *>(p);
+        if (n) {
+            expected.insert(expected.end(), bytes, bytes + n);
+        }
+        hash = server_prompt_disk_hash(p, n, hash);
+    };
+    const uint32_t version = EVAL_CACHE_FORMAT_VERSION, key_len = KEY_A.size(), count = 1;
+    const uint64_t ntok = tokens.size();
+    const uint8_t has_dft = 1;
+    put("LEVC", 4);
+    put(&version, sizeof(version));
+    put(&ec.key_hash, sizeof(ec.key_hash));
+    put(&key_len, sizeof(key_len));
+    put(KEY_A.data(), KEY_A.size());
+    put(&ntok, sizeof(ntok));
+    put(tokens.data(), tokens.size() * sizeof(llama_token));
+    put(&count, sizeof(count));
+    const auto & c = checkpoints.front();
+    const int64_t n = c.n_tokens;
+    const int32_t pmin = c.pos_min, pmax = c.pos_max;
+    put(&n, sizeof(n));
+    put(&pmin, sizeof(pmin));
+    put(&pmax, sizeof(pmax));
+    for (const auto * blob : {&c.data_tgt, &c.data_dft, &c.data_spec, &spec}) {
+        const uint64_t size = blob->size();
+        put(&size, sizeof(size));
+        put(blob->data(), blob->size());
+    }
+    put(&has_dft, sizeof(has_dft));
+    const auto * checksum = reinterpret_cast<const uint8_t *>(&hash);
+    expected.insert(expected.end(), checksum, checksum + sizeof(hash));
+    std::ifstream f(ec.path_hdr(id), std::ios::binary);
+    const std::vector<uint8_t> actual{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+    CHECK(actual == expected);
+
+    const size_t payload = 1u << 20;
+    std::list<common_prompt_checkpoint> big(1);
+    big.front().data_tgt.assign(payload, 6);
+    big.front().data_dft.assign(payload, 7);
+    big.front().data_spec.assign(payload, 8);
+    const std::vector<uint8_t> big_spec(payload, 9);
+    allocation_probe::start(0);
+    const bool saved = ec.add(tokens, big, big_spec, true, id, err);
+    allocation_probe::stop();
+    CHECK(saved && allocation_probe::largest < payload);
+    server_eval_cache_record rec;
+    CHECK(ec.read_header(id, rec, err));
+    CHECK(rec.tokens == tokens && rec.has_dft && rec.spec == big_spec);
+    CHECK(rec.checkpoints.size() == 1);
+    if (!rec.checkpoints.empty()) {
+        CHECK(rec.checkpoints.front().data_tgt == big.front().data_tgt);
+        CHECK(rec.checkpoints.front().data_dft == big.front().data_dft);
+        CHECK(rec.checkpoints.front().data_spec == big.front().data_spec);
+    }
+
+    // An open failure must leave the existing entry and its index intact.
+    fs::create_directory(ec.path_hdr(id) + ".tmp");
+    CHECK(!ec.add(tokens, checkpoints, spec, false, id, err));
+    CHECK(ec.entries.size() == 1 && ec.entries.front().has_dft);
+    CHECK(ec.read_header(id, rec, err) && rec.spec == big_spec && rec.has_dft);
+#ifdef __linux__
+    // /dev/full opens successfully but rejects writes; exercise failure after open.
+    fs::remove(ec.path_hdr(id) + ".tmp");
+    fs::create_symlink("/dev/full", ec.path_hdr(id) + ".tmp");
+    {
+        std::ofstream probe(ec.path_hdr(id) + ".tmp", std::ios::binary);
+        CHECK(probe.is_open() && probe.good());
+    }
+    std::ifstream before_file(ec.path_hdr(id), std::ios::binary);
+    const std::vector<uint8_t> before{std::istreambuf_iterator<char>(before_file),
+                                     std::istreambuf_iterator<char>()};
+    // The large payload forces the stream buffer to flush before close.
+    CHECK(!ec.add(tokens, big, big_spec, false, id, err));
+    std::ifstream after_file(ec.path_hdr(id), std::ios::binary);
+    const std::vector<uint8_t> after{std::istreambuf_iterator<char>(after_file),
+                                    std::istreambuf_iterator<char>()};
+    CHECK(before == after && !before.empty());
+    CHECK(ec.entries.size() == 1 && ec.entries.front().has_dft);
+    CHECK(ec.read_header(id, rec, err) && rec.spec == big_spec && rec.has_dft);
+    CHECK(rec.checkpoints.size() == 1);
+    if (!rec.checkpoints.empty()) {
+        CHECK(rec.checkpoints.front().data_tgt == big.front().data_tgt);
+        CHECK(rec.checkpoints.front().data_dft == big.front().data_dft);
+        CHECK(rec.checkpoints.front().data_spec == big.front().data_spec);
+    }
+    fs::remove(ec.path_hdr(id) + ".tmp");
+#endif
+}
+
 static void test_index_ram_budget(const std::string & root) {
     const std::string dir = root + "/index-ram";
     const std::string index = dir + "/eval-cache.json";
@@ -490,6 +596,7 @@ int main() {
     test_corruption(root);
     test_record_ram_budget(root);
     test_record_allocations(root);
+    test_streamed_header(root);
     test_index_ram_budget(root);
     test_index_version(root);
 

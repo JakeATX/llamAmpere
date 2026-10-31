@@ -26,20 +26,6 @@ static const char * EVC_INDEX = "eval-cache.json";
 
 namespace {
 
-struct evc_buf {
-    std::vector<uint8_t> b;
-
-    void bytes(const void * p, size_t n) {
-        const uint8_t * q = (const uint8_t *) p;
-        b.insert(b.end(), q, q + n);
-    }
-    template <typename T> void val(const T & v) { bytes(&v, sizeof(T)); }
-    void blob(const std::vector<uint8_t> & v) {
-        val<uint64_t>(v.size());
-        bytes(v.data(), v.size());
-    }
-};
-
 struct evc_reader {
     std::ifstream f;
     uint64_t      remaining = 0;
@@ -490,10 +476,26 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
     const std::string id = entry_id(tokens);
     id_out = id;
 
-    evc_buf   w;
+    const std::string file = path_hdr(id);
+    const std::string tmp  = file + ".tmp";
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        err = "cannot write " + tmp;
+        return false;
+    }
+
+    // fork: stream checkpoint payloads so a save does not duplicate the whole header in RAM.
     evc_chain hs;
     auto put = [&](const void * p, size_t n) {
-        w.bytes(p, n);
+        if (!f) {
+            return;
+        }
+        if (n > 0) {
+            f.write(static_cast<const char *>(p), (std::streamsize) n);
+            if (!f) {
+                return;
+            }
+        }
         hs.add(p, n);
     };
     auto put_blob = [&](const std::vector<uint8_t> & v) {
@@ -529,18 +531,11 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
     }
     put_blob(spec);
     put(&hd, sizeof(hd));
-    w.val<uint64_t>(hs.h);
-
-    const std::string file = path_hdr(id);
-    const std::string tmp  = file + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        f.write((const char *) w.b.data(), (std::streamsize) w.b.size());
-        f.close();
-        if (!f) {
-            err = "cannot write " + tmp;
-            return false;
-        }
+    f.write(reinterpret_cast<const char *>(&hs.h), sizeof(hs.h));
+    f.close();
+    if (!f) {
+        err = "cannot write " + tmp;
+        return false;
     }
     std::error_code ec;
     fs::rename(tmp, file, ec);
