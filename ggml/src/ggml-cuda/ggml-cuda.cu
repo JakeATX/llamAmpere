@@ -6966,12 +6966,18 @@ static bool ggml_cuda_match_moe_bank_routing(const ggml_cgraph * graph, int i) {
     return true;
 }
 
-// Routed up group followed by the gate group over the same activations, routes and cold mask: one paired launch.
+// One routed group (gate or up) followed by the other over the same activations, routes and cold mask: one paired launch.
 static bool ggml_cuda_match_moe_bank_pair(const ggml_cgraph * graph, int i) {
     return ggml_cuda_match_moe_bank_routing(graph, i) && ggml_cuda_match_moe_bank_mixed(graph, i + 14) &&
             graph->nodes[i + 16]->src[1] == graph->nodes[i + 9] &&
             ggml_cuda_moe_mixed_pair_supported(graph->nodes[i + 10], graph->nodes[i + 11],
                     graph->nodes[i + 14], graph->nodes[i + 15]);
+}
+
+// A paired launch whose next node is the SwiGLU of its two outputs also writes that SwiGLU.
+static bool ggml_cuda_match_moe_bank_pair_glu(const ggml_cgraph * graph, int i) {
+    return ggml_cuda_moe_mixed_glu_enabled() && i + 18 < graph->n_nodes && ggml_cuda_match_moe_bank_pair(graph, i) &&
+            ggml_cuda_moe_mixed_glu_supported(graph->nodes[i + 13], graph->nodes[i + 17], graph->nodes[i + 18]);
 }
 
 static bool ggml_cuda_match_moe_bank_joint(const ggml_cgraph * graph, int i, ggml_cuda_moe_bank_joint_match & m) {
@@ -9431,15 +9437,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const ggml_tensor * map = cgraph->nodes[i + 2]->src[0];
         if (!ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[cuda_ctx->device].cc, bank->src[0]->type) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 14, outputs, 3)) {
-            const int pair_outputs[] = { i + 5, i + 9, i + 13, i + 17 };
+            const int pair_outputs[] = { i + 5, i + 9, i + 13, i + 17, i + 18 };
             if (ggml_cuda_moe_mixed_pair_enabled() && ggml_cuda_match_moe_bank_pair(cgraph, i) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, 18, pair_outputs, 4)) {
+                // The SwiGLU stays a separate node when another stream may run alongside the paired launch.
+                const bool glu = cuda_ctx->stream_context().concurrent_events.empty() &&
+                        ggml_cuda_match_moe_bank_pair_glu(cgraph, i) &&
+                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, 19, pair_outputs, 5);
                 ggml_tensor * bank2 = cgraph->nodes[i + 14], * base2 = cgraph->nodes[i + 15], * dst2 = cgraph->nodes[i + 17];
-                bool done = ggml_cuda_moe_cache_mixed_pair_compute(*cuda_ctx, bank, base, dst, bank2, base2, dst2, map, mask);
+                ggml_tensor * glu_dst = glu ? cgraph->nodes[i + 18] : nullptr;
+                bool done = ggml_cuda_moe_cache_mixed_pair_compute(*cuda_ctx, bank, base, dst, bank2, base2, dst2, map, mask,
+                        glu_dst);
                 if (!done && ggml_backend_buffer_is_cuda(base->src[0]->buffer) &&
                         ggml_backend_buffer_is_cuda(base2->src[0]->buffer) &&
                         base->ne[2] <= get_mmvq_mmid_max_batch(base->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
-                    const ggml_cuda_moe_mixed_pair pair = { bank2, base2, dst2, nullptr, nullptr, nullptr };
+                    const ggml_cuda_moe_mixed_pair pair = { bank2, base2, dst2, nullptr, nullptr, nullptr, glu_dst };
                     ggml_cuda_mul_mat_id_mixed(*cuda_ctx, bank, base, dst, nullptr, nullptr, nullptr, nullptr, map, mask,
                             nullptr, nullptr, 0, &pair);
                     done = true;
@@ -9448,7 +9460,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     cuda_ctx->fusion_stats.moe_bank_mixed += 2;
                     cuda_ctx->fusion_stats.moe_bank_routing++;
                     cuda_ctx->fusion_stats.moe_bank_pair++;
-                    return 17;
+                    cuda_ctx->fusion_stats.moe_bank_pair_glu += glu;
+                    return glu ? 18 : 17;
                 }
             }
             if (ggml_cuda_moe_cache_mixed_compute(*cuda_ctx, bank, base, dst, map, mask)) {
@@ -11361,7 +11374,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (ggml_cuda_match_moe_bank_routing(cgraph, i)) {
                 // A paired launch also writes the gate output while it reads the routing inputs.
                 const bool pair = ggml_cuda_match_moe_bank_pair(cgraph, i);
-                for (ggml_tensor * dst : { cgraph->nodes[i + 13], pair ? cgraph->nodes[i + 17] : nullptr }) {
+                // A fused SwiGLU is written while the routing inputs and both projections are read, too.
+                const bool glu = pair && ggml_cuda_match_moe_bank_pair_glu(cgraph, i);
+                for (ggml_tensor * dst : { cgraph->nodes[i + 13], pair ? cgraph->nodes[i + 17] : nullptr,
+                                           glu ? cgraph->nodes[i + 18] : nullptr }) {
                     if (!dst) { continue; }
                     params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], dst);
                     params->add_alloc_dep(params->user_data, cgraph->nodes[i + 2]->src[0], dst);
@@ -11376,7 +11392,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (pair) {
                     params->add_alloc_dep(params->user_data, cgraph->nodes[i + 13], cgraph->nodes[i + 17]);
                 }
-                i += pair ? 17 : 13;
+                if (glu) {
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i + 13], cgraph->nodes[i + 18]);
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[i + 17], cgraph->nodes[i + 18]);
+                }
+                i += glu ? 18 : pair ? 17 : 13;
                 continue;
             }
             if (ggml_cuda_match_moe_bank_mixed(cgraph, i)) {
@@ -12902,6 +12922,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "moe_bank_pair") == 0) {
         return ctx->fusion_stats.moe_bank_pair;
+    }
+    if (strcmp(name, "moe_bank_pair_glu") == 0) {
+        return ctx->fusion_stats.moe_bank_pair_glu;
     }
     if (strcmp(name, "moe_bank_mixed") == 0) {
         return ctx->fusion_stats.moe_bank_mixed;

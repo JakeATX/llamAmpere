@@ -11898,7 +11898,7 @@ bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context & ctx, const gg
 bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
         const ggml_tensor * bank, ggml_tensor * base, ggml_tensor * dst,
         const ggml_tensor * bank2, ggml_tensor * base2, ggml_tensor * dst2,
-        const ggml_tensor * route_map, ggml_tensor * route_mask) {
+        const ggml_tensor * route_map, ggml_tensor * route_mask, ggml_tensor * glu) {
     if (!ggml_cuda_moe_mixed_pair_supported(bank, base, bank2, base2) ||
             g_session_stack.empty() || !g_session_stack.back().active) {
         return false;
@@ -11955,14 +11955,14 @@ bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
     };
     const bool split = moe_mixed_hit_first();
     if (split) {
-        const ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot };
+        const ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot, glu };
         ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, &op, quantized, first.device, nullptr, first.hot,
                 route_map, route_mask, bank_q.get(), bank_s.get(), 1, &resident);
         CUDA_CHECK(cudaGetLastError());
     }
     const void * const * eff = moe_hf_wait(ctx, session, first);
     const void * const * eff2 = moe_hf_wait(ctx, session, second);
-    const ggml_cuda_moe_mixed_pair rest = { bank2, base2, &op2, eff2, skip_of(second), second.hot };
+    const ggml_cuda_moe_mixed_pair rest = { bank2, base2, &op2, eff2, skip_of(second), second.hot, glu };
     ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, &op, quantized, eff, skip_of(first), first.hot,
             route_map, route_mask, bank_q.get(), bank_s.get(), split ? 2 : 0, &rest);
     CUDA_CHECK(cudaGetLastError());

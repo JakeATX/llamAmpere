@@ -240,7 +240,7 @@ bool ggml_cuda_moe_cache_mixed_compute(ggml_backend_cuda_context & ctx, const gg
 bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
         const ggml_tensor * bank, ggml_tensor * base, ggml_tensor * dst,
         const ggml_tensor * bank2, ggml_tensor * base2, ggml_tensor * dst2,
-        const ggml_tensor * route_map, ggml_tensor * route_mask);
+        const ggml_tensor * route_map, ggml_tensor * route_mask, ggml_tensor * glu = nullptr);
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
         ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu);
 // fork PREFETCHFIX (GGML_MOE_PREFETCH_ASYNC): turns a "moe_prefetch-<src>-<target>" id list into

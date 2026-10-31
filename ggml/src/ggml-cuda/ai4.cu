@@ -5,6 +5,7 @@
 #include "ai4-ampere.cuh"
 #include "rpb-knobs.h"
 #include "quantize.cuh"
+#include "unary.cuh"
 #include "vecdotq.cuh"
 
 #include <algorithm>
@@ -1518,7 +1519,45 @@ struct moe_mixed_second {
     const void * const * table;
     const uint8_t * skip;
     const uint8_t * resident;
+    const float * glu_gate; // fused SwiGLU (glu == nullptr: none)
+    const float * glu_up;
+    float * glu;
 };
+
+// Fused SwiGLU tiles: a tile is the rows and routes one block coordinate stores, the same for both
+// projections. Each of its two blocks counts in after its stores; the second one (in either phase
+// launch) writes silu(gate)*up for the tile and resets the count for the next launch.
+static constexpr int MOE_MIXED_GLU_TILES = 40*64*8;
+static __device__ unsigned int g_moe_mixed_glu_count[MOE_MIXED_GLU_TILES];
+
+static __device__ __forceinline__ void moe_mixed_glu(const moe_mixed_second & second, int bx, int rows, int M,
+        const int * cols, int n) {
+    if (!second.glu) {
+        return;
+    }
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int tile = ((int) blockIdx.z*gridDim.y + blockIdx.y)*(gridDim.x/2) + bx;
+        last = atomicAdd(&g_moe_mixed_glu_count[tile], 1u) == 1u;
+        if (last) {
+            g_moe_mixed_glu_count[tile] = 0;
+        }
+    }
+    __syncthreads();
+    if (!last) {
+        return;
+    }
+    const int own = (int) blockIdx.z*gridDim.y + blockIdx.y;
+    for (int i = threadIdx.x; i < n*rows; i += blockDim.x) {
+        const int r = bx*rows + i % rows;
+        if (r < M) {
+            const int64_t o = (int64_t) (cols ? cols[i / rows] : own)*M + r;
+            second.glu[o] = ggml_cuda_op_silu_single(__ldcg(second.glu_gate + o)) * __ldcg(second.glu_up + o);
+        }
+    }
+}
 
 template <ggml_type BASE, bool IQ4_BANK, int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW, int STAGES>
 static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
@@ -1559,8 +1598,10 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
                     return;
                 }
                 ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(W, q, s, Y, M, M, 1, K, idm, &group, bx);
+                moe_mixed_glu(second, bx, 16*WARPS, M, group.cols, group.n);
             } else {
                 ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, false>(W, q, s, Y, M, M, 1, K, idm, nullptr, bx);
+                moe_mixed_glu(second, bx, 16, M, nullptr, 1);
             }
             return;
         }
@@ -1572,6 +1613,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         if (threadIdx.x < 16*slabs && row0 + threadIdx.x < M) {
             out[threadIdx.x] = 0.0f;
         }
+        moe_mixed_glu(second, bx, 16*slabs, M, nullptr, 1);
         return;
     }
     const char * w = hot ? (const char *) W + (size_t) h*idm.nb02 :
@@ -1608,6 +1650,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
             moe_mixed_base_rows<BASE, WARPS>(sw, x, sy, K);
         }
     }
+    moe_mixed_glu(second, bx, 16*slabs, M, nullptr, 1);
 }
 
 bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor * base) {
@@ -1659,6 +1702,19 @@ bool ggml_cuda_moe_mixed_pair_supported(const ggml_tensor * bank, const ggml_ten
             ggml_are_same_shape(bank, bank2);
 }
 
+bool ggml_cuda_moe_mixed_glu_enabled() {
+    static const bool v = ai4_env_int("GGML_MOE_BANK_MIXED_GLU", nullptr, 1) != 0;
+    return v;
+}
+
+bool ggml_cuda_moe_mixed_glu_supported(const ggml_tensor * dst, const ggml_tensor * dst2, const ggml_tensor * glu) {
+    return glu && glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            ggml_get_op_params_i32(glu, 1) == 0 && glu != dst && glu != dst2 &&
+            ((glu->src[0] == dst && glu->src[1] == dst2) || (glu->src[0] == dst2 && glu->src[1] == dst)) &&
+            glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_are_same_shape(glu, dst) &&
+            dst->ne[0] % 16 == 0 && dst->ne[0]/16*dst->ne[1]*dst->ne[2] <= MOE_MIXED_GLU_TILES;
+}
+
 const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined) {
     if (!joined || joined->op != GGML_OP_ADD || !joined->src[0] || !joined->src[1]) { return nullptr; }
     const ggml_tensor * hot = joined->src[0], * mul = joined->src[1];
@@ -1704,6 +1760,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             pair->dst->type == GGML_TYPE_F32 && ggml_is_contiguous(pair->dst) && ggml_are_same_shape(pair->dst, dst)));
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
     const int K = (int) x->ne[0], M = (int) w->ne[1];
+    GGML_ASSERT(!pair || !pair->glu || (pair->glu->type == GGML_TYPE_F32 && ggml_is_contiguous(pair->glu) &&
+            ggml_are_same_shape(pair->glu, dst) && M/16*ids->ne[0]*ids->ne[1] <= MOE_MIXED_GLU_TILES &&
+            (pair->glu->src[0]->data == dst->data) != (pair->glu->src[0]->data == pair->dst->data)));
     const int xsh = K % 256 == 0 ? 1 : 0;
     const size_t rows = (size_t) x->ne[1]*x->ne[2];
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool());
@@ -1743,7 +1802,14 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     moe_mixed_second second{};
     if (pair) {
         second = { (const uint8_t *) pair->bank->src[0]->data, (float *) pair->dst->data,
-                   (const char *) pair->base->src[0]->data, pair->table, pair->skip, pair->resident };
+                   (const char *) pair->base->src[0]->data, pair->table, pair->skip, pair->resident,
+                   nullptr, nullptr, nullptr };
+        if (pair->glu) {
+            const bool gate_first = pair->glu->src[0]->data == dst->data;
+            second.glu_gate = (const float *) (gate_first ? dst : pair->dst)->data;
+            second.glu_up = (const float *) (gate_first ? pair->dst : dst)->data;
+            second.glu = (float *) pair->glu->data;
+        }
     }
     static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
     const int cfg = ai4_mmvr_cfg();
@@ -1805,8 +1871,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     if (trace) {
-        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d pair=%d\n",
-                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase, pair != nullptr);
+        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d pair=%d glu=%d\n",
+                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase, pair != nullptr, pair && pair->glu);
     }
 }
 #undef MOE_MIXED_TYPES

@@ -30,11 +30,16 @@ struct ggml_cuda_moe_mixed_pair {
     const void * const * table;
     const uint8_t * skip;
     const uint8_t * resident;
+    ggml_tensor * glu = nullptr; // SwiGLU of the two outputs, written by the same launch (nullptr: none)
 };
 // GGML_MOE_BANK_MIXED_PAIR=0 restores separate up and gate launches (default 1).
 bool ggml_cuda_moe_mixed_pair_enabled();
 bool ggml_cuda_moe_mixed_pair_supported(const ggml_tensor * bank, const ggml_tensor * base,
         const ggml_tensor * bank2, const ggml_tensor * base2);
+// GGML_MOE_BANK_MIXED_GLU=0 leaves the SwiGLU of a paired launch to its own node (default 1).
+bool ggml_cuda_moe_mixed_glu_enabled();
+// glu is the plain SwiGLU of the paired outputs dst and dst2 (either one the gate).
+bool ggml_cuda_moe_mixed_glu_supported(const ggml_tensor * dst, const ggml_tensor * dst2, const ggml_tensor * glu);
 void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8 = nullptr,
         const void * const * table = nullptr, const uint8_t * skip = nullptr, const uint8_t * resident = nullptr,

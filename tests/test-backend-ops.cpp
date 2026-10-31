@@ -12166,12 +12166,18 @@ struct test_moe_bank_pair : public test_moe_bank_routing {
     const char * required_fusion() override {
         const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
         const char * pair = getenv("GGML_MOE_BANK_MIXED_PAIR");
-        return direct_mmvq_width() && (!enabled || atoi(enabled)) && (!pair || atoi(pair)) ? "moe_bank_pair" : nullptr;
+        const char * glu = getenv("GGML_MOE_BANK_MIXED_GLU");
+        if (!direct_mmvq_width() || (enabled && !atoi(enabled)) || (pair && !atoi(pair))) {
+            return nullptr;
+        }
+        return !glu || atoi(glu) ? "moe_bank_pair_glu" : "moe_bank_pair";
     }
     const char * forbidden_fusion() override {
         const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
         const char * pair = getenv("GGML_MOE_BANK_MIXED_PAIR");
-        return (enabled && !atoi(enabled)) || (pair && !atoi(pair)) ? "moe_bank_pair" : nullptr;
+        const char * glu = getenv("GGML_MOE_BANK_MIXED_GLU");
+        return (enabled && !atoi(enabled)) || (pair && !atoi(pair)) ? "moe_bank_pair" :
+               glu && !atoi(glu) ? "moe_bank_pair_glu" : nullptr;
     }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         up_result = test_moe_bank_routing::build_graph(ctx);
