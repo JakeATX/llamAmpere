@@ -2397,6 +2397,24 @@ private:
                     const auto vocab_id = common_ngram_cache_get_vocab_id(vocab);
                     params_base.speculative.ngram_cache.vocab_n_tokens = vocab_id.n_tokens;
                     params_base.speculative.ngram_cache.vocab_hash     = vocab_id.hash;
+                    uint64_t total_ram = 0, available_ram = 0;
+                    if (params_base.fit_params) {
+                        common_host_memory(total_ram, available_ram);
+                    }
+                    auto & cache_params = params_base.speculative.ngram_cache;
+                    common_fit_ngram_cache_load_limits(available_ram, params_base.fit_params, cache_params);
+                    if (params_base.fit_params) {
+                        const bool auto_load = !cache_params.lookup_cache_static.empty() ||
+                            (!cache_params.lookup_cache_dynamic.empty() && !cache_params.max_ngrams_dynamic_explicit);
+                        if (auto_load) {
+                            SRV_INF("%s", available_ram <= (5ull << 30) ?
+                                "available RAM is low or unknown; automatic lookup loads accept only empty files to retain system headroom\n" :
+                                "automatic lookup loads use count limits from RAM above 5 GiB; files over the limits are skipped\n");
+                        }
+                        if (cache_params.max_ngrams_dynamic_explicit && !cache_params.lookup_cache_dynamic.empty()) {
+                            SRV_WRN("%s", "explicit dynamic lookup size bypasses RAM load fitting; the 5 GiB floor cannot be guaranteed\n");
+                        }
+                    }
                 }
 
                 try {

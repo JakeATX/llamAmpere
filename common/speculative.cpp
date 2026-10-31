@@ -3664,7 +3664,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         // a cache file that cannot be used is skipped, never fatal: the drafter then starts cold, as without the file
         if (!path_static.empty()) {
             std::string err;
-            if (common_ngram_cache_load_file(path_static, ngram_cache_static, vocab_id, err) == COMMON_NGRAM_CACHE_LOAD_OK) {
+            if (common_ngram_cache_load_file(path_static, ngram_cache_static, vocab_id, err,
+                    this->params.load_max_entries_static, this->params.load_max_continuations_static) == COMMON_NGRAM_CACHE_LOAD_OK) {
                 SPC_INF("static lookup cache loaded: %s (%zu n-grams)\n", path_static.c_str(), ngram_cache_static.size());
             } else {
                 SPC_WRN("static lookup cache ignored: %s\n", err.c_str());
@@ -3674,7 +3675,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         auto status_dynamic = COMMON_NGRAM_CACHE_LOAD_MISSING;
         if (!path_dynamic.empty()) {
             std::string err;
-            status_dynamic = common_ngram_cache_load_file(path_dynamic, ngram_cache_dynamic, vocab_id, err);
+            status_dynamic = common_ngram_cache_load_file(path_dynamic, ngram_cache_dynamic, vocab_id, err,
+                    this->params.load_max_entries_dynamic, this->params.load_max_continuations_dynamic);
             if (status_dynamic == COMMON_NGRAM_CACHE_LOAD_OK) {
                 SPC_INF("dynamic lookup cache loaded: %s (%zu n-grams)\n", path_dynamic.c_str(), ngram_cache_dynamic.size());
                 file_present = true;
@@ -3748,7 +3750,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
             std::string err;
             if (common_ngram_cache_sync_file(params.lookup_cache_dynamic, ngram_cache_dynamic, ngram_cache_delta,
-                        n_max_dynamic, vocab_id, err)) {
+                        n_max_dynamic, vocab_id, err, nullptr, params.load_max_entries_dynamic, params.load_max_continuations_dynamic)) {
                 SPC_INF("dynamic lookup cache saved (%s): %s, %zu n-grams, %.1f ms\n",
                         reason, params.lookup_cache_dynamic.c_str(), ngram_cache_dynamic.size(),
                         (ggml_time_us() - t_start_us) / 1000.0);
@@ -3807,7 +3809,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                 try {
                     cache = delta;
                     ok = common_ngram_cache_sync_file(params.lookup_cache_dynamic, cache, delta,
-                            n_max_dynamic, vocab_id, err, &from_disk);
+                            n_max_dynamic, vocab_id, err, &from_disk, params.load_max_entries_dynamic, params.load_max_continuations_dynamic);
                 } catch (const std::exception & e) {
                     ok  = false;
                     err = e.what();

@@ -1808,6 +1808,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("lookup cache max ngrams must be >= 0");
             }
             params.speculative.ngram_cache.max_ngrams_dynamic = value;
+            params.speculative.ngram_cache.max_ngrams_dynamic_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

@@ -114,6 +114,34 @@ bool common_fit_eval_cache_save_fits(uint64_t available, bool fit, uint64_t n_to
     return n_tokens <= (budget - scratch - spec_bytes) / sizeof(llama_token);
 }
 
+void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_params_speculative_ngram_cache & params) {
+    params.load_max_entries_static = params.load_max_continuations_static = UINT64_MAX;
+    params.load_max_entries_dynamic = params.load_max_continuations_dynamic = UINT64_MAX;
+    const bool use_static = !params.lookup_cache_static.empty();
+    const bool use_dynamic = !params.lookup_cache_dynamic.empty() && !params.max_ngrams_dynamic_explicit;
+    const unsigned count = unsigned(use_static) + unsigned(use_dynamic);
+    if (!fit || count == 0) {
+        return;
+    }
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests = {};
+    for (auto & request : requests) {
+        request.bytes = UINT64_MAX;
+    }
+    const uint64_t bytes = common_fit_ram_plan(available, requests).bytes[COMMON_FIT_RAM_NGRAM] / count;
+    const uint64_t payload = bytes > 8192 ? bytes - 8192 : 0;
+    // Count admission estimates map overhead; this is not allocator byte accounting.
+    const uint64_t entries = payload / 2 / 512;
+    const uint64_t continuations = payload / 2 / 128;
+    if (use_static) {
+        params.load_max_entries_static = entries;
+        params.load_max_continuations_static = continuations;
+    }
+    if (use_dynamic) {
+        params.load_max_entries_dynamic = entries;
+        params.load_max_continuations_dynamic = continuations;
+    }
+}
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {

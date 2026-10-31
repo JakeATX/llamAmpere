@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "common.h"
 #include "ngram-cache.h"
 #include "../src/llama-moe-arena.h"
 #include "../src/llama-b1.h"
@@ -86,6 +87,104 @@ static std::vector<char> ngram_old_file_bytes(const common_ngram_cache & cache, 
     append(result, &hash, sizeof(hash));
     result.insert(result.end(), payload.begin(), payload.end());
     return result;
+}
+
+static void test_ngram_ram_load_fit() {
+    constexpr uint64_t GiB = 1ull << 30;
+    common_params_speculative_ngram_cache params;
+    params.lookup_cache_static = "static";
+    params.lookup_cache_dynamic = "dynamic";
+    uint64_t previous = 0;
+    for (uint64_t ram : {16ull, 32ull, 64ull, 128ull}) {
+        common_fit_ngram_cache_load_limits(ram * GiB, true, params);
+        expect(params.load_max_entries_static > previous &&
+                params.load_max_entries_static == params.load_max_entries_dynamic &&
+                params.load_max_continuations_static == params.load_max_continuations_dynamic,
+                "automatic lookup load quotas scale with fake machine RAM and split across both files");
+        expect(params.load_max_entries_static * 512 + params.load_max_continuations_static * 128 <=
+                (ram * GiB - 5 * GiB) / 2,
+                "lookup load count estimates fit within spare RAM");
+        previous = params.load_max_entries_static;
+    }
+    const uint64_t both_entries = params.load_max_entries_static;
+    params.max_ngrams_dynamic = 0;
+    params.max_ngrams_dynamic_explicit = true;
+    common_fit_ngram_cache_load_limits(128 * GiB, true, params);
+    expect(params.max_ngrams_dynamic == 0 && params.load_max_entries_dynamic == UINT64_MAX &&
+            params.load_max_continuations_dynamic == UINT64_MAX && params.load_max_entries_static > both_entries,
+            "explicit unlimited dynamic size wins and only the static file uses the automatic quota");
+    params.max_ngrams_dynamic = 17;
+    common_fit_ngram_cache_load_limits(0, true, params);
+    expect(params.max_ngrams_dynamic == 17 && params.load_max_entries_dynamic == UINT64_MAX &&
+            params.load_max_entries_static == 0, "explicit positive dynamic size wins even with unknown RAM");
+    params.max_ngrams_dynamic_explicit = false;
+    for (uint64_t ram : std::array<uint64_t, 3>{0, 4 * GiB, 5 * GiB}) {
+        common_fit_ngram_cache_load_limits(ram, true, params);
+        expect(params.load_max_entries_static == 0 && params.load_max_entries_dynamic == 0 &&
+                params.load_max_continuations_static == 0 && params.load_max_continuations_dynamic == 0,
+                "low or unknown RAM refuses nonempty automatic lookup loads");
+    }
+    common_fit_ngram_cache_load_limits(0, false, params);
+    expect(params.load_max_entries_static == UINT64_MAX && params.load_max_entries_dynamic == UINT64_MAX &&
+            params.load_max_continuations_static == UINT64_MAX && params.load_max_continuations_dynamic == UINT64_MAX,
+            "fit off resets prior quotas and preserves unlimited lookup loading");
+    common_fit_ngram_cache_load_limits(UINT64_MAX, true, params);
+    expect(params.load_max_entries_static > 0 && params.load_max_entries_static < UINT64_MAX / 1024 &&
+            params.load_max_continuations_static < UINT64_MAX / 256,
+            "lookup count planning handles the largest available-RAM value without overflow");
+
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("test-ngram-ram-fit-" + std::to_string(ggml_time_us()));
+    const bool created = fs::create_directory(dir);
+    expect(created, "create private RAM lookup load test directory");
+    if (!created) {
+        return;
+    }
+    params.lookup_cache_static.clear();
+    params.lookup_cache_dynamic = (dir / "dynamic").string();
+    common_fit_ngram_cache_load_limits(5 * GiB + (64ull << 20), true, params);
+    expect(params.load_max_entries_dynamic > 0 && params.load_max_entries_dynamic < 4096,
+            "small spare RAM gives a bounded nonzero lookup load quota");
+    if (params.load_max_entries_dynamic == 0 || params.load_max_entries_dynamic >= 4096) {
+        fs::remove_all(dir);
+        return;
+    }
+    common_ngram_cache source;
+    for (llama_token token = 0; uint64_t(token) < params.load_max_entries_dynamic; ++token) {
+        source[common_ngram(&token, 1)] = {{1, 2}};
+    }
+    const common_ngram_cache_vocab_id vocab = {100000, 123};
+    std::string err;
+    expect(common_ngram_cache_save_file(source, params.lookup_cache_dynamic, vocab, err), "write exact-quota lookup file");
+    common_ngram_cache loaded;
+    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
+            params.load_max_entries_dynamic, params.load_max_continuations_dynamic) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == source,
+            "RAM-derived key quota accepts a real file exactly at its limit");
+    const llama_token extra_token = llama_token(params.load_max_entries_dynamic);
+    source[common_ngram(&extra_token, 1)] = {{1, 2}};
+    expect(common_ngram_cache_save_file(source, params.lookup_cache_dynamic, vocab, err), "write over-quota lookup file");
+    const auto read = [&]() {
+        std::ifstream in(params.lookup_cache_dynamic, std::ios::binary);
+        return std::vector<char>(std::istreambuf_iterator<char>(in), {});
+    };
+    const auto before = read();
+    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
+            params.load_max_entries_dynamic, params.load_max_continuations_dynamic) == COMMON_NGRAM_CACHE_LOAD_LIMIT && loaded.empty(),
+            "RAM-derived quotas refuse a real oversized file before map insertion");
+    const llama_token token = 0;
+    common_ngram_cache live = {{common_ngram(&token, 1), {{1, 3}}}};
+    common_ngram_cache delta = {{common_ngram(&token, 1), {{1, 1}}}};
+    const auto live_before = live;
+    const auto delta_before = delta;
+    expect(!common_ngram_cache_sync_file(params.lookup_cache_dynamic, live, delta, 0, vocab, err, nullptr,
+            params.load_max_entries_dynamic, params.load_max_continuations_dynamic) &&
+            live == live_before && delta == delta_before && read() == before,
+            "RAM quota refusal on checkpoint preserves the entire file, live cache and pending counts");
+    common_fit_ngram_cache_load_limits(0, false, params);
+    expect(common_ngram_cache_load_file(params.lookup_cache_dynamic, loaded, vocab, err,
+            params.load_max_entries_dynamic, params.load_max_continuations_dynamic) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == source,
+            "the same file still loads with fit off");
+    fs::remove_all(dir);
 }
 
 static void test_ngram_stream_save() {
@@ -589,6 +688,7 @@ static void test_ram_prompt_fit() {
 }
 
 int main() {
+    test_ngram_ram_load_fit();
     test_ngram_stream_save();
     test_ngram_load_limits();
     test_ngram_live_limit();
