@@ -2663,9 +2663,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 up_exps && gate_exps && down_exps && !gate_up_exps &&
                 !up_exps_b && !gate_exps_b && !down_exps_b &&
                 !up_exps_s && !gate_exps_s && !down_exps_s &&
-                (hot.up->type == GGML_TYPE_AIT2_U || hot.up->type == GGML_TYPE_AIT3_U) &&
-                (hot.gate->type == GGML_TYPE_AIT2_U || hot.gate->type == GGML_TYPE_AIT3_U) &&
-                (hot.down->type == GGML_TYPE_AIT2_U || hot.down->type == GGML_TYPE_AIT3_U ||
+                (hot.up->type == GGML_TYPE_AIT2_U || hot.up->type == GGML_TYPE_AIT2P_U || hot.up->type == GGML_TYPE_AIT3_U) &&
+                (hot.gate->type == GGML_TYPE_AIT2_U || hot.gate->type == GGML_TYPE_AIT2P_U || hot.gate->type == GGML_TYPE_AIT3_U) &&
+                (hot.down->type == GGML_TYPE_AIT2_U || hot.down->type == GGML_TYPE_AIT2P_U || hot.down->type == GGML_TYPE_AIT3_U ||
                  (hot.down->type == GGML_TYPE_AIT4_U && hot.down->ne[0] == 640) ||
                  (hot.down->type == GGML_TYPE_IQ4_NL && down_exps->type == GGML_TYPE_IQ4_NL))) {
             ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, nullptr, il);

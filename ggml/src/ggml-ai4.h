@@ -1,8 +1,14 @@
 // AI+ unit layout (AITk_U): inference-only reconstruction and inverse rotation.
+// AIT2P_U (ggml type 121): AIT2_U bytes (k = 2, 16-row x 128-K units, 16 tiles of 16 rows x 8 cols, MSB-first tile
+// streams), AIT2P pair-table levels. Pair p (0..63) of a tile = weights 2p, 2p + 1 (one row, two adjacent columns);
+// window w_p = the 20 stream bits [4p - 16, 4p + 4) (circular, MSB-first, so w_p = ((w_{p-1} << 4) | 4 new bits) mod 2^20);
+// level(2p + ce) = ait2p_tab[2 ait2p_entry(w_p) + ce]. Decoders take C = trellis multiplier; C == 0 selects this code.
 #pragma once
 
 #include <stdint.h>
 #include <string.h>
+
+#include "ggml-ait.h"   // ait2p_tab / ait2p_entry (AIT2P_U)
 
 
 #define AI4_HB     256
@@ -121,6 +127,26 @@ static inline uint32_t aik_get_state(const uint32_t * wd, int k, int n) {
     return (uint32_t)((c >> (48 - sh)) & 0xFFFFu);
 }
 
+// AIT2P_U pair window: the 20 stream bits of a k = 2 tile ending at bit 4p + 4 (circular)
+static inline uint32_t aik_pair_window(const uint32_t * wd, int p) {
+    const int nb = AI4_TILE*2, nw = AIK_TILE_WORDS(2);
+    int b0 = 4*p + 4 - 20;
+    if (b0 < 0) {
+        b0 += nb;
+    }
+    const int w = b0 >> 5, sh = b0 & 31;
+    const uint64_t c = ((uint64_t) wd[w] << 32) | wd[(w + 1) % nw];
+    return (uint32_t)((c >> (44 - sh)) & 0xFFFFFu);
+}
+
+// level of weight n of a tile: 1MAD with multiplier C, or (C == 0, k == 2) the AIT2P pair table
+static inline int aik_level_n(const uint32_t * wd, int k, uint32_t C, int n) {
+    if (C == 0) {
+        return ait2p_tab[2*ait2p_entry(aik_pair_window(wd, n >> 1)) + (n & 1)];
+    }
+    return aik_level_c(aik_get_state(wd, k, n), C);
+}
+
 static inline void aik_dequantize_slab_rotated_c(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K) {
     const int ub = AI4U_UNIT_BYTES(k), tw = AIK_TILE_WORDS(k);
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
@@ -130,7 +156,7 @@ static inline void aik_dequantize_slab_rotated_c(int k, uint32_t C, const uint8_
         for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
             for (int n = 0; n < AI4_TILE; ++n) {
                 const int r = n / AI4_TC, kk = ct*AI4_TC + n % AI4_TC;
-                dst[r*K + u*AI4U_UK + kk] = ai4_fp16_to_fp32(dh[r])*(float) aik_level_c(aik_get_state(wd + ct*tw, k, n), C);
+                dst[r*K + u*AI4U_UK + kk] = ai4_fp16_to_fp32(dh[r])*(float) aik_level_n(wd + ct*tw, k, C, n);
             }
         }
     }

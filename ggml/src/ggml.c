@@ -862,6 +862,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // 16-row units, not row-addressable
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_AIT2P_U] = {
+        .type_name                = "ait2p_u",
+        .blck_size                = 128,
+        .type_size                = 34,   // AIT2_U bytes; levels from the AIT2P pair table
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row units, not row-addressable
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_AIT3_U] = {
         .type_name                = "ait3_u",
         .blck_size                = 128,
@@ -1593,7 +1601,8 @@ int ggml_exl3_bits(enum ggml_type type) {
 // ---- AI+ unit types (ggml-ai4.h): rate, layout and the per-type decoder constant / encoder scale seed ----
 int ggml_ai4_rate(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_AIT2_U:  return 2;
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2P_U: return 2;
         case GGML_TYPE_AIT3_U:  return 3;
         case GGML_TYPE_AIT4_U:  return 4;
         case GGML_TYPE_AIT5_U:  return 5;
@@ -1630,7 +1639,15 @@ int ggml_ai4_layout(enum ggml_type type) {
     return ggml_ai4_rate(type) == 0 ? -1 : 1;
 }
 
-// The level of a 16-bit state is ((bytesum(state * C) + 2) >> 2) - 128, so C is part of the type.
+int ggml_ai4_code(enum ggml_type type) {
+    if (ggml_ai4_rate(type) == 0) {
+        return -1;
+    }
+    return type == GGML_TYPE_AIT2P_U ? 1 : 0;
+}
+
+// The level of a 16-bit state is ((bytesum(state * C) + 2) >> 2) - 128, so C is part of the type. AIT2P_U has no C (0):
+// its levels come from the AIT2P pair table, and the shared decoders treat C == 0 as that code.
 uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_AIT2_U:  return 0xC3CCD12Du;
@@ -1644,7 +1661,8 @@ uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
 // Encoder scale seed = group rms / level rms * this (per-rate probe value; the encoder, not the decoder, uses it).
 float ggml_ai4_scale_mul(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_AIT2_U:  return 1.00f;
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2P_U: return 1.00f;
         case GGML_TYPE_AIT3_U:  return 1.05f;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT5_U:  return 1.09f;
