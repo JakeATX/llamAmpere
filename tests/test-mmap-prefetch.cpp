@@ -35,6 +35,24 @@ static void expect(bool ok, const char * message) {
 }
 
 int main() {
+    constexpr uint64_t GiB = 1ull << 30;
+    constexpr size_t MiB = 1u << 20;
+    for (uint64_t host : {16, 32, 64, 128}) {
+        const uint64_t available = (host - 6) * GiB;
+        const size_t expected = size_t(((host - 11) * 1024 * 4 / 5) / 10) * MiB;
+        size_t budget = llama_mmap_prefetch_budget(available);
+        expect(budget == expected, "fake host prefetch uses independently calculated eight percent of RAM above floor");
+        const size_t first = llama_mmap_prefetch_take(budget, 1);
+        const size_t second = llama_mmap_prefetch_take(budget, SIZE_MAX);
+        expect(first == 1 && second == expected - MiB && budget == 0, "two shards share one page-rounded budget");
+    }
+    for (uint64_t available : {uint64_t(0), 4 * GiB, 5 * GiB}) {
+        expect(llama_mmap_prefetch_budget(available) == 0, "unknown or low RAM disables optional prefetch");
+    }
+    size_t huge = llama_mmap_prefetch_budget(UINT64_MAX);
+    const size_t huge_start = huge;
+    expect(llama_mmap_prefetch_take(huge, SIZE_MAX) == huge_start && huge == 0, "extreme RAM cannot overflow the quota or debit");
+
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         return 1;
@@ -80,7 +98,31 @@ int main() {
             }
         }
     }
+    // A real mapping must exist before querying the policy, and the policy
+    // must disable whole-map population even when the initial request is full.
+    {
+        llama_file file(temporary);
+        struct policy_state { size_t remaining; int calls; bool mapped; } state{((bytes.size() + MiB - 1) / MiB) * MiB, 0, false};
+        const auto limit = [](size_t requested, void * opaque) noexcept -> size_t {
+            auto & state = *static_cast<policy_state *>(opaque);
+            state.mapped = mapped_flags != 0;
+            state.calls++;
+            return llama_mmap_prefetch_take(state.remaining, requested);
+        };
+        for (int shard = 0; shard < 2; ++shard) {
+            advice.clear();
+            mapped_flags = 0;
+            llama_mmap mapping(&file, SIZE_MAX, false, {}, +limit, &state);
+            expect(!(mapped_flags & MAP_POPULATE), "post-map policy prevents eager whole-map population");
+            size_t advised = 0;
+            for (const auto & call : advice) {
+                if (call.kind == POSIX_MADV_WILLNEED) { advised += call.size; }
+            }
+            expect(shard == 0 ? advised == bytes.size() : advised == 0, "next shard cannot reuse first shard's page-rounded quota");
+        }
+        expect(state.calls == 2 && state.mapped && state.remaining == 0, "policy runs after each actual mmap and shares one budget");
+    }
     std::fclose(temporary);
-    std::printf("%s mmap prefetch: 28 actual syscall cases; no model or GPU\n", failures ? "FAIL" : "PASS");
+    std::printf("%s mmap prefetch: 28 baseline syscall cases + shared-quota callbacks + fake RAM hosts; no model or GPU\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

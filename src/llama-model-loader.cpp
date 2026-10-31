@@ -1685,7 +1685,19 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool private_dense) {
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool private_dense, bool fit_ram) {
+    size_t prefetch_remaining = SIZE_MAX;
+    const auto fit_prefetch = [](size_t requested, void * data) noexcept -> size_t {
+        auto & remaining = *static_cast<size_t *>(data);
+        size_t safe = 0;
+        try { safe = llama_mmap_prefetch_budget(llama_moe_arena::available_memory()); }
+        catch (...) { /* Unknown RAM disables optional read-ahead. */ }
+        if (remaining == SIZE_MAX) {
+            LLAMA_LOG_INFO("RAM fit: page prefetch limited to %zu MiB to leave 5 GiB free and reserve RAM for other caches\n", safe / MiB);
+        }
+        remaining = std::min(remaining, safe);
+        return llama_mmap_prefetch_take(remaining, requested);
+    };
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1708,7 +1720,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap && !use_moe_arena && !direct_overlay ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    lazy.for_file(idx), fit_ram ? +fit_prefetch : nullptr, &prefetch_remaining);
             if (private_dense) {
                 for (const char * name : { "token_embd.weight", "output.weight" }) {
                     auto found = weights_map.find(name);
