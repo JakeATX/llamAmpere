@@ -239,6 +239,94 @@ static void test_ngram_context_fit() {
             "extreme available RAM and slot counts do not overflow quota arithmetic");
 }
 
+static void test_ngram_checkpoint_fit() {
+    constexpr uint64_t GiB = 1ull << 30;
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests = {};
+    for (auto & request : requests) {
+        request.bytes = UINT64_MAX;
+    }
+    for (uint64_t ram : {16ull, 32ull, 64ull, 128ull}) {
+        const uint64_t budget = common_fit_ram_plan(ram * GiB, requests).bytes[COMMON_FIT_RAM_NGRAM];
+        uint64_t previous = UINT64_MAX;
+        for (int mode : {0, 1, 2}) {
+            common_params_speculative_ngram_cache params;
+            params.lookup_cache_static = "static";
+            params.lookup_cache_dynamic = "dynamic";
+            params.save_dynamic = mode > 0;
+            params.save_dynamic_interval = mode == 2 ? 300 : 0;
+            common_fit_ngram_cache_load_limits(ram * GiB, true, params, 4);
+            expect(params.load_max_entries_dynamic > 0 && params.load_max_entries_dynamic < previous &&
+                    params.load_max_entries_dynamic == params.load_max_entries_static &&
+                    params.load_max_entries_dynamic == params.max_entries_context &&
+                    params.load_max_continuations_dynamic == params.load_max_continuations_static &&
+                    params.load_max_continuations_dynamic == params.max_continuations_context,
+                    "saving modes reduce per-map quotas and retain equal file and slot shares");
+            // Live, delta and merged maps coexist at shutdown; periodic saves also retain a worker delta.
+            const uint64_t maps = mode == 0 ? 6 : mode == 1 ? 8 : 9;
+            const uint64_t estimate = params.load_max_entries_dynamic * 512 +
+                    params.load_max_continuations_dynamic * 128 + 8192;
+            expect(estimate <= budget / maps,
+                    "all simultaneous checkpoint, file and slot estimates fit the ngram RAM share");
+            previous = params.load_max_entries_dynamic;
+        }
+    }
+
+    common_params_speculative_ngram_cache params;
+    params.lookup_cache_dynamic = "dynamic";
+    params.save_dynamic = true;
+    params.save_dynamic_interval = 300;
+    common_fit_ngram_cache_load_limits(16 * GiB, true, params, 0);
+    const uint64_t periodic_entries = params.load_max_entries_dynamic;
+    const uint64_t budget = common_fit_ram_plan(16 * GiB, requests).bytes[COMMON_FIT_RAM_NGRAM];
+    expect(periodic_entries > 0 && params.max_entries_context == 0 &&
+            (periodic_entries * 512 + params.load_max_continuations_dynamic * 128 + 8192) <= budget / 4,
+            "dynamic-only periodic saving budgets every map without static files or slots");
+    params.save_dynamic_interval = -1;
+    common_fit_ngram_cache_load_limits(16 * GiB, true, params, 0);
+    expect(params.load_max_entries_dynamic > periodic_entries,
+            "nonpositive checkpoint interval uses the shutdown-only memory budget");
+
+    params.lookup_cache_dynamic.clear();
+    common_fit_ngram_cache_load_limits(16 * GiB, true, params, 4);
+    const uint64_t context_only = params.max_entries_context;
+    params.save_dynamic = false;
+    common_fit_ngram_cache_load_limits(16 * GiB, true, params, 4);
+    expect(params.max_entries_context == context_only && params.load_max_entries_dynamic == UINT64_MAX,
+            "saving without a dynamic path does not reserve phantom checkpoint maps");
+    common_fit_ngram_cache_load_limits(16 * GiB, true, params, 0);
+    expect(params.load_max_entries_dynamic == UINT64_MAX && params.max_entries_context == UINT64_MAX,
+            "no files and no slots preserve the no-consumer path");
+
+    params.lookup_cache_dynamic = "dynamic";
+    params.save_dynamic = true;
+    params.max_ngrams_dynamic_explicit = true;
+    for (uint32_t explicit_size : {0u, 17u}) {
+        params.max_ngrams_dynamic = explicit_size;
+        common_fit_ngram_cache_load_limits(16 * GiB, true, params, 4);
+        expect(params.max_ngrams_dynamic == explicit_size && params.load_max_entries_dynamic == UINT64_MAX &&
+                params.load_max_continuations_dynamic == UINT64_MAX && params.max_entries_context == context_only,
+                "explicit dynamic sizes preserve their override without charging automatic slots for their copies");
+    }
+    params.max_ngrams_dynamic_explicit = false;
+    params.save_dynamic_interval = 300;
+    for (uint64_t ram : std::array<uint64_t, 3>{0, 4 * GiB, 5 * GiB}) {
+        common_fit_ngram_cache_load_limits(ram, true, params, 4);
+        expect(params.load_max_entries_dynamic == 0 && params.load_max_continuations_dynamic == 0 &&
+                params.max_entries_context == 0 && params.max_continuations_context == 0,
+                "low or unknown RAM disables automatic checkpoint and context growth");
+    }
+    common_fit_ngram_cache_load_limits(0, false, params, 4);
+    expect(params.load_max_entries_dynamic == UINT64_MAX && params.load_max_continuations_dynamic == UINT64_MAX &&
+            params.max_entries_context == UINT64_MAX && params.max_continuations_context == UINT64_MAX,
+            "fit off resets checkpoint and context quotas to unlimited");
+    common_fit_ngram_cache_load_limits(UINT64_MAX, true, params, UINT32_MAX);
+    const uint64_t maps = uint64_t(UINT32_MAX) + 4;
+    const uint64_t estimate = params.max_entries_context * 512 + params.max_continuations_context * 128 + 8192;
+    expect(params.load_max_entries_dynamic > 0 && params.load_max_entries_dynamic == params.max_entries_context &&
+            estimate <= common_fit_ram_plan(UINT64_MAX, requests).bytes[COMMON_FIT_RAM_NGRAM] / maps,
+            "maximum RAM and slot values keep checkpoint aggregate estimates within budget");
+}
+
 static void test_ngram_context_admission() {
     common_params_speculative params;
     params.types = {COMMON_SPECULATIVE_TYPE_NGRAM_CACHE};
@@ -1135,6 +1223,7 @@ static void test_ram_prompt_fit() {
 int main() {
     test_ngram_ram_load_fit();
     test_ngram_context_fit();
+    test_ngram_checkpoint_fit();
     test_ngram_context_admission();
     test_ngram_checkpoint_load_quotas();
     test_ngram_checkpoint_merge_allocations();

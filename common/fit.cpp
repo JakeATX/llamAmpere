@@ -120,7 +120,10 @@ void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_par
     params.max_entries_context = params.max_continuations_context = UINT64_MAX;
     const bool use_static = !params.lookup_cache_static.empty();
     const bool use_dynamic = !params.lookup_cache_dynamic.empty() && !params.max_ngrams_dynamic_explicit;
-    const uint64_t count = uint64_t(use_static) + uint64_t(use_dynamic) + n_seq;
+    // fork: checkpoints can hold the live cache, two deltas and the loaded/merged cache together.
+    const uint64_t copies_dynamic = !use_dynamic ? 0 : !params.save_dynamic ? 1 :
+        params.save_dynamic_interval > 0 ? 4 : 3;
+    const uint64_t count = uint64_t(use_static) + copies_dynamic + n_seq;
     if (!fit || count == 0) {
         return;
     }
