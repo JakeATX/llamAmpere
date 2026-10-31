@@ -19313,6 +19313,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ3_XXS, width, 2, 1, false, true, 2560, 640));
             test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ4_NL, width, 2, 4, false, true, 640, 2560));
         }
+        // all-AI+ banked experts: AIT4_U down over the IQ4_NL cold down
+        for (int mode : { 0, 1, 2 }) {
+            test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT4_U, GGML_TYPE_IQ4_NL, width, mode, 4, false, mode == 2, 640, 2560));
+        }
     }
 
     for (int width : { 1, 4, 5, 8 }) {

@@ -1750,7 +1750,9 @@ bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor *
         return false;
     }
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
-    if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT3_U && w->type != GGML_TYPE_IQ4_NL) ||
+    // AIT4_U banks: the K = 640 down projection only (a banked expert is AI+ in all three matrices).
+    if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT3_U && w->type != GGML_TYPE_IQ4_NL &&
+            (w->type != GGML_TYPE_AIT4_U || w->ne[0] != 640)) ||
             (w->type == GGML_TYPE_IQ4_NL ? cw->type != GGML_TYPE_IQ4_NL : !ggml_cuda_ai4_supported(bank)) ||
             w->ne[3] != 1 || !ggml_is_contiguous(w) ||
             x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] <= 0 || x->ne[0] > 65536 || x->ne[0] % 128 ||
@@ -2050,6 +2052,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         MOE_MIXED_WARPS(GGML_TYPE_IQ3_S, ai4k::LAY_AIT3_U, 1, 2560);
     } else if (ai4_mmvr_kt() && K == 640 && M == 2560 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_Q2_0) {
         MOE_MIXED_WARPS(GGML_TYPE_Q2_0, ai4k::LAY_AIT2_U, 0, 640);
+    } else if (w->type == GGML_TYPE_AIT4_U) {
+        if (ai4_mmvr_kt()) { MOE_MIXED_WARPS(GGML_TYPE_COUNT, ai4k::LAY_AIT4_U, 0, 640); }
+        else               { MOE_MIXED_WARPS(GGML_TYPE_COUNT, ai4k::LAY_AIT4_U, 0, 0); }
     } else if (w->type == GGML_TYPE_AIT2_U) {
         MOE_MIXED_SHAPE(ai4k::LAY_AIT2_U);
     } else {

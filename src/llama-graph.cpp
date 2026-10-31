@@ -2666,6 +2666,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 (hot.up->type == GGML_TYPE_AIT2_U || hot.up->type == GGML_TYPE_AIT3_U) &&
                 (hot.gate->type == GGML_TYPE_AIT2_U || hot.gate->type == GGML_TYPE_AIT3_U) &&
                 (hot.down->type == GGML_TYPE_AIT2_U || hot.down->type == GGML_TYPE_AIT3_U ||
+                 (hot.down->type == GGML_TYPE_AIT4_U && hot.down->ne[0] == 640) ||
                  (hot.down->type == GGML_TYPE_IQ4_NL && down_exps->type == GGML_TYPE_IQ4_NL))) {
             ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, nullptr, il);
             // fork: slot-cache IDs have a different domain from the bank map; retain the old path there.
