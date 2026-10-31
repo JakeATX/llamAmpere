@@ -1530,9 +1530,16 @@ struct moe_mixed_second {
     bool red_tree;
 };
 
-// Fused SwiGLU tiles: a tile is the rows and routes one block coordinate stores, the same for both
-// projections. Each of its two blocks counts in after its stores; the second one (in either phase
-// launch) writes silu(gate)*up for the tile and resets the count for the next launch.
+// Epilogue tiles are 16-row slices of one route's output, so launches that tile the rows differently (the SPW
+// hit-first launch and the 16-row phase-2 launch) count into the same tiles. A block covers rows rows from row
+// bx*rows (at most four slices).
+static __device__ __forceinline__ int moe_mixed_slices(int bx, int rows, int M, int & first) {
+    first = bx*rows/16;
+    return min(rows/16, M/16 - first);
+}
+
+// Fused SwiGLU: each projection's store of a slice counts in once; the second one (in either phase launch)
+// writes silu(gate)*up for that slice and resets the count for the next launch.
 static constexpr int MOE_MIXED_GLU_TILES = 40*64*8;
 static __device__ unsigned int g_moe_mixed_glu_count[MOE_MIXED_GLU_TILES];
 
@@ -1541,32 +1548,29 @@ static __device__ __forceinline__ void moe_mixed_glu(const moe_mixed_second & se
     if (!second.glu) {
         return;
     }
-    __shared__ bool last;
     __threadfence();
     __syncthreads();
-    if (threadIdx.x == 0) {
-        const int tile = ((int) blockIdx.z*gridDim.y + blockIdx.y)*(gridDim.x/2) + bx;
-        last = atomicAdd(&g_moe_mixed_glu_count[tile], 1u) == 1u;
-        if (last) {
-            g_moe_mixed_glu_count[tile] = 0;
-        }
-    }
-    __syncthreads();
-    if (!last) {
-        return;
-    }
+    int first;
+    const int slices = moe_mixed_slices(bx, rows, M, first);
     const int own = (int) blockIdx.z*gridDim.y + blockIdx.y;
-    for (int i = threadIdx.x; i < n*rows; i += blockDim.x) {
-        const int r = bx*rows + i % rows;
-        if (r < M) {
-            const int64_t o = (int64_t) (cols ? cols[i / rows] : own)*M + r;
-            second.glu[o] = ggml_cuda_op_silu_single(__ldcg(second.glu_gate + o)) * __ldcg(second.glu_up + o);
+    for (int i = threadIdx.x; i < n*slices; i += blockDim.x) {
+        const int col = cols ? cols[i / slices] : own;
+        const int slice = first + i % slices;
+        unsigned int * count = &g_moe_mixed_glu_count[col*(M/16) + slice];
+        if (atomicAdd(count, 1u) != 1u) {
+            continue;
+        }
+        *count = 0;
+        const int64_t o = (int64_t) col*M + slice*16;
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            second.glu[o + r] = ggml_cuda_op_silu_single(__ldcg(second.glu_gate + o + r)) * __ldcg(second.glu_up + o + r);
         }
     }
 }
 
-// Fused routed sum (unpaired launches): a block counts in once per route it stored, per (token, row tile); the block
-// that completes a token's n_used routes (in either phase launch) writes that token's tile of the sum and resets the
+// Fused routed sum (unpaired launches): each stored route slice counts in once per (token, slice); the block that
+// completes a token's n_used routes (in either phase launch) writes that token's slice of the sum and resets the
 // count. Same expression and order as moe_mixed_reduction_f32: products rounded alone, then serial or warp-tree
 // hot and cold buckets, then hot + cold.
 static constexpr int MOE_MIXED_RED_TILES = 4096*8;
@@ -1578,61 +1582,59 @@ static __device__ __forceinline__ void moe_mixed_reduce(const moe_mixed_second &
         return;
     }
     const int n_used = gridDim.y;
-    __shared__ unsigned int done;
+    __shared__ unsigned int done;   // bit 4*token + slice - first
     __threadfence();
     if (threadIdx.x == 0) {
         done = 0;
     }
     __syncthreads();
+    int first;
+    const int slices = moe_mixed_slices(bx, rows, M, first);
     const int own = (int) blockIdx.z*n_used + blockIdx.y;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const int tok = (cols ? cols[i] : own) / n_used;
-        unsigned int * count = &g_moe_mixed_red_count[tok*gridDim.x + bx];
+    for (int i = threadIdx.x; i < n*slices; i += blockDim.x) {
+        const int tok = (cols ? cols[i / slices] : own) / n_used;
+        const int j = i % slices;
+        unsigned int * count = &g_moe_mixed_red_count[tok*(M/16) + first + j];
         if (atomicAdd(count, 1u) == (unsigned int) n_used - 1) {
             *count = 0;
-            atomicOr(&done, 1u << tok);
+            atomicOr(&done, 1u << (4*tok + j));
         }
     }
     __syncthreads();
-    for (unsigned int m = done; m != 0; m &= m - 1) {
-        const int tok = __ffs(m) - 1;
+    if (done == 0) {
+        return;
+    }
+    const bool tree = second.red_tree;
+    const int lane = threadIdx.x & 31;
+    const int step = tree ? blockDim.x >> 5 : blockDim.x;
+    for (int i = tree ? threadIdx.x >> 5 : threadIdx.x; i < 32*16; i += step) {
+        const int bit = i / 16;
+        if (!(done >> bit & 1u)) {
+            continue;
+        }
+        const int tok = bit / 4;
+        const int r = (first + bit % 4)*16 + i % 16;
         const float * w = second.red_w + (int64_t) tok*n_used;
         const int32_t * bank = second.red_bank + tok*second.red_bank_stride;
-        const float * y = Y + (int64_t) tok*n_used*M;
-        float * dst = second.red_dst + (int64_t) tok*M;
-        if (second.red_tree) {
-            const int lane = threadIdx.x & 31;
-            for (int i = threadIdx.x >> 5; i < rows; i += blockDim.x >> 5) {
-                const int r = bx*rows + i;
-                if (r >= M) {
-                    break;
-                }
-                float hot = 0.0f, cold = 0.0f;
-                if (lane < n_used) {
-                    const float value = __fmul_rn(__ldcg(y + (int64_t) lane*M + r), w[lane]);
-                    if (bank[lane] >= 0) { hot = value; }
-                    else { cold = value; }
-                }
-                hot = warp_reduce_sum(hot);
-                cold = warp_reduce_sum(cold);
-                if (lane == 0) {
-                    dst[r] = __fadd_rn(hot, cold);
-                }
+        const float * y = Y + (int64_t) tok*n_used*M + r;
+        float hot = 0.0f, cold = 0.0f;
+        if (tree) {
+            if (lane < n_used) {
+                const float value = __fmul_rn(__ldcg(y + (int64_t) lane*M), w[lane]);
+                if (bank[lane] >= 0) { hot = value; }
+                else { cold = value; }
             }
+            hot = warp_reduce_sum(hot);
+            cold = warp_reduce_sum(cold);
         } else {
-            for (int i = threadIdx.x; i < rows; i += blockDim.x) {
-                const int r = bx*rows + i;
-                if (r >= M) {
-                    break;
-                }
-                float hot = 0.0f, cold = 0.0f;
-                for (int e = 0; e < n_used; ++e) {
-                    const float value = __fmul_rn(__ldcg(y + (int64_t) e*M + r), w[e]);
-                    if (bank[e] >= 0) { hot = __fadd_rn(hot, value); }
-                    else { cold = __fadd_rn(cold, value); }
-                }
-                dst[r] = __fadd_rn(hot, cold);
+            for (int e = 0; e < n_used; ++e) {
+                const float value = __fmul_rn(__ldcg(y + (int64_t) e*M), w[e]);
+                if (bank[e] >= 0) { hot = __fadd_rn(hot, value); }
+                else { cold = __fadd_rn(cold, value); }
             }
+        }
+        if (!tree || lane == 0) {
+            second.red_dst[(int64_t) tok*M + r] = __fadd_rn(hot, cold);
         }
     }
 }
@@ -1796,7 +1798,8 @@ bool ggml_cuda_moe_mixed_reduce_supported(const ggml_tensor * experts, const ggm
     const ggml_tensor * w = red.weights, * b = red.bank_ids, * d = red.dst;
     const int64_t n_used = experts->ne[1], tokens = experts->ne[2];
     return w && b && d && experts->type == GGML_TYPE_F32 && ggml_is_contiguous(experts) && experts->ne[3] == 1 &&
-            n_used >= 1 && n_used <= 32 && tokens >= 1 && tokens <= 8 &&
+            n_used >= 1 && n_used <= 32 && tokens >= 1 && tokens <= 8 && experts->ne[0] % 16 == 0 &&
+            experts->ne[0]/16*tokens <= MOE_MIXED_RED_TILES &&
             w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == 1 && w->ne[1] == n_used &&
             w->ne[2] == tokens && w->ne[3] == 1 &&
             b->type == GGML_TYPE_I32 && b->nb[0] == sizeof(int32_t) && b->nb[1] % sizeof(int32_t) == 0 &&
@@ -1967,7 +1970,12 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         idm.direct_map = (const float *) route_map->data;
         idm.direct_map_size = (int) cw->ne[2];
     }
-    const bool spw = w->type != GGML_TYPE_IQ4_NL && ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
+    // The phase-2 launch holds no bank or resident routes: 16-row blocks of four warps spread its few copied
+    // routes over four times the blocks of an SPW grid (each row's arithmetic is the same; the epilogues count
+    // 16-row slices either way). GGML_MOE_BANK_MIXED_P2_FINE=0 keeps the SPW grid.
+    static const bool p2_fine = ai4_env_int("GGML_MOE_BANK_MIXED_P2_FINE", nullptr, 1) != 0;
+    const bool fine = p2_fine && phase == 2;
+    const bool spw = !fine && w->type != GGML_TYPE_IQ4_NL && ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
     const dim3 grid((spw ? (M/16 + 3)/4 : M/16)*(pair ? 2 : 1), ids->ne[0], ids->ne[1]);
     moe_mixed_second second{};
     if (pair) {
@@ -1981,8 +1989,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             second.glu = (float *) pair->glu->data;
         }
     }
-    GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red) &&
-            (int64_t) grid.x*grid.z <= MOE_MIXED_RED_TILES));
+    GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red)));
     if (red) {
         second.red_w = (const float *) red->weights->data;
         second.red_bank = (const int32_t *) red->bank_ids->data;
@@ -1994,7 +2001,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     const int cfg = ai4_mmvr_cfg();
     const bool iq4_hot_single = w->type == GGML_TYPE_IQ4_NL && ids->ne[1] == 1;
     const size_t iq4_smem = iq4_hot_single ? 3*16*32*sizeof(float) : 0;
-    const bool two_warps = !iq4_hot_single && (cfg == 212 || (cfg == 0 && ids->ne[1] > 1 && K >= 1024));
+    const bool two_warps = !fine && !iq4_hot_single && (cfg == 212 || (cfg == 0 && ids->ne[1] > 1 && K >= 1024));
     static const bool single = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0 ||
                                ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
     // Deeper hot-route weight prefetch; the K order and arithmetic are unchanged.
