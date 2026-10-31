@@ -800,23 +800,22 @@ static void test_fit_ram(const std::string & root) {
 
     // Every allocation debit matters: one byte below the full independently summed
     // budget must fail, and the exact budget must restore the complete record.
-    for (int variant = 0; variant < 4; ++variant) {
+    for (int variant = 0; variant < 6; ++variant) {
         auto data = make_entry(20 + variant, variant == 0 ? 1000 : 3, variant == 1 ? 1000 : 1, variant == 2 ? 1 : 0);
-        data.drft.clear();
-        data.spec.clear();
+        if (variant == 4) { data.drft.resize(1000, 27); }
+        if (variant == 5) { data.spec.resize(1000, 35); }
         const std::vector<float> scales(variant == 3 ? 1000 : 0, 0.5f);
         auto tier = make_tier(root + "/fit-debits-" + std::to_string(variant), "k", 0);
         CHECK(tier.write(data.tokens, data.main, data.drft, data.ckpts, data.spec, scales));
         const auto record = tier.entries.begin();
-        size_t need = 4 * MiB + 2 + 2 * data.tokens.size() * sizeof(llama_token) + data.main.size() + scales.size() * sizeof(float);
+        size_t need = 4 * MiB + 2 + 2 * data.tokens.size() * sizeof(llama_token) + data.main.size() + data.drft.size() + data.spec.size() + scales.size() * sizeof(float);
         for (const auto & checkpoint : data.ckpts) {
             need += sizeof(common_prompt_checkpoint) + 2 * sizeof(void *) + checkpoint.data_tgt.size() + checkpoint.data_dft.size() + checkpoint.data_spec.size();
         }
         CHECK(!tier.read(record, rec, need - 1));
         CHECK(fs::exists(record->file) && tier.n_removed_bad == 0 && rec.main.empty());
         CHECK(tier.read(record, rec, need));
-        CHECK(rec.tokens == data.tokens && rec.main == data.main && rec.lora_scales == scales);
-        CHECK(rec.checkpoints.size() == data.ckpts.size());
+        CHECK(same(rec, data) && rec.lora_scales == scales);
     }
 
     // Retained checkpoint capacity counts when the slot hands it over by move.

@@ -791,8 +791,20 @@ struct server_slot {
             return nullptr;
         }
 
+        const size_t spec_bytes = common_speculative_get_state_size(spec, id);
+        if (prompt_cache.fit_ram && (spec_bytes == SIZE_MAX || !prompt_cache.reserve_ram(spec_bytes))) {
+            SRV_WRN("%s", "prompt cache save skipped before speculative state copy to leave 5 GiB free\n");
+            return nullptr;
+        }
         std::vector<uint8_t> spec_state;
         common_speculative_get_state(spec, id, spec_state);
+        if (prompt_cache.fit_ram && spec_state.size() != spec_bytes) {
+            SRV_WRN("%s", "prompt cache save skipped: speculative state size changed\n");
+            return nullptr;
+        }
+        if (cur_size_tgt > SIZE_MAX - cur_size_dft || spec_state.size() > SIZE_MAX - cur_size_tgt - cur_size_dft) {
+            return nullptr;
+        }
         const size_t cur_size = cur_size_tgt + cur_size_dft + spec_state.size();
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",

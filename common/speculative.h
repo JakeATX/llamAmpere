@@ -120,6 +120,8 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 void common_speculative_note_target_conf(common_speculative * spec, llama_seq_id seq_id, const float * p, size_t n);
 
 // (optional) get/set internal state
+// Serialized bytes without allocating a snapshot; SIZE_MAX means the size is not safe.
+size_t common_speculative_get_state_size(common_speculative * spec, llama_seq_id seq_id);
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 // Full slot carryover; does not affect partial-checkpoint eligibility.

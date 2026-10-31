@@ -227,6 +227,7 @@ struct common_speculative_impl {
     virtual void note_target_conf(llama_seq_id /*seq_id*/, const float * /*p*/, size_t /*n*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
+    virtual size_t get_state_size(llama_seq_id /*seq_id*/) const { return 0; }
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
@@ -927,18 +928,23 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
     }
 
-    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
-        if (!need_boundary_stash()) {
-            return false;
+    size_t get_state_size(llama_seq_id seq_id) const override {
+        if (!need_boundary_stash() || seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
+            return 0;
         }
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
-            return false;
-        }
+        const size_t width = pending_g_last[seq_id].size();
+        return width > (SIZE_MAX - sizeof(llama_pos)) / sizeof(float) ? SIZE_MAX : sizeof(llama_pos) + width * sizeof(float);
+    }
 
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        const size_t bytes = get_state_size(seq_id);
+        if (bytes == 0 || bytes == SIZE_MAX) {
+            return false;
+        }
         const llama_pos          pos = pending_pos_last[seq_id];
         const std::vector<float> & g = pending_g_last[seq_id];
 
-        data.resize(sizeof(llama_pos) + g.size() * sizeof(float));
+        data.resize(bytes);
         std::memcpy(data.data(),                     &pos,     sizeof(llama_pos));
         std::memcpy(data.data() + sizeof(llama_pos), g.data(), g.size() * sizeof(float));
         return true;
@@ -1880,8 +1886,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return dropped;
     }
 
-    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+    size_t get_state_size(llama_seq_id seq_id) const override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return 0;
+        }
+        const size_t header = 8 * sizeof(uint32_t);
+        if (n_embd <= 0 || (size_t) n_embd > (SIZE_MAX - header) / sizeof(float)) {
+            return SIZE_MAX;
+        }
+        const size_t row = (size_t) n_embd * sizeof(float);
+        if (row > SIZE_MAX - sizeof(llama_token) - sizeof(llama_pos)) {
+            return SIZE_MAX;
+        }
+        const size_t stride = sizeof(llama_token) + sizeof(llama_pos) + row;
+        const size_t count = std::count(defer.seq.begin(), defer.seq.end(), seq_id);
+        if (count > UINT32_MAX || count > (SIZE_MAX - header - row) / stride) {
+            return SIZE_MAX;
+        }
+        return header + row + count * stride;
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        const size_t bytes = get_state_size(seq_id);
+        if (bytes == 0 || bytes == SIZE_MAX) {
             return false;
         }
 
@@ -1896,7 +1923,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             (uint32_t) n_last[seq_id], (adaptive ? 1u : 0u) | (defer_enabled ? 2u : 0u),
         };
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        data.resize(sizeof(header) + row_bytes + n_defer * (sizeof(llama_token) + sizeof(llama_pos) + row_bytes));
+        data.resize(bytes);
         size_t off = 0;
         auto put = [&](const void * src, size_t n) {
             std::memcpy(data.data() + off, src, n);
@@ -5056,6 +5083,18 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+size_t common_speculative_get_state_size(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec != nullptr) {
+        for (const auto & impl : spec->impls) {
+            const size_t bytes = impl->get_state_size(seq_id);
+            if (bytes != 0) {
+                return bytes;
+            }
+        }
+    }
+    return 0;
 }
 
 // TODO: support the case of more than one speculative implementations having a state
