@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 static int failures = 0;
@@ -17,6 +19,83 @@ static void expect(bool condition, const char * message) {
         std::fprintf(stderr, "FAIL: %s\n", message);
         failures++;
     }
+}
+
+static void test_ngram_load_limits() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("test-ngram-load-fit-" + std::to_string(ggml_time_us()));
+    const bool created = fs::create_directory(dir);
+    expect(created, "create a private lookup load test directory");
+    if (!created) {
+        return;
+    }
+    const std::string path = (dir / "cache").string();
+    const common_ngram_cache_vocab_id vocab = {100, 123};
+    std::vector<llama_token> tokens = {0, 4};
+    const common_ngram a(tokens.data(), 1);
+    const common_ngram b(tokens.data() + 1, 1);
+    const common_ngram_cache source = {{a, {{1, 7}, {2, 8}}}, {b, {{3, 9}}}};
+    const auto read_file = [](const std::string & name) {
+        std::ifstream file(name, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    };
+    std::string err;
+    expect(common_ngram_cache_save_file(source, path, vocab, err), "write a versioned lookup load fixture");
+    const std::string before = read_file(path);
+    common_ngram_cache loaded;
+    expect(common_ngram_cache_load_file(path, loaded, vocab, err, 2, 3) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == source,
+            "exact record and continuation quotas load all counts");
+    for (const auto limits : {std::pair<uint64_t, uint64_t>{0, 3}, {1, 3}, {2, 0}, {2, 2}}) {
+        loaded = source;
+        expect(common_ngram_cache_load_file(path, loaded, vocab, err, limits.first, limits.second) == COMMON_NGRAM_CACHE_LOAD_LIMIT,
+                "one-under and zero quotas refuse nonempty versioned input");
+        expect(loaded.empty() && !err.empty() && read_file(path) == before,
+                "load refusal clears partial results and preserves the file");
+    }
+    common_ngram_cache live = source;
+    live[a][1]++;
+    common_ngram_cache delta = {{a, {{1, 1}}}};
+    const auto live_before = live;
+    const auto delta_before = delta;
+    bool from_disk = true;
+    expect(!common_ngram_cache_sync_file(path, live, delta, 2, vocab, err, &from_disk, 2, 2),
+            "an over-quota existing file cannot be recreated by sync");
+    expect(!from_disk && live == live_before && delta == delta_before && read_file(path) == before,
+            "quota refusal preserves live counts, pending delta and on-disk data");
+    expect(common_ngram_cache_sync_file(path, live, delta, 2, vocab, err, &from_disk, 2, 3) && from_disk,
+            "same-input sync succeeds at the exact load quotas");
+    expect(live == live_before && delta.empty(), "successful sync applies the retained delta exactly once");
+    expect(common_ngram_cache_load_file(path, loaded, vocab, err) == COMMON_NGRAM_CACHE_LOAD_OK && loaded == live,
+            "default unlimited load preserves the prior file behavior");
+
+    const std::string legacy = (dir / "legacy").string();
+    for (int records : {1, 2}) {
+        {
+            std::ofstream file(legacy, std::ios::binary | std::ios::trunc);
+            for (int record = 0; record < records; ++record) {
+                const int32_t count = 3;
+                file.write(reinterpret_cast<const char *>(a.tokens), sizeof(a.tokens));
+                file.write(reinterpret_cast<const char *>(&count), sizeof(count));
+                for (int i = 0; i < count; ++i) {
+                    const llama_token token = 1;
+                    const int32_t one = 1;
+                    file.write(reinterpret_cast<const char *>(&token), sizeof(token));
+                    file.write(reinterpret_cast<const char *>(&one), sizeof(one));
+                }
+            }
+            expect(bool(file), "write duplicate records and continuations in a legacy fixture");
+        }
+        expect(common_ngram_cache_load_file(legacy, loaded, vocab, err, records, records * 3) == COMMON_NGRAM_CACHE_LOAD_OK &&
+                loaded.size() == 1 && loaded.at(a).at(1) == 3, "legacy exact quotas retain duplicate folding semantics");
+        expect(common_ngram_cache_load_file(legacy, loaded, vocab, err, records, records * 3 - 1) == COMMON_NGRAM_CACHE_LOAD_LIMIT && loaded.empty(),
+                "duplicate continuations consume quota before temporary-map allocation");
+        expect(common_ngram_cache_load_file(legacy, loaded, vocab, err, records - 1, UINT64_MAX) == COMMON_NGRAM_CACHE_LOAD_LIMIT && loaded.empty(),
+                "duplicate legacy keys cannot bypass the record quota");
+    }
+    expect(common_ngram_cache_save_file({}, path, vocab, err) &&
+            common_ngram_cache_load_file(path, loaded, vocab, err, 0, 0) == COMMON_NGRAM_CACHE_LOAD_OK && loaded.empty(),
+            "empty versioned caches need no record or continuation quota");
+    fs::remove_all(dir);
 }
 
 static void test_ngram_live_limit() {
@@ -376,6 +455,7 @@ static void test_ram_prompt_fit() {
 }
 
 int main() {
+    test_ngram_load_limits();
     test_ngram_live_limit();
     test_ngram_delta_admission();
     test_ram_fit();

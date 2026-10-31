@@ -307,10 +307,11 @@ struct common_ngram_cache_reader {
 };
 
 // Parse n_ngrams entries (or, if n_ngrams is SIZE_MAX, until the end of the file) of payload into ngram_cache.
-static bool common_ngram_cache_read_payload(
+static common_ngram_cache_load_status common_ngram_cache_read_payload(
         common_ngram_cache_reader & reader, common_ngram_cache & ngram_cache,
-        uint64_t n_ngrams, uint32_t n_vocab, std::string & err) {
+        uint64_t n_ngrams, uint32_t n_vocab, std::string & err, uint64_t max_entries, uint64_t max_continuations) {
     const bool until_eof = n_ngrams == UINT64_MAX;
+    uint64_t continuations = 0;
 
     for (uint64_t i = 0; until_eof || i < n_ngrams; ++i) {
         common_ngram ngram;
@@ -319,7 +320,12 @@ static bool common_ngram_cache_read_payload(
                 break; // clean end of a header-less file
             }
             err = "truncated at n-gram " + std::to_string(i);
-            return false;
+            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
+        }
+
+        if (i >= max_entries) {
+            err = "lookup cache entry limit reached";
+            return COMMON_NGRAM_CACHE_LOAD_LIMIT;
         }
 
         // the n-gram is a prefix of real tokens followed by LLAMA_TOKEN_NULL padding
@@ -328,29 +334,35 @@ static bool common_ngram_cache_read_payload(
             const llama_token token = ngram.tokens[j];
             if (!common_ngram_cache_token_ok(token, n_vocab, true)) {
                 err = "n-gram " + std::to_string(i) + " has token " + std::to_string(token) + " outside the vocab";
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
             if (token == LLAMA_TOKEN_NULL) {
                 in_padding = true;
             } else if (in_padding) {
                 err = "n-gram " + std::to_string(i) + " has a token after its padding";
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
         }
         if (ngram.tokens[0] == LLAMA_TOKEN_NULL) {
             err = "n-gram " + std::to_string(i) + " is empty";
-            return false;
+            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
         }
 
         int32_t n_tokens = 0;
         if (!reader.get(n_tokens)) {
             err = "truncated at n-gram " + std::to_string(i);
-            return false;
+            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
         }
         if (n_tokens <= 0 || n_tokens > COMMON_NGRAM_CACHE_MAX_PART) {
             err = "n-gram " + std::to_string(i) + " has an implausible number of continuations: " + std::to_string(n_tokens);
-            return false;
+            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
         }
+
+        if (uint64_t(n_tokens) > max_continuations - continuations) {
+            err = "lookup cache continuation limit reached";
+            return COMMON_NGRAM_CACHE_LOAD_LIMIT;
+        }
+        continuations += uint64_t(n_tokens);
 
         common_ngram_cache_part part;
         part.reserve(n_tokens);
@@ -359,15 +371,15 @@ static bool common_ngram_cache_read_payload(
             int32_t     count = 0;
             if (!reader.get(token) || !reader.get(count)) {
                 err = "truncated at n-gram " + std::to_string(i);
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
             if (!common_ngram_cache_token_ok(token, n_vocab, false)) {
                 err = "n-gram " + std::to_string(i) + " has continuation token " + std::to_string(token) + " outside the vocab";
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
             if (count <= 0) {
                 err = "n-gram " + std::to_string(i) + " has a non-positive count";
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
             part[token] += count; // a duplicated token in a corrupt or hand-merged file is folded, not rejected
         }
@@ -375,12 +387,13 @@ static bool common_ngram_cache_read_payload(
         ngram_cache[ngram] = std::move(part); // a duplicated n-gram keeps the last entry
     }
 
-    return true;
+    return COMMON_NGRAM_CACHE_LOAD_OK;
 }
 
 common_ngram_cache_load_status common_ngram_cache_load_file(
         const std::string & filename, common_ngram_cache & ngram_cache,
-        const common_ngram_cache_vocab_id & vocab_id, std::string & err) {
+        const common_ngram_cache_vocab_id & vocab_id, std::string & err,
+        uint64_t max_entries, uint64_t max_continuations) {
     ngram_cache.clear();
     err.clear();
 
@@ -412,10 +425,12 @@ common_ngram_cache_load_status common_ngram_cache_load_file(
         reader.reset();
 
         std::string err_payload;
-        if (!common_ngram_cache_read_payload(reader, ngram_cache, UINT64_MAX, vocab_id.n_tokens, err_payload)) {
+        const auto status = common_ngram_cache_read_payload(reader, ngram_cache, UINT64_MAX, vocab_id.n_tokens, err_payload, max_entries, max_continuations);
+        if (status != COMMON_NGRAM_CACHE_LOAD_OK) {
             ngram_cache.clear();
-            err = filename + ": not a lookup cache file (" + err_payload + ")";
-            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
+            err = status == COMMON_NGRAM_CACHE_LOAD_LIMIT ? filename + ": " + err_payload :
+                filename + ": not a lookup cache file (" + err_payload + ")";
+            return status;
         }
         LOG_INF("%s: %s has no header (older format), vocab identity not checked, %zu n-grams\n",
                 __func__, filename.c_str(), ngram_cache.size());
@@ -458,15 +473,21 @@ common_ngram_cache_load_status common_ngram_cache_load_file(
         return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
     }
 
+    if (n_ngrams > max_entries) {
+        err = filename + ": lookup cache entry limit reached";
+        return COMMON_NGRAM_CACHE_LOAD_LIMIT;
+    }
+
     const uint32_t n_vocab_check = vocab_id.n_tokens != 0 ? vocab_id.n_tokens : n_vocab;
 
     reader.reset(); // the payload hash does not cover the header
 
     std::string err_payload;
-    if (!common_ngram_cache_read_payload(reader, ngram_cache, n_ngrams, n_vocab_check, err_payload)) {
+    const auto status = common_ngram_cache_read_payload(reader, ngram_cache, n_ngrams, n_vocab_check, err_payload, max_entries, max_continuations);
+    if (status != COMMON_NGRAM_CACHE_LOAD_OK) {
         ngram_cache.clear();
         err = filename + ": " + err_payload;
-        return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
+        return status;
     }
 
     if (reader.n_read != payload_size) {
@@ -802,7 +823,8 @@ static void common_ngram_cache_remove_stale_tmp(const std::string & filename) {
 
 bool common_ngram_cache_sync_file(
         const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
-        size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk) {
+        size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk,
+        uint64_t max_entries, uint64_t max_continuations) {
     GGML_ASSERT(&ngram_cache != &ngram_cache_delta);
     err.clear();
     if (from_disk) {
@@ -824,7 +846,7 @@ bool common_ngram_cache_sync_file(
     bool loaded = false;
     {
         std::string err_load;
-        switch (common_ngram_cache_load_file(filename, merged, vocab_id, err_load)) {
+        switch (common_ngram_cache_load_file(filename, merged, vocab_id, err_load, max_entries, max_continuations)) {
             case COMMON_NGRAM_CACHE_LOAD_OK:
                 loaded = true;
                 break;
@@ -833,6 +855,9 @@ bool common_ngram_cache_sync_file(
             case COMMON_NGRAM_CACHE_LOAD_CORRUPT:
                 LOG_WRN("%s: existing %s is unusable and will be replaced: %s\n", __func__, filename.c_str(), err_load.c_str());
                 break;
+            case COMMON_NGRAM_CACHE_LOAD_LIMIT:
+                err = err_load + " - not overwriting it";
+                return false;
             case COMMON_NGRAM_CACHE_LOAD_FOREIGN:
                 // a valid cache of another model (or a newer version): overwriting it would destroy someone's data
                 err = err_load + " - not overwriting it";

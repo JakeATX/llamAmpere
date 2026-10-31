@@ -135,14 +135,18 @@ enum common_ngram_cache_load_status {
     COMMON_NGRAM_CACHE_LOAD_MISSING, // the file cannot be opened
     COMMON_NGRAM_CACHE_LOAD_CORRUPT, // truncated, checksum mismatch, out of range values: not a usable cache
     COMMON_NGRAM_CACHE_LOAD_FOREIGN, // a valid cache, but for another vocab or a newer format: must not be overwritten
+    COMMON_NGRAM_CACHE_LOAD_LIMIT,   // resource quota reached: must not be overwritten
 };
 
 // Load an ngram cache file into ngram_cache.
 // vocab_id: identity of the current vocab; a file that records a different vocab is refused.
+// Limits count payload records and continuations before allocation; zero refuses nonempty input.
+// Duplicate records and tokens count toward the limits too; UINT64_MAX is unlimited.
 // returns:  COMMON_NGRAM_CACHE_LOAD_OK on success. Otherwise ngram_cache is left empty and err describes the problem.
 common_ngram_cache_load_status common_ngram_cache_load_file(
     const std::string & filename, common_ngram_cache & ngram_cache,
-    const common_ngram_cache_vocab_id & vocab_id, std::string & err);
+    const common_ngram_cache_vocab_id & vocab_id, std::string & err,
+    uint64_t max_entries = UINT64_MAX, uint64_t max_continuations = UINT64_MAX);
 
 // Save an ngram cache to a file, written to a temporary file next to it and renamed into place, so a reader
 // or a crash never sees a partially written file.
@@ -160,14 +164,15 @@ void common_ngram_cache_prune(common_ngram_cache & ngram_cache, size_t n_max);
 // prunes to n_max, writes the result atomically and, on success, replaces ngram_cache with the merged
 // result and clears ngram_cache_delta.
 // If the file is missing or corrupt, ngram_cache (which must already contain the delta) is written instead.
-// A file that belongs to another vocab or a newer format is never overwritten: the sync fails.
+// A file that exceeds the load quotas, belongs to another vocab or uses a newer format is never overwritten: the sync fails.
 // ngram_cache and ngram_cache_delta must be distinct objects.
 // from_disk: if given, set to true when the existing file was loaded and merged, false when it was missing or
 //            unusable (the file is then recreated from ngram_cache) or when the sync failed.
 // returns: true on success, otherwise err describes the problem and nothing is modified.
 bool common_ngram_cache_sync_file(
     const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
-    size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk = nullptr);
+    size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk = nullptr,
+    uint64_t max_entries = UINT64_MAX, uint64_t max_continuations = UINT64_MAX);
 
 // Save an ngram cache to a file (vocab identity unknown). Logs on failure.
 // ngram_cache: the ngram cache to save.
