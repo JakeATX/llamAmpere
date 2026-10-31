@@ -2531,6 +2531,27 @@ void llama_model::register_moe_bank() {
     const int    n_main  = (int) std::min<uint32_t>(hparams.n_layer(), (uint32_t) layers.size());
     int    n_bank_layers = 0;
     size_t n_bank = 0, bank_bytes = 0;
+    // LLAMA_MOE_BANK_KEEP loads a prefix of each bank (llama-model-loader.cpp): the slots past it leave the hot map,
+    // so their experts are regular ones everywhere (graph, cache, arena)
+    for (int il = 0; il < n_main; ++il) {
+        const auto & layer = layers[il];
+        ggml_tensor * map = layer.ffn_exps_hot_map;
+        if (!map || map->type != GGML_TYPE_F32 || !layer.ffn_down_exps_hot) {
+            continue;
+        }
+        std::vector<float> slot(ggml_nelements(map));
+        ggml_backend_tensor_get(map, slot.data(), 0, ggml_nbytes(map));
+        bool cut = false;
+        for (float & s : slot) {
+            if (s >= (float) layer.ffn_down_exps_hot->ne[2]) {
+                s = -1.0f;
+                cut = true;
+            }
+        }
+        if (cut) {
+            ggml_backend_tensor_set(map, slot.data(), 0, ggml_nbytes(map));
+        }
+    }
     for (int il = 0; il < n_main; ++il) {
         const auto & layer = layers[il];
         ggml_tensor * regular[] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps };
@@ -2572,20 +2593,64 @@ void llama_model::register_moe_bank() {
     if (n_bank > 0) {
         LLAMA_LOG_INFO("[moe-bank] %zu experts in %d layers always resident (%.1f MiB)\n", n_bank, n_bank_layers, bank_bytes / 1048576.0);
     }
-    drop_moe_bank_host_copies();
+    const size_t released = drop_moe_bank_host_copies();
+
+    // fork AIPFIX BANKKEEP: every regular expert is served from the pinned arena, never from NVMe while decoding, so
+    // a smaller bank (more regular copies kept) costs RAM here. With LLAMA_MOE_BANK_KEEP set, MemAvailable under
+    // LLAMA_MOE_RAM_FLOOR_MIB (default 5120) stops the load.
+    const auto * arena = pimpl->moe_arena.get();
+    long long avail_kib = -1;
+    if (std::FILE * f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f)) {
+            if (std::sscanf(line, "MemAvailable: %lld kB", &avail_kib) == 1) { break; }
+        }
+        std::fclose(f);
+    }
+    long long majflt = -1;
+    if (std::FILE * f = std::fopen("/proc/self/stat", "r")) {
+        char buf[1024];
+        const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = 0;
+        std::fclose(f);
+        // field 12 (majflt) counts from the end of the comm field "(...)"
+        if (const char * p = std::strrchr(buf, ')')) {
+            long long v[10] = {};
+            if (std::sscanf(p + 1, " %*c %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld",
+                        &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) == 10) {
+                majflt = v[8];
+            }
+        }
+    }
+    const size_t arena_bytes = arena && arena->data ? arena->size : 0;
+    const char * keep = getenv("LLAMA_MOE_BANK_KEEP");
+    if (!arena_bytes && !(keep && *keep)) {
+        return;
+    }
+    LLAMA_LOG_INFO("[moe-bank] ram: arena %.2f GiB held (%.2f GiB released), MemAvailable %.2f GiB, major faults %lld\n",
+            (arena_bytes - std::min(released, arena_bytes)) / 1073741824.0, released / 1073741824.0,
+            avail_kib / 1048576.0, majflt);
+    if (keep && *keep && avail_kib >= 0) {
+        const char * floor_env = getenv("LLAMA_MOE_RAM_FLOOR_MIB");
+        const long long floor_mib = floor_env && *floor_env ? atoll(floor_env) : 5120;
+        if (avail_kib / 1024 < floor_mib) {
+            throw std::runtime_error(format("[moe-bank] LLAMA_MOE_BANK_KEEP=%s leaves %.2f GiB of RAM available, under the %.2f GiB floor",
+                    keep, avail_kib / 1048576.0, floor_mib / 1024.0));
+        }
+    }
 }
 
 // fork AIPNEXTK BANKDROP: one copy of each weight in use. A bank expert's regular (IQ3/Q2) bytes in the pinned expert
 // arena are never needed: the bank call computes the expert and the regular call routes it with weight 0 (the hit/miss
 // kernels skip it, and device uploads of its range write zeros). Their arena pages are released here; the bytes stay
 // on NVMe in the model file. LLAMA_MOE_BANK_DROP=0 keeps them.
-void llama_model::drop_moe_bank_host_copies() {
+size_t llama_model::drop_moe_bank_host_copies() {
     const char * setting = getenv("LLAMA_MOE_BANK_DROP");
-    if (setting && strcmp(setting, "0") == 0) { return; }
+    if (setting && strcmp(setting, "0") == 0) { return 0; }
     const char * permanent = getenv("LLAMA_MOE_PERMANENT_MIB");
-    if (permanent && *permanent && strcmp(permanent, "0") != 0) { return; } // the permanent-expert discard owns the arena
+    if (permanent && *permanent && strcmp(permanent, "0") != 0) { return 0; } // the permanent-expert discard owns the arena
     auto * arena = pimpl->moe_arena.get();
-    if (!arena || !arena->data || !arena->size) { return; }
+    if (!arena || !arena->data || !arena->size) { return 0; }
     const uintptr_t base = (uintptr_t) arena->data;
     std::vector<std::pair<size_t, size_t>> ranges;
     std::vector<ggml_moe_bank_hole> holes;
@@ -2614,7 +2679,7 @@ void llama_model::drop_moe_bank_host_copies() {
             }
         }
     }
-    if (ranges.empty()) { return; }
+    if (ranges.empty()) { return 0; }
     // register the holes first: from here on every device upload of these bytes writes zeros
     ggml_moe_bank_holes_set(holes.data(), holes.size());
     const int64_t t0 = ggml_time_us();
@@ -2622,10 +2687,12 @@ void llama_model::drop_moe_bank_host_copies() {
         const size_t released = arena->discard(ranges);
         LLAMA_LOG_INFO("[moe-bank] released %.2f GiB of arena RAM holding bank experts' regular copies (%zu ranges, %.1f ms)\n",
                 released / 1073741824.0, ranges.size(), (ggml_time_us() - t0) / 1000.0);
+        return released;
     } catch (const std::exception & error) {
         // nothing was released; the uploads still write zeros for these routes, which is the same math (weight 0)
         LLAMA_LOG_WARN("[moe-bank] arena release failed, bank experts' regular copies stay in RAM: %s\n", error.what());
     }
+    return 0;
 }
 
 void llama_model::pin_borrowed_host_tensor(ggml_tensor * tensor) const {

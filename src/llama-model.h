@@ -868,7 +868,7 @@ struct llama_model {
 
     void pin_borrowed_host_tensor(ggml_tensor * tensor) const;
     void register_moe_bank();
-    void drop_moe_bank_host_copies();
+    size_t drop_moe_bank_host_copies(); // arena bytes released
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

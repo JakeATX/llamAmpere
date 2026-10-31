@@ -555,6 +555,109 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<int,      5>>  (enum llm_kv kid, std::array<int,      5>   & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<int,      6>>  (enum llm_kv kid, std::array<int,      6>   & result, uint32_t n, bool required);
 
+// fork AIPFIX BANKKEEP: LLAMA_MOE_BANK_KEEP=N keeps the N best-ranked experts of the overlay bank. The ranking is a
+// STRP list (LLAMA_MOE_BANK_RANK, else GGML_MOE_CACHE_PROFILE_LOAD): u32 entries layer | expert << 16, best first.
+// A layer's bank slots follow that order, so the kept experts of each layer are a prefix of its slots: the bank
+// tensors' outer dimension shrinks to that count and only those bytes are read. llama_model::register_moe_bank()
+// takes the slots past it out of the hot map, so the other experts run (and stay in the arena) as regular experts.
+static void overlay_bank_keep(ggml_context * ctx, const gguf_context * gguf, const char * path, long keep) {
+    const char * rank_path = getenv("LLAMA_MOE_BANK_RANK");
+    if (!rank_path || !*rank_path) { rank_path = getenv("GGML_MOE_CACHE_PROFILE_LOAD"); }
+    if (!rank_path || !*rank_path) {
+        throw std::runtime_error("LLAMA_MOE_BANK_KEEP needs a ranked list (LLAMA_MOE_BANK_RANK or GGML_MOE_CACHE_PROFILE_LOAD)");
+    }
+    std::ifstream rank_file(rank_path, std::ios::binary);
+    std::vector<char> list((std::istreambuf_iterator<char>(rank_file)), std::istreambuf_iterator<char>());
+    uint32_t head[6] = {};
+    if (list.size() < sizeof(head) || memcmp(list.data(), "STRP", 4) != 0) {
+        throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s is not a ranked STRP list", rank_path));
+    }
+    memcpy(head, list.data(), sizeof(head));
+    const uint32_t n_layer_list = head[2], n_expert_list = head[3], count = head[5];
+    if (n_layer_list == 0 || n_layer_list > 4096 || n_expert_list == 0 || n_expert_list > 4096 ||
+            list.size() != sizeof(head) + (size_t) count*sizeof(uint32_t)) {
+        throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s has a bad header", rank_path));
+    }
+    std::vector<uint32_t> rank((size_t) n_layer_list*n_expert_list, UINT32_MAX);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t p;
+        memcpy(&p, list.data() + sizeof(head) + (size_t) i*sizeof(p), sizeof(p));
+        const uint32_t il = p & 0xFFFF, e = p >> 16;
+        if (il < n_layer_list && e < n_expert_list && rank[(size_t) il*n_expert_list + e] == UINT32_MAX) {
+            rank[(size_t) il*n_expert_list + e] = i;
+        }
+    }
+
+    // (rank, layer, slot) of every bank expert; unlisted experts rank last
+    struct bank_expert { uint32_t rank; int layer; int slot; };
+    std::vector<bank_expert> bank;
+    std::vector<std::array<ggml_tensor *, 3>> hot;
+    std::FILE * f = std::fopen(path, "rb");
+    if (!f) { throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: cannot read %s", path)); }
+    for (int il = 0; il < 4096; ++il) {
+        const std::string pre = "blk." + std::to_string(il) + ".";
+        ggml_tensor * map = ggml_get_tensor(ctx, (pre + "ffn_exps_hot_map.weight").c_str());
+        if (!map) { continue; }
+        std::array<ggml_tensor *, 3> t = { ggml_get_tensor(ctx, (pre + "ffn_gate_exps_hot.weight").c_str()),
+                                           ggml_get_tensor(ctx, (pre + "ffn_up_exps_hot.weight").c_str()),
+                                           ggml_get_tensor(ctx, (pre + "ffn_down_exps_hot.weight").c_str()) };
+        const int64_t n_expert = ggml_nelements(map);
+        if (map->type != GGML_TYPE_F32 || !t[0] || !t[1] || !t[2] || t[0]->ne[2] != t[2]->ne[2] || t[1]->ne[2] != t[2]->ne[2] ||
+                t[2]->ne[3] != 1 || (il < (int) n_layer_list && n_expert != n_expert_list)) {
+            std::fclose(f);
+            throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: overlay layer %d does not match the ranked list", il));
+        }
+        std::vector<float> slot(n_expert);
+        const size_t offs = gguf_get_data_offset(gguf) + gguf_get_tensor_offset(gguf, gguf_find_tensor(gguf, ggml_get_name(map)));
+        if (std::fseek(f, (long) offs, SEEK_SET) != 0 || std::fread(slot.data(), sizeof(float), n_expert, f) != (size_t) n_expert) {
+            std::fclose(f);
+            throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: cannot read the layer %d hot map", il));
+        }
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (slot[e] >= 0.0f) {
+                const uint32_t r = il < (int) n_layer_list ? rank[(size_t) il*n_expert_list + e] : UINT32_MAX;
+                bank.push_back({ r, il, (int) slot[e] });
+            }
+        }
+        if ((int) hot.size() <= il) { hot.resize(il + 1, { nullptr, nullptr, nullptr }); }
+        hot[il] = t;
+    }
+    std::fclose(f);
+    if (keep < 0 || (size_t) keep >= bank.size()) {
+        LLAMA_LOG_INFO("[moe-bank] keep %ld: the bank holds %zu experts, all kept\n", keep, bank.size());
+        return;
+    }
+    std::stable_sort(bank.begin(), bank.end(), [](const bank_expert & a, const bank_expert & b) {
+        return a.rank != b.rank ? a.rank < b.rank : a.layer != b.layer ? a.layer < b.layer : a.slot < b.slot;
+    });
+    std::vector<int64_t> n_keep(hot.size(), 0), max_slot(hot.size(), -1);
+    for (long i = 0; i < keep; ++i) {
+        n_keep[bank[i].layer]++;
+        max_slot[bank[i].layer] = std::max<int64_t>(max_slot[bank[i].layer], bank[i].slot);
+    }
+    int not_prefix = 0, n_layers = 0;
+    int64_t lo = INT64_MAX, hi = 0;
+    size_t skipped = 0;
+    for (size_t il = 0; il < hot.size(); ++il) {
+        if (!hot[il][0]) { continue; }
+        not_prefix += max_slot[il] + 1 != n_keep[il];
+        // a bank tensor keeps at least one slot; a bank under 2 x n_expert_used runs on the regular tensors (llama-graph.cpp)
+        const int64_t n = std::max<int64_t>(n_keep[il], 1);
+        for (ggml_tensor * t : hot[il]) {
+            skipped += (size_t) (t->ne[2] - n)*t->nb[2];
+            t->ne[2] = n;
+            t->nb[3] = t->nb[2]*n;
+        }
+        lo = std::min(lo, n_keep[il]);
+        hi = std::max(hi, n_keep[il]);
+        n_layers++;
+    }
+    LLAMA_LOG_INFO("[moe-bank] keep %ld of %zu bank experts by %s: %d layers, %" PRId64 "..%" PRId64 " per layer, %.1f MiB not loaded\n",
+            keep, bank.size(), rank_path, n_layers, lo, hi, skipped/1048576.0);
+    if (not_prefix) {
+        LLAMA_LOG_WARN("[moe-bank] keep: in %d layers the bank slot order differs from the ranking; the first slots are kept\n", not_prefix);
+    }
+}
 
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
@@ -791,6 +894,9 @@ llama_model_loader::llama_model_loader(
             LLAMA_LOG_INFO("%s: [moe-bank] overlay direct reads enabled; weights bypass the page cache\n", __func__);
         }
         contexts.emplace_back(ctx);
+        if (const char * keep = getenv("LLAMA_MOE_BANK_KEEP"); keep && *keep) {
+            overlay_bank_keep(ctx, ctx_gguf.get(), ov, atol(keep));
+        }
         int n_added = 0;
         size_t added_bytes = 0;
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
