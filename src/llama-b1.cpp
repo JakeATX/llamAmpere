@@ -269,9 +269,11 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         zero_size = std::max(zero_size, b1_align_up(e.alloc - e.nbytes, 4096));
     }
     if (model.ram_fit_enabled()) {
-        const bool explicit_size = getenv("LLAMA_B1_THREADS") || getenv("LLAMA_B1_PIECE_MIB") ||
-                getenv("LLAMA_B1_STAGE_MIB") || getenv("LLAMA_B1_DIRECT_PIECE_MIB");
+        const bool explicit_size = staging_explicit();
         const size_t available = llama_moe_arena::available_memory();
+        if (explicit_size && staging_floor_unmet(available, n_workers, piece_bytes, staging_alignment, zero_size)) {
+            LLAMA_LOG_WARN("RAM fit: explicit prefill staging sizes were kept, but available RAM cannot guarantee 5 GiB free\n");
+        }
         const size_t fitted = fit_staging_piece(available, n_workers, piece_bytes, staging_alignment,
                 zero_size, true, explicit_size);
         if (!fitted) {

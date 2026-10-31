@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,6 +44,25 @@ class llama_b1 {
 public:
     llama_b1(const llama_model & model, ggml_backend_t backend_gpu);
     ~llama_b1();
+
+    // Only effective host-staging settings override the automatic RAM cap.
+    static bool staging_explicit() {
+        for (const char * name : {"LLAMA_B1_THREADS", "LLAMA_B1_PIECE_MIB"}) {
+            const char * value = std::getenv(name);
+            if (value && *value) { return true; }
+        }
+        const char * stage = std::getenv("LLAMA_B1_STAGE_MIB");
+        return stage && *stage && std::atoll(stage) > 0;
+    }
+
+    static bool staging_floor_unmet(uint64_t available, int workers, size_t piece, size_t alignment, size_t zero) {
+        constexpr uint64_t floor = 5ull << 30;
+        if (available < floor || workers < 1 || workers > 64 || !piece || !alignment ||
+                alignment > (SIZE_MAX - 4096) / 3) { return true; }
+        const size_t padding = 3 * alignment + 4096;
+        if (piece > SIZE_MAX - padding || zero > available - floor) { return true; }
+        return uint64_t(piece + padding) > (available - floor - zero) / size_t(workers) / 3;
+    }
 
     // fork: staging gets 10% of the 80% spare-RAM budget above 5 GiB.
     static size_t fit_staging_piece(uint64_t available, int workers, size_t piece, size_t alignment,

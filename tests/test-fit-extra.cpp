@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 
 static int failures = 0;
 
@@ -18,6 +20,51 @@ static void expect(bool condition, const char * message) {
 static void test_ram_fit() {
     constexpr uint64_t GiB = 1ull << 30;
     constexpr uint64_t MiB = 1ull << 20;
+    const char * stage_names[] = {"LLAMA_B1_THREADS", "LLAMA_B1_PIECE_MIB", "LLAMA_B1_STAGE_MIB", "LLAMA_B1_DIRECT_PIECE_MIB"};
+    std::string saved_stage[4];
+    bool had_stage[4];
+    auto set_stage = [](const char * name, const char * value) {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        if (value) { setenv(name, value, 1); } else { unsetenv(name); }
+#endif
+    };
+    for (size_t i = 0; i < 4; ++i) {
+        const char * value = std::getenv(stage_names[i]);
+        had_stage[i] = value != nullptr;
+        if (value) { saved_stage[i] = value; }
+        set_stage(stage_names[i], nullptr);
+    }
+    expect(!llama_b1::staging_explicit(), "absent staging settings retain automatic fitting");
+    for (const char * name : stage_names) {
+        set_stage(name, "");
+        expect(!llama_b1::staging_explicit(), "empty staging settings retain automatic fitting");
+        set_stage(name, nullptr);
+    }
+    for (const char * value : {"0", "-1", "bad", "", " 0"}) {
+        set_stage("LLAMA_B1_STAGE_MIB", value);
+        expect(!llama_b1::staging_explicit(), "ineffective stage sizes cannot bypass the RAM cap");
+        expect(llama_b1::fit_staging_piece(5 * GiB + 128 * MiB, 8, 16 * MiB, 4096, 4096,
+                true, llama_b1::staging_explicit()) == 0, "ineffective override cannot allocate staging below the floor");
+    }
+    set_stage("LLAMA_B1_STAGE_MIB", nullptr);
+    for (const char * name : {stage_names[0], stage_names[1], stage_names[2]}) {
+        set_stage(name, "4");
+        expect(llama_b1::staging_explicit(), "effective explicit sizes retain precedence");
+        set_stage(name, nullptr);
+    }
+    set_stage("LLAMA_B1_DIRECT_PIECE_MIB", "64");
+    expect(!llama_b1::staging_explicit(), "direct GPU upload chunks do not override host staging sizes");
+    for (size_t i = 0; i < 4; ++i) { set_stage(stage_names[i], had_stage[i] ? saved_stage[i].c_str() : nullptr); }
+    const uint64_t stage_required = 24 * (16 * MiB + 16384) + 4096;
+    expect(!llama_b1::staging_floor_unmet(5 * GiB + stage_required, 8, 16 * MiB, 4096, 4096),
+            "explicit staging may exactly meet the RAM floor");
+    expect(llama_b1::staging_floor_unmet(5 * GiB + stage_required - 1, 8, 16 * MiB, 4096, 4096) &&
+            llama_b1::staging_floor_unmet(0, 8, 16 * MiB, 4096, 4096), "unsafe or unknown explicit staging needs a warning");
+    expect(llama_b1::staging_floor_unmet(UINT64_MAX, 64, SIZE_MAX, 4096, 4096) &&
+            llama_b1::staging_floor_unmet(UINT64_MAX, 64, MiB, SIZE_MAX, 4096),
+            "explicit staging warning arithmetic cannot overflow");
     std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests;
     for (auto & request : requests) {
         request.bytes = UINT64_MAX;
