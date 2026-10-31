@@ -44,6 +44,24 @@ public:
     llama_b1(const llama_model & model, ggml_backend_t backend_gpu);
     ~llama_b1();
 
+    // fork: staging gets 10% of the 80% spare-RAM budget above 5 GiB.
+    static size_t fit_staging_piece(uint64_t available, int workers, size_t piece, size_t alignment,
+            size_t zero, bool fit, bool explicit_request) {
+        if (!fit || explicit_request) { return piece; }
+        constexpr uint64_t MiB = 1ull << 20;
+        if (available <= (5ull << 30) || workers < 1 || workers > 64 || !alignment || !piece) { return 0; }
+        const uint64_t spare = (available - (5ull << 30)) / MiB;
+        const uint64_t budget = (spare / 5) * 4 + (spare % 5) * 4 / 5;
+        const size_t quota = size_t(std::min<uint64_t>(budget / 10, SIZE_MAX / MiB)) * size_t(MiB);
+        if (zero > quota || alignment > (SIZE_MAX - 4096) / 3) { return 0; }
+        // Two pinned slots and one O_DIRECT bounce per worker; allow padding and page rounding for each.
+        const size_t per_buffer = (quota - zero) / size_t(workers) / 3;
+        const size_t padding = 3 * alignment + 4096;
+        if (per_buffer <= padding) { return 0; }
+        const size_t limit = (per_buffer - padding) / 4096 * 4096;
+        return limit < std::min<size_t>(piece, MiB) ? 0 : std::min(piece, limit);
+    }
+
     bool ok() const { return init_ok; }
     void set_ffn_enabled(bool enabled) { ffn_requested = enabled; }
     // VRAM the plan must leave free beyond its keep, for scratch measured only after a plan exists (the legacy layer graph)

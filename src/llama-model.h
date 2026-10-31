@@ -833,6 +833,7 @@ struct llama_model {
 
     size_t size() const; // file size
     size_t moe_arena_size() const;
+    bool ram_fit_enabled() const { return params.fit_ram; }
     void moe_resident_init(ggml_backend_dev_t device, const ggml_moe_cache_tensor_desc * tensors, int count) const;
     size_t n_tensors() const;
     size_t n_devices() const;

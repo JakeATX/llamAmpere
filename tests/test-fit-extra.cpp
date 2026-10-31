@@ -1,5 +1,6 @@
 #include "fit.h"
 #include "../src/llama-moe-arena.h"
+#include "../src/llama-b1.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -37,6 +38,10 @@ static void test_ram_fit() {
                 "explicit arena selection wins over the automatic share");
         expect(llama_moe_arena::fits_ram_budget(expert_budget + 1, available, false, false),
                 "fit off preserves legacy arena admission");
+        const size_t stage_piece = llama_b1::fit_staging_piece(available, 8, 16 * MiB, 4096, 4096, true, false);
+        expect(stage_piece > 0 && stage_piece <= 16 * MiB, "fake hosts retain bounded prefill staging");
+        expect(24 * (stage_piece + 3 * 4096 + 4096) + 4096 <= plan.bytes[COMMON_FIT_RAM_STAGING],
+                "staging share covers two pinned slots, disk bounce and padding per worker");
         uint64_t sum = 0;
         for (uint64_t bytes : plan.bytes) {
             expect(bytes <= available - sum, "RAM plan cannot overflow available memory");
@@ -60,6 +65,27 @@ static void test_ram_fit() {
     }
     expect(llama_moe_arena::fit_memory_budget(UINT64_MAX) <= UINT64_MAX - 5 * GiB,
             "extreme host RAM cannot overflow the expert budget");
+    for (uint64_t available : {uint64_t(0), 4 * GiB, 5 * GiB}) {
+        expect(llama_b1::fit_staging_piece(available, 8, 16 * MiB, 4096, 4096, true, false) == 0,
+                "unknown or low RAM disables automatic staging before host allocation");
+        expect(llama_b1::fit_staging_piece(available, 8, 16 * MiB, 4096, 4096, false, false) == 16 * MiB &&
+                llama_b1::fit_staging_piece(available, 8, 16 * MiB, 4096, 4096, true, true) == 16 * MiB,
+                "fit off and explicit staging retain legacy sizes");
+    }
+    const uint64_t tight_ram = 5 * GiB + GiB;
+    const size_t tight_piece = llama_b1::fit_staging_piece(tight_ram, 8, 16 * MiB, 4096, 4096, true, false);
+    expect(tight_piece >= MiB && tight_piece < 16 * MiB, "tight RAM shrinks automatic staging");
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> staging_requests = {};
+    for (auto & request : staging_requests) { request.bytes = UINT64_MAX; }
+    const size_t stage_quota = common_fit_ram_plan(tight_ram, staging_requests).bytes[COMMON_FIT_RAM_STAGING];
+    expect(24 * (tight_piece + 16384) + 4096 <= stage_quota, "reduced stage and disk bounce fit their quota");
+    expect(llama_b1::fit_staging_piece(tight_ram, 8, 16 * MiB, 4096, stage_quota, true, false) == 0,
+            "zero buffer exhausting the quota disables staging");
+    expect(llama_b1::fit_staging_piece(UINT64_MAX, 64, 16 * MiB, 4096, 4096, true, false) == 16 * MiB,
+            "extreme RAM does not overflow staging quota");
+    expect(llama_b1::fit_staging_piece(16 * GiB, 8, 16 * MiB, SIZE_MAX, 4096, true, false) == 0 &&
+            llama_b1::fit_staging_piece(16 * GiB, 0, 16 * MiB, 4096, 4096, true, false) == 0,
+            "invalid alignment and worker counts cannot overflow staging arithmetic");
     requests[COMMON_FIT_RAM_PROMPT] = {123 * MiB, true};
     requests[COMMON_FIT_RAM_EXPERTS].bytes = 0;
     const auto explicit_plan = common_fit_ram_plan(16 * GiB, requests);
