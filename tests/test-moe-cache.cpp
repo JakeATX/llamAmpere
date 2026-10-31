@@ -6213,24 +6213,28 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
     if (!fusion_count) {
         return false;
     }
-    bool ok = true;
+    bool all_ok = true;
+    constexpr int64_t n_expert = 512;
     std::vector<float> importance(n_in, 1.0f);
     for (const auto type : ggml_moe_cache_types) {
         if (type == GGML_TYPE_IQ1_M) {
             continue;
         }
-        ggml_init_params weight_params = {2 * ggml_tensor_overhead(), nullptr, true};
+        bool ok = true;
+        ggml_init_params weight_params = {3 * ggml_tensor_overhead(), nullptr, true};
         ggml_context * weights_ctx = ggml_init(weight_params);
         ggml_tensor * weights[] = {
+            ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
             ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
             ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
         };
         ggml_set_name(weights[0], "blk.7.ffn_up_exps.weight");
         ggml_set_name(weights[1], "blk.7.ffn_gate_exps.weight");
+        ggml_set_name(weights[2], "blk.7.ffn_down_exps.weight");
         ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu);
         ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::vector<float> values(n_in * n_out * n_expert);
-        for (int bank = 0; bank < 2; ++bank) {
+        for (int bank = 0; bank < 3; ++bank) {
             for (size_t i = 0; i < values.size(); ++i) {
                 values[i] = 0.15f * std::sin((float)(i % 997) * (0.017f + bank * 0.013f));
             }
@@ -6262,7 +6266,7 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
                 std::vector<int32_t> routing(512 * tokens, 63);
                 for (int t = 0; t < tokens; ++t) {
                     routing[512*t] = t % 3;
-                    routing[512*t + 1] = (t + 1) % 3;
+                    routing[512*t + 1] = n_expert - 1;
                 }
                 for (int i = 0; i < 2; ++i) {
                     acts[i] = ggml_new_tensor_3d(input_ctx[i], GGML_TYPE_F32, n_in, channels, tokens);
@@ -6279,16 +6283,16 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
                 ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
                 const auto api = active_api();
                 void * session = create_direct_session(gpu, cpu);
-                ggml_moe_cache_tensor_desc descriptors[2];
-                std::vector<uint64_t> usage[2] = {std::vector<uint64_t>(n_expert, 0), std::vector<uint64_t>(n_expert, 0)};
-                const uint64_t * counts[] = {usage[0].data(), usage[1].data()};
-                for (int i = 0; i < 2; ++i) {
+                ggml_moe_cache_tensor_desc descriptors[3];
+                std::vector<uint64_t> usage(n_expert, 0);
+                for (int e = 0; e < 3; ++e) { usage[e] = 100; }
+                const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
+                for (int i = 0; i < 3; ++i) {
                     auto * w = weights[i];
                     descriptors[i] = {w->name, w->data, w->nb[2], n_in, n_out, n_expert, (int32_t)type};
-                    usage[i][i] = 100;
                 }
-                bool prepared = session && api.warm(session, descriptors, counts, 2) == 2 &&
-                        api.device_prepare(session, descriptors, 2) == 1;
+                bool prepared = session && api.warm(session, descriptors, counts, 3) > 0 &&
+                        api.device_prepare(session, descriptors, 3) == 1;
                 ok &= prepared;
                 const int64_t before = fusion_count(gpu, "mul_mat_glu");
                 if (prepared) {
@@ -6312,6 +6316,8 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
                 const std::string log = capture.get();
                 ok &= max_field_value(log, "dispatches=") == 160;
                 ok &= max_field_value(log, "replays=") >= 8;
+                ok &= max_field_value(log, "hits=") > 0;
+                ok &= max_field_value(log, "misses=") > 0;
                 if (!ok) {
                     fprintf(stderr, "fused device type=%s tokens=%d channels=%d\n%s", ggml_type_name(type), tokens, channels, log.c_str());
                 }
@@ -6324,13 +6330,14 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
             }
         }
         printf("cache-device-fused type=%s: %s\n", ggml_type_name(type), ok ? "OK" : "FAIL");
+        all_ok &= ok;
         ggml_backend_buffer_free(weights_buffer);
         ggml_free(weights_ctx);
     }
     for (const char * name : {"GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_CACHE_DEVICE_FUSED"}) {
         set_env(name, nullptr);
     }
-    return ok;
+    return all_ok;
 }
 
 // fork: retain exact expert images across stable-table updates and source invalidation.
@@ -8147,6 +8154,12 @@ int main(int argc, char ** argv) {
         return !provider_is_cuda ? 77 : ok ? 0 : 1;
     }
 #endif
+    if (argc == 2 && strcmp(argv[1], "--device-fused-tables-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_fused_tables(gpu, cpu, capture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--device-missjoin-retain-lifecycle-only") == 0) {
         const bool ok = provider_is_cuda && run_device_missjoin_retain_lifecycle(gpu, cpu, capture);
         ggml_backend_free(gpu);
