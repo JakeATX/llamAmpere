@@ -356,13 +356,19 @@ static void exact_sink_case(llama_model * model) {
                 "pending seal beyond sink and sequence is refused");
         require(g_last_error.find("corrupt section") != std::string::npos, "invalid pending seal rejected by header validation");
         require(seq_state(ctx.get()) == before, "invalid pending seal leaves the cache unchanged");
-        const auto expected = decode(ctx.get(), n, n + 4, 1, 7);
+        std::vector<std::vector<float>> expected;
+        for (llama_pos p = n; p < n + 4; ++p) {
+            expected.push_back(decode(ctx.get(), p, p + 1, 1, 7));
+        }
         for (int reuse = 0; reuse < 2; ++reuse) {
             require(llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0, flags) == checkpoint.size(),
                     "restore exact checkpoint at " + std::to_string(n));
             require(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, n, -1), "trim restored sequence");
             require(seq_state(ctx.get()) == before, "exact checkpoint restores prefix bytes");
-            require(same_logits(decode(ctx.get(), n, n + 4, 1, 7), expected), "exact checkpoint continuation is bit-identical");
+            for (llama_pos p = n; p < n + 4; ++p) {
+                require(same_logits(decode(ctx.get(), p, p + 1, 1, 7), expected[p - n]),
+                        "exact checkpoint continuation is bit-identical at " + std::to_string(p));
+            }
         }
         printf("OK: exact checkpoint n=%u restored twice with identical bytes and logits; invalid pending seal refused\n", n);
     }
