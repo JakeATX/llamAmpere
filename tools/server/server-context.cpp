@@ -5927,7 +5927,7 @@ private:
                         // Leave a logits tail and keep the cold prefill's physical batch and record boundaries.
                         const int64_t at = std::min<int64_t>(slot.task->params.eval_cache_save_at, n_task - 1);
                         eval_cache_end = sj_kvarn_ckpt_floor(at - at % n_ubatch);
-                        if (eval_cache_end > 0 && eval_cache->find(input_tokens.get_text_tokens(), eval_cache_end - 1) >= 0) {
+                        if (eval_cache_end > 0 && eval_cache->find(input_tokens.get_tokens(), eval_cache_end - 1) >= 0) {
                             eval_cache_end = 0;
                         }
                     }

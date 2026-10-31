@@ -157,7 +157,7 @@ uint64_t common_fit_eval_cache_load_bytes(uint64_t available, bool fit, uint64_t
     if (n_tokens > budget / sizeof(llama_token)) {
         return 0;
     }
-    // The request copy is released before reading; restore needs one token buffer beside the record.
+    // State-load validation needs one token buffer beside the parsed record.
     return budget - n_tokens * sizeof(llama_token);
 }
 
