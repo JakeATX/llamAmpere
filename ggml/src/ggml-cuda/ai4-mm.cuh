@@ -18,7 +18,11 @@ bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t);
 
 bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor * base);
 const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined);
+// The caller retains these buffers through the mixed GEMV; IQ4_NL banks need only Q8 activations.
+void ggml_cuda_moe_mixed_quantize_x(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
+        ggml_cuda_pool_alloc<int8_t> & q, ggml_cuda_pool_alloc<float> & s);
 void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8 = nullptr,
         const void * const * table = nullptr, const uint8_t * skip = nullptr, const uint8_t * resident = nullptr,
-        const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr);
+        const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr,
+        const int8_t * act_ai_q = nullptr, const float * act_ai_s = nullptr);

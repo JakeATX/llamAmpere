@@ -1570,10 +1570,25 @@ const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined) {
     return mul->src[0];
 }
 
+void ggml_cuda_moe_mixed_quantize_x(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
+        ggml_cuda_pool_alloc<int8_t> & q, ggml_cuda_pool_alloc<float> & s) {
+    if (bank->src[0]->type == GGML_TYPE_IQ4_NL) {
+        return;
+    }
+    const ggml_tensor * x = bank->src[1];
+    const int K = (int) x->ne[0];
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    const size_t rows = (size_t) x->ne[1]*x->ne[2];
+    q.alloc(rows*K);
+    s.alloc(rows*(K >> (7 + xsh)));
+    ai4_quantize_x((const float *) x->data, rows, K, xsh, q.get(), s.get(), ctx.stream());
+}
+
 void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8,
         const void * const * table, const uint8_t * skip, const uint8_t * resident,
-        const ggml_tensor * route_map, ggml_tensor * route_mask) {
+        const ggml_tensor * route_map, ggml_tensor * route_mask,
+        const int8_t * act_ai_q, const float * act_ai_s) {
     GGML_ASSERT(ggml_cuda_moe_mixed_supported(bank, base));
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
     const int K = (int) x->ne[0], M = (int) w->ne[1];
@@ -1581,10 +1596,11 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     const size_t rows = (size_t) x->ne[1]*x->ne[2];
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool());
     ggml_cuda_pool_alloc<float> s(ctx.pool());
-    if (w->type != GGML_TYPE_IQ4_NL) {
-        q.alloc(rows*K);
-        s.alloc(rows*(K >> (7 + xsh)));
-        ai4_quantize_x((const float *) x->data, rows, K, xsh, q.get(), s.get(), ctx.stream());
+    GGML_ASSERT((act_ai_q == nullptr) == (act_ai_s == nullptr));
+    if (!act_ai_q) {
+        ggml_cuda_moe_mixed_quantize_x(ctx, bank, q, s);
+        act_ai_q = q.get();
+        act_ai_s = s.get();
     }
     ggml_cuda_pool_alloc<char> q8(ctx.pool());
     if (!act_q8) {
@@ -1621,7 +1637,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
                                ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
 #define MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, SINGLE, SPW) \
     moe_mixed_mmv<L, XSH, KT, WARPS, SINGLE, SPW><<<grid, WARPS*32, std::max((size_t) (WARPS*2*ai4k::mmv_stage_bytes<true, L>()), iq4_smem), ctx.stream()>>>( \
-            (const uint8_t *) w->data, q.get(), s.get(), (float *) dst->data, M, K, idm, \
+            (const uint8_t *) w->data, act_ai_q, act_ai_s, (float *) dst->data, M, K, idm, \
             w->type, (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
             ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
             route_map ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr, trace > 1)

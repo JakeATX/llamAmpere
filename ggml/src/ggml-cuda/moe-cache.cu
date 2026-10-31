@@ -11733,6 +11733,12 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
     }
     ggml_cuda_pool_alloc<char> q8(ctx.pool());
     char * quantized = moe_quantize_act(ctx, a, (ggml_type) table.desc.type, table.mj_kind == 0 || table.mj_kind == 1, q8);
+    ggml_cuda_pool_alloc<int8_t> bank_q(ctx.pool());
+    ggml_cuda_pool_alloc<float> bank_s(ctx.pool());
+    if (bank && hf_on) {
+        // fork: overlap both activation quantizers with expert copies before joining the side stream.
+        ggml_cuda_moe_mixed_quantize_x(ctx, bank, bank_q, bank_s);
+    }
     if (hf_on) {
         // Resident routes first, then the routes whose experts were just copied; together they compute
         // every route exactly once with the same kernel.
@@ -11776,7 +11782,8 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             eff = moe_hf_wait(ctx, session, table);
             ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, eff,
                     cs ? g_cs_mask + (size_t) table.mj_kind*g_hf_experts :
-                    tail ? g_tail_mask + (size_t) table.mj_kind*g_hf_experts : nullptr, table.hot, route_map, route_mask);
+                    tail ? g_tail_mask + (size_t) table.mj_kind*g_hf_experts : nullptr, table.hot, route_map, route_mask,
+                    bank_q.get(), bank_s.get());
         } else if (one != 0) {
             eff = moe_hf_wait(ctx, session, table);
             const int64_t count = op->ne[0] * ids->ne[0] * ids->ne[1];
