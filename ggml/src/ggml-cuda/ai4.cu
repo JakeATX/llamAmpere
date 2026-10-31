@@ -1296,6 +1296,7 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     X(GGML_TYPE_IQ2_S,   vec_dot_iq2_s_q8_1,   VDR_IQ2_S_Q8_1_MMVQ) \
     X(GGML_TYPE_IQ3_XXS, vec_dot_iq3_xxs_q8_1, VDR_IQ3_XXS_Q8_1_MMVQ) \
     X(GGML_TYPE_IQ3_S,   vec_dot_iq3_s_q8_1,   VDR_IQ3_S_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ4_NL,  vec_dot_iq4_nl_q8_1,  VDR_IQ4_NL_Q8_1_MMVQ) \
     X(GGML_TYPE_IQ4_XS,  vec_dot_iq4_xs_q8_1,  VDR_IQ4_XS_Q8_1_MMVQ)
 
 template <ggml_type T> struct moe_mixed_dot;
@@ -1328,7 +1329,7 @@ static __device__ __forceinline__ void moe_mixed_base_rows(const char * w, const
     }
 }
 
-template <int LAY>
+template <int LAY, int XSH>
 static __global__ void __launch_bounds__(128, 4) moe_mixed_mmv(
         const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
         const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
@@ -1337,7 +1338,7 @@ static __global__ void __launch_bounds__(128, 4) moe_mixed_mmv(
     const int u = blockIdx.y, t = blockIdx.z;
     const int h = *(const int32_t *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
     if (h >= 0 && h < idm.direct_n_expert) {
-        ai4k::mmvr_body<LAY, 1, true, 0, 2, 4, 4, true, false, 1, 1, true>(W, q, s, Y, M, M, 1, K, idm);
+        ai4k::mmvr_body<LAY, XSH, true, 0, 2, 4, 4, true, false, 1, 1, true>(W, q, s, Y, M, M, 1, K, idm);
         return;
     }
     float * out = Y + ((int64_t) t*idm.direct_n_used + u)*M + blockIdx.x*16;
@@ -1375,7 +1376,7 @@ bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor *
     }
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
     if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT3_U) ||
-            x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] <= 0 || x->ne[0] > 65536 || x->ne[0] % 256 ||
+            x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] <= 0 || x->ne[0] > 65536 || x->ne[0] % 128 ||
             w->ne[1] <= 0 || w->ne[1] > 65536 || w->ne[1] % 16 || w->ne[2] <= 0 || w->ne[2] > INT32_MAX ||
             cw->ne[0] != w->ne[0] || cw->ne[1] != w->ne[1] || cw->ne[2] <= 0 || cw->ne[2] > INT32_MAX ||
             cw->ne[3] != 1 || !ggml_is_contiguous_2(cw) || cw->nb[1] != ggml_row_size(cw->type, cw->ne[0]) ||
@@ -1418,10 +1419,11 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     GGML_ASSERT(ggml_cuda_moe_mixed_supported(bank, base));
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
     const int K = (int) x->ne[0], M = (int) w->ne[1];
+    const int xsh = K % 256 == 0 ? 1 : 0;
     const size_t rows = (size_t) x->ne[1]*x->ne[2];
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), rows*K);
-    ggml_cuda_pool_alloc<float> s(ctx.pool(), rows*(K/256));
-    ai4_quantize_x((const float *) x->data, rows, K, 1, q.get(), s.get(), ctx.stream());
+    ggml_cuda_pool_alloc<float> s(ctx.pool(), rows*(K >> (7 + xsh)));
+    ai4_quantize_x((const float *) x->data, rows, K, xsh, q.get(), s.get(), ctx.stream());
     ggml_cuda_pool_alloc<char> q8(ctx.pool());
     if (!act_q8) {
         const int padded = GGML_PAD(K, MATRIX_ROW_PADDING);
@@ -1437,13 +1439,18 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     idm.direct_n_used = (int) ids->ne[0]; idm.direct_ne11 = (int) x->ne[1]; idm.direct_n_expert = (int) w->ne[2];
     const dim3 grid(M/16, ids->ne[0], ids->ne[1]);
     static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
-#define MOE_MIXED_LAUNCH(L) \
-    moe_mixed_mmv<L><<<grid, 128, 4*2*ai4k::mmv_stage_bytes<true, L>(), ctx.stream()>>>( \
+#define MOE_MIXED_LAUNCH(L, XSH) \
+    moe_mixed_mmv<L, XSH><<<grid, 128, 4*2*ai4k::mmv_stage_bytes<true, L>(), ctx.stream()>>>( \
             (const uint8_t *) w->data, q.get(), s.get(), (float *) dst->data, M, K, idm, \
             (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
             ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, trace > 1)
-    if (w->type == GGML_TYPE_AIT2_U) { MOE_MIXED_LAUNCH(ai4k::LAY_AIT2_U); }
-    else { MOE_MIXED_LAUNCH(ai4k::LAY_AIT3_U); }
+    if (w->type == GGML_TYPE_AIT2_U) {
+        if (xsh) { MOE_MIXED_LAUNCH(ai4k::LAY_AIT2_U, 1); }
+        else     { MOE_MIXED_LAUNCH(ai4k::LAY_AIT2_U, 0); }
+    } else {
+        if (xsh) { MOE_MIXED_LAUNCH(ai4k::LAY_AIT3_U, 1); }
+        else     { MOE_MIXED_LAUNCH(ai4k::LAY_AIT3_U, 0); }
+    }
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     if (trace) {

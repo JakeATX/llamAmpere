@@ -11897,11 +11897,12 @@ struct test_moe_bank_mixed : public test_case {
     const ggml_type bank_type, base_type;
     const int width, mode, channels;
     const bool extra_reader, reduce;
+    const int n_in, n_out;
     test_moe_bank_mixed(ggml_type bank_type, ggml_type base_type, int width, int mode, int channels,
-            bool extra_reader = false, bool reduce = false) :
+            bool extra_reader = false, bool reduce = false, int n_in = 256, int n_out = 32) :
         bank_type(bank_type), base_type(base_type), width(width), mode(mode), channels(channels),
-        extra_reader(extra_reader), reduce(reduce) {}
-    std::string vars() override { return VARS_TO_STR7(bank_type, base_type, width, mode, channels, extra_reader, reduce); }
+        extra_reader(extra_reader), reduce(reduce), n_in(n_in), n_out(n_out) {}
+    std::string vars() override { return VARS_TO_STR9(bank_type, base_type, width, mode, channels, extra_reader, reduce, n_in, n_out); }
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -11910,9 +11911,9 @@ struct test_moe_bank_mixed : public test_case {
     }
     const char * forbidden_fusion() override { return extra_reader || base_type == GGML_TYPE_F32 ? "moe_bank_mixed" : nullptr; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, 256, 32, 4);
-        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, 256, 32, 4);
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, channels, width);
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, channels, width);
         ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
         ggml_tensor * ci = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, width);
         ggml_set_name(hi, "mixed_bank_ids"); ggml_set_name(ci, "mixed_base_ids");
@@ -11925,7 +11926,7 @@ struct test_moe_bank_mixed : public test_case {
         if (reduce) {
             ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 4, width);
             out = ggml_reshape_2d(ctx, ggml_sum_rows(ctx,
-                    ggml_cont(ctx, ggml_permute(ctx, ggml_mul(ctx, out, weights), 1, 0, 2, 3))), 32, width);
+                    ggml_cont(ctx, ggml_permute(ctx, ggml_mul(ctx, out, weights), 1, 0, 2, 3))), n_out, width);
         }
         return extra_reader ? ggml_add(ctx, out, h) : out;
     }
@@ -18918,6 +18919,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int width : { 1, 4, 8 }) {
         for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
             test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ2_XS, width, 2, 4, false, true));
+            test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ3_XXS, width, 2, 1, false, true, 2560, 640));
+            test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ4_NL, width, 2, 4, false, true, 640, 2560));
         }
     }
 
