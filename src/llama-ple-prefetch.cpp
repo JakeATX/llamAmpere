@@ -185,13 +185,13 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
             posix_fadvise(pf->fd, 0, 0, POSIX_FADV_RANDOM);
         }
     }
-    if (model.params.fit_ram || pf->bounded_window || (pf->use_pread && pf->populate)) {
+    if (model.ram_fit_enabled() || pf->bounded_window || (pf->use_pread && pf->populate)) {
         // The gather and fault readers share mapping read-around, separate from the pread descriptor.
         const uintptr_t page = table_base - table_base%4096;
         const uint64_t bytes = pf->n_rows*pf->row_size;
         if (bytes > SIZE_MAX - (table_base - page) ||
                 madvise((void *) page, (size_t) bytes + table_base - page, MADV_RANDOM) != 0) {
-            if (model.params.fit_ram || pf->bounded_window) {
+            if (model.ram_fit_enabled() || pf->bounded_window) {
                 LLAMA_LOG_WARN("%s: [PLEPF] cannot bound mapped read-around, bounded prefetch off\n", __func__);
                 return nullptr;
             }
@@ -354,7 +354,7 @@ bool llama_ple_prefetch::run_ready(size_t i) const {
 }
 
 size_t llama_ple_prefetch::fit_pages(size_t requested) const {
-    if (!model->params.fit_ram) { return requested; }
+    if (!model->ram_fit_enabled()) { return requested; }
     uint64_t available = 0;
     try { available = llama_moe_arena::available_memory(); }
     catch (...) { /* Unknown RAM disables optional reads. */ }
@@ -494,7 +494,7 @@ void llama_ple_prefetch::build() {
         const size_t r0 = nr;
         for (size_t j = 0; j < cp.size(); ++j) {
             // fork: bounded windows must not pull unused or already-read pages into the cache.
-            const uint64_t gap = coalesce && !bounded_window && !model->params.fit_ram ? 16 : 0;
+            const uint64_t gap = coalesce && !bounded_window && !model->ram_fit_enabled() ? 16 : 0;
             if (nr > r0 && cp[j] <= run_key[nr - 1] + run_len[nr - 1] + gap && cp[j] - run_key[nr - 1] < RUN_MAX) {
                 run_len[nr - 1] = (uint32_t) (cp[j] - run_key[nr - 1] + 1);
             } else {
@@ -997,7 +997,7 @@ void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n
     if (!running || a < n_prev || a >= toks.size()) {
         return;
     }
-    if (model->params.fit_ram && model->prefetch_remaining.load(std::memory_order_relaxed) < 4096) {
+    if (model->ram_fit_enabled() && model->prefetch_remaining.load(std::memory_order_relaxed) < 4096) {
         return;
     }
     const uint64_t n = std::min<uint64_t>(n_tokens, toks.size() - a);
@@ -1006,7 +1006,7 @@ void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n
     for (uint64_t i = 0; i < n; ++i) {
         llama_ple_hash_rows(hp, toks[a + i], toks.data() + a + i - n_prev, dec_rows.data() + i*nh);
     }
-    if (model->params.fit_ram) {
+    if (model->ram_fit_enabled()) {
         std::vector<uintptr_t> pages;
         for (int32_t row : dec_rows) {
             const uintptr_t first = (uintptr_t) ple->data + (size_t) row*row_size;
