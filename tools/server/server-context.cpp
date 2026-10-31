@@ -3056,13 +3056,13 @@ private:
         }
         if (n_tokens < 0 || uint64_t(n_tokens) > slot.prompt.tokens.size() || spec_bytes == SIZE_MAX ||
                 !common_fit_eval_cache_save_fits(available_ram, params_base.fit_params, uint64_t(n_tokens), spec_bytes)) {
-            SLT_ERR(slot, "eval cache: entry was not saved because its temporary copies exceed the current RAM fit budget or its size is invalid\n");
+            SLT_ERR(slot, "%s", "eval cache: entry was not saved because its temporary copies exceed the current RAM fit budget or its size is invalid\n");
             return false;
         }
 
         llama_tokens tokens = slot.prompt.tokens.get_text_tokens(size_t(n_tokens));
         if (uint64_t(n_tokens) > tokens.size()) {
-            SLT_ERR(slot, "eval cache: entry has fewer text tokens than requested\n");
+            SLT_ERR(slot, "%s", "eval cache: entry has fewer text tokens than requested\n");
             return false;
         }
         tokens.resize(n_tokens);
@@ -3072,7 +3072,7 @@ private:
         std::vector<uint8_t> spec_state;
         common_speculative_get_state(spec.get(), slot.id, spec_state);
         if (spec_state.size() != spec_bytes) {
-            SLT_ERR(slot, "eval cache: speculative state size changed during save\n");
+            SLT_ERR(slot, "%s", "eval cache: speculative state size changed during save\n");
             return false;
         }
         if (params_base.fit_params) {
