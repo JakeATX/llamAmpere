@@ -611,6 +611,13 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_test(test-moe-arena NAME test-moe-arena-thp ARGS --thp LABEL "main;cpu")
 endif()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT LLAMA_USE_SYSTEM_GGML)
+    add_executable(test-mmap-prefetch test-mmap-prefetch.cpp ../src/llama-mmap.cpp)
+    target_link_libraries(test-mmap-prefetch PRIVATE llama ggml-base)
+    target_link_options(test-mmap-prefetch PRIVATE "LINKER:--wrap=mmap" "LINKER:--wrap=posix_madvise")
+    llama_test(test-mmap-prefetch LABEL "main;cpu")
+endif()
+
 if (UNIX AND NOT LLAMA_USE_SYSTEM_GGML)
     # safety: --load-mode dio reads through a plain bounce buffer and gives the same bytes as mmap
     add_executable(test-dio-bounce test-dio-bounce.cpp)
