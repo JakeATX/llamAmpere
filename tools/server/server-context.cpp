@@ -3035,7 +3035,7 @@ private:
             return;
         }
 
-        slot.prompt.tokens = server_tokens(e.tokens, false);
+        slot.prompt.tokens = server_tokens(std::move(rec.tokens), false);
         slot.eval_cache_restored = true;
         slot.loop_guard = {};
         slot.prompt.checkpoints = std::move(rec.checkpoints);

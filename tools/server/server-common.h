@@ -189,7 +189,7 @@ public:
     const llama_token& operator[](size_t index) const { return tokens[index]; }
 
     server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd);
-    server_tokens(const llama_tokens & tokens, bool has_mtmd);
+    server_tokens(llama_tokens tokens, bool has_mtmd);
 
     // for debugging
     std::string str() const;

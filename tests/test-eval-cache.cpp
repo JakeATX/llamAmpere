@@ -304,6 +304,33 @@ static void test_record_restore_budget(const std::string & root) {
     }
     CHECK(!ec.read_header(id, rec, err, common_fit_eval_cache_load_bytes(5ull << 30, true, tokens.size())));
     CHECK(ec.read_header(id, rec, err, common_fit_eval_cache_load_bytes(0, false, tokens.size())));
+
+    // A borrowed index still needs its own copy; an owned restore record does not.
+    allocation_probe::start(payload);
+    server_tokens borrowed(ec.entries.front().tokens, false);
+    const size_t borrowed_copies = allocation_probe::stop();
+    CHECK(borrowed_copies == 1 && borrowed.size() == tokens.size());
+    const server_tokens & borrowed_view = borrowed;
+    CHECK(borrowed.size() > 0 && &borrowed_view[0] != ec.entries.front().tokens.data());
+    CHECK(ec.entries.front().tokens == tokens);
+
+    const llama_token * owned_data = rec.tokens.data();
+    allocation_probe::start(payload);
+    server_tokens restored(std::move(rec.tokens), false);
+    const size_t owned_copies = allocation_probe::stop();
+    CHECK(owned_copies == 0 && allocation_probe::largest == 0);
+    const server_tokens & restored_view = restored;
+    CHECK(restored.size() == tokens.size() && restored.size() > 0 && &restored_view[0] == owned_data);
+    CHECK(!restored.has_mtmd && restored.pos_next() == (llama_pos) tokens.size());
+    bool same_tokens = restored.size() == tokens.size();
+    for (size_t i = 0; same_tokens && i < tokens.size(); ++i) {
+        same_tokens = restored_view[i] == tokens[i];
+    }
+    CHECK(same_tokens);
+    CHECK(rec.spec == small_spec && rec.checkpoints.empty());
+    CHECK(ec.entries.front().tokens == tokens);
+    CHECK(ec.read_header(id, rec, err, record_budget));
+    CHECK(rec.tokens == tokens && rec.spec == small_spec);
 }
 
 static void test_record_allocations(const std::string & root) {

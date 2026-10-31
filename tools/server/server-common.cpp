@@ -15,6 +15,7 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 #include <chrono>
 #include <thread>
 
@@ -433,7 +434,7 @@ server_tokens::server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd) : 
     }
 }
 
-server_tokens::server_tokens(const llama_tokens & tokens, bool has_mtmd) : has_mtmd(has_mtmd), tokens(tokens) {
+server_tokens::server_tokens(llama_tokens tokens, bool has_mtmd) : has_mtmd(has_mtmd), tokens(std::move(tokens)) {
 }
 
 llama_pos server_tokens::pos_next(int64_t n_tokens) const {

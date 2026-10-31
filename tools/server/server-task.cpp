@@ -2108,7 +2108,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             const float f_keep_cur = float(lcp_cur) / it->tokens.size();
             const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-            SRV_TRC("   - disk prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+            SRV_TRC("   - disk prompt with length %7zu, lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
             if (f_keep_cur < 0.25f) {
                 continue;
