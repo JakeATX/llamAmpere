@@ -2569,7 +2569,12 @@ private:
         if (!params_base.eval_cache_path.empty()) {
             eval_cache = std::make_unique<server_eval_cache>();
             std::string err;
-            if (!eval_cache->open(params_base.eval_cache_path, prompt_cache_key(true), params_base.eval_cache_build, err)) {
+            uint64_t total_ram = 0, available_ram = 0;
+            if (params_base.fit_params) {
+                common_host_memory(total_ram, available_ram);
+            }
+            const uint64_t index_budget = common_fit_eval_cache_ram_bytes(available_ram, params_base.fit_params);
+            if (!eval_cache->open(params_base.eval_cache_path, prompt_cache_key(true), params_base.eval_cache_build, err, index_budget)) {
                 SRV_ERR("eval cache: refusing to start: %s\n", err.c_str());
                 eval_cache.reset();
                 return false;

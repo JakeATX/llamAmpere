@@ -60,7 +60,8 @@ struct server_eval_cache {
 
     // open the folder. Read-only mode requires an existing index whose key equals `key`; build mode creates the
     // folder and index when missing and still refuses a folder built for another key. An unsupported version disables the read-only cache with a warning; build mode refuses it. `err` says why on failure.
-    bool open(const std::string & dir, const std::string & key, bool writable, std::string & err);
+    bool open(const std::string & dir, const std::string & key, bool writable, std::string & err,
+              uint64_t ram_bytes = UINT64_MAX);
 
     bool enabled() const { return !dir.empty(); }
 

@@ -9,6 +9,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <stdexcept>
 #include <system_error>
 
 namespace fs = std::filesystem;
@@ -273,12 +275,13 @@ bool server_eval_cache::write_index(std::string & err) const {
     return true;
 }
 
-bool server_eval_cache::open(const std::string & dir_in, const std::string & key_in, bool writable_in, std::string & err) {
+bool server_eval_cache::open(const std::string & dir_in, const std::string & key_in, bool writable_in, std::string & err,
+        uint64_t ram_bytes) {
     dir      = dir_in;
     key      = key_in;
     key_hash = server_prompt_disk_hash(key.data(), key.size());
     writable = writable_in;
-    entries.clear();
+    std::vector<server_eval_cache_entry>().swap(entries);
     n_skipped = 0;
 
     while (dir.size() > 1 && dir.back() == '/') {
@@ -287,6 +290,22 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
 
     std::error_code ec;
     const std::string index = dir + "/" + EVC_INDEX;
+    auto ram_failure = [&]() {
+        err = "eval cache index exceeds the RAM fit budget; using fresh prefill";
+        dir.clear();
+        std::vector<server_eval_cache_entry>().swap(entries);
+        if (writable) {
+            return false;
+        }
+        LOG_WRN("eval cache: %s\n", err.c_str());
+        err.clear();
+        return true;
+    };
+    const bool bounded = ram_bytes != UINT64_MAX;
+    if (bounded && ram_bytes < 65536 + sizeof(server_eval_cache)) {
+        return ram_failure();
+    }
+    uint64_t remaining = bounded ? ram_bytes - 65536 - sizeof(server_eval_cache) : UINT64_MAX;
 
     if (!fs::exists(index, ec)) {
         if (!writable) {
@@ -308,10 +327,50 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
     }
 
     json j;
+    bool ram_limited = false;
+    auto charge = [&](uint64_t bytes) {
+        if (bounded && bytes > remaining) {
+            ram_limited = true;
+            throw std::length_error("eval cache RAM budget");
+        }
+        if (bounded) {
+            remaining -= bytes;
+        }
+    };
     try {
-        std::ifstream f(index);
-        j = json::parse(f);
+        std::ifstream f(index, std::ios::binary);
+        if (!bounded) {
+            j = json::parse(f);
+        } else {
+            const uint64_t bytes = fs::file_size(index);
+            if (bytes > remaining / 4 || bytes > SIZE_MAX || bytes > uint64_t(std::numeric_limits<std::streamsize>::max())) {
+                return ram_failure();
+            }
+            // Keep a fixed snapshot; reserve lexer strings and transient copies before parsing.
+            charge(4 * bytes);
+            std::string text(size_t(bytes), '\0');
+            if (!f.read(text.data(), std::streamsize(bytes)) || f.peek() != std::char_traits<char>::eof()) {
+                throw std::runtime_error("index changed while reading");
+            }
+            j = json::parse(text, [&](int depth, json::parse_event_t event, json & value) {
+                if (depth > 64) {
+                    ram_limited = true;
+                    throw std::length_error("eval cache index is too deep");
+                }
+                // Cover vector growth, object pairs, allocator headers and parser nodes.
+                charge(256 + 4 * sizeof(json));
+                if ((event == json::parse_event_t::key || event == json::parse_event_t::value) && value.is_string()) {
+                    const size_t n = value.get_ref<const json::string_t &>().size();
+                    charge(n);
+                    charge(n);
+                }
+                return true;
+            });
+        }
     } catch (const std::exception & e) {
+        if (ram_limited) {
+            return ram_failure();
+        }
         err = index + " does not parse: " + e.what();
         dir.clear();
         return false;
@@ -358,6 +417,9 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
 
     if (j.contains("entries") && j["entries"].is_array()) {
         for (const auto & je : j["entries"]) {
+            if (bounded && remaining < 512 + 4 * sizeof(server_eval_cache_entry)) {
+                return ram_failure();
+            }
             server_eval_cache_entry e;
             e.id      = je.value("id", std::string());
             e.has_dft = je.value("has_dft", false);
@@ -365,10 +427,20 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
                 ++n_skipped;
                 continue;
             }
+            const uint64_t entry_bytes = 512 + 4 * sizeof(server_eval_cache_entry) + 2 * uint64_t(e.id.size());
+            if (bounded) {
+                if (entry_bytes > remaining) {
+                    return ram_failure();
+                }
+                remaining -= entry_bytes;
+            }
 
             server_eval_cache_record rec;
             std::string perr;
-            if (!evc_parse(path_hdr(e.id), key_hash, key, false, rec, perr)) {
+            if (!evc_parse(path_hdr(e.id), key_hash, key, false, rec, perr, remaining)) {
+                if (bounded && perr.find("RAM fit budget") != std::string::npos) {
+                    return ram_failure();
+                }
                 LOG_WRN("eval cache: skipping entry %s: %s\n", e.id.c_str(), perr.c_str());
                 ++n_skipped;
                 continue;
@@ -379,6 +451,13 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
                 continue;
             }
             e.tokens = std::move(rec.tokens);
+            if (bounded) {
+                const uint64_t token_bytes = e.tokens.capacity() * sizeof(llama_token);
+                if (token_bytes > remaining) {
+                    return ram_failure();
+                }
+                remaining -= token_bytes;
+            }
             e.bytes  = fs::file_size(path_hdr(e.id), ec) + fs::file_size(path_tgt(e.id), ec) +
                        (e.has_dft ? fs::file_size(path_dft(e.id), ec) : 0);
             entries.push_back(std::move(e));

@@ -205,6 +205,67 @@ static void test_record_ram_budget(const std::string & root) {
     CHECK(ec.read_header(id, rec, err));
 }
 
+static void test_index_ram_budget(const std::string & root) {
+    const std::string dir = root + "/index-ram";
+    const std::string index = dir + "/eval-cache.json";
+    server_eval_cache writer, reader;
+    std::string err, id;
+    CHECK(writer.open(dir, KEY_A, true, err));
+    for (int i = 0; i < 16; ++i) {
+        CHECK(add_entry(writer, seq(i * 10000, 8192), {}, {}, false, id));
+    }
+    const uint64_t index_bytes = fs::file_size(index);
+    CHECK(reader.open(dir, KEY_A, false, err, 2 * 1024 * 1024));
+    CHECK(reader.enabled() && reader.entries.size() == 16);
+    CHECK(reader.find(seq(0, 8192), 0) >= 0);
+
+    // A small index can refer to more tokens than the whole index budget.
+    CHECK(reader.open(dir, KEY_A, false, err, 256 * 1024));
+    CHECK(!reader.enabled() && reader.entries.empty() && reader.entries.capacity() == 0);
+    CHECK(err.empty());
+    CHECK(!reader.open(dir, KEY_A, true, err, 256 * 1024));
+    CHECK(err.find("RAM fit budget") != std::string::npos);
+    CHECK(fs::file_size(index) == index_bytes);
+    CHECK(reader.open(dir, KEY_A, false, err, 0));
+    CHECK(!reader.enabled());
+    for (uint64_t host_gib : {16, 32, 64, 128}) {
+        CHECK(reader.open(dir, KEY_A, false, err, common_fit_eval_cache_ram_bytes((host_gib - 6) << 30, true)));
+        CHECK(reader.enabled() && reader.entries.size() == 16);
+    }
+    CHECK(reader.open(dir, KEY_A, false, err, common_fit_eval_cache_ram_bytes(0, false)));
+    CHECK(reader.entries.size() == 16);
+
+    // Reject a large snapshot before parsing, then prove the source is untouched.
+    fs::resize_file(index, 1ull << 26);
+    CHECK(reader.open(dir, KEY_A, false, err, 1024 * 1024));
+    CHECK(!reader.enabled() && reader.entries.empty());
+    CHECK(!reader.open(dir, KEY_A, true, err, 1024 * 1024));
+    CHECK(fs::file_size(index) == (1ull << 26));
+    CHECK(writer.write_index(err));
+
+    // Many short JSON values need a node budget even when file bytes fit.
+    {
+        std::ofstream f(index, std::ios::trunc);
+        f << "{\"extra\":[0";
+        for (int i = 0; i < 5000; ++i) {
+            f << ",0";
+        }
+        f << "]}";
+    }
+    CHECK(fs::file_size(index) < 16384);
+    CHECK(reader.open(dir, KEY_A, false, err, 1024 * 1024));
+    CHECK(!reader.enabled());
+    {
+        std::ofstream f(index, std::ios::trunc);
+        f << std::string(72, '[') << '0' << std::string(72, ']');
+    }
+    CHECK(reader.open(dir, KEY_A, false, err, 1024 * 1024));
+    CHECK(!reader.enabled());
+    CHECK(writer.write_index(err));
+    CHECK(reader.open(dir, KEY_A, false, err, 2 * 1024 * 1024));
+    CHECK(reader.enabled() && reader.entries.size() == 16);
+}
+
 static void test_corruption(const std::string & root) {
     const std::string dir = root + "/b";
     std::string err;
@@ -308,6 +369,7 @@ int main() {
     test_open_and_roundtrip(root);
     test_corruption(root);
     test_record_ram_budget(root);
+    test_index_ram_budget(root);
     test_index_version(root);
 
     std::error_code ec;
