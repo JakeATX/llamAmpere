@@ -1748,6 +1748,64 @@ void ggml_cuda_moe_mixed_quantize_x(ggml_backend_cuda_context & ctx, const ggml_
     ai4_quantize_x((const float *) x->data, rows, K, xsh, q.get(), s.get(), ctx.stream());
 }
 
+// fork AIPFIX: the first nai blocks along x run the AI activation quantizer's CTAs, the rest quantize_q8_1's
+// elements with 128 threads per block. Each part runs the same per-CTA / per-warp code as its own kernel.
+template <bool XSH, bool SWZ>
+static __global__ void __launch_bounds__(128) moe_mixed_quantize_dual(const float * __restrict__ x, int K,
+        int8_t * __restrict__ q, float * __restrict__ s, void * __restrict__ q8, int padded, int nai) {
+    const int tok = blockIdx.y;
+    if ((int) blockIdx.x < nai) {
+        if constexpr (XSH) {
+            rq4::quantize_act_body(x, K, q, s, K, gridDim.y, blockIdx.x, tok);
+        } else {
+            ai4k::quantize_act128_body(x, K, q, s, K, gridDim.y, blockIdx.x, tok);
+        }
+        return;
+    }
+    const int i0 = ((int) blockIdx.x - nai)*128 + threadIdx.x;
+    if (i0 >= padded) {
+        return;
+    }
+    quantize_q8_1_elem<SWZ>(x, q8, (int64_t) tok*padded + i0, i0 < K ? (int64_t) tok*K + i0 : -1);
+}
+
+static bool moe_mixed_dualq_enabled() {
+    static const bool v = ai4_env_int("GGML_MOE_BANK_MIXED_DUALQ", nullptr, 1) != 0;
+    return v;
+}
+
+bool ggml_cuda_moe_mixed_quantize_dual(ggml_backend_cuda_context & ctx, const ggml_tensor * bank, const ggml_tensor * x,
+        char * q8, ggml_type q8_type, ggml_cuda_pool_alloc<int8_t> & q, ggml_cuda_pool_alloc<float> & s) {
+    const ggml_tensor * bx = bank->src[1];
+    if (!moe_mixed_dualq_enabled() || bank->src[0]->type == GGML_TYPE_IQ4_NL || x->data != bx->data ||
+            !ggml_are_same_shape(x, bx) || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+            !ggml_is_contiguous(bx) || x->ne[3] != 1) {
+        return false;
+    }
+    const int K = (int) x->ne[0];
+    const int64_t rows = x->ne[1]*x->ne[2];
+    const int padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+    if (rows > 65535 || K % 128 != 0 || padded % 128 != 0) {
+        return false;
+    }
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    q.alloc(rows*K);
+    s.alloc(rows*(K >> (7 + xsh)));
+    const int nai = xsh ? (K/RQ4_HB + 3)/4 : (K/128 + 7)/8;
+    const dim3 grid(nai + padded/128, (unsigned) rows);
+    const bool swz = q8_type == GGML_TYPE_IQ4_XS;
+    const float * xd = (const float *) x->data;
+    if (xsh) {
+        if (swz) { moe_mixed_quantize_dual<true, true><<<grid, 128, 0, ctx.stream()>>>(xd, K, q.get(), s.get(), q8, padded, nai); }
+        else { moe_mixed_quantize_dual<true, false><<<grid, 128, 0, ctx.stream()>>>(xd, K, q.get(), s.get(), q8, padded, nai); }
+    } else {
+        if (swz) { moe_mixed_quantize_dual<false, true><<<grid, 128, 0, ctx.stream()>>>(xd, K, q.get(), s.get(), q8, padded, nai); }
+        else { moe_mixed_quantize_dual<false, false><<<grid, 128, 0, ctx.stream()>>>(xd, K, q.get(), s.get(), q8, padded, nai); }
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8,
         const void * const * table, const uint8_t * skip, const uint8_t * resident,
@@ -1768,15 +1826,23 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool());
     ggml_cuda_pool_alloc<float> s(ctx.pool());
     GGML_ASSERT((act_ai_q == nullptr) == (act_ai_s == nullptr));
+    ggml_cuda_pool_alloc<char> q8(ctx.pool());
+    if (!act_ai_q && !act_q8) {
+        char * p = q8.alloc(rows*(GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1)*sizeof(block_q8_1));
+        if (ggml_cuda_moe_mixed_quantize_dual(ctx, bank, x, p, cw->type, q, s)) {
+            act_ai_q = q.get();
+            act_ai_s = s.get();
+            act_q8 = p;
+        }
+    }
     if (!act_ai_q) {
         ggml_cuda_moe_mixed_quantize_x(ctx, bank, q, s);
         act_ai_q = q.get();
         act_ai_s = s.get();
     }
-    ggml_cuda_pool_alloc<char> q8(ctx.pool());
     if (!act_q8) {
         const int padded = GGML_PAD(K, MATRIX_ROW_PADDING);
-        char * p = q8.alloc(rows*(padded/QK8_1)*sizeof(block_q8_1));
+        char * p = q8.get() ? q8.get() : q8.alloc(rows*(padded/QK8_1)*sizeof(block_q8_1));
         quantize_row_q8_1_cuda((const float *) x->data, nullptr, p, cw->type, K,
                 x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
                 padded, x->ne[1], x->ne[2], 1, ctx.stream());

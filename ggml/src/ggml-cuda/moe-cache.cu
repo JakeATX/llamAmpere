@@ -11670,14 +11670,29 @@ static int moe_q8_share_mode() {
     return mode;
 }
 
+// fork AIPFIX: with a bank, its AI activations (bank_q, bank_s) are written too, by the same launch as the q8_1
+// buffer when that one is quantized here (GGML_MOE_BANK_MIXED_DUALQ), on their own otherwise.
 static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tensor * a, ggml_type type, bool share,
-        ggml_cuda_pool_alloc<char> & local) {
+        ggml_cuda_pool_alloc<char> & local, const ggml_tensor * bank = nullptr,
+        ggml_cuda_pool_alloc<int8_t> * bank_q = nullptr, ggml_cuda_pool_alloc<float> * bank_s = nullptr) {
     const int64_t padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
     const size_t q8_bytes = (size_t)(padded / QK8_1) * a->ne[1] * a->ne[2] * sizeof(block_q8_1);
+    GGML_ASSERT(!bank || (bank_q && bank_s));
+    bool bank_done = false;
     auto quantize = [&](char * out) {
+        if (bank && !bank_done && ggml_cuda_moe_mixed_quantize_dual(ctx, bank, a, out, type, *bank_q, *bank_s)) {
+            bank_done = true;
+            return;
+        }
         quantize_row_q8_1_cuda((const float *) a->data, nullptr, out, type,
                 a->ne[0], a->nb[1] / sizeof(float), a->nb[2] / sizeof(float), a->nb[3] / sizeof(float),
                 padded, a->ne[1], a->ne[2], 1, ctx.stream());
+    };
+    auto finish = [&](char * out) {
+        if (bank && !bank_done) {
+            ggml_cuda_moe_mixed_quantize_x(ctx, bank, *bank_q, *bank_s);
+        }
+        return out;
     };
     const int mode = share ? moe_q8_share_mode() : 0;
     if (mode && a->type == GGML_TYPE_F32 && a->ne[3] == 1 && ggml_is_contiguous(a) && ggml_cuda_q8_cacheable(ctx, q8_bytes)) {
@@ -11697,16 +11712,16 @@ static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tenso
                 ggml_cuda_moe_bits_check((const float *) ref, (const float *) hit, (int64_t) (q8_bytes / sizeof(float)),
                         ctx.stream());
             }
-            return hit;
+            return finish(hit);
         }
         char * buf = ggml_cuda_q8_cache_claim(ctx, base, type, q8_bytes, padded);
         g_st_q8claim.fetch_add(1, std::memory_order_relaxed);
         quantize(buf);
-        return buf;
+        return finish(buf);
     }
     char * buf = local.alloc(q8_bytes);
     quantize(buf);
-    return buf;
+    return finish(buf);
 }
 
 static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op, const ggml_tensor * bank,
@@ -11741,13 +11756,11 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
                 session.device_expert_counts + table.count_offset, n, table.desc.n_expert, (int)ids->ne[0], (int)(ids->nb[1] / sizeof(int32_t)));
     }
     ggml_cuda_pool_alloc<char> q8(ctx.pool());
-    char * quantized = moe_quantize_act(ctx, a, (ggml_type) table.desc.type, table.mj_kind == 0 || table.mj_kind == 1, q8);
     ggml_cuda_pool_alloc<int8_t> bank_q(ctx.pool());
     ggml_cuda_pool_alloc<float> bank_s(ctx.pool());
-    if (bank && hf_on) {
-        // fork: overlap both activation quantizers with expert copies before joining the side stream.
-        ggml_cuda_moe_mixed_quantize_x(ctx, bank, bank_q, bank_s);
-    }
+    // fork: overlap both activation quantizers with expert copies before joining the side stream.
+    char * quantized = moe_quantize_act(ctx, a, (ggml_type) table.desc.type, table.mj_kind == 0 || table.mj_kind == 1, q8,
+            bank && hf_on ? bank : nullptr, &bank_q, &bank_s);
     if (hf_on) {
         // Resident routes first, then the routes whose experts were just copied; together they compute
         // every route exactly once with the same kernel.
@@ -11939,10 +11952,9 @@ bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
         }
     }
     ggml_cuda_pool_alloc<char> q8(ctx.pool());
-    char * quantized = moe_quantize_act(ctx, a, (ggml_type) first.desc.type, true, q8);
     ggml_cuda_pool_alloc<int8_t> bank_q(ctx.pool());
     ggml_cuda_pool_alloc<float> bank_s(ctx.pool());
-    ggml_cuda_moe_mixed_quantize_x(ctx, bank, bank_q, bank_s);
+    char * quantized = moe_quantize_act(ctx, a, (ggml_type) first.desc.type, true, q8, bank, &bank_q, &bank_s);
     ggml_tensor op = *base;
     op.data = dst->data;
     ggml_tensor op2 = *base2;

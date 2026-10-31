@@ -21,6 +21,11 @@ const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined);
 // The caller retains these buffers through the mixed GEMV; IQ4_NL banks need only Q8 activations.
 void ggml_cuda_moe_mixed_quantize_x(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         ggml_cuda_pool_alloc<int8_t> & q, ggml_cuda_pool_alloc<float> & s);
+// Same, plus the base experts' q8_1 activations of x (quantize_row_q8_1_cuda layout for weight type q8_type,
+// ne0 padded to MATRIX_ROW_PADDING) into q8, from one launch. False (nothing done) when the bank or x does not fit;
+// the caller then runs the two quantizers. GGML_MOE_BANK_MIXED_DUALQ=0 always declines (default 1).
+bool ggml_cuda_moe_mixed_quantize_dual(ggml_backend_cuda_context & ctx, const ggml_tensor * bank, const ggml_tensor * x,
+        char * q8, ggml_type q8_type, ggml_cuda_pool_alloc<int8_t> & q, ggml_cuda_pool_alloc<float> & s);
 // Second projection of one paired launch (gate with up): same activations, routes, bank and base types
 // and shapes; its blocks follow the first projection's along x. Route outputs are written by the first only.
 struct ggml_cuda_moe_mixed_pair {

@@ -82,34 +82,8 @@ static __global__ void quantize_q8_1(
 
     const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
 
-    block_q8_1 * y = (block_q8_1 *) vy;
-
-    const int64_t ib  = i_cont / QK8_1; // block index
-    const int64_t iqs = i_cont % QK8_1; // quant index
-
     ggml_cuda_pdl_sync();
-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
-    float amax = fabsf(xi);
-    float sum = 0.0f;
-
-    amax = warp_reduce_max<QK8_1>(amax);
-
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-
-    // fork: the direct MMQ kernel consumes K pairs from both nibble planes.
-    if constexpr (swizzle_iq4) {
-        y[ib].qs[2*(iqs % 16) + iqs/16] = q;
-    } else {
-        y[ib].qs[iqs] = q;
-    }
-    sum = warp_reduce_sum<QK8_1>((float) q);
-
-    if (iqs > 0) {
-        return;
-    }
-
-    y[ib].ds = make_half2(d, d * sum);
+    quantize_q8_1_elem<swizzle_iq4>(x, vy, i_cont, i0 < ne00 ? i03*s03 + i02*s02 + i01*s01 + i00 : -1);
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
