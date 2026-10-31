@@ -343,7 +343,11 @@ static std::vector<uint8_t> save(llama_context * ctx, llama_seq_id seq) {
 
 static snapshot save(contexts & ctx, llama_seq_id seq) {
     snapshot state { save(ctx.tgt, seq), save(ctx.dft, seq), {} };
+    const size_t predicted = common_speculative_get_state_size(ctx.spec, seq);
+    require(predicted > 0 && predicted != SIZE_MAX, "MTP size preflight has a finite snapshot size");
     require(common_speculative_get_state(ctx.spec, seq, state.spec) && !state.spec.empty(), "MTP snapshot contains carry and adaptive state");
+    require(predicted == state.spec.size(), "MTP size preflight matches carry, deferred rows and adaptive state");
+    require(common_speculative_get_state_size(ctx.spec, -1) == 0, "invalid MTP sequence has no serialized bytes");
     return state;
 }
 
@@ -3111,6 +3115,8 @@ static void run_eagle_boundary_restore(llama_model * model) {
     model->target_layer_ids = { 0, 1, 2 };
     contexts ctx(model, { "EAGLE boundary", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, 128, COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
     std::vector<uint8_t> got;
+    require(common_speculative_get_state_size(nullptr, 0) == 0, "no speculative driver needs no snapshot bytes");
+    require(common_speculative_get_state_size(ctx.spec, 1) == 0, "fresh EAGLE sequence needs no snapshot bytes");
     require(!common_speculative_get_state(ctx.spec, 1, got), "fresh EAGLE sequence has no boundary state");
     const llama_pos pos = 123;
     std::vector<float> carry(n_embd);
@@ -3121,6 +3127,7 @@ static void run_eagle_boundary_restore(llama_model * model) {
     std::memcpy(state.data(), &pos, sizeof(pos));
     std::memcpy(state.data() + sizeof(pos), carry.data(), carry.size() * sizeof(float));
     require(common_speculative_restore_state(ctx.spec, 1, state), "restore EAGLE boundary into a fresh driver");
+    require(common_speculative_get_state_size(ctx.spec, 1) == sizeof(llama_pos) + n_embd * sizeof(float), "EAGLE size preflight matches restored boundary");
     require(common_speculative_get_state(ctx.spec, 1, got) && got == state, "EAGLE boundary restore round trip");
     require(!common_speculative_get_state(ctx.spec, 0, got), "EAGLE boundary restore leaves another sequence cold");
     auto truncated = state;

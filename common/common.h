@@ -417,7 +417,16 @@ struct common_params_speculative_ngram_cache {
 
     bool    save_dynamic          = false;   // write the dynamic cache back to lookup_cache_dynamic (checkpoints and shutdown)
     int32_t save_dynamic_interval = 300;     // seconds between checkpoints of the dynamic cache (0 = only at shutdown)
-    int32_t max_ngrams_dynamic    = 1000000; // n-grams kept in the dynamic cache when saving, lowest utility evicted (0 = unlimited)
+    int32_t max_ngrams_dynamic    = 1000000; // live dynamic n-gram key limit; saves also prune by utility (0 = unlimited)
+    bool max_ngrams_dynamic_explicit = false;
+
+    // Automatic count quotas bound file loads, live dynamic growth and each slot's context cache.
+    uint64_t load_max_entries_static        = UINT64_MAX;
+    uint64_t load_max_continuations_static  = UINT64_MAX;
+    uint64_t load_max_entries_dynamic       = UINT64_MAX;
+    uint64_t load_max_continuations_dynamic = UINT64_MAX;
+    uint64_t max_entries_context            = UINT64_MAX;
+    uint64_t max_continuations_context      = UINT64_MAX;
 
     // identity of the target vocab, stored in saved cache files and checked at load (0 = unknown, no check)
     uint32_t vocab_n_tokens = 0;
@@ -607,6 +616,7 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+    bool fit_params_target_explicit = false;
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model

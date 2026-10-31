@@ -227,6 +227,7 @@ struct common_speculative_impl {
     virtual void note_target_conf(llama_seq_id /*seq_id*/, const float * /*p*/, size_t /*n*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
+    virtual size_t get_state_size(llama_seq_id /*seq_id*/) const { return 0; }
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
@@ -927,18 +928,23 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
     }
 
-    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
-        if (!need_boundary_stash()) {
-            return false;
+    size_t get_state_size(llama_seq_id seq_id) const override {
+        if (!need_boundary_stash() || seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
+            return 0;
         }
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos_last[seq_id] < 0) {
-            return false;
-        }
+        const size_t width = pending_g_last[seq_id].size();
+        return width > (SIZE_MAX - sizeof(llama_pos)) / sizeof(float) ? SIZE_MAX : sizeof(llama_pos) + width * sizeof(float);
+    }
 
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        const size_t bytes = get_state_size(seq_id);
+        if (bytes == 0 || bytes == SIZE_MAX) {
+            return false;
+        }
         const llama_pos          pos = pending_pos_last[seq_id];
         const std::vector<float> & g = pending_g_last[seq_id];
 
-        data.resize(sizeof(llama_pos) + g.size() * sizeof(float));
+        data.resize(bytes);
         std::memcpy(data.data(),                     &pos,     sizeof(llama_pos));
         std::memcpy(data.data() + sizeof(llama_pos), g.data(), g.size() * sizeof(float));
         return true;
@@ -1880,8 +1886,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return dropped;
     }
 
-    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+    size_t get_state_size(llama_seq_id seq_id) const override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return 0;
+        }
+        const size_t header = 8 * sizeof(uint32_t);
+        if (n_embd <= 0 || (size_t) n_embd > (SIZE_MAX - header) / sizeof(float)) {
+            return SIZE_MAX;
+        }
+        const size_t row = (size_t) n_embd * sizeof(float);
+        if (row > SIZE_MAX - sizeof(llama_token) - sizeof(llama_pos)) {
+            return SIZE_MAX;
+        }
+        const size_t stride = sizeof(llama_token) + sizeof(llama_pos) + row;
+        const size_t count = std::count(defer.seq.begin(), defer.seq.end(), seq_id);
+        if (count > UINT32_MAX || count > (SIZE_MAX - header - row) / stride) {
+            return SIZE_MAX;
+        }
+        return header + row + count * stride;
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        const size_t bytes = get_state_size(seq_id);
+        if (bytes == 0 || bytes == SIZE_MAX) {
             return false;
         }
 
@@ -1896,7 +1923,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             (uint32_t) n_last[seq_id], (adaptive ? 1u : 0u) | (defer_enabled ? 2u : 0u),
         };
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        data.resize(sizeof(header) + row_bytes + n_defer * (sizeof(llama_token) + sizeof(llama_pos) + row_bytes));
+        data.resize(bytes);
         size_t off = 0;
         auto put = [&](const void * src, size_t n) {
             std::memcpy(data.data() + off, src, n);
@@ -3546,6 +3573,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     // shared across all sequences
     common_ngram_cache ngram_cache_dynamic;
     common_ngram_cache ngram_cache_static;
+    common_ngram_cache_limits limits_dynamic;
 
     // writeback of the dynamic cache, see sync() and checkpoint_poll()
     bool               save_dynamic = false; // params.save_dynamic and a path to write to
@@ -3600,6 +3628,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         size_t cache_size = 0; // number of tokens of the sequence in ngram_cache_context
 
         common_ngram_cache ngram_cache_context;
+        common_ngram_cache_limits limits_context;
     };
 
     std::vector<seq_info> sinfos;
@@ -3630,6 +3659,10 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
 
         sinfos.resize(n_seq);
+        for (auto & sinfo : sinfos) {
+            sinfo.limits_context = common_ngram_cache_limits(sinfo.ngram_cache_context,
+                    this->params.max_entries_context, this->params.max_continuations_context);
+        }
 
         vocab_id.n_tokens = this->params.vocab_n_tokens;
         vocab_id.hash     = this->params.vocab_hash;
@@ -3637,7 +3670,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         // a cache file that cannot be used is skipped, never fatal: the drafter then starts cold, as without the file
         if (!path_static.empty()) {
             std::string err;
-            if (common_ngram_cache_load_file(path_static, ngram_cache_static, vocab_id, err) == COMMON_NGRAM_CACHE_LOAD_OK) {
+            if (common_ngram_cache_load_file(path_static, ngram_cache_static, vocab_id, err,
+                    this->params.load_max_entries_static, this->params.load_max_continuations_static) == COMMON_NGRAM_CACHE_LOAD_OK) {
                 SPC_INF("static lookup cache loaded: %s (%zu n-grams)\n", path_static.c_str(), ngram_cache_static.size());
             } else {
                 SPC_WRN("static lookup cache ignored: %s\n", err.c_str());
@@ -3647,7 +3681,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         auto status_dynamic = COMMON_NGRAM_CACHE_LOAD_MISSING;
         if (!path_dynamic.empty()) {
             std::string err;
-            status_dynamic = common_ngram_cache_load_file(path_dynamic, ngram_cache_dynamic, vocab_id, err);
+            status_dynamic = common_ngram_cache_load_file(path_dynamic, ngram_cache_dynamic, vocab_id, err,
+                    this->params.load_max_entries_dynamic, this->params.load_max_continuations_dynamic);
             if (status_dynamic == COMMON_NGRAM_CACHE_LOAD_OK) {
                 SPC_INF("dynamic lookup cache loaded: %s (%zu n-grams)\n", path_dynamic.c_str(), ngram_cache_dynamic.size());
                 file_present = true;
@@ -3686,6 +3721,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             }
         }
 
+        limits_dynamic = common_ngram_cache_limits(ngram_cache_dynamic,
+                this->params.load_max_entries_dynamic, this->params.load_max_continuations_dynamic);
         t_last_sync_ms = ggml_time_ms();
     }
 
@@ -3721,7 +3758,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
             std::string err;
             if (common_ngram_cache_sync_file(params.lookup_cache_dynamic, ngram_cache_dynamic, ngram_cache_delta,
-                        n_max_dynamic, vocab_id, err)) {
+                        n_max_dynamic, vocab_id, err, nullptr, params.load_max_entries_dynamic, params.load_max_continuations_dynamic)) {
                 SPC_INF("dynamic lookup cache saved (%s): %s, %zu n-grams, %.1f ms\n",
                         reason, params.lookup_cache_dynamic.c_str(), ngram_cache_dynamic.size(),
                         (ggml_time_us() - t_start_us) / 1000.0);
@@ -3778,9 +3815,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                 bool        from_disk = false;
                 std::string err;
                 try {
-                    cache = delta;
                     ok = common_ngram_cache_sync_file(params.lookup_cache_dynamic, cache, delta,
-                            n_max_dynamic, vocab_id, err, &from_disk);
+                            n_max_dynamic, vocab_id, err, &from_disk, params.load_max_entries_dynamic, params.load_max_continuations_dynamic, true);
                 } catch (const std::exception & e) {
                     ok  = false;
                     err = e.what();
@@ -3827,15 +3863,17 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             file_present = true;
 
             try {
-                // the live delta was learned after the handover, it is not in the file yet and stays a delta
-                common_ngram_cache_merge(ckpt_cache, ngram_cache_delta);
-                std::swap(ngram_cache_dynamic, ckpt_cache);
+                // Keep new counts only for pairs retained by the bounded saved cache.
+                common_ngram_cache_refresh(ngram_cache_dynamic, ckpt_cache, ngram_cache_delta, n_max_dynamic,
+                        params.load_max_entries_dynamic, params.load_max_continuations_dynamic);
             } catch (const std::exception & e) {
                 // out of memory during the merge: keep the current in-memory cache (it contains the delta
                 // that was just written, and the live one), and let the worker free the half-merged copy
                 SPC_WRN("dynamic lookup cache saved, but the in-memory cache was not refreshed from it: %s\n", e.what());
             }
 
+            limits_dynamic = common_ngram_cache_limits(ngram_cache_dynamic,
+                    params.load_max_entries_dynamic, params.load_max_continuations_dynamic);
             SPC_INF("dynamic lookup cache saved (checkpoint): %s, %zu n-grams, %.1f ms\n",
                     params.lookup_cache_dynamic.c_str(), ngram_cache_dynamic.size(), ckpt_t_us / 1000.0);
 
@@ -3849,7 +3887,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         // ckpt_delta is the whole last interval, ngram_cache_delta only what came after the handover:
         // add the small one to the big one and take that back
         try {
-            common_ngram_cache_merge(ckpt_delta, ngram_cache_delta);
+            common_ngram_cache_merge(ckpt_delta, ngram_cache_delta, n_max_dynamic);
         } catch (const std::exception & e) {
             // out of memory part way through: a retry would count the merged part twice, so the rest of
             // the live delta (a few seconds of n-grams) is dropped instead
@@ -3919,6 +3957,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             // The context cache can only be appended to (see common_ngram_cache_update), so it is rebuilt from
             // scratch at the next draft.
             sinfo.ngram_cache_context.clear();
+            sinfo.limits_context = common_ngram_cache_limits(sinfo.ngram_cache_context,
+                    params.max_entries_context, params.max_continuations_context);
             sinfo.cache_size = 0;
         }
 
@@ -3946,12 +3986,13 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             // the boundary between the already cached tokens and the new ones are counted as well.
             const int nnew = (int) (inp.size() - sinfo.cache_size);
 
-            common_ngram_cache_update(sinfo.ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false);
+            common_ngram_cache_update(sinfo.ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false,
+                    0, nullptr, &sinfo.limits_context);
 
             if (save_dynamic) {
                 // the dynamic cache learns from every sequence; the delta is what sync() writes back
-                common_ngram_cache_update(ngram_cache_dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false);
-                common_ngram_cache_update(ngram_cache_delta,   LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false);
+                common_ngram_cache_update(ngram_cache_dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false, n_max_dynamic, nullptr, &limits_dynamic);
+                common_ngram_cache_update(ngram_cache_delta,   LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false, n_max_dynamic, &ngram_cache_dynamic);
             }
 
             sinfo.cache_size = inp.size();
@@ -5056,6 +5097,18 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+size_t common_speculative_get_state_size(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec != nullptr) {
+        for (const auto & impl : spec->impls) {
+            const size_t bytes = impl->get_state_size(seq_id);
+            if (bytes != 0) {
+                return bytes;
+            }
+        }
+    }
+    return 0;
 }
 
 // TODO: support the case of more than one speculative implementations having a state

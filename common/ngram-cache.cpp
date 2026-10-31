@@ -27,8 +27,18 @@
 #include <unistd.h>
 #endif
 
+common_ngram_cache_limits::common_ngram_cache_limits(const common_ngram_cache & cache, uint64_t entries, uint64_t continuations)
+    : max_entries(entries), continuations_left(continuations) {
+    if (continuations != UINT64_MAX) {
+        for (const auto & entry : cache) {
+            continuations_left -= std::min(continuations_left, uint64_t(entry.second.size()));
+        }
+    }
+}
+
 void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, int ngram_max,
-                              std::vector<llama_token> & inp, int nnew, bool print_progress) {
+                              std::vector<llama_token> & inp, int nnew, bool print_progress, size_t n_max,
+                              const common_ngram_cache * admitted, common_ngram_cache_limits * limits) {
     const int64_t t_start_ms = ggml_time_ms();
     const int64_t inp_size = inp.size();
 
@@ -41,16 +51,35 @@ void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, 
             const int64_t ngram_start = i - ngram_size;
             common_ngram ngram(&inp[ngram_start], ngram_size);
             const llama_token token = inp[i];
+            if (admitted) {
+                const auto accepted = admitted->find(ngram);
+                if (accepted == admitted->end() || accepted->second.find(token) == accepted->second.end()) {
+                    continue;
+                }
+            }
 
             common_ngram_cache::iterator part_it = ngram_cache.find(ngram);
             if (part_it == ngram_cache.end()) {
+                if ((n_max > 0 && ngram_cache.size() >= n_max) ||
+                    (limits && (ngram_cache.size() >= limits->max_entries || limits->continuations_left == 0))) {
+                    continue;
+                }
                 common_ngram_cache_part part;
                 part.emplace(token, 1);
                 ngram_cache.emplace(ngram, part);
+                if (limits && limits->continuations_left != UINT64_MAX) {
+                    --limits->continuations_left;
+                }
             } else {
                 common_ngram_cache_part::iterator token_count_it = part_it->second.find(token);
                 if (token_count_it == part_it->second.end()) {
+                    if (limits && limits->continuations_left == 0) {
+                        continue;
+                    }
                     part_it->second.emplace(token, 1);
+                    if (limits && limits->continuations_left != UINT64_MAX) {
+                        --limits->continuations_left;
+                    }
                 } else {
                     token_count_it->second++;
                 }
@@ -300,10 +329,11 @@ struct common_ngram_cache_reader {
 };
 
 // Parse n_ngrams entries (or, if n_ngrams is SIZE_MAX, until the end of the file) of payload into ngram_cache.
-static bool common_ngram_cache_read_payload(
+static common_ngram_cache_load_status common_ngram_cache_read_payload(
         common_ngram_cache_reader & reader, common_ngram_cache & ngram_cache,
-        uint64_t n_ngrams, uint32_t n_vocab, std::string & err) {
+        uint64_t n_ngrams, uint32_t n_vocab, std::string & err, uint64_t max_entries, uint64_t max_continuations) {
     const bool until_eof = n_ngrams == UINT64_MAX;
+    uint64_t continuations = 0;
 
     for (uint64_t i = 0; until_eof || i < n_ngrams; ++i) {
         common_ngram ngram;
@@ -312,7 +342,12 @@ static bool common_ngram_cache_read_payload(
                 break; // clean end of a header-less file
             }
             err = "truncated at n-gram " + std::to_string(i);
-            return false;
+            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
+        }
+
+        if (i >= max_entries) {
+            err = "lookup cache entry limit reached";
+            return COMMON_NGRAM_CACHE_LOAD_LIMIT;
         }
 
         // the n-gram is a prefix of real tokens followed by LLAMA_TOKEN_NULL padding
@@ -321,29 +356,35 @@ static bool common_ngram_cache_read_payload(
             const llama_token token = ngram.tokens[j];
             if (!common_ngram_cache_token_ok(token, n_vocab, true)) {
                 err = "n-gram " + std::to_string(i) + " has token " + std::to_string(token) + " outside the vocab";
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
             if (token == LLAMA_TOKEN_NULL) {
                 in_padding = true;
             } else if (in_padding) {
                 err = "n-gram " + std::to_string(i) + " has a token after its padding";
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
         }
         if (ngram.tokens[0] == LLAMA_TOKEN_NULL) {
             err = "n-gram " + std::to_string(i) + " is empty";
-            return false;
+            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
         }
 
         int32_t n_tokens = 0;
         if (!reader.get(n_tokens)) {
             err = "truncated at n-gram " + std::to_string(i);
-            return false;
+            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
         }
         if (n_tokens <= 0 || n_tokens > COMMON_NGRAM_CACHE_MAX_PART) {
             err = "n-gram " + std::to_string(i) + " has an implausible number of continuations: " + std::to_string(n_tokens);
-            return false;
+            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
         }
+
+        if (uint64_t(n_tokens) > max_continuations - continuations) {
+            err = "lookup cache continuation limit reached";
+            return COMMON_NGRAM_CACHE_LOAD_LIMIT;
+        }
+        continuations += uint64_t(n_tokens);
 
         common_ngram_cache_part part;
         part.reserve(n_tokens);
@@ -352,15 +393,15 @@ static bool common_ngram_cache_read_payload(
             int32_t     count = 0;
             if (!reader.get(token) || !reader.get(count)) {
                 err = "truncated at n-gram " + std::to_string(i);
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
             if (!common_ngram_cache_token_ok(token, n_vocab, false)) {
                 err = "n-gram " + std::to_string(i) + " has continuation token " + std::to_string(token) + " outside the vocab";
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
             if (count <= 0) {
                 err = "n-gram " + std::to_string(i) + " has a non-positive count";
-                return false;
+                return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
             }
             part[token] += count; // a duplicated token in a corrupt or hand-merged file is folded, not rejected
         }
@@ -368,12 +409,13 @@ static bool common_ngram_cache_read_payload(
         ngram_cache[ngram] = std::move(part); // a duplicated n-gram keeps the last entry
     }
 
-    return true;
+    return COMMON_NGRAM_CACHE_LOAD_OK;
 }
 
 common_ngram_cache_load_status common_ngram_cache_load_file(
         const std::string & filename, common_ngram_cache & ngram_cache,
-        const common_ngram_cache_vocab_id & vocab_id, std::string & err) {
+        const common_ngram_cache_vocab_id & vocab_id, std::string & err,
+        uint64_t max_entries, uint64_t max_continuations) {
     ngram_cache.clear();
     err.clear();
 
@@ -405,10 +447,12 @@ common_ngram_cache_load_status common_ngram_cache_load_file(
         reader.reset();
 
         std::string err_payload;
-        if (!common_ngram_cache_read_payload(reader, ngram_cache, UINT64_MAX, vocab_id.n_tokens, err_payload)) {
+        const auto status = common_ngram_cache_read_payload(reader, ngram_cache, UINT64_MAX, vocab_id.n_tokens, err_payload, max_entries, max_continuations);
+        if (status != COMMON_NGRAM_CACHE_LOAD_OK) {
             ngram_cache.clear();
-            err = filename + ": not a lookup cache file (" + err_payload + ")";
-            return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
+            err = status == COMMON_NGRAM_CACHE_LOAD_LIMIT ? filename + ": " + err_payload :
+                filename + ": not a lookup cache file (" + err_payload + ")";
+            return status;
         }
         LOG_INF("%s: %s has no header (older format), vocab identity not checked, %zu n-grams\n",
                 __func__, filename.c_str(), ngram_cache.size());
@@ -451,15 +495,21 @@ common_ngram_cache_load_status common_ngram_cache_load_file(
         return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
     }
 
+    if (n_ngrams > max_entries) {
+        err = filename + ": lookup cache entry limit reached";
+        return COMMON_NGRAM_CACHE_LOAD_LIMIT;
+    }
+
     const uint32_t n_vocab_check = vocab_id.n_tokens != 0 ? vocab_id.n_tokens : n_vocab;
 
     reader.reset(); // the payload hash does not cover the header
 
     std::string err_payload;
-    if (!common_ngram_cache_read_payload(reader, ngram_cache, n_ngrams, n_vocab_check, err_payload)) {
+    const auto status = common_ngram_cache_read_payload(reader, ngram_cache, n_ngrams, n_vocab_check, err_payload, max_entries, max_continuations);
+    if (status != COMMON_NGRAM_CACHE_LOAD_OK) {
         ngram_cache.clear();
         err = filename + ": " + err_payload;
-        return COMMON_NGRAM_CACHE_LOAD_CORRUPT;
+        return status;
     }
 
     if (reader.n_read != payload_size) {
@@ -545,40 +595,56 @@ bool common_ngram_cache_save_file(
         const common_ngram_cache_vocab_id & vocab_id, std::string & err) {
     err.clear();
 
-    // serialize the payload in memory first, so the hash and the sizes are known before anything is written
-    std::vector<char> payload;
     uint64_t n_ngrams = 0;
-    for (const auto & item : ngram_cache) {
-        const common_ngram & ngram = item.first;
-        const common_ngram_cache_part & part = item.second;
-        if (part.empty()) {
-            continue; // never written: the reader rejects n-grams without continuations
-        }
+    uint64_t payload_size = 0;
+    uint64_t payload_hash = COMMON_NGRAM_CACHE_FNV_INIT;
 
-        int32_t n_tokens = 0;
-        for (const auto & token_count : part) {
-            if (token_count.second > 0) {
-                ++n_tokens;
+    // Count and hash first, then write the same const maps without a full payload copy.
+    const auto emit_payload = [&](std::ostream * file) {
+        const auto put = [&](const void * data, size_t size) {
+            if (file) {
+                return bool(file->write(static_cast<const char *>(data), size));
             }
-        }
-        if (n_tokens == 0) {
-            continue;
-        }
-
-        common_ngram_cache_put(payload, ngram.tokens, sizeof(ngram.tokens));
-        common_ngram_cache_put(payload, n_tokens);
-        for (const auto & token_count : part) {
-            if (token_count.second <= 0) {
+            if (size > UINT64_MAX - payload_size) {
+                err = "lookup cache payload is too large";
+                return false;
+            }
+            payload_size += size;
+            payload_hash = common_ngram_cache_fnv1a(payload_hash, data, size);
+            return true;
+        };
+        for (const auto & item : ngram_cache) {
+            int32_t n_tokens = 0;
+            for (const auto & token_count : item.second) {
+                if (token_count.second > 0) {
+                    if (n_tokens == COMMON_NGRAM_CACHE_MAX_PART) {
+                        err = "lookup cache has too many continuations in one n-gram";
+                        return false;
+                    }
+                    ++n_tokens;
+                }
+            }
+            if (n_tokens == 0) {
                 continue;
             }
-            common_ngram_cache_put(payload, token_count.first);
-            common_ngram_cache_put(payload, token_count.second);
+            if (!put(item.first.tokens, sizeof(item.first.tokens)) || !put(&n_tokens, sizeof(n_tokens))) {
+                return false;
+            }
+            for (const auto & token_count : item.second) {
+                if (token_count.second > 0 &&
+                        (!put(&token_count.first, sizeof(token_count.first)) || !put(&token_count.second, sizeof(token_count.second)))) {
+                    return false;
+                }
+            }
+            if (!file) {
+                ++n_ngrams;
+            }
         }
-        ++n_ngrams;
+        return true;
+    };
+    if (!emit_payload(nullptr)) {
+        return false;
     }
-
-    const uint64_t payload_size = payload.size();
-    const uint64_t payload_hash = common_ngram_cache_fnv1a(COMMON_NGRAM_CACHE_FNV_INIT, payload.data(), payload.size());
 
     std::vector<char> header;
     common_ngram_cache_put(header, COMMON_NGRAM_CACHE_MAGIC, sizeof(COMMON_NGRAM_CACHE_MAGIC));
@@ -605,9 +671,12 @@ bool common_ngram_cache_save_file(
             err = "cannot create " + filename_tmp;
             return false;
         }
-        file.write(header.data(),  header.size());
-        file.write(payload.data(), payload.size());
+        file.write(header.data(), header.size());
+        if (!file || !emit_payload(&file)) {
+            err = "write to " + filename_tmp + " failed";
+        }
         file.flush();
+        file.close();
         if (!file) {
             err = "write to " + filename_tmp + " failed";
         }
@@ -795,7 +864,8 @@ static void common_ngram_cache_remove_stale_tmp(const std::string & filename) {
 
 bool common_ngram_cache_sync_file(
         const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
-        size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk) {
+        size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk,
+        uint64_t max_entries, uint64_t max_continuations, bool fallback_to_delta) {
     GGML_ASSERT(&ngram_cache != &ngram_cache_delta);
     err.clear();
     if (from_disk) {
@@ -817,7 +887,7 @@ bool common_ngram_cache_sync_file(
     bool loaded = false;
     {
         std::string err_load;
-        switch (common_ngram_cache_load_file(filename, merged, vocab_id, err_load)) {
+        switch (common_ngram_cache_load_file(filename, merged, vocab_id, err_load, max_entries, max_continuations)) {
             case COMMON_NGRAM_CACHE_LOAD_OK:
                 loaded = true;
                 break;
@@ -826,6 +896,9 @@ bool common_ngram_cache_sync_file(
             case COMMON_NGRAM_CACHE_LOAD_CORRUPT:
                 LOG_WRN("%s: existing %s is unusable and will be replaced: %s\n", __func__, filename.c_str(), err_load.c_str());
                 break;
+            case COMMON_NGRAM_CACHE_LOAD_LIMIT:
+                err = err_load + " - not overwriting it";
+                return false;
             case COMMON_NGRAM_CACHE_LOAD_FOREIGN:
                 // a valid cache of another model (or a newer version): overwriting it would destroy someone's data
                 err = err_load + " - not overwriting it";
@@ -833,13 +906,36 @@ bool common_ngram_cache_sync_file(
         }
     }
 
-    if (loaded) {
+    common_ngram_cache & fallback = fallback_to_delta ? ngram_cache_delta : ngram_cache;
+    if (max_entries != UINT64_MAX || max_continuations != UINT64_MAX) {
+        common_ngram_cache_limits limits(merged, max_entries, max_continuations);
+        common_ngram_cache_merge(merged, loaded ? ngram_cache_delta : fallback, 0, &limits);
+    } else if (loaded) {
         common_ngram_cache_merge(merged, ngram_cache_delta);
     } else {
-        merged = ngram_cache;
+        merged = fallback;
     }
 
     common_ngram_cache_prune(merged, n_max);
+
+    // A checkpoint must fit the same quotas used to read it next time.
+    if (max_entries == 0) {
+        merged.clear();
+    } else if (uint64_t(merged.size()) > max_entries) {
+        common_ngram_cache_prune(merged, size_t(max_entries));
+    }
+    if (max_continuations != UINT64_MAX) {
+        uint64_t remaining = max_continuations;
+        for (auto it = merged.begin(); it != merged.end();) {
+            const uint64_t count = it->second.size();
+            if (count > remaining) {
+                it = merged.erase(it);
+            } else {
+                remaining -= count;
+                ++it;
+            }
+        }
+    }
 
     if (!common_ngram_cache_save_file(merged, filename, vocab_id, err)) {
         return false;
@@ -869,14 +965,34 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename) {
     return ngram_cache;
 }
 
-void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add) {
-    for (std::pair<common_ngram, common_ngram_cache_part> ngram_part : ngram_cache_add) {
-        const common_ngram      ngram = ngram_part.first;
-        common_ngram_cache_part  part = ngram_part.second;
+void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add, size_t n_max,
+        common_ngram_cache_limits * limits) {
+    for (const auto & ngram_part : ngram_cache_add) {
+        const common_ngram & ngram = ngram_part.first;
+        const common_ngram_cache_part & part = ngram_part.second;
 
         common_ngram_cache::iterator part_merged_it = ngram_cache_target.find(ngram);
         if (part_merged_it == ngram_cache_target.end()) {
-            ngram_cache_target.emplace(ngram, part);
+            if ((n_max > 0 && ngram_cache_target.size() >= n_max) ||
+                (limits && (ngram_cache_target.size() >= limits->max_entries || limits->continuations_left == 0))) {
+                continue;
+            }
+            if (!limits || part.size() <= limits->continuations_left) {
+                ngram_cache_target.emplace(ngram, part);
+                if (limits && limits->continuations_left != UINT64_MAX) {
+                    limits->continuations_left -= part.size();
+                }
+            } else {
+                common_ngram_cache_part bounded;
+                for (const auto & token_count : part) {
+                    if (bounded.size() == limits->continuations_left) {
+                        break;
+                    }
+                    bounded.insert(token_count);
+                }
+                ngram_cache_target.emplace(ngram, std::move(bounded));
+                limits->continuations_left = 0;
+            }
             continue;
         }
 
@@ -887,11 +1003,42 @@ void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ng
 
             common_ngram_cache_part::iterator token_count_merged_it = part_merged_it->second.find(token);
             if (token_count_merged_it == part_merged_it->second.end()) {
+                if (limits && limits->continuations_left == 0) {
+                    continue;
+                }
                 part_merged_it->second.emplace(token, count);
+                if (limits && limits->continuations_left != UINT64_MAX) {
+                    --limits->continuations_left;
+                }
                 continue;
             }
 
             token_count_merged_it->second += count;
+        }
+    }
+}
+
+void common_ngram_cache_refresh(common_ngram_cache & live, common_ngram_cache & saved, common_ngram_cache & delta, size_t n_max,
+        uint64_t max_entries, uint64_t max_continuations) {
+    GGML_ASSERT(&live != &saved && &live != &delta && &saved != &delta);
+    common_ngram_cache_limits limits(saved, max_entries, max_continuations);
+    common_ngram_cache_merge(saved, delta, n_max, &limits);
+    live.swap(saved);
+    for (auto it = delta.begin(); it != delta.end();) {
+        const auto retained = live.find(it->first);
+        if (retained != live.end()) {
+            for (auto token = it->second.begin(); token != it->second.end();) {
+                if (retained->second.find(token->first) == retained->second.end()) {
+                    token = it->second.erase(token);
+                } else {
+                    ++token;
+                }
+            }
+        }
+        if (retained == live.end() || it->second.empty()) {
+            it = delta.erase(it);
+        } else {
+            ++it;
         }
     }
 }

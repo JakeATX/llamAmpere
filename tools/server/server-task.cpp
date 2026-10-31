@@ -1734,11 +1734,81 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// fork: checkpoint hand-over keeps vector capacity, not just its current length.
+static size_t server_prompt_ram_add(size_t total, size_t part) {
+    return part > SIZE_MAX - total ? SIZE_MAX : total + part;
+}
+
+static size_t server_prompt_checkpoint_ram(const common_prompt_checkpoint & checkpoint) {
+    size_t total = server_prompt_ram_add(checkpoint.data_tgt.capacity(), checkpoint.data_dft.capacity());
+    return server_prompt_ram_add(total, checkpoint.data_spec.capacity());
+}
+
+void server_prompt_cache::configure(std::unique_ptr<server_prompt_cache> & cache, int32_t limit_mib, size_t n_ctx, bool fit_ram) {
+    cache.reset();
+    if (limit_mib > 0) {
+        cache = std::make_unique<server_prompt_cache>(limit_mib, n_ctx);
+        cache->fit_ram = fit_ram;
+        if (fit_ram) {
+            cache->spare_max_n = 0;
+        }
+    }
+}
+
+size_t server_prompt_cache::live_ram_budget() const {
+    if (!fit_ram) {
+        return SIZE_MAX;
+    }
+    uint64_t total = 0, available = 0;
+    if (available_ram) {
+        available = available_ram();
+    } else if (!common_host_memory(total, available)) {
+        return 0;
+    }
+    const uint64_t floor = 5ull << 30;
+    const uint64_t spare = available > floor ? available - floor : 0;
+    return (size_t) std::min<uint64_t>(SIZE_MAX, spare - spare / 5);
+}
+
+size_t server_prompt_cache::disk_read_budget() const {
+    if (!fit_ram) {
+        return SIZE_MAX;
+    }
+    const size_t used = server_prompt_ram_add(size(), spare_size());
+    return std::min(limit_size > used ? limit_size - used : 0, live_ram_budget());
+}
+
+bool server_prompt_cache::reserve_ram(size_t extra) {
+    if (!fit_ram) {
+        return true;
+    }
+    if (extra > limit_size) {
+        return false;
+    }
+    spare.clear();
+    while (!states.empty() && size() > limit_size - extra) {
+        evict_front();
+    }
+    return extra <= disk_read_budget();
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.size();
+        if (!fit_ram) {
+            res += state.size();
+            continue;
+        }
+        for (const size_t part : {state.data.main.capacity(), state.data.drft.capacity(), state.data.spec.capacity(),
+                state.prompt.tokens.capacity() * sizeof(llama_token), state.prompt.lora_scales.capacity() * sizeof(float),
+                sizeof(server_prompt_cache_state) + 2 * sizeof(void *)}) {
+            res = server_prompt_ram_add(res, part);
+        }
+        for (const auto & checkpoint : state.prompt.checkpoints) {
+            res = server_prompt_ram_add(res, server_prompt_checkpoint_ram(checkpoint));
+            res = server_prompt_ram_add(res, sizeof(checkpoint) + 2 * sizeof(void *));
+        }
     }
 
     return res;
@@ -1764,7 +1834,7 @@ bool server_prompt_cache::holds(const server_prompt_cache_state * state) const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
-        std::list<common_prompt_checkpoint> * hand_over, size_t state_size_spec) {
+        std::list<common_prompt_checkpoint> * hand_over, std::vector<uint8_t> state_data_spec) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1780,14 +1850,42 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     const bool ckpt_thin = ckpt_kept.size() < prompt.checkpoints.size();
     size_t checkpoints_size     = 0;
     size_t checkpoints_size_all = 0;
+    size_t checkpoints_ram_size = 0;
     for (const auto * ckpt : ckpt_kept) {
         checkpoints_size += ckpt->size();
+        checkpoints_ram_size = server_prompt_ram_add(checkpoints_ram_size,
+                fit_ram ? server_prompt_checkpoint_ram(*ckpt) : ckpt->size());
     }
     for (const auto & ckpt : prompt.checkpoints) {
         checkpoints_size_all += ckpt.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + state_size_spec + checkpoints_size;
+    const size_t state_size_spec = fit_ram ? state_data_spec.capacity() : state_data_spec.size();
+    size_t state_size_new = 0;
+    for (const size_t part : {state_size_tgt, state_size_dft, state_size_spec, checkpoints_ram_size}) {
+        if (part > SIZE_MAX - state_size_new) {
+            return nullptr;
+        }
+        state_size_new += part;
+    }
+    if (fit_ram) {
+        // Media chunk copies have no byte-size API; keep them in the live slot.
+        if (prompt.tokens.has_media()) {
+            return nullptr;
+        }
+        for (const size_t part : {prompt.tokens.size() * sizeof(llama_token), prompt.lora_scales.size() * sizeof(float),
+                sizeof(server_prompt_cache_state) + 2 * sizeof(void *),
+                ckpt_kept.size() * (sizeof(common_prompt_checkpoint) + 2 * sizeof(void *))}) {
+            if (part > SIZE_MAX - state_size_new) {
+                return nullptr;
+            }
+            state_size_new += part;
+        }
+        if (!reserve_ram(state_size_new)) {
+            SRV_WRN("%s", "prompt cache save skipped to keep its RAM budget and leave 5 GiB free\n");
+            return nullptr;
+        }
+    }
 
     // skip over-limit entries to avoid disturbing the cache; with a disk tier they go straight to disk instead
     if (limit_size > 0 && state_size_new > limit_size) {
@@ -1801,7 +1899,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                 staging.prompt.lora_scales = prompt.lora_scales;
                 staging.data.main.resize(state_size_tgt);
                 staging.data.drft.resize(state_size_dft);
-                staging.data.spec.resize(state_size_spec);
+                staging.data.spec = std::move(state_data_spec);
             } catch (const std::bad_alloc & e) {
                 SRV_ERR("failed to allocate memory for the staged prompt state: %s\n", e.what());
                 staging = server_prompt_cache_state();
@@ -1849,7 +1947,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
-    std::vector<uint8_t> state_data_spec;
     std::list<common_prompt_checkpoint> checkpoints_ram;
 
     // check if we can allocate enough memory for the new state
@@ -1862,7 +1959,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
         state_data_tgt = take_buffer(state_size_tgt);
         state_data_dft = take_buffer(state_size_dft);
-        state_data_spec.resize(state_size_spec);
         trim_spare(state_size_new);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
@@ -2001,14 +2097,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 continue; // another model or KV configuration
             }
 
-            const server_tokens tmp(it->tokens, false);
-
-            const int lcp_cur = tmp.get_common_prefix(tokens_new);
+            // fork: scan the text index without a full token copy before RAM admission.
+            size_t lcp_cur = 0;
+            const size_t n = std::min(it->tokens.size(), tokens_new.size());
+            while (lcp_cur < n && it->tokens[lcp_cur] == tokens_new[lcp_cur]) {
+                ++lcp_cur;
+            }
 
             const float f_keep_cur = float(lcp_cur) / it->tokens.size();
             const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-            SRV_TRC("   - disk prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+            SRV_TRC("   - disk prompt with length %7zu, lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
             if (f_keep_cur < 0.25f) {
                 continue;
@@ -2051,7 +2150,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         // the file stays on disk: it is FIFO-evicted, or superseded once a longer prompt with this prefix is written
         server_prompt_disk_record rec;
-        if (!disk.read(it_best_disk, rec)) {
+        const size_t budget = disk_read_budget();
+        if ((fit_ram && budget == 0) || !disk.read(it_best_disk, rec, budget)) {
             SRV_WRN("%s", " - failed to read prompt from the disk tier\n");
 
             return false;
@@ -2123,7 +2223,7 @@ std::vector<uint8_t> server_prompt_cache::take_buffer(size_t n) {
         res.resize(n); // within capacity: only the bytes past the old size are written
         return res;
     }
-    res.reserve(n + n/8);
+    res.reserve(fit_ram ? n : n + n/8);
     res.resize(n);
     return res;
 }
@@ -2285,7 +2385,15 @@ bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
         return false;
     }
 
-    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints, state.data.spec, state.prompt.lora_scales);
+    const size_t budget = live_ram_budget();
+    const size_t token_bytes = state.prompt.tokens.size() * sizeof(llama_token);
+    // Check before get_text_tokens() copies the slot tokens or the writer scans/allocates.
+    if (fit_ram && (token_bytes > budget || budget - token_bytes < (4u << 20) + 8192)) {
+        SRV_WRN("%s", "prompt cache disk spill skipped to leave 5 GiB free\n");
+        return false;
+    }
+    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints,
+            state.data.spec, state.prompt.lora_scales, fit_ram ? budget - token_bytes : SIZE_MAX);
 }
 
 void server_prompt_cache::flush_to_disk() {

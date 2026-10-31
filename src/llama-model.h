@@ -8,6 +8,7 @@
 #include "llama-vocab.h"
 
 #include <map>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -814,6 +815,8 @@ struct llama_model {
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
+    // Shared by all contexts: optional later read-ahead cannot reuse spent RAM.
+    mutable std::atomic<size_t> prefetch_remaining{SIZE_MAX};
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
@@ -833,6 +836,7 @@ struct llama_model {
 
     size_t size() const; // file size
     size_t moe_arena_size() const;
+    bool ram_fit_enabled() const { return params.fit_ram; }
     void moe_resident_init(ggml_backend_dev_t device, const ggml_moe_cache_tensor_desc * tensors, int count) const;
     size_t n_tensors() const;
     size_t n_devices() const;

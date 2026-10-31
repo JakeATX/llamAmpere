@@ -4,6 +4,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-arena.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include <algorithm>
@@ -263,6 +264,27 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
 
     size_t staging_alignment = 1;
     for (const auto & e : exps) { staging_alignment = std::max(staging_alignment, e.src.alignment); }
+    zero_size = 4096;
+    for (const auto & e : exps) {
+        zero_size = std::max(zero_size, b1_align_up(e.alloc - e.nbytes, 4096));
+    }
+    if (model.ram_fit_enabled()) {
+        const bool explicit_size = staging_explicit();
+        const size_t available = llama_moe_arena::available_memory();
+        if (explicit_size && staging_floor_unmet(available, n_workers, piece_bytes, staging_alignment, zero_size)) {
+            LLAMA_LOG_WARN("RAM fit: explicit prefill staging sizes were kept, but available RAM cannot guarantee 5 GiB free\n");
+        }
+        const size_t fitted = fit_staging_piece(available, n_workers, piece_bytes, staging_alignment,
+                zero_size, true, explicit_size);
+        if (!fitted) {
+            LLAMA_LOG_INFO("RAM fit: prefill staging disabled because RAM cannot cover its buffers while leaving 5 GiB free\n");
+            return;
+        }
+        if (fitted < piece_bytes) {
+            LLAMA_LOG_INFO("RAM fit: prefill staging reduced to %.2f MiB per slot to leave 5 GiB free and reserve RAM for other caches\n", fitted / 1048576.0);
+        }
+        piece_bytes = fitted;
+    }
     stg.resize(n_workers);
     for (auto & w : stg) {
         w.resize(2);
@@ -277,10 +299,6 @@ llama_b1::llama_b1(const llama_model & model, ggml_backend_t backend_gpu) : mode
         }
     }
 
-    zero_size = 4096;
-    for (const auto & e : exps) {
-        zero_size = std::max(zero_size, b1_align_up(e.alloc - e.nbytes, 4096));
-    }
     zero_buf = ggml_backend_buft_alloc_buffer(buft_host, zero_size);
     if (zero_buf == nullptr) {
         LLAMA_LOG_WARN("%s: [B1] cannot allocate the pinned zero buffer, B1 is off\n", __func__);

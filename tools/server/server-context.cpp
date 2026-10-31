@@ -791,8 +791,20 @@ struct server_slot {
             return nullptr;
         }
 
+        const size_t spec_bytes = common_speculative_get_state_size(spec, id);
+        if (prompt_cache.fit_ram && (spec_bytes == SIZE_MAX || !prompt_cache.reserve_ram(spec_bytes))) {
+            SRV_WRN("%s", "prompt cache save skipped before speculative state copy to leave 5 GiB free\n");
+            return nullptr;
+        }
         std::vector<uint8_t> spec_state;
         common_speculative_get_state(spec, id, spec_state);
+        if (prompt_cache.fit_ram && spec_state.size() != spec_bytes) {
+            SRV_WRN("%s", "prompt cache save skipped: speculative state size changed\n");
+            return nullptr;
+        }
+        if (cur_size_tgt > SIZE_MAX - cur_size_dft || spec_state.size() > SIZE_MAX - cur_size_tgt - cur_size_dft) {
+            return nullptr;
+        }
         const size_t cur_size = cur_size_tgt + cur_size_dft + spec_state.size();
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
@@ -800,12 +812,10 @@ struct server_slot {
 
         const int64_t t_start = ggml_time_us();
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, hand_over_ckpts ? &prompt.checkpoints : nullptr, spec_state.size());
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, hand_over_ckpts ? &prompt.checkpoints : nullptr, std::move(spec_state));
         if (cur == nullptr) {
             return nullptr;
         }
-
-        cur->data.spec = std::move(spec_state);
 
         const int64_t t_alloc = ggml_time_us();
 
@@ -2379,12 +2389,28 @@ private:
             }
 
             if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                if (!params_base.speculative.ngram_cache.lookup_cache_static.empty() ||
+                if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                            COMMON_SPECULATIVE_TYPE_NGRAM_CACHE) != params_base.speculative.types.end() ||
+                    !params_base.speculative.ngram_cache.lookup_cache_static.empty() ||
                     !params_base.speculative.ngram_cache.lookup_cache_dynamic.empty()) {
                     // identity of the target vocab, so that a lookup cache file built for another model is refused
                     const auto vocab_id = common_ngram_cache_get_vocab_id(vocab);
                     params_base.speculative.ngram_cache.vocab_n_tokens = vocab_id.n_tokens;
                     params_base.speculative.ngram_cache.vocab_hash     = vocab_id.hash;
+                    uint64_t total_ram = 0, available_ram = 0;
+                    if (params_base.fit_params) {
+                        common_host_memory(total_ram, available_ram);
+                    }
+                    auto & cache_params = params_base.speculative.ngram_cache;
+                    common_fit_ngram_cache_load_limits(available_ram, params_base.fit_params, cache_params, params_base.n_parallel);
+                    if (params_base.fit_params) {
+                        SRV_INF("%s", available_ram <= (5ull << 30) ?
+                            "available RAM is low or unknown; automatic lookup caches cannot add entries to retain system headroom\n" :
+                            "automatic lookup caches share RAM count limits across files and slots; files over the limits are skipped\n");
+                        if (cache_params.max_ngrams_dynamic_explicit && !cache_params.lookup_cache_dynamic.empty()) {
+                            SRV_WRN("%s", "explicit dynamic lookup size bypasses RAM load fitting; the 5 GiB floor cannot be guaranteed\n");
+                        }
+                    }
                 }
 
                 try {
@@ -2485,39 +2511,39 @@ private:
             params_base.cache_ram_mib = 0;
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            int32_t cache_ram_mib = params_base.cache_ram_mib;
-            if (cache_ram_mib == COMMON_CACHE_RAM_AUTO) {
-                // no --cache-ram: size the RAM tier from the host's total memory, clamped to half of what is free
-                uint64_t total_host = 0, avail_host = 0;
-                common_host_memory(total_host, avail_host);
-                std::string why;
-                cache_ram_mib = common_prompt_cache_ram_auto_mib(total_host, avail_host, why);
-                if (llama_model_moe_arena_size(model_tgt) > 0) {
-                    const uint64_t reserve = 11ull << 30;
-                    const uint64_t spare = avail_host > reserve ? avail_host - reserve : 0;
-                    cache_ram_mib = (int32_t)std::min<uint64_t>(cache_ram_mib, spare >> 20);
-                    why += ", expert arena keeps 11 GiB host headroom";
-                }
-                SRV_INF("prompt cache RAM tier: %d MiB (auto: %s; set --cache-ram N to override, 0 disables the prompt cache)\n",
-                        cache_ram_mib, why.c_str());
-            } else if (cache_ram_mib < 0) {
-                // "no limit" must still be bounded by the machine: every cached prompt is a full copy of a
-                // sequence's KV state in host memory (14 GiB for a 220k-token f16 cache on a 27B model),
-                // and an unbounded cache swaps the box to death long before it helps anyone.
-                // Take half of what the host has free when the server starts.
-                size_t free_host = 0, total_host = 0;
+        // Drop the old RAM tier before the wake-up snapshot and size it afresh.
+        prompt_cache.reset();
+        int32_t cache_ram_mib = params_base.cache_ram_mib;
+        if (cache_ram_mib != 0) {
+            // Snapshot after the target/draft contexts, speculative state and batch
+            // have loaded. Existing bank/staging RAM is already debited here.
+            uint64_t total_host = 0, avail_host = 0;
+            common_host_memory(total_host, avail_host);
+            size_t explicit_free = 0, explicit_total = 0;
+            if (cache_ram_mib < 0 && cache_ram_mib != COMMON_CACHE_RAM_AUTO) {
                 if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
-                    ggml_backend_dev_memory(cpu_dev, &free_host, &total_host);
+                    ggml_backend_dev_memory(cpu_dev, &explicit_free, &explicit_total);
                 }
-                cache_ram_mib = free_host > 0 ? (int32_t) std::min<size_t>(free_host / 2 / (1024*1024), INT32_MAX) : 8192;
-                SRV_INF("prompt cache is enabled with no explicit limit, bounding it to %d MiB (half of the %.1f GiB of free host memory)\n",
-                        cache_ram_mib, free_host / (1024.0*1024.0*1024.0));
-            } else {
-                SRV_INF("prompt cache is enabled, size limit: %d MiB\n", cache_ram_mib);
             }
+            std::string why;
+            cache_ram_mib = common_fit_prompt_cache_ram_mib(total_host, avail_host,
+                    cache_ram_mib, params_base.fit_params, why, explicit_free);
+            if (!params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO &&
+                    llama_model_moe_arena_size(model_tgt) > 0) {
+                const uint64_t reserve = 11ull << 30;
+                const uint64_t spare = avail_host > reserve ? avail_host - reserve : 0;
+                cache_ram_mib = (int32_t) std::min<uint64_t>(cache_ram_mib, spare >> 20);
+                why += ", expert arena keeps 11 GiB host headroom";
+            }
+            SRV_INF("prompt cache RAM tier: %d MiB (%s; set --cache-ram N to override, 0 disables it)\n",
+                    cache_ram_mib, why.c_str());
+        }
 
-            prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx);
+        // server_prompt_cache(0) means unlimited internally, so never construct
+        // it when RAM fit disables this optional cache.
+        server_prompt_cache::configure(prompt_cache, cache_ram_mib, n_ctx,
+                params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO);
+        if (prompt_cache) {
 
             prompt_cache->ram_ckpt_keep = (size_t) params_base.cache_ram_ckpt;
             if (params_base.cache_ram_ckpt > 0) {
@@ -2550,14 +2576,19 @@ private:
                 SRV_INF("%s", "prompt cache disk tier is disabled\n");
             }
         } else {
-            SRV_INF("%s", "prompt cache is disabled (--cache-ram 0)\n");
+            SRV_INF("%s", "prompt cache is disabled (explicit setting or RAM fit)\n");
         }
 
         // [EVALFLAG] eval cache: a folder of pre-built prompt states; a folder built for other settings is refused
         if (!params_base.eval_cache_path.empty()) {
             eval_cache = std::make_unique<server_eval_cache>();
             std::string err;
-            if (!eval_cache->open(params_base.eval_cache_path, prompt_cache_key(true), params_base.eval_cache_build, err)) {
+            uint64_t total_ram = 0, available_ram = 0;
+            if (params_base.fit_params) {
+                common_host_memory(total_ram, available_ram);
+            }
+            const uint64_t index_budget = common_fit_eval_cache_ram_bytes(available_ram, params_base.fit_params);
+            if (!eval_cache->open(params_base.eval_cache_path, prompt_cache_key(true), params_base.eval_cache_build, err, index_budget)) {
                 SRV_ERR("eval cache: refusing to start: %s\n", err.c_str());
                 eval_cache.reset();
                 return false;
@@ -2655,9 +2686,8 @@ private:
         stall_watch_start();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
-                params_base.cache_idle_slots = false;
+            if (!prompt_cache) {
+                SRV_WRN("%s", "idle-slot prompt saves are off while the prompt RAM cache is disabled\n");
             } else {
                 if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
@@ -2939,7 +2969,17 @@ private:
     // covers more than the slot can already reuse. The slot's previous content goes to the prompt cache first.
     void eval_cache_load(server_slot & slot, const server_task & task) {
         const size_t have = eval_cache_slot_reuse(slot, task.tokens);
-        const llama_tokens tokens = task.tokens.get_text_tokens();
+        uint64_t total_ram = 0, available_ram = 0;
+        if (params_base.fit_params) {
+            common_host_memory(total_ram, available_ram);
+        }
+        const uint64_t record_budget = common_fit_eval_cache_load_bytes(available_ram, params_base.fit_params, task.tokens.size());
+        if (record_budget == 0) {
+            SRV_WRN("slot %d: eval cache: restore token buffer exceeds the current RAM fit budget; using fresh prefill\n", slot.id);
+            return;
+        }
+        const llama_tokens & tokens = task.tokens.get_tokens();
+        const size_t n_prompt_tokens = tokens.size() - std::count(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL);
         const int idx = eval_cache->find(tokens, have);
         if (idx < 0) {
             return;
@@ -2950,7 +2990,7 @@ private:
 
         server_eval_cache_record rec;
         std::string err;
-        if (!eval_cache->read_header(e.id, rec, err)) {
+        if (!eval_cache->read_header(e.id, rec, err, record_budget)) {
             SRV_WRN("slot %d: eval cache: entry %s unusable: %s\n", slot.id, e.id.c_str(), err.c_str());
             return;
         }
@@ -2989,7 +3029,7 @@ private:
             return;
         }
 
-        slot.prompt.tokens = server_tokens(e.tokens, false);
+        slot.prompt.tokens = server_tokens(std::move(rec.tokens), false);
         slot.eval_cache_restored = true;
         slot.loop_guard = {};
         slot.prompt.checkpoints = std::move(rec.checkpoints);
@@ -3002,15 +3042,48 @@ private:
         n_eval_cache_tokens += e.tokens.size();
 
         SRV_INF("slot %d: eval cache: restored entry %s, %zu of %zu prompt tokens (slot could reuse %zu), %.3f MiB in %.2f ms\n",
-                slot.id, e.id.c_str(), e.tokens.size(), tokens.size(), have, e.bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
+                slot.id, e.id.c_str(), e.tokens.size(), n_prompt_tokens, have, e.bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
     }
 
     // [EVALFLAG] builder: store the slot's state (the first n_tokens prompt tokens, already decoded) as an entry
     bool eval_cache_save(server_slot & slot, int64_t n_tokens) {
         const int64_t t_start = ggml_time_us();
 
-        llama_tokens tokens = slot.prompt.tokens.get_text_tokens();
+        const size_t spec_bytes = common_speculative_get_state_size(spec.get(), slot.id);
+        uint64_t total_ram = 0, available_ram = 0;
+        if (params_base.fit_params) {
+            common_host_memory(total_ram, available_ram);
+        }
+        if (n_tokens < 0 || uint64_t(n_tokens) > slot.prompt.tokens.size() || spec_bytes == SIZE_MAX ||
+                !common_fit_eval_cache_save_fits(available_ram, params_base.fit_params, uint64_t(n_tokens), spec_bytes)) {
+            SLT_ERR(slot, "%s", "eval cache: entry was not saved because its temporary copies exceed the current RAM fit budget or its size is invalid\n");
+            return false;
+        }
+
+        llama_tokens tokens = slot.prompt.tokens.get_text_tokens(size_t(n_tokens));
+        if (uint64_t(n_tokens) > tokens.size()) {
+            SLT_ERR(slot, "%s", "eval cache: entry has fewer text tokens than requested\n");
+            return false;
+        }
         tokens.resize(n_tokens);
+
+        const size_t n_checkpoints = std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                [n_tokens](const common_prompt_checkpoint & c) { return c.n_tokens <= n_tokens; });
+        std::vector<uint8_t> spec_state;
+        common_speculative_get_state(spec.get(), slot.id, spec_state);
+        if (spec_state.size() != spec_bytes) {
+            SLT_ERR(slot, "%s", "eval cache: speculative state size changed during save\n");
+            return false;
+        }
+        if (params_base.fit_params) {
+            common_host_memory(total_ram, available_ram);
+        }
+        const uint64_t index_budget = common_fit_eval_cache_ram_bytes(available_ram, params_base.fit_params);
+        std::string err;
+        if (!eval_cache->can_add(tokens, slot.prompt.checkpoints, spec_state.size(), err, n_tokens, index_budget)) {
+            SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());
+            return false;
+        }
 
         const std::string id   = server_eval_cache::entry_id(tokens);
         const std::string ptgt = eval_cache->path_tgt(id);
@@ -3038,19 +3111,8 @@ private:
             return false;
         }
 
-        // checkpoints the prompt has so far, so that a restored prompt makes the same checkpoint and batch decisions
-        std::list<common_prompt_checkpoint> ckpts;
-        for (const auto & c : slot.prompt.checkpoints) {
-            if (c.n_tokens <= n_tokens) {
-                ckpts.push_back(c);
-            }
-        }
-        std::vector<uint8_t> spec_state;
-        common_speculative_get_state(spec.get(), slot.id, spec_state);
-
         std::string out_id;
-        std::string err;
-        if (!eval_cache->add(tokens, ckpts, spec_state, has_dft, out_id, err)) {
+        if (!eval_cache->add(tokens, slot.prompt.checkpoints, spec_state, has_dft, out_id, err, n_tokens, index_budget)) {
             SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());
             return false;
         }
@@ -3062,7 +3124,7 @@ private:
             }
         }
         SLT_INF(slot, "eval cache: stored entry %s, %" PRId64 " tokens, %zu checkpoints, %.3f MiB in %.2f ms\n",
-                out_id.c_str(), n_tokens, ckpts.size(), bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
+                out_id.c_str(), n_tokens, n_checkpoints, bytes / (1024.0*1024.0), (ggml_time_us() - t_start) / 1000.0);
         return true;
     }
 
@@ -4307,7 +4369,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && prompt_cache) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -5863,7 +5925,7 @@ private:
                         // Leave a logits tail and keep the cold prefill's physical batch and record boundaries.
                         const int64_t at = std::min<int64_t>(slot.task->params.eval_cache_save_at, n_task - 1);
                         eval_cache_end = sj_kvarn_ckpt_floor(at - at % n_ubatch);
-                        if (eval_cache_end > 0 && eval_cache->find(input_tokens.get_text_tokens(), eval_cache_end - 1) >= 0) {
+                        if (eval_cache_end > 0 && eval_cache->find(input_tokens.get_tokens(), eval_cache_end - 1) >= 0) {
                             eval_cache_end = 0;
                         }
                     }

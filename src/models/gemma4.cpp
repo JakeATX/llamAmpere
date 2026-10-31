@@ -445,13 +445,14 @@ public:
 
         if (ubatch->token) {
             if (prefetch) {
-                llama_prefetch_rows(ple, ubatch->token, ubatch->n_tokens);
+                llama_prefetch_rows(ple, ubatch->token, ubatch->n_tokens,
+                        model.ram_fit_enabled() ? &model.prefetch_remaining : nullptr);
             }
             ggml_backend_tensor_set(tokens, ubatch->token, 0, ubatch->n_tokens * ggml_element_size(tokens));
         } else if (prefetch) {
             // [TAG_GEMMA4_IMG_PADDING]
             const int32_t padding = 0;
-            llama_prefetch_rows(ple, &padding, 1);
+            llama_prefetch_rows(ple, &padding, 1, model.ram_fit_enabled() ? &model.prefetch_remaining : nullptr);
         }
     }
 

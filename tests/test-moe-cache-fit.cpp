@@ -92,6 +92,55 @@ int main() {
     }
 
     {
+        constexpr size_t GiB = 1024*MiB;
+        for (size_t margin : {300*MiB, 800*MiB, 3*GiB, 5*GiB}) {
+            const std::vector<common_moe_cache_fit_device_input> devices = {
+                {0, 860, 8*(int64_t)GiB, 2*GiB, margin},
+            };
+            const size_t reserve = margin > 3*GiB ? margin : 3*GiB;
+            const auto result = common_moe_cache_plan_fit(devices, one_pool, 3*GiB, 0, 1);
+            expect(result.feasible && result.devices.size() == 1, "fit and cache headroom should leave a usable pool");
+            if (result.devices.size() == 1) {
+                expect(result.devices[0].reserve_bytes == reserve, "larger fit or provider reserve should win");
+                expect(result.cache_bytes == 6*GiB - reserve, "fit must charge shared free-memory headroom only once");
+            }
+            const auto capped = common_moe_cache_plan_fit(devices, one_pool, 3*GiB, 64*MiB, 1);
+            expect(capped.feasible && capped.cache_bytes == 64*MiB, "explicit pool budget still wins after headroom");
+        }
+
+        const size_t minimum = 5*MiB/4;
+        std::vector<common_moe_cache_fit_device_input> boundary = {
+            {0, 860, (int64_t)(2*GiB + 3*GiB + minimum), 2*GiB, 800*MiB},
+        };
+        const auto exact = common_moe_cache_plan_fit(boundary, one_pool, 3*GiB, 0, 1);
+        expect(exact.feasible && exact.cache_bytes == minimum, "overlapping headroom must not reject a complete pool at its exact boundary");
+        boundary[0].free_bytes--;
+        expect(!common_moe_cache_plan_fit(boundary, one_pool, 3*GiB, 0, 1).feasible, "one byte below the shared-headroom pool floor must fail");
+        for (size_t margin : {6*GiB, std::numeric_limits<size_t>::max()}) {
+            boundary[0] = {0, 860, 8*(int64_t)GiB, 2*GiB, margin};
+            expect(!common_moe_cache_plan_fit(boundary, one_pool, 3*GiB, 0, 1).feasible, "exhausted or hostile fit margin must fail without unsigned wrap");
+        }
+    }
+
+    {
+        const std::vector<common_moe_cache_fit_device_input> aliases = {
+            {7, 860, 11*(int64_t)MiB, 2*MiB, 2*MiB},
+            {7, 750, 10*(int64_t)MiB, 3*MiB, 3*MiB},
+        };
+        for (const auto & devices : {aliases, std::vector<common_moe_cache_fit_device_input>{aliases[1], aliases[0]}}) {
+            const auto result = common_moe_cache_plan_fit(devices, one_pool, MiB, 0, 1);
+            expect(result.feasible && result.devices.size() == 1 && result.cache_bytes == 2*MiB,
+                    "aliases must combine used bytes, keep minimum free bytes and charge the largest margin once in either order");
+        }
+        const std::vector<common_moe_cache_fit_device_input> distinct = {
+            {0, 860, 10*(int64_t)MiB, 2*MiB, 2*MiB},
+            {1, 860, 10*(int64_t)MiB, 2*MiB, 3*MiB},
+        };
+        const auto result = common_moe_cache_plan_fit(distinct, one_pool, MiB, 0, 2);
+        expect(result.feasible && result.devices.size() == 2 && result.cache_bytes == 11*MiB, "distinct cards keep independent fit floors");
+    }
+
+    {
         const std::vector<common_moe_cache_fit_shape_input> mixed = {
             shape(GGML_TYPE_Q4_0, MiB, 100*MiB, MiB, 2*MiB),
             shape(GGML_TYPE_Q4_0, MiB, 100*MiB, MiB/2, 3*MiB),

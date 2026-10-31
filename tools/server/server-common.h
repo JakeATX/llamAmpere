@@ -189,7 +189,7 @@ public:
     const llama_token& operator[](size_t index) const { return tokens[index]; }
 
     server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd);
-    server_tokens(const llama_tokens & tokens, bool has_mtmd);
+    server_tokens(llama_tokens tokens, bool has_mtmd);
 
     // for debugging
     std::string str() const;
@@ -224,7 +224,7 @@ public:
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
 
-    llama_tokens get_text_tokens() const;
+    llama_tokens get_text_tokens(size_t n_max = SIZE_MAX) const;
 
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
@@ -233,6 +233,9 @@ public:
     void set_token(llama_pos pos, llama_token id);
 
     size_t size() const { return tokens.size(); }
+
+    // Backing token storage, also valid when a projector is loaded.
+    size_t capacity() const { return tokens.capacity(); }
 
     bool empty() const { return tokens.empty(); }
 

@@ -1,5 +1,6 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
+#include "llama-moe-arena.h"
 
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -27,7 +28,8 @@ struct llama_logger_state {
 
 static llama_logger_state g_logger_state;
 
-void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
+void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows,
+                         std::atomic<size_t> * remaining) {
     if (!tensor || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || n_rows == 0) {
         return;
     }
@@ -44,7 +46,12 @@ void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_
         mr.push_back({ base + (size_t) rows[i] * tensor->nb[1], row_bytes });
     }
 
-    llama_prefetch(std::move(mr));
+    uint64_t available = 0;
+    if (remaining) {
+        try { available = llama_moe_arena::available_memory(); }
+        catch (...) { /* Unknown RAM disables optional read-ahead. */ }
+    }
+    llama_prefetch(std::move(mr), remaining, available);
 }
 
 time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}

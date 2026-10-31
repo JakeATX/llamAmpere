@@ -687,6 +687,14 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
     }
 
+    static void configure(std::unique_ptr<server_prompt_cache> & cache, int32_t limit_mib, size_t n_ctx, bool fit_ram);
+
+    bool fit_ram = false;
+    std::function<uint64_t()> available_ram;
+    bool reserve_ram(size_t extra);
+    size_t disk_read_budget() const;
+    size_t live_ram_budget() const;
+
     std::list<server_prompt_cache_state> states;
 
     // in bytes, 0 = no limit
@@ -738,7 +746,7 @@ struct server_prompt_cache {
     // [#187] hand_over: the entry takes these checkpoints by move instead of copying them (the caller is about to
     // replace or cut its prompt); see server_slot::prompt_reclaim_checkpoints for the way back
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
-            std::list<common_prompt_checkpoint> * hand_over = nullptr, size_t state_size_spec = 0);
+            std::list<common_prompt_checkpoint> * hand_over = nullptr, std::vector<uint8_t> state_data_spec = {});
 
     // [#187] true while `state` is a RAM entry of this cache (not loaded, evicted or staged)
     bool holds(const server_prompt_cache_state * state) const;

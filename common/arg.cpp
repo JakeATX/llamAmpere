@@ -1804,12 +1804,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lookup-cache-dynamic-max-ngrams"}, "N",
-        string_format("maximum number of n-grams kept in the dynamic lookup cache when it is saved, the least useful ones are evicted, 0 = unlimited (default: %d)", params.speculative.ngram_cache.max_ngrams_dynamic),
+        string_format("maximum n-gram keys learned in the live dynamic lookup cache and kept when saving; full caches still update existing keys, saves evict by utility, 0 = unlimited (default: %d)", params.speculative.ngram_cache.max_ngrams_dynamic),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("lookup cache max ngrams must be >= 0");
             }
             params.speculative.ngram_cache.max_ngrams_dynamic = value;
+            params.speculative.ngram_cache.max_ngrams_dynamic_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -1892,7 +1893,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         "maximum RAM size of the prompt cache in MiB (default: sized from total host RAM: <16 GB 2048, 16 GB 4096, "
-        "32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; "
+        "32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; --fit also reserves 5 GiB and shared RAM headroom; "
         "-1 = half of the free host memory at startup, 0 = disable)"
         "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)",
         [](common_params & params, int value) {
@@ -3557,7 +3558,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
-            "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),
+            "single value is broadcast across all devices; automatic: 300 MiB headless, 800 MiB with a display or unknown display state"),
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 
@@ -3570,13 +3571,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
                 );
             }
-            if (split_arg.size() == 1) {
-                std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), std::stoull(split_arg[0]) * 1024*1024);
+            std::vector<size_t> targets;
+            for (const std::string & part : split_arg) {
+                if (part.empty() || part.find_first_not_of("0123456789") != std::string::npos) {
+                    throw std::invalid_argument("fit target must be a nonnegative whole number of MiB");
+                }
+                const uint64_t mib = std::stoull(part);
+                if (mib > std::min<uint64_t>(SIZE_MAX, INT64_MAX) / (1024 * 1024)) {
+                    throw std::invalid_argument("fit target exceeds the supported size");
+                }
+                targets.push_back(size_t(mib) * 1024 * 1024);
+            }
+            if (targets.size() == 1) {
+                std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), targets[0]);
+                params.fit_params_target_explicit = true;
                 return;
             }
-            for (size_t i = 0; i < split_arg.size(); i++) {
-                params.fit_params_target[i] = std::stoull(split_arg[i]) * 1024*1024;
+            for (size_t i = 0; i < targets.size(); i++) {
+                params.fit_params_target[i] = targets[i];
             }
+            params.fit_params_target_explicit = true;
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
     add_opt(common_arg(

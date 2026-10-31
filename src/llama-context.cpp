@@ -1337,7 +1337,8 @@ struct llama_ple_hinter {
                 rows.swap(queue);
                 queue.clear();
             }
-            llama_prefetch_rows(model.per_layer_tok_embd, rows.data(), rows.size());
+            llama_prefetch_rows(model.per_layer_tok_embd, rows.data(), rows.size(),
+                    model.ram_fit_enabled() ? &model.prefetch_remaining : nullptr);
             rows.clear();
         }
     }

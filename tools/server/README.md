@@ -87,7 +87,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ts, --tensor-split N0,N1,N2,...` | fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1<br/>(env: LLAMA_ARG_TENSOR_SPLIT) |
 | `-mg, --main-gpu INDEX` | the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: 0)<br/>(env: LLAMA_ARG_MAIN_GPU) |
 | `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
-| `-fitt, --fit-target MiB0,MiB1,MiB2,...` | target margin per device for --fit, comma-separated list of values, single value is broadcast across all devices, default: 1024<br/>(env: LLAMA_ARG_FIT_TARGET) |
+| `-fitt, --fit-target MiB0,MiB1,MiB2,...` | target margin per device for --fit, comma-separated list of values, single value is broadcast across all devices; automatic: 300 MiB headless, 800 MiB with a display or unknown display state; explicit values take priority<br/>(env: LLAMA_ARG_FIT_TARGET) |
 | `-fitc, --fit-ctx N` | minimum ctx size that can be set by --fit option, default: 4096<br/>(env: LLAMA_ARG_FIT_CTX) |
 | `--check-tensors` | check model tensor data for invalid values (default: false) |
 | `--override-kv KEY=TYPE:VALUE,...` | advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.<br/>types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false,tokenizer.ggml.add_eos_token=bool:false |
@@ -164,7 +164,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
 | `--lookup-cache-dynamic-save` | write the dynamic lookup cache back to the file given by --lookup-cache-dynamic, so lookup decoding starts warm on the next run; the file then contains n-grams of the served conversations (default: false) |
 | `--lookup-cache-dynamic-save-interval N` | seconds between checkpoints of the dynamic lookup cache, written in the background, 0 = only at shutdown (default: 300) |
-| `--lookup-cache-dynamic-max-ngrams N` | maximum number of n-grams kept in the dynamic lookup cache when it is saved, the least useful ones are evicted, 0 = unlimited (default: 1000000) |
+| `--lookup-cache-dynamic-max-ngrams N` | maximum n-gram keys learned in the live dynamic lookup cache and kept when saving; full caches still update existing keys, saves evict by utility, 0 = unlimited (default: 1000000) |
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |

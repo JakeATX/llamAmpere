@@ -2168,9 +2168,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const char * pin_borrowed = std::getenv("LLAMA_MTP_PIN_BORROWED_HOST");
     const bool private_dense = pin_borrowed && std::strcmp(pin_borrowed, "1") == 0 && !devices.empty() &&
         std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices.front().dev)), "CUDA") == 0;
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr, private_dense);
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr, private_dense, params.fit_ram);
+    prefetch_remaining.store(ml.prefetch_remaining, std::memory_order_relaxed);
     pimpl->mappings.reserve(ml.mappings.size());
-    pimpl->moe_arena = ml.load_moe_arena(params.progress_callback, params.progress_callback_user_data);
+    pimpl->moe_arena = ml.load_moe_arena(params.progress_callback, params.progress_callback_user_data, params.fit_ram);
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
@@ -3771,6 +3772,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.fit_ram                     =*/ false,
     };
 
     return result;

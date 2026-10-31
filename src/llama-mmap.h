@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -45,13 +46,20 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
+// Optional prefetch gets 10% of the 80% spare-RAM budget above a 5 GiB floor.
+// Other shares stay reserved for expert storage, staging and later caches.
+size_t llama_mmap_prefetch_budget(uint64_t available);
+size_t llama_mmap_prefetch_take(size_t & remaining, size_t requested);
+
 struct llama_mmap {
     // list of [first, last) byte ranges within a file
     using ranges = std::vector<std::pair<size_t, size_t>>;
 
+    using prefetch_limit = size_t (*)(size_t requested, void * data) noexcept;
+
     llama_mmap(const llama_mmap &) = delete;
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & lazy_ranges = {});
+               const ranges & lazy_ranges = {}, prefetch_limit limit = nullptr, void * limit_data = nullptr);
     ~llama_mmap();
 
     size_t size() const;
@@ -90,6 +98,6 @@ struct llama_memory_range {
 using llama_memory_ranges = std::vector<llama_memory_range>;
 
 // Prefetch the host pages covering these memory ranges.
-void llama_prefetch(llama_memory_ranges mr);
+void llama_prefetch(llama_memory_ranges mr, std::atomic<size_t> * remaining = nullptr, uint64_t available = 0);
 
 size_t llama_path_max();
