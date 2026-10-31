@@ -58,10 +58,15 @@ static void test_ram_tiers() {
     // unknown host memory
     CHECK(common_prompt_cache_ram_auto_mib(0, 0, why) == 2048);
 
-    // the live query works on this platform
+    // macOS has a total-memory query but no supported free-memory query here.
     uint64_t total = 0, avail = 0;
+#if defined(__APPLE__) && defined(__MACH__)
+    CHECK(!common_host_memory(total, avail));
+    CHECK(total > 0 && avail == 0);
+#else
     CHECK(common_host_memory(total, avail));
     CHECK(total > 0 && avail > 0 && avail <= total);
+#endif
 
     // the default directory follows XDG_CACHE_HOME
 #ifndef _WIN32
@@ -847,6 +852,26 @@ static void test_fit_ram(const std::string & root) {
     CHECK(low.disk.n_match() == 0 && low.states.empty());
     CHECK(!low.disk.write({1}, {2}, {}, {}, {}, {}, 4 * MiB));
     CHECK(low.disk.entries.empty());
+
+    // A cached token vector can retain storage after a prefix is kept.
+    // Its unused backing memory must force eviction before another allocation.
+    server_prompt_cache retained(16, 0);
+    retained.fit_ram = true;
+    retained.spare_max_n = 0;
+    retained.available_ram = []() { return 6 * GiB; };
+    auto * retained_entry = retained.alloc(p, MiB, 0);
+    CHECK(retained_entry != nullptr);
+    if (retained_entry) {
+        while (retained_entry->prompt.tokens.size() < MiB) {
+            retained_entry->prompt.tokens.push_back(1);
+        }
+        retained_entry->prompt.tokens.keep_first(p.tokens.size());
+        CHECK(retained.size() >= 5 * MiB);
+        server_prompt next;
+        next.tokens = server_tokens(llama_tokens{999}, false);
+        CHECK(retained.alloc(next, 13 * MiB, 0) != nullptr);
+        CHECK(retained.states.size() == 1 && retained.size() <= retained.limit_size);
+    }
 
     // The live floor can stop a sub-limit save after RAM use grows.
     pc->available_ram = []() { return 5 * GiB + MiB; };
