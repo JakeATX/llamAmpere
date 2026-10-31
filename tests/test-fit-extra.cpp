@@ -1388,32 +1388,29 @@ static void test_vram_fit_floor() {
 
 static void test_vram_layer_step() {
     constexpr int64_t GiB = 1ll << 30;
-    expect(common_fit_vram_layer_step(49, GiB, 16 * GiB, 7 * GiB) == 19,
+    const auto normal = common_fit_vram_layer_step(49, GiB, 16 * GiB, 7 * GiB, 23 * GiB);
+    expect(normal.status == COMMON_PARAMS_FIT_STATUS_SUCCESS && normal.step == 19,
             "layer interpolation keeps a normal measured placement guess");
-    expect(common_fit_vram_layer_step(49, GiB, 16 * GiB, GiB) == 1,
+    expect(common_fit_vram_layer_step(49, GiB, 16 * GiB, GiB, 23 * GiB).step == 1,
             "an exact zero-layer target still advances by one layer");
-    expect(common_fit_vram_layer_step(UINT32_MAX, 0, INT64_MAX, INT64_MAX - 1) == UINT32_MAX - 1,
+    expect(common_fit_vram_layer_step(UINT32_MAX, 0, INT64_MAX, INT64_MAX - 1, INT64_MAX).step == UINT32_MAX - 1,
             "large valid interpolation bounds cannot overflow the layer product");
-    expect(common_fit_vram_layer_step(49, INT64_MAX - 2, INT64_MAX, INT64_MAX - 1) == 24,
+    expect(common_fit_vram_layer_step(49, INT64_MAX - 2, INT64_MAX, INT64_MAX - 1, INT64_MAX).step == 24,
             "nearby large memory bounds retain their difference before floating conversion");
     for (uint32_t delta : {uint32_t(0), uint32_t(1), uint32_t(49)}) {
-        bool rejected = false;
-        try {
-            common_fit_vram_layer_step(delta, GiB, 16 * GiB, 23 * GiB - int64_t(8796093022207ull << 20));
-        } catch (const std::runtime_error &) {
-            rejected = true;
-        }
-        expect(rejected, "reported large margin is rejected before interpolating a zero-layer deficit");
+        const auto rejected = common_fit_vram_layer_step(delta, GiB, 16 * GiB,
+                23 * GiB - int64_t(8796093022207ull << 20), 23 * GiB);
+        expect(rejected.status == COMMON_PARAMS_FIT_STATUS_FAILURE && rejected.step == 0,
+                "reported large margin is a recoverable failure before interpolation");
+        const auto no_room = common_fit_vram_layer_step(delta, 2 * GiB, 4 * GiB, GiB, GiB);
+        expect(no_room.status == COMMON_PARAMS_FIT_STATUS_NO_ROOM && no_room.step == 0,
+                "reported zero-layer overflow remains hard NO_ROOM before interpolation");
     }
     for (const auto & bounds : std::vector<std::vector<int64_t>>{{-1, 16 * GiB, 7 * GiB},
             {8 * GiB, 16 * GiB, 7 * GiB}, {GiB, GiB, GiB}, {GiB, 16 * GiB, 16 * GiB}}) {
-        bool rejected = false;
-        try {
-            common_fit_vram_layer_step(49, bounds[0], bounds[1], bounds[2]);
-        } catch (const std::runtime_error &) {
-            rejected = true;
-        }
-        expect(rejected, "invalid measured interpolation bounds fail before arithmetic");
+        const auto rejected = common_fit_vram_layer_step(49, bounds[0], bounds[1], bounds[2], 23 * GiB);
+        expect(rejected.status == COMMON_PARAMS_FIT_STATUS_FAILURE && rejected.step == 0,
+                "invalid measured interpolation bounds fail before arithmetic");
     }
 }
 

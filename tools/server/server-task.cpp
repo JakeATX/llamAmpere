@@ -2098,9 +2098,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 continue; // another model or KV configuration
             }
 
-            const server_tokens tmp(it->tokens, false);
-
-            const int lcp_cur = tmp.get_common_prefix(tokens_new);
+            // fork: scan the text index without a full token copy before RAM admission.
+            size_t lcp_cur = 0;
+            const size_t n = std::min(it->tokens.size(), tokens_new.size());
+            while (lcp_cur < n && it->tokens[lcp_cur] == tokens_new[lcp_cur]) {
+                ++lcp_cur;
+            }
 
             const float f_keep_cur = float(lcp_cur) / it->tokens.size();
             const float f_sim_cur  = float(lcp_cur) / tokens_new.size();

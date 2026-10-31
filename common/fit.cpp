@@ -241,14 +241,17 @@ const char * common_moe_cache_tensor_override_pattern() {
     return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.";
 }
 
-uint32_t common_fit_vram_layer_step(uint32_t delta, int64_t low, int64_t high, int64_t target) {
+common_fit_vram_layer_result common_fit_vram_layer_step(uint32_t delta, int64_t low, int64_t high, int64_t target, int64_t free_bytes) {
+    if (free_bytes < 0 || low > free_bytes) {
+        return {COMMON_PARAMS_FIT_STATUS_NO_ROOM, 0};
+    }
     if (delta <= 1 || low < 0 || low > target || target >= high) {
-        throw common_params_fit_exception("layer placement cannot meet the requested free memory margin");
+        return {COMMON_PARAMS_FIT_STATUS_FAILURE, 0};
     }
     // This is only a guess; both measured bounds stay authoritative. Avoid an overflowing integer product.
     const double fraction = double(target - low) / double(high - low);
     const uint32_t step = uint32_t(double(delta) * fraction);
-    return std::max(uint32_t(1), std::min(step, delta - 1));
+    return {COMMON_PARAMS_FIT_STATUS_SUCCESS, std::max(uint32_t(1), std::min(step, delta - 1))};
 }
 
 struct common_moe_cache_fit_pool {
@@ -1383,7 +1386,14 @@ static void common_params_fit_impl(
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
-                    const uint32_t step_size = common_fit_vram_layer_step(delta, mem[id], mem_high[id], targets[id]);
+                    const auto next = common_fit_vram_layer_step(delta, mem[id], mem_high[id], targets[id], dmds_full[id].free);
+                    if (next.status == COMMON_PARAMS_FIT_STATUS_NO_ROOM) {
+                        throw common_params_fit_no_room(dev_names[id] + " compute buffers and caches alone exceed free device memory; lower -ub, -b or -c");
+                    }
+                    if (next.status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                        throw common_params_fit_exception("layer placement cannot meet the requested free memory margin");
+                    }
+                    const uint32_t step_size = next.step;
 
                     std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
                     ngl_per_device_test[id].n_layer += step_size;

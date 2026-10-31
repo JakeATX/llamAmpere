@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <new>
 #include <string>
 #include <algorithm>
 #include <cstdint>
@@ -25,6 +26,27 @@
 #endif
 
 namespace fs = std::filesystem;
+
+namespace allocation_probe {
+static thread_local bool active = false;
+static thread_local size_t bytes = 0;
+static thread_local size_t hits = 0;
+}
+
+void * operator new(size_t n) {
+    if (allocation_probe::active && n == allocation_probe::bytes) {
+        ++allocation_probe::hits;
+    }
+    if (void * p = std::malloc(n ? n : 1)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void operator delete(void * p) noexcept { std::free(p); }
+void operator delete(void * p, size_t) noexcept { std::free(p); }
+void * operator new[](size_t n) { return ::operator new(n); }
+void operator delete[](void * p) noexcept { ::operator delete(p); }
+void operator delete[](void * p, size_t) noexcept { ::operator delete(p); }
 
 static int n_fail = 0;
 static int n_pass = 0;
@@ -774,6 +796,63 @@ static void test_lora_scales(const std::string & root) {
     CHECK(t.read(find_entry(t, n.tokens), r) && r.lora_scales.empty() && same(r, n));
 }
 
+static void test_disk_lookup_ram(const std::string & root) {
+    server_prompt_cache cache(16, 0);
+    cache.fit_ram = true;
+    cache.disk = make_tier(root + "/fit-lookup", "k", 0);
+    const auto data = make_entry(40, 256 * 1024, 1, 0);
+    CHECK(write_entry(cache.disk, data));
+    if (cache.disk.entries.empty()) {
+        return;
+    }
+    const std::string file = cache.disk.entries.front().file;
+    int ram_reads = 0;
+    cache.available_ram = [&]() { ++ram_reads; return 4 * GiB; };
+
+    server_tokens request(data.tokens, true);
+    server_prompt prompt;
+    allocation_probe::bytes = data.tokens.size() * sizeof(llama_token);
+    allocation_probe::hits = 0;
+    allocation_probe::active = true;
+    {
+        const server_tokens copied(data.tokens, false);
+        allocation_probe::active = false;
+        CHECK(copied.size() == data.tokens.size());
+    }
+    CHECK(allocation_probe::hits == 1);
+    allocation_probe::hits = 0;
+    allocation_probe::active = true;
+    const bool loaded = cache.load(prompt, request, nullptr, nullptr, 0, nullptr);
+    allocation_probe::active = false;
+    CHECK(!loaded && ram_reads == 1 && prompt.tokens.empty());
+    CHECK(allocation_probe::hits == 0);
+    CHECK(fs::exists(file) && cache.disk.n_match() == 1 && cache.disk.n_removed_bad == 0);
+
+    // A different first token has no disk match and must not reach state restore.
+    request = server_tokens(llama_tokens{1}, true);
+    ram_reads = 0;
+    CHECK(cache.load(prompt, request, nullptr, nullptr, 0, nullptr));
+    CHECK(ram_reads == 0 && prompt.tokens.empty());
+
+    for (size_t count : {data.tokens.size() / 4 - 1, data.tokens.size() / 4}) {
+        request = server_tokens(data.tokens, true);
+        request.keep_first(count);
+        ram_reads = 0;
+        const bool too_short = count < data.tokens.size() / 4;
+        CHECK(cache.load(prompt, request, nullptr, nullptr, 0, nullptr) == too_short);
+        CHECK(ram_reads == (too_short ? 0 : 1) && prompt.tokens.empty());
+    }
+    request = server_tokens(llama_tokens{LLAMA_TOKEN_NULL}, true);
+    ram_reads = 0;
+    CHECK(cache.load(prompt, request, nullptr, nullptr, 0, nullptr));
+    CHECK(ram_reads == 0);
+
+    // The skipped entry remains readable when RAM is available again.
+    server_prompt_disk_record record;
+    CHECK(cache.disk.read(cache.disk.entries.begin(), record));
+    CHECK(same(record, data));
+}
+
 static void test_fit_ram(const std::string & root) {
     std::unique_ptr<server_prompt_cache> pc;
     server_prompt_cache::configure(pc, 16, 1024, true);
@@ -935,6 +1014,7 @@ int main() {
     test_mtmd_text_only_spills(root);
     test_lora_scales(root);
     test_fit_ram(root);
+    test_disk_lookup_ram(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);
