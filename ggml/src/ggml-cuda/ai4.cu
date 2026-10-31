@@ -1453,10 +1453,10 @@ static __device__ __forceinline__ void moe_mixed_iq4_hot_single(
     __syncthreads(); // another slab may reuse partial in this block
 }
 
-template <int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW>
+template <ggml_type BASE, bool IQ4_BANK, int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW>
 static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
-        ggml_type bank_type, const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
+        const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
         const int32_t * ids, int64_t ids_stride, int n_expert, const block_q8_1 * x,
         const uint8_t * skip, const uint8_t * resident, char * route_ids, size_t route_ids_stride,
         float * route_mask) {
@@ -1470,9 +1470,11 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         route_mask[t*idm.direct_n_used + u] = h < 0 ? 1.0f : 0.0f;
     }
     const bool hot = h >= 0 && h < idm.direct_n_expert;
-    if (hot && bank_type != GGML_TYPE_IQ4_NL) {
-        ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, SPW>(W, q, s, Y, M, M, 1, K, idm);
-        return;
+    if constexpr (!IQ4_BANK) {
+        if (hot) {
+            ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, SPW>(W, q, s, Y, M, M, 1, K, idm);
+            return;
+        }
     }
     constexpr int slabs = SPW ? WARPS : 1;
     const int row0 = blockIdx.x*16*slabs;
@@ -1493,23 +1495,29 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
     for (int slab = 0; slab < slabs && row0 + slab*16 < M; ++slab) {
         const char * sw = w + (size_t) slab*16*row_stride;
         float * sy = out + slab*16;
-        if constexpr (WARPS == 4) {
-            if (hot && bank_type == GGML_TYPE_IQ4_NL && gridDim.z == 1) {
+        if constexpr (IQ4_BANK && WARPS == 4) {
+            if (hot && gridDim.z == 1) {
                 moe_mixed_iq4_hot_single(sw, x, sy, K);
                 continue;
             }
         }
-        switch (hot ? bank_type : type) {
+        if constexpr (BASE == GGML_TYPE_COUNT) {
+            switch (type) {
 #define MOE_MIXED_CASE(T, F, V) case T: \
-        if constexpr (T == GGML_TYPE_Q2_0 || T == GGML_TYPE_IQ4_NL) { \
-            moe_mixed_down_rows<T, WARPS>(sw, x, sy, K); \
-        } else { \
-            moe_mixed_base_rows<T, WARPS>(sw, x, sy, K); \
-        } \
-        break;
-        MOE_MIXED_TYPES(MOE_MIXED_CASE)
+            if constexpr (T == GGML_TYPE_Q2_0 || T == GGML_TYPE_IQ4_NL) { \
+                moe_mixed_down_rows<T, WARPS>(sw, x, sy, K); \
+            } else { \
+                moe_mixed_base_rows<T, WARPS>(sw, x, sy, K); \
+            } \
+            break;
+            MOE_MIXED_TYPES(MOE_MIXED_CASE)
 #undef MOE_MIXED_CASE
-            default: __trap();
+                default: __trap();
+            }
+        } else if constexpr (BASE == GGML_TYPE_Q2_0 || BASE == GGML_TYPE_IQ4_NL) {
+            moe_mixed_down_rows<BASE, WARPS>(sw, x, sy, K);
+        } else {
+            moe_mixed_base_rows<BASE, WARPS>(sw, x, sy, K);
         }
     }
 }
@@ -1629,25 +1637,42 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     const bool two_warps = !iq4_hot_single && (cfg == 212 || (cfg == 0 && ids->ne[1] > 1 && K >= 1024));
     static const bool single = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0 ||
                                ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
-#define MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, SINGLE, SPW) \
-    moe_mixed_mmv<L, XSH, KT, WARPS, SINGLE, SPW><<<grid, WARPS*32, std::max((size_t) (WARPS*2*ai4k::mmv_stage_bytes<true, L>()), iq4_smem), ctx.stream()>>>( \
+#define MOE_MIXED_LAUNCH(T, IQ4, L, XSH, KT, WARPS, SINGLE, SPW) \
+    moe_mixed_mmv<T, IQ4, L, XSH, KT, WARPS, SINGLE, SPW><<<grid, WARPS*32, std::max((size_t) (WARPS*2*ai4k::mmv_stage_bytes<true, L>()), iq4_smem), ctx.stream()>>>( \
             (const uint8_t *) w->data, act_ai_q, act_ai_s, (float *) dst->data, M, K, idm, \
-            w->type, (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
+            (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
             ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
             route_map ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr)
-#define MOE_MIXED_SINGLE(L, XSH, KT, WARPS) \
-    if (single) { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, true, false); } \
-    else        { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, false, false); }
-#define MOE_MIXED_WARPS(L, XSH, KT) \
-    if (spw)            { MOE_MIXED_LAUNCH(L, XSH, KT, 4, false, true); } \
-    else if (two_warps) { MOE_MIXED_SINGLE(L, XSH, KT, 2); } \
-    else                { MOE_MIXED_SINGLE(L, XSH, KT, 4); }
+#define MOE_MIXED_SINGLE(T, L, XSH, KT, WARPS) \
+    if (single) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, true, false); } \
+    else        { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, false, false); }
+#define MOE_MIXED_WARPS(T, L, XSH, KT) \
+    if (spw)            { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true); } \
+    else if (two_warps) { MOE_MIXED_SINGLE(T, L, XSH, KT, 2); } \
+    else                { MOE_MIXED_SINGLE(T, L, XSH, KT, 4); }
 #define MOE_MIXED_SHAPE(L) \
-    if (K == 640 && ai4_mmvr_kt())       { MOE_MIXED_WARPS(L, 0, 640); } \
-    else if (K == 2560 && ai4_mmvr_kt()) { MOE_MIXED_WARPS(L, 1, 2560); } \
-    else if (xsh)                      { MOE_MIXED_WARPS(L, 1, 0); } \
-    else                               { MOE_MIXED_WARPS(L, 0, 0); }
-    if (w->type == GGML_TYPE_AIT2_U || w->type == GGML_TYPE_IQ4_NL) {
+    if (K == 640 && ai4_mmvr_kt())       { MOE_MIXED_WARPS(GGML_TYPE_COUNT, L, 0, 640); } \
+    else if (K == 2560 && ai4_mmvr_kt()) { MOE_MIXED_WARPS(GGML_TYPE_COUNT, L, 1, 2560); } \
+    else if (xsh)                      { MOE_MIXED_WARPS(GGML_TYPE_COUNT, L, 1, 0); } \
+    else                               { MOE_MIXED_WARPS(GGML_TYPE_COUNT, L, 0, 0); }
+    // IQ4 banks have no AI arithmetic; their unused layout, K and SINGLE choices need no variants.
+    if (w->type == GGML_TYPE_IQ4_NL) {
+        if (two_warps) { MOE_MIXED_LAUNCH(GGML_TYPE_IQ4_NL, true, ai4k::LAY_AIT2_U, 0, 0, 2, false, false); }
+        else           { MOE_MIXED_LAUNCH(GGML_TYPE_IQ4_NL, true, ai4k::LAY_AIT2_U, 0, 0, 4, false, false); }
+    // Limit format specializations to production pairs; other shapes retain the generic dispatch.
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_IQ2_XXS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_XXS, ai4k::LAY_AIT2_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_IQ2_XS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_XS, ai4k::LAY_AIT2_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_IQ2_S) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_S, ai4k::LAY_AIT2_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT3_U && cw->type == GGML_TYPE_IQ3_XXS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ3_XXS, ai4k::LAY_AIT3_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT3_U && cw->type == GGML_TYPE_IQ3_S) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ3_S, ai4k::LAY_AIT3_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 640 && M == 2560 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_Q2_0) {
+        MOE_MIXED_WARPS(GGML_TYPE_Q2_0, ai4k::LAY_AIT2_U, 0, 640);
+    } else if (w->type == GGML_TYPE_AIT2_U) {
         MOE_MIXED_SHAPE(ai4k::LAY_AIT2_U);
     } else {
         MOE_MIXED_SHAPE(ai4k::LAY_AIT3_U);
