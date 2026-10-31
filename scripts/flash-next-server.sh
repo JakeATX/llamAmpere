@@ -16,5 +16,5 @@ if [[ -n $FLASH_NEXT_DRAFT_MAX && " $* " != *" --spec-draft-n-"* ]]; then
     [[ " $* " == *" --spec-type"* ]] || depth=(--spec-type draft-mtp-adaptive "${depth[@]}")
 fi
 exec "$server" -md "$LLAMA_ARG_MODEL_DRAFT" --moe-profile "$GGML_MOE_CACHE_PROFILE_LOAD" \
-    -ctk sjkvarn4 -ctv sjkvarn4 --moe-skip \
+    -ot token_embd.weight=CUDA0 -ctk sjkvarn4 -ctv sjkvarn4 --moe-skip \
     "${depth[@]}" "$@" "${exact[@]}"

@@ -59,6 +59,39 @@ static __global__ void moe_weighted_combine_f32(const float * __restrict__ exper
     dst[token * s_dst + col] = __fadd_rn(sum, gated);
 }
 
+template <int expert_count>
+static __global__ void moe_weighted_reduction_f32_vec4(const float4 * __restrict__ experts,
+                                                       const float * __restrict__ expert_scale,
+                                                       const float * __restrict__ weights,
+                                                       float4 * __restrict__ dst,
+                                                       const int64_t n_embd4,
+                                                       const int n_expert_used) {
+    const int64_t token = blockIdx.x;
+    const int64_t col = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= n_embd4) {
+        return;
+    }
+    const int count = expert_count > 0 ? expert_count : n_expert_used;
+    const uint64_t first_row = (uint64_t) token * count;
+    const float4 first = experts[first_row * n_embd4 + col];
+    const float scale = expert_scale ? expert_scale[first_row] : 1.0f;
+    const float weight = weights[first_row];
+    float4 sum = make_float4((first.x * scale) * weight, (first.y * scale) * weight,
+                            (first.z * scale) * weight, (first.w * scale) * weight);
+#pragma unroll
+    for (int expert = 1; expert < count; ++expert) {
+        const uint64_t row = first_row + expert;
+        const float4 value = experts[row * n_embd4 + col];
+        const float s = expert_scale ? expert_scale[row] : 1.0f;
+        const float w = weights[row];
+        sum.x += (value.x * s) * w;
+        sum.y += (value.y * s) * w;
+        sum.z += (value.z * s) * w;
+        sum.w += (value.w * s) * w;
+    }
+    dst[token * n_embd4 + col] = sum;
+}
+
 static void launch_moe_weighted_reduction(const float * experts,
                                           const float * expert_scale,
                                           const float * weights,
@@ -66,8 +99,24 @@ static void launch_moe_weighted_reduction(const float * experts,
                                           int64_t       n_embd,
                                           int64_t       n_tokens,
                                           int           n_expert_used,
+                                          bool          vec4,
                                           cudaStream_t  stream) {
     constexpr int threads = 256;
+    if (vec4) {
+        static const int threads_vec4 = [] {
+            const char * value = getenv("GGML_CUDA_MOE_REDUCE_THREADS");
+            return value && atoi(value) == 128 ? 128 : 256;
+        }();
+        const dim3 blocks(n_tokens, (n_embd / 4 + threads_vec4 - 1) / threads_vec4, 1);
+        if (n_expert_used == 10) {
+            moe_weighted_reduction_f32_vec4<10><<<blocks, threads_vec4, 0, stream>>>(
+                (const float4 *) experts, expert_scale, weights, (float4 *) dst, n_embd / 4, n_expert_used);
+        } else {
+            moe_weighted_reduction_f32_vec4<0><<<blocks, threads_vec4, 0, stream>>>(
+                (const float4 *) experts, expert_scale, weights, (float4 *) dst, n_embd / 4, n_expert_used);
+        }
+        return;
+    }
     const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
     moe_weighted_reduction_f32
         <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
@@ -92,10 +141,17 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
     cudaStream_t  stream        = ctx.stream();
 
+    static const bool use_vec4 = [] {
+        const char * value = getenv("GGML_CUDA_MOE_REDUCE_VEC4");
+        return value && atoi(value) != 0;
+    }();
+    const bool vec4 = use_vec4 && n_tokens > 1 && n_embd % 4 == 0 &&
+        (uintptr_t) experts->data % alignof(float4) == 0 && (uintptr_t) dst->data % alignof(float4) == 0;
+
     launch_moe_weighted_reduction((const float *) experts->data,
                                   expert_scale ? (const float *) expert_scale->data : nullptr,
                                   (const float *) weights->data,
-                                  (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
+                                  (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, vec4, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

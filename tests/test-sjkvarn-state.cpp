@@ -17,6 +17,7 @@
 //   test-sjkvarn-state --scalar-only [tmp_dir]   native scalar 4/4 state and multi-sequence checks
 //   test-sjkvarn-state --resident [tmp_dir]   CUDA split-body state round trips
 //   test-sjkvarn-state --device-bytes   CPU device-snapshot packed-byte regression
+//   test-sjkvarn-state --exact-sink   CPU exact checkpoints below and across the sink boundary
 //   test-sjkvarn-state --compact [tmp_dir]   CUDA compact attention on saved and truncated SJ state
 
 #include "ggml.h"
@@ -338,6 +339,40 @@ static void device_bytes_case(llama_model * model) {
 
 static bool same_logits(const std::vector<float> & a, const std::vector<float> & b) {
     return a.size() == b.size() && memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
+}
+
+static void exact_sink_case(llama_model * model) {
+    const sj_cfg cfg = { "4/4 exact sink", 4, 4, GGML_TYPE_F32 };
+    const auto flags = LLAMA_STATE_SEQ_FLAGS_SJ_EXACT;
+    for (uint32_t n : { 1u, 33u, 127u, 128u, 129u }) {
+        llama_context_ptr ctx(make_ctx(model, cfg));
+        require(ctx != nullptr, "exact-sink context");
+        decode(ctx.get(), 0, n, 128);
+        const auto before = seq_state(ctx.get());
+        const auto checkpoint = seq_state(ctx.get(), flags);
+        const size_t off = sizeof(uint32_t) + sizeof(llama_seq_id);
+        uint32_t magic;
+        require(checkpoint.size() >= off + 8*sizeof(uint32_t), "exact checkpoint header fits");
+        std::memcpy(&magic, checkpoint.data() + off, sizeof(magic));
+        require(magic == LLAMA_SJ_KVARN_CKPT_MAGIC, "exact checkpoint section found");
+        auto invalid = checkpoint;
+        const uint32_t pending = std::max(n, 128u) + 1;
+        std::memcpy(invalid.data() + off + 5*sizeof(uint32_t), &pending, sizeof(pending));
+        g_last_error.clear();
+        require(llama_state_seq_set_data_ext(ctx.get(), invalid.data(), invalid.size(), 0, flags) == 0,
+                "pending seal beyond sink and sequence is refused");
+        require(g_last_error.find("corrupt section") != std::string::npos, "invalid pending seal rejected by header validation");
+        require(seq_state(ctx.get()) == before, "invalid pending seal leaves the cache unchanged");
+        const auto expected = decode(ctx.get(), n, n + 4, 1, 7);
+        for (int reuse = 0; reuse < 2; ++reuse) {
+            require(llama_state_seq_set_data_ext(ctx.get(), checkpoint.data(), checkpoint.size(), 0, flags) == checkpoint.size(),
+                    "restore exact checkpoint at " + std::to_string(n));
+            require(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, n, -1), "trim restored sequence");
+            require(seq_state(ctx.get()) == before, "exact checkpoint restores prefix bytes");
+            require(same_logits(decode(ctx.get(), n, n + 4, 1, 7), expected), "exact checkpoint continuation is bit-identical");
+        }
+        printf("OK: exact checkpoint n=%u restored twice with identical bytes and logits; invalid pending seal refused\n", n);
+    }
 }
 
 #include "test-sjkvarn-compact-state.h"
@@ -1696,6 +1731,7 @@ int main(int argc, char ** argv) {
     const bool resident = argc > 1 && strcmp(argv[1], "--resident") == 0;
     const bool scalar_only = argc > 1 && strcmp(argv[1], "--scalar-only") == 0;
     const bool device_bytes = argc > 1 && strcmp(argv[1], "--device-bytes") == 0;
+    const bool exact_sink = argc > 1 && strcmp(argv[1], "--exact-sink") == 0;
     const bool compact = argc > 1 && strcmp(argv[1], "--compact") == 0;
     const int tmp_arg = resident || scalar_only || compact ? 2 : 1;
     const char * tmp_dir = argc > tmp_arg ? argv[tmp_arg] : (getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
@@ -1711,6 +1747,18 @@ int main(int argc, char ** argv) {
     }
 
     const sj_cfg s44  = { "4/4",        4, 4, GGML_TYPE_F32 };
+    if (exact_sink) {
+        int result = 0;
+        try {
+            exact_sink_case(model);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "exact sink: FAIL: %s\n", e.what());
+            result = 1;
+        }
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
+    }
     if (compact) {
         int result = 0;
         try {

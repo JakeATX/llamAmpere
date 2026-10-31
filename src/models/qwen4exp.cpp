@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <thread>
+#include <vector>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -2380,8 +2382,18 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
         const int64_t n = (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        if (raw) {
+            return raw->ne[1] == n;
+        }
         return emb_in ? emb_in->ne[1] == n : rows->ne[0] == n;
     }
+
+    // fork LLAMA_PLE_RAW_ROWS: the gathered rows in the table's own type [row elements, ple_n_heads * n_tokens], and the
+    // I32 row order 0..n-1 the device get_rows reads them by; when set, rows is null
+    ggml_tensor * raw = nullptr;
+    ggml_tensor * raw_ids = nullptr;
+    std::vector<uint8_t> raw_buf;
+    std::vector<int32_t> raw_iota;
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
     ggml_tensor * emb_in = nullptr; // fork LLAMA_PLE_DECODE: F32 [row elements, ple_n_heads * n_tokens], replaces rows
@@ -2496,6 +2508,58 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         return;
     }
 
+    if (raw) {
+        // copy each row's bytes as stored (no dequantization); the card expands them with get_rows, the same values
+        ggml_tensor * table = model.per_layer_tok_embd;
+        const size_t    rb  = ggml_row_size(table->type, table->ne[0]);
+        const size_t    nr  = idx.size();
+        const int64_t   nt  = table->ne[1];
+        const uint8_t * src = (const uint8_t *) table->data;
+        GGML_ASSERT(rb == raw->nb[1] && (int64_t) nr == raw->ne[1]);
+        uint8_t * dst = nullptr;
+        const bool direct = raw->buffer && ggml_backend_buffer_is_host(raw->buffer);
+        if (direct) {
+            dst = (uint8_t *) raw->data;
+        } else {
+            raw_buf.resize(nr*rb);
+            dst = raw_buf.data();
+        }
+        auto copy = [&](size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ++i) {
+                const int64_t r = idx[i];
+                GGML_ASSERT(r >= 0 && r < nt);
+                memcpy(dst + i*rb, src + (size_t) r*table->nb[1], rb);
+            }
+        };
+        // page faults on a cold row stall the copy; split large calls over a few threads like the CPU get_rows did
+        const size_t n_thr = nr >= 65536 ? std::max<size_t>(1, std::min<size_t>(8, std::thread::hardware_concurrency())) : 1;
+        if (n_thr <= 1) {
+            copy(0, nr);
+        } else {
+            std::vector<std::thread> workers;
+            const size_t step = (nr + n_thr - 1)/n_thr;
+            for (size_t t = 1; t < n_thr; ++t) {
+                const size_t i0 = std::min(nr, t*step);
+                workers.emplace_back(copy, i0, std::min(nr, i0 + step));
+            }
+            copy(0, std::min(nr, step));
+            for (auto & w : workers) {
+                w.join();
+            }
+        }
+        if (!direct) {
+            ggml_backend_tensor_set(raw, raw_buf.data(), 0, nr*rb);
+        }
+        if (raw_iota.size() != nr) {
+            raw_iota.resize(nr);
+            for (size_t i = 0; i < nr; ++i) {
+                raw_iota[i] = (int32_t) i;
+            }
+        }
+        ggml_backend_tensor_set(raw_ids, raw_iota.data(), 0, nr*sizeof(int32_t));
+        return;
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -2599,6 +2663,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     return conv_input;
 }
 
+// LLAMA_PLE_RAW_ROWS=1: only a quantized table read in place from host memory (mmap), without the PLE row cache
+static bool ple_raw_rows_ok(const ggml_tensor * table) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_PLE_RAW_ROWS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on && table && table->data && table->buffer && ggml_backend_buffer_is_host(table->buffer) &&
+           ggml_is_quantized(table->type) && ggml_is_contiguous(table);
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         const llama_memory_hybrid_idx_context * mctx_hyb) {
     const int64_t n_heads = hparams.ple_n_heads;
@@ -2615,6 +2689,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         ggml_set_input(ple_inp->emb_in);
         emb = ple_inp->emb_in;
         res->add_input(std::move(ple_inp));
+    } else if (!model.ple_cache && ple_raw_rows_ok(table)) {
+        // fork LLAMA_PLE_RAW_ROWS=1 (opt-in): the host copies the rows as stored and the device expands them, so the
+        // upload is the table's row size (90 B for the 160-wide IQ4_NL table) instead of 640 B of F32 per row, and
+        // the CPU does no dequantization. Same dequantization formula on the device, so the same values.
+        ple_inp->raw = ggml_new_tensor_2d(ctx0, table->type, table->ne[0], n_heads * n_tokens);
+        ggml_set_input(ple_inp->raw);
+        ple_inp->raw_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->raw_ids);
+        ggml_tensor * raw = ple_inp->raw;
+        ggml_tensor * ids = ple_inp->raw_ids;
+        res->add_input(std::move(ple_inp));
+        emb = ggml_get_rows(ctx0, raw, ids);
     } else {
         ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
         ggml_set_input(ple_inp->rows);

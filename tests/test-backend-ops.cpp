@@ -11896,10 +11896,10 @@ struct test_moe_reduce : public test_case {
 struct test_moe_bank_joint_reduce : public test_case {
     const int64_t n_embd, n_tokens;
     const int mask_mode;
-    const bool extra_reader, strided;
-    test_moe_bank_joint_reduce(int64_t n_embd, int64_t n_tokens, int mask_mode, bool extra_reader = false, bool strided = false) :
-        n_embd(n_embd), n_tokens(n_tokens), mask_mode(mask_mode), extra_reader(extra_reader), strided(strided) {}
-    std::string vars() override { return VARS_TO_STR5(n_embd, n_tokens, mask_mode, extra_reader, strided); }
+    const bool extra_reader, strided, dependency;
+    test_moe_bank_joint_reduce(int64_t n_embd, int64_t n_tokens, int mask_mode, bool extra_reader = false, bool strided = false, bool dependency = false) :
+        n_embd(n_embd), n_tokens(n_tokens), mask_mode(mask_mode), extra_reader(extra_reader), strided(strided), dependency(dependency) {}
+    std::string vars() override { return VARS_TO_STR6(n_embd, n_tokens, mask_mode, extra_reader, strided, dependency); }
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_JOINT_REDUCE"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 1e-6; }
@@ -11913,7 +11913,7 @@ struct test_moe_bank_joint_reduce : public test_case {
         ggml_tensor * wc = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 10, n_tokens);
         ggml_set_name(wh, "joint_hot_weights"); ggml_set_name(wc, "joint_cold_weights");
         ggml_tensor * hw = ggml_mul(ctx, hot, wh);
-        ggml_tensor * cw = ggml_mul(ctx, cold, wc);
+        ggml_tensor * cw = ggml_mul(ctx, dependency ? hw : cold, wc);
         ggml_tensor * joined = ggml_add(ctx, hw, cw);
         ggml_tensor * sum = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, joined, 1, 0, 2, 3)));
         ggml_tensor * out = ggml_reshape_2d(ctx, sum, n_embd, n_tokens);
@@ -18855,6 +18855,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_moe_bank_joint_reduce(2560, 4, 2, true));
+    test_cases.emplace_back(new test_moe_bank_joint_reduce(2560, 4, 2, false, false, true));
     test_cases.emplace_back(new test_moe_bank_joint_reduce(2560, 4, 2, false, true));
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
@@ -18862,6 +18863,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_reduce(516, 10, 33, false, true, true));
+    test_cases.emplace_back(new test_moe_reduce(1028, 10, 17, false, true, true));
+    test_cases.emplace_back(new test_moe_reduce(2560, 10, 129, false, true, true));
     test_cases.emplace_back(new test_moe_reduce(2560, 10, 64, false, false, false, 1));
     test_cases.emplace_back(new test_moe_reduce(2560, 10, 64, false, false, false, 2));
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true,  true,  1));

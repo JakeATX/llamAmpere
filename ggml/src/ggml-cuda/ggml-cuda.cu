@@ -6910,6 +6910,17 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 // 31 nodes, so k <= 15; larger values use the per-operation path.
 static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
 
+static bool ggml_cuda_input_before_fusion(const ggml_cgraph * graph, int first, const ggml_tensor * input) {
+    for (const ggml_tensor * t = input; t; t = t->view_src) {
+        for (int i = first; i < graph->n_nodes; ++i) {
+            if (graph->nodes[i] == t) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 struct ggml_cuda_moe_bank_joint_match {
     const ggml_tensor * hot = nullptr;
     const ggml_tensor * cold = nullptr;
@@ -6956,7 +6967,8 @@ static bool ggml_cuda_match_moe_bank_joint(const ggml_cgraph * graph, int i, ggm
     }
     for (const ggml_tensor * mul : { h, c }) {
         const ggml_tensor * e = mul->src[0], * w = mul->src[1];
-        if (!e || !w || e->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        if (!e || !w || !ggml_cuda_input_before_fusion(graph, i, e) || !ggml_cuda_input_before_fusion(graph, i, w) ||
+                e->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
                 !ggml_is_contiguous(e) || !ggml_is_contiguous(w) || !ggml_are_same_shape(e, h) ||
                 w->ne[0] != 1 || w->ne[1] != h->ne[1] || w->ne[2] != h->ne[2] || w->ne[3] != 1) {
             return false;

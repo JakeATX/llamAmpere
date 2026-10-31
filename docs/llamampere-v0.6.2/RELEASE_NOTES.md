@@ -22,3 +22,5 @@ Small verification batches now use one expert-sum reduction by default; set `LLA
 The bank/cache joint reduction is included with `LLAMA_MOE_BANK_JOINT_REDUCE=1`, but remains off pending its CUDA check. Bank staging and streamed-copy checks are included; pageable bank retention still requires `LLAMA_B1_KEEP_BANK_RAM=1`.
 
 Mapped expert sources require a complete tracked host registration; endpoint-only borrowing is removed. Table rebuilds reuse session-owned mappings through their normal retention accounting so pruning cannot drop a borrowed source registration. `GGML_MOE_CACHE_STRICT_ALIAS=0` no longer weakens this check.
+
+Additional candidate code includes the short-sink saved-state fix and per-token streamed byte fix. The launcher places `token_embd.weight` on CUDA0 with `-ot`. New prompt variants `LLAMA_PLE_RAW_ROWS`, `GGML_CUDA_HC_POST_V4`, and `GGML_CUDA_LID_SPLIT16` remain off unless enabled. `GGML_CUDA_MOE_REDUCE_VEC4=1` enables vector reduction; `GGML_CUDA_MOE_REDUCE_THREADS=128` selects its smaller block size (default 256). CTA2 neighbor sharing stays off. Joint reduction also stays off pending its corrected CUDA checks.

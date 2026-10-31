@@ -3276,6 +3276,8 @@ private:
     bool process_token(completion_token_output & result, server_slot & slot, bool last_in_group = true) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
+        // Keep token bytes apart from text buffered for UTF-8 and stop strings.
+        slot.add_token(result);
         slot.sampled = result.tok;
 
         slot.generated.append(token_str, result.tok);
@@ -3314,20 +3316,16 @@ private:
                 // no send the stop word in the response
                 result.text_to_send = slot.generated.text.substr(pos, std::string::npos);
                 slot.n_sent_text += result.text_to_send.size();
-                // add the token to slot queue and cache
             } else {
                 result.text_to_send = "";
             }
 
-            slot.add_token(result);
             if (slot.task->params.stream) {
                 send_partial_response(slot, result, false);
             }
         }
 
         if (incomplete) {
-            // Probabilities belong to the token even while its text is pending.
-            slot.add_token(result);
             // Send the token ID now; its text waits for a complete character.
             if (slot.task->params.stream) {
                 result.text_to_send.clear();
@@ -3541,6 +3539,9 @@ private:
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
             res->prob_output = tkn; // copy the token probs
+            const bool special = params_base.special ||
+                slot.task->params.sampling.preserved_tokens.count(tkn.tok) != 0;
+            res->prob_output.text_to_send = common_token_to_piece(slot.ctx_tgt, tkn.tok, special);
         }
 
         // populate timings if this is final response or timings_per_token is enabled

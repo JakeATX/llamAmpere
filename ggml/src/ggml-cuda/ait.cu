@@ -1169,7 +1169,13 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         switch (k) {
             case 2:  k_ait_mmv<2, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
             case 3:  k_ait_mmv<3, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
-            default: k_ait_mmv<4, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
+            default:
+                if (neighbor4 && code == 0 && warps <= 12 && occ == 0) {
+                    k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0);
+                } else {
+                    k_ait_mmv<4, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0);
+                }
+                break;
         }
     } else {
         switch (k) {

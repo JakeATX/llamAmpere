@@ -5763,7 +5763,8 @@ void llama_kv_cache::state_read_sj_ckpt(llama_io_read_i & io, llama_seq_id seq_i
         }
     }
     const uint32_t lo = std::max(B, S);
-    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev > B || B_pending < B || B_pending > n ||
+    // fork: before the sink is full, both seal bounds stay at S even when n < S.
+    if (B < S || (B - S) % G != 0 || (B > S && B > n) || B_prev > B || B_pending < B || B_pending > std::max(n, S) ||
             (n > lo && n - lo > sj_kvarn_cap)) {
         throw std::runtime_error("SJ-KVaRN exact checkpoint: corrupt section (sealed end " + std::to_string(B) + ", n " + std::to_string(n) + ")");
     }
