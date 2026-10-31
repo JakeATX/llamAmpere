@@ -3,6 +3,8 @@
 #include "llama-batch.h"
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-mmap.h"
+#include "llama-moe-arena.h"
 
 #include "ggml-backend.h"
 
@@ -183,13 +185,13 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
             posix_fadvise(pf->fd, 0, 0, POSIX_FADV_RANDOM);
         }
     }
-    if (pf->bounded_window || (pf->use_pread && pf->populate)) {
+    if (model.params.fit_ram || pf->bounded_window || (pf->use_pread && pf->populate)) {
         // The gather and fault readers share mapping read-around, separate from the pread descriptor.
         const uintptr_t page = table_base - table_base%4096;
         const uint64_t bytes = pf->n_rows*pf->row_size;
         if (bytes > SIZE_MAX - (table_base - page) ||
                 madvise((void *) page, (size_t) bytes + table_base - page, MADV_RANDOM) != 0) {
-            if (pf->bounded_window) {
+            if (model.params.fit_ram || pf->bounded_window) {
                 LLAMA_LOG_WARN("%s: [PLEPF] cannot bound mapped read-around, bounded prefetch off\n", __func__);
                 return nullptr;
             }
@@ -351,6 +353,22 @@ bool llama_ple_prefetch::run_ready(size_t i) const {
     return i < n_built.load() ? run_chunk[i] < allowed_chunks.load() : built.load();
 }
 
+size_t llama_ple_prefetch::fit_pages(size_t requested) const {
+    if (!model->params.fit_ram) { return requested; }
+    uint64_t available = 0;
+    try { available = llama_moe_arena::available_memory(); }
+    catch (...) { /* Unknown RAM disables optional reads. */ }
+    const size_t safe = llama_mmap_prefetch_budget(available);
+    auto & quota = model->prefetch_remaining;
+    size_t current = quota.load(std::memory_order_relaxed);
+    while (current > safe && !quota.compare_exchange_weak(current, safe, std::memory_order_relaxed)) {}
+    size_t pages;
+    do {
+        pages = std::min(requested, current / 4096);
+    } while (!quota.compare_exchange_weak(current, current - pages*4096, std::memory_order_relaxed));
+    return pages;
+}
+
 void llama_ple_prefetch::build() {
     const auto & hp = model->hparams;
 
@@ -471,10 +489,12 @@ void llama_ple_prefetch::build() {
                 LLAMA_LOG_INFO("%s: [PLEPF] cold table (%.0f%% of sampled pages cached): %d readers at chunk %zu\n", __func__, 100.0*res, n_cold, c);
             }
         }
+        // fork: all readers and contexts spend the mapper's remaining page credit.
+        cp.resize(fit_pages(cp.size()));
         const size_t r0 = nr;
         for (size_t j = 0; j < cp.size(); ++j) {
             // fork: bounded windows must not pull unused or already-read pages into the cache.
-            const uint64_t gap = coalesce && !bounded_window ? 16 : 0;
+            const uint64_t gap = coalesce && !bounded_window && !model->params.fit_ram ? 16 : 0;
             if (nr > r0 && cp[j] <= run_key[nr - 1] + run_len[nr - 1] + gap && cp[j] - run_key[nr - 1] < RUN_MAX) {
                 run_len[nr - 1] = (uint32_t) (cp[j] - run_key[nr - 1] + 1);
             } else {
@@ -809,6 +829,7 @@ void llama_ple_prefetch::verify_rows(const int32_t * idx, size_t n_idx) {
         }
         j = e;
     }
+    verify_pages.resize(fit_pages(verify_pages.size()));
     if (!verify_pages.empty()) {
         verify_runs.clear();
         for (size_t j = 0; j < verify_pages.size();) {
@@ -976,6 +997,9 @@ void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n
     if (!running || a < n_prev || a >= toks.size()) {
         return;
     }
+    if (model->params.fit_ram && model->prefetch_remaining.load(std::memory_order_relaxed) < 4096) {
+        return;
+    }
     const uint64_t n = std::min<uint64_t>(n_tokens, toks.size() - a);
     float * out = decode_buf(n*hp.ple_n_heads*ne0, dst); // sized here: the thread must not reallocate
     dec_thread = std::thread([this, a, n, n_prev, out]() {
@@ -985,6 +1009,22 @@ void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n
         // inside the call every predecessor is a call token, oldest first as the graph input takes them
         for (uint64_t i = 0; i < n; ++i) {
             llama_ple_hash_rows(hp, toks[a + i], toks.data() + a + i - n_prev, dec_rows.data() + i*nh);
+        }
+        if (model->params.fit_ram) {
+            std::vector<uintptr_t> pages;
+            for (int32_t row : dec_rows) {
+                const uintptr_t first = (uintptr_t) ple->data + (size_t) row*row_size;
+                const uintptr_t last = first + row_size - 1;
+                for (uintptr_t page = first/4096; page <= last/4096; ++page) {
+                    pages.push_back(page);
+                }
+            }
+            std::sort(pages.begin(), pages.end());
+            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+            if (fit_pages(pages.size()) != pages.size()) {
+                dec_rows.clear();
+                return;
+            }
         }
         decode_into(dec_rows.data(), dec_rows.size(), out);
         dec_t0 = a;

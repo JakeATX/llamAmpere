@@ -1,5 +1,10 @@
 #include "../src/llama-mmap.h"
+#include "../src/llama-ple-prefetch.h"
+#include "../src/llama-moe-arena.h"
+#include "../src/models/models.h"
+#include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -8,6 +13,7 @@
 #include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 struct advice_call {
     void * addr;
@@ -15,10 +21,23 @@ struct advice_call {
     int kind;
 };
 
+static std::atomic<size_t> fake_available{16ull << 30};
+size_t llama_moe_arena::available_memory() { return fake_available.load(); }
+
 static int mapped_flags;
 static int failures = 0;
 static std::vector<advice_call> advice;
 static std::mutex advice_mutex;
+static std::atomic<size_t> file_read_bytes{0}, file_advice_bytes{0}, mapped_advice_bytes{0};
+extern "C" ssize_t __real_pread(int, void *, size_t, off_t);
+extern "C" ssize_t __wrap_pread(int fd, void * dst, size_t bytes, off_t offset) {
+    file_read_bytes.fetch_add(bytes);
+    return __real_pread(fd, dst, bytes, offset);
+}
+extern "C" int __wrap_posix_fadvise(int, off_t, off_t bytes, int kind) {
+    if (kind == POSIX_FADV_WILLNEED) { file_advice_bytes.fetch_add(size_t(bytes)); }
+    return 0;
+}
 
 extern "C" void * __real_mmap(void *, size_t, int, int, int, off_t);
 extern "C" void * __wrap_mmap(void * addr, size_t size, int prot, int flags, int fd, off_t offset) {
@@ -35,6 +54,11 @@ extern "C" int __wrap_posix_madvise(void * addr, size_t size, int kind) {
 extern "C" int __wrap_madvise(void * addr, size_t size, int kind) {
     std::lock_guard<std::mutex> lock(advice_mutex);
     advice.push_back({addr, size, kind});
+    if (kind == MADV_WILLNEED
+#if defined(MADV_POPULATE_READ)
+            || kind == MADV_POPULATE_READ
+#endif
+    ) { mapped_advice_bytes.fetch_add(size); }
     return 0;
 }
 
@@ -43,6 +67,138 @@ static void expect(bool ok, const char * message) {
         std::fprintf(stderr, "FAIL: %s\n", message);
         failures++;
     }
+}
+
+static void test_ple_readers() {
+    constexpr uint64_t GiB = 1ull << 30;
+    constexpr size_t page = 4096, rows = 64, bytes = rows*page;
+    char path[] = "/tmp/llama-ple-fit-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0 || ftruncate(fd, bytes)) { std::abort(); }
+    void * data = mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) { std::abort(); }
+    auto * buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
+    ggml_context * ctx = ggml_init({8*ggml_tensor_overhead(), nullptr, true});
+    auto * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, page/sizeof(float), rows);
+    table->data = data;
+    table->buffer = buffer;
+    auto params = llama_model_default_params();
+    params.fit_ram = true;
+    {
+        llama_model_qwen4exp model(params);
+        model.arch = LLM_ARCH_QWEN4EXP;
+        model.per_layer_tok_embd = table;
+        model.can_prefetch.insert(table);
+        auto & hp = model.hparams;
+        hp.ple_ngram_size = 2;
+        hp.ple_n_heads = hp.ple_heads_per_ngram = 1;
+        hp.ple_head_vocab_sizes[0] = rows;
+        hp.ple_head_offsets[0] = 0;
+        hp.ple_eos_token_id = 999;
+        hp.ple_layer_multipliers[0] = 1;
+        hp.ple_layer_multipliers[1] = 0;
+        setenv("LLAMA_PLE_PREFETCH", "2", 1);
+        setenv("LLAMA_PLE_PF_WINDOW_UBATCHES", "0", 1);
+        setenv("LLAMA_PLE_PF_COLD_THREADS", "0", 1);
+        setenv("LLAMA_PLE_PF_TEST_DROP", "0", 1);
+        setenv("LLAMA_PLE_DECODE", "0", 1);
+        setenv("LLAMA_PLE_PF_MIN", "1", 1);
+        setenv("LLAMA_PLE_PF_AHEAD", "1000000", 1);
+        setenv("LLAMA_PLE_PF_POPULATE", "0", 1);
+        setenv("LLAMA_PLE_PF_VERIFY", "2", 1);
+        std::vector<llama_token> tokens(rows);
+        for (size_t i = 0; i < rows; ++i) { tokens[i] = i; }
+        // Protected pages trap any unbudgeted fault reader or decode-ahead load.
+        for (const char * mode : {"fault", "pread", "advise", "coalesce"}) {
+            setenv("LLAMA_PLE_PF_MODE", mode, 1);
+            for (size_t credit : {size_t(0), 3*page}) {
+                model.prefetch_remaining = credit;
+                fake_available = 16ull << 30;
+                if (mprotect(data, bytes, PROT_NONE) || (credit && mprotect(data, credit, PROT_READ))) { std::abort(); }
+                auto first = llama_ple_prefetch::create(model, rows);
+                auto second = llama_ple_prefetch::create(model, rows);
+                expect(bool(first) && bool(second), "two actual PLE contexts use the same model");
+                if (!first || !second) { std::abort(); }
+                file_read_bytes = file_advice_bytes = mapped_advice_bytes = 0;
+                first->hint(tokens.data(), tokens.size(), 0);
+                second->hint(tokens.data(), tokens.size(), 0);
+                expect(first->consume(rows, nullptr, 0) && second->consume(rows, nullptr, 0), "production readers drain all completion counters even with exhausted credit");
+                first->stop();
+                second->stop();
+                expect(file_read_bytes + file_advice_bytes <= credit, "actual pread and file-advice syscalls stay within the shared page credit");
+                expect(mapped_advice_bytes <= credit, "mapped advice stays within the shared page credit");
+                expect(model.prefetch_remaining == 0, "PLE contexts share and exhaust the actual model counter");
+                // Use one context after exhaustion, with every page inaccessible.
+                if (mprotect(data, bytes, PROT_NONE)) { std::abort(); }
+                file_read_bytes = file_advice_bytes = mapped_advice_bytes = 0;
+                first->hint(tokens.data(), tokens.size(), 0);
+                expect(first->consume(rows, nullptr, 0), "exhausted production readers cannot touch protected pages");
+                first->stop();
+                expect(file_read_bytes == 0 && file_advice_bytes == 0, "exhausted actual PLE readers make no file IO calls");
+                expect(mapped_advice_bytes == 0, "exhausted actual PLE readers make no mapped read-ahead calls");
+            }
+        }
+        // Coalescing must not read the holes between credited sparse pages.
+        setenv("LLAMA_PLE_PF_MODE", "coalesce", 1);
+        model.prefetch_remaining = 2*page;
+        const llama_token sparse[] = {0, 2, 4};
+        auto holes = llama_ple_prefetch::create(model, 3);
+        if (!holes) { std::abort(); }
+        file_read_bytes = 0;
+        holes->hint(sparse, 3, 0);
+        expect(holes->consume(3, nullptr, 0), "sparse production reader drains completion counters");
+        holes->stop();
+        expect(file_read_bytes == 2*page && model.prefetch_remaining == 0, "coalesced production reads cannot charge two pages then read a third hole");
+        setenv("LLAMA_PLE_PF_MODE", "fault", 1);
+        for (uint64_t available : {uint64_t(0), 4*GiB, 5*GiB}) {
+            fake_available = available;
+            model.prefetch_remaining = SIZE_MAX;
+            auto pf = llama_ple_prefetch::create(model, rows);
+            if (!pf) { std::abort(); }
+            pf->hint(tokens.data(), tokens.size(), 0);
+            expect(pf->consume(rows, nullptr, 0), "unknown and low RAM finish the actual worker without reads");
+            pf->stop();
+            expect(model.prefetch_remaining == 0, "production PLE reader reduces its quota on low or unknown RAM");
+        }
+        // A demand gather remains usable; the next optional decode must not read row one.
+        fake_available = 16ull << 30;
+        model.prefetch_remaining = 0;
+        if (mprotect(data, page, PROT_READ)) { std::abort(); }
+        setenv("LLAMA_PLE_DECODE", "1", 1);
+        setenv("LLAMA_PLE_DECODE_PINNED", "0", 1);
+        auto pf = llama_ple_prefetch::create(model, 1);
+        if (!pf || !pf->decode_enabled()) { std::abort(); }
+        pf->hint(tokens.data(), 2, 0);
+        const int32_t row = 0;
+        expect(pf->consume(1, &row, 1), "verification cannot refill an exhausted production quota");
+        std::vector<float> output(page/sizeof(float), 1.0f);
+        auto * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, output.size(), 1);
+        auto * out_buffer = ggml_backend_cpu_buffer_from_ptr(output.data(), page);
+        dst->data = output.data();
+        dst->buffer = out_buffer;
+        pf->gather(1, &row, 1, dst);
+        pf->stop();
+        expect(std::all_of(output.begin(), output.end(), [](float value) { return value == 0.0f; }) && model.prefetch_remaining == 0,
+                "demand decode stays exact while exhausted decode-ahead cannot touch row one");
+        ggml_backend_buffer_free(out_buffer);
+        pf.reset();
+        // Fit OFF keeps the requested fault readers active and leaves quota unchanged.
+        unsetenv("LLAMA_PLE_DECODE");
+        model.params.fit_ram = false;
+        if (mprotect(data, bytes, PROT_READ)) { std::abort(); }
+        auto legacy = llama_ple_prefetch::create(model, rows);
+        if (!legacy) { std::abort(); }
+        legacy->hint(tokens.data(), tokens.size(), 0);
+        expect(legacy->consume(rows, nullptr, 0), "fit-off retains production PLE fault readers");
+        legacy->stop();
+        expect(model.prefetch_remaining == 0, "fit-off does not debit the RAM-fit quota");
+    }
+    fake_available = 16ull << 30;
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buffer);
+    munmap(data, bytes);
+    close(fd);
+    unlink(path);
 }
 
 int main() {
@@ -197,6 +353,7 @@ int main() {
         expect(base[0] == char(0x5a) && base[bytes.size() - 1] == char(0x5a), "capping optional read-ahead preserves all model bytes");
     }
     std::fclose(temporary);
+    test_ple_readers();
     std::printf("%s mmap prefetch: baseline syscalls + shared startup/later quotas + concurrent contexts + fake RAM hosts; no model or GPU\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

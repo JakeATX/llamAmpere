@@ -68,6 +68,7 @@ private:
     llama_ple_prefetch() = default;
 
     void begin(llama_pos pos0); // toks is set: reset the call state and start the coordinator
+    size_t fit_pages(size_t requested) const;
     void build();   // runs on the coordinator thread: rows and page runs chunk by chunk, readers follow behind
     int64_t reader();  // one reader thread, returns the time of its last read
     size_t chunks_for(uint64_t n_tok) const;

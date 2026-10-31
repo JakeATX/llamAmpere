@@ -612,9 +612,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT LLAMA_USE_SYSTEM_GGML)
-    add_executable(test-mmap-prefetch test-mmap-prefetch.cpp ../src/llama-mmap.cpp)
-    target_link_libraries(test-mmap-prefetch PRIVATE llama ggml-base)
-    target_link_options(test-mmap-prefetch PRIVATE "LINKER:--wrap=mmap" "LINKER:--wrap=posix_madvise" "LINKER:--wrap=madvise")
+    add_executable(test-mmap-prefetch test-mmap-prefetch.cpp ../src/llama-mmap.cpp ../src/llama-ple-prefetch.cpp)
+    target_link_libraries(test-mmap-prefetch PRIVATE llama ggml-cpu ggml-base)
+    target_link_options(test-mmap-prefetch PRIVATE "LINKER:--wrap=mmap" "LINKER:--wrap=posix_madvise" "LINKER:--wrap=madvise" "LINKER:--wrap=pread" "LINKER:--wrap=posix_fadvise")
     llama_test(test-mmap-prefetch LABEL "main;cpu")
 endif()
 
