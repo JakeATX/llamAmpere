@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,40 @@
 #endif
 
 namespace fs = std::filesystem;
+
+namespace allocation_probe {
+static thread_local bool active = false;
+static thread_local size_t bytes = 0;
+static thread_local size_t hits = 0;
+static thread_local size_t last = 0;
+
+static void start(size_t size) {
+    bytes = size;
+    hits = last = 0;
+    active = true;
+}
+static size_t stop() {
+    active = false;
+    return hits;
+}
+}
+
+// Count the real vector/list requests, including requests later freed on failure.
+void * operator new(size_t n) {
+    if (allocation_probe::active) {
+        allocation_probe::last = n;
+        allocation_probe::hits += n == allocation_probe::bytes;
+    }
+    if (void * p = std::malloc(n ? n : 1)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void operator delete(void * p) noexcept { std::free(p); }
+void operator delete(void * p, size_t) noexcept { std::free(p); }
+void * operator new[](size_t n) { return ::operator new(n); }
+void operator delete[](void * p) noexcept { ::operator delete(p); }
+void operator delete[](void * p, size_t) noexcept { ::operator delete(p); }
 
 static int n_fail = 0;
 static int n_pass = 0;
@@ -189,6 +225,23 @@ static void test_record_ram_budget(const std::string & root) {
     CHECK(ec.read_header(id, rec, err, file_bytes + 1024 * 1024));
     CHECK(rec.tokens == seq(1, 100) && rec.checkpoints.size() == 128);
     CHECK(rec.spec == std::vector<uint8_t>({1, 2, 3}));
+
+    // Calibrate the node size, then prove the node cap runs before list growth.
+    allocation_probe::start(0);
+    std::list<common_prompt_checkpoint> probe;
+    probe.emplace_back();
+    allocation_probe::stop();
+    const size_t node_bytes = allocation_probe::last;
+    CHECK(node_bytes >= sizeof(common_prompt_checkpoint));
+    allocation_probe::start(node_bytes);
+    const bool nodes_ok = ec.read_header(id, rec, err);
+    const size_t nodes_seen = allocation_probe::stop();
+    CHECK(nodes_ok && nodes_seen >= 128);
+    allocation_probe::start(node_bytes);
+    const bool nodes_rejected = !ec.read_header(id, rec, err, file_bytes + 65536 + 4096);
+    const size_t rejected_nodes = allocation_probe::stop();
+    CHECK(nodes_rejected && rejected_nodes == 0);
+    CHECK(err.find("checkpoints exceed") != std::string::npos);
     for (uint64_t host_gib : {16, 32, 64, 128}) {
         const uint64_t budget = common_fit_eval_cache_ram_bytes((host_gib - 6) << 30, true);
         CHECK(ec.read_header(id, rec, err, budget));
@@ -205,6 +258,67 @@ static void test_record_ram_budget(const std::string & root) {
     CHECK(ec.read_header(id, rec, err));
 }
 
+static void test_record_allocations(const std::string & root) {
+    server_eval_cache ec;
+    std::string err, id;
+    CHECK(ec.open(root + "/alloc", KEY_A, true, err));
+    const size_t payload = 1u << 20;
+    common_prompt_checkpoint c{};
+    c.data_tgt.assign(payload, 7);
+    CHECK(add_entry(ec, seq(1, payload / sizeof(llama_token)), {c}, std::vector<uint8_t>(payload, 8), false, id));
+    server_eval_cache_record rec;
+    allocation_probe::start(payload);
+    const bool loaded = ec.read_header(id, rec, err);
+    const size_t good_allocations = allocation_probe::stop();
+    CHECK(loaded && good_allocations == 3); // tokens, checkpoint target and spec
+    const uint64_t file_bytes = fs::file_size(ec.path_hdr(id));
+    allocation_probe::start(payload);
+    const bool rejected = !ec.read_header(id, rec, err, file_bytes - 1);
+    const size_t rejected_allocations = allocation_probe::stop();
+    CHECK(rejected && rejected_allocations == 0);
+    CHECK(err.find("RAM fit budget") != std::string::npos);
+    CHECK(rec.tokens.empty() && rec.checkpoints.empty() && rec.spec.empty());
+
+    // Keep a small real file; corrupt each declared payload size in turn.
+    CHECK(add_entry(ec, {1}, {}, {2}, false, id));
+    const auto token_offset = uint64_t(4 + 4 + 8 + 4 + KEY_A.size());
+    const auto count_offset = token_offset + 8 + sizeof(llama_token);
+    const auto blob_offset = count_offset + 4;
+    auto overwrite = [&](uint64_t offset, const void * value, size_t n) {
+        std::fstream f(ec.path_hdr(id), std::ios::binary | std::ios::in | std::ios::out);
+        f.seekp(std::streamoff(offset));
+        f.write(static_cast<const char *>(value), std::streamsize(n));
+        f.close();
+        CHECK(bool(f));
+    };
+    const uint64_t bad_tokens = payload / sizeof(llama_token);
+    const uint64_t bad_blob = payload;
+    for (bool tokens : {true, false}) {
+        CHECK(add_entry(ec, {1}, {}, {2}, false, id));
+        overwrite(tokens ? token_offset : blob_offset, tokens ? &bad_tokens : &bad_blob, 8);
+        allocation_probe::start(payload);
+        const bool bad = !ec.read_header(id, rec, err);
+        const size_t allocations = allocation_probe::stop();
+        CHECK(bad && allocations == 0);
+        CHECK(rec.tokens.empty() && rec.checkpoints.empty() && rec.spec.empty());
+    }
+    CHECK(add_entry(ec, {1}, {}, {2}, false, id));
+    const uint32_t bad_count = 128;
+    overwrite(count_offset, &bad_count, sizeof(bad_count));
+    CHECK(!ec.read_header(id, rec, err));
+    CHECK(err.find("bad checkpoint count") != std::string::npos);
+
+    // A token payload without the required footer must not allocate first.
+    CHECK(add_entry(ec, seq(1, payload / sizeof(llama_token)), {}, {}, false, id));
+    fs::resize_file(ec.path_hdr(id), token_offset + sizeof(uint64_t) + payload);
+    allocation_probe::start(payload);
+    const bool missing_tail = !ec.read_header(id, rec, err);
+    const size_t tail_allocations = allocation_probe::stop();
+    CHECK(missing_tail && tail_allocations == 0);
+    CHECK(err.find("bad token count") != std::string::npos);
+    CHECK(rec.tokens.empty() && rec.checkpoints.empty() && rec.spec.empty());
+}
+
 static void test_index_ram_budget(const std::string & root) {
     const std::string dir = root + "/index-ram";
     const std::string index = dir + "/eval-cache.json";
@@ -215,6 +329,11 @@ static void test_index_ram_budget(const std::string & root) {
         CHECK(add_entry(writer, seq(i * 10000, 8192), {}, {}, false, id));
     }
     const uint64_t index_bytes = fs::file_size(index);
+    auto index_contents = [&]() {
+        std::ifstream f(index, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    };
+    const std::string original_index = index_contents();
     CHECK(reader.open(dir, KEY_A, false, err, 2 * 1024 * 1024));
     CHECK(reader.enabled() && reader.entries.size() == 16);
     CHECK(reader.find(seq(0, 8192), 0) >= 0);
@@ -226,6 +345,7 @@ static void test_index_ram_budget(const std::string & root) {
     CHECK(!reader.open(dir, KEY_A, true, err, 256 * 1024));
     CHECK(err.find("RAM fit budget") != std::string::npos);
     CHECK(fs::file_size(index) == index_bytes);
+    CHECK(index_contents() == original_index);
     CHECK(reader.open(dir, KEY_A, false, err, 0));
     CHECK(!reader.enabled());
     for (uint64_t host_gib : {16, 32, 64, 128}) {
@@ -369,6 +489,7 @@ int main() {
     test_open_and_roundtrip(root);
     test_corruption(root);
     test_record_ram_budget(root);
+    test_record_allocations(root);
     test_index_ram_budget(root);
     test_index_version(root);
 

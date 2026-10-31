@@ -172,8 +172,10 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
     }
 
     uint64_t n_tokens = 0;
+    const uint64_t token_tail = sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint64_t);
     if (!r.val(n_tokens) || n_tokens > EVC_MAX_N_TOKENS || n_tokens == 0 ||
-            n_tokens > SIZE_MAX / sizeof(llama_token) || n_tokens > r.remaining / sizeof(llama_token)) {
+            r.remaining < token_tail || n_tokens > SIZE_MAX / sizeof(llama_token) ||
+            n_tokens > (r.remaining - token_tail) / sizeof(llama_token)) {
         err = file + " has a bad token count";
         return false;
     }
@@ -195,6 +197,13 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
     const uint64_t checkpoint_bytes = sizeof(common_prompt_checkpoint) + 2 * sizeof(void *) + 3 * 64;
     if (n_ckpt > extra_bytes / checkpoint_bytes) {
         err = "eval cache checkpoints exceed the RAM fit budget; using fresh prefill";
+        return false;
+    }
+    // Each checkpoint needs its fields and three blob lengths, even with no payload.
+    const uint64_t checkpoint_min = sizeof(int64_t) + 2 * sizeof(int32_t) + 3 * sizeof(uint64_t);
+    const uint64_t tail_min = sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint64_t);
+    if (r.remaining < tail_min || n_ckpt > (r.remaining - tail_min) / checkpoint_min) {
+        err = file + " has a bad checkpoint count";
         return false;
     }
     out.checkpoints.clear();
