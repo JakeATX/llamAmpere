@@ -569,7 +569,7 @@ static void test_index_growth_budget(const std::string & root) {
     server_eval_cache writer, reader;
     std::string err, id;
     CHECK(writer.open(dir, KEY_A, true, err, 256 * 1024));
-    const llama_tokens first = seq(0, 2048);
+    const llama_tokens first = seq(0, 2053);
     const std::list<common_prompt_checkpoint> first_ck = { ckpt(1000, 1) };
     const std::vector<uint8_t> first_spec = {9, 8, 7};
     CHECK(add_entry(writer, first, first_ck, first_spec, true, id));
@@ -578,10 +578,28 @@ static void test_index_growth_budget(const std::string & root) {
     CHECK(writer.add(first, first_ck, first_spec, true, id, err));
     CHECK(writer.entries.size() == 1 && contents(writer.path_hdr(id)) == first_header);
 
+    const std::string first_index = contents(index);
+    const uint64_t startup_budget = writer.ram_limit_bytes;
+    for (uint64_t live_budget : {uint64_t(0), uint64_t(65536)}) {
+        CHECK(!writer.can_add(first, first_ck, first_spec.size(), err, INT64_MAX, live_budget));
+        CHECK(!writer.add(first, first_ck, first_spec, true, id, err, INT64_MAX, live_budget));
+        CHECK(err.find("RAM fit budget") != std::string::npos);
+        CHECK(writer.ram_limit_bytes == startup_budget && writer.entries.size() == 1);
+        CHECK(contents(index) == first_index && contents(writer.path_hdr(first_id)) == first_header);
+        CHECK(!fs::exists(writer.path_hdr(first_id) + ".tmp"));
+    }
+    for (uint64_t gib : {16, 32, 64, 128}) {
+        const uint64_t live_budget = common_fit_eval_cache_ram_bytes(gib << 30, true);
+        CHECK(writer.can_add(first, first_ck, first_spec.size(), err, INT64_MAX, live_budget));
+        CHECK(writer.ram_limit_bytes == startup_budget);
+    }
+    CHECK(writer.add(first, first_ck, first_spec, true, id, err, INT64_MAX, startup_budget));
+    CHECK(contents(index) == first_index && contents(writer.path_hdr(first_id)) == first_header);
+
     bool refused = false;
     llama_tokens refused_tokens;
     for (int i = 1; i < 128; ++i) {
-        const llama_tokens tokens = seq(i * 2048, 2048);
+        const llama_tokens tokens = seq(i * 2053, 2053);
         const std::string next_id = server_eval_cache::entry_id(tokens);
         const std::string before = contents(index);
         const size_t count = writer.entries.size();
@@ -599,6 +617,8 @@ static void test_index_growth_budget(const std::string & root) {
             CHECK(!fs::exists(writer.path_hdr(next_id)) && !fs::exists(writer.path_hdr(next_id) + ".tmp"));
             CHECK(!fs::exists(writer.path_tgt(next_id)) && !fs::exists(writer.path_dft(next_id)));
             CHECK(!writer.add(tokens, {}, {}, false, id, err));
+            CHECK(!writer.can_add(tokens, {}, 0, err, INT64_MAX, UINT64_MAX));
+            CHECK(writer.ram_limit_bytes == startup_budget);
             CHECK(contents(writer.path_hdr(first_id)) == first_header);
             refused_tokens = tokens;
             refused = true;

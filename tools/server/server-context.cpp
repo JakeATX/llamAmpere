@@ -3057,8 +3057,12 @@ private:
             SLT_ERR(slot, "eval cache: speculative state size changed during save\n");
             return false;
         }
+        if (params_base.fit_params) {
+            common_host_memory(total_ram, available_ram);
+        }
+        const uint64_t index_budget = common_fit_eval_cache_ram_bytes(available_ram, params_base.fit_params);
         std::string err;
-        if (!eval_cache->can_add(tokens, slot.prompt.checkpoints, spec_state.size(), err, n_tokens)) {
+        if (!eval_cache->can_add(tokens, slot.prompt.checkpoints, spec_state.size(), err, n_tokens, index_budget)) {
             SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());
             return false;
         }
@@ -3090,7 +3094,7 @@ private:
         }
 
         std::string out_id;
-        if (!eval_cache->add(tokens, slot.prompt.checkpoints, spec_state, has_dft, out_id, err, n_tokens)) {
+        if (!eval_cache->add(tokens, slot.prompt.checkpoints, spec_state, has_dft, out_id, err, n_tokens, index_budget)) {
             SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());
             return false;
         }

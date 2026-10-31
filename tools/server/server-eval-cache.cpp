@@ -470,15 +470,16 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
 }
 
 bool server_eval_cache::can_add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
-        size_t spec_bytes, std::string & err, int64_t checkpoint_tokens) const {
+        size_t spec_bytes, std::string & err, int64_t checkpoint_tokens, uint64_t ram_bytes) const {
     if (!writable) {
         err = "the eval cache is read-only (start the server with --eval-cache-build to add entries)";
         return false;
     }
 
-    if (ram_limit_bytes != UINT64_MAX) {
+    const uint64_t budget = std::min(ram_limit_bytes, ram_bytes);
+    if (budget != UINT64_MAX) {
         const std::string id = entry_id(tokens);
-        uint64_t remaining = ram_limit_bytes;
+        uint64_t remaining = budget;
         auto charge = [&](uint64_t count, uint64_t size) {
             if (count > remaining / size) {
                 return false;
@@ -543,8 +544,8 @@ bool server_eval_cache::can_add(const llama_tokens & tokens, const std::list<com
 
 bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
         const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err,
-        int64_t checkpoint_tokens) {
-    if (!can_add(tokens, checkpoints, spec.size(), err, checkpoint_tokens)) {
+        int64_t checkpoint_tokens, uint64_t ram_bytes) {
+    if (!can_add(tokens, checkpoints, spec.size(), err, checkpoint_tokens, ram_bytes)) {
         return false;
     }
     const std::string id = entry_id(tokens);
