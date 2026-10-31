@@ -10651,11 +10651,7 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
         return true;
     }
     auto & session = *active_session;
-    const int layer = atoi(op->name + strlen("moe_skipmass-"));
     GGML_ASSERT(session.device_ready.load() && session.devices.size() == 1 && session.devices[0]->logical == ctx.device);
-    GGML_ASSERT(layer < (int) session.mj_groups.size());
-    const auto & group = session.mj_groups[layer];
-    GGML_ASSERT(group[0] && group[1] && group[2] && g_tail_mask && moe_missjoin_hitfirst_enabled());
     const int mode = session.skip_mode;
     GGML_ASSERT(mode >= 0);
     const float threshold = session.skip_threshold;
@@ -10668,6 +10664,10 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
         session.mass_ids = nullptr;
         return true;
     }
+    const int layer = atoi(op->name + strlen("moe_skipmass-"));
+    GGML_ASSERT(layer < (int) session.mj_groups.size());
+    const auto & group = session.mj_groups[layer];
+    GGML_ASSERT(group[0] && group[1] && group[2] && g_tail_mask && moe_missjoin_hitfirst_enabled());
     const bool renorm = session.skip_renorm;
     const int experts = (int) group[0]->desc.n_expert;
     GGML_ASSERT(experts <= g_hf_experts && experts <= MOE_TAIL_MAX_EXPERT);

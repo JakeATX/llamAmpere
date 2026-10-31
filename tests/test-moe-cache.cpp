@@ -7070,6 +7070,19 @@ static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capt
             const bool prepared = session && api.warm(session, descriptors, counts, 3) > 0 &&
                     api.device_prepare(session, descriptors, 3) == 1;
             ok &= prepared;
+            if (prepared) {
+                // Exact router copies need no cache group for the named layer.
+                ggml_set_name(adjusted, "moe_skipmass-47");
+                api.set_skip_tail(session, 1, false);
+                api.set_skip_tail(session, 0, false);
+                api.session_enter(session);
+                ok &= ggml_backend_graph_compute(gpu, startup_graph) == GGML_STATUS_SUCCESS;
+                api.session_leave(session);
+                std::vector<float> unchanged(router_values.size());
+                ggml_backend_tensor_get(adjusted, unchanged.data(), 0, unchanged.size() * sizeof(float));
+                ok &= memcmp(unchanged.data(), router_values.data(), unchanged.size() * sizeof(float)) == 0;
+                ggml_set_name(adjusted, "moe_skipmass-7");
+            }
             const size_t n_out = (size_t) ggml_nelements(graphs[0].out);
             std::vector<float> expected(n_out), exact(n_out), lossy(n_out), again(n_out);
             unsigned long long expected_rows = 0;
