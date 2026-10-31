@@ -256,14 +256,30 @@ static void test_ple_readers() {
         pf.reset();
         // Fit OFF keeps the requested fault readers active and leaves quota unchanged.
         unsetenv("LLAMA_PLE_DECODE");
-        model.params.fit_ram = false;
+        params.fit_ram = false;
+        llama_model_qwen4exp model_off(params);
+        model_off.arch = model.arch;
+        model_off.per_layer_tok_embd = table;
+        model_off.can_prefetch.insert(table);
+        model_off.hparams = model.hparams;
+        model_off.prefetch_remaining = 0;
+        expect(model.ram_fit_enabled() && !model_off.ram_fit_enabled(), "constructor selects independent fit modes");
         if (mprotect(data, bytes, PROT_READ)) { std::abort(); }
-        auto legacy = llama_ple_prefetch::create(model, rows);
+        auto legacy = llama_ple_prefetch::create(model_off, rows);
         if (!legacy) { std::abort(); }
         legacy->hint(tokens.data(), tokens.size(), 0);
         expect(legacy->consume(rows, nullptr, 0), "fit-off retains production PLE fault readers");
         legacy->stop();
-        expect(model.prefetch_remaining == 0, "fit-off does not debit the RAM-fit quota");
+        expect(model_off.prefetch_remaining == 0, "fit-off does not debit the RAM-fit quota");
+        setenv("LLAMA_PLE_PF_MODE", "pread", 1);
+        auto legacy_pread = llama_ple_prefetch::create(model_off, rows);
+        if (!legacy_pread) { std::abort(); }
+        file_read_bytes = 0;
+        legacy_pread->hint(tokens.data(), tokens.size(), 0);
+        expect(legacy_pread->consume(rows, nullptr, 0), "fit-off pread drains with zero optional credit");
+        legacy_pread->stop();
+        expect(file_read_bytes > 0 && model_off.prefetch_remaining == 0,
+                "fit-off performs real file reads without debiting the RAM-fit quota");
     }
     fake_available = 16ull << 30;
     ggml_free(ctx);
