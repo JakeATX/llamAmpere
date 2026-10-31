@@ -961,6 +961,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     static const int vexp = ait_env_int("GGML_CUDA_AIT_V", 0) & 3;
     static const int l2pf = std::max(0, std::min(32, ait_env_int("GGML_CUDA_AIT_L2PF", 0)));
     static const int occ = ait_env_int("GGML_CUDA_AIT_OCC", 0);
+    static const bool neighbor4 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
     static const bool neighbor4_occ = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_OCC", 0) == 1;
     static const int grid_factor = std::max(1, std::min(8, ait_env_int("GGML_CUDA_AIT_OCC_GRID", 4)));
     static const bool ordered = ait_env_int("GGML_CUDA_AIT_ORDERED", 1) != 0;
@@ -971,34 +972,42 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         total_warps = occ >= 3 ? grid_factor * nsm * 8 : 2 * nsm * std::min(warps, 12);
     }
     const bool reserve_neighbor_occ = !use_v && k == 4 && code == 0 && full && warps <= 12 && occ == 0 &&
-        neighbor4_occ && ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
+        neighbor4_occ && neighbor4;
     const int scratch_warps = reserve_neighbor_occ ? 2 * total_warps : total_warps;
     const size_t slots = (scratch_warps + M / 32 - 1) / (M / 32) + 2;
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(id));
     // GGML_CUDA_AIT_FUSE=1 (opt-in, default 0 = second sum kernel): the last warp of each tile sums its slots in the main kernel, so no second launch. The tile
     // counters follow the slots and are zeroed by k_ait_actq. Unset, 0 or the V experiments keep the sum kernel.
     static const bool fuse_opt = ait_env_int("GGML_CUDA_AIT_FUSE", 0) != 0;
-    // The opt-in AIT3/AIT4 kernel experiments below launch without tile counters, so they keep the second sum kernel.
+    // These variants keep the second sum kernel. Plain neighbor loads also support the CTA sum below.
     static const bool ait_kernel_exp = [] {
         static const char * const names[] = { "GGML_CUDA_AIT4_BOUNDS", "GGML_CUDA_AIT4_EARLY_X", "GGML_CUDA_AIT4_UNROLL2",
-            "GGML_CUDA_AIT4_PACK", "GGML_CUDA_AIT4_TAIL", "GGML_CUDA_AIT4_NEIGHBOR", "GGML_CUDA_AIT4_RING1", "GGML_CUDA_AIT4_RING2",
+            "GGML_CUDA_AIT4_PACK", "GGML_CUDA_AIT4_TAIL", "GGML_CUDA_AIT4_RING1", "GGML_CUDA_AIT4_RING2",
             "GGML_CUDA_AIT3_RING1", "GGML_CUDA_AIT3_RING2" };
         for (const char * n : names) { if (ait_env_int(n, 0) == 1) { return true; } }
         const int p3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0);
         return p3 == 1 || p3 == 2;
     }();
-    const bool fuse = ordered && fuse_opt && !use_v && !ait_kernel_exp;
+    static const bool neighbor4_exp = [] {
+        static const char * const names[] = { "GGML_CUDA_AIT4_NEIGHBOR_PACK", "GGML_CUDA_AIT4_NEIGHBOR_RING2",
+            "GGML_CUDA_AIT4_NEIGHBOR_RING1", "GGML_CUDA_AIT4_NEIGHBOR_TAIL", "GGML_CUDA_AIT4_NEIGHBOR_EARLY_X",
+            "GGML_CUDA_AIT4_NEIGHBOR_BOUNDS", "GGML_CUDA_AIT4_NEIGHBOR_UNROLL2", "GGML_CUDA_AIT4_NEIGHBOR_OCC" };
+        for (const char * n : names) { if (ait_env_int(n, 0) == 1) { return true; } }
+        return ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_SCALES", 0) != 0;
+    }();
+    const bool fuse = ordered && fuse_opt && !use_v && !ait_kernel_exp && !neighbor4;
     static const int cta_env = ait_env_int("GGML_CUDA_AIT_CTA", 2);
     static const int cta_mode = cta_env == 1 ? 1 : 2;
     static const bool cta_opt = cta_env != 0;
     static const bool cta_log = ait_env_int("GGML_CUDA_AIT_CTA_LOG", 0) != 0;
-    const bool cta = ordered && cta_opt && !fuse && !use_v && occ == 0 && code == 0 && full && !ait_kernel_exp && ait_cta_ok(M, K, nsm, warps);
+    const bool cta = ordered && cta_opt && !fuse && !use_v && occ == 0 && code == 0 && full && !ait_kernel_exp &&
+        (!neighbor4 || (k == 4 && warps <= 12 && !neighbor4_exp)) && ait_cta_ok(M, K, nsm, warps);
     const size_t cta_smem = cta ? (size_t) warps * 2 * (NT * 33 + 2) * sizeof(float) : 0;
     if (cta_log) {
         // one line per distinct shape, so a run shows whether GGML_CUDA_AIT_CTA engaged or fell back to the ordered slots
         static thread_local std::set<std::tuple<int, int, int, int>> seen;
         if (seen.insert(std::make_tuple(M, K, (int) NT, (int) cta)).second) {
-            fprintf(stderr, "[ait-cta] M=%d K=%d N=%d code=%d k=%d: %s\n", M, K, (int) NT, code, k, cta ? "CTA sum" : "ordered slots (not eligible)");
+            fprintf(stderr, "[ait-cta] M=%d K=%d N=%d code=%d k=%d: %s\n", M, K, (int) NT, code, k, cta ? (neighbor4 ? "CTA sum (neighbor)" : "CTA sum") : "ordered slots (not eligible)");
         }
     }
     if (ordered && !cta) {
@@ -1062,8 +1071,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
         finish();
         return;
     }
-    static const bool neighbor4 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
-    if (neighbor4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+    if (neighbor4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0 && !cta) {
         static const bool neighbor4_pack = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_PACK", 0) == 1;
         static const bool neighbor4_ring2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING2", 0) == 1;
         static const bool neighbor4_ring1 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING1", 0) == 1;
@@ -1171,7 +1179,7 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
             case 3:  k_ait_mmv<3, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
             default:
                 if (neighbor4 && code == 0 && warps <= 12 && occ == 0) {
-                    k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0);
+                    k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0);
                 } else {
                     k_ait_mmv<4, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0);
                 }
