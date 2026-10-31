@@ -120,6 +120,42 @@ static void test(std::mt19937 & rng, bool perf) {
     }
 }
 
+static void test_large_row_offsets(std::mt19937 & rng) {
+    constexpr int M = 32, K = 6144, N = 349536, NU = K/128, TB = 4*magic2::tile_words<5,2>;
+    static_assert(int64_t(N-1)*K > INT32_MAX, "activation offsets cross signed 32-bit range");
+    std::vector<uint8_t> w(size_t(M/16)*NU*AIF25_UNIT_BYTES);
+    for (uint8_t & v : w) v = rng();
+    for (size_t offset = 0; offset < w.size(); offset += AIF25_UNIT_BYTES) {
+        for (int m = 0; m < 16; ++m) {
+            const __half scale = __float2half(1.0f);
+            std::memcpy(w.data()+offset+2*m, &scale, sizeof(scale));
+        }
+    }
+    std::vector<float> scales(size_t(N)*(NU/2), 1.0f);
+    uint8_t * dw; int8_t * dx; float * ds, * dy;
+    CK(cudaMalloc(&dw, w.size())); CK(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dx, size_t(N)*K)); CK(cudaMemset(dx, 1, size_t(N)*K));
+    CK(cudaMalloc(&ds, scales.size()*sizeof(float)));
+    CK(cudaMemcpy(ds, scales.data(), scales.size()*sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dy, size_t(N)*M*sizeof(float)));
+    magic2::mmv<5,2,AIF25_MUL,1><<<dim3(M/16, (N+7)/8),128>>>(dw, dx, ds, dy, M, K, N);
+    CK(cudaGetLastError());
+    int expected[M] = {};
+    for (int m = 0; m < M; ++m) for (int u = 0; u < NU; ++u) for (int k = 0; k < 128; ++k) {
+        const uint8_t * unit = w.data()+((m/16)*NU+u)*AIF25_UNIT_BYTES;
+        expected[m] += reference<5,2,AIF25_MUL>(unit+32+(k/8)*TB, (m%16)*8+k%8);
+    }
+    for (int row : {0, INT32_MAX/K-1, INT32_MAX/K, INT32_MAX/K+1, N-1}) {
+        float y[M];
+        CK(cudaMemcpy(y, dy+int64_t(row)*M, sizeof(y), cudaMemcpyDeviceToHost));
+        for (int m = 0; m < M; ++m) {
+            require(std::isfinite(y[m]) && y[m] == expected[m], "large activation row mismatch");
+        }
+    }
+    CK(cudaFree(dw)); CK(cudaFree(dx)); CK(cudaFree(ds)); CK(cudaFree(dy));
+    std::puts("PASS fractional activation offsets above INT32_MAX");
+}
+
 static std::vector<float> backend_product(ggml_backend_t backend, int K, int M, int tokens, int seqs, int groups,
                                          const std::vector<uint8_t> & w, const std::vector<float> & x) {
     ggml_context * ctx = ggml_init({ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true});
@@ -147,6 +183,16 @@ static std::vector<float> backend_product(ggml_backend_t backend, int K, int M, 
 static void test_backend(std::mt19937 & rng) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     require(backend != nullptr, "CUDA backend initialization failed");
+    for (bool wide_k : {false, true}) {
+        ggml_context * ctx = ggml_init({ggml_tensor_overhead()*4, nullptr, true});
+        require(ctx != nullptr, "shape-only context allocation failed");
+        const int64_t K = wide_k ? int64_t(INT32_MAX)+1 : 128;
+        const int64_t M = wide_k ? 16 : int64_t(INT32_MAX)+1;
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_AIF25_U, K, M);
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
+        require(!ggml_backend_supports_op(backend, ggml_mul_mat(ctx, weight, input)), "fractional dispatch narrowed an oversized dimension");
+        ggml_free(ctx);
+    }
     constexpr int M = 32;
     for (int K : {128, 256, 6144}) {
         std::vector<uint8_t> w(size_t(M/16)*(K/128)*AIF25_UNIT_BYTES);
@@ -191,6 +237,9 @@ int main(int argc, char ** argv) {
         test<2,1,0xC3CCD12Du>(rng, perf);
         test<3,1,0x87D8D12Du>(rng, perf);
     }
-    if (!perf) test_backend(rng);
+    if (!perf) {
+        test_backend(rng);
+        test_large_row_offsets(rng);
+    }
     std::puts(perf ? "PERF COMPLETE prepared-activation kernel only" : "PASS computed-pair and scalar controls");
 }

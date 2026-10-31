@@ -1109,6 +1109,7 @@ bool ggml_cuda_aif25_supported(const ggml_tensor * op) {
     const auto * w = op->src[0]; const auto * x = op->src[1];
     return op->op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_AIF25_U &&
         x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        w->ne[0] > 0 && w->ne[0] <= INT32_MAX && w->ne[1] > 0 && w->ne[1] <= INT32_MAX &&
         w->ne[2] == 1 && w->ne[3] == 1 &&
         w->ne[0] % 128 == 0 && w->ne[1] % 16 == 0 &&
         ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op);

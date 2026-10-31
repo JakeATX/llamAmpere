@@ -50,10 +50,10 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
     __shared__ float partial[4][8][16];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int row = lane >> 2, col = lane & 3, nu = K / 128;
-    const int nbase = blockIdx.y * 8, mbase = blockIdx.x * 16;
+    const int64_t nbase = int64_t(blockIdx.y) * 8, mbase = int64_t(blockIdx.x) * 16;
     float sum[4] = {0, 0, 0, 0};
     for (int u = warp; u < nu; u += 4) {
-        const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (blockIdx.x * nu + u) * UW;
+        const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (int64_t(blockIdx.x) * nu + u) * UW;
         for (int i = lane; i < UW; i += 32) tiles[warp][i] = __ldg(source + i);
         __syncwarp();
         int c[4] = {0, 0, 0, 0};
@@ -65,7 +65,7 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
                 fragment<B,V,C>(a1, row, col & 1), fragment<B,V,C>(a1, row + 8, col & 1)};
             uint32_t b0 = 0, b1 = 0;
             if (nbase + row < N) {
-                const int8_t * p = x + (nbase + row) * K + u * 128 + j * 32 + col * 4;
+                const int8_t * p = x + (nbase + row) * K + int64_t(u) * 128 + j * 32 + col * 4;
                 b0 = __ldg(reinterpret_cast<const uint32_t *>(p));
                 b1 = __ldg(reinterpret_cast<const uint32_t *>(p + 16));
             }
