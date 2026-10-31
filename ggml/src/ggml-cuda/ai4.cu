@@ -1459,7 +1459,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         ggml_type bank_type, const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
         const int32_t * ids, int64_t ids_stride, int n_expert, const block_q8_1 * x,
         const uint8_t * skip, const uint8_t * resident, char * route_ids, size_t route_ids_stride,
-        float * route_mask, bool trace) {
+        float * route_mask) {
     const int u = blockIdx.y, t = blockIdx.z;
     const int native = *(const int32_t *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
     const int h = idm.direct_map ?
@@ -1511,12 +1511,6 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
 #undef MOE_MIXED_CASE
             default: __trap();
         }
-    }
-    if (trace && !hot && table && blockIdx.x == 0 && threadIdx.x == 0 &&
-            (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL)) {
-        printf("[moe-bank-mixed] base-computed base=%s table=1 width=%d expert=%d route=%d token=%d\n",
-                type == GGML_TYPE_IQ3_XXS ? "iq3_xxs" : type == GGML_TYPE_Q2_0 ? "q2_0" : "iq4_nl",
-                (int) gridDim.z, e, u, t);
     }
 }
 
@@ -1640,7 +1634,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             (const uint8_t *) w->data, act_ai_q, act_ai_s, (float *) dst->data, M, K, idm, \
             w->type, (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
             ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
-            route_map ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr, trace > 1)
+            route_map ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr)
 #define MOE_MIXED_SINGLE(L, XSH, KT, WARPS) \
     if (single) { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, true, false); } \
     else        { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, false, false); }
