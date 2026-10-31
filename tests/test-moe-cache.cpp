@@ -5092,6 +5092,12 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
                 routing[2*t] = route_mode == 0 ? 0 : route_mode == 1 ? 1 : t % 3;
                 routing[2*t + 1] = route_mode == 0 ? 0 : route_mode == 1 ? 2 : t == 2 ? routing[2*t] : (t + 1) % 3;
             }
+            if (neighbor_output) {
+                // High IDs stay cold under the bounded whole-expert plan.
+                for (auto & id : routing) {
+                    if (id != 0) { id = weights->ne[2] - id; }
+                }
+            }
             ggml_backend_tensor_set(acts, values.data(), 0, values.size() * sizeof(float));
             ggml_backend_tensor_set(ids, routing.data(), 0, routing.size() * sizeof(int32_t));
             test_graph reference = make_graph(cpu, weights, acts, ids);
@@ -5112,7 +5118,11 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             std::vector<uint64_t> usage(weights->ne[2], 0);
             usage[0] = 100;
             const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
-            ok &= sibling_buffer && ggml_backend_sched_moe_cache_warm(scheduler, descriptors, counts, 3) > 0;
+            const auto warmed = sibling_buffer ? ggml_backend_sched_moe_cache_warm(scheduler, descriptors, counts, 3) : 0;
+            ok &= warmed > 0;
+            if (neighbor_output) {
+                ok &= warmed >= 3 * 64 && warmed < 3 * weights->ne[2];
+            }
             const bool prepared = sibling_buffer && ggml_backend_sched_moe_cache_device_prepare(scheduler, descriptors, 3) == 1;
             ok &= prepared != unsupported;
             if (unsupported) {
@@ -5168,6 +5178,9 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
                 // the budget is full, so only all-expert-0 routing must hit everywhere.
                 ok &= max_field_value(log, "hits=") + max_field_value(log, "misses=") == 6 * tokens;
                 ok &= route_mode != 0 || max_field_value(log, "misses=") == 0;
+                if (neighbor_output && route_mode != 0) {
+                    ok &= max_field_value(log, "misses=") > 0;
+                }
             }
             ggml_backend_buffer_free(candidate.buffer);
             ggml_free(candidate.ctx);
@@ -7520,7 +7533,8 @@ static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
     // and unregistered pages, although the destination is outside all weights.
     {
         const size_t page = (size_t)sysconf(_SC_PAGESIZE);
-        const size_t bytes = ggml_nbytes(initial_weights);
+        constexpr int64_t edge_experts = 512;
+        const size_t bytes = initial_weights->nb[2] * edge_experts;
         const size_t bank_offset = 64;
         const size_t rounded_end = (bank_offset + bytes + page - 1) & ~(page - 1);
         const size_t allocation_bytes = rounded_end + 2 * page;
@@ -7531,10 +7545,15 @@ static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
             void * data = (char *)allocation + bank_offset;
             float * destination = (float *)((char *)allocation + rounded_end - 128);
             edge_ok &= (char *)destination >= (char *)data + bytes;
-            memcpy(data, initial_weights->data, bytes);
+            for (int64_t e = 0; e < edge_experts; ++e) {
+                memcpy((char *)data + e * initial_weights->nb[2],
+                        (const char *)initial_weights->data + (e % initial_weights->ne[2]) * initial_weights->nb[2],
+                        initial_weights->nb[2]);
+            }
             ggml_init_params params = {ggml_tensor_overhead(), nullptr, true};
             ggml_context * ctx = ggml_init(params);
-            ggml_tensor * weights = ggml_dup_tensor(ctx, initial_weights);
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, initial_weights->type,
+                    initial_weights->ne[0], initial_weights->ne[1], edge_experts);
             ggml_set_name(weights, initial_weights->name);
             ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
             edge_ok &= ggml_backend_tensor_alloc(buffer, weights, data) == GGML_STATUS_SUCCESS;
@@ -8408,6 +8427,18 @@ int main(int argc, char ** argv) {
     std::vector<float> reference(ggml_nelements(graph.out));
     ggml_backend_tensor_get(
             graph.out, reference.data(), 0, reference.size() * sizeof(float));
+
+    if (argc == 2 && strcmp(argv[1], "--device-tables-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_tables(gpu, cpu, weights, capture);
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_quantize_free();
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        ggml_log_set(nullptr, nullptr);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
 
     if (profile_warm_only) {
         bool ok = run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
