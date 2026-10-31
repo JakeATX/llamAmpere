@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 
 static int failures = 0;
@@ -62,6 +63,82 @@ static void test_ngram_live_limit() {
     common_ngram_cache_merge(collected, unlimited, 0);
     expect(collected.size() == unlimited.size(), "zero key limit keeps unlimited merge behavior");
     expect(unlimited == source_before, "bounded and unlimited merges leave the source unchanged");
+}
+
+static void test_ngram_delta_admission() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("test-ngram-fit-" + std::to_string(ggml_time_us()));
+    const bool created = fs::create_directory(dir);
+    expect(created, "create a private ngram save test directory");
+    if (!created) {
+        return;
+    }
+    const std::string path = (dir / "cache").string();
+    const common_ngram_cache_vocab_id vocab = {100, 123};
+    std::string err;
+    std::vector<llama_token> tokens = {2, 3, 0, 1};
+    common_ngram a(tokens.data() + 2, 1);
+    common_ngram b(tokens.data(), 1);
+    const common_ngram_cache disk = {{a, {{1, 10}}}};
+
+    // The old independent cap learns B in the delta and loses the retained A increment at save.
+    common_ngram_cache old_live = disk;
+    common_ngram_cache old_delta;
+    common_ngram_cache_update(old_live, 1, 1, tokens, tokens.size(), false, 1);
+    common_ngram_cache_update(old_delta, 1, 1, tokens, tokens.size(), false, 1);
+    expect(old_live.at(a).at(1) == 11 && old_delta.count(b) == 1 && old_delta.count(a) == 0,
+            "independent admission positive control reproduces different live and delta keys");
+    expect(common_ngram_cache_save_file(disk, path, vocab, err), "write independent-admission control");
+    expect(common_ngram_cache_sync_file(path, old_live, old_delta, 1, vocab, err), "save independent-admission control");
+    expect(old_live.at(a).at(1) == 10, "independent-admission control loses the retained increment");
+
+    common_ngram_cache live = disk;
+    common_ngram_cache delta;
+    common_ngram_cache_update(live, 1, 1, tokens, tokens.size(), false, 1);
+    common_ngram_cache_update(delta, 1, 1, tokens, tokens.size(), false, 1, &live);
+    expect(live.size() == 1 && delta.size() == 1 && delta.at(a).at(1) == 1,
+            "the bounded delta records only keys admitted by the live cache");
+    expect(common_ngram_cache_save_file(disk, path, vocab, err), "write coordinated-admission base");
+    expect(common_ngram_cache_sync_file(path, live, delta, 1, vocab, err), "save coordinated delta");
+    common_ngram_cache restored;
+    expect(common_ngram_cache_load_file(path, restored, vocab, err) == COMMON_NGRAM_CACHE_LOAD_OK,
+            "restore coordinated save");
+    expect(live == restored && live.at(a).at(1) == 11 && delta.empty(),
+            "save and reload keep the retained key increment exactly once");
+
+    std::vector<llama_token> next = {4, 5};
+    common_ngram c(next.data(), 1);
+    common_ngram_cache saved = {{c, {{5, 100}}}};
+    delta = {{a, {{1, 1}}}};
+    common_ngram_cache_refresh(live, saved, delta, 1);
+    expect(live.size() == 1 && live.count(c) == 1 && delta.empty() && saved.count(a) == 1,
+            "checkpoint collection drops retired delta keys and hands the old live cache back");
+    const auto checkpoint_disk = live;
+    common_ngram_cache_update(live, 1, 1, next, next.size(), false, 1);
+    common_ngram_cache_update(delta, 1, 1, next, next.size(), false, 1, &live);
+    expect(delta.size() == 1 && delta.at(c).at(5) == 1, "retired keys cannot fill the next checkpoint delta");
+    expect(common_ngram_cache_save_file(checkpoint_disk, path, vocab, err), "write changed checkpoint base");
+    expect(common_ngram_cache_sync_file(path, live, delta, 1, vocab, err), "save after a different-key checkpoint");
+    expect(live.size() == 1 && live.at(c).at(5) == 101 && delta.empty(),
+            "the next saved checkpoint also keeps its retained increment");
+
+    common_ngram_cache unlimited = disk;
+    common_ngram_cache unlimited_delta;
+    common_ngram_cache_update(unlimited, 1, 1, tokens, tokens.size(), false);
+    common_ngram_cache_update(unlimited_delta, 1, 1, tokens, tokens.size(), false, 0, &unlimited);
+    common_ngram_cache expected = disk;
+    common_ngram_cache_update(expected, 1, 1, tokens, tokens.size(), false);
+    common_ngram_cache refreshed = disk;
+    common_ngram_cache_refresh(unlimited, refreshed, unlimited_delta, 0);
+    expect(unlimited == expected && unlimited_delta.size() == 3,
+            "unlimited checkpoint collection keeps all learned keys and counts");
+
+    common_ngram_cache failed_delta = {{a, {{1, 2}}}};
+    common_ngram_cache since_handover = {{c, {{5, 3}}}};
+    common_ngram_cache_merge(failed_delta, since_handover, 2);
+    expect(failed_delta.size() == 2 && failed_delta.at(a).at(1) == 2 && failed_delta.at(c).at(5) == 3,
+            "failed checkpoint collection keeps disjoint admitted delta keys");
+    fs::remove_all(dir);
 }
 
 static void test_ram_fit() {
@@ -300,6 +377,7 @@ static void test_ram_prompt_fit() {
 
 int main() {
     test_ngram_live_limit();
+    test_ngram_delta_admission();
     test_ram_fit();
     test_ram_prompt_fit();
     test_ram_eval_fit();

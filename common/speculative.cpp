@@ -3854,9 +3854,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             file_present = true;
 
             try {
-                // the live delta was learned after the handover, it is not in the file yet and stays a delta
-                common_ngram_cache_merge(ckpt_cache, ngram_cache_delta, n_max_dynamic);
-                std::swap(ngram_cache_dynamic, ckpt_cache);
+                // Keep new counts only for keys retained by the bounded saved cache.
+                common_ngram_cache_refresh(ngram_cache_dynamic, ckpt_cache, ngram_cache_delta, n_max_dynamic);
             } catch (const std::exception & e) {
                 // out of memory during the merge: keep the current in-memory cache (it contains the delta
                 // that was just written, and the live one), and let the worker free the half-merged copy
@@ -3978,7 +3977,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
             if (save_dynamic) {
                 // the dynamic cache learns from every sequence; the delta is what sync() writes back
                 common_ngram_cache_update(ngram_cache_dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false, n_max_dynamic);
-                common_ngram_cache_update(ngram_cache_delta,   LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false, n_max_dynamic);
+                common_ngram_cache_update(ngram_cache_delta,   LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, inp, nnew, false, n_max_dynamic, &ngram_cache_dynamic);
             }
 
             sinfo.cache_size = inp.size();

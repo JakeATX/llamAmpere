@@ -28,7 +28,8 @@
 #endif
 
 void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, int ngram_max,
-                              std::vector<llama_token> & inp, int nnew, bool print_progress, size_t n_max) {
+                              std::vector<llama_token> & inp, int nnew, bool print_progress, size_t n_max,
+                              const common_ngram_cache * admitted) {
     const int64_t t_start_ms = ggml_time_ms();
     const int64_t inp_size = inp.size();
 
@@ -41,6 +42,9 @@ void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, 
             const int64_t ngram_start = i - ngram_size;
             common_ngram ngram(&inp[ngram_start], ngram_size);
             const llama_token token = inp[i];
+            if (admitted && admitted->find(ngram) == admitted->end()) {
+                continue;
+            }
 
             common_ngram_cache::iterator part_it = ngram_cache.find(ngram);
             if (part_it == ngram_cache.end()) {
@@ -898,6 +902,19 @@ void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ng
             }
 
             token_count_merged_it->second += count;
+        }
+    }
+}
+
+void common_ngram_cache_refresh(common_ngram_cache & live, common_ngram_cache & saved, common_ngram_cache & delta, size_t n_max) {
+    GGML_ASSERT(&live != &saved && &live != &delta && &saved != &delta);
+    common_ngram_cache_merge(saved, delta, n_max);
+    live.swap(saved);
+    for (auto it = delta.begin(); it != delta.end();) {
+        if (live.find(it->first) == live.end()) {
+            it = delta.erase(it);
+        } else {
+            ++it;
         }
     }
 }
