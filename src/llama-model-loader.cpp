@@ -20,6 +20,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <sstream>
 #include <fstream>
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -911,12 +912,17 @@ llama_model_loader::llama_model_loader(
             ++n_added;
         }
         LLAMA_LOG_INFO("%s: overlay %s: %d tensors, %.2f GiB\n", __func__, ov, n_added, added_bytes/1073741824.0);
-        // LLAMA_MODEL_OVERLAY_PATCH=FILE.gguf: tensors that replace same-named, same-shape overlay tensors (a re-encode
-        // of part of a bank without a full copy of it); every patch tensor must replace one overlay tensor.
-        if (const char * pf = getenv("LLAMA_MODEL_OVERLAY_PATCH"); pf && pf[0]) {
+        // LLAMA_MODEL_OVERLAY_PATCH=A.gguf[,B.gguf...]: tensors that replace same-named, same-shape model or overlay
+        // tensors (a re-encode of part of a bank, or re-encoded attention weights, without a full copy of either);
+        // every patch tensor must replace one tensor.
+        if (const char * pfs = getenv("LLAMA_MODEL_OVERLAY_PATCH"); pfs && pfs[0]) {
             if (getenv("LLAMA_MOE_BANK_KEEP")) {
                 throw std::runtime_error("LLAMA_MODEL_OVERLAY_PATCH does not support LLAMA_MOE_BANK_KEEP");
             }
+            std::stringstream pss(pfs);
+            for (std::string pfn; std::getline(pss, pfn, ',');) {
+            if (pfn.empty()) { continue; }
+            const char * pf = pfn.c_str();
             struct ggml_context * pctx = NULL;
             struct gguf_init_params p_params = {
                 /*.no_alloc = */ true,
@@ -936,8 +942,8 @@ llama_model_loader::llama_model_loader(
             int n_patched = 0;
             for (ggml_tensor * cur = ggml_get_first_tensor(pctx); cur; cur = ggml_get_next_tensor(pctx, cur)) {
                 auto it = weights_map.find(cur->name);
-                if (it == weights_map.end() || it->second.idx != idx || !ggml_are_same_shape(it->second.tensor, cur)) {
-                    throw std::runtime_error(format("overlay patch %s: tensor '%s' does not replace an overlay tensor of the same shape",
+                if (it == weights_map.end() || !ggml_are_same_shape(it->second.tensor, cur)) {
+                    throw std::runtime_error(format("overlay patch %s: tensor '%s' does not replace a tensor of the same shape",
                             pf, ggml_get_name(cur)));
                 }
                 n_bytes += ggml_nbytes(cur) - ggml_nbytes(it->second.tensor);
@@ -945,6 +951,7 @@ llama_model_loader::llama_model_loader(
                 ++n_patched;
             }
             LLAMA_LOG_INFO("%s: overlay patch %s: %d tensors replaced\n", __func__, pf, n_patched);
+            }
         }
         }
     }
