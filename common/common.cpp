@@ -1033,8 +1033,8 @@ bool common_host_memory(uint64_t & total, uint64_t & available) {
     if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
         total = memsize;
     }
-    // no MemAvailable equivalent that is cheap and stable: take the total, the clamp is then a no-op
-    available = total;
+    // Total RAM cannot prove free RAM. Automatic fit stays off without a live query.
+    return false;
 #else
     std::ifstream f("/proc/meminfo");
     bool available_read = false;

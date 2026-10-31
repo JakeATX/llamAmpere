@@ -102,7 +102,19 @@ static void test_ram_prompt_fit() {
             "explicit prompt limit wins even when RAM floor cannot be met");
     expect(why.find("cannot") != std::string::npos, "unsafe explicit prompt limit reports infeasible floor");
     expect(common_fit_prompt_cache_ram_mib(16 * GiB, 8 * GiB, 0, true, why) == 0, "explicit cache disable wins");
-    expect(common_fit_prompt_cache_ram_mib(16 * GiB, 8 * GiB, -1, true, why) == 4096, "explicit half-free setting keeps its meaning");
+    for (bool fit : {false, true}) {
+        // Linux CPU backend reports total RAM here, unlike MemAvailable.
+        expect(common_fit_prompt_cache_ram_mib(16 * GiB, 8 * GiB, -1, fit, why, 16 * GiB) == 8192,
+                "explicit half-free limit uses the same CPU query as the release baseline");
+        expect(common_fit_prompt_cache_ram_mib(16 * GiB, 8 * GiB, -1, fit, why, 6 * GiB) == 3072,
+                "explicit half-free limit follows backend free RAM when it differs from total RAM");
+        expect(common_fit_prompt_cache_ram_mib(16 * GiB, 8 * GiB, -1, fit, why, 0) == 8192,
+                "missing CPU query keeps the baseline eight GiB explicit fallback");
+    }
+    expect(common_fit_prompt_cache_ram_mib(64 * GiB, 0, -2, true, why) == 0,
+            "known total with unknown available RAM disables automatic cache under fit");
+    expect(common_fit_prompt_cache_ram_mib(64 * GiB, 0, -2, false, why) == 12288,
+            "unknown available RAM with fit off keeps the baseline total-memory tier");
     expect(common_fit_prompt_cache_ram_mib(16 * GiB, 6 * GiB, -2, false, why) == 3072,
             "fit off keeps prior tier and half-available clamp");
 }

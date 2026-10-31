@@ -40,7 +40,7 @@ size_t common_fit_vram_floor(bool display_attached);
 // Resolve the server prompt cache only after model, contexts and draft have loaded.
 // Positive/zero limits and the explicit half-free setting keep their meaning.
 int32_t common_fit_prompt_cache_ram_mib(uint64_t total, uint64_t available,
-        int32_t requested_mib, bool fit, std::string & why);
+        int32_t requested_mib, bool fit, std::string & why, uint64_t explicit_free = 0);
 
 struct common_moe_cache_params;
 

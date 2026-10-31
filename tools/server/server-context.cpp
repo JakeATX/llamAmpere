@@ -2505,9 +2505,15 @@ private:
             // have loaded. Existing bank/staging RAM is already debited here.
             uint64_t total_host = 0, avail_host = 0;
             common_host_memory(total_host, avail_host);
+            size_t explicit_free = 0, explicit_total = 0;
+            if (cache_ram_mib < 0 && cache_ram_mib != COMMON_CACHE_RAM_AUTO) {
+                if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+                    ggml_backend_dev_memory(cpu_dev, &explicit_free, &explicit_total);
+                }
+            }
             std::string why;
             cache_ram_mib = common_fit_prompt_cache_ram_mib(total_host, avail_host,
-                    cache_ram_mib, params_base.fit_params, why);
+                    cache_ram_mib, params_base.fit_params, why, explicit_free);
             if (!params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO &&
                     llama_model_moe_arena_size(model_tgt) > 0) {
                 const uint64_t reserve = 11ull << 30;

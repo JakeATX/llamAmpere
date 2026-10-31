@@ -59,13 +59,14 @@ common_fit_ram_result common_fit_ram_plan(uint64_t available,
 }
 
 int32_t common_fit_prompt_cache_ram_mib(uint64_t total, uint64_t available,
-        int32_t requested_mib, bool fit, std::string & why) {
+        int32_t requested_mib, bool fit, std::string & why, uint64_t explicit_free) {
     constexpr uint64_t MiB = 1ull << 20;
     if (requested_mib != COMMON_CACHE_RAM_AUTO) {
-        // -1 explicitly requests half the free host memory, not unlimited RAM.
-        const int32_t resolved = requested_mib < 0 ?
-            (int32_t) std::min<uint64_t>(available / (2 * MiB), INT32_MAX) : requested_mib;
-        why = requested_mib < 0 ? "explicit half of available RAM" : "explicit cache limit";
+        // Keep the CPU backend query and 8192 MiB fallback used by explicit -1.
+        const int32_t resolved = requested_mib < 0 ? (explicit_free > 0 ?
+            (int32_t) std::min<uint64_t>(explicit_free / (2 * MiB), INT32_MAX) : 8192) : requested_mib;
+        why = requested_mib < 0 ? (explicit_free > 0 ? "explicit half of backend-reported free RAM" :
+            "explicit limit uses the 8192 MiB fallback") : "explicit cache limit";
         if (fit && (available < (5ull << 30) || uint64_t(resolved) * MiB > available - (5ull << 30))) {
             why += "; cannot leave 5 GiB free with this explicit setting";
         }
