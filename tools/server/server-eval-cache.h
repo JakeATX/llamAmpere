@@ -57,6 +57,7 @@ struct server_eval_cache {
     std::vector<server_eval_cache_entry> entries;
 
     size_t n_skipped = 0; // entries ignored at open (bad header, key mismatch)
+    uint64_t ram_limit_bytes = UINT64_MAX;
 
     // open the folder. Read-only mode requires an existing index whose key equals `key`; build mode creates the
     // folder and index when missing and still refuses a folder built for another key. An unsupported version disables the read-only cache with a warning; build mode refuses it. `err` says why on failure.

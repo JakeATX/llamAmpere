@@ -555,6 +555,63 @@ static void test_streamed_index(const std::string & root) {
 #endif
 }
 
+static void test_index_growth_budget(const std::string & root) {
+    const std::string dir = root + "/index-growth";
+    const std::string index = dir + "/eval-cache.json";
+    auto contents = [](const std::string & path) {
+        std::ifstream f(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    };
+    server_eval_cache writer, reader;
+    std::string err, id;
+    CHECK(writer.open(dir, KEY_A, true, err, 256 * 1024));
+    const llama_tokens first = seq(0, 2048);
+    CHECK(add_entry(writer, first, {}, {}, false, id));
+    const std::string first_id = id;
+    const std::string first_header = contents(writer.path_hdr(id));
+    CHECK(writer.add(first, {}, {}, false, id, err));
+    CHECK(writer.entries.size() == 1 && contents(writer.path_hdr(id)) == first_header);
+
+    bool refused = false;
+    llama_tokens refused_tokens;
+    for (int i = 1; i < 128; ++i) {
+        const llama_tokens tokens = seq(i * 2048, 2048);
+        const std::string next_id = server_eval_cache::entry_id(tokens);
+        const std::string before = contents(index);
+        const size_t count = writer.entries.size();
+        touch(writer.path_tgt(next_id), 4096);
+        allocation_probe::start(tokens.size() * sizeof(llama_token));
+        const bool saved = writer.add(tokens, {}, {}, false, id, err);
+        const size_t copies = allocation_probe::stop();
+        if (!saved) {
+            CHECK(err.find("RAM fit budget") != std::string::npos);
+            CHECK(copies == 0 && allocation_probe::largest < tokens.size() * sizeof(llama_token));
+            CHECK(writer.entries.size() == count && contents(index) == before);
+            CHECK(!fs::exists(writer.path_hdr(next_id)) && !fs::exists(writer.path_hdr(next_id) + ".tmp"));
+            CHECK(contents(writer.path_hdr(first_id)) == first_header);
+            refused_tokens = tokens;
+            refused = true;
+            break;
+        }
+    }
+    CHECK(refused && writer.entries.size() > 1);
+    CHECK(reader.open(dir, KEY_A, false, err));
+    CHECK(reader.entries.size() == writer.entries.size());
+    server_eval_cache_record rec;
+    CHECK(reader.read_header(first_id, rec, err) && rec.tokens == first);
+    if (!refused) {
+        return;
+    }
+
+    // An unbounded reopen must accept the same tokens and make the real copy.
+    CHECK(writer.open(dir, KEY_A, true, err));
+    allocation_probe::start(refused_tokens.size() * sizeof(llama_token));
+    const bool saved = writer.add(refused_tokens, {}, {}, false, id, err);
+    const size_t copies = allocation_probe::stop();
+    CHECK(saved && copies > 0);
+    CHECK(writer.read_header(id, rec, err) && rec.tokens == refused_tokens);
+}
+
 static void test_index_ram_budget(const std::string & root) {
     const std::string dir = root + "/index-ram";
     const std::string index = dir + "/eval-cache.json";
@@ -730,6 +787,7 @@ int main() {
     test_borrowed_checkpoints(root);
     test_streamed_index(root);
     test_index_ram_budget(root);
+    test_index_growth_budget(root);
     test_index_version(root);
 
     std::error_code ec;

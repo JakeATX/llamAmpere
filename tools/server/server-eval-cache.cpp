@@ -278,6 +278,7 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
     key      = key_in;
     key_hash = server_prompt_disk_hash(key.data(), key.size());
     writable = writable_in;
+    ram_limit_bytes = ram_bytes;
     std::vector<server_eval_cache_entry>().swap(entries);
     n_skipped = 0;
 
@@ -478,6 +479,33 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
 
     const std::string id = entry_id(tokens);
     id_out = id;
+
+    if (ram_limit_bytes != UINT64_MAX) {
+        uint64_t remaining = ram_limit_bytes;
+        auto charge = [&](uint64_t count, uint64_t size) {
+            if (count > remaining / size) {
+                return false;
+            }
+            remaining -= count * size;
+            return true;
+        };
+        // Include vector growth, the pending entry, and replacement-copy scratch.
+        bool fits = charge(1, 65536 + sizeof(*this)) && charge(dir.capacity(), 1) && charge(key.capacity(), 1) &&
+                charge(entries.capacity(), 4 * sizeof(server_eval_cache_entry)) &&
+                charge(tokens.size(), 2 * sizeof(llama_token)) && charge(id.capacity(), 2) && charge(1, 512);
+        for (const auto & e : entries) {
+            const size_t n_tokens = e.id == id ? std::max(e.tokens.capacity(), tokens.size()) : e.tokens.capacity();
+            fits = fits && charge(1, 512 + 4 * sizeof(server_eval_cache_entry)) &&
+                    charge(e.id.capacity(), 2) && charge(n_tokens, sizeof(llama_token));
+            if (!fits) {
+                break;
+            }
+        }
+        if (!fits) {
+            err = "eval cache index growth exceeds the RAM fit budget; entry was not saved";
+            return false;
+        }
+    }
 
     const std::string file = path_hdr(id);
     const std::string tmp  = file + ".tmp";
