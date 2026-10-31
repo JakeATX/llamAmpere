@@ -1,5 +1,8 @@
 #include "../ggml/src/ggml-cuda/magic2-v2.cuh"
 #include "../ggml/src/ggml-aif25.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -117,6 +120,63 @@ static void test(std::mt19937 & rng, bool perf) {
     }
 }
 
+static std::vector<float> backend_product(ggml_backend_t backend, int K, int M, int tokens, int seqs, int groups,
+                                         const std::vector<uint8_t> & w, const std::vector<float> & x) {
+    ggml_context * ctx = ggml_init({ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true});
+    require(ctx != nullptr, "backend context allocation failed");
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_AIF25_U, K, M);
+    ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, K, tokens, seqs, groups);
+    ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
+    require(out->ne[0] == M && out->ne[1] == tokens && out->ne[2] == seqs && out->ne[3] == groups, "backend output shape mismatch");
+    require(ggml_backend_supports_op(backend, out), "fractional backend dispatch rejected activation shape");
+    ggml_build_forward_expand(graph, out);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "backend tensor allocation failed");
+    require(ggml_nbytes(weight) == w.size() && ggml_nbytes(input) == x.size()*sizeof(float), "backend input size mismatch");
+    ggml_backend_tensor_set(weight, w.data(), 0, w.size());
+    ggml_backend_tensor_set(input, x.data(), 0, x.size()*sizeof(float));
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "fractional backend graph failed");
+    std::vector<float> y(ggml_nelements(out));
+    ggml_backend_tensor_get(out, y.data(), 0, y.size()*sizeof(float));
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return y;
+}
+
+static void test_backend(std::mt19937 & rng) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    require(backend != nullptr, "CUDA backend initialization failed");
+    constexpr int M = 32;
+    for (int K : {128, 256, 6144}) {
+        std::vector<uint8_t> w(size_t(M/16)*(K/128)*AIF25_UNIT_BYTES);
+        for (uint8_t & v : w) v = rng();
+        for (size_t offset = 0; offset < w.size(); offset += AIF25_UNIT_BYTES) {
+            for (int m = 0; m < 16; ++m) {
+                const __half scale = __float2half((int(rng()%19)-9)/128.0f);
+                std::memcpy(w.data()+offset+2*m, &scale, sizeof(scale));
+            }
+        }
+        for (int tokens : {1, 5}) for (int seqs : {1, 3}) for (int groups : {1, 2}) {
+            const int rows = tokens*seqs*groups;
+            std::vector<float> x(rows*K);
+            for (float & v : x) v = (int(rng()%255)-127)/64.0f;
+            const auto y = backend_product(backend, K, M, tokens, seqs, groups, w, x);
+            // Each row gets its own graph so a dropped or mixed sequence cannot match.
+            for (int row = 0; row < rows; ++row) {
+                const std::vector<float> xi(x.begin()+row*K, x.begin()+(row+1)*K);
+                const auto ref = backend_product(backend, K, M, 1, 1, 1, w, xi);
+                for (int m = 0; m < M; ++m) {
+                    require(std::isfinite(y[row*M+m]) && y[row*M+m] == ref[m], "backend sequence row mismatch");
+                }
+            }
+            std::printf("BACKEND PASS K=%d tokens=%d seqs=%d groups=%d rows=%d\n", K, tokens, seqs, groups, rows);
+        }
+    }
+    ggml_backend_free(backend);
+    std::puts("PASS fractional backend sequence dimensions");
+}
+
 int main(int argc, char ** argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
@@ -131,5 +191,6 @@ int main(int argc, char ** argv) {
         test<2,1,0xC3CCD12Du>(rng, perf);
         test<3,1,0x87D8D12Du>(rng, perf);
     }
+    if (!perf) test_backend(rng);
     std::puts(perf ? "PERF COMPLETE prepared-activation kernel only" : "PASS computed-pair and scalar controls");
 }
