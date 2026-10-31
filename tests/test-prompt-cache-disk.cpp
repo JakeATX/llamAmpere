@@ -769,6 +769,55 @@ static void test_lora_scales(const std::string & root) {
     CHECK(t.read(find_entry(t, n.tokens), r) && r.lora_scales.empty() && same(r, n));
 }
 
+static void test_fit_ram(const std::string & root) {
+    std::unique_ptr<server_prompt_cache> pc;
+    server_prompt_cache::configure(pc, 16, 1024, true);
+    CHECK(pc && pc->fit_ram && pc->spare_max_n == 0);
+    pc->available_ram = []() { return 6 * GiB; };
+    pc->disk = make_tier(root + "/fit", "k", 0);
+
+    server_prompt p;
+    p.tokens = server_tokens(make_entry(3, 300, 0).tokens, false);
+    CHECK(pc->alloc(p, 17 * MiB, 0) == nullptr);
+    CHECK(!pc->staging_pending && pc->size() == 0);
+    CHECK(pc->alloc(p, SIZE_MAX, 1) == nullptr);
+
+    auto * entry = pc->alloc(p, MiB, 0);
+    CHECK(entry != nullptr && pc->size() <= pc->limit_size);
+    CHECK(entry && entry->data.main.capacity() == MiB);
+    pc->flush_to_disk();
+    CHECK(pc->disk.n_match() == 1);
+
+    // Budget failures keep the disk file; a later read with room still works.
+    const auto it = pc->disk.entries.begin();
+    const std::string file = it->file;
+    server_prompt_disk_record rec;
+    CHECK(!pc->disk.read(it, rec, 4 * MiB));
+    CHECK(rec.main.empty() && rec.tokens.empty() && fs::exists(file));
+    CHECK(pc->disk.n_match() == 1);
+    CHECK(pc->disk.read(it, rec, 6 * MiB));
+    CHECK(rec.main.size() == MiB && rec.tokens == p.tokens.get_text_tokens());
+
+    // The live floor can stop a sub-limit save after RAM use grows.
+    pc->available_ram = []() { return 5 * GiB + MiB; };
+    server_prompt q;
+    q.tokens = server_tokens(make_entry(9, 300, 0).tokens, false);
+    CHECK(pc->alloc(q, 2 * MiB, 0) == nullptr);
+    CHECK(!pc->staging_pending);
+    CHECK(pc->disk_read_budget() == MiB - MiB / 5);
+    pc->available_ram = []() { return 4 * GiB; };
+    CHECK(pc->disk_read_budget() == 0);
+
+    // Reload must drop a prior positive cache when the new fit selects zero.
+    server_prompt_cache::configure(pc, 0, 1024, true);
+    CHECK(!pc);
+    server_prompt_cache::configure(pc, 16, 1024, true);
+    CHECK(pc && pc->states.empty() && pc->spare.empty() && !pc->staging_pending);
+    CHECK(pc->limit_size == 16 * MiB);
+    server_prompt_cache::configure(pc, 0, 1024, true);
+    CHECK(!pc);
+}
+
 int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
@@ -786,6 +835,7 @@ int main() {
     test_ram_ckpt_keep();
     test_mtmd_text_only_spills(root);
     test_lora_scales(root);
+    test_fit_ram(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);

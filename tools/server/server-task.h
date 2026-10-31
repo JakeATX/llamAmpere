@@ -687,6 +687,13 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
     }
 
+    static void configure(std::unique_ptr<server_prompt_cache> & cache, int32_t limit_mib, size_t n_ctx, bool fit_ram);
+
+    bool fit_ram = false;
+    std::function<uint64_t()> available_ram;
+    bool reserve_ram(size_t extra);
+    size_t disk_read_budget() const;
+
     std::list<server_prompt_cache_state> states;
 
     // in bytes, 0 = no limit

@@ -2485,6 +2485,8 @@ private:
             params_base.cache_ram_mib = 0;
         }
 
+        // Drop the old RAM tier before the wake-up snapshot and size it afresh.
+        prompt_cache.reset();
         int32_t cache_ram_mib = params_base.cache_ram_mib;
         if (cache_ram_mib != 0) {
             // Snapshot after the target/draft contexts, speculative state and batch
@@ -2507,8 +2509,9 @@ private:
 
         // server_prompt_cache(0) means unlimited internally, so never construct
         // it when RAM fit disables this optional cache.
-        if (cache_ram_mib > 0) {
-            prompt_cache = std::make_unique<server_prompt_cache>(cache_ram_mib, n_ctx);
+        server_prompt_cache::configure(prompt_cache, cache_ram_mib, n_ctx,
+                params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO);
+        if (prompt_cache) {
 
             prompt_cache->ram_ckpt_keep = (size_t) params_base.cache_ram_ckpt;
             if (params_base.cache_ram_ckpt > 0) {
@@ -2646,9 +2649,8 @@ private:
         stall_watch_start();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
-                params_base.cache_idle_slots = false;
+            if (!prompt_cache) {
+                SRV_WRN("%s", "idle-slot prompt saves are off while the prompt RAM cache is disabled\n");
             } else {
                 if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
@@ -4297,7 +4299,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && prompt_cache) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");

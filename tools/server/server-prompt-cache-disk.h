@@ -118,7 +118,7 @@ struct server_prompt_disk_tier {
                const std::vector<float> & lora_scales = {});
 
     // read a matching entry; a file that fails to parse or to verify is deleted
-    bool read(std::list<server_prompt_disk_entry>::iterator it, server_prompt_disk_record & out);
+    bool read(std::list<server_prompt_disk_entry>::iterator it, server_prompt_disk_record & out, size_t ram_budget = SIZE_MAX);
 
     void remove(std::list<server_prompt_disk_entry>::iterator it);
 

@@ -1734,11 +1734,57 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+void server_prompt_cache::configure(std::unique_ptr<server_prompt_cache> & cache, int32_t limit_mib, size_t n_ctx, bool fit_ram) {
+    cache.reset();
+    if (limit_mib > 0) {
+        cache = std::make_unique<server_prompt_cache>(limit_mib, n_ctx);
+        cache->fit_ram = fit_ram;
+        if (fit_ram) {
+            cache->spare_max_n = 0;
+        }
+    }
+}
+
+size_t server_prompt_cache::disk_read_budget() const {
+    if (!fit_ram) {
+        return SIZE_MAX;
+    }
+    uint64_t total = 0, available = 0;
+    if (available_ram) {
+        available = available_ram();
+    } else if (!common_host_memory(total, available)) {
+        return 0;
+    }
+    const size_t used = size() + spare_size();
+    const uint64_t floor = 5ull << 30;
+    const uint64_t spare = available > floor ? available - floor : 0;
+    return (size_t) std::min<uint64_t>(limit_size > used ? limit_size - used : 0, spare - spare / 5);
+}
+
+bool server_prompt_cache::reserve_ram(size_t extra) {
+    if (!fit_ram) {
+        return true;
+    }
+    if (extra > limit_size) {
+        return false;
+    }
+    spare.clear();
+    while (!states.empty() && size() > limit_size - extra) {
+        evict_front();
+    }
+    return extra <= disk_read_budget();
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
     for (const auto & state : states) {
         res += state.size();
+        if (fit_ram) {
+            res += state.prompt.tokens.size() * sizeof(llama_token) + state.prompt.lora_scales.size() * sizeof(float);
+            res += sizeof(server_prompt_cache_state) + 2 * sizeof(void *);
+            res += state.prompt.checkpoints.size() * (sizeof(common_prompt_checkpoint) + 2 * sizeof(void *));
+        }
     }
 
     return res;
@@ -1787,7 +1833,31 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size_all += ckpt.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + state_size_spec + checkpoints_size;
+    size_t state_size_new = 0;
+    for (const size_t part : {state_size_tgt, state_size_dft, state_size_spec, checkpoints_size}) {
+        if (part > SIZE_MAX - state_size_new) {
+            return nullptr;
+        }
+        state_size_new += part;
+    }
+    if (fit_ram) {
+        // Media chunk copies have no byte-size API; keep them in the live slot.
+        if (prompt.tokens.has_media()) {
+            return nullptr;
+        }
+        for (const size_t part : {prompt.tokens.size() * sizeof(llama_token), prompt.lora_scales.size() * sizeof(float),
+                sizeof(server_prompt_cache_state) + 2 * sizeof(void *),
+                ckpt_kept.size() * (sizeof(common_prompt_checkpoint) + 2 * sizeof(void *))}) {
+            if (part > SIZE_MAX - state_size_new) {
+                return nullptr;
+            }
+            state_size_new += part;
+        }
+        if (!reserve_ram(state_size_new)) {
+            SRV_WRN("%s", "prompt cache save skipped to keep its RAM budget and leave 5 GiB free\n");
+            return nullptr;
+        }
+    }
 
     // skip over-limit entries to avoid disturbing the cache; with a disk tier they go straight to disk instead
     if (limit_size > 0 && state_size_new > limit_size) {
@@ -2051,7 +2121,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         // the file stays on disk: it is FIFO-evicted, or superseded once a longer prompt with this prefix is written
         server_prompt_disk_record rec;
-        if (!disk.read(it_best_disk, rec)) {
+        const size_t budget = disk_read_budget();
+        if ((fit_ram && budget == 0) || !disk.read(it_best_disk, rec, budget)) {
             SRV_WRN("%s", " - failed to read prompt from the disk tier\n");
 
             return false;
@@ -2123,7 +2194,7 @@ std::vector<uint8_t> server_prompt_cache::take_buffer(size_t n) {
         res.resize(n); // within capacity: only the bytes past the old size are written
         return res;
     }
-    res.reserve(n + n/8);
+    res.reserve(fit_ram ? n : n + n/8);
     res.resize(n);
     return res;
 }
