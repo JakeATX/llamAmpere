@@ -6883,6 +6883,10 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                 if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
                     continue;
                 }
+                // ggml_cast records its destination as src[1]; it is not a read dependency.
+                if (src_idx == 1 && cgraph->nodes[j]->op == GGML_OP_CPY && src == cgraph->nodes[j]) {
+                    continue;
+                }
 
                 if (nodes_overlap(dst, src)) {
                     bool found = false;
@@ -6937,8 +6941,13 @@ static bool ggml_cuda_match_moe_bank_routing(const ggml_cgraph * graph, int i) {
     const ggml_op ops[] = { GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
         GGML_OP_RESHAPE, GGML_OP_CPY, GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_RESHAPE,
         GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_ADD };
-    const int outputs[] = { i + 5, i + 9, i + 13 };
-    if (!ggml_can_fuse_subgraph(graph, i, 14, ops, outputs, 3)) { return false; }
+    // The F32 cast has one self-use (its copy destination) in addition to SCALE.
+    // Check its consumers explicitly: the generic helper only counts later-node uses.
+    const ggml_tensor * cast = graph->nodes[i + 6];
+    if (cast->src[1] != cast || (cast->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_node_get_use_count(graph, i + 6) != 2) { return false; }
+    const int checked_outputs[] = { i + 5, i + 6, i + 9, i + 13 };
+    if (!ggml_can_fuse_subgraph(graph, i, 14, ops, checked_outputs, 4)) { return false; }
     const ggml_tensor * copy = graph->nodes[i], * rows = graph->nodes[i + 2];
     const ggml_tensor * map = rows->src[0], * hot = graph->nodes[i + 10], * cold = graph->nodes[i + 11];
     if (copy->src[0] != cold->src[2] || rows->src[1] != graph->nodes[i + 1] ||
