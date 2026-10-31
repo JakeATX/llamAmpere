@@ -3033,6 +3033,16 @@ private:
         llama_tokens tokens = slot.prompt.tokens.get_text_tokens();
         tokens.resize(n_tokens);
 
+        const size_t n_checkpoints = std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                [n_tokens](const common_prompt_checkpoint & c) { return c.n_tokens <= n_tokens; });
+        std::vector<uint8_t> spec_state;
+        common_speculative_get_state(spec.get(), slot.id, spec_state);
+        std::string err;
+        if (!eval_cache->can_add(tokens, slot.prompt.checkpoints, spec_state.size(), err, n_tokens)) {
+            SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());
+            return false;
+        }
+
         const std::string id   = server_eval_cache::entry_id(tokens);
         const std::string ptgt = eval_cache->path_tgt(id);
         const std::string pdft = eval_cache->path_dft(id);
@@ -3059,14 +3069,7 @@ private:
             return false;
         }
 
-        // checkpoints the prompt has so far, so that a restored prompt makes the same checkpoint and batch decisions
-        const size_t n_checkpoints = std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
-                [n_tokens](const common_prompt_checkpoint & c) { return c.n_tokens <= n_tokens; });
-        std::vector<uint8_t> spec_state;
-        common_speculative_get_state(spec.get(), slot.id, spec_state);
-
         std::string out_id;
-        std::string err;
         if (!eval_cache->add(tokens, slot.prompt.checkpoints, spec_state, has_dft, out_id, err, n_tokens)) {
             SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());
             return false;

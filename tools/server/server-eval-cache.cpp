@@ -469,18 +469,15 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
     return true;
 }
 
-bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
-        const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err,
-        int64_t checkpoint_tokens) {
+bool server_eval_cache::can_add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
+        size_t spec_bytes, std::string & err, int64_t checkpoint_tokens) const {
     if (!writable) {
         err = "the eval cache is read-only (start the server with --eval-cache-build to add entries)";
         return false;
     }
 
-    const std::string id = entry_id(tokens);
-    id_out = id;
-
     if (ram_limit_bytes != UINT64_MAX) {
+        const std::string id = entry_id(tokens);
         uint64_t remaining = ram_limit_bytes;
         auto charge = [&](uint64_t count, uint64_t size) {
             if (count > remaining / size) {
@@ -489,16 +486,50 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
             remaining -= count * size;
             return true;
         };
-        // Include vector growth, the pending entry, and replacement-copy scratch.
+        // Include save scratch and an upper bound on write_index() text and open() parser events.
         bool fits = charge(1, 65536 + sizeof(*this)) && charge(dir.capacity(), 1) && charge(key.capacity(), 1) &&
                 charge(entries.capacity(), 4 * sizeof(server_eval_cache_entry)) &&
-                charge(tokens.size(), 2 * sizeof(llama_token)) && charge(id.capacity(), 2) && charge(1, 512);
+                charge(tokens.size(), 2 * sizeof(llama_token)) && charge(id.capacity(), 2) &&
+                charge(512, 4) && charge(key.size(), 24) && charge(32, 256 + 4 * sizeof(json)) &&
+                charge(1, 512) && charge(key.size(), 2);
+        auto charge_entry = [&](const std::string & entry_id, size_t id_capacity, size_t n_tokens) {
+            return charge(256, 4) && charge(entry_id.size(), 24) && charge(16, 256 + 4 * sizeof(json)) &&
+                    charge(1, 128) && charge(entry_id.size(), 2) &&
+                    charge(1, 512 + 4 * sizeof(server_eval_cache_entry)) &&
+                    charge(id_capacity, 2) && charge(n_tokens, sizeof(llama_token));
+        };
+        bool replaced = false;
         for (const auto & e : entries) {
+            replaced |= e.id == id;
             const size_t n_tokens = e.id == id ? std::max(e.tokens.capacity(), tokens.size()) : e.tokens.capacity();
-            fits = fits && charge(1, 512 + 4 * sizeof(server_eval_cache_entry)) &&
-                    charge(e.id.capacity(), 2) && charge(n_tokens, sizeof(llama_token));
+            fits = fits && charge_entry(e.id, e.id.capacity(), n_tokens);
             if (!fits) {
                 break;
+            }
+        }
+        fits = fits && (replaced || charge_entry(id, id.capacity(), tokens.size())) &&
+                charge(1, sizeof(server_eval_cache_record) + sizeof(evc_reader) + 65536);
+        const uint64_t record_room = remaining;
+        // Startup reads one header at a time while all prior tokens and the JSON tree remain live.
+        fits = fits && charge(1, 4 + 3 * sizeof(uint32_t) + 4 * sizeof(uint64_t) + sizeof(uint8_t)) &&
+                charge(key.size(), 1) && charge(tokens.size(), sizeof(llama_token)) && charge(spec_bytes, 1);
+        for (const auto & c : checkpoints) {
+            if (c.n_tokens <= checkpoint_tokens) {
+                fits = fits && charge(1, sizeof(int64_t) + 2 * sizeof(int32_t) + 3 * sizeof(uint64_t)) &&
+                        charge(c.data_tgt.size(), 1) && charge(c.data_dft.size(), 1) && charge(c.data_spec.size(), 1);
+            }
+            if (!fits) {
+                break;
+            }
+        }
+        for (const auto & e : entries) {
+            if (!fits) {
+                break;
+            }
+            if (e.id != id) {
+                std::error_code ec;
+                const uint64_t bytes = fs::file_size(path_hdr(e.id), ec);
+                fits = !ec && bytes <= record_room;
             }
         }
         if (!fits) {
@@ -506,6 +537,18 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
             return false;
         }
     }
+
+    return true;
+}
+
+bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
+        const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err,
+        int64_t checkpoint_tokens) {
+    if (!can_add(tokens, checkpoints, spec.size(), err, checkpoint_tokens)) {
+        return false;
+    }
+    const std::string id = entry_id(tokens);
+    id_out = id;
 
     const std::string file = path_hdr(id);
     const std::string tmp  = file + ".tmp";

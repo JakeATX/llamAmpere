@@ -79,6 +79,10 @@ struct server_eval_cache {
     bool read_header(const std::string & id, server_eval_cache_record & out, std::string & err,
                      uint64_t ram_bytes = UINT64_MAX) const;
 
+    // Check the save and next startup peak before publishing any state files.
+    bool can_add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
+                 size_t spec_bytes, std::string & err, int64_t checkpoint_tokens = INT64_MAX) const;
+
     // Write directly from existing checkpoints up to checkpoint_tokens, preserving their order.
     // The state files must already be in place. Inputs remain borrowed until this call returns.
     bool add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,

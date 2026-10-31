@@ -21,6 +21,7 @@
 #include <iterator>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -102,12 +103,15 @@ static common_prompt_checkpoint ckpt(int64_t n, int fill) {
 
 static bool add_entry(server_eval_cache & ec, const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & ck,
         const std::vector<uint8_t> & spec, bool has_dft, std::string & id) {
+    std::string err;
+    if (!ec.can_add(tokens, ck, spec.size(), err)) {
+        return false;
+    }
     const std::string pid = server_eval_cache::entry_id(tokens);
     touch(ec.path_tgt(pid), 4096);
     if (has_dft) {
         touch(ec.path_dft(pid), 1024);
     }
-    std::string err;
     const bool ok = ec.add(tokens, ck, spec, has_dft, id, err);
     if (!ok) {
         fprintf(stderr, "add: %s\n", err.c_str());
@@ -566,10 +570,12 @@ static void test_index_growth_budget(const std::string & root) {
     std::string err, id;
     CHECK(writer.open(dir, KEY_A, true, err, 256 * 1024));
     const llama_tokens first = seq(0, 2048);
-    CHECK(add_entry(writer, first, {}, {}, false, id));
+    const std::list<common_prompt_checkpoint> first_ck = { ckpt(1000, 1) };
+    const std::vector<uint8_t> first_spec = {9, 8, 7};
+    CHECK(add_entry(writer, first, first_ck, first_spec, true, id));
     const std::string first_id = id;
     const std::string first_header = contents(writer.path_hdr(id));
-    CHECK(writer.add(first, {}, {}, false, id, err));
+    CHECK(writer.add(first, first_ck, first_spec, true, id, err));
     CHECK(writer.entries.size() == 1 && contents(writer.path_hdr(id)) == first_header);
 
     bool refused = false;
@@ -579,15 +585,20 @@ static void test_index_growth_budget(const std::string & root) {
         const std::string next_id = server_eval_cache::entry_id(tokens);
         const std::string before = contents(index);
         const size_t count = writer.entries.size();
-        touch(writer.path_tgt(next_id), 4096);
         allocation_probe::start(tokens.size() * sizeof(llama_token));
-        const bool saved = writer.add(tokens, {}, {}, false, id, err);
+        bool saved = writer.can_add(tokens, {}, 0, err);
+        if (saved) {
+            touch(writer.path_tgt(next_id), 4096);
+            saved = writer.add(tokens, {}, {}, false, id, err);
+        }
         const size_t copies = allocation_probe::stop();
         if (!saved) {
             CHECK(err.find("RAM fit budget") != std::string::npos);
             CHECK(copies == 0 && allocation_probe::largest < tokens.size() * sizeof(llama_token));
             CHECK(writer.entries.size() == count && contents(index) == before);
             CHECK(!fs::exists(writer.path_hdr(next_id)) && !fs::exists(writer.path_hdr(next_id) + ".tmp"));
+            CHECK(!fs::exists(writer.path_tgt(next_id)) && !fs::exists(writer.path_dft(next_id)));
+            CHECK(!writer.add(tokens, {}, {}, false, id, err));
             CHECK(contents(writer.path_hdr(first_id)) == first_header);
             refused_tokens = tokens;
             refused = true;
@@ -595,21 +606,50 @@ static void test_index_growth_budget(const std::string & root) {
         }
     }
     CHECK(refused && writer.entries.size() > 1);
-    CHECK(reader.open(dir, KEY_A, false, err));
-    CHECK(reader.entries.size() == writer.entries.size());
+    const size_t saved_count = writer.entries.size();
+    CHECK(reader.open(dir, KEY_A, false, err, 256 * 1024));
+    CHECK(reader.enabled() && reader.entries.size() == saved_count);
+    CHECK(writer.open(dir, KEY_A, true, err, 256 * 1024));
+    CHECK(writer.enabled() && writer.entries.size() == saved_count);
     server_eval_cache_record rec;
     CHECK(reader.read_header(first_id, rec, err) && rec.tokens == first);
     if (!refused) {
         return;
     }
 
+    auto snapshot = [&]() {
+        std::vector<std::pair<std::string, std::string>> files;
+        for (const auto & entry : fs::recursive_directory_iterator(dir)) {
+            if (entry.is_regular_file()) {
+                files.emplace_back(entry.path().string(), contents(entry.path().string()));
+            }
+        }
+        std::sort(files.begin(), files.end());
+        return files;
+    };
+    // Reject a replacement before the caller overwrites either state file.
+    touch(writer.path_tgt(first_id), 17);
+    touch(writer.path_dft(first_id), 19);
+    const auto before = snapshot();
+    const std::vector<uint8_t> replacement_spec(256 * 1024, 73);
+    const std::list<common_prompt_checkpoint> replacement_ck = { ckpt(1000, 9) };
+    CHECK(!add_entry(writer, first, replacement_ck, replacement_spec, true, id));
+    CHECK(snapshot() == before && writer.entries.size() == saved_count);
+    CHECK(!writer.add(first, replacement_ck, replacement_spec, true, id, err));
+    CHECK(snapshot() == before);
+    CHECK(reader.read_header(first_id, rec, err) && rec.tokens == first && rec.spec == first_spec && rec.checkpoints.size() == 1);
+
     // An unbounded reopen must accept the same tokens and make the real copy.
     CHECK(writer.open(dir, KEY_A, true, err));
+    touch(writer.path_tgt(server_eval_cache::entry_id(refused_tokens)), 4096);
     allocation_probe::start(refused_tokens.size() * sizeof(llama_token));
     const bool saved = writer.add(refused_tokens, {}, {}, false, id, err);
     const size_t copies = allocation_probe::stop();
     CHECK(saved && copies > 0);
     CHECK(writer.read_header(id, rec, err) && rec.tokens == refused_tokens);
+    CHECK(add_entry(writer, first, replacement_ck, replacement_spec, true, id));
+    CHECK(snapshot() != before && fs::file_size(writer.path_tgt(first_id)) == 4096);
+    CHECK(writer.read_header(first_id, rec, err) && rec.spec == replacement_spec && rec.checkpoints.size() == 1);
 }
 
 static void test_index_ram_budget(const std::string & root) {
