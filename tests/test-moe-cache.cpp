@@ -4905,6 +4905,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     api.prefetch_configure(session, 1);
     // Whole-expert warm needs all three banks and at least 64 complete experts.
     // Expand the tiny source fixture so the 4 MiB plan leaves the last expert cold.
+    const char * names[] = {"blk.1.ffn_up_exps.weight", "blk.1.ffn_gate_exps.weight", "blk.1.ffn_down_exps.weight"};
     ggml_tensor expanded[3];
     ggml_tensor * described[3];
     ggml_backend_buffer_t expanded_buffer = nullptr;
@@ -4923,6 +4924,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         for (int bank = 0; bank < 3; ++bank) {
             const auto * source = bank == 1 && gate_weights ? gate_weights : weights;
             expanded[bank] = *source;
+            ggml_set_name(&expanded[bank], names[bank]);
             expanded[bank].buffer = expanded_buffer;
             expanded[bank].data = data + bank * experts * bytes;
             expanded[bank].ne[2] = experts;
@@ -4939,10 +4941,9 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     if (gate_weights) { gate_weights = described[1]; }
     ggml_moe_cache_tensor_desc descriptors[3] = {};
     const int banks = 3;
-    const char * names[] = {"blk.1.ffn_up_exps.weight", "blk.1.ffn_gate_exps.weight", "blk.1.ffn_down_exps.weight"};
     for (int i = 0; i < banks; ++i) {
         const auto * w = described[i];
-        descriptors[i] = {names[i], w->data,
+        descriptors[i] = {w->name, w->data,
             w->nb[2], w->ne[0], w->ne[1], w->ne[2], (int32_t) w->type};
     }
     std::vector<uint64_t> usage(weights->ne[2], 0);
@@ -4971,25 +4972,36 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     ggml_backend_tensor_set(card_acts, values.data(), 0, values.size() * sizeof(float));
     ggml_backend_tensor_set(host_ids, route, 0, sizeof(route));
     ggml_backend_tensor_set(card_ids, route, 0, sizeof(route));
-    test_graph reference = gate_weights ? make_fused_graph(cpu, weights, gate_weights, host_acts, host_ids) :
-            make_graph(cpu, weights, host_acts, host_ids);
-    test_graph candidate = gate_weights ? make_fused_graph(gpu, weights, gate_weights, card_acts, card_ids) :
-            make_graph(device_mode ? gpu : cpu, weights,
-                    device_mode ? card_acts : host_acts, device_mode ? card_ids : host_ids);
+    const int graphs = gate_weights ? 2 : 3;
+    const auto backend = device_mode ? gpu : cpu;
+    test_graph reference[3], candidate[3];
+    std::vector<float> expected[3], actual[3], first[3];
+    for (int i = 0; i < graphs; ++i) {
+        const int bank = gate_weights && i == 1 ? 2 : i;
+        const bool fused = gate_weights && i == 0;
+        reference[i] = fused ? make_fused_graph(cpu, weights, gate_weights, host_acts, host_ids) :
+                make_graph(cpu, described[bank], host_acts, host_ids);
+        candidate[i] = fused ? make_fused_graph(gpu, weights, gate_weights, card_acts, card_ids) :
+                make_graph(backend, described[bank], device_mode ? card_acts : host_acts,
+                        device_mode ? card_ids : host_ids);
+        ok &= ggml_backend_graph_compute(cpu, reference[i].graph) == GGML_STATUS_SUCCESS;
+        expected[i].resize(ggml_nelements(reference[i].out));
+        actual[i].resize(expected[i].size());
+        ggml_backend_tensor_get(reference[i].out, expected[i].data(), 0, expected[i].size() * sizeof(float));
+    }
     auto fusion_count = (int64_t (*)(ggml_backend_t, const char *)) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)), "ggml_backend_cuda_fusion_count");
     const int64_t fused_before = gate_weights && fusion_count ? fusion_count(gpu, "mul_mat_glu") : 0;
-    ok &= ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS;
-    std::vector<float> expected(ggml_nelements(reference.out)), actual(expected.size()), first;
-    ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
     auto compute = [&]() {
-        ok &= ggml_backend_graph_compute(device_mode ? gpu : cpu, candidate.graph) == GGML_STATUS_SUCCESS;
-        ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
-        ok &= compare_output(expected, actual, 5e-4);
-        if (first.empty()) {
-            first = actual;
-        } else if (device_mode) {
-            ok &= first == actual;
+        for (int i = 0; i < graphs; ++i) {
+            ok &= ggml_backend_graph_compute(backend, candidate[i].graph) == GGML_STATUS_SUCCESS;
+            ggml_backend_tensor_get(candidate[i].out, actual[i].data(), 0, actual[i].size() * sizeof(float));
+            ok &= compare_output(expected[i], actual[i], 5e-4);
+            if (first[i].empty()) {
+                first[i] = actual[i];
+            } else if (device_mode) {
+                ok &= first[i] == actual[i];
+            }
         }
     };
     for (int round = 0; round < 4 && ok; ++round) {
@@ -5051,11 +5063,18 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     }
     if (device_mode) {
         ok &= max_field_value(log, "replays=") > 0;
+        if (whole_banks) {
+            ok &= log.find("source mappings setup: new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
+            ok &= max_field_value(log, "new_copy_bytes=") == 0;
+            ok &= max_field_value(log, "new_registered_bytes=") == 0;
+        }
     }
     ok &= log.find("expert=0 ") == std::string::npos;
     ok &= max_field_value(log, "fill-fail=") == 0;
-    free_graph(candidate);
-    free_graph(reference);
+    for (int i = 0; i < graphs; ++i) {
+        free_graph(candidate[i]);
+        free_graph(reference[i]);
+    }
     ggml_backend_buffer_free(card_buffer);
     ggml_backend_buffer_free(host_buffer);
     ggml_free(card);
@@ -5073,13 +5092,13 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
 }
 
 static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
-        ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr, bool require_staging = false) {
+        ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr, bool require_staging = false,
+        ggml_tensor * const * whole_banks = nullptr) {
     if (!active_api().device_prepare || !active_api().device_supports) {
         return false;
     }
     bool ok = true;
-    // Whole-expert residency builds device tables only for complete up/gate/down
-    // layers, so describe two same-shape siblings next to the tested tensor.
+    // Whole-expert residency needs complete up/gate/down layers; borrow supplied banks or build same-shape siblings.
     int layer = -1;
     const char * suffix = strchr(weights->name + 4, '.');
     ok &= sscanf(weights->name, "blk.%d.", &layer) == 1 && suffix != nullptr;
@@ -5091,22 +5110,39 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
         }
     }
     ok &= n_siblings == 2;
-    ggml_init_params sibling_params = {2 * ggml_tensor_overhead(), nullptr, true};
-    ggml_context * sibling_ctx = ggml_init(sibling_params);
-    ggml_tensor * siblings[2];
-    for (int i = 0; i < 2; ++i) {
-        siblings[i] = ggml_new_tensor_3d(sibling_ctx, weights->type, weights->ne[0], weights->ne[1], weights->ne[2]);
-        ggml_set_name(siblings[i], sibling_names[i].c_str());
-    }
-    ggml_backend_buffer_t sibling_buffer = ggml_backend_alloc_ctx_tensors(sibling_ctx, cpu);
-    ok &= sibling_buffer != nullptr;
-    if (ok) {
-        ggml_backend_buffer_set_usage(sibling_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        for (ggml_tensor * sibling : siblings) {
-            for (int64_t e = 0; e < weights->ne[2]; ++e) {
-                memcpy((char *)sibling->data + e * sibling->nb[2], (const char *)weights->data + e * weights->nb[2], sibling->nb[2]);
+    ggml_context * sibling_ctx = nullptr;
+    ggml_backend_buffer_t sibling_buffer = nullptr;
+    ggml_tensor * siblings[2] = {};
+    if (whole_banks) {
+        for (int i = 0; i < 2; ++i) {
+            for (int bank = 0; bank < 3; ++bank) {
+                if (sibling_names[i] == whole_banks[bank]->name) {
+                    siblings[i] = whole_banks[bank];
+                }
             }
         }
+    } else {
+        ggml_init_params sibling_params = {2 * ggml_tensor_overhead(), nullptr, true};
+        sibling_ctx = ggml_init(sibling_params);
+        for (int i = 0; i < 2; ++i) {
+            siblings[i] = ggml_new_tensor_3d(sibling_ctx, weights->type, weights->ne[0], weights->ne[1], weights->ne[2]);
+            ggml_set_name(siblings[i], sibling_names[i].c_str());
+        }
+        sibling_buffer = ggml_backend_alloc_ctx_tensors(sibling_ctx, cpu);
+        if (sibling_buffer) {
+            ggml_backend_buffer_set_usage(sibling_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            for (ggml_tensor * sibling : siblings) {
+                for (int64_t e = 0; e < weights->ne[2]; ++e) {
+                    memcpy((char *)sibling->data + e * sibling->nb[2], (const char *)weights->data + e * weights->nb[2], sibling->nb[2]);
+                }
+            }
+        }
+    }
+    const bool sources_ready = ok && siblings[0] && siblings[1] && (whole_banks || sibling_buffer);
+    if (!sources_ready) {
+        if (sibling_buffer) { ggml_backend_buffer_free(sibling_buffer); }
+        if (sibling_ctx) { ggml_free(sibling_ctx); }
+        return false;
     }
     for (int route_mode : {0, 1, 2}) {
     for (int tokens : {1, 4}) {
@@ -5156,12 +5192,12 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             std::vector<uint64_t> usage(weights->ne[2], 0);
             usage[0] = 100;
             const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
-            const auto warmed = sibling_buffer ? ggml_backend_sched_moe_cache_warm(scheduler, descriptors, counts, 3) : 0;
+            const auto warmed = sources_ready ? ggml_backend_sched_moe_cache_warm(scheduler, descriptors, counts, 3) : 0;
             ok &= warmed > 0;
             if (neighbor_output) {
                 ok &= warmed >= 3 * 64 && warmed < 3 * weights->ne[2];
             }
-            const bool prepared = sibling_buffer && ggml_backend_sched_moe_cache_device_prepare(scheduler, descriptors, 3) == 1;
+            const bool prepared = sources_ready && ggml_backend_sched_moe_cache_device_prepare(scheduler, descriptors, 3) == 1;
             ok &= prepared != unsupported;
             if (unsupported) {
                 // A failed opt-in must leave CPU scheduling and the legacy
@@ -5212,6 +5248,11 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
                     ok &= max_field_value(log, "new_copy_bytes=") > 0;
                     ok &= max_field_value(log, "new_registered_bytes=") == 0;
                 }
+                if (whole_banks) {
+                    ok &= log.find("source mappings setup: new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
+                    ok &= max_field_value(log, "new_copy_bytes=") == 0;
+                    ok &= max_field_value(log, "new_registered_bytes=") == 0;
+                }
                 // Whole-only warm admits complete experts hottest first (expert 0) until
                 // the budget is full, so only all-expert-0 routing must hit everywhere.
                 ok &= max_field_value(log, "hits=") + max_field_value(log, "misses=") == 6 * tokens;
@@ -5235,7 +5276,7 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
     if (sibling_buffer) {
         ggml_backend_buffer_free(sibling_buffer);
     }
-    ggml_free(sibling_ctx);
+    if (sibling_ctx) { ggml_free(sibling_ctx); }
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
     printf("cache-device-tables type=%s mode=%s: %s\n", ggml_type_name(weights->type),
@@ -7847,13 +7888,15 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
     if (registered) {
         weights->ne[2] = gate->ne[2] = experts;
         weights->nb[3] = gate->nb[3] = stride * experts;
+        ggml_set_name(weights, "blk.1.ffn_up_exps.weight");
+        ggml_set_name(gate, "blk.1.ffn_gate_exps.weight");
         ggml_tensor down = *weights;
         down.data = arena + 2 * bytes;
         ggml_set_name(&down, "blk.1.ffn_down_exps.weight");
         ggml_tensor * whole_banks[] = {weights, gate, &down};
-        ok &= run_device_tables_case(gpu, cpu, weights, capture);
+        ok &= run_device_tables_case(gpu, cpu, weights, capture, nullptr, false, whole_banks);
         // The second projection starts inside the same registered allocation.
-        ok &= run_device_tables_case(gpu, cpu, gate, capture);
+        ok &= run_device_tables_case(gpu, cpu, gate, capture, nullptr, false, whole_banks);
         // Actual padded tensors, pinned by the model owner: all paths must copy and consume.
         ok &= run_prefetch_staging(gpu, cpu, weights, capture, false, nullptr, whole_banks);
         ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, nullptr, whole_banks);
