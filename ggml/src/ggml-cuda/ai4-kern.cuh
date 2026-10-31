@@ -30,6 +30,7 @@
 #pragma once
 
 #include "rq4.cuh"
+#include "../ggml-ait.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -45,6 +46,7 @@ constexpr int LAY_AIT5_U = 11;   // rate-5 units of 16 x 128 ([d 16][16 tiles x 
 constexpr int LAY_AIT2_U = 12;   // rate-2 units ([d 16][16 tiles x 8 words], 544 B)
 constexpr int LAY_AIT3_U = 13;   // rate-3 units ([d 16][16 tiles x 12 words], 800 B)
 constexpr int LAY_AIT4_U = 14;   // rate-4 units ([d 16][16 tiles x 16 words], 1056 B)
+constexpr int LAY_AIT2P_U = 15;  // AIT2_U bytes, AIT2P pair-table levels (ggml-ai4.h); no trellis constant
 
 // mmv-ID columns per block: lanes g = 0..7 of the mmv kernel each own one token column
 constexpr int MMV_ID_BN = 8;
@@ -101,9 +103,10 @@ constexpr int U_SC      = 32;     // fp16 d[16]
 
 // symbol rate of a layout (bits per weight in the tile stream) and its trellis constant
 template <int LAY> constexpr __host__ __device__ int lay_rate() {
-    static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U, "ai4k layout");
-    return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U ? 2 : LAY == LAY_AIT3_U ? 3 : 4;
+    static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U, "ai4k layout");
+    return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U ? 2 : LAY == LAY_AIT3_U ? 3 : 4;
 }
+template <int LAY> constexpr __host__ __device__ bool lay_pair() { return LAY == LAY_AIT2P_U; }
 template <int LAY> constexpr __host__ __device__ uint32_t lay_mul() {
     static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U, "ai4k layout");
     return LAY == LAY_AIT2_U ? 0xC3CCD12Du : LAY == LAY_AIT3_U ? 0x87D8D12Du : 0xAA73876Bu;
@@ -114,7 +117,7 @@ template <int LAY> constexpr __host__ __device__ bool lay_k5()  { return lay_rat
 template <int LAY> constexpr __host__ __device__ int ch_bytes() { return 256*lay_rate<LAY>(); }
 template <int LAY> constexpr __host__ __device__ int u_bytes()  { return ch_bytes<LAY>() + U_SC; }
 static_assert(ch_bytes<LAY_AIT4_U>() == CH_BYTES && u_bytes<LAY_AIT4_U>() == U_BYTES && u_bytes<LAY_AIT5_U>() == 1312 &&
-              u_bytes<LAY_AIT2_U>() == 544 && u_bytes<LAY_AIT3_U>() == 800, "ai4k layout sizes");
+              u_bytes<LAY_AIT2_U>() == 544 && u_bytes<LAY_AIT2P_U>() == 544 && u_bytes<LAY_AIT3_U>() == 800, "ai4k layout sizes");
 template <int LAY> static __host__ __device__ __forceinline__ int64_t slab_bytes_l(int K) { return (int64_t) (K/128)*u_bytes<LAY>(); }
 
 // byte offset of chunk kc's 16 tiles inside a slab
@@ -234,6 +237,30 @@ static __device__ __forceinline__ void a_regs_smem_kr(const uint32_t * __restric
     a[3] = levels4_kr<KR, MULT>(__funnelshift_l(tb[wb.w1], tb[wb.w0], wb.sh));
 }
 
+// AIT2P_U pair table: the 1024 entries of ait2p_tab as u16 (low byte = even weight), 2 KB of static shared memory per
+// block that decodes the pair layout. Pair window w = the 20 stream bits ending at the pair's last bit (any read whose
+// low 20 bits are the window); entry = ((w (w + 1)) >> 10) & 1023, byte address = 2 entry.
+static __device__ __align__(16) const int8_t pair_tab_g[2048] = AIT2P_TAB_INIT;
+static __shared__ __align__(16) uint32_t pair_tab_s[512];
+static __device__ __forceinline__ void pair_tab_fill(int tid, int nthreads) {
+    for (int i = tid; i < 512; i += nthreads) {
+        pair_tab_s[i] = ((const uint32_t *) pair_tab_g)[i];
+    }
+}
+static __device__ __forceinline__ uint32_t pair_lv(const uint32_t w) {
+    const uint32_t h = w*w + w;
+    return *(const uint16_t *) ((const uint8_t *) pair_tab_s + ((h >> 9) & 0x7FEu));
+}
+// levels of the 4 symbols of a 4-symbol k = 2 window f (32 bits ending at the 4th symbol): pairs f >> 4 and f
+static __device__ __forceinline__ uint32_t pair_levels4(const uint32_t f) {
+    return pair_lv(f >> 4) | (pair_lv(f) << 16);
+}
+// levels of the 8 symbols of an 8-symbol k = 2 row window f (32 bits ending at the 8th symbol)
+static __device__ __forceinline__ void pair_levels8(const uint32_t f, uint32_t & lo, uint32_t & hi) {
+    lo = pair_lv(f >> 12) | (pair_lv(f >> 8) << 16);
+    hi = pair_lv(f >> 4)  | (pair_lv(f) << 16);
+}
+
 // per-layout window (per lane constant) and A-register decode
 template <int LAY>
 static __device__ __forceinline__ k5win lay_win(int R, int h) {
@@ -244,7 +271,15 @@ static __device__ __forceinline__ k5win lay_win(int R, int h) {
 template <int LAY>
 static __device__ __forceinline__ void a_regs_lay(const uint32_t * __restrict__ tw, int j, int g, int t, const k5win & wa, const k5win & wb,
                                                   uint32_t (&a)[4]) {
-    if constexpr (lay_rate<LAY>() == 5) { a_regs_smem_k5<LAY>(tw, j, t, wa, wb, a); }
+    if constexpr (lay_pair<LAY>()) {
+        const uint32_t * ta = tw + (4*j + (t >> 1))*8;
+        const uint32_t * tb = ta + 16;
+        a[0] = pair_levels4(__funnelshift_l(ta[wa.w1], ta[wa.w0], wa.sh));
+        a[1] = pair_levels4(__funnelshift_l(ta[wb.w1], ta[wb.w0], wb.sh));
+        a[2] = pair_levels4(__funnelshift_l(tb[wa.w1], tb[wa.w0], wa.sh));
+        a[3] = pair_levels4(__funnelshift_l(tb[wb.w1], tb[wb.w0], wb.sh));
+    }
+    else if constexpr (lay_rate<LAY>() == 5) { a_regs_smem_k5<LAY>(tw, j, t, wa, wb, a); }
     else if constexpr (lay_rate<LAY>() == 4) { a_regs_smem<lay_mul<LAY>()>(tw, j, g, t, a); }
     else { a_regs_smem_kr<lay_rate<LAY>(), lay_mul<LAY>()>(tw, j, t, wa, wb, a); }
 }
@@ -325,6 +360,9 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
             scol[i] = i < N ? idm.cols[o + nt + i] : 0;
         }
         __syncthreads();
+    }
+    if constexpr (lay_pair<LAY>()) {
+        pair_tab_fill(tid, GEMM_THREADS);   // visible after the first stage barrier
     }
     auto xrow = [&](int c) -> int64_t { if constexpr (ID) { return srow[c]; } else { return n0 + c; } };
 
@@ -663,6 +701,10 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmv(
     const int XSN = K >> (7 + XSH);
     const int * prow = nullptr;
     const int * pcol = nullptr;
+    if constexpr (lay_pair<LAY>()) {
+        pair_tab_fill(threadIdx.x, WARPS*32);
+        __syncthreads();
+    }
     if constexpr (ID) {
         // grid.y = token tile of MMV_ID_BN pairs (ids_helper with bn = MMV_ID_BN); the tile's pairs are the columns. With
         // distinct expert ids per token (top-k routing) every expert has <= n_tok <= 8 pairs, so tile = active expert.
@@ -977,6 +1019,10 @@ static __device__ __forceinline__ void mmvr_body(
     // bx overrides the slab block index (paired launches stack two projections along x).
     const int bxi = bx >= 0 ? bx : (int) blockIdx.x;
     const int slab = SPW ? bxi*WARPS + warp : bxi;
+    if constexpr (lay_pair<LAY>()) {
+        pair_tab_fill(threadIdx.x, WARPS*32);   // before any early return
+        __syncthreads();
+    }
     if constexpr (SPW) {
         if (slab >= M/16) {
             return;
@@ -1115,8 +1161,13 @@ static __device__ __forceinline__ void mmvr_body(
                 const uint32_t * ta = tw + 4*j*TW;
                 const uint32_t f0 = __funnelshift_l(ta[wa.w1], ta[wa.w0], wa.sh);
                 const uint32_t f1 = __funnelshift_l(ta[wb.w1], ta[wb.w0], wb.sh);
-                levels8_k2<lay_mul<LAY>()>(f0, a[0], a[2]);
-                levels8_k2<lay_mul<LAY>()>(f1, a[1], a[3]);
+                if constexpr (lay_pair<LAY>()) {
+                    pair_levels8(f0, a[0], a[2]);
+                    pair_levels8(f1, a[1], a[3]);
+                } else {
+                    levels8_k2<lay_mul<LAY>()>(f0, a[0], a[2]);
+                    levels8_k2<lay_mul<LAY>()>(f1, a[1], a[3]);
+                }
                 b0 = xv[j]; b1 = xv[4 + j];
             } else {
                 const uint32_t * ta = tw + 4*j*TW;

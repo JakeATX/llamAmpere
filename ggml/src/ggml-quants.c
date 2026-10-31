@@ -5972,6 +5972,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ5_0:
         case GGML_TYPE_AIT5_U:
         case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2P_U:
         case GGML_TYPE_AIT3_U:
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT2:

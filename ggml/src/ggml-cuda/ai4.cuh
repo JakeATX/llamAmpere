@@ -5,6 +5,8 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+#include "../ggml-ait.h"   // AIT2P_TAB_INIT (AIT2P_U levels)
+
 // RQ4 rotation signs (ggml-rq4.h RQ4_SIGN_WORDS == ggml-ai4.h ai4_sign_bits)
 static __device__ __constant__ uint32_t ai4_dev_sign_bits[8] = {
     0x9e3779b9u, 0x7f4a7c15u, 0xf39cc060u, 0x5ced2a1bu,
@@ -58,7 +60,25 @@ static __device__ __forceinline__ uint32_t aik_dev_state(const uint32_t * __rest
     return (uint32_t) (c >> (48 - sh)) & 0xFFFFu;
 }
 
-// Reconstruct W[M][K] from a rate-KB unit tensor. UNROT = true: original basis; false: rotated basis (the values the
+// AIT2P_U (ggml-ai4.h): pair p = symbols 2p, 2p+1 of a rate-2 tile; window = the 20 stream bits ending at bit 4p+4.
+// level(2p + ce) = aik_pair_dev_tab[2 entry + ce]. The reference path reads the table from global memory.
+static __device__ const int8_t aik_pair_dev_tab[2048] = AIT2P_TAB_INIT;
+
+static __device__ __forceinline__ int aik_dev_pair_entry(const uint32_t w) {
+    return (int) (((w * (w + 1u)) >> 10) & 1023u);
+}
+
+static __device__ __forceinline__ int aik_dev_pair_level(const uint32_t * __restrict__ tile, const int n) {
+    constexpr int NB = 256, NW = 8;
+    int b0 = 4 * (n >> 1) + 4 - 20;
+    b0 += b0 < 0 ? NB : 0;
+    const int w = b0 >> 5, sh = b0 & 31;
+    const int w1 = w + 1 == NW ? 0 : w + 1;
+    const uint64_t c = ((uint64_t) tile[w] << 32) | tile[w1];
+    return aik_pair_dev_tab[2 * aik_dev_pair_entry((uint32_t) (c >> (44 - sh))) + (n & 1)];
+}
+
+// Reconstruct W[M][K] from a rate-KB unit tensor. C == 0 (KB == 2): AIT2P_U pair-table levels. UNROT = true: original basis; false: rotated basis (the values the
 // IMMA path multiplies with rotated activations). Block = 512 threads = 16 warps = the 16 rows of one slab, grid =
 // (ceil(K/256), M/16); lane l of warp r decodes unit 2*blockIdx.x + l/16, column step l%16 (8 K columns), then the warp
 // (RB = 256) or each half-warp (RB = 128) unrotates its block.
@@ -78,7 +98,11 @@ static __global__ void __launch_bounds__(512) k_aik_reconstruct(const uint8_t * 
         const float d = __half2float(__ushort_as_half(((const uint16_t *) blk)[r]));
 #pragma unroll
         for (int q = 0; q < 8; ++q) {
-            v[q] = d * (float) aik_dev_level_c(aik_dev_state<KB>(tile, r * 8 + q), C);
+            if (KB == 2 && C == 0) {
+                v[q] = d * (float) aik_dev_pair_level(tile, r * 8 + q);
+            } else {
+                v[q] = d * (float) aik_dev_level_c(aik_dev_state<KB>(tile, r * 8 + q), C);
+            }
         }
     }
     if constexpr (UNROT) {

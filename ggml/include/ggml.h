@@ -468,6 +468,7 @@ extern "C" {
         GGML_TYPE_AIT2_U  = 115,
         GGML_TYPE_AIT3_U  = 116,
         GGML_TYPE_AIT4_U  = 117,
+        GGML_TYPE_AIT2P_U = 121, // AIT2_U bytes and units, AIT2P pair-table level map (ggml-ai4.h)
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         GGML_TYPE_COUNT   = 144,
@@ -835,6 +836,8 @@ extern "C" {
     GGML_API bool     ggml_ai4_is_unit    (enum ggml_type type);
     GGML_API int      ggml_ai4_layout     (enum ggml_type type);
     GGML_API uint32_t ggml_ai4_trellis_mul(enum ggml_type type);
+    // AI+ unit level map: 0 = 1MAD (trellis_mul), 1 = AIT2P pair table (GGML_TYPE_AIT2P_U, trellis_mul 0), -1 = not a unit type
+    GGML_API int      ggml_ai4_code       (enum ggml_type type);
     GGML_API float    ggml_ai4_scale_mul  (enum ggml_type type);
 
     GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits/weight for GGML_TYPE_EXL3_*, 0 otherwise
