@@ -174,16 +174,17 @@ void common_ngram_cache_prune(common_ngram_cache & ngram_cache, size_t n_max);
 // result and clears ngram_cache_delta. The result also fits the load quotas; whole n-grams are
 // dropped in map order if their continuations exceed the remaining continuation quota.
 // Finite load quotas also bound merge allocations; existing file pairs keep priority over new pairs.
-// If the file is missing or corrupt, ngram_cache (which must already contain the delta) is written instead.
+// If the file is missing or corrupt, ngram_cache (which must already contain the delta) is written instead, unless fallback_to_delta is set.
+// fallback_to_delta: use the worker-owned delta instead, without first copying it into ngram_cache.
 // A file that exceeds the load quotas, belongs to another vocab or uses a newer format is never overwritten: the sync fails.
 // ngram_cache and ngram_cache_delta must be distinct objects.
 // from_disk: if given, set to true when the existing file was loaded and merged, false when it was missing or
-//            unusable (the file is then recreated from ngram_cache) or when the sync failed.
+//            unusable (the file is then recreated from the fallback cache) or when the sync failed.
 // returns: true on success, otherwise err describes the problem and nothing is modified.
 bool common_ngram_cache_sync_file(
     const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
     size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk = nullptr,
-    uint64_t max_entries = UINT64_MAX, uint64_t max_continuations = UINT64_MAX);
+    uint64_t max_entries = UINT64_MAX, uint64_t max_continuations = UINT64_MAX, bool fallback_to_delta = false);
 
 // Save an ngram cache to a file (vocab identity unknown). Logs on failure.
 // ngram_cache: the ngram cache to save.

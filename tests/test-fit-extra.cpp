@@ -309,32 +309,39 @@ static void test_ngram_checkpoint_merge_allocations() {
     source[key].emplace(1, 3);
     std::string err;
     size_t bounded_max_bytes = 0;
-    for (int mode = 0; mode < 3; ++mode) {
-        fs::remove(path);
-        if (mode == 0) {
-            expect(common_ngram_cache_save_file(seed, path, vocab, err), "seed full checkpoint allocation control");
-        } else if (mode == 2) {
-            std::ofstream corrupt(path, std::ios::binary);
-            corrupt << "bad";
+    for (uint64_t max_continuations : {uint64_t(1), UINT64_MAX}) {
+        for (int mode = 0; mode < 4; ++mode) {
+            fs::remove(path);
+            if (mode == 0) {
+                expect(common_ngram_cache_save_file(seed, path, vocab, err), "seed full checkpoint allocation control");
+            } else if (mode == 2) {
+                std::ofstream corrupt(path, std::ios::binary);
+                corrupt << "bad";
+            } else if (mode == 3) {
+                auto bytes = ngram_old_file_bytes(seed, vocab);
+                bytes.back() ^= 1;
+                std::ofstream corrupt(path, std::ios::binary);
+                corrupt.write(bytes.data(), bytes.size());
+            }
+            common_ngram_cache live = source;
+            common_ngram_cache delta = source;
+            bool from_disk = false;
+            allocation_probe::total = 0;
+            allocation_probe::active = true;
+            const bool ok = common_ngram_cache_sync_file(path, live, delta, 0, vocab, err, &from_disk, 1, max_continuations);
+            allocation_probe::active = false;
+            const size_t allocated = allocation_probe::total;
+            bounded_max_bytes = std::max(bounded_max_bytes, allocated);
+            expect(ok && delta.empty() && live.size() == 1 && live.begin()->second.size() <= max_continuations && from_disk == (mode == 0),
+                    "loaded, missing and corrupt checkpoints bound merge nodes before publication");
+            expect(allocated < 128 * 1024, "bounded checkpoint allocates less than 128 KiB despite 16385 proposed pairs");
+            if (mode == 0) {
+                expect(live.at(key).at(1) == 13, "full saved quota still learns retained counts exactly once");
+            }
+            common_ngram_cache reloaded;
+            expect(common_ngram_cache_load_file(path, reloaded, vocab, err, 1, max_continuations) == COMMON_NGRAM_CACHE_LOAD_OK && reloaded == live,
+                    "bounded merge output reloads under the same quotas");
         }
-        common_ngram_cache live = source;
-        common_ngram_cache delta = source;
-        bool from_disk = false;
-        allocation_probe::total = 0;
-        allocation_probe::active = true;
-        const bool ok = common_ngram_cache_sync_file(path, live, delta, 0, vocab, err, &from_disk, 1, 1);
-        allocation_probe::active = false;
-        const size_t allocated = allocation_probe::total;
-        bounded_max_bytes = std::max(bounded_max_bytes, allocated);
-        expect(ok && delta.empty() && live.size() == 1 && live.begin()->second.size() == 1 && from_disk == (mode == 0),
-                "loaded, missing and corrupt checkpoints bound merge nodes before publication");
-        expect(allocated < 128 * 1024, "bounded checkpoint allocates less than 128 KiB despite 16385 proposed pairs");
-        if (mode == 0) {
-            expect(live == common_ngram_cache({{key, {{1, 13}}}}), "full saved quota still learns retained counts exactly once");
-        }
-        common_ngram_cache reloaded;
-        expect(common_ngram_cache_load_file(path, reloaded, vocab, err, 1, 1) == COMMON_NGRAM_CACHE_LOAD_OK && reloaded == live,
-                "bounded merge output reloads under the same quotas");
     }
     fs::remove(path);
     common_ngram_cache live = source;
@@ -345,6 +352,90 @@ static void test_ngram_checkpoint_merge_allocations() {
     allocation_probe::active = false;
     expect(ok && delta.empty() && live == source && allocation_probe::total > 2 * bounded_max_bytes,
             "unlimited positive control retains all pairs and shows the old full-copy allocation cost");
+    fs::remove_all(dir);
+}
+
+static void test_ngram_worker_fallback() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / ("test-ngram-worker-fit-" + std::to_string(ggml_time_us()));
+    const bool created = fs::create_directory(dir);
+    expect(created, "create private worker fallback test directory");
+    if (!created) {
+        return;
+    }
+    const std::string path = (dir / "dynamic").string();
+    const common_ngram_cache_vocab_id vocab = {100000, 123};
+    const llama_token token = 0;
+    const common_ngram key(&token, 1);
+    const common_ngram_cache seed = {{key, {{1, 10}}}};
+    common_ngram_cache source = {{key, {{1, 3}}}};
+    for (llama_token t = 100; t < 16484; ++t) {
+        source[common_ngram(&t, 1)].emplace(1, 1);
+    }
+    std::string err;
+    for (uint64_t quota : {uint64_t(1), UINT64_MAX}) {
+        for (int mode = 0; mode < 3; ++mode) {
+            size_t copied_bytes = 0;
+            for (bool borrow_delta : {false, true}) {
+                fs::remove(path);
+                if (mode == 0) {
+                    expect(common_ngram_cache_save_file(seed, path, vocab, err), "seed worker fallback file");
+                } else if (mode == 2) {
+                    auto bytes = ngram_old_file_bytes(seed, vocab);
+                    bytes.back() ^= 1;
+                    std::ofstream corrupt(path, std::ios::binary);
+                    corrupt.write(bytes.data(), bytes.size());
+                }
+                common_ngram_cache cache;
+                common_ngram_cache delta = source;
+                bool from_disk = false;
+                allocation_probe::total = 0;
+                allocation_probe::active = true;
+                if (!borrow_delta) {
+                    cache = delta;
+                }
+                const bool ok = common_ngram_cache_sync_file(path, cache, delta, 0, vocab, err, &from_disk,
+                        quota, quota, borrow_delta);
+                allocation_probe::active = false;
+                const size_t allocated = allocation_probe::total;
+                expect(ok && delta.empty() && from_disk == (mode == 0), "worker fallback saves loaded, missing and late-corrupt files");
+                if (quota == 1) {
+                    expect(cache.size() == 1 && cache.begin()->second.size() == 1, "worker fallback respects both quotas");
+                    if (mode == 0) {
+                        expect(cache == common_ngram_cache({{key, {{1, 13}}}}), "worker adds known counts exactly once");
+                    }
+                    if (borrow_delta) {
+                        expect(allocated < 128 * 1024 && copied_bytes > 2 * allocated,
+                                "worker avoids its full input copy before bounded merge; copied control allocates more");
+                    }
+                } else {
+                    common_ngram_cache expected = source;
+                    if (mode == 0) {
+                        expected[key][1] += 10;
+                    }
+                    expect(cache == expected, "unlimited worker fallback retains every pair with exact counts");
+                }
+                if (!borrow_delta) {
+                    copied_bytes = allocated;
+                }
+                common_ngram_cache reloaded;
+                expect(common_ngram_cache_load_file(path, reloaded, vocab, err, quota, quota) == COMMON_NGRAM_CACHE_LOAD_OK &&
+                        reloaded == cache, "worker output reloads at the same quotas");
+            }
+        }
+    }
+#ifdef __linux__
+    expect(common_ngram_cache_save_file(seed, path, vocab, err), "seed worker failure control");
+    const auto bytes_before = ngram_old_file_bytes(seed, vocab);
+    const std::string tmp = path + ".tmp." + std::to_string(getpid());
+    expect(fs::create_directory(tmp), "block worker temporary-file creation");
+    common_ngram_cache cache = seed;
+    common_ngram_cache delta = source;
+    expect(!common_ngram_cache_sync_file(path, cache, delta, 0, vocab, err, nullptr, 1, 1, true) &&
+            !err.empty() && cache == seed && delta == source, "failed worker write preserves result and retry delta");
+    std::ifstream saved(path, std::ios::binary);
+    expect(std::vector<char>(std::istreambuf_iterator<char>(saved), {}) == bytes_before, "failed worker write preserves the old file");
+#endif
     fs::remove_all(dir);
 }
 
@@ -933,6 +1024,7 @@ int main() {
     test_ngram_ram_load_fit();
     test_ngram_checkpoint_load_quotas();
     test_ngram_checkpoint_merge_allocations();
+    test_ngram_worker_fallback();
     test_ngram_live_successor_budget();
     test_ngram_stream_save();
     test_ngram_load_limits();

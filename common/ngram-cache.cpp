@@ -865,7 +865,7 @@ static void common_ngram_cache_remove_stale_tmp(const std::string & filename) {
 bool common_ngram_cache_sync_file(
         const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
         size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk,
-        uint64_t max_entries, uint64_t max_continuations) {
+        uint64_t max_entries, uint64_t max_continuations, bool fallback_to_delta) {
     GGML_ASSERT(&ngram_cache != &ngram_cache_delta);
     err.clear();
     if (from_disk) {
@@ -906,13 +906,14 @@ bool common_ngram_cache_sync_file(
         }
     }
 
+    common_ngram_cache & fallback = fallback_to_delta ? ngram_cache_delta : ngram_cache;
     if (max_entries != UINT64_MAX || max_continuations != UINT64_MAX) {
         common_ngram_cache_limits limits(merged, max_entries, max_continuations);
-        common_ngram_cache_merge(merged, loaded ? ngram_cache_delta : ngram_cache, 0, &limits);
+        common_ngram_cache_merge(merged, loaded ? ngram_cache_delta : fallback, 0, &limits);
     } else if (loaded) {
         common_ngram_cache_merge(merged, ngram_cache_delta);
     } else {
-        merged = ngram_cache;
+        merged = fallback;
     }
 
     common_ngram_cache_prune(merged, n_max);

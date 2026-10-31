@@ -3810,9 +3810,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                 bool        from_disk = false;
                 std::string err;
                 try {
-                    cache = delta;
                     ok = common_ngram_cache_sync_file(params.lookup_cache_dynamic, cache, delta,
-                            n_max_dynamic, vocab_id, err, &from_disk, params.load_max_entries_dynamic, params.load_max_continuations_dynamic);
+                            n_max_dynamic, vocab_id, err, &from_disk, params.load_max_entries_dynamic, params.load_max_continuations_dynamic, true);
                 } catch (const std::exception & e) {
                     ok  = false;
                     err = e.what();
