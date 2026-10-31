@@ -203,11 +203,28 @@ static void test_backend(std::mt19937 & rng) {
                 std::memcpy(w.data()+offset+2*m, &scale, sizeof(scale));
             }
         }
+        std::vector<float> decoded(size_t(M)*K);
+        for (int slab = 0; slab < M/16; ++slab) {
+            aif25_dequantize_slab(w.data()+size_t(slab)*(K/128)*AIF25_UNIT_BYTES,
+                                  decoded.data()+size_t(slab)*16*K, K);
+        }
         for (int tokens : {1, 5}) for (int seqs : {1, 3}) for (int groups : {1, 2}) {
             const int rows = tokens*seqs*groups;
             std::vector<float> x(rows*K);
             for (float & v : x) v = (int(rng()%255)-127)/64.0f;
             const auto y = backend_product(backend, K, M, tokens, seqs, groups, w, x);
+            // Compare raw inputs with the CPU bit decoder and inverse rotation.
+            double error = 0, norm = 0;
+            for (int row = 0; row < rows; ++row) for (int m = 0; m < M; ++m) {
+                double expected = 0;
+                for (int k = 0; k < K; ++k) expected += double(decoded[m*K+k])*x[row*K+k];
+                const double delta = y[row*M+m]-expected;
+                error += delta*delta;
+                norm += expected*expected;
+            }
+            const double relative = std::sqrt(error/std::max(norm, 1e-30));
+            if (!(relative < .02)) std::fprintf(stderr, "fractional raw-input mismatch K=%d rows=%d relative=%.8g\n", K, rows, relative);
+            require(relative < .02, "fractional raw-input CPU reference mismatch");
             // Each row gets its own graph so a dropped or mixed sequence cannot match.
             for (int row = 0; row < rows; ++row) {
                 const std::vector<float> xi(x.begin()+row*K, x.begin()+(row+1)*K);
@@ -220,6 +237,7 @@ static void test_backend(std::mt19937 & rng) {
         }
     }
     ggml_backend_free(backend);
+    std::puts("PASS fractional raw-input CPU reference");
     std::puts("PASS fractional backend sequence dimensions");
 }
 

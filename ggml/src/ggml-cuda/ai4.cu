@@ -312,15 +312,15 @@ static void ai4_launch_mmv_tuned(const uint8_t * W, const int8_t * q, const floa
 // Activations: rotate + int8-quantize X [N rows of K] once. XSH = 1: H256 and one scale per 256 (track B's kernel, used
 // when K % 256 == 0); XSH = 0: H128 and one scale per 128 (K % 256 != 0).
 // gridDim.y carries the rows (<= 65535), so longer inputs run in pieces.
-template <bool SWAP8 = false, bool XPERM = false>
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
 static void ai4_quantize_x(const float * X, int64_t N, int K, int xsh, int8_t * q, float * s, cudaStream_t stream) {
     const int64_t ns = K >> (7 + xsh);
     for (int64_t r0 = 0; r0 < N; r0 += 65535) {
         const int nr = (int) std::min<int64_t>(65535, N - r0);
         if (xsh) {
-            rq4::launch_quantize_act<SWAP8, XPERM>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
+            rq4::launch_quantize_act<SWAP8, XPERM, LINEAR>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
         } else {
-            ai4k::launch_quantize_act128<SWAP8, XPERM>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
+            ai4k::launch_quantize_act128<SWAP8, XPERM, LINEAR>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
         }
     }
 }
@@ -1126,7 +1126,8 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     auto stream = ctx.stream();
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t)N*K);
     ggml_cuda_pool_alloc<float> scales(ctx.pool(), (size_t)N*(K >> (7+xsh)));
-    ai4_quantize_x((const float *)x->data, N, K, xsh, q.get(), scales.get(), stream);
+    // The pair kernel reads rotated columns in their original order.
+    ai4_quantize_x<false, false, true>((const float *)x->data, N, K, xsh, q.get(), scales.get(), stream);
     // CUDA grid.y is limited to 65535; each block handles eight activation rows.
     for (int64_t n0 = 0; n0 < N; n0 += 8*65535) {
         const int nr = (int) std::min<int64_t>(N-n0, 8*65535);

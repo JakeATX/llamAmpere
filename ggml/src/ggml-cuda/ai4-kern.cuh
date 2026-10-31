@@ -1235,7 +1235,7 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
 // Activations for H128 tensors (AI+ units with K % 256 != 0): rotate each 128 block by (1/sqrt(128)) H128 D (D = the first 128
 // sign bits), int8-quantize with one fp32 scale per (token, 128 K) at s[tok*(K/128) + block], bytes in the same fragment
 // order as rq4::quantize_act inside a 128 chunk. One half-warp per (token, 128 block); 4 warps = 8 blocks per CTA.
-template <bool SWAP8 = false, bool XPERM = false>
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
 static __global__ void __launch_bounds__(128) quantize_act128(
         const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N) {
     const int lane = threadIdx.x & 31;
@@ -1301,7 +1301,10 @@ static __global__ void __launch_bounds__(128) quantize_act128(
     const int h  = (l & 3) >> 1;
     const int t0 = (l & 1)*2;
     static_assert(!SWAP8 || !XPERM, "exclusive activation scratch layouts");
-    if constexpr (XPERM) {
+    static_assert(!LINEAR || (!SWAP8 && !XPERM), "linear activation scratch excludes permutations");
+    if constexpr (LINEAR) {
+        *(uint2 *) (q + (int64_t) tok*K + cb*128 + l*8) = make_uint2(w[0], w[1]);
+    } else if constexpr (XPERM) {
         int8_t * qr = q + (int64_t) tok*K + cb*128 + h*64 + (t0 >> 1)*32 + j*8;
         *(uint2 *) qr = make_uint2(w[0], w[1]);
     } else {
@@ -1314,10 +1317,10 @@ static __global__ void __launch_bounds__(128) quantize_act128(
     }
 }
 
-template <bool SWAP8 = false, bool XPERM = false>
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
 static void launch_quantize_act128(const float * x, int64_t sx, int8_t * q, float * s, int K, int N, cudaStream_t stream) {
     const dim3 grid((K/128 + 7)/8, N);
-    quantize_act128<SWAP8, XPERM><<<grid, 128, 0, stream>>>(x, sx, q, s, K, N);
+    quantize_act128<SWAP8, XPERM, LINEAR><<<grid, 128, 0, stream>>>(x, sx, q, s, K, N);
 }
 
 // ---------------------------------------------------------------------------------------------
