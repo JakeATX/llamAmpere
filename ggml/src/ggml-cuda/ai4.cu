@@ -71,6 +71,11 @@ static int ai4_env_int(const char * name, const char * /*unused*/, int def) {
     const char * e = getenv(name);
     return e ? atoi(e) : def;
 }
+// fork: routed AI+ unit kernels; set GGML_CUDA_AIKERN=0 for the prior path.
+static bool ai4_aikern() {
+    static const bool v = ai4_env_int("GGML_CUDA_AIKERN", nullptr, 1) != 0;
+    return v;
+}
 static bool ai4_ai23_tuned() {
     static const bool v = ai4_env_int("GGML_CUDA_AI23_TUNED", nullptr, 0) != 0;
     return v;
@@ -350,7 +355,7 @@ static bool ai4_mmvr_on() {
 // direct path was 28-42% faster than the mmv-ID kernel at widths 1-6 for 640x2560 / 2560x640 experts (kernel-only,
 // no end-to-end speed test yet). Unset: follows GGML_CUDA_AI23_MMVR, as before.
 static bool ai4_mmvr_on_id() {
-    static const bool v = getenv("GGML_CUDA_AI23_MMVR_ID") ? ai4_env_int("GGML_CUDA_AI23_MMVR_ID", nullptr, 0) != 0 : ai4_mmvr_on();
+    static const bool v = getenv("GGML_CUDA_AI23_MMVR_ID") ? ai4_env_int("GGML_CUDA_AI23_MMVR_ID", nullptr, 0) != 0 : (ai4_mmvr_on() || ai4_aikern());
     return v;
 }
 static int ai4_mmvr_cfg() {
@@ -429,6 +434,30 @@ static void ai23_launch_mmvr(const uint8_t * W, const int8_t * q, const float * 
     ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 1, SINGLE_N>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
 }
 
+static bool ai4_spw_enabled(int M, int K, const ai4k::idmap & idm, int max_tiles) {
+    static const int mode = ai4_env_int("GGML_CUDA_AIKERN_SPW", nullptr, 2);
+    if (!ai4_aikern() || mode == 0 || idm.direct_ids == nullptr || idm.direct_x != nullptr || M % 16 != 0) {
+        return false;
+    }
+    const int n_tok = max_tiles/idm.direct_n_used;
+    return mode != 2 || K == 640 || n_tok >= 4;
+}
+
+// fork: each warp owns 16 rows and scans K without a cross-warp sum.
+template <int LAY, int XSH, bool ID, int KT>
+static bool ai4_spw_try(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
+                        cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
+    if constexpr (!ID) {
+        return false;
+    } else {
+        if (!ai4_spw_enabled(M, K, idm, max_tiles)) {
+            return false;
+        }
+        ai4k::launch_mmvr<LAY, XSH, ID, KT, 2, 4, 6, true, false, 1, 1, false, true>(W, q, s, Y, M, M, 1, K, stream, idm, max_tiles);
+        return true;
+    }
+}
+
 template <int LAY, int XSH, bool ID, int KT>
 static bool ai4_mmvr_go(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K,
                         cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
@@ -452,6 +481,9 @@ static bool ai4_mmvr_go(const uint8_t * W, const int8_t * q, const float * s, fl
         }
         const bool two_warps = cfg == 212 || (cfg == 0 && ID && N > 1 && K >= 1024);
         if constexpr (ID) {
+            if (ai4_spw_try<LAY, XSH, ID, KT>(W, q, s, Y, M, K, stream, idm, max_tiles)) {
+                return true;
+            }
             if (idm.direct_ids != nullptr) {
                 if (idm.direct_x != nullptr) {
                     ai23_launch_mmvr<LAY, XSH, ID, KT, 2, 4, 6, true, true>(W, q, s, Y, M, M, N, K, stream, idm, max_tiles);
@@ -502,10 +534,11 @@ template <int LAY, int XSH, bool ID>
 static bool ai4_mmvr_try(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K,
                          cudaStream_t stream, const ai4k::idmap & idm = ai4k::idmap{}, int max_tiles = 1) {
     constexpr int rate = ai4k::lay_rate<LAY>();
-    if constexpr (rate != 2 && rate != 3) {
+    constexpr bool r4 = LAY == ai4k::LAY_AIT4_U && ID;
+    if constexpr (rate != 2 && rate != 3 && !r4) {
         return false;
     } else {
-        if (!(ID ? ai4_mmvr_on_id() : ai4_mmvr_on())) {
+        if (r4 ? !ai4_aikern() : !(ID ? ai4_mmvr_on_id() : ai4_mmvr_on())) {
             return false;
         }
         const int cfg = ai4_mmvr_cfg();
@@ -667,10 +700,9 @@ static int ai4_lay_of(ggml_type t) {
     }
 }
 
-// Rate-2 / rate-3 IMMA kernels (generic window decode, ai4k::kr_win). Opt-in while new: GGML_CUDA_AI23_FAST=1 runs them,
-// unset keeps the rate-k reference path (reconstruct + SGEMM, host-routed MUL_MAT_ID).
+// Rate-2 / rate-3 IMMA kernels; GGML_CUDA_AI23_FAST overrides the routed AI+ default.
 static bool ai4_ai23_fast() {
-    static const bool v = ai4_env_int("GGML_CUDA_AI23_FAST", nullptr, 0) != 0;
+    static const bool v = ai4_env_int("GGML_CUDA_AI23_FAST", nullptr, ai4_aikern() ? 1 : 0) != 0;
     return v;
 }
 
@@ -1035,7 +1067,7 @@ static bool ai4_mmvid_route(int n_tok, int n_used, int n_expert, int rate) {
         return true;
     }
     const int p = getenv("GGML_CUDA_AI4_MMVID_PAIRS") ? ai4_mmvid_pairs() :
-        (ai4_ai23_tuned() && (rate == 2 || rate == 3) ? 4 : 0);
+        (((ai4_ai23_tuned() && (rate == 2 || rate == 3)) || (ai4_aikern() && rate >= 2 && rate <= 4)) ? 4 : 0);
     if (p <= 0 || n_expert <= 0) {
         return false;
     }
@@ -1211,7 +1243,14 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     static const int direct_max = std::min(8, ai4_env_int("GGML_CUDA_AI23_DIRECT", nullptr, ai4_ai23_tuned() ? 4 : 0));
     static const bool fused_x = ai4_env_int("GGML_CUDA_AI23_FUSED_X", nullptr, 0) != 0;
     const int rate = ggml_ai4_rate(src0->type);
-    const bool direct = ai4_mmvr_on_id() && (rate == 2 || rate == 3) && n_tok <= direct_max;
+    const int sms = ai4_ampere_sms(ctx);
+    // The Ampere kernel consumes grouped routing, including when sparse IDs qualify for direct routing.
+    const bool ampere_grouped = sms && src0->type == GGML_TYPE_AIT4_U && ai4_ampere_mmv(n_tok);
+    static const int aikern_direct_max = ai4_env_int("GGML_CUDA_AIKERN_DIRECT", nullptr, 64);
+    const bool aikern_direct = !ampere_grouped && ai4_aikern() && rate >= 2 && rate <= 4 && (rate == 4 || ai4_mmvr_on_id());
+    const bool direct = aikern_direct ?
+        (n_tok <= aikern_direct_max && ai4_mmvid_route(n_tok, n_used, n_expert, rate)) :
+        (ai4_mmvr_on_id() && (rate == 2 || rate == 3) && n_tok <= direct_max);
     // fork: one output column per direct block; zero skipped slots in that same kernel.
     static const bool verify_compact = ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
     const bool direct_zero = direct && verify_compact;
@@ -1227,11 +1266,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     if ((rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN && ai23_id_bn() != 0) {
         bn = ai23_id_bn();
     }
-    const int sms = ai4_ampere_sms(ctx);
-    if (sms && src0->type == GGML_TYPE_AIT4_U) {
-        if (ai4_ampere_mmv(n_tok)) {
-            bn = ai4_ampere_bn(n_tok);
-        }
+    if (ampere_grouped) {
+        bn = ai4_ampere_bn(n_tok);
     }
     static const bool tight_grid = ai4_env_int("GGML_CUDA_AI23_ID_TIGHT_GRID", nullptr, 0) != 0;
     const bool tight = tight_grid && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
@@ -1383,7 +1419,7 @@ static __device__ __forceinline__ void moe_mixed_down_rows(const char * w, const
     }
 }
 
-template <int LAY, int XSH, int KT, int WARPS, bool SINGLE_N>
+template <int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW>
 static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
         ggml_type bank_type, const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
@@ -1401,33 +1437,40 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
     }
     const bool hot = h >= 0 && h < idm.direct_n_expert;
     if (hot && bank_type != GGML_TYPE_IQ4_NL) {
-        ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N>(W, q, s, Y, M, M, 1, K, idm);
+        ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, SPW>(W, q, s, Y, M, M, 1, K, idm);
         return;
     }
-    float * out = Y + ((int64_t) t*idm.direct_n_used + u)*M + blockIdx.x*16;
+    constexpr int slabs = SPW ? WARPS : 1;
+    const int row0 = blockIdx.x*16*slabs;
+    float * out = Y + ((int64_t) t*idm.direct_n_used + u)*M + row0;
     const int e = ids[t*ids_stride + u];
     if (!hot && (h >= 0 || e < 0 || e >= n_expert || (skip && skip[e] && (!resident || !resident[e])))) {
-        if (threadIdx.x < 16) {
+        if (threadIdx.x < 16*slabs && row0 + threadIdx.x < M) {
             out[threadIdx.x] = 0.0f;
         }
         return;
     }
     const char * w = hot ? (const char *) W + (size_t) h*idm.nb02 :
             table ? (const char *) table[e] : base + (size_t) e*expert_stride;
-    w += (size_t) blockIdx.x*16*row_stride;
+    w += (size_t) row0*row_stride;
     const int64_t act_row = (int64_t) t*idm.direct_ne11 + u % idm.direct_ne11;
     x += act_row*(GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1);
-    switch (hot ? bank_type : type) {
+    // SPW covers four slabs; retain each cold row's original MMVQ reduction.
+    for (int slab = 0; slab < slabs && row0 + slab*16 < M; ++slab) {
+        const char * sw = w + (size_t) slab*16*row_stride;
+        float * sy = out + slab*16;
+        switch (hot ? bank_type : type) {
 #define MOE_MIXED_CASE(T, F, V) case T: \
         if constexpr (T == GGML_TYPE_Q2_0 || T == GGML_TYPE_IQ4_NL) { \
-            moe_mixed_down_rows<T, WARPS>(w, x, out, K); \
+            moe_mixed_down_rows<T, WARPS>(sw, x, sy, K); \
         } else { \
-            moe_mixed_base_rows<T, WARPS>(w, x, out, K); \
+            moe_mixed_base_rows<T, WARPS>(sw, x, sy, K); \
         } \
         break;
         MOE_MIXED_TYPES(MOE_MIXED_CASE)
 #undef MOE_MIXED_CASE
-        default: __trap();
+            default: __trap();
+        }
     }
     if (trace && !hot && table && blockIdx.x == 0 && threadIdx.x == 0 &&
             (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL)) {
@@ -1527,24 +1570,26 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         idm.direct_map = (const float *) route_map->data;
         idm.direct_map_size = (int) cw->ne[2];
     }
-    const dim3 grid(M/16, ids->ne[0], ids->ne[1]);
+    const bool spw = w->type != GGML_TYPE_IQ4_NL && ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
+    const dim3 grid(spw ? (M/16 + 3)/4 : M/16, ids->ne[0], ids->ne[1]);
     static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
     const int cfg = ai4_mmvr_cfg();
     const bool two_warps = cfg == 212 || (cfg == 0 && ids->ne[1] > 1 && K >= 1024);
     static const bool single = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0 ||
                                ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
-#define MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, SINGLE) \
-    moe_mixed_mmv<L, XSH, KT, WARPS, SINGLE><<<grid, WARPS*32, WARPS*2*ai4k::mmv_stage_bytes<true, L>(), ctx.stream()>>>( \
+#define MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, SINGLE, SPW) \
+    moe_mixed_mmv<L, XSH, KT, WARPS, SINGLE, SPW><<<grid, WARPS*32, WARPS*2*ai4k::mmv_stage_bytes<true, L>(), ctx.stream()>>>( \
             (const uint8_t *) w->data, q.get(), s.get(), (float *) dst->data, M, K, idm, \
             w->type, (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
             ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
             route_map ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr, trace > 1)
 #define MOE_MIXED_SINGLE(L, XSH, KT, WARPS) \
-    if (single) { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, true); } \
-    else        { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, false); }
+    if (single) { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, true, false); } \
+    else        { MOE_MIXED_LAUNCH(L, XSH, KT, WARPS, false, false); }
 #define MOE_MIXED_WARPS(L, XSH, KT) \
-    if (two_warps) { MOE_MIXED_SINGLE(L, XSH, KT, 2); } \
-    else           { MOE_MIXED_SINGLE(L, XSH, KT, 4); }
+    if (spw)            { MOE_MIXED_LAUNCH(L, XSH, KT, 4, false, true); } \
+    else if (two_warps) { MOE_MIXED_SINGLE(L, XSH, KT, 2); } \
+    else                { MOE_MIXED_SINGLE(L, XSH, KT, 4); }
 #define MOE_MIXED_SHAPE(L) \
     if (K == 640 && ai4_mmvr_kt())       { MOE_MIXED_WARPS(L, 0, 640); } \
     else if (K == 2560 && ai4_mmvr_kt()) { MOE_MIXED_WARPS(L, 1, 2560); } \
@@ -1561,8 +1606,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     if (trace) {
-        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d\n",
-                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr);
+        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d\n",
+                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw);
     }
 }
 #undef MOE_MIXED_TYPES
