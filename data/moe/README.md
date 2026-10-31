@@ -1,6 +1,6 @@
 # Flash-Next startup expert profile
 
-The Flash-Next launcher (`scripts/flash-next-server.sh`) loads `flash-next-experts.strp`, our v2-r-pure expert list, by default through `data/moe/flash-next.env`. Set `FLASH_NEXT_PROFILE` to use another list. The notes below describe the usage-count profile format.
+The Flash-Next launcher (`scripts/flash-next-server.sh`) loads `flash-next-experts.strp`, our v2-r-pure-skip15 expert list (v2-r-pure refined for the default skip rule), by default through `data/moe/flash-next.env`. Set `FLASH_NEXT_PROFILE` to use another list. The notes below describe the usage-count profile format.
 
 `flash-next.profile` uses the MOEPROF1 usage-count format from fn/fast. Its model identity and checksum are verified before any expert is warmed. The loader does not change a single quantized weight block.
 

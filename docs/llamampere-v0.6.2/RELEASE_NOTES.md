@@ -5,7 +5,7 @@ This candidate still needs its combined build, correctness, saved-prompt, qualit
 `scripts/flash-next-server.sh -m MODEL` selects the Flash-Next launch defaults:
 
 - SJ-KVaRN 4-bit keys and values, adaptive MTP depth 3 to 4, and mb-MTP enabled.
-- Our Q2S drafter and bundled `data/moe/flash-next-experts.strp` expert list (our v2-r-pure list) from `data/moe/flash-next.env`; override their paths with `FLASH_NEXT_DRAFTER` and `FLASH_NEXT_PROFILE`.
+- Our Q2S drafter and bundled `data/moe/flash-next-experts.strp` expert list (our v2-r-pure-skip15 list) from `data/moe/flash-next.env`; override their paths with `FLASH_NEXT_DRAFTER` and `FLASH_NEXT_PROFILE`.
 - `--moe-skip`: skip low-weight experts that are off the card within a 15% cumulative router-weight budget, protecting the first five routes. This changes the model's answers. Resident experts and prompt processing keep their normal computation.
 - Two-worker PLE page-touch prefetch and the CPU expert split. Set `LLAMA_PLE_PREFETCH=0` to disable prefetch; existing environment overrides are kept.
 
