@@ -3030,13 +3030,33 @@ private:
     bool eval_cache_save(server_slot & slot, int64_t n_tokens) {
         const int64_t t_start = ggml_time_us();
 
+        const size_t spec_bytes = common_speculative_get_state_size(spec.get(), slot.id);
+        uint64_t total_ram = 0, available_ram = 0;
+        if (params_base.fit_params) {
+            common_host_memory(total_ram, available_ram);
+        }
+        // get_text_tokens() reserves the whole slot, even when only a prefix is saved.
+        if (n_tokens < 0 || uint64_t(n_tokens) > slot.prompt.tokens.size() || spec_bytes == SIZE_MAX ||
+                !common_fit_eval_cache_save_fits(available_ram, params_base.fit_params, slot.prompt.tokens.size(), spec_bytes)) {
+            SLT_ERR(slot, "eval cache: entry was not saved because its temporary copies exceed the current RAM fit budget or its size is invalid\n");
+            return false;
+        }
+
         llama_tokens tokens = slot.prompt.tokens.get_text_tokens();
+        if (uint64_t(n_tokens) > tokens.size()) {
+            SLT_ERR(slot, "eval cache: entry has fewer text tokens than requested\n");
+            return false;
+        }
         tokens.resize(n_tokens);
 
         const size_t n_checkpoints = std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
                 [n_tokens](const common_prompt_checkpoint & c) { return c.n_tokens <= n_tokens; });
         std::vector<uint8_t> spec_state;
         common_speculative_get_state(spec.get(), slot.id, spec_state);
+        if (spec_state.size() != spec_bytes) {
+            SLT_ERR(slot, "eval cache: speculative state size changed during save\n");
+            return false;
+        }
         std::string err;
         if (!eval_cache->can_add(tokens, slot.prompt.checkpoints, spec_state.size(), err, n_tokens)) {
             SLT_ERR(slot, "eval cache: failed to add entry: %s\n", err.c_str());

@@ -102,6 +102,18 @@ uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit) {
     return common_fit_ram_plan(available, requests).bytes[COMMON_FIT_RAM_EVAL];
 }
 
+bool common_fit_eval_cache_save_fits(uint64_t available, bool fit, uint64_t n_tokens, uint64_t spec_bytes) {
+    if (!fit) {
+        return true;
+    }
+    const uint64_t budget = common_fit_eval_cache_ram_bytes(available, true);
+    constexpr uint64_t scratch = 65536;
+    if (budget < scratch || spec_bytes > budget - scratch) {
+        return false;
+    }
+    return n_tokens <= (budget - scratch - spec_bytes) / sizeof(llama_token);
+}
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {

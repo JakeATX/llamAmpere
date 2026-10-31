@@ -187,6 +187,28 @@ static void test_ram_eval_fit() {
     }
     expect(common_fit_eval_cache_ram_bytes(UINT64_MAX, true) < UINT64_MAX / 20,
             "extreme available RAM cannot overflow eval quota");
+
+    for (uint64_t host_gib : {16, 32, 64, 128}) {
+        const uint64_t available = (host_gib - 6) * GiB;
+        const uint64_t budget = common_fit_eval_cache_ram_bytes(available, true);
+        const uint64_t n_tokens = 100000;
+        const uint64_t spec_bytes = budget - 65536 - n_tokens * sizeof(llama_token);
+        expect(common_fit_eval_cache_save_fits(available, true, n_tokens, spec_bytes),
+                "token and speculative copies at the live eval quota fit");
+        expect(!common_fit_eval_cache_save_fits(available, true, n_tokens, spec_bytes + 1),
+                "one byte over the live save quota is refused before either copy");
+        expect(!common_fit_eval_cache_save_fits(available, true, n_tokens + 1, spec_bytes),
+                "the token copy is charged along with the speculative state");
+        expect(!common_fit_eval_cache_save_fits(available, true, UINT64_MAX, 0) &&
+                !common_fit_eval_cache_save_fits(available, true, 0, UINT64_MAX),
+                "hostile copy sizes cannot wrap save admission arithmetic");
+    }
+    for (uint64_t available : {uint64_t(0), 4 * GiB, 5 * GiB, 5 * GiB + MiB - 1}) {
+        expect(!common_fit_eval_cache_save_fits(available, true, 0, 0),
+                "low or unknown current RAM disables eval saves before extraction");
+        expect(common_fit_eval_cache_save_fits(available, false, 100000, 8 * MiB),
+                "fit off preserves valid eval save sizes without a RAM probe");
+    }
 }
 
 static void test_ram_prompt_fit() {
