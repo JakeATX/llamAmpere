@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "../src/llama-moe-arena.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -25,6 +26,17 @@ static void test_ram_fit() {
         // Fake a mapped model and context that already use six GiB.
         const uint64_t available = (host_gib - 6) * GiB;
         const auto plan = common_fit_ram_plan(available, requests);
+        const size_t expert_budget = llama_moe_arena::fit_memory_budget(available);
+        const uint64_t expected_expert_mib = (((host_gib - 11) * 1024 * 4 / 5) / 2);
+        expect(expert_budget == expected_expert_mib * MiB && expert_budget == plan.bytes[COMMON_FIT_RAM_EXPERTS],
+                "post-map expert arena quota agrees with the common RAM-fit plan on fake hosts");
+        expect(llama_moe_arena::fits_ram_budget(expert_budget, available, true, false), "exact expert quota can pin");
+        expect(!llama_moe_arena::fits_ram_budget(expert_budget + 1, available, true, false),
+                "one byte beyond expert quota selects the existing unpinned fallback");
+        expect(llama_moe_arena::fits_ram_budget(expert_budget + 1, available, true, true),
+                "explicit arena selection wins over the automatic share");
+        expect(llama_moe_arena::fits_ram_budget(expert_budget + 1, available, false, false),
+                "fit off preserves legacy arena admission");
         uint64_t sum = 0;
         for (uint64_t bytes : plan.bytes) {
             expect(bytes <= available - sum, "RAM plan cannot overflow available memory");
@@ -41,6 +53,13 @@ static void test_ram_fit() {
         std::printf("RAM fit fake %llu GiB host: available=%llu MiB optional=%llu MiB floor=5120 MiB\n",
                 (unsigned long long) host_gib, (unsigned long long) (available / MiB), (unsigned long long) (sum / MiB));
     }
+    for (uint64_t available : {uint64_t(0), 4 * GiB, 5 * GiB}) {
+        expect(llama_moe_arena::fit_memory_budget(available) == 0 &&
+                !llama_moe_arena::fits_ram_budget(MiB, available, true, false),
+                "unknown or low RAM disables automatic pinned expert storage");
+    }
+    expect(llama_moe_arena::fit_memory_budget(UINT64_MAX) <= UINT64_MAX - 5 * GiB,
+            "extreme host RAM cannot overflow the expert budget");
     requests[COMMON_FIT_RAM_PROMPT] = {123 * MiB, true};
     requests[COMMON_FIT_RAM_EXPERTS].bytes = 0;
     const auto explicit_plan = common_fit_ram_plan(16 * GiB, requests);

@@ -2228,7 +2228,7 @@ void llama_model_loader::print_info() const {
     }
 }
 
-std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progress_callback callback, void * user_data) {
+std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progress_callback callback, void * user_data, bool fit_ram) {
     if (!use_moe_arena || no_alloc) { return nullptr; }
     std::map<int, std::vector<ggml_tensor *>> layers;
     for (const auto & entry : ctx_map) {
@@ -2267,7 +2267,13 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         reserve += largest_layer + mapping_margin;
     }
     const size_t available = llama_moe_arena::available_memory();
-    if (available < reserve || total > available - reserve || !llama_moe_arena::pin_supported()) {
+    const bool quota_ok = llama_moe_arena::fits_ram_budget(total, available, fit_ram,
+            getenv("LLAMA_MOE_ARENA") != nullptr);
+    if (available < reserve || total > available - reserve || !llama_moe_arena::pin_supported() || !quota_ok) {
+        if (!quota_ok) {
+            LLAMA_LOG_INFO("RAM fit: pinned expert storage disabled because %.2f GiB exceeds its %.2f GiB RAM share; using unpinned model pages to leave 5 GiB free and room for other caches\n",
+                    total / double(GiB), llama_moe_arena::fit_memory_budget(available) / double(GiB));
+        }
         LLAMA_LOG_WARN("%s: %.2f GiB experts use unpinned mmap storage; %.2f GiB available, %.2f GiB pinning headroom required\n",
                 __func__, total / double(GiB), available / double(GiB), reserve / double(GiB));
 #ifdef __linux__

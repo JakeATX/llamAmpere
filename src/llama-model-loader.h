@@ -90,7 +90,7 @@ struct llama_model_loader {
     mutable std::unordered_map<std::string, bool> router_bf16_exact;
     bool router_bf16_exact_check(const char * name) const;
     std::set<const ggml_tensor *> arena_tensors;
-    std::unique_ptr<llama_moe_arena> load_moe_arena(llama_progress_callback callback, void * user_data);
+    std::unique_ptr<llama_moe_arena> load_moe_arena(llama_progress_callback callback, void * user_data, bool fit_ram = false);
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
