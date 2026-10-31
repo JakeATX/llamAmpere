@@ -1734,6 +1734,16 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// fork: checkpoint hand-over keeps vector capacity, not just its current length.
+static size_t server_prompt_ram_add(size_t total, size_t part) {
+    return part > SIZE_MAX - total ? SIZE_MAX : total + part;
+}
+
+static size_t server_prompt_checkpoint_ram(const common_prompt_checkpoint & checkpoint) {
+    size_t total = server_prompt_ram_add(checkpoint.data_tgt.capacity(), checkpoint.data_dft.capacity());
+    return server_prompt_ram_add(total, checkpoint.data_spec.capacity());
+}
+
 void server_prompt_cache::configure(std::unique_ptr<server_prompt_cache> & cache, int32_t limit_mib, size_t n_ctx, bool fit_ram) {
     cache.reset();
     if (limit_mib > 0) {
@@ -1745,7 +1755,7 @@ void server_prompt_cache::configure(std::unique_ptr<server_prompt_cache> & cache
     }
 }
 
-size_t server_prompt_cache::disk_read_budget() const {
+size_t server_prompt_cache::live_ram_budget() const {
     if (!fit_ram) {
         return SIZE_MAX;
     }
@@ -1755,10 +1765,17 @@ size_t server_prompt_cache::disk_read_budget() const {
     } else if (!common_host_memory(total, available)) {
         return 0;
     }
-    const size_t used = size() + spare_size();
     const uint64_t floor = 5ull << 30;
     const uint64_t spare = available > floor ? available - floor : 0;
-    return (size_t) std::min<uint64_t>(limit_size > used ? limit_size - used : 0, spare - spare / 5);
+    return (size_t) std::min<uint64_t>(SIZE_MAX, spare - spare / 5);
+}
+
+size_t server_prompt_cache::disk_read_budget() const {
+    if (!fit_ram) {
+        return SIZE_MAX;
+    }
+    const size_t used = server_prompt_ram_add(size(), spare_size());
+    return std::min(limit_size > used ? limit_size - used : 0, live_ram_budget());
 }
 
 bool server_prompt_cache::reserve_ram(size_t extra) {
@@ -1779,11 +1796,18 @@ size_t server_prompt_cache::size() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.size();
-        if (fit_ram) {
-            res += state.prompt.tokens.size() * sizeof(llama_token) + state.prompt.lora_scales.size() * sizeof(float);
-            res += sizeof(server_prompt_cache_state) + 2 * sizeof(void *);
-            res += state.prompt.checkpoints.size() * (sizeof(common_prompt_checkpoint) + 2 * sizeof(void *));
+        if (!fit_ram) {
+            res += state.size();
+            continue;
+        }
+        for (const size_t part : {state.data.main.capacity(), state.data.drft.capacity(), state.data.spec.capacity(),
+                state.prompt.tokens.size() * sizeof(llama_token), state.prompt.lora_scales.capacity() * sizeof(float),
+                sizeof(server_prompt_cache_state) + 2 * sizeof(void *)}) {
+            res = server_prompt_ram_add(res, part);
+        }
+        for (const auto & checkpoint : state.prompt.checkpoints) {
+            res = server_prompt_ram_add(res, server_prompt_checkpoint_ram(checkpoint));
+            res = server_prompt_ram_add(res, sizeof(checkpoint) + 2 * sizeof(void *));
         }
     }
 
@@ -1826,15 +1850,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     const bool ckpt_thin = ckpt_kept.size() < prompt.checkpoints.size();
     size_t checkpoints_size     = 0;
     size_t checkpoints_size_all = 0;
+    size_t checkpoints_ram_size = 0;
     for (const auto * ckpt : ckpt_kept) {
         checkpoints_size += ckpt->size();
+        checkpoints_ram_size = server_prompt_ram_add(checkpoints_ram_size,
+                fit_ram ? server_prompt_checkpoint_ram(*ckpt) : ckpt->size());
     }
     for (const auto & ckpt : prompt.checkpoints) {
         checkpoints_size_all += ckpt.size();
     }
 
     size_t state_size_new = 0;
-    for (const size_t part : {state_size_tgt, state_size_dft, state_size_spec, checkpoints_size}) {
+    for (const size_t part : {state_size_tgt, state_size_dft, state_size_spec, checkpoints_ram_size}) {
         if (part > SIZE_MAX - state_size_new) {
             return nullptr;
         }
@@ -2356,7 +2383,15 @@ bool server_prompt_cache::disk_spill(const server_prompt_cache_state & state) {
         return false;
     }
 
-    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints, state.data.spec, state.prompt.lora_scales);
+    const size_t budget = live_ram_budget();
+    const size_t token_bytes = state.prompt.tokens.size() * sizeof(llama_token);
+    // Check before get_text_tokens() copies the slot tokens or the writer scans/allocates.
+    if (fit_ram && (token_bytes > budget || budget - token_bytes < (4u << 20) + 8192)) {
+        SRV_WRN("%s", "prompt cache disk spill skipped to leave 5 GiB free\n");
+        return false;
+    }
+    return disk.write(state.prompt.tokens.get_text_tokens(), state.data.main, state.data.drft, state.prompt.checkpoints,
+            state.data.spec, state.prompt.lora_scales, fit_ram ? budget - token_bytes : SIZE_MAX);
 }
 
 void server_prompt_cache::flush_to_disk() {

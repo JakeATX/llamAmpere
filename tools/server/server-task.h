@@ -693,6 +693,7 @@ struct server_prompt_cache {
     std::function<uint64_t()> available_ram;
     bool reserve_ram(size_t extra);
     size_t disk_read_budget() const;
+    size_t live_ram_budget() const;
 
     std::list<server_prompt_cache_state> states;
 

@@ -515,8 +515,15 @@ bool server_prompt_disk_tier::write(const llama_tokens & tokens,
                                     const std::vector<uint8_t> & drft,
                                     const std::list<common_prompt_checkpoint> & checkpoints,
                                     const std::vector<uint8_t> & spec,
-                                    const std::vector<float> & lora_scales) {
+                                    const std::vector<float> & lora_scales, size_t ram_budget) {
     if (!enabled() || tokens.empty() || main.empty()) {
+        return false;
+    }
+
+    // fork: bound the I/O buffer and new token index before any bulk write allocation.
+    const size_t overhead = (4u << 20) + 8192;
+    if (ram_budget != SIZE_MAX && (ram_budget < overhead || tokens.size() > (ram_budget - overhead) / sizeof(llama_token))) {
+        SRV_WRN("%s", "prompt cache disk write skipped to keep its RAM budget\n");
         return false;
     }
 

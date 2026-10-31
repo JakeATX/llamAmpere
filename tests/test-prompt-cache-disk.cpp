@@ -798,6 +798,57 @@ static void test_fit_ram(const std::string & root) {
     CHECK(pc->disk.read(it, rec, 6 * MiB));
     CHECK(rec.main.size() == MiB && rec.tokens == p.tokens.get_text_tokens());
 
+    // Every allocation debit matters: one byte below the full independently summed
+    // budget must fail, and the exact budget must restore the complete record.
+    for (int variant = 0; variant < 4; ++variant) {
+        auto data = make_entry(20 + variant, variant == 0 ? 1000 : 3, variant == 1 ? 1000 : 1, variant == 2 ? 1 : 0);
+        data.drft.clear();
+        data.spec.clear();
+        const std::vector<float> scales(variant == 3 ? 1000 : 0, 0.5f);
+        auto tier = make_tier(root + "/fit-debits-" + std::to_string(variant), "k", 0);
+        CHECK(tier.write(data.tokens, data.main, data.drft, data.ckpts, data.spec, scales));
+        const auto record = tier.entries.begin();
+        size_t need = 4 * MiB + 2 + 2 * data.tokens.size() * sizeof(llama_token) + data.main.size() + scales.size() * sizeof(float);
+        for (const auto & checkpoint : data.ckpts) {
+            need += sizeof(common_prompt_checkpoint) + 2 * sizeof(void *) + checkpoint.data_tgt.size() + checkpoint.data_dft.size() + checkpoint.data_spec.size();
+        }
+        CHECK(!tier.read(record, rec, need - 1));
+        CHECK(fs::exists(record->file) && tier.n_removed_bad == 0 && rec.main.empty());
+        CHECK(tier.read(record, rec, need));
+        CHECK(rec.tokens == data.tokens && rec.main == data.main && rec.lora_scales == scales);
+        CHECK(rec.checkpoints.size() == data.ckpts.size());
+    }
+
+    // Retained checkpoint capacity counts when the slot hands it over by move.
+    server_prompt move_prompt;
+    move_prompt.tokens = server_tokens(llama_tokens{100, 101}, false);
+    auto & checkpoint = move_prompt.checkpoints.emplace_back();
+    checkpoint.data_tgt.reserve(9 * MiB);
+    checkpoint.data_tgt.resize(8 * MiB);
+    CHECK(pc->alloc(move_prompt, 7 * MiB, 0, &move_prompt.checkpoints) == nullptr);
+    CHECK(move_prompt.checkpoints.size() == 1);
+    auto * moved = pc->alloc(move_prompt, 6 * MiB, 0, &move_prompt.checkpoints);
+    CHECK(moved && move_prompt.checkpoints.empty());
+    CHECK(moved && moved->prompt.checkpoints.front().data_tgt.capacity() >= 9 * MiB);
+    CHECK(pc->size() >= 15 * MiB && pc->size() <= pc->limit_size);
+
+    // Low live RAM blocks both flush and eviction before writer buffers/token copies.
+    server_prompt_cache low(16, 0);
+    low.fit_ram = true;
+    low.spare_max_n = 0;
+    low.available_ram = []() { return 6 * GiB; };
+    low.disk = make_tier(root + "/fit-low-writer", "k", 0);
+    CHECK(low.alloc(p, 12 * MiB, 0) != nullptr);
+    low.available_ram = []() { return 4 * GiB; };
+    low.flush_to_disk();
+    CHECK(low.disk.n_match() == 0 && low.states.size() == 1);
+    server_prompt low_next;
+    low_next.tokens = server_tokens(llama_tokens{999}, false);
+    CHECK(low.alloc(low_next, 8 * MiB, 0) == nullptr);
+    CHECK(low.disk.n_match() == 0 && low.states.empty());
+    CHECK(!low.disk.write({1}, {2}, {}, {}, {}, {}, 4 * MiB));
+    CHECK(low.disk.entries.empty());
+
     // The live floor can stop a sub-limit save after RAM use grows.
     pc->available_ram = []() { return 5 * GiB + MiB; };
     server_prompt q;

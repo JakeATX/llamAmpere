@@ -115,7 +115,8 @@ struct server_prompt_disk_tier {
                const std::vector<uint8_t> & drft,
                const std::list<common_prompt_checkpoint> & checkpoints,
                const std::vector<uint8_t> & spec = {},
-               const std::vector<float> & lora_scales = {});
+               const std::vector<float> & lora_scales = {},
+               size_t ram_budget = SIZE_MAX);
 
     // read a matching entry; a file that fails to parse or to verify is deleted
     bool read(std::list<server_prompt_disk_entry>::iterator it, server_prompt_disk_record & out, size_t ram_budget = SIZE_MAX);
