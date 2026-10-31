@@ -502,6 +502,15 @@ static void test_ngram_checkpoint_merge_allocations() {
     source[key].emplace(1, 3);
     std::string err;
     size_t bounded_max_bytes = 0;
+    {
+        // The first warning in the process sets up the logger; keep that one-time cost out of the probe.
+        std::ofstream corrupt(path, std::ios::binary);
+        corrupt << "bad";
+        corrupt.close();
+        common_ngram_cache warm_live = seed;
+        common_ngram_cache warm_delta = seed;
+        common_ngram_cache_sync_file(path, warm_live, warm_delta, 0, vocab, err, nullptr, 1, 1);
+    }
     for (uint64_t max_continuations : {uint64_t(1), UINT64_MAX}) {
         for (int mode = 0; mode < 4; ++mode) {
             fs::remove(path);
