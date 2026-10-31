@@ -911,6 +911,41 @@ llama_model_loader::llama_model_loader(
             ++n_added;
         }
         LLAMA_LOG_INFO("%s: overlay %s: %d tensors, %.2f GiB\n", __func__, ov, n_added, added_bytes/1073741824.0);
+        // LLAMA_MODEL_OVERLAY_PATCH=FILE.gguf: tensors that replace same-named, same-shape overlay tensors (a re-encode
+        // of part of a bank without a full copy of it); every patch tensor must replace one overlay tensor.
+        if (const char * pf = getenv("LLAMA_MODEL_OVERLAY_PATCH"); pf && pf[0]) {
+            if (getenv("LLAMA_MOE_BANK_KEEP")) {
+                throw std::runtime_error("LLAMA_MODEL_OVERLAY_PATCH does not support LLAMA_MOE_BANK_KEEP");
+            }
+            struct ggml_context * pctx = NULL;
+            struct gguf_init_params p_params = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &pctx,
+            };
+            gguf_context_ptr p_gguf { gguf_init_from_file(pf, p_params) };
+            if (!p_gguf) {
+                throw std::runtime_error(format("%s: failed to load overlay patch GGUF %s", __func__, pf));
+            }
+            if (const char * error = llama_ait_format_error(p_gguf.get())) { throw std::runtime_error(error); }
+            if (files.size() >= UINT16_MAX) {
+                throw std::runtime_error("too many model files for an overlay patch");
+            }
+            const uint16_t pidx = (uint16_t) files.size();
+            files.emplace_back(new llama_file(pf, "rb"));
+            contexts.emplace_back(pctx);
+            int n_patched = 0;
+            for (ggml_tensor * cur = ggml_get_first_tensor(pctx); cur; cur = ggml_get_next_tensor(pctx, cur)) {
+                auto it = weights_map.find(cur->name);
+                if (it == weights_map.end() || it->second.idx != idx || !ggml_are_same_shape(it->second.tensor, cur)) {
+                    throw std::runtime_error(format("overlay patch %s: tensor '%s' does not replace an overlay tensor of the same shape",
+                            pf, ggml_get_name(cur)));
+                }
+                n_bytes += ggml_nbytes(cur) - ggml_nbytes(it->second.tensor);
+                it->second = llama_tensor_weight(files.back().get(), pidx, p_gguf.get(), cur);
+                ++n_patched;
+            }
+            LLAMA_LOG_INFO("%s: overlay patch %s: %d tensors replaced\n", __func__, pf, n_patched);
+        }
         }
     }
 
