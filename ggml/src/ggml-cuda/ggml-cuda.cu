@@ -9428,7 +9428,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 cuda_ctx->fusion_stats.moe_bank_routing++;
                 return 13;
             }
-            if (ggml_backend_buffer_is_cuda(base->src[0]->buffer)) {
+            // Direct weights must retain native MMQ arithmetic above the MMVQ batch limit.
+            if (ggml_backend_buffer_is_cuda(base->src[0]->buffer) &&
+                    base->ne[2] <= get_mmvq_mmid_max_batch(base->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                 ggml_cuda_mul_mat_id_mixed(*cuda_ctx, bank, base, dst, nullptr, nullptr, nullptr, nullptr, map, mask);
                 cuda_ctx->fusion_stats.moe_bank_mixed++;
                 cuda_ctx->fusion_stats.moe_bank_routing++;
@@ -9448,7 +9450,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 cuda_ctx->fusion_stats.moe_bank_mixed++;
                 return 3;
             }
-            if (ggml_backend_buffer_is_cuda(base->src[0]->buffer)) {
+            // Direct weights must retain native MMQ arithmetic above the MMVQ batch limit.
+            if (ggml_backend_buffer_is_cuda(base->src[0]->buffer) &&
+                    base->ne[2] <= get_mmvq_mmid_max_batch(base->src[0]->type, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                 ggml_cuda_mul_mat_id_mixed(*cuda_ctx, node, base, dst);
                 cuda_ctx->fusion_stats.moe_bank_mixed++;
                 return 3;

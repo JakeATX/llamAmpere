@@ -47,6 +47,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -11906,9 +11907,21 @@ struct test_moe_bank_mixed : public test_case {
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
+    bool direct_mmvq_width() const {
+        // Above these widths some CUDA architectures use native MMQ; exact tests check that fallback.
+        switch (base_type) {
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_IQ3_XXS: return width <= 7;
+            case GGML_TYPE_IQ3_S:   return width <= 6;
+            case GGML_TYPE_Q3_K:    return width <= 5;
+            default:               return true;
+        }
+    }
     const char * required_fusion() override {
         const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
-        return !extra_reader && base_type != GGML_TYPE_F32 && (!enabled || atoi(enabled)) ? "moe_bank_mixed" : nullptr;
+        return !extra_reader && base_type != GGML_TYPE_F32 && direct_mmvq_width() &&
+                (!enabled || atoi(enabled)) ? "moe_bank_mixed" : nullptr;
     }
     const char * forbidden_fusion() override {
         const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
@@ -11956,8 +11969,9 @@ struct test_moe_bank_mixed : public test_case {
 struct test_moe_bank_mixed_exact : public test_moe_bank_mixed {
     ggml_tensor * mixed_result = nullptr;
     ggml_tensor * reference_result = nullptr;
-    test_moe_bank_mixed_exact(ggml_type bank_type, int width) :
-        test_moe_bank_mixed(bank_type, GGML_TYPE_IQ4_NL, width, 1, 4, false, false, 640, 2560) {}
+    test_moe_bank_mixed_exact(ggml_type bank_type, int width, ggml_type base_type = GGML_TYPE_IQ4_NL,
+            int mode = 1, int channels = 4, int n_in = 640, int n_out = 2560) :
+        test_moe_bank_mixed(bank_type, base_type, width, mode, channels, false, false, n_in, n_out) {}
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED_EXACT"; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         mixed_result = test_moe_bank_mixed::build_graph(ctx);
@@ -11983,7 +11997,7 @@ struct test_moe_bank_mixed_exact : public test_moe_bank_mixed {
         ggml_backend_tensor_get(mixed_result, actual.data(), 0, actual.size()*sizeof(uint32_t));
         ggml_backend_tensor_get(reference_result, expected.data(), 0, expected.size()*sizeof(uint32_t));
         if (actual != expected) {
-            printf("mixed hot projection differs from native projection ");
+            printf("mixed projection differs from native projection ");
             return false;
         }
         return true;
@@ -12004,7 +12018,7 @@ struct test_moe_bank_routing : public test_moe_bank_mixed {
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_ROUTING"; }
     const char * required_fusion() override {
         const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
-        return !enabled || atoi(enabled) ? "moe_bank_routing" : nullptr;
+        return direct_mmvq_width() && (!enabled || atoi(enabled)) ? "moe_bank_routing" : nullptr;
     }
     const char * forbidden_fusion() override {
         const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
@@ -19130,6 +19144,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_IQ4_NL }) {
             test_cases.emplace_back(new test_moe_bank_mixed_reduce(bank, width));
+        }
+    }
+
+    // Native direct-weight MMQ boundaries on Ampere; width 4 also requires mixed fusion to fire.
+    for (const auto & boundary : { std::make_pair(GGML_TYPE_IQ3_XXS, 4),
+                                  std::make_pair(GGML_TYPE_IQ3_XXS, 8),
+                                  std::make_pair(GGML_TYPE_IQ2_S, 8),
+                                  std::make_pair(GGML_TYPE_Q2_K, 8),
+                                  std::make_pair(GGML_TYPE_IQ3_S, 7),
+                                  std::make_pair(GGML_TYPE_IQ3_S, 8),
+                                  std::make_pair(GGML_TYPE_Q3_K, 6),
+                                  std::make_pair(GGML_TYPE_Q3_K, 8) }) {
+        const ggml_type base = boundary.first;
+        const ggml_type bank = base == GGML_TYPE_IQ3_XXS || base == GGML_TYPE_IQ3_S ? GGML_TYPE_AIT3_U : GGML_TYPE_AIT2_U;
+        for (int mode : { 0, 2 }) {
+            for (int channels : { 1, 4 }) {
+                test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, boundary.second, base,
+                        mode, channels, 2560, 640));
+            }
         }
     }
 
