@@ -235,26 +235,27 @@ bool server_eval_cache::read_header(const std::string & id, server_eval_cache_re
 }
 
 bool server_eval_cache::write_index(std::string & err) const {
-    json j;
-    j["format"]         = "llamampere-eval-cache";
-    j["format_version"] = EVAL_CACHE_FORMAT_VERSION;
-    j["key_hash"]       = string_format("%016" PRIx64, key_hash);
-    j["key"]            = key;
-    json arr = json::array();
-    for (const auto & e : entries) {
-        arr.push_back({
-            {"id",       e.id},
-            {"n_tokens", e.tokens.size()},
-            {"bytes",    e.bytes},
-            {"has_dft",  e.has_dft},
-        });
-    }
-    j["entries"] = arr;
-
     const std::string tmp = dir + "/." + EVC_INDEX + ".tmp";
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        f << j.dump(1) << "\n";
+        if (!f) {
+            err = "cannot write " + tmp;
+            return false;
+        }
+        // fork: stream each row without a second index tree or full text copy.
+        f << "{\n \"format\": \"llamampere-eval-cache\",\n \"format_version\": "
+          << json(EVAL_CACHE_FORMAT_VERSION)
+          << ",\n \"key_hash\": " << json(string_format("%016" PRIx64, key_hash))
+          << ",\n \"key\": " << json(key) << ",\n \"entries\": [";
+        for (size_t i = 0; f && i < entries.size(); ++i) {
+            const auto & e = entries[i];
+            f << (i == 0 ? "\n" : ",\n")
+              << "  {\n   \"id\": " << json(e.id)
+              << ",\n   \"n_tokens\": " << json(e.tokens.size())
+              << ",\n   \"bytes\": " << json(e.bytes)
+              << ",\n   \"has_dft\": " << json(e.has_dft) << "\n  }";
+        }
+        f << (entries.empty() ? "]\n}\n" : "\n ]\n}\n");
         f.close();
         if (!f) {
             err = "cannot write " + tmp;

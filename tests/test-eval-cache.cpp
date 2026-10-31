@@ -10,7 +10,10 @@
 #include "fit.h"
 #include "log.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -391,9 +394,17 @@ static void test_streamed_header(const std::string & root) {
         CHECK(rec.checkpoints.front().data_spec == big.front().data_spec);
     }
 
+    const std::string index_path = ec.dir + "/eval-cache.json";
+    auto index_bytes = [&]() {
+        std::ifstream file(index_path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    };
+    const std::string before_index = index_bytes();
+    CHECK(!before_index.empty());
     // An open failure must leave the existing entry and its index intact.
     fs::create_directory(ec.path_hdr(id) + ".tmp");
     CHECK(!ec.add(tokens, checkpoints, spec, false, id, err));
+    CHECK(index_bytes() == before_index);
     CHECK(ec.entries.size() == 1 && ec.entries.front().has_dft);
     CHECK(ec.read_header(id, rec, err) && rec.spec == big_spec && rec.has_dft);
 #ifdef __linux__
@@ -409,6 +420,7 @@ static void test_streamed_header(const std::string & root) {
                                      std::istreambuf_iterator<char>()};
     // The large payload forces the stream buffer to flush before close.
     CHECK(!ec.add(tokens, big, big_spec, false, id, err));
+    CHECK(index_bytes() == before_index);
     std::ifstream after_file(ec.path_hdr(id), std::ios::binary);
     const std::vector<uint8_t> after{std::istreambuf_iterator<char>(after_file),
                                     std::istreambuf_iterator<char>()};
@@ -422,6 +434,65 @@ static void test_streamed_header(const std::string & root) {
         CHECK(rec.checkpoints.front().data_spec == big.front().data_spec);
     }
     fs::remove(ec.path_hdr(id) + ".tmp");
+#endif
+}
+
+static void test_streamed_index(const std::string & root) {
+    using json = nlohmann::ordered_json;
+    server_eval_cache ec;
+    std::string err;
+    const std::string key = KEY_A + ";escaped=\"\\\n\t\x01";
+    CHECK(ec.open(root + "/stream-index", key, true, err));
+    const std::string path = ec.dir + "/eval-cache.json";
+    auto bytes = [&]() {
+        std::ifstream file(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    };
+    auto control = [&]() {
+        json j;
+        j["format"] = "llamampere-eval-cache";
+        j["format_version"] = EVAL_CACHE_FORMAT_VERSION;
+        j["key_hash"] = string_format("%016" PRIx64, ec.key_hash);
+        j["key"] = ec.key;
+        json arr = json::array();
+        for (const auto & e : ec.entries) {
+            arr.push_back({{"id", e.id}, {"n_tokens", e.tokens.size()},
+                           {"bytes", e.bytes}, {"has_dft", e.has_dft}});
+        }
+        j["entries"] = arr;
+        return j.dump(1) + "\n";
+    };
+    CHECK(bytes() == control());
+    // Use real new requests to catch whole-tree and full-text allocations.
+    for (int i = 0; i < 4096; ++i) {
+        server_eval_cache_entry e;
+        e.id = std::to_string(i) + "\"\\\n";
+        e.tokens = seq(i, i % 3);
+        e.bytes = UINT64_MAX - i;
+        e.has_dft = (i % 2) != 0;
+        ec.entries.push_back(std::move(e));
+        if (i == 0) {
+            CHECK(ec.write_index(err));
+            CHECK(bytes() == control());
+        }
+    }
+    allocation_probe::start(0);
+    const bool saved = ec.write_index(err);
+    allocation_probe::stop();
+    CHECK(saved && allocation_probe::largest < 65536);
+    const std::string before = bytes();
+    CHECK(before == control() && before.size() > 65536);
+
+    const std::string tmp = ec.dir + "/.eval-cache.json.tmp";
+    fs::create_directory(tmp);
+    CHECK(!ec.write_index(err));
+    CHECK(bytes() == before);
+    fs::remove(tmp);
+#ifdef __linux__
+    fs::create_symlink("/dev/full", tmp);
+    CHECK(!ec.write_index(err));
+    CHECK(bytes() == before);
+    fs::remove(tmp);
 #endif
 }
 
@@ -597,6 +668,7 @@ int main() {
     test_record_ram_budget(root);
     test_record_allocations(root);
     test_streamed_header(root);
+    test_streamed_index(root);
     test_index_ram_budget(root);
     test_index_version(root);
 
