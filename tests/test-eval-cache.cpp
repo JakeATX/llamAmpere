@@ -3,6 +3,7 @@
 //   (tokens, checkpoints, speculative state), longest-prefix lookup, the refusal of a folder built for another key
 //   (naming the differing field), the format-version check, and skipping of corrupt / incomplete entries.
 
+#include "server-common.h"
 #include "server-eval-cache.h"
 #include "server-prompt-cache-disk.h"
 
