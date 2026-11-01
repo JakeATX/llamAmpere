@@ -2067,7 +2067,12 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     static const bool p2_compact_env = ai4_env_int("GGML_MOE_BANK_MIXED_P2_COMPACT", nullptr, 1) != 0;
     const bool p2_compact = p2_compact_env && fine && ggml_nelements(ids) <= 64;
     const int p2_n_tok = p2_compact ? (int) ids->ne[1] : 0;
-    const dim3 grid((spw ? (M/16 + 3)/4 : M/16)*(pair ? 2 : 1), p2_compact ? 4 : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
+    // Slabs per hit-first block: 4 warps x 16 rows is 20 blocks per route for a 640-row projection (the fused 3XS
+    // hit kernel runs 80); 2 warps doubles the block count at the same warps per SM and keeps each row's k order.
+    // GGML_CUDA_AI23_MIXED_SPW_WARPS=2|4 (default 4).
+    static const int spw_warps = ai4_env_int("GGML_CUDA_AI23_MIXED_SPW_WARPS", nullptr, 4) == 2 ? 2 : 4;
+    const int slabs_per_block = spw ? spw_warps : 1;
+    const dim3 grid((M/16 + slabs_per_block - 1)/slabs_per_block*(pair ? 2 : 1), p2_compact ? 4 : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
     moe_mixed_second second{};
     if (pair) {
         second = { (const uint8_t *) pair->bank->src[0]->data, (float *) pair->dst->data,
@@ -2111,7 +2116,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     if (single) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, true, false, 2); } \
     else        { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, false, false, 2); }
 #define MOE_MIXED_WARPS(T, L, XSH, KT) \
-    if (spw && spw_stages == 8)      { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 8); } \
+    if (spw && spw_warps == 2)       { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 2, false, true, 4); } \
+    else if (spw && spw_stages == 8) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 8); } \
     else if (spw && spw_stages == 4) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 4); } \
     else if (spw)       { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 2); } \
     else if (two_warps) { MOE_MIXED_SINGLE(T, L, XSH, KT, 2); } \
