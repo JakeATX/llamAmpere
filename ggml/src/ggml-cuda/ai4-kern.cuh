@@ -996,7 +996,7 @@ template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int 
 static __device__ __forceinline__ void mmvr_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
         float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm,
-        const mmvr_group * group = nullptr, int bx = -1) {
+        const mmvr_group * group = nullptr, int bx = -1, int slab_ov = -1) {
     static_assert(!SINGLE_N || !ID || DIRECT, "single-column dense or direct scope");
     constexpr int KR = lay_rate<LAY>();
     static_assert(SPLITS == 1 || (!ID && WARPS == 4 && (KT == 5120 || KT == 17408)), "small split scope");
@@ -1018,7 +1018,8 @@ static __device__ __forceinline__ void mmvr_body(
     const int g = lane >> 2, t = lane & 3;
     // bx overrides the slab block index (paired launches stack two projections along x).
     const int bxi = bx >= 0 ? bx : (int) blockIdx.x;
-    const int slab = SPW ? bxi*WARPS + warp : bxi;
+    // slab_ov >= 0: the caller picks this warp's slab (paired-warp launches give two warps one slab).
+    const int slab = SPW ? (slab_ov >= 0 ? slab_ov : bxi*WARPS + warp) : bxi;
     if constexpr (lay_pair<LAY>()) {
         pair_tab_fill(threadIdx.x, WARPS*32);   // before any early return
         __syncthreads();
