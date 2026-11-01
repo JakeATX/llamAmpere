@@ -30,6 +30,7 @@
 #pragma once
 
 #include "rq4.cuh"
+#include "unary.cuh"
 #include "../ggml-ait.h"
 
 #include <algorithm>
@@ -76,7 +77,24 @@ struct idmap {
     const void * const * table2 = nullptr;
     const uint8_t * filter2 = nullptr;
     float * y2 = nullptr;
+    // fork AIPFIX D6 (with table2): fused SwiGLU. glu[o] = silu(glu_gate[o]) * glu_up[o] for each 16-row slice once
+    // both projections of its route are stored. glu_prev / glu_prev2 = the earlier (hit) pass's filters of the table /
+    // table2 projection (val 1), nullptr in the hit pass itself. mmvr resolves glu_pfilter / glu_prev to the partner's.
+    float * glu = nullptr;
+    const float * glu_up = nullptr;
+    const float * glu_gate = nullptr;
+    const uint8_t * glu_prev = nullptr;
+    const uint8_t * glu_prev2 = nullptr;
+    const uint8_t * glu_pfilter = nullptr;
 };
+
+// fork AIPFIX D6: arrivals per (route column, 16-row slice) when both projections of a route are stored by the same
+// launch; the second arrival writes the slice and resets it to 0. Hit passes (filter_val 1) count in bank 0, miss
+// passes in bank 1, and every block clears its tile in the other bank, so a launch whose filters changed under it
+// (one partner counted, the other did not) leaves nothing for the next one: the miss pass that always follows a hit
+// pass clears bank 0 over the same routes, and each hit pass clears bank 1 before its miss pass.
+static constexpr int GLU_PAIR_TILES = 65536;
+static __device__ unsigned int g_ai4k_glu_count[2*GLU_PAIR_TILES];
 
 using rq4::cp_async16;
 using rq4::cp_async4;
@@ -1038,11 +1056,18 @@ static __device__ __forceinline__ void mmvr_body(
             return;
         }
     }
+    if constexpr (DIRECT && !GROUPED) {
+        if (idm.glu && (SPW ? lane == 0 : threadIdx.x == 0)) {
+            const int64_t col = (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
+            g_ai4k_glu_count[(idm.filter_val ? GLU_PAIR_TILES : 0) + col*(M/16) + slab] = 0;
+        }
+    }
     const int nk = K/RQ4_CHUNK;
     const int XSN = K >> (7 + XSH);
     const int * prow = nullptr;
     const int * pcol = nullptr;
     int direct_row = 0;
+    int direct_e = -1;
     if constexpr (DIRECT) {
         static_assert(ID, "mmvr direct ids");
         const int u = blockIdx.y;
@@ -1060,6 +1085,7 @@ static __device__ __forceinline__ void mmvr_body(
         if (idm.filter && idm.filter[e] != idm.filter_val) {
             return;
         }
+        direct_e = e;
         W = idm.table ? (const uint8_t *) idm.table[e] : W + (int64_t) e*idm.nb02;
         direct_row = tok*idm.direct_ne11 + (idm.direct_ne11 == 1 ? 0 : u);
         if constexpr (GROUPED) {
@@ -1324,6 +1350,32 @@ static __device__ __forceinline__ void mmvr_body(
             }
         }
     }
+    if constexpr (DIRECT && !GROUPED) {
+        // fork AIPFIX D6: the warp that stored this slab finishes the route's SwiGLU slice when its partner
+        // projection is stored too: in this launch (count, second arrival writes) or by the earlier hit pass.
+        if (idm.glu && (SPW || warp == 0)) {
+            __threadfence();
+            __syncwarp();
+            const int64_t col = (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
+            int go = 0;
+            if (lane == 0) {
+                if (!idm.glu_pfilter || idm.glu_pfilter[direct_e] == idm.filter_val) {
+                    unsigned int * count = &g_ai4k_glu_count[(idm.filter_val ? 0 : GLU_PAIR_TILES) + col*(M/16) + slab];
+                    if (atomicAdd(count, 1u) == 1u) {
+                        *count = 0;
+                        go = 1;
+                    }
+                } else if (idm.glu_prev && idm.glu_prev[direct_e] == 1) {
+                    go = 1;
+                }
+            }
+            go = __shfl_sync(0xffffffff, go, 0);
+            if (go && lane < 16) {
+                const int64_t o = col*ldy + slab*16 + lane;
+                idm.glu[o] = ggml_cuda_op_silu_single(__ldcg(idm.glu_gate + o)) * __ldcg(idm.glu_up + o);
+            }
+        }
+    }
     (void) M;
 }
 
@@ -1338,6 +1390,8 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
             idmap m = idm;
             m.table = second ? idm.table2 : idm.table;
             m.filter = second ? idm.filter2 : idm.filter;
+            m.glu_pfilter = second ? idm.filter : idm.filter2;
+            m.glu_prev = second ? idm.glu_prev : idm.glu_prev2;
             mmvr_body<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>(
                     W, Xq, Xs, second ? idm.y2 : Y, ldy, M, N, K, m, nullptr, (int) blockIdx.x - (second ? half : 0));
             return;

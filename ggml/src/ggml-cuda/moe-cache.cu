@@ -12068,6 +12068,15 @@ static bool moe_ai_pair_enabled() {
     return on;
 }
 
+// fork AIPFIX D6: the paired launches also write the SwiGLU (no separate kernel). GGML_MOE_CACHE_AI_PAIR_GLU=0 opts out.
+static bool moe_ai_pair_glu_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_MOE_CACHE_AI_PAIR_GLU");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static __global__ void moe_ai_swiglu(const float * gate, const float * up, float * dst, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) {
@@ -12137,14 +12146,18 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                     const int64_t n = ggml_nelements(glu);
                     ggml_cuda_pool_alloc<float> up_out(ctx.pool(), n);
                     ggml_cuda_pool_alloc<float> gate_out(ctx.pool(), n);
+                    const bool fglu = moe_ai_pair_glu_enabled() &&
+                            glu->ne[0]/16*ids->ne[0]*ids->ne[1] <= 65536;
+                    float * glu_out = fglu ? (float *) glu->data : nullptr;
                     auto pair = [&](const void * const * ut, const void * const * gt, const uint8_t * uf,
-                            const uint8_t * gf, int val) {
+                            const uint8_t * gf, int val, const uint8_t * up_prev, const uint8_t * gate_prev) {
                         const bool pok = ggml_cuda_moe_ai_table_mmv(ut, wtype, quantized, (const int32_t *) ids->data,
                                 up_out.get(), a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids_stride,
-                                (int) up_table.desc.n_expert, uf, val, ctx.stream(), gt, gate_out.get(), gf);
+                                (int) up_table.desc.n_expert, uf, val, ctx.stream(), gt, gate_out.get(), gf,
+                                glu_out, up_prev, gate_prev);
                         GGML_ASSERT(pok);
                     };
-                    pair(up_table.device, gate_table.device, up_table.hot, gate_table.hot, 1);
+                    pair(up_table.device, gate_table.device, up_table.hot, gate_table.hot, 1, nullptr, nullptr);
                     const void * const * up_eff = moe_hf_wait(ctx, session, up_table);
                     const void * const * gate_eff = moe_hf_wait(ctx, session, gate_table);
                     const bool cs = session.cs_layer >= 0 && session.cs_layer == up_table.mj_layer;
@@ -12153,9 +12166,11 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                             tail ? g_tail_mask + (size_t) up_table.mj_kind * g_hf_experts : up_table.hot;
                     const uint8_t * skip_gate = cs ? g_cs_mask + (size_t) gate_table.mj_kind * g_hf_experts :
                             tail ? g_tail_mask + (size_t) gate_table.mj_kind * g_hf_experts : gate_table.hot;
-                    pair(up_eff, gate_eff, skip_up, skip_gate, 0);
-                    moe_ai_swiglu<<<(n + 255)/256, 256, 0, ctx.stream()>>>(gate_out.get(), up_out.get(),
-                            (float *) glu->data, n);
+                    pair(up_eff, gate_eff, skip_up, skip_gate, 0, up_table.hot, gate_table.hot);
+                    if (!fglu) {
+                        moe_ai_swiglu<<<(n + 255)/256, 256, 0, ctx.stream()>>>(gate_out.get(), up_out.get(),
+                                (float *) glu->data, n);
+                    }
                     CUDA_CHECK(cudaGetLastError());
                     if (tail) {
                         moe_tail_zero(ctx, ids, (int) up_table.desc.n_expert, glu);
