@@ -2391,10 +2391,18 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     static const bool single = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0 ||
                                ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
     // Deeper hot-route weight prefetch; the K order and arithmetic are unchanged.
-    static const int spw_stages = [] {
+    static const int spw_stages_all = [] {
         const int v = ai4_env_int("GGML_CUDA_AI23_MIXED_STAGES", nullptr, 4);
         return v == 2 || v == 8 ? v : 4;
     }();
+    // Phase 1 runs while the layer's miss copy streams from host memory (same as the native hit pass): a shallower
+    // pipeline (smaller shared-memory stages, fewer loads in flight) leaves the copy kernel room. Same K order and
+    // arithmetic. GGML_MOE_BANK_MIXED_P1_STAGES=0 keeps the common depth.
+    static const int p1_stages = [] {
+        const int v = ai4_env_int("GGML_MOE_BANK_MIXED_P1_STAGES", nullptr, 2);
+        return v == 2 || v == 4 || v == 8 ? v : 0;
+    }();
+    const int spw_stages = phase == 1 && p1_stages ? p1_stages : spw_stages_all;
 #define MOE_MIXED_LAUNCH(T, IQ4, L, XSH, KT, WARPS, SINGLE, SPW, ST) \
     moe_mixed_mmv<T, IQ4, L, XSH, KT, WARPS, SINGLE, SPW, ST><<<grid, WARPS*32, std::max((size_t) (WARPS*ST*ai4k::mmv_stage_bytes<true, L>()), iq4_smem), ctx.stream()>>>( \
             (const uint8_t *) w->data, act_ai_q, act_ai_s, (float *) dst->data, M, K, idm, \
