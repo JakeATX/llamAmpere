@@ -4849,6 +4849,24 @@ struct ggml_cuda_upload_ring {
     struct pending { size_t beg, end; cudaEvent_t ev; };
     std::vector<pending>     inflight;  // oldest first
     std::vector<cudaEvent_t> spare;
+    // GGML_SCHED_UPLOAD_BATCH=1: staged but not yet launched copies, one list per backend stream (see
+    // ggml_backend_cuda_upload_flush)
+    struct staged { const char * src; char * dst; size_t n; };
+    struct batch  { std::vector<staged> items; size_t beg = 0, end = 0; };
+    std::map<cudaStream_t, batch> batches;
+};
+
+static bool ggml_cuda_upload_batch_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_SCHED_UPLOAD_BATCH"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+// one launch for up to UPLOAD_BATCH_MAX staged copies: block row y copies entry y (same bytes as k_cuda_upload_copy)
+#define UPLOAD_BATCH_MAX 32
+struct ggml_cuda_upload_batch_args {
+    const char * src[UPLOAD_BATCH_MAX];
+    char *       dst[UPLOAD_BATCH_MAX];
+    uint32_t     n[UPLOAD_BATCH_MAX];
 };
 
 static __global__ void k_cuda_upload_copy(const char * __restrict__ src, char * __restrict__ dst, size_t n) {
@@ -4869,6 +4887,81 @@ static __global__ void k_cuda_upload_copy(const char * __restrict__ src, char * 
     }
 }
 
+static ggml_cuda_upload_ring & ggml_cuda_upload_ring_for(int device) {
+    static ggml_cuda_upload_ring rings[GGML_CUDA_MAX_DEVICES];
+    return rings[device];
+}
+
+static __global__ void k_cuda_upload_copy_batch(const ggml_cuda_upload_batch_args a) {
+    const int    e = blockIdx.y;
+    const char * src = a.src[e];
+    char *       dst = a.dst[e];
+    const size_t n = a.n[e];
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    const size_t i0 = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if ((((uintptr_t) dst) & 15) == 0) {
+        const size_t n16 = n / 16;
+        for (size_t i = i0; i < n16; i += stride) {
+            ((uint4 *) dst)[i] = ((const uint4 *) src)[i];
+        }
+        for (size_t i = n16 * 16 + i0; i < n; i += stride) {
+            dst[i] = src[i];
+        }
+    } else {
+        for (size_t i = i0; i < n; i += stride) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+// launch the staged copies of one stream as one kernel and one event; caller holds r.mu
+static void ggml_cuda_upload_launch_batch(ggml_cuda_upload_ring & r, cudaStream_t stream) {
+    auto it = r.batches.find(stream);
+    if (it == r.batches.end() || it->second.items.empty()) {
+        return;
+    }
+    auto & b = it->second;
+    ggml_cuda_upload_batch_args args;
+    size_t n_items = b.items.size(), max_n = 1;
+    for (size_t i = 0; i < n_items; ++i) {
+        args.src[i] = b.items[i].src;
+        args.dst[i] = b.items[i].dst;
+        args.n[i]   = (uint32_t) b.items[i].n;
+        max_n = std::max(max_n, b.items[i].n);
+    }
+    const int threads = 256;
+    const unsigned gx = (unsigned) std::min<size_t>(256, std::max<size_t>(1, (max_n + 16 * threads - 1) / (16 * threads)));
+    k_cuda_upload_copy_batch<<<dim3(gx, (unsigned) n_items), threads, 0, stream>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+    cudaEvent_t ev = nullptr;
+    if (!r.spare.empty()) {
+        ev = r.spare.back();
+        r.spare.pop_back();
+    } else {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(ev, stream));
+    r.inflight.push_back({ b.beg, b.end, ev });
+    b.items.clear();
+}
+
+// GGML_SCHED_UPLOAD_BATCH=1: the scheduler calls this once after it has staged all inputs of a split, right before the
+// split's graph compute; every copy staged on this stream so far goes out as one kernel. Also called when the staging
+// ring wraps and from the CUDA graph compute entry, so a staged copy is always launched before any kernel that could
+// read its destination.
+static void ggml_backend_cuda_upload_flush(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_cuda(backend) || !ggml_cuda_upload_batch_enabled()) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto & r = ggml_cuda_upload_ring_for(ctx->device);
+    std::lock_guard<std::mutex> lock(r.mu);
+    if (!r.batches.empty()) {
+        ggml_cuda_set_device(ctx->device);
+        ggml_cuda_upload_launch_batch(r, ctx->stream());
+    }
+}
+
 static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const void * src, ggml_tensor * dst, size_t size) {
     if (!backend || !ggml_backend_is_cuda(backend) || !src || !dst || !dst->data || size == 0 ||
             size > ggml_cuda_upload_ring::RING_BYTES / 8) {
@@ -4878,8 +4971,7 @@ static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const vo
     if (ctx->scratch_borrowed) {
         return false;
     }
-    static ggml_cuda_upload_ring rings[GGML_CUDA_MAX_DEVICES];
-    auto & r = rings[ctx->device];
+    auto & r = ggml_cuda_upload_ring_for(ctx->device);
     std::lock_guard<std::mutex> lock(r.mu);
     if (r.failed) {
         return false;
@@ -4895,7 +4987,13 @@ static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const vo
         }
     }
     const size_t need = GGML_PAD(size, 256);
+    const bool batch = ggml_cuda_upload_batch_enabled();
     if (r.head + need > ggml_cuda_upload_ring::RING_BYTES) {
+        if (batch) {  // staged copies still read the end of the ring: launch them before it is reused
+            for (auto & kv : r.batches) {
+                ggml_cuda_upload_launch_batch(r, kv.first);
+            }
+        }
         r.head = 0;
     }
     const size_t beg = r.head, end = beg + need;
@@ -4918,6 +5016,21 @@ static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const vo
             CUDA_CHECK(cudaEventSynchronize(p.ev));
         }
     }
+    memcpy(r.host + beg, src, size);
+    cudaStream_t stream = ctx->stream();
+    if (batch) {
+        auto & b = r.batches[stream];
+        if (b.items.empty()) {
+            b.beg = beg;
+        }
+        b.end = end;
+        b.items.push_back({ r.dev + beg, (char *) dst->data, size });
+        r.head = end;
+        if (b.items.size() >= UPLOAD_BATCH_MAX) {
+            ggml_cuda_upload_launch_batch(r, stream);
+        }
+        return true;
+    }
     cudaEvent_t ev = nullptr;
     if (!r.spare.empty()) {
         ev = r.spare.back();
@@ -4925,8 +5038,6 @@ static bool ggml_backend_cuda_upload_host_small(ggml_backend_t backend, const vo
     } else {
         CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
     }
-    memcpy(r.host + beg, src, size);
-    cudaStream_t stream = ctx->stream();
     const int threads = 256;
     const int blocks  = (int) std::min<size_t>(256, std::max<size_t>(1, (size + 16 * threads - 1) / (16 * threads)));
     k_cuda_upload_copy<<<blocks, threads, 0, stream>>>(r.dev + beg, (char *) dst->data, size);
@@ -10836,6 +10947,34 @@ struct ggml_cuda_host_block_timer {
     }
 };
 
+// GGML_CUDA_LAUNCH_STATS=1 (diagnostic, off by default, no synchronization): host time of the cudaGraphLaunch call and of
+// the work in front of it (graph compute entry -> launch call) for decode-size graphs (>= 1,500 nodes), logged every 256
+// such launches. Settles what a launch costs without a profiler attached.
+static thread_local int64_t g_cuda_graph_compute_t_entry = 0;
+static bool ggml_cuda_launch_stats_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LAUNCH_STATS"); return e && atoi(e) != 0; }();
+    return on;
+}
+static void ggml_cuda_launch_stats_add(int n_nodes, int64_t pre_us, int64_t launch_us) {
+    static thread_local struct { int64_t n = 0, pre = 0, launch = 0, max_launch = 0; int64_t n_small = 0, small_launch = 0; } st;
+    if (n_nodes < 1500) {
+        st.n_small++;
+        st.small_launch += launch_us;
+        return;
+    }
+    st.n++;
+    st.pre += pre_us;
+    st.launch += launch_us;
+    st.max_launch = std::max(st.max_launch, launch_us);
+    if (st.n % 256 == 0) {
+        GGML_LOG_INFO("[LAUNCHSTATS] %lld big graphs (n_nodes %d): host in front of launch %.1f us, cudaGraphLaunch %.1f us (max %lld); "
+                      "%lld small graphs: cudaGraphLaunch %.1f us\n", (long long) st.n, n_nodes, (double) st.pre / st.n,
+                      (double) st.launch / st.n, (long long) st.max_launch, (long long) st.n_small,
+                      st.n_small ? (double) st.small_launch / st.n_small : 0.0);
+        st = {};
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -11227,7 +11366,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
-        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (ggml_cuda_launch_stats_enabled()) {
+            const int64_t t_launch = ggml_time_us();
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            ggml_cuda_launch_stats_add(cgraph->n_nodes, t_launch - g_cuda_graph_compute_t_entry, ggml_time_us() - t_launch);
+        } else {
+            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        }
         ggml_cuda_moe_cache_device_graph_record(cuda_ctx->device, cuda_graph_update_required, cgraph);
 #else
         GGML_UNUSED(graph_key);
@@ -11255,8 +11400,12 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ggml_cuda_launch_stats_enabled()) {
+        g_cuda_graph_compute_t_entry = ggml_time_us();
+    }
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_backend_cuda_upload_flush(backend);  // no-op unless GGML_SCHED_UPLOAD_BATCH=1 staged copies are waiting
     if (cuda_ctx->scratch_borrowed && !ggml_cuda_borrowed_plan_fits(*cuda_ctx, cgraph)) {
         GGML_LOG_ERROR("%s: graph does not fit borrowed CUDA scratch\n", __func__);
         return GGML_STATUS_ALLOC_FAILED;
@@ -13226,6 +13375,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_upload_host_small") == 0) {
         return (void *) ggml_backend_cuda_upload_host_small;
+    }
+    if (strcmp(name, "ggml_backend_cuda_upload_flush") == 0) {
+        return (void *) ggml_backend_cuda_upload_flush;
     }
     if (strcmp(name, "ggml_backend_cuda_fill_prefix_mask") == 0) {
         return (void *) ggml_backend_cuda_fill_prefix_mask;
