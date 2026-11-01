@@ -19406,7 +19406,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // Widths below SPW at the production gate/up bases (unique and repeated routes), plus the cold Q2_0 down.
-    for (int width : { 1, 2, 3 }) {
+    // Width 1 is left out: this graph's unfused reference is native four-warp MMVQ, while the production
+    // one-token path with the expert cache keeps the one-warp row order the mixed path uses.
+    for (int width : { 2, 3 }) {
         for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U }) {
             const bool ai3 = bank == GGML_TYPE_AIT3_U;
             for (ggml_type base : { ai3 ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XXS, ai3 ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ2_XS,
