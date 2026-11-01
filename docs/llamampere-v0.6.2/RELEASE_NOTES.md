@@ -1,6 +1,52 @@
-# v0.6.2 candidate
+# llamAmpere v0.6.2
 
-This candidate still needs its combined build, correctness, saved-prompt, quality, and product-speed checks. Earlier measurements do not qualify this binary.
+Release checks: the saved-prompt save, erase and restore test gave three identical runs that match the release candidate exactly (30,455 tokens restored); the 2.3 bpw model loads and answers correctly; 20 of 22 CPU tests pass, and the other two (`test-mmap-prefetch` and `test-sjkvarn-state --scalar-only`) fail the same way in the unmodified candidate.
+
+## Quick start: Swift 1.5 27B at 2.3 bpw, 200K context, 24 GB RTX 30-series card
+
+Requirements: Linux, an NVIDIA driver with the CUDA 12 or newer toolkit (`nvcc`), CMake, git and a C++ compiler; the model is a ~9.1 GB download on first start.
+
+This one paste clones llamAmpere at v0.6.2 (or updates an existing `llamAmpere` folder to v0.6.2), builds `llama-server` with HTTPS support so `-hf` can download the model, and starts the server with the recommended flags below. It downloads [jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2) on the first start.
+
+```bash
+if [ -d llamAmpere ]; then
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.2
+else
+  git clone -b v0.6.2 https://github.com/JakeATX/llamAmpere.git
+fi && cd llamAmpere && \
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
+cmake --build build-sm86 -j8 --target llama-server && \
+./build-sm86/bin/llama-server -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
+  -c 204800 -ngl 99 -fa on -b 4096 -ub 1024 --parallel 1 --jinja --no-context-shift \
+  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
+  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 3 \
+  --spec-draft-p-min 0 --spec-mb-mtp
+```
+
+The server listens on http://127.0.0.1:8080 and serves an OpenAI-compatible chat API there. This block was tested on an RTX 30-series card (`sm_86`) only. For another NVIDIA card generation, change `86` in `-DCMAKE_CUDA_ARCHITECTURES=86` to your card's CUDA compute capability number without the dot (NVIDIA lists it for every card); other generations have not been tested.
+
+## Recommended flags
+
+For the Swift 1.5 27B dense model (the 2.3 bpw file above) at 200K context on a 24 GB RTX 30-series card, with the SJ-KVaRN 3/2 KV cache:
+
+| Flag | What it does |
+|---|---|
+| `-hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2` | Downloads the model's single GGUF file from Hugging Face on first start and reuses the saved copy afterward. |
+| `-c 204800` | Gives the model 204,800 tokens (200K) of context. |
+| `-ngl 99` | Puts every model layer on the graphics card. |
+| `-fa on` | Turns on flash attention, the attention path that reads the SJ-KVaRN cache. |
+| `-b 4096 -ub 1024` | Reads prompts in 4,096-token batches, 1,024 tokens per card step, which speeds up long prompts. |
+| `--parallel 1` | Uses one conversation slot so the whole 200K context belongs to one conversation (the server otherwise picks 4 slots that share it). |
+| `--jinja` | Formats chats with the chat template stored in the model file (already the default). |
+| `--no-context-shift` | Stops a reply at the context limit instead of silently dropping the oldest text (already the default). |
+| `-ctk sjkvarn3 -ctv sjkvarn2` | Stores the attention memory (KV cache) in our compressed SJ-KVaRN format with 3 bits per key and 2 bits per value, the 3/2 setting (2.78 bits per element in the compressed cache body, versus 4.28 for 4/4). |
+| `--sjkvarn-body-type auto` | Picks the trellis encoding that the 3/2 setting needs. |
+| `--spec-type draft-mtp-adaptive` | Turns on speculative decoding with the draft layer built into the model file, which guesses tokens ahead so the full model can check several at once. |
+| `--spec-draft-n-min-adaptive 3 --spec-draft-n-max 3` | Drafts 3 tokens per round, the setting used for the model card's results. |
+| `--spec-draft-p-min 0` | Always drafts the full 3 tokens instead of stopping early when the draft layer is unsure. |
+| `--spec-mb-mtp` | Turns on mb-MTP, which also keeps a draft token the full model would have rejected when that token is at least as likely as the replacement; this is faster but changes sampling slightly, so use `--no-spec-mb-mtp` instead for exact sampling (mb-MTP is already on by default with MTP). |
+
+## Changes
 
 `scripts/flash-next-server.sh -m MODEL` selects the Flash-Next launch defaults:
 
