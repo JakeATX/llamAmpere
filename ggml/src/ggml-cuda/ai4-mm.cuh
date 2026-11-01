@@ -15,3 +15,6 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 // true when ggml_cuda_mul_mat_id_ai4 would take the host-routed reference path (GGML_CUDA_AI4_REF=1 or pre-Ampere)
 bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t);
+
+bool ggml_cuda_aif25_supported(const ggml_tensor * op);
+void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst);

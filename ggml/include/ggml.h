@@ -468,6 +468,9 @@ extern "C" {
         GGML_TYPE_AIT2_U  = 115,
         GGML_TYPE_AIT3_U  = 116,
         GGML_TYPE_AIT4_U  = 117,
+        // Fractional computed pair: 5 bits per two weights + fp16/128 scale = 2.625 bpw.
+        // Whole-tensor 16-row units; CUDA dense matmul only. No row-wise embedding lookup.
+        GGML_TYPE_AIF25_U = 118,
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         GGML_TYPE_COUNT   = 144,

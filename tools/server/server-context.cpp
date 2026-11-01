@@ -1117,7 +1117,7 @@ struct server_slot {
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
-        if (spec_draft.empty() && !(task->params.sampling.spec_lossy && spec_is_replay)) {
+        if (spec_draft.empty() && !spec_smpl_after_verify) {
             // no speculative decoding
             i_batch = batch.size();
 
@@ -5143,15 +5143,13 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
-                    // stale candidates: a replay never reads them, a new draft refills them
-                    slot.spec_draft_q.clear();
-
-                    if (!slot.spec_draft.empty() || (slot.task->params.sampling.spec_lossy && slot.spec_is_replay)) {
+                    if (!slot.spec_draft.empty() || slot.spec_smpl_after_verify) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
                     } else {
+                        slot.spec_draft_q.clear();
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
                         slot.spec_ckpt.update_pos(
@@ -5159,9 +5157,8 @@ private:
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
-                        if (slot.task->params.sampling.spec_lossy) {
-                            common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
-                        }
+                        slot.spec_ckpt.data_spec.clear();
+                        common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
@@ -5239,9 +5236,7 @@ private:
             if (ctx_dft) {
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    if (slot.task->params.sampling.spec_lossy) {
-                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
-                    }
+                    common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -6709,7 +6704,7 @@ private:
                 return;
             }
 
-            if (slot.can_speculate() && (!slot.spec_draft.empty() || (slot.task->params.sampling.spec_lossy && slot.spec_is_replay))) {
+            if (slot.can_speculate() && (!slot.spec_draft.empty() || slot.spec_smpl_after_verify)) {
                 return; // sample using speculative decoding
             }
 
@@ -6769,7 +6764,7 @@ private:
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
-                    (slot.spec_draft.empty() && !(slot.task->params.sampling.spec_lossy && slot.spec_is_replay)) || slot.spec_i_batch.empty()) {
+                    (slot.spec_draft.empty() && !slot.spec_smpl_after_verify) || slot.spec_i_batch.empty()) {
                 return;
             }
 
@@ -6778,7 +6773,7 @@ private:
             const size_t verify_width = slot.spec_smpl_after_verify ? slot.spec_verify_width : n_draft;
             std::vector<completion_token_output> pre_sample_probs;
 
-            GGML_ASSERT(n_draft > 0 || (slot.task->params.sampling.spec_lossy && slot.spec_is_replay));
+            GGML_ASSERT(n_draft > 0 || slot.spec_smpl_after_verify);
 
             // verify and try to accept the draft
             {
@@ -6821,6 +6816,7 @@ private:
                 };
                 llama_tokens accepted;
                 const int64_t t_sample0 = ggml_time_us();
+                const bool replayed_verify = bool(slot.spec_smpl_after_verify);
                 if (slot.spec_smpl_after_verify) {
                     accepted = slot.spec_draft;
                     accepted.push_back(slot.spec_replay_token);
@@ -6832,7 +6828,7 @@ private:
                                 slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                                 synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
                         : (slot.spec_draft_q.empty()
-                            ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                            ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, is_stop)
                             : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch,
                                     slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay, slot.id, slot.stats.n_gen, is_stop));
                 }
@@ -6871,7 +6867,7 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
-                        if (slot.task->params.sampling.spec_lossy && synth_probs.empty()) {
+                        if (synth_probs.empty()) {
                             slot.spec_smpl_after_verify.reset(common_sampler_clone(slot.smpl.get()));
                             slot.spec_verify_width = n_draft;
                             slot.spec_replay_token = slot.spec_draft.back();
@@ -6893,9 +6889,7 @@ private:
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        if (slot.task->params.sampling.spec_lossy) {
-                            common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
-                        }
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
@@ -6918,10 +6912,11 @@ private:
                 // controller is fed the count the exact rule would have accepted (the first rescue ends that count),
                 // so beat drafts at the depths exact would. LLAMA_SPEC_MB_CTRL=beat feeds the kept count (old behavior).
                 int32_t n_ctrl = -1;
-                if (slot.task->params.sampling.spec_lossy && server_mb_ctrl_exact() && !slot.spec_draft_q.empty() && synth_probs.empty()) {
+                if (slot.task->params.sampling.spec_lossy && server_mb_ctrl_exact() &&
+                        (!slot.spec_draft_q.empty() || replayed_verify) && synth_probs.empty()) {
                     n_ctrl = common_sampler_get_first_rescue(slot.smpl.get());
                 }
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, n_ctrl);
+                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, n_ctrl, verify_width);
 
                 slot.spec_draft = std::move(accepted);
                 slot.spec_draft_q.clear();
@@ -6930,7 +6925,7 @@ private:
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
-            if (slot.spec_is_replay && (!slot.task->params.sampling.spec_lossy || !common_speculative_get_synth_probs(spec.get()).empty()) && n_accepted > 0) {
+            if (slot.spec_is_replay && !common_speculative_get_synth_probs(spec.get()).empty() && n_accepted > 0) {
                 n_accepted--;
             }
             slot.spec_is_replay = false;

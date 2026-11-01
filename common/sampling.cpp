@@ -798,9 +798,10 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     }
 
     gsmpl->reset();
-    // Exact p/q verification also draws acceptance and residual samples from this stream.
     gsmpl->pq_rng.seed(gsmpl->pq_seed);
     gsmpl->pq_stats = {};
+    gsmpl->top1_trace.clear();
+    gsmpl->first_rescue = -1;
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
@@ -814,9 +815,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
     };
-    if (gsmpl->params.spec_lossy) {
-        result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
-    }
+    result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() + (gsmpl->cur_p.data - gsmpl->cur.data()) : nullptr;
     result->t_total_us = gsmpl->t_total_us;
     result->fused_top_k = gsmpl->fused_top_k;
     result->fused_topk_bias = gsmpl->fused_topk_bias;
@@ -824,6 +823,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     result->pq_seed    = gsmpl->pq_seed;
     result->pq_rng     = gsmpl->pq_rng;   // a restored clone must replay the same accept decisions
     result->pq_stats   = gsmpl->pq_stats;
+    result->top1_trace = gsmpl->top1_trace;
+    result->first_rescue = gsmpl->first_rescue;
     return result;
 }
 
@@ -843,12 +844,13 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->prev       = src->prev;
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() + (src->params.spec_lossy ? src->cur_p.data - src->cur.data() : 0) : nullptr;
+    dst->cur_p.data = src->cur_p.data ? dst->cur.data() + (src->cur_p.data - src->cur.data()) : nullptr;
     dst->rng        = src->rng;
-    // Checkpoint replay must restore exact p/q decisions as well as mode-biased decisions.
     dst->pq_seed  = src->pq_seed;
     dst->pq_rng   = src->pq_rng;
     dst->pq_stats = src->pq_stats;
+    dst->top1_trace = src->top1_trace;
+    dst->first_rescue = src->first_rescue;
     dst->t_total_us = src->t_total_us;
     dst->fused_top_k = src->fused_top_k;
     dst->fused_topk_bias = src->fused_topk_bias;
@@ -1196,8 +1198,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first, const std::function<bool(llama_token, const llama_tokens &)> & is_stop) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    gsmpl->first_rescue = -1;
+    gsmpl->top1_trace.clear();
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -1210,10 +1214,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         common_sampler_accept(gsmpl, id, true);
 
+        const bool stopped = llama_vocab_is_eog(vocab, id) || (is_stop && is_stop(id, result));
         result.push_back(id);
 
-        // Stop before a bonus draw after a committed EOG.
-        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && (gsmpl->params.spec_lossy || i + 1 < draft.size()))) {
+        // Stop before a bonus draw after a committed end token or stop string.
+        if (draft[i] != id || stopped) {
             break;
         }
     }
@@ -1347,13 +1352,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     return result;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first, const std::function<bool(llama_token, const llama_tokens &)> & is_stop) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {
         idxs[i] = i;
     }
 
-    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first, is_stop);
 }
 
 bool common_sampler_pq_supported(const struct common_sampler * gsmpl) {
@@ -1518,7 +1523,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
         const std::function<bool(llama_token, const llama_tokens &)> & is_stop) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     if (!common_sampler_pq_supported(gsmpl)) {
-        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first, is_stop);
     }
     GGML_ASSERT((!replay || !gsmpl->params.spec_lossy) && "beat replay must restore the saved post-verification sampler");
     std::vector<llama_token> result;
@@ -1582,7 +1587,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
             // id-match for this and the remaining positions
             res.accepted = x == draft[i];
         }
-        const bool stopped = gsmpl->params.spec_lossy && (llama_vocab_is_eog(vocab, res.id) || ends(res.id));
+        const bool stopped = llama_vocab_is_eog(vocab, res.id) || ends(res.id);
         common_sampler_accept(gsmpl, res.id, true);
         result.push_back(res.id);
         if (!res.accepted || stopped) {
