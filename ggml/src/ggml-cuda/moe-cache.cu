@@ -158,7 +158,7 @@ static unsigned long long * g_tail_counts = nullptr;
 #define MOE_SWST_LAYERS 48
 #define MOE_SWST_COLS 14
 static unsigned long long * g_swst = nullptr;
-// fork SWAPPOL: swap score source (GGML_MOE_SWAP_SCORE=count|kept|weight|weightkept). Non-count modes accumulate per
+// fork SWAPPOL: swap score source (GGML_MOE_SWAP_SCORE=count|kept|weight|weightkept, GGML_MOE_SWAP_SKIPW). Non-count modes accumulate per
 // (layer, expert) in units of 1/1024 route: kept drops the routes the skip budget left out, weight counts a route as
 // 10x its router weight.
 static unsigned long long * g_swscore = nullptr;
@@ -172,7 +172,22 @@ static int moe_swap_score_mode() {
         if (strcmp(v, "weightkept") == 0) { return 3; }
         GGML_ABORT("GGML_MOE_SWAP_SCORE must be count, kept, weight or weightkept");
     }();
-    return mode;
+    // GGML_MOE_SWAP_SKIPW alone (count scores) still needs the score buffer: mode 4.
+    static const bool skipw_set = getenv("GGML_MOE_SWAP_SKIPW") && *getenv("GGML_MOE_SWAP_SKIPW");
+    return mode ? mode : (skipw_set ? 4 : 0);
+}
+// fork SWAPPOL: GGML_MOE_SWAP_SKIPW=<0..1> scales the score of routes the skip budget left out (not resident, rank
+// past the floor): 1 counts them fully, 0 ignores them (same as kept). Returned in 1/1024 units.
+static unsigned moe_swap_skipw() {
+    static const unsigned w = [] {
+        if (moe_swap_score_mode() & 1) { return 0u; }
+        const char * v = getenv("GGML_MOE_SWAP_SKIPW");
+        if (!v || !*v) { return 1024u; }
+        const float f = strtof(v, nullptr);
+        if (!(f >= 0.0f && f <= 1.0f)) { GGML_ABORT("GGML_MOE_SWAP_SKIPW must be in [0, 1]"); }
+        return (unsigned) (f * 1024.0f + 0.5f);
+    }();
+    return w;
 }
 static const char * moe_swst_path() {
     static const char * path = [] { const char * v = getenv("GGML_MOE_SWAP_STATS"); return v && *v ? v : nullptr; }();
@@ -7917,7 +7932,7 @@ static bool moe_cache_swap_init(moe_cache_session & session) {
             return false;
         }
         memset(g_swscore_host, 0, bytes);
-        MOE_CACHE_LOG("[moe-cache] swap score: mode=%d (1 kept, 2 weight, 3 weight+kept)\n", moe_swap_score_mode());
+        MOE_CACHE_LOG("[moe-cache] swap score: mode=%d (1 kept, 2 weight, 3 weight+kept, 4 count) skipw=%u/1024\n", moe_swap_score_mode(), moe_swap_skipw());
     }
     session.swap_prev.assign(n, 0);
     session.swap_score.assign(n, 0.0f);
@@ -10769,7 +10784,7 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
         const uint8_t * hot0, const uint8_t * hot1, const uint8_t * hot2,
         uint8_t * masks, int mask_stride, unsigned long long * counts,
         moe_mass_record * trace, unsigned * trace_counts,
-        unsigned long long * swst, unsigned long long * swscore, int score_mode) {
+        unsigned long long * swst, unsigned long long * swscore, int score_mode, unsigned skipw) {
     __shared__ unsigned char drop[80], hot[80];
     __shared__ int expert[80];
     __shared__ float scale[8];
@@ -10837,8 +10852,9 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
             for (int j = 0; j < i; ++j) { first &= expert[j] != e; }
             if (first) { atomicAdd(row + 13, 1ULL); }
         }
-        if (swscore && !((score_mode & 1) && drop[i])) {
-            atomicAdd(swscore + (size_t) layer * experts + e, score_mode & 2 ? wfx : 1024ULL);
+        if (swscore) {
+            const unsigned long long v = (score_mode & 2 ? wfx : 1024ULL) * (drop[i] ? skipw : 1024u) / 1024u;
+            if (v) { atomicAdd(swscore + (size_t) layer * experts + e, v); }
         }
     }
     if (!mode) { return; }
@@ -10902,7 +10918,7 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
         (const int32_t *) op->src[1]->data, (int) (op->src[1]->nb[1] / sizeof(int32_t)), (int) op->ne[2],
         layer, active ? mode : 0, threshold, renorm, session.skip_rank_floor, experts, group[0]->hot, group[1]->hot, group[2]->hot,
         g_tail_mask, g_hf_experts, g_tail_counts, (moe_mass_record *) session.mass_trace, session.mass_trace_counts,
-        experts == g_hf_experts ? g_swst : nullptr, experts == g_hf_experts ? g_swscore : nullptr, moe_swap_score_mode());
+        experts == g_hf_experts ? g_swst : nullptr, experts == g_hf_experts ? g_swscore : nullptr, moe_swap_score_mode(), moe_swap_skipw());
     CUDA_CHECK(cudaGetLastError());
     session.mass_layer = active ? layer : -1;
     session.mass_ids = op->src[1]->data;
