@@ -98,9 +98,11 @@ LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-ser
 
 ### 8 GB cards: we do not recommend this model
 
-The weights alone take 7,416 MiB on the card, and the server needs about 8,400 MiB before any context is added (estimated from the 12 GB figures). An 8 GB card has 8,192 MiB, so the model does not fit on it. Use a smaller model on an 8 GB card.
+The weights alone take 7,416 MiB on the card with the MTP draft layer, and the server needs about 8,400 MiB before any context is added (estimated from the 12 GB figures). An 8 GB card has 8,192 MiB, so the model does not fit on it. Use a smaller model on an 8 GB card.
 
-Experimental only, with no desktop on the card (headless), 2-bit keys and values (about twice the cache error of 3/2), and part of the model in system RAM: with a 300 MiB floor the budget is about 7,890 MiB, so about 490 MiB of weights must move off the card even at zero context. At 32,768 tokens of context the 2/2 cache adds about 290 MiB, so about 780 MiB must move. One layer is about 104 MiB, so about 8 of the 64 layers (`-ngl 56`). All of these figures are arithmetic, not measurements. Expect it to be much slower than a 12 GB card. If it will not start, lower `-ngl` in steps of 4 or lower `-c`.
+Experimental only, with no desktop on the card (headless), 2-bit keys and values (about twice the cache error of 3/2), no MTP draft layer, and part of the model in system RAM. The command leaves out every MTP flag. Without them the server does not load the draft layer, which frees 332 MiB (7,084 MiB of weights remain), and it drafts with the n-gram cache instead: `--spec-type ngram-cache` guesses the next tokens from text it has already seen and saves what it learns to `ngram-cache.bin`. On a different 27B file (IQ3_S) that measured +16% speed over no drafter, against far more for MTP, and has not been measured on this model.
+
+How the context was calculated (arithmetic, not measurement): a 300 MiB floor on an 8,192 MiB card leaves about 7,890 MiB. Without the draft layer the fixed part is about 8,050 MiB or a little less, so about 160 MiB of weights must move off the card even with no context. At 32,768 tokens of context the 2/2 cache adds about 290 MiB, so about 450 MiB must move. One layer is about 104 MiB, so 5 layers; the command moves 6 of the 64 (`-ngl 58`) to leave room for the n-gram snapshot memory, which has not been measured. Expect it to be much slower than a 12 GB card. If it will not start, lower `-ngl` in steps of 2 or lower `-c`.
 
 ```bash
 if [ -d llamAmpere ]; then
@@ -110,14 +112,14 @@ else
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
-LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
+LLAMA_KQ_MASK_PACKED=1 ./build-sm86/bin/llama-server \
   -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
-  -c 32768 --parallel 1 -ngl 56 -fa on -fit off -b 4096 -ub 512 --no-context-shift --jinja \
+  -c 32768 --parallel 1 -ngl 58 -fa on -fit off -b 4096 -ub 512 --no-context-shift --jinja \
   -ctk sjkvarn2 -ctv sjkvarn2 --sjkvarn-body-type auto \
   --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
   --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 --cache-type-s q8_0 \
-  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 --spec-draft-p-min 0 --spec-mb-mtp \
-  --spec-draft-vocab-map auto:65536 --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-window 8192 \
+  --spec-type ngram-cache --spec-ngram-cache-n-max 3 \
+  --lookup-cache-dynamic ngram-cache.bin --lookup-cache-dynamic-save \
   --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
 ```
 
