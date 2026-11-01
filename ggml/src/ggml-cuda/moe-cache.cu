@@ -48,6 +48,7 @@ static void moe_cache_register_stub(const void * owner) {
 #endif
 #include "moe-cpu-split.h"
 #include "moe-hf-copy.cuh"
+#include "unary.cuh"
 
 #include <algorithm>
 #include <array>
@@ -11698,7 +11699,22 @@ static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tenso
         // fork AIPFIX D: AI+ cached experts read the AI activation layout (no q8_1, no bank beside them)
         GGML_ASSERT(!bank && ggml_is_contiguous(a));
         const int64_t rows = a->ne[1] * a->ne[2];
-        char * buf = local.alloc(ggml_cuda_moe_ai_act_bytes(rows, a->ne[0]));
+        const size_t ai_bytes = ggml_cuda_moe_ai_act_bytes(rows, a->ne[0]);
+        // fork AIPFIX D4: up and gate read one AI activation (the shared q8 cache keyed on the input tensor;
+        // ne10_padded = -K marks the AI layout so it never matches a q8_1 entry). Same kernel on the same floats.
+        if (share && moe_q8_share_mode() && a->type == GGML_TYPE_F32 && a->ne[3] == 1 &&
+                ggml_cuda_q8_cacheable(ctx, ai_bytes)) {
+            char * hit = ggml_cuda_q8_cache_lookup(ctx, a, type, ai_bytes, -a->ne[0]);
+            if (hit) {
+                g_st_q8hit.fetch_add(1, std::memory_order_relaxed);
+                return hit;
+            }
+            char * buf = ggml_cuda_q8_cache_claim(ctx, a, type, ai_bytes, -a->ne[0]);
+            g_st_q8claim.fetch_add(1, std::memory_order_relaxed);
+            ggml_cuda_moe_ai_quantize((const float *) a->data, rows, a->ne[0], buf, ctx.stream());
+            return buf;
+        }
+        char * buf = local.alloc(ai_bytes);
         ggml_cuda_moe_ai_quantize((const float *) a->data, rows, a->ne[0], buf, ctx.stream());
         return buf;
     }
@@ -12042,6 +12058,23 @@ bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
     return true;
 }
 
+// fork AIPFIX D4: cached AI+ gate/up run as one paired AI+ GEMV per pass (gate in the upper half of the grid) and one
+// SwiGLU (the GLU op's formula), instead of two GEMVs per pass and the GLU op. GGML_MOE_CACHE_AI_PAIR=0 opts out.
+static bool moe_ai_pair_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_MOE_CACHE_AI_PAIR");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static __global__ void moe_ai_swiglu(const float * gate, const float * up, float * dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = ggml_cuda_op_silu_single(gate[i]) * up[i];
+    }
+}
+
 // fork: one activation quantization and one MMV retain both exact expert projections.
 bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
         ggml_tensor * up, ggml_tensor * gate, ggml_tensor * glu) {
@@ -12057,9 +12090,11 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
             !moe_cache_device_op_fits(*g_session_stack.back().active, gate, ctx.device) ||
             up->src[0]->type != gate->src[0]->type || up->src[1] != gate->src[1] || up->src[2] != gate->src[2] ||
             !ggml_are_same_shape(up, gate) || !ggml_are_same_shape(up, glu) ||
-            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || ggml_ai4_is_unit(up->src[0]->type)) {
+            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+            (ggml_ai4_is_unit(up->src[0]->type) && (!hitg || !moe_ai_pair_enabled()))) {
         return false;
     }
+    const bool ai = ggml_ai4_is_unit(up->src[0]->type);
     auto & session = *g_session_stack.back().active;
 #if !defined(GGML_USE_HIP)
     // fork PREFETCHRW: table prefetch dispatches per projection; use the unfused path while it is active.
@@ -12076,8 +12111,9 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
         const bool ok = up_table.mj_kind == 0 && gate_table.mj_kind == 1 &&
                 up_table.mj_layer >= 0 && up_table.mj_layer == gate_table.mj_layer &&
                 a->type == GGML_TYPE_F32 && ids->ne[2] == 1 &&
+                (ai ? ggml_cuda_moe_ai_table_supported((ggml_type) up_table.desc.type, a->ne[0], glu->ne[0], ids->ne[1]) :
                 ggml_cuda_moe_table_mmv_hitg_supported((ggml_type) up_table.desc.type, a->ne[0], glu->ne[0],
-                    ids->ne[0], ids->ne[1], a->ne[1], ids_stride);
+                    ids->ne[0], ids->ne[1], a->ne[1], ids_stride));
         if (ok) {
             moe_cache_swap_note_stream(session, ctx);
             if (moe_hf_begin(ctx, session, up_table, a, ids)) {
@@ -12096,6 +12132,36 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 ggml_cuda_pool_alloc<char> q8(ctx.pool());
                 char * quantized = moe_quantize_act(ctx, a, (ggml_type) up_table.desc.type, true, q8);
                 g_st_hitg.fetch_add(1, std::memory_order_relaxed);
+                if (ai) {
+                    const ggml_type wtype = (ggml_type) up_table.desc.type;
+                    const int64_t n = ggml_nelements(glu);
+                    ggml_cuda_pool_alloc<float> up_out(ctx.pool(), n);
+                    ggml_cuda_pool_alloc<float> gate_out(ctx.pool(), n);
+                    auto pair = [&](const void * const * ut, const void * const * gt, const uint8_t * uf,
+                            const uint8_t * gf, int val) {
+                        const bool pok = ggml_cuda_moe_ai_table_mmv(ut, wtype, quantized, (const int32_t *) ids->data,
+                                up_out.get(), a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids_stride,
+                                (int) up_table.desc.n_expert, uf, val, ctx.stream(), gt, gate_out.get(), gf);
+                        GGML_ASSERT(pok);
+                    };
+                    pair(up_table.device, gate_table.device, up_table.hot, gate_table.hot, 1);
+                    const void * const * up_eff = moe_hf_wait(ctx, session, up_table);
+                    const void * const * gate_eff = moe_hf_wait(ctx, session, gate_table);
+                    const bool cs = session.cs_layer >= 0 && session.cs_layer == up_table.mj_layer;
+                    const bool tail = moe_tail_active(session, up_table);
+                    const uint8_t * skip_up = cs ? g_cs_mask + (size_t) up_table.mj_kind * g_hf_experts :
+                            tail ? g_tail_mask + (size_t) up_table.mj_kind * g_hf_experts : up_table.hot;
+                    const uint8_t * skip_gate = cs ? g_cs_mask + (size_t) gate_table.mj_kind * g_hf_experts :
+                            tail ? g_tail_mask + (size_t) gate_table.mj_kind * g_hf_experts : gate_table.hot;
+                    pair(up_eff, gate_eff, skip_up, skip_gate, 0);
+                    moe_ai_swiglu<<<(n + 255)/256, 256, 0, ctx.stream()>>>(gate_out.get(), up_out.get(),
+                            (float *) glu->data, n);
+                    CUDA_CHECK(cudaGetLastError());
+                    if (tail) {
+                        moe_tail_zero(ctx, ids, (int) up_table.desc.n_expert, glu);
+                    }
+                    return true;
+                }
                 // hit pass: experts resident for both projections
                 ggml_cuda_moe_table_mmv_hitg(ctx, up_table.device, gate_table.device, (ggml_type) up_table.desc.type,
                         quantized, (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0],

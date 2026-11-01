@@ -1959,8 +1959,9 @@ bool ggml_cuda_moe_ai_table_supported(ggml_type type, int64_t K, int64_t M, int6
 
 bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, const char * act, const int32_t * ids,
         float * dst, int64_t K, int64_t M, int64_t n_used, int64_t n_tok, int64_t ne11, int64_t ids_stride,
-        int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream) {
-    if (!table || !ggml_cuda_moe_ai_table_supported(type, K, M, n_tok)) {
+        int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream,
+        const void * const * table2, float * dst2, const uint8_t * filter2) {
+    if (!table || !ggml_cuda_moe_ai_table_supported(type, K, M, n_tok) || (table2 && !dst2)) {
         return false;
     }
     const int xsh = K % 256 == 0 ? 1 : 0;
@@ -1976,6 +1977,9 @@ bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, cons
     idm.table = table;
     idm.filter = filter;
     idm.filter_val = filter_val;
+    idm.table2 = table2;
+    idm.filter2 = filter2;
+    idm.y2 = dst2;
     const int max_tiles = (int) (n_used*n_tok);
     bool ok = false;
     switch (ai4_lay_of(type)) {

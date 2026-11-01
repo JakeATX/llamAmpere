@@ -71,6 +71,11 @@ struct idmap {
     const void * const * table = nullptr;
     const uint8_t * filter = nullptr;
     int filter_val = 0;
+    // fork AIPFIX D4 (direct ids + table only): a second projection (gate beside up) in the upper half of grid x,
+    // its own slot table, filter and output
+    const void * const * table2 = nullptr;
+    const uint8_t * filter2 = nullptr;
+    float * y2 = nullptr;
 };
 
 using rq4::cp_async16;
@@ -1326,6 +1331,18 @@ template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int 
 static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         const uint8_t * W, const int8_t * Xq, const float * Xs,
         float * Y, int64_t ldy, int M, int N, int K, const idmap idm) {
+    if constexpr (DIRECT) {
+        if (idm.table2) {
+            const int half = (int) gridDim.x/2;
+            const bool second = (int) blockIdx.x >= half;
+            idmap m = idm;
+            m.table = second ? idm.table2 : idm.table;
+            m.filter = second ? idm.filter2 : idm.filter;
+            mmvr_body<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>(
+                    W, Xq, Xs, second ? idm.y2 : Y, ldy, M, N, K, m, nullptr, (int) blockIdx.x - (second ? half : 0));
+            return;
+        }
+    }
     mmvr_body<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>(W, Xq, Xs, Y, ldy, M, N, K, idm);
 }
 
@@ -1341,7 +1358,8 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
         attr_set[dev & 63] = true;
     }
     // Direct routing has one slot and token per block; separate dimensions avoid device-side integer division.
-    const dim3 grid(SPW ? (M/16 + WARPS - 1)/WARPS : M/16, DIRECT ? idm.direct_n_used : ID ? max_experts : 1,
+    const dim3 grid((SPW ? (M/16 + WARPS - 1)/WARPS : M/16)*(DIRECT && idm.table2 ? 2 : 1),
+                    DIRECT ? idm.direct_n_used : ID ? max_experts : 1,
                     DIRECT ? max_experts/idm.direct_n_used : SPLITS);
     static const bool report = getenv("GGML_CUDA_AI23_RESOURCE") && atoi(getenv("GGML_CUDA_AI23_RESOURCE"));
     static bool reported[64] = {};

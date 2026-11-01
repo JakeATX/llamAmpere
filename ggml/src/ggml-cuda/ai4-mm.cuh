@@ -24,11 +24,13 @@ void ggml_cuda_moe_ai_quantize(const float * x, int64_t rows, int64_t K, char * 
 // Routed GEMV over expert pointers table[e] (one direct block per route and token, the stock AI+ MUL_MAT_ID direct
 // kernel and order). ids [n_used, n_tok] with row stride ids_stride; act from ggml_cuda_moe_ai_quantize of the
 // [K, ne11, n_tok] input; dst [M, n_used, n_tok]. With a filter only routes whose expert has filter[e] == filter_val
-// are written. False (nothing launched) when the type or shape has no direct kernel.
+// are written. False (nothing launched) when the type or shape has no direct kernel. With table2 the same launch
+// also computes a second projection of the same type and shape (gate beside up) into dst2, filtered by filter2.
 bool ggml_cuda_moe_ai_table_supported(ggml_type type, int64_t K, int64_t M, int64_t n_tok);
 bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, const char * act, const int32_t * ids,
         float * dst, int64_t K, int64_t M, int64_t n_used, int64_t n_tok, int64_t ne11, int64_t ids_stride,
-        int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream);
+        int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream,
+        const void * const * table2 = nullptr, float * dst2 = nullptr, const uint8_t * filter2 = nullptr);
 
 bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor * base);
 const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined);
