@@ -926,6 +926,11 @@ static void ai4_reconstruct_any(const void * src, float * W, int64_t K, int64_t 
     GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t)));
 }
 
+// fork AIPFIX ONEPATH check: the f32 image [M][K] of an AI+ unit matrix in the original basis (reference only)
+void ggml_cuda_moe_ai_reconstruct(const void * src, ggml_type type, float * W, int64_t K, int64_t M, cudaStream_t stream) {
+    ai4_reconstruct_any(src, W, K, M, stream, type);
+}
+
 static bool ai4_fast_ok(const ggml_backend_cuda_context & ctx) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     return !ai4_ref() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;

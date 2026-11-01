@@ -18,6 +18,8 @@ bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t);
 
 // fork AIPFIX D: AI+ unit experts held in the expert cache. Activations [K, rows] f32 (contiguous) to the AI layout
 // (int8 q then fp32 group scales at ggml_cuda_moe_ai_act_scales); act_bytes is the buffer size it needs.
+// fork AIPFIX ONEPATH check: f32 image [M][K] of an AI+ unit matrix (original basis), reference only
+void ggml_cuda_moe_ai_reconstruct(const void * src, ggml_type type, float * W, int64_t K, int64_t M, cudaStream_t stream);
 size_t ggml_cuda_moe_ai_act_bytes(int64_t rows, int64_t K);
 size_t ggml_cuda_moe_ai_act_scales(int64_t rows, int64_t K);
 void ggml_cuda_moe_ai_quantize(const float * x, int64_t rows, int64_t K, char * out, cudaStream_t stream);

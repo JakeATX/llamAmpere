@@ -756,6 +756,8 @@ struct moe_cache_device_table {
     const void ** ai_bank = nullptr;
     uint8_t * ai_bank_flag = nullptr;
     int ai_bank_type = -1;
+    std::vector<const void *> ai_bank_rows; // host copies of ai_bank / ai_bank_flag (LLAMA_MOE_BANK_ONEPATH_CHECK)
+    std::vector<uint8_t> ai_bank_host;
     struct moe_cache_pool * swap_pool = nullptr;
     size_t count_offset = 0;
     // fork (missjoin): layer and projection (0 up, 1 gate, 2 down) parsed from the tensor name.
@@ -11792,6 +11794,77 @@ static void moe_onepath_log(int type, const char * what) {
     }
 }
 
+// fork AIPFIX ONEPATH check (LLAMA_MOE_BANK_ONEPATH_CHECK=1; synchronizes, so run it with GGML_CUDA_DISABLE_GRAPHS=1):
+// the bank experts' routes of out against an f32 reference, the reconstructed bank rows times the unquantized input
+// (with gate: out = silu(gate x) * (table x)). Prints the worst relative route error per call, first 300 calls.
+static int moe_onepath_check_mode() {
+    static const int v = [] { const char * e = getenv("LLAMA_MOE_BANK_ONEPATH_CHECK"); return e ? atoi(e) : 0; }();
+    return v;
+}
+
+static void moe_onepath_check(ggml_backend_cuda_context & ctx, const moe_cache_device_table & table,
+        const moe_cache_device_table * gate, const ggml_tensor * a, const ggml_tensor * ids, const float * out,
+        int64_t M, const char * where) {
+    static std::atomic<int> calls{0};
+    if (moe_onepath_check_mode() == 0 || table.ai_bank_rows.empty() || calls.fetch_add(1) >= 300) {
+        return;
+    }
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    cudaStream_t stream = ctx.stream();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int64_t K = a->ne[0], n_used = ids->ne[0], n_tok = ids->ne[1], ne11 = a->ne[1];
+    const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
+    std::vector<int32_t> hid((size_t) (ids_stride*(n_tok - 1) + n_used));
+    CUDA_CHECK(cudaMemcpy(hid.data(), ids->data, hid.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    std::vector<float> hx((size_t) (K*ne11*n_tok));
+    CUDA_CHECK(cudaMemcpy(hx.data(), a->data, hx.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    std::vector<float> hy((size_t) (M*n_used*n_tok));
+    CUDA_CHECK(cudaMemcpy(hy.data(), out, hy.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    ggml_cuda_pool_alloc<float> w(ctx.pool(), (size_t) (M*K));
+    std::vector<float> hw((size_t) (M*K));
+    std::vector<double> ref((size_t) M), g((size_t) M);
+    auto gemv = [&](const void * rows, ggml_type type, const float * x, std::vector<double> & y) {
+        ggml_cuda_moe_ai_reconstruct(rows, type, w.get(), K, M, stream);
+        CUDA_CHECK(cudaMemcpyAsync(hw.data(), w.get(), hw.size()*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int64_t m = 0; m < M; ++m) {
+            double acc = 0.0;
+            for (int64_t k = 0; k < K; ++k) {
+                acc += (double) hw[(size_t) (m*K + k)] * x[k];
+            }
+            y[(size_t) m] = acc;
+        }
+    };
+    double worst = 0.0;
+    int routes = 0;
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t u = 0; u < n_used; ++u) {
+            const int32_t e = hid[(size_t) (t*ids_stride + u)];
+            if (e < 0 || e >= (int32_t) table.ai_bank_host.size() || !table.ai_bank_host[e]) {
+                continue;
+            }
+            const float * x = hx.data() + (t*ne11 + (ne11 == 1 ? 0 : u))*K;
+            gemv(table.ai_bank_rows[e], (ggml_type) table.ai_bank_type, x, ref);
+            if (gate) {
+                gemv(gate->ai_bank_rows[e], (ggml_type) gate->ai_bank_type, x, g);
+                for (int64_t m = 0; m < M; ++m) {
+                    ref[(size_t) m] *= g[(size_t) m] / (1.0 + exp(-g[(size_t) m]));
+                }
+            }
+            const float * y = hy.data() + (t*n_used + u)*M;
+            double d2 = 0.0, r2 = 0.0;
+            for (int64_t m = 0; m < M; ++m) {
+                d2 += (y[m] - ref[(size_t) m])*(y[m] - ref[(size_t) m]);
+                r2 += ref[(size_t) m]*ref[(size_t) m];
+            }
+            worst = std::max(worst, sqrt(d2/std::max(r2, 1e-30)));
+            ++routes;
+        }
+    }
+    fprintf(stderr, "[onepath-check] %s layer=%d kind=%d tokens=%lld routes=%d worst_rel=%.4g\n", where, table.mj_layer,
+            table.mj_kind, (long long) n_tok, routes, worst);
+}
+
 static void moe_onepath_bank(ggml_backend_cuda_context & ctx, const moe_cache_device_table & table,
         const ggml_tensor * a, const ggml_tensor * ids, float * out, int64_t M, bool share) {
     if (!table.ai_bank) {
@@ -11807,6 +11880,7 @@ static void moe_onepath_bank(ggml_backend_cuda_context & ctx, const moe_cache_de
             a->ne[0], M, ids->ne[0], ids->ne[1], a->ne[1], ids->nb[1] / sizeof(int32_t), (int) table.desc.n_expert,
             table.ai_bank_flag, 1, ctx.stream());
     GGML_ASSERT(ok);
+    moe_onepath_check(ctx, table, nullptr, a, ids, out, M, "bank-pass");
 }
 
 static __global__ void moe_onepath_swiglu(const float * gate, const float * up, float * dst, const int32_t * ids,
@@ -11845,6 +11919,7 @@ static void moe_onepath_bank_pair(ggml_backend_cuda_context & ctx, const moe_cac
     if (ut == gt && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(), gate_table.ai_bank_flag,
             (float *) glu->data)) {
         moe_onepath_log((int) ut, "paired gate/up+SwiGLU");
+        moe_onepath_check(ctx, up_table, &gate_table, a, ids, (const float *) glu->data, M, "pair-pass");
         return;
     }
     moe_onepath_log((int) ut, "gate/up (two launches)");
@@ -11853,6 +11928,7 @@ static void moe_onepath_bank_pair(ggml_backend_cuda_context & ctx, const moe_cac
     moe_onepath_swiglu<<<(n + 255)/256, 256, 0, ctx.stream()>>>(gate_out.get(), up_out.get(), (float *) glu->data,
             (const int32_t *) ids->data, up_table.ai_bank_flag, (int) M, (int) ids->ne[0], ids_stride, n);
     CUDA_CHECK(cudaGetLastError());
+    moe_onepath_check(ctx, up_table, &gate_table, a, ids, (const float *) glu->data, M, "pair-pass");
 }
 
 static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op, const ggml_tensor * bank,
@@ -12024,6 +12100,9 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
         }
         if (red && bank && cs && table.mj_kind == 2) {
             ggml_cuda_op_moe_mixed_reduction(ctx, op, red->weights, red->bank_ids, red->dst);
+        }
+        if (!bank) {
+            moe_onepath_check(ctx, table, nullptr, a, ids, (const float *) op->data, op->ne[0], "final");
         }
         return true;
     }
@@ -12308,6 +12387,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 if (tail) {
                     moe_tail_zero(ctx, ids, (int) up_table.desc.n_expert, glu);
                 }
+                moe_onepath_check(ctx, up_table, &gate_table, a, ids, (const float *) glu->data, glu->ne[0], "final");
                 return true;
             }
         }
@@ -12993,6 +13073,8 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     return fail();
                 }
                 table.ai_bank_type = rows_type;
+                table.ai_bank_rows = std::move(ai);
+                table.ai_bank_host = std::move(flag);
             }
 
         }
