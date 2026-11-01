@@ -58,24 +58,22 @@ static inline void row_levels_scalar(const uint8_t * ext, int k, uint32_t C, int
 }
 
 #if defined(__AVX2__) && defined(__FMA__)
+// 8 levels in one 32-bit lane each: even levels from one 64-bit shift, odd ones from another moved up 32 bits,
+// state * C in 32-bit lanes, byte sum by two pairwise adds, ((sum + 2) >> 2) - 128 as (sum - 510) >> 2 (512 = 4 * 128).
+// Same integer levels as aik_level_c, so the dot products are unchanged.
 static inline __m256 row_levels_avx2(const uint8_t * ext, int k, uint32_t C, int r) {
     const int b = k*8*r + k - 16 + 32;
     const int off = b & 7;
     const __m256i w = _mm256_set1_epi64x((long long) load_be64(ext + (b >> 3)));
     const int s0 = 48 - off;
-    const __m256i sh_lo = _mm256_setr_epi64x(s0, s0 - k, s0 - 2*k, s0 - 3*k);
-    const __m256i sh_hi = _mm256_setr_epi64x(s0 - 4*k, s0 - 5*k, s0 - 6*k, s0 - 7*k);
-    const __m256i m16 = _mm256_set1_epi64x(0xFFFF), m32 = _mm256_set1_epi64x(0xFFFFFFFFll), c = _mm256_set1_epi64x(C);
-    const __m256i z = _mm256_setzero_si256();
-    __m256i lo = _mm256_and_si256(_mm256_srlv_epi64(w, sh_lo), m16);
-    __m256i hi = _mm256_and_si256(_mm256_srlv_epi64(w, sh_hi), m16);
-    lo = _mm256_sad_epu8(_mm256_and_si256(_mm256_mul_epu32(lo, c), m32), z);   // byte sum of the low 32 product bits
-    hi = _mm256_sad_epu8(_mm256_and_si256(_mm256_mul_epu32(hi, c), m32), z);
-    const __m256i idx = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
-    lo = _mm256_permutevar8x32_epi32(lo, idx);
-    hi = _mm256_permutevar8x32_epi32(hi, idx);
-    __m256i v = _mm256_permute2x128_si256(lo, hi, 0x20);
-    v = _mm256_sub_epi32(_mm256_srai_epi32(_mm256_add_epi32(v, _mm256_set1_epi32(2)), 2), _mm256_set1_epi32(128));
+    const __m256i sh_ev = _mm256_setr_epi64x(s0, s0 - 2*k, s0 - 4*k, s0 - 6*k);
+    const __m256i sh_od = _mm256_setr_epi64x(s0 - k, s0 - 3*k, s0 - 5*k, s0 - 7*k);
+    const __m256i ev = _mm256_srlv_epi64(w, sh_ev);
+    const __m256i od = _mm256_slli_epi64(_mm256_srlv_epi64(w, sh_od), 32);
+    __m256i v = _mm256_and_si256(_mm256_blend_epi32(ev, od, 0xAA), _mm256_set1_epi32(0xFFFF));
+    v = _mm256_mullo_epi32(v, _mm256_set1_epi32((int) C));
+    v = _mm256_madd_epi16(_mm256_maddubs_epi16(v, _mm256_set1_epi8(1)), _mm256_set1_epi16(1));
+    v = _mm256_srai_epi32(_mm256_sub_epi32(v, _mm256_set1_epi32(510)), 2);
     return _mm256_cvtepi32_ps(v);
 }
 

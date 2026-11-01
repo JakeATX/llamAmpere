@@ -47,6 +47,32 @@ int main(int argc, char ** argv) {
                     for (int r = 0; r < AI4_TR; ++r) { dh[r] = f32_to_f16_bits(0.001f + 0.01f * (uni(rng) + 1.0f)); }
                 }
             }
+#if defined(__AVX2__) && defined(__FMA__)
+            // the AVX2 level decode must give exactly the scalar levels (aik_level_c) for every tile row
+            {
+                int bad = 0;
+                uint8_t ext[12 + 16*5 + 4];
+                const int tw = AIK_TILE_WORDS(k);
+                for (int64_t sl = 0; sl < M / AI4_TR; ++sl) {
+                    for (int64_t u = 0; u < K / AI4U_UK; ++u) {
+                        const uint32_t * wd = (const uint32_t *) (w.data() + sl * AI4_TR * row_bytes + u * ub + AI4U_SCALE_BYTES);
+                        for (int ct = 0; ct < AI4U_UK / AI4_TC; ++ct) {
+                            moe_ai::tile_bytes(wd + ct * tw, k, ext);
+                            for (int r = 0; r < AI4_TR; ++r) {
+                                int lev[8];
+                                float got[8];
+                                moe_ai::row_levels_scalar(ext, k, C, r, lev);
+                                _mm256_storeu_ps(got, moe_ai::row_levels_avx2(ext, k, C, r));
+                                for (int kk = 0; kk < 8; ++kk) { bad += got[kk] != (float) lev[kk]; }
+                            }
+                        }
+                    }
+                }
+                printf("%-8s K=%5lld M=%5lld  AVX2 levels vs scalar: %d mismatches  %s\n",
+                       ggml_type_name(type), (long long) K, (long long) M, bad, bad ? "FAIL" : "OK");
+                fails += bad != 0;
+            }
+#endif
             // reference weights (original basis)
             std::vector<float> wf((size_t) M * K);
             for (int64_t sl = 0; sl < M / AI4_TR; ++sl) {
