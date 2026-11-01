@@ -11797,6 +11797,9 @@ static void moe_onepath_log(int type, const char * what) {
 // fork AIPFIX ONEPATH check (LLAMA_MOE_BANK_ONEPATH_CHECK=1; synchronizes, so run it with GGML_CUDA_DISABLE_GRAPHS=1):
 // the bank experts' routes of out against an f32 reference, the reconstructed bank rows times the unquantized input
 // (with gate: out = silu(gate x) * (table x)). Prints the worst relative route error per call, first 300 calls.
+// =2: every route of every call, the other experts against their host rows (f32 dequant); prints only routes over 5%
+// and a summary every 2000 calls. Gate/up routes of the CPU-split experts are skipped (the host computes them; the
+// card writes only their down rows, after the join).
 static int moe_onepath_check_mode() {
     static const int v = [] { const char * e = getenv("LLAMA_MOE_BANK_ONEPATH_CHECK"); return e ? atoi(e) : 0; }();
     return v;
@@ -11806,9 +11809,15 @@ static void moe_onepath_check(ggml_backend_cuda_context & ctx, const moe_cache_d
         const moe_cache_device_table * gate, const ggml_tensor * a, const ggml_tensor * ids, const float * out,
         int64_t M, const char * where) {
     static std::atomic<int> calls{0};
-    if (moe_onepath_check_mode() == 0 || table.ai_bank_rows.empty() || calls.fetch_add(1) >= 300) {
+    const int mode = moe_onepath_check_mode();
+    if (mode == 0 || (mode == 1 && (table.ai_bank_rows.empty() || calls.fetch_add(1) >= 300))) {
         return;
     }
+    // mode 2 checks the finished outputs only (the bank and pair passes leave the other routes to the miss pass)
+    if (mode == 2 && strcmp(where, "final") != 0) {
+        return;
+    }
+    const int call = mode == 2 ? calls.fetch_add(1) : 0;
     GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
     cudaStream_t stream = ctx.stream();
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -11835,17 +11844,60 @@ static void moe_onepath_check(ggml_backend_cuda_context & ctx, const moe_cache_d
             y[(size_t) m] = acc;
         }
     };
+    // the host rows of an expert outside the bank (its regular copy), dequantized to f32
+    std::vector<float> hrow((size_t) K);
+    auto host_gemv = [&](const moe_cache_device_table & tb, int32_t e, const float * x, std::vector<double> & y) {
+        const ggml_type type = (ggml_type) tb.desc.type;
+        const size_t row_bytes = ggml_row_size(type, K);
+        const char * base = (const char *) tb.desc.data + (size_t) e*tb.host_stride;
+        const auto * traits = ggml_get_type_traits(type);
+        GGML_ASSERT(traits->to_float && "onepath check 2: no host dequant for this type");
+        for (int64_t m = 0; m < M; ++m) {
+            traits->to_float(base + (size_t) m*row_bytes, hrow.data(), K);
+            double acc = 0.0;
+            for (int64_t k = 0; k < K; ++k) {
+                acc += (double) hrow[(size_t) k] * x[k];
+            }
+            y[(size_t) m] = acc;
+        }
+    };
+    // CPU-split experts of this layer (the plan of the layer's first projection)
+    std::vector<int32_t> cpu_exp;
+    if (mode == 2 && g_cs_on && g_cs_plan) {
+        moe_cs_plan_dev plan;
+        CUDA_CHECK(cudaMemcpy(&plan, g_cs_plan, sizeof(plan), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < std::min(plan.n_exp, (int) MOE_CS_MAX_EXPERTS); ++i) {
+            cpu_exp.push_back(plan.expert[i]);
+        }
+    }
+    static std::atomic<long long> s_routes{0}, s_bad{0};
+    static double s_worst_bank = 0.0, s_worst_other = 0.0;
     double worst = 0.0;
     int routes = 0;
     for (int64_t t = 0; t < n_tok; ++t) {
         for (int64_t u = 0; u < n_used; ++u) {
             const int32_t e = hid[(size_t) (t*ids_stride + u)];
-            if (e < 0 || e >= (int32_t) table.ai_bank_host.size() || !table.ai_bank_host[e]) {
+            const bool banked = e >= 0 && e < (int32_t) table.ai_bank_host.size() && table.ai_bank_host[e];
+            if (e < 0 || e >= (int32_t) table.desc.n_expert || (!banked && mode != 2)) {
+                continue;
+            }
+            const bool cpu = std::find(cpu_exp.begin(), cpu_exp.end(), e) != cpu_exp.end();
+            const bool released = (size_t) e < table.bank.size() && table.bank[e] != 0; // bank-path control: host rows gone
+            if (!banked && ((cpu && table.mj_kind != 2) || released)) {
                 continue;
             }
             const float * x = hx.data() + (t*ne11 + (ne11 == 1 ? 0 : u))*K;
-            gemv(table.ai_bank_rows[e], (ggml_type) table.ai_bank_type, x, ref);
-            if (gate) {
+            if (banked) {
+                gemv(table.ai_bank_rows[e], (ggml_type) table.ai_bank_type, x, ref);
+            } else {
+                host_gemv(table, e, x, ref);
+            }
+            if (gate && !banked) {
+                host_gemv(*gate, e, x, g);
+                for (int64_t m = 0; m < M; ++m) {
+                    ref[(size_t) m] *= g[(size_t) m] / (1.0 + exp(-g[(size_t) m]));
+                }
+            } else if (gate) {
                 gemv(gate->ai_bank_rows[e], (ggml_type) gate->ai_bank_type, x, g);
                 for (int64_t m = 0; m < M; ++m) {
                     ref[(size_t) m] *= g[(size_t) m] / (1.0 + exp(-g[(size_t) m]));
@@ -11857,9 +11909,28 @@ static void moe_onepath_check(ggml_backend_cuda_context & ctx, const moe_cache_d
                 d2 += (y[m] - ref[(size_t) m])*(y[m] - ref[(size_t) m]);
                 r2 += ref[(size_t) m]*ref[(size_t) m];
             }
-            worst = std::max(worst, sqrt(d2/std::max(r2, 1e-30)));
+            const double rel = sqrt(d2/std::max(r2, 1e-30));
+            worst = std::max(worst, rel);
             ++routes;
+            if (mode == 2) {
+                double & w2 = banked ? s_worst_bank : s_worst_other;
+                w2 = std::max(w2, rel);
+                ++s_routes;
+                if (!(rel <= 0.05)) {
+                    ++s_bad;
+                    fprintf(stderr, "[onepath-check2] BAD call=%d %s layer=%d kind=%d gate=%d tok=%lld slot=%lld expert=%d "
+                            "bank=%d cpu=%d rel=%.4g |ref|=%.4g\n", call, where, table.mj_layer, table.mj_kind, gate ? 1 : 0,
+                            (long long) t, (long long) u, e, banked ? 1 : 0, cpu ? 1 : 0, rel, sqrt(r2));
+                }
+            }
         }
+    }
+    if (mode == 2) {
+        if (call % 2000 == 0) {
+            fprintf(stderr, "[onepath-check2] calls=%d routes=%lld bad=%lld worst_bank=%.4g worst_other=%.4g\n", call + 1,
+                    s_routes.load(), s_bad.load(), s_worst_bank, s_worst_other);
+        }
+        return;
     }
     fprintf(stderr, "[onepath-check] %s layer=%d kind=%d tokens=%lld routes=%d worst_rel=%.4g\n", where, table.mj_layer,
             table.mj_kind, (long long) n_tok, routes, worst);
