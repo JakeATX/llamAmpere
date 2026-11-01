@@ -46,7 +46,7 @@ For the Swift 1.5 27B dense model (the 2.3 bpw file above) at 200K context on a 
 | `--spec-draft-p-min 0` | Always drafts the full depth instead of stopping early when the draft layer is unsure. |
 | `--spec-mb-mtp` | Turns on mb-MTP, which also keeps a draft token the full model would have rejected when that token is at least as likely as the replacement; this is faster but changes sampling slightly, so use `--no-spec-mb-mtp` instead for exact sampling (mb-MTP is already on by default with MTP). |
 
-## Smaller cards: 12 GB, 10 GB and 8 GB (Linux, one paste each)
+## Smaller cards: 12 GB and 10 GB (8 GB is not recommended) (Linux, one paste each)
 
 **Not yet run on this model.** These adapt the 12 GB command we measured in October on an earlier 2.3 bpw file, adding the v0.6.2 settings (depth up to 4, mb-MTP, the packed attention mask, this model). Every memory figure is arithmetic from those older measurements, not a new measurement. Same requirements as the 24 GB quick start. On the card the model's weights, including the draft layer, take 7,416 MiB; the 1,288 MiB token embedding stays in system RAM.
 
@@ -96,9 +96,11 @@ LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-ser
   --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
 ```
 
-### 8 GB cards (RTX 3060 Ti, 3070, 3070 Ti): 32,768 tokens, part of the model in system RAM (least certain)
+### 8 GB cards: we do not recommend this model
 
-The weights alone are 7,416 MiB, so the model cannot fit fully on an 8 GB card. `-fit on -fitt 800` lets the server move some layers to system RAM and keeps 800 MiB free for the desktop. Expect much slower writing than on a 12 GB card. If it will not start, replace `-fit on -fitt 800` with `-fit off -ngl 48`, and lower 48 in steps of 4 if it still runs out of memory.
+The weights alone take 7,416 MiB on the card, and the server needs about 8,400 MiB before any context is added (estimated from the 12 GB figures). An 8 GB card has 8,192 MiB, so the model does not fit on it. Use a smaller model on an 8 GB card.
+
+Experimental only, with no desktop on the card (headless), 2-bit keys and values (about twice the cache error of 3/2), and part of the model in system RAM: with a 300 MiB floor the budget is about 7,890 MiB, so about 490 MiB of weights must move off the card even at zero context. At 32,768 tokens of context the 2/2 cache adds about 290 MiB, so about 780 MiB must move. One layer is about 104 MiB, so about 8 of the 64 layers (`-ngl 56`). All of these figures are arithmetic, not measurements. Expect it to be much slower than a 12 GB card. If it will not start, lower `-ngl` in steps of 4 or lower `-c`.
 
 ```bash
 if [ -d llamAmpere ]; then
@@ -110,8 +112,8 @@ cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_
 cmake --build build-sm86 -j8 --target llama-server && \
 LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
   -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
-  -c 32768 --parallel 1 -fa on -fit on -fitt 800 -b 4096 -ub 512 --no-context-shift --jinja \
-  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
+  -c 32768 --parallel 1 -ngl 56 -fa on -fit off -b 4096 -ub 512 --no-context-shift --jinja \
+  -ctk sjkvarn2 -ctv sjkvarn2 --sjkvarn-body-type auto \
   --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
   --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 --cache-type-s q8_0 \
   --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 --spec-draft-p-min 0 --spec-mb-mtp \
