@@ -1642,6 +1642,7 @@ struct moe_mixed_second {
     int64_t red_bank_stride;
     float * red_dst;
     bool red_tree;
+    bool pair_warp;         // hot SPW routes: warp pairs compute gate and up of one slab (see moe_mixed_mmv)
 };
 
 // Epilogue tiles are 16-row slices of one route's output, so launches that tile the rows differently (the SPW
@@ -1829,6 +1830,8 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
         const uint8_t * skip, const uint8_t * resident, char * route_ids, size_t route_ids_stride,
         float * route_mask, int phase, int p2_n_tok, const moe_mixed_second second) {
     int bx = blockIdx.x;
+    const uint8_t * const W0 = W;
+    float * const Y0 = Y;
     if (second.W && bx >= (int) gridDim.x/2) {
         bx -= gridDim.x/2;
         W = second.W; Y = second.Y; base = second.base; table = second.table;
@@ -1892,6 +1895,27 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
                 __shared__ ai4k::mmvr_group group;
                 moe_mixed_group(idm, h, group);
                 if (group.n == 0) {
+                    return;
+                }
+                if (second.pair_warp) {
+                    // Paired warps (as the fused 3XS hit kernel): block x owns WARPS/2 slabs of both projections,
+                    // even warps the first, odd warps the second, so SwiGLU needs no cross-block count. The grid
+                    // is the same size (2*ceil(slabs/WARPS) >= ceil(slabs/(WARPS/2))); each row keeps its
+                    // one-warp k order and the epilogue expression, so the stores are unchanged.
+                    const int warp = threadIdx.x >> 5;
+                    const int slab = (int) blockIdx.x*(WARPS/2) + (warp >> 1);
+                    float * Yw = warp & 1 ? second.Y : Y0;
+                    ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(
+                            warp & 1 ? second.W : W0, q, s, Yw, M, M, 1, K, idm, &group, (int) blockIdx.x, slab);
+                    if (second.glu) {
+                        __syncthreads();
+                        const int first = (int) blockIdx.x*(WARPS/2);
+                        const int rows = 16*max(0, min(WARPS/2, M/16 - first));
+                        for (int i = threadIdx.x; i < group.n*rows; i += blockDim.x) {
+                            const int64_t o = (int64_t) group.cols[i / rows]*M + first*16 + i % rows;
+                            second.glu[o] = ggml_cuda_op_silu_single(second.glu_gate[o]) * second.glu_up[o];
+                        }
+                    }
                     return;
                 }
                 ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(W, q, s, Y, M, M, 1, K, idm, &group, bx);
@@ -2226,7 +2250,12 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     static const bool p2_compact_env = ai4_env_int("GGML_MOE_BANK_MIXED_P2_COMPACT", nullptr, 1) != 0;
     const bool p2_compact = p2_compact_env && fine && ggml_nelements(ids) <= 64;
     const int p2_n_tok = p2_compact ? (int) ids->ne[1] : 0;
-    const dim3 grid((spw ? (M/16 + 3)/4 : M/16)*(pair ? 2 : 1), p2_compact ? 4 : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
+    // Slabs per hit-first block: 4 warps x 16 rows is 20 blocks per route for a 640-row projection (the fused 3XS
+    // hit kernel runs 80); 2 warps doubles the block count at the same warps per SM and keeps each row's k order.
+    // GGML_CUDA_AI23_MIXED_SPW_WARPS=2|4 (default 4).
+    static const int spw_warps = ai4_env_int("GGML_CUDA_AI23_MIXED_SPW_WARPS", nullptr, 4) == 2 ? 2 : 4;
+    const int slabs_per_block = spw ? spw_warps : 1;
+    const dim3 grid((M/16 + slabs_per_block - 1)/slabs_per_block*(pair ? 2 : 1), p2_compact ? 4 : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
     moe_mixed_second second{};
     if (pair) {
         second = { (const uint8_t *) pair->bank->src[0]->data, (float *) pair->dst->data,
@@ -2239,6 +2268,10 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             second.glu = (float *) pair->glu->data;
         }
     }
+    // Hot gate+up of a paired SPW launch in one block (warp pairs, block-local SwiGLU); cold routes keep the
+    // two-half grid. Default on; GGML_CUDA_AI23_MIXED_PAIR_WARP=0 opts out.
+    static const bool pair_warp = ai4_env_int("GGML_CUDA_AI23_MIXED_PAIR_WARP", nullptr, 1) != 0;
+    second.pair_warp = pair && spw && pair_warp;
     GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red)));
     if (red) {
         second.red_w = (const float *) red->weights->data;
@@ -2270,7 +2303,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     if (single) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, true, false, 2); } \
     else        { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, false, false, 2); }
 #define MOE_MIXED_WARPS(T, L, XSH, KT) \
-    if (spw && spw_stages == 8)      { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 8); } \
+    if (spw && spw_warps == 2)       { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 2, false, true, 4); } \
+    else if (spw && spw_stages == 8) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 8); } \
     else if (spw && spw_stages == 4) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 4); } \
     else if (spw)       { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 2); } \
     else if (two_warps) { MOE_MIXED_SINGLE(T, L, XSH, KT, 2); } \
@@ -2321,8 +2355,8 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 #undef MOE_MIXED_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     if (trace) {
-        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d pair=%d glu=%d reduce=%d\n",
-                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase, pair != nullptr, pair && pair->glu, red != nullptr);
+        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d pair=%d glu=%d reduce=%d pw=%d\n",
+                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase, pair != nullptr, pair && pair->glu, red != nullptr, (int) second.pair_warp);
     }
 }
 #undef MOE_MIXED_TYPES
