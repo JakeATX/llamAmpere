@@ -158,7 +158,7 @@ static unsigned long long * g_tail_counts = nullptr;
 #define MOE_SWST_LAYERS 48
 #define MOE_SWST_COLS 14
 static unsigned long long * g_swst = nullptr;
-// fork SWAPPOL: swap score source (GGML_MOE_SWAP_SCORE=count|kept|weight|weightkept, GGML_MOE_SWAP_SKIPW). Non-count modes accumulate per
+// fork SWAPPOL: swap score source (GGML_MOE_SWAP_SCORE=count|kept|weight|weightkept, GGML_MOE_SWAP_DROPW). Non-count modes accumulate per
 // (layer, expert) in units of 1/1024 route: kept drops the routes the skip budget left out, weight counts a route as
 // 10x its router weight.
 static unsigned long long * g_swscore = nullptr;
@@ -172,19 +172,19 @@ static int moe_swap_score_mode() {
         if (strcmp(v, "weightkept") == 0) { return 3; }
         GGML_ABORT("GGML_MOE_SWAP_SCORE must be count, kept, weight or weightkept");
     }();
-    // GGML_MOE_SWAP_SKIPW alone (count scores) still needs the score buffer: mode 4.
-    static const bool skipw_set = getenv("GGML_MOE_SWAP_SKIPW") && *getenv("GGML_MOE_SWAP_SKIPW");
+    // GGML_MOE_SWAP_DROPW alone (count scores) still needs the score buffer: mode 4.
+    static const bool skipw_set = getenv("GGML_MOE_SWAP_DROPW") && *getenv("GGML_MOE_SWAP_DROPW");
     return mode ? mode : (skipw_set ? 4 : 0);
 }
-// fork SWAPPOL: GGML_MOE_SWAP_SKIPW=<0..1> scales the score of routes the skip budget left out (not resident, rank
+// fork SWAPPOL: GGML_MOE_SWAP_DROPW=<0..1> scales the score of routes the skip budget left out (not resident, rank
 // past the floor): 1 counts them fully, 0 ignores them (same as kept). Returned in 1/1024 units.
 static unsigned moe_swap_skipw() {
     static const unsigned w = [] {
         if (moe_swap_score_mode() & 1) { return 0u; }
-        const char * v = getenv("GGML_MOE_SWAP_SKIPW");
+        const char * v = getenv("GGML_MOE_SWAP_DROPW");
         if (!v || !*v) { return 1024u; }
         const float f = strtof(v, nullptr);
-        if (!(f >= 0.0f && f <= 1.0f)) { GGML_ABORT("GGML_MOE_SWAP_SKIPW must be in [0, 1]"); }
+        if (!(f >= 0.0f && f <= 1.0f)) { GGML_ABORT("GGML_MOE_SWAP_DROPW must be in [0, 1]"); }
         return (unsigned) (f * 1024.0f + 0.5f);
     }();
     return w;
