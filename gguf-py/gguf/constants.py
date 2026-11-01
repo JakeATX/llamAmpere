@@ -6056,6 +6056,7 @@ class GGMLQuantizationType(IntEnum):
     AIT3_U  = 116
     AIT4_U  = 117
     AIT2P_U = 121
+    AIF25_U = 118
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6305,6 +6306,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.AIT3_U: (128, 50),
     GGMLQuantizationType.AIT4_U: (128, 66),
     GGMLQuantizationType.AIT2P_U: (128, 34),
+    GGMLQuantizationType.AIF25_U: (128, 42),
 }
 
 

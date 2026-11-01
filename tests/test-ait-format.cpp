@@ -127,6 +127,15 @@ int main() {
         require(llama_ait_format_error(meta) == nullptr, "non-AIT model unaffected");
         gguf_free(meta);
     }
+    auto * fractional = fixture(GGML_TYPE_AIF25_U);
+    require(ggml_row_size(GGML_TYPE_AIF25_U,128) == 42, "fractional exact 2.625-bpw bytes");
+    require(ggml_ai4_rate(GGML_TYPE_AIF25_U) == 0, "fractional never enters integer-rate dispatch");
+    require(llama_ait_format_error(fractional) != nullptr, "unversioned fractional bytes rejected");
+    gguf_set_val_str(fractional, "ait.fractional.contract", "wrong");
+    require(llama_ait_format_error(fractional) != nullptr, "wrong fractional contract rejected");
+    gguf_set_val_str(fractional, "ait.fractional.contract", AIF25_CONTRACT);
+    require(llama_ait_format_error(fractional) == nullptr, "fractional own-constant contract accepted");
+    gguf_free(fractional);
     std::printf("PASS %d checks\n", checks);
     return 0;
 }

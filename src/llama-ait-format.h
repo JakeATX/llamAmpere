@@ -1,6 +1,7 @@
 #pragma once
 #include "gguf.h"
 #include "../ggml/src/ggml-ait.h"
+#include "../ggml/src/ggml-aif25.h"
 #include <cstring>
 
 // Inspect the stored metadata directly: command-line overrides cannot relabel old bytes.
@@ -10,6 +11,13 @@ static inline const char * llama_ait_format_error(const gguf_context * meta) {
     bool pair_u = false;   // 121 = AIT2P_U: unit bytes, AIT2P pair table
     for (int64_t i = 0; i < gguf_get_n_tensors(meta); ++i) {
         const int type = (int) gguf_get_tensor_type(meta, i);
+        if (type == GGML_TYPE_AIF25_U) {
+            const int key = gguf_find_key(meta, "ait.fractional.contract");
+            if (key < 0 || gguf_get_kv_type(meta, key) != GGUF_TYPE_STRING ||
+                std::strcmp(gguf_get_val_str(meta, key), AIF25_CONTRACT) != 0) {
+                return "AIF25_U requires ait.fractional.contract=pair5-l16-magic2-unit128-v1";
+            }
+        }
         if (type >= 110 && type <= 117) { used[type - 110] = true; }
         if (type == 121) { pair_u = true; }
     }

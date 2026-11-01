@@ -83,7 +83,7 @@ static __device__ __forceinline__ float magic_i2f(int x) {
 // Optional scratch layout swaps the two 8-byte halves of each vector for token bit 1.
 // The default fragment layout remains unchanged.
 // quantize_act_body is one CTA's work for grid block (bx, tok); other kernels may run it on part of their grid.
-template <bool SWAP8 = false, bool XPERM = false>
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
 static __device__ __forceinline__ void quantize_act_body(
         const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
         int bx, int tok) {
@@ -148,7 +148,10 @@ static __device__ __forceinline__ void quantize_act_body(
     const int h  = (lane & 3) >> 1;
     const int t0 = (lane & 1)*2;
     static_assert(!SWAP8 || !XPERM, "exclusive activation scratch layouts");
-    if constexpr (XPERM) {
+    static_assert(!LINEAR || (!SWAP8 && !XPERM), "linear activation scratch excludes permutations");
+    if constexpr (LINEAR) {
+        *(uint2 *) (q + (int64_t) tok*K + hb*RQ4_HB + lane*8) = make_uint2(w[0], w[1]);
+    } else if constexpr (XPERM) {
         int8_t * qr = q + (int64_t) tok*K + hb*RQ4_HB + c*RQ4_CHUNK + h*64 + (t0 >> 1)*32 + j*8;
         *(uint2 *) qr = make_uint2(w[0], w[1]);
     } else {
@@ -161,10 +164,10 @@ static __device__ __forceinline__ void quantize_act_body(
     }
 }
 
-template <bool SWAP8 = false, bool XPERM = false>
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
 static __global__ void __launch_bounds__(128) quantize_act(
         const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N) {
-    quantize_act_body<SWAP8, XPERM>(x, sx, q, s, K, N, blockIdx.x, blockIdx.y);
+    quantize_act_body<SWAP8, XPERM, LINEAR>(x, sx, q, s, K, N, blockIdx.x, blockIdx.y);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -739,10 +742,10 @@ static void launch_mmv(const uint8_t * W, int64_t row_bytes, const int8_t * Xq, 
     mmv<Codec><<<M/16, MMV_WARPS*32, 0, stream>>>(W, row_bytes, Xq, Xs, Y, ldy, M, N, K);
 }
 
-template <bool SWAP8 = false, bool XPERM = false>
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
 static void launch_quantize_act(const float * x, int64_t sx, int8_t * q, float * s, int K, int N, cudaStream_t stream) {
     const dim3 grid((K/RQ4_HB + 3)/4, N);
-    quantize_act<SWAP8, XPERM><<<grid, 128, 0, stream>>>(x, sx, q, s, K, N);
+    quantize_act<SWAP8, XPERM, LINEAR><<<grid, 128, 0, stream>>>(x, sx, q, s, K, N);
 }
 
 } // namespace rq4

@@ -1,6 +1,9 @@
 #include "sampling.h"
+#include "arg.h"
+#include "spec-defaults.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "gguf.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -10,8 +13,72 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+static void test_model_mtp_default() {
+#ifndef _WIN32
+    char path[] = "/tmp/test-spec-default-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0);
+    FILE * file = fdopen(fd, "wb");
+    assert(file);
+    auto * metadata = gguf_init_empty();
+    gguf_set_val_str(metadata, "general.architecture", "qwen35");
+    gguf_set_val_u32(metadata, "qwen35.block_count", 2);
+    gguf_set_val_u32(metadata, "qwen35.nextn_predict_layers", 1);
+    ggml_init_params gp = {ggml_tensor_overhead(), nullptr, true};
+    auto * ctx = ggml_init(gp);
+    assert(ctx);
+    auto * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_name(tensor, "blk.1.nextn.eh_proj.weight");
+    gguf_add_tensor(metadata, tensor);
+    assert(gguf_write_to_file_ptr(metadata, file, true));
+    assert(fclose(file) == 0);
+    gguf_free(metadata);
+    ggml_free(ctx);
+
+    const struct {
+        std::vector<std::string> options;
+        bool automatic;
+        bool mode_biased;
+    } cases[] = {
+        {{}, true, true},
+        {{"--no-spec-mb-mtp"}, true, false},
+        {{"--spec-mb-mtp"}, true, true},
+        {{"--spec-type", "draft-mtp"}, false, true},
+        {{"--spec-type", "draft-mtp-adaptive"}, false, true},
+        {{"--spec-type", "draft-mtp", "--no-spec-mb-mtp"}, false, false},
+        {{"--spec-type", "draft-mtp-adaptive", "--no-spec-mb-mtp"}, false, false},
+        {{"--spec-type", "none"}, false, false},
+        {{"--spec-draft-n-max", "0"}, false, false},
+    };
+    for (const auto & test : cases) {
+        std::vector<std::string> args = {"test-spec-beat", "-m", path};
+        args.insert(args.end(), test.options.begin(), test.options.end());
+        std::vector<char *> argv;
+        for (auto & arg : args) { argv.push_back(&arg[0]); }
+        common_params params;
+        assert(common_params_parse(argv.size(), argv.data(), params, LLAMA_EXAMPLE_SERVER));
+        if (test.automatic) {
+            assert(params.speculative.types == std::vector<common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE});
+        }
+        assert(common_speculative_apply_model_default(params));
+        assert(params.sampling.spec_lossy == test.mode_biased);
+        if (test.automatic) {
+            assert(params.speculative.types.back() == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
+        }
+        assert(common_speculative_apply_model_default(params));
+        assert(params.sampling.spec_lossy == test.mode_biased);
+    }
+    assert(unlink(path) == 0);
+    puts("model-header automatic MTP, explicit choices and repeated resolution: PASS");
+#endif
+}
 
 static std::vector<llama_token_data> probs(std::initializer_list<float> p) {
     std::vector<llama_token_data> result;
@@ -245,7 +312,7 @@ static void test_mode_distribution() {
     puts("mode-biased local law, ending veto, ties, missing/zero support: PASS");
 }
 
-static void test_model_state(const char * path) {
+static void test_model_state(const char * path, bool mode_biased) {
     ggml_backend_load_all();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
@@ -283,7 +350,7 @@ static void test_model_state(const char * path) {
     };
     common_params_sampling params;
     params.seed = 7300; params.temp = 1; params.top_k = 3; params.top_p = 1; params.min_p = 0;
-    params.spec_lossy = true;
+    params.spec_lossy = mode_biased;
     auto * s = common_sampler_init(model, params);
     std::vector<std::vector<llama_token_data>> qs(4, {{20, 0, .75f}, {21, 0, .1f}, {22, 0, .15f}});
     auto step = [&](common_sampler * sampler) {
@@ -324,10 +391,50 @@ static void test_model_state(const char * path) {
         assert(step(clone) == expected && step(copied) == expected);
         assert(common_sampler_get_pq_stats(s).n_pos == common_sampler_get_pq_stats(copied).n_pos);
     }
-    assert(common_sampler_get_pq_stats(s).n_lossy > 0);
+    assert((common_sampler_get_pq_stats(s).n_lossy > 0) == mode_biased);
     common_sampler_reset(copied);
     auto * fresh = common_sampler_init(model, params);
     for (int i = 0; i < 32; ++i) { assert(step(copied) == step(fresh)); }
+    common_sampler * slots[3], * controls[3];
+    for (int i = 0; i < 3; ++i) {
+        params.seed = 8100 + i;
+        slots[i] = common_sampler_init(model, params);
+        controls[i] = common_sampler_init(model, params);
+    }
+    for (int round = 0; round < 64; ++round) {
+        for (int i = 0; i < 3; ++i) {
+            // A slot may finish, reset, or replay while the other slots keep their state.
+            if (round == 32 && i == 1) {
+                common_sampler_reset(slots[i]);
+                common_sampler_reset(controls[i]);
+            }
+            auto * saved = common_sampler_clone(slots[i]);
+            const auto expected = step(controls[i]);
+            assert(step(slots[i]) == expected);
+            const auto rescue = common_sampler_get_first_rescue(slots[i]);
+            const auto trace = common_sampler_get_top1_trace(slots[i]);
+            auto * verified = common_sampler_clone(slots[i]);
+            assert(common_sampler_get_first_rescue(verified) == rescue);
+            assert(common_sampler_get_top1_trace(verified) == trace);
+            common_sampler_copy(saved, slots[i]);
+            common_sampler_free(saved);
+            assert(step(slots[i]) == expected);
+            assert(common_sampler_get_first_rescue(slots[i]) == rescue);
+            assert(common_sampler_get_pq_stats(slots[i]).n_pos == common_sampler_get_pq_stats(controls[i]).n_pos);
+            // Restore the post-verify snapshot after rollback; do not draw from the replay logits.
+            common_sampler_reset(slots[i]);
+            common_sampler_copy(verified, slots[i]);
+            common_sampler_free(verified);
+            assert(common_sampler_get_first_rescue(slots[i]) == rescue);
+            assert(common_sampler_get_top1_trace(slots[i]) == trace);
+            assert(step(slots[i]) == step(controls[i]));
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        common_sampler_free(slots[i]);
+        common_sampler_free(controls[i]);
+    }
+    puts("three independent sampler states, per-slot reset and checkpoint replay: PASS");
     // A committed stop must terminate verification, with no bonus or suffix sampler draws.
     set_p(true);
     auto before = common_sampler_get_pq_stats(s).n_pos;
@@ -378,6 +485,48 @@ static void test_model_state(const char * path) {
     out = common_sampler_sample_and_accept_n_pq(s, ctx, {0,1,2}, {20,20}, {{{20,0,1}},{{20,0,1}}},
             false, false, 0, 0, [](llama_token id, const llama_tokens & prefix) { return id == 20 && prefix.size() == 1; });
     assert(out == (llama_tokens{20,20}));
+    // Unsupported p/q chains and empty-q verification must obey the same stop prefix.
+    for (const bool fallback : {false, true}) {
+        auto stop_params = params;
+        stop_params.mirostat = fallback ? 2 : 0;
+        for (const bool pq : {false, true}) {
+            for (size_t prefix_size = 0; prefix_size < 2; ++prefix_size) {
+                auto * stopped = common_sampler_init(model, stop_params);
+                auto * control = common_sampler_init(model, stop_params);
+                assert(common_sampler_pq_supported(stopped) != fallback);
+                auto stop = [prefix_size](llama_token id, const llama_tokens & prefix) {
+                    return id == 20 && prefix.size() == prefix_size;
+                };
+                out = pq
+                    ? common_sampler_sample_and_accept_n_pq(stopped, ctx, {0,1,2}, {20,20}, {{{20,0,1}},{{20,0,1}}}, false, false, 0, 0, stop)
+                    : common_sampler_sample_and_accept_n(stopped, ctx, llama_tokens{20,20}, false, stop);
+                assert(out == llama_tokens(prefix_size + 1, 20));
+                for (size_t j = 0; j <= prefix_size; ++j) {
+                    const auto id = common_sampler_sample(control, ctx, j);
+                    assert(id == 20);
+                    common_sampler_accept(control, id, true);
+                }
+                if (fallback || !pq) {
+                    // Compare later random draws, not just the forced stop tokens.
+                    set_p(false);
+                    for (int j = 0; j < 8; ++j) {
+                        const auto id = common_sampler_sample(control, ctx, 0);
+                        assert(common_sampler_sample(stopped, ctx, 0) == id);
+                        common_sampler_accept(control, id, true);
+                        common_sampler_accept(stopped, id, true);
+                    }
+                }
+                common_sampler_free(stopped);
+                common_sampler_free(control);
+                for (int row = 0; row < 3; ++row) {
+                    float * logits = llama_get_logits_ith(ctx, row);
+                    for (int k = 0; k < n; ++k) { logits[k] = -INFINITY; }
+                    logits[20] = 0;
+                }
+            }
+        }
+    }
+    puts("ordinary and Mirostat fallback stop prefixes without extra sampler draws: PASS");
     // XTC can leave cur_p pointing inside cur. Snapshots must own that same shifted view.
     params.xtc_probability = 1.0f; params.xtc_threshold = .1f;
     auto * shifted = common_sampler_init(model, params);
@@ -436,8 +585,9 @@ static void bench() {
 }
 
 int main(int argc, char ** argv) {
+    test_model_mtp_default();
     test_verifier_identity(); test_identity_and_ties(); test_laws(); test_mode_distribution();
-    if (argc == 2) { test_model_state(argv[1]); }
+    if (argc == 2) { test_model_state(argv[1], false); test_model_state(argv[1], true); }
     bench();
     puts("test-spec-beat: PASS");
 }

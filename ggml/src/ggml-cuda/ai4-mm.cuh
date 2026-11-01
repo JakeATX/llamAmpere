@@ -83,3 +83,5 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr,
         const int8_t * act_ai_q = nullptr, const float * act_ai_s = nullptr, int phase = 0,
         const ggml_cuda_moe_mixed_pair * pair = nullptr, const ggml_cuda_moe_mixed_reduce * red = nullptr);
+bool ggml_cuda_aif25_supported(const ggml_tensor * op);
+void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst);
