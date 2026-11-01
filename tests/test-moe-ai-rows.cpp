@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -27,7 +28,7 @@ int main(int argc, char ** argv) {
     const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U };
     const int64_t shapes[][2] = { { 2560, 640 }, { 640, 2560 } };   // K (in), M (out)
 #if defined(__AVX2__) && defined(__FMA__)
-    printf("path: AVX2\n");
+    printf("path: AVX2%s\n", moe_ai::has_avx512() ? " + AVX-512 (default; AVX2 also timed)" : "");
 #else
     printf("path: scalar\n");
 #endif
@@ -99,6 +100,30 @@ int main(int argc, char ** argv) {
                     }
                 };
                 run();
+#if defined(__AVX2__) && defined(__FMA__)
+                if (moe_ai::has_avx512()) {
+                    // the AVX-512 path must equal the AVX2 path bit for bit
+                    std::vector<float> o2((size_t) nt * M);
+                    float * op2[8];
+                    for (int64_t a = 0; a < M; a += AI4_TR) {
+                        for (int t = 0; t < nt; ++t) { op2[t] = o2.data() + t * M + a; }
+                        moe_ai::slab_rows((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, yp, op2, 0);
+                    }
+                    const bool same = memcmp(o2.data(), out.data(), o2.size() * sizeof(float)) == 0;
+                    printf("%-8s K=%5lld M=%5lld nt=%d  AVX-512 vs AVX2: %s\n", ggml_type_name(type), (long long) K, (long long) M, nt,
+                           same ? "bit-identical OK" : "DIFFERENT FAIL");
+                    fails += !same;
+                    const auto t2 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < reps; ++i) {
+                        for (int64_t a = 0; a < M; a += AI4_TR) {
+                            for (int t = 0; t < nt; ++t) { op2[t] = o2.data() + t * M + a; }
+                            moe_ai::slab_rows((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, yp, op2, 0);
+                        }
+                    }
+                    printf("  AVX2 path %.1f us/projection (1 thread)\n",
+                           std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t2).count() / reps);
+                }
+#endif
                 float scale = 0.0f, err = 0.0f;
                 for (size_t i = 0; i < ref.size(); ++i) { scale = std::max(scale, std::fabs(ref[i])); }
                 for (size_t i = 0; i < ref.size(); ++i) { err = std::max(err, std::fabs(out[i] - ref[i])); }
