@@ -7754,6 +7754,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
     };
     p.ple_pf = ple_pf.get();
     p.mtp_tok_row = mtp_pipe.active;
+    p.moe_onepath_live = ggml_moe_bank_onepath_live();
     if (b1_cur.active) {
         p.b1_il0   = b1_cur.il0;
         p.b1_il1   = b1_cur.il1;

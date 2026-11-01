@@ -988,6 +988,9 @@ struct llm_graph_params {
 
     // [RTPORT] 1-row MTP step whose token embedding row is a device input (LLAMA_MTP_PIPELINE); set after construction
     bool mtp_tok_row = false;
+    // fork AIPFIX ONEPATH: ggml_moe_bank_onepath_live() when the params were taken; a graph built either way is only
+    // reused while it holds (the one path drops the bank graph)
+    bool moe_onepath_live = false;
 
     // true for a graph built only to reserve compute buffers (llama_context::graph_reserve): its output rows are
     // placeholders and may sit on sequences that have no backend sampler (none is attached yet at context creation)
@@ -1067,6 +1070,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (moe_onepath_live != other.moe_onepath_live) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -1103,6 +1110,7 @@ public:
     int64_t get_max_nodes() const;
     const llm_b1_ffn * get_b1_ffn() const { return params.b1_ffn; }
     int get_b1_ffn_phase() const { return params.b1_ffn_phase; }
+    bool get_moe_onepath_live() const { return params.moe_onepath_live; }
 
     void reset();
 

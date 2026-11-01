@@ -8929,6 +8929,17 @@ bool ggml_moe_bank_any(void) {
     return g_moe_bank_any;
 }
 
+// fork AIPFIX ONEPATH: set by the CUDA expert cache while its device tables hold the bank rows of every banked tensor
+static int g_moe_bank_onepath_live = 0;
+
+void ggml_moe_bank_onepath_set_live(bool live) {
+    __atomic_store_n(&g_moe_bank_onepath_live, live ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+bool ggml_moe_bank_onepath_live(void) {
+    return __atomic_load_n(&g_moe_bank_onepath_live, __ATOMIC_ACQUIRE) != 0;
+}
+
 const uint8_t * ggml_moe_bank_lookup(const void * weight_data) {
     // no tensor with a bank (every model without hot-bank tensors): nothing to look up
     if (!g_moe_bank_any) {

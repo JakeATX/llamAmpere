@@ -8858,6 +8858,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     }
     moe_pf_release(&session); // fork PREFETCHFIX: tables below are about to be freed
     session.device_ready.store(false);
+    ggml_moe_bank_onepath_set_live(false);
     if (session.device_adapt_stream) {
         if (!session.devices.empty()) {
             ggml_cuda_set_device(session.devices[0]->logical);
@@ -13243,6 +13244,17 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             CUDA_CHECK(cudaMemset(session->mass_trace_counts, 0, 2 * sizeof(unsigned)));
         }
         session->device_ready.store(true, std::memory_order_release);
+        if (moe_onepath()) {
+            // fork AIPFIX ONEPATH: the graph takes the one path only while every banked table has its bank rows
+            size_t banked = 0, with_rows = 0;
+            for (const auto & entry : session->device_tables) {
+                banked += entry.second.n_bank > 0;
+                with_rows += entry.second.n_bank > 0 && entry.second.ai_bank != nullptr;
+            }
+            ggml_moe_bank_onepath_set_live(banked > 0 && with_rows == banked);
+            MOE_CACHE_LOG("[moe-cache] one path %s: %zu of %zu banked tensors have bank rows\n",
+                    banked > 0 && with_rows == banked ? "live" : "off (bank graph kept)", with_rows, banked);
+        }
         MOE_CACHE_LOG("[moe-cache] device tables active: %zu tensors, %zu MiB mapped existing pages, %zu KiB device tables; stable slots with boundary adaptation; no per-layer host routing or result copies\n",
                 session->device_tables.size(), (pin_bytes + retained_staging + retained_registered) >> 20, table_bytes >> 10);
         return 1;

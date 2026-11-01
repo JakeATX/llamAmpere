@@ -2643,6 +2643,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // 64 routed rows, moe_cache_node_rows_max) qualify: past it the stock call would read the dropped bank rows.
     // Larger batches keep the bank graph. Prompt ubatches (not every token an output) and every B1 phase keep it too:
     // the scheduler runs those on the CPU path, which reads the dropped host rows of the bank experts.
+    // So does every batch while the cache's device tables lack the bank rows (not built yet, or refused: f3l's 8K MTP
+    // arm had partial bundles, no tables, and the stock call read the dropped rows).
     static const bool onepath = [] {
         const char * value = getenv("LLAMA_MOE_BANK_ONEPATH");
         return value && atoi(value) != 0;
@@ -2652,7 +2654,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 t->type == GGML_TYPE_AIT4_U);
     };
     if (onepath && moe_hot.hot_map != nullptr && (int64_t) n_tokens*n_expert_used <= 64 &&
-            n_outputs == n_tokens && res->get_b1_ffn_phase() == 0 &&
+            n_outputs == n_tokens && res->get_b1_ffn_phase() == 0 && res->get_moe_onepath_live() &&
             !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) != 0) &&
             up_exps && gate_exps && down_exps && !gate_up_exps &&
             ai_unit(moe_hot.up) && ai_unit(moe_hot.gate) && ai_unit(moe_hot.down)) {

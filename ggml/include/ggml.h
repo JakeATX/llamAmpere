@@ -3286,6 +3286,10 @@ extern "C" {
     GGML_API void            ggml_moe_bank_unregister(const void * weight_data);
     // true once some registered tensor has bank experts (a model with hot-bank tensors is loaded)
     GGML_API bool            ggml_moe_bank_any       (void);
+    // fork AIPFIX ONEPATH: true while the CUDA expert cache's device tables carry the bank rows of every banked tensor
+    // (the one path computes bank routes from them); false before the tables exist, when they were refused, or after
+    GGML_API void            ggml_moe_bank_onepath_set_live(bool live);
+    GGML_API bool            ggml_moe_bank_onepath_live    (void);
     // flags of a registered tensor with a bank, NULL otherwise or when GGML_MOE_BANK_SKIP=0
     GGML_API const uint8_t * ggml_moe_bank_lookup    (const void * weight_data);
     // fork AIPFIX ONEPATH: where the bank rows of a registered tensor's bank experts live (the bank tensor's data,
