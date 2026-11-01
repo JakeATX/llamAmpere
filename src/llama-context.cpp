@@ -5968,6 +5968,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        // top-k row export: K ids and logits per row land in the per-output-row strided sampling buffers
+        for (const auto & [seq_id, tk] : res->t_topk_rows) {
+            const auto & rows = res->sampled_rows.at(seq_id);
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tk.first);
+            GGML_ASSERT(sampling.logits.has_data() && sampling.candidates.has_data());
+            const size_t K = tk.first->ne[0];
+            for (size_t i = 0; i < rows.size();) {
+                const uint32_t first = rows[i];
+                const size_t   i0    = i;
+                uint32_t count = 1;
+                while (++i < rows.size() && rows[i] == first + count) {
+                    ++count;
+                }
+                GGML_ASSERT(n_outputs_prev + first + count <= (int64_t) sampling.logits_count.size());
+                const size_t dst = (size_t) (n_outputs_prev + first) * n_vocab;
+                ggml_backend_tensor_get_2d_async(backend, tk.first, sampling.candidates.data + dst,
+                        i0 * K * sizeof(int32_t), K * sizeof(int32_t), count, K * sizeof(int32_t), (size_t) n_vocab * sizeof(int32_t));
+                ggml_backend_tensor_get_2d_async(backend, tk.second, sampling.logits.data + dst,
+                        i0 * K * sizeof(float), K * sizeof(float), count, K * sizeof(float), (size_t) n_vocab * sizeof(float));
+                for (uint32_t c = 0; c < count; ++c) {
+                    sampling.candidates_count[n_outputs_prev + first + c] = K;
+                    sampling.logits_count[n_outputs_prev + first + c]     = K;
+                }
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers &&
             (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {

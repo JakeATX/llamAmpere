@@ -1630,6 +1630,7 @@ void llm_graph_result::reset() {
     greedy_rows.clear();
     t_sampled_rows.clear();
     sampled_rows.clear();
+    t_topk_rows.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
@@ -5230,6 +5231,19 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            if (data.sampled == nullptr && !ids_map && data.candidates != nullptr && data.logits != nullptr && data.candidates->ne[1] == n_rows) {
+                // truncation-only chain: export the kept ids and logits of every row, the host finishes the sampling
+                ggml_format_name(data.candidates, "topk_ids_rows_%d", seq_id);
+                ggml_format_name(data.logits, "topk_logits_rows_%d", seq_id);
+                ggml_set_output(data.candidates);
+                ggml_set_output(data.logits);
+                ggml_build_forward_expand(gf, data.candidates);
+                ggml_build_forward_expand(gf, data.logits);
+                res->t_topk_rows[seq_id] = { data.candidates, data.logits };
+                res->sampled_rows[seq_id].assign(rows.begin(), rows.end());
+                continue;
+            }
 
             GGML_ASSERT(data.sampled != nullptr && ggml_nelements(data.sampled) == n_rows && "row-block sampler chain produced no sampled ids");
 

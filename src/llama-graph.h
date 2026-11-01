@@ -1147,6 +1147,9 @@ public:
     // ([n_rows] I32) and the logit row of each entry
     std::map<llama_seq_id, ggml_tensor *> t_sampled_rows;
     std::map<llama_seq_id, std::vector<uint32_t>> sampled_rows;
+    // top-k row export (a row-block chain that only truncates): per sequence the K kept ids and logits of each row
+    // ([K, n_rows] I32 and F32), sent to the host instead of the full logit rows
+    std::map<llama_seq_id, std::pair<ggml_tensor *, ggml_tensor *>> t_topk_rows;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 

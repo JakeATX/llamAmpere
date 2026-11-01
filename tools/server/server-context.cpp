@@ -88,6 +88,20 @@ static bool server_mb_ctrl_exact() {
     return on;
 }
 
+// Top-K candidate download for CPU p/q verification (works with mb-MTP): the card sends the K best logits of each
+// verification row instead of the whole 248K-wide row. LLAMA_MTP_TOPK_VERIFY=0 turns it off.
+static bool server_mtp_topk_verify_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_MTP_TOPK_VERIFY");
+        const bool enabled = e != nullptr && std::atoi(e) != 0;
+        if (enabled) {
+            setenv("GGML_CUDA_TOPK_SELECT", "1", 0); // radix select for the wide rows; the default is a full-row sort
+        }
+        return enabled;
+    }();
+    return on;
+}
+
 static bool server_mtp_gpu_verify_sampled_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
     return gpu_verify != nullptr && std::strcmp(gpu_verify, "1") == 0;
@@ -3275,6 +3289,11 @@ private:
                     SLT_INF(slot, "%s", "GPU verification ineligible for sampler settings; using CPU verification\n");
                 }
             }
+            bool speculative_topk = false;
+            if (slot.can_speculate() && !speculative_sampler && server_mtp_topk_verify_enabled()) {
+                speculative_sampler = common_sampler_get_topk_backend(slot.smpl.get());
+                speculative_topk = speculative_sampler != nullptr;
+            }
             use_backend_sampling &= !slot.can_speculate();
             use_backend_sampling |= speculative_sampler != nullptr;
 
@@ -3285,7 +3304,9 @@ private:
             if (use_backend_sampling) {
                 bool enabled = llama_set_sampler(ctx_tgt, slot.id,
                         speculative_sampler ? speculative_sampler : common_sampler_get(slot.smpl.get()));
-                const bool rows_ready = !speculative_sampler ? true : (speculative_sampled
+                const bool rows_ready = !speculative_sampler ? true : (speculative_topk
+                        ? common_sampler_topk_backend_ready(slot.smpl.get())
+                        : speculative_sampled
                         ? common_sampler_backend_verify_ready(slot.smpl.get())
                         : common_sampler_greedy_backend_ready(slot.smpl.get()));
                 if (enabled && !rows_ready) {
@@ -3296,7 +3317,7 @@ private:
                     enabled = false;
                 }
                 if (speculative_sampler) {
-                    SLT_INF(slot, "GPU %s verification %s\n", speculative_sampled ? "sampled" : "greedy",
+                    SLT_INF(slot, "GPU %s verification %s\n", speculative_topk ? "top-K candidate" : speculative_sampled ? "sampled" : "greedy",
                             enabled ? "enabled" : "unavailable; using CPU verification");
                 }
             } else {

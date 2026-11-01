@@ -392,6 +392,7 @@ struct common_sampler {
 
     mutable int64_t t_total_us = 0;
     llama_sampler * greedy_backend = nullptr;
+    llama_sampler * topk_backend   = nullptr; // [top-k K] chain for the card-side candidate download
     // true when greedy_backend is [logit-bias, greedy] rather than a bare [greedy]: a biased chain really
     // runs a backend graph, so it has to have been offloaded before it can be trusted
     bool greedy_backend_biased = false;
@@ -739,6 +740,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
     llama_sampler_free(gsmpl->greedy_backend);
+    llama_sampler_free(gsmpl->topk_backend);
 
     delete gsmpl;
 }
@@ -1085,6 +1087,27 @@ struct llama_sampler * common_sampler_get_backend_verify(struct common_sampler *
         return nullptr;
     }
     return gsmpl->chain;
+}
+
+struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * gsmpl) {
+    // fused_top_k > 0 and no fused bias means the CPU chain's first live sampler is top-k with nothing before it
+    // that touches the logits, so the CPU chain sees the same candidates from the K best as from the full row
+    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || gsmpl->fused_top_k <= 0 || !gsmpl->fused_topk_bias.empty() ||
+            gsmpl->params.temp <= 0.0f || gsmpl->params.mirostat != 0 || gsmpl->params.n_probs != 0) {
+        return nullptr;
+    }
+    if (!gsmpl->topk_backend) {
+        auto params = llama_sampler_chain_default_params();
+        params.no_perf = gsmpl->params.no_perf;
+        gsmpl->topk_backend = llama_sampler_chain_init(params);
+        // K >= 64 takes the card's radix-select path (wide rows with a small K fall to a full-row sort)
+        llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_top_k(std::max(gsmpl->fused_top_k, 64)));
+    }
+    return gsmpl->topk_backend;
+}
+
+bool common_sampler_topk_backend_ready(const struct common_sampler * gsmpl) {
+    return gsmpl && gsmpl->topk_backend && llama_sampler_backend_rows_ready(gsmpl->topk_backend);
 }
 
 bool common_sampler_backend_verify_ready(const struct common_sampler * gsmpl) {
