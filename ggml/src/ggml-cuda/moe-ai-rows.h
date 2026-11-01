@@ -141,8 +141,8 @@ MOE_AI_T512 static void unit_rows_512(const uint8_t * blk, int k, uint32_t C, in
     for (int r = 0; r < AI4_TR/2; ++r) {
         const float d0 = ai4_fp16_to_fp32(dh[2*r]), d1 = ai4_fp16_to_fp32(dh[2*r + 1]);
         for (int t = 0; t < nt; ++t) {
-            acc[t][2*r]     += d0*hsum8(_mm512_castps512_ps256(part[t][r]));
-            acc[t][2*r + 1] += d1*hsum8(_mm512_extractf32x8_ps(part[t][r], 1));
+            acc[t][2*r]     = __builtin_fmaf(d0, hsum8(_mm512_castps512_ps256(part[t][r])), acc[t][2*r]);
+            acc[t][2*r + 1] = __builtin_fmaf(d1, hsum8(_mm512_extractf32x8_ps(part[t][r], 1)), acc[t][2*r + 1]);
         }
     }
 }
@@ -180,7 +180,7 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
             }
             for (int r = 0; r < AI4_TR; ++r) {
                 const float d = ai4_fp16_to_fp32(dh[r]);
-                for (int t = 0; t < nt; ++t) { acc[t][r] += d*hsum8(part[t][r]); }
+                for (int t = 0; t < nt; ++t) { acc[t][r] = __builtin_fmaf(d, hsum8(part[t][r]), acc[t][r]); }
             }
             continue;
         }

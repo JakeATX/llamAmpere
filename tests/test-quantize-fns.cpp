@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-cpu/quants.h"
+#include "../ggml/src/ggml-quants.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -411,7 +412,6 @@ static int test_iq_grouped(bool verbose) {
 
 static int test_q8_K_quantizer_matches_ref(bool verbose) {
     // the CPU Q8_K input quantizer (vectorized on x86) must give the same bytes as the reference one
-    const auto * ref = ggml_get_type_traits(GGML_TYPE_Q8_K);
     const auto * cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     const int nb = 10;
     std::vector<float> x(nb * QK_K);
@@ -431,7 +431,7 @@ static int test_q8_K_quantizer_matches_ref(bool verbose) {
         }
         memset(a.data(), 0, nb * sizeof(block_q8_K));
         memset(b.data(), 0, nb * sizeof(block_q8_K));
-        ref->from_float_ref(x.data(), a.data(), x.size());
+        quantize_row_q8_K_ref(x.data(), a.data(), x.size());
         cpu->from_float(x.data(), b.data(), x.size());
         for (int i = 0; i < nb; ++i) {
             const bool zero = a[i].d == 0.0f;   // the reference leaves bsums unwritten for an all-zero block
