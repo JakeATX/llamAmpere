@@ -19,7 +19,7 @@ cmake --build build-sm86 -j8 --target llama-server && \
 ./build-sm86/bin/llama-server -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
   -c 204800 -ngl 99 -fa on -b 4096 -ub 1024 --parallel 1 --jinja --no-context-shift \
   -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
-  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 3 \
+  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 \
   --spec-draft-p-min 0 --spec-mb-mtp
 ```
 
@@ -42,9 +42,84 @@ For the Swift 1.5 27B dense model (the 2.3 bpw file above) at 200K context on a 
 | `-ctk sjkvarn3 -ctv sjkvarn2` | Stores the attention memory (KV cache) in our compressed SJ-KVaRN format with 3 bits per key and 2 bits per value, the 3/2 setting (2.78 bits per element in the compressed cache body, versus 4.28 for 4/4). |
 | `--sjkvarn-body-type auto` | Picks the trellis encoding that the 3/2 setting needs. |
 | `--spec-type draft-mtp-adaptive` | Turns on speculative decoding with the draft layer built into the model file, which guesses tokens ahead so the full model can check several at once. |
-| `--spec-draft-n-min-adaptive 3 --spec-draft-n-max 3` | Drafts 3 tokens per round, the setting used for the model card's results. |
-| `--spec-draft-p-min 0` | Always drafts the full 3 tokens instead of stopping early when the draft layer is unsure. |
+| `--spec-draft-n-min-adaptive 3 --spec-draft-n-max 4` | Drafts 3 or 4 tokens per round, picking the depth as it goes. This is our recommended speed setting; the model card's LiveCodeBench results were run at 3, and depth changes speed, not the model. |
+| `--spec-draft-p-min 0` | Always drafts the full depth instead of stopping early when the draft layer is unsure. |
 | `--spec-mb-mtp` | Turns on mb-MTP, which also keeps a draft token the full model would have rejected when that token is at least as likely as the replacement; this is faster but changes sampling slightly, so use `--no-spec-mb-mtp` instead for exact sampling (mb-MTP is already on by default with MTP). |
+
+## Smaller cards: 12 GB, 10 GB and 8 GB (Linux, one paste each)
+
+**Not yet run on this model.** These adapt the 12 GB command we measured in October on an earlier 2.3 bpw file, adding the v0.6.2 settings (depth up to 4, mb-MTP, the packed attention mask, this model). Every memory figure is arithmetic from those older measurements, not a new measurement. Same requirements as the 24 GB quick start. On the card the model's weights, including the draft layer, take 7,416 MiB; the 1,288 MiB token embedding stays in system RAM.
+
+### 12 GB cards (RTX 3060 12 GB, 3080 12 GB, 3080 Ti): 204,800 tokens of context
+
+Estimated about 11,000 MiB on the card, which leaves about 1 GB for the desktop. If it runs out of memory, change `-ctv sjkvarn3` to `-ctv sjkvarn2` (about 390 MiB less, at about twice the cache error).
+
+```bash
+if [ -d llamAmpere ]; then
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.2
+else
+  git clone -b v0.6.2 https://github.com/JakeATX/llamAmpere.git
+fi && cd llamAmpere && \
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
+cmake --build build-sm86 -j8 --target llama-server && \
+LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
+  -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
+  -c 204800 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 --no-context-shift --jinja \
+  -ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto \
+  --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
+  --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 --cache-type-s q8_0 \
+  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 --spec-draft-p-min 0 --spec-mb-mtp \
+  --spec-draft-vocab-map auto:65536 --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-window 8192 \
+  --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
+```
+
+### 10 GB cards (RTX 3080 10 GB): 49,152 tokens of context (estimate)
+
+Estimated 8,650 to 8,950 MiB. Nearly 8 GB of that is fixed before any context is added, so there is little room; if you have spare memory, try `-c 65536`.
+
+```bash
+if [ -d llamAmpere ]; then
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.2
+else
+  git clone -b v0.6.2 https://github.com/JakeATX/llamAmpere.git
+fi && cd llamAmpere && \
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
+cmake --build build-sm86 -j8 --target llama-server && \
+LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
+  -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
+  -c 49152 --parallel 1 -ngl 99 -fa on -fit off -b 4096 -ub 512 --no-context-shift --jinja \
+  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
+  --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
+  --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 --cache-type-s q8_0 \
+  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 --spec-draft-p-min 0 --spec-mb-mtp \
+  --spec-draft-vocab-map auto:65536 --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-window 8192 \
+  --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
+```
+
+### 8 GB cards (RTX 3060 Ti, 3070, 3070 Ti): 32,768 tokens, part of the model in system RAM (least certain)
+
+The weights alone are 7,416 MiB, so the model cannot fit fully on an 8 GB card. `-fit on -fitt 800` lets the server move some layers to system RAM and keeps 800 MiB free for the desktop. Expect much slower writing than on a 12 GB card. If it will not start, replace `-fit on -fitt 800` with `-fit off -ngl 48`, and lower 48 in steps of 4 if it still runs out of memory.
+
+```bash
+if [ -d llamAmpere ]; then
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.2
+else
+  git clone -b v0.6.2 https://github.com/JakeATX/llamAmpere.git
+fi && cd llamAmpere && \
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
+cmake --build build-sm86 -j8 --target llama-server && \
+LLAMA_KQ_MASK_PACKED=1 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 ./build-sm86/bin/llama-server \
+  -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
+  -c 32768 --parallel 1 -fa on -fit on -fitt 800 -b 4096 -ub 512 --no-context-shift --jinja \
+  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
+  --sjkvarn-sink 128 --sjkvarn-sink-type f16 --sjkvarn-staging-type tq6_0 \
+  --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 --cache-type-s q8_0 \
+  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 --spec-draft-p-min 0 --spec-mb-mtp \
+  --spec-draft-vocab-map auto:65536 --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-window 8192 \
+  --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0
+```
+
+What the extra small-card flags do: `LLAMA_KQ_MASK_PACKED=1` stores the attention mask at one bit per entry (saves 188 MiB at 204,800); `LLAMA_MTP_DRAFT_COMPUTE_LEAN=1` keeps the draft layer's work buffer small; `-ub 512` keeps work buffers inside the card; `--cache-type-s q8_0` stores the non-attention layers' running memory at 8 bits instead of 32; `--spec-draft-type-k/-v q8_0 --spec-draft-window 8192` store the draft layer's own memory at 8 bits with an 8,192-token look-back; `--spec-draft-vocab-map auto:65536` lets the draft layer guess from the 65,536 most common tokens; the `--sjkvarn-sink/-staging/-tail` flags keep the first 128 and the newest 4,096 to 8,192 tokens at higher precision. The sampling flags are the model's recommended settings.
 
 ## Changes
 
