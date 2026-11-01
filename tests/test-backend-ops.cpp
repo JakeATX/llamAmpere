@@ -19809,6 +19809,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     // [AIPTAB] mixed-bank hot expert launches at the Flash-Next shapes, AIT2_U vs AIT2P_U: GGML_TEST_AIPTAB_PERF=1
+    if (getenv("GGML_TEST_AIPTAB_PERF") != nullptr && std::string(getenv("GGML_TEST_AIPTAB_PERF")) == "types") {
+        // placement table: expert types at the Flash-Next shapes, MUL_MAT_ID top-10 of 512, widths 1 / 4 / 5.
+        // down is K=640 (m=2560), gate/up is K=2560 (m=640); bytes per expert matrix goes to stderr.
+        struct shape_set { int64_t m, k; std::vector<ggml_type> types; };
+        const std::vector<shape_set> sets = {
+            { 2560, 640,  { GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0 } },
+            { 640,  2560, { GGML_TYPE_IQ4_XS, GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS } },
+        };
+        for (const auto & ss : sets) {
+            for (ggml_type t : ss.types) {
+                fprintf(stderr, "[bytes] %s m=%lld k=%lld bytes_per_expert=%zu\n", ggml_type_name(t), (long long) ss.m, (long long) ss.k,
+                        (size_t) (ggml_row_size(t, ss.k) * ss.m));
+                for (int64_t n : { 1, 4, 5 }) {
+                    const bool broadcast = ss.k == 2560;
+                    if (t == GGML_TYPE_AIT3_U || t == GGML_TYPE_AIT4_U) {
+                        test_cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, broadcast, ss.m, n, ss.k, false, true));
+                    } else {
+                        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, broadcast, ss.m, n, ss.k));
+                    }
+                }
+            }
+        }
+        return test_cases;
+    }
     if (getenv("GGML_TEST_AIPTAB_PERF") != nullptr) {
         for (int width : { 1, 3, 5 }) {
             for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U }) {
