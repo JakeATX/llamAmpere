@@ -409,6 +409,43 @@ static int test_iq_grouped(bool verbose) {
     return failed;
 }
 
+static int test_q8_K_quantizer_matches_ref(bool verbose) {
+    // the CPU Q8_K input quantizer (vectorized on x86) must give the same bytes as the reference one
+    const auto * ref = ggml_get_type_traits(GGML_TYPE_Q8_K);
+    const auto * cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const int nb = 10;
+    std::vector<float> x(nb * QK_K);
+    std::vector<block_q8_K> a(nb), b(nb);
+    uint32_t rng = 12345;
+    auto next = [&rng]() { rng = rng * 1664525u + 1013904223u; return (rng >> 8) / (float) (1 << 24) - 0.5f; };
+    int failed = 0;
+    for (int it = 0; it < 4000; ++it) {
+        for (size_t j = 0; j < x.size(); ++j) {
+            const float r = next() * 2.0f;
+            switch (it % 4) {
+                case 0:  x[j] = r; break;
+                case 1:  x[j] = roundf(r * 4.0f) * 0.25f; break;    // ties for the largest magnitude
+                case 2:  x[j] = (j % 17 == 0) ? r * 50.0f : r * 0.01f; break;
+                default: x[j] = (j / QK_K == 3) ? 0.0f : r * (float) (1 << (it % 20)); break;
+            }
+        }
+        memset(a.data(), 0, nb * sizeof(block_q8_K));
+        memset(b.data(), 0, nb * sizeof(block_q8_K));
+        ref->from_float_ref(x.data(), a.data(), x.size());
+        cpu->from_float(x.data(), b.data(), x.size());
+        for (int i = 0; i < nb; ++i) {
+            const bool zero = a[i].d == 0.0f;   // the reference leaves bsums unwritten for an all-zero block
+            if (a[i].d != b[i].d || memcmp(a[i].qs, b[i].qs, QK_K) != 0 || (!zero && memcmp(a[i].bsums, b[i].bsums, sizeof(a[i].bsums)) != 0)) {
+                failed = 1;
+            }
+        }
+    }
+    if (failed || verbose) {
+        printf(" q8_K input quantizer vs reference:     %s\n", RESULT_STR[failed]);
+    }
+    return failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -433,6 +470,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_prism_ternary(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
     num_failed += test_iq_grouped(verbose);
+    num_failed += test_q8_K_quantizer_matches_ref(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);
