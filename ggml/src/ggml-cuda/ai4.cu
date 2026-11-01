@@ -2343,12 +2343,17 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     static const bool p2_compact_env = ai4_env_int("GGML_MOE_BANK_MIXED_P2_COMPACT", nullptr, 1) != 0;
     const bool p2_compact = p2_compact_env && fine && ggml_nelements(ids) <= 64;
     const int p2_n_tok = p2_compact ? (int) ids->ne[1] : 0;
+    // Blocks per 16-row tile in compact phase 2: each block takes every gridDim.y-th miss route, so with four blocks
+    // a layer's 1-3 misses run one route per block, serially per tile (d9: 12.2 us gate+up pair / 6.8 down mean,
+    // 2.8 / 3.1 min, vs the native list kernel 4.3). Default 8 spreads misses over twice the blocks; the per-route
+    // arithmetic and k order are unchanged (identity). GGML_MOE_BANK_MIXED_P2_Y=4 restores the old grid.
+    static const int p2_y = std::min(64, std::max(1, ai4_env_int("GGML_MOE_BANK_MIXED_P2_Y", nullptr, 8)));
     // Slabs per hit-first block: 4 warps x 16 rows is 20 blocks per route for a 640-row projection (the fused 3XS
     // hit kernel runs 80); 2 warps doubles the block count at the same warps per SM and keeps each row's k order.
     // GGML_CUDA_AI23_MIXED_SPW_WARPS=2|4 (default 4).
     static const int spw_warps = ai4_env_int("GGML_CUDA_AI23_MIXED_SPW_WARPS", nullptr, 4) == 2 ? 2 : 4;
     const int slabs_per_block = spw ? spw_warps : 1;
-    const dim3 grid((M/16 + slabs_per_block - 1)/slabs_per_block*(pair ? 2 : 1), p2_compact ? 4 : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
+    const dim3 grid((M/16 + slabs_per_block - 1)/slabs_per_block*(pair ? 2 : 1), p2_compact ? p2_y : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
     moe_mixed_second second{};
     if (pair) {
         second = { (const uint8_t *) pair->bank->src[0]->data, (float *) pair->dst->data,
