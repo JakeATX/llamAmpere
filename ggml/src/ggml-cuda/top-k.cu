@@ -562,6 +562,117 @@ static __global__ void __launch_bounds__(BLOCK) topk_select_rows_fast(const floa
     }
 }
 
+// [TOPKREG] topk_select_rows_fast with the row read once: each lane keeps its PER keys of the warp's segment in
+// registers (the layout of the final pass), so the three histogram passes and the count/write pass read no global
+// memory. Same digits, same ties, same index order, so the same output. GGML_CUDA_TOPK_SELECT_REG=1, rows up to
+// 1024*PER columns (the QSA pool select at 100K has about 25K).
+template <int BLOCK, int PER>
+static __global__ void __launch_bounds__(BLOCK) topk_select_rows_reg(const float * __restrict__ src, int * __restrict__ dst,
+                                                                     const int ncols, const int k) {
+    constexpr int BPT = TOPK_SEL_BINS / BLOCK;
+    static_assert(BPT >= 1 && TOPK_SEL_BINS % BLOCK == 0, "bad block");
+    __shared__ int hist[TOPK_SEL_BINS];
+    __shared__ int s_warp[BLOCK/32];
+    __shared__ int s_digit;
+    __shared__ int s_rank;
+
+    const int     tid  = threadIdx.x;
+    const int     lane = tid & 31;
+    const int     warp = tid >> 5;
+    const float * row  = src + (size_t) blockIdx.x * ncols;
+    int *         out  = dst + (size_t) blockIdx.x * k;
+    const int     seg  = (((ncols + BLOCK/32 - 1) / (BLOCK/32)) + 31) & ~31;
+    const int     c0   = min(ncols, warp*seg);
+    const int     c1   = min(ncols, c0 + seg);
+
+    uint32_t keys[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int c = c0 + lane + 32*j;
+        keys[j] = c < c1 ? topk_sel_key(row[c]) : 0u;
+    }
+
+    uint32_t prefix = 0;
+    uint32_t pmask  = 0;
+    int      rank   = k;
+
+#pragma unroll 1
+    for (int pass = 0; pass < 3; ++pass) {
+        const int      shift = pass == 0 ? 21 : (pass == 1 ? 10 : 0);
+        const uint32_t dmask = pass == 2 ? 0x3FFu : 0x7FFu;
+        for (int i = tid; i < TOPK_SEL_BINS; i += BLOCK) {
+            hist[i] = 0;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const bool     valid = c0 + lane + 32*j < c1 && (keys[j] & pmask) == prefix;
+            const uint32_t bin   = valid ? (keys[j] >> shift) & dmask : 0xFFFFFFFFu;
+            const uint32_t peers = __match_any_sync(0xFFFFFFFFu, bin);
+            if (valid && lane == __ffs(peers) - 1) {
+                atomicAdd(&hist[bin], __popc(peers));
+            }
+        }
+        __syncthreads();
+
+        int own = 0;
+#pragma unroll
+        for (int j = 0; j < BPT; ++j) {
+            own += hist[TOPK_SEL_BINS - 1 - BPT*tid - j];
+        }
+        int total;
+        int above = topk_sel_scan<BLOCK>(own, s_warp, &total);
+#pragma unroll
+        for (int j = 0; j < BPT; ++j) {
+            const int b = TOPK_SEL_BINS - 1 - BPT*tid - j;
+            const int h = hist[b];
+            if (above < rank && above + h >= rank) {
+                s_digit = b;
+                s_rank  = rank - above;
+            }
+            above += h;
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_digit << shift;
+        pmask  |= dmask << shift;
+        rank    = s_rank;
+        __syncthreads();
+    }
+
+    const int      n_gt_want = k - rank;
+    const unsigned lt        = (1u << lane) - 1u;
+    int n_gt = 0;
+    int n_eq = 0;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const bool in = c0 + lane + 32*j < c1;
+        n_gt += __popc(__ballot_sync(0xFFFFFFFFu, in && keys[j] > prefix));
+        n_eq += __popc(__ballot_sync(0xFFFFFFFFu, in && keys[j] == prefix));
+    }
+    int total;
+    int gt_off = topk_sel_scan<BLOCK>(lane == 0 ? n_gt : 0, s_warp, &total);
+    int eq_off = topk_sel_scan<BLOCK>(lane == 0 ? n_eq : 0, s_warp, &total);
+    gt_off = __shfl_sync(0xFFFFFFFFu, gt_off, 0);
+    eq_off = __shfl_sync(0xFFFFFFFFu, eq_off, 0);
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int      c  = c0 + lane + 32*j;
+        const bool     in = c < c1;
+        const unsigned bg = __ballot_sync(0xFFFFFFFFu, in && keys[j] > prefix);
+        const unsigned be = __ballot_sync(0xFFFFFFFFu, in && keys[j] == prefix);
+        if (in && keys[j] > prefix) {
+            out[gt_off + __popc(bg & lt)] = c;
+        } else if (in && keys[j] == prefix) {
+            const int e = eq_off + __popc(be & lt);
+            if (e < rank) {
+                out[n_gt_want + e] = c;
+            }
+        }
+        gt_off += __popc(bg);
+        eq_off += __popc(be);
+    }
+}
+
 // [PREFILLFAST] same candidates as topk_tile, by radix select: per tile the top k by the 64-bit key (value bits, then
 // the lower column first), written in descending key order. Keys are unique (the column is part of them), so the set and
 // the order are fully determined, and a tile with fewer than k columns ends with (-inf, 0) like topk_tile.
@@ -827,7 +938,17 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             const char * value = getenv("GGML_CUDA_TOPK_SELECT_FAST");
             return value == nullptr || atoi(value) != 0;
         }();
-        if (select_fast) {
+        static const bool select_reg = [] {
+            const char * value = getenv("GGML_CUDA_TOPK_SELECT_REG");
+            return value != nullptr && atoi(value) != 0;
+        }();
+        if (select_fast && select_reg && ncols <= 8*1024) {
+            topk_select_rows_reg<1024, 8><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, ncols, k);
+        } else if (select_fast && select_reg && ncols <= 16*1024) {
+            topk_select_rows_reg<1024, 16><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, ncols, k);
+        } else if (select_fast && select_reg && ncols <= 32*1024) {
+            topk_select_rows_reg<1024, 32><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, ncols, k);
+        } else if (select_fast) {
             topk_select_rows_fast<1024><<<nrows, 1024, 0, stream>>>(src0_d, dst_d, ncols, k);
         } else {
             topk_select_rows<TOPK_SEL_BLOCK><<<nrows, TOPK_SEL_BLOCK, 0, stream>>>(src0_d, dst_d, ncols, k);

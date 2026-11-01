@@ -3,9 +3,55 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+// fork: optional host memory, planned after required model/context allocations.
+enum common_fit_ram_consumer {
+    COMMON_FIT_RAM_EXPERTS,
+    COMMON_FIT_RAM_STAGING,
+    COMMON_FIT_RAM_PREFETCH,
+    COMMON_FIT_RAM_PROMPT,
+    COMMON_FIT_RAM_NGRAM,
+    COMMON_FIT_RAM_EVAL,
+    COMMON_FIT_RAM_COUNT,
+};
+
+struct common_fit_ram_request {
+    uint64_t bytes = 0; // zero keeps an unused consumer off
+    bool explicit_size = false;
+};
+
+struct common_fit_ram_result {
+    bool floor_met = false;
+    uint64_t available = 0;
+    uint64_t floor = 5ull << 30;
+    uint64_t automatic_budget = 0;
+    std::array<uint64_t, COMMON_FIT_RAM_COUNT> bytes = {};
+};
+
+common_fit_ram_result common_fit_ram_plan(uint64_t available,
+        const std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> & requests);
+
+size_t common_fit_vram_floor(bool display_attached);
+size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_session);
+struct common_params;
+std::vector<size_t> common_fit_vram_targets(const common_params & params, size_t floor);
+
+uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit);
+uint64_t common_fit_eval_cache_load_bytes(uint64_t available, bool fit, uint64_t n_tokens);
+
+struct common_params_speculative_ngram_cache;
+void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_params_speculative_ngram_cache & params, uint32_t n_seq = 1);
+
+bool common_fit_eval_cache_save_fits(uint64_t available, bool fit, uint64_t n_tokens, uint64_t spec_bytes);
+
+// Resolve the server prompt cache only after model, contexts and draft have loaded.
+// Positive/zero limits and the explicit half-free setting keep their meaning.
+int32_t common_fit_prompt_cache_ram_mib(uint64_t total, uint64_t available,
+        int32_t requested_mib, bool fit, std::string & why, uint64_t explicit_free = 0);
 
 struct common_moe_cache_params;
 
@@ -16,6 +62,7 @@ struct common_moe_cache_fit_device_input {
     int compute_capability = 0;
     int64_t free_bytes = 0;
     size_t used_bytes = 0;
+    size_t margin_bytes = 0;
 };
 
 struct common_moe_cache_fit_shape_input {
@@ -32,6 +79,7 @@ struct common_moe_cache_fit_device {
     int compute_capability = 0;
     int64_t free_bytes = 0;
     int64_t used_bytes = 0;
+    size_t reserve_bytes = 0;
     size_t cache_bytes = 0;
 };
 
@@ -58,6 +106,18 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
     COMMON_PARAMS_FIT_STATUS_NO_ROOM = 3, // no allocation can fit, even with every layer's weights in system memory
 };
+
+// fork: classify measured allocations before treating requested margins as a proven fit.
+common_params_fit_status common_fit_vram_margin_status(int64_t free_bytes, size_t used_bytes, size_t margin_bytes);
+int64_t common_fit_vram_margin_surplus(int64_t free_bytes, const std::vector<int64_t> & margins);
+struct common_fit_vram_layer_result {
+    common_params_fit_status status;
+    uint32_t step;
+};
+common_fit_vram_layer_result common_fit_vram_layer_step(uint32_t delta, int64_t low, int64_t high, int64_t target, int64_t free_bytes);
+
+// fork: require a proven fit with at least `floor` (never below 300 MiB) left on every device.
+bool common_fit_verify_compact_safe(bool complete, const std::vector<int64_t> & headroom, const std::vector<int64_t> & margins, int64_t floor = 300ll * 1024 * 1024);
 
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
@@ -106,7 +166,8 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
+                               bool * margins_verified = nullptr);
 
 // print estimated memory to stdout
 void common_fit_print(

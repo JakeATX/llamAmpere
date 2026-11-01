@@ -3,6 +3,8 @@
 #include "ai4.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
+#include "magic2-v2.cuh"
+#include "../ggml-aif25.h"
 #include "rpb-knobs.h"
 
 #include <algorithm>
@@ -32,6 +34,12 @@
 //   GGML_CUDA_AI4_AMPERE_GEMM    retired; keeps baseline prefill after measured regressions
 //   GGML_CUDA_AI4_PREFILL_V2=1  experimental rate-4 decode-once dense prefill, N >= 512 (default off)
 //   GGML_CUDA_AI23_MMVR=1    rate-2/3 decode with fixed stage offsets (default off)
+//   GGML_CUDA_AI23_MMVR_ID=1 rate-2/3 mmvr for expert stacks (MUL_MAT_ID) only (default: follows GGML_CUDA_AI23_MMVR)
+//   GGML_CUDA_AI23_ID_REF=0  AIT2_U/AIT3_U MUL_MAT_ID run the device-routed IMMA kernels (default 1 = reference path)
+//   GGML_CUDA_AI_ID_SKIP_ZERO=1  zero the outputs of skipped (out-of-stack) expert ids even without an expert bank
+//                            (default: only when a model with hot-bank tensors is loaded)
+//   GGML_CUDA_AI23_DIRECT=N  MUL_MAT_ID widths up to N (max 8) skip the routing helper (default 4 with
+//                            GGML_CUDA_AI23_TUNED=1, else 0; lane measurement used 6)
 //   GGML_CUDA_AI23_TUNED=1   select measured rate-2/3 decode and tile defaults (default off)
 //   GGML_CUDA_AI23_MMVR_STAGES=4|8  deeper dense fixed-K four-warp weight prefetch (default 2)
 //   GGML_CUDA_AI23_MMVR_UNROLL=1|2|4|8  dense fixed-K loop unroll (tuned 8 at long K, 4 otherwise)
@@ -40,6 +48,14 @@
 //   GGML_CUDA_AI23_SMALL_SPLIT=2|4  split small-width fixed-K dense products (default off)
 //   GGML_CUDA_AI23_FUSED_X=1  quantize activations inside direct one-token expert blocks (default off)
 //   GGML_CUDA_AI23_DIRECT=1..8  skip expert grouping through this token width in MMVR (default off)
+//   GGML_CUDA_AI23_ID_BN=32|64|128  override rate-2/3 routed prompt GEMM tile width (default automatic)
+//   GGML_CUDA_AI23_ID_STAGES=2|3  routed rate-2/3 prompt staging depth (default 3)
+//   GGML_CUDA_AI23_ID_SLABS=4|8  routed rate-2/3 prompt row slabs per block (default 8)
+//   GGML_CUDA_AI23_ID_THREADS=256  smaller routed prompt helper for <=1024 experts (default 1024)
+//   GGML_CUDA_AI23_ID_TIGHT_GRID=1  bound routed prompt tiles after each active expert's first pair (default off)
+//   GGML_CUDA_AI23_ID_ROUTE_AGG=1  combine routed prompt counter updates within each warp (default off)
+//   GGML_CUDA_AI23_ID_FIXED_LOAD=1  unroll fixed-size routed prompt staging copies (default off)
+//   GGML_CUDA_AI23_ID_ZERO=1  zero skipped prompt columns in the routing helper (default off)
 //   GGML_CUDA_AI23_DENSE_TILE=1..29  dense shared-activation tile controls for 9..64 tokens (default off)
 //                             22/23 swap quantized activation halves to avoid LDS64 bank conflicts
 //   GGML_CUDA_AI23_XPERM=1  vector activation loads for whole-row dense rate-2 kernels (default off)
@@ -310,15 +326,15 @@ static void ai4_launch_mmv_tuned(const uint8_t * W, const int8_t * q, const floa
 // Activations: rotate + int8-quantize X [N rows of K] once. XSH = 1: H256 and one scale per 256 (track B's kernel, used
 // when K % 256 == 0); XSH = 0: H128 and one scale per 128 (K % 256 != 0).
 // gridDim.y carries the rows (<= 65535), so longer inputs run in pieces.
-template <bool SWAP8 = false, bool XPERM = false>
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
 static void ai4_quantize_x(const float * X, int64_t N, int K, int xsh, int8_t * q, float * s, cudaStream_t stream) {
     const int64_t ns = K >> (7 + xsh);
     for (int64_t r0 = 0; r0 < N; r0 += 65535) {
         const int nr = (int) std::min<int64_t>(65535, N - r0);
         if (xsh) {
-            rq4::launch_quantize_act<SWAP8, XPERM>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
+            rq4::launch_quantize_act<SWAP8, XPERM, LINEAR>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
         } else {
-            ai4k::launch_quantize_act128<SWAP8, XPERM>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
+            ai4k::launch_quantize_act128<SWAP8, XPERM, LINEAR>(X + r0*K, K, q + r0*K, s + r0*ns, K, nr, stream);
         }
     }
 }
@@ -328,6 +344,13 @@ static void ai4_quantize_x(const float * X, int64_t N, int K, int xsh, int8_t * 
 // GGML_CUDA_AI23_MMVR_KT=0 keeps K a runtime value (default: K in {640, 2048, 2560, 5120, 17408} is a template constant).
 static bool ai4_mmvr_on() {
     static const bool v = ai4_env_int("GGML_CUDA_AI23_MMVR", nullptr, ai4_ai23_tuned() ? 1 : 0) != 0;
+    return v;
+}
+// GGML_CUDA_AI23_MMVR_ID=1 (opt-in): expert stacks (MUL_MAT_ID) take mmvr. Lane note: on a 3090 the rate-2/3 mmvr
+// direct path was 28-42% faster than the mmv-ID kernel at widths 1-6 for 640x2560 / 2560x640 experts (kernel-only,
+// no end-to-end speed test yet). Unset: follows GGML_CUDA_AI23_MMVR, as before.
+static bool ai4_mmvr_on_id() {
+    static const bool v = getenv("GGML_CUDA_AI23_MMVR_ID") ? ai4_env_int("GGML_CUDA_AI23_MMVR_ID", nullptr, 0) != 0 : ai4_mmvr_on();
     return v;
 }
 static int ai4_mmvr_cfg() {
@@ -370,7 +393,7 @@ static void ai23_launch_mmvr(const uint8_t * W, const int8_t * q, const float * 
     }
     if constexpr (ID && DIRECT && !SINGLE_N) {
         static const bool single_id = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0;
-        if (single_id) {
+        if (single_id || idm.direct_zero) {
             ai23_launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, true>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
             return;
         }
@@ -482,7 +505,7 @@ static bool ai4_mmvr_try(const uint8_t * W, const int8_t * q, const float * s, f
     if constexpr (rate != 2 && rate != 3) {
         return false;
     } else {
-        if (!ai4_mmvr_on()) {
+        if (!(ID ? ai4_mmvr_on_id() : ai4_mmvr_on())) {
             return false;
         }
         const int cfg = ai4_mmvr_cfg();
@@ -784,6 +807,53 @@ static bool ai4_ref_only_type(ggml_type t) {
     return false;
 }
 
+// GGML_CUDA_AI23_ID_REF=0 (opt-in): MUL_MAT_ID over AIT2_U / AIT3_U expert stacks runs the device-routed IMMA kernels (mmv-ID / GEMM-ID):
+// the reference path routes on the host (stream sync, no CUDA graphs) and runs one f32 SGEMV per (slot, token) pair,
+// which made a prompt batch over an AI+ expert bank several times slower than the IQ expert stack it replaces.
+// Default (unset or 1) keeps the reference path for MUL_MAT_ID; dense MUL_MAT keeps ai4_ref_only_type.
+static bool ai4_id_ref_only_type(ggml_type t) {
+    static const bool id_ref = ai4_env_int("GGML_CUDA_AI23_ID_REF", nullptr, 1) != 0;
+    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) {
+        return id_ref && ai4_ref_only_type(t);
+    }
+    return ai4_ref_only_type(t);
+}
+
+// Pairs whose expert id is outside [0, n_expert) are skipped by the routing (an expert bank marks the slots another bank
+// serves with -1); their dst columns are written as zeros so the routing-weight product downstream stays finite.
+// grid (n_tok), block 256: one block per token checks its n_used ids and zeroes the skipped columns.
+static __global__ void __launch_bounds__(256) k_ai4_zero_skipped(const char * __restrict__ ids, int64_t nb0, int64_t nb1,
+                                                                   int n_used, int n_expert, int M, float * __restrict__ Y) {
+    const int t = blockIdx.x;
+    for (int u = 0; u < n_used; ++u) {
+        const int e = *(const int *) (ids + u*nb0 + t*nb1);
+        if (e >= 0 && e < n_expert) {
+            continue;
+        }
+        float * y = Y + ((int64_t) t*n_used + u)*M;
+        for (int i = threadIdx.x; i < M; i += blockDim.x) {
+            y[i] = 0.0f;
+        }
+    }
+}
+
+// Skipped ids only come from an expert bank; without one the zeroing launch is left out (no change to other models).
+static bool ai4_id_skip_on() {
+    static const bool forced = ai4_env_int("GGML_CUDA_AI_ID_SKIP_ZERO", nullptr, 0) != 0;
+    return forced || ggml_moe_bank_any();
+}
+
+static void ai4_zero_skipped(const ggml_tensor * ids, int n_used, int n_tok, int n_expert, int M, float * Y, cudaStream_t stream) {
+    if (!ai4_id_skip_on()) {
+        return;
+    }
+    for (int t0 = 0; t0 < n_tok; t0 += 65535) {
+        const int nt = std::min(65535, n_tok - t0);
+        k_ai4_zero_skipped<<<nt, 256, 0, stream>>>((const char *) ids->data + (int64_t) t0*ids->nb[1], ids->nb[0], ids->nb[1],
+                                                   n_used, n_expert, M, Y + (int64_t) t0*n_used*M);
+    }
+}
+
 static void ai4_reconstruct_any(const void * src, float * W, int64_t K, int64_t M, cudaStream_t stream, ggml_type t) {
     GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t)));
 }
@@ -877,7 +947,7 @@ static void ai4_ref_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 }
 
 bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t) {
-    return ai4_ref() || ai4_ref_only_type(t) || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE;
+    return ai4_ref() || ai4_id_ref_only_type(t) || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE;
 }
 
 bool ggml_cuda_ai4_supported(const ggml_tensor * op) {
@@ -949,6 +1019,17 @@ static int ai4_mmvid_pairs() {
     static const int v = ai4_env_int("GGML_CUDA_AI4_MMVID_PAIRS", nullptr, 0);
     return v;
 }
+static int ai23_id_bn() {
+    static const int bn = [] {
+        const int v = ai4_env_int("GGML_CUDA_AI23_ID_BN", nullptr, 0);
+        if (v == 0 || v == 32 || v == 64 || v == 128) {
+            return v;
+        }
+        GGML_LOG_WARN("invalid GGML_CUDA_AI23_ID_BN; using automatic tile width (expected 32, 64 or 128)\n");
+        return 0;
+    }();
+    return bn;
+}
 static bool ai4_mmvid_route(int n_tok, int n_used, int n_expert, int rate) {
     if (n_tok <= 8) {
         return true;
@@ -960,6 +1041,74 @@ static bool ai4_mmvid_route(int n_tok, int n_used, int n_expert, int rate) {
     }
     const double act = n_expert*(1.0 - std::pow(1.0 - (double) n_used/n_expert, (double) n_tok));
     return (double) n_used*n_tok <= p*act;
+}
+
+// fork: reuse dense staging and fragment schedules without changing routed rows or K order.
+template <int BN, int STAGES, int LAY, int XSH, int SLABS = ai4k::GEMM_SLABS>
+static void ai23_launch_id_shape(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
+                                  cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
+    static const bool fixed_load = ai4_env_int("GGML_CUDA_AI23_ID_FIXED_LOAD", nullptr, 0) != 0;
+    static const bool j_major = ai4_env_int("GGML_CUDA_AI23_ID_J_MAJOR", nullptr, 0) != 0;
+    if (j_major) {
+        if (fixed_load) {
+            ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS,
+                            false, 1, false, true, false, false, false, false, true>(
+                    W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        } else {
+            ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS,
+                            false, 1, false, true>(
+                    W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        }
+        return;
+    }
+    if (fixed_load) {
+        ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS,
+                        false, 1, false, false, false, false, false, false, true>(
+                W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+    } else {
+        ai23_launch_gemm<BN, STAGES, 4, LAY, XSH, true, 1, SLABS>(
+                W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+    }
+}
+
+template <int BN, int LAY, int XSH>
+static void ai23_launch_id_gemm(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
+                                 cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
+    if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
+        static const int stages = [] {
+            const int v = ai4_env_int("GGML_CUDA_AI23_ID_STAGES", nullptr, 3);
+            if (v == 2 || v == 3) {
+                return v;
+            }
+            GGML_LOG_WARN("invalid GGML_CUDA_AI23_ID_STAGES; using 3 (expected 2 or 3)\n");
+            return 3;
+        }();
+        static const int slabs = [] {
+            const int v = ai4_env_int("GGML_CUDA_AI23_ID_SLABS", nullptr, 8);
+            if (v == 4 || v == 8) {
+                return v;
+            }
+            GGML_LOG_WARN("invalid GGML_CUDA_AI23_ID_SLABS; using 8 (expected 4 or 8)\n");
+            return 8;
+        }();
+        if (slabs == 4) {
+            if (stages == 2) {
+                ai23_launch_id_shape<BN, 2, LAY, XSH, 4>(W, q, s, Y, M, K, stream, idm, max_tiles);
+            } else {
+                ai23_launch_id_shape<BN, 3, LAY, XSH, 4>(W, q, s, Y, M, K, stream, idm, max_tiles);
+            }
+            return;
+        }
+        if (stages == 2) {
+            ai23_launch_id_shape<BN, 2, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
+            return;
+        }
+    }
+    if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
+        ai23_launch_id_shape<BN, 3, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
+    } else {
+        ai23_launch_gemm<BN, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+    }
 }
 
 template <int LAY, int XSH>
@@ -986,10 +1135,16 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
         } else {
             ai4_launch_mmv_tuned<LAY, XSH, true>(W, q, s, Y, M, 0, K, stream, k.warps, k.minb, idm, max_tiles);
         }
+    } else if (bn == 32) {
+        if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
+            ai23_launch_id_gemm<32, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
+        } else {
+            GGML_ABORT("32-column expert tiles require rate 2 or 3");
+        }
     } else if (bn == 128) {
-        ai23_launch_gemm<128, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        ai23_launch_id_gemm<128, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     } else {
-        ai23_launch_gemm<64, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        ai23_launch_id_gemm<64, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     }
 }
 
@@ -1014,7 +1169,12 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t n_rows  = (int64_t) ne11*n_tok;
     cudaStream_t stream = ctx.stream();
 
-    if (!ai4_fast_ok(ctx) || ai4_ref_only_type(src0->type)) {
+    // skipped pairs (id outside [0, n_expert)) get zero columns; the kernels below never write them. Small batches on the
+    // routed fast path zero them inside the routing helper (no extra launch per decode step).
+    const bool ref_path = !ai4_fast_ok(ctx) || ai4_id_ref_only_type(src0->type);
+
+    if (ref_path) {
+        ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, (float *) dst->data, stream);
         // reference: reconstruct each selected expert to f32, one SGEMV per (slot, token) pair (host-side routing)
         std::vector<int32_t> h((size_t) n_pairs);
         CUDA_CHECK(cudaMemcpy2DAsync(h.data(), n_used*sizeof(int32_t), ids->data, ids->nb[1], n_used*sizeof(int32_t), n_tok,
@@ -1047,10 +1207,14 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     GGML_ASSERT(((uintptr_t) src1->data & 15) == 0);
+    // direct: one block per (slot, token) pair reads its expert id itself, no routing helper; measured to width 6
     static const int direct_max = std::min(8, ai4_env_int("GGML_CUDA_AI23_DIRECT", nullptr, ai4_ai23_tuned() ? 4 : 0));
     static const bool fused_x = ai4_env_int("GGML_CUDA_AI23_FUSED_X", nullptr, 0) != 0;
     const int rate = ggml_ai4_rate(src0->type);
-    const bool direct = ai4_mmvr_on() && (rate == 2 || rate == 3) && n_tok <= direct_max;
+    const bool direct = ai4_mmvr_on_id() && (rate == 2 || rate == 3) && n_tok <= direct_max;
+    // fork: one output column per direct block; zero skipped slots in that same kernel.
+    const bool verify_compact = ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 1) != 0;
+    const bool direct_zero = direct && verify_compact;
     const bool fused = direct && fused_x && n_tok == 1;
     const int xsh = K % 256 == 0 ? 1 : 0;
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) n_rows*K);
@@ -1059,13 +1223,25 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // mmv-ID (n_tok <= 8) takes tiles of MMV_ID_BN pairs, so an expert repeated within a token still fits
     int bn = ai4_mmvid_route(n_tok, n_used, n_expert, ggml_ai4_rate(src0->type)) ? ai4k::MMV_ID_BN : (n_tok >= ai4_bn128_min() ? 128 : 64);
+    // fork: keep decode and sparse MMV routing unchanged; size the helper and GEMM from the same tile width.
+    if ((rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN && ai23_id_bn() != 0) {
+        bn = ai23_id_bn();
+    }
     const int sms = ai4_ampere_sms(ctx);
     if (sms && src0->type == GGML_TYPE_AIT4_U) {
         if (ai4_ampere_mmv(n_tok)) {
             bn = ai4_ampere_bn(n_tok);
         }
     }
-    const int max_tiles = direct ? (int) n_pairs : ai4k::ids_max_tiles(n_expert, n_pairs, bn);
+    static const bool tight_grid = ai4_env_int("GGML_CUDA_AI23_ID_TIGHT_GRID", nullptr, 0) != 0;
+    const bool tight = tight_grid && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
+    const int max_tiles = direct ? (int) n_pairs : ai4k::ids_max_tiles(n_expert, n_pairs, bn, tight);
+    static const bool prompt_zero = ai4_env_int("GGML_CUDA_AI23_ID_ZERO", nullptr, 0) != 0;
+    const bool zero_in_helper = !direct && (n_tok <= 8 ||
+        (prompt_zero && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN));
+    if (!zero_in_helper && !direct_zero) {
+        ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, (float *) dst->data, stream);
+    }
     GGML_ASSERT(max_tiles <= 65535);
     ggml_cuda_pool_alloc<int> routing(ctx.pool());
     ai4k::idmap idm{};
@@ -1078,10 +1254,16 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         idm.direct_ne11 = ne11;
         idm.direct_n_expert = n_expert;
         idm.direct_x = fused ? (const float *) src1->data : nullptr;
+        idm.direct_zero = direct_zero;
     } else {
         routing.alloc((size_t) ai4k::ids_helper_ints(n_expert, n_pairs, max_tiles));
+        static const bool route_agg = ai4_env_int("GGML_CUDA_AI23_ID_ROUTE_AGG", nullptr, 0) != 0;
+        const bool aggregate = route_agg && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
+        static const int route_threads = ai4_env_int("GGML_CUDA_AI23_ID_THREADS", nullptr, 1024);
+        const bool compact = route_threads == 256 && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
         idm = ai4k::launch_ids_helper(ids->data, ids->nb[0], ids->nb[1], n_used, n_tok, ne11, n_expert, bn,
-                                    max_tiles, src0->nb[2], routing.get(), stream);
+                                    max_tiles, src0->nb[2], routing.get(), stream,
+                                    zero_in_helper && ai4_id_skip_on() ? (float *) dst->data : nullptr, M, aggregate, compact);
     }
     const uint8_t * W = (const uint8_t *) src0->data;
     float * Y = (float *) dst->data;
@@ -1099,4 +1281,45 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         default: GGML_ABORT("not an AI+ unit type");
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Fractional pair path. Reuse the numerically checked pair decoder and existing
+// activation rotation; keep the fractional rate separate from integer AI+ dispatch.
+bool ggml_cuda_aif25_supported(const ggml_tensor * op) {
+    const auto * w = op->src[0]; const auto * x = op->src[1];
+    return op->op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_AIF25_U &&
+        x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+        w->ne[0] > 0 && w->ne[0] <= INT32_MAX && w->ne[1] > 0 && w->ne[1] <= INT32_MAX &&
+        w->ne[2] == 1 && w->ne[3] == 1 &&
+        w->ne[0] % 128 == 0 && w->ne[1] % 16 == 0 &&
+        ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op);
+}
+
+void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
+                            const ggml_tensor * x, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_aif25_supported(dst));
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    GGML_ASSERT(GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE);
+    const int K = w->ne[0], M = w->ne[1];
+    const int64_t N = ggml_nrows(x);
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    auto stream = ctx.stream();
+    ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t)N*K);
+    ggml_cuda_pool_alloc<float> scales(ctx.pool(), (size_t)N*(K >> (7+xsh)));
+    // The pair kernel reads rotated columns in their original order.
+    ai4_quantize_x<false, false, true>((const float *)x->data, N, K, xsh, q.get(), scales.get(), stream);
+    // CUDA grid.y is limited to 65535; each block handles eight activation rows.
+    for (int64_t n0 = 0; n0 < N; n0 += 8*65535) {
+        const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
+        const dim3 grid(M/16, (nr+7)/8);
+        const float * xs = scales.get() + (size_t)n0*(K >> (7+xsh));
+        if (xsh) {
+            magic2::mmv<5,2,AIF25_MUL,1><<<grid,128,0,stream>>>((const uint8_t *)w->data,
+                q.get()+(size_t)n0*K, xs, (float *)dst->data+(size_t)n0*M, M,K,nr);
+        } else {
+            magic2::mmv<5,2,AIF25_MUL,0><<<grid,128,0,stream>>>((const uint8_t *)w->data,
+                q.get()+(size_t)n0*K, xs, (float *)dst->data+(size_t)n0*M, M,K,nr);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
 }

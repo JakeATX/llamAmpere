@@ -24,6 +24,8 @@ struct llama_cparams {
 
     enum llama_moe_cache_mode moe_cache_mode;
     size_t moe_cache_budget_mib;
+    int32_t moe_skip_tail;
+    bool moe_skip_mass;
     int32_t moe_prefetch;
 
     float rope_freq_base;

@@ -4,11 +4,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <stdexcept>
 #include <system_error>
 
 namespace fs = std::filesystem;
@@ -23,20 +26,6 @@ static constexpr uint64_t EVC_MAX_BLOB     = 1ull << 36;
 static const char * EVC_INDEX = "eval-cache.json";
 
 namespace {
-
-struct evc_buf {
-    std::vector<uint8_t> b;
-
-    void bytes(const void * p, size_t n) {
-        const uint8_t * q = (const uint8_t *) p;
-        b.insert(b.end(), q, q + n);
-    }
-    template <typename T> void val(const T & v) { bytes(&v, sizeof(T)); }
-    void blob(const std::vector<uint8_t> & v) {
-        val<uint64_t>(v.size());
-        bytes(v.data(), v.size());
-    }
-};
 
 struct evc_reader {
     std::ifstream f;
@@ -67,7 +56,7 @@ struct evc_reader {
     template <typename T> bool val(T & v) { return bytes(&v, sizeof(T)); }
     bool blob(std::vector<uint8_t> & v) {
         uint64_t n = 0;
-        if (!val(n) || n > remaining || n > EVC_MAX_BLOB) {
+        if (!val(n) || n > remaining || n > EVC_MAX_BLOB || n > SIZE_MAX) {
             ok = false;
             return false;
         }
@@ -106,12 +95,28 @@ uint64_t server_eval_cache::total_bytes() const {
 int server_eval_cache::find(const llama_tokens & tokens, size_t n_min) const {
     int    best   = -1;
     size_t best_n = n_min;
+    const size_t n_text = tokens.size() - std::count(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL);
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto & et = entries[i].tokens;
-        if (et.size() <= best_n || et.size() > tokens.size()) {
+        if (et.size() <= best_n || et.size() > n_text) {
             continue;
         }
-        if (std::equal(et.begin(), et.end(), tokens.begin())) {
+        bool matches = true;
+        if (n_text == tokens.size()) {
+            matches = std::equal(et.begin(), et.end(), tokens.begin());
+        } else {
+            size_t pos = 0;
+            for (llama_token token : et) {
+                while (pos < tokens.size() && tokens[pos] == LLAMA_TOKEN_NULL) {
+                    ++pos;
+                }
+                if (pos == tokens.size() || tokens[pos++] != token) {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if (matches) {
             best   = (int) i;
             best_n = et.size();
         }
@@ -121,7 +126,7 @@ int server_eval_cache::find(const llama_tokens & tokens, size_t n_min) const {
 
 // parse the header up to the token list; `full` also reads checkpoints + speculative state and verifies the checksum
 static bool evc_parse(const std::string & file, uint64_t key_hash, const std::string & key, bool full,
-        server_eval_cache_record & out, std::string & err) {
+        server_eval_cache_record & out, std::string & err, uint64_t ram_bytes = UINT64_MAX) {
     evc_reader r;
     r.f.open(file, std::ios::binary);
     if (!r.f) {
@@ -134,6 +139,14 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
         err = "cannot stat " + file;
         return false;
     }
+    // File bytes cover all blob payloads. Charge list nodes and allocator slack separately.
+    const uint64_t fixed_bytes = sizeof(server_eval_cache_record) + sizeof(evc_reader) + 65536;
+    const uint64_t file_bytes = r.remaining;
+    if (fixed_bytes > ram_bytes || file_bytes > ram_bytes - fixed_bytes) {
+        err = "eval cache record exceeds the RAM fit budget; using fresh prefill";
+        return false;
+    }
+    const uint64_t extra_bytes = ram_bytes - fixed_bytes - file_bytes;
 
     char     magic[4];
     uint32_t version = 0;
@@ -147,7 +160,7 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
         err = file + string_format(" has format version %u, this server reads version %d", version, EVAL_CACHE_FORMAT_VERSION);
         return false;
     }
-    if (!r.val(khash) || !r.val(klen) || klen > EVC_MAX_KEY_LEN) {
+    if (!r.val(khash) || !r.val(klen) || klen > EVC_MAX_KEY_LEN || klen > r.remaining) {
         err = file + " has a truncated header";
         return false;
     }
@@ -162,7 +175,10 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
     }
 
     uint64_t n_tokens = 0;
-    if (!r.val(n_tokens) || n_tokens > EVC_MAX_N_TOKENS || n_tokens == 0) {
+    const uint64_t token_tail = sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint64_t);
+    if (!r.val(n_tokens) || n_tokens > EVC_MAX_N_TOKENS || n_tokens == 0 ||
+            r.remaining < token_tail || n_tokens > SIZE_MAX / sizeof(llama_token) ||
+            n_tokens > (r.remaining - token_tail) / sizeof(llama_token)) {
         err = file + " has a bad token count";
         return false;
     }
@@ -179,6 +195,18 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
     uint32_t n_ckpt = 0;
     if (!r.val(n_ckpt) || n_ckpt > EVC_MAX_N_CKPT) {
         err = file + " is truncated";
+        return false;
+    }
+    const uint64_t checkpoint_bytes = sizeof(common_prompt_checkpoint) + 2 * sizeof(void *) + 3 * 64;
+    if (n_ckpt > extra_bytes / checkpoint_bytes) {
+        err = "eval cache checkpoints exceed the RAM fit budget; using fresh prefill";
+        return false;
+    }
+    // Each checkpoint needs its fields and three blob lengths, even with no payload.
+    const uint64_t checkpoint_min = sizeof(int64_t) + 2 * sizeof(int32_t) + 3 * sizeof(uint64_t);
+    const uint64_t tail_min = sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint64_t);
+    if (r.remaining < tail_min || n_ckpt > (r.remaining - tail_min) / checkpoint_min) {
+        err = file + " has a bad checkpoint count";
         return false;
     }
     out.checkpoints.clear();
@@ -213,31 +241,38 @@ static bool evc_parse(const std::string & file, uint64_t key_hash, const std::st
     return true;
 }
 
-bool server_eval_cache::read_header(const std::string & id, server_eval_cache_record & out, std::string & err) const {
-    return evc_parse(path_hdr(id), key_hash, key, true, out, err);
+bool server_eval_cache::read_header(const std::string & id, server_eval_cache_record & out, std::string & err,
+        uint64_t ram_bytes) const {
+    out = {};
+    if (!evc_parse(path_hdr(id), key_hash, key, true, out, err, ram_bytes)) {
+        out = {};
+        return false;
+    }
+    return true;
 }
 
 bool server_eval_cache::write_index(std::string & err) const {
-    json j;
-    j["format"]         = "llamampere-eval-cache";
-    j["format_version"] = EVAL_CACHE_FORMAT_VERSION;
-    j["key_hash"]       = string_format("%016" PRIx64, key_hash);
-    j["key"]            = key;
-    json arr = json::array();
-    for (const auto & e : entries) {
-        arr.push_back({
-            {"id",       e.id},
-            {"n_tokens", e.tokens.size()},
-            {"bytes",    e.bytes},
-            {"has_dft",  e.has_dft},
-        });
-    }
-    j["entries"] = arr;
-
     const std::string tmp = dir + "/." + EVC_INDEX + ".tmp";
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        f << j.dump(1) << "\n";
+        if (!f) {
+            err = "cannot write " + tmp;
+            return false;
+        }
+        // fork: stream each row without a second index tree or full text copy.
+        f << "{\n \"format\": \"llamampere-eval-cache\",\n \"format_version\": "
+          << json(EVAL_CACHE_FORMAT_VERSION)
+          << ",\n \"key_hash\": " << json(string_format("%016" PRIx64, key_hash))
+          << ",\n \"key\": " << json(key) << ",\n \"entries\": [";
+        for (size_t i = 0; f && i < entries.size(); ++i) {
+            const auto & e = entries[i];
+            f << (i == 0 ? "\n" : ",\n")
+              << "  {\n   \"id\": " << json(e.id)
+              << ",\n   \"n_tokens\": " << json(e.tokens.size())
+              << ",\n   \"bytes\": " << json(e.bytes)
+              << ",\n   \"has_dft\": " << json(e.has_dft) << "\n  }";
+        }
+        f << (entries.empty() ? "]\n}\n" : "\n ]\n}\n");
         f.close();
         if (!f) {
             err = "cannot write " + tmp;
@@ -253,12 +288,14 @@ bool server_eval_cache::write_index(std::string & err) const {
     return true;
 }
 
-bool server_eval_cache::open(const std::string & dir_in, const std::string & key_in, bool writable_in, std::string & err) {
+bool server_eval_cache::open(const std::string & dir_in, const std::string & key_in, bool writable_in, std::string & err,
+        uint64_t ram_bytes) {
     dir      = dir_in;
     key      = key_in;
     key_hash = server_prompt_disk_hash(key.data(), key.size());
     writable = writable_in;
-    entries.clear();
+    ram_limit_bytes = ram_bytes;
+    std::vector<server_eval_cache_entry>().swap(entries);
     n_skipped = 0;
 
     while (dir.size() > 1 && dir.back() == '/') {
@@ -267,6 +304,22 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
 
     std::error_code ec;
     const std::string index = dir + "/" + EVC_INDEX;
+    auto ram_failure = [&]() {
+        err = "eval cache index exceeds the RAM fit budget; using fresh prefill";
+        dir.clear();
+        std::vector<server_eval_cache_entry>().swap(entries);
+        if (writable) {
+            return false;
+        }
+        LOG_WRN("eval cache: %s\n", err.c_str());
+        err.clear();
+        return true;
+    };
+    const bool bounded = ram_bytes != UINT64_MAX;
+    if (bounded && ram_bytes < 65536 + sizeof(server_eval_cache)) {
+        return ram_failure();
+    }
+    uint64_t remaining = bounded ? ram_bytes - 65536 - sizeof(server_eval_cache) : UINT64_MAX;
 
     if (!fs::exists(index, ec)) {
         if (!writable) {
@@ -288,10 +341,50 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
     }
 
     json j;
+    bool ram_limited = false;
+    auto charge = [&](uint64_t bytes) {
+        if (bounded && bytes > remaining) {
+            ram_limited = true;
+            throw std::length_error("eval cache RAM budget");
+        }
+        if (bounded) {
+            remaining -= bytes;
+        }
+    };
     try {
-        std::ifstream f(index);
-        j = json::parse(f);
+        std::ifstream f(index, std::ios::binary);
+        if (!bounded) {
+            j = json::parse(f);
+        } else {
+            const uint64_t bytes = fs::file_size(index);
+            if (bytes > remaining / 4 || bytes > SIZE_MAX || bytes > uint64_t(std::numeric_limits<std::streamsize>::max())) {
+                return ram_failure();
+            }
+            // Keep a fixed snapshot; reserve lexer strings and transient copies before parsing.
+            charge(4 * bytes);
+            std::string text(size_t(bytes), '\0');
+            if (!f.read(text.data(), std::streamsize(bytes)) || f.peek() != std::char_traits<char>::eof()) {
+                throw std::runtime_error("index changed while reading");
+            }
+            j = json::parse(text, [&](int depth, json::parse_event_t event, json & value) {
+                if (depth > 64) {
+                    ram_limited = true;
+                    throw std::length_error("eval cache index is too deep");
+                }
+                // Cover vector growth, object pairs, allocator headers and parser nodes.
+                charge(256 + 4 * sizeof(json));
+                if ((event == json::parse_event_t::key || event == json::parse_event_t::value) && value.is_string()) {
+                    const size_t n = value.get_ref<const json::string_t &>().size();
+                    charge(n);
+                    charge(n);
+                }
+                return true;
+            });
+        }
     } catch (const std::exception & e) {
+        if (ram_limited) {
+            return ram_failure();
+        }
         err = index + " does not parse: " + e.what();
         dir.clear();
         return false;
@@ -338,6 +431,9 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
 
     if (j.contains("entries") && j["entries"].is_array()) {
         for (const auto & je : j["entries"]) {
+            if (bounded && remaining < 512 + 4 * sizeof(server_eval_cache_entry)) {
+                return ram_failure();
+            }
             server_eval_cache_entry e;
             e.id      = je.value("id", std::string());
             e.has_dft = je.value("has_dft", false);
@@ -345,10 +441,20 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
                 ++n_skipped;
                 continue;
             }
+            const uint64_t entry_bytes = 512 + 4 * sizeof(server_eval_cache_entry) + 2 * uint64_t(e.id.size());
+            if (bounded) {
+                if (entry_bytes > remaining) {
+                    return ram_failure();
+                }
+                remaining -= entry_bytes;
+            }
 
             server_eval_cache_record rec;
             std::string perr;
-            if (!evc_parse(path_hdr(e.id), key_hash, key, false, rec, perr)) {
+            if (!evc_parse(path_hdr(e.id), key_hash, key, false, rec, perr, remaining)) {
+                if (bounded && perr.find("RAM fit budget") != std::string::npos) {
+                    return ram_failure();
+                }
                 LOG_WRN("eval cache: skipping entry %s: %s\n", e.id.c_str(), perr.c_str());
                 ++n_skipped;
                 continue;
@@ -359,6 +465,13 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
                 continue;
             }
             e.tokens = std::move(rec.tokens);
+            if (bounded) {
+                const uint64_t token_bytes = e.tokens.capacity() * sizeof(llama_token);
+                if (token_bytes > remaining) {
+                    return ram_failure();
+                }
+                remaining -= token_bytes;
+            }
             e.bytes  = fs::file_size(path_hdr(e.id), ec) + fs::file_size(path_tgt(e.id), ec) +
                        (e.has_dft ? fs::file_size(path_dft(e.id), ec) : 0);
             entries.push_back(std::move(e));
@@ -372,20 +485,108 @@ bool server_eval_cache::open(const std::string & dir_in, const std::string & key
     return true;
 }
 
-bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
-        const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err) {
+bool server_eval_cache::can_add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
+        size_t spec_bytes, std::string & err, int64_t checkpoint_tokens, uint64_t ram_bytes) const {
     if (!writable) {
         err = "the eval cache is read-only (start the server with --eval-cache-build to add entries)";
         return false;
     }
 
+    const uint64_t budget = std::min(ram_limit_bytes, ram_bytes);
+    if (budget != UINT64_MAX) {
+        const std::string id = entry_id(tokens);
+        uint64_t remaining = budget;
+        auto charge = [&](uint64_t count, uint64_t size) {
+            if (count > remaining / size) {
+                return false;
+            }
+            remaining -= count * size;
+            return true;
+        };
+        // Include save scratch and an upper bound on write_index() text and open() parser events.
+        bool fits = charge(1, 65536 + sizeof(*this)) && charge(dir.capacity(), 1) && charge(key.capacity(), 1) &&
+                charge(entries.capacity(), 4 * sizeof(server_eval_cache_entry)) &&
+                charge(tokens.size(), 2 * sizeof(llama_token)) && charge(id.capacity(), 2) &&
+                charge(512, 4) && charge(key.size(), 24) && charge(32, 256 + 4 * sizeof(json)) &&
+                charge(1, 512) && charge(key.size(), 2);
+        auto charge_entry = [&](const std::string & entry_id, size_t id_capacity, size_t n_tokens) {
+            return charge(256, 4) && charge(entry_id.size(), 24) && charge(16, 256 + 4 * sizeof(json)) &&
+                    charge(1, 128) && charge(entry_id.size(), 2) &&
+                    charge(1, 512 + 4 * sizeof(server_eval_cache_entry)) &&
+                    charge(id_capacity, 2) && charge(n_tokens, sizeof(llama_token));
+        };
+        bool replaced = false;
+        for (const auto & e : entries) {
+            replaced |= e.id == id;
+            const size_t n_tokens = e.id == id ? std::max(e.tokens.capacity(), tokens.size()) : e.tokens.capacity();
+            fits = fits && charge_entry(e.id, e.id.capacity(), n_tokens);
+            if (!fits) {
+                break;
+            }
+        }
+        fits = fits && (replaced || charge_entry(id, id.capacity(), tokens.size())) &&
+                charge(1, sizeof(server_eval_cache_record) + sizeof(evc_reader) + 65536);
+        const uint64_t record_room = remaining;
+        // Startup reads one header at a time while all prior tokens and the JSON tree remain live.
+        fits = fits && charge(1, 4 + 3 * sizeof(uint32_t) + 4 * sizeof(uint64_t) + sizeof(uint8_t)) &&
+                charge(key.size(), 1) && charge(tokens.size(), sizeof(llama_token)) && charge(spec_bytes, 1);
+        for (const auto & c : checkpoints) {
+            if (c.n_tokens <= checkpoint_tokens) {
+                fits = fits && charge(1, sizeof(int64_t) + 2 * sizeof(int32_t) + 3 * sizeof(uint64_t)) &&
+                        charge(c.data_tgt.size(), 1) && charge(c.data_dft.size(), 1) && charge(c.data_spec.size(), 1);
+            }
+            if (!fits) {
+                break;
+            }
+        }
+        for (const auto & e : entries) {
+            if (!fits) {
+                break;
+            }
+            if (e.id != id) {
+                std::error_code ec;
+                const uint64_t bytes = fs::file_size(path_hdr(e.id), ec);
+                fits = !ec && bytes <= record_room;
+            }
+        }
+        if (!fits) {
+            err = "eval cache index growth exceeds the RAM fit budget; entry was not saved";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
+        const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err,
+        int64_t checkpoint_tokens, uint64_t ram_bytes) {
+    if (!can_add(tokens, checkpoints, spec.size(), err, checkpoint_tokens, ram_bytes)) {
+        return false;
+    }
     const std::string id = entry_id(tokens);
     id_out = id;
 
-    evc_buf   w;
+    const std::string file = path_hdr(id);
+    const std::string tmp  = file + ".tmp";
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        err = "cannot write " + tmp;
+        return false;
+    }
+
+    // fork: stream checkpoint payloads so a save does not duplicate the whole header in RAM.
     evc_chain hs;
     auto put = [&](const void * p, size_t n) {
-        w.bytes(p, n);
+        if (!f) {
+            return;
+        }
+        if (n > 0) {
+            f.write(static_cast<const char *>(p), (std::streamsize) n);
+            if (!f) {
+                return;
+            }
+        }
         hs.add(p, n);
     };
     auto put_blob = [&](const std::vector<uint8_t> & v) {
@@ -397,7 +598,8 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
     const uint32_t version = EVAL_CACHE_FORMAT_VERSION;
     const uint32_t klen    = (uint32_t) key.size();
     const uint64_t ntok    = tokens.size();
-    const uint32_t nckpt   = (uint32_t) checkpoints.size();
+    const uint32_t nckpt   = (uint32_t) std::count_if(checkpoints.begin(), checkpoints.end(),
+            [checkpoint_tokens](const common_prompt_checkpoint & c) { return c.n_tokens <= checkpoint_tokens; });
     const uint8_t  hd      = has_dft ? 1 : 0;
 
     put(EVC_MAGIC, 4);
@@ -409,6 +611,9 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
     put(tokens.data(), tokens.size() * sizeof(llama_token));
     put(&nckpt, sizeof(nckpt));
     for (const auto & c : checkpoints) {
+        if (c.n_tokens > checkpoint_tokens) {
+            continue;
+        }
         const int64_t n    = c.n_tokens;
         const int32_t pmin = c.pos_min;
         const int32_t pmax = c.pos_max;
@@ -421,18 +626,11 @@ bool server_eval_cache::add(const llama_tokens & tokens, const std::list<common_
     }
     put_blob(spec);
     put(&hd, sizeof(hd));
-    w.val<uint64_t>(hs.h);
-
-    const std::string file = path_hdr(id);
-    const std::string tmp  = file + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        f.write((const char *) w.b.data(), (std::streamsize) w.b.size());
-        f.close();
-        if (!f) {
-            err = "cannot write " + tmp;
-            return false;
-        }
+    f.write(reinterpret_cast<const char *>(&hs.h), sizeof(hs.h));
+    f.close();
+    if (!f) {
+        err = "cannot write " + tmp;
+        return false;
     }
     std::error_code ec;
     fs::rename(tmp, file, ec);

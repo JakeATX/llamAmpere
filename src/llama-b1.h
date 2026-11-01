@@ -12,11 +12,13 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,8 +45,48 @@ public:
     llama_b1(const llama_model & model, ggml_backend_t backend_gpu);
     ~llama_b1();
 
+    // Only effective host-staging settings override the automatic RAM cap.
+    static bool staging_explicit() {
+        for (const char * name : {"LLAMA_B1_THREADS", "LLAMA_B1_PIECE_MIB"}) {
+            const char * value = std::getenv(name);
+            if (value && *value) { return true; }
+        }
+        const char * stage = std::getenv("LLAMA_B1_STAGE_MIB");
+        return stage && *stage && std::atoll(stage) > 0;
+    }
+
+    static bool staging_floor_unmet(uint64_t available, int workers, size_t piece, size_t alignment, size_t zero) {
+        constexpr uint64_t floor = 5ull << 30;
+        if (available < floor || workers < 1 || workers > 64 || !piece || !alignment ||
+                alignment > (SIZE_MAX - 4096) / 3) { return true; }
+        const size_t padding = 3 * alignment + 4096;
+        if (piece > SIZE_MAX - padding || zero > available - floor) { return true; }
+        return uint64_t(piece + padding) > (available - floor - zero) / size_t(workers) / 3;
+    }
+
+    // fork: staging gets 10% of the 80% spare-RAM budget above 5 GiB.
+    static size_t fit_staging_piece(uint64_t available, int workers, size_t piece, size_t alignment,
+            size_t zero, bool fit, bool explicit_request) {
+        if (!fit || explicit_request) { return piece; }
+        constexpr uint64_t MiB = 1ull << 20;
+        if (available <= (5ull << 30) || workers < 1 || workers > 64 || !alignment || !piece) { return 0; }
+        const uint64_t spare = (available - (5ull << 30)) / MiB;
+        const uint64_t budget = (spare / 5) * 4 + (spare % 5) * 4 / 5;
+        const size_t quota = size_t(std::min<uint64_t>(budget / 10, SIZE_MAX / MiB)) * size_t(MiB);
+        if (zero > quota || alignment > (SIZE_MAX - 4096) / 3) { return 0; }
+        // Two pinned slots and one O_DIRECT bounce per worker; allow padding and page rounding for each.
+        const size_t per_buffer = (quota - zero) / size_t(workers) / 3;
+        const size_t padding = 3 * alignment + 4096;
+        if (per_buffer <= padding) { return 0; }
+        const size_t limit = (per_buffer - padding) / 4096 * 4096;
+        return limit < std::min<size_t>(piece, MiB) ? 0 : std::min(piece, limit);
+    }
+
     bool ok() const { return init_ok; }
     void set_ffn_enabled(bool enabled) { ffn_requested = enabled; }
+    // VRAM the plan must leave free beyond its keep, for scratch measured only after a plan exists (the legacy layer graph)
+    void set_extra_keep(size_t bytes) { extra_keep = bytes; }
+    size_t extra_keep = 0;
     bool ffn_enabled() const { return !ffn_views.empty(); }
     llm_b1_ffn * ffn(size_t ub);
     llm_b1_ffn * ffn_group() { return ffn_all.get(); }
@@ -104,6 +146,10 @@ public:
 
     const llama_b1_stats & stats() const { return st; }
 
+    // views over the parts of the lent VRAM regions that no slot or carry of the current plan uses, largest first,
+    // each at least min_bytes; the layer graph may use them as compute scratch until refill() restores the lent tensors
+    std::vector<ggml_backend_buffer_ptr> spare_views(size_t min_bytes, size_t max_views) const;
+
 private:
     struct exps_tensor {
         ggml_tensor *         t       = nullptr;
@@ -115,12 +161,14 @@ private:
         void *                home_data = nullptr;
         bool                  resident  = false; // home is VRAM
         llama_b1_file_src     src;
+        std::vector<char>     kept; // pageable bytes; never registered with the GPU
     };
 
     struct layer_info {
         std::vector<int> tensors; // indices into exps
         bool   resident = false;  // every exps tensor of the layer is in VRAM
         size_t bytes    = 0;
+        size_t res_bytes = 0;     // the VRAM-resident exps tensors only: what lending this layer frees
     };
 
     // a contiguous VRAM range the plan may place slots and carries in
@@ -192,6 +240,8 @@ private:
     };
     struct piece {
         const char * src_host = nullptr; // memcpy source, or null for pread
+        const char * src_kept = nullptr; // pageable source, always copied through staging
+        size_t alignment = 1;
         int          fd       = -1;
         size_t       src_offs = 0;
         region *     dst      = nullptr;
@@ -205,6 +255,10 @@ private:
     // to the copy stream (no memcpy into a staging buffer, no staging event wait); direct_piece caps those pieces
     bool   direct       = false;
     size_t direct_piece = 64u << 20;
+    // fork AIPNEXTK: LLAMA_B1_BANK_STAGE=1 gathers an arena piece that touches dropped bank-expert bytes into the
+    // worker's pinned staging block (zeros for the dropped bytes) and uploads it with one copy; such pieces then span
+    // experts up to piece_bytes instead of one copy (plus one memset per hole) per expert under the stream lock
+    bool   bank_stage   = false;
     std::vector<std::vector<staging>> stg; // [worker][2]
     ggml_backend_buffer_t zero_buf = nullptr;
     char * zero_data = nullptr;

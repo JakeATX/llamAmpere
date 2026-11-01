@@ -100,7 +100,9 @@ common_arg & common_arg::set_excludes(std::initializer_list<enum llama_example> 
 }
 
 common_arg & common_arg::set_env(const char * env) {
-    help = help + "\n(env: " + env + ")";
+    if (!help.empty()) {
+        help = help + "\n(env: " + env + ")";
+    }
     this->env = env;
     return *this;
 }
@@ -948,8 +950,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
 
                 // arg with single value
-                check_arg(i);
-                std::string val = argv[++i];
+                std::string val;
+                if (opt.value_optional_default && (i + 1 == argc || argv[i + 1][0] == '-')) {
+                    val = opt.value_optional_default;
+                } else {
+                    check_arg(i);
+                    val = argv[++i];
+                }
                 if (opt.handler_int) {
                     opt.handler_int(params, std::stoi(val));
                     continue;
@@ -1076,7 +1083,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 static void common_params_print_usage(common_params_context & ctx_arg) {
     auto print_options = [](std::vector<common_arg *> & options) {
         for (common_arg * opt : options) {
-            printf("%s", opt->to_string().c_str());
+            if (!opt->help.empty()) { printf("%s", opt->to_string().c_str()); }
         }
     };
 
@@ -1138,6 +1145,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
     printf("    opts=\"");
     auto print_options = [](const std::vector<common_arg *> & options) {
         for (const common_arg * opt : options) {
+            if (opt->help.empty()) { continue; }
             for (const char * arg : opt->args) {
                 printf("%s ", arg);
             }
@@ -1342,8 +1350,12 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
         }
         if (opt.value_hint != nullptr) {
             // arg with single value
-            check_arg(i);
-            val = argv[++i];
+            if (opt.value_optional_default && (i + 1 == argc || argv[i + 1][0] == '-')) {
+                val = opt.value_optional_default;
+            } else {
+                check_arg(i);
+                val = argv[++i];
+            }
         }
         if (opt.value_hint_2 != nullptr) {
             // TODO: support arg with 2 values
@@ -1401,6 +1413,13 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             ctx_arg.params = params_org;
             return false;
         }
+        // Detailed settings win over the preset in either argument order.
+        if (params.moe_cache.skip_preset >= 0) {
+            const bool on = params.moe_cache.skip_preset != 0;
+            if (!params.moe_cache.skip_budget_explicit) { params.moe_cache.skip_budget = on ? 0.15f : 0.0f; }
+            if (params.moe_cache.skip_rank_floor < 0) { params.moe_cache.skip_rank_floor = on ? 5 : 0; }
+            if (!on || !params.moe_cache.skip_tail_explicit) { params.moe_cache.skip_tail = 0; }
+        }
         if (ctx_arg.params.usage) {
             common_params_print_usage(ctx_arg);
             if (ctx_arg.print_usage) {
@@ -1415,11 +1434,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
 
         bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        common_speculative_apply_mtp_sampling_default(params);
         const bool any_mtp = adaptive_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-        if (any_mtp && !params.sampling.spec_lossy_explicit) {
-            params.sampling.spec_lossy = true;
-            LOG_INF("FYI: mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling\n");
-        }
         // mb-MTP with no depth flags: adaptive depth 3..5 (as --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3
         // --spec-draft-n-max 5); an explicit --spec-draft-n-max or --spec-draft-n-min-adaptive keeps the user's depth
         if (any_mtp && params.sampling.spec_lossy &&
@@ -1436,7 +1452,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (params.speculative.draft.depth_policy == "cdepth" && !adaptive_mtp) {
             throw std::invalid_argument("error: --spec-depth-policy cdepth needs --spec-type draft-mtp-adaptive");
         }
-
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -1785,12 +1800,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--lookup-cache-dynamic-max-ngrams"}, "N",
-        string_format("maximum number of n-grams kept in the dynamic lookup cache when it is saved, the least useful ones are evicted, 0 = unlimited (default: %d)", params.speculative.ngram_cache.max_ngrams_dynamic),
+        string_format("maximum n-gram keys learned in the live dynamic lookup cache and kept when saving; full caches still update existing keys, saves evict by utility, 0 = unlimited (default: %d)", params.speculative.ngram_cache.max_ngrams_dynamic),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("lookup cache max ngrams must be >= 0");
             }
             params.speculative.ngram_cache.max_ngrams_dynamic = value;
+            params.speculative.ngram_cache.max_ngrams_dynamic_explicit = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -1873,7 +1889,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         "maximum RAM size of the prompt cache in MiB (default: sized from total host RAM: <16 GB 2048, 16 GB 4096, "
-        "32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; "
+        "32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; --fit also reserves 5 GiB and shared RAM headroom; "
         "-1 = half of the free host memory at startup, 0 = disable)"
         "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)",
         [](common_params & params, int value) {
@@ -3358,6 +3374,54 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_keep_map = value;
         }
     ).set_env("LLAMA_ARG_MOE_KEEP_MAP"));
+    common_arg skip_preset(
+        {"--moe-skip"}, "[on|off]",
+        "LOSSY: skip the lightest experts that are not in VRAM (recommended settings). "
+        "Bare flag: budget 0.15, rank floor 5; off disables skipping. Detailed flags override the preset.",
+        [](common_params & params, const std::string & value) {
+            if (value != "on" && value != "off") {
+                throw std::invalid_argument("--moe-skip expects on or off");
+            }
+            params.moe_cache.skip_preset = value == "on" ? 1 : 0;
+        });
+    skip_preset.value_optional_default = "on";
+    add_opt(skip_preset.set_env("LLAMA_ARG_MOE_SKIP"));
+    add_opt(common_arg(
+        {"--moe-skip-tail"}, "N", "", // legacy scripts only; deliberately absent from help
+        [](common_params & params, int value) {
+            if (value < 0 || value > 9) {
+                throw std::invalid_argument("--moe-skip-tail must be in [0, 9]");
+            }
+            params.moe_cache.skip_tail = value;
+            params.moe_cache.skip_tail_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_SKIP_TAIL"));
+    add_opt(common_arg(
+        {"--moe-skip-budget"}, "F",
+        "LOSSY, changes answers: in a single-sequence decode or verify window, leave out the lightest experts that are "
+        "not resident in VRAM while their summed router weight stays at or below F; resident experts are always "
+        "computed and the remaining weights are not renormalized. Prompt processing is never affected. "
+        "0 = off, max 0.25 (default: 0)",
+        [](common_params & params, const std::string & value) {
+            char * end = nullptr;
+            const float budget = std::strtof(value.c_str(), &end);
+            if (end == value.c_str() || *end != 0 || !std::isfinite(budget) || budget < 0.0f || budget > 0.25f) {
+                throw std::invalid_argument("--moe-skip-budget must be a number in [0, 0.25]");
+            }
+            params.moe_cache.skip_budget = budget;
+            params.moe_cache.skip_budget_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_SKIP_BUDGET"));
+    add_opt(common_arg(
+        {"--moe-skip-rank-floor"}, "N",
+        "Protect the first N ranked experts when using a cumulative --moe-skip-budget (0..10, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 10) {
+                throw std::invalid_argument("--moe-skip-rank-floor must be in [0, 10]");
+            }
+            params.moe_cache.skip_rank_floor = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SKIP_RANK_FLOOR"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
         "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
@@ -3490,7 +3554,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
-            "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),
+            "single value is broadcast across all devices; automatic: 300 MiB headless, 800 MiB with a display or unknown display state"),
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 
@@ -3503,13 +3567,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
                 );
             }
-            if (split_arg.size() == 1) {
-                std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), std::stoull(split_arg[0]) * 1024*1024);
+            std::vector<size_t> targets;
+            for (const std::string & part : split_arg) {
+                if (part.empty() || part.find_first_not_of("0123456789") != std::string::npos) {
+                    throw std::invalid_argument("fit target must be a nonnegative whole number of MiB");
+                }
+                const uint64_t mib = std::stoull(part);
+                if (mib > std::min<uint64_t>(SIZE_MAX, INT64_MAX) / (1024 * 1024)) {
+                    throw std::invalid_argument("fit target exceeds the supported size");
+                }
+                targets.push_back(size_t(mib) * 1024 * 1024);
+            }
+            if (targets.size() == 1) {
+                std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), targets[0]);
+                params.fit_params_target_explicit = true;
                 return;
             }
-            for (size_t i = 0; i < split_arg.size(); i++) {
-                params.fit_params_target[i] = std::stoull(split_arg[i]) * 1024*1024;
+            for (size_t i = 0; i < targets.size(); i++) {
+                params.fit_params_target[i] = targets[i];
             }
+            params.fit_params_target_explicit = true;
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
     add_opt(common_arg(
@@ -4158,6 +4235,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.timeout_write = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TIMEOUT"));
+    add_opt(common_arg(
+        {"--loop-guard-reps"}, "N",
+        string_format("stop repeated output after N repeats (0 = disabled, default: %d); bulk repetitive data: send loop_guard:false or start with --loop-guard-reps 0", params.loop_guard_reps),
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("loop guard repeats must be non-negative"); }
+            params.loop_guard_reps = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--loop-guard-span"}, "N",
+        string_format("stop repeated output after N tokens with at least four repeats (default: %d)", params.loop_guard_span),
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("loop guard span must be positive"); }
+            params.loop_guard_span = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--sse-ping-interval"}, "N",
         string_format("server SSE ping interval in seconds (-1 = disabled, default: %d)", params.sse_ping_interval),

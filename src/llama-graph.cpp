@@ -472,6 +472,37 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
         data[i] = m->s_copy((int) i);
     }
 
+    if (s_copy_conv != nullptr && s_copy_conv->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_conv->buffer));
+        int32_t *     conv = (int32_t *) s_copy_conv->data;
+        const int64_t off  = (int64_t) m->get_replay_len() * m->get_size();
+        for (int64_t i = 0; i < n_rs; ++i) {
+            conv[i] = (int32_t) (data[i] + off);
+        }
+    }
+    if (replay_w != nullptr && replay_w->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(replay_w->buffer));
+        float *        w = (float *) replay_w->data;
+        const uint32_t K = m->get_n_rs_seq();
+        const uint32_t r = m->get_replay_len();
+        const uint32_t S = m->get_ckpt_span();
+        GGML_ASSERT(r <= S && S <= K && (int64_t) K == replay_w->ne[0]);
+        // need_base: replay the accepted prefix from the checkpoint; else the replay base is the
+        // state row itself and every slot is masked (the replay then returns it bit-exact)
+        const bool need_base = r > 0 || m->get_s_stale();
+        for (uint32_t j = 0; j < K; ++j) {
+            w[j] = need_base && j < S - r ? 1.0f : 0.0f;
+        }
+        if (s_copy_pair != nullptr && s_copy_pair->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_pair->buffer));
+            int32_t *     pair   = (int32_t *) s_copy_pair->data;
+            const int64_t n_main = s_copy_pair_main->ne[0];
+            for (int64_t i = 0; i < n_rs; ++i) {
+                pair[i] = (int32_t) (data[i] + (need_base && i < n_main ? (int64_t) m->get_size() : 0));
+            }
+        }
+    }
+
     set_input_shift(m);
 }
 
@@ -499,6 +530,8 @@ void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * 
     // write puts back what is there. Those planes stay stale and uncredited: rs_valid after the ubatch is
     // at most rs_valid - r_s + n <= n + K - 1 - r_s. In replay mode s_copy carries no rollback group
     // (rs_idx stays 0, plane0 = replay_len) and the lanes agree, so every lane moves snap_shift groups.
+    // replay mode reads the pending rollback's plane through the indices (the gather's view starts at plane 0)
+    const int64_t plane0 = m->get_gdn_replay() ? (int64_t) m->get_replay_len() * mem_size : 0;
     const int64_t n_seqs = s_copy_shift->ne[0] / snap_shift;
     for (int64_t s = 0; s < n_seqs; ++s) {
         uint32_t n_move = snap_shift;
@@ -509,10 +542,26 @@ void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * 
         }
         for (uint32_t j = 0; j < snap_shift; ++j) {
             data[j * n_seqs + s] = j < n_move
-                ? (int32_t) (j * (int64_t) mem_size + main[s])
+                ? (int32_t) (plane0 + j * (int64_t) mem_size + main[s])
                 : (int32_t) ((int64_t) (n + j) * mem_size + head + s);
         }
     }
+}
+
+bool llm_graph_input_rs::replay_reusable(const llama_memory_recurrent_context * m, const llama_ubatch & ubatch) {
+    const uint32_t r = m->get_replay_len();
+    const uint32_t S = m->get_ckpt_span();
+    const bool     z = m->get_s_stale();
+    if (replay_w == nullptr) {
+        return replay_len == r && ckpt_span == S && s_stale == z;
+    }
+    // same graph for every pending rollback; set_input() hands the new span back to the memory
+    const uint32_t n = ubatch.n_seqs > 0 ? ubatch.n_tokens / ubatch.n_seqs : 0;
+    replay_len = r;
+    ckpt_span  = S;
+    s_stale    = z;
+    span_new   = llama_memory_recurrent::replay_span_new(S, r, n, m->get_n_rs_seq());
+    return llama_memory_recurrent::replay_static_width(n, m->get_n_rs_seq());
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -530,10 +579,9 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= rs_z == mctx->get_rs_z();
 
     // DRC phase 2: a nonzero (or changed) replay length needs a differently-shaped extra
-    // reconstruction node in the graph, so it can't be satisfied by reusing existing topology.
-    res &= replay_len == mctx->get_replay_len();
-    res &= ckpt_span  == mctx->get_ckpt_span();
-    res &= s_stale    == mctx->get_s_stale();
+    // reconstruction node in the graph, so it can't be satisfied by reusing existing topology --
+    // except in the static verify graph (replay_w), where it is data.
+    res &= replay_reusable(mctx, params.ubatch);
     res &= snap_shift == mctx->get_snap_shift();
     res &= n_written  == mctx->get_n_written();
     res &= n_older    == mctx->get_n_older();
@@ -1346,9 +1394,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
-    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
-    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
-    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->replay_reusable(mctx->get_recr(), params.ubatch);
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
     res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
     res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
@@ -1389,9 +1435,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
-    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
-    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
-    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->replay_reusable(mctx->get_recr(), params.ubatch);
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
     res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
     res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
@@ -1477,9 +1521,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     // DRC phase 2: same guard as llm_graph_input_rs::can_reuse -- a changed replay length means a
     // differently-shaped reconstruction subtree, which reused topology cannot express.
-    res &= inp_rs->replay_len == mctx->get_recr()->get_replay_len();
-    res &= inp_rs->ckpt_span  == mctx->get_recr()->get_ckpt_span();
-    res &= inp_rs->s_stale    == mctx->get_recr()->get_s_stale();
+    res &= inp_rs->replay_reusable(mctx->get_recr(), params.ubatch);
     res &= inp_rs->snap_shift == mctx->get_recr()->get_snap_shift();
     res &= inp_rs->n_written  == mctx->get_recr()->get_n_written();
     res &= inp_rs->n_older    == mctx->get_recr()->get_n_older();
@@ -2359,6 +2401,12 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// fork: CPU fallback is exact; lossy weight policies require device residency tables.
+static void moe_skipmass_cpu(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor *, int ith, int, void *) {
+    GGML_ASSERT(!getenv("GGML_MOE_SKIP_POLICY") || strcmp(getenv("GGML_MOE_SKIP_POLICY"), "rank") == 0);
+    if (ith == 0) { memcpy(dst->data, a->data, ggml_nbytes(a)); }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2566,11 +2614,134 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    if (moe_weights_override != nullptr) {
+        // inner call of the hot/cold split below: the routing weights were already masked
+        weights = moe_weights_override;
+        moe_weights_override = nullptr;
+    } else if ((getenv("GGML_MOE_SKIP_POLICY") || getenv("GGML_MOE_SKIP_TRACE")) &&
+            norm_w && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX && n_expert == 512 &&
+            il < 48 && ubatch.n_seqs == 1 && n_expert_used == 10 && n_tokens > 0 && n_tokens <= 8) {
+        weights = ggml_map_custom2(ctx0, weights, selected_experts, moe_skipmass_cpu, 1, nullptr);
+        // fork: explicit graph output keeps adjusted weights alive until the final expert sum.
+        ggml_format_name(weights, "moe_skipmass-%d", il);
+    }
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // warmup routes every expert (n_expert_used == n_expert): too many for the bank's filler slots, so it
+    // runs on the cold bank alone, which holds every expert
+    if (moe_hot.hot_map != nullptr && moe_hot.down->ne[2] < 2*n_expert_used) {
+        moe_hot = {};
+    }
+    if (moe_hot.hot_map != nullptr) {
+        // split the selected experts between the hot bank and the cold bank; each bank runs on all
+        // n_expert_used columns with the weights of the other bank's experts set to zero
+        const moe_hot_bank hot = moe_hot;
+        moe_hot = {};
+        // [B1] layer-major prompt: the routing phase runs the hot call here (the hot bank is on the card) and records
+        // the cold weights, hot slots zeroed, for the whole-prompt cold GEMMs; their zero-weight rows are skipped.
+        const bool b1_routing = res->get_b1_ffn_phase() == 1 && res->get_b1_ffn() != nullptr;
+        GGML_ASSERT(!weight_before_ffn);
+
+        // the maps hold one row per expert; look them up with the flattened expert ids
+        ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens, 1);
+        ggml_tensor * slot = ggml_reshape_3d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.hot_map, 1, n_expert), sel_flat), 1, n_expert_used, n_tokens);
+        cb(slot, "ffn_moe_hot_slot", il);
+        ggml_tensor * mask  = ggml_step(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 0.5f)); // 1 = hot, 0 = cold
+        ggml_tensor * w_hot  = ggml_mul(ctx0, weights, mask);
+        ggml_tensor * w_cold = ggml_sub(ctx0, weights, w_hot);
+        cb(w_hot,  "ffn_moe_weights_hot",  il);
+        cb(w_cold, "ffn_moe_weights_cold", il);
+
+        // mul_mat_id needs every expert at most once per token, so the masked (cold) slots of the hot call
+        // get distinct filler slots that the token does not use: one-hot the token's hot slots over the
+        // bank, then take the n_expert_used least-used bank slots (argsort puts the used ones last)
+        const int64_t n_hot = hot.down->ne[2];
+        // AI+ banks: the masked slots get id -1, which the AI+ MUL_MAT_ID skips (zero output, CUDA and CPU), so the hot
+        // call computes only the token's hot pairs instead of n_expert_used pairs with fillers. LLAMA_MOE_HOT_FILLER=1
+        // keeps the filler slots (an A/B control; the outputs are identical because the filler weights are zero).
+        static const bool hot_filler = getenv("LLAMA_MOE_HOT_FILLER") != nullptr && atoi(getenv("LLAMA_MOE_HOT_FILLER")) != 0;
+        const bool hot_skip = !hot_filler && ggml_ai4_rate(hot.up->type) != 0 && ggml_ai4_rate(hot.gate->type) != 0 &&
+                              ggml_ai4_rate(hot.down->type) != 0 &&
+                              !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) == 1); // dbg 1 runs the cold bank
+        ggml_tensor * hot_ids = nullptr;
+        if (hot_skip) {
+            // (slot + 1) * mask - 1: the bank slot where hot, -1 where cold
+            ggml_tensor * hot_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 1.0f), mask), 1.0f, -1.0f);
+            hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, hot_f, n_expert_used, n_tokens), GGML_TYPE_I32);
+        } else {
+            ggml_tensor * bank_pos = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_hot, 1.0f), n_hot, 1, 1),
+                    n_hot, n_expert_used, n_tokens, 1);
+            ggml_tensor * onehot = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, bank_pos, slot)), -1.0f, 0.5f)); // [n_hot, n_expert_used, n_tokens]
+            ggml_tensor * used   = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, onehot, 1, 0, 2, 3)));               // [1, n_hot, n_tokens]
+            ggml_tensor * filler = ggml_argsort_top_k(ctx0, ggml_scale(ctx0, ggml_reshape_2d(ctx0, used, n_hot, n_tokens), -1.0f), n_expert_used); // [n_expert_used, n_tokens]
+            ggml_tensor * fill_f = ggml_reshape_3d(ctx0, ggml_cast(ctx0, ggml_cont(ctx0, filler), GGML_TYPE_F32), 1, n_expert_used, n_tokens);
+            ggml_tensor * hot_f  = ggml_add(ctx0, ggml_mul(ctx0, slot, mask), ggml_sub(ctx0, fill_f, ggml_mul(ctx0, fill_f, mask)));
+            hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, hot_f, n_expert_used, n_tokens), GGML_TYPE_I32);
+        }
+        cb(hot_ids, "ffn_moe_hot_ids", il);
+        // the cold bank keeps all n_expert experts, so the routed ids stay unique there; the hot experts
+        // run with zero weight in the cold call
+        GGML_ASSERT(down_exps == nullptr || down_exps->ne[2] == n_expert);
+        ggml_tensor * cold_ids = selected_experts;
+
+        static const int hot_dbg = getenv("GGML_MOE_HOT_DBG") ? atoi(getenv("GGML_MOE_HOT_DBG")) : 0;
+        static const bool joint_enabled = [] {
+            const char * value = getenv("LLAMA_MOE_BANK_JOINT_REDUCE");
+            return value && atoi(value) != 0;
+        }();
+        const bool joint_reduce = joint_enabled && !b1_routing && hot_skip && hot_dbg == 0 &&
+                n_tokens <= 8 && n_expert_used == hparams.n_expert_used(il);
+        GGML_ASSERT(!moe_defer_reduce);
+        moe_defer_reduce = joint_reduce;
+        moe_weights_override = w_hot;
+        moe_b1_bypass = b1_routing;
+        ggml_tensor * out_hot = hot_dbg == 1 ?
+            build_moe_ffn(cur, gate_inp, nullptr,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, selected_experts) :
+            build_moe_ffn(cur, gate_inp, nullptr,
+                hot.up, nullptr, hot.gate, nullptr, hot.down, nullptr, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, nullptr, nullptr, nullptr, nullptr, nullptr, hot_ids);
+        moe_b1_bypass = false;
+        if (hot_dbg == 2) {
+            out_hot = ggml_scale(ctx0, out_hot, 0.0f);
+            w_cold  = weights;
+        }
+        moe_weights_override = w_cold;
+        ggml_tensor * out_cold = build_moe_ffn(cur, gate_inp, nullptr,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, cold_ids);
+        GGML_ASSERT(moe_weights_override == nullptr);
+        moe_defer_reduce = false;
+        if (joint_reduce) {
+            // fork: keep both expert slabs live until one weighted reduction consumes them.
+            ggml_build_forward_expand(gf, out_hot);
+            ggml_build_forward_expand(gf, out_cold);
+            ggml_tensor * hot_weighted = ggml_mul(ctx0, out_hot, w_hot);
+            ggml_tensor * cold_weighted = ggml_mul(ctx0, out_cold, w_cold);
+            ggml_tensor * joined = ggml_add(ctx0, hot_weighted, cold_weighted);
+            ggml_tensor * summed = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, joined, 1, 0, 2, 3)));
+            ggml_tensor * moe_out = ggml_reshape_2d(ctx0, summed, n_embd, n_tokens);
+            cb(moe_out, "ffn_moe_out", il);
+            return moe_out;
+        }
+        if (b1_routing) {
+            GGML_ASSERT(out_cold == nullptr);
+            return out_hot; // added to the shared expert output that seeds the whole-prompt accumulator
+        }
+        ggml_tensor * moe_out = ggml_add(ctx0, out_hot, out_cold);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
     const auto * b1_ffn = res->get_b1_ffn();
-    if (res->get_b1_ffn_phase() == 1 && b1_ffn) {
+    if (res->get_b1_ffn_phase() == 1 && b1_ffn && !moe_b1_bypass) {
         GGML_ASSERT(selected_experts->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, b1_ffn->ids));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens), b1_ffn->weights));
@@ -2757,6 +2928,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
+    if (moe_defer_reduce) {
+        GGML_ASSERT(!weight_before_ffn);
+        return experts;
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
@@ -2773,10 +2949,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Use the per-layer n_expert_used (not the ubatch one) so the graph stays
     // bounded during warmup. ref: https://github.com/ggml-org/llama.cpp/pull/14753
     const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+    static const bool small_reduce = [] {
+        const char * value = getenv("LLAMA_MOE_SMALL_REDUCE");
+        return !value || atoi(value) != 0;
+    }();
+    // Small verify batches avoid one add launch per expert. Keep warmup's wider routing unchanged.
+    const bool reduce_verify = small_reduce && n_tokens <= 8 && n_expert_used_il == n_expert_used;
     ggml_tensor * moe_out;
     if (n_expert_used_il == 1) {
         moe_out = ggml_cont(ctx0, ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], 0));
-    } else if (n_tokens == 1) {
+    } else if (n_tokens == 1 || reduce_verify) {
         ggml_tensor * experts_pe = ggml_cont(ctx0, ggml_permute(ctx0, experts, 1, 0, 2, 3));
         ggml_tensor * summed     = ggml_sum_rows(ctx0, experts_pe); // [1, n_embd, 1]
         moe_out = ggml_reshape_2d(ctx0, summed, n_embd, n_tokens);
@@ -3323,6 +3505,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (fa_sel_rows != nullptr) {
+            cur->src[8] = fa_sel_rows;
+            fa_sel_rows = nullptr;
+        }
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
@@ -3333,7 +3519,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // the attended position count: the mask width, or n_kv for the packed mask (op_params[0] of the input;
             // a row view's op_params hold its offset, so read the source tensor's)
             const ggml_tensor * kq_mask_src = kq_mask && kq_mask->view_src ? kq_mask->view_src : kq_mask;
-            const int64_t n_kv_pad = kq_mask && kq_mask->type == GGML_TYPE_I32 ? kq_mask_src->op_params[0] :
+            // (a packed mask built in the graph, LLAMA_QSA_ROWS_MASK, has no n_kv there: every bit of a row counts)
+            const int64_t n_kv_packed = kq_mask && kq_mask->type == GGML_TYPE_I32 && kq_mask_src->op == GGML_OP_NONE ?
+                                        kq_mask_src->op_params[0] : 0;
+            const int64_t n_kv_pad = kq_mask && kq_mask->type == GGML_TYPE_I32 ?
+                                     (n_kv_packed > 0 ? n_kv_packed : kq_mask->ne[0]*32) :
                                      kq_mask ? kq_mask->ne[0] : 0;
             GGML_ASSERT(kq_mask && n_kv_pad > 0 && n_kv_pad % 64 == 0);
             cur->src[7] = sj_kvarn_pending.selected;
@@ -4547,6 +4737,23 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_copy_shift);
     }
 
+    // --gdn-replay: a ubatch that fills the ring (or, opt-in, a short verify round) takes the
+    // rollback-independent graph (see replay_w)
+    if (mctx_cur->get_gdn_replay() && n_seqs > 0 &&
+            llama_memory_recurrent::replay_static_width(ubatch.n_tokens / n_seqs, mctx_cur->get_n_rs_seq())) {
+        inp->s_copy_conv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_conv);
+        ggml_set_name(inp->s_copy_conv, "rs_s_copy_conv");
+        inp->s_copy_conv_main = ggml_view_1d(ctx0, inp->s_copy_conv, n_seqs, 0);
+        inp->s_copy_pair = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_pair);
+        ggml_set_name(inp->s_copy_pair, "rs_s_copy_pair");
+        inp->s_copy_pair_main = ggml_view_1d(ctx0, inp->s_copy_pair, n_seqs, 0);
+        inp->replay_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t) mctx_cur->get_n_rs_seq());
+        ggml_set_input(inp->replay_w);
+        ggml_set_name(inp->replay_w, "rs_replay_w");
+    }
+
     // [TAG_RECURRENT_ROLLBACK_RING]
     inp->n_written = mctx_cur->get_n_written();
     inp->n_older   = mctx_cur->get_n_older();
@@ -4600,8 +4807,18 @@ ggml_tensor * llm_graph_context::build_rs(
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
     ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+    ggml_tensor * copy_main  = inp->s_copy_main;
 
-    ggml_tensor * out = build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
+    // --gdn-replay verify graph: the GDN state (plane 0 of the state/checkpoint pair) is gathered
+    // through s_copy_pair, so the ubatch's rows are the replay base (see llm_graph_input_rs)
+    if (inp->s_copy_pair != nullptr && older == nullptr && s->view_src != nullptr && s->view_offs == 0 &&
+            s->view_src->ne[1] == 2 * s->ne[1] && strncmp(s->view_src->name, "cache_s2_l", 10) == 0) {
+        s          = s->view_src;
+        state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy_pair;
+        copy_main  = inp->s_copy_pair_main;
+    }
+
+    ggml_tensor * out = build_rs(s, state_copy, copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
 
@@ -4610,6 +4827,19 @@ ggml_tensor * llm_graph_context::build_rs(
     }
 
     return out;
+}
+
+ggml_tensor * llm_graph_context::build_rs_conv(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    if (inp->s_copy_conv == nullptr) {
+        return build_rs(inp, s, state_size, n_seqs);
+    }
+    const auto * kv_state = inp->mctx;
+    return build_rs(s, inp->s_copy_conv, inp->s_copy_conv_main, state_size, n_seqs,
+                    kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z());
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

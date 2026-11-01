@@ -12,6 +12,19 @@
 #include "mmvq-iq4xs-wide.cuh"
 #endif
 
+// fork AIPNEXTK BANKSKIP: the shared all-zero block that the MoE cache tables point at for the always-resident bank
+// experts (moe-cache.cu; the bank call computes those experts). The filtered hit/miss kernels return early for such
+// routes and write their own zeros instead of multiplying zeros. Null: off. The address is a
+// host-side value per device, passed to the kernels as an argument (a device global failed with "invalid device
+// symbol" once the expert pool held the card).
+static const void * g_moe_bank_zero_host[GGML_CUDA_MAX_DEVICES] = {};
+void ggml_cuda_moe_set_bank_zero(const void * zero) {
+    g_moe_bank_zero_host[ggml_cuda_get_device()] = zero;
+}
+static const void * moe_bank_zero_cur() {
+    return g_moe_bank_zero_host[ggml_cuda_get_device()];
+}
+
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
@@ -1595,7 +1608,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const float up_min, const float up_max, const float gate_min, const float gate_max,
         const void * const * expert_table, const void * const * gate_table, const bool rank_major,
-        const uint8_t * route_hot, const int route_want_hot) {
+        const uint8_t * route_hot, const int route_want_hot, const void * bank_zero) {
     // [VFLOOR] rank_major (GGML_MOE_MMV_RANK_MAJOR=1): the grid is (ranks, row blocks) instead of (row blocks, ranks),
     // so the blocks of every rank for one row block run together and tokens that share an expert read its rows from L2.
     // Every output keeps the same arithmetic (bit-identical); only the block order changes.
@@ -1664,6 +1677,12 @@ static __global__ void mul_mat_vec_q_moe(
         // route_want_hot; the complementary pass computes the rest. Every route runs exactly once, in
         // the same code with the same inputs, so the results are bit-identical.
         if (!shared_expert && (route_hot[channel_x] != 0) != (route_want_hot != 0)) {
+            return;
+        }
+        if (!shared_expert && expert_table && bank_zero && expert_table[channel_x] == bank_zero) {
+            if (threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+                dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+            }
             return;
         }
     }
@@ -1956,7 +1975,8 @@ static void mul_mat_vec_q_moe_launch(
         vx, vy, ids, act_ids, gate_ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table, rank_major, route_hot, route_want_hot);
+        ncols_dst, ids_stride, up_min, up_max, gate_min, gate_max, expert_table, gate_table, rank_major, route_hot, route_want_hot,
+        moe_bank_zero_cur());
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -2039,6 +2059,23 @@ static __device__ __forceinline__ void moe_d1_rows(
     }
 }
 
+// fork: skipped bank routes own the same output rows as the computed routes.
+template <int rows_per_block>
+static __device__ __forceinline__ void moe_bank_zero_routes(uint64_t mask, float * dst,
+        int nrows, int n_ids, int stride_col, int stride_channel) {
+    const int thread = threadIdx.y*blockDim.x + threadIdx.x;
+    for (int i = thread; i < rows_per_block; i += blockDim.x*blockDim.y) {
+        const int row = blockIdx.x*rows_per_block + i;
+        if (row >= nrows) { continue; }
+        uint64_t left = mask;
+        while (left) {
+            const int route = __ffsll((long long) left) - 1;
+            left &= left - 1;
+            dst[(route % n_ids)*stride_channel + (route / n_ids)*stride_col + row] = 0.0f;
+        }
+    }
+}
+
 // Grid: (row tiles, n_ids*n_tokens routes in token-major order). Every warp reads the route list itself (at most 64
 // routes, two per lane) and ballots for the routes that share this block's expert; only the block of the expert's
 // first route works, so no shared memory and no block barrier are needed. Members run in token order, c_group at a
@@ -2051,7 +2088,7 @@ static __global__ void mul_mat_vec_q_moe_d1(
         const int ncols_x, const int nrows_x, const int stride_row_x, const int act_channels,
         const int stride_col_y, const int stride_channel_y, const int stride_col_dst, const int stride_channel_dst,
         const int n_ids, const int n_tokens, const int ids_stride,
-        const uint8_t * route_hot, const int route_want_hot) {
+        const uint8_t * route_hot, const int route_want_hot, const void * bank_zero) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     const int routes = n_ids*n_tokens;
     const int q = blockIdx.y;
@@ -2069,6 +2106,10 @@ static __global__ void mul_mat_vec_q_moe_d1(
     if (route_hot != nullptr) {
         // the residency flag belongs to the expert, so the plain kernel filters all of its routes the same way
         if ((route_hot[me] != 0) != (route_want_hot != 0)) {
+            return;
+        }
+        if (bank_zero && table[me] == bank_zero) {
+            moe_bank_zero_routes<c_warps*c_rows>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
             return;
         }
     }
@@ -2136,7 +2177,8 @@ static void moe_d1_launch(const void * const * table, const char * act_q8, const
             dim3(32, c_warps), 0, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q_moe_d1<type, c_warps, c_rows, c_group, c_smem>, params, table, (const block_q8_1 *) act_q8,
             ids, dst, (int) n_in, (int) n_out, stride_row_x, (int) channels, (int) channels*s11, s11,
-            (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride, route_hot, route_want_hot);
+            (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride, route_hot, route_want_hot,
+            moe_bank_zero_cur());
 }
 
 // [MOEGAP DOWNSW] Sub-warp rows for the expert down projection (GGML_MOE_DOWN_SW). Its rows are short (the
@@ -2243,7 +2285,7 @@ static __global__ void mul_mat_vec_q_moe_sw(
         const int ncols_x, const int nrows_x, const int stride_row_x, const int act_channels,
         const int stride_col_y, const int stride_channel_y, const int stride_col_dst, const int stride_channel_dst,
         const int n_ids, const int n_tokens, const int ids_stride,
-        const uint8_t * route_hot, const int route_want_hot) {
+        const uint8_t * route_hot, const int route_want_hot, const void * bank_zero) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int rows_per_warp = (32/c_lanes)*c_rows;
     const int routes = n_ids*n_tokens;
@@ -2260,6 +2302,10 @@ static __global__ void mul_mat_vec_q_moe_sw(
         return;
     }
     if (route_hot != nullptr && (route_hot[me] != 0) != (route_want_hot != 0)) {
+        return;
+    }
+    if (route_hot != nullptr && bank_zero && table[me] == bank_zero) {
+        moe_bank_zero_routes<c_warps*rows_per_warp>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
         return;
     }
     const int wrow0 = (blockIdx.x*c_warps + threadIdx.y)*rows_per_warp;
@@ -2314,7 +2360,7 @@ static void moe_sw_launch(const void * const * table, const char * act_q8, const
     ggml_cuda_kernel_launch(mul_mat_vec_q_moe_sw<type, c_warps, c_lanes, c_rows, c_group>, params, table,
             (const block_q8_1 *) act_q8, ids, dst, (int) n_in, (int) n_out, stride_row_x, (int) channels,
             (int) channels*s11, s11, (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride,
-            route_hot, route_want_hot);
+            route_hot, route_want_hot, moe_bank_zero_cur());
 }
 
 // [MOEGAP HITG] Fused gate + up + SwiGLU form of the decode-once kernel (GGML_MOE_HIT_FUSED). Both
@@ -2390,7 +2436,7 @@ static __global__ void mul_mat_vec_q_moe_hitg(
         float * dst, const int ncols_x, const int nrows_x, const int stride_row_x, const int act_channels,
         const int stride_col_y, const int stride_channel_y, const int stride_col_dst, const int stride_channel_dst,
         const int n_ids, const int n_tokens, const int ids_stride,
-        const uint8_t * m0, const uint8_t * m1, const int want) {
+        const uint8_t * m0, const uint8_t * m1, const int want, const void * bank_zero) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     const int routes = n_ids*n_tokens;
     const int q = blockIdx.y;
@@ -2406,6 +2452,10 @@ static __global__ void mul_mat_vec_q_moe_hitg(
         return;
     }
     if (((m0[me] != 0) && (m1[me] != 0)) != (want != 0)) {
+        return;
+    }
+    if (bank_zero && up_table[me] == bank_zero && gate_table[me] == bank_zero) {
+        moe_bank_zero_routes<c_warps*c_rows>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
         return;
     }
     constexpr bool use_smem = c_smem && ggml_cuda_mmvq_smem_grid_type(type);
@@ -2594,7 +2644,7 @@ static __global__ void mul_mat_vec_q_moe_hitg_sw(
         float * dst, const int ncols_x, const int nrows_x, const int stride_row_x, const int act_channels,
         const int stride_col_y, const int stride_channel_y, const int stride_col_dst, const int stride_channel_dst,
         const int n_ids, const int n_tokens, const int ids_stride,
-        const uint8_t * m0, const uint8_t * m1, const int want) {
+        const uint8_t * m0, const uint8_t * m1, const int want, const void * bank_zero) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int rows_per_warp = (32/c_lanes)*c_rows;
     const int routes = n_ids*n_tokens;
@@ -2611,6 +2661,10 @@ static __global__ void mul_mat_vec_q_moe_hitg_sw(
         return;
     }
     if (((m0[me] != 0) && (m1[me] != 0)) != (want != 0)) {
+        return;
+    }
+    if (bank_zero && up_table[me] == bank_zero && gate_table[me] == bank_zero) {
+        moe_bank_zero_routes<c_warps*rows_per_warp>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
         return;
     }
     // [MOEGAP HITGSW s] codebook copy in shared memory, as mul_mat_vec_q_moe_hitg (block-uniform point: every
@@ -2680,7 +2734,7 @@ static void moe_hitg_sw_launch(const void * const * up_table, const void * const
             dim3(32, c_warps), 0, stream);
 #define MOE_HITG_SW_KARGS up_table, gate_table, (const block_q8_1 *) act_q8, ids, dst, (int) n_in, (int) n_out, \
         stride_row_x, (int) channels, (int) channels*s11, s11, (int) (n_ids*n_out), (int) n_out, (int) n_ids, \
-        (int) n_tokens, (int) ids_stride, m0, m1, want
+        (int) n_tokens, (int) ids_stride, m0, m1, want, moe_bank_zero_cur()
     if (n_in == 10*ggml_cuda_type_traits<type>::qk) {   // Flash-Next gate/up: K = 2560, 10 blocks per row
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe_hitg_sw<type, c_warps, c_lanes, c_rows, c_group, 10, c_smem>, params, MOE_HITG_SW_KARGS);
     } else {
@@ -2701,7 +2755,7 @@ static void moe_hitg_launch(const void * const * up_table, const void * const * 
     ggml_cuda_kernel_launch(mul_mat_vec_q_moe_hitg<type, c_warps, c_rows, c_group, c_smem>, params, up_table, gate_table,
             (const block_q8_1 *) act_q8, ids, dst, (int) n_in, (int) n_out, stride_row_x, (int) channels,
             (int) channels*s11, s11, (int) (n_ids*n_out), (int) n_out, (int) n_ids, (int) n_tokens, (int) ids_stride,
-            m0, m1, want);
+            m0, m1, want, moe_bank_zero_cur());
 }
 
 // check mode: dst must equal silu(gate) * up of the plain kernel on every route of the pass

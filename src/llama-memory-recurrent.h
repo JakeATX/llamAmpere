@@ -143,8 +143,16 @@ public:
 
     // gdn_replay: the span the ring holds behind the checkpoint after a ubatch of n_seq_tokens
     // tokens per seq -- the accepted prefix (ckpt_span - replay_len) plus the new tokens, capped
-    // at the ring capacity. The graph input and replay_split::advance() both use it.
+    // at the ring capacity. The graph input and replay_split::advance() both use it. A short ubatch
+    // on the static graph (replay_static_width, n < n_rs_seq) re-bases the checkpoint to its start,
+    // so the ring then holds just its n_seq_tokens tokens.
     static uint32_t replay_span_new(uint32_t ckpt_span, uint32_t replay_len, uint32_t n_seq_tokens, uint32_t n_rs_seq);
+
+    // gdn_replay: whether a ubatch of n_seq_tokens tokens per seq takes the rollback-independent verify
+    // graph (llm_graph_input_rs::replay_w): n >= n_rs_seq (LLAMA_GDN_REPLAY_STATIC=0 turns it off), and,
+    // opt-in with LLAMA_GDN_REPLAY_SHORT=1, the short verify rounds 2 <= n < n_rs_seq of a drafter that
+    // stopped early. Graph and bookkeeping must agree, so both ask here.
+    static bool replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq);
 
     // [TAG_GDN_REPLAY_SPLIT] the replay subtree of a ubatch is built from one (replay_len,
     // ckpt_span, s_stale) -- see llama_memory_recurrent_context::get_replay_len() -- so seqs that
@@ -303,6 +311,7 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_ingr_l(int32_t il) const;    // nullptr unless mem->gdn_replay
+    bool          get_gdn_replay() const;            // mem->gdn_replay and not a full-state context
     ggml_tensor * get_s_ckpt_l(int32_t il) const;  // nullptr unless mem->gdn_replay
     ggml_tensor * get_p_l(int32_t il) const;
 
@@ -380,6 +389,9 @@ private:
         int32_t  rs_z = -1;
         std::vector<llama_memory_recurrent::mem_cell> cells;
         std::vector<uint32_t> rs_idx; // pending rollback group per sequence, as the normal order's ubatch sees it
+        std::vector<uint32_t> replay_len; // gdn_replay bookkeeping per sequence, as the normal order's ubatch sees it
+        std::vector<uint32_t> ckpt_span;
+        std::vector<uint8_t>  s_stale;
     };
     std::vector<b1_view> b1_views;
 };

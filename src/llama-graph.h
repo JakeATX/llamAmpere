@@ -351,9 +351,25 @@ public:
     ggml_tensor * rs_old_src = nullptr; // I32 [n_older]: older-group rows to carry for seqs whose data moves cells
     ggml_tensor * rs_old_dst = nullptr; // I32 [n_older]
 
+    // --gdn-replay, ubatches of n >= n_rs_seq tokens (every speculative verify): the pending rollback
+    // is data, not topology, so one graph serves every round. s_copy_conv = s_copy + replay_len *
+    // mem_size picks the conv history group; replay_w = K slot weights (1 for the accepted prefix
+    // [0, ckpt_span - replay_len) when the logical state needs the replay, else all 0). s_copy_pair
+    // gathers the replay base from the state/checkpoint pair tensor: the checkpoint row (plane 1)
+    // when the logical state needs the replay, else the state row. nullptr otherwise.
+    ggml_tensor * s_copy_conv      = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_conv_main = nullptr; // I32 [n_seqs] view
+    ggml_tensor * s_copy_pair      = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_pair_main = nullptr; // I32 [n_seqs] view
+    ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq]
+
     // fill every rs input (s_copy and the shift or ring tensors) from the memory context; exactly
     // once per ubatch -- both fills consume the pending rollback
     void fill_s_copy(const llama_memory_recurrent_context * m);
+
+    // can_reuse's replay check: the replay fields must match unless replay_w makes them data (then
+    // they and span_new are refreshed from the new context)
+    bool replay_reusable(const llama_memory_recurrent_context * m, const llama_ubatch & ubatch);
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1266,9 +1282,24 @@ struct llm_graph_context {
         const std::vector<uint32_t> * n_kv_streams = nullptr; // multi-stream: per-stream n_kv (see llm_graph_input_attn_kv)
         ggml_tensor * wush_ao = nullptr; // EXPERIMENTAL WUSH-KV: output transform replacing the inverse Hadamard
     } sj_kvarn_pending;
+    // QSA prompt (LLAMA_QSA_DIRECT_LISTS): final selected-cell rows [n_sel, n_tokens] for the next flash attention node's
+    // src[8], so the CUDA sparse path builds its per-tile cell lists from them instead of scanning the n_kv-wide mask
+    mutable ggml_tensor * fa_sel_rows = nullptr;
     // multi-stream SJ-KVaRN: per-stream mask views cut to the stream's own n_kv are not contiguous when the ubatch
     // has more than one token row, and FA needs a contiguous mask; the contiguous copies are made once per graph
     // (the mask is shared by every layer)
+    // hot-expert bank of the next build_moe_ffn call (set by the model, consumed by the call):
+    // the selected experts are split between an always-resident hot bank and the regular (cold) bank
+    struct moe_hot_bank {
+        ggml_tensor * up       = nullptr;
+        ggml_tensor * gate     = nullptr;
+        ggml_tensor * down     = nullptr;
+        ggml_tensor * hot_map  = nullptr; // F32 [n_expert]: hot slot or -1
+    };
+    mutable moe_hot_bank  moe_hot;
+    mutable ggml_tensor * moe_weights_override = nullptr;
+    mutable bool          moe_defer_reduce     = false;
+    mutable bool          moe_b1_bypass        = false; // [B1] hot bank call inside the routing phase: compute it now
     mutable ggml_tensor * sj_kvarn_mask_src = nullptr;
     mutable std::vector<ggml_tensor *> sj_kvarn_mask_s;
 
@@ -1639,6 +1670,14 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+
+    // the conv history gather: build_rs, except that under --gdn-replay's static verify graph the rows
+    // come from the pending rollback's group (inp->s_copy_conv)
+    ggml_tensor * build_rs_conv(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

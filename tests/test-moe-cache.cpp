@@ -1,3 +1,4 @@
+#include "../ggml/src/ggml-moe-skipmass.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -12,6 +13,7 @@
 #include "../ggml/src/ggml-cuda/moe-cache.cuh"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -3698,7 +3700,8 @@ static bool run_prompt_warm(
 #endif
     const uint64_t * missing_counts[] = {nullptr};
     ok &= api.warm(session, &descriptor, missing_counts, 1) == 0;
-    ok &= api.warm(session, &descriptor, counts, 1) == 2;
+    const bool whole = strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu->device)), "CUDA") == 0;
+    ok &= api.warm(session, &descriptor, counts, 1) == (whole ? descriptor.n_expert : 2);
     const std::string warm_log = capture.get();
     ok &= warm_log.find("hits=") == std::string::npos &&
         warm_log.find("cpu-overlap calibration:") == std::string::npos;
@@ -3893,6 +3896,51 @@ static bool run_profile_whole_return(ggml_backend_t gpu, ggml_backend_t cpu,
         transition_ok &= log.find("whole-only warm refused:") == std::string::npos;
     }
     if (reader) { api.session_destroy(reader); }
+    const char * old_pool = getenv("GGML_MOE_CACHE_POOL_PLAN");
+    const bool had_pool = old_pool != nullptr;
+    const std::string saved_pool = old_pool ? old_pool : "";
+    const std::string pool_path = path + ".pool";
+    std::vector<uint8_t> pool_data;
+    for (uint64_t value : {UINT64_C(0x314c4f4f50454f4d), UINT64_C(2), (uint64_t)types[0],
+            (uint64_t)whole_desc[0].expert_size, UINT64_C(128), (uint64_t)types[2],
+            (uint64_t)whole_desc[2].expert_size, UINT64_C(64)}) {
+        for (int shift = 0; shift < 64; shift += 8) { pool_data.push_back((uint8_t)(value >> shift)); }
+    }
+    FILE * pool_file = fopen(pool_path.c_str(), "wb");
+    bool pool_ok = pool_file != nullptr;
+    if (pool_file) {
+        pool_ok &= fwrite(pool_data.data(), 1, pool_data.size(), pool_file) == pool_data.size();
+        pool_ok &= fclose(pool_file) == 0;
+    }
+    set_env("GGML_MOE_CACHE_POOL_PLAN", pool_path.c_str());
+    reader = pool_ok ? create_direct_session(gpu, cpu) : nullptr;
+    pool_ok &= reader != nullptr;
+    if (reader) {
+        capture.clear();
+        pool_ok &= api.warm(reader, whole_desc, nullptr, 3) == 192;
+        pool_ok &= capture.get().find("pool plan loaded:") != std::string::npos;
+        for (int pass = 0; pass < 2; ++pass) {
+            pool_ok &= api.trim(reader, 1u << 20) >= 1u << 20;
+            capture.clear();
+            api.restore(reader);
+            pool_ok &= max_field_value(capture.get(), "expert_slots=") == 192;
+            pool_ok &= api.warm(reader, whole_desc, whole_counts, 3) >= 0;
+            api.session_enter(reader);
+            for (const auto & desc : whole_desc) {
+                pool_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                        n_in, n_out, desc.type, n_expert, 0) == 1;
+                pool_ok &= direct_plan_one(desc.name, desc.data, desc.expert_size,
+                        n_in, n_out, desc.type, n_expert, 64) == 0;
+            }
+            api.session_leave(reader);
+        }
+        api.session_destroy(reader);
+    }
+    set_env("GGML_MOE_CACHE_POOL_PLAN", had_pool ? saved_pool.c_str() : nullptr);
+    remove(pool_path.c_str());
+    printf("cache-pool-plan-return: %s\n", pool_ok ? "OK" : "FAIL");
+    if (!pool_ok) { fprintf(stderr, "%s", capture.get().c_str()); }
+    transition_ok &= pool_ok;
 #ifdef GGML_CUDA
     // A compute allocation made during the prompt loan is outside the cache
     // grant. Rebuild must use physical headroom, without starving a late pool.
@@ -3961,6 +4009,7 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
     if (!api.warm || !api.trim) {
         return false;
     }
+    const bool whole = strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu->device)), "CUDA") == 0;
     configure_cache(nullptr);
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
     set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
@@ -4108,7 +4157,7 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         bool blend_ok = reader != nullptr;
         if (reader) {
             capture.clear();
-            const bool profile_wins = strcmp(blend, "75") == 0 || strcmp(blend, "100") == 0;
+            const bool profile_wins = whole || strcmp(blend, "75") == 0 || strcmp(blend, "100") == 0;
             blend_ok &= api.warm(reader, &loaded, prompt_counts, 1) == (profile_wins ? 0 : 1);
             const std::string warm_log = capture.get();
             blend_ok &= warm_log.find("profile loaded:") != std::string::npos;
@@ -4212,7 +4261,7 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         ok &= write_file(extended) && rejected(loaded);
         ok &= write_file(original);
     }
-    // Unobserved first-layer experts precede a hot later layer at startup.
+    // Whole-expert plans rank the hot later layer before unused first-layer entries.
     ggml_moe_cache_tensor_desc layers[] = {descriptor, descriptor};
     layers[0].name = "blk.0.ffn_up_exps.weight";
     layers[0].n_expert = 64;
@@ -4225,7 +4274,7 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", path.c_str());
     void * writer = create_direct_session(gpu, cpu);
     if (writer) {
-        ok &= api.warm(writer, layers, layer_counts, 2) == 1;
+        ok &= api.warm(writer, layers, layer_counts, 2) == (whole ? 64 : 1);
         api.session_destroy(writer);
     } else { ok = false; }
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
@@ -4236,10 +4285,10 @@ static bool run_profile_persistence(ggml_backend_t gpu, ggml_backend_t cpu, log_
         api.session_enter(reader);
         for (int32_t e : {0, 63}) {
             ok &= direct_plan_one(layers[0].name, layers[0].data, expert_bytes,
-                    shape_in, shape_out, GGML_TYPE_Q4_0, 64, e) == 1;
+                    shape_in, shape_out, GGML_TYPE_Q4_0, 64, e) == (whole && e == 63 ? 0 : 1);
         }
         ok &= direct_plan_one(layers[1].name, layers[1].data, expert_bytes,
-                shape_in, shape_out, GGML_TYPE_Q4_0, 1, 0) == 0;
+                shape_in, shape_out, GGML_TYPE_Q4_0, 1, 0) == (whole ? 1 : 0);
         api.session_leave(reader);
         api.session_destroy(reader);
     } else { ok = false; }
@@ -4314,7 +4363,7 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
 #if defined(__linux__) && defined(GGML_CUDA)
     const char * directory = getenv("GGML_MOE_CACHE_TEST_TMPDIR");
     if (!directory || !active_api().warm || !active_api().device_prepare) {
-        fprintf(stderr, "cache-profile-swap-prior: missing temporary directory or device API\n");
+        printf("cache-profile-swap-prior: FAIL (missing temporary directory or device API)\n");
         return false;
     }
     struct saved_environment {
@@ -4335,7 +4384,9 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
                     "GGML_MOE_CACHE_PROFILE_GLOBAL", "GGML_MOE_CACHE_PROFILE_PRIOR_PCT",
                     "GGML_MOE_CACHE_PROFILE_PRIOR_DECAY", "GGML_MOE_CACHE_SWAP",
                     "GGML_MOE_CACHE_SWAP_INTERVAL", "GGML_MOE_CACHE_SWAP_DECAY_PCT",
-                    "GGML_MOE_CACHE_SWAP_MARGIN"}) {
+                    "GGML_MOE_CACHE_SWAP_MARGIN", "GGML_MOE_CACHE_SWAP_MARGIN_MILLI",
+                    "GGML_MOE_CACHE_SWAP_DECAY_AFTER", "GGML_MOE_CACHE_SWAP_MAX", "GGML_MOE_CACHE_SWAP_MB",
+                    "GGML_MOE_CACHE_SWAP_HYST_PCT", "GGML_MOE_CACHE_WHOLE_ONLY"}) {
                 const char * value = getenv(name);
                 entries.push_back({name, value != nullptr, value ? value : ""});
             }
@@ -4347,7 +4398,8 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
         }
     } saved;
     configure_cache(nullptr, "8");
-    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "24");
+    set_env("GGML_MOE_CACHE_WHOLE_ONLY", "1");
     set_env("GGML_MOE_CACHE_PROFILE_LOAD", nullptr);
     set_env("GGML_MOE_CACHE_PROFILE_BLEND_PCT", "0");
     set_env("GGML_MOE_CACHE_PROFILE_GLOBAL", nullptr);
@@ -4358,50 +4410,82 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
     std::vector<char> filename(pattern.begin(), pattern.end());
     filename.push_back('\0');
     const int fd = mkstemp(filename.data());
-    if (fd < 0) { return false; }
+    if (fd < 0) {
+        std::perror("cache-profile-swap-prior: create profile");
+        printf("cache-profile-swap-prior: FAIL (create profile)\n");
+        return false;
+    }
     close(fd);
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", filename.data());
 
-    constexpr int64_t width = 1024, rows = 206, experts = 65;
+    constexpr int tensors = 6;
+    constexpr int64_t width = 1024, rows = 256, experts = 65;
     ggml_init_params params = {8 * ggml_tensor_overhead(), nullptr, true};
     ggml_context * ctx = ggml_init(params);
     ggml_context * inputs = ggml_init(params);
-    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, width, rows, experts);
-    ggml_set_name(weights, "blk.7.ffn_up_exps.weight");
+    if (!ctx || !inputs) {
+        printf("cache-profile-swap-prior: FAIL (tensor contexts)\n");
+        ggml_free(inputs);
+        ggml_free(ctx);
+        unlink(filename.data());
+        return false;
+    }
+    ggml_tensor * weights[tensors];
+    ggml_moe_cache_tensor_desc descriptors[tensors];
+    const char * roles[] = {"up", "gate", "down"};
+    for (int t = 0; t < tensors; ++t) {
+        weights[t] = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, width, rows, experts);
+        ggml_format_name(weights[t], "blk.%d.ffn_%s_exps.weight", 7 + t / 3, roles[t % 3]);
+    }
     auto * acts = ggml_new_tensor_3d(inputs, GGML_TYPE_F32, width, 1, 1);
-    auto * ids = ggml_new_tensor_2d(inputs, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * ids[] = {ggml_new_tensor_2d(inputs, GGML_TYPE_I32, 2, 1),
+        ggml_new_tensor_2d(inputs, GGML_TYPE_I32, 2, 1)};
     auto buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
     auto input_buffer = ggml_backend_alloc_ctx_tensors(inputs, cpu);
     bool ok = buffer && input_buffer;
+    const char * setup_stage = "CPU tensor allocation";
     if (ok) {
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::vector<float> values(width * rows * experts);
         for (size_t i = 0; i < values.size(); ++i) {
             values[i] = 0.2f * std::sin((float)(i % 10007) * 0.013f);
         }
-        std::vector<uint8_t> quantized(ggml_nbytes(weights));
+        setup_stage = "weight quantization";
+        std::vector<uint8_t> quantized(ggml_nbytes(weights[0]));
         ok &= ggml_quantize_chunk(GGML_TYPE_Q4_0, values.data(), quantized.data(),
                 0, rows * experts, width, nullptr) == quantized.size();
-        ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
+        for (int t = 0; t < tensors; ++t) {
+            ggml_backend_tensor_set(weights[t], quantized.data(), 0, quantized.size());
+            descriptors[t] = {weights[t]->name, weights[t]->data, weights[t]->nb[2],
+                width, rows, experts, GGML_TYPE_Q4_0};
+        }
         values.resize(width);
         ggml_backend_tensor_set(acts, values.data(), 0, width * sizeof(float));
     }
     // Swap victims need exact mapped fallback sources, including initially hot experts.
-    const bool registered = ok && cudaHostRegister(weights->data, ggml_nbytes(weights),
-            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    if (ok) { setup_stage = "CUDA host registration"; }
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    const bool registered = ok && pin && unpin && pin(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer));
     ok &= registered;
     if (!registered) { (void)cudaGetLastError(); }
-    const ggml_moe_cache_tensor_desc descriptor = {weights->name, weights->data,
-        weights->nb[2], width, rows, experts, GGML_TYPE_Q4_0};
-    std::vector<uint64_t> profile(experts, 0), prompt(experts, 1000);
-    profile[64] = 1000000;
-    prompt[64] = 0;
-    const uint64_t * profile_counts[] = {profile.data()};
-    const uint64_t * prompt_counts[] = {prompt.data()};
+    // Raw saved counts keep layer 7's experts and layer 8's expert 0 resident.
+    // Per-table normalization gives cold layer 8 expert 64 a 1/3 prior rate.
+    std::vector<uint64_t> profile[] = {std::vector<uint64_t>(experts, 1000000), std::vector<uint64_t>(experts, 0)};
+    profile[0][64] = 0;
+    profile[1][0] = 1800000;
+    profile[1][64] = 900000;
+    const uint64_t * profile_counts[tensors];
+    for (int t = 0; t < tensors; ++t) { profile_counts[t] = profile[t / 3].data(); }
+    if (ok) { setup_stage = "profile session creation"; }
     void * writer = ok ? create_direct_session(gpu, cpu) : nullptr;
     ok &= writer != nullptr;
     if (writer) {
-        ok &= active_api().warm(writer, &descriptor, profile_counts, 1) == 1;
+        setup_stage = "profile warm";
+        const int queued = active_api().warm(writer, descriptors, profile_counts, tensors);
+        ok &= queued > 0;
+        printf("cache-profile-swap-prior writer queued=%d: %s\n", queued, queued > 0 ? "OK" : "FAIL");
         active_api().session_destroy(writer);
     }
     set_env("GGML_MOE_CACHE_PROFILE_SAVE", nullptr);
@@ -4413,67 +4497,106 @@ static bool run_profile_swap_prior(ggml_backend_t gpu, ggml_backend_t cpu, log_c
     set_env("GGML_MOE_CACHE_SWAP_INTERVAL", "1");
     set_env("GGML_MOE_CACHE_SWAP_DECAY_PCT", "95");
     set_env("GGML_MOE_CACHE_SWAP_MARGIN", "2");
-    std::vector<std::vector<float>> control_outputs(2);
-    for (int mode = 0; mode < 4 && ok; ++mode) {
-        const int prior_pct = mode == 0 ? 0 : mode == 3 ? 200 : 100;
-        set_env("GGML_MOE_CACHE_PROFILE_PRIOR_PCT", mode == 0 ? "0" : mode == 3 ? "200" : "100");
+    set_env("GGML_MOE_CACHE_SWAP_MARGIN_MILLI", nullptr);
+    set_env("GGML_MOE_CACHE_SWAP_DECAY_AFTER", "0");
+    set_env("GGML_MOE_CACHE_SWAP_MAX", "3");
+    set_env("GGML_MOE_CACHE_SWAP_MB", "2");
+    set_env("GGML_MOE_CACHE_SWAP_HYST_PCT", "10");
+    printf("cache-profile-swap-prior setup: %s\n", ok ? "OK" : "FAIL");
+    if (!ok) { fprintf(stderr, "cache-profile-swap-prior failed at %s\n%s", setup_stage, capture.get().c_str()); }
+    const bool setup_ok = ok;
+    std::vector<std::vector<float>> control_outputs(2 * tensors);
+    for (int mode = 0; mode < 4; ++mode) {
+        const int prior_pct = mode == 0 ? 0 : mode == 3 ? 400 : 100;
+        set_env("GGML_MOE_CACHE_PROFILE_PRIOR_PCT", mode == 0 ? "0" : mode == 3 ? "400" : "100");
         set_env("GGML_MOE_CACHE_PROFILE_PRIOR_DECAY", mode == 2 ? "1" : nullptr);
         // A nondecaying empirical score needs finite first-snapshot scaling.
-        // 200% makes its initial two routes exceed the admission margin.
+        // 400% x 1/3 x two routes exceeds the whole-bundle admission margin.
         set_env("GGML_MOE_CACHE_SWAP_DECAY_PCT", mode == 3 ? "100" : "95");
+        if (!setup_ok) {
+            printf("cache-profile-swap-prior pct=%d mode=%s counter_decay=%d: FAIL (setup)\n", prior_pct,
+                    mode == 2 ? "decaying-seed" : "persistent", mode == 3 ? 100 : 95);
+            continue;
+        }
         capture.clear();
-        test_graph reference = make_graph(cpu, weights, acts, ids);
-        test_graph candidate = make_graph(gpu, weights, acts, ids);
+        test_graph reference[tensors];
+        auto * graph_ctx = ggml_init({8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+        auto * graph = graph_ctx ? ggml_new_graph(graph_ctx) : nullptr;
+        ggml_tensor * outputs[tensors];
+        bool case_ok = graph != nullptr;
+        for (int t = 0; t < tensors && graph; ++t) {
+            reference[t] = make_graph(cpu, weights[t], acts, ids[t / 3]);
+            case_ok &= reference[t].buffer != nullptr;
+            outputs[t] = ggml_mul_mat_id(graph_ctx, weights[t], acts, ids[t / 3]);
+            ggml_build_forward_expand(graph, outputs[t]);
+        }
         ggml_backend_t backends[] = {gpu, cpu};
         auto scheduler = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
-        bool case_ok = scheduler && reference.buffer && candidate.buffer;
+        case_ok &= scheduler != nullptr;
         if (case_ok) {
-            case_ok &= ggml_backend_sched_moe_cache_warm(scheduler, &descriptor, prompt_counts, 1) >= 0;
-            case_ok &= ggml_backend_sched_moe_cache_device_prepare(scheduler, &descriptor, 1) == 1;
-            case_ok &= ggml_backend_sched_alloc_graph(scheduler, candidate.graph);
+            case_ok &= ggml_backend_sched_moe_cache_warm(scheduler, descriptors, profile_counts, tensors) >= 0;
+            case_ok &= ggml_backend_sched_moe_cache_device_prepare(scheduler, descriptors, tensors) == 1;
+            case_ok &= ggml_backend_sched_alloc_graph(scheduler, graph);
             for (int phase = 0; phase < 2 && case_ok; ++phase) {
-                const int32_t route[] = {phase == 0 ? 0 : 64, phase == 0 ? 0 : 64};
-                ggml_backend_tensor_set(ids, route, 0, sizeof(route));
-                case_ok &= ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS;
-                std::vector<float> expected(ggml_nelements(reference.out)), actual(expected.size()), first;
-                ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
+                for (int layer = 0; layer < 2; ++layer) {
+                    const int32_t expert = phase == 1 && layer == 1 ? 64 : 0;
+                    const int32_t route[] = {expert, expert};
+                    ggml_backend_tensor_set(ids[layer], route, 0, sizeof(route));
+                }
+                std::vector<float> expected[tensors], actual[tensors], first[tensors];
+                for (int t = 0; t < tensors; ++t) {
+                    case_ok &= ggml_backend_graph_compute(cpu, reference[t].graph) == GGML_STATUS_SUCCESS;
+                    expected[t].resize(ggml_nelements(reference[t].out));
+                    actual[t].resize(expected[t].size());
+                    ggml_backend_tensor_get(reference[t].out, expected[t].data(), 0, expected[t].size() * sizeof(float));
+                }
                 for (int replay = 0; replay < (phase == 0 ? 16 : 1) && case_ok; ++replay) {
-                    case_ok &= ggml_backend_sched_graph_compute(scheduler, candidate.graph) == GGML_STATUS_SUCCESS;
-                    ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
-                    case_ok &= compare_output(expected, actual, 5e-4);
-                    if (replay == 0) { first = actual; }
-                    else { case_ok &= actual == first; }
-                    // Drain private swap/readback streams deterministically before the next decision.
+                    case_ok &= ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS;
+                    for (int t = 0; t < tensors; ++t) {
+                        ggml_backend_tensor_get(outputs[t], actual[t].data(), 0, actual[t].size() * sizeof(float));
+                        case_ok &= compare_output(expected[t], actual[t], 5e-4);
+                        if (replay == 0) { first[t] = actual[t]; }
+                        else { case_ok &= actual[t] == first[t]; }
+                    }
+                    // Drain private swap/readback streams before the next decision.
                     case_ok &= cudaDeviceSynchronize() == cudaSuccess;
                 }
-                if (mode == 0) { control_outputs[phase] = actual; }
-                else { case_ok &= actual == control_outputs[phase]; }
+                for (int t = 0; t < tensors; ++t) {
+                    if (mode == 0) { control_outputs[phase * tensors + t] = actual[t]; }
+                    else { case_ok &= actual[t] == control_outputs[phase * tensors + t]; }
+                }
             }
         }
         if (scheduler) { ggml_backend_sched_free(scheduler); }
         const std::string log = capture.get();
         case_ok &= log.find("newly_uncovered_bytes=0") != std::string::npos;
-        // Final teardown counters include the sole probe of the never-routed
-        // profile expert. Default cannot promote it before that first probe.
-        case_ok &= max_field_value(log, "dispatches=") == 17;
-        case_ok &= max_field_value(log, "misses=") == (mode == 0 ? 2 : 0);
-        case_ok &= max_field_value(log, "hits=") == (mode == 0 ? 32 : 34);
-        case_ok &= mode == 0 ? max_field_value(log, " swaps=") == 0 : max_field_value(log, " swaps=") >= 1;
+        case_ok &= log.find("whole swap initial:") != std::string::npos && log.find("partial=0") != std::string::npos;
+        case_ok &= log.find("whole-only swaps disabled:") == std::string::npos;
+        // Only layer 8's last probe is cold without a prior. Layer 7 stays hot.
+        // Two final routes cannot pass the no-prior admission margin of two.
+        case_ok &= max_field_value(log, "dispatches=") == 17 * tensors;
+        case_ok &= max_field_value(log, "misses=") == (mode == 0 ? tensors : 0);
+        case_ok &= max_field_value(log, "hits=") == (mode == 0 ? 33 : 34) * tensors;
+        case_ok &= mode == 0 ? max_field_value(log, " swaps=") == 0 : max_field_value(log, " swaps=") >= 3;
         case_ok &= mode == 0 ? log.find("swap profile prior:") == std::string::npos :
             log.find(mode == 2 ? "mode=decaying-seed" : "mode=persistent") != std::string::npos;
+        printf("cache-profile-swap-prior counters pct=%d dispatches=%lld hits=%lld misses=%lld swaps=%lld\n",
+                prior_pct, max_field_value(log, "dispatches="), max_field_value(log, "hits="),
+                max_field_value(log, "misses="), max_field_value(log, " swaps="));
         printf("cache-profile-swap-prior pct=%d mode=%s counter_decay=%d: %s\n", prior_pct,
                 mode == 2 ? "decaying-seed" : "persistent", mode == 3 ? 100 : 95, case_ok ? "OK" : "FAIL");
         if (!case_ok) { fprintf(stderr, "%s", log.c_str()); }
         ok &= case_ok;
-        free_graph(candidate);
-        free_graph(reference);
+        for (auto & r : reference) { free_graph(r); }
+        ggml_free(graph_ctx);
     }
-    if (registered) { ok &= cudaHostUnregister(weights->data) == cudaSuccess; }
+    if (registered) { unpin(ggml_backend_buffer_get_base(buffer)); }
     ggml_backend_buffer_free(input_buffer);
     ggml_backend_buffer_free(buffer);
     ggml_free(inputs);
     ggml_free(ctx);
     unlink(filename.data());
+    printf("cache-profile-swap-prior: %s\n", ok ? "OK" : "FAIL");
     return ok;
 #else
     (void) gpu; (void) cpu; (void) capture;
@@ -4505,7 +4628,7 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
                     "GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE",
                     "GGML_MOE_CACHE_PROFILE_SAVE", "GGML_MOE_CACHE_PROFILE_LOAD", "GGML_MOE_CACHE_PROFILE_GLOBAL",
                     "GGML_MOE_CACHE_PROFILE_PRIOR_PCT", "GGML_MOE_CACHE_SWAP", "GGML_MOE_CACHE_SWAP_WHOLE",
-                    "GGML_MOE_CACHE_SWAP_LAYER", "GGML_MOE_CACHE_SWAP_MAX", "GGML_MOE_CACHE_SWAP_MB",
+                    "GGML_MOE_CACHE_SWAP_TOP_ONLY", "GGML_MOE_CACHE_SWAP_FREE_PROBE", "GGML_MOE_CACHE_SWAP_COLD_PRUNE", "GGML_MOE_CACHE_SWAP_LAYER", "GGML_MOE_CACHE_SWAP_MAX", "GGML_MOE_CACHE_SWAP_MB",
                     "GGML_MOE_CACHE_SWAP_INTERVAL", "GGML_MOE_CACHE_SWAP_DECAY_PCT",
                     "GGML_MOE_CACHE_SWAP_DECAY_AFTER", "GGML_MOE_CACHE_SWAP_HYST_PCT",
                     "GGML_MOE_CACHE_SWAP_MARGIN_MILLI"}) {
@@ -4561,18 +4684,19 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         ggml_backend_tensor_set(weights[t], quantized.data(), 0, quantized.size());
         values.resize(n_in);
         ggml_backend_tensor_set(acts[t], values.data(), 0, n_in * sizeof(float));
-        const int32_t routes[] = {t < 3 ? 0 : 32, t < 3 ? 0 : 32};
+        const int32_t routes[] = {t < 3 ? 0 : 32, t < 3 ? 0 : 31};
         ggml_backend_tensor_set(ids[t], routes, 0, sizeof(routes));
         desc[t] = {weights[t]->name, weights[t]->data, weights[t]->nb[2], n_in, n_out, experts, GGML_TYPE_Q4_0};
     }
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
     if (ok) {
         setup_stage = "CUDA host registration";
-        const cudaError_t error = cudaHostRegister(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer),
-                cudaHostRegisterPortable | cudaHostRegisterMapped);
-        registered = error == cudaSuccess;
+        registered = pin && unpin && pin(ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer));
         ok &= registered;
         if (!registered) {
-            fprintf(stderr, "cache-swap-whole: host registration failed: %s\n", cudaGetErrorString(error));
+            fprintf(stderr, "cache-swap-whole: tracked host registration failed\n");
             (void) cudaGetLastError();
         }
     }
@@ -4612,10 +4736,16 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
     if (!ok) {
         fprintf(stderr, "cache-swap-whole setup incompatible=%d failed at %s\n%s", incompatible, setup_stage, capture.get().c_str());
     }
-    for (int mode = 0; mode < (incompatible ? 2 : 6) && ok; ++mode) {
+    std::vector<std::array<long long, 4>> decisions;
+    const int n_modes = incompatible ? 2 : 7;
+    for (int run = 0; run < 8 * n_modes && ok; ++run) {
+        const int variant = run / n_modes, mode = run % n_modes;
+        set_env("GGML_MOE_CACHE_SWAP_TOP_ONLY", variant & 1 ? "1" : "0");
+        set_env("GGML_MOE_CACHE_SWAP_FREE_PROBE", variant & 2 ? "1" : "0");
+        set_env("GGML_MOE_CACHE_SWAP_COLD_PRUNE", variant & 4 ? "1" : "0");
         set_env("GGML_MOE_CACHE_SWAP", mode == 0 ? "0" : "1");
         set_env("GGML_MOE_CACHE_SWAP_WHOLE", "1");
-        set_env("GGML_MOE_CACHE_SWAP_MAX", mode == 2 ? "2" : "3");
+        set_env("GGML_MOE_CACHE_SWAP_MAX", mode == 6 ? "256" : mode == 2 ? "2" : "3");
         set_env("GGML_MOE_CACHE_SWAP_MB", mode == 3 ? "1" : "2");
         set_env("GGML_MOE_CACHE_SWAP_LAYER", mode == 4 ? "1" : "0");
         desc[5].name = mode == 5 ? "blk.1.ffn_unknown_exps.weight" : weights[5]->name;
@@ -4653,7 +4783,8 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
         const std::string log = capture.get();
         const long long swaps = max_field_value(log, " swaps=");
         if (mode == 0) { case_ok &= swaps <= 0; }
-        else if (mode != 5) { case_ok &= mode == 1 && !incompatible ? swaps == 3 : swaps == 0; }
+        // Layer 1 routes two cold experts (32, 31): both get admitted whole, 3 projections each.
+        else if (mode != 5) { case_ok &= (mode == 1 || mode == 6) && !incompatible ? swaps == 6 : swaps == 0; }
         if (mode != 0 && mode != 5) {
             case_ok &= log.find("whole swap initial:") != std::string::npos;
             case_ok &= log.find("partial=0") != std::string::npos;
@@ -4664,16 +4795,19 @@ static bool run_swap_whole(ggml_backend_t gpu, ggml_backend_t cpu, log_capture &
             case_ok &= log.find("device tables active:") == std::string::npos;
             case_ok &= swaps <= 0;
         }
-        if (mode == 1 && !incompatible) {
+        if ((mode == 1 || mode == 6) && !incompatible) {
             case_ok &= max_field_value(log, "evictions=") >= 3;
             case_ok &= max_field_value(log, "hits=") > max_field_value(log, "misses=");
         }
-        printf("cache-swap-whole incompatible=%d mode=%d: %s\n", incompatible, mode, case_ok ? "OK" : "FAIL");
+        const std::array<long long, 4> decision = {swaps, max_field_value(log, "evictions="), max_field_value(log, "pairs="), max_field_value(log, "candidates=")};
+        if (variant == 0) { decisions.push_back(decision); }
+        else { case_ok &= decision == decisions[mode]; }
+        printf("cache-swap-whole incompatible=%d mode=%d top_only=%d free_probe=%d cold_prune=%d: %s\n", incompatible, mode, variant & 1, (variant >> 1) & 1, (variant >> 2) & 1, case_ok ? "OK" : "FAIL");
         if (!case_ok) { fprintf(stderr, "%s", log.c_str()); }
         ok &= case_ok;
         ggml_free(graph_ctx);
     }
-    if (registered) { ok &= cudaHostUnregister(ggml_backend_buffer_get_base(buffer)) == cudaSuccess; }
+    if (registered) { unpin(ggml_backend_buffer_get_base(buffer)); }
     if (buffer) { ggml_backend_buffer_free(buffer); }
     ggml_free(ctx);
     unlink(filename.data());
@@ -4752,9 +4886,9 @@ static bool run_prefetch_router(ggml_backend_t gpu, ggml_backend_t cpu) {
 
 // Exercise actual copies, selected publication, retirement, and same-graph reuse.
 static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
-        ggml_tensor * weights, log_capture & capture, bool device_mode, ggml_tensor * gate_weights = nullptr) {
+        ggml_tensor * weights, log_capture & capture, bool device_mode, ggml_tensor * gate_weights = nullptr,
+        ggml_tensor * const * whole_banks = nullptr) {
     configure_cache(nullptr, "8");
-    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "16");
     set_env("GGML_MOE_CACHE_DEVICE", device_mode ? "1" : nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", device_mode ? "1" : nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_FUSED", gate_weights ? "1" : nullptr);
@@ -4769,19 +4903,56 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         return false;
     }
     api.prefetch_configure(session, 1);
-    ggml_moe_cache_tensor_desc descriptors[2] = {};
-    const int banks = gate_weights ? 2 : 1;
+    // Whole-expert warm needs all three banks and at least 64 complete experts.
+    // Expand the tiny source fixture so the 4 MiB plan leaves the last expert cold.
+    const char * names[] = {"blk.1.ffn_up_exps.weight", "blk.1.ffn_gate_exps.weight", "blk.1.ffn_down_exps.weight"};
+    ggml_tensor expanded[3];
+    ggml_tensor * described[3];
+    ggml_backend_buffer_t expanded_buffer = nullptr;
+    if (whole_banks) {
+        std::copy(whole_banks, whole_banks + 3, described);
+    } else {
+        const size_t bytes = ggml_row_size(weights->type, weights->ne[0]) * weights->ne[1];
+        const int64_t experts = 512;
+        expanded_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 3 * experts * bytes);
+        if (!expanded_buffer) {
+            api.session_destroy(session);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(expanded_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        auto * data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(expanded_buffer));
+        for (int bank = 0; bank < 3; ++bank) {
+            const auto * source = bank == 1 && gate_weights ? gate_weights : weights;
+            expanded[bank] = *source;
+            ggml_set_name(&expanded[bank], names[bank]);
+            expanded[bank].buffer = expanded_buffer;
+            expanded[bank].data = data + bank * experts * bytes;
+            expanded[bank].ne[2] = experts;
+            expanded[bank].nb[2] = bytes;
+            expanded[bank].nb[3] = bytes * experts;
+            for (int64_t e = 0; e < experts; ++e) {
+                memcpy(static_cast<uint8_t *>(expanded[bank].data) + e * bytes,
+                        static_cast<const uint8_t *>(source->data) + (e % source->ne[2]) * source->nb[2], bytes);
+            }
+            described[bank] = &expanded[bank];
+        }
+    }
+    weights = described[0];
+    if (gate_weights) { gate_weights = described[1]; }
+    ggml_moe_cache_tensor_desc descriptors[3] = {};
+    const int banks = 3;
     for (int i = 0; i < banks; ++i) {
-        auto * w = i ? gate_weights : weights;
-        descriptors[i] = {i ? "blk.1.ffn_gate_exps.weight" : "blk.1.ffn_up_exps.weight", w->data,
+        const auto * w = described[i];
+        descriptors[i] = {w->name, w->data,
             w->nb[2], w->ne[0], w->ne[1], w->ne[2], (int32_t) w->type};
     }
     std::vector<uint64_t> usage(weights->ne[2], 0);
     for (int i = 0; i < 8; ++i) {
         usage[i] = 100;
     }
-    const uint64_t * counts[] = {usage.data(), usage.data()};
-    bool ok = api.warm(session, descriptors, counts, banks) == 8 * banks;
+    const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
+    const auto warmed = api.warm(session, descriptors, counts, banks);
+    bool ok = warmed >= 64 * banks && warmed < weights->ne[2] * banks;
     if (device_mode) {
         ok &= api.device_prepare(session, descriptors, banks) == 1;
     }
@@ -4795,30 +4966,42 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     auto host_buffer = ggml_backend_alloc_ctx_tensors(host, cpu);
     auto card_buffer = ggml_backend_alloc_ctx_tensors(card, gpu);
     std::vector<float> values(weights->ne[0], 0.125f);
-    const int32_t route[] = {63, 63};
+    const int32_t cold = weights->ne[2] - 1;
+    const int32_t route[] = {cold, cold};
     ggml_backend_tensor_set(host_acts, values.data(), 0, values.size() * sizeof(float));
     ggml_backend_tensor_set(card_acts, values.data(), 0, values.size() * sizeof(float));
     ggml_backend_tensor_set(host_ids, route, 0, sizeof(route));
     ggml_backend_tensor_set(card_ids, route, 0, sizeof(route));
-    test_graph reference = gate_weights ? make_fused_graph(cpu, weights, gate_weights, host_acts, host_ids) :
-            make_graph(cpu, weights, host_acts, host_ids);
-    test_graph candidate = gate_weights ? make_fused_graph(gpu, weights, gate_weights, card_acts, card_ids) :
-            make_graph(device_mode ? gpu : cpu, weights,
-                    device_mode ? card_acts : host_acts, device_mode ? card_ids : host_ids);
+    const int graphs = gate_weights ? 2 : 3;
+    const auto backend = device_mode ? gpu : cpu;
+    test_graph reference[3], candidate[3];
+    std::vector<float> expected[3], actual[3], first[3];
+    for (int i = 0; i < graphs; ++i) {
+        const int bank = gate_weights && i == 1 ? 2 : i;
+        const bool fused = gate_weights && i == 0;
+        reference[i] = fused ? make_fused_graph(cpu, weights, gate_weights, host_acts, host_ids) :
+                make_graph(cpu, described[bank], host_acts, host_ids);
+        candidate[i] = fused ? make_fused_graph(gpu, weights, gate_weights, card_acts, card_ids) :
+                make_graph(backend, described[bank], device_mode ? card_acts : host_acts,
+                        device_mode ? card_ids : host_ids);
+        ok &= ggml_backend_graph_compute(cpu, reference[i].graph) == GGML_STATUS_SUCCESS;
+        expected[i].resize(ggml_nelements(reference[i].out));
+        actual[i].resize(expected[i].size());
+        ggml_backend_tensor_get(reference[i].out, expected[i].data(), 0, expected[i].size() * sizeof(float));
+    }
     auto fusion_count = (int64_t (*)(ggml_backend_t, const char *)) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)), "ggml_backend_cuda_fusion_count");
     const int64_t fused_before = gate_weights && fusion_count ? fusion_count(gpu, "mul_mat_glu") : 0;
-    ok &= ggml_backend_graph_compute(cpu, reference.graph) == GGML_STATUS_SUCCESS;
-    std::vector<float> expected(ggml_nelements(reference.out)), actual(expected.size()), first;
-    ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
     auto compute = [&]() {
-        ok &= ggml_backend_graph_compute(device_mode ? gpu : cpu, candidate.graph) == GGML_STATUS_SUCCESS;
-        ggml_backend_tensor_get(candidate.out, actual.data(), 0, actual.size() * sizeof(float));
-        ok &= compare_output(expected, actual, 5e-4);
-        if (first.empty()) {
-            first = actual;
-        } else if (device_mode) {
-            ok &= first == actual;
+        for (int i = 0; i < graphs; ++i) {
+            ok &= ggml_backend_graph_compute(backend, candidate[i].graph) == GGML_STATUS_SUCCESS;
+            ggml_backend_tensor_get(candidate[i].out, actual[i].data(), 0, actual[i].size() * sizeof(float));
+            ok &= compare_output(expected[i], actual[i], 5e-4);
+            if (first[i].empty()) {
+                first[i] = actual[i];
+            } else if (device_mode) {
+                ok &= first[i] == actual[i];
+            }
         }
     };
     for (int round = 0; round < 4 && ok; ++round) {
@@ -4828,7 +5011,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         api.prefetch_observe(session, 1, nullptr, 0);
         api.prefetch_observe(session, 0, nullptr, 0);
-        const int32_t ranked[] = {0, 63}; // Resident expert must not be copied.
+        const int32_t ranked[] = {0, cold}; // Resident expert must not be copied.
         api.prefetch(session, descriptors, banks, ranked, 2, 0, 1, 0);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         bool completed = true;
@@ -4839,7 +5022,7 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
                 // Planning can promote a queued prediction to demand. Finish this
                 // bank before promoting another, which would preempt its copy.
                 bank_completed = direct_plan_one(desc.name, desc.data, desc.expert_size,
-                        desc.n_in, desc.n_out, desc.type, desc.n_expert, 63) == 1;
+                        desc.n_in, desc.n_out, desc.type, desc.n_expert, cold) == 1;
                 if (!bank_completed) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
@@ -4880,15 +5063,23 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
     }
     if (device_mode) {
         ok &= max_field_value(log, "replays=") > 0;
+        if (whole_banks) {
+            ok &= log.find("source mappings setup: new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
+            ok &= max_field_value(log, "new_copy_bytes=") == 0;
+            ok &= max_field_value(log, "new_registered_bytes=") == 0;
+        }
     }
     ok &= log.find("expert=0 ") == std::string::npos;
     ok &= max_field_value(log, "fill-fail=") == 0;
-    free_graph(candidate);
-    free_graph(reference);
+    for (int i = 0; i < graphs; ++i) {
+        free_graph(candidate[i]);
+        free_graph(reference[i]);
+    }
     ggml_backend_buffer_free(card_buffer);
     ggml_backend_buffer_free(host_buffer);
     ggml_free(card);
     ggml_free(host);
+    if (expanded_buffer) { ggml_backend_buffer_free(expanded_buffer); }
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_FUSED", nullptr);
@@ -4901,11 +5092,58 @@ static bool run_prefetch_staging(ggml_backend_t gpu, ggml_backend_t cpu,
 }
 
 static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
-        ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr) {
+        ggml_tensor * weights, log_capture & capture, float * neighbor_output = nullptr, bool require_staging = false,
+        ggml_tensor * const * whole_banks = nullptr) {
     if (!active_api().device_prepare || !active_api().device_supports) {
         return false;
     }
     bool ok = true;
+    // Whole-expert residency needs complete up/gate/down layers; borrow supplied banks or build same-shape siblings.
+    int layer = -1;
+    const char * suffix = strchr(weights->name + 4, '.');
+    ok &= sscanf(weights->name, "blk.%d.", &layer) == 1 && suffix != nullptr;
+    std::string sibling_names[2];
+    int n_siblings = 0;
+    for (const char * kind : {"ffn_up_exps.weight", "ffn_gate_exps.weight", "ffn_down_exps.weight"}) {
+        if (ok && strcmp(suffix + 1, kind) != 0 && n_siblings < 2) {
+            sibling_names[n_siblings++] = "blk." + std::to_string(layer) + "." + kind;
+        }
+    }
+    ok &= n_siblings == 2;
+    ggml_context * sibling_ctx = nullptr;
+    ggml_backend_buffer_t sibling_buffer = nullptr;
+    ggml_tensor * siblings[2] = {};
+    if (whole_banks) {
+        for (int i = 0; i < 2; ++i) {
+            for (int bank = 0; bank < 3; ++bank) {
+                if (sibling_names[i] == whole_banks[bank]->name) {
+                    siblings[i] = whole_banks[bank];
+                }
+            }
+        }
+    } else {
+        ggml_init_params sibling_params = {2 * ggml_tensor_overhead(), nullptr, true};
+        sibling_ctx = ggml_init(sibling_params);
+        for (int i = 0; i < 2; ++i) {
+            siblings[i] = ggml_new_tensor_3d(sibling_ctx, weights->type, weights->ne[0], weights->ne[1], weights->ne[2]);
+            ggml_set_name(siblings[i], sibling_names[i].c_str());
+        }
+        sibling_buffer = ggml_backend_alloc_ctx_tensors(sibling_ctx, cpu);
+        if (sibling_buffer) {
+            ggml_backend_buffer_set_usage(sibling_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            for (ggml_tensor * sibling : siblings) {
+                for (int64_t e = 0; e < weights->ne[2]; ++e) {
+                    memcpy((char *)sibling->data + e * sibling->nb[2], (const char *)weights->data + e * weights->nb[2], sibling->nb[2]);
+                }
+            }
+        }
+    }
+    const bool sources_ready = ok && siblings[0] && siblings[1] && (whole_banks || sibling_buffer);
+    if (!sources_ready) {
+        if (sibling_buffer) { ggml_backend_buffer_free(sibling_buffer); }
+        if (sibling_ctx) { ggml_free(sibling_ctx); }
+        return false;
+    }
     for (int route_mode : {0, 1, 2}) {
     for (int tokens : {1, 4}) {
         for (int channels : {1, 2}) {
@@ -4928,6 +5166,12 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
                 routing[2*t] = route_mode == 0 ? 0 : route_mode == 1 ? 1 : t % 3;
                 routing[2*t + 1] = route_mode == 0 ? 0 : route_mode == 1 ? 2 : t == 2 ? routing[2*t] : (t + 1) % 3;
             }
+            if (neighbor_output) {
+                // High IDs stay cold under the bounded whole-expert plan.
+                for (auto & id : routing) {
+                    if (id != 0) { id = weights->ne[2] - id; }
+                }
+            }
             ggml_backend_tensor_set(acts, values.data(), 0, values.size() * sizeof(float));
             ggml_backend_tensor_set(ids, routing.data(), 0, routing.size() * sizeof(int32_t));
             test_graph reference = make_graph(cpu, weights, acts, ids);
@@ -4939,13 +5183,21 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             ggml_backend_t backends[] = {gpu, cpu};
             ggml_backend_sched_t scheduler = ggml_backend_sched_new(backends, nullptr, 2,
                     GGML_DEFAULT_GRAPH_SIZE, false, false);
-            const ggml_moe_cache_tensor_desc descriptor = {weights->name, weights->data,
-                weights->nb[2], weights->ne[0], weights->ne[1], weights->ne[2], (int32_t) weights->type};
+            ggml_tensor * described[] = {weights, siblings[0], siblings[1]};
+            ggml_moe_cache_tensor_desc descriptors[3];
+            for (int i = 0; i < 3; ++i) {
+                const ggml_tensor * t = described[i];
+                descriptors[i] = {t->name, t->data, t->nb[2], t->ne[0], t->ne[1], t->ne[2], (int32_t) t->type};
+            }
             std::vector<uint64_t> usage(weights->ne[2], 0);
             usage[0] = 100;
-            const uint64_t * counts[] = {usage.data()};
-            ok &= ggml_backend_sched_moe_cache_warm(scheduler, &descriptor, counts, 1) == 1;
-            const bool prepared = ggml_backend_sched_moe_cache_device_prepare(scheduler, &descriptor, 1) == 1;
+            const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
+            const auto warmed = sources_ready ? ggml_backend_sched_moe_cache_warm(scheduler, descriptors, counts, 3) : 0;
+            ok &= warmed > 0;
+            if (neighbor_output) {
+                ok &= warmed >= 3 * 64 && warmed < 3 * weights->ne[2];
+            }
+            const bool prepared = sources_ready && ggml_backend_sched_moe_cache_device_prepare(scheduler, descriptors, 3) == 1;
             ok &= prepared != unsupported;
             if (unsupported) {
                 // A failed opt-in must leave CPU scheduling and the legacy
@@ -4960,7 +5212,9 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             } else if (prepared) {
                 ok &= ggml_backend_sched_alloc_graph(scheduler, candidate.graph);
                 ok &= ggml_backend_sched_get_tensor_backend(scheduler, candidate.out) == gpu;
-                ok &= ggml_backend_sched_get_buffer_size(scheduler, gpu) < ggml_nbytes(weights);
+                if (!require_staging) {
+                    ok &= ggml_backend_sched_get_buffer_size(scheduler, gpu) < ggml_nbytes(weights);
+                }
                 std::vector<float> first(expected.size()), second(expected.size());
                 auto read_output = [&](std::vector<float> & output) {
                     void * destination = neighbor_output ? (void *)neighbor_output : output.data();
@@ -4987,17 +5241,23 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             if (prepared) {
                 const std::string log = capture.get();
                 ok &= max_field_value(log, "dispatches=") == 3;
-                if (neighbor_output) {
+                if (neighbor_output || require_staging) {
                     ok &= log.find("mapped registration boundary copy:") != std::string::npos;
                 }
-                if (route_mode == 0) {
-                    ok &= max_field_value(log, "hits=") == 6 * tokens;
-                    ok &= max_field_value(log, "misses=") == 0;
-                } else if (route_mode == 1) {
-                    ok &= max_field_value(log, "hits=") == 0;
-                    ok &= max_field_value(log, "misses=") == 6 * tokens;
-                } else {
-                    ok &= max_field_value(log, "hits=") > 0;
+                if (require_staging) {
+                    ok &= max_field_value(log, "new_copy_bytes=") > 0;
+                    ok &= max_field_value(log, "new_registered_bytes=") == 0;
+                }
+                if (whole_banks) {
+                    ok &= log.find("source mappings setup: new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
+                    ok &= max_field_value(log, "new_copy_bytes=") == 0;
+                    ok &= max_field_value(log, "new_registered_bytes=") == 0;
+                }
+                // Whole-only warm admits complete experts hottest first (expert 0) until
+                // the budget is full, so only all-expert-0 routing must hit everywhere.
+                ok &= max_field_value(log, "hits=") + max_field_value(log, "misses=") == 6 * tokens;
+                ok &= route_mode != 0 || max_field_value(log, "misses=") == 0;
+                if (neighbor_output && route_mode != 0) {
                     ok &= max_field_value(log, "misses=") > 0;
                 }
             }
@@ -5013,6 +5273,10 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
         }
     }
     }
+    if (sibling_buffer) {
+        ggml_backend_buffer_free(sibling_buffer);
+    }
+    if (sibling_ctx) { ggml_free(sibling_ctx); }
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
     printf("cache-device-tables type=%s mode=%s: %s\n", ggml_type_name(weights->type),
@@ -5020,6 +5284,72 @@ static bool run_device_tables_case(ggml_backend_t gpu, ggml_backend_t cpu,
             ok ? "OK" : "FAIL");
     return ok;
 }
+
+#if defined(GGML_CUDA) && defined(__linux__)
+static bool run_device_pageable_fallback(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture, bool sparse = false) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { return false; }
+    const size_t page = (size_t)page_size;
+    // 1280 experts x 3 whole-only siblings (4.4 MB) exceed the 4 MiB cache, so
+    // non-resident experts must be mapped through the pageable fallback.
+    constexpr int64_t n_expert = 1280;
+    void * allocation = malloc((n_expert + 2) * page);
+    if (!allocation) { return false; }
+    const char * strict_alias = getenv("GGML_MOE_CACHE_STRICT_ALIAS");
+    const std::string saved_strict_alias = strict_alias ? strict_alias : "";
+    // A former opt-out must not restore endpoint-only checks on sparse registrations.
+    set_env("GGML_MOE_CACHE_STRICT_ALIAS", "0");
+    void * data = (void *)((((uintptr_t)allocation + page - 1) & ~(page - 1)) + 64);
+    ggml_init_params params{ggml_tensor_overhead(), nullptr, true};
+    auto * ctx = ggml_init(params);
+    auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, 256, 8, n_expert);
+    ggml_set_name(weights, "blk.7.ffn_up_exps.weight");
+    const size_t packed_bytes = ggml_nbytes(weights);
+    const size_t expert_bytes = weights->nb[2];
+    if (sparse) { weights->nb[2] = page; weights->nb[3] = n_expert * page; }
+    const size_t bytes = ggml_nbytes(weights);
+    auto * buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
+    bool ok = buffer && expert_bytes + 64 < page &&
+            ggml_backend_tensor_alloc(buffer, weights, data) == GGML_STATUS_SUCCESS;
+    auto unregistered = [&]() {
+        cudaPointerAttributes attributes{};
+        const auto error = cudaPointerGetAttributes(&attributes, (char *)data + (sparse ? page : 0));
+        (void)cudaGetLastError();
+        return error == cudaErrorInvalidValue || (error == cudaSuccess && attributes.type == cudaMemoryTypeUnregistered);
+    };
+    // CUDA knows both endpoints, but the owner ledger must reject the pageable middle.
+    void * first_page = (void *)((uintptr_t)data - 64);
+    void * last_page = (char *)first_page + (n_expert - 1) * page;
+    const bool first_pinned = sparse && cudaHostRegister(first_page, page, cudaHostRegisterMapped) == cudaSuccess;
+    const bool last_pinned = sparse && cudaHostRegister(last_page, page, cudaHostRegisterMapped) == cudaSuccess;
+    ok &= !sparse || (first_pinned && last_pinned);
+    (void)cudaGetLastError();
+    ok &= unregistered();
+    if (ok) {
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values(ggml_nelements(weights), 0.125f);
+        std::vector<uint8_t> packed(packed_bytes);
+        ok &= ggml_quantize_chunk(weights->type, values.data(), packed.data(), 0, 8 * n_expert, 256, nullptr) == packed_bytes;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            memcpy((char *)data + e * weights->nb[2], packed.data() + e * expert_bytes, expert_bytes);
+        }
+        if (ok) { ok &= run_device_tables_case(gpu, cpu, weights, capture, nullptr, true); }
+        ok &= unregistered();
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    bool released = !(first_pinned || last_pinned) || cudaDeviceSynchronize() == cudaSuccess;
+    if (released) {
+        if (first_pinned) { released &= cudaHostUnregister(first_page) == cudaSuccess; }
+        if (last_pinned) { released &= cudaHostUnregister(last_page) == cudaSuccess; }
+    }
+    ok &= released;
+    if (released) { free(allocation); }
+    set_env("GGML_MOE_CACHE_STRICT_ALIAS", strict_alias ? saved_strict_alias.c_str() : nullptr);
+    printf("cache-device-pageable-fallback%s: %s\n", sparse ? "-sparse" : "", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif
 
 // A full warm cache must admit a repeatedly routed miss without invalidating
 // the graph. Then route its evicted victim to verify the mapped fallback.
@@ -5975,24 +6305,28 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
     if (!fusion_count) {
         return false;
     }
-    bool ok = true;
+    bool all_ok = true;
+    constexpr int64_t n_expert = 512;
     std::vector<float> importance(n_in, 1.0f);
     for (const auto type : ggml_moe_cache_types) {
         if (type == GGML_TYPE_IQ1_M) {
             continue;
         }
-        ggml_init_params weight_params = {2 * ggml_tensor_overhead(), nullptr, true};
+        bool ok = true;
+        ggml_init_params weight_params = {3 * ggml_tensor_overhead(), nullptr, true};
         ggml_context * weights_ctx = ggml_init(weight_params);
         ggml_tensor * weights[] = {
+            ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
             ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
             ggml_new_tensor_3d(weights_ctx, type, n_in, n_out, n_expert),
         };
         ggml_set_name(weights[0], "blk.7.ffn_up_exps.weight");
         ggml_set_name(weights[1], "blk.7.ffn_gate_exps.weight");
+        ggml_set_name(weights[2], "blk.7.ffn_down_exps.weight");
         ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu);
         ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::vector<float> values(n_in * n_out * n_expert);
-        for (int bank = 0; bank < 2; ++bank) {
+        for (int bank = 0; bank < 3; ++bank) {
             for (size_t i = 0; i < values.size(); ++i) {
                 values[i] = 0.15f * std::sin((float)(i % 997) * (0.017f + bank * 0.013f));
             }
@@ -6024,7 +6358,7 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
                 std::vector<int32_t> routing(512 * tokens, 63);
                 for (int t = 0; t < tokens; ++t) {
                     routing[512*t] = t % 3;
-                    routing[512*t + 1] = (t + 1) % 3;
+                    routing[512*t + 1] = n_expert - 1;
                 }
                 for (int i = 0; i < 2; ++i) {
                     acts[i] = ggml_new_tensor_3d(input_ctx[i], GGML_TYPE_F32, n_in, channels, tokens);
@@ -6041,16 +6375,16 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
                 ggml_backend_tensor_get(reference.out, expected.data(), 0, expected.size() * sizeof(float));
                 const auto api = active_api();
                 void * session = create_direct_session(gpu, cpu);
-                ggml_moe_cache_tensor_desc descriptors[2];
-                std::vector<uint64_t> usage[2] = {std::vector<uint64_t>(n_expert, 0), std::vector<uint64_t>(n_expert, 0)};
-                const uint64_t * counts[] = {usage[0].data(), usage[1].data()};
-                for (int i = 0; i < 2; ++i) {
+                ggml_moe_cache_tensor_desc descriptors[3];
+                std::vector<uint64_t> usage(n_expert, 0);
+                for (int e = 0; e < 3; ++e) { usage[e] = 100; }
+                const uint64_t * counts[] = {usage.data(), usage.data(), usage.data()};
+                for (int i = 0; i < 3; ++i) {
                     auto * w = weights[i];
                     descriptors[i] = {w->name, w->data, w->nb[2], n_in, n_out, n_expert, (int32_t)type};
-                    usage[i][i] = 100;
                 }
-                bool prepared = session && api.warm(session, descriptors, counts, 2) == 2 &&
-                        api.device_prepare(session, descriptors, 2) == 1;
+                bool prepared = session && api.warm(session, descriptors, counts, 3) > 0 &&
+                        api.device_prepare(session, descriptors, 3) == 1;
                 ok &= prepared;
                 const int64_t before = fusion_count(gpu, "mul_mat_glu");
                 if (prepared) {
@@ -6074,6 +6408,8 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
                 const std::string log = capture.get();
                 ok &= max_field_value(log, "dispatches=") == 160;
                 ok &= max_field_value(log, "replays=") >= 8;
+                ok &= max_field_value(log, "hits=") > 0;
+                ok &= max_field_value(log, "misses=") > 0;
                 if (!ok) {
                     fprintf(stderr, "fused device type=%s tokens=%d channels=%d\n%s", ggml_type_name(type), tokens, channels, log.c_str());
                 }
@@ -6086,13 +6422,14 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
             }
         }
         printf("cache-device-fused type=%s: %s\n", ggml_type_name(type), ok ? "OK" : "FAIL");
+        all_ok &= ok;
         ggml_backend_buffer_free(weights_buffer);
         ggml_free(weights_ctx);
     }
     for (const char * name : {"GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_CACHE_DEVICE_FUSED"}) {
         set_env(name, nullptr);
     }
-    return ok;
+    return all_ok;
 }
 
 // fork: retain exact expert images across stable-table updates and source invalidation.
@@ -6614,6 +6951,422 @@ static bool run_device_fused_missjoin(ggml_backend_t gpu, ggml_backend_t cpu, lo
     return ok;
 }
 
+static bool run_skipmass_rule() {
+    const float weights[10] = {0.40f, 0.20f, 0.10f, 0.08f, 0.06f, 0.05f, 0.04f, 0.03f, 0.025f, 0.015f};
+    unsigned char hot[10] = {}, drop[10];
+    bool ok = true;
+    hot[9] = 1; // A partial resident must not be dropped.
+    ggml_moe_skipmass_select(weights, hot, 10, 1, 0.03f, drop);
+    for (int i = 0; i < 10; ++i) { ok &= drop[i] == (i == 8); } // Strict threshold.
+    ggml_moe_skipmass_select(weights, hot, 10, 2, 0.055f, drop);
+    for (int i = 0; i < 10; ++i) { ok &= drop[i] == (i == 7 || i == 8); }
+    ggml_moe_skipmass_select(weights, hot, 10, 2, 0.0f, drop);
+    for (int i = 0; i < 10; ++i) { ok &= !drop[i]; }
+    const float unsorted[4] = {0.125f, 0.5f, 0.125f, 0.25f};
+    ggml_moe_skipmass_select(unsorted, hot, 4, 2, 0.125f, drop);
+    ok &= !drop[0] && !drop[1] && drop[2] && !drop[3]; // Stable ties, not rank order.
+    const float invalid[2] = {NAN, 0.01f};
+    ok &= !ggml_moe_skipmass_select(invalid, hot, 2, 1, 0.1f, drop);
+    ok &= !drop[0] && !drop[1];
+    ok &= ggml_moe_skipmass_budget_valid(2, 0.25f);
+    ok &= !ggml_moe_skipmass_budget_valid(2, std::nextafter(0.25f, 1.0f));
+    ok &= !ggml_moe_skipmass_budget_valid(2, NAN);
+    ok &= !ggml_moe_skipmass_budget_valid(2, -0.01f);
+    ok &= ggml_moe_skipmass_budget_valid(1, 0.999f);
+    const float concentrated[10] = {0.5f, 0.25f, 0.03125f, 0.03125f, 0.03125f, 0.03125f, 0.03125f, 0.03125f, 0.03125f, 0.03125f};
+    memset(hot, 0, sizeof(hot));
+    ggml_moe_skipmass_select(concentrated, hot, 10, 2, 0.25f, drop);
+    for (int i = 0; i < 10; ++i) { ok &= drop[i] == (i >= 2); }
+    // Compare the faster selector to the original sorted scan, including cutoff boundaries.
+    auto reference = [](const float * w, const unsigned char * h, int n, int mode, float t, unsigned char * d, int floor) {
+        bool chosen[10] = {};
+        float mass = 0.0f;
+        for (int i = 0; i < n; ++i) { d[i] = 0; }
+        for (int step = 0; step < n; ++step) {
+            int best = -1;
+            for (int i = n - 1; i >= 0; --i) {
+                if ((mode != 2 || i >= floor) && !chosen[i] && !h[i] && (best < 0 || w[i] < w[best])) { best = i; }
+            }
+            if (best < 0) { break; }
+            chosen[best] = true;
+            if (mode == 1 ? w[best] < t : mass + w[best] <= t) { d[best] = 1; mass += w[best]; }
+        }
+    };
+    const float cases[][10] = {
+        {0.40f, 0.20f, 0.10f, 0.08f, 0.06f, 0.05f, 0.04f, 0.03f, 0.025f, 0.015f},
+        {0.0f, 0.125f, 0.0625f, 0.125f, 0.0f, 0.0625f, 0.25f, 0.125f, 0.125f, 0.125f},
+    };
+    unsigned char expected[10];
+    for (const auto & w : cases) {
+        for (unsigned mask = 0; mask < 1024; ++mask) {
+            for (int i = 0; i < 10; ++i) { hot[i] = mask >> i & 1u ? (unsigned char) (1 + i % 7) : 0; }
+            for (int n : {1, 4, 10}) {
+                for (int mode : {1, 2}) {
+                    for (float t : {0.0f, 0.03f, std::nextafter(0.03f, 1.0f), 0.125f, 0.25f, 0.999f}) {
+                        if (mode == 2 && t > 0.25f) { continue; }
+                      for (int floor : {0, 1, 5, 10}) {
+                        reference(w, hot, n, mode, t, expected, floor);
+                        const bool changed = ggml_moe_skipmass_select(w, hot, n, mode, t, drop, floor);
+                        ok &= memcmp(drop, expected, n) == 0;
+                        bool expected_changed = false;
+                        for (int i = 0; i < n; ++i) { expected_changed |= expected[i] != 0; }
+                        ok &= changed == expected_changed;
+                      }
+                    }
+                }
+            }
+        }
+    }
+    // Validate the whole token before dropping any earlier low-weight route.
+    const float invalid_last[2] = {0.01f, NAN};
+    hot[0] = hot[1] = 0;
+    ok &= !ggml_moe_skipmass_select(invalid_last, hot, 2, 1, 0.1f, drop);
+    ok &= !drop[0] && !drop[1];
+    printf("cache-skipmass-rule: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// --moe-skip-tail: the route-rank rule on its own (host-side helper shared by the CPU path).
+static bool run_skip_tail_rank_rule() {
+    bool ok = true;
+    // two tokens, top-4: expert 9 sits at positions 3 and 2, expert 5 at 0, expert 7 only at 3
+    const int32_t ids[8] = {5, 1, 2, 9,   4, 6, 9, 7};
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 2, 0, 3);   // rank 0 is head
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 2, 3, 3);   // 9: token 1 ranks it 2 < 3
+    ok &= ggml_moe_cache_tail_rank_ok(ids, 8, 2, 3, 2);    // 9: best rank 2 >= 2
+    ok &= ggml_moe_cache_tail_rank_ok(ids, 8, 2, 7, 3);    // 7: rank 3 only
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 2, 7, 0);   // 0 = off
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 2, 7, 4);   // rank >= top_k never skips
+    ok &= !ggml_moe_cache_tail_rank_ok(ids, 8, 3, 7, 3);   // malformed shape
+    ok &= !ggml_moe_cache_tail_rank_ok(nullptr, 8, 2, 7, 3);
+    printf("cache-skip-tail-rank-rule: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// --moe-skip-tail on the hit-first device path: a full up/gate/swiglu/down layer, experts 0..5 resident. Each route
+// pattern runs exact (rank 0), then with the cutoff, then exact again, so every rank change recaptures the graph.
+// Under the cutoff a route whose expert is missed and ranked >= R by every token must be exactly zero, and every
+// other route must be bit-identical to the exact run (same kernels, same bytes). The exact runs must match the CPU
+// at quantization-noise level and must reproduce themselves after the cutoff was on.
+static bool run_skip_tail_layer(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture) {
+    const auto api = active_api();
+    if (!api.set_skip_tail || !api.warm || !api.device_prepare) {
+        printf("cache-skip-tail-layer: FAIL (provider has no set_skip_tail)\n");
+        return false;
+    }
+    bool all_ok = true;
+    std::vector<float> importance(256, 1.0f);
+    constexpr int k_used = 10, dim = 256, rank = 7;
+    // 256 experts: the pool keeps at least 64 slots per bank, so a 64-expert layer would be fully resident.
+    // An 8 MiB budget holds well under 128 complete experts; routes use experts 0..5 (warm) and >= 128 (missed).
+    constexpr int64_t n_expert = 256;
+    constexpr int miss_base = 128;
+    unsigned long long expected_rows_total = 0;
+    long long logged_rows_total = 0;
+    for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        bool ok = true;
+        ggml_init_params weight_params = {4 * ggml_tensor_overhead(), nullptr, true};
+        ggml_context * weights_ctx = ggml_init(weight_params);
+        ggml_tensor * weights[3];
+        const char * names[3] = {"blk.7.ffn_up_exps.weight", "blk.7.ffn_gate_exps.weight", "blk.7.ffn_down_exps.weight"};
+        for (int bank = 0; bank < 3; ++bank) {
+            weights[bank] = ggml_new_tensor_3d(weights_ctx, type, dim, dim, n_expert);
+            ggml_set_name(weights[bank], names[bank]);
+        }
+        ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu);
+        ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values((size_t) dim * dim * n_expert);
+        for (int bank = 0; bank < 3; ++bank) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = 0.15f * std::sin((float)(i % 997) * (0.017f + bank * 0.013f)) +
+                            0.05f * std::cos((float)(i % 431) * (0.031f + bank * 0.007f));
+            }
+            std::vector<uint8_t> quantized(ggml_nbytes(weights[bank]));
+            const float * imatrix = ggml_quantize_requires_imatrix(type) ? importance.data() : nullptr;
+            ok &= ggml_quantize_chunk(type, values.data(), quantized.data(), 0, (int64_t) dim * n_expert, dim, imatrix) ==
+                    quantized.size();
+            ggml_backend_tensor_set(weights[bank], quantized.data(), 0, quantized.size());
+        }
+        for (int tokens : {1, 4, 5, 8}) {
+            if (tokens == 8 && type == GGML_TYPE_IQ3_S) { continue; } // Ampere IQ3_S tables stop at six tokens.
+            configure_cache(nullptr, "8");
+            set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
+            set_env("GGML_MOE_CACHE_DEVICE", "1");
+            set_env("GGML_MOE_CACHE_DEVICE_STATS", "1");
+            set_env("GGML_MOE_CACHE_DEVICE_CAPTURE", "1");
+            set_env("GGML_MOE_MISSJOIN", "stage");
+            capture.clear();
+            ggml_init_params params = {12 * ggml_tensor_overhead(), nullptr, true};
+            ggml_context * input_ctx[] = {ggml_init(params), ggml_init(params)};
+            ggml_backend_t backends[] = {cpu, gpu};
+            ggml_tensor * acts[2], * storage[2], * ids[2];
+            ggml_backend_buffer_t buffers[2];
+            std::vector<float> activations((size_t) dim * tokens);
+            for (size_t i = 0; i < activations.size(); ++i) {
+                activations[i] = 0.2f * std::cos((float)i * 0.019f);
+            }
+            for (int i = 0; i < 2; ++i) {
+                acts[i] = ggml_new_tensor_3d(input_ctx[i], GGML_TYPE_F32, dim, 1, tokens);
+                storage[i] = ggml_new_tensor_2d(input_ctx[i], GGML_TYPE_I32, 64, tokens);
+                ids[i] = ggml_view_2d(input_ctx[i], storage[i], k_used, tokens, storage[i]->nb[1], 0);
+                buffers[i] = ggml_backend_alloc_ctx_tensors(input_ctx[i], backends[i]);
+                ggml_backend_tensor_set(acts[i], activations.data(), 0, activations.size() * sizeof(float));
+            }
+            test_graph graphs[2];
+            for (int i = 0; i < 2; ++i) {
+                ggml_init_params gp = {24 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true};
+                graphs[i].ctx = ggml_init(gp);
+                ggml_context * c = graphs[i].ctx;
+                ggml_tensor * up = ggml_mul_mat_id(c, weights[0], acts[i], ids[i]);
+                ggml_tensor * gate = ggml_mul_mat_id(c, weights[1], acts[i], ids[i]);
+                ggml_tensor * mid = ggml_swiglu_split(c, gate, up);
+                graphs[i].out = ggml_mul_mat_id(c, weights[2], mid, ids[i]);
+                graphs[i].graph = ggml_new_graph(c);
+                ggml_build_forward_expand(graphs[i].graph, graphs[i].out);
+                graphs[i].buffer = ggml_backend_alloc_ctx_tensors(c, backends[i]);
+            }
+            test_graph mass_graph;
+            ggml_init_params mp = {8 * ggml_tensor_overhead() + 2 * ggml_graph_overhead(), nullptr, true};
+            mass_graph.ctx = ggml_init(mp);
+            auto * router = ggml_new_tensor_3d(mass_graph.ctx, GGML_TYPE_F32, 1, k_used, tokens);
+            auto * adjusted = ggml_map_custom2(mass_graph.ctx, router, ids[1],
+                [](ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int, void *) { GGML_ABORT("CUDA required"); }, 1, nullptr);
+            ggml_set_name(adjusted, "moe_skipmass-7");
+            mass_graph.out = ggml_mul(mass_graph.ctx, graphs[1].out, adjusted);
+            mass_graph.graph = ggml_new_graph(mass_graph.ctx);
+            ggml_build_forward_expand(mass_graph.graph, adjusted);
+            ggml_build_forward_expand(mass_graph.graph, mass_graph.out);
+            mass_graph.buffer = ggml_backend_alloc_ctx_tensors(mass_graph.ctx, gpu);
+            const float shares[10] = {0.40f, 0.20f, 0.10f, 0.08f, 0.06f, 0.05f, 0.04f, 0.03f, 0.025f, 0.015f};
+            std::vector<float> router_values((size_t) k_used * tokens);
+            for (int i = 0; i < k_used * tokens; ++i) { router_values[i] = shares[i % k_used]; }
+            ggml_backend_tensor_set(router, router_values.data(), 0, router_values.size() * sizeof(float));
+            void * session = create_direct_session(gpu, cpu);
+            // Production warmup executes this node before device_prepare; cache-off has no session at all.
+            auto * startup_graph = ggml_new_graph(mass_graph.ctx);
+            ggml_build_forward_expand(startup_graph, adjusted);
+            for (bool enter : {false, true}) {
+                if (enter && !session) { ok = false; break; }
+                if (enter) { api.session_enter(session); }
+                ok &= ggml_backend_graph_compute(gpu, startup_graph) == GGML_STATUS_SUCCESS;
+                if (enter) { api.session_leave(session); }
+                std::vector<float> unchanged(router_values.size());
+                ggml_backend_tensor_get(adjusted, unchanged.data(), 0, unchanged.size() * sizeof(float));
+                ok &= memcmp(unchanged.data(), router_values.data(), unchanged.size() * sizeof(float)) == 0;
+            }
+            ggml_moe_cache_tensor_desc descriptors[3];
+            std::vector<uint64_t> usage[3];
+            const uint64_t * counts[3];
+            for (int i = 0; i < 3; ++i) {
+                auto * w = weights[i];
+                descriptors[i] = {w->name, w->data, w->nb[2], dim, dim, n_expert, (int32_t) type};
+                usage[i].assign(n_expert, 0);
+                for (int e = 0; e < 6; ++e) {
+                    usage[i][e] = 100; // experts 0..5 resident, everything else misses
+                }
+                counts[i] = usage[i].data();
+            }
+            const bool prepared = session && api.warm(session, descriptors, counts, 3) > 0 &&
+                    api.device_prepare(session, descriptors, 3) == 1;
+            ok &= prepared;
+            if (prepared) {
+                // Exact router copies need no cache group for the named layer.
+                ggml_set_name(adjusted, "moe_skipmass-47");
+                api.set_skip_tail(session, 1, false);
+                api.set_skip_tail(session, 0, false);
+                api.session_enter(session);
+                ok &= ggml_backend_graph_compute(gpu, startup_graph) == GGML_STATUS_SUCCESS;
+                api.session_leave(session);
+                std::vector<float> unchanged(router_values.size());
+                ggml_backend_tensor_get(adjusted, unchanged.data(), 0, unchanged.size() * sizeof(float));
+                ok &= memcmp(unchanged.data(), router_values.data(), unchanged.size() * sizeof(float)) == 0;
+                ggml_set_name(adjusted, "moe_skipmass-7");
+            }
+            const size_t n_out = (size_t) ggml_nelements(graphs[0].out);
+            std::vector<float> expected(n_out), exact(n_out), lossy(n_out), again(n_out);
+            unsigned long long expected_rows = 0;
+            for (int pattern = 0; pattern < 10 && prepared; ++pattern) {
+                std::vector<int32_t> routing(64 * tokens, 63);
+                for (int t = 0; t < tokens; ++t) {
+                    for (int j = 0; j < k_used; ++j) {
+                        int e;
+                        switch (pattern) {
+                            case 0: e = (j + t) % 6; break;                              // all resident: nothing skips
+                            case 1: e = 20 + ((j * 3 + t * 5) % 40); break;              // all missed
+                            case 2: e = (j % 2) ? (j * 7 + t) % 6 : 10 + j + t; break;   // mixed
+                            case 3: e = j < rank ? 40 + j : 50 + ((j + t) % 3); break;   // shared tail misses
+                            case 4: e = j < rank ? (j % 6) : (t % 2 ? 30 + j : 30 + k_used - 1 - j); break; // tail misses across ranks
+                            case 5: e = j < rank ? 12 + j : 12 + (j - rank); break;    // every tail expert is also a head expert: nothing skips
+                            case 6: e = 20; break;                                  // one missing expert repeats at every rank
+                            case 7: e = j % 3 == 0 ? 0 : 20 + t % 2; break;          // resident and missing duplicates share the window
+                            case 8: e = j < rank ? j % 6 : 20; break;                // every dropped occurrence shares one expert
+                            default: e = j >= rank || (t == tokens - 1 && j == 0) ? 20 : j % 6; break; // a later kept occurrence prevents omission
+                        }
+                        routing[64 * t + j] = e < 6 ? e : e - 6 + miss_base;
+                    }
+                }
+                // rows the cutoff must leave out
+                std::vector<uint8_t> skip_route((size_t) tokens * k_used, 0);
+                for (int t = 0; t < tokens; ++t) {
+                    for (int j = 0; j < k_used; ++j) {
+                        const int e = routing[64 * t + j];
+                        bool head = e < 6; // resident experts are always computed
+                        for (int t2 = 0; t2 < tokens && !head; ++t2) {
+                            for (int j2 = 0; j2 < rank; ++j2) {
+                                head |= routing[64 * t2 + j2] == e;
+                            }
+                        }
+                        skip_route[(size_t) t * k_used + j] = !head;
+                        expected_rows += head ? 0 : 3;
+                    }
+                }
+                for (int i = 0; i < 2; ++i) {
+                    ggml_backend_tensor_set(storage[i], routing.data(), 0, routing.size() * sizeof(int32_t));
+                }
+                ok &= ggml_backend_graph_compute(cpu, graphs[0].graph) == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(graphs[0].out, expected.data(), 0, n_out * sizeof(float));
+                for (int step = 0; step < 3; ++step) {
+                    api.set_skip_tail(session, step == 1 ? rank : 0, false);
+                    api.session_enter(session);
+                    ok &= ggml_backend_graph_compute(gpu, graphs[1].graph) == GGML_STATUS_SUCCESS;
+                    api.session_leave(session);
+                    auto & dst = step == 0 ? exact : step == 1 ? lossy : again;
+                    ggml_backend_tensor_get(graphs[1].out, dst.data(), 0, n_out * sizeof(float));
+                }
+                for (int mode : {1, 2}) {
+                    for (int renorm : {0, 1}) {
+                      for (int floor : {0, 5, 10}) {
+                        set_env("GGML_MOE_SKIP_POLICY", mode == 1 ? "threshold" : "cumulative");
+                        set_env("GGML_MOE_SKIP_THRESHOLD", mode == 1 ? "0.04" : "0.25");
+                        set_env("GGML_MOE_SKIP_RENORM", renorm ? "1" : "0");
+                        const std::string floor_text = std::to_string(floor);
+                        set_env("GGML_MOE_SKIP_RANK_FLOOR", floor_text.c_str());
+                        api.set_skip_tail(session, 0, true); // Budget mode has no route-rank cutoff.
+                        api.session_enter(session);
+                        ok &= ggml_backend_graph_compute(gpu, mass_graph.graph) == GGML_STATUS_SUCCESS;
+                        api.session_leave(session);
+                        std::vector<float> actual_weights(router_values.size()), actual(n_out);
+                        ggml_backend_tensor_get(adjusted, actual_weights.data(), 0, actual_weights.size() * sizeof(float));
+                        ggml_backend_tensor_get(mass_graph.out, actual.data(), 0, n_out * sizeof(float));
+                        std::vector<unsigned char> drops(router_values.size());
+                        for (int t = 0; t < tokens; ++t) {
+                            unsigned char hot[10];
+                            for (int j = 0; j < k_used; ++j) { hot[j] = routing[64 * t + j] < 6 ? 7 : 0; }
+                            ggml_moe_skipmass_select(shares, hot, k_used, mode, mode == 1 ? 0.04f : 0.25f, drops.data() + t * k_used, floor);
+                            float total = 0.0f, kept = 0.0f;
+                            bool changed = false;
+                            for (int j = 0; j < k_used; ++j) {
+                                total += shares[j];
+                                if (!drops[t * k_used + j]) { kept += shares[j]; }
+                                changed |= drops[t * k_used + j] != 0;
+                            }
+                            for (int j = 0; j < k_used; ++j) {
+                                const float want = drops[t * k_used + j] ? 0.0f : shares[j] * (renorm && changed ? total / kept : 1.0f);
+                                ok &= std::fabs(actual_weights[t * k_used + j] - want) < 1e-6f;
+                                if (!renorm || !changed || drops[t * k_used + j]) {
+                                    ok &= memcmp(&actual_weights[t * k_used + j], &want, sizeof(float)) == 0;
+                                }
+                                for (int q = 0; q < dim; ++q) {
+                                    const size_t index = ((size_t) t * k_used + j) * dim + q;
+                                    const float ref = exact[index] * want;
+                                    ok &= std::isfinite(actual[index]) && std::fabs(actual[index] - ref) < 1e-5f * std::max(1.0f, std::fabs(ref));
+                                }
+                            }
+                        }
+                        for (int t = 0; t < tokens; ++t) {
+                            for (int j = 0; j < k_used; ++j) {
+                                const int e = routing[64 * t + j];
+                                bool keep = e < 6;
+                                for (int t2 = 0; t2 < tokens; ++t2) {
+                                    for (int j2 = 0; j2 < k_used; ++j2) { keep |= routing[64 * t2 + j2] == e && !drops[t2 * k_used + j2]; }
+                                }
+                                if (!keep) { expected_rows += 3; }
+                            }
+                        }
+                        api.set_skip_tail(session, 0, false);
+                        api.session_enter(session);
+                        ok &= ggml_backend_graph_compute(gpu, startup_graph) == GGML_STATUS_SUCCESS;
+                        api.session_leave(session);
+                        ggml_backend_tensor_get(adjusted, actual_weights.data(), 0, actual_weights.size() * sizeof(float));
+                        ok &= memcmp(actual_weights.data(), router_values.data(), actual_weights.size() * sizeof(float)) == 0;
+                        set_env("GGML_MOE_SKIP_POLICY", nullptr);
+                        set_env("GGML_MOE_SKIP_THRESHOLD", nullptr);
+                        set_env("GGML_MOE_SKIP_RENORM", nullptr);
+                        set_env("GGML_MOE_SKIP_RANK_FLOOR", nullptr);
+                      }
+                    }
+                }
+                const bool cpu_ok = compare_output(expected, exact, 8e-3);
+                const bool repro_ok = exact == again;
+                ok &= cpu_ok && repro_ok;
+                size_t bad_skip = 0, bad_keep = 0;
+                float max_keep_diff = 0.0f;
+                for (int t = 0; t < tokens; ++t) {
+                    for (int j = 0; j < k_used; ++j) {
+                        const size_t base = ((size_t) t * k_used + j) * dim;
+                        for (int q = 0; q < dim; ++q) {
+                            const float want = skip_route[(size_t) t * k_used + j] ? 0.0f : exact[base + q];
+                            if (memcmp(&lossy[base + q], &want, sizeof(float)) != 0) {
+                                ok = false;
+                                if (skip_route[(size_t) t * k_used + j]) {
+                                    ++bad_skip;
+                                } else {
+                                    ++bad_keep;
+                                    max_keep_diff = std::max(max_keep_diff, std::fabs(lossy[base + q] - want));
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!ok) {
+                    fprintf(stderr, "skip-tail layer type=%s tokens=%d pattern=%d failed: cpu=%d repro=%d bad_skip=%zu bad_keep=%zu max_keep_diff=%g\n",
+                            ggml_type_name(type), tokens, pattern, cpu_ok, repro_ok, bad_skip, bad_keep, max_keep_diff);
+                    break;
+                }
+            }
+            if (session) {
+                api.session_destroy(session);
+            }
+            const std::string log = capture.get();
+            long long logged = -1;
+            const size_t end = log.rfind(" missed tensor-expert rows left out (");
+            if (end != std::string::npos) {
+                const size_t pos = log.rfind("[moe-cache] skip-tail: ", end);
+                if (pos != std::string::npos) {
+                    logged = atoll(log.c_str() + pos + strlen("[moe-cache] skip-tail: "));
+                }
+            }
+            // The device counter is a process total, so compare the growth of this shape.
+            const long long grown = logged - logged_rows_total;
+            ok &= expected_rows == 0 ? (logged < 0 || grown == 0) : grown == (long long) expected_rows;
+            ok &= log.find("missjoin hit-first: on") != std::string::npos;
+            if (logged >= 0) {
+                logged_rows_total = logged;
+            }
+            expected_rows_total += expected_rows;
+            if (!ok) {
+                fprintf(stderr, "skip-tail layer type=%s tokens=%d expected_rows=%llu logged=%lld\n%s",
+                        ggml_type_name(type), tokens, expected_rows, logged, log.c_str());
+            }
+            for (int i = 0; i < 2; ++i) {
+                free_graph(graphs[i]);
+                ggml_backend_buffer_free(buffers[i]);
+                ggml_free(input_ctx[i]);
+            }
+        }
+        printf("cache-skip-tail-layer type=%s rank=%d: %s\n", ggml_type_name(type), rank, ok ? "OK" : "FAIL");
+        all_ok &= ok;
+        ggml_backend_buffer_free(weights_buffer);
+        ggml_free(weights_ctx);
+    }
+    for (const char * name : {"GGML_MOE_CACHE_DEVICE", "GGML_MOE_CACHE_DEVICE_STATS", "GGML_MOE_CACHE_DEVICE_CAPTURE", "GGML_MOE_MISSJOIN"}) {
+        set_env(name, nullptr);
+    }
+    all_ok &= expected_rows_total > 0;
+    printf("cache-skip-tail-layer: rows left out=%llu: %s\n", expected_rows_total, all_ok ? "OK" : "FAIL");
+    return all_ok;
+}
+
 // fork VFIXMISS: a full up/gate/swiglu/down layer with mixed resident and missed experts, replayed
 // with changing routes. The CPU result must match within rounding, replays of one graph must be
 // bit-identical to the first run, and (via GGML_MOE_CACHE_TEST_HF_DUMP) a run with
@@ -6859,7 +7612,8 @@ static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
     // and unregistered pages, although the destination is outside all weights.
     {
         const size_t page = (size_t)sysconf(_SC_PAGESIZE);
-        const size_t bytes = ggml_nbytes(initial_weights);
+        constexpr int64_t edge_experts = 512;
+        const size_t bytes = initial_weights->nb[2] * edge_experts;
         const size_t bank_offset = 64;
         const size_t rounded_end = (bank_offset + bytes + page - 1) & ~(page - 1);
         const size_t allocation_bytes = rounded_end + 2 * page;
@@ -6870,10 +7624,15 @@ static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
             void * data = (char *)allocation + bank_offset;
             float * destination = (float *)((char *)allocation + rounded_end - 128);
             edge_ok &= (char *)destination >= (char *)data + bytes;
-            memcpy(data, initial_weights->data, bytes);
+            for (int64_t e = 0; e < edge_experts; ++e) {
+                memcpy((char *)data + e * initial_weights->nb[2],
+                        (const char *)initial_weights->data + (e % initial_weights->ne[2]) * initial_weights->nb[2],
+                        initial_weights->nb[2]);
+            }
             ggml_init_params params = {ggml_tensor_overhead(), nullptr, true};
             ggml_context * ctx = ggml_init(params);
-            ggml_tensor * weights = ggml_dup_tensor(ctx, initial_weights);
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, initial_weights->type,
+                    initial_weights->ne[0], initial_weights->ne[1], edge_experts);
             ggml_set_name(weights, initial_weights->name);
             ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(data, bytes);
             edge_ok &= ggml_backend_tensor_alloc(buffer, weights, data) == GGML_STATUS_SUCCESS;
@@ -7096,14 +7855,16 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
         ggml_tensor * weights, ggml_tensor * gate, test_graph & graph,
         const std::vector<float> & reference, log_capture & capture) {
     const ggml_tensor original = *weights, gate_original = *gate;
-    const size_t bytes = weights->nb[2], stride = 3 * bytes;
-    const size_t arena_size = stride * (size_t)weights->ne[2];
+    const size_t bytes = weights->nb[2], stride = 4 * bytes;
+    const int64_t experts = 512;
+    const size_t arena_size = stride * experts;
     auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), arena_size);
     auto * arena = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer));
     memset(arena, 0xa5, arena_size);
-    for (int64_t e = 0; e < weights->ne[2]; ++e) {
-        memcpy(arena + e * stride, (const char *)weights->data + e * bytes, bytes);
-        memcpy(arena + e * stride + bytes, (const char *)gate->data + e * bytes, bytes);
+    for (int64_t e = 0; e < experts; ++e) {
+        memcpy(arena + e * stride, (const char *)weights->data + (e % weights->ne[2]) * bytes, bytes);
+        memcpy(arena + e * stride + bytes, (const char *)gate->data + (e % gate->ne[2]) * bytes, bytes);
+        memcpy(arena + e * stride + 2 * bytes, arena + e * stride, bytes);
     }
     ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     weights->buffer = gate->buffer = buffer;
@@ -7119,26 +7880,36 @@ static bool run_arena_stride(ggml_backend_t gpu, ggml_backend_t cpu,
     ok &= run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
     ok &= run_scenario("cache-arena-stride", nullptr, gpu, cpu, graph, reference, capture);
 #ifdef GGML_CUDA
-    const bool registered = cudaHostRegister(arena, arena_size,
-            cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+    auto pin = (bool (*)(void *, size_t))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *))ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    const bool registered = pin && unpin && pin(arena, arena_size);
     ok &= registered;
     if (registered) {
-        ok &= run_device_tables_case(gpu, cpu, weights, capture);
+        weights->ne[2] = gate->ne[2] = experts;
+        weights->nb[3] = gate->nb[3] = stride * experts;
+        ggml_set_name(weights, "blk.1.ffn_up_exps.weight");
+        ggml_set_name(gate, "blk.1.ffn_gate_exps.weight");
+        ggml_tensor down = *weights;
+        down.data = arena + 2 * bytes;
+        ggml_set_name(&down, "blk.1.ffn_down_exps.weight");
+        ggml_tensor * whole_banks[] = {weights, gate, &down};
+        ok &= run_device_tables_case(gpu, cpu, weights, capture, nullptr, false, whole_banks);
         // The second projection starts inside the same registered allocation.
-        ok &= run_device_tables_case(gpu, cpu, gate, capture);
+        ok &= run_device_tables_case(gpu, cpu, gate, capture, nullptr, false, whole_banks);
         // Actual padded tensors, pinned by the model owner: all paths must copy and consume.
-        ok &= run_prefetch_staging(gpu, cpu, weights, capture, false);
-        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true);
-        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, gate);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, false, nullptr, whole_banks);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, nullptr, whole_banks);
+        ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, gate, whole_banks);
         unsigned int flags = 0;
         // Cache/table teardown must leave the model-owned registration alive.
         ok &= cudaHostGetFlags(&flags, arena) == cudaSuccess;
         ok &= capture.get().find("new_copy_bytes=0 new_registered_bytes=0") != std::string::npos;
-        ok &= cudaHostUnregister(arena) == cudaSuccess;
+        unpin(arena);
     }
 #endif
-    for (int64_t e = 0; e < weights->ne[2]; ++e) {
-        for (size_t i = 2 * bytes; i < stride; ++i) { ok &= arena[e * stride + i] == 0xa5; }
+    for (int64_t e = 0; e < experts; ++e) {
+        for (size_t i = 3 * bytes; i < stride; ++i) { ok &= arena[e * stride + i] == 0xa5; }
     }
     *weights = original;
     *gate = gate_original;
@@ -7169,6 +7940,40 @@ static bool test_prefetch_budget() {
 static bool test_profile_global_plan() {
     using item = ggml_cuda_moe_profile_item;
     ggml_cuda_moe_profile_plan plan;
+    std::vector<uint8_t> pool_data;
+    auto append64 = [&](uint64_t value) {
+        for (int shift = 0; shift < 64; shift += 8) { pool_data.push_back((uint8_t)(value >> shift)); }
+    };
+    for (uint64_t value : {UINT64_C(0x314c4f4f50454f4d), UINT64_C(2), UINT64_C(3), UINT64_C(4), UINT64_C(64),
+            UINT64_C(2), UINT64_C(8), UINT64_C(128)}) { append64(value); }
+    const std::vector<ggml_cuda_moe_pool_limit> pools = {{2, 8, 256}, {3, 4, 256}};
+    std::vector<size_t> caps;
+    bool pool_ok = ggml_cuda_moe_cache_pool_plan(pool_data.data(), pool_data.size(), pools, 64, caps);
+    pool_ok &= caps == std::vector<size_t>({128, 64});
+    const auto saved_caps = caps;
+    auto reject_pool = [&](std::vector<uint8_t> data) {
+        return !ggml_cuda_moe_cache_pool_plan(data.data(), data.size(), pools, 64, caps) && caps == saved_caps;
+    };
+    auto bad_pool = pool_data;
+    bad_pool[0] = 0; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[8] = 1; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool.pop_back(); pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool.push_back(0); pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[16] = 9; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[24] = 8; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[32] = 63; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; bad_pool[33] = 2; pool_ok &= reject_pool(bad_pool);
+    bad_pool = pool_data; std::copy_n(bad_pool.begin() + 16, 24, bad_pool.begin() + 40); pool_ok &= reject_pool(bad_pool);
+    pool_ok &= !ggml_cuda_moe_cache_pool_plan(pool_data.data(), pool_data.size(), pools, 0, caps);
+    std::vector<item> constrained;
+    for (int32_t expert = 0; expert < 256; ++expert) {
+        constrained.push_back({0, expert, 0, 0, 8, (uint64_t)(256 - expert)});
+        constrained.push_back({1, expert, 0, 1, 4, (uint64_t)(256 - expert)});
+    }
+    pool_ok &= ggml_cuda_moe_cache_profile_plan(constrained, caps, 4096, 64, plan);
+    pool_ok &= plan.bundles == 64 && plan.bytes == 768 && plan.slots == std::vector<size_t>({64, 64});
+    printf("cache-pool-plan: %s\n", pool_ok ? "OK" : "FAIL");
+    if (!pool_ok) { return false; }
     std::vector<item> items;
     std::vector<uint8_t> ranked;
     auto append32 = [&](uint32_t value) {
@@ -7295,7 +8100,69 @@ static bool test_profile_global_plan() {
     return ok;
 }
 
+#if defined(GGML_CUDA) && defined(__linux__)
+static bool test_host_pin_lifetime(ggml_backend_reg_t reg) {
+    auto pin = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
+    auto unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
+    auto unpinned = (bool (*)(const void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_is_unpinned");
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (!pin || !unpin || !unpinned || page_size <= 0) { return false; }
+    const size_t page = (size_t) page_size, bytes = 4 * page;
+    char * data = (char *) mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == MAP_FAILED) { return false; }
+    memset(data, 0x5a, bytes);
+    if (!pin(data, bytes)) { munmap(data, bytes); return false; }
+    bool ok = !unpinned(data, bytes) && !pin(data + page, page);
+    void * device = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t done = nullptr;
+    const bool allocated = cudaMalloc(&device, bytes) == cudaSuccess;
+    const bool streamed = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+    const bool event_created = cudaEventCreateWithFlags(&done, cudaEventDisableTiming) == cudaSuccess;
+    bool queued = allocated && streamed && event_created;
+    if (queued) {
+        queued = cudaMemcpyAsync(device, data, bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                cudaEventRecord(done, stream) == cudaSuccess;
+    }
+    unpin(data);
+    ok &= queued && cudaEventQuery(done) == cudaSuccess;
+    ok &= unpinned(data, bytes);
+    if (queued) {
+        memset(data, 0, bytes);
+        ok &= cudaMemcpy(data, device, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+        for (size_t i = 0; i < bytes; ++i) { ok &= data[i] == 0x5a; }
+    }
+    if (event_created) { ok &= cudaEventDestroy(done) == cudaSuccess; }
+    if (streamed) { ok &= cudaStreamDestroy(stream) == cudaSuccess; }
+    if (allocated) { ok &= cudaFree(device) == cudaSuccess; }
+    const bool first = pin(data, page), last = pin(data + 3 * page, page);
+    ok &= first && last && unpinned(data + page, 2 * page);
+    if (first && last) { ok &= !pin(data, bytes); }
+    if (unpinned(data + page, 2 * page)) { ok &= madvise(data + page, 2 * page, MADV_DONTNEED) == 0; }
+    if (first) { unpin(data); }
+    if (last) { unpin(data + 3 * page); }
+    ok &= unpinned(data, bytes);
+    const bool tiny = pin(data, 1);
+    ok &= tiny && !pin(data + 1, 1);
+    if (tiny) { unpin(data); }
+    ok &= unpinned(data, bytes);
+    ok &= munmap(data, bytes) == 0;
+    printf("cache-host-pin-lifetime: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif
+
 int main(int argc, char ** argv) {
+    // The ALLOCSIM fixtures expect the opt-in plan refresh and growth step-down (engine default off).
+    if (!getenv("GGML_MOE_CACHE_PLAN_REFRESH")) { set_env("GGML_MOE_CACHE_PLAN_REFRESH", "1"); }
+    if (!getenv("GGML_MOE_CACHE_GROW_STEPDOWN")) { set_env("GGML_MOE_CACHE_GROW_STEPDOWN", "1"); }
+#if defined(GGML_CUDA) && !defined(GGML_BACKEND_DL) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (argc == 2 && strcmp(argv[1], "--swap-async-cpu-only") == 0) {
+        const bool ok = ggml_cuda_moe_cache_swap_async_test();
+        printf("cache-swap-async snapshot/sequence/stale: %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && strcmp(argv[1], "--profile-global-plan-only") == 0) {
         return test_profile_global_plan() ? 0 : 1;
     }
@@ -7326,6 +8193,9 @@ int main(int argc, char ** argv) {
         const bool ok = cpu && run_resident_host_barriers(cpu);
         if (cpu) { ggml_backend_free(cpu); }
         return ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--skip-tail-rule-only") == 0) {
+        return run_skip_tail_rank_rule() && run_skipmass_rule() ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--prefetch-policy-only") == 0) {
         return 0;
@@ -7377,6 +8247,26 @@ int main(int argc, char ** argv) {
             ggml_backend_free(cpu);
         }
         return 1;
+    }
+#if defined(GGML_CUDA) && defined(__linux__)
+    if (argc == 2 && strcmp(argv[1], "--device-pageable-fallback-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_pageable_fallback(gpu, cpu, capture) && run_device_pageable_fallback(gpu, cpu, capture, true);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--host-pin-lifetime-only") == 0) {
+        const bool ok = provider_is_cuda && test_host_pin_lifetime(provider_reg);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+#endif
+    if (argc == 2 && strcmp(argv[1], "--device-fused-tables-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_fused_tables(gpu, cpu, capture);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--device-missjoin-retain-lifecycle-only") == 0) {
         const bool ok = provider_is_cuda && run_device_missjoin_retain_lifecycle(gpu, cpu, capture);
@@ -7439,6 +8329,12 @@ int main(int argc, char ** argv) {
         ok &= capture.get().find("publish_async=1") != std::string::npos;
         ok &= provider_is_cuda && run_device_adaptation_starvation(gpu, cpu, capture);
         set_env("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC", previous ? saved.c_str() : nullptr);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--skip-tail-only") == 0) {
+        const bool ok = provider_is_cuda && run_skip_tail_rank_rule() && run_skip_tail_layer(gpu, cpu, capture);
         ggml_backend_free(gpu);
         ggml_backend_free(cpu);
         return !provider_is_cuda ? 77 : ok ? 0 : 1;
@@ -7621,6 +8517,36 @@ int main(int argc, char ** argv) {
     ggml_backend_tensor_get(
             graph.out, reference.data(), 0, reference.size() * sizeof(float));
 
+    if (argc == 2 && strcmp(argv[1], "--device-tables-only") == 0) {
+        const bool ok = provider_is_cuda && run_device_tables(gpu, cpu, weights, capture);
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_quantize_free();
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        ggml_log_set(nullptr, nullptr);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--device-prefetch-only") == 0) {
+        bool ok = provider_is_cuda;
+        if (provider_is_cuda) {
+            ok &= run_arena_stride(gpu, cpu, weights, gate_weights, graph, reference, capture);
+            ok &= run_prefetch_staging(gpu, cpu, weights, capture, false);
+            ok &= run_prefetch_staging(gpu, cpu, weights, capture, true);
+            ok &= run_prefetch_staging(gpu, cpu, weights, capture, true, gate_weights);
+        }
+        free_graph(graph);
+        ggml_backend_buffer_free(static_buffer);
+        ggml_free(static_ctx);
+        ggml_quantize_free();
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        ggml_log_set(nullptr, nullptr);
+        return !provider_is_cuda ? 77 : ok ? 0 : 1;
+    }
+
     if (profile_warm_only) {
         bool ok = run_prompt_warm(gpu, cpu, weights, graph, reference, capture);
         ok &= run_prompt_warm_ranking(gpu, cpu, capture);
@@ -7716,11 +8642,19 @@ int main(int argc, char ** argv) {
     ok &= run_optional(provider_is_cuda, "cache-device-tables", [&] {
         return run_device_tables(gpu, cpu, weights, capture);
     });
+#if defined(GGML_CUDA) && defined(__linux__)
+    ok &= run_optional(provider_is_cuda, "cache-device-pageable-fallback", [&] {
+        return run_device_pageable_fallback(gpu, cpu, capture) && run_device_pageable_fallback(gpu, cpu, capture, true);
+    });
+#endif
     ok &= run_optional(provider_is_cuda, "cache-device-fused", [&] {
         return run_device_fused_tables(gpu, cpu, capture);
     });
     ok &= run_optional(provider_is_cuda, "cache-hitfirst-layer", [&] {
         return run_hitfirst_layer(gpu, cpu, capture);
+    });
+    ok &= run_optional(provider_is_cuda, "cache-skip-tail-layer", [&] {
+        return run_skip_tail_rank_rule() && run_skip_tail_layer(gpu, cpu, capture);
     });
     ok &= run_optional(provider_is_cuda, "cache-device-host-budget", [&] {
         return run_device_host_budget();

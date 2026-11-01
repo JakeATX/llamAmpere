@@ -467,6 +467,96 @@ def test_n_probs():
             assert "bytes" in prob and type(prob["bytes"]) == list
 
 
+@pytest.mark.parametrize("post_sampling_probs", [False, True])
+def test_n_probs_incomplete_utf8(post_sampling_probs):
+    global server
+    server.start()
+    tokenized = server.make_request("POST", "/tokenize", data={
+        "content": "\U0010ffff",
+        "with_pieces": True,
+    })
+    assert tokenized.status_code == 200
+    token = next(t for t in tokenized.body["tokens"]
+                 if isinstance(t["piece"], list) and 0xC2 <= t["piece"][0] <= 0xF4)
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Hello",
+        "n_predict": 1,
+        "n_probs": 10,
+        "return_tokens": True,
+        "temperature": 0.0,
+        "logit_bias": [[token["id"], 1000]],
+        "post_sampling_probs": post_sampling_probs,
+        "backend_sampling": False,
+    })
+    assert res.status_code == 200
+    assert res.body["tokens"] == [token["id"]]
+    assert res.body["timings"]["predicted_n"] == 1
+    assert len(res.body["completion_probabilities"]) == 1
+    row = res.body["completion_probabilities"][0]
+    assert row["id"] == token["id"] and row["bytes"] == token["piece"]
+    if post_sampling_probs:
+        assert len(row["top_probs"]) == 1
+        assert row["top_probs"][0]["id"] == token["id"]
+        assert row["top_probs"][0]["prob"] == pytest.approx(1.0)
+    else:
+        assert len(row["top_logprobs"]) == 10
+
+
+@pytest.mark.parametrize("post_sampling_probs", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_n_probs_complete_utf8(post_sampling_probs, stream):
+    global server
+    server.start()
+    text = "\U0010ffff"
+    pieces = server.make_request("POST", "/tokenize", data={
+        "content": text, "with_pieces": True,
+    }).body["tokens"]
+    pieces = [p for p in pieces if isinstance(p["piece"], list)]
+    expected = [p["piece"] for p in pieces]
+    assert bytes(b for piece in expected for b in piece) == text.encode()
+    data = {
+        "prompt": "Hello", "n_predict": len(pieces), "n_probs": 10,
+        "return_tokens": True, "temperature": 0.0, "backend_sampling": False,
+        "grammar": 'root ::= "' + text + '"',
+        "post_sampling_probs": post_sampling_probs, "stream": stream,
+    }
+    if stream:
+        chunks = list(server.make_stream_request("POST", "/completion", data=data))
+        rows = [row for chunk in chunks for row in chunk.get("completion_probabilities", [])]
+        assert "".join(chunk["content"] for chunk in chunks) == text
+    else:
+        res = server.make_request("POST", "/completion", data=data)
+        assert res.status_code == 200 and res.body["content"] == text
+        rows = res.body["completion_probabilities"]
+    assert [row["id"] for row in rows] == [p["id"] for p in pieces]
+    assert [row["bytes"] for row in rows] == expected
+    assert bytes(b for row in rows for b in row["bytes"]) == text.encode()
+
+
+@pytest.mark.parametrize("post_sampling_probs", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_n_probs_ascii_bytes(post_sampling_probs, stream):
+    global server
+    server.start()
+    data = {
+        "prompt": "Hello", "n_predict": 5, "n_probs": 10,
+        "return_tokens": True, "temperature": 0.0, "backend_sampling": False,
+        "post_sampling_probs": post_sampling_probs, "stream": stream,
+    }
+    if stream:
+        chunks = list(server.make_stream_request("POST", "/completion", data=data))
+        rows = [r for c in chunks for r in c.get("completion_probabilities", [])]
+        tokens = [t for c in chunks for t in c.get("tokens", [])]
+    else:
+        res = server.make_request("POST", "/completion", data=data)
+        assert res.status_code == 200
+        rows, tokens = res.body["completion_probabilities"], res.body["tokens"]
+    assert len(rows) == 5 and [r["id"] for r in rows] == tokens
+    for row in rows:
+        text = server.make_request("POST", "/detokenize", data={"tokens": [row["id"]]}).body["content"]
+        assert text.isascii() and row["bytes"] == list(text.encode())
+
+
 def test_n_probs_stream():
     global server
     server.start()

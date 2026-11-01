@@ -2,6 +2,9 @@
 // emulated activation path of the tile kernel (H256 rotation, x column scale, int8 round trip with one scale per
 // (token, slice)), then cuBLAS SGEMM in row slabs. This is the W4A8-style arithmetic of the fast kernel up to summation
 // order, so KL measured on it is the KL of the format. N <= 8 tokens take the tile-chain IMMA kernel (k_ait_mmv) unless
+// GGML_CUDA_AIT_ORDERED=0 restores the legacy unordered sum for comparison; GGML_CUDA_AIT_FUSE=1 (opt-in, default 0) sums the ordered slots inside the main kernel instead of a second kernel.
+// GGML_CUDA_AIT_SUM_CURSOR=1 advances ordered-sum bounds without per-partial division (default off; second sum kernel only).
+// GGML_CUDA_AIT_CTA (default 2 = one warp per tile and token in the epilogue; 1 = same sum, one thread per output; 0 = off, ordered slots; GGML_CUDA_AIT_CTA_LOG=1 prints which shapes engaged): the CTA adds its warps' tile sums in fixed order in shared memory and issues at most two atomics per output, so no slot buffer and no second kernel (shapes that do not qualify keep the ordered slots).
 // GGML_CUDA_AIT_REF=1; GGML_CUDA_AIT_WARPS = warps per block of it (default 12),
 // GGML_CUDA_AIT_FULL = 1 (default): fully unrolled chunk loop, 0 = rolled 4 x 4 groups (Gate 2 10-23: unrolled 8-13% faster at N=1, every rate). GGML_CUDA_AIT_EXACT=1: f32 activations (no int8 round trip; the
 // A/B for the activation quantizer). GGML_CUDA_AIT_ASLICE = 512 (default) or 256: activation scale slice.
@@ -10,7 +13,28 @@
 // l and l + 16 share a copy), 2: u16 entries, one copy per bank (64 KB, conflict-free, two more ALU ops per address).
 // GGML_CUDA_AIT_OCC = 0 (default), 1 or 2: AIT4 low-register experiment with a two-group or one-group prefetch ring.
 // Modes 3/4 cap registers; GGML_CUDA_AIT_OCC_GRID sets their blocks per SM (1..8, default 4).
+// GGML_CUDA_AIT3_PACK: 1 packs each AIT3 row tile with a tight register cap; 2 keeps the base register budget.
+// GGML_CUDA_AIT3_RING2=1 keeps two AIT3 weight groups live with the base register budget.
+// GGML_CUDA_AIT3_RING1=1 keeps one AIT3 weight group live; it takes precedence over RING2 and PACK.
+// GGML_CUDA_AIT4_NEIGHBOR=1 loads one weight vector per lane and shuffles its neighbor instead of loading it twice.
+// GGML_CUDA_AIT4_NEIGHBOR_PACK=1 packs one MMA tile at a time in the neighbor path.
+// GGML_CUDA_AIT4_NEIGHBOR_TAIL=1 refills the neighbor ring after its IMMA work.
+// GGML_CUDA_AIT4_NEIGHBOR_EARLY_X=1 reads activations before the neighbor group's decode.
+// GGML_CUDA_AIT4_NEIGHBOR_BOUNDS=1 gives the neighbor kernel a 384-thread compile bound.
+// GGML_CUDA_AIT4_NEIGHBOR_RING1=1 keeps one weight group live in the neighbor path.
+// GGML_CUDA_AIT4_NEIGHBOR_UNROLL2=1 unrolls two four-group steps in the neighbor path.
+// GGML_CUDA_AIT4_NEIGHBOR_OCC=1 launches two register-capped blocks per SM without tile packing.
+// GGML_CUDA_AIT4_NEIGHBOR_SCALES=1 reads scales early; =2 shares row scales between adjacent lanes.
+// GGML_CUDA_AIT4_RING2=1 keeps two AIT4 weight groups live with the base register budget (OCC=0, NEIGHBOR=0).
+// GGML_CUDA_AIT4_RING1=1 keeps one AIT4 weight group live and takes precedence over RING2.
+// GGML_CUDA_AIT4_TAIL=1 refills the four-group weight ring after each group's IMMA work.
+// GGML_CUDA_AIT4_PACK=1 packs each AIT4 MMA tile at the base register budget and four-group ring.
+// GGML_CUDA_AIT4_UNROLL2=1 unrolls two four-group steps instead of all four steps.
+// GGML_CUDA_AIT4_EARLY_X=1 loads each activation vector before decoding its weight group.
+// GGML_CUDA_AIT4_BOUNDS=1 sets the plain decode thread bound to 384 for a larger register budget.
 #include "ait.cuh"
+#include <set>
+#include <tuple>
 #include "ait-mm.cuh"
 #include "ai4.cuh"
 #include "ggml.h"
@@ -223,7 +247,7 @@ static __global__ void __launch_bounds__(64) k_ait_actq(const float * __restrict
         const uint32_t lo = (uint8_t) (int8_t) __float2int_rn(v[2 * q] * id), hi = (uint8_t) (int8_t) __float2int_rn(v[2 * q + 1] * id);
         *reinterpret_cast<uint16_t *>(dst + 8 * q) = (uint16_t) (lo | (hi << 8));
     }
-    for (int i = blockIdx.x * 64 + threadIdx.x; i < NT * M; i += gridDim.x * 64) {
+    for (int i = blockIdx.x * 64 + threadIdx.x; Y && i < NT * M; i += gridDim.x * 64) {
         Y[i] = 0.0f;
     }
 }
@@ -243,19 +267,30 @@ static __device__ __forceinline__ void ait_group_mma(int * c, const uint32_t (&a
     mma_s8(c, p[0], p[1], p[2], p[3], b.x, b.y);
 }
 
-// One group decodes four tiles and advances its prefetch-ring slot before the two IMMA operations.
-template <int KB, int NT, int Gi, int PC = 0, bool CO = false, int DEPTH = 4, bool LOW = false, bool SHARED_X = false>
+// One group decodes four tiles and refills its ring slot before IMMA, or after IMMA with TAIL.
+template <int KB, int NT, int Gi, int PC = 0, bool CO = false, int DEPTH = 4, bool LOW = false, bool SHARED_X = false, bool NEIGHBOR = false, bool TAIL = false, bool EARLY_X = false>
 static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const int G, const bool pf, const char * gp, const int (&off)[2],
         const int r, const char * xs, const bool live, int (&c)[2][4], const char * tsm = nullptr, const uint32_t lo = 0) {
+    static_assert(!TAIL || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X), "tail refill requires plain AIT4");
+    static_assert(!EARLY_X || (KB == 4 && PC == 0 && !CO && !LOW && !SHARED_X && !TAIL), "early activation requires plain AIT4");
     using namespace aitk;
     constexpr int GB = 128 * KB;
     constexpr bool ONE = 7 * KB + 16 <= 32;
-    const uint4 cur0 = buf[Gi][0], cur1 = buf[Gi][1];
-    if (pf) {
+    const uint4 cur0 = buf[Gi][0];
+    uint4 cur1;
+    if constexpr (NEIGHBOR) {
+        static_assert(KB == 4 && PC == 0, "neighbor vectors require one 16-byte vector per lane");
+        const int src = (threadIdx.x + 1) & 31;
+        cur1 = make_uint4(__shfl_sync(0xffffffffu, cur0.x, src), __shfl_sync(0xffffffffu, cur0.y, src),
+                         __shfl_sync(0xffffffffu, cur0.z, src), __shfl_sync(0xffffffffu, cur0.w, src));
+    } else {
+        cur1 = buf[Gi][1];
+    }
+    if (pf && !TAIL) {
         // groups past this chunk continue in the next one, after its 64 side bytes
         const char * p = gp + (G + DEPTH) * GB + (G + DEPTH >= 16 ? 64 : 0);
         buf[Gi][0] = ldw16(p + off[0]);
-        buf[Gi][1] = ldw16(p + off[1]);
+        if constexpr (!NEIGHBOR) { buf[Gi][1] = ldw16(p + off[1]); }
     }
     if constexpr (PC != 0) {
         static_assert(KB == 2, "AIT2P is k = 2");
@@ -277,7 +312,7 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         return;
     }
     if constexpr (LOW) {
-        static_assert(KB == 4 && PC == 0, "low-register path requires AIT4");
+        static_assert((KB == 3 || KB == 4) && PC == 0, "low-register path requires AIT3 or AIT4");
         uint32_t a[4], f[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -297,6 +332,12 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         ait_group_mma<KB, 1>(c[1], a, f, b);
         return;
     }
+    uint2 b = make_uint2(0, 0);
+    if constexpr (EARLY_X) {
+        if (NT == 8 || live) {
+            b = __ldg((const uint2 *) (xs + G * NT * 32));
+        }
+    }
     uint32_t Lv[4][8];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -309,9 +350,10 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
         Lv[i][0] = st1<KB, 0>(A, F1); Lv[i][1] = st1<KB, 1>(A, F1); Lv[i][2] = st1<KB, 2>(A, F1); Lv[i][3] = st1<KB, 3>(A, F1);
         Lv[i][4] = st1<KB, 4>(A, F1); Lv[i][5] = st1<KB, 5>(A, F1); Lv[i][6] = st1<KB, 6>(A, F1); Lv[i][7] = st1<KB, 7>(A, F1);
     }
-    uint2 b = make_uint2(0, 0);
-    if (NT == 8 || live) {
-        b = CO ? __ldcg((const uint2 *) (xs + G * NT * 32)) : __ldg((const uint2 *) (xs + G * NT * 32));
+    if constexpr (!EARLY_X) {
+        if (NT == 8 || live) {
+            b = CO ? __ldcg((const uint2 *) (xs + G * NT * 32)) : __ldg((const uint2 *) (xs + G * NT * 32));
+        }
     }
 #pragma unroll
     for (int u = 0; u < 2; ++u) {
@@ -325,6 +367,13 @@ static __device__ __forceinline__ void ait_group(uint4 (&buf)[DEPTH][2], const i
             }
         }
         mma_s8(c[u], a[0], a[1], a[2], a[3], b.x, b.y);
+    }
+    if constexpr (TAIL) {
+        if (pf) {
+            const char * p = gp + (G + DEPTH) * GB + (G + DEPTH >= 16 ? 64 : 0);
+            buf[Gi][0] = ldw16(p + off[0]);
+            if constexpr (!NEIGHBOR) { buf[Gi][1] = ldw16(p + off[1]); }
+        }
     }
 }
 
@@ -341,16 +390,49 @@ static __device__ __forceinline__ void ait_st_rel(unsigned int * p, unsigned int
     asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
 }
 
+// Only nonempty warp ranges write scratch. Reduce them in warp order without reading unused slots.
+static __device__ __forceinline__ bool ait_slot_live(int w, int tile, int S, int items, int warps) {
+    const int lo = (int) ((int64_t) w * items / warps), hi = (int) ((int64_t) (w + 1) * items / warps);
+    return lo < hi && lo < (tile + 1) * S && hi > tile * S;
+}
+
+// Slot window [first, last) of a tile and how many of its warps own a nonempty range.
+static __device__ __forceinline__ void ait_tile_slots(int tile, int S, int items, int warps, int & first, int & last, int & live) {
+    first = (int) ((int64_t) tile * S * warps / items);
+    last = (int) (((int64_t) (tile + 1) * S * warps + items - 1) / items);
+    live = 0;
+    for (int w = first; w < last; ++w) {
+        live += ait_slot_live(w, tile, S, items, warps);
+    }
+}
+
+static __device__ __forceinline__ void ait_tile_sum(const float * partial, float * Y, int tile, int token, int lane, int slot_stride,
+        int M, int S, int items, int warps, int first, int last) {
+    const int row = tile * 32 + lane;
+    float sum = 0.0f;
+    for (int w = first; w < last; ++w) {
+        if (ait_slot_live(w, tile, S, items, warps)) {
+            sum += __ldcg(partial + (int64_t) (w - first) * slot_stride + token * M + row);
+        }
+    }
+    Y[token * M + row] = sum;
+}
+
 // FULL: the 16 groups of a chunk fully unrolled (largest code); else a rolled loop of 4 x (4 unrolled groups) (about 1/4 the
 // code: the Gate-2 trace showed the unrolled 1MAD loop losing 8-11 us when another kernel ran before it)
 // V (experiment, GGML_CUDA_AIT_V): bit 0 = load the item's row scales and SA at item start (they were a cold DRAM read at the
 // item's end, not prefetched); bit 1 = fused activation prep: the kernel itself does k_ait_actq's work (one warp per (token,
 // 512-K slice)) and zeroes Y, behind a grid barrier (cooperative launch, 1 CTA per SM); the weight ring and l2pf lines
 // (prefetch.global.L2, 128 B per lane each) are issued before the barrier; activations are then read with ld.global.cg.
-template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false>
-static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
+template <int KB, int NT, bool FULL, int PC = 0, int V = 0, int DEPTH = 4, bool LOW = false, bool CAP = false, bool PACK = LOW, bool NEIGHBOR = false, bool TAIL = false, bool UNROLL2 = false, bool EARLY_X = false, bool BOUNDS = false>
+static __global__ void __launch_bounds__(CAP ? 256 : LOW || BOUNDS ? 384 : 512, CAP ? 4 : LOW ? 2 : 1) k_ait_mmv(const char * __restrict__ W, const int8_t * X,
         const float * SA, float * __restrict__ Y, const int M, const int K, const float * __restrict__ XF = nullptr,
-        const int l2pf = 0) {
+        const int l2pf = 0, float * __restrict__ partial = nullptr, unsigned int * tcnt = nullptr, const int det = 0) {
+    static_assert(!NEIGHBOR || (KB == 4 && FULL && PC == 0 && (V == 0 || V == 1 || V == 5)), "neighbor path requires plain full AIT4");
+    static_assert(!TAIL || (KB == 4 && FULL && PC == 0 && V == 0 && !PACK), "tail refill requires plain full AIT4");
+    static_assert(!UNROLL2 || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL), "two-step unroll requires plain full AIT4");
+    static_assert(!EARLY_X || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL && !UNROLL2), "early activation requires plain full AIT4");
+    static_assert(!BOUNDS || (KB == 4 && FULL && PC == 0 && V == 0 && DEPTH == 4 && !LOW && !CAP && !PACK && !TAIL && !UNROLL2 && !EARLY_X), "thread bound requires plain full AIT4");
     constexpr bool CO = (V & 2) != 0;
     using namespace aitk;
     constexpr int BQ = 8 * KB, GB = 16 * BQ, CS = 2048 * KB + 64, MU = 2;
@@ -366,6 +448,15 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
     if (!CO && i0 >= i1) {
         return;
     }
+    // det != 0 (GGML_CUDA_AIT_CTA, host-checked by ait_cta_ok: every warp has work, spans at most two tiles, every tile spans at most two CTAs):
+    // warps park their tile sums in shared memory (dynamic, PC == 0 only) and the CTA adds them in warp order, so a Y element gets at most two
+    // float atomics, 0 + a + b, whose order cannot change the bits. dfs = [warp][flush slot][token][33], then two ints per warp.
+    float * dfs = (float *) ait_mv_tab;
+    int * dti = (int *) (dfs + nw * 2 * NT * 33);
+    if (det != 0 && lane == 0) {
+        dti[2 * (threadIdx.x >> 5)] = i0 / S;
+        dti[2 * (threadIdx.x >> 5) + 1] = (i1 - 1) / S - i0 / S + 1;
+    }
     const int wq = (lane * BQ) >> 5, r = (lane * BQ) & 31;
     const int off[2] = { 16 * (wq % BQ), 16 * ((wq + 1) % BQ) };
     const char * gp = W + (int64_t) i0 * CS;
@@ -374,7 +465,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
 #pragma unroll
         for (int d = 0; d < DEPTH; ++d) {
             buf[d][0] = ldw16(gp + d * GB + off[0]);
-            buf[d][1] = ldw16(gp + d * GB + off[1]);
+            if constexpr (!NEIGHBOR) { buf[d][1] = ldw16(gp + d * GB + off[1]); }
         }
     }
     if constexpr (CO) {
@@ -436,7 +527,7 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
                 }
             }
         }
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < NT * M; i += gridDim.x * blockDim.x) {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; !partial && i < NT * M; i += gridDim.x * blockDim.x) {
             Y[i] = 0.0f;
         }
         __syncthreads();
@@ -464,6 +555,8 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
     int t = i0 / S, ks = i0 - t * S;
     const char * xs = xb + ks * (16 * NT * 32);
     float cf[MU][4];
+    uint32_t rp[MU];
+    float rs[MU][2];
 #pragma unroll
     for (int u = 0; u < MU; ++u) {
         cf[u][0] = cf[u][1] = cf[u][2] = cf[u][3] = 0.0f;
@@ -477,24 +570,57 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
             c[u][0] = c[u][1] = c[u][2] = c[u][3] = 0;
         }
         float s0 = 0.0f, s1 = 0.0f;
-        uint32_t rp[MU];
+        float sr[MU][4];
         if constexpr ((V & 1) != 0) {
             // row scales of rows 32t + 16u + g (+8) for K block ks / 2: chunk (t, 2 (ks / 2) + u), slots g and g + 8
             if (n0 < NT)     { s0 = CO ? __ldcg(SA + n0 * S + ks) : __ldg(SA + n0 * S + ks); }
             if (n0 + 1 < NT) { s1 = CO ? __ldcg(SA + (n0 + 1) * S + ks) : __ldg(SA + (n0 + 1) * S + ks); }
+            // Adjacent K slices use the same row scales; a warp may start on the odd slice.
+            if (!NEIGHBOR || V != 5 || it == i0 || (ks & 1) == 0) {
+                if constexpr (NEIGHBOR && V == 5) {
+                    const unsigned short * sb = (const unsigned short *) (gp - (ks & 1) * CS + 2048 * KB);
+                    const int row = g + ((q & 1) << 3);
+                    // Pack both row tiles so one shuffle supplies their peer scales.
+                    const uint32_t rows = (uint32_t) __ldg(sb + row) | ((uint32_t) __ldg(sb + CS / 2 + row) << 16);
+                    const uint32_t peer = __shfl_xor_sync(0xffffffffu, rows, 1);
+                    rp[0] = __byte_perm(rows, peer, (q & 1) ? 0x1054 : 0x5410);
+                    rp[1] = __byte_perm(rows, peer, (q & 1) ? 0x3276 : 0x7632);
 #pragma unroll
-            for (int u = 0; u < MU; ++u) {
-                const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
-                rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+                    for (int u = 0; u < MU; ++u) {
+                        rs[u][0] = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
+                        rs[u][1] = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
+                    }
+                } else {
+#pragma unroll
+                    for (int u = 0; u < MU; ++u) {
+                        const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
+                        rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+                    }
+                }
             }
         }
-        if constexpr (FULL) {
+        if constexpr (NEIGHBOR && V == 5) {
+#pragma unroll
+            for (int u = 0; u < MU; ++u) {
+                sr[u][0] = s0 * rs[u][0]; sr[u][1] = s1 * rs[u][0];
+                sr[u][2] = s0 * rs[u][1]; sr[u][3] = s1 * rs[u][1];
+            }
+        }
+        if constexpr (UNROLL2) {
+#pragma unroll 2
+            for (int G4 = 0; G4 < 16; G4 += 4) {
+                ait_group<KB, NT, 0, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 0, G4 + 4 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 1, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 1, G4 + 5 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 2, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 2, G4 + 6 < 16 || more, gp, off, r, xs, live, c);
+                ait_group<KB, NT, 3, PC, CO, DEPTH, PACK, false, NEIGHBOR>(buf, G4 + 3, G4 + 7 < 16 || more, gp, off, r, xs, live, c);
+            }
+        } else if constexpr (FULL) {
 #pragma unroll
             for (int G4 = 0; G4 < 16; G4 += 4) {
-                ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 1 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 2 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
-                ait_group<KB, NT, 3 % DEPTH, PC, CO, DEPTH, LOW>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 0 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 0, G4 + DEPTH < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 1 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 2 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
+                ait_group<KB, NT, 3 % DEPTH, PC, CO, DEPTH, PACK, false, NEIGHBOR, TAIL, EARLY_X>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, live, c, tsm, lo);
             }
         } else {
 #pragma unroll 1
@@ -518,10 +644,15 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
         }
 #pragma unroll
         for (int u = 0; u < MU; ++u) {
-            const float r0 = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
-            const float r1 = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
-            cf[u][0] += s0 * r0 * (float) c[u][0]; cf[u][1] += s1 * r0 * (float) c[u][1];
-            cf[u][2] += s0 * r1 * (float) c[u][2]; cf[u][3] += s1 * r1 * (float) c[u][3];
+            if constexpr (NEIGHBOR && V == 5) {
+                cf[u][0] += sr[u][0] * (float) c[u][0]; cf[u][1] += sr[u][1] * (float) c[u][1];
+                cf[u][2] += sr[u][2] * (float) c[u][2]; cf[u][3] += sr[u][3] * (float) c[u][3];
+            } else {
+                const float r0 = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
+                const float r1 = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
+                cf[u][0] += s0 * r0 * (float) c[u][0]; cf[u][1] += s1 * r0 * (float) c[u][1];
+                cf[u][2] += s0 * r1 * (float) c[u][2]; cf[u][3] += s1 * r1 * (float) c[u][3];
+            }
         }
         xs += 16 * NT * 32;
         ++ks;
@@ -529,14 +660,114 @@ static __global__ void __launch_bounds__(CAP ? 256 : LOW ? 384 : 512, CAP ? 4 : 
 #pragma unroll
             for (int u = 0; u < MU; ++u) {
                 const int m0 = t * 32 + 16 * u + g, m1 = m0 + 8;
-                if (n0 < NT)     { atomicAdd(Y + n0 * M + m0, cf[u][0]);       atomicAdd(Y + n0 * M + m1, cf[u][2]); }
-                if (n0 + 1 < NT) { atomicAdd(Y + (n0 + 1) * M + m0, cf[u][1]); atomicAdd(Y + (n0 + 1) * M + m1, cf[u][3]); }
+                if (det != 0) {
+                    float * fs = dfs + ((threadIdx.x >> 5) * 2 + (t - i0 / S)) * NT * 33;
+                    const int rr = 16 * u + g;
+                    if (n0 < NT)     { fs[n0 * 33 + rr] = cf[u][0];       fs[n0 * 33 + rr + 8] = cf[u][2]; }
+                    if (n0 + 1 < NT) { fs[(n0 + 1) * 33 + rr] = cf[u][1]; fs[(n0 + 1) * 33 + rr + 8] = cf[u][3]; }
+                } else if (partial) {
+                    const int first = (int) ((int64_t) t * S * W_ / items);
+                    float * out = partial + (int64_t) (w - first) * NT * M;
+                    if (n0 < NT)     { out[n0 * M + m0] = cf[u][0];       out[n0 * M + m1] = cf[u][2]; }
+                    if (n0 + 1 < NT) { out[(n0 + 1) * M + m0] = cf[u][1]; out[(n0 + 1) * M + m1] = cf[u][3]; }
+                } else {
+                    if (n0 < NT)     { atomicAdd(Y + n0 * M + m0, cf[u][0]);       atomicAdd(Y + n0 * M + m1, cf[u][2]); }
+                    if (n0 + 1 < NT) { atomicAdd(Y + (n0 + 1) * M + m0, cf[u][1]); atomicAdd(Y + (n0 + 1) * M + m1, cf[u][3]); }
+                }
                 cf[u][0] = cf[u][1] = cf[u][2] = cf[u][3] = 0.0f;
+            }
+            if (tcnt) {
+                // The last warp to finish tile t sums its slots in warp order (same order and bits as k_ait_mmv_sum).
+                int first, last, n_slot;
+                ait_tile_slots(t, S, items, W_, first, last, n_slot);
+                __threadfence();
+                __syncwarp();
+                unsigned int prev = 0;
+                if (lane == 0) {
+                    prev = atomicAdd(tcnt + t, 1u);
+                }
+                if (__shfl_sync(0xffffffffu, prev, 0) + 1 == (unsigned int) n_slot) {
+                    __threadfence();
+                    for (int n = 0; n < NT; ++n) {
+                        ait_tile_sum(partial, Y, t, n, lane, NT * M, M, S, items, W_, first, last);
+                    }
+                }
             }
             ks = 0;
             ++t;
             xs = xb;
         }
+    }
+    if (det != 0) {
+        __syncthreads();
+        const int w0 = blockIdx.x * nw;
+        const int c0 = (int) ((int64_t) w0 * items / W_), c1 = (int) ((int64_t) (w0 + nw) * items / W_);
+        const int ta = c0 / S, ntl = (c1 - 1) / S - ta + 1;
+        if (det == 2) {
+            // one warp per (tile, token): lane = output row; a ballot over the warps' tile ranges names the contributing warps, added in ascending order (same bits as det 1)
+            const int ws = lane < nw ? dti[2 * lane] : 0, wc = lane < nw ? dti[2 * lane + 1] : 0;
+            for (int pr = threadIdx.x >> 5; pr < ntl * NT; pr += nw) {
+                const int tile = ta + pr / NT, n = pr % NT;
+                unsigned int m = __ballot_sync(0xffffffffu, lane < nw && tile >= ws && tile < ws + wc);
+                float sum = 0.0f;
+                while (m != 0) {
+                    const int wl = __ffs(m) - 1;
+                    m &= m - 1;
+                    sum += dfs[((wl * 2 + (tile - dti[2 * wl])) * NT + n) * 33 + lane];
+                }
+                atomicAdd(Y + (int64_t) n * M + tile * 32 + lane, sum);
+            }
+            return;
+        }
+        for (int e = threadIdx.x; e < ntl * NT * 32; e += blockDim.x) {
+            const int tile = ta + e / (NT * 32), n = (e / 32) % NT, row = e & 31;
+            float sum = 0.0f;
+            for (int wl = 0; wl < nw; ++wl) {
+                const int sl = tile - dti[2 * wl];
+                if (sl >= 0 && sl < dti[2 * wl + 1]) {
+                    sum += dfs[((wl * 2 + sl) * NT + n) * 33 + row];
+                }
+            }
+            atomicAdd(Y + (int64_t) n * M + tile * 32 + row, sum);
+        }
+    }
+}
+
+// Only nonempty warp ranges write scratch. Reduce them in warp order without reading unused slots.
+// CURSOR: the same slots and order, with the range bounds advanced incrementally instead of divided per slot.
+template <int NT, bool CURSOR>
+static __global__ void k_ait_mmv_sum(const float * __restrict__ partial, float * __restrict__ Y, int M, int S, int warps, int step, uint32_t tail) {
+    const int tile = blockIdx.x, items = (M / 32) * S;
+    if constexpr (CURSOR) {
+        const int row = tile * 32 + (threadIdx.x & 31), token = threadIdx.x >> 5;
+        const int begin = tile * S, end = begin + S;
+        const int first = (int) ((int64_t) begin * warps / items);
+        const int last = (int) (((int64_t) end * warps + items - 1) / items);
+        float sum = 0.0f;
+        const uint32_t warp_count = (uint32_t) warps;
+        const int64_t start = (int64_t) first * items;
+        int hi = (int) (start / warps);
+        // carry + tail <= 2 * (warps - 1) < 2^32 for positive int warps.
+        uint32_t carry = (uint32_t) (start - (int64_t) hi * warps);
+        const bool nonempty_step = step != 0;
+        const int64_t partial_stride = (int64_t) NT * M;
+        int64_t partial_offset = (int64_t) token * M + row;
+        for (int w = first; w < last; ++w) {
+            carry += tail;
+            const bool wrap = carry >= warp_count;
+            hi += step + wrap;
+            carry -= wrap ? warp_count : 0;
+            // The range is nonempty iff step > 0 or the remainder wraps.
+            if ((nonempty_step || wrap) && hi > begin) {
+                sum += partial[partial_offset];
+            }
+            partial_offset += partial_stride;
+        }
+        Y[token * M + row] = sum;
+    } else {
+        int first, last, live;
+        ait_tile_slots(tile, S, items, warps, first, last, live);
+        ait_tile_sum(partial, Y, tile, threadIdx.x >> 5, threadIdx.x & 31, NT * M, M, S, items, warps, first, last);
     }
 }
 
@@ -647,20 +878,20 @@ static __global__ void __launch_bounds__(32 * NW, NW == 16 ? 2 : 4) k_ait4_row_o
 
 template <int NT, bool FULL, int PC>
 static void ait_mmv_p(const dim3 grid, const dim3 block, cudaStream_t stream, const char * w, const int8_t * xq, const float * sa,
-        float * Y, int M, int K) {
+        float * Y, int M, int K, float * partial, unsigned int * tcnt) {
     constexpr int SMEM = aitk::ptab_bytes<PC, 16>();
     static bool attr = false;
     if (!attr) {
         CUDA_CHECK(cudaFuncSetAttribute(k_ait_mmv<2, NT, FULL, PC>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
         attr = true;
     }
-    k_ait_mmv<2, NT, FULL, PC><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K);
+    k_ait_mmv<2, NT, FULL, PC><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K, nullptr, 0, partial, tcnt);
 }
 
 // GGML_CUDA_AIT_V experiment launcher (FULL kernel; NT 1/4/5/8 only, others keep V = 0): V & 2 = cooperative fused launch
 template <int KB, int NT, int PC, int V>
 static void ait_mmv_v(const dim3 grid, const dim3 block, cudaStream_t stream, const char * w, const int8_t * xq, const float * sa,
-        float * Y, int M, int K, const float * X, int l2pf) {
+        float * Y, int M, int K, const float * X, int l2pf, float * partial) {
     constexpr int SMEM = aitk::ptab_bytes<PC, 16>();
     static bool attr = false;
     if (!attr && SMEM > 0) {
@@ -668,27 +899,37 @@ static void ait_mmv_v(const dim3 grid, const dim3 block, cudaStream_t stream, co
     }
     attr = true;
     if constexpr ((V & 2) != 0) {
-        void * args[] = { (void *) &w, (void *) &xq, (void *) &sa, (void *) &Y, (void *) &M, (void *) &K, (void *) &X, (void *) &l2pf };
+        unsigned int * tc0 = nullptr;
+        int det0 = 0;
+        void * args[] = { (void *) &w, (void *) &xq, (void *) &sa, (void *) &Y, (void *) &M, (void *) &K, (void *) &X, (void *) &l2pf, (void *) &partial, (void *) &tc0, (void *) &det0 };
         CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) k_ait_mmv<KB, NT, true, PC, V>, grid, block, args, SMEM, stream));
     } else {
-        k_ait_mmv<KB, NT, true, PC, V><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K, X, l2pf);
+        k_ait_mmv<KB, NT, true, PC, V><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K, X, l2pf, partial);
     }
 }
 
 template <int NT, int V>
 static void ait_mmv_vk(const dim3 grid, const dim3 block, cudaStream_t stream, const char * w, const int8_t * xq, const float * sa,
-        float * Y, int M, int K, const float * X, int l2pf, int k, int code) {
-    if (code == 1) { ait_mmv_v<2, NT, 1, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf); return; }
+        float * Y, int M, int K, const float * X, int l2pf, int k, int code, float * partial) {
+    if (code == 1) { ait_mmv_v<2, NT, 1, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf, partial); return; }
     switch (k) {
-        case 2:  ait_mmv_v<2, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf); break;
-        case 3:  ait_mmv_v<3, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf); break;
-        default: ait_mmv_v<4, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf); break;
+        case 2:  ait_mmv_v<2, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf, partial); break;
+        case 3:  ait_mmv_v<3, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf, partial); break;
+        default: ait_mmv_v<4, NT, 0, V>(grid, block, stream, w, xq, sa, Y, M, K, X, l2pf, partial); break;
     }
 }
 
 static int ait_plds() {
     static const int v = ait_env_int("GGML_CUDA_AIT_PLDS", 1) == 2 ? 2 : 1;
     return v;
+}
+
+// GGML_CUDA_AIT_CTA: the shared-memory CTA sum of k_ait_mmv needs every warp to own work, to touch at most two tiles (item range <= S) and every
+// tile to span at most two CTAs (a CTA's item range > S). Anything else keeps the ordered slot path.
+static bool ait_cta_ok(int M, int K, int nsm, int warps) {
+    const int S = K / 512;
+    const int64_t lmin = (int64_t) (M / 32) * S / ((int64_t) nsm * warps);
+    return lmin >= 1 && lmin + 1 <= S && warps * lmin >= S + 1;
 }
 
 template <int NT>
@@ -719,66 +960,239 @@ static void ait_fast_nt(ggml_backend_cuda_context & ctx, const uint8_t * W, cons
     const char * w = (const char *) W;
     static const int vexp = ait_env_int("GGML_CUDA_AIT_V", 0) & 3;
     static const int l2pf = std::max(0, std::min(32, ait_env_int("GGML_CUDA_AIT_L2PF", 0)));
+    static const int occ = ait_env_int("GGML_CUDA_AIT_OCC", 0);
+    static const bool neighbor4 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR", 0) == 1;
+    static const bool neighbor4_occ = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_OCC", 0) == 1;
+    static const int grid_factor = std::max(1, std::min(8, ait_env_int("GGML_CUDA_AIT_OCC_GRID", 4)));
+    static const bool ordered = ait_env_int("GGML_CUDA_AIT_ORDERED", 1) != 0;
+    static const bool sum_cursor = ait_env_int("GGML_CUDA_AIT_SUM_CURSOR", 0) != 0;
+    const bool use_v = (NT == 1 || NT == 4 || NT == 5 || NT == 8) && vexp != 0 && (code != 1 || ait_plds() == 1);
+    int total_warps = nsm * warps;
+    if (!use_v && k == 4 && code == 0 && full && occ > 0) {
+        total_warps = occ >= 3 ? grid_factor * nsm * 8 : 2 * nsm * std::min(warps, 12);
+    }
+    const bool reserve_neighbor_occ = !use_v && k == 4 && code == 0 && full && warps <= 12 && occ == 0 &&
+        neighbor4_occ && neighbor4;
+    const int scratch_warps = reserve_neighbor_occ ? 2 * total_warps : total_warps;
+    const size_t slots = (scratch_warps + M / 32 - 1) / (M / 32) + 2;
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(id));
+    // GGML_CUDA_AIT_FUSE=1 (opt-in, default 0 = second sum kernel): the last warp of each tile sums its slots in the main kernel, so no second launch. The tile
+    // counters follow the slots and are zeroed by k_ait_actq. Unset, 0 or the V experiments keep the sum kernel.
+    static const bool fuse_opt = ait_env_int("GGML_CUDA_AIT_FUSE", 0) != 0;
+    // These variants keep the second sum kernel. Plain neighbor loads also support the CTA sum below.
+    static const bool ait_kernel_exp = [] {
+        static const char * const names[] = { "GGML_CUDA_AIT4_BOUNDS", "GGML_CUDA_AIT4_EARLY_X", "GGML_CUDA_AIT4_UNROLL2",
+            "GGML_CUDA_AIT4_PACK", "GGML_CUDA_AIT4_TAIL", "GGML_CUDA_AIT4_RING1", "GGML_CUDA_AIT4_RING2",
+            "GGML_CUDA_AIT3_RING1", "GGML_CUDA_AIT3_RING2" };
+        for (const char * n : names) { if (ait_env_int(n, 0) == 1) { return true; } }
+        const int p3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0);
+        return p3 == 1 || p3 == 2;
+    }();
+    static const bool neighbor4_exp = [] {
+        static const char * const names[] = { "GGML_CUDA_AIT4_NEIGHBOR_PACK", "GGML_CUDA_AIT4_NEIGHBOR_RING2",
+            "GGML_CUDA_AIT4_NEIGHBOR_RING1", "GGML_CUDA_AIT4_NEIGHBOR_TAIL", "GGML_CUDA_AIT4_NEIGHBOR_EARLY_X",
+            "GGML_CUDA_AIT4_NEIGHBOR_BOUNDS", "GGML_CUDA_AIT4_NEIGHBOR_UNROLL2", "GGML_CUDA_AIT4_NEIGHBOR_OCC" };
+        for (const char * n : names) { if (ait_env_int(n, 0) == 1) { return true; } }
+        return ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_SCALES", 0) != 0;
+    }();
+    const bool fuse = ordered && fuse_opt && !use_v && !ait_kernel_exp && !neighbor4;
+    static const int cta_env = ait_env_int("GGML_CUDA_AIT_CTA", 2);
+    static const int cta_mode = cta_env == 1 ? 1 : 2;
+    static const bool cta_opt = cta_env != 0;
+    static const bool cta_log = ait_env_int("GGML_CUDA_AIT_CTA_LOG", 0) != 0;
+    const bool cta = ordered && cta_opt && !fuse && !use_v && occ == 0 && code == 0 && full && !ait_kernel_exp &&
+        (!neighbor4 || (k == 4 && warps <= 12 && !neighbor4_exp)) && ait_cta_ok(M, K, nsm, warps);
+    const size_t cta_smem = cta ? (size_t) warps * 2 * (NT * 33 + 2) * sizeof(float) : 0;
+    if (cta_log) {
+        // one line per distinct shape, so a run shows whether GGML_CUDA_AIT_CTA engaged or fell back to the ordered slots
+        static thread_local std::set<std::tuple<int, int, int, int>> seen;
+        if (seen.insert(std::make_tuple(M, K, (int) NT, (int) cta)).second) {
+            fprintf(stderr, "[ait-cta] M=%d K=%d N=%d code=%d k=%d: %s\n", M, K, (int) NT, code, k, cta ? (neighbor4 ? "CTA sum (neighbor)" : "CTA sum") : "ordered slots (not eligible)");
+        }
+    }
+    if (ordered && !cta) {
+        scratch.alloc(slots * NT * (size_t) M + (fuse ? NT * (size_t) M : 0));
+    }
+    float * partial = ordered && !cta ? scratch.get() : nullptr;
+    unsigned int * tcnt = fuse ? (unsigned int *) (partial + slots * NT * (size_t) M) : nullptr;
+    float * actq_zero = fuse ? (float *) tcnt : ordered && !cta ? nullptr : Y;
+    auto finish = [&]() {
+        if (ordered && !fuse && !cta) {
+            CUDA_CHECK(cudaGetLastError());
+            if (sum_cursor) {
+                const int items = (M / 32) * S;
+                k_ait_mmv_sum<NT, true><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps, items / total_warps, (uint32_t) (items % total_warps));
+            } else {
+                k_ait_mmv_sum<NT, false><<<M / 32, 32 * NT, 0, stream>>>(partial, Y, M, S, total_warps, 0, 0);
+            }
+        }
+        CUDA_CHECK(cudaGetLastError());
+    };
     if constexpr (NT == 1 || NT == 4 || NT == 5 || NT == 8) {
         if (vexp != 0 && (code != 1 || ait_plds() == 1)) {
             if (vexp & 2) {
-                ait_mmv_vk<NT, 3>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code);
+                ait_mmv_vk<NT, 3>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code, partial);
             } else {
-                k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), Y, M, K, k);
-                ait_mmv_vk<NT, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code);
+                k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), actq_zero, M, K, k);
+                ait_mmv_vk<NT, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, X, l2pf, k, code, partial);
             }
-            CUDA_CHECK(cudaGetLastError());
+            finish();
             return;
         }
     }
-    k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), Y, M, K, k);
-    static const int occ = ait_env_int("GGML_CUDA_AIT_OCC", 0);
+    k_ait_actq<NT><<<NT * S, 64, 0, stream>>>(X, W, xq.get(), sa.get(), actq_zero, M, K, k);
+    static const bool bounds4 = ait_env_int("GGML_CUDA_AIT4_BOUNDS", 0) == 1;
+    if (bounds4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool early4_x = ait_env_int("GGML_CUDA_AIT4_EARLY_X", 0) == 1;
+    if (early4_x && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool unroll4_two = ait_env_int("GGML_CUDA_AIT4_UNROLL2", 0) == 1;
+    if (unroll4_two && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool pack4 = ait_env_int("GGML_CUDA_AIT4_PACK", 0) == 1;
+    if (pack4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool tail4 = ait_env_int("GGML_CUDA_AIT4_TAIL", 0) == 1;
+    if (tail4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    if (neighbor4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0 && !cta) {
+        static const bool neighbor4_pack = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_PACK", 0) == 1;
+        static const bool neighbor4_ring2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING2", 0) == 1;
+        static const bool neighbor4_ring1 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_RING1", 0) == 1;
+        static const bool neighbor4_tail = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_TAIL", 0) == 1;
+        static const bool neighbor4_early_x = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_EARLY_X", 0) == 1;
+        static const bool neighbor4_bounds = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_BOUNDS", 0) == 1;
+        static const bool neighbor4_unroll2 = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_UNROLL2", 0) == 1;
+        static const int neighbor4_scales = ait_env_int("GGML_CUDA_AIT4_NEIGHBOR_SCALES", 0);
+        if (neighbor4_pack) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_ring2) {
+            k_ait_mmv<4, NT, true, 0, 0, 2, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_ring1) {
+            k_ait_mmv<4, NT, true, 0, 0, 1, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_tail) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_early_x) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_bounds) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_unroll2) {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_scales == 1) {
+            k_ait_mmv<4, NT, true, 0, 1, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_scales == 2) {
+            k_ait_mmv<4, NT, true, 0, 5, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else if (neighbor4_occ) {
+            const dim3 grid_occ(2 * nsm);
+            total_warps = 2 * nsm * warps;
+            k_ait_mmv<4, NT, true, 0, 0, 4, true, false, false, true><<<grid_occ, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else {
+            k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        }
+        finish();
+        return;
+    }
+    static const bool ring4_one = ait_env_int("GGML_CUDA_AIT4_RING1", 0) == 1;
+    if (ring4_one && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 1><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool ring4 = ait_env_int("GGML_CUDA_AIT4_RING2", 0) == 1;
+    if (ring4 && k == 4 && code == 0 && full && warps <= 12 && occ == 0) {
+        k_ait_mmv<4, NT, true, 0, 0, 2><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool ring1 = ait_env_int("GGML_CUDA_AIT3_RING1", 0) == 1;
+    if (ring1 && k == 3 && code == 0 && full && warps <= 12) {
+        k_ait_mmv<3, NT, true, 0, 0, 1><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const bool ring2 = ait_env_int("GGML_CUDA_AIT3_RING2", 0) == 1;
+    if (ring2 && k == 3 && code == 0 && full && warps <= 12) {
+        k_ait_mmv<3, NT, true, 0, 0, 2><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        finish();
+        return;
+    }
+    static const int pack3 = ait_env_int("GGML_CUDA_AIT3_PACK", 0);
+    if ((pack3 == 1 || pack3 == 2) && k == 3 && code == 0 && full && warps <= 12) {
+        if (pack3 == 2) {
+            k_ait_mmv<3, NT, true, 0, 0, 4, false, false, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        } else {
+            k_ait_mmv<3, NT, true, 0, 0, 4, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial);
+        }
+        finish();
+        return;
+    }
     if (k == 4 && code == 0 && full && occ > 0) {
         // Modes 3/4 cap registers for four 256-thread blocks per SM. Keep
         // both prefetch depths; profiles must check for local-memory spills.
         if (occ >= 3) {
-            static const int grid_factor = std::max(1, std::min(8, ait_env_int("GGML_CUDA_AIT_OCC_GRID", 4)));
             const dim3 grid_cap(grid_factor * nsm), block_cap(256);
             if (occ == 4) {
-                k_ait_mmv<4, NT, true, 0, 0, 1, true, true><<<grid_cap, block_cap, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K);
+                k_ait_mmv<4, NT, true, 0, 0, 1, true, true><<<grid_cap, block_cap, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt);
             } else {
-                k_ait_mmv<4, NT, true, 0, 0, 2, true, true><<<grid_cap, block_cap, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K);
+                k_ait_mmv<4, NT, true, 0, 0, 2, true, true><<<grid_cap, block_cap, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt);
             }
-            CUDA_CHECK(cudaGetLastError());
+            finish();
             return;
         }
         const dim3 grid_occ(2 * nsm), block_occ(32 * std::min(warps, 12));
         if (occ == 2) {
-            k_ait_mmv<4, NT, true, 0, 0, 1, true><<<grid_occ, block_occ, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K);
+            k_ait_mmv<4, NT, true, 0, 0, 1, true><<<grid_occ, block_occ, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt);
         } else {
-            k_ait_mmv<4, NT, true, 0, 0, 2, true><<<grid_occ, block_occ, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K);
+            k_ait_mmv<4, NT, true, 0, 0, 2, true><<<grid_occ, block_occ, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt);
         }
-        CUDA_CHECK(cudaGetLastError());
+        finish();
         return;
     }
     if (code == 1) {
         const int pl = ait_plds();
         if (full) {
-            if (pl == 2) { ait_mmv_p<NT, true, 2>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K); }
-            else         { ait_mmv_p<NT, true, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K); }
+            if (pl == 2) { ait_mmv_p<NT, true, 2>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, partial, tcnt); }
+            else         { ait_mmv_p<NT, true, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, partial, tcnt); }
         } else {
-            if (pl == 2) { ait_mmv_p<NT, false, 2>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K); }
-            else         { ait_mmv_p<NT, false, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K); }
+            if (pl == 2) { ait_mmv_p<NT, false, 2>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, partial, tcnt); }
+            else         { ait_mmv_p<NT, false, 1>(grid, block, stream, w, xq.get(), sa.get(), Y, M, K, partial, tcnt); }
         }
     } else if (full) {
         switch (k) {
-            case 2:  k_ait_mmv<2, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
-            case 3:  k_ait_mmv<3, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
-            default: k_ait_mmv<4, NT, true><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
+            case 2:  k_ait_mmv<2, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
+            case 3:  k_ait_mmv<3, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0); break;
+            default:
+                if (neighbor4 && code == 0 && warps <= 12 && occ == 0) {
+                    k_ait_mmv<4, NT, true, 0, 0, 4, false, false, false, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0);
+                } else {
+                    k_ait_mmv<4, NT, true><<<grid, block, cta_smem, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt, cta ? cta_mode : 0);
+                }
+                break;
         }
     } else {
         switch (k) {
-            case 2:  k_ait_mmv<2, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
-            case 3:  k_ait_mmv<3, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
-            default: k_ait_mmv<4, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K); break;
+            case 2:  k_ait_mmv<2, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt); break;
+            case 3:  k_ait_mmv<3, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt); break;
+            default: k_ait_mmv<4, NT, false><<<grid, block, 0, stream>>>(w, xq.get(), sa.get(), Y, M, K, nullptr, 0, partial, tcnt); break;
         }
     }
-    CUDA_CHECK(cudaGetLastError());
+    finish();
 }
 
 static bool ait_fast(ggml_backend_cuda_context & ctx, const uint8_t * W, const float * X, float * Y, int64_t T, int M, int K, int k, int code) {

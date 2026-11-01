@@ -161,10 +161,37 @@ static bool test_sparse_arena() {
 #endif
 }
 
+// LLAMA_MOE_ARENA_THP=2: the arena must start on a 2 MiB boundary, hold written data, and unmap cleanly.
+static bool test_thp_arena() {
+#ifdef __linux__
+    setenv("LLAMA_MOE_ARENA_THP", "2", 1);
+    const size_t bytes = 64ull << 20;
+    bool ok = true;
+    {
+        llama_moe_arena arena(bytes);
+        ok &= ((uintptr_t) arena.data & ((2ull << 20) - 1)) == 0;
+        auto * p = static_cast<uint8_t *>(arena.data);
+        for (size_t i = 0; i < bytes; i += 4096) { p[i] = (uint8_t) (i >> 12); }
+        for (size_t i = 0; i < bytes; i += 4096) { ok &= p[i] == (uint8_t) (i >> 12); }
+        arena.report_thp();
+    }
+    unsetenv("LLAMA_MOE_ARENA_THP");
+    {
+        llama_moe_arena plain(bytes);
+        static_cast<uint8_t *>(plain.data)[bytes - 1] = 1;
+    }
+    printf("THP arena alignment and data: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+#else
+    return true;
+#endif
+}
+
 // Exercise the original mixed IQ blocks with the arena's gate/up/down stride.
 int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--cuda-output") == 0) { return test_reclaimable_output(true) ? 0 : 1; }
     if (argc == 2 && strcmp(argv[1], "--cuda-arena") == 0) { return test_sparse_arena() ? 0 : 1; }
+    if (argc == 2 && strcmp(argv[1], "--thp") == 0) { return test_thp_arena() ? 0 : 1; }
     if (argc != 1) { return 2; }
     constexpr int64_t n_in = 256, n_out = 32, n_experts = 3;
     const ggml_type types[] = { GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL };

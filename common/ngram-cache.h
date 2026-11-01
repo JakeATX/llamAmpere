@@ -61,6 +61,14 @@ typedef std::unordered_map<llama_token, int32_t> common_ngram_cache_part;
 // n-gram -> empirical distribution of following tokens
 typedef std::unordered_map<common_ngram, common_ngram_cache_part, common_ngram_hash_function> common_ngram_cache;
 
+struct common_ngram_cache_limits {
+    uint64_t max_entries = UINT64_MAX;
+    uint64_t continuations_left = UINT64_MAX;
+
+    common_ngram_cache_limits() = default;
+    common_ngram_cache_limits(const common_ngram_cache & cache, uint64_t entries, uint64_t continuations);
+};
+
 
 // Update an ngram cache with tokens.
 // ngram_cache:         the cache to modify.
@@ -68,11 +76,15 @@ typedef std::unordered_map<common_ngram, common_ngram_cache_part, common_ngram_h
 // inp_data:            the token sequence with which to update ngram_cache.
 // nnew:                how many new tokens have been appended to inp_data since the last call to this function.
 // print_progress:      whether to print progress to stderr.
+// n_max:               stop adding keys at this size; existing keys still learn, no pruning (0 = unlimited).
+// admitted:            if set, learn only (key, token) pairs already in this cache (used for the live writeback delta).
+// limits:              optional entry cap and remaining successor credit; reset after replacing the cache.
 //
 // In order to get correct results inp_data can ONLY BE APPENDED TO.
 // Changes in the middle need a complete rebuild.
 void common_ngram_cache_update(
-    common_ngram_cache & ngram_cache, int ngram_min, int ngram_max, std::vector<llama_token> & inp_data, int nnew, bool print_progress);
+    common_ngram_cache & ngram_cache, int ngram_min, int ngram_max, std::vector<llama_token> & inp_data, int nnew, bool print_progress, size_t n_max = 0,
+    const common_ngram_cache * admitted = nullptr, common_ngram_cache_limits * limits = nullptr);
 
 // Try to draft tokens from ngram caches.
 // inp:                the tokens generated so far.
@@ -132,14 +144,18 @@ enum common_ngram_cache_load_status {
     COMMON_NGRAM_CACHE_LOAD_MISSING, // the file cannot be opened
     COMMON_NGRAM_CACHE_LOAD_CORRUPT, // truncated, checksum mismatch, out of range values: not a usable cache
     COMMON_NGRAM_CACHE_LOAD_FOREIGN, // a valid cache, but for another vocab or a newer format: must not be overwritten
+    COMMON_NGRAM_CACHE_LOAD_LIMIT,   // resource quota reached: must not be overwritten
 };
 
 // Load an ngram cache file into ngram_cache.
 // vocab_id: identity of the current vocab; a file that records a different vocab is refused.
+// Limits count payload records and continuations before allocation; zero refuses nonempty input.
+// Duplicate records and tokens count toward the limits too; UINT64_MAX is unlimited.
 // returns:  COMMON_NGRAM_CACHE_LOAD_OK on success. Otherwise ngram_cache is left empty and err describes the problem.
 common_ngram_cache_load_status common_ngram_cache_load_file(
     const std::string & filename, common_ngram_cache & ngram_cache,
-    const common_ngram_cache_vocab_id & vocab_id, std::string & err);
+    const common_ngram_cache_vocab_id & vocab_id, std::string & err,
+    uint64_t max_entries = UINT64_MAX, uint64_t max_continuations = UINT64_MAX);
 
 // Save an ngram cache to a file, written to a temporary file next to it and renamed into place, so a reader
 // or a crash never sees a partially written file.
@@ -155,16 +171,20 @@ void common_ngram_cache_prune(common_ngram_cache & ngram_cache, size_t n_max);
 // Read-modify-write of a cache file shared between processes:
 // merges ngram_cache_delta into the file's current content (under an advisory lock where available),
 // prunes to n_max, writes the result atomically and, on success, replaces ngram_cache with the merged
-// result and clears ngram_cache_delta.
-// If the file is missing or corrupt, ngram_cache (which must already contain the delta) is written instead.
-// A file that belongs to another vocab or a newer format is never overwritten: the sync fails.
+// result and clears ngram_cache_delta. The result also fits the load quotas; whole n-grams are
+// dropped in map order if their continuations exceed the remaining continuation quota.
+// Finite load quotas also bound merge allocations; existing file pairs keep priority over new pairs.
+// If the file is missing or corrupt, ngram_cache (which must already contain the delta) is written instead, unless fallback_to_delta is set.
+// fallback_to_delta: use the worker-owned delta instead, without first copying it into ngram_cache.
+// A file that exceeds the load quotas, belongs to another vocab or uses a newer format is never overwritten: the sync fails.
 // ngram_cache and ngram_cache_delta must be distinct objects.
 // from_disk: if given, set to true when the existing file was loaded and merged, false when it was missing or
-//            unusable (the file is then recreated from ngram_cache) or when the sync failed.
+//            unusable (the file is then recreated from the fallback cache) or when the sync failed.
 // returns: true on success, otherwise err describes the problem and nothing is modified.
 bool common_ngram_cache_sync_file(
     const std::string & filename, common_ngram_cache & ngram_cache, common_ngram_cache & ngram_cache_delta,
-    size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk = nullptr);
+    size_t n_max, const common_ngram_cache_vocab_id & vocab_id, std::string & err, bool * from_disk = nullptr,
+    uint64_t max_entries = UINT64_MAX, uint64_t max_continuations = UINT64_MAX, bool fallback_to_delta = false);
 
 // Save an ngram cache to a file (vocab identity unknown). Logs on failure.
 // ngram_cache: the ngram cache to save.
@@ -180,4 +200,10 @@ common_ngram_cache common_ngram_cache_load(const std::string & filename);
 // Merge two ngram caches, counts of shared (n-gram, token) pairs are summed.
 // ngram_cache_target: the ngram cache to which to add the information from ngram_cache_add.
 // ngram_cache_add:    the ngram cache to add to ngram_cache_target.
-void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add);
+// n_max:              stop adding keys at this size; existing keys still merge, no pruning (0 = unlimited).
+void common_ngram_cache_merge(common_ngram_cache & ngram_cache_target, common_ngram_cache & ngram_cache_add, size_t n_max = 0,
+    common_ngram_cache_limits * limits = nullptr);
+
+// Collect a saved cache and live delta; drop delta pairs that the bounded result did not retain.
+void common_ngram_cache_refresh(common_ngram_cache & live, common_ngram_cache & saved, common_ngram_cache & delta, size_t n_max,
+    uint64_t max_entries = UINT64_MAX, uint64_t max_continuations = UINT64_MAX);

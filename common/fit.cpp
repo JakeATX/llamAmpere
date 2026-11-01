@@ -12,10 +12,200 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+common_fit_ram_result common_fit_ram_plan(uint64_t available,
+        const std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> & requests) {
+    constexpr uint64_t MiB = 1ull << 20;
+    static const unsigned shares[COMMON_FIT_RAM_COUNT] = {50, 10, 10, 20, 5, 5};
+    common_fit_ram_result result;
+    result.available = available;
+    result.floor_met = available >= result.floor;
+    uint64_t spare = result.floor_met ? available - result.floor : 0;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!requests[i].explicit_size) {
+            continue;
+        }
+        result.bytes[i] = requests[i].bytes;
+        if (requests[i].bytes > spare) {
+            result.floor_met = false;
+            spare = 0;
+        } else {
+            spare -= requests[i].bytes;
+        }
+    }
+    if (!result.floor_met) {
+        return result;
+    }
+
+    // Keep a fifth of the spare RAM for later allocations. Work in MiB to avoid overflow.
+    const uint64_t spare_mib = spare / MiB;
+    const uint64_t budget_mib = (spare_mib / 5) * 4 + (spare_mib % 5) * 4 / 5;
+    result.automatic_budget = budget_mib * MiB;
+    uint64_t carry_mib = 0;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const uint64_t quota_mib = (budget_mib / 100) * shares[i] + (budget_mib % 100) * shares[i] / 100;
+        carry_mib += quota_mib;
+        if (!requests[i].explicit_size) {
+            const uint64_t assigned_mib = std::min(carry_mib, requests[i].bytes / MiB);
+            result.bytes[i] = assigned_mib * MiB;
+            carry_mib -= assigned_mib;
+        }
+    }
+    return result;
+}
+
+int32_t common_fit_prompt_cache_ram_mib(uint64_t total, uint64_t available,
+        int32_t requested_mib, bool fit, std::string & why, uint64_t explicit_free) {
+    constexpr uint64_t MiB = 1ull << 20;
+    if (requested_mib != COMMON_CACHE_RAM_AUTO) {
+        // Keep the CPU backend query and 8192 MiB fallback used by explicit -1.
+        const int32_t resolved = requested_mib < 0 ? (explicit_free > 0 ?
+            (int32_t) std::min<uint64_t>(explicit_free / (2 * MiB), INT32_MAX) : 8192) : requested_mib;
+        why = requested_mib < 0 ? (explicit_free > 0 ? "explicit half of backend-reported free RAM" :
+            "explicit limit uses the 8192 MiB fallback") : "explicit cache limit";
+        if (fit && (available < (5ull << 30) || uint64_t(resolved) * MiB > available - (5ull << 30))) {
+            why += "; cannot leave 5 GiB free with this explicit setting";
+        }
+        return resolved;
+    }
+    const int32_t tier = common_prompt_cache_ram_auto_mib(total, available, why);
+    if (!fit) {
+        return tier;
+    }
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests = {};
+    requests[COMMON_FIT_RAM_PROMPT].bytes = uint64_t(tier) * MiB;
+    const auto plan = common_fit_ram_plan(available, requests);
+    const int32_t resolved = (int32_t) (plan.bytes[COMMON_FIT_RAM_PROMPT] / MiB);
+    why += (resolved < tier || !plan.floor_met) ?
+        "; prompt cache reduced to leave 5 GiB free and retain the RAM fit reserve" :
+        "; within the RAM fit budget after model and context allocations";
+    return resolved;
+}
+
+size_t common_fit_vram_floor(bool display_attached) {
+    return (display_attached ? 800u : 300u) * size_t(1024 * 1024);
+}
+
+size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_session) {
+    const size_t safe = common_fit_vram_floor(true);
+    if (display_session) {
+        return safe;
+    }
+    std::error_code ec;
+    std::filesystem::directory_iterator it(drm_root, ec), end;
+    bool connector_seen = false;
+    for (; !ec && it != end; it.increment(ec)) {
+        const auto path = it->path() / "status";
+        const bool exists = std::filesystem::exists(path, ec);
+        if (ec) {
+            return safe;
+        }
+        if (!exists) {
+            const std::string name = it->path().filename().string();
+            if (name.compare(0, 4, "card") == 0 && name.find('-') != std::string::npos) {
+                return safe;
+            }
+            continue;
+        }
+        std::ifstream file(path);
+        std::string status;
+        if (!(file >> status) || status != "disconnected") {
+            return safe;
+        }
+        connector_seen = true;
+    }
+    return ec || !connector_seen ? safe : common_fit_vram_floor(false);
+}
+
+std::vector<size_t> common_fit_vram_targets(const common_params & params, size_t floor) {
+    auto targets = params.fit_params_target;
+    if ((!params.fit_params && !params.n_cpu_moe_auto) || params.fit_params_target_explicit) {
+        return targets;
+    }
+    // fork: retain programmatic overrides that differ from the stock margin.
+    for (size_t & target : targets) {
+        if (target == size_t(1024) * 1024 * 1024) {
+            target = floor;
+        }
+    }
+    return targets;
+}
+
+uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit) {
+    if (!fit) {
+        return UINT64_MAX;
+    }
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests = {};
+    // Other optional caches can still grow into their shares after this read.
+    for (auto & request : requests) {
+        request.bytes = UINT64_MAX;
+    }
+    return common_fit_ram_plan(available, requests).bytes[COMMON_FIT_RAM_EVAL];
+}
+
+uint64_t common_fit_eval_cache_load_bytes(uint64_t available, bool fit, uint64_t n_tokens) {
+    if (!fit) {
+        return UINT64_MAX;
+    }
+    const uint64_t budget = common_fit_eval_cache_ram_bytes(available, true);
+    if (n_tokens > budget / sizeof(llama_token)) {
+        return 0;
+    }
+    // State-load validation needs one token buffer beside the parsed record.
+    return budget - n_tokens * sizeof(llama_token);
+}
+
+bool common_fit_eval_cache_save_fits(uint64_t available, bool fit, uint64_t n_tokens, uint64_t spec_bytes) {
+    if (!fit) {
+        return true;
+    }
+    const uint64_t budget = common_fit_eval_cache_ram_bytes(available, true);
+    constexpr uint64_t scratch = 65536;
+    if (budget < scratch || spec_bytes > budget - scratch) {
+        return false;
+    }
+    return n_tokens <= (budget - scratch - spec_bytes) / sizeof(llama_token);
+}
+
+void common_fit_ngram_cache_load_limits(uint64_t available, bool fit, common_params_speculative_ngram_cache & params, uint32_t n_seq) {
+    params.load_max_entries_static = params.load_max_continuations_static = UINT64_MAX;
+    params.load_max_entries_dynamic = params.load_max_continuations_dynamic = UINT64_MAX;
+    params.max_entries_context = params.max_continuations_context = UINT64_MAX;
+    const bool use_static = !params.lookup_cache_static.empty();
+    const bool use_dynamic = !params.lookup_cache_dynamic.empty() && !params.max_ngrams_dynamic_explicit;
+    // fork: checkpoints can hold the live cache, two deltas and the loaded/merged cache together.
+    const uint64_t copies_dynamic = !use_dynamic ? 0 : !params.save_dynamic ? 1 :
+        params.save_dynamic_interval > 0 ? 4 : 3;
+    const uint64_t count = uint64_t(use_static) + copies_dynamic + n_seq;
+    if (!fit || count == 0) {
+        return;
+    }
+    std::array<common_fit_ram_request, COMMON_FIT_RAM_COUNT> requests = {};
+    for (auto & request : requests) {
+        request.bytes = UINT64_MAX;
+    }
+    const uint64_t bytes = common_fit_ram_plan(available, requests).bytes[COMMON_FIT_RAM_NGRAM] / count;
+    const uint64_t payload = bytes > 8192 ? bytes - 8192 : 0;
+    // Count admission estimates map overhead; this is not allocator byte accounting.
+    const uint64_t entries = payload / 2 / 512;
+    const uint64_t continuations = payload / 2 / 128;
+    params.max_entries_context = n_seq > 0 ? entries : 0;
+    params.max_continuations_context = n_seq > 0 ? continuations : 0;
+    if (use_static) {
+        params.load_max_entries_static = entries;
+        params.load_max_continuations_static = continuations;
+    }
+    if (use_dynamic) {
+        params.load_max_entries_dynamic = entries;
+        params.load_max_continuations_dynamic = continuations;
+    }
+}
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
@@ -36,8 +226,32 @@ class common_params_fit_no_room : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+int64_t common_fit_vram_margin_surplus(int64_t free_bytes, const std::vector<int64_t> & margins) {
+    for (int64_t margin : margins) {
+        // Keep the deficit negatable for logging and context reduction.
+        if (margin < 0 || free_bytes < -INT64_MAX + margin) {
+            throw common_params_fit_exception("requested free memory margins exceed the supported total size");
+        }
+        free_bytes -= margin;
+    }
+    return free_bytes;
+}
+
 const char * common_moe_cache_tensor_override_pattern() {
-    return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+    return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.";
+}
+
+common_fit_vram_layer_result common_fit_vram_layer_step(uint32_t delta, int64_t low, int64_t high, int64_t target, int64_t free_bytes) {
+    if (free_bytes < 0 || low > free_bytes) {
+        return {COMMON_PARAMS_FIT_STATUS_NO_ROOM, 0};
+    }
+    if (delta <= 1 || low < 0 || low > target || target >= high) {
+        return {COMMON_PARAMS_FIT_STATUS_FAILURE, 0};
+    }
+    // This is only a guess; both measured bounds stay authoritative. Avoid an overflowing integer product.
+    const double fraction = double(target - low) / double(high - low);
+    const uint32_t step = uint32_t(double(delta) * fraction);
+    return {COMMON_PARAMS_FIT_STATUS_SUCCESS, std::max(uint32_t(1), std::min(step, delta - 1))};
 }
 
 struct common_moe_cache_fit_pool {
@@ -82,6 +296,8 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
         common_moe_cache_fit_device & device = result.devices[device_index];
         device.free_bytes = std::min(device.free_bytes, input.free_bytes);
         device.compute_capability = std::min(device.compute_capability, input.compute_capability);
+        // fork: the fit floor and cache reserve protect the same free device memory.
+        device.reserve_bytes = std::max(device.reserve_bytes, std::max(reserve_bytes, input.margin_bytes));
         if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
             result.reason = "device memory accounting overflowed";
             LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
@@ -97,10 +313,10 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
 
     for (common_moe_cache_fit_device & device : result.devices) {
         const int64_t projected_free = device.free_bytes - device.used_bytes;
-        if (projected_free <= 0 || (uint64_t)projected_free <= reserve_bytes) {
+        if (projected_free <= 0 || (uint64_t)projected_free <= device.reserve_bytes) {
             continue;
         }
-        device.cache_bytes = (size_t)projected_free - reserve_bytes;
+        device.cache_bytes = (size_t)projected_free - device.reserve_bytes;
         if (budget_bytes > 0) {
             device.cache_bytes = std::min(device.cache_bytes, budget_bytes);
         }
@@ -258,7 +474,7 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
             return result;
         }
         device_inputs.push_back({caps.physical_device, caps.compute_capability,
-                memory[index].free - margins[index], memory[index].mb.total()});
+                memory[index].free, memory[index].mb.total(), (size_t) margins[index]});
         min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
     }
 
@@ -503,11 +719,32 @@ common_fit_extra_memory common_fit_extra_memory_at(
     return ret;
 }
 
+common_params_fit_status common_fit_vram_margin_status(int64_t free_bytes, size_t used_bytes, size_t margin_bytes) {
+    if (free_bytes < 0 || used_bytes > (uint64_t)free_bytes) {
+        return COMMON_PARAMS_FIT_STATUS_NO_ROOM;
+    }
+    return (uint64_t)free_bytes - used_bytes >= margin_bytes ?
+        COMMON_PARAMS_FIT_STATUS_SUCCESS : COMMON_PARAMS_FIT_STATUS_FAILURE;
+}
+
+bool common_fit_verify_compact_safe(bool complete, const std::vector<int64_t> & headroom, const std::vector<int64_t> & margins, int64_t floor) {
+    if (!complete || headroom.empty() || headroom.size() != margins.size()) {
+        return false;
+    }
+    const int64_t min_margin = std::max<int64_t>(floor, 300ll * 1024 * 1024);
+    for (size_t i = 0; i < margins.size(); i++) {
+        if (margins[i] < min_margin || headroom[i] < margins[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min,
-        const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        const common_fit_extra_model * extra, enum ggml_log_level log_level, bool * margins_verified) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -532,6 +769,7 @@ static void common_params_fit_impl(
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    bool extra_complete = true;
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes: both its KV cache and its compute graph
@@ -579,6 +817,7 @@ static void common_params_fit_impl(
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                extra_complete = false;
                 dmds_extra = dmds_t(devs.size() + 1);
                 n_ctx_extra = n_ctx_measure;
                 return;
@@ -587,13 +826,18 @@ static void common_params_fit_impl(
             dmds_extra = dmds_t(devs.size() + 1);
             dmds_extra.back().mb = measured.back().mb;
             for (size_t je = 0; je < devs_extra.size(); je++) {
+                bool found = false;
                 for (size_t id = 0; id < devs.size(); id++) {
                     if (devs_extra[je] == devs[id]) {
+                        found = true;
                         dmds_extra[id].mb.model   += measured[je].mb.model;
                         dmds_extra[id].mb.context += measured[je].mb.context;
                         dmds_extra[id].mb.compute += measured[je].mb.compute;
                         break;
                     }
+                }
+                if (!found) {
+                    extra_complete = false;
                 }
             }
             if (extra->shares_model) {
@@ -618,6 +862,40 @@ static void common_params_fit_impl(
             dmds[id].mb.model   += mem.model;
             dmds[id].mb.context += mem.context;
             dmds[id].mb.compute += mem.compute;
+        }
+    };
+
+    auto verify_final_fit = [&] {
+        if (!margins_verified) {
+            return;
+        }
+        try {
+            std::vector<llama_moe_tensor_info> final_tensors;
+            const auto expected_devs = devs;
+            dmds_t final_memory = common_get_device_memory_data_impl(
+                path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &final_tensors);
+            if (devs.empty() || devs != expected_devs || final_memory.size() != devs.size() + 1) {
+                return;
+            }
+            // Probe the drafter again against the final target placement, even at the same context size.
+            dmds_extra.clear();
+            add_extra_memory(final_memory);
+            std::vector<int64_t> headroom;
+            std::vector<int64_t> targets;
+            for (size_t id = 0; id < devs.size(); id++) {
+                headroom.push_back(final_memory[id].free - int64_t(final_memory[id].mb.total()));
+                targets.push_back(margins_s[id]);
+            }
+            if (!common_fit_verify_compact_safe(extra_complete, headroom, targets)) {
+                return;
+            }
+            if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF && !final_tensors.empty() &&
+                !common_moe_cache_evaluate_fit(moe_cache, final_tensors, devs, final_memory, targets).feasible) {
+                return;
+            }
+            *margins_verified = true;
+        } catch (const std::runtime_error & e) {
+            LOG_WRN("%s: cannot verify final memory margins: %s\n", __func__, e.what());
         }
     };
 
@@ -655,6 +933,11 @@ static void common_params_fit_impl(
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
+    for (size_t id = 0; id < std::max(size_t(1), nd); id++) {
+        if (margins_s[id] > INT64_MAX) {
+            throw common_params_fit_exception("requested free memory margin exceeds the supported size");
+        }
+    }
     if (nd == 0) {
         margins.push_back(margins_s[0]);
     } else {
@@ -696,6 +979,7 @@ static void common_params_fit_impl(
         if (sum_projected_free >= margins[0]) {
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
                 __func__, sum_projected_free/MiB, margins[0]/MiB);
+            verify_final_fit();
             return;
         }
     } else {
@@ -727,6 +1011,7 @@ static void common_params_fit_impl(
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
                 log_stock_fit();
+                verify_final_fit();
                 return;
             }
         } else {
@@ -740,6 +1025,7 @@ static void common_params_fit_impl(
             if (!changes_needed) {
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
                 log_stock_fit();
+                verify_final_fit();
                 return;
             }
         }
@@ -748,14 +1034,7 @@ static void common_params_fit_impl(
     // step 2: try reducing memory use by reducing the context size
 
     {
-        int64_t global_surplus = sum_projected_free;
-        if (nd == 0) {
-            global_surplus -= margins[0];
-        } else {
-            for (size_t id = 0; id < nd; id++) {
-                global_surplus -= margins[id];
-            }
-        }
+        const int64_t global_surplus = common_fit_vram_margin_surplus(sum_projected_free, margins);
         if (global_surplus < 0) {
             if (nd <= 1) {
                 LOG_TRC("%s: cannot meet free memory target of %" PRId64 " MiB, need to reduce device memory by %" PRId64 " MiB\n",
@@ -767,14 +1046,7 @@ static void common_params_fit_impl(
             }
             if (n_ctx_auto) {
                 if (n_ctx_max > n_ctx_min_total) {
-                    int64_t sum_used_target = sum_free;
-                    if (nd == 0) {
-                        sum_used_target -= margins[0];
-                    } else {
-                        for (size_t id = 0; id < nd; id++) {
-                            sum_used_target -= margins[id];
-                        }
-                    }
+                    int64_t sum_used_target = common_fit_vram_margin_surplus(sum_free, margins);
                     if (nd > 1) {
                         // for multiple devices we need to be more conservative in terms of how much context we think can fit:
                         //   - for dense models only whole layers can be assigned to devices
@@ -782,7 +1054,12 @@ static void common_params_fit_impl(
                         //   - on average we expect a waste of 0.5 layers/tensors per device
                         //   - use slightly more than the expected average for nd devices to be safe
                         const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
-                        sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
+                        if (model_per_layer < 0 || nd >= uint64_t(INT64_MAX) ||
+                            model_per_layer > INT64_MAX / (int64_t(nd) + 1)) {
+                            throw common_params_fit_exception("device memory accounting exceeds the supported total size");
+                        }
+                        sum_used_target = common_fit_vram_margin_surplus(sum_used_target,
+                            {(int64_t(nd) + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6)});
                     }
 
                     int64_t sum_projected_used_min_ctx = 0;
@@ -815,18 +1092,30 @@ static void common_params_fit_impl(
                             for (int it = 0; nd == 1 && it < 8; it++) {
                                 dmds_t dmds_chk = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
                                 add_extra_memory(dmds_chk);
-                                const int64_t deficit = margins[0] - (dmds_chk[0].free - int64_t(dmds_chk[0].mb.total()));
+                                if (dmds_chk[0].mb.total() > INT64_MAX) {
+                                    throw common_params_fit_exception("device memory accounting exceeds the supported size");
+                                }
+                                const int64_t deficit = -common_fit_vram_margin_surplus(dmds_chk[0].free,
+                                    {int64_t(dmds_chk[0].mb.total()), margins[0]});
                                 if (deficit <= 0 || cparams->n_ctx <= n_ctx_min_total) {
                                     break;
                                 }
-                                const int64_t step = std::max<int64_t>(align, (deficit + std::max<int64_t>(bytes_per_ctx, 1) - 1) / std::max<int64_t>(bytes_per_ctx, 1));
+                                const int64_t step = std::min<int64_t>(cparams->n_ctx,
+                                    std::max<int64_t>(align, 1 + (deficit - 1) / std::max<int64_t>(bytes_per_ctx, 1)));
                                 const uint32_t n_ctx_prev = cparams->n_ctx;
                                 cparams->n_ctx = (uint32_t) std::max<int64_t>(int64_t(cparams->n_ctx) - (step + align - 1) / align * align, n_ctx_min_total);
                                 LOG_TRC("%s: context size %" PRIu32 " is projected %" PRId64 " MiB over the target -> reduced to %" PRIu32 "\n",
                                     __func__, n_ctx_prev, deficit/MiB, cparams->n_ctx);
                             }
-                            LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
-                            return;
+                            dmds_t dmds_chk = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                            add_extra_memory(dmds_chk);
+                            const auto & memory = nd == 0 ? dmds_chk.back() : dmds_chk[0];
+                            const int64_t free_bytes = nd == 0 ? memory.total : memory.free;
+                            if (common_fit_vram_margin_status(free_bytes, memory.mb.total(), margins_s[0]) == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                                LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
+                                verify_final_fit();
+                                return;
+                            }
                         }
                         LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
                     } else {
@@ -911,7 +1200,7 @@ static void common_params_fit_impl(
             case LAYER_FRACTION_MOE: {
                 static std::array<std::string, n_strings> patterns;
                 if (patterns[il].empty()) {
-                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.";
                 }
                 return patterns[il].c_str();
             }
@@ -999,6 +1288,9 @@ static void common_params_fit_impl(
         std::vector<int64_t> ret;
         ret.reserve(nd);
         for (size_t id = 0; id < nd; id++) {
+            if (dmd_nl[id].mb.total() > INT64_MAX) {
+                throw common_params_fit_exception("device memory use exceeds the supported total size");
+            }
             ret.push_back(dmd_nl[id].mb.total());
         }
         return ret;
@@ -1070,8 +1362,14 @@ static void common_params_fit_impl(
         add_extra_memory(dmds_cpu_moe);
 
         for (size_t id = 0; id < nd; id++) {
+            if (dmds_cpu_moe[id].free < 0 || (global_surplus_cpu_moe > 0 &&
+                dmds_cpu_moe[id].free > INT64_MAX - global_surplus_cpu_moe) ||
+                dmds_cpu_moe[id].mb.total() > INT64_MAX) {
+                throw common_params_fit_exception("device memory accounting exceeds the supported total size");
+            }
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
-            global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
+            global_surplus_cpu_moe = common_fit_vram_margin_surplus(global_surplus_cpu_moe,
+                {int64_t(dmds_cpu_moe[id].mb.total()), margins[id]});
         }
 
         if (global_surplus_cpu_moe > 0) {
@@ -1134,9 +1432,14 @@ static void common_params_fit_impl(
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
-                    step_size = std::max(step_size, uint32_t(1));
-                    step_size = std::min(step_size, delta - 1);
+                    const auto next = common_fit_vram_layer_step(delta, mem[id], mem_high[id], targets[id], dmds_full[id].free);
+                    if (next.status == COMMON_PARAMS_FIT_STATUS_NO_ROOM) {
+                        throw common_params_fit_no_room(dev_names[id] + " compute buffers and caches alone exceed free device memory; lower -ub, -b or -c");
+                    }
+                    if (next.status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                        throw common_params_fit_exception("layer placement cannot meet the requested free memory margin");
+                    }
+                    const uint32_t step_size = next.step;
 
                     std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
                     ngl_per_device_test[id].n_layer += step_size;
@@ -1174,6 +1477,10 @@ static void common_params_fit_impl(
                 " MiB with every layer's weights in system memory, but has " + std::to_string(dmds_full[id].free/MiB) +
                 " MiB free: the compute buffers and caches alone do not fit (a draft or MTP model counts too); lower -ub, -b or -c");
         }
+        // fork: positive headroom can still miss the requested floor with no GPU layers.
+        if (common_fit_vram_margin_status(dmds_full[id].free, mem[id], margins_s[id]) != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            throw common_params_fit_exception(dev_names[id] + " cannot leave the requested free memory margin; lower -ub, -b or -c");
+        }
     }
 
     if (hp_nex > 0 && global_surplus_cpu_moe > 0 && moe_cache &&
@@ -1206,6 +1513,7 @@ static void common_params_fit_impl(
 
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        verify_final_fit();
         return;
     }
 
@@ -1525,6 +1833,7 @@ static void common_params_fit_impl(
                                 __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
                                 (int64_t)(best_cache_fit.minimum_device_bytes / MiB));
                     }
+                    verify_final_fit();
                     return;
                 }
                 LOG_INF("%s: MoE cache soft mode kept stock placement (partial eviction could not fit cache pools)\n",
@@ -1554,6 +1863,7 @@ static void common_params_fit_impl(
                             __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
                             (int64_t)(cache_fit.minimum_device_bytes / MiB));
                 }
+                verify_final_fit();
                 return;
             }
             LOG_INF("%s: MoE cache fit kept stock placement: %s\n", __func__, cache_fit.reason.c_str());
@@ -1561,6 +1871,7 @@ static void common_params_fit_impl(
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+    verify_final_fit();
 }
 
 enum common_params_fit_status common_fit_params(
@@ -1573,11 +1884,14 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
-        ggml_log_level log_level) {
+        ggml_log_level log_level, bool * margins_verified) {
     const int64_t t0_us = llama_time_us();
+    if (margins_verified) {
+        *margins_verified = false;
+    }
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-            common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level, margins_verified);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_no_room & e) {
         LOG_ERR("%s: no placement fits in device memory: %s\n", __func__, e.what());

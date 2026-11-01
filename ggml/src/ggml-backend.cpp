@@ -142,8 +142,26 @@ void ggml_moe_cache_host_restore(const void * data, size_t size) {
     }
 }
 
+static std::vector<ggml_moe_bank_hole> g_moe_bank_holes;
+
+void ggml_moe_bank_holes_set(const ggml_moe_bank_hole * holes, size_t n) {
+    g_moe_bank_holes.assign(holes, holes + n);
+    std::sort(g_moe_bank_holes.begin(), g_moe_bank_holes.end(),
+            [](const ggml_moe_bank_hole & a, const ggml_moe_bank_hole & b) { return a.begin < b.begin; });
+}
+
+const ggml_moe_bank_hole * ggml_moe_bank_holes(size_t * n) {
+    *n = g_moe_bank_holes.size();
+    return g_moe_bank_holes.empty() ? nullptr : g_moe_bank_holes.data();
+}
+
 bool ggml_moe_cache_resident_copy(ggml_backend_t backend, struct ggml_tensor * dst, size_t offset, const void * host, size_t size) {
-    if (!ggml_moe_cache_has_residents()) { return false; }
+    // fork: prompt loans retain runtime slots without a permanent resident allocation.
+    static const bool keep_prompt = [] {
+        const char * e = getenv("LLAMA_PP_KEEP_EXPERTS");
+        return e && strcmp(e, "1") == 0;
+    }();
+    if (!keep_prompt && !ggml_moe_cache_has_residents() && g_moe_bank_holes.empty()) { return false; }
     std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
     for (const auto & api : g_moe_cache_providers) {
         if (api.resident_copy && api.resident_copy(backend, dst, offset, host, size)) { return true; }
@@ -1318,6 +1336,10 @@ struct ggml_backend_sched {
     // expert keep policy (#215/#217), owned copy; keep_default -1 and n_layer 0 = off
     int32_t   moe_keep_default;
     int32_t * moe_keep_layer;
+    // --moe-skip-tail value last handed to moe_skip_tail_session (0 = exact)
+    int       moe_skip_tail;
+    bool      moe_skip_mass;
+    void *    moe_skip_tail_session;
     int32_t   moe_keep_n_layer;
 
     ggml_backend_sched_eval_callback callback_eval;
@@ -3172,9 +3194,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        // GGML_CUDA_HOST_BLOCK_MS=<ms> (diagnostic): name each input copy whose host call takes >= <ms>
+        static const float host_block_ms = [] { const char * e = getenv("GGML_CUDA_HOST_BLOCK_MS"); return e && *e ? (float) atof(e) : 0.0f; }();
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                const int64_t t0 = host_block_ms > 0.0f ? ggml_time_us() : 0;
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                if (host_block_ms > 0.0f && (ggml_time_us() - t0) / 1000.0f >= host_block_ms) {
+                    GGML_LOG_INFO("[HOSTBLOCK] input split=%d %s (%s) bytes=%zu ms=%.2f\n", split_id, split->inputs[input_id]->name,
+                            ggml_backend_name(split_backend), ggml_nbytes(split->inputs[input_id]), (ggml_time_us() - t0) / 1000.0f);
+                }
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -3350,6 +3379,22 @@ int ggml_backend_sched_moe_cache_status(ggml_backend_sched_t sched, size_t * all
     return sched->moe_cache_api.session_status(sched->moe_cache_session, allocated_bytes);
 }
 
+void ggml_backend_sched_moe_cache_set_skip_tail(ggml_backend_sched_t sched, int rank, bool mass) {
+    GGML_ASSERT(rank >= 0 && rank <= 9);
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.set_skip_tail) {
+        return;
+    }
+    if (sched->moe_skip_tail == rank && sched->moe_skip_mass == mass && sched->moe_skip_tail_session == sched->moe_cache_session) {
+        return;
+    }
+    // The previous graph may still read the old policy's tables.
+    ggml_backend_sched_synchronize(sched);
+    sched->moe_cache_api.set_skip_tail(sched->moe_cache_session, rank, mass);
+    sched->moe_skip_tail = rank;
+    sched->moe_skip_mass = mass;
+    sched->moe_skip_tail_session = sched->moe_cache_session;
+}
+
 void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
     GGML_ASSERT(sched);
@@ -3360,6 +3405,7 @@ void ggml_backend_sched_set_moe_cache(
     sched->moe_cache_donor = nullptr;
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+        sched->moe_skip_tail_session = nullptr;
     }
     sched->moe_cache_session = nullptr;
     sched->moe_cache_api = ggml_moe_cache_api{};
@@ -3497,6 +3543,7 @@ bool ggml_backend_sched_moe_cache_suspend(ggml_backend_sched_t sched) {
     }
     ggml_backend_sched_synchronize(sched);
     sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+    sched->moe_skip_tail_session = nullptr;
     sched->moe_cache_session   = nullptr;
     sched->moe_cache_suspended = true;
     sched->moe_cache_device_graph = false;
@@ -3548,6 +3595,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     sched->moe_keep_layer = nullptr;
     if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
         sched->moe_cache_api.session_destroy(sched->moe_cache_session);
+        sched->moe_skip_tail_session = nullptr;
         sched->moe_cache_session = NULL;
     }
     for (int b = 0; b < sched->n_backends; b++) {

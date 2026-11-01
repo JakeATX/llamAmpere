@@ -130,13 +130,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false, const std::function<bool(llama_token, const llama_tokens &)> & is_stop = {});
 
 // as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false, const std::function<bool(llama_token, const llama_tokens &)> & is_stop = {});
 
 // exact speculative verification: rejection sampling of each draft token against the distribution it was
 // sampled from (draft_q[i]: candidate ids with normalised probabilities), so the output distribution stays
@@ -174,6 +174,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
         const std::function<bool(llama_token, const llama_tokens &)> & is_stop = {});
 
 const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_sampler * gsmpl);
+
+// Marginal token law of mode-biased p/q verification at one fixed prefix. Output follows p's
+// order; p and q must be normalized. This is a local sampler diagnostic, not sequence KL.
+std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_array & p,
+        const std::vector<llama_token_data> & q, const std::function<bool(llama_token)> & is_stop = {});
 
 // top-1 probability of the target distribution at each position the last common_sampler_sample_and_accept_n_pq
 // call sampled from (request-matched, after the sampler chain; -1 where the chain sampled on the backend).

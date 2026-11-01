@@ -870,6 +870,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // 16-row units, not row-addressable
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_AIF25_U] = {
+        .type_name                = "aif25_u",
+        .blck_size                = 128,
+        .type_size                = 42,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row units; not row-addressable
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_AIT4_U] = {
         .type_name                = "ait4_u",
         .blck_size                = 128,
@@ -5717,7 +5725,8 @@ static struct ggml_tensor * ggml_fill_impl(
     struct ggml_tensor  * a,
     float                 c,
     bool                  inplace) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16 || a->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16 || a->type == GGML_TYPE_Q8_0 ||
+                a->type == GGML_TYPE_I32); // I32: the value is truncated to an integer
     GGML_ASSERT(ggml_is_contiguous(a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
@@ -6885,9 +6894,9 @@ struct ggml_tensor * ggml_gated_delta_net(
     // emit_mode == 1: K ingredient sets (k, v, g, beta), each width S_v -> K * 4 rows per snap,
     //                 plus one trailing full [S_v, S_v, H] final-state block (S_v rows, not
     //                 scaled by K) so the true end-of-batch state is always available, plus (only
-    //                 when n_tokens > K) one further such block: the state immediately before the
-    //                 K-token retained window starts, free to capture since the recurrence already
-    //                 passes through it en route to the final state.
+    //                 when n_tokens > K, or n_tokens <= K with ggml_gated_delta_net_set_prefix) one
+    //                 further such block: the state immediately before the K-token retained window
+    //                 starts, free to capture since the recurrence already passes through it.
     // emit_mode == 2: compact slots (g and beta stored once per head), padded to whole rows.
     const bool    needs_ckpt  = emit_mode != 0 && n_tokens > K;
     const int64_t state_rows  = emit_mode == 0
@@ -6909,6 +6918,32 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[5] = state;
 
     return result;
+}
+
+void ggml_gated_delta_net_set_prefix(
+        struct ggml_tensor * gdn,
+        struct ggml_tensor * ring,
+        struct ggml_tensor * w,
+        int32_t              ring_mode) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(gdn, 1) != 0);
+    GGML_ASSERT(ring->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(ring->nb[0] == sizeof(float) && ggml_is_contiguous(w));
+    const struct ggml_tensor * v = gdn->src[2];
+    const int64_t P = ggml_nelements(w);
+    GGML_ASSERT(P >= 1 && ring->ne[1] == v->ne[3]);
+    GGML_ASSERT(P * ggml_gated_delta_net_ingr_width(v->ne[0], gdn->src[3]->ne[0], ring_mode) * v->ne[1] <= ring->ne[0]);
+    // n_tokens <= K: the state after the prefix is the checkpoint, so the output gains the trailing block that
+    // n_tokens > K always has (set before allocation, so only the shape changes)
+    if (v->ne[2] <= ggml_get_op_params_i32(gdn, 0) && ggml_get_op_params_i32(gdn, 2) == 0) {
+        GGML_ASSERT(gdn->data == NULL && gdn->buffer == NULL && gdn->view_src == NULL);
+        gdn->ne[1] += v->ne[0] * v->ne[3];
+        gdn->nb[2]  = gdn->nb[1] * gdn->ne[1];
+        gdn->nb[3]  = gdn->nb[2] * gdn->ne[2];
+    }
+    ggml_set_op_params_i32(gdn, 2, (int32_t) P);
+    ggml_set_op_params_i32(gdn, 3, ring_mode);
+    gdn->src[6] = ring;
+    gdn->src[7] = w;
 }
 
 int64_t ggml_gated_delta_net_ingr_width(int64_t S_v, int64_t g_width, int32_t emit_mode) {
@@ -8809,4 +8844,136 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->poll       != p1->poll       ) return false;
     if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
+}
+
+// MoE always-resident expert bank table (see ggml.h). Written only at model load, before compute.
+#define GGML_MOE_BANK_MAX_TENSORS 512
+#define GGML_MOE_BANK_MAX_EXPERTS 512
+
+struct ggml_moe_bank_entry_s {
+    const void * data;
+    int32_t      layer;
+    int32_t      n_expert;
+    bool         has_bank;
+    uint8_t      in_bank[GGML_MOE_BANK_MAX_EXPERTS];
+};
+
+static struct ggml_moe_bank_entry_s g_moe_bank[GGML_MOE_BANK_MAX_TENSORS];
+static int g_moe_bank_n = 0;
+static bool g_moe_bank_any = false; // some registered tensor has bank experts (recomputed on register/unregister)
+
+static void ggml_moe_bank_refresh_any(void) {
+    g_moe_bank_any = false;
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        g_moe_bank_any = g_moe_bank_any || g_moe_bank[i].has_bank;
+    }
+}
+
+void ggml_moe_bank_register(const void * weight_data, int32_t layer, int32_t n_expert, const uint8_t * in_bank) {
+    if (!weight_data || n_expert <= 0 || n_expert > GGML_MOE_BANK_MAX_EXPERTS) {
+        return;
+    }
+    struct ggml_moe_bank_entry_s * e = NULL;
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        if (g_moe_bank[i].data == weight_data) {
+            e = &g_moe_bank[i];
+            break;
+        }
+    }
+    if (!e) {
+        if (g_moe_bank_n >= GGML_MOE_BANK_MAX_TENSORS) {
+            GGML_LOG_WARN("%s: table full, tensor not registered\n", __func__);
+            return;
+        }
+        e = &g_moe_bank[g_moe_bank_n++];
+    }
+    memset(e, 0, sizeof(*e));
+    e->data     = weight_data;
+    e->layer    = layer;
+    e->n_expert = n_expert;
+    if (in_bank) {
+        for (int32_t i = 0; i < n_expert; ++i) {
+            e->in_bank[i] = in_bank[i] ? 1 : 0;
+            e->has_bank   = e->has_bank || in_bank[i];
+        }
+    }
+    ggml_moe_bank_refresh_any();
+}
+
+void ggml_moe_bank_unregister(const void * weight_data) {
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        if (g_moe_bank[i].data == weight_data) {
+            g_moe_bank[i] = g_moe_bank[--g_moe_bank_n];
+            ggml_moe_bank_refresh_any();
+            return;
+        }
+    }
+}
+
+bool ggml_moe_bank_any(void) {
+    return g_moe_bank_any;
+}
+
+const uint8_t * ggml_moe_bank_lookup(const void * weight_data) {
+    // no tensor with a bank (every model without hot-bank tensors): nothing to look up
+    if (!g_moe_bank_any) {
+        return NULL;
+    }
+    static int skip = -1;
+    if (skip < 0) {
+        const char * v = getenv("GGML_MOE_BANK_SKIP");
+        skip = !(v && strcmp(v, "0") == 0);
+    }
+    if (!skip || !weight_data) {
+        return NULL;
+    }
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        if (g_moe_bank[i].data == weight_data) {
+            return g_moe_bank[i].has_bank ? g_moe_bank[i].in_bank : NULL;
+        }
+    }
+    return NULL;
+}
+
+bool ggml_moe_bank_entry(int index, const void ** weight_data, int32_t * layer, int32_t * n_expert, const uint8_t ** in_bank) {
+    if (index < 0 || index >= g_moe_bank_n) {
+        return false;
+    }
+    const struct ggml_moe_bank_entry_s * e = &g_moe_bank[index];
+    if (weight_data) { *weight_data = e->data; }
+    if (layer)       { *layer       = e->layer; }
+    if (n_expert)    { *n_expert    = e->n_expert; }
+    if (in_bank)     { *in_bank     = e->in_bank; }
+    return true;
+}
+
+bool ggml_moe_bank_census(bool (*resident)(void * user, const void * weight_data, int32_t expert), void * user,
+        int32_t * layer_min, int32_t * layer_max, size_t * cache, size_t * bank, size_t * both) {
+    *layer_min = INT32_MAX; *layer_max = -1; *cache = 0; *bank = 0; *both = 0;
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        const int32_t layer = g_moe_bank[i].layer;
+        bool first = true; // count each layer once, at its first registered tensor
+        for (int j = 0; j < i; ++j) {
+            first = first && g_moe_bank[j].layer != layer;
+        }
+        if (!first || layer < 0) {
+            continue;
+        }
+        *layer_min = MIN(*layer_min, layer);
+        *layer_max = MAX(*layer_max, layer);
+        for (int32_t e = 0; e < g_moe_bank[i].n_expert; ++e) {
+            bool in_bank = false, complete = true;
+            for (int j = i; j < g_moe_bank_n; ++j) {
+                if (g_moe_bank[j].layer != layer) {
+                    continue;
+                }
+                in_bank  = in_bank  || (e < g_moe_bank[j].n_expert && g_moe_bank[j].in_bank[e]);
+                complete = complete && e < g_moe_bank[j].n_expert && resident(user, g_moe_bank[j].data, e);
+            }
+            *bank  += in_bank;
+            *cache += complete && !in_bank;
+            *both  += complete && in_bank;
+        }
+    }
+    return *layer_max >= 0;
 }

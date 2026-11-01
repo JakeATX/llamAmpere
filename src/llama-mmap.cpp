@@ -449,12 +449,43 @@ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, 
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 #endif
 
+// Safety: an O_DIRECT read must never land in pinned or cudaHostRegister'ed pages (UVM in HMM mode can panic the
+// machine). Reads len bytes at the current position into the plain bounce buffer in chunks of at most bounce_size,
+// copying each chunk to dst. For a direct-I/O file, len, bounce_size and the bounce address must be aligned to
+// read_alignment(); dst may be any memory, pinned included.
+void llama_file::read_raw_bounced(void * dst, size_t len, void * bounce, size_t bounce_size) {
+    for (size_t done = 0; done < len; ) {
+        const size_t n = std::min(bounce_size, len - done);
+        read_raw_unsafe(bounce, n);
+        memcpy((char *) dst + done, bounce, n);
+        done += n;
+    }
+}
+
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
 void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
 void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap
+
+size_t llama_mmap_prefetch_budget(uint64_t available) {
+    constexpr uint64_t MiB = 1ull << 20;
+    if (available <= (5ull << 30)) { return 0; }
+    const uint64_t spare = (available - (5ull << 30)) / MiB;
+    const uint64_t budget = (spare / 5) * 4 + (spare % 5) * 4 / 5;
+    return size_t(std::min<uint64_t>(budget / 10, SIZE_MAX / MiB)) * size_t(MiB);
+}
+
+size_t llama_mmap_prefetch_take(size_t & remaining, size_t requested) {
+    constexpr size_t MiB = 1u << 20;
+    // Charge a whole MiB for the last partial file page, rather than carrying
+    // sub-page credit to the next shard and exceeding the total physical budget.
+    remaining -= remaining % MiB;
+    const size_t bytes = std::min(remaining, requested);
+    if (bytes) { remaining -= ((bytes - 1) / MiB + 1) * MiB; }
+    return bytes;
+}
 
 #if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
 // merge `ranges` and return their complement within [0, limit)
@@ -483,7 +514,8 @@ struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+            llama_mmap::prefetch_limit limit, void * limit_data) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
@@ -493,13 +525,16 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        // MAP_POPULATE would fault in the lazy ranges too
-        if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
+        // fork: MAP_POPULATE faults the whole map, beyond a finite prefetch budget.
+        if (!limit && prefetch >= size && prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+
+        // The policy sees available RAM after the map exists, before faulting pages.
+        if (limit && prefetch) { prefetch = std::min(prefetch, limit(std::min(size, prefetch), limit_data)); }
 
         // page-aligned madvise over [beg, end), clamped to the file
         auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
@@ -590,7 +625,8 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+            llama_mmap::prefetch_limit limit, void * limit_data) {
         GGML_UNUSED(numa);
 
         size = file->size();
@@ -611,6 +647,8 @@ struct llama_mmap::impl {
             CloseHandle(hMapping);
             throw std::runtime_error(format("MapViewOfFile failed: %s", llama_format_win_err(error).c_str()));
         }
+
+        if (limit && prefetch) { prefetch = std::min(prefetch, limit(std::min(size, prefetch), limit_data)); }
 
         if (prefetch > 0) {
 #if _WIN32_WINNT >= 0x602
@@ -659,11 +697,14 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+            llama_mmap::prefetch_limit limit, void * limit_data) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
         GGML_UNUSED(lazy_ranges);
+        GGML_UNUSED(limit);
+        GGML_UNUSED(limit_data);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -681,7 +722,8 @@ struct llama_mmap::impl {
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & lazy_ranges, prefetch_limit limit, void * limit_data)
+        : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges, limit, limit_data)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
@@ -864,7 +906,7 @@ const bool llama_mlock::SUPPORTED = true;
 const bool llama_mlock::SUPPORTED = false;
 #endif
 
-void llama_prefetch(llama_memory_ranges mr) {
+void llama_prefetch(llama_memory_ranges mr, std::atomic<size_t> * remaining, uint64_t available) {
 #if defined(__linux__) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
     if (mr.empty()) {
         return;
@@ -890,6 +932,14 @@ void llama_prefetch(llama_memory_ranges mr) {
     }
 
     const size_t page = (size_t) page_size;
+    if (remaining) {
+        const size_t safe = llama_mmap_prefetch_budget(available);
+        size_t current = remaining->load(std::memory_order_relaxed);
+        while (current > safe && !remaining->compare_exchange_weak(current, safe, std::memory_order_relaxed)) {}
+        if (current == SIZE_MAX) {
+            LLAMA_LOG_INFO("RAM fit: later page prefetch limited to %zu MiB to leave 5 GiB free and reserve RAM for other caches\n", safe >> 20);
+        }
+    }
     std::sort(mr.begin(), mr.end(), [](const llama_memory_range & a, const llama_memory_range & b) {
         return (uintptr_t) a.addr < (uintptr_t) b.addr;
     });
@@ -898,7 +948,7 @@ void llama_prefetch(llama_memory_ranges mr) {
 #if defined(_WIN32)
     // collect the mr and prefetch them in one call, so the reads can be issued concurrently
     std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-    auto prefetch = [&]() {
+    auto issue = [&]() {
         entries.push_back({ (PVOID) begin, (SIZE_T) (end - begin) });
         return true;
     };
@@ -915,7 +965,7 @@ void llama_prefetch(llama_memory_ranges mr) {
         return n;
     }();
     std::vector<std::pair<uintptr_t, uintptr_t>> merged;
-    auto prefetch = [&]() {
+    auto issue = [&]() {
         if (n_threads > 1) {
             merged.emplace_back(begin, end);
             return true;
@@ -927,11 +977,26 @@ void llama_prefetch(llama_memory_ranges mr) {
         return true;
     };
 #endif
+    auto prefetch = [&]() {
+        if (remaining) {
+            size_t current = remaining->load(std::memory_order_relaxed);
+            size_t bytes;
+            do {
+                bytes = std::min(end - begin, current - current % page);
+            } while (!remaining->compare_exchange_weak(current, current - bytes, std::memory_order_relaxed));
+            if (bytes == 0) { return true; }
+            end = begin + bytes;
+        }
+        return issue();
+    };
     for (const auto & range : mr) {
         if (!range.addr || range.size == 0) {
             continue;
         }
         const uintptr_t pointer = (uintptr_t) range.addr;
+        if (range.size > UINTPTR_MAX - pointer || pointer + range.size > UINTPTR_MAX - (page - 1)) {
+            continue; // Invalid advice must not wrap to unrelated memory.
+        }
         const uintptr_t first = pointer / page * page;
         const uintptr_t last = (pointer + range.size + page - 1) / page * page;
         if (end && first > end) {
@@ -983,6 +1048,8 @@ void llama_prefetch(llama_memory_ranges mr) {
 #endif
 #else
     GGML_UNUSED(mr);
+    GGML_UNUSED(remaining);
+    GGML_UNUSED(available);
 #endif
 }
 

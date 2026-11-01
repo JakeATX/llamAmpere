@@ -1,5 +1,7 @@
 # Flash-Next startup expert profile
 
+The Flash-Next launcher (`scripts/flash-next-server.sh`) loads `flash-next-experts.strp`, our v2-r-pure-skip15 expert list (v2-r-pure refined for the default skip rule), by default through `data/moe/flash-next.env`. Set `FLASH_NEXT_PROFILE` to use another list. The notes below describe the usage-count profile format.
+
 `flash-next.profile` uses the MOEPROF1 usage-count format from fn/fast. Its model identity and checksum are verified before any expert is warmed. The loader does not change a single quantized weight block.
 
 The shipped profile was measured on coding, agentic, and retrieval workloads. Startup fills the first layer first, including unobserved experts, since it has no preceding routing layer for prefetch. It orders the later layers by each tensor's measured use rates per expert byte, with a boost of `1 + 4/(layer + 1)` for early layers, and fills unused capacity in that order. A user-supplied `--moe-profile FILE` takes precedence over this default. To persist new measurements, retain the existing `GGML_MOE_CACHE_PROFILE_SAVE=/mnt/models/<task>/local.profile` setting. On the next startup, pass `--moe-profile /mnt/models/<task>/local.profile`; loading a profile does not overwrite the shipped default.

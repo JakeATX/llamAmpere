@@ -3,6 +3,7 @@
 #include "ggml.h" // for ggml_log_level
 
 #include <string>
+#include <atomic>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -77,7 +78,8 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 }
 
 // Prefetch the host pages needed to gather these rows.
-void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
+void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows,
+                         std::atomic<size_t> * remaining = nullptr);
 
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);

@@ -1251,6 +1251,9 @@ const ggml_cuda_device_info & ggml_cuda_info();
 
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
+bool ggml_cuda_host_pin_contains(const void * ptr, size_t size);
+cudaError_t ggml_cuda_host_register(void * ptr, size_t size, unsigned int flags);
+void ggml_cuda_host_unregister(void * ptr);
 
 // raw device allocation, honors GGML_CUDA_ENABLE_UNIFIED_MEMORY. free with cudaFree
 cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
@@ -1696,6 +1699,18 @@ struct ggml_backend_cuda_context {
         bool                used       = false;
     };
     std::vector<gdn_state_read_entry> gdn_state_reads;
+
+    // [GDNDIRECT] prefixed (folded replay) gated_delta_net nodes whose final-state / checkpoint block cpy into
+    // the recurrent cache is skipped: the launch stores those blocks at final_dst / ckpt_dst (one sequence,
+    // D-float rows). Filled by ggml_cuda_gdn_replay_direct_plan, checked and cleared at the end of each evaluation.
+    struct gdn_replay_direct_entry {
+        const ggml_tensor * gdn       = nullptr;
+        float *             final_dst = nullptr;
+        float *             ckpt_dst  = nullptr; // nullptr: the checkpoint block stays in the op output
+        float *             ingr_dst  = nullptr; // the K new ingredient slots (ring row); nullptr: op output
+        bool                used      = false;
+    };
+    std::vector<gdn_replay_direct_entry> gdn_replay_directs;
 
     // [ROUNDFIX] lightning_indexer nodes whose pooled-key GET_ROWS gather is skipped (GGML_CUDA_LID_GATHER=1):
     // the vec launch reads key i from base + rows[i] * row_stride (F16 rows) instead of src[1].

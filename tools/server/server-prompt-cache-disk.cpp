@@ -112,7 +112,18 @@ struct pc_reader {
     FILE *    f  = nullptr;
     pc_hasher hs;
     uint64_t  remaining = 0; // bytes left in the file
+    size_t    ram_remaining = SIZE_MAX;
+    bool      ram_exceeded = false;
     bool      ok = true;
+
+    bool claim(size_t n) {
+        if (n > ram_remaining) {
+            ram_exceeded = true;
+            return false;
+        }
+        ram_remaining -= n;
+        return true;
+    }
 
     bool bytes(void * p, size_t n) {
         if (!ok) {
@@ -131,7 +142,7 @@ struct pc_reader {
 
     bool blob(std::vector<uint8_t> & v) {
         uint64_t n = 0;
-        if (!val(n) || n > remaining) {
+        if (!val(n) || n > remaining || n > SIZE_MAX || !claim((size_t) n)) {
             ok = false;
             return false;
         }
@@ -504,8 +515,15 @@ bool server_prompt_disk_tier::write(const llama_tokens & tokens,
                                     const std::vector<uint8_t> & drft,
                                     const std::list<common_prompt_checkpoint> & checkpoints,
                                     const std::vector<uint8_t> & spec,
-                                    const std::vector<float> & lora_scales) {
+                                    const std::vector<float> & lora_scales, size_t ram_budget) {
     if (!enabled() || tokens.empty() || main.empty()) {
+        return false;
+    }
+
+    // fork: bound the I/O buffer and new token index before any bulk write allocation.
+    const size_t overhead = (4u << 20) + 8192;
+    if (ram_budget != SIZE_MAX && (ram_budget < overhead || tokens.size() > (ram_budget - overhead) / sizeof(llama_token))) {
+        SRV_WRN("%s", "prompt cache disk write skipped to keep its RAM budget\n");
         return false;
     }
 
@@ -635,7 +653,7 @@ bool server_prompt_disk_tier::write(const llama_tokens & tokens,
     return true;
 }
 
-bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator it, server_prompt_disk_record & out) {
+bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator it, server_prompt_disk_record & out, size_t ram_budget) {
     const std::string file = it->file;
 
     std::error_code ec;
@@ -647,10 +665,16 @@ bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator
         entries.erase(it); // gone (another server evicted it)
         return false;
     }
+    out = server_prompt_disk_record();
+    pc_reader r;
+    r.ram_remaining = ram_budget;
+    if (!r.claim(4u << 20)) {
+        fclose(f);
+        return false;
+    }
     std::vector<char> iobuf(4u << 20);
     setvbuf(f, iobuf.data(), _IOFBF, iobuf.size());
 
-    pc_reader r;
     r.f = f;
     r.remaining = fsize;
 
@@ -670,13 +694,18 @@ bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator
     } else if (!r.val(khash) || !r.val(key_len) || key_len > PC_MAX_KEY_LEN) {
         why = "bad key";
     } else {
-        fkey.resize(key_len);
-        if (!r.bytes(fkey.data(), key_len)) {
+        if (!r.claim(key_len + 1)) {
+            why = "RAM budget";
+        } else {
+            fkey.resize(key_len);
+        }
+        if (why || !r.bytes(fkey.data(), key_len)) {
             why = "bad key";
         } else if (khash != key_hash || fkey != key) {
             why     = "key mismatch";
             foreign = true;
-        } else if (!r.val(n_tokens) || n_tokens > PC_MAX_N_TOKENS) {
+        } else if (!r.val(n_tokens) || n_tokens > PC_MAX_N_TOKENS ||
+                !r.claim(2 * n_tokens * sizeof(llama_token))) {
             why = "bad token count";
         } else {
             out.tokens.resize(n_tokens);
@@ -694,7 +723,7 @@ bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator
     out.checkpoints.clear();
     for (uint32_t i = 0; !why && i < n_ckpt; ++i) {
         common_prompt_checkpoint c;
-        if (!r.val(c.n_tokens) || !r.val(c.id_task) || !r.val(c.pos_min) || !r.val(c.pos_max) ||
+        if (!r.claim(sizeof(c) + 2 * sizeof(void *)) || !r.val(c.n_tokens) || !r.val(c.id_task) || !r.val(c.pos_min) || !r.val(c.pos_max) ||
             !r.blob(c.data_tgt) || !r.blob(c.data_dft) || !r.blob(c.data_spec)) {
             why = "truncated checkpoint";
             break;
@@ -703,7 +732,7 @@ bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator
     }
 
     uint32_t n_lora = 0;
-    if (!why && (!r.val(n_lora) || n_lora > PC_MAX_N_LORA)) {
+    if (!why && (!r.val(n_lora) || n_lora > PC_MAX_N_LORA || !r.claim(n_lora * sizeof(float)))) {
         why = "truncated lora scales";
     }
     if (!why) {
@@ -731,6 +760,12 @@ bool server_prompt_disk_tier::read(std::list<server_prompt_disk_entry>::iterator
         out = server_prompt_disk_record();
         it->match = false;
         it->tokens.clear();
+        return false;
+    }
+
+    if (r.ram_exceeded) {
+        SRV_WRN("%s", "prompt cache disk restore skipped to keep its RAM budget\n");
+        out = server_prompt_disk_record();
         return false;
     }
 

@@ -46,6 +46,7 @@ enum stop_type {
     STOP_TYPE_NONE,
     STOP_TYPE_EOS,
     STOP_TYPE_WORD,
+    STOP_TYPE_LOOP,
     STOP_TYPE_LIMIT,
 };
 
@@ -69,6 +70,9 @@ struct task_params {
     int32_t n_predict = -1; // new tokens to predict
     int32_t n_indent  =  0; // minimum line indentation for the generated text in number of whitespace characters
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
+
+    bool    loop_guard = true;
+    int32_t loop_guard_reps = 100;
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
@@ -683,6 +687,14 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
     }
 
+    static void configure(std::unique_ptr<server_prompt_cache> & cache, int32_t limit_mib, size_t n_ctx, bool fit_ram);
+
+    bool fit_ram = false;
+    std::function<uint64_t()> available_ram;
+    bool reserve_ram(size_t extra);
+    size_t disk_read_budget() const;
+    size_t live_ram_budget() const;
+
     std::list<server_prompt_cache_state> states;
 
     // in bytes, 0 = no limit
@@ -734,7 +746,7 @@ struct server_prompt_cache {
     // [#187] hand_over: the entry takes these checkpoints by move instead of copying them (the caller is about to
     // replace or cut its prompt); see server_slot::prompt_reclaim_checkpoints for the way back
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
-            std::list<common_prompt_checkpoint> * hand_over = nullptr, size_t state_size_spec = 0);
+            std::list<common_prompt_checkpoint> * hand_over = nullptr, std::vector<uint8_t> state_data_spec = {});
 
     // [#187] true while `state` is a RAM entry of this cache (not loaded, evicted or staged)
     bool holds(const server_prompt_cache_state * state) const;

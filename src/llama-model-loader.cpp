@@ -745,6 +745,69 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // LLAMA_MODEL_OVERLAY=FILE.gguf: one more GGUF whose tensors are added to the model (an always-on expert bank next
+    // to unchanged model files). Its metadata is not merged except for its own AIT format check; a tensor that the
+    // model files already hold is an error.
+    if (const char * ov = getenv("LLAMA_MODEL_OVERLAY"); ov && ov[0] && !fname.empty()) {
+        struct ggml_context * ctx = NULL;
+        struct gguf_init_params ov_params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+        gguf_context_ptr ctx_gguf { gguf_init_from_file(ov, ov_params) };
+        if (!ctx_gguf) {
+            throw std::runtime_error(format("%s: failed to load overlay GGUF %s", __func__, ov));
+        }
+        if (const char * error = llama_ait_format_error(ctx_gguf.get())) { throw std::runtime_error(error); }
+        // the overlay belongs to a model that holds the regular expert tensor of every bank tensor; any other model loaded
+        // in the same process (an MTP drafter, a draft model) does not take it
+        bool belongs = true;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur && belongs; cur = ggml_get_next_tensor(ctx, cur)) {
+            std::string base = cur->name;
+            const size_t pos = base.find("_exps_hot.");
+            if (pos != std::string::npos) {
+                base.replace(pos, strlen("_exps_hot."), "_exps.");
+                belongs = weights_map.find(base) != weights_map.end();
+            }
+        }
+        if (!belongs) {
+            LLAMA_LOG_INFO("%s: overlay %s does not belong to this model (no matching expert tensors), not loaded\n", __func__, ov);
+            ggml_free(ctx);
+        } else {
+        if (files.size() >= UINT16_MAX) {
+            throw std::runtime_error("too many model files for an overlay");
+        }
+        const uint16_t idx = (uint16_t) files.size();
+        overlay_idx = idx;
+        // LLAMA_MODEL_OVERLAY_DIRECT=1 opts in to O_DIRECT overlay reads (UNSAFE on the home PC, rental only); the
+        // reads then go through a plain malloc bounce buffer, never straight into pinned or registered memory
+        bool overlay_direct = false;
+#ifdef __linux__
+        const char * direct = getenv("LLAMA_MODEL_OVERLAY_DIRECT");
+        overlay_direct = direct && atoi(direct) != 0;
+#endif
+        files.emplace_back(new llama_file(ov, "rb", overlay_direct));
+        if (files.back()->has_direct_io()) {
+            LLAMA_LOG_INFO("%s: [moe-bank] overlay direct reads enabled; weights bypass the page cache\n", __func__);
+        }
+        contexts.emplace_back(ctx);
+        int n_added = 0;
+        size_t added_bytes = 0;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            std::string tensor_name = std::string(cur->name);
+            if (weights_map.find(tensor_name) != weights_map.end()) {
+                throw std::runtime_error(format("overlay %s: tensor '%s' is already in the model", ov, ggml_get_name(cur)));
+            }
+            n_elements  += ggml_nelements(cur);
+            n_bytes     += ggml_nbytes(cur);
+            added_bytes += ggml_nbytes(cur);
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+            ++n_added;
+        }
+        LLAMA_LOG_INFO("%s: overlay %s: %d tensors, %.2f GiB\n", __func__, ov, n_added, added_bytes/1073741824.0);
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -1622,7 +1685,19 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool private_dense) {
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool private_dense, bool fit_ram) {
+    prefetch_remaining = SIZE_MAX;
+    const auto fit_prefetch = [](size_t requested, void * data) noexcept -> size_t {
+        auto & remaining = *static_cast<size_t *>(data);
+        size_t safe = 0;
+        try { safe = llama_mmap_prefetch_budget(llama_moe_arena::available_memory()); }
+        catch (...) { /* Unknown RAM disables optional read-ahead. */ }
+        if (remaining == SIZE_MAX) {
+            LLAMA_LOG_INFO("RAM fit: page prefetch limited to %zu MiB to leave 5 GiB free and reserve RAM for other caches\n", safe / MiB);
+        }
+        remaining = std::min(remaining, safe);
+        return llama_mmap_prefetch_take(remaining, requested);
+    };
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1641,10 +1716,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap && !use_moe_arena ? -1 : 0;
+            const bool direct_overlay = (int) idx == overlay_idx && file->has_direct_io();
+            const size_t prefetch_size = prefetch && use_mmap && !use_moe_arena && !direct_overlay ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    lazy.for_file(idx), fit_ram ? +fit_prefetch : nullptr, &prefetch_remaining);
             if (private_dense) {
                 for (const char * name : { "token_embd.weight", "output.weight" }) {
                     auto found = weights_map.find(name);
@@ -1733,7 +1809,7 @@ bool llama_model_loader::load_all_data(
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
-    constexpr size_t n_buffers = 4;
+    const size_t n_buffers = overlay_idx >= 0 ? 2 : 4;
 
     size_t alignment = 1;
     for (const auto & file : files) {
@@ -1747,8 +1823,12 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+    struct dio_bounce_deleter { void operator()(void * p) const { free(p); } };
+    std::unique_ptr<void, dio_bounce_deleter> dio_bounce; // plain bounce for O_DIRECT reads (never pinned)
+    size_t dio_bounce_align = 0;
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        const bool direct_overlay = overlay_idx >= 0 && files.at(overlay_idx)->has_direct_io();
+        if ((use_mmap && !direct_overlay) || check_tensors) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1847,6 +1927,7 @@ bool llama_model_loader::load_all_data(
         for (auto * cur : tensors) {
             const auto * weight = get_weight(ggml_get_name(cur));
             if (!weight || arena_tensors.count(cur) || lazy.has(cur) || !cur->buffer || ggml_backend_buffer_is_host(cur->buffer)) { continue; }
+            if (weight->idx == overlay_idx && files.at(weight->idx)->has_direct_io()) { continue; }
             const int fd = files.at(weight->idx)->file_id();
             const size_t chunk = (size_t) 8 << 20;
             for (size_t a = weight->offs; a < weight->offs + ggml_nbytes(cur); a += chunk) {
@@ -1925,7 +2006,13 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        // fork: stream bank weights through the bounded pinned buffers, even when the base model uses mmap.
+        const bool direct_overlay = weight->idx == overlay_idx && files.at(weight->idx)->has_direct_io() &&
+                cur->buffer && !ggml_backend_buffer_is_host(cur->buffer);
+        if (direct_overlay && !upload_backend && !check_tensors) {
+            throw std::runtime_error("bank direct reads require a backend with pinned async uploads");
+        }
+        const bool from_mapping = (use_mmap || lazy.has(cur)) && !direct_overlay;
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1974,6 +2061,7 @@ bool llama_model_loader::load_all_data(
                 if (upload_backend) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
+                    const size_t chunk_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE : buffer_size;
                     size_t aligned_offset = offset & ~(alignment - 1);
                     size_t offset_from_alignment = offset - aligned_offset;
                     file->seek(aligned_offset, SEEK_SET);
@@ -1985,8 +2073,24 @@ bool llama_model_loader::load_all_data(
                     size_t bytes_read = 0;
                     size_t data_read = 0;  // Actual tensor data copied (excluding padding)
 
+                    // safety: O_DIRECT reads (--load-mode dio, a direct overlay) land in one plain, never pinned or
+                    // registered, aligned bounce buffer of LLAMA_DIRECT_IO_BUFFER_SIZE, reused for every chunk, then memcpy
+                    const bool direct_read = file->has_direct_io();
+                    if (direct_read && (!dio_bounce || dio_bounce_align < alignment)) {
+                        void * raw = nullptr;
+                        const size_t bounce_align = std::max<size_t>(alignment, 4096);
+#ifndef _WIN32
+                        if (posix_memalign(&raw, bounce_align, LLAMA_DIRECT_IO_BUFFER_SIZE) != 0) { raw = nullptr; }
+#endif
+                        if (!raw) {
+                            throw std::runtime_error("cannot allocate the direct-read bounce buffer");
+                        }
+                        dio_bounce.reset(raw);
+                        dio_bounce_align = bounce_align;
+                    }
+
                     while (bytes_read < read_end - read_start) {
-                        size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
+                        size_t read_size = std::min<size_t>(chunk_size, read_end - read_start - bytes_read);
 
                         // Align the destination pointer within the pinned buffer
                         uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
@@ -1995,7 +2099,15 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_event_synchronize(events[buffer_idx]);
 
                         // Read aligned chunk from file
-                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                        if (direct_read) {
+                            file->read_raw_bounced(reinterpret_cast<void *>(ptr_dest_aligned), read_size,
+                                                   dio_bounce.get(), LLAMA_DIRECT_IO_BUFFER_SIZE);
+                        } else {
+                            file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                        }
+                        if (direct_overlay && !file->has_direct_io()) {
+                            throw std::runtime_error("bank direct read fell back to buffered I/O");
+                        }
 
                         // Calculate actual data portion (excluding alignment padding)
                         uintptr_t ptr_data = ptr_dest_aligned;
@@ -2085,6 +2197,13 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+#ifdef __linux__
+        // fork: the overlay (an always-on VRAM expert bank) is not read again except to refill lent tensors; its file
+        // pages would only crowd the RAM expert arena. LLAMA_MODEL_OVERLAY_KEEP_CACHE=1 keeps them.
+        if (overlay_idx >= 0 && overlay_idx < (int) files.size() && !getenv("LLAMA_MODEL_OVERLAY_KEEP_CACHE")) {
+            posix_fadvise(files.at(overlay_idx)->file_id(), 0, 0, POSIX_FADV_DONTNEED);
+        }
+#endif
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.
@@ -2109,7 +2228,7 @@ void llama_model_loader::print_info() const {
     }
 }
 
-std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progress_callback callback, void * user_data) {
+std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progress_callback callback, void * user_data, bool fit_ram) {
     if (!use_moe_arena || no_alloc) { return nullptr; }
     std::map<int, std::vector<ggml_tensor *>> layers;
     for (const auto & entry : ctx_map) {
@@ -2148,7 +2267,13 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         reserve += largest_layer + mapping_margin;
     }
     const size_t available = llama_moe_arena::available_memory();
-    if (available < reserve || total > available - reserve || !llama_moe_arena::pin_supported()) {
+    const bool quota_ok = llama_moe_arena::fits_ram_budget(total, available, fit_ram,
+            getenv("LLAMA_MOE_ARENA") != nullptr);
+    if (available < reserve || total > available - reserve || !llama_moe_arena::pin_supported() || !quota_ok) {
+        if (!quota_ok) {
+            LLAMA_LOG_INFO("RAM fit: pinned expert storage disabled because %.2f GiB exceeds its %.2f GiB RAM share; using unpinned model pages to leave 5 GiB free and room for other caches\n",
+                    total / double(GiB), llama_moe_arena::fit_memory_budget(available) / double(GiB));
+        }
         LLAMA_LOG_WARN("%s: %.2f GiB experts use unpinned mmap storage; %.2f GiB available, %.2f GiB pinning headroom required\n",
                 __func__, total / double(GiB), available / double(GiB), reserve / double(GiB));
 #ifdef __linux__
@@ -2264,6 +2389,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
             LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
                     llama_moe_arena::available_memory() / double(GiB));
         }
+        arena->report_thp();
         LLAMA_LOG_INFO("%s: %.2f GiB pinned (%s, registration took %.2f s), load+pin %.2f s, gate/up/down grouped by expert, original weight blocks preserved\n",
                 __func__, total / double(GiB), pin_early ? "registered beside the reads" : "registered after the reads", pin_seconds,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_start).count());
@@ -2350,6 +2476,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
                 llama_moe_arena::available_memory() / double(GiB));
     }
+    arena->report_thp();
     LLAMA_LOG_INFO("%s: %.2f GiB pinned, gate/up/down grouped by expert, original weight blocks preserved\n", __func__, total / double(GiB));
     return arena;
 }

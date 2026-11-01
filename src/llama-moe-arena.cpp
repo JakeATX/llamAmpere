@@ -322,10 +322,79 @@ bool llama_moe_arena::pin_supported() {
 #endif
 }
 
+// LLAMA_MOE_ARENA_THP=1 (default unset): back the arena with 2 MiB transparent huge pages. The CPU expert pool streams
+// whole experts (~1.7 MB each); with 4 KB pages that is ~430 TLB misses per expert, and the hardware prefetcher stops at
+// every 4 KB boundary. "1" skips the request when under half the arena could be backed by free 2 MiB blocks (compaction
+// on a fragmented box can stall the load for minutes); "2" asks anyway.
+#ifndef _WIN32
+static size_t arena_free_huge_bytes() {
+    std::ifstream f("/proc/buddyinfo");
+    std::string line;
+    size_t blocks = 0;
+    while (std::getline(f, line)) {
+        // "Node 0, zone   Normal  4688 601 ..." : skip the zone name, then one count per order
+        const size_t zone = line.find("zone");
+        if (zone == std::string::npos) { continue; }
+        const char * c = line.c_str() + zone + 4;
+        while (*c == ' ') { ++c; }
+        while (*c && *c != ' ') { ++c; }
+        for (int order = 0; *c; ++order) {
+            char * end = nullptr;
+            const unsigned long n = strtoul(c, &end, 10);
+            if (end == c) { break; }
+            c = end;
+            if (order >= 9) { blocks += (size_t) n << (order - 9); }
+        }
+    }
+    return blocks << 21;
+}
+
+static size_t arena_thp_kb(const void * base, size_t bytes) {
+    std::ifstream f("/proc/self/smaps");
+    std::string line;
+    const uintptr_t lo = (uintptr_t) base, hi = lo + bytes;
+    bool inside = false;
+    size_t kb = 0;
+    while (std::getline(f, line)) {
+        uintptr_t a = 0, b = 0;
+        if (sscanf(line.c_str(), "%lx-%lx", &a, &b) == 2) { inside = a < hi && b > lo; continue; }
+        size_t v = 0;
+        if (inside && sscanf(line.c_str(), "AnonHugePages: %zu kB", &v) == 1) { kb += v; }
+    }
+    return kb;
+}
+#endif
+
 llama_moe_arena::llama_moe_arena(size_t bytes) : size(bytes) {
 #ifndef _WIN32
-    data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (data == MAP_FAILED) { data = nullptr; throw std::bad_alloc(); }
+    const char * thp_env = getenv("LLAMA_MOE_ARENA_THP");
+    const int thp = thp_env ? atoi(thp_env) : 0;
+    constexpr size_t huge = 2ull << 20;
+    if (thp > 0) {
+        const size_t padded = size + huge;
+        void * raw = mmap(nullptr, padded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) { throw std::bad_alloc(); }
+        const uintptr_t start = (uintptr_t) raw;
+        const uintptr_t aligned = (start + huge - 1) & ~(uintptr_t) (huge - 1);
+        if (aligned > start) { munmap(raw, aligned - start); }
+        const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+        const uintptr_t end = aligned + ((size + page - 1) & ~(page - 1)), raw_end = start + padded;
+        if (raw_end > end) { munmap((void *) end, raw_end - end); }
+        data = (void *) aligned;
+        const size_t free_huge = arena_free_huge_bytes();
+        if (thp == 1 && free_huge < size / 2) {
+            LLAMA_LOG_WARN("%s: THP not requested: %zu GiB of free 2 MiB blocks for a %zu GiB arena (LLAMA_MOE_ARENA_THP=2 asks anyway)\n",
+                    __func__, free_huge >> 30, size >> 30);
+        } else if (madvise(data, size, MADV_HUGEPAGE) == 0) {
+            thp_requested = true;
+            LLAMA_LOG_INFO("%s: THP requested for %zu GiB arena (%zu GiB free 2 MiB blocks)\n", __func__, size >> 30, free_huge >> 30);
+        } else {
+            LLAMA_LOG_WARN("%s: madvise(MADV_HUGEPAGE) failed: %s\n", __func__, strerror(errno));
+        }
+    } else {
+        data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (data == MAP_FAILED) { data = nullptr; throw std::bad_alloc(); }
+    }
     buffer.reset(ggml_backend_cpu_buffer_from_ptr(data, size));
     if (!buffer) { munmap(data, size); data = nullptr; throw std::bad_alloc(); }
     ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -334,12 +403,22 @@ llama_moe_arena::llama_moe_arena(size_t bytes) : size(bytes) {
 #endif
 }
 
+void llama_moe_arena::report_thp() const {
+#ifndef _WIN32
+    if (thp_requested && data) {
+        const size_t kb = arena_thp_kb(data, size);
+        LLAMA_LOG_INFO("%s: %.2f of %.2f GiB of the arena is on 2 MiB pages\n", __func__, kb / double(1 << 20), size / double(1ull << 30));
+    }
+#endif
+}
+
 void llama_moe_arena::pin() {
     pin_ranges.reserve(1);
     auto * reg = arena_cuda_reg();
     pin_range = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
     unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
-    if (!pin_ranges.empty() || !pin_range || !unpin || !pin_range(data, size)) {
+    is_unpinned = (bool (*)(const void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_is_unpinned");
+    if (!pin_ranges.empty() || !pin_range || !unpin || !is_unpinned || !pin_range(data, size)) {
         throw std::runtime_error("expert arena CUDA host registration failed");
     }
     pin_ranges.emplace_back(0, size);
@@ -387,6 +466,7 @@ size_t llama_moe_arena::discard(const std::vector<std::pair<size_t, size_t>> & r
     pin_ranges.reserve(cold.size() + holes.size());
     // The GPU owner must preserve every covered byte before this transition.
     unpin(data);
+    GGML_ASSERT(is_unpinned(data, size));
     pin_ranges.clear();
     for (const auto & range : cold) {
         if (!pin_range((char *) data + range.first, range.second)) {
@@ -399,6 +479,7 @@ size_t llama_moe_arena::discard(const std::vector<std::pair<size_t, size_t>> & r
     }
     missing_ranges = std::move(holes);
     for (const auto & range : missing_ranges) {
+        GGML_ASSERT(is_unpinned((char *) data + range.first, range.second));
         if (madvise((char *) data + range.first, range.second, MADV_DONTNEED) != 0) {
             throw std::runtime_error("cannot discard GPU-backed arena pages");
         }
@@ -411,18 +492,27 @@ size_t llama_moe_arena::discard(const std::vector<std::pair<size_t, size_t>> & r
 }
 
 void llama_moe_arena::pin_restored() {
-    for (const auto & range : missing_ranges) {
-        if (!pin_range((char *) data + range.first, range.second)) {
-            throw std::runtime_error("cannot pin restored arena pages");
+    const size_t original = pin_ranges.size();
+    pin_ranges.reserve(original + missing_ranges.size());
+    try {
+        for (const auto & range : missing_ranges) {
+            if (!pin_range((char *) data + range.first, range.second)) {
+                throw std::runtime_error("cannot pin restored arena pages");
+            }
+            pin_ranges.push_back(range);
         }
-        pin_ranges.push_back(range);
+    } catch (...) {
+        for (size_t i = original; i < pin_ranges.size(); ++i) { unpin((char *) data + pin_ranges[i].first); }
+        pin_ranges.resize(original);
+        throw;
     }
     missing_ranges.clear();
 }
 
 llama_moe_arena::~llama_moe_arena() {
-    buffer.reset();
     for (const auto & range : pin_ranges) { unpin((char *) data + range.first); }
+    GGML_ASSERT(!is_unpinned || is_unpinned(data, size));
+    buffer.reset();
 #ifndef _WIN32
     if (data) { munmap(data, size); }
 #endif

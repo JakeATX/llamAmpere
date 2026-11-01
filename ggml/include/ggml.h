@@ -468,6 +468,9 @@ extern "C" {
         GGML_TYPE_AIT2_U  = 115,
         GGML_TYPE_AIT3_U  = 116,
         GGML_TYPE_AIT4_U  = 117,
+        // Fractional computed pair: 5 bits per two weights + fp16/128 scale = 2.625 bpw.
+        // Whole-tensor 16-row units; CUDA dense matmul only. No row-wise embedding lookup.
+        GGML_TYPE_AIF25_U = 118,
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         GGML_TYPE_COUNT   = 144,
@@ -2811,6 +2814,19 @@ extern "C" {
             int64_t               K,
             int32_t               emit_mode);
 
+    // emit_mode 1 or 2 only: before its n_tokens, `gdn` runs w->ne[0] prefix tokens read from `ring`,
+    // [n_rows, n_seqs] rows of packed ingredient slots in the layout of emit_mode `ring_mode` (slot j
+    // of seq s at row s, offset j * ingr_width * H, as this op emits them), with g and beta
+    // multiplied by w[j]. A prefix token only advances the state: no attention output, no slot,
+    // and it does not count towards the checkpoint block. w[j] == 0 leaves the state bit-exact,
+    // so a masked ring prefix replays the accepted slots ahead of the batch in the same call.
+    // With n_tokens <= K the output gains the checkpoint block: the state after the prefix.
+    GGML_API void ggml_gated_delta_net_set_prefix(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * ring,
+            struct ggml_tensor  * w,
+            int32_t               ring_mode);
+
     // ggml_gated_delta_net emit_mode 1 and 2: floats per head in one ingredient slot (g_width = g->ne[0])
     GGML_API int64_t ggml_gated_delta_net_ingr_width(int64_t S_v, int64_t g_width, int32_t emit_mode);
 
@@ -3261,6 +3277,24 @@ extern "C" {
     GGML_API struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads);
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
+
+    // MoE always-resident expert bank: per regular expert tensor (keyed by its data pointer), which experts are also
+    // held in an always-on-device bank. The regular call leaves those rows out and the expert cache never plans them.
+    // in_bank may be NULL (tensor registered for the resident census only). Registration happens at model load,
+    // before any compute; n_expert must be <= 512.
+    GGML_API void            ggml_moe_bank_register  (const void * weight_data, int32_t layer, int32_t n_expert, const uint8_t * in_bank);
+    GGML_API void            ggml_moe_bank_unregister(const void * weight_data);
+    // true once some registered tensor has bank experts (a model with hot-bank tensors is loaded)
+    GGML_API bool            ggml_moe_bank_any       (void);
+    // flags of a registered tensor with a bank, NULL otherwise or when GGML_MOE_BANK_SKIP=0
+    GGML_API const uint8_t * ggml_moe_bank_lookup    (const void * weight_data);
+    // enumerate every registered tensor (ignores GGML_MOE_BANK_SKIP); returns false past the end
+    GGML_API bool            ggml_moe_bank_entry     (int index, const void ** weight_data, int32_t * layer, int32_t * n_expert, const uint8_t ** in_bank);
+    // resident census over the registered layers: an expert counts once, as bank when it is in the bank, else as cache
+    // when every registered tensor of its layer has it resident (resident() decides). both = cache copies of bank
+    // experts. Returns false when nothing is registered.
+    GGML_API bool            ggml_moe_bank_census    (bool (*resident)(void * user, const void * weight_data, int32_t expert), void * user,
+                                                      int32_t * layer_min, int32_t * layer_max, size_t * cache, size_t * bank, size_t * both);
 
 #ifdef  __cplusplus
 }

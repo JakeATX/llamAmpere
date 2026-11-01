@@ -14,6 +14,8 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
+#include <thread>
 #include <map>
 #include <vector>
 
@@ -151,6 +153,10 @@ struct llama_context {
 
     void set_n_threads(int32_t n_threads, int32_t n_threads_batch);
     void set_decode_phase(enum llama_decode_phase phase);
+    // PP-1: generation phase with the expert cache refill on a helper thread (LLAMA_PP_OVERLAP=1)
+    void set_decode_phase_async(enum llama_decode_phase phase);
+    bool prompt_warm_join();
+    bool prompt_warm_running() const { return pp_warm_thread.joinable(); }
     void set_next_decode_phase(enum llama_decode_phase phase);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
@@ -668,6 +674,9 @@ private:
     std::vector<size_t> b1_layer_compute_bytes;
     std::vector<ggml_backend_buffer_ptr> b1_kv_views;
     ggml_backend_buffer_ptr b1_kv_owned;
+    size_t b1_legacy_deficit = 0; // VRAM the last legacy layer reservation lacked (re-plan lends that much more)
+    bool b1_lend_scratch = false; // the layer graph may also use the lent, unused B1 VRAM (opt-in: LLAMA_B1_LEND_SCRATCH=1)
+    std::vector<ggml_backend_buffer_ptr> b1_lend_views; // refilled with the lent tensors, never cleared here
     bool b1_kv_scratch_release();
     bool b1_kv_scratch_bind(int32_t l0, int32_t l1, bool preflight = false);
 
@@ -707,10 +716,19 @@ private:
     std::vector<std::vector<uint64_t>> b1_cache_counts;
     uint64_t b1_cache_readbacks = 0;
     int64_t b1_compute_submit_us = 0;
+    // LLAMA_PP_LAYERS split of the B1 per-graph host time: input fill vs scheduler submit (input copies + launches)
+    int64_t b1_pp_inputs_us = 0;
+    int64_t b1_pp_submit_us = 0;
     static bool b1_cache_eval(ggml_tensor * tensor, bool ask, void * user_data);
     void b1_cache_profile_load();
     void b1_cache_warm();
     void b1_cache_device_prepare();
+    // PP-1: refill thread state. pp_warm_async is set only while set_decode_phase_async() runs.
+    std::thread pp_warm_thread;
+    std::atomic<bool> pp_warm_done{false};
+    std::atomic<bool> pp_warm_failed{false};
+    bool pp_warm_async = false;
+    void pp_warm_start();
 
 public:
     // in-call checkpoints (llama_state_seq_capture_arm)
@@ -738,6 +756,7 @@ public:
 
     int32_t capture_arm(llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n);
     int32_t capture_min_tail() const;
+    size_t  capture_size() const { return ckpt_size_hint.load(std::memory_order_acquire); }
     bool    capture_select(int32_t k, llama_pos * pos_min, llama_pos * pos_max);
 
 private:
@@ -745,6 +764,7 @@ private:
     bool                      ckpt_armed = false; // set by capture_arm, consumed by the next decode
     int32_t                   ckpt_sel   = -1;
     std::vector<ckpt_capture> ckpt_caps;
+    std::atomic<size_t>       ckpt_size_hint{0}; // largest laid-out capture blob, read by other threads
 
     // the recurrent memory whose PARTIAL_ONLY state the captures copy, nullptr when unsupported
     const llama_memory_recurrent * capture_mem() const;

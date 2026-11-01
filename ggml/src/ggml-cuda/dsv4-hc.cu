@@ -196,6 +196,59 @@ static __global__ void dsv4_hc_post_f32(
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
+// [HCPV4] GGML_CUDA_HC_POST_V4=1 (opt-in): the identity-comb hc_post with hc == 4 and contiguous rows. One thread
+// takes 4 consecutive columns of one token for all 4 streams: x is read once as a float4 (the generic kernel reads it
+// once per stream), the residual and dst rows move as float4, and the 2D grid (columns, tokens) drops the 64-bit
+// div/mod per element. Same expression per element as dsv4_hc_post_f32<false>, so the output is unchanged.
+static __global__ void dsv4_hc_post_v4_f32(
+        const float * x,
+        const float * residual,
+        const float * post,
+        float * dst,
+        int n_embd4,
+        int64_t sx1,
+        int64_t sr1,
+        int64_t sr2,
+        int64_t sp0,
+        int64_t sp1,
+        int64_t sd1,
+        int64_t sd2) {
+    ggml_cuda_pdl_lc();
+    const int     i4 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t it = blockIdx.y;
+
+    if (i4 >= n_embd4) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    // all loads before the first store: dst may be the residual buffer (in place), which blocks reordering them, and
+    // each thread only reads the elements it writes
+    const float4 xv = reinterpret_cast<const float4 *>(x + it*sx1)[i4];
+    float  p[4];
+    float4 rv[4];
+#pragma unroll
+    for (int idst = 0; idst < 4; ++idst) {
+        p[idst]  = post[idst*sp0 + it*sp1];
+        rv[idst] = reinterpret_cast<const float4 *>(residual + idst*sr1 + it*sr2)[i4];
+    }
+#pragma unroll
+    for (int idst = 0; idst < 4; ++idst) {
+        float4 o;
+        o.x = xv.x * p[idst]; o.x += rv[idst].x;
+        o.y = xv.y * p[idst]; o.y += rv[idst].y;
+        o.z = xv.z * p[idst]; o.z += rv[idst].z;
+        o.w = xv.w * p[idst]; o.w += rv[idst].w;
+        reinterpret_cast<float4 *>(dst + idst*sd1 + it*sd2)[i4] = o;
+    }
+}
+
+static bool dsv4_hc_post_v4_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_HC_POST_V4"); return e && atoi(e) != 0; }();
+    return on;
+}
+
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mixes = dst->src[0];
     const ggml_tensor * scale = dst->src[1];
@@ -303,6 +356,25 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
+
+    const bool aligned16 = ((uintptr_t) x->data | (uintptr_t) residual->data | (uintptr_t) o->data) % 16 == 0 &&
+        (nbx1 | nbr1 | nbr2 | nbd1 | nbd2) % 16 == 0;
+    if (comb == nullptr && hc == 4 && n_embd % 4 == 0 && n_tokens <= 65535 && aligned16 &&
+            nbx0 == sizeof(float) && nbr0 == sizeof(float) && nbd0 == sizeof(float) && dsv4_hc_post_v4_enabled()) {
+        const int n_embd4 = (int) (n_embd / 4);
+        const int bs = 128;
+        const dim3 block_dims(bs, 1, 1);
+        const dim3 grid_dims((n_embd4 + bs - 1) / bs, (unsigned) n_tokens, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+        ggml_cuda_kernel_launch(dsv4_hc_post_v4_f32, launch_params,
+                (const float *) x->data, (const float *) residual->data, (const float *) post->data, (float *) o->data,
+                n_embd4,
+                (int64_t) (nbx1 / sizeof(float)),
+                (int64_t) (nbr1 / sizeof(float)), (int64_t) (nbr2 / sizeof(float)),
+                (int64_t) (nbp0 / sizeof(float)), (int64_t) (nbp1 / sizeof(float)),
+                (int64_t) (nbd1 / sizeof(float)), (int64_t) (nbd2 / sizeof(float)));
+        return;
+    }
 
     const int block_size = 256;
     const int64_t nr = n_embd * hc * n_tokens;

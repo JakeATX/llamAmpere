@@ -3,28 +3,52 @@
 #include "llama-batch.h"
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-mmap.h"
+#include "llama-moe-arena.h"
 
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <thread>
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 
 static constexpr int64_t PLE_PF_DEFAULT_THREADS = 0;
 static constexpr int64_t PLE_PF_DEFAULT_MIN     = 4096;
+static constexpr int64_t PLE_PF_DEFAULT_COLD    = 0;   // readers when the table is mostly out of the page cache (opt-in: LLAMA_PLE_PF_COLD_THREADS=N, e.g. 32)
 
 static int64_t ple_pf_env(const char * name, int64_t def) {
     const char * v = getenv(name);
-    return v && *v ? (int64_t) atoll(v) : def;
+    return v && *v ? (int64_t) strtoll(v, nullptr, 10) : def;
+}
+
+void llama_ple_hash_rows(const llama_hparams & hp, llama_token token, const llama_token * prev, int32_t * rows) {
+    const uint32_t n_prev = hp.ple_ngram_size - 1;
+    uint64_t mixed = (uint64_t) token * hp.ple_layer_multipliers[0];
+    bool cut = false;
+    for (uint32_t s = 1; s <= n_prev; ++s) {
+        const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[n_prev - s];
+        cut = cut || t < 0 || t == (llama_token) hp.ple_eos_token_id;
+        mixed ^= (uint64_t) (cut ? (int64_t) hp.ple_eos_token_id : t) * hp.ple_layer_multipliers[s];
+        const uint32_t base = (s - 1) * hp.ple_heads_per_ngram;
+        for (uint32_t g = 0; g < hp.ple_heads_per_ngram; ++g) {
+            const uint32_t h = base + g;
+            rows[h] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
+        }
+    }
 }
 
 #if defined(__linux__)
@@ -66,34 +90,83 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     // Opt in with LLAMA_PLE_PREFETCH=N reader threads; read-ahead can churn the page cache on low-RAM hosts.
     const bool    user  = getenv("LLAMA_PLE_PREFETCH") != nullptr;
     const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", ple_pf_env("LLAMA_PLE_PF_THREADS", PLE_PF_DEFAULT_THREADS));
-    if (n_thr <= 0) {
+    if (n_thr <= 0 || n_ubatch == 0) {
         return nullptr;
     }
     const ggml_tensor * t = model.per_layer_tok_embd;
     if (model.arch != LLM_ARCH_QWEN4EXP || !t || !model.can_prefetch.count(t) || !t->data || !t->buffer ||
-            !ggml_backend_buffer_is_host(t->buffer) || model.hparams.ple_n_heads == 0 || model.hparams.ple_ngram_size < 2) {
+            !ggml_backend_buffer_is_host(t->buffer) || t->nb[1] == 0 || t->ne[1] <= 0 ||
+            model.hparams.ple_n_heads == 0 || model.hparams.ple_ngram_size < 2) {
         if (user) {
             LLAMA_LOG_WARN("%s: [PLEPF] LLAMA_PLE_PREFETCH is set but this model has no lazily mapped qwen4exp PLE table, off\n", __func__);
         }
         return nullptr;
     }
 
+    const uintptr_t buffer_base = (uintptr_t) ggml_backend_buffer_get_base(t->buffer);
+    const uintptr_t table_base  = (uintptr_t) t->data;
+    const size_t buffer_size = ggml_backend_buffer_get_size(t->buffer);
+    // fork: check the full row span before readers form page addresses.
+    if (!buffer_base || table_base < buffer_base || table_base - buffer_base > buffer_size ||
+            (uint64_t) t->ne[1] > (buffer_size - (table_base - buffer_base))/t->nb[1]) {
+        return nullptr;
+    }
+
+    const auto & hp = model.hparams;
+    if (hp.ple_ngram_size > hp.ple_layer_multipliers.size() || hp.ple_n_heads > hp.ple_head_vocab_sizes.size() ||
+            hp.ple_heads_per_ngram == 0 || (uint64_t) (hp.ple_ngram_size - 1)*hp.ple_heads_per_ngram != hp.ple_n_heads) {
+        return nullptr;
+    }
+    for (uint32_t h = 0; h < hp.ple_n_heads; ++h) {
+        const uint64_t end = (uint64_t) hp.ple_head_offsets[h] + hp.ple_head_vocab_sizes[h];
+        if (hp.ple_head_vocab_sizes[h] == 0 || end > (uint64_t) t->ne[1] || end > (uint64_t) INT32_MAX + 1) {
+            return nullptr;
+        }
+    }
+
     std::unique_ptr<llama_ple_prefetch> pf(new llama_ple_prefetch());
     pf->model     = &model;
     pf->ple       = t;
     pf->n_threads = (int) std::min<int64_t>(n_thr, 512);
+    pf->batch_runs = (size_t) std::min<int64_t>(64, std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_BATCH_RUNS", 1)));
+    // fork: a cold table (evicted by another process, first prompt after boot) is bound by disk queue depth, not by
+    // the readers' CPU; LLAMA_PLE_PF_COLD_THREADS=0 keeps n_threads in every case
+    pf->n_cold    = (int) std::min<int64_t>(std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_COLD_THREADS", PLE_PF_DEFAULT_COLD)), 512);
+    pf->n_recheck = (uint32_t) std::min<int64_t>(std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_RECHECK", 0)), UINT32_MAX);
     // by default only long calls (a short check or catch-up batch is cheaper to fault in) and the whole call ahead
-    pf->n_min     = (uint32_t) std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN));
+    pf->n_min     = (uint32_t) std::min<int64_t>(UINT32_MAX,
+            std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN)));
     pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", user ? 2*(int64_t) n_ubatch : INT64_MAX/2));
+    // fork: cap read-ahead in ubatches; zero keeps the existing token-based setting.
+    const int64_t window = ple_pf_env("LLAMA_PLE_PF_WINDOW_UBATCHES", 0);
+    if (window > 0) {
+        const uint64_t cap = (uint64_t) std::min<int64_t>(window, 64)*(uint64_t) n_ubatch;
+        pf->n_ahead = std::min(pf->n_ahead, cap);
+    }
+    pf->verify    = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) > 0;
+    pf->verify_sync = ple_pf_env("LLAMA_PLE_PF_VERIFY", 0) >= 2;
+    pf->test_drop   = (int) std::min<int64_t>(ple_pf_env("LLAMA_PLE_PF_TEST_DROP", 0), 100);
+    // fork: the startup-profile cache remaps rows to its own table, which this decode does not read
+    pf->decode_on    = ple_pf_env("LLAMA_PLE_DECODE", 0) > 0 && !model.ple_cache;
+    pf->n_decode     = (int) std::min<int64_t>(std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_DECODE_THREADS", 16)), 256);
+    pf->dec_pinned   = ple_pf_env("LLAMA_PLE_DECODE_PINNED", 1) > 0;
+    pf->n_decode_min = (uint32_t) std::min<int64_t>(std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_DECODE_MIN", 1024)), UINT32_MAX);
     pf->n_ubatch  = n_ubatch;
     pf->row_size  = t->nb[1];
     pf->n_rows    = (uint64_t) t->ne[1];
 
     const char * mode = getenv("LLAMA_PLE_PF_MODE");
+    // LLAMA_PLE_PF_MODE=coalesce (opt-in): pread runs may span holes of up to 16 pages, one chunk per call
+    pf->coalesce = mode && strcmp(mode, "coalesce") == 0;
+    pf->bounded_window = window > 0;
     pf->use_pread = !(mode && strcmp(mode, "fault") == 0);
     // by default the readers only queue the reads (posix_fadvise WILLNEED): nothing is copied, so two threads keep
     // the disk busy without taking CPU from the prompt setup; the gather waits on any page still in flight
-    pf->use_advise = pf->use_pread && (mode ? strcmp(mode, "advise") == 0 : !user);
+    pf->use_advise = pf->use_pread && !pf->coalesce && (mode ? strcmp(mode, "advise") == 0 : !user);
+    // fork: pread readers also map the pages they read (same-box screens r104/r116 faster, identity r114 PASS);
+    // LLAMA_PLE_PF_POPULATE=0 keeps pread-only. The advise mode keeps its old mapping unless asked.
+    const int64_t populate = ple_pf_env("LLAMA_PLE_PF_POPULATE", pf->use_pread && !pf->use_advise ? 1 : 0);
+    pf->populate = populate == 2 || populate == 3 ? (int) populate : populate > 0;
 #if defined(__linux__)
     if (pf->use_pread) {
         std::string path;
@@ -105,24 +178,45 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
             LLAMA_LOG_WARN("%s: [PLEPF] cannot open the file behind the PLE table, reading by page faults\n", __func__);
             pf->use_pread = false;
             pf->use_advise = false;
+            pf->coalesce = false;
         } else {
             pf->file_off = off;
             // the descriptor's own readahead state: read exactly the pages asked for
             posix_fadvise(pf->fd, 0, 0, POSIX_FADV_RANDOM);
         }
     }
+    if (model.ram_fit_enabled() || pf->bounded_window || (pf->use_pread && pf->populate)) {
+        // The gather and fault readers share mapping read-around, separate from the pread descriptor.
+        const uintptr_t page = table_base - table_base%4096;
+        const uint64_t bytes = pf->n_rows*pf->row_size;
+        if (bytes > SIZE_MAX - (table_base - page) ||
+                madvise((void *) page, (size_t) bytes + table_base - page, MADV_RANDOM) != 0) {
+            if (model.ram_fit_enabled() || pf->bounded_window) {
+                LLAMA_LOG_WARN("%s: [PLEPF] cannot bound mapped read-around, bounded prefetch off\n", __func__);
+                return nullptr;
+            }
+            pf->populate = 0;
+            LLAMA_LOG_WARN("%s: [PLEPF] cannot bound mapped read-around, using pread only\n", __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: [PLEPF] mapped reads use random-access mapping\n", __func__);
+        }
+    }
 #else
     pf->use_pread = false;
     pf->use_advise = false;
+    pf->coalesce = false;
 #endif
 
     LLAMA_LOG_WARN("%s: [PLEPF] PLE prefetch on: %d threads, %s, calls of %u+ tokens, %" PRIu64 " tokens ahead\n", __func__,
-            pf->n_threads, pf->use_advise ? "advise" : pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
+            pf->n_threads, pf->coalesce ? "coalesced pread" : pf->use_advise ? "advise" : pf->use_pread ? "pread" : "page faults", pf->n_min, pf->n_ahead);
     return pf;
 }
 
 llama_ple_prefetch::~llama_ple_prefetch() {
     stop();
+    if (dec_pin) {
+        ggml_backend_buffer_free(dec_pin);
+    }
 #if defined(__linux__)
     if (fd >= 0) {
         close(fd);
@@ -195,13 +289,28 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     pos0_call = pos0;
     seq_start = pos0 == 0;
     hinted    = false;
+    chunk_size = coalesce ? std::max<size_t>(CHUNK, n) : CHUNK;
+    // fork: small windows must not read a whole 256-token fault chunk ahead.
+    if (bounded_window) {
+        chunk_size = std::max<size_t>(1, coalesce ? n_ubatch : std::min<uint32_t>(CHUNK, n_ubatch));
+    }
 
-    // the run arrays at their upper bound (each row touches at most two pages); written front to back only
-    const size_t cap = n*(size_t) model->hparams.ple_n_heads*2 + 1;
+    // A row can start within a page and can span more than two pages.
+    const uint64_t pages_per_row = 1 + (row_size - 1)/4096 + ((row_size - 1)%4096 != 0);
+    const size_t max_runs = std::numeric_limits<size_t>::max()/sizeof(uint64_t) - 1;
+    const size_t n_heads = model->hparams.ple_n_heads;
+    if (pages_per_row > max_runs || n > max_runs/n_heads || n*n_heads > max_runs/pages_per_row) {
+        throw std::length_error("PLE prefetch page count exceeds array size");
+    }
+    // fork: global page dedup means the run count cannot exceed the table's page span.
+    // The extra page covers an unaligned table start in both fault and file-read modes.
+    const uint64_t table_bytes = n_rows*row_size;
+    const uint64_t table_pages = table_bytes/4096 + (table_bytes % 4096 != 0) + 1;
+    const size_t cap = std::min(n*n_heads*(size_t) pages_per_row, (size_t) table_pages) + 1;
     run_key.reset(new uint64_t[cap]);
     run_len.reset(new uint32_t[cap]);
     run_chunk.reset(new uint32_t[cap]);
-    n_chunks = (n + CHUNK - 1)/CHUNK;
+    n_chunks = n/chunk_size + (n % chunk_size != 0);
     remaining.reset(new std::atomic<int64_t>[n_chunks]);
     for (size_t c = 0; c < n_chunks; ++c) {
         remaining[c].store(PLE_PF_PENDING);
@@ -213,6 +322,12 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
     n_built   = 0;
     allowed_chunks = chunks_for((uint64_t) n_ubatch + n_ahead);
     n_read    = 0;
+    n_map_runs = 0;
+    n_direct_runs = 0;
+    n_verify_missing = 0;
+    n_test_dropped   = 0;
+    n_verify_ubatch  = 0;
+    t_verify_us      = 0;
     n_pages_all = 0;
     consumed  = 0;
     t_wait_us = 0;
@@ -228,7 +343,7 @@ void llama_ple_prefetch::begin(llama_pos pos0) {
 }
 
 size_t llama_ple_prefetch::chunks_for(uint64_t n_tok) const {
-    return (size_t) std::min<uint64_t>(n_chunks, n_tok/CHUNK + (n_tok % CHUNK != 0));
+    return (size_t) std::min<uint64_t>(n_chunks, n_tok/chunk_size + (n_tok % chunk_size != 0));
 }
 
 bool llama_ple_prefetch::run_ready(size_t i) const {
@@ -236,6 +351,22 @@ bool llama_ple_prefetch::run_ready(size_t i) const {
         return true;
     }
     return i < n_built.load() ? run_chunk[i] < allowed_chunks.load() : built.load();
+}
+
+size_t llama_ple_prefetch::fit_pages(size_t requested) const {
+    if (!model->ram_fit_enabled()) { return requested; }
+    uint64_t available = 0;
+    try { available = llama_moe_arena::available_memory(); }
+    catch (...) { /* Unknown RAM disables optional reads. */ }
+    const size_t safe = llama_mmap_prefetch_budget(available);
+    auto & quota = model->prefetch_remaining;
+    size_t current = quota.load(std::memory_order_relaxed);
+    while (current > safe && !quota.compare_exchange_weak(current, safe, std::memory_order_relaxed)) {}
+    size_t pages;
+    do {
+        pages = std::min(requested, current / 4096);
+    } while (!quota.compare_exchange_weak(current, current - pages*4096, std::memory_order_relaxed));
+    return pages;
 }
 
 void llama_ple_prefetch::build() {
@@ -248,9 +379,10 @@ void llama_ple_prefetch::build() {
     const int64_t eos      = hp.ple_eos_token_id;
 
     // [PFGAP] the readers start first and follow the chunks as they are published
-    std::vector<int64_t> last(n_threads, 0);
+    std::vector<int64_t> last(std::max(n_threads, n_cold), 0);
     readers.clear();
-    readers.reserve(n_threads);
+    readers.reserve(last.size());
+    n_readers = n_threads;
     for (int i = 0; i < n_threads; ++i) {
         readers.emplace_back([this, i, &last]() { last[i] = reader(); });
     }
@@ -258,22 +390,42 @@ void llama_ple_prefetch::build() {
     const uint64_t base  = use_pread ? file_off : (uint64_t) (uintptr_t) ple->data;
     const uint64_t key0  = base / 4096;
     const uint64_t nkeys = (base + n_rows*row_size + 4095)/4096 - key0 + 1;
-    std::vector<uint8_t> seen(nkeys, 0);
+    std::vector<uint64_t> seen(nkeys/64 + (nkeys % 64 != 0), 0);
     std::vector<uint64_t> cp;   // the new pages of one chunk
-    cp.reserve((size_t) CHUNK*n_heads*2);
+    if (bounded_window) {
+        // fork: reserve for this window's rows once, not for a fixed 256-token fault chunk.
+        const uint64_t pages_per_row = 1 + (row_size - 1)/4096 + ((row_size - 1)%4096 != 0);
+        const uint64_t chunk_pages = std::min<uint64_t>(n, chunk_size)*n_heads*pages_per_row;
+        cp.reserve((size_t) std::min(nkeys, chunk_pages));
+    } else {
+        cp.reserve((size_t) CHUNK*n_heads*2);
+    }
 
     // the rows, as llm_graph_input_qwen4exp_ple::set_input computes them; a predecessor before the call is unknown,
     // unless the call starts the sequence (then it reads as EOS)
-    pred.assign((size_t) (n*n_heads), -1);
-    std::vector<int64_t> ctx(n_gram);
     size_t nr = 0;
+    int64_t t_window_us = 0;
     for (size_t c = 0; c < n_chunks && !stopping.load(std::memory_order_relaxed); ++c) {
-        const int64_t i0 = (int64_t) c*CHUNK;
-        const int64_t i1 = std::min<int64_t>(n, i0 + CHUNK);
+        // fork: bound hashing, sorting and cold-page samples to the same window as the readers.
+        if (bounded_window && c >= allowed_chunks.load()) {
+            const int64_t tw = ggml_time_us();
+            std::unique_lock<std::mutex> lk(mtx);
+            cv_work.wait(lk, [&]() { return stopping.load() || c < allowed_chunks.load(); });
+            t_window_us += ggml_time_us() - tw;
+            if (stopping.load()) {
+                break;
+            }
+        }
+        const int64_t i0 = (int64_t) (c*chunk_size);
+        const int64_t i1 = i0 + (int64_t) std::min<size_t>(n - i0, chunk_size);
+        cp.clear();
         for (int64_t i = i0; i < i1; ++i) {
-            ctx[0] = toks[i];
-            int64_t known = 0;
-            bool    cut   = false;
+            // fork: a large coalesced ubatch must not delay stop() until every row is hashed.
+            if (bounded_window && (i - i0) % 64 == 0 && stopping.load(std::memory_order_relaxed)) {
+                break;
+            }
+            uint64_t mixed = (uint64_t) toks[i] * hp.ple_layer_multipliers[0];
+            bool cut = false;
             for (int64_t s = 1; s < n_gram; ++s) {
                 if (!cut && i - s < 0) {
                     if (!seq_start) {
@@ -283,45 +435,68 @@ void llama_ple_prefetch::build() {
                 }
                 const int64_t t = cut ? -1 : toks[i - s];
                 cut = cut || t < 0 || t == eos;
-                ctx[s] = cut ? eos : t;
-                known  = s;
-            }
-            for (int64_t g = 2; g <= n_gram && g - 1 <= known; ++g) {
-                uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
-                for (int64_t j = 1; j < g; ++j) {
-                    mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
-                }
-                const int64_t hb = (g - 2) * per_gram;
+                mixed ^= (uint64_t) (cut ? eos : t) * hp.ple_layer_multipliers[s];
+                const int64_t hb = (s - 1) * per_gram;
                 for (int64_t k = 0; k < per_gram; ++k) {
                     const int64_t h = hb + k;
-                    pred[(size_t) (i*n_heads + h)] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
-                }
-            }
-        }
-
-        // the chunk's pages not read for an earlier chunk, sorted, then merged into runs of consecutive pages
-        cp.clear();
-        for (int64_t i = i0; i < i1; ++i) {
-            for (int64_t h = 0; h < n_heads; ++h) {
-                const int32_t r = pred[(size_t) (i*n_heads + h)];
-                if (r < 0 || (uint64_t) r >= n_rows) {
-                    continue;
-                }
-                const uint64_t b = base + (uint64_t) r*row_size;
-                const uint64_t k0 = b/4096, k1 = (b + row_size - 1)/4096;
-                for (uint64_t k = k0; k <= k1; ++k) {
-                    if (!seen[k - key0]) {
-                        seen[k - key0] = 1;
-                        cp.push_back(k);
+                    const int32_t r = (int32_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
+                    if (r < 0 || (uint64_t) r >= n_rows) {
+                        continue;
+                    }
+                    const uint64_t b = base + (uint64_t) r*row_size;
+                    const uint64_t k0 = b/4096, k1 = (b + row_size - 1)/4096;
+                    for (uint64_t page = k0; page <= k1;) {
+                        const uint64_t index = page - key0;
+                        const uint64_t end = std::min(k1 - key0, index | UINT64_C(63));
+                        const uint64_t mask = (UINT64_MAX << (index % 64)) & (UINT64_MAX >> (63 - end % 64));
+                        uint64_t & word = seen[index/64];
+                        uint64_t fresh = mask & ~word;
+                        word |= mask;
+                        // fork: skip duplicate row spans before walking their individual pages.
+#if defined(__GNUC__) || defined(__clang__)
+                        while (fresh) {
+                            const uint64_t bit = (uint64_t) __builtin_ctzll(fresh);
+                            cp.push_back(key0 + (index & ~UINT64_C(63)) + bit);
+                            fresh &= fresh - 1;
+                        }
+#else
+                        if (fresh) {
+                            for (uint64_t j = index; j <= end; ++j) {
+                                if (fresh & (UINT64_C(1) << (j % 64))) {
+                                    cp.push_back(key0 + j);
+                                }
+                            }
+                        }
+#endif
+                        page = key0 + end + 1;
                     }
                 }
             }
         }
+        if (bounded_window && stopping.load(std::memory_order_relaxed)) {
+            break;
+        }
         std::sort(cp.begin(), cp.end());
+        // fork: a hot shared prefix can hide cold pages in the rest of the call.
+        const bool sample = c == 0 || (n_recheck > 0 && c % n_recheck == 0);
+        if (sample && n_readers == n_threads && n_cold > n_threads && !cp.empty()) {
+            const double res = resident_fraction(cp, base);
+            if (res < 0.5) {
+                for (int i = n_threads; i < n_cold; ++i) {
+                    readers.emplace_back([this, i, &last]() { last[i] = reader(); });
+                }
+                n_readers = n_cold;
+                LLAMA_LOG_INFO("%s: [PLEPF] cold table (%.0f%% of sampled pages cached): %d readers at chunk %zu\n", __func__, 100.0*res, n_cold, c);
+            }
+        }
+        // fork: all readers and contexts spend the mapper's remaining page credit.
+        cp.resize(fit_pages(cp.size()));
         const size_t r0 = nr;
         for (size_t j = 0; j < cp.size(); ++j) {
-            if (nr > r0 && cp[j] == run_key[nr - 1] + run_len[nr - 1] && run_len[nr - 1] < RUN_MAX) {
-                ++run_len[nr - 1];
+            // fork: bounded windows must not pull unused or already-read pages into the cache.
+            const uint64_t gap = coalesce && !bounded_window && !model->ram_fit_enabled() ? 16 : 0;
+            if (nr > r0 && cp[j] <= run_key[nr - 1] + run_len[nr - 1] + gap && cp[j] - run_key[nr - 1] < RUN_MAX) {
+                run_len[nr - 1] = (uint32_t) (cp[j] - run_key[nr - 1] + 1);
             } else {
                 run_key[nr] = cp[j];
                 run_len[nr] = 1;
@@ -340,7 +515,7 @@ void llama_ple_prefetch::build() {
             cv_done.notify_all();
         }
     }
-    t_build_us = ggml_time_us() - t_start_us;
+    t_build_us = ggml_time_us() - t_start_us - t_window_us;
     {
         std::lock_guard<std::mutex> lk(mtx);
         built = true;
@@ -359,42 +534,175 @@ void llama_ple_prefetch::build() {
     t_last_read_us = t_last > 0 ? t_last - t_start_us : 0;
 }
 
+// share of up to 256 of the given page keys (spread over the list) that are in the page cache; 1 if unknown
+double llama_ple_prefetch::resident_fraction(const std::vector<uint64_t> & keys, uint64_t base) const {
+#if defined(__linux__)
+    // keys are file pages in pread/advise mode: the mapping keeps the file's offset within a page
+    const uintptr_t to_virt = use_pread ? (uintptr_t) ple->data - (uintptr_t) base : 0;
+    // fork: round up so a partial sample group cannot exceed the 256-probe budget.
+    const size_t step = std::max<size_t>(1, keys.size()/256 + (keys.size() % 256 != 0));
+    size_t n = 0, in = 0;
+    for (size_t j = 0; j < keys.size(); j += step) {
+        unsigned char v = 0;
+        if (mincore((void *) (keys[j]*4096 + to_virt), 4096, &v) != 0) {
+            return 1.0;
+        }
+        in += v & 1;
+        ++n;
+    }
+    return n ? (double) in/n : 1.0;
+#else
+    GGML_UNUSED(keys);
+    GGML_UNUSED(base);
+    return 1.0;
+#endif
+}
+
 int64_t llama_ple_prefetch::reader() {
-    std::vector<char> buf(use_pread && !use_advise ? (size_t) RUN_MAX*4096 : 0);
+    std::unique_ptr<char[]> buf;
+    size_t buf_size = 0;
     int64_t t_last = 0;
+    int64_t pages_read = 0;
+    int64_t mapped_runs = 0;
+    int64_t direct_runs = 0;
+    size_t next = 0, end = 0, ready_end = 0;
+    size_t done_chunk = 0;
+    int64_t done_runs = 0;
+    auto flush_done = [&]() {
+        if (done_runs > 0) {
+            t_last = ggml_time_us();
+        }
+        if (done_runs > 0 && remaining[done_chunk].fetch_sub(done_runs) == done_runs) {
+            std::lock_guard<std::mutex> lk(mtx);
+            cv_done.notify_all();
+        }
+        done_runs = 0;
+    };
     for (;;) {
-        const size_t i = cursor.fetch_add(1);
-        if (!run_ready(i)) {
+        if (next == end) {
+            next = cursor.fetch_add(batch_runs);
+            end = next + batch_runs;
+        }
+        const size_t i = next++;
+        if (i >= ready_end && !run_ready(i)) {
+            // fork: release completed chunks before waiting for the consumer to advance the window.
+            flush_done();
             std::unique_lock<std::mutex> lk(mtx);
             cv_work.wait(lk, [&]() { return run_ready(i); });
         }
-        if (stopping.load() || i >= n_built.load()) {
+        if (stopping.load()) {
             break;
+        }
+        if (i >= ready_end) {
+            const size_t published = n_built.load();
+            if (i >= published) {
+                break;
+            }
+            ready_end = i + 1;
+            // fork: published runs and allowed chunks only grow, so a ready batch stays ready.
+            const size_t claim_end = std::min(end, published);
+            if (batch_runs > 1 && run_chunk[claim_end - 1] < allowed_chunks.load()) {
+                ready_end = claim_end;
+            }
+        }
+        if (done_runs > 0 && done_chunk != run_chunk[i]) {
+            flush_done();
         }
         const uint64_t off = run_key[i]*4096, len = (uint64_t) run_len[i]*4096;
 #if defined(__linux__)
         if (use_advise) {
             posix_fadvise(fd, (off_t) off, (off_t) len, POSIX_FADV_WILLNEED);
         } else if (use_pread) {
-            if (pread(fd, buf.data(), (size_t) len, (off_t) off) < 0) {
-                // a failed read only costs the gather a fault
+            // fork: finish short reads, but do not require padding past the table's last byte.
+            const size_t need = (size_t) std::min(len, file_off + n_rows*row_size - off);
+            const uint64_t first = std::max(off, file_off) - file_off;
+            const uint64_t limit = std::min(off + len, file_off + n_rows*row_size) - file_off;
+            bool mapped = false;
+#if defined(MADV_POPULATE_READ)
+            if (populate == 3 && first < limit && !stopping.load(std::memory_order_relaxed)) {
+                // A partial EOF page can populate successfully; retain the complete-read requirement.
+                struct stat st;
+                if (fstat(fd, &st) == 0 && st.st_size >= 0 && (uint64_t) st.st_size >= off + need) {
+                    const uintptr_t addr = (uintptr_t) ple->data + first;
+                    const uintptr_t page = addr - addr%4096;
+                    mapped = madvise((void *) page, (size_t) (addr - page + limit - first), MADV_POPULATE_READ) == 0;
+                    mapped_runs += mapped;
+                    direct_runs += mapped;
+                }
+            }
+#endif
+            if (!mapped && buf_size < need) {
+                // fork: pread overwrites this scratch; do not clear or copy its old bytes.
+                const size_t cap = std::max(need, std::min((size_t) RUN_MAX*4096, buf_size*2));
+                buf.reset(new char[cap]);
+                buf_size = cap;
+            }
+            size_t done = mapped ? need : 0;
+            while (done < need && !stopping.load()) {
+                const ssize_t got = pread(fd, buf.get() + done, need - done, (off_t) (off + done));
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (got <= 0) {
+                    break;
+                }
+                done += (size_t) got;
+            }
+            if (done != need) {
+                // fork: leave an incomplete run uncounted and let the gather use its normal path.
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    stopping = true;
+                }
+                cv_work.notify_all();
+                cv_done.notify_all();
+                break;
+            }
+            if (populate) {
+                // File reads fill the page cache, but the gather also needs mapped page-table entries.
+#if defined(MADV_POPULATE_READ)
+                if (populate == 2 && first < limit && !stopping.load(std::memory_order_relaxed)) {
+                    const uintptr_t addr = (uintptr_t) ple->data + first;
+                    const uintptr_t page = addr - addr%4096;
+                    mapped = madvise((void *) page, (size_t) (addr - page + limit - first), MADV_POPULATE_READ) == 0;
+                    mapped_runs += mapped;
+                }
+#endif
+                // fork: unsupported kernels and failed bulk requests keep the page-touch fallback.
+                for (uint64_t rel = first; !mapped && rel < limit && !stopping.load(std::memory_order_relaxed);
+                        rel += 4096 - ((uintptr_t) ple->data + rel)%4096) {
+                    (void) *(const volatile char *) ((const char *) ple->data + rel);
+                }
+                if (stopping.load()) {
+                    break;
+                }
             }
         } else
 #endif
         {
             char sink = 0;
             for (uint64_t o = 0; o < len; o += 4096) {
+                if (bounded_window && stopping.load(std::memory_order_relaxed)) {
+                    break;
+                }
                 sink ^= *(const volatile char *) (uintptr_t) (off + o);
             }
             GGML_UNUSED(sink);
+            if (bounded_window && stopping.load(std::memory_order_relaxed)) {
+                break;
+            }
         }
-        n_read.fetch_add(run_len[i], std::memory_order_relaxed);
-        t_last = ggml_time_us();
-        if (remaining[run_chunk[i]].fetch_sub(1) == 1) {
-            std::lock_guard<std::mutex> lk(mtx);
-            cv_done.notify_all();
+        pages_read += run_len[i];
+        done_chunk = run_chunk[i];
+        ++done_runs;
+        if (next == end) {
+            flush_done();
         }
     }
+    flush_done();
+    n_read.fetch_add(pages_read, std::memory_order_relaxed);
+    n_map_runs.fetch_add(mapped_runs, std::memory_order_relaxed);
+    n_direct_runs.fetch_add(direct_runs, std::memory_order_relaxed);
     return t_last;
 }
 
@@ -409,16 +717,17 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
         ++n_ubatch_u;
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        const size_t a = chunks_for(t1 + n_ahead);
-        if (a > allowed_chunks.load()) {
+    const size_t a = chunks_for(t1 + n_ahead);
+    // fork: partial consumes within the same window need no reader or producer wake-up.
+    if (a > allowed_chunks.load()) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
             allowed_chunks.store(a);
         }
+        cv_work.notify_all();
     }
-    cv_work.notify_all();
 
-    const size_t c0 = (size_t) (t0/CHUNK), c1 = (size_t) ((t1 - 1)/CHUNK);
+    const size_t c0 = (size_t) (t0/chunk_size), c1 = (size_t) ((t1 - 1)/chunk_size);
     {
         std::unique_lock<std::mutex> lk(mtx);
         cv_done.wait(lk, [&]() {
@@ -439,12 +748,145 @@ bool llama_ple_prefetch::consume(uint32_t n_tokens, const int32_t * idx, size_t 
     t_wait_us += ggml_time_us() - tw;
     ++n_ubatch_c;
 
-    GGML_UNUSED(idx);
-    GGML_UNUSED(n_idx);
+    if (test_drop > 0 && idx && n_idx) {
+        test_drop_rows(idx, n_idx);
+    }
+    if (verify && idx && n_idx) {
+        verify_rows(idx, n_idx);
+    }
     return true;
 }
 
+// fork: test only. LLAMA_PLE_PF_TEST_DROP=N pushes the pages of a fixed N% of this ubatch's rows out of the page cache
+// after their prefetch read, which is what memory pressure does on a small-RAM host. Lets the VERIFY paths be timed on
+// a large-RAM box. MADV_PAGEOUT reclaims clean file pages mapped only by this process.
+void llama_ple_prefetch::test_drop_rows(const int32_t * idx, size_t n_idx) {
+#if defined(__linux__) && defined(MADV_PAGEOUT)
+    const uintptr_t tb = (uintptr_t) ple->data;
+    for (size_t i = 0; i < n_idx; ++i) {
+        const int32_t r = idx[i];
+        if (r < 0 || (uint64_t) r >= n_rows || ((uint32_t) r*2654435761u) % 100 >= (uint32_t) test_drop) {
+            continue;
+        }
+        const uintptr_t a = tb + (uint64_t) r*row_size, a0 = a - a%4096;
+        if (madvise((void *) a0, (size_t) (a + row_size - a0), MADV_PAGEOUT) == 0) {
+            ++n_test_dropped;
+        }
+    }
+#else
+    GGML_UNUSED(idx); GGML_UNUSED(n_idx);
+#endif
+}
+
+// fork: a page read early in a long call can be evicted again before its ubatch gathers (the readers dedup pages over
+// the whole call, so a later ubatch never asks for it twice). This ubatch's pages are listed, sorted and checked with
+// mincore over short clusters only (a whole-table mincore per ubatch cost ~350 ms on a large table, verify-r123); the
+// evicted ones are queued as asynchronous reads (MADV_WILLNEED) or read back (VERIFY=2) before the gather faults on them.
+void llama_ple_prefetch::verify_rows(const int32_t * idx, size_t n_idx) {
+#if defined(__linux__)
+    const int64_t tv = ggml_time_us();
+    const uintptr_t tb = (uintptr_t) ple->data, pb = tb - tb%4096;
+    verify_runs.clear();
+    for (size_t i = 0; i < n_idx; ++i) {
+        const int32_t r = idx[i];
+        if (r < 0 || (uint64_t) r >= n_rows) {
+            continue;
+        }
+        const uint64_t off = (tb - pb) + (uint64_t) r*row_size;
+        const uint64_t k0 = off/4096, k1 = (off + row_size - 1)/4096;
+        verify_runs.emplace_back(k0, (size_t) (k1 - k0 + 1));
+    }
+    std::sort(verify_runs.begin(), verify_runs.end());
+    // clusters: runs whose gap is <= 32 pages share one mincore call
+    constexpr uint64_t GAP = 32;
+    verify_pages.clear();
+    for (size_t j = 0; j < verify_runs.size();) {
+        const uint64_t c0 = verify_runs[j].first;
+        uint64_t c1 = c0 + verify_runs[j].second; // exclusive
+        size_t e = j + 1;
+        while (e < verify_runs.size() && verify_runs[e].first <= c1 + GAP) {
+            c1 = std::max<uint64_t>(c1, verify_runs[e].first + verify_runs[e].second);
+            ++e;
+        }
+        if (verify_map.size() < c1 - c0) {
+            verify_map.resize(c1 - c0);
+        }
+        if (mincore((void *) (pb + c0*4096), (size_t) (c1 - c0)*4096, verify_map.data()) != 0) {
+            LLAMA_LOG_WARN("%s: [PLEPF] mincore failed (%s), page verification off\n", __func__, strerror(errno));
+            verify = false;
+            verify_runs.clear();
+            return;
+        }
+        uint64_t nk = c0; // first page not yet listed (runs are sorted by first page and may overlap)
+        for (size_t q = j; q < e; ++q) {
+            const uint64_t end = verify_runs[q].first + verify_runs[q].second;
+            for (uint64_t k = std::max(verify_runs[q].first, nk); k < end; ++k) {
+                if (!(verify_map[k - c0] & 1)) {
+                    verify_pages.push_back(k);
+                }
+            }
+            nk = std::max(nk, end);
+        }
+        j = e;
+    }
+    verify_pages.resize(fit_pages(verify_pages.size()));
+    if (!verify_pages.empty()) {
+        verify_runs.clear();
+        for (size_t j = 0; j < verify_pages.size();) {
+            size_t e = j + 1;
+            while (e < verify_pages.size() && verify_pages[e] == verify_pages[e - 1] + 1) {
+                ++e;
+            }
+            if (verify_sync) {
+                verify_runs.emplace_back(verify_pages[j], e - j);
+            } else {
+                madvise((void *) (pb + verify_pages[j]*4096), (e - j)*4096, MADV_WILLNEED);
+            }
+            j = e;
+        }
+        if (verify_sync) {
+            // VERIFY=2: read the evicted pages back now on several threads, so the gather does not fault them in one
+            // at a time. Same bytes either way; only the moment they are read changes.
+            const size_t n_runs = verify_runs.size();
+            const size_t n_thr  = std::min<size_t>(n_runs, (size_t) std::max({1, n_threads, n_cold}));
+            std::atomic<size_t> next{0};
+            auto work = [&]() {
+                for (size_t r; (r = next.fetch_add(1, std::memory_order_relaxed)) < n_runs;) {
+                    const uintptr_t a = pb + verify_runs[r].first*4096;
+                    const size_t    n = verify_runs[r].second*4096;
+                    // the first and last listed pages may extend past the table; clip the touch to its bytes
+                    const uintptr_t lo = std::max(a, tb), hi = std::min<uintptr_t>(a + n, tb + n_rows*row_size);
+                    bool done = false;
+#if defined(MADV_POPULATE_READ)
+                    done = madvise((void *) a, n, MADV_POPULATE_READ) == 0;
+#endif
+                    for (uintptr_t q = lo; !done && q < hi; q = (q - q%4096) + 4096) {
+                        (void) *(volatile const unsigned char *) q;
+                    }
+                }
+            };
+            std::vector<std::thread> thr;
+            for (size_t t = 1; t < n_thr; ++t) {
+                thr.emplace_back(work);
+            }
+            work();
+            for (auto & t : thr) {
+                t.join();
+            }
+        }
+        n_verify_missing += (int64_t) verify_pages.size();
+        ++n_verify_ubatch;
+    }
+    t_verify_us += ggml_time_us() - tv;
+#else
+    GGML_UNUSED(idx);
+    GGML_UNUSED(n_idx);
+#endif
+}
+
 void llama_ple_prefetch::stop() {
+    decode_join(); // the decode thread reads toks
+    dec_t0 = UINT64_MAX;
     if (!running) {
         return;
     }
@@ -461,18 +903,157 @@ void llama_ple_prefetch::stop() {
     hinted  = false;
 
     LLAMA_LOG_WARN("%s: [PLEPF] %zu tokens: %zu pages (%.0f MiB) in %zu reads, guessed in %.1f ms, %" PRId64 " read, last read at %.1f ms; "
-            "%d ubatches waited %.1f ms in all%s", __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
+            "%d ubatches waited %.1f ms in all, %d readers%s; bulk mapped runs=%" PRId64 "; direct mapped runs=%" PRId64, __func__, toks.size(), n_pages_all, n_pages_all*4096.0/1048576.0,
             (size_t) n_built.load(), t_build_us.load()/1e3, n_read.load(), t_last_read_us.load()/1e3, n_ubatch_c, t_wait_us/1e3,
-            n_ubatch_u ? " (some ubatches fell outside the call)" : "");
+            n_readers, n_ubatch_u ? " (some ubatches fell outside the call)" : "", n_map_runs.load(), n_direct_runs.load());
+    if (test_drop > 0) {
+        LLAMA_LOG_CONT("; test drop: %" PRId64 " rows paged out", n_test_dropped);
+    }
+    if (decode_on) {
+        LLAMA_LOG_CONT("; decode: %d ubatches taken ahead, %d decoded in place, %.1f ms waited",
+                n_dec_hit, n_dec_miss, t_dec_wait_us/1e3);
+        n_dec_hit = n_dec_miss = 0;
+        t_dec_wait_us = 0;
+    }
+    if (verify) {
+        LLAMA_LOG_CONT("; verify: %" PRId64 " pages evicted before their gather in %d ubatches, %s in %.1f ms",
+                n_verify_missing, n_verify_ubatch, verify_sync ? "read back" : "re-queued", t_verify_us/1e3);
+    }
     LLAMA_LOG_CONT("\n");
 
     toks.clear();
-    pred.clear();
-    pred.shrink_to_fit();
     run_key.reset();
     run_len.reset();
     run_chunk.reset();
     remaining.reset();
     n_chunks = 0;
     n_built  = 0;
+}
+
+// fork: LLAMA_PLE_DECODE. Rows to F32 with the type's to_float (what the CPU get_rows calls for this table), split
+// over n_decode threads so their page faults overlap.
+void llama_ple_prefetch::decode_into(const int32_t * idx, size_t n_idx, float * dst) const {
+    const int64_t ne0  = ple->ne[0];
+    const size_t  nb1  = ple->nb[1];
+    const char *  base = (const char *) ple->data;
+    const ggml_to_float_t to_float = ple->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(ple->type)->to_float;
+    GGML_ASSERT(ple->type == GGML_TYPE_F32 || to_float);
+    auto work = [&](size_t i0, size_t i1) {
+        for (size_t i = i0; i < i1; ++i) {
+            const int32_t r = idx[i];
+            GGML_ASSERT(r >= 0 && (uint64_t) r < n_rows);
+            const char * src = base + (size_t) r*nb1;
+            float * out = dst + i*ne0;
+            if (to_float) {
+                to_float(src, out, ne0);
+            } else {
+                memcpy(out, src, ne0*sizeof(float));
+            }
+        }
+    };
+    const size_t nt = std::min<size_t>((size_t) n_decode, std::max<size_t>(1, n_idx/1024));
+    if (nt <= 1) {
+        work(0, n_idx);
+        return;
+    }
+    std::vector<std::thread> th;
+    th.reserve(nt - 1);
+    const size_t step = (n_idx + nt - 1)/nt;
+    for (size_t t = 1; t < nt; ++t) {
+        const size_t i0 = std::min(n_idx, t*step), i1 = std::min(n_idx, i0 + step);
+        th.emplace_back(work, i0, i1);
+    }
+    work(0, std::min(n_idx, step));
+    for (auto & t : th) {
+        t.join();
+    }
+}
+
+void llama_ple_prefetch::decode_join() {
+    if (dec_thread.joinable()) {
+        dec_thread.join();
+    }
+}
+
+void llama_ple_prefetch::gather(uint32_t n_tokens, const int32_t * idx, size_t n_idx, ggml_tensor * dst) {
+    const int64_t ne0 = ple->ne[0];
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_nelements(dst) == (int64_t) n_idx*ne0);
+    const int64_t tg = ggml_time_us();
+    decode_join();
+    // consume() already counted this ubatch, so it starts at consumed - n_tokens
+    const bool hit = running && consumed >= n_tokens && dec_t0 == consumed - n_tokens && dec_rows.size() == n_idx &&
+            memcmp(dec_rows.data(), idx, n_idx*sizeof(int32_t)) == 0;
+    if (!hit) {
+        decode_into(idx, n_idx, decode_buf(n_idx*ne0, dst));
+    }
+    hit ? ++n_dec_hit : ++n_dec_miss;
+    t_dec_wait_us += ggml_time_us() - tg;
+    ggml_backend_tensor_set(dst, dec_ptr, 0, n_idx*ne0*sizeof(float)); // synchronous: the buffer is free after
+    dec_t0 = UINT64_MAX;
+
+    // the next ubatch of the call, assumed the same size (a different one is decoded in place)
+    const auto & hp = model->hparams;
+    const uint64_t n_prev = (uint64_t) hp.ple_ngram_size - 1, a = consumed;
+    if (!running || a < n_prev || a >= toks.size()) {
+        return;
+    }
+    if (model->ram_fit_enabled() && model->prefetch_remaining.load(std::memory_order_relaxed) < 4096) {
+        return;
+    }
+    const uint64_t n = std::min<uint64_t>(n_tokens, toks.size() - a);
+    const uint64_t nh = hp.ple_n_heads;
+    dec_rows.resize(n*nh);
+    for (uint64_t i = 0; i < n; ++i) {
+        llama_ple_hash_rows(hp, toks[a + i], toks.data() + a + i - n_prev, dec_rows.data() + i*nh);
+    }
+    if (model->ram_fit_enabled()) {
+        std::vector<uintptr_t> pages;
+        for (int32_t row : dec_rows) {
+            const uintptr_t first = (uintptr_t) ple->data + (size_t) row*row_size;
+            const uintptr_t last = first + row_size - 1;
+            for (uintptr_t page = first/4096; page <= last/4096; ++page) {
+                pages.push_back(page);
+            }
+        }
+        std::sort(pages.begin(), pages.end());
+        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+        if (fit_pages(pages.size()) != pages.size()) {
+            dec_rows.clear();
+            return;
+        }
+    }
+    // Reserve the pages before growing the optional output or starting its thread.
+    float * out = decode_buf(n*nh*ne0, dst);
+    dec_thread = std::thread([this, a, out]() {
+        decode_into(dec_rows.data(), dec_rows.size(), out);
+        dec_t0 = a;
+    });
+}
+
+float * llama_ple_prefetch::decode_buf(size_t n, const ggml_tensor * dst) {
+    if (dec_ptr && n <= dec_cap) {
+        return dec_ptr;
+    }
+    if (dec_pin) {
+        ggml_backend_buffer_free(dec_pin);
+        dec_pin = nullptr;
+    }
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (dec_pinned && dst->buffer && !ggml_backend_buffer_is_host(dst->buffer)) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer));
+        buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    }
+    if (buft) {
+        dec_pin = ggml_backend_buft_alloc_buffer(buft, n*sizeof(float));
+    }
+    if (dec_pin) {
+        std::vector<float>().swap(dec_data);
+        dec_ptr = (float *) ggml_backend_buffer_get_base(dec_pin);
+    } else {
+        dec_pinned = false; // pageable from here on
+        dec_data.resize(n);
+        dec_ptr = dec_data.data();
+    }
+    dec_cap = n;
+    return dec_ptr;
 }

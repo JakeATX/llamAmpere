@@ -159,7 +159,37 @@ struct ggml_moe_cache_api {
     // expert of the tensor is valid in the active session's device pool right now, else 0. No side effects: no fills,
     // no demand counts, no LRU or pin changes. Returns the number of resident ids. NULL means nothing is resident.
     int (*resident)(const struct ggml_moe_cache_tensor_desc * tensor, const int32_t * ids, int n_ids, uint8_t * resident);
+
+    // LOSSY route-rank cutoff for the session's decode windows (--moe-skip-tail). 0 = exact. With rank R > 0, an
+    // expert that is not resident on the device and that no token of the window ranks below R is left out: its
+    // output rows are zero and its weights are never read. mass independently enables the environment-selected
+    // weight-budget policy; rank 0 and mass false keep the window exact. NULL means always exact.
+    void (*set_skip_tail)(void * session, int rank, bool mass);
 };
+
+// plan() slot index for a row the route-rank cutoff left out: the caller writes a zero row and does no work.
+#define GGML_MOE_CACHE_SKIP (-2)
+
+// True when no token of the window ranks expert ids[index] below rank (ids are [n_tokens][top_k] in descending
+// router score order). Rank 0 or rank >= top_k never skips.
+static inline bool ggml_moe_cache_tail_rank_ok(const int32_t * ids, int n_ids, int n_tokens, int index, int rank) {
+    if (!ids || n_tokens < 1 || n_ids < n_tokens || n_ids % n_tokens != 0 || index < 0 || index >= n_ids) {
+        return false;
+    }
+    const int top_k = n_ids / n_tokens;
+    if (rank <= 0 || rank >= top_k) {
+        return false;
+    }
+    for (int i = 0; i < n_ids; ++i) {
+        if (ids[i] == ids[index] && i % top_k < rank) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Sets the rank cutoff and weight-budget enable; synchronizes only when either value or the session changes.
+GGML_API void ggml_backend_sched_moe_cache_set_skip_tail(ggml_backend_sched_t sched, int rank, bool mass);
 
 GGML_API void ggml_backend_sched_moe_cache_prefetch_configure(ggml_backend_sched_t sched, int mode);
 GGML_API int ggml_backend_sched_moe_cache_warm(ggml_backend_sched_t sched,
@@ -231,6 +261,13 @@ static inline int ggml_moe_cache_wtype_supported(int wtype) {
 }
 
 GGML_API bool ggml_moe_cache_has_residents(void);
+
+// fork AIPNEXTK BANKDROP: host byte ranges [begin, end) of always-resident bank experts whose RAM copy was dropped
+// (the bank call computes them; the regular call routes them with weight 0). Copies of such a range to a device
+// write zeros instead (ggml_moe_cache_resident_copy). Set once at model load; sorted and disjoint.
+typedef struct { uintptr_t begin; uintptr_t end; } ggml_moe_bank_hole;
+GGML_API void ggml_moe_bank_holes_set(const ggml_moe_bank_hole * holes, size_t n);
+GGML_API const ggml_moe_bank_hole * ggml_moe_bank_holes(size_t * n);
 GGML_API void ggml_moe_cache_resident_notify(bool created);
 
 // Read barriers are independent of thread-local cache suspension.

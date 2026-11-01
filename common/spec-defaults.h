@@ -45,3 +45,6 @@ const common_speculative_family_default * common_speculative_apply_family_defaul
 // the drafter exactly as with explicit flags
 // returns false if the resulting settings are invalid (explicit flags that contradict each other)
 bool common_speculative_apply_model_default(common_params & params);
+
+// Apply after each drafter resolution; an explicit mb-MTP choice is kept.
+void common_speculative_apply_mtp_sampling_default(common_params & params);

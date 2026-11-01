@@ -90,7 +90,7 @@ struct llama_model_loader {
     mutable std::unordered_map<std::string, bool> router_bf16_exact;
     bool router_bf16_exact_check(const char * name) const;
     std::set<const ggml_tensor *> arena_tensors;
-    std::unique_ptr<llama_moe_arena> load_moe_arena(llama_progress_callback callback, void * user_data);
+    std::unique_ptr<llama_moe_arena> load_moe_arena(llama_progress_callback callback, void * user_data, bool fit_ram = false);
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -130,6 +130,7 @@ struct llama_model_loader {
     llama_fver  fver;
 
     llama_mmaps mappings;
+    size_t prefetch_remaining = SIZE_MAX;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
@@ -147,6 +148,7 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+    int overlay_idx = -1; // LLAMA_MODEL_OVERLAY file index; its page cache is dropped once loaded
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -251,7 +253,7 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr, bool private_dense = false);
+    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr, bool private_dense = false, bool fit_ram = false);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 

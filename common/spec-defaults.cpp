@@ -157,6 +157,17 @@ static bool common_speculative_read_arch_nextn(const std::string & path, std::st
     return true;
 }
 
+void common_speculative_apply_mtp_sampling_default(common_params & params) {
+    const auto & types = params.speculative.types;
+    const bool mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
+                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
+    if (mtp && !params.sampling.spec_lossy_explicit && !params.sampling.spec_lossy) {
+        params.sampling.spec_lossy = true;
+        LOG_INF("FYI: mode-biased MTP (--spec-mb-mtp) is on by default with MTP drafting. "
+                "To turn it off: --no-spec-mb-mtp\n");
+    }
+}
+
 bool common_speculative_apply_model_default(common_params & params) {
     auto & spec = params.speculative;
 
@@ -181,6 +192,8 @@ bool common_speculative_apply_model_default(common_params & params) {
         LOG_ERR("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]\n");
         return false;
     }
+
+    common_speculative_apply_mtp_sampling_default(params);
 
     const std::string n_min_adaptive = adaptive ? string_format(", n-min-adaptive %d", spec.draft.n_min_adaptive) : "";
 

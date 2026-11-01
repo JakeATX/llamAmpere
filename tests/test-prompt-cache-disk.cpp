@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <new>
 #include <string>
 #include <algorithm>
 #include <cstdint>
@@ -25,6 +26,27 @@
 #endif
 
 namespace fs = std::filesystem;
+
+namespace allocation_probe {
+static thread_local bool active = false;
+static thread_local size_t bytes = 0;
+static thread_local size_t hits = 0;
+}
+
+void * operator new(size_t n) {
+    if (allocation_probe::active && n == allocation_probe::bytes) {
+        ++allocation_probe::hits;
+    }
+    if (void * p = std::malloc(n ? n : 1)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void operator delete(void * p) noexcept { std::free(p); }
+void operator delete(void * p, size_t) noexcept { std::free(p); }
+void * operator new[](size_t n) { return ::operator new(n); }
+void operator delete[](void * p) noexcept { ::operator delete(p); }
+void operator delete[](void * p, size_t) noexcept { ::operator delete(p); }
 
 static int n_fail = 0;
 static int n_pass = 0;
@@ -58,10 +80,15 @@ static void test_ram_tiers() {
     // unknown host memory
     CHECK(common_prompt_cache_ram_auto_mib(0, 0, why) == 2048);
 
-    // the live query works on this platform
+    // macOS has a total-memory query but no supported free-memory query here.
     uint64_t total = 0, avail = 0;
+#if defined(__APPLE__) && defined(__MACH__)
+    CHECK(!common_host_memory(total, avail));
+    CHECK(total > 0 && avail == 0);
+#else
     CHECK(common_host_memory(total, avail));
     CHECK(total > 0 && avail > 0 && avail <= total);
+#endif
 
     // the default directory follows XDG_CACHE_HOME
 #ifndef _WIN32
@@ -711,9 +738,8 @@ static void test_mtmd_text_only_spills(const std::string & root) {
     p.tokens = server_tokens(make_entry(3, 300, 0).tokens, /* has_mtmd = */ true);
     CHECK(p.tokens.has_mtmd && !p.tokens.has_media());
 
-    auto * e = pc.alloc(p, 1*MiB, 0, nullptr, 31);
+    auto * e = pc.alloc(p, 1*MiB, 0, nullptr, std::vector<uint8_t>(31, 42));
     CHECK(e != nullptr && e->prompt.tokens.has_mtmd);
-    e->data.spec.assign(31, 42);
     CHECK(e->size() == 1*MiB + 31);
     pc.flush_to_disk();
     CHECK(pc.disk.n_match() == 1);
@@ -725,9 +751,8 @@ static void test_mtmd_text_only_spills(const std::string & root) {
     server_prompt q;
     q.tokens = server_tokens(make_entry(4, 300, 0).tokens, /* has_mtmd = */ true);
     pc.limit_size = 1*MiB;
-    auto * st = pc.alloc(q, 2*MiB, 0, nullptr, 17);
+    auto * st = pc.alloc(q, 2*MiB, 0, nullptr, std::vector<uint8_t>(17, 7));
     CHECK(st != nullptr && pc.staging_pending);
-    st->data.spec.assign(17, 7);
     pc.update();
     CHECK(!pc.staging_pending && pc.disk.n_match() == 2);
     CHECK(pc.disk.read(find_entry(pc.disk, q.tokens.get_text_tokens()), record));
@@ -769,6 +794,258 @@ static void test_lora_scales(const std::string & root) {
     CHECK(t.read(find_entry(t, n.tokens), r) && r.lora_scales.empty() && same(r, n));
 }
 
+static void test_disk_lookup_ram(const std::string & root) {
+    server_prompt_cache cache(16, 0);
+    cache.fit_ram = true;
+    cache.disk = make_tier(root + "/fit-lookup", "k", 0);
+    const auto data = make_entry(40, 256 * 1024, 1, 0);
+    CHECK(write_entry(cache.disk, data));
+    if (cache.disk.entries.empty()) {
+        return;
+    }
+    const std::string file = cache.disk.entries.front().file;
+    int ram_reads = 0;
+    cache.available_ram = [&]() { ++ram_reads; return 4 * GiB; };
+
+    server_tokens request(data.tokens, true);
+    server_prompt prompt;
+    allocation_probe::bytes = data.tokens.size() * sizeof(llama_token);
+    allocation_probe::hits = 0;
+    allocation_probe::active = true;
+    {
+        const server_tokens copied(data.tokens, false);
+        allocation_probe::active = false;
+        CHECK(copied.size() == data.tokens.size());
+    }
+    CHECK(allocation_probe::hits == 1);
+    allocation_probe::hits = 0;
+    allocation_probe::active = true;
+    const bool loaded = cache.load(prompt, request, nullptr, nullptr, 0, nullptr);
+    allocation_probe::active = false;
+    CHECK(!loaded && ram_reads == 1 && prompt.tokens.empty());
+    CHECK(allocation_probe::hits == 0);
+    CHECK(fs::exists(file) && cache.disk.n_match() == 1 && cache.disk.n_removed_bad == 0);
+
+    // A different first token has no disk match and must not reach state restore.
+    request = server_tokens(llama_tokens{1}, true);
+    ram_reads = 0;
+    CHECK(cache.load(prompt, request, nullptr, nullptr, 0, nullptr));
+    CHECK(ram_reads == 0 && prompt.tokens.empty());
+
+    for (size_t count : {data.tokens.size() / 4 - 1, data.tokens.size() / 4}) {
+        request = server_tokens(data.tokens, true);
+        request.keep_first(count);
+        ram_reads = 0;
+        const bool too_short = count < data.tokens.size() / 4;
+        CHECK(cache.load(prompt, request, nullptr, nullptr, 0, nullptr) == too_short);
+        CHECK(ram_reads == (too_short ? 0 : 1) && prompt.tokens.empty());
+    }
+    request = server_tokens(llama_tokens{LLAMA_TOKEN_NULL}, true);
+    ram_reads = 0;
+    CHECK(cache.load(prompt, request, nullptr, nullptr, 0, nullptr));
+    CHECK(ram_reads == 0);
+
+    // The skipped entry remains readable when RAM is available again.
+    server_prompt_disk_record record;
+    CHECK(cache.disk.read(cache.disk.entries.begin(), record));
+    CHECK(same(record, data));
+}
+
+static void test_owned_spec_state(const std::string & root) {
+    const size_t payload = 8 * MiB;
+    for (const bool fit : {false, true}) {
+        for (const uint64_t gib : {16, 32, 64, 128}) {
+            server_prompt_cache pc(16, 1024);
+            pc.fit_ram = fit;
+            pc.available_ram = [gib]() { return gib * GiB; };
+            pc.disk = make_tier(root + "/owned-spec-" + std::to_string(fit) + "-" + std::to_string(gib), "k", 0);
+            server_prompt p;
+            p.tokens = server_tokens(llama_tokens{31, 32}, false);
+            std::vector<uint8_t> spec(payload, 91);
+            const uint8_t * storage = spec.data();
+            allocation_probe::bytes = payload;
+            allocation_probe::hits = 0;
+            allocation_probe::active = true;
+            auto * entry = pc.alloc(p, MiB, 0, nullptr, std::move(spec));
+            allocation_probe::active = false;
+            CHECK(allocation_probe::hits == 0);
+            CHECK(entry != nullptr);
+            if (!entry) {
+                continue;
+            }
+            CHECK(entry->data.spec.data() == storage && entry->data.spec.size() == payload);
+            CHECK(std::all_of(entry->data.spec.begin(), entry->data.spec.end(), [](uint8_t b) { return b == 91; }));
+            pc.flush_to_disk();
+            CHECK(pc.disk.n_match() == 1);
+            if (pc.disk.entries.empty()) {
+                continue;
+            }
+            server_prompt_disk_record rec;
+            CHECK(pc.disk.read(pc.disk.entries.begin(), rec));
+            CHECK(rec.tokens == p.tokens.get_text_tokens() && rec.spec == entry->data.spec);
+        }
+    }
+
+    // Moving a short vector still transfers its full backing storage.
+    server_prompt_cache pc(16, 1024);
+    pc.fit_ram = true;
+    pc.available_ram = []() { return 16 * GiB; };
+    server_prompt p;
+    p.tokens = server_tokens(llama_tokens{31, 32}, false);
+    std::vector<uint8_t> spec(1, 91);
+    spec.reserve(17 * MiB);
+    CHECK(pc.alloc(p, MiB, 0, nullptr, std::move(spec)) == nullptr);
+    CHECK(pc.states.empty() && !pc.staging_pending);
+    spec = std::vector<uint8_t>(1, 91);
+    spec.reserve(7 * MiB);
+    auto * entry = pc.alloc(p, 8 * MiB, 0, nullptr, std::move(spec));
+    CHECK(entry && entry->data.spec.size() == 1 && entry->data.spec[0] == 91);
+    CHECK(pc.size() >= 15 * MiB && pc.size() <= pc.limit_size);
+}
+
+static void test_fit_ram(const std::string & root) {
+    std::unique_ptr<server_prompt_cache> pc;
+    server_prompt_cache::configure(pc, 16, 1024, true);
+    CHECK(pc && pc->fit_ram && pc->spare_max_n == 0);
+    pc->available_ram = []() { return 6 * GiB; };
+    pc->disk = make_tier(root + "/fit", "k", 0);
+
+    server_prompt p;
+    p.tokens = server_tokens(make_entry(3, 300, 0).tokens, false);
+    CHECK(pc->alloc(p, 17 * MiB, 0) == nullptr);
+    CHECK(!pc->staging_pending && pc->size() == 0);
+    CHECK(pc->alloc(p, SIZE_MAX, 1) == nullptr);
+
+    auto * entry = pc->alloc(p, MiB, 0);
+    CHECK(entry != nullptr && pc->size() <= pc->limit_size);
+    CHECK(entry && entry->data.main.capacity() == MiB);
+    pc->flush_to_disk();
+    CHECK(pc->disk.n_match() == 1);
+
+    // Budget failures keep the disk file; a later read with room still works.
+    const auto it = pc->disk.entries.begin();
+    const std::string file = it->file;
+    server_prompt_disk_record rec;
+    CHECK(!pc->disk.read(it, rec, 4 * MiB));
+    CHECK(rec.main.empty() && rec.tokens.empty() && fs::exists(file));
+    CHECK(pc->disk.n_match() == 1);
+    CHECK(pc->disk.read(it, rec, 6 * MiB));
+    CHECK(rec.main.size() == MiB && rec.tokens == p.tokens.get_text_tokens());
+
+    // Every allocation debit matters: one byte below the full independently summed
+    // budget must fail, and the exact budget must restore the complete record.
+    for (int variant = 0; variant < 6; ++variant) {
+        auto data = make_entry(20 + variant, variant == 0 ? 1000 : 3, variant == 1 ? 1000 : 1, variant == 2 ? 1 : 0);
+        if (variant == 4) { data.drft.resize(1000, 27); }
+        if (variant == 5) { data.spec.resize(1000, 35); }
+        const std::vector<float> scales(variant == 3 ? 1000 : 0, 0.5f);
+        auto tier = make_tier(root + "/fit-debits-" + std::to_string(variant), "k", 0);
+        CHECK(tier.write(data.tokens, data.main, data.drft, data.ckpts, data.spec, scales));
+        const auto record = tier.entries.begin();
+        size_t need = 4 * MiB + 2 + 2 * data.tokens.size() * sizeof(llama_token) + data.main.size() + data.drft.size() + data.spec.size() + scales.size() * sizeof(float);
+        for (const auto & checkpoint : data.ckpts) {
+            need += sizeof(common_prompt_checkpoint) + 2 * sizeof(void *) + checkpoint.data_tgt.size() + checkpoint.data_dft.size() + checkpoint.data_spec.size();
+        }
+        CHECK(!tier.read(record, rec, need - 1));
+        CHECK(fs::exists(record->file) && tier.n_removed_bad == 0 && rec.main.empty());
+        CHECK(tier.read(record, rec, need));
+        CHECK(same(rec, data) && rec.lora_scales == scales);
+    }
+
+    // Retained checkpoint capacity counts when the slot hands it over by move.
+    server_prompt move_prompt;
+    move_prompt.tokens = server_tokens(llama_tokens{100, 101}, false);
+    auto & checkpoint = move_prompt.checkpoints.emplace_back();
+    checkpoint.data_tgt.reserve(9 * MiB);
+    checkpoint.data_tgt.resize(8 * MiB);
+    CHECK(pc->alloc(move_prompt, 7 * MiB, 0, &move_prompt.checkpoints) == nullptr);
+    CHECK(move_prompt.checkpoints.size() == 1);
+    auto * moved = pc->alloc(move_prompt, 6 * MiB, 0, &move_prompt.checkpoints);
+    CHECK(moved && move_prompt.checkpoints.empty());
+    CHECK(moved && moved->prompt.checkpoints.front().data_tgt.capacity() >= 9 * MiB);
+    CHECK(pc->size() >= 15 * MiB && pc->size() <= pc->limit_size);
+
+    // Low live RAM blocks both flush and eviction before writer buffers/token copies.
+    server_prompt_cache low(16, 0);
+    low.fit_ram = true;
+    low.spare_max_n = 0;
+    low.available_ram = []() { return 6 * GiB; };
+    low.disk = make_tier(root + "/fit-low-writer", "k", 0);
+    CHECK(low.alloc(p, 12 * MiB, 0) != nullptr);
+    low.available_ram = []() { return 4 * GiB; };
+    low.flush_to_disk();
+    CHECK(low.disk.n_match() == 0 && low.states.size() == 1);
+    server_prompt low_next;
+    low_next.tokens = server_tokens(llama_tokens{999}, false);
+    CHECK(low.alloc(low_next, 8 * MiB, 0) == nullptr);
+    CHECK(low.disk.n_match() == 0 && low.states.empty());
+    CHECK(!low.disk.write({1}, {2}, {}, {}, {}, {}, 4 * MiB));
+    CHECK(low.disk.entries.empty());
+
+    // A cached token vector can retain storage after a prefix is kept.
+    // Its unused backing memory must force eviction before another allocation.
+    server_prompt_cache retained(16, 0);
+    retained.fit_ram = true;
+    retained.spare_max_n = 0;
+    retained.available_ram = []() { return 6 * GiB; };
+    auto * retained_entry = retained.alloc(p, MiB, 0);
+    CHECK(retained_entry != nullptr);
+    if (retained_entry) {
+        while (retained_entry->prompt.tokens.size() < MiB) {
+            retained_entry->prompt.tokens.push_back(1);
+        }
+        retained_entry->prompt.tokens.keep_first(p.tokens.size());
+        CHECK(retained.size() >= 5 * MiB);
+        server_prompt next;
+        next.tokens = server_tokens(llama_tokens{999}, false);
+        CHECK(retained.alloc(next, 13 * MiB, 0) != nullptr);
+        CHECK(retained.states.size() == 1 && retained.size() <= retained.limit_size);
+    }
+
+    // A loaded projector marks even text-only prompts as multimodal-capable.
+    // Automatic RAM accounting must not use the text-only get_tokens accessor.
+    server_prompt_cache projector(16, 0);
+    projector.fit_ram = true;
+    projector.spare_max_n = 0;
+    projector.available_ram = []() { return 6 * GiB; };
+    projector.disk = make_tier(root + "/fit-projector", "k", 0);
+    server_prompt text;
+    text.tokens = server_tokens(llama_tokens{41, 42, 43}, true);
+    CHECK(text.tokens.has_mtmd && !text.tokens.has_media());
+    auto * text_entry = projector.alloc(text, MiB, 0);
+    CHECK(text_entry != nullptr);
+    if (text_entry) {
+        CHECK(text_entry->prompt.tokens.has_mtmd);
+        const size_t token_bytes = text_entry->prompt.tokens.capacity() * sizeof(llama_token);
+        CHECK(token_bytes >= 3 * sizeof(llama_token));
+        CHECK(projector.size() >= MiB + token_bytes);
+        projector.flush_to_disk();
+        CHECK(projector.disk.n_match() == 1);
+        server_prompt_disk_record restored;
+        CHECK(projector.disk.read(projector.disk.entries.begin(), restored, projector.disk_read_budget()));
+        CHECK(restored.tokens == text.tokens.get_text_tokens() && restored.main.size() == MiB);
+    }
+
+    // The live floor can stop a sub-limit save after RAM use grows.
+    pc->available_ram = []() { return 5 * GiB + MiB; };
+    server_prompt q;
+    q.tokens = server_tokens(make_entry(9, 300, 0).tokens, false);
+    CHECK(pc->alloc(q, 2 * MiB, 0) == nullptr);
+    CHECK(!pc->staging_pending);
+    CHECK(pc->disk_read_budget() == MiB - MiB / 5);
+    pc->available_ram = []() { return 4 * GiB; };
+    CHECK(pc->disk_read_budget() == 0);
+
+    // Reload must drop a prior positive cache when the new fit selects zero.
+    server_prompt_cache::configure(pc, 0, 1024, true);
+    CHECK(!pc);
+    server_prompt_cache::configure(pc, 16, 1024, true);
+    CHECK(pc && pc->states.empty() && pc->spare.empty() && !pc->staging_pending);
+    CHECK(pc->limit_size == 16 * MiB);
+    server_prompt_cache::configure(pc, 0, 1024, true);
+    CHECK(!pc);
+}
+
 int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
@@ -786,6 +1063,9 @@ int main() {
     test_ram_ckpt_keep();
     test_mtmd_text_only_spills(root);
     test_lora_scales(root);
+    test_owned_spec_state(root);
+    test_fit_ram(root);
+    test_disk_lookup_ram(root);
 
     std::error_code ec;
     fs::remove_all(root, ec);

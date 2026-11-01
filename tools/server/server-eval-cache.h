@@ -57,16 +57,18 @@ struct server_eval_cache {
     std::vector<server_eval_cache_entry> entries;
 
     size_t n_skipped = 0; // entries ignored at open (bad header, key mismatch)
+    uint64_t ram_limit_bytes = UINT64_MAX;
 
     // open the folder. Read-only mode requires an existing index whose key equals `key`; build mode creates the
     // folder and index when missing and still refuses a folder built for another key. An unsupported version disables the read-only cache with a warning; build mode refuses it. `err` says why on failure.
-    bool open(const std::string & dir, const std::string & key, bool writable, std::string & err);
+    bool open(const std::string & dir, const std::string & key, bool writable, std::string & err,
+              uint64_t ram_bytes = UINT64_MAX);
 
     bool enabled() const { return !dir.empty(); }
 
     uint64_t total_bytes() const;
 
-    // the longest entry whose tokens are all a prefix of `tokens` and longer than `n_min`; -1 = none
+    // The longest entry that prefixes the non-null tokens and is longer than `n_min`; -1 = none.
     int find(const llama_tokens & tokens, size_t n_min) const;
 
     std::string path_hdr(const std::string & id) const;
@@ -74,11 +76,18 @@ struct server_eval_cache {
     std::string path_dft(const std::string & id) const;
 
     // read an entry header (tokens, checkpoints, speculative state); verifies key and checksum
-    bool read_header(const std::string & id, server_eval_cache_record & out, std::string & err) const;
+    bool read_header(const std::string & id, server_eval_cache_record & out, std::string & err,
+                     uint64_t ram_bytes = UINT64_MAX) const;
 
-    // write the header of a new entry, then add it to the index (the state files must already be in place)
+    // Check the save and next startup peak before publishing any state files.
+    bool can_add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
+                 size_t spec_bytes, std::string & err, int64_t checkpoint_tokens = INT64_MAX, uint64_t ram_bytes = UINT64_MAX) const;
+
+    // Write directly from existing checkpoints up to checkpoint_tokens, preserving their order.
+    // The state files must already be in place. Inputs remain borrowed until this call returns.
     bool add(const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & checkpoints,
-             const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err);
+             const std::vector<uint8_t> & spec, bool has_dft, std::string & id_out, std::string & err,
+             int64_t checkpoint_tokens = INT64_MAX, uint64_t ram_bytes = UINT64_MAX);
 
     static std::string entry_id(const llama_tokens & tokens);
 

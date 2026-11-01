@@ -21,6 +21,10 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ## Quick start
 
+The v0.6.2 candidate Flash-Next launcher, `scripts/flash-next-server.sh -m MODEL`, uses `--moe-skip`
+for a 15% router-weight budget with the first five expert routes protected. This changes answers.
+Use `--moe-skip off` to disable skipping. See the [candidate notes](docs/llamampere-v0.6.2/RELEASE_NOTES.md).
+
 **Build and run (v0.6.1, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
 CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 14.4 GB.
 

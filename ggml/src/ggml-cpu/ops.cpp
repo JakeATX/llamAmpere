@@ -2353,6 +2353,27 @@ static void ggml_compute_forward_fill_f32(const ggml_compute_params * params, gg
     }
 }
 
+static void ggml_compute_forward_fill_i32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const int32_t c = (int32_t) ggml_get_op_params_f32(dst, 0);
+
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
+    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb);
+
+    const auto [ir0, ir1] = get_thread_range(params, dst);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne2*ne1);
+        const int64_t i02 = (ir - i03*ne2*ne1)/ne1;
+        const int64_t i01 = (ir - i03*ne2*ne1 - i02*ne1);
+
+        int32_t * dst_ptr = (int32_t *) ((char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1);
+
+        for (int64_t i = 0; i < ne0; ++i) {
+            dst_ptr[i] = c;
+        }
+    }
+}
+
 static void ggml_compute_forward_fill_f16(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_fp16_t c = GGML_CPU_FP32_TO_FP16(ggml_get_op_params_f32(dst, 0));
 
@@ -2441,6 +2462,10 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
         case GGML_TYPE_Q8_0:
             {
                 ggml_compute_forward_fill_quant(params, dst);
+            } break;
+        case GGML_TYPE_I32:
+            {
+                ggml_compute_forward_fill_i32(params, dst);
             } break;
         default:
             {
@@ -11552,15 +11577,17 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // new_states (emit_mode==1): 4   * S_v * H * n_seqs * K                     floats (k,v,g,beta rows)
     // new_states (emit_mode==2): (2 * S_v + neg0 + 1) * H * n_seqs * K          floats, padded to whole rows
     // final_state (emit_mode!=0 only): S_v * S_v * H * n_seqs                   floats (fixed, not scaled by K)
-    // ckpt_state (emit_mode!=0 && n_tokens>K only): S_v * S_v * H * n_seqs      floats (state before
+    // ckpt_state (emit_mode!=0 && n_tokens>K, or ==K with a prefix): S_v*S_v*H*n_seqs floats (state before
     //   the K-token retained window starts -- free to capture, the recurrence already passes
     //   through it; lets a caller reconstruct a rollback without a second op call over the prefix)
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     // floats per head in one slot: a full state, or the ingredient width of emit_mode 1 or 2
     const int64_t slot_w              = (emit_mode == 0) ? S_v * S_v : ggml_gated_delta_net_ingr_width(S_v, neg0, emit_mode);
     const int64_t state_size_per_snap = slot_w * H * n_seqs;
-    const bool    needs_ckpt          = (emit_mode != 0) && (n_tokens > K);
-    const int64_t t_ckpt              = n_tokens - K - 1; // token index whose post-step state to save
+    // with a prefix (ggml_gated_delta_net_set_prefix) n_tokens <= K has the block too: the state after the prefix
+    const bool    needs_ckpt          = (emit_mode != 0) &&
+        (n_tokens > K || ggml_get_op_params_i32(dst, 2) > 0);
+    const int64_t t_ckpt              = n_tokens > K ? n_tokens - K - 1 : -1; // token index whose post-step state to save (-1: after the prefix)
     float * attn_out_base   = (float *)dst->data;
     float * state_out_base  = (float *)dst->data + attn_score_elems;
     float * final_state_out = emit_mode == 0 ? nullptr    // emit_mode!=0 only
@@ -11600,6 +11627,42 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+
+        // ggml_gated_delta_net_set_prefix: masked ring tokens ahead of the batch, state only
+        const int64_t n_prefix = ggml_get_op_params_i32(dst, 2);
+        for (int64_t t = 0; t < n_prefix; t++) {
+            const float w_t = ((const float *) dst->src[7]->data)[t];
+            if (w_t == 0.0f) {
+                continue;
+            }
+            const int32_t pmode  = ggml_get_op_params_i32(dst, 3);
+            const int64_t pw     = ggml_gated_delta_net_ingr_width(S_v, neg0, pmode);
+            const float * slot   = (const float *)((const char *)dst->src[6]->data + iv3 * dst->src[6]->nb[1]) +
+                                   (t * H + iv1) * pw;
+            const float   b_t    = slot[pmode == 1 ? 3 * S_v : 2 * S_v + neg0] * w_t;
+            const float * g_t    = slot + 2 * S_v;
+            if (kda) {
+                for (int64_t i = 0; i < S_v; ++i) {
+                    delta[i] = expf(g_t[i] * w_t);
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+                }
+            } else {
+                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_t[0] * w_t));
+            }
+            for (int64_t j = 0; j < S_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, slot, 0, 1);
+                delta[j] = (slot[S_v + j] - sum) * b_t;
+            }
+            for (int64_t j = 0; j < S_v; ++j) {
+                ggml_vec_mad_f32(S_v, &s_out[j * S_v], slot, delta[j]);
+            }
+        }
+        if (needs_ckpt && t_ckpt == -1) {
+            memcpy(ckpt_state_out + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;

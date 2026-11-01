@@ -15,6 +15,7 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 #include <chrono>
 #include <thread>
 
@@ -95,6 +96,12 @@ json server_slot_stats::to_json() const {
         {"predicted_per_token_ms", t_gen_per_token_ms()},
         {"predicted_per_second",   n_gen_tps()},
     };
+
+    if (stopped_loop) {
+        base["stopped_loop"] = true;
+        base["loop_period"] = loop_period;
+        base["loop_repeats"] = loop_repeats;
+    }
 
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
@@ -427,7 +434,7 @@ server_tokens::server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd) : 
     }
 }
 
-server_tokens::server_tokens(const llama_tokens & tokens, bool has_mtmd) : has_mtmd(has_mtmd), tokens(tokens) {
+server_tokens::server_tokens(llama_tokens tokens, bool has_mtmd) : has_mtmd(has_mtmd), tokens(std::move(tokens)) {
 }
 
 llama_pos server_tokens::pos_next(int64_t n_tokens) const {
@@ -678,10 +685,13 @@ server_tokens server_tokens::deserialize(const llama_tokens & packed, bool has_m
     return result;
 }
 
-llama_tokens server_tokens::get_text_tokens() const {
+llama_tokens server_tokens::get_text_tokens(size_t n_max) const {
     llama_tokens res;
-    res.reserve(tokens.size());
+    res.reserve(std::min(tokens.size(), n_max));
     for (llama_token t : tokens) {
+        if (res.size() == n_max) {
+            break;
+        }
         if (t != LLAMA_TOKEN_NULL) {
             res.push_back(t);
         }

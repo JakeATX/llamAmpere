@@ -37,6 +37,35 @@ static inline bool ggml_cuda_moe_cache_host_merge(uintptr_t begin, uintptr_t end
 #include <utility>
 #include <vector>
 
+struct ggml_cuda_moe_pool_limit {
+    uint64_t type;
+    size_t expert_bytes;
+    size_t slots;
+};
+
+// fork: MOEPOOL1 stores little-endian (type, expert_bytes, slots) rows for every pool.
+static inline bool ggml_cuda_moe_cache_pool_plan(const uint8_t * data, size_t bytes,
+        const std::vector<ggml_cuda_moe_pool_limit> & pools, size_t minimum, std::vector<size_t> & caps) {
+    if (!data || pools.empty() || pools.size() > 4096 || !minimum || bytes != 16 + 24 * pools.size()) { return false; }
+    auto u64 = [&](size_t offset) {
+        uint64_t value = 0;
+        for (int i = 0; i < 8; ++i) { value |= (uint64_t)data[offset + i] << (8 * i); }
+        return value;
+    };
+    if (u64(0) != UINT64_C(0x314c4f4f50454f4d) || u64(8) != pools.size()) { return false; }
+    std::vector<size_t> limits(pools.size(), 0);
+    for (size_t i = 0; i < pools.size(); ++i) {
+        const uint64_t type = u64(16 + 24 * i), size = u64(24 + 24 * i), slots = u64(32 + 24 * i);
+        size_t p = 0;
+        while (p < pools.size() && (pools[p].type != type || pools[p].expert_bytes != size)) { ++p; }
+        if (p == pools.size() || limits[p] || !size || slots < minimum || slots > pools[p].slots ||
+                slots > SIZE_MAX / size) { return false; }
+        limits[p] = (size_t)slots;
+    }
+    caps = std::move(limits);
+    return true;
+}
+
 // fork: ranked-pair data has no model-weight signature; validate its shape and unique pairs.
 static inline bool ggml_cuda_moe_cache_ranked_profile(const uint8_t * data, size_t bytes,
         size_t layers, size_t experts, std::vector<std::vector<uint64_t>> & output) {
@@ -198,6 +227,8 @@ static inline bool ggml_cuda_moe_cache_profile_plan(const std::vector<ggml_cuda_
 struct ggml_tensor;
 struct ggml_cgraph;
 struct ggml_backend_cuda_context;
+// PP-1: counts warms whose expert pools are fully sized (fills may still be running).
+uint64_t ggml_cuda_moe_cache_fill_epoch(void);
 // A nonzero token requires an active prepared session and opt-in capture.
 uint64_t ggml_cuda_moe_cache_device_capture_generation(int device);
 void ggml_cuda_moe_cache_device_graph_record(int device, bool captured, const ggml_cgraph * graph);
@@ -220,4 +251,13 @@ void ggml_cuda_moe_cache_cs_graph_scan(ggml_backend_cuda_context & ctx, const st
 void ggml_cuda_moe_cache_table_graph_begin(ggml_backend_cuda_context & ctx, bool allow_single_stream);
 void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx);
 #endif
+#endif
+
+// Opt-in weight policies, represented by an explicit custom graph node.
+bool ggml_cuda_moe_skipmass_supports(const ggml_tensor * op);
+bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Host planner fixture; does not initialize CUDA.
+bool ggml_cuda_moe_cache_swap_async_test();
 #endif

@@ -1033,10 +1033,11 @@ bool common_host_memory(uint64_t & total, uint64_t & available) {
     if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
         total = memsize;
     }
-    // no MemAvailable equivalent that is cheap and stable: take the total, the clamp is then a no-op
-    available = total;
+    // Total RAM cannot prove free RAM. Automatic fit stays off without a live query.
+    return false;
 #else
     std::ifstream f("/proc/meminfo");
+    bool available_read = false;
     std::string   key;
     uint64_t      value = 0;
     std::string   unit;
@@ -1045,6 +1046,7 @@ bool common_host_memory(uint64_t & total, uint64_t & available) {
             total = value * 1024;
         } else if (key == "MemAvailable:") {
             available = value * 1024;
+            available_read = true;
         }
     }
     if (total == 0) {
@@ -1054,8 +1056,8 @@ bool common_host_memory(uint64_t & total, uint64_t & available) {
             total = (uint64_t) pages * (uint64_t) psize;
         }
     }
-    if (available == 0) {
-        available = total;
+    if (!available_read) {
+        return false; // unknown free RAM: callers must not budget from MemTotal
     }
 #endif
     return total > 0;
@@ -1348,6 +1350,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+    bool verify_compact_fit_safe = false;
 
     // --n-cpu-moe auto (#224): let the fit place the layers (whole layers on the GPU front to back, the routed experts
     // of the remaining layers in the CPU) instead of the user's -ngl, and without the MoE-cache placement candidate,
@@ -1384,6 +1387,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_INF("%s", "skipping device-memory auto-fit because a shared KV/compute arena is explicitly configured\n");
     }
     if (common_params_should_fit_device_memory(params) || ncmoe_auto) {
+        // fork: unknown display state keeps the larger floor on all devices.
+        size_t vram_floor = common_fit_vram_floor(true);
+#if defined(__linux__)
+        vram_floor = common_fit_vram_floor_detect("/sys/class/drm",
+            !common_get_env("DISPLAY").empty() || !common_get_env("WAYLAND_DISPLAY").empty());
+#endif
+        auto fit_targets = common_fit_vram_targets(params, vram_floor);
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         // Snapshot the pre-fit state so a failed fit can be rolled back to a
@@ -1443,10 +1453,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             ncmoe_auto ? nullptr : &params.moe_cache,
-            params.fit_params_target.data(),
+            fit_targets.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            &verify_compact_fit_safe);
+        // fork: compact verify also needs every margin to cover the detected display or headless floor
+        for (size_t target : fit_targets) {
+            verify_compact_fit_safe = verify_compact_fit_safe && target >= vram_floor;
+        }
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
             throw std::runtime_error(
                 "failed to fit parameters to device memory (hard error); retry with -fit off");
@@ -1481,6 +1496,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             COM_INF("--n-cpu-moe auto: fitted -ngl %d (-1 = all layers), %d of those layers keep (part of) their FFN/experts in the CPU\n",
                 mparams.n_gpu_layers, n_cpu_layers);
         }
+    }
+
+    if (!verify_compact_fit_safe) {
+        // fork: a smaller requested margin or an unproven fit cannot enable compact verification.
+        common_set_env("GGML_CUDA_AI23_VERIFY_COMPACT", "0");
+        COM_INF("%s", "AI+ compact verification off: fit must guarantee at least 300 MiB of free device memory\n");
     }
 
     if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {
@@ -1975,6 +1996,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.fit_ram         = params.fit_params;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -2077,6 +2099,22 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         }
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
+    cparams.moe_skip_tail = params.moe_cache.skip_tail;
+    cparams.moe_skip_mass = params.moe_cache.skip_budget > 0.0f;
+    if (params.moe_cache.skip_rank_floor >= 0) {
+        common_set_env("GGML_MOE_SKIP_RANK_FLOOR", std::to_string(params.moe_cache.skip_rank_floor));
+    }
+    if (params.moe_cache.skip_budget > 0.0f) {
+        // the engine reads the drop policy from the environment at graph build time
+        const std::string policy = common_get_env("GGML_MOE_SKIP_POLICY");
+        if (!policy.empty() && policy != "cumulative") {
+            throw std::invalid_argument("--moe-skip-budget conflicts with GGML_MOE_SKIP_POLICY=" + policy);
+        }
+        char budget[32];
+        snprintf(budget, sizeof(budget), "%.6g", params.moe_cache.skip_budget);
+        common_set_env("GGML_MOE_SKIP_POLICY", "cumulative");
+        common_set_env("GGML_MOE_SKIP_THRESHOLD", budget);
+    }
     cparams.moe_prefetch = params.moe_prefetch;
 
     cparams.moe_cache_size = params.moe_cache_size;

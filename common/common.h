@@ -417,7 +417,16 @@ struct common_params_speculative_ngram_cache {
 
     bool    save_dynamic          = false;   // write the dynamic cache back to lookup_cache_dynamic (checkpoints and shutdown)
     int32_t save_dynamic_interval = 300;     // seconds between checkpoints of the dynamic cache (0 = only at shutdown)
-    int32_t max_ngrams_dynamic    = 1000000; // n-grams kept in the dynamic cache when saving, lowest utility evicted (0 = unlimited)
+    int32_t max_ngrams_dynamic    = 1000000; // live dynamic n-gram key limit; saves also prune by utility (0 = unlimited)
+    bool max_ngrams_dynamic_explicit = false;
+
+    // Automatic count quotas bound file loads, live dynamic growth and each slot's context cache.
+    uint64_t load_max_entries_static        = UINT64_MAX;
+    uint64_t load_max_continuations_static  = UINT64_MAX;
+    uint64_t load_max_entries_dynamic       = UINT64_MAX;
+    uint64_t load_max_continuations_dynamic = UINT64_MAX;
+    uint64_t max_entries_context            = UINT64_MAX;
+    uint64_t max_continuations_context      = UINT64_MAX;
 
     // identity of the target vocab, stored in saved cache files and checked at load (0 = unknown, no check)
     uint32_t vocab_n_tokens = 0;
@@ -559,6 +568,12 @@ struct common_moe_cache_params {
     size_t budget_mib          = 0;
     bool mode_explicit         = false;
     bool fit_selected          = false;
+    int32_t skip_tail          = 0; // --moe-skip-tail: 0 off, 1..9 lossy route-rank cutoff for missed experts
+    bool    skip_tail_explicit = false;
+    int     skip_preset        = -1; // --moe-skip: -1 unset, 0 off, 1 recommended
+    float   skip_budget        = 0.0f; // --moe-skip-budget: 0 off, (0, 0.25] lossy summed-weight budget for missed experts
+    bool    skip_budget_explicit = false;
+    int32_t skip_rank_floor    = -1; // --moe-skip-rank-floor: protected routes in cumulative mode, -1 uses the environment
 };
 
 // --cache-ram not given: pick the prompt-cache RAM budget from the host's memory at startup
@@ -601,6 +616,7 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+    bool fit_params_target_explicit = false;
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
@@ -768,6 +784,8 @@ struct common_params {
     std::string cls_sep    = "\t";  // separator of classification sequences
 
     // server params
+    int32_t loop_guard_reps     = 100; // 0 disables repetition stopping
+    int32_t loop_guard_span     = 400; // stop long stretches with at least four repeats
     int32_t port                = 8080;          // server listens on this network port
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
     int32_t timeout_read        = 3600;          // http read timeout in seconds
@@ -1423,7 +1441,7 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 // FFN offload utils
 //
 
-const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps\\.";
 
 const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
 

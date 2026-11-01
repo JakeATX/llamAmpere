@@ -18,6 +18,7 @@
 #include "../ggml-common.h"
 #include "moe-iq-rows.h"
 #include "../ggml-cpu/quants.h"
+#include "../ggml-cpu/vec.h"
 
 #include <algorithm>
 #include <atomic>
@@ -131,72 +132,117 @@ inline float hsum8(__m256 v) {
 }
 #endif
 
-void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc) {
+void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc, bool shuffle_bytes) {
     const int nb = n / QK8_0;
+#if defined(__AVX2__)
+    const __m256i shuffle = _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    const __m256i lanes = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+#else
+    (void) shuffle_bytes;
+#endif
     for (int i = 0; i < nb; ++i) {
-        int8_t t[QK8_0];
         int sum = 0;
-        for (int s = 0; s < 4; ++s) {
-            for (int b = 0; b < 8; ++b) { t[8 * s + b] = y[i].qs[4 * b + s]; }
+#if defined(__AVX2__)
+        if (shuffle_bytes) {
+            const __m256i q = _mm256_loadu_si256((const __m256i *) y[i].qs);
+            const __m256i reordered = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(q, shuffle), lanes);
+            _mm256_storeu_si256((__m256i *) y[i].qs, reordered);
+            const __m256i sums = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), q), _mm256_set1_epi16(1));
+            __m128i total = _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
+            total = _mm_hadd_epi32(total, total);
+            total = _mm_hadd_epi32(total, total);
+            sum = _mm_cvtsi128_si32(total);
+        } else
+#endif
+        {
+            int8_t t[QK8_0];
+            for (int s = 0; s < 4; ++s) {
+                for (int b = 0; b < 8; ++b) {
+                    const int8_t q = y[i].qs[4 * b + s];
+                    t[8 * s + b] = q;
+                    sum += q;
+                }
+            }
+            memcpy(y[i].qs, t, QK8_0);
         }
-        for (int j = 0; j < QK8_0; ++j) { sum += t[j]; }
-        memcpy(y[i].qs, t, QK8_0);
         yd[i] = ggml_fp16_to_fp32(y[i].d);
         if (i & 1) { yc[i / 2] += yd[i] * (float) sum; } else { yc[i / 2] = yd[i] * (float) sum; }
     }
 }
 
-void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const block_q8_0 * y, const float * yd,
-        const float * yc, float * out) {
+template<int NT>
+void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const block_q8_0 * y, size_t y_stride,
+        const float * yd, const float * yc, size_t aux_stride, float * out, size_t out_stride, int ahead) {
     const int nb = n / QK2_0;
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
     const __m256i shifts = _mm256_set_epi64x(6, 4, 2, 0);
     const __m256i m3 = _mm256_set1_epi8(3);
     const __m256i ones16 = _mm256_set1_epi16(1);
-    int r = 0;
-    for (; r < nrows; r += 4) {
-        const int nr = std::min(4, nrows - r);
-        __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
-        float corr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    constexpr int rows = 4 / NT;
+    for (int r = 0; r < nrows; r += rows) {
+        const int nr = std::min(rows, nrows - r);
+        __m256 acc[NT][rows];
+        float corr[NT][rows] = {};
+        for (int t = 0; t < NT; ++t) {
+            for (int k = 0; k < rows; ++k) { acc[t][k] = _mm256_setzero_ps(); }
+        }
         for (int i = 0; i < nb; ++i) {
-            const __m256i q0 = _mm256_loadu_si256((const __m256i *) y[2 * i].qs);
-            const __m256i q1 = _mm256_loadu_si256((const __m256i *) y[2 * i + 1].qs);
-            const __m256 s0 = _mm256_set1_ps(yd[2 * i]);
-            const __m256 s1 = _mm256_set1_ps(yd[2 * i + 1]);
+            __m256i q0[NT], q1[NT];
+            __m256 s0[NT], s1[NT];
+            for (int t = 0; t < NT; ++t) {
+                const auto * yt = (const block_q8_0 *) ((const char *) y + (size_t) t * y_stride);
+                q0[t] = _mm256_loadu_si256((const __m256i *) yt[2 * i].qs);
+                q1[t] = _mm256_loadu_si256((const __m256i *) yt[2 * i + 1].qs);
+                s0[t] = _mm256_set1_ps(yd[(size_t) t * aux_stride + 2 * i]);
+                s1[t] = _mm256_set1_ps(yd[(size_t) t * aux_stride + 2 * i + 1]);
+            }
             for (int k = 0; k < nr; ++k) {
                 const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) (r + k) * row_bytes) + i;
+                if (ahead > 0 && i + ahead < nb && (i & 3) == 0) {
+                    _mm_prefetch((const char *) (x + ahead), _MM_HINT_T0);
+                    _mm_prefetch((const char *) (x + ahead + 1) - 1, _MM_HINT_T0);
+                }
                 const float d = _cvtsh_ss(x->d);
                 long long c0, c1;
                 memcpy(&c0, x->qs, 8);
                 memcpy(&c1, x->qs + 8, 8);
                 const __m256i w0 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(c0), shifts), m3);
                 const __m256i w1 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(c1), shifts), m3);
-                const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(w0, q0), ones16);
-                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(w1, q1), ones16);
-                const __m256 f = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), s0, _mm256_mul_ps(_mm256_cvtepi32_ps(p1), s1));
-                acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(d), f, acc[k]);
-                corr[k] += d * yc[i];
+                for (int t = 0; t < NT; ++t) {
+                    const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(w0, q0[t]), ones16);
+                    const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(w1, q1[t]), ones16);
+                    const __m256 f = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), s0[t], _mm256_mul_ps(_mm256_cvtepi32_ps(p1), s1[t]));
+                    acc[t][k] = _mm256_fmadd_ps(_mm256_set1_ps(d), f, acc[t][k]);
+                    corr[t][k] += d * yc[(size_t) t * aux_stride + i];
+                }
             }
         }
-        for (int k = 0; k < nr; ++k) { out[r + k] = hsum8(acc[k]) - corr[k]; }
+        for (int t = 0; t < NT; ++t) {
+            for (int k = 0; k < nr; ++k) { out[(size_t) t * out_stride + r + k] = hsum8(acc[t][k]) - corr[t][k]; }
+        }
     }
 #else
-    for (int r = 0; r < nrows; ++r) {
-        const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) r * row_bytes);
-        float sum = 0.0f;
-        for (int i = 0; i < nb; ++i) {
-            const float d = ggml_fp16_to_fp32(x[i].d);
-            for (int k = 0; k < 2; ++k) {
-                const block_q8_0 & yb = y[2 * i + k];
-                int isum = 0;
-                for (int s = 0; s < 4; ++s) {
-                    for (int b = 0; b < 8; ++b) { isum += ((x[i].qs[8 * k + b] >> (2 * s)) & 3) * yb.qs[8 * s + b]; }
+    (void) ahead;
+    for (int t = 0; t < NT; ++t) {
+        const auto * yt = (const block_q8_0 *) ((const char *) y + (size_t) t * y_stride);
+        for (int r = 0; r < nrows; ++r) {
+            const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) r * row_bytes);
+            float sum = 0.0f;
+            for (int i = 0; i < nb; ++i) {
+                const float d = ggml_fp16_to_fp32(x[i].d);
+                for (int k = 0; k < 2; ++k) {
+                    const block_q8_0 & yb = yt[2 * i + k];
+                    int isum = 0;
+                    for (int s = 0; s < 4; ++s) {
+                        for (int b = 0; b < 8; ++b) { isum += ((x[i].qs[8 * k + b] >> (2 * s)) & 3) * yb.qs[8 * s + b]; }
+                    }
+                    sum += d * yd[(size_t) t * aux_stride + 2 * i + k] * (float) isum;
                 }
-                sum += d * yd[2 * i + k] * (float) isum;
+                sum -= d * yc[(size_t) t * aux_stride + i];
             }
-            sum -= d * yc[i];
+            out[(size_t) t * out_stride + r] = sum;
         }
-        out[r] = sum;
     }
 #endif
 }
@@ -396,6 +442,23 @@ struct layer_math {
     bool shared_input = false;  // up and gate quantize their input the same way
 };
 
+// Scratch rows that several workers write side by side. A std::vector base is only 16-byte aligned, so with the
+// 64-byte row strides below every tile boundary would still split a cache line between two workers (the line then
+// bounces between their cores, across both CCDs). `align` (GGML_MOE_CPU_SPLIT_ALIGN) starts the data on a line.
+template <typename T>
+struct scratch_buf {
+    std::vector<T> v;
+    T * p = nullptr;
+    void assign(size_t n, T val, bool align) {
+        v.assign(n + (align ? 64 / sizeof(T) : 0), val);
+        p = v.data();
+        if (align) { while ((uintptr_t) p % 64) { ++p; } }
+    }
+    T * data() { return p; }
+    const T * data() const { return p; }
+    T & operator[](size_t i) { return p[i]; }
+};
+
 struct pool_state {
     std::mutex mu;              // registration and start
     bool running = false;
@@ -420,21 +483,36 @@ struct pool_state {
     bool q8_reuse = false;
     bool down_reuse = false;
     int group_tokens = 4;
-    std::vector<uint8_t> xq;    // [2][MOE_CS_MAX_ROUTES] quantized input rows
+    scratch_buf<uint8_t> xq;    // [2][MOE_CS_MAX_ROUTES] quantized input rows
     size_t xq_stride = 0;
-    std::vector<float> hidden;  // [MOE_CS_MAX_ROUTES][max_ff]
-    std::vector<uint8_t> hq;    // [MOE_CS_MAX_ROUTES] quantized hidden rows
+    scratch_buf<float> hidden;  // [MOE_CS_MAX_ROUTES][max_ff]
+    scratch_buf<uint8_t> hq;    // [MOE_CS_MAX_ROUTES] quantized hidden rows
     size_t hq_stride = 0;
     bool avx512 = false;       // GGML_MOE_CPU_SPLIT_AVX512 and the CPU has AVX-512 F/BW/VL/VNNI
+    bool q2_pair = false;      // Share Q2 down weights between two routes of one expert.
+    bool q2_group4 = false;    // Share Q2 down weights between up to four routes of one expert.
+    bool vector_silu = false;  // Use the CPU backend's vector activation in grouped up/gate tiles.
     bool q2_fast = false;      // GGML_MOE_CPU_SPLIT_Q2_FAST: reordered hidden rows + dot_q2_0_rows for Q2_0 down
+    bool q2_shuffle = false;   // Use AVX2 to reorder hidden bytes, with the same integer sums.
+    int q2_pf = 0;             // Q2 down prefetch distance in weight blocks; zero disables it.
     size_t aux_stride = 0;     // floats per route in hq_aux: n/32 block scales, then n/64 offsets
-    std::vector<float> hq_aux;
+    scratch_buf<float> hq_aux;
     int rows_ug = 16, rows_down = 64;
     bool iq_rows = false;      // GGML_MOE_CPU_SPLIT_ROWS: moe-iq-rows.h kernels, each chunk decoded once per expert
     int iq_variant = -1;       // moe_iq::get variant bits (GGML_MOE_CPU_SPLIT_ROWS: 1 = best mix, 2..17 = bits + 2)
     int iq_pf = 0;             // GGML_MOE_CPU_SPLIT_PF: prefetch distance of those kernels in bytes (0 = off)
     bool schedule = false;    // Assign quantization rows directly and claim math tiles in small groups.
+    int waitpf = 0;           // GGML_MOE_CPU_SPLIT_WAITPF: KiB of its first tile a worker prefetches while it waits at a phase barrier (0 = off)
     bool host_help = false;
+    bool item_barrier = false; // GGML_MOE_CPU_SPLIT_ITEM_BARRIER: phases end when their items are done, not their threads
+    bool own_xq = false;       // GGML_MOE_CPU_SPLIT_OWN_XQ (with ITEM_BARRIER): every thread quantizes the inputs itself
+    std::vector<uint8_t> xq_own;   // [threads][2][MOE_CS_MAX_ROUTES] private copies of xq
+    bool flow = false;         // GGML_MOE_CPU_SPLIT_FLOW (with ITEM_BARRIER): per-expert dependencies replace barriers 1 and 2
+    std::atomic<int> ug_left[MOE_CS_MAX_EXPERTS];   // flow: up + gate tiles of expert i not yet finished
+    std::atomic<int> hq_left[MOE_CS_MAX_EXPERTS];   // flow: hidden rows of expert i not yet quantized
+    int expert_of[MOE_CS_MAX_ROUTES] = {};          // flow: expert index of each route
+    size_t xq_own_stride = 0;
+    bool expjob = false;      // GGML_MOE_CPU_SPLIT_EXPJOB=1: one worker runs a whole expert (up/gate, SiLU, down) per claim, no phase barriers inside a job
     int host_cpu = -1;
     std::atomic<int> help_phase{-1}; // -1 closed, 1/3 open, 5/7 held by a helper
     std::atomic<unsigned long long> closed[4];
@@ -442,12 +520,21 @@ struct pool_state {
     alignas(64) std::atomic<unsigned long long> gen{0};
     alignas(64) std::atomic<int> next[4];
     alignas(64) std::atomic<unsigned long long> fin[4];
+    // item_barrier: (job number << 32) | next item / items finished, per phase
+    alignas(64) std::atomic<unsigned long long> inext[4];
+    alignas(64) std::atomic<unsigned long long> idone[4];
     alignas(64) std::atomic<int> sleepers{0};
     std::mutex sleep_mu;
     std::condition_variable sleep_cv;
 
     std::atomic<unsigned long long> st_jobs{0}, st_experts{0}, st_routes{0}, st_busy_ns{0}, st_null{0};
     unsigned long long phase_ns[4] = {};   // thread 0's time through each phase (barrier included), summed
+    // GGML_MOE_CPU_SPLIT_WSTATS=1 (default off): per worker, time spent claiming and running tiles and time spent waiting at
+    // the end-of-phase barrier, plus how late the worker joined a job. Tells a slow or late core from a slow kernel.
+    struct alignas(64) wstat_t { unsigned long long jobs = 0, lag_ns = 0, work_ns[4] = {}, wait_ns[4] = {}; int cpu = -1; };
+    bool wstats = false;
+    wstat_t wst[64];
+    std::atomic<long long> job_t0_ns{0};   // leader's clock when the job was published
     // host-posted jobs (the probe) use this instead of the mapped seq
     std::atomic<unsigned long long> local_seq{0}, local_done{0};
 };
@@ -455,6 +542,19 @@ struct pool_state {
 pool_state & P() {
     static pool_state * p = new pool_state();   // never destroyed: threads may still spin at exit
     return *p;
+}
+
+// Clears the per-worker counters (the probe's jobs are not production work).
+void wst_clear(pool_state & s) {
+    for (auto & w : s.wst) {
+        const int cpu = w.cpu;
+        w = pool_state::wstat_t();
+        w.cpu = cpu;
+    }
+}
+
+inline long long ns_of(clk::time_point t) {
+    return (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
 }
 
 int items_of(const pool_state & s, int phase) {
@@ -474,13 +574,14 @@ const char * role_row(pool_state & s, const role_math & m, int expert, int64_t r
     (void) s;
 }
 
-void run_item(pool_state & s, int phase, int item) {
+void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) {
     const layer_math & L = *s.cur;
+    uint8_t * const xq = xq_mine ? xq_mine : s.xq.data();
     if (phase == 0) {
         const int nr = s.n_input;
         const int k = item / nr, q = s.inputs[item % nr];
         const role_math & m = L.role[k];
-        m.quant(s.x + (size_t) q * s.x_stride, s.xq.data() + ((size_t) k * MOE_CS_MAX_ROUTES + q) * s.xq_stride, m.r.n_in);
+        m.quant(s.x + (size_t) q * s.x_stride, xq + ((size_t) k * MOE_CS_MAX_ROUTES + q) * s.xq_stride, m.r.n_in);
         return;
     }
     if (phase == 2) {
@@ -489,7 +590,7 @@ void run_item(pool_state & s, int phase, int item) {
         if (s.q2_fast && m.q2) {
             float * aux = s.hq_aux.data() + (size_t) item * s.aux_stride;
             q2_reorder_hidden((int) m.r.n_in, (block_q8_0 *) (s.hq.data() + (size_t) item * s.hq_stride), aux,
-                    aux + m.r.n_in / QK8_0);
+                    aux + m.r.n_in / QK8_0, s.q2_shuffle);
         }
         return;
     }
@@ -522,8 +623,8 @@ void run_item(pool_state & s, int phase, int item) {
                 const block_q8_K * yg[8];
                 for (int t = 0; t < nt; ++t) {
                     const int q = s.input_of[q0 + t];
-                    yu[t] = (const block_q8_K *) (s.xq.data() + (size_t) q * s.xq_stride);
-                    yg[t] = (const block_q8_K *) (s.xq.data() + (xg + q) * s.xq_stride);
+                    yu[t] = (const block_q8_K *) (xq + (size_t) q * s.xq_stride);
+                    yg[t] = (const block_q8_K *) (xq + (xg + q) * s.xq_stride);
                 }
                 for (int64_t a = r0; a < r1; a += 16) {
                     const int64_t b = std::min<int64_t>(a + 16, r1);
@@ -537,9 +638,16 @@ void run_item(pool_state & s, int phase, int item) {
                         for (int t = 0; t < nt; ++t) { for (int k = 0; k < 16; ++k) { ub[t][k] = 0.0f; gb[t][k] = 0.0f; } }
                     }
                     for (int t = 0; t < nt; ++t) {
+                        float * h = s.hidden.data() + (size_t) (q0 + t) * s.max_ff + a;
+                        if (s.vector_silu) {
+                            // fork: same SiLU function as the CPU backend, with its vector rounding.
+                            ggml_vec_silu_f32((int) (b - a), h, gb[t]);
+                            for (int k = 0; k < b - a; ++k) { h[k] *= ub[t][k]; }
+                            continue;
+                        }
                         for (int64_t row = a; row < b; ++row) {
                             const float u = ub[t][row - a], g = gb[t][row - a];
-                            s.hidden[(size_t) (q0 + t) * s.max_ff + row] = g / (1.0f + expf(-g)) * u;
+                            h[row - a] = g / (1.0f + expf(-g)) * u;
                         }
                     }
                 }
@@ -555,8 +663,8 @@ void run_item(pool_state & s, int phase, int item) {
                 float u = 0.0f, g = 0.0f;
                 if (wu && wg) {
                     const int input = s.input_of[q];
-                    const uint8_t * xu = s.xq.data() + (size_t) input * s.xq_stride;
-                    const uint8_t * xgp = s.xq.data() + (xg + input) * s.xq_stride;
+                    const uint8_t * xu = xq + (size_t) input * s.xq_stride;
+                    const uint8_t * xgp = xq + (xg + input) * s.xq_stride;
                     if (up.q2) { dot_q2_0_q8_0((int) up.r.n_in, &u, wu, xu); } else { up.dot((int) up.r.n_in, &u, 0, wu, 0, xu, 0, 1); }
                     if (gate.q2) { dot_q2_0_q8_0((int) gate.r.n_in, &g, wg, xgp); } else { gate.dot((int) gate.r.n_in, &g, 0, wg, 0, xgp, 0, 1); }
                 }
@@ -573,12 +681,28 @@ void run_item(pool_state & s, int phase, int item) {
     const int e = s.expert[i];
     if (s.q2_fast && down.q2) {
         const char * w = role_row(s, down, e, r0);
-        for (int q = s.first[i]; q < s.first[i + 1]; ++q) {
+        for (int q = s.first[i]; q < s.first[i + 1];) {
             float * o = s.out + (size_t) q * s.out_stride + r0;
-            if (!w) { for (int64_t row = r0; row < r1; ++row) { o[row - r0] = 0.0f; } continue; }
+            if (!w) { for (int64_t row = r0; row < r1; ++row) { o[row - r0] = 0.0f; } ++q; continue; }
             const float * aux = s.hq_aux.data() + (size_t) q * s.aux_stride;
-            dot_q2_0_rows((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes,
-                    (const block_q8_0 *) (s.hq.data() + (size_t) q * s.hq_stride), aux, aux + down.r.n_in / QK8_0, o);
+            const auto * y = (const block_q8_0 *) (s.hq.data() + (size_t) q * s.hq_stride);
+            if (s.q2_group4 && q + 3 < s.first[i + 1]) {
+                dot_q2_0_rows<4>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
+                q += 4;
+            } else if (s.q2_group4 && q + 2 < s.first[i + 1]) {
+                dot_q2_0_rows<3>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
+                q += 3;
+            } else if (s.q2_pair && q + 1 < s.first[i + 1]) {
+                dot_q2_0_rows<2>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
+                q += 2;
+            } else {
+                dot_q2_0_rows<1>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                        aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
+                ++q;
+            }
         }
         if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
         return;
@@ -639,19 +763,73 @@ void run_item(pool_state & s, int phase, int item) {
     }
 }
 
+// waitpf: with the first tile of the up/gate and down phases handed out by worker number, a worker that finishes
+// early at the previous barrier already knows which weight rows it reads next and pulls them toward its cache
+// while the slower workers finish, instead of spinning on a pause instruction.
+struct pf_cursor {
+    const char * base[2] = {nullptr, nullptr};
+    size_t len = 0, at = 0;
+};
+
+pf_cursor pf_tile(pool_state & s, int phase, int item) {
+    pf_cursor c;
+    if (!s.waitpf || (phase != 1 && phase != 3) || item >= items_of(s, phase)) { return c; }
+    const layer_math & L = *s.cur;
+    const bool ug = phase == 1;
+    const role_math & m = L.role[ug ? 0 : 2];
+    const int rows = ug ? s.rows_ug : s.rows_down;
+    const int blocks = (int) ((m.r.n_out + rows - 1) / rows);
+    const int64_t r0 = (int64_t) (item % blocks) * rows;
+    const int e = s.expert[item / blocks];
+    c.len = std::min<size_t>((size_t) std::min<int64_t>(rows, m.r.n_out - r0) * m.r.row_bytes, (size_t) s.waitpf * 1024);
+    c.base[0] = role_row(s, m, e, r0);
+    if (ug) { c.base[1] = role_row(s, L.role[1], e, r0); }
+    return c;
+}
+
+// Issues up to four lines of the tile (alternating up and gate); false once the tile is covered.
+bool pf_step(pf_cursor & c) {
+    for (int k = 0; k < 4 && c.at < c.len; ++k) {
+        for (int j = 0; j < 2; ++j) { if (c.base[j]) { __builtin_prefetch(c.base[j] + c.at, 0, 3); } }
+        c.at += 64;
+    }
+    return c.at < c.len;
+}
+
 // Every thread runs all four phases of job number `n` (1-based); the fin counters only grow, so a thread that is
 // late to notice a finished phase never misses it.
 void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead = false) {
     const unsigned long long target = n * (unsigned long long) s.threads;
     auto t = clk::now();
+    pool_state::wstat_t * W = s.wstats && worker < 64 ? &s.wst[worker] : nullptr;
+    if (W) {
+        ++W->jobs;
+        if (!lead) { W->lag_ns += (unsigned long long) std::max<long long>(0, ns_of(t) - s.job_t0_ns.load(std::memory_order_relaxed)); }
+    }
+    auto tw = t;
+    pf_cursor pf;
     for (int p = 0; p < 4; ++p) {
         const int total = items_of(s, p);
-        if (s.schedule && (p == 0 || p == 2)) {
+        if (s.expjob && p >= 1) {
+            // Fused phase: claim whole experts. Each expert's tiles are the same items the phased path runs, in the same
+            // per-row order, so the output is unchanged; phases 2 and 3 only pass the (already satisfied) barriers.
+            if (p == 1) {
+                for (int i = s.next[1].fetch_add(1, std::memory_order_relaxed); i < s.n_exp;
+                        i = s.next[1].fetch_add(1, std::memory_order_relaxed)) {
+                    const int bu = total / s.n_exp;
+                    for (int b = 0; b < bu; ++b) { run_item(s, 1, i * bu + b); }
+                    for (int q = s.first[i]; q < s.first[i + 1]; ++q) { run_item(s, 2, q); }
+                    const int bd = items_of(s, 3) / s.n_exp;
+                    for (int b = 0; b < bd; ++b) { run_item(s, 3, i * bd + b); }
+                }
+            }
+        } else if (s.schedule && (p == 0 || p == 2)) {
             // Each row has one writer. The phase barrier publishes it before any consumer runs.
             for (int it = worker; it < total; it += s.threads) {
                 run_item(s, p, it);
             }
         } else {
+            if (s.waitpf && (p == 1 || p == 3) && worker < total) { run_item(s, p, worker); }
             // Keep at least three claims per worker, with at most four adjacent tiles per claim.
             const int chunk = s.schedule ? std::max(1, std::min(4, total / (3 * s.threads))) : 1;
             for (int begin = s.next[p].fetch_add(chunk, std::memory_order_relaxed); begin < total;
@@ -662,6 +840,11 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
             }
         }
         const auto finished = s.fin[p].fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (W) {
+            const auto t1 = clk::now();
+            W->work_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - tw).count();
+            tw = t1;
+        }
         if (s.host_help) {
             if (finished == target) {
                 if (p == 1 || p == 3) {
@@ -680,17 +863,141 @@ void run_job_phases(pool_state & s, unsigned long long n, int worker, bool lead 
             }
         }
         if (p < 3) {
-            while (s.fin[p].load(std::memory_order_acquire) < target) { cpu_relax(); }
+            if (s.waitpf && p < 2) { pf = pf_tile(s, p == 0 ? 1 : 3, worker); }   // phase 2 keeps the down-tile cursor
+            while (s.fin[p].load(std::memory_order_acquire) < target) {
+                if (!(s.waitpf && pf_step(pf))) { cpu_relax(); }
+            }
+        }
+        if (lead && p == 3) {
+            while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
+        }
+        if (W) {
+            const auto t2 = clk::now();
+            W->wait_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - tw).count();
+            tw = t2;
         }
         if (lead) {
-            if (p == 3) {
-                while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
-            }
             const auto now = clk::now();
             s.phase_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
             t = now;
         }
     }
+}
+
+// item_barrier: the same items as run_job_phases, but a phase ends when all of its items are finished instead of
+// when every thread has passed it, so a pool thread the OS has descheduled while it holds no item (a pool core is
+// shared with the desktop and the server's own threads) no longer stalls the job at four barriers. Claims carry the
+// job number: a thread that wakes up late in an old job can never claim an item of a newer one. Every item still
+// writes its own rows the same way, so the results are bit-identical.
+// own_xq: the input rows are a few KB, so instead of sharing phase 0 every thread quantizes all of them into its own
+// copy (same function, same bytes) and goes straight to up + gate: no thread waits on another before its first tile.
+constexpr unsigned long long item_low = 0xffffffffULL;
+
+// flow: phases 1-3 become one list of items in the same order (all up + gate tiles, then the hidden rows, then the
+// down tiles, each expert-major) claimed from inext[1] and counted in idone[1]. Instead of waiting for the whole
+// phase before it, a hidden row waits only for its own expert's up + gate tiles and a down tile only for its own
+// expert's hidden rows. Those items sit earlier in the list, so they are already claimed and running: nobody waits
+// on unclaimed work, and threads that finish early go on with other experts. Same items, same rows: bit-identical.
+void run_flow_items(pool_state & s, unsigned long long tag, uint8_t * mine, bool lead, clk::time_point t) {
+    const unsigned long long n1 = (unsigned long long) items_of(s, 1), n2 = (unsigned long long) items_of(s, 2);
+    const unsigned long long total = n1 + n2 + (unsigned long long) items_of(s, 3);
+    const int ug_blocks = (int) (n1 / (unsigned long long) s.n_exp);
+    const int down_blocks = (int) ((total - n1 - n2) / (unsigned long long) s.n_exp);
+    for (unsigned long long c = s.inext[1].load(std::memory_order_acquire);
+            (c & ~item_low) == tag && (c & item_low) < total;) {
+        if (!s.inext[1].compare_exchange_weak(c, c + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            continue;
+        }
+        const unsigned long long k = c & item_low;
+        if (k < n1) {
+            const int i = (int) k / ug_blocks;
+            run_item(s, 1, (int) k, mine);
+            s.ug_left[i].fetch_sub(1, std::memory_order_acq_rel);
+        } else if (k < n1 + n2) {
+            const int q = (int) (k - n1), i = s.expert_of[q];
+            while (s.ug_left[i].load(std::memory_order_acquire) > 0) { cpu_relax(); }
+            run_item(s, 2, q);
+            s.hq_left[i].fetch_sub(1, std::memory_order_acq_rel);
+        } else {
+            const int item = (int) (k - n1 - n2), i = item / down_blocks;
+            while (s.hq_left[i].load(std::memory_order_acquire) > 0) { cpu_relax(); }
+            run_item(s, 3, item);
+        }
+        s.idone[1].fetch_add(1, std::memory_order_acq_rel);
+        c = s.inext[1].load(std::memory_order_acquire);
+    }
+    if (!lead) { return; }   // thread 0 alone waits for the last items and publishes `done`
+    while ((s.idone[1].load(std::memory_order_acquire) & item_low) < total) { cpu_relax(); }
+    s.phase_ns[1] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t).count();
+}
+
+void run_job_items(pool_state & s, unsigned long long n, int worker, bool lead = false) {
+    const unsigned long long tag = (n & item_low) << 32;
+    uint8_t * const mine = s.own_xq ? s.xq_own.data() + (size_t) worker * s.xq_own_stride : nullptr;
+    auto t = clk::now();
+    for (int p = 0; p < 4; ++p) {
+        if (p == 1 && s.flow) { run_flow_items(s, tag, mine, lead, t); return; }
+        const unsigned long long total = (unsigned long long) items_of(s, p);
+        if (p == 0 && mine) {
+            for (unsigned long long it = 0; it < total; ++it) {
+                if ((s.inext[1].load(std::memory_order_acquire) & ~item_low) != tag) { return; }   // job already over
+                run_item(s, 0, (int) it, mine);
+            }
+            if (lead) {
+                const auto now = clk::now();
+                s.phase_ns[0] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+                t = now;
+            }
+            continue;
+        }
+        for (unsigned long long c = s.inext[p].load(std::memory_order_acquire);
+                (c & ~item_low) == tag && (c & item_low) < total;) {
+            if (!s.inext[p].compare_exchange_weak(c, c + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                continue;
+            }
+            run_item(s, p, (int) (c & item_low), p == 1 ? mine : nullptr);
+            s.idone[p].fetch_add(1, std::memory_order_acq_rel);
+            c = s.inext[p].load(std::memory_order_acquire);
+        }
+        if (p == 3 && !lead) { return; }   // thread 0 alone waits for the last items and publishes `done`
+        for (;;) {
+            const unsigned long long d = s.idone[p].load(std::memory_order_acquire);
+            if ((d & ~item_low) != tag) { return; }   // this job ended without this thread
+            if ((d & item_low) >= total) { break; }
+            cpu_relax();
+        }
+        if (lead) {
+            const auto now = clk::now();
+            s.phase_ns[p] += (unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+            t = now;
+        }
+    }
+}
+
+// item_barrier + host help: the waiting host claims one item of the open phase of the current job, the same
+// tagged claim the pool uses, so it needs no admission handshake: thread 0 cannot finish (or replace) the job
+// until this item is counted, and a claim against a closed or newer job fails. Same items, same rows.
+bool help_items(pool_state & s) {
+    const unsigned long long n = s.gen.load(std::memory_order_acquire);
+    if (n == 0) { return false; }
+    const unsigned long long tag = (n & item_low) << 32;
+    // own_xq: the host has no input copy, so it helps hidden + down only; flow: it helps the input rows only
+    for (int p = s.own_xq ? 2 : 0; p < (s.flow ? 1 : 4); ++p) {
+        if (p > 0) {
+            const unsigned long long d = s.idone[p - 1].load(std::memory_order_acquire);
+            if ((d & ~item_low) != tag || (d & item_low) < (unsigned long long) items_of(s, p - 1)) { return false; }
+        }
+        const unsigned long long total = (unsigned long long) items_of(s, p);
+        for (unsigned long long c = s.inext[p].load(std::memory_order_acquire);
+                (c & ~item_low) == tag && (c & item_low) < total;) {
+            if (s.inext[p].compare_exchange_weak(c, c + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                run_item(s, p, (int) (c & item_low));
+                s.idone[p].fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void pin_thread(int cpu) {
@@ -735,6 +1042,7 @@ void sleep_us(int us) {
 void worker_main(pool_state * sp, int idx, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+    if (idx < 64) { s.wst[idx].cpu = cpu; }
     unsigned long long seen = 0;
     for (;;) {
         auto spin_until = clk::now() + std::chrono::microseconds(s.spin_us);
@@ -753,7 +1061,7 @@ void worker_main(pool_state * sp, int idx, int cpu) {
             }
         }
         seen = g;
-        run_job_phases(s, g, idx);
+        if (s.item_barrier) { run_job_items(s, g, idx); } else { run_job_phases(s, g, idx); }
     }
 }
 
@@ -761,6 +1069,7 @@ void worker_main(pool_state * sp, int idx, int cpu) {
 void leader_main(pool_state * sp, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+    s.wst[0].cpu = cpu;
 #if defined(__linux__)
     (void) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);   // naps end within ~1 us of the asked time, not +50 us
 #endif
@@ -815,15 +1124,35 @@ void leader_main(pool_state * sp, int cpu) {
                 if (input == q) { s.inputs[s.n_input++] = q; }
             }
             ++n;
-            for (int p = 0; p < 4; ++p) { s.next[p].store(0, std::memory_order_relaxed); }
+            const unsigned long long tag = (n & item_low) << 32;
+            if (s.flow) {
+                const int ug_blocks = items_of(s, 1) / s.n_exp;
+                for (int i = 0; i < s.n_exp; ++i) {
+                    s.ug_left[i].store(ug_blocks, std::memory_order_relaxed);
+                    s.hq_left[i].store(s.first[i + 1] - s.first[i], std::memory_order_relaxed);
+                    for (int q = s.first[i]; q < s.first[i + 1]; ++q) { s.expert_of[q] = i; }
+                }
+            }
+            for (int p = 0; p < 4; ++p) {
+                s.next[p].store(s.waitpf && (p == 1 || p == 3) ? s.threads : 0, std::memory_order_relaxed);
+                s.idone[p].store(tag, std::memory_order_relaxed);
+                s.inext[p].store(tag, std::memory_order_relaxed);
+            }
+            if (s.wstats) { s.job_t0_ns.store(ns_of(clk::now()), std::memory_order_relaxed); }
             s.gen.store(n, std::memory_order_seq_cst);
             if (s.sleepers.load(std::memory_order_seq_cst) > 0) {
                 std::lock_guard<std::mutex> lk(s.sleep_mu);
                 s.sleep_cv.notify_all();
             }
-            run_job_phases(s, n, 0, true);
-            const unsigned long long target = n * (unsigned long long) s.threads;
-            while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
+            if (s.item_barrier) {
+                run_job_items(s, n, 0, true);
+                // close this job's claims before the next job's state is written
+                for (int p = 0; p < 4; ++p) { s.inext[p].store(tag | item_low, std::memory_order_release); }
+            } else {
+                run_job_phases(s, n, 0, true);
+                const unsigned long long target = n * (unsigned long long) s.threads;
+                while (s.fin[3].load(std::memory_order_acquire) < target) { cpu_relax(); }
+            }
             s.st_experts.fetch_add((unsigned) s.n_exp, std::memory_order_relaxed);
             s.st_routes.fetch_add((unsigned) s.n_route, std::memory_order_relaxed);
         } else {
@@ -861,10 +1190,16 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     // Quantized rows are never larger than the f32 rows they come from.
     s.xq_stride = GGML_PAD((size_t) max_embd * sizeof(float), 64);
     s.hq_stride = GGML_PAD((size_t) max_ff * sizeof(float), 64);
-    s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0);
-    s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f);
-    s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0);
+    const bool align = env_int("GGML_MOE_CPU_SPLIT_ALIGN", 0, 0, 1) != 0;
+    s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0, align);
+    s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f, align);
+    s.hq.assign(MOE_CS_MAX_ROUTES * s.hq_stride, 0, align);
+    s.q2_pair = env_int("GGML_MOE_CPU_SPLIT_Q2_PAIR", 0, 0, 1) != 0;
+    s.q2_group4 = env_int("GGML_MOE_CPU_SPLIT_Q2_GROUP4", 0, 0, 1) != 0;
+    s.vector_silu = env_int("GGML_MOE_CPU_SPLIT_VECTOR_SILU", 0, 0, 1) != 0;
     s.q2_fast = env_int("GGML_MOE_CPU_SPLIT_Q2_FAST", 0, 0, 1) != 0;
+    s.q2_shuffle = env_int("GGML_MOE_CPU_SPLIT_Q2_SHUFFLE", 0, 0, 1) != 0;
+    s.q2_pf = env_int("GGML_MOE_CPU_SPLIT_Q2_PF", 0, 0, 64);
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
     s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
     s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 1, 0, 1) ? 8 : 4;
@@ -872,7 +1207,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 1, 0, 1) != 0 && cpu_has_avx512_vnni();
 #endif
     s.aux_stride = (size_t) max_ff / QK8_0 + (size_t) max_ff / QK2_0 + 16;
-    s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f);
+    s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f, align);
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
 #if defined(MOE_IQ_ROWS)
@@ -888,7 +1223,16 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
     s.schedule = env_int("GGML_MOE_CPU_SPLIT_SCHEDULE", 0, 0, 1) != 0;
     s.host_help = env_int("GGML_MOE_CPU_SPLIT_HOST", 0, 0, 1) != 0;
-    for (int p = 0; p < 4; ++p) { s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); }
+    s.item_barrier = env_int("GGML_MOE_CPU_SPLIT_ITEM_BARRIER", 0, 0, 1) != 0 && !s.schedule;
+    s.wstats = env_int("GGML_MOE_CPU_SPLIT_WSTATS", 0, 0, 1) != 0;
+    s.waitpf = env_int("GGML_MOE_CPU_SPLIT_WAITPF", 0, 0, 1024);
+    s.expjob = env_int("GGML_MOE_CPU_SPLIT_EXPJOB", 0, 0, 1) != 0;
+    // ITEM_BARRIER and WAITPF/EXPJOB were built separately and schedule the same work counters differently: run one at a time.
+    if (s.item_barrier) { s.waitpf = 0; s.expjob = false; }
+    if (s.expjob) { s.host_help = false; s.waitpf = 0; }
+    for (int p = 0; p < 4; ++p) {
+        s.next[p].store(0); s.fin[p].store(0); s.closed[p].store(0); s.inext[p].store(item_low); s.idone[p].store(0);
+    }
     // Reserve the caller's actual core and keep the card-driving thread on it.
     const bool max_threads = env_int("GGML_MOE_CPU_SPLIT_MAX_THREADS", 1, 0, 1) != 0;
 #if defined(__linux__)
@@ -907,6 +1251,9 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         if (s.host_help) { s.host_cpu = cores[0]; pin_thread(s.host_cpu); }
         std::vector<char> skip(cores.size(), 0);
         if (!max_threads) { skip[0] = 1; }
+        // GGML_MOE_CPU_SPLIT_CORE0=0 keeps the pool off core 0 even with MAX_THREADS: the card queue fences every
+        // other process onto core 0 during a timed run, and a pool thread there stalls the layer when it is preempted.
+        if (env_int("GGML_MOE_CPU_SPLIT_CORE0", 1, 0, 1) == 0 && cores.size() > 2) { skip[0] = 1; }
         const char * ep = getenv("GGML_CPU_EXPERT_PIN");
         if (!s.host_help && !max_threads && ep && strcmp(ep, "1") == 0 && cores.size() > 2) { skip[1] = 1; }
 #if defined(__linux__)
@@ -960,8 +1307,29 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         }
     }
 #endif
+    // GGML_MOE_CPU_SPLIT_CPULIST="11,10,9,..." (default unset): use exactly these cpus, in this order, instead of the
+    // derived list. Used to test pool placement (which L3 group, whether the desktop core is in the pool).
+#if defined(__linux__)
+    if (const char * cl = getenv("GGML_MOE_CPU_SPLIT_CPULIST")) {
+        std::vector<int> forced;
+        for (const char * c = cl; *c;) {
+            if (*c < '0' || *c > '9') { ++c; continue; }
+            char * end = nullptr;
+            const long v = strtol(c, &end, 10);
+            c = end;
+            if (v >= 0 && v < CPU_SETSIZE) { forced.push_back((int) v); }
+        }
+        if (!forced.empty()) { avail = forced; skipped = "forced by GGML_MOE_CPU_SPLIT_CPULIST"; }
+    }
+#endif
     const int hw_free = !avail.empty() ? (int) avail.size() : (int) std::max(1u, std::thread::hardware_concurrency() / 2 - 1);
     s.threads = env_int("GGML_MOE_CPU_SPLIT_THREADS", hw_free, 1, 64);
+    s.own_xq = s.item_barrier && env_int("GGML_MOE_CPU_SPLIT_OWN_XQ", 0, 0, 1) != 0;
+    s.flow = s.item_barrier && env_int("GGML_MOE_CPU_SPLIT_FLOW", 0, 0, 1) != 0;
+    if (s.own_xq) {
+        s.xq_own_stride = 2 * MOE_CS_MAX_ROUTES * s.xq_stride;
+        s.xq_own.assign((size_t) s.threads * s.xq_own_stride, 0);
+    }
     const bool pin = env_int("GGML_MOE_CPU_SPLIT_PIN", 1, 0, 1) != 0 && !avail.empty();
     auto cpu_of = [&](int i) { return pin ? avail[(size_t) i % avail.size()] : -1; };
     s.running = true;
@@ -975,9 +1343,15 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
+    if (align) { fprintf(stderr, "[moe-cpu-split] scratch rows start on 64-byte lines (GGML_MOE_CPU_SPLIT_ALIGN)\n"); }
+    if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
+    if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across three/four-route groups\n"); }
+    if (s.vector_silu && s.iq_rows) { fprintf(stderr, "[moe-cpu-split] grouped up/gate uses CPU vector SiLU\n"); }
     if (s.iq_rows) { fprintf(stderr, "[moe-cpu-split] IQ up/gate row kernels (each chunk decoded once per expert), variant %d, prefetch %d B\n", s.iq_variant, s.iq_pf); }
+    if (s.expjob) { fprintf(stderr, "[moe-cpu-split] one worker per whole expert (GGML_MOE_CPU_SPLIT_EXPJOB)\n"); }
     if (s.schedule) { fprintf(stderr, "[moe-cpu-split] static quantization rows, grouped math claims\n"); }
     if (s.host_help) { fprintf(stderr, "[moe-cpu-split] waiting host drains math tiles on cpu %d\n", s.host_cpu); }
+    if (s.item_barrier) { fprintf(stderr, "[moe-cpu-split] item barriers (a descheduled idle thread does not stall a job)%s%s\n", s.own_xq ? ", private input rows per thread" : "", s.flow ? ", per-expert flow (no phase barriers after the inputs)" : ""); }
     fprintf(stderr, "[moe-cpu-split] input Q8 reuse %s, IQ token group %d, IQ4_NL down reuse %s\n", s.q8_reuse ? "on" : "off", s.group_tokens, s.down_reuse ? "on" : "off");
     return true;
 }
@@ -992,6 +1366,7 @@ bool moe_cs_help() {
 #if defined(__linux__)
     if (s.host_cpu >= 0 && sched_getcpu() != s.host_cpu) { pin_thread(s.host_cpu); }
 #endif
+    if (s.item_barrier) { return help_items(s); }
     int phase = s.help_phase.load(std::memory_order_acquire);
     if ((phase != 1 && phase != 3) ||
         !s.help_phase.compare_exchange_strong(phase, phase + 4, std::memory_order_acq_rel)) { return false; }
@@ -1174,6 +1549,7 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     *fixed_ns = std::max(0.0, t1 - per);
     // the probe's jobs count as work in the statistics; clear them
     s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
+    wst_clear(s);
     fprintf(stderr, "[moe-cpu-split] probe on layer %d: empty job %.1f us, 1 expert %.1f us, 4 experts %.1f us -> %.1f us per (expert, route) + %.1f us per job\n",
             layer, t0 / 1000.0, t1 / 1000.0, t4 / 1000.0, per / 1000.0, *fixed_ns / 1000.0);
     // Contention check: warns when the pool spent over 25% of the timed jobs waiting for a cpu (about 1.33x slower or worse).
@@ -1218,7 +1594,23 @@ bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int rep
     *ns_per_job = total / reps;
     for (int p = 0; p < 4; ++p) { phase_ns[p] = (double) s.phase_ns[p] / reps; s.phase_ns[p] = 0; }
     s.st_jobs = 0; s.st_experts = 0; s.st_routes = 0; s.st_busy_ns = 0; s.st_null = 0;
+    wst_clear(s);
     return true;
+}
+
+void moe_cs_wstats_report(const char * when) {
+    pool_state & s = P();
+    if (!s.wstats) { return; }
+    static const char * const names[4] = {"quantize", "up+gate", "silu", "down"};
+    for (int i = 0; i < s.threads && i < 64; ++i) {
+        const pool_state::wstat_t & w = s.wst[i];
+        const double j = (double) std::max(1ull, w.jobs);
+        fprintf(stderr, "[moe-cpu-split] wstats %s worker %d cpu %d jobs %llu join-lag %.2f us/job", when, i, w.cpu, w.jobs, w.lag_ns / j / 1e3);
+        for (int p = 0; p < 4; ++p) {
+            fprintf(stderr, " | %s work %.1f wait %.1f", names[p], w.work_ns[p] / j / 1e3, w.wait_ns[p] / j / 1e3);
+        }
+        fprintf(stderr, " us/job\n");
+    }
 }
 
 void moe_cs_stats(unsigned long long out[9]) {

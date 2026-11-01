@@ -374,6 +374,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool fit_ram;         // cap optional model read-ahead using available host RAM
     };
 
     struct llama_sampler_seq_config {
@@ -421,6 +422,8 @@ extern "C" {
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
         int32_t moe_prefetch;                     // experimental: 0 off, -1 auto, 1..3 future layers
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
+        int32_t moe_skip_tail;                     // LOSSY: 0 off; 1..9 = leave out a non-resident expert that every token of a single-sequence decode window ranks at this position or later [EXPERIMENTAL]
+        bool moe_skip_mass;                        // LOSSY: enable the configured weight-budget policy independently of route rank
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
 
         // Expert keep policy for CPU-held MoE experts (#215/#217) [EXPERIMENTAL]
@@ -1146,6 +1149,10 @@ extern "C" {
     // The fewest tokens that must follow a capture spot in the same call (the ubatch split keeps that many trailing
     // tokens together, so a spot closer to the end of the call does not end a ubatch); -1 when unsupported.
     LLAMA_API int32_t llama_state_seq_capture_min_tail(struct llama_context * ctx);
+
+    // Byte size of the largest capture laid out so far by the armed decode (0 until the first one is laid out, reset
+    // by llama_state_seq_capture_arm). Safe to call from another thread while the decode runs.
+    LLAMA_API size_t llama_state_seq_capture_size(struct llama_context * ctx);
 
     // After the decode: true when capture k is complete. It then sets pos_min/pos_max to the memory's range at that
     // spot, and until llama_state_seq_capture_select(ctx, -1, ...) llama_state_seq_get_size_ext/get_data_ext with
