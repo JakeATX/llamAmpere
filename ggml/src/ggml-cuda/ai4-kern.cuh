@@ -1363,6 +1363,7 @@ static __device__ __forceinline__ void mmvr_body(
                     unsigned int * count = &g_ai4k_glu_count[(idm.filter_val ? 0 : GLU_PAIR_TILES) + col*(M/16) + slab];
                     if (atomicAdd(count, 1u) == 1u) {
                         *count = 0;
+                        __threadfence();    // acquire side: the partner fenced its stores before its arrival
                         go = 1;
                     }
                 } else if (idm.glu_prev && idm.glu_prev[direct_e] == 1) {
@@ -1370,6 +1371,7 @@ static __device__ __forceinline__ void mmvr_body(
                 }
             }
             go = __shfl_sync(0xffffffff, go, 0);
+            __syncwarp();
             if (go && lane < 16) {
                 const int64_t o = col*ldy + slab*16 + lane;
                 idm.glu[o] = ggml_cuda_op_silu_single(__ldcg(idm.glu_gate + o)) * __ldcg(idm.glu_up + o);
