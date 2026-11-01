@@ -1089,10 +1089,10 @@ struct llama_sampler * common_sampler_get_backend_verify(struct common_sampler *
     return gsmpl->chain;
 }
 
-struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * gsmpl) {
-    // fused_top_k > 0 and no fused bias means the CPU chain's first live sampler is top-k with nothing before it
-    // that touches the logits, so the CPU chain sees the same candidates from the K best as from the full row
-    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || gsmpl->fused_top_k <= 0 || !gsmpl->fused_topk_bias.empty() ||
+struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * gsmpl, const struct llama_model * model) {
+    // fused_top_k > 0 means the CPU chain's first live samplers are [logit-bias,] top-k, so the CPU chain sees the same
+    // candidates from the K best of the biased row as from the full row (the bias is applied on the card first)
+    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || gsmpl->fused_top_k <= 0 ||
             gsmpl->params.temp <= 0.0f || gsmpl->params.mirostat != 0 || gsmpl->params.n_probs != 0) {
         return nullptr;
     }
@@ -1100,6 +1100,11 @@ struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * g
         auto params = llama_sampler_chain_default_params();
         params.no_perf = gsmpl->params.no_perf;
         gsmpl->topk_backend = llama_sampler_chain_init(params);
+        if (!gsmpl->fused_topk_bias.empty()) {
+            // request bans (for example the end-of-turn ids) are forced to -INFINITY before the K best are kept
+            llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_logit_bias(
+                    llama_vocab_n_tokens(llama_model_get_vocab(model)), gsmpl->fused_topk_bias.size(), gsmpl->fused_topk_bias.data()));
+        }
         // K >= 64 takes the card's radix-select path (wide rows with a small K fall to a full-row sort)
         llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_top_k(std::max(gsmpl->fused_top_k, 64)));
     }

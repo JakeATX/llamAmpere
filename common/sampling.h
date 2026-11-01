@@ -105,8 +105,8 @@ bool common_sampler_backend_verify_ready(const struct common_sampler * gsmpl);
 // Card-side top-K candidate download for CPU p/q verification: the card keeps the K best logits of every
 // verification row (K >= the request's top-k) and only those ids and logits are copied to the host, where the
 // unchanged CPU chain finishes the sampling. Returns the chain to install with llama_set_sampler, or nullptr
-// when the request is not eligible (no leading top-k, logit bias, grammar, greedy). The chain is owned by gsmpl.
-struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * gsmpl);
+// when the request is not eligible (no leading top-k, grammar, greedy). The chain is owned by gsmpl.
+struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * gsmpl, const struct llama_model * model);
 bool common_sampler_topk_backend_ready(const struct common_sampler * gsmpl);
 
 // extended sampling implementation:

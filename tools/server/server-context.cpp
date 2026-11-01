@@ -3291,7 +3291,7 @@ private:
             }
             bool speculative_topk = false;
             if (slot.can_speculate() && !speculative_sampler && server_mtp_topk_verify_enabled()) {
-                speculative_sampler = common_sampler_get_topk_backend(slot.smpl.get());
+                speculative_sampler = common_sampler_get_topk_backend(slot.smpl.get(), model_tgt);
                 speculative_topk = speculative_sampler != nullptr;
             }
             use_backend_sampling &= !slot.can_speculate();
