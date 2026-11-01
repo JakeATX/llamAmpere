@@ -12131,6 +12131,17 @@ struct test_moe_bank_mixed_exact : public test_moe_bank_mixed {
         ggml_backend_tensor_get(mixed_result, actual.data(), 0, actual.size()*sizeof(uint32_t));
         ggml_backend_tensor_get(reference_result, expected.data(), 0, expected.size()*sizeof(uint32_t));
         if (actual != expected) {
+            if (getenv("GGML_TEST_EXACT_DIAG")) {
+                const int64_t ne0 = mixed_result->ne[0], nr = (int64_t) actual.size()/ne0;
+                for (int64_t r = 0; r < nr; ++r) {
+                    int64_t nd = 0, first = -1; float md = 0.0f;
+                    for (int64_t i = 0; i < ne0; ++i) {
+                        float a, e; memcpy(&a, &actual[r*ne0 + i], 4); memcpy(&e, &expected[r*ne0 + i], 4);
+                        if (actual[r*ne0 + i] != expected[r*ne0 + i]) { nd += 1; if (first < 0) { first = i; } md = std::max(md, fabsf(a - e)); }
+                    }
+                    printf("[diag] row %lld: %lld/%lld differ, first %lld, max|d| %g\n", (long long) r, (long long) nd, (long long) ne0, (long long) first, md);
+                }
+            }
             printf("mixed projection differs from native projection ");
             return false;
         }
