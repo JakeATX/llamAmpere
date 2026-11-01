@@ -1710,18 +1710,13 @@ static __device__ __forceinline__ void moe_mixed_cold(
                 continue;
             }
         }
-        // One token: native runs cold rows as generic four-warp MMVQ. At K = 640 the down
-        // rows fit one warp pass plus a tail, where the one-warp order is already identical.
-        const bool single_tok = WARPS == 4 && !SPW && n_tok == 1;
-        const bool single_down = single_tok && K != 640;
+        // Cold rows keep the one-warp order at every width: with the expert cache the unmixed
+        // one-token path matches it bit for bit (native four-warp MMVQ does not).
         if constexpr (BASE == GGML_TYPE_COUNT) {
             switch (type) {
 #define MOE_MIXED_CASE(T, F, V) case T: \
             if constexpr (T == GGML_TYPE_Q2_0 || T == GGML_TYPE_IQ4_NL) { \
-                if (single_down) { moe_mixed_rows_single<T>(sw, x, sy, K); } \
-                else             { moe_mixed_down_rows<T, WARPS>(sw, x, sy, K); } \
-            } else if (single_tok) { \
-                moe_mixed_rows_single<T>(sw, x, sy, K); \
+                moe_mixed_down_rows<T, WARPS>(sw, x, sy, K); \
             } else { \
                 moe_mixed_base_rows<T, WARPS>(sw, x, sy, K); \
             } \
@@ -1731,10 +1726,7 @@ static __device__ __forceinline__ void moe_mixed_cold(
                 default: __trap();
             }
         } else if constexpr (BASE == GGML_TYPE_Q2_0 || BASE == GGML_TYPE_IQ4_NL) {
-            if (single_down) { moe_mixed_rows_single<BASE>(sw, x, sy, K); }
-            else             { moe_mixed_down_rows<BASE, WARPS>(sw, x, sy, K); }
-        } else if (single_tok) {
-            moe_mixed_rows_single<BASE>(sw, x, sy, K);
+            moe_mixed_down_rows<BASE, WARPS>(sw, x, sy, K);
         } else {
             moe_mixed_base_rows<BASE, WARPS>(sw, x, sy, K);
         }
