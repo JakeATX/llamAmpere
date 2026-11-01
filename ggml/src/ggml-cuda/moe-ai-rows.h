@@ -84,7 +84,6 @@ static inline float hsum8(__m256 v) {
     return _mm_cvtss_f32(a);
 }
 
-#if defined(GGML_MOE_AI_AVX512)
 // AVX-512 (Zen 4/5 hosts, runtime-dispatched; the build targets Zen 3): tile rows r and r + 1 in one 512-bit decode.
 // Row r + 1 starts k bytes after row r at the same bit offset. Per row the lanes, FMA order and final sum are the
 // AVX2 path's, so the results are bit-identical to it.
@@ -142,10 +141,6 @@ MOE_AI_T512 static void unit_rows_512(const uint8_t * blk, int k, uint32_t C, in
         }
     }
 }
-#else
-// AVX-512 is opt-in at build time (-DGGML_MOE_AI_AVX512): bundles must stay free of AVX-512 instructions.
-static bool has_avx512() { return false; }
-#endif
 #endif
 
 // rows [a, b) of one expert (a multiple of 16; b - a <= 16, rows past b are computed and dropped), nt tokens:
@@ -162,12 +157,10 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
         const uint16_t * dh  = (const uint16_t *) blk;
         const uint32_t * wd  = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
 #if defined(__AVX2__) && defined(__FMA__)
-#if defined(GGML_MOE_AI_AVX512)
         if (C != 0 && path != 0 && has_avx512()) {
             unit_rows_512(blk, k, C, nt, y, u*AI4U_UK, acc);
             continue;
         }
-#endif
         if (C != 0) {
             __m256 part[8][AI4_TR];
             for (int t = 0; t < nt; ++t) { for (int r = 0; r < AI4_TR; ++r) { part[t][r] = _mm256_setzero_ps(); } }
