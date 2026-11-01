@@ -152,6 +152,57 @@ static uint8_t * g_tail_mask = nullptr;
 // [0] rows [1] layer windows [2] experts left out [3..13] tokens by left-out routes (0..10)
 #define MOE_TAIL_COUNTS 14
 static unsigned long long * g_tail_counts = nullptr;
+// fork SWAPPOL: per (layer, expert) decode-window statistics, written by the skip kernel (GGML_MOE_SWAP_STATS=path,
+// dumped at device release). Row of MOE_SWST_COLS: routes by rank 0..9, summed weight x10240, routes skipped, routes
+// hit (all three projections resident), windows present.
+#define MOE_SWST_LAYERS 48
+#define MOE_SWST_COLS 14
+static unsigned long long * g_swst = nullptr;
+// fork SWAPPOL: swap score source (GGML_MOE_SWAP_SCORE=count|kept|weight|weightkept, GGML_MOE_SWAP_DROPW). Non-count modes accumulate per
+// (layer, expert) in units of 1/1024 route: kept drops the routes the skip budget left out, weight counts a route as
+// 10x its router weight. Default: weight with DROPW 0.5 when the skip budget is on (its kernel fills the scores; SWAPPOL
+// r37x+r43x, 29 Taichi pairs: -0.96% ms/round, p=.026), count otherwise. GGML_MOE_SWAP_SCORE=count restores the old policy.
+static unsigned long long * g_swscore = nullptr;
+static unsigned long long * g_swscore_host = nullptr;
+static bool moe_swap_score_default_weight() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_MOE_SWAP_SCORE");
+        const char * p = getenv("GGML_MOE_SKIP_POLICY");
+        return (!v || !*v) && p && *p;
+    }();
+    return on;
+}
+static int moe_swap_score_mode() {
+    static const int mode = [] {
+        const char * v = getenv("GGML_MOE_SWAP_SCORE");
+        if (moe_swap_score_default_weight()) { return 2; }
+        if (!v || !*v || strcmp(v, "count") == 0) { return 0; }
+        if (strcmp(v, "kept") == 0) { return 1; }
+        if (strcmp(v, "weight") == 0) { return 2; }
+        if (strcmp(v, "weightkept") == 0) { return 3; }
+        GGML_ABORT("GGML_MOE_SWAP_SCORE must be count, kept, weight or weightkept");
+    }();
+    // GGML_MOE_SWAP_DROPW alone (count scores) still needs the score buffer: mode 4.
+    static const bool skipw_set = getenv("GGML_MOE_SWAP_DROPW") && *getenv("GGML_MOE_SWAP_DROPW");
+    return mode ? mode : (skipw_set ? 4 : 0);
+}
+// fork SWAPPOL: GGML_MOE_SWAP_DROPW=<0..1> scales the score of routes the skip budget left out (not resident, rank
+// past the floor): 1 counts them fully, 0 ignores them (same as kept). Returned in 1/1024 units.
+static unsigned moe_swap_skipw() {
+    static const unsigned w = [] {
+        if (moe_swap_score_mode() & 1) { return 0u; }
+        const char * v = getenv("GGML_MOE_SWAP_DROPW");
+        if (!v || !*v) { return moe_swap_score_default_weight() ? 512u : 1024u; }
+        const float f = strtof(v, nullptr);
+        if (!(f >= 0.0f && f <= 1.0f)) { GGML_ABORT("GGML_MOE_SWAP_DROPW must be in [0, 1]"); }
+        return (unsigned) (f * 1024.0f + 0.5f);
+    }();
+    return w;
+}
+static const char * moe_swst_path() {
+    static const char * path = [] { const char * v = getenv("GGML_MOE_SWAP_STATS"); return v && *v ? v : nullptr; }();
+    return path;
+}
 static size_t g_hf_stride = 0;
 static int64_t g_hf_experts = 0;
 static int g_hf_slots = 0;
@@ -900,6 +951,9 @@ struct moe_cache_session {
     double swap_host_ms_total = 0.0;
     std::chrono::steady_clock::time_point swap_issue_time;
     double swap_land_ms_total = 0.0;
+    // fork SWAPPOL: score-mode counts per count index (1/1024 route units) and their scale into routes.
+    std::vector<unsigned long long> swap_policy_counts;
+    float swap_count_scale = 1.0f;
     // Guarded by mu: startup restores must retain space for the not-yet-created helper.
     bool prompt_loaned = false;
     bool profile_load_attempted = false;
@@ -7879,6 +7933,17 @@ static bool moe_cache_swap_init(moe_cache_session & session) {
         session.swap_groups.clear();
     }
     session.swap_writes_cap = writes_cap;
+    if (g_swscore && g_hf_experts > 0) {
+        // fork SWAPPOL: score counts restart with swap_prev; the readback below orders after this on the same stream.
+        const size_t bytes = (size_t) MOE_SWST_LAYERS * g_hf_experts * sizeof(unsigned long long);
+        if (cudaMemsetAsync(g_swscore, 0, bytes, session.swap_streams[0]) != cudaSuccess) {
+            (void) cudaGetLastError();
+            moe_cache_swap_free(session);
+            return false;
+        }
+        memset(g_swscore_host, 0, bytes);
+        MOE_CACHE_LOG("[moe-cache] swap score: mode=%d (1 kept, 2 weight, 3 weight+kept, 4 count) skipw=%u/1024\n", moe_swap_score_mode(), moe_swap_skipw());
+    }
     session.swap_prev.assign(n, 0);
     session.swap_score.assign(n, 0.0f);
     int64_t prior_pct = 0;
@@ -7988,6 +8053,115 @@ static void moe_cache_swap_commit(moe_cache_session & session, bool ok, bool pub
         (void) cudaGetLastError();
         session.swap_broken = true;
     }
+}
+
+// fork SWAPPOL: swap payback per (layer, expert), host only (GGML_MOE_SWAP_STATS). One projection (kind 0) stands
+// for the expert; uses = routes counted for it between swap-in and eviction.
+struct moe_swtrack {
+    std::vector<long long> in_count;   // route count at swap-in; -1 when not resident through a tracked swap
+    std::vector<unsigned long long> in_scope, swap_in, swap_out, uses_evicted;
+    unsigned long long hist_uses[2][10] = {};   // [evicted, still resident at release] by use bucket
+    unsigned long long hist_life[10] = {};      // evicted, by rounds resident
+    unsigned long long evict_initial = 0, rounds = 0, updates = 0, slices = 0, bytes = 0;
+};
+static moe_swtrack g_swtrack;
+
+// 0, 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-128, 129+
+static int moe_swtrack_bucket(unsigned long long v) {
+    if (v <= 2) { return (int) v; }
+    int b = 3;
+    for (unsigned long long hi = 4; v > hi && b < 9; hi *= 2) { ++b; }
+    return b;
+}
+
+static void moe_swtrack_event(const moe_cache_session & session, const moe_cache_device_table & table, int32_t e, bool in) {
+    if (!g_swst || table.mj_kind != 0 || table.mj_layer < 0 || table.mj_layer >= MOE_SWST_LAYERS || e < 0 || e >= g_hf_experts) {
+        return;
+    }
+    auto & t = g_swtrack;
+    const size_t rows = (size_t) MOE_SWST_LAYERS * g_hf_experts;
+    if (t.in_count.size() != rows) {
+        t.in_count.assign(rows, -1);
+        for (auto * v : {&t.in_scope, &t.swap_in, &t.swap_out, &t.uses_evicted}) { v->assign(rows, 0); }
+    }
+    const size_t i = (size_t) table.mj_layer * g_hf_experts + e;
+    const long long now = session.swap_counts_host ? (long long) session.swap_counts_host[table.count_offset + e] : 0;
+    if (in) {
+        t.swap_in[i]++;
+        t.in_count[i] = now;
+        t.in_scope[i] = session.swap_scopes;
+        return;
+    }
+    t.swap_out[i]++;
+    if (t.in_count[i] < 0) {
+        t.evict_initial++;
+        return;
+    }
+    const unsigned long long uses = now > t.in_count[i] ? (unsigned long long) (now - t.in_count[i]) : 0;
+    t.uses_evicted[i] += uses;
+    t.hist_uses[0][moe_swtrack_bucket(uses)]++;
+    t.hist_life[moe_swtrack_bucket(session.swap_scopes - t.in_scope[i])]++;
+    t.in_count[i] = -1;
+}
+
+// Called at device release after its device sync: close the still-resident swaps, then rewrite the cumulative dump.
+static void moe_swtrack_dump(const moe_cache_session & session) {
+    const char * path = moe_swst_path();
+    if (!path || !g_swst || g_hf_experts <= 0) {
+        return;
+    }
+    auto & t = g_swtrack;
+    const size_t rows = (size_t) MOE_SWST_LAYERS * g_hf_experts;
+    if (t.in_count.size() == rows) {
+        for (const auto & entry : session.device_tables) {
+            const auto & table = entry.second;
+            if (table.mj_kind != 0 || table.mj_layer < 0 || table.mj_layer >= MOE_SWST_LAYERS || table.desc.n_expert != g_hf_experts) { continue; }
+            for (int32_t e = 0; e < table.desc.n_expert; ++e) {
+                const size_t i = (size_t) table.mj_layer * g_hf_experts + e;
+                if (t.in_count[i] < 0) { continue; }
+                const long long now = session.swap_counts_host ? (long long) session.swap_counts_host[table.count_offset + e] : t.in_count[i];
+                t.hist_uses[1][moe_swtrack_bucket(now > t.in_count[i] ? (unsigned long long) (now - t.in_count[i]) : 0)]++;
+                t.in_count[i] = -1;
+            }
+        }
+    }
+    t.rounds += session.swap_scopes;
+    t.updates += session.swap_updates;
+    t.slices += session.swap_total;
+    t.bytes += session.swap_bytes_total;
+    std::vector<unsigned long long> st(rows * MOE_SWST_COLS);
+    if (cudaMemcpy(st.data(), g_swst, st.size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        MOE_CACHE_LOG("[moe-cache] swap stats: device read failed; no dump\n");
+        return;
+    }
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        MOE_CACHE_LOG("[moe-cache] swap stats: cannot write %s\n", path);
+        return;
+    }
+    fprintf(f, "# swappol-stats v1 experts=%lld rounds=%llu updates=%llu slices=%llu bytes=%llu evict_initial=%llu score_mode=%d\n",
+            (long long) g_hf_experts, t.rounds, t.updates, t.slices, t.bytes, t.evict_initial, moe_swap_score_mode());
+    fprintf(f, "# use buckets: 0 1 2 3-4 5-8 9-16 17-32 33-64 65-128 129+\n");
+    const char * names[3] = {"hist_uses_evicted", "hist_uses_resident_at_end", "hist_rounds_evicted"};
+    for (int h = 0; h < 3; ++h) {
+        fprintf(f, "%s", names[h]);
+        for (int b = 0; b < 10; ++b) { fprintf(f, " %llu", h < 2 ? t.hist_uses[h][b] : t.hist_life[b]); }
+        fprintf(f, "\n");
+    }
+    fprintf(f, "layer expert r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 weight_x10240 skipped hit windows swap_in swap_out uses_evicted\n");
+    for (size_t i = 0; i < rows; ++i) {
+        const unsigned long long * row = st.data() + i * MOE_SWST_COLS;
+        const unsigned long long sin = t.swap_in.empty() ? 0 : t.swap_in[i], sout = t.swap_out.empty() ? 0 : t.swap_out[i];
+        bool any = sin || sout;
+        for (int c = 0; c < MOE_SWST_COLS; ++c) { any |= row[c] != 0; }
+        if (!any) { continue; }
+        fprintf(f, "%zu %zu", i / (size_t) g_hf_experts, i % (size_t) g_hf_experts);
+        for (int c = 0; c < MOE_SWST_COLS; ++c) { fprintf(f, " %llu", row[c]); }
+        fprintf(f, " %llu %llu %llu\n", sin, sout, t.uses_evicted.empty() ? 0ULL : t.uses_evicted[i]);
+    }
+    fclose(f);
+    MOE_CACHE_LOG("[moe-cache] swap stats: wrote %s (rounds=%llu slices=%llu)\n", path, t.rounds, t.slices);
 }
 
 static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session & session, size_t & n_cands) {
@@ -8112,7 +8286,8 @@ static std::vector<moe_swap_pair> moe_cache_swap_whole_pairs(moe_cache_session &
 static std::vector<moe_swap_pair> moe_cache_swap_plan(moe_cache_session & session, size_t & n_cands) {
     auto & device = *session.devices[0];
     const size_t n = session.swap_prev.size();
-    const unsigned long long * counts = session.swap_counts_host;
+    const unsigned long long * counts = session.swap_policy_counts.empty() ? session.swap_counts_host : session.swap_policy_counts.data();
+    const float scale = session.swap_policy_counts.empty() ? 1.0f : session.swap_count_scale;
     const float decay = session.swap_decay_after ? 1.0f : session.swap_decay;
     if (session.swap_profile_strength > 0) {
         for (const auto & entry : session.device_tables) {
@@ -8120,7 +8295,7 @@ static std::vector<moe_swap_pair> moe_cache_swap_plan(moe_cache_session & sessio
             long double recent_total = 0;
             for (int32_t e = 0; e < table.desc.n_expert; ++e) {
                 const size_t index = table.count_offset + e;
-                recent_total += counts[index] - session.swap_prev[index];
+                recent_total += (long double) (counts[index] - session.swap_prev[index]) * scale;
             }
             auto & table_ema = session.swap_profile_table_ema[table.desc.data];
             const bool calibrated = session.swap_profile_calibrated_tables.count(table.desc.data) != 0;
@@ -8132,7 +8307,7 @@ static std::vector<moe_swap_pair> moe_cache_swap_plan(moe_cache_session & sessio
                 (float) recent_total / (session.swap_decay < 1 ? 1 - session.swap_decay : 1);
             for (int32_t e = 0; e < table.desc.n_expert; ++e) {
                 const size_t index = table.count_offset + e;
-                const float recent = (float) (counts[index] - session.swap_prev[index]);
+                const float recent = (float) (counts[index] - session.swap_prev[index]) * scale;
                 session.swap_prev[index] = counts[index];
                 session.swap_observed_score[index] = session.swap_observed_score[index] * decay + recent;
                 float prior = session.swap_profile_rate[index] * table_ema * session.swap_profile_strength;
@@ -8149,7 +8324,7 @@ static std::vector<moe_swap_pair> moe_cache_swap_plan(moe_cache_session & sessio
         for (size_t i = 0; i < n; ++i) {
             const unsigned long long recent = counts[i] - session.swap_prev[i];
             session.swap_prev[i] = counts[i];
-            session.swap_score[i] = session.swap_score[i] * decay + (float)recent;
+            session.swap_score[i] = session.swap_score[i] * decay + (float)recent * scale;
         }
     }
     struct cand { float score; moe_cache_device_table * table; int32_t expert; };
@@ -8310,6 +8485,7 @@ static void moe_cache_swap_apply_decision(moe_cache_session & session, const std
                     continue; // keep a resident with no exact host fallback
                 }
                 old_table.addresses[old_expert] = old_table.fallback[old_expert];
+                moe_swtrack_event(session, old_table, old_expert, false);
                 moe_swap_push_address(writes, old_table, old_expert, old_table.fallback[old_expert]);
                 moe_cache_slot_reset(pool, p.slot, false);
                 device.evictions++;
@@ -8320,6 +8496,7 @@ static void moe_cache_swap_apply_decision(moe_cache_session & session, const std
             slot.state = moe_cache_slot_state::copying;
             slot.uses = (uint32_t)std::min(p.gain, 4.0e9f);
             pool.map[key] = p.slot;
+            moe_swtrack_event(session, *p.table, p.expert, true);
             session.swap_inflight.push_back({&pool, p.slot, p.table, p.expert, pool.slab + (size_t)p.slot * pool.expert_size});
             bytes += pool.expert_size;
         }
@@ -8393,6 +8570,8 @@ static std::unique_ptr<moe_cache_session> moe_cache_swap_snapshot(const moe_cach
     copy->swap_profile_seed = session.swap_profile_seed;
     copy->swap_profile_table_ema = session.swap_profile_table_ema;
     copy->swap_profile_calibrated_tables = session.swap_profile_calibrated_tables;
+    copy->swap_policy_counts = session.swap_policy_counts;
+    copy->swap_count_scale = session.swap_count_scale;
     copy->device_previous_counts.assign(session.swap_counts_host, session.swap_counts_host + session.swap_prev.size());
     copy->swap_counts_host = copy->device_previous_counts.data();
     if (copy->devices.empty()) { copy->devices.emplace_back(new moe_cache_device(0, 0)); }
@@ -8586,6 +8765,26 @@ bool ggml_cuda_moe_cache_swap_async_test() {
 }
 
 // Called with mu held after the last scope left; never waits for the card.
+// fork SWAPPOL: map the per (layer, expert) score readback onto count indices for the planner.
+static void moe_swap_fill_policy_counts(moe_cache_session & session) {
+    if (!g_swscore_host || g_hf_experts <= 0) {
+        session.swap_policy_counts.clear();
+        return;
+    }
+    session.swap_policy_counts.assign(session.swap_prev.size(), 0);
+    session.swap_count_scale = 1.0f / 1024.0f;
+    for (const auto & entry : session.device_tables) {
+        const auto & table = entry.second;
+        if (table.mj_layer < 0 || table.mj_layer >= MOE_SWST_LAYERS || table.desc.n_expert != g_hf_experts ||
+                table.count_offset + table.desc.n_expert > session.swap_policy_counts.size()) {
+            continue;
+        }
+        for (int32_t e = 0; e < table.desc.n_expert; ++e) {
+            session.swap_policy_counts[table.count_offset + e] = g_swscore_host[(size_t) table.mj_layer * g_hf_experts + e];
+        }
+    }
+}
+
 static void moe_cache_swap_step(moe_cache_session & session) {
     if (!session.device_expert_counts || session.devices.size() != 1 || session.swap_broken ||
             session.swap_n_streams.load(std::memory_order_acquire) == 0) {
@@ -8644,6 +8843,7 @@ static void moe_cache_swap_step(moe_cache_session & session) {
         if (q != cudaErrorNotReady) {
             session.swap_counts_pending = false;
             if (q == cudaSuccess) {
+                moe_swap_fill_policy_counts(session);
                 static const bool async = getenv("GGML_MOE_SWAP_ASYNC") && atoi(getenv("GGML_MOE_SWAP_ASYNC")) != 0;
                 if (async) {
                     try {
@@ -8675,6 +8875,8 @@ static void moe_cache_swap_step(moe_cache_session & session) {
         cudaStream_t main = session.swap_streams[0];
         if (cudaMemcpyAsync(session.swap_counts_host, session.device_expert_counts,
                     session.swap_prev.size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost, main) == cudaSuccess &&
+                (!g_swscore_host || cudaMemcpyAsync(g_swscore_host, g_swscore, (size_t) MOE_SWST_LAYERS * g_hf_experts *
+                    sizeof(unsigned long long), cudaMemcpyDeviceToHost, main) == cudaSuccess) &&
                 cudaEventRecord(session.swap_counts_event, main) == cudaSuccess) {
             session.swap_counts_pending = true;
         } else {
@@ -8690,6 +8892,7 @@ static void moe_cache_swap_release(moe_cache_session & session) {
         session.swap_decision = {};
     }
     session.swap_snapshot.reset();
+    moe_swtrack_dump(session);
     if (session.swap_updates || session.swap_commits) {
         MOE_CACHE_LOG("[moe-cache] swap totals: updates=%llu swaps=%llu bytes=%llu commits=%llu host_ms_total=%.3f land_ms_total=%.3f scopes=%llu async_plan_ms_total=%.3f\n",
                 (unsigned long long)session.swap_updates, (unsigned long long)session.swap_total,
@@ -9751,6 +9954,17 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
                 g_hf_experts = experts;
                 g_hf_slots = slots;
             }
+            const size_t sw_rows = (size_t) MOE_SWST_LAYERS * experts;
+            if (ok && moe_swst_path()) {
+                ok = cudaMalloc((void **) &g_swst, sw_rows * MOE_SWST_COLS * sizeof(unsigned long long)) == cudaSuccess &&
+                     cudaMemset(g_swst, 0, sw_rows * MOE_SWST_COLS * sizeof(unsigned long long)) == cudaSuccess;
+            }
+            if (ok && moe_swap_score_mode()) {
+                ok = cudaMalloc((void **) &g_swscore, sw_rows * sizeof(unsigned long long)) == cudaSuccess &&
+                     cudaMemset(g_swscore, 0, sw_rows * sizeof(unsigned long long)) == cudaSuccess &&
+                     cudaHostAlloc((void **) &g_swscore_host, sw_rows * sizeof(unsigned long long), cudaHostAllocPortable) == cudaSuccess;
+                if (ok) { memset(g_swscore_host, 0, sw_rows * sizeof(unsigned long long)); }
+            }
         }
         ok = ok && stride <= g_hf_stride && experts <= g_hf_experts && slots <= g_hf_slots;
         if (!ok) {
@@ -10579,7 +10793,8 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
         int stride, int width, int layer, int mode, float threshold, bool renorm, int rank_floor, int experts,
         const uint8_t * hot0, const uint8_t * hot1, const uint8_t * hot2,
         uint8_t * masks, int mask_stride, unsigned long long * counts,
-        moe_mass_record * trace, unsigned * trace_counts) {
+        moe_mass_record * trace, unsigned * trace_counts,
+        unsigned long long * swst, unsigned long long * swscore, int score_mode, unsigned skipw) {
     __shared__ unsigned char drop[80], hot[80];
     __shared__ int expert[80];
     __shared__ float scale[8];
@@ -10632,6 +10847,26 @@ static __global__ void moe_mass_kernel(const float * weights, float * out_weight
     for (int i = tid; i < routes; i += blockDim.x) {
         out_weights[i] = drop[i] ? 0.0f : (rescale[i / 10] ? weights[i] * scale[i / 10] : weights[i]);
     }
+    // fork SWAPPOL: statistics and swap scores from the drop decisions above (integer atomics: order-independent).
+    for (int i = tid; (swst || swscore) && i < routes; i += blockDim.x) {
+        const int e = expert[i];
+        if (e < 0 || e >= experts) { continue; }
+        const unsigned long long wfx = (unsigned long long) (fminf(fmaxf(weights[i], 0.0f), 1.0f) * 10240.0f + 0.5f);
+        if (swst) {
+            unsigned long long * row = swst + ((size_t) layer * experts + e) * MOE_SWST_COLS;
+            atomicAdd(row + i % 10, 1ULL);
+            atomicAdd(row + 10, wfx);
+            if (drop[i]) { atomicAdd(row + 11, 1ULL); }
+            if (hot[i] == 7) { atomicAdd(row + 12, 1ULL); }
+            bool first = true;
+            for (int j = 0; j < i; ++j) { first &= expert[j] != e; }
+            if (first) { atomicAdd(row + 13, 1ULL); }
+        }
+        if (swscore) {
+            const unsigned long long v = (score_mode & 2 ? wfx : 1024ULL) * (drop[i] ? skipw : 1024u) / 1024u;
+            if (v) { atomicAdd(swscore + (size_t) layer * experts + e, v); }
+        }
+    }
     if (!mode) { return; }
     for (int token = tid; counts && token < width; token += blockDim.x) {
         int left = 0;
@@ -10675,7 +10910,7 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     const float threshold = session.skip_threshold;
     GGML_ASSERT(!mode || ggml_moe_skipmass_budget_valid(mode, threshold));
     const bool active = mode && session.skip_mass;
-    if (!active && !session.mass_trace) {
+    if (!active && !session.mass_trace && !g_swst && !g_swscore) {
         // fork: exact evaluation needs no route selection or residency reads.
         CUDA_CHECK(cudaMemcpyAsync(op->data, op->src[0]->data, ggml_nbytes(op), cudaMemcpyDeviceToDevice, ctx.stream()));
         session.mass_layer = -1;
@@ -10692,7 +10927,8 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     moe_mass_kernel<<<1, 256, 0, ctx.stream()>>>((const float *) op->src[0]->data, (float *) op->data,
         (const int32_t *) op->src[1]->data, (int) (op->src[1]->nb[1] / sizeof(int32_t)), (int) op->ne[2],
         layer, active ? mode : 0, threshold, renorm, session.skip_rank_floor, experts, group[0]->hot, group[1]->hot, group[2]->hot,
-        g_tail_mask, g_hf_experts, g_tail_counts, (moe_mass_record *) session.mass_trace, session.mass_trace_counts);
+        g_tail_mask, g_hf_experts, g_tail_counts, (moe_mass_record *) session.mass_trace, session.mass_trace_counts,
+        experts == g_hf_experts ? g_swst : nullptr, experts == g_hf_experts ? g_swscore : nullptr, moe_swap_score_mode(), moe_swap_skipw());
     CUDA_CHECK(cudaGetLastError());
     session.mass_layer = active ? layer : -1;
     session.mass_ids = op->src[1]->data;
