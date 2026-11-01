@@ -11823,6 +11823,10 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
         const bool ai = ggml_ai4_is_unit(wtype);
         GGML_ASSERT(!ai || !bank);
         auto ai_pass = [&](const void * const * tbl, float * out, const uint8_t * filter, int filter_val) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                fprintf(stderr, "[moe-cache-ai] first cached AI+ slot GEMV: type=%d filter=%d\n", (int) wtype, filter_val);
+            }
             const bool ok = ggml_cuda_moe_ai_table_mmv(tbl, wtype, quantized, (const int32_t *) ids->data, out,
                     a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids_stride, (int) table.desc.n_expert,
                     filter, filter_val, ctx.stream());
@@ -12144,6 +12148,11 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 if (ai) {
                     const ggml_type wtype = (ggml_type) up_table.desc.type;
                     const int64_t n = ggml_nelements(glu);
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true)) {
+                        fprintf(stderr, "[moe-cache-ai] first cached AI+ paired gate/up launch: type=%d tokens=%lld glu=%d\n",
+                                (int) wtype, (long long) ids->ne[1], (int) moe_ai_pair_glu_enabled());
+                    }
                     ggml_cuda_pool_alloc<float> up_out(ctx.pool(), n);
                     ggml_cuda_pool_alloc<float> gate_out(ctx.pool(), n);
                     const bool fglu = moe_ai_pair_glu_enabled() &&

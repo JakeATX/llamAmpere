@@ -44,6 +44,18 @@
 #include <immintrin.h>
 #endif
 
+// fork AIPFIX: one line the first time the host computes an AI+ unit expert, with the decode path it takes
+static void moe_ai_log_first(const char * role) {
+    static std::atomic<bool> logged{false};
+    if (logged.exchange(true)) { return; }
+#if defined(__AVX2__) && defined(__FMA__)
+    const char * isa = moe_ai::has_avx512() ? "avx512" : "avx2";
+#else
+    const char * isa = "scalar";
+#endif
+    fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s\n", role, isa);
+}
+
 namespace {
 
 // Acquire load of an expert address the card side publishes. MSVC has no __atomic builtins; a volatile read there is
@@ -608,6 +620,7 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
         const size_t xg = L.shared_input ? 0 : (size_t) MOE_CS_MAX_ROUTES;
         if (up.ai) {
             // fork AIPFIX D2: 16-row AI+ slabs, up to 8 tokens per slab decode
+            moe_ai_log_first("gate/up");
             const char * wu = role_row(s, up, e, 0);
             const char * wg = role_row(s, gate, e, 0);
             for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 8) {
@@ -719,6 +732,7 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
     const int e = s.expert[i];
     if (down.ai) {
         // fork AIPFIX D2: 16-row AI+ slabs of the rotated hidden rows
+        moe_ai_log_first("down");
         const char * w = role_row(s, down, e, 0);
         for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 8) {
             const int nt = std::min(8, s.first[i + 1] - q0);
