@@ -8,6 +8,7 @@
 #include "../ggml-ai4.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(__AVX2__)
@@ -90,8 +91,12 @@ static inline float hsum8(__m256 v) {
 #define MOE_AI_T512 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma,f16c")))
 
 static bool has_avx512() {
-    static const bool on = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-                           __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq");
+    // GGML_MOE_AI_HOST_AVX512=0 forces the AVX2 path (default 1: AVX-512 whenever the CPU has it)
+    static const bool on = [] {
+        const char * e = getenv("GGML_MOE_AI_HOST_AVX512");
+        return !(e && e[0] == '0') && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+               __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq");
+    }();
     return on;
 }
 
