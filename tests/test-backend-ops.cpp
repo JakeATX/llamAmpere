@@ -19405,6 +19405,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // Widths below SPW at the production gate/up bases (unique and repeated routes), plus the cold Q2_0 down.
+    for (int width : { 1, 2, 3 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U }) {
+            const bool ai3 = bank == GGML_TYPE_AIT3_U;
+            for (ggml_type base : { ai3 ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XXS, ai3 ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ2_XS,
+                                    ai3 ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL }) {
+                for (int channels : { 1, 4 }) {
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, base, 2, channels, 2560, 640));
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, base, 2, channels, 2560, 640, true));
+                }
+            }
+            test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, GGML_TYPE_Q2_0, 2, 4, 640, 2560));
+        }
+    }
     // Production top-k10 crosses ballot chunks at both 32 and 64 routes.
     for (int width : { 5, 8 }) {
         for (int channels : { 1, 10 }) {
