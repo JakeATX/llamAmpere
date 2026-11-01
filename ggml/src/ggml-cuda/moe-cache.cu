@@ -12041,15 +12041,27 @@ static void moe_onepath_bank_pair(ggml_backend_cuda_context & ctx, const moe_cac
                 ids->ne[0], ids->ne[1], a->ne[1], ids_stride, (int) t.desc.n_expert, t.ai_bank_flag, 1, ctx.stream(),
                 t2, out2, f2, g);
     };
-    if (ut == gt && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(), gate_table.ai_bank_flag,
+    // f3m: the fused SwiGLU was wrong for every bank route of the 100K config (AIKERN grouped paired launch). Its
+    // per-slab arrival counters are cleared by the filter-0 pass that follows a filter-1 pass in the cached AI+ path,
+    // and the one path runs the filter-1 pass alone. The default pairs the projections and runs the SwiGLU after;
+    // LLAMA_MOE_BANK_ONEPATH_GLU=1 keeps the fused epilogue (diagnostic).
+    static const bool fused = [] {
+        const char * v = getenv("LLAMA_MOE_BANK_ONEPATH_GLU");
+        return v && atoi(v) != 0;
+    }();
+    if (ut == gt && fused && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(), gate_table.ai_bank_flag,
             (float *) glu->data)) {
         moe_onepath_log((int) ut, "paired gate/up+SwiGLU");
         moe_onepath_check(ctx, up_table, &gate_table, a, ids, (const float *) glu->data, M, "pair-pass");
         return;
     }
-    moe_onepath_log((int) ut, "gate/up (two launches)");
-    GGML_ASSERT(run(up_table, ut, up_out.get(), nullptr, nullptr, nullptr, nullptr));
-    GGML_ASSERT(run(gate_table, gt, gate_out.get(), nullptr, nullptr, nullptr, nullptr));
+    if (ut == gt && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(), gate_table.ai_bank_flag, nullptr)) {
+        moe_onepath_log((int) ut, "paired gate/up, SwiGLU after");
+    } else {
+        moe_onepath_log((int) ut, "gate/up (two launches)");
+        GGML_ASSERT(run(up_table, ut, up_out.get(), nullptr, nullptr, nullptr, nullptr));
+        GGML_ASSERT(run(gate_table, gt, gate_out.get(), nullptr, nullptr, nullptr, nullptr));
+    }
     moe_onepath_swiglu<<<(n + 255)/256, 256, 0, ctx.stream()>>>(gate_out.get(), up_out.get(), (float *) glu->data,
             (const int32_t *) ids->data, up_table.ai_bank_flag, (int) M, (int) ids->ne[0], ids_stride, n);
     CUDA_CHECK(cudaGetLastError());
