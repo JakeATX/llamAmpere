@@ -268,18 +268,27 @@ static __device__ __forceinline__ void a_regs_smem_kr(const uint32_t * __restric
 // AIT2P_U pair table: the 1024 entries of ait2p_tab as u16 (low byte = even weight), 2 KB of static shared memory per
 // block that decodes the pair layout. Pair window w = the 20 stream bits ending at the pair's last bit (any read whose
 // low 20 bits are the window); entry = ((w (w + 1)) >> 10) & 1023, byte address = 2 entry.
-static __device__ __align__(16) const int8_t pair_tab_g[2048] = AIT2P_TAB_INIT;
+// 32 identical copies in global memory: blocks of one wave all read the table at the same instant, so each block reads
+// copy (linear block id & 31) to spread those reads over different L2 lines.
+#define PAIR_TAB_COPIES 32
+static __device__ __align__(16) const int8_t pair_tab_g[PAIR_TAB_COPIES][2048] = {
+#define PT1 AIT2P_TAB_INIT
+    PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1,
+    PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1, PT1 };
+static __device__ __forceinline__ const int8_t * pair_tab_src() {
+    return pair_tab_g[(blockIdx.x + blockIdx.y*gridDim.x) & (PAIR_TAB_COPIES - 1)];
+}
 static __shared__ __align__(16) uint32_t pair_tab_s[512];
 static __device__ __forceinline__ void pair_tab_fill(int tid, int nthreads) {
     for (int i = tid; i < 512; i += nthreads) {
-        pair_tab_s[i] = ((const uint32_t *) pair_tab_g)[i];
+        pair_tab_s[i] = ((const uint32_t *) pair_tab_src())[i];
     }
 }
 // Same table via cp.async (128 x 16 B): issued before the first weight stages so the copy overlaps their latency; visible
 // after cp_async_wait of the issuing group plus a block barrier.
 static __device__ __forceinline__ void pair_tab_async(int tid, int nthreads) {
     for (int i = tid; i < 128; i += nthreads) {
-        cp_async16((uint8_t *) pair_tab_s + i*16, (const uint8_t *) pair_tab_g + i*16, true);
+        cp_async16((uint8_t *) pair_tab_s + i*16, (const uint8_t *) pair_tab_src() + i*16, true);
     }
 }
 static __device__ __forceinline__ uint32_t pair_lv(const uint32_t w) {
