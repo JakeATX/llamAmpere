@@ -17,6 +17,7 @@
 #define GGML_COMMON_IMPL_CPP   // the IQ grids, for the AVX-512 dot loops below
 #include "../ggml-common.h"
 #include "moe-iq-rows.h"
+#include "moe-ai-rows.h"
 #include "../ggml-cpu/quants.h"
 #include "../ggml-cpu/vec.h"
 
@@ -427,6 +428,9 @@ bool cpu_has_avx512_vnni() {
 struct role_math {
     moe_cs_role r;
     ggml_vec_dot_t dot = nullptr;
+    bool ai = false;            // fork AIPFIX D2: AI+ unit expert (moe_ai::slab_rows on rotated f32 inputs)
+    int ai_k = 0;
+    uint32_t ai_C = 0;
     bool q2 = false;            // dot_q2_0_q8_0 instead of ggml's kernel
     ggml_type vec_type = GGML_TYPE_COUNT;
     ggml_from_float_t quant = nullptr;
@@ -602,6 +606,40 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
         const int64_t r0 = (int64_t) (item % blocks) * s.rows_ug, r1 = std::min<int64_t>(r0 + s.rows_ug, up.r.n_out);
         const int e = s.expert[i];
         const size_t xg = L.shared_input ? 0 : (size_t) MOE_CS_MAX_ROUTES;
+        if (up.ai) {
+            // fork AIPFIX D2: 16-row AI+ slabs, up to 8 tokens per slab decode
+            const char * wu = role_row(s, up, e, 0);
+            const char * wg = role_row(s, gate, e, 0);
+            for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 8) {
+                const int nt = std::min(8, s.first[i + 1] - q0);
+                const float * yu[8];
+                const float * yg[8];
+                for (int t = 0; t < nt; ++t) {
+                    const int q = s.input_of[q0 + t];
+                    yu[t] = (const float *) (xq + (size_t) q * s.xq_stride);
+                    yg[t] = (const float *) (xq + (xg + q) * s.xq_stride);
+                }
+                for (int64_t a = r0; a < r1; a += AI4_TR) {
+                    const int64_t b = std::min<int64_t>(a + AI4_TR, r1);
+                    float ub[8][AI4_TR] = {}, gb[8][AI4_TR] = {};
+                    float * uo[8], * go[8];
+                    for (int t = 0; t < nt; ++t) { uo[t] = ub[t]; go[t] = gb[t]; }
+                    if (wu && wg) {
+                        moe_ai::slab_rows(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, yu, uo);
+                        moe_ai::slab_rows(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, yg, go);
+                    }
+                    for (int t = 0; t < nt; ++t) {
+                        float * h = s.hidden.data() + (size_t) (q0 + t) * s.max_ff + a;
+                        for (int64_t row = a; row < b; ++row) {
+                            const float u = ub[t][row - a], g = gb[t][row - a];
+                            h[row - a] = g / (1.0f + expf(-g)) * u;
+                        }
+                    }
+                }
+            }
+            if (!wu || !wg) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
+            return;
+        }
 #if defined(MOE_IQ_ROWS)
         if (up.rows[4] && gate.rows[4]) {
             // Decode once for each token group; AVX-512 uses a different valid float reduction order.
@@ -679,6 +717,31 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
     const int i = item / blocks;
     const int64_t r0 = (int64_t) (item % blocks) * s.rows_down, r1 = std::min<int64_t>(r0 + s.rows_down, down.r.n_out);
     const int e = s.expert[i];
+    if (down.ai) {
+        // fork AIPFIX D2: 16-row AI+ slabs of the rotated hidden rows
+        const char * w = role_row(s, down, e, 0);
+        for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 8) {
+            const int nt = std::min(8, s.first[i + 1] - q0);
+            const float * y[8];
+            float * o[8];
+            for (int t = 0; t < nt; ++t) {
+                y[t] = (const float *) (s.hq.data() + (size_t) (q0 + t) * s.hq_stride);
+                o[t] = s.out + (size_t) (q0 + t) * s.out_stride;
+            }
+            for (int64_t a = r0; a < r1; a += AI4_TR) {
+                const int64_t b = std::min<int64_t>(a + AI4_TR, r1);
+                float * oa[8];
+                for (int t = 0; t < nt; ++t) { oa[t] = o[t] + a; }
+                if (w) {
+                    moe_ai::slab_rows(w, down.r.row_bytes, down.ai_k, down.ai_C, a, b, down.r.n_in, nt, y, oa);
+                } else {
+                    for (int t = 0; t < nt; ++t) { for (int64_t row = a; row < b; ++row) { oa[t][row - a] = 0.0f; } }
+                }
+            }
+        }
+        if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
+        return;
+    }
     if (s.q2_fast && down.q2) {
         const char * w = role_row(s, down, e, r0);
         for (int q = s.first[i]; q < s.first[i + 1];) {
@@ -1397,6 +1460,18 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
         ok = m.r.src != nullptr && m.r.type >= 0 && m.r.type < GGML_TYPE_COUNT;
         if (!ok) { break; }
         const ggml_type t = (ggml_type) m.r.type;
+        if (ggml_ai4_is_unit(t)) {
+            // fork AIPFIX D2: AI+ unit experts; inputs are rotated into the weights' basis instead of quantized
+            m.ai = true;
+            m.ai_k = ggml_ai4_rate(t);
+            m.ai_C = ggml_ai4_trellis_mul(t);
+            m.vec_type = GGML_TYPE_F32;
+            m.quant = moe_ai::rotate;
+            m.vec_bytes = (size_t) m.r.n_in * sizeof(float);
+            ok = m.ai_k >= 2 && m.ai_k <= 5 && m.r.n_in % AI4U_UK == 0 && m.r.n_out % AI4_TR == 0 &&
+                 m.r.row_bytes == ggml_row_size(t, m.r.n_in) && s.rows_ug % AI4_TR == 0 && s.rows_down % AI4_TR == 0;
+            continue;
+        }
         const auto * tr = ggml_get_type_traits_cpu(t);
         ok = tr && tr->vec_dot && m.r.n_in % ggml_blck_size(t) == 0 && m.r.row_bytes == ggml_row_size(t, m.r.n_in);
         if (!ok) { break; }
@@ -1426,6 +1501,7 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
              (!m.q2 || m.vec_type == GGML_TYPE_Q8_0);
         m.vec_bytes = ok ? ggml_row_size(m.vec_type, m.r.n_in) : 0;
     }
+    ok = ok && L.role[0].ai == L.role[1].ai;
     L.ok = ok;
     L.shared_input = ok && L.role[0].vec_type == L.role[1].vec_type;
     if ((int) s.layers.size() <= layer) { s.layers.resize(layer + 1); }
