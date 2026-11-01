@@ -19808,6 +19808,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [AIPTAB] mixed-bank hot expert launches at the Flash-Next shapes, AIT2_U vs AIT2P_U: GGML_TEST_AIPTAB_PERF=1
+    if (getenv("GGML_TEST_AIPTAB_PERF") != nullptr) {
+        for (int width : { 1, 3, 5 }) {
+            for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U }) {
+                test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ2_XXS, width, 1, 1, false, false, 2560, 640, 8));
+                test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_Q2_0, width, 1, 1, false, false, 640, 2560, 8));
+            }
+        }
+        return test_cases;
+    }
     // [PFGAP-U3] Flash-Next non-routed prompt matmuls (attention, GDN output, shared expert): GGML_TEST_FN_DENSE_PERF=1
     if (getenv("GGML_TEST_FN_DENSE_PERF") != nullptr) {
         add_fn_dense_cases(test_cases);

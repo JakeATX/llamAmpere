@@ -275,6 +275,13 @@ static __device__ __forceinline__ void pair_tab_fill(int tid, int nthreads) {
         pair_tab_s[i] = ((const uint32_t *) pair_tab_g)[i];
     }
 }
+// Same table via cp.async (128 x 16 B): issued before the first weight stages so the copy overlaps their latency; visible
+// after cp_async_wait of the issuing group plus a block barrier.
+static __device__ __forceinline__ void pair_tab_async(int tid, int nthreads) {
+    for (int i = tid; i < 128; i += nthreads) {
+        cp_async16((uint8_t *) pair_tab_s + i*16, (const uint8_t *) pair_tab_g + i*16, true);
+    }
+}
 static __device__ __forceinline__ uint32_t pair_lv(const uint32_t w) {
     const uint32_t h = w*w + w;
     return *(const uint16_t *) ((const uint8_t *) pair_tab_s + ((h >> 9) & 0x7FEu));
@@ -1048,12 +1055,11 @@ static __device__ __forceinline__ void mmvr_body(
     const int bxi = bx >= 0 ? bx : (int) blockIdx.x;
     // slab_ov >= 0: the caller picks this warp's slab (paired-warp launches give two warps one slab).
     const int slab = SPW ? (slab_ov >= 0 ? slab_ov : bxi*WARPS + warp) : bxi;
-    if constexpr (lay_pair<LAY>()) {
-        pair_tab_fill(threadIdx.x, WARPS*32);   // before any early return
-        __syncthreads();
-    }
+    // Pair layouts: slabs past M keep running the table copy and its barrier (no work), so the block barrier is uniform.
+    bool dead = false;
     if constexpr (SPW) {
-        if (slab >= M/16) {
+        dead = slab >= M/16;
+        if (dead && !lay_pair<LAY>()) {
             return;
         }
     }
@@ -1131,7 +1137,7 @@ static __device__ __forceinline__ void mmvr_body(
     // Split boundaries are whole chunk pairs per warp.
     const int group_begin = SPLITS > 1 ? ((KT/(RQ4_CHUNK*WARPS*2))*(int) blockIdx.z/SPLITS)*2 : 0;
     const int group_end = SPLITS > 1 ? ((KT/(RQ4_CHUNK*WARPS*2))*((int) blockIdx.z + 1)/SPLITS)*2 : 0;
-    const int nmy = SPW ? nk : SPLITS > 1 ? group_end - group_begin :
+    const int nmy = SPW ? (dead ? 0 : nk) : SPLITS > 1 ? group_end - group_begin :
                    KT > 0 && (KT/RQ4_CHUNK) % WARPS == 0 ? KT/(RQ4_CHUNK*WARPS) :
                    KT > 0 ? KT/(RQ4_CHUNK*WARPS) + (warp < (KT/RQ4_CHUNK) % WARPS) :
                             (nk - warp + WARPS - 1)/WARPS;
@@ -1245,6 +1251,9 @@ static __device__ __forceinline__ void mmvr_body(
         }
     };
 
+    if constexpr (lay_pair<LAY>()) {
+        pair_tab_async(threadIdx.x, WARPS*32);   // first commit group with stage 0
+    }
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < nmy) {
@@ -1256,6 +1265,13 @@ static __device__ __forceinline__ void mmvr_body(
     float da = 0.0f, db = 0.0f;
     if (nmy > 0) {
         ldx(xr, 0, xa, da);
+    }
+    if constexpr (lay_pair<LAY>()) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (dead) {
+            return;
+        }
     }
 
     // The short five-chunk down projection has a known maximum trip count even when warps have unequal tails.
