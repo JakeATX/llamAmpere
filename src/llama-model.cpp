@@ -2562,6 +2562,7 @@ void llama_model::register_moe_bank() {
         }
         const int32_t n_expert = (int32_t) any->ne[2];
         std::vector<uint8_t> in_bank;
+        std::vector<int32_t> bank_slot;
         const ggml_tensor * map = layer.ffn_exps_hot_map;
         // the graph runs a bank smaller than 2 x n_expert_used on the regular tensors alone (llama-graph.cpp)
         if (!hot_dbg && map && map->type == GGML_TYPE_F32 && ggml_nelements(map) == n_expert && layer.ffn_down_exps_hot &&
@@ -2569,10 +2570,12 @@ void llama_model::register_moe_bank() {
             std::vector<float> slot(n_expert);
             ggml_backend_tensor_get(map, slot.data(), 0, n_expert * sizeof(float));
             in_bank.resize(n_expert);
+            bank_slot.assign(n_expert, -1);
             size_t n = 0;
             for (int32_t e = 0; e < n_expert; ++e) {
                 in_bank[e] = slot[e] >= 0.0f;
                 n += in_bank[e];
+                bank_slot[e] = in_bank[e] ? (int32_t) slot[e] : -1;
             }
             if (n > 0) {
                 n_bank_layers++;
@@ -2584,10 +2587,19 @@ void llama_model::register_moe_bank() {
                 in_bank.clear();
             }
         }
-        for (ggml_tensor * t : regular) {
+        // fork AIPFIX ONEPATH: the expert cache also learns where each bank expert's rows are (device bank tensors)
+        ggml_tensor * hot[] = { layer.ffn_up_exps_hot, layer.ffn_gate_exps_hot, layer.ffn_down_exps_hot, nullptr };
+        for (int k = 0; k < 4; ++k) {
+            ggml_tensor * t = regular[k];
             if (t && t->data && t->ne[2] == n_expert) {
                 ggml_moe_bank_register(t->data, il, n_expert, in_bank.empty() ? nullptr : in_bank.data());
                 moe_bank_registered.push_back(t->data);
+                if (!in_bank.empty() && hot[k] && hot[k]->data && hot[k]->buffer &&
+                        !ggml_backend_buffer_is_host(hot[k]->buffer) &&
+                        hot[k]->ne[0] == t->ne[0] && hot[k]->ne[1] == t->ne[1] &&
+                        *std::max_element(bank_slot.begin(), bank_slot.end()) < hot[k]->ne[2]) {
+                    ggml_moe_bank_register_rows(t->data, hot[k]->data, hot[k]->type, hot[k]->nb[2], bank_slot.data());
+                }
             }
         }
     }

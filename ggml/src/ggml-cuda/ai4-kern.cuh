@@ -30,6 +30,7 @@
 #pragma once
 
 #include "rq4.cuh"
+#include "unary.cuh"
 #include "../ggml-ait.h"
 
 #include <algorithm>
@@ -66,7 +67,34 @@ struct idmap {
     int direct_n_used = 0, direct_ne11 = 0, direct_n_expert = 0;
     const float * direct_x = nullptr;
     bool direct_zero = false;
+    // fork AIPFIX D (direct ids only): expert e's weights at table[e] (expert-cache slots) instead of W + e*nb02;
+    // with a filter, blocks whose expert has filter[e] != filter_val write nothing (cache hit / miss passes)
+    const void * const * table = nullptr;
+    const uint8_t * filter = nullptr;
+    int filter_val = 0;
+    // fork AIPFIX D4 (direct ids + table only): a second projection (gate beside up) in the upper half of grid x,
+    // its own slot table, filter and output
+    const void * const * table2 = nullptr;
+    const uint8_t * filter2 = nullptr;
+    float * y2 = nullptr;
+    // fork AIPFIX D6 (with table2): fused SwiGLU. glu[o] = silu(glu_gate[o]) * glu_up[o] for each 16-row slice once
+    // both projections of its route are stored. glu_prev / glu_prev2 = the earlier (hit) pass's filters of the table /
+    // table2 projection (val 1), nullptr in the hit pass itself. mmvr resolves glu_pfilter / glu_prev to the partner's.
+    float * glu = nullptr;
+    const float * glu_up = nullptr;
+    const float * glu_gate = nullptr;
+    const uint8_t * glu_prev = nullptr;
+    const uint8_t * glu_prev2 = nullptr;
+    const uint8_t * glu_pfilter = nullptr;
 };
+
+// fork AIPFIX D6: arrivals per (route column, 16-row slice) when both projections of a route are stored by the same
+// launch; the second arrival writes the slice and resets it to 0. Hit passes (filter_val 1) count in bank 0, miss
+// passes in bank 1, and every block clears its tile in the other bank, so a launch whose filters changed under it
+// (one partner counted, the other did not) leaves nothing for the next one: the miss pass that always follows a hit
+// pass clears bank 0 over the same routes, and each hit pass clears bank 1 before its miss pass.
+static constexpr int GLU_PAIR_TILES = 65536;
+static __device__ unsigned int g_ai4k_glu_count[2*GLU_PAIR_TILES];
 
 using rq4::cp_async16;
 using rq4::cp_async4;
@@ -996,7 +1024,7 @@ template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int 
 static __device__ __forceinline__ void mmvr_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
         float * __restrict__ Y, int64_t ldy, int M, int N, int Kr, const idmap idm,
-        const mmvr_group * group = nullptr, int bx = -1) {
+        const mmvr_group * group = nullptr, int bx = -1, int slab_ov = -1) {
     static_assert(!SINGLE_N || !ID || DIRECT, "single-column dense or direct scope");
     constexpr int KR = lay_rate<LAY>();
     static_assert(SPLITS == 1 || (!ID && WARPS == 4 && (KT == 5120 || KT == 17408)), "small split scope");
@@ -1018,7 +1046,8 @@ static __device__ __forceinline__ void mmvr_body(
     const int g = lane >> 2, t = lane & 3;
     // bx overrides the slab block index (paired launches stack two projections along x).
     const int bxi = bx >= 0 ? bx : (int) blockIdx.x;
-    const int slab = SPW ? bxi*WARPS + warp : bxi;
+    // slab_ov >= 0: the caller picks this warp's slab (paired-warp launches give two warps one slab).
+    const int slab = SPW ? (slab_ov >= 0 ? slab_ov : bxi*WARPS + warp) : bxi;
     if constexpr (lay_pair<LAY>()) {
         pair_tab_fill(threadIdx.x, WARPS*32);   // before any early return
         __syncthreads();
@@ -1028,11 +1057,18 @@ static __device__ __forceinline__ void mmvr_body(
             return;
         }
     }
+    if constexpr (DIRECT && !GROUPED) {
+        if (idm.glu && (SPW ? lane == 0 : threadIdx.x == 0)) {
+            const int64_t col = (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
+            g_ai4k_glu_count[(idm.filter_val ? GLU_PAIR_TILES : 0) + col*(M/16) + slab] = 0;
+        }
+    }
     const int nk = K/RQ4_CHUNK;
     const int XSN = K >> (7 + XSH);
     const int * prow = nullptr;
     const int * pcol = nullptr;
     int direct_row = 0;
+    int direct_e = -1;
     if constexpr (DIRECT) {
         static_assert(ID, "mmvr direct ids");
         const int u = blockIdx.y;
@@ -1047,7 +1083,11 @@ static __device__ __forceinline__ void mmvr_body(
             }
             return;
         }
-        W += (int64_t) e*idm.nb02;
+        if (idm.filter && idm.filter[e] != idm.filter_val) {
+            return;
+        }
+        direct_e = e;
+        W = idm.table ? (const uint8_t *) idm.table[e] : W + (int64_t) e*idm.nb02;
         direct_row = tok*idm.direct_ne11 + (idm.direct_ne11 == 1 ? 0 : u);
         if constexpr (GROUPED) {
             N = group->n;
@@ -1311,6 +1351,37 @@ static __device__ __forceinline__ void mmvr_body(
             }
         }
     }
+    if constexpr (DIRECT) {
+        // fork AIPFIX D6: the warp that stored this slab finishes the route's SwiGLU slice when its partner
+        // projection is stored too: in this launch (count, second arrival writes) or by the earlier hit pass.
+        // D7: a grouped block does this for each of its columns.
+        if (idm.glu && (SPW || warp == 0)) {
+            __threadfence();
+            __syncwarp();
+          for (int k = 0; k < (GROUPED ? N : 1); ++k) {
+            const int64_t col = GROUPED ? (int64_t) pcol[k] : (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
+            int go = 0;
+            if (lane == 0) {
+                if (!idm.glu_pfilter || idm.glu_pfilter[direct_e] == idm.filter_val) {
+                    unsigned int * count = &g_ai4k_glu_count[(idm.filter_val ? 0 : GLU_PAIR_TILES) + col*(M/16) + slab];
+                    if (atomicAdd(count, 1u) == 1u) {
+                        *count = 0;
+                        __threadfence();    // acquire side: the partner fenced its stores before its arrival
+                        go = 1;
+                    }
+                } else if (idm.glu_prev && idm.glu_prev[direct_e] == 1) {
+                    go = 1;
+                }
+            }
+            go = __shfl_sync(0xffffffff, go, 0);
+            __syncwarp();
+            if (go && lane < 16) {
+                const int64_t o = col*ldy + slab*16 + lane;
+                idm.glu[o] = ggml_cuda_op_silu_single(__ldcg(idm.glu_gate + o)) * __ldcg(idm.glu_up + o);
+            }
+          }
+        }
+    }
     (void) M;
 }
 
@@ -1318,6 +1389,20 @@ template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int 
 static __global__ void __launch_bounds__(WARPS*32, MINB) mmvr(
         const uint8_t * W, const int8_t * Xq, const float * Xs,
         float * Y, int64_t ldy, int M, int N, int K, const idmap idm) {
+    if constexpr (DIRECT) {
+        if (idm.table2) {
+            const int half = (int) gridDim.x/2;
+            const bool second = (int) blockIdx.x >= half;
+            idmap m = idm;
+            m.table = second ? idm.table2 : idm.table;
+            m.filter = second ? idm.filter2 : idm.filter;
+            m.glu_pfilter = second ? idm.filter : idm.filter2;
+            m.glu_prev = second ? idm.glu_prev : idm.glu_prev2;
+            mmvr_body<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>(
+                    W, Xq, Xs, second ? idm.y2 : Y, ldy, M, N, K, m, nullptr, (int) blockIdx.x - (second ? half : 0));
+            return;
+        }
+    }
     mmvr_body<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, SPLITS, LOOP_UNROLL, SINGLE_N, SPW>(W, Xq, Xs, Y, ldy, M, N, K, idm);
 }
 
@@ -1333,7 +1418,8 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
         attr_set[dev & 63] = true;
     }
     // Direct routing has one slot and token per block; separate dimensions avoid device-side integer division.
-    const dim3 grid(SPW ? (M/16 + WARPS - 1)/WARPS : M/16, DIRECT ? idm.direct_n_used : ID ? max_experts : 1,
+    const dim3 grid((SPW ? (M/16 + WARPS - 1)/WARPS : M/16)*(DIRECT && idm.table2 ? 2 : 1),
+                    DIRECT ? idm.direct_n_used : ID ? max_experts : 1,
                     DIRECT ? max_experts/idm.direct_n_used : SPLITS);
     static const bool report = getenv("GGML_CUDA_AI23_RESOURCE") && atoi(getenv("GGML_CUDA_AI23_RESOURCE"));
     static bool reported[64] = {};

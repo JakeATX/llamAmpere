@@ -2638,6 +2638,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (moe_hot.hot_map != nullptr && moe_hot.down->ne[2] < 2*n_expert_used) {
         moe_hot = {};
     }
+    // fork AIPFIX ONEPATH (LLAMA_MOE_BANK_ONEPATH=1): decode-size batches run a banked layer as a plain layer. The expert
+    // cache already holds the bank experts as zero-weight entries; it computes their routes from the bank rows itself
+    // (moe-cache.cu, AI+ table GEMV), so no routing split, mask or merge nodes. Only batches the cache takes (at most
+    // 64 routed rows, moe_cache_node_rows_max) qualify: past it the stock call would read the dropped bank rows.
+    // Larger batches keep the bank graph. Prompt ubatches (not every token an output) and every B1 phase keep it too:
+    // the scheduler runs those on the CPU path, which reads the dropped host rows of the bank experts.
+    static const bool onepath = [] {
+        const char * value = getenv("LLAMA_MOE_BANK_ONEPATH");
+        return value && atoi(value) != 0;
+    }();
+    auto ai_unit = [](const ggml_tensor * t) {
+        return t && (t->type == GGML_TYPE_AIT2_U || t->type == GGML_TYPE_AIT2P_U || t->type == GGML_TYPE_AIT3_U ||
+                t->type == GGML_TYPE_AIT4_U);
+    };
+    if (onepath && moe_hot.hot_map != nullptr && (int64_t) n_tokens*n_expert_used <= 64 &&
+            n_outputs == n_tokens && res->get_b1_ffn_phase() == 0 &&
+            !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) != 0) &&
+            up_exps && gate_exps && down_exps && !gate_up_exps &&
+            ai_unit(moe_hot.up) && ai_unit(moe_hot.gate) && ai_unit(moe_hot.down)) {
+        moe_hot = {};
+    }
     if (moe_hot.hot_map != nullptr) {
         // split the selected experts between the hot bank and the cold bank; each bank runs on all
         // n_expert_used columns with the weights of the other bank's experts set to zero

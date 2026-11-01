@@ -3288,6 +3288,13 @@ extern "C" {
     GGML_API bool            ggml_moe_bank_any       (void);
     // flags of a registered tensor with a bank, NULL otherwise or when GGML_MOE_BANK_SKIP=0
     GGML_API const uint8_t * ggml_moe_bank_lookup    (const void * weight_data);
+    // fork AIPFIX ONEPATH: where the bank rows of a registered tensor's bank experts live (the bank tensor's data,
+    // type and expert stride; slot[e] = bank row of expert e or -1). Call after ggml_moe_bank_register. ggml_moe_bank_rows
+    // is false for a tensor without them (or without a bank, or with GGML_MOE_BANK_SKIP=0).
+    GGML_API void            ggml_moe_bank_register_rows(const void * weight_data, const void * bank_data, int32_t bank_type,
+                                                         size_t bank_nb2, const int32_t * slot);
+    GGML_API bool            ggml_moe_bank_rows      (const void * weight_data, const void ** bank_data, int32_t * bank_type,
+                                                      size_t * bank_nb2, const int16_t ** slot);
     // enumerate every registered tensor (ignores GGML_MOE_BANK_SKIP); returns false past the end
     GGML_API bool            ggml_moe_bank_entry     (int index, const void ** weight_data, int32_t * layer, int32_t * n_expert, const uint8_t ** in_bank);
     // resident census over the registered layers: an expert counts once, as bank when it is in the bank, else as cache

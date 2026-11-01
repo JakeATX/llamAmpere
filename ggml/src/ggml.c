@@ -8866,6 +8866,11 @@ struct ggml_moe_bank_entry_s {
     int32_t      n_expert;
     bool         has_bank;
     uint8_t      in_bank[GGML_MOE_BANK_MAX_EXPERTS];
+    // fork AIPFIX ONEPATH: the bank rows of this tensor's experts (bank tensor data, type, expert stride, slot or -1)
+    const void * rows_data;
+    int32_t      rows_type;
+    size_t       rows_nb2;
+    int16_t      rows_slot[GGML_MOE_BANK_MAX_EXPERTS];
 };
 
 static struct ggml_moe_bank_entry_s g_moe_bank[GGML_MOE_BANK_MAX_TENSORS];
@@ -8943,6 +8948,44 @@ const uint8_t * ggml_moe_bank_lookup(const void * weight_data) {
         }
     }
     return NULL;
+}
+
+void ggml_moe_bank_register_rows(const void * weight_data, const void * bank_data, int32_t bank_type, size_t bank_nb2,
+        const int32_t * slot) {
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        struct ggml_moe_bank_entry_s * e = &g_moe_bank[i];
+        if (e->data != weight_data || !e->has_bank) {
+            continue;
+        }
+        e->rows_data = bank_data;
+        e->rows_type = bank_type;
+        e->rows_nb2  = bank_nb2;
+        for (int32_t x = 0; x < e->n_expert; ++x) {
+            e->rows_slot[x] = (int16_t) (e->in_bank[x] && slot[x] >= 0 ? slot[x] : -1);
+        }
+        return;
+    }
+}
+
+bool ggml_moe_bank_rows(const void * weight_data, const void ** bank_data, int32_t * bank_type, size_t * bank_nb2,
+        const int16_t ** slot) {
+    if (!ggml_moe_bank_lookup(weight_data)) {
+        return false;
+    }
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        const struct ggml_moe_bank_entry_s * e = &g_moe_bank[i];
+        if (e->data == weight_data) {
+            if (!e->rows_data) {
+                return false;
+            }
+            *bank_data = e->rows_data;
+            *bank_type = e->rows_type;
+            *bank_nb2  = e->rows_nb2;
+            *slot      = e->rows_slot;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool ggml_moe_bank_entry(int index, const void ** weight_data, int32_t * layer, int32_t * n_expert, const uint8_t ** in_bank) {
