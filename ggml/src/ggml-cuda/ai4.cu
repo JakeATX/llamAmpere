@@ -2331,7 +2331,13 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     // 16-row slices either way). GGML_MOE_BANK_MIXED_P2_FINE=0 keeps the SPW grid.
     static const bool p2_fine = ai4_env_int("GGML_MOE_BANK_MIXED_P2_FINE", nullptr, 1) != 0;
     const bool fine = p2_fine && phase == 2;
-    const bool spw = !fine && w->type != GGML_TYPE_IQ4_NL && ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
+    // Hot K=640 downs: the slab-per-warp grid gives one warp 16 rows and all of K (2.5 units per warp, so the
+    // 4-stage prefetch never fills; d9 traces: AIT2_U down 35.7 us vs Q2_0 sw 27.9, AIT4_U 55-105 vs IQ4_NL 35-44).
+    // Default: the 16-row split-K blocks (M/16 x routes x tokens) that gate/up used before SPW. The k order changes
+    // (KLD-gated, not identity). GGML_CUDA_AI23_DOWN_SPW=1 keeps the SPW grid for K=640.
+    static const bool down_spw = ai4_env_int("GGML_CUDA_AI23_DOWN_SPW", nullptr, 0) != 0;
+    const bool spw = !fine && w->type != GGML_TYPE_IQ4_NL && (K != 640 || down_spw) &&
+            ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
     // Compact phase 2 (as the native miss list): four blocks per 16-row tile walk only the routes phase 2 owns,
     // instead of one block per route and tile that mostly exits. GGML_MOE_BANK_MIXED_P2_COMPACT=0 opts out.
     static const bool p2_compact_env = ai4_env_int("GGML_MOE_BANK_MIXED_P2_COMPACT", nullptr, 1) != 0;
