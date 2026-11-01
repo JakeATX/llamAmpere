@@ -751,6 +751,11 @@ struct moe_cache_device_table {
     // (the regular call gives it weight 0) and it is marked permanent, so no miss, swap or CPU split touches it.
     std::vector<uint8_t> bank;
     int n_bank = 0; // fork AIPNEXTK BANKSKIP: bank entries in this table
+    // fork AIPFIX ONEPATH: device pointers to the bank rows of the bank experts (nullptr elsewhere), a device flag
+    // (1 = bank expert) and the rows' type; set only with LLAMA_MOE_BANK_ONEPATH=1 and AI+ unit bank rows
+    const void ** ai_bank = nullptr;
+    uint8_t * ai_bank_flag = nullptr;
+    int ai_bank_type = -1;
     struct moe_cache_pool * swap_pool = nullptr;
     size_t count_offset = 0;
     // fork (missjoin): layer and projection (0 up, 1 gate, 2 down) parsed from the tensor name.
@@ -2568,6 +2573,14 @@ static bool moe_cache_table_mask_enabled() {
             (automask && moe_missjoin_mode() == 1 && !(mask && strcmp(mask, "0") == 0));
 }
 
+// fork AIPFIX ONEPATH (LLAMA_MOE_BANK_ONEPATH=1, the graph side is in llama-graph.cpp): a banked layer's decode-size
+// batches run as a plain layer. The regular passes write zero for the bank experts' routes, as they do beside the bank
+// call; one AI+ table GEMV over the bank rows then writes those routes (gate/up paired with the SwiGLU).
+static bool moe_onepath() {
+    static const bool on = [] { const char * v = getenv("LLAMA_MOE_BANK_ONEPATH"); return v && atoi(v) != 0; }();
+    return on;
+}
+
 static bool moe_cache_table_bytes_add(size_t & total, size_t bytes) {
     const size_t alignment = 256;
     if (bytes > SIZE_MAX - (alignment - 1)) {
@@ -2593,7 +2606,10 @@ static bool moe_cache_reserve_table_arena(moe_cache_session & session, moe_cache
         if (count > SIZE_MAX / sizeof(void *) || count > SIZE_MAX - entries ||
                 !moe_cache_table_bytes_add(required, count * sizeof(void *)) ||
                 (session.prefetch_enabled && !moe_cache_table_bytes_add(required, count * sizeof(void *))) ||
-                (mask && !moe_cache_table_bytes_add(required, count))) {
+                (mask && !moe_cache_table_bytes_add(required, count)) ||
+                // fork AIPFIX ONEPATH: bank row pointers and flags (reserved for every table, used by banked ones)
+                (moe_onepath() && (!moe_cache_table_bytes_add(required, count * sizeof(void *)) ||
+                    !moe_cache_table_bytes_add(required, count)))) {
             return false;
         }
         entries += count;
@@ -11767,6 +11783,78 @@ static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tenso
     return finish(buf);
 }
 
+// fork AIPFIX ONEPATH: the bank experts' routes of one projection, from their bank rows, after a regular pass wrote
+// zero there (the bank experts' entries are the zero block). The AI+ table GEMV writes only routes with flag 1.
+static void moe_onepath_log(int type, const char * what) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        fprintf(stderr, "[moe-cache-ai] one path: first bank-row %s launch, type=%d\n", what, type);
+    }
+}
+
+static void moe_onepath_bank(ggml_backend_cuda_context & ctx, const moe_cache_device_table & table,
+        const ggml_tensor * a, const ggml_tensor * ids, float * out, int64_t M, bool share) {
+    if (!table.ai_bank) {
+        // a banked tensor without bank rows here would leave its bank routes at zero
+        GGML_ASSERT(!(moe_onepath() && table.n_bank > 0) && "one path: banked tensor without AI+ bank rows");
+        return;
+    }
+    const ggml_type wtype = (ggml_type) table.ai_bank_type;
+    moe_onepath_log((int) wtype, "GEMV");
+    ggml_cuda_pool_alloc<char> local(ctx.pool());
+    const char * act = moe_quantize_act(ctx, a, wtype, share, local);
+    const bool ok = ggml_cuda_moe_ai_table_mmv(table.ai_bank, wtype, act, (const int32_t *) ids->data, out,
+            a->ne[0], M, ids->ne[0], ids->ne[1], a->ne[1], ids->nb[1] / sizeof(int32_t), (int) table.desc.n_expert,
+            table.ai_bank_flag, 1, ctx.stream());
+    GGML_ASSERT(ok);
+}
+
+static __global__ void moe_onepath_swiglu(const float * gate, const float * up, float * dst, const int32_t * ids,
+        const uint8_t * flag, int M, int n_used, int64_t ids_stride, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t r = i / M;
+    if (flag[ids[(r / n_used)*ids_stride + r % n_used]]) {
+        dst[i] = ggml_cuda_op_silu_single(gate[i]) * up[i];
+    }
+}
+
+// gate/up of the bank experts' routes and their SwiGLU into glu (one paired launch when the two bank types match)
+static void moe_onepath_bank_pair(ggml_backend_cuda_context & ctx, const moe_cache_device_table & up_table,
+        const moe_cache_device_table & gate_table, const ggml_tensor * a, const ggml_tensor * ids, ggml_tensor * glu) {
+    GGML_ASSERT(!up_table.ai_bank == !gate_table.ai_bank);
+    if (!up_table.ai_bank) {
+        GGML_ASSERT(!(moe_onepath() && up_table.n_bank > 0) && "one path: banked tensor without AI+ bank rows");
+        return;
+    }
+    const ggml_type ut = (ggml_type) up_table.ai_bank_type;
+    const ggml_type gt = (ggml_type) gate_table.ai_bank_type;
+    const int64_t M = glu->ne[0], n = ggml_nelements(glu), ids_stride = ids->nb[1] / sizeof(int32_t);
+    ggml_cuda_pool_alloc<char> local(ctx.pool());
+    const char * act = moe_quantize_act(ctx, a, ut, true, local);
+    ggml_cuda_pool_alloc<float> up_out(ctx.pool(), n);
+    ggml_cuda_pool_alloc<float> gate_out(ctx.pool(), n);
+    auto run = [&](const moe_cache_device_table & t, ggml_type type, float * out, const void * const * t2, float * out2,
+            const uint8_t * f2, float * g) {
+        return ggml_cuda_moe_ai_table_mmv(t.ai_bank, type, act, (const int32_t *) ids->data, out, a->ne[0], M,
+                ids->ne[0], ids->ne[1], a->ne[1], ids_stride, (int) t.desc.n_expert, t.ai_bank_flag, 1, ctx.stream(),
+                t2, out2, f2, g);
+    };
+    if (ut == gt && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(), gate_table.ai_bank_flag,
+            (float *) glu->data)) {
+        moe_onepath_log((int) ut, "paired gate/up+SwiGLU");
+        return;
+    }
+    moe_onepath_log((int) ut, "gate/up (two launches)");
+    GGML_ASSERT(run(up_table, ut, up_out.get(), nullptr, nullptr, nullptr, nullptr));
+    GGML_ASSERT(run(gate_table, gt, gate_out.get(), nullptr, nullptr, nullptr, nullptr));
+    moe_onepath_swiglu<<<(n + 255)/256, 256, 0, ctx.stream()>>>(gate_out.get(), up_out.get(), (float *) glu->data,
+            (const int32_t *) ids->data, up_table.ai_bank_flag, (int) M, (int) ids->ne[0], ids_stride, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tensor * op, const ggml_tensor * bank,
         const ggml_tensor * route_map = nullptr, ggml_tensor * route_mask = nullptr,
         const ggml_cuda_moe_mixed_reduce * red = nullptr) {
@@ -11911,9 +11999,12 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             if (one == 2 && !(cs && g_cs_partial)) {
                 ggml_cuda_moe_bits_check(reference.get(), (const float *) op->data, count, ctx.stream());
             }
+            moe_onepath_bank(ctx, table, a, ids, (float *) op->data, op->ne[0], table.mj_kind == 0 || table.mj_kind == 1);
         } else {
             hit_pass((float *) op->data);
             CUDA_CHECK(cudaGetLastError());
+            // fork AIPFIX ONEPATH: bank experts are resident (hot), so the hit pass wrote their zeros; before the wait
+            moe_onepath_bank(ctx, table, a, ids, (float *) op->data, op->ne[0], table.mj_kind == 0 || table.mj_kind == 1);
             eff = moe_hf_wait(ctx, session, table);
             miss_pass((float *) op->data);
             if (tail) {
@@ -11958,6 +12049,9 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
                 a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
     }
     CUDA_CHECK(cudaGetLastError());
+    if (!bank) {
+        moe_onepath_bank(ctx, table, a, ids, (float *) op->data, op->ne[0], table.mj_kind == 0 || table.mj_kind == 1);
+    }
     if (effective.pf_marked) {
         moe_pf_mark_end_kernel<<<1, 1, 0, ctx.stream()>>>(g_pf.d_mark_seq, g_pf.d_mark);
     }
@@ -12190,6 +12284,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 ggml_cuda_moe_table_mmv_hitg(ctx, up_table.device, gate_table.device, (ggml_type) up_table.desc.type,
                         quantized, (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0],
                         ids->ne[1], a->ne[1], ids_stride, up_table.hot, gate_table.hot, 1);
+                moe_onepath_bank_pair(ctx, up_table, gate_table, a, ids, glu);
                 const void * const * up_eff = moe_hf_wait(ctx, session, up_table);
                 const void * const * gate_eff = moe_hf_wait(ctx, session, gate_table);
                 // miss pass: every other expert the card computes (a CPU-split layer skips the host's experts)
@@ -12247,6 +12342,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
                 a->ne[1], ids->nb[1] / sizeof(int32_t), ctx.stream());
     }
     CUDA_CHECK(cudaGetLastError());
+    moe_onepath_bank_pair(ctx, up_table, gate_table, a, ids, glu);
     if (up_effective.pf_marked || gate_effective.pf_marked) {
         // Overflow and unaligned misses can still read host memory after staging.
         moe_pf_mark_end_kernel<<<1, 1, 0, ctx.stream()>>>(g_pf.d_mark_seq, g_pf.d_mark);
@@ -12571,7 +12667,10 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             table_bytes += (size_t) d.n_expert * (sizeof(void *) * (session->prefetch_enabled ? 2 : 1) + sizeof(unsigned long long) + (resident_mask ? sizeof(uint8_t) : 0));
             if (!moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert * sizeof(void *)) ||
                     (session->prefetch_enabled && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert * sizeof(void *))) ||
-                    (resident_mask && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert))) {
+                    (resident_mask && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert)) ||
+                    (moe_onepath() && table.n_bank > 0 &&
+                        (!moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert * sizeof(void *)) ||
+                         !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert)))) {
                 return fail();
             }
             auto & stored = session->device_tables.emplace(d.data, std::move(table)).first->second;
@@ -12869,6 +12968,31 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             table.device = (const void **)table_take(bytes);
             if (!table.device || cudaMemcpy(table.device, table.addresses.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                 return fail();
+            }
+            // fork AIPFIX ONEPATH: the bank experts' own rows, for the AI+ table GEMV beside the regular passes
+            const void * rows = nullptr;
+            int32_t rows_type = -1;
+            size_t rows_nb2 = 0;
+            const int16_t * rows_slot = nullptr;
+            if (moe_onepath() && table.n_bank > 0 &&
+                    ggml_moe_bank_rows(table.desc.data, &rows, &rows_type, &rows_nb2, &rows_slot) &&
+                    ggml_ai4_is_unit((ggml_type) rows_type)) {
+                std::vector<const void *> ai(table.addresses.size(), nullptr);
+                std::vector<uint8_t> flag(table.addresses.size(), 0);
+                for (size_t e = 0; e < ai.size(); ++e) {
+                    if (table.bank[e] && rows_slot[e] >= 0) {
+                        ai[e] = (const char *) rows + (size_t) rows_slot[e] * rows_nb2;
+                        flag[e] = 1;
+                    }
+                }
+                table.ai_bank = (const void **) table_take(bytes);
+                table.ai_bank_flag = (uint8_t *) table_take(flag.size());
+                if (!table.ai_bank || !table.ai_bank_flag ||
+                        cudaMemcpy(table.ai_bank, ai.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+                        cudaMemcpy(table.ai_bank_flag, flag.data(), flag.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    return fail();
+                }
+                table.ai_bank_type = rows_type;
             }
 
         }
