@@ -160,12 +160,22 @@ static unsigned long long * g_tail_counts = nullptr;
 static unsigned long long * g_swst = nullptr;
 // fork SWAPPOL: swap score source (GGML_MOE_SWAP_SCORE=count|kept|weight|weightkept, GGML_MOE_SWAP_DROPW). Non-count modes accumulate per
 // (layer, expert) in units of 1/1024 route: kept drops the routes the skip budget left out, weight counts a route as
-// 10x its router weight.
+// 10x its router weight. Default: weight with DROPW 0.5 when the skip budget is on (its kernel fills the scores; SWAPPOL
+// r37x+r43x, 29 Taichi pairs: -0.96% ms/round, p=.026), count otherwise. GGML_MOE_SWAP_SCORE=count restores the old policy.
 static unsigned long long * g_swscore = nullptr;
 static unsigned long long * g_swscore_host = nullptr;
+static bool moe_swap_score_default_weight() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_MOE_SWAP_SCORE");
+        const char * p = getenv("GGML_MOE_SKIP_POLICY");
+        return (!v || !*v) && p && *p;
+    }();
+    return on;
+}
 static int moe_swap_score_mode() {
     static const int mode = [] {
         const char * v = getenv("GGML_MOE_SWAP_SCORE");
+        if (moe_swap_score_default_weight()) { return 2; }
         if (!v || !*v || strcmp(v, "count") == 0) { return 0; }
         if (strcmp(v, "kept") == 0) { return 1; }
         if (strcmp(v, "weight") == 0) { return 2; }
@@ -182,7 +192,7 @@ static unsigned moe_swap_skipw() {
     static const unsigned w = [] {
         if (moe_swap_score_mode() & 1) { return 0u; }
         const char * v = getenv("GGML_MOE_SWAP_DROPW");
-        if (!v || !*v) { return 1024u; }
+        if (!v || !*v) { return moe_swap_score_default_weight() ? 512u : 1024u; }
         const float f = strtof(v, nullptr);
         if (!(f >= 0.0f && f <= 1.0f)) { GGML_ABORT("GGML_MOE_SWAP_DROPW must be in [0, 1]"); }
         return (unsigned) (f * 1024.0f + 0.5f);
