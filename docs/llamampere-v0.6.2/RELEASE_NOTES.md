@@ -46,7 +46,7 @@ For the Swift 1.5 27B dense model (the 2.3 bpw file above) at 200K context on a 
 | `--spec-draft-p-min 0` | Always drafts the full depth instead of stopping early when the draft layer is unsure. |
 | `--spec-mb-mtp` | Turns on mb-MTP, which also keeps a draft token the full model would have rejected when that token is at least as likely as the replacement; this is faster but changes sampling slightly, so use `--no-spec-mb-mtp` instead for exact sampling (mb-MTP is already on by default with MTP). |
 
-## Smaller cards: 12 GB and 10 GB (8 GB is not recommended) (Linux, one paste each)
+## Smaller cards: 12 GB and 10 GB, one paste each for Linux (8 GB is not recommended)
 
 **Not yet run on this model.** These adapt the 12 GB command we measured in October on an earlier 2.3 bpw file, adding the v0.6.2 settings (depth up to 4, mb-MTP, the packed attention mask, this model). Every memory figure is arithmetic from those older measurements, not a new measurement. Same requirements as the 24 GB quick start. On the card the model's weights, including the draft layer, take 7,416 MiB; the 1,288 MiB token embedding stays in system RAM.
 
