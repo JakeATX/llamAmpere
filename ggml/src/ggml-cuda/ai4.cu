@@ -2370,8 +2370,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     // two-half grid. Default on; GGML_CUDA_AI23_MIXED_PAIR_WARP=0 opts out.
     static const bool pair_warp = ai4_env_int("GGML_CUDA_AI23_MIXED_PAIR_WARP", nullptr, 1) != 0;
     second.pair_warp = pair && spw && pair_warp;
-    // Cold (base-type) routes grouped by expert in multi-token launches. GGML_MOE_BANK_MIXED_COLD_GROUP=0 opts out.
-    static const bool cold_group = ai4_env_int("GGML_MOE_BANK_MIXED_COLD_GROUP", nullptr, 1) != 0;
+    // Cold (base-type) routes grouped by expert in multi-token launches. Off by default: the paired coding-100K run
+    // (f3b-speed) measured it 0.65 ms/round slower than ungrouped (p = 0.049). GGML_MOE_BANK_MIXED_COLD_GROUP=1 opts in.
+    static const bool cold_group = ai4_env_int("GGML_MOE_BANK_MIXED_COLD_GROUP", nullptr, 0) != 0;
     second.cold_group = cold_group;
     GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red)));
     if (red) {
