@@ -2397,9 +2397,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     }();
     // Phase 1 runs while the layer's miss copy streams from host memory (same as the native hit pass): a shallower
     // pipeline (smaller shared-memory stages, fewer loads in flight) leaves the copy kernel room. Same K order and
-    // arithmetic. GGML_MOE_BANK_MIXED_P1_STAGES=0 keeps the common depth.
+    // arithmetic. Default 0 keeps the common depth (no measured gain, AIPTAB r52); =2|4|8 opts in.
     static const int p1_stages = [] {
-        const int v = ai4_env_int("GGML_MOE_BANK_MIXED_P1_STAGES", nullptr, 2);
+        const int v = ai4_env_int("GGML_MOE_BANK_MIXED_P1_STAGES", nullptr, 0);
         return v == 2 || v == 4 || v == 8 ? v : 0;
     }();
     const int spw_stages = phase == 1 && p1_stages ? p1_stages : spw_stages_all;
