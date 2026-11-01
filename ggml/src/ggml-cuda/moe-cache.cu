@@ -1456,6 +1456,13 @@ static bool moe_cache_type_supported(ggml_type type) {
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
             return true;
+        // fork AIPFIX D: AI+ unit experts are cached in slots of their own size and computed by the AI+ direct
+        // GEMV over the slot table (moe_cache_device_compute); no hit-first overlap or CPU split for them yet
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2P_U:
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT4_U:
+            return getenv("GGML_MOE_CACHE_AI") == nullptr || atoi(getenv("GGML_MOE_CACHE_AI")) != 0;
         default:
             return false;
     }
@@ -4898,7 +4905,7 @@ static void * moe_cache_fused_begin(
         up->n_expert != gate->n_expert || up->type != gate->type ||
         up->n_in <= 0 || up->n_out <= 0 ||
         up->n_expert <= 0 ||
-        up->type == GGML_TYPE_NVFP4 ||
+        up->type == GGML_TYPE_NVFP4 || ggml_ai4_is_unit((ggml_type) up->type) ||
         !moe_cache_type_supported((ggml_type)up->type)) {
         return nullptr;
     }
@@ -8943,7 +8950,8 @@ static bool moe_cache_device_op_fits(const moe_cache_session & session, const gg
         ids->nb[0] == sizeof(int32_t) && ids->nb[1] % sizeof(int32_t) == 0 &&
         ids->nb[1] / sizeof(int32_t) <= INT_MAX / MMVQ_MAX_BATCH_SIZE && ids->nb[1] / sizeof(int32_t) >= (size_t)ids->ne[0] &&
         ids->ne[0] > 0 && ids->ne[0] <= 64 && ids->ne[1] > 0 &&
-        ids->ne[1] <= get_mmvq_mmid_max_batch(w->type, ggml_cuda_info().devices[logical].cc) &&
+        (ggml_ai4_is_unit(w->type) ? ggml_cuda_moe_ai_table_supported(w->type, w->ne[0], w->ne[1], ids->ne[1]) :
+            ids->ne[1] <= get_mmvq_mmid_max_batch(w->type, ggml_cuda_info().devices[logical].cc)) &&
         ids->ne[2] == 1 && ids->ne[3] == 1 && a->ne[0] == d.n_in &&
         a->ne[1] > 0 && a->ne[1] <= ids->ne[0] && a->ne[2] == ids->ne[1] && a->ne[3] == 1 &&
         op->ne[0] == d.n_out && op->ne[1] == ids->ne[0] && op->ne[2] == ids->ne[1] && op->ne[3] == 1 &&
@@ -11677,6 +11685,14 @@ static int moe_q8_share_mode() {
 static char * moe_quantize_act(ggml_backend_cuda_context & ctx, const ggml_tensor * a, ggml_type type, bool share,
         ggml_cuda_pool_alloc<char> & local, const ggml_tensor * bank = nullptr,
         ggml_cuda_pool_alloc<int8_t> * bank_q = nullptr, ggml_cuda_pool_alloc<float> * bank_s = nullptr) {
+    if (ggml_ai4_is_unit(type)) {
+        // fork AIPFIX D: AI+ cached experts read the AI activation layout (no q8_1, no bank beside them)
+        GGML_ASSERT(!bank && ggml_is_contiguous(a));
+        const int64_t rows = a->ne[1] * a->ne[2];
+        char * buf = local.alloc(ggml_cuda_moe_ai_act_bytes(rows, a->ne[0]));
+        ggml_cuda_moe_ai_quantize((const float *) a->data, rows, a->ne[0], buf, ctx.stream());
+        return buf;
+    }
     const int64_t padded = GGML_PAD(a->ne[0], MATRIX_ROW_PADDING);
     const size_t q8_bytes = (size_t)(padded / QK8_1) * a->ne[1] * a->ne[2] * sizeof(block_q8_1);
     GGML_ASSERT(!bank || (bank_q && bank_s));
@@ -11873,7 +11889,13 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
     }
     moe_cache_effective_table effective(ctx.pool());
     const void * const * mmv_table = moe_cache_resolve_table(ctx, session, table, ids, effective);
-    if (bank) {
+    if (ggml_ai4_is_unit((ggml_type) table.desc.type)) {
+        GGML_ASSERT(!bank);
+        const bool ok = ggml_cuda_moe_ai_table_mmv(mmv_table, (ggml_type) table.desc.type, quantized,
+                (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                ids->nb[1] / sizeof(int32_t), (int) table.desc.n_expert, nullptr, 0, ctx.stream());
+        GGML_ASSERT(ok);
+    } else if (bank) {
         ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, mmv_table, nullptr, nullptr, route_map, route_mask,
                 nullptr, nullptr, 0, nullptr, red);
     } else if (!ggml_cuda_moe_table_mmv_grouped_try(ctx, mmv_table, nullptr, (ggml_type)table.desc.type, quantized,
@@ -12006,7 +12028,7 @@ bool ggml_cuda_moe_cache_device_fused_compute(ggml_backend_cuda_context & ctx,
             !moe_cache_device_op_fits(*g_session_stack.back().active, gate, ctx.device) ||
             up->src[0]->type != gate->src[0]->type || up->src[1] != gate->src[1] || up->src[2] != gate->src[2] ||
             !ggml_are_same_shape(up, gate) || !ggml_are_same_shape(up, glu) ||
-            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || ggml_ai4_is_unit(up->src[0]->type)) {
         return false;
     }
     auto & session = *g_session_stack.back().active;

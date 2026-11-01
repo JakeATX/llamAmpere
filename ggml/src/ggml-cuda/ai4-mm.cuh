@@ -16,6 +16,20 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
 // true when ggml_cuda_mul_mat_id_ai4 would take the host-routed reference path (GGML_CUDA_AI4_REF=1 or pre-Ampere)
 bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t);
 
+// fork AIPFIX D: AI+ unit experts held in the expert cache. Activations [K, rows] f32 (contiguous) to the AI layout
+// (int8 q then fp32 group scales at ggml_cuda_moe_ai_act_scales); act_bytes is the buffer size it needs.
+size_t ggml_cuda_moe_ai_act_bytes(int64_t rows, int64_t K);
+size_t ggml_cuda_moe_ai_act_scales(int64_t rows, int64_t K);
+void ggml_cuda_moe_ai_quantize(const float * x, int64_t rows, int64_t K, char * out, cudaStream_t stream);
+// Routed GEMV over expert pointers table[e] (one direct block per route and token, the stock AI+ MUL_MAT_ID direct
+// kernel and order). ids [n_used, n_tok] with row stride ids_stride; act from ggml_cuda_moe_ai_quantize of the
+// [K, ne11, n_tok] input; dst [M, n_used, n_tok]. With a filter only routes whose expert has filter[e] == filter_val
+// are written. False (nothing launched) when the type or shape has no direct kernel.
+bool ggml_cuda_moe_ai_table_supported(ggml_type type, int64_t K, int64_t M, int64_t n_tok);
+bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, const char * act, const int32_t * ids,
+        float * dst, int64_t K, int64_t M, int64_t n_used, int64_t n_tok, int64_t ne11, int64_t ids_stride,
+        int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream);
+
 bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor * base);
 const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined);
 // The caller retains these buffers through the mixed GEMV; IQ4_NL banks need only Q8 activations.

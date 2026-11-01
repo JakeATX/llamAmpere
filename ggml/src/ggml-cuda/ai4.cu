@@ -1936,6 +1936,67 @@ void ggml_cuda_moe_mixed_quantize_x(ggml_backend_cuda_context & ctx, const ggml_
     ai4_quantize_x((const float *) x->data, rows, K, xsh, q.get(), s.get(), ctx.stream());
 }
 
+// fork AIPFIX D: AI+ unit experts in the expert cache (see ai4-mm.cuh).
+size_t ggml_cuda_moe_ai_act_scales(int64_t rows, int64_t K) {
+    return GGML_PAD((size_t) (rows*K), 16);
+}
+
+size_t ggml_cuda_moe_ai_act_bytes(int64_t rows, int64_t K) {
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    return ggml_cuda_moe_ai_act_scales(rows, K) + (size_t) rows*(K >> (7 + xsh))*sizeof(float);
+}
+
+void ggml_cuda_moe_ai_quantize(const float * x, int64_t rows, int64_t K, char * out, cudaStream_t stream) {
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    ai4_quantize_x(x, rows, (int) K, xsh, (int8_t *) out, (float *) (out + ggml_cuda_moe_ai_act_scales(rows, K)), stream);
+}
+
+bool ggml_cuda_moe_ai_table_supported(ggml_type type, int64_t K, int64_t M, int64_t n_tok) {
+    const int rate = ggml_ai4_rate(type);
+    return ggml_ai4_is_unit(type) && rate >= 2 && rate <= 4 && (rate == 4 ? ai4_aikern() : ai4_mmvr_on_id()) &&
+        K % 128 == 0 && M % 16 == 0 && n_tok >= 1 && n_tok <= 64;
+}
+
+bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, const char * act, const int32_t * ids,
+        float * dst, int64_t K, int64_t M, int64_t n_used, int64_t n_tok, int64_t ne11, int64_t ids_stride,
+        int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream) {
+    if (!table || !ggml_cuda_moe_ai_table_supported(type, K, M, n_tok)) {
+        return false;
+    }
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    const int8_t * q = (const int8_t *) act;
+    const float * s = (const float *) (act + ggml_cuda_moe_ai_act_scales(n_tok*ne11, K));
+    ai4k::idmap idm{};
+    idm.direct_ids = (const char *) ids;
+    idm.direct_nb0 = sizeof(int32_t);
+    idm.direct_nb1 = ids_stride*sizeof(int32_t);
+    idm.direct_n_used = (int) n_used;
+    idm.direct_ne11 = (int) ne11;
+    idm.direct_n_expert = n_expert;
+    idm.table = table;
+    idm.filter = filter;
+    idm.filter_val = filter_val;
+    const int max_tiles = (int) (n_used*n_tok);
+    bool ok = false;
+    switch (ai4_lay_of(type)) {
+#define AI4_TABLE_U(L) \
+        case L: \
+            ok = xsh ? ai4_mmvr_try<L, 1, true>(nullptr, q, s, dst, (int) M, (int) n_tok, (int) K, stream, idm, max_tiles) \
+                     : ai4_mmvr_try<L, 0, true>(nullptr, q, s, dst, (int) M, (int) n_tok, (int) K, stream, idm, max_tiles); \
+            break;
+        AI4_TABLE_U(ai4k::LAY_AIT2_U)
+        AI4_TABLE_U(ai4k::LAY_AIT2P_U)
+        AI4_TABLE_U(ai4k::LAY_AIT3_U)
+        AI4_TABLE_U(ai4k::LAY_AIT4_U)
+#undef AI4_TABLE_U
+        default: break;
+    }
+    if (ok) {
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return ok;
+}
+
 // fork AIPFIX: the first nai blocks along x run the AI activation quantizer's CTAs, the rest quantize_q8_1's
 // elements with 128 threads per block. Each part runs the same per-CTA / per-warp code as its own kernel.
 template <bool XSH, bool SWZ>

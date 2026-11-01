@@ -66,6 +66,11 @@ struct idmap {
     int direct_n_used = 0, direct_ne11 = 0, direct_n_expert = 0;
     const float * direct_x = nullptr;
     bool direct_zero = false;
+    // fork AIPFIX D (direct ids only): expert e's weights at table[e] (expert-cache slots) instead of W + e*nb02;
+    // with a filter, blocks whose expert has filter[e] != filter_val write nothing (cache hit / miss passes)
+    const void * const * table = nullptr;
+    const uint8_t * filter = nullptr;
+    int filter_val = 0;
 };
 
 using rq4::cp_async16;
@@ -1047,7 +1052,10 @@ static __device__ __forceinline__ void mmvr_body(
             }
             return;
         }
-        W += (int64_t) e*idm.nb02;
+        if (idm.filter && idm.filter[e] != idm.filter_val) {
+            return;
+        }
+        W = idm.table ? (const uint8_t *) idm.table[e] : W + (int64_t) e*idm.nb02;
         direct_row = tok*idm.direct_ne11 + (idm.direct_ne11 == 1 ? 0 : u);
         if constexpr (GROUPED) {
             N = group->n;
