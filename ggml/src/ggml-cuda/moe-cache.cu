@@ -10721,12 +10721,23 @@ static void moe_tail_zero(ggml_backend_cuda_context & ctx, const ggml_tensor * i
     CUDA_CHECK(cudaGetLastError());
 }
 
+// fork AIPFIX D3: a projection can run the hit/miss passes when its filtered table GEMV takes this many tokens
+// (MMVQ types: the per-type mmid batch limit; AI+ unit experts: the AI+ direct GEMV over the slot table).
+static bool moe_hf_type_ok(const moe_cache_device_table & t, int64_t n_tok, int cc) {
+    const ggml_type type = (ggml_type) t.desc.type;
+    if (ggml_ai4_is_unit(type)) {
+        return ggml_cuda_moe_ai_table_supported(type, t.desc.n_in, t.desc.n_out, n_tok);
+    }
+    return ggml_cuda_moe_table_mmv_filtered_supported(type) && n_tok <= get_mmvq_mmid_max_batch(type, cc);
+}
+
 static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & session,
         const moe_cache_device_table & table, const ggml_tensor * a, const ggml_tensor * ids) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!moe_missjoin_hitfirst_enabled() || session.mj_groups.empty() || table.staging_device || !table.hot ||
             table.mj_layer < 0 || table.mj_layer >= (int) session.mj_groups.size() || !g_hf_scratch ||
             ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 ||
-            !ggml_cuda_moe_table_mmv_filtered_supported((ggml_type) table.desc.type)) {
+            !moe_hf_type_ok(table, ids->ne[1], cc)) {
         return false;
     }
     const auto & group = session.mj_groups[table.mj_layer];
@@ -10742,11 +10753,9 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
     // IQ3_XXS/IQ2_S at 7, the rest at 8). With --parallel 2 a 6-8 token verify batch could otherwise start a layer
     // whose down (or gate) projection then runs on the CPU, leaving that projection's side copy unjoined across
     // the graph split. One sequence (<= 5 tokens) always fits every type, so this never declines there.
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     for (int j = 0; j < 3; ++j) {
-        if (!ggml_cuda_moe_table_mmv_filtered_supported((ggml_type) group[j]->desc.type) || group[j]->staging_device ||
-                group[j]->desc.n_expert != group[0]->desc.n_expert ||
-                ids->ne[1] > get_mmvq_mmid_max_batch((ggml_type) group[j]->desc.type, cc)) {
+        if (!moe_hf_type_ok(*group[j], ids->ne[1], cc) || group[j]->staging_device ||
+                group[j]->desc.n_expert != group[0]->desc.n_expert) {
             return false;
         }
     }
@@ -11792,7 +11801,22 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
         const uint8_t * miss_skip = cs ? g_cs_mask + (size_t) table.mj_kind * g_hf_experts :
                 tail ? g_tail_mask + (size_t) table.mj_kind * g_hf_experts : table.hot;
         const void * const * eff = nullptr;
+        // fork AIPFIX D3: AI+ unit experts run both passes through the AI+ direct GEMV (same per-route kernel,
+        // filtered by expert, so the two passes write disjoint routes as the MMVQ ones do)
+        const ggml_type wtype = (ggml_type) table.desc.type;
+        const bool ai = ggml_ai4_is_unit(wtype);
+        GGML_ASSERT(!ai || !bank);
+        auto ai_pass = [&](const void * const * tbl, float * out, const uint8_t * filter, int filter_val) {
+            const bool ok = ggml_cuda_moe_ai_table_mmv(tbl, wtype, quantized, (const int32_t *) ids->data, out,
+                    a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids_stride, (int) table.desc.n_expert,
+                    filter, filter_val, ctx.stream());
+            GGML_ASSERT(ok);
+        };
         auto hit_pass = [&](float * out) {
+            if (ai) {
+                ai_pass(table.device, out, table.hot, 1);
+                return;
+            }
             const bool hit_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, table.device, (ggml_type) table.desc.type, quantized,
                     (const int32_t *) ids->data, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
                     ids_stride, table.hot, 1) ||
@@ -11802,6 +11826,10 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             GGML_ASSERT(hit_ok);
         };
         auto old_miss = [&](float * out) {
+            if (ai) {
+                ai_pass(eff, out, miss_skip, 0);
+                return;
+            }
             const bool miss_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, eff, (ggml_type) table.desc.type, quantized,
                     (const int32_t *) ids->data, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
                     ids_stride, miss_skip, 0) ||
@@ -11811,7 +11839,7 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             GGML_ASSERT(miss_ok);
         };
         auto miss_pass = [&](float * out) {
-            if (!(ids->ne[2] == 1 && table.mj_kind >= 0 && table.mj_kind < 3 &&
+            if (!(!ai && ids->ne[2] == 1 && table.mj_kind >= 0 && table.mj_kind < 3 &&
                     moe_miss_pass_list(ctx, session, table.mj_layer, table.mj_kind, eff, nullptr, (ggml_type) table.desc.type,
                         quantized, out, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1], old_miss))) {
                 old_miss(out);
@@ -11849,7 +11877,8 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             }
             // every expert the card owns (CPU-split layers skip the host's experts, flagged by the plan)
             const uint8_t * cpu = cs ? g_cs_mask + 3 * (size_t) g_hf_experts : g_hf_zero;
-            const bool one_ok = ggml_cuda_moe_table_mmv_d1_try(ctx, eff, (ggml_type) table.desc.type, quantized,
+            const bool one_ok = (ai && (ai_pass(eff, (float *) op->data, cpu, 0), true)) ||
+                ggml_cuda_moe_table_mmv_d1_try(ctx, eff, (ggml_type) table.desc.type, quantized,
                     (const int32_t *) ids->data, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1],
                     a->ne[1], ids_stride, cpu, 0) ||
                 ggml_cuda_moe_table_mmv_filtered(eff, (ggml_type) table.desc.type, quantized,
