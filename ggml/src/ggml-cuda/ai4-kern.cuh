@@ -1350,13 +1350,15 @@ static __device__ __forceinline__ void mmvr_body(
             }
         }
     }
-    if constexpr (DIRECT && !GROUPED) {
+    if constexpr (DIRECT) {
         // fork AIPFIX D6: the warp that stored this slab finishes the route's SwiGLU slice when its partner
         // projection is stored too: in this launch (count, second arrival writes) or by the earlier hit pass.
+        // D7: a grouped block does this for each of its columns.
         if (idm.glu && (SPW || warp == 0)) {
             __threadfence();
             __syncwarp();
-            const int64_t col = (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
+          for (int k = 0; k < (GROUPED ? N : 1); ++k) {
+            const int64_t col = GROUPED ? (int64_t) pcol[k] : (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
             int go = 0;
             if (lane == 0) {
                 if (!idm.glu_pfilter || idm.glu_pfilter[direct_e] == idm.filter_val) {
@@ -1376,6 +1378,7 @@ static __device__ __forceinline__ void mmvr_body(
                 const int64_t o = col*ldy + slab*16 + lane;
                 idm.glu[o] = ggml_cuda_op_silu_single(__ldcg(idm.glu_gate + o)) * __ldcg(idm.glu_up + o);
             }
+          }
         }
     }
     (void) M;

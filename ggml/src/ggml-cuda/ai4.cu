@@ -446,6 +446,11 @@ static bool ai4_spw_enabled(int M, int K, const ai4k::idmap & idm, int max_tiles
     return mode != 2 || K == 640 || n_tok >= 4;
 }
 
+// fork AIPFIX D7 (defined after moe_mixed_group): cached AI+ experts, routes of one expert share a weight read
+template <int LAY, int XSH, int KT>
+static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
+                                  const ai4k::idmap & idm, int max_tiles);
+
 // fork: each warp owns 16 rows and scans K without a cross-warp sum.
 template <int LAY, int XSH, bool ID, int KT>
 static bool ai4_spw_try(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
@@ -455,6 +460,9 @@ static bool ai4_spw_try(const uint8_t * W, const int8_t * q, const float * s, fl
     } else {
         if (!ai4_spw_enabled(M, K, idm, max_tiles)) {
             return false;
+        }
+        if (ai4_table_grouped_try<LAY, XSH, KT>(q, s, Y, M, K, stream, idm, max_tiles)) {
+            return true;
         }
         ai4k::launch_mmvr<LAY, XSH, ID, KT, 2, 4, 6, true, false, 1, 1, false, true>(W, q, s, Y, M, M, 1, K, stream, idm, max_tiles);
         return true;
@@ -1537,6 +1545,85 @@ static __device__ __forceinline__ void moe_mixed_group(const ai4k::idmap & idm, 
         }
     }
     __syncthreads();
+}
+
+// fork AIPFIX D7: the slab-per-warp direct GEMV over cached AI+ experts (slot table), with the routes that picked the
+// same expert in one block (up to MMV_ID_BN columns per weight read, as the bank's grouped hot path). Every column
+// keeps the direct SPW K order, so the outputs are the ungrouped launch's bits. Filters, the paired second projection
+// (upper half of x) and the fused SwiGLU work as in mmvr. GGML_MOE_CACHE_AI_GROUP=0 opts out.
+template <int LAY, int XSH, int KT>
+static __global__ void __launch_bounds__(128, 6) ai4_table_grouped(const int8_t * __restrict__ Xq,
+        const float * __restrict__ Xs, float * Y, int M, int K, const ai4k::idmap idm) {
+    constexpr int WARPS = 4;
+    const bool second = idm.table2 && (int) blockIdx.x >= (int) gridDim.x/2;
+    const int bx = (int) blockIdx.x - (second ? (int) gridDim.x/2 : 0);
+    ai4k::idmap m = idm;
+    float * y = Y;
+    if (idm.table2) {
+        m.table = second ? idm.table2 : idm.table;
+        m.filter = second ? idm.filter2 : idm.filter;
+        m.glu_pfilter = second ? idm.filter : idm.filter2;
+        m.glu_prev = second ? idm.glu_prev : idm.glu_prev2;
+        y = second ? idm.y2 : Y;
+    }
+    const int lane = threadIdx.x & 31;
+    const int slab = bx*WARPS + (int) (threadIdx.x >> 5);
+    const int u = blockIdx.y, t = blockIdx.z;
+    const int64_t col = (int64_t) t*idm.direct_n_used + u;
+    // every route clears its own tile in the other bank, filtered or not (mmvr does the same before its filter)
+    if (m.glu && lane == 0 && slab < M/16) {
+        ai4k::g_ai4k_glu_count[(m.filter_val ? ai4k::GLU_PAIR_TILES : 0) + col*(M/16) + slab] = 0;
+    }
+    const int e = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
+    if (e < 0 || e >= idm.direct_n_expert) {
+        if (idm.direct_zero && lane < 16 && slab < M/16) {
+            y[col*M + slab*16 + lane] = 0.0f;
+        }
+        return;
+    }
+    if (m.filter && m.filter[e] != m.filter_val) {
+        return;
+    }
+    __shared__ ai4k::mmvr_group group;
+    moe_mixed_group(m, e, group);
+    if (group.n == 0) {
+        return;
+    }
+    ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 6, true, false, 1, 1, false, true, true>(nullptr, Xq, Xs, y, M, M, 1,
+            K, m, &group, bx);
+}
+
+static bool ai4_table_grouped_on() {
+    static const bool on = ai4_env_int("GGML_MOE_CACHE_AI_GROUP", nullptr, 1) != 0;
+    return on;
+}
+
+template <int LAY, int XSH, int KT>
+static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
+                                  const ai4k::idmap & idm, int max_tiles) {
+    // one token has nothing to share; the native-id map (bank) and fused activations keep their own launches
+    if (!ai4_table_grouped_on() || !idm.table || idm.direct_map || idm.direct_x || idm.direct_n_used <= 0 ||
+            max_tiles/idm.direct_n_used < 2 || M % 16 != 0) {
+        return false;
+    }
+    constexpr int WARPS = 4;
+    constexpr int smem = WARPS*2*ai4k::mmv_stage_bytes<true, LAY>();
+    static bool attr_set[64] = {};
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (!attr_set[dev & 63]) {
+        CUDA_CHECK(cudaFuncSetAttribute(ai4_table_grouped<LAY, XSH, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        attr_set[dev & 63] = true;
+    }
+    const dim3 grid(((M/16 + WARPS - 1)/WARPS)*(idm.table2 ? 2 : 1), idm.direct_n_used, max_tiles/idm.direct_n_used);
+    ai4_table_grouped<LAY, XSH, KT><<<grid, WARPS*32, smem, stream>>>(q, s, Y, M, K, idm);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "[ai4] grouped cached AI+ GEMV first launch: M=%d K=%d tokens=%d paired=%d\n", M, K,
+                max_tiles/idm.direct_n_used, idm.table2 ? 1 : 0);
+    }
+    return true;
 }
 
 // Paired launch: blocks at x >= gridDim.x/2 compute this second projection (W == nullptr: unpaired).
