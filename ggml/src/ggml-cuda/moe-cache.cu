@@ -12043,7 +12043,7 @@ static void moe_onepath_bank_pair(ggml_backend_cuda_context & ctx, const moe_cac
             const uint8_t * f2, float * g) {
         return ggml_cuda_moe_ai_table_mmv(t.ai_bank, type, act, (const int32_t *) ids->data, out, a->ne[0], M,
                 ids->ne[0], ids->ne[1], a->ne[1], ids_stride, (int) t.desc.n_expert, t.ai_bank_flag, 1, ctx.stream(),
-                t2, out2, f2, g, !t2 || group_pair);
+                t2, out2, f2, g, nullptr, nullptr, !t2 || group_pair);
     };
     // f3n: the bank-route errors of the 100K config came from the grouped AI+ GEMV's paired launch over the bank rows,
     // not the fused SwiGLU (grouping off with the fused epilogue checked clean; the unpaired grouped downs are clean).
