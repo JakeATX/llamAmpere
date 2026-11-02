@@ -1033,7 +1033,7 @@ static __device__ __forceinline__ void mmvr_body(
     static_assert(!FUSED_X || DIRECT, "fused activation needs direct ids");
     static_assert(KR == 2 || KR == 3 || KR == 4, "mmvr: rates 2, 3 and 4");
     static_assert(!SPW || (ID && DIRECT && SPLITS == 1 && !FUSED_X), "slab-per-warp scope");
-    static_assert(!GROUPED || (SPW && !SINGLE_N), "grouped slab-per-warp scope");
+    static_assert(!GROUPED || ((SPW || (ID && DIRECT)) && !SINGLE_N), "grouped scope: slab-per-warp or split-K");
     constexpr int CW = SPW ? 1 : WARPS;
     static_assert(STAGES % 2 == 0, "mmvr: even stages (activation double buffer)");
     static_assert(WARPS >= 2 && (WARPS & (WARPS - 1)) == 0 && WARPS <= 16, "mmvr warps");
@@ -1335,7 +1335,8 @@ static __device__ __forceinline__ void mmvr_body(
             const int r = slab*16 + g;
             const int c = 2*t;
             auto ycol = [&](int cc) -> int64_t {
-                if constexpr (DIRECT) { return blockIdx.z*idm.direct_n_used + blockIdx.y; }
+                if constexpr (GROUPED) { return pcol[cc]; }
+                else if constexpr (DIRECT) { return blockIdx.z*idm.direct_n_used + blockIdx.y; }
                 else if constexpr (ID) { return pcol[cc]; }
                 else { return cc; }
             };

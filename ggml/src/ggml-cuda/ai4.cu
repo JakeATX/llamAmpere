@@ -1663,6 +1663,7 @@ struct moe_mixed_second {
     bool red_tree;
     bool pair_warp;         // hot SPW routes: warp pairs compute gate and up of one slab (see moe_mixed_mmv)
     bool cold_group;        // cold routes of one expert share a weight read (see moe_mixed_cold)
+    bool splitk;            // hot routes: one block per (16-row slab, unique expert), warps split K (see moe_mixed_mmv)
 };
 
 // Epilogue tiles are 16-row slices of one route's output, so launches that tile the rows differently (the SPW
@@ -2008,6 +2009,22 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
                 ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(W, q, s, Y, M, M, 1, K, idm, &group, bx);
                 moe_mixed_done(second, Y, bx, 16*WARPS, M, group.cols, group.n, 0, idm.direct_n_used);
             } else {
+                if constexpr (!SINGLE_N) {
+                    // fork AIPTAB SK1 (opt-in GGML_MOE_BANK_MIXED_SPLITK=1): the first route of each expert owns the
+                    // later routes that picked it (<= MMV_ID_BN columns); the block's warps split K of one 16-row
+                    // slab, so a warp walks 5 of the 20 K units instead of all 20, and each weight byte is read once.
+                    if (second.splitk && gridDim.z > 1) {
+                        __shared__ ai4k::mmvr_group group;
+                        moe_mixed_group(idm, h, group);
+                        if (group.n == 0) {
+                            return;
+                        }
+                        ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, false, false, true>(
+                                W, q, s, Y, M, M, 1, K, idm, &group, bx);
+                        moe_mixed_done(second, Y, bx, 16, M, group.cols, group.n, 0, idm.direct_n_used);
+                        return;
+                    }
+                }
                 ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, false>(W, q, s, Y, M, M, 1, K, idm, nullptr, bx);
                 moe_mixed_done(second, Y, bx, 16, M, nullptr, 1, t*idm.direct_n_used + u, idm.direct_n_used);
             }
@@ -2332,7 +2349,10 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     // 16-row slices either way). GGML_MOE_BANK_MIXED_P2_FINE=0 keeps the SPW grid.
     static const bool p2_fine = ai4_env_int("GGML_MOE_BANK_MIXED_P2_FINE", nullptr, 1) != 0;
     const bool fine = p2_fine && phase == 2;
-    const bool spw = !fine && w->type != GGML_TYPE_IQ4_NL && ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
+    // Opt-in split-K grouped hot launch (GGML_MOE_BANK_MIXED_SPLITK=1): multi-token, AI+ bank types.
+    static const bool splitk_env = ai4_env_int("GGML_MOE_BANK_MIXED_SPLITK", nullptr, 0) != 0;
+    const bool splitk = splitk_env && !fine && w->type != GGML_TYPE_IQ4_NL && ids->ne[1] > 1;
+    const bool spw = !fine && !splitk && w->type != GGML_TYPE_IQ4_NL && ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
     // Compact phase 2 (as the native miss list): four blocks per 16-row tile walk only the routes phase 2 owns,
     // instead of one block per route and tile that mostly exits. GGML_MOE_BANK_MIXED_P2_COMPACT=0 opts out.
     static const bool p2_compact_env = ai4_env_int("GGML_MOE_BANK_MIXED_P2_COMPACT", nullptr, 1) != 0;
@@ -2364,6 +2384,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     // (f3b-speed) measured it 0.65 ms/round slower than ungrouped (p = 0.049). GGML_MOE_BANK_MIXED_COLD_GROUP=1 opts in.
     static const bool cold_group = ai4_env_int("GGML_MOE_BANK_MIXED_COLD_GROUP", nullptr, 0) != 0;
     second.cold_group = cold_group;
+    second.splitk = splitk;
     GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red)));
     if (red) {
         second.red_w = (const float *) red->weights->data;
@@ -2399,6 +2420,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     else if (spw && spw_stages == 8) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 8); } \
     else if (spw && spw_stages == 4) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 4); } \
     else if (spw)       { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 2); } \
+    else if (splitk)    { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, false, 2); } \
     else if (two_warps) { MOE_MIXED_SINGLE(T, L, XSH, KT, 2); } \
     else                { MOE_MIXED_SINGLE(T, L, XSH, KT, 4); }
 #define MOE_MIXED_SHAPE(L) \
