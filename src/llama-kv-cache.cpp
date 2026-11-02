@@ -3896,7 +3896,7 @@ bool llama_kv_cache::sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0) {
         // the staging rows of [replay_B(p0), reopen_lo) were overwritten (the cache ran more than about the ring
         // capacity past p0) and the first re-prefill ubatch would still read them as exact rows in a cold prefill:
         // the cut reopens what the ring still holds, the re-prefill is close to a cold one but not identical
-        LLAMA_LOG_WARN("%s: SJ-KVaRN cut at %d: the ring reaches back to %u, a cold prefill keeps rows from %u exact; "
+        LLAMA_LOG_DEBUG("%s: SJ-KVaRN cut at %d: the ring reaches back to %u, a cold prefill keeps rows from %u exact; "
                 "the re-prefill will not be bit-identical to a cold one\n", __func__, (int) p0,
                 sj_kvarn_reopen_lo(strm), sj_kvarn_replay_B(c0));
     }
