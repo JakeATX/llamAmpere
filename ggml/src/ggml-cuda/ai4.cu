@@ -1621,8 +1621,8 @@ template <int LAY, int XSH, int KT>
 static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
                                   const ai4k::idmap & idm, int max_tiles) {
     // one token has nothing to share; the native-id map (bank) and fused activations keep their own launches
-    if (!ai4_table_grouped_on() || !idm.table || idm.direct_map || idm.direct_x || idm.direct_n_used <= 0 ||
-            max_tiles/idm.direct_n_used < 2 || M % 16 != 0) {
+    if (!ai4_table_grouped_on() || !idm.table || idm.no_group || idm.direct_map || idm.direct_x ||
+            idm.direct_n_used <= 0 || max_tiles/idm.direct_n_used < 2 || M % 16 != 0) {
         return false;
     }
     constexpr int WARPS = 4;
@@ -2159,7 +2159,7 @@ bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, cons
         float * dst, int64_t K, int64_t M, int64_t n_used, int64_t n_tok, int64_t ne11, int64_t ids_stride,
         int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream,
         const void * const * table2, float * dst2, const uint8_t * filter2,
-        float * glu, const uint8_t * prev, const uint8_t * prev2) {
+        float * glu, const uint8_t * prev, const uint8_t * prev2, bool group) {
     if (!table || !ggml_cuda_moe_ai_table_supported(type, K, M, n_tok) || (table2 && !dst2) || (glu && !table2) ||
             (glu && M/16*n_used*n_tok > ai4k::GLU_PAIR_TILES)) {
         return false;
@@ -2185,6 +2185,7 @@ bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, cons
     idm.glu_gate = dst2;
     idm.glu_prev = prev;
     idm.glu_prev2 = prev2;
+    idm.no_group = !group;
     const int max_tiles = (int) (n_used*n_tok);
     bool ok = false;
     switch (ai4_lay_of(type)) {

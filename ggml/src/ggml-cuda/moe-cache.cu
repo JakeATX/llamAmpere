@@ -12035,27 +12035,37 @@ static void moe_onepath_bank_pair(ggml_backend_cuda_context & ctx, const moe_cac
     const char * act = moe_quantize_act(ctx, a, ut, true, local);
     ggml_cuda_pool_alloc<float> up_out(ctx.pool(), n);
     ggml_cuda_pool_alloc<float> gate_out(ctx.pool(), n);
+    static const bool group_pair = [] {
+        const char * v = getenv("LLAMA_MOE_BANK_ONEPATH_GROUP_PAIR");
+        return v && atoi(v) != 0;
+    }();
     auto run = [&](const moe_cache_device_table & t, ggml_type type, float * out, const void * const * t2, float * out2,
             const uint8_t * f2, float * g) {
         return ggml_cuda_moe_ai_table_mmv(t.ai_bank, type, act, (const int32_t *) ids->data, out, a->ne[0], M,
                 ids->ne[0], ids->ne[1], a->ne[1], ids_stride, (int) t.desc.n_expert, t.ai_bank_flag, 1, ctx.stream(),
-                t2, out2, f2, g);
+                t2, out2, f2, g, !t2 || group_pair);
     };
-    // f3m: the fused SwiGLU was wrong for every bank route of the 100K config (AIKERN grouped paired launch). Its
-    // per-slab arrival counters are cleared by the filter-0 pass that follows a filter-1 pass in the cached AI+ path,
-    // and the one path runs the filter-1 pass alone. The default pairs the projections and runs the SwiGLU after;
-    // LLAMA_MOE_BANK_ONEPATH_GLU=1 keeps the fused epilogue (diagnostic).
+    // f3n: the bank-route errors of the 100K config came from the grouped AI+ GEMV's paired launch over the bank rows,
+    // not the fused SwiGLU (grouping off with the fused epilogue checked clean; the unpaired grouped downs are clean).
+    // The paired launch stays ungrouped (LLAMA_MOE_BANK_ONEPATH_GROUP_PAIR=1 groups it) and the fused epilogue is the
+    // default again; LLAMA_MOE_BANK_ONEPATH_GLU=0 runs the SwiGLU after, LLAMA_MOE_BANK_ONEPATH_PAIR=0 runs gate and
+    // up as two unpaired (grouped) launches (diagnostics).
     static const bool fused = [] {
         const char * v = getenv("LLAMA_MOE_BANK_ONEPATH_GLU");
-        return v && atoi(v) != 0;
+        return !v || atoi(v) != 0;
     }();
-    if (ut == gt && fused && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(), gate_table.ai_bank_flag,
-            (float *) glu->data)) {
+    static const bool paired = [] {
+        const char * v = getenv("LLAMA_MOE_BANK_ONEPATH_PAIR");
+        return !v || atoi(v) != 0;
+    }();
+    if (ut == gt && paired && fused && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(),
+            gate_table.ai_bank_flag, (float *) glu->data)) {
         moe_onepath_log((int) ut, "paired gate/up+SwiGLU");
         moe_onepath_check(ctx, up_table, &gate_table, a, ids, (const float *) glu->data, M, "pair-pass");
         return;
     }
-    if (ut == gt && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(), gate_table.ai_bank_flag, nullptr)) {
+    if (ut == gt && paired && run(up_table, ut, up_out.get(), gate_table.ai_bank, gate_out.get(), gate_table.ai_bank_flag,
+            nullptr)) {
         moe_onepath_log((int) ut, "paired gate/up, SwiGLU after");
     } else {
         moe_onepath_log((int) ut, "gate/up (two launches)");

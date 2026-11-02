@@ -30,13 +30,14 @@ void ggml_cuda_moe_ai_quantize(const float * x, int64_t rows, int64_t K, char * 
 // also computes a second projection of the same type and shape (gate beside up) into dst2, filtered by filter2.
 // With glu (and table2 = gate, table = up) the launch also writes glu = silu(dst2)*dst for every route whose two
 // projections are stored by this launch or (prev / prev2 = the hit pass filters of up / gate, val 1) by that earlier
-// pass; false (nothing launched) when the route tiles exceed the counter table.
+// pass; false (nothing launched) when the route tiles exceed the counter table. group = false keeps the routes of
+// one expert in their own blocks (no grouped slab-per-warp launch).
 bool ggml_cuda_moe_ai_table_supported(ggml_type type, int64_t K, int64_t M, int64_t n_tok);
 bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, const char * act, const int32_t * ids,
         float * dst, int64_t K, int64_t M, int64_t n_used, int64_t n_tok, int64_t ne11, int64_t ids_stride,
         int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream,
         const void * const * table2 = nullptr, float * dst2 = nullptr, const uint8_t * filter2 = nullptr,
-        float * glu = nullptr, const uint8_t * prev = nullptr, const uint8_t * prev2 = nullptr);
+        float * glu = nullptr, const uint8_t * prev = nullptr, const uint8_t * prev2 = nullptr, bool group = true);
 
 bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor * base);
 const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined);

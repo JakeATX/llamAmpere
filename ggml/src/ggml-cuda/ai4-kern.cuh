@@ -86,6 +86,8 @@ struct idmap {
     const uint8_t * glu_prev = nullptr;
     const uint8_t * glu_prev2 = nullptr;
     const uint8_t * glu_pfilter = nullptr;
+    // fork AIPFIX: no grouped launch for this call (the routes of one expert stay in their own blocks)
+    bool no_group = false;
 };
 
 // fork AIPFIX D6: arrivals per (route column, 16-row slice) when both projections of a route are stored by the same
