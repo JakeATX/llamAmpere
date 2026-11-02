@@ -6335,9 +6335,14 @@ private:
                 SRV_ERR("ubatch handoff failed (done = %d, ret = %d)\n", handoff.done, ret);
                 throw std::runtime_error("MTP ubatch handoff failed");
             }
-            SRV_WRN("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
+            // the full catch-up (with the last ubatch deferred by design under PP overlap) is routine: debug level
+            if (handoff.done + handoff.deferred_count < batch.view.size()) {
+                SRV_WRN("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
+            } else {
+                SRV_DBG("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
+            }
             if (handoff.deferred_count) {
-                SRV_WRN("[PP] deferred final device handoff: first %d, rows %d\n", handoff.done, handoff.deferred_count);
+                SRV_DBG("[PP] deferred final device handoff: first %d, rows %d\n", handoff.done, handoff.deferred_count);
             }
         }
 
@@ -6510,7 +6515,7 @@ private:
         }
 
         if (t_deferred_start) {
-            SRV_WRN("[PP] final device catch-up: %d rows, %.3f ms\n", handoff.deferred_count,
+            SRV_DBG("[PP] final device catch-up: %d rows, %.3f ms\n", handoff.deferred_count,
                     (ggml_time_us() - t_deferred_start) / 1000.0);
         }
         // fork: finish draft catch-up before returning scratch to the response cache.
