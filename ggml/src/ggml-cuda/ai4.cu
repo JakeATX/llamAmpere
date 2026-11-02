@@ -1665,6 +1665,7 @@ struct moe_mixed_second {
     bool red_tree;
     bool pair_warp;         // hot SPW routes: warp pairs compute gate and up of one slab (see moe_mixed_mmv)
     bool cold_group;        // cold routes of one expert share a weight read (see moe_mixed_cold)
+    bool res_both;          // paired: a cached route is resident only when both projections are (see P2LIST)
 };
 
 // Epilogue tiles are 16-row slices of one route's output, so launches that tile the rows differently (the SPW
@@ -1921,8 +1922,11 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
     int bx = blockIdx.x;
     const uint8_t * const W0 = W;
     float * const Y0 = Y;
+    // fork AIPFIX P2LIST: the other projection's resident flags (null: this projection's alone decide)
+    const uint8_t * other = second.res_both ? second.resident : nullptr;
     if (second.W && bx >= (int) gridDim.x/2) {
         bx -= gridDim.x/2;
+        other = second.res_both ? resident : nullptr;
         W = second.W; Y = second.Y; base = second.base; table = second.table;
         skip = second.skip; resident = second.resident; route_ids = nullptr;
     }
@@ -1942,7 +1946,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
                     const int h = moe_mixed_slot(idm, u, t);
                     const int e = ids[t*ids_stride + u];
                     const bool hot = h >= 0 && h < idm.direct_n_expert;
-                    mine = !hot && !(h < 0 && e >= 0 && e < n_expert && resident[e]);
+                    mine = !hot && !(h < 0 && e >= 0 && e < n_expert && resident[e] && (!other || other[e]));
                 }
                 const unsigned int b = __ballot_sync(0xffffffffu, mine);
                 if (mine) {
@@ -1974,7 +1978,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
     // Hit-first split: phase 1 runs before the copy wait (bank and resident routes),
     // phase 2 after it (all other routes); each route is written by exactly one phase.
     const int e = ids[t*ids_stride + u];
-    const bool res = phase != 0 && !hot && h < 0 && e >= 0 && e < n_expert && resident[e];
+    const bool res = phase != 0 && !hot && h < 0 && e >= 0 && e < n_expert && resident[e] && (!other || other[e]);
     if ((phase == 1 && !hot && !res) || (phase == 2 && (hot || res))) {
         return;
     }
@@ -2376,6 +2380,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     // (f3b-speed) measured it 0.65 ms/round slower than ungrouped (p = 0.049). GGML_MOE_BANK_MIXED_COLD_GROUP=1 opts in.
     static const bool cold_group = ai4_env_int("GGML_MOE_BANK_MIXED_COLD_GROUP", nullptr, 0) != 0;
     second.cold_group = cold_group;
+    second.res_both = pair && pair->res_both;
     GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red)));
     if (red) {
         second.red_w = (const float *) red->weights->data;

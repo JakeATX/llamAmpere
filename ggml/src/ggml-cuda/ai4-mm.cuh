@@ -58,6 +58,7 @@ struct ggml_cuda_moe_mixed_pair {
     const uint8_t * skip;
     const uint8_t * resident;
     ggml_tensor * glu = nullptr; // SwiGLU of the two outputs, written by the same launch (nullptr: none)
+    bool res_both = false;       // fork AIPFIX P2LIST: a cached route is resident only when both projections are
 };
 // GGML_MOE_BANK_MIXED_PAIR=0 restores separate up and gate launches (default 1).
 bool ggml_cuda_moe_mixed_pair_enabled();

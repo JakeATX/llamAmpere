@@ -129,6 +129,19 @@ static bool moe_mixed_hit_first() {
     return v;
 }
 
+// fork AIPFIX P2LIST: GGML_MOE_BANK_P2_LIST=1 runs a banked layer's copied (cold) routes through the 3XS miss-list
+// kernel from the plan's list (one weight read per expert for every token that routes to it, gate and up fused)
+// instead of the mixed kernel's phase 2. Needs the hit-first split and GGML_MOE_MISS_LIST. Skipped routes are zeroed
+// as the 3XS path does (tail zero; the CPU join rewrites host routes); the routed sum is then its own launch.
+// Default off until a paired speed run.
+static bool moe_bank_p2_list() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_MOE_BANK_P2_LIST");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 // fork MOEGAP DOWNONE: GGML_MOE_DOWN_ONE=1|check. On a hit-first layer the down projection waits for its copy
 // first and then computes every route the card owns in ONE launch over the effective table (resident experts at
 // their cache address, staged ones at their copy), instead of a hit pass and a miss pass. The down copy is normally
@@ -210,7 +223,8 @@ static int g_hf_slots = 0;
 static std::atomic<unsigned long long> g_hf_layers{0};
 // fork MOEGAP: how often each new switch took its path (counted where the host issues the work, so a CUDA graph
 // counts once per capture, not per replay)
-static std::atomic<unsigned long long> g_st_hitg{0}, g_st_ml{0}, g_st_pc{0}, g_st_q8hit{0}, g_st_q8claim{0}, g_st_pub_plan{0};
+static std::atomic<unsigned long long> g_st_hitg{0}, g_st_ml{0}, g_st_pc{0}, g_st_q8hit{0}, g_st_q8claim{0}, g_st_pub_plan{0},
+        g_st_p2list{0};
 // fork PARFIX: graphs that ended with a layer's side copies still unjoined (see ggml_cuda_moe_cache_hf_graph_end).
 static std::atomic<unsigned long long> g_hf_graph_end_joins{0};
 // fork MOEGAP (GGML_MOE_CPU_SPLIT=1): the host CPU computes part of each hit-first layer's missed experts
@@ -352,11 +366,11 @@ static void moe_missjoin_log(const char * when) {
                 g_hf_graph_end_joins.load(std::memory_order_relaxed));
     }
     if (g_st_hitg.load() || g_st_ml.load() || g_st_pc.load() || g_st_q8hit.load() || g_st_q8claim.load() ||
-            ggml_cuda_moe_down_sw_count() || g_st_one.load() || g_st_pub_plan.load()) {
+            ggml_cuda_moe_down_sw_count() || g_st_one.load() || g_st_pub_plan.load() || g_st_p2list.load()) {
         MOE_CACHE_LOG("[moe-cache] path counts %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
-                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu (issue-time counts)\n",
+                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu bank_p2_list=%llu (issue-time counts)\n",
                 when, g_st_hitg.load(), g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(),
-                ggml_cuda_moe_down_sw_count(), g_st_one.load(), g_st_pub_plan.load());
+                ggml_cuda_moe_down_sw_count(), g_st_one.load(), g_st_pub_plan.load(), g_st_p2list.load());
     }
     if (g_cs_on && g_cs_plan) {
         moe_cs_plan_dev plan{};
@@ -12345,15 +12359,39 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             // the resident table equals the effective one for those experts.
             const bool split = moe_mixed_hit_first();
             // the CPU join below rewrites routes after the launch, so a CPU-split layer sums them afterwards
-            const ggml_cuda_moe_mixed_reduce * kred = cs && table.mj_kind == 2 ? nullptr : red;
+            // fork AIPFIX P2LIST: the copied routes take the 3XS miss-list kernel (the sum is then its own launch)
+            const bool p2list = split && moe_bank_p2_list() && ids->ne[2] == 1 && table.mj_kind >= 0 &&
+                    table.mj_kind < 3 && session.ml_layer >= 0 && session.ml_layer == table.mj_layer &&
+                    ggml_cuda_moe_table_mmv_list_supported(wtype, false, a->ne[0], ids->ne[0], ids->ne[1], a->ne[1]);
+            const ggml_cuda_moe_mixed_reduce * kred = (cs && table.mj_kind == 2) || p2list ? nullptr : red;
             if (split) {
                 ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, table.device, nullptr, table.hot,
                         route_map, route_mask, bank_q.get(), bank_s.get(), 1, nullptr, kred);
                 CUDA_CHECK(cudaGetLastError());
             }
             eff = moe_hf_wait(ctx, session, table);
-            ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, eff, mixed_skip, table.hot, route_map, route_mask,
-                    bank_q.get(), bank_s.get(), split ? 2 : 0, nullptr, kred);
+            auto mixed_rest = [&](float * out) {
+                ggml_tensor o = *op;
+                o.data = out;
+                ggml_cuda_mul_mat_id_mixed(ctx, bank, op, &o, quantized, eff, mixed_skip, table.hot, route_map,
+                        route_mask, bank_q.get(), bank_s.get(), split ? 2 : 0, nullptr, kred);
+            };
+            if (!p2list || !moe_miss_pass_list(ctx, session, table.mj_layer, table.mj_kind, eff, nullptr, wtype,
+                        quantized, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                        mixed_rest)) {
+                mixed_rest((float *) op->data);
+            }
+            if (p2list) {
+                CUDA_CHECK(cudaGetLastError());
+                g_st_p2list.fetch_add(1, std::memory_order_relaxed);
+                if (tail) {
+                    moe_tail_zero(ctx, ids, (int) table.desc.n_expert, op);
+                }
+                // CPU-split down layers sum after the join below
+                if (red && !(cs && table.mj_kind == 2)) {
+                    ggml_cuda_op_moe_mixed_reduction(ctx, op, red->weights, red->bank_ids, red->dst);
+                }
+            }
         } else if (one != 0) {
             eff = moe_hf_wait(ctx, session, table);
             const int64_t count = op->ne[0] * ids->ne[0] * ids->ne[1];
@@ -12527,15 +12565,74 @@ bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
                 tail ? g_tail_mask + (size_t) table.mj_kind*g_hf_experts : nullptr;
     };
     const bool split = moe_mixed_hit_first();
+    // fork AIPFIX P2LIST: the copied routes take the 3XS miss-list kernel (fused up * silu(gate) into glu, or one
+    // list launch per projection without glu). The fused list covers every route either projection missed, so
+    // phase 1 then takes a cached route only when both projections hold it (no half-counted SwiGLU tile).
+    const ggml_type wtype = (ggml_type) first.desc.type;
+    const bool p2list = split && moe_bank_p2_list() && ids->ne[2] == 1 && session.ml_layer >= 0 &&
+            session.ml_layer == first.mj_layer &&
+            ggml_cuda_moe_table_mmv_list_supported(wtype, glu != nullptr, a->ne[0], ids->ne[0], ids->ne[1], a->ne[1]);
+    const bool both = p2list && glu != nullptr;
     if (split) {
-        const ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot, glu };
+        const ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot, glu, both };
         ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, &op, quantized, first.device, nullptr, first.hot,
                 route_map, route_mask, bank_q.get(), bank_s.get(), 1, &resident);
         CUDA_CHECK(cudaGetLastError());
     }
     const void * const * eff = moe_hf_wait(ctx, session, first);
     const void * const * eff2 = moe_hf_wait(ctx, session, second);
-    const ggml_cuda_moe_mixed_pair rest = { bank2, base2, &op2, eff2, skip_of(second), second.hot, glu };
+    bool listed = false;
+    if (p2list) {
+        const bool up_first = first.mj_kind == 0;
+        const void * const * up_eff = up_first ? eff : eff2;
+        const void * const * gate_eff = up_first ? eff2 : eff;
+        ggml_tensor & up_op = up_first ? op : op2;
+        ggml_tensor & gate_op = up_first ? op2 : op;
+        const int64_t n_in = a->ne[0], n_out = op.ne[0], n_ids = ids->ne[0], n_tok = ids->ne[1], ch = a->ne[1];
+        auto mixed_rest = [&](ggml_tensor * d1, ggml_tensor * d2, ggml_tensor * g) {
+            const ggml_cuda_moe_mixed_pair rest = { bank2, base2, d2, eff2, skip_of(second), second.hot, g, both };
+            ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, d1, quantized, eff, skip_of(first), first.hot,
+                    route_map, route_mask, bank_q.get(), bank_s.get(), 2, &rest);
+        };
+        if (glu) {
+            // check mode: the mixed phase 2 into a copy of glu (its up/gate stores land in op/op2 as usual)
+            listed = moe_miss_pass_list(ctx, session, first.mj_layer, 3, up_eff, gate_eff, wtype, quantized,
+                    (float *) glu->data, n_in, n_out, n_ids, n_tok, ch, [&](float * out) {
+                        ggml_tensor g = *glu;
+                        g.data = out;
+                        mixed_rest(&op, &op2, &g);
+                    });
+        } else {
+            listed = moe_miss_pass_list(ctx, session, first.mj_layer, 0, up_eff, nullptr, wtype, quantized,
+                    (float *) up_op.data, n_in, n_out, n_ids, n_tok, ch, [&](float * out) {
+                        ggml_tensor o = up_op;
+                        o.data = out;
+                        mixed_rest(up_first ? &o : &op, up_first ? &op2 : &o, nullptr);
+                    });
+            // the up list ran, so the gate list (same checks) runs too
+            const bool gate_listed = listed && moe_miss_pass_list(ctx, session, first.mj_layer, 1, gate_eff, nullptr,
+                    wtype, quantized, (float *) gate_op.data, n_in, n_out, n_ids, n_tok, ch, [&](float * out) {
+                        ggml_tensor o = gate_op;
+                        o.data = out;
+                        mixed_rest(up_first ? &op : &o, up_first ? &o : &op2, nullptr);
+                    });
+            GGML_ASSERT(gate_listed == listed);
+        }
+        if (listed) {
+            CUDA_CHECK(cudaGetLastError());
+            g_st_p2list.fetch_add(1, std::memory_order_relaxed);
+            if (tail) {
+                if (glu) {
+                    moe_tail_zero(ctx, ids, (int) first.desc.n_expert, glu);
+                } else {
+                    moe_tail_zero(ctx, ids, (int) first.desc.n_expert, &op);
+                    moe_tail_zero(ctx, ids, (int) first.desc.n_expert, &op2);
+                }
+            }
+            return true;
+        }
+    }
+    const ggml_cuda_moe_mixed_pair rest = { bank2, base2, &op2, eff2, skip_of(second), second.hot, glu, both };
     ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, &op, quantized, eff, skip_of(first), first.hot,
             route_map, route_mask, bank_q.get(), bank_s.get(), split ? 2 : 0, &rest);
     CUDA_CHECK(cudaGetLastError());
