@@ -2230,7 +2230,7 @@ struct clip_model_loader {
             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
         }
 
-        // host weights count as host memory; the device keeps the largest weight for the staging copy
+        // host weights count as host memory; the largest weight stays on the device as extra headroom (scheduler copies are in mem_compute; this is not a bound for cuBLAS F16 conversion of quantized weights)
         ggml_backend_buffer_type_t host_weights_buft = clip_host_weights_buft(ctx_clip);
         ggml_backend_dev_t weights_dev = ggml_backend_get_device(ctx_clip.backend);
 

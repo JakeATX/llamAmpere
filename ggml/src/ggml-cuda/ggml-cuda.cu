@@ -1958,12 +1958,6 @@ static bool ggml_cuda_host_weights_enabled() {
     return enabled;
 }
 
-// disables the CUDA_Host_W staging copy, for A/B tests only
-static bool ggml_cuda_host_weights_staging_disabled() {
-    static const bool disabled = getenv("GGML_CUDA_NO_HOST_WEIGHTS_STAGING") != nullptr;
-    return disabled;
-}
-
 static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
@@ -2749,16 +2743,12 @@ static std::vector<ggml_backend_cuda_kv_stream_runtime_t> ggml_cuda_kv_stream_pr
     return runtimes;
 }
 
-// CUDA_Host_W: pinned host memory for weights only, read by kernels through UVA
-// it has its own name so supports_buft can accept it without accepting CUDA_Host, which also holds model inputs: accepting CUDA_Host drops the scheduler input copy and the barrier with it
+// CUDA_Host_W: pinned host memory for weights only; CUDA does not claim it, so the scheduler copies these weights to the device per split
+// separate from CUDA_Host, which also holds model inputs: CUDA never accepts CUDA_Host_W, so the scheduler keeps its input copies and sync barrier
 static const char * ggml_backend_cuda_host_weights_buffer_type_name(ggml_backend_buffer_type_t buft) {
     return GGML_CUDA_NAME "_Host_W";
 
     GGML_UNUSED(buft);
-}
-
-static bool ggml_backend_buft_is_cuda_host_weights(ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_name == ggml_backend_cuda_host_weights_buffer_type_name;
 }
 
 static size_t ggml_backend_cuda_host_weights_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -2782,7 +2772,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_weights_buffer_type_alloc_bu
     void * ptr = ggml_cuda_host_malloc(size);
 
     if (ptr == nullptr) {
-        // no fallback to a CPU buffer: the device cannot read unpinned memory, the caller falls back to device memory
+        // pinned memory only, no pageable fallback: the caller uses device memory instead, or fails the load after a memory fit
         GGML_LOG_WARN("%s: failed to pin %.2f MiB of host memory for weights\n",
                 __func__, size / 1024.0 / 1024.0);
         return nullptr;
@@ -2942,21 +2932,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
-    // copy a CUDA_Host_W weight to the pool in one transfer, cuBLAS reading it in place over PCIe is ~5x slower
-    const bool src0_stage_from_host =
-        src0->buffer != nullptr &&
-        ggml_backend_buffer_is_host(src0->buffer) &&
-        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-        ggml_is_contiguously_allocated(src0) &&
-        !ggml_cuda_host_weights_staging_disabled();
-
-    if (src0->type == compute_type && src0_stage_from_host) {
-        // contiguously allocated, so s01/s02/s03 stay valid for the copy
-        src0_alloc.alloc(ggml_nelements(src0));
-        CUDA_CHECK(cudaMemcpyAsync(src0_alloc.get(), src0->data, ggml_nbytes(src0),
-                                   cudaMemcpyHostToDevice, main_stream));
-        src0_ptr = src0_alloc.get();
-    } else if (src0->type == compute_type) {
+    if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
     } else {
         src0_alloc.alloc(ggml_nelements(src0));
@@ -11019,8 +10995,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                          ggml_cuda_qsa_resident_is_buft(node->buffer->buft)) &&
                         node->buffer->buft->device == expected_dev) ||
                        ((integrated || ggml_cuda_host_weights_enabled()) &&
-                        ggml_backend_buft_is_cuda_host(node->buffer->buft)) ||
-                       ggml_backend_buft_is_cuda_host_weights(node->buffer->buft));
+                        ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
@@ -11030,8 +11005,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                  ggml_cuda_qsa_resident_is_buft(node->src[j]->buffer->buft)) &&
                                 node->src[j]->buffer->buft->device == expected_dev) ||
                                ((integrated || ggml_cuda_host_weights_enabled()) &&
-                                ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
-                               ggml_backend_buft_is_cuda_host_weights(node->src[j]->buffer->buft));
+                                ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
 #else
@@ -12647,8 +12621,7 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
         || (ggml_backend_buft_is_cuda_kv_stream(buft) && buft->device == dev)
         || (ggml_cuda_qsa_resident_is_buft(buft) && buft->device == dev)
         || (ggml_backend_buft_is_cuda_qsa_raw_host(buft) && buft->device == dev)
-        || ((integrated || ggml_cuda_host_weights_enabled()) && ggml_backend_buft_is_cuda_host(buft))
-        || ggml_backend_buft_is_cuda_host_weights(buft);
+        || ((integrated || ggml_cuda_host_weights_enabled()) && ggml_backend_buft_is_cuda_host(buft));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {

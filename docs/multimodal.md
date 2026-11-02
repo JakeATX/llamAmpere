@@ -16,7 +16,7 @@ To enable it, you can use one of the 2 methods below:
 
 By default, multimodal projector will be offloaded to GPU. To disable this, add `--no-mmproj-offload`
 
-On CUDA, `--mmproj-host-weights` keeps the projector weights in pinned host RAM while the projector still runs on the GPU. This frees the projector's VRAM (about 0.9 GiB for a 27B Qwen F16 projector) at the cost of slower image encoding; the weights are pinned, so that RAM cannot be swapped out. `GGML_CUDA_NO_HOST_WEIGHTS_STAGING=1` disables the per-matmul staging copy, for A/B comparison only. If pinning fails, the weights go to VRAM instead; in `llama-server` with `--fit on` (the default) startup fails instead, to prevent a VRAM fallback the fit did not plan for.
+On CUDA, `--mmproj-host-weights` keeps the projector weights in pinned host RAM while the projector still runs on the GPU. This frees the projector's VRAM (about 0.9 GiB for a 27B Qwen F16 projector) at the cost of slower image encoding; the weights are pinned, so that RAM cannot be swapped out. The scheduler copies the weights to the GPU for each part of the graph, so quantized projectors also avoid slow reads over PCIe (a Q8_0 projector measured about as fast as F16 on an RTX 3090 Ti). If pinning fails, the weights go to VRAM instead; in `llama-server` with `--fit on` (the default) startup fails instead, to prevent a VRAM fallback the fit did not plan for.
 
 For example:
 
