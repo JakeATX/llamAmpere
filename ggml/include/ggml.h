@@ -469,6 +469,13 @@ extern "C" {
         GGML_TYPE_AIT3_U  = 116,
         GGML_TYPE_AIT4_U  = 117,
         GGML_TYPE_AIT2P_U = 121, // AIT2_U bytes and units, AIT2P pair-table level map (ggml-ai4.h)
+        // AITk_U2 (k = 2/3/4), expert unit layout v2: same 128-weight tiles and constants as AITk_U, but ONE fp16 scale per
+        // row per 640 K (block = 16 rows x 640 K = [16 fp16 scales][5 units x 16 tiles x 16k bytes], 80k + 2 bytes per row
+        // and block, k + 0.025 bpw) and the full-sum level rule w = scale * (bytesum(state * C) - 510) / 4 (no >> 2 rounding).
+        // K % 640 == 0 (Flash-Next experts 2560 / 640). Not a ggml_ai4_is_unit type: no kernel dispatches it yet (ggml-ai4.h).
+        GGML_TYPE_AIT2_U2 = 122,
+        GGML_TYPE_AIT3_U2 = 123,
+        GGML_TYPE_AIT4_U2 = 124,
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         GGML_TYPE_COUNT   = 144,
@@ -839,6 +846,9 @@ extern "C" {
     // AI+ unit level map: 0 = 1MAD (trellis_mul), 1 = AIT2P pair table (GGML_TYPE_AIT2P_U, trellis_mul 0), -1 = not a unit type
     GGML_API int      ggml_ai4_code       (enum ggml_type type);
     GGML_API float    ggml_ai4_scale_mul  (enum ggml_type type);
+    // AITk_U2 expert layout v2: trellis rate k for GGML_TYPE_AIT2_U2..AIT4_U2, 0 otherwise (decoder constants = those of the AITk_U type)
+    GGML_API int      ggml_ai4v2_rate     (enum ggml_type type);
+    GGML_API uint32_t ggml_ai4v2_trellis_mul(enum ggml_type type);
 
     GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits/weight for GGML_TYPE_EXL3_*, 0 otherwise
     // EXL3 reference decode of trellis rows 16*g .. 16*g+15 of a [K, N] EXL3 tensor (bits 2..8) into y[16][K]

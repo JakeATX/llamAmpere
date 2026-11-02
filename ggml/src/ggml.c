@@ -870,6 +870,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // 16-row units, not row-addressable
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_AIT2_U2] = {
+        .type_name                = "ait2_u2",
+        .blck_size                = 640,
+        .type_size                = 162,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT3_U2] = {
+        .type_name                = "ait3_u2",
+        .blck_size                = 640,
+        .type_size                = 242,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT4_U2] = {
+        .type_name                = "ait4_u2",
+        .blck_size                = 640,
+        .type_size                = 322,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_AIT3_U] = {
         .type_name                = "ait3_u",
         .blck_size                = 128,
@@ -1607,6 +1631,24 @@ int ggml_ai4_rate(enum ggml_type type) {
         case GGML_TYPE_AIT4_U:  return 4;
         case GGML_TYPE_AIT5_U:  return 5;
         default:                return 0;
+    }
+}
+
+int ggml_ai4v2_rate(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U2: return 2;
+        case GGML_TYPE_AIT3_U2: return 3;
+        case GGML_TYPE_AIT4_U2: return 4;
+        default:                return 0;
+    }
+}
+
+uint32_t ggml_ai4v2_trellis_mul(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U2: return 0xC3CCD12Du;
+        case GGML_TYPE_AIT3_U2: return 0x87D8D12Du;
+        case GGML_TYPE_AIT4_U2: return 0xAA73876Bu;
+        default:                return 0u;
     }
 }
 

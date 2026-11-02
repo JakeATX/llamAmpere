@@ -172,6 +172,45 @@ static inline void aik_dequantize_slab_c(int k, uint32_t C, const uint8_t * src,
     }
 }
 
+// ---- AITk_U2 (expert layout v2): one fp16 scale per row per 640 K, full-sum level rule (see ggml.h GGML_TYPE_AIT2_U2) ----
+#define AI4V2_BK             640
+#define AI4V2_UNITS          (AI4V2_BK/AI4U_UK)                      // 5 units of 128 K per block
+#define AI4V2_BLOCK_BYTES(k) (AI4U_SCALE_BYTES + AI4V2_UNITS*(AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k))   // 32 + 1280 k
+
+// 4 x level: the full 4-byte sum of state * C, centered (range -510..510); weight = scale * level4 / 4
+static inline int aik_level4_c(uint32_t state, uint32_t C) {
+    const uint32_t x = state * C;
+    return (int)(x & 255) + (int)((x >> 8) & 255) + (int)((x >> 16) & 255) + (int)(x >> 24) - 510;
+}
+
+// block = 16 rows x 640 K at src (AI4V2_BLOCK_BYTES(k) bytes); dst rows stride K; tiles are the AITk_U tiles (no pair code)
+static inline void aik_dequantize_block_v2_rotated(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K) {
+    const int tw = AIK_TILE_WORDS(k);
+    const uint16_t * dh = (const uint16_t *) src;
+    for (int u = 0; u < AI4V2_UNITS; ++u) {
+        const uint32_t * wd = (const uint32_t *) (src + AI4U_SCALE_BYTES + (int64_t) u*(AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k));
+        for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
+            for (int n = 0; n < AI4_TILE; ++n) {
+                const int r = n / AI4_TC, kk = u*AI4U_UK + ct*AI4_TC + n % AI4_TC;
+                dst[r*K + kk] = ai4_fp16_to_fp32(dh[r])*0.25f*(float) aik_level4_c(aik_get_state(wd + ct*tw, k, n), C);
+            }
+        }
+    }
+}
+
+// slab = 16 rows x K (K % 640 == 0): K/640 blocks; dst[16][K] after the inverse rotation (H256 if K % 256 == 0, else H128)
+static inline void aik_dequantize_slab_v2_c(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K) {
+    for (int64_t b = 0; b < K/AI4V2_BK; ++b) {
+        aik_dequantize_block_v2_rotated(k, C, src + b*AI4V2_BLOCK_BYTES(k), dst + b*AI4V2_BK, K);
+    }
+    const int rb = ai4u_rot_size(K);
+    for (int r = 0; r < AI4_TR; ++r) {
+        for (int64_t b = 0; b < K/rb; ++b) {
+            ai4_unrotate_n(dst + r*K + b*rb, rb);
+        }
+    }
+}
+
 static inline int64_t ai4x_slab_bytes_k(int64_t K, int k) {
     return (K/AI4U_UK)*AI4U_UNIT_BYTES(k);
 }

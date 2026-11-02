@@ -380,6 +380,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_AIT2_U2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // no CPU op yet (reference decode in ggml-ai4.h)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AIT3_U2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // no CPU op yet (reference decode in ggml-ai4.h)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AIT4_U2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // no CPU op yet (reference decode in ggml-ai4.h)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_AIT3_U] = {
         .from_float               = NULL,
         .vec_dot                  = NULL, // whole-operation unit reference path
