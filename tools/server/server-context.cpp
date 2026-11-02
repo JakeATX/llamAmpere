@@ -2275,6 +2275,8 @@ private:
                 }
             }
 
+            // the fit counted pinned weights as host memory: a pin failure now must not fall back to device memory
+            mparams.host_weights_strict = params_base.fit_params;
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());

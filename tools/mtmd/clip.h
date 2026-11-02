@@ -50,6 +50,7 @@ struct clip_context_params {
     bool use_gpu;
     // projector weights in pinned host memory (see mtmd_context_params)
     bool host_weights;
+    bool host_weights_strict;
     ggml_backend_dev_t device;
     enum clip_flash_attn_type flash_attn_type;
     int image_min_tokens;

@@ -169,6 +169,7 @@ struct clip_ctx {
 
     // keep projector weights in pinned host memory (--mmproj-host-weights)
     bool host_weights = false;
+    bool host_weights_strict = false;
 
     // for measuring memory usage
     bool no_alloc = false;
@@ -185,6 +186,7 @@ struct clip_ctx {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
         host_weights = ctx_params.host_weights;
+        host_weights_strict = ctx_params.host_weights_strict;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -3748,6 +3750,9 @@ struct clip_model_loader {
                         ctx_clip.buf.reset(host_buf);
                         LOG_INF("%s: --mmproj-host-weights: projector weights in host memory, buffer \"%s\"\n",
                                 __func__, ggml_backend_buft_name(buft));
+                    } else if (ctx_clip.host_weights_strict && !ctx_clip.no_alloc) {
+                        // the memory fit counted these weights as host memory, so device memory may not have room for them
+                        throw std::runtime_error(string_format("%s: --mmproj-host-weights: failed to pin host memory after the memory fit; free host RAM, or use --fit off or --no-mmproj-host-weights\n", __func__));
                     } else {
                         LOG_WRN("%s: --mmproj-host-weights: failed to pin host memory, weights stay in device memory\n",
                                 __func__);

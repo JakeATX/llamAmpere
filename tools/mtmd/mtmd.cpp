@@ -459,6 +459,7 @@ mtmd_context_params mtmd_context_params_default() {
     mtmd_context_params params {
         /* use_gpu           */ true,
         /* host_weights      */ false,
+        /* host_weights_strict */ false,
         /* device            */ nullptr,
         /* print_timings     */ true,
         /* n_threads         */ 4,
@@ -569,6 +570,7 @@ struct mtmd_context {
         clip_context_params ctx_clip_params {
             /* use_gpu           */ ctx_params.use_gpu,
             /* host_weights      */ ctx_params.host_weights,
+            /* host_weights_strict */ ctx_params.host_weights_strict,
             /* device            */ ctx_params.device,
             /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ctx_params.flash_attn_type),
             /* image_min_tokens  */ ctx_params.image_min_tokens,
