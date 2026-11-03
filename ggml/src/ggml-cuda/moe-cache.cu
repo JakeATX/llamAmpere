@@ -161,6 +161,49 @@ static bool moe_bank_p1_hitg_down() {
     return (moe_bank_p1_hitg_bits() & 2) != 0;
 }
 
+// fork AIPFIX P1CONC: GGML_MOE_BANK_P1_CONC=1 (default off, needs P1HITG and the bank zero skip). With P1HITG the
+// 3XS hit kernel and the bank-only mixed phase 1 each fill a fraction of the card (ncu: the width-5 mixed launch runs
+// at 22% occupancy). The bank phase now runs on a second stream at the same time as the hit kernel, which skips bank
+// routes without writing them, so the two launches write disjoint rows. Same kernels, same inputs, same per-row
+// arithmetic: the output is bit-identical to P1HITG alone.
+static bool moe_bank_p1_conc() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_MOE_BANK_P1_CONC");
+        const bool on = e && atoi(e) != 0;
+        if (on) {
+            GGML_LOG_INFO("[p1-conc] bank phase 1 on a second stream beside the 3XS hit kernel\n");
+        }
+        return on;
+    }();
+    return v && ggml_cuda_moe_bank_zero_active();
+}
+static constexpr int MOE_P1_CONC_STREAM = GGML_CUDA_MAX_STREAMS - 1;
+static std::atomic<unsigned long long> g_st_p1conc{0};
+// fork: run(): the bank launch, issued on the side stream; then main(): the hit kernel with bank rows unwritten.
+template <typename B, typename H>
+static void moe_p1_conc_run(ggml_backend_cuda_context & ctx, B && bank_launch, H && hit_launch) {
+    static cudaEvent_t ev[GGML_CUDA_MAX_DEVICES][2] = {};
+    const int dev = ctx.device;
+    if (!ev[dev][0]) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev[dev][0], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev[dev][1], cudaEventDisableTiming));
+    }
+    const int saved = ctx.curr_stream_no;
+    cudaStream_t main_s = ctx.stream();
+    cudaStream_t side_s = ctx.stream(dev, MOE_P1_CONC_STREAM);
+    CUDA_CHECK(cudaEventRecord(ev[dev][0], main_s));
+    CUDA_CHECK(cudaStreamWaitEvent(side_s, ev[dev][0], 0));
+    ctx.curr_stream_no = MOE_P1_CONC_STREAM;
+    bank_launch();
+    ctx.curr_stream_no = saved;
+    CUDA_CHECK(cudaEventRecord(ev[dev][1], side_s));
+    ggml_cuda_moe_set_bank_zero_nowrite(true);
+    hit_launch();
+    ggml_cuda_moe_set_bank_zero_nowrite(false);
+    CUDA_CHECK(cudaStreamWaitEvent(main_s, ev[dev][1], 0));
+    g_st_p1conc.fetch_add(1, std::memory_order_relaxed);
+}
+
 // fork MOEGAP DOWNONE: GGML_MOE_DOWN_ONE=1|check. On a hit-first layer the down projection waits for its copy
 // first and then computes every route the card owns in ONE launch over the effective table (resident experts at
 // their cache address, staged ones at their copy), instead of a hit pass and a miss pass. The down copy is normally
@@ -388,10 +431,10 @@ static void moe_missjoin_log(const char * when) {
             ggml_cuda_moe_down_sw_count() || g_st_one.load() || g_st_pub_plan.load() || g_st_p2list.load() ||
             g_st_p1hitg.load()) {
         MOE_CACHE_LOG("[moe-cache] path counts %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
-                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu bank_p2_list=%llu bank_p1_hitg=%llu (issue-time counts)\n",
+                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu bank_p2_list=%llu bank_p1_hitg=%llu bank_p1_conc=%llu (issue-time counts)\n",
                 when, g_st_hitg.load(), g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(),
                 ggml_cuda_moe_down_sw_count(), g_st_one.load(), g_st_pub_plan.load(), g_st_p2list.load(),
-                g_st_p1hitg.load());
+                g_st_p1hitg.load(), g_st_p1conc.load());
     }
     if (g_cs_on && g_cs_plan) {
         moe_cs_plan_dev plan{};
@@ -12390,13 +12433,23 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             const bool p1hd = split && !ai && table.mj_kind == 2 && ids->ne[2] == 1 && moe_bank_p1_hitg_down();
             const ggml_cuda_moe_mixed_reduce * kred = (cs && table.mj_kind == 2) || p2list || p1hd ? nullptr : red;
             if (split) {
+                auto phase1 = [&]() {
+                    ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, table.device, nullptr, table.hot,
+                            route_map, route_mask, bank_q.get(), bank_s.get(), p1hd ? 3 : 1, nullptr, kred);
+                    CUDA_CHECK(cudaGetLastError());
+                };
                 if (p1hd) {
-                    hit_pass((float *) op->data);
                     g_st_p1hitg.fetch_add(1, std::memory_order_relaxed);
                 }
-                ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, table.device, nullptr, table.hot,
-                        route_map, route_mask, bank_q.get(), bank_s.get(), p1hd ? 3 : 1, nullptr, kred);
-                CUDA_CHECK(cudaGetLastError());
+                // fork AIPFIX P1CONC: bank-only phase 3 on the side stream while the 3XS hit pass runs
+                if (p1hd && moe_bank_p1_conc()) {
+                    moe_p1_conc_run(ctx, phase1, [&]() { hit_pass((float *) op->data); });
+                } else {
+                    if (p1hd) {
+                        hit_pass((float *) op->data);
+                    }
+                    phase1();
+                }
             }
             eff = moe_hf_wait(ctx, session, table);
             auto mixed_rest = [&](float * out) {
@@ -12608,20 +12661,30 @@ bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
             ggml_cuda_moe_table_mmv_hitg_supported(wtype, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
                     ids_stride);
     const bool both = (p2list && glu != nullptr) || p1hitg;
-    if (p1hitg) {
-        const auto & up_t = first.mj_kind == 0 ? first : second;
-        const auto & gate_t = first.mj_kind == 0 ? second : first;
-        ggml_cuda_moe_table_mmv_hitg(ctx, up_t.device, gate_t.device, wtype, quantized, (const int32_t *) ids->data,
-                (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids_stride,
-                up_t.hot, gate_t.hot, 1);
-        g_st_p1hitg.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (split) {
-        ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot, glu, both };
-        resident.hot_only = p1hitg;
+    ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot, glu, both };
+    resident.hot_only = p1hitg;
+    auto phase1 = [&]() {
         ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, &op, quantized, first.device, nullptr, first.hot,
                 route_map, route_mask, bank_q.get(), bank_s.get(), 1, &resident);
         CUDA_CHECK(cudaGetLastError());
+    };
+    if (p1hitg) {
+        const auto & up_t = first.mj_kind == 0 ? first : second;
+        const auto & gate_t = first.mj_kind == 0 ? second : first;
+        auto hit = [&]() {
+            ggml_cuda_moe_table_mmv_hitg(ctx, up_t.device, gate_t.device, wtype, quantized, (const int32_t *) ids->data,
+                    (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids_stride,
+                    up_t.hot, gate_t.hot, 1);
+        };
+        g_st_p1hitg.fetch_add(1, std::memory_order_relaxed);
+        if (moe_bank_p1_conc()) {
+            moe_p1_conc_run(ctx, phase1, hit);   // split is set whenever p1hitg is
+        } else {
+            hit();
+            phase1();
+        }
+    } else if (split) {
+        phase1();
     }
     const void * const * eff = moe_hf_wait(ctx, session, first);
     const void * const * eff2 = moe_hf_wait(ctx, session, second);

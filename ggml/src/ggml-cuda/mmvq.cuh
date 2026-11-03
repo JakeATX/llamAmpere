@@ -104,6 +104,8 @@ bool ggml_cuda_moe_table_mmv_list_supported(ggml_type type, bool fused, int64_t 
 int ggml_cuda_moe_hit_fused_mode();
 // fork AIPNEXTK BANKSKIP: filtered MoE table kernels skip routes whose table entry is this address (null: off)
 void ggml_cuda_moe_set_bank_zero(const void * zero);
+void ggml_cuda_moe_set_bank_zero_nowrite(bool on);
+bool ggml_cuda_moe_bank_zero_active();
 bool ggml_cuda_moe_table_mmv_hitg_supported(ggml_type type, int64_t n_in, int64_t n_out, int64_t n_ids,
         int64_t n_tokens, int64_t channels, int64_t ids_stride);
 void ggml_cuda_moe_table_mmv_hitg(ggml_backend_cuda_context & ctx,

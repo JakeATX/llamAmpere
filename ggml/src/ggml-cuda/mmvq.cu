@@ -21,8 +21,25 @@ static const void * g_moe_bank_zero_host[GGML_CUDA_MAX_DEVICES] = {};
 void ggml_cuda_moe_set_bank_zero(const void * zero) {
     g_moe_bank_zero_host[ggml_cuda_get_device()] = zero;
 }
+// fork AIPFIX P1CONC: while set, the zero-block pointer goes out with its low bit set and the kernels skip bank
+// routes without writing them (the bank pass on a second stream writes those rows at the same time).
+static bool g_moe_bank_zero_nowrite[GGML_CUDA_MAX_DEVICES] = {};
+void ggml_cuda_moe_set_bank_zero_nowrite(bool on) {
+    g_moe_bank_zero_nowrite[ggml_cuda_get_device()] = on;
+}
+bool ggml_cuda_moe_bank_zero_active() {
+    return g_moe_bank_zero_host[ggml_cuda_get_device()] != nullptr;
+}
 static const void * moe_bank_zero_cur() {
-    return g_moe_bank_zero_host[ggml_cuda_get_device()];
+    const int dev = ggml_cuda_get_device();
+    const void * z = g_moe_bank_zero_host[dev];
+    return z && g_moe_bank_zero_nowrite[dev] ? (const void *) ((uintptr_t) z | 1) : z;
+}
+static __device__ __forceinline__ const void * moe_bz(const void * z) {
+    return (const void *) ((uintptr_t) z & ~(uintptr_t) 1);
+}
+static __device__ __forceinline__ bool moe_bz_write(const void * z) {
+    return ((uintptr_t) z & 1) == 0;
 }
 
 #include <climits>
@@ -1699,8 +1716,8 @@ static __global__ void mul_mat_vec_q_moe(
         if (!shared_expert && (route_hot[channel_x] != 0) != (route_want_hot != 0)) {
             return;
         }
-        if (!shared_expert && expert_table && bank_zero && expert_table[channel_x] == bank_zero) {
-            if (threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+        if (!shared_expert && expert_table && bank_zero && expert_table[channel_x] == moe_bz(bank_zero)) {
+            if (moe_bz_write(bank_zero) && threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
                 dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
             }
             return;
@@ -2128,8 +2145,8 @@ static __global__ void mul_mat_vec_q_moe_d1(
         if ((route_hot[me] != 0) != (route_want_hot != 0)) {
             return;
         }
-        if (bank_zero && table[me] == bank_zero) {
-            moe_bank_zero_routes<c_warps*c_rows>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
+        if (bank_zero && table[me] == moe_bz(bank_zero)) {
+            if (moe_bz_write(bank_zero)) moe_bank_zero_routes<c_warps*c_rows>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
             return;
         }
     }
@@ -2324,8 +2341,8 @@ static __global__ void mul_mat_vec_q_moe_sw(
     if (route_hot != nullptr && (route_hot[me] != 0) != (route_want_hot != 0)) {
         return;
     }
-    if (route_hot != nullptr && bank_zero && table[me] == bank_zero) {
-        moe_bank_zero_routes<c_warps*rows_per_warp>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
+    if (route_hot != nullptr && bank_zero && table[me] == moe_bz(bank_zero)) {
+        if (moe_bz_write(bank_zero)) moe_bank_zero_routes<c_warps*rows_per_warp>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
         return;
     }
     const int wrow0 = (blockIdx.x*c_warps + threadIdx.y)*rows_per_warp;
@@ -2474,8 +2491,8 @@ static __global__ void mul_mat_vec_q_moe_hitg(
     if (((m0[me] != 0) && (m1[me] != 0)) != (want != 0)) {
         return;
     }
-    if (bank_zero && up_table[me] == bank_zero && gate_table[me] == bank_zero) {
-        moe_bank_zero_routes<c_warps*c_rows>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
+    if (bank_zero && up_table[me] == moe_bz(bank_zero) && gate_table[me] == moe_bz(bank_zero)) {
+        if (moe_bz_write(bank_zero)) moe_bank_zero_routes<c_warps*c_rows>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
         return;
     }
     constexpr bool use_smem = c_smem && ggml_cuda_mmvq_smem_grid_type(type);
@@ -2683,8 +2700,8 @@ static __global__ void mul_mat_vec_q_moe_hitg_sw(
     if (((m0[me] != 0) && (m1[me] != 0)) != (want != 0)) {
         return;
     }
-    if (bank_zero && up_table[me] == bank_zero && gate_table[me] == bank_zero) {
-        moe_bank_zero_routes<c_warps*rows_per_warp>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
+    if (bank_zero && up_table[me] == moe_bz(bank_zero) && gate_table[me] == moe_bz(bank_zero)) {
+        if (moe_bz_write(bank_zero)) moe_bank_zero_routes<c_warps*rows_per_warp>(mask, dst, nrows_x, n_ids, stride_col_dst, stride_channel_dst);
         return;
     }
     // [MOEGAP HITGSW s] codebook copy in shared memory, as mul_mat_vec_q_moe_hitg (block-uniform point: every
