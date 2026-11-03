@@ -2607,10 +2607,11 @@ void llama_model::register_moe_bank() {
         LLAMA_LOG_INFO("[moe-bank] %zu experts in %d layers always resident (%.1f MiB)\n", n_bank, n_bank_layers, bank_bytes / 1048576.0);
         // fork AIPFIX BANKDET: on the bank path, which experts the prompt leaves in the expert cache depended on
         // fill-worker timing (live-queue limits, fills published mid-scope), so identical runs could answer
-        // differently. With a bank, default to the deterministic cache mode (GGML_MOE_CACHE_DET) with prompt
-        // queue limits that never bind. Explicit settings win; LLAMA_MOE_BANK_DET=0 keeps the old behavior.
+        // differently. LLAMA_MOE_BANK_DET=1 selects the deterministic cache mode (GGML_MOE_CACHE_DET) with prompt
+        // queue limits that never bind. Opt-in (LLAMA_MOE_BANK_DET=1, default off) so the default keeps the
+        // timing-driven fill and its speed. Explicit GGML_* settings win.
         const char * bd = getenv("LLAMA_MOE_BANK_DET");
-        if (!bd || atoi(bd) != 0) {
+        if (bd && atoi(bd) != 0) {
 #ifdef _WIN32
             if (!getenv("GGML_MOE_CACHE_DET"))           { _putenv_s("GGML_MOE_CACHE_DET", "1"); }
             if (!getenv("GGML_CUDA_MOE_CACHE_QUEUE"))    { _putenv_s("GGML_CUDA_MOE_CACHE_QUEUE", "65536"); }
