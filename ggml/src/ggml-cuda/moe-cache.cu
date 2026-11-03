@@ -162,6 +162,20 @@ static bool moe_bank_p1_hitg_down() {
     return (moe_bank_p1_hitg_bits() & 2) != 0;
 }
 
+// fork AIPFIX P2SAME: with P1HITG, a banked layer's copied (3XS) routes run through the same 3XS kernel as its cached
+// routes (the hit kernel again, with the miss masks), as a 3XS layer's hit and miss passes do, instead of the mixed
+// kernel's phase 2 or the miss list. Then a route's bits do not depend on whether its expert was resident or copied
+// this step (the run-to-run split of the bank path: same input, different prompt-time cache fill, different tokens).
+// Default on; GGML_MOE_BANK_P2_SAME=0 opts out.
+static bool moe_bank_p2_same() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_MOE_BANK_P2_SAME");
+        return !e || atoi(e) != 0;
+    }();
+    return v;
+}
+static std::atomic<unsigned long long> g_st_p2same{0};
+
 // fork AIPFIX P1CONC: GGML_MOE_BANK_P1_CONC (staged default ON, =0 opts out; needs P1HITG and the bank zero skip). With P1HITG the
 // 3XS hit kernel and the bank-only mixed phase 1 each fill a fraction of the card (ncu: the width-5 mixed launch runs
 // at 22% occupancy). The bank phase now runs on a second stream at the same time as the hit kernel, which skips bank
@@ -433,12 +447,12 @@ static void moe_missjoin_log(const char * when) {
     }
     if (g_st_hitg.load() || g_st_ml.load() || g_st_pc.load() || g_st_q8hit.load() || g_st_q8claim.load() ||
             ggml_cuda_moe_down_sw_count() || g_st_one.load() || g_st_pub_plan.load() || g_st_p2list.load() ||
-            g_st_p1hitg.load()) {
+            g_st_p1hitg.load() || g_st_p2same.load()) {
         MOE_CACHE_LOG("[moe-cache] path counts %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
-                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu bank_p2_list=%llu bank_p1_hitg=%llu bank_p1_conc=%llu (issue-time counts)\n",
+                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu bank_p2_list=%llu bank_p1_hitg=%llu bank_p1_conc=%llu bank_p2_same=%llu (issue-time counts)\n",
                 when, g_st_hitg.load(), g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(),
                 ggml_cuda_moe_down_sw_count(), g_st_one.load(), g_st_pub_plan.load(), g_st_p2list.load(),
-                g_st_p1hitg.load(), g_st_p1conc.load());
+                g_st_p1hitg.load(), g_st_p1conc.load(), g_st_p2same.load());
     }
     if (g_cs_on && g_cs_plan) {
         moe_cs_plan_dev plan{};
@@ -12610,7 +12624,12 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
                 ggml_cuda_mul_mat_id_mixed(ctx, bank, op, &o, quantized, eff, mixed_skip, table.hot, route_map,
                         route_mask, bank_q.get(), bank_s.get(), split ? 2 : 0, nullptr, kred);
             };
-            if (!p2list || !moe_miss_pass_list(ctx, session, table.mj_layer, table.mj_kind, eff, nullptr, wtype,
+            // fork AIPFIX P2SAME: with P1HITG down, the copied routes take the 3XS miss pass (same kernel as the
+            // hit pass above, miss masks; bank routes are hot and skipped), not the mixed kernel's phase 2
+            if (p1hd && moe_bank_p2_same()) {
+                old_miss((float *) op->data);
+                g_st_p2same.fetch_add(1, std::memory_order_relaxed);
+            } else if (!p2list || !moe_miss_pass_list(ctx, session, table.mj_layer, table.mj_kind, eff, nullptr, wtype,
                         quantized, (float *) op->data, a->ne[0], op->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
                         mixed_rest)) {
                 mixed_rest((float *) op->data);
@@ -12840,6 +12859,24 @@ bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
     }
     const void * const * eff = moe_hf_wait(ctx, session, first);
     const void * const * eff2 = moe_hf_wait(ctx, session, second);
+    // fork AIPFIX P2SAME: the copied routes take the hit kernel again with the miss masks (the 3XS layer's miss pass):
+    // bank routes are hot (skipped), phase 1 wrote them; resident routes were written by the hit pass above.
+    if (p1hitg && moe_bank_p2_same()) {
+        const bool up_first = first.mj_kind == 0;
+        const auto & up_t = up_first ? first : second;
+        const auto & gate_t = up_first ? second : first;
+        const uint8_t * skip_up = skip_of(up_t);
+        const uint8_t * skip_gate = skip_of(gate_t);
+        ggml_cuda_moe_table_mmv_hitg(ctx, up_first ? eff : eff2, up_first ? eff2 : eff, wtype, quantized,
+                (const int32_t *) ids->data, (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1],
+                a->ne[1], ids_stride, skip_up ? skip_up : up_t.hot, skip_gate ? skip_gate : gate_t.hot, 0);
+        CUDA_CHECK(cudaGetLastError());
+        g_st_p2same.fetch_add(1, std::memory_order_relaxed);
+        if (tail) {
+            moe_tail_zero(ctx, ids, (int) first.desc.n_expert, glu);
+        }
+        return true;
+    }
     bool listed = false;
     if (p2list) {
         const bool up_first = first.mj_kind == 0;
