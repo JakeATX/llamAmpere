@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -2412,6 +2413,36 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     // GGML_CUDA_AI23_MIXED_SPW_WARPS=2|4 (default 4).
     static const int spw_warps = ai4_env_int("GGML_CUDA_AI23_MIXED_SPW_WARPS", nullptr, 4) == 2 ? 2 : 4;
     const int slabs_per_block = spw ? spw_warps : 1;
+    // fork AIPFIX P1PLAIN: phase 3 of a down projection (bank routes only; the 3XS hit kernel ran the cached ones,
+    // and the down ids already hold bank slots) runs the plain AI+ direct GEMV, the MUL_MAT_ID kernel that isolated
+    // ncu measured at 63-79% of DRAM speed, instead of the mixed kernel (22% occupancy). Routes without a bank slot
+    // exit unwritten, as in phase 3. The k order may differ (KLD-close class). GGML_MOE_BANK_P1_PLAIN=1 opts in.
+    static const bool p1_plain = ai4_env_int("GGML_MOE_BANK_P1_PLAIN", nullptr, 0) != 0;
+    if (p1_plain && p1_hot_only && !pair && !red && !route_map && w->type != GGML_TYPE_IQ4_NL) {
+        const int n_tok = (int) ids->ne[1], n_pairs = (int) ggml_nelements(ids);
+        const uint8_t * W = (const uint8_t *) w->data;
+        float * Y = (float *) dst->data;
+        bool ok = false;
+        switch (ai4_lay_of(w->type)) {
+#define AI4_P1_PLAIN(L) \
+            case L: ok = xsh ? ai4_mmvr_try<L, 1, true>(W, act_ai_q, act_ai_s, Y, M, n_tok, K, ctx.stream(), idm, n_pairs) \
+                             : ai4_mmvr_try<L, 0, true>(W, act_ai_q, act_ai_s, Y, M, n_tok, K, ctx.stream(), idm, n_pairs); break;
+            AI4_P1_PLAIN(ai4k::LAY_AIT2_U)
+            AI4_P1_PLAIN(ai4k::LAY_AIT2P_U)
+            AI4_P1_PLAIN(ai4k::LAY_AIT3_U)
+            AI4_P1_PLAIN(ai4k::LAY_AIT4_U)
+#undef AI4_P1_PLAIN
+            default: break;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            fprintf(stderr, "[moe-bank] P1PLAIN first phase-3 down: type=%d K=%d M=%d plain=%d\n", (int) w->type, K, M, (int) ok);
+        }
+        if (ok) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     const dim3 grid((M/16 + slabs_per_block - 1)/slabs_per_block*(pair ? 2 : 1), p2_compact ? p2_y : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
     moe_mixed_second second{};
     if (pair) {
