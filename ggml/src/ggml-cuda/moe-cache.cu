@@ -146,12 +146,19 @@ static bool moe_bank_p2_list() {
 // fused hit kernel (one weight read per expert for every token routed to it, SwiGLU in the store), before the mixed
 // phase 1, which then takes the bank routes only. Needs the hit-first split and the fused SwiGLU. Default off until
 // a paired speed run.
-static bool moe_bank_p1_hitg() {
-    static const bool v = [] {
+// Bit 0: gate/up, bit 1: down (=3 both).
+static int moe_bank_p1_hitg_bits() {
+    static const int v = [] {
         const char * e = getenv("GGML_MOE_BANK_P1_HITG");
-        return e && atoi(e) != 0;
+        return e ? atoi(e) & 3 : 0;
     }();
     return v;
+}
+static bool moe_bank_p1_hitg() {
+    return (moe_bank_p1_hitg_bits() & 1) != 0;
+}
+static bool moe_bank_p1_hitg_down() {
+    return (moe_bank_p1_hitg_bits() & 2) != 0;
 }
 
 // fork MOEGAP DOWNONE: GGML_MOE_DOWN_ONE=1|check. On a hit-first layer the down projection waits for its copy
@@ -12377,10 +12384,18 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
             const bool p2list = split && moe_bank_p2_list() && ids->ne[2] == 1 && table.mj_kind >= 0 &&
                     table.mj_kind < 3 && session.ml_layer >= 0 && session.ml_layer == table.mj_layer &&
                     ggml_cuda_moe_table_mmv_list_supported(wtype, false, a->ne[0], ids->ne[0], ids->ne[1], a->ne[1]);
-            const ggml_cuda_moe_mixed_reduce * kred = (cs && table.mj_kind == 2) || p2list ? nullptr : red;
+            // fork AIPFIX P1HITG (down): the cached 3XS down routes take the 3XS hit kernel (one weight read per
+            // expert for all tokens routed to it; bank routes get zeros there), phase 1 then takes the bank routes
+            // only, and the routed sum is its own launch, as P2LIST.
+            const bool p1hd = split && !ai && table.mj_kind == 2 && ids->ne[2] == 1 && moe_bank_p1_hitg_down();
+            const ggml_cuda_moe_mixed_reduce * kred = (cs && table.mj_kind == 2) || p2list || p1hd ? nullptr : red;
             if (split) {
+                if (p1hd) {
+                    hit_pass((float *) op->data);
+                    g_st_p1hitg.fetch_add(1, std::memory_order_relaxed);
+                }
                 ggml_cuda_mul_mat_id_mixed(ctx, bank, op, op, quantized, table.device, nullptr, table.hot,
-                        route_map, route_mask, bank_q.get(), bank_s.get(), 1, nullptr, kred);
+                        route_map, route_mask, bank_q.get(), bank_s.get(), p1hd ? 3 : 1, nullptr, kred);
                 CUDA_CHECK(cudaGetLastError());
             }
             eff = moe_hf_wait(ctx, session, table);
@@ -12395,9 +12410,9 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
                         mixed_rest)) {
                 mixed_rest((float *) op->data);
             }
-            if (p2list) {
+            if (p2list || p1hd) {
                 CUDA_CHECK(cudaGetLastError());
-                g_st_p2list.fetch_add(1, std::memory_order_relaxed);
+                g_st_p2list.fetch_add(p2list ? 1 : 0, std::memory_order_relaxed);
                 if (tail) {
                     moe_tail_zero(ctx, ids, (int) table.desc.n_expert, op);
                 }

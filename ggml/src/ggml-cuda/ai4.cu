@@ -2278,6 +2278,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         const int8_t * act_ai_q, const float * act_ai_s, int phase, const ggml_cuda_moe_mixed_pair * pair,
         const ggml_cuda_moe_mixed_reduce * red) {
     GGML_ASSERT(ggml_cuda_moe_mixed_supported(bank, base));
+    // phase 3 = phase 1 over the bank routes only (fork AIPFIX P1HITG down: the 3XS hit kernel ran the cached ones)
+    const bool p1_hot_only = phase == 3;
+    phase = p1_hot_only ? 1 : phase;
     GGML_ASSERT(phase >= 0 && phase <= 2 && (phase == 0 || resident));
     GGML_ASSERT(!pair || (ggml_cuda_moe_mixed_pair_supported(bank, base, pair->bank, pair->base) &&
             (table == nullptr) == (pair->table == nullptr) && (phase == 0 || pair->resident) &&
@@ -2382,7 +2385,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     static const bool cold_group = ai4_env_int("GGML_MOE_BANK_MIXED_COLD_GROUP", nullptr, 0) != 0;
     second.cold_group = cold_group;
     second.res_both = pair && pair->res_both;
-    second.hot_only = pair && pair->hot_only && phase == 1;
+    second.hot_only = phase == 1 && (p1_hot_only || (pair && pair->hot_only));
     GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red)));
     if (red) {
         second.red_w = (const float *) red->weights->data;
