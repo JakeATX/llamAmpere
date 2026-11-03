@@ -922,9 +922,6 @@ llama_model_loader::llama_model_loader(
     const char * ov_env = getenv("LLAMA_MODEL_OVERLAY");
     const bool patch_base = !(ov_env && ov_env[0]);
     if (const char * pfs = getenv("LLAMA_MODEL_OVERLAY_PATCH"); pfs && pfs[0] && !fname.empty() && (patch_base || overlay_idx >= 0)) {
-        if (getenv("LLAMA_MOE_BANK_KEEP")) {
-            throw std::runtime_error("LLAMA_MODEL_OVERLAY_PATCH does not support LLAMA_MOE_BANK_KEEP");
-        }
         std::stringstream pss(pfs);
         for (std::string pfn; std::getline(pss, pfn, ',');) {
         if (pfn.empty()) { continue; }
@@ -956,6 +953,14 @@ llama_model_loader::llama_model_loader(
         int n_patched = 0;
         for (ggml_tensor * cur = ggml_get_first_tensor(pctx); cur; cur = ggml_get_next_tensor(pctx, cur)) {
             auto it = weights_map.find(cur->name);
+            // LLAMA_MOE_BANK_KEEP shrank the bank tensors to their kept slot prefix: a full-size patch of a bank tensor
+            // holds the same slots in the same order, so it is read up to that prefix
+            if (it != weights_map.end() && strstr(cur->name, "_exps_hot.") && cur->ne[3] == 1 && it->second.tensor->ne[3] == 1 &&
+                    cur->ne[0] == it->second.tensor->ne[0] && cur->ne[1] == it->second.tensor->ne[1] &&
+                    cur->ne[2] > it->second.tensor->ne[2]) {
+                cur->ne[2] = it->second.tensor->ne[2];
+                cur->nb[3] = cur->nb[2]*cur->ne[2];
+            }
             if (it == weights_map.end() || !ggml_are_same_shape(it->second.tensor, cur)) {
                 throw std::runtime_error(format("overlay patch %s: tensor '%s' does not replace a tensor of the same shape",
                         pf, ggml_get_name(cur)));
