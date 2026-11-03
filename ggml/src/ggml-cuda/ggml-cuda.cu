@@ -10753,6 +10753,191 @@ static bool ggml_cuda_shexp_chain_find(const ggml_cgraph * g, int d, const std::
     return true;
 }
 
+// [QKVSIDE] GGML_CUDA_QKV_SIDE=1 (default off): in a sparse-attention layer the Q/K/V projections (with their norms,
+// rotary embeddings and the output gate) depend only on the layer's block input, not on the indexer's selection, so
+// they run on the second stream while the indexer scores, selects and compacts on the main one. Same kernels on the
+// same inputs in the same order within each stream: bit-identical. Decode-sized batches only (<= 16 rows).
+static bool ggml_cuda_qkv_side_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_QKV_SIDE"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// the group of one layer: every node that only the layer's rotary Q, rotary K, V and gate tensors depend on
+static bool ggml_cuda_side_group_find(const ggml_cgraph * g, const std::vector<int> & seeds,
+                                      const std::unordered_map<const ggml_tensor *, int> & idx,
+                                      const std::unordered_map<const ggml_tensor *, int> & n_use, ggml_cuda_shexp_chain & c) {
+    c = ggml_cuda_shexp_chain();
+    std::unordered_map<const ggml_tensor *, int> inner;
+    std::unordered_set<const ggml_tensor *> in_chain;
+    const auto take = [&](const ggml_tensor * t) {
+        in_chain.insert(t);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s]) {
+                inner[t->src[s]]++;
+            }
+        }
+    };
+    int top = 0;
+    std::vector<int> rev;
+    for (const int d : seeds) {
+        if (g->nodes[d]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        rev.push_back(d);
+        take(g->nodes[d]);
+        top = std::max(top, d);
+    }
+    for (int k = top - 1; k >= 0 && k >= top - 192; --k) {
+        const ggml_tensor * t = g->nodes[k];
+        if (in_chain.count(t)) {
+            continue;
+        }
+        const auto it = inner.find(t);
+        if (it == inner.end()) {
+            continue;
+        }
+        const auto u = n_use.find(t);
+        if (u == n_use.end() || u->second != it->second || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;  // read outside the group too: an input of the group, not part of it
+        }
+        if (t->view_src != nullptr && !ggml_cuda_is_view_or_noop(t)) {
+            return false;  // writes in place into another tensor
+        }
+        rev.push_back(k);
+        take(t);
+    }
+    std::sort(rev.begin(), rev.end());
+    c.nodes = rev;
+    bool has_mm = false;
+    for (const int k : c.nodes) {
+        const ggml_tensor * t = g->nodes[k];
+        has_mm = has_mm || t->op == GGML_OP_MUL_MAT;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (src == nullptr || in_chain.count(src)) {
+                continue;
+            }
+            for (const ggml_tensor * x : { src, (const ggml_tensor *) src->view_src }) {
+                if (x == nullptr) {
+                    continue;
+                }
+                const auto xi = idx.find(x);
+                if (xi != idx.end()) {
+                    c.insert_at = std::max(c.insert_at, xi->second + 1);
+                    if (std::find(c.ext.begin(), c.ext.end(), x) == c.ext.end()) {
+                        c.ext.push_back(x);
+                    }
+                }
+            }
+        }
+    }
+    if (!has_mm || c.insert_at < 0) {
+        return false;
+    }
+    for (int k = c.nodes.front() + 1; k < g->n_nodes && c.first_use < 0; ++k) {
+        const ggml_tensor * t = g->nodes[k];
+        if (t->op == GGML_OP_NONE || in_chain.count(t)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && c.first_use < 0; ++s) {
+            for (const int d : seeds) {
+                if (t->src[s] == g->nodes[d] || (t->src[s] && t->src[s]->view_src == g->nodes[d])) {
+                    c.first_use = k;
+                    break;
+                }
+            }
+        }
+    }
+    if (c.first_use < 0) {
+        return false;
+    }
+    for (int k = c.insert_at; k < top; ++k) {
+        const ggml_tensor * t = g->nodes[k];
+        if (in_chain.count(t) || ggml_cuda_is_view_or_noop(t) || t->view_src == nullptr) {
+            continue;
+        }
+        if (std::find(c.ext.begin(), c.ext.end(), t->view_src) != c.ext.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the Q/K/V group of every sparse-attention layer (a layer with an "indexer_score-<il>" node); small batches only
+static void ggml_cuda_qkv_side_groups(const ggml_cgraph * g, const std::unordered_map<const ggml_tensor *, int> & idx,
+                                      const std::unordered_map<const ggml_tensor *, int> & n_use,
+                                      std::vector<ggml_cuda_shexp_chain> & groups) {
+    groups.clear();
+    static const char * const want[4] = { "Qcur-", "Kcur-", "Vcur-", "gate_reshaped-" };
+    std::unordered_map<std::string, int> last;  // name -> last graph index
+    std::vector<std::string> layers;
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const char * nm = g->nodes[i]->name;
+        if (strncmp(nm, "indexer_score-", 14) == 0) {
+            layers.push_back(nm + 14);
+        }
+        for (const char * w : want) {
+            if (strncmp(nm, w, strlen(w)) == 0 && g->nodes[i]->op != GGML_OP_NONE) {
+                last[nm] = i;
+            }
+        }
+    }
+    for (const std::string & il : layers) {
+        std::vector<int> seeds;
+        for (const char * w : want) {
+            const auto it = last.find(std::string(w) + il);
+            if (it != last.end()) {
+                seeds.push_back(it->second);
+            }
+        }
+        const auto gate = last.find("gate_reshaped-" + il);
+        ggml_cuda_shexp_chain c;
+        if (seeds.size() != 4 || gate == last.end() || g->nodes[gate->second]->ne[1] > 16 ||
+                !ggml_cuda_side_group_find(g, seeds, idx, n_use, c)) {
+            continue;
+        }
+        groups.push_back(c);
+    }
+}
+
+// graph_optimize: move every Q/K/V group up to its insert point and extend its lifetime (see [QKVSIDE] above)
+static void ggml_cuda_qkv_side_optimize(ggml_cgraph * g, ggml_backend_graph_optimize_params * params) {
+    std::unordered_map<const ggml_tensor *, int> idx, n_use;
+    ggml_cuda_shexp_uses(g, idx, n_use);
+    std::vector<ggml_cuda_shexp_chain> groups;
+    ggml_cuda_qkv_side_groups(g, idx, n_use, groups);
+    for (const ggml_cuda_shexp_chain & c : groups) {
+        // groups are in separate layers and never overlap, so indices of the later ones are untouched by a move
+        ggml_tensor * until = g->nodes[c.first_use];
+        std::vector<ggml_tensor *> members;
+        for (const int j : c.nodes) {
+            members.push_back(g->nodes[j]);
+        }
+        const int last = c.nodes.back();
+        if (c.insert_at < c.nodes.front()) {
+            std::vector<ggml_tensor *> chain, rest;
+            size_t ci = 0;
+            for (int k = c.insert_at; k <= last; ++k) {
+                if (ci < c.nodes.size() && c.nodes[ci] == k) {
+                    chain.push_back(g->nodes[k]);
+                    ++ci;
+                } else {
+                    rest.push_back(g->nodes[k]);
+                }
+            }
+            int k = c.insert_at;
+            for (ggml_tensor * t : chain) { g->nodes[k++] = t; }
+            for (ggml_tensor * t : rest)  { g->nodes[k++] = t; }
+        }
+        for (ggml_tensor * t : members) {
+            params->add_alloc_dep(params->user_data, t, until);
+        }
+        for (const ggml_tensor * x : c.ext) {
+            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x), until);
+        }
+    }
+}
+
 static bool ggml_cuda_shexp_is_down(const ggml_tensor * t) {
     return t->op != GGML_OP_NONE && strncmp(t->name, "ffn_shexp-", 10) == 0;
 }
@@ -10814,7 +10999,7 @@ static void ggml_cuda_shexp_side_plan(const ggml_cgraph * g, std::vector<ggml_cu
     runs.clear();
     bool any = false;
     for (int d = 0; d < g->n_nodes && !any; ++d) {
-        any = ggml_cuda_shexp_is_down(g->nodes[d]);
+        any = ggml_cuda_shexp_is_down(g->nodes[d]) || (ggml_cuda_qkv_side_enabled() && strncmp(g->nodes[d]->name, "indexer_score-", 14) == 0);
     }
     if (!any) {
         return;
@@ -10844,6 +11029,31 @@ static void ggml_cuda_shexp_side_plan(const ggml_cgraph * g, std::vector<ggml_cu
             }
         }
         runs.push_back(r);
+    }
+    if (ggml_cuda_qkv_side_enabled()) {
+        std::vector<ggml_cuda_shexp_chain> groups;
+        ggml_cuda_qkv_side_groups(g, idx, n_use, groups);
+        for (const ggml_cuda_shexp_chain & c : groups) {
+            // only groups the optimize pass left contiguous at their insert point
+            if (c.nodes.back() - c.nodes.front() + 1 == (int) c.nodes.size() && c.insert_at == c.nodes.front()) {
+                runs.push_back({ c.nodes.front(), c.nodes.back(), c.first_use, c.first_use });
+            }
+        }
+        std::sort(runs.begin(), runs.end(), [](const ggml_cuda_shexp_side_run & a, const ggml_cuda_shexp_side_run & b) {
+            return a.begin < b.begin;
+        });
+        std::vector<ggml_cuda_shexp_side_run> kept;
+        for (const ggml_cuda_shexp_side_run & r : runs) {
+            if (kept.empty() || kept.back().join_at <= r.begin) {
+                kept.push_back(r);
+            }
+        }
+        runs.swap(kept);
+        static bool logged = false;
+        if (!logged && !runs.empty()) {
+            logged = true;
+            GGML_LOG_INFO("%s: [QKVSIDE] first planned graph: %zu Q/K/V groups found, %zu side runs kept (with shared-expert chains)\n", __func__, groups.size(), runs.size());
+        }
     }
 }
 
@@ -11537,6 +11747,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // final order); not combined with the generic concurrent streams of GGML_CUDA_GRAPH_OPT
     if (ggml_cuda_shexp_side_enabled() && !(getenv("GGML_CUDA_GRAPH_OPT") && atoi(getenv("GGML_CUDA_GRAPH_OPT")) == 1)) {
         ggml_cuda_shexp_side_optimize(cgraph, params);
+        if (ggml_cuda_qkv_side_enabled()) {
+            ggml_cuda_qkv_side_optimize(cgraph, params);
+        }
     }
 
     if (!disable_fusion) {
