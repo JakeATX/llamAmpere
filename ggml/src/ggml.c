@@ -870,6 +870,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // 16-row units, not row-addressable
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_AIT2_U2] = {
+        .type_name                = "ait2_u2",
+        .blck_size                = 640,
+        .type_size                = 162,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT3_U2] = {
+        .type_name                = "ait3_u2",
+        .blck_size                = 640,
+        .type_size                = 242,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT4_U2] = {
+        .type_name                = "ait4_u2",
+        .blck_size                = 640,
+        .type_size                = 322,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_AIT3_U] = {
         .type_name                = "ait3_u",
         .blck_size                = 128,
@@ -1610,11 +1634,31 @@ int ggml_exl3_bits(enum ggml_type type) {
 int ggml_ai4_rate(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2:
         case GGML_TYPE_AIT2P_U: return 2;
-        case GGML_TYPE_AIT3_U:  return 3;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 3;
         case GGML_TYPE_AIT4_U:  return 4;
         case GGML_TYPE_AIT5_U:  return 5;
         default:                return 0;
+    }
+}
+
+int ggml_ai4v2_rate(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U2: return 2;
+        case GGML_TYPE_AIT3_U2: return 3;
+        case GGML_TYPE_AIT4_U2: return 4;
+        default:                return 0;
+    }
+}
+
+uint32_t ggml_ai4v2_trellis_mul(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U2: return 0xC3CCD12Du;
+        case GGML_TYPE_AIT3_U2: return 0x87D8D12Du;
+        case GGML_TYPE_AIT4_U2: return 0xAA73876Bu;
+        default:                return 0u;
     }
 }
 
@@ -1658,8 +1702,10 @@ int ggml_ai4_code(enum ggml_type type) {
 // its levels come from the AIT2P pair table, and the shared decoders treat C == 0 as that code.
 uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_AIT2_U:  return 0xC3CCD12Du;
-        case GGML_TYPE_AIT3_U:  return 0x87D8D12Du;
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2: return 0xC3CCD12Du;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 0x87D8D12Du;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT5_U:  return 0xAA73876Bu;
         default:                return 0u;
@@ -1670,8 +1716,10 @@ uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
 float ggml_ai4_scale_mul(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2:
         case GGML_TYPE_AIT2P_U: return 1.00f;
-        case GGML_TYPE_AIT3_U:  return 1.05f;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 1.05f;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT5_U:  return 1.09f;
         default:                return 0.0f;
@@ -8935,6 +8983,17 @@ void ggml_moe_bank_unregister(const void * weight_data) {
 
 bool ggml_moe_bank_any(void) {
     return g_moe_bank_any;
+}
+
+// fork AIPFIX ONEPATH: set by the CUDA expert cache while its device tables hold the bank rows of every banked tensor
+static int g_moe_bank_onepath_live = 0;
+
+void ggml_moe_bank_onepath_set_live(bool live) {
+    __atomic_store_n(&g_moe_bank_onepath_live, live ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+bool ggml_moe_bank_onepath_live(void) {
+    return __atomic_load_n(&g_moe_bank_onepath_live, __ATOMIC_ACQUIRE) != 0;
 }
 
 const uint8_t * ggml_moe_bank_lookup(const void * weight_data) {

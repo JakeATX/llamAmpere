@@ -7936,13 +7936,14 @@ static bool is_ai4_family(ggml_type t) {
 }
 
 static void init_tensor_ai4_random(ggml_tensor * t, const std::vector<bool> * used = nullptr) {
-    GGML_ASSERT(is_ai4_family(t->type) && ggml_is_contiguous(t) && t->ne[0] % 128 == 0 && t->ne[1] % 16 == 0);
+    const bool v2 = ggml_ai4v2_rate(t->type) != 0;   // row-scale block = 16 rows x 640 K: [d[16]][5 x 16k-byte tiles]
+    GGML_ASSERT(is_ai4_family(t->type) && ggml_is_contiguous(t) && t->ne[0] % (v2 ? 640 : 128) == 0 && t->ne[1] % 16 == 0);
     std::random_device rd;
     std::mt19937 rng(rd());
     std::uniform_real_distribution<float> ud(0.002f, 0.02f);
     std::vector<uint8_t> buf(ggml_nbytes(t));
     // one unit = 16 rows x 128 K: [fp16 row scales d[16]][16k-byte trellis tiles]
-    const size_t bb  = (size_t) (32 + 256*ggml_ai4_rate(t->type));
+    const size_t bb  = (size_t) (32 + (v2 ? 5 : 1)*256*ggml_ai4_rate(t->type));
     const size_t nsc = 16;
     const size_t nblk = buf.size() / bb;
     for (size_t b = 0; b < nblk; ++b) {
@@ -15712,13 +15713,15 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
 // AIT2P_U (unit bytes, AIT2P pair-table levels) at the Flash-Next expert shapes: gate/up K 2560 x M 640 (H256, broadcast
 // src1), down K 640 x M 2560 (H128); decode / MTP-verify widths 1-8, then prompt widths; MUL_MAT_ID on a 221-expert bank
 // stack top 10 with repeated and skipped ids. Also small shapes and partial row tiles.
-static void add_ait2pu_cases(std::vector<std::unique_ptr<test_case>> & cases) {
-    const ggml_type t = GGML_TYPE_AIT2P_U;
+static void add_ait2pu_cases(std::vector<std::unique_ptr<test_case>> & cases, ggml_type t = GGML_TYPE_AIT2P_U) {
+    const bool v2 = ggml_ai4v2_rate(t) != 0;   // row-scale types: K % 640 == 0 only
     for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33, 64, 65, 512, 600}) {
         cases.emplace_back(new test_mul_mat_ai4(640,  n, 2560, t));
         cases.emplace_back(new test_mul_mat_ai4(2560, n, 640,  t));
     }
     for (int64_t n : {1, 5, 9, 130}) {
+        cases.emplace_back(new test_mul_mat_ai4(48, n, 1280, t));   // 10 chunks: nk % 4 == 2 control for every unit type
+        if (v2) { continue; }
         cases.emplace_back(new test_mul_mat_ai4(16,  n, 128,  t));
         cases.emplace_back(new test_mul_mat_ai4(48,  n, 384,  t));
         cases.emplace_back(new test_mul_mat_ai4(400, n, 3072, t));
@@ -15732,6 +15735,7 @@ static void add_ait2pu_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     for (int n : {1, 4, 8, 9, 33}) {
         cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2560, true));
         cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 640,  true));
+        if (v2) { continue; }
         cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 32, n, 384, true, false, 1));
         cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, true, 48, n, 256, false, false, 1));
     }
@@ -15879,6 +15883,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_ai23_cases(test_cases);
     add_ai_bank_cases(test_cases);
     add_ait2pu_cases(test_cases);
+    add_ait2pu_cases(test_cases, GGML_TYPE_AIT2_U2);
+    add_ait2pu_cases(test_cases, GGML_TYPE_AIT3_U2);
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int64_t n : {1, 9, 512}) {
@@ -19420,8 +19426,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Width 1 is left out: this graph's unfused reference is native four-warp MMVQ, while the production
     // one-token path with the expert cache keeps the one-warp row order the mixed path uses.
     for (int width : { 2, 3 }) {
-        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U }) {
-            const bool ai3 = bank == GGML_TYPE_AIT3_U;
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2 }) {
+            const bool ai3 = bank == GGML_TYPE_AIT3_U || bank == GGML_TYPE_AIT3_U2;
             for (ggml_type base : { ai3 ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XXS, ai3 ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ2_XS,
                                     ai3 ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL }) {
                 for (int channels : { 1, 4 }) {
@@ -19932,7 +19938,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 640, 2560 }, { 2560, 640 } }) {
                 const bool broadcast = mk.second == 2560;
                 for (int64_t n : { 1, 2, 3, 4, 5, 6, 512, 2048, 12288 }) {
-                    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U }) {
+                    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2 }) {
                         for (int ne : { 221, 512 }) {
                             test_cases.emplace_back(new test_mul_mat_id_ai4(t, ne, 10, broadcast, mk.first, n, mk.second, false, true));
                         }

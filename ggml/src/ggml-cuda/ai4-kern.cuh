@@ -48,6 +48,8 @@ constexpr int LAY_AIT2_U = 12;   // rate-2 units ([d 16][16 tiles x 8 words], 54
 constexpr int LAY_AIT3_U = 13;   // rate-3 units ([d 16][16 tiles x 12 words], 800 B)
 constexpr int LAY_AIT4_U = 14;   // rate-4 units ([d 16][16 tiles x 16 words], 1056 B)
 constexpr int LAY_AIT2P_U = 15;  // AIT2_U bytes, AIT2P pair-table levels (ggml-ai4.h); no trellis constant
+constexpr int LAY_AIT2_U2 = 16;  // AIT2_U levels, one fp16 scale per row per 640 K: block = [d 16][5 chunks x 16 tiles x 8 words] (ggml.h AIT2_U2)
+constexpr int LAY_AIT3_U2 = 17;  // AIT3_U levels, same block shape (rate 3)
 
 // mmv-ID columns per block: lanes g = 0..7 of the mmv kernel each own one token column
 constexpr int MMV_ID_BN = 8;
@@ -86,6 +88,11 @@ struct idmap {
     const uint8_t * glu_prev = nullptr;
     const uint8_t * glu_prev2 = nullptr;
     const uint8_t * glu_pfilter = nullptr;
+    // fork AIPFIX: no grouped launch for this call (the routes of one expert stay in their own blocks)
+    bool no_group = false;
+    // fork AIPTAB lean: grouped slab-per-warp launches with exactly one route per expert decode AIT2_U2 with the
+    // full-sum level rule (one IMAD + one DP4A per weight, no level packing, no IMMA); GGML_MOE_BANK_LEAN=1
+    bool lean = false;
 };
 
 // fork AIPFIX D6: arrivals per (route column, 16-row slice) when both projections of a route are stored by the same
@@ -131,13 +138,17 @@ constexpr int U_SC      = 32;     // fp16 d[16]
 
 // symbol rate of a layout (bits per weight in the tile stream) and its trellis constant
 template <int LAY> constexpr __host__ __device__ int lay_rate() {
-    static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U, "ai4k layout");
-    return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U ? 2 : LAY == LAY_AIT3_U ? 3 : 4;
+    static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U ||
+                  LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2, "ai4k layout");
+    return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT2_U2 ? 2 :
+           LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 ? 3 : 4;
 }
 template <int LAY> constexpr __host__ __device__ bool lay_pair() { return LAY == LAY_AIT2P_U; }
+// row-scale layouts: one scale header per 5 chunks (640 K) instead of one per chunk
+template <int LAY> constexpr __host__ __device__ bool lay_v2() { return LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2; }
 template <int LAY> constexpr __host__ __device__ uint32_t lay_mul() {
-    static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U, "ai4k layout");
-    return LAY == LAY_AIT2_U ? 0xC3CCD12Du : LAY == LAY_AIT3_U ? 0x87D8D12Du : 0xAA73876Bu;
+    static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U || lay_v2<LAY>(), "ai4k layout");
+    return LAY == LAY_AIT2_U || LAY == LAY_AIT2_U2 ? 0xC3CCD12Du : LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 ? 0x87D8D12Du : 0xAA73876Bu;
 }
 template <int LAY> constexpr __host__ __device__ bool lay_k5()  { return lay_rate<LAY>() == 5; }
 
@@ -146,15 +157,26 @@ template <int LAY> constexpr __host__ __device__ int ch_bytes() { return 256*lay
 template <int LAY> constexpr __host__ __device__ int u_bytes()  { return ch_bytes<LAY>() + U_SC; }
 static_assert(ch_bytes<LAY_AIT4_U>() == CH_BYTES && u_bytes<LAY_AIT4_U>() == U_BYTES && u_bytes<LAY_AIT5_U>() == 1312 &&
               u_bytes<LAY_AIT2_U>() == 544 && u_bytes<LAY_AIT2P_U>() == 544 && u_bytes<LAY_AIT3_U>() == 800, "ai4k layout sizes");
-template <int LAY> static __host__ __device__ __forceinline__ int64_t slab_bytes_l(int K) { return (int64_t) (K/128)*u_bytes<LAY>(); }
+constexpr int V2_CHUNKS = 5;   // 128-K chunks per row-scale block
+template <int LAY> constexpr __host__ __device__ int v2_block_bytes() { return U_SC + V2_CHUNKS*ch_bytes<LAY>(); }
+template <int LAY> static __host__ __device__ __forceinline__ int64_t slab_bytes_l(int K) {
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (K/(128*V2_CHUNKS))*v2_block_bytes<LAY>(); }
+    else { return (int64_t) (K/128)*u_bytes<LAY>(); }
+}
 
 // byte offset of chunk kc's 16 tiles inside a slab
 template <int LAY>
-static __device__ __forceinline__ int64_t chunk_off(int kc) { return (int64_t) kc*u_bytes<LAY>() + U_SC; }
+static __device__ __forceinline__ int64_t chunk_off(int kc) {
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/V2_CHUNKS)*v2_block_bytes<LAY>() + U_SC + (int64_t) (kc % V2_CHUNKS)*ch_bytes<LAY>(); }
+    else { return (int64_t) kc*u_bytes<LAY>() + U_SC; }
+}
 
 // byte offset of chunk kc's scale header inside a slab
 template <int LAY>
-static __device__ __forceinline__ int64_t sc_off(int kc) { return (int64_t) kc*u_bytes<LAY>(); }
+static __device__ __forceinline__ int64_t sc_off(int kc) {
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/V2_CHUNKS)*v2_block_bytes<LAY>(); }
+    else { return (int64_t) kc*u_bytes<LAY>(); }
+}
 
 // four s8 levels from the states at shifts 12, 8, 4, 0 of f (byte 0 = shift 12)
 template <uint32_t MULT>
@@ -1036,6 +1058,12 @@ struct mmvr_group {
     int cols[MMV_ID_BN];
 };
 
+static __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c) {
+    int r;
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+}
+
 template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false, bool SPW = false, bool GROUPED = false>
 static __device__ __forceinline__ void mmvr_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
@@ -1047,7 +1075,7 @@ static __device__ __forceinline__ void mmvr_body(
     static_assert(!FUSED_X || DIRECT, "fused activation needs direct ids");
     static_assert(KR == 2 || KR == 3 || KR == 4, "mmvr: rates 2, 3 and 4");
     static_assert(!SPW || (ID && DIRECT && SPLITS == 1 && !FUSED_X), "slab-per-warp scope");
-    static_assert(!GROUPED || (SPW && !SINGLE_N), "grouped slab-per-warp scope");
+    static_assert(!GROUPED || ((SPW || (ID && DIRECT)) && !SINGLE_N), "grouped scope: slab-per-warp or split-K");
     constexpr int CW = SPW ? 1 : WARPS;
     static_assert(STAGES % 2 == 0, "mmvr: even stages (activation double buffer)");
     static_assert(WARPS >= 2 && (WARPS & (WARPS - 1)) == 0 && WARPS <= 16, "mmvr warps");
@@ -1131,11 +1159,16 @@ static __device__ __forceinline__ void mmvr_body(
     const int kw = SPW ? 0 : warp;
     const uint8_t * ws = W + (int64_t) slab*slab_bytes_l<LAY>(K);
     // first chunk of this warp
-    const uint8_t * gt = ws + (int64_t) kw*u_bytes<LAY>() + U_SC;
-    const uint8_t * gs = ws + (int64_t) kw*u_bytes<LAY>();
+    const uint8_t * gt = ws;   // slab base; tiles and scale header of chunk gk come from chunk_off / sc_off (row-scale layouts share one header per 5 chunks)
+    const uint8_t * gs = ws;
+    int gk = kw;               // absolute chunk index of this warp's current base chunk
     uint8_t * ring = smem + warp*STAGES*ST;
 
     const bool has_n = g < N;
+    bool lean = false;
+    if constexpr (SPW && GROUPED && lay_v2<LAY>() && KR == 2) {
+        lean = idm.lean && N == 1;
+    }
     const int8_t * xr = Xq + (has_n ? xrow(g) : xrow(0))*K + kw*RQ4_CHUNK + (PERM ? 64*(t & 1) + 4*(t >> 1) : t*32);
     const float * xf = FUSED_X ? idm.direct_x + (int64_t) direct_row*K + (warp >> XSH)*(128 << XSH) : nullptr;
     const int  ns = lane - 16;
@@ -1151,8 +1184,7 @@ static __device__ __forceinline__ void mmvr_body(
                    KT > 0 ? KT/(RQ4_CHUNK*WARPS) + (warp < (KT/RQ4_CHUNK) % WARPS) :
                             (nk - warp + WARPS - 1)/WARPS;
     if constexpr (SPLITS > 1) {
-        gt += mmvr_toff<LAY, WARPS>(group_begin);
-        gs += mmvr_soff<LAY, WARPS>(group_begin);
+        gk += group_begin*WARPS;
         xr += (int64_t) group_begin*WARPS*RQ4_CHUNK;
         xsr += group_begin*XS_STEP;
         Y += (int64_t) blockIdx.z*M*N;
@@ -1161,7 +1193,7 @@ static __device__ __forceinline__ void mmvr_body(
     // load the chunk c chunks past the current base into stage s
     auto load = [&](const uint8_t * bt, const uint8_t * bs, const float * bx, int c, int s) {
         uint8_t * st = ring + s*ST;
-        const uint8_t * tiles = bt + mmvr_toff<LAY, CW>(c);
+        const uint8_t * tiles = bt + chunk_off<LAY>(gk + c*CW);
         constexpr int CHP = CHB/16;
 #pragma unroll
         for (int r = 0; r < (CHP + 31)/32; ++r) {
@@ -1171,7 +1203,7 @@ static __device__ __forceinline__ void mmvr_body(
         }
         const bool weight_scale = lane < 8;
         const bool activation_scale = !FUSED_X && lane >= 16 && lane < 24;
-        const void * src = weight_scale ? (const void *) (bs + mmvr_soff<LAY, CW>(c) + lane*4)
+        const void * src = weight_scale ? (const void *) (bs + sc_off<LAY>(gk + c*CW) + lane*4)
                                        : sok ? (const void *) (bx + (SPW ? (c >> XSH) : c*XS_STEP)) : (const void *) Xs;
         cp_async4_guard(st + OSC + lane*4, src, weight_scale || sok, weight_scale || activation_scale);
     };
@@ -1206,6 +1238,34 @@ static __device__ __forceinline__ void mmvr_body(
     auto compute = [&](int s, const uint32_t (&xv)[8], float act_scale) {
         const uint8_t * st = ring + s*ST;
         const uint32_t * tw = tl + s*(ST/4);
+        if constexpr (SPW && GROUPED && lay_v2<LAY>() && KR == 2) {
+            if (lean) {
+                // full-sum rule: w = (bytesum(state*MULT) - 510)/4, so a.w = (sum a*bytesum - 510*sum a)/4
+                constexpr uint32_t MU = lay_mul<LAY>();
+                int u0 = 0, u1 = 0, sa = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const uint32_t * ta = tw + 4*j*TW;
+                    const uint32_t f0 = __funnelshift_l(ta[wa.w1], ta[wa.w0], wa.sh);
+                    const uint32_t f1 = __funnelshift_l(ta[wb.w1], ta[wb.w0], wb.sh);
+                    const uint32_t b0 = xv[j], b1 = xv[4 + j];
+                    sa = __dp4a((int) b0, 0x01010101, sa);
+                    sa = __dp4a((int) b1, 0x01010101, sa);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const uint32_t rep = __byte_perm(i < 4 ? b0 : b1, 0u, (i & 3)*0x1111);
+                        u0 = dp4a_us(((f0 >> (14 - 2*i)) & 0xFFFFu)*MU, rep, u0);
+                        u1 = dp4a_us(((f1 >> (14 - 2*i)) & 0xFFFFu)*MU, rep, u1);
+                    }
+                }
+                const half  * sdw = (const half *) (st + OSC);
+                const float * sdx = (const float *) (st + OSC + 64);
+                const float dx = sdx[0]*0.25f;
+                acc[0] += (float) (u0 - 510*sa) * (__half2float(sdw[g])*dx);
+                acc[2] += (float) (u1 - 510*sa) * (__half2float(sdw[g + 8])*dx);
+                return;
+            }
+        }
         int p[4] = { 0, 0, 0, 0 };
         int q[4] = { 0, 0, 0, 0 };
 #pragma unroll
@@ -1300,8 +1360,7 @@ static __device__ __forceinline__ void mmvr_body(
                 compute(s, (s & 1) ? xb : xa, (s & 1) ? db : da);
             }
         }
-        gt  += mmvr_toff<LAY, CW>(STAGES);
-        gs  += mmvr_soff<LAY, CW>(STAGES);
+        gk  += STAGES*CW;
         xsr += SPW ? (STAGES >> XSH) : STAGES*XS_STEP;
         xr  += (int64_t) STAGES*CW*RQ4_CHUNK;
         if constexpr (FUSED_X) xf += STAGES*WARPS*RQ4_CHUNK;
@@ -1320,6 +1379,14 @@ static __device__ __forceinline__ void mmvr_body(
 
     if constexpr (SPW) {
         const int r = slab*16 + g;
+        if constexpr (GROUPED && lay_v2<LAY>() && KR == 2) {
+            if (lean) {
+                acc[0] += __shfl_xor_sync(0xffffffffu, acc[0], 1);
+                acc[0] += __shfl_xor_sync(0xffffffffu, acc[0], 2);
+                acc[2] += __shfl_xor_sync(0xffffffffu, acc[2], 1);
+                acc[2] += __shfl_xor_sync(0xffffffffu, acc[2], 2);
+            }
+        }
         if constexpr (GROUPED) {
             // Each MMA column retains the direct SPW K order; only its input/output row changes.
             const int c = 2*t;
@@ -1358,7 +1425,8 @@ static __device__ __forceinline__ void mmvr_body(
             const int r = slab*16 + g;
             const int c = 2*t;
             auto ycol = [&](int cc) -> int64_t {
-                if constexpr (DIRECT) { return blockIdx.z*idm.direct_n_used + blockIdx.y; }
+                if constexpr (GROUPED) { return pcol[cc]; }
+                else if constexpr (DIRECT) { return blockIdx.z*idm.direct_n_used + blockIdx.y; }
                 else if constexpr (ID) { return pcol[cc]; }
                 else { return cc; }
             };
