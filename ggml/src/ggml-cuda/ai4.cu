@@ -1640,8 +1640,11 @@ static bool ai4_table_grouped_on() {
 template <int LAY, int XSH, int KT>
 static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
                                   const ai4k::idmap & idm, int max_tiles) {
-    // one token has nothing to share; the native-id map (bank) and fused activations keep their own launches
-    if (!ai4_table_grouped_on() || !idm.table || idm.no_group || idm.direct_map || idm.direct_x ||
+    // one token has nothing to share; the native-id map (bank) and fused activations keep their own launches.
+    // Paired launches (table2) stay ungrouped: the grouped second projection gives wrong output (f3q/f3r 11-02:
+    // every bank route of that half off from element 0, unpaired grouped clean), and the paired ungrouped launch
+    // was the faster one anyway (f3v2). This is what broke P1PLAIN-GU at >= 4 tokens (11-03 'incomplete output').
+    if (!ai4_table_grouped_on() || !idm.table || idm.table2 || idm.no_group || idm.direct_map || idm.direct_x ||
             idm.direct_n_used <= 0 || max_tiles/idm.direct_n_used < 2 || M % 16 != 0) {
         return false;
     }
