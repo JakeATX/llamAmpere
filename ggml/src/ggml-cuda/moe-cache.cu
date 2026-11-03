@@ -567,7 +567,17 @@ struct moe_cache_slot {
     uint32_t warm_uses = 0;
     bool staging = false;
     moe_cache_slot_state state = moe_cache_slot_state::free;
+    // GGML_MOE_CACHE_DET: scope serial of the plan that queued this fill (a same-scope fill is never a hit).
+    uint64_t det_scope = 0;
 };
+
+// fork AIPFIX: GGML_MOE_CACHE_DET=1 makes legacy (pre-freeze) hit/miss choices independent of fill-worker
+// timing: every scope starts with the fill queue drained, a fill queued in the current scope is never a
+// hit, and the queue limits count this scope's jobs instead of the live queue.
+static bool moe_cache_det() {
+    static const bool det = [] { const char * e = getenv("GGML_MOE_CACHE_DET"); return e && atoi(e) != 0; }();
+    return det;
+}
 
 static uint64_t moe_cache_lending_uses(const moe_cache_slot & slot) {
     return (uint64_t)slot.warm_uses + slot.uses;
@@ -798,6 +808,9 @@ struct moe_cache_device {
 
     std::deque<moe_cache_job> queue;
     size_t queued_bytes = 0;
+    // GGML_MOE_CACHE_DET: jobs/bytes queued since the scope began (the queue is empty at scope start).
+    int det_jobs = 0;
+    size_t det_bytes = 0;
     bool worker_started = false;
     bool inflight = false;
     bool inflight_prefetch = false;
@@ -1090,6 +1103,7 @@ struct moe_cache_session {
     int ml_layer = -1;
     int active_scopes = 0;
     int active_nodes = 0;
+    uint64_t det_scope = 0;   // GGML_MOE_CACHE_DET scope serial
     struct active_source {
         size_t bytes = 0;
         int references = 0;
@@ -3939,7 +3953,7 @@ static void moe_cache_session_enter(void * opaque) {
         }
         return;
     }
-    std::lock_guard<std::mutex> lock(session->mu);
+    std::unique_lock<std::mutex> lock(session->mu);
     if (session->dormant.load()) {
         if (g_session_stack.empty()) {
             return;
@@ -3969,6 +3983,23 @@ static void moe_cache_session_enter(void * opaque) {
         return;
     }
     session->active_scopes++;
+    if (moe_cache_det() && !session->device_frozen && session->active_scopes == 1) {
+        // Drain prompt-phase fills so this scope's hits do not depend on how far the worker got.
+        const bool drained = session->idle_cv.wait_for(lock, std::chrono::seconds(10), [&] {
+            for (const auto & d : session->devices) {
+                if (!d->dead.load() && (!d->queue.empty() || d->inflight)) { return false; }
+            }
+            return true;
+        });
+        static int warned = 0;
+        if (!drained && warned++ < 4) {
+            MOE_CACHE_LOG("[moe-cache] det: fill queue did not drain within 10 s at scope start\n");
+        }
+        session->det_scope++;
+        for (auto & d : session->devices) { d->det_jobs = 0; d->det_bytes = 0; }
+        static bool logged = false;
+        if (!logged) { logged = true; MOE_CACHE_LOG("[moe-cache] det: on (drain fills at scope start, same-scope fills miss, per-scope queue limits)\n"); }
+    }
     moe_cache_calibration_on_enter(*session);
 }
 
@@ -4448,6 +4479,9 @@ static int moe_cache_lookup_or_queue_locked(
                 std::rotate(device.queue.begin(), queued, std::next(queued));
             }
         }
+        if (moe_cache_det() && pool.slots[found->second].det_scope == session.det_scope) {
+            return -1;
+        }
         return pool.slots[found->second].state == moe_cache_slot_state::valid
             ? found->second : -1;
     }
@@ -4477,8 +4511,11 @@ static int moe_cache_lookup_or_queue_locked(
         return -1;
     }
     const size_t queue_limit = session.config.queue_mb << 20;
-    if (inserts_left <= 0 || (int)device.queue.size() >= session.config.queue_max ||
-        expert_size > queue_limit - std::min(queue_limit, device.queued_bytes)) {
+    const bool det = moe_cache_det();
+    const int queued_jobs = det ? device.det_jobs : (int)device.queue.size();
+    const size_t queued_bytes = det ? device.det_bytes : device.queued_bytes;
+    if (inserts_left <= 0 || queued_jobs >= session.config.queue_max ||
+        expert_size > queue_limit - std::min(queue_limit, queued_bytes)) {
         device.insert_skips++;
         return -1;
     }
@@ -4527,6 +4564,7 @@ static int moe_cache_lookup_or_queue_locked(
     slot.generation++;
     slot.readers = 0;
     slot.state = moe_cache_slot_state::copying;
+    slot.det_scope = session.det_scope;
     try {
         const auto inserted = pool.map.emplace(key, slot_index);
         if (!inserted.second) {
@@ -4543,6 +4581,8 @@ static int moe_cache_lookup_or_queue_locked(
                 pool_index, slot_index, slot.generation,
                 key, source, expert_size, nullptr});
         device.queued_bytes += expert_size;
+        device.det_jobs++;
+        device.det_bytes += expert_size;
     } catch (...) {
         moe_cache_slot_reset(pool, slot_index, true);
         device.insert_skips++;
