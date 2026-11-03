@@ -9619,6 +9619,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
     if (node->op == GGML_OP_MUL_MAT_ID) {
         const int output = i + 3;
+        // Bank dispatch: a routed expert runs from the bank, a cache slot or the just-copied path, depending on what
+        // the cache holds at that moment. All read the same weights; the summation order can differ, so reruns may
+        // differ in last-digit rounding. LLAMA_MOE_BANK_DET=1 gives identical reruns.
         if (cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_match_moe_bank_mixed(cgraph, i) &&
                 GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
                 ggml_cuda_info().devices[cuda_ctx->device].cc >= GGML_CUDA_CC_AMPERE &&

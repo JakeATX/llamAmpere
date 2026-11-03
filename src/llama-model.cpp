@@ -2605,11 +2605,12 @@ void llama_model::register_moe_bank() {
     }
     if (n_bank > 0) {
         LLAMA_LOG_INFO("[moe-bank] %zu experts in %d layers always resident (%.1f MiB)\n", n_bank, n_bank_layers, bank_bytes / 1048576.0);
-        // fork AIPFIX BANKDET: on the bank path, which experts the prompt leaves in the expert cache depended on
-        // fill-worker timing (live-queue limits, fills published mid-scope), so identical runs could answer
-        // differently. LLAMA_MOE_BANK_DET=1 selects the deterministic cache mode (GGML_MOE_CACHE_DET) with prompt
-        // queue limits that never bind. Opt-in (LLAMA_MOE_BANK_DET=1, default off) so the default keeps the
-        // timing-driven fill and its speed. Explicit GGML_* settings win.
+        // fork AIPFIX BANKDET: with a bank, which experts the prompt leaves in the expert cache follows fill timing,
+        // so an expert may be computed from its cache slot in one run and from the just-copied path in another.
+        // Both use the same weights; only the summation order differs, so reruns can differ in last-digit rounding
+        // (quality unchanged). LLAMA_MOE_BANK_DET=1 selects the deterministic cache mode (GGML_MOE_CACHE_DET) with
+        // prompt queue limits that never bind, for identical reruns. Off by default to keep the timing-driven fill
+        // and its speed. Explicit GGML_* settings win.
         const char * bd = getenv("LLAMA_MOE_BANK_DET");
         if (bd && atoi(bd) != 0) {
 #ifdef _WIN32
@@ -2623,6 +2624,8 @@ void llama_model::register_moe_bank() {
 #endif
             LLAMA_LOG_INFO("[moe-bank] deterministic expert cache: det=%s queue=%s/%s MiB\n", getenv("GGML_MOE_CACHE_DET"),
                     getenv("GGML_CUDA_MOE_CACHE_QUEUE"), getenv("GGML_CUDA_MOE_CACHE_QUEUE_MB"));
+        } else {
+            LLAMA_LOG_INFO("[moe-bank] bank: reruns may differ in last-digit rounding; LLAMA_MOE_BANK_DET=1 for identical reruns\n");
         }
     }
     const size_t released = drop_moe_bank_host_copies();

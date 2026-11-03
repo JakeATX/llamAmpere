@@ -1407,6 +1407,9 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         s.xq_own_stride = 2 * MOE_CS_MAX_ROUTES * s.xq_stride;
         s.xq_own.assign((size_t) s.threads * s.xq_own_stride, 0);
     }
+    // Experts computed here use CPU int8 dot products, which sum in a different order than the GPU kernel. Which
+    // experts land here follows expert-cache timing, so reruns may differ in last-digit rounding (quality unchanged).
+    // On the bank path LLAMA_MOE_BANK_DET=1 gives identical reruns.
     const bool pin = env_int("GGML_MOE_CPU_SPLIT_PIN", 1, 0, 1) != 0 && !avail.empty();
     auto cpu_of = [&](int i) { return pin ? avail[(size_t) i % avail.size()] : -1; };
     s.running = true;
