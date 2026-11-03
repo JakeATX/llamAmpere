@@ -2782,12 +2782,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }();
         const bool joint_reduce = joint_enabled && !b1_routing && hot_skip && hot_dbg == 0 &&
                 n_tokens <= 8 && n_expert_used == hparams.n_expert_used(il);
-        // fork AIPFIX ONECHAIN (opt-in LLAMA_MOE_BANK_ONECHAIN=1): prompt batches skip the separate bank chain (its
+        // fork AIPFIX ONECHAIN (default on; LLAMA_MOE_BANK_ONECHAIN=0 opts out): prompt batches skip the separate bank chain (its
         // full-width zero fill, SwiGLU, weighting and reduction); the regular chain below takes the bank products
         // in place with the full routing weights. Valid math: one sum over all routes instead of bank + regular sums.
         static const bool onechain_enabled = [] {
             const char * value = getenv("LLAMA_MOE_BANK_ONECHAIN");
-            return value && atoi(value) != 0;
+            return !value || atoi(value) != 0;
         }();
         static const bool onechain_cold_skip = [] {
             const char * value = getenv("LLAMA_MOE_COLD_SKIP");
