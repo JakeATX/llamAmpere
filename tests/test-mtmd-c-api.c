@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -11,6 +12,12 @@ int main(void) {
     printf("--------\n\n");
 
     struct mtmd_context_params params = mtmd_context_params_default();
+    // host_weights stays after the older fields so their offsets do not move (the struct still grows)
+    if (params.host_weights ||
+        offsetof(struct mtmd_context_params, host_weights) < offsetof(struct mtmd_context_params, progress_callback_user_data)) {
+        fprintf(stderr, "mtmd_context_params: host_weights must default to false and come after progress_callback_user_data\n");
+        return 1;
+    }
     printf("Default image marker: %s\n", params.image_marker);
 
     mtmd_input_chunks * chunks = mtmd_test_create_input_chunks();

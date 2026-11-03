@@ -2757,7 +2757,7 @@ static size_t ggml_backend_cuda_host_weights_buffer_type_get_alignment(ggml_back
     GGML_UNUSED(buft);
 }
 
-// pad quantized rows like the CUDA buffer type, MMQ reads the last tile past ne0
+// same row padding as the CUDA buffer type; the GPU never reads this buffer, it reads the scheduler's device copy
 static size_t ggml_backend_cuda_host_weights_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     size_t size = ggml_nbytes(tensor);
     if (ggml_is_quantized(tensor->type) && tensor->ne[0] % MATRIX_ROW_PADDING != 0) {
@@ -2778,7 +2778,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_weights_buffer_type_alloc_bu
         return nullptr;
     }
 
-    memset(ptr, 0, size); // zero the quantized row padding, it must not hold NaN scales
+    memset(ptr, 0, size); // zero the row padding too, so CPU fallback ops never see uninitialized bytes
 
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;

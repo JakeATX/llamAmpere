@@ -458,8 +458,6 @@ static clip_flash_attn_type mtmd_get_clip_flash_attn_type(enum llama_flash_attn_
 mtmd_context_params mtmd_context_params_default() {
     mtmd_context_params params {
         /* use_gpu           */ true,
-        /* host_weights      */ false,
-        /* host_weights_strict */ false,
         /* device            */ nullptr,
         /* print_timings     */ true,
         /* n_threads         */ 4,
@@ -474,6 +472,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* host_weights      */ false,
     };
     return params;
 }
@@ -532,7 +531,8 @@ struct mtmd_context {
     mtmd_context(const char * mmproj_fname,
                    const llama_model * text_model,
                    const mtmd_context_params & ctx_params,
-                   bool no_alloc = false) :
+                   bool no_alloc = false,
+                   bool host_weights_strict = false) :
         print_timings   (ctx_params.print_timings),
         n_threads       (ctx_params.n_threads),
         media_marker    (ctx_params.media_marker),
@@ -570,7 +570,7 @@ struct mtmd_context {
         clip_context_params ctx_clip_params {
             /* use_gpu           */ ctx_params.use_gpu,
             /* host_weights      */ ctx_params.host_weights,
-            /* host_weights_strict */ ctx_params.host_weights_strict,
+            /* host_weights_strict */ host_weights_strict,
             /* device            */ ctx_params.device,
             /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ctx_params.flash_attn_type),
             /* image_min_tokens  */ ctx_params.image_min_tokens,
@@ -1122,8 +1122,15 @@ private:
 mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct llama_model * text_model,
         const struct mtmd_context_params ctx_params) {
+    return mtmd_init_from_file_impl(mmproj_fname, text_model, ctx_params, false);
+}
+
+mtmd_context * mtmd_init_from_file_impl(const char * mmproj_fname,
+        const llama_model * text_model,
+        const mtmd_context_params & ctx_params,
+        bool host_weights_strict) {
     try {
-        return new mtmd_context(mmproj_fname, text_model, ctx_params);
+        return new mtmd_context(mmproj_fname, text_model, ctx_params, false, host_weights_strict);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;

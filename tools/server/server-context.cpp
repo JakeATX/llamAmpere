@@ -22,6 +22,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "mtmd-internal.h"
 #include "../../src/llama-ext.h"
 
 extern "C" {
@@ -2276,8 +2277,7 @@ private:
             }
 
             // the fit counted pinned weights as host memory: a pin failure now must not fall back to device memory
-            mparams.host_weights_strict = params_base.fit_params;
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            mctx = mtmd_init_from_file_impl(mmproj_path.c_str(), model_tgt, mparams, params_base.fit_params);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;

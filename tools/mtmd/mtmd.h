@@ -96,10 +96,6 @@ typedef bool (*mtmd_progress_callback)(float progress, void * user_data);
 
 struct mtmd_context_params {
     bool use_gpu;
-    // keep projector weights in pinned host memory, compute stays on the device (default: false)
-    bool host_weights;
-    // with host_weights: fail the load if pinning fails, instead of using device memory (the server sets it when the memory fit counted the weights as host memory)
-    bool host_weights_strict;
     ggml_backend_dev_t device;
     bool print_timings;
     int n_threads;
@@ -126,6 +122,9 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // keep projector weights in pinned host memory, compute stays on the device (default: false)
+    bool host_weights;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
