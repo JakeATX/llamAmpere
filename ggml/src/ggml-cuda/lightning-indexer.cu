@@ -1674,7 +1674,10 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (lid_ref.get() != nullptr) {
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap_status));
+        // the check needs a host sync, which is illegal while a CUDA graph is being captured; skip it then
+        if (lid_ref.get() != nullptr && cap_status == cudaStreamCaptureStatusNone) {
             ggml_cuda_pool_alloc<unsigned long long> n_diff(ctx.pool(), 1);
             CUDA_CHECK(cudaMemsetAsync(n_diff.get(), 0, sizeof(unsigned long long), ctx.stream()));
             lightning_indexer_compare<<<512, 256, 0, ctx.stream()>>>(lid_ref.get(), (const char *) dst_out, n_kv, n_batch, n_stream, nb1, nb3, n_diff.get());
