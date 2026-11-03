@@ -9575,7 +9575,18 @@ static int ggml_cuda_try_moe_onechain_fill(ggml_backend_cuda_context & ctx, ggml
             kept->type != GGML_TYPE_F32 || bank->type != GGML_TYPE_F32 || !ggml_are_same_shape(kept, bank) ||
             !ggml_are_same_shape(out, bank) || !ggml_is_contiguous(kept) || !ggml_is_contiguous(bank) ||
             ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[ctx.device].cc, bank->src[0]->type) ||
-            !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_MUL_MAT_ID, GGML_OP_ADD }, { i + 2 })) {
+            kept->view_src != kept->src[0] || out->view_src == nullptr) {
+        return 0;
+    }
+    // not ggml_can_fuse_subgraph: kept is an in-place view of the regular product (outside the three nodes), which
+    // that helper always rejects. The two inner nodes must feed only out and must not be graph outputs.
+    for (int j = i; j < i + 3; ++j) {
+        if ((cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+    }
+    if ((kept->flags | bank->flags) & GGML_TENSOR_FLAG_OUTPUT ||
+            ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1) {
         return 0;
     }
     ggml_cuda_mul_mat_id_ai4(ctx, bank, (float *) out->data);
