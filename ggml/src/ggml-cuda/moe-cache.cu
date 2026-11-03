@@ -569,6 +569,7 @@ struct moe_cache_slot {
     moe_cache_slot_state state = moe_cache_slot_state::free;
     // GGML_MOE_CACHE_DET: scope serial of the plan that queued this fill (a same-scope fill is never a hit).
     uint64_t det_scope = 0;
+    uint64_t det_serial = 0;   // GGML_MOE_CACHE_DET: enqueue order, used to publish deferred fills in a fixed order
 };
 
 // fork AIPFIX: GGML_MOE_CACHE_DET=1 makes legacy (pre-freeze) hit/miss choices independent of fill-worker
@@ -811,6 +812,9 @@ struct moe_cache_device {
     // GGML_MOE_CACHE_DET: jobs/bytes queued since the scope began (the queue is empty at scope start).
     int det_jobs = 0;
     size_t det_bytes = 0;
+    uint64_t det_serial = 0;
+    // GGML_MOE_CACHE_DET: finished fills (serial, job) held back until the next scope start or the freeze.
+    std::vector<std::pair<uint64_t, moe_cache_job>> det_done;
     bool worker_started = false;
     bool inflight = false;
     bool inflight_prefetch = false;
@@ -1682,6 +1686,36 @@ static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
     }
 }
 
+// A finished fill becomes a valid slot at the LRU tail. Under GGML_MOE_CACHE_DET (before the freeze) this is
+// held back and done at the next scope start in enqueue order, so LRU order and demand counts never depend
+// on when the worker finished a copy.
+static void moe_cache_fill_publish(moe_cache_device & device, moe_cache_pool & pool, const moe_cache_job & job, bool defer) {
+    moe_cache_slot & slot = pool.slots[job.slot];
+    if (defer) {
+        device.det_done.emplace_back(slot.det_serial, job);
+        return;
+    }
+    slot.state = moe_cache_slot_state::valid;
+    moe_cache_lru_push_back(pool, job.slot);
+    device.demand_count.erase(job.key);
+}
+
+static void moe_cache_det_publish_locked(moe_cache_device & device) {
+    std::sort(device.det_done.begin(), device.det_done.end(),
+        [](const std::pair<uint64_t, moe_cache_job> & a, const std::pair<uint64_t, moe_cache_job> & b) { return a.first < b.first; });
+    for (const auto & item : device.det_done) {
+        const moe_cache_job & job = item.second;
+        if (job.pool < 0 || job.pool >= (int) device.pools.size()) { continue; }
+        moe_cache_pool & pool = *device.pools[job.pool];
+        if (job.slot < 0 || job.slot >= pool.n_slots) { continue; }
+        const moe_cache_slot & slot = pool.slots[job.slot];
+        if (slot.state == moe_cache_slot_state::copying && slot.generation == job.generation && slot.key == job.key) {
+            moe_cache_fill_publish(device, pool, job, false);
+        }
+    }
+    device.det_done.clear();
+}
+
 static bool moe_cache_cuda_ok(
         moe_cache_device & device, cudaError_t error, const char * operation, bool fatal) {
     if (error == cudaSuccess) {
@@ -2391,9 +2425,7 @@ static void moe_cache_worker_fill_batch(moe_cache_session * session, moe_cache_d
                 if (slot.state == moe_cache_slot_state::copying &&
                     slot.generation == job.generation && slot.key == job.key) {
                     if (errors[i] == cudaSuccess && (!slot.prediction || !slot.prediction->closed)) {
-                        slot.state = moe_cache_slot_state::valid;
-                        moe_cache_lru_push_back(*pool, job.slot);
-                        device->demand_count.erase(job.key);
+                        moe_cache_fill_publish(*device, *pool, job, moe_cache_det() && !session->device_frozen);
                         device->fills++;
                     } else {
                         moe_cache_slot_reset(*pool, job.slot, true);
@@ -2583,9 +2615,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 if (slot.state == moe_cache_slot_state::copying &&
                     slot.generation == job.generation && slot.key == job.key) {
                     if (!expired && error == cudaSuccess && (!slot.prediction || !slot.prediction->closed)) {
-                        slot.state = moe_cache_slot_state::valid;
-                        moe_cache_lru_push_back(*pool, job.slot);
-                        device->demand_count.erase(job.key);
+                        moe_cache_fill_publish(*device, *pool, job, moe_cache_det() && !session->device_frozen);
                         device->fills++;
                     } else {
                         moe_cache_slot_reset(*pool, job.slot, true);
@@ -3996,7 +4026,7 @@ static void moe_cache_session_enter(void * opaque) {
             MOE_CACHE_LOG("[moe-cache] det: fill queue did not drain within 10 s at scope start\n");
         }
         session->det_scope++;
-        for (auto & d : session->devices) { d->det_jobs = 0; d->det_bytes = 0; }
+        for (auto & d : session->devices) { moe_cache_det_publish_locked(*d); d->det_jobs = 0; d->det_bytes = 0; }
         static bool logged = false;
         if (!logged) { logged = true; MOE_CACHE_LOG("[moe-cache] det: on (drain fills at scope start, same-scope fills miss, per-scope queue limits)\n"); }
     }
@@ -4565,6 +4595,7 @@ static int moe_cache_lookup_or_queue_locked(
     slot.readers = 0;
     slot.state = moe_cache_slot_state::copying;
     slot.det_scope = session.det_scope;
+    slot.det_serial = ++device.det_serial;
     try {
         const auto inserted = pool.map.emplace(key, slot_index);
         if (!inserted.second) {
@@ -13115,6 +13146,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         MOE_CACHE_LOG("[moe-cache] device tables skipped: fill queue did not drain\n");
         return 0;
     }
+    for (auto & d : session->devices) { moe_cache_det_publish_locked(*d); }
     if (session->prefetch_enabled) {
         for (auto & pool : device.pools) {
             for (int i = 0; i < 4; ++i) {
