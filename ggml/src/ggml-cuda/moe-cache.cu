@@ -3544,7 +3544,7 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             std::to_string(session.config.readmit_after) + "-replace"
         : "1-complete/" + std::to_string(session.config.admit_after) +
             "-partial/" + std::to_string(session.config.readmit_after) + "-replace";
-    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s hot=%d cpu-overlap=%s fills=%s\n",
+    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s hot=%d cpu-overlap=%s fills=%s queue=%d/%zu MiB det=%d\n",
             session.config.automatic ? "auto" : "on",
             session.devices.size(), budget.c_str(),
             session.config.reserve_mb,
@@ -3554,7 +3554,8 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             admission.c_str(),
             session.config.hot_uses,
             overlap_cpu_rows.c_str(),
-            session.config.serial_fill ? "serial" : "parallel");
+            session.config.serial_fill ? "serial" : "parallel",
+            session.config.queue_max, session.config.queue_mb, moe_cache_det() ? 1 : 0);
 }
 
 static void * moe_cache_session_create(
