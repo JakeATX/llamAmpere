@@ -166,11 +166,12 @@ static bool moe_bank_p1_hitg_down() {
 // routes (the hit kernel again, with the miss masks), as a 3XS layer's hit and miss passes do, instead of the mixed
 // kernel's phase 2 or the miss list. Then a route's bits do not depend on whether its expert was resident or copied
 // this step (the run-to-run split of the bank path: same input, different prompt-time cache fill, different tokens).
-// Default on; GGML_MOE_BANK_P2_SAME=0 opts out.
+// Default off (it did not make reruns identical, and it takes the copied routes away from P2LIST's miss-list
+// kernel); GGML_MOE_BANK_P2_SAME=1 opts in.
 static bool moe_bank_p2_same() {
     static const bool v = [] {
         const char * e = getenv("GGML_MOE_BANK_P2_SAME");
-        return !e || atoi(e) != 0;
+        return e && atoi(e) != 0;
     }();
     return v;
 }
