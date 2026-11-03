@@ -1666,6 +1666,7 @@ struct moe_mixed_second {
     bool pair_warp;         // hot SPW routes: warp pairs compute gate and up of one slab (see moe_mixed_mmv)
     bool cold_group;        // cold routes of one expert share a weight read (see moe_mixed_cold)
     bool res_both;          // paired: a cached route is resident only when both projections are (see P2LIST)
+    bool hot_only;          // phase 1 skips cached routes too (P1HITG: the 3XS fused hit kernel computed them)
 };
 
 // Epilogue tiles are 16-row slices of one route's output, so launches that tile the rows differently (the SPW
@@ -1979,7 +1980,7 @@ static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
     // phase 2 after it (all other routes); each route is written by exactly one phase.
     const int e = ids[t*ids_stride + u];
     const bool res = phase != 0 && !hot && h < 0 && e >= 0 && e < n_expert && resident[e] && (!other || other[e]);
-    if ((phase == 1 && !hot && !res) || (phase == 2 && (hot || res))) {
+    if ((phase == 1 && !hot && (!res || second.hot_only)) || (phase == 2 && (hot || res))) {
         return;
     }
     if constexpr (!IQ4_BANK) {
@@ -2381,6 +2382,7 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     static const bool cold_group = ai4_env_int("GGML_MOE_BANK_MIXED_COLD_GROUP", nullptr, 0) != 0;
     second.cold_group = cold_group;
     second.res_both = pair && pair->res_both;
+    second.hot_only = pair && pair->hot_only && phase == 1;
     GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red)));
     if (red) {
         second.red_w = (const float *) red->weights->data;

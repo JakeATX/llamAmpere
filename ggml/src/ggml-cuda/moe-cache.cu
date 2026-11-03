@@ -142,6 +142,18 @@ static bool moe_bank_p2_list() {
     return v;
 }
 
+// fork AIPFIX P1HITG: GGML_MOE_BANK_P1_HITG=1 runs a banked layer's cached (3XS) gate/up routes through the 3XS
+// fused hit kernel (one weight read per expert for every token routed to it, SwiGLU in the store), before the mixed
+// phase 1, which then takes the bank routes only. Needs the hit-first split and the fused SwiGLU. Default off until
+// a paired speed run.
+static bool moe_bank_p1_hitg() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_MOE_BANK_P1_HITG");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
 // fork MOEGAP DOWNONE: GGML_MOE_DOWN_ONE=1|check. On a hit-first layer the down projection waits for its copy
 // first and then computes every route the card owns in ONE launch over the effective table (resident experts at
 // their cache address, staged ones at their copy), instead of a hit pass and a miss pass. The down copy is normally
@@ -224,7 +236,7 @@ static std::atomic<unsigned long long> g_hf_layers{0};
 // fork MOEGAP: how often each new switch took its path (counted where the host issues the work, so a CUDA graph
 // counts once per capture, not per replay)
 static std::atomic<unsigned long long> g_st_hitg{0}, g_st_ml{0}, g_st_pc{0}, g_st_q8hit{0}, g_st_q8claim{0}, g_st_pub_plan{0},
-        g_st_p2list{0};
+        g_st_p2list{0}, g_st_p1hitg{0};
 // fork PARFIX: graphs that ended with a layer's side copies still unjoined (see ggml_cuda_moe_cache_hf_graph_end).
 static std::atomic<unsigned long long> g_hf_graph_end_joins{0};
 // fork MOEGAP (GGML_MOE_CPU_SPLIT=1): the host CPU computes part of each hit-first layer's missed experts
@@ -366,11 +378,13 @@ static void moe_missjoin_log(const char * when) {
                 g_hf_graph_end_joins.load(std::memory_order_relaxed));
     }
     if (g_st_hitg.load() || g_st_ml.load() || g_st_pc.load() || g_st_q8hit.load() || g_st_q8claim.load() ||
-            ggml_cuda_moe_down_sw_count() || g_st_one.load() || g_st_pub_plan.load() || g_st_p2list.load()) {
+            ggml_cuda_moe_down_sw_count() || g_st_one.load() || g_st_pub_plan.load() || g_st_p2list.load() ||
+            g_st_p1hitg.load()) {
         MOE_CACHE_LOG("[moe-cache] path counts %s: hit_fused_layers=%llu miss_list_passes=%llu plan_count_layers=%llu "
-                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu bank_p2_list=%llu (issue-time counts)\n",
+                "q8_share_hits=%llu q8_share_claims=%llu down_sw_passes=%llu down_one_layers=%llu pub_plan_layers=%llu bank_p2_list=%llu bank_p1_hitg=%llu (issue-time counts)\n",
                 when, g_st_hitg.load(), g_st_ml.load(), g_st_pc.load(), g_st_q8hit.load(), g_st_q8claim.load(),
-                ggml_cuda_moe_down_sw_count(), g_st_one.load(), g_st_pub_plan.load(), g_st_p2list.load());
+                ggml_cuda_moe_down_sw_count(), g_st_one.load(), g_st_pub_plan.load(), g_st_p2list.load(),
+                g_st_p1hitg.load());
     }
     if (g_cs_on && g_cs_plan) {
         moe_cs_plan_dev plan{};
@@ -12572,9 +12586,24 @@ bool ggml_cuda_moe_cache_mixed_pair_compute(ggml_backend_cuda_context & ctx,
     const bool p2list = split && moe_bank_p2_list() && ids->ne[2] == 1 && session.ml_layer >= 0 &&
             session.ml_layer == first.mj_layer &&
             ggml_cuda_moe_table_mmv_list_supported(wtype, glu != nullptr, a->ne[0], ids->ne[0], ids->ne[1], a->ne[1]);
-    const bool both = p2list && glu != nullptr;
+    // fork AIPFIX P1HITG: cached routes (resident for both projections) take the 3XS fused hit kernel first; it
+    // writes zeros for bank routes (their table entry is the bank zero block), which phase 1 then overwrites.
+    const int64_t ids_stride = ids->nb[1] / sizeof(int32_t);
+    const bool p1hitg = split && glu && moe_bank_p1_hitg() && ids->ne[2] == 1 && a->type == GGML_TYPE_F32 &&
+            ggml_cuda_moe_table_mmv_hitg_supported(wtype, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1], a->ne[1],
+                    ids_stride);
+    const bool both = (p2list && glu != nullptr) || p1hitg;
+    if (p1hitg) {
+        const auto & up_t = first.mj_kind == 0 ? first : second;
+        const auto & gate_t = first.mj_kind == 0 ? second : first;
+        ggml_cuda_moe_table_mmv_hitg(ctx, up_t.device, gate_t.device, wtype, quantized, (const int32_t *) ids->data,
+                (float *) glu->data, a->ne[0], glu->ne[0], ids->ne[0], ids->ne[1], a->ne[1], ids_stride,
+                up_t.hot, gate_t.hot, 1);
+        g_st_p1hitg.fetch_add(1, std::memory_order_relaxed);
+    }
     if (split) {
-        const ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot, glu, both };
+        ggml_cuda_moe_mixed_pair resident = { bank2, base2, &op2, second.device, nullptr, second.hot, glu, both };
+        resident.hot_only = p1hitg;
         ggml_cuda_mul_mat_id_mixed(ctx, bank, &op, &op, quantized, first.device, nullptr, first.hot,
                 route_map, route_mask, bank_q.get(), bank_s.get(), 1, &resident);
         CUDA_CHECK(cudaGetLastError());
