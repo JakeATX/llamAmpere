@@ -17,6 +17,27 @@
 #include <unordered_set>
 #include <vector>
 
+// Type ids of the retired pre-format-2 AI+ family (AI4, AI*_U, AI*_S and two private A/B controls). They have no
+// decoder or encoder any more: a file that names one is refused at load, and no tool may write one.
+static const char * gguf_deprecated_ai_type_name(int64_t type) {
+    switch (type) {
+        case 70:  return "AI4";
+        case 71:  return "AI4_U";
+        case 72:  return "AI3_U";
+        case 73:  return "AI2_U";
+        case 74:  return "AI5_U";
+        case 75:  return "AI6_U";
+        case 86:  return "AI6_UO";
+        case 87:  return "AI5_UN";
+        case 96:  return "AI2_S";
+        case 97:  return "AI3_S";
+        case 98:  return "AI4_S";
+        case 99:  return "AI5_S";
+        case 100: return "AI6_S";
+        default:  return nullptr;
+    }
+}
+
 #define GGUF_MAX_STRING_LENGTH  (1024*1024*1024)
 #define GGUF_MAX_ARRAY_ELEMENTS (1024*1024*1024)
 
@@ -726,6 +747,13 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         {
             ok = ok && gr.read(info.t.type);
 
+            if (const char * dep = gguf_deprecated_ai_type_name((int64_t) info.t.type)) {
+                GGML_LOG_ERROR("%s: deprecated AI+ format %s (type %d) is no longer supported; re-encode with a current type (tensor '%s')\n",
+                    __func__, dep, (int) info.t.type, info.t.name);
+                ok = false;
+                break;
+            }
+
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT || ggml_type_size(info.t.type) == 0) {
                 GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n",
@@ -1410,6 +1438,9 @@ void gguf_add_tensor(
              struct gguf_context * ctx,
         const struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
+    if (const char * dep = gguf_deprecated_ai_type_name((int64_t) tensor->type)) {
+        GGML_ABORT("deprecated AI+ format %s (type %d) is no longer supported; re-encode with a current type", dep, (int) tensor->type);
+    }
     if (gguf_find_tensor(ctx, tensor->name) != -1) {
         GGML_ABORT("duplicate tensor name: %s", tensor->name);
     }
@@ -1427,6 +1458,9 @@ void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggm
         GGML_ABORT("tensor not found: %s", name);
     }
     struct ggml_tensor * tensor = &ctx->info[tensor_id].t;
+    if (const char * dep = gguf_deprecated_ai_type_name((int64_t) type)) {
+        GGML_ABORT("deprecated AI+ format %s (type %d) is no longer supported; re-encode with a current type", dep, (int) type);
+    }
     const size_t  type_size = ggml_type_size(type);
     const int64_t blck_size = ggml_blck_size(type);
 
