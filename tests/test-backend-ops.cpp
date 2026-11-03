@@ -15709,7 +15709,8 @@ static void add_ait2pu_cases(std::vector<std::unique_ptr<test_case>> & cases, gg
         cases.emplace_back(new test_mul_mat_ai4(2560, n, 640,  t));
     }
     for (int64_t n : {1, 5, 9, 130}) {
-        if (v2) { cases.emplace_back(new test_mul_mat_ai4(48, n, 1280, t)); continue; }
+        cases.emplace_back(new test_mul_mat_ai4(48, n, 1280, t));   // 10 chunks: nk % 4 == 2 control for every unit type
+        if (v2) { continue; }
         cases.emplace_back(new test_mul_mat_ai4(16,  n, 128,  t));
         cases.emplace_back(new test_mul_mat_ai4(48,  n, 384,  t));
         cases.emplace_back(new test_mul_mat_ai4(400, n, 3072, t));
