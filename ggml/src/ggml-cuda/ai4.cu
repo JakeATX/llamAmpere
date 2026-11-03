@@ -2318,6 +2318,24 @@ bool ggml_cuda_moe_mixed_quantize_dual(ggml_backend_cuda_context & ctx, const gg
     return true;
 }
 
+// fork AIPFIX P1PLAIN-GU prep: per route, the bank slot of its expert into ids and the cold mask (what the mixed
+// phase 1 stores for later projections); per bank slot, its weight address for each projection.
+static __global__ void moe_p1_plain_prep(const char * ci, size_t ci_nb0, size_t ci_nb1, const float * map,
+        int map_size, char * ids, size_t ids_nb0, size_t ids_nb1, float * mask, int n_used, int n_routes,
+        int n_slots, const uint8_t * w1, size_t nb1, const uint8_t * w2, size_t nb2, const void ** tab) {
+    for (int i = threadIdx.x; i < n_routes; i += blockDim.x) {
+        const int u = i % n_used, t = i / n_used;
+        const int native = *(const int32_t *) (ci + u*ci_nb0 + t*ci_nb1);
+        const int h = native >= 0 && native < map_size ? (int) map[native] : -1;
+        *(int32_t *) (ids + u*ids_nb0 + t*ids_nb1) = h;
+        mask[i] = h < 0 ? 1.0f : 0.0f;
+    }
+    for (int j = threadIdx.x; j < n_slots; j += blockDim.x) {
+        tab[j] = w1 + (size_t) j*nb1;
+        tab[n_slots + j] = w2 + (size_t) j*nb2;
+    }
+}
+
 void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
         const ggml_tensor * base, ggml_tensor * dst, const char * act_q8,
         const void * const * table, const uint8_t * skip, const uint8_t * resident,
@@ -2417,7 +2435,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     // and the down ids already hold bank slots) runs the plain AI+ direct GEMV, the MUL_MAT_ID kernel that isolated
     // ncu measured at 63-79% of DRAM speed, instead of the mixed kernel (22% occupancy). Routes without a bank slot
     // exit unwritten, as in phase 3. The k order may differ (KLD-close class). GGML_MOE_BANK_P1_PLAIN=1 opts in.
-    static const bool p1_plain = ai4_env_int("GGML_MOE_BANK_P1_PLAIN", nullptr, 0) != 0;
+    // =2 takes the bank gate/up instead (P1PLAIN-GU below), =3 both.
+    static const int p1_plain_mode = ai4_env_int("GGML_MOE_BANK_P1_PLAIN", nullptr, 0);
+    const bool p1_plain = (p1_plain_mode & 1) != 0;
     if (p1_plain && p1_hot_only && !pair && !red && !route_map && w->type != GGML_TYPE_IQ4_NL) {
         const int n_tok = (int) ids->ne[1], n_pairs = (int) ggml_nelements(ids);
         const uint8_t * W = (const uint8_t *) w->data;
@@ -2442,6 +2462,58 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             CUDA_CHECK(cudaGetLastError());
             return;
         }
+    }
+    // fork AIPFIX P1PLAIN-GU: phase 1 of the bank gate/up under P1HITG (bank routes only) runs the plain AI+ table
+    // GEMV (gate and up in one launch, fused SwiGLU; routes of one expert share a weight read at >= 4 tokens)
+    // instead of the mixed kernel. A prep kernel writes what phase 1 wrote for later projections (bank slot ids,
+    // route mask) and a slot -> weight table per projection. The k order may differ (KLD-close class).
+    if ((p1_plain_mode & 2) && phase == 1 && pair && pair->hot_only && pair->glu && route_map && !red &&
+            ids->ne[2] == 1 && w->type != GGML_TYPE_IQ4_NL && pair->bank->src[0]->type == w->type &&
+            pair->bank->src[0]->ne[2] == w->ne[2] && M % 16 == 0 &&
+            (int64_t) (M/16)*ids->ne[0]*ids->ne[1] <= ai4k::GLU_PAIR_TILES) {
+        const int n_used = (int) ids->ne[0], n_tok = (int) ids->ne[1], n_slots = (int) w->ne[2];
+        ggml_cuda_pool_alloc<const void *> tab(ctx.pool(), 2*(size_t) n_slots);
+        const ggml_tensor * w2 = pair->bank->src[0];
+        moe_p1_plain_prep<<<1, 256, 0, ctx.stream()>>>((const char *) ci->data, ci->nb[0], ci->nb[1],
+                (const float *) route_map->data, (int) ggml_nelements(route_map), (char *) ids->data, ids->nb[0],
+                ids->nb[1], (float *) route_mask->data, n_used, n_used*n_tok, n_slots,
+                (const uint8_t *) w->data, w->nb[2], (const uint8_t *) w2->data, w2->nb[2], tab.get());
+        CUDA_CHECK(cudaGetLastError());
+        ai4k::idmap pm{};
+        pm.nb02 = w->nb[2];
+        pm.direct_ids = (const char *) ids->data;
+        pm.direct_nb0 = ids->nb[0]; pm.direct_nb1 = ids->nb[1];
+        pm.direct_n_used = n_used; pm.direct_ne11 = (int) x->ne[1]; pm.direct_n_expert = n_slots;
+        pm.table = tab.get();
+        pm.table2 = tab.get() + n_slots;
+        pm.y2 = (float *) pair->dst->data;
+        const bool gate_first = pair->glu->src[0]->data == dst->data;
+        pm.glu = (float *) pair->glu->data;
+        pm.glu_gate = (const float *) (gate_first ? dst : pair->dst)->data;
+        pm.glu_up = (const float *) (gate_first ? pair->dst : dst)->data;
+        float * Y = (float *) dst->data;
+        bool ok = false;
+        switch (ai4_lay_of(w->type)) {
+#define AI4_P1_PLAIN_GU(L) \
+            case L: ok = xsh ? ai4_mmvr_try<L, 1, true>(nullptr, act_ai_q, act_ai_s, Y, M, n_tok, K, ctx.stream(), pm, n_used*n_tok) \
+                             : ai4_mmvr_try<L, 0, true>(nullptr, act_ai_q, act_ai_s, Y, M, n_tok, K, ctx.stream(), pm, n_used*n_tok); break;
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT2_U)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT2P_U)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT3_U)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT4_U)
+#undef AI4_P1_PLAIN_GU
+            default: break;
+        }
+        static std::atomic<bool> logged_gu{false};
+        if (!logged_gu.exchange(true)) {
+            fprintf(stderr, "[moe-bank] P1PLAIN-GU first bank gate/up: type=%d K=%d M=%d slots=%d tokens=%d plain=%d\n",
+                    (int) w->type, K, M, n_slots, n_tok, (int) ok);
+        }
+        if (ok) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        // declined: the mixed phase 1 below rewrites the same slot ids and mask
     }
     const dim3 grid((M/16 + slabs_per_block - 1)/slabs_per_block*(pair ? 2 : 1), p2_compact ? p2_y : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
     moe_mixed_second second{};
