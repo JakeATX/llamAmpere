@@ -144,13 +144,13 @@ static bool moe_bank_p2_list() {
 
 // fork AIPFIX P1HITG: GGML_MOE_BANK_P1_HITG=1 runs a banked layer's cached (3XS) gate/up routes through the 3XS
 // fused hit kernel (one weight read per expert for every token routed to it, SwiGLU in the store), before the mixed
-// phase 1, which then takes the bank routes only. Needs the hit-first split and the fused SwiGLU. Default off until
-// a paired speed run.
-// Bit 0: gate/up, bit 1: down (=3 both).
+// phase 1, which then takes the bank routes only. Needs the hit-first split and the fused SwiGLU (GGML_MOE_HIT_FUSED=1).
+// Bit 0: gate/up, bit 1: down. Default 3 (both): paired Taichi coding 100K, keep-2000 bank, -0.84 ms/round (p=.0025).
+// GGML_MOE_BANK_P1_HITG=0 opts out.
 static int moe_bank_p1_hitg_bits() {
     static const int v = [] {
         const char * e = getenv("GGML_MOE_BANK_P1_HITG");
-        return e ? atoi(e) & 3 : 0;
+        return e ? atoi(e) & 3 : 3;
     }();
     return v;
 }
