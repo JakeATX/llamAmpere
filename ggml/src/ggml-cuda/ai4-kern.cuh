@@ -1101,7 +1101,7 @@ static __device__ __forceinline__ void mmvr_body(
         }
     }
     if constexpr (DIRECT && !GROUPED) {
-        if (idm.glu && (SPW ? lane == 0 : threadIdx.x == 0)) {
+        if (idm.glu && !dead && (SPW ? lane == 0 : threadIdx.x == 0)) {
             const int64_t col = (int64_t) blockIdx.z*idm.direct_n_used + blockIdx.y;
             g_ai4k_glu_count[(idm.filter_val ? GLU_PAIR_TILES : 0) + col*(M/16) + slab] = 0;
         }
@@ -1120,7 +1120,8 @@ static __device__ __forceinline__ void mmvr_body(
         const int e = idm.direct_map ?
                 (native >= 0 && native < idm.direct_map_size ? (int) idm.direct_map[native] : -1) : native;
         if (e < 0 || e >= idm.direct_n_expert) {
-            if (idm.direct_zero && (SPW ? lane < 16 : threadIdx.x < 16)) {
+            // dead pair-layout slabs (slab >= M/16) stay alive only for the table barrier; they own no output rows
+            if (idm.direct_zero && !dead && (SPW ? lane < 16 : threadIdx.x < 16)) {
                 const int64_t col = (int64_t) tok*idm.direct_n_used + u;
                 Y[col*ldy + slab*16 + (SPW ? lane : (int) threadIdx.x)] = 0.0f;
             }
