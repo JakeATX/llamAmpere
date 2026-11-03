@@ -1586,10 +1586,11 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return value != nullptr ? atoi(value) : 0;
         }();
         const bool multi = lid_multi > 0 && n_batch > 1;
-        // fork: GGML_CUDA_LID_ROWS=1 scores all (1-7) tokens per block with the reduce-scatter kernel; =2 also checks the bits
+        // fork: GGML_CUDA_LID_ROWS scores all (1-7) tokens per block with the reduce-scatter kernel (default on; =0 opts out);
+        // =2 also checks the bits
         static const int lid_rows = [] {
             const char * value = getenv("GGML_CUDA_LID_ROWS");
-            return value != nullptr ? atoi(value) : 0;
+            return value != nullptr ? atoi(value) : 1;
         }();
         const bool use_rows = lid_rows > 0 && n_batch <= LID_ROWS_MAXT && n_stream >= 1 &&
             (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16);

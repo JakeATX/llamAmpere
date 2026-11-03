@@ -10753,12 +10753,12 @@ static bool ggml_cuda_shexp_chain_find(const ggml_cgraph * g, int d, const std::
     return true;
 }
 
-// [QKVSIDE] GGML_CUDA_QKV_SIDE=1 (default off): in a sparse-attention layer the Q/K/V projections (with their norms,
+// [QKVSIDE] GGML_CUDA_QKV_SIDE (default on; =0 opts out): in a sparse-attention layer the Q/K/V projections (with their norms,
 // rotary embeddings and the output gate) depend only on the layer's block input, not on the indexer's selection, so
 // they run on the second stream while the indexer scores, selects and compacts on the main one. Same kernels on the
 // same inputs in the same order within each stream: bit-identical. Decode-sized batches only (<= 16 rows).
 static bool ggml_cuda_qkv_side_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_CUDA_QKV_SIDE"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_QKV_SIDE"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 
