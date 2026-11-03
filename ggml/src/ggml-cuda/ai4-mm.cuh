@@ -11,7 +11,8 @@ void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 bool ggml_cuda_ai4_supported(const ggml_tensor * op);
 
 // MUL_MAT_ID over an AI+ unit expert stack (device-side routing, only the selected experts are read)
-void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+// y_into != nullptr: write the routed pairs into y_into (same layout as dst) and leave skipped pairs untouched
+void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, float * y_into = nullptr);
 
 // true when ggml_cuda_mul_mat_id_ai4 would take the host-routed reference path (GGML_CUDA_AI4_REF=1 or pre-Ampere)
 bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t);

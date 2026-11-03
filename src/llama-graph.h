@@ -1312,6 +1312,11 @@ struct llm_graph_context {
     mutable bool          moe_defer_reduce     = false;
     mutable bool          moe_b1_bypass        = false; // [B1] hot bank call inside the routing phase: compute it now
     mutable ggml_tensor * moe_route_skip       = nullptr; // per-route value >= 0: the cold MUL_MAT_IDs may skip the route
+    // fork AIPFIX ONECHAIN: prompt batches of a banked layer run one expert chain; after each regular expert product
+    // the bank product of the same projection fills the bank routes (moe_onechain_ids >= 0), see build_moe_ffn
+    mutable const moe_hot_bank * moe_onechain_bank = nullptr;
+    mutable ggml_tensor * moe_onechain_ids  = nullptr; // I32 [n_expert_used, n_tokens]: bank slot or -1
+    mutable ggml_tensor * moe_onechain_cold = nullptr; // F32 [1, n_expert_used, n_tokens]: 1 = regular route, 0 = bank route
     mutable ggml_tensor * sj_kvarn_mask_src = nullptr;
     mutable std::vector<ggml_tensor *> sj_kvarn_mask_s;
 
@@ -1319,6 +1324,7 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+    ggml_tensor * build_moe_onechain_fill(ggml_tensor * regular, ggml_tensor * bank_w, ggml_tensor * x) const;
 
     // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
     bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {

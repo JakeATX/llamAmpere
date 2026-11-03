@@ -9555,6 +9555,40 @@ static int ggml_cuda_try_gated_norm(ggml_backend_cuda_context & ctx, ggml_cgraph
     return 3;
 }
 
+// fork AIPFIX ONECHAIN (llama-graph.cpp build_moe_onechain_fill): kept = regular * cold_mask (in place),
+// bank = AI+ MUL_MAT_ID with the bank routes (-1 elsewhere), out = kept + bank (in place). The bank kernel writes
+// exactly the routes where cold_mask is 0 and never the others, so it writes straight into the regular output:
+// no mask pass, no zero fill, no add. GGML_CUDA_MOE_ONECHAIN_FUSE=0 runs the three nodes as written.
+static int ggml_cuda_try_moe_onechain_fill(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MOE_ONECHAIN_FUSE");
+        return !value || atoi(value) != 0;
+    }();
+    if (!enabled || i + 3 > cgraph->n_nodes || !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    ggml_tensor * kept = cgraph->nodes[i], * bank = cgraph->nodes[i + 1], * out = cgraph->nodes[i + 2];
+    if (kept->op != GGML_OP_MUL || bank->op != GGML_OP_MUL_MAT_ID || out->op != GGML_OP_ADD ||
+            strcmp(bank->name, "moe_onechain_bank") != 0 || ggml_ai4_rate(bank->src[0]->type) == 0 ||
+            out->src[0] != kept || out->src[1] != bank || kept->src[0] == nullptr ||
+            kept->data != kept->src[0]->data || out->data != kept->data ||
+            kept->type != GGML_TYPE_F32 || bank->type != GGML_TYPE_F32 || !ggml_are_same_shape(kept, bank) ||
+            !ggml_are_same_shape(out, bank) || !ggml_is_contiguous(kept) || !ggml_is_contiguous(bank) ||
+            ggml_cuda_ai4_id_needs_sync(ggml_cuda_info().devices[ctx.device].cc, bank->src[0]->type) ||
+            !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_MUL_MAT_ID, GGML_OP_ADD }, { i + 2 })) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_id_ai4(ctx, bank, (float *) out->data);
+    ctx.fusion_stats.moe_onechain_fill++;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: [moe-bank] onechain prompt fill fused (bank rows written into the regular expert output)\n",
+                __func__);
+    }
+    return 2;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -9562,6 +9596,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_MUL) {
+        const int n_fill = ggml_cuda_try_moe_onechain_fill(*cuda_ctx, cgraph, i);
+        if (n_fill > 0) {
+            return n_fill;
+        }
+    }
     if (node->op == GGML_OP_SSM_CONV && ggml_cuda_try_gdn_conv_norm(*cuda_ctx, cgraph, i)) {
         return 7;
     }
@@ -13270,6 +13310,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "q8_cache_hits") == 0) {
         return ctx->fusion_stats.q8_cache_hits;
+    }
+    if (strcmp(name, "moe_onechain_fill") == 0) {
+        return ctx->fusion_stats.moe_onechain_fill;
     }
     if (strcmp(name, "mmq_route_skip") == 0) {
         return ctx->fusion_stats.mmq_route_skip;

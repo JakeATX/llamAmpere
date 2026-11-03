@@ -2411,6 +2411,25 @@ static void moe_skipmass_cpu(ggml_tensor * dst, const ggml_tensor * a, const ggm
     if (ith == 0) { memcpy(dst->data, a->data, ggml_nbytes(a)); }
 }
 
+// the CUDA fusion matches this name (same literal in ggml-cuda.cu)
+#define GGML_MOE_ONECHAIN_BANK_NAME "moe_onechain_bank"
+
+// fork AIPFIX ONECHAIN: regular route values stay (cold mask 1), bank routes (cold mask 0, skipped by the regular
+// MUL_MAT_ID) take the bank product. The three nodes stay adjacent: the CUDA backend writes the bank product straight
+// into the regular output (ggml-cuda.cu, ggml_cuda_try_moe_onechain_fill); the bank kernel never writes skipped routes.
+ggml_tensor * llm_graph_context::build_moe_onechain_fill(ggml_tensor * regular, ggml_tensor * bank_w, ggml_tensor * x) const {
+    GGML_ASSERT(moe_onechain_ids && moe_onechain_cold);
+    ggml_build_forward_expand(gf, regular);
+    ggml_tensor * kept = ggml_mul_inplace(ctx0, regular, moe_onechain_cold);
+    ggml_build_forward_expand(gf, kept);
+    ggml_tensor * bank = ggml_mul_mat_id(ctx0, bank_w, x, moe_onechain_ids);
+    ggml_set_name(bank, GGML_MOE_ONECHAIN_BANK_NAME);
+    ggml_build_forward_expand(gf, bank);
+    ggml_tensor * out = ggml_add_inplace(ctx0, kept, bank);
+    ggml_build_forward_expand(gf, out);
+    return out;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2763,6 +2782,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }();
         const bool joint_reduce = joint_enabled && !b1_routing && hot_skip && hot_dbg == 0 &&
                 n_tokens <= 8 && n_expert_used == hparams.n_expert_used(il);
+        // fork AIPFIX ONECHAIN (opt-in LLAMA_MOE_BANK_ONECHAIN=1): prompt batches skip the separate bank chain (its
+        // full-width zero fill, SwiGLU, weighting and reduction); the regular chain below takes the bank products
+        // in place with the full routing weights. Valid math: one sum over all routes instead of bank + regular sums.
+        static const bool onechain_enabled = [] {
+            const char * value = getenv("LLAMA_MOE_BANK_ONECHAIN");
+            return value && atoi(value) != 0;
+        }();
+        static const bool onechain_cold_skip = [] {
+            const char * value = getenv("LLAMA_MOE_COLD_SKIP");
+            return !value || atoi(value) != 0;
+        }();
+        if (onechain_enabled && onechain_cold_skip && hot_dbg == 0 && !b1_routing && n_tokens > 8 && hot_skip && !joint_reduce && type_op == LLM_FFN_SILU &&
+                il >= 0 && hparams.swiglu_clamp_exp[il] <= 1e-6f && loras->empty() &&
+                (!hadamard_rotations || hadamard_rotations->empty()) &&
+                up_exps && gate_exps && down_exps && !gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
+                !up_exps_s && !gate_exps_s && !down_exps_s && !llm_sched_needs_moe_f16_act_guard(sched)) {
+            moe_route_skip = slot;
+            moe_weights_override = weights;
+            moe_onechain_bank = &hot;
+            moe_onechain_ids  = hot_ids;
+            moe_onechain_cold = ggml_scale_bias(ctx0, mask, -1.0f, 1.0f);
+            ggml_build_forward_expand(gf, hot_ids);
+            ggml_build_forward_expand(gf, moe_onechain_cold);
+            ggml_tensor * out = build_moe_ffn(cur, gate_inp, nullptr,
+                    up_exps, nullptr, gate_exps, nullptr, down_exps, nullptr, exp_probs_b,
+                    n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                    logits, nullptr, nullptr, nullptr, nullptr, nullptr, cold_ids);
+            moe_onechain_bank = nullptr;
+            moe_onechain_ids  = nullptr;
+            moe_onechain_cold = nullptr;
+            moe_route_skip = nullptr;
+            GGML_ASSERT(moe_weights_override == nullptr);
+            return out;
+        }
         GGML_ASSERT(!moe_defer_reduce);
         moe_defer_reduce = joint_reduce;
         moe_weights_override = w_hot;
@@ -2831,6 +2884,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * const moe_in = cur;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2889,6 +2943,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps_b) {
             cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);
+        }
+        if (moe_onechain_bank) {
+            // keep the two regular products adjacent (shared prompt MMQ prep), then fill their bank routes
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, up);
+            up  = build_moe_onechain_fill(up,  moe_onechain_bank->up,   moe_in);
+            cur = build_moe_onechain_fill(cur, moe_onechain_bank->gate, moe_in);
         }
     }
 
@@ -2997,6 +3058,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
     }
     cb(experts, "ffn_moe_down", il);
+    if (moe_onechain_bank) {
+        experts = build_moe_onechain_fill(experts, moe_onechain_bank->down, cur);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);

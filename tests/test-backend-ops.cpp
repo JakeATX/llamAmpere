@@ -8728,6 +8728,84 @@ struct test_mul_mat_id_route_skip : public test_case {
     }
 };
 
+// fork AIPFIX ONECHAIN (llama-graph.cpp build_moe_onechain_fill): a prompt batch of a banked layer runs one expert
+// chain. Regular product (bank routes skipped via src[3]), times the cold mask in place, plus the AI+ bank product
+// (bank slot or -1) in place. CUDA writes the bank product straight into the regular output.
+struct test_moe_onechain_fill : public test_case {
+    const ggml_type bank_type, base_type;
+    const bool b; // broadcast input (gate/up), else one row per route (down)
+    const int64_t m, n, k;
+    const int n_mats = 32, n_bank = 8, n_used = 10;
+
+    test_moe_onechain_fill(ggml_type bank_type, ggml_type base_type, bool b, int64_t m, int64_t n, int64_t k)
+        : bank_type(bank_type), base_type(base_type), b(b), m(m), n(n), k(k) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_ONECHAIN_FILL"; }
+    std::string vars() override { return VARS_TO_STR6(bank_type, base_type, b, m, n, k); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    const char * required_fusion() override {
+        const char * enabled = getenv("GGML_CUDA_MOE_ONECHAIN_FUSE");
+        return !enabled || atoi(enabled) ? "moe_onechain_fill" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, k, m, n_mats);
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, k, m, n_bank);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        ggml_tensor * ci = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_tensor * skip = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(ci, "onechain_regular_ids"); ggml_set_name(hi, "onechain_bank_ids"); ggml_set_name(skip, "skip");
+        ggml_tensor * cold = ggml_step(ctx, ggml_scale_bias(ctx, skip, -1.0f, -0.5f)); // 1 where skip < 0
+        ggml_build_forward_expand(gf, cold);
+        ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ci);
+        c->src[3] = skip;
+        ggml_build_forward_expand(gf, c);
+        ggml_tensor * kept = ggml_mul_inplace(ctx, c, cold);
+        ggml_build_forward_expand(gf, kept);
+        ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, hi);
+        ggml_set_name(h, "moe_onechain_bank");
+        ggml_build_forward_expand(gf, h);
+        ggml_tensor * out = ggml_add_inplace(ctx, kept, h);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(4321);
+        std::vector<int32_t> regular(n_used*n), bank(n_used*n);
+        std::vector<float> skip(n_used*n);
+        for (int64_t t = 0; t < n; ++t) {
+            std::vector<int32_t> experts(n_mats);
+            std::iota(experts.begin(), experts.end(), 0);
+            std::shuffle(experts.begin(), experts.end(), rng);
+            std::vector<int32_t> slots(n_bank);
+            std::iota(slots.begin(), slots.end(), 0);
+            std::shuffle(slots.begin(), slots.end(), rng);
+            int used_slots = 0;
+            for (int i = 0; i < n_used; ++i) {
+                const int64_t j = t*n_used + i;
+                // some tokens are all bank, some all regular, the rest mixed
+                const bool hot = used_slots < n_bank && (t % 7 == 3 ? true : t % 7 == 5 ? false : rng() % 3 == 0);
+                regular[j] = experts[i];
+                bank[j] = hot ? slots[used_slots++] : -1;
+                skip[j] = hot ? (float) bank[j] : -1.0f;
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "onechain_regular_ids") == 0) {
+                ggml_backend_tensor_set(t, regular.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "onechain_bank_ids") == 0) {
+                ggml_backend_tensor_set(t, bank.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "skip") == 0) {
+                ggml_backend_tensor_set(t, skip.data(), 0, ggml_nbytes(t));
+            } else if (t->op == GGML_OP_NONE && is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_mul_mat_id_ai4 : public test_mul_mat_id {
     const bool dup;
     const bool initialize_all;
@@ -19404,6 +19482,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int n : { 9, 64, 600 }) {
                 test_cases.emplace_back(new test_mul_mat_id_route_skip(type_a, 32, 10, b, 128, n, 256));
             }
+        }
+    }
+    for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int n : { 9, 64, 600 }) {
+            test_cases.emplace_back(new test_moe_onechain_fill(bank, GGML_TYPE_IQ3_XXS, true,  128, n, 512)); // gate/up
+            test_cases.emplace_back(new test_moe_onechain_fill(bank, GGML_TYPE_Q2_0,    false, 256, n, 640)); // down
         }
     }
 
