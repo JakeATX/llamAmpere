@@ -133,11 +133,12 @@ static bool moe_mixed_hit_first() {
 // kernel from the plan's list (one weight read per expert for every token that routes to it, gate and up fused)
 // instead of the mixed kernel's phase 2. Needs the hit-first split and GGML_MOE_MISS_LIST. Skipped routes are zeroed
 // as the 3XS path does (tail zero; the CPU join rewrites host routes); the routed sum is then its own launch.
-// Default off until a paired speed run.
+// Default on (still needs GGML_MOE_MISS_LIST): paired Taichi coding 100K on top of P1HITG+P1CONC, -0.38 ms/round
+// width-matched (p=.04). GGML_MOE_BANK_P2_LIST=0 opts out.
 static bool moe_bank_p2_list() {
     static const bool v = [] {
         const char * e = getenv("GGML_MOE_BANK_P2_LIST");
-        return e && atoi(e) != 0;
+        return e ? atoi(e) != 0 : true;
     }();
     return v;
 }
