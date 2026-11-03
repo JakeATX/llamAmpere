@@ -776,10 +776,6 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmv(
     uint8_t * ring = smem + warp*STAGES*ST;
 
     const bool has_n = g < N;
-    bool lean = false;
-    if constexpr (SPW && GROUPED && lay_v2<LAY>() && KR == 2) {
-        lean = idm.lean && N == 1;
-    }
     const int8_t * xr = Xq + (has_n ? xrow(g) : 0)*K + t*32;
     // activation scale pointer of the token this lane loads (lanes 16..23 load tokens 0..7)
     const float * xsr = Xs + ((lane >= 16 && lane < 24 && lane - 16 < N) ? xrow(lane - 16) : 0)*XSN;
@@ -1154,6 +1150,10 @@ static __device__ __forceinline__ void mmvr_body(
     uint8_t * ring = smem + warp*STAGES*ST;
 
     const bool has_n = g < N;
+    bool lean = false;
+    if constexpr (SPW && GROUPED && lay_v2<LAY>() && KR == 2) {
+        lean = idm.lean && N == 1;
+    }
     const int8_t * xr = Xq + (has_n ? xrow(g) : xrow(0))*K + kw*RQ4_CHUNK + (PERM ? 64*(t & 1) + 4*(t >> 1) : t*32);
     const float * xf = FUSED_X ? idm.direct_x + (int64_t) direct_row*K + (warp >> XSH)*(128 << XSH) : nullptr;
     const int  ns = lane - 16;
