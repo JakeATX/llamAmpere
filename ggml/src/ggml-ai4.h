@@ -177,12 +177,6 @@ static inline void aik_dequantize_slab_c(int k, uint32_t C, const uint8_t * src,
 #define AI4V2_UNITS          (AI4V2_BK/AI4U_UK)                      // 5 units of 128 K per block
 #define AI4V2_BLOCK_BYTES(k) (AI4U_SCALE_BYTES + AI4V2_UNITS*(AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k))   // 32 + 1280 k
 
-// 4 x level: the full 4-byte sum of state * C, centered (range -510..510); weight = scale * level4 / 4
-static inline int aik_level4_c(uint32_t state, uint32_t C) {
-    const uint32_t x = state * C;
-    return (int)(x & 255) + (int)((x >> 8) & 255) + (int)((x >> 16) & 255) + (int)(x >> 24) - 510;
-}
-
 // block = 16 rows x 640 K at src (AI4V2_BLOCK_BYTES(k) bytes); dst rows stride K; tiles are the AITk_U tiles (no pair code)
 static inline void aik_dequantize_block_v2_rotated(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K) {
     const int tw = AIK_TILE_WORDS(k);
@@ -192,7 +186,7 @@ static inline void aik_dequantize_block_v2_rotated(int k, uint32_t C, const uint
         for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
             for (int n = 0; n < AI4_TILE; ++n) {
                 const int r = n / AI4_TC, kk = u*AI4U_UK + ct*AI4_TC + n % AI4_TC;
-                dst[r*K + kk] = ai4_fp16_to_fp32(dh[r])*0.25f*(float) aik_level4_c(aik_get_state(wd + ct*tw, k, n), C);
+                dst[r*K + kk] = ai4_fp16_to_fp32(dh[r])*(float) aik_level_c(aik_get_state(wd + ct*tw, k, n), C);
             }
         }
     }
@@ -209,6 +203,11 @@ static inline void aik_dequantize_slab_v2_c(int k, uint32_t C, const uint8_t * s
             ai4_unrotate_n(dst + r*K + b*rb, rb);
         }
     }
+}
+
+// row-scale slab (K % 640 == 0): K/640 blocks
+static inline int64_t ai4x_slab_bytes_v2(int64_t K, int k) {
+    return (K/AI4V2_BK)*AI4V2_BLOCK_BYTES(k);
 }
 
 static inline int64_t ai4x_slab_bytes_k(int64_t K, int k) {

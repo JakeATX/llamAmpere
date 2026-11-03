@@ -6018,6 +6018,9 @@ size_t ggml_ai4_slab_nbytes(enum ggml_type type, int64_t K) {
     if (k == 0 || K <= 0 || K % AI4U_UK != 0) {
         return 0;
     }
+    if (ggml_ai4v2_rate(type) != 0) {
+        return K % AI4V2_BK == 0 ? (size_t) ai4x_slab_bytes_v2(K, k) : 0;
+    }
     return (size_t) ai4x_slab_bytes_k(K, k);
 }
 
@@ -6039,6 +6042,10 @@ bool ggml_ai4_dequantize_slab(enum ggml_type type, const void * data, int64_t K,
                 ai4_unrotate256(yr + b);
             }
         }
+        return true;
+    }
+    if (ggml_ai4v2_rate(type) != 0) {
+        aik_dequantize_slab_v2_c(ggml_ai4_rate(type), ggml_ai4_trellis_mul(type), (const uint8_t *) data + (size_t) g * sb, y, K);
         return true;
     }
     aik_dequantize_slab_c(ggml_ai4_rate(type), ggml_ai4_trellis_mul(type), (const uint8_t *) data + (size_t) g * sb, y, K);

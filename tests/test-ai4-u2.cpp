@@ -1,4 +1,4 @@
-// AITk_U2 reference decode vs AITk_U (same tiles, same scales): only the level rounding may differ (old = floor((b+2)/4)-128 vs full (b-510)/4: rms 0.43 level units, ~1.3% of the level rms 37).
+// AITk_U2 reference decode vs AITk_U (same tiles, same scale in every unit of a block, same level rule): must match exactly.
 #include "ggml-ai4.h"
 #include <cstdio>
 #include <cstdlib>
@@ -30,7 +30,7 @@ int main() {
             double ee = 0, ss = 0;
             for (size_t i = 0; i < a.size(); ++i) { ee += (a[i]-b[i])*(double)(a[i]-b[i]); ss += (double) a[i]*a[i]; }
             const double rel = sqrt(ee/ss);
-            const int ok = rel < 0.02 && ss > 0;
+            const int ok = rel == 0.0 && ss > 0;   // same tiles, same level rule: bit-identical decode
             printf("k=%d K=%lld bytes/row-block %d  rel rms diff old-vs-v2 = %.5f %s\n", k, (long long) K, (int) (AI4V2_BLOCK_BYTES(k)/16), rel, ok ? "OK" : "FAIL");
             bad += !ok;
         }

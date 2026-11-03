@@ -17,6 +17,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "ggml-ai4.h"
+#include "ggml-ai4-decode.h"
 #include "tiled/tiled.h"
 #include "exl3.h"
 
@@ -1627,7 +1628,7 @@ static void ggml_compute_forward_mul_mat_ai4(
     float * wbuf = (float *) params->wdata + (size_t) ith * 16 * K;
 
     for (int64_t g = ith; g < ng; g += nth) {
-        aik_dequantize_slab_c(aik, aimul, (const uint8_t *) src0->data + g * ai4x_slab_bytes_k(K, aik), wbuf, K);
+        ggml_ai4_dequantize_slab(src0->type, src0->data, K, g, wbuf); (void) aimul;
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
@@ -1701,7 +1702,7 @@ static void ggml_compute_forward_mul_mat_id_ai4(
         }
         const uint8_t * w = (const uint8_t *) src0->data + e*nb02;
         for (int64_t g = ith; g < ng; g += nth) {
-            aik_dequantize_slab_c(aik, aimul, w + g * ai4x_slab_bytes_k(K, aik), wbuf, K);
+            ggml_ai4_dequantize_slab(src0->type, w, K, g, wbuf); (void) aimul;
             for (int64_t t = 0; t < n_tok; ++t) {
                 for (int64_t s = 0; s < n_ids; ++s) {
                     if (*(const int32_t *) ((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]) != e) {

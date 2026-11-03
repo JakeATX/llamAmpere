@@ -706,6 +706,8 @@ static int ai4_lay_of(ggml_type t) {
         case GGML_TYPE_AIT2_U: return ai4k::LAY_AIT2_U;
         case GGML_TYPE_AIT2P_U: return ai4k::LAY_AIT2P_U;
         case GGML_TYPE_AIT3_U: return ai4k::LAY_AIT3_U;
+        case GGML_TYPE_AIT2_U2: return ai4k::LAY_AIT2_U2;
+        case GGML_TYPE_AIT3_U2: return ai4k::LAY_AIT3_U2;
         case GGML_TYPE_AIT4_U: return ai4k::LAY_AIT4_U;
         case GGML_TYPE_AIT5_U: return ai4k::LAY_AIT5_U;
         default: GGML_ABORT("not an AI+ unit type");
@@ -827,6 +829,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
                 break;
             AI23_SPLIT_U(ai4k::LAY_AIT2_U)
             AI23_SPLIT_U(ai4k::LAY_AIT3_U)
+            AI23_SPLIT_U(ai4k::LAY_AIT2_U2)
+            AI23_SPLIT_U(ai4k::LAY_AIT3_U2)
 #undef AI23_SPLIT_U
             default: GGML_ABORT("unsupported AI23 split layout");
         }
@@ -851,6 +855,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             break;
         AI4_MM_U(ai4k::LAY_AIT2_U)
         AI4_MM_U(ai4k::LAY_AIT3_U)
+        AI4_MM_U(ai4k::LAY_AIT2_U2)
+        AI4_MM_U(ai4k::LAY_AIT3_U2)
         AI4_MM_U(ai4k::LAY_AIT4_U)
         AI4_MM_U(ai4k::LAY_AIT5_U)
 #undef AI4_MM_U
@@ -866,6 +872,9 @@ static bool ai4_is_type(ggml_type t) {
 // under GGML_CUDA_AI5_REF=1 (an A/B check of its rate-5 kernels); AIT2_U / AIT3_U unless GGML_CUDA_AI23_FAST=1.
 static bool ai4_ref_only_type(ggml_type t) {
     static const bool v = ai4_env_int("GGML_CUDA_AI5_REF", nullptr, 0) != 0;
+    if (t == GGML_TYPE_AIT2_U2 || t == GGML_TYPE_AIT3_U2) {
+        return false;   // row-scale layouts have no host-reconstruct reference path; the fast kernels are the only path
+    }
     if (t == GGML_TYPE_AIT5_U) {
         return v;
     }
@@ -881,6 +890,9 @@ static bool ai4_ref_only_type(ggml_type t) {
 // Default (unset or 1) keeps the reference path for MUL_MAT_ID; dense MUL_MAT keeps ai4_ref_only_type.
 static bool ai4_id_ref_only_type(ggml_type t) {
     static const bool id_ref = ai4_env_int("GGML_CUDA_AI23_ID_REF", nullptr, 1) != 0;
+    if (t == GGML_TYPE_AIT2_U2 || t == GGML_TYPE_AIT3_U2) {
+        return false;
+    }
     if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT2P_U || t == GGML_TYPE_AIT3_U) {
         return id_ref && ai4_ref_only_type(t);
     }
@@ -1027,7 +1039,7 @@ bool ggml_cuda_ai4_supported(const ggml_tensor * op) {
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
     if (b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[1] % 16 != 0 ||
-            a->ne[3] != 1 || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
+            (ggml_ai4v2_rate(a->type) != 0 && a->ne[0] % 640 != 0) || a->ne[3] != 1 || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
         return false;
     }
     if (op->op == GGML_OP_MUL_MAT) {
@@ -1353,6 +1365,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         AI4_MMID_U(ai4k::LAY_AIT2_U)
         AI4_MMID_U(ai4k::LAY_AIT2P_U)
         AI4_MMID_U(ai4k::LAY_AIT3_U)
+        AI4_MMID_U(ai4k::LAY_AIT2_U2)
+        AI4_MMID_U(ai4k::LAY_AIT3_U2)
         AI4_MMID_U(ai4k::LAY_AIT4_U)
         AI4_MMID_U(ai4k::LAY_AIT5_U)
 #undef AI4_MMID_U
@@ -2046,7 +2060,8 @@ bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor *
     }
     const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
     // AIT4_U banks: the K = 640 down projection only (a banked expert is AI+ in all three matrices).
-    if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT2P_U && w->type != GGML_TYPE_AIT3_U && w->type != GGML_TYPE_IQ4_NL &&
+    if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT2P_U && w->type != GGML_TYPE_AIT3_U && w->type != GGML_TYPE_AIT2_U2 &&
+            w->type != GGML_TYPE_AIT3_U2 && w->type != GGML_TYPE_IQ4_NL &&
             (w->type != GGML_TYPE_AIT4_U || w->ne[0] != 640)) ||
             (w->type == GGML_TYPE_IQ4_NL ? cw->type != GGML_TYPE_IQ4_NL : !ggml_cuda_ai4_supported(bank)) ||
             w->ne[3] != 1 || !ggml_is_contiguous(w) ||
@@ -2214,6 +2229,8 @@ bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, cons
         AI4_TABLE_U(ai4k::LAY_AIT2_U)
         AI4_TABLE_U(ai4k::LAY_AIT2P_U)
         AI4_TABLE_U(ai4k::LAY_AIT3_U)
+        AI4_TABLE_U(ai4k::LAY_AIT2_U2)
+        AI4_TABLE_U(ai4k::LAY_AIT3_U2)
         AI4_TABLE_U(ai4k::LAY_AIT4_U)
 #undef AI4_TABLE_U
         default: break;
@@ -2462,6 +2479,10 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         MOE_MIXED_WARPS(GGML_TYPE_Q2_0, ai4k::LAY_AIT2P_U, 0, 640);
     } else if (w->type == GGML_TYPE_AIT2P_U) {
         MOE_MIXED_SHAPE(ai4k::LAY_AIT2P_U);
+    } else if (w->type == GGML_TYPE_AIT2_U2) {
+        MOE_MIXED_SHAPE(ai4k::LAY_AIT2_U2);
+    } else if (w->type == GGML_TYPE_AIT3_U2) {
+        MOE_MIXED_SHAPE(ai4k::LAY_AIT3_U2);
     } else {
         MOE_MIXED_SHAPE(ai4k::LAY_AIT3_U);
     }

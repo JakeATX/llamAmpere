@@ -1626,8 +1626,10 @@ int ggml_exl3_bits(enum ggml_type type) {
 int ggml_ai4_rate(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2:
         case GGML_TYPE_AIT2P_U: return 2;
-        case GGML_TYPE_AIT3_U:  return 3;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 3;
         case GGML_TYPE_AIT4_U:  return 4;
         case GGML_TYPE_AIT5_U:  return 5;
         default:                return 0;
@@ -1692,8 +1694,10 @@ int ggml_ai4_code(enum ggml_type type) {
 // its levels come from the AIT2P pair table, and the shared decoders treat C == 0 as that code.
 uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_AIT2_U:  return 0xC3CCD12Du;
-        case GGML_TYPE_AIT3_U:  return 0x87D8D12Du;
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2: return 0xC3CCD12Du;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 0x87D8D12Du;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT5_U:  return 0xAA73876Bu;
         default:                return 0u;
@@ -1704,8 +1708,10 @@ uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
 float ggml_ai4_scale_mul(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2:
         case GGML_TYPE_AIT2P_U: return 1.00f;
-        case GGML_TYPE_AIT3_U:  return 1.05f;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 1.05f;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT5_U:  return 1.09f;
         default:                return 0.0f;
