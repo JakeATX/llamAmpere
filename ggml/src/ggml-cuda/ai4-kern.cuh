@@ -90,6 +90,9 @@ struct idmap {
     const uint8_t * glu_pfilter = nullptr;
     // fork AIPFIX: no grouped launch for this call (the routes of one expert stay in their own blocks)
     bool no_group = false;
+    // fork AIPTAB lean: grouped slab-per-warp launches with exactly one route per expert decode AIT2_U2 with the
+    // full-sum level rule (one IMAD + one DP4A per weight, no level packing, no IMMA); GGML_MOE_BANK_LEAN=1
+    bool lean = false;
 };
 
 // fork AIPFIX D6: arrivals per (route column, 16-row slice) when both projections of a route are stored by the same
@@ -773,6 +776,10 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmv(
     uint8_t * ring = smem + warp*STAGES*ST;
 
     const bool has_n = g < N;
+    bool lean = false;
+    if constexpr (SPW && GROUPED && lay_v2<LAY>() && KR == 2) {
+        lean = idm.lean && N == 1;
+    }
     const int8_t * xr = Xq + (has_n ? xrow(g) : 0)*K + t*32;
     // activation scale pointer of the token this lane loads (lanes 16..23 load tokens 0..7)
     const float * xsr = Xs + ((lane >= 16 && lane < 24 && lane - 16 < N) ? xrow(lane - 16) : 0)*XSN;
@@ -1039,6 +1046,12 @@ struct mmvr_group {
     int cols[MMV_ID_BN];
 };
 
+static __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c) {
+    int r;
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+}
+
 template <int LAY, int XSH, bool ID, int KT, int STAGES = 2, int WARPS = 4, int MINB = 6, bool DIRECT = false, bool FUSED_X = false, int SPLITS = 1, int LOOP_UNROLL = 1, bool SINGLE_N = false, bool SPW = false, bool GROUPED = false>
 static __device__ __forceinline__ void mmvr_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
@@ -1210,6 +1223,34 @@ static __device__ __forceinline__ void mmvr_body(
     auto compute = [&](int s, const uint32_t (&xv)[8], float act_scale) {
         const uint8_t * st = ring + s*ST;
         const uint32_t * tw = tl + s*(ST/4);
+        if constexpr (SPW && GROUPED && lay_v2<LAY>() && KR == 2) {
+            if (lean) {
+                // full-sum rule: w = (bytesum(state*MULT) - 510)/4, so a.w = (sum a*bytesum - 510*sum a)/4
+                constexpr uint32_t MU = lay_mul<LAY>();
+                int u0 = 0, u1 = 0, sa = 0;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const uint32_t * ta = tw + 4*j*TW;
+                    const uint32_t f0 = __funnelshift_l(ta[wa.w1], ta[wa.w0], wa.sh);
+                    const uint32_t f1 = __funnelshift_l(ta[wb.w1], ta[wb.w0], wb.sh);
+                    const uint32_t b0 = xv[j], b1 = xv[4 + j];
+                    sa = __dp4a((int) b0, 0x01010101, sa);
+                    sa = __dp4a((int) b1, 0x01010101, sa);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const uint32_t rep = __byte_perm(i < 4 ? b0 : b1, 0u, (i & 3)*0x1111);
+                        u0 = dp4a_us(((f0 >> (14 - 2*i)) & 0xFFFFu)*MU, rep, u0);
+                        u1 = dp4a_us(((f1 >> (14 - 2*i)) & 0xFFFFu)*MU, rep, u1);
+                    }
+                }
+                const half  * sdw = (const half *) (st + OSC);
+                const float * sdx = (const float *) (st + OSC + 64);
+                const float dx = sdx[0]*0.25f;
+                acc[0] += (float) (u0 - 510*sa) * (__half2float(sdw[g])*dx);
+                acc[2] += (float) (u1 - 510*sa) * (__half2float(sdw[g + 8])*dx);
+                return;
+            }
+        }
         int p[4] = { 0, 0, 0, 0 };
         int q[4] = { 0, 0, 0, 0 };
 #pragma unroll
@@ -1313,6 +1354,14 @@ static __device__ __forceinline__ void mmvr_body(
 
     if constexpr (SPW) {
         const int r = slab*16 + g;
+        if constexpr (GROUPED && lay_v2<LAY>() && KR == 2) {
+            if (lean) {
+                acc[0] += __shfl_xor_sync(0xffffffffu, acc[0], 1);
+                acc[0] += __shfl_xor_sync(0xffffffffu, acc[0], 2);
+                acc[2] += __shfl_xor_sync(0xffffffffu, acc[2], 1);
+                acc[2] += __shfl_xor_sync(0xffffffffu, acc[2], 2);
+            }
+        }
         if constexpr (GROUPED) {
             // Each MMA column retains the direct SPW K order; only its input/output row changes.
             const int c = 2*t;

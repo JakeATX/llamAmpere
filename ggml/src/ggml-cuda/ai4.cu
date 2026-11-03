@@ -2218,6 +2218,10 @@ bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, cons
     idm.glu_prev = prev;
     idm.glu_prev2 = prev2;
     idm.no_group = !group;
+    {
+        static const bool lean_env = ai4_env_int("GGML_MOE_BANK_LEAN", nullptr, 0) != 0;
+        idm.lean = lean_env;
+    }
     const int max_tiles = (int) (n_used*n_tok);
     bool ok = false;
     switch (ai4_lay_of(type)) {
