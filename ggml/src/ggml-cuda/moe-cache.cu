@@ -161,7 +161,7 @@ static bool moe_bank_p1_hitg_down() {
     return (moe_bank_p1_hitg_bits() & 2) != 0;
 }
 
-// fork AIPFIX P1CONC: GGML_MOE_BANK_P1_CONC=1 (default off, needs P1HITG and the bank zero skip). With P1HITG the
+// fork AIPFIX P1CONC: GGML_MOE_BANK_P1_CONC (staged default ON, =0 opts out; needs P1HITG and the bank zero skip). With P1HITG the
 // 3XS hit kernel and the bank-only mixed phase 1 each fill a fraction of the card (ncu: the width-5 mixed launch runs
 // at 22% occupancy). The bank phase now runs on a second stream at the same time as the hit kernel, which skips bank
 // routes without writing them, so the two launches write disjoint rows. Same kernels, same inputs, same per-row
@@ -169,13 +169,16 @@ static bool moe_bank_p1_hitg_down() {
 static bool moe_bank_p1_conc() {
     static const bool v = [] {
         const char * e = getenv("GGML_MOE_BANK_P1_CONC");
-        const bool on = e && atoi(e) != 0;
-        if (on) {
-            GGML_LOG_INFO("[p1-conc] bank phase 1 on a second stream beside the 3XS hit kernel\n");
-        }
-        return on;
+        return e ? atoi(e) != 0 : true;
     }();
-    return v && ggml_cuda_moe_bank_zero_active();
+    // Only a loaded bank (zero skip active) uses the second stream; a plain 3XS run never reaches this and logs nothing.
+    static bool logged = false;
+    const bool on = v && ggml_cuda_moe_bank_zero_active();
+    if (on && !logged) {
+        logged = true;
+        GGML_LOG_INFO("[p1-conc] bank phase 1 on a second stream beside the 3XS hit kernel\n");
+    }
+    return on;
 }
 static constexpr int MOE_P1_CONC_STREAM = GGML_CUDA_MAX_STREAMS - 1;
 static std::atomic<unsigned long long> g_st_p1conc{0};
