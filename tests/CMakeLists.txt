@@ -507,6 +507,7 @@ endif()
 
 # Manual fixed-token model gate; needs model paths and input IDs supplied by the caller.
 llama_build(test-moe-prefetch-model.cpp)
+llama_build(test-kq-mask-host.cpp)   # host-KV KQ mask: -ngl 0 logits finite and equal to LLAMA_KQ_MASK_DEVICE=0 (gate runs it twice)
 
 llama_build_and_test(test-moe-cache-fit.cpp)
 llama_build_and_test(test-moe-expert-keep.cpp) # [#215/#217] CPU-only expert keep policy
