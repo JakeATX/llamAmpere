@@ -198,6 +198,24 @@ static bool moe_bank_p1_conc() {
 }
 static constexpr int MOE_P1_CONC_STREAM = GGML_CUDA_MAX_STREAMS - 1;
 static std::atomic<unsigned long long> g_st_p1conc{0};
+// fork AIPFIX P1PRIO: GGML_MOE_BANK_P1_PRIO (default 0). Traces of the ship stack show the 3XS hit kernels are the
+// longer side of both concurrent pairs (gate/up hitg ends ~21 us after the bank mixed GEMV; the down hit kernel starts
+// ~11 us after its inputs are ready because the bank down launch, issued first, takes the SMs, then ends ~14 us after
+// it). 1 = issue the hit kernel first, on the side stream created one step above default priority (graph node
+// priority needs GGML_CUDA_GRAPH_NODE_PRIORITY=1, part of the ship stack), with the bank launch on the main stream;
+// 2 = the same swap at default priority (issue order only). Scheduling only: same kernels, inputs and rows.
+static int moe_bank_p1_prio() {
+    static const int v = [] {
+        const char * e = getenv("GGML_MOE_BANK_P1_PRIO");
+        const int m = e ? atoi(e) : 0;
+        if (m) {
+            GGML_LOG_INFO("[p1-prio] mode %d: hit kernels issued first on the side stream%s\n", m,
+                    m == 1 ? " at raised priority" : "");
+        }
+        return m == 1 || m == 2 ? m : 0;
+    }();
+    return v;
+}
 // fork: run(): the bank launch, issued on the side stream; then main(): the hit kernel with bank rows unwritten.
 template <typename B, typename H>
 static void moe_p1_conc_run(ggml_backend_cuda_context & ctx, B && bank_launch, H && hit_launch) {
@@ -207,18 +225,36 @@ static void moe_p1_conc_run(ggml_backend_cuda_context & ctx, B && bank_launch, H
         CUDA_CHECK(cudaEventCreateWithFlags(&ev[dev][0], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&ev[dev][1], cudaEventDisableTiming));
     }
+    const int prio = moe_bank_p1_prio();
+    if (prio == 1 && ctx.streams[dev][MOE_P1_CONC_STREAM] == nullptr) {
+        int least = 0, greatest = 0;
+        ggml_cuda_set_device(dev);
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        // one step above default, below the hit-first copy stream (greatest), so the copies still go first
+        const int p = greatest < least ? least - 1 : least;
+        CUDA_CHECK(cudaStreamCreateWithPriority(&ctx.streams[dev][MOE_P1_CONC_STREAM], cudaStreamNonBlocking, p));
+    }
     const int saved = ctx.curr_stream_no;
     cudaStream_t main_s = ctx.stream();
     cudaStream_t side_s = ctx.stream(dev, MOE_P1_CONC_STREAM);
     CUDA_CHECK(cudaEventRecord(ev[dev][0], main_s));
     CUDA_CHECK(cudaStreamWaitEvent(side_s, ev[dev][0], 0));
     ctx.curr_stream_no = MOE_P1_CONC_STREAM;
-    bank_launch();
-    ctx.curr_stream_no = saved;
-    CUDA_CHECK(cudaEventRecord(ev[dev][1], side_s));
-    ggml_cuda_moe_set_bank_zero_nowrite(true);
-    hit_launch();
-    ggml_cuda_moe_set_bank_zero_nowrite(false);
+    if (prio) {
+        ggml_cuda_moe_set_bank_zero_nowrite(true);
+        hit_launch();
+        ggml_cuda_moe_set_bank_zero_nowrite(false);
+        ctx.curr_stream_no = saved;
+        CUDA_CHECK(cudaEventRecord(ev[dev][1], side_s));
+        bank_launch();
+    } else {
+        bank_launch();
+        ctx.curr_stream_no = saved;
+        CUDA_CHECK(cudaEventRecord(ev[dev][1], side_s));
+        ggml_cuda_moe_set_bank_zero_nowrite(true);
+        hit_launch();
+        ggml_cuda_moe_set_bank_zero_nowrite(false);
+    }
     CUDA_CHECK(cudaStreamWaitEvent(main_s, ev[dev][1], 0));
     g_st_p1conc.fetch_add(1, std::memory_order_relaxed);
 }
