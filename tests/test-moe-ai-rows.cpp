@@ -93,7 +93,7 @@ int main(int argc, char ** argv) {
             for (int64_t sl = 0; sl < M / AI4_TR; ++sl) {
                 aik_dequantize_slab_c(k, C, w.data() + sl * AI4_TR * row_bytes, wf.data() + sl * AI4_TR * K, K);
             }
-            for (int nt : { 1, 2, 8 }) {
+            for (int nt : { 1, 2, 3, 4, 5, 8 }) {  // AIPFIX: 3-5 cover the G=4 and G=2 q8 groups
                 std::vector<float> x((size_t) nt * K), y((size_t) nt * K), out((size_t) nt * M), ref((size_t) nt * M);
                 for (auto & v : x) { v = uni(rng); }
                 const float * yp[8];

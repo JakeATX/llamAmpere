@@ -53,6 +53,9 @@ static void moe_ai_log_first(const char * role) {
 #else
     const char * isa = "scalar";
 #endif
+#if defined(__AVX2__) && defined(__FMA__)
+    if (moe_ai::use_host_q8()) { isa = "avx2"; } // the q8 kernel is AVX2 only, even on AVX-512/VBMI hosts
+#endif
     fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s act=%s\n", role, isa,
             moe_ai::use_host_q8() ? "q8 (GGML_MOE_AI_HOST_Q8=1)" : "f32");
 }
@@ -643,6 +646,7 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
                     float ub[8][AI4_TR] = {}, gb[8][AI4_TR] = {};
                     float * uo[8], * go[8];
                     for (int t = 0; t < nt; ++t) { uo[t] = ub[t]; go[t] = gb[t]; }
+                    if (wu && wg) { GGML_ASSERT(gate.ai_q8 == up.ai_q8); } // gate reads the up activation format
                     if (wu && wg && up.ai_q8) {
                         moe_ai::slab_rows_q8(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, qu, uo);
                         moe_ai::slab_rows_q8(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, qg, go);
