@@ -1796,6 +1796,8 @@ struct host_alt_store {
     std::vector<host_alt_file> files;
     std::vector<std::vector<const void *>> srcs;   // kept alive for the pool's role tables
     std::vector<std::pair<std::string, moe_cs_role>> found;   // one entry per tensor name (sessions re-register)
+    std::vector<std::pair<const char *, size_t>> ranges;      // mapped bytes of each found tensor (warm-up)
+    bool warmed = false;
 };
 host_alt_store & HA() { static host_alt_store s; return s; }
 }
@@ -1836,6 +1838,7 @@ bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_e
             return true;
         }
     }
+    // the loader already checked that these files are the base model (llama-model-loader: host 3XS source check)
     for (const host_alt_file & f : h.files) {
         const int64_t id = gguf_find_tensor(f.g, name);
         const ggml_tensor * t = id >= 0 ? ggml_get_tensor(f.ctx, name) : nullptr;
@@ -1846,8 +1849,9 @@ bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_e
         const size_t eb = rb * (size_t) t->ne[1];
         if (t->ne[0] != n_in || t->ne[1] != n_out || t->ne[2] != n_expert || t->ne[3] != 1 ||
                 off + eb * (size_t) n_expert > f.size || ggml_ai4_is_unit(type)) {
-            fprintf(stderr, "[moe-cpu-split] host 3XS source: %s in %s has another shape or an AI+ type, not used\n", name, f.path.c_str());
-            return false;
+            fprintf(stderr, "[moe-cpu-split] host 3XS source: %s in %s has another shape or an AI+ type, trying the next file\n",
+                    name, f.path.c_str());
+            continue;
         }
         std::vector<const void *> src((size_t) n_expert);
         for (int64_t e = 0; e < n_expert; ++e) { src[(size_t) e] = f.base + off + (size_t) e * eb; }
@@ -1859,11 +1863,57 @@ bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_e
         out->row_bytes = rb;
         out->src = h.srcs.back().data();
         h.found.emplace_back(name, *out);
+        h.ranges.push_back({ f.base + off, eb * (size_t) n_expert });
         return true;
     }
+    fprintf(stderr, "[moe-cpu-split] host 3XS source: %s not found (with this shape) in GGML_MOE_CPU_SPLIT_HOST_GGUF; "
+            "this layer's host misses keep the AI+ decode\n", name);
     return false;
 #else
     (void) name; (void) n_in; (void) n_out; (void) n_expert; (void) out;
     return false;
+#endif
+}
+
+double moe_cs_host_alt_warm() {
+#if defined(__linux__)
+    host_alt_store & h = HA();
+    std::lock_guard<std::mutex> lock(h.mu);
+    size_t total = 0;
+    for (const auto & r : h.ranges) { total += r.second; }
+    if (total == 0 || h.warmed) { return 0.0; }
+    h.warmed = true;
+    const double gib = 1024.0*1024.0*1024.0;
+    const char * e = getenv("GGML_MOE_CPU_SPLIT_HOST_WARM");
+    if (e && e[0] == '0') {
+        fprintf(stderr, "[moe-cpu-split] host 3XS warm-up off (GGML_MOE_CPU_SPLIT_HOST_WARM=0): %.2f GiB cold, first misses read the disk\n",
+                total / gib);
+        return 0.0;
+    }
+    // budget: MemAvailable minus the 7 GiB target the expert arena keeps free (hard floor 5 GiB); ranges in layer order
+    long long avail_kib = -1;
+    if (FILE * fp = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) { if (sscanf(line, "MemAvailable: %lld kB", &avail_kib) == 1) { break; } }
+        fclose(fp);
+    }
+    const char * fe = getenv("GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB");
+    const double target_gib = std::max(5.0, fe && fe[0] ? atof(fe) : 7.0);
+    const double avail = avail_kib > 0 ? avail_kib * 1024.0 : 0.0;
+    double budget = std::max(0.0, avail - target_gib * gib);
+    size_t warmed = 0;
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    for (const auto & r : h.ranges) {
+        if ((double) (warmed + r.second) > budget) { break; }
+        const uintptr_t b = (uintptr_t) r.first & ~(uintptr_t) (page - 1);
+        const size_t len = (uintptr_t) r.first + r.second - b;
+        if (madvise((void *) b, len, MADV_WILLNEED) == 0) { warmed += r.second; }
+    }
+    fprintf(stderr, "[moe-cpu-split] host 3XS warm-up: %.2f of %.2f GiB queued for reading (MemAvailable %.2f GiB, keeps %.1f GiB free); "
+            "%.2f GiB stay cold (misses there read the disk)%s\n", warmed / gib, total / gib, avail / gib, target_gib,
+            (total - warmed) / gib, warmed < total ? " - WARNING: not all host 3XS bytes fit in RAM" : "");
+    return warmed / gib;
+#else
+    return 0.0;
 #endif
 }

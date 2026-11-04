@@ -320,7 +320,8 @@ MOE_AI_T512V static void unit_rows_512_vbmi(const uint8_t * blk, int k, uint32_t
 
 // rows [a, b) of one expert (a multiple of 16; b - a <= 16, rows past b are computed and dropped), nt tokens:
 // o[t][row - a] = W[row] . x_t, with y[t] the rotated inputs from rotate()
-// path: -1 = best available, 0 = AVX2 (or scalar), 1 = AVX-512 (VBMI decode when the host has it), 2 = AVX-512 without VBMI,
+// path: -1 = best available (VBMI if present, else AVX2), 0 = AVX2 (or scalar), 1 = AVX-512 (VBMI decode when the host has it),
+// 2 = AVX-512 without VBMI,
 // 3 = AVX2 with the old window decode (row_levels_avx2; test reference)
 static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                       const float * const * y, float * const * o, int path = -1) {
@@ -333,7 +334,9 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
         const uint16_t * dh  = (const uint16_t *) blk;
         const uint32_t * wd  = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
 #if defined(__AVX2__) && defined(__FMA__)
-        if (C != 0 && path != 0 && path != 3 && has_avx512()) {
+        // default (-1): VBMI decode where the host has it; AVX-512 hosts WITHOUT VBMI (Skylake-X/Cascade Lake class) take the
+        // AVX2 shuffle path below, which beat the word-read AVX-512 decode on the 9900X (249-280 vs 363 us, airows1)
+        if (C != 0 && (path == 1 || path == 2 || (path == -1 && has_vbmi())) && has_avx512()) {
             if (path != 2 && has_vbmi()) { unit_rows_512_vbmi(blk, k, C, nt, y, u*AI4U_UK, acc); }
             else { unit_rows_512(blk, k, C, nt, y, u*AI4U_UK, acc); }
             continue;

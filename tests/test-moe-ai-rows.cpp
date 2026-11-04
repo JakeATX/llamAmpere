@@ -1,6 +1,6 @@
 // fork AIPFIX D2: check and time the host pool's AI+ unit slab kernel (moe-ai-rows.h) against the reference
 // (aik_dequantize_slab_c to f32 in the original basis, then f32 dot products), on Qwen3.8 Flash-Next expert shapes:
-// gate/up 2560 in x 640 out, down 640 in x 2560 out, for AIT2_U / AIT3_U / AIT4_U and 1, 2 and 8 tokens.
+// gate/up 2560 in x 640 out, down 640 in x 2560 out, for AIT2_U / AIT3_U / AIT4_U / AIT5_U and 1, 2 and 8 tokens.
 // Weights are random bit streams with random scales; inputs random. Pass: every output within 2e-5 relative to the
 // largest reference output of its projection (float summation order differs). Exit code 1 on failure.
 //
@@ -25,7 +25,7 @@ int main(int argc, char ** argv) {
     const int reps = argc > 1 ? atoi(argv[1]) : 20;
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-    const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U };
+    const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U };
     const int64_t shapes[][2] = { { 2560, 640 }, { 640, 2560 } };   // K (in), M (out)
 #if defined(__AVX2__) && defined(__FMA__)
     printf("path: AVX2%s%s\n", moe_ai::has_avx512() ? " + AVX-512 (default; AVX2 also timed)" : "", moe_ai::has_vbmi() ? " + VBMI decode (default)" : "");
@@ -59,10 +59,11 @@ int main(int argc, char ** argv) {
                         const uint32_t * wd = (const uint32_t *) (w.data() + sl * AI4_TR * row_bytes + u * ub + AI4U_SCALE_BYTES);
                         for (int ct = 0; ct < AI4U_UK / AI4_TC; ++ct) {
                             moe_ai::tile_bytes(wd + ct * tw, k, ext);
-                            uint32_t E[AIK_TILE_WORDS(5) + 3];
+                            uint32_t E[AIK_TILE_WORDS(5) + 3] = {};
                             moe_ai::tile_words(wd + ct * tw, k, E);
-                            // AIPFAST: the word window must equal the old byte-stream read at every byte offset used
-                            for (int B = 0; B + 8 <= 4 * tw + 12; ++B) { bad += moe_ai::window64(E, B) != moe_ai::load_be64(ext + B); }
+                            // AIPFAST: the word window must equal the old byte-stream read at every byte offset
+                            // whose three words lie inside E (B <= 4*tw + 3)
+                            for (int B = 0; B <= 4 * tw + 3; ++B) { bad += moe_ai::window64(E, B) != moe_ai::load_be64(ext + B); }
                             for (int r = 0; r < AI4_TR; ++r) {
                                 int lev[8];
                                 float got[8];

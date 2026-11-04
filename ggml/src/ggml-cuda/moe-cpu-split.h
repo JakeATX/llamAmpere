@@ -70,3 +70,7 @@ int moe_cs_threads();
 // The files are mapped read-only (page cache, no pinned RAM). Fills `out` (type, shape, row bytes, per-expert
 // sources) when the tensor exists with the given shape and the host can read its type; false otherwise.
 bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_expert, moe_cs_role * out);
+// Once after registration: madvise(WILLNEED) the found tensors in layer order while MemAvailable stays above 7 GiB
+// (GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB, min 5; GGML_MOE_CPU_SPLIT_HOST_WARM=0 skips). Logs warmed vs cold GiB;
+// returns the GiB queued.
+double moe_cs_host_alt_warm();
