@@ -141,7 +141,8 @@ static inline void row_levels_scalar(const uint32_t * E, int k, uint32_t C, int 
     }
 }
 
-// ---- AIPFIX: opt-in int8-activation host path (GGML_MOE_AI_HOST_Q8=1, default off) ----
+// ---- AIPFIX: int8-activation host path for AI+ host rows (default on; GGML_MOE_AI_HOST_Q8=0 = float path) ----
+// Only AI+ unit experts use it, so a file without AI+ experts (3XS) computes exactly as before.
 // The rotated input row is quantized once per token the way the 3XS host rows quantize theirs: Q8_K blocks of 256 when
 // K % 256 == 0 (gate/up: float d, q = min(127, nearest(-127/max * x)), as quantize_row_q8_K_ref) else Q8_0 blocks of 32
 // (down, K = 640: d = fp16(amax/127), q = round(x * 127/amax), as quantize_row_q8_0_ref). Weight levels are exact
@@ -154,7 +155,7 @@ static inline int q8_block(int64_t K) { return K % 256 == 0 ? 256 : 32; }
 static inline size_t q8_bytes(int64_t K) { return (size_t) K*4 + (size_t) (K/32)*sizeof(float); }
 
 static bool use_host_q8() {
-    static const bool on = [] { const char * e = getenv("GGML_MOE_AI_HOST_Q8"); return e && e[0] == '1'; }();
+    static const bool on = [] { const char * e = getenv("GGML_MOE_AI_HOST_Q8"); return !(e && e[0] == '0'); }();
     return on;
 }
 

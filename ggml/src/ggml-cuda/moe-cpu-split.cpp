@@ -59,7 +59,7 @@ static void moe_ai_log_first(const char * role) {
     if (moe_ai::use_host_q8()) { isa = moe_ai::use_q8_vbmi() ? "avx512-vbmi" : "avx2"; } // q8: AVX2 unless GGML_MOE_AI_HOST_Q8_VBMI=1
 #endif
     fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s act=%s\n", role, isa,
-            moe_ai::use_host_q8() ? "q8 (GGML_MOE_AI_HOST_Q8=1)" : "f32");
+            moe_ai::use_host_q8() ? "q8 (default; GGML_MOE_AI_HOST_Q8=0 = f32)" : "f32 (GGML_MOE_AI_HOST_Q8=0)");
 }
 
 namespace {
@@ -447,7 +447,7 @@ struct role_math {
     moe_cs_role r;
     ggml_vec_dot_t dot = nullptr;
     bool ai = false;            // fork AIPFIX D2: AI+ unit expert (moe_ai::slab_rows on rotated f32 inputs)
-    bool ai_q8 = false;         // AIPFIX: opt-in int8 activations (moe_ai::slab_rows_q8, GGML_MOE_AI_HOST_Q8=1)
+    bool ai_q8 = false;         // AIPFIX: int8 activations (moe_ai::slab_rows_q8; default on, GGML_MOE_AI_HOST_Q8=0 = off)
     int ai_k = 0;
     uint32_t ai_C = 0;
     bool q2 = false;            // dot_q2_0_q8_0 instead of ggml's kernel
