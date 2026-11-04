@@ -557,7 +557,8 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<int,      6>>  (enum llm_kv kid, std::array<int,      6>   & result, uint32_t n, bool required);
 
 // fork AIPFIX BANKKEEP: LLAMA_MOE_BANK_KEEP=N keeps the N best-ranked experts of the overlay bank. The ranking is a
-// STRP list (LLAMA_MOE_BANK_RANK, else GGML_MOE_CACHE_PROFILE_LOAD): u32 entries layer | expert << 16, best first.
+// STRP list (LLAMA_MOE_BANK_RANK, else GGML_MOE_CACHE_PROFILE_LOAD): u32 entries layer | expert << 16, best first;
+// the 4-byte (pairs only) and 8-byte (pairs + per-slot rank table) file forms are both read, anything else is refused by name.
 // A layer's bank slots follow that order, so the kept experts of each layer are a prefix of its slots: the bank
 // tensors' outer dimension shrinks to that count and only those bytes are read. llama_model::register_moe_bank()
 // takes the slots past it out of the hot map, so the other experts run (and stay in the arena) as regular experts.
@@ -571,21 +572,40 @@ static void overlay_bank_keep(ggml_context * ctx, const gguf_context * gguf, con
     std::vector<char> list((std::istreambuf_iterator<char>(rank_file)), std::istreambuf_iterator<char>());
     uint32_t head[6] = {};
     if (list.size() < sizeof(head) || memcmp(list.data(), "STRP", 4) != 0) {
-        throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s is not a ranked STRP list", rank_path));
+        throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s is not a ranked STRP list (file is %zu bytes, no STRP header)",
+            rank_path, list.size()));
     }
     memcpy(head, list.data(), sizeof(head));
     const uint32_t n_layer_list = head[2], n_expert_list = head[3], count = head[5];
-    if (n_layer_list == 0 || n_layer_list > 4096 || n_expert_list == 0 || n_expert_list > 4096 ||
-            list.size() != sizeof(head) + (size_t) count*sizeof(uint32_t)) {
-        throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s has a bad header", rank_path));
+    // Two on-disk forms of the same list: "4-byte" = header + count u32 pairs; "8-byte" = the same plus a trailing u32 per
+    // (layer, expert) slot holding that slot's list position (UINT32_MAX when unlisted). Accept both, never guess.
+    const size_t n_slots = (size_t) n_layer_list*n_expert_list;
+    const size_t pair_bytes = sizeof(head) + (size_t) count*sizeof(uint32_t);
+    if (head[1] != 1 || n_layer_list == 0 || n_layer_list > 4096 || n_expert_list == 0 || n_expert_list > 4096 ||
+            count == 0 || count > head[4] || head[4] > n_slots ||
+            (list.size() != pair_bytes && list.size() != pair_bytes + n_slots*sizeof(uint32_t))) {
+        throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s has a bad STRP header or size (%zu bytes; version %u, %u layers x %u experts, "
+            "%u listed): expected %zu bytes (4-byte pairs) or %zu bytes (pairs + per-slot rank table)", rank_path, list.size(), head[1],
+            n_layer_list, n_expert_list, count, pair_bytes, pair_bytes + n_slots*sizeof(uint32_t)));
     }
-    std::vector<uint32_t> rank((size_t) n_layer_list*n_expert_list, UINT32_MAX);
+    std::vector<uint32_t> rank(n_slots, UINT32_MAX);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t p;
         memcpy(&p, list.data() + sizeof(head) + (size_t) i*sizeof(p), sizeof(p));
         const uint32_t il = p & 0xFFFF, e = p >> 16;
-        if (il < n_layer_list && e < n_expert_list && rank[(size_t) il*n_expert_list + e] == UINT32_MAX) {
-            rank[(size_t) il*n_expert_list + e] = i;
+        if (il >= n_layer_list || e >= n_expert_list || rank[(size_t) il*n_expert_list + e] != UINT32_MAX) {
+            throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s entry %u (layer %u expert %u) is out of range or repeated",
+                rank_path, i, il, e));
+        }
+        rank[(size_t) il*n_expert_list + e] = i;
+    }
+    if (list.size() != pair_bytes) {
+        for (size_t i = 0; i < n_slots; ++i) {
+            uint32_t v;
+            memcpy(&v, list.data() + pair_bytes + i*sizeof(v), sizeof(v));
+            if (v != rank[i]) {
+                throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s per-slot rank table disagrees with its pair list at slot %zu", rank_path, i));
+            }
         }
     }
 
