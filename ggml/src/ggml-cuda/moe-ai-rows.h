@@ -886,7 +886,7 @@ MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_reduce(__m
 
 // KR = rate k, GG = row groups (of 4 rows) per pass over the unit's tiles, ST = tiles per quant block
 template <int KR, int NT, int GG, int ST>
-MOE_AI_T512Q static void unit_rows_q8v_nt(const uint8_t * blk, uint32_t C, const void * const * xq, int64_t koff, int64_t Kin,
+MOE_AI_T512Q static void unit_rows_512_q8v_nt(const uint8_t * blk, uint32_t C, const void * const * xq, int64_t koff, int64_t Kin,
                                           float (*acc)[AI4_TR]) {
     static_assert(4 % GG == 0, "row groups per pass");
     const vbmi_q8_tabs & T = vbmi_q8_tables();
@@ -957,28 +957,28 @@ MOE_AI_T512Q static void unit_rows_q8v_nt(const uint8_t * blk, uint32_t C, const
 #endif
 
 template <int KR, int ST>
-MOE_AI_T512Q static void unit_rows_q8v_k(const uint8_t * blk, uint32_t C, int nt, const void * const * xq, int64_t koff,
+MOE_AI_T512Q static void unit_rows_512_q8v_k(const uint8_t * blk, uint32_t C, int nt, const void * const * xq, int64_t koff,
                                          int64_t Kin, float (*acc)[AI4_TR]) {
     switch (nt) {
-        case 1:  unit_rows_q8v_nt<KR, 1, MOE_AI_Q8V_GG(1), ST>(blk, C, xq, koff, Kin, acc); break;
-        case 2:  unit_rows_q8v_nt<KR, 2, MOE_AI_Q8V_GG(2), ST>(blk, C, xq, koff, Kin, acc); break;
-        case 3:  unit_rows_q8v_nt<KR, 3, MOE_AI_Q8V_GG(3), ST>(blk, C, xq, koff, Kin, acc); break;
-        case 4:  unit_rows_q8v_nt<KR, 4, MOE_AI_Q8V_GG(4), ST>(blk, C, xq, koff, Kin, acc); break;
-        case 5:  unit_rows_q8v_nt<KR, 5, MOE_AI_Q8V_GG(5), ST>(blk, C, xq, koff, Kin, acc); break;
-        case 6:  unit_rows_q8v_nt<KR, 6, MOE_AI_Q8V_GG(6), ST>(blk, C, xq, koff, Kin, acc); break;
-        case 7:  unit_rows_q8v_nt<KR, 7, MOE_AI_Q8V_GG(7), ST>(blk, C, xq, koff, Kin, acc); break;
-        default: unit_rows_q8v_nt<KR, 8, MOE_AI_Q8V_GG(8), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 1:  unit_rows_512_q8v_nt<KR, 1, MOE_AI_Q8V_GG(1), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 2:  unit_rows_512_q8v_nt<KR, 2, MOE_AI_Q8V_GG(2), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 3:  unit_rows_512_q8v_nt<KR, 3, MOE_AI_Q8V_GG(3), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 4:  unit_rows_512_q8v_nt<KR, 4, MOE_AI_Q8V_GG(4), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 5:  unit_rows_512_q8v_nt<KR, 5, MOE_AI_Q8V_GG(5), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 6:  unit_rows_512_q8v_nt<KR, 6, MOE_AI_Q8V_GG(6), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 7:  unit_rows_512_q8v_nt<KR, 7, MOE_AI_Q8V_GG(7), ST>(blk, C, xq, koff, Kin, acc); break;
+        default: unit_rows_512_q8v_nt<KR, 8, MOE_AI_Q8V_GG(8), ST>(blk, C, xq, koff, Kin, acc); break;
     }
 }
 
 template <int ST>
-MOE_AI_T512Q static bool unit_rows_q8v_st(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
+MOE_AI_T512Q static bool unit_rows_512_q8v_st(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
                                           int64_t Kin, float (*acc)[AI4_TR]) {
     switch (k) {
-        case 2: unit_rows_q8v_k<2, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
-        case 3: unit_rows_q8v_k<3, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
-        case 4: unit_rows_q8v_k<4, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
-        case 5: unit_rows_q8v_k<5, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
+        case 2: unit_rows_512_q8v_k<2, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
+        case 3: unit_rows_512_q8v_k<3, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
+        case 4: unit_rows_512_q8v_k<4, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
+        case 5: unit_rows_512_q8v_k<5, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
         default: return false;
     }
 }
@@ -987,8 +987,8 @@ MOE_AI_T512Q static bool unit_rows_q8v_st(const uint8_t * blk, int k, uint32_t C
 static bool unit_rows_q8_vbmi(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
                               float (*acc)[AI4_TR]) {
     if (!has_q8_vbmi()) { return false; }
-    return q8_block(Kin) == 256 ? unit_rows_q8v_st<16>(blk, k, C, nt, xq, koff, Kin, acc)
-                                : unit_rows_q8v_st<4>(blk, k, C, nt, xq, koff, Kin, acc);
+    return q8_block(Kin) == 256 ? unit_rows_512_q8v_st<16>(blk, k, C, nt, xq, koff, Kin, acc)
+                                : unit_rows_512_q8v_st<4>(blk, k, C, nt, xq, koff, Kin, acc);
 }
 #endif
 
