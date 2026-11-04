@@ -2087,13 +2087,48 @@ private:
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params_base.mmproj.path.empty();
-        const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() ||
                               std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params_base.speculative.types.end();
+        if (params_base.speculative.has_dft()) {
+            // a draft file (-md) is only used by the draft-model speculative types; with none of them
+            // (e.g. --spec-type none, or n-gram types only) it would be loaded and never used. An MTP head file
+            // also cannot run as a standalone draft model: it borrows the target's embeddings and output head,
+            // so building its graph without them crashed at startup. Skip the unused file; refuse an MTP head
+            // under a type that would run it standalone.
+            bool uses_draft_model = false;
+            for (const auto type : params_base.speculative.types) {
+                switch (type) {
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                        uses_draft_model = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            const std::string & dft_path = params_base.speculative.draft.mparams.path;
+            if (!uses_draft_model) {
+                SRV_WRN("draft model '%s' is not loaded: the speculative type (--spec-type) uses no draft model\n",
+                        dft_path.c_str());
+                params_base.speculative.draft.mparams = {};
+            } else if (!spec_mtp && !dft_path.empty()) {
+                const auto types_gguf = common_speculative_types_from_gguf(dft_path);
+                if (std::find(types_gguf.begin(), types_gguf.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types_gguf.end()) {
+                    SRV_ERR("draft model '%s' is an MTP head; it runs only with --spec-type draft-mtp or "
+                            "draft-mtp-adaptive\n", dft_path.c_str());
+                    return false;
+                }
+            }
+        }
+        const bool has_draft = params_base.speculative.has_dft();
         const bool has_spec = has_draft || spec_mtp;
         const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
 
