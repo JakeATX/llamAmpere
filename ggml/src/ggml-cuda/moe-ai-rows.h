@@ -496,10 +496,13 @@ static bool unit_rows_direct(const uint8_t * blk, int k, uint32_t C, int nt, con
 // rs = fma(row sum, d, rs) per block; then acc = fma(fp16 scale, rs, acc) per unit. unit_rows_q8_scalar does the same
 // float steps in the same order, so the two are bit-identical. (r30: the reduce used to be scalar per token and row
 // pair, and the 32-wide case kept a float lane per column pair live next to the int lanes, which spilled at 5-8 tokens.)
-template <int K, int NT, int G, int R0, size_t... P>
+// KP (R8 host cache fill, GGML_MOE_AI_HOST_R8_MB): also store the pair's int8 levels into the R8 words at dst (tile base;
+// rows R, R + 1 are adjacent 4-byte lanes of group R/8, gs bytes between the slab's two groups). The dots are unchanged.
+template <int K, int NT, int G, int R0, bool KP, size_t... P>
 static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
                                                            __m256i sh, __m256i Cv, const int16_t * const (&xt)[NT],
-                                                           __m256i (&ip)[NT][G/2], std::index_sequence<P...>) {
+                                                           __m256i (&ip)[NT][G/2], int8_t * dst, int64_t gs,
+                                                           std::index_sequence<P...>) {
     auto pair = [&](auto pi) {
         constexpr int p = decltype(pi)::value;
 #if !defined(MOE_AI_Q8_PACKS)
@@ -512,6 +515,13 @@ static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, 
         const __m256i s01 = _mm256_packs_epi32(s0, s1);
 #endif
         const __m256i lev = _mm256_srai_epi16(_mm256_sub_epi16(s01, _mm256_set1_epi16(510)), 2);
+        if constexpr (KP) {   // lev int16 [rR c0-3, rR+1 c0-3 | rR c4-7, rR+1 c4-7], all in [-128, 127]: packs is exact
+            constexpr int R = R0 + 2*p;
+            const __m256i b8 = _mm256_packs_epi16(lev, lev);
+            int8_t * d = dst + (R/8)*gs + (R%8)*4;
+            _mm_storel_epi64((__m128i *) d, _mm256_castsi256_si128(b8));
+            _mm_storel_epi64((__m128i *) (d + 32), _mm256_extracti128_si256(b8, 1));
+        }
         for (int t = 0; t < NT; ++t) {
             ip[t][p] = _mm256_add_epi32(ip[t][p], _mm256_madd_epi16(lev, _mm256_loadu_si256((const __m256i *) xt[t])));
         }
@@ -525,9 +535,10 @@ static inline __attribute__((always_inline)) __m128i q8_half_add(__m256i v) {
 }
 
 // dd[b][t][0] = dd[b][t][1] = token t's scale of the unit's quant block b (a token pair's [d0 d0 d1 d1] is one load)
-template <int K, int NT, int G, int R0, int ST>
+template <int K, int NT, int G, int R0, int ST, bool KP>
 static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, const void * const * xq, int64_t koff,
-                                                           const float (*dd)[8][2], __m256i Cv, float (*acc)[AI4_TR]) {
+                                                           const float (*dd)[8][2], __m256i Cv, float (*acc)[AI4_TR],
+                                                           int8_t * Wu, int64_t gs) {
     constexpr int tw = AIK_TILE_WORDS(K);
     // float accumulators: G >= 8: one __m256 per token per 8 rows; G == 4: one __m128 per token; G == 2: one per token pair
     constexpr int N8 = G >= 8 ? NT*(G/8) : 1, N4 = G == 4 ? NT : G == 2 ? (NT + 1)/2 : 1;
@@ -546,7 +557,8 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
             const __m128i f4 = _mm_loadu_si128((const __m128i *) wt), l4 = _mm_loadu_si128((const __m128i *) (wt + tw - 4));
             const int16_t * xt[NT];
             for (int t = 0; t < NT; ++t) { xt[t] = q8_xs(xq[t]) + (koff/AI4_TC + ct)*16; }
-            q8_pairs<K, NT, G, R0>(wt, f4, l4, T, sh, Cv, xt, ip, std::make_index_sequence<G/2>{});
+            q8_pairs<K, NT, G, R0, KP>(wt, f4, l4, T, sh, Cv, xt, ip, KP ? Wu + ct*(AI4_TC/4)*32 : nullptr, gs,
+                                       std::make_index_sequence<G/2>{});
         }
         const float (*db)[2] = dd[c0/ST];
         if constexpr (G >= 8) {
@@ -588,11 +600,11 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
     }
 }
 
-template <int K, int NT, int ST, size_t... J>
+template <int K, int NT, int ST, bool KP, size_t... J>
 static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int64_t koff, const float (*dd)[8][2], __m256i Cv,
-                              float (*acc)[AI4_TR], std::index_sequence<J...>) {
+                              float (*acc)[AI4_TR], int8_t * Wu, int64_t gs, std::index_sequence<J...>) {
     constexpr int G = AI4_TR/(int) sizeof...(J);
-    (q8_group<K, NT, G, (int) J*G, ST>(blk, xq, koff, dd, Cv, acc), ...);
+    (q8_group<K, NT, G, (int) J*G, ST, KP>(blk, xq, koff, dd, Cv, acc, Wu, gs), ...);
 }
 
 // Rows per group by token count and block shape (home 5800X3D, 1 core): G = 4 at nt = 5 is 4-8% faster for down
@@ -601,41 +613,42 @@ static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int6
 #define MOE_AI_Q8_G(NT, ST) ((NT) == 1 ? 16 : (NT) == 2 ? 8 : (NT) <= 4 || ((NT) == 5 && (ST) == 4) ? 4 : 2)
 #endif
 
-template <int K, int NT, int ST>
-static void unit_rows_q8_nt(const uint8_t * blk, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv, float (*acc)[AI4_TR]) {
+template <int K, int NT, int ST, bool KP>
+static void unit_rows_q8_nt(const uint8_t * blk, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv, float (*acc)[AI4_TR],
+                            int8_t * Wu, int64_t gs) {
     constexpr int G = MOE_AI_Q8_G(NT, ST);   // rows per group (G/2 int32 pair accumulators per token)
     constexpr int NB = AI4U_UK/AI4_TC/ST, QB = ST*AI4_TC < AI4U_UK ? 32 : 256;
     alignas(16) float dd[NB][8][2] = {};
     for (int b = 0; b < NB; ++b) {
         for (int t = 0; t < NT; ++t) { dd[b][t][0] = dd[b][t][1] = q8_d(xq[t], Kin)[(koff + b*ST*AI4_TC)/QB]; }
     }
-    unit_rows_q8_impl<K, NT, ST>(blk, xq, koff, dd, Cv, acc, std::make_index_sequence<AI4_TR/G>{});
+    unit_rows_q8_impl<K, NT, ST, KP>(blk, xq, koff, dd, Cv, acc, Wu, gs, std::make_index_sequence<AI4_TR/G>{});
 }
 
-template <int K, int ST>
+template <int K, int ST, bool KP>
 static void unit_rows_q8_k(const uint8_t * blk, int nt, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv,
-                           float (*acc)[AI4_TR]) {
+                           float (*acc)[AI4_TR], int8_t * Wu, int64_t gs) {
     switch (nt) {
-        case 1:  unit_rows_q8_nt<K, 1, ST>(blk, xq, koff, Kin, Cv, acc); break;
-        case 2:  unit_rows_q8_nt<K, 2, ST>(blk, xq, koff, Kin, Cv, acc); break;
-        case 3:  unit_rows_q8_nt<K, 3, ST>(blk, xq, koff, Kin, Cv, acc); break;
-        case 4:  unit_rows_q8_nt<K, 4, ST>(blk, xq, koff, Kin, Cv, acc); break;
-        case 5:  unit_rows_q8_nt<K, 5, ST>(blk, xq, koff, Kin, Cv, acc); break;
-        case 6:  unit_rows_q8_nt<K, 6, ST>(blk, xq, koff, Kin, Cv, acc); break;
-        case 7:  unit_rows_q8_nt<K, 7, ST>(blk, xq, koff, Kin, Cv, acc); break;
-        default: unit_rows_q8_nt<K, 8, ST>(blk, xq, koff, Kin, Cv, acc); break;
+        case 1:  unit_rows_q8_nt<K, 1, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 2:  unit_rows_q8_nt<K, 2, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 3:  unit_rows_q8_nt<K, 3, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 4:  unit_rows_q8_nt<K, 4, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 5:  unit_rows_q8_nt<K, 5, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 6:  unit_rows_q8_nt<K, 6, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 7:  unit_rows_q8_nt<K, 7, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        default: unit_rows_q8_nt<K, 8, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
     }
 }
 
-template <int ST>
+template <int ST, bool KP = false>
 static bool unit_rows_q8_st(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
-                            float (*acc)[AI4_TR]) {
+                            float (*acc)[AI4_TR], int8_t * Wu = nullptr, int64_t gs = 0) {
     const __m256i Cv = _mm256_set1_epi32((int) C);
     switch (k) {
-        case 2: unit_rows_q8_k<2, ST>(blk, nt, xq, koff, Kin, Cv, acc); return true;
-        case 3: unit_rows_q8_k<3, ST>(blk, nt, xq, koff, Kin, Cv, acc); return true;
-        case 4: unit_rows_q8_k<4, ST>(blk, nt, xq, koff, Kin, Cv, acc); return true;
-        case 5: unit_rows_q8_k<5, ST>(blk, nt, xq, koff, Kin, Cv, acc); return true;
+        case 2: unit_rows_q8_k<2, ST, KP>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
+        case 3: unit_rows_q8_k<3, ST, KP>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
+        case 4: unit_rows_q8_k<4, ST, KP>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
+        case 5: unit_rows_q8_k<5, ST, KP>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
         default: return false;
     }
 }
@@ -1093,5 +1106,121 @@ static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, in
         for (int64_t row = a; row < b; ++row) { o[t][row - a] = acc[t][row - a]; }
     }
 }
+
+// ---- R8 host cache (AIPFAST, opt-in GGML_MOE_AI_HOST_R8_MB=<MiB> with GGML_MOE_AI_HOST_Q8=1, AVX2 hosts) ----
+// A CPU-computed AI+ projection (n_out x K, k = 2..4) can keep an int8 copy of its levels so the next CPU miss of the same
+// expert skips the trellis decode. Slot layout (r8_slot_bytes): W = [n_out/8 groups][K/4 words][32 B], word j of a group
+// = 8 rows x levels K 4j..4j+3 (byte 4r + i = row r, K 4j + i), so each 32-bit lane is one row; then S = the unit fp16 row
+// scales, [n_out/8][K/128][8]. Integer sums are exact and the float steps match unit_rows_q8_scalar (rs = fma(int sum, d, rs)
+// per q8 block, acc = fma(scale, rs, acc) per unit), so a hit is bit-identical to slab_rows_q8, like the fill pass itself.
+static inline size_t r8_w_bytes(int64_t n_out, int64_t K) { return (size_t) n_out*K; }
+static inline size_t r8_slot_bytes(int64_t n_out, int64_t K) { return (r8_w_bytes(n_out, K) + (size_t) n_out*(K/AI4U_UK)*2 + 63) & ~(size_t) 63; }
+static inline bool r8_ok(int k, uint32_t C, int64_t n_out, int64_t K) {
+#if defined(__AVX2__) && defined(__FMA__)
+    return direct_tables().ok && C != 0 && k >= 2 && k <= 5 && n_out % AI4_TR == 0 && K % AI4U_UK == 0 && K <= 8192;
+#else
+    (void) k; (void) C; (void) n_out; (void) K;
+    return false;
+#endif
+}
+
+#if defined(__AVX2__) && defined(__FMA__)
+// slab_rows_q8 for one full 16-row slab (a % 16 == 0) that also writes the slab's R8 words and scales into slot R
+// (needs r8_ok). Output equals slab_rows_q8 bit for bit (same AVX2 dots, only stores added).
+static void slab_rows_q8_keep(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t n_out, int64_t K, int nt,
+                              const void * const * xq, float * const * o, uint8_t * R) {
+    const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
+    const int ub = AI4U_UNIT_BYTES(k);
+    const int64_t nu = K/AI4U_UK, g0 = a/8;
+    int8_t * W = (int8_t *) R + g0*K*8;
+    uint16_t * S = (uint16_t *) (R + r8_w_bytes(n_out, K));
+    float acc[8][AI4_TR] = {};
+    for (int64_t u = 0; u < nu; ++u) {
+        const uint8_t * blk = slab + u*ub;
+        memcpy(S + (g0*nu + u)*8, blk, 16);
+        memcpy(S + ((g0 + 1)*nu + u)*8, blk + 16, 16);
+        int8_t * Wu = W + u*AI4U_UK*8;
+        if (q8_block(K) == 256) { unit_rows_q8_st<16, true>(blk, k, C, nt, xq, u*AI4U_UK, K, acc, Wu, K*8); }
+        else                    { unit_rows_q8_st<4, true>(blk, k, C, nt, xq, u*AI4U_UK, K, acc, Wu, K*8); }
+    }
+    for (int t = 0; t < nt; ++t) { for (int r = 0; r < AI4_TR; ++r) { o[t][r] = acc[t][r]; } }
+}
+
+// one 8-row group, NT tokens: per 4 K one activation broadcast, |w| x sign(q, w) (|w| <= 128, |q| <= 127: no int16
+// saturation), pair sums to int32 lanes (one lane per row)
+template <int NT>
+static inline __attribute__((always_inline)) void r8_group(const int8_t * wg, const uint16_t * sg, int64_t K, int qb,
+                                                           const int8_t (*q)[8192], const float * const * d, float (*o)[AI4_TR],
+                                                           int r0) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    const int qbu = qb < AI4U_UK ? qb : AI4U_UK;
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) { accf[t] = _mm256_setzero_ps(); }
+    for (int64_t u = 0; u < K/AI4U_UK; ++u) {
+        __m256 rs[NT];
+        for (int t = 0; t < NT; ++t) { rs[t] = _mm256_setzero_ps(); }
+        for (int b0 = 0; b0 < AI4U_UK; b0 += qbu) {
+            __m256i a32[NT];
+            for (int t = 0; t < NT; ++t) { a32[t] = _mm256_setzero_si256(); }
+            const int64_t c0 = u*AI4U_UK + b0;
+#pragma GCC unroll 8
+            for (int j = 0; j < qbu/4; ++j) {
+                const __m256i wv = _mm256_loadu_si256((const __m256i *) (wg + (c0/4 + j)*32));
+                const __m256i aw = _mm256_abs_epi8(wv);
+                for (int t = 0; t < NT; ++t) {
+                    int32_t qq;
+                    memcpy(&qq, q[t] + c0 + 4*j, 4);
+                    const __m256i sg8 = _mm256_sign_epi8(_mm256_set1_epi32(qq), wv);
+                    a32[t] = _mm256_add_epi32(a32[t], _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sg8), ones));
+                }
+            }
+            for (int t = 0; t < NT; ++t) { rs[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a32[t]), _mm256_set1_ps(d[t][c0/qb]), rs[t]); }
+        }
+        const __m256 dw = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (sg + u*8)));
+        for (int t = 0; t < NT; ++t) { accf[t] = _mm256_fmadd_ps(dw, rs[t], accf[t]); }
+    }
+    for (int t = 0; t < NT; ++t) { _mm256_storeu_ps(&o[t][r0], accf[t]); }
+}
+
+// hit: rows [a, a + 16) of a filled slot R, nt <= 8 tokens (xq = quant_q8 buffers), same output as slab_rows_q8
+static void slab_rows_r8(const uint8_t * R, int64_t a, int64_t n_out, int64_t K, int nt, const void * const * xq, float * const * o) {
+    alignas(32) int8_t q[8][8192];   // plain int8 activations (the q8 buffer holds them as duplicated int16 pairs)
+    const float * d[8];
+    for (int t = 0; t < nt; ++t) {
+        const int16_t * xs = q8_xs(xq[t]);
+        for (int64_t c = 0; c < K/AI4_TC; ++c) {
+            const __m128i v = _mm_loadu_si128((const __m128i *) (xs + c*16));       // x 0-3 twice
+            const __m128i w = _mm_loadu_si128((const __m128i *) (xs + c*16 + 8));   // x 4-7 twice
+            const __m128i b = _mm_packs_epi16(v, w);
+            const int32_t lo = _mm_cvtsi128_si32(b), hi = _mm_extract_epi32(b, 2);
+            memcpy(q[t] + c*8, &lo, 4);
+            memcpy(q[t] + c*8 + 4, &hi, 4);
+        }
+        d[t] = q8_d(xq[t], K);
+    }
+    const int qb = q8_block(K);
+    const int64_t nu = K/AI4U_UK;
+    float acc[8][AI4_TR];
+    for (int g = 0; g < 2; ++g) {
+        const int64_t gi = a/8 + g;
+        const int8_t * wg = (const int8_t *) R + gi*K*8;
+        const uint16_t * sg = (const uint16_t *) (R + r8_w_bytes(n_out, K)) + gi*nu*8;
+        for (int t0 = 0; t0 < nt; ) {
+            const int n = nt - t0 >= 4 ? (nt - t0 == 5 ? 3 : 4) : nt - t0;   // 5 = 3 + 2, 6 = 4 + 2, 7 = 4 + 3, 8 = 4 + 4
+            switch (n) {
+                case 1:  r8_group<1>(wg, sg, K, qb, q + t0, d + t0, acc + t0, g*8); break;
+                case 2:  r8_group<2>(wg, sg, K, qb, q + t0, d + t0, acc + t0, g*8); break;
+                case 3:  r8_group<3>(wg, sg, K, qb, q + t0, d + t0, acc + t0, g*8); break;
+                default: r8_group<4>(wg, sg, K, qb, q + t0, d + t0, acc + t0, g*8); break;
+            }
+            t0 += n;
+        }
+    }
+    for (int t = 0; t < nt; ++t) { for (int r = 0; r < AI4_TR; ++r) { o[t][r] = acc[t][r]; } }
+}
+#else
+static void slab_rows_q8_keep(const char *, size_t, int, uint32_t, int64_t, int64_t, int64_t, int, const void * const *, float * const *, uint8_t *) { abort(); }   // r8_ok is false without AVX2
+static void slab_rows_r8(const uint8_t *, int64_t, int64_t, int64_t, int, const void * const *, float * const *) { abort(); }   // r8_ok is false without AVX2
+#endif
 
 } // namespace moe_ai

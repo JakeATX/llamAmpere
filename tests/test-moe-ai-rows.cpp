@@ -219,6 +219,35 @@ int main(int argc, char ** argv) {
                     bool samev = true;
                     if (hv) { run_q(ov, false, 1); samev = memcmp(ov.data(), os.data(), ov.size() * sizeof(float)) == 0; }
                     const bool same = samea && samev;
+#if defined(__AVX2__) && defined(__FMA__)
+                    // AIPFAST R8 host cache: decode + keep == scalar, and the hit kernel on the kept slot == scalar, bit for bit
+                    if (moe_ai::r8_ok(k, C, M, K)) {
+                        std::vector<uint8_t> slot(moe_ai::r8_slot_bytes(M, K) + 64, 0xA5);
+                        uint8_t * R = slot.data() + (64 - (uintptr_t) slot.data() % 64) % 64;
+                        std::vector<float> ok8((size_t) nt * M), oh8((size_t) nt * M);
+                        auto run_r = [&](std::vector<float> & o, bool keep) {
+                            float * op[8];
+                            for (int64_t a = 0; a < M; a += AI4_TR) {
+                                for (int t = 0; t < nt; ++t) { op[t] = o.data() + t * M + a; }
+                                if (keep) { moe_ai::slab_rows_q8_keep((const char *) w.data(), row_bytes, k, C, a, M, K, nt, qp, op, R); }
+                                else      { moe_ai::slab_rows_r8(R, a, M, K, nt, qp, op); }
+                            }
+                        };
+                        run_r(ok8, true);
+                        run_r(oh8, false);
+                        const bool sk = memcmp(ok8.data(), os.data(), os.size() * sizeof(float)) == 0;
+                        const bool sh8 = memcmp(oh8.data(), os.data(), os.size() * sizeof(float)) == 0;
+                        double uk = 0.0, uh = 0.0, u8 = 0.0;
+                        for (int m3 = 0; m3 < 3; ++m3) {
+                            const auto ta = std::chrono::steady_clock::now();
+                            for (int i = 0; i < reps; ++i) { if (m3 == 0) { run_r(ok8, true); } else if (m3 == 1) { run_r(oh8, false); } else { run_q(oq, false); } }
+                            (m3 == 0 ? uk : m3 == 1 ? uh : u8) = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ta).count() / reps;
+                        }
+                        printf("%-8s K=%5lld M=%5lld nt=%d  r8: keep==scalar %s  hit==scalar %s  keep %.1f us  hit %.1f us  q8 %.1f us /projection (1 thread, warm)\n",
+                               ggml_type_name(type), (long long) K, (long long) M, nt, sk ? "OK" : "DIFFERENT", sh8 ? "OK" : "DIFFERENT", uk, uh, u8);
+                        fails += !(sk && sh8);
+                    }
+#endif
                     float sc = 0.0f, eabs = 0.0f, erel = 0.0f;
                     for (size_t i = 0; i < ref.size(); ++i) { sc = std::max(sc, std::fabs(ref[i])); }
                     for (size_t i = 0; i < ref.size(); ++i) {

@@ -550,6 +550,24 @@ struct pool_state {
     std::condition_variable sleep_cv;
 
     std::atomic<unsigned long long> st_jobs{0}, st_experts{0}, st_routes{0}, st_busy_ns{0}, st_null{0};
+    // AIPFAST R8 host cache (GGML_MOE_AI_HOST_R8_MB=<MiB>, with GGML_MOE_AI_HOST_Q8=1): int8 level copies of recently
+    // CPU-computed AI+ projections, LRU, keyed by (layer, expert, role). A miss decodes and keeps (moe_ai::slab_rows_q8_keep),
+    // a hit runs moe_ai::slab_rows_r8; both are bit-identical to slab_rows_q8. Thread 0 plans each card job before `gen`
+    // moves; a slot filled by job n turns ready when job n + 1 is planned (job n has finished by then). The load probe
+    // posts host jobs, which never use the cache, so the planner's per-route cost stays the decode cost.
+    struct r8_state {
+        uint8_t * arena = nullptr;
+        size_t slot = 0;
+        int n = 0, n_expert = 0, head = -1, tail = -1;
+        std::vector<int32_t> map, key, prv, nxt, pending;   // map: (layer*n_expert + e)*3 + role -> slot or -1
+        std::vector<uint8_t> ready;
+        unsigned long long hit = 0, fill = 0, plain = 0, jobs = 0;
+    } r8;
+    int r8_mb = 0;
+    int r8_every = 16384;                        // card jobs between hit-rate lines (GGML_MOE_AI_HOST_R8_STATS)
+    bool r8_reset = false;                       // a layer was (re)registered: rebuild the table at the next card job
+    uint8_t * r8p[MOE_CS_MAX_EXPERTS][3] = {};   // this job: slot of (expert i, role)
+    uint8_t r8m[MOE_CS_MAX_EXPERTS][3] = {};     // this job: 0 = decode, 1 = hit (R8 kernel), 2 = decode + keep
     unsigned long long phase_ns[4] = {};   // thread 0's time through each phase (barrier included), summed
     // GGML_MOE_CPU_SPLIT_WSTATS=1 (default off): per worker, time spent claiming and running tiles and time spent waiting at
     // the end-of-phase barrier, plus how late the worker joined a job. Tells a slow or late core from a slow kernel.
@@ -594,6 +612,97 @@ const char * role_row(pool_state & s, const role_math & m, int expert, int64_t r
     if (!base) { return nullptr; }
     return (const char *) base + (size_t) row * m.r.row_bytes;
     (void) s;
+}
+
+static void r8_touch(pool_state::r8_state & c, int sl) {   // move slot sl to the front (most recent) of the LRU list
+    if (c.head == sl) { return; }
+    const int p = c.prv[sl], q = c.nxt[sl];
+    if (p >= 0) { c.nxt[p] = q; }
+    if (q >= 0) { c.prv[q] = p; }
+    if (c.tail == sl) { c.tail = p; }
+    c.prv[sl] = -1; c.nxt[sl] = c.head;
+    if (c.head >= 0) { c.prv[c.head] = sl; }
+    c.head = sl;
+    if (c.tail < 0) { c.tail = sl; }
+}
+
+static bool r8_init(pool_state & s) {
+    pool_state::r8_state & c = s.r8;
+    s.r8_reset = false;
+    size_t slot = 0;
+    int ne = 0;
+    for (const layer_math & L : s.layers) {
+        for (int k = 0; L.ok && k < 3; ++k) {
+            const role_math & m = L.role[k];
+            if (!m.ai_q8 || !moe_ai::r8_ok(m.ai_k, m.ai_C, m.r.n_out, m.r.n_in)) { continue; }
+            slot = std::max(slot, moe_ai::r8_slot_bytes(m.r.n_out, m.r.n_in));
+            ne = std::max(ne, (int) m.r.n_expert);
+        }
+    }
+    if (!slot) { fprintf(stderr, "[moe-cpu-split] r8 host cache: no AI+ host roles, off\n"); return false; }
+    const size_t n = std::min<size_t>(((size_t) s.r8_mb << 20) / slot, 1u << 24);
+    if (n < 3 * MOE_CS_MAX_EXPERTS + 1) {   // a job must never evict a slot it uses itself
+        fprintf(stderr, "[moe-cpu-split] r8 host cache: %d MiB holds %zu slots, need %d, off\n", s.r8_mb, n, 3 * MOE_CS_MAX_EXPERTS + 1);
+        return false;
+    }
+    free(c.arena);
+    c.arena = (uint8_t *) aligned_alloc(64, n * slot);
+    if (!c.arena) { fprintf(stderr, "[moe-cpu-split] r8 host cache: alloc of %zu MiB failed, off\n", (n * slot) >> 20); return false; }
+    c.slot = slot; c.n = (int) n; c.n_expert = ne;
+    c.map.assign(s.layers.size() * (size_t) ne * 3, -1);
+    c.key.assign(n, -1); c.ready.assign(n, 0); c.prv.resize(n); c.nxt.resize(n); c.pending.clear();
+    for (int i = 0; i < c.n; ++i) { c.prv[i] = i - 1; c.nxt[i] = i + 1 < c.n ? i + 1 : -1; }
+    c.head = 0; c.tail = c.n - 1;
+    fprintf(stderr, "[moe-cpu-split] r8 host cache: %d slots x %.2f MiB = %zu MiB (GGML_MOE_AI_HOST_R8_MB, pages fill on first use)\n",
+            c.n, slot / 1048576.0, (n * slot) >> 20);
+    return true;
+}
+
+// thread 0, before `gen` moves: choose decode / hit / decode + keep for every AI+ q8 (expert, role) of this job
+static void r8_plan(pool_state & s, int layer, bool card) {
+    for (int i = 0; i < s.n_exp; ++i) { s.r8m[i][0] = s.r8m[i][1] = s.r8m[i][2] = 0; }
+    if (!card || s.r8_mb <= 0) { return; }
+    pool_state::r8_state & c = s.r8;
+    if ((c.n == 0 || s.r8_reset) && !r8_init(s)) { s.r8_mb = 0; return; }
+    for (const int sl : c.pending) { c.ready[sl] = 1; }
+    c.pending.clear();
+    for (int i = 0; i < s.n_exp; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            const role_math & m = s.cur->role[k];
+            if (!m.ai_q8) { continue; }
+            if (!moe_ai::r8_ok(m.ai_k, m.ai_C, m.r.n_out, m.r.n_in) || !moe_cs_load_acquire(&m.r.src[s.expert[i]])) { ++c.plain; continue; }
+            const int32_t idx = (int32_t) (((size_t) layer * c.n_expert + s.expert[i]) * 3 + k);
+            int sl = c.map[idx];
+            if (sl >= 0 && c.ready[sl]) {
+                s.r8m[i][k] = 1; ++c.hit;
+            } else {
+                if (sl < 0) {
+                    sl = c.tail;
+                    if (c.key[sl] >= 0) { c.map[c.key[sl]] = -1; }
+                    c.key[sl] = idx; c.map[idx] = sl;
+                }
+                c.ready[sl] = 0; c.pending.push_back(sl);
+                s.r8m[i][k] = 2; ++c.fill;
+            }
+            r8_touch(c, sl);
+            s.r8p[i][k] = c.arena + (size_t) sl * c.slot;
+        }
+    }
+    if (++c.jobs % (unsigned long long) s.r8_every == 0) {
+        const unsigned long long tot = c.hit + c.fill + c.plain;
+        fprintf(stderr, "[moe-cpu-split] r8 host cache: %llu card jobs, AI+ host projections hit %llu fill %llu plain %llu (hit %.1f%%)\n",
+                c.jobs, c.hit, c.fill, c.plain, tot ? 100.0 * c.hit / tot : 0.0);
+    }
+}
+
+// one 16-row slab of an AI+ q8 projection by the job's plan (rows [a, a + 16), needs b == a + 16 for modes 1/2)
+static inline void r8_proj(const pool_state & s, const role_math & m, int i, int k, const char * w, int64_t a, int64_t b, int nt,
+                           const void * const * q, float * const * o) {
+    switch (b - a == AI4_TR ? s.r8m[i][k] : 0) {
+        case 1:  moe_ai::slab_rows_r8(s.r8p[i][k], a, m.r.n_out, m.r.n_in, nt, q, o); return;
+        case 2:  moe_ai::slab_rows_q8_keep(w, m.r.row_bytes, m.ai_k, m.ai_C, a, m.r.n_out, m.r.n_in, nt, q, o, s.r8p[i][k]); return;
+        default: moe_ai::slab_rows_q8(w, m.r.row_bytes, m.ai_k, m.ai_C, a, b, m.r.n_in, nt, q, o);
+    }
 }
 
 void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) {
@@ -649,8 +758,8 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
                     for (int t = 0; t < nt; ++t) { uo[t] = ub[t]; go[t] = gb[t]; }
                     if (wu && wg) { GGML_ASSERT(gate.ai_q8 == up.ai_q8); } // gate reads the up activation format
                     if (wu && wg && up.ai_q8) {
-                        moe_ai::slab_rows_q8(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, qu, uo);
-                        moe_ai::slab_rows_q8(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, qg, go);
+                        r8_proj(s, up, i, 0, wu, a, b, nt, qu, uo);
+                        r8_proj(s, gate, i, 1, wg, a, b, nt, qg, go);
                     } else if (wu && wg) {
                         moe_ai::slab_rows(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, yu, uo);
                         moe_ai::slab_rows(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, yg, go);
@@ -763,7 +872,7 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
                 float * oa[8];
                 for (int t = 0; t < nt; ++t) { oa[t] = o[t] + a; }
                 if (w && down.ai_q8) {
-                    moe_ai::slab_rows_q8(w, down.r.row_bytes, down.ai_k, down.ai_C, a, b, down.r.n_in, nt, yq, oa);
+                    r8_proj(s, down, i, 2, w, a, b, nt, yq, oa);
                 } else if (w) {
                     moe_ai::slab_rows(w, down.r.row_bytes, down.ai_k, down.ai_C, a, b, down.r.n_in, nt, y, oa);
                 } else {
@@ -1218,6 +1327,7 @@ void leader_main(pool_state * sp, int cpu) {
                 s.input_of[q] = input;
                 if (input == q) { s.inputs[s.n_input++] = q; }
             }
+            r8_plan(s, layer, card);
             ++n;
             const unsigned long long tag = (n & item_low) << 32;
             if (s.flow) {
@@ -1298,6 +1408,8 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
     s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
     s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 1, 0, 1) ? 8 : 4;
+    s.r8_mb = moe_ai::use_host_q8() ? env_int("GGML_MOE_AI_HOST_R8_MB", 0, 0, 1 << 20) : 0;
+    s.r8_every = env_int("GGML_MOE_AI_HOST_R8_STATS", 16384, 1, 1 << 30);
 #if defined(MOE_CS_AVX512)
     s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 1, 0, 1) != 0 && cpu_has_avx512_vnni();
 #endif
@@ -1548,6 +1660,7 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
     // The pool reads the layer table only while a card job is in flight; registration happens at session
     // preparation, outside any graph, so no job is running.
     s.layers[layer] = L;
+    s.r8_reset = true;
     return ok;
 }
 
