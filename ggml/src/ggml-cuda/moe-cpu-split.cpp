@@ -1857,7 +1857,7 @@ double host_alt_mem_avail() {
 }
 double host_alt_floor_gib() {
     const char * fe = getenv("GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB");
-    return std::max(5.0, fe && fe[0] ? atof(fe) : 7.0);
+    return std::max(5.0, fe && fe[0] ? atof(fe) : 5.0);
 }
 host_alt_store & HA() { static host_alt_store s; return s; }
 }
@@ -1950,7 +1950,7 @@ bool moe_cs_host_alt_keep(int layer, const char * const names[3]) {
     const char * fit = getenv("GGML_MOE_CPU_SPLIT_HOST_FIT");
     const bool fit_on = !(fit && fit[0] == '0');
     if (fit_on && h.budget < 0.0) {
-        // budget: GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB, else MemAvailable minus the warm-up floor (7 GiB, min 5)
+        // budget: GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB, else MemAvailable minus the warm-up floor (5 GiB default, min 5; Jake RAM rule)
         const char * be = getenv("GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB");
         h.budget = be && be[0] ? std::max(0.0, atof(be)) * 1024.0 * 1024.0
                                : std::max(0.0, host_alt_mem_avail() - host_alt_floor_gib() * gib);
@@ -1988,7 +1988,7 @@ double moe_cs_host_alt_warm() {
                 total / gib);
         return 0.0;
     }
-    // budget: MemAvailable minus the 7 GiB target the expert arena keeps free (hard floor 5 GiB); ranges in layer order
+    // budget: MemAvailable minus the 5 GiB floor (GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB raises it); ranges in layer order
     const double target_gib = host_alt_floor_gib();
     const double avail = host_alt_mem_avail();
     double budget = std::max(0.0, avail - target_gib * gib);
