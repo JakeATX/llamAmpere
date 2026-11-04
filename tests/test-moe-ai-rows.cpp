@@ -199,17 +199,26 @@ int main(int argc, char ** argv) {
                         qp[t] = qb.data() + t * moe_ai::q8_bytes(K);
                         moe_ai::quant_q8(yp[t], (void *) qp[t], K);
                     }
-                    std::vector<float> oq((size_t) nt * M), os((size_t) nt * M);
-                    auto run_q = [&](std::vector<float> & o, bool scalar) {
+                    std::vector<float> oq((size_t) nt * M), os((size_t) nt * M), ov((size_t) nt * M);
+                    auto run_q = [&](std::vector<float> & o, bool scalar, int vbmi = 0) {
                         float * opq[8];
                         for (int64_t a = 0; a < M; a += AI4_TR) {
                             for (int t = 0; t < nt; ++t) { opq[t] = o.data() + t * M + a; }
-                            moe_ai::slab_rows_q8((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, qp, opq, scalar);
+                            moe_ai::slab_rows_q8((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, qp, opq, scalar, vbmi);
                         }
                     };
                     run_q(oq, false);
                     run_q(os, true);
-                    const bool same = memcmp(oq.data(), os.data(), oq.size() * sizeof(float)) == 0;
+                    const bool samea = memcmp(oq.data(), os.data(), oq.size() * sizeof(float)) == 0;
+                    // AIPFIX: AVX-512 VBMI + VNNI q8 kernel (opt-in GGML_MOE_AI_HOST_Q8_VBMI=1) == scalar bit for bit, where present
+#if defined(__AVX2__) && defined(__FMA__)
+                    const bool hv = moe_ai::has_q8_vbmi();
+#else
+                    const bool hv = false;
+#endif
+                    bool samev = true;
+                    if (hv) { run_q(ov, false, 1); samev = memcmp(ov.data(), os.data(), ov.size() * sizeof(float)) == 0; }
+                    const bool same = samea && samev;
                     float sc = 0.0f, eabs = 0.0f, erel = 0.0f;
                     for (size_t i = 0; i < ref.size(); ++i) { sc = std::max(sc, std::fabs(ref[i])); }
                     for (size_t i = 0; i < ref.size(); ++i) {
@@ -219,7 +228,12 @@ int main(int argc, char ** argv) {
                     }
                     const bool ok = same && eabs <= 0.05f * sc;
                     fails += !ok;
-                    double uq = 0.0, uf = 0.0;
+                    double uq = 0.0, uf = 0.0, uv = 0.0;
+                    if (hv) {
+                        const auto ta = std::chrono::steady_clock::now();
+                        for (int i = 0; i < reps; ++i) { run_q(ov, false, 1); }
+                        uv = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ta).count() / reps;
+                    }
                     for (int rep = 0; rep < 2; ++rep) {
                         for (int j = 0; j < 2; ++j) {
                             const bool q8 = (rep ^ j) == 0;
@@ -229,8 +243,9 @@ int main(int argc, char ** argv) {
                             (q8 ? uq : uf) += d;
                         }
                     }
-                    printf("%-8s K=%5lld M=%5lld nt=%d  q8: avx2==scalar %s  max|err| %.3e  max|err|/max|ref| %.2e  max rel err (|ref| > 10%% max) %.2e  %s  q8 %.1f us vs default %.1f us /projection (1 thread)\n",
-                           ggml_type_name(type), (long long) K, (long long) M, nt, same ? "OK" : "DIFFERENT", eabs, eabs / sc, erel,
+                    printf("%-8s K=%5lld M=%5lld nt=%d  q8: avx2==scalar %s  vbmi==scalar %s (%.1f us)  max|err| %.3e  max|err|/max|ref| %.2e  max rel err (|ref| > 10%% max) %.2e  %s  q8 %.1f us vs default %.1f us /projection (1 thread)\n",
+                           ggml_type_name(type), (long long) K, (long long) M, nt, samea ? "OK" : "DIFFERENT",
+                           hv ? (samev ? "OK" : "DIFFERENT") : "n/a", uv, eabs, eabs / sc, erel,
                            ok ? "OK" : "FAIL", uq, uf);
                 }
                 float scale = 0.0f, err = 0.0f;

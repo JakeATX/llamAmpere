@@ -806,6 +806,190 @@ MOE_AI_T512V static void unit_rows_512_vbmi(const uint8_t * blk, int k, uint32_t
         }
     }
 }
+
+// AIPFIX: opt-in AVX-512 VBMI + VNNI Q8 path (GGML_MOE_AI_HOST_Q8_VBMI=1 with GGML_MOE_AI_HOST_Q8=1; Zen 4/5 hosts).
+// Levels come from the VBMI decode above (4 tile rows per zmm, 16-bit lanes), with the qword lanes ordered so each
+// 128-bit lane pairs with the Q8 buffer's tile layout [x0..3 x0..3 | x4..7 x4..7]: qwords [rA lo, rB lo, rA hi, rB hi,
+// rC lo, rD lo, rC hi, rD hi] (lo = states 0-3, hi = 4-7). The tile's 32 activation bytes are broadcast to both 256-bit
+// halves by one load, and one vpdpwssd per token and row group gives the exact int32 pair sums (= the AVX2 vpmaddwd +
+// vpaddd). Per quant block the pair lanes of each row are summed exactly, converted once, rs = fma(row sum, d, rs);
+// then acc = fma(fp16 scale, rs, acc) per unit: the float steps and order of unit_rows_q8_scalar, so the result is
+// bit-identical to it and to the AVX2 Q8 path (the test checks).
+#define MOE_AI_T512Q __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vnni,fma,f16c")))
+
+static bool has_q8_vbmi() {
+    static const bool on = has_vbmi() && __builtin_cpu_supports("avx512vnni");
+    return on;
+}
+
+static bool use_q8_vbmi() {
+    static const bool on = [] { const char * e = getenv("GGML_MOE_AI_HOST_Q8_VBMI"); return e && e[0] == '1' && has_q8_vbmi(); }();
+    return on;
+}
+
+struct vbmi_q8_tabs {
+    uint8_t idx[6][4][64];   // [k][row group]: tile byte for each window byte (vpermi2b over 128 tile bytes)
+    uint8_t ctl[6][64];      // [k]: vpmultishiftqb bit offsets (2 per 16-bit state)
+    uint8_t row[16];         // reduced lane p -> row of the unit (4 row groups)
+    vbmi_q8_tabs() {
+        memset(this, 0, sizeof(*this));
+        for (int k = 2; k <= 5; ++k) {
+            const int nw = AIK_TILE_WORDS(k);
+            for (int g = 0; g < 4; ++g) {
+                for (int L = 0; L < 8; ++L) {
+                    const int r = 4*g + 2*(L >> 2) + (L & 1);
+                    for (int m = 0; m < 8; ++m) {
+                        const int P = k*r + 2 + 7 - m;            // ext byte (tile_bytes layout) of window byte m
+                        const int j = P >> 2, q = P & 3;          // E word, big-endian byte in it
+                        const int wi = j == 0 ? nw - 1 : (j - 1) % nw;
+                        idx[k][g][8*L + m] = (uint8_t) (4*wi + 3 - q);
+                    }
+                }
+            }
+            for (int L = 0; L < 8; ++L) {
+                for (int s = 0; s < 4; ++s) {
+                    const int kk = 4*((L >> 1) & 1) + s;
+                    const int p = 48 - k - k*kk;                  // state kk = (w >> p) & 0xFFFF
+                    ctl[k][8*L + 2*s]     = (uint8_t) p;
+                    ctl[k][8*L + 2*s + 1] = (uint8_t) (p + 8);
+                }
+            }
+        }
+        // q8v_reduce output lane p (128-bit lane p/4, element p%4): group (lane >= 2 ? 2 : 0) + (e >= 2), row in group
+        // 2*(lane & 1) + (e & 1)
+        for (int p = 0; p < 16; ++p) {
+            const int lane = p/4, e = p%4;
+            row[p] = (uint8_t) (4*((lane >= 2 ? 2 : 0) + (e >= 2 ? 1 : 0)) + 2*(lane & 1) + (e & 1));
+        }
+    }
+};
+
+static const vbmi_q8_tabs & vbmi_q8_tables() {
+    static const vbmi_q8_tabs T;
+    return T;
+}
+
+MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_hadd(__m512i a, __m512i b) {   // [a0+a1 a2+a3 b0+b1 b2+b3]
+    const __m512 fa = _mm512_castsi512_ps(a), fb = _mm512_castsi512_ps(b);
+    return _mm512_add_epi32(_mm512_castps_si512(_mm512_shuffle_ps(fa, fb, _MM_SHUFFLE(2, 0, 2, 0))),
+                            _mm512_castps_si512(_mm512_shuffle_ps(fa, fb, _MM_SHUFFLE(3, 1, 3, 1))));
+}
+
+// x_g: int32 pair sums of row group g (128-bit lanes [rA s01 s23, rB s01 s23 | rA s45 s67, rB .. | rC .. , rD .. | ..])
+// -> 16 exact row sums, lane p holds row vbmi_q8_tabs::row[p]
+MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_reduce(__m512i x0, __m512i x1, __m512i x2, __m512i x3) {
+    __m512i h01 = q8v_hadd(x0, x1), h23 = q8v_hadd(x2, x3);
+    h01 = _mm512_add_epi32(h01, _mm512_shuffle_i32x4(h01, h01, _MM_SHUFFLE(2, 3, 0, 1)));   // lane 0 = lane 0 + lane 1, ..
+    h23 = _mm512_add_epi32(h23, _mm512_shuffle_i32x4(h23, h23, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm512_shuffle_i32x4(h01, h23, _MM_SHUFFLE(2, 0, 2, 0));
+}
+
+// KR = rate k, GG = row groups (of 4 rows) per pass over the unit's tiles, ST = tiles per quant block
+template <int KR, int NT, int GG, int ST>
+MOE_AI_T512Q static void unit_rows_q8v_nt(const uint8_t * blk, uint32_t C, const void * const * xq, int64_t koff, int64_t Kin,
+                                          float (*acc)[AI4_TR]) {
+    static_assert(4 % GG == 0, "row groups per pass");
+    const vbmi_q8_tabs & T = vbmi_q8_tables();
+    constexpr int tb = 4*AIK_TILE_WORDS(KR);                 // tile bytes, 16k
+    constexpr __mmask64 m0 = tb >= 64 ? ~0ULL : (1ULL << tb) - 1;
+    constexpr __mmask64 m1 = tb > 64 ? (1ULL << (tb - 64)) - 1 : 0;
+    constexpr int NB = AI4U_UK/AI4_TC/ST, QB = ST*AI4_TC < AI4U_UK ? 32 : 256;
+    const uint8_t * wb = blk + AI4U_SCALE_BYTES;
+    const __m512i ctl = _mm512_loadu_si512(T.ctl[KR]);
+    const __m512i cl = _mm512_set1_epi16((short) (C & 0xFFFF)), ch = _mm512_set1_epi16((short) (C >> 16));
+    const __m512i one8 = _mm512_set1_epi8(1), k510 = _mm512_set1_epi16(510);
+    float d[NB][8];
+    for (int b = 0; b < NB; ++b) { for (int t = 0; t < NT; ++t) { d[b][t] = q8_d(xq[t], Kin)[(koff + b*ST*AI4_TC)/QB]; } }
+    const int16_t * xs[NT];
+    for (int t = 0; t < NT; ++t) { xs[t] = q8_xs(xq[t]) + (koff/AI4_TC)*16; }
+    alignas(64) float rs[8][16];
+    for (int G0 = 0; G0 < 4; G0 += GG) {
+        __m512i idx[GG];
+        for (int g = 0; g < GG; ++g) { idx[g] = _mm512_loadu_si512(T.idx[KR][G0 + g]); }
+        __m512 F[NT];
+        for (int t = 0; t < NT; ++t) { F[t] = _mm512_setzero_ps(); }
+        for (int b = 0; b < NB; ++b) {
+            __m512i ip[NT][GG];
+            for (int t = 0; t < NT; ++t) { for (int g = 0; g < GG; ++g) { ip[t][g] = _mm512_setzero_si512(); } }
+            for (int ct = b*ST; ct < (b + 1)*ST; ++ct) {
+                const uint8_t * tp = wb + ct*tb;
+                const __m512i t0 = _mm512_maskz_loadu_epi8(m0, tp);
+                const __m512i t1 = tb > 64 ? _mm512_maskz_loadu_epi8(m1, tp + 64) : _mm512_setzero_si512();
+                for (int g = 0; g < GG; ++g) {
+                    const __m512i win = _mm512_permutex2var_epi8(t0, idx[g], t1);
+                    const __m512i st  = _mm512_multishift_epi64_epi8(ctl, win);
+                    const __m512i lo  = _mm512_mullo_epi16(st, cl);
+                    const __m512i hi  = _mm512_add_epi16(_mm512_mulhi_epu16(st, cl), _mm512_mullo_epi16(st, ch));
+                    const __m512i sum = _mm512_add_epi16(_mm512_maddubs_epi16(lo, one8), _mm512_maddubs_epi16(hi, one8));
+                    const __m512i lev = _mm512_srai_epi16(_mm512_sub_epi16(sum, k510), 2);
+                    for (int t = 0; t < NT; ++t) {
+                        const __m512i xb = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i *) (xs[t] + ct*16)));
+                        ip[t][g] = _mm512_dpwssd_epi32(ip[t][g], lev, xb);
+                    }
+                }
+            }
+            const __m512i z = _mm512_setzero_si512();
+            for (int t = 0; t < NT; ++t) {
+                const __m512i rsum = q8v_reduce(ip[t][0], GG > 1 ? ip[t][GG > 1 ? 1 : 0] : z,
+                                                GG > 2 ? ip[t][GG > 2 ? 2 : 0] : z, GG > 3 ? ip[t][GG > 3 ? 3 : 0] : z);
+                F[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(rsum), _mm512_set1_ps(d[b][t]), F[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            alignas(64) float tmp[16];
+            _mm512_store_ps(tmp, F[t]);
+            for (int p = 0; p < 16; ++p) {
+                const int r = T.row[p];
+                if (r/4 < GG) { rs[t][4*G0 + r] = tmp[p]; }   // lanes of groups past GG are the zero padding
+            }
+        }
+    }
+    const uint16_t * dh = (const uint16_t *) blk;
+    for (int r = 0; r < AI4_TR; ++r) {
+        const float dw = ai4_fp16_to_fp32(dh[r]);
+        for (int t = 0; t < NT; ++t) { acc[t][r] = __builtin_fmaf(dw, rs[t][r], acc[t][r]); }
+    }
+}
+
+// row groups per pass: all four while the int32 accumulators (NT x GG zmm) leave room for the decode temporaries
+#if !defined(MOE_AI_Q8V_GG)
+#define MOE_AI_Q8V_GG(NT) ((NT) <= 2 ? 4 : (NT) <= 5 ? 2 : 1)
+#endif
+
+template <int KR, int ST>
+MOE_AI_T512Q static void unit_rows_q8v_k(const uint8_t * blk, uint32_t C, int nt, const void * const * xq, int64_t koff,
+                                         int64_t Kin, float (*acc)[AI4_TR]) {
+    switch (nt) {
+        case 1:  unit_rows_q8v_nt<KR, 1, MOE_AI_Q8V_GG(1), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 2:  unit_rows_q8v_nt<KR, 2, MOE_AI_Q8V_GG(2), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 3:  unit_rows_q8v_nt<KR, 3, MOE_AI_Q8V_GG(3), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 4:  unit_rows_q8v_nt<KR, 4, MOE_AI_Q8V_GG(4), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 5:  unit_rows_q8v_nt<KR, 5, MOE_AI_Q8V_GG(5), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 6:  unit_rows_q8v_nt<KR, 6, MOE_AI_Q8V_GG(6), ST>(blk, C, xq, koff, Kin, acc); break;
+        case 7:  unit_rows_q8v_nt<KR, 7, MOE_AI_Q8V_GG(7), ST>(blk, C, xq, koff, Kin, acc); break;
+        default: unit_rows_q8v_nt<KR, 8, MOE_AI_Q8V_GG(8), ST>(blk, C, xq, koff, Kin, acc); break;
+    }
+}
+
+template <int ST>
+MOE_AI_T512Q static bool unit_rows_q8v_st(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
+                                          int64_t Kin, float (*acc)[AI4_TR]) {
+    switch (k) {
+        case 2: unit_rows_q8v_k<2, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
+        case 3: unit_rows_q8v_k<3, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
+        case 4: unit_rows_q8v_k<4, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
+        case 5: unit_rows_q8v_k<5, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
+        default: return false;
+    }
+}
+
+// k in 2..5 on a VBMI + VNNI host; returns false (nothing done) otherwise
+static bool unit_rows_q8_vbmi(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
+                              float (*acc)[AI4_TR]) {
+    if (!has_q8_vbmi()) { return false; }
+    return q8_block(Kin) == 256 ? unit_rows_q8v_st<16>(blk, k, C, nt, xq, koff, Kin, acc)
+                                : unit_rows_q8v_st<4>(blk, k, C, nt, xq, koff, Kin, acc);
+}
 #endif
 
 // rows [a, b) of one expert (a multiple of 16; b - a <= 16, rows past b are computed and dropped), nt tokens:
@@ -888,15 +1072,19 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
 }
 
 // Q8 path: rows [a, b) of one expert (as slab_rows), nt <= 8 tokens, xq[t] = quant_q8/rotate_q8 buffers.
-// scalar = true forces the scalar reference (the test checks AVX2 == scalar bit for bit).
+// scalar = true forces the scalar reference (the test checks AVX2 == scalar bit for bit). vbmi: -1 = AVX-512 VBMI+VNNI
+// kernel when GGML_MOE_AI_HOST_Q8_VBMI=1 and the host has it, 0 = never, 1 = whenever the host has it (test/bench).
 static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
-                         const void * const * xq, float * const * o, bool scalar = false) {
+                         const void * const * xq, float * const * o, bool scalar = false, int vbmi = -1) {
     const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
     const int ub = AI4U_UNIT_BYTES(k);
     float acc[8][AI4_TR] = {};
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
         const uint8_t * blk = slab + u*ub;
 #if defined(__AVX2__) && defined(__FMA__)
+        if (!scalar && C != 0 && (vbmi > 0 || (vbmi < 0 && use_q8_vbmi())) && unit_rows_q8_vbmi(blk, k, C, nt, xq, u*AI4U_UK, K, acc)) {
+            continue;
+        }
         if (!scalar && C != 0 && unit_rows_q8(blk, k, C, nt, xq, u*AI4U_UK, K, acc)) { continue; }
 #endif
         unit_rows_q8_scalar(blk, k, C, nt, xq, u*AI4U_UK, K, acc);

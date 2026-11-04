@@ -55,7 +55,7 @@ static void moe_ai_log_first(const char * role) {
     const char * isa = "scalar";
 #endif
 #if defined(__AVX2__) && defined(__FMA__)
-    if (moe_ai::use_host_q8()) { isa = "avx2"; } // the q8 kernel is AVX2 only, even on AVX-512/VBMI hosts
+    if (moe_ai::use_host_q8()) { isa = moe_ai::use_q8_vbmi() ? "avx512-vbmi" : "avx2"; } // q8: AVX2 unless GGML_MOE_AI_HOST_Q8_VBMI=1
 #endif
     fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s act=%s\n", role, isa,
             moe_ai::use_host_q8() ? "q8 (GGML_MOE_AI_HOST_Q8=1)" : "f32");
