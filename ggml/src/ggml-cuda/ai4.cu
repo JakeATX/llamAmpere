@@ -1041,8 +1041,14 @@ bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t) {
 bool ggml_cuda_ai4_supported(const ggml_tensor * op) {
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
+    // MUL_MAT_ID: each expert's rows must be dense, but experts may sit nb[2] apart (the host expert arena interleaves
+    // one expert's up/gate/down, so nb[2] spans all three). Every ID kernel addresses experts as W + e*nb[2]. Rejecting
+    // that stride sent prompt-size AI+ MUL_MAT_IDs from the arena to the CPU backend while 3XS ones were offloaded.
+    const bool a_rows_dense = a->nb[0] == ggml_type_size(a->type) && a->nb[1] == ggml_row_size(a->type, a->ne[0]) &&
+        a->nb[2] >= a->nb[1]*a->ne[1] && a->nb[2] % 16 == 0 && a->nb[3] == a->nb[2]*a->ne[2];
+    const bool a_ok = op->op == GGML_OP_MUL_MAT_ID ? a_rows_dense : ggml_is_contiguous(a);
     if (b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[1] % 16 != 0 ||
-            (ggml_ai4v2_rate(a->type) != 0 && a->ne[0] % 640 != 0) || a->ne[3] != 1 || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
+            (ggml_ai4v2_rate(a->type) != 0 && a->ne[0] % 640 != 0) || a->ne[3] != 1 || !a_ok || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
         return false;
     }
     if (op->op == GGML_OP_MUL_MAT) {
@@ -2078,7 +2084,7 @@ bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor *
     if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT2P_U && w->type != GGML_TYPE_AIT3_U && w->type != GGML_TYPE_AIT2_U2 &&
             w->type != GGML_TYPE_AIT3_U2 && w->type != GGML_TYPE_IQ4_NL &&
             (w->type != GGML_TYPE_AIT4_U || w->ne[0] != 640)) ||
-            (w->type == GGML_TYPE_IQ4_NL ? cw->type != GGML_TYPE_IQ4_NL : !ggml_cuda_ai4_supported(bank)) ||
+            (w->type == GGML_TYPE_IQ4_NL ? cw->type != GGML_TYPE_IQ4_NL : (!ggml_cuda_ai4_supported(bank) || !ggml_is_contiguous(w))) ||
             w->ne[3] != 1 || !ggml_is_contiguous(w) ||
             x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] <= 0 || x->ne[0] > 65536 || x->ne[0] % 128 ||
             w->ne[1] <= 0 || w->ne[1] > 65536 || w->ne[1] % 16 || w->ne[2] <= 0 || w->ne[2] > INT32_MAX ||
