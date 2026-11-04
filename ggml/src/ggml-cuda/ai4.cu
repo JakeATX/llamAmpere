@@ -2434,9 +2434,11 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
     // fork AIPFIX P1PLAIN: phase 3 of a down projection (bank routes only; the 3XS hit kernel ran the cached ones,
     // and the down ids already hold bank slots) runs the plain AI+ direct GEMV, the MUL_MAT_ID kernel that isolated
     // ncu measured at 63-79% of DRAM speed, instead of the mixed kernel (22% occupancy). Routes without a bank slot
-    // exit unwritten, as in phase 3. The k order may differ (KLD-close class). GGML_MOE_BANK_P1_PLAIN=1 opts in.
-    // =2 takes the bank gate/up instead (P1PLAIN-GU below), =3 both.
-    static const int p1_plain_mode = ai4_env_int("GGML_MOE_BANK_P1_PLAIN", nullptr, 0);
+    // exit unwritten, as in phase 3. The k order may differ (KLD-close class). Default 1 (down only): paired Taichi
+    // coding 100K 11-04, 6 pairs, width-matched ms/round -2.4% (p=.008), writing tok/s +2.5% (p=.032).
+    // GGML_MOE_BANK_P1_PLAIN=0 keeps the mixed kernel; =2 takes the bank gate/up instead (P1PLAIN-GU below,
+    // measured slower), =3 both.
+    static const int p1_plain_mode = ai4_env_int("GGML_MOE_BANK_P1_PLAIN", nullptr, 1);
     const bool p1_plain = (p1_plain_mode & 1) != 0;
     if (p1_plain && p1_hot_only && !pair && !red && !route_map && w->type != GGML_TYPE_IQ4_NL) {
         const int n_tok = (int) ids->ne[1], n_pairs = (int) ggml_nelements(ids);
