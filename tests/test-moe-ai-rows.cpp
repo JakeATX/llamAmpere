@@ -70,6 +70,13 @@ int main(int argc, char ** argv) {
                                 for (int kk = 0; kk < 8; ++kk) { bad += lev[kk] != aik_level_n(wd + ct * tw, k, C, r * AI4_TC + kk); }
                                 _mm256_storeu_ps(got, moe_ai::row_levels_avx2(E, k, C, r));
                                 for (int kk = 0; kk < 8; ++kk) { bad += got[kk] != (float) lev[kk]; }
+                                // AIPFAST: the AVX2 shuffle decode must give the same levels
+                                uint32_t Es[AIK_TILE_WORDS(5) + 3 + 4] = {};
+                                memcpy(Es, E, sizeof(uint32_t) * (tw + 3));
+                                const moe_ai::shuf_tabs & T = moe_ai::shuf_tables();
+                                _mm256_storeu_ps(got, moe_ai::row_levels_shuf(Es, T, k, _mm256_loadu_si256((const __m256i *) T.sh[k]),
+                                                                              _mm256_set1_epi32((int) C), r));
+                                for (int kk = 0; kk < 8; ++kk) { bad += got[kk] != (float) lev[kk]; }
                             }
                         }
                     }
@@ -106,6 +113,33 @@ int main(int argc, char ** argv) {
                 };
                 run();
 #if defined(__AVX2__) && defined(__FMA__)
+                {
+                    // AIPFAST: AVX2 shuffle decode (path 0) vs the old AVX2 window decode (path 3): bit-identical, both timed
+                    std::vector<float> oa((size_t) nt * M), ob((size_t) nt * M);
+                    auto run_p = [&](std::vector<float> & o, int p) {
+                        float * opx[8];
+                        for (int64_t a = 0; a < M; a += AI4_TR) {
+                            for (int t = 0; t < nt; ++t) { opx[t] = o.data() + t * M + a; }
+                            moe_ai::slab_rows((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, yp, opx, p);
+                        }
+                    };
+                    run_p(oa, 0);
+                    run_p(ob, 3);
+                    const bool same = memcmp(oa.data(), ob.data(), oa.size() * sizeof(float)) == 0;
+                    fails += !same;
+                    double us[2] = {};
+                    for (int rep = 0; rep < 2; ++rep) {   // ABBA-ish: shuf, old, old, shuf
+                        for (int p : { 0, 3 }) {
+                            const int pp = rep ? 3 - p : p;
+                            const auto ta = std::chrono::steady_clock::now();
+                            for (int i = 0; i < reps; ++i) { run_p(pp == 0 ? oa : ob, pp); }
+                            us[pp == 0 ? 0 : 1] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ta).count() / (2.0 * reps);
+                        }
+                    }
+                    printf("%-8s K=%5lld M=%5lld nt=%d  AVX2 shuf vs old: %s  shuf %.1f us  old %.1f us /projection (1 thread)\n",
+                           ggml_type_name(type), (long long) K, (long long) M, nt, same ? "bit-identical OK" : "DIFFERENT FAIL",
+                           us[0], us[1]);
+                }
                 if (moe_ai::has_avx512()) {
                     // the AVX-512 path must equal the AVX2 path bit for bit
                     std::vector<float> o2((size_t) nt * M);

@@ -96,6 +96,61 @@ static inline __m256 row_levels_avx2(const uint32_t * E, int k, uint32_t C, int 
     return _mm256_cvtepi32_ps(v);
 }
 
+// AIPFAST: AVX2 shuffle decode (Zen 3 / any AVX2 host; the default AVX2 path). Row r's states sit at fixed ext bytes
+// (window byte m of row r = ext byte k*r + 2 + m; state kk starts k*(kk+1) bits into that window), so one vpshufb per
+// row gathers, for each state, the 3 big-endian stream bytes holding it straight from the tile words (E layout), one
+// vpsrlvd + mask cuts the 16-bit state, and the level is formed exactly as in row_levels_avx2. Replaces the scalar
+// 64-bit window build + GPR broadcast + two variable shifts + blend per row. Same integer levels, so the dot products
+// are bit-identical to row_levels_avx2 (the test checks every row). GGML_MOE_AI_HOST_SHUF=0 keeps the old decode.
+struct shuf_tabs {
+    uint8_t idx[6][AI4_TR][32];   // [k][row]: per 128-bit lane, E byte (relative to the lane base) of each state byte
+    uint8_t base[6][AI4_TR][2];   // [k][row]: lane base, in E words (low lane = states 0-3, high lane = states 4-7)
+    uint32_t sh[6][8];            // [k][state]: right shift that puts the state in the low 16 bits
+    shuf_tabs() {
+        memset(this, 0, sizeof(*this));
+        for (int k = 2; k <= 5; ++k) {
+            for (int kk = 0; kk < 8; ++kk) { sh[k][kk] = 8 - (k*(kk + 1) & 7); }
+            for (int r = 0; r < AI4_TR; ++r) {
+                const int Bw = k*r + 2;                                  // ext byte of window byte 0
+                for (int h = 0; h < 2; ++h) {
+                    const int j0 = (Bw + ((k*(4*h + 1)) >> 3)) >> 2;     // word holding the lane's first state byte
+                    base[k][r][h] = (uint8_t) j0;
+                    for (int s = 0; s < 4; ++s) {
+                        const int kk = 4*h + s, m0 = (k*(kk + 1)) >> 3;
+                        uint8_t * d = idx[k][r] + 16*h + 4*s;
+                        for (int i = 0; i < 3; ++i) {                    // lane byte i = window byte m0 + 2 - i
+                            const int P = Bw + m0 + 2 - i;
+                            d[i] = (uint8_t) (4*(P >> 2) + 3 - (P & 3) - 4*j0);
+                        }
+                        d[3] = 0x80;
+                    }
+                }
+            }
+        }
+    }
+};
+
+static const shuf_tabs & shuf_tables() {
+    static const shuf_tabs T;
+    return T;
+}
+
+static bool use_shuf() {
+    static const bool on = [] { const char * e = getenv("GGML_MOE_AI_HOST_SHUF"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
+// E: tile_words output with at least 4 readable words past E[nw + 2] (lane loads read whole 16-byte groups)
+static inline __m256 row_levels_shuf(const uint32_t * E, const shuf_tabs & T, int k, __m256i sh, __m256i Cv, int r) {
+    const __m256i src = _mm256_loadu2_m128i((const __m128i *) (E + T.base[k][r][1]), (const __m128i *) (E + T.base[k][r][0]));
+    __m256i v = _mm256_shuffle_epi8(src, _mm256_loadu_si256((const __m256i *) T.idx[k][r]));
+    v = _mm256_and_si256(_mm256_srlv_epi32(v, sh), _mm256_set1_epi32(0xFFFF));
+    v = _mm256_mullo_epi32(v, Cv);
+    v = _mm256_madd_epi16(_mm256_maddubs_epi16(v, _mm256_set1_epi8(1)), _mm256_set1_epi16(1));
+    v = _mm256_srai_epi32(_mm256_sub_epi32(v, _mm256_set1_epi32(510)), 2);
+    return _mm256_cvtepi32_ps(v);
+}
+
 static inline float hsum8(__m256 v) {
     __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     a = _mm_add_ps(a, _mm_movehl_ps(a, a));
@@ -265,19 +320,20 @@ MOE_AI_T512V static void unit_rows_512_vbmi(const uint8_t * blk, int k, uint32_t
 
 // rows [a, b) of one expert (a multiple of 16; b - a <= 16, rows past b are computed and dropped), nt tokens:
 // o[t][row - a] = W[row] . x_t, with y[t] the rotated inputs from rotate()
-// path: -1 = best available, 0 = AVX2 (or scalar), 1 = AVX-512 (VBMI decode when the host has it), 2 = AVX-512 without VBMI
+// path: -1 = best available, 0 = AVX2 (or scalar), 1 = AVX-512 (VBMI decode when the host has it), 2 = AVX-512 without VBMI,
+// 3 = AVX2 with the old window decode (row_levels_avx2; test reference)
 static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                       const float * const * y, float * const * o, int path = -1) {
     const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
     const int ub = AI4U_UNIT_BYTES(k), tw = AIK_TILE_WORDS(k);
     float acc[8][AI4_TR] = {};
-    uint32_t E[AIK_TILE_WORDS(5) + 3];  // k <= 5
+    uint32_t E[AIK_TILE_WORDS(5) + 3 + 4] = {};  // k <= 5; +4 words of slack for row_levels_shuf's 16-byte lane loads
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
         const uint8_t  * blk = slab + u*ub;
         const uint16_t * dh  = (const uint16_t *) blk;
         const uint32_t * wd  = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
 #if defined(__AVX2__) && defined(__FMA__)
-        if (C != 0 && path != 0 && has_avx512()) {
+        if (C != 0 && path != 0 && path != 3 && has_avx512()) {
             if (path != 2 && has_vbmi()) { unit_rows_512_vbmi(blk, k, C, nt, y, u*AI4U_UK, acc); }
             else { unit_rows_512(blk, k, C, nt, y, u*AI4U_UK, acc); }
             continue;
@@ -285,12 +341,15 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
         if (C != 0) {
             __m256 part[8][AI4_TR];
             for (int t = 0; t < nt; ++t) { for (int r = 0; r < AI4_TR; ++r) { part[t][r] = _mm256_setzero_ps(); } }
+            const bool shuf = path != 3 && use_shuf();
+            const shuf_tabs & T = shuf_tables();
+            const __m256i shv = _mm256_loadu_si256((const __m256i *) T.sh[k]), Cv = _mm256_set1_epi32((int) C);
             for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
                 tile_words(wd + ct*tw, k, E);
                 __m256 yv[8];
                 for (int t = 0; t < nt; ++t) { yv[t] = _mm256_loadu_ps(y[t] + u*AI4U_UK + ct*AI4_TC); }
                 for (int r = 0; r < AI4_TR; ++r) {
-                    const __m256 lev = row_levels_avx2(E, k, C, r);
+                    const __m256 lev = shuf ? row_levels_shuf(E, T, k, shv, Cv, r) : row_levels_avx2(E, k, C, r);
                     for (int t = 0; t < nt; ++t) { part[t][r] = _mm256_fmadd_ps(lev, yv[t], part[t][r]); }
                 }
             }
