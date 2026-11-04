@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -1838,9 +1839,26 @@ struct host_alt_store {
     std::vector<host_alt_file> files;
     std::vector<std::vector<const void *>> srcs;   // kept alive for the pool's role tables
     std::vector<std::pair<std::string, moe_cs_role>> found;   // one entry per tensor name (sessions re-register)
-    std::vector<std::pair<const char *, size_t>> ranges;      // mapped bytes of each found tensor (warm-up)
+    std::vector<std::pair<const char *, size_t>> ranges;      // mapped bytes of each kept tensor (warm-up)
+    std::map<std::string, std::pair<const char *, size_t>> pending;   // found, not yet kept by moe_cs_host_alt_keep
+    std::map<int, bool> layer_kept;                           // per layer: 3XS copy kept (true) or over budget (false)
+    double budget = -1.0;                                     // bytes left for kept copies (-1 = not set yet)
     bool warmed = false;
 };
+// MemAvailable in bytes (0 if unreadable)
+double host_alt_mem_avail() {
+    long long avail_kib = -1;
+    if (FILE * fp = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) { if (sscanf(line, "MemAvailable: %lld kB", &avail_kib) == 1) { break; } }
+        fclose(fp);
+    }
+    return avail_kib > 0 ? avail_kib * 1024.0 : 0.0;
+}
+double host_alt_floor_gib() {
+    const char * fe = getenv("GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB");
+    return std::max(5.0, fe && fe[0] ? atof(fe) : 7.0);
+}
 host_alt_store & HA() { static host_alt_store s; return s; }
 }
 
@@ -1905,7 +1923,7 @@ bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_e
         out->row_bytes = rb;
         out->src = h.srcs.back().data();
         h.found.emplace_back(name, *out);
-        h.ranges.push_back({ f.base + off, eb * (size_t) n_expert });
+        h.pending[name] = { f.base + off, eb * (size_t) n_expert };
         return true;
     }
     fprintf(stderr, "[moe-cpu-split] host 3XS source: %s not found (with this shape) in GGML_MOE_CPU_SPLIT_HOST_GGUF; "
@@ -1913,6 +1931,44 @@ bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_e
     return false;
 #else
     (void) name; (void) n_in; (void) n_out; (void) n_expert; (void) out;
+    return false;
+#endif
+}
+
+bool moe_cs_host_alt_keep(int layer, const char * const names[3]) {
+#if defined(__linux__)
+    host_alt_store & h = HA();
+    std::lock_guard<std::mutex> lock(h.mu);
+    if (const auto it = h.layer_kept.find(layer); it != h.layer_kept.end()) { return it->second; }
+    size_t bytes = 0;
+    for (int k = 0; k < 3; ++k) {
+        const auto it = h.pending.find(names[k]);
+        if (it == h.pending.end()) { return false; }
+        bytes += it->second.second;
+    }
+    const double gib = 1024.0*1024.0*1024.0;
+    const char * fit = getenv("GGML_MOE_CPU_SPLIT_HOST_FIT");
+    const bool fit_on = !(fit && fit[0] == '0');
+    if (fit_on && h.budget < 0.0) {
+        // budget: GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB, else MemAvailable minus the warm-up floor (7 GiB, min 5)
+        const char * be = getenv("GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB");
+        h.budget = be && be[0] ? std::max(0.0, atof(be)) * 1024.0 * 1024.0
+                               : std::max(0.0, host_alt_mem_avail() - host_alt_floor_gib() * gib);
+        fprintf(stderr, "[moe-cpu-split] host 3XS copies: RAM budget %.2f GiB (%s); layers past it keep the AI+ decode\n",
+                h.budget / gib, be && be[0] ? "GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB" : "MemAvailable minus floor");
+    }
+    if (fit_on && (double) bytes > h.budget) {
+        h.layer_kept[layer] = false;
+        fprintf(stderr, "[moe-cpu-split] layer %d: host 3XS copy (%.2f GiB) over the RAM budget (%.2f GiB left), "
+                "host misses keep the AI+ decode\n", layer, bytes / gib, h.budget / gib);
+        return false;
+    }
+    if (fit_on) { h.budget -= (double) bytes; }
+    for (int k = 0; k < 3; ++k) { h.ranges.push_back(h.pending[names[k]]); }
+    h.layer_kept[layer] = true;
+    return true;
+#else
+    (void) layer; (void) names;
     return false;
 #endif
 }
@@ -1933,15 +1989,8 @@ double moe_cs_host_alt_warm() {
         return 0.0;
     }
     // budget: MemAvailable minus the 7 GiB target the expert arena keeps free (hard floor 5 GiB); ranges in layer order
-    long long avail_kib = -1;
-    if (FILE * fp = fopen("/proc/meminfo", "r")) {
-        char line[256];
-        while (fgets(line, sizeof(line), fp)) { if (sscanf(line, "MemAvailable: %lld kB", &avail_kib) == 1) { break; } }
-        fclose(fp);
-    }
-    const char * fe = getenv("GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB");
-    const double target_gib = std::max(5.0, fe && fe[0] ? atof(fe) : 7.0);
-    const double avail = avail_kib > 0 ? avail_kib * 1024.0 : 0.0;
+    const double target_gib = host_alt_floor_gib();
+    const double avail = host_alt_mem_avail();
     double budget = std::max(0.0, avail - target_gib * gib);
     size_t warmed = 0;
     const size_t page = (size_t) sysconf(_SC_PAGESIZE);

@@ -10117,6 +10117,15 @@ static void moe_cs_prepare(moe_cache_session & session) {
                 have = moe_cs_host_alt(name, roles[k].n_in, roles[k].n_out, roles[k].n_expert, &alt[k]);
             }
             if (have) {
+                char nm[3][64];
+                const char * nms[3];
+                for (int k = 0; k < 3; ++k) {
+                    snprintf(nm[k], sizeof(nm[k]), "blk.%d.ffn_%s_exps.weight", (int) l, kind[k]);
+                    nms[k] = nm[k];
+                }
+                have = moe_cs_host_alt_keep((int) l, nms);   // over the RAM budget: keep the AI+ decode, no disk reads
+            }
+            if (have) {
                 for (int k = 0; k < 3; ++k) { roles[k] = alt[k]; }
                 swapped = true;
             }
