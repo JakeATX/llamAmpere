@@ -941,6 +941,7 @@ llama_model_loader::llama_model_loader(
     // model that holds none of its tensors (an MTP drafter in the same process) skips it.
     const char * ov_env = getenv("LLAMA_MODEL_OVERLAY");
     const bool patch_base = !(ov_env && ov_env[0]);
+    int n_retyped = 0;
     if (const char * pfs = getenv("LLAMA_MODEL_OVERLAY_PATCH"); pfs && pfs[0] && !fname.empty() && (patch_base || overlay_idx >= 0)) {
         std::stringstream pss(pfs);
         for (std::string pfn; std::getline(pss, pfn, ',');) {
@@ -985,12 +986,37 @@ llama_model_loader::llama_model_loader(
                 throw std::runtime_error(format("overlay patch %s: tensor '%s' does not replace a tensor of the same shape",
                         pf, ggml_get_name(cur)));
             }
+            if (it->second.tensor->type != cur->type && strstr(cur->name, "_exps.weight")) {
+                ++n_retyped;   // a routed-expert base tensor in another type (all-AI+ experts: the cache takes this type)
+            }
             n_bytes += ggml_nbytes(cur) - ggml_nbytes(it->second.tensor);
             it->second = llama_tensor_weight(files.back().get(), pidx, p_gguf.get(), cur);
             ++n_patched;
         }
         LLAMA_LOG_INFO("%s: overlay patch %s: %d tensors replaced\n", __func__, pf, n_patched);
         }
+    }
+    if (n_retyped > 0) {
+        // the paired gate/up cache path reads both projections with one type: refuse a patch that splits them
+        int n_ai_layers = 0;
+        for (int il = 0; il < 1024; ++il) {
+            auto g = weights_map.find(format("blk.%d.ffn_gate_exps.weight", il));
+            auto u = weights_map.find(format("blk.%d.ffn_up_exps.weight", il));
+            auto d = weights_map.find(format("blk.%d.ffn_down_exps.weight", il));
+            if (g == weights_map.end() || u == weights_map.end() || d == weights_map.end()) { continue; }
+            const ggml_type tg = g->second.tensor->type, tu = u->second.tensor->type, td = d->second.tensor->type;
+            if (tg != tu && (ggml_ai4_is_unit(tg) || ggml_ai4_is_unit(tu))) {
+                throw std::runtime_error(format("overlay patch: layer %d gate/up types differ (%s vs %s); AI+ expert patches "
+                        "must give gate and up one type", il, ggml_type_name(tg), ggml_type_name(tu)));
+            }
+            if (ggml_ai4_is_unit(tg) || ggml_ai4_is_unit(td)) {
+                ++n_ai_layers;
+                LLAMA_LOG_INFO("%s: AI+ experts: layer %d gate/up %s down %s\n", __func__, il, ggml_type_name(tg), ggml_type_name(td));
+            }
+        }
+        // WARN, not INFO: llama-server logs hide libllama INFO lines and a smoke must be able to see this
+        LLAMA_LOG_WARN("%s: overlay patch retyped %d routed-expert tensors; %d layers hold AI+ experts in the base tensors\n",
+                __func__, n_retyped, n_ai_layers);
     }
 
     n_kv      = gguf_get_n_kv(metadata);
