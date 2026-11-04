@@ -65,3 +65,8 @@ bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t 
 // arm. False when the build or the type has no row kernel.
 bool moe_cs_iq_unpack(int type, const void * block, int c, bool joined, unsigned char * mag, signed char * sgn, int * mul);
 int moe_cs_threads();
+// AIPFAST route 2: GGML_MOE_CPU_SPLIT_HOST_GGUF=a.gguf[,b.gguf...] names model files (normally the 3XS base the AI+
+// patch overlays) whose copy of tensor `name` the host computes its misses from instead of the cache's own bytes.
+// The files are mapped read-only (page cache, no pinned RAM). Fills `out` (type, shape, row bytes, per-expert
+// sources) when the tensor exists with the given shape and the host can read its type; false otherwise.
+bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_expert, moe_cs_role * out);

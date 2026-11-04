@@ -10074,6 +10074,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
         return;
     }
     size_t layers = 0;
+    int host_alt_layers = 0;
     for (size_t l = 0; l < session.mj_groups.size(); ++l) {
         const auto & g = session.mj_groups[l];
         if (!g[0] || !g[1] || !g[2]) { continue; }
@@ -10088,6 +10089,22 @@ static void moe_cs_prepare(moe_cache_session & session) {
             roles[k].row_bytes = ggml_row_size((ggml_type) t.desc.type, t.desc.n_in);
             roles[k].src = t.copy_source.data();
             ok = ok && t.copy_source.size() == (size_t) t.desc.n_expert && t.desc.n_expert <= g_hf_experts;
+        }
+        // AIPFAST route 2: an AI+ layer computes its host misses from the base file's 3XS copy when one is named
+        // (GGML_MOE_CPU_SPLIT_HOST_GGUF); the card keeps the AI+ bytes. All three projections or none.
+        if (ok && (ggml_ai4_is_unit((ggml_type) roles[0].type) || ggml_ai4_is_unit((ggml_type) roles[2].type))) {
+            static const char * kind[3] = {"up", "gate", "down"};
+            moe_cs_role alt[3];
+            bool have = true;
+            for (int k = 0; k < 3 && have; ++k) {
+                char name[64];
+                snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", (int) l, kind[k]);
+                have = moe_cs_host_alt(name, roles[k].n_in, roles[k].n_out, roles[k].n_expert, &alt[k]);
+            }
+            if (have) {
+                for (int k = 0; k < 3; ++k) { roles[k] = alt[k]; }
+                ++host_alt_layers;
+            }
         }
         if (ok && moe_cs_register_layer((int) l, roles)) {
             session.cs_registered[l] = 1;
@@ -10123,6 +10140,9 @@ static void moe_cs_prepare(moe_cache_session & session) {
     g_cs_on = layers > 0 && g_cs_ns_per_byte > 0.0f;
     MOE_CACHE_LOG("[moe-cache] cpu split: %s, %zu of %zu layers on the host pool (%d threads)\n",
             g_cs_on ? "on" : "off", layers, session.mj_groups.size(), moe_cs_threads());
+    if (host_alt_layers) {
+        fprintf(stderr, "[moe-cpu-split] host misses of %d AI+ layers use the 3XS copies in GGML_MOE_CPU_SPLIT_HOST_GGUF\n", host_alt_layers);
+    }
 }
 
 // Called at the end of device preparation, outside graph capture.

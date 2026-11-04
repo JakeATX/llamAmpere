@@ -1768,3 +1768,102 @@ bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t 
     return false;
 #endif
 }
+
+// AIPFAST route 2 (see moe-cpu-split.h): host-only copies of routed-expert tensors from other model files.
+// With every cache slot in AI+ bytes, a host miss would run the AI+ trellis decode (about 2.5x the IQ row kernels
+// on an AVX2 desktop). The base file still holds each expert's 3XS bytes; the pool computes its misses from those
+// (same math as the ship stack's host misses) while the card keeps the AI+ bytes. Pages load on first use and stay
+// in the page cache; nothing here is pinned.
+#include "gguf.h"
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+namespace {
+struct host_alt_file {
+    std::string path;
+    gguf_context * g = nullptr;
+    ggml_context * ctx = nullptr;
+    const char * base = nullptr;
+    size_t size = 0;
+};
+struct host_alt_store {
+    std::mutex mu;
+    bool opened = false;
+    std::vector<host_alt_file> files;
+    std::vector<std::vector<const void *>> srcs;   // kept alive for the pool's role tables
+    std::vector<std::pair<std::string, moe_cs_role>> found;   // one entry per tensor name (sessions re-register)
+};
+host_alt_store & HA() { static host_alt_store s; return s; }
+}
+
+bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_expert, moe_cs_role * out) {
+#if defined(__linux__)
+    const char * env = getenv("GGML_MOE_CPU_SPLIT_HOST_GGUF");
+    if (!env || !env[0] || !name || !out) { return false; }
+    host_alt_store & h = HA();
+    std::lock_guard<std::mutex> lock(h.mu);
+    if (!h.opened) {
+        h.opened = true;
+        std::string all(env);
+        for (size_t a = 0; a <= all.size();) {
+            size_t b = all.find(',', a);
+            if (b == std::string::npos) { b = all.size(); }
+            const std::string path = all.substr(a, b - a);
+            a = b + 1;
+            if (path.empty()) { continue; }
+            host_alt_file f;
+            f.path = path;
+            gguf_init_params ip = { /*.no_alloc = */ true, /*.ctx = */ &f.ctx };
+            f.g = gguf_init_from_file(path.c_str(), ip);
+            const int fd = f.g ? open(path.c_str(), O_RDONLY) : -1;
+            struct stat st = {};
+            if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+                void * m = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+                if (m != MAP_FAILED) { f.base = (const char *) m; f.size = (size_t) st.st_size; }
+            }
+            if (fd >= 0) { close(fd); }
+            fprintf(stderr, "[moe-cpu-split] host 3XS source %s: %s\n", path.c_str(), f.base ? "mapped" : "FAILED (not used)");
+            if (f.base) { h.files.push_back(f); }
+        }
+    }
+    for (const auto & fr : h.found) {
+        if (fr.first == name && fr.second.n_in == n_in && fr.second.n_out == n_out && fr.second.n_expert == n_expert) {
+            *out = fr.second;
+            return true;
+        }
+    }
+    for (const host_alt_file & f : h.files) {
+        const int64_t id = gguf_find_tensor(f.g, name);
+        const ggml_tensor * t = id >= 0 ? ggml_get_tensor(f.ctx, name) : nullptr;
+        if (!t) { continue; }
+        const ggml_type type = t->type;
+        const size_t rb = ggml_row_size(type, t->ne[0]);
+        const size_t off = gguf_get_data_offset(f.g) + gguf_get_tensor_offset(f.g, id);
+        const size_t eb = rb * (size_t) t->ne[1];
+        if (t->ne[0] != n_in || t->ne[1] != n_out || t->ne[2] != n_expert || t->ne[3] != 1 ||
+                off + eb * (size_t) n_expert > f.size || ggml_ai4_is_unit(type)) {
+            fprintf(stderr, "[moe-cpu-split] host 3XS source: %s in %s has another shape or an AI+ type, not used\n", name, f.path.c_str());
+            return false;
+        }
+        std::vector<const void *> src((size_t) n_expert);
+        for (int64_t e = 0; e < n_expert; ++e) { src[(size_t) e] = f.base + off + (size_t) e * eb; }
+        h.srcs.push_back(std::move(src));
+        out->type = (int) type;
+        out->n_in = n_in;
+        out->n_out = n_out;
+        out->n_expert = n_expert;
+        out->row_bytes = rb;
+        out->src = h.srcs.back().data();
+        h.found.emplace_back(name, *out);
+        return true;
+    }
+    return false;
+#else
+    (void) name; (void) n_in; (void) n_out; (void) n_expert; (void) out;
+    return false;
+#endif
+}
