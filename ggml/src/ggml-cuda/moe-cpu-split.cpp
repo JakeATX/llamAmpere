@@ -2143,6 +2143,29 @@ double moe_cs_host_alt_warm() {
     fprintf(stderr, "[moe-cpu-split] host 3XS warm-up: %.2f of %.2f GiB queued for reading (MemAvailable %.2f GiB, keeps %.1f GiB free); "
             "%.2f GiB stay cold (misses there read the disk)%s\n", warmed / gib, total / gib, avail / gib, target_gib,
             (total - warmed) / gib, warmed < total ? " - WARNING: not all host 3XS bytes fit in RAM" : "");
+    // WILLNEED only fills the page cache; this mapping's page tables stay empty, so each first touch on the miss path
+    // still took a page fault (Taichi h arm, aipfast-r2k: 144 us per host route measured vs 29 us probed). Fault the
+    // warmed ranges in now, at load, the same way the model's own map uses MAP_POPULATE.
+    // GGML_MOE_CPU_SPLIT_HOST_POPULATE=0 keeps the lazy faults.
+#if !defined(MADV_POPULATE_READ)
+#define MADV_POPULATE_READ 22
+#endif
+    const char * pe = getenv("GGML_MOE_CPU_SPLIT_HOST_POPULATE");
+    if (warmed > 0 && !(pe && pe[0] == '0')) {
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t done = 0, left = warmed;
+        bool ok = true;
+        for (const auto & r : h.ranges) {
+            if (r.second > left) { break; }
+            left -= r.second;
+            const uintptr_t b = (uintptr_t) r.first & ~(uintptr_t) (page - 1);
+            const size_t len = (uintptr_t) r.first + r.second - b;
+            if (madvise((void *) b, len, MADV_POPULATE_READ) == 0) { done += r.second; } else { ok = false; break; }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "[moe-cpu-split] host 3XS copies mapped in: %.2f of %.2f GiB in %.0f ms%s\n", done / gib, warmed / gib, ms,
+                ok ? "" : " (MADV_POPULATE_READ failed: older kernel? the rest fault in on first use)");
+    }
     return warmed / gib;
 #else
     return 0.0;
