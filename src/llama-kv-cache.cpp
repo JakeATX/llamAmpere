@@ -800,6 +800,9 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
+        if (ggml_backend_buft_is_host(buft)) {
+            kq_mask_defer_ok = false;   // a host-side attention reads the mask directly: no input copy would fill it
+        }
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -4607,7 +4610,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
             ok = ubatch->pos[i] >= 0 && (s == seq_id || cells.seq_covers_used(s));
         }
         if (ok && cells.seq_covers_used(seq_id)) {
-            if (dst->type == GGML_TYPE_F16 && llama_kq_mask_device_enabled() && dst->ne[1] == (int64_t) n_tokens &&
+            if (dst->type == GGML_TYPE_F16 && kq_mask_defer_ok && llama_kq_mask_device_enabled() && dst->ne[1] == (int64_t) n_tokens &&
                     ggml_is_contiguous(dst)) {
                 std::vector<int32_t> counts;
                 if (kq_mask_seq_prefix_counts(cells, ubatch, n_kv, counts) &&
