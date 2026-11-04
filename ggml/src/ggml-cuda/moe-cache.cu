@@ -47,6 +47,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include "moe-table-state.cuh"
 #endif
 #include "moe-cpu-split.h"
+#include "moe-cs-greedy.h"
 #include "moe-hf-copy.cuh"
 #include "unary.cuh"
 
@@ -1161,6 +1162,8 @@ struct moe_cache_session {
     // down shape (checked per graph by ggml_cuda_moe_cache_cs_graph_scan); the layer whose CPU job is in flight.
     std::vector<uint8_t> cs_registered;
     std::vector<uint8_t> cs_valid;
+    // AIPFIX GGML_MOE_CPU_SPLIT_PROBE_PER_TYPE=1: each registered layer's own host cost (ns; empty = the global one)
+    std::vector<float> cs_route_l, cs_fixed_l;
     int cs_layer = -1;
     // fork MOEGAP MISSLIST: the layer whose plan wrote the miss lists (-1: none)
     int ml_layer = -1;
@@ -9993,6 +9996,13 @@ static float moe_cs_env_float(const char * name, float def) {
     return v && *v ? (float) atof(v) : def;
 }
 
+// AIPFIX: GGML_MOE_CPU_SPLIT_PROBE_PER_TYPE=1 probes one layer per distinct host type triple (up, gate, down) and the
+// planner uses each layer's own cost (default off: one probe on the first layer, its cost for every layer).
+static bool moe_cs_per_type_enabled() {
+    static const bool on = [] { const char * v = getenv("GGML_MOE_CPU_SPLIT_PROBE_PER_TYPE"); return v && strcmp(v, "1") == 0; }();
+    return on;
+}
+
 // Host-to-card copy rate of pinned memory, bytes per second (best of three 32 MiB copies); 0 when it fails.
 static double moe_cs_probe_link(void * dst, size_t cap) {
     const size_t bytes = std::min(cap, (size_t) 32u << 20);
@@ -10029,6 +10039,8 @@ static void moe_cs_prepare(moe_cache_session & session) {
     session.cs_registered.assign(session.mj_groups.size(), 0);
     session.cs_valid.assign(session.mj_groups.size(), 0);
     session.cs_layer = -1;
+    session.cs_route_l.clear();
+    session.cs_fixed_l.clear();
     if (!moe_cs_enabled() || session.devices.size() != 1) {
         return;
     }
@@ -10124,10 +10136,21 @@ static void moe_cs_prepare(moe_cache_session & session) {
         }
     }
     static bool probed = false;
+    static std::map<std::array<int, 3>, std::array<double, 2>> type_cost;   // AIPFIX per-type: raw probes (ns)
     if (!probed && layers) {
         probed = true;
         double route_ns = 0.0, fixed_ns = 0.0;
         const bool cpu_ok = moe_cs_probe(&route_ns, &fixed_ns);
+        if (cpu_ok && moe_cs_per_type_enabled()) {
+            // moe_cs_probe timed the lowest registered layer: reuse it for that layer's type triple
+            for (size_t l = 0; l < session.cs_registered.size(); ++l) {
+                int t[3];
+                if (session.cs_registered[l] && moe_cs_layer_types((int) l, t)) {
+                    type_cost[{t[0], t[1], t[2]}] = {route_ns, fixed_ns};
+                    break;
+                }
+            }
+        }
         const double link = moe_cs_probe_link(g_hf_scratch, 3 * (size_t) g_hf_slots * g_hf_stride);
         // overrides: microseconds per (expert, route) on the CPU, microseconds per job, link GB/s
         g_cs_route_ns = moe_cs_env_float("GGML_MOE_CPU_SPLIT_ROUTE_US", cpu_ok ? (float) (route_ns / 1000.0) : 60.0f) * 1000.0f;
@@ -10150,6 +10173,39 @@ static void moe_cs_prepare(moe_cache_session & session) {
                 g_cs_adapt ? "corrected from measured jobs (ADAPT)" : "fixed");
     }
     g_cs_on = layers > 0 && g_cs_ns_per_byte > 0.0f;
+    if (g_cs_on && moe_cs_per_type_enabled()) {
+        std::vector<std::array<int, 3>> key(session.cs_registered.size(), std::array<int, 3>{-1, -1, -1});
+        for (size_t l = 0; l < key.size(); ++l) {
+            int t[3];
+            if (session.cs_registered[l] && moe_cs_layer_types((int) l, t)) { key[l] = {t[0], t[1], t[2]}; }
+        }
+        const float hs_ns = moe_cs_env_float("GGML_MOE_CPU_SPLIT_HANDSHAKE_US", 8.0f) * 1000.0f;
+        const bool route_env = getenv("GGML_MOE_CPU_SPLIT_ROUTE_US") && *getenv("GGML_MOE_CPU_SPLIT_ROUTE_US");
+        const bool fixed_env = getenv("GGML_MOE_CPU_SPLIT_FIXED_US") && *getenv("GGML_MOE_CPU_SPLIT_FIXED_US");
+        std::vector<double> rl, fl;
+        moe_cs_type_costs(key, [](int l, double * r, double * f) { return moe_cs_probe_at(l, r, f); },
+                (double) g_cs_route_ns, (double) (g_cs_fixed_ns - hs_ns), type_cost, rl, fl);
+        session.cs_route_l.assign(key.size(), 0.0f);
+        session.cs_fixed_l.assign(key.size(), 0.0f);
+        std::map<std::array<int, 3>, int> n_of;
+        for (size_t l = 0; l < key.size(); ++l) {
+            if (key[l][0] < 0) { continue; }
+            session.cs_route_l[l] = route_env ? g_cs_route_ns : (float) rl[l];
+            session.cs_fixed_l[l] = fixed_env ? g_cs_fixed_ns : (float) fl[l] + hs_ns;
+            ++n_of[key[l]];
+        }
+        for (const auto & kv : n_of) {
+            const auto & c = type_cost[kv.first];
+            MOE_CACHE_LOG("[moe-cache] cpu split per-type probe: up %s gate %s down %s, %d layers: %.1f us per (expert, route), "
+                    "%.1f us per job incl. handshake (x%.2f the reference)%s\n",
+                    ggml_type_name((ggml_type) kv.first[0]), ggml_type_name((ggml_type) kv.first[1]),
+                    ggml_type_name((ggml_type) kv.first[2]), kv.second,
+                    route_env ? g_cs_route_ns / 1000.0f : (float) (c[0] / 1000.0),
+                    fixed_env ? g_cs_fixed_ns / 1000.0f : (float) ((c[1] + hs_ns) / 1000.0),
+                    route_env || g_cs_route_ns <= 0.0f ? 1.0f : (float) (c[0] / g_cs_route_ns),
+                    route_env || fixed_env ? " (env override)" : "");
+        }
+    }
     MOE_CACHE_LOG("[moe-cache] cpu split: %s, %zu of %zu layers on the host pool (%d threads)\n",
             g_cs_on ? "on" : "off", layers, session.mj_groups.size(), moe_cs_threads());
     if (host_alt_layers) {
@@ -10359,6 +10415,7 @@ struct moe_hf_plan_args {
     uint8_t * cs_cpu;             // fork MOEGAP DOWNONE: [cs_mask_stride] 1 = on the CPU this layer (null: off)
     int64_t cs_mask_stride;
     float cs_route_ns, cs_fixed_ns, cs_ns_per_byte;
+    float cs_adapt_scale;         // AIPFIX per-type probe: this layer's route cost / the reference cost (1 = off)
     int cs_adapt;
     float cs_bytes[3];            // copy bytes of one expert per projection
     int cs_max_exp, cs_max_route;
@@ -10629,36 +10686,19 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             for (int k = 0; k < 3; ++k) { gpu += (float) s_nk[k] * args.cs_bytes[k]; }
             gpu *= w;
             const float floor_ns = args.cs_floor_ns * (float) s_n[0];
-            float cpu = 0.0f;
-            int ne = 0, nr = 0;
+            // AIPFIX per-type: the live (ADAPT) cost is kept in the reference layer's units; cs_adapt_scale = this
+            // layer's probe cost / the reference's (1 when the per-type probe is off)
+            const float route_ns = args.cs_adapt && plan->route_ns_live > 0.0f ? plan->route_ns_live * args.cs_adapt_scale : args.cs_route_ns;
+            const moe_cs_greedy_cfg gc = { route_ns, args.cs_fixed_ns, w, floor_ns,
+                    { args.cs_bytes[0], args.cs_bytes[1], args.cs_bytes[2] }, args.cs_max_exp, args.cs_max_route };
+            const unsigned char * const fl[3] = { s_flag[0], s_flag[1], s_flag[2] };
+            int take[MOE_CS_MAX_EXPERTS];
+            int nr = 0;
             unsigned long long parts = 0, partial = 0;
-            const float route_ns = args.cs_adapt && plan->route_ns_live > 0.0f ? plan->route_ns_live : args.cs_route_ns;
-            s_cs_first[0] = 0;
-            for (int r = 0; r < s_ncand && ne < args.cs_max_exp; ++r) {
-                const int i = s_order[r];
-                const int c = s_cnt[i] / 4;
-                if (nr + c > args.cs_max_route) { break; }
-                float saved = 0.0f;
-                int nm = 0;
-#pragma unroll
-                for (int k = 0; k < 3; ++k) {
-                    if ((s_flag[k][i] & 3) == 3) { saved += args.cs_bytes[k]; ++nm; }
-                }
-                const float cpu2 = args.cs_fixed_ns + (float) (nr + c) * route_ns;
-                const float gpu2 = gpu - saved * w;
-                const float now = fmaxf(cpu, fmaxf(floor_ns, gpu));
-                const float next = fmaxf(cpu2, fmaxf(floor_ns, gpu2));
-                // without a floor, ties stop (the old rule); with one, ties inside the floor go to the CPU
-                if (floor_ns > 0.0f ? next > now : next >= now) { break; }
-                cpu = cpu2;
-                gpu = gpu2;
-                plan->expert[ne] = s_e[i];
-                s_cpu[s_e[i]] = (unsigned char) (ne + 1);
-                ++ne;
-                nr += c;
-                parts += (unsigned long long) nm;
-                partial += nm < 3;
-                s_cs_first[ne] = nr;
+            const int ne = moe_cs_greedy(gc, gpu, s_ncand, s_order, s_cnt, fl, take, s_cs_first, &nr, &parts, &partial);
+            for (int j = 0; j < ne; ++j) {
+                plan->expert[j] = s_e[take[j]];
+                s_cpu[s_e[take[j]]] = (unsigned char) (j + 1);
             }
             plan->stat_parts += parts;
             plan->stat_partial += partial;
@@ -10890,7 +10930,7 @@ static __device__ __forceinline__ unsigned long long moe_cs_now_ns() {
 // into the projection output (those routes were skipped by both card passes). One block per possible CPU route.
 static __global__ void moe_cs_join_kernel(moe_cs_plan_dev * plan, moe_cs_job * job, const float * out_h,
         size_t out_stride, char * dst, size_t nb1, size_t nb2, int n_ids, int n_out, float adapt_route0, float adapt_fixed,
-        const int32_t * bank_ids = nullptr, size_t bank_stride = 0) {
+        const int32_t * bank_ids = nullptr, size_t bank_stride = 0, float adapt_scale = 1.0f) {
     const unsigned long long seq = plan->seq;
     const int n_route = plan->n_route;
     if (seq == 0 || (int) blockIdx.x >= n_route) {
@@ -10912,7 +10952,9 @@ static __global__ void moe_cs_join_kernel(moe_cs_plan_dev * plan, moe_cs_job * j
                 // Measured cost per route of this job (the host's busy time less the job's fixed cost; the fixed
                 // cost already carries the handshake allowance), folded in at 1/16 per job.
                 const float busy = (float) moe_cs_ld_sys(&job->busy_ns);
-                const float smp = fminf(fmaxf((busy + 8000.0f - adapt_fixed) / (float) n_route, 500.0f), 500000.0f);
+                // AIPFIX per-type: adapt_scale = this layer's probe cost / the reference's; the sample is folded in
+                // the reference's units (adapt_scale 1 = off: unchanged)
+                const float smp = fminf(fmaxf((busy + 8000.0f - adapt_fixed) / (float) n_route / adapt_scale, 500.0f), 500000.0f);
                 const float cur = plan->route_ns_live > 0.0f ? plan->route_ns_live : adapt_route0;
                 plan->route_ns_live = cur + (smp - cur) * 0.0625f;
                 plan->stat_adapt += 1;
@@ -11354,6 +11396,12 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
         args.cs_route_ns = g_cs_route_ns;
         args.cs_adapt = g_cs_adapt;
         args.cs_fixed_ns = g_cs_fixed_ns;
+        args.cs_adapt_scale = 1.0f;
+        if (L < (int) session.cs_route_l.size() && session.cs_route_l[L] > 0.0f) {   // AIPFIX per-type probe
+            args.cs_route_ns = session.cs_route_l[L];
+            args.cs_fixed_ns = session.cs_fixed_l[L];
+            args.cs_adapt_scale = g_cs_route_ns > 0.0f ? session.cs_route_l[L] / g_cs_route_ns : 1.0f;
+        }
         args.cs_ns_per_byte = g_cs_ns_per_byte;
         for (int j = 0; j < 3; ++j) { args.cs_bytes[j] = (float) moe_missjoin_copy_bytes(*group[j]); }
         args.cs_max_exp = g_cs_max_exp;
@@ -12771,11 +12819,15 @@ static bool moe_cache_device_compute(ggml_backend_cuda_context & ctx, ggml_tenso
         CUDA_CHECK(cudaGetLastError());
         if (cs && table.mj_kind == 2) {
             GGML_ASSERT(op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float));
+            // AIPFIX per-type probe: this layer's fixed cost, and its route cost relative to the reference
+            const int csl = table.mj_layer;
+            const bool own = csl >= 0 && csl < (int) session.cs_route_l.size() && session.cs_route_l[csl] > 0.0f && g_cs_route_ns > 0.0f;
             moe_cs_join_kernel<<<g_cs_max_route, 128, 0, ctx.stream()>>>(g_cs_plan, g_cs_job_d, g_cs_out_d,
                     g_cs_out_stride, (char *) op->data, op->nb[1], op->nb[2], (int) ids->ne[0], (int) op->ne[0],
-                    g_cs_adapt ? g_cs_route_ns : 0.0f, g_cs_fixed_ns,
+                    g_cs_adapt ? g_cs_route_ns : 0.0f, own ? session.cs_fixed_l[csl] : g_cs_fixed_ns,
                     bank ? (const int32_t *) bank->src[2]->data : nullptr,
-                    bank ? bank->src[2]->nb[1]/sizeof(int32_t) : 0);
+                    bank ? bank->src[2]->nb[1]/sizeof(int32_t) : 0,
+                    own ? session.cs_route_l[csl] / g_cs_route_ns : 1.0f);
             CUDA_CHECK(cudaGetLastError());
             session.cs_layer = -1;
         }

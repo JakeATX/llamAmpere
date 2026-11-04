@@ -1705,6 +1705,25 @@ static bool moe_cs_probe_layer(int layer, double * route_ns, double * fixed_ns) 
     return true;
 }
 
+// AIPFIX per-type probe (GGML_MOE_CPU_SPLIT_PROBE_PER_TYPE=1): the host types a registered layer computes with, and a
+// probe of that layer alone (pool idle, as moe_cs_probe).
+bool moe_cs_layer_types(int layer, int types[3]) {
+    pool_state & s = P();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (layer < 0 || layer >= (int) s.layers.size() || !s.layers[layer].ok) { return false; }
+    for (int k = 0; k < 3; ++k) { types[k] = s.layers[layer].role[k].r.type; }
+    return true;
+}
+
+bool moe_cs_probe_at(int layer, double * route_ns, double * fixed_ns) {
+    pool_state & s = P();
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (!s.running || layer < 0 || layer >= (int) s.layers.size() || !s.layers[layer].ok) { return false; }
+    }
+    return moe_cs_probe_layer(layer, route_ns, fixed_ns);
+}
+
 bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int reps, double * ns_per_job,
         double phase_ns[4]) {
     pool_state & s = P();
