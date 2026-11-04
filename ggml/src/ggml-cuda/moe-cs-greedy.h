@@ -62,8 +62,8 @@ MOE_CS_HD int moe_cs_greedy(const moe_cs_greedy_cfg & c, float gpu, int ncand, c
     return ne;
 }
 
-#if !defined(__CUDA_ARCH__)
-// AIPFIX per-type probe: one probe per distinct host type triple (up, gate, down) among the registered layers;
+// AIPFIX per-type probe (host-only template; no __CUDA_ARCH__ guard: nvcc's device pass must still see the name)
+// One probe per distinct host type triple (up, gate, down) among the registered layers;
 // each layer gets its own triple's cost. key[l] = {-1,-1,-1} for unregistered layers (cost left at 0). `probe(l, &r, &f)`
 // times layer l (false = failed: that triple falls back to the global cost). `known` carries probes across sessions.
 // Returns the number of new probes run.
@@ -87,4 +87,3 @@ int moe_cs_type_costs(const std::vector<std::array<int, 3>> & key, Probe probe, 
     }
     return probes;
 }
-#endif
