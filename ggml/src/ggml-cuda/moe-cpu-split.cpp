@@ -1559,6 +1559,8 @@ static double moe_cs_runq_wait_ns() {
 #endif
 }
 
+static bool moe_cs_probe_layer(int layer, double * route_ns, double * fixed_ns);
+
 bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     pool_state & s = P();
     int layer = -1;
@@ -1570,6 +1572,28 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
         }
     }
     if (layer < 0) { return false; }
+    const bool ok = moe_cs_probe_layer(layer, route_ns, fixed_ns);
+    // AIPFAST: GGML_MOE_CPU_SPLIT_PROBE_LAYERS=20,31 also probes those layers (log only; the planner keeps the first
+    // probe), e.g. to time host misses of an AI+ layer next to a 3XS one in the same process.
+    if (const char * e = getenv("GGML_MOE_CPU_SPLIT_PROBE_LAYERS")) {
+        for (const char * c = e; *c; ) {
+            const int l = atoi(c);
+            bool usable;
+            {
+                std::lock_guard<std::mutex> lock(s.mu);
+                usable = l >= 0 && l < (int) s.layers.size() && s.layers[l].ok;
+            }
+            double r = 0.0, f = 0.0;
+            if (!usable || !moe_cs_probe_layer(l, &r, &f)) { fprintf(stderr, "[moe-cpu-split] extra probe on layer %d: not available\n", l); }
+            while (*c && *c != ',') { ++c; }
+            if (*c == ',') { ++c; }
+        }
+    }
+    return ok;
+}
+
+static bool moe_cs_probe_layer(int layer, double * route_ns, double * fixed_ns) {
+    pool_state & s = P();
     const layer_math & L = s.layers[layer];
     // Experts with a host source; the probe reads real weights. Enough of them (64 x ~2 MB) that the rotation
     // below reads from memory, not from the last-level cache, as a decode's missed experts do.

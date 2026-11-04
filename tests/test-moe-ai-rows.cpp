@@ -59,11 +59,16 @@ int main(int argc, char ** argv) {
                         const uint32_t * wd = (const uint32_t *) (w.data() + sl * AI4_TR * row_bytes + u * ub + AI4U_SCALE_BYTES);
                         for (int ct = 0; ct < AI4U_UK / AI4_TC; ++ct) {
                             moe_ai::tile_bytes(wd + ct * tw, k, ext);
+                            uint32_t E[AIK_TILE_WORDS(5) + 3];
+                            moe_ai::tile_words(wd + ct * tw, k, E);
+                            // AIPFAST: the word window must equal the old byte-stream read at every byte offset used
+                            for (int B = 0; B + 8 <= 4 * tw + 12; ++B) { bad += moe_ai::window64(E, B) != moe_ai::load_be64(ext + B); }
                             for (int r = 0; r < AI4_TR; ++r) {
                                 int lev[8];
                                 float got[8];
-                                moe_ai::row_levels_scalar(ext, k, C, r, lev);
-                                _mm256_storeu_ps(got, moe_ai::row_levels_avx2(ext, k, C, r));
+                                moe_ai::row_levels_scalar(E, k, C, r, lev);
+                                for (int kk = 0; kk < 8; ++kk) { bad += lev[kk] != aik_level_n(wd + ct * tw, k, C, r * AI4_TC + kk); }
+                                _mm256_storeu_ps(got, moe_ai::row_levels_avx2(E, k, C, r));
                                 for (int kk = 0; kk < 8; ++kk) { bad += got[kk] != (float) lev[kk]; }
                             }
                         }

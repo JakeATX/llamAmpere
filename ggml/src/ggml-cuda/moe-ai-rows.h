@@ -47,10 +47,28 @@ static inline uint64_t load_be64(const uint8_t * p) {
     return __builtin_bswap64(v);
 }
 
+// AIPFAST: the same circular stream as tile_bytes, kept as 32-bit words: E[0] = last word, E[1..nw] = the tile,
+// E[nw+1..nw+2] = its first two words again. window64(E, B) equals load_be64(ext + B) for that tile's ext. Reading
+// whole words avoids the byte stores + 8-byte reload of tile_bytes, which x86 cannot forward from the store buffer
+// (the reload waited for every byte store to retire, ~600 us per 640x2560 AIT2_U projection on the 9900X).
+static inline void tile_words(const uint32_t * wd, int k, uint32_t * E) {
+    const int nw = AIK_TILE_WORDS(k);
+    E[0] = wd[nw - 1];
+    memcpy(E + 1, wd, (size_t) nw * sizeof(uint32_t));
+    E[nw + 1] = wd[0];
+    E[nw + 2] = wd[1 % nw];
+}
+
+static inline uint64_t window64(const uint32_t * E, int B) {
+    const int j = B >> 2, q = 8*(B & 3);
+    const uint64_t hi = ((uint64_t) E[j] << 32) | E[j + 1];
+    return (hi << q) | (((uint64_t) E[j + 2] << q) >> 32);
+}
+
 // levels of tile row r (weights n = 8r .. 8r + 7): state of n = the 16 stream bits ending at bit k*n + k
-static inline void row_levels_scalar(const uint8_t * ext, int k, uint32_t C, int r, int * lev) {
+static inline void row_levels_scalar(const uint32_t * E, int k, uint32_t C, int r, int * lev) {
     const int b = k*8*r + k - 16 + 32;  // first state's first bit, shifted by the 32-bit front pad
-    const uint64_t w = load_be64(ext + (b >> 3));
+    const uint64_t w = window64(E, b >> 3);
     const int off = b & 7;
     for (int kk = 0; kk < 8; ++kk) {
         const uint32_t st = (uint32_t) (w >> (64 - 16 - off - k*kk)) & 0xFFFFu;
@@ -62,10 +80,10 @@ static inline void row_levels_scalar(const uint8_t * ext, int k, uint32_t C, int
 // 8 levels in one 32-bit lane each: even levels from one 64-bit shift, odd ones from another moved up 32 bits,
 // state * C in 32-bit lanes, byte sum by two pairwise adds, ((sum + 2) >> 2) - 128 as (sum - 510) >> 2 (512 = 4 * 128).
 // Same integer levels as aik_level_c, so the dot products are unchanged.
-static inline __m256 row_levels_avx2(const uint8_t * ext, int k, uint32_t C, int r) {
+static inline __m256 row_levels_avx2(const uint32_t * E, int k, uint32_t C, int r) {
     const int b = k*8*r + k - 16 + 32;
     const int off = b & 7;
-    const __m256i w = _mm256_set1_epi64x((long long) load_be64(ext + (b >> 3)));
+    const __m256i w = _mm256_set1_epi64x((long long) window64(E, b >> 3));
     const int s0 = 48 - off;
     const __m256i sh_ev = _mm256_setr_epi64x(s0, s0 - 2*k, s0 - 4*k, s0 - 6*k);
     const __m256i sh_od = _mm256_setr_epi64x(s0 - k, s0 - 3*k, s0 - 5*k, s0 - 7*k);
@@ -100,11 +118,11 @@ static bool has_avx512() {
     return on;
 }
 
-MOE_AI_T512 static inline __m512 row2_levels_512(const uint8_t * ext, int k, uint32_t C, int r) {
+MOE_AI_T512 static inline __m512 row2_levels_512(const uint32_t * E, int k, uint32_t C, int r) {
     const int b = k*8*r + k - 16 + 32;
     const int off = b & 7;
-    const __m512i w = _mm512_inserti64x4(_mm512_set1_epi64((long long) load_be64(ext + (b >> 3))),
-                                         _mm256_set1_epi64x((long long) load_be64(ext + (b >> 3) + k)), 1);
+    const __m512i w = _mm512_inserti64x4(_mm512_set1_epi64((long long) window64(E, b >> 3)),
+                                         _mm256_set1_epi64x((long long) window64(E, (b >> 3) + k)), 1);
     const long long s0 = 48 - off;
     const __m512i sh_ev = _mm512_setr_epi64(s0, s0 - 2*k, s0 - 4*k, s0 - 6*k, s0, s0 - 2*k, s0 - 4*k, s0 - 6*k);
     const __m512i sh_od = _mm512_setr_epi64(s0 - k, s0 - 3*k, s0 - 5*k, s0 - 7*k, s0 - k, s0 - 3*k, s0 - 5*k, s0 - 7*k);
@@ -123,18 +141,18 @@ MOE_AI_T512 static void unit_rows_512(const uint8_t * blk, int k, uint32_t C, in
     const uint16_t * dh = (const uint16_t *) blk;
     const uint32_t * wd = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
     const int tw = AIK_TILE_WORDS(k);
-    uint8_t ext[12 + 16*5 + 4];
+    uint32_t E[AIK_TILE_WORDS(5) + 3];
     __m512 part[8][AI4_TR/2];
     for (int t = 0; t < nt; ++t) { for (int r = 0; r < AI4_TR/2; ++r) { part[t][r] = _mm512_setzero_ps(); } }
     for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
-        tile_bytes(wd + ct*tw, k, ext);
+        tile_words(wd + ct*tw, k, E);
         __m512 yv[8];
         for (int t = 0; t < nt; ++t) {
             const __m512 h = _mm512_castps256_ps512(_mm256_loadu_ps(y[t] + koff + ct*AI4_TC));
             yv[t] = _mm512_shuffle_f32x4(h, h, 0x44);
         }
         for (int r = 0; r < AI4_TR/2; ++r) {
-            const __m512 lev = row2_levels_512(ext, k, C, 2*r);
+            const __m512 lev = row2_levels_512(E, k, C, 2*r);
             for (int t = 0; t < nt; ++t) { part[t][r] = _mm512_fmadd_ps(lev, yv[t], part[t][r]); }
         }
     }
@@ -156,7 +174,7 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
     const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
     const int ub = AI4U_UNIT_BYTES(k), tw = AIK_TILE_WORDS(k);
     float acc[8][AI4_TR] = {};
-    uint8_t ext[12 + 16*5 + 4];  // k <= 5
+    uint32_t E[AIK_TILE_WORDS(5) + 3];  // k <= 5
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
         const uint8_t  * blk = slab + u*ub;
         const uint16_t * dh  = (const uint16_t *) blk;
@@ -170,11 +188,11 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
             __m256 part[8][AI4_TR];
             for (int t = 0; t < nt; ++t) { for (int r = 0; r < AI4_TR; ++r) { part[t][r] = _mm256_setzero_ps(); } }
             for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
-                tile_bytes(wd + ct*tw, k, ext);
+                tile_words(wd + ct*tw, k, E);
                 __m256 yv[8];
                 for (int t = 0; t < nt; ++t) { yv[t] = _mm256_loadu_ps(y[t] + u*AI4U_UK + ct*AI4_TC); }
                 for (int r = 0; r < AI4_TR; ++r) {
-                    const __m256 lev = row_levels_avx2(ext, k, C, r);
+                    const __m256 lev = row_levels_avx2(E, k, C, r);
                     for (int t = 0; t < nt; ++t) { part[t][r] = _mm256_fmadd_ps(lev, yv[t], part[t][r]); }
                 }
             }
@@ -190,8 +208,8 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
             for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
                 int lev[8];
                 if (C != 0) {
-                    tile_bytes(wd + ct*tw, k, ext);
-                    row_levels_scalar(ext, k, C, r, lev);
+                    tile_words(wd + ct*tw, k, E);
+                    row_levels_scalar(E, k, C, r, lev);
                 } else {
                     for (int kk = 0; kk < 8; ++kk) { lev[kk] = aik_level_n(wd + ct*tw, k, 0, r*AI4_TC + kk); }
                 }
