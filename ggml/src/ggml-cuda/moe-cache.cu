@@ -117,6 +117,9 @@ static int moe_miss_list_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_MOE_MISS_LIST");
         if (!e) { return 0; }
+        // auto (the Flash-Next default): on, except for a layer whose experts have an AI+ bank (a timing race with
+        // the bank copy makes the answer differ from run to run there; 3XS output is the same either way)
+        if (strcmp(e, "auto") == 0) { return 3; }
         return strcmp(e, "check") == 0 ? 2 : atoi(e) != 0 ? 1 : 0;
     }();
     return mode;
@@ -11376,7 +11379,9 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
             group[2]->desc.n_out <= (int64_t) g_cs_out_stride;
     session.cs_layer = cs ? L : -1;
     // fork MOEGAP MISSLIST
-    const bool ml = moe_miss_list_mode() != 0 && fast && routes <= MOE_MISS_LIST_MAX && g_hf_miss;
+    const int ml_mode = moe_miss_list_mode();
+    const bool ml = ml_mode != 0 && (ml_mode != 3 || !ggml_moe_bank_lookup(group[0]->desc.data)) &&
+            fast && routes <= MOE_MISS_LIST_MAX && g_hf_miss;
     session.ml_layer = ml ? L : -1;
     if (ml) { args.miss = g_hf_miss; }
     session.pc_layer = -1;

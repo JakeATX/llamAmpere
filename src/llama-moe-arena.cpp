@@ -583,6 +583,24 @@ void llama_moe_arena_apply_flashnext_defaults() {
         { "GGML_MOE_CPU_SPLIT_Q8_REUSE",           "1" },
         { "GGML_MOE_CPU_SPLIT_DOWN_REUSE",         "1" },
         { "GGML_CUDA_GRAPH_NODE_PRIORITY",        "1" },   // scheduling only: hit-first copies overlap the matrix-vector product
+        // expert kernels that every speed measurement ran with (each also takes =check, which runs the old path next
+        // to the new one and stops on any bit difference; =0 turns one off). AI23_*: AI+ banked experts only.
+        { "GGML_MOE_HIT_FUSED",                   "1" },
+        { "GGML_MOE_MISS_LIST",                   "1" },      // as measured; "auto" keeps it off on AI+ bank layers
+        { "GGML_MOE_DOWN_SW",                     "1" },
+        { "GGML_MOE_Q8_SHARE",                    "1" },
+        { "GGML_MOE_PLAN_COUNT",                  "1" },
+        { "GGML_CUDA_HC_UP_Q8",                   "1" },
+        { "GGML_CUDA_KQ_ROWS",                    "1" },
+        { "GGML_CUDA_AI23_ID_REF",                "0" },
+        { "GGML_CUDA_AI23_DIRECT",                "6" },
+        { "GGML_CUDA_AI23_VERIFY_COMPACT",        "0" },
+        // prompt memory handling the measured runs used
+        { "LLAMA_B1_LEND_SCRATCH",                "1" },
+        { "LLAMA_B1_REPLAN",                      "1" },
+        { "LLAMA_B1_MALLOC_TRIM",                 "1" },
+        { "LLAMA_MALLOC_TRIM",                    "1" },
+        { "LLAMA_QSA_POOL_COMPACT",               "1" },
         // fork: short prompts need a checkpoint before the restore-grid boundary for prefix reuse.
         { "LLAMA_SJKVARN_EXACT_CKPT",              "1" },
         // helper (MTP) memory and launch savings
