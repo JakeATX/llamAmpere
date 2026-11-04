@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
+#include <utility>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -191,6 +193,177 @@ static inline float hsum8(__m256 v) {
     return _mm_cvtss_f32(a);
 }
 
+// AIPFIX: AVX2 direct decode (default AVX2 path, e.g. the Zen 3 home host). row_levels_shuf's two 16-byte lane loads
+// come from a per-tile tile_words copy: a memcpy of k-dependent size plus loads that span several of its 4-byte stores,
+// which x86 cannot forward from the store buffer. Here all 24 stream bytes a tile row needs lie in 4 consecutive E words
+// E[S..S+3] (S fixed per rate k and row r, both compile-time), so each row does ONE 16-byte load broadcast to both
+// lanes, straight from the tile in the weight buffer (E word j = tile word j - 1), and vpshufb picks each state's
+// 3 bytes from it. Only row 0 (S = 0, E[0..3] == E[nw..nw+3]) and row 15 (S = nw - 2) touch the circular wrap; their
+// windows are cut once per tile from the tile's first and last 4 words with one alignr each. No read leaves the tile.
+// Rows run in groups sized so the accumulators stay in registers; every (token, row) still sums tiles 0..15 in order
+// with the same FMA and the same integer levels, so outputs are bit-identical to the shuffle path (the test checks).
+// GGML_MOE_AI_HOST_ROWWIN=0 keeps the shuffle path.
+static constexpr int direct_word(int k, int r, int kk, int i) {   // E word holding byte i (0 = lowest) of state kk's lane
+    return (k*r + 2 + ((k*(kk + 1)) >> 3) + 2 - i) >> 2;
+}
+
+static constexpr int direct_lo(int k, int r) {
+    int lo = 1 << 20;
+    for (int kk = 0; kk < 8; ++kk) { for (int i = 0; i < 3; ++i) { lo = direct_word(k, r, kk, i) < lo ? direct_word(k, r, kk, i) : lo; } }
+    return lo;
+}
+
+static constexpr int direct_hi(int k, int r) {
+    int hi = 0;
+    for (int kk = 0; kk < 8; ++kk) { for (int i = 0; i < 3; ++i) { hi = direct_word(k, r, kk, i) > hi ? direct_word(k, r, kk, i) : hi; } }
+    return hi;
+}
+
+// first E word S of row r's 4-word window
+static constexpr int direct_S(int k, int r) {
+    const int nw = AIK_TILE_WORDS(k), lo = direct_lo(k, r), hi = direct_hi(k, r);
+    if (lo >= 1 && hi <= nw) { return lo < nw - 3 ? lo : nw - 3; }   // inside the tile: load tile words S-1 .. S+2
+    return lo == 0 ? 0 : hi - 3;                                       // wrap: S = 0 or nw-2 / nw-1
+}
+
+// window source: >= 0 = tile word offset of the 16-byte load; -m (m = 1..3) = alignr(first4, last4, 4m) = E[nw-3+m ..]
+static constexpr int direct_src(int k, int r) {
+    const int nw = AIK_TILE_WORDS(k), S = direct_S(k, r);
+    if (S >= 1 && S <= nw - 3) { return S - 1; }
+    return -(S == 0 ? 3 : S - nw + 3);
+}
+
+struct direct_tabs {
+    alignas(32) uint8_t idx[6][AI4_TR][32];   // per lane: window byte of each state byte (0x80 = zero)
+    bool ok = true;                           // layout self-check (every row fits its window; wrap rows as above)
+    direct_tabs() {
+        memset(idx, 0x80, sizeof(idx));
+        for (int k = 2; k <= 5; ++k) {
+            const int nw = AIK_TILE_WORDS(k);
+            for (int r = 0; r < AI4_TR; ++r) {
+                const int S = direct_S(k, r), src = direct_src(k, r), Sc = S == 0 ? 0 : S;
+                ok = ok && direct_hi(k, r) - direct_lo(k, r) <= 3 && direct_lo(k, r) >= Sc && direct_hi(k, r) <= Sc + 3 &&
+                     (src >= 0 ? src + 4 <= nw : (src >= -3 && (S == 0 || S == nw - 3 - src)));
+                for (int kk = 0; kk < 8; ++kk) {
+                    const int m0 = (k*(kk + 1)) >> 3;
+                    uint8_t * d = idx[k][r] + 16*(kk >> 2) + 4*(kk & 3);
+                    for (int i = 0; i < 3; ++i) {                    // lane byte i = window byte m0 + 2 - i
+                        const int P = k*r + 2 + m0 + 2 - i;
+                        d[i] = (uint8_t) (4*((P >> 2) - Sc) + 3 - (P & 3));
+                    }
+                }
+            }
+        }
+    }
+};
+
+static const direct_tabs & direct_tables() {
+    static const direct_tabs T;
+    return T;
+}
+
+static bool use_rowwin() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_MOE_AI_HOST_ROWWIN");
+        return !(e && e[0] == '0') && direct_tables().ok;
+    }();
+    return on;
+}
+
+template <int K, int R>
+static inline __attribute__((always_inline)) __m256 row_levels_direct(const uint32_t * wt, __m128i f4, __m128i l4,
+                                                                      const direct_tabs & T, __m256i sh, __m256i Cv) {
+    constexpr int src = direct_src(K, R);
+    __m256i v;
+    if constexpr (src >= 0) {
+        v = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (wt + src)));
+    } else {
+        v = _mm256_broadcastsi128_si256(_mm_alignr_epi8(f4, l4, -4*src));
+    }
+    v = _mm256_shuffle_epi8(v, _mm256_load_si256((const __m256i *) T.idx[K][R]));
+    v = _mm256_and_si256(_mm256_srlv_epi32(v, sh), _mm256_set1_epi32(0xFFFF));
+    v = _mm256_mullo_epi32(v, Cv);
+    v = _mm256_madd_epi16(_mm256_maddubs_epi16(v, _mm256_set1_epi8(1)), _mm256_set1_epi16(1));
+    v = _mm256_srai_epi32(_mm256_sub_epi32(v, _mm256_set1_epi32(510)), 2);
+    return _mm256_cvtepi32_ps(v);
+}
+
+template <int K, int NT, int G, int R0, size_t... I>
+static inline __attribute__((always_inline)) void direct_rows(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
+                                                              __m256i sh, __m256i Cv, const __m256 (&yv)[NT],
+                                                              __m256 (&part)[NT][G], std::index_sequence<I...>) {
+    auto row = [&](auto gi) {
+        constexpr int g = decltype(gi)::value;
+        const __m256 lev = row_levels_direct<K, R0 + g>(wt, f4, l4, T, sh, Cv);
+        for (int t = 0; t < NT; ++t) { part[t][g] = _mm256_fmadd_ps(lev, yv[t], part[t][g]); }
+    };
+    (row(std::integral_constant<int, (int) I>{}), ...);
+}
+
+template <int K, int NT, int G, int R0>
+static inline __attribute__((always_inline)) void direct_group(const uint8_t * blk, const float * const * y, int64_t koff,
+                                                               __m256i Cv, float (*acc)[AI4_TR]) {
+    constexpr int tw = AIK_TILE_WORDS(K);
+    const direct_tabs & T = direct_tables();
+    const __m256i sh = _mm256_loadu_si256((const __m256i *) shuf_tables().sh[K]);
+    const uint32_t * wd = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
+    __m256 part[NT][G];
+    for (int t = 0; t < NT; ++t) { for (int g = 0; g < G; ++g) { part[t][g] = _mm256_setzero_ps(); } }
+    for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
+        const uint32_t * wt = wd + ct*tw;
+        const __m128i f4 = _mm_loadu_si128((const __m128i *) wt), l4 = _mm_loadu_si128((const __m128i *) (wt + tw - 4));
+        __m256 yv[NT];
+        for (int t = 0; t < NT; ++t) { yv[t] = _mm256_loadu_ps(y[t] + koff + ct*AI4_TC); }
+        direct_rows<K, NT, G, R0>(wt, f4, l4, T, sh, Cv, yv, part, std::make_index_sequence<G>{});
+    }
+    const uint16_t * dh = (const uint16_t *) blk;
+    for (int g = 0; g < G; ++g) {
+        const float d = ai4_fp16_to_fp32(dh[R0 + g]);
+        for (int t = 0; t < NT; ++t) { acc[t][R0 + g] = __builtin_fmaf(d, hsum8(part[t][g]), acc[t][R0 + g]); }
+    }
+}
+
+// one unit (16 rows x 128 K): acc[t][r] += scale_r * (row r . y_t), rows in groups of G (NT * G accumulators <= 8)
+template <int K, int NT, size_t... J>
+static void unit_rows_direct_impl(const uint8_t * blk, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR],
+                                  std::index_sequence<J...>) {
+    constexpr int G = AI4_TR/(int) sizeof...(J);
+    (direct_group<K, NT, G, (int) J*G>(blk, y, koff, Cv, acc), ...);
+}
+
+template <int K, int NT>
+static void unit_rows_direct_nt(const uint8_t * blk, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR]) {
+    constexpr int G = NT == 1 ? 8 : NT == 2 ? 4 : NT <= 4 ? 2 : 1;
+    unit_rows_direct_impl<K, NT>(blk, y, koff, Cv, acc, std::make_index_sequence<AI4_TR/G>{});
+}
+
+template <int K>
+static void unit_rows_direct_k(const uint8_t * blk, int nt, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR]) {
+    switch (nt) {
+        case 1:  unit_rows_direct_nt<K, 1>(blk, y, koff, Cv, acc); break;
+        case 2:  unit_rows_direct_nt<K, 2>(blk, y, koff, Cv, acc); break;
+        case 3:  unit_rows_direct_nt<K, 3>(blk, y, koff, Cv, acc); break;
+        case 4:  unit_rows_direct_nt<K, 4>(blk, y, koff, Cv, acc); break;
+        case 5:  unit_rows_direct_nt<K, 5>(blk, y, koff, Cv, acc); break;
+        case 6:  unit_rows_direct_nt<K, 6>(blk, y, koff, Cv, acc); break;
+        case 7:  unit_rows_direct_nt<K, 7>(blk, y, koff, Cv, acc); break;
+        default: unit_rows_direct_nt<K, 8>(blk, y, koff, Cv, acc); break;
+    }
+}
+
+// k in 2..5; returns false (nothing done) for other rates
+static bool unit_rows_direct(const uint8_t * blk, int k, uint32_t C, int nt, const float * const * y, int64_t koff,
+                             float (*acc)[AI4_TR]) {
+    const __m256i Cv = _mm256_set1_epi32((int) C);
+    switch (k) {
+        case 2: unit_rows_direct_k<2>(blk, nt, y, koff, Cv, acc); return true;
+        case 3: unit_rows_direct_k<3>(blk, nt, y, koff, Cv, acc); return true;
+        case 4: unit_rows_direct_k<4>(blk, nt, y, koff, Cv, acc); return true;
+        case 5: unit_rows_direct_k<5>(blk, nt, y, koff, Cv, acc); return true;
+        default: return false;
+    }
+}
+
 // AVX-512 (Zen 4/5 hosts, runtime-dispatched; the build targets Zen 3): tile rows r and r + 1 in one 512-bit decode.
 // Row r + 1 starts k bytes after row r at the same bit offset. Per row the lanes, FMA order and final sum are the
 // AVX2 path's, so the results are bit-identical to it.
@@ -356,7 +529,9 @@ MOE_AI_T512V static void unit_rows_512_vbmi(const uint8_t * blk, int k, uint32_t
 // path: -1 = best available (VBMI if present, else AVX2), 0 = AVX2 (or scalar), 1 = AVX-512 (VBMI decode when the host has it),
 // 2 = AVX-512 without VBMI,
 // 3 = AVX2 with the old window decode (row_levels_avx2; test reference), 4 = AVX2 shuffle reading every lane from E
-// (the shuffle decode before direct lane loads; GGML_MOE_AI_HOST_DIRECT=0 makes it the default)
+// (the shuffle decode before direct lane loads; GGML_MOE_AI_HOST_DIRECT=0 makes it the shuffle fallback),
+// 5 = AVX2 row-window decode (unit_rows_direct: one 16-byte load per row, register-grouped rows; the default AVX2 path
+// unless GGML_MOE_AI_HOST_ROWWIN=0, which falls back to path 0 = shuffle with direct interior lane loads)
 static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                       const float * const * y, float * const * o, int path = -1) {
     const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
@@ -373,6 +548,9 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
         if (C != 0 && (path == 1 || path == 2 || (path == -1 && has_vbmi())) && has_avx512()) {
             if (path != 2 && has_vbmi()) { unit_rows_512_vbmi(blk, k, C, nt, y, u*AI4U_UK, acc); }
             else { unit_rows_512(blk, k, C, nt, y, u*AI4U_UK, acc); }
+            continue;
+        }
+        if (C != 0 && (path == 5 || (path == -1 && use_rowwin())) && unit_rows_direct(blk, k, C, nt, y, u*AI4U_UK, acc)) {
             continue;
         }
         if (C != 0) {

@@ -115,9 +115,11 @@ int main(int argc, char ** argv) {
                 run();
 #if defined(__AVX2__) && defined(__FMA__)
                 {
-                    // AIPFAST: AVX2 shuffle decode with direct lane loads (path 0), the shuffle decode reading E (path 4) and
-                    // the old AVX2 window decode (path 3): all bit-identical, all timed (order 0 4 3 3 4 0)
-                    std::vector<float> oa((size_t) nt * M), ob((size_t) nt * M), oc((size_t) nt * M);
+                    // AVX2 decodes, all bit-identical, all timed (order 5 0 4 3 3 4 0 5): row-window decode (path 5, AIPFIX),
+                    // shuffle with direct lane loads (path 0, AIPFAST), shuffle reading E (path 4), old window decode (path 3)
+                    constexpr int NP = 4;
+                    const int ps[NP] = { 5, 0, 4, 3 };
+                    std::vector<float> ov[NP];
                     auto run_p = [&](std::vector<float> & o, int p) {
                         float * opx[8];
                         for (int64_t a = 0; a < M; a += AI4_TR) {
@@ -125,26 +127,25 @@ int main(int argc, char ** argv) {
                             moe_ai::slab_rows((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, yp, opx, p);
                         }
                     };
-                    run_p(oa, 0);
-                    run_p(ob, 3);
-                    run_p(oc, 4);
-                    const bool same = memcmp(oa.data(), ob.data(), oa.size() * sizeof(float)) == 0 &&
-                                      memcmp(oc.data(), ob.data(), oc.size() * sizeof(float)) == 0;
+                    bool same = true;
+                    for (int j = 0; j < NP; ++j) {
+                        ov[j].assign((size_t) nt * M, 0.0f);
+                        run_p(ov[j], ps[j]);
+                        same = same && memcmp(ov[j].data(), ov[0].data(), ov[j].size() * sizeof(float)) == 0;
+                    }
                     fails += !same;
-                    const int ps[3] = { 0, 4, 3 };
-                    std::vector<float> * os[3] = { &oa, &oc, &ob };
-                    double us[3] = {};
+                    double us[NP] = {};
                     for (int rep = 0; rep < 2; ++rep) {
-                        for (int j = 0; j < 3; ++j) {
-                            const int q = rep ? 2 - j : j;
+                        for (int j = 0; j < NP; ++j) {
+                            const int q = rep ? NP - 1 - j : j;
                             const auto ta = std::chrono::steady_clock::now();
-                            for (int i = 0; i < reps; ++i) { run_p(*os[q], ps[q]); }
+                            for (int i = 0; i < reps; ++i) { run_p(ov[q], ps[q]); }
                             us[q] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ta).count() / (2.0 * reps);
                         }
                     }
-                    printf("%-8s K=%5lld M=%5lld nt=%d  AVX2 direct/shuf/old: %s  direct %.1f us  shuf %.1f us  old %.1f us /projection (1 thread)\n",
+                    printf("%-8s K=%5lld M=%5lld nt=%d  AVX2 rowwin/direct/shuf/old: %s  rowwin %.1f us  direct %.1f us  shuf %.1f us  old %.1f us /projection (1 thread)\n",
                            ggml_type_name(type), (long long) K, (long long) M, nt, same ? "bit-identical OK" : "DIFFERENT FAIL",
-                           us[0], us[1], us[2]);
+                           us[0], us[1], us[2], us[3]);
                 }
                 if (moe_ai::has_avx512()) {
                     // the AVX-512 path must equal the AVX2 path bit for bit
