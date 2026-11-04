@@ -80,7 +80,7 @@ bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_e
 // host miss reads the disk; layers past the budget keep the AI+ decode. Same answer on re-registration.
 // GGML_MOE_CPU_SPLIT_HOST_FIT=0 keeps every layer (the old behavior). Only kept layers are warmed.
 bool moe_cs_host_alt_keep(int layer, const char * const names[3]);
-// Once after registration: madvise(WILLNEED) the found tensors in layer order while MemAvailable stays above 7 GiB
+// Once after registration: madvise(WILLNEED) the found tensors in layer order while MemAvailable stays above 5 GiB
 // (GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB, min 5; GGML_MOE_CPU_SPLIT_HOST_WARM=0 skips). Logs warmed vs cold GiB;
 // returns the GiB queued.
 double moe_cs_host_alt_warm();
