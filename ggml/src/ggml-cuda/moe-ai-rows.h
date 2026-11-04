@@ -164,6 +164,20 @@ static inline int q8_nearest_int(float fval) {   // ggml nearest_int (round half
     return (i & 0x007fffff) - 0x00400000;
 }
 
+// q8_nearest_int(s*x) with the product and the 1.5*2^23 add in ONE rounding when the build has FMA. GCC contracts the
+// plain expression into an FMA on -mfma builds (fp-contract=fast; the shipped hq8 bytes were made that way), so this
+// spells it out and the AVX2 path below can match it bit for bit whatever the compiler decides to fuse.
+static inline int q8_nearest_int_mul(float s, float x) {
+#if defined(__FMA__)
+    const float val = __builtin_fmaf(s, x, 12582912.f);
+#else
+    const float val = s*x + 12582912.f;
+#endif
+    int i;
+    memcpy(&i, &val, sizeof(int));
+    return (i & 0x007fffff) - 0x00400000;
+}
+
 static inline uint16_t q8_fp32_to_fp16(float f) {   // ggml's portable fp32 -> fp16 (round to nearest even)
     auto to_bits = [](float x) { uint32_t u; memcpy(&u, &x, 4); return u; };
     auto from_bits = [](uint32_t u) { float x; memcpy(&x, &u, 4); return x; };
@@ -193,7 +207,7 @@ static void quant_q8_scalar(const float * y, void * vq, int64_t K) {
                 memset(q, 0, sizeof(q));
             } else {
                 const float iscale = -127.f/mx;
-                for (int j = 0; j < qb; ++j) { const int v = q8_nearest_int(iscale*x[j]); q[j] = (int8_t) (v < 127 ? v : 127); }
+                for (int j = 0; j < qb; ++j) { const int v = q8_nearest_int_mul(iscale, x[j]); q[j] = (int8_t) (v < 127 ? v : 127); }
                 d[b] = 1/iscale;
             }
         } else {
@@ -210,10 +224,10 @@ static void quant_q8_scalar(const float * y, void * vq, int64_t K) {
     }
 }
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) && defined(__FMA__)
 // AIPFAST: AVX2 quant_q8, bit-identical to quant_q8_scalar. Q8_K: the same first-largest |x| (vector max, then the
-// first index holding it), q = round-half-even(iscale * x) by _mm256_round_ps (what q8_nearest_int computes for
-// |v| < 2^22), clamped at 127. Q8_0: round-half-away(x * id) as trunc plus one step when |v - trunc| >= 0.5 (v - trunc
+// first index holding it), q = q8_nearest_int_mul(iscale, x) as one fused multiply-add per 8 lanes, clamped at 127.
+// Q8_0: round-half-away(x * id) as trunc plus one step when |v - trunc| >= 0.5 (v - trunc
 // is exact). Lane order of the int16 copy: packs(v, v) of 8 int32 levels gives x0..3 x0..3 | x4..7 x4..7.
 static inline void q8_store8(int16_t * o, __m256i v) {
     _mm256_storeu_si256((__m256i *) o, _mm256_packs_epi32(v, v));
@@ -242,11 +256,11 @@ static void quant_q8_avx2(const float * y, void * vq, int64_t K) {
             int jm = 0;
             while (__builtin_fabsf(x[jm]) != amax) { ++jm; }
             const float iscale = -127.f/x[jm];
-            const __m256 vs = _mm256_set1_ps(iscale);
-            const __m256i hi = _mm256_set1_epi32(127);
-            for (int j = 0; j < qb; j += 8) {
-                const __m256 v = _mm256_round_ps(_mm256_mul_ps(vs, _mm256_loadu_ps(x + j)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                q8_store8(o + 2*j, _mm256_min_epi32(_mm256_cvtps_epi32(v), hi));
+            const __m256 vs = _mm256_set1_ps(iscale), magic = _mm256_set1_ps(12582912.f);
+            const __m256i hi = _mm256_set1_epi32(127), man = _mm256_set1_epi32(0x007fffff), bias = _mm256_set1_epi32(0x00400000);
+            for (int j = 0; j < qb; j += 8) {   // q8_nearest_int_mul, 8 lanes: fma(s, x, 1.5*2^23), low mantissa bits - 2^22
+                const __m256i v = _mm256_castps_si256(_mm256_fmadd_ps(vs, _mm256_loadu_ps(x + j), magic));
+                q8_store8(o + 2*j, _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(v, man), bias), hi));
             }
             d[b] = 1/iscale;
         } else {
@@ -267,7 +281,7 @@ static void quant_q8_avx2(const float * y, void * vq, int64_t K) {
 #endif
 
 static void quant_q8(const float * y, void * vq, int64_t K) {
-#if defined(__AVX2__)
+#if defined(__AVX2__) && defined(__FMA__)
     if (rot_simd_on()) { quant_q8_avx2(y, vq, K); return; }
 #endif
     quant_q8_scalar(y, vq, K);

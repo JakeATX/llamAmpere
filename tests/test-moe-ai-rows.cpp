@@ -34,7 +34,7 @@ int main(int argc, char ** argv) {
     printf("path: scalar\n");
 #endif
     int fails = 0;
-#if defined(__AVX2__)
+#if defined(__AVX2__) && defined(__FMA__)
     {
         // AIPFAST: AVX2 rotate + quant_q8 == scalar bit for bit (random rows at several scales, rows with a tied largest
         // |x| of both signs, all-zero blocks, values on .5 steps), then timed per 2560/640-float row
