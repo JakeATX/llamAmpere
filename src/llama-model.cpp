@@ -2609,21 +2609,25 @@ void llama_model::register_moe_bank() {
         // so an expert may be computed from its cache slot in one run and from the just-copied path in another.
         // Both use the same weights; only the summation order differs, so reruns can differ in last-digit rounding
         // (quality unchanged). LLAMA_MOE_BANK_DET=1 selects the deterministic cache mode (GGML_MOE_CACHE_DET) with
-        // prompt queue limits that never bind, for identical reruns. Off by default to keep the timing-driven fill
-        // and its speed. Explicit GGML_* settings win.
+        // prompt queue limits that never bind, for identical reruns. It also selects GGML_MOE_BANK_P2_SAME=1 (copied
+        // routes run the same 3XS kernel as cached ones): with the miss-list kernel instead, reruns still differed
+        // (home dw1 identity, 11-04: P2_SAME=0 reruns diverged at token 71, P2_SAME=1 reruns 256/256 identical).
+        // Off by default to keep the timing-driven fill and its speed. Explicit GGML_* settings win.
         const char * bd = getenv("LLAMA_MOE_BANK_DET");
         if (bd && atoi(bd) != 0) {
 #ifdef _WIN32
             if (!getenv("GGML_MOE_CACHE_DET"))           { _putenv_s("GGML_MOE_CACHE_DET", "1"); }
             if (!getenv("GGML_CUDA_MOE_CACHE_QUEUE"))    { _putenv_s("GGML_CUDA_MOE_CACHE_QUEUE", "65536"); }
             if (!getenv("GGML_CUDA_MOE_CACHE_QUEUE_MB")) { _putenv_s("GGML_CUDA_MOE_CACHE_QUEUE_MB", "1024"); }
+            if (!getenv("GGML_MOE_BANK_P2_SAME"))        { _putenv_s("GGML_MOE_BANK_P2_SAME", "1"); }
 #else
             setenv("GGML_MOE_CACHE_DET", "1", 0);
             setenv("GGML_CUDA_MOE_CACHE_QUEUE", "65536", 0);
             setenv("GGML_CUDA_MOE_CACHE_QUEUE_MB", "1024", 0);
+            setenv("GGML_MOE_BANK_P2_SAME", "1", 0);
 #endif
-            LLAMA_LOG_INFO("[moe-bank] deterministic expert cache: det=%s queue=%s/%s MiB\n", getenv("GGML_MOE_CACHE_DET"),
-                    getenv("GGML_CUDA_MOE_CACHE_QUEUE"), getenv("GGML_CUDA_MOE_CACHE_QUEUE_MB"));
+            LLAMA_LOG_INFO("[moe-bank] deterministic expert cache: det=%s queue=%s/%s MiB p2_same=%s\n", getenv("GGML_MOE_CACHE_DET"),
+                    getenv("GGML_CUDA_MOE_CACHE_QUEUE"), getenv("GGML_CUDA_MOE_CACHE_QUEUE_MB"), getenv("GGML_MOE_BANK_P2_SAME"));
         } else {
             LLAMA_LOG_INFO("[moe-bank] bank: reruns may differ in last-digit rounding; LLAMA_MOE_BANK_DET=1 for identical reruns\n");
         }

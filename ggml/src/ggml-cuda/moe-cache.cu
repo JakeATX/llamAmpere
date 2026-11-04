@@ -167,7 +167,7 @@ static bool moe_bank_p1_hitg_down() {
 // kernel's phase 2 or the miss list. Then a route's bits do not depend on whether its expert was resident or copied
 // this step (the run-to-run split of the bank path: same input, different prompt-time cache fill, different tokens).
 // Default off (it did not make reruns identical, and it takes the copied routes away from P2LIST's miss-list
-// kernel); GGML_MOE_BANK_P2_SAME=1 opts in.
+// kernel); GGML_MOE_BANK_P2_SAME=1 opts in, and LLAMA_MOE_BANK_DET=1 (identical reruns) turns it on at model load.
 static bool moe_bank_p2_same() {
     static const bool v = [] {
         const char * e = getenv("GGML_MOE_BANK_P2_SAME");
