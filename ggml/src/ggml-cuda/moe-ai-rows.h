@@ -951,9 +951,9 @@ MOE_AI_T512Q static void unit_rows_q8v_nt(const uint8_t * blk, uint32_t C, const
     }
 }
 
-// row groups per pass: all four while the int32 accumulators (NT x GG zmm) leave room for the decode temporaries
+// row groups per pass: all four at 1-2 tokens, else two (Taichi 9900X: GG = 2 beat GG = 1 at nt = 8 by 16% gate/up, 26% down)
 #if !defined(MOE_AI_Q8V_GG)
-#define MOE_AI_Q8V_GG(NT) ((NT) <= 2 ? 4 : (NT) <= 5 ? 2 : 1)
+#define MOE_AI_Q8V_GG(NT) ((NT) <= 2 ? 4 : 2)
 #endif
 
 template <int KR, int ST>
