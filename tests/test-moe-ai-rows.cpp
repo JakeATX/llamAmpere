@@ -34,6 +34,17 @@ int main(int argc, char ** argv) {
     printf("path: scalar\n");
 #endif
     int fails = 0;
+    {
+        // AIPFAST: R8 RAM fit keeps the 5 GiB MemAvailable floor (asked size capped, auto = pct of the room, floor min 5)
+        const double G = 1073741824.0, M = 1048576.0;
+        struct { long long req; double avail, floor; int pct; double want; } c[] = {
+            { 6144, 16*G, 5, 50, 6144*M }, { 6144, 9*G, 5, 50, 4*G }, { 6144, 4*G, 5, 50, 0 }, { -1, 15*G, 5, 50, 5*G },
+            { -1, 15*G, 7, 100, 8*G }, { 6144, 16*G, 2, 50, 6144*M }, { 20000, 10*G, 1, 50, 5*G }, { -1, 5*G, 5, 50, 0 } };
+        int bad = 0;
+        for (const auto & t : c) { bad += moe_ai::r8_fit_bytes(t.req, t.avail, t.floor, t.pct) != (size_t) t.want; }
+        printf("r8 RAM fit: %d/%zu cases wrong  %s\n", bad, sizeof(c) / sizeof(c[0]), bad ? "FAIL" : "OK");
+        fails += bad != 0;
+    }
 #if defined(__AVX2__) && defined(__FMA__)
     {
         // AIPFAST: AVX2 rotate + quant_q8 == scalar bit for bit (random rows at several scales, rows with a tied largest

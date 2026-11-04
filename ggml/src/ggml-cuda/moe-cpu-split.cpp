@@ -39,6 +39,7 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <time.h>
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
@@ -557,6 +558,7 @@ struct pool_state {
     // posts host jobs, which never use the cache, so the planner's per-route cost stays the decode cost.
     struct r8_state {
         uint8_t * arena = nullptr;
+        size_t arena_bytes = 0;                  // mmap length of arena
         size_t slot = 0;
         int n = 0, n_expert = 0, head = -1, tail = -1;
         std::vector<int32_t> map, key, prv, nxt, pending;   // map: (layer*n_expert + e)*3 + role -> slot or -1
@@ -626,6 +628,16 @@ static void r8_touch(pool_state::r8_state & c, int sl) {   // move slot sl to th
     if (c.tail < 0) { c.tail = sl; }
 }
 
+static double r8_mem_avail() {   // MemAvailable in bytes (0 if unreadable)
+    long long kib = -1;
+    if (FILE * fp = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) { if (sscanf(line, "MemAvailable: %lld kB", &kib) == 1) { break; } }
+        fclose(fp);
+    }
+    return kib > 0 ? kib * 1024.0 : 0.0;
+}
+
 static bool r8_init(pool_state & s) {
     pool_state::r8_state & c = s.r8;
     s.r8_reset = false;
@@ -640,14 +652,29 @@ static bool r8_init(pool_state & s) {
         }
     }
     if (!slot) { fprintf(stderr, "[moe-cpu-split] r8 host cache: no AI+ host roles, off\n"); return false; }
-    const size_t n = std::min<size_t>(((size_t) s.r8_mb << 20) / slot, 1u << 24);
+    // RAM-aware fit: the cache is sized after load against MemAvailable minus the 5 GiB floor
+    // (GGML_MOE_AI_HOST_R8_FLOOR_GIB raises it; R8_MB=-1 = auto, GGML_MOE_AI_HOST_R8_PCT % of the room, default 50),
+    // and its pages are committed now (MAP_POPULATE; GGML_MOE_AI_HOST_R8_POPULATE=0 keeps them lazy) so the floor holds.
+    if (c.arena) { munmap(c.arena, c.arena_bytes); c.arena = nullptr; c.arena_bytes = 0; }
+    const double avail0 = r8_mem_avail();
+    const char * fe = getenv("GGML_MOE_AI_HOST_R8_FLOOR_GIB");
+    const double floor_gib = fe && fe[0] ? atof(fe) : 5.0;
+    const size_t fit = moe_ai::r8_fit_bytes(s.r8_mb, avail0, floor_gib, env_int("GGML_MOE_AI_HOST_R8_PCT", 50, 0, 100));
+    const size_t n = std::min<size_t>(fit / slot, 1u << 24);
     if (n < 3 * MOE_CS_MAX_EXPERTS + 1) {   // a job must never evict a slot it uses itself
-        fprintf(stderr, "[moe-cpu-split] r8 host cache: %d MiB holds %zu slots, need %d, off\n", s.r8_mb, n, 3 * MOE_CS_MAX_EXPERTS + 1);
+        fprintf(stderr, "[moe-cpu-split] r8 host cache: %d MiB asked, %zu MiB fits above the %.1f GiB floor (MemAvailable %.2f GiB): "
+                "%zu slots, need %d, off\n", s.r8_mb, fit >> 20, std::max(5.0, floor_gib), avail0 / 1073741824.0, n, 3 * MOE_CS_MAX_EXPERTS + 1);
         return false;
     }
-    free(c.arena);
-    c.arena = (uint8_t *) aligned_alloc(64, n * slot);
-    if (!c.arena) { fprintf(stderr, "[moe-cpu-split] r8 host cache: alloc of %zu MiB failed, off\n", (n * slot) >> 20); return false; }
+    const bool populate = env_int("GGML_MOE_AI_HOST_R8_POPULATE", 1, 0, 1) != 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    void * mem = mmap(nullptr, n * slot, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | (populate ? MAP_POPULATE : 0), -1, 0);
+    if (mem == MAP_FAILED) { fprintf(stderr, "[moe-cpu-split] r8 host cache: map of %zu MiB failed, off\n", (n * slot) >> 20); return false; }
+    c.arena = (uint8_t *) mem; c.arena_bytes = n * slot;
+    fprintf(stderr, "[moe-cpu-split] r8 host cache: RAM fit %d MiB asked, %zu MiB used, MemAvailable %.2f -> %.2f GiB (floor %.1f), "
+            "%s in %.0f ms\n", s.r8_mb, (n * slot) >> 20, avail0 / 1073741824.0, r8_mem_avail() / 1073741824.0,
+            std::max(5.0, floor_gib), populate ? "populated" : "lazy",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     c.slot = slot; c.n = (int) n; c.n_expert = ne;
     c.map.assign(s.layers.size() * (size_t) ne * 3, -1);
     c.key.assign(n, -1); c.ready.assign(n, 0); c.prv.resize(n); c.nxt.resize(n); c.pending.clear();
@@ -661,7 +688,7 @@ static bool r8_init(pool_state & s) {
 // thread 0, before `gen` moves: choose decode / hit / decode + keep for every AI+ q8 (expert, role) of this job
 static void r8_plan(pool_state & s, int layer, bool card) {
     for (int i = 0; i < s.n_exp; ++i) { s.r8m[i][0] = s.r8m[i][1] = s.r8m[i][2] = 0; }
-    if (!card || s.r8_mb <= 0) { return; }
+    if (!card || s.r8_mb == 0) { return; }
     pool_state::r8_state & c = s.r8;
     if ((c.n == 0 || s.r8_reset) && !r8_init(s)) { s.r8_mb = 0; return; }
     for (const int sl : c.pending) { c.ready[sl] = 1; }
@@ -1408,7 +1435,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
     s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
     s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 1, 0, 1) ? 8 : 4;
-    s.r8_mb = moe_ai::use_host_q8() ? env_int("GGML_MOE_AI_HOST_R8_MB", 0, 0, 1 << 20) : 0;
+    s.r8_mb = moe_ai::use_host_q8() ? env_int("GGML_MOE_AI_HOST_R8_MB", 0, -1, 1 << 20) : 0;
     s.r8_every = env_int("GGML_MOE_AI_HOST_R8_STATS", 16384, 1, 1 << 30);
 #if defined(MOE_CS_AVX512)
     s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 1, 0, 1) != 0 && cpu_has_avx512_vnni();

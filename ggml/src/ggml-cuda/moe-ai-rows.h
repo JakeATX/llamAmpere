@@ -7,6 +7,7 @@
 
 #include "../ggml-ai4.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1254,6 +1255,13 @@ static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, in
 // per q8 block, acc = fma(scale, rs, acc) per unit), so a hit is bit-identical to slab_rows_q8, like the fill pass itself.
 static inline size_t r8_w_bytes(int64_t n_out, int64_t K) { return (size_t) n_out*K; }
 static inline size_t r8_slot_bytes(int64_t n_out, int64_t K) { return (r8_w_bytes(n_out, K) + (size_t) n_out*(K/AI4U_UK)*2 + 63) & ~(size_t) 63; }
+// RAM-aware R8 size (Jake's rule: keep a 5 GiB MemAvailable floor, then use a share of the rest). req_mb > 0 asks for a
+// size, capped at what sits above the floor; req_mb < 0 is auto = pct % of (avail - floor). Returns bytes (0 = no room).
+static inline size_t r8_fit_bytes(long long req_mb, double avail, double floor_gib, int pct) {
+    const double room = std::max(0.0, avail - std::max(5.0, floor_gib) * 1073741824.0);
+    const double want = req_mb < 0 ? room * std::min(100, std::max(0, pct)) / 100.0 : (double) req_mb * 1048576.0;
+    return (size_t) std::min(want, room);
+}
 static inline bool r8_ok(int k, uint32_t C, int64_t n_out, int64_t K) {
 #if defined(__AVX2__) && defined(__FMA__)
     return direct_tables().ok && C != 0 && k >= 2 && k <= 5 && n_out % AI4_TR == 0 && K % AI4U_UK == 0 && K <= 8192;
