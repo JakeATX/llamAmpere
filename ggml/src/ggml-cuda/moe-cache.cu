@@ -594,6 +594,10 @@ static bool moe_cache_det() {
     static const bool det = [] { const char * e = getenv("GGML_MOE_CACHE_DET"); return e && atoi(e) != 0; }();
     return det;
 }
+// fork AIPFIX DETWARM: set while moe_cache_warm queues its ranked fills. The warm queues in a fixed rank order and
+// waits for live queue space itself, so the per-scope det limits must not bind there: with them the warm stopped
+// after queue_mb (1 GiB) of fills, leaving a half-loaded expert, and the whole-only device tables were refused.
+static thread_local bool g_moe_cache_in_warm = false;
 
 static uint64_t moe_cache_lending_uses(const moe_cache_slot & slot) {
     return (uint64_t)slot.warm_uses + slot.uses;
@@ -4557,7 +4561,7 @@ static int moe_cache_lookup_or_queue_locked(
         return -1;
     }
     const size_t queue_limit = session.config.queue_mb << 20;
-    const bool det = moe_cache_det();
+    const bool det = moe_cache_det() && !g_moe_cache_in_warm;
     const int queued_jobs = det ? device.det_jobs : (int)device.queue.size();
     const size_t queued_bytes = det ? device.det_bytes : device.queued_bytes;
     if (inserts_left <= 0 || queued_jobs >= session.config.queue_max ||
@@ -6893,6 +6897,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
     };
     int queued = 0;
     std::unordered_set<moe_cache_pool *> settled;
+    struct warm_flag { warm_flag() { g_moe_cache_in_warm = true; } ~warm_flag() { g_moe_cache_in_warm = false; } } warm_flag_guard;
     for (const auto & c : ranked) {
         if (std::chrono::steady_clock::now() >= deadline) {
             break;
