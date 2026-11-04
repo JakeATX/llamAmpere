@@ -1526,10 +1526,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int> n_own;
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
     std::vector<common_speculative_posgate>  pos_gate;      // [n_seq] fork AIPFIX POSGATE (LLAMA_SPEC_POS_GATE, default off)
+    std::vector<common_speculative_tpm>      tpm;           // [n_seq] fork AIPFIX TPM (LLAMA_SPEC_TPM=1, default off)
 
     // streak depth, capped by POSGATE when it is on
     int adaptive_depth(llama_seq_id s) {
         const int n = adaptive_ctrl[s].n_cur;
+        if (common_speculative_tpm::enabled() && s < (llama_seq_id) tpm.size()) {
+            const int floor = std::min(std::max(1, params.n_min_adaptive), std::max(1, params.n_max));
+            return tpm[s].pick(n, floor, std::max(1, params.n_max), ggml_time_us());
+        }
         if (!common_speculative_posgate::enabled() || s >= (llama_seq_id) pos_gate.size()) {
             return n;
         }
@@ -1741,6 +1746,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
             pos_gate.assign(n_seq, common_speculative_posgate());
+            tpm.assign(n_seq, common_speculative_tpm());
             for (uint32_t s = 0; s < n_seq; ++s) {
                 // start at the floor max(1, n_min_adaptive), bounded by n_max;
                 // the controller climbs from there once acceptance feedback arrives
@@ -2134,6 +2140,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 adaptive_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
                 if (seq_id < (llama_seq_id) pos_gate.size()) {
                     pos_gate[seq_id].reset();
+                }
+                if (seq_id < (llama_seq_id) tpm.size()) {
+                    tpm[seq_id].reset();
                 }
             }
         }
@@ -3279,6 +3288,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             adaptive_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
             if (seq_id < (llama_seq_id) pos_gate.size()) {
                 pos_gate[seq_id].update(own, n_acc);
+            }
+            if (seq_id < (llama_seq_id) tpm.size()) {
+                tpm[seq_id].update(own, n_acc);
             }
             if (adaptive_ctrl[seq_id].n_cur != depth_before) {
                 SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",

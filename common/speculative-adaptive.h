@@ -167,3 +167,160 @@ struct common_speculative_posgate {
         return d;
     }
 };
+
+// fork AIPFIX TPM (LLAMA_SPEC_TPM=1, default off): pick the draft depth that maximizes expected tokens per ms.
+// Per position k it keeps a running mean of the conditional acceptance p_k = P(draft token k accepted | 1..k-1
+// accepted), learned from every verified round that drafted at least k tokens (the MTP draft chain does not depend
+// on the depth chosen, so p_k is shared by all depths >= k). Per drafted count d it keeps a running mean of the
+// wall time of a whole round (draft start to the next draft start: draft + verify + accept), so the cost includes
+// the extra expert reads of a wider verify on the card it runs on. Expected tokens of a depth-d round:
+//   E(d) = 1 + sum_{k=1..d} prod_{j<=k} p_j            (the target always gives one token)
+// and the depth is argmax E(d) / cost(d) over [floor, n_max], moving off the current depth only for a > margin gain.
+// Depths without a measured cost use the nearest measured depth scaled by (1 + slope x row difference); positions
+// without enough samples are reached by a probe round (current best + 1) every `probe` rounds. LLAMA_SPEC_TPM_COST
+// = "c1,c2,..." fixes the per-depth costs (ms) instead of measuring them. Lossless: it only chooses a depth from
+// verified history. Its state is per request and is not part of the prompt-cache snapshot.
+struct common_speculative_tpm {
+    static constexpr int N_DEPTH = 9;
+    float p[N_DEPTH]     = {}; // conditional acceptance of position k (1-based)
+    int   tried[N_DEPTH] = {};
+    float cost[N_DEPTH]  = {}; // ms per round drafted d deep
+    int   timed[N_DEPTH] = {};
+    int   rounds = 0;
+    int   since_probe = 0;
+    int   cur = 0;          // last chosen depth
+    int   last_d = 0;       // drafted count of the round in flight (set by update)
+    long long t_start = -1; // us, start of the round in flight
+    long long n_pick[N_DEPTH] = {};
+
+    struct config {
+        bool  on = false;
+        float alpha = 0.03f;
+        float margin = 0.01f;
+        float slope = 0.10f; // prior cost per extra draft token, fraction of the measured neighbor's round
+        int   min_seen = 16;
+        int   probe = 24;
+        int   warm = 32;     // rounds on the streak depth before the controller takes over
+        int   log_every = 0; // rounds between [spec-tpm] state lines (0 = only at reset)
+        float fixed[N_DEPTH] = {};
+    };
+
+    static const config & cfg() {
+        static const config c = [] {
+            config r;
+            auto f = [](const char * name, float def) { const char * v = getenv(name); return v && *v ? (float) atof(v) : def; };
+            r.on = f("LLAMA_SPEC_TPM", 0.0f) != 0.0f;
+            r.alpha = std::min(1.0f, std::max(0.001f, f("LLAMA_SPEC_TPM_ALPHA", 0.03f)));
+            r.margin = std::max(0.0f, f("LLAMA_SPEC_TPM_MARGIN", 0.01f));
+            r.slope = std::max(0.0f, f("LLAMA_SPEC_TPM_SLOPE", 0.10f));
+            r.min_seen = std::max(1, (int) f("LLAMA_SPEC_TPM_MIN", 16.0f));
+            r.probe = std::max(2, (int) f("LLAMA_SPEC_TPM_PROBE", 24.0f));
+            r.warm = std::max(0, (int) f("LLAMA_SPEC_TPM_WARM", 32.0f));
+            r.log_every = std::max(0, (int) f("LLAMA_SPEC_TPM_LOG", 0.0f));
+            if (const char * s = getenv("LLAMA_SPEC_TPM_COST")) {
+                int d = 1;
+                for (const char * q = s; *q && d < N_DEPTH; ++d) {
+                    r.fixed[d] = (float) atof(q);
+                    while (*q && *q != ',') ++q;
+                    if (*q == ',') ++q;
+                }
+            }
+            if (r.on) {
+                fprintf(stderr, "[spec-tpm] on: alpha=%.3f margin=%.3f slope=%.3f min=%d probe=%d warm=%d fixed=%s\n",
+                        r.alpha, r.margin, r.slope, r.min_seen, r.probe, r.warm, r.fixed[1] > 0.0f ? "yes" : "no");
+            }
+            return r;
+        }();
+        return c;
+    }
+
+    static bool enabled() { return cfg().on; }
+
+    void log_state(const char * why) const {
+        fprintf(stderr, "[spec-tpm] %s rounds=%d p=", why, rounds);
+        for (int k = 1; k < N_DEPTH && tried[k] > 0; ++k) fprintf(stderr, "%s%.3f", k > 1 ? "," : "", p[k]);
+        fprintf(stderr, " ms=");
+        for (int d = 1; d < N_DEPTH; ++d) if (timed[d] > 0) fprintf(stderr, "d%d:%.2f(%d) ", d, cost[d], timed[d]);
+        fprintf(stderr, "picks=");
+        for (int d = 1; d < N_DEPTH; ++d) if (n_pick[d] > 0) fprintf(stderr, "d%d:%lld ", d, n_pick[d]);
+        fprintf(stderr, "\n");
+    }
+
+    void reset() {
+        if (rounds > 0) log_state("end");
+        *this = common_speculative_tpm();
+    }
+
+    // one verified round: n_draft tokens drafted (verify width n_draft + 1), n_accepted of them accepted
+    void update(int n_draft, int n_accepted) {
+        if (n_draft < 1) return;
+        const config & c = cfg();
+        n_accepted = std::min(n_accepted, n_draft);
+        for (int k = 1; k <= std::min(n_accepted + 1, n_draft) && k < N_DEPTH; ++k) {
+            const float g = k <= n_accepted ? 1.0f : 0.0f;
+            p[k] += (tried[k] == 0 ? 1.0f : c.alpha) * (g - p[k]);
+            tried[k]++;
+        }
+        last_d = std::min(n_draft, N_DEPTH - 1);
+        rounds++;
+        if (c.log_every > 0 && rounds % c.log_every == 0) log_state("state");
+    }
+
+    float cost_of(int d) const {
+        const config & c = cfg();
+        if (c.fixed[d] > 0.0f) return c.fixed[d];
+        if (timed[d] >= c.min_seen / 2) return cost[d];
+        int best = -1;
+        for (int m = 1; m < N_DEPTH; ++m) {
+            if (timed[m] >= c.min_seen / 2 && (best < 0 || std::abs(m - d) < std::abs(best - d))) best = m;
+        }
+        if (best < 0) return 1.0f + c.slope * d; // relative only; the argmax needs ratios
+        return cost[best] * std::max(0.1f, 1.0f + c.slope * (d - best));
+    }
+
+    float expected(int d) const {
+        float e = 1.0f, run = 1.0f;
+        for (int k = 1; k <= d; ++k) { run *= p[k]; e += run; }
+        return e;
+    }
+
+    // depth for the round that starts now; streak = the streak controller's depth (used during warm-up)
+    int pick(int streak, int floor, int cap, long long now_us) {
+        const config & c = cfg();
+        cap = std::min(cap, N_DEPTH - 1);
+        floor = std::max(1, std::min(floor, cap));
+        if (t_start >= 0 && last_d > 0) {
+            const float ms = (float) (now_us - t_start) * 1e-3f;
+            const float ref = timed[last_d] > 0 ? cost[last_d] : 0.0f;
+            if (ms > 0.0f && ms < 1000.0f && (ref == 0.0f || ms < 4.0f * ref)) { // drop gaps between requests
+                cost[last_d] += (timed[last_d] == 0 ? 1.0f : cfg().alpha) * (ms - cost[last_d]);
+                timed[last_d]++;
+            }
+        }
+        t_start = now_us;
+        last_d = 0;
+        int d;
+        if (rounds < c.warm) {
+            d = std::max(floor, std::min(streak, cap));
+        } else {
+            int best = cur > 0 ? std::max(floor, std::min(cur, cap)) : std::max(floor, std::min(streak, cap));
+            float best_r = expected(best) / cost_of(best);
+            for (int e = floor; e <= cap; ++e) {
+                bool known = true;
+                for (int k = 1; k <= e; ++k) known = known && tried[k] >= c.min_seen;
+                if (!known) continue;
+                const float r = expected(e) / cost_of(e);
+                if (r > best_r * (1.0f + c.margin)) { best = e; best_r = r; }
+            }
+            d = best;
+            if (++since_probe >= c.probe) { // one deeper round keeps p and cost of the next depth measured
+                since_probe = 0;
+                if (d < cap) d++;
+            } else {
+                cur = d;
+            }
+        }
+        n_pick[d]++;
+        return d;
+    }
+};
