@@ -682,23 +682,30 @@ static void overlay_bank_keep(ggml_context * ctx, const gguf_context * gguf, con
 
 // AIPFAST route 2: GGML_MOE_CPU_SPLIT_HOST_GGUF names files whose 3XS expert tensors the CPU uses for host misses of
 // the AI+ layers a patch made (ggml-cuda moe-cpu-split). They must be the base model this patch overlays, or the host
-// computes from wrong weights with no error. Checks, failing loud: same general.architecture, block_count and
-// expert_count as the base; every retyped expert tensor present in one of the files; where the base's first file holds
-// it, the same type, size and bytes (three 64 KiB windows per sampled tensor, first/middle/last AI+ layer gate + down).
+// computes from wrong weights with no error. Checks, failing loud: a file with general.architecture has the base's
+// architecture, block_count and expert_count (a file without it must be a gguf split); every retyped expert tensor is
+// in one of the files with the base's type and size; per file that serves tensors, sampled tensors (first/middle/last
+// AI+ layer gate + down) equal the base's bytes in three 64 KiB windows.
 template <typename WMap>
-static void host_gguf_check(const char * list, const std::string & fname, const gguf_context * base, const WMap & wmap) {
-    struct hfile { std::string path; gguf_context_ptr g; };
-    std::vector<hfile> hf;
-    {
-        std::stringstream ss(list);
-        for (std::string p; std::getline(ss, p, ',');) {
-            if (p.empty()) { continue; }
+static void host_gguf_check(const char * list, const std::vector<std::string> & base_paths, const WMap & wmap) {
+    struct gfile { std::string path; gguf_context_ptr g; int n_used = 0, n_compared = 0; std::string first; };
+    const auto open_list = [](const std::vector<std::string> & paths) {
+        std::vector<gfile> out;
+        for (const auto & p : paths) {
             gguf_init_params ip = { /*.no_alloc = */ true, /*.ctx = */ nullptr };
             gguf_context_ptr g { gguf_init_from_file(p.c_str(), ip) };
             if (!g) { throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: cannot read %s as GGUF", p.c_str())); }
-            hf.push_back({ p, std::move(g) });
+            out.push_back({ p, std::move(g), 0, 0, {} });
         }
+        return out;
+    };
+    std::vector<std::string> hpaths;
+    {
+        std::stringstream ss(list);
+        for (std::string p; std::getline(ss, p, ',');) { if (!p.empty()) { hpaths.push_back(p); } }
     }
+    std::vector<gfile> hf = open_list(hpaths), bf = open_list(base_paths);
+    const std::string & base0 = base_paths.front();
     const auto kv_str = [](const gguf_context * g, const std::string & key) -> std::string {
         const int64_t id = gguf_find_key(g, key.c_str());
         if (id < 0) { return "(missing)"; }
@@ -707,86 +714,100 @@ static void host_gguf_check(const char * list, const std::string & fname, const 
             case GGUF_TYPE_UINT32: return std::to_string(gguf_get_val_u32(g, id));
             case GGUF_TYPE_INT32:  return std::to_string(gguf_get_val_i32(g, id));
             case GGUF_TYPE_UINT64: return std::to_string(gguf_get_val_u64(g, id));
+            case GGUF_TYPE_UINT16: return std::to_string(gguf_get_val_u16(g, id));
             default:               return "(other type)";
         }
     };
-    const std::string arch = kv_str(base, "general.architecture");
+    const gguf_context * bmeta = bf.front().g.get();
+    const std::string arch = kv_str(bmeta, "general.architecture");
     for (const auto & f : hf) {
+        if (gguf_find_key(f.g.get(), "general.architecture") < 0) {
+            if (gguf_find_key(f.g.get(), "split.no") < 0) {
+                throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s has no general.architecture and is not a gguf split",
+                        f.path.c_str()));
+            }
+            continue;
+        }
         for (const std::string & key : { std::string("general.architecture"), arch + ".block_count", arch + ".expert_count" }) {
-            const std::string a = kv_str(base, key), b = kv_str(f.g.get(), key);
-            if (a != b) {
+            const std::string x = kv_str(bmeta, key), y = kv_str(f.g.get(), key);
+            if (x != y) {
                 throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s is not the base model %s: %s = %s vs %s",
-                        f.path.c_str(), fname.c_str(), key.c_str(), b.c_str(), a.c_str()));
+                        f.path.c_str(), base0.c_str(), key.c_str(), y.c_str(), x.c_str()));
             }
         }
     }
     // retyped (AI+) routed-expert tensors in layer order
     std::vector<std::string> names;
+    std::vector<int> layers;
     for (int il = 0; il < 1024; ++il) {
         for (const char * kind : { "gate", "up", "down" }) {
             const std::string n = format("blk.%d.ffn_%s_exps.weight", il, kind);
             auto it = wmap.find(n);
-            if (it != wmap.end() && ggml_ai4_is_unit(it->second.tensor->type)) { names.push_back(n); }
+            if (it != wmap.end() && ggml_ai4_is_unit(it->second.tensor->type)) {
+                names.push_back(n);
+                if (layers.empty() || layers.back() != il) { layers.push_back(il); }
+            }
         }
     }
     if (names.empty()) { return; }
-    std::vector<int> sample_layers;
-    {
-        std::vector<int> ls;
-        for (const auto & n : names) { const int l = atoi(n.c_str() + 4); if (ls.empty() || ls.back() != l) { ls.push_back(l); } }
-        sample_layers = { ls.front(), ls[ls.size()/2], ls.back() };
-    }
-    std::vector<std::string> missing;
-    int n_compared = 0;
-    for (const auto & n : names) {
-        const hfile * f = nullptr;
-        int64_t hid = -1;
-        for (const auto & c : hf) { hid = gguf_find_tensor(c.g.get(), n.c_str()); if (hid >= 0) { f = &c; break; } }
-        if (!f) { missing.push_back(n); continue; }
-        const ggml_type ht = gguf_get_tensor_type(f->g.get(), hid);
-        if (ggml_ai4_is_unit(ht)) {
-            throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s holds %s as AI+ (%s), not a 3XS base copy",
-                    f->path.c_str(), n.c_str(), ggml_type_name(ht)));
-        }
-        const int64_t bid = gguf_find_tensor(base, n.c_str());
-        if (bid < 0) { continue; }   // in another split of the base: present, not byte-checked
-        const size_t bsz = gguf_get_tensor_size(base, bid), hsz = gguf_get_tensor_size(f->g.get(), hid);
-        if (gguf_get_tensor_type(base, bid) != ht || bsz != hsz) {
-            throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s in %s is %s (%zu bytes), base %s has %s (%zu bytes)",
-                    n.c_str(), f->path.c_str(), ggml_type_name(ht), hsz, fname.c_str(),
-                    ggml_type_name(gguf_get_tensor_type(base, bid)), bsz));
-        }
-        const int l = atoi(n.c_str() + 4);
-        const bool sampled = std::find(sample_layers.begin(), sample_layers.end(), l) != sample_layers.end() &&
-                             n.find("_up_") == std::string::npos;
-        if (!sampled) { continue; }
-        const size_t boff = gguf_get_data_offset(base) + gguf_get_tensor_offset(base, bid);
-        const size_t hoff = gguf_get_data_offset(f->g.get()) + gguf_get_tensor_offset(f->g.get(), hid);
+    const int sample[3] = { layers.front(), layers[layers.size()/2], layers.back() };
+    const auto compare = [](gfile & f, int64_t hid, const gfile & b, int64_t bid, const std::string & n) {
+        const size_t bsz = gguf_get_tensor_size(b.g.get(), bid);
+        const size_t boff = gguf_get_data_offset(b.g.get()) + gguf_get_tensor_offset(b.g.get(), bid);
+        const size_t hoff = gguf_get_data_offset(f.g.get()) + gguf_get_tensor_offset(f.g.get(), hid);
         const size_t win = std::min<size_t>(65536, bsz);
-        std::ifstream bf(fname, std::ios::binary), hfs(f->path, std::ios::binary);
-        std::vector<char> a(win), b(win);
+        std::ifstream bs(b.path, std::ios::binary), hs(f.path, std::ios::binary);
+        std::vector<char> x(win), y(win);
         for (size_t at : { (size_t) 0, (bsz - win)/2, bsz - win }) {
-            bf.seekg((std::streamoff) (boff + at));
-            hfs.seekg((std::streamoff) (hoff + at));
-            bf.read(a.data(), (std::streamsize) win);
-            hfs.read(b.data(), (std::streamsize) win);
-            if (!bf || !hfs || memcmp(a.data(), b.data(), win) != 0) {
+            bs.seekg((std::streamoff) (boff + at));
+            hs.seekg((std::streamoff) (hoff + at));
+            bs.read(x.data(), (std::streamsize) win);
+            hs.read(y.data(), (std::streamsize) win);
+            if (!bs || !hs || memcmp(x.data(), y.data(), win) != 0) {
                 throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s bytes in %s differ from the base %s (offset %zu); "
-                        "not the same model", n.c_str(), f->path.c_str(), fname.c_str(), at));
+                        "not the same model", n.c_str(), f.path.c_str(), b.path.c_str(), at));
             }
         }
-        ++n_compared;
+        ++f.n_compared;
+    };
+    std::vector<std::string> missing;
+    for (const auto & n : names) {
+        gfile * f = nullptr;
+        int64_t hid = -1;
+        for (auto & c : hf) { hid = gguf_find_tensor(c.g.get(), n.c_str()); if (hid >= 0) { f = &c; break; } }
+        const gfile * b = nullptr;
+        int64_t bid = -1;
+        for (const auto & c : bf) { bid = gguf_find_tensor(c.g.get(), n.c_str()); if (bid >= 0) { b = &c; break; } }
+        if (!f || !b) { missing.push_back(n); continue; }
+        ++f->n_used;
+        const ggml_type ht = gguf_get_tensor_type(f->g.get(), hid), bt = gguf_get_tensor_type(b->g.get(), bid);
+        const size_t bsz = gguf_get_tensor_size(b->g.get(), bid), hsz = gguf_get_tensor_size(f->g.get(), hid);
+        if (ggml_ai4_is_unit(ht) || ht != bt || bsz != hsz) {
+            throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s in %s is %s (%zu bytes), base %s has %s (%zu bytes)",
+                    n.c_str(), f->path.c_str(), ggml_type_name(ht), hsz, b->path.c_str(), ggml_type_name(bt), bsz));
+        }
+        if (f->first.empty()) { f->first = n; }
+        const int l = atoi(n.c_str() + 4);
+        if ((l != sample[0] && l != sample[1] && l != sample[2]) || n.find("_up_") != std::string::npos) { continue; }
+        compare(*f, hid, *b, bid, n);
     }
     if (!missing.empty()) {
-        throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %zu of %zu AI+ expert tensors are in none of the files "
-                "(first: %s)", missing.size(), names.size(), missing.front().c_str()));
+        throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %zu of %zu AI+ expert tensors are missing from the listed "
+                "files or the base (first: %s)", missing.size(), names.size(), missing.front().c_str()));
     }
-    if (n_compared == 0) {
-        throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: could not compare any tensor bytes with the base %s "
-                "(base split layout?); refusing unverified host copies", fname.c_str()));
+    int n_compared = 0;
+    for (auto & f : hf) {
+        if (f.n_used > 0 && f.n_compared == 0) {
+            // a file serving tensors none of which fell on a sampled layer: compare its first served tensor
+            for (const auto & b : bf) {
+                const int64_t bid = gguf_find_tensor(b.g.get(), f.first.c_str());
+                if (bid >= 0) { compare(f, gguf_find_tensor(f.g.get(), f.first.c_str()), b, bid, f.first); break; }
+            }
+        }
+        n_compared += f.n_compared;
     }
-    LLAMA_LOG_WARN("%s: host 3XS source check passed: %zu AI+ expert tensors found in %zu file(s), %d byte-compared with %s\n",
-            __func__, names.size(), hf.size(), n_compared, fname.c_str());
+    LLAMA_LOG_WARN("%s: host 3XS source check passed: %zu AI+ expert tensors found in %zu file(s), %d byte-compared with the base\n",
+            __func__, names.size(), hf.size(), n_compared);
 }
 
 llama_model_loader::llama_model_loader(
@@ -1127,7 +1148,7 @@ llama_model_loader::llama_model_loader(
         LLAMA_LOG_WARN("%s: overlay patch retyped %d routed-expert tensors; %d layers hold AI+ experts in the base tensors\n",
                 __func__, n_retyped, n_ai_layers);
         if (const char * hg = getenv("GGML_MOE_CPU_SPLIT_HOST_GGUF"); hg && hg[0]) {
-            host_gguf_check(hg, fname, metadata, weights_map);
+            host_gguf_check(hg, splits.empty() ? std::vector<std::string>{ fname } : splits, weights_map);
         }
     }
 
