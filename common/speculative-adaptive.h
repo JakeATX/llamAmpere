@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 // Adaptive draft depth controller for MTP speculative decoding (draft-mtp-adaptive).
 //
@@ -88,5 +90,80 @@ struct common_speculative_adaptive {
                 }
             }
         }
+    }
+};
+
+// fork AIPFIX POSGATE (LLAMA_SPEC_POS_GATE=<ratio>, default off): a cap on top of the streak controller from
+// per-depth acceptance. For each depth d it keeps, over rounds drafted exactly d deep, a running mean of
+//   gain_d = 1 if the d-th draft token was accepted, else 0      (the extra token position d buys)
+//   base_d = 1 + min(n_accepted, d - 1)                          (tokens the same round gives without it)
+// and caps the depth at d - 1 while gain_d < ratio * base_d, ratio = the cost of one more verify row as a fraction
+// of a round (whole-round w5/w4 on the Taichi trace: ~0.13). Every `probe` gated rounds one round runs at the
+// streak depth so gain_d keeps being measured. Lossless: it only reads verified history to choose a depth.
+// Its state is not part of the prompt-cache snapshot; it relearns after a restore or a new request.
+struct common_speculative_posgate {
+    static constexpr int N_DEPTH = 9;
+    float gain[N_DEPTH] = {};
+    float base[N_DEPTH] = {};
+    int   seen[N_DEPTH] = {};
+    int   gated = 0;
+
+    struct config {
+        float ratio = 0.0f;  // 0 = off
+        float alpha = 0.05f; // running-mean weight of the newest round
+        int   min_seen = 16; // rounds at a depth before it can be gated
+        int   probe = 32;    // gated rounds between probe rounds
+    };
+
+    static const config & cfg() {
+        static const config c = [] {
+            config r;
+            auto f = [](const char * name, float def) { const char * v = getenv(name); return v && *v ? (float) atof(v) : def; };
+            r.ratio = std::max(0.0f, f("LLAMA_SPEC_POS_GATE", 0.0f));
+            r.alpha = std::min(1.0f, std::max(0.001f, f("LLAMA_SPEC_POS_GATE_ALPHA", 0.05f)));
+            r.min_seen = std::max(1, (int) f("LLAMA_SPEC_POS_GATE_MIN", 16.0f));
+            r.probe = std::max(1, (int) f("LLAMA_SPEC_POS_GATE_PROBE", 32.0f));
+            if (r.ratio > 0.0f) {
+                fprintf(stderr, "[pos-gate] on: ratio=%.4f alpha=%.3f min=%d probe=%d\n", r.ratio, r.alpha, r.min_seen, r.probe);
+            }
+            return r;
+        }();
+        return c;
+    }
+
+    static bool enabled() { return cfg().ratio > 0.0f; }
+
+    void reset() { *this = common_speculative_posgate(); }
+
+    // one verified round drafted n_draft deep with n_accepted accepted (both at the controller's own depth)
+    void update(int n_draft, int n_accepted) {
+        if (n_draft < 1 || n_draft >= N_DEPTH) {
+            return;
+        }
+        const config & c = cfg();
+        const float g = n_accepted >= n_draft ? 1.0f : 0.0f;
+        const float b = 1.0f + (float) std::min(n_accepted, n_draft - 1);
+        const float a = seen[n_draft] == 0 ? 1.0f : c.alpha;
+        gain[n_draft] += a * (g - gain[n_draft]);
+        base[n_draft] += a * (b - base[n_draft]);
+        seen[n_draft]++;
+    }
+
+    // depth to draft this round given the streak depth n_cur and the floor
+    int cap(int n_cur, int floor) {
+        const config & c = cfg();
+        int d = n_cur;
+        while (d > floor && d < N_DEPTH && seen[d] >= c.min_seen && gain[d] < c.ratio * base[d]) {
+            --d;
+        }
+        if (d == n_cur) {
+            gated = 0;
+            return d;
+        }
+        if (++gated >= c.probe) {
+            gated = 0;
+            return n_cur; // probe round keeps gain[n_cur] fresh
+        }
+        return d;
     }
 };

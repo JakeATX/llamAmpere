@@ -1035,6 +1035,10 @@ struct moe_cache_session {
     int skip_mode = 0;
     int skip_rank_floor = 0;
     float skip_threshold = 0.0f;
+    // fork AIPFIX SKIPBANK: GGML_MOE_SKIP_BANK_FLOOR / _BUDGET replace the rank floor / cumulative budget in layers
+    // that carry AI+ bank experts (-1 = same as the other layers); read with the policy, so graphs bake them in
+    int skip_bank_floor = -1;
+    float skip_bank_threshold = -1.0f;
     bool skip_renorm = false;
     bool skip_logged = false;
     int mass_layer = -1;
@@ -11160,11 +11164,15 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
     const auto & group = session.mj_groups[layer];
     GGML_ASSERT(group[0] && group[1] && group[2] && g_tail_mask && moe_missjoin_hitfirst_enabled());
     const bool renorm = session.skip_renorm;
+    // fork AIPFIX SKIPBANK: a layer with AI+ bank experts may use its own floor / budget
+    const bool bank_layer = group[0]->n_bank > 0 || group[1]->n_bank > 0 || group[2]->n_bank > 0;
+    const int rank_floor = bank_layer && session.skip_bank_floor >= 0 ? session.skip_bank_floor : session.skip_rank_floor;
+    const float layer_threshold = bank_layer && session.skip_bank_threshold >= 0.0f ? session.skip_bank_threshold : threshold;
     const int experts = (int) group[0]->desc.n_expert;
     GGML_ASSERT(experts <= g_hf_experts && experts <= MOE_TAIL_MAX_EXPERT);
     moe_mass_kernel<<<1, 256, 0, ctx.stream()>>>((const float *) op->src[0]->data, (float *) op->data,
         (const int32_t *) op->src[1]->data, (int) (op->src[1]->nb[1] / sizeof(int32_t)), (int) op->ne[2],
-        layer, active ? mode : 0, threshold, renorm, session.skip_rank_floor, experts, group[0]->hot, group[1]->hot, group[2]->hot,
+        layer, active ? mode : 0, layer_threshold, renorm, rank_floor, experts, group[0]->hot, group[1]->hot, group[2]->hot,
         g_tail_mask, g_hf_experts, g_tail_counts, (moe_mass_record *) session.mass_trace, session.mass_trace_counts,
         experts == g_hf_experts ? g_swst : nullptr, experts == g_hf_experts ? g_swscore : nullptr, moe_swap_score_mode(), moe_swap_skipw());
     CUDA_CHECK(cudaGetLastError());
@@ -13879,10 +13887,24 @@ static void moe_cache_set_skip_tail(void * opaque, int rank, bool mass) {
         mode = -1;
     }
     const int rank_floor = mode == 2 ? (int) floor_value : 0;
+    // fork AIPFIX SKIPBANK: optional per-bank-layer floor and budget (cumulative policy only; invalid values = off)
+    int bank_floor = -1;
+    float bank_threshold = -1.0f;
+    if (mode == 2) {
+        const char * bf = getenv("GGML_MOE_SKIP_BANK_FLOOR");
+        const char * bb = getenv("GGML_MOE_SKIP_BANK_BUDGET");
+        char * e1 = nullptr;
+        char * e2 = nullptr;
+        const long v1 = bf ? strtol(bf, &e1, 10) : -1;
+        const float v2 = bb ? strtof(bb, &e2) : -1.0f;
+        bank_floor = bf && e1 != bf && *e1 == 0 && v1 >= 0 && v1 <= 10 ? (int) v1 : -1;
+        bank_threshold = bb && e2 != bb && *e2 == 0 && std::isfinite(v2) && ggml_moe_skipmass_budget_valid(2, v2) ? v2 : -1.0f;
+    }
     // A positive legacy rank still enables an environment-selected mass policy.
     mass = mode != 0 && (mass || rank > 0);
     std::lock_guard<std::mutex> lock(session->mu);
-    const bool policy_changed = session->skip_mass != mass || session->skip_mode != mode || session->skip_threshold != threshold || session->skip_renorm != renorm || session->skip_rank_floor != rank_floor;
+    const bool policy_changed = session->skip_mass != mass || session->skip_mode != mode || session->skip_threshold != threshold || session->skip_renorm != renorm || session->skip_rank_floor != rank_floor ||
+        session->skip_bank_floor != bank_floor || session->skip_bank_threshold != bank_threshold;
     if (policy_changed) {
         session->skip_logged = false;
     }
@@ -13890,10 +13912,15 @@ static void moe_cache_set_skip_tail(void * opaque, int rank, bool mass) {
     session->skip_mass = mass;
     session->skip_rank_floor = rank_floor;
     session->skip_threshold = threshold;
+    session->skip_bank_floor = bank_floor;
+    session->skip_bank_threshold = bank_threshold;
     session->skip_renorm = renorm;
     if ((rank > 0 || mass) && !session->skip_logged) {
         static const char * names[] = {"invalid", "rank", "threshold", "cumulative"};
         MOE_CACHE_LOG("[moe-skip] policy=%s tail=%d threshold=%g renorm=%d rank_floor=%d\n", names[mode + 1], rank, threshold, renorm ? 1 : 0, rank_floor);
+        if (bank_floor >= 0 || bank_threshold >= 0.0f) {
+            MOE_CACHE_LOG("[moe-skip] bank layers: rank_floor=%d threshold=%g (-1 = same as other layers)\n", bank_floor, bank_threshold);
+        }
         session->skip_logged = true;
     }
     if (session->skip_tail == rank && !policy_changed) {

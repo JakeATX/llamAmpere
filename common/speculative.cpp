@@ -1525,6 +1525,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // (n_cap can be raised to the round's deepest cap); the adaptive controller is fed at this depth
     std::vector<int> n_own;
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
+    std::vector<common_speculative_posgate>  pos_gate;      // [n_seq] fork AIPFIX POSGATE (LLAMA_SPEC_POS_GATE, default off)
+
+    // streak depth, capped by POSGATE when it is on
+    int adaptive_depth(llama_seq_id s) {
+        const int n = adaptive_ctrl[s].n_cur;
+        if (!common_speculative_posgate::enabled() || s >= (llama_seq_id) pos_gate.size()) {
+            return n;
+        }
+        const int floor = std::min(std::max(1, params.n_min_adaptive), std::max(1, params.n_max));
+        return pos_gate[s].cap(n, floor);
+    }
 
     // CDEPTH (--spec-depth-policy cdepth): per-token confidence stop rule between n_min_adaptive and n_max
     bool cdepth = false;
@@ -1729,6 +1740,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
+            pos_gate.assign(n_seq, common_speculative_posgate());
             for (uint32_t s = 0; s < n_seq; ++s) {
                 // start at the floor max(1, n_min_adaptive), bounded by n_max;
                 // the controller climbs from there once acceptance feedback arrives
@@ -2120,6 +2132,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             static const bool carry = [] { const char * e = getenv("LLAMA_SPEC_ADAPTIVE_CARRY"); return e && atoi(e) != 0; }();
             if (!carry) {
                 adaptive_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
+                if (seq_id < (llama_seq_id) pos_gate.size()) {
+                    pos_gate[seq_id].reset();
+                }
             }
         }
         if (cdepth && seq_id >= 0 && seq_id < (llama_seq_id) cd_state.size()) {
@@ -2684,7 +2699,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // effective draft cap: adaptive depth (or n_max), then clamped by the
                 // per-call context bound from the server (same as the sequential path)
-                n_cap[seq_one] = adaptive ? adaptive_ctrl[seq_one].n_cur : params.n_max;
+                n_cap[seq_one] = adaptive ? adaptive_depth(seq_one) : params.n_max;
                 if (cdepth && !cd_chain_warned) {
                     cd_chain_warned = true;
                     LOG_WRN("%s: --spec-depth-policy cdepth applies to the per-token draft loop; the chained-graph draft path keeps the streak controller\n", __func__);
@@ -2985,7 +3000,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // effective draft cap for this step: adaptive depth (or the user n_max),
             // then clamped by the per-call context bound from the server
-            n_cap[seq_id] = (adaptive && !cdepth) ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+            n_cap[seq_id] = (adaptive && !cdepth) ? adaptive_depth(seq_id) : params.n_max;
             if (cdepth) {
                 cd_state[seq_id].begin_round();
             }
@@ -3262,6 +3277,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 n_acc = std::min<int>(n_acc, n_accepted_ctrl); // [MBFIX] exact-rule count under mode-biased MTP
             }
             adaptive_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
+            if (seq_id < (llama_seq_id) pos_gate.size()) {
+                pos_gate[seq_id].update(own, n_acc);
+            }
             if (adaptive_ctrl[seq_id].n_cur != depth_before) {
                 SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
                         (int) seq_id, depth_before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], n_accepted);
