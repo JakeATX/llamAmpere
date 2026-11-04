@@ -106,6 +106,8 @@ struct shuf_tabs {
     uint8_t idx[6][AI4_TR][32];   // [k][row]: per 128-bit lane, E byte (relative to the lane base) of each state byte
     uint8_t base[6][AI4_TR][2];   // [k][row]: lane base, in E words (low lane = states 0-3, high lane = states 4-7)
     uint32_t sh[6][8];            // [k][state]: right shift that puts the state in the low 16 bits
+    uint8_t dir[6][AI4_TR][2];    // [k][row][lane]: 1 = every byte the lane uses is a tile word (E[1..nw]), so the lane can
+                                  // be loaded straight from the weights; 2 = also its whole 16-byte load stays in the tile
     shuf_tabs() {
         memset(this, 0, sizeof(*this));
         for (int k = 2; k <= 5; ++k) {
@@ -124,6 +126,13 @@ struct shuf_tabs {
                         }
                         d[3] = 0x80;
                     }
+                    int lo = 1 << 30, hi = -1;
+                    for (int s = 0; s < 4; ++s) {
+                        const int kk = 4*h + s, m0 = (k*(kk + 1)) >> 3;
+                        for (int i = 0; i < 3; ++i) { const int P = Bw + m0 + 2 - i; lo = P/4 < lo ? P/4 : lo; hi = P/4 > hi ? P/4 : hi; }
+                    }
+                    const int nw = AIK_TILE_WORDS(k);
+                    dir[k][r][h] = (uint8_t) (lo >= 1 && hi <= nw ? (j0 + 3 <= nw ? 2 : 1) : 0);
                 }
             }
         }
@@ -149,6 +158,30 @@ static inline __m256 row_levels_shuf(const uint32_t * E, const shuf_tabs & T, in
     v = _mm256_madd_epi16(_mm256_maddubs_epi16(v, _mm256_set1_epi8(1)), _mm256_set1_epi16(1));
     v = _mm256_srai_epi32(_mm256_sub_epi32(v, _mm256_set1_epi32(510)), 2);
     return _mm256_cvtepi32_ps(v);
+}
+
+// AIPFAST: same decode, but lanes whose bytes all lie inside the tile load straight from the weights (wd = the tile's
+// words, E[j] = wd[j - 1] there) instead of from E. E is rebuilt by small stores every tile, and a 16-byte load over
+// several of those stores cannot be forwarded from the store buffer, so every row waited for E's stores to retire.
+// Only the 2-3 edge lanes per tile (circular wrap) still read E. last = the slab's final tile of a unit: there a
+// lane may only over-read inside the tile (dir == 2), so the load never runs past the unit. Same bytes, same levels.
+static inline __m256 row_levels_shuf_d(const uint32_t * E, const uint32_t * wd, int lim, const shuf_tabs & T, int k,
+                                       __m256i sh, __m256i Cv, int r) {
+    const int b0 = T.base[k][r][0], b1 = T.base[k][r][1];
+    const uint32_t * p0 = T.dir[k][r][0] >= lim ? wd + b0 - 1 : E + b0;
+    const uint32_t * p1 = T.dir[k][r][1] >= lim ? wd + b1 - 1 : E + b1;
+    const __m256i src = _mm256_loadu2_m128i((const __m128i *) p1, (const __m128i *) p0);
+    __m256i v = _mm256_shuffle_epi8(src, _mm256_loadu_si256((const __m256i *) T.idx[k][r]));
+    v = _mm256_and_si256(_mm256_srlv_epi32(v, sh), _mm256_set1_epi32(0xFFFF));
+    v = _mm256_mullo_epi32(v, Cv);
+    v = _mm256_madd_epi16(_mm256_maddubs_epi16(v, _mm256_set1_epi8(1)), _mm256_set1_epi16(1));
+    v = _mm256_srai_epi32(_mm256_sub_epi32(v, _mm256_set1_epi32(510)), 2);
+    return _mm256_cvtepi32_ps(v);
+}
+
+static bool use_direct() {
+    static const bool on = [] { const char * e = getenv("GGML_MOE_AI_HOST_DIRECT"); return !(e && e[0] == '0'); }();
+    return on;
 }
 
 static inline float hsum8(__m256 v) {
@@ -322,7 +355,8 @@ MOE_AI_T512V static void unit_rows_512_vbmi(const uint8_t * blk, int k, uint32_t
 // o[t][row - a] = W[row] . x_t, with y[t] the rotated inputs from rotate()
 // path: -1 = best available (VBMI if present, else AVX2), 0 = AVX2 (or scalar), 1 = AVX-512 (VBMI decode when the host has it),
 // 2 = AVX-512 without VBMI,
-// 3 = AVX2 with the old window decode (row_levels_avx2; test reference)
+// 3 = AVX2 with the old window decode (row_levels_avx2; test reference), 4 = AVX2 shuffle reading every lane from E
+// (the shuffle decode before direct lane loads; GGML_MOE_AI_HOST_DIRECT=0 makes it the default)
 static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                       const float * const * y, float * const * o, int path = -1) {
     const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
@@ -345,14 +379,18 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
             __m256 part[8][AI4_TR];
             for (int t = 0; t < nt; ++t) { for (int r = 0; r < AI4_TR; ++r) { part[t][r] = _mm256_setzero_ps(); } }
             const bool shuf = path != 3 && use_shuf();
+            const bool direct = shuf && path != 4 && use_direct();
             const shuf_tabs & T = shuf_tables();
             const __m256i shv = _mm256_loadu_si256((const __m256i *) T.sh[k]), Cv = _mm256_set1_epi32((int) C);
             for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
                 tile_words(wd + ct*tw, k, E);
                 __m256 yv[8];
                 for (int t = 0; t < nt; ++t) { yv[t] = _mm256_loadu_ps(y[t] + u*AI4U_UK + ct*AI4_TC); }
+                const uint32_t * wdt = wd + ct*tw;
+                const int lim = !direct ? 3 : (ct == AI4U_UK/AI4_TC - 1 ? 2 : 1);  // 3 = never direct
                 for (int r = 0; r < AI4_TR; ++r) {
-                    const __m256 lev = shuf ? row_levels_shuf(E, T, k, shv, Cv, r) : row_levels_avx2(E, k, C, r);
+                    const __m256 lev = !shuf ? row_levels_avx2(E, k, C, r)
+                                     : row_levels_shuf_d(E, wdt, lim, T, k, shv, Cv, r);
                     for (int t = 0; t < nt; ++t) { part[t][r] = _mm256_fmadd_ps(lev, yv[t], part[t][r]); }
                 }
             }

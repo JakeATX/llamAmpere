@@ -115,8 +115,9 @@ int main(int argc, char ** argv) {
                 run();
 #if defined(__AVX2__) && defined(__FMA__)
                 {
-                    // AIPFAST: AVX2 shuffle decode (path 0) vs the old AVX2 window decode (path 3): bit-identical, both timed
-                    std::vector<float> oa((size_t) nt * M), ob((size_t) nt * M);
+                    // AIPFAST: AVX2 shuffle decode with direct lane loads (path 0), the shuffle decode reading E (path 4) and
+                    // the old AVX2 window decode (path 3): all bit-identical, all timed (order 0 4 3 3 4 0)
+                    std::vector<float> oa((size_t) nt * M), ob((size_t) nt * M), oc((size_t) nt * M);
                     auto run_p = [&](std::vector<float> & o, int p) {
                         float * opx[8];
                         for (int64_t a = 0; a < M; a += AI4_TR) {
@@ -126,20 +127,24 @@ int main(int argc, char ** argv) {
                     };
                     run_p(oa, 0);
                     run_p(ob, 3);
-                    const bool same = memcmp(oa.data(), ob.data(), oa.size() * sizeof(float)) == 0;
+                    run_p(oc, 4);
+                    const bool same = memcmp(oa.data(), ob.data(), oa.size() * sizeof(float)) == 0 &&
+                                      memcmp(oc.data(), ob.data(), oc.size() * sizeof(float)) == 0;
                     fails += !same;
-                    double us[2] = {};
-                    for (int rep = 0; rep < 2; ++rep) {   // ABBA-ish: shuf, old, old, shuf
-                        for (int p : { 0, 3 }) {
-                            const int pp = rep ? 3 - p : p;
+                    const int ps[3] = { 0, 4, 3 };
+                    std::vector<float> * os[3] = { &oa, &oc, &ob };
+                    double us[3] = {};
+                    for (int rep = 0; rep < 2; ++rep) {
+                        for (int j = 0; j < 3; ++j) {
+                            const int q = rep ? 2 - j : j;
                             const auto ta = std::chrono::steady_clock::now();
-                            for (int i = 0; i < reps; ++i) { run_p(pp == 0 ? oa : ob, pp); }
-                            us[pp == 0 ? 0 : 1] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ta).count() / (2.0 * reps);
+                            for (int i = 0; i < reps; ++i) { run_p(*os[q], ps[q]); }
+                            us[q] += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ta).count() / (2.0 * reps);
                         }
                     }
-                    printf("%-8s K=%5lld M=%5lld nt=%d  AVX2 shuf vs old: %s  shuf %.1f us  old %.1f us /projection (1 thread)\n",
+                    printf("%-8s K=%5lld M=%5lld nt=%d  AVX2 direct/shuf/old: %s  direct %.1f us  shuf %.1f us  old %.1f us /projection (1 thread)\n",
                            ggml_type_name(type), (long long) K, (long long) M, nt, same ? "bit-identical OK" : "DIFFERENT FAIL",
-                           us[0], us[1]);
+                           us[0], us[1], us[2]);
                 }
                 if (moe_ai::has_avx512()) {
                     // the AVX-512 path must equal the AVX2 path bit for bit
