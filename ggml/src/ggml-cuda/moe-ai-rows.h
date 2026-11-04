@@ -166,9 +166,9 @@ static void unit_rows_q8_scalar(const uint8_t * blk, int k, uint32_t C, int nt, 
     const int tw = AIK_TILE_WORDS(k), qb = q8_block(K), st = (qb < AI4U_UK ? qb : AI4U_UK)/AI4_TC;
     uint32_t E[AIK_TILE_WORDS(5) + 3 + 4] = {};
     for (int r = 0; r < AI4_TR; ++r) {
-        float rs[8] = {}, F[8][4] = {};
+        float rs[8] = {};
         for (int c0 = 0; c0 < AI4U_UK/AI4_TC; c0 += st) {
-            int32_t is[8] = {}, P[8][4] = {};
+            int32_t is[8] = {};
             for (int ct = c0; ct < c0 + st; ++ct) {
                 int lev[8];
                 if (C != 0) {
@@ -179,20 +179,12 @@ static void unit_rows_q8_scalar(const uint8_t * blk, int k, uint32_t C, int nt, 
                 }
                 for (int t = 0; t < nt; ++t) {
                     const int16_t * xt = q8_xs(xq[t]) + (koff/AI4_TC + ct)*16;
-                    for (int kk = 0; kk < 8; ++kk) {
-                        const int v = lev[kk]*xt[(kk < 4 ? 0 : 8) + (kk & 3)];
-                        is[t] += v;
-                        P[t][kk >> 1] += v;
-                    }
+                    for (int kk = 0; kk < 8; ++kk) { is[t] += lev[kk]*xt[(kk < 4 ? 0 : 8) + (kk & 3)]; }
                 }
             }
-            for (int t = 0; t < nt; ++t) {
-                const float dx = q8_d(xq[t], K)[(koff + c0*AI4_TC)/qb];
-                if (st == AI4U_UK/AI4_TC) { rs[t] = __builtin_fmaf(dx, (float) is[t], rs[t]); continue; }
-                for (int j = 0; j < 4; ++j) { F[t][j] = __builtin_fmaf(dx, (float) P[t][j], F[t][j]); }
-            }
+            // exact int32 row sum over the block, then one fma per block (rs starts at +0)
+            for (int t = 0; t < nt; ++t) { rs[t] = __builtin_fmaf((float) is[t], q8_d(xq[t], K)[(koff + c0*AI4_TC)/qb], rs[t]); }
         }
-        if (st != AI4U_UK/AI4_TC) { for (int t = 0; t < nt; ++t) { rs[t] = (F[t][0] + F[t][2]) + (F[t][1] + F[t][3]); } }
         const float dw = ai4_fp16_to_fp32(dh[r]);
         for (int t = 0; t < nt; ++t) { acc[t][r] = __builtin_fmaf(dw, rs[t], acc[t][r]); }
     }
@@ -497,20 +489,20 @@ static bool unit_rows_direct(const uint8_t * blk, int k, uint32_t C, int nt, con
     }
 }
 
-// AIPFIX Q8 path, AVX2: rows decoded as in unit_rows_direct; two rows' byte sums packed to int16 (vpackssdw), level
-// (S - 510) >> 2 in int16, then one vpmaddwd per token against the tile's int16 activations gives exact int32 pair sums
-// (replaces cvtepi32_ps + fmadd per row). 256-wide blocks (one scale per unit): the int lanes are reduced exactly to
-// row sums, rs = d * (float) isum. 32-wide blocks: each int32 lane (a column pair) is scaled into a float lane per
-// block, F = fma(d, (float) lane, F), and the lanes are summed once per unit as (F01 + F45) + (F23 + F67). Then
-// acc = fma(fp16 scale, rs, acc) per unit. unit_rows_q8_scalar follows the same order, so the two are bit-identical.
-template <int K, int NT, int G, int R0, int ST, size_t... P>
+// AIPFIX Q8 path, AVX2: rows decoded as in unit_rows_direct; two rows' byte-pair sums joined by vphaddw (= vpackssdw of
+// their byte sums, S <= 1020), level (S - 510) >> 2 in int16, then one vpmaddwd per token against the tile's int16
+// activations gives exact int32 pair sums. Per quant block (256 wide: one per unit; 32 wide: four per unit) the int32
+// lanes are reduced exactly to row sums with vector adds (vphaddd + 128-bit half add), converted once, and
+// rs = fma(row sum, d, rs) per block; then acc = fma(fp16 scale, rs, acc) per unit. unit_rows_q8_scalar does the same
+// float steps in the same order, so the two are bit-identical. (r30: the reduce used to be scalar per token and row
+// pair, and the 32-wide case kept a float lane per column pair live next to the int lanes, which spilled at 5-8 tokens.)
+template <int K, int NT, int G, int R0, size_t... P>
 static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
                                                            __m256i sh, __m256i Cv, const int16_t * const (&xt)[NT],
                                                            __m256i (&ip)[NT][G/2], std::index_sequence<P...>) {
     auto pair = [&](auto pi) {
         constexpr int p = decltype(pi)::value;
 #if !defined(MOE_AI_Q8_PACKS)
-        // vphaddw of the two rows' byte-pair sums = vpackssdw of their byte sums (S <= 1020, no wrap); fewer ops
         const __m256i m0 = row_bytepair_direct<K, R0 + 2*p>(wt, f4, l4, T, sh, Cv);
         const __m256i m1 = row_bytepair_direct<K, R0 + 2*p + 1>(wt, f4, l4, T, sh, Cv);
         const __m256i s01 = _mm256_hadd_epi16(m0, m1);
@@ -527,16 +519,25 @@ static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, 
     (pair(std::integral_constant<int, (int) P>{}), ...);
 }
 
+// pair lanes: [r0 c01, r0 c23, r1 c01, r1 c23 | r0 c45, r0 c67, r1 c45, r1 c67] (int32, exact)
+static inline __attribute__((always_inline)) __m128i q8_half_add(__m256i v) {
+    return _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+}
+
+// dd[b][t][0] = dd[b][t][1] = token t's scale of the unit's quant block b (a token pair's [d0 d0 d1 d1] is one load)
 template <int K, int NT, int G, int R0, int ST>
 static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, const void * const * xq, int64_t koff,
-                                                           int64_t Kin, __m256i Cv, float (*acc)[AI4_TR]) {
-    constexpr int tw = AIK_TILE_WORDS(K), QB = ST*AI4_TC < AI4U_UK ? 32 : 256;
+                                                           const float (*dd)[8][2], __m256i Cv, float (*acc)[AI4_TR]) {
+    constexpr int tw = AIK_TILE_WORDS(K);
+    // float accumulators: G >= 8: one __m256 per token per 8 rows; G == 4: one __m128 per token; G == 2: one per token pair
+    constexpr int N8 = G >= 8 ? NT*(G/8) : 1, N4 = G == 4 ? NT : G == 2 ? (NT + 1)/2 : 1;
     const direct_tabs & T = direct_tables();
     const __m256i sh = _mm256_loadu_si256((const __m256i *) shuf_tables().sh[K]);
     const uint32_t * wd = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
-    float rs[NT][G] = {};
-    __m256 fp[NT][G/2];   // ST < 16 (32-wide blocks): per-lane float sums, reduced once per unit
-    if constexpr (ST < 16) { for (int t = 0; t < NT; ++t) { for (int p = 0; p < G/2; ++p) { fp[t][p] = _mm256_setzero_ps(); } } }
+    __m256 F8[N8];
+    __m128 F4[N4];
+    for (int i = 0; i < N8; ++i) { F8[i] = _mm256_setzero_ps(); }
+    for (int i = 0; i < N4; ++i) { F4[i] = _mm_setzero_ps(); }
     for (int c0 = 0; c0 < AI4U_UK/AI4_TC; c0 += ST) {
         __m256i ip[NT][G/2];
         for (int t = 0; t < NT; ++t) { for (int p = 0; p < G/2; ++p) { ip[t][p] = _mm256_setzero_si256(); } }
@@ -545,35 +546,40 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
             const __m128i f4 = _mm_loadu_si128((const __m128i *) wt), l4 = _mm_loadu_si128((const __m128i *) (wt + tw - 4));
             const int16_t * xt[NT];
             for (int t = 0; t < NT; ++t) { xt[t] = q8_xs(xq[t]) + (koff/AI4_TC + ct)*16; }
-            q8_pairs<K, NT, G, R0, ST>(wt, f4, l4, T, sh, Cv, xt, ip, std::make_index_sequence<G/2>{});
+            q8_pairs<K, NT, G, R0>(wt, f4, l4, T, sh, Cv, xt, ip, std::make_index_sequence<G/2>{});
         }
-        if constexpr (ST < 16) {
+        const float (*db)[2] = dd[c0/ST];
+        if constexpr (G >= 8) {
             for (int t = 0; t < NT; ++t) {
-                const __m256 dx = _mm256_set1_ps(q8_d(xq[t], Kin)[(koff + c0*AI4_TC)/QB]);
-                for (int p = 0; p < G/2; ++p) { fp[t][p] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ip[t][p]), dx, fp[t][p]); }
+                for (int q = 0; q < G/8; ++q) {
+                    const __m256i x01 = _mm256_hadd_epi32(ip[t][4*q], ip[t][4*q + 1]);   // [r0..r3 c0-3 | r0..r3 c4-7]
+                    const __m256i x23 = _mm256_hadd_epi32(ip[t][4*q + 2], ip[t][4*q + 3]);
+                    const __m256i z = _mm256_add_epi32(_mm256_permute2x128_si256(x01, x23, 0x20),
+                                                       _mm256_permute2x128_si256(x01, x23, 0x31));   // rows 0..7
+                    F8[t*(G/8) + q] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(z), _mm256_broadcast_ss(&db[t][0]), F8[t*(G/8) + q]);
+                }
             }
-            continue;
-        }
-        for (int t = 0; t < NT; ++t) {
-            const float dx = q8_d(xq[t], Kin)[(koff + c0*AI4_TC)/QB];
-            for (int p = 0; p < G/2; ++p) {
-                // lanes: [r0 c01, r0 c23, r1 c01, r1 c23 | r0 c45, r0 c67, r1 c45, r1 c67]
-                __m128i v = _mm_add_epi32(_mm256_castsi256_si128(ip[t][p]), _mm256_extracti128_si256(ip[t][p], 1));
-                v = _mm_hadd_epi32(v, v);
-                rs[t][2*p]     = __builtin_fmaf(dx, (float) _mm_cvtsi128_si32(v), rs[t][2*p]);
-                rs[t][2*p + 1] = __builtin_fmaf(dx, (float) _mm_extract_epi32(v, 1), rs[t][2*p + 1]);
+        } else if constexpr (G == 4) {
+            for (int t = 0; t < NT; ++t) {
+                const __m128i z = q8_half_add(_mm256_hadd_epi32(ip[t][0], ip[t][1]));   // rows 0..3
+                F4[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(z), _mm_broadcast_ss(&db[t][0]), F4[t]);
+            }
+        } else {
+            static_assert(G == 2, "q8 rows per group");
+            for (int tp = 0; tp < N4; ++tp) {
+                const __m256i i1 = 2*tp + 1 < NT ? ip[2*tp + 1 < NT ? 2*tp + 1 : 0][0] : _mm256_setzero_si256();
+                const __m128i z = q8_half_add(_mm256_hadd_epi32(ip[2*tp][0], i1));   // [r0 t0, r1 t0, r0 t1, r1 t1]
+                F4[tp] = _mm_fmadd_ps(_mm_cvtepi32_ps(z), _mm_loadu_ps(&db[2*tp][0]), F4[tp]);
             }
         }
     }
-    if constexpr (ST < 16) {
-        for (int t = 0; t < NT; ++t) {
-            for (int p = 0; p < G/2; ++p) {
-                __m128 v = _mm_add_ps(_mm256_castps256_ps128(fp[t][p]), _mm256_extractf128_ps(fp[t][p], 1));
-                v = _mm_hadd_ps(v, v);
-                rs[t][2*p] = _mm_cvtss_f32(v);
-                rs[t][2*p + 1] = _mm_cvtss_f32(_mm_movehdup_ps(v));
-            }
-        }
+    alignas(32) float rs[8][G];
+    if constexpr (G >= 8) {
+        for (int t = 0; t < NT; ++t) { for (int q = 0; q < G/8; ++q) { _mm256_storeu_ps(&rs[t][8*q], F8[t*(G/8) + q]); } }
+    } else if constexpr (G == 4) {
+        for (int t = 0; t < NT; ++t) { _mm_storeu_ps(&rs[t][0], F4[t]); }
+    } else {
+        for (int tp = 0; tp < N4; ++tp) { _mm_storeu_ps(&rs[2*tp][0], F4[tp]); }   // rs[t0][0..1], rs[t1][0..1]
     }
     const uint16_t * dh = (const uint16_t *) blk;
     for (int g = 0; g < G; ++g) {
@@ -583,16 +589,27 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
 }
 
 template <int K, int NT, int ST, size_t... J>
-static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv,
+static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int64_t koff, const float (*dd)[8][2], __m256i Cv,
                               float (*acc)[AI4_TR], std::index_sequence<J...>) {
     constexpr int G = AI4_TR/(int) sizeof...(J);
-    (q8_group<K, NT, G, (int) J*G, ST>(blk, xq, koff, Kin, Cv, acc), ...);
+    (q8_group<K, NT, G, (int) J*G, ST>(blk, xq, koff, dd, Cv, acc), ...);
 }
+
+// Rows per group by token count and block shape (home 5800X3D, 1 core): G = 4 at nt = 5 is 4-8% faster for down
+// (ST = 4, four Q8_0 blocks per unit) but 6-15% slower for gate/up (ST = 16), so only down takes it.
+#if !defined(MOE_AI_Q8_G)
+#define MOE_AI_Q8_G(NT, ST) ((NT) == 1 ? 16 : (NT) == 2 ? 8 : (NT) <= 4 || ((NT) == 5 && (ST) == 4) ? 4 : 2)
+#endif
 
 template <int K, int NT, int ST>
 static void unit_rows_q8_nt(const uint8_t * blk, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv, float (*acc)[AI4_TR]) {
-    constexpr int G = NT == 1 ? 16 : NT == 2 ? 8 : NT <= 4 ? 4 : 2;   // rows per group (G/2 int32 pair accumulators per token)
-    unit_rows_q8_impl<K, NT, ST>(blk, xq, koff, Kin, Cv, acc, std::make_index_sequence<AI4_TR/G>{});
+    constexpr int G = MOE_AI_Q8_G(NT, ST);   // rows per group (G/2 int32 pair accumulators per token)
+    constexpr int NB = AI4U_UK/AI4_TC/ST, QB = ST*AI4_TC < AI4U_UK ? 32 : 256;
+    alignas(16) float dd[NB][8][2] = {};
+    for (int b = 0; b < NB; ++b) {
+        for (int t = 0; t < NT; ++t) { dd[b][t][0] = dd[b][t][1] = q8_d(xq[t], Kin)[(koff + b*ST*AI4_TC)/QB]; }
+    }
+    unit_rows_q8_impl<K, NT, ST>(blk, xq, koff, dd, Cv, acc, std::make_index_sequence<AI4_TR/G>{});
 }
 
 template <int K, int ST>
