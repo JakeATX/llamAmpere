@@ -19,8 +19,8 @@
 
 namespace moe_ai {
 
-// ggml_from_float_t: x (k floats) -> y (k floats) in the AI+ rotated basis
-static void rotate(const float * x, void * vy, int64_t k) {
+// ggml_from_float_t: x (k floats) -> y (k floats) in the AI+ rotated basis (scalar reference)
+static void rotate_scalar(const float * x, void * vy, int64_t k) {
     float * y = (float *) vy;
     const int rb = ai4u_rot_size(k);
     const float s = ai4_rot_norm(rb);
@@ -30,6 +30,68 @@ static void rotate(const float * x, void * vy, int64_t k) {
         }
         ai4_fwht_n(y + b, rb);
     }
+}
+
+#if defined(__AVX2__)
+// AIPFAST: AVX2 rotate, bit-identical to rotate_scalar. Every output is the same chain of single float ops: one
+// multiply by +-1/sqrt(rb), then the same butterflies in the same stage order (h = 1, 2, 4 inside a register by lane
+// swaps, h >= 8 across registers). a + b is computed as a + b or b + a (IEEE addition is commutative bit for bit),
+// a - b always as x[j] - x[j + h]. The scalar version took ~6 us for one 2560-float row on the 5800X3D, run by one
+// thread while the other seven waited at the phase-0 barrier of every CPU-split job.
+static inline __m256 fwht8_avx2(__m256 v) {
+    __m256 s = _mm256_permute_ps(v, 0xB1);                                           // h = 1: x1 x0 x3 x2 ..
+    v = _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xAA);
+    s = _mm256_permute_ps(v, 0x4E);                                                  // h = 2: x2 x3 x0 x1 ..
+    v = _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xCC);
+    s = _mm256_permute2f128_ps(v, v, 1);                                             // h = 4: halves swapped
+    return _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xF0);
+}
+
+static const float * rot_signs(int rb) {   // +-1/sqrt(rb) per position of a rotation block (rb = 128 or 256)
+    static float t[2][256];
+    static const bool init = [] {
+        for (int w = 0; w < 2; ++w) {
+            const int n = w ? 256 : 128;
+            const float s = ai4_rot_norm(n);
+            for (int i = 0; i < n; ++i) { t[w][i] = ai4_sign_neg(i) ? -s : s; }
+        }
+        return true;
+    }();
+    (void) init;
+    return t[rb == 256];
+}
+
+static void rotate_avx2(const float * x, float * y, int64_t k) {
+    const int rb = ai4u_rot_size(k);
+    const float * sg = rot_signs(rb);
+    for (int64_t b = 0; b < k; b += rb) {
+        float * yb = y + b;
+        for (int i = 0; i < rb; i += 8) {
+            _mm256_storeu_ps(yb + i, fwht8_avx2(_mm256_mul_ps(_mm256_loadu_ps(x + b + i), _mm256_loadu_ps(sg + i))));
+        }
+        for (int h = 8; h < rb; h <<= 1) {
+            for (int i = 0; i < rb; i += 2*h) {
+                for (int j = i; j < i + h; j += 8) {
+                    const __m256 a = _mm256_loadu_ps(yb + j), c = _mm256_loadu_ps(yb + j + h);
+                    _mm256_storeu_ps(yb + j,     _mm256_add_ps(a, c));
+                    _mm256_storeu_ps(yb + j + h, _mm256_sub_ps(a, c));
+                }
+            }
+        }
+    }
+}
+#endif
+
+static bool rot_simd_on() {   // GGML_MOE_AI_HOST_ROTSIMD=0 keeps the scalar rotate / quantize (same bytes, slower)
+    static const bool on = [] { const char * e = getenv("GGML_MOE_AI_HOST_ROTSIMD"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
+static void rotate(const float * x, void * vy, int64_t k) {
+#if defined(__AVX2__)
+    if (rot_simd_on() && k % 128 == 0) { rotate_avx2(x, (float *) vy, k); return; }
+#endif
+    rotate_scalar(x, vy, k);
 }
 
 // tile bit stream (4k words, MSB first in each word, circular) -> bytes in stream order with the last 4 bytes in front
@@ -115,8 +177,8 @@ static inline uint16_t q8_fp32_to_fp16(float f) {   // ggml's portable fp32 -> f
     return (uint16_t) ((sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign));
 }
 
-// y: K rotated floats (rotate() output) -> one token's q8 buffer
-static void quant_q8(const float * y, void * vq, int64_t K) {
+// y: K rotated floats (rotate() output) -> one token's q8 buffer (scalar reference)
+static void quant_q8_scalar(const float * y, void * vq, int64_t K) {
     int16_t * xs = (int16_t *) vq;
     float * d = (float *) ((uint8_t *) vq + (size_t) K*4);
     const int qb = q8_block(K);
@@ -146,6 +208,69 @@ static void quant_q8(const float * y, void * vq, int64_t K) {
             for (int i = 0; i < 4; ++i) { o[i] = o[4 + i] = q[j + i]; o[8 + i] = o[12 + i] = q[j + 4 + i]; }
         }
     }
+}
+
+#if defined(__AVX2__)
+// AIPFAST: AVX2 quant_q8, bit-identical to quant_q8_scalar. Q8_K: the same first-largest |x| (vector max, then the
+// first index holding it), q = round-half-even(iscale * x) by _mm256_round_ps (what q8_nearest_int computes for
+// |v| < 2^22), clamped at 127. Q8_0: round-half-away(x * id) as trunc plus one step when |v - trunc| >= 0.5 (v - trunc
+// is exact). Lane order of the int16 copy: packs(v, v) of 8 int32 levels gives x0..3 x0..3 | x4..7 x4..7.
+static inline void q8_store8(int16_t * o, __m256i v) {
+    _mm256_storeu_si256((__m256i *) o, _mm256_packs_epi32(v, v));
+}
+
+static void quant_q8_avx2(const float * y, void * vq, int64_t K) {
+    int16_t * xs = (int16_t *) vq;
+    float * d = (float *) ((uint8_t *) vq + (size_t) K*4);
+    const int qb = q8_block(K);
+    const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    for (int64_t b = 0; b < K/qb; ++b) {
+        const float * x = y + b*qb;
+        int16_t * o = xs + (size_t) b*qb*2;
+        __m256 vm = _mm256_setzero_ps();
+        for (int j = 0; j < qb; j += 8) { vm = _mm256_max_ps(vm, _mm256_and_ps(_mm256_loadu_ps(x + j), absm)); }
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(vm), _mm256_extractf128_ps(vm, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+        const float amax = _mm_cvtss_f32(m4);
+        if (qb == 256) {
+            if (amax == 0.0f) {
+                d[b] = 0.0f;
+                memset(o, 0, (size_t) qb*2*sizeof(int16_t));
+                continue;
+            }
+            int jm = 0;
+            while (__builtin_fabsf(x[jm]) != amax) { ++jm; }
+            const float iscale = -127.f/x[jm];
+            const __m256 vs = _mm256_set1_ps(iscale);
+            const __m256i hi = _mm256_set1_epi32(127);
+            for (int j = 0; j < qb; j += 8) {
+                const __m256 v = _mm256_round_ps(_mm256_mul_ps(vs, _mm256_loadu_ps(x + j)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                q8_store8(o + 2*j, _mm256_min_epi32(_mm256_cvtps_epi32(v), hi));
+            }
+            d[b] = 1/iscale;
+        } else {
+            const float dd = amax/127.f, id = dd != 0.0f ? 1.0f/dd : 0.0f;
+            const __m256 vi = _mm256_set1_ps(id), half = _mm256_set1_ps(0.5f), one = _mm256_set1_ps(1.0f);
+            const __m256 sgn = _mm256_castsi256_ps(_mm256_set1_epi32((int) 0x80000000u));
+            for (int j = 0; j < qb; j += 8) {
+                const __m256 v = _mm256_mul_ps(_mm256_loadu_ps(x + j), vi);
+                const __m256 t = _mm256_round_ps(v, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+                const __m256 up = _mm256_cmp_ps(_mm256_and_ps(_mm256_sub_ps(v, t), absm), half, _CMP_GE_OQ);
+                const __m256 st = _mm256_or_ps(_mm256_and_ps(v, sgn), one);   // +-1 with v's sign
+                q8_store8(o + 2*j, _mm256_cvtps_epi32(_mm256_add_ps(t, _mm256_and_ps(up, st))));
+            }
+            d[b] = ai4_fp16_to_fp32(q8_fp32_to_fp16(dd));
+        }
+    }
+}
+#endif
+
+static void quant_q8(const float * y, void * vq, int64_t K) {
+#if defined(__AVX2__)
+    if (rot_simd_on()) { quant_q8_avx2(y, vq, K); return; }
+#endif
+    quant_q8_scalar(y, vq, K);
 }
 
 // ggml_from_float_t for the Q8 path: rotate into the weights' basis, then quantize (K <= 8192)

@@ -34,6 +34,49 @@ int main(int argc, char ** argv) {
     printf("path: scalar\n");
 #endif
     int fails = 0;
+#if defined(__AVX2__)
+    {
+        // AIPFAST: AVX2 rotate + quant_q8 == scalar bit for bit (random rows at several scales, rows with a tied largest
+        // |x| of both signs, all-zero blocks, values on .5 steps), then timed per 2560/640-float row
+        std::vector<float> x(2560), ya(2560), ys(2560);
+        std::vector<uint8_t> qa(moe_ai::q8_bytes(2560)), qs(moe_ai::q8_bytes(2560));
+        int bad_r = 0, bad_q = 0, cases = 0;
+        for (int64_t K : { (int64_t) 2560, (int64_t) 640 }) {
+            for (int it = 0; it < 4000; ++it) {
+                const float sc = std::ldexp(1.0f, (it % 40) - 20);
+                for (int64_t i = 0; i < K; ++i) { x[i] = uni(rng) * sc; }
+                if (it % 7 == 1) { const int64_t a = rng() % K, b = rng() % K; x[a] = 2.0f * sc; x[b] = -2.0f * sc; }
+                if (it % 11 == 2) { std::fill(x.begin(), x.begin() + (K % 256 ? 128 : 256), 0.0f); }   // one zero rotation / q8 block
+                if (it % 13 == 3) { for (int64_t i = 0; i < K; ++i) { x[i] = 0.5f * (float) ((int) (rng() % 255) - 127); } }
+                moe_ai::rotate_avx2(x.data(), ya.data(), K);
+                moe_ai::rotate_scalar(x.data(), ys.data(), K);
+                bad_r += memcmp(ya.data(), ys.data(), K * sizeof(float)) != 0;
+                // quantize both the rotated rows and the raw rows (the raw .5 steps exercise the rounding ties)
+                for (const float * src : { (const float *) ys.data(), (const float *) x.data() }) {
+                    moe_ai::quant_q8_avx2(src, qa.data(), K);
+                    moe_ai::quant_q8_scalar(src, qs.data(), K);
+                    bad_q += memcmp(qa.data(), qs.data(), moe_ai::q8_bytes(K)) != 0;
+                }
+                ++cases;
+            }
+            const int nr = 20000;
+            auto tm = [&](auto && f) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < nr; ++i) { f(); }
+                return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / nr;
+            };
+            const double rs = tm([&] { moe_ai::rotate_scalar(x.data(), ys.data(), K); });
+            const double ra = tm([&] { moe_ai::rotate_avx2(x.data(), ya.data(), K); });
+            const double qsu = tm([&] { moe_ai::quant_q8_scalar(ys.data(), qs.data(), K); });
+            const double qau = tm([&] { moe_ai::quant_q8_avx2(ys.data(), qa.data(), K); });
+            printf("rotate/quant_q8 K=%5lld: rotate scalar %.2f us avx2 %.2f us, quant_q8 scalar %.2f us avx2 %.2f us (1 thread)\n",
+                   (long long) K, rs, ra, qsu, qau);
+        }
+        printf("rotate/quant_q8 AVX2 vs scalar: %d cases, rotate mismatches %d, quant mismatches %d  %s\n",
+               cases, bad_r, bad_q, bad_r || bad_q ? "FAIL" : "OK");
+        fails += bad_r != 0 || bad_q != 0;
+    }
+#endif
     for (ggml_type type : types) {
         const int k = ggml_ai4_rate(type);
         const uint32_t C = ggml_ai4_trellis_mul(type);
