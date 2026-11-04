@@ -254,16 +254,21 @@ int main(int argc, char ** argv) {
                         moe_ai::quant_q8(yp[t], (void *) qp[t], K);
                     }
                     std::vector<float> oq((size_t) nt * M), os((size_t) nt * M), ov((size_t) nt * M);
-                    auto run_q = [&](std::vector<float> & o, bool scalar, int vbmi = 0) {
+                    auto run_q = [&](std::vector<float> & o, bool scalar, int vbmi = 0, int lv = 0) {
                         float * opq[8];
                         for (int64_t a = 0; a < M; a += AI4_TR) {
                             for (int t = 0; t < nt; ++t) { opq[t] = o.data() + t * M + a; }
-                            moe_ai::slab_rows_q8((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, qp, opq, scalar, vbmi);
+                            moe_ai::slab_rows_q8((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, qp, opq, scalar, vbmi, lv);
                         }
                     };
                     run_q(oq, false);
                     run_q(os, true);
-                    const bool samea = memcmp(oq.data(), os.data(), oq.size() * sizeof(float)) == 0;
+                    // AIPFIX: opt-in gate/up level kernel (GGML_MOE_AI_HOST_Q8_LV) == scalar bit for bit (down ignores lv)
+                    std::vector<float> ol((size_t) nt * M);
+                    run_q(ol, false, 0, 1);
+                    const bool samel = memcmp(ol.data(), os.data(), ol.size() * sizeof(float)) == 0;
+                    if (!samel) { printf("%-8s K=%5lld M=%5lld nt=%d  q8 lv==scalar DIFFERENT FAIL\n", ggml_type_name(type), (long long) K, (long long) M, nt); }
+                    const bool samea = samel && memcmp(oq.data(), os.data(), oq.size() * sizeof(float)) == 0;
                     // AIPFIX: AVX-512 VBMI + VNNI q8 kernel (opt-in GGML_MOE_AI_HOST_Q8_VBMI=1) == scalar bit for bit, where present
 #if defined(__AVX2__) && defined(__FMA__)
                     const bool hv = moe_ai::has_q8_vbmi();

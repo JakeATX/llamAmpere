@@ -150,12 +150,22 @@ static inline void row_levels_scalar(const uint32_t * E, int k, uint32_t C, int 
 // sum over units of fp16 scale * (sum over the unit's blocks of d * int dot). This CHANGES output vs the float path
 // (activation rounding, the same class of rounding 3XS has on its int8 activations).
 // One token's buffer (q8_bytes): int16 xs[K/8][16] (tile c: x[8c..8c+3] twice, then x[8c+4..8c+7] twice, the lane order
-// of a packed 2-row level pair), then float d[K/qb].
+// of a packed 2-row level pair), then float d[K/qb]. Q8_K only (gate/up), in the spare d slots after d[K/256]: int32
+// xu[K/128] = 128 * (sum of the q of each 128-column unit), used by the opt-in LV kernel (GGML_MOE_AI_HOST_Q8_LV=1).
 static inline int q8_block(int64_t K) { return K % 256 == 0 ? 256 : 32; }
 static inline size_t q8_bytes(int64_t K) { return (size_t) K*4 + (size_t) (K/32)*sizeof(float); }
+static inline int32_t * q8_xu_w(void * q, int64_t K) { return (int32_t *) ((uint8_t *) q + (size_t) K*4) + K/256; }
 
 static bool use_host_q8() {
     static const bool on = [] { const char * e = getenv("GGML_MOE_AI_HOST_Q8"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
+// AIPFIX: opt-in gate/up level trick for the AVX2 q8 kernel (GGML_MOE_AI_HOST_Q8_LV=1 with GGML_MOE_AI_HOST_Q8=1).
+// Same integers, so bit-identical to the default q8 kernel (see q8_pairs). Down (Q8_0, four blocks per unit) keeps the
+// default kernel: there the per-block correction cost more than it saved (HOSTGAP.md section 4).
+static bool use_q8_lv() {
+    static const bool on = [] { const char * e = getenv("GGML_MOE_AI_HOST_Q8_LV"); return e && e[0] == '1'; }();
     return on;
 }
 
@@ -193,6 +203,21 @@ static inline uint16_t q8_fp32_to_fp16(float f) {   // ggml's portable fp32 -> f
     return (uint16_t) ((sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign));
 }
 
+// Q8_K buffers: xu[u] = 128 * (sum of q over 128-column unit u), read back from the stored int16 copy (exact)
+static inline void q8_fill_xu(void * vq, int64_t K) {
+    if (q8_block(K) != 256) { return; }
+    const int16_t * xs = (const int16_t *) vq;
+    int32_t * xu = q8_xu_w(vq, K);
+    for (int64_t u = 0; u < K/128; ++u) {
+        int32_t s = 0;
+        for (int c = 0; c < 128/AI4_TC; ++c) {
+            const int16_t * o = xs + (u*(128/AI4_TC) + c)*16;
+            for (int i = 0; i < 4; ++i) { s += o[i] + o[8 + i]; }
+        }
+        xu[u] = 128*s;
+    }
+}
+
 // y: K rotated floats (rotate() output) -> one token's q8 buffer (scalar reference)
 static void quant_q8_scalar(const float * y, void * vq, int64_t K) {
     int16_t * xs = (int16_t *) vq;
@@ -224,6 +249,7 @@ static void quant_q8_scalar(const float * y, void * vq, int64_t K) {
             for (int i = 0; i < 4; ++i) { o[i] = o[4 + i] = q[j + i]; o[8 + i] = o[12 + i] = q[j + 4 + i]; }
         }
     }
+    q8_fill_xu(vq, K);
 }
 
 #if defined(__AVX2__) && defined(__FMA__)
@@ -279,6 +305,7 @@ static void quant_q8_avx2(const float * y, void * vq, int64_t K) {
             d[b] = ai4_fp16_to_fp32(q8_fp32_to_fp16(dd));
         }
     }
+    q8_fill_xu(vq, K);
 }
 #endif
 
@@ -298,6 +325,7 @@ static void rotate_q8(const float * x, void * vq, int64_t k) {
 
 static inline const int16_t * q8_xs(const void * q) { return (const int16_t *) q; }
 static inline const float * q8_d(const void * q, int64_t K) { return (const float *) ((const uint8_t *) q + (size_t) K*4); }
+static inline const int32_t * q8_xu(const void * q, int64_t K) { return q8_xu_w((void *) q, K); }
 
 // scalar reference of the Q8 path (and the non-AVX2 fallback): same integer dots, same float order as the AVX2 kernel
 static void unit_rows_q8_scalar(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
@@ -639,7 +667,10 @@ static bool unit_rows_direct(const uint8_t * blk, int k, uint32_t C, int nt, con
 // pair, and the 32-wide case kept a float lane per column pair live next to the int lanes, which spilled at 5-8 tokens.)
 // KP (R8 host cache fill, GGML_MOE_AI_HOST_R8_MB): also store the pair's int8 levels into the R8 words at dst (tile base;
 // rows R, R + 1 are adjacent 4-byte lanes of group R/8, gs bytes between the slab's two groups). The dots are unchanged.
-template <int K, int NT, int G, int R0, bool KP, size_t... P>
+// LV (opt-in GGML_MOE_AI_HOST_Q8_LV, gate/up only, never with KP): level + 128 = (S + 2) >> 2 = vpmulhrsw(S, 8192), one
+// op instead of vpsubw + vpsraw ((S * 8192 + 2^14) >> 15 is exact for S in [0, 1020]); the dots then hold
+// sum (level + 128) * q, and q8_group subtracts 128 * sum q of the unit (q8_xu) before the convert: the same int32 row sums.
+template <int K, int NT, int G, int R0, bool KP, bool LV, size_t... P>
 static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
                                                            __m256i sh, __m256i Cv, const int16_t * const (&xt)[NT],
                                                            __m256i (&ip)[NT][G/2], int8_t * dst, int64_t gs,
@@ -655,7 +686,9 @@ static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, 
         const __m256i s1 = row_bytesum_direct<K, R0 + 2*p + 1>(wt, f4, l4, T, sh, Cv);
         const __m256i s01 = _mm256_packs_epi32(s0, s1);
 #endif
-        const __m256i lev = _mm256_srai_epi16(_mm256_sub_epi16(s01, _mm256_set1_epi16(510)), 2);
+        static_assert(!(KP && LV), "the R8 fill stores signed levels");
+        const __m256i lev = LV ? _mm256_mulhrs_epi16(s01, _mm256_set1_epi16(8192))
+                               : _mm256_srai_epi16(_mm256_sub_epi16(s01, _mm256_set1_epi16(510)), 2);
         if constexpr (KP) {   // lev int16 [rR c0-3, rR+1 c0-3 | rR c4-7, rR+1 c4-7], all in [-128, 127]: packs is exact
             constexpr int R = R0 + 2*p;
             const __m256i b8 = _mm256_packs_epi16(lev, lev);
@@ -676,10 +709,12 @@ static inline __attribute__((always_inline)) __m128i q8_half_add(__m256i v) {
 }
 
 // dd[b][t][0] = dd[b][t][1] = token t's scale of the unit's quant block b (a token pair's [d0 d0 d1 d1] is one load)
-template <int K, int NT, int G, int R0, int ST, bool KP>
+// xc[t][0] = xc[t][1] = 128 * token t's sum of q over this unit (LV only; ST = 16, one block per unit)
+template <int K, int NT, int G, int R0, int ST, bool KP, bool LV>
 static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, const void * const * xq, int64_t koff,
-                                                           const float (*dd)[8][2], __m256i Cv, float (*acc)[AI4_TR],
-                                                           int8_t * Wu, int64_t gs) {
+                                                           const float (*dd)[8][2], const int32_t (*xc)[2], __m256i Cv,
+                                                           float (*acc)[AI4_TR], int8_t * Wu, int64_t gs) {
+    static_assert(!LV || ST == AI4U_UK/AI4_TC, "LV corrects once per unit");
     constexpr int tw = AIK_TILE_WORDS(K);
     // float accumulators: G >= 8: one __m256 per token per 8 rows; G == 4: one __m128 per token; G == 2: one per token pair
     constexpr int N8 = G >= 8 ? NT*(G/8) : 1, N4 = G == 4 ? NT : G == 2 ? (NT + 1)/2 : 1;
@@ -698,7 +733,7 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
             const __m128i f4 = _mm_loadu_si128((const __m128i *) wt), l4 = _mm_loadu_si128((const __m128i *) (wt + tw - 4));
             const int16_t * xt[NT];
             for (int t = 0; t < NT; ++t) { xt[t] = q8_xs(xq[t]) + (koff/AI4_TC + ct)*16; }
-            q8_pairs<K, NT, G, R0, KP>(wt, f4, l4, T, sh, Cv, xt, ip, KP ? Wu + ct*(AI4_TC/4)*32 : nullptr, gs,
+            q8_pairs<K, NT, G, R0, KP, LV>(wt, f4, l4, T, sh, Cv, xt, ip, KP ? Wu + ct*(AI4_TC/4)*32 : nullptr, gs,
                                        std::make_index_sequence<G/2>{});
         }
         const float (*db)[2] = dd[c0/ST];
@@ -707,21 +742,24 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
                 for (int q = 0; q < G/8; ++q) {
                     const __m256i x01 = _mm256_hadd_epi32(ip[t][4*q], ip[t][4*q + 1]);   // [r0..r3 c0-3 | r0..r3 c4-7]
                     const __m256i x23 = _mm256_hadd_epi32(ip[t][4*q + 2], ip[t][4*q + 3]);
-                    const __m256i z = _mm256_add_epi32(_mm256_permute2x128_si256(x01, x23, 0x20),
-                                                       _mm256_permute2x128_si256(x01, x23, 0x31));   // rows 0..7
+                    __m256i z = _mm256_add_epi32(_mm256_permute2x128_si256(x01, x23, 0x20),
+                                                 _mm256_permute2x128_si256(x01, x23, 0x31));   // rows 0..7
+                    if constexpr (LV) { z = _mm256_sub_epi32(z, _mm256_set1_epi32(xc[t][0])); }
                     F8[t*(G/8) + q] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(z), _mm256_broadcast_ss(&db[t][0]), F8[t*(G/8) + q]);
                 }
             }
         } else if constexpr (G == 4) {
             for (int t = 0; t < NT; ++t) {
-                const __m128i z = q8_half_add(_mm256_hadd_epi32(ip[t][0], ip[t][1]));   // rows 0..3
+                __m128i z = q8_half_add(_mm256_hadd_epi32(ip[t][0], ip[t][1]));   // rows 0..3
+                if constexpr (LV) { z = _mm_sub_epi32(z, _mm_set1_epi32(xc[t][0])); }
                 F4[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(z), _mm_broadcast_ss(&db[t][0]), F4[t]);
             }
         } else {
             static_assert(G == 2, "q8 rows per group");
             for (int tp = 0; tp < N4; ++tp) {
                 const __m256i i1 = 2*tp + 1 < NT ? ip[2*tp + 1 < NT ? 2*tp + 1 : 0][0] : _mm256_setzero_si256();
-                const __m128i z = q8_half_add(_mm256_hadd_epi32(ip[2*tp][0], i1));   // [r0 t0, r1 t0, r0 t1, r1 t1]
+                __m128i z = q8_half_add(_mm256_hadd_epi32(ip[2*tp][0], i1));   // [r0 t0, r1 t0, r0 t1, r1 t1]
+                if constexpr (LV) { z = _mm_sub_epi32(z, _mm_loadu_si128((const __m128i *) &xc[2*tp][0])); }   // [x t0, x t0, x t1, x t1]
                 F4[tp] = _mm_fmadd_ps(_mm_cvtepi32_ps(z), _mm_loadu_ps(&db[2*tp][0]), F4[tp]);
             }
         }
@@ -741,11 +779,12 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
     }
 }
 
-template <int K, int NT, int ST, bool KP, size_t... J>
-static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int64_t koff, const float (*dd)[8][2], __m256i Cv,
-                              float (*acc)[AI4_TR], int8_t * Wu, int64_t gs, std::index_sequence<J...>) {
+template <int K, int NT, int ST, bool KP, bool LV, size_t... J>
+static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int64_t koff, const float (*dd)[8][2],
+                              const int32_t (*xc)[2], __m256i Cv, float (*acc)[AI4_TR], int8_t * Wu, int64_t gs,
+                              std::index_sequence<J...>) {
     constexpr int G = AI4_TR/(int) sizeof...(J);
-    (q8_group<K, NT, G, (int) J*G, ST, KP>(blk, xq, koff, dd, Cv, acc, Wu, gs), ...);
+    (q8_group<K, NT, G, (int) J*G, ST, KP, LV>(blk, xq, koff, dd, xc, Cv, acc, Wu, gs), ...);
 }
 
 // Rows per group by token count and block shape (home 5800X3D, 1 core): G = 4 at nt = 5 is 4-8% faster for down
@@ -754,7 +793,7 @@ static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int6
 #define MOE_AI_Q8_G(NT, ST) ((NT) == 1 ? 16 : (NT) == 2 ? 8 : (NT) <= 4 || ((NT) == 5 && (ST) == 4) ? 4 : 2)
 #endif
 
-template <int K, int NT, int ST, bool KP>
+template <int K, int NT, int ST, bool KP, bool LV>
 static void unit_rows_q8_nt(const uint8_t * blk, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv, float (*acc)[AI4_TR],
                             int8_t * Wu, int64_t gs) {
     constexpr int G = MOE_AI_Q8_G(NT, ST);   // rows per group (G/2 int32 pair accumulators per token)
@@ -763,43 +802,49 @@ static void unit_rows_q8_nt(const uint8_t * blk, const void * const * xq, int64_
     for (int b = 0; b < NB; ++b) {
         for (int t = 0; t < NT; ++t) { dd[b][t][0] = dd[b][t][1] = q8_d(xq[t], Kin)[(koff + b*ST*AI4_TC)/QB]; }
     }
-    unit_rows_q8_impl<K, NT, ST, KP>(blk, xq, koff, dd, Cv, acc, Wu, gs, std::make_index_sequence<AI4_TR/G>{});
+    alignas(16) int32_t xc[8][2] = {};   // a token pair's [x0 x0 x1 x1] is one load; odd tails read a zero pair
+    if constexpr (LV) {
+        for (int t = 0; t < NT; ++t) { xc[t][0] = xc[t][1] = q8_xu(xq[t], Kin)[koff/AI4U_UK]; }
+    }
+    unit_rows_q8_impl<K, NT, ST, KP, LV>(blk, xq, koff, dd, xc, Cv, acc, Wu, gs, std::make_index_sequence<AI4_TR/G>{});
 }
 
-template <int K, int ST, bool KP>
+template <int K, int ST, bool KP, bool LV>
 static void unit_rows_q8_k(const uint8_t * blk, int nt, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv,
                            float (*acc)[AI4_TR], int8_t * Wu, int64_t gs) {
     switch (nt) {
-        case 1:  unit_rows_q8_nt<K, 1, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
-        case 2:  unit_rows_q8_nt<K, 2, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
-        case 3:  unit_rows_q8_nt<K, 3, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
-        case 4:  unit_rows_q8_nt<K, 4, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
-        case 5:  unit_rows_q8_nt<K, 5, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
-        case 6:  unit_rows_q8_nt<K, 6, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
-        case 7:  unit_rows_q8_nt<K, 7, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
-        default: unit_rows_q8_nt<K, 8, ST, KP>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 1:  unit_rows_q8_nt<K, 1, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 2:  unit_rows_q8_nt<K, 2, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 3:  unit_rows_q8_nt<K, 3, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 4:  unit_rows_q8_nt<K, 4, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 5:  unit_rows_q8_nt<K, 5, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 6:  unit_rows_q8_nt<K, 6, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        case 7:  unit_rows_q8_nt<K, 7, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
+        default: unit_rows_q8_nt<K, 8, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
     }
 }
 
-template <int ST, bool KP = false>
+template <int ST, bool KP = false, bool LV = false>
 static bool unit_rows_q8_st(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
                             float (*acc)[AI4_TR], int8_t * Wu = nullptr, int64_t gs = 0) {
     const __m256i Cv = _mm256_set1_epi32((int) C);
     switch (k) {
-        case 2: unit_rows_q8_k<2, ST, KP>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
-        case 3: unit_rows_q8_k<3, ST, KP>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
-        case 4: unit_rows_q8_k<4, ST, KP>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
-        case 5: unit_rows_q8_k<5, ST, KP>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
+        case 2: unit_rows_q8_k<2, ST, KP, LV>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
+        case 3: unit_rows_q8_k<3, ST, KP, LV>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
+        case 4: unit_rows_q8_k<4, ST, KP, LV>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
+        case 5: unit_rows_q8_k<5, ST, KP, LV>(blk, nt, xq, koff, Kin, Cv, acc, Wu, gs); return true;
         default: return false;
     }
 }
 
 // k in 2..5 with valid row-window tables; returns false (nothing done) otherwise
+// lv: 1 = LV kernel for gate/up, 0 = default, -1 = GGML_MOE_AI_HOST_Q8_LV
 static bool unit_rows_q8(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
-                         float (*acc)[AI4_TR]) {
+                         float (*acc)[AI4_TR], int lv = -1) {
     if (!direct_tables().ok) { return false; }
-    return q8_block(Kin) == 256 ? unit_rows_q8_st<16>(blk, k, C, nt, xq, koff, Kin, acc)
-                                : unit_rows_q8_st<4>(blk, k, C, nt, xq, koff, Kin, acc);
+    if (q8_block(Kin) != 256) { return unit_rows_q8_st<4>(blk, k, C, nt, xq, koff, Kin, acc); }
+    return (lv > 0 || (lv < 0 && use_q8_lv())) ? unit_rows_q8_st<16, false, true>(blk, k, C, nt, xq, koff, Kin, acc)
+                                               : unit_rows_q8_st<16>(blk, k, C, nt, xq, koff, Kin, acc);
 }
 
 // AVX-512 (Zen 4/5 hosts, runtime-dispatched; the build targets Zen 3): tile rows r and r + 1 in one 512-bit decode.
@@ -1229,7 +1274,7 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
 // scalar = true forces the scalar reference (the test checks AVX2 == scalar bit for bit). vbmi: -1 = AVX-512 VBMI+VNNI
 // kernel when GGML_MOE_AI_HOST_Q8_VBMI=1 and the host has it, 0 = never, 1 = whenever the host has it (test/bench).
 static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
-                         const void * const * xq, float * const * o, bool scalar = false, int vbmi = -1) {
+                         const void * const * xq, float * const * o, bool scalar = false, int vbmi = -1, int lv = -1) {
     const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
     const int ub = AI4U_UNIT_BYTES(k);
     float acc[8][AI4_TR] = {};
@@ -1239,7 +1284,7 @@ static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, in
         if (!scalar && C != 0 && (vbmi > 0 || (vbmi < 0 && use_q8_vbmi())) && unit_rows_q8_vbmi(blk, k, C, nt, xq, u*AI4U_UK, K, acc)) {
             continue;
         }
-        if (!scalar && C != 0 && unit_rows_q8(blk, k, C, nt, xq, u*AI4U_UK, K, acc)) { continue; }
+        if (!scalar && C != 0 && unit_rows_q8(blk, k, C, nt, xq, u*AI4U_UK, K, acc, lv)) { continue; }
 #endif
         unit_rows_q8_scalar(blk, k, C, nt, xq, u*AI4U_UK, K, acc);
     }
