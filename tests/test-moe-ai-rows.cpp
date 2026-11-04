@@ -2,7 +2,8 @@
 // (aik_dequantize_slab_c to f32 in the original basis, then f32 dot products), on Qwen3.8 Flash-Next expert shapes:
 // gate/up 2560 in x 640 out, down 640 in x 2560 out, for AIT2_U / AIT3_U / AIT4_U / AIT5_U and 1, 2 and 8 tokens.
 // Weights are random bit streams with random scales; inputs random. Pass: every output within 2e-5 relative to the
-// largest reference output of its projection (float summation order differs). Exit code 1 on failure.
+// largest reference output of its projection (float summation order differs). The opt-in q8 path (int8 activations)
+// must match its scalar reference bit for bit and stay within 5% of max|ref| (its error is reported). Exit code 1 on failure.
 //
 //   test-moe-ai-rows [reps for timing, default 20]
 #include "../ggml/src/ggml-cuda/moe-ai-rows.h"
@@ -188,6 +189,50 @@ int main(int argc, char ** argv) {
                            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t3).count() / reps);
                 }
 #endif
+                {
+                    // AIPFIX: opt-in int8-activation path (slab_rows_q8): AVX2 == scalar reference bit for bit, error vs the
+                    // double reference from activation rounding only (reported; sanity bound 5% of max|ref|), timed vs the
+                    // default float path
+                    std::vector<uint8_t> qb((size_t) nt * moe_ai::q8_bytes(K));
+                    const void * qp[8];
+                    for (int t = 0; t < nt; ++t) {
+                        qp[t] = qb.data() + t * moe_ai::q8_bytes(K);
+                        moe_ai::quant_q8(yp[t], (void *) qp[t], K);
+                    }
+                    std::vector<float> oq((size_t) nt * M), os((size_t) nt * M);
+                    auto run_q = [&](std::vector<float> & o, bool scalar) {
+                        float * opq[8];
+                        for (int64_t a = 0; a < M; a += AI4_TR) {
+                            for (int t = 0; t < nt; ++t) { opq[t] = o.data() + t * M + a; }
+                            moe_ai::slab_rows_q8((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, qp, opq, scalar);
+                        }
+                    };
+                    run_q(oq, false);
+                    run_q(os, true);
+                    const bool same = memcmp(oq.data(), os.data(), oq.size() * sizeof(float)) == 0;
+                    float sc = 0.0f, eabs = 0.0f, erel = 0.0f;
+                    for (size_t i = 0; i < ref.size(); ++i) { sc = std::max(sc, std::fabs(ref[i])); }
+                    for (size_t i = 0; i < ref.size(); ++i) {
+                        const float e = std::fabs(oq[i] - ref[i]);
+                        eabs = std::max(eabs, e);
+                        if (std::fabs(ref[i]) > 0.1f * sc) { erel = std::max(erel, e / std::fabs(ref[i])); }
+                    }
+                    const bool ok = same && eabs <= 0.05f * sc;
+                    fails += !ok;
+                    double uq = 0.0, uf = 0.0;
+                    for (int rep = 0; rep < 2; ++rep) {
+                        for (int j = 0; j < 2; ++j) {
+                            const bool q8 = (rep ^ j) == 0;
+                            const auto ta = std::chrono::steady_clock::now();
+                            for (int i = 0; i < reps; ++i) { if (q8) { run_q(oq, false); } else { run(); } }
+                            const double d = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ta).count() / (2.0 * reps);
+                            (q8 ? uq : uf) += d;
+                        }
+                    }
+                    printf("%-8s K=%5lld M=%5lld nt=%d  q8: avx2==scalar %s  max|err| %.3e  max|err|/max|ref| %.2e  max rel err (|ref| > 10%% max) %.2e  %s  q8 %.1f us vs default %.1f us /projection (1 thread)\n",
+                           ggml_type_name(type), (long long) K, (long long) M, nt, same ? "OK" : "DIFFERENT", eabs, eabs / sc, erel,
+                           ok ? "OK" : "FAIL", uq, uf);
+                }
                 float scale = 0.0f, err = 0.0f;
                 for (size_t i = 0; i < ref.size(); ++i) { scale = std::max(scale, std::fabs(ref[i])); }
                 for (size_t i = 0; i < ref.size(); ++i) { err = std::max(err, std::fabs(out[i] - ref[i])); }

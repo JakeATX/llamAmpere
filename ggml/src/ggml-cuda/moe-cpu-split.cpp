@@ -53,7 +53,8 @@ static void moe_ai_log_first(const char * role) {
 #else
     const char * isa = "scalar";
 #endif
-    fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s\n", role, isa);
+    fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s act=%s\n", role, isa,
+            moe_ai::use_host_q8() ? "q8 (GGML_MOE_AI_HOST_Q8=1)" : "f32");
 }
 
 namespace {
@@ -441,6 +442,7 @@ struct role_math {
     moe_cs_role r;
     ggml_vec_dot_t dot = nullptr;
     bool ai = false;            // fork AIPFIX D2: AI+ unit expert (moe_ai::slab_rows on rotated f32 inputs)
+    bool ai_q8 = false;         // AIPFIX: opt-in int8 activations (moe_ai::slab_rows_q8, GGML_MOE_AI_HOST_Q8=1)
     int ai_k = 0;
     uint32_t ai_C = 0;
     bool q2 = false;            // dot_q2_0_q8_0 instead of ggml's kernel
@@ -627,17 +629,24 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
                 const int nt = std::min(8, s.first[i + 1] - q0);
                 const float * yu[8];
                 const float * yg[8];
+                const void * qu[8];
+                const void * qg[8];
                 for (int t = 0; t < nt; ++t) {
                     const int q = s.input_of[q0 + t];
-                    yu[t] = (const float *) (xq + (size_t) q * s.xq_stride);
-                    yg[t] = (const float *) (xq + (xg + q) * s.xq_stride);
+                    qu[t] = xq + (size_t) q * s.xq_stride;
+                    qg[t] = xq + (xg + q) * s.xq_stride;
+                    yu[t] = (const float *) qu[t];
+                    yg[t] = (const float *) qg[t];
                 }
                 for (int64_t a = r0; a < r1; a += AI4_TR) {
                     const int64_t b = std::min<int64_t>(a + AI4_TR, r1);
                     float ub[8][AI4_TR] = {}, gb[8][AI4_TR] = {};
                     float * uo[8], * go[8];
                     for (int t = 0; t < nt; ++t) { uo[t] = ub[t]; go[t] = gb[t]; }
-                    if (wu && wg) {
+                    if (wu && wg && up.ai_q8) {
+                        moe_ai::slab_rows_q8(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, qu, uo);
+                        moe_ai::slab_rows_q8(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, qg, go);
+                    } else if (wu && wg) {
                         moe_ai::slab_rows(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, yu, uo);
                         moe_ai::slab_rows(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, yg, go);
                     }
@@ -737,16 +746,20 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
         for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 8) {
             const int nt = std::min(8, s.first[i + 1] - q0);
             const float * y[8];
+            const void * yq[8];
             float * o[8];
             for (int t = 0; t < nt; ++t) {
-                y[t] = (const float *) (s.hq.data() + (size_t) (q0 + t) * s.hq_stride);
+                yq[t] = s.hq.data() + (size_t) (q0 + t) * s.hq_stride;
+                y[t] = (const float *) yq[t];
                 o[t] = s.out + (size_t) (q0 + t) * s.out_stride;
             }
             for (int64_t a = r0; a < r1; a += AI4_TR) {
                 const int64_t b = std::min<int64_t>(a + AI4_TR, r1);
                 float * oa[8];
                 for (int t = 0; t < nt; ++t) { oa[t] = o[t] + a; }
-                if (w) {
+                if (w && down.ai_q8) {
+                    moe_ai::slab_rows_q8(w, down.r.row_bytes, down.ai_k, down.ai_C, a, b, down.r.n_in, nt, yq, oa);
+                } else if (w) {
                     moe_ai::slab_rows(w, down.r.row_bytes, down.ai_k, down.ai_C, a, b, down.r.n_in, nt, y, oa);
                 } else {
                     for (int t = 0; t < nt; ++t) { for (int64_t row = a; row < b; ++row) { oa[t][row - a] = 0.0f; } }
@@ -1264,9 +1277,9 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     ggml_cpu_init();
     s.job = job; s.x = x; s.out = out; s.x_stride = x_stride; s.out_stride = out_stride;
     s.max_ff = max_ff; s.max_embd = max_embd;
-    // Quantized rows are never larger than the f32 rows they come from.
-    s.xq_stride = GGML_PAD((size_t) max_embd * sizeof(float), 64);
-    s.hq_stride = GGML_PAD((size_t) max_ff * sizeof(float), 64);
+    // Quantized rows are never larger than the f32 rows they come from, except the AI+ q8 rows (int16 pairs + scales).
+    s.xq_stride = GGML_PAD(std::max((size_t) max_embd * sizeof(float), moe_ai::use_host_q8() ? moe_ai::q8_bytes(max_embd) : 0), 64);
+    s.hq_stride = GGML_PAD(std::max((size_t) max_ff * sizeof(float), moe_ai::use_host_q8() ? moe_ai::q8_bytes(max_ff) : 0), 64);
     const bool align = env_int("GGML_MOE_CPU_SPLIT_ALIGN", 0, 0, 1) != 0;
     s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0, align);
     s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f, align);
@@ -1485,6 +1498,11 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
             m.vec_type = GGML_TYPE_F32;
             m.quant = moe_ai::rotate;
             m.vec_bytes = (size_t) m.r.n_in * sizeof(float);
+            if (moe_ai::use_host_q8() && m.r.n_in <= 8192) {   // rotate_q8's stack row holds 8192 floats
+                m.ai_q8 = true;
+                m.quant = moe_ai::rotate_q8;
+                m.vec_bytes = moe_ai::q8_bytes(m.r.n_in);
+            }
             ok = m.ai_k >= 2 && m.ai_k <= 5 && m.r.n_in % AI4U_UK == 0 && m.r.n_out % AI4_TR == 0 &&
                  m.r.row_bytes == ggml_row_size(t, m.r.n_in) && s.rows_ug % AI4_TR == 0 && s.rows_down % AI4_TR == 0;
             continue;
