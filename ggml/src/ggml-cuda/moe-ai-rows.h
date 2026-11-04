@@ -166,9 +166,106 @@ MOE_AI_T512 static void unit_rows_512(const uint8_t * blk, int k, uint32_t C, in
 }
 #endif
 
+#if defined(__AVX2__) && defined(__FMA__)
+// AIPFAST: AVX-512 VBMI tile decode (Zen 4/5), 4 tile rows per step instead of 2. Row r's 64-bit window starts at
+// stream byte k*r + 2 with bit offset k (b = 8kr + k + 16), so every gather index and shift is fixed per rate k:
+// vpermi2b builds the big-endian windows of 4 rows straight from the tile's little-endian words (2 qword lanes per row),
+// vpmultishiftqb cuts the 32 16-bit states, and the level (byte sum of state * C, mod 2^32) is formed in 16-bit lanes:
+// low half = lo16(st * Cl), high half = hi16(st * Cl) + lo16(st * Ch). Same integer levels and the same per-row-pair
+// FMA order as unit_rows_512, so results are bit-identical to it (and to the AVX2 path).
+#define MOE_AI_T512V __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,fma,f16c")))
+
+static bool has_vbmi() {
+    // GGML_MOE_AI_HOST_VBMI=0 keeps the plain AVX-512 decode
+    static const bool on = [] {
+        const char * e = getenv("GGML_MOE_AI_HOST_VBMI");
+        return !(e && e[0] == '0') && has_avx512() && __builtin_cpu_supports("avx512vbmi");
+    }();
+    return on;
+}
+
+struct vbmi_tabs {
+    uint8_t idx[6][4][64];   // [k][row group]: tile byte for each window byte (vpermi2b over 128 tile bytes)
+    uint8_t ctl[6][64];      // [k]: vpmultishiftqb bit offsets (2 per 16-bit state)
+    vbmi_tabs() {
+        memset(this, 0, sizeof(*this));
+        for (int k = 2; k <= 5; ++k) {
+            const int nw = AIK_TILE_WORDS(k);
+            for (int g = 0; g < 4; ++g) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    const int r = 4*g + lane/2;
+                    for (int m = 0; m < 8; ++m) {
+                        const int P = k*r + 2 + 7 - m;            // ext byte (tile_bytes layout) of window byte m
+                        const int j = P >> 2, q = P & 3;          // E word, big-endian byte in it
+                        const int wi = j == 0 ? nw - 1 : (j - 1) % nw;
+                        idx[k][g][8*lane + m] = (uint8_t) (4*wi + 3 - q);
+                    }
+                }
+            }
+            for (int lane = 0; lane < 8; ++lane) {
+                for (int s = 0; s < 4; ++s) {
+                    const int kk = 4*(lane & 1) + s;
+                    const int p = 48 - k - k*kk;                  // state kk = (w >> p) & 0xFFFF
+                    ctl[k][8*lane + 2*s]     = (uint8_t) p;
+                    ctl[k][8*lane + 2*s + 1] = (uint8_t) (p + 8);
+                }
+            }
+        }
+    }
+};
+
+MOE_AI_T512V static void unit_rows_512_vbmi(const uint8_t * blk, int k, uint32_t C, int nt, const float * const * y,
+                                            int64_t koff, float (*acc)[AI4_TR]) {
+    static const vbmi_tabs T;
+    const uint16_t * dh = (const uint16_t *) blk;
+    const uint8_t  * wb = blk + AI4U_SCALE_BYTES;
+    const int tb = 4*AIK_TILE_WORDS(k);                      // tile bytes, 16k
+    const __mmask64 m0 = tb >= 64 ? ~0ULL : (1ULL << tb) - 1;
+    const __mmask64 m1 = tb > 64 ? (1ULL << (tb - 64)) - 1 : 0;
+    const __m512i ctl = _mm512_loadu_si512(T.ctl[k]);
+    const __m512i cl = _mm512_set1_epi16((short) (C & 0xFFFF)), ch = _mm512_set1_epi16((short) (C >> 16));
+    const __m512i one8 = _mm512_set1_epi8(1), k510 = _mm512_set1_epi16(510);
+    __m512i idx[4];
+    for (int g = 0; g < 4; ++g) { idx[g] = _mm512_loadu_si512(T.idx[k][g]); }
+    __m512 part[8][AI4_TR/2];
+    for (int t = 0; t < nt; ++t) { for (int r = 0; r < AI4_TR/2; ++r) { part[t][r] = _mm512_setzero_ps(); } }
+    for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
+        const uint8_t * tp = wb + ct*tb;
+        const __m512i t0 = _mm512_maskz_loadu_epi8(m0, tp);
+        const __m512i t1 = _mm512_maskz_loadu_epi8(m1, tp + 64);
+        __m512 yv[8];
+        for (int t = 0; t < nt; ++t) {
+            const __m512 h = _mm512_castps256_ps512(_mm256_loadu_ps(y[t] + koff + ct*AI4_TC));
+            yv[t] = _mm512_shuffle_f32x4(h, h, 0x44);
+        }
+        for (int g = 0; g < 4; ++g) {
+            const __m512i win = _mm512_permutex2var_epi8(t0, idx[g], t1);
+            const __m512i st  = _mm512_multishift_epi64_epi8(ctl, win);
+            const __m512i lo  = _mm512_mullo_epi16(st, cl);
+            const __m512i hi  = _mm512_add_epi16(_mm512_mulhi_epu16(st, cl), _mm512_mullo_epi16(st, ch));
+            const __m512i sum = _mm512_add_epi16(_mm512_maddubs_epi16(lo, one8), _mm512_maddubs_epi16(hi, one8));
+            const __m512i lev = _mm512_srai_epi16(_mm512_sub_epi16(sum, k510), 2);
+            const __m512 l0 = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(lev)));
+            const __m512 l1 = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(lev, 1)));
+            for (int t = 0; t < nt; ++t) {
+                part[t][2*g]     = _mm512_fmadd_ps(l0, yv[t], part[t][2*g]);
+                part[t][2*g + 1] = _mm512_fmadd_ps(l1, yv[t], part[t][2*g + 1]);
+            }
+        }
+    }
+    for (int r = 0; r < AI4_TR/2; ++r) {
+        const float d0 = ai4_fp16_to_fp32(dh[2*r]), d1 = ai4_fp16_to_fp32(dh[2*r + 1]);
+        for (int t = 0; t < nt; ++t) {
+            acc[t][2*r]     = __builtin_fmaf(d0, hsum8(_mm512_castps512_ps256(part[t][r])), acc[t][2*r]);
+            acc[t][2*r + 1] = __builtin_fmaf(d1, hsum8(_mm512_extractf32x8_ps(part[t][r], 1)), acc[t][2*r + 1]);
+        }
+    }
+}
+#endif
+
 // rows [a, b) of one expert (a multiple of 16; b - a <= 16, rows past b are computed and dropped), nt tokens:
 // o[t][row - a] = W[row] . x_t, with y[t] the rotated inputs from rotate()
-// path: -1 = best available, 0 = AVX2 (or scalar), 1 = AVX-512 when the host has it
+// path: -1 = best available, 0 = AVX2 (or scalar), 1 = AVX-512 (VBMI decode when the host has it), 2 = AVX-512 without VBMI
 static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                       const float * const * y, float * const * o, int path = -1) {
     const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
@@ -181,7 +278,8 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
         const uint32_t * wd  = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
 #if defined(__AVX2__) && defined(__FMA__)
         if (C != 0 && path != 0 && has_avx512()) {
-            unit_rows_512(blk, k, C, nt, y, u*AI4U_UK, acc);
+            if (path != 2 && has_vbmi()) { unit_rows_512_vbmi(blk, k, C, nt, y, u*AI4U_UK, acc); }
+            else { unit_rows_512(blk, k, C, nt, y, u*AI4U_UK, acc); }
             continue;
         }
         if (C != 0) {
