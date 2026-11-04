@@ -10140,16 +10140,12 @@ static void moe_cs_prepare(moe_cache_session & session) {
     if (!probed && layers) {
         probed = true;
         double route_ns = 0.0, fixed_ns = 0.0;
-        const bool cpu_ok = moe_cs_probe(&route_ns, &fixed_ns);
+        int timed_layer = -1;
+        const bool cpu_ok = moe_cs_probe(&route_ns, &fixed_ns, &timed_layer);
         if (cpu_ok && moe_cs_per_type_enabled()) {
-            // moe_cs_probe timed the lowest registered layer: reuse it for that layer's type triple
-            for (size_t l = 0; l < session.cs_registered.size(); ++l) {
-                int t[3];
-                if (session.cs_registered[l] && moe_cs_layer_types((int) l, t)) {
-                    type_cost[{t[0], t[1], t[2]}] = {route_ns, fixed_ns};
-                    break;
-                }
-            }
+            // reuse the first probe for the type triple of the layer it actually timed (lowest pool-ok layer)
+            int t[3];
+            if (moe_cs_layer_types(timed_layer, t)) { type_cost[{t[0], t[1], t[2]}] = {route_ns, fixed_ns}; }
         }
         const double link = moe_cs_probe_link(g_hf_scratch, 3 * (size_t) g_hf_slots * g_hf_stride);
         // overrides: microseconds per (expert, route) on the CPU, microseconds per job, link GB/s

@@ -47,7 +47,8 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]);
 bool moe_cs_layer_ok(int layer);
 // Times host jobs on a registered layer (the pool must be idle: no card job in flight). Fills the cost of one
 // (expert, route) pair and the fixed cost of a job, in nanoseconds. False when no layer is registered.
-bool moe_cs_probe(double * route_ns, double * fixed_ns);
+// timed_layer (optional) gets the layer the costs belong to.
+bool moe_cs_probe(double * route_ns, double * fixed_ns, int * timed_layer = nullptr);
 // AIPFIX per-type probe: host types (up, gate, down) of a registered layer; false when it is not registered.
 bool moe_cs_layer_types(int layer, int types[3]);
 // Probe of one registered layer (pool idle), same output as moe_cs_probe. False when the layer cannot be probed.

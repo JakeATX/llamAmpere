@@ -1583,7 +1583,7 @@ static double moe_cs_runq_wait_ns() {
 
 static bool moe_cs_probe_layer(int layer, double * route_ns, double * fixed_ns);
 
-bool moe_cs_probe(double * route_ns, double * fixed_ns) {
+bool moe_cs_probe(double * route_ns, double * fixed_ns, int * timed_layer) {
     pool_state & s = P();
     int layer = -1;
     {
@@ -1595,6 +1595,7 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     }
     if (layer < 0) { return false; }
     const bool ok = moe_cs_probe_layer(layer, route_ns, fixed_ns);
+    if (timed_layer) { *timed_layer = layer; }
     // AIPFAST: GGML_MOE_CPU_SPLIT_PROBE_LAYERS=20,31 also probes those layers (log only; the planner keeps the first
     // probe), e.g. to time host misses of an AI+ layer next to a 3XS one in the same process.
     if (const char * e = getenv("GGML_MOE_CPU_SPLIT_PROBE_LAYERS")) {
