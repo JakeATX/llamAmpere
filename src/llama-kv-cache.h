@@ -428,6 +428,10 @@ private:
 
     bool v_trans = true;  // the value tensor is transposed
 
+    // LLAMA_KQ_MASK_DEVICE defers the f16 mask fill to the scheduler's input copy. With any KV layer in a host buffer the
+    // attention can read the host mask with no copy, so the fill would never run (stale mask, NaN on CPU / -ngl 0).
+    bool kq_mask_defer_ok = true;
+
     // SJ-KVaRN state (see is_sj_kvarn()). Positions: [0, sink) exact rows 0..sink-1; [sink, B) sealed records
     // (sink..B in groups of `group`); [B, N) exact ring rows sink + (p - sink) % cap. Cells stay one per
     // position (cell index == position) so the mask and the sequence bookkeeping are unchanged.
