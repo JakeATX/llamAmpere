@@ -7325,9 +7325,16 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             // LLAMA_B1_REPLAN_SHRINK=0 = extra keep only (old behavior).
             if (b1_ctx_env("LLAMA_B1_REPLAN_SHRINK", 1) != 0) {
                 const size_t prev = b1->last_fresh(), cut = b1_legacy_deficit + ((size_t) 64 << 20);
-                b1->set_fresh_cap(prev > cut ? prev - cut : 0);
+                size_t cap = prev > cut ? prev - cut : 0;
+                // A cut below the smallest host carry plan would refuse a plan that fits, because free VRAM can be higher at
+                // the re-plan (3XS at 12 GB: cap 1150 MiB, one slot + carry 1377.5 MiB, 5154 MiB free, 3269 MiB needed by the
+                // graph + keep). Step down one plan size instead; the extra keep still limits what the plan may take.
+                if (b1->carry_on_host() && cap < b1->carry_step_min()) {
+                    cap = b1->carry_step_below(prev);
+                }
+                b1->set_fresh_cap(cap);
                 LLAMA_LOG_WARN("%s: [B1] re-plan caps fresh VRAM at %.1f MiB (was %.1f MiB, short %.1f MiB)\n", __func__,
-                        (prev > cut ? prev - cut : 0) / 1048576.0, prev / 1048576.0, b1_legacy_deficit / 1048576.0);
+                        cap / 1048576.0, prev / 1048576.0, b1_legacy_deficit / 1048576.0);
             }
             b1->hold_carry_pin(true);
             const bool replanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);

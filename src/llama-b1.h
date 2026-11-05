@@ -96,6 +96,20 @@ public:
     // so the re-plan caps fresh below the failed plan's (smaller variant: sync carry, then one expert slot).
     void set_fresh_cap(size_t bytes) { fresh_cap = bytes; }
     size_t fresh_cap = SIZE_MAX;
+    // Host carry plan sizes, largest first: two expert slots + async, two + sync, one + async, one + sync.
+    // carry_step_below() = the next size under `fresh` (0 when none); carry_step_min() = the smallest one that can run.
+    size_t carry_step_below(size_t fresh) const {
+        const size_t s = step_slot_bytes, c = step_carry_bytes;
+        for (size_t bytes : { 2*s + 2*c, 2*s + c, s + 2*c, s + c }) {
+            if (bytes < fresh) {
+                return bytes;
+            }
+        }
+        return 0;
+    }
+    size_t carry_step_min() const { return step_slot_bytes + step_carry_bytes; }
+    size_t step_slot_bytes = 0;
+    size_t step_carry_bytes = 0;
     // [KEEPAUTO] VRAM keep reserve in MiB for this plan (-1 = LLAMA_B1_KEEP_FREE_MIB or the default). The legacy
     // layer check (llama-context.cpp) reads the same value so plan and check always agree.
     void set_keep_override(int64_t mib) { keep_override_mib = mib; }

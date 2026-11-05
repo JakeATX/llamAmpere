@@ -728,6 +728,11 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     // over the passes that group size needs, and lend as little as that even group size requires. A group larger than
     // the even size takes the same number of passes but carries more ubatches and lends (and later refills) more.
     const size_t g_max = group_ub_req == 0 ? nub : std::min<size_t>(group_ub_req, nub);
+    step_carry_bytes = carry_bytes;
+    step_slot_bytes  = 0;
+    for (size_t role : role_max) {
+        step_slot_bytes += b1_align_up(role, align);
+    }
     bool   found = false;
     size_t g_sel = 0;
     std::vector<int> lent_sel;
