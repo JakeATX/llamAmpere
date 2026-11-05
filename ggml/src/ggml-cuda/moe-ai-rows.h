@@ -1199,14 +1199,43 @@ static bool unit_rows_q8_vbmi(const uint8_t * blk, int k, uint32_t C, int nt, co
 // (the shuffle decode before direct lane loads; GGML_MOE_AI_HOST_DIRECT=0 makes it the shuffle fallback),
 // 5 = AVX2 row-window decode (unit_rows_direct: one 16-byte load per row, register-grouped rows; the default AVX2 path
 // unless GGML_MOE_AI_HOST_ROWWIN=0, which falls back to path 0 = shuffle with direct interior lane loads)
+// AIPFAST: U2 row-scale slabs (AITk_U2, ggml-ai4.h AI4V2_*; K % 640 == 0): one fp16 row scale per 640-K block, shared by
+// its 5 units of 128 K. Every host kernel reads a unit as [16 fp16 row scales][16 tiles], so for U2 the unit is gathered
+// into a stack copy (the block's scales + that unit's tiles, 32 + 256k bytes) and the decode, q8 and R8 kernels run
+// unchanged. The block scale is then applied once per unit (acc = fma(d, unit sum, acc)): a valid-math reorder of
+// d * (sum of the 5 units). The layout is told apart by the row size (U: 2 + 16k bytes per row per 128 K, U2: 2 + 80k
+// per 640 K), so callers pass the tensor's row_bytes as before.
+static inline bool slab_is_v2(size_t row_bytes, int k, int64_t K) {
+    return K % AI4V2_BK == 0 && row_bytes*AI4_TR == (size_t) (K/AI4V2_BK)*AI4V2_BLOCK_BYTES(k);
+}
+
+struct unit_src {
+    const uint8_t * slab;
+    int k, ub;
+    bool v2;
+    alignas(64) uint8_t buf[AI4U_UNIT_BYTES(5) + 128];   // + slack for the kernels' lane loads past a tile
+    unit_src(const uint8_t * s, size_t row_bytes, int k_, int64_t K)
+        : slab(s), k(k_), ub(AI4U_UNIT_BYTES(k_)), v2(slab_is_v2(row_bytes, k_, K)) {
+        if (v2) { memset(buf, 0, sizeof(buf)); }
+    }
+    const uint8_t * at(int64_t u) {
+        if (!v2) { return slab + u*ub; }
+        const int tb = (AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k);
+        const uint8_t * b = slab + (u/AI4V2_UNITS)*AI4V2_BLOCK_BYTES(k);
+        if (u % AI4V2_UNITS == 0) { memcpy(buf, b, AI4U_SCALE_BYTES); }
+        memcpy(buf + AI4U_SCALE_BYTES, b + AI4U_SCALE_BYTES + (u % AI4V2_UNITS)*tb, tb);
+        return buf;
+    }
+};
+
 static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                       const float * const * y, float * const * o, int path = -1) {
-    const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
-    const int ub = AI4U_UNIT_BYTES(k), tw = AIK_TILE_WORDS(k);
+    unit_src us((const uint8_t *) w + (size_t) a*row_bytes, row_bytes, k, K);
+    const int tw = AIK_TILE_WORDS(k);
     float acc[8][AI4_TR] = {};
     uint32_t E[AIK_TILE_WORDS(5) + 3 + 4] = {};  // k <= 5; +4 words of slack for row_levels_shuf's 16-byte lane loads
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
-        const uint8_t  * blk = slab + u*ub;
+        const uint8_t  * blk = us.at(u);
         const uint16_t * dh  = (const uint16_t *) blk;
         const uint32_t * wd  = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
 #if defined(__AVX2__) && defined(__FMA__)
@@ -1275,11 +1304,10 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
 // kernel when GGML_MOE_AI_HOST_Q8_VBMI=1 and the host has it, 0 = never, 1 = whenever the host has it (test/bench).
 static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
                          const void * const * xq, float * const * o, bool scalar = false, int vbmi = -1, int lv = -1) {
-    const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
-    const int ub = AI4U_UNIT_BYTES(k);
+    unit_src us((const uint8_t *) w + (size_t) a*row_bytes, row_bytes, k, K);
     float acc[8][AI4_TR] = {};
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
-        const uint8_t * blk = slab + u*ub;
+        const uint8_t * blk = us.at(u);
 #if defined(__AVX2__) && defined(__FMA__)
         if (!scalar && C != 0 && (vbmi > 0 || (vbmi < 0 && use_q8_vbmi())) && unit_rows_q8_vbmi(blk, k, C, nt, xq, u*AI4U_UK, K, acc)) {
             continue;
@@ -1322,14 +1350,13 @@ static inline bool r8_ok(int k, uint32_t C, int64_t n_out, int64_t K) {
 // (needs r8_ok). Output equals slab_rows_q8 bit for bit (same AVX2 dots, only stores added).
 static void slab_rows_q8_keep(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t n_out, int64_t K, int nt,
                               const void * const * xq, float * const * o, uint8_t * R) {
-    const uint8_t * slab = (const uint8_t *) w + (size_t) a*row_bytes;
-    const int ub = AI4U_UNIT_BYTES(k);
+    unit_src us((const uint8_t *) w + (size_t) a*row_bytes, row_bytes, k, K);
     const int64_t nu = K/AI4U_UK, g0 = a/8;
     int8_t * W = (int8_t *) R + g0*K*8;
     uint16_t * S = (uint16_t *) (R + r8_w_bytes(n_out, K));
     float acc[8][AI4_TR] = {};
     for (int64_t u = 0; u < nu; ++u) {
-        const uint8_t * blk = slab + u*ub;
+        const uint8_t * blk = us.at(u);
         memcpy(S + (g0*nu + u)*8, blk, 16);
         memcpy(S + ((g0 + 1)*nu + u)*8, blk + 16, 16);
         int8_t * Wu = W + u*AI4U_UK*8;

@@ -26,7 +26,7 @@ int main(int argc, char ** argv) {
     const int reps = argc > 1 ? atoi(argv[1]) : 20;
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-    const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U };
+    const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2 };
     const int64_t shapes[][2] = { { 2560, 640 }, { 640, 2560 } };   // K (in), M (out)
 #if defined(__AVX2__) && defined(__FMA__)
     printf("path: AVX2%s%s\n", moe_ai::has_avx512() ? " + AVX-512 (default; AVX2 also timed)" : "", moe_ai::has_vbmi() ? " + VBMI decode (default)" : "");
@@ -97,9 +97,19 @@ int main(int argc, char ** argv) {
             std::vector<uint8_t> w(row_bytes * M);
             for (auto & b : w) { b = (uint8_t) rng(); }
             const int ub = AI4U_UNIT_BYTES(k);
+            // AIPFAST: U2 row-scale types: 16 row scales per 640-K block, then the 5 units' tiles (ggml-ai4.h AI4V2_*)
+            const bool v2 = ggml_ai4v2_rate(type) != 0;
+            if (v2 != moe_ai::slab_is_v2(row_bytes, k, K)) { printf("%-8s K=%5lld layout from row size WRONG FAIL\n", ggml_type_name(type), (long long) K); ++fails; }
+            const int tbu = (AI4U_UK / AI4_TC) * AI4U_TILE_BYTES(k);
+            auto scale_at = [&](int64_t sl, int64_t u) {   // scales of unit u (U2: of its block)
+                return w.data() + sl * AI4_TR * row_bytes + (v2 ? (u / AI4V2_UNITS) * AI4V2_BLOCK_BYTES(k) : u * ub);
+            };
+            auto tiles_at = [&](int64_t sl, int64_t u) {
+                return v2 ? scale_at(sl, u) + AI4U_SCALE_BYTES + (u % AI4V2_UNITS) * tbu : scale_at(sl, u) + AI4U_SCALE_BYTES;
+            };
             for (int64_t sl = 0; sl < M / AI4_TR; ++sl) {
-                for (int64_t u = 0; u < K / AI4U_UK; ++u) {
-                    uint16_t * dh = (uint16_t *) (w.data() + sl * AI4_TR * row_bytes + u * ub);
+                for (int64_t u = 0; u < K / AI4U_UK; u += v2 ? AI4V2_UNITS : 1) {
+                    uint16_t * dh = (uint16_t *) scale_at(sl, u);
                     for (int r = 0; r < AI4_TR; ++r) { dh[r] = f32_to_f16_bits(0.001f + 0.01f * (uni(rng) + 1.0f)); }
                 }
             }
@@ -111,7 +121,7 @@ int main(int argc, char ** argv) {
                 const int tw = AIK_TILE_WORDS(k);
                 for (int64_t sl = 0; sl < M / AI4_TR; ++sl) {
                     for (int64_t u = 0; u < K / AI4U_UK; ++u) {
-                        const uint32_t * wd = (const uint32_t *) (w.data() + sl * AI4_TR * row_bytes + u * ub + AI4U_SCALE_BYTES);
+                        const uint32_t * wd = (const uint32_t *) tiles_at(sl, u);
                         for (int ct = 0; ct < AI4U_UK / AI4_TC; ++ct) {
                             moe_ai::tile_bytes(wd + ct * tw, k, ext);
                             uint32_t E[AIK_TILE_WORDS(5) + 3] = {};
@@ -145,7 +155,8 @@ int main(int argc, char ** argv) {
             // reference weights (original basis)
             std::vector<float> wf((size_t) M * K);
             for (int64_t sl = 0; sl < M / AI4_TR; ++sl) {
-                aik_dequantize_slab_c(k, C, w.data() + sl * AI4_TR * row_bytes, wf.data() + sl * AI4_TR * K, K);
+                if (v2) { aik_dequantize_slab_v2_c(k, C, w.data() + sl * AI4_TR * row_bytes, wf.data() + sl * AI4_TR * K, K); }
+                else    { aik_dequantize_slab_c(k, C, w.data() + sl * AI4_TR * row_bytes, wf.data() + sl * AI4_TR * K, K); }
             }
             for (int nt = 1; nt <= 8; ++nt) {  // AIPFIX: 3-7 cover the G=4 and G=2 q8 groups and their odd tails
                 std::vector<float> x((size_t) nt * K), y((size_t) nt * K), out((size_t) nt * M), ref((size_t) nt * M);
