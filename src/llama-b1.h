@@ -15,6 +15,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -264,6 +265,26 @@ private:
     ggml_backend_buffer_t carry_host_buf = nullptr;
     ggml_backend_buffer_t carry_pin_spare = nullptr; // [PINRE] pinned carry held over a re-plan
     bool carry_pin_hold = false;
+    // [PINCH] LLAMA_B1_CARRY_PIN_CHUNKED=1: the carry RAM is plain memory that a helper thread page-locks in chunks,
+    // front to back, so the ~2 s pin overlaps the first layer; a copy waits only for the chunks it touches
+    struct carry_chunk_pin {
+        void * ptr = nullptr;
+        size_t size = 0;
+        ggml_backend_buffer_t buf = nullptr;   // CPU view of ptr (does not own it)
+        void (*unpin)(void *) = nullptr;
+        std::vector<void *> pinned;            // chunk starts, written by the helper thread only
+        std::thread th;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::atomic<size_t> done{0};           // bytes [0, done) settled (pinned, or left pageable after a failure)
+        std::atomic<bool> stop{false};
+        int64_t pin_us = 0;                    // helper thread wall time
+        int64_t wait_us = 0;                   // copies blocked on the helper
+    };
+    std::unique_ptr<carry_chunk_pin> carry_chunk, carry_chunk_spare;
+    bool carry_chunk_alloc(size_t bytes);
+    static void carry_chunk_free(std::unique_ptr<carry_chunk_pin> & c);
+    void carry_pin_wait(size_t ub);
     std::vector<size_t> carry_host_offs; // per ubatch of the call
     ggml_context * ctx_meta = nullptr;
     std::vector<ggml_tensor *> carries; // per ubatch of the call

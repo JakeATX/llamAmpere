@@ -419,6 +419,95 @@ void llama_b1::drop_carry_spare() {
         ggml_backend_buffer_free(carry_pin_spare);
         carry_pin_spare = nullptr;
     }
+    carry_chunk_free(carry_chunk_spare);
+}
+
+// [PINCH] plain RAM + a helper thread that page-locks it chunk by chunk from the front (the order layer 0 stores the
+// ubatches); false = no pin entry point or no memory, the caller pins the whole buffer up front as before
+bool llama_b1::carry_chunk_alloc(size_t bytes) {
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto pin   = (bool (*)(void *, size_t)) (reg ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin")   : nullptr);
+    auto unpin = (void (*)(void *))         (reg ? ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin") : nullptr);
+    if (!pin || !unpin || bytes == 0) {
+        return false;
+    }
+    const size_t align = 2u << 20;
+    const size_t chunk = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_CARRY_PIN_CHUNK_MB", 32), 2, 1024) << 20;
+    auto c = std::make_unique<carry_chunk_pin>();
+    c->size = (bytes + align - 1) / align * align;
+    if (posix_memalign(&c->ptr, align, c->size) != 0) {
+        return false;
+    }
+    c->buf = ggml_backend_cpu_buffer_from_ptr(c->ptr, c->size);
+    if (!c->buf) {
+        free(c->ptr);
+        return false;
+    }
+    c->unpin = unpin;
+    carry_chunk_pin * cp = c.get();
+    c->th = std::thread([cp, pin, chunk]() {
+        const int64_t t0 = ggml_time_us();
+        bool ok = true;
+        for (size_t off = 0; off < cp->size && !cp->stop.load(std::memory_order_relaxed); off += chunk) {
+            const size_t n = std::min(chunk, cp->size - off);
+            void * p = (char *) cp->ptr + off;
+            if (ok && pin(p, n)) {
+                cp->pinned.push_back(p);
+            } else if (ok) {
+                ok = false; // the rest stays pageable: copies stay correct, only slower
+                LLAMA_LOG_WARN("[B1] chunked carry pin: page-lock failed at %.1f of %.1f MiB; the rest stays pageable\n",
+                        off/1048576.0, cp->size/1048576.0);
+            }
+            {
+                std::lock_guard<std::mutex> lk(cp->mu);
+                cp->done.store(off + n, std::memory_order_release);
+            }
+            cp->cv.notify_all();
+        }
+        {
+            std::lock_guard<std::mutex> lk(cp->mu);
+            cp->pin_us = ggml_time_us() - t0;
+            cp->done.store(cp->size, std::memory_order_release);
+        }
+        cp->cv.notify_all();
+    });
+    carry_chunk = std::move(c);
+    return true;
+}
+
+void llama_b1::carry_chunk_free(std::unique_ptr<carry_chunk_pin> & c) {
+    if (!c) {
+        return;
+    }
+    c->stop.store(true);
+    if (c->th.joinable()) {
+        c->th.join();
+    }
+    LLAMA_LOG_WARN("[B1] chunked carry pin: %zu chunk(s), %.1f MiB pinned in %.0f ms on the helper thread, copies waited %.0f ms\n",
+            c->pinned.size(), c->size/1048576.0, c->pin_us/1000.0, c->wait_us/1000.0);
+    for (void * p : c->pinned) {
+        c->unpin(p);
+    }
+    if (c->buf) {
+        ggml_backend_buffer_free(c->buf);
+    }
+    free(c->ptr);
+    c.reset();
+}
+
+void llama_b1::carry_pin_wait(size_t ub) {
+    carry_chunk_pin * c = carry_chunk.get();
+    if (!c) {
+        return;
+    }
+    const size_t end = carry_host_offs[ub] + ggml_nbytes(carries[ub]);
+    if (c->done.load(std::memory_order_acquire) >= end) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    std::unique_lock<std::mutex> lk(c->mu);
+    c->cv.wait(lk, [&] { return c->done.load(std::memory_order_acquire) >= end; });
+    c->wait_us += ggml_time_us() - t0;
 }
 
 void llama_b1::release_plan() {
@@ -447,7 +536,14 @@ void llama_b1::release_plan() {
     carry_async_free();
     if (carry_host_buf) {
         ggml_backend_synchronize(backend_gpu); // the staging copies read and write this RAM on the compute stream
-        if (carry_pin_hold && b1_env_int("LLAMA_B1_CARRY_PIN_REUSE", 1) > 0) {
+        if (carry_chunk) {
+            if (carry_pin_hold && b1_env_int("LLAMA_B1_CARRY_PIN_REUSE", 1) > 0) {
+                drop_carry_spare();
+                carry_chunk_spare = std::move(carry_chunk); // [PINCH] buffer and helper thread carry over to the re-plan
+            } else {
+                carry_chunk_free(carry_chunk); // frees carry_host_buf too
+            }
+        } else if (carry_pin_hold && b1_env_int("LLAMA_B1_CARRY_PIN_REUSE", 1) > 0) {
             drop_carry_spare();
             carry_pin_spare = carry_host_buf; // [PINRE] the re-plan's begin() may reuse it
         } else {
@@ -754,7 +850,8 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             g_fit = g_max;
         } else {
             // a pinned carry held over a re-plan comes back to this plan, so it counts as available
-            const int64_t ram = b1_ram_available() + (carry_pin_spare ? (int64_t) ggml_backend_buffer_get_size(carry_pin_spare) : 0);
+            const int64_t ram = b1_ram_available() + (carry_pin_spare ? (int64_t) ggml_backend_buffer_get_size(carry_pin_spare) : 0) +
+                    (carry_chunk_spare ? (int64_t) carry_chunk_spare->size : 0);
             const int64_t room = ram > (5LL << 30) ? (ram - (5LL << 30)) / 5 * 4 : 0;
             if ((int64_t) host_carry_total > room) {
                 LLAMA_LOG_WARN("%s: [B1] host carry needs %.1f MiB of pinned RAM, only %.1f MiB allowed (MemAvailable %.1f MiB); "
@@ -955,14 +1052,23 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         const int64_t t_alloc0 = ggml_time_us();
         ggml_backend_buffer_type_t buft_host = ggml_backend_dev_host_buffer_type(dev);
         bool reused = false;
-        if (carry_pin_spare && ggml_backend_buffer_get_size(carry_pin_spare) >= host_carry_total &&
+        const bool chunked = b1_env_int("LLAMA_B1_CARRY_PIN_CHUNKED", 0) > 0;
+        if (chunked && carry_chunk_spare && carry_chunk_spare->size >= host_carry_total) {
+            carry_chunk     = std::move(carry_chunk_spare); // [PINCH] same call; its helper may still be pinning
+            carry_host_buf  = carry_chunk->buf;
+            reused = true;
+        } else if (carry_pin_spare && ggml_backend_buffer_get_size(carry_pin_spare) >= host_carry_total &&
                 ggml_backend_buffer_get_type(carry_pin_spare) == buft_host) {
             carry_host_buf  = carry_pin_spare; // [PINRE] same call, already pinned
             carry_pin_spare = nullptr;
             reused = true;
         } else {
             drop_carry_spare();
-            carry_host_buf = buft_host ? ggml_backend_buft_alloc_buffer(buft_host, host_carry_total) : nullptr;
+            if (chunked && buft_host && carry_chunk_alloc(host_carry_total)) {
+                carry_host_buf = carry_chunk->buf;
+            } else {
+                carry_host_buf = buft_host ? ggml_backend_buft_alloc_buffer(buft_host, host_carry_total) : nullptr;
+            }
         }
         if (carry_host_buf == nullptr) {
             LLAMA_LOG_WARN("%s: [B1] cannot pin %.1f MiB of host RAM for the carries; using the normal prefill\n",
@@ -996,7 +1102,8 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
         LLAMA_LOG_WARN("%s: [B1] host carry: %.1f MiB pinned for %zu ubatches in %.0f ms%s, %zu VRAM carry slot(s) of %.1f MiB%s "
                 "(VRAM carries would need %.1f MiB)\n", __func__, host_carry_total/1048576.0, nub,
-                (ggml_time_us() - t_alloc0)/1000.0, reused ? " (reused from the previous plan)" : "",
+                (ggml_time_us() - t_alloc0)/1000.0,
+                reused ? " (reused from the previous plan)" : carry_chunk ? " (chunked pin running on a helper thread)" : "",
                 n_host_slots(), carry_bytes/1048576.0,
                 carry_async ? ", async staging stream" : "", host_carry_total/1048576.0);
     }
@@ -1269,6 +1376,7 @@ void llama_b1::carry_load(size_t ub) {
         return;
     }
     const size_t n = ggml_nbytes(carries[ub]);
+    carry_pin_wait(ub);
     ggml_backend_tensor_set_async(backend_gpu, carries[ub],
             (const char *) ggml_backend_buffer_get_base(carry_host_buf) + carry_host_offs[ub], 0, n);
     st.bytes_carry_h2d += n;
@@ -1278,6 +1386,7 @@ void llama_b1::carry_fetch(size_t ub) {
     const size_t s = ub % 2;
     const size_t n = ggml_nbytes(carries[ub]);
     ggml_backend_event_wait(backend_carry, ev_cdone[s]); // the graphs that used the slot are done with it
+    carry_pin_wait(ub);
     ggml_backend_tensor_set_async(backend_carry, carries[ub],
             (const char *) ggml_backend_buffer_get_base(carry_host_buf) + carry_host_offs[ub], 0, n);
     ggml_backend_event_record(ev_cload[s], backend_carry);
@@ -1344,6 +1453,7 @@ void llama_b1::carry_store(size_t ub) {
         const size_t n = ggml_nbytes(carries[ub]);
         ggml_backend_event_record(ev_cdone[s], backend_gpu);
         ggml_backend_event_wait(backend_carry, ev_cdone[s]);
+        carry_pin_wait(ub);
         ggml_backend_tensor_get_async(backend_carry, carries[ub],
                 (char *) ggml_backend_buffer_get_base(carry_host_buf) + carry_host_offs[ub], 0, n);
         ggml_backend_event_record(ev_cstore[s], backend_carry);
@@ -1351,6 +1461,7 @@ void llama_b1::carry_store(size_t ub) {
         return;
     }
     const size_t n = ggml_nbytes(carries[ub]);
+    carry_pin_wait(ub);
     ggml_backend_tensor_get_async(backend_gpu, carries[ub],
             (char *) ggml_backend_buffer_get_base(carry_host_buf) + carry_host_offs[ub], 0, n);
     st.bytes_carry_d2h += n;
