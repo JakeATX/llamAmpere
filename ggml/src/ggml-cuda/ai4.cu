@@ -2459,6 +2459,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             AI4_P1_PLAIN(ai4k::LAY_AIT2P_U)
             AI4_P1_PLAIN(ai4k::LAY_AIT3_U)
             AI4_P1_PLAIN(ai4k::LAY_AIT4_U)
+            AI4_P1_PLAIN(ai4k::LAY_AIT2_U2)
+            AI4_P1_PLAIN(ai4k::LAY_AIT3_U2)
+            AI4_P1_PLAIN(ai4k::LAY_AIT4_U2)
 #undef AI4_P1_PLAIN
             default: break;
         }
@@ -2509,6 +2512,9 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
             AI4_P1_PLAIN_GU(ai4k::LAY_AIT2P_U)
             AI4_P1_PLAIN_GU(ai4k::LAY_AIT3_U)
             AI4_P1_PLAIN_GU(ai4k::LAY_AIT4_U)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT2_U2)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT3_U2)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT4_U2)
 #undef AI4_P1_PLAIN_GU
             default: break;
         }

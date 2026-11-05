@@ -6309,7 +6309,7 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
     constexpr int64_t n_expert = 512;
     std::vector<float> importance(n_in, 1.0f);
     for (const auto type : ggml_moe_cache_types) {
-        if (type == GGML_TYPE_IQ1_M) {
+        if (type == GGML_TYPE_IQ1_M || n_in % ggml_blck_size(type) != 0) {
             continue;
         }
         bool ok = true;
@@ -7586,6 +7586,9 @@ static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
     }
     std::vector<float> importance(n_in, 1.0f);
     for (const auto type : ggml_moe_cache_types) {
+        if (n_in % ggml_blck_size(type) != 0) {
+            continue;
+        }
         ggml_init_params params = {ggml_tensor_overhead(), nullptr, true};
         ggml_context * ctx = ggml_init(params);
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, type, n_in, n_out, n_expert);
