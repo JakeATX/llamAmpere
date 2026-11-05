@@ -26,7 +26,7 @@ int main(int argc, char ** argv) {
     const int reps = argc > 1 ? atoi(argv[1]) : 20;
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-    const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2 };
+    const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 };
     const int64_t shapes[][2] = { { 2560, 640 }, { 640, 2560 } };   // K (in), M (out)
 #if defined(__AVX2__) && defined(__FMA__)
     printf("path: AVX2%s%s\n", moe_ai::has_avx512() ? " + AVX-512 (default; AVX2 also timed)" : "", moe_ai::has_vbmi() ? " + VBMI decode (default)" : "");

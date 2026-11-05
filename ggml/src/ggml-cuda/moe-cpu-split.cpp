@@ -1680,8 +1680,8 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
                 m.quant = moe_ai::rotate_q8;
                 m.vec_bytes = moe_ai::q8_bytes(m.r.n_in);
             }
-            // AIPFAST: U2 row-scale types (K % 640) are read by block (moe_ai::unit_src); the row size must give the
-            // type's layout, or the host would walk U2 bytes as U units (wrong outputs, not a crash)
+            // U2 row-scale types (K % 640) are read by block (moe_ai::unit_src); the row size must give the type's layout,
+            // or the host would walk U2 bytes as U units (wrong outputs, not a crash). AIF25 (rate 25) stays off the host split.
             ok = m.ai_k >= 2 && m.ai_k <= 5 && m.r.n_in % AI4U_UK == 0 && m.r.n_out % AI4_TR == 0 &&
                  m.r.row_bytes == ggml_row_size(t, m.r.n_in) && s.rows_ug % AI4_TR == 0 && s.rows_down % AI4_TR == 0 &&
                  (ggml_ai4v2_rate(t) != 0) == moe_ai::slab_is_v2(m.r.row_bytes, m.ai_k, m.r.n_in);
