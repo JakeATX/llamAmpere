@@ -617,6 +617,24 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // a 12 GB card is ~8 GB here, a 24 GB card ~20 GB) runs -ub 6144: the 12 GB measured pick (one layer-major pass
     // of 17 ubatches with LLAMA_LEAN_PROMPT; 8192 needs a second carry slot and two 128-route tiles per expert,
     // 0.77x prompt). LLAMA_UB_SMALL_CARD_CAP=0 keeps the asked size.
+    // fork: LLAMA_LEAN_PROMPT (packed QSA rows mask + direct lists + in-place expert weighting on prompt batches) is
+    // the 12 GB pick only: on a 24 GB card it cost prompt 0.980x and writing 0.984x. Unset = on for an MoE model on a
+    // small card (same test as the ubatch cap below), off otherwise; the first context decides; an explicit value wins.
+    if (!getenv("LLAMA_LEAN_PROMPT")) {
+        bool lean = false;
+        size_t free = 0, total = 0;
+        if (model.hparams.n_expert > 0 && !model.devices.empty() &&
+            ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            const char * e = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB");
+            ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
+            lean = (free >> 20) < (size_t) (e ? atoll(e) : 14336);
+        }
+        setenv("LLAMA_LEAN_PROMPT", lean ? "1" : "0", 0);
+        if (lean) {
+            LLAMA_LOG_WARN("%s: small card (%zu MiB free): LLAMA_LEAN_PROMPT on (=0 turns it off)\n", __func__, free >> 20);
+        }
+    }
+
     if (cparams.n_ubatch > 6144 && model.hparams.n_expert > 0 && !model.devices.empty()) {
         static const bool cap_on = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_CAP"); return !e || atoi(e) != 0; }();
         static const size_t lim_mib = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 14336); }();

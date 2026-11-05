@@ -2585,7 +2585,7 @@ void ggml_cuda_flash_attn_ext_set_rows_window(const int64_t q0, const int c0) {
 }
 
 int ggml_cuda_flash_attn_ext_direct_lists_mode() {
-    static const int mode = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); if (e) return atoi(e); const char * l = getenv("LLAMA_LEAN_PROMPT"); return !l || atoi(l) != 0 ? 1 : 0; }(); // LLAMA_LEAN_PROMPT (default on): see qwen4exp.cpp
+    static const int mode = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); if (e) return atoi(e); const char * l = getenv("LLAMA_LEAN_PROMPT"); return l && atoi(l) != 0 ? 1 : 0; }(); // LLAMA_LEAN_PROMPT (unset = off; set by llama_context on small cards): see qwen4exp.cpp
     return mode;
 }
 
