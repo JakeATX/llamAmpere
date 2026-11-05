@@ -5709,7 +5709,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             b1_cur = { true, b1_final_l0, -1, b1_final_l0 > 0 ? b1->carry(b1_i) : nullptr };
             if (b1_final_l0 > 0 && b1->carry_on_host()) {
-                b1->carry_load(b1_i); // [PP12]
+                b1->carry_load_final(b1_i); // [PP12]
             }
         }
 
@@ -7684,6 +7684,8 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             }
             if (b1->carry_on_host() && l0 > 0) {
                 b1->carry_load(u); // [PP12] this range reads the hidden state the previous range stored
+            } else if (b1->carry_on_host()) {
+                b1->carry_write_begin(u); // [PP12A] layer 0 writes the slot without reading it
             }
             const int64_t t_compute0 = ggml_time_us();
             const int64_t u_inputs0 = b1_pp_inputs_us, u_submit0 = b1_pp_submit_us;
@@ -7704,6 +7706,19 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             }
             if (b1->carry_on_host()) {
                 b1->carry_store(u);
+                if (b1->carry_async_on()) {
+                    // [PP12A] the slot u just freed next serves ubatch u + 2 in visiting order (this range, or
+                    // wrapped into the next range, which always reads its carry); only when it maps to the same slot
+                    size_t t = u + 2;
+                    bool reads = l0 > 0;
+                    if (t >= ub1) {
+                        t = ub0 + (t - ub1);
+                        reads = true;
+                    }
+                    if (t < ub1 && t % 2 == u % 2 && reads) {
+                        b1->carry_prefetch(t);
+                    }
+                }
             }
             capture_ubatch(mctx->get_ubatch(), l0, l1);
         }

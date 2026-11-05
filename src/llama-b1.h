@@ -137,6 +137,16 @@ public:
     bool carry_on_host() const { return carry_host; }
     void carry_load(size_t ub);
     void carry_store(size_t ub);
+    // [PP12A] LLAMA_B1_HOST_CARRY_ASYNC=1 (opt-in, with host carry): two VRAM carry slots (ubatch u uses slot u % 2)
+    // and a separate copy stream, so the store of ubatch u and the load of the next ubatch for that slot run while the
+    // graph of u + 1 computes. Same bytes, same graphs: bit-identical to the one-slot path.
+    // carry_write_begin: a range that writes the carry without reading it (layer 0) waits for the slot's last store.
+    // carry_prefetch: load ub into its slot now (the caller has just stored the slot's previous ubatch).
+    // carry_load_final: the final range (no store after it): frees the previous slot and prefetches the next ubatch.
+    void carry_write_begin(size_t ub);
+    void carry_prefetch(size_t ub);
+    void carry_load_final(size_t ub);
+    bool carry_async_on() const { return carry_host && carry_async; }
 
     // the layer ranges of the plan: every streamed layer is its own range, a run of layers that stay resident is
     // one range; the last range [final_l0(), n_layer) is built with the model output by the normal decode body
@@ -228,6 +238,15 @@ private:
     std::vector<placement> slot_place; // [slot*n_roles + role]
     std::vector<placement> carry_place; // [ubatch index within the group]; one entry when carry_host
     bool carry_host = false;
+    bool carry_async = false;               // [PP12A] two slots + own copy stream
+    size_t n_host_slots() const { return carry_async ? 2 : 1; }
+    ggml_backend_t backend_carry = nullptr; // [PP12A] the carry copy stream
+    ggml_backend_event_t ev_cload[2]  = { nullptr, nullptr }; // slot loaded (carry stream)
+    ggml_backend_event_t ev_cdone[2]  = { nullptr, nullptr }; // graph done with slot (compute stream)
+    ggml_backend_event_t ev_cstore[2] = { nullptr, nullptr }; // slot stored to host (carry stream)
+    size_t carry_pend[2] = { SIZE_MAX, SIZE_MAX };            // ubatch whose load into the slot is issued, not yet consumed
+    void carry_fetch(size_t ub);
+    void carry_async_free();
     ggml_backend_buffer_t carry_host_buf = nullptr;
     std::vector<size_t> carry_host_offs; // per ubatch of the call
     ggml_context * ctx_meta = nullptr;
