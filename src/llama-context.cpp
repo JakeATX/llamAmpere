@@ -7234,7 +7234,10 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
                 LLAMA_LOG_WARN("%s: [B1] re-plan caps fresh VRAM at %.1f MiB (was %.1f MiB, short %.1f MiB)\n", __func__,
                         (prev > cut ? prev - cut : 0) / 1048576.0, prev / 1048576.0, b1_legacy_deficit / 1048576.0);
             }
+            b1->hold_carry_pin(true);
             const bool replanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
+            b1->hold_carry_pin(false);
+            b1->drop_carry_spare();
             b1->set_extra_keep(0);
             b1->set_fresh_cap(SIZE_MAX);
             if (!replanned || b1->n_groups() != 1) {

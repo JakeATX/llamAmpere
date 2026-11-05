@@ -333,6 +333,7 @@ llama_b1::~llama_b1() {
         refill();
     }
     release_plan();
+    drop_carry_spare();
     for (auto & w : stg) {
         for (auto & s : w) {
             if (s.ev) {
@@ -413,6 +414,13 @@ std::vector<ggml_backend_buffer_ptr> llama_b1::spare_views(size_t min_bytes, siz
     return out;
 }
 
+void llama_b1::drop_carry_spare() {
+    if (carry_pin_spare) {
+        ggml_backend_buffer_free(carry_pin_spare);
+        carry_pin_spare = nullptr;
+    }
+}
+
 void llama_b1::release_plan() {
     GGML_ASSERT(workers.empty() && !coord.joinable());
     // fork: only an explicit keep request may retain clean pageable bank weights.
@@ -439,7 +447,12 @@ void llama_b1::release_plan() {
     carry_async_free();
     if (carry_host_buf) {
         ggml_backend_synchronize(backend_gpu); // the staging copies read and write this RAM on the compute stream
-        ggml_backend_buffer_free(carry_host_buf);
+        if (carry_pin_hold && b1_env_int("LLAMA_B1_CARRY_PIN_REUSE", 1) > 0) {
+            drop_carry_spare();
+            carry_pin_spare = carry_host_buf; // [PINRE] the re-plan's begin() may reuse it
+        } else {
+            ggml_backend_buffer_free(carry_host_buf);
+        }
         carry_host_buf = nullptr;
     }
     carry_host_offs.clear();
@@ -740,7 +753,8 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         if (host_carry_mode < 2 && try_group(g_max)) {
             g_fit = g_max;
         } else {
-            const int64_t ram = b1_ram_available();
+            // a pinned carry held over a re-plan comes back to this plan, so it counts as available
+            const int64_t ram = b1_ram_available() + (carry_pin_spare ? (int64_t) ggml_backend_buffer_get_size(carry_pin_spare) : 0);
             const int64_t room = ram > (5LL << 30) ? (ram - (5LL << 30)) / 5 * 4 : 0;
             if ((int64_t) host_carry_total > room) {
                 LLAMA_LOG_WARN("%s: [B1] host carry needs %.1f MiB of pinned RAM, only %.1f MiB allowed (MemAvailable %.1f MiB); "
@@ -940,7 +954,16 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     if (carry_host) {
         const int64_t t_alloc0 = ggml_time_us();
         ggml_backend_buffer_type_t buft_host = ggml_backend_dev_host_buffer_type(dev);
-        carry_host_buf = buft_host ? ggml_backend_buft_alloc_buffer(buft_host, host_carry_total) : nullptr;
+        bool reused = false;
+        if (carry_pin_spare && ggml_backend_buffer_get_size(carry_pin_spare) >= host_carry_total &&
+                ggml_backend_buffer_get_type(carry_pin_spare) == buft_host) {
+            carry_host_buf  = carry_pin_spare; // [PINRE] same call, already pinned
+            carry_pin_spare = nullptr;
+            reused = true;
+        } else {
+            drop_carry_spare();
+            carry_host_buf = buft_host ? ggml_backend_buft_alloc_buffer(buft_host, host_carry_total) : nullptr;
+        }
         if (carry_host_buf == nullptr) {
             LLAMA_LOG_WARN("%s: [B1] cannot pin %.1f MiB of host RAM for the carries; using the normal prefill\n",
                     __func__, host_carry_total/1048576.0);
@@ -971,9 +994,10 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             }
             ggml_backend_synchronize(backend_carry); // create the stream on this thread
         }
-        LLAMA_LOG_WARN("%s: [B1] host carry: %.1f MiB pinned for %zu ubatches in %.0f ms, %zu VRAM carry slot(s) of %.1f MiB%s "
+        LLAMA_LOG_WARN("%s: [B1] host carry: %.1f MiB pinned for %zu ubatches in %.0f ms%s, %zu VRAM carry slot(s) of %.1f MiB%s "
                 "(VRAM carries would need %.1f MiB)\n", __func__, host_carry_total/1048576.0, nub,
-                (ggml_time_us() - t_alloc0)/1000.0, n_host_slots(), carry_bytes/1048576.0,
+                (ggml_time_us() - t_alloc0)/1000.0, reused ? " (reused from the previous plan)" : "",
+                n_host_slots(), carry_bytes/1048576.0,
                 carry_async ? ", async staging stream" : "", host_carry_total/1048576.0);
     }
 

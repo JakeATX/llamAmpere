@@ -97,6 +97,10 @@ public:
     size_t fresh_cap = SIZE_MAX;
     size_t last_fresh() const { return fresh_last; }
     size_t fresh_last = 0;
+    // [PINRE] keep the pinned host carry across a re-plan inside one call (begin() releases the plan first);
+    // re-pinning 3.9 GiB costs ~2 s. drop_carry_spare() frees what the re-plan did not reuse.
+    void hold_carry_pin(bool hold) { carry_pin_hold = hold; }
+    void drop_carry_spare();
     bool ffn_enabled() const { return !ffn_views.empty(); }
     llm_b1_ffn * ffn(size_t ub);
     llm_b1_ffn * ffn_group() { return ffn_all.get(); }
@@ -258,6 +262,8 @@ private:
     void carry_fetch(size_t ub);
     void carry_async_free();
     ggml_backend_buffer_t carry_host_buf = nullptr;
+    ggml_backend_buffer_t carry_pin_spare = nullptr; // [PINRE] pinned carry held over a re-plan
+    bool carry_pin_hold = false;
     std::vector<size_t> carry_host_offs; // per ubatch of the call
     ggml_context * ctx_meta = nullptr;
     std::vector<ggml_tensor *> carries; // per ubatch of the call
