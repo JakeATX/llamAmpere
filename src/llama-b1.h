@@ -96,6 +96,10 @@ public:
     // so the re-plan caps fresh below the failed plan's (smaller variant: sync carry, then one expert slot).
     void set_fresh_cap(size_t bytes) { fresh_cap = bytes; }
     size_t fresh_cap = SIZE_MAX;
+    // [KEEPAUTO] VRAM keep reserve in MiB for this plan (-1 = LLAMA_B1_KEEP_FREE_MIB or the default). The legacy
+    // layer check (llama-context.cpp) reads the same value so plan and check always agree.
+    void set_keep_override(int64_t mib) { keep_override_mib = mib; }
+    int64_t keep_override_mib = -1;
     size_t last_fresh() const { return fresh_last; }
     size_t fresh_last = 0;
     // [PINRE] keep the pinned host carry across a re-plan inside one call (begin() releases the plan first);

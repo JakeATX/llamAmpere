@@ -6964,7 +6964,7 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         const size_t card_limit = (size_t) 23552 << 20;
         const size_t keep = std::max<size_t>(
                 // same keep as the plan (llama-b1.cpp): the env may lower it too, else the plan takes the VRAM this check then misses
-                (size_t) std::max<int64_t>(512, b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20,
+                (size_t) std::max<int64_t>(512, b1->keep_override_mib >= 0 ? b1->keep_override_mib : b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20,
                 total > card_limit ? total - card_limit + (64u << 20) : 0);
         // fork: lent, unused B1 VRAM covers most of the layer graph (see b1_kv_scratch_bind); only the owned rest needs free VRAM
         size_t lend_spare = 0;
@@ -7269,6 +7269,11 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         // plan once more leaving that deficit free: the plan lends more resident experts (refilled after the prompt)
         // instead of allocating fresh VRAM. Opt-in: LLAMA_B1_REPLAN=1.
         // Allocation rounding can leave the re-plan a little short, so up to three re-plans add each new deficit.
+        // [KEEPAUTO] opt-in LLAMA_B1_KEEP_AUTO_MIN_MIB=N (>= 512): when no plan fits with the normal keep reserve,
+        // lower the keep in 128 MiB steps down to N and plan again (each step with the usual re-plans). Default off.
+        const int64_t keep_start = b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536);
+        const int64_t keep_min   = b1_ctx_env("LLAMA_B1_KEEP_AUTO_MIN_MIB", 0);
+        for (int64_t keep_try = keep_start; ; ) {
         size_t extra = 0;
         for (int attempt = 0; attempt < 3 && !reserved && b1_legacy_deficit > 0 && b1_ctx_env("LLAMA_B1_REPLAN", 0) != 0; ++attempt) {
             extra += b1_legacy_deficit + ((size_t) 64 << 20);
@@ -7294,6 +7299,29 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             b1_kv_scratch_enabled = kv_scratch_wanted;
             b1_lend_scratch = lend_wanted;
             reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
+        }
+        keep_try -= 128;
+        if (reserved || keep_min < 512 || keep_try < keep_min) {
+            break;
+        }
+        b1->set_keep_override(keep_try);
+        LLAMA_LOG_WARN("%s: [B1] keep auto: planning again with a %lld MiB VRAM keep reserve (min %lld)\n", __func__,
+                (long long) keep_try, (long long) keep_min);
+        b1->hold_carry_pin(true);
+        const bool kplanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
+        b1->hold_carry_pin(false);
+        b1->drop_carry_spare();
+        b1_legacy_deficit = 0;
+        if (kplanned && b1->n_groups() == 1) {
+            b1_kv_scratch_enabled = kv_scratch_wanted;
+            b1_lend_scratch = lend_wanted;
+            reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
+        }
+        }
+        if (b1->keep_override_mib >= 0) {
+            LLAMA_LOG_WARN("%s: [B1] keep auto: %s with a %lld MiB keep reserve\n", __func__, reserved ? "one pass fits" : "no fit",
+                    (long long) b1->keep_override_mib);
+            b1->set_keep_override(-1);
         }
         if (!reserved) {
             b1_kv_scratch_enabled = false; b1_lend_scratch = false;
