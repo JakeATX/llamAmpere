@@ -596,7 +596,8 @@ static int galloc_peak_cmp(const void * a, const void * b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-static void galloc_peak_report(struct ggml_gallocr * g, int n_nodes) {
+static void galloc_peak_report(struct ggml_gallocr * g, const struct ggml_cgraph * graph) {
+    const int n_nodes = graph->n_nodes;
     const int top = galloc_peak_top();
     if (!top) { return; }
     static long min_mib = -1;
@@ -611,6 +612,21 @@ static void galloc_peak_report(struct ggml_gallocr * g, int n_nodes) {
         for (int i = 0; i < g->pk_snap_n[b] && i < top && off > 0 && off < (int) sizeof(line) - 128; ++i) {
             const struct ggml_tensor * t = g->pk_snap[b][i].t;
             off += snprintf(line + off, sizeof(line) - off, " %s(%s)=%.1f", t->name, ggml_op_desc(t), g->pk_snap[b][i].size / 1048576.0);
+            // readers of this tensor (direct or through a view): a second reader is what blocks in-place reuse
+            int nr = 0;
+            for (int k = 0; k < n_nodes && off > 0 && off < (int) sizeof(line) - 128; ++k) {
+                const struct ggml_tensor * nd = graph->nodes[k];
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    const struct ggml_tensor * sj = nd->src[j];
+                    if (sj && (sj == t || sj->view_src == t)) {
+                        off += snprintf(line + off, sizeof(line) - off, "%s%s:%s%s", nr++ ? "," : "<", nd->name, ggml_op_desc(nd),
+                                sj == t ? "" : "/v");
+                        break;
+                    }
+                }
+                if (nr >= 4) { break; }
+            }
+            if (nr && off > 0 && off < (int) sizeof(line) - 2) { off += snprintf(line + off, sizeof(line) - off, ">"); }
         }
         GGML_LOG_WARN("%s\n", line);
     }
@@ -1066,7 +1082,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
-    galloc_peak_report(galloc, graph->n_nodes);
+    galloc_peak_report(galloc, graph);
 }
 
 static bool ggml_gallocr_reserve_n_impl(

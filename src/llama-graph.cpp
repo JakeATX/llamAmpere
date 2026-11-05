@@ -3077,7 +3077,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        // LLAMA_MOE_WEIGHT_INPLACE=1 (opt-in): prompt batches scale the expert outputs in place, so the weighted copy
+        // (n_embd x n_expert_used x n_tokens f32, 400 MiB at 4,096 tokens) does not sit next to the unweighted one in the
+        // layer graph. Same values; only valid while nothing else reads ffn_moe_down after this node.
+        static const bool w_inplace = [] { const char * e = getenv("LLAMA_MOE_WEIGHT_INPLACE"); return e && atoi(e) != 0; }();
+        experts = w_inplace && n_tokens > 8 ? ggml_mul_inplace(ctx0, experts, weights) : ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 
