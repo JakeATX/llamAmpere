@@ -620,7 +620,9 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // fork: LLAMA_LEAN_PROMPT (packed QSA rows mask + direct lists + in-place expert weighting on prompt batches) is
     // the 12 GB pick only: on a 24 GB card it cost prompt 0.980x and writing 0.984x. Unset = on for an MoE model on a
     // small card (same test as the ubatch cap below), off otherwise; the first context decides; an explicit value wins.
-    if (!getenv("LLAMA_LEAN_PROMPT")) {
+    // A no_alloc context (the memory-fit trial pass, logs muted, weights not loaded yet) must not decide: it would
+    // test free memory before the weights and stay silent.
+    if (!model.hparams.no_alloc && !getenv("LLAMA_LEAN_PROMPT")) {
         bool lean = false;
         size_t free = 0, total = 0;
         if (model.hparams.n_expert > 0 && !model.devices.empty() &&
