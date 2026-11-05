@@ -19,6 +19,11 @@ fi
 # the default --kv-gpu-tokens needs a single stream, so the model would refuse to load
 slots=()
 [[ " $* " == *" -np "* || " $* " == *" --parallel"* || " $* " == *" -np="* ]] || slots=(--parallel 1)
+# the shape our speed numbers were measured with; the caller's own arguments come later, so they win. A 12 GB card still
+# reads the prompt with -ub 6144 (the engine lowers it), and experts fall back to unpinned file pages when RAM is short.
+shape=(-ngl 999 -fa on -c 110592 -b 131072 -ub 8192 --fit off --moe-arena on --moe-cache on --ctx-checkpoints 4)
+# 8 CPU threads as measured; smaller machines keep the engine's own count (physical cores)
+(( $(nproc --all) < 16 )) || shape+=(-t 8 -tb 8)
 exec "$server" -md "$LLAMA_ARG_MODEL_DRAFT" --moe-profile "$GGML_MOE_CACHE_PROFILE_LOAD" \
     -ot token_embd.weight=CUDA0 -ctk sjkvarn4 -ctv sjkvarn4 --moe-skip \
-    "${slots[@]}" "${depth[@]}" "$@" "${exact[@]}"
+    "${shape[@]}" "${slots[@]}" "${depth[@]}" "$@" "${exact[@]}"
