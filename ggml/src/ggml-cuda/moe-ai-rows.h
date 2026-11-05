@@ -20,6 +20,17 @@
 
 namespace moe_ai {
 
+// AIPFAST: one 128-K unit as the host kernels read it: dh = its 16 fp16 row scales, w = its 16 tiles. In the U layout
+// both sit together (unit = [scales][tiles], w = dh + 32 bytes); in the U2 row-scale layout the scales are per 640-K
+// block and the 5 units' tiles follow them, so unit_src points dh at the block scales and w at the unit's tiles in place
+// (no per-unit copy). Converts from a U unit pointer, so callers holding a U unit (tests, R8) are unchanged.
+struct ublk {
+    const uint16_t * dh;
+    const uint8_t  * w;
+    ublk(const uint16_t * d, const uint8_t * t) : dh(d), w(t) {}
+    ublk(const uint8_t * u) : dh((const uint16_t *) u), w(u + AI4U_SCALE_BYTES) {}  // NOLINT: implicit on purpose
+};
+
 // ggml_from_float_t: x (k floats) -> y (k floats) in the AI+ rotated basis (scalar reference)
 static void rotate_scalar(const float * x, void * vy, int64_t k) {
     float * y = (float *) vy;
@@ -328,10 +339,10 @@ static inline const float * q8_d(const void * q, int64_t K) { return (const floa
 static inline const int32_t * q8_xu(const void * q, int64_t K) { return q8_xu_w((void *) q, K); }
 
 // scalar reference of the Q8 path (and the non-AVX2 fallback): same integer dots, same float order as the AVX2 kernel
-static void unit_rows_q8_scalar(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
+static void unit_rows_q8_scalar(ublk blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
                                 int64_t K, float (*acc)[AI4_TR]) {
-    const uint16_t * dh = (const uint16_t *) blk;
-    const uint32_t * wd = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
+    const uint16_t * dh = blk.dh;
+    const uint32_t * wd = (const uint32_t *) blk.w;
     const int tw = AIK_TILE_WORDS(k), qb = q8_block(K), st = (qb < AI4U_UK ? qb : AI4U_UK)/AI4_TC;
     uint32_t E[AIK_TILE_WORDS(5) + 3 + 4] = {};
     for (int r = 0; r < AI4_TR; ++r) {
@@ -595,12 +606,12 @@ static inline __attribute__((always_inline)) void direct_rows(const uint32_t * w
 }
 
 template <int K, int NT, int G, int R0>
-static inline __attribute__((always_inline)) void direct_group(const uint8_t * blk, const float * const * y, int64_t koff,
+static inline __attribute__((always_inline)) void direct_group(ublk blk, const float * const * y, int64_t koff,
                                                                __m256i Cv, float (*acc)[AI4_TR]) {
     constexpr int tw = AIK_TILE_WORDS(K);
     const direct_tabs & T = direct_tables();
     const __m256i sh = _mm256_loadu_si256((const __m256i *) shuf_tables().sh[K]);
-    const uint32_t * wd = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
+    const uint32_t * wd = (const uint32_t *) blk.w;
     __m256 part[NT][G];
     for (int t = 0; t < NT; ++t) { for (int g = 0; g < G; ++g) { part[t][g] = _mm256_setzero_ps(); } }
     for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
@@ -610,7 +621,7 @@ static inline __attribute__((always_inline)) void direct_group(const uint8_t * b
         for (int t = 0; t < NT; ++t) { yv[t] = _mm256_loadu_ps(y[t] + koff + ct*AI4_TC); }
         direct_rows<K, NT, G, R0>(wt, f4, l4, T, sh, Cv, yv, part, std::make_index_sequence<G>{});
     }
-    const uint16_t * dh = (const uint16_t *) blk;
+    const uint16_t * dh = blk.dh;
     for (int g = 0; g < G; ++g) {
         const float d = ai4_fp16_to_fp32(dh[R0 + g]);
         for (int t = 0; t < NT; ++t) { acc[t][R0 + g] = __builtin_fmaf(d, hsum8(part[t][g]), acc[t][R0 + g]); }
@@ -619,20 +630,20 @@ static inline __attribute__((always_inline)) void direct_group(const uint8_t * b
 
 // one unit (16 rows x 128 K): acc[t][r] += scale_r * (row r . y_t), rows in groups of G (NT * G accumulators <= 8)
 template <int K, int NT, size_t... J>
-static void unit_rows_direct_impl(const uint8_t * blk, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR],
+static void unit_rows_direct_impl(ublk blk, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR],
                                   std::index_sequence<J...>) {
     constexpr int G = AI4_TR/(int) sizeof...(J);
     (direct_group<K, NT, G, (int) J*G>(blk, y, koff, Cv, acc), ...);
 }
 
 template <int K, int NT>
-static void unit_rows_direct_nt(const uint8_t * blk, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR]) {
+static void unit_rows_direct_nt(ublk blk, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR]) {
     constexpr int G = NT == 1 ? 8 : NT == 2 ? 4 : NT <= 4 ? 2 : 1;
     unit_rows_direct_impl<K, NT>(blk, y, koff, Cv, acc, std::make_index_sequence<AI4_TR/G>{});
 }
 
 template <int K>
-static void unit_rows_direct_k(const uint8_t * blk, int nt, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR]) {
+static void unit_rows_direct_k(ublk blk, int nt, const float * const * y, int64_t koff, __m256i Cv, float (*acc)[AI4_TR]) {
     switch (nt) {
         case 1:  unit_rows_direct_nt<K, 1>(blk, y, koff, Cv, acc); break;
         case 2:  unit_rows_direct_nt<K, 2>(blk, y, koff, Cv, acc); break;
@@ -646,7 +657,7 @@ static void unit_rows_direct_k(const uint8_t * blk, int nt, const float * const 
 }
 
 // k in 2..5; returns false (nothing done) for other rates
-static bool unit_rows_direct(const uint8_t * blk, int k, uint32_t C, int nt, const float * const * y, int64_t koff,
+static bool unit_rows_direct(ublk blk, int k, uint32_t C, int nt, const float * const * y, int64_t koff,
                              float (*acc)[AI4_TR]) {
     const __m256i Cv = _mm256_set1_epi32((int) C);
     switch (k) {
@@ -711,7 +722,7 @@ static inline __attribute__((always_inline)) __m128i q8_half_add(__m256i v) {
 // dd[b][t][0] = dd[b][t][1] = token t's scale of the unit's quant block b (a token pair's [d0 d0 d1 d1] is one load)
 // xc[t][0] = xc[t][1] = 128 * token t's sum of q over this unit (LV only; ST = 16, one block per unit)
 template <int K, int NT, int G, int R0, int ST, bool KP, bool LV>
-static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, const void * const * xq, int64_t koff,
+static inline __attribute__((always_inline)) void q8_group(ublk blk, const void * const * xq, int64_t koff,
                                                            const float (*dd)[8][2], const int32_t (*xc)[2], __m256i Cv,
                                                            float (*acc)[AI4_TR], int8_t * Wu, int64_t gs) {
     static_assert(!LV || ST == AI4U_UK/AI4_TC, "LV corrects once per unit");
@@ -720,7 +731,7 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
     constexpr int N8 = G >= 8 ? NT*(G/8) : 1, N4 = G == 4 ? NT : G == 2 ? (NT + 1)/2 : 1;
     const direct_tabs & T = direct_tables();
     const __m256i sh = _mm256_loadu_si256((const __m256i *) shuf_tables().sh[K]);
-    const uint32_t * wd = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
+    const uint32_t * wd = (const uint32_t *) blk.w;
     __m256 F8[N8];
     __m128 F4[N4];
     for (int i = 0; i < N8; ++i) { F8[i] = _mm256_setzero_ps(); }
@@ -772,7 +783,7 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
     } else {
         for (int tp = 0; tp < N4; ++tp) { _mm_storeu_ps(&rs[2*tp][0], F4[tp]); }   // rs[t0][0..1], rs[t1][0..1]
     }
-    const uint16_t * dh = (const uint16_t *) blk;
+    const uint16_t * dh = blk.dh;
     for (int g = 0; g < G; ++g) {
         const float dw = ai4_fp16_to_fp32(dh[R0 + g]);
         for (int t = 0; t < NT; ++t) { acc[t][R0 + g] = __builtin_fmaf(dw, rs[t][g], acc[t][R0 + g]); }
@@ -780,7 +791,7 @@ static inline __attribute__((always_inline)) void q8_group(const uint8_t * blk, 
 }
 
 template <int K, int NT, int ST, bool KP, bool LV, size_t... J>
-static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int64_t koff, const float (*dd)[8][2],
+static void unit_rows_q8_impl(ublk blk, const void * const * xq, int64_t koff, const float (*dd)[8][2],
                               const int32_t (*xc)[2], __m256i Cv, float (*acc)[AI4_TR], int8_t * Wu, int64_t gs,
                               std::index_sequence<J...>) {
     constexpr int G = AI4_TR/(int) sizeof...(J);
@@ -794,7 +805,7 @@ static void unit_rows_q8_impl(const uint8_t * blk, const void * const * xq, int6
 #endif
 
 template <int K, int NT, int ST, bool KP, bool LV>
-static void unit_rows_q8_nt(const uint8_t * blk, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv, float (*acc)[AI4_TR],
+static void unit_rows_q8_nt(ublk blk, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv, float (*acc)[AI4_TR],
                             int8_t * Wu, int64_t gs) {
     constexpr int G = MOE_AI_Q8_G(NT, ST);   // rows per group (G/2 int32 pair accumulators per token)
     constexpr int NB = AI4U_UK/AI4_TC/ST, QB = ST*AI4_TC < AI4U_UK ? 32 : 256;
@@ -810,7 +821,7 @@ static void unit_rows_q8_nt(const uint8_t * blk, const void * const * xq, int64_
 }
 
 template <int K, int ST, bool KP, bool LV>
-static void unit_rows_q8_k(const uint8_t * blk, int nt, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv,
+static void unit_rows_q8_k(ublk blk, int nt, const void * const * xq, int64_t koff, int64_t Kin, __m256i Cv,
                            float (*acc)[AI4_TR], int8_t * Wu, int64_t gs) {
     switch (nt) {
         case 1:  unit_rows_q8_nt<K, 1, ST, KP, LV>(blk, xq, koff, Kin, Cv, acc, Wu, gs); break;
@@ -825,7 +836,7 @@ static void unit_rows_q8_k(const uint8_t * blk, int nt, const void * const * xq,
 }
 
 template <int ST, bool KP = false, bool LV = false>
-static bool unit_rows_q8_st(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
+static bool unit_rows_q8_st(ublk blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
                             float (*acc)[AI4_TR], int8_t * Wu = nullptr, int64_t gs = 0) {
     const __m256i Cv = _mm256_set1_epi32((int) C);
     switch (k) {
@@ -839,7 +850,7 @@ static bool unit_rows_q8_st(const uint8_t * blk, int k, uint32_t C, int nt, cons
 
 // k in 2..5 with valid row-window tables; returns false (nothing done) otherwise
 // lv: 1 = LV kernel for gate/up, 0 = default, -1 = GGML_MOE_AI_HOST_Q8_LV
-static bool unit_rows_q8(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
+static bool unit_rows_q8(ublk blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
                          float (*acc)[AI4_TR], int lv = -1) {
     if (!direct_tables().ok) { return false; }
     if (q8_block(Kin) != 256) { return unit_rows_q8_st<4>(blk, k, C, nt, xq, koff, Kin, acc); }
@@ -880,10 +891,10 @@ MOE_AI_T512 static inline __m512 row2_levels_512(const uint32_t * E, int k, uint
 }
 
 // one unit (16 rows x 128 K) of slab_rows: acc[t][r] += scale_r * (row r . y_t)
-MOE_AI_T512 static void unit_rows_512(const uint8_t * blk, int k, uint32_t C, int nt, const float * const * y, int64_t koff,
+MOE_AI_T512 static void unit_rows_512(ublk blk, int k, uint32_t C, int nt, const float * const * y, int64_t koff,
                                       float (*acc)[AI4_TR]) {
-    const uint16_t * dh = (const uint16_t *) blk;
-    const uint32_t * wd = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
+    const uint16_t * dh = blk.dh;
+    const uint32_t * wd = (const uint32_t *) blk.w;
     const int tw = AIK_TILE_WORDS(k);
     uint32_t E[AIK_TILE_WORDS(5) + 3];
     __m512 part[8][AI4_TR/2];
@@ -958,11 +969,11 @@ struct vbmi_tabs {
     }
 };
 
-MOE_AI_T512V static void unit_rows_512_vbmi(const uint8_t * blk, int k, uint32_t C, int nt, const float * const * y,
+MOE_AI_T512V static void unit_rows_512_vbmi(ublk blk, int k, uint32_t C, int nt, const float * const * y,
                                             int64_t koff, float (*acc)[AI4_TR]) {
     static const vbmi_tabs T;
-    const uint16_t * dh = (const uint16_t *) blk;
-    const uint8_t  * wb = blk + AI4U_SCALE_BYTES;
+    const uint16_t * dh = blk.dh;
+    const uint8_t  * wb = blk.w;
     const int tb = 4*AIK_TILE_WORDS(k);                      // tile bytes, 16k
     const __mmask64 m0 = tb >= 64 ? ~0ULL : (1ULL << tb) - 1;
     const __mmask64 m1 = tb > 64 ? (1ULL << (tb - 64)) - 1 : 0;
@@ -1085,7 +1096,7 @@ MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_reduce(__m
 
 // KR = rate k, GG = row groups (of 4 rows) per pass over the unit's tiles, ST = tiles per quant block
 template <int KR, int NT, int GG, int ST>
-MOE_AI_T512Q static void unit_rows_512_q8v_nt(const uint8_t * blk, uint32_t C, const void * const * xq, int64_t koff, int64_t Kin,
+MOE_AI_T512Q static void unit_rows_512_q8v_nt(ublk blk, uint32_t C, const void * const * xq, int64_t koff, int64_t Kin,
                                           float (*acc)[AI4_TR]) {
     static_assert(4 % GG == 0, "row groups per pass");
     const vbmi_q8_tabs & T = vbmi_q8_tables();
@@ -1093,7 +1104,7 @@ MOE_AI_T512Q static void unit_rows_512_q8v_nt(const uint8_t * blk, uint32_t C, c
     constexpr __mmask64 m0 = tb >= 64 ? ~0ULL : (1ULL << tb) - 1;
     constexpr __mmask64 m1 = tb > 64 ? (1ULL << (tb - 64)) - 1 : 0;
     constexpr int NB = AI4U_UK/AI4_TC/ST, QB = ST*AI4_TC < AI4U_UK ? 32 : 256;
-    const uint8_t * wb = blk + AI4U_SCALE_BYTES;
+    const uint8_t * wb = blk.w;
     const __m512i ctl = _mm512_loadu_si512(T.ctl[KR]);
     const __m512i cl = _mm512_set1_epi16((short) (C & 0xFFFF)), ch = _mm512_set1_epi16((short) (C >> 16));
     const __m512i one8 = _mm512_set1_epi8(1), k510 = _mm512_set1_epi16(510);
@@ -1143,7 +1154,7 @@ MOE_AI_T512Q static void unit_rows_512_q8v_nt(const uint8_t * blk, uint32_t C, c
             }
         }
     }
-    const uint16_t * dh = (const uint16_t *) blk;
+    const uint16_t * dh = blk.dh;
     for (int r = 0; r < AI4_TR; ++r) {
         const float dw = ai4_fp16_to_fp32(dh[r]);
         for (int t = 0; t < NT; ++t) { acc[t][r] = __builtin_fmaf(dw, rs[t][r], acc[t][r]); }
@@ -1156,7 +1167,7 @@ MOE_AI_T512Q static void unit_rows_512_q8v_nt(const uint8_t * blk, uint32_t C, c
 #endif
 
 template <int KR, int ST>
-MOE_AI_T512Q static void unit_rows_512_q8v_k(const uint8_t * blk, uint32_t C, int nt, const void * const * xq, int64_t koff,
+MOE_AI_T512Q static void unit_rows_512_q8v_k(ublk blk, uint32_t C, int nt, const void * const * xq, int64_t koff,
                                          int64_t Kin, float (*acc)[AI4_TR]) {
     switch (nt) {
         case 1:  unit_rows_512_q8v_nt<KR, 1, MOE_AI_Q8V_GG(1), ST>(blk, C, xq, koff, Kin, acc); break;
@@ -1171,7 +1182,7 @@ MOE_AI_T512Q static void unit_rows_512_q8v_k(const uint8_t * blk, uint32_t C, in
 }
 
 template <int ST>
-MOE_AI_T512Q static bool unit_rows_512_q8v_st(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
+MOE_AI_T512Q static bool unit_rows_512_q8v_st(ublk blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff,
                                           int64_t Kin, float (*acc)[AI4_TR]) {
     switch (k) {
         case 2: unit_rows_512_q8v_k<2, ST>(blk, C, nt, xq, koff, Kin, acc); return true;
@@ -1183,7 +1194,7 @@ MOE_AI_T512Q static bool unit_rows_512_q8v_st(const uint8_t * blk, int k, uint32
 }
 
 // k in 2..5 on a VBMI + VNNI host; returns false (nothing done) otherwise
-static bool unit_rows_q8_vbmi(const uint8_t * blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
+static bool unit_rows_q8_vbmi(ublk blk, int k, uint32_t C, int nt, const void * const * xq, int64_t koff, int64_t Kin,
                               float (*acc)[AI4_TR]) {
     if (!has_q8_vbmi()) { return false; }
     return q8_block(Kin) == 256 ? unit_rows_512_q8v_st<16>(blk, k, C, nt, xq, koff, Kin, acc)
@@ -1200,31 +1211,25 @@ static bool unit_rows_q8_vbmi(const uint8_t * blk, int k, uint32_t C, int nt, co
 // 5 = AVX2 row-window decode (unit_rows_direct: one 16-byte load per row, register-grouped rows; the default AVX2 path
 // unless GGML_MOE_AI_HOST_ROWWIN=0, which falls back to path 0 = shuffle with direct interior lane loads)
 // AIPFAST: U2 row-scale slabs (AITk_U2, ggml-ai4.h AI4V2_*; K % 640 == 0): one fp16 row scale per 640-K block, shared by
-// its 5 units of 128 K. Every host kernel reads a unit as [16 fp16 row scales][16 tiles], so for U2 the unit is gathered
-// into a stack copy (the block's scales + that unit's tiles, 32 + 256k bytes) and the decode, q8 and R8 kernels run
-// unchanged. The block scale is then applied once per unit (acc = fma(d, unit sum, acc)): a valid-math reorder of
-// d * (sum of the 5 units). The layout is told apart by the row size (U: 2 + 16k bytes per row per 128 K, U2: 2 + 80k
-// per 640 K), so callers pass the tensor's row_bytes as before.
+// its 5 units of 128 K. Host kernels take a unit as ublk (scale pointer + tile pointer), so for U2 unit_src points the
+// scales at the block's and the tiles at that unit's, in place (the first version gathered a 32 + 256k byte stack copy
+// per unit: 3-10% slower than U per projection on rbuild, f25h1). The block scale is then applied once per unit
+// (acc = fma(d, unit sum, acc)): a valid-math reorder of d * (sum of the 5 units). The layout is told apart by the row
+// size (U: 2 + 16k bytes per row per 128 K, U2: 2 + 80k per 640 K), so callers pass the tensor's row_bytes as before.
 static inline bool slab_is_v2(size_t row_bytes, int k, int64_t K) {
     return K % AI4V2_BK == 0 && row_bytes*AI4_TR == (size_t) (K/AI4V2_BK)*AI4V2_BLOCK_BYTES(k);
 }
 
 struct unit_src {
     const uint8_t * slab;
-    int k, ub;
+    int k, ub, tb;
     bool v2;
-    alignas(64) uint8_t buf[AI4U_UNIT_BYTES(5) + 128];   // + slack for the kernels' lane loads past a tile
     unit_src(const uint8_t * s, size_t row_bytes, int k_, int64_t K)
-        : slab(s), k(k_), ub(AI4U_UNIT_BYTES(k_)), v2(slab_is_v2(row_bytes, k_, K)) {
-        if (v2) { memset(buf, 0, sizeof(buf)); }
-    }
-    const uint8_t * at(int64_t u) {
-        if (!v2) { return slab + u*ub; }
-        const int tb = (AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k);
+        : slab(s), k(k_), ub(AI4U_UNIT_BYTES(k_)), tb((AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k_)), v2(slab_is_v2(row_bytes, k_, K)) {}
+    ublk at(int64_t u) const {
+        if (!v2) { return ublk(slab + u*ub); }
         const uint8_t * b = slab + (u/AI4V2_UNITS)*AI4V2_BLOCK_BYTES(k);
-        if (u % AI4V2_UNITS == 0) { memcpy(buf, b, AI4U_SCALE_BYTES); }
-        memcpy(buf + AI4U_SCALE_BYTES, b + AI4U_SCALE_BYTES + (u % AI4V2_UNITS)*tb, tb);
-        return buf;
+        return ublk((const uint16_t *) b, b + AI4U_SCALE_BYTES + (u % AI4V2_UNITS)*tb);
     }
 };
 
@@ -1235,9 +1240,9 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
     float acc[8][AI4_TR] = {};
     uint32_t E[AIK_TILE_WORDS(5) + 3 + 4] = {};  // k <= 5; +4 words of slack for row_levels_shuf's 16-byte lane loads
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
-        const uint8_t  * blk = us.at(u);
-        const uint16_t * dh  = (const uint16_t *) blk;
-        const uint32_t * wd  = (const uint32_t *) (blk + AI4U_SCALE_BYTES);
+        const ublk blk = us.at(u);
+        const uint16_t * dh  = blk.dh;
+        const uint32_t * wd  = (const uint32_t *) blk.w;
 #if defined(__AVX2__) && defined(__FMA__)
         // default (-1): VBMI decode where the host has it; AVX-512 hosts WITHOUT VBMI (Skylake-X/Cascade Lake class) take the
         // AVX2 shuffle path below, which beat the word-read AVX-512 decode on the 9900X (249-280 vs 363 us, airows1)
@@ -1307,7 +1312,7 @@ static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, in
     unit_src us((const uint8_t *) w + (size_t) a*row_bytes, row_bytes, k, K);
     float acc[8][AI4_TR] = {};
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
-        const uint8_t * blk = us.at(u);
+        ublk blk = us.at(u);
 #if defined(__AVX2__) && defined(__FMA__)
         if (!scalar && C != 0 && (vbmi > 0 || (vbmi < 0 && use_q8_vbmi())) && unit_rows_q8_vbmi(blk, k, C, nt, xq, u*AI4U_UK, K, acc)) {
             continue;
@@ -1356,9 +1361,9 @@ static void slab_rows_q8_keep(const char * w, size_t row_bytes, int k, uint32_t 
     uint16_t * S = (uint16_t *) (R + r8_w_bytes(n_out, K));
     float acc[8][AI4_TR] = {};
     for (int64_t u = 0; u < nu; ++u) {
-        const uint8_t * blk = us.at(u);
-        memcpy(S + (g0*nu + u)*8, blk, 16);
-        memcpy(S + ((g0 + 1)*nu + u)*8, blk + 16, 16);
+        ublk blk = us.at(u);
+        memcpy(S + (g0*nu + u)*8, blk.dh, 16);
+        memcpy(S + ((g0 + 1)*nu + u)*8, blk.dh + 8, 16);
         int8_t * Wu = W + u*AI4U_UK*8;
         if (q8_block(K) == 256) { unit_rows_q8_st<16, true>(blk, k, C, nt, xq, u*AI4U_UK, K, acc, Wu, K*8); }
         else                    { unit_rows_q8_st<4, true>(blk, k, C, nt, xq, u*AI4U_UK, K, acc, Wu, K*8); }
