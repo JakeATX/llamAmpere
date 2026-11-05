@@ -629,7 +629,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
             lean = (free >> 20) < (size_t) (e ? atoll(e) : 14336);
         }
+#ifdef _WIN32
+        _putenv_s("LLAMA_LEAN_PROMPT", lean ? "1" : "0");
+#else
         setenv("LLAMA_LEAN_PROMPT", lean ? "1" : "0", 0);
+#endif
         if (lean) {
             LLAMA_LOG_WARN("%s: small card (%zu MiB free): LLAMA_LEAN_PROMPT on (=0 turns it off)\n", __func__, free >> 20);
         }
