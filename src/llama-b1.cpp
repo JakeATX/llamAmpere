@@ -365,7 +365,7 @@ std::vector<ggml_backend_buffer_ptr> llama_b1::spare_views(size_t min_bytes, siz
     const size_t n_lent = regions.size() - (fresh_buf ? 1 : 0);
     const size_t n_roles = roles.size();
     const size_t align = buft_dev ? ggml_backend_buft_get_alignment(buft_dev) : 0;
-    if (!align || slot_place.size() != 2*n_roles || carry_place.size() != g_ub) {
+    if (!align || slot_place.size() != 2*n_roles || carry_place.size() != (carry_host ? 1 : g_ub)) {
         return {};
     }
     for (size_t r = 0; r < n_lent; ++r) {
@@ -381,7 +381,7 @@ std::vector<ggml_backend_buffer_ptr> llama_b1::spare_views(size_t min_bytes, siz
                 continue;
             }
             uint32_t tokens = 0;
-            for (size_t u = j; u < ub_n.size(); u += g_ub) {
+            for (size_t u = j; u < ub_n.size(); u += (carry_host ? 1 : g_ub)) {
                 tokens = std::max(tokens, ub_n[u]);
             }
             used.push_back({ carry_place[j].offs, carry_place[j].offs + (size_t) tokens * n_embd * n_hc * sizeof(float) });
@@ -436,6 +436,13 @@ void llama_b1::release_plan() {
     LLAMA_LOG_INFO("%s: [B1] bank RAM: released %zu bytes, retained %zu bytes\n", __func__, freed_bytes, kept_bytes);
     reserve_layer_restore();
     ffn_release();
+    if (carry_host_buf) {
+        ggml_backend_synchronize(backend_gpu); // the staging copies read and write this RAM on the compute stream
+        ggml_backend_buffer_free(carry_host_buf);
+        carry_host_buf = nullptr;
+    }
+    carry_host_offs.clear();
+    carry_host = false;
     if (fresh_buf) {
         ggml_backend_buffer_free(fresh_buf);
         fresh_buf = nullptr;
@@ -625,12 +632,16 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
                 items.push_back(role_max[r]);
             }
         }
-        for (size_t j = 0; j < g; ++j) {
-            uint32_t tokens = 0;
-            for (size_t u = j; u < nub; u += g) {
-                tokens = std::max(tokens, ub_n[u]);
+        if (carry_host) {
+            items.push_back(carry_bytes); // [PP12] one VRAM slot; the carries live in pinned host RAM
+        } else {
+            for (size_t j = 0; j < g; ++j) {
+                uint32_t tokens = 0;
+                for (size_t u = j; u < nub; u += g) {
+                    tokens = std::max(tokens, ub_n[u]);
+                }
+                items.push_back(b1_align_up((size_t) tokens * n_embd * n_hc * sizeof(float), align));
             }
-            items.push_back(b1_align_up((size_t) tokens * n_embd * n_hc * sizeof(float), align));
         }
 
         size_t ffn_bytes = 0;
@@ -712,7 +723,35 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     };
 
     size_t g_fit = 0;
-    for (size_t g = g_max; g >= 1; --g) {
+    // [PP12] host carry: keep one pass over the experts when only the carries keep the whole group out of VRAM.
+    // RAM rule: the pinned carries may use at most 80% of MemAvailable above a 5 GiB floor.
+    const int64_t host_carry_mode = ffn_requested ? 0 : b1_env_int("LLAMA_B1_HOST_CARRY", 0);
+    size_t host_carry_total = 0;
+    for (uint32_t n : ub_n) {
+        host_carry_total += b1_align_up((size_t) n * n_embd * n_hc * sizeof(float), align);
+    }
+    if (host_carry_mode > 0 && nub > 1) {
+        if (host_carry_mode < 2 && try_group(g_max)) {
+            g_fit = g_max;
+        } else {
+            const int64_t ram = b1_ram_available();
+            const int64_t room = ram > (5LL << 30) ? (ram - (5LL << 30)) / 5 * 4 : 0;
+            if ((int64_t) host_carry_total > room) {
+                LLAMA_LOG_WARN("%s: [B1] host carry needs %.1f MiB of pinned RAM, only %.1f MiB allowed (MemAvailable %.1f MiB); "
+                        "not used\n", __func__, host_carry_total/1048576.0, room/1048576.0, ram/1048576.0);
+            } else {
+                carry_host = true;
+                if (try_group(g_max)) {
+                    g_fit = g_max;
+                } else {
+                    carry_host = false;
+                    LLAMA_LOG_WARN("%s: [B1] host carry: the expert slots alone do not fit (%.1f MiB free, keeping %zu MiB); "
+                            "not used\n", __func__, free_mem/1048576.0, keep >> 20);
+                }
+            }
+        }
+    }
+    for (size_t g = g_max; g_fit == 0 && g >= 1; --g) {
         if (try_group(g)) {
             g_fit = g;
             break;
@@ -845,25 +884,47 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     }
 
     slot_place.assign(2*n_roles, {});
-    carry_place.assign(g_sel, {});
+    carry_place.assign(carry_host ? 1 : g_sel, {});
     for (size_t i = 0; i < place_sel.size(); ++i) {
         const placement p = { place_sel[i].first, place_sel[i].second };
         GGML_ASSERT(p.region >= 0 && (size_t) p.region < regions.size());
         if (i < 2*n_roles) {
             slot_place[i] = p;
-        } else if (i < 2*n_roles + g_sel) {
+        } else if (i < 2*n_roles + carry_place.size()) {
             carry_place[i - 2*n_roles] = p;
         }
     }
 
     carries.resize(nub);
     for (size_t u = 0; u < nub; ++u) {
-        const placement & p = carry_place[u % g_sel];
+        const placement & p = carry_place[carry_host ? 0 : u % g_sel];
         ggml_tensor * t = ggml_new_tensor_3d(ctx_meta, GGML_TYPE_F32, n_embd, n_hc, ub_n[u]);
         t->buffer = regions[p.region].buf;
         t->data   = regions[p.region].base + p.offs;
         ggml_format_name(t, "b1_carry_%zu", u);
         carries[u] = t;
+    }
+
+    if (carry_host) {
+        const int64_t t_alloc0 = ggml_time_us();
+        ggml_backend_buffer_type_t buft_host = ggml_backend_dev_host_buffer_type(dev);
+        carry_host_buf = buft_host ? ggml_backend_buft_alloc_buffer(buft_host, host_carry_total) : nullptr;
+        if (carry_host_buf == nullptr) {
+            LLAMA_LOG_WARN("%s: [B1] cannot pin %.1f MiB of host RAM for the carries; using the normal prefill\n",
+                    __func__, host_carry_total/1048576.0);
+            release_plan();
+            return false;
+        }
+        carry_host_offs.resize(nub);
+        size_t offs = 0;
+        for (size_t u = 0; u < nub; ++u) {
+            carry_host_offs[u] = offs;
+            offs += b1_align_up((size_t) ub_n[u] * n_embd * n_hc * sizeof(float), align);
+        }
+        st.bytes_carry_host = host_carry_total;
+        LLAMA_LOG_WARN("%s: [B1] host carry: %.1f MiB pinned for %zu ubatches in %.0f ms, one VRAM carry slot of %.1f MiB "
+                "(VRAM carries would need %.1f MiB)\n", __func__, host_carry_total/1048576.0, nub,
+                (ggml_time_us() - t_alloc0)/1000.0, carry_bytes/1048576.0, host_carry_total/1048576.0);
     }
 
     if (ffn_requested && g_sel == nub) {
@@ -938,7 +999,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         }
     }
     st.bytes_fresh += fresh_sel;
-    for (size_t j = 0; j < g_sel; ++j) {
+    for (size_t j = 0; j < (carry_host ? 1 : g_sel); ++j) {
         uint32_t tokens = 0;
         for (size_t u = j; u < nub; u += g_sel) {
             tokens = std::max(tokens, ub_n[u]);
@@ -1119,6 +1180,22 @@ int32_t llama_b1::range_end(int32_t l0) const {
 ggml_tensor * llama_b1::carry(size_t ub) {
     GGML_ASSERT(ub < carries.size());
     return carries[ub];
+}
+
+void llama_b1::carry_load(size_t ub) {
+    GGML_ASSERT(carry_host && carry_host_buf && ub < carries.size() && ub < carry_host_offs.size());
+    const size_t n = ggml_nbytes(carries[ub]);
+    ggml_backend_tensor_set_async(backend_gpu, carries[ub],
+            (const char *) ggml_backend_buffer_get_base(carry_host_buf) + carry_host_offs[ub], 0, n);
+    st.bytes_carry_h2d += n;
+}
+
+void llama_b1::carry_store(size_t ub) {
+    GGML_ASSERT(carry_host && carry_host_buf && ub < carries.size() && ub < carry_host_offs.size());
+    const size_t n = ggml_nbytes(carries[ub]);
+    ggml_backend_tensor_get_async(backend_gpu, carries[ub],
+            (char *) ggml_backend_buffer_get_base(carry_host_buf) + carry_host_offs[ub], 0, n);
+    st.bytes_carry_d2h += n;
 }
 
 bool llama_b1::tensor_streamed(int il, const exps_tensor & e) const {
@@ -1510,6 +1587,10 @@ void llama_b1::end(bool failed) {
             grp_first.size(), g_ub, st.bytes_h2d/1073741824.0, s > 0 ? st.bytes_h2d/1e9/s : 0.0, s, st.t_wait_ms,
             st.bytes_lent/1048576.0, st.bytes_fresh/1048576.0, st.bytes_carry/1048576.0);
 
+    if (st.bytes_carry_host) {
+        LLAMA_LOG_WARN("%s: [B1] host carry: %.1f MiB pinned, staged %.2f GiB to VRAM and %.2f GiB back\n", __func__,
+                st.bytes_carry_host/1048576.0, st.bytes_carry_h2d/1073741824.0, st.bytes_carry_d2h/1073741824.0);
+    }
     LLAMA_LOG_INFO("%s: [B1] permanent expert copies: D2D_bytes=%llu H2D_bytes=%llu\n", __func__,
             (unsigned long long)st.bytes_d2d, (unsigned long long)st.bytes_h2d);
     LLAMA_LOG_INFO("%s: [B1] pass timing: pipeline wall %.3f ms, overlapped copy submission %.3f ms, exposed host copy waits %.3f ms; overlapping times are not additive\n",

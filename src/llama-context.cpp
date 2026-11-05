@@ -64,6 +64,12 @@
 #include <sys/resource.h>
 #endif
 
+// [PP12] host expert bytes this context uploaded through the copy callback, and copies the MoE cache served;
+// read by the normal-prefill log so a fallback prompt reports what it moved to the card
+static std::atomic<uint64_t> g_pp_upload_bytes{0};
+static std::atomic<uint64_t> g_pp_cache_copies{0};
+
+
 //
 // llama_context
 //
@@ -5620,6 +5626,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         LLAMA_LOG_INFO("%s: layer-sized B1 fallback uses %u-token normal chunks\n", __func__, sched_reserve_tokens);
     }
+    // [PP12] a long prompt on the normal path: log chunks, expert bytes uploaded and wall time when the call ends
+    struct pp_normal_log {
+        bool on = false;
+        uint32_t tokens = 0, chunks = 0, max_chunk = 0;
+        uint64_t up0 = 0, cc0 = 0;
+        int64_t t0 = 0;
+        ~pp_normal_log() {
+            if (!on) {
+                return;
+            }
+            const double s = (ggml_time_us() - t0) / 1e6;
+            const uint64_t up = g_pp_upload_bytes.load(std::memory_order_relaxed) - up0;
+            LLAMA_LOG_WARN("%s: [B1] normal prefill: %u tokens in %u chunks (largest %u), uploaded %.2f GiB of host "
+                    "experts via the copy callback (%.2f GiB/chunk), %llu copies served by the MoE cache, %.1f s (%.0f tok/s)\n",
+                    "decode", tokens, chunks, max_chunk, up / 1073741824.0, chunks ? up / 1073741824.0 / chunks : 0.0,
+                    (unsigned long long) (g_pp_cache_copies.load(std::memory_order_relaxed) - cc0), s, s > 0 ? tokens / s : 0.0);
+        }
+    } pp_nlog;
+    if (b1_mode == 0 && b1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all >= 1024) {
+        pp_nlog.on = true;
+        pp_nlog.tokens = n_tokens_all;
+        pp_nlog.up0 = g_pp_upload_bytes.load(std::memory_order_relaxed);
+        pp_nlog.cc0 = g_pp_cache_copies.load(std::memory_order_relaxed);
+        pp_nlog.t0 = ggml_time_us();
+    }
     if (b1_mode == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all <= 8) {
         b1_cache_warm();
         b1_cache_device_prepare();
@@ -5677,9 +5708,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }
             }
             b1_cur = { true, b1_final_l0, -1, b1_final_l0 > 0 ? b1->carry(b1_i) : nullptr };
+            if (b1_final_l0 > 0 && b1->carry_on_host()) {
+                b1->carry_load(b1_i); // [PP12]
+            }
         }
 
         const auto & ubatch = mctx->get_ubatch();
+        if (pp_nlog.on) {
+            ++pp_nlog.chunks;
+            pp_nlog.max_chunk = std::max(pp_nlog.max_chunk, ubatch.n_tokens);
+        }
 
         // count the outputs in this ubatch
         {
@@ -7644,6 +7682,9 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             if (home) {
                 b1->ubatch_home(l0, true);
             }
+            if (b1->carry_on_host() && l0 > 0) {
+                b1->carry_load(u); // [PP12] this range reads the hidden state the previous range stored
+            }
             const int64_t t_compute0 = ggml_time_us();
             const int64_t u_inputs0 = b1_pp_inputs_us, u_submit0 = b1_pp_submit_us;
             const auto * res = process_ubatch(mctx->get_ubatch(), gtype, mctx, status);
@@ -7660,6 +7701,9 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             b1_cur = {};
             if (!res) {
                 return false;
+            }
+            if (b1->carry_on_host()) {
+                b1->carry_store(u);
             }
             capture_ubatch(mctx->get_ubatch(), l0, l1);
         }
@@ -7897,6 +7941,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             if (used[e]) {
                 ggml_backend_tensor_set_async(backend, dst, (const char *)src->data + e * src->nb[2],
                         e * dst->nb[2], expert_bytes);
+                g_pp_upload_bytes.fetch_add(expert_bytes, std::memory_order_relaxed);
                 if (e + 1 < src->ne[2]) {
                     static const uint8_t padding[512] = {};
                     ggml_backend_tensor_set_async(backend, dst, padding, (e + 1) * dst->nb[2],
@@ -7909,6 +7954,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+        g_pp_cache_copies.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -7969,6 +8015,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             }
             if (next < e) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                g_pp_upload_bytes.fetch_add((e - next)*expert_size, std::memory_order_relaxed);
             }
             e   += n;
             next = e;
@@ -7980,6 +8027,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            g_pp_upload_bytes.fetch_add(size, std::memory_order_relaxed);
         }
 
         first = last + 1;

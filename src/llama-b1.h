@@ -37,6 +37,9 @@ struct llama_b1_stats {
     uint64_t bytes_lent   = 0;   // resident expert bytes borrowed
     uint64_t bytes_fresh  = 0;   // free VRAM allocated
     uint64_t bytes_carry  = 0;
+    uint64_t bytes_carry_host = 0; // [PP12] pinned host RAM holding the carries (0 = carries in VRAM)
+    uint64_t bytes_carry_h2d  = 0; // [PP12] carry bytes staged host -> VRAM
+    uint64_t bytes_carry_d2h  = 0; // [PP12] carry bytes staged VRAM -> host
     int64_t  t_stream_us  = 0;   // first layer_begin to end()
 };
 
@@ -126,6 +129,15 @@ public:
     // the carry tensor of ubatch ub (F32 [n_embd, hc, n_tokens of ub])
     ggml_tensor * carry(size_t ub);
 
+    // [PP12] LLAMA_B1_HOST_CARRY=1 (opt-in): when the carries of one whole-prompt group do not fit in VRAM, keep them
+    // in pinned host RAM and stage each ubatch's carry through one VRAM slot, so the prompt still crosses the experts
+    // once (one pass) instead of falling back to normal chunks. =2 forces it even when VRAM would fit (identity test).
+    // Every carry() tensor then views the same VRAM slot: load before a range that reads it, store after one that
+    // writes it. Both are async copies on the compute stream, so they are ordered with the graphs around them.
+    bool carry_on_host() const { return carry_host; }
+    void carry_load(size_t ub);
+    void carry_store(size_t ub);
+
     // the layer ranges of the plan: every streamed layer is its own range, a run of layers that stay resident is
     // one range; the last range [final_l0(), n_layer) is built with the model output by the normal decode body
     bool    layer_streamed(int il) const;
@@ -214,7 +226,10 @@ private:
     std::vector<region>   regions;
     ggml_backend_buffer_t fresh_buf = nullptr;
     std::vector<placement> slot_place; // [slot*n_roles + role]
-    std::vector<placement> carry_place; // [ubatch index within the group]
+    std::vector<placement> carry_place; // [ubatch index within the group]; one entry when carry_host
+    bool carry_host = false;
+    ggml_backend_buffer_t carry_host_buf = nullptr;
+    std::vector<size_t> carry_host_offs; // per ubatch of the call
     ggml_context * ctx_meta = nullptr;
     std::vector<ggml_tensor *> carries; // per ubatch of the call
     bool ffn_requested = false;
