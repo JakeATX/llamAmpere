@@ -55,6 +55,13 @@ LLAMA_B1_HOST_CARRY=1 LLAMA_B1_HOST_CARRY_ASYNC=1 scripts/flash-next-server.sh -
 slots, it falls back to one slot by itself (`LLAMA_B1_HOST_CARRY_ONE_SLOT=0` disables the fallback). Output is the same
 bytes as without it (checked: same greedy text, prompt-cache save/restore OK).
 
+If the first layer-by-layer plan does not fit after the model loads, the prompt now re-plans with less card memory
+(async carry, then one slot) instead of retrying the same plan and dropping to 512-token pieces.
+`LLAMA_B1_REPLAN_SHRINK=0` restores the old behavior. Measured on the RTX 3090 limited to about 11 GB, AI+, host carry
+and async on, 3 seeds: prompt 258 -> 2,595 tok/s (p = .0001), writing 87.9 -> 86.9 tok/s (p = .48, no change). That
+test build also reused the pinned carry memory across the re-plan, which this release does not, so the re-planned
+prompt here may be slightly slower than that number.
+
 Measured on an RTX 3090 with the card limited to about 11 GB for the server, 100K coding prompt, 5,120 tokens written,
 temperature 1.0, one program build, runs interleaved:
 
@@ -65,6 +72,12 @@ temperature 1.0, one program build, runs interleaved:
 
 ## Other changes
 
+- **Faster 100K prompt with the launcher.** The v0.6.2 launcher forced a slow page-fault prefetch for the per-layer
+  embedding table, so the prompt waited about 15 s on disk reads. The launcher now leaves this to the engine, which reads
+  the table ahead with 4 threads (on by default, skipped when under 8 GiB of RAM is free). RTX 3090 Ti, AI+, 100K coding
+  prompt, 4 interleaved pairs: launcher prompt 2,083 -> 3,023 tok/s (+45%, p < .0001), writing unchanged (132.9 vs 134.0,
+  p = .49). Against no prefetch at all, the new default is +2.8% on the prompt (p = .004). Output is unchanged.
+  `LLAMA_PLE_PREFETCH=0` turns it off.
 - **Steady speed on a busy desktop.** The thread that drives the graphics card no longer shares a CPU core with the CPU
   expert threads. Measured on the 3090 Ti with three busy programs on that core: 33.9 -> 24.6 ms per round; quiet desktop
   27.8 -> 24.8 ms per round (2 blocks per case, no p-value). Output is unchanged. `GGML_CPU_CARD_FENCE=0` turns it off.
