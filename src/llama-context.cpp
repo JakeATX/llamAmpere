@@ -5464,7 +5464,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
     } ple_pf_g;
-    if (ple_pf && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
+    // LLAMA_PLE_PF_LATE=1: start the reads after b1_prepare, so its host pins and output buffers
+    // (which can push freshly read PLE pages out of the page cache) are already in place
+    static const bool ple_pf_late = [] { const char * e = getenv("LLAMA_PLE_PF_LATE"); return e && atoi(e) != 0; }();
+    if (ple_pf && !ple_pf_late && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
         ple_pf_g.p = ple_pf.get();
     }
 
@@ -5606,6 +5609,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
     const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
     pp_dec.mark("b1_prepare");
+    if (ple_pf && ple_pf_late && b1_mode >= 0 && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
+        ple_pf_g.p = ple_pf.get();
+    }
     if (b1_mode == 1) {
         pp_dec.print(__func__);
     }
