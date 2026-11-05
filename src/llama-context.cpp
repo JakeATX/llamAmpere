@@ -6963,7 +6963,8 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         ggml_backend_dev_memory(dev, &free, &total);
         const size_t card_limit = (size_t) 23552 << 20;
         const size_t keep = std::max<size_t>(
-                (size_t) std::max<int64_t>(1536, b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20,
+                // same keep as the plan (llama-b1.cpp): the env may lower it too, else the plan takes the VRAM this check then misses
+                (size_t) std::max<int64_t>(512, b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20,
                 total > card_limit ? total - card_limit + (64u << 20) : 0);
         // fork: lent, unused B1 VRAM covers most of the layer graph (see b1_kv_scratch_bind); only the owned rest needs free VRAM
         size_t lend_spare = 0;
