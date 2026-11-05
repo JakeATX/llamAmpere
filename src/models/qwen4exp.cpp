@@ -1907,6 +1907,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // (~2.4 GB filled, repeated and scattered every attention ubatch); the CUDA attention node sets the bit of each row
     // cell < n_kv before any route reads the mask (ggml_cuda_flash_attn_ext_rows_mask): the same visible cells
     static const bool rows_mask = [] { const char * e = getenv("LLAMA_QSA_ROWS_MASK"); if (e) return atoi(e) != 0; const char * l = getenv("LLAMA_LEAN_PROMPT"); return !l || atoi(l) != 0; }();
+    // the packed mask only exists with direct lists (use_rows); without them the f16 selection is built as before
+    static const bool warned = rows_mask && direct_lists <= 0 &&
+        (LLAMA_LOG_WARN("%s: LLAMA_QSA_ROWS_MASK ignored: needs QSA direct lists (LLAMA_QSA_DIRECT_LISTS / LLAMA_LEAN_PROMPT)\n", __func__), true);
+    GGML_UNUSED(warned);
     if (rows_mask && use_rows && n_kv % 128 == 0 && kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tokens) {
         ggml_tensor * bits = ggml_fill_inplace(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_kv/32, n_tokens, 1, 1), 0.0f);
         cb(bits, "indexer_sel_bits", il);

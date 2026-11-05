@@ -612,6 +612,23 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // fork: small-card prompt ubatch. An MoE model asked for -ub > 6144 on a card with less than
+    // LLAMA_UB_SMALL_CARD_FREE_MIB (default 14336) free here (after the weights, before KV and the expert cache;
+    // a 12 GB card is ~8 GB here, a 24 GB card ~20 GB) runs -ub 6144: the 12 GB measured pick (one layer-major pass
+    // of 17 ubatches with LLAMA_LEAN_PROMPT; 8192 needs a second carry slot and two 128-route tiles per expert,
+    // 0.77x prompt). LLAMA_UB_SMALL_CARD_CAP=0 keeps the asked size.
+    if (cparams.n_ubatch > 6144 && model.hparams.n_expert > 0 && !model.devices.empty()) {
+        static const bool cap_on = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_CAP"); return !e || atoi(e) != 0; }();
+        static const size_t lim_mib = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 14336); }();
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(model.devices[0], &free, &total);
+        if (cap_on && ggml_backend_dev_type(model.devices[0]) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
+            LLAMA_LOG_WARN("%s: small card (%zu MiB free < %zu): n_ubatch %u -> 6144 (LLAMA_UB_SMALL_CARD_CAP=0 keeps it)\n",
+                           __func__, free >> 20, lim_mib, cparams.n_ubatch);
+            cparams.n_ubatch = 6144;
+        }
+    }
+
     if (cparams.n_rs_seq > 0) {
         const uint32_t n_batch_min = cparams.n_rs_seq + 2;
         if (cparams.n_ctx < n_batch_min) {
