@@ -58,8 +58,9 @@ static void moe_ai_log_first(const char * role) {
 #if defined(__AVX2__) && defined(__FMA__)
     if (moe_ai::use_host_q8()) { isa = moe_ai::use_q8_vbmi() ? "avx512-vbmi" : "avx2"; } // q8: AVX2 unless GGML_MOE_AI_HOST_Q8_VBMI=1
 #endif
-    fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s act=%s\n", role, isa,
-            moe_ai::use_host_q8() ? "q8 (default; GGML_MOE_AI_HOST_Q8=0 = f32)" : "f32 (GGML_MOE_AI_HOST_Q8=0)");
+    fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s act=%s%s\n", role, isa,
+            moe_ai::use_host_q8() ? "q8 (default; GGML_MOE_AI_HOST_Q8=0 = f32)" : "f32 (GGML_MOE_AI_HOST_Q8=0)",
+            moe_ai::use_host_q8() && moe_ai::use_q8_lv() ? " lv=on (GGML_MOE_AI_HOST_Q8_LV=1)" : "");
 }
 
 namespace {
