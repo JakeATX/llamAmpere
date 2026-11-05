@@ -40,6 +40,29 @@ Earlier AI+ runs with the floating-point CPU path on the RTX 3090 also wrote fas
 KLD (how far the word probabilities drift from an 8-bit reference; lower is better), 2,286 positions, RTX 3090:
 standard 0.1744 / 0.1753 (two runs), AI+ 0.1537 (12% lower, p = .0007).
 
+### 12 GB cards: fast 100K prompt with host carry (opt-in)
+
+On a 12 GB card the prompt used to fall back to small 512-token pieces, because the in-between results of the
+layer-by-layer prompt pass did not fit on the card. Host carry keeps those results in pinned system memory (about
+3.9 GiB for a 100K prompt) and copies them to the card one layer at a time, so the fast one-pass prompt works again.
+It is off by default in this release; turn it on with:
+
+```bash
+LLAMA_B1_HOST_CARRY=1 LLAMA_B1_HOST_CARRY_ASYNC=1 scripts/flash-next-server.sh -m MODEL ...
+```
+
+`LLAMA_B1_HOST_CARRY_ASYNC=1` overlaps the copies with compute. When two expert layers do not fit next to the carry
+slots, it falls back to one slot by itself (`LLAMA_B1_HOST_CARRY_ONE_SLOT=0` disables the fallback). Output is the same
+bytes as without it (checked: same greedy text, prompt-cache save/restore OK).
+
+Measured on an RTX 3090 with the card limited to about 11 GB for the server, 100K coding prompt, 5,120 tokens written,
+temperature 1.0, one program build, runs interleaved:
+
+| Model | Prompt tok/s, off -> host carry -> host carry + async | Writing tok/s, off -> on |
+|---|---|---|
+| AI+ | 269-273 -> 1,974-1,991 -> 2,510-2,545 (4 runs each) | 88.0-88.9 -> 87.8-90.0 (async) |
+| standard | 242 -> 1,832 (one-slot fallback, 2 runs each) | 68.5-68.6 -> 67.0-68.0 (not enough runs to call) |
+
 ## Other changes
 
 - **Faster expert kernels on by default.** The expert kernels and prompt memory settings that our speed tests always used
