@@ -7226,8 +7226,17 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             extra += b1_legacy_deficit + ((size_t) 64 << 20);
             LLAMA_LOG_WARN("%s: [B1] re-plan leaving %.1f MiB more free for the layer graph\n", __func__, extra / 1048576.0);
             b1->set_extra_keep(extra);
+            // [REFIT] the same plan would come back if it already had slack: cap its fresh VRAM below the failed plan's.
+            // LLAMA_B1_REPLAN_SHRINK=0 = extra keep only (old behavior).
+            if (b1_ctx_env("LLAMA_B1_REPLAN_SHRINK", 1) != 0) {
+                const size_t prev = b1->last_fresh(), cut = b1_legacy_deficit + ((size_t) 64 << 20);
+                b1->set_fresh_cap(prev > cut ? prev - cut : 0);
+                LLAMA_LOG_WARN("%s: [B1] re-plan caps fresh VRAM at %.1f MiB (was %.1f MiB, short %.1f MiB)\n", __func__,
+                        (prev > cut ? prev - cut : 0) / 1048576.0, prev / 1048576.0, b1_legacy_deficit / 1048576.0);
+            }
             const bool replanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
             b1->set_extra_keep(0);
+            b1->set_fresh_cap(SIZE_MAX);
             if (!replanned || b1->n_groups() != 1) {
                 break;
             }

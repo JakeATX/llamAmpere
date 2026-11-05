@@ -90,6 +90,13 @@ public:
     // VRAM the plan must leave free beyond its keep, for scratch measured only after a plan exists (the legacy layer graph)
     void set_extra_keep(size_t bytes) { extra_keep = bytes; }
     size_t extra_keep = 0;
+    // [REFIT] re-plan only: the plan's fresh VRAM must stay at or under this (SIZE_MAX = no cap). The legacy layer graph
+    // is measured after the plan; when it lacks VRAM, extra keep alone changes nothing if the plan already had slack,
+    // so the re-plan caps fresh below the failed plan's (smaller variant: sync carry, then one expert slot).
+    void set_fresh_cap(size_t bytes) { fresh_cap = bytes; }
+    size_t fresh_cap = SIZE_MAX;
+    size_t last_fresh() const { return fresh_last; }
+    size_t fresh_last = 0;
     bool ffn_enabled() const { return !ffn_views.empty(); }
     llm_b1_ffn * ffn(size_t ub);
     llm_b1_ffn * ffn_group() { return ffn_all.get(); }
