@@ -90,6 +90,10 @@ int main(int argc, char ** argv) {
 #endif
     for (ggml_type type : types) {
         const int k = ggml_ai4_rate(type);
+        if (k == 0) {   // type has no unit rate in this tree (e.g. AIT4_U2 before its kernels land): the host split refuses it
+            printf("%-8s no unit rate in this tree, skipped (host split refuses the type)\n", ggml_type_name(type));
+            continue;
+        }
         const uint32_t C = ggml_ai4_trellis_mul(type);
         for (const auto & sh : shapes) {
             const int64_t K = sh[0], M = sh[1];
