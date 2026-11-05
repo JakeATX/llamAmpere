@@ -621,8 +621,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         static const bool cap_on = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_CAP"); return !e || atoi(e) != 0; }();
         static const size_t lim_mib = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 14336); }();
         size_t free = 0, total = 0;
-        ggml_backend_dev_memory(model.devices[0], &free, &total);
-        if (cap_on && ggml_backend_dev_type(model.devices[0]) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
+        ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
+        if (cap_on && ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
             LLAMA_LOG_WARN("%s: small card (%zu MiB free < %zu): n_ubatch %u -> 6144 (LLAMA_UB_SMALL_CARD_CAP=0 keeps it)\n",
                            __func__, free >> 20, lim_mib, cparams.n_ubatch);
             cparams.n_ubatch = 6144;
