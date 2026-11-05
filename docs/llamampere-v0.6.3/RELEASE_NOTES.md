@@ -65,6 +65,9 @@ temperature 1.0, one program build, runs interleaved:
 
 ## Other changes
 
+- **Steady speed on a busy desktop.** The thread that drives the graphics card no longer shares a CPU core with the CPU
+  expert threads. Measured on the 3090 Ti with three busy programs on that core: 33.9 -> 24.6 ms per round; quiet desktop
+  27.8 -> 24.8 ms per round (2 blocks per case, no p-value). Output is unchanged. `GGML_CPU_CARD_FENCE=0` turns it off.
 - **Faster expert kernels on by default.** The expert kernels and prompt memory settings that our speed tests always used
   are now the Flash-Next defaults. Output of the standard model is unchanged (checked bit for bit). `NAME=0` turns one off;
   `LLAMA_FLASHNEXT_DEFAULTS=0` turns all of them off.
