@@ -240,6 +240,9 @@ private:
     bool carry_host = false;
     bool carry_async = false;               // [PP12A] two slots + own copy stream
     size_t n_host_slots() const { return carry_async ? 2 : 1; }
+    bool one_slot = false;                  // [PP12H] host carry with ONE expert layer slot: a layer's copy waits until
+                                            // the previous layer's graphs ran (no copy/compute overlap, half the slot VRAM)
+    size_t n_exp_slots() const { return one_slot ? 1 : 2; }
     ggml_backend_t backend_carry = nullptr; // [PP12A] the carry copy stream
     ggml_backend_event_t ev_cload[2]  = { nullptr, nullptr }; // slot loaded (carry stream)
     ggml_backend_event_t ev_cdone[2]  = { nullptr, nullptr }; // graph done with slot (compute stream)

@@ -445,6 +445,7 @@ void llama_b1::release_plan() {
     carry_host_offs.clear();
     carry_host = false;
     carry_async = false;
+    one_slot = false;
     if (fresh_buf) {
         ggml_backend_buffer_free(fresh_buf);
         fresh_buf = nullptr;
@@ -629,7 +630,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     // the smallest lend (fewest layers, highest first) that fits g ubatches per group; false when none does
     auto try_group = [&](size_t g) -> bool {
         std::vector<size_t> items;
-        for (int s = 0; s < 2; ++s) {
+        for (size_t s = 0; s < n_exp_slots(); ++s) {
             for (size_t r = 0; r < n_roles; ++r) {
                 items.push_back(role_max[r]);
             }
@@ -727,6 +728,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     };
 
     size_t g_fit = 0;
+    one_slot = false;
     // [PP12] host carry: keep one pass over the experts when only the carries keep the whole group out of VRAM.
     // RAM rule: the pinned carries may use at most 80% of MemAvailable above a 5 GiB floor.
     const int64_t host_carry_mode = ffn_requested ? 0 : b1_env_int("LLAMA_B1_HOST_CARRY", 0);
@@ -745,18 +747,34 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
                         "not used\n", __func__, host_carry_total/1048576.0, room/1048576.0, ram/1048576.0);
             } else {
                 carry_host = true;
-                carry_async = b1_env_int("LLAMA_B1_HOST_CARRY_ASYNC", 0) > 0;
-                if (carry_async && !try_group(g_max)) {
-                    LLAMA_LOG_WARN("%s: [B1] host carry: no room for a second carry slot; async staging off\n", __func__);
-                    carry_async = false;
+                // [PP12H] LLAMA_B1_HOST_CARRY_ONE_SLOT: 0 = never, 1 = only when two expert slots do not fit, 2 = always.
+                // Try (two expert slots, async carry) -> (two, sync) -> (one, async) -> (one, sync); same bytes either way.
+                const int64_t one_mode = b1_env_int("LLAMA_B1_HOST_CARRY_ONE_SLOT", 1);
+                const bool want_async  = b1_env_int("LLAMA_B1_HOST_CARRY_ASYNC", 0) > 0;
+                for (int pass = one_mode >= 2 ? 2 : 0; g_fit == 0 && pass < (one_mode > 0 ? 4 : 2); ++pass) {
+                    one_slot    = pass >= 2;
+                    carry_async = want_async && pass % 2 == 0;
+                    if (!want_async && pass % 2 == 0) {
+                        continue;
+                    }
+                    if (try_group(g_max)) {
+                        g_fit = g_max;
+                    }
                 }
-                if (try_group(g_max)) {
-                    g_fit = g_max;
-                } else {
+                if (g_fit == 0) {
                     carry_async = false;
                     carry_host = false;
+                    one_slot = false;
                     LLAMA_LOG_WARN("%s: [B1] host carry: the expert slots alone do not fit (%.1f MiB free, keeping %zu MiB); "
                             "not used\n", __func__, free_mem/1048576.0, keep >> 20);
+                } else {
+                    if (want_async && !carry_async) {
+                        LLAMA_LOG_WARN("%s: [B1] host carry: no room for a second carry slot; async staging off\n", __func__);
+                    }
+                    if (one_slot) {
+                        LLAMA_LOG_WARN("%s: [B1] host carry: one expert slot (%s); copies wait for the previous layer\n",
+                                __func__, one_mode >= 2 ? "forced" : "two do not fit");
+                    }
                 }
             }
         }
@@ -898,10 +916,14 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     for (size_t i = 0; i < place_sel.size(); ++i) {
         const placement p = { place_sel[i].first, place_sel[i].second };
         GGML_ASSERT(p.region >= 0 && (size_t) p.region < regions.size());
-        if (i < 2*n_roles) {
+        const size_t n_slot_items = n_exp_slots()*n_roles;
+        if (i < n_slot_items) {
             slot_place[i] = p;
-        } else if (i < 2*n_roles + carry_place.size()) {
-            carry_place[i - 2*n_roles] = p;
+            if (one_slot) {
+                slot_place[i + n_roles] = p; // [PP12H] slot 1 aliases slot 0; steps only use slot 0
+            }
+        } else if (i < n_slot_items + carry_place.size()) {
+            carry_place[i - n_slot_items] = p;
         }
     }
 
@@ -1042,7 +1064,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         grp_first.push_back(g*g_sel);
         for (int il = 0; il < n_layer; ++il) {
             if (layer_streamed(il)) {
-                steps.push_back({ il, (int) (steps.size() % 2) });
+                steps.push_back({ il, one_slot ? 0 : (int) (steps.size() % 2) });
             }
         }
     }
@@ -1360,7 +1382,8 @@ void llama_b1::coordinator() {
     for (size_t k = 0; k < steps.size(); ++k) {
         {
             std::unique_lock<std::mutex> lk(mtx);
-            cv.wait(lk, [&] { return stop || k < 2 || n_freed + 1 >= k; });
+            // the slot of step k is free once step k - n_exp_slots() ran (k-2 with two slots, k-1 with one)
+            cv.wait(lk, [&] { return stop || k < n_exp_slots() || n_freed + n_exp_slots() >= k + 1; });
             if (stop) {
                 return;
             }
@@ -1368,7 +1391,7 @@ void llama_b1::coordinator() {
 
         const int il   = steps[k].il;
         const int slot = steps[k].slot;
-        if (k >= 2) {
+        if (k >= n_exp_slots()) {
             std::lock_guard<std::mutex> ls(mtx_stream);
             ggml_backend_event_wait(backend_copy, ev_free[slot]);
         }
