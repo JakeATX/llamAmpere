@@ -641,15 +641,57 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
     }
 
-    if (cparams.n_ubatch > 6144 && model.hparams.n_expert > 0 && !model.devices.empty()) {
+    // fork: small-card prompt plan. Without these a 12 GB or 10 GB card falls back to 512-token chunks (about 273 tok/s on
+    // a 100K prompt). Host carry + async staging: 12 GB 9.33x, 10 GB 7.30x prompt, writing unchanged. Below
+    // LLAMA_UB_TINY_CARD_FREE_MIB (default 6400; a 12 GB card is ~7.8 GB here, a 10 GB card ~5.7 GB) the plan also needs
+    // the smaller VRAM keep reserve. The first real context (the main model) decides; an explicit value of each variable
+    // wins; LLAMA_SMALL_CARD_AUTO=0 keeps all of them off. The carry's RAM rule stays in llama_b1::begin (5 GiB floor).
+    if (!model.hparams.no_alloc && model.hparams.n_expert > 0 && !model.devices.empty() &&
+        ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        static bool small_decided = false;
+        const char * small_auto = getenv("LLAMA_SMALL_CARD_AUTO");
+        if (!small_decided && (!small_auto || atoi(small_auto) != 0)) {
+            const char * lim = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB");
+            const char * tiny = getenv("LLAMA_UB_TINY_CARD_FREE_MIB");
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
+            const auto set_unset = [](const char * name, const char * value) {
+                if (!getenv(name)) {
+#ifdef _WIN32
+                    _putenv_s(name, value);
+#else
+                    setenv(name, value, 0);
+#endif
+                }
+            };
+            if ((free >> 20) < (size_t) (lim ? atoll(lim) : 14336)) {
+                const bool is_tiny = (free >> 20) < (size_t) (tiny ? atoll(tiny) : 6400);
+                set_unset("LLAMA_B1_HOST_CARRY", "1");
+                set_unset("LLAMA_B1_HOST_CARRY_ASYNC", "1");
+                if (is_tiny) {
+                    set_unset("LLAMA_B1_KEEP_AUTO_MIN_MIB", "1024");
+                }
+                LLAMA_LOG_WARN("%s: small card (%zu MiB free): prompt host carry + async%s on (LLAMA_SMALL_CARD_AUTO=0 turns them off)\n",
+                               __func__, free >> 20, is_tiny ? " + keep auto" : "");
+            }
+        }
+        small_decided = true;
+    }
+
+    if (cparams.n_ubatch > 2048 && model.hparams.n_expert > 0 && !model.devices.empty()) {
         static const bool cap_on = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_CAP"); return !e || atoi(e) != 0; }();
         static const size_t lim_mib = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 14336); }();
+        static const size_t tiny_mib = [] { const char * e = getenv("LLAMA_UB_TINY_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 6400); }();
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
         if (cap_on && ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
-            LLAMA_LOG_WARN("%s: small card (%zu MiB free < %zu): n_ubatch %u -> 6144 (LLAMA_UB_SMALL_CARD_CAP=0 keeps it)\n",
-                           __func__, free >> 20, lim_mib, cparams.n_ubatch);
-            cparams.n_ubatch = 6144;
+            // 10 GB measured pick: -ub 2048 (49 ubatches, one pass); only the 12 GB tier keeps 6144
+            const uint32_t cap = (free >> 20) < tiny_mib ? 2048 : 6144;
+            if (cparams.n_ubatch > cap) {
+                LLAMA_LOG_WARN("%s: small card (%zu MiB free < %zu): n_ubatch %u -> %u (LLAMA_UB_SMALL_CARD_CAP=0 keeps it)\n",
+                               __func__, free >> 20, lim_mib, cparams.n_ubatch, cap);
+                cparams.n_ubatch = cap;
+            }
         }
     }
 
