@@ -78,6 +78,11 @@ temperature 1.0, one program build, runs interleaved:
   prompt, 4 interleaved pairs: launcher prompt 2,083 -> 3,023 tok/s (+45%, p < .0001), writing unchanged (132.9 vs 134.0,
   p = .49). Against no prefetch at all, the new default is +2.8% on the prompt (p = .004). Output is unchanged.
   `LLAMA_PLE_PREFETCH=0` turns it off.
+- **The launcher now runs the measured setup without extra flags.** `scripts/flash-next-server.sh -m MODEL` sets the batch
+  size, threads and card settings itself; anything you pass still wins. It also keeps a long prompt's temporary output
+  (about 4 GiB at `-c 110592`) in a hidden file under `~/.cache/llamampere/moe-output` that is removed automatically. Set
+  `LLAMA_MOE_ARENA_OUTPUT_DIR` to use another folder. With under 16 GiB free, or on a RAM disk, it stays in RAM and prompts
+  are slower.
 - **Steady speed on a busy desktop.** The thread that drives the graphics card no longer shares a CPU core with the CPU
   expert threads. Measured on the 3090 Ti with three busy programs on that core: 33.9 -> 24.6 ms per round; quiet desktop
   27.8 -> 24.8 ms per round (2 blocks per case, no p-value). Output is unchanged. `GGML_CPU_CARD_FENCE=0` turns it off.
