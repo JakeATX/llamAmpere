@@ -1470,8 +1470,26 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     }
     // Reserve the caller's actual core and keep the card-driving thread on it.
     const bool max_threads = env_int("GGML_MOE_CPU_SPLIT_MAX_THREADS", 1, 0, 1) != 0;
+    // GGML_CPU_CARD_FENCE=1 (default): the card-driving thread is not held on one logical cpu. Pinned to one cpu, any
+    // other runnable task there (a browser tab, a compile) time-slices it and the card sits idle (home test 11-05,
+    // 3 busy loops on that core: 41.8 vs 24.3 ms/round). The pool still skips the card's core; once the pool cpus are
+    // known, the card thread may run on every allowed cpu that has no pool thread. 0 = the old single-cpu pin.
+    const bool card_fence = env_int("GGML_CPU_CARD_FENCE", 1, 0, 1) != 0;
+    (void) card_fence;
 #if defined(__linux__)
-    if (max_threads) { pin_thread(sched_getcpu()); }
+    cpu_set_t card_allowed;
+    const bool have_allowed = pthread_getaffinity_np(pthread_self(), sizeof(card_allowed), &card_allowed) == 0;
+    if (max_threads) {
+        int home = sched_getcpu();
+        if (card_fence) {
+            // With the fence on, ggml no longer pins its main thread under GGML_CPU_EXPERT_PIN=1 (ggml-cpu.c). Reserve
+            // the core that pin used (the second physical core) so the pool layout stays the same.
+            const char * ep0 = getenv("GGML_CPU_EXPERT_PIN");
+            const std::vector<int> c0 = core_leaders();
+            if (ep0 && strcmp(ep0, "1") == 0 && c0.size() > 2 && have_allowed && CPU_ISSET(c0[1], &card_allowed)) { home = c0[1]; }
+        }
+        pin_thread(home);
+    }
 #endif
     // One thread per physical core, never an SMT sibling, never core 0 (the OS and the desktop) and never the
     // core of the thread that drives the card: a spinning pool thread sharing a core with it is time-sliced in
@@ -1570,6 +1588,19 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     // On the bank path LLAMA_MOE_BANK_DET=1 gives identical reruns.
     const bool pin = env_int("GGML_MOE_CPU_SPLIT_PIN", 1, 0, 1) != 0 && !avail.empty();
     auto cpu_of = [&](int i) { return pin ? avail[(size_t) i % avail.size()] : -1; };
+    std::string card_where;
+#if defined(__linux__)
+    if (max_threads && card_fence && pin && have_allowed && !s.host_help) {
+        // widen the card thread from its reserved cpu to every allowed cpu that no pool thread is pinned to
+        cpu_set_t m = card_allowed;
+        for (int i = 0; i < s.threads; ++i) { CPU_CLR(cpu_of(i), &m); }
+        if (CPU_COUNT(&m) > 1 && pthread_setaffinity_np(pthread_self(), sizeof(m), &m) == 0) {
+            for (int c = 0; c < CPU_SETSIZE; ++c) {
+                if (CPU_ISSET(c, &m)) { card_where += (card_where.empty() ? "" : ",") + std::to_string(c); }
+            }
+        }
+    }
+#endif
     s.running = true;
     s.workers.emplace_back(leader_main, &s, cpu_of(0));
     for (int i = 1; i < s.threads; ++i) {
@@ -1581,6 +1612,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
+    if (!card_where.empty()) { fprintf(stderr, "[moe-cpu-split] card thread may run on cpus %s (GGML_CPU_CARD_FENCE=1)\n", card_where.c_str()); }
     if (align) { fprintf(stderr, "[moe-cpu-split] scratch rows start on 64-byte lines (GGML_MOE_CPU_SPLIT_ALIGN)\n"); }
     if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
     if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across three/four-route groups\n"); }

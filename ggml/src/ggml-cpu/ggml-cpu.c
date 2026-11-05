@@ -4542,6 +4542,14 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 
 #endif // GGML_USE_OPENMP
 
+// GGML_CPU_CARD_FENCE=1 (default): under GGML_CPU_EXPERT_PIN the calling thread (it drives the GPU) is not pinned to
+// one cpu, so another busy process on that cpu cannot time-slice it; the CUDA CPU-split pool then lets it run on every
+// cpu without a pool thread (moe-cpu-split.cpp). 0 = the old strict pin of the calling thread.
+static bool ggml_cpu_card_fence(void) {
+    const char * env = getenv("GGML_CPU_CARD_FENCE");
+    return !env || strcmp(env, "0") != 0;
+}
+
 static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool_params * tpp,
                struct ggml_cgraph * cgraph,
@@ -4596,6 +4604,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     for (int j = 0; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
     }
+    if (expert_pinned && ggml_cpu_card_fence()) { memset(workers[0].cpumask, 0, sizeof(workers[0].cpumask)); }
 #else // GGML_USE_OPENMP
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
@@ -4613,6 +4622,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     }
 
     ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+    if (expert_pinned && ggml_cpu_card_fence()) { memset(workers[0].cpumask, 0, sizeof(workers[0].cpumask)); }
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
