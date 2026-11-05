@@ -1,6 +1,6 @@
 #pragma once
 
-// [PLEPF] PLE page prefetch (opt-in, LLAMA_PLE_PREFETCH=<threads>, qwen4exp only).
+// [PLEPF] PLE page prefetch (default 4 readers, LLAMA_PLE_PREFETCH=<threads>, 0 = off, qwen4exp only).
 //
 // The per_layer_token_embd table (27 GiB on Flash-Next) stays memory-mapped and mostly out of the page cache, and every
 // prompt token gathers ple_n_heads rows of it at scattered places. The normal input step reads the rows of one ubatch at
@@ -33,7 +33,7 @@ void llama_ple_hash_rows(const llama_hparams & hp, llama_token token, const llam
 
 class llama_ple_prefetch {
 public:
-    // nullptr unless LLAMA_PLE_PREFETCH > 0 and the model has a lazily mapped PLE table this can read
+    // nullptr when LLAMA_PLE_PREFETCH=0, when the default meets a low-MemAvailable host, or unless the model has a lazily mapped PLE table this can read
     static std::unique_ptr<llama_ple_prefetch> create(const llama_model & model, uint32_t n_ubatch);
 
     ~llama_ple_prefetch();
