@@ -1891,7 +1891,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // LLAMA_QSA_DIRECT_LISTS=1 (opt-in, needs DIRECT): a live slot holds a cell < n_kv and a dead one its dump row >= n_kv,
     // so the finite cells of the selection below are exactly the slots < n_kv; the attention node gets these rows too
     // (src[8]) and the CUDA sparse path builds its per-tile cell lists from them without reading the mask
-    static const int direct_lists = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); return e ? atoi(e) : 0; }();
+    // LLAMA_LEAN_PROMPT=1 turns on DIRECT_LISTS, ROWS_MASK and LLAMA_MOE_WEIGHT_INPLACE together; an explicit flag wins
+    static const int direct_lists = [] { const char * e = getenv("LLAMA_QSA_DIRECT_LISTS"); if (e) return atoi(e); const char * l = getenv("LLAMA_LEAN_PROMPT"); return l && atoi(l) != 0 ? 1 : 0; }();
     const bool use_rows = direct_lists > 0 && sel_direct && n_tokens > 1 && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1;
     if (use_rows) {
         GGML_ASSERT(fa_sel_rows == nullptr);
@@ -1905,7 +1906,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // a zero-filled one-bit mask (n_kv/32 I32 words per token, ~0.15 GB at 100K x 12288) instead of the f16 selection
     // (~2.4 GB filled, repeated and scattered every attention ubatch); the CUDA attention node sets the bit of each row
     // cell < n_kv before any route reads the mask (ggml_cuda_flash_attn_ext_rows_mask): the same visible cells
-    static const bool rows_mask = [] { const char * e = getenv("LLAMA_QSA_ROWS_MASK"); return e && atoi(e) != 0; }();
+    static const bool rows_mask = [] { const char * e = getenv("LLAMA_QSA_ROWS_MASK"); if (e) return atoi(e) != 0; const char * l = getenv("LLAMA_LEAN_PROMPT"); return l && atoi(l) != 0; }();
     if (rows_mask && use_rows && n_kv % 128 == 0 && kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tokens) {
         ggml_tensor * bits = ggml_fill_inplace(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_kv/32, n_tokens, 1, 1), 0.0f);
         cb(bits, "indexer_sel_bits", il);
