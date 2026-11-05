@@ -523,6 +523,9 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+#define GALLOC_PEAK_BUFS 8
+struct galloc_peak_ent { const struct ggml_tensor * t; size_t size; int buf; };
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -541,7 +544,77 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // fork: GGML_ALLOC_PEAK_REPORT=N (diagnosis only) logs the N largest tensors live at each buffer's peak
+    struct galloc_peak_ent * pk_live; int pk_n, pk_cap;
+    struct galloc_peak_ent * pk_snap[GALLOC_PEAK_BUFS]; int pk_snap_n[GALLOC_PEAK_BUFS], pk_snap_cap[GALLOC_PEAK_BUFS];
+    size_t pk_cur[GALLOC_PEAK_BUFS], pk_peak[GALLOC_PEAK_BUFS];
+    const struct ggml_tensor * pk_at[GALLOC_PEAK_BUFS];
 };
+
+static int galloc_peak_top(void) {
+    static int top = -1;
+    if (top < 0) { const char * e = getenv("GGML_ALLOC_PEAK_REPORT"); top = e ? atoi(e) : 0; if (top < 0) { top = 0; } }
+    return top;
+}
+
+static void galloc_peak_add(struct ggml_gallocr * g, const struct ggml_tensor * t, size_t size, int buf) {
+    if (!galloc_peak_top() || buf < 0 || buf >= GALLOC_PEAK_BUFS) { return; }
+    if (g->pk_n == g->pk_cap) {
+        g->pk_cap = g->pk_cap ? 2*g->pk_cap : 256;
+        g->pk_live = realloc(g->pk_live, g->pk_cap * sizeof(*g->pk_live));
+        GGML_ASSERT(g->pk_live != NULL);
+    }
+    g->pk_live[g->pk_n++] = (struct galloc_peak_ent) { t, size, buf };
+    g->pk_cur[buf] += size;
+    if (g->pk_cur[buf] <= g->pk_peak[buf]) { return; }
+    g->pk_peak[buf] = g->pk_cur[buf];
+    g->pk_at[buf] = t;
+    if (g->pk_snap_cap[buf] < g->pk_n) {
+        g->pk_snap_cap[buf] = g->pk_cap;
+        g->pk_snap[buf] = realloc(g->pk_snap[buf], g->pk_snap_cap[buf] * sizeof(*g->pk_live));
+        GGML_ASSERT(g->pk_snap[buf] != NULL);
+    }
+    int n = 0;
+    for (int i = 0; i < g->pk_n; ++i) { if (g->pk_live[i].buf == buf) { g->pk_snap[buf][n++] = g->pk_live[i]; } }
+    g->pk_snap_n[buf] = n;
+}
+
+// in-place reuse: the node takes over its parent's bytes
+static void galloc_peak_move(struct ggml_gallocr * g, const struct ggml_tensor * from, const struct ggml_tensor * to) {
+    for (int i = 0; galloc_peak_top() && i < g->pk_n; ++i) { if (g->pk_live[i].t == from) { g->pk_live[i].t = to; return; } }
+}
+
+static void galloc_peak_del(struct ggml_gallocr * g, const struct ggml_tensor * t) {
+    for (int i = 0; galloc_peak_top() && i < g->pk_n; ++i) {
+        if (g->pk_live[i].t == t) { g->pk_cur[g->pk_live[i].buf] -= g->pk_live[i].size; g->pk_live[i] = g->pk_live[--g->pk_n]; return; }
+    }
+}
+
+static int galloc_peak_cmp(const void * a, const void * b) {
+    const size_t x = ((const struct galloc_peak_ent *) a)->size, y = ((const struct galloc_peak_ent *) b)->size;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void galloc_peak_report(struct ggml_gallocr * g, int n_nodes) {
+    const int top = galloc_peak_top();
+    if (!top) { return; }
+    static long min_mib = -1;
+    if (min_mib < 0) { const char * e = getenv("GGML_ALLOC_PEAK_MIN_MB"); min_mib = e ? atol(e) : 512; }
+    for (int b = 0; b < g->n_buffers && b < GALLOC_PEAK_BUFS; ++b) {
+        if (g->pk_peak[b] < ((size_t) min_mib << 20)) { continue; }
+        qsort(g->pk_snap[b], g->pk_snap_n[b], sizeof(*g->pk_live), galloc_peak_cmp);
+        char line[4096];
+        int off = snprintf(line, sizeof(line), "[alloc-peak] %s nodes %d: peak live %.1f MiB in %d tensors, set by %s (%s); top:",
+                ggml_backend_buft_name(g->bufts[b]), n_nodes, g->pk_peak[b] / 1048576.0, g->pk_snap_n[b],
+                g->pk_at[b] ? g->pk_at[b]->name : "?", g->pk_at[b] ? ggml_op_desc(g->pk_at[b]) : "?");
+        for (int i = 0; i < g->pk_snap_n[b] && i < top && off > 0 && off < (int) sizeof(line) - 128; ++i) {
+            const struct ggml_tensor * t = g->pk_snap[b][i].t;
+            off += snprintf(line + off, sizeof(line) - off, " %s(%s)=%.1f", t->name, ggml_op_desc(t), g->pk_snap[b][i].size / 1048576.0);
+        }
+        GGML_LOG_WARN("%s\n", line);
+    }
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -621,6 +694,8 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     }
 
     ggml_hash_set_free(&galloc->hash_set);
+    free(galloc->pk_live);
+    for (int b = 0; b < GALLOC_PEAK_BUFS; ++b) { free(galloc->pk_snap[b]); }
     free(galloc->hash_values);
     free(galloc->bufts);
     free(galloc->buffers);
@@ -830,6 +905,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             hn->addr = p_hn->addr;
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
+                            galloc_peak_move(galloc, view_src, node);
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
                             return;
                         }
@@ -838,6 +914,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                         hn->buffer_id = p_hn->buffer_id;
                         hn->addr = p_hn->addr;
                         p_hn->allocated = false; // avoid freeing the parent
+                        galloc_peak_move(galloc, parent, node);
                         ggml_gallocr_free_extra_space(galloc, node, parent);
                         return;
                     }
@@ -850,6 +927,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        galloc_peak_add(galloc, node, size, buffer_id);
     }
 }
 
@@ -874,6 +952,7 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 
     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     hn->allocated = false;
+    galloc_peak_del(galloc, node);
 }
 
 static int get_node_buffer_id(const int * node_buffer_ids, int i) {
@@ -884,6 +963,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+    galloc->pk_n = 0;
+    for (int b = 0; b < GALLOC_PEAK_BUFS; ++b) { galloc->pk_cur[b] = galloc->pk_peak[b] = 0; galloc->pk_snap_n[b] = 0; galloc->pk_at[b] = NULL; }
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -985,6 +1066,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
+    galloc_peak_report(galloc, graph->n_nodes);
 }
 
 static bool ggml_gallocr_reserve_n_impl(
