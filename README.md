@@ -5,6 +5,11 @@ tuned for NVIDIA RTX 30-series "Ampere" graphics cards, especially the RTX 3090 
 including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model
 writes faster) and Qwen3.8 Flash-Next.
 
+## What's new in v0.6.3
+
+- **AI+ for Flash-Next:** load an AI+ copy of every expert (`LLAMA_MODEL_OVERLAY_PATCH=FILE`). The card holds about 12-13% more experts, so writing is faster: +8.4% on coding (RTX 3090 Ti) and +11.7% on agentic (RTX 3090), +18-26% on a 12 GB card; prompt reading +8-12%. Lower drift from the reference model (KLD 12% lower). [v0.6.3 release notes](docs/llamampere-v0.6.3/RELEASE_NOTES.md).
+- The expert kernels our speed tests use are now on by default; whole-file page read-ahead when the model fits in RAM.
+
 ## What's new in v0.6.1
 
 - **Faster Flash-Next:** about 3% faster writing and prompt reading than v0.6 on an RTX 3090 Ti (113.15 vs 109.65 writing tokens/s, 2,751 vs 2,672 prompt tokens/s, 100K prompt; one-seed observation), and room for more experts on the card. Fixes the 12 GB startup crash. [v0.6.1 release notes](docs/llamampere-v0.6.1/RELEASE_NOTES.md).
