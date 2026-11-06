@@ -1044,6 +1044,11 @@ static void test_ram_fit() {
     expect(retry_ubatch == 2048 && llama_b1::smaller_ubatch(retry_ubatch) == 0 &&
             llama_b1::smaller_ubatch(512) == 0,
             "scratch retries stop at 2048 and never increase a small ubatch");
+    expect(llama_b1::smaller_tail_ubatch(4096) == 2048 &&
+            llama_b1::smaller_tail_ubatch(1696) == 1024 &&
+            llama_b1::smaller_tail_ubatch(1024) == 512 &&
+            llama_b1::smaller_tail_ubatch(512) == 0,
+            "opt-in short tails retry below the normal floor and stop at 512");
     expect(llama_b1::fit_carry_group(5 * GiB, 80 * MiB, 100) == 0 &&
             llama_b1::fit_carry_group(0, 80 * MiB, 100) == 0,
             "adaptive carry cannot use the 5 GiB reserve or unknown RAM");

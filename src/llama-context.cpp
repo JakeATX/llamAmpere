@@ -5712,8 +5712,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
     int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
-    while (b1_mode == 2) {
-        const uint32_t smaller = llama_b1::smaller_ubatch(turn_ubatch);
+    while (b1_mode == 2 || b1_mode == 3) {
+        const uint32_t smaller = b1_mode == 3 ?
+            llama_b1::smaller_tail_ubatch(std::min(turn_ubatch, n_tokens_all)) :
+            llama_b1::smaller_ubatch(turn_ubatch);
         GGML_ASSERT(smaller > 0 && smaller < turn_ubatch);
         LLAMA_LOG_INFO("%s: [B1] layer scratch did not fit; retrying ubatch %u -> %u before prompt state apply\n",
                 __func__, turn_ubatch, smaller);
@@ -7424,6 +7426,12 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             LLAMA_LOG_WARN("%s: [B1] legacy layer reservation failed before applying prompt state\n", __func__);
             b1_end(true);
             const int result = normal();
+            // A short continuation can be smaller than the ordinary 2048-row
+            // retry floor. Split it before state apply, down to 512 rows only.
+            if (result == 0 && adaptive_passes && short_tail &&
+                    llama_b1::smaller_tail_ubatch(*std::max_element(sizes.begin(), sizes.end())) > 0) {
+                return 3;
+            }
             if (result == 0 && adaptive_passes && llama_b1::smaller_ubatch(*std::max_element(sizes.begin(), sizes.end())) > 0) {
                 return 2;
             }
