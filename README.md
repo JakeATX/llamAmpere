@@ -26,25 +26,26 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ## Quick start
 
-The v0.6.2 candidate Flash-Next launcher, `scripts/flash-next-server.sh -m MODEL`, uses `--moe-skip`
-for a 15% router-weight budget with the first five expert routes protected. This changes answers.
-Use `--moe-skip off` to disable skipping. See the [candidate notes](docs/llamampere-v0.6.2/RELEASE_NOTES.md).
-
-**Build and run (v0.6.1, one RTX 3090 / 3090 Ti, 262,144-token context).** Needs Linux, an NVIDIA card with 24 GB, the
-CUDA toolkit (tested with 12.4), CMake, git and a C++ compiler. The model download is 14.4 GB.
+**Build and run (v0.6.2, Swift 1.5 27B at 2.3 bpw, 200K context, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
+toolkit (`nvcc`), CMake, git and a C++ compiler. The model (about 9.1 GB) downloads on first start. This one paste clones or
+updates llamAmpere at v0.6.2, builds `llama-server` and starts it:
 
 ```bash
-git clone -b v0.6.1 https://github.com/JakeATX/llamAmpere.git
-cd llamAmpere
-cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
-  -DLLAMA_BUILD_BORINGSSL=ON
-cmake --build build-sm86 -j8 --target llama-server
-./build-sm86/bin/llama-server \
-  --hf-repo jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4 \
-  --hf-file qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf -c 262144 \
-  -ngl 99 -fa on -ctk sjkvarn4 -ctv sjkvarn4 -b 4096 -ub 1024 --parallel 1 \
-  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 5 --spec-draft-p-min 0
+if [ -d llamAmpere ]; then
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.2
+else
+  git clone -b v0.6.2 https://github.com/JakeATX/llamAmpere.git
+fi && cd llamAmpere && \
+cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
+cmake --build build-sm86 -j8 --target llama-server && \
+./build-sm86/bin/llama-server -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
+  -c 204800 -ngl 99 -fa on -b 4096 -ub 1024 --parallel 1 --jinja --no-context-shift \
+  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
+  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 \
+  --spec-draft-p-min 0 --spec-mb-mtp
 ```
+
+Commands for 12 and 10 GB cards (not yet run on this model) are in the [v0.6.2 release notes](https://github.com/JakeATX/llamAmpere/releases/tag/v0.6.2).
 
 The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
 To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, use
@@ -56,7 +57,7 @@ Numbers for this release (Swift 1.5 27B, v0.6 against v0.5) are in the [v0.6 rel
 
 ## Links
 
-- Release notes: [v0.6.1](docs/llamampere-v0.6.1/RELEASE_NOTES.md), [v0.6](docs/llamampere-v0.6/RELEASE_NOTES.md), [v0.5](docs/llamampere-v0.5/RELEASE_NOTES.md), [v0.4](docs/llamampere-v0.4/RELEASE_NOTES.md), [v0.3.1](docs/llamampere-v0.3.1/RELEASE_NOTES.md); recommended settings for each card size: [v0.5 RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md)
+- Release notes: [v0.6.2](docs/llamampere-v0.6.2/RELEASE_NOTES.md), [v0.6.1](docs/llamampere-v0.6.1/RELEASE_NOTES.md), [v0.6](docs/llamampere-v0.6/RELEASE_NOTES.md), [v0.5](docs/llamampere-v0.5/RELEASE_NOTES.md), [v0.4](docs/llamampere-v0.4/RELEASE_NOTES.md), [v0.3.1](docs/llamampere-v0.3.1/RELEASE_NOTES.md); recommended settings for each card size: [v0.5 RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md)
 - Models: [huggingface.co/jakeatx](https://huggingface.co/jakeatx)
 - Background: [QWEN_AMPERE.md](QWEN_AMPERE.md), [write-up](docs/llamampere-v0.3/ARTICLE.md), flags in [docs/speculative.md](docs/speculative.md) and [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md)
 - SJ-KVaRN paper: [paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper), codec [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT)

@@ -104,8 +104,8 @@ adaptive tq6_0 tail (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`). The adaptiv
 | Path        | Flags                                                  | Body bits per element | Sealed body codec                     |
 |-------------|--------------------------------------------------------|-----------------------|---------------------------------------|
 | 4/4         | `-ctk sjkvarn4 -ctv sjkvarn4`                              | 4.28                  | scalar records                        |
-| 3/3 trellis | `-ctk sjkvarn4 -ctv sjkvarn4 --sjkvarn-bits-k 3 --sjkvarn-bits-v 3 --sjkvarn-body-type auto` | 3.28 | trellis (L=9, 512-entry codebook) |
-| 3/2 trellis | `-ctk sjkvarn4 -ctv sjkvarn4 --sjkvarn-bits-k 3 --sjkvarn-bits-v 2 --sjkvarn-body-type auto` | 2.78 | trellis (K L=9, V L=8, 256-entry codebook) |
+| 3/3 trellis | `-ctk sjkvarn3 -ctv sjkvarn3 --sjkvarn-body-type auto` | 3.28 | trellis (L=9, 512-entry codebook) |
+| 3/2 trellis | `-ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto` | 2.78 | trellis (K L=9, V L=8, 256-entry codebook) |
 
 `--sjkvarn-body-type` selects the sealed-body codec: `sjkvarn4` (scalar records, the default), `sjkvarn4t` (trellis for every
 supported pair), `turbo4` (Tiered TQ) or `auto`, which picks the trellis body for the 3/3, 3/2 and 2/2 pairs and scalar

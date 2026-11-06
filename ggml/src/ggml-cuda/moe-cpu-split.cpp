@@ -75,6 +75,19 @@ inline const void * moe_cs_load_acquire(const void * const * p) {
 #endif
 }
 
+// Read prefetch into all cache levels. MSVC has no __builtin_prefetch; _mm_prefetch with T0 is the same hint on x64.
+inline void moe_cs_prefetch(const void * p) {
+#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(_M_X64)
+    _mm_prefetch((const char *) p, _MM_HINT_T0);
+#else
+    (void) p;
+#endif
+#else
+    __builtin_prefetch(p, 0, 3);
+#endif
+}
+
 using clk = std::chrono::steady_clock;
 
 int env_int(const char * name, int def, int lo, int hi) {
@@ -1022,7 +1035,7 @@ pf_cursor pf_tile(pool_state & s, int phase, int item) {
 // Issues up to four lines of the tile (alternating up and gate); false once the tile is covered.
 bool pf_step(pf_cursor & c) {
     for (int k = 0; k < 4 && c.at < c.len; ++k) {
-        for (int j = 0; j < 2; ++j) { if (c.base[j]) { __builtin_prefetch(c.base[j] + c.at, 0, 3); } }
+        for (int j = 0; j < 2; ++j) { if (c.base[j]) { moe_cs_prefetch(c.base[j] + c.at); } }
         c.at += 64;
     }
     return c.at < c.len;
