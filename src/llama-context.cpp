@@ -646,7 +646,17 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // LLAMA_UB_TINY_CARD_FREE_MIB (default 6400; a 12 GB card is ~7.8 GB here, a 10 GB card ~5.7 GB) the plan also needs
     // the smaller VRAM keep reserve. The first real context (the main model) decides; an explicit value of each variable
     // wins; LLAMA_SMALL_CARD_AUTO=0 keeps all of them off. The carry's RAM rule stays in llama_b1::begin (5 GiB floor).
-    if (!model.hparams.no_alloc && model.hparams.n_expert > 0 && !model.devices.empty() &&
+    // The plan is for AI+ expert files only: with a 3XS file, B1 at -ub 6144 gave different greedy text fresh vs restored
+    // (scid3, cause not named), so 3XS keeps its -ub 6144 cap and chunks unless the caller sets these variables.
+    const bool small_plan_file = [&] {
+        for (const auto & entry : model.tensors_by_name) {
+            if (ggml_ai4_rate(entry.second->type) != 0 || ggml_ait_rate(entry.second->type) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    if (small_plan_file && !model.hparams.no_alloc && model.hparams.n_expert > 0 && !model.devices.empty() &&
         ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
         static bool small_decided = false;
         const char * small_auto = getenv("LLAMA_SMALL_CARD_AUTO");
@@ -686,7 +696,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
         if (cap_on && ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
             // 10 GB measured pick: -ub 2048 (49 ubatches, one pass); only the 12 GB tier keeps 6144
-            const uint32_t cap = (free >> 20) < tiny_mib ? 2048 : 6144;
+            const uint32_t cap = small_plan_file && (free >> 20) < tiny_mib ? 2048 : 6144;
             if (cparams.n_ubatch > cap) {
                 LLAMA_LOG_WARN("%s: small card (%zu MiB free < %zu): n_ubatch %u -> %u (LLAMA_UB_SMALL_CARD_CAP=0 keeps it)\n",
                                __func__, free >> 20, lim_mib, cparams.n_ubatch, cap);
