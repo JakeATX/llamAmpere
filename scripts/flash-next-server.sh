@@ -15,12 +15,23 @@ if [[ -n $FLASH_NEXT_DRAFT_MAX && " $* " != *" --spec-draft-n-"* ]]; then
     # --spec-type adds to the list, so only pick adaptive MTP when the caller names no type
     [[ " $* " == *" --spec-type"* ]] || depth=(--spec-type draft-mtp-adaptive "${depth[@]}")
 fi
-# one slot unless the caller sets the count: the server default (4 slots) gives SJ-KVaRN one KV stream per slot, and
-# the default --kv-gpu-tokens needs a single stream, so the model would refuse to load
 slots=()
-[[ " $* " == *" -np "* || " $* " == *" --parallel"* || " $* " == *" -np="* ]] || slots=(--parallel 1)
+slot_count=${LLAMA_ARG_N_PARALLEL-1}
+slot_explicit=${LLAMA_ARG_N_PARALLEL+x}
+slot_next=0
+for arg in "$@"; do
+    if (( slot_next )); then slot_count=$arg; slot_next=0; fi
+    case $arg in
+        -np|--parallel) slot_next=1; slot_explicit=1 ;;
+        -np=*|--parallel=*) slot_count=${arg#*=}; slot_explicit=1 ;;
+    esac
+done
+[[ -n $slot_explicit ]] || slots=(--parallel 1)
 # The caller's own shape arguments come later, so they win.
 shape=(-ngl 999 -fa on -b 131072 -ub 8192 --fit off --moe-arena on --moe-cache on --ctx-checkpoints 4)
+# The resident QSA window supports one stream; several slots use the existing per-sequence GPU cache instead.
+# Explicit CLI values come last, and an explicit environment value also wins.
+[[ $slot_count == 1 || -n ${LLAMA_ARG_KV_GPU_TOKENS+x} ]] || shape+=(--kv-gpu-tokens 0)
 # Small cards use less host carry RAM. The server lists devices in CUDA order, including visibility remapping.
 device_spec=${LLAMA_ARG_DEVICE-}
 device_next=0
