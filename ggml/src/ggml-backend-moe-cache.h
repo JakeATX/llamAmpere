@@ -249,9 +249,7 @@ static const enum ggml_type ggml_moe_cache_types[] = {
     GGML_TYPE_AIT3_U,
     GGML_TYPE_AIT4_U,
     GGML_TYPE_AIT2_U2,
-    GGML_TYPE_AIF25_U2,
     GGML_TYPE_AIT3_U2,
-    GGML_TYPE_AIT4_U2,
 };
 
 static inline int ggml_moe_cache_wtype_count(void) {
