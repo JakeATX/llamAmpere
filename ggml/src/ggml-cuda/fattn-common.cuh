@@ -1813,9 +1813,7 @@ void launch_fattn(
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32 || mask->type == GGML_TYPE_I64);
     GGML_ASSERT(!mask || mask->type != GGML_TYPE_I64 || (!use_sparse && mask->nb[1] == sizeof(int64_t)));
-    // [#175] packed I32 masks also feed the sparse gather: the list builders (lists_from_rows, compact_mask) and the
-    // sparse branch of flash_attn_ext_f16_load_mask read one bit per cell (LLAMA_QSA_ROWS_MASK on a G16 prefill tile)
-    GGML_ASSERT(!mask || mask->type != GGML_TYPE_I32 || (mask->nb[1] & 3) == 0);
+    GGML_ASSERT(!mask || mask->type != GGML_TYPE_I32 || (!use_sparse && (mask->nb[1] & 3) == 0));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();

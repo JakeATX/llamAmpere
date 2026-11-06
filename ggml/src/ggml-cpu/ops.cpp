@@ -2353,27 +2353,6 @@ static void ggml_compute_forward_fill_f32(const ggml_compute_params * params, gg
     }
 }
 
-static void ggml_compute_forward_fill_i32(const ggml_compute_params * params, ggml_tensor * dst) {
-    const int32_t c = (int32_t) ggml_get_op_params_f32(dst, 0);
-
-    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
-    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb);
-
-    const auto [ir0, ir1] = get_thread_range(params, dst);
-
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t i03 = ir/(ne2*ne1);
-        const int64_t i02 = (ir - i03*ne2*ne1)/ne1;
-        const int64_t i01 = (ir - i03*ne2*ne1 - i02*ne1);
-
-        int32_t * dst_ptr = (int32_t *) ((char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1);
-
-        for (int64_t i = 0; i < ne0; ++i) {
-            dst_ptr[i] = c;
-        }
-    }
-}
-
 static void ggml_compute_forward_fill_f16(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_fp16_t c = GGML_CPU_FP32_TO_FP16(ggml_get_op_params_f32(dst, 0));
 
@@ -2462,10 +2441,6 @@ void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor *
         case GGML_TYPE_Q8_0:
             {
                 ggml_compute_forward_fill_quant(params, dst);
-            } break;
-        case GGML_TYPE_I32:
-            {
-                ggml_compute_forward_fill_i32(params, dst);
             } break;
         default:
             {
