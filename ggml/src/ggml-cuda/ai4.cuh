@@ -84,7 +84,7 @@ static __device__ __forceinline__ int aik_dev_pair_level(const uint32_t * __rest
 // (RB = 256) or each half-warp (RB = 128) unrotates its block.
 template <typename T, int KB, int RB, bool UNROT>
 static __global__ void __launch_bounds__(512) k_aik_reconstruct(const uint8_t * __restrict__ src, T * __restrict__ W,
-                                                               const int64_t K, const uint32_t C) {
+                                                               const int64_t K, const uint32_t C, const bool row_scale) {
     constexpr int UB = 32 + 256 * KB;
     const int r = threadIdx.x >> 5;
     const int l = threadIdx.x & 31;
@@ -93,8 +93,12 @@ static __global__ void __launch_bounds__(512) k_aik_reconstruct(const uint8_t * 
     const bool live  = u < nu;
     float v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     if (live) {
-        const uint8_t  * blk  = src + ((int64_t) blockIdx.y * nu + u) * UB;
-        const uint32_t * tile = (const uint32_t *) (blk + 32) + (l & 15) * (4 * KB);
+        // U2 shares one scale header across five consecutive 128-column chunks.
+        const int64_t slab_bytes = row_scale ? (nu / 5) * (32 + 5 * 256 * KB) : nu * UB;
+        const uint8_t * slab = src + (int64_t) blockIdx.y * slab_bytes;
+        const uint8_t * blk = slab + (row_scale ? (u / 5) * (32 + 5 * 256 * KB) : u * UB);
+        const int64_t chunk = row_scale ? (u % 5) * 256 * KB : 0;
+        const uint32_t * tile = (const uint32_t *) (blk + 32 + chunk) + (l & 15) * (4 * KB);
         const float d = __half2float(__ushort_as_half(((const uint16_t *) blk)[r]));
 #pragma unroll
         for (int q = 0; q < 8; ++q) {
@@ -144,26 +148,27 @@ static __global__ void __launch_bounds__(512) k_aik_reconstruct(const uint8_t * 
 
 template <typename T, int KB>
 static void aik_reconstruct_launch(const void * src, T * W, const int64_t K, const int64_t M, const bool unrot, cudaStream_t stream,
-                                   const uint32_t C) {
+                                   const uint32_t C, const bool row_scale) {
     const dim3 grid((unsigned) ((K / 128 + 1) / 2), (unsigned) (M / 16));
     if (K % 256 == 0) {
-        if (unrot) k_aik_reconstruct<T, KB, 256, true ><<<grid, 512, 0, stream>>>((const uint8_t *) src, W, K, C);
-        else       k_aik_reconstruct<T, KB, 256, false><<<grid, 512, 0, stream>>>((const uint8_t *) src, W, K, C);
+        if (unrot) k_aik_reconstruct<T, KB, 256, true ><<<grid, 512, 0, stream>>>((const uint8_t *) src, W, K, C, row_scale);
+        else       k_aik_reconstruct<T, KB, 256, false><<<grid, 512, 0, stream>>>((const uint8_t *) src, W, K, C, row_scale);
     } else {
-        if (unrot) k_aik_reconstruct<T, KB, 128, true ><<<grid, 512, 0, stream>>>((const uint8_t *) src, W, K, C);
-        else       k_aik_reconstruct<T, KB, 128, false><<<grid, 512, 0, stream>>>((const uint8_t *) src, W, K, C);
+        if (unrot) k_aik_reconstruct<T, KB, 128, true ><<<grid, 512, 0, stream>>>((const uint8_t *) src, W, K, C, row_scale);
+        else       k_aik_reconstruct<T, KB, 128, false><<<grid, 512, 0, stream>>>((const uint8_t *) src, W, K, C, row_scale);
     }
 }
 
 // Reference reconstruct at any AI+ unit rate (2, 3, 4, 5). Returns false for an unknown rate.
 template <typename T>
 static bool aik_reconstruct_rate(const int rate, const void * src, T * W, const int64_t K, const int64_t M, const bool unrot,
-                                 cudaStream_t stream, const uint32_t C) {
+                                 cudaStream_t stream, const uint32_t C, const bool row_scale = false) {
+    GGML_ASSERT(!row_scale || K % 640 == 0);
     switch (rate) {
-        case 2: aik_reconstruct_launch<T, 2>(src, W, K, M, unrot, stream, C); return true;
-        case 3: aik_reconstruct_launch<T, 3>(src, W, K, M, unrot, stream, C); return true;
-        case 4: aik_reconstruct_launch<T, 4>(src, W, K, M, unrot, stream, C); return true;
-        case 5: aik_reconstruct_launch<T, 5>(src, W, K, M, unrot, stream, C); return true;
+        case 2: aik_reconstruct_launch<T, 2>(src, W, K, M, unrot, stream, C, row_scale); return true;
+        case 3: aik_reconstruct_launch<T, 3>(src, W, K, M, unrot, stream, C, row_scale); return true;
+        case 4: aik_reconstruct_launch<T, 4>(src, W, K, M, unrot, stream, C, row_scale); return true;
+        case 5: aik_reconstruct_launch<T, 5>(src, W, K, M, unrot, stream, C, row_scale); return true;
         default: return false;
     }
 }

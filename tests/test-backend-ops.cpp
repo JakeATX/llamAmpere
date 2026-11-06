@@ -15963,6 +15963,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_ait2pu_cases(test_cases);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT2_U2);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT3_U2);
+    // U2 reference decoding: odd chunk count, multiple slabs, and the small-output fallback.
+    // The last case must also work with GGML_CUDA_AI23_SMALL_SPLIT=2/4.
+    for (ggml_type type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
+        test_cases.emplace_back(new test_mul_mat_ai4(48, 1, 640, type));
+        test_cases.emplace_back(new test_mul_mat_ai4(128, 1, 1280, type));
+        test_cases.emplace_back(new test_mul_mat_ai4(144, 4, 5120, type));
+    }
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int64_t n : {1, 9, 512}) {

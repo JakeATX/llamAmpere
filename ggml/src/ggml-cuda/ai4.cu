@@ -803,7 +803,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     else { ai4_quantize_x(X, N, K, xsh, q.get(), s.get(), stream); }
     const int rate = ggml_ai4_rate(t);
     static const int small_splits = ai4_env_int("GGML_CUDA_AI23_SMALL_SPLIT", nullptr, 0);
-    if ((rate == 2 || rate == 3) && N <= 8 && (K == 5120 || K == 17408) &&
+    // This optional launch expects a scale header for every 128-column chunk.
+    if ((rate == 2 || rate == 3) && !ggml_ai4v2_rate(t) && N <= 8 && (K == 5120 || K == 17408) &&
             (small_splits == 2 || small_splits == 4)) {
         ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) M*N*small_splits);
         // All valid two/three-bit layouts use H256 at these fixed K values.
@@ -877,7 +878,7 @@ static bool ai4_is_type(ggml_type t) {
 static bool ai4_ref_only_type(ggml_type t) {
     static const bool v = ai4_env_int("GGML_CUDA_AI5_REF", nullptr, 0) != 0;
     if (t == GGML_TYPE_AIT2_U2 || t == GGML_TYPE_AIT3_U2) {
-        return false;   // row-scale layouts have no host-reconstruct reference path; the fast kernels are the only path
+        return false;   // row-scale layouts use native kernels when available
     }
     if (t == GGML_TYPE_AIT5_U) {
         return v;
@@ -939,7 +940,8 @@ static void ai4_zero_skipped(const ggml_tensor * ids, int n_used, int n_tok, int
 }
 
 static void ai4_reconstruct_any(const void * src, float * W, int64_t K, int64_t M, cudaStream_t stream, ggml_type t) {
-    GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t)));
+    GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t),
+                                          ggml_ai4v2_rate(t) != 0));
 }
 
 // fork AIPFIX ONEPATH check: the f32 image [M][K] of an AI+ unit matrix in the original basis (reference only)
@@ -1022,7 +1024,7 @@ static void ai4_ref_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             ai4_reconstruct_any(src, w.get(), K, mm, stream, src0->type);
         } else {
             GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(src0->type), src, w.get(), K, mm, !emul, stream,
-                                                    ggml_ai4_trellis_mul(src0->type)));
+                                                    ggml_ai4_trellis_mul(src0->type), ggml_ai4v2_rate(src0->type) != 0));
         }
         // C(mm x T) at row m0 of the M x T result. ldc = M, so column t lands at Y[t*M + m0].
         CUBLAS_CHECK(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
