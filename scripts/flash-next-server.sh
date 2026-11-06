@@ -22,6 +22,14 @@ slots=()
 # the shape our speed numbers were measured with; the caller's own arguments come later, so they win. A 12 GB card still
 # reads the prompt with -ub 6144 (the engine lowers it), and experts fall back to unpinned file pages when RAM is short.
 shape=(-ngl 999 -fa on -b 131072 -ub 8192 --fit off --moe-arena on --moe-cache on --ctx-checkpoints 4)
+# Small cards use less host carry RAM; free memory also covers a card shared with another process.
+gpu=${CUDA_VISIBLE_DEVICES:-0}
+gpu=${gpu%%,*}
+memory=$(nvidia-smi -i "$gpu" --query-gpu=memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null) || memory=
+IFS=', ' read -r card_mib free_mib <<< "$memory"
+if [[ $card_mib =~ ^[0-9]+$ && $free_mib =~ ^[0-9]+$ ]] && (( card_mib < 23552 || free_mib < 14336 )); then
+    shape+=(-b 32768)
+fi
 [[ " $* " == *" -c "* || " $* " == *" --ctx-size"* ]] || shape+=(-c 110592)
 # 8 CPU threads as measured; smaller machines keep the engine's own count (physical cores)
 (( $(nproc --all) < 16 )) || shape+=(-t 8 -tb 8)
