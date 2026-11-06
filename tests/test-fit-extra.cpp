@@ -1037,6 +1037,41 @@ static void test_ram_fit() {
     expect(!llama_b1::staging_explicit(), "direct GPU upload chunks do not override host staging sizes");
     for (size_t i = 0; i < 4; ++i) { set_stage(stage_names[i], had_stage[i] ? saved_stage[i].c_str() : nullptr); }
     const uint64_t stage_required = 24 * (16 * MiB + 16384) + 4096;
+    uint32_t retry_ubatch = 6144;
+    retry_ubatch = llama_b1::smaller_ubatch(retry_ubatch);
+    expect(retry_ubatch == 4096, "failed layer scratch first retries 4096-token ubatches");
+    retry_ubatch = llama_b1::smaller_ubatch(retry_ubatch);
+    expect(retry_ubatch == 2048 && llama_b1::smaller_ubatch(retry_ubatch) == 0 &&
+            llama_b1::smaller_ubatch(512) == 0,
+            "scratch retries stop at 2048 and never increase a small ubatch");
+    expect(llama_b1::fit_carry_group(5 * GiB, 80 * MiB, 100) == 0 &&
+            llama_b1::fit_carry_group(0, 80 * MiB, 100) == 0,
+            "adaptive carry cannot use the 5 GiB reserve or unknown RAM");
+    expect(llama_b1::fit_carry_group(5 * GiB + 800 * MiB, 80 * MiB, 100) == 5 &&
+            llama_b1::fit_carry_group(5 * GiB + 800 * MiB - 1, 80 * MiB, 100) == 4,
+            "adaptive carry rounds down to a full ubatch at the budget boundary");
+    expect(llama_b1::fit_carry_group(5 * GiB + 512 * MiB, 240 * MiB, 17) == 1,
+            "low-RAM replans must not credit the capacity of a released chunked spare");
+    expect(llama_b1::cap_pass_group(25, 4096, true) == 8 &&
+            llama_b1::cap_pass_group(17, 6144, true) == 5 &&
+            llama_b1::cap_pass_group(13, 8192, false) == 13,
+            "host and device carry share the small-card cap while large-card passes stay unchanged");
+    expect(llama_b1::cap_pass_group(1, 32769, true) == 0 &&
+            llama_b1::cap_pass_group(25, 0, true) == 0 &&
+            llama_b1::cap_pass_group(0, 4096, true) == 0,
+            "a pass needs a nonempty ubatch that fits the token cap");
+    expect(llama_b1::fit_carry_group(64 * GiB, 240 * MiB, 17, 6144, true) == 5 &&
+            llama_b1::fit_carry_group(64 * GiB, 160 * MiB, 25, 4096, true) == 8,
+            "small-card host passes stay within 32768 tokens at both ubatch sizes");
+    expect(llama_b1::fit_carry_group(64 * GiB, 240 * MiB, 17, 6144, false) == 17 &&
+            llama_b1::fit_carry_group(64 * GiB, 240 * MiB, 17, 32769, true) == 0,
+            "large-card carry is uncapped and an oversized small-card ubatch cannot fit");
+    expect(llama_b1::fit_carry_group(64 * GiB, 80 * MiB, 13) == 13 &&
+            llama_b1::fit_carry_group(UINT64_MAX, 80 * MiB, 13) == 13,
+            "adaptive carry preserves a fitting single pass without overflow");
+    expect(llama_b1::fit_carry_group(64 * GiB, 0, 13) == 0 &&
+            llama_b1::fit_carry_group(64 * GiB, 80 * MiB, 0) == 0,
+            "empty carry requests cannot divide by zero or create a pass");
     expect(!llama_b1::staging_floor_unmet(5 * GiB + stage_required, 8, 16 * MiB, 4096, 4096),
             "explicit staging may exactly meet the RAM floor");
     expect(llama_b1::staging_floor_unmet(5 * GiB + stage_required - 1, 8, 16 * MiB, 4096, 4096) &&

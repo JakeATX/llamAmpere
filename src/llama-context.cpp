@@ -691,14 +691,22 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         small_decided = true;
     }
 
-    if (cparams.n_ubatch > 2048 && model.hparams.n_expert > 0 && !model.devices.empty()) {
+    if (model.hparams.n_expert > 0 && !model.devices.empty()) {
         static const bool cap_on = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_CAP"); return !e || atoi(e) != 0; }();
         static const size_t lim_mib = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 14336); }();
         static const size_t tiny_mib = [] { const char * e = getenv("LLAMA_UB_TINY_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 6400); }();
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
-        if (cap_on && ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
-            // 10 GB measured pick: -ub 2048 (49 ubatches, one pass); only the 12 GB tier keeps 6144
+        small_prompt_card = ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                ((total > 0 && (total >> 20) < 23552) || (free >> 20) < lim_mib);
+        const char * adaptive = getenv("LLAMA_B1_ADAPTIVE_PASSES");
+        const char * layer_major = getenv("LLAMA_B1");
+        const char * packed = getenv("LLAMA_B1_FFN");
+        const bool adaptive_legacy = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && adaptive && atoi(adaptive) > 0 &&
+                layer_major && atoi(layer_major) > 0 && (!packed || atoi(packed) == 0);
+        // fork: adaptive B1 keeps the requested size until its layer scratch fit fails.
+        if (cparams.n_ubatch > 2048 && cap_on && !adaptive_legacy && ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
+            // 10 GB uses 2048; the legacy 12 GB path keeps 6144.
             const uint32_t cap = small_plan_file && (free >> 20) < tiny_mib ? 2048 : 6144;
             if (cparams.n_ubatch > cap) {
                 LLAMA_LOG_WARN("%s: small card (%zu MiB free < %zu): n_ubatch %u -> %u (LLAMA_UB_SMALL_CARD_CAP=0 keeps it)\n",
@@ -2546,11 +2554,11 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
             const size_t card_limit = (size_t) 23552 << 20;
-            // fork: LLAMA_PROMPT_TEMP_HEADROOM=1 (opt-in) leaves 512 MiB for CUDA kernel temporaries during
-            // cached-prompt turns, which graph sizing does not see (default 256 MiB / +64 MiB over the card cap)
-            static const bool big_headroom = [] { const char * e = getenv("LLAMA_PROMPT_TEMP_HEADROOM"); return e && atoi(e) != 0; }();
-            const size_t headroom_min = big_headroom ? (512u << 20) : (256u << 20);
-            const size_t headroom_pad = big_headroom ? (512u << 20) : (64u << 20);
+            // fork: kernel temporaries are outside graph sizing. Leave 128 MiB beyond the card cap by default.
+            // LLAMA_PROMPT_TEMP_HEADROOM=0 restores 64 MiB; nonzero retains the larger 512 MiB cushion.
+            static const int headroom_mode = [] { const char * e = getenv("LLAMA_PROMPT_TEMP_HEADROOM"); return e ? (atoi(e) != 0 ? 1 : 0) : -1; }();
+            const size_t headroom_min = headroom_mode > 0 ? (512u << 20) : (256u << 20);
+            const size_t headroom_pad = headroom_mode > 0 ? (512u << 20) : (headroom_mode == 0 ? (64u << 20) : (128u << 20));
             const size_t headroom = std::max<size_t>(headroom_min, total > card_limit ? total - card_limit + headroom_pad : 0);
             size_t handoff_growth = 0;
             if (mtp_hidden.ring && ubatch_rows_cb && dev == model.dev_output()) {
@@ -5619,7 +5627,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     } cache_capture_guard_ { b1_cache_collect };
     // Packed B1 reserves a small full-model graph and grows phase graphs on demand.
     // Its causal attention/shared-expert chunks still use the requested turn size.
-    const uint32_t turn_ubatch = (b1_ffn_scratch_active || b1_layer_scratch_active) ? cparams.n_ubatch :
+    uint32_t turn_ubatch = (b1_ffn_scratch_active || b1_layer_scratch_active) ? cparams.n_ubatch :
             (sched_reserve_tokens ? std::min(cparams.n_ubatch, sched_reserve_tokens) : cparams.n_ubatch);
 
     if (t_compute_start_us == 0) {
@@ -5703,7 +5711,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     pp_dec.mark("output_reserve");
 
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
-    const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
+    int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
+    while (b1_mode == 2) {
+        const uint32_t smaller = llama_b1::smaller_ubatch(turn_ubatch);
+        GGML_ASSERT(smaller > 0 && smaller < turn_ubatch);
+        LLAMA_LOG_INFO("%s: [B1] layer scratch did not fit; retrying ubatch %u -> %u before prompt state apply\n",
+                __func__, turn_ubatch, smaller);
+        turn_ubatch = smaller;
+        mctx.reset();
+        mctx = memory->init_batch(*balloc, turn_ubatch, output_all);
+        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: [B1] cannot prepare smaller prompt ubatches\n", __func__);
+            return -2;
+        }
+        b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
+    }
     pp_dec.mark("b1_prepare");
     if (ple_pf && ple_pf_late && b1_mode >= 0 && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
         ple_pf_g.p = ple_pf.get();
@@ -7132,6 +7154,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
                 LLAMA_LOG_WARN("%s: [B1] LLAMA_B1 is set but layer-major prefill is off: %s\n", __func__, why);
             } else {
                 b1 = std::make_unique<llama_b1>(model, gpu);
+                b1->set_small_card(small_prompt_card);
                 if (!b1->ok()) {
                     b1.reset();
                 }
@@ -7240,6 +7263,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         model.hparams.n_embd <= 65536 && model.hparams.n_expert <= 4096 && model.hparams.n_expert_used() <= 128;
     b1->set_ffn_enabled(packed_ffn);
     const bool lean_legacy = b1_layer_scratch_active && !packed_ffn;
+    const bool adaptive_passes = !packed_ffn && b1_ctx_env("LLAMA_B1_ADAPTIVE_PASSES", 0) > 0;
     b1_kv_scratch_enabled = false; b1_lend_scratch = false;
     const bool kv_cold = memory->seq_pos_max(seq) < 0;
 
@@ -7319,7 +7343,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         b1_kv_prompt_cells = n_tokens_all + 512;
         b1_kv_outputs = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(n_tokens_all, n_outputs_all));
         const bool kv_scratch_wanted = b1_kv_scratch_enabled, lend_wanted = b1_lend_scratch;
-        bool reserved = b1->n_groups() == 1 && b1_reserve_legacy_layers(sizes, n_outputs_all);
+        bool reserved = (b1->n_groups() == 1 || adaptive_passes) && b1_reserve_legacy_layers(sizes, n_outputs_all);
         // fork: the plan sizes carries and slots before the layer graph is measured. When the graph then lacks VRAM,
         // plan once more leaving that deficit free: the plan lends more resident experts (refilled after the prompt)
         // instead of allocating fresh VRAM. Opt-in: LLAMA_B1_REPLAN=1.
@@ -7356,11 +7380,11 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             b1->drop_carry_spare();
             b1->set_extra_keep(0);
             b1->set_fresh_cap(SIZE_MAX);
-            if (!replanned || b1->n_groups() != 1) {
+            if (!replanned || (b1->n_groups() != 1 && !adaptive_passes)) {
                 break;
             }
-            b1_kv_scratch_enabled = kv_scratch_wanted;
-            b1_lend_scratch = lend_wanted;
+            b1_kv_scratch_enabled = kv_scratch_wanted && b1->n_groups() == 1;
+            b1_lend_scratch = lend_wanted && b1->n_groups() == 1;
             reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
         }
         keep_try -= 128;
@@ -7375,9 +7399,9 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         b1->hold_carry_pin(false);
         b1->drop_carry_spare();
         b1_legacy_deficit = 0;
-        if (kplanned && b1->n_groups() == 1) {
-            b1_kv_scratch_enabled = kv_scratch_wanted;
-            b1_lend_scratch = lend_wanted;
+        if (kplanned && (b1->n_groups() == 1 || adaptive_passes)) {
+            b1_kv_scratch_enabled = kv_scratch_wanted && b1->n_groups() == 1;
+            b1_lend_scratch = lend_wanted && b1->n_groups() == 1;
             reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
         }
         }
@@ -7388,9 +7412,13 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         }
         if (!reserved) {
             b1_kv_scratch_enabled = false; b1_lend_scratch = false;
-            LLAMA_LOG_WARN("%s: [B1] legacy one-pass layer reservation failed before applying prompt state\n", __func__);
+            LLAMA_LOG_WARN("%s: [B1] legacy layer reservation failed before applying prompt state\n", __func__);
             b1_end(true);
-            return normal();
+            const int result = normal();
+            if (result == 0 && adaptive_passes && llama_b1::smaller_ubatch(*std::max_element(sizes.begin(), sizes.end())) > 0) {
+                return 2;
+            }
+            return result;
         }
         pp_clock.mark("legacy_reserve");
         b1->start_streaming();

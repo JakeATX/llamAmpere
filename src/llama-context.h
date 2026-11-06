@@ -87,6 +87,7 @@ struct llama_context {
         }
         return 1;
     }
+    bool prompt_small_card() const { return small_prompt_card; }
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -665,6 +666,7 @@ private:
     bool ple_hint_tried = false;
     bool b1_env   = false; // LLAMA_B1 set
     bool b1_tried = false; // b1 construction attempted
+    bool small_prompt_card = false; // card headroom before KV/cache allocation
     bool b1_ffn_scratch_active = false;
     bool b1_layer_scratch_active = false;
     bool b1_kv_scratch_enabled = false;
@@ -692,7 +694,7 @@ private:
     } b1_cur;
 
     // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
-    // 0 for the normal path, < 0 for a decode error code
+    // 2 to retry smaller ubatches before state apply, 0 for the normal path, < 0 for a decode error code
     int  b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all, int64_t n_outputs_all);
     bool b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes, int64_t n_outputs_all);
     // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with

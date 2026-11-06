@@ -19,8 +19,7 @@ fi
 # the default --kv-gpu-tokens needs a single stream, so the model would refuse to load
 slots=()
 [[ " $* " == *" -np "* || " $* " == *" --parallel"* || " $* " == *" -np="* ]] || slots=(--parallel 1)
-# the shape our speed numbers were measured with; the caller's own arguments come later, so they win. A 12 GB card still
-# reads the prompt with -ub 6144 (the engine lowers it), and experts fall back to unpinned file pages when RAM is short.
+# The caller's own shape arguments come later, so they win.
 shape=(-ngl 999 -fa on -b 131072 -ub 8192 --fit off --moe-arena on --moe-cache on --ctx-checkpoints 4)
 # Small cards use less host carry RAM. The server lists devices in CUDA order, including visibility remapping.
 device_spec=${LLAMA_ARG_DEVICE-}
@@ -38,7 +37,7 @@ while IFS= read -r device; do
     name=${BASH_REMATCH[1],,}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
     [[ -z $device_spec || ,${device_spec,,}, == *,"$name",* ]] || continue
     if (( card_mib < 23552 || free_mib < 14336 )); then
-        shape+=(-b 32768)
+        shape+=(-b 32768 -ub 4096)
         break
     fi
 done <<< "$devices"
