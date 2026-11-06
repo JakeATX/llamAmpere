@@ -7205,7 +7205,12 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // expert bytes as the normal path but overlaps the copies with compute (the server sends the last n_ubatch + 4
     // prompt tokens as their own calls for its context checkpoints)
     const int64_t min_tok = b1_ctx_env("LLAMA_B1_MIN_TOKENS", 16384);
-    if (sizes.empty() || (int64_t) n_tokens_all < min_tok) {
+    // fork: let a short continuation of a long prompt use B1, without lowering the fresh-prompt threshold.
+    const int64_t tail_min = b1_ctx_env("LLAMA_B1_TAIL_MIN_TOKENS", 0);
+    const bool short_tail = small_prompt_card && tail_min >= 512 &&
+            (int64_t) n_tokens_all >= tail_min && (int64_t) n_tokens_all < min_tok &&
+            balloc->seq_pos_min(seq) >= min_tok;
+    if (sizes.empty() || ((int64_t) n_tokens_all < min_tok && !short_tail)) {
         return normal();
     }
     if (!mctx->b1_supported()) {
@@ -7224,6 +7229,10 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     }
     if (others) {
         return normal();
+    }
+    if (short_tail) {
+        LLAMA_LOG_INFO("%s: [B1] trying short continuation: %u tokens at position %d (tail minimum %lld)\n",
+                __func__, n_tokens_all, balloc->seq_pos_min(seq), (long long) tail_min);
     }
     size_t lend_cap = SIZE_MAX;
     const int64_t lend_mib = b1_ctx_env("LLAMA_B1_LEND_MIB", -1);
