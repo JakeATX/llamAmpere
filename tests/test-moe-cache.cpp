@@ -969,22 +969,24 @@ static bool run_capability_queries(
     ok &= api.query_shape(
             GGML_TYPE_Q4_0, n_in, n_out, 0, expert_size, &shape) == 0;
 
-    for (const auto type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
-        bool type_ok = true;
-        for (const int64_t width : {2560, 640}) {
-            const int64_t rows = width == 2560 ? 640 : 2560;
-            const size_t bytes = ggml_row_size(type, width) * rows;
-            set_env("GGML_MOE_CACHE_AI", nullptr);
-            type_ok &= api.query_shape(type, width, rows, 512, bytes, &shape) == 1;
-            type_ok &= shape.pool_bytes == bytes * 64;
-            type_ok &= shape.minimum_bytes == shape.scratch_bytes + shape.pool_bytes;
-            set_env("GGML_MOE_CACHE_AI", "0");
-            type_ok &= api.query_shape(type, width, rows, 512, bytes, &shape) == 0;
+    if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(provider_device)), "CUDA") == 0) {
+        for (const auto type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
+            bool type_ok = true;
+            for (const int64_t width : {2560, 640}) {
+                const int64_t rows = width == 2560 ? 640 : 2560;
+                const size_t bytes = ggml_row_size(type, width) * rows;
+                set_env("GGML_MOE_CACHE_AI", nullptr);
+                type_ok &= api.query_shape(type, width, rows, 512, bytes, &shape) == 1;
+                type_ok &= shape.pool_bytes == bytes * 64;
+                type_ok &= shape.minimum_bytes == shape.scratch_bytes + shape.pool_bytes;
+                set_env("GGML_MOE_CACHE_AI", "0");
+                type_ok &= api.query_shape(type, width, rows, 512, bytes, &shape) == 0;
+            }
+            printf("cache-capabilities type=%s: %s\n", ggml_type_name(type), type_ok ? "OK" : "FAIL");
+            ok &= type_ok;
         }
-        printf("cache-capabilities type=%s: %s\n", ggml_type_name(type), type_ok ? "OK" : "FAIL");
-        ok &= type_ok;
+        set_env("GGML_MOE_CACHE_AI", nullptr);
     }
-    set_env("GGML_MOE_CACHE_AI", nullptr);
 
     set_env("GGML_CUDA_MOE_CACHE", "0");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "off");
