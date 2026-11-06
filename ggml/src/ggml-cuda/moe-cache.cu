@@ -1689,6 +1689,8 @@ static bool moe_cache_type_supported(ggml_type type) {
         case GGML_TYPE_AIT2P_U:
         case GGML_TYPE_AIT3_U:
         case GGML_TYPE_AIT4_U:
+        case GGML_TYPE_AIT2_U2:
+        case GGML_TYPE_AIT3_U2:
             return getenv("GGML_MOE_CACHE_AI") == nullptr || atoi(getenv("GGML_MOE_CACHE_AI")) != 0;
         default:
             return false;
