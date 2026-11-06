@@ -20,6 +20,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <sstream>
 #include <fstream>
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -555,6 +556,259 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<int,      5>>  (enum llm_kv kid, std::array<int,      5>   & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<int,      6>>  (enum llm_kv kid, std::array<int,      6>   & result, uint32_t n, bool required);
 
+// fork AIPFIX BANKKEEP: LLAMA_MOE_BANK_KEEP=N keeps the N best-ranked experts of the overlay bank. The ranking is a
+// STRP list (LLAMA_MOE_BANK_RANK, else GGML_MOE_CACHE_PROFILE_LOAD): u32 entries layer | expert << 16, best first;
+// the 4-byte (pairs only) and 8-byte (pairs + per-slot rank table) file forms are both read, anything else is refused by name.
+// A layer's bank slots follow that order, so the kept experts of each layer are a prefix of its slots: the bank
+// tensors' outer dimension shrinks to that count and only those bytes are read. llama_model::register_moe_bank()
+// takes the slots past it out of the hot map, so the other experts run (and stay in the arena) as regular experts.
+static void overlay_bank_keep(ggml_context * ctx, const gguf_context * gguf, const char * path, long keep) {
+    const char * rank_path = getenv("LLAMA_MOE_BANK_RANK");
+    if (!rank_path || !*rank_path) { rank_path = getenv("GGML_MOE_CACHE_PROFILE_LOAD"); }
+    if (!rank_path || !*rank_path) {
+        throw std::runtime_error("LLAMA_MOE_BANK_KEEP needs a ranked list (LLAMA_MOE_BANK_RANK or GGML_MOE_CACHE_PROFILE_LOAD)");
+    }
+    std::ifstream rank_file(rank_path, std::ios::binary);
+    std::vector<char> list((std::istreambuf_iterator<char>(rank_file)), std::istreambuf_iterator<char>());
+    uint32_t head[6] = {};
+    if (list.size() < sizeof(head) || memcmp(list.data(), "STRP", 4) != 0) {
+        throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s is not a ranked STRP list (file is %zu bytes, no STRP header)",
+            rank_path, list.size()));
+    }
+    memcpy(head, list.data(), sizeof(head));
+    const uint32_t n_layer_list = head[2], n_expert_list = head[3], count = head[5];
+    // Two on-disk forms of the same list: "4-byte" = header + count u32 pairs; "8-byte" = the same plus a trailing u32 per
+    // (layer, expert) slot holding that slot's list position (UINT32_MAX when unlisted). Accept both, never guess.
+    const size_t n_slots = (size_t) n_layer_list*n_expert_list;
+    const size_t pair_bytes = sizeof(head) + (size_t) count*sizeof(uint32_t);
+    if (head[1] != 1 || n_layer_list == 0 || n_layer_list > 4096 || n_expert_list == 0 || n_expert_list > 4096 ||
+            count == 0 || count > head[4] || head[4] > n_slots ||
+            (list.size() != pair_bytes && list.size() != pair_bytes + n_slots*sizeof(uint32_t))) {
+        throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s has a bad STRP header or size (%zu bytes; version %u, %u layers x %u experts, "
+            "%u listed): expected %zu bytes (4-byte pairs) or %zu bytes (pairs + per-slot rank table)", rank_path, list.size(), head[1],
+            n_layer_list, n_expert_list, count, pair_bytes, pair_bytes + n_slots*sizeof(uint32_t)));
+    }
+    std::vector<uint32_t> rank(n_slots, UINT32_MAX);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t p;
+        memcpy(&p, list.data() + sizeof(head) + (size_t) i*sizeof(p), sizeof(p));
+        const uint32_t il = p & 0xFFFF, e = p >> 16;
+        if (il >= n_layer_list || e >= n_expert_list || rank[(size_t) il*n_expert_list + e] != UINT32_MAX) {
+            throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s entry %u (layer %u expert %u) is out of range or repeated",
+                rank_path, i, il, e));
+        }
+        rank[(size_t) il*n_expert_list + e] = i;
+    }
+    if (list.size() != pair_bytes) {
+        for (size_t i = 0; i < n_slots; ++i) {
+            uint32_t v;
+            memcpy(&v, list.data() + pair_bytes + i*sizeof(v), sizeof(v));
+            if (v != rank[i]) {
+                throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: %s per-slot rank table disagrees with its pair list at slot %zu", rank_path, i));
+            }
+        }
+    }
+
+    // (rank, layer, slot) of every bank expert; unlisted experts rank last
+    struct bank_expert { uint32_t rank; int layer; int slot; };
+    std::vector<bank_expert> bank;
+    std::vector<std::array<ggml_tensor *, 3>> hot;
+    std::FILE * f = std::fopen(path, "rb");
+    if (!f) { throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: cannot read %s", path)); }
+    for (int il = 0; il < 4096; ++il) {
+        const std::string pre = "blk." + std::to_string(il) + ".";
+        ggml_tensor * map = ggml_get_tensor(ctx, (pre + "ffn_exps_hot_map.weight").c_str());
+        if (!map) { continue; }
+        std::array<ggml_tensor *, 3> t = { ggml_get_tensor(ctx, (pre + "ffn_gate_exps_hot.weight").c_str()),
+                                           ggml_get_tensor(ctx, (pre + "ffn_up_exps_hot.weight").c_str()),
+                                           ggml_get_tensor(ctx, (pre + "ffn_down_exps_hot.weight").c_str()) };
+        const int64_t n_expert = ggml_nelements(map);
+        if (map->type != GGML_TYPE_F32 || !t[0] || !t[1] || !t[2] || t[0]->ne[2] != t[2]->ne[2] || t[1]->ne[2] != t[2]->ne[2] ||
+                t[2]->ne[3] != 1 || (il < (int) n_layer_list && n_expert != n_expert_list)) {
+            std::fclose(f);
+            throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: overlay layer %d does not match the ranked list", il));
+        }
+        std::vector<float> slot(n_expert);
+        const size_t offs = gguf_get_data_offset(gguf) + gguf_get_tensor_offset(gguf, gguf_find_tensor(gguf, ggml_get_name(map)));
+        if (std::fseek(f, (long) offs, SEEK_SET) != 0 || std::fread(slot.data(), sizeof(float), n_expert, f) != (size_t) n_expert) {
+            std::fclose(f);
+            throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: cannot read the layer %d hot map", il));
+        }
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (slot[e] >= 0.0f) {
+                const uint32_t r = il < (int) n_layer_list ? rank[(size_t) il*n_expert_list + e] : UINT32_MAX;
+                bank.push_back({ r, il, (int) slot[e] });
+            }
+        }
+        if ((int) hot.size() <= il) { hot.resize(il + 1, { nullptr, nullptr, nullptr }); }
+        hot[il] = t;
+    }
+    std::fclose(f);
+    if (keep < 0 || (size_t) keep >= bank.size()) {
+        LLAMA_LOG_INFO("[moe-bank] keep %ld: the bank holds %zu experts, all kept\n", keep, bank.size());
+        return;
+    }
+    std::stable_sort(bank.begin(), bank.end(), [](const bank_expert & a, const bank_expert & b) {
+        return a.rank != b.rank ? a.rank < b.rank : a.layer != b.layer ? a.layer < b.layer : a.slot < b.slot;
+    });
+    std::vector<int64_t> n_keep(hot.size(), 0), max_slot(hot.size(), -1);
+    for (long i = 0; i < keep; ++i) {
+        n_keep[bank[i].layer]++;
+        max_slot[bank[i].layer] = std::max<int64_t>(max_slot[bank[i].layer], bank[i].slot);
+    }
+    int not_prefix = 0, n_layers = 0;
+    int64_t lo = INT64_MAX, hi = 0;
+    size_t skipped = 0;
+    for (size_t il = 0; il < hot.size(); ++il) {
+        if (!hot[il][0]) { continue; }
+        not_prefix += max_slot[il] + 1 != n_keep[il];
+        // a bank tensor keeps at least one slot; a bank under 2 x n_expert_used runs on the regular tensors (llama-graph.cpp)
+        const int64_t n = std::max<int64_t>(n_keep[il], 1);
+        for (ggml_tensor * t : hot[il]) {
+            skipped += (size_t) (t->ne[2] - n)*t->nb[2];
+            t->ne[2] = n;
+            t->nb[3] = t->nb[2]*n;
+        }
+        lo = std::min(lo, n_keep[il]);
+        hi = std::max(hi, n_keep[il]);
+        n_layers++;
+    }
+    LLAMA_LOG_INFO("[moe-bank] keep %ld of %zu bank experts by %s: %d layers, %" PRId64 "..%" PRId64 " per layer, %.1f MiB not loaded\n",
+            keep, bank.size(), rank_path, n_layers, lo, hi, skipped/1048576.0);
+    if (not_prefix) {
+        LLAMA_LOG_WARN("[moe-bank] keep: in %d layers the bank slot order differs from the ranking; the first slots are kept\n", not_prefix);
+    }
+}
+
+// AIPFAST route 2: GGML_MOE_CPU_SPLIT_HOST_GGUF names files whose 3XS expert tensors the CPU uses for host misses of
+// the AI+ layers a patch made (ggml-cuda moe-cpu-split). They must be the base model this patch overlays, or the host
+// computes from wrong weights with no error. Checks, failing loud: a file with general.architecture has the base's
+// architecture, block_count and expert_count (a file without it must be a gguf split); every retyped expert tensor is
+// in one of the files with the base's type and size; per file that serves tensors, sampled tensors (first/middle/last
+// AI+ layer gate + down) equal the base's bytes in three 64 KiB windows.
+template <typename WMap>
+static void host_gguf_check(const char * list, const std::vector<std::string> & base_paths, const WMap & wmap) {
+    struct gfile { std::string path; gguf_context_ptr g; int n_used = 0, n_compared = 0; std::string first; };
+    const auto open_list = [](const std::vector<std::string> & paths) {
+        std::vector<gfile> out;
+        for (const auto & p : paths) {
+            gguf_init_params ip = { /*.no_alloc = */ true, /*.ctx = */ nullptr };
+            gguf_context_ptr g { gguf_init_from_file(p.c_str(), ip) };
+            if (!g) { throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: cannot read %s as GGUF", p.c_str())); }
+            out.push_back({ p, std::move(g), 0, 0, {} });
+        }
+        return out;
+    };
+    std::vector<std::string> hpaths;
+    {
+        std::stringstream ss(list);
+        for (std::string p; std::getline(ss, p, ',');) { if (!p.empty()) { hpaths.push_back(p); } }
+    }
+    std::vector<gfile> hf = open_list(hpaths), bf = open_list(base_paths);
+    const std::string & base0 = base_paths.front();
+    const auto kv_str = [](const gguf_context * g, const std::string & key) -> std::string {
+        const int64_t id = gguf_find_key(g, key.c_str());
+        if (id < 0) { return "(missing)"; }
+        switch (gguf_get_kv_type(g, id)) {
+            case GGUF_TYPE_STRING: return gguf_get_val_str(g, id);
+            case GGUF_TYPE_UINT32: return std::to_string(gguf_get_val_u32(g, id));
+            case GGUF_TYPE_INT32:  return std::to_string(gguf_get_val_i32(g, id));
+            case GGUF_TYPE_UINT64: return std::to_string(gguf_get_val_u64(g, id));
+            case GGUF_TYPE_UINT16: return std::to_string(gguf_get_val_u16(g, id));
+            default:               return "(other type)";
+        }
+    };
+    const gguf_context * bmeta = bf.front().g.get();
+    const std::string arch = kv_str(bmeta, "general.architecture");
+    for (const auto & f : hf) {
+        if (gguf_find_key(f.g.get(), "general.architecture") < 0) {
+            if (gguf_find_key(f.g.get(), "split.no") < 0) {
+                throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s has no general.architecture and is not a gguf split",
+                        f.path.c_str()));
+            }
+            continue;
+        }
+        for (const std::string & key : { std::string("general.architecture"), arch + ".block_count", arch + ".expert_count" }) {
+            const std::string x = kv_str(bmeta, key), y = kv_str(f.g.get(), key);
+            if (x != y) {
+                throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s is not the base model %s: %s = %s vs %s",
+                        f.path.c_str(), base0.c_str(), key.c_str(), y.c_str(), x.c_str()));
+            }
+        }
+    }
+    // retyped (AI+) routed-expert tensors in layer order
+    std::vector<std::string> names;
+    std::vector<int> layers;
+    for (int il = 0; il < 1024; ++il) {
+        for (const char * kind : { "gate", "up", "down" }) {
+            const std::string n = format("blk.%d.ffn_%s_exps.weight", il, kind);
+            auto it = wmap.find(n);
+            if (it != wmap.end() && ggml_ai4_is_unit(it->second.tensor->type)) {
+                names.push_back(n);
+                if (layers.empty() || layers.back() != il) { layers.push_back(il); }
+            }
+        }
+    }
+    if (names.empty()) { return; }
+    const int sample[3] = { layers.front(), layers[layers.size()/2], layers.back() };
+    const auto compare = [](gfile & f, int64_t hid, const gfile & b, int64_t bid, const std::string & n) {
+        const size_t bsz = gguf_get_tensor_size(b.g.get(), bid);
+        const size_t boff = gguf_get_data_offset(b.g.get()) + gguf_get_tensor_offset(b.g.get(), bid);
+        const size_t hoff = gguf_get_data_offset(f.g.get()) + gguf_get_tensor_offset(f.g.get(), hid);
+        const size_t win = std::min<size_t>(65536, bsz);
+        std::ifstream bs(b.path, std::ios::binary), hs(f.path, std::ios::binary);
+        std::vector<char> x(win), y(win);
+        for (size_t at : { (size_t) 0, (bsz - win)/2, bsz - win }) {
+            bs.seekg((std::streamoff) (boff + at));
+            hs.seekg((std::streamoff) (hoff + at));
+            bs.read(x.data(), (std::streamsize) win);
+            hs.read(y.data(), (std::streamsize) win);
+            if (!bs || !hs || memcmp(x.data(), y.data(), win) != 0) {
+                throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s bytes in %s differ from the base %s (offset %zu); "
+                        "not the same model", n.c_str(), f.path.c_str(), b.path.c_str(), at));
+            }
+        }
+        ++f.n_compared;
+    };
+    std::vector<std::string> missing;
+    for (const auto & n : names) {
+        gfile * f = nullptr;
+        int64_t hid = -1;
+        for (auto & c : hf) { hid = gguf_find_tensor(c.g.get(), n.c_str()); if (hid >= 0) { f = &c; break; } }
+        const gfile * b = nullptr;
+        int64_t bid = -1;
+        for (const auto & c : bf) { bid = gguf_find_tensor(c.g.get(), n.c_str()); if (bid >= 0) { b = &c; break; } }
+        if (!f || !b) { missing.push_back(n); continue; }
+        ++f->n_used;
+        const ggml_type ht = gguf_get_tensor_type(f->g.get(), hid), bt = gguf_get_tensor_type(b->g.get(), bid);
+        const size_t bsz = gguf_get_tensor_size(b->g.get(), bid), hsz = gguf_get_tensor_size(f->g.get(), hid);
+        if (ggml_ai4_is_unit(ht) || ht != bt || bsz != hsz) {
+            throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %s in %s is %s (%zu bytes), base %s has %s (%zu bytes)",
+                    n.c_str(), f->path.c_str(), ggml_type_name(ht), hsz, b->path.c_str(), ggml_type_name(bt), bsz));
+        }
+        if (f->first.empty()) { f->first = n; }
+        const int l = atoi(n.c_str() + 4);
+        if ((l != sample[0] && l != sample[1] && l != sample[2]) || n.find("_up_") != std::string::npos) { continue; }
+        compare(*f, hid, *b, bid, n);
+    }
+    if (!missing.empty()) {
+        throw std::runtime_error(format("GGML_MOE_CPU_SPLIT_HOST_GGUF: %zu of %zu AI+ expert tensors are missing from the listed "
+                "files or the base (first: %s)", missing.size(), names.size(), missing.front().c_str()));
+    }
+    int n_compared = 0;
+    for (auto & f : hf) {
+        if (f.n_used > 0 && f.n_compared == 0) {
+            // a file serving tensors none of which fell on a sampled layer: compare its first served tensor
+            for (const auto & b : bf) {
+                const int64_t bid = gguf_find_tensor(b.g.get(), f.first.c_str());
+                if (bid >= 0) { compare(f, gguf_find_tensor(f.g.get(), f.first.c_str()), b, bid, f.first); break; }
+            }
+        }
+        n_compared += f.n_compared;
+    }
+    LLAMA_LOG_WARN("%s: host 3XS source check passed: %zu AI+ expert tensors found in %zu file(s), %d byte-compared with the base\n",
+            __func__, names.size(), hf.size(), n_compared);
+}
 
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
@@ -791,6 +1045,9 @@ llama_model_loader::llama_model_loader(
             LLAMA_LOG_INFO("%s: [moe-bank] overlay direct reads enabled; weights bypass the page cache\n", __func__);
         }
         contexts.emplace_back(ctx);
+        if (const char * keep = getenv("LLAMA_MOE_BANK_KEEP"); keep && *keep) {
+            overlay_bank_keep(ctx, ctx_gguf.get(), ov, atol(keep));
+        }
         int n_added = 0;
         size_t added_bytes = 0;
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -805,6 +1062,93 @@ llama_model_loader::llama_model_loader(
             ++n_added;
         }
         LLAMA_LOG_INFO("%s: overlay %s: %d tensors, %.2f GiB\n", __func__, ov, n_added, added_bytes/1073741824.0);
+        }
+    }
+
+    // LLAMA_MODEL_OVERLAY_PATCH=A.gguf[,B.gguf...]: tensors that replace same-named, same-shape model or overlay
+    // tensors (a re-encode of part of a bank, or re-encoded attention weights, without a full copy of either);
+    // every patch tensor must replace one tensor. Without LLAMA_MODEL_OVERLAY the patch applies to the base model files; a
+    // model that holds none of its tensors (an MTP drafter in the same process) skips it.
+    const char * ov_env = getenv("LLAMA_MODEL_OVERLAY");
+    const bool patch_base = !(ov_env && ov_env[0]);
+    int n_retyped = 0;
+    if (const char * pfs = getenv("LLAMA_MODEL_OVERLAY_PATCH"); pfs && pfs[0] && !fname.empty() && (patch_base || overlay_idx >= 0)) {
+        std::stringstream pss(pfs);
+        for (std::string pfn; std::getline(pss, pfn, ',');) {
+        if (pfn.empty()) { continue; }
+        const char * pf = pfn.c_str();
+        struct ggml_context * pctx = NULL;
+        struct gguf_init_params p_params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &pctx,
+        };
+        gguf_context_ptr p_gguf { gguf_init_from_file(pf, p_params) };
+        if (!p_gguf) {
+            throw std::runtime_error(format("%s: failed to load overlay patch GGUF %s", __func__, pf));
+        }
+        if (const char * error = llama_ait_format_error(p_gguf.get())) { throw std::runtime_error(error); }
+        if (patch_base) {
+            ggml_tensor * first = ggml_get_first_tensor(pctx);
+            if (!first || weights_map.find(first->name) == weights_map.end()) {
+                LLAMA_LOG_INFO("%s: overlay patch %s does not belong to this model, not loaded\n", __func__, pf);
+                ggml_free(pctx);
+                continue;
+            }
+        }
+        if (files.size() >= UINT16_MAX) {
+            throw std::runtime_error("too many model files for an overlay patch");
+        }
+        const uint16_t pidx = (uint16_t) files.size();
+        files.emplace_back(new llama_file(pf, "rb"));
+        contexts.emplace_back(pctx);
+        int n_patched = 0;
+        for (ggml_tensor * cur = ggml_get_first_tensor(pctx); cur; cur = ggml_get_next_tensor(pctx, cur)) {
+            auto it = weights_map.find(cur->name);
+            // LLAMA_MOE_BANK_KEEP shrank the bank tensors to their kept slot prefix: a full-size patch of a bank tensor
+            // holds the same slots in the same order, so it is read up to that prefix
+            if (it != weights_map.end() && strstr(cur->name, "_exps_hot.") && cur->ne[3] == 1 && it->second.tensor->ne[3] == 1 &&
+                    cur->ne[0] == it->second.tensor->ne[0] && cur->ne[1] == it->second.tensor->ne[1] &&
+                    cur->ne[2] > it->second.tensor->ne[2]) {
+                cur->ne[2] = it->second.tensor->ne[2];
+                cur->nb[3] = cur->nb[2]*cur->ne[2];
+            }
+            if (it == weights_map.end() || !ggml_are_same_shape(it->second.tensor, cur)) {
+                throw std::runtime_error(format("overlay patch %s: tensor '%s' does not replace a tensor of the same shape",
+                        pf, ggml_get_name(cur)));
+            }
+            if (it->second.tensor->type != cur->type && strstr(cur->name, "_exps.weight")) {
+                ++n_retyped;   // a routed-expert base tensor in another type (all-AI+ experts: the cache takes this type)
+            }
+            n_bytes += ggml_nbytes(cur) - ggml_nbytes(it->second.tensor);
+            it->second = llama_tensor_weight(files.back().get(), pidx, p_gguf.get(), cur);
+            ++n_patched;
+        }
+        LLAMA_LOG_INFO("%s: overlay patch %s: %d tensors replaced\n", __func__, pf, n_patched);
+        }
+    }
+    if (n_retyped > 0) {
+        // the paired gate/up cache path reads both projections with one type: refuse a patch that splits them
+        int n_ai_layers = 0;
+        for (int il = 0; il < 1024; ++il) {
+            auto g = weights_map.find(format("blk.%d.ffn_gate_exps.weight", il));
+            auto u = weights_map.find(format("blk.%d.ffn_up_exps.weight", il));
+            auto d = weights_map.find(format("blk.%d.ffn_down_exps.weight", il));
+            if (g == weights_map.end() || u == weights_map.end() || d == weights_map.end()) { continue; }
+            const ggml_type tg = g->second.tensor->type, tu = u->second.tensor->type, td = d->second.tensor->type;
+            if (tg != tu && (ggml_ai4_is_unit(tg) || ggml_ai4_is_unit(tu))) {
+                throw std::runtime_error(format("overlay patch: layer %d gate/up types differ (%s vs %s); AI+ expert patches "
+                        "must give gate and up one type", il, ggml_type_name(tg), ggml_type_name(tu)));
+            }
+            if (ggml_ai4_is_unit(tg) || ggml_ai4_is_unit(td)) {
+                ++n_ai_layers;
+                LLAMA_LOG_INFO("%s: AI+ experts: layer %d gate/up %s down %s\n", __func__, il, ggml_type_name(tg), ggml_type_name(td));
+            }
+        }
+        // WARN, not INFO: llama-server logs hide libllama INFO lines and a smoke must be able to see this
+        LLAMA_LOG_WARN("%s: overlay patch retyped %d routed-expert tensors; %d layers hold AI+ experts in the base tensors\n",
+                __func__, n_retyped, n_ai_layers);
+        if (const char * hg = getenv("GGML_MOE_CPU_SPLIT_HOST_GGUF"); hg && hg[0]) {
+            host_gguf_check(hg, splits.empty() ? std::vector<std::string>{ fname } : splits, weights_map);
         }
     }
 
@@ -859,8 +1203,11 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q6_CR:   ftype = LLAMA_FTYPE_MOSTLY_Q6_CR;   break;
             case GGML_TYPE_AIT5_U:
             case GGML_TYPE_AIT2_U:
+            case GGML_TYPE_AIT2P_U:
             case GGML_TYPE_AIT3_U:
             case GGML_TYPE_AIT4_U:
+            case GGML_TYPE_AIT2_U2:
+            case GGML_TYPE_AIT3_U2:
             case GGML_TYPE_AIT2:
             case GGML_TYPE_AIT3:
             case GGML_TYPE_AIT4:

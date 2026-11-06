@@ -1630,6 +1630,7 @@ void llm_graph_result::reset() {
     greedy_rows.clear();
     t_sampled_rows.clear();
     sampled_rows.clear();
+    t_topk_rows.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
@@ -1970,6 +1971,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+    if (moe_route_skip && !ggml_exl3_bits(w->type) && ggml_nelements(moe_route_skip) == res->ne[1]*res->ne[2]) {
+        res->src[3] = moe_route_skip; // a backend that ignores it computes those routes (their weight is zero)
+    }
 
     // fork: native CPU experts use logical IDs for both compressed weights and side vectors.
     const char * cpu_exl3 = getenv("GGML_CPU_EXL3");
@@ -2407,6 +2411,25 @@ static void moe_skipmass_cpu(ggml_tensor * dst, const ggml_tensor * a, const ggm
     if (ith == 0) { memcpy(dst->data, a->data, ggml_nbytes(a)); }
 }
 
+// the CUDA fusion matches this name (same literal in ggml-cuda.cu)
+#define GGML_MOE_ONECHAIN_BANK_NAME "moe_onechain_bank"
+
+// fork AIPFIX ONECHAIN: regular route values stay (cold mask 1), bank routes (cold mask 0, skipped by the regular
+// MUL_MAT_ID) take the bank product. The three nodes stay adjacent: the CUDA backend writes the bank product straight
+// into the regular output (ggml-cuda.cu, ggml_cuda_try_moe_onechain_fill); the bank kernel never writes skipped routes.
+ggml_tensor * llm_graph_context::build_moe_onechain_fill(ggml_tensor * regular, ggml_tensor * bank_w, ggml_tensor * x) const {
+    GGML_ASSERT(moe_onechain_ids && moe_onechain_cold);
+    ggml_build_forward_expand(gf, regular);
+    ggml_tensor * kept = ggml_mul_inplace(ctx0, regular, moe_onechain_cold);
+    ggml_build_forward_expand(gf, kept);
+    ggml_tensor * bank = ggml_mul_mat_id(ctx0, bank_w, x, moe_onechain_ids);
+    ggml_set_name(bank, GGML_MOE_ONECHAIN_BANK_NAME);
+    ggml_build_forward_expand(gf, bank);
+    ggml_tensor * out = ggml_add_inplace(ctx0, kept, bank);
+    ggml_build_forward_expand(gf, out);
+    return out;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2634,6 +2657,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (moe_hot.hot_map != nullptr && moe_hot.down->ne[2] < 2*n_expert_used) {
         moe_hot = {};
     }
+    // fork AIPFIX ONEPATH (LLAMA_MOE_BANK_ONEPATH=1): decode-size batches run a banked layer as a plain layer. The expert
+    // cache already holds the bank experts as zero-weight entries; it computes their routes from the bank rows itself
+    // (moe-cache.cu, AI+ table GEMV), so no routing split, mask or merge nodes. Only batches the cache takes (at most
+    // 64 routed rows, moe_cache_node_rows_max) qualify: past it the stock call would read the dropped bank rows.
+    // Larger batches keep the bank graph. Prompt ubatches (not every token an output) and every B1 phase keep it too:
+    // the scheduler runs those on the CPU path, which reads the dropped host rows of the bank experts.
+    // So does every batch while the cache's device tables lack the bank rows (not built yet, or refused: f3l's 8K MTP
+    // arm had partial bundles, no tables, and the stock call read the dropped rows).
+    static const bool onepath = [] {
+        const char * value = getenv("LLAMA_MOE_BANK_ONEPATH");
+        return value && atoi(value) != 0;
+    }();
+    auto ai_unit = [](const ggml_tensor * t) {
+        return t && (t->type == GGML_TYPE_AIT2_U || t->type == GGML_TYPE_AIT2P_U || t->type == GGML_TYPE_AIT3_U ||
+                t->type == GGML_TYPE_AIT4_U);
+    };
+    if (onepath && moe_hot.hot_map != nullptr && (int64_t) n_tokens*n_expert_used <= 64 &&
+            n_outputs == n_tokens && res->get_b1_ffn_phase() == 0 && res->get_moe_onepath_live() &&
+            !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) != 0) &&
+            up_exps && gate_exps && down_exps && !gate_up_exps &&
+            ai_unit(moe_hot.up) && ai_unit(moe_hot.gate) && ai_unit(moe_hot.down)) {
+        moe_hot = {};
+    }
     if (moe_hot.hot_map != nullptr) {
         // split the selected experts between the hot bank and the cold bank; each bank runs on all
         // n_expert_used columns with the weights of the other bank's experts set to zero
@@ -2649,6 +2695,48 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * slot = ggml_reshape_3d(ctx0,
                 ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, hot.hot_map, 1, n_expert), sel_flat), 1, n_expert_used, n_tokens);
         cb(slot, "ffn_moe_hot_slot", il);
+        static const bool mixed_enabled = [] {
+            const char * value = getenv("LLAMA_MOE_BANK_MIXED");
+            return !value || atoi(value) != 0;
+        }();
+        if (mixed_enabled && !b1_routing && n_tokens <= 8 &&
+                !(getenv("GGML_MOE_HOT_DBG") && atoi(getenv("GGML_MOE_HOT_DBG")) != 0) &&
+                type_op == LLM_FFN_SILU && il >= 0 && hparams.swiglu_clamp_exp[il] <= 1e-6f &&
+                loras->empty() && (!hadamard_rotations || hadamard_rotations->empty()) &&
+                up_exps && gate_exps && down_exps && !gate_up_exps &&
+                !up_exps_b && !gate_exps_b && !down_exps_b &&
+                !up_exps_s && !gate_exps_s && !down_exps_s &&
+                (hot.up->type == GGML_TYPE_AIT2_U || hot.up->type == GGML_TYPE_AIT2P_U || hot.up->type == GGML_TYPE_AIT3_U) &&
+                (hot.gate->type == GGML_TYPE_AIT2_U || hot.gate->type == GGML_TYPE_AIT2P_U || hot.gate->type == GGML_TYPE_AIT3_U) &&
+                (hot.down->type == GGML_TYPE_AIT2_U || hot.down->type == GGML_TYPE_AIT2P_U || hot.down->type == GGML_TYPE_AIT3_U ||
+                 (hot.down->type == GGML_TYPE_AIT4_U && hot.down->ne[0] == 640) ||
+                 (hot.down->type == GGML_TYPE_IQ4_NL && down_exps->type == GGML_TYPE_IQ4_NL))) {
+            ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, nullptr, il);
+            // fork: slot-cache IDs have a different domain from the bank map; retain the old path there.
+            if (!slots) {
+                ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+                ggml_build_forward_expand(gf, x);
+                ggml_tensor * hot_ids = ggml_cast(ctx0, ggml_reshape_2d(ctx0, slot, n_expert_used, n_tokens), GGML_TYPE_I32);
+                ggml_tensor * cold_mask = ggml_reshape_3d(ctx0,
+                        ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, hot_ids, GGML_TYPE_F32), -1.0f, -0.5f)),
+                        1, n_expert_used, n_tokens);
+                ggml_build_forward_expand(gf, cold_mask);
+                auto mixed_mm = [&](ggml_tensor * hw, ggml_tensor * cw, ggml_tensor * x) {
+                    ggml_tensor * h = build_lora_mm_id(hw, x, hot_ids);
+                    ggml_tensor * c = build_lora_mm_id(cw, x, selected_experts);
+                    return ggml_add(ctx0, h, ggml_mul(ctx0, c, cold_mask));
+                };
+                ggml_tensor * up = mixed_mm(hot.up, up_exps, x);
+                ggml_tensor * gate = mixed_mm(hot.gate, gate_exps, x);
+                x = ggml_swiglu_split(ctx0, gate, up);
+                ggml_tensor * experts = mixed_mm(hot.down, down_exps, x);
+                ggml_tensor * weighted = ggml_mul(ctx0, experts, weights);
+                ggml_tensor * sum = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, weighted, 1, 0, 2, 3)));
+                ggml_tensor * out = ggml_reshape_2d(ctx0, sum, n_embd, n_tokens);
+                cb(out, "ffn_moe_out", il);
+                return out;
+            }
+        }
         ggml_tensor * mask  = ggml_step(ctx0, ggml_scale_bias(ctx0, slot, 1.0f, 0.5f)); // 1 = hot, 0 = cold
         ggml_tensor * w_hot  = ggml_mul(ctx0, weights, mask);
         ggml_tensor * w_cold = ggml_sub(ctx0, weights, w_hot);
@@ -2694,6 +2782,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }();
         const bool joint_reduce = joint_enabled && !b1_routing && hot_skip && hot_dbg == 0 &&
                 n_tokens <= 8 && n_expert_used == hparams.n_expert_used(il);
+        // fork AIPFIX ONECHAIN (default on; LLAMA_MOE_BANK_ONECHAIN=0 opts out): prompt batches skip the separate bank chain (its
+        // full-width zero fill, SwiGLU, weighting and reduction); the regular chain below takes the bank products
+        // in place with the full routing weights. Valid math: one sum over all routes instead of bank + regular sums.
+        static const bool onechain_enabled = [] {
+            const char * value = getenv("LLAMA_MOE_BANK_ONECHAIN");
+            return !value || atoi(value) != 0;
+        }();
+        static const bool onechain_cold_skip = [] {
+            const char * value = getenv("LLAMA_MOE_COLD_SKIP");
+            return !value || atoi(value) != 0;
+        }();
+        if (onechain_enabled && onechain_cold_skip && hot_dbg == 0 && !b1_routing && n_tokens > 8 && hot_skip && !joint_reduce && type_op == LLM_FFN_SILU &&
+                il >= 0 && hparams.swiglu_clamp_exp[il] <= 1e-6f && loras->empty() &&
+                (!hadamard_rotations || hadamard_rotations->empty()) &&
+                up_exps && gate_exps && down_exps && !gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
+                !up_exps_s && !gate_exps_s && !down_exps_s && !llm_sched_needs_moe_f16_act_guard(sched)) {
+            moe_route_skip = slot;
+            moe_weights_override = weights;
+            moe_onechain_bank = &hot;
+            moe_onechain_ids  = hot_ids;
+            moe_onechain_cold = ggml_scale_bias(ctx0, mask, -1.0f, 1.0f);
+            ggml_build_forward_expand(gf, hot_ids);
+            ggml_build_forward_expand(gf, moe_onechain_cold);
+            ggml_tensor * out = build_moe_ffn(cur, gate_inp, nullptr,
+                    up_exps, nullptr, gate_exps, nullptr, down_exps, nullptr, exp_probs_b,
+                    n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+                    logits, nullptr, nullptr, nullptr, nullptr, nullptr, cold_ids);
+            moe_onechain_bank = nullptr;
+            moe_onechain_ids  = nullptr;
+            moe_onechain_cold = nullptr;
+            moe_route_skip = nullptr;
+            GGML_ASSERT(moe_weights_override == nullptr);
+            return out;
+        }
         GGML_ASSERT(!moe_defer_reduce);
         moe_defer_reduce = joint_reduce;
         moe_weights_override = w_hot;
@@ -2713,10 +2835,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             w_cold  = weights;
         }
         moe_weights_override = w_cold;
+        // prompt batches: the cold GEMMs leave out the hot routes (zero weight here, computed by the hot call)
+        // instead of running them against the zero-filled bank holes. LLAMA_MOE_COLD_SKIP=0 opts out.
+        static const bool cold_skip = [] {
+            const char * value = getenv("LLAMA_MOE_COLD_SKIP");
+            return !value || atoi(value) != 0;
+        }();
+        if (cold_skip && hot_dbg == 0 && !b1_routing && n_tokens > 8) {
+            moe_route_skip = slot;
+        }
         ggml_tensor * out_cold = build_moe_ffn(cur, gate_inp, nullptr,
                 up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, exp_probs_b,
                 n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
                 logits, gate_up_exps, gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, cold_ids);
+        moe_route_skip = nullptr;
         GGML_ASSERT(moe_weights_override == nullptr);
         moe_defer_reduce = false;
         if (joint_reduce) {
@@ -2752,6 +2884,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    ggml_tensor * const moe_in = cur;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2810,6 +2943,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps_b) {
             cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);
+        }
+        if (moe_onechain_bank) {
+            // keep the two regular products adjacent (shared prompt MMQ prep), then fill their bank routes
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, up);
+            up  = build_moe_onechain_fill(up,  moe_onechain_bank->up,   moe_in);
+            cur = build_moe_onechain_fill(cur, moe_onechain_bank->gate, moe_in);
         }
     }
 
@@ -2918,6 +3058,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
     }
     cb(experts, "ffn_moe_down", il);
+    if (moe_onechain_bank) {
+        experts = build_moe_onechain_fill(experts, moe_onechain_bank->down, cur);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
@@ -2934,7 +3077,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        // LLAMA_MOE_WEIGHT_INPLACE=1 (opt-in): prompt batches scale the expert outputs in place, so the weighted copy
+        // (n_embd x n_expert_used x n_tokens f32, 400 MiB at 4,096 tokens) does not sit next to the unweighted one in the
+        // layer graph. Same values; only valid while nothing else reads ffn_moe_down after this node.
+        static const bool w_inplace = [] { const char * e = getenv("LLAMA_MOE_WEIGHT_INPLACE"); if (e) return atoi(e) != 0; const char * l = getenv("LLAMA_LEAN_PROMPT"); return l && atoi(l) != 0; }(); // LLAMA_LEAN_PROMPT (unset = off; llama_context sets it on small cards)
+        experts = w_inplace && n_tokens > 8 ? ggml_mul_inplace(ctx0, experts, weights) : ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 
@@ -5175,6 +5322,19 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            if (data.sampled == nullptr && !ids_map && data.candidates != nullptr && data.logits != nullptr && data.candidates->ne[1] == n_rows) {
+                // truncation-only chain: export the kept ids and logits of every row, the host finishes the sampling
+                ggml_format_name(data.candidates, "topk_ids_rows_%d", seq_id);
+                ggml_format_name(data.logits, "topk_logits_rows_%d", seq_id);
+                ggml_set_output(data.candidates);
+                ggml_set_output(data.logits);
+                ggml_build_forward_expand(gf, data.candidates);
+                ggml_build_forward_expand(gf, data.logits);
+                res->t_topk_rows[seq_id] = { data.candidates, data.logits };
+                res->sampled_rows[seq_id].assign(rows.begin(), rows.end());
+                continue;
+            }
 
             GGML_ASSERT(data.sampled != nullptr && ggml_nelements(data.sampled) == n_rows && "row-block sampler chain produced no sampled ids");
 

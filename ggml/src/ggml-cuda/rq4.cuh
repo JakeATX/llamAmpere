@@ -82,12 +82,13 @@ static __device__ __forceinline__ float magic_i2f(int x) {
 
 // Optional scratch layout swaps the two 8-byte halves of each vector for token bit 1.
 // The default fragment layout remains unchanged.
+// quantize_act_body is one CTA's work for grid block (bx, tok); other kernels may run it on part of their grid.
 template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
-static __global__ void __launch_bounds__(128) quantize_act(
-        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N) {
+static __device__ __forceinline__ void quantize_act_body(
+        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
+        int bx, int tok) {
     const int lane = threadIdx.x & 31;
-    const int hb   = blockIdx.x*4 + (threadIdx.x >> 5);
-    const int tok  = blockIdx.y;
+    const int hb   = bx*4 + (threadIdx.x >> 5);
     if (hb*RQ4_HB >= K || tok >= N) {
         return;
     }
@@ -161,6 +162,12 @@ static __global__ void __launch_bounds__(128) quantize_act(
     if (lane == 0) {
         s[(int64_t) tok*(K/RQ4_HB) + hb] = d;
     }
+}
+
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
+static __global__ void __launch_bounds__(128) quantize_act(
+        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N) {
+    quantize_act_body<SWAP8, XPERM, LINEAR>(x, sx, q, s, K, N, blockIdx.x, blockIdx.y);
 }
 
 // ---------------------------------------------------------------------------------------------

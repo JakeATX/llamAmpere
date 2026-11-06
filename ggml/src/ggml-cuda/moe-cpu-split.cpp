@@ -17,6 +17,7 @@
 #define GGML_COMMON_IMPL_CPP   // the IQ grids, for the AVX-512 dot loops below
 #include "../ggml-common.h"
 #include "moe-iq-rows.h"
+#include "moe-ai-rows.h"
 #include "../ggml-cpu/quants.h"
 #include "../ggml-cpu/vec.h"
 
@@ -28,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -37,11 +39,29 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <time.h>
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
+
+// fork AIPFIX: one line the first time the host computes an AI+ unit expert, with the decode path it takes
+static void moe_ai_log_first(const char * role) {
+    static std::atomic<bool> logged{false};
+    if (logged.exchange(true)) { return; }
+#if defined(__AVX2__) && defined(__FMA__)
+    const char * isa = moe_ai::has_avx512() ? "avx512" : "avx2";
+#else
+    const char * isa = "scalar";
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+    if (moe_ai::use_host_q8()) { isa = moe_ai::use_q8_vbmi() ? "avx512-vbmi" : "avx2"; } // q8: AVX2 unless GGML_MOE_AI_HOST_Q8_VBMI=1
+#endif
+    fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s act=%s%s\n", role, isa,
+            moe_ai::use_host_q8() ? "q8 (default; GGML_MOE_AI_HOST_Q8=0 = f32)" : "f32 (GGML_MOE_AI_HOST_Q8=0)",
+            moe_ai::use_host_q8() && moe_ai::use_q8_lv() ? " lv=on (GGML_MOE_AI_HOST_Q8_LV=1)" : "");
+}
 
 namespace {
 
@@ -440,6 +460,10 @@ bool cpu_has_avx512_vnni() {
 struct role_math {
     moe_cs_role r;
     ggml_vec_dot_t dot = nullptr;
+    bool ai = false;            // fork AIPFIX D2: AI+ unit expert (moe_ai::slab_rows on rotated f32 inputs)
+    bool ai_q8 = false;         // AIPFIX: int8 activations (moe_ai::slab_rows_q8; default on, GGML_MOE_AI_HOST_Q8=0 = off)
+    int ai_k = 0;
+    uint32_t ai_C = 0;
     bool q2 = false;            // dot_q2_0_q8_0 instead of ggml's kernel
     ggml_type vec_type = GGML_TYPE_COUNT;
     ggml_from_float_t quant = nullptr;
@@ -541,6 +565,25 @@ struct pool_state {
     std::condition_variable sleep_cv;
 
     std::atomic<unsigned long long> st_jobs{0}, st_experts{0}, st_routes{0}, st_busy_ns{0}, st_null{0};
+    // AIPFAST R8 host cache (GGML_MOE_AI_HOST_R8_MB=<MiB>, with GGML_MOE_AI_HOST_Q8=1): int8 level copies of recently
+    // CPU-computed AI+ projections, LRU, keyed by (layer, expert, role). A miss decodes and keeps (moe_ai::slab_rows_q8_keep),
+    // a hit runs moe_ai::slab_rows_r8; both are bit-identical to slab_rows_q8. Thread 0 plans each card job before `gen`
+    // moves; a slot filled by job n turns ready when job n + 1 is planned (job n has finished by then). The load probe
+    // posts host jobs, which never use the cache, so the planner's per-route cost stays the decode cost.
+    struct r8_state {
+        uint8_t * arena = nullptr;
+        size_t arena_bytes = 0;                  // mmap length of arena
+        size_t slot = 0;
+        int n = 0, n_expert = 0, head = -1, tail = -1;
+        std::vector<int32_t> map, key, prv, nxt, pending;   // map: (layer*n_expert + e)*3 + role -> slot or -1
+        std::vector<uint8_t> ready;
+        unsigned long long hit = 0, fill = 0, plain = 0, jobs = 0;
+    } r8;
+    int r8_mb = 0;
+    int r8_every = 16384;                        // card jobs between hit-rate lines (GGML_MOE_AI_HOST_R8_STATS)
+    bool r8_reset = false;                       // a layer was (re)registered: rebuild the table at the next card job
+    uint8_t * r8p[MOE_CS_MAX_EXPERTS][3] = {};   // this job: slot of (expert i, role)
+    uint8_t r8m[MOE_CS_MAX_EXPERTS][3] = {};     // this job: 0 = decode, 1 = hit (R8 kernel), 2 = decode + keep
     unsigned long long phase_ns[4] = {};   // thread 0's time through each phase (barrier included), summed
     // GGML_MOE_CPU_SPLIT_WSTATS=1 (default off): per worker, time spent claiming and running tiles and time spent waiting at
     // the end-of-phase barrier, plus how late the worker joined a job. Tells a slow or late core from a slow kernel.
@@ -587,6 +630,122 @@ const char * role_row(pool_state & s, const role_math & m, int expert, int64_t r
     (void) s;
 }
 
+static void r8_touch(pool_state::r8_state & c, int sl) {   // move slot sl to the front (most recent) of the LRU list
+    if (c.head == sl) { return; }
+    const int p = c.prv[sl], q = c.nxt[sl];
+    if (p >= 0) { c.nxt[p] = q; }
+    if (q >= 0) { c.prv[q] = p; }
+    if (c.tail == sl) { c.tail = p; }
+    c.prv[sl] = -1; c.nxt[sl] = c.head;
+    if (c.head >= 0) { c.prv[c.head] = sl; }
+    c.head = sl;
+    if (c.tail < 0) { c.tail = sl; }
+}
+
+static double r8_mem_avail() {   // MemAvailable in bytes (0 if unreadable)
+    long long kib = -1;
+    if (FILE * fp = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) { if (sscanf(line, "MemAvailable: %lld kB", &kib) == 1) { break; } }
+        fclose(fp);
+    }
+    return kib > 0 ? kib * 1024.0 : 0.0;
+}
+
+static bool r8_init(pool_state & s) {
+    pool_state::r8_state & c = s.r8;
+    s.r8_reset = false;
+    size_t slot = 0;
+    int ne = 0;
+    for (const layer_math & L : s.layers) {
+        for (int k = 0; L.ok && k < 3; ++k) {
+            const role_math & m = L.role[k];
+            if (!m.ai_q8 || !moe_ai::r8_ok(m.ai_k, m.ai_C, m.r.n_out, m.r.n_in)) { continue; }
+            slot = std::max(slot, moe_ai::r8_slot_bytes(m.r.n_out, m.r.n_in));
+            ne = std::max(ne, (int) m.r.n_expert);
+        }
+    }
+    if (!slot) { fprintf(stderr, "[moe-cpu-split] r8 host cache: no AI+ host roles, off\n"); return false; }
+    // RAM-aware fit: the cache is sized after load against MemAvailable minus the 5 GiB floor
+    // (GGML_MOE_AI_HOST_R8_FLOOR_GIB raises it; R8_MB=-1 = auto, GGML_MOE_AI_HOST_R8_PCT % of the room, default 50),
+    // and its pages are committed now (MAP_POPULATE; GGML_MOE_AI_HOST_R8_POPULATE=0 keeps them lazy) so the floor holds.
+    if (c.arena) { munmap(c.arena, c.arena_bytes); c.arena = nullptr; c.arena_bytes = 0; }
+    const double avail0 = r8_mem_avail();
+    const char * fe = getenv("GGML_MOE_AI_HOST_R8_FLOOR_GIB");
+    const double floor_gib = fe && fe[0] ? atof(fe) : 5.0;
+    const size_t fit = moe_ai::r8_fit_bytes(s.r8_mb, avail0, floor_gib, env_int("GGML_MOE_AI_HOST_R8_PCT", 50, 0, 100));
+    const size_t n = std::min<size_t>(fit / slot, 1u << 24);
+    if (n < 3 * MOE_CS_MAX_EXPERTS + 1) {   // a job must never evict a slot it uses itself
+        fprintf(stderr, "[moe-cpu-split] r8 host cache: %d MiB asked, %zu MiB fits above the %.1f GiB floor (MemAvailable %.2f GiB): "
+                "%zu slots, need %d, off\n", s.r8_mb, fit >> 20, std::max(5.0, floor_gib), avail0 / 1073741824.0, n, 3 * MOE_CS_MAX_EXPERTS + 1);
+        return false;
+    }
+    const bool populate = env_int("GGML_MOE_AI_HOST_R8_POPULATE", 1, 0, 1) != 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    void * mem = mmap(nullptr, n * slot, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | (populate ? MAP_POPULATE : 0), -1, 0);
+    if (mem == MAP_FAILED) { fprintf(stderr, "[moe-cpu-split] r8 host cache: map of %zu MiB failed, off\n", (n * slot) >> 20); return false; }
+    c.arena = (uint8_t *) mem; c.arena_bytes = n * slot;
+    fprintf(stderr, "[moe-cpu-split] r8 host cache: RAM fit %d MiB asked, %zu MiB used, MemAvailable %.2f -> %.2f GiB (floor %.1f), "
+            "%s in %.0f ms\n", s.r8_mb, (n * slot) >> 20, avail0 / 1073741824.0, r8_mem_avail() / 1073741824.0,
+            std::max(5.0, floor_gib), populate ? "populated" : "lazy",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    c.slot = slot; c.n = (int) n; c.n_expert = ne;
+    c.map.assign(s.layers.size() * (size_t) ne * 3, -1);
+    c.key.assign(n, -1); c.ready.assign(n, 0); c.prv.resize(n); c.nxt.resize(n); c.pending.clear();
+    for (int i = 0; i < c.n; ++i) { c.prv[i] = i - 1; c.nxt[i] = i + 1 < c.n ? i + 1 : -1; }
+    c.head = 0; c.tail = c.n - 1;
+    fprintf(stderr, "[moe-cpu-split] r8 host cache: %d slots x %.2f MiB = %zu MiB (GGML_MOE_AI_HOST_R8_MB, pages fill on first use)\n",
+            c.n, slot / 1048576.0, (n * slot) >> 20);
+    return true;
+}
+
+// thread 0, before `gen` moves: choose decode / hit / decode + keep for every AI+ q8 (expert, role) of this job
+static void r8_plan(pool_state & s, int layer, bool card) {
+    for (int i = 0; i < s.n_exp; ++i) { s.r8m[i][0] = s.r8m[i][1] = s.r8m[i][2] = 0; }
+    if (!card || s.r8_mb == 0) { return; }
+    pool_state::r8_state & c = s.r8;
+    if ((c.n == 0 || s.r8_reset) && !r8_init(s)) { s.r8_mb = 0; return; }
+    for (const int sl : c.pending) { c.ready[sl] = 1; }
+    c.pending.clear();
+    for (int i = 0; i < s.n_exp; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            const role_math & m = s.cur->role[k];
+            if (!m.ai_q8) { continue; }
+            if (!moe_ai::r8_ok(m.ai_k, m.ai_C, m.r.n_out, m.r.n_in) || !moe_cs_load_acquire(&m.r.src[s.expert[i]])) { ++c.plain; continue; }
+            const int32_t idx = (int32_t) (((size_t) layer * c.n_expert + s.expert[i]) * 3 + k);
+            int sl = c.map[idx];
+            if (sl >= 0 && c.ready[sl]) {
+                s.r8m[i][k] = 1; ++c.hit;
+            } else {
+                if (sl < 0) {
+                    sl = c.tail;
+                    if (c.key[sl] >= 0) { c.map[c.key[sl]] = -1; }
+                    c.key[sl] = idx; c.map[idx] = sl;
+                }
+                c.ready[sl] = 0; c.pending.push_back(sl);
+                s.r8m[i][k] = 2; ++c.fill;
+            }
+            r8_touch(c, sl);
+            s.r8p[i][k] = c.arena + (size_t) sl * c.slot;
+        }
+    }
+    if (++c.jobs % (unsigned long long) s.r8_every == 0) {
+        const unsigned long long tot = c.hit + c.fill + c.plain;
+        fprintf(stderr, "[moe-cpu-split] r8 host cache: %llu card jobs, AI+ host projections hit %llu fill %llu plain %llu (hit %.1f%%)\n",
+                c.jobs, c.hit, c.fill, c.plain, tot ? 100.0 * c.hit / tot : 0.0);
+    }
+}
+
+// one 16-row slab of an AI+ q8 projection by the job's plan (rows [a, a + 16), needs b == a + 16 for modes 1/2)
+static inline void r8_proj(const pool_state & s, const role_math & m, int i, int k, const char * w, int64_t a, int64_t b, int nt,
+                           const void * const * q, float * const * o) {
+    switch (b - a == AI4_TR ? s.r8m[i][k] : 0) {
+        case 1:  moe_ai::slab_rows_r8(s.r8p[i][k], a, m.r.n_out, m.r.n_in, nt, q, o); return;
+        case 2:  moe_ai::slab_rows_q8_keep(w, m.r.row_bytes, m.ai_k, m.ai_C, a, m.r.n_out, m.r.n_in, nt, q, o, s.r8p[i][k]); return;
+        default: moe_ai::slab_rows_q8(w, m.r.row_bytes, m.ai_k, m.ai_C, a, b, m.r.n_in, nt, q, o);
+    }
+}
+
 void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) {
     const layer_math & L = *s.cur;
     uint8_t * const xq = xq_mine ? xq_mine : s.xq.data();
@@ -615,6 +774,49 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
         const int64_t r0 = (int64_t) (item % blocks) * s.rows_ug, r1 = std::min<int64_t>(r0 + s.rows_ug, up.r.n_out);
         const int e = s.expert[i];
         const size_t xg = L.shared_input ? 0 : (size_t) MOE_CS_MAX_ROUTES;
+        if (up.ai) {
+            // fork AIPFIX D2: 16-row AI+ slabs, up to 8 tokens per slab decode
+            moe_ai_log_first("gate/up");
+            const char * wu = role_row(s, up, e, 0);
+            const char * wg = role_row(s, gate, e, 0);
+            for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 8) {
+                const int nt = std::min(8, s.first[i + 1] - q0);
+                const float * yu[8];
+                const float * yg[8];
+                const void * qu[8];
+                const void * qg[8];
+                for (int t = 0; t < nt; ++t) {
+                    const int q = s.input_of[q0 + t];
+                    qu[t] = xq + (size_t) q * s.xq_stride;
+                    qg[t] = xq + (xg + q) * s.xq_stride;
+                    yu[t] = (const float *) qu[t];
+                    yg[t] = (const float *) qg[t];
+                }
+                for (int64_t a = r0; a < r1; a += AI4_TR) {
+                    const int64_t b = std::min<int64_t>(a + AI4_TR, r1);
+                    float ub[8][AI4_TR] = {}, gb[8][AI4_TR] = {};
+                    float * uo[8], * go[8];
+                    for (int t = 0; t < nt; ++t) { uo[t] = ub[t]; go[t] = gb[t]; }
+                    if (wu && wg) { GGML_ASSERT(gate.ai_q8 == up.ai_q8); } // gate reads the up activation format
+                    if (wu && wg && up.ai_q8) {
+                        r8_proj(s, up, i, 0, wu, a, b, nt, qu, uo);
+                        r8_proj(s, gate, i, 1, wg, a, b, nt, qg, go);
+                    } else if (wu && wg) {
+                        moe_ai::slab_rows(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, yu, uo);
+                        moe_ai::slab_rows(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, yg, go);
+                    }
+                    for (int t = 0; t < nt; ++t) {
+                        float * h = s.hidden.data() + (size_t) (q0 + t) * s.max_ff + a;
+                        for (int64_t row = a; row < b; ++row) {
+                            const float u = ub[t][row - a], g = gb[t][row - a];
+                            h[row - a] = g / (1.0f + expf(-g)) * u;
+                        }
+                    }
+                }
+            }
+            if (!wu || !wg) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
+            return;
+        }
 #if defined(MOE_IQ_ROWS)
         if (up.rows[4] && gate.rows[4]) {
             // Decode once for each token group; AVX-512 uses a different valid float reduction order.
@@ -692,6 +894,36 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
     const int i = item / blocks;
     const int64_t r0 = (int64_t) (item % blocks) * s.rows_down, r1 = std::min<int64_t>(r0 + s.rows_down, down.r.n_out);
     const int e = s.expert[i];
+    if (down.ai) {
+        // fork AIPFIX D2: 16-row AI+ slabs of the rotated hidden rows
+        moe_ai_log_first("down");
+        const char * w = role_row(s, down, e, 0);
+        for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += 8) {
+            const int nt = std::min(8, s.first[i + 1] - q0);
+            const float * y[8];
+            const void * yq[8];
+            float * o[8];
+            for (int t = 0; t < nt; ++t) {
+                yq[t] = s.hq.data() + (size_t) (q0 + t) * s.hq_stride;
+                y[t] = (const float *) yq[t];
+                o[t] = s.out + (size_t) (q0 + t) * s.out_stride;
+            }
+            for (int64_t a = r0; a < r1; a += AI4_TR) {
+                const int64_t b = std::min<int64_t>(a + AI4_TR, r1);
+                float * oa[8];
+                for (int t = 0; t < nt; ++t) { oa[t] = o[t] + a; }
+                if (w && down.ai_q8) {
+                    r8_proj(s, down, i, 2, w, a, b, nt, yq, oa);
+                } else if (w) {
+                    moe_ai::slab_rows(w, down.r.row_bytes, down.ai_k, down.ai_C, a, b, down.r.n_in, nt, y, oa);
+                } else {
+                    for (int t = 0; t < nt; ++t) { for (int64_t row = a; row < b; ++row) { oa[t][row - a] = 0.0f; } }
+                }
+            }
+        }
+        if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
+        return;
+    }
     if (s.q2_fast && down.q2) {
         const char * w = role_row(s, down, e, r0);
         for (int q = s.first[i]; q < s.first[i + 1];) {
@@ -1136,6 +1368,7 @@ void leader_main(pool_state * sp, int cpu) {
                 s.input_of[q] = input;
                 if (input == q) { s.inputs[s.n_input++] = q; }
             }
+            r8_plan(s, layer, card);
             ++n;
             const unsigned long long tag = (n & item_low) << 32;
             if (s.flow) {
@@ -1200,9 +1433,9 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     ggml_cpu_init();
     s.job = job; s.x = x; s.out = out; s.x_stride = x_stride; s.out_stride = out_stride;
     s.max_ff = max_ff; s.max_embd = max_embd;
-    // Quantized rows are never larger than the f32 rows they come from.
-    s.xq_stride = GGML_PAD((size_t) max_embd * sizeof(float), 64);
-    s.hq_stride = GGML_PAD((size_t) max_ff * sizeof(float), 64);
+    // Quantized rows are never larger than the f32 rows they come from, except the AI+ q8 rows (int16 pairs + scales).
+    s.xq_stride = GGML_PAD(std::max((size_t) max_embd * sizeof(float), moe_ai::use_host_q8() ? moe_ai::q8_bytes(max_embd) : 0), 64);
+    s.hq_stride = GGML_PAD(std::max((size_t) max_ff * sizeof(float), moe_ai::use_host_q8() ? moe_ai::q8_bytes(max_ff) : 0), 64);
     const bool align = env_int("GGML_MOE_CPU_SPLIT_ALIGN", 0, 0, 1) != 0;
     s.xq.assign(2 * MOE_CS_MAX_ROUTES * s.xq_stride, 0, align);
     s.hidden.assign((size_t) MOE_CS_MAX_ROUTES * max_ff, 0.0f, align);
@@ -1216,6 +1449,8 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.q8_reuse = env_int("GGML_MOE_CPU_SPLIT_Q8_REUSE", 1, 0, 1) != 0;
     s.down_reuse = env_int("GGML_MOE_CPU_SPLIT_DOWN_REUSE", 1, 0, 1) != 0;
     s.group_tokens = env_int("GGML_MOE_CPU_SPLIT_REUSE8", 1, 0, 1) ? 8 : 4;
+    s.r8_mb = moe_ai::use_host_q8() ? env_int("GGML_MOE_AI_HOST_R8_MB", 0, -1, 1 << 20) : 0;
+    s.r8_every = env_int("GGML_MOE_AI_HOST_R8_STATS", 16384, 1, 1 << 30);
 #if defined(MOE_CS_AVX512)
     s.avx512 = env_int("GGML_MOE_CPU_SPLIT_AVX512", 1, 0, 1) != 0 && cpu_has_avx512_vnni();
 #endif
@@ -1248,8 +1483,26 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     }
     // Reserve the caller's actual core and keep the card-driving thread on it.
     const bool max_threads = env_int("GGML_MOE_CPU_SPLIT_MAX_THREADS", 1, 0, 1) != 0;
+    // GGML_CPU_CARD_FENCE=1 (default): the card-driving thread is not held on one logical cpu. Pinned to one cpu, any
+    // other runnable task there (a browser tab, a compile) time-slices it and the card sits idle (home test 11-05,
+    // 3 busy loops on that core: 41.8 vs 24.3 ms/round). The pool still skips the card's core; once the pool cpus are
+    // known, the card thread may run on every allowed cpu that has no pool thread. 0 = the old single-cpu pin.
+    const bool card_fence = env_int("GGML_CPU_CARD_FENCE", 1, 0, 1) != 0;
+    (void) card_fence;
 #if defined(__linux__)
-    if (max_threads) { pin_thread(sched_getcpu()); }
+    cpu_set_t card_allowed;
+    const bool have_allowed = pthread_getaffinity_np(pthread_self(), sizeof(card_allowed), &card_allowed) == 0;
+    if (max_threads) {
+        int home = sched_getcpu();
+        if (card_fence) {
+            // With the fence on, ggml no longer pins its main thread under GGML_CPU_EXPERT_PIN=1 (ggml-cpu.c). Reserve
+            // the core that pin used (the second physical core) so the pool layout stays the same.
+            const char * ep0 = getenv("GGML_CPU_EXPERT_PIN");
+            const std::vector<int> c0 = core_leaders();
+            if (ep0 && strcmp(ep0, "1") == 0 && c0.size() > 2 && have_allowed && CPU_ISSET(c0[1], &card_allowed)) { home = c0[1]; }
+        }
+        pin_thread(home);
+    }
 #endif
     // One thread per physical core, never an SMT sibling, never core 0 (the OS and the desktop) and never the
     // core of the thread that drives the card: a spinning pool thread sharing a core with it is time-sliced in
@@ -1343,8 +1596,24 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         s.xq_own_stride = 2 * MOE_CS_MAX_ROUTES * s.xq_stride;
         s.xq_own.assign((size_t) s.threads * s.xq_own_stride, 0);
     }
+    // Experts computed here use CPU int8 dot products, which sum in a different order than the GPU kernel. Which
+    // experts land here follows expert-cache timing, so reruns may differ in last-digit rounding (quality unchanged).
+    // On the bank path LLAMA_MOE_BANK_DET=1 gives identical reruns.
     const bool pin = env_int("GGML_MOE_CPU_SPLIT_PIN", 1, 0, 1) != 0 && !avail.empty();
     auto cpu_of = [&](int i) { return pin ? avail[(size_t) i % avail.size()] : -1; };
+    std::string card_where;
+#if defined(__linux__)
+    if (max_threads && card_fence && pin && have_allowed && !s.host_help) {
+        // widen the card thread from its reserved cpu to every allowed cpu that no pool thread is pinned to
+        cpu_set_t m = card_allowed;
+        for (int i = 0; i < s.threads; ++i) { CPU_CLR(cpu_of(i), &m); }
+        if (CPU_COUNT(&m) > 1 && pthread_setaffinity_np(pthread_self(), sizeof(m), &m) == 0) {
+            for (int c = 0; c < CPU_SETSIZE; ++c) {
+                if (CPU_ISSET(c, &m)) { card_where += (card_where.empty() ? "" : ",") + std::to_string(c); }
+            }
+        }
+    }
+#endif
     s.running = true;
     s.workers.emplace_back(leader_main, &s, cpu_of(0));
     for (int i = 1; i < s.threads; ++i) {
@@ -1356,6 +1625,7 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     fprintf(stderr, "[moe-cpu-split] pool: %d threads, %s%s (skipped cores at cpus %s), spin %d us, nap %d us, rows up/gate %d down %d%s%s%s\n",
             s.threads, pin ? "pinned to cpus " : "unpinned", where.c_str(), skipped.c_str(), s.spin_us, s.nap_us, s.rows_ug, s.rows_down,
             s.q2_fast ? ", Q2_0 down fast path" : "", smt ? ", SMT siblings" : "", s.avx512 ? ", grouped AVX-512 VNNI IQ" : "");
+    if (!card_where.empty()) { fprintf(stderr, "[moe-cpu-split] card thread may run on cpus %s (GGML_CPU_CARD_FENCE=1)\n", card_where.c_str()); }
     if (align) { fprintf(stderr, "[moe-cpu-split] scratch rows start on 64-byte lines (GGML_MOE_CPU_SPLIT_ALIGN)\n"); }
     if (s.q2_pair && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across route pairs\n"); }
     if (s.q2_group4 && s.q2_fast) { fprintf(stderr, "[moe-cpu-split] Q2_0 down shares weights across three/four-route groups\n"); }
@@ -1410,6 +1680,26 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
         ok = m.r.src != nullptr && m.r.type >= 0 && m.r.type < GGML_TYPE_COUNT;
         if (!ok) { break; }
         const ggml_type t = (ggml_type) m.r.type;
+        if (ggml_ai4_is_unit(t)) {
+            // fork AIPFIX D2: AI+ unit experts; inputs are rotated into the weights' basis instead of quantized
+            m.ai = true;
+            m.ai_k = ggml_ai4_rate(t);
+            m.ai_C = ggml_ai4_trellis_mul(t);
+            m.vec_type = GGML_TYPE_F32;
+            m.quant = moe_ai::rotate;
+            m.vec_bytes = (size_t) m.r.n_in * sizeof(float);
+            if (moe_ai::use_host_q8() && m.r.n_in <= 8192) {   // rotate_q8's stack row holds 8192 floats
+                m.ai_q8 = true;
+                m.quant = moe_ai::rotate_q8;
+                m.vec_bytes = moe_ai::q8_bytes(m.r.n_in);
+            }
+            // U2 row-scale types (K % 640) are read by block (moe_ai::unit_src); the row size must give the type's layout,
+            // or the host would walk U2 bytes as U units (wrong outputs, not a crash). AIF25 (rate 25) stays off the host split.
+            ok = m.ai_k >= 2 && m.ai_k <= 5 && m.r.n_in % AI4U_UK == 0 && m.r.n_out % AI4_TR == 0 &&
+                 m.r.row_bytes == ggml_row_size(t, m.r.n_in) && s.rows_ug % AI4_TR == 0 && s.rows_down % AI4_TR == 0 &&
+                 (ggml_ai4v2_rate(t) != 0) == moe_ai::slab_is_v2(m.r.row_bytes, m.ai_k, m.r.n_in);
+            continue;
+        }
         const auto * tr = ggml_get_type_traits_cpu(t);
         ok = tr && tr->vec_dot && m.r.n_in % ggml_blck_size(t) == 0 && m.r.row_bytes == ggml_row_size(t, m.r.n_in);
         if (!ok) { break; }
@@ -1439,12 +1729,14 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
              (!m.q2 || m.vec_type == GGML_TYPE_Q8_0);
         m.vec_bytes = ok ? ggml_row_size(m.vec_type, m.r.n_in) : 0;
     }
+    ok = ok && L.role[0].ai == L.role[1].ai;
     L.ok = ok;
     L.shared_input = ok && L.role[0].vec_type == L.role[1].vec_type;
     if ((int) s.layers.size() <= layer) { s.layers.resize(layer + 1); }
     // The pool reads the layer table only while a card job is in flight; registration happens at session
     // preparation, outside any graph, so no job is running.
     s.layers[layer] = L;
+    s.r8_reset = true;
     return ok;
 }
 
@@ -1479,7 +1771,9 @@ static double moe_cs_runq_wait_ns() {
 #endif
 }
 
-bool moe_cs_probe(double * route_ns, double * fixed_ns) {
+static bool moe_cs_probe_layer(int layer, double * route_ns, double * fixed_ns);
+
+bool moe_cs_probe(double * route_ns, double * fixed_ns, int * timed_layer) {
     pool_state & s = P();
     int layer = -1;
     {
@@ -1490,6 +1784,29 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
         }
     }
     if (layer < 0) { return false; }
+    const bool ok = moe_cs_probe_layer(layer, route_ns, fixed_ns);
+    if (timed_layer) { *timed_layer = layer; }
+    // AIPFAST: GGML_MOE_CPU_SPLIT_PROBE_LAYERS=20,31 also probes those layers (log only; the planner keeps the first
+    // probe), e.g. to time host misses of an AI+ layer next to a 3XS one in the same process.
+    if (const char * e = getenv("GGML_MOE_CPU_SPLIT_PROBE_LAYERS")) {
+        for (const char * c = e; *c; ) {
+            const int l = atoi(c);
+            bool usable;
+            {
+                std::lock_guard<std::mutex> lock(s.mu);
+                usable = l >= 0 && l < (int) s.layers.size() && s.layers[l].ok;
+            }
+            double r = 0.0, f = 0.0;
+            if (!usable || !moe_cs_probe_layer(l, &r, &f)) { fprintf(stderr, "[moe-cpu-split] extra probe on layer %d: not available\n", l); }
+            while (*c && *c != ',') { ++c; }
+            if (*c == ',') { ++c; }
+        }
+    }
+    return ok;
+}
+
+static bool moe_cs_probe_layer(int layer, double * route_ns, double * fixed_ns) {
+    pool_state & s = P();
     const layer_math & L = s.layers[layer];
     // Experts with a host source; the probe reads real weights. Enough of them (64 x ~2 MB) that the rotation
     // below reads from memory, not from the last-level cache, as a decode's missed experts do.
@@ -1579,6 +1896,25 @@ bool moe_cs_probe(double * route_ns, double * fixed_ns) {
     return true;
 }
 
+// AIPFIX per-type probe (GGML_MOE_CPU_SPLIT_PROBE_PER_TYPE=1): the host types a registered layer computes with, and a
+// probe of that layer alone (pool idle, as moe_cs_probe).
+bool moe_cs_layer_types(int layer, int types[3]) {
+    pool_state & s = P();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (layer < 0 || layer >= (int) s.layers.size() || !s.layers[layer].ok) { return false; }
+    for (int k = 0; k < 3; ++k) { types[k] = s.layers[layer].role[k].r.type; }
+    return true;
+}
+
+bool moe_cs_probe_at(int layer, double * route_ns, double * fixed_ns) {
+    pool_state & s = P();
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (!s.running || layer < 0 || layer >= (int) s.layers.size() || !s.layers[layer].ok) { return false; }
+    }
+    return moe_cs_probe_layer(layer, route_ns, fixed_ns);
+}
+
 bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int reps, double * ns_per_job,
         double phase_ns[4]) {
     pool_state & s = P();
@@ -1662,5 +1998,225 @@ bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t 
 #else
     (void) type; (void) nt; (void) w; (void) row_bytes; (void) r0; (void) r1; (void) n_in; (void) y; (void) out; (void) prefetch; (void) variant; (void) wide;
     return false;
+#endif
+}
+
+// AIPFAST route 2 (see moe-cpu-split.h): host-only copies of routed-expert tensors from other model files.
+// With every cache slot in AI+ bytes, a host miss would run the AI+ trellis decode (about 2.5x the IQ row kernels
+// on an AVX2 desktop). The base file still holds each expert's 3XS bytes; the pool computes its misses from those
+// (same math as the ship stack's host misses) while the card keeps the AI+ bytes. Pages load on first use and stay
+// in the page cache; nothing here is pinned.
+#include "gguf.h"
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+namespace {
+struct host_alt_file {
+    std::string path;
+    gguf_context * g = nullptr;
+    ggml_context * ctx = nullptr;
+    const char * base = nullptr;
+    size_t size = 0;
+};
+struct host_alt_store {
+    std::mutex mu;
+    bool opened = false;
+    std::vector<host_alt_file> files;
+    std::vector<std::vector<const void *>> srcs;   // kept alive for the pool's role tables
+    std::vector<std::pair<std::string, moe_cs_role>> found;   // one entry per tensor name (sessions re-register)
+    std::vector<std::pair<const char *, size_t>> ranges;      // mapped bytes of each kept tensor (warm-up)
+    std::map<std::string, std::pair<const char *, size_t>> pending;   // found, not yet kept by moe_cs_host_alt_keep
+    std::map<int, bool> layer_kept;                           // per layer: 3XS copy kept (true) or over budget (false)
+    double budget = -1.0;                                     // bytes left for kept copies (-1 = not set yet)
+    bool warmed = false;
+};
+// MemAvailable in bytes (0 if unreadable)
+double host_alt_mem_avail() {
+    long long avail_kib = -1;
+    if (FILE * fp = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) { if (sscanf(line, "MemAvailable: %lld kB", &avail_kib) == 1) { break; } }
+        fclose(fp);
+    }
+    return avail_kib > 0 ? avail_kib * 1024.0 : 0.0;
+}
+double host_alt_floor_gib() {
+    const char * fe = getenv("GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB");
+    return std::max(5.0, fe && fe[0] ? atof(fe) : 5.0);
+}
+host_alt_store & HA() { static host_alt_store s; return s; }
+}
+
+bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_expert, moe_cs_role * out) {
+#if defined(__linux__)
+    const char * env = getenv("GGML_MOE_CPU_SPLIT_HOST_GGUF");
+    if (!env || !env[0] || !name || !out) { return false; }
+    host_alt_store & h = HA();
+    std::lock_guard<std::mutex> lock(h.mu);
+    if (!h.opened) {
+        h.opened = true;
+        std::string all(env);
+        for (size_t a = 0; a <= all.size();) {
+            size_t b = all.find(',', a);
+            if (b == std::string::npos) { b = all.size(); }
+            const std::string path = all.substr(a, b - a);
+            a = b + 1;
+            if (path.empty()) { continue; }
+            host_alt_file f;
+            f.path = path;
+            gguf_init_params ip = { /*.no_alloc = */ true, /*.ctx = */ &f.ctx };
+            f.g = gguf_init_from_file(path.c_str(), ip);
+            const int fd = f.g ? open(path.c_str(), O_RDONLY) : -1;
+            struct stat st = {};
+            if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+                void * m = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+                if (m != MAP_FAILED) { f.base = (const char *) m; f.size = (size_t) st.st_size; }
+            }
+            if (fd >= 0) { close(fd); }
+            fprintf(stderr, "[moe-cpu-split] host 3XS source %s: %s\n", path.c_str(), f.base ? "mapped" : "FAILED (not used)");
+            if (f.base) { h.files.push_back(f); }
+        }
+    }
+    for (const auto & fr : h.found) {
+        if (fr.first == name && fr.second.n_in == n_in && fr.second.n_out == n_out && fr.second.n_expert == n_expert) {
+            *out = fr.second;
+            return true;
+        }
+    }
+    // the loader already checked that these files are the base model (llama-model-loader: host 3XS source check)
+    for (const host_alt_file & f : h.files) {
+        const int64_t id = gguf_find_tensor(f.g, name);
+        const ggml_tensor * t = id >= 0 ? ggml_get_tensor(f.ctx, name) : nullptr;
+        if (!t) { continue; }
+        const ggml_type type = t->type;
+        const size_t rb = ggml_row_size(type, t->ne[0]);
+        const size_t off = gguf_get_data_offset(f.g) + gguf_get_tensor_offset(f.g, id);
+        const size_t eb = rb * (size_t) t->ne[1];
+        if (t->ne[0] != n_in || t->ne[1] != n_out || t->ne[2] != n_expert || t->ne[3] != 1 ||
+                off + eb * (size_t) n_expert > f.size || ggml_ai4_is_unit(type)) {
+            fprintf(stderr, "[moe-cpu-split] host 3XS source: %s in %s has another shape or an AI+ type, trying the next file\n",
+                    name, f.path.c_str());
+            continue;
+        }
+        std::vector<const void *> src((size_t) n_expert);
+        for (int64_t e = 0; e < n_expert; ++e) { src[(size_t) e] = f.base + off + (size_t) e * eb; }
+        h.srcs.push_back(std::move(src));
+        out->type = (int) type;
+        out->n_in = n_in;
+        out->n_out = n_out;
+        out->n_expert = n_expert;
+        out->row_bytes = rb;
+        out->src = h.srcs.back().data();
+        h.found.emplace_back(name, *out);
+        h.pending[name] = { f.base + off, eb * (size_t) n_expert };
+        return true;
+    }
+    fprintf(stderr, "[moe-cpu-split] host 3XS source: %s not found (with this shape) in GGML_MOE_CPU_SPLIT_HOST_GGUF; "
+            "this layer's host misses keep the AI+ decode\n", name);
+    return false;
+#else
+    (void) name; (void) n_in; (void) n_out; (void) n_expert; (void) out;
+    return false;
+#endif
+}
+
+bool moe_cs_host_alt_keep(int layer, const char * const names[3]) {
+#if defined(__linux__)
+    host_alt_store & h = HA();
+    std::lock_guard<std::mutex> lock(h.mu);
+    if (const auto it = h.layer_kept.find(layer); it != h.layer_kept.end()) { return it->second; }
+    size_t bytes = 0;
+    for (int k = 0; k < 3; ++k) {
+        const auto it = h.pending.find(names[k]);
+        if (it == h.pending.end()) { return false; }
+        bytes += it->second.second;
+    }
+    const double gib = 1024.0*1024.0*1024.0;
+    const char * fit = getenv("GGML_MOE_CPU_SPLIT_HOST_FIT");
+    const bool fit_on = !(fit && fit[0] == '0');
+    if (fit_on && h.budget < 0.0) {
+        // budget: GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB, else MemAvailable minus the warm-up floor (5 GiB default, min 5; Jake RAM rule)
+        const char * be = getenv("GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB");
+        h.budget = be && be[0] ? std::max(0.0, atof(be)) * 1024.0 * 1024.0
+                               : std::max(0.0, host_alt_mem_avail() - host_alt_floor_gib() * gib);
+        fprintf(stderr, "[moe-cpu-split] host 3XS copies: RAM budget %.2f GiB (%s); layers past it keep the AI+ decode\n",
+                h.budget / gib, be && be[0] ? "GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB" : "MemAvailable minus floor");
+    }
+    if (fit_on && (double) bytes > h.budget) {
+        h.layer_kept[layer] = false;
+        fprintf(stderr, "[moe-cpu-split] layer %d: host 3XS copy (%.2f GiB) over the RAM budget (%.2f GiB left), "
+                "host misses keep the AI+ decode\n", layer, bytes / gib, h.budget / gib);
+        return false;
+    }
+    if (fit_on) { h.budget -= (double) bytes; }
+    for (int k = 0; k < 3; ++k) { h.ranges.push_back(h.pending[names[k]]); }
+    h.layer_kept[layer] = true;
+    return true;
+#else
+    (void) layer; (void) names;
+    return false;
+#endif
+}
+
+double moe_cs_host_alt_warm() {
+#if defined(__linux__)
+    host_alt_store & h = HA();
+    std::lock_guard<std::mutex> lock(h.mu);
+    size_t total = 0;
+    for (const auto & r : h.ranges) { total += r.second; }
+    if (total == 0 || h.warmed) { return 0.0; }
+    h.warmed = true;
+    const double gib = 1024.0*1024.0*1024.0;
+    const char * e = getenv("GGML_MOE_CPU_SPLIT_HOST_WARM");
+    if (e && e[0] == '0') {
+        fprintf(stderr, "[moe-cpu-split] host 3XS warm-up off (GGML_MOE_CPU_SPLIT_HOST_WARM=0): %.2f GiB cold, first misses read the disk\n",
+                total / gib);
+        return 0.0;
+    }
+    // budget: MemAvailable minus the 5 GiB floor (GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB raises it); ranges in layer order
+    const double target_gib = host_alt_floor_gib();
+    const double avail = host_alt_mem_avail();
+    double budget = std::max(0.0, avail - target_gib * gib);
+    size_t warmed = 0;
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    for (const auto & r : h.ranges) {
+        if ((double) (warmed + r.second) > budget) { break; }
+        const uintptr_t b = (uintptr_t) r.first & ~(uintptr_t) (page - 1);
+        const size_t len = (uintptr_t) r.first + r.second - b;
+        if (madvise((void *) b, len, MADV_WILLNEED) == 0) { warmed += r.second; }
+    }
+    fprintf(stderr, "[moe-cpu-split] host 3XS warm-up: %.2f of %.2f GiB queued for reading (MemAvailable %.2f GiB, keeps %.1f GiB free); "
+            "%.2f GiB stay cold (misses there read the disk)%s\n", warmed / gib, total / gib, avail / gib, target_gib,
+            (total - warmed) / gib, warmed < total ? " - WARNING: not all host 3XS bytes fit in RAM" : "");
+    // WILLNEED only fills the page cache; this mapping's page tables stay empty, so each first touch on the miss path
+    // still took a page fault (Taichi h arm, aipfast-r2k: 144 us per host route measured vs 29 us probed). Fault the
+    // warmed ranges in now, at load, the same way the model's own map uses MAP_POPULATE.
+    // GGML_MOE_CPU_SPLIT_HOST_POPULATE=0 keeps the lazy faults.
+#if !defined(MADV_POPULATE_READ)
+#define MADV_POPULATE_READ 22
+#endif
+    const char * pe = getenv("GGML_MOE_CPU_SPLIT_HOST_POPULATE");
+    if (warmed > 0 && !(pe && pe[0] == '0')) {
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t done = 0, left = warmed;
+        bool ok = true;
+        for (const auto & r : h.ranges) {
+            if (r.second > left) { break; }
+            left -= r.second;
+            const uintptr_t b = (uintptr_t) r.first & ~(uintptr_t) (page - 1);
+            const size_t len = (uintptr_t) r.first + r.second - b;
+            if (madvise((void *) b, len, MADV_POPULATE_READ) == 0) { done += r.second; } else { ok = false; break; }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "[moe-cpu-split] host 3XS copies mapped in: %.2f of %.2f GiB in %.0f ms%s\n", done / gib, warmed / gib, ms,
+                ok ? "" : " (MADV_POPULATE_READ failed: older kernel? the rest fault in on first use)");
+    }
+    return warmed / gib;
+#else
+    return 0.0;
 #endif
 }

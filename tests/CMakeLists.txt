@@ -510,10 +510,13 @@ llama_build(test-moe-prefetch-model.cpp)
 llama_build(test-kq-mask-host.cpp)   # host-KV KQ mask: -ngl 0 logits finite and equal to LLAMA_KQ_MASK_DEVICE=0 (gate runs it twice)
 
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-moe-r2-plan.cpp)   # route 2: card slots sized by real AI+ bytes
 llama_build_and_test(test-moe-expert-keep.cpp) # [#215/#217] CPU-only expert keep policy
 llama_build_and_test(test-decode-phase.cpp)     # one-shot decode tag gates the #217 trunk keep map
 llama_build_and_test(test-fit-extra.cpp)
 llama_build_and_test(test-moe-bank.cpp)
+llama_build_and_test(test-moe-ai-rows.cpp)   # fork AIPFIX D2: host AI+ slab kernel vs reference
+llama_build_and_test(test-moe-cs-plan.cpp)   # fork AIPFIX: CPU-split planner greedy step + per-type probe cost table
 
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
@@ -636,6 +639,7 @@ endif()
 llama_build_and_test(test-gdn-conv-norm.cpp)
 set_tests_properties(test-gdn-conv-norm PROPERTIES SKIP_RETURN_CODE 77)
 llama_build_and_test(test-ait-format.cpp)
+llama_build_and_test(test-gguf-deprecated-ai.cpp)
 
 if (GGML_CUDA)
     enable_language(CUDA)

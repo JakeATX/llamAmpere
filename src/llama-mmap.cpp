@@ -474,7 +474,7 @@ size_t llama_mmap_prefetch_budget(uint64_t available) {
     if (available <= (5ull << 30)) { return 0; }
     const uint64_t spare = (available - (5ull << 30)) / MiB;
     const uint64_t budget = (spare / 5) * 4 + (spare % 5) * 4 / 5;
-    return size_t(std::min<uint64_t>(budget / 10, SIZE_MAX / MiB)) * size_t(MiB);
+    return size_t(std::min<uint64_t>(budget, SIZE_MAX / MiB)) * size_t(MiB);
 }
 
 size_t llama_mmap_prefetch_take(size_t & remaining, size_t requested) {

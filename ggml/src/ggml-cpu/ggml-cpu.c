@@ -17,6 +17,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "ggml-ai4.h"
+#include "ggml-ai4-decode.h"
 #include "tiled/tiled.h"
 #include "exl3.h"
 
@@ -371,6 +372,30 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_AIT2_U] = {
         .from_float               = NULL,
         .vec_dot                  = NULL, // whole-operation unit reference path
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AIT2P_U] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // whole-operation unit reference path
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AIT2_U2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // no CPU op yet (reference decode in ggml-ai4.h)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AIT3_U2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // no CPU op yet (reference decode in ggml-ai4.h)
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_AIT4_U2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // no CPU op yet (reference decode in ggml-ai4.h)
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
@@ -1603,7 +1628,7 @@ static void ggml_compute_forward_mul_mat_ai4(
     float * wbuf = (float *) params->wdata + (size_t) ith * 16 * K;
 
     for (int64_t g = ith; g < ng; g += nth) {
-        aik_dequantize_slab_c(aik, aimul, (const uint8_t *) src0->data + g * ai4x_slab_bytes_k(K, aik), wbuf, K);
+        ggml_ai4_dequantize_slab(src0->type, src0->data, K, g, wbuf); (void) aimul;
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
@@ -1677,7 +1702,7 @@ static void ggml_compute_forward_mul_mat_id_ai4(
         }
         const uint8_t * w = (const uint8_t *) src0->data + e*nb02;
         for (int64_t g = ith; g < ng; g += nth) {
-            aik_dequantize_slab_c(aik, aimul, w + g * ai4x_slab_bytes_k(K, aik), wbuf, K);
+            ggml_ai4_dequantize_slab(src0->type, w, K, g, wbuf); (void) aimul;
             for (int64_t t = 0; t < n_tok; ++t) {
                 for (int64_t s = 0; s < n_ids; ++s) {
                     if (*(const int32_t *) ((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]) != e) {
@@ -2266,6 +2291,11 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 }
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                // Mixed hot banks use -1 for zero-weight IQ4_NL filler rows.
+                if (type == GGML_TYPE_IQ4_NL && i02 == -1) {
+                    memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
+                    continue;
+                }
                 assert(i02 >= 0 && i02 < n_as);
 
                 // keep_skip is zero unless this node has at most 64 routed rows. A wider prefill
@@ -4512,6 +4542,14 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 
 #endif // GGML_USE_OPENMP
 
+// GGML_CPU_CARD_FENCE=1 (default): under GGML_CPU_EXPERT_PIN the calling thread (it drives the GPU) is not pinned to
+// one cpu, so another busy process on that cpu cannot time-slice it; the CUDA CPU-split pool then lets it run on every
+// cpu without a pool thread (moe-cpu-split.cpp). 0 = the old strict pin of the calling thread.
+static bool ggml_cpu_card_fence(void) {
+    const char * env = getenv("GGML_CPU_CARD_FENCE");
+    return !env || strcmp(env, "0") != 0;
+}
+
 static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool_params * tpp,
                struct ggml_cgraph * cgraph,
@@ -4566,6 +4604,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     for (int j = 0; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
     }
+    if (expert_pinned && ggml_cpu_card_fence()) { memset(workers[0].cpumask, 0, sizeof(workers[0].cpumask)); }
 #else // GGML_USE_OPENMP
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
@@ -4583,6 +4622,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     }
 
     ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+    if (expert_pinned && ggml_cpu_card_fence()) { memset(workers[0].cpumask, 0, sizeof(workers[0].cpumask)); }
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume

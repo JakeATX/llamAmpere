@@ -653,7 +653,7 @@ private:
     // [B1] layer-major prefill (LLAMA_B1=1, opt-in; see llama-b1.h). Declared after the backends so it is
     // destroyed first; the destructor also resets it explicitly.
     std::unique_ptr<llama_b1> b1;
-    // [PLEPF] PLE page prefetch (LLAMA_PLE_PREFETCH=<threads>, opt-in; see llama-ple-prefetch.h)
+    // [PLEPF] PLE page prefetch (LLAMA_PLE_PREFETCH=<threads>, default 4, 0 = off; see llama-ple-prefetch.h)
     std::unique_ptr<llama_ple_prefetch> ple_pf;
     bool ple_pf_tried = false;
     void ple_pf_init();

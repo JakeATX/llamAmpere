@@ -47,7 +47,12 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]);
 bool moe_cs_layer_ok(int layer);
 // Times host jobs on a registered layer (the pool must be idle: no card job in flight). Fills the cost of one
 // (expert, route) pair and the fixed cost of a job, in nanoseconds. False when no layer is registered.
-bool moe_cs_probe(double * route_ns, double * fixed_ns);
+// timed_layer (optional) gets the layer the costs belong to.
+bool moe_cs_probe(double * route_ns, double * fixed_ns, int * timed_layer = nullptr);
+// AIPFIX per-type probe: host types (up, gate, down) of a registered layer; false when it is not registered.
+bool moe_cs_layer_types(int layer, int types[3]);
+// Probe of one registered layer (pool idle), same output as moe_cs_probe. False when the layer cannot be probed.
+bool moe_cs_probe_at(int layer, double * route_ns, double * fixed_ns);
 // Bench (tests only, pool idle): runs `reps` host jobs of `n_exp` experts (one route each) on `layer`, taking the
 // experts in turn from `experts[0..n_list)`. Fills the mean ns per job and the mean ns per phase.
 bool moe_cs_bench(int layer, const int * experts, int n_list, int n_exp, int reps, double * ns_per_job,
@@ -65,3 +70,17 @@ bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t 
 // arm. False when the build or the type has no row kernel.
 bool moe_cs_iq_unpack(int type, const void * block, int c, bool joined, unsigned char * mag, signed char * sgn, int * mul);
 int moe_cs_threads();
+// AIPFAST route 2: GGML_MOE_CPU_SPLIT_HOST_GGUF=a.gguf[,b.gguf...] names model files (normally the 3XS base the AI+
+// patch overlays) whose copy of tensor `name` the host computes its misses from instead of the cache's own bytes.
+// The files are mapped read-only (page cache, no pinned RAM). Fills `out` (type, shape, row bytes, per-expert
+// sources) when the tensor exists with the given shape and the host can read its type; false otherwise.
+bool moe_cs_host_alt(const char * name, int64_t n_in, int64_t n_out, int64_t n_expert, moe_cs_role * out);
+// Per layer, after moe_cs_host_alt found all three tensors: keep this layer's 3XS copy only if its bytes fit the RAM
+// budget left (GGML_MOE_CPU_SPLIT_HOST_BUDGET_MB, else MemAvailable minus the warm-up floor at the first call), so no
+// host miss reads the disk; layers past the budget keep the AI+ decode. Same answer on re-registration.
+// GGML_MOE_CPU_SPLIT_HOST_FIT=0 keeps every layer (the old behavior). Only kept layers are warmed.
+bool moe_cs_host_alt_keep(int layer, const char * const names[3]);
+// Once after registration: madvise(WILLNEED) the found tensors in layer order while MemAvailable stays above 5 GiB
+// (GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB, min 5; GGML_MOE_CPU_SPLIT_HOST_WARM=0 skips). Logs warmed vs cold GiB;
+// returns the GiB queued.
+double moe_cs_host_alt_warm();

@@ -295,9 +295,9 @@ int main() {
     constexpr size_t MiB = 1u << 20;
     for (uint64_t host : {16, 32, 64, 128}) {
         const uint64_t available = (host - 6) * GiB;
-        const size_t expected = size_t(((host - 11) * 1024 * 4 / 5) / 10) * MiB;
+        const size_t expected = size_t(((host - 11) * 1024 * 4 / 5)) * MiB;
         size_t budget = llama_mmap_prefetch_budget(available);
-        expect(budget == expected, "fake host prefetch uses independently calculated eight percent of RAM above floor");
+        expect(budget == expected, "fake host prefetch uses independently calculated eighty percent of RAM above floor");
         const size_t first = llama_mmap_prefetch_take(budget, 1);
         const size_t second = llama_mmap_prefetch_take(budget, SIZE_MAX);
         expect(first == 1 && second == expected - MiB && budget == 0, "two shards share one page-rounded budget");
@@ -424,7 +424,7 @@ int main() {
             advice.clear();
             quota = SIZE_MAX;
             const uint64_t available = (host - 6) * GiB;
-            const size_t expected = size_t(((host - 11) * 1024 * 4 / 5) / 10) * MiB;
+            const size_t expected = size_t(((host - 11) * 1024 * 4 / 5)) * MiB;
             llama_prefetch({{base, page}}, &quota, available);
             expect(total() == page && quota == expected - page, "later quota uses the independent fake-host budget before its first syscall");
         }

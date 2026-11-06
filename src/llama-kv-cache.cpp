@@ -2596,11 +2596,11 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
-    return layers[0].k->type;
+    return layers.empty() ? GGML_TYPE_COUNT : layers[0].k->type; // DFlash drafter context has no KV layers
 }
 
 ggml_type llama_kv_cache::type_v() const {
-    return layers[0].v->type;
+    return layers.empty() ? GGML_TYPE_COUNT : layers[0].v->type;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
@@ -3899,7 +3899,7 @@ bool llama_kv_cache::sj_kvarn_prefill_cut(llama_seq_id seq_id, llama_pos p0) {
         // the staging rows of [replay_B(p0), reopen_lo) were overwritten (the cache ran more than about the ring
         // capacity past p0) and the first re-prefill ubatch would still read them as exact rows in a cold prefill:
         // the cut reopens what the ring still holds, the re-prefill is close to a cold one but not identical
-        LLAMA_LOG_WARN("%s: SJ-KVaRN cut at %d: the ring reaches back to %u, a cold prefill keeps rows from %u exact; "
+        LLAMA_LOG_DEBUG("%s: SJ-KVaRN cut at %d: the ring reaches back to %u, a cold prefill keeps rows from %u exact; "
                 "the re-prefill will not be bit-identical to a cold one\n", __func__, (int) p0,
                 sj_kvarn_reopen_lo(strm), sj_kvarn_replay_B(c0));
     }

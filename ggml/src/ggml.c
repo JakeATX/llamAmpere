@@ -862,6 +862,38 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // 16-row units, not row-addressable
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_AIT2P_U] = {
+        .type_name                = "ait2p_u",
+        .blck_size                = 128,
+        .type_size                = 34,   // AIT2_U bytes; levels from the AIT2P pair table
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row units, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT2_U2] = {
+        .type_name                = "ait2_u2",
+        .blck_size                = 640,
+        .type_size                = 162,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT3_U2] = {
+        .type_name                = "ait3_u2",
+        .blck_size                = 640,
+        .type_size                = 242,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT4_U2] = {
+        .type_name                = "ait4_u2",
+        .blck_size                = 640,
+        .type_size                = 322,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_AIT3_U] = {
         .type_name                = "ait3_u",
         .blck_size                = 128,
@@ -1601,11 +1633,32 @@ int ggml_exl3_bits(enum ggml_type type) {
 // ---- AI+ unit types (ggml-ai4.h): rate, layout and the per-type decoder constant / encoder scale seed ----
 int ggml_ai4_rate(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_AIT2_U:  return 2;
-        case GGML_TYPE_AIT3_U:  return 3;
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2:
+        case GGML_TYPE_AIT2P_U: return 2;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 3;
         case GGML_TYPE_AIT4_U:  return 4;
         case GGML_TYPE_AIT5_U:  return 5;
         default:                return 0;
+    }
+}
+
+int ggml_ai4v2_rate(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U2: return 2;
+        case GGML_TYPE_AIT3_U2: return 3;
+        case GGML_TYPE_AIT4_U2: return 4;
+        default:                return 0;
+    }
+}
+
+uint32_t ggml_ai4v2_trellis_mul(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U2: return 0xC3CCD12Du;
+        case GGML_TYPE_AIT3_U2: return 0x87D8D12Du;
+        case GGML_TYPE_AIT4_U2: return 0xAA73876Bu;
+        default:                return 0u;
     }
 }
 
@@ -1638,11 +1691,21 @@ int ggml_ai4_layout(enum ggml_type type) {
     return ggml_ai4_rate(type) == 0 ? -1 : 1;
 }
 
-// The level of a 16-bit state is ((bytesum(state * C) + 2) >> 2) - 128, so C is part of the type.
+int ggml_ai4_code(enum ggml_type type) {
+    if (ggml_ai4_rate(type) == 0) {
+        return -1;
+    }
+    return type == GGML_TYPE_AIT2P_U ? 1 : 0;
+}
+
+// The level of a 16-bit state is ((bytesum(state * C) + 2) >> 2) - 128, so C is part of the type. AIT2P_U has no C (0):
+// its levels come from the AIT2P pair table, and the shared decoders treat C == 0 as that code.
 uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_AIT2_U:  return 0xC3CCD12Du;
-        case GGML_TYPE_AIT3_U:  return 0x87D8D12Du;
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2: return 0xC3CCD12Du;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 0x87D8D12Du;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT5_U:  return 0xAA73876Bu;
         default:                return 0u;
@@ -1652,8 +1715,11 @@ uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
 // Encoder scale seed = group rms / level rms * this (per-rate probe value; the encoder, not the decoder, uses it).
 float ggml_ai4_scale_mul(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_AIT2_U:  return 1.00f;
-        case GGML_TYPE_AIT3_U:  return 1.05f;
+        case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2:
+        case GGML_TYPE_AIT2P_U: return 1.00f;
+        case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2: return 1.05f;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT5_U:  return 1.09f;
         default:                return 0.0f;
@@ -8856,6 +8922,11 @@ struct ggml_moe_bank_entry_s {
     int32_t      n_expert;
     bool         has_bank;
     uint8_t      in_bank[GGML_MOE_BANK_MAX_EXPERTS];
+    // fork AIPFIX ONEPATH: the bank rows of this tensor's experts (bank tensor data, type, expert stride, slot or -1)
+    const void * rows_data;
+    int32_t      rows_type;
+    size_t       rows_nb2;
+    int16_t      rows_slot[GGML_MOE_BANK_MAX_EXPERTS];
 };
 
 static struct ggml_moe_bank_entry_s g_moe_bank[GGML_MOE_BANK_MAX_TENSORS];
@@ -8914,6 +8985,17 @@ bool ggml_moe_bank_any(void) {
     return g_moe_bank_any;
 }
 
+// fork AIPFIX ONEPATH: set by the CUDA expert cache while its device tables hold the bank rows of every banked tensor
+static int g_moe_bank_onepath_live = 0;
+
+void ggml_moe_bank_onepath_set_live(bool live) {
+    __atomic_store_n(&g_moe_bank_onepath_live, live ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+bool ggml_moe_bank_onepath_live(void) {
+    return __atomic_load_n(&g_moe_bank_onepath_live, __ATOMIC_ACQUIRE) != 0;
+}
+
 const uint8_t * ggml_moe_bank_lookup(const void * weight_data) {
     // no tensor with a bank (every model without hot-bank tensors): nothing to look up
     if (!g_moe_bank_any) {
@@ -8933,6 +9015,44 @@ const uint8_t * ggml_moe_bank_lookup(const void * weight_data) {
         }
     }
     return NULL;
+}
+
+void ggml_moe_bank_register_rows(const void * weight_data, const void * bank_data, int32_t bank_type, size_t bank_nb2,
+        const int32_t * slot) {
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        struct ggml_moe_bank_entry_s * e = &g_moe_bank[i];
+        if (e->data != weight_data || !e->has_bank) {
+            continue;
+        }
+        e->rows_data = bank_data;
+        e->rows_type = bank_type;
+        e->rows_nb2  = bank_nb2;
+        for (int32_t x = 0; x < e->n_expert; ++x) {
+            e->rows_slot[x] = (int16_t) (e->in_bank[x] && slot[x] >= 0 ? slot[x] : -1);
+        }
+        return;
+    }
+}
+
+bool ggml_moe_bank_rows(const void * weight_data, const void ** bank_data, int32_t * bank_type, size_t * bank_nb2,
+        const int16_t ** slot) {
+    if (!ggml_moe_bank_lookup(weight_data)) {
+        return false;
+    }
+    for (int i = 0; i < g_moe_bank_n; ++i) {
+        const struct ggml_moe_bank_entry_s * e = &g_moe_bank[i];
+        if (e->data == weight_data) {
+            if (!e->rows_data) {
+                return false;
+            }
+            *bank_data = e->rows_data;
+            *bank_type = e->rows_type;
+            *bank_nb2  = e->rows_nb2;
+            *slot      = e->rows_slot;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool ggml_moe_bank_entry(int index, const void ** weight_data, int32_t * layer, int32_t * n_expert, const uint8_t ** in_bank) {

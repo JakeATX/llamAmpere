@@ -1663,6 +1663,14 @@ struct ggml_backend_cuda_context {
         int64_t conv_ring     = 0;   // ssm_conv launches that read the CONCAT operands and wrote the windows [#110]
         int64_t nemotron_ssm  = 0;
         int64_t nemotron_moe  = 0;
+        int64_t moe_bank_mixed = 0;
+        int64_t moe_bank_routing = 0;
+        int64_t moe_bank_pair = 0;
+        int64_t moe_bank_pair_glu = 0;
+        int64_t moe_bank_mixed_reduce = 0;
+        int64_t moe_bank_down_reduce = 0;   // routed sums written by the banked down launch
+        int64_t mmq_route_skip = 0;         // prompt MUL_MAT_IDs that left out the hot-bank routes
+        int64_t moe_onechain_fill = 0;      // AI+ bank products written into the regular prompt expert output
     } fusion_stats;
     // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
     // address table is pointed at a slot instead of at the expert's home address once it is copied.

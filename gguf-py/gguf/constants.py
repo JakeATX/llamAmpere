@@ -6055,7 +6055,11 @@ class GGMLQuantizationType(IntEnum):
     AIT2_U  = 115
     AIT3_U  = 116
     AIT4_U  = 117
+    AIT2P_U = 121
     AIF25_U = 118
+    AIT2_U2 = 122
+    AIT3_U2 = 123
+    AIT4_U2 = 124
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6304,7 +6308,11 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.AIT2_U: (128, 34),
     GGMLQuantizationType.AIT3_U: (128, 50),
     GGMLQuantizationType.AIT4_U: (128, 66),
+    GGMLQuantizationType.AIT2P_U: (128, 34),
     GGMLQuantizationType.AIF25_U: (128, 42),
+    GGMLQuantizationType.AIT2_U2: (640, 162),   # 2 + 80k bytes per row per 640 K (one fp16 row scale)
+    GGMLQuantizationType.AIT3_U2: (640, 242),
+    GGMLQuantizationType.AIT4_U2: (640, 322),
 }
 
 

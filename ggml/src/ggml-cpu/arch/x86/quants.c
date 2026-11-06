@@ -501,10 +501,73 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
-// placeholder implementation for Apple targets
+#if defined(__AVX2__)
+// Same bytes as quantize_row_q8_K_ref: the scale comes from the first element with the largest magnitude, values are
+// rounded with the ref's magic-number trick and capped at 127.
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    block_q8_K * GGML_RESTRICT y = (block_q8_K *) vy;
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256i cap = _mm256_set1_epi32(127);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    for (int64_t i = 0; i < nb; i++, x += QK_K) {
+        __m256 vmax = _mm256_setzero_ps();
+        for (int j = 0; j < QK_K; j += 8) {
+            vmax = _mm256_max_ps(_mm256_and_ps(_mm256_loadu_ps(x + j), absmask), vmax); // a NaN keeps the running max, as in the ref
+        }
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+        const float amax = _mm_cvtss_f32(m4);
+        if (!amax) {
+            y[i].d = 0;
+            memset(y[i].qs, 0, QK_K);
+            continue;
+        }
+        float max = amax;
+        const __m256 vamax = _mm256_set1_ps(amax);
+        for (int j = 0; j < QK_K; j += 8) {
+            const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_and_ps(_mm256_loadu_ps(x + j), absmask), vamax, _CMP_EQ_OQ));
+            if (m) { max = x[j + __builtin_ctz(m)]; break; }
+        }
+        const float iscale = -127.f/max;
+        const __m256 viscale = _mm256_set1_ps(iscale);
+        const __m256 vmagic = _mm256_set1_ps(12582912.f);
+        const __m256i vmask = _mm256_set1_epi32(0x007fffff);
+        const __m256i vbias = _mm256_set1_epi32(0x00400000);
+        for (int j = 0; j < QK_K; j += 32) {
+            __m256i qi[4];
+            for (int n = 0; n < 4; ++n) {
+                const __m256 xv = _mm256_loadu_ps(x + j + 8*n);
+#if defined(__FMA__)
+                const __m256 t = _mm256_fmadd_ps(viscale, xv, vmagic);   // the ref's iscale*x + magic is contracted to an fma by the compiler
+#else
+                const __m256 t = _mm256_add_ps(_mm256_mul_ps(viscale, xv), vmagic);
+#endif
+                qi[n] = _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(t), vmask), vbias), cap);
+            }
+            const __m256i i0 = qi[0], i1 = qi[1], i2 = qi[2], i3 = qi[3];
+            const __m256i p01 = _mm256_packs_epi32(i0, i1);   // 16-bit, lanes interleaved: [0-3 8-11 | 4-7 12-15]
+            const __m256i p23 = _mm256_packs_epi32(i2, i3);
+            const __m256i b = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(p01, p23), _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            _mm256_storeu_si256((__m256i *)(y[i].qs + j), b);
+        }
+        for (int j = 0; j < QK_K/16; ++j) {
+            const __m256i w = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(y[i].qs + j*16))), ones16);
+            __m128i s = _mm_add_epi32(_mm256_castsi256_si128(w), _mm256_extracti128_si256(w, 1));
+            s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+            s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+            y[i].bsums[j] = (int16_t) _mm_cvtsi128_si32(s);
+        }
+        y[i].d = 1/iscale;
+    }
+}
+#else
 void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q8_K_ref(x, y, k);
 }
+#endif
 
 //===================================== Dot products =================================
 

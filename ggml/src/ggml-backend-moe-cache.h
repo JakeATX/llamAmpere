@@ -243,6 +243,13 @@ static const enum ggml_type ggml_moe_cache_types[] = {
     GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_IQ4_XS,
+    // fork AIPFIX D: AI+ unit experts (CUDA only; the slot table GEMV is ggml_cuda_moe_ai_table_mmv)
+    GGML_TYPE_AIT2_U,
+    GGML_TYPE_AIT2P_U,
+    GGML_TYPE_AIT3_U,
+    GGML_TYPE_AIT4_U,
+    GGML_TYPE_AIT2_U2,
+    GGML_TYPE_AIT3_U2,
 };
 
 static inline int ggml_moe_cache_wtype_count(void) {

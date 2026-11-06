@@ -969,6 +969,25 @@ static bool run_capability_queries(
     ok &= api.query_shape(
             GGML_TYPE_Q4_0, n_in, n_out, 0, expert_size, &shape) == 0;
 
+    if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(provider_device)), "CUDA") == 0) {
+        for (const auto type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
+            bool type_ok = true;
+            for (const int64_t width : {2560, 640}) {
+                const int64_t rows = width == 2560 ? 640 : 2560;
+                const size_t bytes = ggml_row_size(type, width) * rows;
+                set_env("GGML_MOE_CACHE_AI", nullptr);
+                type_ok &= api.query_shape(type, width, rows, 512, bytes, &shape) == 1;
+                type_ok &= shape.pool_bytes == bytes * 64;
+                type_ok &= shape.minimum_bytes == shape.scratch_bytes + shape.pool_bytes;
+                set_env("GGML_MOE_CACHE_AI", "0");
+                type_ok &= api.query_shape(type, width, rows, 512, bytes, &shape) == 0;
+            }
+            printf("cache-capabilities type=%s: %s\n", ggml_type_name(type), type_ok ? "OK" : "FAIL");
+            ok &= type_ok;
+        }
+        set_env("GGML_MOE_CACHE_AI", nullptr);
+    }
+
     set_env("GGML_CUDA_MOE_CACHE", "0");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "off");
     ok &= api.query_config(-1, 0, &config) == 0;
@@ -6309,7 +6328,7 @@ static bool run_device_fused_tables(ggml_backend_t gpu, ggml_backend_t cpu, log_
     constexpr int64_t n_expert = 512;
     std::vector<float> importance(n_in, 1.0f);
     for (const auto type : ggml_moe_cache_types) {
-        if (type == GGML_TYPE_IQ1_M) {
+        if (type == GGML_TYPE_IQ1_M || n_in % ggml_blck_size(type) != 0) {
             continue;
         }
         bool ok = true;
@@ -7586,6 +7605,9 @@ static bool run_device_tables(ggml_backend_t gpu, ggml_backend_t cpu,
     }
     std::vector<float> importance(n_in, 1.0f);
     for (const auto type : ggml_moe_cache_types) {
+        if (n_in % ggml_blck_size(type) != 0) {
+            continue;
+        }
         ggml_init_params params = {ggml_tensor_overhead(), nullptr, true};
         ggml_context * ctx = ggml_init(params);
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, type, n_in, n_out, n_expert);
@@ -8247,6 +8269,13 @@ int main(int argc, char ** argv) {
             ggml_backend_free(cpu);
         }
         return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--capabilities-only") == 0) {
+        const bool ok = run_capability_queries(provider_device, cpu);
+        ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        ggml_log_set(nullptr, nullptr);
+        return ok ? 0 : 1;
     }
 #if defined(GGML_CUDA) && defined(__linux__)
     if (argc == 2 && strcmp(argv[1], "--device-pageable-fallback-only") == 0) {

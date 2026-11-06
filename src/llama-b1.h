@@ -15,6 +15,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,9 @@ struct llama_b1_stats {
     uint64_t bytes_lent   = 0;   // resident expert bytes borrowed
     uint64_t bytes_fresh  = 0;   // free VRAM allocated
     uint64_t bytes_carry  = 0;
+    uint64_t bytes_carry_host = 0; // [PP12] pinned host RAM holding the carries (0 = carries in VRAM)
+    uint64_t bytes_carry_h2d  = 0; // [PP12] carry bytes staged host -> VRAM
+    uint64_t bytes_carry_d2h  = 0; // [PP12] carry bytes staged VRAM -> host
     int64_t  t_stream_us  = 0;   // first layer_begin to end()
 };
 
@@ -87,6 +91,35 @@ public:
     // VRAM the plan must leave free beyond its keep, for scratch measured only after a plan exists (the legacy layer graph)
     void set_extra_keep(size_t bytes) { extra_keep = bytes; }
     size_t extra_keep = 0;
+    // [REFIT] re-plan only: the plan's fresh VRAM must stay at or under this (SIZE_MAX = no cap). The legacy layer graph
+    // is measured after the plan; when it lacks VRAM, extra keep alone changes nothing if the plan already had slack,
+    // so the re-plan caps fresh below the failed plan's (smaller variant: sync carry, then one expert slot).
+    void set_fresh_cap(size_t bytes) { fresh_cap = bytes; }
+    size_t fresh_cap = SIZE_MAX;
+    // Host carry plan sizes, largest first: two expert slots + async, two + sync, one + async, one + sync.
+    // carry_step_below() = the next size under `fresh` (0 when none); carry_step_min() = the smallest one that can run.
+    size_t carry_step_below(size_t fresh) const {
+        const size_t s = step_slot_bytes, c = step_carry_bytes;
+        for (size_t bytes : { 2*s + 2*c, 2*s + c, s + 2*c, s + c }) {
+            if (bytes < fresh) {
+                return bytes;
+            }
+        }
+        return 0;
+    }
+    size_t carry_step_min() const { return step_slot_bytes + step_carry_bytes; }
+    size_t step_slot_bytes = 0;
+    size_t step_carry_bytes = 0;
+    // [KEEPAUTO] VRAM keep reserve in MiB for this plan (-1 = LLAMA_B1_KEEP_FREE_MIB or the default). The legacy
+    // layer check (llama-context.cpp) reads the same value so plan and check always agree.
+    void set_keep_override(int64_t mib) { keep_override_mib = mib; }
+    int64_t keep_override_mib = -1;
+    size_t last_fresh() const { return fresh_last; }
+    size_t fresh_last = 0;
+    // [PINRE] keep the pinned host carry across a re-plan inside one call (begin() releases the plan first);
+    // re-pinning 3.9 GiB costs ~2 s. drop_carry_spare() frees what the re-plan did not reuse.
+    void hold_carry_pin(bool hold) { carry_pin_hold = hold; }
+    void drop_carry_spare();
     bool ffn_enabled() const { return !ffn_views.empty(); }
     llm_b1_ffn * ffn(size_t ub);
     llm_b1_ffn * ffn_group() { return ffn_all.get(); }
@@ -125,6 +158,25 @@ public:
 
     // the carry tensor of ubatch ub (F32 [n_embd, hc, n_tokens of ub])
     ggml_tensor * carry(size_t ub);
+
+    // [PP12] LLAMA_B1_HOST_CARRY=1 (opt-in): when the carries of one whole-prompt group do not fit in VRAM, keep them
+    // in pinned host RAM and stage each ubatch's carry through one VRAM slot, so the prompt still crosses the experts
+    // once (one pass) instead of falling back to normal chunks. =2 forces it even when VRAM would fit (identity test).
+    // Every carry() tensor then views the same VRAM slot: load before a range that reads it, store after one that
+    // writes it. Both are async copies on the compute stream, so they are ordered with the graphs around them.
+    bool carry_on_host() const { return carry_host; }
+    void carry_load(size_t ub);
+    void carry_store(size_t ub);
+    // [PP12A] LLAMA_B1_HOST_CARRY_ASYNC=1 (opt-in, with host carry): two VRAM carry slots (ubatch u uses slot u % 2)
+    // and a separate copy stream, so the store of ubatch u and the load of the next ubatch for that slot run while the
+    // graph of u + 1 computes. Same bytes, same graphs: bit-identical to the one-slot path.
+    // carry_write_begin: a range that writes the carry without reading it (layer 0) waits for the slot's last store.
+    // carry_prefetch: load ub into its slot now (the caller has just stored the slot's previous ubatch).
+    // carry_load_final: the final range (no store after it): frees the previous slot and prefetches the next ubatch.
+    void carry_write_begin(size_t ub);
+    void carry_prefetch(size_t ub);
+    void carry_load_final(size_t ub);
+    bool carry_async_on() const { return carry_host && carry_async; }
 
     // the layer ranges of the plan: every streamed layer is its own range, a run of layers that stay resident is
     // one range; the last range [final_l0(), n_layer) is built with the model output by the normal decode body
@@ -214,7 +266,44 @@ private:
     std::vector<region>   regions;
     ggml_backend_buffer_t fresh_buf = nullptr;
     std::vector<placement> slot_place; // [slot*n_roles + role]
-    std::vector<placement> carry_place; // [ubatch index within the group]
+    std::vector<placement> carry_place; // [ubatch index within the group]; one entry when carry_host
+    bool carry_host = false;
+    bool carry_async = false;               // [PP12A] two slots + own copy stream
+    size_t n_host_slots() const { return carry_async ? 2 : 1; }
+    bool one_slot = false;                  // [PP12H] host carry with ONE expert layer slot: a layer's copy waits until
+                                            // the previous layer's graphs ran (no copy/compute overlap, half the slot VRAM)
+    size_t n_exp_slots() const { return one_slot ? 1 : 2; }
+    ggml_backend_t backend_carry = nullptr; // [PP12A] the carry copy stream
+    ggml_backend_event_t ev_cload[2]  = { nullptr, nullptr }; // slot loaded (carry stream)
+    ggml_backend_event_t ev_cdone[2]  = { nullptr, nullptr }; // graph done with slot (compute stream)
+    ggml_backend_event_t ev_cstore[2] = { nullptr, nullptr }; // slot stored to host (carry stream)
+    size_t carry_pend[2] = { SIZE_MAX, SIZE_MAX };            // ubatch whose load into the slot is issued, not yet consumed
+    void carry_fetch(size_t ub);
+    void carry_async_free();
+    ggml_backend_buffer_t carry_host_buf = nullptr;
+    ggml_backend_buffer_t carry_pin_spare = nullptr; // [PINRE] pinned carry held over a re-plan
+    bool carry_pin_hold = false;
+    // [PINCH] LLAMA_B1_CARRY_PIN_CHUNKED=1: the carry RAM is plain memory that a helper thread page-locks in chunks,
+    // front to back, so the ~2 s pin overlaps the first layer; a copy waits only for the chunks it touches
+    struct carry_chunk_pin {
+        void * ptr = nullptr;
+        size_t size = 0;
+        ggml_backend_buffer_t buf = nullptr;   // CPU view of ptr (does not own it)
+        void (*unpin)(void *) = nullptr;
+        std::vector<void *> pinned;            // chunk starts, written by the helper thread only
+        std::thread th;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::atomic<size_t> done{0};           // bytes [0, done) settled (pinned, or left pageable after a failure)
+        std::atomic<bool> stop{false};
+        int64_t pin_us = 0;                    // helper thread wall time
+        int64_t wait_us = 0;                   // copies blocked on the helper
+    };
+    std::unique_ptr<carry_chunk_pin> carry_chunk, carry_chunk_spare;
+    bool carry_chunk_alloc(size_t bytes);
+    static void carry_chunk_free(std::unique_ptr<carry_chunk_pin> & c);
+    void carry_pin_wait(size_t ub);
+    std::vector<size_t> carry_host_offs; // per ubatch of the call
     ggml_context * ctx_meta = nullptr;
     std::vector<ggml_tensor *> carries; // per ubatch of the call
     bool ffn_requested = false;

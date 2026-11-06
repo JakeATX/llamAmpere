@@ -3038,6 +3038,32 @@ static ggml_sched_upload_fn_t ggml_sched_upload_fn(ggml_backend_t backend) {
     return fn;
 }
 
+// GGML_SCHED_UPLOAD_BATCH=1: the backend stages the small input copies above and launches them as one kernel when the
+// scheduler calls this after the inputs of a split are staged (no-op for backends without the proc address).
+using ggml_sched_upload_flush_fn_t = void (*)(ggml_backend_t);
+static void ggml_sched_upload_flush(ggml_backend_t backend) {
+    static std::mutex mu;
+    static std::vector<std::pair<ggml_backend_reg_t, ggml_sched_upload_flush_fn_t>> cache;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return;
+    }
+    ggml_sched_upload_flush_fn_t fn = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = std::find_if(cache.begin(), cache.end(), [reg](const auto & c) { return c.first == reg; });
+        if (it == cache.end()) {
+            cache.emplace_back(reg, (ggml_sched_upload_flush_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_upload_flush"));
+            it = cache.end() - 1;
+        }
+        fn = it->second;
+    }
+    if (fn) {
+        fn(backend);
+    }
+}
+
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -3206,6 +3232,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+        ggml_sched_upload_flush(split_backend);
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 if (ggml_sched_xs_use(sched, split_id,

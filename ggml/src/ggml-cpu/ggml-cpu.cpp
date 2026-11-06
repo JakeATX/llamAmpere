@@ -458,7 +458,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             if (ggml_ai4_rate(src0->type) != 0) {
                 // reference path only (unit slab dequantize + f32 dot): 2-D weights, f32 activations
                 return src1->type == GGML_TYPE_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
-                       src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0;
+                       src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0 &&
+                       (ggml_ai4v2_rate(src0->type) == 0 || src0->ne[0] % 640 == 0);
             }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
@@ -479,7 +480,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             if (ggml_ai4_rate(src0->type) != 0) {
                 // unit slab reference path: 3-D expert stack, f32 activations
                 return src1->type == GGML_TYPE_F32 && src0->ne[3] == 1 &&
-                       src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0;
+                       src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0 &&
+                       (ggml_ai4v2_rate(src0->type) == 0 || src0->ne[0] % 640 == 0);
             }
             return true;
         case GGML_OP_SOFT_MAX_BACK: {

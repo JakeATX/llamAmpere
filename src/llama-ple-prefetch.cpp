@@ -26,13 +26,40 @@
 #include <unistd.h>
 #endif
 
-static constexpr int64_t PLE_PF_DEFAULT_THREADS = 0;
+// default on (home 5800X3D, 64 GB, cold table: layer-1 prompt wall 4.1 -> 1.2 s, 100K prompt +8.9%);
+// LLAMA_PLE_PREFETCH=0 turns it off. Readers only queue page reads (advise), so they take almost no CPU.
+static constexpr int64_t PLE_PF_DEFAULT_THREADS = 4;
+// the default stays off when the host has less than this much MemAvailable at load (pages read ahead could be
+// evicted again before the gather reads them); an explicit LLAMA_PLE_PREFETCH=N skips the check
+static constexpr int64_t PLE_PF_DEFAULT_MIN_AVAIL_MIB = 8192;
 static constexpr int64_t PLE_PF_DEFAULT_MIN     = 4096;
 static constexpr int64_t PLE_PF_DEFAULT_COLD    = 0;   // readers when the table is mostly out of the page cache (opt-in: LLAMA_PLE_PF_COLD_THREADS=N, e.g. 32)
 
 static int64_t ple_pf_env(const char * name, int64_t def) {
     const char * v = getenv(name);
     return v && *v ? (int64_t) strtoll(v, nullptr, 10) : def;
+}
+
+// MemAvailable in MiB, -1 when unknown
+static int64_t ple_pf_mem_avail_mib() {
+#if defined(__linux__)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) {
+        return -1;
+    }
+    char line[256];
+    int64_t kib = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "MemAvailable:", 13) == 0) {
+            kib = strtoll(line + 13, nullptr, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kib < 0 ? -1 : kib/1024;
+#else
+    return -1;
+#endif
 }
 
 void llama_ple_hash_rows(const llama_hparams & hp, llama_token token, const llama_token * prev, int32_t * rows) {
@@ -87,13 +114,22 @@ static bool ple_pf_resolve(const void * addr, std::string & path, uint64_t & off
 #endif
 
 std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model & model, uint32_t n_ubatch) {
-    // Opt in with LLAMA_PLE_PREFETCH=N reader threads; read-ahead can churn the page cache on low-RAM hosts.
+    // LLAMA_PLE_PREFETCH=N sets the reader threads (0 = off); the default skips hosts with little MemAvailable.
     const bool    user  = getenv("LLAMA_PLE_PREFETCH") != nullptr;
     const int64_t n_thr = ple_pf_env("LLAMA_PLE_PREFETCH", ple_pf_env("LLAMA_PLE_PF_THREADS", PLE_PF_DEFAULT_THREADS));
     if (n_thr <= 0 || n_ubatch == 0) {
         return nullptr;
     }
     const ggml_tensor * t = model.per_layer_tok_embd;
+    const bool explicit_thr = user || getenv("LLAMA_PLE_PF_THREADS") != nullptr;
+    if (!explicit_thr && model.arch == LLM_ARCH_QWEN4EXP && t) {
+        const int64_t avail = ple_pf_mem_avail_mib();
+        if (avail >= 0 && avail < PLE_PF_DEFAULT_MIN_AVAIL_MIB) {
+            LLAMA_LOG_WARN("%s: [PLEPF] default PLE prefetch off: MemAvailable %" PRId64 " MiB < %" PRId64 " MiB (LLAMA_PLE_PREFETCH=N forces it)\n",
+                    __func__, avail, PLE_PF_DEFAULT_MIN_AVAIL_MIB);
+            return nullptr;
+        }
+    }
     if (model.arch != LLM_ARCH_QWEN4EXP || !t || !model.can_prefetch.count(t) || !t->data || !t->buffer ||
             !ggml_backend_buffer_is_host(t->buffer) || t->nb[1] == 0 || t->ne[1] <= 0 ||
             model.hparams.ple_n_heads == 0 || model.hparams.ple_ngram_size < 2) {
@@ -137,8 +173,11 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     pf->n_min     = (uint32_t) std::min<int64_t>(UINT32_MAX,
             std::max<int64_t>(1, ple_pf_env("LLAMA_PLE_PF_MIN", user ? 256 : PLE_PF_DEFAULT_MIN)));
     pf->n_ahead   = (uint64_t) std::max<int64_t>(0, ple_pf_env("LLAMA_PLE_PF_AHEAD", user ? 2*(int64_t) n_ubatch : INT64_MAX/2));
-    // fork: cap read-ahead in ubatches; zero keeps the existing token-based setting.
-    const int64_t window = ple_pf_env("LLAMA_PLE_PF_WINDOW_UBATCHES", 0);
+    // fork: cap read-ahead in ubatches; zero keeps the existing token-based setting. The default whole-call
+    // read-ahead can lose its pages to the expert stream before late ubatches use them, so unless the user set
+    // the prefetch or its read-ahead, the default reads two ubatches ahead.
+    const bool user_ahead = user || getenv("LLAMA_PLE_PF_AHEAD") != nullptr;
+    const int64_t window = ple_pf_env("LLAMA_PLE_PF_WINDOW_UBATCHES", user_ahead ? 0 : 2);
     if (window > 0) {
         const uint64_t cap = (uint64_t) std::min<int64_t>(window, 64)*(uint64_t) n_ubatch;
         pf->n_ahead = std::min(pf->n_ahead, cap);

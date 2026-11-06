@@ -468,9 +468,17 @@ extern "C" {
         GGML_TYPE_AIT2_U  = 115,
         GGML_TYPE_AIT3_U  = 116,
         GGML_TYPE_AIT4_U  = 117,
+        GGML_TYPE_AIT2P_U = 121, // AIT2_U bytes and units, AIT2P pair-table level map (ggml-ai4.h)
         // Fractional computed pair: 5 bits per two weights + fp16/128 scale = 2.625 bpw.
         // Whole-tensor 16-row units; CUDA dense matmul only. No row-wise embedding lookup.
         GGML_TYPE_AIF25_U = 118,
+        // AITk_U2 (k = 2/3/4), expert unit layout v2: same 128-weight tiles, constants and level rule as AITk_U, but ONE fp16
+        // scale per row per 640 K (block = 16 rows x 640 K = [16 fp16 scales][5 chunks x 16 tiles x 16k bytes], 80k + 2 bytes
+        // per row and block, k + 0.025 bpw instead of k + 0.125). K % 640 == 0 (Flash-Next experts 2560 / 640). k = 2/3 are
+        // ggml_ai4_is_unit types with CUDA kernels; k = 4 (124) is registered only (no kernel, ggml_ai4_rate 0).
+        GGML_TYPE_AIT2_U2 = 122,
+        GGML_TYPE_AIT3_U2 = 123,
+        GGML_TYPE_AIT4_U2 = 124,
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         GGML_TYPE_COUNT   = 144,
@@ -838,7 +846,12 @@ extern "C" {
     GGML_API bool     ggml_ai4_is_unit    (enum ggml_type type);
     GGML_API int      ggml_ai4_layout     (enum ggml_type type);
     GGML_API uint32_t ggml_ai4_trellis_mul(enum ggml_type type);
+    // AI+ unit level map: 0 = 1MAD (trellis_mul), 1 = AIT2P pair table (GGML_TYPE_AIT2P_U, trellis_mul 0), -1 = not a unit type
+    GGML_API int      ggml_ai4_code       (enum ggml_type type);
     GGML_API float    ggml_ai4_scale_mul  (enum ggml_type type);
+    // AITk_U2 expert layout v2: trellis rate k for GGML_TYPE_AIT2_U2..AIT4_U2, 0 otherwise (decoder constants = those of the AITk_U type)
+    GGML_API int      ggml_ai4v2_rate     (enum ggml_type type);
+    GGML_API uint32_t ggml_ai4v2_trellis_mul(enum ggml_type type);
 
     GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits/weight for GGML_TYPE_EXL3_*, 0 otherwise
     // EXL3 reference decode of trellis rows 16*g .. 16*g+15 of a [K, N] EXL3 tensor (bits 2..8) into y[16][K]
@@ -3286,8 +3299,19 @@ extern "C" {
     GGML_API void            ggml_moe_bank_unregister(const void * weight_data);
     // true once some registered tensor has bank experts (a model with hot-bank tensors is loaded)
     GGML_API bool            ggml_moe_bank_any       (void);
+    // fork AIPFIX ONEPATH: true while the CUDA expert cache's device tables carry the bank rows of every banked tensor
+    // (the one path computes bank routes from them); false before the tables exist, when they were refused, or after
+    GGML_API void            ggml_moe_bank_onepath_set_live(bool live);
+    GGML_API bool            ggml_moe_bank_onepath_live    (void);
     // flags of a registered tensor with a bank, NULL otherwise or when GGML_MOE_BANK_SKIP=0
     GGML_API const uint8_t * ggml_moe_bank_lookup    (const void * weight_data);
+    // fork AIPFIX ONEPATH: where the bank rows of a registered tensor's bank experts live (the bank tensor's data,
+    // type and expert stride; slot[e] = bank row of expert e or -1). Call after ggml_moe_bank_register. ggml_moe_bank_rows
+    // is false for a tensor without them (or without a bank, or with GGML_MOE_BANK_SKIP=0).
+    GGML_API void            ggml_moe_bank_register_rows(const void * weight_data, const void * bank_data, int32_t bank_type,
+                                                         size_t bank_nb2, const int32_t * slot);
+    GGML_API bool            ggml_moe_bank_rows      (const void * weight_data, const void ** bank_data, int32_t * bank_type,
+                                                      size_t * bank_nb2, const int16_t ** slot);
     // enumerate every registered tensor (ignores GGML_MOE_BANK_SKIP); returns false past the end
     GGML_API bool            ggml_moe_bank_entry     (int index, const void ** weight_data, int32_t * layer, int32_t * n_expert, const uint8_t ** in_bank);
     // resident census over the registered layers: an expert counts once, as bank when it is in the bank, else as cache

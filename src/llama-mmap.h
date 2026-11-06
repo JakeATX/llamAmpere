@@ -46,7 +46,7 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
-// Optional prefetch gets 10% of the 80% spare-RAM budget above a 5 GiB floor.
+// Optional prefetch gets the 80% spare-RAM budget above a 5 GiB floor (so a mapped file that fits is read ahead whole).
 // Other shares stay reserved for expert storage, staging and later caches.
 size_t llama_mmap_prefetch_budget(uint64_t available);
 size_t llama_mmap_prefetch_take(size_t & remaining, size_t requested);

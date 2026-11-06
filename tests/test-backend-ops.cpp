@@ -47,6 +47,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -7935,13 +7936,14 @@ static bool is_ai4_family(ggml_type t) {
 }
 
 static void init_tensor_ai4_random(ggml_tensor * t, const std::vector<bool> * used = nullptr) {
-    GGML_ASSERT(is_ai4_family(t->type) && ggml_is_contiguous(t) && t->ne[0] % 128 == 0 && t->ne[1] % 16 == 0);
+    const bool v2 = ggml_ai4v2_rate(t->type) != 0;   // row-scale block = 16 rows x 640 K: [d[16]][5 x 16k-byte tiles]
+    GGML_ASSERT(is_ai4_family(t->type) && ggml_is_contiguous(t) && t->ne[0] % (v2 ? 640 : 128) == 0 && t->ne[1] % 16 == 0);
     std::random_device rd;
     std::mt19937 rng(rd());
     std::uniform_real_distribution<float> ud(0.002f, 0.02f);
     std::vector<uint8_t> buf(ggml_nbytes(t));
     // one unit = 16 rows x 128 K: [fp16 row scales d[16]][16k-byte trellis tiles]
-    const size_t bb  = (size_t) (32 + 256*ggml_ai4_rate(t->type));
+    const size_t bb  = (size_t) (32 + (v2 ? 5 : 1)*256*ggml_ai4_rate(t->type));
     const size_t nsc = 16;
     const size_t nblk = buf.size() / bb;
     for (size_t b = 0; b < nblk; ++b) {
@@ -8656,6 +8658,151 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// MUL_MAT_ID with a per-route skip value in src[3] (>= 0: another call computes the route), as the cold bank
+// call of a prompt batch with a hot bank. A backend may leave those routes out (zero rows) or compute them; the
+// routes are compared after the cold mask, so both are correct. Some tokens skip every route, some none.
+struct test_mul_mat_id_route_skip : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool b; // broadcast b matrix (gate/up), else one row per route (down)
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_ROUTE_SKIP";
+    }
+
+    // the skipped rows differ before the mask; only the masked output is defined
+    bool run_whole_graph() override { return true; }
+
+    const char * required_fusion() override { return "mmq_route_skip"; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_route_skip(ggml_type type_a = GGML_TYPE_IQ3_XXS, int n_mats = 32, int n_used = 10, bool b = true,
+            int64_t m = 128, int64_t n = 64, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        ggml_set_name(x, "b");
+        ggml_tensor * skip = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(skip, "skip");
+        ggml_tensor * mm = ggml_mul_mat_id(ctx, as, x, ids);
+        mm->src[3] = skip;
+        ggml_tensor * cold = ggml_step(ctx, ggml_scale_bias(ctx, skip, -1.0f, -0.5f)); // 1 where skip < 0
+        ggml_tensor * out = ggml_mul(ctx, mm, cold);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        std::default_random_engine rng(1234);
+        ggml_tensor * skip = ggml_get_tensor(ctx, "skip");
+        std::vector<float> v(ggml_nelements(skip));
+        for (int64_t t = 0; t < n; ++t) {
+            for (int64_t i = 0; i < n_used; ++i) {
+                const bool hot = t % 7 == 3 ? true : t % 7 == 5 ? false : rng() % 2 == 0;
+                v[t*n_used + i] = hot ? (float) (rng() % 4) : -1.0f;
+            }
+        }
+        ggml_backend_tensor_set(skip, v.data(), 0, ggml_nbytes(skip));
+    }
+};
+
+// fork AIPFIX ONECHAIN (llama-graph.cpp build_moe_onechain_fill): a prompt batch of a banked layer runs one expert
+// chain. Regular product (bank routes skipped via src[3]), times the cold mask in place, plus the AI+ bank product
+// (bank slot or -1) in place. CUDA writes the bank product straight into the regular output.
+struct test_moe_onechain_fill : public test_case {
+    const ggml_type bank_type, base_type;
+    const bool b; // broadcast input (gate/up), else one row per route (down)
+    const int64_t m, n, k;
+    const int n_mats = 32, n_bank = 8, n_used = 10;
+
+    test_moe_onechain_fill(ggml_type bank_type, ggml_type base_type, bool b, int64_t m, int64_t n, int64_t k)
+        : bank_type(bank_type), base_type(base_type), b(b), m(m), n(n), k(k) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_ONECHAIN_FILL"; }
+    std::string vars() override { return VARS_TO_STR6(bank_type, base_type, b, m, n, k); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    const char * required_fusion() override {
+        const char * enabled = getenv("GGML_CUDA_MOE_ONECHAIN_FUSE");
+        return !enabled || atoi(enabled) ? "moe_onechain_fill" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, k, m, n_mats);
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, k, m, n_bank);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        ggml_tensor * ci = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_tensor * skip = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(ci, "onechain_regular_ids"); ggml_set_name(hi, "onechain_bank_ids"); ggml_set_name(skip, "skip");
+        ggml_tensor * cold = ggml_step(ctx, ggml_scale_bias(ctx, skip, -1.0f, -0.5f)); // 1 where skip < 0
+        ggml_build_forward_expand(gf, cold);
+        ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ci);
+        c->src[3] = skip;
+        ggml_build_forward_expand(gf, c);
+        ggml_tensor * kept = ggml_mul_inplace(ctx, c, cold);
+        ggml_build_forward_expand(gf, kept);
+        ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, hi);
+        ggml_set_name(h, "moe_onechain_bank");
+        ggml_build_forward_expand(gf, h);
+        ggml_tensor * out = ggml_add_inplace(ctx, kept, h);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(4321);
+        std::vector<int32_t> regular(n_used*n), bank(n_used*n);
+        std::vector<float> skip(n_used*n);
+        for (int64_t t = 0; t < n; ++t) {
+            std::vector<int32_t> experts(n_mats);
+            std::iota(experts.begin(), experts.end(), 0);
+            std::shuffle(experts.begin(), experts.end(), rng);
+            std::vector<int32_t> slots(n_bank);
+            std::iota(slots.begin(), slots.end(), 0);
+            std::shuffle(slots.begin(), slots.end(), rng);
+            int used_slots = 0;
+            for (int i = 0; i < n_used; ++i) {
+                const int64_t j = t*n_used + i;
+                // some tokens are all bank, some all regular, the rest mixed
+                const bool hot = used_slots < n_bank && (t % 7 == 3 ? true : t % 7 == 5 ? false : rng() % 3 == 0);
+                regular[j] = experts[i];
+                bank[j] = hot ? slots[used_slots++] : -1;
+                skip[j] = hot ? (float) bank[j] : -1.0f;
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "onechain_regular_ids") == 0) {
+                ggml_backend_tensor_set(t, regular.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "onechain_bank_ids") == 0) {
+                ggml_backend_tensor_set(t, bank.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "skip") == 0) {
+                ggml_backend_tensor_set(t, skip.data(), 0, ggml_nbytes(t));
+            } else if (t->op == GGML_OP_NONE && is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -11890,6 +12037,396 @@ struct test_moe_reduce : public test_case {
         out = shexp_gate == 1 ? ggml_add(ctx, out, gated) : ggml_add(ctx, gated, out);
         ggml_set_name(out, "moe_combine");
         return out;
+    }
+};
+
+struct test_moe_bank_mixed : public test_case {
+    const ggml_type bank_type, base_type;
+    const int width, mode, channels;
+    const bool extra_reader, reduce;
+    const int n_in, n_out, n_used;
+    test_moe_bank_mixed(ggml_type bank_type, ggml_type base_type, int width, int mode, int channels,
+            bool extra_reader = false, bool reduce = false, int n_in = 256, int n_out = 32, int n_used = 4) :
+        bank_type(bank_type), base_type(base_type), width(width), mode(mode), channels(channels),
+        extra_reader(extra_reader), reduce(reduce), n_in(n_in), n_out(n_out), n_used(n_used) {}
+    std::string vars() override {
+        return VARS_TO_STR9(bank_type, base_type, width, mode, channels, extra_reader, reduce, n_in, n_out) +
+                "," + VAR_TO_STR(n_used);
+    }
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    bool direct_mmvq_width() const {
+        // Above these widths some CUDA architectures use native MMQ; exact tests check that fallback.
+        switch (base_type) {
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_IQ3_XXS: return width <= 7;
+            case GGML_TYPE_IQ3_S:   return width <= 6;
+            case GGML_TYPE_Q3_K:    return width <= 5;
+            default:               return true;
+        }
+    }
+    const char * required_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return !extra_reader && base_type != GGML_TYPE_F32 && direct_mmvq_width() &&
+                (!enabled || atoi(enabled)) ? "moe_bank_mixed" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return extra_reader || base_type == GGML_TYPE_F32 || (enabled && !atoi(enabled)) ? "moe_bank_mixed" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, channels, width);
+        ggml_tensor * hi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, width);
+        ggml_tensor * ci = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, width);
+        ggml_set_name(hi, "mixed_bank_ids"); ggml_set_name(ci, "mixed_base_ids");
+        ggml_tensor * mask = ggml_reshape_3d(ctx,
+                ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, hi, GGML_TYPE_F32), -1.0f, -0.5f)), 1, n_used, width);
+        ggml_build_forward_expand(gf, mask);
+        ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, hi);
+        ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ci);
+        ggml_tensor * out = ggml_add(ctx, h, ggml_mul(ctx, c, mask));
+        if (reduce) {
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, width);
+            out = ggml_reshape_2d(ctx, ggml_sum_rows(ctx,
+                    ggml_cont(ctx, ggml_permute(ctx, ggml_mul(ctx, out, weights), 1, 0, 2, 3))), n_out, width);
+        }
+        return extra_reader ? ggml_add(ctx, out, h) : out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32 && t->op == GGML_OP_NONE) {
+                const bool bank = strcmp(t->name, "mixed_bank_ids") == 0;
+                std::vector<int32_t> values(n_used*width);
+                for (int j = 0; j < n_used*width; ++j) {
+                    const bool hot = mode == 1 || (mode == 2 && (j%3) != 0);
+                    values[j] = bank ? (hot ? (j*3 + j/n_used)%4 : -1) : (j + j/n_used)%4;
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_moe_bank_mixed_exact : public test_moe_bank_mixed {
+    const bool repeated_routes, mapped_routes;
+    ggml_tensor * mixed_result = nullptr;
+    ggml_tensor * reference_result = nullptr;
+    ggml_tensor * native_ids = nullptr;
+    ggml_tensor * route_map = nullptr;
+    std::vector<int32_t> expected_ids;
+    std::vector<float> expected_mask;
+    test_moe_bank_mixed_exact(ggml_type bank_type, int width, ggml_type base_type = GGML_TYPE_IQ4_NL,
+            int mode = 1, int channels = 4, int n_in = 640, int n_out = 2560,
+            bool repeated_routes = false, bool mapped_routes = false, int n_used = 4) :
+        test_moe_bank_mixed(bank_type, base_type, width, mode, channels, false, false, n_in, n_out, n_used),
+        repeated_routes(repeated_routes), mapped_routes(mapped_routes) {}
+    std::string vars() override {
+        return test_moe_bank_mixed::vars() + "," + VAR_TO_STR(repeated_routes) + "," + VAR_TO_STR(mapped_routes);
+    }
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED_EXACT"; }
+    const char * required_fusion() override {
+        const char * required = test_moe_bank_mixed::required_fusion();
+        return mapped_routes && required ? "moe_bank_routing" : required;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (mapped_routes) {
+            ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
+            ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, channels, width);
+            native_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used + 2, width);
+            ggml_set_name(native_ids, "mixed_base_ids");
+            ggml_tensor * ids = ggml_view_2d(ctx, native_ids, n_used, width, native_ids->nb[1], 0);
+            route_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 4);
+            ggml_build_forward_expand(gf, ids);
+            ggml_build_forward_expand(gf, x);
+            ggml_tensor * flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ids), n_used*width, 1);
+            ggml_tensor * slot = ggml_reshape_3d(ctx, ggml_get_rows(ctx, route_map, flat), 1, n_used, width);
+            ggml_tensor * hi = ggml_cast(ctx, ggml_reshape_2d(ctx, slot, n_used, width), GGML_TYPE_I32);
+            ggml_tensor * mask = ggml_reshape_3d(ctx,
+                    ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, hi, GGML_TYPE_F32), -1.0f, -0.5f)), 1, n_used, width);
+            ggml_set_output(hi);
+            ggml_set_output(mask);
+            ggml_build_forward_expand(gf, mask);
+            mixed_result = ggml_add(ctx, ggml_mul_mat_id(ctx, hw, x, hi),
+                    ggml_mul(ctx, ggml_mul_mat_id(ctx, cw, x, ids), mask));
+        } else {
+            mixed_result = test_moe_bank_mixed::build_graph(ctx);
+        }
+        ggml_set_output(mixed_result);
+        ggml_build_forward_expand(gf, mixed_result);
+        ggml_tensor * h = mixed_result->src[0], * c = mixed_result->src[1]->src[0];
+        ggml_tensor * hot = ggml_mul_mat_id(ctx, h->src[0], h->src[1], h->src[2]);
+        ggml_set_output(hot);
+        ggml_build_forward_expand(gf, hot);
+        ggml_tensor * cold = ggml_mul_mat_id(ctx, c->src[0], c->src[1], c->src[2]);
+        reference_result = ggml_add(ctx, hot, ggml_mul(ctx, cold, mixed_result->src[1]->src[1]));
+        ggml_set_output(reference_result);
+        return reference_result;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_moe_bank_mixed::initialize_tensors(ctx);
+        if (!repeated_routes) { return; }
+        // The all-hot case has n_used*width occurrences of one bank slot. Mixed cases
+        // interleave cold routes and a second hot slot, including odd final groups.
+        const float map[] = { 2.0f, -1.0f, 0.0f, 3.0f };
+        std::vector<int32_t> native(n_used*width);
+        expected_ids.resize(n_used*width);
+        expected_mask.resize(n_used*width);
+        for (int j = 0; j < n_used*width; ++j) {
+            native[j] = mode == 1 ? 0 : j%5 == 0 ? 1 : j%7 == 0 ? 2 : 0;
+            expected_ids[j] = (int32_t) map[native[j]];
+            expected_mask[j] = expected_ids[j] < 0 ? 1.0f : 0.0f;
+        }
+        if (mapped_routes) {
+            ggml_backend_tensor_set(route_map, map, 0, sizeof(map));
+            std::vector<int32_t> storage((n_used + 2)*width, 3);
+            for (int t = 0; t < width; ++t) {
+                std::copy_n(native.data() + n_used*t, n_used, storage.data() + (n_used + 2)*t);
+            }
+            ggml_backend_tensor_set(native_ids, storage.data(), 0, storage.size()*sizeof(int32_t));
+        } else {
+            ggml_tensor * hi = mixed_result->src[0]->src[2];
+            ggml_tensor * ci = mixed_result->src[1]->src[0]->src[2];
+            ggml_backend_tensor_set(hi, expected_ids.data(), 0, expected_ids.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(ci, native.data(), 0, native.size()*sizeof(int32_t));
+        }
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { mixed_result, reference_result }; }
+    bool verify_backend_result(ggml_backend_t backend) override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        const char * disabled = getenv("GGML_CUDA_DISABLE_FUSION");
+        if ((enabled && !atoi(enabled)) || (disabled && atoi(disabled))) { return true; }
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count")) { return true; }
+        std::vector<uint32_t> actual(ggml_nelements(mixed_result)), expected(actual.size());
+        ggml_backend_tensor_get(mixed_result, actual.data(), 0, actual.size()*sizeof(uint32_t));
+        ggml_backend_tensor_get(reference_result, expected.data(), 0, expected.size()*sizeof(uint32_t));
+        if (actual != expected) {
+            if (getenv("GGML_TEST_EXACT_DIAG")) {
+                const int64_t ne0 = mixed_result->ne[0], nr = (int64_t) actual.size()/ne0;
+                for (int64_t r = 0; r < nr; ++r) {
+                    int64_t nd = 0, first = -1; float md = 0.0f;
+                    for (int64_t i = 0; i < ne0; ++i) {
+                        float a, e; memcpy(&a, &actual[r*ne0 + i], 4); memcpy(&e, &expected[r*ne0 + i], 4);
+                        if (actual[r*ne0 + i] != expected[r*ne0 + i]) { nd += 1; if (first < 0) { first = i; } md = std::max(md, fabsf(a - e)); }
+                    }
+                    printf("[diag] row %lld: %lld/%lld differ, first %lld, max|d| %g\n", (long long) r, (long long) nd, (long long) ne0, (long long) first, md);
+                }
+            }
+            printf("mixed projection differs from native projection ");
+            return false;
+        }
+        if (mapped_routes) {
+            std::vector<int32_t> ids(expected_ids.size());
+            std::vector<float> mask(expected_mask.size());
+            ggml_backend_tensor_get(mixed_result->src[0]->src[2], ids.data(), 0, ids.size()*sizeof(int32_t));
+            ggml_backend_tensor_get(mixed_result->src[1]->src[1], mask.data(), 0, mask.size()*sizeof(float));
+            if (ids != expected_ids || mask != expected_mask) {
+                printf("grouped routing metadata differs from native map ");
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+struct test_moe_bank_routing : public test_moe_bank_mixed {
+    const bool strided_ids;
+    ggml_tensor * native_ids = nullptr;
+    ggml_tensor * map = nullptr;
+    ggml_tensor * bank_ids = nullptr;
+    ggml_tensor * cold_mask = nullptr;
+    ggml_tensor * result = nullptr;
+    test_moe_bank_routing(int width, bool strided_ids) :
+        test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_IQ3_XXS, width, 2, 1, false, false, 2560, 640),
+        strided_ids(strided_ids) {}
+    std::string vars() override { return test_moe_bank_mixed::vars() + "," + VAR_TO_STR(strided_ids); }
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_ROUTING"; }
+    const char * required_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return direct_mmvq_width() && (!enabled || atoi(enabled)) ? "moe_bank_routing" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return enabled && !atoi(enabled) ? "moe_bank_routing" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_in, 1, width);
+        native_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided_ids ? 6 : 4, width);
+        ggml_tensor * ids = strided_ids ? ggml_view_2d(ctx, native_ids, 4, width, native_ids->nb[1], 0) : native_ids;
+        map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 4);
+        ggml_build_forward_expand(gf, ids);
+        ggml_build_forward_expand(gf, x);
+        ggml_tensor * flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ids), 4*width, 1);
+        ggml_tensor * slot = ggml_reshape_3d(ctx, ggml_get_rows(ctx, map, flat), 1, 4, width);
+        bank_ids = ggml_cast(ctx, ggml_reshape_2d(ctx, slot, 4, width), GGML_TYPE_I32);
+        cold_mask = ggml_reshape_3d(ctx,
+                ggml_step(ctx, ggml_scale_bias(ctx, ggml_cast(ctx, bank_ids, GGML_TYPE_F32), -1.0f, -0.5f)), 1, 4, width);
+        ggml_set_output(bank_ids);
+        ggml_set_output(cold_mask);
+        ggml_build_forward_expand(gf, cold_mask);
+        ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, bank_ids);
+        ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ids);
+        result = ggml_add(ctx, h, ggml_mul(ctx, c, cold_mask));
+        return result;
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { bank_ids, cold_mask, result }; }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_moe_bank_mixed::initialize_tensors(ctx);
+        const float values[] = { 3.0f, -1.0f, 0.0f, -1.0f };
+        ggml_backend_tensor_set(map, values, 0, sizeof(values));
+        std::vector<int32_t> ids(ggml_nelements(native_ids), 2);
+        for (int t = 0; t < width; ++t) {
+            for (int e = 0; e < 4; ++e) { ids[t*native_ids->ne[0] + e] = (e + t)%4; }
+        }
+        ggml_backend_tensor_set(native_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+        std::vector<int32_t> stale_ids(4*width, -73);
+        std::vector<float> stale_mask(4*width, 9.0f);
+        ggml_backend_tensor_set(bank_ids, stale_ids.data(), 0, stale_ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(cold_mask, stale_mask.data(), 0, stale_mask.size()*sizeof(float));
+    }
+    bool verify_backend_result(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        std::vector<int32_t> ids(4*width);
+        std::vector<float> mask(4*width);
+        ggml_backend_tensor_get(bank_ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+        ggml_backend_tensor_get(cold_mask, mask.data(), 0, mask.size()*sizeof(float));
+        const int32_t slots[] = { 3, -1, 0, -1 };
+        for (int t = 0; t < width; ++t) {
+            for (int e = 0; e < 4; ++e) {
+                const int slot = slots[(e + t)%4];
+                if (ids[t*4 + e] != slot || mask[t*4 + e] != (slot < 0 ? 1.0f : 0.0f)) {
+                    printf("mixed routing did not materialize bank IDs and mask ");
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+};
+
+// Routed up then gate over the same routes: CUDA computes both projections in one paired launch.
+struct test_moe_bank_pair : public test_moe_bank_routing {
+    ggml_tensor * up_result = nullptr;
+    test_moe_bank_pair(int width, bool strided_ids) : test_moe_bank_routing(width, strided_ids) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_PAIR"; }
+    const char * required_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        const char * pair = getenv("GGML_MOE_BANK_MIXED_PAIR");
+        const char * glu = getenv("GGML_MOE_BANK_MIXED_GLU");
+        if (!direct_mmvq_width() || (enabled && !atoi(enabled)) || (pair && !atoi(pair))) {
+            return nullptr;
+        }
+        return !glu || atoi(glu) ? "moe_bank_pair_glu" : "moe_bank_pair";
+    }
+    const char * forbidden_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        const char * pair = getenv("GGML_MOE_BANK_MIXED_PAIR");
+        const char * glu = getenv("GGML_MOE_BANK_MIXED_GLU");
+        return (enabled && !atoi(enabled)) || (pair && !atoi(pair)) ? "moe_bank_pair" :
+               glu && !atoi(glu) ? "moe_bank_pair_glu" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        up_result = test_moe_bank_routing::build_graph(ctx);
+        ggml_tensor * x = up_result->src[0]->src[1];
+        ggml_tensor * ids = up_result->src[1]->src[0]->src[2];
+        ggml_tensor * hw = ggml_new_tensor_3d(ctx, bank_type, n_in, n_out, 4);
+        ggml_tensor * cw = ggml_new_tensor_3d(ctx, base_type, n_in, n_out, 4);
+        ggml_tensor * h = ggml_mul_mat_id(ctx, hw, x, bank_ids);
+        ggml_tensor * c = ggml_mul_mat_id(ctx, cw, x, ids);
+        ggml_tensor * gate = ggml_add(ctx, h, ggml_mul(ctx, c, cold_mask));
+        ggml_set_output(up_result);
+        result = ggml_swiglu_split(ctx, gate, up_result);
+        return result;
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { bank_ids, cold_mask, up_result, result }; }
+};
+
+struct test_moe_bank_mixed_reduce : public test_moe_bank_mixed {
+    ggml_tensor * mixed_result = nullptr;
+    ggml_tensor * reference_result = nullptr;
+    test_moe_bank_mixed_reduce(ggml_type bank_type, int width) :
+        test_moe_bank_mixed(bank_type, GGML_TYPE_IQ4_NL, width, 2, 4, false, false, 640, 2560) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED_REDUCE"; }
+    // the banked down launch writes the routed sum itself unless GGML_MOE_BANK_MIXED_REDUCE=0
+    bool down_reduce() const {
+        const char * enabled = getenv("GGML_MOE_BANK_MIXED_REDUCE");
+        return (!enabled || atoi(enabled)) && direct_mmvq_width() && width <= 8;
+    }
+    const char * required_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return !enabled || atoi(enabled) ? (down_reduce() ? "moe_bank_down_reduce" : "moe_bank_mixed_reduce") : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        return enabled && !atoi(enabled) ? "moe_bank_mixed_reduce" : !down_reduce() ? "moe_bank_down_reduce" : nullptr;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts = test_moe_bank_mixed::build_graph(ctx);
+        ggml_tensor * cold_mask = experts->src[1]->src[1];
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 4, width);
+        auto sum = [&](ggml_tensor * x, ggml_tensor * w) {
+            return ggml_reshape_2d(ctx, ggml_sum_rows(ctx,
+                    ggml_cont(ctx, ggml_permute(ctx, ggml_mul(ctx, x, w), 1, 0, 2, 3))), n_out, width);
+        };
+        mixed_result = sum(experts, weights);
+        ggml_set_output(mixed_result);
+        ggml_build_forward_expand(gf, mixed_result);
+        // Keep the reference outside the mixed matcher, using the same projection output bytes.
+        ggml_tensor * copy = ggml_dup(ctx, experts);
+        ggml_tensor * cold_weights = ggml_mul(ctx, weights, cold_mask);
+        ggml_tensor * hot_weights = ggml_sub(ctx, weights, cold_weights);
+        reference_result = ggml_add(ctx, sum(copy, hot_weights), sum(copy, cold_weights));
+        ggml_set_output(reference_result);
+        return reference_result;
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { mixed_result, reference_result }; }
+    bool verify_backend_result(ggml_backend_t backend) override {
+        const char * enabled = getenv("LLAMA_MOE_BANK_MIXED");
+        const char * small = getenv("LLAMA_MOE_SMALL_REDUCE");
+        const char * disabled = getenv("GGML_CUDA_DISABLE_FUSION");
+        if ((enabled && !atoi(enabled)) || (disabled && atoi(disabled)) || (width != 1 && small && !atoi(small))) {
+            return true;
+        }
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count")) {
+            return true;
+        }
+        std::vector<uint32_t> actual(ggml_nelements(mixed_result)), expected(actual.size());
+        ggml_backend_tensor_get(mixed_result, actual.data(), 0, actual.size()*sizeof(uint32_t));
+        ggml_backend_tensor_get(reference_result, expected.data(), 0, expected.size()*sizeof(uint32_t));
+        if (actual != expected) {
+            size_t first = actual.size(), count = 0;
+            double max_abs = 0.0;
+            uint32_t max_ulp = 0;
+            auto ordered = [](uint32_t bits) { return bits & 0x80000000u ? ~bits : bits ^ 0x80000000u; };
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (actual[i] == expected[i]) { continue; }
+                if (first == actual.size()) { first = i; }
+                ++count;
+                float a, b;
+                memcpy(&a, &actual[i], sizeof(a)); memcpy(&b, &expected[i], sizeof(b));
+                max_abs = std::max(max_abs, std::abs(double(a) - double(b)));
+                const uint32_t oa = ordered(actual[i]), ob = ordered(expected[i]);
+                max_ulp = std::max(max_ulp, oa > ob ? oa - ob : ob - oa);
+            }
+            float a, b;
+            memcpy(&a, &actual[first], sizeof(a)); memcpy(&b, &expected[first], sizeof(b));
+            printf("mixed reduction differs: first=%zu actual=%.9g/%08x expected=%.9g/%08x count=%zu max_abs=%.9g max_ulp=%u ",
+                    first, a, actual[first], b, expected[first], count, max_abs, max_ulp);
+            return false;
+        }
+        return true;
     }
 };
 
@@ -15251,6 +15788,37 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     }
 }
 
+// AIT2P_U (unit bytes, AIT2P pair-table levels) at the Flash-Next expert shapes: gate/up K 2560 x M 640 (H256, broadcast
+// src1), down K 640 x M 2560 (H128); decode / MTP-verify widths 1-8, then prompt widths; MUL_MAT_ID on a 221-expert bank
+// stack top 10 with repeated and skipped ids. Also small shapes and partial row tiles.
+static void add_ait2pu_cases(std::vector<std::unique_ptr<test_case>> & cases, ggml_type t = GGML_TYPE_AIT2P_U) {
+    const bool v2 = ggml_ai4v2_rate(t) != 0;   // row-scale types: K % 640 == 0 only
+    for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33, 64, 65, 512, 600}) {
+        cases.emplace_back(new test_mul_mat_ai4(640,  n, 2560, t));
+        cases.emplace_back(new test_mul_mat_ai4(2560, n, 640,  t));
+    }
+    for (int64_t n : {1, 5, 9, 130}) {
+        cases.emplace_back(new test_mul_mat_ai4(48, n, 1280, t));   // 10 chunks: nk % 4 == 2 control for every unit type
+        if (v2) { continue; }
+        cases.emplace_back(new test_mul_mat_ai4(16,  n, 128,  t));
+        cases.emplace_back(new test_mul_mat_ai4(48,  n, 384,  t));
+        cases.emplace_back(new test_mul_mat_ai4(400, n, 3072, t));
+    }
+    for (int skip : {0, 1}) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 64, 512}) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 221, 10, true,  640,  n, 2560, false, false, skip));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 221, 10, false, 2560, n, 640,  false, false, skip));
+        }
+    }
+    for (int n : {1, 4, 8, 9, 33}) {
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2560, true));
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 640,  true));
+        if (v2) { continue; }
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 32, n, 384, true, false, 1));
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, true, 48, n, 256, false, false, 1));
+    }
+}
+
 // AI+ expert bank (Flash-Next hot bank) MUL_MAT_ID: every AI+ unit type at the expert shapes (gate/up 640 x 2560 with a
 // broadcast src1, down 2560 x 640 H128), a 221-expert stack, top 10, decode / MTP-verify widths 1-8 and prompt widths,
 // with and without skipped (-1 / out-of-stack) ids. The prompt widths run the GEMM-ID kernels (BN64 / BN128).
@@ -15392,6 +15960,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     add_ai23_cases(test_cases);
     add_ai_bank_cases(test_cases);
+    add_ait2pu_cases(test_cases);
+    add_ait2pu_cases(test_cases, GGML_TYPE_AIT2_U2);
+    add_ait2pu_cases(test_cases, GGML_TYPE_AIT3_U2);
+    // U2 reference decoding: odd chunk count, multiple slabs, and the small-output fallback.
+    // The last case must also work with GGML_CUDA_AI23_SMALL_SPLIT=2/4.
+    for (ggml_type type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
+        test_cases.emplace_back(new test_mul_mat_ai4(48, 1, 640, type));
+        test_cases.emplace_back(new test_mul_mat_ai4(128, 1, 1280, type));
+        test_cases.emplace_back(new test_mul_mat_ai4(144, 4, 5120, type));
+    }
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int64_t n : {1, 9, 512}) {
@@ -18847,6 +19425,142 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (ggml_type base : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS }) {
+            for (int width : { 1, 4, 8 }) {
+                for (int mode : { 0, 1, 2 }) {
+                    for (int channels : { 1, 4 }) {
+                        test_cases.emplace_back(new test_moe_bank_mixed(bank, base, width, mode, channels));
+                    }
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_IQ2_XS, 4, 2, 4, true));
+    // AIT2P_U bank on the production expert shapes and base types (specialized and generic mixed launches).
+    for (int width : { 1, 4, 5, 8 }) {
+        for (int mode : { 0, 1, 2 }) {
+            for (ggml_type base : { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS }) {
+                test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2P_U, base, width, mode, 1, false, true, 2560, 640));
+            }
+            test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2P_U, GGML_TYPE_Q2_0, width, mode, 4, false, true, 640, 2560));
+            test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2P_U, GGML_TYPE_Q4_0, width, mode, 4));
+        }
+        test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT2P_U, width));
+        test_cases.emplace_back(new test_moe_bank_mixed_reduce(GGML_TYPE_AIT2P_U, width));
+        for (int channels : { 1, 4 }) {
+            test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT2P_U, width, GGML_TYPE_IQ4_NL, 2, channels, 2560, 640, true, false));
+        }
+    }
+    test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_F32, 4, 2, 4));
+    for (int width : { 1, 4, 8 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+            test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ2_XS, width, 2, 4, false, true));
+            test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ3_XXS, width, 2, 1, false, true, 2560, 640));
+            test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ4_NL, width, 2, 4, false, true, 640, 2560));
+        }
+        // all-AI+ banked experts: AIT4_U down over the IQ4_NL cold down
+        for (int mode : { 0, 1, 2 }) {
+            test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT4_U, GGML_TYPE_IQ4_NL, width, mode, 4, false, mode == 2, 640, 2560));
+        }
+    }
+
+    for (int width : { 1, 4, 5, 8 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_IQ4_NL }) {
+            test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width));
+        }
+        for (bool strided_ids : { false, true }) {
+            test_cases.emplace_back(new test_moe_bank_routing(width, strided_ids));
+            test_cases.emplace_back(new test_moe_bank_pair(width, strided_ids));
+        }
+        test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT2_U, GGML_TYPE_Q2_0,
+                width, 2, 4, false, true, 640, 2560));
+        for (int mode : { 0, 1, 2 }) {
+            test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL,
+                    width, mode, 4, false, true, 640, 2560));
+        }
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_IQ4_NL }) {
+            test_cases.emplace_back(new test_moe_bank_mixed_reduce(bank, width));
+        }
+    }
+
+    for (ggml_type type_a : { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q4_K }) {
+        for (bool b : { true, false }) {
+            for (int n : { 9, 64, 600 }) {
+                test_cases.emplace_back(new test_mul_mat_id_route_skip(type_a, 32, 10, b, 128, n, 256));
+            }
+        }
+    }
+    for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+        for (int n : { 9, 64, 600 }) {
+            test_cases.emplace_back(new test_moe_onechain_fill(bank, GGML_TYPE_IQ3_XXS, true,  128, n, 512)); // gate/up
+            test_cases.emplace_back(new test_moe_onechain_fill(bank, GGML_TYPE_Q2_0,    false, 256, n, 640)); // down
+        }
+    }
+
+    // Explicit repeated routes exercise SPW columns, same-token duplicates, owners at
+    // ranks 8/16/24, raw-map routing, odd group tails, and the last partial output CTA.
+    for (int width : { 4, 5, 8 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+            for (int channels : { 1, 4 }) {
+                for (bool mapped : { false, true }) {
+                    if (mapped && channels != 1) { continue; } // routing-prefix fusion is an up/gate path
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, GGML_TYPE_IQ4_NL,
+                            1, channels, 640, 80, true, mapped));
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, GGML_TYPE_IQ4_NL,
+                            2, channels, 2560, 640, true, mapped));
+                }
+            }
+        }
+    }
+    // Widths below SPW at the production gate/up bases (unique and repeated routes), plus the cold Q2_0 down.
+    // Width 1 is left out: this graph's unfused reference is native four-warp MMVQ, while the production
+    // one-token path with the expert cache keeps the one-warp row order the mixed path uses.
+    for (int width : { 2, 3 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2 }) {
+            const bool ai3 = bank == GGML_TYPE_AIT3_U || bank == GGML_TYPE_AIT3_U2;
+            for (ggml_type base : { ai3 ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XXS, ai3 ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ2_XS,
+                                    ai3 ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL }) {
+                for (int channels : { 1, 4 }) {
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, base, 2, channels, 2560, 640));
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, base, 2, channels, 2560, 640, true));
+                }
+            }
+            test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, GGML_TYPE_Q2_0, 2, 4, 640, 2560));
+        }
+    }
+    // Production top-k10 crosses ballot chunks at both 32 and 64 routes.
+    for (int width : { 5, 8 }) {
+        for (int channels : { 1, 10 }) {
+            for (bool mapped : { false, true }) {
+                if (mapped && channels != 1) { continue; }
+                for (int mode : { 1, 2 }) {
+                    test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT2_U, width,
+                            GGML_TYPE_IQ4_NL, mode, channels, 640, 80, true, mapped, 10));
+                }
+            }
+        }
+    }
+
+    // Native direct-weight MMQ boundaries on Ampere; width 4 also requires mixed fusion to fire.
+    for (const auto & boundary : { std::make_pair(GGML_TYPE_IQ3_XXS, 4),
+                                  std::make_pair(GGML_TYPE_IQ3_XXS, 8),
+                                  std::make_pair(GGML_TYPE_IQ2_S, 8),
+                                  std::make_pair(GGML_TYPE_Q2_K, 8),
+                                  std::make_pair(GGML_TYPE_IQ3_S, 7),
+                                  std::make_pair(GGML_TYPE_IQ3_S, 8),
+                                  std::make_pair(GGML_TYPE_Q3_K, 6),
+                                  std::make_pair(GGML_TYPE_Q3_K, 8) }) {
+        const ggml_type base = boundary.first;
+        const ggml_type bank = base == GGML_TYPE_IQ3_XXS || base == GGML_TYPE_IQ3_S ? GGML_TYPE_AIT3_U : GGML_TYPE_AIT2_U;
+        for (int mode : { 0, 2 }) {
+            for (int channels : { 1, 4 }) {
+                test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, boundary.second, base,
+                        mode, channels, 2560, 640));
+            }
+        }
+    }
+
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     for (int64_t width : { 1, 3, 4, 5, 8, 9 }) {
         for (int mask : { 0, 1, 2, 3 }) {
@@ -19158,8 +19872,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 1000, 3, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 1000, 77, 1, 1, GGML_TYPE_F16));
     // Flash-Next verify widths (2..7 tokens take the one-read-per-key kernel), 100K-context pool count, both masks
-    for (int nb : { 2, 4, 5, 7 }) {
+    for (int nb : { 1, 2, 3, 4, 5, 6, 7 }) {
         test_cases.emplace_back(new test_lightning_indexer(128, 4, 25088, nb, 1, 1, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, 12345, nb, 1, 1, GGML_TYPE_F16)); // odd key count, F16 keys
         test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 25088, nb, 1, 1, GGML_TYPE_F32));
     }
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1001, 5, 2, 1, GGML_TYPE_F32));
@@ -19191,6 +19906,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // [AIPTAB] mixed-bank hot expert launches at the Flash-Next shapes, AIT2_U vs AIT2P_U: GGML_TEST_AIPTAB_PERF=1
+    if (getenv("GGML_TEST_AIPTAB_PERF") != nullptr && std::string(getenv("GGML_TEST_AIPTAB_PERF")) == "types") {
+        // placement table: expert types at the Flash-Next shapes, MUL_MAT_ID top-10 of 512, widths 1 / 4 / 5.
+        // down is K=640 (m=2560), gate/up is K=2560 (m=640); bytes per expert matrix goes to stderr.
+        struct shape_set { int64_t m, k; std::vector<ggml_type> types; };
+        const std::vector<shape_set> sets = {
+            { 2560, 640,  { GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0 } },
+            { 640,  2560, { GGML_TYPE_IQ4_XS, GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS } },
+        };
+        for (const auto & ss : sets) {
+            for (ggml_type t : ss.types) {
+                fprintf(stderr, "[bytes] %s m=%lld k=%lld bytes_per_expert=%zu\n", ggml_type_name(t), (long long) ss.m, (long long) ss.k,
+                        (size_t) (ggml_row_size(t, ss.k) * ss.m));
+                for (int64_t n : { 1, 4, 5 }) {
+                    const bool broadcast = ss.k == 2560;
+                    if (t == GGML_TYPE_AIT3_U || t == GGML_TYPE_AIT4_U) {
+                        test_cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, broadcast, ss.m, n, ss.k, false, true));
+                    } else {
+                        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, broadcast, ss.m, n, ss.k));
+                    }
+                }
+            }
+        }
+        return test_cases;
+    }
+    if (getenv("GGML_TEST_AIPTAB_PERF") != nullptr) {
+        for (int width : { 1, 3, 5 }) {
+            for (ggml_type bank : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U }) {
+                test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_IQ2_XXS, width, 1, 1, false, false, 2560, 640, 8));
+                test_cases.emplace_back(new test_moe_bank_mixed(bank, GGML_TYPE_Q2_0, width, 1, 1, false, false, 640, 2560, 8));
+            }
+        }
+        return test_cases;
+    }
     // [PFGAP-U3] Flash-Next non-routed prompt matmuls (attention, GDN output, shared expert): GGML_TEST_FN_DENSE_PERF=1
     if (getenv("GGML_TEST_FN_DENSE_PERF") != nullptr) {
         add_fn_dense_cases(test_cases);
@@ -19280,7 +20029,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 640, 2560 }, { 2560, 640 } }) {
                 const bool broadcast = mk.second == 2560;
                 for (int64_t n : { 1, 2, 3, 4, 5, 6, 512, 2048, 12288 }) {
-                    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+                    for (ggml_type t : { GGML_TYPE_AIT2_U, GGML_TYPE_AIT2P_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2 }) {
                         for (int ne : { 221, 512 }) {
                             test_cases.emplace_back(new test_mul_mat_id_ai4(t, ne, 10, broadcast, mk.first, n, mk.second, false, true));
                         }
@@ -20092,7 +20841,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 8192, 1, 1, GGML_TYPE_F32));
     }
     // Flash-Next QSA verify at 100K context: 25088 pooled keys, widths 1/4/5
-    for (int nb : { 1, 4, 5 }) {
+    for (int nb : { 1, 2, 3, 4, 5, 7 }) {
         test_cases.emplace_back(new test_lightning_indexer(128, 4, 25088, nb, 1, 1, GGML_TYPE_F32));
     }
     for (int kv : { 256, 4096, 65536 }) {

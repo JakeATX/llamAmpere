@@ -6,11 +6,16 @@
 #include "magic2-v2.cuh"
 #include "../ggml-aif25.h"
 #include "rpb-knobs.h"
+#include "quantize.cuh"
+#include "moe-weighted-reduction.cuh"
+#include "unary.cuh"
+#include "vecdotq.cuh"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -42,6 +47,7 @@
 //                            GGML_CUDA_AI23_TUNED=1, else 0; lane measurement used 6)
 //   GGML_CUDA_AI23_TUNED=1   select measured rate-2/3 decode and tile defaults (default off)
 //   GGML_CUDA_AI23_MMVR_STAGES=4|8  deeper dense fixed-K four-warp weight prefetch (default 2)
+//   GGML_CUDA_AI23_MIXED_STAGES=2|4|8  hot-route weight prefetch depth of the banked mixed MoE GEMV (default 4)
 //   GGML_CUDA_AI23_MMVR_UNROLL=1|2|4|8  dense fixed-K loop unroll (tuned 8 at long K, 4 otherwise)
 //   GGML_CUDA_AI23_MMVR_SINGLE_N=1  omit unused odd-column accumulators for dense N=1 (default off)
 //   GGML_CUDA_AI23_MMVR_SINGLE_ID=1  omit unused odd-column accumulators for direct experts (default off)
@@ -49,6 +55,7 @@
 //   GGML_CUDA_AI23_FUSED_X=1  quantize activations inside direct one-token expert blocks (default off)
 //   GGML_CUDA_AI23_DIRECT=1..8  skip expert grouping through this token width in MMVR (default off)
 //   GGML_CUDA_AI23_ID_BN=32|64|128  override rate-2/3 routed prompt GEMM tile width (default automatic)
+//   GGML_CUDA_AI23_ID_BN64_MAXR=R  automatic tiles: use the 64-route tile when routes < R x experts (default 64, 0 = off)
 //   GGML_CUDA_AI23_ID_STAGES=2|3  routed rate-2/3 prompt staging depth (default 3)
 //   GGML_CUDA_AI23_ID_SLABS=4|8  routed rate-2/3 prompt row slabs per block (default 8)
 //   GGML_CUDA_AI23_ID_THREADS=256  smaller routed prompt helper for <=1024 experts (default 1024)
@@ -70,6 +77,11 @@
 static int ai4_env_int(const char * name, const char * /*unused*/, int def) {
     const char * e = getenv(name);
     return e ? atoi(e) : def;
+}
+// fork: routed AI+ unit kernels; set GGML_CUDA_AIKERN=0 for the prior path.
+static bool ai4_aikern() {
+    static const bool v = ai4_env_int("GGML_CUDA_AIKERN", nullptr, 1) != 0;
+    return v;
 }
 static bool ai4_ai23_tuned() {
     static const bool v = ai4_env_int("GGML_CUDA_AI23_TUNED", nullptr, 0) != 0;
@@ -350,7 +362,7 @@ static bool ai4_mmvr_on() {
 // direct path was 28-42% faster than the mmv-ID kernel at widths 1-6 for 640x2560 / 2560x640 experts (kernel-only,
 // no end-to-end speed test yet). Unset: follows GGML_CUDA_AI23_MMVR, as before.
 static bool ai4_mmvr_on_id() {
-    static const bool v = getenv("GGML_CUDA_AI23_MMVR_ID") ? ai4_env_int("GGML_CUDA_AI23_MMVR_ID", nullptr, 0) != 0 : ai4_mmvr_on();
+    static const bool v = getenv("GGML_CUDA_AI23_MMVR_ID") ? ai4_env_int("GGML_CUDA_AI23_MMVR_ID", nullptr, 0) != 0 : (ai4_mmvr_on() || ai4_aikern());
     return v;
 }
 static int ai4_mmvr_cfg() {
@@ -429,6 +441,38 @@ static void ai23_launch_mmvr(const uint8_t * W, const int8_t * q, const float * 
     ai4k::launch_mmvr<LAY, XSH, ID, KT, STAGES, WARPS, MINB, DIRECT, FUSED_X, 1, 1, SINGLE_N>(W, q, s, Y, ldy, M, N, K, stream, idm, max_tiles);
 }
 
+static bool ai4_spw_enabled(int M, int K, const ai4k::idmap & idm, int max_tiles) {
+    static const int mode = ai4_env_int("GGML_CUDA_AIKERN_SPW", nullptr, 2);
+    if (!ai4_aikern() || mode == 0 || idm.direct_ids == nullptr || idm.direct_x != nullptr || M % 16 != 0) {
+        return false;
+    }
+    const int n_tok = max_tiles/idm.direct_n_used;
+    return mode != 2 || K == 640 || n_tok >= 4;
+}
+
+// fork AIPFIX D7 (defined after moe_mixed_group): cached AI+ experts, routes of one expert share a weight read
+template <int LAY, int XSH, int KT>
+static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
+                                  const ai4k::idmap & idm, int max_tiles);
+
+// fork: each warp owns 16 rows and scans K without a cross-warp sum.
+template <int LAY, int XSH, bool ID, int KT>
+static bool ai4_spw_try(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K,
+                        cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
+    if constexpr (!ID) {
+        return false;
+    } else {
+        if (!ai4_spw_enabled(M, K, idm, max_tiles)) {
+            return false;
+        }
+        if (ai4_table_grouped_try<LAY, XSH, KT>(q, s, Y, M, K, stream, idm, max_tiles)) {
+            return true;
+        }
+        ai4k::launch_mmvr<LAY, XSH, ID, KT, 2, 4, 6, true, false, 1, 1, false, true>(W, q, s, Y, M, M, 1, K, stream, idm, max_tiles);
+        return true;
+    }
+}
+
 template <int LAY, int XSH, bool ID, int KT>
 static bool ai4_mmvr_go(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K,
                         cudaStream_t stream, const ai4k::idmap & idm, int max_tiles) {
@@ -452,6 +496,9 @@ static bool ai4_mmvr_go(const uint8_t * W, const int8_t * q, const float * s, fl
         }
         const bool two_warps = cfg == 212 || (cfg == 0 && ID && N > 1 && K >= 1024);
         if constexpr (ID) {
+            if (ai4_spw_try<LAY, XSH, ID, KT>(W, q, s, Y, M, K, stream, idm, max_tiles)) {
+                return true;
+            }
             if (idm.direct_ids != nullptr) {
                 if (idm.direct_x != nullptr) {
                     ai23_launch_mmvr<LAY, XSH, ID, KT, 2, 4, 6, true, true>(W, q, s, Y, M, M, N, K, stream, idm, max_tiles);
@@ -502,10 +549,11 @@ template <int LAY, int XSH, bool ID>
 static bool ai4_mmvr_try(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K,
                          cudaStream_t stream, const ai4k::idmap & idm = ai4k::idmap{}, int max_tiles = 1) {
     constexpr int rate = ai4k::lay_rate<LAY>();
-    if constexpr (rate != 2 && rate != 3) {
+    constexpr bool r4 = LAY == ai4k::LAY_AIT4_U && ID;
+    if constexpr (rate != 2 && rate != 3 && !r4) {
         return false;
     } else {
-        if (!(ID ? ai4_mmvr_on_id() : ai4_mmvr_on())) {
+        if (r4 ? !ai4_aikern() : !(ID ? ai4_mmvr_on_id() : ai4_mmvr_on())) {
             return false;
         }
         const int cfg = ai4_mmvr_cfg();
@@ -660,17 +708,19 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
 static int ai4_lay_of(ggml_type t) {
     switch (t) {
         case GGML_TYPE_AIT2_U: return ai4k::LAY_AIT2_U;
+        case GGML_TYPE_AIT2P_U: return ai4k::LAY_AIT2P_U;
         case GGML_TYPE_AIT3_U: return ai4k::LAY_AIT3_U;
+        case GGML_TYPE_AIT2_U2: return ai4k::LAY_AIT2_U2;
+        case GGML_TYPE_AIT3_U2: return ai4k::LAY_AIT3_U2;
         case GGML_TYPE_AIT4_U: return ai4k::LAY_AIT4_U;
         case GGML_TYPE_AIT5_U: return ai4k::LAY_AIT5_U;
         default: GGML_ABORT("not an AI+ unit type");
     }
 }
 
-// Rate-2 / rate-3 IMMA kernels (generic window decode, ai4k::kr_win). Opt-in while new: GGML_CUDA_AI23_FAST=1 runs them,
-// unset keeps the rate-k reference path (reconstruct + SGEMM, host-routed MUL_MAT_ID).
+// Rate-2 / rate-3 IMMA kernels; GGML_CUDA_AI23_FAST overrides the routed AI+ default.
 static bool ai4_ai23_fast() {
-    static const bool v = ai4_env_int("GGML_CUDA_AI23_FAST", nullptr, 0) != 0;
+    static const bool v = ai4_env_int("GGML_CUDA_AI23_FAST", nullptr, ai4_aikern() ? 1 : 0) != 0;
     return v;
 }
 
@@ -707,6 +757,24 @@ static void ai23_split_width(const uint8_t * W, const int8_t * q, const float * 
     else { ai23_split_tile<64, LAY, XSH>(W, q, s, partial, M, N, K, splits, tile, stream); }
 }
 
+// AIT2P_U dense: mmvr (N <= 8) or the default GEMM; the other rate-2 variants decode the trellis only.
+template <int XSH>
+static void ai2p_mm_kernels(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K, cudaStream_t stream) {
+    constexpr int L = ai4k::LAY_AIT2P_U;
+    if (N <= 8) {
+        const ai4k::idmap idm{};
+        if (ai4_mmvr_kt()) {
+            if (ai4_mmvr_go<L, XSH, false,  640>(W, q, s, Y, M, N, K, stream, idm, 1)) return;
+            if (ai4_mmvr_go<L, XSH, false, 2560>(W, q, s, Y, M, N, K, stream, idm, 1)) return;
+        }
+        ai4_mmvr_go<L, XSH, false, 0>(W, q, s, Y, M, N, K, stream, idm, 1);
+    } else if (N >= ai4_bn128_min()) {
+        ai23_launch_gemm<128, 3, 4, L, XSH>(W, q, s, Y, M, M, N, K, stream);
+    } else {
+        ai23_launch_gemm<64, 3, 4, L, XSH>(W, q, s, Y, M, M, N, K, stream);
+    }
+}
+
 // W4A8 fast path: rotate+quantize the activations, then the AI+ decode-to-IMMA kernels
 static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const uint8_t * W, const float * X, float * Y,
                             int M, int N, int K) {
@@ -714,6 +782,12 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     const int xsh = K % 256 == 0 ? 1 : 0;
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) N*K);
     ggml_cuda_pool_alloc<float>  s(ctx.pool(), (size_t) N*(K >> (7 + xsh)));
+    if (t == GGML_TYPE_AIT2P_U) {
+        ai4_quantize_x(X, N, K, xsh, q.get(), s.get(), stream);
+        if (xsh) { ai2p_mm_kernels<1>(W, q.get(), s.get(), Y, M, N, K, stream); }
+        else     { ai2p_mm_kernels<0>(W, q.get(), s.get(), Y, M, N, K, stream); }
+        return;
+    }
     const ai23_dense_policy policy = ai23_dense_config(M, N, K, ai4_ampere_sms(ctx), ggml_ai4_rate(t));
     const int tile = policy.tile;
     const bool swap8 = (ggml_ai4_rate(t) == 2 || ggml_ai4_rate(t) == 3) && N > 8 && N <= 64 && (tile == 22 || tile == 23 || tile == 25 || tile == 27);
@@ -729,7 +803,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     else { ai4_quantize_x(X, N, K, xsh, q.get(), s.get(), stream); }
     const int rate = ggml_ai4_rate(t);
     static const int small_splits = ai4_env_int("GGML_CUDA_AI23_SMALL_SPLIT", nullptr, 0);
-    if ((rate == 2 || rate == 3) && N <= 8 && (K == 5120 || K == 17408) &&
+    // This optional launch expects a scale header for every 128-column chunk.
+    if ((rate == 2 || rate == 3) && !ggml_ai4v2_rate(t) && N <= 8 && (K == 5120 || K == 17408) &&
             (small_splits == 2 || small_splits == 4)) {
         ggml_cuda_pool_alloc<float> partial(ctx.pool(), (size_t) M*N*small_splits);
         // All valid two/three-bit layouts use H256 at these fixed K values.
@@ -759,6 +834,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
                 break;
             AI23_SPLIT_U(ai4k::LAY_AIT2_U)
             AI23_SPLIT_U(ai4k::LAY_AIT3_U)
+            AI23_SPLIT_U(ai4k::LAY_AIT2_U2)
+            AI23_SPLIT_U(ai4k::LAY_AIT3_U2)
 #undef AI23_SPLIT_U
             default: GGML_ABORT("unsupported AI23 split layout");
         }
@@ -783,6 +860,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             break;
         AI4_MM_U(ai4k::LAY_AIT2_U)
         AI4_MM_U(ai4k::LAY_AIT3_U)
+        AI4_MM_U(ai4k::LAY_AIT2_U2)
+        AI4_MM_U(ai4k::LAY_AIT3_U2)
         AI4_MM_U(ai4k::LAY_AIT4_U)
         AI4_MM_U(ai4k::LAY_AIT5_U)
 #undef AI4_MM_U
@@ -798,10 +877,13 @@ static bool ai4_is_type(ggml_type t) {
 // under GGML_CUDA_AI5_REF=1 (an A/B check of its rate-5 kernels); AIT2_U / AIT3_U unless GGML_CUDA_AI23_FAST=1.
 static bool ai4_ref_only_type(ggml_type t) {
     static const bool v = ai4_env_int("GGML_CUDA_AI5_REF", nullptr, 0) != 0;
+    if (t == GGML_TYPE_AIT2_U2 || t == GGML_TYPE_AIT3_U2) {
+        return false;   // row-scale layouts use native kernels when available
+    }
     if (t == GGML_TYPE_AIT5_U) {
         return v;
     }
-    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) {
+    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT2P_U || t == GGML_TYPE_AIT3_U) {
         return !ai4_ai23_fast();
     }
     return false;
@@ -813,7 +895,10 @@ static bool ai4_ref_only_type(ggml_type t) {
 // Default (unset or 1) keeps the reference path for MUL_MAT_ID; dense MUL_MAT keeps ai4_ref_only_type.
 static bool ai4_id_ref_only_type(ggml_type t) {
     static const bool id_ref = ai4_env_int("GGML_CUDA_AI23_ID_REF", nullptr, 1) != 0;
-    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) {
+    if (t == GGML_TYPE_AIT2_U2 || t == GGML_TYPE_AIT3_U2) {
+        return false;
+    }
+    if (t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT2P_U || t == GGML_TYPE_AIT3_U) {
         return id_ref && ai4_ref_only_type(t);
     }
     return ai4_ref_only_type(t);
@@ -855,7 +940,13 @@ static void ai4_zero_skipped(const ggml_tensor * ids, int n_used, int n_tok, int
 }
 
 static void ai4_reconstruct_any(const void * src, float * W, int64_t K, int64_t M, cudaStream_t stream, ggml_type t) {
-    GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t)));
+    GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t),
+                                          ggml_ai4v2_rate(t) != 0));
+}
+
+// fork AIPFIX ONEPATH check: the f32 image [M][K] of an AI+ unit matrix in the original basis (reference only)
+void ggml_cuda_moe_ai_reconstruct(const void * src, ggml_type type, float * W, int64_t K, int64_t M, cudaStream_t stream) {
+    ai4_reconstruct_any(src, W, K, M, stream, type);
 }
 
 static bool ai4_fast_ok(const ggml_backend_cuda_context & ctx) {
@@ -933,7 +1024,7 @@ static void ai4_ref_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             ai4_reconstruct_any(src, w.get(), K, mm, stream, src0->type);
         } else {
             GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(src0->type), src, w.get(), K, mm, !emul, stream,
-                                                    ggml_ai4_trellis_mul(src0->type)));
+                                                    ggml_ai4_trellis_mul(src0->type), ggml_ai4v2_rate(src0->type) != 0));
         }
         // C(mm x T) at row m0 of the M x T result. ldc = M, so column t lands at Y[t*M + m0].
         CUBLAS_CHECK(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
@@ -953,8 +1044,14 @@ bool ggml_cuda_ai4_id_needs_sync(int cc, ggml_type t) {
 bool ggml_cuda_ai4_supported(const ggml_tensor * op) {
     const ggml_tensor * a = op->src[0];
     const ggml_tensor * b = op->src[1];
+    // MUL_MAT_ID: each expert's rows must be dense, but experts may sit nb[2] apart (the host expert arena interleaves
+    // one expert's up/gate/down, so nb[2] spans all three). Every ID kernel addresses experts as W + e*nb[2]. Rejecting
+    // that stride sent prompt-size AI+ MUL_MAT_IDs from the arena to the CPU backend while 3XS ones were offloaded.
+    const bool a_rows_dense = a->nb[0] == ggml_type_size(a->type) && a->nb[1] == ggml_row_size(a->type, a->ne[0]) &&
+        a->nb[2] >= a->nb[1]*a->ne[1] && a->nb[2] % 16 == 0 && a->nb[3] == a->nb[2]*a->ne[2];
+    const bool a_ok = op->op == GGML_OP_MUL_MAT_ID ? a_rows_dense : ggml_is_contiguous(a);
     if (b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[1] % 16 != 0 ||
-            a->ne[3] != 1 || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
+            (ggml_ai4v2_rate(a->type) != 0 && a->ne[0] % 640 != 0) || a->ne[3] != 1 || !a_ok || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
         return false;
     }
     if (op->op == GGML_OP_MUL_MAT) {
@@ -1035,7 +1132,7 @@ static bool ai4_mmvid_route(int n_tok, int n_used, int n_expert, int rate) {
         return true;
     }
     const int p = getenv("GGML_CUDA_AI4_MMVID_PAIRS") ? ai4_mmvid_pairs() :
-        (ai4_ai23_tuned() && (rate == 2 || rate == 3) ? 4 : 0);
+        (((ai4_ai23_tuned() && (rate == 2 || rate == 3)) || (ai4_aikern() && rate >= 2 && rate <= 4)) ? 4 : 0);
     if (p <= 0 || n_expert <= 0) {
         return false;
     }
@@ -1153,7 +1250,7 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
 // token lists on the device (no host sync, graph-capturable), then mmv-ID (n_tok <= 8) or GEMM-ID over (active expert, token
 // tile) blocks. Only the selected experts' bytes are read, so a stack whose unused experts are not resident (the scheduler
 // copies only the used experts of a host-resident stack) works.
-void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, float * y_into) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -1168,13 +1265,17 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t n_pairs = (int64_t) n_used*n_tok;
     const int64_t n_rows  = (int64_t) ne11*n_tok;
     cudaStream_t stream = ctx.stream();
+    // fork AIPFIX ONECHAIN: y_into keeps whatever the skipped pairs hold there (the caller's regular-route values)
+    float * const y_out = y_into ? y_into : (float *) dst->data;
 
     // skipped pairs (id outside [0, n_expert)) get zero columns; the kernels below never write them. Small batches on the
     // routed fast path zero them inside the routing helper (no extra launch per decode step).
     const bool ref_path = !ai4_fast_ok(ctx) || ai4_id_ref_only_type(src0->type);
 
     if (ref_path) {
-        ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, (float *) dst->data, stream);
+        if (!y_into) {
+            ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, y_out, stream);
+        }
         // reference: reconstruct each selected expert to f32, one SGEMV per (slot, token) pair (host-side routing)
         std::vector<int32_t> h((size_t) n_pairs);
         CUDA_CHECK(cudaMemcpy2DAsync(h.data(), n_used*sizeof(int32_t), ids->data, ids->nb[1], n_used*sizeof(int32_t), n_tok,
@@ -1198,7 +1299,7 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
                 }
                 const int u = (int) (p % n_used), t = (int) (p / n_used);
                 const float * x = (const float *) src1->data + ((int64_t) t*ne11 + u % ne11)*K;
-                float * y = (float *) dst->data + ((int64_t) t*n_used + u)*M;
+                float * y = y_out + ((int64_t) t*n_used + u)*M;
                 CUBLAS_CHECK(cublasSgemv(ctx.cublas_handle(), CUBLAS_OP_T, K, M, &alpha, w.get(), K, x, 1, &beta, y, 1));
             }
         }
@@ -1211,10 +1312,17 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     static const int direct_max = std::min(8, ai4_env_int("GGML_CUDA_AI23_DIRECT", nullptr, ai4_ai23_tuned() ? 4 : 0));
     static const bool fused_x = ai4_env_int("GGML_CUDA_AI23_FUSED_X", nullptr, 0) != 0;
     const int rate = ggml_ai4_rate(src0->type);
-    const bool direct = ai4_mmvr_on_id() && (rate == 2 || rate == 3) && n_tok <= direct_max;
+    const int sms = ai4_ampere_sms(ctx);
+    // The Ampere kernel consumes grouped routing, including when sparse IDs qualify for direct routing.
+    const bool ampere_grouped = sms && src0->type == GGML_TYPE_AIT4_U && ai4_ampere_mmv(n_tok);
+    static const int aikern_direct_max = ai4_env_int("GGML_CUDA_AIKERN_DIRECT", nullptr, 64);
+    const bool aikern_direct = !ampere_grouped && ai4_aikern() && rate >= 2 && rate <= 4 && (rate == 4 || ai4_mmvr_on_id());
+    const bool direct = aikern_direct ?
+        (n_tok <= aikern_direct_max && ai4_mmvid_route(n_tok, n_used, n_expert, rate)) :
+        (ai4_mmvr_on_id() && (rate == 2 || rate == 3) && n_tok <= direct_max);
     // fork: one output column per direct block; zero skipped slots in that same kernel.
     const bool verify_compact = ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 1) != 0;
-    const bool direct_zero = direct && verify_compact;
+    const bool direct_zero = direct && verify_compact && !y_into;
     const bool fused = direct && fused_x && n_tok == 1;
     const int xsh = K % 256 == 0 ? 1 : 0;
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) n_rows*K);
@@ -1227,20 +1335,33 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     if ((rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN && ai23_id_bn() != 0) {
         bn = ai23_id_bn();
     }
-    const int sms = ai4_ampere_sms(ctx);
-    if (sms && src0->type == GGML_TYPE_AIT4_U) {
-        if (ai4_ampere_mmv(n_tok)) {
-            bn = ai4_ampere_bn(n_tok);
+    // [AIPFAST] pfx3 (Taichi, U2 gate/up K2560, 512 experts top-10, uniform routes): at 2048 tokens (40 routes per
+    // expert) the 64-route tile takes 1,218 vs 1,790 us for the 128 tile (down 1,421 vs 1,870); at 4096 (80 routes) 128 wins
+    // (1,902 vs 2,348). The n_tok rule (GGML_CUDA_AI4_BN128_MIN) ignores the expert count, so take the 64 tile while the
+    // mean expert has < R routes (R = 64 splits the two measured points). bn64b: 10 GB route 2 prompt 1.043x (quiet runs, p .0004), writing 1.000x. Logs once at INFO.
+    static const int bn64_maxr = ai4_env_int("GGML_CUDA_AI23_ID_BN64_MAXR", nullptr, 64);
+    if ((rate == 2 || rate == 3) && bn == 128 && ai23_id_bn() == 0 && bn64_maxr > 0) {
+        const bool take64 = n_pairs < (int64_t) bn64_maxr*n_expert;
+        static std::atomic<bool> logged[2];
+        if (!logged[take64].exchange(true)) {
+            GGML_LOG_INFO("%s: 64-route tile rule (R = %d): first %s tile: %lld routes, %d experts, %d tokens\n", __func__, bn64_maxr,
+                take64 ? "64-route" : "128-route", (long long) n_pairs, (int) n_expert, (int) n_tok);
         }
+        if (take64) {
+            bn = 64;
+        }
+    }
+    if (ampere_grouped) {
+        bn = ai4_ampere_bn(n_tok);
     }
     static const bool tight_grid = ai4_env_int("GGML_CUDA_AI23_ID_TIGHT_GRID", nullptr, 0) != 0;
     const bool tight = tight_grid && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
     const int max_tiles = direct ? (int) n_pairs : ai4k::ids_max_tiles(n_expert, n_pairs, bn, tight);
     static const bool prompt_zero = ai4_env_int("GGML_CUDA_AI23_ID_ZERO", nullptr, 0) != 0;
-    const bool zero_in_helper = !direct && (n_tok <= 8 ||
+    const bool zero_in_helper = !direct && !y_into && (n_tok <= 8 ||
         (prompt_zero && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN));
-    if (!zero_in_helper && !direct_zero) {
-        ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, (float *) dst->data, stream);
+    if (!zero_in_helper && !direct_zero && !y_into) {
+        ai4_zero_skipped(ids, n_used, n_tok, n_expert, M, y_out, stream);
     }
     GGML_ASSERT(max_tiles <= 65535);
     ggml_cuda_pool_alloc<int> routing(ctx.pool());
@@ -1263,10 +1384,10 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         const bool compact = route_threads == 256 && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
         idm = ai4k::launch_ids_helper(ids->data, ids->nb[0], ids->nb[1], n_used, n_tok, ne11, n_expert, bn,
                                     max_tiles, src0->nb[2], routing.get(), stream,
-                                    zero_in_helper && ai4_id_skip_on() ? (float *) dst->data : nullptr, M, aggregate, compact);
+                                    zero_in_helper && ai4_id_skip_on() ? y_out : nullptr, M, aggregate, compact);
     }
     const uint8_t * W = (const uint8_t *) src0->data;
-    float * Y = (float *) dst->data;
+    float * Y = y_out;
     switch (ai4_lay_of(src0->type)) {
 #define AI4_MMID_U(L) \
         case L: \
@@ -1274,7 +1395,10 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
             else     { ai4_mm_id_kernels<L, 0>(W, q.get(), s.get(), Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
             break;
         AI4_MMID_U(ai4k::LAY_AIT2_U)
+        AI4_MMID_U(ai4k::LAY_AIT2P_U)
         AI4_MMID_U(ai4k::LAY_AIT3_U)
+        AI4_MMID_U(ai4k::LAY_AIT2_U2)
+        AI4_MMID_U(ai4k::LAY_AIT3_U2)
         AI4_MMID_U(ai4k::LAY_AIT4_U)
         AI4_MMID_U(ai4k::LAY_AIT5_U)
 #undef AI4_MMID_U
@@ -1283,6 +1407,1272 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
+// fork: each route owns one slab and chooses its weight format before reading either stack.
+#define MOE_MIXED_TYPES(X) \
+    X(GGML_TYPE_Q2_0,    vec_dot_q2_0_q8_1,    VDR_Q2_0_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q4_0,    vec_dot_q4_0_q8_1,    VDR_Q4_0_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q2_K,    vec_dot_q2_K_q8_1,    VDR_Q2_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q3_K,    vec_dot_q3_K_q8_1,    VDR_Q3_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q4_K,    vec_dot_q4_K_q8_1,    VDR_Q4_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q5_K,    vec_dot_q5_K_q8_1,    VDR_Q5_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_Q6_K,    vec_dot_q6_K_q8_1,    VDR_Q6_K_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ2_XXS, vec_dot_iq2_xxs_q8_1, VDR_IQ2_XXS_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ2_XS,  vec_dot_iq2_xs_q8_1,  VDR_IQ2_XS_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ2_S,   vec_dot_iq2_s_q8_1,   VDR_IQ2_S_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ3_XXS, vec_dot_iq3_xxs_q8_1, VDR_IQ3_XXS_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ3_S,   vec_dot_iq3_s_q8_1,   VDR_IQ3_S_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ4_NL,  vec_dot_iq4_nl_q8_1,  VDR_IQ4_NL_Q8_1_MMVQ) \
+    X(GGML_TYPE_IQ4_XS,  vec_dot_iq4_xs_q8_1,  VDR_IQ4_XS_Q8_1_MMVQ)
+
+template <ggml_type T> struct moe_mixed_dot;
+#define MOE_MIXED_DOT(T, F, V) \
+    template <> struct moe_mixed_dot<T> { \
+        static constexpr int vdr = V; \
+        static __device__ __forceinline__ float dot(const void * w, const block_q8_1 * x, int k, int i) { return F(w, x, k, i); } \
+    };
+MOE_MIXED_TYPES(MOE_MIXED_DOT)
+#undef MOE_MIXED_DOT
+
+// NC routes of one expert (cold rows grouped by expert) share each weight read; every column keeps the
+// one-route k order and reduction, so each column's sums are those of the NC = 1 call.
+template <ggml_type T, int WARPS, int NC = 1>
+static __device__ __forceinline__ void moe_mixed_base_rows(const char * w, const block_q8_1 * const * xs, float * const * ys, int K) {
+    constexpr int qk = ggml_cuda_type_traits<T>::qk;
+    constexpr int qi = ggml_cuda_type_traits<T>::qi;
+    constexpr int vdr = moe_mixed_dot<T>::vdr;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    constexpr int rows = 16/WARPS;
+    float sum[NC][rows] = {};
+    for (int k = lane / (qi/vdr); k < K/qk; k += 32*vdr/qi) {
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const int row = warp + r*WARPS;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                sum[c][r] += moe_mixed_dot<T>::dot(w, xs[c] + k*(qk/QK8_1), row*(K/qk) + k, vdr*(lane % (qi/vdr)));
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            sum[c][r] = warp_reduce_sum<32>(sum[c][r]);
+            if (lane == 0) {
+                ys[c][warp + r*WARPS] = sum[c][r];
+            }
+        }
+    }
+}
+
+// Each register set keeps one original MMVQ lane; the butterfly order is unchanged (per column for NC > 1).
+template <ggml_type T, int WARPS, int NC = 1>
+static __device__ __forceinline__ void moe_mixed_down_rows(const char * w, const block_q8_1 * const * xs, float * const * ys, int K) {
+    constexpr int qk = ggml_cuda_type_traits<T>::qk;
+    constexpr int qi = ggml_cuda_type_traits<T>::qi;
+    constexpr int vdr = moe_mixed_dot<T>::vdr;
+    constexpr int rows = 4/WARPS;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int p = lane & 7;
+    const int row0 = (warp*4 + lane/8)*rows;
+    float sum[NC][4][rows] = {};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int v = p + 8*j;
+        for (int k = v/(qi/vdr); k < K/qk; k += 32*vdr/qi) {
+#pragma unroll
+            for (int r = 0; r < rows; ++r) {
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    sum[c][j][r] += moe_mixed_dot<T>::dot(w, xs[c] + k*(qk/QK8_1), (row0 + r)*(K/qk) + k, vdr*(v%(qi/vdr)));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int d = 2; d > 0; d >>= 1) {
+            float next[4][rows];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+#pragma unroll
+                for (int r = 0; r < rows; ++r) {
+                    next[j][r] = sum[c][j][r] + sum[c][j ^ d][r];
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+#pragma unroll
+                for (int r = 0; r < rows; ++r) { sum[c][j][r] = next[j][r]; }
+            }
+        }
+#pragma unroll
+        for (int d = 4; d > 0; d >>= 1) {
+#pragma unroll
+            for (int r = 0; r < rows; ++r) {
+                sum[c][0][r] += __shfl_xor_sync(0xffffffffu, sum[c][0][r], d);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            if (p == 0) { ys[c][row0 + r] = sum[c][0][r]; }
+        }
+    }
+}
+
+// One-token native MMVQ splits K across four warps (small_k only changes rows per block):
+// merge the four K partitions before the lane butterfly. Used for IQ4_NL banks and cold rows.
+template <ggml_type T>
+static __device__ __forceinline__ void moe_mixed_rows_single(
+        const char * w, const block_q8_1 * x, float * y, int K) {
+    constexpr int qk = ggml_cuda_type_traits<T>::qk;
+    constexpr int qi = ggml_cuda_type_traits<T>::qi;
+    constexpr int vdr = moe_mixed_dot<T>::vdr;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float sum[16] = {};
+    for (int k = tid/(qi/vdr); k < K/qk; k += 128*vdr/qi) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            sum[r] += moe_mixed_dot<T>::dot(w, x + k*(qk/QK8_1), r*(K/qk) + k, vdr*(tid%(qi/vdr)));
+        }
+    }
+    extern __shared__ __align__(16) uint8_t smem[];
+    float (*partial)[16][32] = (float (*)[16][32]) smem;
+    if (warp > 0) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) { partial[warp - 1][r][lane] = sum[r]; }
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+#pragma unroll
+            for (int p = 0; p < 3; ++p) { sum[r] += partial[p][r][lane]; }
+            sum[r] = warp_reduce_sum<32>(sum[r]);
+            if (lane == 0) { y[r] = sum[r]; }
+        }
+    }
+    __syncthreads(); // another slab may reuse partial in this block
+}
+
+// Each eighth occurrence owns the following <=8 matching routes. Scan immutable inputs,
+// including the native-ID map on the first projection, never another CTA's route_ids stores.
+static __device__ __forceinline__ void moe_mixed_group(const ai4k::idmap & idm, int h, ai4k::mmvr_group & group) {
+    if (gridDim.z == 1) {
+        // Decode top-k IDs are normally unique; duplicates remain independent, as before.
+        if (threadIdx.x == 0) {
+            group.n = 1;
+            group.rows[0] = blockIdx.y % idm.direct_ne11;
+            group.cols[0] = blockIdx.y;
+        }
+        __syncthreads();
+        return;
+    }
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        const int own = (int) blockIdx.z*idm.direct_n_used + blockIdx.y;
+        const int routes = (int) gridDim.z*idm.direct_n_used;
+        const unsigned lower_lanes = (1u << lane) - 1u;
+        int before = 0, count = 0;
+        for (int first = 0; first < routes; first += 32) {
+            const int route = first + lane;
+            int slot = -1;
+            if (route < routes) {
+                const int u = route % idm.direct_n_used, t = route / idm.direct_n_used;
+                const int native = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
+                slot = idm.direct_map ?
+                        (native >= 0 && native < idm.direct_map_size ? (int) idm.direct_map[native] : -1) : native;
+            }
+            const unsigned matches = __ballot_sync(0xffffffffu, slot == h);
+            const unsigned prior = __ballot_sync(0xffffffffu, slot == h && route < own);
+            before += __popc(prior);
+            if (first + 32 <= own) {
+                continue;
+            }
+            if (before % ai4k::MMV_ID_BN != 0) {
+                break;
+            }
+            const unsigned following = matches & ~prior;
+            const int index = count + __popc(following & lower_lanes);
+            if ((following & (1u << lane)) && index < ai4k::MMV_ID_BN) {
+                const int u = route % idm.direct_n_used, t = route / idm.direct_n_used;
+                group.rows[index] = t*idm.direct_ne11 + u % idm.direct_ne11;
+                group.cols[index] = route;
+            }
+            count += __popc(following);
+            if (count >= ai4k::MMV_ID_BN) {
+                break;
+            }
+        }
+        if (lane == 0) {
+            group.n = min(count, ai4k::MMV_ID_BN);
+        }
+    }
+    __syncthreads();
+}
+
+// fork AIPFIX D7: the slab-per-warp direct GEMV over cached AI+ experts (slot table), with the routes that picked the
+// same expert in one block (up to MMV_ID_BN columns per weight read, as the bank's grouped hot path). Every column
+// keeps the direct SPW K order, so the outputs are the ungrouped launch's bits. Filters, the paired second projection
+// (upper half of x) and the fused SwiGLU work as in mmvr. GGML_MOE_CACHE_AI_GROUP=0 opts out.
+template <int LAY, int XSH, int KT>
+static __global__ void __launch_bounds__(128, 6) ai4_table_grouped(const int8_t * __restrict__ Xq,
+        const float * __restrict__ Xs, float * Y, int M, int K, const ai4k::idmap idm) {
+    constexpr int WARPS = 4;
+    const bool second = idm.table2 && (int) blockIdx.x >= (int) gridDim.x/2;
+    const int bx = (int) blockIdx.x - (second ? (int) gridDim.x/2 : 0);
+    ai4k::idmap m = idm;
+    float * y = Y;
+    if (idm.table2) {
+        m.table = second ? idm.table2 : idm.table;
+        m.filter = second ? idm.filter2 : idm.filter;
+        m.glu_pfilter = second ? idm.filter : idm.filter2;
+        m.glu_prev = second ? idm.glu_prev : idm.glu_prev2;
+        y = second ? idm.y2 : Y;
+    }
+    const int lane = threadIdx.x & 31;
+    const int slab = bx*WARPS + (int) (threadIdx.x >> 5);
+    const int u = blockIdx.y, t = blockIdx.z;
+    const int64_t col = (int64_t) t*idm.direct_n_used + u;
+    // every route clears its own tile in the other bank, filtered or not (mmvr does the same before its filter)
+    if (m.glu && lane == 0 && slab < M/16) {
+        ai4k::g_ai4k_glu_count[(m.filter_val ? ai4k::GLU_PAIR_TILES : 0) + col*(M/16) + slab] = 0;
+    }
+    const int e = *(const int *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
+    if (e < 0 || e >= idm.direct_n_expert) {
+        if (idm.direct_zero && lane < 16 && slab < M/16) {
+            y[col*M + slab*16 + lane] = 0.0f;
+        }
+        return;
+    }
+    if (m.filter && m.filter[e] != m.filter_val) {
+        return;
+    }
+    __shared__ ai4k::mmvr_group group;
+    moe_mixed_group(m, e, group);
+    if (group.n == 0) {
+        return;
+    }
+    ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 6, true, false, 1, 1, false, true, true>(nullptr, Xq, Xs, y, M, M, 1,
+            K, m, &group, bx);
+}
+
+static bool ai4_table_grouped_on() {
+    static const bool on = ai4_env_int("GGML_MOE_CACHE_AI_GROUP", nullptr, 1) != 0;
+    return on;
+}
+
+template <int LAY, int XSH, int KT>
+static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
+                                  const ai4k::idmap & idm, int max_tiles) {
+    // one token has nothing to share; the native-id map (bank) and fused activations keep their own launches.
+    // Paired launches (table2) stay ungrouped: the grouped second projection gives wrong output (f3q/f3r 11-02:
+    // every bank route of that half off from element 0, unpaired grouped clean), and the paired ungrouped launch
+    // was the faster one anyway (f3v2). This is what broke P1PLAIN-GU at >= 4 tokens (11-03 'incomplete output').
+    if (!ai4_table_grouped_on() || !idm.table || idm.table2 || idm.no_group || idm.direct_map || idm.direct_x ||
+            idm.direct_n_used <= 0 || max_tiles/idm.direct_n_used < 2 || M % 16 != 0) {
+        return false;
+    }
+    constexpr int WARPS = 4;
+    constexpr int smem = WARPS*2*ai4k::mmv_stage_bytes<true, LAY>();
+    static bool attr_set[64] = {};
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    if (!attr_set[dev & 63]) {
+        CUDA_CHECK(cudaFuncSetAttribute(ai4_table_grouped<LAY, XSH, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        attr_set[dev & 63] = true;
+    }
+    const dim3 grid(((M/16 + WARPS - 1)/WARPS)*(idm.table2 ? 2 : 1), idm.direct_n_used, max_tiles/idm.direct_n_used);
+    ai4_table_grouped<LAY, XSH, KT><<<grid, WARPS*32, smem, stream>>>(q, s, Y, M, K, idm);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "[ai4] grouped cached AI+ GEMV first launch: M=%d K=%d tokens=%d paired=%d\n", M, K,
+                max_tiles/idm.direct_n_used, idm.table2 ? 1 : 0);
+    }
+    return true;
+}
+
+// Paired launch: blocks at x >= gridDim.x/2 compute this second projection (W == nullptr: unpaired).
+struct moe_mixed_second {
+    const uint8_t * W;
+    float * Y;
+    const char * base;
+    const void * const * table;
+    const uint8_t * skip;
+    const uint8_t * resident;
+    const float * glu_gate; // fused SwiGLU (glu == nullptr: none)
+    const float * glu_up;
+    float * glu;
+    const float * red_w;    // fused routed sum of an unpaired launch (red_dst == nullptr: none)
+    const int32_t * red_bank;
+    int64_t red_bank_stride;
+    float * red_dst;
+    bool red_tree;
+    bool pair_warp;         // hot SPW routes: warp pairs compute gate and up of one slab (see moe_mixed_mmv)
+    bool cold_group;        // cold routes of one expert share a weight read (see moe_mixed_cold)
+    bool res_both;          // paired: a cached route is resident only when both projections are (see P2LIST)
+    bool hot_only;          // phase 1 skips cached routes too (P1HITG: the 3XS fused hit kernel computed them)
+    bool splitk;            // hot routes: one block per (16-row slab, unique expert), warps split K (see moe_mixed_mmv)
+};
+
+// Epilogue tiles are 16-row slices of one route's output, so launches that tile the rows differently (the SPW
+// hit-first launch and the 16-row phase-2 launch) count into the same tiles. A block covers rows rows from row
+// bx*rows (at most four slices).
+static __device__ __forceinline__ int moe_mixed_slices(int bx, int rows, int M, int & first) {
+    first = bx*rows/16;
+    return min(rows/16, M/16 - first);
+}
+
+// Fused SwiGLU: each projection's store of a slice counts in once; the second one (in either phase launch)
+// writes silu(gate)*up for that slice and resets the count for the next launch.
+static constexpr int MOE_MIXED_GLU_TILES = 40*64*8;
+static __device__ unsigned int g_moe_mixed_glu_count[MOE_MIXED_GLU_TILES];
+
+static __device__ __forceinline__ void moe_mixed_glu(const moe_mixed_second & second, int bx, int rows, int M,
+        const int * cols, int n, int own) {
+    if (!second.glu) {
+        return;
+    }
+    __threadfence();
+    __syncthreads();
+    int first;
+    const int slices = moe_mixed_slices(bx, rows, M, first);
+    for (int i = threadIdx.x; i < n*slices; i += blockDim.x) {
+        const int col = cols ? cols[i / slices] : own;
+        const int slice = first + i % slices;
+        unsigned int * count = &g_moe_mixed_glu_count[col*(M/16) + slice];
+        if (atomicAdd(count, 1u) != 1u) {
+            continue;
+        }
+        *count = 0;
+        const int64_t o = (int64_t) col*M + slice*16;
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            second.glu[o + r] = ggml_cuda_op_silu_single(__ldcg(second.glu_gate + o + r)) * __ldcg(second.glu_up + o + r);
+        }
+    }
+}
+
+// Fused routed sum (unpaired launches): each stored route slice counts in once per (token, slice); the block that
+// completes a token's n_used routes (in either phase launch) writes that token's slice of the sum and resets the
+// count. Same expression and order as moe_mixed_reduction_f32: products rounded alone, then serial or warp-tree
+// hot and cold buckets, then hot + cold.
+static constexpr int MOE_MIXED_RED_TILES = 4096*8;
+static __device__ unsigned int g_moe_mixed_red_count[MOE_MIXED_RED_TILES];
+
+static __device__ __forceinline__ void moe_mixed_reduce(const moe_mixed_second & second, const float * Y, int bx,
+        int rows, int M, const int * cols, int n, int own, int n_used) {
+    if (!second.red_dst) {
+        return;
+    }
+    __shared__ unsigned int done;   // bit 4*token + slice - first
+    __threadfence();
+    if (threadIdx.x == 0) {
+        done = 0;
+    }
+    __syncthreads();
+    int first;
+    const int slices = moe_mixed_slices(bx, rows, M, first);
+    for (int i = threadIdx.x; i < n*slices; i += blockDim.x) {
+        const int tok = (cols ? cols[i / slices] : own) / n_used;
+        const int j = i % slices;
+        unsigned int * count = &g_moe_mixed_red_count[tok*(M/16) + first + j];
+        if (atomicAdd(count, 1u) == (unsigned int) n_used - 1) {
+            *count = 0;
+            atomicOr(&done, 1u << (4*tok + j));
+        }
+    }
+    __syncthreads();
+    if (done == 0) {
+        return;
+    }
+    const bool tree = second.red_tree;
+    const int lane = threadIdx.x & 31;
+    const int step = tree ? blockDim.x >> 5 : blockDim.x;
+    for (int i = tree ? threadIdx.x >> 5 : threadIdx.x; i < 32*16; i += step) {
+        const int bit = i / 16;
+        if (!(done >> bit & 1u)) {
+            continue;
+        }
+        const int tok = bit / 4;
+        const int r = (first + bit % 4)*16 + i % 16;
+        const float * w = second.red_w + (int64_t) tok*n_used;
+        const int32_t * bank = second.red_bank + tok*second.red_bank_stride;
+        const float * y = Y + (int64_t) tok*n_used*M + r;
+        float hot = 0.0f, cold = 0.0f;
+        if (tree) {
+            if (lane < n_used) {
+                const float value = __fmul_rn(__ldcg(y + (int64_t) lane*M), w[lane]);
+                if (bank[lane] >= 0) { hot = value; }
+                else { cold = value; }
+            }
+            hot = warp_reduce_sum(hot);
+            cold = warp_reduce_sum(cold);
+        } else {
+            for (int e = 0; e < n_used; ++e) {
+                const float value = __fmul_rn(__ldcg(y + (int64_t) e*M), w[e]);
+                if (bank[e] >= 0) { hot = __fadd_rn(hot, value); }
+                else { cold = __fadd_rn(cold, value); }
+            }
+        }
+        if (!tree || lane == 0) {
+            second.red_dst[(int64_t) tok*M + r] = __fadd_rn(hot, cold);
+        }
+    }
+}
+
+// Epilogues of one block's stores: rows rows from tile bx of the routes cols[0..n) (cols == nullptr: route own).
+static __device__ __forceinline__ void moe_mixed_done(const moe_mixed_second & second, const float * Y, int bx, int rows,
+        int M, const int * cols, int n, int own, int n_used) {
+    moe_mixed_glu(second, bx, rows, M, cols, n, own);
+    moe_mixed_reduce(second, Y, bx, rows, M, cols, n, own, n_used);
+}
+
+// Bank slot of a route: the native expert through the optional native->bank map (-1: cold).
+static __device__ __forceinline__ int moe_mixed_slot(const ai4k::idmap & idm, int u, int t) {
+    const int native = *(const int32_t *) (idm.direct_ids + u*idm.direct_nb0 + t*idm.direct_nb1);
+    return idm.direct_map ?
+            (native >= 0 && native < idm.direct_map_size ? (int) idm.direct_map[native] : -1) : native;
+}
+
+// Cold rows of NC grouped routes: one weight read per k step serves every column (per-column sums unchanged).
+template <ggml_type BASE, int WARPS, int NC>
+static __device__ __forceinline__ void moe_mixed_cold_rows(const char * w, const block_q8_1 * const * xs,
+        float * const * ys, int K) {
+    if constexpr (BASE == GGML_TYPE_Q2_0 || BASE == GGML_TYPE_IQ4_NL) {
+        moe_mixed_down_rows<BASE, WARPS, NC>(w, xs, ys, K);
+    } else {
+        moe_mixed_base_rows<BASE, WARPS, NC>(w, xs, ys, K);
+    }
+}
+
+// The cold (base-weight) rows of route (u, t), plus one-token IQ4_NL bank rows; zero-fills skipped routes.
+// With group (multi-token launches, specialized base type), the first cold route of an expert also computes the
+// later routes of that expert (at most MMV_ID_BN), so their blocks exit and the expert's weights are read once.
+template <ggml_type BASE, bool IQ4_BANK, int WARPS, bool SPW>
+static __device__ __forceinline__ void moe_mixed_cold(
+        const uint8_t * W, float * Y, int M, int K, const ai4k::idmap & idm, const char * base,
+        const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride, int n_expert,
+        const block_q8_1 * x, const uint8_t * skip, const uint8_t * resident, const moe_mixed_second & second,
+        int u, int t, int n_tok, int bx, int h, bool hot, int e, const int32_t * ids = nullptr, int64_t ids_stride = 0) {
+    const int own = t*idm.direct_n_used + u;
+    constexpr int slabs = SPW ? WARPS : 1;
+    const int row0 = bx*16*slabs;
+    float * out = Y + ((int64_t) t*idm.direct_n_used + u)*M + row0;
+    if (!hot && (h >= 0 || e < 0 || e >= n_expert || (skip && skip[e] && (!resident || !resident[e])))) {
+        if (threadIdx.x < 16*slabs && row0 + threadIdx.x < M) {
+            out[threadIdx.x] = 0.0f;
+        }
+        moe_mixed_done(second, Y, bx, 16*slabs, M, nullptr, 1, own, idm.direct_n_used);
+        return;
+    }
+    const char * w = hot ? (const char *) W + (size_t) h*idm.nb02 :
+            table ? (const char *) table[e] : base + (size_t) e*expert_stride;
+    w += (size_t) row0*row_stride;
+    const int pad = GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1;
+    if constexpr (BASE != GGML_TYPE_COUNT && !IQ4_BANK) {
+        if (ids && second.cold_group && n_tok > 1 && !hot) {
+            __shared__ int gcols[ai4k::MMV_ID_BN];
+            __shared__ int gn;
+            if (threadIdx.x < 32) {
+                // Same expert = same classification (bank map, skip and resident flags are per expert).
+                const int lane = threadIdx.x, routes = n_tok*idm.direct_n_used;
+                int before = 0, n = 0;
+                for (int first = 0; first < routes; first += 32) {
+                    const int route = first + lane;
+                    bool m = false;
+                    if (route < routes) {
+                        const int uu = route % idm.direct_n_used, tt = route / idm.direct_n_used;
+                        m = ids[tt*ids_stride + uu] == e && moe_mixed_slot(idm, uu, tt) < 0;
+                    }
+                    before += __popc(__ballot_sync(0xffffffffu, m && route < own));
+                    const unsigned after = __ballot_sync(0xffffffffu, m && route >= own);
+                    const int i = n + __popc(after & ((1u << lane) - 1u));
+                    if (m && route >= own && i < ai4k::MMV_ID_BN) {
+                        gcols[i] = route;
+                    }
+                    n += __popc(after);
+                }
+                if (lane == 0) {
+                    gn = before % ai4k::MMV_ID_BN == 0 ? min(n, ai4k::MMV_ID_BN) : 0;
+                }
+            }
+            __syncthreads();
+            const int n = gn;
+            if (n == 0) {
+                return; // an earlier route of this expert computes this one
+            }
+            const block_q8_1 * xs[ai4k::MMV_ID_BN];
+            float * ys[ai4k::MMV_ID_BN];
+            for (int c = 0; c < n; ++c) {
+                const int uu = gcols[c] % idm.direct_n_used, tt = gcols[c] / idm.direct_n_used;
+                xs[c] = x + ((int64_t) tt*idm.direct_ne11 + uu % idm.direct_ne11)*pad;
+                ys[c] = Y + (int64_t) gcols[c]*M + row0;
+            }
+            for (int slab = 0; slab < slabs && row0 + slab*16 < M; ++slab) {
+                const char * sw = w + (size_t) slab*16*row_stride;
+                float * yo[ai4k::MMV_ID_BN];
+                for (int c = 0; c < n; ++c) {
+                    yo[c] = ys[c] + slab*16;
+                }
+                int c = 0;
+                for (; c + 4 <= n; c += 4) {
+                    moe_mixed_cold_rows<BASE, WARPS, 4>(sw, xs + c, yo + c, K);
+                }
+                if (c + 2 <= n) {
+                    moe_mixed_cold_rows<BASE, WARPS, 2>(sw, xs + c, yo + c, K);
+                    c += 2;
+                }
+                if (c < n) {
+                    moe_mixed_cold_rows<BASE, WARPS, 1>(sw, xs + c, yo + c, K);
+                }
+            }
+            moe_mixed_done(second, Y, bx, 16*slabs, M, gcols, n, own, idm.direct_n_used);
+            return;
+        }
+    }
+    const int64_t act_row = (int64_t) t*idm.direct_ne11 + u % idm.direct_ne11;
+    x += act_row*pad;
+    // SPW covers four slabs; retain each cold row's original MMVQ reduction.
+    for (int slab = 0; slab < slabs && row0 + slab*16 < M; ++slab) {
+        const char * sw = w + (size_t) slab*16*row_stride;
+        float * sy = out + slab*16;
+        if constexpr (IQ4_BANK && WARPS == 4) {
+            if (hot && n_tok == 1) {
+                moe_mixed_rows_single<GGML_TYPE_IQ4_NL>(sw, x, sy, K);
+                continue;
+            }
+        }
+        // Cold rows keep the one-warp order at every width: with the expert cache the unmixed
+        // one-token path matches it bit for bit (native four-warp MMVQ does not).
+        if constexpr (BASE == GGML_TYPE_COUNT) {
+            switch (type) {
+#define MOE_MIXED_CASE(T, F, V) case T: moe_mixed_cold_rows<T, WARPS, 1>(sw, &x, &sy, K); break;
+            MOE_MIXED_TYPES(MOE_MIXED_CASE)
+#undef MOE_MIXED_CASE
+                default: __trap();
+            }
+        } else {
+            moe_mixed_cold_rows<BASE, WARPS, 1>(sw, &x, &sy, K);
+        }
+    }
+    moe_mixed_done(second, Y, bx, 16*slabs, M, nullptr, 1, own, idm.direct_n_used);
+}
+
+template <ggml_type BASE, bool IQ4_BANK, int LAY, int XSH, int KT, int WARPS, bool SINGLE_N, bool SPW, int STAGES>
+static __global__ void __launch_bounds__(WARPS*32, 24/WARPS) moe_mixed_mmv(
+        const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, ai4k::idmap idm,
+        const char * base, const void * const * table, ggml_type type, size_t expert_stride, size_t row_stride,
+        const int32_t * ids, int64_t ids_stride, int n_expert, const block_q8_1 * x,
+        const uint8_t * skip, const uint8_t * resident, char * route_ids, size_t route_ids_stride,
+        float * route_mask, int phase, int p2_n_tok, const moe_mixed_second second) {
+    int bx = blockIdx.x;
+    const uint8_t * const W0 = W;
+    float * const Y0 = Y;
+    // fork AIPFIX P2LIST: the other projection's resident flags (null: this projection's alone decide)
+    const uint8_t * other = second.res_both ? second.resident : nullptr;
+    if (second.W && bx >= (int) gridDim.x/2) {
+        bx -= gridDim.x/2;
+        other = second.res_both ? resident : nullptr;
+        W = second.W; Y = second.Y; base = second.base; table = second.table;
+        skip = second.skip; resident = second.resident; route_ids = nullptr;
+    }
+    if (p2_n_tok > 0) {
+        // Compact phase 2: gridDim.y blocks per row tile split the routes this phase owns (copied, skipped
+        // or invalid ones; at most 64), so a layer without misses costs a few hundred blocks, not one per route.
+        __shared__ int list[64];
+        __shared__ int n_list;
+        if (threadIdx.x < 32) {
+            const int n_routes = idm.direct_n_used*p2_n_tok;
+            int n = 0;
+            for (int c = 0; c < n_routes; c += 32) {
+                const int i = c + (int) threadIdx.x;
+                bool mine = false;
+                if (i < n_routes) {
+                    const int u = i % idm.direct_n_used, t = i / idm.direct_n_used;
+                    const int h = moe_mixed_slot(idm, u, t);
+                    const int e = ids[t*ids_stride + u];
+                    const bool hot = h >= 0 && h < idm.direct_n_expert;
+                    mine = !hot && !(h < 0 && e >= 0 && e < n_expert && resident[e] && (!other || other[e]));
+                }
+                const unsigned int b = __ballot_sync(0xffffffffu, mine);
+                if (mine) {
+                    list[n + __popc(b & ((1u << threadIdx.x) - 1))] = i;
+                }
+                n += __popc(b);
+            }
+            if (threadIdx.x == 0) {
+                n_list = n;
+            }
+        }
+        __syncthreads();
+        for (int k = blockIdx.y; k < n_list; k += gridDim.y) {
+            const int u = list[k] % idm.direct_n_used, t = list[k] / idm.direct_n_used;
+            moe_mixed_cold<BASE, IQ4_BANK, WARPS, SPW>(W, Y, M, K, idm, base, table, type, expert_stride, row_stride,
+                    n_expert, x, skip, resident, second, u, t, p2_n_tok, bx, moe_mixed_slot(idm, u, t), false,
+                    ids[t*ids_stride + u]);
+        }
+        return;
+    }
+    const int u = blockIdx.y, t = blockIdx.z;
+    const int h = moe_mixed_slot(idm, u, t);
+    // Other slabs resolve the map themselves; these stores serve later projections.
+    if (route_ids && bx == 0 && threadIdx.x == 0) {
+        *(int32_t *) (route_ids + t*route_ids_stride + u*sizeof(int32_t)) = h;
+        route_mask[t*idm.direct_n_used + u] = h < 0 ? 1.0f : 0.0f;
+    }
+    const bool hot = h >= 0 && h < idm.direct_n_expert;
+    // Hit-first split: phase 1 runs before the copy wait (bank and resident routes),
+    // phase 2 after it (all other routes); each route is written by exactly one phase.
+    const int e = ids[t*ids_stride + u];
+    const bool res = phase != 0 && !hot && h < 0 && e >= 0 && e < n_expert && resident[e] && (!other || other[e]);
+    if ((phase == 1 && !hot && (!res || second.hot_only)) || (phase == 2 && (hot || res))) {
+        return;
+    }
+    if constexpr (!IQ4_BANK) {
+        if (hot) {
+            if constexpr (SPW) {
+                __shared__ ai4k::mmvr_group group;
+                moe_mixed_group(idm, h, group);
+                if (group.n == 0) {
+                    return;
+                }
+                if (second.pair_warp) {
+                    // Paired warps (as the fused 3XS hit kernel): block x owns WARPS/2 slabs of both projections,
+                    // even warps the first, odd warps the second, so SwiGLU needs no cross-block count. The grid
+                    // is the same size (2*ceil(slabs/WARPS) >= ceil(slabs/(WARPS/2))); each row keeps its
+                    // one-warp k order and the epilogue expression, so the stores are unchanged.
+                    const int warp = threadIdx.x >> 5;
+                    const int slab = (int) blockIdx.x*(WARPS/2) + (warp >> 1);
+                    float * Yw = warp & 1 ? second.Y : Y0;
+                    ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(
+                            warp & 1 ? second.W : W0, q, s, Yw, M, M, 1, K, idm, &group, (int) blockIdx.x, slab);
+                    if (second.glu) {
+                        __syncthreads();
+                        const int first = (int) blockIdx.x*(WARPS/2);
+                        const int rows = 16*max(0, min(WARPS/2, M/16 - first));
+                        for (int i = threadIdx.x; i < group.n*rows; i += blockDim.x) {
+                            const int64_t o = (int64_t) group.cols[i / rows]*M + first*16 + i % rows;
+                            second.glu[o] = ggml_cuda_op_silu_single(second.glu_gate[o]) * second.glu_up[o];
+                        }
+                    }
+                    return;
+                }
+                ai4k::mmvr_body<LAY, XSH, true, KT, STAGES, WARPS, 24/WARPS, true, false, 1, 1, false, true, true>(W, q, s, Y, M, M, 1, K, idm, &group, bx);
+                moe_mixed_done(second, Y, bx, 16*WARPS, M, group.cols, group.n, 0, idm.direct_n_used);
+            } else {
+                if constexpr (!SINGLE_N) {
+                    // fork AIPTAB SK1 (opt-in GGML_MOE_BANK_MIXED_SPLITK=1): the first route of each expert owns the
+                    // later routes that picked it (<= MMV_ID_BN columns); the block's warps split K of one 16-row
+                    // slab, so a warp walks 5 of the 20 K units instead of all 20, and each weight byte is read once.
+                    if (second.splitk && gridDim.z > 1) {
+                        __shared__ ai4k::mmvr_group group;
+                        moe_mixed_group(idm, h, group);
+                        if (group.n == 0) {
+                            return;
+                        }
+                        ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, false, false, true>(
+                                W, q, s, Y, M, M, 1, K, idm, &group, bx);
+                        moe_mixed_done(second, Y, bx, 16, M, group.cols, group.n, 0, idm.direct_n_used);
+                        return;
+                    }
+                }
+                ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 24/WARPS, true, false, 1, 1, SINGLE_N, false>(W, q, s, Y, M, M, 1, K, idm, nullptr, bx);
+                moe_mixed_done(second, Y, bx, 16, M, nullptr, 1, t*idm.direct_n_used + u, idm.direct_n_used);
+            }
+            return;
+        }
+    }
+    moe_mixed_cold<BASE, IQ4_BANK, WARPS, SPW>(W, Y, M, K, idm, base, table, type, expert_stride, row_stride,
+            n_expert, x, skip, resident, second, u, t, gridDim.z, bx, h, hot, e, ids, ids_stride);
+}
+
+bool ggml_cuda_moe_mixed_supported(const ggml_tensor * bank, const ggml_tensor * base) {
+    if (!bank || !base || bank->op != GGML_OP_MUL_MAT_ID || base->op != GGML_OP_MUL_MAT_ID ||
+            !bank->src[0] || !bank->src[1] || !bank->src[2] || !base->src[0] || !base->src[2] ||
+            ggml_get_op_params_i32(base, 3) == GGML_PREC_F32 ||
+            base->src[1] != bank->src[1] || bank->type != GGML_TYPE_F32 || base->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(bank, base) ||
+            !ggml_is_contiguous(bank) || !ggml_is_contiguous(base)) {
+        return false;
+    }
+    const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
+    // AIT4_U banks: the K = 640 down projection only (a banked expert is AI+ in all three matrices).
+    if ((w->type != GGML_TYPE_AIT2_U && w->type != GGML_TYPE_AIT2P_U && w->type != GGML_TYPE_AIT3_U && w->type != GGML_TYPE_AIT2_U2 &&
+            w->type != GGML_TYPE_AIT3_U2 && w->type != GGML_TYPE_IQ4_NL &&
+            (w->type != GGML_TYPE_AIT4_U || w->ne[0] != 640)) ||
+            (w->type == GGML_TYPE_IQ4_NL ? cw->type != GGML_TYPE_IQ4_NL : (!ggml_cuda_ai4_supported(bank) || !ggml_is_contiguous(w))) ||
+            w->ne[3] != 1 || !ggml_is_contiguous(w) ||
+            x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] <= 0 || x->ne[0] > 65536 || x->ne[0] % 128 ||
+            w->ne[1] <= 0 || w->ne[1] > 65536 || w->ne[1] % 16 || w->ne[2] <= 0 || w->ne[2] > INT32_MAX ||
+            cw->ne[0] != w->ne[0] || cw->ne[1] != w->ne[1] || cw->ne[2] <= 0 || cw->ne[2] > INT32_MAX ||
+            cw->ne[3] != 1 || !ggml_is_contiguous_2(cw) || cw->nb[1] != ggml_row_size(cw->type, cw->ne[0]) ||
+            ids->type != GGML_TYPE_I32 || ci->type != GGML_TYPE_I32 || !ggml_are_same_shape(ids, ci) ||
+            ids->ne[0] < 1 || ids->ne[0] > 64 || ids->ne[1] < 1 || ids->ne[1] > 8 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            ids->nb[0] != sizeof(int32_t) || ci->nb[0] != sizeof(int32_t) || ci->nb[1] % sizeof(int32_t) ||
+            (x->ne[1] != 1 && x->ne[1] != ids->ne[0]) || x->ne[2] != ids->ne[1] || x->ne[3] != 1) {
+        return false;
+    }
+    switch (cw->type) {
+#define MOE_MIXED_SUPPORT(T, F, V) case T: return true;
+        MOE_MIXED_TYPES(MOE_MIXED_SUPPORT)
+#undef MOE_MIXED_SUPPORT
+        default: return false;
+    }
+}
+
+bool ggml_cuda_moe_mixed_pair_enabled() {
+    static const bool v = ai4_env_int("GGML_MOE_BANK_MIXED_PAIR", nullptr, 1) != 0;
+    return v;
+}
+
+bool ggml_cuda_moe_mixed_pair_supported(const ggml_tensor * bank, const ggml_tensor * base,
+        const ggml_tensor * bank2, const ggml_tensor * base2) {
+    if (!ggml_cuda_moe_mixed_supported(bank, base) || !ggml_cuda_moe_mixed_supported(bank2, base2)) {
+        return false;
+    }
+    const ggml_tensor * w = bank->src[0], * w2 = bank2->src[0], * cw = base->src[0], * cw2 = base2->src[0];
+    return w->type != GGML_TYPE_IQ4_NL && w2->type == w->type && cw2->type == cw->type &&
+            ggml_are_same_shape(w, w2) && ggml_are_same_stride(w, w2) &&
+            ggml_are_same_shape(cw, cw2) && ggml_are_same_stride(cw, cw2) &&
+            bank2->src[1] == bank->src[1] && bank2->src[2] == bank->src[2] && base2->src[2] == base->src[2] &&
+            ggml_are_same_shape(bank, bank2);
+}
+
+bool ggml_cuda_moe_mixed_reduce_enabled() {
+    static const bool v = ai4_env_int("GGML_MOE_BANK_MIXED_REDUCE", nullptr, 1) != 0;
+    return v;
+}
+
+bool ggml_cuda_moe_mixed_reduce_supported(const ggml_tensor * experts, const ggml_cuda_moe_mixed_reduce & red) {
+    const ggml_tensor * w = red.weights, * b = red.bank_ids, * d = red.dst;
+    const int64_t n_used = experts->ne[1], tokens = experts->ne[2];
+    return w && b && d && experts->type == GGML_TYPE_F32 && ggml_is_contiguous(experts) && experts->ne[3] == 1 &&
+            n_used >= 1 && n_used <= 32 && tokens >= 1 && tokens <= 8 && experts->ne[0] % 16 == 0 &&
+            experts->ne[0]/16*tokens <= MOE_MIXED_RED_TILES &&
+            w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && w->ne[0] == 1 && w->ne[1] == n_used &&
+            w->ne[2] == tokens && w->ne[3] == 1 &&
+            b->type == GGML_TYPE_I32 && b->nb[0] == sizeof(int32_t) && b->nb[1] % sizeof(int32_t) == 0 &&
+            b->ne[0] == n_used && b->ne[1] == tokens && b->ne[2] == 1 && b->ne[3] == 1 &&
+            d->type == GGML_TYPE_F32 && ggml_is_contiguous(d) && ggml_nelements(d) == experts->ne[0]*tokens &&
+            d->data != experts->data && d->data != w->data && d->data != b->data;
+}
+
+bool ggml_cuda_moe_mixed_glu_enabled() {
+    static const bool v = ai4_env_int("GGML_MOE_BANK_MIXED_GLU", nullptr, 1) != 0;
+    return v;
+}
+
+bool ggml_cuda_moe_mixed_glu_supported(const ggml_tensor * dst, const ggml_tensor * dst2, const ggml_tensor * glu) {
+    return glu && glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            ggml_get_op_params_i32(glu, 1) == 0 && glu != dst && glu != dst2 &&
+            ((glu->src[0] == dst && glu->src[1] == dst2) || (glu->src[0] == dst2 && glu->src[1] == dst)) &&
+            glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_are_same_shape(glu, dst) &&
+            dst->ne[0] % 16 == 0 && dst->ne[0]/16*dst->ne[1]*dst->ne[2] <= MOE_MIXED_GLU_TILES;
+}
+
+const ggml_tensor * ggml_cuda_moe_mixed_base(const ggml_tensor * joined) {
+    if (!joined || joined->op != GGML_OP_ADD || !joined->src[0] || !joined->src[1]) { return nullptr; }
+    const ggml_tensor * hot = joined->src[0], * mul = joined->src[1];
+    if (mul->op != GGML_OP_MUL || !mul->src[0] || !mul->src[1] ||
+            !ggml_cuda_moe_mixed_supported(hot, mul->src[0]) || !ggml_are_same_shape(joined, hot) ||
+            !ggml_are_same_shape(mul, hot) || !ggml_is_contiguous(joined) || !ggml_is_contiguous(mul)) { return nullptr; }
+    const ggml_tensor * mask = mul->src[1];
+    if (mask->type != GGML_TYPE_F32 || !ggml_is_contiguous(mask) || mask->op != GGML_OP_RESHAPE ||
+            mask->ne[0] != 1 || mask->ne[1] != hot->ne[1] || mask->ne[2] != hot->ne[2] || mask->ne[3] != 1) { return nullptr; }
+    const ggml_tensor * step = mask->src[0];
+    if (!step || step->op != GGML_OP_UNARY || ggml_get_unary_op(step) != GGML_UNARY_OP_STEP) { return nullptr; }
+    const ggml_tensor * scale = step->src[0];
+    if (!scale || scale->op != GGML_OP_SCALE || ggml_get_op_params_f32(scale, 0) != -1.0f ||
+            ggml_get_op_params_f32(scale, 1) != -0.5f) { return nullptr; }
+    const ggml_tensor * cast = scale->src[0];
+    if (!cast || cast->op != GGML_OP_CPY || cast->type != GGML_TYPE_F32 || cast->src[0] != hot->src[2]) { return nullptr; }
+    return mul->src[0];
+}
+
+void ggml_cuda_moe_mixed_quantize_x(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
+        ggml_cuda_pool_alloc<int8_t> & q, ggml_cuda_pool_alloc<float> & s) {
+    if (bank->src[0]->type == GGML_TYPE_IQ4_NL) {
+        return;
+    }
+    const ggml_tensor * x = bank->src[1];
+    const int K = (int) x->ne[0];
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    const size_t rows = (size_t) x->ne[1]*x->ne[2];
+    q.alloc(rows*K);
+    s.alloc(rows*(K >> (7 + xsh)));
+    ai4_quantize_x((const float *) x->data, rows, K, xsh, q.get(), s.get(), ctx.stream());
+}
+
+// fork AIPFIX D: AI+ unit experts in the expert cache (see ai4-mm.cuh).
+size_t ggml_cuda_moe_ai_act_scales(int64_t rows, int64_t K) {
+    return GGML_PAD((size_t) (rows*K), 16);
+}
+
+size_t ggml_cuda_moe_ai_act_bytes(int64_t rows, int64_t K) {
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    return ggml_cuda_moe_ai_act_scales(rows, K) + (size_t) rows*(K >> (7 + xsh))*sizeof(float);
+}
+
+void ggml_cuda_moe_ai_quantize(const float * x, int64_t rows, int64_t K, char * out, cudaStream_t stream) {
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    ai4_quantize_x(x, rows, (int) K, xsh, (int8_t *) out, (float *) (out + ggml_cuda_moe_ai_act_scales(rows, K)), stream);
+}
+
+bool ggml_cuda_moe_ai_table_supported(ggml_type type, int64_t K, int64_t M, int64_t n_tok) {
+    const int rate = ggml_ai4_rate(type);
+    return ggml_ai4_is_unit(type) && rate >= 2 && rate <= 4 && (rate == 4 ? ai4_aikern() : ai4_mmvr_on_id()) &&
+        K % 128 == 0 && M % 16 == 0 && n_tok >= 1 && n_tok <= 64;
+}
+
+bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, const char * act, const int32_t * ids,
+        float * dst, int64_t K, int64_t M, int64_t n_used, int64_t n_tok, int64_t ne11, int64_t ids_stride,
+        int n_expert, const uint8_t * filter, int filter_val, cudaStream_t stream,
+        const void * const * table2, float * dst2, const uint8_t * filter2,
+        float * glu, const uint8_t * prev, const uint8_t * prev2, bool group) {
+    if (!table || !ggml_cuda_moe_ai_table_supported(type, K, M, n_tok) || (table2 && !dst2) || (glu && !table2) ||
+            (glu && M/16*n_used*n_tok > ai4k::GLU_PAIR_TILES)) {
+        return false;
+    }
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    const int8_t * q = (const int8_t *) act;
+    const float * s = (const float *) (act + ggml_cuda_moe_ai_act_scales(n_tok*ne11, K));
+    ai4k::idmap idm{};
+    idm.direct_ids = (const char *) ids;
+    idm.direct_nb0 = sizeof(int32_t);
+    idm.direct_nb1 = ids_stride*sizeof(int32_t);
+    idm.direct_n_used = (int) n_used;
+    idm.direct_ne11 = (int) ne11;
+    idm.direct_n_expert = n_expert;
+    idm.table = table;
+    idm.filter = filter;
+    idm.filter_val = filter_val;
+    idm.table2 = table2;
+    idm.filter2 = filter2;
+    idm.y2 = dst2;
+    idm.glu = glu;
+    idm.glu_up = dst;
+    idm.glu_gate = dst2;
+    idm.glu_prev = prev;
+    idm.glu_prev2 = prev2;
+    idm.no_group = !group;
+    {
+        static const bool lean_env = ai4_env_int("GGML_MOE_BANK_LEAN", nullptr, 0) != 0;
+        idm.lean = lean_env;
+    }
+    const int max_tiles = (int) (n_used*n_tok);
+    bool ok = false;
+    switch (ai4_lay_of(type)) {
+#define AI4_TABLE_U(L) \
+        case L: \
+            ok = xsh ? ai4_mmvr_try<L, 1, true>(nullptr, q, s, dst, (int) M, (int) n_tok, (int) K, stream, idm, max_tiles) \
+                     : ai4_mmvr_try<L, 0, true>(nullptr, q, s, dst, (int) M, (int) n_tok, (int) K, stream, idm, max_tiles); \
+            break;
+        AI4_TABLE_U(ai4k::LAY_AIT2_U)
+        AI4_TABLE_U(ai4k::LAY_AIT2P_U)
+        AI4_TABLE_U(ai4k::LAY_AIT3_U)
+        AI4_TABLE_U(ai4k::LAY_AIT2_U2)
+        AI4_TABLE_U(ai4k::LAY_AIT3_U2)
+        AI4_TABLE_U(ai4k::LAY_AIT4_U)
+#undef AI4_TABLE_U
+        default: break;
+    }
+    if (ok) {
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return ok;
+}
+
+// fork AIPFIX: the first nai blocks along x run the AI activation quantizer's CTAs, the rest quantize_q8_1's
+// elements with 128 threads per block. Each part runs the same per-CTA / per-warp code as its own kernel.
+template <bool XSH, bool SWZ>
+static __global__ void __launch_bounds__(128) moe_mixed_quantize_dual(const float * __restrict__ x, int K,
+        int8_t * __restrict__ q, float * __restrict__ s, void * __restrict__ q8, int padded, int nai) {
+    const int tok = blockIdx.y;
+    if ((int) blockIdx.x < nai) {
+        if constexpr (XSH) {
+            rq4::quantize_act_body(x, K, q, s, K, gridDim.y, blockIdx.x, tok);
+        } else {
+            ai4k::quantize_act128_body(x, K, q, s, K, gridDim.y, blockIdx.x, tok);
+        }
+        return;
+    }
+    const int i0 = ((int) blockIdx.x - nai)*128 + threadIdx.x;
+    if (i0 >= padded) {
+        return;
+    }
+    quantize_q8_1_elem<SWZ>(x, q8, (int64_t) tok*padded + i0, i0 < K ? (int64_t) tok*K + i0 : -1);
+}
+
+static bool moe_mixed_dualq_enabled() {
+    static const bool v = ai4_env_int("GGML_MOE_BANK_MIXED_DUALQ", nullptr, 1) != 0;
+    return v;
+}
+
+bool ggml_cuda_moe_mixed_quantize_dual(ggml_backend_cuda_context & ctx, const ggml_tensor * bank, const ggml_tensor * x,
+        char * q8, ggml_type q8_type, ggml_cuda_pool_alloc<int8_t> & q, ggml_cuda_pool_alloc<float> & s) {
+    const ggml_tensor * bx = bank->src[1];
+    if (!moe_mixed_dualq_enabled() || bank->src[0]->type == GGML_TYPE_IQ4_NL || x->data != bx->data ||
+            !ggml_are_same_shape(x, bx) || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+            !ggml_is_contiguous(bx) || x->ne[3] != 1) {
+        return false;
+    }
+    const int K = (int) x->ne[0];
+    const int64_t rows = x->ne[1]*x->ne[2];
+    const int padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+    if (rows > 65535 || K % 128 != 0 || padded % 128 != 0) {
+        return false;
+    }
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    q.alloc(rows*K);
+    s.alloc(rows*(K >> (7 + xsh)));
+    const int nai = xsh ? (K/RQ4_HB + 3)/4 : (K/128 + 7)/8;
+    const dim3 grid(nai + padded/128, (unsigned) rows);
+    const bool swz = q8_type == GGML_TYPE_IQ4_XS;
+    const float * xd = (const float *) x->data;
+    if (xsh) {
+        if (swz) { moe_mixed_quantize_dual<true, true><<<grid, 128, 0, ctx.stream()>>>(xd, K, q.get(), s.get(), q8, padded, nai); }
+        else { moe_mixed_quantize_dual<true, false><<<grid, 128, 0, ctx.stream()>>>(xd, K, q.get(), s.get(), q8, padded, nai); }
+    } else {
+        if (swz) { moe_mixed_quantize_dual<false, true><<<grid, 128, 0, ctx.stream()>>>(xd, K, q.get(), s.get(), q8, padded, nai); }
+        else { moe_mixed_quantize_dual<false, false><<<grid, 128, 0, ctx.stream()>>>(xd, K, q.get(), s.get(), q8, padded, nai); }
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// fork AIPFIX P1PLAIN-GU prep: per route, the bank slot of its expert into ids and the cold mask (what the mixed
+// phase 1 stores for later projections); per bank slot, its weight address for each projection.
+static __global__ void moe_p1_plain_prep(const char * ci, size_t ci_nb0, size_t ci_nb1, const float * map,
+        int map_size, char * ids, size_t ids_nb0, size_t ids_nb1, float * mask, int n_used, int n_routes,
+        int n_slots, const uint8_t * w1, size_t nb1, const uint8_t * w2, size_t nb2, const void ** tab) {
+    for (int i = threadIdx.x; i < n_routes; i += blockDim.x) {
+        const int u = i % n_used, t = i / n_used;
+        const int native = *(const int32_t *) (ci + u*ci_nb0 + t*ci_nb1);
+        const int h = native >= 0 && native < map_size ? (int) map[native] : -1;
+        *(int32_t *) (ids + u*ids_nb0 + t*ids_nb1) = h;
+        mask[i] = h < 0 ? 1.0f : 0.0f;
+    }
+    for (int j = threadIdx.x; j < n_slots; j += blockDim.x) {
+        tab[j] = w1 + (size_t) j*nb1;
+        tab[n_slots + j] = w2 + (size_t) j*nb2;
+    }
+}
+
+void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tensor * bank,
+        const ggml_tensor * base, ggml_tensor * dst, const char * act_q8,
+        const void * const * table, const uint8_t * skip, const uint8_t * resident,
+        const ggml_tensor * route_map, ggml_tensor * route_mask,
+        const int8_t * act_ai_q, const float * act_ai_s, int phase, const ggml_cuda_moe_mixed_pair * pair,
+        const ggml_cuda_moe_mixed_reduce * red) {
+    GGML_ASSERT(ggml_cuda_moe_mixed_supported(bank, base));
+    // phase 3 = phase 1 over the bank routes only (fork AIPFIX P1HITG down: the 3XS hit kernel ran the cached ones)
+    const bool p1_hot_only = phase == 3;
+    phase = p1_hot_only ? 1 : phase;
+    GGML_ASSERT(phase >= 0 && phase <= 2 && (phase == 0 || resident));
+    GGML_ASSERT(!pair || (ggml_cuda_moe_mixed_pair_supported(bank, base, pair->bank, pair->base) &&
+            (table == nullptr) == (pair->table == nullptr) && (phase == 0 || pair->resident) &&
+            pair->dst->type == GGML_TYPE_F32 && ggml_is_contiguous(pair->dst) && ggml_are_same_shape(pair->dst, dst)));
+    const ggml_tensor * w = bank->src[0], * x = bank->src[1], * ids = bank->src[2], * cw = base->src[0], * ci = base->src[2];
+    const int K = (int) x->ne[0], M = (int) w->ne[1];
+    GGML_ASSERT(!pair || !pair->glu || (pair->glu->type == GGML_TYPE_F32 && ggml_is_contiguous(pair->glu) &&
+            ggml_are_same_shape(pair->glu, dst) && M/16*ids->ne[0]*ids->ne[1] <= MOE_MIXED_GLU_TILES &&
+            (pair->glu->src[0]->data == dst->data) != (pair->glu->src[0]->data == pair->dst->data)));
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    const size_t rows = (size_t) x->ne[1]*x->ne[2];
+    // q8 is taken from the pool before q and s on every path: the pool frees in reverse order of allocation.
+    ggml_cuda_pool_alloc<char> q8(ctx.pool());
+    ggml_cuda_pool_alloc<int8_t> q(ctx.pool());
+    ggml_cuda_pool_alloc<float> s(ctx.pool());
+    GGML_ASSERT((act_ai_q == nullptr) == (act_ai_s == nullptr));
+    if (!act_q8) {
+        q8.alloc(rows*(GGML_PAD(K, MATRIX_ROW_PADDING)/QK8_1)*sizeof(block_q8_1));
+    }
+    if (!act_ai_q && !act_q8) {
+        char * p = q8.get();
+        if (ggml_cuda_moe_mixed_quantize_dual(ctx, bank, x, p, cw->type, q, s)) {
+            act_ai_q = q.get();
+            act_ai_s = s.get();
+            act_q8 = p;
+        }
+    }
+    if (!act_ai_q) {
+        ggml_cuda_moe_mixed_quantize_x(ctx, bank, q, s);
+        act_ai_q = q.get();
+        act_ai_s = s.get();
+    }
+    if (!act_q8) {
+        const int padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+        char * p = q8.get();
+        quantize_row_q8_1_cuda((const float *) x->data, nullptr, p, cw->type, K,
+                x->nb[1]/sizeof(float), x->nb[2]/sizeof(float), x->nb[3]/sizeof(float),
+                padded, x->ne[1], x->ne[2], 1, ctx.stream());
+        act_q8 = p;
+    }
+    ai4k::idmap idm{};
+    idm.nb02 = w->nb[2]; idm.direct_ids = (const char *) ids->data;
+    idm.direct_nb0 = ids->nb[0]; idm.direct_nb1 = ids->nb[1];
+    idm.direct_n_used = (int) ids->ne[0]; idm.direct_ne11 = (int) x->ne[1]; idm.direct_n_expert = (int) w->ne[2];
+    GGML_ASSERT((route_map == nullptr) == (route_mask == nullptr));
+    if (route_map) {
+        GGML_ASSERT(route_map->type == GGML_TYPE_F32 && ggml_is_contiguous(route_map));
+        GGML_ASSERT(ggml_nelements(route_map) == cw->ne[2]);
+        GGML_ASSERT(route_mask->type == GGML_TYPE_F32 && ggml_is_contiguous(route_mask));
+        GGML_ASSERT(ggml_nelements(route_mask) == ggml_nelements(ids));
+        idm.direct_ids = (const char *) ci->data;
+        idm.direct_nb0 = ci->nb[0]; idm.direct_nb1 = ci->nb[1];
+        idm.direct_map = (const float *) route_map->data;
+        idm.direct_map_size = (int) cw->ne[2];
+    }
+    // The phase-2 launch holds no bank or resident routes: 16-row blocks of four warps spread its few copied
+    // routes over four times the blocks of an SPW grid (each row's arithmetic is the same; the epilogues count
+    // 16-row slices either way). GGML_MOE_BANK_MIXED_P2_FINE=0 keeps the SPW grid.
+    static const bool p2_fine = ai4_env_int("GGML_MOE_BANK_MIXED_P2_FINE", nullptr, 1) != 0;
+    const bool fine = p2_fine && phase == 2;
+    // Hot K=640 downs: the slab-per-warp grid gives one warp 16 rows and all of K (2.5 units per warp, so the
+    // 4-stage prefetch never fills; d9 traces: AIT2_U down 35.7 us vs Q2_0 sw 27.9, AIT4_U 55-105 vs IQ4_NL 35-44).
+    // Default: the 16-row split-K blocks (M/16 x routes x tokens) that gate/up used before SPW. The k order changes
+    // (KLD-gated, not identity). GGML_CUDA_AI23_DOWN_SPW=1 keeps the SPW grid for K=640.
+    static const bool down_spw = ai4_env_int("GGML_CUDA_AI23_DOWN_SPW", nullptr, 0) != 0;
+    // Opt-in split-K grouped hot launch (GGML_MOE_BANK_MIXED_SPLITK=1): multi-token, AI+ bank types.
+    static const bool splitk_env = ai4_env_int("GGML_MOE_BANK_MIXED_SPLITK", nullptr, 0) != 0;
+    const bool splitk = splitk_env && !fine && w->type != GGML_TYPE_IQ4_NL && ids->ne[1] > 1;
+    const bool spw = !fine && !splitk && w->type != GGML_TYPE_IQ4_NL && (K != 640 || down_spw) &&
+            ai4_spw_enabled(M, K, idm, (int) ggml_nelements(ids));
+    // Compact phase 2 (as the native miss list): four blocks per 16-row tile walk only the routes phase 2 owns,
+    // instead of one block per route and tile that mostly exits. GGML_MOE_BANK_MIXED_P2_COMPACT=0 opts out.
+    static const bool p2_compact_env = ai4_env_int("GGML_MOE_BANK_MIXED_P2_COMPACT", nullptr, 1) != 0;
+    const bool p2_compact = p2_compact_env && fine && ggml_nelements(ids) <= 64;
+    const int p2_n_tok = p2_compact ? (int) ids->ne[1] : 0;
+    // Blocks per 16-row tile in compact phase 2: each block takes every gridDim.y-th miss route, so with four blocks
+    // a layer's 1-3 misses run one route per block, serially per tile (d9: 12.2 us gate+up pair / 6.8 down mean,
+    // 2.8 / 3.1 min, vs the native list kernel 4.3). Default 8 spreads misses over twice the blocks; the per-route
+    // arithmetic and k order are unchanged (identity). GGML_MOE_BANK_MIXED_P2_Y=4 restores the old grid.
+    static const int p2_y = std::min(64, std::max(1, ai4_env_int("GGML_MOE_BANK_MIXED_P2_Y", nullptr, 8)));
+    // Slabs per hit-first block: 4 warps x 16 rows is 20 blocks per route for a 640-row projection (the fused 3XS
+    // hit kernel runs 80); 2 warps doubles the block count at the same warps per SM and keeps each row's k order.
+    // GGML_CUDA_AI23_MIXED_SPW_WARPS=2|4 (default 4).
+    static const int spw_warps = ai4_env_int("GGML_CUDA_AI23_MIXED_SPW_WARPS", nullptr, 4) == 2 ? 2 : 4;
+    const int slabs_per_block = spw ? spw_warps : 1;
+    // fork AIPFIX P1PLAIN: phase 3 of a down projection (bank routes only; the 3XS hit kernel ran the cached ones,
+    // and the down ids already hold bank slots) runs the plain AI+ direct GEMV, the MUL_MAT_ID kernel that isolated
+    // ncu measured at 63-79% of DRAM speed, instead of the mixed kernel (22% occupancy). Routes without a bank slot
+    // exit unwritten, as in phase 3. The k order may differ (KLD-close class). Default 1 (down only): paired Taichi
+    // coding 100K 11-04, 6 pairs, width-matched ms/round -2.4% (p=.008), writing tok/s +2.5% (p=.032).
+    // GGML_MOE_BANK_P1_PLAIN=0 keeps the mixed kernel; =2 takes the bank gate/up instead (P1PLAIN-GU below,
+    // measured slower), =3 both.
+    static const int p1_plain_mode = ai4_env_int("GGML_MOE_BANK_P1_PLAIN", nullptr, 1);
+    const bool p1_plain = (p1_plain_mode & 1) != 0;
+    if (p1_plain && p1_hot_only && !pair && !red && !route_map && w->type != GGML_TYPE_IQ4_NL) {
+        const int n_tok = (int) ids->ne[1], n_pairs = (int) ggml_nelements(ids);
+        const uint8_t * W = (const uint8_t *) w->data;
+        float * Y = (float *) dst->data;
+        bool ok = false;
+        switch (ai4_lay_of(w->type)) {
+#define AI4_P1_PLAIN(L) \
+            case L: ok = xsh ? ai4_mmvr_try<L, 1, true>(W, act_ai_q, act_ai_s, Y, M, n_tok, K, ctx.stream(), idm, n_pairs) \
+                             : ai4_mmvr_try<L, 0, true>(W, act_ai_q, act_ai_s, Y, M, n_tok, K, ctx.stream(), idm, n_pairs); break;
+            AI4_P1_PLAIN(ai4k::LAY_AIT2_U)
+            AI4_P1_PLAIN(ai4k::LAY_AIT2P_U)
+            AI4_P1_PLAIN(ai4k::LAY_AIT3_U)
+            AI4_P1_PLAIN(ai4k::LAY_AIT4_U)
+            AI4_P1_PLAIN(ai4k::LAY_AIT2_U2)
+            AI4_P1_PLAIN(ai4k::LAY_AIT3_U2)
+#undef AI4_P1_PLAIN
+            default: break;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            fprintf(stderr, "[moe-bank] P1PLAIN first phase-3 down: type=%d K=%d M=%d plain=%d\n", (int) w->type, K, M, (int) ok);
+        }
+        if (ok) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+    // fork AIPFIX P1PLAIN-GU: phase 1 of the bank gate/up under P1HITG (bank routes only) runs the plain AI+ table
+    // GEMV (gate and up in one launch, fused SwiGLU; routes of one expert share a weight read at >= 4 tokens)
+    // instead of the mixed kernel. A prep kernel writes what phase 1 wrote for later projections (bank slot ids,
+    // route mask) and a slot -> weight table per projection. The k order may differ (KLD-close class).
+    if ((p1_plain_mode & 2) && phase == 1 && pair && pair->hot_only && pair->glu && route_map && !red &&
+            ids->ne[2] == 1 && w->type != GGML_TYPE_IQ4_NL && pair->bank->src[0]->type == w->type &&
+            pair->bank->src[0]->ne[2] == w->ne[2] && M % 16 == 0 &&
+            (int64_t) (M/16)*ids->ne[0]*ids->ne[1] <= ai4k::GLU_PAIR_TILES) {
+        const int n_used = (int) ids->ne[0], n_tok = (int) ids->ne[1], n_slots = (int) w->ne[2];
+        ggml_cuda_pool_alloc<const void *> tab(ctx.pool(), 2*(size_t) n_slots);
+        const ggml_tensor * w2 = pair->bank->src[0];
+        moe_p1_plain_prep<<<1, 256, 0, ctx.stream()>>>((const char *) ci->data, ci->nb[0], ci->nb[1],
+                (const float *) route_map->data, (int) ggml_nelements(route_map), (char *) ids->data, ids->nb[0],
+                ids->nb[1], (float *) route_mask->data, n_used, n_used*n_tok, n_slots,
+                (const uint8_t *) w->data, w->nb[2], (const uint8_t *) w2->data, w2->nb[2], tab.get());
+        CUDA_CHECK(cudaGetLastError());
+        ai4k::idmap pm{};
+        pm.nb02 = w->nb[2];
+        pm.direct_ids = (const char *) ids->data;
+        pm.direct_nb0 = ids->nb[0]; pm.direct_nb1 = ids->nb[1];
+        pm.direct_n_used = n_used; pm.direct_ne11 = (int) x->ne[1]; pm.direct_n_expert = n_slots;
+        pm.table = tab.get();
+        pm.table2 = tab.get() + n_slots;
+        pm.y2 = (float *) pair->dst->data;
+        const bool gate_first = pair->glu->src[0]->data == dst->data;
+        pm.glu = (float *) pair->glu->data;
+        pm.glu_gate = (const float *) (gate_first ? dst : pair->dst)->data;
+        pm.glu_up = (const float *) (gate_first ? pair->dst : dst)->data;
+        float * Y = (float *) dst->data;
+        bool ok = false;
+        switch (ai4_lay_of(w->type)) {
+#define AI4_P1_PLAIN_GU(L) \
+            case L: ok = xsh ? ai4_mmvr_try<L, 1, true>(nullptr, act_ai_q, act_ai_s, Y, M, n_tok, K, ctx.stream(), pm, n_used*n_tok) \
+                             : ai4_mmvr_try<L, 0, true>(nullptr, act_ai_q, act_ai_s, Y, M, n_tok, K, ctx.stream(), pm, n_used*n_tok); break;
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT2_U)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT2P_U)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT3_U)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT4_U)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT2_U2)
+            AI4_P1_PLAIN_GU(ai4k::LAY_AIT3_U2)
+#undef AI4_P1_PLAIN_GU
+            default: break;
+        }
+        static std::atomic<bool> logged_gu{false};
+        if (!logged_gu.exchange(true)) {
+            fprintf(stderr, "[moe-bank] P1PLAIN-GU first bank gate/up: type=%d K=%d M=%d slots=%d tokens=%d plain=%d\n",
+                    (int) w->type, K, M, n_slots, n_tok, (int) ok);
+        }
+        if (ok) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        // declined: the mixed phase 1 below rewrites the same slot ids and mask
+    }
+    const dim3 grid((M/16 + slabs_per_block - 1)/slabs_per_block*(pair ? 2 : 1), p2_compact ? p2_y : ids->ne[0], p2_compact ? 1 : ids->ne[1]);
+    moe_mixed_second second{};
+    if (pair) {
+        second = { (const uint8_t *) pair->bank->src[0]->data, (float *) pair->dst->data,
+                   (const char *) pair->base->src[0]->data, pair->table, pair->skip, pair->resident,
+                   nullptr, nullptr, nullptr };
+        if (pair->glu) {
+            const bool gate_first = pair->glu->src[0]->data == dst->data;
+            second.glu_gate = (const float *) (gate_first ? dst : pair->dst)->data;
+            second.glu_up = (const float *) (gate_first ? pair->dst : dst)->data;
+            second.glu = (float *) pair->glu->data;
+        }
+    }
+    // Hot gate+up of a paired SPW launch in one block (warp pairs, block-local SwiGLU); cold routes keep the
+    // two-half grid. Default on; GGML_CUDA_AI23_MIXED_PAIR_WARP=0 opts out.
+    static const bool pair_warp = ai4_env_int("GGML_CUDA_AI23_MIXED_PAIR_WARP", nullptr, 1) != 0;
+    second.pair_warp = pair && spw && pair_warp;
+    // Cold (base-type) routes grouped by expert in multi-token launches. Off by default: the paired coding-100K run
+    // (f3b-speed) measured it 0.65 ms/round slower than ungrouped (p = 0.049). GGML_MOE_BANK_MIXED_COLD_GROUP=1 opts in.
+    static const bool cold_group = ai4_env_int("GGML_MOE_BANK_MIXED_COLD_GROUP", nullptr, 0) != 0;
+    second.cold_group = cold_group;
+    second.res_both = pair && pair->res_both;
+    second.hot_only = phase == 1 && (p1_hot_only || (pair && pair->hot_only));
+    second.splitk = splitk;
+    GGML_ASSERT(!red || (!pair && ggml_cuda_moe_mixed_reduce_supported(dst, *red)));
+    if (red) {
+        second.red_w = (const float *) red->weights->data;
+        second.red_bank = (const int32_t *) red->bank_ids->data;
+        second.red_bank_stride = red->bank_ids->nb[1]/sizeof(int32_t);
+        second.red_dst = (float *) red->dst->data;
+        second.red_tree = ggml_cuda_moe_mixed_reduction_tree(dst);
+    }
+    static const int trace = getenv("GGML_MOE_BANK_MIXED_TRACE") ? atoi(getenv("GGML_MOE_BANK_MIXED_TRACE")) : 0;
+    const int cfg = ai4_mmvr_cfg();
+    const bool iq4_hot_single = w->type == GGML_TYPE_IQ4_NL && ids->ne[1] == 1;
+    // moe_mixed_rows_single partials (IQ4 hot and one-token cold rows).
+    const size_t iq4_smem = ids->ne[1] == 1 ? 3*16*32*sizeof(float) : 0;
+    const bool two_warps = !fine && !iq4_hot_single && (cfg == 212 || (cfg == 0 && ids->ne[1] > 1 && K >= 1024));
+    static const bool single = ai4_env_int("GGML_CUDA_AI23_MMVR_SINGLE_ID", nullptr, 0) != 0 ||
+                               ai4_env_int("GGML_CUDA_AI23_VERIFY_COMPACT", nullptr, 0) != 0;
+    // Deeper hot-route weight prefetch; the K order and arithmetic are unchanged.
+    static const int spw_stages_all = [] {
+        const int v = ai4_env_int("GGML_CUDA_AI23_MIXED_STAGES", nullptr, 4);
+        return v == 2 || v == 8 ? v : 4;
+    }();
+    // Phase 1 runs while the layer's miss copy streams from host memory (same as the native hit pass): a shallower
+    // pipeline (smaller shared-memory stages, fewer loads in flight) leaves the copy kernel room. Same K order and
+    // arithmetic. Default 0 keeps the common depth (no measured gain, AIPTAB r52); =2|4|8 opts in.
+    static const int p1_stages = [] {
+        const int v = ai4_env_int("GGML_MOE_BANK_MIXED_P1_STAGES", nullptr, 0);
+        return v == 2 || v == 4 || v == 8 ? v : 0;
+    }();
+    const int spw_stages = phase == 1 && p1_stages ? p1_stages : spw_stages_all;
+#define MOE_MIXED_LAUNCH(T, IQ4, L, XSH, KT, WARPS, SINGLE, SPW, ST) \
+    moe_mixed_mmv<T, IQ4, L, XSH, KT, WARPS, SINGLE, SPW, ST><<<grid, WARPS*32, std::max((size_t) (WARPS*ST*ai4k::mmv_stage_bytes<true, L>()), iq4_smem), ctx.stream()>>>( \
+            (const uint8_t *) w->data, act_ai_q, act_ai_s, (float *) dst->data, M, K, idm, \
+            (const char *) cw->data, table, cw->type, cw->nb[2], cw->nb[1], (const int32_t *) ci->data, \
+            ci->nb[1]/sizeof(int32_t), (int) cw->ne[2], (const block_q8_1 *) act_q8, skip, resident, \
+            route_map && phase != 2 ? (char *) ids->data : nullptr, ids->nb[1], route_mask ? (float *) route_mask->data : nullptr, phase, p2_n_tok, second)
+#define MOE_MIXED_SINGLE(T, L, XSH, KT, WARPS) \
+    if (single) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, true, false, 2); } \
+    else        { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, WARPS, false, false, 2); }
+#define MOE_MIXED_WARPS(T, L, XSH, KT) \
+    if (spw && spw_warps == 2)       { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 2, false, true, 4); } \
+    else if (spw && spw_stages == 8) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 8); } \
+    else if (spw && spw_stages == 4) { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 4); } \
+    else if (spw)       { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, true, 2); } \
+    else if (splitk)    { MOE_MIXED_LAUNCH(T, false, L, XSH, KT, 4, false, false, 2); } \
+    else if (two_warps) { MOE_MIXED_SINGLE(T, L, XSH, KT, 2); } \
+    else                { MOE_MIXED_SINGLE(T, L, XSH, KT, 4); }
+#define MOE_MIXED_SHAPE(L) \
+    if (K == 640 && ai4_mmvr_kt())       { MOE_MIXED_WARPS(GGML_TYPE_COUNT, L, 0, 640); } \
+    else if (K == 2560 && ai4_mmvr_kt()) { MOE_MIXED_WARPS(GGML_TYPE_COUNT, L, 1, 2560); } \
+    else if (xsh)                      { MOE_MIXED_WARPS(GGML_TYPE_COUNT, L, 1, 0); } \
+    else                               { MOE_MIXED_WARPS(GGML_TYPE_COUNT, L, 0, 0); }
+    // IQ4 banks have no AI arithmetic; their unused layout, K and SINGLE choices need no variants.
+    if (w->type == GGML_TYPE_IQ4_NL) {
+        if (two_warps) { MOE_MIXED_LAUNCH(GGML_TYPE_IQ4_NL, true, ai4k::LAY_AIT2_U, 0, 0, 2, false, false, 2); }
+        else           { MOE_MIXED_LAUNCH(GGML_TYPE_IQ4_NL, true, ai4k::LAY_AIT2_U, 0, 0, 4, false, false, 2); }
+    // Limit format specializations to production pairs; other shapes retain the generic dispatch.
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_IQ2_XXS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_XXS, ai4k::LAY_AIT2_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_IQ2_XS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_XS, ai4k::LAY_AIT2_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_IQ2_S) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_S, ai4k::LAY_AIT2_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT3_U && cw->type == GGML_TYPE_IQ3_XXS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ3_XXS, ai4k::LAY_AIT3_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT3_U && cw->type == GGML_TYPE_IQ3_S) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ3_S, ai4k::LAY_AIT3_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 640 && M == 2560 && w->type == GGML_TYPE_AIT2_U && cw->type == GGML_TYPE_Q2_0) {
+        MOE_MIXED_WARPS(GGML_TYPE_Q2_0, ai4k::LAY_AIT2_U, 0, 640);
+    } else if (ai4_mmvr_kt() && K == 640 && M == 2560 && w->type == GGML_TYPE_AIT4_U && cw->type == GGML_TYPE_IQ4_NL) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ4_NL, ai4k::LAY_AIT4_U, 0, 640);
+    } else if (w->type == GGML_TYPE_AIT4_U) {
+        if (ai4_mmvr_kt()) { MOE_MIXED_WARPS(GGML_TYPE_COUNT, ai4k::LAY_AIT4_U, 0, 640); }
+        else               { MOE_MIXED_WARPS(GGML_TYPE_COUNT, ai4k::LAY_AIT4_U, 0, 0); }
+    } else if (w->type == GGML_TYPE_AIT2_U) {
+        MOE_MIXED_SHAPE(ai4k::LAY_AIT2_U);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2P_U && cw->type == GGML_TYPE_IQ2_XXS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_XXS, ai4k::LAY_AIT2P_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2P_U && cw->type == GGML_TYPE_IQ2_XS) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_XS, ai4k::LAY_AIT2P_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 2560 && M == 640 && w->type == GGML_TYPE_AIT2P_U && cw->type == GGML_TYPE_IQ2_S) {
+        MOE_MIXED_WARPS(GGML_TYPE_IQ2_S, ai4k::LAY_AIT2P_U, 1, 2560);
+    } else if (ai4_mmvr_kt() && K == 640 && M == 2560 && w->type == GGML_TYPE_AIT2P_U && cw->type == GGML_TYPE_Q2_0) {
+        MOE_MIXED_WARPS(GGML_TYPE_Q2_0, ai4k::LAY_AIT2P_U, 0, 640);
+    } else if (w->type == GGML_TYPE_AIT2P_U) {
+        MOE_MIXED_SHAPE(ai4k::LAY_AIT2P_U);
+    } else if (w->type == GGML_TYPE_AIT2_U2) {
+        MOE_MIXED_SHAPE(ai4k::LAY_AIT2_U2);
+    } else if (w->type == GGML_TYPE_AIT3_U2) {
+        MOE_MIXED_SHAPE(ai4k::LAY_AIT3_U2);
+    } else {
+        MOE_MIXED_SHAPE(ai4k::LAY_AIT3_U);
+    }
+#undef MOE_MIXED_SHAPE
+#undef MOE_MIXED_WARPS
+#undef MOE_MIXED_SINGLE
+#undef MOE_MIXED_LAUNCH
+    CUDA_CHECK(cudaGetLastError());
+    if (trace) {
+        fprintf(stderr, "[moe-bank-mixed] launch K=%d M=%d routes=%lld width=%lld bank=%s base=%s table=%d routing=%d spw=%d phase=%d pair=%d glu=%d reduce=%d pw=%d\n",
+                K, M, (long long) ids->ne[0], (long long) ids->ne[1], ggml_type_name(w->type), ggml_type_name(cw->type), table != nullptr, route_map != nullptr, spw, phase, pair != nullptr, pair && pair->glu, red != nullptr, (int) second.pair_warp);
+    }
+}
+#undef MOE_MIXED_TYPES
 // Fractional pair path. Reuse the numerically checked pair decoder and existing
 // activation rotation; keep the fractional rate separate from integer AI+ dispatch.
 bool ggml_cuda_aif25_supported(const ggml_tensor * op) {

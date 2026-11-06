@@ -64,6 +64,12 @@
 #include <sys/resource.h>
 #endif
 
+// [PP12] host expert bytes this context uploaded through the copy callback, and copies the MoE cache served;
+// read by the normal-prefill log so a fallback prompt reports what it moved to the card
+static std::atomic<uint64_t> g_pp_upload_bytes{0};
+static std::atomic<uint64_t> g_pp_cache_copies{0};
+
+
 //
 // llama_context
 //
@@ -605,6 +611,102 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    // fork: small-card prompt ubatch. An MoE model asked for -ub > 6144 on a card with less than
+    // LLAMA_UB_SMALL_CARD_FREE_MIB (default 14336) free here (after the weights, before KV and the expert cache;
+    // a 12 GB card is ~8 GB here, a 24 GB card ~20 GB) runs -ub 6144: the 12 GB measured pick (one layer-major pass
+    // of 17 ubatches with LLAMA_LEAN_PROMPT; 8192 needs a second carry slot and two 128-route tiles per expert,
+    // 0.77x prompt). LLAMA_UB_SMALL_CARD_CAP=0 keeps the asked size.
+    // fork: LLAMA_LEAN_PROMPT (packed QSA rows mask + direct lists + in-place expert weighting on prompt batches) is
+    // the 12 GB pick only: on a 24 GB card it cost prompt 0.980x and writing 0.984x. Unset = on for an MoE model on a
+    // small card (same test as the ubatch cap below), off otherwise; the first context decides; an explicit value wins.
+    // A no_alloc context (the memory-fit trial pass, logs muted, weights not loaded yet) must not decide: it would
+    // test free memory before the weights and stay silent.
+    if (!model.hparams.no_alloc && !getenv("LLAMA_LEAN_PROMPT")) {
+        bool lean = false;
+        size_t free = 0, total = 0;
+        if (model.hparams.n_expert > 0 && !model.devices.empty() &&
+            ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            const char * e = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB");
+            ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
+            lean = (free >> 20) < (size_t) (e ? atoll(e) : 14336);
+        }
+#ifdef _WIN32
+        _putenv_s("LLAMA_LEAN_PROMPT", lean ? "1" : "0");
+#else
+        setenv("LLAMA_LEAN_PROMPT", lean ? "1" : "0", 0);
+#endif
+        if (lean) {
+            LLAMA_LOG_WARN("%s: small card (%zu MiB free): LLAMA_LEAN_PROMPT on (=0 turns it off)\n", __func__, free >> 20);
+        }
+    }
+
+    // fork: small-card prompt plan. Without these a 12 GB or 10 GB card falls back to 512-token chunks (about 273 tok/s on
+    // a 100K prompt). Host carry + async staging: 12 GB 9.33x, 10 GB 7.30x prompt, writing unchanged. Below
+    // LLAMA_UB_TINY_CARD_FREE_MIB (default 6400; a 12 GB card is ~7.8 GB here, a 10 GB card ~5.7 GB) the plan also needs
+    // the smaller VRAM keep reserve. The first real context (the main model) decides; an explicit value of each variable
+    // wins; LLAMA_SMALL_CARD_AUTO=0 keeps all of them off. The carry's RAM rule stays in llama_b1::begin (5 GiB floor).
+    // The plan is for AI+ expert files only: with a 3XS file, B1 at -ub 6144 gave different greedy text fresh vs restored
+    // (scid3, cause not named), so 3XS keeps its -ub 6144 cap and chunks unless the caller sets these variables.
+    const bool small_plan_file = [&] {
+        for (const auto & layer : model.layers) {
+            for (const auto * weight : {layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps,
+                                       layer.ffn_gate_up_exps}) {
+                if (weight && (ggml_ai4_rate(weight->type) != 0 || ggml_ait_rate(weight->type) != 0)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }();
+    if (small_plan_file && !model.hparams.no_alloc && model.hparams.n_expert > 0 && !model.devices.empty() &&
+        ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        static bool small_decided = false;
+        const char * small_auto = getenv("LLAMA_SMALL_CARD_AUTO");
+        if (!small_decided && (!small_auto || atoi(small_auto) != 0)) {
+            const char * lim = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB");
+            const char * tiny = getenv("LLAMA_UB_TINY_CARD_FREE_MIB");
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
+            const auto set_unset = [](const char * name, const char * value) {
+                if (!getenv(name)) {
+#ifdef _WIN32
+                    _putenv_s(name, value);
+#else
+                    setenv(name, value, 0);
+#endif
+                }
+            };
+            if ((free >> 20) < (size_t) (lim ? atoll(lim) : 14336)) {
+                const bool is_tiny = (free >> 20) < (size_t) (tiny ? atoll(tiny) : 6400);
+                set_unset("LLAMA_B1_HOST_CARRY", "1");
+                set_unset("LLAMA_B1_HOST_CARRY_ASYNC", "1");
+                if (is_tiny) {
+                    set_unset("LLAMA_B1_KEEP_AUTO_MIN_MIB", "1024");
+                }
+                LLAMA_LOG_WARN("%s: small card (%zu MiB free): prompt host carry + async%s on (LLAMA_SMALL_CARD_AUTO=0 turns them off)\n",
+                               __func__, free >> 20, is_tiny ? " + keep auto" : "");
+            }
+        }
+        small_decided = true;
+    }
+
+    if (cparams.n_ubatch > 2048 && model.hparams.n_expert > 0 && !model.devices.empty()) {
+        static const bool cap_on = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_CAP"); return !e || atoi(e) != 0; }();
+        static const size_t lim_mib = [] { const char * e = getenv("LLAMA_UB_SMALL_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 14336); }();
+        static const size_t tiny_mib = [] { const char * e = getenv("LLAMA_UB_TINY_CARD_FREE_MIB"); return (size_t) (e ? atoll(e) : 6400); }();
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
+        if (cap_on && ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
+            // 10 GB measured pick: -ub 2048 (49 ubatches, one pass); only the 12 GB tier keeps 6144
+            const uint32_t cap = small_plan_file && (free >> 20) < tiny_mib ? 2048 : 6144;
+            if (cparams.n_ubatch > cap) {
+                LLAMA_LOG_WARN("%s: small card (%zu MiB free < %zu): n_ubatch %u -> %u (LLAMA_UB_SMALL_CARD_CAP=0 keeps it)\n",
+                               __func__, free >> 20, lim_mib, cparams.n_ubatch, cap);
+                cparams.n_ubatch = cap;
+            }
+        }
+    }
 
     if (cparams.n_rs_seq > 0) {
         const uint32_t n_batch_min = cparams.n_rs_seq + 2;
@@ -5458,7 +5560,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
     } ple_pf_g;
-    if (ple_pf && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
+    // LLAMA_PLE_PF_LATE=1: start the reads after b1_prepare, so its host pins and output buffers
+    // (which can push freshly read PLE pages out of the page cache) are already in place
+    static const bool ple_pf_late = [] { const char * e = getenv("LLAMA_PLE_PF_LATE"); return e && atoi(e) != 0; }();
+    if (ple_pf && !ple_pf_late && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
         ple_pf_g.p = ple_pf.get();
     }
 
@@ -5600,6 +5705,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
     const int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
     pp_dec.mark("b1_prepare");
+    if (ple_pf && ple_pf_late && b1_mode >= 0 && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
+        ple_pf_g.p = ple_pf.get();
+    }
     if (b1_mode == 1) {
         pp_dec.print(__func__);
     }
@@ -5619,6 +5727,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             return -2;
         }
         LLAMA_LOG_INFO("%s: layer-sized B1 fallback uses %u-token normal chunks\n", __func__, sched_reserve_tokens);
+    }
+    // [PP12] a long prompt on the normal path: log chunks, expert bytes uploaded and wall time when the call ends
+    struct pp_normal_log {
+        bool on = false;
+        uint32_t tokens = 0, chunks = 0, max_chunk = 0;
+        uint64_t up0 = 0, cc0 = 0;
+        int64_t t0 = 0;
+        ~pp_normal_log() {
+            if (!on) {
+                return;
+            }
+            const double s = (ggml_time_us() - t0) / 1e6;
+            const uint64_t up = g_pp_upload_bytes.load(std::memory_order_relaxed) - up0;
+            LLAMA_LOG_WARN("%s: [B1] normal prefill: %u tokens in %u chunks (largest %u), uploaded %.2f GiB of host "
+                    "experts via the copy callback (%.2f GiB/chunk), %llu copies served by the MoE cache, %.1f s (%.0f tok/s)\n",
+                    "decode", tokens, chunks, max_chunk, up / 1073741824.0, chunks ? up / 1073741824.0 / chunks : 0.0,
+                    (unsigned long long) (g_pp_cache_copies.load(std::memory_order_relaxed) - cc0), s, s > 0 ? tokens / s : 0.0);
+        }
+    } pp_nlog;
+    if (b1_mode == 0 && b1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all >= 1024) {
+        pp_nlog.on = true;
+        pp_nlog.tokens = n_tokens_all;
+        pp_nlog.up0 = g_pp_upload_bytes.load(std::memory_order_relaxed);
+        pp_nlog.cc0 = g_pp_cache_copies.load(std::memory_order_relaxed);
+        pp_nlog.t0 = ggml_time_us();
     }
     if (b1_mode == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all <= 8) {
         b1_cache_warm();
@@ -5677,9 +5810,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }
             }
             b1_cur = { true, b1_final_l0, -1, b1_final_l0 > 0 ? b1->carry(b1_i) : nullptr };
+            if (b1_final_l0 > 0 && b1->carry_on_host()) {
+                b1->carry_load_final(b1_i); // [PP12]
+            }
         }
 
         const auto & ubatch = mctx->get_ubatch();
+        if (pp_nlog.on) {
+            ++pp_nlog.chunks;
+            pp_nlog.max_chunk = std::max(pp_nlog.max_chunk, ubatch.n_tokens);
+        }
 
         // count the outputs in this ubatch
         {
@@ -5965,6 +6105,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 ggml_backend_tensor_get_async(backend, t_sampled_rows,
                         sampling.sampled.data + n_outputs_prev + first,
                         i0 * sizeof(llama_token), count * sizeof(llama_token));
+            }
+        }
+
+        // top-k row export: K ids and logits per row land in the per-output-row strided sampling buffers
+        for (const auto & [seq_id, tk] : res->t_topk_rows) {
+            const auto & rows = res->sampled_rows.at(seq_id);
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tk.first);
+            GGML_ASSERT(sampling.logits.has_data() && sampling.candidates.has_data());
+            const size_t K = tk.first->ne[0];
+            for (size_t i = 0; i < rows.size();) {
+                const uint32_t first = rows[i];
+                const size_t   i0    = i;
+                uint32_t count = 1;
+                while (++i < rows.size() && rows[i] == first + count) {
+                    ++count;
+                }
+                GGML_ASSERT(n_outputs_prev + first + count <= (int64_t) sampling.logits_count.size());
+                const size_t dst = (size_t) (n_outputs_prev + first) * n_vocab;
+                ggml_backend_tensor_get_2d_async(backend, tk.first, sampling.candidates.data + dst,
+                        i0 * K * sizeof(int32_t), K * sizeof(int32_t), count, K * sizeof(int32_t), (size_t) n_vocab * sizeof(int32_t));
+                ggml_backend_tensor_get_2d_async(backend, tk.second, sampling.logits.data + dst,
+                        i0 * K * sizeof(float), K * sizeof(float), count, K * sizeof(float), (size_t) n_vocab * sizeof(float));
+                for (uint32_t c = 0; c < count; ++c) {
+                    sampling.candidates_count[n_outputs_prev + first + c] = K;
+                    sampling.logits_count[n_outputs_prev + first + c]     = K;
+                }
             }
         }
 
@@ -6852,7 +7018,8 @@ bool llama_context::b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes
         ggml_backend_dev_memory(dev, &free, &total);
         const size_t card_limit = (size_t) 23552 << 20;
         const size_t keep = std::max<size_t>(
-                (size_t) std::max<int64_t>(1536, b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20,
+                // same keep as the plan (llama-b1.cpp): the env may lower it too, else the plan takes the VRAM this check then misses
+                (size_t) std::max<int64_t>(512, b1->keep_override_mib >= 0 ? b1->keep_override_mib : b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536)) << 20,
                 total > card_limit ? total - card_limit + (64u << 20) : 0);
         // fork: lent, unused B1 VRAM covers most of the layer graph (see b1_kv_scratch_bind); only the owned rest needs free VRAM
         size_t lend_spare = 0;
@@ -7157,19 +7324,67 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         // plan once more leaving that deficit free: the plan lends more resident experts (refilled after the prompt)
         // instead of allocating fresh VRAM. Opt-in: LLAMA_B1_REPLAN=1.
         // Allocation rounding can leave the re-plan a little short, so up to three re-plans add each new deficit.
+        // [KEEPAUTO] opt-in LLAMA_B1_KEEP_AUTO_MIN_MIB=N (>= 512): when no plan fits with the normal keep reserve,
+        // lower the keep in 128 MiB steps down to N and plan again (each step with the usual re-plans). Default off.
+        const int64_t keep_start = b1_ctx_env("LLAMA_B1_KEEP_FREE_MIB", 1536);
+        const int64_t keep_min   = b1_ctx_env("LLAMA_B1_KEEP_AUTO_MIN_MIB", 0);
+        for (int64_t keep_try = keep_start; ; ) {
         size_t extra = 0;
         for (int attempt = 0; attempt < 3 && !reserved && b1_legacy_deficit > 0 && b1_ctx_env("LLAMA_B1_REPLAN", 0) != 0; ++attempt) {
             extra += b1_legacy_deficit + ((size_t) 64 << 20);
             LLAMA_LOG_WARN("%s: [B1] re-plan leaving %.1f MiB more free for the layer graph\n", __func__, extra / 1048576.0);
             b1->set_extra_keep(extra);
+            // [REFIT] the same plan would come back if it already had slack: cap its fresh VRAM below the failed plan's.
+            // LLAMA_B1_REPLAN_SHRINK=0 = extra keep only (old behavior).
+            if (b1_ctx_env("LLAMA_B1_REPLAN_SHRINK", 1) != 0) {
+                const size_t prev = b1->last_fresh(), cut = b1_legacy_deficit + ((size_t) 64 << 20);
+                size_t cap = prev > cut ? prev - cut : 0;
+                // A cut below the smallest host carry plan would refuse a plan that fits, because free VRAM can be higher at
+                // the re-plan (3XS at 12 GB: cap 1150 MiB, one slot + carry 1377.5 MiB, 5154 MiB free, 3269 MiB needed by the
+                // graph + keep). Step down one plan size instead; the extra keep still limits what the plan may take.
+                // With keep auto on, refusal stays: a lower keep then finds the async plan (10 GB route 2, the measured path).
+                if (keep_min < 512 && b1->carry_on_host() && cap < b1->carry_step_min()) {
+                    cap = b1->carry_step_below(prev);
+                }
+                b1->set_fresh_cap(cap);
+                LLAMA_LOG_WARN("%s: [B1] re-plan caps fresh VRAM at %.1f MiB (was %.1f MiB, short %.1f MiB)\n", __func__,
+                        cap / 1048576.0, prev / 1048576.0, b1_legacy_deficit / 1048576.0);
+            }
+            b1->hold_carry_pin(true);
             const bool replanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
+            b1->hold_carry_pin(false);
+            b1->drop_carry_spare();
             b1->set_extra_keep(0);
+            b1->set_fresh_cap(SIZE_MAX);
             if (!replanned || b1->n_groups() != 1) {
                 break;
             }
             b1_kv_scratch_enabled = kv_scratch_wanted;
             b1_lend_scratch = lend_wanted;
             reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
+        }
+        keep_try -= 128;
+        if (reserved || keep_min < 512 || keep_try < keep_min) {
+            break;
+        }
+        b1->set_keep_override(keep_try);
+        LLAMA_LOG_WARN("%s: [B1] keep auto: planning again with a %lld MiB VRAM keep reserve (min %lld)\n", __func__,
+                (long long) keep_try, (long long) keep_min);
+        b1->hold_carry_pin(true);
+        const bool kplanned = b1->begin(sizes, group_ub, lend_cap, final_home, nullptr, lean_legacy);
+        b1->hold_carry_pin(false);
+        b1->drop_carry_spare();
+        b1_legacy_deficit = 0;
+        if (kplanned && b1->n_groups() == 1) {
+            b1_kv_scratch_enabled = kv_scratch_wanted;
+            b1_lend_scratch = lend_wanted;
+            reserved = b1_reserve_legacy_layers(sizes, n_outputs_all);
+        }
+        }
+        if (b1->keep_override_mib >= 0) {
+            LLAMA_LOG_WARN("%s: [B1] keep auto: %s with a %lld MiB keep reserve\n", __func__, reserved ? "one pass fits" : "no fit",
+                    (long long) b1->keep_override_mib);
+            b1->set_keep_override(-1);
         }
         if (!reserved) {
             b1_kv_scratch_enabled = false; b1_lend_scratch = false;
@@ -7618,6 +7833,11 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             if (home) {
                 b1->ubatch_home(l0, true);
             }
+            if (b1->carry_on_host() && l0 > 0) {
+                b1->carry_load(u); // [PP12] this range reads the hidden state the previous range stored
+            } else if (b1->carry_on_host()) {
+                b1->carry_write_begin(u); // [PP12A] layer 0 writes the slot without reading it
+            }
             const int64_t t_compute0 = ggml_time_us();
             const int64_t u_inputs0 = b1_pp_inputs_us, u_submit0 = b1_pp_submit_us;
             const auto * res = process_ubatch(mctx->get_ubatch(), gtype, mctx, status);
@@ -7634,6 +7854,22 @@ bool llama_context::b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggm
             b1_cur = {};
             if (!res) {
                 return false;
+            }
+            if (b1->carry_on_host()) {
+                b1->carry_store(u);
+                if (b1->carry_async_on()) {
+                    // [PP12A] the slot u just freed next serves ubatch u + 2 in visiting order (this range, or
+                    // wrapped into the next range, which always reads its carry); only when it maps to the same slot
+                    size_t t = u + 2;
+                    bool reads = l0 > 0;
+                    if (t >= ub1) {
+                        t = ub0 + (t - ub1);
+                        reads = true;
+                    }
+                    if (t < ub1 && t % 2 == u % 2 && reads) {
+                        b1->carry_prefetch(t);
+                    }
+                }
             }
             capture_ubatch(mctx->get_ubatch(), l0, l1);
         }
@@ -7755,6 +7991,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
     };
     p.ple_pf = ple_pf.get();
     p.mtp_tok_row = mtp_pipe.active;
+    p.moe_onepath_live = ggml_moe_bank_onepath_live();
     if (b1_cur.active) {
         p.b1_il0   = b1_cur.il0;
         p.b1_il1   = b1_cur.il1;
@@ -7870,6 +8107,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             if (used[e]) {
                 ggml_backend_tensor_set_async(backend, dst, (const char *)src->data + e * src->nb[2],
                         e * dst->nb[2], expert_bytes);
+                g_pp_upload_bytes.fetch_add(expert_bytes, std::memory_order_relaxed);
                 if (e + 1 < src->ne[2]) {
                     static const uint8_t padding[512] = {};
                     ggml_backend_tensor_set_async(backend, dst, padding, (e + 1) * dst->nb[2],
@@ -7882,6 +8120,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+        g_pp_cache_copies.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -7942,6 +8181,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             }
             if (next < e) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                g_pp_upload_bytes.fetch_add((e - next)*expert_size, std::memory_order_relaxed);
             }
             e   += n;
             next = e;
@@ -7953,6 +8193,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            g_pp_upload_bytes.fetch_add(size, std::memory_order_relaxed);
         }
 
         first = last + 1;

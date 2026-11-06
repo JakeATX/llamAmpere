@@ -91,6 +91,37 @@ int main() {
         }
         gguf_free(meta);
     }
+    {
+        // AIT2P_U: unit bytes, pair-table metadata, no multiplier
+        const auto t = GGML_TYPE_AIT2P_U;
+        require(ggml_ai4_rate(t) == 2 && ggml_ai4_layout(t) == 1 && ggml_ai4_code(t) == 1, "AIT2P_U rate, layout, code");
+        require(ggml_ai4_code(GGML_TYPE_AIT2_U) == 0 && ggml_ai4_code(GGML_TYPE_AIT2P) == -1, "unit codes");
+        require(ggml_ai4_trellis_mul(t) == 0 && ggml_ait_rate(t) == 0, "AIT2P_U has no multiplier, is not tiled");
+        require(ggml_blck_size(t) == 128 && ggml_row_size(t, 640) == 5*34, "AIT2P_U row bytes");
+        auto * meta = fixture((int) t);
+        require(llama_ait_format_error(meta) != nullptr, "unversioned AIT2P_U rejected");
+        stamp(meta);
+        require(llama_ait_format_error(meta) == nullptr, "valid AIT2P_U accepted");
+        gguf_set_val_str(meta, AIT2P_HASH_KEY, "wrong table");
+        require(llama_ait_format_error(meta) != nullptr, "AIT2P_U wrong pair table rejected");
+        gguf_free(meta);
+        // independent decode of one random tile: bit-serial MSB-first stream, pair windows of 20 bits ending at 4p + 4
+        uint32_t wd[8];
+        uint32_t x = 0x12345679u;
+        for (int rep = 0; rep < 64; ++rep) {
+            for (uint32_t & w : wd) { x = x * 1664525u + 1013904223u; w = x ^ (x >> 15); }
+            for (int n = 0; n < 128; ++n) {
+                const int p = n / 2;
+                uint32_t win = 0;
+                for (int b = 4*p + 4 - 20; b < 4*p + 4; ++b) {
+                    const int bb = (b + 256) % 256;
+                    win = (win << 1) | ((wd[bb / 32] >> (31 - bb % 32)) & 1u);
+                }
+                const uint32_t e = ((win * (win + 1u)) >> 10) & 1023u;
+                require(aik_level_n(wd, 2, 0, n) == ait2p_tab[2*e + n % 2], "independent AIT2P_U pair level");
+            }
+        }
+    }
     for (int type : {-1, (int) GGML_TYPE_F16}) {
         auto * meta = fixture(type);
         require(llama_ait_format_error(meta) == nullptr, "non-AIT model unaffected");

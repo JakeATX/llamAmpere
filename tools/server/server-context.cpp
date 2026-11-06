@@ -88,6 +88,20 @@ static bool server_mb_ctrl_exact() {
     return on;
 }
 
+// Top-K candidate download for CPU p/q verification (works with mb-MTP): the card sends the K best logits of each
+// verification row instead of the whole 248K-wide row. LLAMA_MTP_TOPK_VERIFY=0 turns it off.
+static bool server_mtp_topk_verify_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_MTP_TOPK_VERIFY");
+        const bool enabled = e != nullptr && std::atoi(e) != 0;
+        if (enabled) {
+            setenv("GGML_CUDA_TOPK_SELECT", "1", 0); // radix select for the wide rows; the default is a full-row sort
+        }
+        return enabled;
+    }();
+    return on;
+}
+
 static bool server_mtp_gpu_verify_sampled_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
     return gpu_verify != nullptr && std::strcmp(gpu_verify, "1") == 0;
@@ -2073,13 +2087,48 @@ private:
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params_base.mmproj.path.empty();
-        const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() ||
                               std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params_base.speculative.types.end();
+        if (params_base.speculative.has_dft()) {
+            // a draft file (-md) is only used by the draft-model speculative types; with none of them
+            // (e.g. --spec-type none, or n-gram types only) it would be loaded and never used. An MTP head file
+            // also cannot run as a standalone draft model: it borrows the target's embeddings and output head,
+            // so building its graph without them crashed at startup. Skip the unused file; refuse an MTP head
+            // under a type that would run it standalone.
+            bool uses_draft_model = false;
+            for (const auto type : params_base.speculative.types) {
+                switch (type) {
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                        uses_draft_model = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            const std::string & dft_path = params_base.speculative.draft.mparams.path;
+            if (!uses_draft_model) {
+                SRV_WRN("draft model '%s' is not loaded: the speculative type (--spec-type) uses no draft model\n",
+                        dft_path.c_str());
+                params_base.speculative.draft.mparams = {};
+            } else if (!spec_mtp && !dft_path.empty()) {
+                const auto types_gguf = common_speculative_types_from_gguf(dft_path);
+                if (std::find(types_gguf.begin(), types_gguf.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types_gguf.end()) {
+                    SRV_ERR("draft model '%s' is an MTP head; it runs only with --spec-type draft-mtp or "
+                            "draft-mtp-adaptive\n", dft_path.c_str());
+                    return false;
+                }
+            }
+        }
+        const bool has_draft = params_base.speculative.has_dft();
         const bool has_spec = has_draft || spec_mtp;
         const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
 
@@ -3275,6 +3324,11 @@ private:
                     SLT_INF(slot, "%s", "GPU verification ineligible for sampler settings; using CPU verification\n");
                 }
             }
+            bool speculative_topk = false;
+            if (slot.can_speculate() && !speculative_sampler && server_mtp_topk_verify_enabled()) {
+                speculative_sampler = common_sampler_get_topk_backend(slot.smpl.get(), model_tgt);
+                speculative_topk = speculative_sampler != nullptr;
+            }
             use_backend_sampling &= !slot.can_speculate();
             use_backend_sampling |= speculative_sampler != nullptr;
 
@@ -3285,7 +3339,9 @@ private:
             if (use_backend_sampling) {
                 bool enabled = llama_set_sampler(ctx_tgt, slot.id,
                         speculative_sampler ? speculative_sampler : common_sampler_get(slot.smpl.get()));
-                const bool rows_ready = !speculative_sampler ? true : (speculative_sampled
+                const bool rows_ready = !speculative_sampler ? true : (speculative_topk
+                        ? common_sampler_topk_backend_ready(slot.smpl.get())
+                        : speculative_sampled
                         ? common_sampler_backend_verify_ready(slot.smpl.get())
                         : common_sampler_greedy_backend_ready(slot.smpl.get()));
                 if (enabled && !rows_ready) {
@@ -3296,7 +3352,7 @@ private:
                     enabled = false;
                 }
                 if (speculative_sampler) {
-                    SLT_INF(slot, "GPU %s verification %s\n", speculative_sampled ? "sampled" : "greedy",
+                    SLT_INF(slot, "GPU %s verification %s\n", speculative_topk ? "top-K candidate" : speculative_sampled ? "sampled" : "greedy",
                             enabled ? "enabled" : "unavailable; using CPU verification");
                 }
             } else {
@@ -6393,9 +6449,14 @@ private:
                 SRV_ERR("ubatch handoff failed (done = %d, ret = %d)\n", handoff.done, ret);
                 throw std::runtime_error("MTP ubatch handoff failed");
             }
-            SRV_WRN("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
+            // the full catch-up (with the last ubatch deferred by design under PP overlap) is routine: debug level
+            if (handoff.done + handoff.deferred_count < batch.view.size()) {
+                SRV_WRN("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
+            } else {
+                SRV_DBG("ubatch handoff: helper caught up %d of %d rows during the decode\n", handoff.done, batch.view.size());
+            }
             if (handoff.deferred_count) {
-                SRV_WRN("[PP] deferred final device handoff: first %d, rows %d\n", handoff.done, handoff.deferred_count);
+                SRV_DBG("[PP] deferred final device handoff: first %d, rows %d\n", handoff.done, handoff.deferred_count);
             }
         }
 
@@ -6568,7 +6629,7 @@ private:
         }
 
         if (t_deferred_start) {
-            SRV_WRN("[PP] final device catch-up: %d rows, %.3f ms\n", handoff.deferred_count,
+            SRV_DBG("[PP] final device catch-up: %d rows, %.3f ms\n", handoff.deferred_count,
                     (ggml_time_us() - t_deferred_start) / 1000.0);
         }
         // fork: finish draft catch-up before returning scratch to the response cache.

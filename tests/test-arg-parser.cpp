@@ -270,6 +270,7 @@ static void test(void) {
         common_params with_tail;
         assert(common_params_parse(args_budget.size(), list_str_to_char(args_budget).data(), with_tail, LLAMA_EXAMPLE_SERVER));
         assert(common_context_params_to_llama(with_tail).moe_skip_tail == 8);
+        assert(common_context_params_to_llama(with_tail).moe_skip_mass);
         assert(std::string(getenv("GGML_MOE_SKIP_THRESHOLD")) == "0.15");
         for (const char * value : {"0", "1", "5", "10"}) {
             args_budget = {"binary_name", "--moe-skip-budget", "0.15", "--moe-skip-rank-floor", value};
