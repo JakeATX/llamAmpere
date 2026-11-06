@@ -615,9 +615,9 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // fork: small-card prompt ubatch. An MoE model asked for -ub > 6144 on a card with less than
     // LLAMA_UB_SMALL_CARD_FREE_MIB (default 14336) free here (after the weights, before KV and the expert cache;
     // a 12 GB card is ~8 GB here, a 24 GB card ~20 GB) runs -ub 6144: the 12 GB measured pick (one layer-major pass
-    // of 17 ubatches with LLAMA_LEAN_PROMPT; 8192 needs a second carry slot and two 128-route tiles per expert,
+    // of 17 ubatches; 8192 needs a second carry slot and two 128-route tiles per expert,
     // 0.77x prompt). LLAMA_UB_SMALL_CARD_CAP=0 keeps the asked size.
-    // fork: LLAMA_LEAN_PROMPT (packed QSA rows mask + direct lists + in-place expert weighting on prompt batches) is
+    // fork: LLAMA_LEAN_PROMPT (in-place expert weighting on prompt batches) is
     // the 12 GB pick only: on a 24 GB card it cost prompt 0.980x and writing 0.984x. Unset = on for an MoE model on a
     // small card (same test as the ubatch cap below), off otherwise; the first context decides; an explicit value wins.
     // A no_alloc context (the memory-fit trial pass, logs muted, weights not loaded yet) must not decide: it would
@@ -649,9 +649,12 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // The plan is for AI+ expert files only: with a 3XS file, B1 at -ub 6144 gave different greedy text fresh vs restored
     // (scid3, cause not named), so 3XS keeps its -ub 6144 cap and chunks unless the caller sets these variables.
     const bool small_plan_file = [&] {
-        for (const auto & entry : model.tensors_by_name) {
-            if (ggml_ai4_rate(entry.second->type) != 0 || ggml_ait_rate(entry.second->type) != 0) {
-                return true;
+        for (const auto & layer : model.layers) {
+            for (const auto * weight : {layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps,
+                                       layer.ffn_gate_up_exps}) {
+                if (weight && (ggml_ai4_rate(weight->type) != 0 || ggml_ait_rate(weight->type) != 0)) {
+                    return true;
+                }
             }
         }
         return false;
