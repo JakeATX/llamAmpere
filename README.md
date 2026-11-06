@@ -7,8 +7,7 @@ writes faster) and Qwen3.8 Flash-Next.
 
 ## What's new in v0.6.3
 
-- **New Flash-Next model file, [@@NAME@@](https://huggingface.co/jakeatx/@@NAME@@):** every expert in AI+, baked into the file (@@GB_TOTAL@@ GB). @@README_RESULT@@
-- **AI+ for Flash-Next:** load an AI+ copy of every expert (`LLAMA_MODEL_OVERLAY_PATCH=FILE`). The card holds about 12-13% more experts, so writing is faster: +8.4% on coding (RTX 3090 Ti) and +11.7% on agentic (RTX 3090), +18-26% on a 12 GB card; prompt reading +8-12%. Lower drift from the reference model (KLD 12% lower). [v0.6.3 release notes](docs/llamampere-v0.6.3/RELEASE_NOTES.md).
+- **New Flash-Next model file, [qwen3.8-flash-next-Swift1.5-ATX-AI3](https://huggingface.co/jakeatx/qwen3.8-flash-next-Swift1.5-ATX-AI3):** 80.11 GB (74.61 GiB), compared with 75.97 GB for IQ3_XXS. On an RTX 3090 with ample system RAM, this file wrote 121–125 tokens/s across coding, agentic and RAG tasks. These are observations on the new file, not a same-engine comparison with the standard file. [Measured results and limits](docs/llamampere-v0.6.3/RELEASE_NOTES.md).
 - The expert kernels our speed tests use are now on by default; whole-file page read-ahead when the model fits in RAM.
 
 ## What's new in v0.6.1
@@ -27,9 +26,8 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ## Quick start
 
-**Build and run (v0.6.3, Qwen3.8 Flash-Next, Linux).** For one 24 GB RTX 30-series card, or a 12 GB one with 64 GB of RAM; the same paste
-works on both, and the launcher plans for the card it finds. @@FIT_LINE@@ Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
-compiler, the `hf` download tool (`pip install -U huggingface_hub`) and about @@GB_DISK@@ GB of disk. It always leaves 5 GiB of RAM free. This
+**Build and run (v0.6.3, Qwen3.8 Flash-Next, Linux).** For one 24 GB RTX 30-series card, or a supported 12 GB card, with 64 GB of system RAM. Cards under 24 GB use 32K-token prompt passes; see the hardware support notes and the explanation of exact output after reloading a conversation. The launcher keeps the tested `--fit off` setting; its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
+compiler, the `hf` download tool (`pip install -U huggingface_hub`) and 81.63 GB for the model and drafter, plus space for the build, prompt scratch and saved prompts. The launcher uses a 5 GiB free-RAM floor. This
 one paste clones or updates llamAmpere at v0.6.3, builds `llama-server`, downloads the model and its drafter and starts the server:
 
 ```bash
@@ -40,11 +38,11 @@ else
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
-hf download jakeatx/@@NAME@@ --include '*.gguf' --local-dir models/flash-next && \
+hf download jakeatx/qwen3.8-flash-next-Swift1.5-ATX-AI3 --include '*.gguf' --local-dir models/flash-next && \
 hf download jakeatx/Swift-1.5-Qwen3.8-Flash-Next-MTP-Drafter-GGUF mtp-Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2S-B.gguf --local-dir models/flash-next && \
 LLAMA_SERVER_BIN=build-sm86/bin/llama-server \
 FLASH_NEXT_DRAFTER=models/flash-next/mtp-Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2S-B.gguf \
-scripts/flash-next-server.sh -m models/flash-next/@@NAME@@-00001-of-00002.gguf
+scripts/flash-next-server.sh -m models/flash-next/qwen3.8-flash-next-Swift1.5-ATX-AI3-00001-of-00002.gguf
 ```
 
 To start it again later, run the last three lines from the `llamAmpere` folder. The server listens on http://127.0.0.1:8080 (OpenAI-compatible API).

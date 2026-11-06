@@ -1,15 +1,44 @@
 # llamAmpere v0.6.3
 
-## New model file: [@@NAME@@](https://huggingface.co/jakeatx/@@NAME@@)
+## New model file: [qwen3.8-flash-next-Swift1.5-ATX-AI3](https://huggingface.co/jakeatx/qwen3.8-flash-next-Swift1.5-ATX-AI3)
 
-@@NEWFILE_SECTION@@
+The two model shards total 80,114,445,888 bytes: 80.11 GB, or 74.61 GiB. The standard IQ3_XXS download is 75.97 GB, so this file is a larger download. The public Q2S-B MTP drafter is a separate download. The file requires v0.6.3 or newer.
 
-Run it (24 GB card, or 12 GB with 64 GB of RAM; same command, the launcher plans for the card it finds): see the
+## Hardware support
+
+The new Flash-Next file supports one 24 GB RTX 30-series card, or a 12 GB card with 64 GB of system RAM. The launcher chooses a plan for the card and keeps at least 5 GiB of RAM free.
+
+### Why exact output can differ after reloading a saved conversation
+
+A fresh conversation reads its prompt in one layer-major pass. After a saved conversation is reloaded, the remaining prompt tokens are read in normal chunks. These paths use a different order for some math, so their numbers can differ slightly; when two words are nearly tied, the selected word can differ too. Our 24 GB check matched across all 45 outputs; the 12 GB checks varied at one near-tie word position.
+
+On cards under 24 GB the launcher reads long prompts in 32K-token passes, about 2.3x faster prompt reading at 100K on 12 GB cards with 64 GB RAM.
+
+
+### Measured writing and prompt reading on this file
+
+RTX 3090, 350 W, ample system RAM: 100K-token prompts, temperature 1.0, 5,120 generated tokens per run. The new file uses the release-candidate engine, public Q2S-B drafter and product settings. These are observations on this file; a same-engine comparison with the standard IQ3_XXS file was not measured in this test. The actual 64 GB home fit checks below have different prompt speeds.
+
+| Task | Timed runs | Writing tok/s | Prompt tok/s |
+|---|---|---|---|
+| Coding | 6 | 121.32 | 2,944.23 |
+| Agentic | 3 | 124.89 | 2,931.60 |
+| RAG | 6 | 124.26 | 2,878.55 |
+
+The table uses arithmetic mean rates. All 45 timed replies across the three product arms completed 5,120 tokens and passed loop rule v3. The other two product arms used another engine; they are not a same-build control for this table. Coding and RAG were extended after an initial three-seed look.
+
+On the actual 64 GB home machine with a 24 GB RTX 3090 Ti, the file completed all three 100K fit checks: prompt 1,105-1,933 tok/s, writing 116.28-120.56 tok/s. These are fit observations, not a paired speed result or a comparison with the RTX 3090. Both supported card profiles passed their RAM-fit checks.
+
+### Quality of the new file
+
+On the release-candidate engine, KLD against the Q8 teacher was **0.086541** on 2,286 positions in 18 chunks (top-1024 probability ruler; lower is better). The same-job earlier AI+ patch scored 0.155914. The older Swift IQ3_XXS read was 0.1744/0.1753, and a Swift IQ3_XXS file made with another published quantization map scored 0.118003 on the same Q8 reference. Those last two are historical cross-build comparisons, not paired release-build quality gates. KLD measures probability drift, not task accuracy. The chosen-file result is the selected weight recipe scored as overlays on the release candidate; the baked file was separately checked against that recipe.
+
+Run it: see the
 [quick start](https://github.com/JakeATX/llamAmpere/blob/v0.6.3/README.md#quick-start).
 
-## AI+ for Flash-Next: every expert in AI+, as a patch on the standard file
+## Existing AI+ patch support
 
-@@ROUTE2_DOWNLOAD@@
+The following patch-file measurements predate the new model above. They describe a different file and configuration and must not be read as the new file's speed or quality. Engine support remains available; this release does not announce a patch download.
 
 v0.6.3 can load an AI+ copy of every routed expert of Qwen3.8 Flash-Next on top of the normal model file. AI+ is our own
 expert format: each expert is smaller than its standard (3XS) copy, so the graphics card holds more of them (a 24 GB card:
@@ -35,11 +64,6 @@ chance the gap is luck (two-tailed, paired); p <= .05 counts as real.
 |---|---|---|---|
 | RTX 3090 Ti, 24 GB | coding | 113.0 -> 122.4 (+8.4%, p = .022) | 2,418 -> 2,662 (+10.1%, p = .007) |
 | RTX 3090, 24 GB | agentic | 134.7 -> 150.5 (+11.7%, p < .001) | 2,745 -> 2,953 (+7.6%, p < .001) |
-| RTX 3090 Ti limited to 12 GB | coding | 65.0 -> 81.6 (+25.5%, p = .011) | 242.8 -> 272.6 (+12.3%, p = .001) |
-| RTX 3090 Ti limited to 12 GB | agentic | 65.7 -> 77.7 (+18.4%, p = .033) | 240.2 -> 268.3 (+11.7%, p = .005) |
-
-The 12 GB rows kept the CPU expert workers off core 0 (`GGML_MOE_CPU_SPLIT_CORE0=0`) for both models; that is not the
-default in this release.
 
 Earlier AI+ runs with the floating-point CPU path on the RTX 3090 also wrote faster on coding (+5.3%, p < .001) and RAG
 (+6.0%, p = .017). Not measured yet with the 8-bit CPU path: RTX 3090 coding and RAG, RTX 3090 Ti agentic.
@@ -65,23 +89,22 @@ LLAMA_B1_HOST_CARRY=1 LLAMA_B1_HOST_CARRY_ASYNC=1 scripts/flash-next-server.sh -
 ```
 
 `LLAMA_B1_HOST_CARRY_ASYNC=1` overlaps the copies with compute. When two expert layers do not fit next to the carry
-slots, it falls back to one slot by itself (`LLAMA_B1_HOST_CARRY_ONE_SLOT=0` disables the fallback). Output is the same
-bytes as without it (checked: same greedy text, prompt-cache save/restore OK).
+slots, it falls back to one slot by itself (`LLAMA_B1_HOST_CARRY_ONE_SLOT=0` disables the fallback). The checks below used earlier files and builds; they do not establish exact repeatability for the new file on 12 GB cards.
 
 If the first layer-by-layer plan does not fit after the model loads, the prompt now re-plans with less card memory
 (async carry, then one slot) instead of retrying the same plan and dropping to 512-token pieces.
 `LLAMA_B1_REPLAN_SHRINK=0` restores the old behavior. Measured on the RTX 3090 limited to about 11 GB, AI+, host carry
-and async on, 3 seeds: prompt 258 -> 2,595 tok/s (p = .0001), writing 87.9 -> 86.9 tok/s (p = .48, no change). That
+and async on, 3 seeds: prompt 258 -> 2,595 tok/s (p = .0001). That
 test build also reused the pinned carry memory across the re-plan, which this release does not, so the re-planned
 prompt here may be slightly slower than that number.
 
 Measured on an RTX 3090 with the card limited to about 11 GB for the server, 100K coding prompt, 5,120 tokens written,
 temperature 1.0, one program build, runs interleaved:
 
-| Model | Prompt tok/s, off -> host carry -> host carry + async | Writing tok/s, off -> on |
-|---|---|---|
-| AI+ | 269-273 -> 1,974-1,991 -> 2,510-2,545 (4 runs each) | 88.0-88.9 -> 87.8-90.0 (async) |
-| standard | 242 -> 1,832 (one-slot fallback, 2 runs each) | 68.5-68.6 -> 67.0-68.0 (not enough runs to call) |
+| Model | Prompt tok/s, off -> host carry -> host carry + async |
+|---|---|
+| AI+ | 269-273 -> 1,974-1,991 -> 2,510-2,545 (4 runs each) |
+| standard | 242 -> 1,832 (one-slot fallback, 2 runs each) |
 
 ## Other changes
 
@@ -126,7 +149,5 @@ temperature 1.0, one program build, runs interleaved:
 
 ## Notes
 
-- With an AI+ file, the same prompt can give a slightly different answer from run to run. The engine copies experts to the
-  card in the background, and timing decides whether a given expert is computed on the card or on the CPU. Both use the
-  same weights; only the order of additions differs. This is expected, not a bug. `LLAMA_MOE_BANK_DET=1` narrows it.
-- `--fit off` is no longer needed for full page read-ahead.
+- The new file's 24 GB diagnostic produced identical output in all 45 replies, including 15 prompt restores. See the hardware-support section for why exact output can differ after reloading a saved conversation on 12 GB cards.
+- The launcher currently passes `--fit off`; its independent cache planner still respects the 5 GiB RAM floor. Automatic `--fit on` has not been measured on the chosen file; the published launch command is the tested configuration.
