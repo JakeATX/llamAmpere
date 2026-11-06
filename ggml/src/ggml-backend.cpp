@@ -1150,23 +1150,32 @@ bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_te
 
 // Backend (reg)
 
+// A null reg is legal: the dynamic meta device used by --split-mode tensor has no backend registry.
 const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
-    GGML_ASSERT(reg);
+    if (!reg) {
+        return "";
+    }
     return reg->iface.get_name(reg);
 }
 
 size_t ggml_backend_reg_dev_count(ggml_backend_reg_t reg) {
-    GGML_ASSERT(reg);
+    if (!reg) {
+        return 0;
+    }
     return reg->iface.get_device_count(reg);
 }
 
 ggml_backend_dev_t ggml_backend_reg_dev_get(ggml_backend_reg_t reg, size_t index) {
-    GGML_ASSERT(reg);
+    if (!reg) {
+        return NULL;
+    }
     return reg->iface.get_device(reg, index);
 }
 
 void * ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    GGML_ASSERT(reg);
+    if (!reg) {
+        return NULL;
+    }
     if (!reg->iface.get_proc_address) {
         return NULL;
     }
