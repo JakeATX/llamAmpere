@@ -1,6 +1,15 @@
 # llamAmpere v0.6.3
 
-## AI+ for Flash-Next: every expert in AI+
+## New model file: [@@NAME@@](https://huggingface.co/jakeatx/@@NAME@@)
+
+@@NEWFILE_SECTION@@
+
+Run it (24 GB card, or 12 GB with 64 GB of RAM; same command, the launcher plans for the card it finds): see the
+[quick start](https://github.com/JakeATX/llamAmpere/blob/v0.6.3/README.md#quick-start).
+
+## AI+ for Flash-Next: every expert in AI+, as a patch on the standard file
+
+@@ROUTE2_DOWNLOAD@@
 
 v0.6.3 can load an AI+ copy of every routed expert of Qwen3.8 Flash-Next on top of the normal model file. AI+ is our own
 expert format: each expert is smaller than its standard (3XS) copy, so the graphics card holds more of them (a 24 GB card:
@@ -10,7 +19,7 @@ reference model than the standard file (lower KLD, see below).
 Turn it on with one setting (the standard model file stays the same):
 
 ```bash
-LLAMA_MODEL_OVERLAY_PATCH=/path/to/AIPLUS_PATCH_FILE.gguf scripts/flash-next-server.sh -m MODEL
+LLAMA_MODEL_OVERLAY_PATCH=/path/to/patch.gguf scripts/flash-next-server.sh -m MODEL
 ```
 
 Experts that still run on the CPU use 8-bit integer math by default on all CPUs (`GGML_MOE_AI_HOST_Q8=0` selects the
@@ -40,12 +49,16 @@ Earlier AI+ runs with the floating-point CPU path on the RTX 3090 also wrote fas
 KLD (how far the word probabilities drift from an 8-bit reference; lower is better), 2,286 positions, RTX 3090:
 standard 0.1744 / 0.1753 (two runs), AI+ 0.1537 (12% lower, p = .0007).
 
-### 12 GB cards: fast 100K prompt with host carry (opt-in)
+### 12 GB cards: fast 100K prompt with host carry, on by itself for AI+ files
 
 On a 12 GB card the prompt used to fall back to small 512-token pieces, because the in-between results of the
 layer-by-layer prompt pass did not fit on the card. Host carry keeps those results in pinned system memory (about
 3.9 GiB for a 100K prompt) and copies them to the card one layer at a time, so the fast one-pass prompt works again.
-It is off by default in this release; turn it on with:
+
+With an AI+ expert file, baked in or loaded as a patch, this now turns on by itself when the card has under 14 GB free.
+`LLAMA_SMALL_CARD_AUTO=0` turns the automatic plan off. Host carry still leaves 5 GiB of RAM free or stays off. With the
+standard model it stays opt-in, because at this prompt size a fresh run and a restored run gave different greedy text in
+our check and we have not found out why:
 
 ```bash
 LLAMA_B1_HOST_CARRY=1 LLAMA_B1_HOST_CARRY_ASYNC=1 scripts/flash-next-server.sh -m MODEL ...
@@ -72,6 +85,14 @@ temperature 1.0, one program build, runs interleaved:
 
 ## Other changes
 
+- **New AI+ expert formats are ready for the card cache.** Experts in the U2 formats (`ait2_u2`, `ait3_u2`) are read in place
+  and can be cached on the card like the older formats.
+- **Baked AI+ files get the full expert budget.** The launcher now plans for up to 24,576 ranked experts with every file; the
+  card budget still decides how many fit, so the standard model is not changed.
+- **About 4% faster 100K prompt reading on small cards with an AI+ file.** A 64-route work tile is now used when a prompt batch
+  routes few rows per expert (`GGML_CUDA_AI23_ID_BN64_MAXR=0` turns it off). RTX 3090 limited to 10 GB: prompt +4.3% on runs
+  without the slow page-fault class (p = .0004), writing unchanged. Counting all 32 runs the gap is not significant, because
+  that slow class hit 10 of the 32 runs, 5 per arm (0.94x, p = .38). Output unchanged at 10 and 12 GB on our check prompt.
 - **Faster 100K prompt with the launcher.** The v0.6.2 launcher forced a slow page-fault prefetch for the per-layer
   embedding table, so the prompt waited about 15 s on disk reads. The launcher now leaves this to the engine, which reads
   the table ahead with 4 threads (on by default, skipped when under 8 GiB of RAM is free). RTX 3090 Ti, AI+, 100K coding
