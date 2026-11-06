@@ -1315,6 +1315,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_QWEN3TTS:
         case LLM_ARCH_K2_HORIZON:
+        case LLM_ARCH_QWEN4EXP: // tensor split was never run on this arch (MoE arena/cache are single-device); refuse cleanly
             return false;
         default:
             return true;
