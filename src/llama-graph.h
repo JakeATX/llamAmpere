@@ -1293,9 +1293,6 @@ struct llm_graph_context {
         const std::vector<uint32_t> * n_kv_streams = nullptr; // multi-stream: per-stream n_kv (see llm_graph_input_attn_kv)
         ggml_tensor * wush_ao = nullptr; // EXPERIMENTAL WUSH-KV: output transform replacing the inverse Hadamard
     } sj_kvarn_pending;
-    // QSA prompt (LLAMA_QSA_DIRECT_LISTS): final selected-cell rows [n_sel, n_tokens] for the next flash attention node's
-    // src[8], so the CUDA sparse path builds its per-tile cell lists from them instead of scanning the n_kv-wide mask
-    mutable ggml_tensor * fa_sel_rows = nullptr;
     // multi-stream SJ-KVaRN: per-stream mask views cut to the stream's own n_kv are not contiguous when the ubatch
     // has more than one token row, and FA needs a contiguous mask; the contiguous copies are made once per graph
     // (the mask is shared by every layer)

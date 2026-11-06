@@ -425,9 +425,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
                 out.buffer = nullptr;
                 out.view_src = nullptr;
                 out.view_offs = 0;
-                ggml_cuda_flash_attn_ext_set_rows_window(q0, c0); // src[8] rows hold node cells for all queries
                 ggml_cuda_sj_kvarn_prefill_partial(ctx, &out, parts, meta);
-                ggml_cuda_flash_attn_ext_set_rows_window(0, 0);
                 const size_t row0 = size_t(q0)*n_head;
                 ggml_cuda_sj_kvarn_prefill_accumulate(parts, meta, acc + row0*256, acc_meta + row0,
                     int(qn*n_head), c0 == 0, ctx.stream());
