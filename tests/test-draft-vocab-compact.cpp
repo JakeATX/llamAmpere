@@ -172,8 +172,11 @@ static head_case make_ai(ggml_type type, int64_t K, int64_t N, int64_t n_sel, ui
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> ud(0.002f, 0.02f);
     h.data.resize(ggml_row_size(type, K) * N);
-    const size_t unit = 32 + 256 * (size_t) ggml_ai4_rate(type);   // [fp16 d[16]][16 rows x 128 K of k-bit trellis]
-    GGML_ASSERT(h.data.size() % unit == 0 && ggml_ai4_slab_nbytes(type, K) == unit * (size_t) (K / 128));
+    const bool v2 = ggml_ai4v2_rate(type) != 0;
+    const int64_t block_k = v2 ? 640 : 128;
+    const size_t unit = 32 + 2 * (size_t) block_k * ggml_ai4_rate(type);
+    GGML_ASSERT(K % block_k == 0 && h.data.size() % unit == 0 &&
+            ggml_ai4_slab_nbytes(type, K) == unit * (size_t) (K / block_k));
     for (size_t b = 0; b < h.data.size(); b += unit) {
         ggml_fp16_t * d = (ggml_fp16_t *) (h.data.data() + b);
         for (int r = 0; r < 16; ++r) d[r] = ggml_fp32_to_fp16(ud(rng));
@@ -272,6 +275,7 @@ static void run_logits(ggml_backend_t be, const head_case & h,
         ggml_context * cw = ggml_init(pw);
         ggml_tensor * w   = ggml_new_tensor_2d(cw, h.type, K, N);
         ggml_tensor * x   = ggml_new_tensor_2d(cw, GGML_TYPE_F32, K, T);
+        ggml_tensor * ids = ggml_new_tensor_1d(cw, GGML_TYPE_I32, n_sel);
         ggml_tensor * suh = exl3 ? ggml_new_tensor_1d(cw, GGML_TYPE_F32, K) : nullptr;
         ggml_tensor * svh = exl3 ? ggml_new_tensor_1d(cw, GGML_TYPE_F32, N) : nullptr;
         ggml_tensor * had = exl3 ? ggml_new_tensor_2d(cw, GGML_TYPE_F32, 128, 128) : nullptr;
@@ -285,6 +289,7 @@ static void run_logits(ggml_backend_t be, const head_case & h,
         std::vector<float> xv((size_t) K * T);
         for (float & f : xv) f = nd(rng);
         ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(ids, h.ids.data(), 0, ggml_nbytes(ids));
         if (exl3) {
             ggml_backend_tensor_set(suh, h.suh.data(), 0, ggml_nbytes(suh));
             ggml_backend_tensor_set(svh, h.svh.data(), 0, ggml_nbytes(svh));
@@ -311,6 +316,9 @@ static void run_logits(ggml_backend_t be, const head_case & h,
         ggml_set_output(y_full);
         ggml_cgraph * gf = ggml_new_graph(cg);
         ggml_build_forward_expand(gf, y_full);
+        ggml_tensor * y_gather = llama_draft_vocab_gather_logits(cg, y_full, ids);
+        ggml_set_output(y_gather);
+        ggml_build_forward_expand(gf, y_gather);
         std::vector<ggml_tensor *> yc;
         for (ggml_tensor * c : ct) {
             yc.push_back(ggml_mul_mat(cg, c, xr));
@@ -358,6 +366,12 @@ static void run_logits(ggml_backend_t be, const head_case & h,
             check(ok, "U2 full-head logits vs host reference");
         }
         std::vector<float> yv((size_t) n_sel * T);
+        ggml_backend_tensor_get(y_gather, yv.data(), 0, ggml_nbytes(y_gather));
+        const bool gather_ok = yv.size() == ysel.size() &&
+            memcmp(yv.data(), ysel.data(), ysel.size()*sizeof(float)) == 0;
+        printf("  (gather) %-6s %-10s T=%lld full-head selected logits byte-equal: %s\n",
+                bname, h.name.c_str(), (long long) T, gather_ok ? "ok" : "FAIL");
+        check(gather_ok, "full-head shortlist gather identity");
         for (size_t i = 0; i < compact.size(); ++i) {
             ggml_backend_tensor_get(yc[i], yv.data(), 0, ggml_nbytes(yc[i]));
             const err e = compare(yv.data(), yc_ref.data(), yv.size());
@@ -450,8 +464,9 @@ int main() {
     run_head(make_exl3(3, 1024, 2048, 333, 8102), backends);
     run_head(make_plain(GGML_TYPE_Q6_K, 1024, 2048, 333, 8103), backends);
     // (e) K = 2048 (16 units), N = 2048 (128 slabs)
-    run_head(make_ai(GGML_TYPE_AIT5_U, 2048, 2048, 333, 8104), backends);
-    run_head(make_ai(GGML_TYPE_AIT4_U, 2048, 2048, 333, 8105), backends);
+    run_head(make_ai(GGML_TYPE_AIT2_U2, 5120, 2048, 333, 8104), backends);
+    run_head(make_ai(GGML_TYPE_AIT3_U2, 5120, 2048, 333, 8105), backends);
+    run_head(make_ai(GGML_TYPE_AIT4_U2, 5120, 2048, 333, 8106), backends);
 
     for (ggml_backend_t be : backends) ggml_backend_free(be);
     printf("%s: %d failing checks\n", g_fail == 0 ? "PASS" : "FAIL", g_fail);

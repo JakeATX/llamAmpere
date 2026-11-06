@@ -5,6 +5,7 @@
 #include "llama-sampler.h"
 #include "llama-ext.h"
 #include "llama-mtp-chain-sample.h"
+#include "llama-draft-vocab-compact.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -9301,6 +9302,7 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     }
     // [#81] a compact head built from this head replaces the hadamard_head / head_layout outcomes
     const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    const bool full_head = !compact && llama_draft_vocab_full_head(head_w);
     if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
@@ -9313,7 +9315,7 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
     }
-    if (!compact) {
+    if (!compact && !full_head) {
         if (const char * why = draft_vocab_direct(head_w)) {
             return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
         }
@@ -9330,6 +9332,14 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         }
     }
     GGML_ASSERT(cur->ne[1] == n_outputs);
+
+    if (full_head) {
+        ggml_tensor * logits = llama_draft_vocab_gather_logits(
+                ctx0, build_lora_mm(head_w, cur, head_s), draft_vocab_ids);
+        cb(logits, "draft_vocab_logits", -1);
+        res->t_logits_ids = draft_vocab_ids;
+        return logits;
+    }
 
     if (compact) {
         ggml_tensor * logits = build_draft_vocab_compact(head_w, head_s, cur); // [n_sel, n_outputs]
@@ -9383,6 +9393,7 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
         return nullptr;
     }
     const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    const bool full_head = !compact && llama_draft_vocab_full_head(head_w);
     if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
@@ -9395,12 +9406,15 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
     if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
     }
-    if (!compact) {
+    if (!compact && !full_head) {
         if (const char * why = draft_vocab_direct(head_w)) {
             return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
         }
     }
     GGML_ASSERT(cur->ne[1] == 1);
+    if (full_head) {
+        return llama_draft_vocab_gather_logits(ctx0, build_lora_mm(head_w, cur, head_s), draft_vocab_ids);
+    }
     if (compact) {
         return build_draft_vocab_compact(head_w, head_s, cur);
     }

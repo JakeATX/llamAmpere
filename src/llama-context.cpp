@@ -1799,8 +1799,13 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
         const int force = env != nullptr && env[0] != '\0' ? atoi(env) : -1;
         const bool is_exl3 = ggml_exl3_bits(head->type) != 0;
         const bool is_ai   = ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0; // AI+ tiles too
+        const bool full_head = llama_draft_vocab_full_head(head);
         const bool want = !model.no_alloc() && !model.hadamard_rotations.count(head) &&
-                n_sel < head->ne[1] && (force == 1 || (force != 0 && (is_exl3 || is_ai)));
+                !full_head && n_sel < head->ne[1] && (force == 1 || (force != 0 && (is_exl3 || is_ai)));
+        if (full_head) {
+            LLAMA_LOG_WARN("%s: draft shortlist uses existing %s head (%s), no compact weight copy\n",
+                    __func__, ggml_get_name(head), ggml_type_name(head->type));
+        }
         if (want) {
             compact_type = is_ai ? GGML_TYPE_Q6_K : GGML_TYPE_IQ4_XS;
             if (const char * te = getenv("LLAMA_DRAFT_VOCAB_COMPACT_TYPE"); te != nullptr && te[0] != '\0') {
