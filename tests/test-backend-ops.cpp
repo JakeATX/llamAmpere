@@ -19865,8 +19865,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 1000, 3, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 1000, 77, 1, 1, GGML_TYPE_F16));
     // Flash-Next verify widths (2..7 tokens take the one-read-per-key kernel), 100K-context pool count, both masks
-    for (int nb : { 2, 4, 5, 7 }) {
+    for (int nb : { 1, 2, 3, 4, 5, 6, 7 }) {
         test_cases.emplace_back(new test_lightning_indexer(128, 4, 25088, nb, 1, 1, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, 12345, nb, 1, 1, GGML_TYPE_F16)); // odd key count, F16 keys
         test_cases.emplace_back(new test_lightning_indexer_rmask(128, 4, 25088, nb, 1, 1, GGML_TYPE_F32));
     }
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1001, 5, 2, 1, GGML_TYPE_F32));
@@ -20833,7 +20834,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, 8192, 1, 1, GGML_TYPE_F32));
     }
     // Flash-Next QSA verify at 100K context: 25088 pooled keys, widths 1/4/5
-    for (int nb : { 1, 4, 5 }) {
+    for (int nb : { 1, 2, 3, 4, 5, 7 }) {
         test_cases.emplace_back(new test_lightning_indexer(128, 4, 25088, nb, 1, 1, GGML_TYPE_F32));
     }
     for (int kv : { 256, 4096, 65536 }) {
