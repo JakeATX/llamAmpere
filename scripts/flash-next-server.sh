@@ -27,6 +27,11 @@ for arg in "$@"; do
     esac
 done
 [[ -n $slot_explicit ]] || slots=(--parallel 1)
+# Shared-expert stream joins can be crossed by fused multi-slot graphs.
+# Keep those experts on the main stream until the multi-slot join is safe.
+if [[ $slot_count != 1 ]]; then
+    export GGML_CUDA_SHEXP_SIDE=${GGML_CUDA_SHEXP_SIDE-0}
+fi
 # The caller's own shape arguments come later, so they win.
 shape=(-ngl 999 -fa on -b 131072 -ub 8192 --fit off --moe-arena on --moe-cache on --ctx-checkpoints 4)
 # The resident QSA window supports one stream; several slots use the existing per-sequence GPU cache instead.
