@@ -95,7 +95,13 @@ static bool server_mtp_topk_verify_enabled() {
         const char * e = std::getenv("LLAMA_MTP_TOPK_VERIFY");
         const bool enabled = e != nullptr && std::atoi(e) != 0;
         if (enabled) {
+#ifdef _WIN32
+            if (std::getenv("GGML_CUDA_TOPK_SELECT") == nullptr) {
+                common_set_env("GGML_CUDA_TOPK_SELECT", "1");
+            }
+#else
             setenv("GGML_CUDA_TOPK_SELECT", "1", 0); // radix select for the wide rows; the default is a full-row sort
+#endif
         }
         return enabled;
     }();
