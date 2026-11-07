@@ -100,7 +100,8 @@ int main() {
     }
     // Forced shares ignore the cost probe but keep the expert and route bounds.
     {
-        CHECK(moe_cs_target_parts(0.6f, 10) == 6 && moe_cs_target_parts(0.8f, 10) == 8,
+        CHECK(moe_cs_target_parts(0.6f, 10) == 6 && moe_cs_target_parts(0.8f, 10) == 8 &&
+              moe_cs_target_parts(0.6f, 25) == 15,
               "exact share multiples must not round up an extra part");
         CHECK(moe_cs_target_parts(0.6f, 24) == 15 && moe_cs_target_parts(-1.0f, 24) == -1,
               "fractional shares round up; unset keeps auto");

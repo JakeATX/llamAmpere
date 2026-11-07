@@ -10041,23 +10041,24 @@ static double moe_cs_probe_link(void * dst, size_t cap) {
     return best;
 }
 
+static void moe_cs_log_inactive(const char * reason) {
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("[moe-cpu-split] startup: CPU split off (%s); measured link=unavailable CPU probe=unavailable CPU share=0\n", reason);
+        logged = true;
+    }
+}
+
 // Mapped job memory, the host pool, the layer registrations and the startup probe (once per process; the layers
 // are registered again for every session). Needs the hit-first buffers (g_hf_scratch is the link probe's target).
 static void moe_cs_prepare(moe_cache_session & session) {
-    const auto log_inactive = [](const char * reason) {
-        static bool logged = false;
-        if (!logged) {
-            GGML_LOG_INFO("[moe-cpu-split] startup: CPU split off (%s); measured link=unavailable CPU probe=unavailable CPU share=0\n", reason);
-            logged = true;
-        }
-    };
     session.cs_registered.assign(session.mj_groups.size(), 0);
     session.cs_valid.assign(session.mj_groups.size(), 0);
     session.cs_layer = -1;
     session.cs_route_l.clear();
     session.cs_fixed_l.clear();
     if (!moe_cs_enabled() || session.devices.size() != 1) {
-        log_inactive(!moe_cs_enabled() ? "disabled" : "requires one device");
+        moe_cs_log_inactive(!moe_cs_enabled() ? "disabled" : "requires one device");
         return;
     }
     int64_t max_ff = 0, max_embd = 0;
@@ -10068,7 +10069,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
         }
     }
     if (!max_ff || !max_embd) {
-        log_inactive("no host layer registered");
+        moe_cs_log_inactive("no host layer registered");
         return;
     }
     static bool failed = false;
@@ -10096,12 +10097,12 @@ static void moe_cs_prepare(moe_cache_session & session) {
             failed = true;
             g_cs_job_h = nullptr;
             MOE_CACHE_LOG("[moe-cache] cpu split: setup failed, off\n");
-            log_inactive("host setup failed");
+            moe_cs_log_inactive("host setup failed");
             return;
         }
     }
     if (!g_cs_job_h) {
-        log_inactive("host workers unavailable");
+        moe_cs_log_inactive("host workers unavailable");
         return;
     }
     size_t layers = 0;
@@ -10212,7 +10213,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
                 g_cs_adapt ? "corrected from measured jobs (ADAPT)" : "fixed");
     }
     g_cs_on = layers > 0 && g_cs_ns_per_byte > 0.0f;
-    if (!g_cs_on) { log_inactive(layers ? "link disabled" : "no host layer registered"); }
+    if (!g_cs_on) { moe_cs_log_inactive(layers ? "link disabled" : "no host layer registered"); }
     if (g_cs_on && moe_cs_per_type_enabled()) {
         std::vector<std::array<int, 3>> key(session.cs_registered.size(), std::array<int, 3>{-1, -1, -1});
         for (size_t l = 0; l < key.size(); ++l) {
@@ -10264,6 +10265,9 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
     session.hf_order.clear();
     session.hf_seq.clear();
     const bool hitfirst = moe_missjoin_hitfirst_enabled();
+    if (!hitfirst) {
+        moe_cs_log_inactive(!moe_cs_enabled() ? "disabled" : "hit-first disabled");
+    }
     if (!moe_missjoin_overlap_enabled() && !hitfirst) {
         return;
     }
@@ -10339,6 +10343,7 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
         }
         ok = ok && stride <= g_hf_stride && experts <= g_hf_experts && slots <= g_hf_slots;
         if (!ok) {
+            moe_cs_log_inactive(session.mj_groups.empty() ? "no host layer registered" : "hit-first setup failed");
             (void) cudaGetLastError();
             session.mj_groups.clear();
             for (auto & entry : session.device_tables) { entry.second.mj_layer = -1; entry.second.mj_kind = -1; }

@@ -368,7 +368,7 @@ static void test(void) {
         const char * prev = getenv("LLAMA_MOE_CPU_SHARE");
         const bool had_prev = prev != nullptr;
         const std::string saved = prev ? prev : "";
-        auto parse_share = [](std::vector<std::string> args) {
+        auto parse_share = [&list_str_to_char](std::vector<std::string> args) {
             common_params p;
             return common_params_parse(args.size(), list_str_to_char(args).data(), p, LLAMA_EXAMPLE_SERVER);
         };
