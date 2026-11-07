@@ -2170,7 +2170,7 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
-    struct dio_bounce_deleter { void operator()(void * p) const { free(p); } };
+    struct dio_bounce_deleter { void operator()(void * p) const { llama_aligned_free(p); } };
     std::unique_ptr<void, dio_bounce_deleter> dio_bounce; // plain bounce for O_DIRECT reads (never pinned)
     size_t dio_bounce_align = 0;
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
@@ -2424,11 +2424,8 @@ bool llama_model_loader::load_all_data(
                     // registered, aligned bounce buffer of LLAMA_DIRECT_IO_BUFFER_SIZE, reused for every chunk, then memcpy
                     const bool direct_read = file->has_direct_io();
                     if (direct_read && (!dio_bounce || dio_bounce_align < alignment)) {
-                        void * raw = nullptr;
                         const size_t bounce_align = std::max<size_t>(alignment, 4096);
-#ifndef _WIN32
-                        if (posix_memalign(&raw, bounce_align, LLAMA_DIRECT_IO_BUFFER_SIZE) != 0) { raw = nullptr; }
-#endif
+                        void * raw = llama_aligned_alloc(bounce_align, LLAMA_DIRECT_IO_BUFFER_SIZE);
                         if (!raw) {
                             throw std::runtime_error("cannot allocate the direct-read bounce buffer");
                         }

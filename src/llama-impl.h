@@ -4,9 +4,14 @@
 
 #include <string>
 #include <atomic>
+#include <cstdlib>
 #include <thread>
 #include <type_traits>
 #include <vector>
+
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 
 #ifdef __GNUC__
 #    if defined(__MINGW32__) && !defined(__clang__)
@@ -36,6 +41,23 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 //
 // helpers
 //
+
+static inline void * llama_aligned_alloc(size_t alignment, size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, alignment);
+#else
+    void * ptr = nullptr;
+    return posix_memalign(&ptr, alignment, size) == 0 ? ptr : nullptr;
+#endif
+}
+
+static inline void llama_aligned_free(void * ptr) {
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
 
 template <typename T>
 struct no_init {
