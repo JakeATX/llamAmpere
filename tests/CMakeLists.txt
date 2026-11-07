@@ -628,6 +628,7 @@ if (UNIX AND NOT LLAMA_USE_SYSTEM_GGML)
     add_executable(test-dio-bounce test-dio-bounce.cpp)
     target_link_libraries(test-dio-bounce PRIVATE llama ggml-base)
     llama_test(test-dio-bounce LABEL "main;cpu")
+    llama_test(test-dio-bounce NAME test-aligned-alloc LABEL "main;cpu" ARGS --alloc-only)
     set_tests_properties(test-dio-bounce PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 

@@ -44,16 +44,15 @@ static bool b1_read_file(int fd, void * dst, size_t offs, size_t len, size_t ali
     const size_t read_size = b1_align_up(needed, alignment);
     // alignment > 1 means an O_DIRECT descriptor: its reads must never land in pinned or cudaHostRegister'ed pages
     // (UVM in HMM mode can panic the PC), so they go to a plain per-thread malloc bounce buffer and are copied out
-    struct bounce_t { void * p = nullptr; size_t n = 0; ~bounce_t() { free(p); } };
+    struct bounce_t { void * p = nullptr; size_t n = 0; ~bounce_t() { llama_aligned_free(p); } };
     thread_local bounce_t bounce;
     char * p = (char *) (scratch ? scratch : dst);
     if (alignment > 1) {
         if (bounce.n < read_size) {
-            free(bounce.p);
-            bounce.p = nullptr;
+            llama_aligned_free(bounce.p);
+            bounce.p = llama_aligned_alloc(alignment, read_size);
             bounce.n = 0;
-            if (posix_memalign(&bounce.p, alignment, read_size) != 0 || !bounce.p) {
-                bounce.p = nullptr;
+            if (!bounce.p) {
                 return false;
             }
             bounce.n = read_size;
@@ -435,12 +434,13 @@ bool llama_b1::carry_chunk_alloc(size_t bytes) {
     const size_t chunk = (size_t) std::clamp<int64_t>(b1_env_int("LLAMA_B1_CARRY_PIN_CHUNK_MB", 32), 2, 1024) << 20;
     auto c = std::make_unique<carry_chunk_pin>();
     c->size = (bytes + align - 1) / align * align;
-    if (posix_memalign(&c->ptr, align, c->size) != 0) {
+    c->ptr = llama_aligned_alloc(align, c->size);
+    if (!c->ptr) {
         return false;
     }
     c->buf = ggml_backend_cpu_buffer_from_ptr(c->ptr, c->size);
     if (!c->buf) {
-        free(c->ptr);
+        llama_aligned_free(c->ptr);
         return false;
     }
     c->unpin = unpin;
@@ -491,7 +491,7 @@ void llama_b1::carry_chunk_free(std::unique_ptr<carry_chunk_pin> & c) {
     if (c->buf) {
         ggml_backend_buffer_free(c->buf);
     }
-    free(c->ptr);
+    llama_aligned_free(c->ptr);
     c.reset();
 }
 

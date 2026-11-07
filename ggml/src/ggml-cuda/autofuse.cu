@@ -400,7 +400,7 @@ ggml_cuda_autofuse_plan * ggml_cuda_autofuse_prepare(ggml_backend_cuda_context &
 
 int ggml_cuda_autofuse_launch(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int i, ggml_cuda_autofuse_plan & plan) {
     const int length = plan.lengths[i];
-    if (!length) { return 0; }
+    if (!length || i + length > graph->n_nodes) { return 0; }
     program p = {};
     p.length = length;
     const ggml_tensor * out = graph->nodes[i + length - 1];

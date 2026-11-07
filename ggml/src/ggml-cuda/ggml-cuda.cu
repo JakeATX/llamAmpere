@@ -10677,7 +10677,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-// [VSHX] GGML_CUDA_SHEXP_SIDE=1 (default off): the shared expert of a MoE layer runs on a second stream while the
+// [VSHX] GGML_CUDA_SHEXP_SIDE (default on; =0 opts out): the shared expert of a MoE layer runs on a second stream while the
 // router, the routed experts and the hit-first miss copies run on the main one.
 //  - graph_optimize moves the shared expert's own nodes (the nodes only the "ffn_shexp-<il>" tensor depends on) up
 //    to just after their input, and keeps them allocated until their first outside reader, so nothing the main
@@ -11386,6 +11386,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             size_t shexp_next  = 0;
             int    shexp_state = 0;  // 0: main stream, 1: launching a chain on the side stream, 2: waiting to join
             const ggml_cuda_shexp_side_run * shexp_cur = nullptr;
+            ggml_cgraph fusion_graph = *cgraph;
 
             g_hc_pre_xn_pending.clear();
             ggml_cuda_autofuse_plan * autofuse = ggml_cuda_autofuse_enabled() && !ggml_cuda_fusion_disabled() && stream_ctx.concurrent_events.empty() ?
@@ -11457,6 +11458,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 prev_i = i;
 
+                // fork: a fused launch must stop before the next stream fork, chain end or join.
+                fusion_graph.n_nodes = cgraph->n_nodes;
+                if (shexp_state == 1) {
+                    fusion_graph.n_nodes = shexp_cur->end + 1;
+                } else if (shexp_state == 2) {
+                    fusion_graph.n_nodes = shexp_cur->join_at;
+                } else if (shexp_next < shexp_runs.size()) {
+                    fusion_graph.n_nodes = shexp_runs[shexp_next].begin;
+                }
+
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
                 }
@@ -11487,13 +11498,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 // [MOEGAP HCUPQ8] the hc mix that also writes its consumers' q8_1 activation
-                if (node->op == GGML_OP_DSV4_HC_UP && ggml_cuda_try_hc_up_q8(*cuda_ctx, cgraph, i)) {
+                if (node->op == GGML_OP_DSV4_HC_UP && ggml_cuda_try_hc_up_q8(*cuda_ctx, &fusion_graph, i)) {
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, &fusion_graph, i);
                 if (nodes_to_skip == 0 && autofuse) {
-                    nodes_to_skip = ggml_cuda_autofuse_launch(*cuda_ctx, cgraph, i, *autofuse);
+                    nodes_to_skip = ggml_cuda_autofuse_launch(*cuda_ctx, &fusion_graph, i, *autofuse);
                 }
 
                 if (nodes_to_skip != 0) {
