@@ -48,6 +48,10 @@ enum clip_flash_attn_type {
 
 struct clip_context_params {
     bool use_gpu;
+    // projector weights in pinned host memory (see mtmd_context_params)
+    bool host_weights;
+    // with host_weights: fail the load if pinning fails (set by the server through mtmd_init_from_file_impl)
+    bool host_weights_strict;
     ggml_backend_dev_t device;
     enum clip_flash_attn_type flash_attn_type;
     int image_min_tokens;

@@ -122,6 +122,9 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // keep projector weights in pinned host memory, compute stays on the device (default: false)
+    bool host_weights;
 };
 
 MTMD_API const char * mtmd_default_marker(void);

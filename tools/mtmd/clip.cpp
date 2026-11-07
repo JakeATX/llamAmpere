@@ -167,6 +167,10 @@ struct clip_ctx {
 
     bool debug_output_embeddings = false;
 
+    // keep projector weights in pinned host memory (--mmproj-host-weights)
+    bool host_weights = false;
+    bool host_weights_strict = false;
+
     // for measuring memory usage
     bool no_alloc = false;
     std::map<ggml_backend_dev_t, size_t> mem_usage;
@@ -181,6 +185,8 @@ struct clip_ctx {
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
+        host_weights = ctx_params.host_weights;
+        host_weights_strict = ctx_params.host_weights_strict;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -1163,6 +1169,20 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
     builder->n_batch = imgs.entries.size();
 
     return builder;
+}
+
+// CUDA_Host_W buffer type of the clip backend, nullptr when --mmproj-host-weights is off or the backend has none
+static ggml_backend_buffer_type_t clip_host_weights_buft(const clip_ctx & ctx_clip) {
+    if (!ctx_clip.host_weights || ctx_clip.backend == ctx_clip.backend_cpu) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    typedef ggml_backend_buffer_type_t (*host_weights_buft_fn)(void);
+    auto get_host_weights_buft = reg
+        ? (host_weights_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_weights_buffer_type")
+        : nullptr;
+    return get_host_weights_buft ? get_host_weights_buft() : nullptr;
 }
 
 //
@@ -2210,6 +2230,10 @@ struct clip_model_loader {
             throw std::runtime_error(string_format("%s: failed to init ggml context\n", __func__));
         }
 
+        // host weights count as host memory; the largest weight stays on the device as extra headroom (scheduler copies are in mem_compute; this is not a bound for cuBLAS F16 conversion of quantized weights)
+        ggml_backend_buffer_type_t host_weights_buft = clip_host_weights_buft(ctx_clip);
+        ggml_backend_dev_t weights_dev = ggml_backend_get_device(ctx_clip.backend);
+
         // helper function
         std::unordered_set<std::string> loaded_tensor_names;
         auto get_tensor = [&](const std::string & name, bool required = true) {
@@ -2228,7 +2252,12 @@ struct clip_model_loader {
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
                 // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                if (host_weights_buft) {
+                    ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend_cpu)] += ggml_nbytes(cur);
+                    ctx_clip.mem_usage[weights_dev] = std::max(ctx_clip.mem_usage[weights_dev], ggml_nbytes(cur));
+                } else {
+                    ctx_clip.mem_usage[weights_dev] += ggml_nbytes(cur);
+                }
             }
             return cur;
         };
@@ -3710,7 +3739,38 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            // weights in pinned host memory, compute stays on the GPU; uses CUDA_Host_W, not the shared host buft that holds model inputs
+            if (ctx_clip.host_weights && ctx_clip.backend != ctx_clip.backend_cpu) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(ctx_clip.backend);
+                ggml_backend_buffer_type_t host_buft = host_weights_buft;
+                if (host_buft != nullptr) {
+                    ggml_backend_buffer_t host_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), host_buft);
+                    if (host_buf != nullptr) {
+                        buft = host_buft;
+                        ctx_clip.buf.reset(host_buf);
+                        LOG_INF("%s: --mmproj-host-weights: projector weights in host memory, buffer \"%s\"\n",
+                                __func__, ggml_backend_buft_name(buft));
+                    } else if (ctx_clip.host_weights_strict && !ctx_clip.no_alloc) {
+                        // the memory fit counted these weights as host memory, so device memory may not have room for them
+                        throw std::runtime_error(string_format("%s: --mmproj-host-weights: failed to pin host memory after the memory fit; free host RAM, or use --fit off or --no-mmproj-host-weights\n", __func__));
+                    } else {
+                        LOG_WRN("%s: --mmproj-host-weights: failed to pin host memory, weights stay in device memory\n",
+                                __func__);
+                    }
+                } else {
+                    LOG_WRN("%s: --mmproj-host-weights set, but device \"%s\" has no host weights buffer type\n",
+                            __func__, dev ? ggml_backend_dev_name(dev) : "?");
+                }
+            }
+            if (!ctx_clip.buf) {
+                ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            }
+            // pinning failed: the weights are in device memory after all, move them back in the estimate
+            if (host_weights_buft && buft != host_weights_buft) {
+                ggml_backend_dev_t cpu_dev = ggml_backend_get_device(ctx_clip.backend_cpu);
+                ctx_clip.mem_usage[weights_dev] = ctx_clip.mem_usage[cpu_dev];
+                ctx_clip.mem_usage.erase(cpu_dev);
+            }
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!ctx_clip.no_alloc) {
