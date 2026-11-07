@@ -514,7 +514,7 @@ static void moe_missjoin_log(const char * when) {
         MOE_CACHE_LOG("[moe-cache] cpu split share %s: cpu_parts=%llu of missed_parts=%llu (%.1f%%), partial_experts=%llu, "
                 "parts over the link=%llu\n", when, plan.stat_parts, c[2], c[2] ? 100.0 * plan.stat_parts / c[2] : 0.0,
                 plan.stat_partial, c[3]);
-        fprintf(stderr, "[moe-cpu-split] live %s: CPU-served=%llu staged=%llu missed=%llu CPU share=%.3f (missed projections)\n",
+        GGML_LOG_INFO("[moe-cpu-split] live %s: CPU-served=%llu staged=%llu missed=%llu CPU share=%.3f (missed projections)\n",
                 when, plan.stat_parts, c[3], c[2], c[2] ? (double) plan.stat_parts / c[2] : 0.0);
         moe_cs_wstats_report(when);
     }
@@ -10044,12 +10044,20 @@ static double moe_cs_probe_link(void * dst, size_t cap) {
 // Mapped job memory, the host pool, the layer registrations and the startup probe (once per process; the layers
 // are registered again for every session). Needs the hit-first buffers (g_hf_scratch is the link probe's target).
 static void moe_cs_prepare(moe_cache_session & session) {
+    const auto log_inactive = [](const char * reason) {
+        static bool logged = false;
+        if (!logged) {
+            GGML_LOG_INFO("[moe-cpu-split] startup: CPU split off (%s); measured link=unavailable CPU probe=unavailable CPU share=0\n", reason);
+            logged = true;
+        }
+    };
     session.cs_registered.assign(session.mj_groups.size(), 0);
     session.cs_valid.assign(session.mj_groups.size(), 0);
     session.cs_layer = -1;
     session.cs_route_l.clear();
     session.cs_fixed_l.clear();
     if (!moe_cs_enabled() || session.devices.size() != 1) {
+        log_inactive(!moe_cs_enabled() ? "disabled" : "requires one device");
         return;
     }
     int64_t max_ff = 0, max_embd = 0;
@@ -10060,6 +10068,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
         }
     }
     if (!max_ff || !max_embd) {
+        log_inactive("no host layer registered");
         return;
     }
     static bool failed = false;
@@ -10087,10 +10096,12 @@ static void moe_cs_prepare(moe_cache_session & session) {
             failed = true;
             g_cs_job_h = nullptr;
             MOE_CACHE_LOG("[moe-cache] cpu split: setup failed, off\n");
+            log_inactive("host setup failed");
             return;
         }
     }
     if (!g_cs_job_h) {
+        log_inactive("host workers unavailable");
         return;
     }
     size_t layers = 0;
@@ -10176,9 +10187,11 @@ static void moe_cs_prepare(moe_cache_session & session) {
         const char * share = getenv("LLAMA_MOE_CPU_SHARE");
         if (share && *share) {
             char * end = nullptr;
-            g_cs_share = strtof(share, &end);
-            if (end == share || *end || !(g_cs_share >= 0.0f && g_cs_share <= 1.0f)) {
-                GGML_ABORT("LLAMA_MOE_CPU_SHARE must be a number in [0, 1]");
+            const float value = strtof(share, &end);
+            if (end == share || *end || !(value >= 0.0f && value <= 1.0f)) {
+                GGML_LOG_WARN("[moe-cpu-split] ignoring invalid LLAMA_MOE_CPU_SHARE: expected a number in [0, 1]\n");
+            } else {
+                g_cs_share = value;
             }
         }
         const bool first = moe_cs_env_float("GGML_MOE_CPU_SPLIT_FIRST", 0.0f) != 0.0f;
@@ -10189,7 +10202,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
         g_cs_link_w = std::max(0.05f, moe_cs_env_float("GGML_MOE_CPU_SPLIT_LINK_WEIGHT", 1.0f));
         char share_text[64] = "auto (chosen per layer)";
         if (g_cs_share >= 0.0f) { snprintf(share_text, sizeof(share_text), "%.3f (override, within work caps)", g_cs_share); }
-        fprintf(stderr, "[moe-cpu-split] startup: measured link=%.2f GB/s CPU probe=%.2f us CPU share=%s\n",
+        GGML_LOG_INFO("[moe-cpu-split] startup: measured link=%.2f GB/s CPU probe=%.2f us CPU share=%s\n",
                 link / 1e9, cpu_ok ? route_ns / 1000.0 : -1.0, share_text);
         MOE_CACHE_LOG("[moe-cache] cpu split: partial experts %s, card floor %.1f us per distinct expert, link weight %.2f\n",
                 g_cs_partial ? "on" : "off", g_cs_floor_ns / 1000.0f, g_cs_link_w);
@@ -10199,6 +10212,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
                 g_cs_adapt ? "corrected from measured jobs (ADAPT)" : "fixed");
     }
     g_cs_on = layers > 0 && g_cs_ns_per_byte > 0.0f;
+    if (!g_cs_on) { log_inactive(layers ? "link disabled" : "no host layer registered"); }
     if (g_cs_on && moe_cs_per_type_enabled()) {
         std::vector<std::array<int, 3>> key(session.cs_registered.size(), std::array<int, 3>{-1, -1, -1});
         for (size_t l = 0; l < key.size(); ++l) {
@@ -10715,7 +10729,7 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             // AIPFIX per-type: the live (ADAPT) cost is kept in the reference layer's units; cs_adapt_scale = this
             // layer's probe cost / the reference's (1 when the per-type probe is off)
             const float route_ns = args.cs_adapt && plan->route_ns_live > 0.0f ? plan->route_ns_live * args.cs_adapt_scale : args.cs_route_ns;
-            const int target = args.cs_share < 0.0f ? -1 : (int) ceilf(args.cs_share * (s_nk[0] + s_nk[1] + s_nk[2]));
+            const int target = moe_cs_target_parts(args.cs_share, s_nk[0] + s_nk[1] + s_nk[2]);
             const moe_cs_greedy_cfg gc = { route_ns, args.cs_fixed_ns, w, floor_ns,
                     { args.cs_bytes[0], args.cs_bytes[1], args.cs_bytes[2] }, args.cs_max_exp, args.cs_max_route, target };
             const unsigned char * const fl[3] = { s_flag[0], s_flag[1], s_flag[2] };

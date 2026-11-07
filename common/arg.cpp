@@ -3315,7 +3315,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-cpu-share"}, "F",
         "force the CPU share of missed expert projections (0..1, rounded up per layer, within CPU work caps; "
-        "requires CPU split; default: auto)",
+        "requires CPU split, includes partial experts; default: auto)",
         [](common_params &, const std::string & value) {
             size_t end = 0;
             const float share = std::stof(value, &end);

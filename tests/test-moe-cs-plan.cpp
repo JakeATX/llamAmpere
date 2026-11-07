@@ -100,6 +100,10 @@ int main() {
     }
     // Forced shares ignore the cost probe but keep the expert and route bounds.
     {
+        CHECK(moe_cs_target_parts(0.6f, 10) == 6 && moe_cs_target_parts(0.8f, 10) == 8,
+              "exact share multiples must not round up an extra part");
+        CHECK(moe_cs_target_parts(0.6f, 24) == 15 && moe_cs_target_parts(-1.0f, 24) == -1,
+              "fractional shares round up; unset keeps auto");
         short order[8], cnt[8];
         unsigned char flag[3][8];
         for (int i = 0; i < 8; ++i) {
@@ -112,7 +116,7 @@ int main() {
         int take[8], first[9], nr;
         unsigned long long parts, partial;
         for (float share : {0.0f, 0.6f, 0.8f, 1.0f}) {
-            c.target_parts = (int) ceilf(share * 24);
+            c.target_parts = moe_cs_target_parts(share, 24);
             const int ne = moe_cs_greedy(c, 24e6f * c.w, 8, order, cnt, fl, take, first, &nr, &parts, &partial);
             const int expected = (c.target_parts + 2) / 3;
             CHECK(ne == expected && nr == expected && parts == (unsigned) (3 * expected) && partial == 0,
