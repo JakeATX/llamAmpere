@@ -9869,8 +9869,9 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
             const bool trellis_pair = pair == ((3 << 8) | 3) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
             const bool ok = pair == ((4 << 8) | 4) || (lower_pair && (!trellis || trellis_pair));
             if (!ok) {
-                LLAMA_LOG_ERROR("%s: SJ-KVaRN cache: supported K/V pairs are 4/4, 4/3, 3/3, 4/2, 2/4, 3/2 and 2/2 (trellis body: 4/4, 3/3, 3/2 and 2/2), got %d/%d\n",
-                        __func__, params.sj_kvarn_bits_k, params.sj_kvarn_bits_v);
+                LLAMA_LOG_ERROR("%s: SJ-KVaRN cache: unsupported K/V pair %d/%d for the %s body; supported pairs: %s\n",
+                        __func__, params.sj_kvarn_bits_k, params.sj_kvarn_bits_v, trellis ? "trellis" : "scalar",
+                        trellis ? "4/4, 3/3, 3/2, 2/2; use --sjkvarn-body-type sjkvarn4 for scalar 4/3, 4/2 or 2/4" : "4/4, 4/3, 3/3, 4/2, 2/4, 3/2, 2/2");
                 return nullptr;
             }
         }

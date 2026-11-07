@@ -111,6 +111,7 @@ adaptive tq6_0 tail (`--sjkvarn-tail 4096 --sjkvarn-tail-max 8192`). The adaptiv
 supported pair), `turbo4` (Tiered TQ) or `auto`, which picks the trellis body for the 3/3, 3/2 and 2/2 pairs and scalar
 records for everything else. The trellis pairs are 4/4, 3/3, 3/2 and 2/2; a 4-bit side inside a low-bit pair is rejected
 because the low-bit tile loader would read it as scalar. The 2/2 pair works but is data only, not a recommendation.
+Scalar bodies support 4/4, 4/3, 3/3, 4/2, 2/4, 3/2 and 2/2. For 4/3, use `--sjkvarn-body-type sjkvarn4` or `auto`; an explicit `sjkvarn4t` body rejects that pair at startup and lists the supported pairs.
 
 The trained trellis codebooks are compiled into the binary (`ggml/src/ggml-sjkvarn-cb-lowbits.h`, generated from
 `cb3_trained_mse.bin` and `cb2_trained_mse.bin`); no files or environment variables are needed. The per-group norm refit

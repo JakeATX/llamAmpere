@@ -8986,14 +8986,26 @@ bool ggml_moe_bank_any(void) {
 }
 
 // fork AIPFIX ONEPATH: set by the CUDA expert cache while its device tables hold the bank rows of every banked tensor
+#ifdef _MSC_VER
+static volatile LONG g_moe_bank_onepath_live = 0;
+#else
 static int g_moe_bank_onepath_live = 0;
+#endif
 
 void ggml_moe_bank_onepath_set_live(bool live) {
+#ifdef _MSC_VER
+    InterlockedExchange(&g_moe_bank_onepath_live, live ? 1 : 0);
+#else
     __atomic_store_n(&g_moe_bank_onepath_live, live ? 1 : 0, __ATOMIC_RELEASE);
+#endif
 }
 
 bool ggml_moe_bank_onepath_live(void) {
+#ifdef _MSC_VER
+    return InterlockedCompareExchange(&g_moe_bank_onepath_live, 0, 0) != 0;
+#else
     return __atomic_load_n(&g_moe_bank_onepath_live, __ATOMIC_ACQUIRE) != 0;
+#endif
 }
 
 const uint8_t * ggml_moe_bank_lookup(const void * weight_data) {
