@@ -699,10 +699,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
         small_prompt_card = ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
                 ((total > 0 && (total >> 20) < 23552) || (free >> 20) < lim_mib);
-        const char * adaptive = getenv("LLAMA_B1_ADAPTIVE_PASSES");
+        const bool adaptive = llama_b1::adaptive_passes_enabled(small_prompt_card);
         const char * layer_major = getenv("LLAMA_B1");
         const char * packed = getenv("LLAMA_B1_FFN");
-        const bool adaptive_legacy = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && (adaptive ? atoi(adaptive) > 0 : small_prompt_card) &&
+        const bool adaptive_legacy = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && adaptive &&
                 layer_major && atoi(layer_major) > 0 && (!packed || atoi(packed) == 0);
         // fork: adaptive B1 keeps the requested size until its layer scratch fit fails.
         if (cparams.n_ubatch > 2048 && cap_on && !adaptive_legacy && ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
@@ -7280,7 +7280,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         model.hparams.n_embd <= 65536 && model.hparams.n_expert <= 4096 && model.hparams.n_expert_used() <= 128;
     b1->set_ffn_enabled(packed_ffn);
     const bool lean_legacy = b1_layer_scratch_active && !packed_ffn;
-    const bool adaptive_passes = !packed_ffn && b1_ctx_env("LLAMA_B1_ADAPTIVE_PASSES", 0) > 0;
+    const bool adaptive_passes = !packed_ffn && llama_b1::adaptive_passes_enabled(small_prompt_card);
     b1_kv_scratch_enabled = false; b1_lend_scratch = false;
     const bool kv_cold = memory->seq_pos_max(seq) < 0;
 

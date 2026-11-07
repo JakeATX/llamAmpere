@@ -53,7 +53,7 @@ while IFS= read -r device; do
     name=${BASH_REMATCH[1],,}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
     [[ -z $device_spec || ,${device_spec,,}, == *,"$name",* ]] || continue
     if (( card_mib < 23552 || free_mib < 14336 )); then
-        export LLAMA_B1_ADAPTIVE_PASSES=${LLAMA_B1_ADAPTIVE_PASSES-1}
+        export LLAMA_B1_ADAPTIVE_PASSES=${LLAMA_B1_ADAPTIVE_PASSES:-1}
         shape+=(-ub 4096)
         # Adaptive B1 bounds each pass, so the full prompt can stay in one batch.
         (( LLAMA_B1_ADAPTIVE_PASSES > 0 )) || shape+=(-b 32768)

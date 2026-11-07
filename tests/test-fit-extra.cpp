@@ -1037,6 +1037,18 @@ static void test_ram_fit() {
     expect(!llama_b1::staging_explicit(), "direct GPU upload chunks do not override host staging sizes");
     for (size_t i = 0; i < 4; ++i) { set_stage(stage_names[i], had_stage[i] ? saved_stage[i].c_str() : nullptr); }
     const uint64_t stage_required = 24 * (16 * MiB + 16384) + 4096;
+    const char * old_adaptive = std::getenv("LLAMA_B1_ADAPTIVE_PASSES");
+    const bool had_adaptive = old_adaptive != nullptr;
+    const std::string saved_adaptive = old_adaptive ? old_adaptive : "";
+    set_stage("LLAMA_B1_ADAPTIVE_PASSES", nullptr);
+    expect(llama_b1::adaptive_passes_enabled(true) && !llama_b1::adaptive_passes_enabled(false), "adaptive passes default only on small cards");
+    set_stage("LLAMA_B1_ADAPTIVE_PASSES", "0");
+    expect(!llama_b1::adaptive_passes_enabled(true) && !llama_b1::adaptive_passes_enabled(false), "explicit zero disables adaptive passes on both card sizes");
+    set_stage("LLAMA_B1_ADAPTIVE_PASSES", "1");
+    expect(llama_b1::adaptive_passes_enabled(true) && llama_b1::adaptive_passes_enabled(false), "explicit one enables adaptive passes on both card sizes");
+    set_stage("LLAMA_B1_ADAPTIVE_PASSES", "");
+    expect(llama_b1::adaptive_passes_enabled(true) && !llama_b1::adaptive_passes_enabled(false), "empty adaptive settings retain the card default");
+    set_stage("LLAMA_B1_ADAPTIVE_PASSES", had_adaptive ? saved_adaptive.c_str() : nullptr);
     uint32_t retry_ubatch = 6144;
     retry_ubatch = llama_b1::smaller_ubatch(retry_ubatch);
     expect(retry_ubatch == 4096, "failed layer scratch first retries 4096-token ubatches");
