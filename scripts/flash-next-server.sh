@@ -54,6 +54,8 @@ while IFS= read -r device; do
     [[ -z $device_spec || ,${device_spec,,}, == *,"$name",* ]] || continue
     if (( card_mib < 23552 || free_mib < 14336 )); then
         shape+=(-b 32768 -ub 4096)
+        # Keep the small-card graph pad; the larger pad was measured on 24 GB cards.
+        (( card_mib >= 23552 )) || export LLAMA_PROMPT_TEMP_HEADROOM=${LLAMA_PROMPT_TEMP_HEADROOM-0}
         break
     fi
 done <<< "$devices"
