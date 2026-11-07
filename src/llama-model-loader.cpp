@@ -2038,7 +2038,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool private_dense, bool fit_ram) {
-#ifndef __linux__
+#ifndef _POSIX_MAPPED_FILES
     if (private_dense) {
         LLAMA_LOG_INFO("%s: private dense remapping unavailable on this platform; using normal model mappings\n", __func__);
         private_dense = false;
