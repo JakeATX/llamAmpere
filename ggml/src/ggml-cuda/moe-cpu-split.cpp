@@ -653,6 +653,11 @@ static double r8_mem_avail() {   // MemAvailable in bytes (0 if unreadable)
 }
 
 static bool r8_init(pool_state & s) {
+#if !defined(__linux__)
+    s.r8_reset = false;
+    fprintf(stderr, "[moe-cpu-split] r8 host cache: requires Linux, off\n");
+    return false;
+#else
     pool_state::r8_state & c = s.r8;
     s.r8_reset = false;
     size_t slot = 0;
@@ -697,6 +702,7 @@ static bool r8_init(pool_state & s) {
     fprintf(stderr, "[moe-cpu-split] r8 host cache: %d slots x %.2f MiB = %zu MiB (GGML_MOE_AI_HOST_R8_MB, pages fill on first use)\n",
             c.n, slot / 1048576.0, (n * slot) >> 20);
     return true;
+#endif
 }
 
 // thread 0, before `gen` moves: choose decode / hit / decode + keep for every AI+ q8 (expert, role) of this job
