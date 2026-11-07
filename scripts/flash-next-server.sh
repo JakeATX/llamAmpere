@@ -63,8 +63,25 @@ while IFS= read -r device; do
     fi
 done <<< "$devices"
 [[ " $* " == *" -c "* || " $* " == *" --ctx-size"* ]] || shape+=(-c 110592)
-# 8 CPU threads as measured; smaller machines keep the engine's own count (physical cores)
-(( $(nproc --all) < 16 )) || shape+=(-t 8 -tb 8)
+threads=0
+(( $(nproc --all) < 16 )) || threads=8
+if [[ -r /sys/devices/cpu_core/cpus ]]; then
+    p_cores=$(lscpu -p=CPU,CORE,SOCKET 2>/dev/null | awk -F, -v cpus="$(cat /sys/devices/cpu_core/cpus)" '
+        BEGIN {
+            n = split(cpus, ranges, ",")
+            for (i = 1; i <= n; ++i) {
+                split(ranges[i], ends, "-")
+                last = ends[2] == "" ? ends[1] : ends[2]
+                for (cpu = ends[1]; cpu <= last; ++cpu) keep[cpu] = 1
+            }
+        }
+        !/^#/ && ($1 in keep) { cores[$2 "," $3] = 1 }
+        END { print length(cores) }
+    ') || p_cores=0
+    # Count each P-core once, even when its two threads are listed.
+    [[ ! $p_cores =~ ^[1-9][0-9]*$ ]] || threads=$(( p_cores < 8 ? p_cores : 8 ))
+fi
+(( threads == 0 )) || shape+=(-t "$threads" -tb "$threads")
 # a long prompt's temporary output (about 4 GiB at -c 110592) lives in an unlinked file, as measured. In RAM it is pinned,
 # costs seconds to allocate and pushes the prompt's read cache out. Needs a real disk with room; otherwise it stays in RAM.
 if [[ -z ${LLAMA_MOE_ARENA_OUTPUT_DIR-} ]]; then
