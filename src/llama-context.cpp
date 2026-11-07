@@ -7232,6 +7232,12 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     if (others) {
         return normal();
     }
+    // fork: shrink short tails before any cache loan or memory state change.
+    if (short_tail && b1_ctx_env("LLAMA_B1_TAIL_UBATCH", 0) == 512 &&
+            *std::max_element(sizes.begin(), sizes.end()) > 512) {
+        LLAMA_LOG_INFO("%s: [B1] short continuation requests 512-row ubatches before prompt state apply\n", __func__);
+        return 3;
+    }
     if (short_tail) {
         LLAMA_LOG_INFO("%s: [B1] trying short continuation: %u tokens at position %d (tail minimum %lld)\n",
                 __func__, n_tokens_all, balloc->seq_pos_min(seq), (long long) tail_min);
