@@ -6,8 +6,8 @@ Flash-Next fixes and optional prompt memory planning. Use the same model and Q2S
 
 - On 24 GB cards, prompt graph sizing leaves a larger cushion for temporary CUDA allocations. The short 4K-token warm-up and 100K-token prompt checks stayed within 23,552 MiB of whole-card memory.
 - Cards under 24 GB keep 32K-token prompt passes and the prior graph cushion. Their launcher microbatch is 4096 instead of 6144: in the measured 12 GB setup, 6144 could run out of layer scratch and fall back to much slower 512-token chunks. Explicit user microbatch settings still win. This does not guarantee that every prompt pass fits the available RAM.
-- The Flash-Next launcher supports startup with `--parallel` greater than one, using per-slot GPU KV storage and the main stream for shared experts. No parallel throughput improvement is claimed.
-- Unsupported Flash-Next `--split-mode tensor` now returns a clear error instead of asserting during startup. Other MTP plus tensor-split failures are not claimed fixed.
+- The Flash-Next launcher supports startup with `--parallel` greater than one, using per-slot GPU KV storage and the main stream for shared experts. Context is split across users: the 110,592-token window becomes 55,296 tokens per user with `--parallel 2` and 27,648 with `--parallel 4`. Multi-user speed is being worked on; no parallel throughput improvement is claimed.
+- Unsupported Flash-Next `--split-mode tensor` now returns a clear error instead of asserting during startup (issue #86). Other MTP plus tensor-split failures are not claimed fixed.
 - Small-card prompt messages explain the pass limit instead of suggesting a larger prompt batch.
 
 ## Optional adaptive prompt passes
