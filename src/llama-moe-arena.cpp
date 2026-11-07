@@ -198,8 +198,8 @@ void llama_moe_arena_parallel_load(const std::vector<llama_moe_arena_copy> & cop
         stop = true;
     };
     auto worker = [&]() {
-        void * raw = nullptr;
-        if (posix_memalign(&raw, align, chunk) != 0 || !raw) { fail("cannot allocate arena read buffer"); return; }
+        void * raw = llama_aligned_alloc(align, chunk);
+        if (!raw) { fail("cannot allocate arena read buffer"); return; }
         char * buf = (char *) raw;
         while (!stop.load(std::memory_order_relaxed)) {
             const size_t k = next.fetch_add(1);
@@ -245,7 +245,7 @@ void llama_moe_arena_parallel_load(const std::vector<llama_moe_arena_copy> & cop
             }
             done += need_end - s0;
         }
-        free(buf);
+        llama_aligned_free(buf);
     };
     // the direct descriptors are all opened above, so workers only read direct_fd
     std::vector<std::thread> pool;

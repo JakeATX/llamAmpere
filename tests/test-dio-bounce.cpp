@@ -3,6 +3,7 @@
 // usage: test-dio-bounce MODEL.gguf   (exit 77 = skipped: no model, or the filesystem refuses O_DIRECT)
 
 #include "gguf.h"
+#include "../src/llama-impl.h"
 #include "../src/llama-mmap.h"
 
 #include <algorithm>
@@ -13,15 +14,25 @@
 #include <memory>
 #include <vector>
 
-struct free_deleter { void operator()(void * p) const { free(p); } };
-
-static void * aligned_buf(size_t align, size_t n) {
-    void * p = nullptr;
-    if (posix_memalign(&p, align, n) != 0) { return nullptr; }
-    return p;
-}
+struct free_deleter { void operator()(void * p) const { llama_aligned_free(p); } };
 
 int main(int argc, char ** argv) {
+    llama_aligned_free(nullptr);
+    for (size_t alignment : { sizeof(void *), (size_t) 64, (size_t) 4096, (size_t) 2 << 20 }) {
+        for (size_t size : { (size_t) 1, (size_t) 4097, (size_t) LLAMA_DIRECT_IO_BUFFER_SIZE }) {
+            std::unique_ptr<void, free_deleter> p(llama_aligned_alloc(alignment, size));
+            if (!p || (uintptr_t) p.get() % alignment) { fprintf(stderr, "bad aligned allocation\n"); return 1; }
+            memset(p.get(), 0x5a, size);
+        }
+    }
+#ifdef _WIN32
+    FILE * tmp = tmpfile();
+    if (!tmp) { return 1; }
+    const bool direct = llama_file(tmp).has_direct_io();
+    fclose(tmp);
+    if (direct) { fprintf(stderr, "buffered Windows file reported direct I/O\n"); return 1; }
+#endif
+    if (argc > 1 && strcmp(argv[1], "--alloc-only") == 0) { printf("aligned allocation: PASS\n"); return 0; }
     const char * path = argc > 1 ? argv[1] : getenv("LLAMA_TEST_DIO_MODEL");
     if (!path || !path[0]) {
         printf("test-dio-bounce: no model given, skipped\n");
@@ -48,10 +59,10 @@ int main(int argc, char ** argv) {
     int failures = 0;
     // 64 MiB = the loader's bounce; 1 MiB forces several bounce chunks per read
     for (size_t bounce_size : { (size_t) LLAMA_DIRECT_IO_BUFFER_SIZE, (size_t) 1 << 20 }) {
-        std::unique_ptr<void, free_deleter> bounce(aligned_buf(std::max<size_t>(alignment, 4096), bounce_size));
+        std::unique_ptr<void, free_deleter> bounce(llama_aligned_alloc(std::max<size_t>(alignment, 4096), bounce_size));
         // stands in for the pinned upload slot: same size and alignment rules as the loader
         const size_t slot_size = LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment;
-        std::unique_ptr<void, free_deleter> slot(aligned_buf(64, slot_size));
+        std::unique_ptr<void, free_deleter> slot(llama_aligned_alloc(64, slot_size));
         if (!bounce || !slot) { fprintf(stderr, "allocation failed\n"); return 1; }
         std::vector<uint8_t> out;
         size_t bytes = 0;

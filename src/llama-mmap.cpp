@@ -176,7 +176,8 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        // ggml_fopen does not open the Windows handle with FILE_FLAG_NO_BUFFERING.
+        return false;
     }
 
     ~impl() {
@@ -330,14 +331,13 @@ struct llama_file::impl {
         // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
         const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
 
-        void * raw_buffer = nullptr;
-        int ret = posix_memalign(&raw_buffer, alignment, buffer_size);
-        if (ret != 0) {
-            throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+        void * raw_buffer = llama_aligned_alloc(alignment, buffer_size);
+        if (!raw_buffer) {
+            throw std::runtime_error("cannot allocate aligned read buffer");
         }
 
         struct aligned_buffer_deleter {
-            void operator()(void * p) const { free(p); }
+            void operator()(void * p) const { llama_aligned_free(p); }
         };
         std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
 
