@@ -728,7 +728,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     // over the passes that group size needs, and lend as little as that even group size requires. A group larger than
     // the even size takes the same number of passes but carries more ubatches and lends (and later refills) more.
     size_t g_max = group_ub_req == 0 ? nub : std::min<size_t>(group_ub_req, nub);
-    const bool adaptive_passes = !ffn_requested && b1_env_int("LLAMA_B1_ADAPTIVE_PASSES", 0) > 0;
+    const bool adaptive_passes = !ffn_requested && b1_env_int("LLAMA_B1_ADAPTIVE_PASSES", small_card ? 1 : 0) > 0;
     if (adaptive_passes) {
         g_max = cap_pass_group(g_max, max_tok, small_card);
         if (g_max == 0) {
@@ -1888,7 +1888,7 @@ void llama_b1::pass_compute(size_t ub, int64_t host_us) {
 void llama_b1::pass_end(size_t ub) {
     ggml_backend_synchronize(backend_gpu);
     // fork: the next pass may reuse the same host carry rows.
-    if (carry_host && g_ub < ub_n.size() && backend_carry && b1_env_int("LLAMA_B1_ADAPTIVE_PASSES", 0) > 0) {
+    if (carry_host && g_ub < ub_n.size() && backend_carry && b1_env_int("LLAMA_B1_ADAPTIVE_PASSES", small_card ? 1 : 0) > 0) {
         ggml_backend_synchronize(backend_carry);
     }
     pass_wall_us[ub / g_ub] = ggml_time_us() - pass_start_us[ub / g_ub];
