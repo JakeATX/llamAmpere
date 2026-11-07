@@ -25,13 +25,6 @@ int main(int argc, char ** argv) {
             memset(p.get(), 0x5a, size);
         }
     }
-#ifdef _WIN32
-    FILE * tmp = tmpfile();
-    if (!tmp) { return 1; }
-    const bool direct = llama_file(tmp).has_direct_io();
-    fclose(tmp);
-    if (direct) { fprintf(stderr, "buffered Windows file reported direct I/O\n"); return 1; }
-#endif
     if (argc > 1 && strcmp(argv[1], "--alloc-only") == 0) { printf("aligned allocation: PASS\n"); return 0; }
     const char * path = argc > 1 ? argv[1] : getenv("LLAMA_TEST_DIO_MODEL");
     if (!path || !path[0]) {
@@ -82,6 +75,11 @@ int main(int argc, char ** argv) {
                 const size_t read_size = std::min<size_t>(LLAMA_DIRECT_IO_BUFFER_SIZE, read_end - aligned_offset - bytes_read);
                 const uintptr_t dest = ((uintptr_t) slot.get() + alignment - 1) & ~(uintptr_t) (alignment - 1);
                 direct.read_raw_bounced((void *) dest, read_size, bounce.get(), bounce_size);
+                if (!direct.has_direct_io()) {
+                    fprintf(stderr, "O_DIRECT fell back to buffered I/O\n");
+                    gguf_free(gctx);
+                    return 1;
+                }
                 uintptr_t data = dest;
                 size_t n = read_size;
                 if (bytes_read == 0) { data += offset_from_alignment; n -= offset_from_alignment; }
