@@ -7031,25 +7031,26 @@ struct test_shexp_gate : public test_case {
     const int64_t E;
     const int64_t n_tokens;
     const bool    other_first;
+    const bool    side_stream;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "SHEXP_GATE";
+        return side_stream ? "SHEXP_SIDE" : "SHEXP_GATE";
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(K, E, n_tokens, other_first);
+        return VARS_TO_STR5(K, E, n_tokens, other_first, side_stream);
     }
 
     bool run_whole_graph() override { return true; }
     bool perf_whole_graph() override { return true; }
 
-    test_shexp_gate(int64_t K = 2560, int64_t E = 2560, int64_t n_tokens = 5, bool other_first = true)
-        : K(K), E(E), n_tokens(n_tokens), other_first(other_first) {}
+    test_shexp_gate(int64_t K = 2560, int64_t E = 2560, int64_t n_tokens = 5, bool other_first = true, bool side_stream = false)
+        : K(K), E(E), n_tokens(n_tokens), other_first(other_first), side_stream(side_stream) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (std::string(ggml_get_name(t)) == "w") {
+            if (std::string(ggml_get_name(t)) == "w" || std::string(ggml_get_name(t)) == "shexp_w") {
                 init_tensor_uniform(t, -0.05f, 0.05f);
             } else {
                 init_tensor_uniform(t);
@@ -7066,6 +7067,13 @@ struct test_shexp_gate : public test_case {
         ggml_set_name(y, "y");
         ggml_set_name(x, "x");
         ggml_set_name(other, "other");
+        if (side_stream) {
+            ggml_tensor * shared_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, E);
+            ggml_set_name(shared_w, "shexp_w");
+            y = ggml_scale(ctx, y, 0.5f);
+            x = ggml_mul_mat(ctx, shared_w, y);
+            ggml_set_name(x, "ffn_shexp-0");
+        }
         ggml_tensor * gated = ggml_mul(ctx, x, ggml_sigmoid(ctx, ggml_mul_mat(ctx, w, y)));
         ggml_tensor * out = other_first ? ggml_add(ctx, other, gated) : ggml_add(ctx, gated, other);
         ggml_set_name(out, "out");
@@ -16295,6 +16303,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_shexp_gate(2560, 2560, nt, false));
     }
     test_cases.emplace_back(new test_shexp_gate(1000, 777, 3, true));
+    for (int64_t nt = 1; nt <= 16; ++nt) {
+        test_cases.emplace_back(new test_shexp_gate(256, 256, nt, true, true));
+        test_cases.emplace_back(new test_shexp_gate(256, 256, nt, false, true));
+    }
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     // [HCPC] hc_post + CPY into a separate tensor (1) or back into the residual (2)
