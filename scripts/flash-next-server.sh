@@ -58,7 +58,11 @@ while IFS= read -r device; do
         # Adaptive B1 bounds each pass, so the full prompt can stay in one batch.
         (( LLAMA_B1_ADAPTIVE_PASSES > 0 )) || shape+=(-b 32768)
         # Keep the small-card graph pad; the larger pad was measured on 24 GB cards.
-        (( card_mib >= 23552 )) || export LLAMA_PROMPT_TEMP_HEADROOM=${LLAMA_PROMPT_TEMP_HEADROOM-0}
+        if (( card_mib < 23552 )); then
+            export LLAMA_PROMPT_TEMP_HEADROOM=${LLAMA_PROMPT_TEMP_HEADROOM-0}
+            export LLAMA_B1_TAIL_MIN_TOKENS=${LLAMA_B1_TAIL_MIN_TOKENS-1024}
+            export LLAMA_B1_TAIL_UBATCH=${LLAMA_B1_TAIL_UBATCH-512}
+        fi
         break
     fi
 done <<< "$devices"
