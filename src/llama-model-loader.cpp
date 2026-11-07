@@ -630,7 +630,12 @@ static void overlay_bank_keep(ggml_context * ctx, const gguf_context * gguf, con
         }
         std::vector<float> slot(n_expert);
         const size_t offs = gguf_get_data_offset(gguf) + gguf_get_tensor_offset(gguf, gguf_find_tensor(gguf, ggml_get_name(map)));
-        if (std::fseek(f, (long) offs, SEEK_SET) != 0 || std::fread(slot.data(), sizeof(float), n_expert, f) != (size_t) n_expert) {
+#ifdef _WIN32
+        const int seek_status = _fseeki64(f, (int64_t) offs, SEEK_SET);
+#else
+        const int seek_status = std::fseek(f, (long) offs, SEEK_SET);
+#endif
+        if (seek_status != 0 || std::fread(slot.data(), sizeof(float), n_expert, f) != (size_t) n_expert) {
             std::fclose(f);
             throw std::runtime_error(format("LLAMA_MOE_BANK_KEEP: cannot read the layer %d hot map", il));
         }
