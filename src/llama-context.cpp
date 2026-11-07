@@ -699,10 +699,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         ggml_backend_dev_memory(model.devices[0].dev, &free, &total);
         small_prompt_card = ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
                 ((total > 0 && (total >> 20) < 23552) || (free >> 20) < lim_mib);
-        const char * adaptive = getenv("LLAMA_B1_ADAPTIVE_PASSES");
+        const bool adaptive = llama_b1::adaptive_passes_enabled(small_prompt_card);
         const char * layer_major = getenv("LLAMA_B1");
         const char * packed = getenv("LLAMA_B1_FFN");
-        const bool adaptive_legacy = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && adaptive && atoi(adaptive) > 0 &&
+        const bool adaptive_legacy = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && adaptive &&
                 layer_major && atoi(layer_major) > 0 && (!packed || atoi(packed) == 0);
         // fork: adaptive B1 keeps the requested size until its layer scratch fit fails.
         if (cparams.n_ubatch > 2048 && cap_on && !adaptive_legacy && ggml_backend_dev_type(model.devices[0].dev) == GGML_BACKEND_DEVICE_TYPE_GPU && (free >> 20) < lim_mib) {
@@ -5712,8 +5712,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // [B1] layer-major prefill: plan the call and apply every ubatch up front, or give lent experts back first
     int b1_mode = b1_prepare(mctx.get(), batch_inp, n_tokens_all, n_outputs_all);
-    while (b1_mode == 2) {
-        const uint32_t smaller = llama_b1::smaller_ubatch(turn_ubatch);
+    while (b1_mode == 2 || b1_mode == 3) {
+        const uint32_t smaller = b1_mode == 3 ?
+            llama_b1::smaller_tail_ubatch(std::min(turn_ubatch, n_tokens_all)) :
+            llama_b1::smaller_ubatch(turn_ubatch);
         GGML_ASSERT(smaller > 0 && smaller < turn_ubatch);
         LLAMA_LOG_INFO("%s: [B1] layer scratch did not fit; retrying ubatch %u -> %u before prompt state apply\n",
                 __func__, turn_ubatch, smaller);
@@ -7205,7 +7207,12 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     // expert bytes as the normal path but overlaps the copies with compute (the server sends the last n_ubatch + 4
     // prompt tokens as their own calls for its context checkpoints)
     const int64_t min_tok = b1_ctx_env("LLAMA_B1_MIN_TOKENS", 16384);
-    if (sizes.empty() || (int64_t) n_tokens_all < min_tok) {
+    // fork: let a short continuation of a long prompt use B1, without lowering the fresh-prompt threshold.
+    const int64_t tail_min = b1_ctx_env("LLAMA_B1_TAIL_MIN_TOKENS", 0);
+    const bool short_tail = small_prompt_card && tail_min >= 512 &&
+            (int64_t) n_tokens_all >= tail_min && (int64_t) n_tokens_all < min_tok &&
+            balloc->seq_pos_min(seq) >= min_tok;
+    if (sizes.empty() || ((int64_t) n_tokens_all < min_tok && !short_tail)) {
         return normal();
     }
     if (!mctx->b1_supported()) {
@@ -7224,6 +7231,16 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
     }
     if (others) {
         return normal();
+    }
+    // fork: shrink short tails before any cache loan or memory state change.
+    if (short_tail && b1_ctx_env("LLAMA_B1_TAIL_UBATCH", 0) == 512 &&
+            *std::max_element(sizes.begin(), sizes.end()) > 512) {
+        LLAMA_LOG_INFO("%s: [B1] short continuation requests 512-row ubatches before prompt state apply\n", __func__);
+        return 3;
+    }
+    if (short_tail) {
+        LLAMA_LOG_INFO("%s: [B1] trying short continuation: %u tokens at position %d (tail minimum %lld)\n",
+                __func__, n_tokens_all, balloc->seq_pos_min(seq), (long long) tail_min);
     }
     size_t lend_cap = SIZE_MAX;
     const int64_t lend_mib = b1_ctx_env("LLAMA_B1_LEND_MIB", -1);
@@ -7263,7 +7280,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
         model.hparams.n_embd <= 65536 && model.hparams.n_expert <= 4096 && model.hparams.n_expert_used() <= 128;
     b1->set_ffn_enabled(packed_ffn);
     const bool lean_legacy = b1_layer_scratch_active && !packed_ffn;
-    const bool adaptive_passes = !packed_ffn && b1_ctx_env("LLAMA_B1_ADAPTIVE_PASSES", 0) > 0;
+    const bool adaptive_passes = !packed_ffn && llama_b1::adaptive_passes_enabled(small_prompt_card);
     b1_kv_scratch_enabled = false; b1_lend_scratch = false;
     const bool kv_cold = memory->seq_pos_max(seq) < 0;
 
@@ -7415,6 +7432,12 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             LLAMA_LOG_WARN("%s: [B1] legacy layer reservation failed before applying prompt state\n", __func__);
             b1_end(true);
             const int result = normal();
+            // A short continuation can be smaller than the ordinary 2048-row
+            // retry floor. Split it before state apply, down to 512 rows only.
+            if (result == 0 && adaptive_passes && short_tail &&
+                    llama_b1::smaller_tail_ubatch(*std::max_element(sizes.begin(), sizes.end())) > 0) {
+                return 3;
+            }
             if (result == 0 && adaptive_passes && llama_b1::smaller_ubatch(*std::max_element(sizes.begin(), sizes.end())) > 0) {
                 return 2;
             }
@@ -9846,8 +9869,9 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
             const bool trellis_pair = pair == ((3 << 8) | 3) || pair == ((3 << 8) | 2) || pair == ((2 << 8) | 2);
             const bool ok = pair == ((4 << 8) | 4) || (lower_pair && (!trellis || trellis_pair));
             if (!ok) {
-                LLAMA_LOG_ERROR("%s: SJ-KVaRN cache: supported K/V pairs are 4/4, 4/3, 3/3, 4/2, 2/4, 3/2 and 2/2 (trellis body: 4/4, 3/3, 3/2 and 2/2), got %d/%d\n",
-                        __func__, params.sj_kvarn_bits_k, params.sj_kvarn_bits_v);
+                LLAMA_LOG_ERROR("%s: SJ-KVaRN cache: unsupported K/V pair %d/%d for the %s body; supported pairs: %s\n",
+                        __func__, params.sj_kvarn_bits_k, params.sj_kvarn_bits_v, trellis ? "trellis" : "scalar",
+                        trellis ? "4/4, 3/3, 3/2, 2/2; use --sjkvarn-body-type sjkvarn4 for scalar 4/3, 4/2 or 2/4" : "4/4, 4/3, 3/3, 4/2, 2/4, 3/2, 2/2");
                 return nullptr;
             }
         }

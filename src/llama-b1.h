@@ -87,8 +87,16 @@ public:
     }
 
     bool ok() const { return init_ok; }
+    static bool adaptive_passes_enabled(bool small_card) {
+        const char * value = std::getenv("LLAMA_B1_ADAPTIVE_PASSES");
+        return value && *value ? std::atoll(value) > 0 : small_card;
+    }
     static uint32_t smaller_ubatch(uint32_t tokens) {
         return tokens > 4096 ? 4096 : tokens > 2048 ? 2048 : 0;
+    }
+    static uint32_t smaller_tail_ubatch(uint32_t tokens) {
+        const uint32_t normal = smaller_ubatch(tokens);
+        return normal ? normal : tokens > 1024 ? 1024 : tokens > 512 ? 512 : 0;
     }
     // fork: leave half the spare RAM for page faults and cache growth after admission.
     static uint64_t carry_ram_budget(uint64_t available) {

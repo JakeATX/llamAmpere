@@ -378,6 +378,7 @@ static uint8_t * g_cs_mask = nullptr;      // [3][g_hf_experts]: resident or on 
 // with GGML_MOE_DOWN_ONE on); the single down pass skips exactly those.
 static float g_cs_route_ns = 0.0f, g_cs_fixed_ns = 0.0f, g_cs_ns_per_byte = 0.0f;
 static int g_cs_max_exp = 8, g_cs_max_route = 24;
+static float g_cs_share = -1.0f;
 static int g_cs_adapt = 0;   // GGML_MOE_CPU_SPLIT_ADAPT=1: the join corrects the per-route cost from the host's measured job times
 // fork MOEGAP CPU-first (GGML_MOE_CPU_SPLIT_FIRST=1 sets all three; each can be set alone):
 //  PARTIAL=1: an expert missing in only one or two projections may go to the CPU too (the CPU computes the whole
@@ -513,6 +514,8 @@ static void moe_missjoin_log(const char * when) {
         MOE_CACHE_LOG("[moe-cache] cpu split share %s: cpu_parts=%llu of missed_parts=%llu (%.1f%%), partial_experts=%llu, "
                 "parts over the link=%llu\n", when, plan.stat_parts, c[2], c[2] ? 100.0 * plan.stat_parts / c[2] : 0.0,
                 plan.stat_partial, c[3]);
+        GGML_LOG_INFO("[moe-cpu-split] live %s: CPU-served=%llu staged=%llu missed=%llu CPU share=%.3f (missed projections)\n",
+                when, plan.stat_parts, c[3], c[2], c[2] ? (double) plan.stat_parts / c[2] : 0.0);
         moe_cs_wstats_report(when);
     }
 }
@@ -10038,6 +10041,14 @@ static double moe_cs_probe_link(void * dst, size_t cap) {
     return best;
 }
 
+static void moe_cs_log_inactive(const char * reason) {
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("[moe-cpu-split] startup: CPU split off (%s); measured link=unavailable CPU probe=unavailable CPU share=0\n", reason);
+        logged = true;
+    }
+}
+
 // Mapped job memory, the host pool, the layer registrations and the startup probe (once per process; the layers
 // are registered again for every session). Needs the hit-first buffers (g_hf_scratch is the link probe's target).
 static void moe_cs_prepare(moe_cache_session & session) {
@@ -10047,6 +10058,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
     session.cs_route_l.clear();
     session.cs_fixed_l.clear();
     if (!moe_cs_enabled() || session.devices.size() != 1) {
+        moe_cs_log_inactive(!moe_cs_enabled() ? "disabled" : "requires one device");
         return;
     }
     int64_t max_ff = 0, max_embd = 0;
@@ -10057,6 +10069,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
         }
     }
     if (!max_ff || !max_embd) {
+        moe_cs_log_inactive("no host layer registered");
         return;
     }
     static bool failed = false;
@@ -10084,10 +10097,12 @@ static void moe_cs_prepare(moe_cache_session & session) {
             failed = true;
             g_cs_job_h = nullptr;
             MOE_CACHE_LOG("[moe-cache] cpu split: setup failed, off\n");
+            moe_cs_log_inactive("host setup failed");
             return;
         }
     }
     if (!g_cs_job_h) {
+        moe_cs_log_inactive("host workers unavailable");
         return;
     }
     size_t layers = 0;
@@ -10170,11 +10185,26 @@ static void moe_cs_prepare(moe_cache_session & session) {
         g_cs_ns_per_byte = gbps > 0.0f ? 1.0f / gbps : 0.0f;
         g_cs_max_exp = std::max(1, std::min((int) moe_cs_env_float("GGML_MOE_CPU_SPLIT_MAX_EXPERTS", 8.0f), MOE_CS_MAX_EXPERTS));
         g_cs_max_route = std::max(1, std::min((int) moe_cs_env_float("GGML_MOE_CPU_SPLIT_MAX_ROUTES", 24.0f), MOE_CS_MAX_ROUTES));
+        const char * share = getenv("LLAMA_MOE_CPU_SHARE");
+        if (share && *share) {
+            char * end = nullptr;
+            const float value = strtof(share, &end);
+            if (end == share || *end || !(value >= 0.0f && value <= 1.0f)) {
+                GGML_LOG_WARN("[moe-cpu-split] ignoring invalid LLAMA_MOE_CPU_SHARE: expected a number in [0, 1]\n");
+            } else {
+                g_cs_share = value;
+            }
+        }
         const bool first = moe_cs_env_float("GGML_MOE_CPU_SPLIT_FIRST", 0.0f) != 0.0f;
         g_cs_adapt = moe_cs_env_float("GGML_MOE_CPU_SPLIT_ADAPT", first ? 1.0f : 0.0f) != 0.0f ? 1 : 0;
         g_cs_partial = moe_cs_env_float("GGML_MOE_CPU_SPLIT_PARTIAL", first ? 1.0f : 0.0f) != 0.0f ? 1 : 0;
+        if (g_cs_share >= 0.0f) { g_cs_partial = 1; }
         g_cs_floor_ns = std::max(0.0f, moe_cs_env_float("GGML_MOE_CPU_SPLIT_FLOOR_US", first ? 4.0f : 0.0f)) * 1000.0f;
         g_cs_link_w = std::max(0.05f, moe_cs_env_float("GGML_MOE_CPU_SPLIT_LINK_WEIGHT", 1.0f));
+        char share_text[64] = "auto (chosen per layer)";
+        if (g_cs_share >= 0.0f) { snprintf(share_text, sizeof(share_text), "%.3f (override, within work caps)", g_cs_share); }
+        GGML_LOG_INFO("[moe-cpu-split] startup: measured link=%.2f GB/s CPU probe=%.2f us CPU share=%s\n",
+                link / 1e9, cpu_ok ? route_ns / 1000.0 : -1.0, share_text);
         MOE_CACHE_LOG("[moe-cache] cpu split: partial experts %s, card floor %.1f us per distinct expert, link weight %.2f\n",
                 g_cs_partial ? "on" : "off", g_cs_floor_ns / 1000.0f, g_cs_link_w);
         MOE_CACHE_LOG("[moe-cache] cpu split: probe link %.1f GB/s -> using %.1f GB/s; CPU %.1f us per (expert, route), "
@@ -10183,6 +10213,7 @@ static void moe_cs_prepare(moe_cache_session & session) {
                 g_cs_adapt ? "corrected from measured jobs (ADAPT)" : "fixed");
     }
     g_cs_on = layers > 0 && g_cs_ns_per_byte > 0.0f;
+    if (!g_cs_on) { moe_cs_log_inactive(layers ? "link disabled" : "no host layer registered"); }
     if (g_cs_on && moe_cs_per_type_enabled()) {
         std::vector<std::array<int, 3>> key(session.cs_registered.size(), std::array<int, 3>{-1, -1, -1});
         for (size_t l = 0; l < key.size(); ++l) {
@@ -10234,6 +10265,9 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
     session.hf_order.clear();
     session.hf_seq.clear();
     const bool hitfirst = moe_missjoin_hitfirst_enabled();
+    if (!hitfirst) {
+        moe_cs_log_inactive(!moe_cs_enabled() ? "disabled" : "hit-first disabled");
+    }
     if (!moe_missjoin_overlap_enabled() && !hitfirst) {
         return;
     }
@@ -10309,6 +10343,7 @@ static void moe_missjoin_overlap_prepare(moe_cache_session & session) {
         }
         ok = ok && stride <= g_hf_stride && experts <= g_hf_experts && slots <= g_hf_slots;
         if (!ok) {
+            moe_cs_log_inactive(session.mj_groups.empty() ? "no host layer registered" : "hit-first setup failed");
             (void) cudaGetLastError();
             session.mj_groups.clear();
             for (auto & entry : session.device_tables) { entry.second.mj_layer = -1; entry.second.mj_kind = -1; }
@@ -10430,7 +10465,7 @@ struct moe_hf_plan_args {
     float cs_bytes[3];            // copy bytes of one expert per projection
     int cs_max_exp, cs_max_route;
     int cs_partial;               // fork MOEGAP CPU-first (see g_cs_partial)
-    float cs_floor_ns, cs_link_w;
+    float cs_floor_ns, cs_link_w, cs_share;
     moe_miss_list * miss;         // fork MOEGAP MISSLIST: [4] lists to write (null: off; fast kernel only)
     unsigned long long * pc_exp[3];   // fork MOEGAP PLANCOUNT: per-kind expert counts (null: off; fast kernel only)
     unsigned long long * pc_route;    // [0] hot routes, [1] cold routes, [2] dispatches (may be null)
@@ -10699,8 +10734,9 @@ static __global__ void __launch_bounds__(256) moe_hf_plan_fast_kernel(const moe_
             // AIPFIX per-type: the live (ADAPT) cost is kept in the reference layer's units; cs_adapt_scale = this
             // layer's probe cost / the reference's (1 when the per-type probe is off)
             const float route_ns = args.cs_adapt && plan->route_ns_live > 0.0f ? plan->route_ns_live * args.cs_adapt_scale : args.cs_route_ns;
+            const int target = moe_cs_target_parts(args.cs_share, s_nk[0] + s_nk[1] + s_nk[2]);
             const moe_cs_greedy_cfg gc = { route_ns, args.cs_fixed_ns, w, floor_ns,
-                    { args.cs_bytes[0], args.cs_bytes[1], args.cs_bytes[2] }, args.cs_max_exp, args.cs_max_route };
+                    { args.cs_bytes[0], args.cs_bytes[1], args.cs_bytes[2] }, args.cs_max_exp, args.cs_max_route, target };
             const unsigned char * const fl[3] = { s_flag[0], s_flag[1], s_flag[2] };
             int take[MOE_CS_MAX_EXPERTS];
             int nr = 0;
@@ -11421,6 +11457,7 @@ static bool moe_hf_begin(ggml_backend_cuda_context & ctx, moe_cache_session & se
         args.cs_partial = g_cs_partial;
         args.cs_floor_ns = g_cs_floor_ns;
         args.cs_link_w = g_cs_link_w;
+        args.cs_share = g_cs_share;
     }
     // fork MOEGAP PUBPLAN
     const bool pub_plan = cs && fast && moe_cs_pub_plan_enabled();

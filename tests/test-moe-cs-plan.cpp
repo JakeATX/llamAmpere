@@ -98,6 +98,52 @@ int main() {
             return n; };
         CHECK(ef == expect(62.2e3f) && es == expect(94.0e3f), "closed form %d/%d vs %d/%d", expect(62.2e3f), expect(94.0e3f), ef, es);
     }
+    // Forced shares ignore the cost probe but keep the expert and route bounds.
+    {
+        CHECK(moe_cs_target_parts(0.6f, 10) == 6 && moe_cs_target_parts(0.8f, 10) == 8 &&
+              moe_cs_target_parts(0.6f, 25) == 15,
+              "exact share multiples must not round up an extra part");
+        CHECK(moe_cs_target_parts(0.6f, 24) == 15 && moe_cs_target_parts(-1.0f, 24) == -1,
+              "fractional shares round up; unset keeps auto");
+        short order[8], cnt[8];
+        unsigned char flag[3][8];
+        for (int i = 0; i < 8; ++i) {
+            order[i] = (short) i;
+            cnt[i] = 4;
+            for (int k = 0; k < 3; ++k) { flag[k][i] = 3; }
+        }
+        const unsigned char * const fl[3] = {flag[0], flag[1], flag[2]};
+        moe_cs_greedy_cfg c = {1e9f, 1e9f, 0.04f, 0.0f, {1e6f, 1e6f, 1e6f}, 8, 24};
+        int take[8], first[9], nr;
+        unsigned long long parts, partial;
+        for (float share : {0.0f, 0.6f, 0.8f, 1.0f}) {
+            c.target_parts = moe_cs_target_parts(share, 24);
+            const int ne = moe_cs_greedy(c, 24e6f * c.w, 8, order, cnt, fl, take, first, &nr, &parts, &partial);
+            const int expected = (c.target_parts + 2) / 3;
+            CHECK(ne == expected && nr == expected && parts == (unsigned) (3 * expected) && partial == 0,
+                  "share %.1f: got %d experts / %llu parts", share, ne, parts);
+            for (int i = 0; i < ne; ++i) { CHECK(take[i] == i && first[i + 1] == i + 1, "forced route offsets"); }
+        }
+        c.target_parts = 24;
+        c.max_exp = 2;
+        CHECK(moe_cs_greedy(c, 0, 8, order, cnt, fl, take, first, &nr, &parts, &partial) == 2 && parts == 6,
+              "forced share must obey the expert cap");
+        c.max_exp = 8;
+        c.max_route = 3;
+        cnt[0] = 8;
+        CHECK(moe_cs_greedy(c, 0, 8, order, cnt, fl, take, first, &nr, &parts, &partial) == 2 && nr == 3,
+              "forced share must obey the route cap");
+        c.max_route = 24;
+        cnt[0] = 4;
+        flag[1][0] = flag[2][0] = 0;
+        flag[2][1] = 0;
+        c.target_parts = 3;
+        CHECK(moe_cs_greedy(c, 0, 8, order, cnt, fl, take, first, &nr, &parts, &partial) == 2 && parts == 3 && partial == 2,
+              "partial experts count only their missed projections");
+        c.target_parts = -1;
+        CHECK(moe_cs_greedy(c, 0, 8, order, cnt, fl, take, first, &nr, &parts, &partial) == 0,
+              "auto mode still uses the cost probe");
+    }
     // 3. per-type cost table
     {
         const std::array<int, 3> A = {23, 23, 20}, B = {150, 150, 150}, none = {-1, -1, -1};

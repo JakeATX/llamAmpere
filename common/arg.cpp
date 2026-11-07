@@ -3313,6 +3313,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params &, bool value) { common_set_env("GGML_MOE_CPU_SPLIT", value ? "1" : "0"); }
     ));
     add_opt(common_arg(
+        {"--moe-cpu-share"}, "F",
+        "force the CPU share of missed expert projections (0..1, rounded up per layer, within CPU work caps; "
+        "requires CPU split, includes partial experts; default: auto)",
+        [](common_params &, const std::string & value) {
+            size_t end = 0;
+            const float share = std::stof(value, &end);
+            if (end != value.size() || !(share >= 0.0f && share <= 1.0f)) {
+                throw std::invalid_argument("--moe-cpu-share must be a number in [0, 1]");
+            }
+            common_set_env("LLAMA_MOE_CPU_SHARE", value);
+        }
+    ).set_env("LLAMA_MOE_CPU_SHARE"));
+    add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
         "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "

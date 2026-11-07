@@ -19,7 +19,12 @@ struct moe_cs_greedy_cfg {
     float floor_ns;   // card floor (already x distinct experts)
     float bytes[3];   // copy bytes of one expert per projection
     int max_exp, max_route;
+    int target_parts = -1; // fork: >=0 forces this many missed projections onto the CPU, within the work caps
 };
+
+MOE_CS_HD int moe_cs_target_parts(float share, int missed) {
+    return share < 0.0f ? -1 : (int) ceilf(share * missed - 1e-4f);
+}
 
 // Candidates in `order` (most routes first); cnt[i] / 4 = routes of candidate i; flag[k][i] & 3 == 3 = projection k
 // of candidate i is a miss. `gpu` = the card's copy time with every miss copied. Moves candidates to the host while
@@ -32,6 +37,7 @@ MOE_CS_HD int moe_cs_greedy(const moe_cs_greedy_cfg & c, float gpu, int ncand, c
     unsigned long long parts = 0, partial = 0;
     first[0] = 0;
     for (int r = 0; r < ncand && ne < c.max_exp; ++r) {
+        if (c.target_parts >= 0 && parts >= (unsigned long long) c.target_parts) { break; }
         const int i = order[r];
         const int n = cnt[i] / 4;
         if (nr + n > c.max_route) { break; }
@@ -46,7 +52,7 @@ MOE_CS_HD int moe_cs_greedy(const moe_cs_greedy_cfg & c, float gpu, int ncand, c
         const float now = fmaxf(cpu, fmaxf(c.floor_ns, gpu));
         const float next = fmaxf(cpu2, fmaxf(c.floor_ns, gpu2));
         // without a floor, ties stop (the old rule); with one, ties inside the floor go to the CPU
-        if (c.floor_ns > 0.0f ? next > now : next >= now) { break; }
+        if (c.target_parts < 0 && (c.floor_ns > 0.0f ? next > now : next >= now)) { break; }
         cpu = cpu2;
         gpu = gpu2;
         take[ne] = i;

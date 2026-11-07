@@ -2750,7 +2750,12 @@ void llama_model::pin_borrowed_host_tensor(ggml_tensor * tensor) const {
         auto pin = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_pin");
         auto unpin = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_unpin");
         if (!pin || !unpin || !pin(tensor->data, bytes)) {
+#ifndef __linux__
+            LLAMA_LOG_WARN("%s: cannot page-lock borrowed host %s on this platform; leaving it unpinned\n", __func__, tensor->name);
+            return;
+#else
             throw std::runtime_error(format("cannot pin borrowed host tensor %s via CUDA; request-time weight residency is required", tensor->name));
+#endif
         }
         pinned->data = tensor->data;
         pinned->unpin = unpin;

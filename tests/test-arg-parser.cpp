@@ -363,6 +363,37 @@ static void test(void) {
         unsetenv("GGML_MOE_SKIP_RANK_FLOOR");
     }
 
+#ifndef _WIN32
+    {
+        const char * prev = getenv("LLAMA_MOE_CPU_SHARE");
+        const bool had_prev = prev != nullptr;
+        const std::string saved = prev ? prev : "";
+        auto parse_share = [&list_str_to_char](std::vector<std::string> args) {
+            common_params p;
+            return common_params_parse(args.size(), list_str_to_char(args).data(), p, LLAMA_EXAMPLE_SERVER);
+        };
+        unsetenv("LLAMA_MOE_CPU_SHARE");
+        assert(parse_share({"binary_name"}));
+        assert(getenv("LLAMA_MOE_CPU_SHARE") == nullptr);
+        for (const char * value : {"0", "0.6", "0.8", "1"}) {
+            assert(parse_share({"binary_name", "--moe-cpu-share", value}));
+            assert(std::string(getenv("LLAMA_MOE_CPU_SHARE")) == value);
+        }
+        setenv("LLAMA_MOE_CPU_SHARE", "0.8", 1);
+        assert(parse_share({"binary_name"}));
+        assert(parse_share({"binary_name", "--moe-cpu-share", "0.6"}));
+        assert(std::string(getenv("LLAMA_MOE_CPU_SHARE")) == "0.6");
+        for (const char * value : {"-0.1", "1.1", "nan", "inf", "0.6junk", ""}) {
+            unsetenv("LLAMA_MOE_CPU_SHARE");
+            assert(!parse_share({"binary_name", "--moe-cpu-share", value}));
+            setenv("LLAMA_MOE_CPU_SHARE", value, 1);
+            if (*value) { assert(!parse_share({"binary_name"})); }
+        }
+        if (had_prev) { setenv("LLAMA_MOE_CPU_SHARE", saved.c_str(), 1); }
+        else { unsetenv("LLAMA_MOE_CPU_SHARE"); }
+    }
+#endif
+
     // missing value
     argv = {"binary_name", "-m"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

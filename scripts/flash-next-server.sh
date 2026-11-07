@@ -53,15 +53,39 @@ while IFS= read -r device; do
     name=${BASH_REMATCH[1],,}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
     [[ -z $device_spec || ,${device_spec,,}, == *,"$name",* ]] || continue
     if (( card_mib < 23552 || free_mib < 14336 )); then
-        shape+=(-b 32768 -ub 4096)
+        export LLAMA_B1_ADAPTIVE_PASSES=${LLAMA_B1_ADAPTIVE_PASSES:-1}
+        shape+=(-ub 4096)
+        # Adaptive B1 bounds each pass, so the full prompt can stay in one batch.
+        (( LLAMA_B1_ADAPTIVE_PASSES > 0 )) || shape+=(-b 32768)
         # Keep the small-card graph pad; the larger pad was measured on 24 GB cards.
-        (( card_mib >= 23552 )) || export LLAMA_PROMPT_TEMP_HEADROOM=${LLAMA_PROMPT_TEMP_HEADROOM-0}
+        if (( card_mib < 23552 )); then
+            export LLAMA_PROMPT_TEMP_HEADROOM=${LLAMA_PROMPT_TEMP_HEADROOM-0}
+            export LLAMA_B1_TAIL_MIN_TOKENS=${LLAMA_B1_TAIL_MIN_TOKENS-1024}
+            export LLAMA_B1_TAIL_UBATCH=${LLAMA_B1_TAIL_UBATCH-512}
+        fi
         break
     fi
 done <<< "$devices"
 [[ " $* " == *" -c "* || " $* " == *" --ctx-size"* ]] || shape+=(-c 110592)
-# 8 CPU threads as measured; smaller machines keep the engine's own count (physical cores)
-(( $(nproc --all) < 16 )) || shape+=(-t 8 -tb 8)
+threads=0
+(( $(nproc --all) < 16 )) || threads=8
+if [[ -r /sys/devices/cpu_core/cpus ]]; then
+    p_cores=$(lscpu -p=CPU,CORE,SOCKET 2>/dev/null | awk -F, -v cpus="$(cat /sys/devices/cpu_core/cpus)" '
+        BEGIN {
+            n = split(cpus, ranges, ",")
+            for (i = 1; i <= n; ++i) {
+                split(ranges[i], ends, "-")
+                last = ends[2] == "" ? ends[1] : ends[2]
+                for (cpu = ends[1]; cpu <= last; ++cpu) keep[cpu] = 1
+            }
+        }
+        !/^#/ && ($1 in keep) { cores[$2 "," $3] = 1 }
+        END { print length(cores) }
+    ') || p_cores=0
+    # Count each P-core once, even when its two threads are listed.
+    [[ ! $p_cores =~ ^[1-9][0-9]*$ ]] || threads=$(( p_cores < 8 ? p_cores : 8 ))
+fi
+(( threads == 0 )) || shape+=(-t "$threads" -tb "$threads")
 # a long prompt's temporary output (about 4 GiB at -c 110592) lives in an unlinked file, as measured. In RAM it is pinned,
 # costs seconds to allocate and pushes the prompt's read cache out. Needs a real disk with room; otherwise it stays in RAM.
 if [[ -z ${LLAMA_MOE_ARENA_OUTPUT_DIR-} ]]; then

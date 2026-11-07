@@ -256,6 +256,11 @@ int main(int argc, char ** argv) {
         test_skip(false);
         return failures ? 1 : 0;
     }
+    CHECK(!ggml_moe_bank_onepath_live());
+    ggml_moe_bank_onepath_set_live(true);
+    CHECK(ggml_moe_bank_onepath_live());
+    ggml_moe_bank_onepath_set_live(false);
+    CHECK(!ggml_moe_bank_onepath_live());
     test_patterns();
     test_skip(true);
     test_census();

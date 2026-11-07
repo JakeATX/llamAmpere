@@ -694,7 +694,8 @@ private:
     } b1_cur;
 
     // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
-    // 2 to retry smaller ubatches before state apply, 0 for the normal path, < 0 for a decode error code
+    // 2 to retry smaller ubatches before state apply, 3 for opt-in short-tail retries down to 512 rows,
+    // 0 for the normal path, < 0 for a decode error code
     int  b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp, uint32_t n_tokens_all, int64_t n_outputs_all);
     bool b1_reserve_legacy_layers(const std::vector<uint32_t> & sizes, int64_t n_outputs_all);
     // runs layers [0, n_layer - 1) of every ubatch of the group that starts at ub0, then seeks back to ub0 with
