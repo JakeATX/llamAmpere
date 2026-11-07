@@ -727,7 +727,16 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     // group picker: find the largest group that fits (lending allowed up to the cap), then spread the ubatches evenly
     // over the passes that group size needs, and lend as little as that even group size requires. A group larger than
     // the even size takes the same number of passes but carries more ubatches and lends (and later refills) more.
-    const size_t g_max = group_ub_req == 0 ? nub : std::min<size_t>(group_ub_req, nub);
+    size_t g_max = group_ub_req == 0 ? nub : std::min<size_t>(group_ub_req, nub);
+    const bool adaptive_passes = !ffn_requested && b1_env_int("LLAMA_B1_ADAPTIVE_PASSES", 0) > 0;
+    if (adaptive_passes) {
+        g_max = cap_pass_group(g_max, max_tok, small_card);
+        if (g_max == 0) {
+            LLAMA_LOG_WARN("%s: [B1] no ubatch fits the prompt pass cap; using the normal prefill\n", __func__);
+            return false;
+        }
+    }
+    bool bounded_host_carry = false;
     step_carry_bytes = carry_bytes;
     step_slot_bytes  = 0;
     for (size_t role : role_max) {
@@ -844,9 +853,10 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     size_t g_fit = 0;
     one_slot = false;
     // [PP12] host carry: keep one pass over the experts when only the carries keep the whole group out of VRAM.
-    // RAM rule: the pinned carries may use at most 80% of MemAvailable above a 5 GiB floor.
+    // RAM rule: adaptive carries use half the RAM above 5 GiB; the control keeps its 80% budget.
     const int64_t host_carry_mode = ffn_requested ? 0 : b1_env_int("LLAMA_B1_HOST_CARRY", 0);
     size_t host_carry_total = 0;
+    size_t host_carry_budget = SIZE_MAX;
     for (uint32_t n : ub_n) {
         host_carry_total += b1_align_up((size_t) n * n_embd * n_hc * sizeof(float), align);
     }
@@ -854,11 +864,26 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         if (host_carry_mode < 2 && try_group(g_max)) {
             g_fit = g_max;
         } else {
-            // a pinned carry held over a re-plan comes back to this plan, so it counts as available
-            const int64_t ram = b1_ram_available() + (carry_pin_spare ? (int64_t) ggml_backend_buffer_get_size(carry_pin_spare) : 0) +
+            // fork: a chunked spare may still have untouched pages; free it before sampling RAM.
+            if (adaptive_passes) {
+                drop_carry_spare();
+            }
+            const int64_t ram_now = b1_ram_available();
+            const int64_t ram = adaptive_passes ? ram_now : ram_now + (carry_pin_spare ? (int64_t) ggml_backend_buffer_get_size(carry_pin_spare) : 0) +
                     (carry_chunk_spare ? (int64_t) carry_chunk_spare->size : 0);
-            const int64_t room = ram > (5LL << 30) ? (ram - (5LL << 30)) / 5 * 4 : 0;
-            if ((int64_t) host_carry_total > room) {
+            const int64_t room = adaptive_passes ? int64_t(carry_ram_budget(ram > 0 ? uint64_t(ram) : 0)) :
+                    (ram > (5LL << 30) ? (ram - (5LL << 30)) / 5 * 4 : 0);
+            size_t fit = g_max;
+            if (adaptive_passes) {
+                fit = fit_carry_group(ram > 0 ? uint64_t(ram) : 0, carry_bytes, g_max, max_tok, small_card);
+                host_carry_budget = fit * carry_bytes;
+                if (fit > 0 && fit < nub) {
+                    g_max = fit;
+                    host_carry_total = g_max * carry_bytes;
+                    bounded_host_carry = true;
+                }
+            }
+            if ((int64_t) host_carry_total > room || fit == 0) {
                 LLAMA_LOG_WARN("%s: [B1] host carry needs %.1f MiB of pinned RAM, only %.1f MiB allowed (MemAvailable %.1f MiB); "
                         "not used\n", __func__, host_carry_total/1048576.0, room/1048576.0, ram/1048576.0);
             } else {
@@ -901,7 +926,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
             break;
         }
         // fork: ask the cache only for space the full group cannot borrow from resident weights.
-        if (borrow_bytes && g == g_max && minimum_fresh != SIZE_MAX) {
+        if (borrow_bytes && !adaptive_passes && g == g_max && minimum_fresh != SIZE_MAX) {
             *borrow_bytes = b1_borrow_deficit(minimum_fresh, keep, free_mem);
             if (*borrow_bytes > 0) {
                 return false;
@@ -913,7 +938,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         found  = true;
         passes = (nub + g_fit - 1)/g_fit;
         const size_t g_even = (nub + passes - 1)/passes;
-        if (g_even < g_fit) {
+        if (g_even < g_fit && !adaptive_passes) {
             // keep the g_fit selection if the smaller group unexpectedly does not pack (first-fit is not monotone)
             const auto keep = std::make_tuple(g_sel, lent_sel, place_sel, regs_sel, fresh_sel);
             if (!try_group(g_even)) {
@@ -923,10 +948,27 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
     }
 
     if (!found) {
+        if (adaptive_passes && borrow_bytes && minimum_fresh != SIZE_MAX) {
+            *borrow_bytes = b1_borrow_deficit(minimum_fresh, keep, free_mem);
+        }
         LLAMA_LOG_WARN("%s: [B1] no plan fits: %.1f MiB free VRAM (keeping %zu MiB), carry %.1f MiB per ubatch, "
                 "lend cap %.1f MiB; using the normal prefill\n", __func__, free_mem/1048576.0, keep >> 20,
                 carry_bytes/1048576.0, lend_cap/1048576.0);
         return false;
+    }
+    if (bounded_host_carry && carry_host) {
+        host_carry_total = g_sel * carry_bytes;
+    }
+    if (adaptive_passes) {
+        size_t pass_tokens = 0;
+        for (size_t u = 0; u < g_sel; ++u) { pass_tokens += ub_n[u]; }
+        LLAMA_LOG_INFO("%s: [B1] adaptive passes: pass_tokens=%zu ubatches=%zu passes=%zu carry=%s host_MiB=%.1f floor_MiB=5120\n",
+                __func__, pass_tokens, g_sel, (nub + g_sel - 1) / g_sel, carry_host ? "host" : "device",
+                carry_host ? host_carry_total / 1048576.0 : 0.0);
+        if (bounded_host_carry && carry_host) {
+            LLAMA_LOG_INFO("%s: [FNGUARD] prompt passes capped at %zu tokens to fit RAM (5 GiB floor)\n",
+                    __func__, pass_tokens);
+        }
     }
 
     // check that the borrowed tensors hold their file bytes before overwriting them: the refill copies the file back
@@ -1058,11 +1100,13 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         ggml_backend_buffer_type_t buft_host = ggml_backend_dev_host_buffer_type(dev);
         bool reused = false;
         const bool chunked = b1_env_int("LLAMA_B1_CARRY_PIN_CHUNKED", 0) > 0;
-        if (chunked && carry_chunk_spare && carry_chunk_spare->size >= host_carry_total) {
+        if (chunked && carry_chunk_spare && carry_chunk_spare->size >= host_carry_total &&
+                carry_chunk_spare->size <= host_carry_budget) {
             carry_chunk     = std::move(carry_chunk_spare); // [PINCH] same call; its helper may still be pinning
             carry_host_buf  = carry_chunk->buf;
             reused = true;
         } else if (carry_pin_spare && ggml_backend_buffer_get_size(carry_pin_spare) >= host_carry_total &&
+                ggml_backend_buffer_get_size(carry_pin_spare) <= host_carry_budget &&
                 ggml_backend_buffer_get_type(carry_pin_spare) == buft_host) {
             carry_host_buf  = carry_pin_spare; // [PINRE] same call, already pinned
             carry_pin_spare = nullptr;
@@ -1084,7 +1128,7 @@ bool llama_b1::begin(const std::vector<uint32_t> & ub_tokens, uint32_t group_ub_
         carry_host_offs.resize(nub);
         size_t offs = 0;
         for (size_t u = 0; u < nub; ++u) {
-            carry_host_offs[u] = offs;
+            carry_host_offs[u] = bounded_host_carry ? (u % g_sel) * carry_bytes : offs;
             offs += b1_align_up((size_t) ub_n[u] * n_embd * n_hc * sizeof(float), align);
         }
         st.bytes_carry_host = host_carry_total;
@@ -1843,6 +1887,10 @@ void llama_b1::pass_compute(size_t ub, int64_t host_us) {
 
 void llama_b1::pass_end(size_t ub) {
     ggml_backend_synchronize(backend_gpu);
+    // fork: the next pass may reuse the same host carry rows.
+    if (carry_host && g_ub < ub_n.size() && backend_carry && b1_env_int("LLAMA_B1_ADAPTIVE_PASSES", 0) > 0) {
+        ggml_backend_synchronize(backend_carry);
+    }
     pass_wall_us[ub / g_ub] = ggml_time_us() - pass_start_us[ub / g_ub];
 }
 

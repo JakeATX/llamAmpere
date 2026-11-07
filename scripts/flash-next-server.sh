@@ -15,13 +15,28 @@ if [[ -n $FLASH_NEXT_DRAFT_MAX && " $* " != *" --spec-draft-n-"* ]]; then
     # --spec-type adds to the list, so only pick adaptive MTP when the caller names no type
     [[ " $* " == *" --spec-type"* ]] || depth=(--spec-type draft-mtp-adaptive "${depth[@]}")
 fi
-# one slot unless the caller sets the count: the server default (4 slots) gives SJ-KVaRN one KV stream per slot, and
-# the default --kv-gpu-tokens needs a single stream, so the model would refuse to load
 slots=()
-[[ " $* " == *" -np "* || " $* " == *" --parallel"* || " $* " == *" -np="* ]] || slots=(--parallel 1)
-# the shape our speed numbers were measured with; the caller's own arguments come later, so they win. A 12 GB card still
-# reads the prompt with -ub 6144 (the engine lowers it), and experts fall back to unpinned file pages when RAM is short.
+slot_count=${LLAMA_ARG_N_PARALLEL-1}
+slot_explicit=${LLAMA_ARG_N_PARALLEL+x}
+slot_next=0
+for arg in "$@"; do
+    if (( slot_next )); then slot_count=$arg; slot_next=0; fi
+    case $arg in
+        -np|--parallel) slot_next=1; slot_explicit=1 ;;
+        -np=*|--parallel=*) slot_count=${arg#*=}; slot_explicit=1 ;;
+    esac
+done
+[[ -n $slot_explicit ]] || slots=(--parallel 1)
+# Shared-expert stream joins can be crossed by fused multi-slot graphs.
+# Keep those experts on the main stream until the multi-slot join is safe.
+if [[ $slot_count != 1 ]]; then
+    export GGML_CUDA_SHEXP_SIDE=${GGML_CUDA_SHEXP_SIDE-0}
+fi
+# The caller's own shape arguments come later, so they win.
 shape=(-ngl 999 -fa on -b 131072 -ub 8192 --fit off --moe-arena on --moe-cache on --ctx-checkpoints 4)
+# The resident QSA window supports one stream; several slots use the existing per-sequence GPU cache instead.
+# Explicit CLI values come last, and an explicit environment value also wins.
+[[ $slot_count == 1 || -n ${LLAMA_ARG_KV_GPU_TOKENS+x} ]] || shape+=(--kv-gpu-tokens 0)
 # Small cards use less host carry RAM. The server lists devices in CUDA order, including visibility remapping.
 device_spec=${LLAMA_ARG_DEVICE-}
 device_next=0
@@ -38,7 +53,9 @@ while IFS= read -r device; do
     name=${BASH_REMATCH[1],,}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
     [[ -z $device_spec || ,${device_spec,,}, == *,"$name",* ]] || continue
     if (( card_mib < 23552 || free_mib < 14336 )); then
-        shape+=(-b 32768)
+        shape+=(-b 32768 -ub 4096)
+        # Keep the small-card graph pad; the larger pad was measured on 24 GB cards.
+        (( card_mib >= 23552 )) || export LLAMA_PROMPT_TEMP_HEADROOM=${LLAMA_PROMPT_TEMP_HEADROOM-0}
         break
     fi
 done <<< "$devices"

@@ -87,6 +87,26 @@ public:
     }
 
     bool ok() const { return init_ok; }
+    static uint32_t smaller_ubatch(uint32_t tokens) {
+        return tokens > 4096 ? 4096 : tokens > 2048 ? 2048 : 0;
+    }
+    // fork: leave half the spare RAM for page faults and cache growth after admission.
+    static uint64_t carry_ram_budget(uint64_t available) {
+        constexpr uint64_t floor = 5ull << 30;
+        return available > floor ? (available - floor) / 2 : 0;
+    }
+    static size_t cap_pass_group(size_t requested, size_t ub_tokens, bool small_card) {
+        if (!ub_tokens) { return 0; }
+        return small_card ? std::min(requested, size_t(32768) / ub_tokens) : requested;
+    }
+    static size_t fit_carry_group(uint64_t available, size_t carry_bytes, size_t requested,
+            size_t ub_tokens = 1, bool small_card = false) {
+        if (!carry_bytes || !ub_tokens) { return 0; }
+        const size_t fit = size_t(std::min<uint64_t>(requested, carry_ram_budget(available) / carry_bytes));
+        return cap_pass_group(fit, ub_tokens, small_card);
+    }
+    void set_small_card(bool value) { small_card = value; }
+    bool small_card = false;
     void set_ffn_enabled(bool enabled) { ffn_requested = enabled; }
     // VRAM the plan must leave free beyond its keep, for scratch measured only after a plan exists (the legacy layer graph)
     void set_extra_keep(size_t bytes) { extra_keep = bytes; }

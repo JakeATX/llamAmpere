@@ -5,6 +5,11 @@ tuned for NVIDIA RTX 30-series "Ampere" graphics cards, especially the RTX 3090 
 including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model
 writes faster) and Qwen3.8 Flash-Next.
 
+## What's new in v0.6.3.1
+
+- Flash-Next leaves more temporary card memory on 24 GB cards and handles `--parallel` startup. Unsupported Flash-Next tensor split now gives a clear error.
+- Small cards keep 32K prompt passes, with a 4096-token microbatch to avoid a measured prompt fallback. Adaptive prompt passes remain opt-in. [Release notes](docs/llamampere-v0.6.3.1/RELEASE_NOTES.md).
+
 ## What's new in v0.6.3
 
 - **New Flash-Next model file, [qwen3.8-flash-next-Swift1.5-ATX-AI3](https://huggingface.co/jakeatx/qwen3.8-flash-next-Swift1.5-ATX-AI3):** 80.11 GB (74.61 GiB), compared with 75.97 GB for IQ3_XXS. On an RTX 3090 with ample system RAM, this file wrote 121–125 tokens/s across coding, agentic and RAG tasks. These are observations on the new file, not a same-engine comparison with the standard file. [Measured results and limits](docs/llamampere-v0.6.3/RELEASE_NOTES.md).
@@ -26,15 +31,15 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ## Quick start
 
-**Build and run (v0.6.3, Qwen3.8 Flash-Next, Linux).** For one 24 GB RTX 30-series card, or a supported 12 GB card, with 64 GB of system RAM. Cards under 24 GB use 32K-token prompt passes; see the hardware support notes and the explanation of exact output after reloading a conversation. The launcher keeps the tested `--fit off` setting; its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
+**Build and run (v0.6.3.1, Qwen3.8 Flash-Next, Linux).** For one 24 GB RTX 30-series card, or a supported 12 GB card, with 64 GB of system RAM. Cards under 24 GB use 32K-token prompt passes; see the hardware support notes and the explanation of exact output after reloading a conversation. The launcher keeps the tested `--fit off` setting; its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
 compiler, the `hf` download tool (`pip install -U huggingface_hub`) and 81.63 GB for the model and drafter, plus space for the build, prompt scratch and saved prompts. The launcher uses a 5 GiB free-RAM floor. This
-one paste clones or updates llamAmpere at v0.6.3, builds `llama-server`, downloads the model and its drafter and starts the server:
+one paste clones or updates llamAmpere at v0.6.3.1, builds `llama-server`, downloads the model and its drafter and starts the server:
 
 ```bash
 if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.1
 else
-  git clone -b v0.6.3 https://github.com/JakeATX/llamAmpere.git
+  git clone -b v0.6.3.1 https://github.com/JakeATX/llamAmpere.git
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \

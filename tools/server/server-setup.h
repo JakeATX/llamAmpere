@@ -101,7 +101,12 @@ static void server_setup_report(const common_params & params, llama_context * ct
     const uint32_t ubatch = llama_n_ubatch(ctx);
     const uint32_t passes = (context + (uint64_t) batch - 1) / batch;
     if (batch < context) {
-        warn(string_format("prompt batch %u is smaller than slot context %u: at least %u prompt passes; raise -b", batch, context, passes));
+        if (ctx->prompt_small_card()) {
+            SRV_INF("[FNGUARD] prompt passes capped at %u tokens to fit RAM on a small card; at least %u passes for slot context %u\n",
+                    batch, passes, context);
+        } else {
+            warn(string_format("prompt batch %u is smaller than slot context %u: at least %u prompt passes; raise -b", batch, context, passes));
+        }
     }
     if (ubatch < 4096) {
         warn(string_format("prompt ubatch %u is below 4096; raise -ub", ubatch));
