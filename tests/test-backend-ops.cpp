@@ -15971,6 +15971,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_ait2pu_cases(test_cases);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT2_U2);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT3_U2);
+    add_ait2pu_cases(test_cases, GGML_TYPE_AIT4_U2);
     // U2 reference decoding: odd chunk count, multiple slabs, and the small-output fallback.
     // The last case must also work with GGML_CUDA_AI23_SMALL_SPLIT=2/4.
     for (ggml_type type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
@@ -19539,6 +19540,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
             test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, GGML_TYPE_Q2_0, 2, 4, 640, 2560));
+        }
+    }
+    // Row-scale four-bit down banks must keep the native and mixed paths equal.
+    for (int width : { 1, 3, 5, 8 }) {
+        for (bool repeated : { false, true }) {
+            test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT4_U2, width,
+                    GGML_TYPE_IQ4_NL, 2, 4, 640, 2560, repeated));
         }
     }
     // Production top-k10 crosses ballot chunks at both 32 and 64 routes.

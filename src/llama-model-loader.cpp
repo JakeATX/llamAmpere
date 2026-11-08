@@ -1213,6 +1213,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_AIT4_U:
             case GGML_TYPE_AIT2_U2:
             case GGML_TYPE_AIT3_U2:
+        case GGML_TYPE_AIT4_U2:
             case GGML_TYPE_AIT2:
             case GGML_TYPE_AIT3:
             case GGML_TYPE_AIT4:

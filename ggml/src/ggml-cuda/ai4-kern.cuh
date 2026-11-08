@@ -49,6 +49,7 @@ constexpr int LAY_AIT3_U = 13;   // rate-3 units ([d 16][16 tiles x 12 words], 8
 constexpr int LAY_AIT4_U = 14;   // rate-4 units ([d 16][16 tiles x 16 words], 1056 B)
 constexpr int LAY_AIT2P_U = 15;  // AIT2_U bytes, AIT2P pair-table levels (ggml-ai4.h); no trellis constant
 constexpr int LAY_AIT2_U2 = 16;  // AIT2_U levels, one fp16 scale per row per 640 K: block = [d 16][5 chunks x 16 tiles x 8 words] (ggml.h AIT2_U2)
+constexpr int LAY_AIT4_U2 = 20;  // 4-bit tiles in the 640-K row-scale block
 constexpr int LAY_AIT3_U2 = 17;  // AIT3_U levels, same block shape (rate 3)
 
 // mmv-ID columns per block: lanes g = 0..7 of the mmv kernel each own one token column
@@ -139,13 +140,13 @@ constexpr int U_SC      = 32;     // fp16 d[16]
 // symbol rate of a layout (bits per weight in the tile stream) and its trellis constant
 template <int LAY> constexpr __host__ __device__ int lay_rate() {
     static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U ||
-                  LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2, "ai4k layout");
+                  LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2, "ai4k layout");
     return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT2_U2 ? 2 :
            LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 ? 3 : 4;
 }
 template <int LAY> constexpr __host__ __device__ bool lay_pair() { return LAY == LAY_AIT2P_U; }
 // row-scale layouts: one scale header per 5 chunks (640 K) instead of one per chunk
-template <int LAY> constexpr __host__ __device__ bool lay_v2() { return LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2; }
+template <int LAY> constexpr __host__ __device__ bool lay_v2() { return LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2; }
 template <int LAY> constexpr __host__ __device__ uint32_t lay_mul() {
     static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U || lay_v2<LAY>(), "ai4k layout");
     return LAY == LAY_AIT2_U || LAY == LAY_AIT2_U2 ? 0xC3CCD12Du : LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 ? 0x87D8D12Du : 0xAA73876Bu;
