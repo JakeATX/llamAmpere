@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +21,19 @@ static int pc_getpid() { return (int) getpid(); }
 #endif
 
 namespace fs = std::filesystem;
+
+std::string server_prompt_cache_routing_key(
+        const common_moe_cache_params & params, const char * cpu_split, const char * graph_opt) {
+    // Match each backend switch's parse rule; unset and disabled share a key.
+    const bool split = cpu_split && strcmp(cpu_split, "1") == 0;
+    const bool graph = graph_opt && atoi(graph_opt) == 1;
+    return "moe_cache=" + std::to_string((int) params.mode) +
+        ",explicit=" + std::to_string(params.mode_explicit) +
+        ",budget_mib=" + std::to_string(params.budget_mib) +
+        ",fit=" + std::to_string(params.fit_selected) +
+        ";GGML_MOE_CPU_SPLIT=" + std::to_string(split) +
+        ";GGML_CUDA_GRAPH_OPT=" + std::to_string(graph) + ";";
+}
 
 static const char     PC_MAGIC[4] = {'L', 'C', 'P', 'C'};
 static const uint32_t PC_VERSION  = 4;

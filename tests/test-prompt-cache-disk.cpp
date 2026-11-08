@@ -58,6 +58,44 @@ static int n_pass = 0;
 static const uint64_t GiB = 1024ull*1024*1024;
 static const uint64_t MiB = 1024ull*1024;
 
+static void test_routing_key() {
+    common_moe_cache_params params;
+    params.mode_explicit = true;
+    const std::string prefix = "model=fixed;build=fixed;ctk=q8_0;ctv=q8_0;";
+    auto key = [&](const char * split, const char * graph) {
+        return prefix + server_prompt_cache_routing_key(params, split, graph);
+    };
+    const std::string base = key(nullptr, nullptr);
+    CHECK(base == prefix + "moe_cache=1,explicit=1,budget_mib=0,fit=0;GGML_MOE_CPU_SPLIT=0;GGML_CUDA_GRAPH_OPT=0;");
+    CHECK(base == key(nullptr, nullptr));
+    CHECK(base == key("0", "0"));
+    CHECK(base == key("", ""));
+    for (const auto mode : {COMMON_MOE_CACHE_MODE_OFF, COMMON_MOE_CACHE_MODE_ON, COMMON_MOE_CACHE_MODE_SOFT}) {
+        params.mode = mode;
+        CHECK(key(nullptr, nullptr) == prefix + "moe_cache=" + std::to_string((int) mode) +
+                ",explicit=1,budget_mib=0,fit=0;GGML_MOE_CPU_SPLIT=0;GGML_CUDA_GRAPH_OPT=0;");
+        CHECK(key(nullptr, nullptr) != base);
+    }
+    params.mode = COMMON_MOE_CACHE_MODE_AUTO;
+    CHECK(key("1", nullptr) == prefix + "moe_cache=1,explicit=1,budget_mib=0,fit=0;GGML_MOE_CPU_SPLIT=1;GGML_CUDA_GRAPH_OPT=0;");
+    CHECK(key("1", nullptr) != base);
+    CHECK(key(nullptr, "1") == prefix + "moe_cache=1,explicit=1,budget_mib=0,fit=0;GGML_MOE_CPU_SPLIT=0;GGML_CUDA_GRAPH_OPT=1;");
+    CHECK(key(nullptr, "1") != base);
+    CHECK(key("01", nullptr) == base);
+    CHECK(key(nullptr, "01") == key(nullptr, "1"));
+    CHECK(key(nullptr, "2") == base);
+    params.mode_explicit = false;
+    CHECK(key(nullptr, nullptr) != base);
+    params.mode_explicit = true;
+    params.budget_mib = 4096;
+    CHECK(key(nullptr, nullptr) != base);
+    params.budget_mib = 0;
+    params.fit_selected = true;
+    CHECK(key(nullptr, nullptr) != base);
+    params.fit_selected = false;
+    CHECK(key(nullptr, nullptr) == base);
+}
+
 static void test_split_identity(const std::string & root) {
     const std::string first = root + "/model-00001-of-00002.gguf";
     const std::string second = root + "/model-00002-of-00002.gguf";
@@ -1090,6 +1128,7 @@ int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
 
+    test_routing_key();
     test_split_identity(root);
     test_ram_tiers();
     test_dir_creation(root);
