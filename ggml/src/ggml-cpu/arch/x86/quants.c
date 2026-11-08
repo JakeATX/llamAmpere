@@ -529,7 +529,11 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
         const __m256 vamax = _mm256_set1_ps(amax);
         for (int j = 0; j < QK_K; j += 8) {
             const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_and_ps(_mm256_loadu_ps(x + j), absmask), vamax, _CMP_EQ_OQ));
+#if defined(_MSC_VER) && !defined(__clang__)
+            if (m) { max = x[j + _tzcnt_u32((unsigned) m)]; break; }
+#else
             if (m) { max = x[j + __builtin_ctz(m)]; break; }
+#endif
         }
         const float iscale = -127.f/max;
         const __m256 viscale = _mm256_set1_ps(iscale);

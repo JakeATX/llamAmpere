@@ -10,6 +10,7 @@
 #include <sys/prctl.h>
 #include <dirent.h>
 #endif
+#include "moe-msvc-compat.h"
 #include "moe-cpu-split.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -41,6 +42,15 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <time.h>
+#endif
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -1068,6 +1078,9 @@ void pin_thread(int cpu) {
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     (void) pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#elif defined(_WIN32)
+    if (cpu < 0 || cpu >= 64) { return; }
+    (void) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu);
 #else
     (void) cpu;
 #endif
@@ -1086,6 +1099,22 @@ std::vector<int> core_leaders() {
         if (FILE * f = fopen((base + "physical_package_id").c_str(), "r")) { if (fscanf(f, "%d", &pkg) != 1) { pkg = 0; } fclose(f); }
         if (core < 0) { return {}; }
         if (seen.insert({pkg, core}).second) { out.push_back(c); }
+    }
+#elif defined(_WIN32)
+    // Lowest logical cpu of each physical core (processor group 0 only).
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    std::vector<char> buf(len);
+    if (len && GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+        for (DWORD off = 0; off < len;) {
+            auto * e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (buf.data() + off);
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupMask[0].Group == 0) {
+                const unsigned long long m = (unsigned long long) e->Processor.GroupMask[0].Mask;
+                if (m) { unsigned long b = 0; _BitScanForward64(&b, m); out.push_back((int) b); }
+            }
+            off += e->Size;
+        }
+        std::sort(out.begin(), out.end());
     }
 #endif
     return out;
@@ -1334,6 +1363,11 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         // GGML_MOE_CPU_SPLIT_CORE0=0 keeps the pool off core 0 even with MAX_THREADS: the card queue fences every
         // other process onto core 0 during a timed run, and a pool thread there stalls the layer when it is preempted.
         if (env_int("GGML_MOE_CPU_SPLIT_CORE0", 1, 0, 1) == 0 && cores.size() > 2) { skip[0] = 1; }
+#if defined(_WIN32)
+        // Windows: the caller is not pinned to a home core (no sched_getcpu pin above), so keep core 0 free for the
+        // card-driving thread and the desktop instead of placing a spinning pool thread on every core.
+        if (cores.size() > 2) { skip[0] = 1; }
+#endif
         const char * ep = getenv("GGML_CPU_EXPERT_PIN");
         if (!s.host_help && !max_threads && ep && strcmp(ep, "1") == 0 && cores.size() > 2) { skip[1] = 1; }
 #if defined(__linux__)
@@ -1386,6 +1420,25 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
             }
         }
     }
+#elif defined(_WIN32)
+    if (smt) {
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+        std::vector<char> buf(len);
+        if (len && GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+            const size_t n_lead = avail.size();
+            for (size_t i = 0; i < n_lead; ++i) {
+                for (DWORD off = 0; off < len;) {
+                    auto * e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) (buf.data() + off);
+                    const unsigned long long m = (unsigned long long) e->Processor.GroupMask[0].Mask;
+                    if (e->Processor.GroupMask[0].Group == 0 && avail[i] < 64 && (m >> avail[i] & 1)) {
+                        for (int v = 0; v < 64; ++v) { if ((m >> v & 1) && v != avail[i]) { avail.push_back(v); } }
+                    }
+                    off += e->Size;
+                }
+            }
+        }
+    }
 #endif
     // GGML_MOE_CPU_SPLIT_CPULIST="11,10,9,..." (default unset): use exactly these cpus, in this order, instead of the
     // derived list. Used to test pool placement (which L3 group, whether the desktop core is in the pool).
@@ -1424,6 +1477,19 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
         if (CPU_COUNT(&m) > 1 && pthread_setaffinity_np(pthread_self(), sizeof(m), &m) == 0) {
             for (int c = 0; c < CPU_SETSIZE; ++c) {
                 if (CPU_ISSET(c, &m)) { card_where += (card_where.empty() ? "" : ",") + std::to_string(c); }
+            }
+        }
+    }
+#endif
+#if defined(_WIN32)
+    // GGML_MOE_CPU_SPLIT_WIN_CARD=1 (default): keep the card-driving thread off the pool cpus.
+    if (pin && env_int("GGML_MOE_CPU_SPLIT_WIN_CARD", 1, 0, 1) != 0) {
+        DWORD_PTR proc = 0, sys = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) {
+            DWORD_PTR m = proc;
+            for (int i = 0; i < s.threads; ++i) { const int c = cpu_of(i); if (c >= 0 && c < 64) { m &= ~((DWORD_PTR) 1 << c); } }
+            if (m && SetThreadAffinityMask(GetCurrentThread(), m)) {
+                for (int c = 0; c < 64; ++c) { if (m & ((DWORD_PTR) 1 << c)) { card_where += (card_where.empty() ? "" : ",") + std::to_string(c); } }
             }
         }
     }
