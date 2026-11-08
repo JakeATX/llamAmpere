@@ -6,6 +6,7 @@
 // summation order differs (valid-math change).
 
 #include "../ggml-ai4.h"
+#include "moe-msvc-compat.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -564,7 +565,7 @@ static bool use_rowwin() {
 
 // byte-pair sums of state * C for the 8 states of tile row R (two int16 per 32-bit lane, one lane per column)
 template <int K, int R>
-static inline __attribute__((always_inline)) __m256i row_bytepair_direct(const uint32_t * wt, __m128i f4, __m128i l4,
+static inline MOE_ALWAYS_INLINE __m256i row_bytepair_direct(const uint32_t * wt, __m128i f4, __m128i l4,
                                                                         const direct_tabs & T, __m256i sh, __m256i Cv) {
     constexpr int src = direct_src(K, R);
     __m256i v;
@@ -581,20 +582,20 @@ static inline __attribute__((always_inline)) __m256i row_bytepair_direct(const u
 
 // byte sum S of state * C for the 8 states of tile row R (level = (S - 510) >> 2), one 32-bit lane per column
 template <int K, int R>
-static inline __attribute__((always_inline)) __m256i row_bytesum_direct(const uint32_t * wt, __m128i f4, __m128i l4,
+static inline MOE_ALWAYS_INLINE __m256i row_bytesum_direct(const uint32_t * wt, __m128i f4, __m128i l4,
                                                                         const direct_tabs & T, __m256i sh, __m256i Cv) {
     return _mm256_madd_epi16(row_bytepair_direct<K, R>(wt, f4, l4, T, sh, Cv), _mm256_set1_epi16(1));
 }
 
 template <int K, int R>
-static inline __attribute__((always_inline)) __m256 row_levels_direct(const uint32_t * wt, __m128i f4, __m128i l4,
+static inline MOE_ALWAYS_INLINE __m256 row_levels_direct(const uint32_t * wt, __m128i f4, __m128i l4,
                                                                       const direct_tabs & T, __m256i sh, __m256i Cv) {
     const __m256i v = row_bytesum_direct<K, R>(wt, f4, l4, T, sh, Cv);
     return _mm256_cvtepi32_ps(_mm256_srai_epi32(_mm256_sub_epi32(v, _mm256_set1_epi32(510)), 2));
 }
 
 template <int K, int NT, int G, int R0, size_t... I>
-static inline __attribute__((always_inline)) void direct_rows(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
+static inline MOE_ALWAYS_INLINE void direct_rows(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
                                                               __m256i sh, __m256i Cv, const __m256 (&yv)[NT],
                                                               __m256 (&part)[NT][G], std::index_sequence<I...>) {
     auto row = [&](auto gi) {
@@ -606,7 +607,7 @@ static inline __attribute__((always_inline)) void direct_rows(const uint32_t * w
 }
 
 template <int K, int NT, int G, int R0>
-static inline __attribute__((always_inline)) void direct_group(ublk blk, const float * const * y, int64_t koff,
+static inline MOE_ALWAYS_INLINE void direct_group(ublk blk, const float * const * y, int64_t koff,
                                                                __m256i Cv, float (*acc)[AI4_TR]) {
     constexpr int tw = AIK_TILE_WORDS(K);
     const direct_tabs & T = direct_tables();
@@ -682,7 +683,7 @@ static bool unit_rows_direct(ublk blk, int k, uint32_t C, int nt, const float * 
 // op instead of vpsubw + vpsraw ((S * 8192 + 2^14) >> 15 is exact for S in [0, 1020]); the dots then hold
 // sum (level + 128) * q, and q8_group subtracts 128 * sum q of the unit (q8_xu) before the convert: the same int32 row sums.
 template <int K, int NT, int G, int R0, bool KP, bool LV, size_t... P>
-static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
+static inline MOE_ALWAYS_INLINE void q8_pairs(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
                                                            __m256i sh, __m256i Cv, const int16_t * const (&xt)[NT],
                                                            __m256i (&ip)[NT][G/2], int8_t * dst, int64_t gs,
                                                            std::index_sequence<P...>) {
@@ -715,14 +716,14 @@ static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, 
 }
 
 // pair lanes: [r0 c01, r0 c23, r1 c01, r1 c23 | r0 c45, r0 c67, r1 c45, r1 c67] (int32, exact)
-static inline __attribute__((always_inline)) __m128i q8_half_add(__m256i v) {
+static inline MOE_ALWAYS_INLINE __m128i q8_half_add(__m256i v) {
     return _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
 }
 
 // dd[b][t][0] = dd[b][t][1] = token t's scale of the unit's quant block b (a token pair's [d0 d0 d1 d1] is one load)
 // xc[t][0] = xc[t][1] = 128 * token t's sum of q over this unit (LV only; ST = 16, one block per unit)
 template <int K, int NT, int G, int R0, int ST, bool KP, bool LV>
-static inline __attribute__((always_inline)) void q8_group(ublk blk, const void * const * xq, int64_t koff,
+static inline MOE_ALWAYS_INLINE void q8_group(ublk blk, const void * const * xq, int64_t koff,
                                                            const float (*dd)[8][2], const int32_t (*xc)[2], __m256i Cv,
                                                            float (*acc)[AI4_TR], int8_t * Wu, int64_t gs) {
     static_assert(!LV || ST == AI4U_UK/AI4_TC, "LV corrects once per unit");
@@ -861,7 +862,7 @@ static bool unit_rows_q8(ublk blk, int k, uint32_t C, int nt, const void * const
 // AVX-512 (Zen 4/5 hosts, runtime-dispatched; the build targets Zen 3): tile rows r and r + 1 in one 512-bit decode.
 // Row r + 1 starts k bytes after row r at the same bit offset. Per row the lanes, FMA order and final sum are the
 // AVX2 path's, so the results are bit-identical to it.
-#define MOE_AI_T512 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma,f16c")))
+#define MOE_AI_T512 MOE_TARGET("avx512f,avx512bw,avx512vl,avx512dq,fma,f16c")
 
 static bool has_avx512() {
     // GGML_MOE_AI_HOST_AVX512=0 forces the AVX2 path (default 1: AVX-512 whenever the CPU has it)
@@ -928,7 +929,7 @@ MOE_AI_T512 static void unit_rows_512(ublk blk, int k, uint32_t C, int nt, const
 // vpmultishiftqb cuts the 32 16-bit states, and the level (byte sum of state * C, mod 2^32) is formed in 16-bit lanes:
 // low half = lo16(st * Cl), high half = hi16(st * Cl) + lo16(st * Ch). Same integer levels and the same per-row-pair
 // FMA order as unit_rows_512, so results are bit-identical to it (and to the AVX2 path).
-#define MOE_AI_T512V __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,fma,f16c")))
+#define MOE_AI_T512V MOE_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,fma,f16c")
 
 static bool has_vbmi() {
     // GGML_MOE_AI_HOST_VBMI=0 keeps the plain AVX-512 decode
@@ -1025,7 +1026,7 @@ MOE_AI_T512V static void unit_rows_512_vbmi(ublk blk, int k, uint32_t C, int nt,
 // vpaddd). Per quant block the pair lanes of each row are summed exactly, converted once, rs = fma(row sum, d, rs);
 // then acc = fma(fp16 scale, rs, acc) per unit: the float steps and order of unit_rows_q8_scalar, so the result is
 // bit-identical to it and to the AVX2 Q8 path (the test checks).
-#define MOE_AI_T512Q __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vnni,fma,f16c")))
+#define MOE_AI_T512Q MOE_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx512vbmi,avx512vnni,fma,f16c")
 
 static bool has_q8_vbmi() {
     static const bool on = has_vbmi() && __builtin_cpu_supports("avx512vnni");
@@ -1079,7 +1080,7 @@ static const vbmi_q8_tabs & vbmi_q8_tables() {
     return T;
 }
 
-MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_hadd(__m512i a, __m512i b) {   // [a0+a1 a2+a3 b0+b1 b2+b3]
+MOE_AI_T512Q static inline MOE_ALWAYS_INLINE __m512i q8v_hadd(__m512i a, __m512i b) {   // [a0+a1 a2+a3 b0+b1 b2+b3]
     const __m512 fa = _mm512_castsi512_ps(a), fb = _mm512_castsi512_ps(b);
     return _mm512_add_epi32(_mm512_castps_si512(_mm512_shuffle_ps(fa, fb, _MM_SHUFFLE(2, 0, 2, 0))),
                             _mm512_castps_si512(_mm512_shuffle_ps(fa, fb, _MM_SHUFFLE(3, 1, 3, 1))));
@@ -1087,7 +1088,7 @@ MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_hadd(__m51
 
 // x_g: int32 pair sums of row group g (128-bit lanes [rA s01 s23, rB s01 s23 | rA s45 s67, rB .. | rC .. , rD .. | ..])
 // -> 16 exact row sums, lane p holds row vbmi_q8_tabs::row[p]
-MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_reduce(__m512i x0, __m512i x1, __m512i x2, __m512i x3) {
+MOE_AI_T512Q static inline MOE_ALWAYS_INLINE __m512i q8v_reduce(__m512i x0, __m512i x1, __m512i x2, __m512i x3) {
     __m512i h01 = q8v_hadd(x0, x1), h23 = q8v_hadd(x2, x3);
     h01 = _mm512_add_epi32(h01, _mm512_shuffle_i32x4(h01, h01, _MM_SHUFFLE(2, 3, 0, 1)));   // lane 0 = lane 0 + lane 1, ..
     h23 = _mm512_add_epi32(h23, _mm512_shuffle_i32x4(h23, h23, _MM_SHUFFLE(2, 3, 0, 1)));
@@ -1374,7 +1375,7 @@ static void slab_rows_q8_keep(const char * w, size_t row_bytes, int k, uint32_t 
 // one 8-row group, NT tokens: per 4 K one activation broadcast, |w| x sign(q, w) (|w| <= 128, |q| <= 127: no int16
 // saturation), pair sums to int32 lanes (one lane per row)
 template <int NT>
-static inline __attribute__((always_inline)) void r8_group(const int8_t * wg, const uint16_t * sg, int64_t K, int qb,
+static inline MOE_ALWAYS_INLINE void r8_group(const int8_t * wg, const uint16_t * sg, int64_t K, int qb,
                                                            const int8_t (*q)[8192], const float * const * d, float (*o)[AI4_TR],
                                                            int r0) {
     const __m256i ones = _mm256_set1_epi16(1);

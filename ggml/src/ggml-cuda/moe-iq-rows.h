@@ -35,7 +35,12 @@ struct pm_lut {
         for (int i = 0; i < 128; ++i) {
             uint64_t w = 0;
             for (int bit = 0; bit < 8; ++bit) {
-                w |= ((ksigns_iq2xs[i] >> bit) & 1 ? 0xFFull : 0x01ull) << (8 * bit);
+                // ksigns_iq2xs[i] == i | parity(i) << 7, computed here because MSVC rejects reading a
+                // non-constexpr table inside a constexpr constructor (verified equal to the table for all 128)
+                int pc = 0;
+                for (int b = 0; b < 7; ++b) { pc += (i >> b) & 1; }
+                const int ks = i | ((pc & 1) << 7);
+                w |= ((ks >> bit) & 1 ? 0xFFull : 0x01ull) << (8 * bit);
             }
             v[i] = w;
         }
