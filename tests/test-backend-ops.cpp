@@ -19546,8 +19546,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Check that valid-math path against CPU; bitwise cases below also run with
     // GGML_CUDA_AI23_DOWN_SPW=1 to match the native accumulation order.
     for (int width : { 1, 3, 5, 8 }) {
-        test_cases.emplace_back(new test_moe_bank_mixed(GGML_TYPE_AIT4_U2,
-                GGML_TYPE_IQ4_NL, width, 2, 4, false, false, 640, 2560));
+        for (ggml_type bank : { GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 }) {
+            test_cases.emplace_back(new test_moe_bank_mixed(bank,
+                    GGML_TYPE_IQ4_NL, width, 2, 4, false, false, 640, 2560));
+        }
     }
     for (int width : { 1, 3, 5, 8 }) {
         for (bool repeated : { false, true }) {
