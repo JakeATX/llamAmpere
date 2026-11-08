@@ -4577,9 +4577,6 @@ private:
                         break;
                     }
 
-                    const int64_t t_end = ggml_time_us();
-                    const double t_save_ms = (t_end - t_start) / 1000.0;
-
                     // the drafter's memory goes to its own sidecar: context checkpoints no longer carry a
                     // plain-KV drafter (ckpt_needs_dft), and the state file holds the target only
                     if (ctx_dft) {
@@ -4608,7 +4605,7 @@ private:
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite;
-                    res->t_ms     = t_save_ms;
+                    res->t_ms     = (ggml_time_us() - t_start) / 1000.0;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:

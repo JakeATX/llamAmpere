@@ -980,7 +980,8 @@ struct exl3_gemv_args {
 
 template <int BITS, int T, bool FUSED, bool WM = false>
 static void exl3_gemv_launch_bt(const exl3_gemv_args & a, cudaStream_t stream) {
-    static int grid_max = 0;   // resident blocks on the device (per instantiation), measured once
+    static thread_local int grid_max_by_device[GGML_CUDA_MAX_DEVICES] = {};
+    int & grid_max = grid_max_by_device[ggml_cuda_get_device()];
     if (grid_max == 0) {
         int nb = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv<BITS, T, FUSED, WM>, 32 * EXL3_GEMV_NWARPS, 0));
@@ -1087,7 +1088,8 @@ static void exl3_gemv_dec_launch_bt(const exl3_gemv_args & a, cudaStream_t strea
             return;
         }
     }
-    static int grid_max = 0;   // resident blocks on the device (per instantiation), measured once
+    static thread_local int grid_max_by_device[GGML_CUDA_MAX_DEVICES] = {};
+    int & grid_max = grid_max_by_device[ggml_cuda_get_device()];
     if (grid_max == 0) {
         int nb = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, k_exl3_gemv_dec<BITS, T, WM, FR, PF2>, 32 * EXL3_GEMV_NWARPS, 0));
@@ -1297,7 +1299,8 @@ static rpb_exl3_alt exl3_gemv_alt(int T, bool fused, int bits) {
 // T = 1, not fused, not weight-major. Only instantiated for NWARPS in {2, 8}.
 template <int BITS, int NWARPS>
 static void exl3_gemv_launch_t1_nw(const exl3_gemv_args & a, cudaStream_t stream) {
-    static int grid_max = 0;
+    static thread_local int grid_max_by_device[GGML_CUDA_MAX_DEVICES] = {};
+    int & grid_max = grid_max_by_device[ggml_cuda_get_device()];
     if (grid_max == 0) {
         int nb = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -1319,7 +1322,8 @@ static void exl3_gemv_launch_t1_nw(const exl3_gemv_args & a, cudaStream_t stream
 // T is 2..8. NWARPS is 2 or 8. Grid policy matches exl3_gemv_dec_launch_bt.
 template <int BITS, int T, int NWARPS>
 static void exl3_gemv_launch_dec_nw(const exl3_gemv_args & a, cudaStream_t stream) {
-    static int grid_max = 0;
+    static thread_local int grid_max_by_device[GGML_CUDA_MAX_DEVICES] = {};
+    int & grid_max = grid_max_by_device[ggml_cuda_get_device()];
     if (grid_max == 0) {
         int nb = 0;
         CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(

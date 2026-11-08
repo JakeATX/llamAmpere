@@ -2918,6 +2918,14 @@ static size_t moe_table_prefetch_capacity(const moe_cache_device & device) {
 static bool moe_table_prefetch_reserve(moe_cache_session & session, moe_cache_device & device) {
     const int mode = moe_table_prefetch_mode();
     if (!mode) return true;
+    if (moe_mixed_hit_first()) {
+        static const bool warned = [] {
+            GGML_LOG_WARN("[moe-cache] GGML_MOE_TABLE_PREFETCH disabled: requires GGML_MOE_BANK_MIXED_HITFIRST=0\n");
+            return true;
+        }();
+        GGML_UNUSED(warned);
+        return true;
+    }
 #if defined(GGML_USE_HIP) || !defined(__linux__) || CUDART_VERSION < 11070
     GGML_UNUSED(session); GGML_UNUSED(device);
     GGML_ABORT("table prefetch requires Linux CUDA >= 11.7");
