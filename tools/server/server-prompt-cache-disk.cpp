@@ -91,7 +91,7 @@ std::string server_prompt_cache_file_identity(const std::string & path, int spli
         throw std::runtime_error("prompt cache: invalid model split count");
     }
     if (split_count > 1) {
-        std::vector<char> buf(llama_path_max(), 0);
+        std::vector<char> buf(path.size() + 1, 0);
         const int n = llama_split_prefix(buf.data(), buf.size(), path.c_str(), 0, split_count);
         if (n <= 0 || (size_t) n >= buf.size()) {
             throw std::runtime_error("prompt cache: invalid split model path: " + path);
