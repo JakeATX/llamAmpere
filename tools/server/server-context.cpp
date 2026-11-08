@@ -2567,15 +2567,21 @@ private:
         server_prompt_cache::configure(prompt_cache, cache_ram_mib, n_ctx,
                 params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO);
         std::string disk_cache_key, eval_cache_key;
-        try {
-            if (prompt_cache && params_base.cache_disk && params_base.cache_disk_mib != 0) {
+        bool disk_cache_enabled = params_base.cache_disk && params_base.cache_disk_mib != 0;
+        if (prompt_cache && disk_cache_enabled) {
+            try {
                 disk_cache_key = prompt_cache_key();
+            } catch (const std::exception & e) {
+                SRV_WRN("prompt cache disk tier disabled, running RAM-only: %s\n", e.what());
+                disk_cache_enabled = false;
             }
+        }
+        try {
             if (!params_base.eval_cache_path.empty()) {
                 eval_cache_key = prompt_cache_key(true);
             }
         } catch (const std::exception & e) {
-            SRV_ERR("cache fingerprint failed: %s\n", e.what());
+            SRV_ERR("eval cache: refusing to start: fingerprint failed: %s\n", e.what());
             return false;
         }
         if (prompt_cache) {
@@ -2586,7 +2592,7 @@ private:
                         params_base.cache_ram_ckpt);
             }
 
-            if (params_base.cache_disk && params_base.cache_disk_mib != 0) {
+            if (disk_cache_enabled) {
                 std::string dir = params_base.cache_disk_path;
                 if (dir.empty()) {
                     dir = common_prompt_cache_default_dir().string();
