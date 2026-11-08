@@ -58,6 +58,7 @@ struct ggml_cuda_qsa_clock_map {
     // LLAMA_LSA_J3 (record pages): per record, the own resolve count of the last own resolve that picked it; made by
     // the first ggml_cuda_lsa_prefetch that asks for the previous pick (nullptr before, then the own mark fills it)
     uint32_t * prev = nullptr;
+    uint32_t * j3_src = nullptr; // LLAMA_LSA_J3 log: (own resolve number << 3) | sources that marked the record for it
 };
 
 bool ggml_cuda_qsa_clock_is_buft(ggml_backend_buffer_type_t buft);

@@ -256,6 +256,9 @@ static void qsa_clock_reset(ggml_backend_buffer_t buffer) {
         if (m.prev) {
             CUDA_CHECK(cudaMemset(m.prev, 0, size_t(m.records)*sizeof(uint32_t)));
         }
+        if (m.j3_src) {
+            CUDA_CHECK(cudaMemset(m.j3_src, 0, size_t(m.records)*sizeof(uint32_t)));
+        }
         if (m.stage_ctl) {
             CUDA_CHECK(cudaMemset(m.stage_ctl, 0, 8*sizeof(uint32_t)));
         }
@@ -283,6 +286,7 @@ static void qsa_clock_free(ggml_backend_buffer_t buffer) {
             if (e->pf_done) CUDA_CHECK(cudaEventDestroy(e->pf_done));
             if (e->recall_history) CUDA_CHECK(cudaFree(e->recall_history));
             if (e->map.prev) CUDA_CHECK(cudaFree(e->map.prev));
+            if (e->map.j3_src) CUDA_CHECK(cudaFree(e->map.j3_src));
             for (int i = 0; i < GGML_LSA_PREFETCH_SOURCES; ++i) {
                 if (e->j3_units[i]) CUDA_CHECK(cudaFree(e->j3_units[i]));
                 if (e->j3_desc[i]) CUDA_CHECK(cudaFree(e->j3_desc[i]));
@@ -1310,6 +1314,13 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
         // LLAMA_LSA_J3 previous-pick source: this own resolve's number (the assign below counts it)
         m.prev[record] = uint32_t(reinterpret_cast<const unsigned long long *>(m.ctl + 8)[2]) + 1;
     }
+    const uint32_t j3_bits = m.j3_src && !pf && (m.j3_src[record] >> 3) ==
+        uint32_t(reinterpret_cast<const unsigned long long *>(m.ctl + 8)[2]) + 1 ? m.j3_src[record] & 7u : 0u;
+    if (m.j3_src && !pf) {
+        // LLAMA_LSA_J3 cascade: each picked record counted once, by the first source that marked it (ahead-3, then the
+        // ahead-1 top-up, then the previous pick), else unpredicted; the four add up to picked
+        atomicAdd(m.ctl + (j3_bits & 1u ? 19 : j3_bits & 2u ? 20 : j3_bits & 4u ? 21 : 22), 1u);
+    }
     bool admit = true;
     if (m.seen && !pf) {
         // own resolves only (prefetch resolves also advance the epoch): step n admits pages step n-1 picked
@@ -1318,6 +1329,9 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
         m.seen[record] = step;
     }
     const int slot = atomicCAS(m.table + record, -1, -2);
+    if (slot == -1 && j3_bits) {
+        atomicAdd(m.ctl + 23, 1u); // predicted, but no slot at the own resolve (dropped, evicted or never copied in)
+    }
     if (slot >= 0) {
         m.stamp[slot] = epoch;
         m.ref[slot] = 1;
@@ -1404,8 +1418,9 @@ static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit
                     m.layer, c[2], m.stage_ctl[0], m.stage_n, clock_over, over);
             }
             if (m.ctl[6]) {
-                printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu prefetched=%u pf_resolves=%u pf_hits=%u pf_dropped=%u\n",
-                    m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride, m.ctl[5], m.ctl[6], m.ctl[17], m.ctl[18]);
+                printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu prefetched=%u pf_resolves=%u pf_hits=%u pf_dropped=%u j3_a3=%u j3_a1_add=%u j3_prev_add=%u j3_unpredicted=%u j3_lost=%u\n",
+                    m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride, m.ctl[5], m.ctl[6], m.ctl[17], m.ctl[18],
+                    m.ctl[19], m.ctl[20], m.ctl[21], m.ctl[22], m.ctl[23]);
             } else if (m.seen) {
                 printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu not_admitted=%u\n",
                     m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride, m.ctl[7]);
@@ -1479,7 +1494,7 @@ static void lsa_page_prefetch(ggml_backend_cuda_context & ctx, qsa_clock_tensor 
 // here (lsa_stage_reset only clears entries that still hold its own value). Resident hits get this pass's epoch, so
 // later passes of the step keep them. Runs on the side stream, between two own resolves of the target.
 static __global__ void lsa_j3_mark(ggml_cuda_qsa_clock_map m, const int32_t * desc, const float * units, int64_t nunits,
-        int nrows, int unit, int use_prev, uint32_t limit) {
+        int nrows, int unit, int use_prev, uint32_t limit, uint32_t unit_bit) {
     const int g = blockIdx.x*blockDim.x + threadIdx.x;
     const int S = desc[GGML_SJKVARN_DESC_S], G = desc[GGML_SJKVARN_DESC_G];
     if (G != GGML_LSA_PAGE_CELLS || g >= (desc[GGML_SJKVARN_DESC_B_OLD] - S)/G) return;
@@ -1493,11 +1508,21 @@ static __global__ void lsa_j3_mark(ggml_cuda_qsa_clock_map m, const int32_t * de
     }
     const int record = desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + g] : g;
     if (record < 0 || record >= int(m.records)) return;
-    if (!live && use_prev && m.prev) {
-        const uint32_t own = uint32_t(reinterpret_cast<const unsigned long long *>(m.ctl + 8)[2]);
-        live = own != 0 && m.prev[record] == own;
+    const uint32_t own = uint32_t(reinterpret_cast<const unsigned long long *>(m.ctl + 8)[2]);
+    const bool prev_live = use_prev && m.prev && own != 0 && m.prev[record] == own;
+    if (!live && !prev_live) return;
+    if (m.j3_src) {
+        // tag the sources for the target's next own resolve (number own + 1); a stale tag is replaced
+        const uint32_t bits = (live ? unit_bit : 0u) | (prev_live ? 4u : 0u);
+        uint32_t t = m.j3_src[record];
+        for (;;) {
+            const uint32_t want = ((t >> 3) == own + 1 ? t : (own + 1) << 3) | bits;
+            if (want == t) break;
+            const uint32_t seen = atomicCAS(m.j3_src + record, t, want);
+            if (seen == t) break;
+            t = seen;
+        }
     }
-    if (!live) return;
     const uint32_t epoch = m.ctl[0] + 1;
     int cur = m.table[record];
     for (;;) {
@@ -1558,10 +1583,13 @@ void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             CUDA_CHECK(cudaEventCreateWithFlags(&lsa_pf_fork[e->device], cudaEventDisableTiming));
         }
     }
-    if (use_prev && !e->map.prev) {
-        // the own mark fills it from the next own resolve on; nothing to read yet, so this call marks no previous pick
+    if (!e->map.prev) {
+        // the own mark fills both from the next own resolve on (prev: the previous-pick source; j3_src: the cascade
+        // log), so this first call marks no previous pick
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->map.prev), size_t(e->map.records)*sizeof(uint32_t)));
         CUDA_CHECK(cudaMemsetAsync(e->map.prev, 0, size_t(e->map.records)*sizeof(uint32_t), ctx.stream()));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->map.j3_src), size_t(e->map.records)*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemsetAsync(e->map.j3_src, 0, size_t(e->map.records)*sizeof(uint32_t), ctx.stream()));
     }
     if (!units && !use_prev) return;
     if (e->j3_issued[src]) {
@@ -1584,7 +1612,7 @@ void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     CUDA_CHECK(cudaStreamWaitEvent(side, lsa_pf_fork[e->device], 0));
     const uint32_t cap = e->map.slots;
     lsa_j3_mark<<<(e->map.records + 127)/128, 128, 0, side>>>(e->map, e->j3_desc[src], units ? e->j3_units[src] : nullptr,
-        nunits, nrows, unit, use_prev, cap);
+        nunits, nrows, unit, use_prev, cap, src == 0 ? 1u : 2u); // src 0 = ahead-3, src 1 = ahead-1 top-up
     CUDA_CHECK(cudaGetLastError());
     lsa_page_assign<<<1, 1024, 0, side>>>(e->map, cap, (flags & GGML_LSA_PREFETCH_PROTECT_PREV) ? 2 : 3);
     CUDA_CHECK(cudaGetLastError());
