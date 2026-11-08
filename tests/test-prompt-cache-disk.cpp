@@ -59,41 +59,61 @@ static const uint64_t GiB = 1024ull*1024*1024;
 static const uint64_t MiB = 1024ull*1024;
 
 static void test_routing_key() {
+    const std::vector<std::string> names = {"GGML_MOE_CPU_SPLIT", "GGML_CUDA_GRAPH_OPT",
+        "GGML_CUDA_MOE_CACHE_MODE", "GGML_CUDA_MOE_CACHE",
+        "GGML_CUDA_MOE_CACHE_BUDGET_MB", "GGML_CUDA_MOE_CACHE_RESERVE_MB"};
+    std::vector<std::string> saved;
+    for (const auto & name : names) {
+        saved.push_back(common_get_env(name));
+        common_set_env(name, "");
+    }
     common_moe_cache_params params;
-    params.mode_explicit = true;
     const std::string prefix = "model=fixed;build=fixed;ctk=q8_0;ctv=q8_0;";
-    auto key = [&](const char * split, const char * graph) {
-        return prefix + server_prompt_cache_routing_key(params, split, graph);
-    };
-    const std::string base = key(nullptr, nullptr);
-    CHECK(base == prefix + "moe_cache=1,explicit=1,budget_mib=0,fit=0;GGML_MOE_CPU_SPLIT=0;GGML_CUDA_GRAPH_OPT=0;");
-    CHECK(base == key(nullptr, nullptr));
-    CHECK(base == key("0", "0"));
-    CHECK(base == key("", ""));
+    auto key = [&]() { return prefix + server_prompt_cache_routing_key(params); };
+    const std::string base = key();
+    CHECK(base == key());
+    CHECK(base.substr(0, prefix.size()) == prefix);
     for (const auto mode : {COMMON_MOE_CACHE_MODE_OFF, COMMON_MOE_CACHE_MODE_ON, COMMON_MOE_CACHE_MODE_SOFT}) {
         params.mode = mode;
-        CHECK(key(nullptr, nullptr) == prefix + "moe_cache=" + std::to_string((int) mode) +
-                ",explicit=1,budget_mib=0,fit=0;GGML_MOE_CPU_SPLIT=0;GGML_CUDA_GRAPH_OPT=0;");
-        CHECK(key(nullptr, nullptr) != base);
+        CHECK(key() != base);
     }
     params.mode = COMMON_MOE_CACHE_MODE_AUTO;
-    CHECK(key("1", nullptr) == prefix + "moe_cache=1,explicit=1,budget_mib=0,fit=0;GGML_MOE_CPU_SPLIT=1;GGML_CUDA_GRAPH_OPT=0;");
-    CHECK(key("1", nullptr) != base);
-    CHECK(key(nullptr, "1") == prefix + "moe_cache=1,explicit=1,budget_mib=0,fit=0;GGML_MOE_CPU_SPLIT=0;GGML_CUDA_GRAPH_OPT=1;");
-    CHECK(key(nullptr, "1") != base);
-    CHECK(key("01", nullptr) == base);
-    CHECK(key(nullptr, "01") == key(nullptr, "1"));
-    CHECK(key(nullptr, "2") == base);
-    params.mode_explicit = false;
-    CHECK(key(nullptr, nullptr) != base);
+    // Exercise real environment lookup, including implicit AUTO + --fit off.
+    for (size_t i = 0; i < names.size(); ++i) {
+        common_set_env(names[i], i == 2 ? "off" : i >= 4 ? "4096" : "1");
+        CHECK(key() != base);
+        CHECK(key().substr(0, prefix.size()) == prefix);
+        if (i == 2) {
+            const std::string off = key();
+            common_set_env(names[i], "on");
+            CHECK(key() != off);
+        }
+        common_set_env(names[i], "");
+        CHECK(key() == base);
+    }
+    common_set_env(names[0], "01");
+    CHECK(key() == base);
+    common_set_env(names[0], "");
+    common_set_env(names[1], "01");
+    const std::string graph = key();
+    common_set_env(names[1], "1");
+    CHECK(key() == graph && graph != base);
+    common_set_env(names[1], "2");
+    CHECK(key() == base);
+    common_set_env(names[1], "");
     params.mode_explicit = true;
+    CHECK(key() != base);
+    params.mode_explicit = false;
     params.budget_mib = 4096;
-    CHECK(key(nullptr, nullptr) != base);
+    CHECK(key() != base);
     params.budget_mib = 0;
     params.fit_selected = true;
-    CHECK(key(nullptr, nullptr) != base);
+    CHECK(key() != base);
     params.fit_selected = false;
-    CHECK(key(nullptr, nullptr) == base);
+    CHECK(key() == base);
+    for (size_t i = 0; i < names.size(); ++i) {
+        common_set_env(names[i], saved[i]);
+    }
 }
 
 static void test_split_identity(const std::string & root) {

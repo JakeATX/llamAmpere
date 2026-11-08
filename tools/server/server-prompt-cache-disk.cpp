@@ -23,16 +23,28 @@ static int pc_getpid() { return (int) getpid(); }
 namespace fs = std::filesystem;
 
 std::string server_prompt_cache_routing_key(
-        const common_moe_cache_params & params, const char * cpu_split, const char * graph_opt) {
+        const common_moe_cache_params & params) {
+    const char * cpu_split = getenv("GGML_MOE_CPU_SPLIT");
+    const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
     // Match each backend switch's parse rule; unset and disabled share a key.
     const bool split = cpu_split && strcmp(cpu_split, "1") == 0;
     const bool graph = graph_opt && atoi(graph_opt) == 1;
-    return "moe_cache=" + std::to_string((int) params.mode) +
+    std::string key = "moe_cache=" + std::to_string((int) params.mode) +
+        // Explicit AUTO overrides the provider mode; implicit AUTO inherits it.
         ",explicit=" + std::to_string(params.mode_explicit) +
         ",budget_mib=" + std::to_string(params.budget_mib) +
         ",fit=" + std::to_string(params.fit_selected) +
         ";GGML_MOE_CPU_SPLIT=" + std::to_string(split) +
         ";GGML_CUDA_GRAPH_OPT=" + std::to_string(graph) + ";";
+    // Keep provider overrides too: params alone do not resolve an implicit mode.
+    // Raw, length-prefixed values conservatively miss on equivalent spellings.
+    for (const char * name : {"GGML_CUDA_MOE_CACHE_MODE", "GGML_CUDA_MOE_CACHE",
+            "GGML_CUDA_MOE_CACHE_BUDGET_MB", "GGML_CUDA_MOE_CACHE_RESERVE_MB"}) {
+        const char * value = getenv(name);
+        const std::string text = value ? value : "";
+        key += std::string(name) + "=" + std::to_string(text.size()) + ":" + text + ";";
+    }
+    return key;
 }
 
 static const char     PC_MAGIC[4] = {'L', 'C', 'P', 'C'};
