@@ -58,6 +58,46 @@ static int n_pass = 0;
 static const uint64_t GiB = 1024ull*1024*1024;
 static const uint64_t MiB = 1024ull*1024;
 
+static void test_split_identity(const std::string & root) {
+    const std::string first = root + "/model-00001-of-00002.gguf";
+    const std::string second = root + "/model-00002-of-00002.gguf";
+    const std::string payload(2*MiB, 'x');
+    for (const auto & path : {first, second}) {
+        std::ofstream f(path, std::ios::binary);
+        f.write(payload.data(), payload.size());
+        CHECK(f.good());
+    }
+    const std::string key = server_prompt_cache_file_identity(first, 2);
+    CHECK(key == server_prompt_cache_file_identity(first, 2));
+    CHECK(key != server_prompt_cache_file_identity(first));
+    for (const uint64_t off : {uint64_t(0), 2*MiB - 1}) {
+        const std::string first_key = server_prompt_cache_file_identity(first);
+        const std::string prior = server_prompt_cache_file_identity(first, 2);
+        std::fstream f(second, std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(off);
+        f.put('y');
+        f.close();
+        CHECK(fs::file_size(second) == payload.size());
+        CHECK(first_key == server_prompt_cache_file_identity(first));
+        CHECK(prior != server_prompt_cache_file_identity(first, 2));
+    }
+    fs::remove(second);
+    bool rejected = false;
+    try {
+        server_prompt_cache_file_identity(first, 2);
+    } catch (const std::exception &) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    rejected = false;
+    try {
+        server_prompt_cache_file_identity(first, 3);
+    } catch (const std::exception &) {
+        rejected = true;
+    }
+    CHECK(rejected);
+}
+
 static void test_ram_tiers() {
     std::string why;
 
@@ -1050,6 +1090,7 @@ int main() {
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
 
+    test_split_identity(root);
     test_ram_tiers();
     test_dir_creation(root);
     test_roundtrip_and_key(root);

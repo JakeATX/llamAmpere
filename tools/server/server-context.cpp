@@ -1837,43 +1837,6 @@ private:
         stall_thread.join();
     }
 
-    // identity of a model file: size plus a hash of its first and last MiB and 16 evenly spaced 64 KiB samples
-    static std::string prompt_cache_file_identity(const std::string & path) {
-        if (path.empty()) {
-            return "none";
-        }
-
-        std::error_code ec;
-        const uint64_t fsize = std::filesystem::file_size(path, ec);
-        if (ec) {
-            return "unreadable:" + path;
-        }
-
-        std::ifstream f(path, std::ios::binary);
-        uint64_t h = server_prompt_disk_hash(&fsize, sizeof(fsize));
-
-        auto sample = [&](uint64_t off, uint64_t len) {
-            if (off >= fsize) {
-                return;
-            }
-            len = std::min(len, fsize - off);
-            std::vector<char> buf(len);
-            f.clear();
-            f.seekg((std::streamoff) off);
-            f.read(buf.data(), (std::streamsize) len);
-            h = server_prompt_disk_hash(buf.data(), (size_t) f.gcount(), h);
-        };
-
-        const uint64_t MiB = 1024*1024;
-        sample(0, MiB);
-        for (int i = 1; i <= 16; ++i) {
-            sample(fsize / 17 * i, 64*1024);
-        }
-        sample(fsize > MiB ? fsize - MiB : 0, MiB);
-
-        return string_format("%" PRIu64 ":%016" PRIx64, fsize, h);
-    }
-
     // everything that decides whether a serialized slot state can be restored into this server: the model
     // (and drafter) weights, the KV / recurrent-state layout of the trunk and the drafter, and the knobs that
     // change what the stored values mean. A disk entry with any other key is never restored.
@@ -1912,21 +1875,26 @@ private:
             add("build", string_format("%d-%s", llama_build_number(), llama_commit()));
         }
 
+        auto model_identity = [](const std::string & path, const llama_model * model) {
+            char count[16] = {0};
+            const int n = llama_model_meta_val_str(model, "split.count", count, sizeof(count));
+            return server_prompt_cache_file_identity(path, n < 0 ? 1 : std::max(1, std::stoi(count)));
+        };
         {
             char desc[256] = {0};
             llama_model_desc(model_tgt, desc, sizeof(desc));
-            add("model", prompt_cache_file_identity(params_base.model.path));
+            add("model", model_identity(params_base.model.path, model_tgt));
             add("model_desc", string_format("%s,n_params=%" PRIu64 ",size=%" PRIu64, desc,
                     llama_model_n_params(model_tgt), llama_model_size(model_tgt)));
         }
         if (model_dft) {
-            add("draft_model", prompt_cache_file_identity(params_base.speculative.draft.mparams.path));
+            add("draft_model", model_identity(params_base.speculative.draft.mparams.path, model_dft));
         }
         for (const auto & la : params_base.lora_adapters) {
-            add("lora", prompt_cache_file_identity(la.path) + string_format("@%g", la.scale));
+            add("lora", server_prompt_cache_file_identity(la.path) + string_format("@%g", la.scale));
         }
         for (const auto & cv : params_base.control_vectors) {
-            add("cvec", prompt_cache_file_identity(cv.fname) + string_format("@%g", cv.strength));
+            add("cvec", server_prompt_cache_file_identity(cv.fname) + string_format("@%g", cv.strength));
         }
 
         add_kv("", params_base);
@@ -2598,6 +2566,18 @@ private:
         // it when RAM fit disables this optional cache.
         server_prompt_cache::configure(prompt_cache, cache_ram_mib, n_ctx,
                 params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO);
+        std::string disk_cache_key, eval_cache_key;
+        try {
+            if (prompt_cache && params_base.cache_disk && params_base.cache_disk_mib != 0) {
+                disk_cache_key = prompt_cache_key();
+            }
+            if (!params_base.eval_cache_path.empty()) {
+                eval_cache_key = prompt_cache_key(true);
+            }
+        } catch (const std::exception & e) {
+            SRV_ERR("cache fingerprint failed: %s\n", e.what());
+            return false;
+        }
         if (prompt_cache) {
 
             prompt_cache->ram_ckpt_keep = (size_t) params_base.cache_ram_ckpt;
@@ -2623,7 +2603,7 @@ private:
                 }
 
                 std::string err;
-                if (dir.empty() || !prompt_cache->disk_open(dir, prompt_cache_key(), limit, err)) {
+                if (dir.empty() || !prompt_cache->disk_open(dir, disk_cache_key, limit, err)) {
                     SRV_WRN("prompt cache disk tier disabled, running RAM-only: %s\n",
                             dir.empty() ? "no cache directory could be determined" : err.c_str());
                 }
@@ -2643,7 +2623,7 @@ private:
                 common_host_memory(total_ram, available_ram);
             }
             const uint64_t index_budget = common_fit_eval_cache_ram_bytes(available_ram, params_base.fit_params);
-            if (!eval_cache->open(params_base.eval_cache_path, prompt_cache_key(true), params_base.eval_cache_build, err, index_budget)) {
+            if (!eval_cache->open(params_base.eval_cache_path, eval_cache_key, params_base.eval_cache_build, err, index_budget)) {
                 SRV_ERR("eval cache: refusing to start: %s\n", err.c_str());
                 eval_cache.reset();
                 return false;
