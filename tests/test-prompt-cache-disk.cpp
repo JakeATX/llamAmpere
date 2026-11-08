@@ -59,6 +59,9 @@ static const uint64_t GiB = 1024ull*1024*1024;
 static const uint64_t MiB = 1024ull*1024;
 
 static void test_routing_key() {
+    const std::string mixed_name = "gGmL_pRoMpT_CaChE_tEsT_mIxEd";
+    const std::string mixed_saved = common_get_env(mixed_name);
+    common_set_env(mixed_name, "");
     const std::vector<std::string> names = {"GGML_MOE_CPU_SPLIT", "GGML_CUDA_GRAPH_OPT",
         "GGML_CUDA_MOE_CACHE_MODE", "GGML_CUDA_MOE_CACHE",
         "GGML_CUDA_MOE_CACHE_BUDGET_MB", "GGML_CUDA_MOE_CACHE_RESERVE_MB",
@@ -112,6 +115,23 @@ static void test_routing_key() {
     common_set_env(names[6], "");
     common_set_env(names[7], "");
     CHECK(key() == base);
+    common_set_env(mixed_name, "0");
+    const std::string mixed_off = key();
+    common_set_env(mixed_name, "1");
+    const std::string mixed_on = key();
+#ifdef _WIN32
+    CHECK(common_get_env("GGML_PROMPT_CACHE_TEST_MIXED") == "1");
+    CHECK(mixed_off != base);
+    CHECK(mixed_on != mixed_off);
+    common_set_env(mixed_name, "");
+    common_set_env("GGML_PROMPT_CACHE_TEST_MIXED", "1");
+    CHECK(key() == mixed_on);
+#else
+    CHECK(mixed_off == base);
+    CHECK(mixed_on == base);
+#endif
+    common_set_env(mixed_name, "");
+    CHECK(key() == base);
     params.mode_explicit = true;
     CHECK(key() != base);
     params.mode_explicit = false;
@@ -125,6 +145,7 @@ static void test_routing_key() {
     for (size_t i = 0; i < names.size(); ++i) {
         common_set_env(names[i], saved[i]);
     }
+    common_set_env(mixed_name, mixed_saved);
 }
 
 static void test_split_identity(const std::string & root) {

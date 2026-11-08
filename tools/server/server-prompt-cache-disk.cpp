@@ -39,8 +39,20 @@ std::string server_prompt_cache_routing_key(
     std::vector<std::pair<std::string, std::string>> env;
     auto append = [&](const std::string & entry) {
         const size_t end = entry.find('=');
-        if (entry.compare(0, 5, "GGML_") == 0 && end != std::string::npos) {
-            env.emplace_back(entry.substr(0, end), entry.substr(end + 1));
+        if (end == std::string::npos) {
+            return;
+        }
+        std::string name = entry.substr(0, end);
+#ifdef _WIN32
+        // Windows backend lookups ignore the case of environment names.
+        for (char & c : name) {
+            if (c >= 'a' && c <= 'z') {
+                c = c - 'a' + 'A';
+            }
+        }
+#endif
+        if (name.compare(0, 5, "GGML_") == 0) {
+            env.emplace_back(std::move(name), entry.substr(end + 1));
         }
     };
 #ifdef _WIN32
