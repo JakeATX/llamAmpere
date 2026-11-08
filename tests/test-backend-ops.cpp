@@ -19543,18 +19543,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // Default mixed downs split K while native downs use one warp per row.
-    // Check that valid-math path against CPU; bitwise cases below also run with
-    // GGML_CUDA_AI23_DOWN_SPW=1 to match the native accumulation order.
+    // Check that valid-math path against CPU; bitwise cases require the native accumulation order.
     for (int width : { 1, 3, 5, 8 }) {
         for (ggml_type bank : { GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 }) {
             test_cases.emplace_back(new test_moe_bank_mixed(bank,
                     GGML_TYPE_IQ4_NL, width, 2, 4, false, false, 640, 2560));
         }
     }
-    for (int width : { 1, 3, 5, 8 }) {
-        for (bool repeated : { false, true }) {
-            test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT4_U2, width,
-                    GGML_TYPE_IQ4_NL, 2, 4, 640, 2560, repeated));
+    const char * down_spw = getenv("GGML_CUDA_AI23_DOWN_SPW");
+    if (down_spw && atoi(down_spw) != 0) {
+        // Width 1 uses a four-warp cold reference; the mixed cold path uses one warp.
+        for (int width : { 3, 5, 8 }) {
+            for (bool repeated : { false, true }) {
+                test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT4_U2, width,
+                        GGML_TYPE_IQ4_NL, 2, 4, 640, 2560, repeated));
+            }
         }
     }
     // Production top-k10 crosses ballot chunks at both 32 and 64 routes.
