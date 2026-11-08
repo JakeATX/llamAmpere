@@ -4432,6 +4432,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LSA_UNIT_LSE:
             ggml_cuda_lsa_unit_lse(ctx, dst);
             break;
+        case GGML_OP_LSA_PREFETCH:
+            ggml_cuda_lsa_prefetch(ctx, dst); // no-op unless the body has record-page slots
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -5641,6 +5644,9 @@ static bool ggml_cuda_graph_check_compability_fast(ggml_cgraph * cgraph) {
                 ggml_cuda_flash_attn_ext_bounded_prefill_applies(device, node)) {
             return false;
         }
+        if (node->op == GGML_OP_LSA_PREFETCH) {
+            return false; // same rule as the plain check
+        }
     }
     return true;
 }
@@ -5740,6 +5746,11 @@ static bool ggml_cuda_graph_check_compability_plain(ggml_cgraph * cgraph) {
         // [#22/#29] bounded f16 prefill runs a group loop with pool/reserved scratch and asserts it is not captured:
         // a graph holding such a node always runs eagerly. With GGML_CUDA_PREFILL_KV_MIB=0/off the check returns at once.
         if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_flash_attn_ext_bounded_prefill_applies(ggml_cuda_get_device(), node)) {
+            use_cuda_graph = false;
+        }
+
+        // LLAMA_LSA_J3: the prefetch forks a side stream and decides on the host per call (scratch growth, pending joins)
+        if (node->op == GGML_OP_LSA_PREFETCH) {
             use_cuda_graph = false;
         }
 
@@ -13774,6 +13785,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lsa_comp_merge_supported(op);
         case GGML_OP_LSA_UNIT_LSE:
             return ggml_cuda_lsa_unit_lse_supported(op);
+        case GGML_OP_LSA_PREFETCH:
+            return true;
         case GGML_OP_FLASH_ATTN_EXT:
             // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN). Only the generic MMA f16 route reads it:
             // refuse it with TurboQuant/TQ K/V, SJ-KVaRN (src[6]), QSA selected rows (src[8]) and kv-stream K/V buffers.

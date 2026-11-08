@@ -149,6 +149,17 @@ struct llama_lsa_config {
                                     // probability (all q heads) that falls on the kept cells, logged at WARN every 256 steps
     bool        stats     = false;  // LLAMA_LSA_STATS: log the mean kept share per layer (WARN, every 256 steps; syncs)
     bool        spec_recall = false; // LLAMA_LSA_SPEC_RECALL: diagnostic only; queries one to three layers ahead
+    // LLAMA_LSA_J3=1 (opt-in, needs LLAMA_LSA_RESIDENT record pages): look-ahead prefetch into the slots of later LSA
+    // layers on a side copy stream. Never changes what attention reads (a record without a slot comes from the master).
+    // Sources, each its own switch: _A3=<pct> stale query three mapped layers ahead (pct of the target's pick budget,
+    // 100/110/125/150, default 150, 0 off); _A1=<pct> one layer ahead, top-up of what is not already resident (default
+    // 150, 0 off); _PREV=0/1 the target's previous-step pick (default 1, also keeps those slots from prefetch eviction).
+    // _FIRST=N: the first N mapped layers keep the whole body on the card (default 3; no earlier layer to predict them).
+    bool        j3        = false;
+    int         j3_a3     = 150;
+    int         j3_a1     = 150;
+    bool        j3_prev   = true;
+    int         j3_first  = 3;
     std::string layers;             // LLAMA_LSA_LAYERS: comma list of layer ids to sparsify (default: all mapped)
     std::string keep_frac_layers;   // LLAMA_LSA_KEEP_FRAC_LAYERS: "il:frac,il:frac" per-layer override of keep_frac
                                     // (frac of n_kv; 1 or more = that layer stays dense)

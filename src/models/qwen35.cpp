@@ -5,6 +5,7 @@
 #include "llama-memory-recurrent.h"
 #include "llama-mtp-chain-sample.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <vector>
@@ -209,6 +210,49 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
                 lsa.slice == 0 && lsa.window >= 8192 && lsa.sinks >= 128 && (!lsa.shared || lsa.shared_union));
     }
 
+    // Query of LSA layer `target` from an earlier layer's residual: its norm, projection, q-norm and rope.
+    auto stale_query = [&](ggml_tensor * resid, int target) -> ggml_tensor * {
+        const auto & layer = model.layers[target];
+        GGML_ASSERT(layer.wq && !layer.wqkv); // Swift's separate joint query/gate projection
+        ggml_tensor * sq = build_norm(resid, layer.attn_norm, nullptr, LLM_NORM_RMS, target);
+        sq = build_lora_mm(layer.wq, sq, layer.wq_s);
+        if (layer.wq_b) {
+            sq = ggml_add(ctx0, sq, layer.wq_b);
+        }
+        sq = ggml_view_3d(ctx0, sq, n_embd_head, n_head, n_tokens,
+                ggml_element_size(sq)*n_embd_head*2, ggml_element_size(sq)*n_embd_head*2*n_head, 0);
+        sq = build_norm(sq, layer.attn_q_norm, nullptr, LLM_NORM_RMS, target);
+        return ggml_rope_multi(ctx0, sq, inp_pos, nullptr, n_rot, sections, rope_type, n_ctx_orig,
+                freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    };
+
+    // LLAMA_LSA_J3 (opt-in): at mapped LSA layer i, prefetch into the slots of mapped layer i+1 (top-up) and i+3
+    // (look-ahead, with the target's previous-step pick) on the side stream; mapped layers before j3_first keep the
+    // whole body on the card. Decode-sized single-sequence ubatches with the record pick the stale query predicts.
+    std::vector<int> j3_mapped;
+    if (lsa.j3 && lsa.mode != llama_lsa_config::OFF && n_tokens <= 8 && ubatch.n_seqs_unq == 1) {
+        const bool j3_cfg = lsa.mode == llama_lsa_config::KEY && lsa.idx_cache && !lsa.per_head &&
+                lsa.block == 128 && (lsa.refine == 128 || lsa.refine == 16) && lsa.fused_sel && !lsa.unit_op && !lsa.rec_blk &&
+                !lsa.block_sum && !lsa.fast && lsa.topp <= 0.0 && lsa.pick_every == 1 && !lsa.pick_check &&
+                !lsa.blk_list && !lsa.vk && !lsa.sj_compact && lsa.resident_sticky == 0.0 && lsa.slice == 0 &&
+                (!lsa.shared || lsa.shared_union);
+        if (j3_cfg) {
+            for (int jl = 0; jl < n_layer; ++jl) {
+                if (!hparams.is_recr(jl) && lsa.layer_enabled(jl) && llama_lsa_map_has_layer(jl)) {
+                    j3_mapped.push_back(jl);
+                }
+            }
+        } else {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: LLAMA_LSA_J3 needs the key-mode fused record pick (BLOCK 128, REFINE 16/128, FUSED_SEL, "
+                        "IDX_CACHE, SHARED 0/3, no PER_HEAD/UNIT_OP/BLOCK_SUM/PICK_EVERY/VK/SJ_COMPACT/STICKY/SLICE): J3 off\n", __func__);
+            }
+        }
+    }
+    auto * j3_inp = j3_mapped.empty() ? nullptr : inp->get_attn();
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -231,21 +275,30 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
                 do { ++next; } while (next < n_layer && (hparams.is_recr(next) ||
                         !lsa.layer_enabled(next) || !llama_lsa_map_has_layer(next)));
                 if (next == n_layer) { break; }
-                const auto & layer = model.layers[next];
-                GGML_ASSERT(layer.wq && !layer.wqkv); // Swift's separate joint query/gate projection
-                ggml_tensor * sq = build_norm(inpL, layer.attn_norm, nullptr, LLM_NORM_RMS, next);
-                sq = build_lora_mm(layer.wq, sq, layer.wq_s);
-                if (layer.wq_b) {
-                    sq = ggml_add(ctx0, sq, layer.wq_b);
-                }
-                sq = ggml_view_3d(ctx0, sq, n_embd_head, n_head, n_tokens,
-                        ggml_element_size(sq)*n_embd_head*2, ggml_element_size(sq)*n_embd_head*2*n_head, 0);
-                sq = build_norm(sq, layer.attn_q_norm, nullptr, LLM_NORM_RMS, next);
-                sq = ggml_rope_multi(ctx0, sq, inp_pos, nullptr, n_rot, sections, rope_type, n_ctx_orig,
-                        freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                ggml_tensor * sq = stale_query(inpL, next);
                 (ahead == 1 ? spec_q1 : ahead == 2 ? spec_q2 : spec_q3)[next] = sq;
                 cb(sq, ahead == 1 ? "lsa_spec_q" : ahead == 2 ? "lsa_spec_q2" : "lsa_spec_q3", next);
                 ggml_build_forward_expand(gf, sq); // capture before this source layer runs
+            }
+        }
+
+        if (j3_inp) {
+            const auto it = std::find(j3_mapped.begin(), j3_mapped.end(), il);
+            if (it != j3_mapped.end()) {
+                const int i = (int) (it - j3_mapped.begin()), first = lsa.j3_first, n_map = (int) j3_mapped.size();
+                const int protect = lsa.j3_prev ? GGML_LSA_PREFETCH_PROTECT_PREV : 0;
+                // nearest target first: the side stream runs the passes in issue order
+                if (i + 1 < n_map && i + 1 >= first) {
+                    const int t = j3_mapped[i + 1];
+                    const bool prev_here = lsa.j3_prev && i + 1 < 3; // no ahead-3 source for this target
+                    build_attn_lsa_j3(j3_inp, lsa.j3_a1 > 0 ? stale_query(inpL, t) : nullptr, t, lsa.j3_a1,
+                            protect | (prev_here ? GGML_LSA_PREFETCH_PREV : 0), 1);
+                }
+                if (i + 3 < n_map && i + 3 >= first) {
+                    const int t = j3_mapped[i + 3];
+                    build_attn_lsa_j3(j3_inp, lsa.j3_a3 > 0 ? stale_query(inpL, t) : nullptr, t, lsa.j3_a3,
+                            protect | (lsa.j3_prev ? GGML_LSA_PREFETCH_PREV : 0), 0);
+                }
             }
         }
 

@@ -1750,6 +1750,23 @@ struct llm_graph_context {
             ggml_tensor * k,
                     int   il) const;
 
+    // LLAMA_LSA_J3: side-stream slot prefetch for LSA layer il, built at an earlier (source) layer so it runs there in
+    // graph order. sq: [d_head, n_head, T] query of layer il computed from the source layer's residual (or nullptr: the
+    // previous-pick source only); pct: pick budget in percent; flags: GGML_LSA_PREFETCH_PREV/_PROTECT_PREV; src: scratch.
+    void build_attn_lsa_j3(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * sq,
+                    int   il,
+                    int   pct,
+                    int   flags,
+                    int   src) const;
+    // the [n_kv/F, T] 0/1 unit prediction of layer il's record pick from sq (nullptr: layer il would not pick)
+    ggml_tensor * build_attn_lsa_j3_units(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * sq,
+                    int   il,
+                    int   pct) const;
+
     // LSA fast path (LLAMA_LSA_FAST=1): S = [n_kv, T] index scores; gathers the kept cells into *k / *v and returns
     // their mask, or nullptr when the layer stays dense
     ggml_tensor * build_attn_lsa_fast(

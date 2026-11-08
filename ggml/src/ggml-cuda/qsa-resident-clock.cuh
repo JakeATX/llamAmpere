@@ -55,6 +55,9 @@ struct ggml_cuda_qsa_clock_map {
     const char * strip_master = nullptr; // opt-in source only; CLOCK slots stay canonical
     size_t strip_master_capacity = 0;
     uint32_t strip_master_bits = 0; // K width << 8 | V width
+    // LLAMA_LSA_J3 (record pages): per record, the own resolve count of the last own resolve that picked it; made by
+    // the first ggml_cuda_lsa_prefetch that asks for the previous pick (nullptr before, then the own mark fills it)
+    uint32_t * prev = nullptr;
 };
 
 bool ggml_cuda_qsa_clock_is_buft(ggml_backend_buffer_type_t buft);
@@ -80,6 +83,10 @@ bool ggml_cuda_qsa_strip_body(const ggml_tensor * body);
 ggml_backend_buffer_type_t ggml_backend_cuda_qsa_page_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots, uint32_t heads);
 const char * ggml_cuda_lsa_page_body(const ggml_tensor * body); // tagged map for a page body, else body->data
 void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+// GGML_OP_LSA_PREFETCH (LLAMA_LSA_J3): mark the target body's predicted (and/or previously picked) records, give them
+// CLOCK slots and copy them in on the low-priority side stream; the target's next prepare/refresh joins it. No-op for a
+// body without record-page slots.
+void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // LLAMA_LSA_RESIDENT_STICKY: card record -> slot table of a page body (slot >= 0 = on the card), nullptr if the body
 // has no record-page map; *records = table length
 const int32_t * ggml_cuda_lsa_page_table(const ggml_tensor * body, uint32_t * records);

@@ -1364,6 +1364,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LSA_BLOCK_SELECT",
     "LSA_COMP_MERGE",
     "LSA_UNIT_LSE",
+    "LSA_PREFETCH",
 
     "UNARY",
 
@@ -1487,6 +1488,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "lsa_block_select(s, cell_pos, q_pos)",
     "lsa_comp_merge(o, lse, q, kmean, vmean, nd)",
     "lsa_unit_lse(k, q, mask)",
+    "lsa_prefetch(desc, body, units)",
 
     "unary(x)",
 
@@ -6130,6 +6132,38 @@ struct ggml_tensor * ggml_lsa_unit_lse(
     result->src[0] = k;
     result->src[1] = q;
     result->src[2] = mask;
+
+    return result;
+}
+
+// ggml_lsa_prefetch
+
+struct ggml_tensor * ggml_lsa_prefetch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * desc,
+        struct ggml_tensor  * body,
+        struct ggml_tensor  * units,
+        int                   unit,
+        int                   flags,
+        int                   src) {
+    GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_is_contiguous(desc));
+    GGML_ASSERT(src >= 0 && src < GGML_LSA_PREFETCH_SOURCES);
+    GGML_ASSERT((flags & ~(GGML_LSA_PREFETCH_UNITS | GGML_LSA_PREFETCH_PREV | GGML_LSA_PREFETCH_PROTECT_PREV)) == 0);
+    GGML_ASSERT(((flags & GGML_LSA_PREFETCH_UNITS) != 0) == (units != NULL));
+    if (units) {
+        GGML_ASSERT(units->type == GGML_TYPE_F32 && ggml_is_contiguous(units) && units->ne[2] == 1 && units->ne[3] == 1);
+        GGML_ASSERT(unit >= 1 && unit <= 128 && (unit & (unit - 1)) == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    int32_t params[3] = { unit, flags, src };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_LSA_PREFETCH;
+    result->src[0] = desc;
+    result->src[1] = body;
+    result->src[2] = units;
 
     return result;
 }

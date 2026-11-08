@@ -15,6 +15,11 @@
 #include <string>
 #include <vector>
 
+// ctl words per map: 0 epoch, 1 hand, 2 queued misses, 3 picked, 4 assigned, 5 prefetched, 6 prefetch resolves,
+// 7 not admitted, 8..15 u64 own counters (fetched, picked, resolves, over), 16 epoch of the last own resolve,
+// 17 J3 marks already resident, 18 J3 marks with no slot (cap or every slot protected)
+constexpr int QSA_CLOCK_CTL_WORDS = 24;
+
 struct qsa_clock_type {
     ggml_backend_buffer_type buft;
     size_t stride;
@@ -45,6 +50,13 @@ struct qsa_clock_tensor {
     bool pf_pending = false;
     uint32_t * recall_history = nullptr; // diagnostic only: previous visible end, resolve, then strip bits per page
     size_t recall_pages = 0;
+    // LLAMA_LSA_J3 (GGML_OP_LSA_PREFETCH): per source, the prediction and descriptor copied on the main stream (graph
+    // memory is reused once the op is done) and read by the side stream's mark; issued = copied, not yet joined
+    float * j3_units[GGML_LSA_PREFETCH_SOURCES] = {};
+    size_t j3_units_cap[GGML_LSA_PREFETCH_SOURCES] = {};
+    int32_t * j3_desc[GGML_LSA_PREFETCH_SOURCES] = {};
+    size_t j3_desc_cap[GGML_LSA_PREFETCH_SOURCES] = {};
+    bool j3_issued[GGML_LSA_PREFETCH_SOURCES] = {};
 };
 
 // GGML_CUDA_LSA_PREFETCH=<records> (0/unset = off): most records one layer's pick may prefetch into the next LSA
@@ -109,6 +121,14 @@ static bool lsa_copy_wide() {
     }();
     return on;
 }
+// GGML_CUDA_LSA_J3_COPY_BLOCKS: blocks per KV head of the J3 side-stream record copy (default 16, as the old prefetch)
+static uint32_t lsa_j3_copy_blocks() {
+    static const uint32_t n = [] {
+        const char * v = getenv("GGML_CUDA_LSA_J3_COPY_BLOCKS");
+        return v && atoi(v) > 0 ? uint32_t(std::min(atoi(v), 1024)) : 16u;
+    }();
+    return n;
+}
 static bool lsa_stage_strips() {
     static const bool on = [] {
         const char * v = getenv("GGML_CUDA_LSA_RESIDENT_STAGE_STRIPS");
@@ -136,6 +156,7 @@ static void lsa_pf_join(cudaStream_t stream, qsa_clock_tensor * e) {
     if (e && e->pf_pending) {
         CUDA_CHECK(cudaStreamWaitEvent(stream, e->pf_done, 0));
         e->pf_pending = false;
+        for (bool & issued : e->j3_issued) issued = false; // the side stream has read every J3 scratch copy
     }
 }
 
@@ -169,7 +190,7 @@ static size_t qsa_clock_layout(ggml_cuda_qsa_clock_map & m, ggml_cuda_qsa_clock_
     char * ref = take(m.slots*sizeof(int32_t));
     char * miss_page = take(m.slots*sizeof(int32_t));
     char * miss_slot = take(m.slots*sizeof(int32_t));
-    char * ctl = take(16*sizeof(uint32_t));
+    char * ctl = take(QSA_CLOCK_CTL_WORDS*sizeof(uint32_t));
     char * seen = take(m.cells == GGML_LSA_PAGE_CELLS && lsa_admit_filter() ? size_t(m.records)*sizeof(uint32_t) : 0);
     char * stage_page = take(size_t(m.stage_n)*sizeof(int32_t));
     char * stage_ctl = take(m.stage_n ? 8*sizeof(uint32_t) : 0);
@@ -228,9 +249,12 @@ static void qsa_clock_reset(ggml_backend_buffer_t buffer) {
         CUDA_CHECK(cudaMemset(m.table, 0xff, size_t(m.records)*(m.group/m.cells)*sizeof(int32_t)));
         CUDA_CHECK(cudaMemset(m.stamp, 0, m.slots*sizeof(uint32_t)));
         CUDA_CHECK(cudaMemset(m.ref, 0, m.slots*sizeof(int32_t)));
-        CUDA_CHECK(cudaMemset(m.ctl, 0, 16*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(m.ctl, 0, QSA_CLOCK_CTL_WORDS*sizeof(uint32_t)));
         if (m.seen) {
             CUDA_CHECK(cudaMemset(m.seen, 0, size_t(m.records)*sizeof(uint32_t)));
+        }
+        if (m.prev) {
+            CUDA_CHECK(cudaMemset(m.prev, 0, size_t(m.records)*sizeof(uint32_t)));
         }
         if (m.stage_ctl) {
             CUDA_CHECK(cudaMemset(m.stage_ctl, 0, 8*sizeof(uint32_t)));
@@ -258,6 +282,11 @@ static void qsa_clock_free(ggml_backend_buffer_t buffer) {
             lsa_pf_entries.erase(std::remove(lsa_pf_entries.begin(), lsa_pf_entries.end(), e.get()), lsa_pf_entries.end());
             if (e->pf_done) CUDA_CHECK(cudaEventDestroy(e->pf_done));
             if (e->recall_history) CUDA_CHECK(cudaFree(e->recall_history));
+            if (e->map.prev) CUDA_CHECK(cudaFree(e->map.prev));
+            for (int i = 0; i < GGML_LSA_PREFETCH_SOURCES; ++i) {
+                if (e->j3_units[i]) CUDA_CHECK(cudaFree(e->j3_units[i]));
+                if (e->j3_desc[i]) CUDA_CHECK(cudaFree(e->j3_desc[i]));
+            }
         }
     }
     for (const auto & e : b->tensors) {
@@ -428,7 +457,7 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
     CUDA_CHECK(cudaMemset(m.table, 0xff, size_t(m.records)*(m.group/m.cells)*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(m.stamp, 0, m.slots*sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(m.ref, 0, m.slots*sizeof(int32_t)));
-    CUDA_CHECK(cudaMemset(m.ctl, 0, 16*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(m.ctl, 0, QSA_CLOCK_CTL_WORDS*sizeof(uint32_t)));
     if (m.seen) {
         CUDA_CHECK(cudaMemset(m.seen, 0, size_t(m.records)*sizeof(uint32_t)));
     }
@@ -700,7 +729,7 @@ size_t ggml_backend_cuda_qsa_clock_device_bytes(ggml_backend_buffer_type_t buft,
     }
     return pages*(t->heads*qsa_page_head_bytes(m) + 5*sizeof(int32_t)) +
         records*(t->heads*qsa_meta_head_bytes(m) + (t->group/t->cells)*sizeof(int32_t)) +
-        16*sizeof(uint32_t) + sizeof(ggml_cuda_qsa_clock_map);
+        QSA_CLOCK_CTL_WORDS*sizeof(uint32_t) + sizeof(ggml_cuda_qsa_clock_map);
 }
 
 size_t ggml_backend_cuda_qsa_clock_shared_bytes(ggml_backend_buffer_type_t buft, const ggml_context * ctx) {
@@ -973,6 +1002,7 @@ static void qsa_clock_written_range(ggml_backend_buffer_t buffer, qsa_clock_tens
     if (e->pf_pending) {
         CUDA_CHECK(cudaEventSynchronize(e->pf_done));
         e->pf_pending = false;
+        for (bool & issued : e->j3_issued) issued = false;
     }
     GGML_ASSERT(e->map.stride && size_t(e->map.records) <= SIZE_MAX/e->map.stride);
     const size_t bytes = size_t(e->map.records)*e->map.stride;
@@ -1276,6 +1306,10 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
     if (!live) return;
     const uint32_t epoch = m.ctl[0] + 1; // epochs start at 1 (stamps reset to 0); 2^32 resolves never wrap in practice
     if (!pf) atomicAdd(m.ctl + 3, 1u);
+    if (m.prev && !pf) {
+        // LLAMA_LSA_J3 previous-pick source: this own resolve's number (the assign below counts it)
+        m.prev[record] = uint32_t(reinterpret_cast<const unsigned long long *>(m.ctl + 8)[2]) + 1;
+    }
     bool admit = true;
     if (m.seen && !pf) {
         // own resolves only (prefetch resolves also advance the epoch): step n admits pages step n-1 picked
@@ -1302,20 +1336,25 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
     }
 }
 
+// pf: 0 own resolve, 1 GGML_CUDA_LSA_PREFETCH, 2/3 LLAMA_LSA_J3 (2: the previous own pick's slots are protected too).
+// A J3 prefetch never evicts a slot stamped after the target's last own resolve (an earlier source of the same step
+// put or found it there), so the sources of one step add up instead of evicting each other.
 static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit, int pf, bool stage_all = false) {
-    __shared__ uint32_t epoch, assigned, hand, nmiss;
+    __shared__ uint32_t epoch, assigned, hand, nmiss, keep_from;
     if (threadIdx.x == 0) {
         epoch = m.ctl[0] + 1;
         assigned = 0;
         hand = m.ctl[1];
         nmiss = min(m.ctl[2], limit);
+        keep_from = pf == 2 ? m.ctl[16] : pf == 3 ? m.ctl[16] + 1 : epoch;
     }
     __syncthreads();
     const uint32_t lanes = min(uint32_t(blockDim.x), m.slots);
     uint32_t scanned = 0;
     while (assigned < nmiss && scanned < 3*m.slots + lanes) {
         const uint32_t slot = (hand + scanned + threadIdx.x)%m.slots;
-        if (threadIdx.x < lanes && m.stamp[slot] != epoch && atomicExch(m.ref + slot, 0) == 0) {
+        const bool free_slot = pf >= 2 ? m.tags[slot] < 0 || m.stamp[slot] < keep_from : m.stamp[slot] != epoch;
+        if (threadIdx.x < lanes && free_slot && atomicExch(m.ref + slot, 0) == 0) {
             const uint32_t item = atomicAdd(&assigned, 1u);
             if (item < nmiss) {
                 const int old = m.tags[slot];
@@ -1352,6 +1391,7 @@ static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit
             c[1] += m.ctl[3];
             c[2] += 1;
             c[3] += over;
+            m.ctl[16] = epoch; // J3: slots stamped after this belong to the next own resolve's prefetch
         }
         m.ctl[0] = epoch;
         m.ctl[1] = (hand + scanned)%m.slots;
@@ -1364,8 +1404,8 @@ static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit
                     m.layer, c[2], m.stage_ctl[0], m.stage_n, clock_over, over);
             }
             if (m.ctl[6]) {
-                printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu prefetched=%u pf_resolves=%u\n",
-                    m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride, m.ctl[5], m.ctl[6]);
+                printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu prefetched=%u pf_resolves=%u pf_hits=%u pf_dropped=%u\n",
+                    m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride, m.ctl[5], m.ctl[6], m.ctl[17], m.ctl[18]);
             } else if (m.seen) {
                 printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu not_admitted=%u\n",
                     m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride, m.ctl[7]);
@@ -1430,6 +1470,128 @@ static void lsa_page_prefetch(ggml_backend_cuda_context & ctx, qsa_clock_tensor 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(next->pf_done, side));
     next->pf_pending = true;
+}
+
+// LLAMA_LSA_J3: one thread per sealed body group of the target layer. A record is marked if a unit of the prediction
+// that overlaps it is set in any row (units: `unit` cells of the cell axis, the decode mask's columns) or, with prev,
+// if the target's last own resolve picked it. Records sealed by this ubatch are skipped (their master bytes are being
+// written now). A record's stage entry from the last own resolve (-3 - k) is stale for the next one: it may be claimed
+// here (lsa_stage_reset only clears entries that still hold its own value). Resident hits get this pass's epoch, so
+// later passes of the step keep them. Runs on the side stream, between two own resolves of the target.
+static __global__ void lsa_j3_mark(ggml_cuda_qsa_clock_map m, const int32_t * desc, const float * units, int64_t nunits,
+        int nrows, int unit, int use_prev, uint32_t limit) {
+    const int g = blockIdx.x*blockDim.x + threadIdx.x;
+    const int S = desc[GGML_SJKVARN_DESC_S], G = desc[GGML_SJKVARN_DESC_G];
+    if (G != GGML_LSA_PAGE_CELLS || g >= (desc[GGML_SJKVARN_DESC_B_OLD] - S)/G) return;
+    bool live = false;
+    if (units) {
+        const int64_t c0 = int64_t(S) + int64_t(g)*G;
+        const int64_t u0 = c0/unit, u1 = min(nunits - 1, (c0 + G - 1)/unit);
+        for (int r = 0; r < nrows && !live; ++r) {
+            for (int64_t u = u0; u <= u1 && !live; ++u) live = units[r*nunits + u] > 0.5f;
+        }
+    }
+    const int record = desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + g] : g;
+    if (record < 0 || record >= int(m.records)) return;
+    if (!live && use_prev && m.prev) {
+        const uint32_t own = uint32_t(reinterpret_cast<const unsigned long long *>(m.ctl + 8)[2]);
+        live = own != 0 && m.prev[record] == own;
+    }
+    if (!live) return;
+    const uint32_t epoch = m.ctl[0] + 1;
+    int cur = m.table[record];
+    for (;;) {
+        if (cur >= 0) {
+            m.stamp[cur] = epoch;
+            m.ref[cur] = 1;
+            atomicAdd(m.ctl + 17, 1u);
+            return;
+        }
+        if (cur == -2) return; // queued by this pass already
+        const int old = atomicCAS(m.table + record, cur, -2);
+        if (old == cur) break;
+        cur = old;
+    }
+    const uint32_t miss = atomicAdd(m.ctl + 2, 1u);
+    if (miss < limit) {
+        m.miss_page[miss] = record;
+    } else {
+        m.table[record] = -1;
+        atomicAdd(m.ctl + 18, 1u);
+    }
+}
+
+// grow a J3 scratch buffer; cudaFree waits for the device, so an old copy still read by the side stream is safe
+template <typename T>
+static void lsa_j3_reserve(T *& p, size_t & cap, size_t n) {
+    if (n <= cap) return;
+    if (p) CUDA_CHECK(cudaFree(p));
+    cap = ((n + 65535)/65536)*65536;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&p), cap*sizeof(T)));
+}
+
+void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, sizeof(float), ctx.stream())); // the result is a placeholder
+    const ggml_tensor * desc = dst->src[0];
+    const ggml_tensor * units = dst->src[2];
+    auto * e = dst->src[1] ? qsa_clock_entry(dst->src[1]) : nullptr;
+    if (!e || e->map.cells != GGML_LSA_PAGE_CELLS || e->map.strip_master || e->device != ctx.device) {
+        return; // no record-page slots (the whole body is on the card), or the unpublished strip-master source
+    }
+    const int unit = ggml_get_op_params_i32(dst, 0), flags = ggml_get_op_params_i32(dst, 1), src = ggml_get_op_params_i32(dst, 2);
+    GGML_ASSERT(src >= 0 && src < GGML_LSA_PREFETCH_SOURCES);
+    GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_is_contiguous(desc));
+    GGML_ASSERT(!units || (units->type == GGML_TYPE_F32 && ggml_is_contiguous(units) && unit >= 1));
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+    GGML_ASSERT(capture == cudaStreamCaptureStatusNone); // the CUDA graph checks refuse graphs holding this op
+    const bool use_prev = (flags & GGML_LSA_PREFETCH_PREV) != 0;
+    {
+        std::lock_guard<std::mutex> lock(lsa_pf_mutex);
+        if (!e->pf_done) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&e->pf_done, cudaEventDisableTiming));
+        }
+        if (!lsa_pf_stream[e->device]) {
+            int lo = 0, hi = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&lsa_pf_stream[e->device], cudaStreamNonBlocking, lo));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lsa_pf_fork[e->device], cudaEventDisableTiming));
+        }
+    }
+    if (use_prev && !e->map.prev) {
+        // the own mark fills it from the next own resolve on; nothing to read yet, so this call marks no previous pick
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->map.prev), size_t(e->map.records)*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemsetAsync(e->map.prev, 0, size_t(e->map.records)*sizeof(uint32_t), ctx.stream()));
+    }
+    if (!units && !use_prev) return;
+    if (e->j3_issued[src]) {
+        lsa_pf_join(ctx.stream(), e); // same source twice before the target ran: its scratch may still be read
+    }
+    const size_t ndesc = size_t(ggml_nelements(desc));
+    lsa_j3_reserve(e->j3_desc[src], e->j3_desc_cap[src], ndesc);
+    CUDA_CHECK(cudaMemcpyAsync(e->j3_desc[src], desc->data, ndesc*sizeof(int32_t), cudaMemcpyDeviceToDevice, ctx.stream()));
+    int64_t nunits = 0;
+    int nrows = 0;
+    if (units) {
+        nunits = units->ne[0];
+        nrows = int(units->ne[1]);
+        lsa_j3_reserve(e->j3_units[src], e->j3_units_cap[src], size_t(ggml_nelements(units)));
+        CUDA_CHECK(cudaMemcpyAsync(e->j3_units[src], units->data, ggml_nbytes(units), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+    e->j3_issued[src] = true;
+    cudaStream_t side = lsa_pf_stream[e->device];
+    CUDA_CHECK(cudaEventRecord(lsa_pf_fork[e->device], ctx.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(side, lsa_pf_fork[e->device], 0));
+    const uint32_t cap = e->map.slots;
+    lsa_j3_mark<<<(e->map.records + 127)/128, 128, 0, side>>>(e->map, e->j3_desc[src], units ? e->j3_units[src] : nullptr,
+        nunits, nrows, unit, use_prev, cap);
+    CUDA_CHECK(cudaGetLastError());
+    lsa_page_assign<<<1, 1024, 0, side>>>(e->map, cap, (flags & GGML_LSA_PREFETCH_PROTECT_PREV) ? 2 : 3);
+    CUDA_CHECK(cudaGetLastError());
+    lsa_page_copy_misses<<<dim3(lsa_j3_copy_blocks(), e->map.heads), 256, 0, side>>>(e->map);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(e->pf_done, side));
+    e->pf_pending = true;
 }
 
 // Logging-only: observe the table BEFORE mark/assign makes misses look resident. Single-block reduction keeps

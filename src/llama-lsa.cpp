@@ -109,6 +109,11 @@ const llama_lsa_config & llama_lsa_cfg() {
         c.topp_min  = lsa_env_f64("LLAMA_LSA_TOPP_MIN",  c.topp_min);
         c.stats     = lsa_env_i64("LLAMA_LSA_STATS",     0) != 0;
         c.spec_recall = lsa_env_i64("LLAMA_LSA_SPEC_RECALL", 0) != 0;
+        c.j3        = lsa_env_i64("LLAMA_LSA_J3",       0) != 0;
+        c.j3_a3     = (int) lsa_env_i64("LLAMA_LSA_J3_A3",    150);
+        c.j3_a1     = (int) lsa_env_i64("LLAMA_LSA_J3_A1",    150);
+        c.j3_prev   = lsa_env_i64("LLAMA_LSA_J3_PREV",  1) != 0;
+        c.j3_first  = (int) std::max<int64_t>(0, lsa_env_i64("LLAMA_LSA_J3_FIRST", 3));
         c.recall    = lsa_env_i64("LLAMA_LSA_RECALL",    0) != 0;
         c.block     = lsa_env_i64("LLAMA_LSA_BLOCK",     0);
         c.block_tau = lsa_env_f64("LLAMA_LSA_BLOCK_TAU", c.block_tau);
@@ -190,6 +195,24 @@ const llama_lsa_config & llama_lsa_cfg() {
         if (c.bucket < 1) {
             c.bucket = 1;
         }
+        if (c.j3 && c.mode != llama_lsa_config::OFF) {
+            auto pct_ok = [](int p) { return p == 0 || p == 100 || p == 110 || p == 125 || p == 150; };
+            const char * pf = getenv("GGML_CUDA_LSA_PREFETCH");
+            if (!pct_ok(c.j3_a3) || !pct_ok(c.j3_a1)) {
+                LLAMA_LOG_WARN("%s: LLAMA_LSA_J3_A3/_A1 must be 0, 100, 110, 125 or 150 (got %d/%d): J3 off\n", __func__,
+                        c.j3_a3, c.j3_a1);
+                c.j3 = false;
+            } else if (c.spec_recall || (pf && atoi(pf) > 0)) {
+                LLAMA_LOG_WARN("%s: LLAMA_LSA_J3 does not combine with LLAMA_LSA_SPEC_RECALL or GGML_CUDA_LSA_PREFETCH: J3 off\n", __func__);
+                c.j3 = false;
+            } else if (c.resident <= 0.0) {
+                LLAMA_LOG_WARN("%s: LLAMA_LSA_J3 needs LLAMA_LSA_RESIDENT (record-page slots): J3 off\n", __func__);
+                c.j3 = false;
+            }
+        }
+        if (c.mode == llama_lsa_config::OFF) {
+            c.j3 = false;
+        }
         if (c.mode != llama_lsa_config::OFF && c.map_path.empty() && !c.mapless_probe()) {
             LLAMA_LOG_WARN("%s: LLAMA_LSA_MODE set but LLAMA_LSA_MAP is empty, LSA stays off\n", __func__);
             c.mode = llama_lsa_config::OFF;
@@ -216,7 +239,9 @@ static std::string llama_lsa_describe_cfg(const llama_lsa_config & c) {
        << " keep_frac_layers=" << (c.keep_frac_layers.empty() ? "none" : c.keep_frac_layers)
        << " keep_sched=" << (c.keep_sched.empty() ? "none" : c.keep_sched) << " resident_mib=" << c.resident_mib << " sticky=" << c.resident_sticky
        << " topp=" << c.topp << " topp_tau=" << c.topp_tau << " topp_min=" << c.topp_min << " stats=" << (c.stats ? 1 : 0) << " recall=" << (c.recall ? 1 : 0)
-       << " spec_recall=" << (c.spec_recall ? 1 : 0) << " map=" << c.map_path;
+       << " spec_recall=" << (c.spec_recall ? 1 : 0)
+       << " j3=" << (c.j3 ? 1 : 0) << " j3_a3=" << c.j3_a3 << " j3_a1=" << c.j3_a1 << " j3_prev=" << (c.j3_prev ? 1 : 0)
+       << " j3_first=" << c.j3_first << " map=" << c.map_path;
     return os.str();
 }
 

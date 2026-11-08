@@ -6292,6 +6292,150 @@ ggml_tensor * llm_graph_context::build_attn_lsa_idx_sj(
     return ggml_view_3d(ctx0, w, d_idx, n_kv, n_hc, w->nb[1], w->nb[2], 0); // [d_idx, n_kv, n_hc]
 }
 
+// LLAMA_LSA_J3: the same stale-query pick as the LLAMA_LSA_SPEC_RECALL logger, for a later layer il, built from what
+// exists at the source layer: il's index cache as of the previous ubatch (this ubatch's rows are appended by il itself;
+// they sit in the always-read window and are forced below), il's map, the shared mask and positions. The keep budget
+// follows build_attn_lsa_mask for il; every guard there that turns il's pick off returns nullptr here.
+ggml_tensor * llm_graph_context::build_attn_lsa_j3_units(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * sq,
+                int   il,
+                int   pct) const {
+    const auto & cfg = llama_lsa_cfg();
+    const auto * mctx_cur = inp->mctx;
+    ggml_tensor * kq_mask = inp->lsa_kq_mask ? inp->lsa_kq_mask : inp->get_kq_mask();
+    const int64_t T = sq->ne[2];
+    if (!kq_mask || (kq_mask->type != GGML_TYPE_F16 && kq_mask->type != GGML_TYPE_F32) || kq_mask->ne[1] != T ||
+            kq_mask->ne[2] != 1 || kq_mask->ne[3] != 1 || T > cfg.max_rows) {
+        return nullptr;
+    }
+    const int64_t n_kv = kq_mask->ne[0];
+    if (inp->lsa_cell_pos->ne[0] != n_kv) {
+        return nullptr;
+    }
+    if (cfg.min_pos > 0) {
+        bool any = false;
+        for (int64_t i = 0; i < T; ++i) {
+            any = any || ubatch.pos[i] >= cfg.min_pos;
+        }
+        if (!any) {
+            return nullptr;
+        }
+    }
+    const double sched = cfg.keep_frac_sched(n_kv);
+    if (sched == 0.0) {
+        return nullptr;
+    }
+    const double frac = sched > 0.0 ? cfg.keep_frac_for(il, sched) : cfg.keep_frac_for(il);
+    if (frac >= 1.0) {
+        return nullptr;
+    }
+    int64_t keep_lr = frac > 0.0 ? (int64_t) (frac * (double) n_kv) : cfg.keep;
+    if (const double cf = llama_lsa_keep_cap_frac(); cf > 0.0 && frac > 0.0 && frac > cf) {
+        keep_lr = (int64_t) (cf * (double) n_kv);
+    } else if (const int64_t cc = llama_lsa_keep_cap_cells(); cc > 0 && frac <= 0.0) {
+        keep_lr = std::min(keep_lr, cc);
+    }
+    if (n_kv <= cfg.sinks + cfg.window + std::max<int64_t>(keep_lr, 0)) {
+        return nullptr;
+    }
+    const int64_t B = cfg.block;
+    const int64_t F = cfg.refine;
+    if (B != 128 || (F != 16 && F != 128) || n_kv % B != 0) {
+        return nullptr;
+    }
+    const int64_t nb = n_kv/B;
+    const int64_t kc = std::min<int64_t>(nb, (int64_t) std::ceil(cfg.refine_mult*(double) keep_lr/(double) B));
+    const int64_t nu = n_kv/F;
+    const int64_t ku = std::max<int64_t>(1, std::min<int64_t>(nu, keep_lr/F));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    const ggml_tensor * kbase = k->view_src ? k->view_src : k;
+    if (!kbase->buffer) {
+        return nullptr;
+    }
+    const auto buft = ggml_backend_buffer_get_type(kbase->buffer);
+    ggml_tensor * wq = nullptr;
+    ggml_tensor * wk = nullptr;
+    const int64_t d_head    = sq->ne[0];
+    const int64_t n_head    = sq->ne[1];
+    const int64_t n_head_kv = hparams.n_head_kv(il);
+    const int64_t d_kv      = d_head*n_head_kv;
+    if (n_head_kv <= 0 || n_head % n_head_kv != 0 || !llama_lsa_get_map(il, buft, &wq, &wk) || wk->ne[0] != d_kv) {
+        return nullptr;
+    }
+    const int64_t d_idx   = wk->ne[1];
+    const int64_t kv_size = mctx_cur->get_kv_size();
+    llama_lsa_idx_slot slot;
+    if (n_kv > kv_size || !llama_lsa_idx_get(kbase, d_idx, buft, &slot, kv_size, 1) || !slot.valid) {
+        return nullptr; // il rebuilds (or has no) index cache this ubatch: nothing to rank yet
+    }
+    ggml_tensor * PT  = ggml_view_2d(ctx0, slot.t, d_idx, n_kv, slot.t->nb[1], 0);
+    ggml_tensor * mk2 = ggml_reshape_2d(ctx0, ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask), n_kv, T);
+    const int64_t g = n_head/n_head_kv;
+    ggml_tensor * sq4 = ggml_reshape_4d(ctx0, ggml_cont(ctx0, sq), d_head, g, n_head_kv, T);
+    sq4 = ggml_cont(ctx0, ggml_permute(ctx0, sq4, 1, 0, 2, 3));
+    ggml_tensor * sqs = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, sq4), d_kv, T);
+    if (sqs->type != GGML_TYPE_F32) {
+        sqs = ggml_cast(ctx0, sqs, GGML_TYPE_F32);
+    }
+    ggml_tensor * ss = ggml_mul_mat(ctx0, PT, ggml_mul_mat(ctx0, wq, sqs)); // [n_kv, T]
+    ggml_tensor * sp = llama_lsa_build_recall_pick(ctx0, ss, mk2, inp->lsa_cell_pos, inp->lsa_q_pos,
+            (int) B, (int) F, (float) cfg.block_tau, (int) cfg.window, (int) cfg.sinks,
+            (int) std::max<int64_t>(1, kc), (int) ku, pct);
+    if (T > 1) {
+        // one prefetch per ubatch: the union of the rows' picks
+        ggml_tensor * st = ggml_cont(ctx0, ggml_transpose(ctx0, sp));
+        sp = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, st, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nu, 1);
+    }
+    // sinks and the window are read by every row that sees them; a unit with one such cell counts
+    ggml_tensor * cp  = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, inp->lsa_cell_pos, n_kv, 1), ss);
+    ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, cp, inp->lsa_q_pos), 1.0f, (float) cfg.window - 0.5f));
+    ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, cp, -1.0f, (float) cfg.sinks - 0.5f));
+    ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, mk2, GGML_TYPE_F32), 1.0f, 1e29f));
+    ggml_tensor * force = ggml_pool_1d(ctx0, ggml_mul(ctx0, ggml_add(ctx0, win, snk), vis), GGML_OP_POOL_MAX, (int) F, (int) F, 0);
+    if (T > 1) {
+        ggml_tensor * ft = ggml_cont(ctx0, ggml_transpose(ctx0, force));
+        force = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, ft, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nu, 1);
+    }
+    ggml_tensor * units = ggml_cont(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_add(ctx0, sp, force), 1.0f, -0.5f)));
+    cb(units, "lsa_j3_units", il);
+    return units;
+}
+
+void llm_graph_context::build_attn_lsa_j3(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * sq,
+                int   il,
+                int   pct,
+                int   flags,
+                int   src) const {
+    const auto & cfg = llama_lsa_cfg();
+    if (!cfg.j3 || cfg.mode == llama_lsa_config::OFF || !inp || !inp->self_sj_kvarn_desc || !inp->lsa_cell_pos ||
+            !inp->lsa_q_pos || !inp->lsa_q_cell || !ubatch.pos) {
+        return;
+    }
+    const auto * mctx_cur = inp->mctx;
+    ggml_tensor * body = mctx_cur->get_sj_kvarn_body(il);
+    uint32_t bits_k = 0, bits_v = 0;
+    const int tier = mctx_cur->get_sj_kvarn_layer_tier(il, bits_k, bits_v);
+    ggml_tensor * desc = tier == 1 ? inp->self_sj_kvarn_desc_edge : inp->self_sj_kvarn_desc;
+    if (!body || !desc) {
+        return;
+    }
+    ggml_tensor * units = sq && pct > 0 ? build_attn_lsa_j3_units(inp, sq, il, pct) : nullptr;
+    flags &= GGML_LSA_PREFETCH_PREV | GGML_LSA_PREFETCH_PROTECT_PREV;
+    if (units) {
+        flags |= GGML_LSA_PREFETCH_UNITS;
+    }
+    if (!(flags & (GGML_LSA_PREFETCH_UNITS | GGML_LSA_PREFETCH_PREV))) {
+        return;
+    }
+    ggml_tensor * r = ggml_lsa_prefetch(ctx0, desc, body, units, (int) cfg.refine, flags, src);
+    cb(r, "lsa_j3_prefetch", il);
+    ggml_build_forward_expand(gf, r);
+}
+
 // LLAMA_LSA_BLOCK_SUM (llama-lsa.h): per-block channel max / min of the index keys, F16 [d_idx, kv_size/B] next to the
 // index cache. Valid cache: only the blocks of this ubatch's rows are recomputed from the index cache after the store
 // (duplicate block ids write identical values). Rebuilt index cache (plain caches): every whole block below n_kv.

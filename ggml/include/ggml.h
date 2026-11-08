@@ -655,6 +655,7 @@ extern "C" {
         GGML_OP_LSA_BLOCK_SELECT,
         GGML_OP_LSA_COMP_MERGE,
         GGML_OP_LSA_UNIT_LSE,
+        GGML_OP_LSA_PREFETCH,
 
         GGML_OP_UNARY,
 
@@ -2716,6 +2717,25 @@ extern "C" {
             struct ggml_tensor  * mask,
             int                   F,
             float                 tau);
+
+    // LLAMA_LSA_J3 (opt-in): side-stream prefetch into the record-page slots of a later LSA layer's resident SJ-KVaRN
+    // body. desc: that layer's SJ-KVaRN descriptor (I32); body: its body tensor; units: F32 [n_units, rows] 0/1
+    // prediction over unit-cell groups of the cell axis (1 = predicted read), or NULL. flags: GGML_LSA_PREFETCH_*.
+    // src: per-source scratch index, 0..GGML_LSA_PREFETCH_SOURCES-1. Result: F32 [1] set to 0. Only the slot
+    // map changes, never what attention reads (a record without a slot is read from the master), so output does not
+    // depend on it. Backends without record-page slots treat it as a no-op.
+#define GGML_LSA_PREFETCH_UNITS        1 // mark the records the units predict
+#define GGML_LSA_PREFETCH_PREV         2 // also mark the records the layer's previous own resolve picked
+#define GGML_LSA_PREFETCH_PROTECT_PREV 4 // never evict the previous own pick's slots for a prefetch
+#define GGML_LSA_PREFETCH_SOURCES      2
+    GGML_API struct ggml_tensor * ggml_lsa_prefetch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * desc,
+            struct ggml_tensor  * body,
+            struct ggml_tensor  * units,
+            int                   unit,
+            int                   flags,
+            int                   src);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

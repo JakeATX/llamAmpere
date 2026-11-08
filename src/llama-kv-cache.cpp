@@ -1014,8 +1014,23 @@ llama_kv_cache::llama_kv_cache(
             // LLAMA_LSA_RESIDENT=<pct> (opt-in, LSA layers with a map): body master in pinned host RAM, <pct>% of its
             // 16-cell strips (scalar 4/4) or whole 128-cell records (3/3t, 3/2t and other low-bit bodies, whose
             // token-axis trellis payload moves only by record) in CLOCK slots on the card, filled before each decode attention
+            // LLAMA_LSA_J3: the first j3_first mapped LSA layers have no layer three ahead of them to predict their
+            // reads, so their bodies stay whole on the card (same bytes as LSA_RESIDENT off for those layers)
+            bool lsa_j3_whole = false;
+            if (llama_lsa_cfg().j3 && llama_lsa_cfg().mode != llama_lsa_config::OFF && llama_lsa_map_has_layer((int32_t) il)) {
+                const auto & lc = llama_lsa_cfg();
+                int before = 0;
+                for (uint32_t jl = 0; jl < il; ++jl) {
+                    before += !hparams.is_recr(jl) && lc.layer_enabled((int) jl) && llama_lsa_map_has_layer((int) jl);
+                }
+                lsa_j3_whole = !hparams.is_recr(il) && lc.layer_enabled((int) il) && before < lc.j3_first;
+                if (lsa_j3_whole && llama_lsa_cfg().resident > 0.0) {
+                    LLAMA_LOG_WARN("%s: LLAMA_LSA_J3: layer %u is mapped LSA layer %d of the first %d: whole body on the card\n",
+                        __func__, il, before, lc.j3_first);
+                }
+            }
             if (body_ctx == ctx && llama_lsa_cfg().resident > 0.0 && offload && llama_lsa_map_has_layer((int32_t) il) &&
-                    ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    !lsa_j3_whole && ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 static bool warned = false;
                 // slots per layer: <pct> of the records, or LLAMA_LSA_RESIDENT_MIB split evenly over the layers that can
                 // be resident (mapped, offloaded, interior tier), capped at the whole body
