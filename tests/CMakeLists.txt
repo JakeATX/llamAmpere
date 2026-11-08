@@ -516,6 +516,7 @@ llama_build_and_test(test-decode-phase.cpp)     # one-shot decode tag gates the 
 llama_build_and_test(test-fit-extra.cpp)
 llama_build_and_test(test-moe-bank.cpp)
 llama_build_and_test(test-moe-ai-rows.cpp)   # fork AIPFIX D2: host AI+ slab kernel vs reference
+llama_build_and_test(test-moe-iq-signs.cpp)   # compile-time IQ sign bytes vs runtime ksigns_iq2xs
 llama_build_and_test(test-moe-cs-plan.cpp)   # fork AIPFIX: CPU-split planner greedy step + per-type probe cost table
 
 llama_build_and_test(test-tiled-mulmat.cpp)

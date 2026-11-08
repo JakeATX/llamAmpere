@@ -1935,6 +1935,8 @@ private:
             add("dft", "none");
         }
 
+        k += server_prompt_cache_routing_key(params_base.moe_cache);
+
         // environment knobs that change the stored values or their layout
         static const char * env_names[] = {
             "TURBO_INNERQ", "TURBO_INNERQ_STRENGTH", "TURBO_LAYER_ADAPTIVE", "TURBO_AUTO_ASYMMETRIC",

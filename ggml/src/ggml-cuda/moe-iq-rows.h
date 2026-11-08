@@ -11,10 +11,12 @@
 // outputs are therefore the same floats ggml produces (test-moe-iq-rows compares the bits, and compares each
 // unpacked slice with ggml's own dequantize_row_* output).
 //
-// Sign bytes come from ggml-common.h's ksigns_iq2xs for the formats with 7-bit sign indices, and from ggml's
+// Sign bytes (moe-iq-signs.h, equal to ggml-common.h's ksigns_iq2xs) serve the formats with 7-bit sign indices, and from ggml's
 // shuffle-and-mask expansion for the formats that store one sign bit per weight.
 //
 // Needs the IQ grid and sign tables of ggml-common.h (GGML_COMMON_IMPL_CPP) included before this header.
+
+#include "moe-iq-signs.h"
 
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__) && defined(__BMI2__)
 #define MOE_IQ_ROWS 1
@@ -25,24 +27,6 @@
 namespace moe_iq {
 
 // ---- sign bytes ------------------------------------------------------------------------------------------------
-
-// ksigns_iq2xs maps a 7-bit sign index to the 8 sign bits of a weight group (bit 7 is the parity bit). Widen each
-// entry once to one byte per weight: 0x01 keeps the activation, 0xFF negates it (the second operand of
-// _mm256_sign_epi8).
-struct pm_lut {
-    uint64_t v[128];
-    constexpr pm_lut() : v() {
-        for (int i = 0; i < 128; ++i) {
-            uint64_t w = 0;
-            for (int bit = 0; bit < 8; ++bit) {
-                w |= ((ksigns_iq2xs[i] >> bit) & 1 ? 0xFFull : 0x01ull) << (8 * bit);
-            }
-            v[i] = w;
-        }
-    }
-};
-alignas(64) inline constexpr pm_lut k_pm{};
-static_assert(k_pm.v[3] == 0x010101010101FFFFull && k_pm.v[127] == 0xFFFFFFFFFFFFFFFFull, "pm_lut");
 
 // byte picks / bit selectors for the one-sign-bit-per-weight formats (same constants as ggml's IQ2_S / IQ3_S dot)
 alignas(32) inline constexpr uint8_t k_pick_byte[32] = {

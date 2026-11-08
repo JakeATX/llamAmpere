@@ -7,6 +7,7 @@
 #include "server-task.h"
 
 #include "common.h"
+#include "ggml.h"
 #include "log.h"
 
 #include <chrono>
@@ -57,6 +58,96 @@ static int n_pass = 0;
 
 static const uint64_t GiB = 1024ull*1024*1024;
 static const uint64_t MiB = 1024ull*1024;
+
+static void test_routing_key() {
+    const std::string mixed_name = "gGmL_pRoMpT_CaChE_tEsT_mIxEd";
+    const std::string mixed_saved = common_get_env(mixed_name);
+    common_set_env(mixed_name, "");
+    const std::vector<std::string> names = {"GGML_MOE_CPU_SPLIT", "GGML_CUDA_GRAPH_OPT",
+        "GGML_CUDA_MOE_CACHE_MODE", "GGML_CUDA_MOE_CACHE",
+        "GGML_CUDA_MOE_CACHE_BUDGET_MB", "GGML_CUDA_MOE_CACHE_RESERVE_MB",
+        "GGML_PROMPT_CACHE_TEST", "GGML_PROMPT_CACHE_TEST0", "PROMPT_CACHE_TEST_OTHER"};
+    std::vector<std::string> saved;
+    for (const auto & name : names) {
+        saved.push_back(common_get_env(name));
+        common_set_env(name, "");
+    }
+    common_moe_cache_params params;
+    const std::string prefix = "model=fixed;build=fixed;ctk=q8_0;ctv=q8_0;";
+    auto key = [&]() { return prefix + server_prompt_cache_routing_key(params); };
+    const std::string base = key();
+    CHECK(base == key());
+    CHECK(base.substr(0, prefix.size()) == prefix);
+    for (const auto mode : {COMMON_MOE_CACHE_MODE_OFF, COMMON_MOE_CACHE_MODE_ON, COMMON_MOE_CACHE_MODE_SOFT}) {
+        params.mode = mode;
+        CHECK(key() != base);
+    }
+    params.mode = COMMON_MOE_CACHE_MODE_AUTO;
+    // Exercise real environment lookup, including implicit AUTO + --fit off.
+    for (size_t i = 0; i + 1 < names.size(); ++i) {
+        common_set_env(names[i], i == 2 ? "off" : i >= 4 ? "4096" : "1");
+        CHECK(key() != base);
+        CHECK(key().substr(0, prefix.size()) == prefix);
+        if (i == 2) {
+            const std::string off = key();
+            common_set_env(names[i], "on");
+            CHECK(key() != off);
+        }
+        common_set_env(names[i], "");
+        CHECK(key() == base);
+    }
+    common_set_env(names.back(), "1");
+    CHECK(key() == base);
+    common_set_env(names.back(), "");
+    // Environment insertion order must not change the key.
+    common_set_env(names[6], "a;=b:2");
+    common_set_env(names[7], "c");
+    const std::string ordered = key();
+    CHECK(ordered != base);
+    CHECK(ordered.find("22:GGML_PROMPT_CACHE_TEST") < ordered.find("23:GGML_PROMPT_CACHE_TEST0"));
+    common_set_env(names[6], "");
+    common_set_env(names[7], "");
+    common_set_env(names[7], "c");
+    common_set_env(names[6], "a;=b:2");
+    CHECK(key() == ordered);
+    common_set_env(names[6], "a");
+    common_set_env(names[7], ";=b:2c");
+    CHECK(key() != ordered);
+    common_set_env(names[6], "");
+    common_set_env(names[7], "");
+    CHECK(key() == base);
+    common_set_env(mixed_name, "0");
+    const std::string mixed_off = key();
+    common_set_env(mixed_name, "1");
+    const std::string mixed_on = key();
+#ifdef _WIN32
+    CHECK(common_get_env("GGML_PROMPT_CACHE_TEST_MIXED") == "1");
+    CHECK(mixed_off != base);
+    CHECK(mixed_on != mixed_off);
+    common_set_env(mixed_name, "");
+    common_set_env("GGML_PROMPT_CACHE_TEST_MIXED", "1");
+    CHECK(key() == mixed_on);
+#else
+    CHECK(mixed_off == base);
+    CHECK(mixed_on == base);
+#endif
+    common_set_env(mixed_name, "");
+    CHECK(key() == base);
+    params.mode_explicit = true;
+    CHECK(key() != base);
+    params.mode_explicit = false;
+    params.budget_mib = 4096;
+    CHECK(key() != base);
+    params.budget_mib = 0;
+    params.fit_selected = true;
+    CHECK(key() != base);
+    params.fit_selected = false;
+    CHECK(key() == base);
+    for (size_t i = 0; i < names.size(); ++i) {
+        common_set_env(names[i], saved[i]);
+    }
+    common_set_env(mixed_name, mixed_saved);
+}
 
 static void test_split_identity(const std::string & root) {
     const std::string first = root + "/model-00001-of-00002.gguf";
@@ -1087,9 +1178,12 @@ static void test_fit_ram(const std::string & root) {
 }
 
 int main() {
+    // Windows ggml_time_us() divides by the timer frequency set here; the server gets it from backend init.
+    ggml_time_init();
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
 
+    test_routing_key();
     test_split_identity(root);
     test_ram_tiers();
     test_dir_creation(root);

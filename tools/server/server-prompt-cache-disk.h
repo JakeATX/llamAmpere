@@ -49,6 +49,9 @@ struct server_prompt_disk_record {
 
 std::string server_prompt_cache_file_identity(const std::string & path, int split_count = 1);
 
+std::string server_prompt_cache_routing_key(
+        const common_moe_cache_params & params);
+
 uint64_t server_prompt_disk_hash(const void * data, size_t n, uint64_t seed = 0xcbf29ce484222325ull);
 
 // the checkpoints of an entry with n_tokens tokens that a keep-newest-plus-doubling-distance policy keeps: the

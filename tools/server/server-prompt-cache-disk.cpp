@@ -5,21 +5,77 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <system_error>
 #include <stdexcept>
+#include <utility>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <process.h>
 static int pc_getpid() { return _getpid(); }
 #else
 #include <unistd.h>
+extern char ** environ;
 static int pc_getpid() { return (int) getpid(); }
 #endif
 
 namespace fs = std::filesystem;
+
+std::string server_prompt_cache_routing_key(
+        const common_moe_cache_params & params) {
+    std::string key = "moe_cache=" + std::to_string((int) params.mode) +
+        // Explicit AUTO overrides the provider mode; implicit AUTO inherits it.
+        ",explicit=" + std::to_string(params.mode_explicit) +
+        ",budget_mib=" + std::to_string(params.budget_mib) +
+        ",fit=" + std::to_string(params.fit_selected) + ";";
+    // Backend knobs can change row placement or math; include future knobs too.
+    std::vector<std::pair<std::string, std::string>> env;
+    auto append = [&](const std::string & entry) {
+        const size_t end = entry.find('=');
+        if (end == std::string::npos) {
+            return;
+        }
+        std::string name = entry.substr(0, end);
+#ifdef _WIN32
+        // Windows backend lookups ignore the case of environment names.
+        for (char & c : name) {
+            if (c >= 'a' && c <= 'z') {
+                c = c - 'a' + 'A';
+            }
+        }
+#endif
+        if (name.compare(0, 5, "GGML_") == 0) {
+            env.emplace_back(std::move(name), entry.substr(end + 1));
+        }
+    };
+#ifdef _WIN32
+    LPWCH block = GetEnvironmentStringsW();
+    if (!block) {
+        throw std::runtime_error("cannot read process environment for prompt cache key");
+    }
+    for (LPWCH e = block; *e; e += wcslen(e) + 1) {
+        append(wstring_to_utf8(e));
+    }
+    FreeEnvironmentStringsW(block);
+#else
+    for (char ** e = environ; e && *e; ++e) {
+        append(*e);
+    }
+#endif
+    std::sort(env.begin(), env.end());
+    for (const auto & entry : env) {
+        key += std::to_string(entry.first.size()) + ":" + entry.first +
+            std::to_string(entry.second.size()) + ":" + entry.second + ";";
+    }
+    return key;
+}
 
 static const char     PC_MAGIC[4] = {'L', 'C', 'P', 'C'};
 static const uint32_t PC_VERSION  = 4;

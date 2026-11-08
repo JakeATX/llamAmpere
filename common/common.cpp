@@ -1900,15 +1900,18 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     tmp.push_back(0);
     tmp.push_back(0);
 
-    int ret;
     {
         common_batch batch = common_batch_get_one(ctx, tmp);
-        ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-    }
-    if (ret != 0) {
-        COM_ERR("llama_process() failed: %d\n", ret);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-        goto done;
+        for (int32_t off = 0; off < batch.size();) {
+            const int32_t n = std::min<uint32_t>(llama_n_batch(ctx), batch.size() - off);
+            const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(off, n));
+            if (ret != 0) {
+                COM_ERR("llama_process() failed: %d\n", ret);
+                res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+                goto done;
+            }
+            off += n;
+        }
     }
 
     // try to remove the last tokens

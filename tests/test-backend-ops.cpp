@@ -15971,6 +15971,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_ait2pu_cases(test_cases);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT2_U2);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT3_U2);
+    add_ait2pu_cases(test_cases, GGML_TYPE_AIT4_U2);
     // U2 reference decoding: odd chunk count, multiple slabs, and the small-output fallback.
     // The last case must also work with GGML_CUDA_AI23_SMALL_SPLIT=2/4.
     for (ggml_type type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
@@ -19539,6 +19540,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
             test_cases.emplace_back(new test_moe_bank_mixed_exact(bank, width, GGML_TYPE_Q2_0, 2, 4, 640, 2560));
+        }
+    }
+    // Default mixed downs split K while native downs use one warp per row.
+    // Check that valid-math path against CPU; bitwise cases require the native accumulation order.
+    for (int width : { 1, 3, 5, 8 }) {
+        for (ggml_type bank : { GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 }) {
+            test_cases.emplace_back(new test_moe_bank_mixed(bank,
+                    GGML_TYPE_IQ4_NL, width, 2, 4, false, false, 640, 2560));
+        }
+    }
+    const char * down_spw = getenv("GGML_CUDA_AI23_DOWN_SPW");
+    if (down_spw && atoi(down_spw) != 0) {
+        // Width 1 uses a four-warp cold reference; the mixed cold path uses one warp.
+        for (int width : { 3, 5, 8 }) {
+            for (bool repeated : { false, true }) {
+                test_cases.emplace_back(new test_moe_bank_mixed_exact(GGML_TYPE_AIT4_U2, width,
+                        GGML_TYPE_IQ4_NL, 2, 4, 640, 2560, repeated));
+            }
         }
     }
     // Production top-k10 crosses ballot chunks at both 32 and 64 routes.
