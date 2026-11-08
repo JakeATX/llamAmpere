@@ -70,5 +70,5 @@ const moe_cs_kernels moe_cs_scalar_kernels = {
 #endif
     ai_decode, moe_ai::r8_ok, moe_ai::rotate, moe_ai::rotate_q8, ai_f32, ai_q8,
     moe_ai::slab_rows_q8_keep, moe_ai::slab_rows_r8, dot_q2_0_q8_0, q2_reorder_hidden,
-    { nullptr, dot_q2_0_rows<1>, dot_q2_0_rows<2>, dot_q2_0_rows<3>, dot_q2_0_rows<4> }, iq_get, iq_unpack,
+    { nullptr, dot_q2_0_rows<1>, dot_q2_0_rows<2>, dot_q2_0_rows<3>, dot_q2_0_rows<4> }, iq_get, iq_unpack, moe_ai::quant_q8,
 };

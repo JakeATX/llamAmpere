@@ -199,15 +199,11 @@ static inline int q8_nearest_int(float fval) {   // ggml nearest_int (round half
     return (i & 0x007fffff) - 0x00400000;
 }
 
-// q8_nearest_int(s*x) with the product and the 1.5*2^23 add in ONE rounding when the build has FMA. GCC contracts the
+// q8_nearest_int(s*x) with the product and the 1.5*2^23 add in ONE rounding on every CPU. GCC contracts the
 // plain expression into an FMA on -mfma builds (fp-contract=fast; the shipped hq8 bytes were made that way), so this
-// spells it out and the AVX2 path below can match it bit for bit whatever the compiler decides to fuse.
+// spells it out; std::fma supplies the same rounding in software on the baseline path without FMA instructions.
 static inline int q8_nearest_int_mul(float s, float x) {
-#if defined(__FMA__)
     const float val = std::fma(s, x, 12582912.f);
-#else
-    const float val = s*x + 12582912.f;
-#endif
     int i;
     memcpy(&i, &val, sizeof(int));
     return (i & 0x007fffff) - 0x00400000;

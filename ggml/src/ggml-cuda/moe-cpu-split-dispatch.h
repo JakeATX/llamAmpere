@@ -21,6 +21,7 @@ struct moe_cs_kernels {
     moe_cs_q2_rows_fn q2_rows[5];
     moe_cs_rows_fn (*iq_get)(int, int, int, bool);
     bool (*iq_unpack)(int, const void *, int, bool, unsigned char *, signed char *, int *);
+    void (*ai_quant_q8)(const float *, void *, int64_t);
 };
 
 extern const moe_cs_kernels moe_cs_scalar_kernels;
