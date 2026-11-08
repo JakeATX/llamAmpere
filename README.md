@@ -5,6 +5,11 @@ tuned for NVIDIA RTX 30-series "Ampere" graphics cards, especially the RTX 3090 
 including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model
 writes faster) and Qwen3.8 Flash-Next.
 
+## What's new in v0.6.3.6
+
+- Flash-Next runs AI4, a four-bit AI+ model file (84.97 GiB, closer to the Swift-Q8 reference than UD-IQ4_XS). Not recommended on 64 GB RAM machines; use AI3 there.
+- Fixes the Linux build failure with Clang and some other compilers (#98). Saved prompt caches are keyed by expert-routing and GGML_ settings. [Release notes](docs/llamampere-v0.6.3.6/RELEASE_NOTES.md).
+
 ## What's new in v0.6.3.5
 
 - Flash-Next leaves more temporary card memory for long prompts on small cards. Explicit memory settings still win. [Release notes and hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md).
@@ -46,15 +51,15 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ## Quick start
 
-**Build and run (v0.6.3.5, Qwen3.8 Flash-Next, Linux).** For one RTX 30-series card with enough system RAM for the model and prompt workspace. Small-card tests used a 3090 limited to 12 GB with about 90 GiB of system RAM; native 12/16 GB cards remain unmeasured, and 64 GB of system RAM is not a fit promise. Small cards use memory-bounded prompt passes; see the [hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md). The launcher keeps the tested `--fit off` setting; its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
+**Build and run (v0.6.3.6, Qwen3.8 Flash-Next, Linux).** For one RTX 30-series card with enough system RAM for the model and prompt workspace. Small-card tests used a 3090 limited to 12 GB with about 90 GiB of system RAM; native 12/16 GB cards remain unmeasured, and 64 GB of system RAM is not a fit promise. Small cards use memory-bounded prompt passes; see the [hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md). The launcher keeps the tested `--fit off` setting; its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
 compiler, the `hf` download tool (`pip install -U huggingface_hub`) and 81.63 GB for the model and drafter, plus space for the build, prompt scratch and saved prompts. The launcher uses a 5 GiB free-RAM floor. This
-one paste clones or updates llamAmpere at v0.6.3.5, builds `llama-server`, downloads the model and its drafter and starts the server:
+one paste clones or updates llamAmpere at v0.6.3.6, builds `llama-server`, downloads the model and its drafter and starts the server:
 
 ```bash
 if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.5
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.6
 else
-  git clone -b v0.6.3.5 https://github.com/JakeATX/llamAmpere.git
+  git clone -b v0.6.3.6 https://github.com/JakeATX/llamAmpere.git
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
@@ -67,15 +72,15 @@ scripts/flash-next-server.sh -m models/flash-next/qwen3.8-flash-next-Swift1.5-AT
 
 To start it again later, run the last three lines from the `llamAmpere` folder. The server listens on http://127.0.0.1:8080 (OpenAI-compatible API).
 
-**Build and run (v0.6.3.5, Swift 1.5 27B at 2.3 bpw, 200K context, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
+**Build and run (v0.6.3.6, Swift 1.5 27B at 2.3 bpw, 200K context, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
 toolkit (`nvcc`), CMake, git and a C++ compiler. The model (about 9.1 GB) downloads on first start. This one paste clones or
-updates llamAmpere at v0.6.3.5, builds `llama-server` and starts it:
+updates llamAmpere at v0.6.3.6, builds `llama-server` and starts it:
 
 ```bash
 if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.5
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.6
 else
-  git clone -b v0.6.3.5 https://github.com/JakeATX/llamAmpere.git
+  git clone -b v0.6.3.6 https://github.com/JakeATX/llamAmpere.git
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
@@ -98,7 +103,7 @@ Numbers for this release (Swift 1.5 27B, v0.6 against v0.5) are in the [v0.6 rel
 
 ## Links
 
-- Release notes: [v0.6.3.5](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md), [v0.6.3.3](docs/llamampere-v0.6.3.3/RELEASE_NOTES.md), [v0.6.3.2](docs/llamampere-v0.6.3.2/RELEASE_NOTES.md), [v0.6.3.1](docs/llamampere-v0.6.3.1/RELEASE_NOTES.md), [v0.6.3](docs/llamampere-v0.6.3/RELEASE_NOTES.md), [v0.6.2](docs/llamampere-v0.6.2/RELEASE_NOTES.md), [v0.6.1](docs/llamampere-v0.6.1/RELEASE_NOTES.md), [v0.6](docs/llamampere-v0.6/RELEASE_NOTES.md), [v0.5](docs/llamampere-v0.5/RELEASE_NOTES.md), [v0.4](docs/llamampere-v0.4/RELEASE_NOTES.md), [v0.3.1](docs/llamampere-v0.3.1/RELEASE_NOTES.md); recommended settings for each card size: [v0.5 RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md)
+- Release notes: [v0.6.3.6](docs/llamampere-v0.6.3.6/RELEASE_NOTES.md), [v0.6.3.5](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md), [v0.6.3.3](docs/llamampere-v0.6.3.3/RELEASE_NOTES.md), [v0.6.3.2](docs/llamampere-v0.6.3.2/RELEASE_NOTES.md), [v0.6.3.1](docs/llamampere-v0.6.3.1/RELEASE_NOTES.md), [v0.6.3](docs/llamampere-v0.6.3/RELEASE_NOTES.md), [v0.6.2](docs/llamampere-v0.6.2/RELEASE_NOTES.md), [v0.6.1](docs/llamampere-v0.6.1/RELEASE_NOTES.md), [v0.6](docs/llamampere-v0.6/RELEASE_NOTES.md), [v0.5](docs/llamampere-v0.5/RELEASE_NOTES.md), [v0.4](docs/llamampere-v0.4/RELEASE_NOTES.md), [v0.3.1](docs/llamampere-v0.3.1/RELEASE_NOTES.md); recommended settings for each card size: [v0.5 RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md)
 - Models: [huggingface.co/jakeatx](https://huggingface.co/jakeatx)
 - Background: [QWEN_AMPERE.md](QWEN_AMPERE.md), [write-up](docs/llamampere-v0.3/ARTICLE.md), flags in [docs/speculative.md](docs/speculative.md) and [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md)
 - SJ-KVaRN paper: [paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper), codec [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT)
