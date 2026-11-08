@@ -6,6 +6,7 @@
 #include "sjkvarn-seal.cuh"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -128,6 +129,20 @@ static uint32_t lsa_j3_copy_blocks() {
         return v && atoi(v) > 0 ? uint32_t(std::min(atoi(v), 1024)) : 16u;
     }();
     return n;
+}
+// GGML_CUDA_LSA_J3_GRAPHS=1 (opt-in): LLAMA_LSA_J3 under CUDA graphs. All host setup runs from the graph check before
+// capture (ggml_cuda_lsa_prefetch_reserve); captured kernels hold the map and scratch pointers, so every allocation
+// that changes one bumps lsa_j3_gen and the graphs re-capture (ggml_cuda_graph_update_required).
+static std::atomic<uint64_t> lsa_j3_gen{0};
+bool ggml_cuda_lsa_j3_graphs() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_LSA_J3_GRAPHS");
+        return v && atoi(v) > 0;
+    }();
+    return on;
+}
+uint64_t ggml_cuda_lsa_j3_generation() {
+    return lsa_j3_gen.load(std::memory_order_relaxed);
 }
 static bool lsa_stage_strips() {
     static const bool on = [] {
@@ -1553,24 +1568,18 @@ static void lsa_j3_reserve(T *& p, size_t & cap, size_t n) {
     if (p) CUDA_CHECK(cudaFree(p));
     cap = ((n + 65535)/65536)*65536;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&p), cap*sizeof(T)));
+    lsa_j3_gen.fetch_add(1, std::memory_order_relaxed); // captured graphs hold the old pointer
 }
 
-void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, sizeof(float), ctx.stream())); // the result is a placeholder
+// Host setup of one J3 pass that never runs during capture: side stream, events, prev/j3_src, scratch. Returns the
+// entry, or nullptr when the op is a no-op for this body (same rule as ggml_cuda_lsa_prefetch).
+static qsa_clock_tensor * lsa_j3_setup(const ggml_tensor * dst, int device, cudaStream_t stream) {
     const ggml_tensor * desc = dst->src[0];
     const ggml_tensor * units = dst->src[2];
     auto * e = dst->src[1] ? qsa_clock_entry(dst->src[1]) : nullptr;
-    if (!e || e->map.cells != GGML_LSA_PAGE_CELLS || e->map.strip_master || e->device != ctx.device) {
-        return; // no record-page slots (the whole body is on the card), or the unpublished strip-master source
+    if (!e || e->map.cells != GGML_LSA_PAGE_CELLS || e->map.strip_master || e->device != device) {
+        return nullptr;
     }
-    const int unit = ggml_get_op_params_i32(dst, 0), flags = ggml_get_op_params_i32(dst, 1), src = ggml_get_op_params_i32(dst, 2);
-    GGML_ASSERT(src >= 0 && src < GGML_LSA_PREFETCH_SOURCES);
-    GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_is_contiguous(desc));
-    GGML_ASSERT(!units || (units->type == GGML_TYPE_F32 && ggml_is_contiguous(units) && unit >= 1));
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
-    GGML_ASSERT(capture == cudaStreamCaptureStatusNone); // the CUDA graph checks refuse graphs holding this op
-    const bool use_prev = (flags & GGML_LSA_PREFETCH_PREV) != 0;
     {
         std::lock_guard<std::mutex> lock(lsa_pf_mutex);
         if (!e->pf_done) {
@@ -1587,23 +1596,89 @@ void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         // the own mark fills both from the next own resolve on (prev: the previous-pick source; j3_src: the cascade
         // log), so this first call marks no previous pick
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->map.prev), size_t(e->map.records)*sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemsetAsync(e->map.prev, 0, size_t(e->map.records)*sizeof(uint32_t), ctx.stream()));
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->map.j3_src), size_t(e->map.records)*sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemsetAsync(e->map.j3_src, 0, size_t(e->map.records)*sizeof(uint32_t), ctx.stream()));
+        if (stream) {
+            CUDA_CHECK(cudaMemsetAsync(e->map.prev, 0, size_t(e->map.records)*sizeof(uint32_t), stream));
+            CUDA_CHECK(cudaMemsetAsync(e->map.j3_src, 0, size_t(e->map.records)*sizeof(uint32_t), stream));
+        } else {
+            CUDA_CHECK(cudaMemset(e->map.prev, 0, size_t(e->map.records)*sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemset(e->map.j3_src, 0, size_t(e->map.records)*sizeof(uint32_t)));
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        lsa_j3_gen.fetch_add(1, std::memory_order_relaxed); // own-resolve graphs captured before hold map.prev == nullptr
     }
-    if (!units && !use_prev) return;
-    if (e->j3_issued[src]) {
-        lsa_pf_join(ctx.stream(), e); // same source twice before the target ran: its scratch may still be read
+    const int src = ggml_get_op_params_i32(dst, 2);
+    GGML_ASSERT(src >= 0 && src < GGML_LSA_PREFETCH_SOURCES);
+    if (!units && !(ggml_get_op_params_i32(dst, 1) & GGML_LSA_PREFETCH_PREV)) {
+        return e;
+    }
+    if (e->j3_issued[src] && stream) {
+        lsa_pf_join(stream, e); // same source twice before the target ran: its scratch may still be read
+    }
+    lsa_j3_reserve(e->j3_desc[src], e->j3_desc_cap[src], size_t(ggml_nelements(desc)));
+    if (units) {
+        lsa_j3_reserve(e->j3_units[src], e->j3_units_cap[src], size_t(ggml_nelements(units)));
+    }
+    return e;
+}
+
+void ggml_cuda_lsa_prefetch_reserve(const ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_LSA_PREFETCH);
+    if (dst->src[1] && dst->src[0]) {
+        // cudaFree in a scratch growth waits for the device, so a pass still reading the old copy is safe
+        lsa_j3_setup(dst, ggml_cuda_get_device(), nullptr);
+    }
+}
+
+void ggml_cuda_lsa_j3_graph_end(ggml_backend_cuda_context & ctx) {
+    // a stream capture must rejoin every forked stream before it ends: join any pass whose target did not run
+    std::lock_guard<std::mutex> lock(lsa_pf_mutex);
+    for (auto * e : lsa_pf_entries) {
+        if (e->device == ctx.device) {
+            lsa_pf_join(ctx.stream(), e);
+        }
+    }
+}
+
+void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, sizeof(float), ctx.stream())); // the result is a placeholder
+    const ggml_tensor * desc = dst->src[0];
+    const ggml_tensor * units = dst->src[2];
+    const int unit = ggml_get_op_params_i32(dst, 0), flags = ggml_get_op_params_i32(dst, 1), src = ggml_get_op_params_i32(dst, 2);
+    GGML_ASSERT(src >= 0 && src < GGML_LSA_PREFETCH_SOURCES);
+    GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_is_contiguous(desc));
+    GGML_ASSERT(!units || (units->type == GGML_TYPE_F32 && ggml_is_contiguous(units) && unit >= 1));
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+    const bool capturing = capture != cudaStreamCaptureStatusNone;
+    GGML_ASSERT(!capturing || ggml_cuda_lsa_j3_graphs()); // the CUDA graph checks refuse this op otherwise
+    const bool use_prev = (flags & GGML_LSA_PREFETCH_PREV) != 0;
+    qsa_clock_tensor * e = nullptr;
+    if (capturing) {
+        // ggml_cuda_lsa_prefetch_reserve ran from the graph check for this graph: no allocation, only the join
+        e = dst->src[1] ? qsa_clock_entry(dst->src[1]) : nullptr;
+        if (!e || e->map.cells != GGML_LSA_PAGE_CELLS || e->map.strip_master || e->device != ctx.device) {
+            return;
+        }
+        GGML_ASSERT(e->pf_done && lsa_pf_stream[e->device] && e->map.prev && e->map.j3_src);
+        if (!units && !use_prev) return;
+        if (e->j3_issued[src]) {
+            lsa_pf_join(ctx.stream(), e);
+        }
+        GGML_ASSERT(size_t(ggml_nelements(desc)) <= e->j3_desc_cap[src]);
+        GGML_ASSERT(!units || size_t(ggml_nelements(units)) <= e->j3_units_cap[src]);
+    } else {
+        e = lsa_j3_setup(dst, ctx.device, ctx.stream());
+        if (!e) return; // no record-page slots (the whole body is on the card), or the unpublished strip-master source
+        if (!units && !use_prev) return;
     }
     const size_t ndesc = size_t(ggml_nelements(desc));
-    lsa_j3_reserve(e->j3_desc[src], e->j3_desc_cap[src], ndesc);
     CUDA_CHECK(cudaMemcpyAsync(e->j3_desc[src], desc->data, ndesc*sizeof(int32_t), cudaMemcpyDeviceToDevice, ctx.stream()));
     int64_t nunits = 0;
     int nrows = 0;
     if (units) {
         nunits = units->ne[0];
         nrows = int(units->ne[1]);
-        lsa_j3_reserve(e->j3_units[src], e->j3_units_cap[src], size_t(ggml_nelements(units)));
         CUDA_CHECK(cudaMemcpyAsync(e->j3_units[src], units->data, ggml_nbytes(units), cudaMemcpyDeviceToDevice, ctx.stream()));
     }
     e->j3_issued[src] = true;

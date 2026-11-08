@@ -5645,7 +5645,10 @@ static bool ggml_cuda_graph_check_compability_fast(ggml_cgraph * cgraph) {
             return false;
         }
         if (node->op == GGML_OP_LSA_PREFETCH) {
-            return false; // same rule as the plain check
+            if (!ggml_cuda_lsa_j3_graphs()) {
+                return false; // same rule as the plain check
+            }
+            ggml_cuda_lsa_prefetch_reserve(node); // all J3 host setup before capture
         }
     }
     return true;
@@ -5749,9 +5752,14 @@ static bool ggml_cuda_graph_check_compability_plain(ggml_cgraph * cgraph) {
             use_cuda_graph = false;
         }
 
-        // LLAMA_LSA_J3: the prefetch forks a side stream and decides on the host per call (scratch growth, pending joins)
+        // LLAMA_LSA_J3: the prefetch forks a side stream and decides on the host per call (scratch growth, pending joins).
+        // GGML_CUDA_LSA_J3_GRAPHS=1 moves that setup here, before capture, and keeps the graph.
         if (node->op == GGML_OP_LSA_PREFETCH) {
-            use_cuda_graph = false;
+            if (ggml_cuda_lsa_j3_graphs()) {
+                ggml_cuda_lsa_prefetch_reserve(node);
+            } else {
+                use_cuda_graph = false;
+            }
         }
 
         if (!use_cuda_graph) {
@@ -5807,6 +5815,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     if (moe_cache_changed) {
         graph->moe_cache_generation = moe_cache_generation;
         res = true;
+    }
+    if (ggml_cuda_lsa_j3_graphs()) {
+        const uint64_t lsa_j3_generation = ggml_cuda_lsa_j3_generation();
+        if (graph->lsa_j3_generation != lsa_j3_generation) {
+            graph->lsa_j3_generation = lsa_j3_generation;
+            res = true;
+        }
     }
 
     // A live tensor can only reference a KV streaming runtime by holding a
@@ -12172,6 +12187,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_moe_cache_table_graph_end(*cuda_ctx);
             }
 #endif
+            if (ggml_cuda_lsa_j3_graphs()) {
+                ggml_cuda_lsa_j3_graph_end(*cuda_ctx); // LLAMA_LSA_J3 side stream rejoins before cudaStreamEndCapture
+            }
         }
 
 #ifdef USE_CUDA_GRAPH

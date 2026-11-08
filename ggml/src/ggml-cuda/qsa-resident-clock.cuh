@@ -88,6 +88,13 @@ void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tens
 // CLOCK slots and copy them in on the low-priority side stream; the target's next prepare/refresh joins it. No-op for a
 // body without record-page slots.
 void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// GGML_CUDA_LSA_J3_GRAPHS=1 (opt-in): CUDA graphs keep running with GGML_OP_LSA_PREFETCH. The graph check calls
+// _reserve for every such node before capture (all allocation happens there); _generation changes whenever a captured
+// pointer would go stale; _graph_end joins the side stream before the capture ends.
+bool ggml_cuda_lsa_j3_graphs();
+uint64_t ggml_cuda_lsa_j3_generation();
+void ggml_cuda_lsa_prefetch_reserve(const ggml_tensor * dst);
+void ggml_cuda_lsa_j3_graph_end(ggml_backend_cuda_context & ctx);
 // LLAMA_LSA_RESIDENT_STICKY: card record -> slot table of a page body (slot >= 0 = on the card), nullptr if the body
 // has no record-page map; *records = table length
 const int32_t * ggml_cuda_lsa_page_table(const ggml_tensor * body, uint32_t * records);
