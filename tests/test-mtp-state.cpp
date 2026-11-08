@@ -1,6 +1,7 @@
 // Exercise real MTP cache restoration with a generated CPU model, split prefill, deferred rows, and adaptive draft widths.
 // Restore into a fresh driver and a different destination sequence.
 // --save-model PATH exports the fixture for other state tests.
+// --memoryless-state-only PATH checks shared Gemma KV and memoryless sequence files.
 // --bookkeep-output-only checks the experimental sampler output snapshot using only the CPU fixture.
 // --bookkeep-sampler-only emits an exact common-sampler digest for fresh-process environment comparisons.
 // --reserve-probe CTX PARALLEL [MODEL] measures production graph geometry without allocating weights or running kernels.
@@ -30,6 +31,7 @@
 #include "../src/llama-ext.h"
 #include "../src/llama-graph.h"
 #include "../src/llama-kv-cache.h"
+#include "../src/llama-kv-cache-iswa.h"
 #include "../src/llama-memory.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-memory-hybrid-idx.h"
@@ -180,7 +182,8 @@ static llama_model * make_model(bool no_alloc = false, const model_geometry & g 
     ms.add_kv(LLM_KV_CONTEXT_LENGTH, uint32_t(2048));
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH, g.embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT, g.layers);
-    ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, arch == LLM_ARCH_GEMMA4 ? uint32_t(0) :
+            arch == LLM_ARCH_GEMMA4_ASSISTANT ? g.layers : uint32_t(1));
     ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH, g.ff);
     ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, g.heads);
     ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, g.heads_kv);
@@ -195,6 +198,16 @@ static llama_model * make_model(bool no_alloc = false, const model_geometry & g 
     ms.add_kv(LLM_KV_SSM_STATE_SIZE, uint32_t(128));
     ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK, g.ssm_rank);
     ms.add_kv(LLM_KV_SSM_GROUP_COUNT, g.ssm_groups);
+    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t> { 1, 0 });
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW, uint32_t(64));
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA, g.head_dim);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, g.head_dim);
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, uint32_t(0));
+        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            ms.add_kv(LLM_KV_EMBEDDING_LENGTH_OUT, uint32_t(n_embd));
+        }
+    }
     if (arch == LLM_ARCH_QWEN4EXP) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT, uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
@@ -3536,6 +3549,70 @@ static void run_tail_chunks(llama_model * model, const cache_config & config, ui
             config.name, ub, boundary / ub, remainder, cold_error, cache_error);
 }
 
+static void run_memoryless_state(llama_model * model, const char * path) {
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 512;
+    cp.n_batch = cp.n_ubatch = 32;
+    cp.n_threads = cp.n_threads_batch = 2;
+    llama_context_ptr with_memory(llama_init_from_model(model, cp));
+    require(with_memory && llama_get_memory(with_memory.get()), "create memory-bearing context");
+    llama_model_ptr empty_model(make_model());
+    empty_model->hparams.vocab_only = true;
+    llama_context_ptr empty(llama_init_from_model(empty_model.get(), cp));
+    require(empty && !llama_get_memory(empty.get()), "create memoryless context");
+    model_geometry g;
+    g.layers = 2;
+    g.head_dim = g.rope_dim = 128;
+    llama_model_ptr target_model(make_model(false, g, LLM_ARCH_GEMMA4));
+    llama_context_ptr target(llama_init_from_model(target_model.get(), cp));
+    require(target != nullptr, "create Gemma target context");
+    g.embd = 128;
+    llama_model_ptr draft_model(make_model(false, g, LLM_ARCH_GEMMA4_ASSISTANT));
+    cp.ctx_other = target.get();
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    llama_context_ptr draft(llama_init_from_model(draft_model.get(), cp));
+    require(draft != nullptr, "create Gemma assistant context");
+    auto * target_kv = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(target.get()));
+    auto * draft_kv = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(draft.get()));
+    require(target_kv && draft_kv, "Gemma target and assistant have non-null shared KV wrappers");
+    auto * target_base = target_kv->get_base()->get_k_storage(1);
+    auto * target_swa = target_kv->get_swa()->get_k_storage(0);
+    auto * draft_base = draft_kv->get_base()->get_k_storage(1);
+    auto * draft_swa = draft_kv->get_swa()->get_k_storage(0);
+    require(target_base && target_swa && draft_base && draft_swa &&
+            target_base->data && target_swa->data &&
+            target_base->data == draft_base->data && target_swa->data == draft_swa->data,
+            "Gemma assistant borrows both target cache tensors");
+    const llama_token tokens[] = { 3, 7 };
+    for (auto * ctx : { draft.get(), empty.get() }) {
+        for (size_t count : { size_t(0), size_t(2) }) {
+            const size_t saved = llama_state_seq_save_file(ctx, path, 0, tokens, count);
+            require(saved == 12 + count*sizeof(llama_token), "empty payload file size");
+            size_t count_out = SIZE_MAX;
+            require(llama_state_seq_load_file(ctx, path, 0, nullptr, 0, &count_out) == 12 && count_out == count,
+                    "probe empty payload token count");
+            llama_token actual[] = { -1, -1 };
+            require(llama_state_seq_load_file(ctx, path, 0, actual, 2, &count_out) == saved && count_out == count,
+                    "restore empty payload");
+            require(std::equal(tokens, tokens + count, actual), "restore token bytes");
+            require(llama_state_seq_load_file(with_memory.get(), path, 0, actual, 2, &count_out) == 0,
+                    "memory-bearing context rejects empty payload");
+            if (count) {
+                require(llama_state_seq_load_file(ctx, path, 0, actual, 1, &count_out) == 0,
+                        "token capacity remains enforced");
+            }
+            {
+                llama_file file(path, "ab");
+                file.write_u32(1);
+            }
+            require(llama_state_seq_load_file(ctx, path, 0, actual, 2, &count_out) == 0,
+                    "empty-state context rejects trailing payload");
+        }
+    }
+    require(std::remove(path) == 0, "remove sequence fixture");
+    printf("PASS shared Gemma KV and memoryless sequence files: zero/two tokens, count probe, exact restore, malformed payload and capacity refusal\n");
+}
+
 int main(int argc, char ** argv) {
     const bool reserve_probe = (argc == 4 || argc == 5) && std::strcmp(argv[1], "--reserve-probe") == 0;
     common_log_set_verbosity_thold(LOG_LEVEL_ERROR);
@@ -3664,6 +3741,12 @@ int main(int argc, char ** argv) {
             return 0;
         }
         model = make_model();
+        if (argc == 3 && std::strcmp(argv[1], "--memoryless-state-only") == 0) {
+            run_memoryless_state(model, argv[2]);
+            llama_model_free(model);
+            llama_backend_free();
+            return 0;
+        }
         if (argc == 3 && std::strcmp(argv[1], "--save-model") == 0) {
             llama_model_saver saver(model);
             saver.add_kv_from_model();
