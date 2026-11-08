@@ -3626,6 +3626,11 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             overlap_cpu_rows.c_str(),
             session.config.serial_fill ? "serial" : "parallel",
             session.config.queue_max, session.config.queue_mb, moe_cache_det() ? 1 : 0);
+    const char * device_table = getenv("GGML_MOE_CACHE_DEVICE");
+    if (session.devices.size() > 1 && device_table && strcmp(device_table, "1") == 0) {
+        MOE_CACHE_LOG("[moe-cache] device table unavailable with %zu physical GPUs; using fallback expert path (use --device CUDA0 for the device table)\n",
+                session.devices.size());
+    }
 }
 
 static void * moe_cache_session_create(
