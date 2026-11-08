@@ -1,8 +1,10 @@
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import requests
 from utils import ServerPreset
 
 
@@ -147,3 +149,65 @@ def test_eval_cache_save_disabled(cache_server, tmp_path):
     complete(builder, 2003)
     builder.stop()
     assert entries(folder) == []
+
+
+def test_eval_cache_busy_slot(cache_server, tmp_path, monkeypatch):
+    live = {
+        "prompt": [128 + i % 24 for i in range(512)],
+        "id_slot": 0,
+        "temperature": 0,
+        "seed": 42,
+        "n_predict": 2048,
+        "ignore_eos": True,
+        "loop_guard": False,
+        "return_tokens": True,
+        "cache_prompt": False,
+    }
+    solo = cache_server("busy-solo")
+    queued_reference = complete(solo, 2003)
+    reference = solo.make_request("POST", "/completion", data=live)
+    assert reference.status_code == 200, reference.body
+    assert len(reference.body["tokens"]) == live["n_predict"]
+    solo.stop()
+
+    folder = tmp_path / "busy-cache"
+    builder = cache_server("busy-builder", folder=folder, build=True)
+    complete(builder, 2003, save_at=2003)
+    builder.stop()
+    assert [entry["n_tokens"] for entry in entries(folder)] == [1536]
+    before = snapshot(folder)
+
+    monkeypatch.setenv("DEBUG", "1")
+    server = cache_server("busy-cached", folder=folder)
+    chunks = []
+    with requests.post(server.make_url("/completion"), json={**live, "stream": True},
+                       stream=True, timeout=(5, 60)) as response:
+        assert response.status_code == 200, response.text
+        events = response.iter_lines(chunk_size=1)
+        for line in events:
+            if line.startswith(b"data: "):
+                chunks.append(json.loads(line[6:]))
+                if chunks[-1].get("tokens"):
+                    break
+        assert chunks and chunks[-1].get("tokens"), "live request did not start"
+        assert not chunks[-1]["stop"]
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            queued = pool.submit(complete, server, 2003)
+            for line in events:
+                if line.startswith(b"data: ") and line[6:] != b"[DONE]":
+                    chunks.append(json.loads(line[6:]))
+            result = queued.result(timeout=60)
+    server.stop()
+
+    log = (tmp_path / "busy-cached.log").read_text()
+    deferred = log.index("requested slot is unavailable, defer task")
+    restored = log.index("eval cache: restored entry")
+    assert deferred < restored, "cache restored into the busy slot before deferral"
+    assert log.count("eval cache: restored entry") == 1
+    assert chunks[-1]["stop"] and not chunks[-1]["truncated"]
+    assert [token for chunk in chunks for token in chunk.get("tokens", [])] == reference.body["tokens"]
+    assert result["tokens"] == queued_reference["tokens"]
+    assert result["content"] == queued_reference["content"]
+    assert result["timings"]["cache_n"] == 1536
+    assert result["timings"]["prompt_n"] == 467
+    assert snapshot(folder) == before

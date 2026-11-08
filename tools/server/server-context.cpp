@@ -2994,7 +2994,7 @@ private:
             }
 
             // [EVALFLAG] a stored eval prompt that covers more of this prompt than the slot can reuse
-            if (eval_cache && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
+            if (eval_cache && !ret->is_processing() && task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt &&
                     task.params.eval_cache_save_at == 0 && !task.tokens.has_mtmd && !task.is_child()) {
                 eval_cache_load(*ret, task);
             }
