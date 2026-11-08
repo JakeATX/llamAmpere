@@ -11,12 +11,18 @@
 #include <fstream>
 #include <system_error>
 #include <stdexcept>
+#include <utility>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <process.h>
 static int pc_getpid() { return _getpid(); }
 #else
 #include <unistd.h>
+extern char ** environ;
 static int pc_getpid() { return (int) getpid(); }
 #endif
 
@@ -24,25 +30,37 @@ namespace fs = std::filesystem;
 
 std::string server_prompt_cache_routing_key(
         const common_moe_cache_params & params) {
-    const char * cpu_split = getenv("GGML_MOE_CPU_SPLIT");
-    const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
-    // Match each backend switch's parse rule; unset and disabled share a key.
-    const bool split = cpu_split && strcmp(cpu_split, "1") == 0;
-    const bool graph = graph_opt && atoi(graph_opt) == 1;
     std::string key = "moe_cache=" + std::to_string((int) params.mode) +
         // Explicit AUTO overrides the provider mode; implicit AUTO inherits it.
         ",explicit=" + std::to_string(params.mode_explicit) +
         ",budget_mib=" + std::to_string(params.budget_mib) +
-        ",fit=" + std::to_string(params.fit_selected) +
-        ";GGML_MOE_CPU_SPLIT=" + std::to_string(split) +
-        ";GGML_CUDA_GRAPH_OPT=" + std::to_string(graph) + ";";
-    // Keep provider overrides too: params alone do not resolve an implicit mode.
-    // Raw, length-prefixed values conservatively miss on equivalent spellings.
-    for (const char * name : {"GGML_CUDA_MOE_CACHE_MODE", "GGML_CUDA_MOE_CACHE",
-            "GGML_CUDA_MOE_CACHE_BUDGET_MB", "GGML_CUDA_MOE_CACHE_RESERVE_MB"}) {
-        const char * value = getenv(name);
-        const std::string text = value ? value : "";
-        key += std::string(name) + "=" + std::to_string(text.size()) + ":" + text + ";";
+        ",fit=" + std::to_string(params.fit_selected) + ";";
+    // Backend knobs can change row placement or math; include future knobs too.
+    std::vector<std::pair<std::string, std::string>> env;
+    auto append = [&](const std::string & entry) {
+        const size_t end = entry.find('=');
+        if (entry.compare(0, 5, "GGML_") == 0 && end != std::string::npos) {
+            env.emplace_back(entry.substr(0, end), entry.substr(end + 1));
+        }
+    };
+#ifdef _WIN32
+    LPWCH block = GetEnvironmentStringsW();
+    if (!block) {
+        throw std::runtime_error("cannot read process environment for prompt cache key");
+    }
+    for (LPWCH e = block; *e; e += wcslen(e) + 1) {
+        append(wstring_to_utf8(e));
+    }
+    FreeEnvironmentStringsW(block);
+#else
+    for (char ** e = environ; e && *e; ++e) {
+        append(*e);
+    }
+#endif
+    std::sort(env.begin(), env.end());
+    for (const auto & entry : env) {
+        key += std::to_string(entry.first.size()) + ":" + entry.first +
+            std::to_string(entry.second.size()) + ":" + entry.second + ";";
     }
     return key;
 }

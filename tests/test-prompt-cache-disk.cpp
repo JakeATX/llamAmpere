@@ -61,7 +61,8 @@ static const uint64_t MiB = 1024ull*1024;
 static void test_routing_key() {
     const std::vector<std::string> names = {"GGML_MOE_CPU_SPLIT", "GGML_CUDA_GRAPH_OPT",
         "GGML_CUDA_MOE_CACHE_MODE", "GGML_CUDA_MOE_CACHE",
-        "GGML_CUDA_MOE_CACHE_BUDGET_MB", "GGML_CUDA_MOE_CACHE_RESERVE_MB"};
+        "GGML_CUDA_MOE_CACHE_BUDGET_MB", "GGML_CUDA_MOE_CACHE_RESERVE_MB",
+        "GGML_PROMPT_CACHE_TEST", "GGML_PROMPT_CACHE_TEST0", "PROMPT_CACHE_TEST_OTHER"};
     std::vector<std::string> saved;
     for (const auto & name : names) {
         saved.push_back(common_get_env(name));
@@ -79,7 +80,7 @@ static void test_routing_key() {
     }
     params.mode = COMMON_MOE_CACHE_MODE_AUTO;
     // Exercise real environment lookup, including implicit AUTO + --fit off.
-    for (size_t i = 0; i < names.size(); ++i) {
+    for (size_t i = 0; i + 1 < names.size(); ++i) {
         common_set_env(names[i], i == 2 ? "off" : i >= 4 ? "4096" : "1");
         CHECK(key() != base);
         CHECK(key().substr(0, prefix.size()) == prefix);
@@ -91,16 +92,26 @@ static void test_routing_key() {
         common_set_env(names[i], "");
         CHECK(key() == base);
     }
-    common_set_env(names[0], "01");
+    common_set_env(names.back(), "1");
     CHECK(key() == base);
-    common_set_env(names[0], "");
-    common_set_env(names[1], "01");
-    const std::string graph = key();
-    common_set_env(names[1], "1");
-    CHECK(key() == graph && graph != base);
-    common_set_env(names[1], "2");
+    common_set_env(names.back(), "");
+    // Environment insertion order must not change the key.
+    common_set_env(names[6], "a;=b:2");
+    common_set_env(names[7], "c");
+    const std::string ordered = key();
+    CHECK(ordered != base);
+    CHECK(ordered.find("22:GGML_PROMPT_CACHE_TEST") < ordered.find("23:GGML_PROMPT_CACHE_TEST0"));
+    common_set_env(names[6], "");
+    common_set_env(names[7], "");
+    common_set_env(names[7], "c");
+    common_set_env(names[6], "a;=b:2");
+    CHECK(key() == ordered);
+    common_set_env(names[6], "a");
+    common_set_env(names[7], ";=b:2c");
+    CHECK(key() != ordered);
+    common_set_env(names[6], "");
+    common_set_env(names[7], "");
     CHECK(key() == base);
-    common_set_env(names[1], "");
     params.mode_explicit = true;
     CHECK(key() != base);
     params.mode_explicit = false;
