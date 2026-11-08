@@ -53,13 +53,14 @@ while IFS= read -r device; do
     name=${BASH_REMATCH[1],,}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
     [[ -z $device_spec || ,${device_spec,,}, == *,"$name",* ]] || continue
     if (( card_mib < 23552 || free_mib < 14336 )); then
+        export GGML_CUDA_MOE_CACHE_RESERVE_MB=${GGML_CUDA_MOE_CACHE_RESERVE_MB-1536}
+        export LLAMA_PROMPT_TEMP_HEADROOM=${LLAMA_PROMPT_TEMP_HEADROOM-1}
         export LLAMA_B1_ADAPTIVE_PASSES=${LLAMA_B1_ADAPTIVE_PASSES:-1}
         shape+=(-ub 4096)
         # Adaptive B1 bounds each pass, so the full prompt can stay in one batch.
         (( LLAMA_B1_ADAPTIVE_PASSES > 0 )) || shape+=(-b 32768)
         # Keep the small-card graph pad; the larger pad was measured on 24 GB cards.
         if (( card_mib < 23552 )); then
-            export LLAMA_PROMPT_TEMP_HEADROOM=${LLAMA_PROMPT_TEMP_HEADROOM-0}
             export LLAMA_B1_TAIL_MIN_TOKENS=${LLAMA_B1_TAIL_MIN_TOKENS-1024}
             export LLAMA_B1_TAIL_UBATCH=${LLAMA_B1_TAIL_UBATCH-512}
         fi
