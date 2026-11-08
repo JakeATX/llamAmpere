@@ -19,6 +19,28 @@ def test_server_start_simple():
     assert res.status_code == 200
 
 
+@pytest.mark.parametrize("n_batch", [1, 2])
+def test_server_start_small_batch(n_batch, monkeypatch):
+    global server
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("LLAMA_ARG_N_GPU_LAYERS", "0")
+    server.n_gpu_layer = 0
+    server.n_slots = 1
+    server.n_batch = n_batch
+    server.n_ubatch = 1
+    server.start()
+    res = server.make_request("GET", "/health")
+    assert res.status_code == 200
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Once upon a time",
+        "n_predict": 8,
+        "temperature": 0,
+        "ignore_eos": True,
+    })
+    assert res.status_code == 200
+    assert res.body["tokens_predicted"] == 8
+
+
 def test_server_multiple_addresses(monkeypatch):
     # The CLI value replaces the environment value, including an unavailable address.
     monkeypatch.setenv("LLAMA_ARG_HOST", "192.0.2.1")
