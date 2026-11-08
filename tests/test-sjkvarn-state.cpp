@@ -70,14 +70,14 @@ static void tensor_data(ggml_tensor * tensor, void * /*userdata*/) {
     ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
 }
 
-static llama_model * make_model(bool resident = false, llm_arch arch = LLM_ARCH_LLAMA) {
+static llama_model * make_model(bool resident = false, llm_arch arch = LLM_ARCH_LLAMA, uint32_t head_dim = n_embd/2) {
     gguf_context * meta = gguf_init_empty();
     {
         llama_model_saver ms(arch, meta);
         ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(arch));
         ms.add_kv(LLM_KV_VOCAB_SIZE,                   n_vocab);
         ms.add_kv(LLM_KV_CONTEXT_LENGTH,               uint32_t(8192));
-        ms.add_kv(LLM_KV_EMBEDDING_LENGTH,             n_embd);
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH,             2*head_dim);
         ms.add_kv(LLM_KV_BLOCK_COUNT,                  n_layer);
         ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,          uint32_t(768));
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,         uint32_t(2));
@@ -1612,7 +1612,71 @@ static void ple_cold_recheck_case() {
 #endif
 }
 
+static void padded_clear_case() {
+    ggml_backend_load_all();
+    llama_backend_init();
+    llama_model_ptr model(make_model(false, LLM_ARCH_LLAMA, 96));
+    require(model != nullptr, "96-channel test model");
+    int checked = 0;
+    for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (bool shared : {false, true}) {
+            llama_kv_cache cache(*model, model->hparams, type, type, false, false, true, 32, 2, 1, 0,
+                                 LLAMA_SWA_TYPE_NONE, nullptr, {}, {}, {});
+            llama_pos pos[] = {0, 1, 2, 3};
+            llama_seq_id id = 0;
+            llama_seq_id * ids[] = {&id, &id, &id, &id};
+            int32_t counts[] = {1, 1, 1, 1};
+            llama_ubatch batch = {};
+            batch.b_equal_seqs = 1;
+            batch.n_tokens = batch.n_seq_tokens = 4;
+            batch.n_seqs = batch.n_seqs_unq = batch.n_pos = 1;
+            batch.pos = pos;
+            batch.n_seq_id = counts;
+            batch.seq_id = ids;
+            batch.seq_id_unq = &id;
+            const auto slots = cache.find_slot(batch, true);
+            require(!slots.empty() && slots.size() == 4, "four allocated cells");
+            cache.apply_ubatch(slots, batch);
+            if (shared) cache.seq_cp(0, 1, 1, 2);
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                for (auto * tensor : {cache.get_k_storage(il), cache.get_v_storage(il)}) {
+                    require(tensor != nullptr, "K and V storage");
+                    require(tensor->ne[0] == (type == GGML_TYPE_Q8_0 ? 192 : 256), "padded storage width");
+                    std::vector<uint8_t> bytes(ggml_nbytes(tensor), 0xa5);
+                    ggml_backend_tensor_set(tensor, bytes.data(), 0, bytes.size());
+                }
+            }
+            cache.state_clear(0);
+            require(cache.seq_pos_max(0) == -1, "cleared sequence metadata");
+            if (shared) require(cache.seq_pos_max(1) == 1, "shared cell metadata retained");
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                for (auto * tensor : {cache.get_k_storage(il), cache.get_v_storage(il)}) {
+                    const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+                    std::vector<uint8_t> expected(ggml_nbytes(tensor), 0xa5), actual(expected.size());
+                    for (size_t i = 0; i < 4; ++i) {
+                        if (shared && i == 1) continue;
+                        memset(expected.data() + slots.idxs[0][i]*row_size, 0, row_size);
+                    }
+                    ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+                    require(actual == expected, "full padded rows cleared; shared and unused rows unchanged");
+                    ++checked;
+                }
+            }
+        }
+    }
+    printf("OK: padded KV clear %d full-buffer comparisons\n", checked);
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--padded-clear") == 0) {
+        try {
+            padded_clear_case();
+            return 0;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "padded KV clear: FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
     if (argc > 1 && strcmp(argv[1], "--ple-populate-direct") == 0) {
         try {
             for (size_t offset : { 0, 64, 4092 }) {

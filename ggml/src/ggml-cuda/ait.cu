@@ -880,11 +880,7 @@ template <int NT, bool FULL, int PC>
 static void ait_mmv_p(const dim3 grid, const dim3 block, cudaStream_t stream, const char * w, const int8_t * xq, const float * sa,
         float * Y, int M, int K, float * partial, unsigned int * tcnt) {
     constexpr int SMEM = aitk::ptab_bytes<PC, 16>();
-    static bool attr = false;
-    if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_ait_mmv<2, NT, FULL, PC>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
-        attr = true;
-    }
+    CUDA_SET_SHARED_MEMORY_LIMIT((k_ait_mmv<2, NT, FULL, PC>), SMEM);
     k_ait_mmv<2, NT, FULL, PC><<<grid, block, SMEM, stream>>>(w, xq, sa, Y, M, K, nullptr, 0, partial, tcnt);
 }
 
@@ -893,11 +889,9 @@ template <int KB, int NT, int PC, int V>
 static void ait_mmv_v(const dim3 grid, const dim3 block, cudaStream_t stream, const char * w, const int8_t * xq, const float * sa,
         float * Y, int M, int K, const float * X, int l2pf, float * partial) {
     constexpr int SMEM = aitk::ptab_bytes<PC, 16>();
-    static bool attr = false;
-    if (!attr && SMEM > 0) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_ait_mmv<KB, NT, true, PC, V>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+    if constexpr (SMEM > 0) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((k_ait_mmv<KB, NT, true, PC, V>), SMEM);
     }
-    attr = true;
     if constexpr ((V & 2) != 0) {
         unsigned int * tc0 = nullptr;
         int det0 = 0;
@@ -1447,11 +1441,7 @@ template <int KB, int NB, int PC = 0, int NC = 16>
 static void ait_mmq_launch(const char * W, const int8_t * xq, const float * sa, float * Y, int M, int K, int T, cudaStream_t stream) {
     constexpr int TN = 8 * NB, SMEM = 2 * 16 * TN * 32 + aitk::ptab_bytes<PC, NC>();
     static_assert(SMEM <= 99 * 1024, "smem");
-    static bool attr = false;
-    if (!attr) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_ait_mmq<KB, NB, PC, NC>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
-        attr = true;
-    }
+    CUDA_SET_SHARED_MEMORY_LIMIT((k_ait_mmq<KB, NB, PC, NC>), SMEM);
     const dim3 grid((unsigned) ((T + TN - 1) / TN), (unsigned) ((M / 32 + 7) / 8)), block(256);
     k_ait_mmq<KB, NB, PC, NC><<<grid, block, SMEM, stream>>>(W, xq, sa, Y, M, K, T);
 }

@@ -1645,7 +1645,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
             if (files.empty()) {
-                max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
+                max_n_tensors += hparams.n_layer_all*256; // include draft-only layers in generated models
             }
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
@@ -1834,7 +1834,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     };
 
     if (files.empty()) {
-        if (flags & TENSOR_SKIP_IF_VIRTUAL) {
+        if ((flags & (TENSOR_SKIP_IF_VIRTUAL | TENSOR_SKIP)) || llm_tensor_info_for(tn.tensor).op == GGML_OP_NONE) {
             return nullptr;
         }
         ggml_type type = GGML_TYPE_F32;

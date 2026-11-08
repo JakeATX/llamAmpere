@@ -339,7 +339,6 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
     const size_t kv_elements_per_head = plan.kv_elements_per_head;
     const size_t output_elements_per_head = plan.output_elements_per_head;
     const size_t kv_elements = plan.kv_elements;
-    const size_t output_bytes = plan.output_bytes;
 
     // Scratch: the region ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size reserved behind dst in the compute buffer,
     // or the pool when dst was not allocated through the buffer type (a view, no buffer) or the region is short.
@@ -348,7 +347,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         offset + plan.scratch_bytes <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
     ggml_cuda_pool_alloc<half> scratch_pool(ctx.pool());
     half * scratch_ptr = reserved ? (half *) ((char *) dst->data + offset) :
-        scratch_pool.alloc(plan.i8qk ? (plan.scratch_bytes + sizeof(half) - 1)/sizeof(half) : 2*kv_elements + output_bytes/sizeof(half));
+        scratch_pool.alloc((plan.scratch_bytes + sizeof(half) - 1)/sizeof(half));
 
     float * output = grouped ? (float *) (scratch_ptr + 2*kv_elements) : (float *) dst->data;
 

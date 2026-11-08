@@ -16,8 +16,8 @@
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP   // the IQ grids, for the AVX-512 dot loops below
 #include "../ggml-common.h"
-#include "moe-iq-rows.h"
 #include "moe-ai-rows.h"
+#include "moe-cpu-split-dispatch.h"
 #include "../ggml-cpu/quants.h"
 #include "../ggml-cpu/vec.h"
 
@@ -50,14 +50,7 @@
 static void moe_ai_log_first(const char * role) {
     static std::atomic<bool> logged{false};
     if (logged.exchange(true)) { return; }
-#if defined(__AVX2__) && defined(__FMA__)
-    const char * isa = moe_ai::has_avx512() ? "avx512" : "avx2";
-#else
-    const char * isa = "scalar";
-#endif
-#if defined(__AVX2__) && defined(__FMA__)
-    if (moe_ai::use_host_q8()) { isa = moe_ai::use_q8_vbmi() ? "avx512-vbmi" : "avx2"; } // q8: AVX2 unless GGML_MOE_AI_HOST_Q8_VBMI=1
-#endif
+    const char * isa = moe_cs_get_kernels().ai_decode();
     fprintf(stderr, "[moe-cpu-split] first host AI+ expert compute: role=%s decode=%s act=%s%s\n", role, isa,
             moe_ai::use_host_q8() ? "q8 (default; GGML_MOE_AI_HOST_Q8=0 = f32)" : "f32 (GGML_MOE_AI_HOST_Q8=0)",
             moe_ai::use_host_q8() && moe_ai::use_q8_lv() ? " lv=on (GGML_MOE_AI_HOST_Q8_LV=1)" : "");
@@ -99,184 +92,6 @@ int env_int(const char * name, int def, int lo, int hi) {
 inline void cpu_relax() {
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
-#endif
-}
-
-// Q2_0 (64 weights: an fp16 scale and 2-bit codes 0..3 meaning -1..2) against two Q8_0 blocks.
-// BMI2 pdep spreads each 16-bit group of codes over 8 bytes, so a 32-weight half is four pdeps.
-void dot_q2_0_q8_0(int n, float * s, const void * vx, const void * vy) {
-    const block_q2_0 * x = (const block_q2_0 *) vx;
-    const block_q8_0 * y = (const block_q8_0 *) vy;
-    const int nb = n / QK2_0;
-#if defined(__AVX2__) && defined(__BMI2__)
-    const __m256i ones8 = _mm256_set1_epi8(1);
-    const __m256i ones16 = _mm256_set1_epi16(1);
-    __m256 acc = _mm256_setzero_ps();
-    for (int i = 0; i < nb; ++i) {
-        const float d0 = ggml_fp16_to_fp32(x[i].d);
-        for (int k = 0; k < 2; ++k) {
-            const block_q8_0 & yb = y[2 * i + k];
-            uint64_t codes;
-            memcpy(&codes, x[i].qs + 8 * k, 8);
-            const uint64_t m = 0x0303030303030303ull;
-            const __m256i w = _mm256_set_epi64x((long long) _pdep_u64(codes >> 48, m), (long long) _pdep_u64((codes >> 32) & 0xffff, m),
-                    (long long) _pdep_u64((codes >> 16) & 0xffff, m), (long long) _pdep_u64(codes & 0xffff, m));
-            const __m256i q = _mm256_loadu_si256((const __m256i *) yb.qs);
-            const __m256i wq = _mm256_madd_epi16(_mm256_maddubs_epi16(w, q), ones16);
-            const __m256i sq = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, q), ones16);
-            const __m256 d = _mm256_set1_ps(d0 * ggml_fp16_to_fp32(yb.d));
-            acc = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(wq, sq)), acc);
-        }
-    }
-    __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
-    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
-    h = _mm_add_ss(h, _mm_movehdup_ps(h));
-    *s = _mm_cvtss_f32(h);
-#else
-    float sum = 0.0f;
-    for (int i = 0; i < nb; ++i) {
-        const float d0 = ggml_fp16_to_fp32(x[i].d);
-        for (int k = 0; k < 2; ++k) {
-            const block_q8_0 & yb = y[2 * i + k];
-            int isum = 0;
-            for (int j = 0; j < 32; ++j) {
-                const int code = (x[i].qs[8 * k + j / 4] >> (2 * (j % 4))) & 3;
-                isum += (code - 1) * yb.qs[j];
-            }
-            sum += d0 * ggml_fp16_to_fp32(yb.d) * (float) isum;
-        }
-    }
-    *s = sum;
-#endif
-}
-
-// Q2_0 down rows, fast form (GGML_MOE_CPU_SPLIT_Q2_FAST=1). The hidden row is quantized once per route and its
-// bytes are reordered inside each 32-weight block (position 8 s + b holds weight 4 b + s), so the 2-bit codes need
-// no spreading: one 64-bit shift per lane (0, 2, 4, 6) and a mask line them up with the reordered bytes. The -1 code
-// offset is folded out: sum (c - 1) q = sum c q - sum q, and sum q per block is computed once per hidden row (yc).
-// Four weight rows share each hidden block load. Same integer products as dot_q2_0_q8_0; the float sums group
-// differently (valid math).
-#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
-inline float hsum8(__m256 v) {
-    __m128 h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
-    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
-    h = _mm_add_ss(h, _mm_movehdup_ps(h));
-    return _mm_cvtss_f32(h);
-}
-#endif
-
-void q2_reorder_hidden(int n, block_q8_0 * y, float * yd, float * yc, bool shuffle_bytes) {
-    const int nb = n / QK8_0;
-#if defined(__AVX2__)
-    const __m256i shuffle = _mm256_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
-            0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
-    const __m256i lanes = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-#else
-    (void) shuffle_bytes;
-#endif
-    for (int i = 0; i < nb; ++i) {
-        int sum = 0;
-#if defined(__AVX2__)
-        if (shuffle_bytes) {
-            const __m256i q = _mm256_loadu_si256((const __m256i *) y[i].qs);
-            const __m256i reordered = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(q, shuffle), lanes);
-            _mm256_storeu_si256((__m256i *) y[i].qs, reordered);
-            const __m256i sums = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), q), _mm256_set1_epi16(1));
-            __m128i total = _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
-            total = _mm_hadd_epi32(total, total);
-            total = _mm_hadd_epi32(total, total);
-            sum = _mm_cvtsi128_si32(total);
-        } else
-#endif
-        {
-            int8_t t[QK8_0];
-            for (int s = 0; s < 4; ++s) {
-                for (int b = 0; b < 8; ++b) {
-                    const int8_t q = y[i].qs[4 * b + s];
-                    t[8 * s + b] = q;
-                    sum += q;
-                }
-            }
-            memcpy(y[i].qs, t, QK8_0);
-        }
-        yd[i] = ggml_fp16_to_fp32(y[i].d);
-        if (i & 1) { yc[i / 2] += yd[i] * (float) sum; } else { yc[i / 2] = yd[i] * (float) sum; }
-    }
-}
-
-template<int NT>
-void dot_q2_0_rows(int n, int nrows, const char * w, size_t row_bytes, const block_q8_0 * y, size_t y_stride,
-        const float * yd, const float * yc, size_t aux_stride, float * out, size_t out_stride, int ahead) {
-    const int nb = n / QK2_0;
-#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
-    const __m256i shifts = _mm256_set_epi64x(6, 4, 2, 0);
-    const __m256i m3 = _mm256_set1_epi8(3);
-    const __m256i ones16 = _mm256_set1_epi16(1);
-    constexpr int rows = 4 / NT;
-    for (int r = 0; r < nrows; r += rows) {
-        const int nr = std::min(rows, nrows - r);
-        __m256 acc[NT][rows];
-        float corr[NT][rows] = {};
-        for (int t = 0; t < NT; ++t) {
-            for (int k = 0; k < rows; ++k) { acc[t][k] = _mm256_setzero_ps(); }
-        }
-        for (int i = 0; i < nb; ++i) {
-            __m256i q0[NT], q1[NT];
-            __m256 s0[NT], s1[NT];
-            for (int t = 0; t < NT; ++t) {
-                const auto * yt = (const block_q8_0 *) ((const char *) y + (size_t) t * y_stride);
-                q0[t] = _mm256_loadu_si256((const __m256i *) yt[2 * i].qs);
-                q1[t] = _mm256_loadu_si256((const __m256i *) yt[2 * i + 1].qs);
-                s0[t] = _mm256_set1_ps(yd[(size_t) t * aux_stride + 2 * i]);
-                s1[t] = _mm256_set1_ps(yd[(size_t) t * aux_stride + 2 * i + 1]);
-            }
-            for (int k = 0; k < nr; ++k) {
-                const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) (r + k) * row_bytes) + i;
-                if (ahead > 0 && i + ahead < nb && (i & 3) == 0) {
-                    _mm_prefetch((const char *) (x + ahead), _MM_HINT_T0);
-                    _mm_prefetch((const char *) (x + ahead + 1) - 1, _MM_HINT_T0);
-                }
-                const float d = _cvtsh_ss(x->d);
-                long long c0, c1;
-                memcpy(&c0, x->qs, 8);
-                memcpy(&c1, x->qs + 8, 8);
-                const __m256i w0 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(c0), shifts), m3);
-                const __m256i w1 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(c1), shifts), m3);
-                for (int t = 0; t < NT; ++t) {
-                    const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(w0, q0[t]), ones16);
-                    const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(w1, q1[t]), ones16);
-                    const __m256 f = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p0), s0[t], _mm256_mul_ps(_mm256_cvtepi32_ps(p1), s1[t]));
-                    acc[t][k] = _mm256_fmadd_ps(_mm256_set1_ps(d), f, acc[t][k]);
-                    corr[t][k] += d * yc[(size_t) t * aux_stride + i];
-                }
-            }
-        }
-        for (int t = 0; t < NT; ++t) {
-            for (int k = 0; k < nr; ++k) { out[(size_t) t * out_stride + r + k] = hsum8(acc[t][k]) - corr[t][k]; }
-        }
-    }
-#else
-    (void) ahead;
-    for (int t = 0; t < NT; ++t) {
-        const auto * yt = (const block_q8_0 *) ((const char *) y + (size_t) t * y_stride);
-        for (int r = 0; r < nrows; ++r) {
-            const block_q2_0 * x = (const block_q2_0 *) (w + (size_t) r * row_bytes);
-            float sum = 0.0f;
-            for (int i = 0; i < nb; ++i) {
-                const float d = ggml_fp16_to_fp32(x[i].d);
-                for (int k = 0; k < 2; ++k) {
-                    const block_q8_0 & yb = yt[2 * i + k];
-                    int isum = 0;
-                    for (int s = 0; s < 4; ++s) {
-                        for (int b = 0; b < 8; ++b) { isum += ((x[i].qs[8 * k + b] >> (2 * s)) & 3) * yb.qs[8 * s + b]; }
-                    }
-                    sum += d * yd[(size_t) t * aux_stride + 2 * i + k] * (float) isum;
-                }
-                sum -= d * yc[(size_t) t * aux_stride + i];
-            }
-            out[(size_t) t * out_stride + r] = sum;
-        }
-    }
 #endif
 }
 
@@ -468,9 +283,7 @@ struct role_math {
     ggml_type vec_type = GGML_TYPE_COUNT;
     ggml_from_float_t quant = nullptr;
     size_t vec_bytes = 0;       // bytes of one quantized input row
-#if defined(MOE_IQ_ROWS)
-    moe_iq::rows_fn rows[9] = {};   // IQ up/gate kernels for 1..8 tokens
-#endif
+    moe_cs_rows_fn rows[9] = {};   // IQ up/gate kernels for 1..8 tokens
 };
 
 struct layer_math {
@@ -665,7 +478,7 @@ static bool r8_init(pool_state & s) {
     for (const layer_math & L : s.layers) {
         for (int k = 0; L.ok && k < 3; ++k) {
             const role_math & m = L.role[k];
-            if (!m.ai_q8 || !moe_ai::r8_ok(m.ai_k, m.ai_C, m.r.n_out, m.r.n_in)) { continue; }
+            if (!m.ai_q8 || !moe_cs_get_kernels().ai_r8_ok(m.ai_k, m.ai_C, m.r.n_out, m.r.n_in)) { continue; }
             slot = std::max(slot, moe_ai::r8_slot_bytes(m.r.n_out, m.r.n_in));
             ne = std::max(ne, (int) m.r.n_expert);
         }
@@ -717,7 +530,7 @@ static void r8_plan(pool_state & s, int layer, bool card) {
         for (int k = 0; k < 3; ++k) {
             const role_math & m = s.cur->role[k];
             if (!m.ai_q8) { continue; }
-            if (!moe_ai::r8_ok(m.ai_k, m.ai_C, m.r.n_out, m.r.n_in) || !moe_cs_load_acquire(&m.r.src[s.expert[i]])) { ++c.plain; continue; }
+            if (!moe_cs_get_kernels().ai_r8_ok(m.ai_k, m.ai_C, m.r.n_out, m.r.n_in) || !moe_cs_load_acquire(&m.r.src[s.expert[i]])) { ++c.plain; continue; }
             const int32_t idx = (int32_t) (((size_t) layer * c.n_expert + s.expert[i]) * 3 + k);
             int sl = c.map[idx];
             if (sl >= 0 && c.ready[sl]) {
@@ -746,13 +559,14 @@ static void r8_plan(pool_state & s, int layer, bool card) {
 static inline void r8_proj(const pool_state & s, const role_math & m, int i, int k, const char * w, int64_t a, int64_t b, int nt,
                            const void * const * q, float * const * o) {
     switch (b - a == AI4_TR ? s.r8m[i][k] : 0) {
-        case 1:  moe_ai::slab_rows_r8(s.r8p[i][k], a, m.r.n_out, m.r.n_in, nt, q, o); return;
-        case 2:  moe_ai::slab_rows_q8_keep(w, m.r.row_bytes, m.ai_k, m.ai_C, a, m.r.n_out, m.r.n_in, nt, q, o, s.r8p[i][k]); return;
-        default: moe_ai::slab_rows_q8(w, m.r.row_bytes, m.ai_k, m.ai_C, a, b, m.r.n_in, nt, q, o);
+        case 1:  moe_cs_get_kernels().ai_r8(s.r8p[i][k], a, m.r.n_out, m.r.n_in, nt, q, o); return;
+        case 2:  moe_cs_get_kernels().ai_keep(w, m.r.row_bytes, m.ai_k, m.ai_C, a, m.r.n_out, m.r.n_in, nt, q, o, s.r8p[i][k]); return;
+        default: moe_cs_get_kernels().ai_q8(w, m.r.row_bytes, m.ai_k, m.ai_C, a, b, m.r.n_in, nt, q, o);
     }
 }
 
 void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) {
+    const moe_cs_kernels & math = moe_cs_get_kernels();
     const layer_math & L = *s.cur;
     uint8_t * const xq = xq_mine ? xq_mine : s.xq.data();
     if (phase == 0) {
@@ -767,7 +581,7 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
         m.quant(s.hidden.data() + (size_t) item * s.max_ff, s.hq.data() + (size_t) item * s.hq_stride, m.r.n_in);
         if (s.q2_fast && m.q2) {
             float * aux = s.hq_aux.data() + (size_t) item * s.aux_stride;
-            q2_reorder_hidden((int) m.r.n_in, (block_q8_0 *) (s.hq.data() + (size_t) item * s.hq_stride), aux,
+            math.q2_reorder((int) m.r.n_in, (block_q8_0 *) (s.hq.data() + (size_t) item * s.hq_stride), aux,
                     aux + m.r.n_in / QK8_0, s.q2_shuffle);
         }
         return;
@@ -808,8 +622,8 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
                         r8_proj(s, up, i, 0, wu, a, b, nt, qu, uo);
                         r8_proj(s, gate, i, 1, wg, a, b, nt, qg, go);
                     } else if (wu && wg) {
-                        moe_ai::slab_rows(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, yu, uo);
-                        moe_ai::slab_rows(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, yg, go);
+                        math.ai_f32(wu, up.r.row_bytes, up.ai_k, up.ai_C, a, b, up.r.n_in, nt, yu, uo);
+                        math.ai_f32(wg, gate.r.row_bytes, gate.ai_k, gate.ai_C, a, b, gate.r.n_in, nt, yg, go);
                     }
                     for (int t = 0; t < nt; ++t) {
                         float * h = s.hidden.data() + (size_t) (q0 + t) * s.max_ff + a;
@@ -823,7 +637,6 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
             if (!wu || !wg) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
             return;
         }
-#if defined(MOE_IQ_ROWS)
         if (up.rows[4] && gate.rows[4]) {
             // Decode once for each token group; AVX-512 uses a different valid float reduction order.
             auto proj = [&](const role_math & m, const char * w, int nt, int64_t a, int64_t b, int nb,
@@ -876,7 +689,6 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
             if (!wu || !wg) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
             return;
         }
-#endif
         for (int64_t row = r0; row < r1; ++row) {
             const char * wu = role_row(s, up, e, row);
             const char * wg = role_row(s, gate, e, row);
@@ -886,8 +698,8 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
                     const int input = s.input_of[q];
                     const uint8_t * xu = xq + (size_t) input * s.xq_stride;
                     const uint8_t * xgp = xq + (xg + input) * s.xq_stride;
-                    if (up.q2) { dot_q2_0_q8_0((int) up.r.n_in, &u, wu, xu); } else { up.dot((int) up.r.n_in, &u, 0, wu, 0, xu, 0, 1); }
-                    if (gate.q2) { dot_q2_0_q8_0((int) gate.r.n_in, &g, wg, xgp); } else { gate.dot((int) gate.r.n_in, &g, 0, wg, 0, xgp, 0, 1); }
+                    if (up.q2) { math.q2_dot((int) up.r.n_in, &u, wu, xu); } else { up.dot((int) up.r.n_in, &u, 0, wu, 0, xu, 0, 1); }
+                    if (gate.q2) { math.q2_dot((int) gate.r.n_in, &g, wg, xgp); } else { gate.dot((int) gate.r.n_in, &g, 0, wg, 0, xgp, 0, 1); }
                 }
                 s.hidden[(size_t) q * s.max_ff + row] = g / (1.0f + expf(-g)) * u;
             }
@@ -921,7 +733,7 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
                 if (w && down.ai_q8) {
                     r8_proj(s, down, i, 2, w, a, b, nt, yq, oa);
                 } else if (w) {
-                    moe_ai::slab_rows(w, down.r.row_bytes, down.ai_k, down.ai_C, a, b, down.r.n_in, nt, y, oa);
+                    math.ai_f32(w, down.r.row_bytes, down.ai_k, down.ai_C, a, b, down.r.n_in, nt, y, oa);
                 } else {
                     for (int t = 0; t < nt; ++t) { for (int64_t row = a; row < b; ++row) { oa[t][row - a] = 0.0f; } }
                 }
@@ -938,19 +750,19 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
             const float * aux = s.hq_aux.data() + (size_t) q * s.aux_stride;
             const auto * y = (const block_q8_0 *) (s.hq.data() + (size_t) q * s.hq_stride);
             if (s.q2_group4 && q + 3 < s.first[i + 1]) {
-                dot_q2_0_rows<4>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                math.q2_rows[4]((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
                         aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
                 q += 4;
             } else if (s.q2_group4 && q + 2 < s.first[i + 1]) {
-                dot_q2_0_rows<3>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                math.q2_rows[3]((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
                         aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
                 q += 3;
             } else if (s.q2_pair && q + 1 < s.first[i + 1]) {
-                dot_q2_0_rows<2>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                math.q2_rows[2]((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
                         aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
                 q += 2;
             } else {
-                dot_q2_0_rows<1>((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
+                math.q2_rows[1]((int) down.r.n_in, (int) (r1 - r0), w, down.r.row_bytes, y, s.hq_stride,
                         aux, aux + down.r.n_in / QK8_0, s.aux_stride, o, s.out_stride, s.q2_pf);
                 ++q;
             }
@@ -958,7 +770,6 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
         if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
         return;
     }
-#if defined(MOE_IQ_ROWS)
     if (s.down_reuse && down.rows[4]) {
         const char * w = role_row(s, down, e, 0);
         for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += s.group_tokens) {
@@ -982,7 +793,6 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
         if (!w) { s.st_null.fetch_add(1, std::memory_order_relaxed); }
         return;
     }
-#endif
     if (s.down_reuse && down.r.type == GGML_TYPE_IQ4_NL) {
         for (int q0 = s.first[i]; q0 < s.first[i + 1]; q0 += s.group_tokens) {
             const int nt = std::min(s.group_tokens, s.first[i + 1] - q0);
@@ -1006,7 +816,7 @@ void run_item(pool_state & s, int phase, int item, uint8_t * xq_mine = nullptr) 
             float v = 0.0f;
             if (w) {
                 const uint8_t * h = s.hq.data() + (size_t) q * s.hq_stride;
-                if (down.q2) { dot_q2_0_q8_0((int) down.r.n_in, &v, w, h); } else { down.dot((int) down.r.n_in, &v, 0, w, 0, h, 0, 1); }
+                if (down.q2) { math.q2_dot((int) down.r.n_in, &v, w, h); } else { down.dot((int) down.r.n_in, &v, 0, w, 0, h, 0, 1); }
             }
             s.out[(size_t) q * s.out_stride + row] = v;
         }
@@ -1464,14 +1274,12 @@ bool moe_cs_start(moe_cs_job * job, const float * x, size_t x_stride, float * ou
     s.hq_aux.assign(MOE_CS_MAX_ROUTES * s.aux_stride, 0.0f, align);
     s.rows_ug = env_int("GGML_MOE_CPU_SPLIT_ROWS_UG", 16, 1, 4096);
     s.rows_down = env_int("GGML_MOE_CPU_SPLIT_ROWS_DOWN", 64, 1, 8192);
-#if defined(MOE_IQ_ROWS)
     {   // 1 = on with the measured best kernel mix; 2..17 = on with moe_iq::get variant bits (value - 2)
         const int v = env_int("GGML_MOE_CPU_SPLIT_ROWS", 0, 0, 17);
-        s.iq_variant = v == 0 ? -1 : v == 1 ? moe_iq::variant_best : v - 2;
+        s.iq_variant = v == 0 ? -1 : v == 1 ? (1 | 8) : v - 2;
     }
     s.iq_rows = s.iq_variant >= 0;
     s.iq_pf = env_int("GGML_MOE_CPU_SPLIT_PF", 2048, 0, 1 << 16);
-#endif
     s.spin_ms = env_int("GGML_MOE_CPU_SPLIT_SPIN_MS", 250, 0, 600000);
     s.spin_us = env_int("GGML_MOE_CPU_SPLIT_SPIN_US", s.spin_ms * 1000, 0, 600000000);
     s.nap_us = env_int("GGML_MOE_CPU_SPLIT_NAP_US", 1000, 1, 100000);
@@ -1692,11 +1500,11 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
             m.ai_k = ggml_ai4_rate(t);
             m.ai_C = ggml_ai4_trellis_mul(t);
             m.vec_type = GGML_TYPE_F32;
-            m.quant = moe_ai::rotate;
+            m.quant = moe_cs_get_kernels().ai_rotate;
             m.vec_bytes = (size_t) m.r.n_in * sizeof(float);
             if (moe_ai::use_host_q8() && m.r.n_in <= 8192) {   // rotate_q8's stack row holds 8192 floats
                 m.ai_q8 = true;
-                m.quant = moe_ai::rotate_q8;
+                m.quant = moe_cs_get_kernels().ai_rotate_q8;
                 m.vec_bytes = moe_ai::q8_bytes(m.r.n_in);
             }
             // U2 row-scale types (K % 640) are read by block (moe_ai::unit_src); the row size must give the type's layout,
@@ -1719,16 +1527,11 @@ bool moe_cs_register_layer(int layer, const moe_cs_role roles[3]) {
         if (s.avx512 && t == GGML_TYPE_IQ3_XXS) { m.dot = dot_iq3_xxs_q8_K_512; }
 #endif
         m.vec_type = tr->vec_dot_type;
-#if defined(MOE_IQ_ROWS)
         for (int nt = 1; nt <= s.group_tokens; ++nt) {
             if (s.iq_rows && m.vec_type == GGML_TYPE_Q8_K) {
-                m.rows[nt] = moe_iq::get(m.r.type, nt, s.iq_variant);
-#if defined(MOE_IQ_ROWS_512)
-                if (s.avx512) { m.rows[nt] = moe_iq::get512(m.r.type, nt); }
-#endif
+                m.rows[nt] = moe_cs_get_kernels().iq_get(m.r.type, nt, s.iq_variant, s.avx512);
             }
         }
-#endif
         const auto * vt = ggml_get_type_traits_cpu(m.vec_type);
         m.quant = vt ? vt->from_float : nullptr;
         ok = m.quant && m.r.n_in % ggml_blck_size(m.vec_type) == 0 &&
@@ -1979,32 +1782,20 @@ void moe_cs_stats(unsigned long long out[9]) {
 }
 
 bool moe_cs_iq_unpack(int type, const void * block, int c, bool joined, unsigned char * mag, signed char * sgn, int * mul) {
-#if defined(MOE_IQ_ROWS)
-    return moe_iq::unpack_slice(type, block, c, joined, (uint8_t *) mag, (int8_t *) sgn, mul);
-#else
-    (void) type; (void) block; (void) c; (void) joined; (void) mag; (void) sgn; (void) mul;
-    return false;
-#endif
+    return moe_cs_get_kernels().iq_unpack(type, block, c, joined, mag, sgn, mul);
 }
 
 bool moe_cs_iq_rows(int type, int nt, const void * w, size_t row_bytes, int64_t r0, int64_t r1, int64_t n_in,
         const void * const * y, float * const * out, int prefetch, int variant, bool wide) {
-#if defined(MOE_IQ_ROWS)
-    moe_iq::rows_fn f = moe_iq::get(type, nt, variant);
-    if (wide) {
-#if defined(MOE_IQ_ROWS_512)
-        f = cpu_has_avx512_vnni() ? moe_iq::get512(type, nt) : nullptr;
+#if defined(MOE_CS_AVX512)
+    if (wide && !cpu_has_avx512_vnni()) { return false; }
 #else
-        f = nullptr;
+    if (wide) { return false; }
 #endif
-    }
+    moe_cs_rows_fn f = moe_cs_get_kernels().iq_get(type, nt, variant, wide);
     if (!f || n_in % QK_K != 0) { return false; }
     f((const char *) w, row_bytes, r0, r1, (int) (n_in / QK_K), (const block_q8_K * const *) y, out, prefetch);
     return true;
-#else
-    (void) type; (void) nt; (void) w; (void) row_bytes; (void) r0; (void) r1; (void) n_in; (void) y; (void) out; (void) prefetch; (void) variant; (void) wide;
-    return false;
-#endif
 }
 
 // AIPFAST route 2 (see moe-cpu-split.h): host-only copies of routed-expert tensors from other model files.

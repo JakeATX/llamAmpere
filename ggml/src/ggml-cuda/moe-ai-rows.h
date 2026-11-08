@@ -8,6 +8,7 @@
 #include "../ggml-ai4.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,13 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define MOE_AI_INLINE __forceinline
+#else
+#define MOE_AI_INLINE inline __attribute__((always_inline))
 #endif
 
 namespace moe_ai {
@@ -120,7 +128,11 @@ static inline void tile_bytes(const uint32_t * wd, int k, uint8_t * ext) {
 static inline uint64_t load_be64(const uint8_t * p) {
     uint64_t v;
     memcpy(&v, p, 8);
+    #if defined(_MSC_VER) && !defined(__clang__)
+    return _byteswap_uint64(v);
+#else
     return __builtin_bswap64(v);
+#endif
 }
 
 // AIPFAST: the same circular stream as tile_bytes, kept as 32-bit words: E[0] = last word, E[1..nw] = the tile,
@@ -187,15 +199,11 @@ static inline int q8_nearest_int(float fval) {   // ggml nearest_int (round half
     return (i & 0x007fffff) - 0x00400000;
 }
 
-// q8_nearest_int(s*x) with the product and the 1.5*2^23 add in ONE rounding when the build has FMA. GCC contracts the
+// q8_nearest_int(s*x) with the product and the 1.5*2^23 add in ONE rounding on every CPU. GCC contracts the
 // plain expression into an FMA on -mfma builds (fp-contract=fast; the shipped hq8 bytes were made that way), so this
-// spells it out and the AVX2 path below can match it bit for bit whatever the compiler decides to fuse.
+// spells it out; std::fma supplies the same rounding in software on the baseline path without FMA instructions.
 static inline int q8_nearest_int_mul(float s, float x) {
-#if defined(__FMA__)
-    const float val = __builtin_fmaf(s, x, 12582912.f);
-#else
-    const float val = s*x + 12582912.f;
-#endif
+    const float val = std::fma(s, x, 12582912.f);
     int i;
     memcpy(&i, &val, sizeof(int));
     return (i & 0x007fffff) - 0x00400000;
@@ -204,7 +212,7 @@ static inline int q8_nearest_int_mul(float s, float x) {
 static inline uint16_t q8_fp32_to_fp16(float f) {   // ggml's portable fp32 -> fp16 (round to nearest even)
     auto to_bits = [](float x) { uint32_t u; memcpy(&u, &x, 4); return u; };
     auto from_bits = [](uint32_t u) { float x; memcpy(&x, &u, 4); return x; };
-    float base = (__builtin_fabsf(f) * 0x1.0p+112f) * 0x1.0p-110f;
+    float base = (std::fabs(f) * 0x1.0p+112f) * 0x1.0p-110f;
     const uint32_t w = to_bits(f), shl1_w = w + w, sign = w & 0x80000000u;
     uint32_t bias = shl1_w & 0xFF000000u;
     if (bias < 0x71000000u) { bias = 0x71000000u; }
@@ -239,7 +247,7 @@ static void quant_q8_scalar(const float * y, void * vq, int64_t K) {
         const float * x = y + b*qb;
         if (qb == 256) {
             float amax = 0.0f, mx = 0.0f;
-            for (int j = 0; j < qb; ++j) { const float ax = __builtin_fabsf(x[j]); if (ax > amax) { amax = ax; mx = x[j]; } }
+            for (int j = 0; j < qb; ++j) { const float ax = std::fabs(x[j]); if (ax > amax) { amax = ax; mx = x[j]; } }
             if (amax == 0.0f) {
                 d[b] = 0.0f;
                 memset(q, 0, sizeof(q));
@@ -250,9 +258,9 @@ static void quant_q8_scalar(const float * y, void * vq, int64_t K) {
             }
         } else {
             float amax = 0.0f;
-            for (int j = 0; j < qb; ++j) { const float ax = __builtin_fabsf(x[j]); amax = ax > amax ? ax : amax; }
+            for (int j = 0; j < qb; ++j) { const float ax = std::fabs(x[j]); amax = ax > amax ? ax : amax; }
             const float dd = amax/127.f, id = dd != 0.0f ? 1.0f/dd : 0.0f;
-            for (int j = 0; j < qb; ++j) { q[j] = (int8_t) __builtin_roundf(x[j]*id); }
+            for (int j = 0; j < qb; ++j) { q[j] = (int8_t) std::round(x[j]*id); }
             d[b] = ai4_fp16_to_fp32(q8_fp32_to_fp16(dd));
         }
         for (int j = 0; j < qb; j += AI4_TC) {
@@ -293,7 +301,7 @@ static void quant_q8_avx2(const float * y, void * vq, int64_t K) {
                 continue;
             }
             int jm = 0;
-            while (__builtin_fabsf(x[jm]) != amax) { ++jm; }
+            while (std::fabs(x[jm]) != amax) { ++jm; }
             const float iscale = -127.f/x[jm];
             const __m256 vs = _mm256_set1_ps(iscale), magic = _mm256_set1_ps(12582912.f);
             const __m256i hi = _mm256_set1_epi32(127), man = _mm256_set1_epi32(0x007fffff), bias = _mm256_set1_epi32(0x00400000);
@@ -363,10 +371,10 @@ static void unit_rows_q8_scalar(ublk blk, int k, uint32_t C, int nt, const void 
                 }
             }
             // exact int32 row sum over the block, then one fma per block (rs starts at +0)
-            for (int t = 0; t < nt; ++t) { rs[t] = __builtin_fmaf((float) is[t], q8_d(xq[t], K)[(koff + c0*AI4_TC)/qb], rs[t]); }
+            for (int t = 0; t < nt; ++t) { rs[t] = std::fma((float) is[t], q8_d(xq[t], K)[(koff + c0*AI4_TC)/qb], rs[t]); }
         }
         const float dw = ai4_fp16_to_fp32(dh[r]);
-        for (int t = 0; t < nt; ++t) { acc[t][r] = __builtin_fmaf(dw, rs[t], acc[t][r]); }
+        for (int t = 0; t < nt; ++t) { acc[t][r] = std::fma(dw, rs[t], acc[t][r]); }
     }
 }
 
@@ -564,7 +572,7 @@ static bool use_rowwin() {
 
 // byte-pair sums of state * C for the 8 states of tile row R (two int16 per 32-bit lane, one lane per column)
 template <int K, int R>
-static inline __attribute__((always_inline)) __m256i row_bytepair_direct(const uint32_t * wt, __m128i f4, __m128i l4,
+static MOE_AI_INLINE __m256i row_bytepair_direct(const uint32_t * wt, __m128i f4, __m128i l4,
                                                                         const direct_tabs & T, __m256i sh, __m256i Cv) {
     constexpr int src = direct_src(K, R);
     __m256i v;
@@ -581,20 +589,20 @@ static inline __attribute__((always_inline)) __m256i row_bytepair_direct(const u
 
 // byte sum S of state * C for the 8 states of tile row R (level = (S - 510) >> 2), one 32-bit lane per column
 template <int K, int R>
-static inline __attribute__((always_inline)) __m256i row_bytesum_direct(const uint32_t * wt, __m128i f4, __m128i l4,
+static MOE_AI_INLINE __m256i row_bytesum_direct(const uint32_t * wt, __m128i f4, __m128i l4,
                                                                         const direct_tabs & T, __m256i sh, __m256i Cv) {
     return _mm256_madd_epi16(row_bytepair_direct<K, R>(wt, f4, l4, T, sh, Cv), _mm256_set1_epi16(1));
 }
 
 template <int K, int R>
-static inline __attribute__((always_inline)) __m256 row_levels_direct(const uint32_t * wt, __m128i f4, __m128i l4,
+static MOE_AI_INLINE __m256 row_levels_direct(const uint32_t * wt, __m128i f4, __m128i l4,
                                                                       const direct_tabs & T, __m256i sh, __m256i Cv) {
     const __m256i v = row_bytesum_direct<K, R>(wt, f4, l4, T, sh, Cv);
     return _mm256_cvtepi32_ps(_mm256_srai_epi32(_mm256_sub_epi32(v, _mm256_set1_epi32(510)), 2));
 }
 
 template <int K, int NT, int G, int R0, size_t... I>
-static inline __attribute__((always_inline)) void direct_rows(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
+static MOE_AI_INLINE void direct_rows(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
                                                               __m256i sh, __m256i Cv, const __m256 (&yv)[NT],
                                                               __m256 (&part)[NT][G], std::index_sequence<I...>) {
     auto row = [&](auto gi) {
@@ -606,7 +614,7 @@ static inline __attribute__((always_inline)) void direct_rows(const uint32_t * w
 }
 
 template <int K, int NT, int G, int R0>
-static inline __attribute__((always_inline)) void direct_group(ublk blk, const float * const * y, int64_t koff,
+static MOE_AI_INLINE void direct_group(ublk blk, const float * const * y, int64_t koff,
                                                                __m256i Cv, float (*acc)[AI4_TR]) {
     constexpr int tw = AIK_TILE_WORDS(K);
     const direct_tabs & T = direct_tables();
@@ -624,7 +632,7 @@ static inline __attribute__((always_inline)) void direct_group(ublk blk, const f
     const uint16_t * dh = blk.dh;
     for (int g = 0; g < G; ++g) {
         const float d = ai4_fp16_to_fp32(dh[R0 + g]);
-        for (int t = 0; t < NT; ++t) { acc[t][R0 + g] = __builtin_fmaf(d, hsum8(part[t][g]), acc[t][R0 + g]); }
+        for (int t = 0; t < NT; ++t) { acc[t][R0 + g] = std::fma(d, hsum8(part[t][g]), acc[t][R0 + g]); }
     }
 }
 
@@ -682,7 +690,7 @@ static bool unit_rows_direct(ublk blk, int k, uint32_t C, int nt, const float * 
 // op instead of vpsubw + vpsraw ((S * 8192 + 2^14) >> 15 is exact for S in [0, 1020]); the dots then hold
 // sum (level + 128) * q, and q8_group subtracts 128 * sum q of the unit (q8_xu) before the convert: the same int32 row sums.
 template <int K, int NT, int G, int R0, bool KP, bool LV, size_t... P>
-static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
+static MOE_AI_INLINE void q8_pairs(const uint32_t * wt, __m128i f4, __m128i l4, const direct_tabs & T,
                                                            __m256i sh, __m256i Cv, const int16_t * const (&xt)[NT],
                                                            __m256i (&ip)[NT][G/2], int8_t * dst, int64_t gs,
                                                            std::index_sequence<P...>) {
@@ -715,14 +723,14 @@ static inline __attribute__((always_inline)) void q8_pairs(const uint32_t * wt, 
 }
 
 // pair lanes: [r0 c01, r0 c23, r1 c01, r1 c23 | r0 c45, r0 c67, r1 c45, r1 c67] (int32, exact)
-static inline __attribute__((always_inline)) __m128i q8_half_add(__m256i v) {
+static MOE_AI_INLINE __m128i q8_half_add(__m256i v) {
     return _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
 }
 
 // dd[b][t][0] = dd[b][t][1] = token t's scale of the unit's quant block b (a token pair's [d0 d0 d1 d1] is one load)
 // xc[t][0] = xc[t][1] = 128 * token t's sum of q over this unit (LV only; ST = 16, one block per unit)
 template <int K, int NT, int G, int R0, int ST, bool KP, bool LV>
-static inline __attribute__((always_inline)) void q8_group(ublk blk, const void * const * xq, int64_t koff,
+static MOE_AI_INLINE void q8_group(ublk blk, const void * const * xq, int64_t koff,
                                                            const float (*dd)[8][2], const int32_t (*xc)[2], __m256i Cv,
                                                            float (*acc)[AI4_TR], int8_t * Wu, int64_t gs) {
     static_assert(!LV || ST == AI4U_UK/AI4_TC, "LV corrects once per unit");
@@ -786,7 +794,7 @@ static inline __attribute__((always_inline)) void q8_group(ublk blk, const void 
     const uint16_t * dh = blk.dh;
     for (int g = 0; g < G; ++g) {
         const float dw = ai4_fp16_to_fp32(dh[R0 + g]);
-        for (int t = 0; t < NT; ++t) { acc[t][R0 + g] = __builtin_fmaf(dw, rs[t][g], acc[t][R0 + g]); }
+        for (int t = 0; t < NT; ++t) { acc[t][R0 + g] = std::fma(dw, rs[t][g], acc[t][R0 + g]); }
     }
 }
 
@@ -861,6 +869,8 @@ static bool unit_rows_q8(ublk blk, int k, uint32_t C, int nt, const void * const
 // AVX-512 (Zen 4/5 hosts, runtime-dispatched; the build targets Zen 3): tile rows r and r + 1 in one 512-bit decode.
 // Row r + 1 starts k bytes after row r at the same bit offset. Per row the lanes, FMA order and final sum are the
 // AVX2 path's, so the results are bit-identical to it.
+
+#if defined(__GNUC__)
 #define MOE_AI_T512 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma,f16c")))
 
 static bool has_avx512() {
@@ -914,14 +924,17 @@ MOE_AI_T512 static void unit_rows_512(ublk blk, int k, uint32_t C, int nt, const
     for (int r = 0; r < AI4_TR/2; ++r) {
         const float d0 = ai4_fp16_to_fp32(dh[2*r]), d1 = ai4_fp16_to_fp32(dh[2*r + 1]);
         for (int t = 0; t < nt; ++t) {
-            acc[t][2*r]     = __builtin_fmaf(d0, hsum8(_mm512_castps512_ps256(part[t][r])), acc[t][2*r]);
-            acc[t][2*r + 1] = __builtin_fmaf(d1, hsum8(_mm512_extractf32x8_ps(part[t][r], 1)), acc[t][2*r + 1]);
+            acc[t][2*r]     = std::fma(d0, hsum8(_mm512_castps512_ps256(part[t][r])), acc[t][2*r]);
+            acc[t][2*r + 1] = std::fma(d1, hsum8(_mm512_extractf32x8_ps(part[t][r], 1)), acc[t][2*r + 1]);
         }
     }
 }
+#else
+static bool has_avx512() { return false; }
+#endif
 #endif
 
-#if defined(__AVX2__) && defined(__FMA__)
+#if defined(__AVX2__) && defined(__FMA__) && defined(__GNUC__)
 // AIPFAST: AVX-512 VBMI tile decode (Zen 4/5), 4 tile rows per step instead of 2. Row r's 64-bit window starts at
 // stream byte k*r + 2 with bit offset k (b = 8kr + k + 16), so every gather index and shift is fixed per rate k:
 // vpermi2b builds the big-endian windows of 4 rows straight from the tile's little-endian words (2 qword lanes per row),
@@ -1011,8 +1024,8 @@ MOE_AI_T512V static void unit_rows_512_vbmi(ublk blk, int k, uint32_t C, int nt,
     for (int r = 0; r < AI4_TR/2; ++r) {
         const float d0 = ai4_fp16_to_fp32(dh[2*r]), d1 = ai4_fp16_to_fp32(dh[2*r + 1]);
         for (int t = 0; t < nt; ++t) {
-            acc[t][2*r]     = __builtin_fmaf(d0, hsum8(_mm512_castps512_ps256(part[t][r])), acc[t][2*r]);
-            acc[t][2*r + 1] = __builtin_fmaf(d1, hsum8(_mm512_extractf32x8_ps(part[t][r], 1)), acc[t][2*r + 1]);
+            acc[t][2*r]     = std::fma(d0, hsum8(_mm512_castps512_ps256(part[t][r])), acc[t][2*r]);
+            acc[t][2*r + 1] = std::fma(d1, hsum8(_mm512_extractf32x8_ps(part[t][r], 1)), acc[t][2*r + 1]);
         }
     }
 }
@@ -1079,7 +1092,7 @@ static const vbmi_q8_tabs & vbmi_q8_tables() {
     return T;
 }
 
-MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_hadd(__m512i a, __m512i b) {   // [a0+a1 a2+a3 b0+b1 b2+b3]
+MOE_AI_T512Q static MOE_AI_INLINE __m512i q8v_hadd(__m512i a, __m512i b) {   // [a0+a1 a2+a3 b0+b1 b2+b3]
     const __m512 fa = _mm512_castsi512_ps(a), fb = _mm512_castsi512_ps(b);
     return _mm512_add_epi32(_mm512_castps_si512(_mm512_shuffle_ps(fa, fb, _MM_SHUFFLE(2, 0, 2, 0))),
                             _mm512_castps_si512(_mm512_shuffle_ps(fa, fb, _MM_SHUFFLE(3, 1, 3, 1))));
@@ -1087,7 +1100,7 @@ MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_hadd(__m51
 
 // x_g: int32 pair sums of row group g (128-bit lanes [rA s01 s23, rB s01 s23 | rA s45 s67, rB .. | rC .. , rD .. | ..])
 // -> 16 exact row sums, lane p holds row vbmi_q8_tabs::row[p]
-MOE_AI_T512Q static inline __attribute__((always_inline)) __m512i q8v_reduce(__m512i x0, __m512i x1, __m512i x2, __m512i x3) {
+MOE_AI_T512Q static MOE_AI_INLINE __m512i q8v_reduce(__m512i x0, __m512i x1, __m512i x2, __m512i x3) {
     __m512i h01 = q8v_hadd(x0, x1), h23 = q8v_hadd(x2, x3);
     h01 = _mm512_add_epi32(h01, _mm512_shuffle_i32x4(h01, h01, _MM_SHUFFLE(2, 3, 0, 1)));   // lane 0 = lane 0 + lane 1, ..
     h23 = _mm512_add_epi32(h23, _mm512_shuffle_i32x4(h23, h23, _MM_SHUFFLE(2, 3, 0, 1)));
@@ -1157,7 +1170,7 @@ MOE_AI_T512Q static void unit_rows_512_q8v_nt(ublk blk, uint32_t C, const void *
     const uint16_t * dh = blk.dh;
     for (int r = 0; r < AI4_TR; ++r) {
         const float dw = ai4_fp16_to_fp32(dh[r]);
-        for (int t = 0; t < NT; ++t) { acc[t][r] = __builtin_fmaf(dw, rs[t][r], acc[t][r]); }
+        for (int t = 0; t < NT; ++t) { acc[t][r] = std::fma(dw, rs[t][r], acc[t][r]); }
     }
 }
 
@@ -1200,6 +1213,11 @@ static bool unit_rows_q8_vbmi(ublk blk, int k, uint32_t C, int nt, const void * 
     return q8_block(Kin) == 256 ? unit_rows_512_q8v_st<16>(blk, k, C, nt, xq, koff, Kin, acc)
                                 : unit_rows_512_q8v_st<4>(blk, k, C, nt, xq, koff, Kin, acc);
 }
+#else
+static bool has_vbmi() { return false; }
+static bool has_q8_vbmi() { return false; }
+static bool use_q8_vbmi() { return false; }
+
 #endif
 
 // rows [a, b) of one expert (a multiple of 16; b - a <= 16, rows past b are computed and dropped), nt tokens:
@@ -1246,11 +1264,13 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
 #if defined(__AVX2__) && defined(__FMA__)
         // default (-1): VBMI decode where the host has it; AVX-512 hosts WITHOUT VBMI (Skylake-X/Cascade Lake class) take the
         // AVX2 shuffle path below, which beat the word-read AVX-512 decode on the 9900X (249-280 vs 363 us, airows1)
+#if defined(__GNUC__)
         if (C != 0 && (path == 1 || path == 2 || (path == -1 && has_vbmi())) && has_avx512()) {
             if (path != 2 && has_vbmi()) { unit_rows_512_vbmi(blk, k, C, nt, y, u*AI4U_UK, acc); }
             else { unit_rows_512(blk, k, C, nt, y, u*AI4U_UK, acc); }
             continue;
         }
+#endif
         if (C != 0 && (path == 5 || (path == -1 && use_rowwin())) && unit_rows_direct(blk, k, C, nt, y, u*AI4U_UK, acc)) {
             continue;
         }
@@ -1275,7 +1295,7 @@ static void slab_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64
             }
             for (int r = 0; r < AI4_TR; ++r) {
                 const float d = ai4_fp16_to_fp32(dh[r]);
-                for (int t = 0; t < nt; ++t) { acc[t][r] = __builtin_fmaf(d, hsum8(part[t][r]), acc[t][r]); }
+                for (int t = 0; t < nt; ++t) { acc[t][r] = std::fma(d, hsum8(part[t][r]), acc[t][r]); }
             }
             continue;
         }
@@ -1314,9 +1334,11 @@ static void slab_rows_q8(const char * w, size_t row_bytes, int k, uint32_t C, in
     for (int64_t u = 0; u < K/AI4U_UK; ++u) {
         ublk blk = us.at(u);
 #if defined(__AVX2__) && defined(__FMA__)
+#if defined(__GNUC__)
         if (!scalar && C != 0 && (vbmi > 0 || (vbmi < 0 && use_q8_vbmi())) && unit_rows_q8_vbmi(blk, k, C, nt, xq, u*AI4U_UK, K, acc)) {
             continue;
         }
+#endif
         if (!scalar && C != 0 && unit_rows_q8(blk, k, C, nt, xq, u*AI4U_UK, K, acc, lv)) { continue; }
 #endif
         unit_rows_q8_scalar(blk, k, C, nt, xq, u*AI4U_UK, K, acc);
@@ -1374,7 +1396,7 @@ static void slab_rows_q8_keep(const char * w, size_t row_bytes, int k, uint32_t 
 // one 8-row group, NT tokens: per 4 K one activation broadcast, |w| x sign(q, w) (|w| <= 128, |q| <= 127: no int16
 // saturation), pair sums to int32 lanes (one lane per row)
 template <int NT>
-static inline __attribute__((always_inline)) void r8_group(const int8_t * wg, const uint16_t * sg, int64_t K, int qb,
+static MOE_AI_INLINE void r8_group(const int8_t * wg, const uint16_t * sg, int64_t K, int qb,
                                                            const int8_t (*q)[8192], const float * const * d, float (*o)[AI4_TR],
                                                            int r0) {
     const __m256i ones = _mm256_set1_epi16(1);
@@ -1449,3 +1471,5 @@ static void slab_rows_r8(const uint8_t *, int64_t, int64_t, int64_t, int, const 
 #endif
 
 } // namespace moe_ai
+
+#undef MOE_AI_INLINE

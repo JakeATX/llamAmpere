@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <system_error>
+#include <stdexcept>
 
 #ifdef _WIN32
 #include <process.h>
@@ -82,6 +83,69 @@ uint64_t server_prompt_disk_hash(const void * data, size_t n, uint64_t seed) {
     hs.h = seed;
     hs.update(data, n);
     return hs.final();
+}
+
+// identity of a model file: size plus a hash of its first and last MiB and 16 evenly spaced 64 KiB samples
+std::string server_prompt_cache_file_identity(const std::string & path, int split_count) {
+    if (split_count < 1 || split_count > UINT16_MAX) {
+        throw std::runtime_error("prompt cache: invalid model split count");
+    }
+    if (split_count > 1) {
+        std::vector<char> buf(path.size() + 1, 0);
+        const int n = llama_split_prefix(buf.data(), buf.size(), path.c_str(), 0, split_count);
+        if (n <= 0 || (size_t) n >= buf.size()) {
+            throw std::runtime_error("prompt cache: invalid split model path: " + path);
+        }
+        const std::string prefix(buf.data(), n);
+        std::string identity = "parts=" + std::to_string(split_count) + ":";
+        for (int i = 0; i < split_count; ++i) {
+            const int len = llama_split_path(buf.data(), buf.size(), prefix.c_str(), i, split_count);
+            if (len <= 0 || (size_t) len >= buf.size()) {
+                throw std::runtime_error("prompt cache: invalid split model path: " + path);
+            }
+            identity += server_prompt_cache_file_identity(std::string(buf.data(), len)) + ";";
+        }
+        return identity;
+    }
+    if (path.empty()) {
+        return "none";
+    }
+
+    std::error_code ec;
+    const uint64_t fsize = std::filesystem::file_size(path, ec);
+    if (ec) {
+        throw std::runtime_error("prompt cache: cannot stat model file: " + path);
+    }
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("prompt cache: cannot open model file: " + path);
+    }
+    uint64_t h = server_prompt_disk_hash(&fsize, sizeof(fsize));
+
+    auto sample = [&](uint64_t off, uint64_t len) {
+        if (off >= fsize) {
+            return;
+        }
+        len = std::min(len, fsize - off);
+        std::vector<char> buf(len);
+        f.clear();
+        f.seekg((std::streamoff) off);
+        f.read(buf.data(), (std::streamsize) len);
+        if (!f || (uint64_t) f.gcount() != len) {
+            throw std::runtime_error("prompt cache: cannot read model file: " + path);
+        }
+        h = server_prompt_disk_hash(buf.data(), buf.size(), h);
+    };
+
+    const uint64_t MiB = 1024*1024;
+    sample(0, MiB);
+    for (int i = 1; i <= 16; ++i) {
+        sample(fsize / 17 * i, 64*1024);
+    }
+    sample(fsize > MiB ? fsize - MiB : 0, MiB);
+
+    return string_format("parts=1:%" PRIu64 ":%016" PRIx64, fsize, h);
 }
 
 struct pc_writer {

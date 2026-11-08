@@ -6373,13 +6373,9 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
     const bool is_contiguous = sinfo.is_contiguous();
 
     for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
-
-        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-
         auto * k = layer.k_stream[strm];
 
-        const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+        const size_t k_size_row = ggml_row_size(k->type, k->ne[0]);
 
         if (is_contiguous) {
             llama_clear_tensor_data(k, sinfo.head() * k_size_row, cell_count * k_size_row);
@@ -6401,7 +6397,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
         }
 
         if (!v_trans) {
-            const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
+            const size_t v_size_row = ggml_row_size(v->type, v->ne[0]);
 
             if (is_contiguous) {
                 llama_clear_tensor_data(v, sinfo.head() * v_size_row, cell_count * v_size_row);

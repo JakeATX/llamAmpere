@@ -8,6 +8,12 @@
 //   test-moe-ai-rows [reps for timing, default 20]
 #include "../ggml/src/ggml-cuda/moe-ai-rows.h"
 #include "ggml.h"
+#if defined(MOE_CS_TEST_DISPATCH)
+#include "../ggml/src/ggml-cuda/moe-cpu-split-dispatch.h"
+namespace moe_cs_test_q2 {
+#include "../ggml/src/ggml-cuda/moe-cpu-split-q2.h"
+}
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -22,11 +28,110 @@ static uint16_t f32_to_f16_bits(float f) {
     return ggml_fp32_to_fp16(f);
 }
 
+#if defined(MOE_CS_TEST_DISPATCH)
+// Q2 reductions group terms differently across ISAs. On these fixed fixtures require
+// <= 256 ULP per output (including FMA rounding); AI+ activation bytes and Q8 rows remain exact.
+static bool q2_cross_isa_close(float a, float b) {
+    if (!std::isfinite(a) || !std::isfinite(b)) { return false; }
+    uint32_t ua, ub;
+    memcpy(&ua, &a, sizeof(ua));
+    memcpy(&ub, &b, sizeof(ub));
+    const int64_t ia = (ua & 0x80000000u) ? 0x80000000LL - (ua & 0x7fffffffu) : 0x80000000LL + ua;
+    const int64_t ib = (ub & 0x80000000u) ? 0x80000000LL - (ub & 0x7fffffffu) : 0x80000000LL + ub;
+    const int64_t ulp = ia > ib ? ia - ib : ib - ia;
+    if (ulp > 256) { printf("Q2 cross-ISA FAIL: %.9g vs %.9g, %lld ULP > 256\n", a, b, (long long) ulp); }
+    return ulp <= 256;
+}
+#endif
+
 int main(int argc, char ** argv) {
     const int reps = argc > 1 ? atoi(argv[1]) : 20;
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+#if defined(MOE_CS_TEST_DISPATCH)
+    const char * expected = getenv("MOE_CS_EXPECT_ISA");
+    printf("production CPU split dispatch=%s expected=%s decode=%s\n", moe_cs_isa(), expected ? expected : "unset",
+           moe_cs_get_kernels().ai_decode());
+    if (!expected || strcmp(expected, moe_cs_isa()) != 0) { return 1; }
+    const bool cross_isa = strcmp(moe_cs_isa(), "avx2") == 0;
+    if (cross_isa) {
+        // Exercise the two actual library objects, not an inlined reference with the test's ISA flags.
+        const auto & s = moe_cs_scalar_kernels;
+        const auto & v = moe_cs_avx2_kernels;
+        std::vector<float> x(2560), sr(2560), vr(2560);
+        std::vector<uint8_t> sq(moe_ai::q8_bytes(2560)), vq(sq.size());
+        for (int64_t K : { (int64_t) 2560, (int64_t) 640 }) {
+            for (int it = 0; it < 128; ++it) {
+                const float scale = std::ldexp(1.0f, it % 40 - 20);
+                for (int64_t j = 0; j < K; ++j) { x[j] = uni(rng) * scale; }
+                if (it % 7 == 0) { x[0] = scale * 2; x[1] = -scale * 2; }
+                if (it % 11 == 0) { std::fill(x.begin(), x.begin() + (K % 256 ? 32 : 256), 0.0f); }
+                s.ai_rotate(x.data(), sr.data(), K);
+                v.ai_rotate(x.data(), vr.data(), K);
+                s.ai_rotate_q8(x.data(), sq.data(), K);
+                v.ai_rotate_q8(x.data(), vq.data(), K);
+                if (memcmp(sr.data(), vr.data(), K * sizeof(float)) || memcmp(sq.data(), vq.data(), moe_ai::q8_bytes(K))) { return 1; }
+                s.ai_quant_q8(x.data(), sq.data(), K);
+                v.ai_quant_q8(x.data(), vq.data(), K);
+                if (memcmp(sq.data(), vq.data(), moe_ai::q8_bytes(K))) { return 1; }
+            }
+        }
+        std::fill(x.begin(), x.end(), 0.0f);
+        x[0] = 1.0f;
+        const uint32_t tie = 0x3f7af5ecu;
+        memcpy(&x[1], &tie, sizeof(tie));
+        s.ai_quant_q8(x.data(), sq.data(), 256);
+        v.ai_quant_q8(x.data(), vq.data(), 256);
+        int16_t rounded;
+        memcpy(&rounded, sq.data() + sizeof(int16_t), sizeof(rounded));
+        if (memcmp(sq.data(), vq.data(), moe_ai::q8_bytes(256)) || rounded != -125) { return 1; }
+        printf("actual scalar vs AVX2 rotation/activation bytes: 256 rows + FMA boundary bit-identical OK\n");
+    }
+    {
+        const auto & m = moe_cs_get_kernels();
+        for (int K : {64, 640, 2560}) {
+            const size_t rb = (size_t) (K / QK2_0) * sizeof(block_q2_0);
+            std::vector<block_q2_0> w((size_t) 4 * K / QK2_0);
+            std::vector<block_q8_0> y((size_t) 4 * K / QK8_0);
+            for (auto & b : w) { b.d = f32_to_f16_bits(0.025f); for (auto & q : b.qs) { q = (uint8_t) rng(); } }
+            for (auto & b : y) { b.d = f32_to_f16_bits(0.02f); for (auto & q : b.qs) { q = (int8_t) ((int) (rng() % 255) - 127); } }
+            float a = 0, b = 0;
+            m.q2_dot(K, &a, w.data(), y.data());
+            moe_cs_test_q2::dot_q2_0_q8_0(K, &b, w.data(), y.data());
+            if (memcmp(&a, &b, sizeof(a)) != 0) { return 1; }
+            if (cross_isa) {
+                moe_cs_scalar_kernels.q2_dot(K, &b, w.data(), y.data());
+                if (!q2_cross_isa_close(a, b)) { return 1; }
+            }
+            auto yr = y;
+            auto yc = y;
+            const size_t ys = (size_t) (K / QK8_0) * sizeof(block_q8_0), as = K / QK8_0 + K / QK2_0;
+            std::vector<float> da(4 * as), db(4 * as), dc(4 * as);
+            for (int t = 0; t < 4; ++t) {
+                m.q2_reorder(K, y.data() + t * K / QK8_0, da.data() + t * as, da.data() + t * as + K / QK8_0, true);
+                moe_cs_test_q2::q2_reorder_hidden(K, yr.data() + t * K / QK8_0, db.data() + t * as, db.data() + t * as + K / QK8_0, true);
+                if (cross_isa) { moe_cs_scalar_kernels.q2_reorder(K, yc.data() + t * K / QK8_0, dc.data() + t * as, dc.data() + t * as + K / QK8_0, true); }
+            }
+            if (memcmp(y.data(), yr.data(), y.size() * sizeof(y[0])) || memcmp(da.data(), db.data(), da.size() * sizeof(float))) { return 1; }
+            if (cross_isa && (memcmp(y.data(), yc.data(), y.size() * sizeof(y[0])) || memcmp(da.data(), dc.data(), da.size() * sizeof(float)))) { return 1; }
+            for (int nt = 1; nt <= 4; ++nt) {
+                float oa[16] = {}, ob[16] = {};
+                moe_cs_q2_rows_fn ref[] = {nullptr, moe_cs_test_q2::dot_q2_0_rows<1>, moe_cs_test_q2::dot_q2_0_rows<2>, moe_cs_test_q2::dot_q2_0_rows<3>, moe_cs_test_q2::dot_q2_0_rows<4>};
+                m.q2_rows[nt](K, 4, (const char *) w.data(), rb, y.data(), ys, da.data(), da.data() + K / QK8_0, as, oa, 4, 0);
+                ref[nt](K, 4, (const char *) w.data(), rb, yr.data(), ys, db.data(), db.data() + K / QK8_0, as, ob, 4, 0);
+                if (memcmp(oa, ob, sizeof(oa))) { return 1; }
+                if (cross_isa) {
+                    moe_cs_scalar_kernels.q2_rows[nt](K, 4, (const char *) w.data(), rb, yc.data(), ys, dc.data(), dc.data() + K / QK8_0, as, ob, 4, 0);
+                    for (int j = 0; j < nt * 4; ++j) { if (!q2_cross_isa_close(oa[j], ob[j])) { return 1; } }
+                }
+            }
+        }
+        printf("production Q2 dispatch vs direct build: bit-identical OK; cross-ISA <=256 ULP %s\n", cross_isa ? "OK" : "not run");
+    }
+    const ggml_type types[] = { GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 };
+#else
     const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 };
+#endif
     const int64_t shapes[][2] = { { 2560, 640 }, { 640, 2560 } };   // K (in), M (out)
 #if defined(__AVX2__) && defined(__FMA__)
     printf("path: AVX2%s%s\n", moe_ai::has_avx512() ? " + AVX-512 (default; AVX2 also timed)" : "", moe_ai::has_vbmi() ? " + VBMI decode (default)" : "");
@@ -278,6 +383,41 @@ int main(int argc, char ** argv) {
                     };
                     run_q(oq, false);
                     run_q(os, true);
+#if defined(MOE_CS_TEST_DISPATCH)
+                    std::vector<uint8_t> dq(qb.size(), 0);
+                    std::vector<float> dout(oq.size(), 0.0f);
+                    const void * dp[8];
+                    for (int t = 0; t < nt; ++t) {
+                        dp[t] = dq.data() + t * moe_ai::q8_bytes(K);
+                        moe_cs_ai_quant(x.data() + t * K, (void *) dp[t], K);
+                    }
+                    for (int64_t a = 0; a < M; a += AI4_TR) {
+                        float * opq[8];
+                        for (int t = 0; t < nt; ++t) { opq[t] = dout.data() + t * M + a; }
+                        moe_cs_ai_rows((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, dp, opq);
+                    }
+                    const bool dsame = memcmp(dq.data(), qb.data(), qb.size()) == 0 &&
+                                       memcmp(dout.data(), oq.data(), oq.size() * sizeof(float)) == 0;
+                    printf("%-8s K=%5lld M=%5lld nt=%d production dispatch vs direct build: %s\n",
+                           ggml_type_name(type), (long long) K, (long long) M, nt, dsame ? "bit-identical OK" : "DIFFERENT FAIL");
+                    fails += !dsame;
+                    if (cross_isa) {
+                        const auto & s = moe_cs_scalar_kernels;
+                        std::fill(dq.begin(), dq.end(), 0);
+                        for (int t = 0; t < nt; ++t) { s.ai_rotate_q8(x.data() + t * K, (void *) dp[t], K); }
+                        for (int64_t a = 0; a < M; a += AI4_TR) {
+                            float * opq[8];
+                            for (int t = 0; t < nt; ++t) { opq[t] = dout.data() + t * M + a; }
+                            s.ai_q8((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, dp, opq);
+                        }
+                        const bool same_scalar = memcmp(dq.data(), qb.data(), qb.size()) == 0 &&
+                                                 memcmp(dout.data(), oq.data(), oq.size() * sizeof(float)) == 0;
+                        printf("actual scalar vs AVX2 %-8s K=%lld nt=%d activation bytes + Q8 rows: %s\n",
+                               ggml_type_name(type), (long long) K, nt, same_scalar ? "bit-identical OK" : "DIFFERENT FAIL");
+                        fails += !same_scalar;
+                    }
+#endif
+
                     // AIPFIX: opt-in gate/up level kernel (GGML_MOE_AI_HOST_Q8_LV) == scalar bit for bit (down ignores lv)
                     std::vector<float> ol((size_t) nt * M);
                     run_q(ol, false, 0, 1);

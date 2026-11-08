@@ -9282,7 +9282,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
         const size_t state_size = file.size() - file.tell();
         llama_io_read_file io(&file);
         const size_t nread = state_seq_read_data(io, seq_id, flags);
-        if (nread == 0 || nread != state_size) {
+        if (nread != state_size) {
             throw std::runtime_error("invalid sequence state length");
         }
     } catch (const std::exception & err) {
