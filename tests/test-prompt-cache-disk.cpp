@@ -7,6 +7,7 @@
 #include "server-task.h"
 
 #include "common.h"
+#include "ggml.h"
 #include "log.h"
 
 #include <chrono>
@@ -1177,6 +1178,8 @@ static void test_fit_ram(const std::string & root) {
 }
 
 int main() {
+    // Windows ggml_time_us() divides by the timer frequency set here; the server gets it from backend init.
+    ggml_time_init();
     const std::string root = (fs::temp_directory_path() / ("llama.cpp-pcdisk-test-" + std::to_string((long long) std::chrono::steady_clock::now().time_since_epoch().count()))).string();
     fs::create_directories(root);
 
