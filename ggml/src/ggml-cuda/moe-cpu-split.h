@@ -84,3 +84,10 @@ bool moe_cs_host_alt_keep(int layer, const char * const names[3]);
 // (GGML_MOE_CPU_SPLIT_HOST_WARM_FLOOR_GIB, min 5; GGML_MOE_CPU_SPLIT_HOST_WARM=0 skips). Logs warmed vs cold GiB;
 // returns the GiB queued.
 double moe_cs_host_alt_warm();
+
+// Selected host implementation. GGML_MOE_CPU_SPLIT_ISA=scalar is a test fallback; it cannot force an unsupported ISA.
+const char * moe_cs_isa();
+// Tests: the selected implementation's AI+ q8 activation and slab kernels (same inputs as moe-ai-rows.h).
+void moe_cs_ai_quant(const float * x, void * q, int64_t K);
+void moe_cs_ai_rows(const char * w, size_t row_bytes, int k, uint32_t C, int64_t a, int64_t b, int64_t K, int nt,
+        const void * const * xq, float * const * out);

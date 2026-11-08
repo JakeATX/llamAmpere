@@ -8,6 +8,12 @@
 //   test-moe-ai-rows [reps for timing, default 20]
 #include "../ggml/src/ggml-cuda/moe-ai-rows.h"
 #include "ggml.h"
+#if defined(MOE_CS_TEST_DISPATCH)
+#include "../ggml/src/ggml-cuda/moe-cpu-split-dispatch.h"
+namespace moe_cs_test_q2 {
+#include "../ggml/src/ggml-cuda/moe-cpu-split-q2.h"
+}
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -26,7 +32,44 @@ int main(int argc, char ** argv) {
     const int reps = argc > 1 ? atoi(argv[1]) : 20;
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+#if defined(MOE_CS_TEST_DISPATCH)
+    const char * expected = getenv("MOE_CS_EXPECT_ISA");
+    printf("production CPU split dispatch=%s expected=%s\n", moe_cs_isa(), expected ? expected : "unset");
+    if (!expected || strcmp(expected, moe_cs_isa()) != 0) { return 1; }
+    {
+        const auto & m = moe_cs_get_kernels();
+        for (int K : {64, 640, 2560}) {
+            const size_t rb = (size_t) (K / QK2_0) * sizeof(block_q2_0);
+            std::vector<block_q2_0> w((size_t) 4 * K / QK2_0);
+            std::vector<block_q8_0> y((size_t) 4 * K / QK8_0);
+            for (auto & b : w) { b.d = f32_to_f16_bits(0.025f); for (auto & q : b.qs) { q = (uint8_t) rng(); } }
+            for (auto & b : y) { b.d = f32_to_f16_bits(0.02f); for (auto & q : b.qs) { q = (int8_t) ((int) (rng() % 255) - 127); } }
+            float a = 0, b = 0;
+            m.q2_dot(K, &a, w.data(), y.data());
+            moe_cs_test_q2::dot_q2_0_q8_0(K, &b, w.data(), y.data());
+            if (memcmp(&a, &b, sizeof(a)) != 0) { return 1; }
+            auto yr = y;
+            const size_t ys = (size_t) (K / QK8_0) * sizeof(block_q8_0), as = K / QK8_0 + K / QK2_0;
+            std::vector<float> da(4 * as), db(4 * as);
+            for (int t = 0; t < 4; ++t) {
+                m.q2_reorder(K, y.data() + t * K / QK8_0, da.data() + t * as, da.data() + t * as + K / QK8_0, true);
+                moe_cs_test_q2::q2_reorder_hidden(K, yr.data() + t * K / QK8_0, db.data() + t * as, db.data() + t * as + K / QK8_0, true);
+            }
+            if (memcmp(y.data(), yr.data(), y.size() * sizeof(y[0])) || memcmp(da.data(), db.data(), da.size() * sizeof(float))) { return 1; }
+            for (int nt = 1; nt <= 4; ++nt) {
+                float oa[16] = {}, ob[16] = {};
+                moe_cs_q2_rows_fn ref[] = {nullptr, moe_cs_test_q2::dot_q2_0_rows<1>, moe_cs_test_q2::dot_q2_0_rows<2>, moe_cs_test_q2::dot_q2_0_rows<3>, moe_cs_test_q2::dot_q2_0_rows<4>};
+                m.q2_rows[nt](K, 4, (const char *) w.data(), rb, y.data(), ys, da.data(), da.data() + K / QK8_0, as, oa, 4, 0);
+                ref[nt](K, 4, (const char *) w.data(), rb, yr.data(), ys, db.data(), db.data() + K / QK8_0, as, ob, 4, 0);
+                if (memcmp(oa, ob, sizeof(oa))) { return 1; }
+            }
+        }
+        printf("production Q2 dispatch vs direct build: bit-identical OK\n");
+    }
+    const ggml_type types[] = { GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 };
+#else
     const ggml_type types[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 };
+#endif
     const int64_t shapes[][2] = { { 2560, 640 }, { 640, 2560 } };   // K (in), M (out)
 #if defined(__AVX2__) && defined(__FMA__)
     printf("path: AVX2%s%s\n", moe_ai::has_avx512() ? " + AVX-512 (default; AVX2 also timed)" : "", moe_ai::has_vbmi() ? " + VBMI decode (default)" : "");
@@ -278,6 +321,26 @@ int main(int argc, char ** argv) {
                     };
                     run_q(oq, false);
                     run_q(os, true);
+#if defined(MOE_CS_TEST_DISPATCH)
+                    std::vector<uint8_t> dq(qb.size(), 0);
+                    std::vector<float> dout(oq.size(), 0.0f);
+                    const void * dp[8];
+                    for (int t = 0; t < nt; ++t) {
+                        dp[t] = dq.data() + t * moe_ai::q8_bytes(K);
+                        moe_cs_ai_quant(x.data() + t * K, (void *) dp[t], K);
+                    }
+                    for (int64_t a = 0; a < M; a += AI4_TR) {
+                        float * opq[8];
+                        for (int t = 0; t < nt; ++t) { opq[t] = dout.data() + t * M + a; }
+                        moe_cs_ai_rows((const char *) w.data(), row_bytes, k, C, a, a + AI4_TR, K, nt, dp, opq);
+                    }
+                    const bool dsame = memcmp(dq.data(), qb.data(), qb.size()) == 0 &&
+                                       memcmp(dout.data(), oq.data(), oq.size() * sizeof(float)) == 0;
+                    printf("%-8s K=%5lld M=%5lld nt=%d production dispatch vs direct build: %s\n",
+                           ggml_type_name(type), (long long) K, (long long) M, nt, dsame ? "bit-identical OK" : "DIFFERENT FAIL");
+                    fails += !dsame;
+#endif
+
                     // AIPFIX: opt-in gate/up level kernel (GGML_MOE_AI_HOST_Q8_LV) == scalar bit for bit (down ignores lv)
                     std::vector<float> ol((size_t) nt * M);
                     run_q(ol, false, 0, 1);
