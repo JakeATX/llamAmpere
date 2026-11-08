@@ -5816,10 +5816,17 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->moe_cache_generation = moe_cache_generation;
         res = true;
     }
+    // J3 scratch moved (generation bump): every graph holding the old pointers re-captures, including one reused by uid
+    bool lsa_j3_changed = false;
     if (ggml_cuda_lsa_j3_graphs()) {
         const uint64_t lsa_j3_generation = ggml_cuda_lsa_j3_generation();
         if (graph->lsa_j3_generation != lsa_j3_generation) {
+            static std::atomic<int64_t> n_recapture{0};
+            GGML_LOG_WARN("%s: LSA J3 scratch generation %llu -> %llu: graph re-capture %lld (uid %zu)\n", __func__,
+                    (unsigned long long) graph->lsa_j3_generation, (unsigned long long) lsa_j3_generation,
+                    (long long) ++n_recapture, (size_t) cgraph->uid);
             graph->lsa_j3_generation = lsa_j3_generation;
+            lsa_j3_changed = true;
             res = true;
         }
     }
@@ -5851,7 +5858,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
-    if (!moe_cache_changed && cgraph->uid != 0 &&
+    if (!moe_cache_changed && !lsa_j3_changed && cgraph->uid != 0 &&
         cgraph->uid == graph->uid &&
         kv_stream_generation == previous_kv_stream_generation) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
