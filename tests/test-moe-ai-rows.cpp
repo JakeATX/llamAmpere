@@ -34,7 +34,8 @@ int main(int argc, char ** argv) {
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
 #if defined(MOE_CS_TEST_DISPATCH)
     const char * expected = getenv("MOE_CS_EXPECT_ISA");
-    printf("production CPU split dispatch=%s expected=%s\n", moe_cs_isa(), expected ? expected : "unset");
+    printf("production CPU split dispatch=%s expected=%s decode=%s\n", moe_cs_isa(), expected ? expected : "unset",
+           moe_cs_get_kernels().ai_decode());
     if (!expected || strcmp(expected, moe_cs_isa()) != 0) { return 1; }
     {
         const auto & m = moe_cs_get_kernels();
