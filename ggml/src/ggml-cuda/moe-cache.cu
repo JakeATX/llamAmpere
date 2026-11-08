@@ -86,31 +86,76 @@ static void moe_cache_register_stub(const void * owner) {
 
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
 
+// Per-thread pinned bounce buffer for moe_h2d_async. Released when the owning thread exits (cudaFreeHost errors are
+// ignored: at process teardown the runtime may already be unloaded).
+struct moe_h2d_bounce {
+    void * ptr = nullptr;
+    ~moe_h2d_bounce() {
+        if (ptr) {
+            (void) cudaFreeHost(ptr);
+            (void) cudaGetLastError();
+            ptr = nullptr;
+        }
+    }
+};
+
 // Host-to-device copy from an expert source. On Windows (WDDM) cudaMemcpyAsync rejects a host range that mixes
 // cudaHostRegister'ed pages with unregistered ones (cudaErrorInvalidValue) instead of staging it like Linux does.
 // Fall back to a per-thread pinned bounce buffer in that case. Other errors and other copy kinds pass through.
+// Every chunk is queued on the caller's stream and the stream is synchronized before the bounce buffer is touched
+// again and before returning, so the copy honors the stream's event waits and has completed when the call returns.
+// If the pinned buffer cannot be allocated the allocation error is returned: no copy is made on any other stream
+// (a default-stream copy would not wait for the nonblocking stream's compute/publish dependencies).
 static cudaError_t moe_h2d_async(void * dst, const void * src, size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
     cudaError_t err = cudaMemcpyAsync(dst, src, bytes, kind, stream);
     if (err != cudaErrorInvalidValue || kind != cudaMemcpyHostToDevice || !dst || !src || !bytes) {
         return err;
     }
     (void) cudaGetLastError();
-    static thread_local void * bounce = nullptr;
+    static thread_local moe_h2d_bounce bounce;
     static constexpr size_t bounce_bytes = 8u << 20;
-    if (!bounce && cudaHostAlloc(&bounce, bounce_bytes, cudaHostAllocPortable) != cudaSuccess) {
-        bounce = nullptr;
-        (void) cudaGetLastError();
-        return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    if (!bounce.ptr) {
+        void * p = nullptr;
+        err = cudaHostAlloc(&p, bounce_bytes, cudaHostAllocPortable);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            return err;
+        }
+        bounce.ptr = p;
     }
     for (size_t off = 0; off < bytes; off += bounce_bytes) {
         const size_t n = bytes - off < bounce_bytes ? bytes - off : bounce_bytes;
-        err = cudaStreamSynchronize(stream);
+        err = cudaStreamSynchronize(stream);   // the previous chunk has finished reading the bounce buffer
         if (err != cudaSuccess) { return err; }
-        memcpy(bounce, (const char *) src + off, n);
-        err = cudaMemcpyAsync((char *) dst + off, bounce, n, cudaMemcpyHostToDevice, stream);
+        memcpy(bounce.ptr, (const char *) src + off, n);
+        err = cudaMemcpyAsync((char *) dst + off, bounce.ptr, n, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) { return err; }
     }
     return cudaStreamSynchronize(stream);
+}
+
+// MiB-valued environment override: plain decimal digits only, at most 1 TiB. Anything else (empty, signed, trailing
+// text, overflow, too large) is rejected with a log line and the default is used, so a bad value can never wrap the
+// shifted/summed byte budgets.
+static size_t moe_env_mib_bytes(const char * name, size_t default_bytes) {
+    const char * v = getenv(name);
+    if (!v) {
+        return default_bytes;
+    }
+    static constexpr unsigned long long max_mib = 1ull << 20;
+    unsigned long long mib = 0;
+    bool ok = *v != '\0';
+    for (const char * c = v; ok && *c; ++c) {
+        if (*c < '0' || *c > '9') { ok = false; break; }
+        mib = mib * 10 + (unsigned long long) (*c - '0');
+        if (mib > max_mib) { ok = false; }
+    }
+    if (!ok) {
+        MOE_CACHE_LOG("[moe-cache] ignoring %s=\"%s\": expected 0..%llu (MiB); using the default %zu MiB\n",
+                name, v, max_mib, default_bytes >> 20);
+        return default_bytes;
+    }
+    return (size_t) (mib << 20);
 }
 
 // fork (missjoin): device counters for opt-in miss staging; see moe_missjoin_stage_kernel.
@@ -13730,11 +13775,9 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             }
 #endif
         }
-        // GGML_MOE_DEVICE_RAM_FLOOR_MIB / GGML_MOE_DEVICE_RAM_MARGIN_MIB override the pinning headroom (defaults 7 GiB / 2 GiB).
-        const char * floor_env = getenv("GGML_MOE_DEVICE_RAM_FLOOR_MIB");
-        const char * margin_env = getenv("GGML_MOE_DEVICE_RAM_MARGIN_MIB");
-        const size_t margin = ranges.empty() ? 0 : (margin_env ? (size_t) atoll(margin_env) << 20 : 2ull << 30);
-        const size_t floor = floor_env ? (size_t) atoll(floor_env) << 20 : 7ull << 30;
+        // GGML_MOE_DEVICE_RAM_FLOOR_MIB / GGML_MOE_DEVICE_RAM_MARGIN_MIB override the pinning headroom (defaults 7 GiB / 2 GiB; values above 1 TiB or not plain decimal are ignored).
+        const size_t margin = ranges.empty() ? 0 : moe_env_mib_bytes("GGML_MOE_DEVICE_RAM_MARGIN_MIB", 2ull << 30);
+        const size_t floor = moe_env_mib_bytes("GGML_MOE_DEVICE_RAM_FLOOR_MIB", 7ull << 30);
         const size_t available = moe_cache_mem_available();
         if (bank_entries) {
             MOE_CACHE_LOG("[moe-cache] device tables: %zu bank expert entries point at a %zu KiB zero block (computed by the bank call)\n",
