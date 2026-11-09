@@ -5803,7 +5803,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         pp_nlog.cc0 = g_pp_cache_copies.load(std::memory_order_relaxed);
         pp_nlog.t0 = ggml_time_us();
     }
-    if (b1_mode == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens_all <= 8) {
+    if (b1_mode == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && (n_tokens_all <= 8 ||
+            (b1_cache_device_pending && sched_reserve_tokens <= 16 && n_tokens_all <= sched_reserve_tokens))) {
         b1_cache_warm();
         b1_cache_device_prepare();
     }
