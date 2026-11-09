@@ -18,7 +18,7 @@ Thanks to huhichao (#98), who wrote the Windows port, found the causes and measu
 
 ## Speed (contributor's numbers)
 
-RTX 3090 24 GB, 64 GB RAM, Intel i5-12490F, Windows 11, Flash-Next, `-c 110592`, started with `scripts/flash-next-server.sh` through Git Bash, with `GGML_MOE_DEVICE_RAM_FLOOR_MIB=0 GGML_MOE_DEVICE_RAM_MARGIN_MIB=0 GGML_MOE_CPU_SPLIT_GBPS=12`:
+RTX 3090 24 GB, 64 GB RAM, Intel i5-12490F, Windows 11, Flash-Next, `-c 110592`, started with `scripts/flash-next-server.sh` through Git Bash, with `GGML_MOE_DEVICE_RAM_FLOOR_MIB=0 GGML_MOE_DEVICE_RAM_MARGIN_MIB=0 GGML_MOE_CPU_SPLIT_GBPS=12`, thinking off, and drafter settings `--spec-draft-vocab-map none --spec-draft-n-max 2 --spec-draft-n-min-adaptive 1` (these settings change speed, so other settings will give other numbers):
 
 | request | before | after |
 |---|---|---|
@@ -31,6 +31,6 @@ We have no Windows machine. Built and tested under MinGW/Wine; Windows speed fig
 
 Linux is unchanged: the new code is Windows-only, apart from the two optional settings above, which do nothing unless set. Checks on Linux: CPU suites, the README-flags check, example builds, the MinGW/Wine Windows build and tensor-split checks all passed, dense 27B greedy output is token-for-token identical to v0.6.3.8, and Flash-Next AI3 starts and writes with the shipped launcher.
 
-Earlier Windows fixes: the MSVC build errors (#93) and the Windows model-loading error (#94) were fixed in v0.6.3.3.
+Earlier Windows fixes: v0.6.3.3 fixed the Windows model-loading error (#94) and the MSVC atomics errors (#93). This release also fixes one more MSVC build error, in `quants.c` (`__builtin_ctz`).
 
 Source-only release.
