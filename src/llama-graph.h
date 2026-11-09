@@ -489,6 +489,10 @@ public:
     // SJ-KVaRN cache (index cache only): I64 [n_tokens] index-cache row of each query row (cell == position there,
     // while the K store goes to ring rows); nullptr on plain caches
     ggml_tensor * lsa_q_cell   = nullptr;
+    // LLAMA_LSA_J3: built once per graph and shared by every stale-query prediction (each fresh reshape of a host
+    // input is its own split input, so per-target views uploaded the mask and cell positions 26 times per token)
+    ggml_tensor * lsa_j3_mk2   = nullptr; // [n_kv, T] view of the KQ mask
+    ggml_tensor * lsa_j3_force = nullptr; // [n_kv/F, T or 1] units forced by sinks and the window
     // LSA index cache (LLAMA_LSA_IDX_CACHE=1): layers this graph rebuilds from the K cache; committed as valid
     // in set_input (so reserve graphs, which never run set_input, cannot mark a cache valid)
     std::vector<std::pair<const ggml_tensor *, uint64_t>> lsa_idx_commit;

@@ -6371,7 +6371,11 @@ ggml_tensor * llm_graph_context::build_attn_lsa_j3_units(
         return nullptr; // il rebuilds (or has no) index cache this ubatch: nothing to rank yet
     }
     ggml_tensor * PT  = ggml_view_2d(ctx0, slot.t, d_idx, n_kv, slot.t->nb[1], 0);
-    ggml_tensor * mk2 = ggml_reshape_2d(ctx0, ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask), n_kv, T);
+    if (!inp->lsa_j3_mk2 || inp->lsa_j3_mk2->ne[0] != n_kv || inp->lsa_j3_mk2->ne[1] != T) {
+        inp->lsa_j3_mk2   = ggml_reshape_2d(ctx0, ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask), n_kv, T);
+        inp->lsa_j3_force = nullptr;
+    }
+    ggml_tensor * mk2 = inp->lsa_j3_mk2;
     const int64_t g = n_head/n_head_kv;
     ggml_tensor * sq4 = ggml_reshape_4d(ctx0, ggml_cont(ctx0, sq), d_head, g, n_head_kv, T);
     sq4 = ggml_cont(ctx0, ggml_permute(ctx0, sq4, 1, 0, 2, 3));
@@ -6388,15 +6392,20 @@ ggml_tensor * llm_graph_context::build_attn_lsa_j3_units(
         ggml_tensor * st = ggml_cont(ctx0, ggml_transpose(ctx0, sp));
         sp = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, st, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nu, 1);
     }
-    // sinks and the window are read by every row that sees them; a unit with one such cell counts
-    ggml_tensor * cp  = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, inp->lsa_cell_pos, n_kv, 1), ss);
-    ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, cp, inp->lsa_q_pos), 1.0f, (float) cfg.window - 0.5f));
-    ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, cp, -1.0f, (float) cfg.sinks - 0.5f));
-    ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, mk2, GGML_TYPE_F32), 1.0f, 1e29f));
-    ggml_tensor * force = ggml_pool_1d(ctx0, ggml_mul(ctx0, ggml_add(ctx0, win, snk), vis), GGML_OP_POOL_MAX, (int) F, (int) F, 0);
-    if (T > 1) {
-        ggml_tensor * ft = ggml_cont(ctx0, ggml_transpose(ctx0, force));
-        force = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, ft, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nu, 1);
+    // sinks and the window are read by every row that sees them; a unit with one such cell counts. The same for
+    // every target of this graph (cell positions, query positions, mask, window, sinks, F): built once
+    ggml_tensor * force = inp->lsa_j3_force;
+    if (!force || force->ne[0] != nu) {
+        ggml_tensor * cp  = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, inp->lsa_cell_pos, n_kv, 1), ss);
+        ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, cp, inp->lsa_q_pos), 1.0f, (float) cfg.window - 0.5f));
+        ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, cp, -1.0f, (float) cfg.sinks - 0.5f));
+        ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, mk2, GGML_TYPE_F32), 1.0f, 1e29f));
+        force = ggml_pool_1d(ctx0, ggml_mul(ctx0, ggml_add(ctx0, win, snk), vis), GGML_OP_POOL_MAX, (int) F, (int) F, 0);
+        if (T > 1) {
+            ggml_tensor * ft = ggml_cont(ctx0, ggml_transpose(ctx0, force));
+            force = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, ft, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nu, 1);
+        }
+        inp->lsa_j3_force = force;
     }
     ggml_tensor * units = ggml_cont(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_add(ctx0, sp, force), 1.0f, -0.5f)));
     cb(units, "lsa_j3_units", il);
