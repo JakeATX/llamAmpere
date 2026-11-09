@@ -5380,8 +5380,18 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         const long value = text && text[0] ? strtol(text, nullptr, 10) : 1024;
         return value >= 0 && value <= 3072 ? (uint32_t) value : 1024u;
     }();
-    const bool small_prompt = decode_rows && small_rows && alone && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
-            sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= small_rows;
+    // The helper (MTP) shares the target compute buffer: its catch-up for the same call keeps writing-sized ubatches
+    // too while the target is at writing size, so it fits the existing buffer instead of growing it outside the cache.
+    const bool small_prompt = decode_rows && small_rows && alone &&
+            sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= small_rows &&
+            (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ||
+             (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer && compute_peer->sched_reserve_tokens <= decode_rows));
+    static bool small_logged = false;
+    if (!small_logged && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        small_logged = true;
+        LLAMA_LOG_INFO("%s: short prompts of %u..%u rows keep the %u-row writing scratch (LLAMA_SMALL_PROMPT_ROWS)\n",
+                __func__, decode_rows + 1, small_rows, decode_rows);
+    }
     if (decode_rows && (n_tokens == 0 || small_prompt || (sched_reserve_tokens <= decode_rows && n_tokens <= decode_rows))) {
         rows = decode_rows;
         // fork ROUNDPREP: LLAMA_MTP_SCRATCH_ROWS=N (1..16; default 8; 0 = off) gives the helper (MTP guesser) a
