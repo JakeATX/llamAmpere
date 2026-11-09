@@ -1,6 +1,6 @@
 # llamAmpere v0.6.3.9
 
-Flash-Next on native Windows builds (MSVC + CUDA) can now use the fast path that keeps expert tables on the graphics card. Before this release that path was Linux-only, so on Windows every expert the card did not hold went through a slow fallback, and writing ran at about 0.26 tokens/s.
+Flash-Next on native Windows builds (MSVC + CUDA) can now use the fast path that keeps expert tables on the graphics card. Before this release that path was Linux-only, so on Windows every expert the card did not hold went through a slow fallback; on the contributor's machine writing ran at 0.26 tokens/s.
 
 Thanks to huhichao (#98), who wrote the Windows port, found the causes and measured it on his own Windows machine.
 
@@ -8,8 +8,8 @@ Thanks to huhichao (#98), who wrote the Windows port, found the causes and measu
 
 - The card-side expert tables are turned on for Windows builds. Windows free RAM is read with `GlobalMemoryStatusEx`; Windows has no cgroups, so the free-RAM floor is the only memory guard there.
 - Windows rejects a copy to the card from a memory range that mixes locked and normal pages, where Linux accepts it. That copy now goes through a small staging buffer on the same GPU stream, and it finishes before the expert slot is used. If locked memory for the buffer cannot be allocated, normal memory is used instead (slower, same order).
-- The CPU expert split pins its threads with the Windows APIs. On Windows, core 0 is left out of the expert thread pool (when there are more than 2 cores), and the thread that drives the card is kept off the pool's cores; `GGML_MOE_CPU_SPLIT_WIN_CARD=0` stops restricting the card thread (core 0 stays out of the pool either way).
-- Windows MoE runs now see the machine's free RAM (it used to read as 0), so the RAM-fit and read-ahead budgets work on Windows as on Linux. This affects every Windows MoE run, not only the card-side tables.
+- The CPU expert split pins its threads with the Windows APIs. On Windows, core 0 is left out of the expert thread pool (when there are more than 2 cores), and the thread that drives the card is kept off the CPUs the pool threads are pinned to (it may still use their second hardware threads); `GGML_MOE_CPU_SPLIT_WIN_CARD=0` stops restricting the card thread (core 0 stays out of the pool either way).
+- Windows MoE runs now see the machine's free RAM (it used to read as 0), so the RAM-fit and read-ahead budgets are no longer disabled on Windows. This affects every Windows MoE run, not only the card-side tables.
 - MSVC build fixes from the port: `/bigobj` for `ai4.cu`, exported CPU helpers, `_tzcnt_u32` instead of `__builtin_ctz`, and half-float conversion helpers for the AVX2 expert kernels.
 
 ## Two new optional settings (all platforms, off unless set)
@@ -31,6 +31,6 @@ We have no Windows machine. Built and tested under MinGW/Wine; Windows speed fig
 
 Linux is unchanged: the new code is Windows-only, apart from the two optional settings above, which do nothing unless set. Checks on Linux: CPU suites, the README-flags check, example builds, the MinGW/Wine Windows build and tensor-split checks all passed, dense 27B greedy output is token-for-token identical to v0.6.3.8, and Flash-Next AI3 starts and writes with the shipped launcher.
 
-Earlier Windows fixes: v0.6.3.3 fixed the Windows model-loading error (#94) and the MSVC atomics errors (#93). This release also fixes one more MSVC build error, in `quants.c` (`__builtin_ctz`).
+Earlier Windows fixes: v0.6.3.3 fixed the Windows model-loading error (#94) and the MSVC atomics errors (#93). The MSVC build fixes listed above are new in this release.
 
 Source-only release.
