@@ -13262,7 +13262,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         if (src && src->buffer && ggml_cuda_qsa_resident_is_buft(src->buffer->buft)) {
             if (src->buffer->buft->device != dev ||
-                !((op->op == GGML_OP_FLASH_ATTN_EXT && i == 5) || op->op == GGML_OP_SJKVARN_SEAL)) {
+                !((op->op == GGML_OP_FLASH_ATTN_EXT && i == 5) || op->op == GGML_OP_SJKVARN_SEAL ||
+                  (op->op == GGML_OP_LSA_PREFETCH && i == 1))) { // LLAMA_LSA_J3: the slot map of the target body
                 return false;
             }
         }
