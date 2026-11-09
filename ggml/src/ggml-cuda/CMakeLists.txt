@@ -300,3 +300,14 @@ endif()
 if (TARGET ggml-cuda AND TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
     target_link_libraries(ggml-cuda PRIVATE ggml-cpu)
 endif()
+
+# MSVC (the AVX2 host kernels get /arch:AVX2 and their feature macros in moe-cpu-split-avx2.cpp and above; the
+# baseline split files stay at the default ISA)
+if (MSVC)
+    # ai4.cu's host stub exceeds the default COFF section limit (C1128); per-file so the other .cu objects stay cached
+    set_property(SOURCE ai4.cu APPEND PROPERTY COMPILE_OPTIONS "-Xcompiler=/bigobj")
+    # moe-cpu-split.cpp calls internal ggml-cpu helpers (ggml_vec_silu_f32 ...) that a .so exports by default but a DLL does not
+    if (TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
+        set_target_properties(ggml-cpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
+endif()

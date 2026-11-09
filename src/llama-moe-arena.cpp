@@ -20,6 +20,14 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#else
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 void llama_copy_moe_output(void * dst, const void * src, size_t bytes) {
@@ -305,6 +313,13 @@ size_t llama_moe_arena::available_memory() {
     while (input >> key >> kib >> unit) {
         if (key == "MemAvailable:" && kib <= SIZE_MAX / 1024) { return kib * 1024; }
     }
+#elif defined(_WIN32)
+    // Windows has no /proc/meminfo: without this every RAM-fit / prefetch budget sees 0 bytes available, so
+    // read-ahead is disabled and cold expert pages fault in one by one. ullAvailPhys counts free + standby,
+    // close to MemAvailable's meaning for the planner's floors.
+    MEMORYSTATUSEX st;
+    st.dwLength = sizeof(st);
+    if (GlobalMemoryStatusEx(&st)) { return (size_t) st.ullAvailPhys; }
 #endif
     return 0;
 }

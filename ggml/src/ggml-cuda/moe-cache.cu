@@ -83,8 +83,138 @@ static void moe_cache_register_stub(const void * owner) {
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>   // GlobalMemoryStatusEx
+#endif
 
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
+
+#if defined(_WIN32)
+// Bounce buffers for moe_h2d_async (Windows only). A thread_local destructor runs under the loader lock on Windows,
+// where a call into the CUDA runtime (cudaFreeHost) can deadlock or touch an already unloaded runtime. So no CUDA
+// call is made there: an exiting thread hands its pinned buffer to this process-wide free list and the next thread
+// that needs one reuses it. The pool is never destroyed; the OS releases the pinned pages at process exit.
+struct moe_h2d_bounce_pool {
+    std::mutex mutex;
+    std::vector<void *> pinned;
+};
+
+static moe_h2d_bounce_pool & moe_h2d_pool() {
+    static moe_h2d_bounce_pool * pool = new moe_h2d_bounce_pool();
+    return *pool;
+}
+
+struct moe_h2d_bounce {
+    void * pinned = nullptr;       // cudaHostAllocPortable, from the pool or newly allocated
+    std::vector<char> pageable;    // used only when no pinned buffer could be allocated
+    ~moe_h2d_bounce() {
+        if (pinned) {
+            // try_lock: at process exit another thread may have been killed while holding the lock; then the buffer
+            // is simply kept (the OS frees it) instead of waiting forever.
+            try {
+                auto & pool = moe_h2d_pool();
+                std::unique_lock<std::mutex> lock(pool.mutex, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    pool.pinned.push_back(pinned);
+                }
+            } catch (...) {
+                // keep the buffer (freed by the OS at exit) rather than throw from a destructor
+            }
+            pinned = nullptr;
+        }
+    }
+};
+#endif
+
+// Host-to-device copy from an expert source, always on the caller's stream.
+// Windows (WDDM): cudaMemcpyAsync rejects a host range that mixes cudaHostRegister'ed pages with unregistered ones
+// (cudaErrorInvalidValue) instead of staging it like Linux does. Only in that case the copy goes through a
+// per-thread bounce buffer: every chunk is queued on the caller's stream, and the stream is synchronized before the
+// buffer is refilled and before returning, so the copy honors the stream's event waits and has completed when the call
+// returns. The buffer is pinned when possible; if pinned memory cannot be allocated a pageable buffer is used, which
+// is still copied on the same stream (only slower). No copy is ever made on another stream.
+// Other platforms: exactly cudaMemcpyAsync.
+static cudaError_t moe_h2d_async(void * dst, const void * src, size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
+    cudaError_t err = cudaMemcpyAsync(dst, src, bytes, kind, stream);
+#if defined(_WIN32)
+    if (err != cudaErrorInvalidValue || kind != cudaMemcpyHostToDevice || !dst || !src || !bytes) {
+        return err;
+    }
+    (void) cudaGetLastError();
+    static thread_local moe_h2d_bounce bounce;
+    static constexpr size_t bounce_bytes = 8u << 20;
+    if (!bounce.pinned) {
+        {
+            auto & pool = moe_h2d_pool();
+            std::lock_guard<std::mutex> lock(pool.mutex);
+            if (!pool.pinned.empty()) {
+                bounce.pinned = pool.pinned.back();
+                pool.pinned.pop_back();
+            }
+        }
+        if (!bounce.pinned) {
+            void * p = nullptr;
+            if (cudaHostAlloc(&p, bounce_bytes, cudaHostAllocPortable) == cudaSuccess) {
+                bounce.pinned = p;
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+    }
+    char * buffer = (char *) bounce.pinned;
+    if (!buffer) {
+        try {
+            if (bounce.pageable.size() < bounce_bytes) {
+                bounce.pageable.resize(bounce_bytes);
+            }
+        } catch (...) {
+            return cudaErrorMemoryAllocation;
+        }
+        buffer = bounce.pageable.data();
+    }
+    for (size_t off = 0; off < bytes; off += bounce_bytes) {
+        const size_t n = bytes - off < bounce_bytes ? bytes - off : bounce_bytes;
+        err = cudaStreamSynchronize(stream);   // the previous chunk has finished reading the bounce buffer
+        if (err != cudaSuccess) { return err; }
+        memcpy(buffer, (const char *) src + off, n);
+        err = cudaMemcpyAsync((char *) dst + off, buffer, n, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess) { return err; }
+    }
+    return cudaStreamSynchronize(stream);
+#else
+    return err;
+#endif
+}
+
+// MiB-valued environment override: plain decimal digits only, at most 1 TiB. Anything else (empty, signed, trailing
+// text, overflow, too large) is rejected with a log line and the default is used, so a bad value can never wrap the
+// shifted/summed byte budgets.
+[[maybe_unused]] static size_t moe_env_mib_bytes(const char * name, size_t default_bytes) {
+    const char * v = getenv(name);
+    if (!v) {
+        return default_bytes;
+    }
+    static constexpr unsigned long long max_mib = 1ull << 20;
+    unsigned long long mib = 0;
+    bool ok = *v != '\0';
+    for (const char * c = v; ok && *c; ++c) {
+        if (*c < '0' || *c > '9') { ok = false; break; }
+        mib = mib * 10 + (unsigned long long) (*c - '0');
+        if (mib > max_mib) { ok = false; }
+    }
+    if (!ok) {
+        MOE_CACHE_LOG("[moe-cache] ignoring %s=\"%s\": expected 0..%llu (MiB); using the default %zu MiB\n",
+                name, v, max_mib, default_bytes >> 20);
+        return default_bytes;
+    }
+    return (size_t) (mib << 20);
+}
 
 // fork (missjoin): device counters for opt-in miss staging; see moe_missjoin_stage_kernel.
 static unsigned long long * g_missjoin_counts = nullptr;
@@ -2448,7 +2578,7 @@ static void moe_cache_worker_fill_batch(moe_cache_session * session, moe_cache_d
                 errors[i] = first_error = cudaErrorInvalidValue;
                 continue;
             }
-            errors[i] = cudaMemcpyAsync(destinations[i], job.source, job.bytes, cudaMemcpyHostToDevice, stream);
+            errors[i] = moe_h2d_async(destinations[i], job.source, job.bytes, cudaMemcpyHostToDevice, stream);
             if (errors[i] != cudaSuccess) {
                 first_error = errors[i];
             } else {
@@ -2638,7 +2768,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // source still works (the driver stages it). Off by default.
             static const bool fill_direct = moe_cache_env_on("GGML_MOE_CACHE_FILL_DIRECT");
             if (!expired && error == cudaSuccess && fill_direct) {
-                error = cudaMemcpyAsync(destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
+                error = moe_h2d_async(destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
                 if (error == cudaSuccess) {
                     error = cudaStreamSynchronize(stream);
                 }
@@ -6933,7 +7063,7 @@ static int moe_cache_warm(void * opaque, const ggml_moe_cache_tensor_desc * tens
             ggml_cuda_set_device(f.device->logical);
             ok = ok && !f.device->dead.load() && !moe_cache_fail(*session, "insert") &&
                     moe_resident_host_restore(f.job.source, f.job.bytes) &&
-                    cudaMemcpyAsync(f.destination, f.job.source, f.job.bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+                    moe_h2d_async(f.destination, f.job.source, f.job.bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess;
             last = stream;
             ++batch_copies;
         }
@@ -7498,6 +7628,10 @@ static size_t moe_cache_mem_available() {
         fclose(f);
     }
     return kb <= SIZE_MAX / 1024 ? kb * 1024 : 0;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof(st);
+    return GlobalMemoryStatusEx(&st) ? (size_t) st.ullAvailPhys : 0;
 #else
     return 0;
 #endif
@@ -7670,6 +7804,12 @@ static bool moe_cache_cgroup_headroom(size_t extra, size_t registered = 0, uint6
         }
         path.resize(slash);
     }
+    return true;
+#elif defined(_WIN32)
+    // No cgroups on Windows; the physical RAM floor check in the caller is the only guard.
+    GGML_UNUSED(extra);
+    GGML_UNUSED(registered);
+    if (peak_current) { *peak_current = 0; }
     return true;
 #else
     GGML_UNUSED(extra);
@@ -7974,7 +8114,7 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
                 }
             } else {
                 for (const auto & fill : queued) {
-                    copy_error = cudaMemcpyAsync(fill.destination, fill.source, fill.bytes,
+                    copy_error = moe_h2d_async(fill.destination, fill.source, fill.bytes,
                             cudaMemcpyHostToDevice, session.device_adapt_stream);
                     if (copy_error != cudaSuccess) {
                         break;
@@ -8014,7 +8154,7 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
         const bool publish_async = session.device_publish_async && session.device_adapt_stream;
         auto publish = [&](void * destination, const void * source, size_t bytes) {
             if (publish_async) {
-                CUDA_CHECK(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, session.device_adapt_stream));
+                CUDA_CHECK(moe_h2d_async(destination, source, bytes, cudaMemcpyHostToDevice, session.device_adapt_stream));
             } else {
                 CUDA_CHECK(cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice));
             }
@@ -8796,7 +8936,7 @@ static void moe_cache_swap_apply_decision(moe_cache_session & session, const std
         if (!source) {
             source = (const char *)fill.table->desc.data + (size_t)fill.expert * fill.table->host_stride;
         }
-        ok = cudaMemcpyAsync(fill.destination, source, fill.pool->expert_size, cudaMemcpyHostToDevice,
+        ok = moe_h2d_async(fill.destination, source, fill.pool->expert_size, cudaMemcpyHostToDevice,
                 session.swap_copy_stream) == cudaSuccess;
     }
     ok = ok && cudaEventRecord(session.swap_copy_event, session.swap_copy_stream) == cudaSuccess;
@@ -10038,7 +10178,7 @@ static double moe_cs_probe_link(void * dst, size_t cap) {
         memset(src, 1, bytes);
         for (int rep = 0; rep < 4; ++rep) {
             float ms = 0.0f;
-            if (cudaEventRecord(e0, st) != cudaSuccess || cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            if (cudaEventRecord(e0, st) != cudaSuccess || moe_h2d_async(dst, src, bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
                     cudaEventRecord(e1, st) != cudaSuccess || cudaEventSynchronize(e1) != cudaSuccess ||
                     cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess) {
                 best = 0.0;
@@ -12009,7 +12149,7 @@ static void moe_pf_worker_main() {
                     g_pf.no_source.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
-                if (cudaMemcpyAsync(dst + g_pf.kind_off[k], src, bytes, cudaMemcpyHostToDevice, g_pf.stream) != cudaSuccess) {
+                if (moe_h2d_async(dst + g_pf.kind_off[k], src, bytes, cudaMemcpyHostToDevice, g_pf.stream) != cudaSuccess) {
                     (void) cudaGetLastError();
                     g_pf.errors.fetch_add(1, std::memory_order_relaxed);
                     continue;
@@ -13368,7 +13508,7 @@ private:
     std::vector<size_t> order, prefix;
 };
 
-#if defined(__linux__) && CUDART_VERSION >= 11010 && !defined(GGML_USE_HIP)
+#if (defined(__linux__) || defined(_WIN32)) && CUDART_VERSION >= 11010 && !defined(GGML_USE_HIP)
 static void * moe_cache_host_alias(const void * source, size_t bytes) {
     const uintptr_t begin = (uintptr_t)source;
     if (!source || !bytes || bytes > UINTPTR_MAX - begin ||
@@ -13394,7 +13534,7 @@ static void * moe_cache_host_alias(const void * source, size_t bytes) {
 #endif
 
 static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_desc * tensors, int n_tensors) {
-#if defined(__linux__) && CUDART_VERSION >= 11010 && !defined(GGML_USE_HIP)
+#if (defined(__linux__) || defined(_WIN32)) && CUDART_VERSION >= 11010 && !defined(GGML_USE_HIP)
     auto * session = (moe_cache_session *) opaque;
     const char * enabled = getenv("GGML_MOE_CACHE_DEVICE");
     if (!session || !enabled || strcmp(enabled, "1") != 0 || !tensors || n_tensors < 1 || n_tensors > 4096 ||
@@ -13473,7 +13613,11 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         return 0;
     };
     try {
+#ifdef _WIN32
+        const size_t page = 4096;  // x64 Windows page size (no sysconf)
+#else
         const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+#endif
         if (!page || (page & (page - 1))) {
             return fail();
         }
@@ -13677,6 +13821,9 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 return fail();
             }
             pin_bytes += bytes;
+#ifdef _WIN32
+            new_bytes += bytes;  // no mincore: count every page as newly resident (conservative)
+#else
             std::vector<unsigned char> residency(bytes / page);
             if (mincore((void *)range.begin, bytes, residency.data()) != 0) {
                 return fail();
@@ -13684,9 +13831,11 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             for (auto resident : residency) {
                 new_bytes += (resident & 1) ? 0 : page;
             }
+#endif
         }
-        const size_t margin = ranges.empty() ? 0 : 2ull << 30;
-        const size_t floor = 7ull << 30;
+        // GGML_MOE_DEVICE_RAM_FLOOR_MIB / GGML_MOE_DEVICE_RAM_MARGIN_MIB override the pinning headroom (defaults 7 GiB / 2 GiB; values above 1 TiB or not plain decimal are ignored).
+        const size_t margin = ranges.empty() ? 0 : moe_env_mib_bytes("GGML_MOE_DEVICE_RAM_MARGIN_MIB", 2ull << 30);
+        const size_t floor = moe_env_mib_bytes("GGML_MOE_DEVICE_RAM_FLOOR_MIB", 7ull << 30);
         const size_t available = moe_cache_mem_available();
         if (bank_entries) {
             MOE_CACHE_LOG("[moe-cache] device tables: %zu bank expert entries point at a %zu KiB zero block (computed by the bank call)\n",
