@@ -6432,6 +6432,27 @@ void llm_graph_context::build_attn_lsa_j3(
         return;
     }
     ggml_tensor * r = ggml_lsa_prefetch(ctx0, desc, body, units, (int) cfg.refine, flags, src);
+    // Pin the op to the GPU backend that owns the body. Left to the scheduler, this consumer-less op lands in a CPU
+    // split: the whole body (72 MiB per layer at 100K) is copied to the host every step and the CPU no-op runs, so
+    // the slot prefetch never happens (r387diag: 28/54 splits per decode graph vs 2, no pf_hits in r384).
+    const ggml_tensor * bb = body->view_src ? body->view_src : body;
+    ggml_backend_t owner = nullptr;
+    for (int b = 0; bb->buffer && b < ggml_backend_sched_get_n_backends(sched) && !owner; ++b) {
+        ggml_backend_t be = ggml_backend_sched_get_backend(sched, b);
+        if (be != backend_cpu && ggml_backend_supports_buft(be, ggml_backend_buffer_get_type(bb->buffer)) &&
+                ggml_backend_supports_op(be, r)) {
+            owner = be;
+        }
+    }
+    if (!owner) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: LLAMA_LSA_J3: no GPU backend owns the body of layer %d; prefetch op not built\n", __func__, il);
+        }
+        return;
+    }
+    ggml_backend_sched_set_tensor_backend(sched, r, owner);
     cb(r, "lsa_j3_prefetch", il);
     ggml_build_forward_expand(gf, r);
 }
