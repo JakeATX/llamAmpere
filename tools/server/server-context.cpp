@@ -125,7 +125,7 @@ static common_speculative_output_limits server_output_limits(const common_params
         n_max = std::max(n_max, params.speculative.draft.n_max);
     }
 
-    auto result = common_speculative_get_output_limits(params.n_batch, params.n_parallel, n_max);
+    auto result = common_speculative_get_output_limits(common_context_n_batch(params), params.n_parallel, n_max);
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);

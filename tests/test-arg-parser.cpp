@@ -32,6 +32,19 @@ static void test(void) {
     assert_output_limits(16, 2, -1, 2, 1);
     assert_output_limits( 6, 2,  3, 6, 4);
     assert_output_limits( 2, 1,  3, 2, 2);
+    {
+        // -b 1 with MTP: the context raises n_batch to n_rs_seq + 2, and the output rows must follow it
+        // (v0.6.3.6 sized them from -b and aborted on the first verify: n_outputs_max <= cparams.n_outputs_max)
+        common_params b1;
+        b1.n_batch = b1.n_ubatch = 1;
+        b1.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        b1.speculative.draft.n_max = 4;
+        assert(common_context_n_batch(b1) == 6);
+        assert(common_context_params_to_llama(b1).n_batch == 6);
+        assert_output_limits(common_context_n_batch(b1), 1, 4, 5, 5);
+        b1.speculative.types.clear();
+        assert(common_context_n_batch(b1) == 1);
+    }
     assert_output_limits(
             std::numeric_limits<int32_t>::max(),
             std::numeric_limits<int32_t>::max(),
