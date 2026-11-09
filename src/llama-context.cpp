@@ -5332,6 +5332,18 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false;  // all sequences use backend sampling
 }
 
+// fork V07QW A7: a call of 9..LLAMA_SMALL_PROMPT_ROWS rows that arrives at writing scratch while the device expert
+// tables are still pending (the turn before stopped before any call of 8 rows or fewer) publishes them first and
+// keeps the writing scratch. LLAMA_PENDING_PUBLISH=0 restores v0.6.3.10: 9-16 rows run on host experts and
+// 17 rows or more grow to 512.
+static bool b1_pending_publish_enabled() {
+    static const bool enabled = [] {
+        const char * text = getenv("LLAMA_PENDING_PUBLISH");
+        return !(text && text[0] == '0');
+    }();
+    return enabled;
+}
+
 bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch) {
     const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
     if (!rotate || rotate[0] != '1' || cparams.warmup || !cparams.causal_attn || cparams.training ||
@@ -5386,7 +5398,8 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     // too while the target is at writing size, so it fits the existing buffer instead of growing it outside the cache.
     const bool small_prompt = decode_rows && small_rows && alone &&
             sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= small_rows &&
-            ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && b1_cache_device_active && !b1_cache_device_pending) ||
+            ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+              (b1_cache_device_pending ? b1_pending_publish_enabled() : b1_cache_device_active)) || // pending: decode() publishes
              (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer && compute_peer->b1_cache_device_active &&
               !compute_peer->b1_cache_device_pending && compute_peer->sched_reserve_tokens <= decode_rows));
     static bool small_logged = false;
@@ -5804,9 +5817,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         pp_nlog.t0 = ggml_time_us();
     }
     if (b1_mode == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && (n_tokens_all <= 8 ||
-            (b1_cache_device_pending && sched_reserve_tokens <= 16 && n_tokens_all <= sched_reserve_tokens))) {
+            (b1_cache_device_pending && sched_reserve_tokens <= 16 && b1_pending_publish_enabled()))) {
+        // At writing scratch with tables pending, the call is either 9-16 rows or a short prompt that
+        // prompt_buffers_resize kept at writing size because this publish follows the output reserve above.
         b1_cache_warm();
         b1_cache_device_prepare();
+        if (n_tokens_all > sched_reserve_tokens && !b1_cache_device_active) {
+            LLAMA_LOG_WARN("%s: device expert prepare failed before a %u-row call kept at %u scratch rows; it runs on "
+                    "host experts (LLAMA_PENDING_PUBLISH=0 restores the grow)\n", __func__, n_tokens_all, sched_reserve_tokens);
+        }
     }
     llama_seq_id b1_seq      = -1;
     llama_pos    b1_pos0     = 0;
