@@ -2025,6 +2025,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+int32_t common_context_n_batch(const common_params & params) {
+    const uint32_t n_rs_seq = params.speculative.need_n_rs_seq();
+    return n_rs_seq > 0 ? std::max<int32_t>(params.n_batch, (int32_t) n_rs_seq + 2) : params.n_batch;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -2040,7 +2045,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     if (cparams.n_rs_seq > 0) {
         const uint32_t n_batch_min = cparams.n_rs_seq + 2;
-        cparams.n_batch  = std::max(cparams.n_batch,  n_batch_min);
+        cparams.n_batch  = (uint32_t) common_context_n_batch(params);
         cparams.n_ubatch = std::max(cparams.n_ubatch, n_batch_min);
     }
 

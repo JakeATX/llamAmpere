@@ -31,7 +31,7 @@ int main(int argc, char ** argv) {
     }
 
     const auto output_limits = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+            common_context_n_batch(params), params.n_parallel, common_speculative_n_max(&params.speculative));
     params.n_outputs_max = output_limits.total;
     params.n_outputs_max_per_seq = output_limits.per_seq;
 

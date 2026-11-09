@@ -1196,6 +1196,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+// n_batch the context will get: raised to n_rs_seq + 2 when a drafter keeps recurrent-state snapshots.
+// Size output rows (n_outputs_max) from this, not from params.n_batch, or -b 1 caps verify at one row.
+int32_t common_context_n_batch(const common_params & params);
 
 bool common_params_should_fit_device_memory(const common_params & params);
 
