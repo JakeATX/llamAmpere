@@ -595,7 +595,6 @@ private:
     bool sched_need_reserve = true;
     // fork: limit only the reserved graph, not the caller's physical batch size.
     uint32_t sched_reserve_tokens = 0;
-    bool small_prompt_ready = false; // F1: set after the first prompt that grew the scratch (cache pools then exist)
     // The scheduler owns expert residency independently of its compute allocator.
     // Reuse it for graph-shape changes while its fixed capacity/configuration fits.
     size_t sched_node_capacity = 0;
@@ -715,6 +714,7 @@ private:
     bool b1_cache_needs_refresh = false;
     bool b1_cache_profile_attempted = false;
     bool b1_cache_device_pending = false;
+    bool b1_cache_device_active = false; // F1: device expert dispatch is on (last prepare had ready > 0, none pending)
     void b1_cache_begin();
     ggml_tensor * b1_cache_user_node = nullptr;
     std::vector<std::vector<uint64_t>> b1_cache_counts;
