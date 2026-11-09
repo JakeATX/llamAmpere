@@ -18,8 +18,9 @@
 
 // ctl words per map: 0 epoch, 1 hand, 2 queued misses, 3 picked, 4 assigned, 5 prefetched, 6 prefetch resolves,
 // 7 not admitted, 8..15 u64 own counters (fetched, picked, resolves, over), 16 epoch of the last own resolve,
-// 17 J3 marks already resident, 18 J3 marks with no slot (cap or every slot protected)
-constexpr int QSA_CLOCK_CTL_WORDS = 24;
+// 17 J3 marks already resident, 18 J3 marks with no slot (cap or every slot protected), 19..23 J3 cascade counters,
+// 24 records the last own resolve picked (J3: the previous pick is protected only while it leaves slots free)
+constexpr int QSA_CLOCK_CTL_WORDS = 25;
 
 struct qsa_clock_type {
     ggml_backend_buffer_type buft;
@@ -1375,7 +1376,9 @@ static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit
         assigned = 0;
         hand = m.ctl[1];
         nmiss = min(m.ctl[2], limit);
-        keep_from = pf == 2 ? m.ctl[16] : pf == 3 ? m.ctl[16] + 1 : epoch;
+        // pf 2 protects the previous own pick only while it is smaller than the slot pool: at a share where one
+        // step's pick fills every slot, protecting it would freeze the pool (r390: j35/j20 copied one pool, then 0)
+        keep_from = pf == 2 ? (m.ctl[24] < m.slots ? m.ctl[16] : m.ctl[16] + 1) : pf == 3 ? m.ctl[16] + 1 : epoch;
     }
     __syncthreads();
     const uint32_t lanes = min(uint32_t(blockDim.x), m.slots);
@@ -1421,6 +1424,7 @@ static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit
             c[2] += 1;
             c[3] += over;
             m.ctl[16] = epoch; // J3: slots stamped after this belong to the next own resolve's prefetch
+            m.ctl[24] = m.ctl[3]; // J3: records this own resolve picked
         }
         m.ctl[0] = epoch;
         m.ctl[1] = (hand + scanned)%m.slots;
