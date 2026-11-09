@@ -5369,7 +5369,33 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         const long value = text && text[0] ? strtol(text, nullptr, 10) : 16;
         return value > 0 && value <= 512 ? (uint32_t) value : 0u;
     }();
-    if (decode_rows && (n_tokens == 0 || (sched_reserve_tokens <= decode_rows && n_tokens <= decode_rows))) {
+    // fork F1 (V07QW): a short single-sequence prompt on the target (a chat or agent follow-up after a long turn)
+    // keeps the writing scratch and runs as ceil(n / decode_rows) writing-sized ubatches through the expert cache,
+    // the same path a follow-up of at most decode_rows tokens already takes. Growing to 512 rows for it lent cache
+    // memory, ran the call on streamed host experts and refilled the cache after it: 14.5 s for 17 tokens and
+    // 20.6 s for 25 tokens after a 100K turn, against 0.12 s for 16 tokens. LLAMA_SMALL_PROMPT_ROWS=N (0..3072,
+    // default 512) is the largest such call; 0 restores the old grow. Only while device expert dispatch is active
+    // (b1_cache_device_prepare reported ready > 0 and no prepare is pending): without it 16-row expert nodes take
+    // the host-copy path (a fresh server stalled on a 1000-row first prompt kept at 16 rows), so the call grows.
+    static const uint32_t small_rows = [] {
+        const char * text = getenv("LLAMA_SMALL_PROMPT_ROWS");
+        const long value = text && text[0] ? strtol(text, nullptr, 10) : 512;
+        return value >= 0 && value <= 3072 ? (uint32_t) value : 512u;
+    }();
+    // The helper (MTP) shares the target compute buffer: its catch-up for the same call keeps writing-sized ubatches
+    // too while the target is at writing size, so it fits the existing buffer instead of growing it outside the cache.
+    const bool small_prompt = decode_rows && small_rows && alone &&
+            sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= small_rows &&
+            ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && b1_cache_device_active && !b1_cache_device_pending) ||
+             (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer && compute_peer->b1_cache_device_active &&
+              !compute_peer->b1_cache_device_pending && compute_peer->sched_reserve_tokens <= decode_rows));
+    static bool small_logged = false;
+    if (!small_logged && decode_rows && small_rows && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        small_logged = true;
+        LLAMA_LOG_INFO("%s: short prompts of %u..%u rows keep the %u-row writing scratch (LLAMA_SMALL_PROMPT_ROWS)\n",
+                __func__, decode_rows + 1, small_rows, decode_rows);
+    }
+    if (decode_rows && (n_tokens == 0 || small_prompt || (sched_reserve_tokens <= decode_rows && n_tokens <= decode_rows))) {
         rows = decode_rows;
         // fork ROUNDPREP: LLAMA_MTP_SCRATCH_ROWS=N (1..16; default 8; 0 = off) gives the helper (MTP guesser) a
         // smaller writing scratch than the target's. At 16 rows the helper's attention is past the fused route's
@@ -7671,6 +7697,9 @@ void llama_context::b1_cache_profile_load() {
         ggml_backend_sched_moe_cache_warm(sched.get(), tensors.data(), nullptr, (int) tensors.size());
         const char * device = getenv("GGML_MOE_CACHE_DEVICE");
         b1_cache_device_pending = device && strcmp(device, "1") == 0;
+        if (b1_cache_device_pending) {
+            b1_cache_device_active = false;
+        }
     } catch (const std::bad_alloc &) {
         LLAMA_LOG_WARN("%s: profile warm skipped after host allocation failure\n", __func__);
     }
@@ -7718,6 +7747,9 @@ void llama_context::b1_cache_warm() {
         // and the next generation decode has resized its output buffer.
         const char * device = getenv("GGML_MOE_CACHE_DEVICE");
         b1_cache_device_pending = device && strcmp(device, "1") == 0;
+        if (b1_cache_device_pending) {
+            b1_cache_device_active = false;
+        }
         LLAMA_LOG_INFO("%s: [B1] cache warm: %zu tensors, %llu synchronized routing readbacks, %d fills queued\n", __func__,
                        tensors.size(), (unsigned long long) b1_cache_readbacks, queued);
     } catch (...) {
@@ -7785,6 +7817,7 @@ void llama_context::b1_cache_device_prepare() {
         const int ready = ggml_backend_sched_moe_cache_device_prepare(sched.get(), tensors.data(), (int)tensors.size());
         LLAMA_LOG_INFO("%s: deferred device expert prepare: tensors=%zu ready=%d elapsed_ms=%.3f phase=post-output-reserve-pregraph\n",
                 __func__, tensors.size(), ready, (ggml_time_us() - started) / 1000.0);
+        b1_cache_device_active = ready > 0;
         if (ready > 0) {
             LLAMA_LOG_INFO("%s: device expert dispatch activated; response graphs invalidated\n", __func__);
         }

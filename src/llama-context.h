@@ -714,6 +714,7 @@ private:
     bool b1_cache_needs_refresh = false;
     bool b1_cache_profile_attempted = false;
     bool b1_cache_device_pending = false;
+    bool b1_cache_device_active = false; // F1: device expert dispatch is on (last prepare had ready > 0, none pending)
     void b1_cache_begin();
     ggml_tensor * b1_cache_user_node = nullptr;
     std::vector<std::vector<uint64_t>> b1_cache_counts;
