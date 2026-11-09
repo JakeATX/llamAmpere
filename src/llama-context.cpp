@@ -5374,7 +5374,8 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     // the same path a follow-up of at most decode_rows tokens already takes. Growing to 512 rows for it lent cache
     // memory, ran the call on streamed host experts and refilled the cache after it: 14.5 s for 17 tokens and
     // 20.6 s for 25 tokens after a 100K turn, against 0.12 s for 16 tokens. LLAMA_SMALL_PROMPT_ROWS=N (0..3072,
-    // default 1024) is the largest such call; 0 restores the old grow.
+    // default 1024) is the largest such call; 0 restores the old grow. The first prompt of a server still grows
+    // (it builds the cache pools; a fresh server hung on a 1000-row first prompt kept at 16 rows), later ones keep.
     static const uint32_t small_rows = [] {
         const char * text = getenv("LLAMA_SMALL_PROMPT_ROWS");
         const long value = text && text[0] ? strtol(text, nullptr, 10) : 1024;
@@ -5384,10 +5385,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     // too while the target is at writing size, so it fits the existing buffer instead of growing it outside the cache.
     const bool small_prompt = decode_rows && small_rows && alone &&
             sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= small_rows &&
-            (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ||
-             (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer && compute_peer->sched_reserve_tokens <= decode_rows));
+            ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && small_prompt_ready) ||
+             (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer && compute_peer->small_prompt_ready &&
+              compute_peer->sched_reserve_tokens <= decode_rows));
     static bool small_logged = false;
-    if (!small_logged && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+    if (!small_logged && decode_rows && small_rows && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
         small_logged = true;
         LLAMA_LOG_INFO("%s: short prompts of %u..%u rows keep the %u-row writing scratch (LLAMA_SMALL_PROMPT_ROWS)\n",
                 __func__, decode_rows + 1, small_rows, decode_rows);
@@ -5469,6 +5471,9 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         (b1_ffn_scratch_active || b1_layer_scratch_active) && suspend_early && suspend_early[0] == '1' &&
         suspend_cache && suspend_cache[0] == '1';
     sched_reserve(suspend_prompt_cache);
+    if (n_tokens > 0 && rows > decode_rows && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        small_prompt_ready = true;
+    }
     if (rows < previous || trim_packed) {
         b1_cache_needs_refresh = true;
     }
