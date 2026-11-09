@@ -493,6 +493,12 @@ public:
     // input is its own split input, so per-target views uploaded the mask and cell positions 26 times per token)
     ggml_tensor * lsa_j3_mk2   = nullptr; // [n_kv, T] view of the KQ mask
     ggml_tensor * lsa_j3_force = nullptr; // [n_kv/F, T or 1] units forced by sinks and the window
+    // what the two were built from: reused only while every key matches (a layer with another mask, position
+    // input, window, sinks or unit size builds its own)
+    const ggml_tensor * lsa_j3_mk2_src  = nullptr; // kq_mask
+    const ggml_tensor * lsa_j3_force_cp = nullptr; // lsa_cell_pos
+    const ggml_tensor * lsa_j3_force_qp = nullptr; // lsa_q_pos
+    int64_t lsa_j3_force_key[3] = {0, 0, 0};       // F, window, sinks
     // LSA index cache (LLAMA_LSA_IDX_CACHE=1): layers this graph rebuilds from the K cache; committed as valid
     // in set_input (so reserve graphs, which never run set_input, cannot mark a cache valid)
     std::vector<std::pair<const ggml_tensor *, uint64_t>> lsa_idx_commit;
