@@ -83,55 +83,109 @@ static void moe_cache_register_stub(const void * owner) {
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>   // GlobalMemoryStatusEx
+#endif
 
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
 
-// Per-thread pinned bounce buffer for moe_h2d_async. Released when the owning thread exits (cudaFreeHost errors are
-// ignored: at process teardown the runtime may already be unloaded).
+#if defined(_WIN32)
+// Bounce buffers for moe_h2d_async (Windows only). A thread_local destructor runs under the loader lock on Windows,
+// where a call into the CUDA runtime (cudaFreeHost) can deadlock or touch an already unloaded runtime. So no CUDA
+// call is made there: an exiting thread hands its pinned buffer to this process-wide free list and the next thread
+// that needs one reuses it. The pool is never destroyed; the OS releases the pinned pages at process exit.
+struct moe_h2d_bounce_pool {
+    std::mutex mutex;
+    std::vector<void *> pinned;
+};
+
+static moe_h2d_bounce_pool & moe_h2d_pool() {
+    static moe_h2d_bounce_pool * pool = new moe_h2d_bounce_pool();
+    return *pool;
+}
+
 struct moe_h2d_bounce {
-    void * ptr = nullptr;
+    void * pinned = nullptr;       // cudaHostAllocPortable, from the pool or newly allocated
+    std::vector<char> pageable;    // used only when no pinned buffer could be allocated
     ~moe_h2d_bounce() {
-        if (ptr) {
-            (void) cudaFreeHost(ptr);
-            (void) cudaGetLastError();
-            ptr = nullptr;
+        if (pinned) {
+            try {
+                auto & pool = moe_h2d_pool();
+                std::lock_guard<std::mutex> lock(pool.mutex);
+                pool.pinned.push_back(pinned);
+            } catch (...) {
+                // keep the buffer (freed by the OS at exit) rather than throw from a destructor
+            }
+            pinned = nullptr;
         }
     }
 };
+#endif
 
-// Host-to-device copy from an expert source. On Windows (WDDM) cudaMemcpyAsync rejects a host range that mixes
-// cudaHostRegister'ed pages with unregistered ones (cudaErrorInvalidValue) instead of staging it like Linux does.
-// Fall back to a per-thread pinned bounce buffer in that case. Other errors and other copy kinds pass through.
-// Every chunk is queued on the caller's stream and the stream is synchronized before the bounce buffer is touched
-// again and before returning, so the copy honors the stream's event waits and has completed when the call returns.
-// If the pinned buffer cannot be allocated the allocation error is returned: no copy is made on any other stream
-// (a default-stream copy would not wait for the nonblocking stream's compute/publish dependencies).
+// Host-to-device copy from an expert source, always on the caller's stream.
+// Windows (WDDM): cudaMemcpyAsync rejects a host range that mixes cudaHostRegister'ed pages with unregistered ones
+// (cudaErrorInvalidValue) instead of staging it like Linux does. Only in that case the copy goes through a
+// per-thread bounce buffer: every chunk is queued on the caller's stream, and the stream is synchronized before the
+// buffer is refilled and before returning, so the copy honors the stream's event waits and has completed when the call
+// returns. The buffer is pinned when possible; if pinned memory cannot be allocated a pageable buffer is used, which
+// is still copied on the same stream (only slower). No copy is ever made on another stream.
+// Other platforms: exactly cudaMemcpyAsync.
 static cudaError_t moe_h2d_async(void * dst, const void * src, size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
     cudaError_t err = cudaMemcpyAsync(dst, src, bytes, kind, stream);
+#if defined(_WIN32)
     if (err != cudaErrorInvalidValue || kind != cudaMemcpyHostToDevice || !dst || !src || !bytes) {
         return err;
     }
     (void) cudaGetLastError();
     static thread_local moe_h2d_bounce bounce;
     static constexpr size_t bounce_bytes = 8u << 20;
-    if (!bounce.ptr) {
-        void * p = nullptr;
-        err = cudaHostAlloc(&p, bounce_bytes, cudaHostAllocPortable);
-        if (err != cudaSuccess) {
-            (void) cudaGetLastError();
-            return err;
+    if (!bounce.pinned) {
+        {
+            auto & pool = moe_h2d_pool();
+            std::lock_guard<std::mutex> lock(pool.mutex);
+            if (!pool.pinned.empty()) {
+                bounce.pinned = pool.pinned.back();
+                pool.pinned.pop_back();
+            }
         }
-        bounce.ptr = p;
+        if (!bounce.pinned) {
+            void * p = nullptr;
+            if (cudaHostAlloc(&p, bounce_bytes, cudaHostAllocPortable) == cudaSuccess) {
+                bounce.pinned = p;
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+    }
+    char * buffer = (char *) bounce.pinned;
+    if (!buffer) {
+        try {
+            if (bounce.pageable.size() < bounce_bytes) {
+                bounce.pageable.resize(bounce_bytes);
+            }
+        } catch (...) {
+            return cudaErrorMemoryAllocation;
+        }
+        buffer = bounce.pageable.data();
     }
     for (size_t off = 0; off < bytes; off += bounce_bytes) {
         const size_t n = bytes - off < bounce_bytes ? bytes - off : bounce_bytes;
         err = cudaStreamSynchronize(stream);   // the previous chunk has finished reading the bounce buffer
         if (err != cudaSuccess) { return err; }
-        memcpy(bounce.ptr, (const char *) src + off, n);
-        err = cudaMemcpyAsync((char *) dst + off, bounce.ptr, n, cudaMemcpyHostToDevice, stream);
+        memcpy(buffer, (const char *) src + off, n);
+        err = cudaMemcpyAsync((char *) dst + off, buffer, n, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) { return err; }
     }
     return cudaStreamSynchronize(stream);
+#else
+    return err;
+#endif
 }
 
 // MiB-valued environment override: plain decimal digits only, at most 1 TiB. Anything else (empty, signed, trailing
