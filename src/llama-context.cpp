@@ -5369,7 +5369,20 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         const long value = text && text[0] ? strtol(text, nullptr, 10) : 16;
         return value > 0 && value <= 512 ? (uint32_t) value : 0u;
     }();
-    if (decode_rows && (n_tokens == 0 || (sched_reserve_tokens <= decode_rows && n_tokens <= decode_rows))) {
+    // fork F1 (V07QW): a short single-sequence prompt on the target (a chat or agent follow-up after a long turn)
+    // keeps the writing scratch and runs as ceil(n / decode_rows) writing-sized ubatches through the expert cache,
+    // the same path a follow-up of at most decode_rows tokens already takes. Growing to 512 rows for it lent cache
+    // memory, ran the call on streamed host experts and refilled the cache after it: 14.5 s for 17 tokens and
+    // 20.6 s for 25 tokens after a 100K turn, against 0.12 s for 16 tokens. LLAMA_SMALL_PROMPT_ROWS=N (0..3072,
+    // default 1024) is the largest such call; 0 restores the old grow.
+    static const uint32_t small_rows = [] {
+        const char * text = getenv("LLAMA_SMALL_PROMPT_ROWS");
+        const long value = text && text[0] ? strtol(text, nullptr, 10) : 1024;
+        return value >= 0 && value <= 3072 ? (uint32_t) value : 1024u;
+    }();
+    const bool small_prompt = decode_rows && small_rows && alone && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= small_rows;
+    if (decode_rows && (n_tokens == 0 || small_prompt || (sched_reserve_tokens <= decode_rows && n_tokens <= decode_rows))) {
         rows = decode_rows;
         // fork ROUNDPREP: LLAMA_MTP_SCRATCH_ROWS=N (1..16; default 8; 0 = off) gives the helper (MTP guesser) a
         // smaller writing scratch than the target's. At 16 rows the helper's attention is past the fused route's
