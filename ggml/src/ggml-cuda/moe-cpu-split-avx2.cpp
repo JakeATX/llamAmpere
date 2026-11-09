@@ -5,5 +5,6 @@
 #define __FMA__ 1
 #define __F16C__ 1
 #define __BMI2__ 1
+#include "moe-msvc-compat.h"   // _cvtsh_ss / _cvtss_sh, used by moe-iq-rows.h and moe-cpu-split-q2.h
 #endif
 #include "moe-cpu-split-kernels.cpp"

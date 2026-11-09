@@ -301,14 +301,11 @@ if (TARGET ggml-cuda AND TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
     target_link_libraries(ggml-cuda PRIVATE ggml-cpu)
 endif()
 
-# MSVC: the host expert split has AVX2/FMA/F16C/BMI2 paths gated on GCC-style macros; /arch:AVX2 only defines
-# __AVX2__, so define the rest (as ggml-cpu-impl.h does for MSVC) or the CPU experts fall back to scalar loops.
+# MSVC (the AVX2 host kernels get /arch:AVX2 and their feature macros in moe-cpu-split-avx2.cpp and above; the
+# baseline split files stay at the default ISA)
 if (MSVC)
-    set_source_files_properties(moe-cpu-split.cpp PROPERTIES
-        COMPILE_OPTIONS "/arch:AVX2"
-        COMPILE_DEFINITIONS "__FMA__;__F16C__;__BMI2__")
     # ai4.cu's host stub exceeds the default COFF section limit (C1128); per-file so the other .cu objects stay cached
-    set_source_files_properties(ai4.cu PROPERTIES COMPILE_OPTIONS "-Xcompiler=/bigobj")
+    set_property(SOURCE ai4.cu APPEND PROPERTY COMPILE_OPTIONS "-Xcompiler=/bigobj")
     # moe-cpu-split.cpp calls internal ggml-cpu helpers (ggml_vec_silu_f32 ...) that a .so exports by default but a DLL does not
     if (TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
         set_target_properties(ggml-cpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)

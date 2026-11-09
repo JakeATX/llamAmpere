@@ -115,10 +115,14 @@ struct moe_h2d_bounce {
     std::vector<char> pageable;    // used only when no pinned buffer could be allocated
     ~moe_h2d_bounce() {
         if (pinned) {
+            // try_lock: at process exit another thread may have been killed while holding the lock; then the buffer
+            // is simply kept (the OS frees it) instead of waiting forever.
             try {
                 auto & pool = moe_h2d_pool();
-                std::lock_guard<std::mutex> lock(pool.mutex);
-                pool.pinned.push_back(pinned);
+                std::unique_lock<std::mutex> lock(pool.mutex, std::try_to_lock);
+                if (lock.owns_lock()) {
+                    pool.pinned.push_back(pinned);
+                }
             } catch (...) {
                 // keep the buffer (freed by the OS at exit) rather than throw from a destructor
             }
@@ -191,7 +195,7 @@ static cudaError_t moe_h2d_async(void * dst, const void * src, size_t bytes, cud
 // MiB-valued environment override: plain decimal digits only, at most 1 TiB. Anything else (empty, signed, trailing
 // text, overflow, too large) is rejected with a log line and the default is used, so a bad value can never wrap the
 // shifted/summed byte budgets.
-static size_t moe_env_mib_bytes(const char * name, size_t default_bytes) {
+[[maybe_unused]] static size_t moe_env_mib_bytes(const char * name, size_t default_bytes) {
     const char * v = getenv(name);
     if (!v) {
         return default_bytes;
