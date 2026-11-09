@@ -8,8 +8,9 @@ Thanks to huhichao (#98), who wrote the Windows port, found the causes and measu
 
 - The card-side expert tables are turned on for Windows builds. Windows free RAM is read with `GlobalMemoryStatusEx`; Windows has no cgroups, so the free-RAM floor is the only memory guard there.
 - Windows rejects a copy to the card from a memory range that mixes locked and normal pages, where Linux accepts it. That copy now goes through a small staging buffer on the same GPU stream, and it finishes before the expert slot is used. If locked memory for the buffer cannot be allocated, normal memory is used instead (slower, same order).
-- The CPU expert split builds with MSVC: AVX2 flags for that file, CPU feature checks, and thread pinning with the Windows APIs. Core 0 stays free for the thread that drives the card; `GGML_MOE_CPU_SPLIT_WIN_CARD=0` turns that off.
-- Smaller MSVC build fixes: `/bigobj` for `ai4.cu`, exported CPU helpers, and `_tzcnt_u32` instead of `__builtin_ctz`.
+- The CPU expert split pins its threads with the Windows APIs. On Windows, core 0 is left out of the expert thread pool (when there are more than 2 cores), and the thread that drives the card is kept off the pool's cores; `GGML_MOE_CPU_SPLIT_WIN_CARD=0` stops restricting the card thread (core 0 stays out of the pool either way).
+- Windows MoE runs now see the machine's free RAM (it used to read as 0), so the RAM-fit and read-ahead budgets work on Windows as on Linux. This affects every Windows MoE run, not only the card-side tables.
+- MSVC build fixes from the port: `/bigobj` for `ai4.cu`, exported CPU helpers, `_tzcnt_u32` instead of `__builtin_ctz`, and half-float conversion helpers for the AVX2 expert kernels.
 
 ## Two new optional settings (all platforms, off unless set)
 
@@ -26,7 +27,7 @@ RTX 3090 24 GB, 64 GB RAM, Intel i5-12490F, Windows 11, Flash-Next, `-c 110592`,
 
 ## How this was tested
 
-We have no Windows machine. Built and tested under MinGW/Wine; Windows speed figures are from the contributor. Those figures were measured on his version of the change. Since then we changed the copy fallback, buffer cleanup and setting checks described above, and we could not build or run that exact code with MSVC + CUDA on Windows. Please report on #98 if your Windows build or speed differs.
+We have no Windows machine. Built and tested under MinGW/Wine; Windows speed figures are from the contributor. The MinGW/Wine build is CPU-only, so it cannot compile the CUDA and MSVC parts of this change. The contributor built and measured his version on his own tree (based on v0.6.3.3). Since then the CPU expert split was reorganized and we changed the copy fallback, buffer cleanup and setting checks, so nobody has yet built this exact code with MSVC + CUDA. Please report on #98 if your Windows build fails or the speed differs.
 
 Linux is unchanged: the new code is Windows-only, apart from the two optional settings above, which do nothing unless set. Checks on Linux: CPU suites, the README-flags check, example builds, the MinGW/Wine Windows build and tensor-split checks all passed, dense 27B greedy output is token-for-token identical to v0.6.3.8, and Flash-Next AI3 starts and writes with the shipped launcher.
 

@@ -7,7 +7,7 @@ writes faster) and Qwen3.8 Flash-Next.
 
 ## What's new in v0.6.3.9
 
-- Flash-Next on native Windows builds (MSVC + CUDA) can use the fast card-side expert tables, which were Linux-only. The contributor measured 0.26 -> 60 tokens/s on code on an RTX 3090 with 64 GB RAM. Thanks to huhichao (#98). We built and tested it under MinGW/Wine only; Linux is unchanged. [Release notes](docs/llamampere-v0.6.3.9/RELEASE_NOTES.md).
+- Flash-Next on native Windows builds (MSVC + CUDA) can use the fast card-side expert tables, which were Linux-only. The contributor measured 0.26 -> 60 tokens/s on code on an RTX 3090 with 64 GB RAM. Thanks to huhichao (#98). We have no Windows machine: built and tested under MinGW/Wine, a CPU-only build that cannot compile the CUDA and MSVC parts; Windows speed figures are from the contributor. Linux is unchanged. [Release notes](docs/llamampere-v0.6.3.9/RELEASE_NOTES.md).
 
 ## What's new in v0.6.3.8
 
