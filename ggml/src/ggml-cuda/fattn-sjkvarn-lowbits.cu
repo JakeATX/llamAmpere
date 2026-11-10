@@ -288,6 +288,8 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
         // trellis-coded body: the stream kernel has no codebook path, the tile loader decodes every width from the
         // codebooks staged in shared memory (#126). Only 3/3, 3/2 and 2/2 seal a 2/3-bit trellis body (llama-context.cpp).
         if constexpr (bits_k <= 3 && bits_v <= 3) {
+            // A5: an LSE node never has >= 128 rows (graph guard); with a strip master the tile kernel would reject it
+            GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr || dst->src[0]->ne[1] < 128);
             if constexpr (!rot) {
                 // [TRPF] n_q >= 128: expand each record once into f16, then the plain f16 MMA kernel (fattn-sjkvarn-prefill.cu)
                 // fork (A5): the expand path writes no LSE output; the graph never asks for one at n_q >= 128

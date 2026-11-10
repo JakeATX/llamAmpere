@@ -7439,8 +7439,8 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & lcfg = llama_lsa_cfg();
         // SJ-KVaRN: fast compensation only (LLAMA_LSA_COMP=2), merged after the FA output is un-rotated, with the
         // un-rotated q (the rotation is orthonormal, so the scores and the log-sum-exp are the same)
-        // the low-bit / trellis SJ-KVaRN kernels (3/3t, 3/2t, 2/2, sjkvarn4t) never write the LSE output, so the
-        // merge would read an unwritten tensor: those layers run LSA uncompensated
+        // the low-bit / trellis SJ-KVaRN kernels (2/2, sjkvarn4t, and 3/3t, 3/2t unless LLAMA_LSA_COMP_LB=1) write no LSE
+        // output, so the merge would read an unwritten tensor: those layers run LSA uncompensated
         const int  sj_body_t = is_sj_kvarn && sj_kvarn_pending.body ? sj_kvarn_pending.body->op_params[7] : -1;
         // A5 (LLAMA_LSA_COMP_LB=1, opt-in): the 3/2 and 3/3 trellis bodies decode only through the low-bit tile kernel,
         // whose uniform stream-k fixup writes the LSE; the scalar low-bit width kernel, 2/2 and sjkvarn4t stay refused

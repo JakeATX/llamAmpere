@@ -14375,6 +14375,13 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     double err(const float * a, const float * b, size_t n) override {
         if (packed_pair && !kq_mask_packed_pair_equal(a, b, n, 2*(size_t) D)) { return INFINITY; }
         if (rot != 2) {
+            // A5 trellis + LSE: output and LSE checked separately, so the LSE values (about 8-10 each) do not dilute
+            // the output error in one NMSE over CONCAT(out, lse)
+            if (lse_out && body_type == GGML_TYPE_I16 && ns == 0) {
+                const size_t nl = (size_t) nh * n_q;
+                GGML_ASSERT(n > nl);
+                return std::max(nmse(a, b, n - nl), nmse(a + (n - nl), b + (n - nl), nl));
+            }
             return test_case::err(a, b, n);
         }
         double m = 0.0; // the difference itself; any nonzero element fails
@@ -14393,6 +14400,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         }
         if (packed_pair) {
             return "FLASH_ATTN_EXT";
+        }
+        if (body_type == GGML_TYPE_I16 && lse_out) {
+            return "FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE"; // A5: own name, so no filter can select a different set
         }
         if (body_type == GGML_TYPE_I16) {
             return "FLASH_ATTN_EXT_SJKVARN_TRELLIS";
@@ -22018,7 +22028,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // A5 (LLAMA_LSA_COMP_LB=1): trellis bodies 3/2 and 3/3 with the LSE output (uniform stream-k fixup of the low-bit tile
     // kernel), fused rotation off / on, decode widths 1 and 5, dense and an LSA record pick (mode 5), plus a 100K body;
-    // output and LSE against the CPU reference. Filter: -o FLASH_ATTN_EXT -p 'body_type=i16' (lse=1 output is a CONCAT)
+    // output and LSE (checked separately) against the CPU reference. Filter: -o FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE (18 cases)
     for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 2}, {3, 3}}) {
         for (int rot : {0, 1}) {
             for (int64_t n_q : {1, 5}) {
