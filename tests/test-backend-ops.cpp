@@ -14517,6 +14517,11 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 }
                 out = o;
                 if (lse_out) {
+                    // A5: the rotation flag belongs on the FA node, not on the CONCAT below (rot = 2 has no LSE form)
+                    GGML_ASSERT(rot != 2);
+                    if (rot == 1) {
+                        ggml_flash_attn_ext_set_sj_kvarn_rot(o, 256);
+                    }
                     ggml_tensor * lse = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nh, n_q, 1);
                     ggml_set_name(lse, "lse");
                     ggml_flash_attn_ext_set_lse(o, lse);
@@ -14535,7 +14540,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             m = m_f16;
             out = ggml_concat(ctx, out, out_p, 0);
         }
-        if (rot != 0 && ns == 0) {
+        if (rot != 0 && ns == 0 && !lse_out) {
             ggml_flash_attn_ext_set_sj_kvarn_rot(out, 256);
         }
         if (rot == 2) {
@@ -22010,6 +22015,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, 0, mask_mode));
             }
         }
+    }
+    // A5 (LLAMA_LSA_COMP_LB=1): trellis bodies 3/2 and 3/3 with the LSE output (uniform stream-k fixup of the low-bit tile
+    // kernel), fused rotation off / on, decode widths 1 and 5, dense and an LSA record pick (mode 5), plus a 100K body;
+    // output and LSE against the CPU reference. Filter: -o FLASH_ATTN_EXT -p 'body_type=i16' (lse=1 output is a CONCAT)
+    for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 2}, {3, 3}}) {
+        for (int rot : {0, 1}) {
+            for (int64_t n_q : {1, 5}) {
+                for (int mm : {0, 5}) {
+                    auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 40, 300, false, false,
+                        GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, rot, 0, mm);
+                    t->lse_out = true;
+                    test_cases.emplace_back(t);
+                }
+            }
+        }
+        auto * t = new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 1024, false, false,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, 0, 0);
+        t->lse_out = true;
+        test_cases.emplace_back(t);
     }
     // [TRPF] trellis prefill (n_q >= 128) takes the expand-once f16 path (fattn-sjkvarn-prefill.cu): bodies with tq6 /
     // f16 / q8 staging, f16 and staging sinks, GQA 6 and 8, a partial last ubatch; GGML_SJKVARN_PREFILL_MIB=1 runs the

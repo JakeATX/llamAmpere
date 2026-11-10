@@ -88,6 +88,8 @@ struct llama_lsa_config {
                                     // for the blocks each ubatch writes (full rebuild when the index cache is invalid)
     double      comp_bias = 0.0;    // LLAMA_LSA_COMP_BIAS: added to the stand-in logits
     int64_t     comp_max_t = 64;    // LLAMA_LSA_COMP_MAX_T: wider ubatches skip the compensation
+    bool        comp_lb   = false;  // LLAMA_LSA_COMP_LB=1 (opt-in, A5): fast compensation also on the 3/2 and 3/3 trellis
+                                    // SJ-KVaRN bodies (the low-bit tile kernel writes the LSE in its uniform fixup)
     bool        block_sum = false;  // LLAMA_LSA_BLOCK_SUM: with LLAMA_LSA_BLOCK and the index cache, rank blocks by an upper
                                     // bound from per-block channel max/min of the index keys (kept next to the index cache,
                                     // updated for the blocks each ubatch writes) instead of scoring every cell

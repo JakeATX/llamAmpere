@@ -290,7 +290,8 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
         if constexpr (bits_k <= 3 && bits_v <= 3) {
             if constexpr (!rot) {
                 // [TRPF] n_q >= 128: expand each record once into f16, then the plain f16 MMA kernel (fattn-sjkvarn-prefill.cu)
-                if (ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ctx, dst)) {
+                // fork (A5): the expand path writes no LSE output; the graph never asks for one at n_q >= 128
+                if (ggml_flash_attn_ext_get_lse(dst) == nullptr && ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ctx, dst)) {
                     return;
                 }
             }

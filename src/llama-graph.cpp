@@ -7442,8 +7442,13 @@ ggml_tensor * llm_graph_context::build_attn(
         // the low-bit / trellis SJ-KVaRN kernels (3/3t, 3/2t, 2/2, sjkvarn4t) never write the LSE output, so the
         // merge would read an unwritten tensor: those layers run LSA uncompensated
         const int  sj_body_t = is_sj_kvarn && sj_kvarn_pending.body ? sj_kvarn_pending.body->op_params[7] : -1;
+        // A5 (LLAMA_LSA_COMP_LB=1, opt-in): the 3/2 and 3/3 trellis bodies decode only through the low-bit tile kernel,
+        // whose uniform stream-k fixup writes the LSE; the scalar low-bit width kernel, 2/2 and sjkvarn4t stay refused
+        const bool sj_lb_lse = is_sj_kvarn && sj_kvarn_pending.body && lcfg.comp_lb && sj_body_t == GGML_TYPE_I16 &&
+                sj_kvarn_pending.bits_k == 3 && (sj_kvarn_pending.bits_v == 2 || sj_kvarn_pending.bits_v == 3);
+        const int  sj_lb_bv  = sj_kvarn_pending.bits_v; // build_attn_mha consumes sj_kvarn_pending
         const bool sj_no_lse = is_sj_kvarn && sj_kvarn_pending.body && (sj_kvarn_pending.bits_k != 4 ||
-                sj_kvarn_pending.bits_v != 4 || sj_body_t == GGML_TYPE_I16);
+                sj_kvarn_pending.bits_v != 4 || sj_body_t == GGML_TYPE_I16) && !sj_lb_lse;
         if (lsa_applied && lcfg.comp && sj_no_lse) {
             static uint32_t warned_lb = 0;
             if (llama_lsa_log_once(warned_lb)) {
@@ -7455,7 +7460,9 @@ ggml_tensor * llm_graph_context::build_attn(
                 sinks == nullptr && v_mla == nullptr && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
                 (!is_sj_kvarn || (lcfg.comp_fast && lsa_means_ok && !sj_no_lse));
         const bool vk_pending = lsa_fa_vk && lsa_fa_sel != nullptr; // LLAMA_LSA_VK: compensation inside the FA node
-        lsa_lse_req = lsa_comp && !vk_pending && lcfg.comp_fast && lsa_means_ok && q->ne[2] <= lcfg.comp_max_t;
+        // A5: no LSE at >= 128 rows on a trellis body (the [TRPF] expand path would take it and writes none)
+        lsa_lse_req = lsa_comp && !vk_pending && lcfg.comp_fast && lsa_means_ok && q->ne[2] <= lcfg.comp_max_t &&
+                !(sj_lb_lse && q->ne[2] >= 128);
         cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, lsa_n_kv_max, kq_scale, il);
         ggml_tensor * lse = lsa_lse;
         lsa_lse     = nullptr;
@@ -7488,6 +7495,15 @@ ggml_tensor * llm_graph_context::build_attn(
                                                              kq_scale, il) : nullptr;
             if (c) {
                 cur = c;
+                if (sj_lb_lse) {
+                    // A5 route proof for gates: one line per layer the first time its merge is built on a trellis body
+                    static std::atomic<uint64_t> lb_seen[8];
+                    const uint64_t bit = uint64_t(1) << (il & 63);
+                    if (il >= 0 && il < 512 && !(lb_seen[il >> 6].fetch_or(bit) & bit)) {
+                        LLAMA_LOG_WARN("%s: layer %d: LSA compensation on the SJ-KVaRN %d/%d trellis body (LLAMA_LSA_COMP_LB=1)\n",
+                                __func__, il, 3, sj_lb_bv);
+                    }
+                }
             }
         }
     }
