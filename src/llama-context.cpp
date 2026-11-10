@@ -5394,12 +5394,20 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         const long value = text && text[0] ? strtol(text, nullptr, 10) : 512;
         return value >= 0 && value <= 3072 ? (uint32_t) value : 512u;
     }();
+    // fork V07QW A7: while the tables are pending, only calls up to LLAMA_PENDING_PUBLISH_ROWS (17..3072, default
+    // 256) keep the writing scratch. Above it the grow to 512 rows is faster than 16-row chunks: after a 100K turn
+    // 512 rows took 4.08 s kept small against 2.99 s grown, 100 rows 1.07 s against 2.36 s (lines cross near 320).
+    static const uint32_t pending_rows = [] {
+        const char * text = getenv("LLAMA_PENDING_PUBLISH_ROWS");
+        const long value = text && text[0] ? strtol(text, nullptr, 10) : 256;
+        return value >= 17 && value <= 3072 ? (uint32_t) value : 256u;
+    }();
     // The helper (MTP) shares the target compute buffer: its catch-up for the same call keeps writing-sized ubatches
     // too while the target is at writing size, so it fits the existing buffer instead of growing it outside the cache.
     const bool small_prompt = decode_rows && small_rows && alone &&
             sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= small_rows &&
             ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
-              (b1_cache_device_pending ? b1_pending_publish_enabled() : b1_cache_device_active)) || // pending: decode() publishes
+              (b1_cache_device_pending ? b1_pending_publish_enabled() && n_tokens <= pending_rows : b1_cache_device_active)) || // pending: decode() publishes
              (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer && compute_peer->b1_cache_device_active &&
               !compute_peer->b1_cache_device_pending && compute_peer->sched_reserve_tokens <= decode_rows));
     static bool small_logged = false;
