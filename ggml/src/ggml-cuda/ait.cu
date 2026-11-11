@@ -162,7 +162,15 @@ template <int KB, int J> static __device__ __forceinline__ uint32_t st1(uint32_t
     constexpr bool ONE = 7 * KB + 16 <= 32;
     constexpr int base = (ONE || J < 4) ? 0 : 4 * KB, d = J * KB - base;
     const uint32_t f = base == 0 ? A : F1;
-    if constexpr (d == 0) { return lv1<KB>(f & 0xFFFFu); } else { return lv1<KB>((f >> d) & 0xFFFFu); }
+    // A state whose offset is 8 or more above another state of the same window (d - 8 is 0 or a multiple of KB) is taken
+    // with one byte permute of that state's shifted word: (f >> d) & 0xFFFF == bytes 1..2 of f >> (d - 8). The shift is
+    // shared (KB = 4: offsets 8, 12 reuse f and f >> 4; KB = 2: 8..14 reuse f .. f >> 6), so a window of 4 states costs
+    // 1 SHF + 2 LOP3 + 2 PRMT instead of 3 SHF + 4 LOP3. Same value bit for bit. KB = 3 has no such pair and is unchanged.
+    constexpr bool PERM = d >= 8 && (d - 8) % KB == 0;
+    if constexpr (d == 0) { return lv1<KB>(f & 0xFFFFu); }
+    else if constexpr (PERM && d == 8) { return lv1<KB>(__byte_perm(f, 0u, 0x4421)); }
+    else if constexpr (PERM) { return lv1<KB>(__byte_perm(f >> (d - 8), 0u, 0x4421)); }
+    else { return lv1<KB>((f >> d) & 0xFFFFu); }
 }
 // AIT2P pair entry (int8 levels in bytes 0, 1) of window w from the shared table. tsm = table base, lo = lane offset
 // (PC 1: 4 (lane % NC), PC 2: 4 lane). PC 1: u32 entries, NC copies, byte (e NC + c) 4. PC 2: u16 entries, one copy per
