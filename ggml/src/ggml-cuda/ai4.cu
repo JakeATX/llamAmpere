@@ -2737,8 +2737,15 @@ template <int XSH>
 static bool aif25_mmq(int tile, int strips, const uint8_t * w, const int8_t * q, const float * scales, float * y,
                       int M, int K, int64_t N, cudaStream_t stream) {
     const int64_t gy = (N + tile - 1) / tile;
-    if (gy > 65535 || N > INT32_MAX || (strips != 1 && strips != 2) || (tile != 32 && tile != 64 && tile != 128) ||
-            (tile == 128 && strips != 1)) {
+    if ((strips != 1 && strips != 2) || (tile != 32 && tile != 64 && tile != 128) || (tile == 128 && strips != 1)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("[AIF25_MMQ] tile=%d strips=%d is not a built variant (32/64/128 with 1 strip, 32/64 with 2); using mmv\n",
+                    tile, strips);
+        }
+        return false;
+    }
+    if (gy > 65535 || N > INT32_MAX) {
         return false;
     }
     const dim3 grid((unsigned) ((M/16 + strips - 1)/strips), (unsigned) gy);
@@ -2781,7 +2788,17 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     if (tile > 0 && N >= aif25_mmq_min() &&
             (xsh ? aif25_mmq<1>(tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)
                  : aif25_mmq<0>(tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream))) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (aif25_mmq_check()) {
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+            if (capture != cudaStreamCaptureStatusNone) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    GGML_LOG_WARN("[AIF25_MMQ] check skipped during CUDA graph capture; set GGML_CUDA_DISABLE_GRAPHS=1\n");
+                }
+            }
+        }
+        if (aif25_mmq_check() && capture == cudaStreamCaptureStatusNone) {
             const int64_t n_out = N*M;
             ggml_cuda_pool_alloc<float> ref(ctx.pool(), (size_t) n_out);
             ggml_cuda_pool_alloc<unsigned long long> count(ctx.pool(), 1);

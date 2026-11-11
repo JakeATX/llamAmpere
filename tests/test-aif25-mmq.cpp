@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-aif25.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -37,7 +38,7 @@ int main() {
     setenv("GGML_CUDA_AIF25_MMQ", "64", 0);
     setenv("GGML_CUDA_AIF25_MMQ_MIN", "9", 0);
     setenv("GGML_CUDA_AIF25_MMQ_CHECK", "2", 1);
-    const int min_n = std::atoi(std::getenv("GGML_CUDA_AIF25_MMQ_MIN"));
+    const int min_n = std::max(9, std::atoi(std::getenv("GGML_CUDA_AIF25_MMQ_MIN")));
     const char * pp_env = std::getenv("GGML_CUDA_AIF25_PP_MIN_N");
     const int pp_min = pp_env ? std::atoi(pp_env) : 0;
     ggml_log_set(log_cb, nullptr);
@@ -83,7 +84,7 @@ int main() {
             ggml_free(ctx);
             break;
         }
-        // 672-byte units: 16 fp16 row scales, 16 bytes pad, 640 bytes of random tile words
+        // 672-byte units: 16 fp16 row scales (32 bytes), then 640 bytes of random tile words
         std::vector<uint8_t> wb(ggml_nbytes(w));
         for (size_t b = 0; b + 672 <= wb.size(); b += 672) {
             ggml_fp16_t * d = (ggml_fp16_t *) (wb.data() + b);
@@ -101,6 +102,13 @@ int main() {
         }
         ggml_backend_tensor_set(w, wb.data(), 0, wb.size());
         ggml_backend_tensor_set(x, xb.data(), 0, ggml_nbytes(x));
+        if (!ggml_backend_supports_op(backend, y)) {
+            std::fprintf(stderr, "CUDA0 does not run AIF25_U MUL_MAT (needs Ampere or newer); this test was not run\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return 77;
+        }
         const int before = g_checked;
         ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS && ok;
         ggml_backend_synchronize(backend);
