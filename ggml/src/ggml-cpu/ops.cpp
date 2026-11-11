@@ -9798,17 +9798,18 @@ static void ggml_compute_forward_flash_attn_ext_grouped_chunk(
         }
         ggml_vec_scale_f32(R * KV_TILE_SZ, KQ, scale);
 
+        if (logit_softcap != 0.0f) {
+            ggml_vec_tanh_f32(R * KV_TILE_SZ, KQ, KQ);
+            ggml_vec_scale_f32(R * KV_TILE_SZ, KQ, logit_softcap);
+        }
+
+        // pad the partial tail after softcap (tanh would turn -inf into the finite -logit_softcap)
         if (kv_tile < KV_TILE_SZ) {
             for (int r = 0; r < R; r++) {
                 for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
                     KQ[r * KV_TILE_SZ + tk] = -INFINITY;
                 }
             }
-        }
-
-        if (logit_softcap != 0.0f) {
-            ggml_vec_tanh_f32(R * KV_TILE_SZ, KQ, KQ);
-            ggml_vec_scale_f32(R * KV_TILE_SZ, KQ, logit_softcap);
         }
 
         if (mask) {
