@@ -627,12 +627,13 @@ static int server_run_instance(common_params & params, server_role & role, commo
     // per-family speculative default (e.g. the built-in MTP drafter of qwen35 models) when --spec-type is not given:
     // resolved from the GGUF header before the model is loaded, so -fit and the context sizing see the drafter
     // exactly as with the explicit flags
-    if (!is_router_server && !common_speculative_apply_model_default(params)) {
+    // server_run_instance never runs the router (upstream split it out), so no router check is needed here
+    if (!common_speculative_apply_model_default(params)) {
         return 1;
     }
+
     // note: this is guaranteed to out-live ctx_http and tools
     server_mcp mcp_mgr;
-
 
     //
     // Start the server

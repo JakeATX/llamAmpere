@@ -891,6 +891,7 @@ void ggml_cuda_flash_attn_ext_vec_partial_case_impl(
         mask ? (const char *) mask->data : nullptr,
         nullptr,
         nullptr,
+        nullptr, // KV_rows: kv_rows (src[9]) never reaches the vec kernels
         partial_dst,
         partial_meta,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

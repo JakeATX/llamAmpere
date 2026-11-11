@@ -2232,7 +2232,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         if (allocated) {
             pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::vector<ggml_backend_buffer_ptr>{});
-            ctx_buf_maps.emplace_back(ctx, llama_buf_map{});
+            ctx_bufs.emplace_back(ctx, std::vector<ggml_backend_buffer_t>{});
             continue;
         }
 
@@ -2731,10 +2731,16 @@ void llama_model_base::load_tensors_hadamard() {
             }
 
             llama_hadamard_transform transform { it->tensor, sign_tensor };
-            // the GDN output projection reads its value heads in tiled order, see set_gdn_v_perm
-            if (hdmd.gdn_v_grouped && weight_name.find(".ssm_out.") != std::string::npos &&
-                !transform.set_gdn_v_perm(weight->ne[0], hparams.ssm_dt_rank, hparams.ssm_n_group)) {
-                throw std::runtime_error(format("prism.hadamard: bad GDN head geometry for %s", weight_name.c_str()));
+            // the GDN output projection reads its value heads in tiled order [hd, nk, rep], the fold used grouped order
+            if (hdmd.gdn_v_grouped && weight_name.find(".ssm_out.") != std::string::npos) {
+                const int64_t n_v = hparams.ssm_dt_rank;
+                const int64_t n_k = hparams.ssm_n_group;
+                if (n_k <= 0 || n_v <= 0 || n_v % n_k != 0 || weight->ne[0] % n_v != 0) {
+                    throw std::runtime_error(format("prism.hadamard: bad GDN head geometry for %s", weight_name.c_str()));
+                }
+                transform.perm_hd  = weight->ne[0] / n_v;
+                transform.perm_nk  = n_k;
+                transform.perm_rep = n_v / n_k;
             }
             target->emplace(weight, transform);
         }

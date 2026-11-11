@@ -204,7 +204,7 @@ llama_build(${LLAMA_CONTEXT_TEST_SRC})
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp  LABEL behavior  LINK llama)
-    llama_build_and_test(test-sampling.cpp  LABEL behavior  LINK llama)
+    llama_build_and_test(test-sampling.cpp  LABEL behavior)   # fork: uses common/sampling.h, so keep the llama-common default link
     llama_build_and_test(test-sampler-topk-exact.cpp)
     llama_build_and_test(test-spec-beat.cpp)
     llama_build_and_test(test-reasoning-budget.cpp  LABEL behavior)

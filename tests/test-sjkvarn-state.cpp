@@ -33,6 +33,7 @@
 #include "../src/llama-context.h"
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "test-kv-writer.h"
 #include "../src/llama-model.h"
 #include "../src/llama-ple-prefetch.h"
 
@@ -73,7 +74,7 @@ static void tensor_data(ggml_tensor * tensor, void * /*userdata*/) {
 static llama_model * make_model(bool resident = false, llm_arch arch = LLM_ARCH_LLAMA, uint32_t head_dim = n_embd/2) {
     gguf_context * meta = gguf_init_empty();
     {
-        llama_model_saver ms(arch, meta);
+        test_kv_writer ms(arch, meta); // the saver no longer takes (arch, ctx)
         ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(arch));
         ms.add_kv(LLM_KV_VOCAB_SIZE,                   n_vocab);
         ms.add_kv(LLM_KV_CONTEXT_LENGTH,               uint32_t(8192));
@@ -1620,7 +1621,7 @@ static void padded_clear_case() {
     int checked = 0;
     for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
         for (bool shared : {false, true}) {
-            llama_kv_cache cache(*model, model->hparams, type, type, false, false, true, 32, 2, 1, 0,
+            llama_kv_cache cache(*model, /*no_alloc*/ false, model->hparams, type, type, false, false, true, 32, 2, 0,
                                  LLAMA_SWA_TYPE_NONE, nullptr, {}, {}, {});
             llama_pos pos[] = {0, 1, 2, 3};
             llama_seq_id id = 0;

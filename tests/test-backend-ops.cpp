@@ -9518,7 +9518,7 @@ struct test_mul_mat_id_skew : public test_mul_mat_id {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats, amax);
+        init_mul_mat_id_tensors(ctx, n_mats, skip);
         std::default_random_engine rng(1234);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
@@ -9759,7 +9759,8 @@ struct test_mul_mat_id_onerow : public test_mul_mat_id {
             mse_a_b += d * d;
             mse_a_0 += double(a[i]) * double(a[i]);
         }
-        const double floor_a_0 = double(n_vals) * double(k) * double(amax) * double(amax) / 9.0;
+        // src1 is U(-1, 1): upstream 3f03b1772 dropped the amax member of test_mul_mat_id
+        const double floor_a_0 = double(n_vals) * double(k) / 9.0;
         return mse_a_b / std::max(mse_a_0, floor_a_0);
     }
 };

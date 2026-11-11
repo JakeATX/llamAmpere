@@ -62,7 +62,7 @@ template <typename F> static bool dies(F fn) {
     fflush(stdout); fflush(stderr);
     pid_t pid = fork();
     if (pid == 0) {
-        freopen("/dev/null", "w", stderr);
+        if (freopen("/dev/null", "w", stderr) == nullptr) { /* keep the child stderr */ }
         fn();
         _exit(0);
     }

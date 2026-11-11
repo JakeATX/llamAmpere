@@ -750,22 +750,19 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
                     (size_t) n_tokens*inp_pos->nb[0], (size_t) row0*inp_pos->nb[0]));
             pos_b = ggml_reshape_1d(ctx0, pos_b, 4*width);
 
-            Q_b = ggml_rope_multi(ctx0, Q_b, pos_b, nullptr,
-                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
-            K_b = ggml_rope_multi(ctx0, K_b, pos_b, nullptr,
-                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
+            // the same rope as the single-row path (build_rope: rope_multi with the M-RoPE sections)
+            Q_b = build_rope(Q_b, pos_b, il);
+            K_b = build_rope(K_b, pos_b, il);
 
             // attention below reads the cache through build_attn_mha directly, so it applies the
             // same rotations build_attn(llm_graph_input_attn_kv *) does, in the same order
-            if (inp_attn->self_k_rot) {
-                Q_b = llama_mul_mat_hadamard(ctx0, Q_b, inp_attn->self_k_rot);
-                K_b = llama_mul_mat_hadamard(ctx0, K_b, inp_attn->self_k_rot);
+            if (inp_attn->self_k_rot[il]) {
+                Q_b = llama_mul_mat_hadamard(ctx0, Q_b, inp_attn->self_k_rot[il]);
+                K_b = llama_mul_mat_hadamard(ctx0, K_b, inp_attn->self_k_rot[il]);
             }
 
-            if (inp_attn->self_v_rot) {
-                V_b = llama_mul_mat_hadamard(ctx0, V_b, inp_attn->self_v_rot);
+            if (inp_attn->self_v_rot[il]) {
+                V_b = llama_mul_mat_hadamard(ctx0, V_b, inp_attn->self_v_rot[il]);
             }
 
             ggml_build_forward_expand(gf, Q_b);
@@ -794,8 +791,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
 
             cur_b = build_attn_turbo_v_out(cur_b, v_view, il);
 
-            if (inp_attn->self_v_rot) {
-                cur_b = llama_mul_mat_hadamard(ctx0, cur_b, inp_attn->self_v_rot);
+            if (inp_attn->self_v_rot[il]) {
+                cur_b = llama_mul_mat_hadamard(ctx0, cur_b, inp_attn->self_v_rot[il]);
             }
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));

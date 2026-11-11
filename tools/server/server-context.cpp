@@ -3105,9 +3105,8 @@ private:
                     }
                 }
 
-                if (saved || loaded) {
-                    prompt_cache->update();
-                }
+                // (the TheTom merge left `if (saved || loaded)` here with no `loaded`; update unconditionally as before)
+                prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -7913,6 +7912,7 @@ void server_routes::warm_build_and_post(const json & body, const json & reply, i
     }
 
     json parsed_first;
+    common_chat_session session_first; // upstream #30210: the session owns the message delimiters
     llama_tokens prefix;
     bool first = true;
     for (const auto & next : next_turns) {
@@ -7922,8 +7922,9 @@ void server_routes::warm_build_and_post(const json & body, const json & reply, i
         b["stream"] = false;
         std::vector<raw_buffer> files;
         json parsed;
+        common_chat_session session;
         try {
-            parsed = oaicompat_chat_params_parse(b, meta->chat_params, files);
+            parsed = oaicompat_chat_params_parse(ctx_server.vocab, b, meta->chat_params, files, session);
         } catch (const std::exception & e) {
             SRV_WRN("warm prefill: next turn does not render (%s)\n", e.what());
             return;
@@ -7938,8 +7939,9 @@ void server_routes::warm_build_and_post(const json & body, const json & reply, i
         const llama_tokens toks = inputs[0].get_text_tokens();
         if (first) {
             prefix       = toks;
-            parsed_first = std::move(parsed);
-            first        = false;
+            parsed_first  = std::move(parsed);
+            session_first = std::move(session);
+            first         = false;
         } else {
             size_t n = 0;
             while (n < prefix.size() && n < toks.size() && prefix[n] == toks[n]) {
@@ -7961,9 +7963,7 @@ void server_routes::warm_build_and_post(const json & body, const json & reply, i
     task.tokens = server_tokens(prefix, false);
     task.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, parsed_first);
 
-    auto delimiters = common_chat_msg_delimiters_parse(json_value(parsed_first, "message_delimiters", json::array()));
-    delimiters.tokenize(ctx_server.vocab);
-    task.params.message_spans = task.tokens.find_message_spans(delimiters);
+    task.apply_chat_session(session_first);
 
     task.params.stream        = false;
     task.params.n_cmpl        = 1;
