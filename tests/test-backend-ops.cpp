@@ -22044,6 +22044,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // fork (LSAKV): 4/4 scalar F32 body under the same picks; GGML_SJKVARN_TILE_SKIP=1 now also turns on the stream
+    // kernel's exact live-strip walk (dead records / strips skipped), same CPU reference with and without the flag
+    for (int64_t n_q : {1, 4, 5}) {
+        for (int mask_mode : {3, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 40, 300, false, false,
+                GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mask_mode));
+        }
+    }
     // A5 (LLAMA_LSA_COMP_LB=1): trellis bodies 3/2 and 3/3 with the LSE output (uniform stream-k fixup of the low-bit tile
     // kernel), fused rotation off / on, decode widths 1 and 5, dense and an LSA record pick (mode 5), plus a 100K body;
     // output and LSE (checked separately) against the CPU reference. Filter: -o FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE (18 cases)

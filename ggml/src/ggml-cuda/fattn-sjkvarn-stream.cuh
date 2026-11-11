@@ -1309,7 +1309,11 @@ static void ggml_cuda_fattn_sj_kvarn_stream_select(ggml_backend_cuda_context & c
 template <bool turbo4_body = false, bool rot = false>
 inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // opt-in record skip (LSA on SJ-KVaRN sets it): build the live-record list from the mask, then walk only those
-    static const bool strip_env = getenv("GGML_SJKVARN_LIVE_STRIPS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_STRIPS")) != 0;
+    // GGML_SJKVARN_TILE_SKIP=1 (the low-bit tile kernel's skip of fully masked body tiles, the switch LSA uses on 3/2t
+    // and 3/3t) takes the same exact skip here: the live-strip walk (dead records and dead 16-cell strips not read)
+    static const bool tile_skip_env = getenv("GGML_SJKVARN_TILE_SKIP") != nullptr && atoi(getenv("GGML_SJKVARN_TILE_SKIP")) != 0;
+    static const bool strip_env = tile_skip_env ||
+        (getenv("GGML_SJKVARN_LIVE_STRIPS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_STRIPS")) != 0);
     static const bool live_env  = strip_env ||
         (getenv("GGML_SJKVARN_LIVE_RECORDS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_RECORDS")) != 0);
     // LSA block list (ggml_flash_attn_ext_set_lsa_blocks): the mask's GGML_LSA_MASK_SEL entries resolve through the
