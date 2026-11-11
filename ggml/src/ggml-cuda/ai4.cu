@@ -26,6 +26,7 @@
 //   GGML_CUDA_AI4_REF_SLAB_ROWS=n  test only. Slab height in rows; a positive value overrides the MiB cap. Rounded
 //                             down to a multiple of 16 (the storage unit). Not a runtime tuning knob.
 //   GGML_CUDA_AI4_BN128_MIN=n  N at which the GEMM switches from 64- to 128-wide token tiles (default 512)
+//   GGML_CUDA_AI_PARW=1       32-column GEMM tiles for row-scale rate-2/3/4 verify widths 9..32 (default off)
 //   GGML_CUDA_AI4_MMV_STAGES=2|3|4  cp.async ring depth of the N <= 8 kernel (default 2: fastest of 2/3/4 at verify
 //                             widths 5-8)
 //   GGML_CUDA_AI4_MMV_XSMEM=1  N <= 8 kernel stages the activations in shared memory (first version, 3 stages) instead
@@ -90,6 +91,10 @@ static bool ai4_ai23_tuned() {
 static bool ai4_ref() {
     static const bool v = ai4_env_int("GGML_CUDA_AI4_REF", nullptr, 0) != 0;
     return v;
+}
+static bool ai4_parw(int n) {
+    static const bool v = ai4_env_int("GGML_CUDA_AI_PARW", nullptr, 0) == 1;
+    return v && n > 8 && n <= 32;
 }
 static bool ai4_ampere_mmv(int n) {
     static const bool v = ai4_env_int("GGML_CUDA_AI4_AMPERE_MMV", nullptr, 0) != 0;
@@ -697,6 +702,8 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
                 }
             }
         }
+    } else if (ai4k::lay_v2<LAY>() && ai4_parw(N)) {
+        ai23_launch_gemm<32, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);
     } else if (N >= ai4_bn128_min()) {
         ai23_launch_gemm<128, 3, 4, LAY, XSH>(W, q, s, Y, M, M, N, K, stream);
     } else {
@@ -1235,10 +1242,10 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
             ai4_launch_mmv_tuned<LAY, XSH, true>(W, q, s, Y, M, 0, K, stream, k.warps, k.minb, idm, max_tiles);
         }
     } else if (bn == 32) {
-        if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
+        if constexpr (ai4k::lay_v2<LAY>() || ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
             ai23_launch_id_gemm<32, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
         } else {
-            GGML_ABORT("32-column expert tiles require rate 2 or 3");
+            GGML_ABORT("unsupported 32-column expert layout");
         }
     } else if (bn == 128) {
         ai23_launch_id_gemm<128, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
@@ -1336,6 +1343,12 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     // fork: keep decode and sparse MMV routing unchanged; size the helper and GEMM from the same tile width.
     if ((rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN && ai23_id_bn() != 0) {
         bn = ai23_id_bn();
+    }
+    // fork: routing storage and its consumer must use the same tile width; sparse MMV routes stay unchanged.
+    if (ggml_ai4v2_rate(src0->type) != 0 &&
+            bn != ai4k::MMV_ID_BN && ai23_id_bn() == 0 && ai4_parw(n_tok) &&
+            ai4k::ids_max_tiles(n_expert, n_pairs, 32) <= 65535) {
+        bn = 32;
     }
     // [AIPFAST] pfx3 (Taichi, U2 gate/up K2560, 512 experts top-10, uniform routes): at 2048 tokens (40 routes per
     // expert) the 64-route tile takes 1,218 vs 1,790 us for the 128 tile (down 1,421 vs 1,870); at 4096 (80 routes) 128 wins
