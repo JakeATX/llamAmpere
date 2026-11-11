@@ -74,6 +74,10 @@ struct llama_lsa_config {
                                     // written as K is stored, instead of recomputing them from all of K every step
     bool        idx_q8    = false;  // LLAMA_LSA_IDX_Q8: index cache stored as q8_0 (34 B per 32 values instead of 64 B), so the
                                     // per-cell pick reads ~half the bytes; lossy in the pick only. Not with LLAMA_LSA_BLOCK_SUM.
+    bool        idx_q4    = false;  // LLAMA_LSA_IDX_Q4 (8 GB test, opt-in): index cache stored as q4_0 (18 B per 32 values);
+                                    // wins over IDX_Q8; lossy in the pick only. Not with LLAMA_LSA_BLOCK_SUM.
+    bool        idx_skip_dense = false; // LLAMA_LSA_IDX_SKIP_DENSE (8 GB test, opt-in): no index cache on a layer that
+                                    // LLAMA_LSA_KEEP_FRAC_LAYERS makes dense (L:1): it was written every token, never read
     double      topp      = 0.0;    // LLAMA_LSA_TOPP: if > 0, inside the keep cap keep only the smallest set of middle cells
                                     // whose index-softmax mass reaches this share (adaptive keep per row and layer)
     double      topp_tau  = 2.0;    // LLAMA_LSA_TOPP_TAU: softmax scale on row z-scores of the index score

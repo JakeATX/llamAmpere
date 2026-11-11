@@ -6361,6 +6361,11 @@ ggml_tensor * llm_graph_context::build_attn_lsa_idx(
     if (!cfg.idx_cache || (cfg.mode != llama_lsa_config::KEY && cfg.mode != llama_lsa_config::POS)) {
         return nullptr;
     }
+    // LLAMA_LSA_IDX_SKIP_DENSE: a KEEP_FRAC_LAYERS L:1 layer never picks (build_attn_lsa_mask returns before scoring),
+    // so its index is not allocated or written. Only without a keep schedule, which can change the fraction per context.
+    if (cfg.idx_skip_dense && cfg.keep_sched.empty() && cfg.keep_frac_for(il) >= 1.0) {
+        return nullptr;
+    }
     if (inp->lsa_q_cell) {
         return build_attn_lsa_idx_sj(inp, k_cur, k, il);
     }
