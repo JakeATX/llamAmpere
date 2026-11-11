@@ -18,6 +18,7 @@ set(LLAMA_CORE_SOURCES
     llama-cparams.cpp
     llama-grammar.cpp
     llama-graph.cpp
+    llama-lsa.cpp
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp
@@ -78,6 +79,10 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 find_package(Threads REQUIRED)
 target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
+
+target_sources(llama PRIVATE ../vendor/hash/sha256/sha256.c)
+set_property(SOURCE ../vendor/hash/sha256/sha256.c APPEND
+             PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/hash")
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -75,6 +75,8 @@ constexpr int RMETA_KZ    = 2*D;                        // per-record vectors st
 constexpr int RMETA_VCH   = 4*D;
 constexpr int RMETA_BYTES = 6*D;                        // 1536, double-buffered per split
 constexpr int RMETA_CHUNKS = RMETA_BYTES/16;
+static_assert(STAGE_BYTES == GGML_LSA_STRIP_HEAD_BYTES && RMETA_BYTES == GGML_QSA_META_HEAD_BYTES && RMETA_VCH == 1024,
+              "LLAMA_LSA_RESIDENT strip slots and card meta hold the stage and RMETA byte images");
 
 constexpr int COL_STRIDE = D + 4; // fp32 stride of one head column in the combine buffer (bank spread)
 constexpr int SLOT_FLOATS = NCOLS2*COL_STRIDE + 2*NCOLS2; // acc + (max, sum) per column
@@ -164,13 +166,148 @@ struct cursor {
     int p0;
     int g;
     int sl;
+    int o;  // ordinal of the record in the walk (== g on the dense walk); picks the rmeta buffer
+    int sm; // live strips of record g (bit sl), all ones unless GGML_SJKVARN_LIVE_STRIPS=1
 };
+
+// Opt-in record skip (GGML_SJKVARN_LIVE_RECORDS=1): the body walk visits only the records that some query row can see
+// (any finite mask entry in the record's G positions). Flags: one warp per record. List: [0] = count, then the live
+// record ids in order (one block, ordered by a ballot scan per 1024 records). Exact strips (sink, ring) are unchanged.
+// Per-head mask (ne[2] == n_head, the q heads of a KV group share one mask): one flag row and one list per KV head
+// (blockIdx.y / blockIdx.x), read from the group's first q head; head_pitch = halfs between KV heads' masks.
+// Strip skip (strips != 0, GGML_SJKVARN_LIVE_STRIPS=1): the flag is the record's live-strip mask (bit sl = some row sees
+// a finite entry in strip sl), and the walk skips the dead strips of a live record (no load, no MMA). A dead strip
+// adds exactly zero (exp(-inf) = 0 and the running max is unchanged), so the output is the dense masked result.
+// Without it the flag is all ones for a live record. List entries: g | flag << 24.
+// LSA block list (ggml_flash_attn_ext_set_lsa_blocks): mask entry GGML_LSA_MASK_SEL at position p = visible iff bit
+// p >> sel_sh of selb is set (blocks >= nbs hidden); any other entry keeps its value
+static __device__ __forceinline__ float sj_lsa_mask_value(const half h, const int p, const uint32_t * selb, const int sel_sh,
+        const int nbs) {
+    const float m = __half2float(h);
+    if (selb != nullptr && m == GGML_LSA_MASK_SEL) {
+        const int b = p >> sel_sh;
+        return b < nbs && ((selb[b >> 5] >> (b & 31)) & 1u) ? 0.0f : -INFINITY;
+    }
+    return m;
+}
+
+// LSA virtual keys (ggml_flash_attn_ext_set_lsa_vk), stored by sj_live_record_list at list - SJ_LIST_HDR: block mean
+// K/V rows of the KV group (head z at + z*D), row pitch in halves; nd row t at nd + t*nd_pitch (< 0.5 picked, else 1 +
+// the dropped count); n = blocks (0: off); alloc = mean rows readable from k/v (>= 16)
+struct sj_lsa_vk {
+    const half  * k;
+    const half  * v;
+    const float * nd;
+    int   k_pitch;
+    int   v_pitch;
+    int   nd_pitch;
+    int   n;
+    int   alloc;
+    float bias;
+};
+constexpr int SJ_LIST_HDR = 16; // ints before the lists: sj_lsa_vk, then list[-4 .. -1]
+static_assert(sizeof(sj_lsa_vk) <= (SJ_LIST_HDR - 4)*sizeof(int32_t), "list header");
+
+// sel F32 [nbs] -> bit words (vk: row 0 of the virtual-key plane, picked = entry < 0.5)
+static __global__ void sj_lsa_sel_bits(const float * sel, const int nbs, uint32_t * bits, const int vk = 0) {
+    const int w = blockIdx.x*blockDim.x + threadIdx.x;
+    if (w*32 >= nbs) {
+        return;
+    }
+    uint32_t x = 0;
+    for (int i = 0; i < 32 && w*32 + i < nbs; ++i) {
+        const float f = sel[w*32 + i];
+        x |= ((vk ? f < 0.5f : f > 0.5f) ? 1u : 0u) << i;
+    }
+    bits[w] = x;
+}
+
+static __global__ void sj_live_record_flags(const half * mask, const int pitch, const int n_q, const int32_t * desc,
+        int32_t * flags, const int nrec_max, const int64_t head_pitch, const int strips,
+        const uint32_t * selb = nullptr, const int sel_sh = 0, const int sel_nbs = 0) {
+    const int g = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    mask  += blockIdx.y*head_pitch;
+    flags += (size_t) blockIdx.y*nrec_max;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int S = desc[GGML_SJKVARN_DESC_S], B = desc[GGML_SJKVARN_DESC_B], G = desc[GGML_SJKVARN_DESC_G];
+    const int nrec = min(nrec_max, (B - S)/G);
+    if (g >= nrec) {
+        return;
+    }
+    const uint32_t full = (1u << (G/16)) - 1u;
+    uint32_t sm = 0;
+    for (int q = 0; q < n_q && sm != full && (strips || sm == 0); ++q) {
+        for (int t0 = 0; t0 < G; t0 += WARP_SIZE) { // 32 positions = strips t0/16 and t0/16 + 1
+            const int t = t0 + lane;
+            const bool f = t < G && sj_lsa_mask_value(mask[(size_t) q*pitch + S + g*G + t], S + g*G + t, selb, sel_sh,
+                                                        sel_nbs) != -INFINITY;
+            const uint32_t bal = __ballot_sync(0xFFFFFFFF, f);
+            sm |= ((bal & 0xFFFFu) ? 1u : 0u) << (t0/16);
+            sm |= ((bal >> 16)     ? 1u : 0u) << (t0/16 + 1);
+        }
+        sm &= full;
+    }
+    if (lane == 0) {
+        flags[g] = sm == 0 ? 0 : (strips ? (int32_t) sm : (int32_t) full);
+    }
+}
+
+// header read by the decode kernel: list[-1] = stride between KV heads' lists; list[-2] = offset (ints, from list) of
+// the LSA selection bits or 0; list[-3] = log2(LSA block); list[-4] = LSA block count
+static __global__ void sj_live_record_list(const int32_t * desc, const int32_t * flags, int32_t * list, const int nrec_max,
+        const int head_stride, const int sel_off = 0, const int sel_sh = 0, const int sel_nbs = 0, const sj_lsa_vk vk = {}) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *(sj_lsa_vk *) (list - SJ_LIST_HDR) = vk;
+        list[-1] = head_stride; // read by the decode kernel: list of KV head z at list + z*head_stride
+        list[-2] = sel_off;
+        list[-3] = sel_sh;
+        list[-4] = sel_nbs;
+    }
+    flags += (size_t) blockIdx.x*nrec_max;
+    list  += (size_t) blockIdx.x*(nrec_max + 1);
+    __shared__ int warp_counts[32];
+    __shared__ int base;
+    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE, nwarps = blockDim.x / WARP_SIZE;
+    const int nrec = min(nrec_max, (desc[GGML_SJKVARN_DESC_B] - desc[GGML_SJKVARN_DESC_S])/desc[GGML_SJKVARN_DESC_G]);
+    if (tid == 0) {
+        base = 0;
+    }
+    __syncthreads();
+    for (int g0 = 0; g0 < nrec; g0 += blockDim.x) {
+        const int g = g0 + tid;
+        const bool live = g < nrec && flags[g] != 0;
+        const uint32_t bal = __ballot_sync(0xFFFFFFFF, live);
+        if (lane == 0) {
+            warp_counts[warp] = __popc(bal);
+        }
+        __syncthreads();
+        int before = base;
+        for (int w = 0; w < warp; ++w) {
+            before += warp_counts[w];
+        }
+        if (live) {
+            list[1 + before + __popc(bal & ((1u << lane) - 1u))] = (int32_t) ((uint32_t) g | ((uint32_t) flags[g] << 24));
+        }
+        __syncthreads();
+        if (tid == 0) {
+            for (int w = 0; w < nwarps; ++w) {
+                base += warp_counts[w];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        list[0] = base;
+    }
+}
 
 #ifdef SJKVARN_STREAM_DBG_TIME
 static __device__ unsigned int fattn_sj_kvarn_stream_dbg_run = 0;
 #endif
 
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false>
+// lsa: opt-in LSA build (live-record walk, strip skip, per-head mask). The default instance (lsa = false) compiles that
+// code out, so the default decode kernel is the pre-LSA code (registers/stack checked with cuobjdump).
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false>
 __launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 ? 2 : 1)
 static __global__ void flash_attn_ext_sj_kvarn_stream(
         const char * __restrict__ Q,
@@ -234,7 +371,28 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     // warp becomes the tail of the kernel
     const int nsplit = gridDim.y * KW;
     const int split  = blockIdx.y * KW + kw;
-    const int sb0    = kv.S/16, sb1 = kv.B/16;
+    // record skip: KV_max carries the live-record list; the walk is then over virtual strips 0 .. n_live*G/16
+    // live[-1] = stride between the KV heads' lists (0: one list shared by all heads)
+    const int * live = lsa && KV_max ? KV_max + z_KV*KV_max[-1] : nullptr;
+    const int n_live = live ? live[0] : 0;
+    // LSA block list: selection bits after the lists (header list[-2..-4], sj_live_record_list)
+    const uint32_t * selb = nullptr;
+    int sel_sh = 0, sel_nbs = 0;
+    if constexpr (lsa) {
+        if (live && KV_max[-2] > 0) {
+            selb    = (const uint32_t *) (KV_max + KV_max[-2]);
+            sel_sh  = KV_max[-3];
+            sel_nbs = KV_max[-4];
+        }
+    }
+    auto mask_at = [&](const half * m, const int p) -> float {
+        if constexpr (lsa) {
+            return sj_lsa_mask_value(m[p], p, selb, sel_sh, sel_nbs);
+        } else {
+            return __half2float(m[p]);
+        }
+    };
+    const int sb0    = live ? 0 : kv.S/16, sb1 = live ? n_live*G16 : kv.B/16;
     const int nbody  = sb1 - sb0;
     const int s_lo   = sb0 + (int) (((int64_t) nbody *  split     ) / nsplit);
     const int s_hi   = sb0 + (int) (((int64_t) nbody * (split + 1)) / nsplit);
@@ -244,7 +402,8 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const float * Qf = (const float *) (Q + (size_t) nt*nb01 + (size_t) (head0 + (hvalid ? hcol : 0))*nb02);
     // [#139] rot build: Q arrives rotated (ggml_cuda_sj_kvarn_rot256_q_pass in the launcher); only the output is rotated here
     static_assert(!rot || !turbo4_body, "turbo4 bodies use the grouped signed basis");
-    const char  * mrow = mask + (size_t) nt*nb31;
+    // per-head mask (ne32 == n_head): the KV group's first q head (the graph gives a group's q heads one mask)
+    const char  * mrow = mask + (size_t) nt*nb31 + (lsa && ne32 > 1 ? (size_t) head0*nb32 : 0);
     const char  * Kh = K + (size_t) z_KV*nb12;
     const char  * Vh = V + (size_t) z_KV*nb22;
 
@@ -413,25 +572,51 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 
     auto is_body = [&](const int p0) { return p0 >= kv.S && p0 < kv.B; };
     auto rec_of  = [&](const cursor & cu) { return fattn_sj_kvarn_rec(kv, cu.g); };
-    auto cursor_init = [&](const int p0) {
+    auto cursor_init = [&](const int s) { // s = strip index of the walk
         cursor cu;
+        if (live) {
+            cu.o  = s / G16;
+            cu.sl = s - cu.o*G16;
+            const uint32_t e = cu.o < n_live ? (uint32_t) live[1 + cu.o] : 0u;
+            cu.g  = (int) (e & 0xFFFFFFu);
+            cu.sm = (int) (e >> 24);
+            cu.p0 = kv.S + cu.g*kv.G + 16*cu.sl;
+            return cu;
+        }
+        const int p0 = 16*s;
         cu.p0 = p0;
         cu.g  = 0;
         cu.sl = 0;
+        cu.sm = 0xFF;
         if (is_body(p0)) {
             cu.g  = (p0 - kv.S) / kv.G;
             cu.sl = ((p0 - kv.S) - cu.g*kv.G) / 16;
         }
+        cu.o = cu.g;
         return cu;
     };
     auto cursor_next = [&](cursor & cu) {
+        if (live) {
+            if (++cu.sl == G16) {
+                cu.sl = 0;
+                ++cu.o;
+                if (cu.o < n_live) {
+                    const uint32_t e = (uint32_t) live[1 + cu.o];
+                    cu.g  = (int) (e & 0xFFFFFFu);
+                    cu.sm = (int) (e >> 24);
+                }
+            }
+            cu.p0 = kv.S + cu.g*kv.G + 16*cu.sl;
+            return;
+        }
         cu.p0 += 16;
         if (cu.p0 == kv.S) {
-            cu.g = 0; cu.sl = 0;
+            cu.g = 0; cu.sl = 0; cu.o = 0;
         } else if (is_body(cu.p0)) {
             if (++cu.sl == G16) {
                 cu.sl = 0;
                 ++cu.g;
+                ++cu.o;
             }
         }
     };
@@ -454,16 +639,36 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         }
         const char * ks   = rec + cu.sl*STRIP_BYTES;
         const uint32_t dst_s = ring_s + stage*STAGE_BYTES;
+        // LLAMA_LSA_RESIDENT: record vectors from the card meta (same 1,536-byte image as RMETA), a resident strip from
+        // its slot (same 4,192-byte image as the stage); a strip without a slot reads the pinned master
+        const char * meta_card = nullptr;
+        const char * slot_card = nullptr;
+        if (kv.strip_map != nullptr) {
+            const ggml_cuda_qsa_clock_map & smap = *kv.strip_map;
+            const int record = kv.table ? kv.table[cu.g] : cu.g;
+            meta_card = smap.meta + ((size_t) record*smap.heads + kv.resident_head)*GGML_QSA_META_HEAD_BYTES;
+            const int slot = smap.table[record*(128/GGML_LSA_STRIP_CELLS) + cu.sl];
+            if (slot >= 0) {
+                slot_card = smap.card + ((size_t) slot*smap.heads + kv.resident_head)*GGML_LSA_STRIP_HEAD_BYTES;
+            }
+        }
         if (with_meta) {
-            const uint32_t dst_m = rmeta_s + (cu.g & 1)*RMETA_BYTES;
+            const uint32_t dst_m = rmeta_s + ((lsa ? cu.o : cu.g) & 1)*RMETA_BYTES;
             for (int q = nt*WARP_SIZE + lane; q < RMETA_CHUNKS; q += NT*WARP_SIZE) {
-                const char * src = q < RMETA_VCH/16 ? rec + kv.k_scale + 16*q : rec + kv.v_ch + 16*(q - RMETA_VCH/16);
+                const char * src = meta_card ? meta_card + 16*q :
+                    q < RMETA_VCH/16 ? rec + kv.k_scale + 16*q : rec + kv.v_ch + 16*(q - RMETA_VCH/16);
                 cp_async_cg_16<0>(dst_m + 16*q, src);
             }
         }
+        if (lsa && cu.sl < 8 && !((cu.sm >> cu.sl) & 1)) { // dead strip (strip skip): record vectors only, empty group keeps the count
+            cp_async_commit();
+            return;
+        }
         for (int q = nt*WARP_SIZE + lane; q < STAGE_CHUNKS; q += NT*WARP_SIZE) {
             const char * src;
-            if (q < STRIP_BYTES/16) {
+            if (slot_card != nullptr) {
+                src = slot_card + 16*q;
+            } else if (q < STRIP_BYTES/16) {
                 src = ks + 16*q;
             } else if (q < 2*STRIP_BYTES/16) {
                 src = ks + kv.v_payload + 16*(q - STRIP_BYTES/16);
@@ -507,7 +712,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         setup_exact();
     }
 
-    cursor ci = cursor_init(16*s_lo);   // issue cursor, NSTAGE-1 strips ahead
+    cursor ci = cursor_init(s_lo);      // issue cursor, NSTAGE-1 strips ahead
     cursor cc = ci;                      // compute cursor
     int stage_i = 0;                     // ring stage of the issue cursor
     int stage_c = 0;                     // ring stage of the compute cursor
@@ -544,7 +749,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 #endif
 
         const int    id = cc.g;
-        const char * rm = rmeta + (id & 1)*RMETA_BYTES;
+        const char * rm = rmeta + ((lsa ? cc.o : cc.g) & 1)*RMETA_BYTES;
 #ifdef SJKVARN_STREAM_DBG_TIME
         dbg_nrec += id != cur_id ? 1 : 0;
 #endif
@@ -573,9 +778,8 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 }
                 mma(kq, a, qp[c]);
             }
-            const half * mk = (const half *) mrow + cc.p0;
-            const float mk0 = __half2float(mk[lane >> 2]);
-            const float mk1 = __half2float(mk[(lane >> 2) + 8]);
+            const float mk0 = mask_at((const half *) mrow, cc.p0 + (lane >> 2));
+            const float mk1 = mask_at((const half *) mrow, cc.p0 + (lane >> 2) + 8);
             kq.x[0] += mk0; kq.x[1] += mk0;
             kq.x[2] += mk1; kq.x[3] += mk1;
             const T_B P = softmax(kq);
@@ -590,7 +794,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 }
                 mma(acc[c], a, P);
             }
-        } else {
+        } else if (!lsa || cc.sl >= 8 || ((cc.sm >> cc.sl) & 1)) { // dead strips (strip skip) add nothing: skipped; G > 128: strips 8+ always walked
             T_C kq;
             const char * st = ring + stage_c*STAGE_BYTES;
             const uint32_t * kwp = (const uint32_t *) st + lane;
@@ -604,13 +808,12 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 mma(kq, a, qp[c]);
             }
             const half * ktok = (const half *) (st + META_KTOK);
-            const half * mk   = (const half *) mrow + cc.p0;
             const half * vsh  = (const half *) (st + META_VS);
             const half * vzh  = (const half *) (st + META_VZ);
             const float tok0 = __half2float(ktok[lane >> 2]);
             const float tok1 = __half2float(ktok[(lane >> 2) + 8]);
-            const float mk0  = __half2float(mk[lane >> 2]);
-            const float mk1  = __half2float(mk[(lane >> 2) + 8]);
+            const float mk0  = mask_at((const half *) mrow, cc.p0 + (lane >> 2));
+            const float mk1  = mask_at((const half *) mrow, cc.p0 + (lane >> 2) + 8);
             kq.x[0] = tok0*(kq.x[0] + c_r[0]) + mk0;
             kq.x[1] = tok0*(kq.x[1] + c_r[1]) + mk0;
             kq.x[2] = tok1*(kq.x[2] + c_r[0]) + mk1;
@@ -661,10 +864,9 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const half * mrow_h = (const half *) mrow;
 
     // KQ of the exact strip staged in the ring (fragment order, K straight) + mask, online softmax -> P
-    auto exact_kq = [&](const int p0) -> T_B {
+    // mk0/mk1: additive term of token rows lane/4 and lane/4 + 8
+    auto kq_add = [&](const float mk0, const float mk1) -> T_B {
         T_C kq;
-        const float mk0 = __half2float(mrow_h[p0 + (lane >> 2)]);
-        const float mk1 = __half2float(mrow_h[p0 + (lane >> 2) + 8]);
 #pragma unroll
         for (int c = 0; c < NTC; ++c) {
             T_A a;
@@ -681,6 +883,9 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         kq.x[2] += mk1;
         kq.x[3] += mk1;
         return softmax(kq);
+    };
+    auto exact_kq = [&](const int p0) -> T_B {
+        return kq_add(mask_at(mrow_h, p0 + (lane >> 2)), mask_at(mrow_h, p0 + (lane >> 2) + 8));
     };
     // acc += V^T P from the V strip staged in the ring (8x8 transposes)
     auto exact_pv = [&](const T_B & P) {
@@ -840,6 +1045,43 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         cp_async_wait_all();
         sync_split(); // everyone has read V before the combine reuses the ring
     }
+
+    // LSA virtual keys (ggml_flash_attn_ext_set_lsa_vk): the dropped blocks' mean K/V rows, 16 blocks per strip, go
+    // through the exact-strip path (f16 rows, same staging, KQ, softmax and PV) with log(n dropped) + bias as the
+    // additive term instead of the mask (-inf: picked block, nothing dropped, or past the block count). Strips continue
+    // the exact round-robin after strip n_ex - 1, so the extra work lands on the splits with the fewest exact strips.
+    if constexpr (lsa) {
+        const sj_lsa_vk * vkp = live && KV_max[-2] > 0 ? (const sj_lsa_vk *) (KV_max - SJ_LIST_HDR) : nullptr;
+        const int vk_n = vkp ? vkp->n : 0;
+        if (vk_n > 0) {
+            const int nvs = (vk_n + 15)/16;
+            int v = (split - n_ex) % nsplit;
+            v += v < 0 ? nsplit : 0;
+            if (v < nvs && split >= n_ex) {
+                setup_exact();
+            }
+            const float * ndr = vkp->nd + (size_t) (nt < n_q ? nt : 0)*vkp->nd_pitch;
+            for (; v < nvs; v += nsplit) {
+                const int b0 = min(16*v, vkp->alloc - 16); // a short last strip re-reads earlier rows (masked below)
+                issue_exact((const char *) (vkp->k + (size_t) b0*vkp->k_pitch + (size_t) z_KV*D), 2*(size_t) vkp->k_pitch,
+                            GGML_TYPE_F16);
+                cp_async_wait_all();
+                sync_split();
+                auto vk_term = [&](const int b) -> float {
+                    const float n = b >= 16*v && b < vk_n && nt < n_q ? ndr[b] - 1.0f : 0.0f; // dropped cells
+                    return n >= 0.5f ? logf(n) + vkp->bias : -INFINITY;
+                };
+                const T_B P = kq_add(vk_term(b0 + (lane >> 2)), vk_term(b0 + (lane >> 2) + 8));
+                sync_split(); // everyone has read K
+                issue_exact((const char *) (vkp->v + (size_t) b0*vkp->v_pitch + (size_t) z_KV*D), 2*(size_t) vkp->v_pitch,
+                            GGML_TYPE_F16);
+                cp_async_wait_all();
+                sync_split();
+                exact_pv(P);
+                sync_split(); // everyone has read V
+            }
+        }
+    }
 #ifdef SJKVARN_STREAM_DBG_TIME
     {
         const long long dbg_t1 = clock64();
@@ -982,10 +1224,10 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 } // namespace fattn_sj_kvarn_stream
 
 // Each query warp shares a packed-data ring with the other query warps in its KV split.
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false>
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false>
 static fattn_kernel_t ggml_cuda_fattn_sj_kvarn_stream_kernel() {
     using namespace fattn_sj_kvarn_stream;
-    fattn_kernel_t kernel = flash_attn_ext_sj_kvarn_stream<max_warps, NSTAGE, turbo4_body, rot>;
+    fattn_kernel_t kernel = flash_attn_ext_sj_kvarn_stream<max_warps, NSTAGE, turbo4_body, rot, lsa>;
     const int id = ggml_cuda_get_device();
     static bool initialized[GGML_CUDA_MAX_DEVICES] = {false};
     if (!initialized[id]) {
@@ -1017,8 +1259,15 @@ static int ggml_cuda_fattn_sj_kvarn_stream_occupancy(const int NT, const int KW)
 template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false>
 static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, const int parallel_blocks) {
     using namespace fattn_sj_kvarn_stream;
+    // the LSA instance only when the opt-in live-record list is set (never for turbo4 bodies)
+    fattn_kernel_t kernel = ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot>();
+    if constexpr (!turbo4_body) {
+        if (ggml_cuda_fattn_sj_live_records != nullptr || (dst->src[3] && dst->src[3]->ne[2] > 1)) {
+            kernel = ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot, true>();
+        }
+    }
     launch_fattn<D, NCOLS2, NCOLS2>
-        (ctx, dst, ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot>(), NT*KW,
+        (ctx, dst, kernel, NT*KW,
          ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body), UNIT,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/false, /*use_sparse=*/false, WARP_SIZE, nullptr, nullptr, parallel_blocks,
          /*async_kv_preload=*/false, /*sj_fill_kv_splits=*/turbo4_body ? 0 : KW);
@@ -1059,6 +1308,89 @@ static void ggml_cuda_fattn_sj_kvarn_stream_select(ggml_backend_cuda_context & c
 
 template <bool turbo4_body = false, bool rot = false>
 inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // opt-in record skip (LSA on SJ-KVaRN sets it): build the live-record list from the mask, then walk only those
+    static const bool strip_env = getenv("GGML_SJKVARN_LIVE_STRIPS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_STRIPS")) != 0;
+    static const bool live_env  = strip_env ||
+        (getenv("GGML_SJKVARN_LIVE_RECORDS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_RECORDS")) != 0);
+    // LSA block list (ggml_flash_attn_ext_set_lsa_blocks): the mask's GGML_LSA_MASK_SEL entries resolve through the
+    // selection bits, so the node always takes the live-record walk (dead records skipped, mapped mask everywhere)
+    const int32_t lsa_blk = ggml_flash_attn_ext_get_lsa_block(dst);
+    GGML_ASSERT(lsa_blk == 0 || !turbo4_body);
+    // LLAMA_LSA_RESIDENT body (16-cell strip slots): take the live-strip walk, so the strips about to be read are known
+    // and resolved into slots before the kernel (a strip without a slot reads the pinned master)
+    const bool strip_res = !turbo4_body && ggml_cuda_qsa_strip_body(dst->src[5]);
+    if (!turbo4_body && (live_env || lsa_blk > 0 || strip_res) && ggml_cuda_fattn_sj_live_records == nullptr) {
+        const ggml_tensor * mask = dst->src[3];
+        const int64_t positions = ggml_get_op_params_i32(dst, 6);
+        const bool head_mask = mask && mask->ne[2] > 1;
+        if (mask && mask->type == GGML_TYPE_F16 && (!head_mask || mask->ne[2] == dst->src[0]->ne[2]) && mask->ne[3] == 1 &&
+                dst->src[0]->ne[3] == 1 && (lsa_blk == 0 || !head_mask) &&
+                positions > 0 && mask->ne[0] >= positions && mask->ne[1] >= dst->src[0]->ne[1] && dst->src[6] != nullptr) {
+            using namespace fattn_sj_kvarn_stream;
+            const int nrec_max = int(positions/16) + 1;
+            const int n_lists  = head_mask ? int(dst->src[1]->ne[2]) : 1;            // one per KV head
+            const int gqa      = int(dst->src[0]->ne[2]/dst->src[1]->ne[2]);
+            const int32_t * desc = (const int32_t *) dst->src[6]->data;
+            // set_lsa_vk_units: the unit pick sits after the n_vk mean-block counts in row 0 of src[8]
+            const int sel_off  = lsa_blk > 0 ? int(ggml_flash_attn_ext_get_lsa_sel_off(dst)) : 0;
+            const int sel_nbs  = lsa_blk > 0 ? int(dst->src[8]->ne[0]) - sel_off : 0;
+            int sel_sh = 0;
+            for (int32_t b = lsa_blk; b > 1; b >>= 1) {
+                ++sel_sh;
+            }
+            const int sel_w    = (sel_nbs + 31)/32;
+            const int hdr      = SJ_LIST_HDR;
+            const bool vk      = ggml_flash_attn_ext_get_lsa_vk(dst);
+            sj_lsa_vk vka = {};
+            if (vk) {
+                const ggml_tensor * km = dst->src[7];
+                const ggml_tensor * vm = dst->src[9];
+                const ggml_tensor * nd = dst->src[8];
+                // rows readable past the view: the mean caches are views of a larger [d, n_blk] tensor
+                auto rows = [](const ggml_tensor * t) -> int64_t {
+                    const ggml_tensor * b = t->view_src;
+                    return b && b->nb[1] == t->nb[1] && b->ne[0] == t->ne[0] ? (int64_t) (ggml_nbytes(b) - t->view_offs)/t->nb[1] : t->ne[1];
+                };
+                vka.k        = (const half *) km->data;
+                vka.v        = (const half *) vm->data;
+                vka.nd       = (const float *) nd->data;
+                vka.k_pitch  = int(km->nb[1]/sizeof(half));
+                vka.v_pitch  = int(vm->nb[1]/sizeof(half));
+                vka.nd_pitch = int(nd->nb[1]/sizeof(float));
+                vka.n        = int(ggml_flash_attn_ext_get_lsa_vk_n(dst));
+                vka.alloc    = int(std::min(rows(km), rows(vm)));
+                vka.bias     = ggml_get_op_params_f32(dst, 11);
+                GGML_ASSERT(vka.alloc >= 16 && vka.alloc >= vka.n && "LSA virtual keys need >= 16 readable mean rows");
+                GGML_ASSERT(km->nb[1] % 16 == 0 && vm->nb[1] % 16 == 0 && ((uintptr_t) km->data % 16) == 0 &&
+                            ((uintptr_t) vm->data % 16) == 0);
+            }
+            const size_t lists = (size_t) (nrec_max + 1)*n_lists;
+            ggml_cuda_pool_alloc<int32_t> flags(ctx.pool(), (size_t) nrec_max*n_lists);
+            ggml_cuda_pool_alloc<int32_t> list(ctx.pool(), hdr + lists + sel_w); // header, lists, selection bits
+            const uint32_t * selb = nullptr;
+            if (lsa_blk > 0) {
+                selb = (const uint32_t *) (list.ptr + hdr + lists);
+                sj_lsa_sel_bits<<<(sel_w + 127)/128, 128, 0, ctx.stream()>>>((const float *) dst->src[8]->data + sel_off,
+                    sel_nbs, (uint32_t *) selb, vk && sel_off == 0 ? 1 : 0);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            sj_live_record_flags<<<dim3((nrec_max + 7)/8, n_lists), 8*WARP_SIZE, 0, ctx.stream()>>>((const half *) mask->data,
+                int(mask->nb[1]/sizeof(half)), int(dst->src[0]->ne[1]), desc, flags.ptr, nrec_max,
+                head_mask ? int64_t(gqa)*int64_t(mask->nb[2]/sizeof(half)) : 0, strip_env || strip_res ? 1 : 0, selb, sel_sh, sel_nbs);
+            CUDA_CHECK(cudaGetLastError());
+            sj_live_record_list<<<n_lists, 1024, 0, ctx.stream()>>>(desc, flags.ptr, list.ptr + hdr, nrec_max,
+                head_mask ? nrec_max + 1 : 0, lsa_blk > 0 ? int(lists) : 0, sel_sh, sel_nbs, vka);
+            CUDA_CHECK(cudaGetLastError());
+            if (strip_res && n_lists == 1) {
+                ggml_cuda_qsa_strip_prepare(ctx, dst->src[5], desc, list.ptr + hdr);
+            }
+            ggml_cuda_fattn_sj_live_records = list.ptr + hdr;
+            ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl<turbo4_body, rot>(ctx, dst);
+            ggml_cuda_fattn_sj_live_records = nullptr;
+            return;
+        }
+        GGML_ASSERT(lsa_blk == 0 && "LSA block list needs a plain F16 [n_kv, n_q] mask on the SJ-KVaRN stream kernel");
+    }
     if constexpr (!turbo4_body && !rot) {
         if (ggml_cuda_fattn_sj_kvarn_rot(dst)) { // [#139] fused rotation: Q pre-pass here, output rotation in the kernel
             ggml_cuda_pool_alloc<float> q_rot(ctx.pool(), ggml_nelements(dst->src[0]));

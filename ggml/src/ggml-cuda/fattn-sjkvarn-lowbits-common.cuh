@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 #include "turbo-quant.cuh"
 #include "fattn-sjkvarn-rot.cuh"
+#include "qsa-resident-clock.cuh"
 
 #include <cstdint>
 
@@ -281,7 +282,25 @@ struct fattn_sj_kvarn_lowbits_ctx {
     int rec_stride;      // n_head_kv * rec_bytes
     const int32_t * table; // paged pool (multi-sequence cache): group g sits at record table[g]; nullptr = identity
     int k_scale, k_zero, k_tok, v_payload, v_ch, v_scale, v_zero;
+    int k_payload = 0;
+    bool stage_token_strip = false;
+    int flags;           // desc[GGML_SJKVARN_DESC_FLAGS_FORK]: bit 0 = skip fully masked body tiles (GGML_SJKVARN_TILE_SKIP)
+    // LLAMA_LSA_RESIDENT record pages (opt-in, nullptr otherwise): record r of this head sits in card slot page_table[r]
+    // (page_card + slot*rec_stride) when that is >= 0, else in the pinned master at body + r*rec_stride
+    const char * page_card;
+    const int32_t * page_table;
+    const char * page_stage; // GGML_CUDA_LSA_RESIDENT_STAGE: table entry -3 - k = stage index k (page_stage + k*rec_stride)
+    const ggml_cuda_qsa_clock_map * page_map = nullptr; // compact-stage metadata only
+    int page_head = 0;
 };
+
+// fork: descriptor entry 15 (zero in every writer, below GGML_SJKVARN_DESC_N_ENTRIES) carries per-call flags without a
+// ggml.h change; must match llama-kv-cache.cpp
+#define GGML_SJKVARN_DESC_FLAGS_FORK 15
+static_assert(GGML_SJKVARN_DESC_FLAGS_FORK < GGML_SJKVARN_DESC_N_ENTRIES && GGML_SJKVARN_DESC_FLAGS_FORK > GGML_SJKVARN_DESC_TABLE,
+              "the fork flags entry must be a spare fixed descriptor entry");
+#define GGML_SJKVARN_FLAG_TILE_SKIP 1
+#define GGML_SJKVARN_FLAG_STAGE_ALL 2
 
 // record of group g of this stream: g itself, or the paged-pool slot of a multi-sequence cache (desc[GGML_SJKVARN_DESC_TABLE])
 #ifndef FATTN_SJKVARN_REC_DEFINED
@@ -292,8 +311,27 @@ static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const ctx_t & 
 }
 #endif
 
+// low-bit record lookup: the paged-pool table, then the LSA resident slot if the record has one (same bytes either way)
+static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const fattn_sj_kvarn_lowbits_ctx & kv, const int g) {
+    const int r = kv.table ? kv.table[g] : g;
+    if (kv.page_table != nullptr) {
+        const int slot = kv.page_table[r];
+        if (slot >= 0) {
+            return kv.page_card + (size_t) slot*kv.rec_stride;
+        }
+        if (slot <= -3) { // staged for this resolve only (never written unless GGML_CUDA_LSA_RESIDENT_STAGE is set)
+            return kv.page_stage + (size_t) (-3 - slot)*(kv.page_map ? kv.page_map->stage_stride : kv.rec_stride);
+        }
+    }
+    if (kv.flags & GGML_SJKVARN_FLAG_STAGE_ALL) {
+        printf("LSA full-stage decode: record %d has no device copy\n", r);
+        __trap();
+    }
+    return kv.body + (size_t) r*kv.rec_stride;
+}
+
 static __device__ __forceinline__ fattn_sj_kvarn_lowbits_ctx fattn_sj_kvarn_lowbits_make_ctx(
-        const char * body, const int32_t * desc, const int z_KV, const int D, const int bits_k, const int bits_v, const size_t k_head_stride, const size_t v_head_stride) {
+        const char * body, const int32_t * desc, const int z_KV, const int D, const int bits_k, const int bits_v, const size_t k_head_stride, const size_t v_head_stride, const int n_q = 0) {
     fattn_sj_kvarn_lowbits_ctx c;
     const int G         = desc[GGML_SJKVARN_DESC_G];
     const int rec_bytes = desc[GGML_SJKVARN_DESC_RECBYTES];
@@ -314,6 +352,26 @@ static __device__ __forceinline__ fattn_sj_kvarn_lowbits_ctx fattn_sj_kvarn_lowb
     c.sink_head_delta_v = (int64_t) z_KV*((int64_t) D*sizeof(half) - (int64_t) v_head_stride);
     c.rec_stride = desc[GGML_SJKVARN_DESC_HKV] * rec_bytes;
     c.table      = desc[GGML_SJKVARN_DESC_TABLE] ? desc + GGML_SJKVARN_DESC_N_ENTRIES : nullptr;
+    c.page_card  = nullptr;
+    c.page_table = nullptr;
+    c.page_stage = nullptr;
+    c.flags = desc[GGML_SJKVARN_DESC_FLAGS_FORK];
+    if ((reinterpret_cast<uintptr_t>(body) & 3) == 2) {
+        // LLAMA_LSA_RESIDENT record pages (ggml_cuda_lsa_page_body): master in pinned host RAM, some records on the card
+        const auto * map = reinterpret_cast<const ggml_cuda_qsa_clock_map *>(reinterpret_cast<uintptr_t>(body) & ~uintptr_t(3));
+        body         = map->host;
+        c.page_card  = map->card + (size_t) z_KV * rec_bytes;
+        c.page_table = map->table;
+        c.page_stage = map->stage ? map->stage + (size_t) z_KV * rec_bytes : nullptr;
+        if (map->stage_stride) {
+            c.page_map = map;
+            c.page_head = z_KV;
+            c.page_stage = map->stage + size_t(z_KV)*(map->stage_stride/map->heads);
+        }
+        if (map->stage_all && n_q > 0 && n_q <= 8) {
+            c.flags |= GGML_SJKVARN_FLAG_TILE_SKIP | GGML_SJKVARN_FLAG_STAGE_ALL;
+        }
+    }
     c.body       = body + (size_t) z_KV * rec_bytes;
     const int k_row = D*c.bits_k/8;
     const int v_row = D*bits_v/8;
@@ -2215,7 +2273,7 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? (mask->type == GGML_TYPE_I32 ? mask->nb[1] | 1 : mask->nb[1]) : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        is_sj_kvarn ? (const char    *) KQV->src[5]->data : nullptr,
+        is_sj_kvarn ? ggml_cuda_lsa_page_body(KQV->src[5]) : nullptr, // body->data unless LLAMA_LSA_RESIDENT record pages
         is_sj_kvarn ? (const int32_t *) KQV->src[6]->data : nullptr
     );
     CUDA_CHECK(cudaGetLastError());

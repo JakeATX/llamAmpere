@@ -914,10 +914,19 @@ inline bool ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported_impl(const ggml_t
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    // The stream pipeline preloads every body strip; split bodies use the mask-gated MMA loader.
+    // The stream pipeline preloads every body strip; split bodies use the mask-gated MMA loader. Exception: LSA strip
+    // slots (LLAMA_LSA_RESIDENT, 16-cell CLOCK strips) at <= stream_max rows, where direct_impl takes the stream kernel,
+    // which resolves the walked strips into slots first and reads a strip without a slot from the pinned master.
     if (dst->src[5] && dst->src[5]->buffer &&
         ggml_cuda_qsa_resident_is_buft(ggml_backend_buffer_get_type(dst->src[5]->buffer))) {
-        return false;
+        static const int stream_max = getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") != nullptr
+                                    ? atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8; // same knob as direct_impl
+        static const bool strip_off = getenv("GGML_CUDA_LSA_STRIP_STREAM") != nullptr &&
+                                      atoi(getenv("GGML_CUDA_LSA_STRIP_STREAM")) == 0; // 0 = old mask-loader route
+        if (strip_off || !ggml_cuda_qsa_strip_body(dst->src[5]) || Q->ne[1] > stream_max ||
+            ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0) {
+            return false;
+        }
     }
     if (sinks != nullptr || mask == nullptr || Q->ne[1] < 1 || Q->ne[1] > 8 || Q->ne[3] != 1) {
         return false;

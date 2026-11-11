@@ -2913,6 +2913,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
+        case GGML_OP_LSA_BLOCK_SELECT:
+            {
+                ggml_compute_forward_lsa_block_select(params, tensor);
+            } break;
+        case GGML_OP_LSA_COMP_MERGE:
+            {
+                ggml_compute_forward_lsa_comp_merge(params, tensor);
+            } break;
+        case GGML_OP_LSA_UNIT_LSE:
+            {
+                ggml_compute_forward_lsa_unit_lse(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -3101,6 +3113,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_DOWN:
         case GGML_OP_DSV4_HC_UP:
         case GGML_OP_TOP_K_MASK:
+        case GGML_OP_LSA_BLOCK_SELECT:
+        case GGML_OP_LSA_COMP_MERGE:
+        case GGML_OP_LSA_UNIT_LSE:
             {
                 n_tasks = n_threads;
             } break;

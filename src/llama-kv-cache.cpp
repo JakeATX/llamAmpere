@@ -5,6 +5,8 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-lsa.h"
+#include "llama-lsa-fit.h"
 
 #include <algorithm>
 #include <cassert>
@@ -467,6 +469,29 @@ llama_kv_cache::llama_kv_cache(
         return it->second.get();
     };
 
+    // LLAMA_LSA_RESIDENT=auto: eligible bodies wait in one context per device until the layer loop has sized the rest of
+    // the cache; then llama_lsa_resident_fit picks the slot count (or keeps them on the card) and fixes their buffer type
+    struct lsa_auto_layer {
+        uint32_t il; ggml_backend_dev_t dev; ggml_backend_buffer_type_t card_buft; void * get_type; bool page;
+        size_t stride; uint32_t heads; ggml_tensor * body;
+    };
+    std::vector<lsa_auto_layer> lsa_auto;
+    std::map<ggml_backend_dev_t, ggml_context_ptr> lsa_auto_ctx;
+    auto lsa_auto_defer = [&](uint32_t il, ggml_backend_dev_t dev, ggml_backend_buffer_type_t card_buft, void * get_type, bool page,
+            size_t stride, uint32_t heads) -> ggml_context * {
+        auto it = lsa_auto_ctx.find(dev);
+        if (it == lsa_auto_ctx.end()) {
+            ggml_init_params params = { size_t((n_layer + 1)*ggml_tensor_overhead()), NULL, true };
+            ggml_context * c = ggml_init(params);
+            if (!c) {
+                return nullptr;
+            }
+            it = lsa_auto_ctx.emplace(dev, ggml_context_ptr(c)).first;
+        }
+        lsa_auto.push_back({ il, dev, card_buft, get_type, page, stride, heads, nullptr });
+        return it->second.get();
+    };
+
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
 
     v_heads.resize(n_stream);
@@ -611,6 +636,7 @@ llama_kv_cache::llama_kv_cache(
 
                 layers.push_back(layer_share);
                 layers.back().il = il;
+                layers.back().shared = true;
 
                 continue;
             }
@@ -985,7 +1011,112 @@ llama_kv_cache::llama_kv_cache(
                         __func__, il, groups_card, kv_rows, (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024*1024), (double) bytes_freed/(1024*1024));
                 }
             }
+            // LLAMA_LSA_RESIDENT=<pct> (opt-in, LSA layers with a map): body master in pinned host RAM, <pct>% of its
+            // 16-cell strips (scalar 4/4) or whole 128-cell records (3/3t, 3/2t and other low-bit bodies, whose
+            // token-axis trellis payload moves only by record) in CLOCK slots on the card, filled before each decode attention
+            if (body_ctx == ctx && llama_lsa_cfg().resident > 0.0 && offload && llama_lsa_map_has_layer((int32_t) il) &&
+                    ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                static bool warned = false;
+                // slots per layer: <pct> of the records, or LLAMA_LSA_RESIDENT_MIB split evenly over the layers that can
+                // be resident (mapped, offloaded, interior tier), capped at the whole body
+                auto lsa_res_groups = [&](double slot_bytes) -> uint32_t {
+                    const auto & lc = llama_lsa_cfg();
+                    if (lc.resident_mib <= 0.0) {
+                        return (uint32_t) std::max<double>(1.0, std::ceil(lc.resident/100.0*sj_kvarn_n_groups));
+                    }
+                    uint32_t n_res = 0;
+                    for (uint32_t jl = 0; jl < hparams.n_layer(); ++jl) {
+                        const bool jedge = sj_kvarn.edge_layers > 0 && (jl < sj_kvarn.edge_layers || jl + sj_kvarn.edge_layers >= sj_kvarn_n_layers_model);
+                        n_res += !jedge && llama_lsa_map_has_layer((int) jl) && model.dev_layer(jl) &&
+                            ggml_backend_dev_type(model.dev_layer(jl)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                    }
+                    const double per = lc.resident_mib*1024.0*1024.0/std::max<uint32_t>(1, n_res);
+                    const uint32_t g = (uint32_t) std::min<double>(sj_kvarn_n_groups, std::max(1.0, std::floor(per/slot_bytes)));
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT_MIB=%.0f over %u layers: %.1f MiB, %u of %u records per layer\n",
+                            __func__, lc.resident_mib, n_res, per/(1024.0*1024.0), g, sj_kvarn_n_groups);
+                    }
+                    return g;
+                };
+                // one decode row reads sinks + window + keep cells at full context; a slot pool not clearly above that
+                // makes CLOCK evict strips the same step needs again (rr3: 2,000 slots vs 2,008 picked strips per step)
+                auto lsa_res_check = [&](uint32_t groups, uint32_t unit_cells) {
+                    static bool said = false;
+                    const auto & lc = llama_lsa_cfg();
+                    const int64_t kv = (int64_t) sj_kvarn_n_groups*sj_kvarn.group;
+                    const double fs = lc.keep_frac_sched(kv);
+                    const double f  = fs >= 0.0 ? fs : lc.keep_frac_for((int) il);
+                    const int64_t need = std::min<int64_t>(kv, (f > 0.0 ? (int64_t) (f*kv) : lc.keep) + lc.window + lc.sinks);
+                    const int64_t have = (int64_t) std::min(groups, sj_kvarn_n_groups)*sj_kvarn.group;
+                    if (!said && have < sj_kvarn_n_groups*(int64_t) sj_kvarn.group && 4*have < 5*need) {
+                        said = true;
+                        LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT: %lld cells of slots per layer vs >= %lld cells one decode row reads at full context "
+                            "(%u-cell units, more when picks scatter or rows differ): slots will thrash; raise LLAMA_LSA_RESIDENT or LLAMA_LSA_RESIDENT_MIB\n",
+                            __func__, (long long) have, (long long) need, unit_cells);
+                    }
+                };
+                const bool scalar44 = layer_new.sj_kvarn_bits_k == 4 && layer_new.sj_kvarn_bits_v == 4 && layer_new.sj_kvarn_body_type == GGML_TYPE_F32;
+                const bool lowbit = !scalar44 && layer_new.sj_kvarn_body_type != GGML_TYPE_TURBO4_0 &&
+                    (layer_new.sj_kvarn_bits_k < 4 || layer_new.sj_kvarn_bits_v < 4) && rb % 16 == 0;
+                if (n_stream != 1 || D != 256 || sj_kvarn.group != 128 || layer_new.sj_kvarn_tier != 0 || (!scalar44 && !lowbit)) {
+                    if (!warned) {
+                        warned = true;
+                        LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT needs one stream, SJ-KVaRN scalar 4/4 or a low-bit (3/3t, 3/2t) body, D 256, G 128; the body stays on the card\n", __func__);
+                    }
+                } else if (lowbit) {
+                    auto * dev = model.dev_layer(il);
+                    using page_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t, uint32_t, uint32_t);
+                    auto * get_type = reinterpret_cast<page_type_fn>(ggml_backend_reg_get_proc_address(
+                        ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_page_buffer_type"));
+                    ggml_context * defer_ctx = llama_lsa_cfg().resident_auto && get_type ?
+                        lsa_auto_defer(il, dev, buft, (void *) get_type, true, rb*hparams.n_head_kv(il), hparams.n_head_kv(il)) : nullptr;
+                    const uint32_t groups = defer_ctx ? 0 : lsa_res_groups((double) rb*hparams.n_head_kv(il));
+                    auto * page_buft = get_type && !defer_ctx ? get_type(dev, rb*hparams.n_head_kv(il), groups, hparams.n_head_kv(il)) : nullptr;
+                    if (defer_ctx) {
+                        body_ctx = defer_ctx;
+                    } else if (page_buft) {
+                        lsa_res_check(groups, 128);
+                        body_ctx = ctx_for_buft(page_buft);
+                        const double slot_mib = (double) std::min(groups, sj_kvarn_n_groups)*rb*hparams.n_head_kv(il)/(1024.0*1024.0);
+                        const double body_mib = (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024.0*1024.0);
+                        LLAMA_LOG_WARN("%s: LSA resident layer %u (K%u/V%u record pages): %u of %u records on the card (%.1f%%), %.1f MiB slots vs %.1f MiB body, %.1f MiB pinned\n",
+                            __func__, il, layer_new.sj_kvarn_bits_k, layer_new.sj_kvarn_bits_v, std::min(groups, sj_kvarn_n_groups), sj_kvarn_n_groups,
+                            llama_lsa_cfg().resident, slot_mib, body_mib, body_mib);
+                    } else if (!warned) {
+                        warned = true;
+                        LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT: this backend has no record-page buffer type; the body stays on the card\n", __func__);
+                    }
+                } else {
+                    auto * dev = model.dev_layer(il);
+                    using strip_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t, uint32_t);
+                    auto * get_type = reinterpret_cast<strip_type_fn>(ggml_backend_reg_get_proc_address(
+                        ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_strip_buffer_type"));
+                    ggml_context * defer_ctx = llama_lsa_cfg().resident_auto && get_type ?
+                        lsa_auto_defer(il, dev, buft, (void *) get_type, false, rb*hparams.n_head_kv(il), hparams.n_head_kv(il)) : nullptr;
+                    const uint32_t groups = defer_ctx ? 0 : lsa_res_groups((double) (sj_kvarn.group/16)*hparams.n_head_kv(il)*4192);
+                    auto * strip_buft = get_type && !defer_ctx ? get_type(dev, rb*hparams.n_head_kv(il), groups) : nullptr;
+                    if (defer_ctx) {
+                        body_ctx = defer_ctx;
+                    } else if (strip_buft) {
+                        lsa_res_check(groups, 16);
+                        body_ctx = ctx_for_buft(strip_buft);
+                        const double strip_mib = (double) groups*(sj_kvarn.group/16)*hparams.n_head_kv(il)*4192/(1024.0*1024.0);
+                        const double body_mib  = (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024.0*1024.0);
+                        const double meta_mib  = (double) sj_kvarn_n_groups*(hparams.n_head_kv(il)*1536 + (sj_kvarn.group/16)*4)/(1024.0*1024.0);
+                        LLAMA_LOG_WARN("%s: LSA resident layer %u: %u of %u records' strips on the card (%.1f%%), %.1f MiB slots + %.1f MiB meta vs %.1f MiB body, %.1f MiB pinned\n",
+                            __func__, il, std::min(groups, sj_kvarn_n_groups), sj_kvarn_n_groups, llama_lsa_cfg().resident, strip_mib, meta_mib, body_mib, body_mib);
+                    } else if (!warned) {
+                        warned = true;
+                        LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT: this backend has no strip buffer type; the body stays on the card\n", __func__);
+                    }
+                }
+            }
             body = ggml_new_tensor_1d(body_ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
+            if (!lsa_auto.empty() && lsa_auto.back().il == il && lsa_auto.back().body == nullptr) {
+                lsa_auto.back().body = body;
+            }
             body->op_params[7] = layer_new.sj_kvarn_body_type;
             ggml_format_name(body, "cache_%ssj_kvarn_l%d", name_tag, il);
             layer_new.body = body;
@@ -1084,8 +1215,155 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> alloc_list;
+    for (auto & [b, c] : ctx_map) {
+        alloc_list.emplace_back(b, std::move(c));
+    }
+    // LLAMA_LSA_RESIDENT=auto: size the slots per device now that the rest of the cache is known
+    int64_t lsa_auto_host_used = 0;
+    bool    lsa_auto_any_res   = false;
+    for (auto & [dev, dctx] : lsa_auto_ctx) {
+        constexpr double MiB = 1024.0*1024.0;
+        const auto & lc = llama_lsa_cfg();
+        std::vector<const lsa_auto_layer *> L;
+        for (const auto & e : lsa_auto) {
+            if (e.dev == dev) {
+                GGML_ASSERT(e.body && e.page == lsa_auto[0].page && e.stride == lsa_auto[0].stride && e.heads == lsa_auto[0].heads);
+                L.push_back(&e);
+            }
+        }
+        const auto & e0 = *L[0];
+        const char * stage_all_env = getenv("GGML_CUDA_LSA_RESIDENT_STAGE_ALL");
+        const bool stage_all = stage_all_env && atoi(stage_all_env) > 0;
+        using page_type_fn  = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t, uint32_t, uint32_t);
+        using strip_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t, size_t, uint32_t);
+        using dev_bytes_fn  = size_t (*)(ggml_backend_buffer_type_t, const ggml_tensor *);
+        auto make_buft = [&](uint32_t g) -> ggml_backend_buffer_type_t {
+            return e0.page ? reinterpret_cast<page_type_fn>(e0.get_type)(dev, e0.stride, g, e0.heads) :
+                             reinterpret_cast<strip_type_fn>(e0.get_type)(dev, e0.stride, g);
+        };
+        auto * dev_bytes = reinterpret_cast<dev_bytes_fn>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_device_bytes"));
+        llama_lsa_resident_fit_in in;
+        int64_t per_rec = 0, fixed_layer = 0;
+        if (dev_bytes) {
+            // card cost is linear in the slot count: probe 1 and 2 slots
+            auto * b1 = make_buft(1);
+            auto * b2 = make_buft(2);
+            if (b1 && b2) {
+                const int64_t d1 = (int64_t) dev_bytes(b1, e0.body), d2 = (int64_t) dev_bytes(b2, e0.body);
+                per_rec = d2 - d1;
+                fixed_layer = d1 - per_rec;
+                // Full-stage reports use the aligned layout; its five slot maps also grow past 64 records.
+                if (e0.page && stage_all) per_rec += 5*sizeof(int32_t);
+            }
+        }
+        for (const auto * e : L) {
+            in.body_bytes += (int64_t) ggml_nbytes(e->body);
+        }
+        in.slots_full  = per_rec*(int64_t) sj_kvarn_n_groups*(int64_t) L.size();
+        in.fixed_bytes = fixed_layer*(int64_t) L.size();
+        for (auto & [b, c] : alloc_list) {
+            const char * bn = ggml_backend_buft_name(b);
+            if (ggml_backend_buft_get_device(b) == dev && !ggml_backend_buft_is_host(b) &&
+                    strncmp(bn, "CUDA_QSA", 8) != 0 && strncmp(bn, "CUDA_LSA", 8) != 0) {
+                in.other_bytes += (int64_t) ggml_backend_alloc_ctx_tensors_from_buft_size(c.get(), b);
+            }
+        }
+        size_t dfree = 0, dtotal = 0;
+        ggml_backend_dev_memory(dev, &dfree, &dtotal);
+        in.free_bytes    = (int64_t) dfree;
+        if (const char * fm = getenv("LLAMA_LSA_RESIDENT_FREE_MIB")) { // test hook: emulate a smaller card's free VRAM
+            in.free_bytes = (int64_t) (strtod(fm, nullptr)*MiB);
+        }
+        const int64_t measured = in.dry_run ? 0 : llama_lsa_measured_compute(dev);
+        const auto rv = llama_lsa_resident_reserve((int64_t) (lc.resident_reserve_mib*MiB), (int64_t) (lc.resident_compute_mib*MiB),
+            lc.resident_reserve_set, lc.resident_compute_set, measured,
+            lc.resident_margin_mib >= 0.0 ? (int64_t) (lc.resident_margin_mib*MiB) : -1);
+        in.reserve_bytes = rv.reserve_bytes;
+        in.compute_bytes = rv.compute_bytes;
+        in.target_share  = lc.resident_target/100.0;
+        in.dry_run       = ctxs_bufs.no_alloc;
+        {
+            const int64_t kv = (int64_t) sj_kvarn_n_groups*sj_kvarn.group;
+            const double fs = lc.keep_frac_sched(kv);
+            const double f  = fs >= 0.0 ? fs : lc.keep_frac_for((int) e0.il);
+            const int64_t need = std::min<int64_t>(kv, (f > 0.0 ? (int64_t) (f*kv) : lc.keep) + lc.window + lc.sinks);
+            in.need_share = std::min(1.0, 1.25*(double) need/(double) std::max<int64_t>(1, kv));
+            in.keep_fit    = lc.resident_keep_fit;
+            in.keep_min    = lc.resident_keep_min;
+            in.keep_now    = std::min(1.0, (f > 0.0 ? f*kv : (double) lc.keep)/(double) std::max<int64_t>(1, kv));
+            in.fixed_share = (double) (lc.window + lc.sinks)/(double) std::max<int64_t>(1, kv);
+        }
+        using set_stage_fn = void (*)(uint32_t);
+        auto * set_stage = reinterpret_cast<set_stage_fn>(ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_lsa_resident_set_stage"));
+        if (e0.page && set_stage && (lc.resident_stage_auto || stage_all)) {
+            in.stage_auto      = true;
+            in.stage_all       = stage_all;
+            in.records         = (int64_t) sj_kvarn_n_groups;
+            in.stage_rec_bytes = (int64_t) e0.stride;
+            const char * strips = getenv("GGML_CUDA_LSA_RESIDENT_STAGE_STRIPS");
+            if (stage_all && strips && atoi(strips) > 0) {
+                in.stage_rec_bytes += int64_t(e0.heads)*4096;
+            }
+        }
+        if (FILE * f = fopen("/proc/meminfo", "r")) {
+            char line[256];
+            long long kb = 0;
+            while (fgets(line, sizeof(line), f)) {
+                if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) {
+                    in.host_avail = std::max<int64_t>(0, ((int64_t) kb << 10) - lsa_auto_host_used);
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        const auto r = llama_lsa_resident_fit(in);
+        if (r.keep_cap > 0.0 && !in.dry_run) {
+            const int64_t kv = (int64_t) sj_kvarn_n_groups*sj_kvarn.group;
+            llama_lsa_set_keep_cap(r.keep_cap, (int64_t) (r.keep_cap*(double) kv));
+        }
+        uint32_t groups = r.on ? (uint32_t) std::min<double>(sj_kvarn_n_groups, std::max(1.0, std::floor(r.share*sj_kvarn_n_groups))) : 0;
+        ggml_backend_buffer_type_t res_buft = r.on && groups < sj_kvarn_n_groups ? make_buft(groups) : nullptr;
+        if (r.on && groups >= sj_kvarn_n_groups) {
+            res_buft = nullptr; // every record would have a slot: plain card body is the same bytes, no host master
+        }
+        if (res_buft && in.stage_all) {
+            LLAMA_LOG_WARN("%s: LSA full stage: %lld records, %.1f MiB shared on the card; decode never reads host KV\n",
+                __func__, (long long) r.stage_records, r.stage_records*in.stage_rec_bytes/MiB);
+        }
+        if (res_buft && r.stage_records > 0 && set_stage && !in.dry_run && !in.stage_all) {
+            set_stage((uint32_t) r.stage_records); // read when the buffer's first record-page layer is made, below
+        }
+        char rvbuf[256];
+        char mgbuf[96] = "";
+        if (rv.margin_set) {
+            snprintf(mgbuf, sizeof(mgbuf), ", margin %.0f MiB from %s", rv.margin_bytes/MiB,
+                lc.resident_margin_from.empty() ? "LLAMA_LSA_RESIDENT_MARGIN_MIB" : lc.resident_margin_from.c_str());
+        }
+        if (rv.measured) {
+            snprintf(rvbuf, sizeof(rvbuf), "reserve %.0f / compute %.0f MiB from the memory-check pass's %.0f MiB compute buffer%s; ",
+                rv.reserve_bytes/MiB, rv.compute_bytes/MiB, measured/MiB, mgbuf);
+        } else {
+            snprintf(rvbuf, sizeof(rvbuf), "reserve %.0f / compute %.0f MiB (%s%s); ", rv.reserve_bytes/MiB, rv.compute_bytes/MiB,
+                measured > 0 ? "set by env" : "defaults, no memory-check measurement", mgbuf);
+        }
+        LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT=auto %s: %s%s -> %s (%zu layers, %u of %u %s per layer, %.0f MiB card, %.0f MiB pinned)\n",
+            __func__, ggml_backend_dev_name(dev), rvbuf, r.why.c_str(), res_buft ? "resident" : "bodies on the card", L.size(),
+            res_buft ? groups : sj_kvarn_n_groups, sj_kvarn_n_groups, e0.page ? "records" : "record strip groups",
+            (res_buft ? (double) r.card_bytes : (double) in.body_bytes)/MiB, res_buft ? in.body_bytes/MiB : 0.0);
+        if (res_buft) {
+            lsa_auto_host_used += in.body_bytes;
+        }
+        lsa_auto_any_res = lsa_auto_any_res || res_buft != nullptr;
+        alloc_list.emplace_back(res_buft ? res_buft : e0.card_buft, std::move(dctx));
+    }
+
+    lsa_res_auto_off = !lsa_auto_ctx.empty() && !lsa_auto_any_res;
+
     // allocate the tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
+    for (auto & [buft, ctx] : alloc_list) {
         ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
@@ -1783,12 +2061,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
-        if (strncmp(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_", 18) == 0) {
+        // LLAMA_LSA_RESIDENT strip buffers split the same way (pinned master on the host, slots + meta on the card)
+        if (strncmp(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_", 18) == 0 ||
+                strncmp(ggml_backend_buft_name(buft), "CUDA_LSA_Strip_", 15) == 0 ||
+                strncmp(ggml_backend_buft_name(buft), "CUDA_LSA_Page_", 14) == 0) {
             auto * dev = ggml_backend_buft_get_device(buft);
             using bytes_fn = size_t (*)(ggml_backend_buffer_type_t, const ggml_tensor *);
             auto * device_bytes = reinterpret_cast<bytes_fn>(ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_device_bytes"));
             GGML_ASSERT(device_bytes);
+            using shared_bytes_fn = size_t (*)(ggml_backend_buffer_type_t, const ggml_context *);
+            auto * shared_bytes = reinterpret_cast<shared_bytes_fn>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_qsa_resident_shared_bytes"));
+            GGML_ASSERT(shared_bytes);
+            ret[ggml_backend_dev_buffer_type(dev)] += shared_bytes(buft, ctx.get());
             ret[ggml_backend_cpu_buffer_type()] += ctxs_bufs.no_alloc ?
                 ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) : ggml_backend_buffer_get_size(buf.get());
             for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
@@ -1988,6 +2274,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
+    }
+
+    if (!sc_info.empty() || do_shift) {
+        lsa_idx_invalidate(do_shift ? "K shift" : "stream copy"); // K changes outside the graph: LSA index cache rebuilds on the next graph
     }
 
     bool updated = false;
@@ -3493,6 +3783,19 @@ ggml_tensor * llama_kv_cache::build_input_sj_kvarn_desc(ggml_context * ctx, cons
     return desc;
 }
 
+static bool sj_kvarn_tile_skip_env() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SJKVARN_TILE_SKIP");
+        const bool v = e != nullptr && atoi(e) != 0;
+        if (v) {
+            // WARN: llama-server logs drop INFO lines, gates grep for this one
+            LLAMA_LOG_WARN("%s: GGML_SJKVARN_TILE_SKIP=1: the SJ-KVaRN low-bit tile kernel skips body tiles masked -inf for every query column\n", __func__);
+        }
+        return v;
+    }();
+    return on;
+}
+
 void llama_kv_cache::set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo, int tier) const {
     GGML_ASSERT(tier == 0 || tier == 1);
     GGML_ASSERT(sj_kvarn.enabled());
@@ -3523,6 +3826,11 @@ void llama_kv_cache::set_input_sj_kvarn_desc(ggml_tensor * dst, const llama_ubat
         d[GGML_SJKVARN_DESC_TYPE_K]   = (int32_t) layers[0].k->type;
         d[GGML_SJKVARN_DESC_TYPE_V]   = (int32_t) layers[0].v->type;
         d[GGML_SJKVARN_DESC_SINK_TYPE] = sj_kvarn.sink_type == GGML_TYPE_F16 ? GGML_TYPE_F16 : 0;
+        // fork: entry 15 = per-call kernel flags (fattn-sjkvarn-lowbits-common.cuh GGML_SJKVARN_DESC_FLAGS_FORK);
+        // bit 0: GGML_SJKVARN_TILE_SKIP=1, the low-bit tile kernel skips body tiles whose mask is all -inf (opt-in)
+        // LLAMA_LSA_RESIDENT also turns it on (exact): a fully masked tile of a record that is not on the card would
+        // otherwise be read from pinned host RAM over the bus for nothing
+        d[15] = (sj_kvarn_tile_skip_env() || (llama_lsa_cfg().resident > 0.0 && !lsa_res_auto_off)) ? 1 : 0;
         if (tier == 1 && sj_kvarn_noseal) {
             // [NOSEAL] nothing of this layer is sealed: positions [sink, N) are all ring rows (the ring never wraps)
             d[GGML_SJKVARN_DESC_B]     = (int32_t) sj_kvarn.sink;
@@ -4672,6 +4980,28 @@ static void set_input_kq_mask_seq_prefix(const llama_kv_cells & cells, const lla
     }
 }
 
+// LSA probe: positions of the KV cells (single stream) and of the query rows, for the sink/window keep rule
+void llama_kv_cache::set_input_lsa_pos(ggml_tensor * cell_pos, ggml_tensor * q_pos, const llama_ubatch * ubatch) const {
+    const int64_t n_kv     = cell_pos->ne[0];
+    const int64_t n_tokens = q_pos->ne[1];
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_F32 && q_pos->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_tokens == (int64_t) ubatch->n_tokens);
+
+    const auto & cells = v_cells.at(seq_to_stream[ubatch->seq_id[0][0]]);
+
+    std::vector<float> cp(n_kv);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        cp[j] = j < (int64_t) cells.size() && !cells.is_empty(j) ? (float) cells.pos_get(j) : 1e9f;
+    }
+    ggml_backend_tensor_set(cell_pos, cp.data(), 0, n_kv*sizeof(float));
+
+    std::vector<float> qp(n_tokens);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        qp[i] = (float) ubatch->pos[i];
+    }
+    ggml_backend_tensor_set(q_pos, qp.data(), 0, n_tokens*sizeof(float));
+}
+
 // the dense (column = cell) KQ mask fill with this fork's fast paths; set_input_attn_mask() is the upstream entry point
 // rows != nullptr: upstream kv_rows (column c is cell rows[c]); the fork's fast paths and the [#175] bit mask then stay off
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
@@ -5252,6 +5582,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     scratch_cancel();
+    lsa_idx_invalidate("state_read"); // restored K bypasses the graph: LSA index cache rebuilds on the next graph
     if (sj_kvarn.enabled() && !other) {
         // see the matching refusal in state_read_sinfo (block KV streaming is refused at construction anyway)
         if (kv_stream_runtime.runtime != nullptr) {
@@ -6360,7 +6691,41 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
+void llama_kv_cache::lsa_idx_invalidate(const char * why) const {
+    std::vector<const ggml_tensor *> ks;
+    ks.reserve(layers.size());
+    for (const auto & l : layers) {
+        if (l.k) {
+            ks.push_back(l.k);
+        }
+        for (const auto * t : l.k_stream) {
+            ks.push_back(t);
+        }
+    }
+    if (ks.empty()) {
+        return; // no layers here: nothing of this cache is indexed (never the global rule, see llama_lsa_idx_invalidate)
+    }
+    llama_lsa_idx_invalidate(ks.data(), ks.size(), why);
+}
+
+void llama_kv_cache::lsa_idx_forget() const {
+    std::vector<const ggml_tensor *> ks;
+    for (const auto & l : layers) {
+        if (l.shared) {
+            continue;
+        }
+        if (l.k) {
+            ks.push_back(l.k);
+        }
+        for (const auto * t : l.k_stream) {
+            ks.push_back(t);
+        }
+    }
+    llama_lsa_idx_forget(ks.data(), ks.size());
+}
+
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+    lsa_idx_invalidate("state_read_data");
     auto & cells = v_cells[strm];
 
     // batch the scatter reads per contiguous run of destination indices
@@ -6761,6 +7126,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_kv_size() const {
+    return kv->get_size();
+}
+
 bool llama_kv_cache_context::has_kv_stream_targets() const {
     return kv->has_kv_stream_targets();
 }
@@ -6929,6 +7298,10 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_lsa_pos(ggml_tensor * cell_pos, ggml_tensor * q_pos, const llama_ubatch * ubatch) const {
+    kv->set_input_lsa_pos(cell_pos, q_pos, ubatch);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

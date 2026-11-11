@@ -1,7 +1,99 @@
 #include "sjkvarn-seal.cuh"
 #include "qsa-resident.cuh"
 #include "turbo-quant.cuh"
+#include "sjkvarn-lowbits.cuh"
 #include "../ggml-sjkvarn.h"
+
+// Pack gathers device bytes into coalesced host stores; unpack reads full host sectors before device scatter.
+static __global__ void sj_kvarn_strip_master_copy(uint8_t * master, size_t master_records, uint8_t * canonical,
+        size_t n_records, const int32_t * record_ids, sj_kvarn_lowbits::strip_master_layout l, bool pack) {
+    for (size_t i = blockIdx.x; i < n_records; i += gridDim.x) {
+        const int32_t record = record_ids[i];
+        if (record < 0 || size_t(record) >= master_records) {
+            __trap();
+            return;
+        }
+        uint8_t * out = master + size_t(record)*size_t(l.bytes);
+        uint8_t * in = canonical + i*size_t(l.canonical_bytes);
+        for (int q = threadIdx.x; q < l.bytes/16; q += blockDim.x) {
+            uint4 value;
+            uint8_t * bytes = reinterpret_cast<uint8_t *>(&value);
+            if (pack) {
+                for (int b = 0; b < 16; ++b) {
+                    const int from = sj_kvarn_lowbits::strip_master_source_byte(l, q*16 + b);
+                    bytes[b] = from < 0 ? 0 : in[from];
+                }
+                reinterpret_cast<uint4 *>(out)[q] = value;
+            } else {
+                value = reinterpret_cast<const uint4 *>(out)[q];
+                for (int b = 0; b < 16; ++b) {
+                    const int from = sj_kvarn_lowbits::strip_master_source_byte(l, q*16 + b);
+                    // History is duplicated; only its unique payload byte may write the canonical result.
+                    if (from >= 0 && sj_kvarn_lowbits::strip_master_byte(l, from) == q*16 + b) in[from] = bytes[b];
+                }
+            }
+        }
+    }
+}
+
+bool ggml_cuda_sj_kvarn_strip_master_copy(ggml_backend_cuda_context & ctx, void * master, size_t master_records,
+        void * canonical, size_t n_records, const int32_t * record_ids, int bits_k, int bits_v, bool pack) {
+    sj_kvarn_lowbits::strip_master_layout l;
+    size_t logical, physical;
+    if (!sj_kvarn_lowbits::make_strip_master_layout(bits_k, bits_v, l) || n_records > master_records ||
+        master_records > size_t(INT32_MAX) ||
+        !sj_kvarn_lowbits::strip_master_records_size(l, master_records, logical, physical)) return false;
+    if (!n_records) return true;
+    if (!master || !canonical || !record_ids || reinterpret_cast<uintptr_t>(master)%16 ||
+        reinterpret_cast<uintptr_t>(canonical)%16 || reinterpret_cast<uintptr_t>(record_ids)%alignof(int32_t)) return false;
+    const unsigned blocks = unsigned(n_records < 65535 ? n_records : 65535);
+    sj_kvarn_strip_master_copy<<<blocks, 128, 0, ctx.stream()>>>(static_cast<uint8_t *>(master), master_records,
+        static_cast<uint8_t *>(canonical), n_records, record_ids, l, pack);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+static __global__ void sj_kvarn_strip_master_stage(const uint8_t * master, size_t master_records, uint8_t * stage,
+        size_t n_records, const int32_t * record_ids, const uint8_t * masks, sj_kvarn_lowbits::strip_master_layout l) {
+    for (size_t i = blockIdx.x; i < n_records; i += gridDim.x) {
+        const int32_t record = record_ids[i];
+        if (record < 0 || size_t(record) >= master_records) {
+            __trap();
+            return;
+        }
+        const uint8_t * src = master + size_t(record)*size_t(l.bytes);
+        uint8_t * dst = stage + i*size_t(l.bytes);
+        const uint8_t wanted = masks[i];
+        for (int q = threadIdx.x; q < 1536/16; q += blockDim.x) {
+            reinterpret_cast<uint4 *>(dst)[q] = reinterpret_cast<const uint4 *>(src)[q];
+        }
+        int rank = 0;
+        for (int s = 0; s < 8; ++s) {
+            if (!(wanted & (1u << s))) continue;
+            const uint4 * in = reinterpret_cast<const uint4 *>(src + 1536 + s*l.strip_bytes);
+            uint4 * out = reinterpret_cast<uint4 *>(dst + 1536 + rank++*l.strip_bytes);
+            for (int q = threadIdx.x; q < l.strip_bytes/16; q += blockDim.x) out[q] = in[q];
+        }
+    }
+}
+
+bool ggml_cuda_sj_kvarn_strip_master_stage(ggml_backend_cuda_context & ctx, const void * master, size_t master_records,
+        void * stage, size_t stage_capacity, size_t n_records, const int32_t * record_ids, const uint8_t * masks,
+        int bits_k, int bits_v) {
+    sj_kvarn_lowbits::strip_master_layout l;
+    size_t logical, physical;
+    if (!sj_kvarn_lowbits::make_strip_master_layout(bits_k, bits_v, l) || master_records > size_t(INT32_MAX) ||
+        !sj_kvarn_lowbits::strip_master_records_size(l, master_records, logical, physical) ||
+        n_records > SIZE_MAX/size_t(l.bytes) || stage_capacity < n_records*size_t(l.bytes)) return false;
+    if (!n_records) return true;
+    if (!master_records || !master || !stage || !record_ids || !masks || reinterpret_cast<uintptr_t>(master)%16 ||
+        reinterpret_cast<uintptr_t>(stage)%16 || reinterpret_cast<uintptr_t>(record_ids)%alignof(int32_t)) return false;
+    const unsigned blocks = unsigned(n_records < 65535 ? n_records : 65535);
+    sj_kvarn_strip_master_stage<<<blocks, 128, 0, ctx.stream()>>>(static_cast<const uint8_t *>(master), master_records,
+        static_cast<uint8_t *>(stage), n_records, record_ids, masks, l);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
 
 // One block per (record, tile): blockIdx.x = 2*record + is_V. The fp16 tile lives in shared memory
 // token-major ([G][D], exactly the source rows); the balanced value cur(r, c) = M(r, c) / s_col[c] / s_row[r]
@@ -149,7 +241,39 @@ struct sj_kvarn_seal_params {
     size_t k_payload, v_payload, k_scale, k_zero, k_tok, v_ch, v_scale, v_zero;
     size_t k_nb1, v_nb1; // bytes per token row of the sources
     int n_groups_max;    // > 0: descriptor-driven (dynamic) seal
+    bool compact_output;
+    int source_rows;
+    size_t master_records, desc_entries;
 };
+
+static __device__ int sj_kvarn_strip_seal_location(const int32_t * desc, const sj_kvarn_seal_params & p,
+        int local, int & row, int & record) {
+    const bool paged = desc[GGML_SJKVARN_DESC_TABLE] != 0;
+    return sj_kvarn_lowbits::strip_master_seal_location(desc[GGML_SJKVARN_DESC_S], desc[GGML_SJKVARN_DESC_CAP],
+        desc[GGML_SJKVARN_DESC_B], desc[GGML_SJKVARN_DESC_B_OLD], p.source_rows, p.n_groups_max,
+        paged ? desc + GGML_SJKVARN_DESC_N_ENTRIES : nullptr, p.desc_entries - GGML_SJKVARN_DESC_N_ENTRIES,
+        p.master_records, p.hkv, local, row, record);
+}
+
+static __global__ void sj_kvarn_strip_pack_sealed(uint8_t * master, const uint8_t * scratch,
+        const int32_t * desc, sj_kvarn_seal_params p, sj_kvarn_lowbits::strip_master_layout l) {
+    const int local = blockIdx.x;
+    int row, record;
+    const int active = sj_kvarn_strip_seal_location(desc, p, local, row, record);
+    if (active < 0) { __trap(); return; }
+    if (!active) return;
+    const uint8_t * src = scratch + size_t(local)*size_t(l.canonical_bytes);
+    uint4 * dst = reinterpret_cast<uint4 *>(master + size_t(record)*size_t(l.bytes));
+    for (int q = threadIdx.x; q < l.bytes/16; q += blockDim.x) {
+        uint4 value;
+        uint8_t * bytes = reinterpret_cast<uint8_t *>(&value);
+        for (int b = 0; b < 16; ++b) {
+            const int from = sj_kvarn_lowbits::strip_master_source_byte(l, q*16 + b);
+            bytes[b] = from < 0 ? 0 : src[from];
+        }
+        dst[q] = value;
+    }
+}
 
 static __device__ __forceinline__ float sj_kvarn_cur(const half * tile, const float * s_row, const float * s_col,
                                                   const int r, const int c, const int sr, const int sc) {
@@ -432,7 +556,12 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
     const int  tid = threadIdx.x;
     int rec  = blockIdx.x >> 1; // record index into body
     int row0;                   // first source token row of the group
-    if (desc == nullptr) {
+    if (p.compact_output) {
+        int physical;
+        const int active = sj_kvarn_strip_seal_location(desc, p, rec, row0, physical);
+        if (active < 0) { __trap(); return; }
+        if (!active) return;
+    } else if (desc == nullptr) {
         row0 = (rec / p.hkv)*G;
     } else {
         const int S     = desc[GGML_SJKVARN_DESC_S];
@@ -727,13 +856,14 @@ bool ggml_cuda_sj_kvarn_seal_supported(const ggml_tensor * op) {
     return true;
 }
 
-void ggml_cuda_sj_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_qsa_resident_invalidate(ctx, dst);
+static void sj_kvarn_seal_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        void * master = nullptr, size_t master_records = 0) {
+    if (!master) ggml_cuda_qsa_resident_invalidate(ctx, dst);
     const ggml_tensor * k = dst->src[0];
     const ggml_tensor * v = dst->src[1];
     GGML_ASSERT(ggml_cuda_sj_kvarn_seal_supported(dst));
 
-    sj_kvarn_seal_params p;
+    sj_kvarn_seal_params p{};
     p.D      = ggml_get_op_params_i32(dst, 0);
     p.G      = ggml_get_op_params_i32(dst, 1);
     p.bits_k = ggml_get_op_params_i32(dst, 2);
@@ -796,9 +926,58 @@ void ggml_cuda_sj_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     if (tr3) {
         p.tr3_arg = tr3_arg_alloc.alloc((size_t) 2*n_rec*(SJKVARN_SEAL_THREADS/32)*SJKVARN_TR3_ARGW);
     }
+    ggml_cuda_pool_alloc<uint8_t> scratch(ctx.pool());
+    uint8_t * output = static_cast<uint8_t *>(dst->data);
+    if (master) {
+        p.compact_output = true;
+        p.master_records = master_records;
+        p.desc_entries = size_t(ggml_nelements(desc));
+        p.source_rows = int(std::min(k->ne[1], v->ne[1]));
+        output = scratch.alloc(size_t(n_rec)*p.rec_bytes);
+    }
     k_sj_kvarn_seal<<<2*n_rec, SJKVARN_SEAL_THREADS, smem, ctx.stream()>>>(
-        (const char *) k->data, (const char *) v->data, (uint8_t *) dst->data,
+        (const char *) k->data, (const char *) v->data, output,
         p.n_groups_max > 0 ? (const int32_t *) desc->data : nullptr, p);
     CUDA_CHECK(cudaGetLastError());
-    ggml_cuda_qsa_clock_refresh(ctx, dst);
+    if (master) {
+        sj_kvarn_lowbits::strip_master_layout ml;
+        GGML_ASSERT(sj_kvarn_lowbits::make_strip_master_layout(p.bits_k, p.bits_v, ml));
+        sj_kvarn_strip_pack_sealed<<<n_rec, 128, 0, ctx.stream()>>>(static_cast<uint8_t *>(master), output,
+            static_cast<const int32_t *>(desc->data), p, ml);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        ggml_cuda_qsa_clock_refresh(ctx, dst);
+    }
+}
+
+void ggml_cuda_sj_kvarn_seal(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_qsa_clock_seal_strip_master(ctx, dst)) return;
+    sj_kvarn_seal_impl(ctx, dst);
+}
+
+bool ggml_cuda_sj_kvarn_seal_strip_master(ggml_backend_cuda_context & ctx, ggml_tensor * op,
+        void * master, size_t master_records, size_t master_capacity) {
+    const char * enabled = getenv("GGML_CUDA_LSA_RESIDENT_STRIP_MASTER");
+    if (!enabled || strcmp(enabled, "1") || !op || !op->src[0] || !op->src[1] ||
+        !ggml_cuda_sj_kvarn_seal_supported(op)) return false;
+    const auto * k = op->src[0];
+    const auto * v = op->src[1];
+    const auto * desc = op->src[2];
+    const int groups = ggml_get_op_params_i32(op, 5);
+    const int64_t heads = k->ne[0]/256;
+    sj_kvarn_lowbits::strip_master_layout l;
+    size_t canonical, physical;
+    if (ggml_get_op_params_i32(op, 0) != 256 || ggml_get_op_params_i32(op, 1) != 128 ||
+        ggml_get_op_params_i32(op, 7) != GGML_TYPE_I16 || !sj_kvarn_tr3::tokens() ||
+        !sj_kvarn_lowbits::make_strip_master_layout(ggml_get_op_params_i32(op, 2), ggml_get_op_params_i32(op, 3), l) ||
+        !master || !master_records || reinterpret_cast<uintptr_t>(master)%16 || master_records > size_t(INT32_MAX) ||
+        !sj_kvarn_lowbits::strip_master_records_size(l, master_records, canonical, physical) || master_capacity < physical ||
+        !heads || master_records%heads || groups <= 0 || groups > INT32_MAX/(2*heads) ||
+        size_t(groups)*size_t(heads) > SIZE_MAX/size_t(l.canonical_bytes) ||
+        k->ne[0] != v->ne[0] || k->ne[0]%256 || k->ne[1] > INT32_MAX || v->ne[1] > INT32_MAX ||
+        !k->data || !v->data || !desc || !desc->data || reinterpret_cast<uintptr_t>(desc->data)%alignof(int32_t) ||
+        desc->type != GGML_TYPE_I32 || !ggml_is_contiguous(desc) ||
+        ggml_nelements(desc) < GGML_SJKVARN_DESC_N_ENTRIES || ggml_nbytes(op) != canonical) return false;
+    sj_kvarn_seal_impl(ctx, op, master, master_records);
+    return true;
 }

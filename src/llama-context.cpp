@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-lsa.h"
 #include "llama-moe-arena.h"
 #include "llama-sampler.h"
 
@@ -845,6 +846,9 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         } else if (model.arch == LLM_ARCH_QWEN4EXP) {
             LLAMA_LOG_WARN("%s: LLAMA_KV_ROWS=1 ignored: kv_rows cannot be combined with QSA selected rows\n", __func__);
             cparams.auto_fkvr = false;
+        } else if (llama_lsa_cfg().mode != llama_lsa_config::OFF) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_ROWS=1 ignored: kv_rows cannot be combined with LSA (LLAMA_LSA)\n", __func__);
+            cparams.auto_fkvr = false;
         } else {
             cparams.auto_fkvr = cparams.kv_unified;
         }
@@ -1005,10 +1009,20 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                     break;
             }
             ok = ok && cparams.flash_attn && cparams.kv_stream_arena_mib == 0 && !model.hparams.use_alibi;
+            // the LSA probe edits an f16 mask: LLAMA_LSA_PACKED=1 gives the LSA layers their own f16 input and keeps the
+            // packed mask for the rest; otherwise the whole context uses the f16 mask while LSA is on
+            ok = ok && (llama_lsa_cfg().mode == llama_lsa_config::OFF || llama_lsa_cfg().packed);
             cparams.kq_mask_packed = ok;
             if (env) {
                 LLAMA_LOG_INFO("%s: packed KQ mask       = %s\n", __func__, ok ? "on" : "off");
             }
+        }
+
+        // LSA config at WARN once per context: the config static is first built inside the server's memory-fit dry
+        // run, whose logger demotes WARN to DEBUG, so a line logged only there never reaches server.log
+        if (llama_lsa_cfg().mode != llama_lsa_config::OFF) {
+            LLAMA_LOG_WARN("%s: LSA probe ON (lossy): %s\n", __func__, llama_lsa_describe().c_str());
+            llama_lsa_log_epoch_bump(); // one-shot graph-build lines fire again for this context
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -2798,6 +2812,11 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
         if (!model.no_alloc()) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
             backend_buf_exp_epoch   = ggml_backend_sched_get_alloc_epoch(sched.get());
+        }
+        if (model.no_alloc() && llama_lsa_cfg().resident_auto) {
+            // LLAMA_LSA_RESIDENT=auto: the memory-check pass measured this device's compute buffer; the real context's
+            // resident sizing uses it instead of the default reserve
+            llama_lsa_note_compute(ggml_backend_buft_get_device(buft), (int64_t) backend_buf_exp_size[i]);
         }
         if (backend_buf_exp_size[i] > 1) {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__, ggml_backend_buft_name(buft),
@@ -9053,6 +9072,9 @@ class llama_io_read_file : public llama_io_read_i {
 
     size_t n_bytes() override { return size_read; }
 
+    // the sequence/session data runs to the end of the file, so an optional suffix section can be detected
+    size_t n_left() override { return file->size() - file->tell(); }
+
   private:
     llama_file *         file;
     size_t               size_read = 0;
@@ -9364,6 +9386,11 @@ class llama_io_read_device : public llama_io_read_i {
 
     size_t n_bytes() override {
         return size_read;
+    }
+
+    // host-side bytes left (tensor bytes live in the device copies), enough to detect an optional suffix header
+    size_t n_left() override {
+        return buf_size;
     }
 
   private:

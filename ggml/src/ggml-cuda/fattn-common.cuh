@@ -74,6 +74,7 @@ struct fattn_sj_kvarn_ctx {
     const char * resident = nullptr;
     const int32_t * resident_tags = nullptr;
     const ggml_cuda_qsa_clock_map * resident_map = nullptr;
+    const ggml_cuda_qsa_clock_map * strip_map = nullptr; // LLAMA_LSA_RESIDENT: 16-cell strip slots (stream kernel only)
     int resident_head = 0;
     uint32_t resident_slots = 0;
     int rec_stride;      // n_head_kv * rec_bytes
@@ -124,6 +125,12 @@ static __device__ __forceinline__ fattn_sj_kvarn_ctx fattn_sj_kvarn_make_ctx(
         c.resident_map = map;
         c.resident_head = z_KV;
         c.resident_slots = map->slots;
+        body = map->host;
+    } else if ((reinterpret_cast<uintptr_t>(body) & 3) == 2) {
+        // LSA strip slots: the stream kernel reads resident strips through strip_map; every other read uses the master
+        const auto * map = reinterpret_cast<const ggml_cuda_qsa_clock_map *>(reinterpret_cast<uintptr_t>(body) & ~uintptr_t(3));
+        c.strip_map = map;
+        c.resident_head = z_KV;
         body = map->host;
     } else if (reinterpret_cast<uintptr_t>(body) & 1) {
         const auto * map = reinterpret_cast<const ggml_cuda_qsa_resident_map *>(reinterpret_cast<uintptr_t>(body) & ~uintptr_t(1));
@@ -1533,7 +1540,8 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const int blocks_per_tile,
         const uint3 fd_iter_j_z_ne12,
         const uint3 fd_iter_j_z,
-        const uint3 fd_iter_j) {
+        const uint3 fd_iter_j,
+        float * __restrict__ lse = nullptr) { // fork (LSA compensation): [H, T, S] row log-sum-exp, combine-kernel row order
     using query_layout = ggml_fattn_query_layout<ncols1, ncols2, compact_q5g6>;
 
     const int jc = blockIdx.y*ncols2 + blockIdx.z;
@@ -1597,6 +1605,11 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         rowsum  = scale_val*rowsum  + scale_add*tmp.y;
 
         max_val = max_val_new;
+    }
+
+    if (lse != nullptr && tid == 0) {
+        const int row = (sequence*ne01 + jt*query_layout::token_step + j)*ne02 + zt_Q + c;
+        lse[row] = rowsum > 0.0f ? max_val + logf(rowsum) : -INFINITY;
     }
 
     // Write back final result:
@@ -1720,7 +1733,8 @@ static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
         const float2 * __restrict__ VKQ_meta,
         float * __restrict__ dst,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        float * __restrict__ lse = nullptr) {
     // Dimension 0: threadIdx.x
     // Dimension 1: blockIdx.x
     // Dimension 2: blockIdx.y
@@ -1763,6 +1777,9 @@ static __global__ void flash_attn_combine_results(
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
+    if (lse != nullptr && tid == 0) { // fork: [H, T, S] row log-sum-exp, same row order as dst
+        lse[j_dst_unrolled] = VKQ_denominator > 0.0f ? kqmax + logf(VKQ_denominator) : -INFINITY;
+    }
 
     if constexpr (rot) {
         static_assert(D == 256, "plain H256");
@@ -1776,6 +1793,9 @@ static __global__ void flash_attn_combine_results(
 // fork: device pointer to one KV bound (multiple of FATTN_KQ_STRIDE) for a single-query-tile, single-sequence launch
 // that neither scans its mask nor uses sparse indices; set by the SJ compact path around its f16 attention call.
 inline thread_local const int * ggml_cuda_fattn_kv_max_override = nullptr;
+// fork: SJ-KVaRN live-record list ([0] = count, then the live body record ids in order) for the stream decode kernel,
+// passed in its KV_max slot; set around the launch by the opt-in record skip (GGML_SJKVARN_LIVE_RECORDS=1).
+inline thread_local const int * ggml_cuda_fattn_sj_live_records = nullptr;
 
 template <int DV, int ncols1, int ncols2, bool compact_q5g6 = false>
 void launch_fattn(
@@ -1803,7 +1823,7 @@ void launch_fattn(
 
     const ggml_tensor * mask    = dst->src[3];
     const ggml_tensor * sinks   = dst->src[4];
-    const ggml_tensor * kv_rows = dst->src[9]; // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
+    const ggml_tensor * kv_rows = ggml_flash_attn_ext_get_kv_rows(dst); // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
 
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
@@ -1991,6 +2011,10 @@ void launch_fattn(
         GGML_ASSERT(K->ne[1] % FATTN_KQ_STRIDE == 0 && FATTN_KQ_STRIDE % nbatch_fa == 0);
         kv_max_ptr = ggml_cuda_fattn_kv_max_override;
     }
+    if (ggml_cuda_fattn_sj_live_records != nullptr) {
+        GGML_ASSERT(is_sj_kvarn && !use_sparse && !scan_mask && ggml_cuda_fattn_kv_max_override == nullptr);
+        kv_max_ptr = ggml_cuda_fattn_sj_live_records;
+    }
 
     // [ROUNDFIX] dead-tile bits for the compressed-KV MMA kernel (passed in the SJ-KVaRN descriptor slot).
     if (skip_dead_tiles && mask && !use_sparse && !is_sj_kvarn && !kv_rows && stream_k && !need_f16_K && !need_f16_V &&
@@ -2023,6 +2047,10 @@ void launch_fattn(
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
+    // fork (LSA compensation): a stream-k launch writes the LSE output in the uniform fixup, so every output tile must be split
+    // into the same number (>= 2) of blocks; the launch below forces that shape only when an LSE output is requested.
+    const bool stream_k_lse = stream_k && ggml_flash_attn_ext_get_lse(KQV) != nullptr;
+    GGML_ASSERT((!stream_k_lse || ntiles_KV >= 2) && "FA LSE output: stream-k needs >= 2 KV tiles");
     if (stream_k) {
         // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
         const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
@@ -2044,7 +2072,7 @@ void launch_fattn(
         };
 
         const int  max_blocks   = max_blocks_per_sm*nsm;
-        const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
+        const bool use_stream_k = stream_k_lse || should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -2063,7 +2091,7 @@ void launch_fattn(
                 ? nblocks_stream_k_rounded
                 : nblocks_stream_k_raw;
 
-            blocks_num.x = nblocks_stream_k;
+            blocks_num.x = stream_k_lse ? std::max(2, nblocks_stream_k_raw / ntiles_dst) * ntiles_dst : nblocks_stream_k;
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
@@ -2109,6 +2137,12 @@ void launch_fattn(
             ggml_get_op_params_i32(KQV, 7) == GGML_TYPE_F32 && K->type == GGML_TYPE_TQ6_0 && V->type == GGML_TYPE_TQ6_0) {
             parallel_blocks = ggml_cuda_sj_fill_split(nsm, max_blocks_per_sm, ntiles_dst, ntiles_KV,
                                                      n_kv, sj_fill_kv_splits, ggml_nrows(KQV));
+        }
+
+        // fork (LSA compensation): an LSE output (src[9]) is written by the parallel-block combine, so keep >= 2 blocks
+        if (ggml_flash_attn_ext_get_lse(KQV) != nullptr) {
+            GGML_ASSERT(!output_partial && ntiles_KV >= 2 && "FA LSE output needs the parallel-block combine");
+            parallel_blocks = std::max(parallel_blocks, 2);
         }
 
         if (output_partial) {
@@ -2193,8 +2227,10 @@ void launch_fattn(
                 <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
-                 gqa_ratio, bpt, fd0, fd1, fd2);
+                 gqa_ratio, bpt, fd0, fd1, fd2,
+                 stream_k_lse ? (float *) KQV->src[9]->data : nullptr);
         } else if (ntiles_dst % blocks_num.x != 0) {
+            GGML_ASSERT(!stream_k_lse);
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
             const int total_work = ntiles_KV * ntiles_dst;
 
@@ -2221,14 +2257,16 @@ void launch_fattn(
             if constexpr (DV == 256) {
                 flash_attn_combine_results<DV, true>
                     <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
-                    (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+                    (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks,
+                     ggml_flash_attn_ext_get_lse(KQV) ? (float *) KQV->src[9]->data : nullptr);
             } else {
                 GGML_ABORT("SJ-KVaRN fused rotation needs DV == 256");
             }
         } else {
         flash_attn_combine_results<DV>
             <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
-            (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks,
+                     ggml_flash_attn_ext_get_lse(KQV) ? (float *) KQV->src[9]->data : nullptr);
         }
     }
     CUDA_CHECK(cudaGetLastError());

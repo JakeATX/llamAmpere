@@ -14,6 +14,8 @@ struct ggml_cuda_qsa_resident_map {
 bool ggml_cuda_qsa_resident_is_buft(ggml_backend_buffer_type_t buft);
 ggml_backend_buffer_type_t ggml_backend_cuda_qsa_resident_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots);
 size_t ggml_backend_cuda_qsa_resident_device_bytes(ggml_backend_buffer_type_t buft, const ggml_tensor * body);
+size_t ggml_backend_cuda_qsa_resident_shared_bytes(ggml_backend_buffer_type_t buft, const ggml_context * ctx);
+void ggml_backend_cuda_lsa_resident_set_stage(uint32_t records); // RESIDENT=auto stage size (records); env STAGE wins
 const char * ggml_cuda_qsa_resident_body(const ggml_tensor * body);
 void ggml_cuda_qsa_resident_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 void ggml_cuda_qsa_resident_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * body);

@@ -1,8 +1,12 @@
 #include "qsa-resident-clock.cuh"
 #include "ggml-backend-impl.h"
 #include "../ggml-sjkvarn.h"
+#include "../ggml-lsa-recall.h"
+#include "sjkvarn-lowbits.cuh"
+#include "sjkvarn-seal.cuh"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -17,14 +21,123 @@ struct qsa_clock_type {
     uint32_t slots;
     uint32_t group;
     uint32_t heads;
+    uint32_t cells; // GGML_QSA_PAGE_CELLS or GGML_LSA_STRIP_CELLS
     int device;
     std::string name;
 };
 
+// bytes of one page of one KV head in a slot, and of one record's card meta per head (record pages need no meta)
+static __host__ __device__ inline size_t qsa_page_head_bytes(const ggml_cuda_qsa_clock_map & m) {
+    return m.cells == GGML_LSA_STRIP_CELLS ? GGML_LSA_STRIP_HEAD_BYTES : m.cells == GGML_LSA_PAGE_CELLS ? m.stride/m.heads : GGML_QSA_PAGE_HEAD_BYTES;
+}
+static __host__ __device__ inline size_t qsa_meta_head_bytes(const ggml_cuda_qsa_clock_map & m) {
+    return m.cells == GGML_LSA_PAGE_CELLS ? 0 : GGML_QSA_META_HEAD_BYTES;
+}
+
 struct qsa_clock_tensor {
     ggml_cuda_qsa_clock_map map{};
+    char * host = nullptr; // host address of the root tensor; map.host is a device mapping
     ggml_cuda_qsa_clock_map * device_map = nullptr;
+    int device = -1;
+    // GGML_CUDA_LSA_PREFETCH (opt-in, record pages): the previous LSA layer's pick fills this layer's slots on a side
+    // stream; pf_done joins it back before this layer's seal refresh or resolve touches the map.
+    cudaEvent_t pf_done = nullptr;
+    bool pf_pending = false;
+    uint32_t * recall_history = nullptr; // diagnostic only: previous visible end, resolve, then strip bits per page
+    size_t recall_pages = 0;
 };
+
+// GGML_CUDA_LSA_PREFETCH=<records> (0/unset = off): most records one layer's pick may prefetch into the next LSA
+// layer's slots per step. Output never depends on residency (a record without a slot is read from the master).
+static int lsa_prefetch_cap() {
+    static const int cap = [] {
+        const char * v = getenv("GGML_CUDA_LSA_PREFETCH");
+        return v ? std::max(0, atoi(v)) : 0;
+    }();
+    return cap;
+}
+// GGML_CUDA_LSA_RESIDENT_FETCH=N (opt-in): copy at most N missed record pages into slots per resolve; the other misses
+// are read straight from the pinned master (same bytes over the link, no slot write and no extra launch work). When the
+// slots are smaller than one step's read set, CLOCK otherwise evicts pages the next step reads again (af1: 40% of the
+// records on the card = 43.7 vs 14.4 ms/token). 0 or unset = up to the slot count (unchanged).
+static uint32_t lsa_fetch_cap(uint32_t slots) {
+    static const int cap = [] {
+        const char * v = getenv("GGML_CUDA_LSA_RESIDENT_FETCH");
+        return v ? std::max(0, atoi(v)) : 0;
+    }();
+    return cap > 0 ? std::min<uint32_t>(slots, uint32_t(cap)) : slots;
+}
+// GGML_CUDA_LSA_RESIDENT_ADMIT=1 (opt-in): a missed page gets a slot only if this layer's previous resolve picked it too;
+// one-step picks are read from the master. Output never depends on residency, so either knob changes speed only.
+static bool lsa_admit_filter() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_LSA_RESIDENT_ADMIT");
+        return v && atoi(v) > 0;
+    }();
+    return on;
+}
+// GGML_CUDA_LSA_RESIDENT_STAGE=<records> (opt-in, record pages): size of the per-buffer on-card staging area for picked
+// records that get no CLOCK slot (past the slots, not admitted, or every slot protected by the pick). They are copied in
+// by the streaming page copy each resolve instead of being read by the low-bit attention kernel over the bus (kf3: the
+// 40%-slot case reads ~18 MiB per layer per step past the slots at ~3.4 GB/s; the page copy moves ~12 GB/s). Same bytes
+// either way, so output never depends on it. 0 or unset = no stage, unless STAGE_ALL is on.
+// RESIDENT=auto may size it instead (ggml_backend_cuda_lsa_resident_set_stage, called before the KV buffers are made);
+// the env value wins, except STAGE_ALL=1 forces room for every record in one layer.
+static uint32_t lsa_stage_auto_n = 0;
+void ggml_backend_cuda_lsa_resident_set_stage(uint32_t records) {
+    lsa_stage_auto_n = std::max(lsa_stage_auto_n, records);
+}
+static uint32_t lsa_stage_cap() {
+    static const int64_t env = [] {
+        const char * v = getenv("GGML_CUDA_LSA_RESIDENT_STAGE");
+        return v ? int64_t(std::max(0, atoi(v))) : int64_t(-1);
+    }();
+    return env >= 0 ? uint32_t(env) : lsa_stage_auto_n;
+}
+static bool lsa_stage_all() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_LSA_RESIDENT_STAGE_ALL");
+        return v && atoi(v) > 0;
+    }();
+    return on;
+}
+
+static bool lsa_copy_wide() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_LSA_RESIDENT_COPY_WIDE");
+        return v && atoi(v) > 0;
+    }();
+    return on;
+}
+static bool lsa_stage_strips() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_LSA_RESIDENT_STAGE_STRIPS");
+        return v && atoi(v) > 0;
+    }();
+    return lsa_stage_all() && on;
+}
+static bool lsa_overflow_log() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_LSA_RESIDENT_OVERFLOW_LOG");
+        return v && atoi(v) > 0;
+    }();
+    return lsa_stage_all() && on;
+}
+static size_t lsa_stage_stride(size_t stride, uint32_t heads) {
+    GGML_ASSERT(heads > 0 && stride <= SIZE_MAX - size_t(heads)*4096);
+    return lsa_stage_strips() ? stride + size_t(heads)*4096 : stride;
+}
+static std::mutex lsa_pf_mutex;
+static std::vector<qsa_clock_tensor *> lsa_pf_entries; // record-page entries, for the next-layer lookup
+static cudaStream_t lsa_pf_stream[GGML_CUDA_MAX_DEVICES] = {};
+static cudaEvent_t lsa_pf_fork[GGML_CUDA_MAX_DEVICES] = {};
+
+static void lsa_pf_join(cudaStream_t stream, qsa_clock_tensor * e) {
+    if (e && e->pf_pending) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, e->pf_done, 0));
+        e->pf_pending = false;
+    }
+}
 
 struct qsa_clock_buffer {
     void * host = nullptr;
@@ -36,6 +149,8 @@ struct qsa_clock_buffer {
     size_t pool_size = 0, pool_used = 0;
     bool pool_tried = false;
     std::vector<void *> blocks;
+    char * stage = nullptr; // GGML_CUDA_LSA_RESIDENT_STAGE: shared by this buffer's record-page layers
+    size_t stage_bytes = 0;
 };
 
 // Carve one layer's device maps from base (nullptr: size only). Every piece is 256-byte aligned.
@@ -46,20 +161,36 @@ static size_t qsa_clock_layout(ggml_cuda_qsa_clock_map & m, ggml_cuda_qsa_clock_
         off += (bytes + 255) & ~size_t(255);
         return p;
     };
-    char * card = take(size_t(m.slots)*m.heads*GGML_QSA_PAGE_HEAD_BYTES);
-    char * meta = take(size_t(m.records)*m.heads*GGML_QSA_META_HEAD_BYTES);
-    char * table = take(size_t(m.records)*(m.group/4)*sizeof(int32_t));
+    char * card = take(size_t(m.slots)*m.heads*qsa_page_head_bytes(m));
+    char * meta = take(size_t(m.records)*m.heads*qsa_meta_head_bytes(m));
+    char * table = take(size_t(m.records)*(m.group/m.cells)*sizeof(int32_t));
     char * tags = take(m.slots*sizeof(int32_t));
     char * stamp = take(m.slots*sizeof(uint32_t));
     char * ref = take(m.slots*sizeof(int32_t));
     char * miss_page = take(m.slots*sizeof(int32_t));
     char * miss_slot = take(m.slots*sizeof(int32_t));
     char * ctl = take(16*sizeof(uint32_t));
+    char * seen = take(m.cells == GGML_LSA_PAGE_CELLS && lsa_admit_filter() ? size_t(m.records)*sizeof(uint32_t) : 0);
+    char * stage_page = take(size_t(m.stage_n)*sizeof(int32_t));
+    char * stage_ctl = take(m.stage_n ? 8*sizeof(uint32_t) : 0);
+    const bool overflow_log = m.cells == GGML_LSA_PAGE_CELLS && m.stage_n && lsa_overflow_log();
+    const bool strip_mask = m.stage_stride || overflow_log;
+    char * stage_mask = take(strip_mask ? size_t(m.records)*sizeof(uint32_t) : 0);
+    char * stage_valid = take(m.stage_stride ? size_t(m.stage_n)*m.heads*sizeof(uint32_t) : 0);
+    char * stage_stats = take(m.stage_stride ? 3*sizeof(unsigned long long) : 0);
+    char * overflow_hist = take(overflow_log ? 9*sizeof(unsigned long long) : 0);
     char * dmap = take(sizeof(ggml_cuda_qsa_clock_map));
     if (base) {
         m.card = card; m.meta = meta; m.table = (int32_t *) table; m.tags = (int32_t *) tags;
         m.stamp = (uint32_t *) stamp; m.ref = (int32_t *) ref; m.miss_page = (int32_t *) miss_page;
         m.miss_slot = (int32_t *) miss_slot; m.ctl = (uint32_t *) ctl;
+        m.seen = m.cells == GGML_LSA_PAGE_CELLS && lsa_admit_filter() ? (uint32_t *) seen : nullptr;
+        m.stage_page = m.stage_n ? (int32_t *) stage_page : nullptr;
+        m.stage_ctl = m.stage_n ? (uint32_t *) stage_ctl : nullptr;
+        m.stage_mask = strip_mask ? (uint32_t *) stage_mask : nullptr;
+        m.stage_valid = m.stage_stride ? (uint32_t *) stage_valid : nullptr;
+        m.stage_stats = m.stage_stride ? (unsigned long long *) stage_stats : nullptr;
+        m.overflow_hist = overflow_log ? (unsigned long long *) overflow_hist : nullptr;
         *device_map = (ggml_cuda_qsa_clock_map *) dmap;
     }
     return off;
@@ -90,11 +221,30 @@ static void qsa_clock_reset(ggml_backend_buffer_t buffer) {
     qsa_clock_sync(buffer);
     for (const auto & entry : static_cast<qsa_clock_buffer *>(buffer->context)->tensors) {
         auto & m = entry->map;
+        if (entry->recall_history) {
+            CUDA_CHECK(cudaMemset(entry->recall_history, 0, (entry->recall_pages + 2)*sizeof(uint32_t)));
+        }
         CUDA_CHECK(cudaMemset(m.tags, 0xff, m.slots*sizeof(int32_t)));
-        CUDA_CHECK(cudaMemset(m.table, 0xff, size_t(m.records)*(m.group/4)*sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(m.table, 0xff, size_t(m.records)*(m.group/m.cells)*sizeof(int32_t)));
         CUDA_CHECK(cudaMemset(m.stamp, 0, m.slots*sizeof(uint32_t)));
         CUDA_CHECK(cudaMemset(m.ref, 0, m.slots*sizeof(int32_t)));
         CUDA_CHECK(cudaMemset(m.ctl, 0, 16*sizeof(uint32_t)));
+        if (m.seen) {
+            CUDA_CHECK(cudaMemset(m.seen, 0, size_t(m.records)*sizeof(uint32_t)));
+        }
+        if (m.stage_ctl) {
+            CUDA_CHECK(cudaMemset(m.stage_ctl, 0, 8*sizeof(uint32_t)));
+        }
+        if (m.stage_mask) {
+            CUDA_CHECK(cudaMemset(m.stage_mask, 0, size_t(m.records)*sizeof(uint32_t)));
+        }
+        if (m.overflow_hist) {
+            CUDA_CHECK(cudaMemset(m.overflow_hist, 0, 9*sizeof(unsigned long long)));
+        }
+        if (m.stage_stride) {
+            CUDA_CHECK(cudaMemset(m.stage_valid, 0, size_t(m.stage_n)*m.heads*sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemset(m.stage_stats, 0, 3*sizeof(unsigned long long)));
+        }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -102,15 +252,81 @@ static void qsa_clock_reset(ggml_backend_buffer_t buffer) {
 static void qsa_clock_free(ggml_backend_buffer_t buffer) {
     auto * b = static_cast<qsa_clock_buffer *>(buffer->context);
     qsa_clock_sync(buffer);
+    {
+        std::lock_guard<std::mutex> lock(lsa_pf_mutex);
+        for (const auto & e : b->tensors) {
+            lsa_pf_entries.erase(std::remove(lsa_pf_entries.begin(), lsa_pf_entries.end(), e.get()), lsa_pf_entries.end());
+            if (e->pf_done) CUDA_CHECK(cudaEventDestroy(e->pf_done));
+            if (e->recall_history) CUDA_CHECK(cudaFree(e->recall_history));
+        }
+    }
     for (const auto & e : b->tensors) {
         uint64_t counters[8]{};
         CUDA_CHECK(cudaMemcpy(counters, e->map.ctl, sizeof(counters), cudaMemcpyDeviceToHost));
+        if (e->map.cells == GGML_LSA_STRIP_CELLS) {
+            // u64 at ctl 8 fetched strips, 10 strips read (picked), 12 resolves, 14 picked strips past the slots
+            const double strip_mib = double(e->map.heads)*GGML_LSA_STRIP_HEAD_BYTES/(1024.0*1024.0);
+            const double calls = std::max<double>(1.0, double(counters[6]));
+            GGML_LOG_WARN("LSA RESIDENT: layer %d slots=%u strips, resolves=%llu picked=%llu fetched=%llu over_slots=%llu, "
+                "per resolve: %.2f MiB fetched + %.2f MiB read from host past the slots\n", e->map.layer, e->map.slots,
+                (unsigned long long) counters[6], (unsigned long long) counters[5], (unsigned long long) counters[4],
+                (unsigned long long) counters[7], counters[4]*strip_mib/calls, counters[7]*strip_mib/calls);
+            continue;
+        }
+        if (e->map.cells == GGML_LSA_PAGE_CELLS) {
+            // same counters, in whole records (128 cells, every head)
+            const double rec_mib = double(e->map.stride)/(1024.0*1024.0);
+            const double calls = std::max<double>(1.0, double(counters[6]));
+            GGML_LOG_WARN("LSA RESIDENT: layer %d slots=%u records, resolves=%llu picked=%llu fetched=%llu over_slots=%llu, "
+                "per resolve: %.2f MiB fetched + %.2f MiB read from host past the slots\n", e->map.layer, e->map.slots,
+                (unsigned long long) counters[6], (unsigned long long) counters[5], (unsigned long long) counters[4],
+                (unsigned long long) counters[7], counters[4]*rec_mib/calls, counters[7]*rec_mib/calls);
+            const uint32_t * pf = reinterpret_cast<const uint32_t *>(counters); // u32 ctl 5 prefetched, 6 prefetch resolves
+            if (pf[6]) {
+                GGML_LOG_WARN("LSA RESIDENT: layer %d prefetch resolves=%u prefetched=%u records (%.2f MiB per prefetch)\n",
+                    e->map.layer, pf[6], pf[5], pf[5]*rec_mib/pf[6]);
+            }
+            if (e->map.seen) { // admission control on: misses refused a slot (u32 ctl 7)
+                GGML_LOG_WARN("LSA RESIDENT: layer %d admission not_admitted=%u records (%.2f per resolve)\n",
+                    e->map.layer, pf[7], pf[7]/calls);
+            }
+            if (e->map.stage_ctl) {
+                uint64_t st[4]{}; // u64 at stage_ctl 2 staged, 4 stage full (totals lag the last resolve)
+                CUDA_CHECK(cudaMemcpy(st, e->map.stage_ctl, sizeof(st), cudaMemcpyDeviceToHost));
+                GGML_LOG_WARN("LSA RESIDENT: layer %d stage=%u records, staged=%llu stage_full=%llu, per resolve: %.2f MiB "
+                    "%s, %.2f MiB still read from host\n", e->map.layer, e->map.stage_n,
+                    (unsigned long long) st[1], (unsigned long long) st[2], st[1]*rec_mib/calls,
+                    e->map.stage_stride ? "whole-record equivalent (actual bytes in LSA STRIP STAGE)" : "copied to the stage", st[2]*rec_mib/calls);
+            }
+            if (e->map.stage_stats) {
+                unsigned long long st[3]{};
+                CUDA_CHECK(cudaMemcpy(st, e->map.stage_stats, sizeof(st), cudaMemcpyDeviceToHost));
+                GGML_LOG_WARN("LSA STRIP STAGE: layer %d bytes=%llu strips=%llu records=%llu heads=%u\n",
+                    e->map.layer, st[0], st[1], st[2], e->map.heads);
+            }
+            if (e->map.overflow_hist) {
+                unsigned long long hist[9]{}, records = 0, strips = 0;
+                CUDA_CHECK(cudaMemcpy(hist, e->map.overflow_hist, sizeof(hist), cudaMemcpyDeviceToHost));
+                for (int s = 0; s <= 8; ++s) {
+                    records += hist[s];
+                    strips += s*hist[s];
+                }
+                const double mean = records ? double(strips)/records : 0.0;
+                GGML_LOG_WARN("LSA OVERFLOW STRIPS: layer=%d records=%llu strips=%llu mean=%.9f heads=%u "
+                    "whole_record_bytes=%zu histogram=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu "
+                    "scope=staged_only decision=%s\n", e->map.layer, records, strips, mean, e->map.heads,
+                    e->map.stride, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8],
+                    !records ? "NO_DATA" : hist[0] ? "INVALID_EMPTY_RECORD" : mean > 5.0 ? "STOP_STRIP_MASTER" : "WITHIN_5_STRIPS");
+            }
+            continue;
+        }
         GGML_LOG_INFO("QSA CLOCK: slots=%u calls=%llu page_misses=%llu selected_cells=%llu last_misses=%u overflow=%u\n",
             e->map.slots, (unsigned long long) counters[6], (unsigned long long) counters[4],
             (unsigned long long) counters[5], uint32_t(counters[1]), uint32_t(counters[2]));
     }
     for (void * block : b->blocks) CUDA_CHECK(cudaFree(block));
     if (b->pool) CUDA_CHECK(cudaFree(b->pool));
+    if (b->stage) CUDA_CHECK(cudaFree(b->stage));
     if (b->host) CUDA_CHECK(cudaFreeHost(b->host));
     delete b;
 }
@@ -132,17 +348,58 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
     void * mapped = nullptr;
     auto * b = static_cast<qsa_clock_buffer *>(buffer->context);
     CUDA_CHECK(cudaHostGetDevicePointer(&mapped, b->host, 0));
+    entry->host = static_cast<char *>(tensor->data);
     m.host = static_cast<const char *>(mapped) + (static_cast<const char *>(tensor->data) - static_cast<const char *>(b->host));
     m.stride = t->stride;
     GGML_ASSERT(ggml_nbytes(tensor)/t->stride <= INT32_MAX/(t->group/4));
     m.records = ggml_nbytes(tensor)/t->stride;
     m.group = t->group;
     m.heads = t->heads;
-    m.slots = std::min<size_t>(t->slots, m.records)*(m.group/4);
+    m.cells = t->cells;
+    m.slots = std::min<size_t>(t->slots, m.records)*(m.group/m.cells);
+    if (m.cells == GGML_LSA_STRIP_CELLS || m.cells == GGML_LSA_PAGE_CELLS) {
+        int il = -1;
+        const char * l = strrchr(tensor->name, 'l');
+        if (l && sscanf(l, "l%d", &il) == 1) m.layer = il;
+        const char * every = getenv("GGML_CUDA_LSA_RESIDENT_LOG");
+        m.log_every = every ? uint32_t(std::max(0, atoi(every))) : 0;
+    }
     if (!m.slots) {
         return GGML_STATUS_FAILED;
     }
     ggml_cuda_set_device(t->device);
+    const uint32_t stage_n = lsa_stage_all() ? m.records : lsa_stage_cap();
+    if (m.cells == GGML_LSA_PAGE_CELLS && stage_n > 0) {
+        // one stage per buffer (made here, never during CUDA graph capture); layers in a buffer share the record size
+        const size_t stride = lsa_stage_stride(m.stride, m.heads);
+        GGML_ASSERT(stage_n <= INT32_MAX - 2 && stride <= SIZE_MAX/stage_n);
+        const size_t sb = size_t(stage_n)*stride;
+        if (!b->stage) {
+            if (cudaMalloc((void **) &b->stage, sb) != cudaSuccess) {
+                (void) cudaGetLastError();
+                b->stage = nullptr;
+                if (lsa_stage_all()) {
+                    GGML_LOG_ERROR("LSA RESIDENT: full stage allocation failed (%.1f MiB); refusing host decode reads\n", sb/1048576.0);
+                    return GGML_STATUS_ALLOC_FAILED;
+                }
+                GGML_LOG_WARN("LSA RESIDENT: could not allocate the %u-record stage (%.1f MiB); records past the slots "
+                    "are read from the master\n", stage_n, sb/1048576.0);
+            } else {
+                b->stage_bytes = sb;
+                GGML_LOG_WARN("LSA RESIDENT: stage of %u records (%.1f MiB) for records past the slots\n",
+                    stage_n, sb/1048576.0);
+            }
+        }
+        if (b->stage && b->stage_bytes >= sb) {
+            m.stage = b->stage;
+            m.stage_n = stage_n;
+            m.stage_all = lsa_stage_all();
+            m.stage_stride = lsa_stage_strips() ? stride : 0;
+        } else if (lsa_stage_all()) {
+            GGML_LOG_ERROR("LSA RESIDENT: shared full stage is too small for this layer\n");
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+    }
     const size_t need = qsa_clock_layout(m, nullptr, nullptr);
     if (!b->pool_tried) {
         // Layers in one buffer share a shape, so size the pool for all of them up front.
@@ -168,33 +425,164 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
     }
     qsa_clock_layout(m, &entry->device_map, base);
     CUDA_CHECK(cudaMemset(m.tags, 0xff, m.slots*sizeof(int32_t)));
-    CUDA_CHECK(cudaMemset(m.table, 0xff, size_t(m.records)*(m.group/4)*sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(m.table, 0xff, size_t(m.records)*(m.group/m.cells)*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(m.stamp, 0, m.slots*sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(m.ref, 0, m.slots*sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(m.ctl, 0, 16*sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(m.meta, 0, size_t(m.records)*m.heads*GGML_QSA_META_HEAD_BYTES));
+    if (m.seen) {
+        CUDA_CHECK(cudaMemset(m.seen, 0, size_t(m.records)*sizeof(uint32_t)));
+    }
+    if (m.stage_ctl) {
+        CUDA_CHECK(cudaMemset(m.stage_ctl, 0, 8*sizeof(uint32_t)));
+    }
+    if (m.stage_mask) {
+        CUDA_CHECK(cudaMemset(m.stage_mask, 0, size_t(m.records)*sizeof(uint32_t)));
+    }
+    if (m.overflow_hist) {
+        CUDA_CHECK(cudaMemset(m.overflow_hist, 0, 9*sizeof(unsigned long long)));
+    }
+    if (m.stage_stride) {
+        CUDA_CHECK(cudaMemset(m.stage_valid, 0, size_t(m.stage_n)*m.heads*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(m.stage_stats, 0, 3*sizeof(unsigned long long)));
+    }
+    CUDA_CHECK(cudaMemset(m.meta, 0, size_t(m.records)*m.heads*qsa_meta_head_bytes(m)));
     CUDA_CHECK(cudaMemcpy(entry->device_map, &m, sizeof(m), cudaMemcpyHostToDevice));
+    entry->device = t->device;
+    if (m.cells == GGML_LSA_PAGE_CELLS && lsa_prefetch_cap() > 0) {
+        // events and the side stream are made here, never while a CUDA graph is being captured
+        std::lock_guard<std::mutex> lock(lsa_pf_mutex);
+        CUDA_CHECK(cudaEventCreateWithFlags(&entry->pf_done, cudaEventDisableTiming));
+        if (!lsa_pf_stream[t->device]) {
+            int lo = 0, hi = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&lsa_pf_stream[t->device], cudaStreamNonBlocking, lo));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lsa_pf_fork[t->device], cudaEventDisableTiming));
+        }
+        lsa_pf_entries.push_back(entry.get());
+    }
     tensor->extra = entry.get();
     static_cast<qsa_clock_buffer *>(buffer->context)->tensors.push_back(std::move(entry));
     return GGML_STATUS_SUCCESS;
 }
 
 static void qsa_clock_written(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, size_t offset, size_t size);
+static void qsa_clock_written_range(ggml_backend_buffer_t buffer, qsa_clock_tensor * e, size_t offset, size_t size);
+
+static sj_kvarn_lowbits::strip_master_layout qsa_clock_master_layout(ggml_backend_buffer_t buffer, const qsa_clock_tensor * e) {
+    const auto & m = e->map;
+    sj_kvarn_lowbits::strip_master_layout l{};
+    GGML_ASSERT(m.cells == GGML_LSA_PAGE_CELLS && m.strip_master && e->host);
+    GGML_ASSERT(sj_kvarn_lowbits::strip_master_clock_layout(m.strip_master_bits >> 8, m.strip_master_bits & 255,
+        m.records, m.heads, m.stride, m.stage_stride, m.strip_master_capacity, l));
+    const uintptr_t base = reinterpret_cast<uintptr_t>(static_cast<qsa_clock_buffer *>(buffer->context)->host);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(e->host);
+    GGML_ASSERT(start >= base && start - base <= buffer->size && m.strip_master_capacity <= buffer->size - (start - base));
+    return l;
+}
+
+static size_t qsa_clock_master_offset(const qsa_clock_tensor * e, const sj_kvarn_lowbits::strip_master_layout & l,
+        const ggml_tensor * tensor, size_t offset, size_t size) {
+    const uintptr_t root = reinterpret_cast<uintptr_t>(e->host), start = reinterpret_cast<uintptr_t>(tensor->data);
+    GGML_ASSERT(start >= root);
+    size_t absolute;
+    GGML_ASSERT(sj_kvarn_lowbits::strip_master_view_range(l, size_t(e->map.records)*e->map.heads,
+        start - root, ggml_nbytes(tensor), offset, size, absolute));
+    return absolute;
+}
+
+const ggml_cuda_qsa_clock_map * ggml_cuda_qsa_clock_strip_master_map(ggml_backend_cuda_context & ctx, const ggml_tensor * body) {
+    if (!body) return nullptr;
+    auto * e = qsa_clock_entry(body);
+    if (!e || !e->map.strip_master) return nullptr;
+    const auto * root = body;
+    while (root->view_src) root = root->view_src;
+    const auto l = qsa_clock_master_layout(root->buffer, e);
+    const auto & m = e->map;
+    GGML_ASSERT(e->device == ctx.device && body->data == e->host && body->type == GGML_TYPE_I8 && ggml_is_contiguous(body));
+    GGML_ASSERT(ggml_nbytes(body) == size_t(m.records)*m.heads*l.canonical_bytes);
+    GGML_ASSERT(m.stage_all && m.stage_n >= m.records);
+    return &m;
+}
+
+static bool qsa_clock_memset_span(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
+        uint8_t value, size_t offset, size_t size) {
+    auto * b = static_cast<qsa_clock_buffer *>(buffer->context);
+    if (std::none_of(b->tensors.begin(), b->tensors.end(), [](const auto & e) { return e->map.strip_master; })) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(b->host), start = reinterpret_cast<uintptr_t>(tensor->data);
+    GGML_ASSERT(start >= base && start - base <= buffer->size);
+    const size_t bytes = ggml_nbytes(tensor);
+    GGML_ASSERT(bytes <= buffer->size - (start - base) && offset <= bytes && size <= bytes - offset);
+    offset += start - base;
+    const size_t end = offset + size;
+    std::vector<qsa_clock_tensor *> entries;
+    for (const auto & e : b->tensors) entries.push_back(e.get());
+    std::sort(entries.begin(), entries.end(), [](const auto * a, const auto * c) {
+        return reinterpret_cast<uintptr_t>(a->host) < reinterpret_cast<uintptr_t>(c->host);
+    });
+    std::vector<sj_kvarn_lowbits::strip_master_arena> arenas;
+    size_t previous_end = 0;
+    for (const auto * e : entries) {
+        const uintptr_t root = reinterpret_cast<uintptr_t>(e->host);
+        GGML_ASSERT(root >= base && root - base <= buffer->size);
+        GGML_ASSERT(e->map.stride && size_t(e->map.records) <= SIZE_MAX/e->map.stride);
+        const size_t canonical = size_t(e->map.records)*e->map.stride;
+        const size_t capacity = e->map.strip_master ? e->map.strip_master_capacity : canonical;
+        GGML_ASSERT(root - base >= previous_end && capacity <= buffer->size - (root - base));
+        previous_end = root - base + capacity;
+        if (e->map.strip_master) {
+            const auto l = qsa_clock_master_layout(buffer, e);
+            arenas.push_back({l.bits_k, l.bits_v, size_t(root - base), size_t(e->map.records)*e->map.heads, capacity});
+        }
+    }
+    GGML_ASSERT(sj_kvarn_lowbits::strip_master_fill_arenas(reinterpret_cast<uint8_t *>(b->host),
+        buffer->size, arenas.data(), arenas.size(), value, offset, size));
+    for (auto * e : entries) {
+        const size_t root = reinterpret_cast<uintptr_t>(e->host) - base;
+        const size_t first = std::max(offset, root);
+        const size_t last = std::min(end, root + size_t(e->map.records)*e->map.stride);
+        if (first < last) qsa_clock_written_range(buffer, e, first - root, last - first);
+    }
+    return true;
+}
 
 static void qsa_clock_set(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     qsa_clock_sync(buffer);
-    memcpy(static_cast<char *>(tensor->data) + offset, data, size);
+    auto * e = qsa_clock_entry(tensor);
+    if (e && e->map.strip_master) {
+        const auto l = qsa_clock_master_layout(buffer, e);
+        const size_t absolute = qsa_clock_master_offset(e, l, tensor, offset, size);
+        GGML_ASSERT(sj_kvarn_lowbits::strip_master_set_records(l, reinterpret_cast<uint8_t *>(e->host),
+            size_t(e->map.records)*e->map.heads, static_cast<const uint8_t *>(data), absolute, size));
+    } else {
+        memcpy(static_cast<char *>(tensor->data) + offset, data, size);
+    }
     qsa_clock_written(buffer, tensor, offset, size);
 }
 
 static void qsa_clock_get(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     qsa_clock_sync(buffer);
-    memcpy(data, static_cast<const char *>(tensor->data) + offset, size);
+    auto * e = qsa_clock_entry(tensor);
+    if (e && e->map.strip_master) {
+        const auto l = qsa_clock_master_layout(buffer, e);
+        const size_t absolute = qsa_clock_master_offset(e, l, tensor, offset, size);
+        GGML_ASSERT(sj_kvarn_lowbits::strip_master_get_records(l, reinterpret_cast<const uint8_t *>(e->host),
+            size_t(e->map.records)*e->map.heads, static_cast<uint8_t *>(data), absolute, size));
+    } else {
+        memcpy(data, static_cast<const char *>(tensor->data) + offset, size);
+    }
 }
 
 static void qsa_clock_memset(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     qsa_clock_sync(buffer);
-    memset(static_cast<char *>(tensor->data) + offset, value, size);
+    auto * e = qsa_clock_entry(tensor);
+    if (e && e->map.strip_master) {
+        const auto l = qsa_clock_master_layout(buffer, e);
+        const size_t absolute = qsa_clock_master_offset(e, l, tensor, offset, size);
+        GGML_ASSERT(sj_kvarn_lowbits::strip_master_fill_records(l, reinterpret_cast<uint8_t *>(e->host),
+            size_t(e->map.records)*e->map.heads, value, absolute, size));
+    } else if (e || !qsa_clock_memset_span(buffer, tensor, value, offset, size)) {
+        memset(static_cast<char *>(tensor->data) + offset, value, size);
+    }
     qsa_clock_written(buffer, tensor, offset, size);
 }
 
@@ -202,7 +590,15 @@ static void qsa_clock_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     qsa_clock_reset(buffer);
     if (buffer->size) memset(qsa_clock_base(buffer), value, buffer->size);
     for (const auto & e : static_cast<qsa_clock_buffer *>(buffer->context)->tensors) {
-        CUDA_CHECK(cudaMemset(e->map.meta, value, size_t(e->map.records)*e->map.heads*GGML_QSA_META_HEAD_BYTES));
+        if (e->map.strip_master) {
+            const auto l = qsa_clock_master_layout(buffer, e.get());
+            const size_t records = size_t(e->map.records)*e->map.heads;
+            GGML_ASSERT(sj_kvarn_lowbits::strip_master_fill_records(l, reinterpret_cast<uint8_t *>(e->host),
+                records, value, 0, records*size_t(l.canonical_bytes)));
+        }
+        // record pages carry no card meta (qsa_meta_head_bytes = 0): the fixed QSA size overran their empty region
+        const size_t meta_bytes = size_t(e->map.records)*e->map.heads*qsa_meta_head_bytes(e->map);
+        if (meta_bytes) CUDA_CHECK(cudaMemset(e->map.meta, value, meta_bytes));
     }
 }
 
@@ -232,10 +628,14 @@ static size_t qsa_clock_alignment(ggml_backend_buffer_type_t) { return 256; }
 // Report a device buffer so all host access uses the synchronized get/set callbacks.
 static bool qsa_clock_host(ggml_backend_buffer_type_t) { return false; }
 
-ggml_backend_buffer_type_t ggml_backend_cuda_qsa_clock_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots) {
+static ggml_backend_buffer_type_t qsa_clock_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots, uint32_t cells,
+        uint32_t page_heads = 0) {
     const uint32_t group = 128;
-    const uint32_t heads = stride/(128*256 + 2*(3*256 + 3*128));
-    if (!dev || !stride || stride % 4 || !slots || group != 128 || !heads || stride != size_t(heads)*(128*256 + 2*(3*256 + 3*128)) || stride > std::numeric_limits<size_t>::max()/slots) {
+    // 4/4 scalar record (QSA pages, LSA strips); LSA record pages take any record size with 16-byte head slices
+    const uint32_t heads = cells == GGML_LSA_PAGE_CELLS ? page_heads : stride/(128*256 + 2*(3*256 + 3*128));
+    const bool shape_ok = cells == GGML_LSA_PAGE_CELLS ? heads && stride % heads == 0 && (stride/heads) % 16 == 0 :
+        heads && stride == size_t(heads)*(128*256 + 2*(3*256 + 3*128));
+    if (!dev || !stride || stride % 4 || !slots || group != 128 || !shape_ok || stride > std::numeric_limits<size_t>::max()/slots) {
         return nullptr;
     }
     int device = -1;
@@ -247,37 +647,89 @@ ggml_backend_buffer_type_t ggml_backend_cuda_qsa_clock_buffer_type(ggml_backend_
     static std::vector<std::unique_ptr<qsa_clock_type>> types;
     std::lock_guard<std::mutex> lock(mutex);
     for (const auto & t : types) {
-        if (t->device == device && t->stride == stride && t->slots == slots) return &t->buft;
+        if (t->device == device && t->stride == stride && t->slots == slots && t->cells == cells) return &t->buft;
     }
     auto t = std::make_unique<qsa_clock_type>();
     t->stride = stride;
     t->slots = slots;
     t->group = group;
     t->heads = heads;
+    t->cells = cells;
     t->device = device;
-    t->name = "CUDA_QSA_Clock_" + std::to_string(device) + "_" + std::to_string(stride) + "_" + std::to_string(slots);
-    GGML_LOG_INFO("QSA CLOCK: selected-page policy enabled, record_groups=%u pages=%llu heads=%u\n", slots,
-        (unsigned long long) slots*(group/4), heads);
+    t->name = std::string(cells == GGML_LSA_STRIP_CELLS ? "CUDA_LSA_Strip_" : cells == GGML_LSA_PAGE_CELLS ? "CUDA_LSA_Page_" : "CUDA_QSA_Clock_") + std::to_string(device) +
+        "_" + std::to_string(stride) + "_" + std::to_string(slots);
+    if (cells == GGML_LSA_PAGE_CELLS) {
+        GGML_LOG_WARN("LSA RESIDENT: 128-cell record slots, records=%u heads=%u (%.1f MiB per layer)\n", slots, heads,
+            double(slots)*stride/(1024.0*1024.0));
+    } else if (cells == GGML_LSA_STRIP_CELLS) {
+        GGML_LOG_WARN("LSA RESIDENT: 16-cell strip slots, record_groups=%u strips=%llu heads=%u (%.1f MiB per layer)\n", slots,
+            (unsigned long long) slots*(group/cells), heads, double(slots)*(group/cells)*heads*GGML_LSA_STRIP_HEAD_BYTES/(1024.0*1024.0));
+    } else {
+        GGML_LOG_INFO("QSA CLOCK: selected-page policy enabled, record_groups=%u pages=%llu heads=%u\n", slots,
+            (unsigned long long) slots*(group/4), heads);
+    }
     t->buft = {{qsa_clock_name, qsa_clock_alloc, nullptr, qsa_clock_alignment, nullptr, nullptr, nullptr, qsa_clock_host}, dev, t.get()};
     auto * result = &t->buft;
     types.push_back(std::move(t));
     return result;
 }
 
+ggml_backend_buffer_type_t ggml_backend_cuda_qsa_clock_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots) {
+    return qsa_clock_buffer_type(dev, stride, slots, GGML_QSA_PAGE_CELLS);
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_qsa_strip_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots) {
+    return qsa_clock_buffer_type(dev, stride, slots, GGML_LSA_STRIP_CELLS);
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_qsa_page_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots, uint32_t heads) {
+    return qsa_clock_buffer_type(dev, stride, slots, GGML_LSA_PAGE_CELLS, heads);
+}
+
 size_t ggml_backend_cuda_qsa_clock_device_bytes(ggml_backend_buffer_type_t buft, const ggml_tensor * body) {
     const auto * t = static_cast<const qsa_clock_type *>(buft->context);
     const size_t slots = std::min<size_t>(t->slots, ggml_nbytes(body)/t->stride);
-    const size_t pages = slots*(t->group/4);
+    const size_t pages = slots*(t->group/t->cells);
     const size_t records = ggml_nbytes(body)/t->stride;
-    return pages*(t->heads*GGML_QSA_PAGE_HEAD_BYTES + 5*sizeof(int32_t)) +
-        records*(t->heads*GGML_QSA_META_HEAD_BYTES + (t->group/4)*sizeof(int32_t)) +
+    ggml_cuda_qsa_clock_map m{};
+    m.cells = t->cells; m.stride = t->stride; m.heads = t->heads;
+    if (t->cells == GGML_LSA_PAGE_CELLS && lsa_stage_all()) {
+        m.slots = pages; m.records = records; m.group = t->group; m.stage_n = records;
+        m.stage_stride = lsa_stage_strips() ? lsa_stage_stride(t->stride, t->heads) : 0;
+        return qsa_clock_layout(m, nullptr, nullptr);
+    }
+    return pages*(t->heads*qsa_page_head_bytes(m) + 5*sizeof(int32_t)) +
+        records*(t->heads*qsa_meta_head_bytes(m) + (t->group/t->cells)*sizeof(int32_t)) +
         16*sizeof(uint32_t) + sizeof(ggml_cuda_qsa_clock_map);
+}
+
+size_t ggml_backend_cuda_qsa_clock_shared_bytes(ggml_backend_buffer_type_t buft, const ggml_context * ctx) {
+    const auto * t = static_cast<const qsa_clock_type *>(buft->context);
+    if (t->cells != GGML_LSA_PAGE_CELLS || !lsa_stage_all()) return 0;
+    size_t bytes = 0;
+    for (auto * body = ggml_get_first_tensor(ctx); body; body = ggml_get_next_tensor(ctx, body)) {
+        if (!body->view_src) {
+            const size_t records = ggml_nbytes(body)/t->stride;
+            const size_t stride = lsa_stage_stride(t->stride, t->heads);
+            GGML_ASSERT(records <= SIZE_MAX/stride);
+            bytes = std::max(bytes, records*stride);
+        }
+    }
+    return bytes;
+}
+
+bool ggml_cuda_lsa_page_full_stage(const ggml_tensor * body) {
+    const auto * e = body ? qsa_clock_entry(body) : nullptr;
+    return e && e->map.cells == GGML_LSA_PAGE_CELLS && e->map.stage_all;
 }
 
 const char * ggml_cuda_qsa_clock_body(const ggml_tensor * body) {
     auto * entry = qsa_clock_entry(body);
     // Body records are aligned; the low bit identifies a device-side split map.
-    return entry ? reinterpret_cast<const char *>(reinterpret_cast<uintptr_t>(entry->device_map) | 3) :
+    // tag 3: QSA four-cell pages; tag 2: LSA strip slots (read only by the SJ-KVaRN stream kernel, others read host) or
+    // LSA record pages (low-bit kernels; ggml_cuda_lsa_page_body)
+    return entry ? reinterpret_cast<const char *>(reinterpret_cast<uintptr_t>(entry->device_map) |
+                                                  (entry->map.cells != GGML_QSA_PAGE_CELLS ? 2 : 3)) :
         static_cast<const char *>(body->data);
 }
 
@@ -302,6 +754,179 @@ static __device__ void qsa_clock_copy_page(ggml_cuda_qsa_clock_map m, int page, 
     }
 }
 
+// LSA strip slot: byte copy of strip sl of the record (K strip, V strip, k_tok, v_scale, v_zero; scalar 4/4, D 256, G 128)
+static __device__ void qsa_strip_copy(ggml_cuda_qsa_clock_map m, int page, int slot, int head) {
+    constexpr int D = 256, G = 128, STRIP = 2048;
+    constexpr int v_payload = D*4/8*G, k_tok = v_payload + D*4/8*G + 4*D, v_scale = k_tok + 2*G + 2*D, v_zero = v_scale + 2*G;
+    const int record = page/(G/GGML_LSA_STRIP_CELLS), sl = page%(G/GGML_LSA_STRIP_CELLS);
+    const char * src = m.host + size_t(record)*m.stride + size_t(head)*(m.stride/m.heads);
+    char * dst = m.card + (size_t(slot)*m.heads + head)*GGML_LSA_STRIP_HEAD_BYTES;
+    for (int q = threadIdx.x; q < GGML_LSA_STRIP_HEAD_BYTES/16; q += blockDim.x) {
+        const char * s;
+        if (q < STRIP/16) {
+            s = src + sl*STRIP + 16*q;
+        } else if (q < 2*STRIP/16) {
+            s = src + v_payload + sl*STRIP + 16*(q - STRIP/16);
+        } else {
+            const int i = q - 2*STRIP/16;
+            s = src + (i < 2 ? k_tok : i < 4 ? v_scale : v_zero) + sl*32 + 16*(i & 1);
+        }
+        reinterpret_cast<uint4 *>(dst)[q] = *reinterpret_cast<const uint4 *>(s);
+    }
+}
+
+static __device__ sj_kvarn_lowbits::strip_master_layout lsa_master_layout(const ggml_cuda_qsa_clock_map & m) {
+    sj_kvarn_lowbits::strip_master_layout l{};
+    if (m.cells != GGML_LSA_PAGE_CELLS || m.group != 128 || !m.stage_all ||
+        !sj_kvarn_lowbits::strip_master_clock_layout(m.strip_master_bits >> 8, m.strip_master_bits & 255,
+            m.records, m.heads, m.stride, m.stage_stride, m.strip_master_capacity, l) ||
+        !m.strip_master || reinterpret_cast<uintptr_t>(m.strip_master)%16 || !m.slots || m.slots > m.records) __trap();
+    return l;
+}
+
+// LSA record page: byte copy of one KV head's slice of a whole record (any SJ-KVaRN record layout, 16-byte multiple)
+static __device__ void lsa_record_copy(const ggml_cuda_qsa_clock_map & m, int record, char * base, int index, int head) {
+    if (m.strip_master) {
+        const auto l = lsa_master_layout(m);
+        if (record < 0 || uint32_t(record) >= m.records || head < 0 || uint32_t(head) >= m.heads ||
+            !base || reinterpret_cast<uintptr_t>(base)%16 || base != m.card ||
+            index < 0 || uint32_t(index) >= m.slots) { __trap(); return; }
+        const auto * src = reinterpret_cast<const uint4 *>(m.strip_master + (size_t(record)*m.heads + head)*l.bytes);
+        auto * dst = reinterpret_cast<uint8_t *>(base + (size_t(index)*m.heads + head)*l.canonical_bytes);
+        for (int q = threadIdx.x; q < l.bytes/16; q += blockDim.x) {
+            const uint4 value = src[q];
+            const auto * bytes = reinterpret_cast<const uint8_t *>(&value);
+            for (int b = 0; b < 16; ++b) {
+                const int from = sj_kvarn_lowbits::strip_master_source_byte(l, q*16 + b);
+                if (from >= 0 && sj_kvarn_lowbits::strip_master_byte(l, from) == q*16 + b) dst[from] = bytes[b];
+            }
+        }
+        return;
+    }
+    const size_t hb = m.stride/m.heads;
+    const uint4 * src = reinterpret_cast<const uint4 *>(m.host + size_t(record)*m.stride + size_t(head)*hb);
+    uint4 * dst = reinterpret_cast<uint4 *>(base + size_t(index)*m.stride + size_t(head)*hb);
+    for (size_t q = threadIdx.x; q < hb/16; q += blockDim.x) dst[q] = src[q];
+}
+static __device__ void lsa_page_copy(const ggml_cuda_qsa_clock_map & m, int record, int slot, int head) {
+    lsa_record_copy(m, record, m.card, slot, head);
+}
+
+// GGML_CUDA_LSA_RESIDENT_STAGE: a picked record without a CLOCK slot takes the next stage index for this resolve
+// (table -3 - k); with no stage, or the stage full, it is read from the master (table -1) exactly as before.
+static __device__ void lsa_stage_or_master(const ggml_cuda_qsa_clock_map & m, int record) {
+    if (m.stage_n) {
+        const uint32_t k = atomicAdd(m.stage_ctl, 1u);
+        if (k < m.stage_n) {
+            m.stage_page[k] = record;
+            m.table[record] = -3 - int(k);
+            return;
+        }
+    }
+    m.table[record] = -1;
+}
+
+// start of a resolve (and of a prefill call): the previous resolve's stage entries go back to -1, so nothing reads the
+// stage after another layer has overwritten it; counters. One block.
+static __global__ void lsa_stage_reset(ggml_cuda_qsa_clock_map m) {
+    const uint32_t n = m.stage_ctl[0];
+    const uint32_t used = min(n, m.stage_n);
+    for (uint32_t i = threadIdx.x; i < used; i += blockDim.x) {
+        const int record = m.stage_page[i];
+        if (m.table[record] == -3 - int(i)) m.table[record] = -1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        auto * c = reinterpret_cast<unsigned long long *>(m.stage_ctl + 2);
+        c[0] += used;
+        c[1] += n - used;
+        m.stage_ctl[0] = 0;
+    }
+}
+
+static __global__ void lsa_stage_copy(ggml_cuda_qsa_clock_map m, int bits_k, int bits_v) {
+    if (m.strip_master) {
+        lsa_master_layout(m);
+        if (!m.stage || reinterpret_cast<uintptr_t>(m.stage)%16 || !m.stage_ctl || !m.stage_page ||
+            !m.stage_mask || !m.stage_valid || !m.stage_stats || m.stage_n < m.records ||
+            bits_k != int(m.strip_master_bits >> 8) || bits_v != int(m.strip_master_bits & 255)) { __trap(); return; }
+    }
+    const uint32_t used = min(m.stage_ctl[0], m.stage_n);
+    for (uint32_t i = blockIdx.x; i < used; i += gridDim.x) {
+        if (m.strip_master && (m.stage_page[i] < 0 || uint32_t(m.stage_page[i]) >= m.records)) { __trap(); return; }
+        if (m.overflow_hist && blockIdx.y == 0 && threadIdx.x == 0) {
+            const uint32_t wanted = m.stage_mask[m.stage_page[i]] & 255u;
+            atomicAdd(m.overflow_hist + __popc(wanted), 1ull);
+        }
+        if (!m.stage_stride) {
+            lsa_record_copy(m, m.stage_page[i], m.stage, i, blockIdx.y);
+            continue;
+        }
+        const int record = m.stage_page[i], head = blockIdx.y;
+        const uint32_t wanted = m.stage_mask[record];
+        if (m.strip_master) {
+            const auto l = lsa_master_layout(m);
+            if (record < 0 || uint32_t(record) >= m.records || uint32_t(head) >= m.heads ||
+                !m.stage_valid || !m.stage_stats || wanted > 255u) { __trap(); return; }
+            const auto * src = reinterpret_cast<const uint4 *>(m.strip_master + (size_t(record)*m.heads + head)*l.bytes);
+            auto * dst = reinterpret_cast<uint4 *>(m.stage + (size_t(i)*m.heads + head)*l.bytes);
+            for (int q = threadIdx.x; q < 1536/16; q += blockDim.x) dst[q] = src[q];
+            int rank = 0;
+            for (int s = 0; s < 8; ++s) {
+                if (!(wanted & (1u << s))) continue;
+                const int from = (1536 + s*l.strip_bytes)/16, to = (1536 + rank++*l.strip_bytes)/16;
+                for (int q = threadIdx.x; q < l.strip_bytes/16; q += blockDim.x) dst[to + q] = src[from + q];
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                m.stage_valid[size_t(i)*m.heads + head] = wanted;
+                if (head == 0) {
+                    atomicAdd(m.stage_stats, (1536ull + rank*l.strip_bytes)*m.heads);
+                    atomicAdd(m.stage_stats + 1, (unsigned long long) rank*m.heads);
+                    atomicAdd(m.stage_stats + 2, 1ull);
+                }
+            }
+            __syncthreads();
+            continue;
+        }
+        const char * src = m.host + size_t(record)*m.stride + head*(m.stride/m.heads);
+        char * dst = m.stage + size_t(i)*m.stage_stride + head*(m.stage_stride/m.heads);
+        const int vp = 4096*bits_k, ks = vp + 4096*bits_v, kz = ks + 512;
+        const int kt = kz + 512, vc = kt + 256, vs = vc + 512, vz = vs + 256;
+        for (int q = threadIdx.x; q < 1536/16; q += blockDim.x) {
+            const int off = q*16;
+            const int from = off < 512 ? ks + off : off < 1024 ? kz + off - 512 : vc + off - 1024;
+            reinterpret_cast<uint4 *>(dst)[q] = *reinterpret_cast<const uint4 *>(src + from);
+        }
+        int rank = 0;
+        const int strip_bytes = sj_kvarn_lowbits::stage_strip_bytes(bits_k, bits_v);
+        for (int s = 0; s < 8; ++s) {
+            if (!(wanted & (1u << s))) continue;
+            char * out = dst + 1536 + rank++*strip_bytes;
+            const int kb = 256*(2*bits_k + 1), vb = 256*(2*bits_v + 1);
+            for (int b = threadIdx.x; b < kb + vb; b += blockDim.x) {
+                const bool v = b >= kb;
+                const int from = sj_kvarn_lowbits::stage_source_byte(v ? bits_v : bits_k, s, v ? b - kb : b);
+                out[b] = from < 0 ? 0 : src[(v ? vp : 0) + from];
+            }
+            for (int q = threadIdx.x; q < 6; q += blockDim.x) {
+                const int from = (q < 2 ? kt : q < 4 ? vs : vz) + s*32 + (q & 1)*16;
+                reinterpret_cast<uint4 *>(out + kb + vb)[q] = *reinterpret_cast<const uint4 *>(src + from);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            m.stage_valid[size_t(i)*m.heads + head] = wanted;
+            if (head == 0) {
+                atomicAdd(m.stage_stats, (1536ull + rank*strip_bytes)*m.heads);
+                atomicAdd(m.stage_stats + 1, (unsigned long long) rank*m.heads);
+                atomicAdd(m.stage_stats + 2, 1ull);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 static __global__ void qsa_clock_refresh_records(ggml_cuda_qsa_clock_map m, const int32_t * desc,
         int first_record, int end_record) {
     int record = first_record + blockIdx.x;
@@ -315,42 +940,89 @@ static __global__ void qsa_clock_refresh_records(ggml_cuda_qsa_clock_map m, cons
     }
     if (record < 0 || record >= m.records) return;
     const int head = blockIdx.y;
+    if (m.cells == GGML_LSA_PAGE_CELLS) {
+        const int slot = m.table[record];
+        if (slot >= 0) lsa_page_copy(m, record, slot, head);
+        return;
+    }
     const char * src = m.host + size_t(record)*m.stride + size_t(head)*(m.stride/m.heads);
     char * meta = m.meta + (size_t(record)*m.heads + head)*GGML_QSA_META_HEAD_BYTES;
     for (int i = threadIdx.x; i < 384; i += blockDim.x) {
         reinterpret_cast<uint32_t *>(meta)[i] =
             reinterpret_cast<const uint32_t *>(src + (i < 256 ? 32768 : 33024))[i];
     }
-    for (int p = 0; p < m.group/4; ++p) {
-        const int page = record*(m.group/4) + p;
+    for (int p = 0; p < m.group/m.cells; ++p) {
+        const int page = record*(m.group/m.cells) + p;
         const int slot = m.table[page];
-        if (slot >= 0) qsa_clock_copy_page(m, page, slot, head);
+        if (slot < 0) continue;
+        if (m.cells == GGML_LSA_STRIP_CELLS) {
+            qsa_strip_copy(m, page, slot, head);
+        } else {
+            qsa_clock_copy_page(m, page, slot, head);
+        }
     }
 }
 
-static void qsa_clock_written(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, size_t offset, size_t size) {
-    auto * e = qsa_clock_entry(tensor);
-    if (!e || !size) return;
-    const auto * root = tensor;
-    while (root->view_src) root = root->view_src;
-    const size_t base = static_cast<const char *>(tensor->data) - static_cast<const char *>(root->data);
-    const size_t first = (base + offset)/e->map.stride;
-    const size_t end = (base + offset + size - 1)/e->map.stride + 1;
+static void qsa_clock_written_range(ggml_backend_buffer_t buffer, qsa_clock_tensor * e, size_t offset, size_t size) {
+    if (!size) return;
+    if (e->map.cells == GGML_LSA_STRIP_CELLS || e->map.cells == GGML_LSA_PAGE_CELLS) {
+        // test only (restore gate power arm): leave LSA slots stale after a host write, so a restore must change the output
+        static const bool no_refresh = getenv("GGML_CUDA_LSA_RESIDENT_TEST_NO_REFRESH") != nullptr;
+        if (no_refresh) return;
+    }
+    if (e->pf_pending) {
+        CUDA_CHECK(cudaEventSynchronize(e->pf_done));
+        e->pf_pending = false;
+    }
+    GGML_ASSERT(e->map.stride && size_t(e->map.records) <= SIZE_MAX/e->map.stride);
+    const size_t bytes = size_t(e->map.records)*e->map.stride;
+    GGML_ASSERT(offset <= bytes && size <= bytes - offset);
+    const size_t first = offset/e->map.stride;
+    const size_t end = (offset + size - 1)/e->map.stride + 1;
     GGML_ASSERT(end <= e->map.records);
     qsa_clock_refresh_records<<<dim3(end - first, e->map.heads), 128>>>(e->map, nullptr, first, end);
     CUDA_CHECK(cudaGetLastError());
     qsa_clock_sync(buffer);
 }
 
+static void qsa_clock_written(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, size_t offset, size_t size) {
+    auto * e = qsa_clock_entry(tensor);
+    if (!e || !size) return;
+    const uintptr_t root = reinterpret_cast<uintptr_t>(e->host), start = reinterpret_cast<uintptr_t>(tensor->data);
+    GGML_ASSERT(start >= root && start - root <= SIZE_MAX - offset);
+    qsa_clock_written_range(buffer, e, start - root + offset, size);
+}
+
 void ggml_cuda_qsa_clock_refresh(ggml_backend_cuda_context & ctx, const ggml_tensor * body) {
     auto * e = qsa_clock_entry(body);
     if (!e) return;
+    lsa_pf_join(ctx.stream(), e); // the seal refresh reads this layer's table: an in-flight prefetch must land first
     const auto * desc = body->src[2];
     const int max_records = ggml_get_op_params_i32(body, 5);
     GGML_ASSERT(desc && max_records > 0);
     qsa_clock_refresh_records<<<dim3(max_records, e->map.heads), 128, 0, ctx.stream()>>>(
         e->map, static_cast<const int32_t *>(desc->data), 0, e->map.records);
     CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_qsa_clock_seal_strip_master(ggml_backend_cuda_context & ctx, ggml_tensor * body) {
+    auto * e = qsa_clock_entry(body);
+    if (!e || !e->map.strip_master) return false;
+    const auto * root = body;
+    while (root->view_src) root = root->view_src;
+    const auto l = qsa_clock_master_layout(root->buffer, e);
+    const auto & m = e->map;
+    GGML_ASSERT(e->device == ctx.device && body->data == e->host && body->type == GGML_TYPE_I8 && ggml_is_contiguous(body));
+    GGML_ASSERT(ggml_nbytes(body) == size_t(m.records)*m.heads*l.canonical_bytes && m.stage_all && m.stage_n >= m.records);
+    GGML_ASSERT(m.slots && m.slots <= m.records);
+    GGML_ASSERT(int(m.strip_master_bits >> 8) == ggml_get_op_params_i32(body, 2) && int(m.strip_master_bits & 255) == ggml_get_op_params_i32(body, 3));
+    GGML_ASSERT(body->src[0] && body->src[0]->ne[0] == int64_t(m.heads)*256);
+    // The pack and refresh share the main stream; a side-stream copy must finish before either writes a slot.
+    lsa_pf_join(ctx.stream(), e);
+    GGML_ASSERT(ggml_cuda_sj_kvarn_seal_strip_master(ctx, body, const_cast<char *>(m.strip_master),
+        size_t(m.records)*m.heads, m.strip_master_capacity));
+    ggml_cuda_qsa_clock_refresh(ctx, body);
+    return true;
 }
 
 static __global__ void qsa_clock_resolve(ggml_cuda_qsa_clock_map m, const int32_t * desc,
@@ -435,7 +1107,7 @@ static __global__ void qsa_clock_copy_misses(ggml_cuda_qsa_clock_map m) {
 void ggml_cuda_qsa_clock_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     if (!dst->src[5] || !dst->src[6]) return;
     auto * e = qsa_clock_entry(dst->src[5]);
-    if (!e) return;
+    if (!e || e->map.cells != GGML_QSA_PAGE_CELLS) return; // LSA strips/records resolve elsewhere (ggml_cuda_qsa_strip_prepare, ggml_cuda_lsa_page_prepare)
     const auto * mask = dst->src[3];
     const auto * ids = dst->src[7];
     if (dst->src[0]->ne[1] > 8 || !ids) {
@@ -452,4 +1124,500 @@ void ggml_cuda_qsa_clock_prepare(ggml_backend_cuda_context & ctx, const ggml_ten
     CUDA_CHECK(cudaGetLastError());
     qsa_clock_copy_misses<<<dim3(128, e->map.heads), 128, 0, ctx.stream()>>>(e->map);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// LLAMA_LSA_RESIDENT (opt-in): CLOCK over 16-cell strip slots, driven by the live-record list of the SJ-KVaRN stream
+// kernel (the strips it is about to read). Hits are stamped with this resolve's epoch (never evicted by it), misses
+// take CLOCK victims and are copied from the pinned master. Unlike the QSA resolve it never traps: picked strips past
+// the free slots keep table entry -1 and the kernel reads them from the master over the bus (counted, ctl 14).
+static __global__ void qsa_strip_resolve(ggml_cuda_qsa_clock_map m, const int32_t * desc, const int32_t * list) {
+    __shared__ uint32_t epoch, assigned, hand, nmiss, picked;
+    if (threadIdx.x == 0) {
+        epoch = m.ctl[0] + 1;
+        m.ctl[0] = epoch;
+        m.ctl[2] = 0;
+        assigned = 0;
+        picked = 0;
+        hand = m.ctl[1];
+    }
+    __syncthreads();
+    if (epoch == 0) {
+        for (int i = threadIdx.x; i < m.slots; i += blockDim.x) m.stamp[i] = ~0u;
+        __syncthreads();
+    }
+    constexpr int P = 128/GGML_LSA_STRIP_CELLS;
+    const int n_live = list[0];
+    uint32_t mine = 0;
+    for (int o = threadIdx.x; o < n_live; o += blockDim.x) {
+        const uint32_t e = uint32_t(list[1 + o]);
+        const int g = int(e & 0xFFFFFFu), sm = int(e >> 24);
+        const int record = desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + g] : g;
+        if (record < 0 || record >= int(m.records)) continue;
+        for (int sl = 0; sl < P; ++sl) {
+            if (!((sm >> sl) & 1)) continue;
+            ++mine;
+            const int page = record*P + sl;
+            const int slot = atomicCAS(m.table + page, -1, -2);
+            if (slot >= 0) {
+                atomicExch(m.stamp + slot, epoch);
+                atomicExch(m.ref + slot, 1);
+            } else if (slot == -1) {
+                const uint32_t miss = atomicAdd(m.ctl + 2, 1u);
+                if (miss < m.slots) {
+                    m.miss_page[miss] = page;
+                } else {
+                    m.table[page] = -1; // past the slots: read from the master
+                }
+            }
+        }
+    }
+    atomicAdd(&picked, mine);
+    __syncthreads();
+    if (threadIdx.x == 0) nmiss = min(m.ctl[2], m.slots);
+    __syncthreads();
+    const uint32_t lanes = min(uint32_t(blockDim.x), m.slots);
+    uint32_t scanned = 0;
+    while (assigned < nmiss && scanned < 3*m.slots + lanes) {
+        const uint32_t slot = (hand + scanned + threadIdx.x)%m.slots;
+        if (threadIdx.x < lanes && m.stamp[slot] != epoch && atomicExch(m.ref + slot, 0) == 0) {
+            const uint32_t item = atomicAdd(&assigned, 1u);
+            if (item < nmiss) {
+                const int old = m.tags[slot];
+                if (old >= 0) m.table[old] = -1;
+                const int page = m.miss_page[item];
+                m.tags[slot] = page;
+                m.stamp[slot] = epoch;
+                m.ref[slot] = 1;
+                m.miss_slot[item] = slot;
+                m.table[page] = slot;
+            }
+        }
+        scanned += lanes;
+        __syncthreads();
+    }
+    const uint32_t got = min(assigned, nmiss);
+    for (uint32_t i = got + threadIdx.x; i < nmiss; i += blockDim.x) {
+        m.table[m.miss_page[i]] = -1; // every slot is protected by this pick: read from the master
+    }
+    if (threadIdx.x == 0) {
+        const uint32_t over = m.ctl[2] - got;
+        m.ctl[2] = got; // the copy kernel copies the assigned misses only
+        m.ctl[1] = (hand + scanned)%m.slots;
+        auto * c = reinterpret_cast<unsigned long long *>(m.ctl + 8);
+        c[0] += got;
+        c[1] += picked;
+        c[2] += 1;
+        c[3] += over;
+        if (m.log_every && c[2] % m.log_every == 0) {
+            printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u strip_bytes=%u\n",
+                m.layer, c[2], c[1], c[0], c[3], m.slots, m.heads*GGML_LSA_STRIP_HEAD_BYTES);
+        }
+    }
+}
+
+static __global__ void qsa_strip_copy_misses(ggml_cuda_qsa_clock_map m) {
+    for (uint32_t i = blockIdx.x; i < m.ctl[2]; i += gridDim.x) {
+        qsa_strip_copy(m, m.miss_page[i], m.miss_slot[i], blockIdx.y);
+    }
+}
+
+bool ggml_cuda_qsa_strip_body(const ggml_tensor * body) {
+    if (!body) return false;
+    const auto * e = qsa_clock_entry(body);
+    return e && e->map.cells == GGML_LSA_STRIP_CELLS;
+}
+
+void ggml_cuda_qsa_strip_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * body, const int32_t * desc,
+        const int32_t * list) {
+    auto * e = body ? qsa_clock_entry(body) : nullptr;
+    if (!e || e->map.cells != GGML_LSA_STRIP_CELLS || !desc || !list) return;
+    qsa_strip_resolve<<<1, 1024, 0, ctx.stream()>>>(e->map, desc, list);
+    CUDA_CHECK(cudaGetLastError());
+    qsa_strip_copy_misses<<<dim3(128, e->map.heads), 128, 0, ctx.stream()>>>(e->map);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// LLAMA_LSA_RESIDENT on low-bit bodies (opt-in): CLOCK over whole 128-cell record slots. Three launches per decode
+// attention: mark (one warp per body group: does any query row's f16 mask keep a cell of it; hits are stamped with this
+// resolve's epoch, misses queued), assign (one block: CLOCK victims for the misses, counters) and copy (misses from the
+// pinned master). A record without a slot is read from the master by the kernel, so the result never depends on
+// residency. ctl: 0 epoch, 1 hand, 2 queued misses, 3 picked this resolve, 4 assigned (copy count), u64 at 8.. counters.
+// limit: most misses queued (m.slots normally). pf: prefetch for the next LSA layer's map m from this layer's mask:
+// picked is not counted and records sealed by this ubatch are skipped (their master bytes are being written now).
+static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * desc, const half * mask, int64_t pitch,
+        int nrows, uint32_t limit, int pf) {
+    const int g = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int S = desc[GGML_SJKVARN_DESC_S], B = desc[GGML_SJKVARN_DESC_B], G = desc[GGML_SJKVARN_DESC_G];
+    if (G != GGML_LSA_PAGE_CELLS || g >= (B - S)/G) return;
+    if (pf && g >= (desc[GGML_SJKVARN_DESC_B_OLD] - S)/G) return;
+    bool live = mask == nullptr; // no usable mask: every sealed record is read
+    uint32_t strips = mask == nullptr ? 255 : 0;
+    for (int r = 0; r < nrows && (!live || m.stage_mask); ++r) { // strip copy and diagnostics need the full union
+        const half * row = mask + r*pitch + S + (int64_t) g*G;
+        bool any = false;
+        for (int i = lane; i < G; i += WARP_SIZE) any |= __half2float(row[i]) != -INFINITY;
+        live = __any_sync(0xffffffff, any);
+        if (m.stage_mask) {
+            for (int s = 0; s < 8; ++s) {
+                if (__any_sync(0xffffffff, lane < 16 && __half2float(row[s*16 + lane]) != -INFINITY)) strips |= 1u << s;
+            }
+        }
+    }
+    if (lane != 0) return;
+    const int record = desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + g] : g;
+    if (record < 0 || record >= int(m.records)) return;
+    if (m.stage_mask) {
+        m.stage_mask[record] = strips;
+        live = strips != 0;
+    }
+    if (!live) return;
+    const uint32_t epoch = m.ctl[0] + 1; // epochs start at 1 (stamps reset to 0); 2^32 resolves never wrap in practice
+    if (!pf) atomicAdd(m.ctl + 3, 1u);
+    bool admit = true;
+    if (m.seen && !pf) {
+        // own resolves only (prefetch resolves also advance the epoch): step n admits pages step n-1 picked
+        const uint32_t step = uint32_t(reinterpret_cast<const unsigned long long *>(m.ctl + 8)[2]) + 1;
+        admit = m.seen[record] + 1 == step;
+        m.seen[record] = step;
+    }
+    const int slot = atomicCAS(m.table + record, -1, -2);
+    if (slot >= 0) {
+        m.stamp[slot] = epoch;
+        m.ref[slot] = 1;
+    } else if (slot == -1 && !admit) {
+        lsa_stage_or_master(m, record); // first pick in a row: no slot (stage, else the master)
+        atomicAdd(m.ctl + 7, 1u);
+    } else if (slot == -1) {
+        const uint32_t miss = atomicAdd(m.ctl + 2, 1u);
+        if (miss < limit) {
+            m.miss_page[miss] = record;
+        } else if (pf) {
+            m.table[record] = -1; // prefetch past its cap: not picked by anyone yet
+        } else {
+            lsa_stage_or_master(m, record); // past the slots: stage, else the master
+        }
+    }
+}
+
+static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit, int pf, bool stage_all = false) {
+    __shared__ uint32_t epoch, assigned, hand, nmiss;
+    if (threadIdx.x == 0) {
+        epoch = m.ctl[0] + 1;
+        assigned = 0;
+        hand = m.ctl[1];
+        nmiss = min(m.ctl[2], limit);
+    }
+    __syncthreads();
+    const uint32_t lanes = min(uint32_t(blockDim.x), m.slots);
+    uint32_t scanned = 0;
+    while (assigned < nmiss && scanned < 3*m.slots + lanes) {
+        const uint32_t slot = (hand + scanned + threadIdx.x)%m.slots;
+        if (threadIdx.x < lanes && m.stamp[slot] != epoch && atomicExch(m.ref + slot, 0) == 0) {
+            const uint32_t item = atomicAdd(&assigned, 1u);
+            if (item < nmiss) {
+                const int old = m.tags[slot];
+                if (old >= 0) m.table[old] = -1;
+                const int record = m.miss_page[item];
+                m.tags[slot] = record;
+                m.stamp[slot] = epoch;
+                m.ref[slot] = 1;
+                m.miss_slot[item] = slot;
+                m.table[record] = slot;
+            }
+        }
+        scanned += lanes;
+        __syncthreads();
+    }
+    const uint32_t got = min(assigned, nmiss);
+    for (uint32_t i = got + threadIdx.x; i < nmiss; i += blockDim.x) {
+        if (pf) m.table[m.miss_page[i]] = -1; else lsa_stage_or_master(m, m.miss_page[i]); // every slot protected by this pick
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t clock_over = m.ctl[2] - got;
+        const uint32_t over = stage_all ? m.stage_ctl[0] - min(m.stage_ctl[0], m.stage_n) : clock_over;
+        if (stage_all) {
+            assert(m.stage_n >= m.records && over == 0);
+        }
+        auto * c = reinterpret_cast<unsigned long long *>(m.ctl + 8);
+        if (pf) {
+            // prefetched slots keep ref 1 (one CLOCK pass of grace) but not the next resolve's epoch
+            m.ctl[5] += got;
+            m.ctl[6] += 1;
+        } else {
+            c[0] += got;
+            c[1] += m.ctl[3];
+            c[2] += 1;
+            c[3] += over;
+        }
+        m.ctl[0] = epoch;
+        m.ctl[1] = (hand + scanned)%m.slots;
+        m.ctl[2] = 0;
+        m.ctl[3] = 0;
+        m.ctl[4] = got;
+        if (!pf && m.log_every && c[2] % m.log_every == 0) {
+            if (stage_all) {
+                printf("LSA STAGE: layer %d resolves=%llu requested=%u capacity=%u clock_over_slots=%u host_records=%u\n",
+                    m.layer, c[2], m.stage_ctl[0], m.stage_n, clock_over, over);
+            }
+            if (m.ctl[6]) {
+                printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu prefetched=%u pf_resolves=%u\n",
+                    m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride, m.ctl[5], m.ctl[6]);
+            } else if (m.seen) {
+                printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu not_admitted=%u\n",
+                    m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride, m.ctl[7]);
+            } else {
+                printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u record_bytes=%llu\n",
+                    m.layer, c[2], c[1], c[0], c[3], m.slots, (unsigned long long) m.stride);
+            }
+        }
+    }
+}
+
+static __global__ void lsa_page_copy_misses(ggml_cuda_qsa_clock_map m) {
+    for (uint32_t i = blockIdx.x; i < m.ctl[4]; i += gridDim.x) {
+        lsa_page_copy(m, m.miss_page[i], m.miss_slot[i], blockIdx.y);
+    }
+}
+
+const char * ggml_cuda_lsa_page_body(const ggml_tensor * body) {
+    const auto * e = body ? qsa_clock_entry(body) : nullptr;
+    if (!e || e->map.cells != GGML_LSA_PAGE_CELLS) {
+        return body ? static_cast<const char *>(body->data) : nullptr;
+    }
+    return ggml_cuda_qsa_clock_body(body);
+}
+
+const int32_t * ggml_cuda_lsa_page_table(const ggml_tensor * body, uint32_t * records) {
+    const auto * e = body ? qsa_clock_entry(body) : nullptr;
+    if (!e || e->map.cells != GGML_LSA_PAGE_CELLS) {
+        return nullptr;
+    }
+    *records = e->map.records;
+    return e->map.table;
+}
+
+// GGML_CUDA_LSA_PREFETCH: mark the next LSA layer's misses from this layer's mask on the main stream (the mask buffer
+// may be reused once this node is done), then assign + copy them on a low-priority side stream that overlaps the
+// layers in between; the next layer joins it (lsa_pf_join) before its seal refresh or its own resolve.
+static void lsa_page_prefetch(ggml_backend_cuda_context & ctx, qsa_clock_tensor * e, const int32_t * desc,
+        const half * m16, int64_t pitch, int nrows) {
+    qsa_clock_tensor * next = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(lsa_pf_mutex);
+        for (auto * c : lsa_pf_entries) {
+            if (c != e && c->device == e->device && c->map.layer > e->map.layer && c->map.records == e->map.records &&
+                    (!next || c->map.layer < next->map.layer)) {
+                next = c;
+            }
+        }
+    }
+    if (!next || next->pf_pending || !m16) return;
+    const uint32_t cap = std::min<uint32_t>(next->map.slots, uint32_t(lsa_prefetch_cap()));
+    const int per_block = 8;
+    lsa_page_mark<<<(next->map.records + per_block - 1)/per_block, per_block*WARP_SIZE, 0, ctx.stream()>>>(
+        next->map, desc, m16, pitch, nrows, cap, 1);
+    CUDA_CHECK(cudaGetLastError());
+    cudaStream_t side = lsa_pf_stream[e->device];
+    CUDA_CHECK(cudaEventRecord(lsa_pf_fork[e->device], ctx.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(side, lsa_pf_fork[e->device], 0));
+    lsa_page_assign<<<1, 1024, 0, side>>>(next->map, cap, 1);
+    CUDA_CHECK(cudaGetLastError());
+    lsa_page_copy_misses<<<dim3(16, next->map.heads), 256, 0, side>>>(next->map);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(next->pf_done, side));
+    next->pf_pending = true;
+}
+
+// Logging-only: observe the table BEFORE mark/assign makes misses look resident. Single-block reduction keeps
+// counters on the device; no readback, prefetch, eviction or slot-map mutation. This diagnostic is not timed.
+static __global__ void lsa_page_spec_recall(ggml_cuda_qsa_clock_map m, const int32_t * desc,
+        const half * mask, int64_t pitch, int nrows, const float * predicted, int nunits, int unit,
+        uint32_t * history) {
+    const int S = desc[GGML_SJKVARN_DESC_S], G = desc[GGML_SJKVARN_DESC_G];
+    const int B = desc[GGML_SJKVARN_DESC_B], old = desc[GGML_SJKVARN_DESC_B_OLD];
+    const int N = desc[GGML_SJKVARN_DESC_N], qpos = desc[GGML_SJKVARN_DESC_QPOS0];
+    if (G != 128 || S < 0 || S % G != 0 || B < S || N < B || N > nunits*unit ||
+            (unit != 16 && unit != 128)) {
+        if (threadIdx.x == 0) {
+            printf("LSA SPEC RECALL INVALID: layer=%d S=%d G=%d B=%d N=%d units=%d unit=%d\n",
+                    m.layer, S, G, B, N, nunits, unit);
+        }
+        return;
+    }
+    const uint32_t resolve = m.ctl[0] + 1;
+    // Consecutive, single-sequence append only. Reset, restore, prompt replay and growing allocations start cold.
+    const bool warm = ggml_lsa_history_contiguous(history[0], history[1], uint32_t(qpos), uint32_t(N), nrows, resolve);
+    ggml_lsa_workset_counts ws{};
+    constexpr int planes = GGML_LSA_RECALL_PLANES;
+    ggml_lsa_recall_counts count[3*planes]{}; // {missing pages, missing strips, all strips} per plane
+    for (int page = threadIdx.x; page < (N + 127)/128; page += blockDim.x) {
+        const int first = page*128;
+        uint32_t actual_bits = 0, pred_bits[planes]{};
+        for (int strip = 0; strip < 8 && first + strip*16 < N; ++strip) {
+            bool actual = false;
+            for (int r = 0; r < nrows; ++r) {
+                for (int i = 0; i < 16 && first + strip*16 + i < N; ++i) {
+                    actual |= __half2float(mask[r*pitch + first + strip*16 + i]) != -INFINITY;
+                }
+                for (int p = 0; p < planes; ++p) {
+                    if (predicted[(p*nrows + r)*int64_t(nunits) + (first + strip*16)/unit] > 0.5f) {
+                        pred_bits[p] |= 1u << strip;
+                    }
+                }
+            }
+            if (actual) { actual_bits |= 1u << strip; }
+        }
+        ws.observe(actual_bits, warm && first < int(history[0]) ? history[page + 2] : 0);
+        history[page + 2] = actual_bits;
+        // Whole-pick coverage is separate from missing-page recall; this is what a lossy prediction would drop.
+        for (int p = 0; p < planes; ++p) {
+            for (int strip = 0; strip < 8 && first + strip*16 < N; ++strip) {
+                count[3*p + 2].observe(false, (actual_bits >> strip) & 1, (pred_bits[p] >> strip) & 1, true);
+            }
+        }
+        // Physical-page recall matches exactly what the current prefetch can act on (full sealed records only).
+        if (first < S || first + 128 > B) { continue; }
+        const int g = (first - S)/G;
+        const int record = desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + g] : g;
+        if (record < 0 || record >= int(m.records)) {
+            // Descriptor corruption must not silently reduce the denominator and improve recall.
+            printf("LSA SPEC RECALL INVALID: layer=%d record=%d records=%u\n", m.layer, record, m.records);
+            continue;
+        }
+        const bool resident = m.table[record] >= 0, was_sealed = first + G <= old;
+        for (int p = 0; p < planes; ++p) {
+            count[3*p].observe(resident, actual_bits != 0, pred_bits[p] != 0, was_sealed);
+            for (int strip = 0; strip < 8; ++strip) {
+                count[3*p + 1].observe(resident, (actual_bits >> strip) & 1, (pred_bits[p] >> strip) & 1, was_sealed);
+            }
+        }
+    }
+    __shared__ ggml_lsa_recall_counts counts[64][3*planes];
+    __shared__ ggml_lsa_workset_counts worksets[64];
+    static_assert(sizeof(counts) + sizeof(worksets) <= 48*1024, "recall reduction exceeds shared memory");
+    for (int j = 0; j < 3*planes; ++j) { counts[threadIdx.x][j] = count[j]; }
+    worksets[threadIdx.x] = ws;
+    __syncthreads();
+    for (int d = 32; d > 0; d >>= 1) {
+        if (threadIdx.x < d) {
+            for (int j = 0; j < 3*planes; ++j) { counts[threadIdx.x][j].add(counts[threadIdx.x + d][j]); }
+            worksets[threadIdx.x].add(worksets[threadIdx.x + d]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const auto w = worksets[0];
+        // Shared-head arm only. head_strips/heads is its per-KV-head mean, with the same denominator as strips.
+        printf("LSA WORKSET: layer=%d resolve=%u rows=%d N=%d B=%d partial=%d warm=%d mask_heads=1 heads=%u "
+                "total_pages=%d pages=%u prev_pages=%u new_pages=%u total_strips=%d strips=%u prev_strips=%u new_strips=%u "
+                "head_strips=%llu new_head_strips=%llu\n", m.layer, resolve, nrows, N, B,
+                int(ggml_lsa_workset_partial_page(uint32_t(N))), int(warm), m.heads,
+                (N + 127)/128, w.pages, w.prev_pages, w.new_pages, (N + 15)/16, w.strips, w.prev_strips, w.new_strips,
+                (unsigned long long) w.strips*m.heads, (unsigned long long) w.new_strips*m.heads);
+        for (int p = 0; p < planes; ++p) {
+            const int ahead = p%GGML_LSA_RECALL_HORIZONS + 1;
+            const double budget = 0.01*ggml_lsa_recall_budget_pct(p/GGML_LSA_RECALL_HORIZONS);
+            for (int scale = 0; scale < 2; ++scale) {
+                const auto c = counts[0][3*p + scale];
+                printf("LSA SPEC RECALL: layer=%d resolve=%u rows=%d ahead=%d budget=%.2f cells=%d unit=%d actual_new=%u predicted_new=%u "
+                        "hit=%u false=%u newly_sealed=%u record_bytes=%llu\n", m.layer, resolve, nrows, ahead, budget,
+                        scale ? 16 : 128, unit, c.actual_new, c.predicted_new, c.hit, c.predicted_new - c.hit,
+                        c.newly_sealed, (unsigned long long) m.stride);
+            }
+            const auto c = counts[0][3*p + 2];
+            printf("LSA SPEC COVERAGE: layer=%d resolve=%u rows=%d ahead=%d budget=%.2f cells=16 unit=%d actual=%u predicted=%u "
+                    "hit=%u miss=%u false=%u\n", m.layer, resolve, nrows, ahead, budget, unit, c.actual_new, c.predicted_new,
+                    c.hit, c.actual_new - c.hit, c.predicted_new - c.hit);
+        }
+        history[0] = N;
+        history[1] = resolve;
+    }
+}
+
+void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    if (!dst->src[5] || !dst->src[6]) return;
+    auto * e = qsa_clock_entry(dst->src[5]);
+    if (!e || e->map.cells != GGML_LSA_PAGE_CELLS) return;
+    const int bits = ggml_get_op_params_i32(dst, 5);
+    if (e->map.stage_stride) {
+        GGML_ASSERT(ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 && ggml_sj_kvarn::trellis3::tokens());
+        GGML_ASSERT((bits >> 8 == 2 || bits >> 8 == 3) && ((bits & 255) == 2 || (bits & 255) == 3));
+        const auto layout = ggml_sj_kvarn::make_layout(256, 128, bits >> 8, bits & 255);
+        GGML_ASSERT(e->map.stride/e->map.heads == layout.bytes);
+        GGML_ASSERT(layout.k_payload == 0);
+        GGML_ASSERT(layout.v_payload == 4096*(bits >> 8));
+        GGML_ASSERT(layout.k_scale == layout.v_payload + 4096*(bits & 255));
+        GGML_ASSERT(layout.k_zero == layout.k_scale + 512);
+        GGML_ASSERT(layout.k_tok == layout.k_zero + 512);
+        GGML_ASSERT(layout.v_ch == layout.k_tok + 256);
+        GGML_ASSERT(layout.v_scale == layout.v_ch + 512);
+        GGML_ASSERT(layout.v_zero == layout.v_scale + 256);
+    }
+    lsa_pf_join(ctx.stream(), e);
+    if (e->map.stage_n) {
+        lsa_stage_reset<<<1, 256, 0, ctx.stream()>>>(e->map); // before anything reads this layer's table again
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (dst->src[0]->ne[1] > 8) return; // prefill reads every record: slots as they are, the rest from the master
+    const ggml_tensor * mask = dst->src[3];
+    const half * m16 = nullptr;
+    int64_t pitch = 0;
+    int nrows = 0;
+    if (mask && mask->type == GGML_TYPE_F16 && mask->ne[3] == 1 && (mask->ne[2] == 1 || mask->nb[2] == mask->ne[1]*mask->nb[1])) {
+        // every plane (per-head masks) and query row: a record is live if any of them keeps one of its cells
+        m16 = static_cast<const half *>(mask->data);
+        pitch = mask->nb[1]/sizeof(half);
+        nrows = int(std::min<int64_t>(dst->src[0]->ne[1], mask->ne[1]));
+        if (mask->ne[2] > 1) {
+            nrows = int(mask->ne[1]*mask->ne[2]); // contiguous planes: walk them as rows
+        }
+    } else {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("LSA RESIDENT: no plain f16 decode mask on a record-page body; every sealed record counts as picked\n");
+        }
+    }
+    if (const ggml_tensor * prediction = ggml_flash_attn_ext_get_lsa_spec_recall(dst)) {
+        GGML_ASSERT(getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr); // diagnostic allocation/logging only
+        GGML_ASSERT(m16 && nrows == dst->src[0]->ne[1] && mask->ne[2] == 1 && lsa_prefetch_cap() == 0);
+        GGML_ASSERT(prediction->type == GGML_TYPE_F32 && ggml_is_contiguous(prediction) &&
+                mask->ne[0] % prediction->ne[0] == 0 && prediction->ne[1] == nrows &&
+                prediction->ne[2] == GGML_LSA_RECALL_HORIZONS && prediction->ne[3] == GGML_LSA_RECALL_BUDGETS);
+        const int unit = int(mask->ne[0]/prediction->ne[0]);
+        GGML_ASSERT(unit == 16 || unit == 128);
+        const size_t pages = (size_t(mask->ne[0]) + 127)/128;
+        if (pages > e->recall_pages) {
+            // Diagnostic arm runs without CUDA graphs. Capacity grows in 256K-cell chunks, never per token.
+            if (e->recall_history) { CUDA_CHECK(cudaFree(e->recall_history)); }
+            e->recall_pages = ((pages + 2047)/2048)*2048;
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->recall_history), (e->recall_pages + 2)*sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemsetAsync(e->recall_history, 0, (e->recall_pages + 2)*sizeof(uint32_t), ctx.stream()));
+        }
+        lsa_page_spec_recall<<<1, 64, 0, ctx.stream()>>>(e->map, static_cast<const int32_t *>(dst->src[6]->data),
+                m16, pitch, nrows, static_cast<const float *>(prediction->data), int(prediction->ne[0]), unit,
+                e->recall_history);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (lsa_prefetch_cap() > 0) {
+        lsa_page_prefetch(ctx, e, static_cast<const int32_t *>(dst->src[6]->data), m16, pitch, nrows);
+    }
+    const int per_block = 8;
+    lsa_page_mark<<<(e->map.records + per_block - 1)/per_block, per_block*WARP_SIZE, 0, ctx.stream()>>>(
+        e->map, static_cast<const int32_t *>(dst->src[6]->data), m16, pitch, nrows, lsa_fetch_cap(e->map.slots), 0);
+    CUDA_CHECK(cudaGetLastError());
+    lsa_page_assign<<<1, 1024, 0, ctx.stream()>>>(e->map, lsa_fetch_cap(e->map.slots), 0, lsa_stage_all());
+    CUDA_CHECK(cudaGetLastError());
+    // More record copies in flight can hide mapped-host load latency.
+    const uint32_t copy_blocks = e->map.stage_all && lsa_copy_wide() ? 256 : 64;
+    lsa_page_copy_misses<<<dim3(copy_blocks, e->map.heads), 256, 0, ctx.stream()>>>(e->map);
+    CUDA_CHECK(cudaGetLastError());
+    if (e->map.stage_n) {
+        lsa_stage_copy<<<dim3(copy_blocks, e->map.heads), 256, 0, ctx.stream()>>>(e->map, bits >> 8, bits & 255);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }

@@ -1,11 +1,13 @@
 #include "models.h"
 #include "llama-impl.h"
+#include "llama-lsa.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 #include "llama-mtp-chain-sample.h"
 
 #include <atomic>
 #include <cstdlib>
+#include <vector>
 
 // Output-row gather indices, or nullptr when every row is an output (decode, speculative verify,
 // MTP drafts): the gather would then be an identity copy. The graph topology still depends only on
@@ -192,6 +194,21 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = qwen35_build_inp_out_ids(*this);
 
+    // Target layer -> predictions captured one to three attention layers earlier (graph-local only).
+    const auto & lsa = llama_lsa_cfg();
+    const bool spec_probe = lsa.spec_recall && lsa.mode != llama_lsa_config::OFF;
+    std::vector<ggml_tensor *> spec_q1(spec_probe ? n_layer : 0, nullptr), spec_q2(spec_probe ? n_layer : 0, nullptr);
+    std::vector<ggml_tensor *> spec_q3(spec_probe ? n_layer : 0, nullptr);
+    if (lsa.spec_recall && lsa.mode != llama_lsa_config::OFF) {
+        // Match the rs3 record pick or its 16-cell refinement, per row/union. Reject other arms, never silently
+        // measure a different predictor. No prefetch, slot-map write or change to the real attention is made.
+        GGML_ASSERT(lsa.mode == llama_lsa_config::KEY && lsa.idx_cache && !lsa.per_head &&
+                lsa.block == 128 && (lsa.refine == 128 || lsa.refine == 16) && lsa.fused_sel && !lsa.unit_op && !lsa.rec_blk &&
+                !lsa.block_sum && !lsa.fast && lsa.topp <= 0.0 && lsa.pick_every == 1 && !lsa.pick_check &&
+                !lsa.blk_list && !lsa.vk && !lsa.sj_compact && lsa.resident_sticky == 0.0 &&
+                lsa.slice == 0 && lsa.window >= 8192 && lsa.sinks >= 128 && (!lsa.shared || lsa.shared_union));
+    }
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -202,6 +219,35 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
         cb(cur, "attn_norm", il);
 
         ggml_build_forward_expand(gf, cur);
+
+        lsa_spec_q = spec_probe ? spec_q1[il] : nullptr;
+        lsa_spec_q2 = spec_probe ? spec_q2[il] : nullptr;
+        lsa_spec_q3 = spec_probe ? spec_q3[il] : nullptr;
+        lsa_spec_sel = nullptr;
+        if (lsa.spec_recall && lsa.mode != llama_lsa_config::OFF && !hparams.is_recr(il) &&
+                lsa.layer_enabled(il) && llama_lsa_map_has_layer(il) && n_tokens <= 8 && ubatch.n_seqs_unq == 1) {
+            int next = il;
+            for (int ahead = 1; ahead <= 3; ++ahead) {
+                do { ++next; } while (next < n_layer && (hparams.is_recr(next) ||
+                        !lsa.layer_enabled(next) || !llama_lsa_map_has_layer(next)));
+                if (next == n_layer) { break; }
+                const auto & layer = model.layers[next];
+                GGML_ASSERT(layer.wq && !layer.wqkv); // Swift's separate joint query/gate projection
+                ggml_tensor * sq = build_norm(inpL, layer.attn_norm, nullptr, LLM_NORM_RMS, next);
+                sq = build_lora_mm(layer.wq, sq, layer.wq_s);
+                if (layer.wq_b) {
+                    sq = ggml_add(ctx0, sq, layer.wq_b);
+                }
+                sq = ggml_view_3d(ctx0, sq, n_embd_head, n_head, n_tokens,
+                        ggml_element_size(sq)*n_embd_head*2, ggml_element_size(sq)*n_embd_head*2*n_head, 0);
+                sq = build_norm(sq, layer.attn_q_norm, nullptr, LLM_NORM_RMS, next);
+                sq = ggml_rope_multi(ctx0, sq, inp_pos, nullptr, n_rot, sections, rope_type, n_ctx_orig,
+                        freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                (ahead == 1 ? spec_q1 : ahead == 2 ? spec_q2 : spec_q3)[next] = sq;
+                cb(sq, ahead == 1 ? "lsa_spec_q" : ahead == 2 ? "lsa_spec_q2" : "lsa_spec_q3", next);
+                ggml_build_forward_expand(gf, sq); // capture before this source layer runs
+            }
+        }
 
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {

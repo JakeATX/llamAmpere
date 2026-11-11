@@ -162,7 +162,7 @@ public:
         // (fork: last, after the fork's tail - upstream passes it right after name_tag)
                             bool   is_indexer = false);
 
-    ~llama_kv_cache() { scratch_cancel(); }
+    ~llama_kv_cache() { scratch_cancel(); lsa_idx_forget(); }
 
     //
     // llama_memory_i
@@ -221,6 +221,8 @@ public:
     bool scratch_safe(uint32_t n_tokens) const;
     void scratch_release();
     void scratch_cancel();
+    void lsa_idx_invalidate(const char * why) const; // LSA index/mean caches of this cache's layers only
+    void lsa_idx_forget() const; // destructor: free the LSA index/mean caches of the layers this cache owns
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);
     bool kv_stream_resize_pool(
@@ -402,6 +404,7 @@ public:
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
             const int32_t * rows = nullptr, bool block_uniform = false) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_lsa_pos   (ggml_tensor * cell_pos, ggml_tensor * q_pos, const llama_ubatch * ubatch) const; // LSA probe
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -445,6 +448,7 @@ private:
         size_t    sj_kvarn_rec_bytes = 0;
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
+        bool      shared             = false; // tensors belong to the source cache (shared-cell draft cache): never forget them
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -623,6 +627,9 @@ private:
     kv_stream_runtime_owner kv_stream_runtime;
     llama_memory_bufs ctxs_bufs;
 
+    // LLAMA_LSA_RESIDENT=auto kept every body on the card: no resident-only behavior (tile skip flag stays as with residency off)
+    bool lsa_res_auto_off = false;
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
@@ -762,6 +769,7 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
+    uint32_t get_kv_size() const; // cells of the cache (LSA index cache rows on SJ-KVaRN)
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -823,6 +831,7 @@ public:
     // fork compat: dense mask without kv_rows
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_lsa_pos   (ggml_tensor * cell_pos, ggml_tensor * q_pos, const llama_ubatch * ubatch) const; // LSA probe
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

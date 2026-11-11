@@ -1,4 +1,7 @@
 #include "llama-graph.h"
+#include "llama-lsa.h"
+#include "../ggml/src/ggml-lsa-recall.h"
+#include "llama-lsa-gather.h"
 #include "llama-sampler.h"
 #include "llama-ext.h"
 #include "llama-mtp-chain-sample.h"
@@ -20,6 +23,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -892,9 +896,47 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_sj_kvarn_desc && self_sj_kvarn_desc->buffer) {
         mctx->set_input_sj_kvarn_desc(self_sj_kvarn_desc, ubatch, 0);
     }
+
+    if (lsa_cell_pos && lsa_cell_pos->buffer && lsa_q_pos->buffer) {
+        mctx->set_input_lsa_pos(lsa_cell_pos, lsa_q_pos, ubatch);
+    }
+    if (lsa_kq_mask && lsa_kq_mask->buffer) {
+        mctx->set_input_kq_mask(lsa_kq_mask, ubatch, cparams.causal_attn);
+    }
+    llama_lsa_set_q_cell(lsa_q_cell, ubatch);
+    if (lsa_n_blk > 0) {
+        llama_lsa_set_q_blk(lsa_q_blk, lsa_q_cell ? lsa_q_cell : self_k_idxs, lsa_n_blk);
+    }
+    if (lsa_n_blk > 0 && lsa_u_blk) {
+        llama_lsa_set_mean_inputs(lsa_u_blk, lsa_u_rblk, lsa_q_ring, lsa_q_cell ? lsa_q_cell : self_k_idxs, lsa_n_blk, lsa_ring_n,
+                lsa_ring_rows);
+    }
+    for (const auto & c : lsa_idx_commit) {
+        llama_lsa_idx_commit(c.first, c.second);
+    }
+    for (const auto & c : lsa_mean_commit) {
+        llama_lsa_mean_commit(c.first, c.second);
+    }
+    for (const auto & c : lsa_pick_commit) {
+        llama_lsa_pick_commit(c.k, c.gen, c.reuse, c.pos0, c.edge, c.nbs, c.seq, c.expire);
+    }
     if (self_sj_kvarn_desc_edge && self_sj_kvarn_desc_edge->buffer) {
         mctx->set_input_sj_kvarn_desc(self_sj_kvarn_desc_edge, ubatch, 1);
     }
+}
+
+// LSA probe: the selection shape (dense or sparse, kept count) is decided at graph build from n_tokens, n_kv and whether
+// the layer's index/mean caches are built. Default: rebuild every ubatch. LLAMA_LSA_GRAPH_REUSE=1: reuse when n_kv is the
+// same (the caller's mask check), this graph built no cache (nothing to commit, so it is the settled form), no cache
+// changed since (a restore or K shift bumps the generation), and neither ubatch starts a sequence (position 0 rebuilds).
+// Positions, rows and ring slots are graph inputs, refreshed by set_input on every decode.
+static bool lsa_graph_reusable(const llm_graph_input_attn_kv & inp, const llama_ubatch & ubatch, uint32_t n_kv) {
+    if (inp.lsa_cell_pos == nullptr) {
+        return true;
+    }
+    return llama_lsa_graph_reuse_on() && ubatch.pos != nullptr && ubatch.pos[0] != 0 && inp.lsa_pos0 != 0 &&
+            inp.lsa_cell_pos->ne[0] == (int64_t) n_kv && inp.lsa_graph_gen == llama_lsa_graph_gen() &&
+            inp.lsa_idx_commit.empty() && inp.lsa_mean_commit.empty() && inp.lsa_pick_commit.empty();
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -914,6 +956,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     if (self_sj_kvarn_desc && (!skip_unused || self_sj_kvarn_desc->buffer)) {
         res &= sj_kvarn_n_kv_streams == mctx->get_sj_kvarn_n_kv_streams();
     }
+
+    res &= lsa_graph_reusable(*this, params.ubatch, mctx->get_n_kv());
 
     return res;
 }
@@ -1476,6 +1520,31 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_sj_kvarn_desc_edge && inp_attn->self_sj_kvarn_desc_edge->buffer) {
         mctx->get_attn()->set_input_sj_kvarn_desc(inp_attn->self_sj_kvarn_desc_edge, ubatch, 1);
     }
+    if (inp_attn->lsa_cell_pos && inp_attn->lsa_cell_pos->buffer && inp_attn->lsa_q_pos->buffer) {
+        mctx->get_attn()->set_input_lsa_pos(inp_attn->lsa_cell_pos, inp_attn->lsa_q_pos, ubatch);
+    }
+    if (inp_attn->lsa_kq_mask && inp_attn->lsa_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->lsa_kq_mask, ubatch, cparams.causal_attn);
+    }
+    llama_lsa_set_q_cell(inp_attn->lsa_q_cell, ubatch);
+    if (inp_attn->lsa_n_blk > 0) {
+        llama_lsa_set_q_blk(inp_attn->lsa_q_blk, inp_attn->lsa_q_cell ? inp_attn->lsa_q_cell : inp_attn->self_k_idxs,
+                inp_attn->lsa_n_blk);
+    }
+    if (inp_attn->lsa_n_blk > 0 && inp_attn->lsa_u_blk) {
+        llama_lsa_set_mean_inputs(inp_attn->lsa_u_blk, inp_attn->lsa_u_rblk, inp_attn->lsa_q_ring,
+                inp_attn->lsa_q_cell ? inp_attn->lsa_q_cell : inp_attn->self_k_idxs, inp_attn->lsa_n_blk, inp_attn->lsa_ring_n,
+                inp_attn->lsa_ring_rows);
+    }
+    for (const auto & c : inp_attn->lsa_idx_commit) {
+        llama_lsa_idx_commit(c.first, c.second);
+    }
+    for (const auto & c : inp_attn->lsa_mean_commit) {
+        llama_lsa_mean_commit(c.first, c.second);
+    }
+    for (const auto & c : inp_attn->lsa_pick_commit) {
+        llama_lsa_pick_commit(c.k, c.gen, c.reuse, c.pos0, c.edge, c.nbs, c.seq, c.expire);
+    }
 
     inp_rs->fill_s_copy(mctx->get_recr());
 
@@ -1497,6 +1566,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     if (inp_attn->self_sj_kvarn_desc) {
         res &= inp_attn->sj_kvarn_n_kv_streams == mctx->get_attn()->get_sj_kvarn_n_kv_streams();
     }
+
+    res &= lsa_graph_reusable(*inp_attn, params.ubatch, mctx->get_attn()->get_n_kv());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3945,6 +4016,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
+    // LLAMA_LSA_BLKLIST mask: only the single-stream flash attention node below resolves its sentinel cells
+    GGML_ASSERT(lsa_fa_sel == nullptr || kq_mask != lsa_fa_m3 || (use_flash_attn && k->ne[3] == 1));
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -4050,15 +4123,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         }
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        ggml_tensor * fa_node = cur; // the pick below attaches after the SJ-KVaRN record pool (src[6]/src[7])
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         if (fa_sel_rows != nullptr) {
+            GGML_ASSERT(lsa_fa_sel == nullptr || kq_mask != lsa_fa_m3);
             cur->src[8] = fa_sel_rows;
             fa_sel_rows = nullptr;
         }
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
+        if (lsa_lse_req) { // LLAMA_LSA_COMP=2 (opt-in): row log-sum-exp output (plain and SJ-KVaRN FA)
+            lsa_lse = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, q->ne[2], q->ne[1], q->ne[3]);
+            ggml_format_name(lsa_lse, "lsa_lse-%d", il);
+            ggml_flash_attn_ext_set_lse(cur, lsa_lse);
+        }
+        lsa_lse_req = false;
 
         // SJ-KVaRN: attach the sealed record pool + region descriptor; Q/K/V are Hadamard-rotated, so un-rotate the output
         const bool is_sj_kvarn_attn = sj_kvarn_pending.body != nullptr;
@@ -4091,6 +4172,36 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
                 cur = ggml_turbo_wht(ctx0, cur, 1, group, nullptr);
             }
+        }
+
+        if (lsa_fa_sel != nullptr && kq_mask == lsa_fa_m3) {
+            // after ggml_flash_attn_ext_set_sj_kvarn: VK needs src[6] set and src[7] (QSA list) free
+            // LLAMA_LSA_BLKLIST: the mask holds GGML_LSA_MASK_SEL at droppable cells, resolved by the block pick
+            GGML_ASSERT(is_sj_kvarn_attn); // sj_kvarn_pending is already cleared here
+            if (lsa_fa_vk) {
+                // LLAMA_LSA_VK: the pick travels in the virtual-key plane; the dropped blocks' means join the softmax
+                GGML_ASSERT(!lsa_lse_req && lsa_vk_km && lsa_vk_vm);
+                if (lsa_fa_vk_n > 0) { // unit pick after the mean-block counts
+                    ggml_flash_attn_ext_set_lsa_vk_units(fa_node, lsa_fa_sel, lsa_fa_blk, lsa_fa_vk_n, lsa_vk_km, lsa_vk_vm,
+                            (float) llama_lsa_cfg().comp_bias);
+                } else {
+                    ggml_flash_attn_ext_set_lsa_vk(fa_node, lsa_fa_sel, lsa_fa_blk, lsa_vk_km, lsa_vk_vm,
+                            (float) llama_lsa_cfg().comp_bias);
+                }
+                lsa_vk_done = true;
+            } else {
+                ggml_flash_attn_ext_set_lsa_blocks(fa_node, lsa_fa_sel, lsa_fa_blk);
+            }
+            lsa_fa_sel = nullptr;
+            lsa_fa_m3  = nullptr;
+            lsa_fa_vk  = false;
+            lsa_fa_vk_n = 0;
+        }
+
+        if (lsa_spec_sel) {
+            GGML_ASSERT(is_sj_kvarn_attn && kq_mask->type == GGML_TYPE_F16 && q->ne[3] == 1);
+            ggml_flash_attn_ext_set_lsa_spec_recall(fa_node, lsa_spec_sel);
+            lsa_spec_sel = nullptr;
         }
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
@@ -4322,6 +4433,59 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->sj_kvarn_n_kv_streams = mctx_cur->get_sj_kvarn_n_kv_streams();
     }
 
+    // LSA probe (llama-lsa.h): one stream only; rotated-K caches stay dense. SJ-KVaRN: key/pos mode with the index
+    // cache only (its K is stored rotated and sealed, so the index keys must come from k_cur as it is stored)
+    const auto & lsa_cfg = llama_lsa_cfg();
+    const bool lsa_sj_ok = !mctx_cur->is_sj_kvarn() || (lsa_cfg.idx_cache && !lsa_cfg.fast &&
+        (lsa_cfg.mode == llama_lsa_config::KEY || lsa_cfg.mode == llama_lsa_config::POS));
+    if (lsa_cfg.mode != llama_lsa_config::OFF && !cparams.training && lsa_sj_ok &&
+            (cparams.kv_unified || ubatch.n_seqs_unq == 1)) {
+        inp->lsa_graph_gen = llama_lsa_graph_gen();
+        inp->lsa_pos0      = ubatch.pos ? ubatch.pos[0] : 0;
+        inp->lsa_cell_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, mctx_cur->get_n_kv(), 1);
+        ggml_set_input(inp->lsa_cell_pos);
+        ggml_set_name(inp->lsa_cell_pos, "attn_inp_lsa_cell_pos");
+        inp->lsa_q_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
+        ggml_set_input(inp->lsa_q_pos);
+        ggml_set_name(inp->lsa_q_pos, "attn_inp_lsa_q_pos");
+        if (inp->self_kq_mask && inp->self_kq_mask->type == GGML_TYPE_I32) {
+            // LLAMA_LSA_PACKED=1 (llama-context keeps the packed mask only then): f16 dense mask for the LSA layers
+            inp->lsa_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, /*allow_packed=*/false);
+            ggml_set_name(inp->lsa_kq_mask, "attn_inp_lsa_kq_mask");
+        }
+        if (mctx_cur->is_sj_kvarn()) {
+            inp->lsa_q_cell = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_tokens);
+            ggml_set_input(inp->lsa_q_cell);
+            ggml_set_name(inp->lsa_q_cell, "attn_inp_lsa_q_cell");
+        }
+        if (lsa_cfg.block_sum || lsa_cfg.comp_fast) {
+            inp->lsa_q_blk = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+            ggml_set_input(inp->lsa_q_blk);
+            ggml_set_name(inp->lsa_q_blk, "attn_inp_lsa_q_blk");
+        }
+        if (lsa_cfg.comp_fast) {
+            const int64_t B   = lsa_cfg.block > 1 ? lsa_cfg.block : 128;
+            const int64_t n_u = (ubatch.n_tokens + B - 1)/B + 1; // most distinct blocks a ubatch of consecutive rows touches
+            inp->lsa_u_blk = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_u);
+            ggml_set_input(inp->lsa_u_blk);
+            ggml_set_name(inp->lsa_u_blk, "attn_inp_lsa_u_blk");
+            if (mctx_cur->is_sj_kvarn()) {
+                // carry ring (default): a few blocks per layer persist; the ubatch's rows are staged in graph scratch
+                // (shared by every layer). Legacy: every row of the ubatch goes through a per-layer ring of
+                // n_ubatch + 2 blocks (277 MiB over 16 layers at n_ubatch 4096, 1024-dim K and V, f16)
+                inp->lsa_ring_rows = !lsa_cfg.ring_legacy;
+                inp->lsa_ring_n = inp->lsa_ring_rows ? lsa_cfg.ring_rows : ((int64_t) (cparams.n_ubatch + B - 1)/B + 1)*B;
+                inp->lsa_u_rblk = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->lsa_ring_rows ? n_u*B : n_u);
+                ggml_set_input(inp->lsa_u_rblk);
+                ggml_set_name(inp->lsa_u_rblk, "attn_inp_lsa_u_rblk");
+                inp->lsa_q_ring = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64,
+                        inp->lsa_ring_rows ? std::min<int64_t>(ubatch.n_tokens, inp->lsa_ring_n) : ubatch.n_tokens);
+                ggml_set_input(inp->lsa_q_ring);
+                ggml_set_name(inp->lsa_q_ring, "attn_inp_lsa_q_ring");
+            }
+        }
+    }
+
     return inp;
 }
 
@@ -4507,6 +4671,2387 @@ static ggml_tensor * build_attn_scale_kv_output(
     return cur;
 }
 
+// plain K types only: the TurboQuant/TQ types hold WHT-rotated K, where the map would see mixed dims
+// LLAMA_LSA_STATS: a = [3, T] per-row (kept, valid, sink+window) cell counts of one layer's final mask. CPU custom
+// op, so the scheduler copies the tiny tensor over each step (probe only). Logs the running kept share at WARN level
+// (llama-server filters libllama INFO) every 256 calls of a layer.
+// LLAMA_LSA_DUMP: write one tensor of one layer as raw f32 (once per layer and tensor), plus a line in <prefix>.index.txt
+static const char * const lsa_dump_names[] = {"q", "k", "v", "score", "mask", "cell_pos", "q_pos"};
+static std::atomic<bool> lsa_dump_done[256][7];
+
+// LLAMA_LSA_RESIDENT_STICKY (opt-in): hand a select node the layer's page body (src 7) and SJ-KVaRN desc (src 8),
+// the bonus (param 10) and the cells per scored element (param 11); the CUDA select adds the bonus to units whose
+// 128-cell record is in a card slot. Off (0 or no residency): the node is unchanged.
+static ggml_tensor * lsa_sticky(ggml_tensor * sel, ggml_tensor * body, ggml_tensor * desc, int cells_per_elem) {
+    const auto & cfg = llama_lsa_cfg();
+    if (sel == nullptr || cfg.resident_sticky == 0.0 || cfg.resident <= 0.0 || body == nullptr || desc == nullptr) {
+        return sel;
+    }
+    const float b = (float) cfg.resident_sticky;
+    const int32_t c = cells_per_elem;
+    memcpy((char *) sel->op_params + 10*sizeof(int32_t), &b, sizeof(b));
+    memcpy((char *) sel->op_params + 11*sizeof(int32_t), &c, sizeof(c));
+    sel->src[7] = body;
+    sel->src[8] = desc;
+    return sel;
+}
+
+// LLAMA_LSA_SLICE (opt-in): slice-local quota pick on a select node (op param 13 = units per slice; both refine stages)
+static ggml_tensor * lsa_slice(ggml_tensor * sel, int64_t cells_per_unit) {
+    const auto & cfg = llama_lsa_cfg();
+    if (sel == nullptr || cfg.slice <= 0) {
+        return sel;
+    }
+    const int32_t u = (int32_t) std::max<int64_t>(1, cfg.slice/std::max<int64_t>(1, cells_per_unit));
+    memcpy((char *) sel->op_params + 13*sizeof(int32_t), &u, sizeof(u));
+    return sel;
+}
+
+static void lsa_dump_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    memcpy(dst->data, a->data, ggml_nbytes(a));
+    const int il = (int) ((intptr_t) userdata >> 4), w = (int) ((intptr_t) userdata & 15);
+    if (il < 0 || il >= 256 || w >= 7 || a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) ||
+            lsa_dump_done[il][w].exchange(true)) {
+        return;
+    }
+    const std::string & pre = llama_lsa_cfg().dump;
+    const std::string path = pre + ".L" + std::to_string(il) + "." + lsa_dump_names[w] + ".f32";
+    FILE * f = fopen(path.c_str(), "wb");
+    const bool ok = f && fwrite(a->data, 1, ggml_nbytes(a), f) == ggml_nbytes(a);
+    if (f) {
+        fclose(f);
+    }
+    if (FILE * fi = fopen((pre + ".index.txt").c_str(), "a")) {
+        fprintf(fi, "%d %s %lld %lld %lld %lld %s\n", il, lsa_dump_names[w], (long long) a->ne[0], (long long) a->ne[1],
+                (long long) a->ne[2], (long long) a->ne[3], ok ? "ok" : "FAIL");
+        fclose(fi);
+    }
+    LLAMA_LOG_WARN("lsa-dump: layer %d %s [%lld, %lld] -> %s%s\n", il, lsa_dump_names[w], (long long) a->ne[0],
+            (long long) a->ne[1], path.c_str(), ok ? "" : " (write FAILED)");
+}
+
+// LLAMA_LSA_SCORE_LOG: a = [2 + 2*nu] F32 = (row 0 position, rows T, the max over rows of each unit's logsumexp score,
+// then 0/1 per unit: holds a middle cell of row 0 = visible, past the sinks, outside the window). Appends one record per
+// call to <prefix>.L<il>.f16: int32 {pos0, nu, F, T}, nu f16 scores (non-finite clamp to +-65504), then the middle flags
+// as ceil(nu/8) bytes (bit i%8 of byte i/8). Diagnostic only; the graph output is a copy of a.
+static void lsa_score_log_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    memcpy(dst->data, a->data, ggml_nbytes(a));
+    const int il = (int) ((intptr_t) userdata & 255), F = (int) ((intptr_t) userdata >> 8);
+    if (a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || ggml_nelements(a) < 3) {
+        return;
+    }
+    const float * r  = (const float *) a->data;
+    const int32_t nu = (int32_t) ((ggml_nelements(a) - 2)/2);
+    std::vector<ggml_fp16_t> h(nu);
+    std::vector<uint8_t>     m((nu + 7)/8, 0);
+    for (int32_t i = 0; i < nu; ++i) {
+        const float v = r[2 + i];
+        h[i] = ggml_fp32_to_fp16(std::isfinite(v) ? std::max(-65504.0f, std::min(65504.0f, v)) : (v > 0 ? 65504.0f : -65504.0f));
+        if (r[2 + nu + i] > 0.5f) {
+            m[i/8] |= (uint8_t) (1u << (i%8));
+        }
+    }
+    const int32_t hdr[4] = { (int32_t) r[0], nu, F, (int32_t) r[1] };
+    const std::string path = llama_lsa_cfg().score_log + ".L" + std::to_string(il) + ".f16";
+    FILE * f = fopen(path.c_str(), "ab");
+    const bool ok = f && fwrite(hdr, sizeof(hdr), 1, f) == 1 && fwrite(h.data(), sizeof(ggml_fp16_t), nu, f) == (size_t) nu &&
+        fwrite(m.data(), 1, m.size(), f) == m.size();
+    if (f) {
+        fclose(f);
+    }
+    static std::atomic<int> logged{0};
+    if (!ok || logged.fetch_add(1) == 0) {
+        LLAMA_LOG_WARN("lsa-score-log: layer %d pos %d units %d of %d rows %d -> %s%s\n", il, hdr[0], nu, F, hdr[3],
+                path.c_str(), ok ? "" : " (write FAILED)");
+    }
+}
+
+// LLAMA_LSA_PICK_CHECK: a = [3] over row 0's middle units (outside the window, past the sinks, visible) =
+// (fresh AND reused, fresh, reused). Logs per layer every 64 reuse graphs: share of the fresh pick the reused one
+// holds (recall), and reused/fresh size. Low recall = the stored pick is not the pick it should be.
+static void lsa_pick_check_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    // userdata = layer | age << 8 (age = graphs since the pick graph, capped at 15): recall by age separates a wrong
+    // stored pick (low at every age, age 1 included) from staleness (high at age 1, falling with age).
+    // a = [3*NL]: (fresh AND reused, fresh, reused) at the pick's own unit, then the same with both picks widened to
+    // 16-, 64- and 128-cell blocks (a block counts as kept if any of its units is): does the same region stay kept
+    // even when the exact units move inside it
+    constexpr int NL = 4;
+    static const char * lvl_name[NL] = { "unit", "b16", "b64", "b128" };
+    static double acc[256][16][NL][3];
+    static int64_t calls[256];
+    const int il  = (int) ((intptr_t) userdata & 255);
+    const int age = (int) std::min<intptr_t>(15, (intptr_t) userdata >> 8);
+    if (a->type != GGML_TYPE_F32 || ggml_nelements(a) != 3*NL) {
+        return;
+    }
+    const float * r = (const float *) a->data;
+    for (int l = 0; l < NL; ++l) {
+        for (int j = 0; j < 3; ++j) {
+            acc[il][0][l][j]   += r[3*l + j];
+            acc[il][age][l][j] += r[3*l + j];
+        }
+    }
+    if (++calls[il] % 64 == 0) {
+        std::string by_age;
+        char buf[48];
+        for (int l = 0; l < NL; ++l) {
+            by_age += l == 0 ? "" : " |";
+            by_age += " ";
+            by_age += lvl_name[l];
+            for (int k = 1; k < 16; ++k) {
+                if (acc[il][k][l][1] > 0) {
+                    snprintf(buf, sizeof(buf), " a%d %.1f%%", k, 100.0*acc[il][k][l][0]/acc[il][k][l][1]);
+                    by_age += buf;
+                }
+            }
+        }
+        LLAMA_LOG_WARN("lsa-pick-check: layer %d reuse graphs %lld recall %.2f%% reused/fresh %.3f (fresh %.1f units/graph) by age:%s\n",
+                il, (long long) calls[il], 100.0*acc[il][0][0][0]/std::max(acc[il][0][0][1], 1.0),
+                acc[il][0][0][2]/std::max(acc[il][0][0][1], 1.0), acc[il][0][0][1]/(double) calls[il], by_age.c_str());
+    }
+    memcpy(dst->data, a->data, ggml_nbytes(a));
+}
+
+static void lsa_stats_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    static double acc[256][3];
+    static int64_t calls[256];
+    const int il = (int) (intptr_t) userdata;
+    if (il < 0 || il >= 256 || a->type != GGML_TYPE_F32 || a->ne[0] != 3) {
+        return;
+    }
+    for (int64_t t = 0; t < a->ne[1]; ++t) {
+        const float * r = (const float *) ((const char *) a->data + t*a->nb[1]);
+        for (int j = 0; j < 3; ++j) {
+            acc[il][j] += r[j];
+        }
+    }
+    if (++calls[il] % 256 == 0) {
+        const double mid_kept = acc[il][0] - acc[il][2], mid_all = acc[il][1] - acc[il][2];
+        LLAMA_LOG_WARN("lsa-stats: layer %d calls %lld kept %.2f%% of cells, %.2f%% of middle\n", il, (long long) calls[il],
+                100.0*acc[il][0]/std::max(acc[il][1], 1.0), 100.0*mid_kept/std::max(mid_all, 1.0));
+    }
+    memcpy(dst->data, a->data, ggml_nbytes(a));
+}
+
+// LLAMA_LSA_STATS: middle 16-cell strips / 128-cell blocks (= SJ-KVaRN body strips / records) that some row of the
+// ubatch keeps, out of those holding any visible middle cell: what the SJ decode kernel's strip / record skip can drop
+static void lsa_stats_blk_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    static double acc[256][4];
+    static int64_t calls[256];
+    const int il = (int) (intptr_t) userdata;
+    if (il < 0 || il >= 256 || a->type != GGML_TYPE_F32 || ggml_nelements(a) != 4) {
+        return;
+    }
+    const float * r = (const float *) a->data;
+    for (int j = 0; j < 4; ++j) {
+        acc[il][j] += r[j];
+    }
+    if (++calls[il] % 256 == 0) {
+        LLAMA_LOG_WARN("lsa-stats: layer %d ubatches %lld live middle strips %.2f%%, live middle records %.2f%%\n", il,
+                (long long) calls[il], 100.0*acc[il][0]/std::max(acc[il][1], 1.0), 100.0*acc[il][2]/std::max(acc[il][3], 1.0));
+    }
+    memcpy(dst->data, a->data, ggml_nbytes(a));
+}
+
+// LLAMA_LSA_STATS, block pick: a = [3] = (picked blocks summed over rows, blocks picked by any row, rows). Logs the
+// running mean per row, the union and their ratio per layer every 256 ubatches.
+static void lsa_stats_union_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    static double acc[256][3];
+    static int64_t calls[256];
+    const int il = (int) (intptr_t) userdata;
+    if (il < 0 || il >= 256 || a->type != GGML_TYPE_F32 || ggml_nelements(a) != 3) {
+        return;
+    }
+    const float * r = (const float *) a->data;
+    for (int j = 0; j < 3; ++j) {
+        acc[il][j] += r[j];
+    }
+    if (++calls[il] % 256 == 0) {
+        const double per_row = acc[il][0]/std::max(acc[il][2], 1.0), uni = acc[il][1]/(double) calls[il];
+        LLAMA_LOG_WARN("lsa-stats: layer %d ubatches %lld rows/ubatch %.2f picked blocks/row %.1f union %.1f (x%.2f)\n", il,
+                (long long) calls[il], acc[il][2]/(double) calls[il], per_row, uni, uni/std::max(per_row, 1e-9));
+    }
+    memcpy(dst->data, a->data, ggml_nbytes(a));
+}
+
+// LLAMA_LSA_RECALL: a = [3] = (sum over rows x q heads of the true attention probability on the kept cells,
+// rows x heads whose missed probability is > 10%, rows x heads). Logs the running kept mass per layer every 256 calls.
+static void lsa_recall_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    static double acc[256][3];
+    static int64_t calls[256];
+    const int il = (int) (intptr_t) userdata;
+    if (il < 0 || il >= 256 || a->type != GGML_TYPE_F32 || ggml_nelements(a) != 3) {
+        return;
+    }
+    const float * r = (const float *) a->data;
+    for (int j = 0; j < 3; ++j) {
+        acc[il][j] += r[j];
+    }
+    if (++calls[il] % 256 == 0) {
+        const double n = std::max(acc[il][2], 1.0);
+        LLAMA_LOG_WARN("lsa-recall: layer %d calls %lld kept attention mass %.4f%% missed %.4f%% rows>10%%missed %.2f%% n %.0f\n",
+                il, (long long) calls[il], 100.0*acc[il][0]/n, 100.0*(1.0 - acc[il][0]/n), 100.0*acc[il][1]/n, acc[il][2]);
+    }
+    memcpy(dst->data, a->data, ggml_nbytes(a));
+}
+
+static bool lsa_k_plain(ggml_type t) {
+    return t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_F32 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q5_0 ||
+           t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_IQ4_NL;
+}
+
+// LSA probe (llama-lsa.h). Scores every KV cell for each query row in the 64-dim index space, adds a large bonus to
+// the first `sinks` positions and the last `window` positions, adds the causal mask, keeps the top
+// sinks + window + keep cells, and builds the replacement mask the way the DSA path does (fill -inf, set the kept
+// cells to 0, add the original mask). The layer stays dense when it has no map, when the cache is not plain
+// single-stream f16/bf16/q8_0-style K, when the ubatch is wider than max_rows or starts before min_pos, or when
+// n_kv is not larger than the kept count.
+// A shared pick (LLAMA_LSA_SHARED, LLAMA_LSA_FAST) ranks blocks by all rows of the ubatch together. Rows of different
+// sequences (several server slots in one ubatch) see different cells, so one sequence's rows would spend the keep
+// budget on cells the other sequence's rows cannot see. Such ubatches pick per row; one-sequence ubatches are unchanged.
+static bool lsa_one_seq(const llama_ubatch & ub, int il = -1) {
+    if (ub.n_seqs_unq <= 1) {
+        return true;
+    }
+    static bool warned = false;
+    if (!warned && il >= 0) {
+        warned = true;
+        LLAMA_LOG_WARN("%s: LSA ubatch holds %u sequences: shared pick off for it, every row picks its own blocks\n",
+            __func__, (unsigned) ub.n_seqs_unq);
+    }
+    return false;
+}
+
+ggml_tensor * llm_graph_context::build_attn_lsa_mask(
+        const llm_graph_input_attn_kv * inp,
+        ggml_tensor * q,
+        ggml_tensor ** k_io,
+        ggml_tensor ** v_io,
+        ggml_tensor * kq_mask,
+                int   il,
+            int64_t * n_kv_max,
+        ggml_tensor * idx,
+              float   kq_scale_lsa,
+        std::vector<ggml_tensor *> * masks_h) const {
+    const auto & cfg = llama_lsa_cfg();
+    if (cfg.mode == llama_lsa_config::OFF || !cfg.layer_enabled(il)) {
+        return nullptr;
+    }
+    const bool cfg_shared = cfg.shared && lsa_one_seq(ubatch, il); // rows of other sequences never share a pick
+    const bool cfg_union  = cfg.shared_union && lsa_one_seq(ubatch, il); // SHARED=3: per-row picks, OR-ed (block/unit pick)
+    ggml_tensor * k = *k_io;
+
+    // SJ-KVaRN (inp->lsa_q_cell set): k is the sink + ring view, cells == positions; n_kv comes from the mask and
+    // scoring must use the index cache
+    const bool sj = inp->lsa_q_cell != nullptr;
+    if (sj && (idx == nullptr || cfg.fast || masks_h != nullptr ||
+            (cfg.mode != llama_lsa_config::KEY && cfg.mode != llama_lsa_config::POS))) {
+        return nullptr;
+    }
+    const int64_t n_kv = sj ? kq_mask->ne[0] : k->ne[2];
+    const int64_t T    = q->ne[2];
+    if (sj && (inp->lsa_cell_pos->ne[0] != n_kv || idx->ne[1] != n_kv)) {
+        return nullptr;
+    }
+
+    if (k->ne[3] != 1 || q->ne[3] != 1 || kq_mask->ne[3] != 1) {
+        return nullptr;
+    }
+    if (kq_mask->type != GGML_TYPE_F16 && kq_mask->type != GGML_TYPE_F32) {
+        return nullptr; // packed mask: llama-context turns it off when LSA is on
+    }
+    if (kq_mask->ne[0] != n_kv || kq_mask->ne[1] != T || T > cfg.max_rows) {
+        return nullptr;
+    }
+    if (ubatch.pos && cfg.min_pos > 0) {
+        // rows before min_pos keep the full mask (handled per row below); skip the work if no row is past it
+        bool any = false;
+        for (int64_t i = 0; i < T; ++i) {
+            any = any || ubatch.pos[i] >= cfg.min_pos;
+        }
+        if (!any) {
+            return nullptr;
+        }
+    }
+
+    // LLAMA_LSA_KEEP_SCHED (opt-in): the fraction follows the context length; below the first point the layer stays dense
+    const double  sched   = cfg.keep_frac_sched(n_kv);
+    if (sched == 0.0) {
+        return nullptr;
+    }
+    const double  frac    = sched > 0.0 ? cfg.keep_frac_for(il, sched) : cfg.keep_frac_for(il);
+    if (frac >= 1.0) {
+        return nullptr; // per-layer override: this layer stays dense
+    }
+    int64_t keep_lr = frac > 0.0 ? (int64_t) (frac * (double) n_kv) : cfg.keep;
+    // LLAMA_LSA_RESIDENT_LOWER_KEEP (opt-in): the resident sizing capped keep so one row's reads fit the card slots
+    if (const double cf = llama_lsa_keep_cap_frac(); cf > 0.0 && frac > 0.0 && frac > cf) {
+        keep_lr = (int64_t) (cf * (double) n_kv);
+    } else if (const int64_t cc = llama_lsa_keep_cap_cells(); cc > 0 && frac <= 0.0) {
+        keep_lr = std::min(keep_lr, cc);
+    }
+    const int64_t k_total = cfg.sinks + cfg.window + std::max<int64_t>(keep_lr, 0);
+    if (n_kv <= k_total) {
+        return nullptr;
+    }
+
+    // K must be a plain cache view: heads of one cell packed back to back
+    const int64_t n_head    = q->ne[1];
+    const int64_t n_head_kv = k->ne[1];
+    const int64_t d_head    = k->ne[0];
+    const int64_t d_kv      = d_head*n_head_kv;
+    // plain K types only: the TurboQuant/TQ types hold WHT-rotated K, where the map would see mixed dims
+    const bool k_plain = lsa_k_plain(k->type);
+    if (!sj && (!k_plain || k->nb[2] != k->nb[1]*n_head_kv)) {
+        return nullptr;
+    }
+    if (q->ne[0] != d_head || n_head % n_head_kv != 0) {
+        return nullptr;
+    }
+
+    const ggml_tensor * kbase = k->view_src ? k->view_src : k;
+    lsa_pick_kbase = nullptr;
+    if (!kbase->buffer) {
+        return nullptr;
+    }
+    lsa_pick_kbase = kbase; // LLAMA_LSA_PICK_EVERY key; build_attn_lsa_mask_sb takes it
+    ggml_tensor * wq = nullptr;
+    ggml_tensor * wk = nullptr;
+    if (!cfg.mapless_probe()) {
+        if (!llama_lsa_get_map(il, ggml_backend_buffer_get_type(kbase->buffer), &wq, &wk)) {
+            return nullptr;
+        }
+        if (wk->ne[0] != d_kv) {
+            static uint32_t warned_ep = 0;
+            if (llama_lsa_log_once(warned_ep)) {
+                LLAMA_LOG_WARN("%s: LSA map width %lld != n_head_kv*head_dim %lld, LSA stays off\n", __func__,
+                        (long long) wk->ne[0], (long long) d_kv);
+            }
+            return nullptr;
+        }
+    }
+    const int64_t d_idx = wk ? wk->ne[1] : 0;
+
+    // index query: sum the q heads of each GQA group (q head h reads KV head h / g) -> [d_kv, T]
+    const int64_t g = n_head/n_head_kv;
+    ggml_tensor * qc = ggml_is_contiguous(q) ? q : ggml_cont(ctx0, q);
+    ggml_tensor * q4 = ggml_reshape_4d(ctx0, qc, d_head, g, n_head_kv, T);
+    q4 = ggml_cont(ctx0, ggml_permute(ctx0, q4, 1, 0, 2, 3)); // [g, d_head, n_head_kv, T]
+    ggml_tensor * qs = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, q4), d_kv, T);
+    if (qs->type != GGML_TYPE_F32) {
+        qs = ggml_cast(ctx0, qs, GGML_TYPE_F32);
+    }
+
+    // all heads of a cell as one row: [d_kv, n_kv]
+    ggml_tensor * kv2 = sj ? nullptr : ggml_view_2d(ctx0, k, d_kv, n_kv, k->nb[2], 0); // SJ-KVaRN: index cache only
+
+    // SJ-KVaRN per-KV-head pick (LLAMA_LSA_PER_HEAD=1, key mode, per-head index cache): one mask per KV head,
+    // repeated over its q heads (mask ne[2] == n_head). Only the 4/4 stream decode kernel reads a per-head mask, so
+    // wider ubatches (and other SJ widths) rank by the sum of the head scores, one shared mask.
+    static const int64_t sj_stream_max = std::min<int64_t>(8, getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") ?
+            atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8);
+    const bool sj_ph   = sj && cfg.per_head && cfg.mode == llama_lsa_config::KEY && idx->ne[0] == d_idx &&
+        idx->ne[2] == n_head_kv;
+    const bool sj_ph_m = sj_ph && T <= sj_stream_max && kq_mask->type == GGML_TYPE_F16 &&
+        sj_kvarn_pending.bits_k == 4 && sj_kvarn_pending.bits_v == 4 && !cfg.sj_compact;
+    if (sj && !sj_ph && (idx->ne[0] != d_idx || idx->ne[2] != 1)) {
+        return nullptr;
+    }
+
+    if (!sj_ph && cfg.block_sum && cfg.mode == llama_lsa_config::KEY && !cfg.fast && !(cfg.per_head && masks_h) &&
+            inp->lsa_smax_cur && inp->lsa_sum_il == il) {
+        if (ggml_tensor * mb = build_attn_lsa_mask_blk(inp, ggml_mul_mat(ctx0, wq, qs), kq_mask, n_kv, keep_lr, il)) {
+            return mb;
+        }
+    }
+
+    ggml_tensor * S = nullptr; // [n_kv, T]
+    std::vector<ggml_tensor *> S_heads; // per-KV-head scores (LLAMA_LSA_PER_HEAD=1, oracle/mass only)
+    auto dump_dense = [&]() {
+        if (cfg.dump.empty()) {
+            return false;
+        }
+        // Dump the first qualifying decode graph per layer. This run's attention stays dense.
+        ggml_tensor * v = *v_io;
+        const bool v_ok = v && v->ne[0] == d_head && v->ne[1] == n_head_kv && v->ne[2] == n_kv &&
+            v->nb[2] == v->nb[1]*n_head_kv;
+        bool need = false;
+        for (int w = 0; w < 7 && il >= 0 && il < 256; ++w) {
+            need = need || !lsa_dump_done[il][w].load();
+        }
+        if (need && kv2 && v_ok && T <= 8 && n_kv >= cfg.dump_min_kv) {
+            ggml_tensor * mk32 = ggml_cont(ctx0, ggml_reshape_2d(ctx0, kq_mask->type == GGML_TYPE_F32 ? kq_mask :
+                    ggml_cast(ctx0, kq_mask, GGML_TYPE_F32), n_kv, T));
+            ggml_tensor * vv = ggml_view_2d(ctx0, v, d_kv, n_kv, v->nb[2], 0);
+            ggml_tensor * parts[7] = {
+                ggml_cont(ctx0, q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32)),
+                ggml_cpy(ctx0, kv2, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_kv, n_kv)),
+                ggml_cpy(ctx0, vv, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_kv, n_kv)),
+                ggml_cont(ctx0, S), mk32, ggml_cont(ctx0, inp->lsa_cell_pos), ggml_cont(ctx0, inp->lsa_q_pos),
+            };
+            for (int w = 0; w < 7; ++w) {
+                ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, parts[w], lsa_dump_op, 1,
+                        (void *) (intptr_t) ((il << 4) | w)));
+            }
+        }
+        return true;
+    };
+    const bool per_head = cfg.per_head && masks_h && !cfg.fast && !sj &&
+        (cfg.mode == llama_lsa_config::ORACLE || cfg.mode == llama_lsa_config::MASS || cfg.mode == llama_lsa_config::KEY ||
+         cfg.mode == llama_lsa_config::QUEST);
+    if (sj_ph) {
+        // query_j = rms_norm(Wq[j]^T qs_j), score_j = key_j . query_j, batched over the KV heads
+        ggml_tensor * wq3 = ggml_cont(ctx0, ggml_view_3d(ctx0, wq, d_head, d_idx, n_head_kv, wq->nb[1], d_head*wq->nb[0], 0));
+        ggml_tensor * qs3 = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, qs, d_head, n_head_kv, T), 0, 2, 1, 3));
+        ggml_tensor * qi3 = ggml_rms_norm(ctx0, ggml_mul_mat(ctx0, wq3, qs3), 1e-12f);                    // [d_idx, T, H]
+        // LLAMA_LSA_BLOCK_SUM + per-head masks: each KV head ranks the blocks by its own summary plane (no per-cell
+        // scores); wider ubatches keep the per-cell summed-head path below
+        if (sj_ph_m && cfg.block_sum && inp->lsa_sum_il == il && (int64_t) inp->lsa_smax_h.size() == n_head_kv) {
+            ggml_tensor * m4 = nullptr;
+            for (int64_t j = 0; j < n_head_kv && (j == 0 || m4); ++j) {
+                ggml_tensor * qj = ggml_cont(ctx0, ggml_view_2d(ctx0, qi3, d_idx, T, qi3->nb[1], j*qi3->nb[2]));
+                ggml_tensor * mh = build_attn_lsa_mask_blk(inp, qj, kq_mask, n_kv, keep_lr, il,
+                        inp->lsa_smax_h[j], inp->lsa_smin_h[j], true);
+                m4 = mh ? (m4 ? ggml_concat(ctx0, m4, mh, 3) : mh) : nullptr;
+            }
+            if (m4) {
+                m4 = ggml_repeat_4d(ctx0, m4, n_kv, T, g, n_head_kv);
+                ggml_tensor * m = ggml_cast(ctx0, ggml_reshape_4d(ctx0, m4, n_kv, T, n_head, 1), kq_mask->type);
+                cb(m, "lsa_kq_mask_blk_heads", il);
+                static uint32_t logged_ep = 0;
+                if (llama_lsa_log_once(logged_ep)) {
+                    LLAMA_LOG_WARN("%s: LSA per-KV-head block-sum pick active (layer %d, T %lld, %lld heads)\n", __func__,
+                            il, (long long) T, (long long) n_head_kv);
+                }
+                return m;
+            }
+        }
+        // head-major index cache view [d_idx, n_kv, H]: each head's keys are read in place (no copy of the cache)
+        ggml_tensor * S3  = ggml_mul_mat(ctx0, idx, qi3);                                                 // [n_kv, T, H]
+        for (int64_t j = 0; j < n_head_kv; ++j) {
+            S_heads.push_back(ggml_view_2d(ctx0, S3, n_kv, T, S3->nb[1], j*S3->nb[2]));
+        }
+        if (!sj_ph_m) {
+            for (ggml_tensor * Sh : S_heads) {
+                S = S ? ggml_add(ctx0, S, Sh) : ggml_cont(ctx0, Sh);
+            }
+            S_heads.clear();
+        } else {
+            S = S_heads.front();
+        }
+    } else if (cfg.mode == llama_lsa_config::QUEST) {
+        // training-free real-key block bound (probe, plain K): per KV head j, blocks of B cells keep the channel max
+        // and min of their keys; bound_j(b, t) = sum_c Q+_jc(t) max_jbc + Q-_jc(t) min_jbc, where Q+/Q- sum the
+        // positive / negative parts of the g q heads of group j (= the sum of the heads' own bounds, so a block whose
+        // keys might score high for any head ranks high). Only whole blocks get a bound; the tail block (and anything
+        // past n_kv) is in the window. Cell score = its block's bound (cells of a block tie).
+        const int64_t B  = std::max<int64_t>(1, cfg.bucket);
+        const int64_t nb = n_kv/B;
+        if (nb < 2) {
+            return nullptr;
+        }
+        ggml_tensor * qf = q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        qf = ggml_is_contiguous(qf) ? qf : ggml_cont(ctx0, qf);
+        ggml_tensor * qpos = ggml_relu(ctx0, qf);
+        ggml_tensor * qneg = ggml_sub(ctx0, qf, qpos);
+        auto group_sum = [&](ggml_tensor * x) -> ggml_tensor * { // [d_head, n_head, T] -> [d_head, T, n_head_kv]
+            ggml_tensor * x4 = ggml_reshape_4d(ctx0, x, d_head, g, n_head_kv, T);
+            x4 = ggml_cont(ctx0, ggml_permute(ctx0, x4, 1, 0, 3, 2)); // [g, d_head, T, n_head_kv]
+            return ggml_reshape_3d(ctx0, ggml_sum_rows(ctx0, x4), d_head, T, n_head_kv);
+        };
+        ggml_tensor * QP = group_sum(qpos);
+        ggml_tensor * QN = group_sum(qneg);
+        for (int64_t j = 0; j < n_head_kv; ++j) {
+            // head j's keys of the whole blocks, dequantized row by row: [d_head, B*nb]
+            ggml_tensor * kj = ggml_view_2d(ctx0, k, d_head, nb*B, k->nb[2], j*k->nb[1]);
+            kj = ggml_cpy(ctx0, kj, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_head, nb*B));
+            ggml_tensor * x  = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, kj, d_head, B, nb), 1, 0, 2, 3)); // [B, d, nb]
+            ggml_tensor * mx = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, x, GGML_OP_POOL_MAX, (int) B, (int) B, 0), d_head, nb);
+            ggml_tensor * mn = ggml_neg(ctx0, ggml_reshape_2d(ctx0,
+                    ggml_pool_1d(ctx0, ggml_neg(ctx0, x), GGML_OP_POOL_MAX, (int) B, (int) B, 0), d_head, nb));
+            ggml_tensor * qpj = ggml_view_2d(ctx0, QP, d_head, T, QP->nb[1], j*QP->nb[2]);
+            ggml_tensor * qnj = ggml_view_2d(ctx0, QN, d_head, T, QN->nb[1], j*QN->nb[2]);
+            ggml_tensor * Sb  = ggml_add(ctx0, ggml_mul_mat(ctx0, mx, qpj), ggml_mul_mat(ctx0, mn, qnj));    // [nb, T]
+            Sb = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, Sb, 1, nb, T), B, nb, T, 1), B*nb, T);
+            if (B*nb < n_kv) {
+                Sb = ggml_pad(ctx0, Sb, (int) (n_kv - B*nb), 0, 0, 0);
+            }
+            if (per_head) {
+                S_heads.push_back(Sb);
+            } else {
+                S = S ? ggml_add(ctx0, S, Sb) : Sb;
+            }
+        }
+        if (per_head) {
+            S = S_heads.front();
+        }
+        static uint32_t logged_ep = 0;
+        if (llama_lsa_log_once(logged_ep)) {
+            LLAMA_LOG_WARN("%s: LSA quest real-key block bound active (layer %d, n_kv %lld, block %lld, per_head %d)\n",
+                    __func__, il, (long long) n_kv, (long long) B, per_head ? 1 : 0);
+        }
+    } else if (cfg.mode == llama_lsa_config::MASS) {
+        // diagnostic oracle: score = attention probability summed over the heads that share the pick (all heads,
+        // or the g q heads of one KV head). Head j's q is zero-padded into its slot of the [d_kv] cell row, so K
+        // is read as the contiguous all-heads view.
+        ggml_tensor * mask2 = ggml_reshape_2d(ctx0,
+                kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32), n_kv, T);
+        ggml_tensor * qf = q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        for (int64_t j = 0; j < n_head_kv; ++j) {
+            ggml_tensor * qg = ggml_view_3d(ctx0, qf, d_head, g, T, qf->nb[1], qf->nb[2], j*g*qf->nb[1]);
+            qg = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, qg, 0, 2, 1, 3)), d_head, T*g); // [d, T*g]
+            qg = ggml_pad_ext(ctx0, qg, (int) (j*d_head), (int) ((n_head_kv - 1 - j)*d_head), 0, 0, 0, 0, 0, 0);
+            ggml_tensor * P = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, kv2, qg), n_kv, T, g);
+            P = ggml_soft_max_ext(ctx0, P, mask2, kq_scale_lsa, 0.0f);
+            ggml_tensor * Sj = nullptr;
+            for (int64_t r = 0; r < g; ++r) {
+                ggml_tensor * pr = ggml_view_2d(ctx0, P, n_kv, T, P->nb[1], r*P->nb[2]);
+                Sj = Sj ? ggml_add(ctx0, Sj, pr) : ggml_cont(ctx0, pr);
+            }
+            if (per_head) {
+                S_heads.push_back(Sj);
+            } else {
+                S = S ? ggml_add(ctx0, S, Sj) : Sj;
+            }
+        }
+        if (per_head) {
+            S = S_heads.front();
+        }
+    } else if (cfg.mode == llama_lsa_config::ORACLE && per_head) {
+        // exact head-summed q.k, but each KV head ranks its own cells
+        for (int64_t j = 0; j < n_head_kv; ++j) {
+            ggml_tensor * qj = ggml_cont(ctx0, ggml_view_2d(ctx0, qs, d_head, T, qs->nb[1], j*d_head*qs->nb[0]));
+            qj = ggml_pad_ext(ctx0, qj, (int) (j*d_head), (int) ((n_head_kv - 1 - j)*d_head), 0, 0, 0, 0, 0, 0);
+            S_heads.push_back(ggml_mul_mat(ctx0, kv2, qj));
+        }
+        S = S_heads.front();
+    } else if (cfg.mode == llama_lsa_config::ORACLE) {
+        S = ggml_mul_mat(ctx0, kv2, qs);
+    } else if (cfg.mode == llama_lsa_config::KEY && per_head) {
+        // training-free per-KV-head index from the shared map: head j uses only its own slice of the map rows
+        // (block-diagonal approximation of Wk / Wq). key_j = norm(k_j @ Wk[j]), query_j = norm(qs_j @ Wq[j]),
+        // score_j = key_j . query_j. Reads K once per head (probe only; the index cache stays shared).
+        ggml_tensor * wkf = wk->type == GGML_TYPE_F32 ? wk : ggml_cast(ctx0, wk, GGML_TYPE_F32);
+        ggml_tensor * wqf = wq->type == GGML_TYPE_F32 ? wq : ggml_cast(ctx0, wq, GGML_TYPE_F32);
+        for (int64_t j = 0; j < n_head_kv; ++j) {
+            const int lo = (int) (j*d_head);
+            const int hi = (int) ((n_head_kv - 1 - j)*d_head);
+            ggml_tensor * wkj = ggml_cont(ctx0, ggml_view_2d(ctx0, wkf, d_head, d_idx, wkf->nb[1], j*d_head*wkf->nb[0]));
+            ggml_tensor * wqj = ggml_cont(ctx0, ggml_view_2d(ctx0, wqf, d_head, d_idx, wqf->nb[1], j*d_head*wqf->nb[0]));
+            wkj = ggml_pad_ext(ctx0, wkj, lo, hi, 0, 0, 0, 0, 0, 0);                         // [d_kv, d_idx], other heads 0
+            ggml_tensor * qj = ggml_cont(ctx0, ggml_view_2d(ctx0, qs, d_head, T, qs->nb[1], j*d_head*qs->nb[0]));
+            ggml_tensor * Pj = ggml_mul_mat(ctx0, kv2, wkj);                                  // [n_kv, d_idx]
+            ggml_tensor * PTj = ggml_rms_norm(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Pj)), 1e-12f);
+            ggml_tensor * qij = ggml_rms_norm(ctx0, ggml_mul_mat(ctx0, wqj, qj), 1e-12f);     // [d_idx, T]
+            S_heads.push_back(ggml_mul_mat(ctx0, PTj, qij));
+        }
+        S = S_heads.front();
+    } else {
+        ggml_tensor * PT = nullptr; // [d_idx, n_kv] normalized index keys
+        if (idx && idx->ne[0] == wk->ne[1] && idx->ne[1] == n_kv && idx->ne[2] == 1) {
+            // M1a: cached index keys (F16), 128 B per cell instead of reading all of K
+            PT = cfg.mode == llama_lsa_config::POS ? ggml_cast(ctx0, idx, GGML_TYPE_F32) : idx;
+        } else {
+            ggml_tensor * P = ggml_mul_mat(ctx0, kv2, wk);                                 // [n_kv, d_idx]
+            PT = ggml_rms_norm(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, P)), 1e-12f);
+        }
+        ggml_tensor * qi = ggml_mul_mat(ctx0, wq, qs);                                     // [d_idx, T]
+        S = ggml_mul_mat(ctx0, PT, qi);
+        if (dump_dense()) {
+            return nullptr;
+        }
+        if (cfg.mode == llama_lsa_config::POS) {
+            // fixed blocks of B consecutive cells: centroid = normalized sum of the block's index keys
+            const int64_t B  = cfg.bucket;
+            const int64_t nb = (n_kv + B - 1)/B;
+            ggml_tensor * PTp = nb*B > n_kv ? ggml_pad(ctx0, PT, 0, (int) (nb*B - n_kv), 0, 0) : PT;
+            ggml_tensor * c3  = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, PTp, d_idx, B, nb), 1, 0, 2, 3));
+            ggml_tensor * C   = ggml_rms_norm(ctx0, ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, c3), d_idx, nb), 1e-12f);
+            ggml_tensor * Sb  = ggml_mul_mat(ctx0, C, qi);                                 // [nb, T]
+            Sb = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, Sb, 1, nb, T), B, nb, T, 1);
+            Sb = ggml_reshape_2d(ctx0, Sb, B*nb, T);
+            Sb = ggml_cont(ctx0, ggml_view_2d(ctx0, Sb, n_kv, T, Sb->nb[1], 0));
+            // the cell score only breaks ties inside a block (|S| <= d_idx after rms_norm on both sides is bounded)
+            S = ggml_add(ctx0, Sb, ggml_scale(ctx0, S, 1e-4f));
+        } else if (cfg.block > 1) {
+            // whole blocks of B cells (B = 128 = an SJ-KVaRN body record, so a dropped block is a skipped record):
+            // block score = log of the block's share of softmax(block_tau * S) (causal mask applied); the cell score
+            // only breaks ties inside a block, so top-k takes whole blocks except at most one partial block
+            const int64_t B  = cfg.block;
+            const int64_t nb = (n_kv + B - 1)/B;
+            if (cfg.rec_blk && cfg.fused_sel && !cfg.fast && cfg.topp <= 0.0) {
+                // LLAMA_LSA_FUSED_SEL=1: block logsumexp(tau*S + mask) + eligibility + top-k in one op; same ranking
+                // as the softmax share below (the row normalizer is common to all blocks), no 200K-wide softmax row
+                if (ggml_tensor * mb = build_attn_lsa_mask_sb(inp, nullptr, kq_mask, n_kv, keep_lr, il, false, S,
+                            (float) cfg.block_tau)) {
+                    static uint32_t logged_ep = 0;
+                    if (llama_lsa_log_once(logged_ep)) {
+                        LLAMA_LOG_WARN("%s: LSA record pick by fused block select active (layer %d, %lld blocks of %lld)\n",
+                                __func__, il, (long long) nb, (long long) B);
+                    }
+                    return mb;
+                }
+            }
+            ggml_tensor * mk = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+            ggml_tensor * Mb = nullptr;
+            ggml_tensor * x  = nullptr; // [nb*B, T] tau*S + mask, clamped and padded (lse path)
+            if ((cfg.rec_blk || cfg.blk_lse || cfg.refine > 0) && !cfg.fast && cfg.topp <= 0.0) {
+                // floor-free block score: logsumexp_block(tau*S + mask) = bmax + log sum exp(x - bmax). Same ranking as
+                // log(block share) wherever that share is above the 1e-30 floor; the query latent is not normalized, so
+                // at tau 2 softmax(tau*S) is near one-hot and most blocks hit the floor (-69): the block top-k then
+                // picked among ties (rbx: REC_BLK KLD 0.053 vs per-cell 0.0016). Hidden cells clamp to -1e30, so a
+                // fully hidden block scores ~-1e30 (never NaN) and is ineligible anyway.
+                x = ggml_add(ctx0, ggml_scale(ctx0, S, (float) cfg.block_tau), ggml_reshape_2d(ctx0, mk, n_kv, T));
+                x = ggml_clamp(ctx0, x, -1e30f, 1e30f);
+                if (nb*B > n_kv) {
+                    // tail cells without a cache cell score -1e30 (exp underflows to 0 below any real cell)
+                    x = ggml_concat(ctx0, x, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nb*B - n_kv, T), -1e30f), 0);
+                }
+                ggml_tensor * bm = ggml_pool_1d(ctx0, x, GGML_OP_POOL_MAX, (int) B, (int) B, 0);       // [nb, T]
+                ggml_tensor * e  = ggml_exp(ctx0, ggml_sub(ctx0, ggml_reshape_3d(ctx0, x, B, nb, T),
+                                                             ggml_reshape_3d(ctx0, bm, 1, nb, T)));
+                Mb = ggml_add(ctx0, ggml_log(ctx0, ggml_sum_rows(ctx0, e)), ggml_reshape_3d(ctx0, bm, 1, nb, T)); // [1, nb, T]
+            } else {
+                ggml_tensor * Pc = ggml_soft_max_ext(ctx0, S, ggml_reshape_2d(ctx0, mk, n_kv, T), (float) cfg.block_tau, 0.0f);
+                if (nb*B > n_kv) {
+                    Pc = ggml_pad(ctx0, Pc, (int) (nb*B - n_kv), 0, 0, 0);
+                }
+                Mb = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, Pc, B, nb, T));                   // [1, nb, T]
+                Mb = ggml_log(ctx0, ggml_scale_bias(ctx0, Mb, 1.0f, 1e-30f));
+            }
+            if (cfg.rec_blk && !cfg.fast && cfg.topp <= 0.0) {
+                // LLAMA_LSA_REC_BLK=1: rank the nb blocks by the same block score instead of a per-cell top-k over
+                // n_kv (at 200K x 25% keep that top-k sorts ~50K of 200K per row per layer); whole blocks only, so
+                // the per-cell pick's single partial block (< B cells) is not taken
+                if (ggml_tensor * mb = build_attn_lsa_mask_sb(inp, ggml_reshape_2d(ctx0, Mb, nb, T), kq_mask, n_kv,
+                            keep_lr, il)) {
+                    static uint32_t logged_ep = 0;
+                    if (llama_lsa_log_once(logged_ep)) {
+                        LLAMA_LOG_WARN("%s: LSA record pick by block top-k active (layer %d, %lld blocks of %lld)\n",
+                                __func__, il, (long long) nb, (long long) B);
+                    }
+                    return mb;
+                }
+            }
+            if (cfg.refine > 0 && x && !cfg.rec_blk) {
+                // LLAMA_LSA_REFINE=F: two-stage pick. Stage 1 keeps the kc best eligible blocks (a block is eligible if it
+                // holds a visible middle cell of the row); stage 2 ranks the cells inside them by the logsumexp score of
+                // their F-cell unit (F = 1: the cell's own tau*S), so the per-cell top-k in make_mask takes the best keep
+                // cells of the candidates. Non-candidates get -1e15: below every candidate, above hidden cells, and far
+                // under the 1e20 sink/window bonus, so sinks and the window stay kept.
+                const int64_t F  = cfg.refine;
+                const int64_t kc = std::min<int64_t>(nb, (int64_t) std::ceil(cfg.refine_mult*(double) keep_lr/(double) B));
+                // LLAMA_LSA_REFINE_SH=1: with SHARED at T > 1 both stages run in the op's shared mode (one pick per
+                // ubatch, row-identical gate), else SHARED keeps the graph chain below
+                const bool rsh = cfg.refine_sh && cfg_shared && T > 1;
+                const int  rsm = rsh ? (cfg.shared_max ? 2 : 1) : 0;
+                const bool runi = cfg_union && T > 1; // LLAMA_LSA_SHARED=3: rows pick their own units, then OR
+                if (cfg.fused_sel && (!(cfg_shared && T > 1) || rsh) && n_kv % B == 0 && S->type == GGML_TYPE_F32 &&
+                        inp->lsa_cell_pos->ne[0] == n_kv) {
+                    // LLAMA_LSA_FUSED_SEL=1: stage 1 = block select of the kc best blocks (block logsumexp in the op),
+                    // stage 2 = the same op over F-cell units gated by stage 1, keep_lr/F units; whole units only and
+                    // the window/sink rule per unit (first cell), otherwise the same ranking as the chain below
+                    ggml_tensor * Sc  = ggml_is_contiguous(S) ? S : ggml_cont(ctx0, S);
+                    ggml_tensor * mk2 = ggml_reshape_2d(ctx0, ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask), n_kv, T);
+                    const int64_t nu  = n_kv/F;
+                    const int64_t ku  = std::max<int64_t>(1, std::min<int64_t>(nu, keep_lr/F));
+                    // LLAMA_LSA_PICK_EVERY=N with the unit pick (shared pick or one row): reuse this layer's last unit
+                    // pick for up to N - 1 graphs (both select ops and the index scoring drop out of those graphs).
+                    // The stored plane is row 0's pick OR row 0's window units, so a unit that leaves the window
+                    // during reuse stays kept (no re-pick on every window-edge move: edge is not checked here);
+                    // units newer than the pick read 0 from the zero padding and are inside the window anyway.
+                    const ggml_tensor * pick_k = lsa_pick_kbase;
+                    lsa_pick_kbase = nullptr;
+                    ggml_tensor * selu       = nullptr;
+                    ggml_tensor * selu_chk   = nullptr; // LLAMA_LSA_PICK_CHECK: the reused pick, while selu is the fresh one
+                    ggml_tensor * pick_store = nullptr;
+                    int64_t       pick_age   = 0;
+                    if (pick_k && cfg.pick_every > 1 && (rsh || runi || T == 1) && ubatch.pos && (int64_t) ubatch.n_tokens == T &&
+                            ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq && pick_k->buffer && inp->lsa_q_pos->ne[0] == 1) {
+                        const int32_t seq   = ubatch.seq_id_unq[0];
+                        const int64_t n_cap = inp->mctx->get_kv_size()/F + 1;
+                        const int64_t pos0  = ubatch.pos[0];
+                        llama_lsa_pick_slot ps;
+                        if (llama_lsa_pick_get(pick_k, n_cap, ggml_backend_buffer_get_type(pick_k->buffer), pos0, 0, nu, seq, &ps)) {
+                            inp->lsa_pick_commit.push_back({ pick_k, ps.gen, ps.reuse, pos0, 0, nu, seq });
+                            if (ps.reuse) {
+                                pick_age = ps.age;
+                                ggml_tensor * v = ggml_view_2d(ctx0, ps.sel, nu, 1, ps.sel->nb[0]*nu, 0);
+                                selu = T == 1 ? ggml_cont(ctx0, v) : ggml_repeat(ctx0, v, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nu, T));
+                                cb(selu, "lsa_unit_sel_reuse", il);
+                                if (cfg.pick_check) {
+                                    selu_chk = selu; // attention keeps the reused pick; the fresh one is built below for the log
+                                    selu     = nullptr;
+                                }
+                                static uint32_t logged_ur = 0;
+                                if (llama_lsa_log_once(logged_ur)) {
+                                    LLAMA_LOG_WARN("%s: LSA unit pick reused (LLAMA_LSA_PICK_EVERY=%lld, layer %d, %lld units of %lld)\n",
+                                            __func__, (long long) cfg.pick_every, il, (long long) nu, (long long) F);
+                                }
+                            } else {
+                                pick_store = ps.sel;
+                            }
+                        }
+                    } else if (pick_k && cfg.pick_every > 1 && ubatch.n_seqs_unq > 1) {
+                        // this graph's rows are of several sequences and skip the cache, but they add cells, so the
+                        // stored pick must not be reused across it (n_use would not count this graph)
+                        inp->lsa_pick_commit.push_back({ pick_k, 0, false, 0, 0, 0, -1, true });
+                    }
+                    // LLAMA_LSA_UNIT_OP=1: one op scores the index keys and takes the F-cell unit logsumexp (the score
+                    // tensor S is never written); stage 1 ranks blocks of B/F units of it, stage 2 its units. Positions
+                    // are the units' first cells and sinks' = sinks - B + B/F (stage 1) / sinks - F + 1 (stage 2), so
+                    // eligibility is the cell rule of the chain; the block score is the logsumexp of the unit scores
+                    // (same value as over the cells, other rounding)
+                    const bool uop = cfg.unit_op && (F & (F - 1)) == 0 && F <= 128 && B % F == 0 &&
+                        (PT->type == GGML_TYPE_F16 || PT->type == GGML_TYPE_F32) && PT->nb[0] == ggml_type_size(PT->type) &&
+                        PT->ne[1] == n_kv && PT->ne[2] == 1 && PT->ne[3] == 1 && qi->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(qi) && qi->ne[0] == PT->ne[0] && qi->ne[1] == T && qi->ne[2] == 1;
+                    const bool fresh = selu == nullptr; // this graph makes the pick (union below applies)
+                    if (!selu && uop) {
+                        ggml_tensor * Ul = ggml_lsa_unit_lse(ctx0, PT, qi, mk2, (int) F, (float) cfg.block_tau);
+                        cb(Ul, "lsa_unit_lse", il);
+                        if (!cfg.score_log.empty() && n_kv >= cfg.score_log_min_kv && Ul->type == GGML_TYPE_F32) {
+                            // LLAMA_LSA_SCORE_LOG: row 0 position, T, then the row max of each unit score, to the host log
+                            ggml_tensor * um = Ul;
+                            if (T > 1) {
+                                ggml_tensor * ut = ggml_cont(ctx0, ggml_transpose(ctx0, Ul));                   // [T, nu]
+                                um = ggml_pool_1d(ctx0, ut, GGML_OP_POOL_MAX, (int) T, (int) T, 0);
+                            }
+                            um = ggml_reshape_1d(ctx0, ggml_cont(ctx0, um), nu);
+                            ggml_tensor * q0 = ggml_reshape_1d(ctx0, ggml_cont(ctx0,
+                                    ggml_view_2d(ctx0, inp->lsa_q_pos, 1, 1, inp->lsa_q_pos->nb[1], 0)), 1);
+                            ggml_tensor * hd = ggml_concat(ctx0, q0, ggml_scale_bias(ctx0, q0, 0.0f, (float) T), 0);
+                            // middle flag per unit, row 0 (same rule as LLAMA_LSA_PICK_CHECK): visible, outside the
+                            // window, past the sinks, by cell position (cells need not be in position order)
+                            ggml_tensor * qp0 = ggml_view_2d(ctx0, inp->lsa_q_pos, 1, 1, inp->lsa_q_pos->nb[1], 0);
+                            ggml_tensor * cp  = ggml_reshape_2d(ctx0, inp->lsa_cell_pos, n_kv, 1);
+                            ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, cp, qp0), 1.0f, (float) cfg.window - 0.5f));
+                            ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, cp, -1.0f, (float) cfg.sinks - 0.5f));
+                            ggml_tensor * mk0 = ggml_view_2d(ctx0, mk2, n_kv, 1, mk2->nb[1], 0);
+                            ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0,
+                                    mk0->type == GGML_TYPE_F32 ? mk0 : ggml_cast(ctx0, mk0, GGML_TYPE_F32), 1.0f, 1e29f));
+                            ggml_tensor * mid = ggml_mul(ctx0, vis, ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_add(ctx0, win, snk), -1.0f, 0.5f)));
+                            ggml_tensor * mu  = ggml_reshape_1d(ctx0, ggml_cont(ctx0,
+                                    ggml_pool_1d(ctx0, mid, GGML_OP_POOL_MAX, (int) F, (int) F, 0)), nu);
+                            ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, ggml_concat(ctx0, ggml_concat(ctx0, hd, um, 0), mu, 0),
+                                    lsa_score_log_op, 1,
+                                    (void *) (intptr_t) ((il & 255) | (F << 8))));
+                        }
+                        ggml_tensor * cpu = inp->lsa_cell_pos;
+                        if (F > 1) {
+                            if (inp->lsa_cpos_u == nullptr || inp->lsa_cpos_u_f != F || inp->lsa_cpos_u->ne[0] != nu) {
+                                inp->lsa_cpos_u   = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, inp->lsa_cell_pos,
+                                        1, nu, F*inp->lsa_cell_pos->nb[0], 0)), nu);
+                                inp->lsa_cpos_u_f = F;
+                            }
+                            cpu = inp->lsa_cpos_u;
+                        }
+                        ggml_tensor * sel1 = lsa_slice(lsa_sticky(ggml_lsa_block_select_cells(ctx0, Ul, nullptr, cpu, inp->lsa_q_pos, (int) (B/F), 1.0f,
+                                (int) cfg.window, (int) (cfg.sinks - B + B/F), (int) std::max<int64_t>(1, kc), rsm),
+                                sj_kvarn_pending.body, sj_kvarn_pending.desc, (int) F), B);
+                        selu = lsa_slice(lsa_sticky(ggml_lsa_block_select_cells_gated_ext(ctx0, Ul, nullptr, cpu, inp->lsa_q_pos, 1, 1.0f,
+                                (int) cfg.window, (int) (cfg.sinks - F + 1), (int) ku, sel1, (int) (B/F), rsm),
+                                sj_kvarn_pending.body, sj_kvarn_pending.desc, (int) F), F);
+                        static uint32_t logged_uo = 0;
+                        if (llama_lsa_log_once(logged_uo)) {
+                            LLAMA_LOG_WARN("%s: LSA unit-lse pick active (LLAMA_LSA_UNIT_OP=1, layer %d, %lld units of %lld, T %lld)\n",
+                                    __func__, il, (long long) nu, (long long) F, (long long) T);
+                        }
+                    }
+                    if (!selu) {
+                        ggml_tensor * sel1 = lsa_slice(lsa_sticky(ggml_lsa_block_select_cells(ctx0, Sc, mk2, inp->lsa_cell_pos, inp->lsa_q_pos,
+                                (int) B, (float) cfg.block_tau, (int) cfg.window, (int) cfg.sinks, (int) std::max<int64_t>(1, kc), rsm),
+                                sj_kvarn_pending.body, sj_kvarn_pending.desc, 1), B);
+                        selu = lsa_slice(lsa_sticky(ggml_lsa_block_select_cells_gated_ext(ctx0, Sc, mk2, inp->lsa_cell_pos, inp->lsa_q_pos,
+                                (int) F, (float) cfg.block_tau, (int) cfg.window, (int) cfg.sinks, (int) ku, sel1, (int) (B/F), rsm),
+                                sj_kvarn_pending.body, sj_kvarn_pending.desc, 1), F);
+                    }
+                    if (fresh) {
+                        if (runi) {
+                            ggml_tensor * st = ggml_cont(ctx0, ggml_transpose(ctx0, selu));                             // [T, nu]
+                            ggml_tensor * u  = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, st, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nu, 1);
+                            selu = ggml_repeat(ctx0, u, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nu, T));
+                            static uint32_t logged_uu = 0;
+                            if (llama_lsa_log_once(logged_uu)) {
+                                LLAMA_LOG_WARN("%s: LSA union of per-row unit picks (LLAMA_LSA_SHARED=3, layer %d, %lld units of %lld per row, T %lld)\n",
+                                        __func__, il, (long long) ku, (long long) F, (long long) T);
+                            }
+                        }
+                    }
+                    if (selu_chk) {
+                        // row 0 middle units: visible, outside row 0's window, past the sinks (cell positions)
+                        ggml_tensor * q0  = ggml_view_2d(ctx0, inp->lsa_q_pos, 1, 1, inp->lsa_q_pos->nb[1], 0);
+                        ggml_tensor * cp  = ggml_reshape_2d(ctx0, inp->lsa_cell_pos, n_kv, 1);
+                        ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, cp, q0), 1.0f, (float) cfg.window - 0.5f));
+                        ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, cp, -1.0f, (float) cfg.sinks - 0.5f));
+                        ggml_tensor * mk0 = ggml_view_2d(ctx0, mk2, n_kv, 1, mk2->nb[1], 0);
+                        ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0,
+                                mk0->type == GGML_TYPE_F32 ? mk0 : ggml_cast(ctx0, mk0, GGML_TYPE_F32), 1.0f, 1e29f));
+                        ggml_tensor * mid = ggml_mul(ctx0, vis, ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_add(ctx0, win, snk), -1.0f, 0.5f)));
+                        ggml_tensor * mu  = ggml_reshape_1d(ctx0, ggml_pool_1d(ctx0, mid, GGML_OP_POOL_MAX, (int) F, (int) F, 0), nu);
+                        ggml_tensor * f0  = ggml_mul(ctx0, ggml_cont(ctx0, ggml_view_1d(ctx0, selu, nu, 0)), mu);
+                        ggml_tensor * r0  = ggml_mul(ctx0, ggml_cont(ctx0, ggml_view_1d(ctx0, selu_chk, nu, 0)), mu);
+                        // recall at the unit, then with both picks widened to 16/64/128-cell blocks (g units per
+                        // block; a level finer than the unit repeats the unit level; a ragged tail block is dropped)
+                        auto lvl = [&](int64_t G) {
+                            const int g = (int) std::max<int64_t>(1, G/F);
+                            ggml_tensor * fb = f0, * rb = r0;
+                            if (g > 1 && nu >= g) {
+                                fb = ggml_reshape_1d(ctx0, ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, f0, nu, 1), GGML_OP_POOL_MAX, g, g, 0), nu/g);
+                                rb = ggml_reshape_1d(ctx0, ggml_pool_1d(ctx0, ggml_reshape_2d(ctx0, r0, nu, 1), GGML_OP_POOL_MAX, g, g, 0), nu/g);
+                            }
+                            return ggml_concat(ctx0, ggml_concat(ctx0, ggml_sum(ctx0, ggml_mul(ctx0, fb, rb)), ggml_sum(ctx0, fb), 0),
+                                    ggml_sum(ctx0, rb), 0);
+                        };
+                        ggml_tensor * st = lvl(F);
+                        for (int64_t G : { 16, 64, 128 }) {
+                            st = ggml_concat(ctx0, st, lvl(G), 0);
+                        }
+                        ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, st, lsa_pick_check_op, 1,
+                                (void *) (intptr_t) ((il & 255) | (std::min<int64_t>(pick_age, 15) << 8))));
+                        selu = selu_chk;
+                    }
+                    if (pick_store) {
+                        // u = sel0 OR win0 (both 0/1): sel0 = row 0's unit pick, win0 = unit holds a cell inside row 0's
+                        // window (cell - q0 > -window), zero-padded to the cache length
+                        ggml_tensor * s0  = ggml_view_1d(ctx0, selu, nu, 0);
+                        ggml_tensor * q0  = ggml_view_2d(ctx0, inp->lsa_q_pos, 1, 1, inp->lsa_q_pos->nb[1], 0);
+                        ggml_tensor * cp  = ggml_reshape_2d(ctx0, inp->lsa_cell_pos, n_kv, 1);
+                        ggml_tensor * w   = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, cp, q0), 1.0f, (float) cfg.window - 0.5f));
+                        ggml_tensor * wu  = ggml_reshape_1d(ctx0, ggml_pool_1d(ctx0, w, GGML_OP_POOL_MAX, (int) F, (int) F, 0), nu);
+                        ggml_tensor * u   = ggml_sub(ctx0, ggml_add(ctx0, s0, wu), ggml_mul(ctx0, s0, wu));
+                        if (pick_store->ne[0] > nu) {
+                            u = ggml_pad(ctx0, u, (int) (pick_store->ne[0] - nu), 0, 0, 0);
+                        }
+                        ggml_build_forward_expand(gf, ggml_cpy(ctx0, u, pick_store));
+                    }
+                    cb(selu, "lsa_unit_sel", il);
+                    if (cfg.spec_recall && sj && T <= 8) {
+                        auto predict = [&](ggml_tensor * stale_q, int budget_pct) -> ggml_tensor * {
+                            // Missing history in the first three mapped layers remains in the denominator.
+                            if (!stale_q) {
+                                return ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nu, T), 0.0f);
+                            }
+                            // Logging-only stale-query predictor. Score after this layer's index append so there is
+                            // no uninitialized read. Newly appended entries are in the dense tail, outside the ranked
+                            // middle. The logger excludes newly sealed pages from prediction (but counts their misses).
+                            GGML_ASSERT((F == 16 || F == 128) && B == 128 && PT == idx && !cfg_shared && cfg.slice == 0);
+                            ggml_tensor * sq4 = ggml_reshape_4d(ctx0, ggml_cont(ctx0, stale_q), d_head, g, n_head_kv, T);
+                            sq4 = ggml_cont(ctx0, ggml_permute(ctx0, sq4, 1, 0, 2, 3));
+                            ggml_tensor * sqs = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, sq4), d_kv, T);
+                            if (sqs->type != GGML_TYPE_F32) {
+                                sqs = ggml_cast(ctx0, sqs, GGML_TYPE_F32);
+                            }
+                            ggml_tensor * ss = ggml_mul_mat(ctx0, PT, ggml_mul_mat(ctx0, wq, sqs));
+                            ggml_tensor * sp = llama_lsa_build_recall_pick(ctx0, ss, mk2, inp->lsa_cell_pos, inp->lsa_q_pos,
+                                    (int) B, (int) F, (float) cfg.block_tau, (int) cfg.window, (int) cfg.sinks,
+                                    (int) std::max<int64_t>(1, kc), (int) ku, budget_pct);
+                            if (runi) {
+                                ggml_tensor * st = ggml_cont(ctx0, ggml_transpose(ctx0, sp));
+                                ggml_tensor * su = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, st, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nu, 1);
+                                sp = ggml_repeat(ctx0, su, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nu, T));
+                            }
+                            // Predict compulsory sink/tail reads too. Visibility remains row-specific, as in the real
+                            // mask, even when the selected middle is shared by union. Any live cell makes a page live.
+                            ggml_tensor * cp = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, inp->lsa_cell_pos, n_kv, 1), ss);
+                            ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, cp, inp->lsa_q_pos),
+                                    1.0f, (float) cfg.window - 0.5f));
+                            ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, cp, -1.0f, (float) cfg.sinks - 0.5f));
+                            ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, mk2, GGML_TYPE_F32), 1.0f, 1e29f));
+                            ggml_tensor * force = ggml_mul(ctx0, ggml_add(ctx0, win, snk), vis);
+                            force = ggml_pool_1d(ctx0, force, GGML_OP_POOL_MAX, (int) F, (int) F, 0);
+                            return ggml_cont(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_add(ctx0, sp, force), 1.0f, -0.5f)));
+                        };
+                        ggml_tensor * stale_q[] = { lsa_spec_q, lsa_spec_q2, lsa_spec_q3 };
+                        ggml_tensor * budgets = nullptr;
+                        for (int b = 0; b < GGML_LSA_RECALL_BUDGETS; ++b) {
+                            const int pct = ggml_lsa_recall_budget_pct(b);
+                            ggml_tensor * picks = predict(stale_q[0], pct);
+                            for (int h = 1; h < GGML_LSA_RECALL_HORIZONS; ++h) {
+                                picks = ggml_concat(ctx0, picks, predict(stale_q[h], pct), 2);
+                            }
+                            budgets = budgets ? ggml_concat(ctx0, budgets, picks, 3) : picks;
+                        }
+                        lsa_spec_sel = ggml_cont(ctx0, budgets);
+                        cb(lsa_spec_sel, "lsa_spec_pick", il);
+                    }
+                    if (ggml_tensor * mu = build_attn_lsa_mask_units(inp, selu, F, kq_mask, n_kv, il, rsm > 0 || runi)) {
+                        static uint32_t logged_ep = 0;
+                        if (llama_lsa_log_once(logged_ep)) {
+                            LLAMA_LOG_WARN("%s: LSA fused refine pick active (layer %d, %lld of %lld blocks of %lld, %lld units of %lld)\n",
+                                    __func__, il, (long long) kc, (long long) nb, (long long) B, (long long) ku, (long long) F);
+                        }
+                        return mu;
+                    }
+                }
+                ggml_tensor * dq  = ggml_sub(ctx0, ggml_repeat(ctx0, inp->lsa_cell_pos, S), inp->lsa_q_pos);
+                ggml_tensor * bon = ggml_add(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, dq, 1.0f, (float) cfg.window - 0.5f)),
+                        ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_cell_pos, -1.0f, (float) cfg.sinks - 0.5f)));
+                ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_reshape_2d(ctx0, mk, n_kv, T), 1.0f, 1e29f));
+                ggml_tensor * mid = ggml_mul(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, bon, -1.0f, 0.5f)), vis); // [n_kv, T]
+                if (nb*B > n_kv) {
+                    mid = ggml_pad(ctx0, mid, (int) (nb*B - n_kv), 0, 0, 0);
+                }
+                ggml_tensor * elig = ggml_pool_1d(ctx0, mid, GGML_OP_POOL_MAX, (int) B, (int) B, 0);           // [nb, T]
+                ggml_tensor * rank = ggml_add(ctx0, ggml_reshape_2d(ctx0, Mb, nb, T), ggml_scale_bias(ctx0, elig, 1e30f, -1e30f));
+                ggml_tensor * top  = ggml_top_k(ctx0, rank, (int) kc);                                          // [kc, T]
+                ggml_tensor * cm   = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nb, T, 1), -1e15f);
+                cm = ggml_set_rows(ctx0, cm, ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, kc, T, 1), 0.0f), top);
+                cm = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, cm, B, nb, T, 1), B*nb, T);
+                cm = ggml_cont(ctx0, ggml_view_2d(ctx0, cm, n_kv, T, cm->nb[1], 0));
+                ggml_tensor * Sf = nullptr;
+                if (F == 1) {
+                    Sf = ggml_scale(ctx0, S, (float) cfg.block_tau);
+                } else {
+                    const int64_t nf = nb*B/F;
+                    ggml_tensor * fm = ggml_pool_1d(ctx0, x, GGML_OP_POOL_MAX, (int) F, (int) F, 0);           // [nf, T]
+                    ggml_tensor * fe = ggml_exp(ctx0, ggml_sub(ctx0, ggml_reshape_3d(ctx0, x, F, nf, T),
+                                                                 ggml_reshape_3d(ctx0, fm, 1, nf, T)));
+                    ggml_tensor * Mf = ggml_add(ctx0, ggml_log(ctx0, ggml_sum_rows(ctx0, fe)), ggml_reshape_3d(ctx0, fm, 1, nf, T));
+                    Mf = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, Mf, F, nf, T, 1), F*nf, T);
+                    Sf = ggml_add(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, Mf, n_kv, T, Mf->nb[1], 0)), ggml_scale(ctx0, S, 1e-4f));
+                }
+                S = ggml_add(ctx0, cm, Sf);
+                static uint32_t logged_ep = 0;
+                if (llama_lsa_log_once(logged_ep)) {
+                    LLAMA_LOG_WARN("%s: LSA refine pick active (layer %d, %lld of %lld blocks of %lld, unit %lld, keep %lld)\n",
+                            __func__, il, (long long) kc, (long long) nb, (long long) B, (long long) F, (long long) keep_lr);
+                }
+            } else {
+            Mb = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, Mb, B, nb, T, 1), B*nb, T);
+            Mb = ggml_cont(ctx0, ggml_view_2d(ctx0, Mb, n_kv, T, Mb->nb[1], 0));
+            S = ggml_add(ctx0, Mb, ggml_scale(ctx0, S, 1e-4f));
+            }
+        }
+    }
+    if ((cfg.mode == llama_lsa_config::ORACLE || cfg.mode == llama_lsa_config::MASS) && dump_dense()) {
+        return nullptr;
+    }
+    if (cfg.fast && lsa_one_seq(ubatch)) {
+        return build_attn_lsa_fast(inp, S, k_io, v_io, kq_mask, keep_lr, il);
+    }
+    if (cfg_shared && T > 1 && S_heads.empty()) {
+        // mb-MTP verify option A: every row of the ubatch gets the same long-range pick, ranked by the sum of the
+        // rows' index scores (= the score of the summed index query). The window covers the draft positions.
+        ggml_tensor * St = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, S)));        // [1, n_kv]
+        S = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, St, n_kv, 1), S);
+    } else if (cfg_shared && T > 1 && sj_ph_m) {
+        // same, per KV head
+        for (ggml_tensor *& Sh : S_heads) {
+            ggml_tensor * St = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Sh)));
+            Sh = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, St, n_kv, 1), Sh);
+        }
+    }
+    // adaptive keep (LLAMA_LSA_TOPP): the top-k cap stays k_total; floor = the k_floor best (sinks/window included)
+    const int64_t k_floor = std::min<int64_t>(k_total, cfg.sinks + cfg.window + (int64_t) (cfg.topp_min * (double) n_kv));
+    auto make_mask = [&](ggml_tensor * S, bool keep_f32 = false) -> ggml_tensor * {
+    cb(S, "lsa_score", il);
+    ggml_tensor * S_raw = S;
+
+    // keep rule: first `sinks` positions and the last `window` positions (query included) get a large bonus
+    ggml_tensor * d   = ggml_sub(ctx0, ggml_repeat(ctx0, inp->lsa_cell_pos, S), inp->lsa_q_pos);    // cell - query
+    ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, d, 1.0f, (float) cfg.window - 0.5f));
+    ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_cell_pos, -1.0f, (float) cfg.sinks - 0.5f));
+    ggml_tensor * bonus = ggml_add(ctx0, win, snk);
+    S = ggml_add(ctx0, S, ggml_scale(ctx0, bonus, 1e20f));
+    ggml_tensor * mask_f32 = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    mask_f32 = ggml_reshape_2d(ctx0, mask_f32, n_kv, T);
+    S = ggml_add(ctx0, S, mask_f32);
+
+    ggml_tensor * top_k = ggml_top_k(ctx0, S, (int) k_total); // I32 [k_total, T]
+    cb(top_k, "lsa_top_k", il);
+
+    // DSA-style mask, in f32: a large negative fill (rows before min_pos get 0, i.e. stay dense), 0 at the kept
+    // cells, then the causal mask added back and the result cast to the mask type (f16 overflow gives -inf)
+    ggml_tensor * m = nullptr;
+    if (cfg.min_pos > 0) {
+        ggml_tensor * sparse_row = ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_q_pos, 1.0f, 0.5f - (float) cfg.min_pos));
+        m = ggml_repeat(ctx0, ggml_scale(ctx0, sparse_row, -1e30f), S);
+    } else {
+        m = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, T), -INFINITY);
+    }
+    m = ggml_view_4d(ctx0, m, 1, n_kv, T, 1, m->nb[0], m->nb[1], m->nb[1]*T, 0);                 // [1, n_kv, T, 1]
+    ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, k_total, T, 1), 0.0f);
+    m = ggml_set_rows(ctx0, m, zeros, top_k);
+    m = ggml_view_2d(ctx0, m, n_kv, T, m->nb[2], 0);                                             // [n_kv, T]
+    m = ggml_add(ctx0, m, mask_f32);
+    ggml_tensor * mid = ggml_step(ctx0, ggml_scale_bias(ctx0, bonus, -1.0f, 0.5f)); // 1 = middle cell (not sink/window)
+    if (cfg.topp > 0.0 && k_floor < k_total) {
+        // smallest set of middle cells holding share P of softmax(tau * z) over the middle, z = row z-score of the
+        // index score: per-row threshold t on z by bisection (12 steps over z in [-4, 12]), mass(t) = sum p[z >= t]
+        ggml_tensor * z    = ggml_norm(ctx0, S_raw, 1e-6f);
+        ggml_tensor * excl = ggml_add(ctx0, mask_f32, ggml_scale_bias(ctx0, mid, 1e30f, -1e30f));
+        ggml_tensor * p    = ggml_soft_max_ext(ctx0, z, excl, (float) cfg.topp_tau, 0.0f);
+        ggml_tensor * t    = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, T), 4.0f);
+        float delta = 4.0f;
+        for (int it = 0; it < 12; ++it) {
+            ggml_tensor * above = ggml_step(ctx0, ggml_sub(ctx0, z, t));
+            ggml_tensor * mass  = ggml_sum_rows(ctx0, ggml_mul(ctx0, p, above));                    // [1, T]
+            ggml_tensor * up    = ggml_step(ctx0, ggml_scale_bias(ctx0, mass, 1.0f, (float) -cfg.topp)); // mass >= P
+            t = ggml_add(ctx0, t, ggml_scale_bias(ctx0, up, 2.0f*delta, -delta));
+            delta *= 0.5f;
+        }
+        // drop = middle cell below t and outside the floor; -1e30 on top of the capped mask (f16 cast gives -inf)
+        ggml_tensor * below = ggml_step(ctx0, ggml_neg(ctx0, ggml_sub(ctx0, z, t)));
+        ggml_tensor * fl = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_kv, T, 1), 1.0f);
+        fl = ggml_set_rows(ctx0, fl, ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, k_floor, T, 1), 0.0f),
+                ggml_top_k(ctx0, S, (int) k_floor));
+        fl = ggml_view_2d(ctx0, fl, n_kv, T, fl->nb[2], 0);
+        ggml_tensor * drop = ggml_mul(ctx0, ggml_mul(ctx0, below, mid), fl);
+        if (cfg.min_pos > 0) {
+            // rows before min_pos stay dense
+            drop = ggml_mul(ctx0, drop, ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_q_pos, 1.0f, 0.5f - (float) cfg.min_pos)));
+        }
+        m = ggml_add(ctx0, m, ggml_scale(ctx0, drop, -1e30f));
+        cb(m, "lsa_topp_mask", il);
+    }
+    if (cfg.stats && il >= 0 && il < 256) {
+        ggml_tensor * valid = ggml_step(ctx0, ggml_scale_bias(ctx0, mask_f32, 1.0f, 1e29f));
+        ggml_tensor * kept  = ggml_sum_rows(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, m, 1.0f, 1e29f)));
+        ggml_tensor * bon   = ggml_sum_rows(ctx0, ggml_mul(ctx0, valid, ggml_scale_bias(ctx0, mid, -1.0f, 1.0f)));
+        ggml_tensor * st    = ggml_concat(ctx0, ggml_concat(ctx0, kept, ggml_sum_rows(ctx0, valid), 0), bon, 0); // [3, T]
+        ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, st, lsa_stats_op, 1, (void *) (intptr_t) il));
+        // union over the ubatch rows (the decode kernel walks a strip / record if any row keeps a cell of it)
+        auto uni = [&](ggml_tensor * x) { // [n_kv, T] 0/1 -> [n_kv] 0/1
+            ggml_tensor * u = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, x)));          // [1, n_kv]
+            return ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_reshape_1d(ctx0, u, n_kv), 1.0f, -0.5f));
+        };
+        auto cnt = [&](ggml_tensor * u, int64_t B) { // live blocks of B cells
+            const int64_t nb = (n_kv + B - 1)/B;
+            ggml_tensor * up = nb*B > n_kv ? ggml_pad(ctx0, u, (int) (nb*B - n_kv), 0, 0, 0) : u;
+            ggml_tensor * bs = ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, up, B, nb));                   // [1, nb]
+            return ggml_sum(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, bs, 1.0f, -0.5f)));
+        };
+        ggml_tensor * keptm = ggml_mul(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, m, 1.0f, 1e29f)), mid);
+        ggml_tensor * uk = uni(keptm);
+        ggml_tensor * uv = uni(ggml_mul(ctx0, valid, mid));
+        ggml_tensor * st2 = ggml_concat(ctx0, ggml_concat(ctx0, cnt(uk, 16), cnt(uv, 16), 0),
+                ggml_concat(ctx0, cnt(uk, 128), cnt(uv, 128), 0), 0);                                  // [4]
+        ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, st2, lsa_stats_blk_op, 1, (void *) (intptr_t) il));
+    }
+    if (!keep_f32 && kq_mask->type != GGML_TYPE_F32) {
+        m = ggml_cast(ctx0, m, kq_mask->type);
+    }
+    m = ggml_reshape_4d(ctx0, m, n_kv, T, 1, 1);
+    cb(m, "lsa_kq_mask", il);
+    return m;
+    };
+
+    ggml_tensor * m = nullptr;
+    if (S_heads.empty()) {
+        m = make_mask(S);
+    } else if (sj_ph_m) {
+        // [n_kv, T, 1, H] -> each KV head's mask repeated over its g q heads (head h reads KV head h / g)
+        ggml_tensor * m4 = nullptr;
+        for (ggml_tensor * Sh : S_heads) {
+            ggml_tensor * mh = make_mask(Sh, true);
+            m4 = m4 ? ggml_concat(ctx0, m4, mh, 3) : mh;
+        }
+        m4 = ggml_repeat_4d(ctx0, m4, n_kv, T, g, n_head_kv);
+        m  = ggml_cast(ctx0, ggml_reshape_4d(ctx0, m4, n_kv, T, n_head, 1), kq_mask->type);
+        cb(m, "lsa_kq_mask_heads", il);
+    } else {
+        // per-KV-head picks: one mask per KV head, the caller runs one FA per GQA group
+        for (ggml_tensor * Sh : S_heads) {
+            masks_h->push_back(make_mask(Sh));
+        }
+        m = masks_h->front();
+    }
+
+    if (cfg.recall && kv2 && T <= 64 && il >= 0 && il < 256) {
+        // true attention of each q head (same scale and causal mask as the model), summed over the cells the pick keeps
+        ggml_tensor * mask2 = ggml_reshape_2d(ctx0,
+                kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32), n_kv, T);
+        ggml_tensor * qf = q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        ggml_tensor * acc = nullptr;
+        for (int64_t j = 0; j < n_head_kv; ++j) {
+            ggml_tensor * mj = (!S_heads.empty() && masks_h && (int64_t) masks_h->size() == n_head_kv) ? (*masks_h)[j] : m;
+            mj = ggml_reshape_2d(ctx0, mj->type == GGML_TYPE_F32 ? mj : ggml_cast(ctx0, mj, GGML_TYPE_F32), n_kv, T);
+            ggml_tensor * keep = ggml_step(ctx0, ggml_scale_bias(ctx0, mj, 1.0f, 1e29f));                  // [n_kv, T] 0/1
+            ggml_tensor * qg = ggml_view_3d(ctx0, qf, d_head, g, T, qf->nb[1], qf->nb[2], j*g*qf->nb[1]);
+            qg = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, qg, 0, 2, 1, 3)), d_head, T*g); // [d, T*g]
+            qg = ggml_pad_ext(ctx0, qg, (int) (j*d_head), (int) ((n_head_kv - 1 - j)*d_head), 0, 0, 0, 0, 0, 0);
+            ggml_tensor * P = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, kv2, qg), n_kv, T, g);
+            P = ggml_soft_max_ext(ctx0, P, mask2, kq_scale_lsa, 0.0f);
+            ggml_tensor * r = ggml_sum_rows(ctx0, ggml_mul(ctx0, P, keep));                                  // [1, T, g]
+            ggml_tensor * bad = ggml_sum(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, r, -1.0f, 0.9f)));     // missed > 10%
+            ggml_tensor * aj = ggml_concat(ctx0, ggml_sum(ctx0, r), bad, 0);                                 // [2]
+            acc = acc ? ggml_add(ctx0, acc, aj) : aj;
+        }
+        ggml_tensor * nrows = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), (float) (T*n_head));
+        ggml_tensor * rc = ggml_concat(ctx0, acc, nrows, 0);                                                 // [3]
+        ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, rc, lsa_recall_op, 1, (void *) (intptr_t) il));
+        static uint32_t logged_ep = 0;
+        if (llama_lsa_log_once(logged_ep)) {
+            LLAMA_LOG_WARN("%s: LSA recall probe active (layer %d, n_kv %lld, T %lld)\n", __func__, il, (long long) n_kv,
+                    (long long) T);
+        }
+    }
+
+    if (cfg.fa_sparse && !sj) {
+        *n_kv_max = k_total;
+    } else if (sj && cfg.sj_compact && S_heads.empty()) {
+        // SJ-KVaRN compact path: its capacity is n_kv_max * T and must hold the union of the rows' kept cells (it traps
+        // on overflow). Per row: k_total. Shared pick: rows differ only by the window shift and the long-range cells
+        // that shift moves in or out, union <= k_total + 2(T-1); the bound is set from that (+256 slack).
+        *n_kv_max = cfg_shared && T > 1 ? (k_total + 2*T + 256 + T - 1)/T : k_total;
+    }
+
+    static int n_logged = 0;
+    if (n_logged < 4) {
+        ++n_logged;
+        LLAMA_LOG_INFO("%s: LSA layer %d: n_kv %lld, T %lld, kept %lld (%.1f%%)\n", __func__, il, (long long) n_kv,
+                (long long) T, (long long) k_total, 100.0*(double) k_total/(double) n_kv);
+    }
+
+    return m;
+}
+
+// LSA centroid compensation (LLAMA_LSA_COMP=1, opt-in, lossy probe; llama-lsa.h). The masked FA drops the long-range
+// cells outside the pick entirely, so their softmax mass is lost. Here every block of B cells with at least one dropped
+// cell re-enters as one stand-in: key = block mean K, value = block mean V, logit = q.k_mean*scale + log(n_dropped)
+// (+ LLAMA_LSA_COMP_BIAS), i.e. n_dropped copies of the mean key (a Jensen under-estimate of their summed exp).
+// With P = softmax over [kept cells | stand-ins], the kept part's share alpha = 1 - sum(P_standin), so
+//   out = alpha * o_kept + sum_b P_b * v_mean_b
+// with o_kept the unchanged masked FA output; the FA kernel and the pick are untouched. Probe cost: dense K scores
+// plus f32 cell-major copies of K and V per layer (no cache); plain K/V types, one stream, T <= comp_max_t only.
+ggml_tensor * llm_graph_context::build_attn_lsa_comp(
+        ggml_tensor * o_kept,
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * lsa_mask,
+        ggml_tensor * kq_mask,
+              float   kq_scale,
+                int   il) const {
+    const auto & cfg = llama_lsa_cfg();
+    const int64_t D = k->ne[0], H_kv = k->ne[1], n_kv = k->ne[2];
+    const int64_t Dv = v->ne[0], H = q->ne[1], T = q->ne[2];
+    if (k->ne[3] != 1 || v->ne[3] != 1 || q->ne[3] != 1 || T > cfg.comp_max_t || q->ne[0] != D ||
+            !lsa_k_plain(k->type) || !lsa_k_plain(v->type) || v->ne[1] != H_kv || v->ne[2] != n_kv ||
+            v->nb[1] > v->nb[2] || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) || H % H_kv != 0 ||
+            lsa_mask->ne[0] != n_kv || lsa_mask->ne[1] != T || ggml_nelements(lsa_mask) != n_kv*T ||
+            ggml_nelements(kq_mask) != n_kv*T || o_kept->ne[0] != Dv*H || o_kept->ne[1] != T) {
+        static uint32_t warned_ep = 0;
+        if (llama_lsa_log_once(warned_ep)) {
+            LLAMA_LOG_WARN("%s: layer %d: LSA compensation skipped (unsupported shape/type)\n", __func__, il);
+        }
+        return nullptr;
+    }
+    const int64_t B   = cfg.block > 1 ? cfg.block : 128;
+    const int64_t nb  = (n_kv + B - 1)/B;
+    const int64_t pad = nb*B - n_kv;
+
+    // block means [nb, Dx, H_kv] from a cell-major f32 copy [n_kv, Dx*H_kv]; the padded tail block is never dropped
+    // (it lies in the window), so its mean is not used
+    auto blk_mean = [&](ggml_tensor * x, int64_t Dx) {
+        ggml_tensor * xt = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, ggml_cast(ctx0, x, GGML_TYPE_F32), Dx*H_kv, n_kv)));
+        if (pad) {
+            xt = ggml_pad(ctx0, xt, (int) pad, 0, 0, 0);
+        }
+        ggml_tensor * sm = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, xt, B, nb, Dx*H_kv));              // [1, nb, Dx*H_kv]
+        return ggml_reshape_3d(ctx0, ggml_scale(ctx0, sm, 1.0f/(float) B), nb, Dx, H_kv);
+    };
+    ggml_tensor * Kb = ggml_cont(ctx0, ggml_permute(ctx0, blk_mean(k, D), 1, 0, 2, 3));                // [D, nb, H_kv]
+    ggml_tensor * Vb = blk_mean(v, Dv);                                                                   // [nb, Dv, H_kv]
+
+    ggml_tensor * qp = ggml_permute(ctx0, q, 0, 2, 1, 3);                                                 // [D, T, H]
+    ggml_tensor * kq = ggml_mul_mat(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3), qp);                         // [n_kv, T, H]
+    ggml_prec_set_acc(kq, GGML_PREC_F32);
+    ggml_tensor * ks = ggml_mul_mat(ctx0, Kb, qp);                                                        // [nb, T, H]
+    ggml_prec_set_acc(ks, GGML_PREC_F32);
+
+    ggml_tensor * mf = ggml_reshape_2d(ctx0, lsa_mask->type == GGML_TYPE_F32 ? lsa_mask : ggml_cast(ctx0, lsa_mask, GGML_TYPE_F32), n_kv, T);
+    ggml_tensor * cf = ggml_reshape_2d(ctx0, kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32), n_kv, T);
+    // dropped = causally visible (causal mask 0) but masked by the pick (rows before min_pos have none)
+    ggml_tensor * drop = ggml_mul(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, cf, 1.0f, 1e29f)),
+                                        ggml_step(ctx0, ggml_scale_bias(ctx0, mf, -1.0f, -1e29f)));
+    if (pad) {
+        drop = ggml_pad(ctx0, drop, (int) pad, 0, 0, 0);
+    }
+    ggml_tensor * nd   = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, drop, B, nb, T)), nb, T);
+    ggml_tensor * off  = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, nd, 1.0f, -0.5f)), 1e30f, -1e30f); // 0 or -1e30
+    ggml_tensor * bias = ggml_add(ctx0, ggml_scale_bias(ctx0, ggml_log(ctx0, ggml_scale_bias(ctx0, nd, 1.0f, 1e-30f)), 1.0f,
+                                  (float) cfg.comp_bias), off);                                           // [nb, T]
+
+    ggml_tensor * S = ggml_concat(ctx0, ggml_add(ctx0, ggml_scale(ctx0, kq, kq_scale), mf),
+                                        ggml_add(ctx0, ggml_scale(ctx0, ks, kq_scale), bias), 0);        // [n_kv+nb, T, H]
+    ggml_tensor * P  = ggml_soft_max(ctx0, S);
+    ggml_tensor * Ps = ggml_cont(ctx0, ggml_view_3d(ctx0, P, nb, T, H, P->nb[1], P->nb[2], n_kv*ggml_element_size(P)));
+    cb(Ps, "lsa_comp_p", il);
+    ggml_tensor * alpha = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, Ps), -1.0f, 1.0f);                   // [1, T, H]
+    ggml_tensor * os = ggml_mul_mat(ctx0, Vb, Ps);                                                        // [Dv, T, H]
+    os    = ggml_cont(ctx0, ggml_permute(ctx0, os, 0, 2, 1, 3));                                          // [Dv, H, T]
+    alpha = ggml_cont(ctx0, ggml_permute(ctx0, alpha, 0, 2, 1, 3));                                       // [1, H, T]
+    ggml_tensor * ok = ggml_reshape_3d(ctx0, o_kept, Dv, H, T);
+    ggml_tensor * out = ggml_add(ctx0, ggml_mul(ctx0, ok, alpha), os);
+    cb(out, "lsa_comp_out", il);
+    return ggml_reshape_2d(ctx0, out, Dv*H, T);
+}
+
+// LSA compensation without dense scores (LLAMA_LSA_COMP=2, opt-in, lossy; needs the index cache for the epoch rule).
+// Same math as build_attn_lsa_comp: the kept part enters the softmax as one logit, its log-sum-exp L_k from the masked
+// FA node (src[9]); the stand-ins are the dropped blocks' cached mean K/V with log(n dropped) on their logits:
+//   P = softmax([q.Kmean_b*scale + log n_b (+bias) | L_k]),  out = P_last * o_kept + sum_b P_b * Vmean_b.
+// The F16 block means [D*H_kv, kv_size/B] live beside the K cache: blocks touched by this ubatch are recomputed from
+// the cache rows after the store (B cells, get_rows), every whole block when the cache is invalid (first graph,
+// state restore, K shift). Per step: ~n_kv/B dot products per row plus the touched blocks' re-read. One stream,
+// plain K/V types, T <= comp_max_t. Node order: o_kept is consumed before the merge reads the LSE (src order).
+bool llm_graph_context::build_attn_lsa_mean_refresh(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * k_new,
+        ggml_tensor * v_new,
+            int64_t   n_kv,
+        ggml_tensor ** kmv,
+        ggml_tensor ** vmv,
+            int64_t * nbs_out,
+                int   il,
+               bool   rot) const {
+    const auto & cfg = llama_lsa_cfg();
+    const int64_t B  = cfg.block > 1 ? cfg.block : 128;
+    const bool    sj = inp->lsa_q_cell != nullptr;
+    ggml_tensor * kb = k->view_src ? k->view_src : k;
+    ggml_tensor * vb = v->view_src ? v->view_src : v;
+    if (!inp->lsa_u_blk || !kb->buffer || (sj && (!k_new || !v_new || !inp->lsa_q_ring || !inp->lsa_u_rblk || !ubatch.pos))) {
+        return false;
+    }
+    int64_t D, Dv, H_kv, n_cells;
+    if (sj) {
+        // cells == positions; K/V of this ubatch in the un-rotated basis [D, H_kv, T]
+        D = k_new->ne[0]; H_kv = k_new->ne[1]; Dv = v_new->ne[0];
+        n_cells = inp->mctx->get_kv_size();
+        if (v_new->ne[1] != H_kv || k_new->ne[2] != v_new->ne[2] || k_new->ne[3] != 1 || v_new->ne[3] != 1 ||
+                inp->lsa_ring_n <= 0 || inp->lsa_ring_n % B != 0 || inp->lsa_q_ring->ne[0] !=
+                (inp->lsa_ring_rows ? std::min<int64_t>(k_new->ne[2], inp->lsa_ring_n) : k_new->ne[2])) {
+            return false;
+        }
+    } else {
+        D = k->ne[0]; H_kv = k->ne[1]; Dv = v->ne[0];
+        n_cells = kb->ne[1];
+        if (k->ne[3] != 1 || v->ne[3] != 1 || !lsa_k_plain(k->type) || !lsa_k_plain(v->type) || v->ne[1] != H_kv ||
+                v->ne[2] != k->ne[2] || kb->ne[0] != D*H_kv || vb->ne[0] != Dv*H_kv || kb->ne[2] != 1 || vb->ne[2] != 1 ||
+                vb->ne[1] != kb->ne[1] || k->view_offs != 0 || v->view_offs != 0 || k->nb[2] != kb->nb[1] ||
+                v->nb[2] != vb->nb[1]) {
+            return false;
+        }
+    }
+    const int64_t nbm = n_cells/B;
+    const int64_t nbs = std::min<int64_t>(n_kv/B, nbm);
+    if (nbm <= 0) {
+        return false;
+    }
+    ggml_tensor * km = nullptr, * vm = nullptr, * kr = nullptr, * vr = nullptr;
+    bool     valid = false;
+    uint64_t epoch = 0;
+    if (!llama_lsa_mean_get(kb, D*H_kv, Dv*H_kv, nbm, ggml_backend_buffer_get_type(kb->buffer), &km, &vm, &valid, &epoch,
+                sj ? inp->lsa_ring_n : 0, &kr, &vr, rot && sj)) {
+        return false;
+    }
+    inp->lsa_n_blk = nbm;
+
+    // F32 [dx*B, n] rows of B cells -> [dx, n] block means
+    auto mean_rows = [&](ggml_tensor * x, int64_t dx) {
+        const int64_t n = x->ne[1];
+        ggml_tensor * xt = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, x, dx, B, n), 1, 0, 2, 3)); // [B, dx, n]
+        return ggml_reshape_2d(ctx0, ggml_scale(ctx0, ggml_sum_rows(ctx0, xt), 1.0f/(float) B), dx, n);
+    };
+    const bool fresh = sj && ubatch.pos[0] == 0;
+    auto refresh = [&](ggml_tensor * base, ggml_tensor * ring, ggml_tensor * x_new, ggml_tensor * mc, int64_t dx) {
+        ggml_tensor * w = nullptr;
+        if (sj && inp->lsa_ring_rows) {
+            // carry ring: gather each block row by row from [carry ring ; this ubatch's rows] (graph scratch). The f16
+            // round trip gives the values the legacy ring held, so the means are the same bits.
+            const int64_t T  = x_new->ne[2];
+            ggml_tensor * xn = ggml_is_contiguous(x_new) ? x_new : ggml_cont(ctx0, x_new);
+            xn = ggml_cast(ctx0, ggml_cast(ctx0, ggml_reshape_2d(ctx0, xn, dx, T), GGML_TYPE_F16), GGML_TYPE_F32);
+            ggml_tensor * xa = ggml_concat(ctx0, ggml_cast(ctx0, ring, GGML_TYPE_F32), xn, 1); // [dx, n_ring + T]
+            ggml_tensor * g  = ggml_get_rows(ctx0, xa, inp->lsa_u_rblk);                      // [dx, n_u*B]
+            w = ggml_set_rows(ctx0, mc, mean_rows(ggml_reshape_2d(ctx0, g, dx*B, g->ne[1]/B), dx), inp->lsa_u_blk);
+            // carry the ubatch's last m rows; reading them from xa orders this write after the gather's ring read
+            const int64_t m = inp->lsa_q_ring->ne[0];
+            ggml_tensor * tail = ggml_view_2d(ctx0, xa, dx, m, xa->nb[1], (size_t) (ring->ne[1] + T - m)*xa->nb[1]);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ring, tail, inp->lsa_q_ring));
+        } else if (sj) {
+            // staging ring: rows = position mod n_ring; a block of this ubatch is whole in the ring (n_ring >= n_ubatch + B),
+            // its unwritten tail is stale but such a block is inside the always-kept window until a later ubatch completes
+            // it and recomputes it (rejected draft rows are rewritten the same way)
+            ggml_tensor * xn = ggml_is_contiguous(x_new) ? x_new : ggml_cont(ctx0, x_new);
+            ggml_tensor * wr = ggml_set_rows(ctx0, ring, ggml_reshape_2d(ctx0, xn, dx, x_new->ne[2]), inp->lsa_q_ring);
+            ggml_build_forward_expand(gf, wr);
+            ggml_tensor * g = ggml_get_rows(ctx0, ggml_view_2d(ctx0, wr, dx*B, ring->ne[1]/B, wr->nb[1]*B, 0), inp->lsa_u_rblk);
+            w = ggml_set_rows(ctx0, mc, mean_rows(g, dx), inp->lsa_u_blk); // get_rows gives F32
+        } else if (!valid) {
+            if (nbs <= 0) {
+                return (ggml_tensor *) nullptr;
+            }
+            ggml_tensor * x = ggml_cast(ctx0, ggml_view_2d(ctx0, base, dx*B, nbs, base->nb[1]*B, 0), GGML_TYPE_F32);
+            w = ggml_cpy(ctx0, mean_rows(x, dx), ggml_view_2d(ctx0, mc, dx, nbs, mc->nb[1], 0));
+        } else {
+            ggml_tensor * g = ggml_get_rows(ctx0, ggml_view_2d(ctx0, base, dx*B, nbm, base->nb[1]*B, 0), inp->lsa_u_blk);
+            w = ggml_set_rows(ctx0, mc, mean_rows(g, dx), inp->lsa_u_blk);
+        }
+        ggml_build_forward_expand(gf, w);
+        return ggml_view_2d(ctx0, w, dx, std::max<int64_t>(nbs, 1), mc->nb[1], 0); // ordered after this graph's refresh
+    };
+    ggml_tensor * kw = refresh(kb, kr, k_new, km, D*H_kv);
+    ggml_tensor * vw = refresh(vb, vr, v_new, vm, Dv*H_kv);
+    if (!kw || !vw) {
+        return false;
+    }
+    cb(kw, "lsa_kmean", il);
+    cb(vw, "lsa_vmean", il);
+    if (!valid && (!sj || fresh)) {
+        inp->lsa_mean_commit.emplace_back(kb, epoch);
+    }
+    if (sj && !valid && !fresh) {
+        static uint32_t warned_ep = 0;
+        if (llama_lsa_log_once(warned_ep)) {
+            LLAMA_LOG_WARN("%s: LSA block means on SJ-KVaRN are stale (restore or K shift); compensation off until a "
+                    "sequence restarts at position 0\n", __func__);
+        }
+        return false;
+    }
+    *kmv = kw;
+    *vmv = vw;
+    *nbs_out = nbs;
+    return nbs > 0;
+}
+
+ggml_tensor * llm_graph_context::build_attn_lsa_comp_fast(
+        const llm_graph_input_attn_kv * inp,
+        ggml_tensor * o_kept,
+        ggml_tensor * lse,
+        ggml_tensor * q,
+        ggml_tensor * kmv,
+        ggml_tensor * vmv,
+            int64_t   nbs,
+            int64_t   H_kv,
+        ggml_tensor * lsa_mask,
+        ggml_tensor * kq_mask,
+              float   kq_scale,
+                int   il) const {
+    const auto & cfg = llama_lsa_cfg();
+    const int64_t B  = cfg.block > 1 ? cfg.block : 128;
+    const int64_t D  = q->ne[0], H = q->ne[1], T = q->ne[2];
+    const int64_t n_kv = lsa_mask->ne[0];
+    const int64_t Dv = H_kv > 0 ? vmv->ne[0]/H_kv : 0;
+    if (q->ne[3] != 1 || T > cfg.comp_max_t || H_kv <= 0 || H % H_kv != 0 || kmv->ne[0] != D*H_kv || vmv->ne[0] != Dv*H_kv ||
+            nbs <= 0 || kmv->ne[1] < nbs || nbs*B > n_kv || lsa_mask->ne[1] != T || ggml_nelements(lsa_mask) != n_kv*T ||
+            ggml_nelements(kq_mask) != n_kv*T || o_kept->ne[0] != Dv*H || o_kept->ne[1] != T || lse->ne[0] != H ||
+            lse->ne[1] != T) {
+        static uint32_t warned_ep = 0;
+        if (llama_lsa_log_once(warned_ep)) {
+            LLAMA_LOG_WARN("%s: layer %d: LSA fast compensation skipped (unsupported shape/type)\n", __func__, il);
+        }
+        return nullptr;
+    }
+    kmv = ggml_view_2d(ctx0, kmv, kmv->ne[0], nbs, kmv->nb[1], 0);
+    vmv = ggml_view_2d(ctx0, vmv, vmv->ne[0], nbs, vmv->nb[1], 0);
+    ggml_tensor * Kb = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, kmv, D, H_kv, nbs), 0, 2, 1, 3));   // [D, nbs, H_kv]
+    ggml_tensor * Vb = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, vmv, Dv, H_kv, nbs), 1, 2, 0, 3));  // [nbs, Dv, H_kv]
+
+    ggml_tensor * qp = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));                                          // [D, T, H]
+    ggml_tensor * ks = ggml_mul_mat(ctx0, Kb, qp);                                                                  // [nbs, T, H]
+    ggml_prec_set_acc(ks, GGML_PREC_F32);
+
+    ggml_tensor * nd = nullptr;
+    if (inp && inp->lsa_comp_nd && inp->lsa_comp_nd_mask == lsa_mask && !cfg.comp_cnt_legacy && !cfg.comp_cnt_exp &&
+            inp->lsa_comp_nd->ne[0] == nbs && inp->lsa_comp_nd->ne[1] == T) {
+        nd = inp->lsa_comp_nd; // from the block pick (build_attn_lsa_mask_sb): no full-width op here
+    } else if (cfg.comp_cnt_legacy) {
+        ggml_tensor * mf = ggml_reshape_2d(ctx0, lsa_mask->type == GGML_TYPE_F32 ? lsa_mask : ggml_cast(ctx0, lsa_mask, GGML_TYPE_F32), n_kv, T);
+        ggml_tensor * cf = ggml_reshape_2d(ctx0, kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32), n_kv, T);
+        ggml_tensor * drop = ggml_mul(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, cf, 1.0f, 1e29f)),
+                                            ggml_step(ctx0, ggml_scale_bias(ctx0, mf, -1.0f, -1e29f)));              // [n_kv, T]
+        drop = ggml_cont(ctx0, ggml_view_2d(ctx0, drop, nbs*B, T, drop->nb[1], 0));    // the partial tail is in the window
+        nd   = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, drop, B, nbs, T)), nbs, T);
+    } else {
+        // Both masks hold only 0 / -inf here (no ALiBi, no soft cap; -1e30 fills become -inf in f16 and exp to 0 in
+        // f32), and the pick mask is the causal mask plus -inf at dropped cells, so exp() is the 0/1 indicator and
+        // dropped = visible - kept, per block. The visible count does not depend on the layer: one per graph. Same
+        // integer counts as the legacy build (exact f32 sums of <= B ones): 3 full-width ops per layer instead of 9.
+        auto blk_count = [&](ggml_tensor * mask) {
+            ggml_tensor * e = ggml_exp(ctx0, ggml_reshape_2d(ctx0, mask, n_kv, T));
+            if (e->type != GGML_TYPE_F32) {
+                e = ggml_cast(ctx0, e, GGML_TYPE_F32);
+            }
+            e = nbs*B == n_kv ? ggml_reshape_3d(ctx0, e, B, nbs, T)    // the partial tail is in the window
+                              : ggml_cont(ctx0, ggml_view_3d(ctx0, e, B, nbs, T, e->nb[0]*B, e->nb[1], 0));
+            return ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, e), nbs, T);
+        };
+        ggml_tensor * vis = inp ? inp->lsa_comp_vis : nullptr;
+        if (vis == nullptr || inp->lsa_comp_vis_src != kq_mask || vis->ne[0] != nbs || vis->ne[1] != T) {
+            vis = blk_count(kq_mask);
+            cb(vis, "lsa_comp_vis", il);
+            if (inp) {
+                inp->lsa_comp_vis     = vis;
+                inp->lsa_comp_vis_src = kq_mask;
+            }
+        }
+        nd = ggml_sub(ctx0, vis, blk_count(lsa_mask));
+    }
+    if (cfg.fused_comp && D % 2 == 0 && D <= 512 && H/H_kv <= 8 && q->nb[0] == sizeof(float) && o_kept->nb[0] == sizeof(float) &&
+            nd->nb[0] == sizeof(float) && ggml_nrows(nd) == T && ggml_is_contiguous(lse) && kmv->type == GGML_TYPE_F16 &&
+            vmv->type == GGML_TYPE_F16) {
+        // LLAMA_LSA_FUSED_COMP=1: the chain below as one op (valid-math change: f32 scores instead of the f16-input
+        // mul_mat, one exp per stand-in). nd < 0.5 leaves a block out, as the -1e30 offset does below.
+        ggml_tensor * out = ggml_lsa_comp_merge(ctx0, o_kept, lse, q, kmv, vmv, nd, (int) H_kv, kq_scale, (float) cfg.comp_bias);
+        cb(out, "lsa_comp_out", il);
+        static uint32_t logged_ep = 0;
+        if (llama_lsa_log_once(logged_ep)) {
+            LLAMA_LOG_WARN("%s: LSA fused compensation merge active (layer %d, %lld mean blocks, T %lld)\n", __func__, il,
+                    (long long) kmv->ne[1], (long long) T);
+        }
+        return out;
+    }
+    ggml_tensor * off  = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, nd, 1.0f, -0.5f)), 1e30f, -1e30f);
+    ggml_tensor * bias = ggml_add(ctx0, ggml_scale_bias(ctx0, ggml_log(ctx0, ggml_scale_bias(ctx0, nd, 1.0f, 1e-30f)), 1.0f,
+                                  (float) cfg.comp_bias), off);                                                     // [nbs, T]
+    ggml_tensor * Lk = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, lse, H, T, 1), 2, 1, 0, 3));        // [1, T, H]
+    ggml_tensor * S  = ggml_concat(ctx0, ggml_add(ctx0, ggml_scale(ctx0, ks, kq_scale), bias), Lk, 0);              // [nbs+1, T, H]
+    ggml_tensor * P  = ggml_soft_max(ctx0, S);
+    ggml_tensor * Ps = ggml_cont(ctx0, ggml_view_3d(ctx0, P, nbs, T, H, P->nb[1], P->nb[2], 0));
+    ggml_tensor * alpha = ggml_cont(ctx0, ggml_view_3d(ctx0, P, 1, T, H, P->nb[1], P->nb[2], nbs*ggml_element_size(P)));
+    cb(Ps, "lsa_comp_p", il);
+    ggml_tensor * os = ggml_mul_mat(ctx0, Vb, Ps);                                                                  // [Dv, T, H]
+    os    = ggml_cont(ctx0, ggml_permute(ctx0, os, 0, 2, 1, 3));                                                    // [Dv, H, T]
+    alpha = ggml_cont(ctx0, ggml_permute(ctx0, alpha, 0, 2, 1, 3));                                                 // [1, H, T]
+    ggml_tensor * ok  = ggml_reshape_3d(ctx0, o_kept, Dv, H, T);
+    ggml_tensor * out = ggml_add(ctx0, ggml_mul(ctx0, ok, alpha), os);
+    cb(out, "lsa_comp_out", il);
+    return ggml_reshape_2d(ctx0, out, Dv*H, T);
+}
+
+// LSA index cache (llama-lsa.h, M1a). Valid cache: Wk^T k_cur of the new tokens, rms-normalized, stored to their
+// cells with set_rows (the cells K was just stored to). Invalid cache (first graph, or after a prompt-cache
+// restore / K shift): the whole [0, n_kv) range is recomputed from the K cache, which already holds the new
+// tokens, and the layer is committed as valid when this graph's inputs are set.
+ggml_tensor * llm_graph_context::build_attn_lsa_idx(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * k,
+                int   il) const {
+    const auto & cfg = llama_lsa_cfg();
+    inp->lsa_smax_cur = nullptr;
+    inp->lsa_smin_cur = nullptr;
+    inp->lsa_sum_il   = -1;
+    if (!cfg.idx_cache || (cfg.mode != llama_lsa_config::KEY && cfg.mode != llama_lsa_config::POS)) {
+        return nullptr;
+    }
+    if (inp->lsa_q_cell) {
+        return build_attn_lsa_idx_sj(inp, k_cur, k, il);
+    }
+    if (k->ne[3] != 1 || k_cur->ne[3] != 1 || !lsa_k_plain(k->type) || k->nb[2] != k->nb[1]*k->ne[1]) {
+        return nullptr;
+    }
+    const ggml_tensor * kbase = k->view_src ? k->view_src : k;
+    if (!kbase->buffer || kbase->ne[2] != 1) {
+        return nullptr;
+    }
+    ggml_tensor * wq = nullptr;
+    ggml_tensor * wk = nullptr;
+    const auto buft = ggml_backend_buffer_get_type(kbase->buffer);
+    const int64_t d_kv = k->ne[0]*k->ne[1];
+    if (!llama_lsa_get_map(il, buft, &wq, &wk) || wk->ne[0] != d_kv || kbase->ne[0] != d_kv) {
+        return nullptr;
+    }
+    const int64_t d_idx = wk->ne[1];
+    const int64_t n_kv  = k->ne[2];
+    llama_lsa_idx_slot slot;
+    if (!llama_lsa_idx_get(kbase, d_idx, buft, &slot)) {
+        return nullptr;
+    }
+
+    ggml_tensor * w = nullptr;
+    if (!slot.valid) {
+        ggml_tensor * kv2 = ggml_view_2d(ctx0, k, d_kv, n_kv, k->nb[2], 0);
+        ggml_tensor * PT  = ggml_rms_norm(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, ggml_mul_mat(ctx0, kv2, wk))), 1e-12f);
+        w = ggml_cpy(ctx0, PT, ggml_view_2d(ctx0, slot.t, d_idx, n_kv, slot.t->nb[1], 0));
+        inp->lsa_idx_commit.emplace_back(kbase, slot.epoch);
+        cb(w, "lsa_idx_rebuild", il);
+    } else {
+        ggml_tensor * kc = ggml_is_contiguous(k_cur) ? k_cur : ggml_cont(ctx0, k_cur);
+        kc = ggml_reshape_2d(ctx0, kc, d_kv, k_cur->ne[2]);
+        if (kc->type != GGML_TYPE_F32) {
+            kc = ggml_cast(ctx0, kc, GGML_TYPE_F32);
+        }
+        ggml_tensor * Pn = ggml_rms_norm(ctx0, ggml_mul_mat(ctx0, wk, kc), 1e-12f); // [d_idx, T]
+        w = ggml_set_rows(ctx0, slot.t, Pn, inp->get_k_idxs());
+        cb(w, "lsa_idx_store", il);
+    }
+    ggml_build_forward_expand(gf, w);
+    build_attn_lsa_sum(inp, slot, w, n_kv, !slot.valid, il);
+    return ggml_view_2d(ctx0, w, d_idx, n_kv, w->nb[1], 0);
+}
+
+// LSA index cache on SJ-KVaRN. The K cache holds only the sink + ring rows, rotated, and sealed records for the rest,
+// so an invalid layer cannot be rebuilt from it: the index cache is (re)validated only by a ubatch whose first row is
+// position 0 (a fresh sequence), which writes every row from k_cur like the valid path. Otherwise the layer stays
+// dense (returns nullptr) until the next fresh sequence. Rows are cells == positions (lsa_q_cell), not the ring rows
+// K is stored to.
+ggml_tensor * llm_graph_context::build_attn_lsa_idx_sj(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * k,
+                int   il) const {
+    const auto * mctx_cur = inp->mctx;
+    if (k->ne[3] != 1 || k_cur->ne[3] != 1 || !ubatch.pos) {
+        return nullptr;
+    }
+    const ggml_tensor * kbase = k->view_src ? k->view_src : k;
+    if (!kbase->buffer) {
+        return nullptr;
+    }
+    ggml_tensor * wq = nullptr;
+    ggml_tensor * wk = nullptr;
+    const auto buft = ggml_backend_buffer_get_type(kbase->buffer);
+    const int64_t d_kv = k_cur->ne[0]*k_cur->ne[1];
+    if (!llama_lsa_get_map(il, buft, &wq, &wk) || wk->ne[0] != d_kv) {
+        return nullptr;
+    }
+    const int64_t d_idx   = wk->ne[1];
+    const int64_t kv_size = mctx_cur->get_kv_size();
+    const int64_t n_kv    = inp->lsa_cell_pos->ne[0];
+    // LLAMA_LSA_PER_HEAD=1 (key mode): one index key per KV head from that head's slice of the map, stored head-major
+    // [d_idx, kv_size, n_head_kv] (4x the shared cache); state save/restore carries the head count
+    const auto &  cfg   = llama_lsa_cfg();
+    const int64_t n_hkv = k_cur->ne[1];
+    const int64_t d_hd  = k_cur->ne[0];
+    const bool    ph    = cfg.per_head && cfg.mode == llama_lsa_config::KEY;
+    const int64_t n_hc  = ph ? n_hkv : 1;
+    llama_lsa_idx_slot slot;
+    if (n_kv > kv_size || !llama_lsa_idx_get(kbase, d_idx, buft, &slot, kv_size, n_hc)) {
+        return nullptr;
+    }
+    const bool fresh = ubatch.pos[0] == 0;
+    if (!slot.valid && !fresh) {
+        static uint32_t warned_ep = 0;
+        static int      n_trace   = 0;
+        if (llama_lsa_idx_trace() && n_trace < 256) {
+            ++n_trace;
+            LLAMA_LOG_WARN("%s: [lsa-trace] stale: layer %d %s at pos %d (epoch %llu)\n", __func__, il, kbase->name,
+                    (int) ubatch.pos[0], (unsigned long long) slot.epoch);
+        }
+        if (llama_lsa_log_once(warned_ep)) {
+            LLAMA_LOG_WARN("%s: LSA index cache on SJ-KVaRN is stale (K shift, or a restored state without the LSA "
+                    "suffix); layers stay dense until a sequence restarts at position 0\n", __func__);
+        }
+        return nullptr;
+    }
+    ggml_tensor * kc = ggml_is_contiguous(k_cur) ? k_cur : ggml_cont(ctx0, k_cur);
+    kc = ggml_reshape_2d(ctx0, kc, d_kv, k_cur->ne[2]);
+    if (kc->type != GGML_TYPE_F32) {
+        kc = ggml_cast(ctx0, kc, GGML_TYPE_F32);
+    }
+    ggml_tensor * Pn = nullptr;
+    if (ph) {
+        // key_j = rms_norm(Wk[j]^T k_j), Wk[j] = rows j*d_head.. of the map (block-diagonal part): [d_idx, T, H]
+        ggml_tensor * wk3 = ggml_cont(ctx0, ggml_view_3d(ctx0, wk, d_hd, d_idx, n_hkv, wk->nb[1], d_hd*wk->nb[0], 0));
+        ggml_tensor * kc3 = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, kc, d_hd, n_hkv, kc->ne[1]), 0, 2, 1, 3));
+        Pn = ggml_rms_norm(ctx0, ggml_mul_mat(ctx0, wk3, kc3), 1e-12f); // [d_idx, T, H]: head-major rows as stored
+    } else {
+        Pn = ggml_rms_norm(ctx0, ggml_mul_mat(ctx0, wk, kc), 1e-12f); // [d_idx, T]
+    }
+    ggml_tensor * w  = ggml_set_rows(ctx0, slot.t, Pn, inp->lsa_q_cell);
+    cb(w, "lsa_idx_store_sj", il);
+    ggml_build_forward_expand(gf, w);
+    build_attn_lsa_sum(inp, slot, w, n_kv, false, il); // per-head: one summary plane per KV head
+    if (!slot.valid) {
+        inp->lsa_idx_commit.emplace_back(kbase, slot.epoch);
+    }
+    return ggml_view_3d(ctx0, w, d_idx, n_kv, n_hc, w->nb[1], w->nb[2], 0); // [d_idx, n_kv, n_hc]
+}
+
+// LLAMA_LSA_BLOCK_SUM (llama-lsa.h): per-block channel max / min of the index keys, F16 [d_idx, kv_size/B] next to the
+// index cache. Valid cache: only the blocks of this ubatch's rows are recomputed from the index cache after the store
+// (duplicate block ids write identical values). Rebuilt index cache (plain caches): every whole block below n_kv.
+// The partial tail block has no summary; it lies inside the always-kept window.
+void llm_graph_context::build_attn_lsa_sum(
+        llm_graph_input_attn_kv * inp,
+        const llama_lsa_idx_slot & slot,
+        ggml_tensor * w,
+            int64_t   n_kv,
+               bool   full,
+                int   il) const {
+    const auto & cfg = llama_lsa_cfg();
+    if (!cfg.block_sum || !slot.smax || !slot.smin || !inp->lsa_q_blk) {
+        return;
+    }
+    const int64_t B   = cfg.block;
+    const int64_t d   = slot.t->ne[0];
+    const int64_t nbm = slot.smax->ne[1];
+    // x F32 [B, d, n] (one row per channel and block) -> the two summary planes [d, n]: channel max / min, or with
+    // LLAMA_LSA_BLOCK_SUM=2 channel mean / variance (avg of squares - mean^2, clamped at 0)
+    auto planes = [&](ggml_tensor * x, int64_t n, ggml_tensor *& pa, ggml_tensor *& pb) {
+        if (cfg.block_sum_mode == 2) {
+            ggml_tensor * mu = ggml_pool_1d(ctx0, x, GGML_OP_POOL_AVG, (int) B, (int) B, 0);
+            ggml_tensor * m2 = ggml_pool_1d(ctx0, ggml_sqr(ctx0, x), GGML_OP_POOL_AVG, (int) B, (int) B, 0);
+            pa = ggml_reshape_2d(ctx0, mu, d, n);
+            pb = ggml_reshape_2d(ctx0, ggml_relu(ctx0, ggml_sub(ctx0, m2, ggml_sqr(ctx0, mu))), d, n);
+            return;
+        }
+        pa = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, x, GGML_OP_POOL_MAX, (int) B, (int) B, 0), d, n);
+        pb = ggml_neg(ctx0, ggml_reshape_2d(ctx0,
+                ggml_pool_1d(ctx0, ggml_neg(ctx0, x), GGML_OP_POOL_MAX, (int) B, (int) B, 0), d, n));
+    };
+    inp->lsa_n_blk = nbm;
+    inp->lsa_smax_h.clear();
+    inp->lsa_smin_h.clear();
+    if (slot.t->ne[2] > 1) {
+        // per-KV-head cache: valid-cache update only (SJ-KVaRN has no full rebuild), one plane per head; the planes
+        // are disjoint views, so each head's mask depends only on its own two writes
+        if (full || slot.smax->ne[2] != slot.t->ne[2] || w->ne[2] != slot.t->ne[2]) {
+            return;
+        }
+        for (int64_t h = 0; h < slot.t->ne[2]; ++h) {
+            ggml_tensor * vb = ggml_view_2d(ctx0, w, d*B, nbm, w->nb[1]*B, h*w->nb[2]);
+            ggml_tensor * g  = ggml_get_rows(ctx0, vb, inp->lsa_q_blk);                      // F32 [d*B, T]
+            ggml_tensor * xh = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, g, d, B, g->ne[1]), 1, 0, 2, 3));
+            ggml_tensor * mx = nullptr;
+            ggml_tensor * mn = nullptr;
+            planes(xh, xh->ne[2], mx, mn);
+            ggml_tensor * pmax = ggml_view_2d(ctx0, slot.smax, d, nbm, slot.smax->nb[1], h*slot.smax->nb[2]);
+            ggml_tensor * pmin = ggml_view_2d(ctx0, slot.smin, d, nbm, slot.smin->nb[1], h*slot.smin->nb[2]);
+            ggml_tensor * wmax = ggml_set_rows(ctx0, pmax, mx, inp->lsa_q_blk);
+            ggml_tensor * wmin = ggml_set_rows(ctx0, pmin, mn, inp->lsa_q_blk);
+            cb(wmax, "lsa_smax_h", il);
+            cb(wmin, "lsa_smin_h", il);
+            ggml_build_forward_expand(gf, wmax);
+            ggml_build_forward_expand(gf, wmin);
+            inp->lsa_smax_h.push_back(wmax);
+            inp->lsa_smin_h.push_back(wmin);
+        }
+        inp->lsa_smax_cur = inp->lsa_smax_h.front();
+        inp->lsa_smin_cur = inp->lsa_smin_h.front();
+        inp->lsa_sum_il   = il;
+        return;
+    }
+    ggml_tensor * x = nullptr; // F32 [B, d, n] one row per (channel, block)
+    int64_t nfull = 0;
+    if (full) {
+        nfull = std::min<int64_t>(n_kv/B, nbm);
+        if (nfull <= 0) {
+            return;
+        }
+        ggml_tensor * v = ggml_view_3d(ctx0, w, d, B, nfull, w->nb[1], w->nb[1]*B, 0);
+        x = ggml_cpy(ctx0, ggml_permute(ctx0, v, 1, 0, 2, 3), ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, B, d, nfull));
+    } else {
+        ggml_tensor * vb = ggml_view_2d(ctx0, w, d*B, nbm, w->nb[1]*B, 0);                 // one row per block
+        ggml_tensor * g  = ggml_get_rows(ctx0, vb, inp->lsa_q_blk);                          // F32 [d*B, T]
+        x = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, g, d, B, g->ne[1]), 1, 0, 2, 3));
+    }
+    ggml_tensor * mx = nullptr;
+    ggml_tensor * mn = nullptr;
+    planes(x, x->ne[2], mx, mn);
+    ggml_tensor * wmax = nullptr;
+    ggml_tensor * wmin = nullptr;
+    if (full) {
+        wmax = ggml_cpy(ctx0, mx, ggml_view_2d(ctx0, slot.smax, d, nfull, slot.smax->nb[1], 0));
+        wmin = ggml_cpy(ctx0, mn, ggml_view_2d(ctx0, slot.smin, d, nfull, slot.smin->nb[1], 0));
+        wmax = ggml_view_2d(ctx0, wmax, d, nbm, slot.smax->nb[1], 0); // whole summary, ordered after the rebuild
+        wmin = ggml_view_2d(ctx0, wmin, d, nbm, slot.smin->nb[1], 0);
+    } else {
+        wmax = ggml_set_rows(ctx0, slot.smax, mx, inp->lsa_q_blk);
+        wmin = ggml_set_rows(ctx0, slot.smin, mn, inp->lsa_q_blk);
+    }
+    cb(wmax, "lsa_smax", il);
+    cb(wmin, "lsa_smin", il);
+    ggml_build_forward_expand(gf, wmax);
+    ggml_build_forward_expand(gf, wmin);
+    inp->lsa_smax_cur = wmax;
+    inp->lsa_smin_cur = wmin;
+    inp->lsa_sum_il   = il;
+}
+
+ggml_tensor * llm_graph_context::build_attn_lsa_mask_blk(
+        const llm_graph_input_attn_kv * inp,
+        ggml_tensor * qi,
+        ggml_tensor * kq_mask,
+            int64_t   n_kv,
+            int64_t   keep_lr,
+                int   il,
+        ggml_tensor * smax,
+        ggml_tensor * smin,
+               bool   keep_f32) const {
+    const auto & cfg = llama_lsa_cfg();
+    smax = smax ? smax : inp->lsa_smax_cur;
+    smin = smin ? smin : inp->lsa_smin_cur;
+    const int64_t B   = cfg.block;
+    const int64_t T   = qi->ne[1];
+    const int64_t nbs = std::min<int64_t>((n_kv + B - 1)/B, smax->ne[1]);
+    const int64_t d   = smax->ne[0];
+    if (nbs < 2 || qi->ne[0] != d || inp->lsa_cell_pos->ne[0] != n_kv) {
+        return nullptr;
+    }
+    // block score = upper bound of its cells' index scores: sum_c max(q_c*max_c, q_c*min_c)
+    ggml_tensor * vmax = ggml_view_2d(ctx0, smax, d, nbs, smax->nb[1], 0);
+    ggml_tensor * vmin = ggml_view_2d(ctx0, smin, d, nbs, smin->nb[1], 0);
+    if (cfg.sum_op && cfg.fused_sel && qi->type == GGML_TYPE_F32 && d % 2 == 0 && smax->type == GGML_TYPE_F16 &&
+            smin->type == GGML_TYPE_F16 && smax->nb[1] == smin->nb[1]) {
+        // LLAMA_LSA_SUM_OP: the fused select scores the blocks itself; the score chain below then has no consumer
+        lsa_sum_q = ggml_is_contiguous(qi) ? qi : ggml_cont(ctx0, qi);
+        lsa_sum_x = vmax;
+        lsa_sum_n = vmin;
+    }
+    if (cfg.block_sum_mode == 2) {
+        // LLAMA_LSA_BLOCK_SUM=2: Gaussian estimate of log sum_{c in block} exp(tau*s_c) - log B with per-channel mean
+        // mu and variance v (channels treated as independent): tau*(q.mu) + tau^2/2*(q^2.v)
+        const float tau = (float) cfg.block_tau;
+        ggml_tensor * Sb = ggml_add(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, vmax, qi), tau),
+                                          ggml_scale(ctx0, ggml_mul_mat(ctx0, vmin, ggml_sqr(ctx0, qi)), 0.5f*tau*tau)); // [nbs, T]
+        ggml_tensor * mb = build_attn_lsa_mask_sb(inp, Sb, kq_mask, n_kv, keep_lr, il, keep_f32);
+        lsa_sum_q = lsa_sum_x = lsa_sum_n = nullptr; // never left for another caller (early returns in mask_sb)
+        return mb;
+    }
+    ggml_tensor * qp = ggml_relu(ctx0, qi);
+    ggml_tensor * qn = ggml_sub(ctx0, qi, qp);
+    ggml_tensor * Sb = ggml_add(ctx0, ggml_mul_mat(ctx0, vmax, qp), ggml_mul_mat(ctx0, vmin, qn));   // [nbs, T]
+    ggml_tensor * mb = build_attn_lsa_mask_sb(inp, Sb, kq_mask, n_kv, keep_lr, il, keep_f32);
+    lsa_sum_q = lsa_sum_x = lsa_sum_n = nullptr;
+    return mb;
+}
+
+// per-graph base of the block/unit masks: kq_mask where always kept (sinks, window, rows before min_pos), kq_mask - 1e30
+// elsewhere. Shared by every layer for decode/verify widths (T <= 64), rebuilt per layer at prefill widths.
+ggml_tensor * llm_graph_context::build_attn_lsa_blk_base(
+        const llm_graph_input_attn_kv * inp, ggml_tensor * kq_mask, int64_t n_kv, int64_t T, int il) const {
+    const auto & cfg = llama_lsa_cfg();
+    const bool share = T <= 64;
+    ggml_tensor * A = share ? inp->lsa_blk_base : nullptr;
+    if (A == nullptr || inp->lsa_blk_base_src != kq_mask || A->ne[0] != n_kv || A->ne[1] != T) {
+        ggml_tensor * mk = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        mk = ggml_reshape_2d(ctx0, mk, n_kv, T);
+        ggml_tensor * dc  = ggml_sub(ctx0, ggml_repeat(ctx0, inp->lsa_cell_pos, mk), inp->lsa_q_pos);
+        ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, dc, 1.0f, (float) cfg.window - 0.5f));
+        ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_cell_pos, -1.0f, (float) cfg.sinks - 0.5f));
+        ggml_tensor * drop = ggml_scale_bias(ctx0, ggml_clamp(ctx0, ggml_add(ctx0, win, snk), 0.0f, 1.0f), -1.0f, 1.0f);
+        if (cfg.min_pos > 0) {
+            drop = ggml_mul(ctx0, drop, ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_q_pos, 1.0f, 0.5f - (float) cfg.min_pos)));
+        }
+        A = ggml_cont(ctx0, ggml_add(ctx0, ggml_scale(ctx0, drop, -1e30f), mk));
+        cb(A, "lsa_blk_base", il);
+        if (share) {
+            inp->lsa_blk_base     = A;
+            inp->lsa_blk_base_src = kq_mask;
+        }
+    }
+    return A;
+}
+
+// LLAMA_LSA_BLKLIST: shape/cache conditions under which the layer's SJ-KVaRN 4/4 stream node can take a pick of B-cell
+// blocks (T decode/verify rows, F16 KQ mask, COMP=2 counts available when COMP is on); the caller adds pick sharing
+bool llm_graph_context::lsa_blist_ok(int64_t T, int64_t B, const ggml_tensor * kq_mask) const {
+    const auto & cfg = llama_lsa_cfg();
+    static const int64_t sj_stream_max = std::min<int64_t>(8, getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") ?
+            atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8);
+    const bool share   = T <= 64;
+    const bool comp_nd = share && cfg.comp_fast && !cfg.comp_cnt_legacy && !cfg.comp_cnt_exp && T <= cfg.comp_max_t;
+    const int  body_t  = sj_kvarn_pending.body ? sj_kvarn_pending.body->op_params[7] : -1;
+    // LLAMA_LSA_RESIDENT record pages (CUDA_LSA_Page_) take the mask-gated loader: no CUDA block-list reader serves them, so
+    // a block-list node there would fail supports_op and run on the CPU (rr1 r44_ref: 15.8 s/token at 98K, GPU 0%).
+    // Strip slots (CUDA_LSA_Strip_) keep the block list: the stream kernel reads them (GGML_CUDA_LSA_STRIP_STREAM=0 = old route).
+    static const bool strip_stream = !(getenv("GGML_CUDA_LSA_STRIP_STREAM") && atoi(getenv("GGML_CUDA_LSA_STRIP_STREAM")) == 0);
+    const ggml_backend_buffer_t body_buf = sj_kvarn_pending.body ? sj_kvarn_pending.body->buffer : nullptr;
+    const char * body_bn = body_buf ? ggml_backend_buft_name(ggml_backend_buffer_get_type(body_buf)) : "";
+    if (strncmp(body_bn, "CUDA_LSA_", 9) == 0 && !(strip_stream && strncmp(body_bn, "CUDA_LSA_Strip_", 15) == 0)) {
+        static bool warned = false;
+        if (!warned && cfg.blk_list) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT layers use the F16 selection mask, not LLAMA_LSA_BLKLIST\n", __func__);
+        }
+        return false;
+    }
+    return share && sj_kvarn_pending.body && T <= sj_stream_max && sj_kvarn_pending.bits_k == 4 &&
+        sj_kvarn_pending.bits_v == 4 && body_t != GGML_TYPE_I16 && body_t != GGML_TYPE_TURBO4_0 && !cfg.sj_compact &&
+        kq_mask->type == GGML_TYPE_F16 && B >= cfg.blist_min_unit && (B & (B - 1)) == 0 && (!cfg.comp || comp_nd) && fa_sel_rows == nullptr;
+}
+
+// LLAMA_LSA_BLKLIST: per-graph F16 mask M3 (kq_mask where always kept, -inf where hidden, GGML_LSA_MASK_SEL at visible
+// droppable cells) from the per-graph base A; the same M3 serves block and unit picks of any size
+ggml_tensor * llm_graph_context::build_attn_lsa_blk_m3(
+        const llm_graph_input_attn_kv * inp, ggml_tensor * A, ggml_tensor * kq_mask, int64_t n_kv, int64_t T, int il) const {
+    ggml_tensor * m3 = inp->lsa_blk_m3;
+    if (m3 == nullptr || inp->lsa_blk_m3_src != A || m3->ne[0] != n_kv || m3->ne[1] != T) {
+        ggml_tensor * mk = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        ggml_tensor * vd = ggml_mul(ctx0, ggml_exp(ctx0, ggml_reshape_2d(ctx0, mk, n_kv, T)),
+                                          ggml_step(ctx0, ggml_scale_bias(ctx0, A, -1.0f, -1.0f))); // 1 = visible droppable
+        // A x (1 - vd) + SEL x vd: vd = 1 only where A = -1e30 (finite), so no inf x 0
+        m3 = ggml_add(ctx0, ggml_mul(ctx0, A, ggml_scale_bias(ctx0, vd, -1.0f, 1.0f)), ggml_scale(ctx0, vd, GGML_LSA_MASK_SEL));
+        m3 = ggml_reshape_4d(ctx0, ggml_cast(ctx0, m3, GGML_TYPE_F16), n_kv, T, 1, 1);
+        cb(m3, "lsa_kq_mask_m3", il);
+        inp->lsa_blk_m3     = m3;
+        inp->lsa_blk_m3_src = A;
+    }
+    return m3;
+}
+
+// LLAMA_LSA_REFINE=F + LLAMA_LSA_FUSED_SEL=1: mask from a 0/1 selection of U-cell units (selu F32 [n_kv/U, T]), kept
+// = selected unit, sink or window, causal mask added back; COMP=2 gets the dropped cells per B-cell block,
+// nd_b = sum over the block's units of (1 - sel_u) x D_u (D_u = visible droppable cells of the unit, once per graph).
+// nullptr if the shapes do not fit (the caller falls back to the graph refine chain).
+ggml_tensor * llm_graph_context::build_attn_lsa_mask_units(
+        const llm_graph_input_attn_kv * inp, ggml_tensor * selu, int64_t U, ggml_tensor * kq_mask, int64_t n_kv,
+        int il, bool shared_pick) const {
+    const auto & cfg = llama_lsa_cfg();
+    const int64_t B  = cfg.block;
+    const int64_t nu = selu->ne[0];
+    const int64_t T  = selu->ne[1];
+    lsa_fa_sel = nullptr;
+    lsa_fa_m3  = nullptr;
+    lsa_fa_vk  = false;
+    lsa_fa_vk_n = 0;
+    if (cfg.blk_mask_legacy || hparams.f_max_alibi_bias != 0.0f || U < 1 || U*nu != n_kv || B % U != 0 || n_kv % B != 0) {
+        return nullptr;
+    }
+    const bool share = T <= 64;
+    ggml_tensor * A = build_attn_lsa_blk_base(inp, kq_mask, n_kv, T, il);
+    const bool blist_on = cfg.blk_list && (shared_pick || T == 1) && lsa_blist_ok(T, U, kq_mask);
+    if (cfg.stats && il >= 0 && il < 256) {
+        // LLAMA_LSA_STATS on the unit pick (it returns before make_mask's stats): kept share of the middle, and the
+        // middle 16-cell strips / 128-cell records some row keeps (what the SJ decode kernel's skip can drop), from
+        // the pick the attention applies (row 0 for every row on the block list)
+        ggml_tensor * mk  = ggml_reshape_2d(ctx0, kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32), n_kv, T);
+        ggml_tensor * vis = ggml_step(ctx0, ggml_scale_bias(ctx0, mk, 1.0f, 1e29f));                  // visible
+        ggml_tensor * dv  = ggml_mul(ctx0, vis, ggml_step(ctx0, ggml_scale_bias(ctx0, A, -1.0f, -1.0f))); // visible droppable
+        ggml_tensor * sp  = blist_on && T > 1 ? ggml_repeat(ctx0, ggml_view_2d(ctx0, selu, nu, 1, selu->nb[1], 0), selu) : selu;
+        ggml_tensor * sc  = U == 1 ? sp : ggml_reshape_2d(ctx0,
+                ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, ggml_cont(ctx0, sp), 1, nu, T), U, nu, T, 1), n_kv, T);
+        ggml_tensor * kd  = ggml_mul(ctx0, dv, sc);                                                    // kept droppable
+        ggml_tensor * s_v = ggml_sum_rows(ctx0, vis);
+        ggml_tensor * bon = ggml_sub(ctx0, s_v, ggml_sum_rows(ctx0, dv));                              // always-kept visible
+        ggml_tensor * st  = ggml_concat(ctx0, ggml_concat(ctx0, ggml_add(ctx0, bon, ggml_sum_rows(ctx0, kd)), s_v, 0), bon, 0);
+        ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, st, lsa_stats_op, 1, (void *) (intptr_t) il));
+        auto uni = [&](ggml_tensor * x) { // [n_kv, T] 0/1 -> [n_kv] 0/1, union over rows
+            ggml_tensor * u = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, x)));
+            return ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_reshape_1d(ctx0, u, n_kv), 1.0f, -0.5f));
+        };
+        auto cnt = [&](ggml_tensor * u, int64_t Bc) { // live blocks of Bc cells
+            const int64_t nbc = (n_kv + Bc - 1)/Bc;
+            ggml_tensor * up = nbc*Bc > n_kv ? ggml_pad(ctx0, u, (int) (nbc*Bc - n_kv), 0, 0, 0) : u;
+            return ggml_sum(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0,
+                    ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, up, Bc, nbc)), 1.0f, -0.5f)));
+        };
+        ggml_tensor * uk = uni(kd);
+        ggml_tensor * uv = uni(dv);
+        ggml_tensor * st2 = ggml_concat(ctx0, ggml_concat(ctx0, cnt(uk, 16), cnt(uv, 16), 0),
+                ggml_concat(ctx0, cnt(uk, 128), cnt(uv, 128), 0), 0);                                  // [4]
+        ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, st2, lsa_stats_blk_op, 1, (void *) (intptr_t) il));
+    }
+    // LLAMA_LSA_BLKLIST: a unit pick shared by all rows (REFINE_SH or one row) goes to the SJ-KVaRN stream node as a block
+    // list with block = U (power of 2, >= 16; >= 1 with LLAMA_LSA_BLKLIST_FINE=1), on the per-graph M3, so no full-width op runs per layer. With
+    // LLAMA_LSA_VK the node takes a split plane (B-block counts for the extra keys, then the unit pick), else COMP=2 merges.
+    if (blist_on) {
+        ggml_tensor * m3 = build_attn_lsa_blk_m3(inp, A, kq_mask, n_kv, T, il);
+        lsa_fa_sel = ggml_view_1d(ctx0, selu, nu, 0); // row 0: every row holds the same pick
+        lsa_fa_blk = (int32_t) U;
+        lsa_fa_m3  = m3;
+        if (cfg.comp) {
+            ggml_tensor * D = inp->lsa_unit_dcnt;
+            if (D == nullptr || inp->lsa_unit_dcnt_src != A || D->ne[0] != nu || D->ne[1] != T) {
+                ggml_tensor * mk = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+                ggml_tensor * vd = ggml_mul(ctx0, ggml_exp(ctx0, ggml_reshape_2d(ctx0, mk, n_kv, T)),
+                                                  ggml_step(ctx0, ggml_scale_bias(ctx0, A, -1.0f, -1.0f)));
+                D = U == 1 ? vd : ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, vd, U, nu, T)), nu, T);
+                cb(D, "lsa_unit_dcnt", il);
+                inp->lsa_unit_dcnt     = D;
+                inp->lsa_unit_dcnt_src = A;
+            }
+            // counts from row 0's pick, the one the node applies to every row (rows can differ at the window edge);
+            // row 0 is broadcast over the rows by the mul (same values as repeating it, without the [nu, T] copies)
+            ggml_tensor * s0  = T == 1 || cfg.blist_lean ? ggml_view_2d(ctx0, selu, nu, 1, selu->nb[1], 0) :
+                ggml_repeat(ctx0, ggml_view_2d(ctx0, selu, nu, 1, selu->nb[1], 0), selu);
+            ggml_tensor * ndu = ggml_mul(ctx0, D, ggml_scale_bias(ctx0, s0, -1.0f, 1.0f));             // [nu, T]
+            ggml_tensor * ndb = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, ndu, B/U, n_kv/B, T)),
+                                                n_kv/B, T);                                              // [nbs, T]
+            if (cfg.vk && lsa_vk_km && lsa_vk_vm && lsa_vk_nbs == n_kv/B) {
+                // LLAMA_LSA_VK with units: plane [nbs + nu, T] = (1 + dropped cells per mean block, unit pick); the
+                // node resolves the mask by unit (row 0) and adds one extra key per block with dropped cells
+                lsa_fa_sel  = ggml_concat(ctx0, ggml_scale_bias(ctx0, ndb, 1.0f, 1.0f), selu, 0);
+                cb(lsa_fa_sel, "lsa_vk_plane_u", il);
+                lsa_fa_vk   = true;
+                lsa_fa_vk_n = (int32_t) (n_kv/B);
+                static uint32_t logged_vku = 0;
+                if (llama_lsa_log_once(logged_vku)) {
+                    LLAMA_LOG_WARN("%s: LSA compensation as virtual keys with the unit pick active (LLAMA_LSA_VK=1, "
+                            "layer %d, %lld blocks, %lld units of %lld, T %lld)\n", __func__, il, (long long) (n_kv/B),
+                            (long long) nu, (long long) U, (long long) T);
+                }
+            } else {
+                inp->lsa_comp_nd      = ndb;
+                inp->lsa_comp_nd_mask = m3;
+            }
+        }
+        static uint32_t logged_ub = 0;
+        if (llama_lsa_log_once(logged_ub)) {
+            LLAMA_LOG_WARN("%s: LSA unit pick as block list to the SJ-KVaRN kernel active (LLAMA_LSA_BLKLIST=1, layer %d, "
+                    "%lld units of %lld, T %lld)\n", __func__, il, (long long) nu, (long long) U, (long long) T);
+        }
+        return m3;
+    }
+    ggml_tensor * m = ggml_add(ctx0, ggml_reshape_3d(ctx0, A, U, nu, T),
+                                     ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, selu, 1e30f, 0.0f), 1, nu, T));
+    m = ggml_clamp(ctx0, ggml_reshape_2d(ctx0, m, n_kv, T), -INFINITY, 0.0f);
+    if (kq_mask->type != GGML_TYPE_F32) {
+        m = ggml_cast(ctx0, m, kq_mask->type);
+    }
+    m = ggml_reshape_4d(ctx0, m, n_kv, T, 1, 1);
+    cb(m, "lsa_kq_mask_unit", il);
+    if (share && cfg.comp_fast && !cfg.comp_cnt_legacy && !cfg.comp_cnt_exp && T <= cfg.comp_max_t) {
+        ggml_tensor * D = inp->lsa_unit_dcnt;
+        if (D == nullptr || inp->lsa_unit_dcnt_src != A || D->ne[0] != nu || D->ne[1] != T) {
+            ggml_tensor * mk = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+            ggml_tensor * vd = ggml_mul(ctx0, ggml_exp(ctx0, ggml_reshape_2d(ctx0, mk, n_kv, T)),
+                                              ggml_step(ctx0, ggml_scale_bias(ctx0, A, -1.0f, -1.0f)));
+            D = U == 1 ? vd : ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, vd, U, nu, T)), nu, T);
+            cb(D, "lsa_unit_dcnt", il);
+            inp->lsa_unit_dcnt     = D;
+            inp->lsa_unit_dcnt_src = A;
+        }
+        ggml_tensor * ndu = ggml_mul(ctx0, D, ggml_scale_bias(ctx0, selu, -1.0f, 1.0f));               // [nu, T]
+        inp->lsa_comp_nd      = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, ndu, B/U, n_kv/B, T)),
+                                                n_kv/B, T);                                              // [nbs, T]
+        inp->lsa_comp_nd_mask = m;
+    }
+    return m;
+}
+
+ggml_tensor * llm_graph_context::build_attn_lsa_mask_sb(
+        const llm_graph_input_attn_kv * inp,
+        ggml_tensor * Sb,
+        ggml_tensor * kq_mask,
+            int64_t   n_kv,
+            int64_t   keep_lr,
+                int   il,
+               bool   keep_f32,
+        ggml_tensor * S_cells,
+              float   tau) const {
+    const auto & cfg = llama_lsa_cfg();
+    const bool cfg_shared = cfg.shared && lsa_one_seq(ubatch, il); // rows of other sequences never share a pick
+    const bool cfg_union  = cfg.shared_union && lsa_one_seq(ubatch, il); // SHARED=3: per-row picks, OR-ed below
+    const int64_t B   = cfg.block;
+    const bool cells  = Sb == nullptr; // fused op only: the op scores the blocks from the cell scores
+    lsa_fa_sel = nullptr; // a pick left by an earlier layer never reaches this layer's FA node
+    lsa_fa_m3  = nullptr;
+    lsa_fa_vk  = false;
+    lsa_fa_vk_n = 0;
+    const int64_t T0  = cells ? (S_cells ? S_cells->ne[1] : 1) : Sb->ne[1];
+    const bool smax   = cfg_shared && cfg.shared_max && T0 > 1; // SHARED=2: fused op mode 2, or the chain below
+    const bool smax_chain = smax && cfg.smax_chain;              // LLAMA_LSA_SMAX_CHAIN=1: old graph chain (A/B)
+    const int  shmode = cfg_shared && T0 > 1 ? (cfg.shared_max ? 2 : 1) : 0;
+    if (cells && (S_cells == nullptr || !cfg.fused_sel || smax_chain || S_cells->ne[0] != n_kv || S_cells->type != GGML_TYPE_F32)) {
+        return nullptr;
+    }
+    const int64_t nbs = cells ? (n_kv + B - 1)/B : Sb->ne[0];
+    const int64_t T   = cells ? S_cells->ne[1] : Sb->ne[1];
+    if (B <= 1 || nbs < 2 || (!cells && (Sb->ne[2] != 1 || Sb->type != GGML_TYPE_F32)) || inp->lsa_cell_pos->ne[0] != n_kv) {
+        return nullptr;
+    }
+    // LLAMA_LSA_FUSED_SEL=1: eligibility, top-k and the 0/1 selection in one op (same selected blocks: an ineligible
+    // block the top-k path could take changes neither the mask nor the dropped counts). sel01 = 1 where selected.
+    ggml_tensor * sel01 = nullptr;
+    const int64_t kb = std::max<int64_t>(1, std::min<int64_t>(nbs, keep_lr/B));
+    // LLAMA_LSA_PICK_EVERY=N: reuse this layer's last pick (one 0/1 plane for all rows, the union of the pick's rows)
+    // for up to N - 1 graphs. The scoring above then has no consumer and drops out of the graph.
+    const ggml_tensor * pick_k = lsa_pick_kbase;
+    lsa_pick_kbase = nullptr;
+    ggml_tensor * sum_q = lsa_sum_q, * sum_x = lsa_sum_x, * sum_n = lsa_sum_n; // LLAMA_LSA_SUM_OP
+    lsa_sum_q = lsa_sum_x = lsa_sum_n = nullptr;
+    ggml_tensor * pick_store = nullptr; // set on a pick graph: write the union here
+    bool pick_k_reused = false;         // sel01 is a reused pick: one plane for all rows
+    // one sequence only: rows of different sequences must not share a pick, and a pick is reused only by its own sequence
+    if (pick_k && cfg.pick_every > 1 && ubatch.pos && (int64_t) ubatch.n_tokens == T && B*nbs <= n_kv && pick_k->buffer &&
+            ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq) {
+        const int32_t seq   = ubatch.seq_id_unq[0];
+        const int64_t n_cap = inp->mctx->get_kv_size()/B + 1;
+        const int64_t pos0  = ubatch.pos[0];
+        const int64_t edge  = (int64_t) std::floor(((double) ubatch.pos[T - 1] - (double) cfg.window + 1.0)/(double) B);
+        llama_lsa_pick_slot ps;
+        if (llama_lsa_pick_get(pick_k, n_cap, ggml_backend_buffer_get_type(pick_k->buffer), pos0, edge, nbs, seq, &ps)) {
+            inp->lsa_pick_commit.push_back({ pick_k, ps.gen, ps.reuse, pos0, edge, nbs, seq });
+            if (ps.reuse) {
+                pick_k_reused = true;
+                ggml_tensor * v = ggml_view_2d(ctx0, ps.sel, nbs, 1, ps.sel->nb[0]*nbs, 0);
+                sel01 = ggml_repeat(ctx0, v, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nbs, T));
+                cb(sel01, "lsa_block_sel_reuse", il);
+                static uint32_t logged_pr = 0;
+                if (llama_lsa_log_once(logged_pr)) {
+                    LLAMA_LOG_WARN("%s: LSA block pick reused (LLAMA_LSA_PICK_EVERY=%lld, layer %d, %lld blocks)\n", __func__,
+                            (long long) cfg.pick_every, il, (long long) nbs);
+                }
+            } else {
+                pick_store = ps.sel;
+            }
+        }
+    } else if (pick_k && cfg.pick_every > 1 && ubatch.n_seqs_unq > 1) {
+        inp->lsa_pick_commit.push_back({ pick_k, 0, false, 0, 0, 0, -1, true }); // multi-sequence graph: expire the pick
+    }
+    // visible droppable cells per block and row, D [nbs, T], once per graph (layer independent): kq_mask 0 and not
+    // sink / window / before min_pos. Used by COMP=2 counts and by LLAMA_LSA_ELIG eligibility.
+    auto blk_dcnt = [&](ggml_tensor * A) -> ggml_tensor * {
+        ggml_tensor * D = inp->lsa_blk_dcnt;
+        if (D == nullptr || inp->lsa_blk_dcnt_src != A || D->ne[0] != nbs || D->ne[1] != T) {
+            // A + 1e30 is 0 at visible droppable cells, +1e30 at always-kept visible ones, -inf where hidden;
+            // exp(-(A + 1e30)^2) would be fragile, so: visible = exp(kq_mask), droppable = step(-A - 1)
+            ggml_tensor * mk  = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+            ggml_tensor * vd  = ggml_mul(ctx0, ggml_exp(ctx0, ggml_reshape_2d(ctx0, mk, n_kv, T)),
+                                               ggml_step(ctx0, ggml_scale_bias(ctx0, A, -1.0f, -1.0f)));
+            D = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, vd, B, nbs, T)), nbs, T);
+            cb(D, "lsa_blk_dcnt", il);
+            inp->lsa_blk_dcnt     = D;
+            inp->lsa_blk_dcnt_src = A;
+        }
+        return D;
+    };
+    // LLAMA_LSA_ELIG=1: eligibility from D (fix for the plain cache, where a block's first cell need not be its
+    // oldest position: holes after seq_rm, several sequences). The fused ops test only cell_pos[b*B], so they get a
+    // stand-in position per block: sinks - B + 1 (outside the sinks and, for every row with droppable cells, outside
+    // its window: such a row has q_pos >= sinks + window) where any row has a droppable cell, else 1e9 (ineligible as
+    // future). Written as e*c + (1 - e)*1e9 so both values are exact in f32.
+    ggml_tensor * elig_D    = nullptr;
+    ggml_tensor * cpos_sel  = inp->lsa_cell_pos;
+    if (!sel01 && cfg.elig_drop && !cfg.blk_mask_legacy && hparams.f_max_alibi_bias == 0.0f && B*nbs == n_kv && n_kv % B == 0) {
+        elig_D = blk_dcnt(build_attn_lsa_blk_base(inp, kq_mask, n_kv, T, il));
+        ggml_tensor * Dt = ggml_cont(ctx0, ggml_transpose(ctx0, elig_D));                                // [T, nbs]
+        ggml_tensor * e  = ggml_step(ctx0, ggml_scale_bias(ctx0,
+                ggml_pool_1d(ctx0, Dt, GGML_OP_POOL_MAX, (int) T, (int) T, 0), 1.0f, -0.5f));             // [1, nbs]
+        ggml_tensor * p  = ggml_add(ctx0, ggml_scale(ctx0, e, (float) (cfg.sinks - B + 1)),
+                                          ggml_scale(ctx0, ggml_scale_bias(ctx0, e, -1.0f, 1.0f), 1e9f));
+        ggml_tensor * z  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, B - 1, nbs), 0.0f);
+        cpos_sel = ggml_reshape_1d(ctx0, ggml_concat(ctx0, p, z, 0), n_kv);                              // p at b*B
+        cb(cpos_sel, "lsa_elig_pos", il);
+        static uint32_t logged_el = 0;
+        if (llama_lsa_log_once(logged_el)) {
+            LLAMA_LOG_WARN("%s: LSA block eligibility from droppable cells (LLAMA_LSA_ELIG=1, layer %d)\n", __func__, il);
+        }
+    }
+    if (sel01) {
+        // reused pick (LLAMA_LSA_PICK_EVERY)
+    } else if (cells) {
+        ggml_tensor * Sc = ggml_is_contiguous(S_cells) ? S_cells : ggml_cont(ctx0, S_cells);
+        ggml_tensor * mk = ggml_reshape_2d(ctx0, ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask), n_kv, T);
+        sel01 = lsa_slice(lsa_sticky(ggml_lsa_block_select_cells(ctx0, Sc, mk, cpos_sel, inp->lsa_q_pos, (int) B, tau,
+                (int) cfg.window, (int) cfg.sinks, (int) kb, shmode), sj_kvarn_pending.body, sj_kvarn_pending.desc, 1), B);
+    } else if (cfg.fused_sel && !smax_chain && Sb->ne[1] == inp->lsa_q_pos->ne[1] && inp->lsa_cell_pos->ne[0] >= B*nbs) {
+        if (sum_q && sum_q->ne[1] == T && sum_x->ne[1] >= nbs) {
+            sel01 = lsa_slice(lsa_sticky(ggml_lsa_block_select_sum(ctx0, sum_q, sum_x, sum_n, cpos_sel, inp->lsa_q_pos, (int) nbs, (int) B,
+                    (float) cfg.block_tau, cfg.block_sum_mode, (int) cfg.window, (int) cfg.sinks, (int) kb, shmode),
+                    sj_kvarn_pending.body, sj_kvarn_pending.desc, 1), B);
+            static uint32_t logged_so = 0;
+            if (llama_lsa_log_once(logged_so)) {
+                LLAMA_LOG_WARN("%s: LSA summary scores inside the block select (LLAMA_LSA_SUM_OP=1, mode %d, layer %d)\n",
+                        __func__, cfg.block_sum_mode, il);
+            }
+        } else {
+            ggml_tensor * Sc = ggml_is_contiguous(Sb) ? Sb : ggml_cont(ctx0, Sb);
+            cb(Sc, "lsa_block_score", il);
+            sel01 = lsa_slice(lsa_sticky(ggml_lsa_block_select(ctx0, Sc, cpos_sel, inp->lsa_q_pos, (int) B, (int) cfg.window,
+                    (int) cfg.sinks, (int) kb, shmode), sj_kvarn_pending.body, sj_kvarn_pending.desc, 1), B);
+        }
+    }
+    if (sel01) {
+        cb(sel01, "lsa_block_sel", il);
+        static uint32_t logged_ep = 0;
+        if (llama_lsa_log_once(logged_ep)) {
+            LLAMA_LOG_WARN("%s: LSA fused block select active (layer %d, %lld of %lld blocks, T %lld, shared %d)\n", __func__, il,
+                    (long long) kb, (long long) nbs, (long long) T, shmode);
+        }
+    }
+    if (!sel01 && smax) {
+        // SHARED=2: one pick for the ubatch (the record skip reads one kb-block set, not the union of T picks),
+        // block rank = max over rows of the row-normalized log share, Sb - logsumexp_row(Sb): a block one verify
+        // row needs strongly stays in even if the other rows ignore it (the summed log scores of SHARED=1 act like
+        // a product of shares and drop such blocks). Masked/empty blocks sit at ~-1e30 and stay ineligible below.
+        ggml_tensor * Sc = ggml_is_contiguous(Sb) ? Sb : ggml_cont(ctx0, Sb);
+        ggml_tensor * bm = ggml_pool_1d(ctx0, Sc, GGML_OP_POOL_MAX, (int) nbs, (int) nbs, 0);        // [1, T]
+        ggml_tensor * ls = ggml_add(ctx0, ggml_log(ctx0, ggml_sum_rows(ctx0,
+                                ggml_exp(ctx0, ggml_sub(ctx0, Sc, ggml_repeat(ctx0, bm, Sc))))), bm); // [1, T]
+        ggml_tensor * Sn = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_sub(ctx0, Sc, ggml_repeat(ctx0, ls, Sc)))); // [T, nbs]
+        ggml_tensor * St = ggml_pool_1d(ctx0, Sn, GGML_OP_POOL_MAX, (int) T, (int) T, 0);           // [1, nbs]
+        Sb = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, St, nbs, 1), Sc);
+    } else if (!sel01 && cfg_shared && T > 1) {
+        ggml_tensor * St = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Sb)));          // [1, nbs]
+        Sb = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, St, nbs, 1), Sb);
+    }
+    ggml_tensor * topb = nullptr;
+    if (!sel01) {
+        cb(Sb, "lsa_block_score", il);
+        // a block wholly inside the window (or in the future, or empty: cell_pos 1e9) or inside the sinks is kept or
+        // masked anyway, so it may not take a pick; its first cell's position decides
+        if (elig_D && elig_D->ne[0] == Sb->ne[0] && elig_D->ne[1] == Sb->ne[1]) {
+            // LLAMA_LSA_ELIG=1: per row, a block with no visible droppable cell may not take a pick
+            Sb = ggml_add(ctx0, Sb, ggml_scale(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, elig_D, -1.0f, 0.5f)), -1e30f));
+        } else {
+        ggml_tensor * bpos = ggml_cont(ctx0, ggml_view_2d(ctx0, inp->lsa_cell_pos, 1, nbs, B*inp->lsa_cell_pos->nb[0], 0));
+        bpos = ggml_reshape_2d(ctx0, bpos, nbs, 1);
+        ggml_tensor * dq    = ggml_sub(ctx0, ggml_repeat(ctx0, bpos, Sb), inp->lsa_q_pos);                // [nbs, T]
+        ggml_tensor * inwin = ggml_step(ctx0, ggml_scale_bias(ctx0, dq, 1.0f, (float) cfg.window - 0.5f));
+        ggml_tensor * insnk = ggml_step(ctx0, ggml_scale_bias(ctx0, bpos, -1.0f, (float) (cfg.sinks - B) + 0.5f));
+        Sb = ggml_add(ctx0, Sb, ggml_scale(ctx0, ggml_add(ctx0, inwin, insnk), -1e30f));
+        }
+        topb = ggml_top_k(ctx0, Sb, (int) kb);                                                           // I32 [kb, T]
+        cb(topb, "lsa_top_blocks", il);
+    }
+    // block selection as a [1, nbs, T] plane: value `on` where selected, `off` elsewhere
+    auto sel_plane = [&](float on, float off) -> ggml_tensor * {
+        if (sel01) {
+            return ggml_reshape_4d(ctx0, ggml_scale_bias(ctx0, sel01, on - off, off), 1, nbs, T, 1);
+        }
+        ggml_tensor * p = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nbs, T, 1), off);
+        return ggml_set_rows(ctx0, p, ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, kb, T, 1), on), topb);
+    };
+    if (pick_store) {
+        // pick graph: union over rows -> [nbs], zero-padded to the cache length so later, wider graphs read 0 for blocks
+        // that did not exist at pick time (they are newer than the window edge, so kept anyway)
+        ggml_tensor * s01 = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, sel_plane(1.0f, 0.0f), nbs, T))); // [T, nbs]
+        ggml_tensor * u   = ggml_reshape_1d(ctx0, ggml_pool_1d(ctx0, s01, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nbs);
+        if (pick_store->ne[0] > nbs) {
+            u = ggml_pad(ctx0, u, (int) (pick_store->ne[0] - nbs), 0, 0, 0);
+        }
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, u, pick_store));
+    }
+    if (cfg.stats && il >= 0 && il < 256) {
+        // LLAMA_LSA_STATS on the block pick: blocks picked per row vs blocks picked by any row of the ubatch (the SJ
+        // record skip walks the union, so union/per-row is what a verify ubatch pays over a single-row pick)
+        ggml_tensor * s01 = ggml_reshape_2d(ctx0, sel_plane(1.0f, 0.0f), nbs, T);
+        ggml_tensor * u   = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, s01)));            // [1, nbs]
+        ggml_tensor * uc  = ggml_sum(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, u, 1.0f, -0.5f)));
+        ggml_tensor * st  = ggml_concat(ctx0, ggml_concat(ctx0, ggml_sum(ctx0, s01), uc, 0),
+                ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), (float) T), 0);             // [3]
+        ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, st, lsa_stats_union_op, 1, (void *) (intptr_t) il));
+    }
+    // LLAMA_LSA_SHARED=3: OR the rows' own picks into one plane for all rows (a reused pick already is one);
+    // after the stats op, which counts the per-row picks against their union
+    bool unioned = false;
+    if (cfg_union && T > 1 && !pick_k_reused) {
+        ggml_tensor * s01 = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, sel_plane(1.0f, 0.0f), nbs, T))); // [T, nbs]
+        ggml_tensor * u   = ggml_reshape_2d(ctx0, ggml_pool_1d(ctx0, s01, GGML_OP_POOL_MAX, (int) T, (int) T, 0), nbs, 1);
+        sel01   = ggml_repeat(ctx0, u, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, nbs, T));
+        cb(sel01, "lsa_block_sel_union", il);
+        unioned = true;
+        static uint32_t logged_un = 0;
+        if (llama_lsa_log_once(logged_un)) {
+            LLAMA_LOG_WARN("%s: LSA union of per-row block picks (LLAMA_LSA_SHARED=3, layer %d, %lld per row of %lld blocks, T %lld)\n",
+                    __func__, il, (long long) kb, (long long) nbs, (long long) T);
+        }
+    }
+    // Shared base mask: sinks, window, min_pos and the causal mask do not depend on the layer, so they are built once
+    // per graph (A = kq_mask where always kept, kq_mask - 1e30 elsewhere). kq_mask holds only 0 / -inf here (no ALiBi),
+    // so a layer's mask is clamp(A + 1e30 x selected block, -inf, 0), broadcast over the block's cells: 2 full-width
+    // ops per layer instead of ~13. Same f16 mask bits as the per-layer build below (+0 kept, -inf dropped/hidden).
+    if (!cfg.blk_mask_legacy && hparams.f_max_alibi_bias == 0.0f && B*nbs == n_kv) {
+        // shared only for decode / verify ubatches: at prefill widths A would stay live across the whole graph
+        // (n_kv x T x 4 B, ~400 MB at 200K x 512), so there it is rebuilt per layer like the old temporaries
+        const bool share = T <= 64;
+        ggml_tensor * A = build_attn_lsa_blk_base(inp, kq_mask, n_kv, T, il);
+        // LLAMA_LSA_BLKLIST=1: one pick for all rows (shared, reused or one row) on the SJ-KVaRN 4/4 stream kernel:
+        // the FA node gets the pick itself plus one per-graph F16 mask M3 (kq_mask where always kept, -inf where
+        // hidden, GGML_LSA_MASK_SEL at visible droppable cells), so no full-width op runs per layer. Same visible set
+        // as the per-layer mask below: a droppable visible cell is seen iff its block is picked.
+        const bool blist = cfg.blk_list && sel01 && share && !keep_f32 && (shmode > 0 || pick_k_reused || unioned || T == 1) &&
+            lsa_blist_ok(T, B, kq_mask);
+        if (blist) {
+            ggml_tensor * m3 = build_attn_lsa_blk_m3(inp, A, kq_mask, n_kv, T, il);
+            lsa_fa_sel = ggml_view_1d(ctx0, sel01, nbs, 0); // row 0: every row holds the same pick
+            lsa_fa_blk = (int32_t) B;
+            lsa_fa_m3  = m3;
+            if (cfg.comp) {
+                ggml_tensor * D = blk_dcnt(A);
+                if (cfg.vk && lsa_vk_km && lsa_vk_vm && lsa_vk_nbs == nbs) {
+                    // LLAMA_LSA_VK: plane (D + 1) x (1 - sel): 0 = picked, else 1 + dropped cells (same integer counts
+                    // as the merge's nd); one op per layer against the per-graph D + 1, no merge after the FA node
+                    ggml_tensor * D1 = inp->lsa_vk_dcnt1;
+                    if (D1 == nullptr || inp->lsa_vk_dcnt1_src != D) {
+                        D1 = ggml_scale_bias(ctx0, D, 1.0f, 1.0f);
+                        cb(D1, "lsa_vk_dcnt1", il);
+                        inp->lsa_vk_dcnt1     = D1;
+                        inp->lsa_vk_dcnt1_src = D;
+                    }
+                    lsa_fa_sel = ggml_mul(ctx0, D1, ggml_reshape_2d(ctx0, sel_plane(0.0f, 1.0f), nbs, T)); // [nbs, T]
+                    cb(lsa_fa_sel, "lsa_vk_plane", il);
+                    lsa_fa_vk  = true;
+                    static uint32_t logged_vk = 0;
+                    if (llama_lsa_log_once(logged_vk)) {
+                        LLAMA_LOG_WARN("%s: LSA compensation as virtual keys in the SJ-KVaRN kernel active (LLAMA_LSA_VK=1, "
+                                "layer %d, %lld blocks, T %lld)\n", __func__, il, (long long) nbs, (long long) T);
+                    }
+                } else {
+                    inp->lsa_comp_nd      = ggml_mul(ctx0, D, ggml_reshape_2d(ctx0, sel_plane(0.0f, 1.0f), nbs, T));
+                    inp->lsa_comp_nd_mask = m3;
+                }
+            }
+            static uint32_t logged_bl = 0;
+            if (llama_lsa_log_once(logged_bl)) {
+                LLAMA_LOG_WARN("%s: LSA block list to the SJ-KVaRN kernel active (LLAMA_LSA_BLKLIST=1, layer %d, %lld blocks, T %lld)\n",
+                        __func__, il, (long long) nbs, (long long) T);
+            }
+            return m3;
+        }
+        ggml_tensor * selb = sel_plane(1e30f, 0.0f);
+        ggml_tensor * m = ggml_add(ctx0, ggml_reshape_3d(ctx0, A, B, nbs, T), ggml_reshape_3d(ctx0, selb, 1, nbs, T));
+        m = ggml_clamp(ctx0, ggml_reshape_2d(ctx0, m, n_kv, T), -INFINITY, 0.0f);
+        if (kq_mask->type != GGML_TYPE_F32 && !keep_f32) {
+            m = ggml_cast(ctx0, m, kq_mask->type);
+        }
+        m = ggml_reshape_4d(ctx0, m, n_kv, T, 1, 1);
+        cb(m, "lsa_kq_mask_blk", il);
+        if (share && cfg.comp_fast && !cfg.comp_cnt_legacy && !cfg.comp_cnt_exp && T <= cfg.comp_max_t) {
+            // COMP=2 dropped cells per block without reading the mask again: a cell is dropped iff it is visible
+            // (kq_mask 0), droppable (A = -1e30: not sink/window, row past min_pos) and its block is not selected, so
+            // dropped_b = (1 - sel_b) x D_b with D_b = visible droppable cells of block b, which is layer independent
+            // (once per graph). Same integers as the exp(mask) count (exact f32 sums of <= B ones, x 0/1).
+            ggml_tensor * D = blk_dcnt(A);
+            ggml_tensor * sel1 = sel_plane(0.0f, 1.0f);
+            inp->lsa_comp_nd      = ggml_mul(ctx0, D, ggml_reshape_2d(ctx0, sel1, nbs, T));            // [nbs, T]
+            inp->lsa_comp_nd_mask = m;
+        }
+        return m;
+    }
+    ggml_tensor * sel = sel_plane(1.0f, 0.0f);
+    ggml_tensor * selc = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, sel, 1, nbs, T), B, nbs, T, 1),
+            B*nbs, T);
+    if (B*nbs < n_kv) {
+        selc = ggml_pad(ctx0, selc, (int) (n_kv - B*nbs), 0, 0, 0); // tail without a summary: window covers it
+    } else if (B*nbs > n_kv) {
+        selc = ggml_cont(ctx0, ggml_view_2d(ctx0, selc, n_kv, T, selc->nb[1], 0));
+    }
+    // cells: kept = selected block, sink or window (query included); then the causal mask is added back
+    ggml_tensor * dc   = ggml_sub(ctx0, ggml_repeat(ctx0, inp->lsa_cell_pos, selc), inp->lsa_q_pos);
+    ggml_tensor * win  = ggml_step(ctx0, ggml_scale_bias(ctx0, dc, 1.0f, (float) cfg.window - 0.5f));
+    ggml_tensor * snk  = ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_cell_pos, -1.0f, (float) cfg.sinks - 0.5f));
+    ggml_tensor * keep = ggml_clamp(ctx0, ggml_add(ctx0, ggml_add(ctx0, selc, win), snk), 0.0f, 1.0f);
+    ggml_tensor * drop = ggml_scale_bias(ctx0, keep, -1.0f, 1.0f);
+    if (cfg.min_pos > 0) {
+        drop = ggml_mul(ctx0, drop, ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_q_pos, 1.0f, 0.5f - (float) cfg.min_pos)));
+    }
+    ggml_tensor * mask_f32 = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    ggml_tensor * m = ggml_add(ctx0, ggml_scale(ctx0, drop, -1e30f), ggml_reshape_2d(ctx0, mask_f32, n_kv, T));
+    if (kq_mask->type != GGML_TYPE_F32 && !keep_f32) {
+        m = ggml_cast(ctx0, m, kq_mask->type);
+    }
+    m = ggml_reshape_4d(ctx0, m, n_kv, T, 1, 1);
+    cb(m, "lsa_kq_mask_blk", il);
+    static int n_logged = 0;
+    if (n_logged < 2) {
+        ++n_logged;
+        LLAMA_LOG_INFO("%s: LSA layer %d: n_kv %lld, T %lld, %lld of %lld blocks of %lld + sinks + window\n", __func__, il,
+                (long long) n_kv, (long long) T, (long long) kb, (long long) nbs, (long long) B);
+    }
+    return m;
+}
+
+// LSA fast path (LLAMA_LSA_FAST=1, llama-lsa-gather.h): one pick for the whole ubatch, ranked by the summed index
+// scores of its rows (the shared pick). Always kept: the first `sinks` positions and every cell from `window` before
+// the first row's position on (the window of each row, widened to cover all rows). The last row's mask drops cells no
+// row can see. The kept cells are copied out of K and V and attention runs over them with the original mask's
+// columns, so a row never sees a cell its causal mask hides. Returns the gathered mask, or nullptr (layer stays dense).
+ggml_tensor * llm_graph_context::build_attn_lsa_fast(
+        const llm_graph_input_attn_kv * inp,
+        ggml_tensor * S,
+        ggml_tensor ** k_io,
+        ggml_tensor ** v_io,
+        ggml_tensor * kq_mask,
+            int64_t   keep_lr,
+                int   il) const {
+    const auto & cfg = llama_lsa_cfg();
+    ggml_tensor * k = *k_io;
+    ggml_tensor * v = *v_io;
+    const int64_t n_kv = S->ne[0];
+    const int64_t T    = S->ne[1];
+
+    if (v == nullptr || v->ne[1] != k->ne[1] || v->ne[2] != n_kv || v->ne[3] != 1) {
+        return nullptr;
+    }
+    if (ubatch.pos && cfg.min_pos > 0) {
+        for (int64_t i = 0; i < T; ++i) {
+            if (ubatch.pos[i] < cfg.min_pos) {
+                return nullptr; // the fast path has no per-row dense fallback: the whole ubatch stays dense
+            }
+        }
+    }
+    // rounded up to 256 cells (FATTN_KQ_STRIDE): the GQA-packed attention kernels need it; the extra cells are the next
+    // best-ranked ones (or masked, if fewer cells are visible)
+    const int64_t n_sel = GGML_PAD(cfg.sinks + cfg.window + (T - 1) + std::max<int64_t>(keep_lr, 0), 256);
+    if (n_kv <= n_sel) {
+        return nullptr;
+    }
+
+    ggml_tensor * s = T > 1 ? ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, S))), n_kv, 1) : S;
+
+    ggml_tensor * mask_f32 = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    mask_f32 = ggml_reshape_2d(ctx0, mask_f32, n_kv, T);
+
+    ggml_tensor * q0  = ggml_view_2d(ctx0, inp->lsa_q_pos, 1, 1, inp->lsa_q_pos->nb[1], 0);           // first row
+    ggml_tensor * d   = ggml_sub(ctx0, inp->lsa_cell_pos, q0);                                         // [n_kv, 1]
+    ggml_tensor * win = ggml_step(ctx0, ggml_scale_bias(ctx0, d, 1.0f, (float) cfg.window - 0.5f));
+    ggml_tensor * snk = ggml_step(ctx0, ggml_scale_bias(ctx0, inp->lsa_cell_pos, -1.0f, (float) cfg.sinks - 0.5f));
+    s = ggml_add(ctx0, s, ggml_scale(ctx0, ggml_add(ctx0, win, snk), 1e20f));
+    s = ggml_add(ctx0, s, ggml_view_2d(ctx0, mask_f32, n_kv, 1, mask_f32->nb[1], (T - 1)*mask_f32->nb[1]));
+    cb(s, "lsa_score_shared", il);
+
+    ggml_tensor * ids = ggml_top_k(ctx0, s, (int) n_sel); // I32 [n_sel, 1]
+    cb(ids, "lsa_ids", il);
+
+    ggml_tensor * kg = llama_lsa_gather_cells(ctx0, k, ids);
+    ggml_tensor * vg = kg ? llama_lsa_gather_cells(ctx0, v, ids) : nullptr;
+    if (kg == nullptr || vg == nullptr) {
+        static uint32_t warned_ep = 0;
+        if (llama_lsa_log_once(warned_ep)) {
+            LLAMA_LOG_WARN("%s: LSA fast path: K/V cache layout not gatherable, layer stays dense\n", __func__);
+        }
+        return nullptr;
+    }
+    cb(kg, "lsa_k_sel", il);
+    cb(vg, "lsa_v_sel", il);
+
+    ggml_tensor * m = llama_lsa_gather_mask(ctx0, mask_f32, ids); // F32 [n_sel, T]
+    if (kq_mask->type != GGML_TYPE_F32) {
+        m = ggml_cast(ctx0, m, kq_mask->type);
+    }
+    m = ggml_reshape_4d(ctx0, m, n_sel, T, 1, 1);
+    cb(m, "lsa_kq_mask_sel", il);
+
+    *k_io = kg;
+    *v_io = vg;
+
+    static int n_logged = 0;
+    if (n_logged < 4) {
+        ++n_logged;
+        LLAMA_LOG_INFO("%s: LSA fast layer %d: n_kv %lld, T %lld, gathered %lld (%.1f%%)\n", __func__, il,
+                (long long) n_kv, (long long) T, (long long) n_sel, 100.0*(double) n_sel/(double) n_kv);
+    }
+    return m;
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -4536,6 +7081,9 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
 
     const bool is_sj_kvarn = inp->self_sj_kvarn_desc != nullptr;
+    ggml_tensor * q_lsa = q_cur; // LSA on SJ-KVaRN: the index map reads q/k before the SJ-KVaRN rotation
+    ggml_tensor * k_lsa = k_cur;
+    ggml_tensor * v_lsa = v_cur; // LLAMA_LSA_COMP=2 on SJ-KVaRN: block means in the un-rotated basis
 
     // SJ-KVaRN: the whole cache lives in the 256-pt Hadamard-rotated basis (ring rows and sealed records alike),
     // so rotate Q/K/V here; the FA output is un-rotated in build_attn_mha. The plain Sylvester Hadamard is an
@@ -4565,6 +7113,15 @@ ggml_tensor * llm_graph_context::build_attn(
         }
         cb(k_cur, "k_sj_kvarn_rot", il);
         cb(v_cur, "v_sj_kvarn_rot", il);
+    }
+
+    // LLAMA_LSA_VK: this ubatch's K/V rows in the cache basis (plain 256-pt rotation) for the rotated block means
+    ggml_tensor * k_lsa_rot = nullptr;
+    ggml_tensor * v_lsa_rot = nullptr;
+    if (is_sj_kvarn && sj_wush == nullptr && mctx_cur->get_sj_kvarn().body_type != GGML_TYPE_TURBO4_0 &&
+            llama_lsa_cfg().vk && llama_lsa_cfg().blk_list) {
+        k_lsa_rot = k_cur;
+        v_lsa_rot = v_cur;
     }
 
     // SJ-KVaRN fused write rotation (#139): the K/V WHT nodes above are dropped, the cache write rotates
@@ -4626,12 +7183,133 @@ ggml_tensor * llm_graph_context::build_attn(
         v = mctx_cur->get_v(ctx0, il);
     }
 
-    const auto & kq_mask = inp->self_attn_mask.raw;
+    ggml_tensor * kq_mask = inp->self_attn_mask.raw;
     const auto & kv_rows = inp->self_attn_mask.rows;
+    // LLAMA_LSA_PACKED=1: the LSA builders start from the f16 dense mask input; a layer LSA leaves dense goes back to
+    // the packed mask below
+    ggml_tensor * const kq_mask_in = kq_mask;
+    if (inp->lsa_kq_mask && inp->lsa_cell_pos) {
+        kq_mask = inp->lsa_kq_mask;
+    }
+    ggml_tensor * const kq_mask_dense = kq_mask;
+
+    int64_t lsa_n_kv_max = 0;
+    std::vector<ggml_tensor *> lsa_masks_h; // LLAMA_LSA_PER_HEAD=1: one mask per KV head
+    // LLAMA_LSA_COMP=2: block means refreshed for every ubatch while LSA runs (prefill included)
+    ggml_tensor * lsa_kmv = nullptr;
+    ggml_tensor * lsa_vmv = nullptr;
+    int64_t       lsa_nbs = 0;
+    bool          lsa_means_ok = false;
+    bool          lsa_means_rot = false; // LLAMA_LSA_VK: means in the rotated cache basis
+    lsa_vk_km = nullptr; lsa_vk_vm = nullptr; lsa_vk_nbs = 0; lsa_vk_done = false;
+    if (inp->lsa_cell_pos && is_sj_kvarn && inp->lsa_q_cell && !cparams.training) {
+        // SJ-KVaRN: masked attention only (dense compute over the sealed records), index keys from the side cache
+        if (ggml_tensor * lsa_idx = build_attn_lsa_idx(inp, k_lsa, k, il)) {
+            if (llama_lsa_cfg().comp_fast && sj_wush == nullptr && !inp->self_k_rot && !inp->self_v_rot) {
+                lsa_means_rot = k_lsa_rot != nullptr;
+                lsa_means_ok = build_attn_lsa_mean_refresh(inp, k, v, lsa_means_rot ? k_lsa_rot : k_lsa,
+                        lsa_means_rot ? v_lsa_rot : v_lsa, kq_mask->ne[0], &lsa_kmv, &lsa_vmv, &lsa_nbs, il, lsa_means_rot);
+                if (lsa_means_ok && lsa_means_rot && q_cur->ne[2] <= llama_lsa_cfg().comp_max_t &&
+                        lsa_kmv->view_src && lsa_kmv->view_src->ne[1] >= 16) {
+                    lsa_vk_km  = lsa_kmv; // the block-list branch of the mask build takes them (LLAMA_LSA_VK)
+                    lsa_vk_vm  = lsa_vmv;
+                    lsa_vk_nbs = lsa_nbs;
+                }
+            }
+            if (ggml_tensor * lsa_mask = build_attn_lsa_mask(inp, q_lsa, &k, &v, kq_mask, il, &lsa_n_kv_max, lsa_idx,
+                        kq_scale, nullptr)) {
+                kq_mask = lsa_mask;
+            }
+        }
+    } else if (inp->lsa_cell_pos && !is_sj_kvarn && !inp->self_k_rot && !cparams.training) {
+        ggml_tensor * lsa_idx = build_attn_lsa_idx(inp, k_cur, k, il);
+        if (llama_lsa_cfg().comp_fast) {
+            lsa_means_ok = build_attn_lsa_mean_refresh(inp, k, v, nullptr, nullptr, k->ne[2], &lsa_kmv, &lsa_vmv, &lsa_nbs, il);
+        }
+        const bool can_split = kq_b == nullptr && sinks == nullptr && v_mla == nullptr && k->ne[3] == 1 &&
+            !(v->nb[1] > v->nb[2]);
+        if (ggml_tensor * lsa_mask = build_attn_lsa_mask(inp, q, &k, &v, kq_mask, il, &lsa_n_kv_max, lsa_idx,
+                    kq_scale, can_split ? &lsa_masks_h : nullptr)) {
+            kq_mask = lsa_mask;
+        }
+    }
+
+    const bool lsa_applied = kq_mask != kq_mask_dense;
+    // LSA rebuilds the mask over its own cell order: upstream kv_rows (opt-in LLAMA_KV_ROWS) never runs with it
+    GGML_ASSERT((!lsa_applied && lsa_masks_h.empty()) || kv_rows == nullptr);
+    if (!lsa_applied && lsa_masks_h.empty()) {
+        kq_mask = kq_mask_in;
+    }
 
     q = build_attn_turbo_q(q, k, mctx_cur);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = nullptr;
+    if (!lsa_masks_h.empty() && (int64_t) lsa_masks_h.size() == k->ne[1] && q->ne[1] % k->ne[1] == 0) {
+        // per-KV-head LSA probe: FA per GQA group with that KV head's mask, outputs concatenated head-major
+        const int64_t g = q->ne[1]/k->ne[1];
+        for (int64_t j = 0; j < k->ne[1]; ++j) {
+            ggml_tensor * qj = ggml_view_3d(ctx0, q, q->ne[0], g, q->ne[2], q->nb[1], q->nb[2], j*g*q->nb[1]);
+            ggml_tensor * kj = ggml_view_4d(ctx0, k, k->ne[0], 1, k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], j*k->nb[1]);
+            ggml_tensor * vj = ggml_view_4d(ctx0, v, v->ne[0], 1, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], j*v->nb[1]);
+            ggml_tensor * c  = build_attn_mha(qj, kj, vj, nullptr, lsa_masks_h[j], nullptr, nullptr, nullptr, lsa_n_kv_max, kq_scale, il);
+            cur = cur ? ggml_concat(ctx0, cur, c, 0) : c;
+        }
+    } else {
+        const auto & lcfg = llama_lsa_cfg();
+        // SJ-KVaRN: fast compensation only (LLAMA_LSA_COMP=2), merged after the FA output is un-rotated, with the
+        // un-rotated q (the rotation is orthonormal, so the scores and the log-sum-exp are the same)
+        // the low-bit / trellis SJ-KVaRN kernels (3/3t, 3/2t, 2/2, sjkvarn4t) never write the LSE output, so the
+        // merge would read an unwritten tensor: those layers run LSA uncompensated
+        const int  sj_body_t = is_sj_kvarn && sj_kvarn_pending.body ? sj_kvarn_pending.body->op_params[7] : -1;
+        const bool sj_no_lse = is_sj_kvarn && sj_kvarn_pending.body && (sj_kvarn_pending.bits_k != 4 ||
+                sj_kvarn_pending.bits_v != 4 || sj_body_t == GGML_TYPE_I16);
+        if (lsa_applied && lcfg.comp && sj_no_lse) {
+            static uint32_t warned_lb = 0;
+            if (llama_lsa_log_once(warned_lb)) {
+                LLAMA_LOG_WARN("%s: layer %d: LSA compensation off (SJ-KVaRN %d/%d %s body has no LSE output)\n", __func__,
+                        il, sj_kvarn_pending.bits_k, sj_kvarn_pending.bits_v, sj_body_t == GGML_TYPE_I16 ? "trellis" : "scalar");
+            }
+        }
+        const bool lsa_comp = lsa_applied && lcfg.comp && lsa_n_kv_max == 0 && kq_b == nullptr &&
+                sinks == nullptr && v_mla == nullptr && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+                (!is_sj_kvarn || (lcfg.comp_fast && lsa_means_ok && !sj_no_lse));
+        const bool vk_pending = lsa_fa_vk && lsa_fa_sel != nullptr; // LLAMA_LSA_VK: compensation inside the FA node
+        lsa_lse_req = lsa_comp && !vk_pending && lcfg.comp_fast && lsa_means_ok && q->ne[2] <= lcfg.comp_max_t;
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, lsa_n_kv_max, kq_scale, il);
+        ggml_tensor * lse = lsa_lse;
+        lsa_lse     = nullptr;
+        lsa_lse_req = false;
+        const bool vk_done = lsa_vk_done;
+        lsa_vk_done = false;
+        lsa_vk_km   = nullptr;
+        lsa_vk_vm   = nullptr;
+        lsa_vk_nbs  = 0;
+        if (vk_pending && !vk_done) {
+            static uint32_t warned_vk = 0;
+            if (llama_lsa_log_once(warned_vk)) {
+                LLAMA_LOG_WARN("%s: layer %d: LSA virtual keys not attached to the FA node, layer uncompensated\n", __func__, il);
+            }
+        }
+        if (lsa_comp && lsa_means_rot && lse && !vk_done) {
+            // rotated means (LLAMA_LSA_VK) on a graph the kernel path does not serve (e.g. 9..16 rows): merge in the
+            // cache basis, rotated q and o_kept in, output rotated back (the rotation is orthonormal and an involution)
+            ggml_tensor * qr = ggml_turbo_wht(ctx0, ggml_is_contiguous(q_lsa) ? q_lsa : ggml_cont(ctx0, q_lsa), 0, 256, nullptr);
+            ggml_tensor * orr = ggml_turbo_wht(ctx0, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), 0, 256, nullptr);
+            ggml_tensor * c = build_attn_lsa_comp_fast(inp, orr, lse, qr, lsa_kmv, lsa_vmv, lsa_nbs, k_lsa->ne[1], kq_mask,
+                    kq_mask_dense, kq_scale, il);
+            if (c) {
+                cur = ggml_turbo_wht(ctx0, c, 0, 256, nullptr);
+            }
+        } else if (lsa_comp && !vk_done) {
+            ggml_tensor * c = !lcfg.comp_fast ? build_attn_lsa_comp(cur, q, k, v, kq_mask, kq_mask_dense, kq_scale, il) :
+                              lse ? build_attn_lsa_comp_fast(inp, cur, lse, is_sj_kvarn ? q_lsa : q, lsa_kmv, lsa_vmv, lsa_nbs,
+                                                             is_sj_kvarn ? k_lsa->ne[1] : k->ne[1], kq_mask, kq_mask_dense,
+                                                             kq_scale, il) : nullptr;
+            if (c) {
+                cur = c;
+            }
+        }
+    }
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 

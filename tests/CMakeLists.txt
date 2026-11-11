@@ -184,6 +184,8 @@ target_include_directories(test-sjkvarn-state PRIVATE ${PROJECT_SOURCE_DIR}/ggml
 llama_build_and_test(test-sjkvarn-split.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-split PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-sjkvarn-fill.cpp LABEL "turbo")
+# LLAMA_LSA_RESIDENT=auto slot sizing (pure function, no model)
+llama_build_and_test(test-lsa-resident-fit.cpp LABEL "turbo")
 # prompt-cache state round trip over every KV / drafter / recurrent-state type (needs an MTP model: -m)
 llama_build(test-prompt-cache-types.cpp)
 
@@ -204,6 +206,9 @@ llama_build(${LLAMA_CONTEXT_TEST_SRC})
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp  LABEL behavior  LINK llama)
+    if (NOT WIN32)
+        llama_build_and_test(test-lsa-state.cpp LABEL "turbo")
+    endif()
     llama_build_and_test(test-sampling.cpp  LABEL behavior)   # fork: uses common/sampling.h, so keep the llama-common default link
     llama_build_and_test(test-sampler-topk-exact.cpp)
     llama_build_and_test(test-spec-beat.cpp)

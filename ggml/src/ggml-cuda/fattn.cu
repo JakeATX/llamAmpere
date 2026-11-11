@@ -1332,7 +1332,7 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
-    if (dst->src[9] != nullptr) {
+    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         return false; // kv_rows (src[9]): the kv-stream streamed FA reads K/V pages in cell order only
     }
     const ggml_tensor * Q = dst->src[0];
@@ -1846,7 +1846,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         ggml_tensor * dst,
         ggml_cuda_kv_stream_transfer_ring * transfer_ring,
         ggml_cuda_kv_stream_resident_cache * resident_cache) {
-    if (dst->src[9] != nullptr) {
+    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         GGML_ABORT("kv-stream streamed flash attention does not support kv_rows (FLASH_ATTN_EXT src[9]); disable LLAMA_KV_ROWS");
     }
     GGML_ASSERT(transfer_ring != nullptr);
@@ -2834,7 +2834,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
         std::max<int64_t>(min_kv_env, 2*(int64_t) n_kv_max) :
         std::max<int64_t>(4096, GGML_CUDA_CC_IS_NVIDIA(cc) ? 2*n_gather : 2LL*n_kv_max);
 
-    return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) && dst->src[9] == nullptr && // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
+    return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) && ggml_flash_attn_ext_get_kv_rows(dst) == nullptr && // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0]*(mask->type == GGML_TYPE_I32 ? 32 : 1) == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= min_kv;
@@ -2891,7 +2891,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // with kv_rows the kernel iterates over the mask columns
     // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
-    const int64_t n_kv = dst->src[9] ? dst->src[9]->ne[0] : K->ne[1];
+    const int64_t n_kv = ggml_flash_attn_ext_get_kv_rows(dst) ? ggml_flash_attn_ext_get_kv_rows(dst)->ne[0] : K->ne[1];
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
@@ -3660,7 +3660,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     }                                                                                                                \
 
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (dst->src[9] != nullptr) {
+    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         GGML_ABORT("flash_attn_ext: the vec kernel does not read kv_rows (src[9]); only the MMA f16 kernel supports it");
     }
     const ggml_tensor * Q = dst->src[0];
@@ -3737,7 +3737,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * kv_rows = dst->src[9]; // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
+    const ggml_tensor * kv_rows = ggml_flash_attn_ext_get_kv_rows(dst); // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
 
     // with kv_rows the kernel iterates over the mask columns
     const int64_t n_kv = kv_rows ? kv_rows->ne[0] : K->ne[1];
@@ -4006,7 +4006,7 @@ static bool ggml_cuda_flash_attn_ext_fused(ggml_backend_cuda_context * ctx, ggml
         return false;
     }
     // kv_rows (src[9]): the fused turbo / in-place q8 MMA readers walk K/V in cell order; never route such a node here
-    if (dst->src[9] != nullptr) {
+    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         return false;
     }
 
@@ -4349,7 +4349,7 @@ static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor 
 static bool ggml_cuda_fattn_mask_is_packed(const ggml_tensor * dst);            // [#175] below
 
 bool ggml_cuda_flash_attn_ext_bounded_prefill_applies(int device, const ggml_tensor * dst) {
-    if (dst->src[9] != nullptr) {
+    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         return false; // kv_rows (src[9]): runs on the generic MMA route only
     }
     if (dst->src[3] != nullptr && dst->src[3]->type == GGML_TYPE_I32) {
@@ -4796,7 +4796,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
     // kv_rows (src[9]; upstream src[5]): only upstream's generic MMA f16 kernel reads K/V through the row lists.
     // The fork routes (SJ-KVaRN, QSA rows, TurboQuant/TQ, fused/i8qk/bounded prefill, vec/tile) would silently ignore them.
-    if (dst->src[9] != nullptr) {
+    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         if (dst->src[6] != nullptr) {
             GGML_ABORT("flash_attn_ext: kv_rows (src[9]) is not supported with SJ-KVaRN (src[6])");
         }
@@ -4840,6 +4840,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_cuda_qsa_clock_prepare(ctx, dst);
         // 4/4 token-axis trellis4 body (I16 under an explicit nonzero GGML_SJKVARN_TRELLIS_TOKENS; the low-bit token-axis default does not apply to 4/4): the low-bit tile loader
         if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_sj_kvarn::trellis3::tokens4())) {
+            ggml_cuda_lsa_page_prepare(ctx, dst); // LLAMA_LSA_RESIDENT record pages only (no-op otherwise)
             ggml_cuda_flash_attn_sj_kvarn_lowbits(ctx,dst);
             return;
         }
@@ -4848,6 +4849,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             return;
         }
         ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2<256, 256>(ctx, dst);
+        return;
+    }
+
+    // fork (LSA compensation, opt-in): an LSE output (src[9]) is written only by the parallel-block combine of the
+    // generic kernels, so skip the fused / i8qk / bounded routes and take tile instead of MMA (MMA launches stream-k)
+    if (ggml_flash_attn_ext_get_lse(dst) != nullptr) {
+        const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+        GGML_ASSERT(k != BEST_FATTN_KERNEL_NONE);
+        if (k == BEST_FATTN_KERNEL_VEC) {
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_tile(ctx, dst);
+        }
         return;
     }
 
@@ -4884,7 +4898,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    if (dst->src[9] != nullptr) {
+    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         // kv_rows (src[9]): generic MMA f16 route only (see ggml_cuda_flash_attn_ext)
         return ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
     }

@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-lsa.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -224,6 +225,13 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
     }
     mem_recr->state_write(io, seq_id, flags);
     state_write_sj_exact(io, seq_id, flags);
+    // LSA index cache on SJ-KVaRN (opt-in LLAMA_LSA_IDX_CACHE=1): optional suffix, absent unless LSA wrote a valid layer
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && mem_attn->is_sj_kvarn() && seq_id >= 0) {
+        const llama_pos pmax = mem_attn->seq_pos_max(seq_id);
+        if (pmax >= 0) {
+            llama_lsa_idx_state_write(io, (int64_t) pmax + 1);
+        }
+    }
 }
 
 void llama_memory_hybrid::state_write_sj_exact(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -251,6 +259,11 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     try {
         mem_recr->state_read(io, seq_id, flags);
         state_read_sj_exact(io, seq_id, flags);
+        if (read_attn && io.n_left() >= 2*sizeof(uint32_t) && mem_attn->is_sj_kvarn()) {
+            llama_lsa_idx_state_read(io); // LSA index cache suffix (see state_write)
+        } else if (read_attn && mem_attn->is_sj_kvarn() && seq_id >= 0 && mem_attn->seq_pos_max(seq_id) >= 0) {
+            llama_lsa_warn_restore_dense("the saved state has no LSA index suffix (saved with LSA off or an older build)", 0, 0);
+        }
     } catch (...) {
         // the attention part is already restored - undo it
         if (read_attn) {
