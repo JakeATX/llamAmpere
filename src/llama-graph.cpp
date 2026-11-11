@@ -4449,7 +4449,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->lsa_q_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
         ggml_set_input(inp->lsa_q_pos);
         ggml_set_name(inp->lsa_q_pos, "attn_inp_lsa_q_pos");
-        if (inp->self_kq_mask && inp->self_kq_mask->type == GGML_TYPE_I32) {
+        if (inp->self_attn_mask.raw && inp->self_attn_mask.raw->type == GGML_TYPE_I32) {
             // LLAMA_LSA_PACKED=1 (llama-context keeps the packed mask only then): f16 dense mask for the LSA layers
             inp->lsa_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, /*allow_packed=*/false);
             ggml_set_name(inp->lsa_kq_mask, "attn_inp_lsa_kq_mask");
@@ -7386,7 +7386,7 @@ ggml_tensor * llm_graph_context::build_attn(
     if (inp->lsa_cell_pos && is_sj_kvarn && inp->lsa_q_cell && !cparams.training) {
         // SJ-KVaRN: masked attention only (dense compute over the sealed records), index keys from the side cache
         if (ggml_tensor * lsa_idx = build_attn_lsa_idx(inp, k_lsa, k, il)) {
-            if (llama_lsa_cfg().comp_fast && sj_wush == nullptr && !inp->self_k_rot && !inp->self_v_rot) {
+            if (llama_lsa_cfg().comp_fast && sj_wush == nullptr && !inp->self_k_rot[il] && !inp->self_v_rot[il]) {
                 lsa_means_rot = k_lsa_rot != nullptr;
                 lsa_means_ok = build_attn_lsa_mean_refresh(inp, k, v, lsa_means_rot ? k_lsa_rot : k_lsa,
                         lsa_means_rot ? v_lsa_rot : v_lsa, kq_mask->ne[0], &lsa_kmv, &lsa_vmv, &lsa_nbs, il, lsa_means_rot);
@@ -7402,7 +7402,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 kq_mask = lsa_mask;
             }
         }
-    } else if (inp->lsa_cell_pos && !is_sj_kvarn && !inp->self_k_rot && !cparams.training) {
+    } else if (inp->lsa_cell_pos && !is_sj_kvarn && !inp->self_k_rot[il] && !cparams.training) {
         ggml_tensor * lsa_idx = build_attn_lsa_idx(inp, k_cur, k, il);
         if (llama_lsa_cfg().comp_fast) {
             lsa_means_ok = build_attn_lsa_mean_refresh(inp, k, v, nullptr, nullptr, k->ne[2], &lsa_kmv, &lsa_vmv, &lsa_nbs, il);
