@@ -332,11 +332,9 @@ std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type bo
                t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
                t == GGML_TYPE_IQ4_NL;
     };
-    const auto gather_ok = [](ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0; };
-    if (c.gather && (sj || !gather_ok(type_k) || !gather_ok(type_v) || c.comp || c.fa_sparse || c.per_head || c.fast ||
-            c.block_sum || c.rec_blk || c.refine > 0)) {
-        return "LLAMA_LSA_GATHER=1 is for plain f16/q8_0 K and V with the per-cell pick only (not with LLAMA_LSA_COMP, "
-               "FA_SPARSE, PER_HEAD, FAST, BLOCK_SUM, REC_BLK or REFINE: those picks never reach the gather)";
+    if (c.gather) {
+        // the gather path is not part of this build: plain f16 / q8_0 run the masked LSA node
+        return "LLAMA_LSA_GATHER=1 is not available in this build (plain f16/q8_0 LSA runs the masked path; unset it)";
     }
     if (sj && c.fa_sparse) {
         return "LLAMA_LSA_FA_SPARSE is for plain K/V (an SJ-KVaRN node ignores the sparse bound)";
