@@ -828,6 +828,17 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                    t == GGML_TYPE_TQ5_0    || t == GGML_TYPE_TQ6_0;
         };
 
+        // LSA and kv_rows share FLASH_ATTN_EXT src[9]: LLAMA_KV_ROWS=1 is ignored while LSA is on. Warn once per
+        // process, before the chain below (an SJ-KVaRN / kv-stream / TQ line there would otherwise hide the LSA reason)
+        const bool kv_rows_lsa = llama_lsa_cfg().mode != llama_lsa_config::OFF;
+        if (kv_rows_opt_in && kv_rows_lsa && !LLAMA_KV_ROWS_DISABLE) {
+            static std::atomic<bool> kv_rows_lsa_warned{false};
+            if (!kv_rows_lsa_warned.exchange(true)) {
+                LLAMA_LOG_WARN("%s: LLAMA_KV_ROWS=1 ignored: kv_rows cannot be combined with LSA (LLAMA_LSA); "
+                        "this warning is printed once\n", __func__);
+            }
+        }
+
         if (LLAMA_KV_ROWS_DISABLE) {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
@@ -846,9 +857,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         } else if (model.arch == LLM_ARCH_QWEN4EXP) {
             LLAMA_LOG_WARN("%s: LLAMA_KV_ROWS=1 ignored: kv_rows cannot be combined with QSA selected rows\n", __func__);
             cparams.auto_fkvr = false;
-        } else if (llama_lsa_cfg().mode != llama_lsa_config::OFF) {
-            LLAMA_LOG_WARN("%s: LLAMA_KV_ROWS=1 ignored: kv_rows cannot be combined with LSA (LLAMA_LSA)\n", __func__);
-            cparams.auto_fkvr = false;
+        } else if (kv_rows_lsa) {
+            cparams.auto_fkvr = false; // warned once above
         } else {
             cparams.auto_fkvr = cparams.kv_unified;
         }
