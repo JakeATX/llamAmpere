@@ -14722,7 +14722,7 @@ struct test_flash_attn_ext_sj_fill : public test_flash_attn_ext_sj_kvarn {
 
 static void add_sj_fill_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     for (int64_t n_kv : {4096, 32768, 102400}) {
-        for (int64_t n_q : {1, 2, 4, 8, 9}) {
+        for (int64_t n_q : {1, 2, 4, 8, 9, 12, 16}) {
             for (int n_seqs : {1, 4}) {
                 cases.emplace_back(new test_flash_attn_ext_sj_fill(n_q, n_kv, n_seqs));
             }
@@ -14730,7 +14730,7 @@ static void add_sj_fill_cases(std::vector<std::unique_ptr<test_case>> & cases, b
     }
     if (!perf) {
         // Partial body visibility, paged records, and the specialized five-row stream kernel.
-        for (int64_t n_q : {3, 5, 6, 7}) {
+        for (int64_t n_q : {3, 5, 6, 7, 12, 16}) {
             cases.emplace_back(new test_flash_attn_ext_sj_fill(n_q, 32768, 1, true));
             cases.emplace_back(new test_flash_attn_ext_sj_fill(n_q, 32768, 4, true));
         }
@@ -20769,6 +20769,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 24, 4, 24,  700)); // GQA 6, 24 records
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(4, 24, 4, 24, 1100)); // GQA 6, 24 records, 4 rows
+    // verify widths 9..16 above the decode kernel (GGML_SJKVARN_ROWSPLIT=1 runs them as 8-row chunks of it)
+    for (int64_t n_q : {9, 12, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 24, 1100));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 300, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 16, 2));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 16, 4,  2,  200)); // GQA 4
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(2,  4, 4,  2,  200)); // GQA 1
     // prefill ubatches: query rows tiled in ncols1 blocks (stream-k fixup across jt), all GQA classes
@@ -20969,6 +20976,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, std::max<int64_t>(n_q, 301), true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 3, 3));
             sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, std::max<int64_t>(n_q, 300), false, false, GGML_TYPE_F16, 128, false, GGML_TYPE_F32, 4, 4));
             sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, std::max<int64_t>(n_q, 1024), false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0, 4, 4));
+        }
+        // verify widths 9..16: packed scalar and turbo4 masks (GGML_SJKVARN_ROWSPLIT=1 expands them for the decode kernel)
+        for (int64_t n_q : {9, 16}) {
+            sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 300, false, false, GGML_TYPE_F16, 128, false, GGML_TYPE_F32, 4, 4));
+            sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 1024, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0, 4, 4));
         }
         for (int ns : {1, 2, 3}) {
             for (int64_t n_q : {5, 129, 512}) {
