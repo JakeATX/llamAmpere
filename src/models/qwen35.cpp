@@ -222,8 +222,7 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
         sq = ggml_view_3d(ctx0, sq, n_embd_head, n_head, n_tokens,
                 ggml_element_size(sq)*n_embd_head*2, ggml_element_size(sq)*n_embd_head*2*n_head, 0);
         sq = build_norm(sq, layer.attn_q_norm, nullptr, LLM_NORM_RMS, target);
-        return ggml_rope_multi(ctx0, sq, inp_pos, nullptr, n_rot, sections, rope_type, n_ctx_orig,
-                freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        return build_rope(sq, inp_pos, target); // the same rope the target layer applies to its own Q
     };
 
     // LLAMA_LSA_J3 (opt-in): at mapped LSA layer i, prefetch into the slots of mapped layer i+1 (top-up) and i+3
