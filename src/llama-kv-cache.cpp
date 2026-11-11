@@ -2656,7 +2656,8 @@ ggml_type llama_kv_cache::type_k() const {
 }
 
 ggml_type llama_kv_cache::type_v() const {
-    return layers.empty() ? GGML_TYPE_COUNT : layers[0].v->type;
+    // a K-only cache (the DSA/qwen4exp indexer KV) has no V tensors: report GGML_TYPE_COUNT like an empty cache
+    return layers.empty() || layers[0].v == nullptr ? GGML_TYPE_COUNT : layers[0].v->type;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
