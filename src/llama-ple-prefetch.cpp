@@ -42,8 +42,12 @@ static int64_t ple_pf_env(const char * name, int64_t def) {
 
 // usable RAM in MiB (the shared cgroup-aware reader), -1 when unknown
 static int64_t ple_pf_mem_avail_mib() {
+#if defined(__linux__)
     const size_t avail = llama_moe_arena::available_memory();
     return avail > 0 ? (int64_t) (avail >> 20) : -1;
+#else
+    return -1; // as before: this gate had a Linux reader only
+#endif
 }
 
 void llama_ple_hash_rows(const llama_hparams & hp, llama_token token, const llama_token * prev, int32_t * rows) {

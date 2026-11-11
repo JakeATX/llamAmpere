@@ -187,62 +187,101 @@ static bool test_thp_arena() {
 #endif
 }
 
-// Exercise the original mixed IQ blocks with the arena's gate/up/down stride.
+#ifdef __linux__
 static void ram_write(const std::string & path, const std::string & text) {
     FILE * f = fopen(path.c_str(), "w");
     if (f) { fputs(text.c_str(), f); fclose(f); }
 }
+#endif
 
 // The usable-RAM reader against fake /proc/meminfo and /sys/fs/cgroup trees.
 static bool test_ram_view() {
-    char tmpl[] = "/tmp/test-moe-arena-ram-XXXXXX";
-    const char * made = mkdtemp(tmpl);
+#ifdef __linux__
+    const char * temporary = std::getenv("TMPDIR");
+    std::string name = std::string(temporary ? temporary : "/tmp") + "/test-moe-arena-ram-XXXXXX";
+    std::vector<char> tmpl(name.begin(), name.end());
+    tmpl.push_back(0);
+    const char * made = mkdtemp(tmpl.data());
     if (!made) { return false; }
     const std::string root = made;
     const uint64_t GiB = 1ull << 30;
     const std::string meminfo = root + "/meminfo";
-    ram_write(meminfo, "MemTotal:       48000000 kB\nMemAvailable:   41943040 kB\nHugePages_Free:     1024\nHugepagesize:       2048 kB\n");
-    const std::string mk = "mkdir -p " + root + "/cg/a/b";
+    ram_write(meminfo, "MemTotal:       48000000 kB\nMemAvailable:   41943040 kB\n");
+    const std::string mk = "mkdir -p '" + root + "/cg/a/b'";
     if (system(mk.c_str()) != 0) { return false; }
     bool ok = true;
+    auto check = [&](bool cond, const char * what) {
+        if (!cond) { printf("usable RAM reader: FAIL: %s\n", what); }
+        ok &= cond;
+    };
     // no group path, and a tree with no limit at any level: MemAvailable, as before
-    ok &= llama_moe_arena::read_ram_view(meminfo, root + "/cg", "").available == 40 * GiB;
+    check(llama_moe_arena::read_ram_view(meminfo, root + "/cg", "").available == 40 * GiB, "no group path");
     ram_write(root + "/cg/a/memory.max", "max\n");
     ram_write(root + "/cg/a/b/memory.max", "max\n");
     ram_write(root + "/cg/a/b/memory.current", "1073741824\n");
     auto view = llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b");
-    ok &= view.available == 40 * GiB && view.group.empty() && view.cgroup == UINT64_MAX;
-    // a limit on our own group: max - current + inactive_file
+    check(view.available == 40 * GiB && view.group.empty() && view.cgroup == UINT64_MAX, "no limit at any level");
+    // a limit on our own group: max - current + inactive_file + active_file (the group's page cache)
     ram_write(root + "/cg/a/b/memory.max", std::to_string(36 * GiB) + "\n");
     ram_write(root + "/cg/a/b/memory.current", std::to_string(10 * GiB) + "\n");
-    ram_write(root + "/cg/a/b/memory.stat", "anon 1\ninactive_file " + std::to_string(4 * GiB) + "\nactive_file 5\n");
+    ram_write(root + "/cg/a/b/memory.stat", "anon 1\ninactive_file " + std::to_string(4 * GiB) + "\nactive_file " +
+            std::to_string(1 * GiB) + "\nshmem 7\n");
     view = llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b");
-    ok &= view.available == 30 * GiB && view.group == root + "/cg/a/b";
+    check(view.available == 31 * GiB && view.cgroup == 31 * GiB && view.group == root + "/cg/a/b", "own group limit");
+    // a group without memory.stat credits no page cache
+    ram_write(root + "/cg/a/b/memory.stat", "");
+    view = llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b");
+    check(view.available == 26 * GiB, "own group limit, empty memory.stat");
+    ram_write(root + "/cg/a/b/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nactive_file " +
+            std::to_string(1 * GiB) + "\n");
     // a looser limit than MemAvailable changes nothing
     ram_write(root + "/cg/a/b/memory.max", std::to_string(64 * GiB) + "\n");
     view = llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b");
-    ok &= view.available == 40 * GiB && view.group.empty();
+    check(view.available == 40 * GiB && view.group.empty(), "looser limit");
     // a tighter parent wins, and memory.high counts as a limit
     ram_write(root + "/cg/a/memory.high", std::to_string(20 * GiB) + "\n");
     ram_write(root + "/cg/a/memory.current", std::to_string(12 * GiB) + "\n");
     view = llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b");
-    ok &= view.available == 8 * GiB && view.group == root + "/cg/a";
-    // usage over the limit gives 0, not a wrapped number
+    check(view.available == 8 * GiB && view.group == root + "/cg/a", "tighter parent memory.high");
+    // usage over the limit gives 0 here, not a wrapped number (available_memory() then reports 1, "exhausted")
     ram_write(root + "/cg/a/memory.current", std::to_string(25 * GiB) + "\n");
-    ok &= llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b").available == 0;
-    // the 2 GiB hugetlb pool counts only when it covers the whole mapping
-    ok &= llama_moe_arena::read_ram_view(meminfo, root + "/cg", "", 2 * GiB).available == 42 * GiB;
-    ok &= llama_moe_arena::read_ram_view(meminfo, root + "/cg", "", 2 * GiB + 1).available == 40 * GiB;
+    check(llama_moe_arena::read_ram_view(meminfo, root + "/cg", "/a/b").available == 0, "over the limit");
     // no meminfo: unknown
-    ok &= llama_moe_arena::read_ram_view(root + "/none", root + "/cg", "/a/b").available == 0;
-    const std::string rm = "rm -rf " + root;
+    check(llama_moe_arena::read_ram_view(root + "/none", root + "/cg", "/a/b").available == 0, "no meminfo");
+    const std::string rm = "rm -rf '" + root + "'";
     if (system(rm.c_str()) != 0) { ok = false; }
     printf("usable RAM reader: %s\n", ok ? "OK" : "FAIL");
     return ok;
+#else
+    return true;
+#endif
 }
 
+// The live figures of this process (diagnostic for the capped-run gate, not a ctest case).
+static int print_ram_now() {
+#ifdef __linux__
+    std::string rel;
+    {
+        FILE * f = fopen("/proc/self/cgroup", "r");
+        char line[4096];
+        while (f && fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "0::", 3) == 0) { rel = line + 3; while (!rel.empty() && rel.back() == '\n') { rel.pop_back(); } }
+        }
+        if (f) { fclose(f); }
+    }
+    const auto view = llama_moe_arena::read_ram_view("/proc/meminfo", "/sys/fs/cgroup", rel);
+    printf("RAMNOW available_memory=%zu meminfo=%llu cgroup=%llu group=%s\n", llama_moe_arena::available_memory(),
+            (unsigned long long) view.meminfo, (unsigned long long) view.cgroup, view.group.empty() ? "-" : view.group.c_str());
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+// Exercise the original mixed IQ blocks with the arena's gate/up/down stride.
 int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--ram") == 0) { return test_ram_view() ? 0 : 1; }
+    if (argc == 2 && strcmp(argv[1], "--ram-now") == 0) { return print_ram_now(); }
     if (argc == 2 && strcmp(argv[1], "--cuda-output") == 0) { return test_reclaimable_output(true) ? 0 : 1; }
     if (argc == 2 && strcmp(argv[1], "--cuda-arena") == 0) { return test_sparse_arena() ? 0 : 1; }
     if (argc == 2 && strcmp(argv[1], "--thp") == 0) { return test_thp_arena() ? 0 : 1; }

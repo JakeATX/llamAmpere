@@ -89,8 +89,12 @@ static int64_t b1_ram_available() {
     if (fake >= 0) {
         return fake << 20;
     }
+#ifdef __linux__
     const size_t avail = llama_moe_arena::available_memory();
     return avail > 0 ? (int64_t) std::min<size_t>(avail, INT64_MAX) : -1;
+#else
+    return -1; // as before: this gate had a Linux reader only
+#endif
 }
 
 // true when the address lies in a file mapping (mmap'd model pages live in the page cache); true when unknown
