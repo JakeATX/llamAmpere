@@ -82,25 +82,15 @@ static bool b1_read_file(int fd, void * dst, size_t offs, size_t len, size_t ali
 #endif
 }
 
-// RAM the page cache can still use, in bytes (MemAvailable; LLAMA_B1_RAM_AVAIL_MIB overrides it). -1 if unknown.
+// RAM the page cache can still use, in bytes (the shared cgroup-aware reader; LLAMA_B1_RAM_AVAIL_MIB overrides
+// it). -1 if unknown.
 static int64_t b1_ram_available() {
     const int64_t fake = b1_env_int("LLAMA_B1_RAM_AVAIL_MIB", -1);
     if (fake >= 0) {
         return fake << 20;
     }
-    int64_t avail = -1;
-    if (FILE * f = fopen("/proc/meminfo", "r")) {
-        char line[256];
-        long long kb = 0;
-        while (fgets(line, sizeof(line), f)) {
-            if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) {
-                avail = (int64_t) kb << 10;
-                break;
-            }
-        }
-        fclose(f);
-    }
-    return avail;
+    const size_t avail = llama_moe_arena::available_memory();
+    return avail > 0 ? (int64_t) std::min<size_t>(avail, INT64_MAX) : -1;
 }
 
 // true when the address lies in a file mapping (mmap'd model pages live in the page cache); true when unknown
