@@ -141,6 +141,15 @@ static void test_trigger(void) {
     assert(cs.wide());
     cs.on_draft(7, 8);
     assert(cs.on_accept(4) == 4 && !cs.wide() && cs.n_miss_blk == 1);
+
+    // a wide round whose lookup proposed no tail: a block miss still leaves wide at once (not counted as a tail miss)
+    for (int i = 0; i < 2; ++i) {
+        cs.on_draft(7, 0);
+        cs.on_accept(7);
+    }
+    assert(cs.wide());
+    cs.on_draft(7, 0);
+    assert(cs.on_accept(5) == 5 && !cs.wide() && cs.n_miss_blk == 1);
 }
 
 int main(void) {

@@ -14,7 +14,7 @@
 //   - block:   a block that departs from the copy anywhere drops the tail (the tail could not be reached, or the
 //              copy has ended);
 //   - trigger: the tail is scheduled only after full-accept rounds, counted by the adaptive depth controller
-//              (narrow = depth 1, wide = depth 2); a miss inside the block of a wide round leaves wide at once.
+//              (narrow = depth 1, wide = depth 2); any miss inside the block leaves wide at once.
 // A match may overlap its own suffix, which makes a periodic repeat continue.
 //
 // Rollback on a recurrent/hybrid target: a draft longer than n_rs_seq is verified under a checkpoint, and a
@@ -151,10 +151,15 @@ struct common_speculative_copy_state {
     uint64_t n_acc      = 0; // tail tokens accepted
     uint64_t n_miss_blk = 0; // wide rounds that missed inside the block
 
+    // per request (common_speculative_begin): the statistics line printed at the end of a request covers that request
     void reset() {
         ctrl.reset(2, 1);
-        n_block = 0;
-        n_tail  = 0;
+        n_block    = 0;
+        n_tail     = 0;
+        n_rounds   = 0;
+        n_gen      = 0;
+        n_acc      = 0;
+        n_miss_blk = 0;
     }
 
     bool wide() const {
@@ -172,15 +177,19 @@ struct common_speculative_copy_state {
 
     // feed one verified round; returns the accepted count that belongs to the model drafter's block
     int32_t on_accept(int32_t n_accepted) {
-        const int32_t acc_block = std::min(n_accepted, n_block);
         if (n_block <= 0) {
             return n_accepted;
         }
+        const int32_t acc_block = std::min(n_accepted, n_block);
         if (n_tail > 0) {
             n_acc += std::max(0, std::min(n_accepted - n_block, n_tail));
         }
-        if (n_tail > 0 && acc_block < n_block) {
-            n_miss_blk++;
+        if (acc_block < n_block) {
+            // a miss inside the block ends the full-accept streak at once, with or without a tail this round
+            // (without this a wide round whose lookup found nothing would only add drop pressure on a block miss)
+            if (n_tail > 0) {
+                n_miss_blk++;
+            }
             ctrl.reset(2, 1);
         } else {
             ctrl.update(n_block + n_tail, std::min(n_accepted, n_block + n_tail), 2, 1);
