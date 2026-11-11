@@ -4417,8 +4417,21 @@ private:
     // LLAMA_CKPT_DFT_KV=1 keeps the drafter KV in every checkpoint (the earlier behaviour, for A/B).
     bool ckpt_needs_dft() const {
         static const bool force = [] { const char * s = getenv("LLAMA_CKPT_DFT_KV"); return s && s[0] == '1'; }();
-        return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
-                params_base.speculative.draft.attn_window > 0);
+        return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART || dft_windowed());
+    }
+
+    // the MTP drafter KV is a ring (--spec-draft-window)
+    bool dft_windowed() const {
+        return ctx_dft != nullptr && params_base.speculative.draft.attn_window > 0;
+    }
+
+    // flags of the drafter part of a context checkpoint: a ring keeps its cell layout ([EVALFLAG] KEEP_LAYOUT: masked
+    // cells and each cell's index come back, so the drafter attends over the same cells in the same order as cold)
+    llama_state_seq_flags ckpt_dft_flags(llama_state_seq_flags flags) const {
+        if (ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            return flags;
+        }
+        return dft_windowed() ? (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     }
 
     // In-call checkpoints: on with B1 (LLAMA_B1=1, layer-major prefill), unless LLAMA_B1_CKPT=0. A prompt checkpoint
@@ -4522,7 +4535,7 @@ private:
         if (ckpt_needs_dft()) {
             // [#240] the exact section rides on a hybrid drafter's recurrent state; a plain-KV drafter checkpoint
             // (LLAMA_CKPT_DFT_KV=1) keeps the whole cache as before
-            cur.update_dft(ctx_dft, slot.id, ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART ? flags : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, ckpt_dft_flags(flags));
         }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -4867,7 +4880,7 @@ private:
                     }
 
                     // the drafter's memory goes to its own sidecar: context checkpoints no longer carry a
-                    // plain-KV drafter (ckpt_needs_dft), and the state file holds the target only
+                    // plain-KV drafter unless it is a ring (ckpt_needs_dft), and the state file holds the target only
                     if (ctx_dft) {
                         if (llama_state_seq_save_file(ctx_dft, (filepath + ".dft").c_str(), slot->id, nullptr, 0) == 0) {
                             send_error(task, "Unable to save drafter sidecar", ERROR_TYPE_SERVER);
@@ -6111,6 +6124,10 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
+                                            // made before the drafter part was kept (older sidecar / cache entry): try an earlier one
+                                            if (ckpt_needs_dft() && cur.data_dft.empty()) {
+                                                return false;
+                                            }
                                             // SJ-KVaRN: seq_rm can only cut the sealed body at a group boundary
                                             if (!sj_kvarn_ckpt_reachable(slot.id, cur)) {
                                                 return false;
@@ -6128,7 +6145,8 @@ private:
                                                     it->data_tgt.empty() ||
                                                     (ckpt_needs_dft() && it->data_dft.empty()) ||
                                                     llama_state_seq_set_data_ext(ctx_tgt, it->data_tgt.data(), it->data_tgt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != it->data_tgt.size() ||
-                                                    (ctx_dft && !it->data_dft.empty() && llama_state_seq_set_data_ext(ctx_dft, it->data_dft.data(), it->data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != it->data_dft.size()) ||
+                                                    (ctx_dft && !it->data_dft.empty() && llama_state_seq_set_data_ext(ctx_dft, it->data_dft.data(), it->data_dft.size(), slot.id,
+                                                            ckpt_needs_dft() ? ckpt_dft_flags(LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != it->data_dft.size()) ||
                                                     !common_speculative_restore_state(spec.get(), slot.id, it->data_spec)) {
                                                 throw std::runtime_error("Invalid context checkpoint");
                                             }
@@ -6435,7 +6453,7 @@ private:
                     int32_t ckpt_min_tail = -1;
                     if (do_checkpoint && sj_align && ckpt_in_call_enabled() && n_tokens_prev == 0 && !has_mtmd && !input_tokens.has_mtmd &&
                             alora_scale <= 0.0f && slot.task->decision.order.empty() && n_decision_first < 0 &&
-                            !wait_shared && (!ckpt_needs_dft() || ckpt_mtp_ranges)) {
+                            !wait_shared && (!ckpt_needs_dft() || (ckpt_mtp_ranges && !dft_windowed()))) {
                         std::vector<uint8_t> spec_state;
                         if (ckpt_mtp_ranges || (!common_speculative_get_state(spec.get(), slot.id, spec_state) && spec_state.empty())) {
                             ckpt_min_tail = llama_state_seq_capture_min_tail(ctx_tgt);
