@@ -45,11 +45,6 @@ static __device__ __forceinline__ void quantize_q8_1_elem(
     y[ib].ds = make_half2(d, d * sum);
 }
 
-typedef void (*quantize_cuda_t)(
-        const float * x, const int32_t * ids, void * vy,
-        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
-        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
-
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,

@@ -130,6 +130,9 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
+    ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -165,6 +168,19 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_dev(bool value);
+
+    // whether decode accepts entries whose embd is a row of ctx_other's layer input device buffer
+    bool supports_embd_row() const;
+
+    // h_nextn device buffer, see llama_set_embeddings_nextn_dev()
+    bool set_embeddings_nextn_dev(bool value);
+    bool get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out);
+    bool set_h_nextn_rows(int64_t row0, int64_t n_rows, const float * data);
+
+    // state rows read from the h_nextn device buffer of src, see llama_set_embd_state_src()
+    bool set_state_src(llama_context * src);
+    bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_chain(bool value);
     void set_mtp_chain_sampling(int32_t top_k, float temp, float top_p, float min_p, const float * u, int32_t n_u); // [#69]
@@ -327,6 +343,14 @@ private:
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    // (re)allocate the device buffer for cparams.embeddings_layer_inp_dev
+    void layer_inp_dev_alloc();
+
+    // (re)allocate the device buffer for cparams.embeddings_nextn_dev, false if it does not fit
+    bool h_nextn_dev_alloc();
+
+    ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
+
     //
     // graph
     //
@@ -367,9 +391,29 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // parameters defining the backend scheduler instance
+    struct sched_params {
+        size_t max_nodes  = 0;
+        bool   parallel   = false;
+        bool   op_offload = false;
+
+        // a scheduler can serve any graph of up to max_nodes nodes
+        bool can_reuse(const sched_params & other) const {
+            return parallel   == other.parallel
+                && op_offload == other.op_offload
+                && max_nodes  <= other.max_nodes;
+        }
+    };
+
+    // create a new backend scheduler with the given parameters, unless the current one can be reused
+    void sched_new(const sched_params & params);
+
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
     static bool sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data);
+
+    // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
+    static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -591,6 +635,7 @@ private:
     std::vector<ggml_backend_buffer_ptr> mtp_input_uploads;
     size_t mtp_input_upload_next = 0;
     ggml_backend_event_ptr mtp_input_upload_done;
+    sched_params sched_params_cur;
 
     bool sched_need_reserve = true;
     // fork: limit only the reserved graph, not the caller's physical batch size.
@@ -603,6 +648,10 @@ private:
     bool sched_pipeline_parallel = false;
     bool sched_op_offload = false;
     bool prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch);
+
+    // whether the reserve graph has a logits tensor, set in sched_reserve()
+    // true until then, because the first output_reserve() runs before any graph is reserved
+    bool graph_has_logits = true;
 
     // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
@@ -618,6 +667,11 @@ private:
     };
 
     copy_experts_info copy_experts;
+
+    // graph reallocations during inference where the backend assignments did not change, split by whether the
+    // graph size is the same as the previously scheduled one (unexpected) or different
+    int32_t n_reallocs_same = 0;
+    int32_t n_reallocs_diff = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -789,6 +843,32 @@ private:
     // buffers only ever grow (each growth is a cudaFreeHost/cudaMallocHost pair)
     uint32_t n_outputs_reserved = 0;
     bool output_buffer_reuse = true;
+    // device buffer with enabled layer inputs, [n_layer_inp*n_embd, n_batch], row = batch index
+    ggml_context_ptr        ctx_layer_inp_dev;
+    ggml_backend_buffer_ptr buf_layer_inp_dev;
+    ggml_tensor *           layer_inp_dev = nullptr;
+    ggml_backend_dev_t      layer_inp_dev_dev = nullptr;
+    ggml_backend_t          layer_inp_backend = nullptr;
+
+    // ordering with the reader context (no host sync):
+    //   written - recorded by this context after the batch, waited on by the reader
+    //   read    - recorded by the reader after it consumed the rows, waited on by this context
+    ggml_backend_event_ptr ev_layer_inp_written;
+    ggml_backend_event_ptr ev_layer_inp_read;
+    bool ev_layer_inp_read_recorded = false;
+
+    // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
+    // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s
+    // ordered with the reader context like the layer input buffer
+    ggml_context_ptr        ctx_h_nextn_dev;
+    ggml_backend_buffer_ptr buf_h_nextn_dev;
+    ggml_tensor *           h_nextn_dev = nullptr;
+    ggml_backend_dev_t      h_nextn_dev_dev = nullptr;
+    ggml_backend_t          h_nextn_backend = nullptr;
+    ggml_backend_event_ptr  ev_h_nextn_written;
+    ggml_backend_event_ptr  ev_h_nextn_read;
+    bool ev_h_nextn_written_recorded = false;
+    bool ev_h_nextn_read_recorded    = false;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
@@ -812,6 +892,8 @@ private:
     // compute, and the CPU MUL_MAT_ID mask is rebuilt from that. The policy is not part
     // of the ggml graph or the CUDA graph key, so a reused graph cannot carry an old tag.
     void sync_moe_keep();
+    // true after the prism.hadamard coverage check passes on a reserved graph
+    bool hadamard_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

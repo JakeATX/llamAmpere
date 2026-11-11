@@ -488,6 +488,8 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
+    // fork: the correction sum of the unquantized values (upstream #31247 sums the quantized values; not taken, it
+    // changes MMQ results and the release gate is bit-identical to v0.6.3)
     float sum;
     if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
         sum = xi.x + xi.y + xi.z + xi.w;
@@ -604,7 +606,6 @@ void quantize_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -634,7 +635,6 @@ void quantize_scatter_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 

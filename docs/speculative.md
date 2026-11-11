@@ -219,8 +219,9 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
-`--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
-acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
+`--spec-draft-p-min P` truncates each drafted block at the first position whose predicted
+acceptance (from the draft's confidence head) falls below `P` (default 0 = disabled).
+Values above 0 require a draft with a confidence head.
 
 Currently only drafts with a Qwen3 backbone are supported; support for other backbones
 (e.g. Gemma4) is planned.
@@ -376,6 +377,9 @@ Use exactly one of these options:
 --spec-draft-n-min-adaptive             N
                                         minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: 3)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE)
+--spec-draft-n-ubatch                   N
+                                        physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)

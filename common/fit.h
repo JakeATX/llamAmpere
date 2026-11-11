@@ -126,7 +126,7 @@ bool common_fit_verify_compact_safe(bool complete, const std::vector<int64_t> & 
 //     does on a single device (LLAMA_SHARED_COMPUTE); it then adds its KV cache and only the growth of the shared
 //     compute buffer beyond the main context's own need
 struct common_fit_extra_model {
-    const char * path_model;
+    std::vector<std::string> paths_model;
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
@@ -157,7 +157,7 @@ common_fit_extra_memory common_fit_extra_memory_at(
 //   - only parameters that have the same value as in llama_default_model_params are modified
 //     with the exception of the context size which is modified if and only if equal to 0
 common_params_fit_status common_fit_params(
-                         const char * path_model,
+     const std::vector<std::string> & paths_model,
                  llama_model_params * mparams,
                llama_context_params * cparams,
                               float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
@@ -171,11 +171,52 @@ common_params_fit_status common_fit_params(
 
 // print estimated memory to stdout
 void common_fit_print(
-                         const char * path_model,
+     const std::vector<std::string> & paths_model,
                  llama_model_params * mparams,
                llama_context_params * cparams);
 
 void common_memory_breakdown_print(const llama_context * ctx);
+
+// one row of the memory breakdown: a device, the host or another buffer type
+struct common_memory_breakdown_row {
+    enum kind_t { DEVICE, HOST, BUFFER_TYPE };
+
+    kind_t      kind = DEVICE;
+    std::string name;        // device or buffer type name, "Host" for the host row
+    std::string description; // device description, empty otherwise
+    int64_t     total = 0;   // device memory in bytes, 0 unless kind == DEVICE
+    int64_t     free  = 0;   // free device memory in bytes, 0 unless kind == DEVICE
+    size_t      model   = 0; // bytes held by this context, by kind of buffer
+    size_t      context = 0;
+    size_t      compute = 0;
+};
+
+// memory a model needs at the min and max context --fit may pick
+struct common_memory_reports {
+    uint32_t n_ctx_train = 0;
+    uint32_t n_ctx_max   = 0; // the largest context that fits the free device memory right now
+    uint32_t n_ctx_min   = 0; // --fit-ctx (the smallest context --fit may pick), with the placement set in params
+    std::vector<common_memory_breakdown_row> info_max; // breakdown at n_ctx_max
+    std::vector<common_memory_breakdown_row> info_min; // breakdown at n_ctx_min
+};
+
+// rows of common_memory_breakdown_print: model devices first, then host
+std::vector<common_memory_breakdown_row> common_memory_breakdown_rows(const llama_context * ctx);
+
+// load model + context with no_alloc and return the memory breakdown, params are used as-is
+// n_ctx_train and n_ctx are optional outputs; throws on failure
+std::vector<common_memory_breakdown_row> common_fit_measure(
+     const std::vector<std::string> & paths_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+                           uint32_t * n_ctx_train,
+                           uint32_t * n_ctx,
+                     ggml_log_level   log_level);
+
+struct common_params;
+
+// measure min and max without allocating, params may be modified as with --fit; throws on failure
+common_memory_reports common_measure_memory(common_params & params);
 
 struct common_device_memory_data {
     int64_t total;
@@ -189,25 +230,27 @@ using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
-                         const char * path_model,
+     const std::vector<std::string> & paths_model,
            const llama_model_params * mparams,
          const llama_context_params * cparams,
     std::vector<ggml_backend_dev_t> & devs,
                            uint32_t & hp_ngl,
+                           uint32_t & hp_ngl_skip,
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
 
 // Load a parent model + context with no_alloc, then return the per-device memory breakdown of a child model + context.
 common_device_memory_data_vec common_get_device_memory_data_with_parent(
-                         const char * path_model,
+     const std::vector<std::string> & paths_model,
            const llama_model_params * mparams,
          const llama_context_params * cparams,
-                         const char * path_parent,
+     const std::vector<std::string> & paths_parent,
            const llama_model_params * mparams_parent,
          const llama_context_params * cparams_parent,
     std::vector<ggml_backend_dev_t> & devs,
                            uint32_t & hp_ngl,
+                           uint32_t & hp_ngl_skip,
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);

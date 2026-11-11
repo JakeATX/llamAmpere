@@ -6,13 +6,13 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    8
+#define RPC_PROTO_MAJOR_VERSION    9
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    3
 
 #ifdef  __cplusplus
-// 102 = upstream 101 + TURBO_WHT (upstream already has LIGHTNING_INDEXER and DSV4_HC_*)
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+// 106 = upstream 102 (incl. TOP_K_MASK) + TURBO_WHT, SJKVARN_SEAL, DSV4_HC_DOWN, DSV4_HC_UP
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

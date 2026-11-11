@@ -1,7 +1,5 @@
 #include "llama-memory-hybrid-idx.h"
 
-#include <type_traits>
-
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -14,6 +12,7 @@
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_set>
 
 void llama_pfdiag_kv_begin(uint32_t n);
@@ -26,12 +25,12 @@ void llama_pfdiag_kv_report(const char * tag, size_t n_ub);
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -51,7 +50,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
       llama_sj_kvarn_config   sj_kvarn) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        no_alloc,
+        type_k, type_v, v_trans, kv_size, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, gdn_replay_req, offload, unified,
         filter_attn, filter_recr,
@@ -99,8 +99,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, type = %s\n", __func__, kv_size, ggml_type_name(type_k_idx));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified_idx,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            model, no_alloc, hparams_idx, type_k_idx, type_v_idx, v_trans, offload, unified_idx,
+            kv_size, n_seq_max, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_", 0, nullptr, 0, llama_sj_kvarn_config(), host_raw);
     }()) {
     if (compact_pool) {
@@ -117,14 +117,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             // Raw F16 history may live on the host, but scored pools retain their original device.
             const auto buft = host_raw && offload ? ggml_backend_dev_buffer_type(model.dev_layer(il)) :
                     ggml_backend_buffer_get_type(raw->buffer);
-            ggml_backend_buffer_ptr buffer(model.hparams.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) :
-                    ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
-            if (!buffer) {
-                throw std::runtime_error("failed to allocate compact indexer pool buffer");
-            }
-            if (model.hparams.no_alloc) {
-                pooled->buffer = buffer.get();
-            } else {
+            // no_alloc: a zero-size dummy buffer is attached to the tensor (throws on failure)
+            ggml_backend_buffer_ptr buffer = llama_memory_bufs::alloc_buf(ctx.get(), buft, no_alloc, "compact indexer pool");
+            if (!no_alloc) {
                 ggml_backend_buffer_clear(buffer.get(), 0);
             }
             LLAMA_LOG_INFO("%s: layer %u compact indexer pool: %lld rows, %.3f MiB (raw rows retained on %s)\n",
@@ -350,7 +345,8 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 
     for (const auto & entry : pool_buffers) {
         const auto buft = ggml_backend_buffer_get_type(entry.second.get());
-        mb[buft] += hparams_idx.no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(entry.first.get(), buft) :
+        // a no_alloc pool holds a zero-size dummy buffer: report the simulated size
+        mb[buft] += ggml_backend_buffer_get_base(entry.second.get()) == nullptr ? ggml_backend_alloc_ctx_tensors_from_buft_size(entry.first.get(), buft) :
                 ggml_backend_buffer_get_size(entry.second.get());
     }
     return mb;
@@ -360,13 +356,9 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     llama_memory_hybrid::state_write(io, seq_id, flags);
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
-    // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        if (mem_idx) {
-            mem_idx->state_write(io, seq_id, flags);
-        }
+    if (mem_idx) {
+        mem_idx->state_write(io, seq_id, flags);
     }
-
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -379,19 +371,24 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     try {
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        // the indexer cache has the SWA type of the attention cache, so both read the same partial state
+        // fork: an SJ-KVaRN attention cache is skipped under PARTIAL_ONLY (its checkpoint is the [#240] SJ_EXACT
+        // section below), as llama_memory_hybrid::state_write skips it - must stay in step with that gate
+        if (!((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && get_mem_attn()->is_sj_kvarn())) {
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
 
         get_mem_recr()->state_read(io, seq_id, flags);
-        state_read_sj_exact(io, seq_id, flags); // [#240] PARTIAL_ONLY only, so never together with the indexer section
+        // [#240] PARTIAL_ONLY only; the indexer section after it is empty then unless the caches are SWA (upstream e467e5b5e)
+        state_read_sj_exact(io, seq_id, flags);
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-            if (mem_idx) {
-                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+        if (mem_idx) {
+            mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+            // a restore that rewrites cells does it behind the pool layout's back
+            // (PARTIAL_ONLY: the caches apply the flag themselves, upstream e467e5b5e)
+            if (!sinfos_attn.empty()) {
                 mem_idx->state_mirror_cell_ext(*get_mem_attn(), sinfos_attn);
-                // the restore rewrites the cells behind the pool layout's back
                 mem_idx_stale_set(seq_id, 0);
             }
         }
@@ -1314,7 +1311,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool_impl(ggml_tensor * pool_ce
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
-    GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_new_g);
+    GGML_ASSERT(ggml_nelements(new_pool_idxs) == (int64_t) kpool*n_new_g);
     // the graph always scatters the fresh pooled keys back into the cache, see build_qsa_sel
     GGML_ASSERT(new_pool_rep != nullptr && ggml_backend_buffer_is_host(new_pool_rep->buffer));
     GGML_ASSERT(new_pool_rep->ne[0] == (int64_t) n_new_g);

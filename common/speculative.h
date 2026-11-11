@@ -81,10 +81,11 @@ struct common_speculative_draft_params {
     // that samples its draft from a matching distribution records that distribution per draft position
     // (candidate ids with normalised probabilities, aligned with *result; an empty row means id-match)
     const common_params_sampling * sampling = nullptr;
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash (DFlash2 only) sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
-    // upstream #27694 fields (probabilistic draft sampling); kept for API compatibility. In this tree the
-    // exact p/q path above (LLAMA_SPEC_PQ=1, `sampling`) is the sampled-draft implementation.
+    // upstream #27694 fields (probabilistic draft sampling): read by DFlash2 drafts (--spec-draft-sampling
+    // probabilistic); for the other drafters the exact p/q path above (LLAMA_SPEC_PQ=1, `sampling`) is the sampled draft.
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 
