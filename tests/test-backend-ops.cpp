@@ -1737,6 +1737,14 @@ struct test_case {
                 }
             }
 
+            if ((t1->op == GGML_OP_FLASH_ATTN_EXT || t1->op == GGML_OP_CONCAT) && getenv("GGML_TEST_DUMP_HASH")) { // CONCAT: multi-stream SJ-KVaRN cases
+                // raw backend1 output bytes (FNV-1a 64) for bit-identity checks between two builds
+                std::vector<uint8_t> raw(ggml_nbytes(t1));
+                ggml_backend_tensor_get(t1, raw.data(), 0, raw.size());
+                uint64_t h = 1469598103934665603ULL;
+                for (const uint8_t b : raw) { h = (h ^ b) * 1099511628211ULL; }
+                printf("TBOHASH\t%s\t%s\t%016" PRIx64 "\n", ggml_op_desc(t1), ud->tc->vars().c_str(), h);
+            }
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
@@ -22012,6 +22020,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(4, 24, 4, 40, 1024, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 4));
+    // [#195] width 5 at GQA 6 past the 5376-position crossover (the five-query stream specialization, and the compact
+    // Q5/G6 tile under GGML_SJKVARN_DIRECT_Q5G6=1): 48 records + 1100 ring rows = 7372 positions, per staging type,
+    // turbo4 body, fused rotation (1 = vs CPU, 2 = fused minus separate passes) and two streams
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true, false, GGML_TYPE_Q8_0, 256));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+    for (int rot : {1, 2}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, rot));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0, 4, 4, 0, 2));
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 0*128, 128 + 2*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0, true));

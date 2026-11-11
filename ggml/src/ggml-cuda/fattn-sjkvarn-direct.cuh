@@ -994,6 +994,9 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl(ggml_backend_cuda_cont
         ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ctx, dst);
         return;
     }
+    if (n_q == 5) {
+        ggml_cuda_fattn_sj_kvarn_q5g6_off("the direct kernel (GGML_SJKVARN_DIRECT_STREAM_MAX < 5)");
+    }
     static const bool w4d_env = getenv("GGML_SJKVARN_DIRECT_NWIN4") != nullptr && atoi(getenv("GGML_SJKVARN_DIRECT_NWIN4")) != 0;
     if (w4d_env) {
         if (ggml_cuda_flash_attn_ext_sj_kvarn_direct_launch<4, 4, 8>(ctx, dst)) {
