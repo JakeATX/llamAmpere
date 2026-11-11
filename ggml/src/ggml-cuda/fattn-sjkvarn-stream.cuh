@@ -1395,10 +1395,11 @@ static int ggml_cuda_fattn_sj_kvarn_q5g6_mode() {
     return mode;
 }
 
-// one warning per process and reason when the switch is set but a width-5 node takes a route without the compact tile
-static void ggml_cuda_fattn_sj_kvarn_q5g6_off(const char * why) {
+// one warning per process when the switch is set but a width-5 node takes a route without the compact tile (shared by
+// the shape reasons); a caller may pass its own flag so its reason is logged even after another one (LSA refusal)
+static void ggml_cuda_fattn_sj_kvarn_q5g6_off(const char * why, std::atomic_flag * own = nullptr) {
     static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-    if (ggml_cuda_fattn_sj_kvarn_q5g6_mode() != 0 && !warned.test_and_set()) {
+    if (ggml_cuda_fattn_sj_kvarn_q5g6_mode() != 0 && !(own ? own : &warned)->test_and_set()) {
         GGML_LOG_WARN("ggml_cuda_fattn_sj_kvarn_q5g6: GGML_SJKVARN_DIRECT_Q5G6 is set but a width-5 node runs %s: compact Q5/G6 tile OFF for it "
                       "(first such node; later ones are not logged)\n", why);
     }
@@ -1418,7 +1419,8 @@ static int ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(const ggml_tensor * dst) {
     // LSA live-record walk (GGML_SJKVARN_TILE_SKIP / LIVE_RECORDS / LIVE_STRIPS, block list, resident strips): only the
     // rows tile has the LSA build, and the compact launcher would ignore the record list
     if (ggml_cuda_fattn_sj_live_records != nullptr) {
-        ggml_cuda_fattn_sj_kvarn_q5g6_off("with the LSA live-record walk");
+        static std::atomic_flag warned_lsa = ATOMIC_FLAG_INIT;
+        ggml_cuda_fattn_sj_kvarn_q5g6_off("with the LSA live-record walk", &warned_lsa);
         return 0;
     }
     const int64_t gqa = dst->src[0]->ne[2] / dst->src[1]->ne[2];
