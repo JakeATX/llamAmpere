@@ -1490,6 +1490,8 @@ struct mmq_args {
     ggml_cuda_mm_fusion_args_device fusion = {}; // gate != nullptr selects the fused gate/up/GLU path
     // fork: the pre-linearization column count (dense: ne11, MoE: ne12), used by [PARW] and the mmq-prefill gate.
     int64_t ncols_max = 0;
+    // fork: MoE tile_spec uses v0.6.3's per-expert grid (mmq_tile_spec_per_expert in mmq.cu), launch with v0.6.3's grid size.
+    bool tiles_v063 = false;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1517,6 +1519,11 @@ static bool ggml_cuda_mmq_sk_48_enabled() {
 
 static inline __host__ bool ggml_cuda_mmq_id_sk_upstream() {
     static const bool v = [] { const char * e = getenv("GGML_CUDA_MMQ_ID_SK_UPSTREAM"); return e && atoi(e) != 0; }();
+    return v;
+}
+
+static inline __host__ bool ggml_cuda_mmq_sk_upstream() {
+    static const bool v = [] { const char * e = getenv("GGML_CUDA_MMQ_SK_UPSTREAM"); return e && atoi(e) != 0; }();
     return v;
 }
 
@@ -1575,18 +1582,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
     const int nwork = ntiles_dst * ((args.ncols_x + config.K_vram - 1) / config.K_vram); // Maximum number of CUDA blocks that can do useful work.
-    int nblocks_stream_k = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork);
-    // fork: MoE (ids_dst) with the linearized layout has fewer tiles than v0.6.3's per-expert grid of
-    // ceil(ncols_max/J) column tiles, so the efficiency test above can split K across blocks where v0.6.3 ran one block
-    // per tile, which changes the sums. When v0.6.3's grid passed the test, keep one block per tile (same per-element
-    // K order). GGML_CUDA_MMQ_ID_SK_UPSTREAM=1 keeps upstream's choice.
-    if (args.ids_dst && GGML_CUDA_CC_IS_NVIDIA(cc) && nblocks_stream_k != ntiles_dst && !ggml_cuda_mmq_id_sk_upstream()) {
-        const int64_t ntiles_v063 = (args.ncols_max + J - 1) / J * (int64_t) nti * args.nchannels_x * args.nsamples_y;
-        const int64_t nwaves_v063 = (ntiles_v063 + nsm - 1) / nsm;
-        if (ntiles_v063 > 0 && 100 * ntiles_v063 / (nsm*nwaves_v063) >= 90) {
-            nblocks_stream_k = ntiles_dst;
-        }
-    }
+    // fork: v0.6.3's stream-k grid size (nsm, not capped at nwork) by default, so kbc, the K split points and the fixup
+    // order are v0.6.3's exactly. MoE: with args.tiles_v063 ntiles_dst also equals v0.6.3's per-expert grid
+    // (GGML_CUDA_MMQ_ID_SK_UPSTREAM=1 = upstream). Dense: GGML_CUDA_MMQ_SK_UPSTREAM=1 = upstream's min(nsm, nwork).
+    const bool grid_v063 = args.ids_dst ? args.tiles_v063 : !ggml_cuda_mmq_sk_upstream();
+    int nblocks_stream_k = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst :
+        (grid_v063 ? nsm : std::min(nsm, nwork));
     // [PARW] a few output tiles over a long K (the 48-row GDN gate projections at verify widths 9..32 are ONE tile):
     // nsm CTAs leave most of them without a K iteration and the fixup's last CTA walks every earlier CTA serially
     // (~16 us per call vs ~5 us of math). Give each CTA at least GGML_CUDA_MMQ_SK_MIN_ITERS (default 2, 0 = off)

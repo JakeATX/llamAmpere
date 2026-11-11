@@ -91,7 +91,7 @@ static __device__ __forceinline__ float op_expm1(float x) {
 }
 
 static __device__ __forceinline__ float op_softplus(float x) {
-    return (x > 20.0f) ? x : log1pf(expf(x));
+    return (x > 20.0f) ? x : logf(1.0f + expf(x)); // llamAmpere: keep v0.6.3 numerics (upstream log1pf); chain.cu fused copy matches
 }
 
 static __device__ __forceinline__ float op_elu(float x) {

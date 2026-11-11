@@ -7163,6 +7163,8 @@ static void ggml_cuda_conv_ring_finish(ggml_backend_cuda_context * cuda_ctx) {
         }
     }
     cuda_ctx->conv_rings.clear();
+}
+
 // match ssm_scan + the strided cpy that scatters its state snapshots into the cache, so the kernel writes them and skips the cpy
 static int ggml_cuda_try_ssm_scan_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy) {

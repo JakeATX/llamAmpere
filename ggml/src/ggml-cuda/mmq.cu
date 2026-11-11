@@ -188,6 +188,31 @@ static __global__ void mmq_route_skip(
     }
 }
 
+// fork: v0.6.3's MoE tile grid (default, see launch_mul_mat_q in mmq.cuh): ntx = ceil(ne12/J) column tiles per expert,
+// tile jt of expert e covering compact columns [b[e] + jt*J, min(b[e] + (jt + 1)*J, b[e+1])), empty past b[e+1], in
+// expert-major, jt-minor order. With nchannels_y == 1 this gives the same tile index and stream-k kbc space as v0.6.3,
+// so the K split points and the fixup order are the same and the sums are bit-identical. The expert bounds come from
+// the per-expert extra entries mm_ids_helper writes after the seam entries: entry nseam + e always ends at b[e+1]
+// (its loop only stops on the expert's last column), and b[0] = 0 (valid ids are >= 0, skipped routes use n_experts).
+static __global__ void mmq_tile_spec_per_expert(
+        const ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec_v063,
+        const int nseam, const int n_experts, const int ntx, const int J) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_experts*ntx) {
+        return;
+    }
+    const int e    = i / ntx;
+    const int jt   = i % ntx;
+    const int b_lo = e == 0 ? 0 : tile_spec[nseam + e - 1].col_high;
+    const int b_hi = tile_spec[nseam + e].col_high;
+    const int col_low = b_lo + jt*J;
+    if (col_low < b_hi) {
+        tile_spec_v063[i] = {e, col_low, min(col_low + J, b_hi), /*padding =*/ 0};
+    } else {
+        tile_spec_v063[i] = {e, b_hi, b_hi, /*padding =*/ 0};
+    }
+}
+
 // Tile width in ne11 (dense) / ne12 (MoE) direction with the fewest tiles that fits into shared memory, 0 if there is none.
 static int ggml_cuda_mmq_get_J_best(
         const ggml_type type, const int64_t ncols, const bool fallback, const int cc, const size_t smpbo, const ggml_prec prec_src1,
@@ -484,6 +509,21 @@ static void ggml_cuda_mul_mat_q_impl(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // fork: v0.6.3 per-expert tile grid unless GGML_CUDA_MMQ_ID_SK_UPSTREAM=1 (upstream #31047's linear layout has fewer
+    // tiles, so stream-k splits K at other points and the sums differ in the last bits), see mmq_tile_spec_per_expert.
+    const bool    tiles_v063 = !ggml_cuda_mmq_id_sk_upstream();
+    const int64_t ntx_v063   = (ne12 + J_best - 1) / J_best;
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec_v063(ctx.pool());
+    if (tiles_v063) {
+        const int64_t n_v063 = ne02*ntx_v063;
+        GGML_ASSERT(n_v063 < INT_MAX);
+        tile_spec_v063.alloc(n_v063);
+        const int nseam = (ne_get_rows + J_best - 1) / J_best;
+        mmq_tile_spec_per_expert<<<(n_v063 + 255)/256, 256, 0, stream>>>(
+            tile_spec.get(), tile_spec_v063.get(), nseam, ne02, ntx_v063, J_best);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
@@ -538,13 +578,14 @@ static void ggml_cuda_mul_mat_q_impl(
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    // With tiles_v063 nchannels_y stays 1: the expert index is part of the linear tile index (e*ntx + jt).
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), tile_spec.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), tiles_v063 ? tile_spec_v063.get() : tile_spec.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02,    1, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ntj, J_best, fusion_device, /*ncols_max =*/ ne12};
+        tiles_v063 ? ne02*ntx_v063 : ntj, J_best, fusion_device, /*ncols_max =*/ ne12, /*tiles_v063 =*/ tiles_v063};
 
     launch_products(args);
 }

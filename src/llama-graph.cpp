@@ -4129,7 +4129,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 
-        ggml_prec_set_acc(kq, GGML_PREC_BF16);
+        ggml_prec_set_acc(kq, GGML_PREC_F32); // llamAmpere: keep v0.6.3 F32 accumulation (upstream BF16)
 
         if (model.arch == LLM_ARCH_GROK) {
             // need to do the following:
