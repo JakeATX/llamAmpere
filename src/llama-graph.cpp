@@ -4677,6 +4677,15 @@ static ggml_tensor * build_attn_scale_kv_output(
 // op, so the scheduler copies the tiny tensor over each step (probe only). Logs the running kept share at WARN level
 // (llama-server filters libllama INFO) every 256 calls of a layer.
 // LLAMA_LSA_DUMP: write one tensor of one layer as raw f32 (once per layer and tensor), plus a line in <prefix>.index.txt
+// v0.7 keeps the K/V rotations per layer; LSA keeps its per-cache rule: any rotated layer keeps the whole cache dense
+static bool llama_lsa_any_rot(const std::vector<ggml_tensor *> & rot) {
+    for (const ggml_tensor * t : rot) {
+        if (t) {
+            return true;
+        }
+    }
+    return false;
+}
 static const char * const lsa_dump_names[] = {"q", "k", "v", "score", "mask", "cell_pos", "q_pos"};
 static std::atomic<bool> lsa_dump_done[256][7];
 
@@ -7386,7 +7395,7 @@ ggml_tensor * llm_graph_context::build_attn(
     if (inp->lsa_cell_pos && is_sj_kvarn && inp->lsa_q_cell && !cparams.training) {
         // SJ-KVaRN: masked attention only (dense compute over the sealed records), index keys from the side cache
         if (ggml_tensor * lsa_idx = build_attn_lsa_idx(inp, k_lsa, k, il)) {
-            if (llama_lsa_cfg().comp_fast && sj_wush == nullptr && !inp->self_k_rot[il] && !inp->self_v_rot[il]) {
+            if (llama_lsa_cfg().comp_fast && sj_wush == nullptr && !llama_lsa_any_rot(inp->self_k_rot) && !llama_lsa_any_rot(inp->self_v_rot)) {
                 lsa_means_rot = k_lsa_rot != nullptr;
                 lsa_means_ok = build_attn_lsa_mean_refresh(inp, k, v, lsa_means_rot ? k_lsa_rot : k_lsa,
                         lsa_means_rot ? v_lsa_rot : v_lsa, kq_mask->ne[0], &lsa_kmv, &lsa_vmv, &lsa_nbs, il, lsa_means_rot);
@@ -7402,7 +7411,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 kq_mask = lsa_mask;
             }
         }
-    } else if (inp->lsa_cell_pos && !is_sj_kvarn && !inp->self_k_rot[il] && !cparams.training) {
+    } else if (inp->lsa_cell_pos && !is_sj_kvarn && !llama_lsa_any_rot(inp->self_k_rot) && !cparams.training) {
         ggml_tensor * lsa_idx = build_attn_lsa_idx(inp, k_cur, k, il);
         if (llama_lsa_cfg().comp_fast) {
             lsa_means_ok = build_attn_lsa_mean_refresh(inp, k, v, nullptr, nullptr, k->ne[2], &lsa_kmv, &lsa_vmv, &lsa_nbs, il);
