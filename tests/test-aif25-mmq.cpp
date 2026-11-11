@@ -3,8 +3,7 @@
 // every qualifying call and aborts if any output differs in any bit; the test then checks that every expected call was
 // checked, and compares three 16-row slabs of every output with a CPU reference (aif25_dequantize_slab, double sums):
 // NMSE <= 1e-3. Tile and strips come from the environment (GGML_CUDA_AIF25_MMQ, default 64; GGML_CUDA_AIF25_MMQ_STRIPS,
-// default 1); the minimum width is set to 9 unless given. With GGML_CUDA_AIF25_PP_MIN_N > 0 the lossy fp16 path takes the
-// prompt widths instead: no bit check is expected and only the CPU reference applies.
+// default 1); the minimum width is set to 9 unless given.
 // Exit 0 = pass, 1 = fail, 77 = no CUDA device.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -39,8 +38,6 @@ int main() {
     setenv("GGML_CUDA_AIF25_MMQ_MIN", "9", 0);
     setenv("GGML_CUDA_AIF25_MMQ_CHECK", "2", 1);
     const int min_n = std::max(9, std::atoi(std::getenv("GGML_CUDA_AIF25_MMQ_MIN")));
-    const char * pp_env = std::getenv("GGML_CUDA_AIF25_PP_MIN_N");
-    const int pp_min = pp_env ? std::atoi(pp_env) : 0;
     ggml_log_set(log_cb, nullptr);
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("CUDA0");
@@ -112,7 +109,7 @@ int main() {
         const int before = g_checked;
         ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS && ok;
         ggml_backend_synchronize(backend);
-        const int want = s.n >= min_n && !(pp_min > 0 && s.n >= pp_min) ? 1 : 0;
+        const int want = s.n >= min_n ? 1 : 0;
         expected += want;
         std::vector<float> yb(ggml_nelements(y));
         ggml_backend_tensor_get(y, yb.data(), 0, ggml_nbytes(y));
@@ -149,8 +146,8 @@ int main() {
     }
     ggml_backend_free(backend);
     ok = ok && g_bad == 0 && g_checked == expected;
-    std::fprintf(stderr, "test-aif25-mmq: tile=%s strips=%s min=%d pp_min=%d: %d of %d expected calls checked bit-identical, %d differ: %s\n",
+    std::fprintf(stderr, "test-aif25-mmq: tile=%s strips=%s min=%d: %d of %d expected calls checked bit-identical, %d differ: %s\n",
             std::getenv("GGML_CUDA_AIF25_MMQ"), std::getenv("GGML_CUDA_AIF25_MMQ_STRIPS") ? std::getenv("GGML_CUDA_AIF25_MMQ_STRIPS") : "1",
-            min_n, pp_min, g_checked, expected, g_bad, ok ? "PASS" : "FAIL");
+            min_n, g_checked, expected, g_bad, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
