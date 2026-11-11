@@ -1415,6 +1415,12 @@ static int ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(const ggml_tensor * dst) {
         ggml_cuda_fattn_sj_kvarn_q5g6_off("with a per-head mask");
         return 0;
     }
+    // LSA live-record walk (GGML_SJKVARN_TILE_SKIP / LIVE_RECORDS / LIVE_STRIPS, block list, resident strips): only the
+    // rows tile has the LSA build, and the compact launcher would ignore the record list
+    if (ggml_cuda_fattn_sj_live_records != nullptr) {
+        ggml_cuda_fattn_sj_kvarn_q5g6_off("with the LSA live-record walk");
+        return 0;
+    }
     const int64_t gqa = dst->src[0]->ne[2] / dst->src[1]->ne[2];
     if (dst->src[0]->ne[2] != 6*dst->src[1]->ne[2]) {
         static std::atomic_flag warned = ATOMIC_FLAG_INIT;
