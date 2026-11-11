@@ -37,8 +37,10 @@
 #include <vector>
 
 static const uint32_t n_vocab = 128, head_dim = 128, n_layer = 4;
-static const uint32_t n_ctx = 2048;
-static const llama_pos n_prompt = 1500; // > what the small arena keeps resident (6 pages of 256 cells per layer)
+static const uint32_t n_ctx = 8192;
+// 7000 cells = 28 pages of 256 per layer, about 28 MiB of f16 KV: more than the small arenas keep resident, so a
+// save/load under real streaming pressure is tested (LLAMA_KV_STREAM_TRACE=1 shows active tokens vs resident pages)
+static const llama_pos n_prompt = 7000;
 
 static void require(bool condition, const std::string & message) {
     if (!condition) {
