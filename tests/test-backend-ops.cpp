@@ -20205,8 +20205,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int n = 1; n <= 8; n++) {
             for (bool broadcast : {false, true}) {
                 test_cases.emplace_back(new test_mul_mat_id_cpu_grouped(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512));
-                test_cases.emplace_back(new test_mul_mat_id_cpu_grouped(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512, 1.0f, 80));
-                test_cases.emplace_back(new test_mul_mat_id_cpu_grouped(type_a, GGML_TYPE_F32, 16, 10, broadcast, 65, n, 512, 1.0f, 80));
+                test_cases.emplace_back(new test_mul_mat_id_cpu_grouped(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512, 80));
+                test_cases.emplace_back(new test_mul_mat_id_cpu_grouped(type_a, GGML_TYPE_F32, 16, 10, broadcast, 65, n, 512, 80));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 4, 4, broadcast, 65, n, 512, 2));
             }
             test_cases.emplace_back(new test_mul_mat_id_shared(type_a, n));
