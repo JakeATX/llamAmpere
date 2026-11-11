@@ -88,7 +88,10 @@ if [[ -n $low_cards ]]; then
             --fit) shape[i+1]=on ;;
         esac
     done
-    echo "flash-next-server: less than $fit_min_mib MiB free on$low_cards; using the memory planner (-ngl auto --fit on), which can keep layers in RAM and pick a shorter context (slower). Close the other programs for full speed" >&2
+    # Skipping light experts needs the card-side expert tables, which a nearly full card cannot hold; the host path
+    # computes every expert (#96: a 2x3090 rental with 3.2 GB free stopped on an assertion with skipping on).
+    shape+=(--moe-skip off)
+    echo "flash-next-server: less than $fit_min_mib MiB free on$low_cards; using the memory planner (-ngl auto --fit on --moe-skip off), which can keep layers in RAM and pick a shorter context (slower). Close the other programs for full speed" >&2
 fi
 while IFS= read -r device; do
     [[ $device =~ ^[[:space:]]*(CUDA[0-9]+):.*\(([0-9]+)\ MiB,\ ([0-9]+)\ MiB\ free\) ]] || continue

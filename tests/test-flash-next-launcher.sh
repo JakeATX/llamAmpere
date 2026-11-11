@@ -65,22 +65,22 @@ run two-idle "$idle24$idle24b" --
 check '[[ $(last --device) == CUDA0 && $(last -ngl) == 999 && $(last --fit) == off ]] && has_err "2 CUDA cards visible; using CUDA0"'
 check '! has_err "other programs" && ! has_err "memory planner"'
 run reporter "$busy0$busy1" --
-check '[[ $(last --device) == CUDA0 && $(last -ngl) == auto && $(last --fit) == on && $(last -c) == "" ]]'
+check '[[ $(last --device) == CUDA0 && $(last -ngl) == auto && $(last --fit) == on && $(last -c) == "" && $(last --moe-skip) == off ]]'
 check 'has_err "CUDA0 has 3469 of 24576 MiB free; other programs hold about 21107 MiB" && ! has_err "CUDA1 has" && has_err "memory planner"'
 run busy-first "$busy0$idle24b" --
-check '[[ $(last --device) == CUDA1 && $(last -ngl) == 999 && $(last --fit) == off ]] && ! has_err "memory planner"'
+check '[[ $(last --device) == CUDA1 && $(last -ngl) == 999 && $(last --fit) == off && $(last --moe-skip) != off ]] && ! has_err "memory planner"'
 run same-multi-idle "$idle24$idle24b" FLASH_NEXT_MULTI_GPU=1 --
 check '[[ $(last --device) == "" && $(last -ngl) == 999 && $(last --fit) == off && -z $err ]]'
 run multi-reporter "$busy0$busy1" FLASH_NEXT_MULTI_GPU=1 --
-check '[[ $(last --device) == "" && $(last -ngl) == auto && $(last --fit) == on ]] && has_err "CUDA0 has 3469" && has_err "CUDA1 has 3387" && has_err "on CUDA0 CUDA1;"'
+check '[[ $(last --device) == "" && $(last -ngl) == auto && $(last --fit) == on && $(last --moe-skip) == off ]] && has_err "CUDA0 has 3469" && has_err "CUDA1 has 3387" && has_err "on CUDA0 CUDA1;"'
 run explicit-busy "$idle24$busy1" -- --device CUDA1
 check '[[ $(grep -c "^--device$" <<< "$out") == 1 && $(last --device) == CUDA1 && $(last -ngl) == auto && $(last --fit) == on ]]'
 run same-env-device "$busy0$idle24b" LLAMA_ARG_DEVICE=CUDA1 --
 check '[[ $(last --device) == "" && $(last -ngl) == 999 && $(last --fit) == off && -z $err ]]'
 run fit-min-off "$busy0$busy1" FLASH_NEXT_FIT_MIN_MIB=0 --
-check '[[ $(last --device) == CUDA0 && $(last -ngl) == 999 && $(last --fit) == off ]] && has_err "other programs" && ! has_err "memory planner"'
-run caller-wins "$busy0$busy1" -- --fit off -ngl 999
-check '[[ $(last -ngl) == 999 && $(last --fit) == off ]]'
+check '[[ $(last --device) == CUDA0 && $(last -ngl) == 999 && $(last --fit) == off && $(last --moe-skip) != off ]] && has_err "other programs" && ! has_err "memory planner"'
+run caller-wins "$busy0$busy1" -- --fit off -ngl 999 --moe-skip on
+check '[[ $(last -ngl) == 999 && $(last --fit) == off && $(last --moe-skip) == on ]]'
 run same-one-idle-10 "$(card CUDA0 10240 9700)" --
 check '[[ $(last -ngl) == 999 && $(last --fit) == off && $(last -c) == 110592 && -z $err ]]'
 run same-explicit-idle "$idle24$idle24b" -- --device CUDA0
