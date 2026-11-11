@@ -2976,7 +2976,9 @@ private:
                     }
                 }
 
-                prompt_cache->update();
+                if (saved || loaded) {
+                    prompt_cache->update();
+                }
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -4299,6 +4301,16 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        // a context that cannot serialize its KV state reports size zero; keeping the
+        // metadata-only entry would let a later restore skip the data load while
+        // proceeding on pos/n_tokens bookkeeping. drop it instead.
+        if (cur.empty()) {
+            SLT_WRN(slot, "dropping empty context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ") - context cannot serialize KV state\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens);
+            slot.prompt.checkpoints.pop_back();
+            return;
+        }
+
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, %.2f ms%s)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
@@ -4424,13 +4436,17 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                const bool saved = slot.prompt_save(*prompt_cache);
+                                if (saved) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (params_base.kv_unified && saved) {
                                     // [TAG_IDLE_SLOT_CLEAR]
+                                    // only clear when the state actually made it into the
+                                    // prompt cache - a failed save means the cache cannot
+                                    // hold it, and clearing would destroy the only copy
                                     slot.prompt_clear();
                                 }
                             }

@@ -387,6 +387,8 @@ llama_kv_cache::llama_kv_cache(
     // Turbo K quantization error gets amplified by the GQA broadcast factor.
     // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
     // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
+    // Qwen2.5-0.5B (14 Q / 2 KV = 7:1): tq6 K PPL ~22, tq5 K ~31.6 vs 8.0 f16, so
+    // the 5- and 6-bit types stay under the rule too.
     // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
     // MLA models (DeepSeek-V4) have no separate V cache (V = view of K),
     // so K and V types must be identical — skip auto-asymmetric for MLA.
@@ -408,6 +410,27 @@ llama_kv_cache::llama_kv_cache(
     // (gemma4-assistant: n_layer()==0) registers its KV layers; has_kv() still
     // gates per-layer. Upstream loops the full hparams.n_layer member here.
     const uint32_t n_layer = hparams.n_layer_all;
+
+    auto check_set_rows_support = [](ggml_backend_dev_t dev, ggml_type type, int64_t ne0, int64_t ne1, const char * kv) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return;
+        }
+        ggml_init_params params = {
+            /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx.get(), type, ne0, ne1);
+        ggml_tensor * src = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, ne0, 1);
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
+        ggml_tensor * op  = ggml_set_rows(ctx.get(), dst, src, idx);
+        if (!ggml_backend_dev_supports_op(dev, op)) {
+            throw std::runtime_error(format("%s cache type %s is not supported on device %s (no SET_ROWS kernel for it); "
+                                            "use a different cache type or keep the KV cache in host memory (-nkvo)",
+                                            kv, ggml_type_name(type), ggml_backend_dev_name(dev)));
+        }
+    };
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -1012,13 +1035,22 @@ llama_kv_cache::llama_kv_cache(
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (!sj_kvarn.enabled() && turbo_rotation == nullptr &&
             (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TQ6_0 || type_k == GGML_TYPE_TQ5_0)) {
-            turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
+            // The KV-stream buffer is host-backed: WHT ops reading these tensors from it get
+            // scheduled on the CPU, round-tripping Q and the FA output over PCIe every layer.
+            ggml_context * turbo_ctx = ctx;
+            if (kv_stream_buft != nullptr && buft == kv_stream_buft) {
+                turbo_ctx = ctx_for_buft(ggml_backend_dev_buffer_type(kv_stream_dev));
+                if (!turbo_ctx) {
+                    throw std::runtime_error("failed to create ggml context for turbo rotation tensors");
+                }
+            }
+            turbo_rotation = ggml_new_tensor_2d(turbo_ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
-            turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
+            turbo_rotation_inv = ggml_new_tensor_2d(turbo_ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation_inv, "turbo_rotation_inv");  // R
 
             // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
-            turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
+            turbo_innerq_scale_inv = ggml_new_tensor_1d(turbo_ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
         }
     }
@@ -4939,20 +4971,14 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 
     // state_write_data below reads each layer's K/V tensor by a flat byte
-    // offset into cell-position order (io.write_tensor(k, range.first *
-    // k_size_row, buf_size)). That's only valid when the tensor's own
-    // storage actually holds every cell contiguously in that order - true
-    // for an ordinary KV buffer, not for a block-streamed one, where only a
-    // resident subset of pages live in the buffer kv_stream_adapt() last
-    // synced and the authoritative copy of the rest lives in host RAM
-    // behind the streaming runtime. Reading it this way would silently
-    // save whatever bytes happen to be resident, not the real KV content.
-    // Refuse rather than produce a state file that looks valid and isn't.
-    if (kv_stream_runtime.runtime != nullptr) {
-        throw std::runtime_error(
-            "llama_state_*: saving KV cache state is not supported while block KV "
-            "streaming is active (--kv-stream-arena-mib)");
-    }
+    // offset into cell-position order. That is valid whenever the tensor's own
+    // storage holds every cell contiguously in that order. The block-streamed
+    // KV buffer is a full-size pinned HOST buffer (ggml_backend_cuda_kv_stream
+    // buffer type): every cell lives in it; rows reach that memory both through
+    // the buffer interface (memcpy + resident-mirror invalidation) and directly
+    // from flash-attention epilogue kernels via the mapped alias. The save runs
+    // between tasks, after llama_synchronize, so no in-flight GPU write can race
+    // the read. So the flat read sees the real, complete KV content.
 
     if (sj_kvarn.enabled()) {
         if (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT) {
@@ -5101,14 +5127,13 @@ const slot_info_vec_t *   sinfos_in) {
         return;
     }
 
-    // See the matching check in state_write() - state_read_data below writes
-    // each layer's K/V tensor by the same flat cell-position byte offset,
-    // which isn't meaningful for a block-streamed cache's buffer.
-    if (kv_stream_runtime.runtime != nullptr) {
-        throw std::runtime_error(
-            "llama_state_*: loading KV cache state is not supported while block KV "
-            "streaming is active (--kv-stream-arena-mib)");
-    }
+    // See the matching note in state_write() - the block-streamed KV buffer is
+    // a full-size pinned host buffer, so the flat cell-order read/write used by
+    // state_read_data is valid. Restoring runs between tasks with no batch in
+    // flight; each write goes through the buffer interface, which memcpys into
+    // the host storage and fully resets the GPU resident mirror (loaded pages,
+    // dirty-row bookkeeping, layer maps) plus bumps the generation counter that
+    // keys the graph cache, so a restored state is consistent for the runtime.
 
     if (sj_kvarn.enabled()) {
         if (sinfos_in) {

@@ -843,12 +843,13 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_t
     // TurboQuant cross-type native kernels are only instantiated for a
     // deliberately narrow set of pairings (turbo K/V combined with {f16,
     // q8_0} and with each other) - see fattn-vec.cuh's EXTERN_DECL_FATTN_VEC_CASE
-    // blocks for turbo2/3/4. Every other case below must be compile-time
+    // blocks for turbo2/3/4/5/6. Every other case below must be compile-time
     // excluded (if constexpr, not a runtime check) whenever it isn't one of
     // those instantiated pairs, or taking the function's address would be an
     // undefined reference at link time for a pairing nobody built.
     constexpr bool k_is_turbo =
-        type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0;
+        type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 ||
+        type_K == GGML_TYPE_TQ5_0 || type_K == GGML_TYPE_TQ6_0;
     switch (type_v) {
         case GGML_TYPE_F16:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
@@ -904,6 +905,18 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_t
                     KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TURBO4_0>;
             }
             return nullptr;
+        case GGML_TYPE_TQ5_0:
+            if constexpr (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || k_is_turbo) {
+                return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                    KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TQ5_0>;
+            }
+            return nullptr;
+        case GGML_TYPE_TQ6_0:
+            if constexpr (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_Q8_0 || k_is_turbo) {
+                return &ggml_cuda_flash_attn_ext_vec_partial_case<
+                    KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_TQ6_0>;
+            }
+            return nullptr;
         default:
             return nullptr;
     }
@@ -924,6 +937,8 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial(
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO2_0);
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO3_0);
         KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TURBO4_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TQ5_0);
+        KV_STREAM_NATIVE_K_CASE(GGML_TYPE_TQ6_0);
         default: return nullptr;
     }
 #undef KV_STREAM_NATIVE_K_CASE
@@ -970,7 +985,7 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         // TurboQuant: WHT-rotated, per-group nearest-centroid quantized K/V
         // types. Real backing storage (storage=true falls out below, since
         // they aren't the Q8_1/Q8_K auxiliary types), writable directly from
-        // F32 via set_rows_cuda_turbo{2,3,4} (set-rows.cu), and dequantizable
+        // F32 via set_rows_cuda_turbo{2,3,4,5,6} (set-rows.cu), and dequantizable
         // to F16 via ggml_get_to_fp16_cuda (convert.cu) - so they qualify for
         // ATTENTION_F16 mode below whenever direct_attention isn't available
         // for a given pair (see the direct_attention switch below - a native
@@ -983,6 +998,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TQ5_0:
+        case GGML_TYPE_TQ6_0:
             result.classified = true;
             break;
         default:
@@ -1004,6 +1021,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TQ5_0:
+        case GGML_TYPE_TQ6_0:
             result.online_write = true;
             break;
         default:
@@ -1040,6 +1059,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TQ5_0:
+        case GGML_TYPE_TQ6_0:
             result.decode_f16 = true;
             break;
         default:
@@ -1060,13 +1081,15 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
         // non-streaming FA dispatch - the comment above the `classified`
         // switch previously claiming no such kernel exists was stale. Only
         // instantiated for turbo paired with {f16, q8_0, turbo2, turbo3,
-        // turbo4} (see kv_stream_resolve_native_partial_for_v below, which
+        // turbo4, tq5, tq6} (see kv_stream_resolve_native_partial_for_v below, which
         // gates on exactly this set); other pairings fall back to
         // ATTENTION_F16 via the storage/online_write/decode_f16 capabilities
         // set above.
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TQ5_0:
+        case GGML_TYPE_TQ6_0:
             result.direct_attention = true;
             break;
         default:
@@ -1086,7 +1109,7 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
 // The original direct_attention type set (F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0)
 // is a fully-connected cross product - every pair among them has a native
 // kernel instantiated. TurboQuant breaks that assumption: turbo only pairs
-// natively with {f16, q8_0, turbo2, turbo3, turbo4} (see
+// natively with {f16, q8_0, turbo2, turbo3, turbo4, tq5, tq6} (see
 // kv_stream_resolve_native_partial_for_v above), not with Q4_0/Q4_1/Q5_0/
 // Q5_1/BF16. direct_attention is a per-type capability flag, so without this
 // explicit pairwise check, get_attention_mode would wrongly select DIRECT
@@ -1095,7 +1118,8 @@ ggml_backend_cuda_kv_stream_get_type_capabilities(ggml_type type) {
 // exactly that.
 static bool kv_stream_direct_attention_pair_supported(ggml_type type_k, ggml_type type_v) {
     const auto is_turbo = [](ggml_type t) {
-        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
+               t == GGML_TYPE_TQ5_0 || t == GGML_TYPE_TQ6_0;
     };
     if (!is_turbo(type_k) && !is_turbo(type_v)) {
         return true;
@@ -1133,7 +1157,8 @@ ggml_backend_cuda_kv_stream_get_attention_mode(ggml_type type_k, ggml_type type_
 // here would be too small for what llama-kv-cache.cpp actually writes.
 static inline uint32_t ggml_cuda_kv_stream_padded_head_dim(ggml_type type, uint32_t head_dim) {
     const bool is_turbo =
-        type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+        type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+        type == GGML_TYPE_TQ5_0 || type == GGML_TYPE_TQ6_0;
     if (!is_turbo) {
         return head_dim;
     }
@@ -1953,8 +1978,37 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
     }
 
-    const bool use_mma_prefill = !convert_to_f16 &&
-        Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+    // Turbo pairs classify to the F16 path so streamed spans can dequantize,
+    // but their native kernels read the coalesced resident span directly.
+    // Route fully resident (or single-page) turbo runs to native FA like
+    // DIRECT. Support-gated: native FA aborts on uncovered geometries.
+    // Turbo on either side makes the per-page F16 conversion wasteful: the
+    // plain native kernels take mixed turbo + q8_0/f16 pairs directly.
+    // Narrowed to both sides in {turbo, q8_0, f16} with at least one turbo:
+    // the tip's pair check (kv_stream_direct_attention_pair_supported)
+    // encodes the same set, and the VEC dispatch has no BF16/Q4_x/Q5_x
+    // x turbo instances.
+    const auto turbo_kv = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0
+            || t == GGML_TYPE_TQ5_0 || t == GGML_TYPE_TQ6_0;
+    };
+    const auto turbo_fast_side = [&](ggml_type t) {
+        return turbo_kv(t) || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16;
+    };
+    const bool turbo_pair =
+        turbo_fast_side(K->type) && turbo_fast_side(V->type) &&
+        (turbo_kv(K->type) || turbo_kv(V->type));
+    const bool turbo_native_supported =
+        turbo_pair && ggml_cuda_flash_attn_ext_supported(ggml_cuda_get_device(), dst);
+    const bool turbo_fast = convert_to_f16 && turbo_native_supported &&
+        (streamed_chunks.empty() || nchunks == 1);
+    const bool effective_convert = convert_to_f16 && !turbo_fast;
+    // MMA reads staged pages directly: native quantized/turbo tiles in native
+    // mode, F16-converted tiles in F16 mode. So type is not a gate. Width is:
+    // MMA partial pins parallel_blocks to 1, so narrow decode queries stay on
+    // vec partial.
+    const bool use_mma_prefill =
+        Q->ne[1] > 8 && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
     GGML_ASSERT(partial_count > 0 && partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK);
@@ -1970,7 +2024,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_pool_alloc<float2> meta(pool);
     ggml_cuda_pool_alloc<float> accumulator(pool);
     ggml_cuda_pool_alloc<float2> accumulator_meta(pool);
-    const bool needs_partial_reduction = convert_to_f16 || (!streamed_chunks.empty() && nchunks > 1);
+    const bool needs_partial_reduction = effective_convert || (!streamed_chunks.empty() && nchunks > 1);
     if (needs_partial_reduction) {
         parts.alloc(size_t(partial_count)*workspace_elements);
         meta.alloc(size_t(partial_count)*workspace_rows);
@@ -2037,8 +2091,66 @@ void ggml_cuda_flash_attn_ext_streamed(
         CUDA_CHECK(cudaEventRecord(transfer_ring->ready[slot], transfer_ring->copy_stream));
         transfer_ring->slot_used[slot] = 1;
         ++transfer_ring->asynchronous_page_uploads;
+        return size_t(1);
     };
 
+    // Group consecutive streamed pages with consecutive stage slots and token
+    // ranges into one wide H2D copy pair: WDDM call overhead dominates deep
+    // spill decode, so one wide memcpy beats per-page copies.
+    auto schedule_streamed_batch = [&](size_t stream_index, size_t max_pages) {
+        auto & first = chunks[streamed_chunks[stream_index]];
+        if (!first.upload) {
+            return schedule_streamed(stream_index);
+        }
+        size_t count = 1;
+        while (count < max_pages && stream_index + count < streamed_chunks.size()) {
+            auto & next = chunks[streamed_chunks[stream_index + count]];
+            if (!next.upload ||
+                    next.slot != first.slot + count ||
+                    next.token_begin != first.token_begin + int64_t(count)*block_tokens ||
+                    next.token_count != first.token_count) {
+                break;
+            }
+            ++count;
+        }
+        // The wide memcpy relies on host contiguity; upload() carried these
+        // asserts, so repeat them here (the batch path skips upload()).
+        GGML_ASSERT(K->nb[1] == first.k_stage_token_stride && K->nb[2] == first.k_stage_head_stride);
+        GGML_ASSERT(V->nb[1] == first.v_stage_token_stride && V->nb[2] == first.v_stage_head_stride);
+        for (size_t i = 0; i < count; ++i) {
+            auto & member = chunks[streamed_chunks[stream_index + i]];
+            if (transfer_ring->slot_used[member.slot]) {
+                CUDA_CHECK(cudaStreamWaitEvent(
+                    transfer_ring->copy_stream, transfer_ring->consumed[member.slot], 0));
+                ++transfer_ring->stage_slot_reuses;
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            first.k_stage, static_cast<const char *>(K->data) + first.token_begin*K->nb[1],
+            count*first.k_bytes, cudaMemcpyHostToDevice, transfer_ring->copy_stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            first.v_stage, static_cast<const char *>(V->data) + first.token_begin*V->nb[1],
+            count*first.v_bytes, cudaMemcpyHostToDevice, transfer_ring->copy_stream));
+        transfer_ring->host_to_device_copy_commands += 2;
+        if (resident_cache != nullptr) {
+            resident_cache->stats.host_to_device_bytes += count*(first.k_bytes + first.v_bytes);
+        }
+        // Record a ready event per member: one shared batch event would be
+        // re-recorded by a refill before a partially consumed span's later
+        // members are waited on (F16 mode always spans one page), stalling
+        // the copy. Costs count event records and the compute-wait
+        // reduction, keeps the copy reduction.
+        for (size_t i = 0; i < count; ++i) {
+            auto & member = chunks[streamed_chunks[stream_index + i]];
+            CUDA_CHECK(cudaEventRecord(
+                transfer_ring->ready[member.slot], transfer_ring->copy_stream));
+            transfer_ring->slot_used[member.slot] = 1;
+            ++transfer_ring->asynchronous_page_uploads;
+        }
+        return count;
+    };
+
+    size_t stream_index = 0;
     if (!graph_planned && !streamed_chunks.empty()) {
         // SET_ROWS and all other producers for this layer are ordered before
         // this marker on the compute stream. The copy stream may then run
@@ -2048,12 +2160,11 @@ void ggml_cuda_flash_attn_ext_streamed(
             transfer_ring->copy_stream, transfer_ring->producer_ready, 0));
         const size_t initial = std::min<size_t>(
             transfer_ring->active_slots, streamed_chunks.size());
-        for (size_t i = 0; i < initial; ++i) {
-            schedule_streamed(i);
+        while (stream_index < initial) {
+            stream_index += schedule_streamed_batch(stream_index, initial - stream_index);
         }
     }
 
-    size_t stream_index = 0;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         auto & desc = chunks[chunk];
         uint32_t streamed_span_pages = 0;
@@ -2083,6 +2194,8 @@ void ggml_cuda_flash_attn_ext_streamed(
             // Coalesce ready pages that occupy consecutive plane slots. The
             // head stride remains the full active-ring plane width, while the
             // tensor's token extent grows across adjacent slots.
+            // Kept on the raw convert flag: turbo-fast runs never enter this
+            // loop (nothing streams, or a single staged page needs no coalescing).
             while (!convert_to_f16 &&
                     streamed_span_pages < maximum_streamed_span_pages &&
                     chunk + int(streamed_span_pages) < nchunks) {
@@ -2133,7 +2246,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                 resident_cache->stats.streamed_pages_attended += streamed_span_pages;
             }
         } else {
-            if (convert_to_f16) {
+            if (effective_convert) {
                 // Generic quantized K/V is converted one page at a time into
                 // the bounded workspace. Keep resident pages separate so the
                 // fallback never creates a context-sized F16 allocation.
@@ -2182,10 +2295,15 @@ void ggml_cuda_flash_attn_ext_streamed(
         staged_v.nb[1] = desc.v_stage_token_stride;
         staged_v.nb[2] = desc.v_stage_head_stride;
         staged_v.nb[3] = desc.v_stage_token_stride*desc.token_count;
+        if (turbo_fast) {
+            // turbo_fast implies nchunks == 1, so the single chunk spans all
+            // K->ne[1] rows; the native FA path needs the full extent.
+            GGML_ASSERT(staged_k.ne[1] == K->ne[1]);
+        }
 
         ggml_tensor converted_k{};
         ggml_tensor converted_v{};
-        if (convert_to_f16) {
+        if (effective_convert) {
             GGML_ASSERT(transfer_ring->conversion_data != nullptr);
             const size_t k_elements = size_t(K->ne[0])*desc.token_count*K->ne[2];
             const size_t v_elements = size_t(V->ne[0])*desc.token_count*V->ne[2];
@@ -2235,15 +2353,16 @@ void ggml_cuda_flash_attn_ext_streamed(
             staged_mask.ne[0] = desc.token_count;
             staged_mask_ptr = &staged_mask;
         }
+        GGML_ASSERT(staged_mask_ptr == nullptr || staged_mask_ptr->ne[0] == staged_k.ne[1]);
 
         ggml_tensor staged_dst = *dst;
-        staged_dst.src[1] = convert_to_f16 ? &converted_k : &staged_k;
-        staged_dst.src[2] = convert_to_f16 ? &converted_v : &staged_v;
+        staged_dst.src[1] = effective_convert ? &converted_k : &staged_k;
+        staged_dst.src[2] = effective_convert ? &converted_v : &staged_v;
         staged_dst.src[3] = staged_mask_ptr;
 
         // Preserve normal CUDA flash attention when the active cache is fully resident or fits in one streamed page.
         // This avoids a partial reduction and keeps logits identical to a non-streamed cache.
-        if (!convert_to_f16 && (streamed_chunks.empty() || nchunks == 1)) {
+        if (!effective_convert && (streamed_chunks.empty() || nchunks == 1)) {
             ggml_cuda_flash_attn_ext(ctx, &staged_dst);
             if (desc.streamed) {
                 if (graph_planned) {
@@ -2289,7 +2408,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                     ++resident_cache->stats.mma_prefill_attention_spans;
                 }
             } else {
-                if (convert_to_f16) {
+                if (effective_convert) {
                     ggml_cuda_flash_attn_ext_vec_partial_case<
                         KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
                             ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
@@ -2316,23 +2435,25 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
 
         if (desc.streamed) {
-            for (uint32_t page = 0; page < streamed_span_pages; ++page) {
-                auto & member = chunks[chunk + page];
-                if (graph_planned) {
-                    kv_stream_graph_release(
-                        transfer_ring, member.request_index, ctx.stream());
-                } else {
-                    CUDA_CHECK(cudaEventRecord(
-                        transfer_ring->consumed[member.slot], ctx.stream()));
-                    const size_t next = stream_index + page + transfer_ring->active_slots;
-                    if (next < streamed_chunks.size()) {
-                        schedule_streamed(next);
-                    }
-                }
-            }
-            stream_index += streamed_span_pages;
             if (graph_planned) {
+                for (uint32_t page = 0; page < streamed_span_pages; ++page) {
+                    kv_stream_graph_release(
+                        transfer_ring, chunks[chunk + page].request_index, ctx.stream());
+                }
                 kv_stream_graph_fill_free_slots(transfer_ring);
+            } else {
+                for (uint32_t page = 0; page < streamed_span_pages; ++page) {
+                    CUDA_CHECK(cudaEventRecord(
+                        transfer_ring->consumed[chunks[chunk + page].slot], ctx.stream()));
+                }
+                // Refill exactly the consumed pages so freed slots are reused
+                // one to one and no batch ever waits on a live consumer.
+                size_t remaining = streamed_span_pages;
+                while (remaining > 0 && stream_index < streamed_chunks.size()) {
+                    const size_t got = schedule_streamed_batch(stream_index, remaining);
+                    stream_index += got;
+                    remaining -= got;
+                }
             }
             chunk += int(streamed_span_pages) - 1;
         }

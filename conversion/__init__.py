@@ -17,6 +17,7 @@ __all__ = [
 
 
 TEXT_MODEL_MAP: dict[str, str] = {
+    "FishOmniBackboneForCausalLM": "fish_omni",
     "AfmoeForCausalLM": "afmoe",
     "AgnesForConditionalGeneration": "agnes",
     "LagunaForCausalLM": "laguna",
