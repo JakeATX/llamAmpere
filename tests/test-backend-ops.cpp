@@ -9345,6 +9345,7 @@ struct test_moe_onechain_fill : public test_case {
     test_moe_onechain_fill(ggml_type bank_type, ggml_type base_type, bool b, int64_t m, int64_t n, int64_t k)
         : bank_type(bank_type), base_type(base_type), b(b), m(m), n(n), k(k) {}
     std::string op_desc(ggml_tensor *) override { return "MOE_ONECHAIN_FILL"; }
+    bool handles_skipped_ids() override { return true; } // cold slots are -1 bank ids on purpose
     std::string vars() override { return VARS_TO_STR6(bank_type, base_type, b, m, n, k); }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -9428,6 +9429,7 @@ struct test_mul_mat_id_ai4 : public test_mul_mat_id {
                (skip ? ",skip=" + std::to_string(skip) : "");
     }
 
+    bool handles_skipped_ids() override { return skip != 0; } // skip = 1 writes -1 ids on purpose
     void apply_skip(std::vector<int32_t> & v, int64_t ne0, int64_t ne1) const {
         if (!skip) {
             return;
