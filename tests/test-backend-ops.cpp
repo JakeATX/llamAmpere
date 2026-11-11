@@ -20776,6 +20776,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 300, true));
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 16, 2));
     }
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12, 16, 4, 2, 200)); // GQA 4, 12 rows
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12,  4, 4, 2, 200)); // GQA 1, 12 rows
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 16, 4,  2,  200)); // GQA 4
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(2,  4, 4,  2,  200)); // GQA 1
     // prefill ubatches: query rows tiled in ncols1 blocks (stream-k fixup across jt), all GQA classes

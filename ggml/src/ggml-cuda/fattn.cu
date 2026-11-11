@@ -4709,7 +4709,9 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
     const ggml_tensor * mask = dst->src[3];
     const int64_t n_q = Q->ne[1];
     if (n_q <= SJ_KVARN_ROWSPLIT_CHUNK || n_q > SJ_KVARN_ROWSPLIT_MAX || mask == nullptr || mask->ne[1] < n_q ||
-            Q->ne[3] != 1 || dst->ne[3] != 1 || dst->ne[2] != n_q || mask->ne[2] != 1 || mask->ne[3] != 1) {
+            Q->ne[3] != 1 || dst->ne[3] != 1 || dst->ne[2] != n_q || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            ggml_get_op_params_i32(dst, 6) % FATTN_KQ_STRIDE != 0 || Q->nb[1] % 16 != 0) {
+        // the last two: the decode kernel contract that ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2 asserts
         return false;
     }
     ggml_tensor m16;
@@ -4731,8 +4733,9 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
 
 static void ggml_cuda_fattn_sj_kvarn_rowsplit_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t n_q = dst->src[0]->ne[1];
-    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
-    if (!logged.test_and_set()) { // proof of route for the gate logs (first node only)
+    static std::atomic<uint32_t> logged{0}; // proof of route for the gate logs: once per distinct width 9..16
+    const uint32_t bit = 1u << (n_q & 31);
+    if (!(logged.fetch_or(bit) & bit)) {
         GGML_LOG_WARN("%s: GGML_SJKVARN_ROWSPLIT=1: SJ-KVaRN 4/4 row split on (%d query rows in chunks of %d)\n",
                 __func__, (int) n_q, (int) SJ_KVARN_ROWSPLIT_CHUNK);
     }
