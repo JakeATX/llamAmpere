@@ -4,6 +4,7 @@
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
 #include "magic2-v2.cuh"
+#include "aif25-mmq.cuh"
 #include "../ggml-aif25.h"
 #include "rpb-knobs.h"
 #include "quantize.cuh"
@@ -2732,35 +2733,6 @@ static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales,
     }
 }
 
-// false when the tile/strip setting is not one of the built variants or N needs more than 65535 token tiles
-template <int XSH>
-static bool aif25_mmq(int tile, int strips, const uint8_t * w, const int8_t * q, const float * scales, float * y,
-                      int M, int K, int64_t N, cudaStream_t stream) {
-    const int64_t gy = (N + tile - 1) / tile;
-    if ((strips != 1 && strips != 2) || (tile != 32 && tile != 64 && tile != 128) || (tile == 128 && strips != 1)) {
-        static std::atomic<bool> warned{false};
-        if (!warned.exchange(true)) {
-            GGML_LOG_WARN("[AIF25_MMQ] tile=%d strips=%d is not a built variant (32/64/128 with 1 strip, 32/64 with 2); using mmv\n",
-                    tile, strips);
-        }
-        return false;
-    }
-    if (gy > 65535 || N > INT32_MAX) {
-        return false;
-    }
-    const dim3 grid((unsigned) ((M/16 + strips - 1)/strips), (unsigned) gy);
-#define AIF25_MMQ_LAUNCH(NB, S) \
-    magic2::mmq<5,2,AIF25_MUL,XSH,NB,S><<<grid,128*(S),0,stream>>>(w, q, scales, y, M, K, (int) N)
-    if (strips == 2) {
-        if (tile == 32) { AIF25_MMQ_LAUNCH(4, 2); } else { AIF25_MMQ_LAUNCH(8, 2); }
-    } else {
-        if (tile == 32) { AIF25_MMQ_LAUNCH(4, 1); } else if (tile == 64) { AIF25_MMQ_LAUNCH(8, 1); } else { AIF25_MMQ_LAUNCH(16, 1); }
-    }
-#undef AIF25_MMQ_LAUNCH
-    CUDA_CHECK(cudaGetLastError());
-    return true;
-}
-
 static __global__ void k_aif25_bits_differ(const float * __restrict__ a, const float * __restrict__ b, const int64_t n,
                                            unsigned long long * __restrict__ count) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -2786,8 +2758,7 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     float * y = (float *) dst->data;
     const int tile = aif25_mmq_tile();
     if (tile > 0 && N >= aif25_mmq_min() &&
-            (xsh ? aif25_mmq<1>(tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)
-                 : aif25_mmq<0>(tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream))) {
+            ggml_cuda_aif25_mmq(xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (aif25_mmq_check()) {
             CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
