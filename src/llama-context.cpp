@@ -10567,6 +10567,29 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
                     __func__, params.sj_kvarn_sink, params.sj_kvarn_tail);
             return nullptr;
         }
+    }
+
+    // LSA (opt-in, lossy): refuse, before anything is allocated, a cache LSA cannot serve or a sub-feature that would
+    // silently do nothing on it (llama_lsa_check_cache); the edge tier of a tiered SJ-KVaRN body is checked too. MTP
+    // draft contexts are not checked: the draft layer has no map, so LSA never runs there
+    if (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        const bool sj = params.sj_kvarn_bits_k > 0 || params.sj_kvarn_bits_v > 0;
+        std::string why = llama_lsa_check_cache(params.sj_kvarn_bits_k, params.sj_kvarn_bits_v, params.sj_kvarn_body_type,
+                params.type_k, params.type_v);
+        if (why.empty() && sj && params.sj_kvarn_edge_layers > 0) {
+            why = llama_lsa_check_cache(params.sj_kvarn_edge_bits_k, params.sj_kvarn_edge_bits_v,
+                    params.sj_kvarn_edge_body_type, params.type_k, params.type_v);
+            if (!why.empty()) {
+                why = "edge tier: " + why;
+            }
+        }
+        if (!why.empty()) {
+            LLAMA_LOG_ERROR("%s: LSA refused for this KV cache: %s\n", __func__, why.c_str());
+            return nullptr;
+        }
+    }
+    // (after the LSA check, so a refusal reports the LSA reason first)
+    if (params.sj_kvarn_bits_k > 0 || params.sj_kvarn_bits_v > 0) {
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
                 continue;

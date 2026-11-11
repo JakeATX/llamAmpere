@@ -82,6 +82,7 @@ const llama_lsa_config & llama_lsa_cfg() {
         c.max_rows  = lsa_env_i64("LLAMA_LSA_MAX_ROWS",  c.max_rows);
         c.min_pos   = lsa_env_i64("LLAMA_LSA_MIN_POS",   c.min_pos);
         c.fa_sparse = lsa_env_i64("LLAMA_LSA_FA_SPARSE", 0) != 0;
+        c.gather    = lsa_env_i64("LLAMA_LSA_GATHER",    0) != 0;
         c.shared    = lsa_env_i64("LLAMA_LSA_SHARED",    0) != 0;
         c.shared_max = lsa_env_i64("LLAMA_LSA_SHARED",   0) == 2;
         c.shared_union = lsa_env_i64("LLAMA_LSA_SHARED", 0) == 3;
@@ -242,7 +243,7 @@ static std::string llama_lsa_describe_cfg(const llama_lsa_config & c) {
        << " topp=" << c.topp << " topp_tau=" << c.topp_tau << " topp_min=" << c.topp_min << " stats=" << (c.stats ? 1 : 0) << " recall=" << (c.recall ? 1 : 0)
        << " spec_recall=" << (c.spec_recall ? 1 : 0)
        << " j3=" << (c.j3 ? 1 : 0) << " j3_a3=" << c.j3_a3 << " j3_a1=" << c.j3_a1 << " j3_prev=" << (c.j3_prev ? 1 : 0)
-       << " j3_first=" << c.j3_first << " map=" << c.map_path;
+       << " j3_first=" << c.j3_first << (c.gather ? " gather=1" : "") << " map=" << c.map_path;
     return os.str();
 }
 
@@ -316,6 +317,71 @@ bool llama_lsa_graph_reuse_on() {
                 c.score_log.empty() && c.resident <= 0.0 && !c.resident_auto;
     }();
     return on;
+}
+
+std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type body, ggml_type type_k, ggml_type type_v) {
+    const auto & c = llama_lsa_cfg();
+    if (c.mode == llama_lsa_config::OFF) {
+        return {};
+    }
+    const bool sj = bits_k > 0 || bits_v > 0;
+    const bool resident = c.resident > 0.0 || c.resident_auto || c.resident_mib > 0.0;
+    // plain K types the LSA probe scores (llama-graph.cpp lsa_k_plain); V any plain type the FA node takes
+    const auto k_plain = [](ggml_type t) {
+        return t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_F32 || t == GGML_TYPE_Q8_0 ||
+               t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q4_1 ||
+               t == GGML_TYPE_IQ4_NL;
+    };
+    const auto gather_ok = [](ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0; };
+    if (c.gather && (sj || !gather_ok(type_k) || !gather_ok(type_v) || c.comp || c.fa_sparse || c.per_head || c.fast ||
+            c.block_sum || c.rec_blk || c.refine > 0)) {
+        return "LLAMA_LSA_GATHER=1 is for plain f16/q8_0 K and V with the per-cell pick only (not with LLAMA_LSA_COMP, "
+               "FA_SPARSE, PER_HEAD, FAST, BLOCK_SUM, REC_BLK or REFINE: those picks never reach the gather)";
+    }
+    if (sj && c.fa_sparse) {
+        return "LLAMA_LSA_FA_SPARSE is for plain K/V (an SJ-KVaRN node ignores the sparse bound)";
+    }
+    if (!sj) {
+        if (!k_plain(type_k) || !k_plain(type_v)) {
+            return std::string("plain K/V cache ") + ggml_type_name(type_k) + "/" + ggml_type_name(type_v) +
+                   " (LSA scores plain f16/bf16/f32/q8_0/q5/q4/iq4_nl caches, SJ-KVaRN 3/2t, 3/3t and 4/4 scalar)";
+        }
+        if (resident || c.j3) {
+            return "LLAMA_LSA_RESIDENT / LLAMA_LSA_J3 need an SJ-KVaRN body (a plain cache has no record pages)";
+        }
+        if (c.sj_compact) {
+            return "LLAMA_LSA_SJ_COMPACT needs an SJ-KVaRN body";
+        }
+        if (c.sj_skip) {
+            LLAMA_LOG_WARN("%s: LLAMA_LSA_SJ_SKIP has no effect on a plain cache (the pick still applies)\n", __func__);
+        }
+        return {};
+    }
+    const bool trellis = body == GGML_TYPE_I16;
+    const bool lb  = trellis && bits_k == 3 && (bits_v == 2 || bits_v == 3);
+    const bool s44 = body == GGML_TYPE_F32 && bits_k == 4 && bits_v == 4;
+    if (!lb && !s44) {
+        return "SJ-KVaRN " + std::to_string(bits_k) + "/" + std::to_string(bits_v) + (trellis ? " trellis" :
+               body == GGML_TYPE_F32 ? " scalar" : " turbo4") +
+               " body (LSA runs on SJ-KVaRN 3/2t, 3/3t and 4/4 scalar, plain f16 and q8_0)";
+    }
+    if (!c.idx_cache || c.fast || (c.mode != llama_lsa_config::KEY && c.mode != llama_lsa_config::POS)) {
+        return "SJ-KVaRN needs LLAMA_LSA_IDX_CACHE=1, mode key or pos, and no LLAMA_LSA_FAST (else every layer would "
+               "stay dense)";
+    }
+    if (lb && (c.per_head || c.sj_compact)) {
+        return "LLAMA_LSA_PER_HEAD / LLAMA_LSA_SJ_COMPACT are 4/4 scalar only (on 3/2t and 3/3t use "
+               "GGML_SJKVARN_TILE_SKIP=1)";
+    }
+    if (lb && c.sj_skip) {
+        // the 8 GB presets set it; on the low-bit tile kernel it skips nothing, the pick still applies
+        LLAMA_LOG_WARN("%s: LLAMA_LSA_SJ_SKIP has no effect on SJ-KVaRN %u/%u trellis (GGML_SJKVARN_TILE_SKIP=1 skips "
+                       "dead tiles there)\n", __func__, bits_k, bits_v);
+    }
+    if (s44 && c.j3) {
+        return "LLAMA_LSA_J3 needs record pages (SJ-KVaRN 3/2t or 3/3t); the 4/4 scalar body keeps 16-cell strips";
+    }
+    return {};
 }
 
 std::string llama_lsa_describe() {

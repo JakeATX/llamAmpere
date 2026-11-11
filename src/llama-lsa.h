@@ -41,6 +41,8 @@ struct llama_lsa_config {
     int64_t     max_rows  = 16;     // LLAMA_LSA_MAX_ROWS: ubatches with more rows stay dense (prefill)
     int64_t     min_pos   = 0;      // LLAMA_LSA_MIN_POS: ubatches starting before this position stay dense
     bool        fa_sparse = false;  // LLAMA_LSA_FA_SPARSE: pass the kept count to FA (n_kv_max) for its sparse path
+    bool        gather    = false;  // LLAMA_LSA_GATHER=1 (opt-in, plain f16/q8_0 K/V only): FA copies the union of the kept
+                                    // cells into a compact K/V/mask and runs the normal kernel on it (exact vs the mask)
     bool        shared    = false;  // LLAMA_LSA_SHARED: one long-range pick per ubatch (summed row scores), not per row
     bool        shared_max = false; // LLAMA_LSA_SHARED=2 (block pick only): rank blocks by their best row's normalized
                                     // log share instead of the summed scores (FUSED_SEL: select op mode 2; else graph chain)
@@ -335,6 +337,13 @@ void llama_lsa_idx_state_read(llama_io_read_i & io);
 
 // one-line summary for the log
 std::string llama_lsa_describe();
+
+// Startup check of the LSA config against the KV cache (llama_init_from_model refuses the context when it fails).
+// LSA runs on SJ-KVaRN 3/2 and 3/3 trellis bodies, SJ-KVaRN 4/4 scalar bodies and plain f16 / q8_0 K and V; every
+// other cache, and every sub-feature that would silently do nothing on the cache it was given, is refused here.
+// bits_k == 0 means a plain cache (type_k / type_v); body = resolved SJ-KVaRN body codec (F32 scalar, I16 trellis).
+// Returns an empty string when the combination is supported, else the reason.
+std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type body, ggml_type type_k, ggml_type type_v);
 
 // One-shot LSA log lines ("... active", "... stays off"): the first graphs are built inside the server's memory-fit
 // dry run, whose logger drops WARN, so a plain static flag spent its line there and server.log never showed it (the
