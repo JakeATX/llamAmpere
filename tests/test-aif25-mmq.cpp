@@ -1,12 +1,15 @@
 // [PP27] AIF25_U exact prompt kernel (magic2::mmq) against the 8-token kernel (magic2::mmv), on the GPU.
 // Runs dense AIF25_U MUL_MATs at prompt widths with GGML_CUDA_AIF25_MMQ_CHECK=2, so the backend runs both kernels on
 // every qualifying call and aborts if any output differs in any bit; the test then checks that every expected call was
-// checked and that the outputs are finite and not all zero. Tile and strips come from the environment
-// (GGML_CUDA_AIF25_MMQ, default 64; GGML_CUDA_AIF25_MMQ_STRIPS, default 1); the minimum width is set to 9 unless given.
+// checked, and compares three 16-row slabs of every output with a CPU reference (aif25_dequantize_slab, double sums):
+// NMSE <= 1e-3. Tile and strips come from the environment (GGML_CUDA_AIF25_MMQ, default 64; GGML_CUDA_AIF25_MMQ_STRIPS,
+// default 1); the minimum width is set to 9 unless given. With GGML_CUDA_AIF25_PP_MIN_N > 0 the lossy fp16 path takes the
+// prompt widths instead: no bit check is expected and only the CPU reference applies.
 // Exit 0 = pass, 1 = fail, 77 = no CUDA device.
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-aif25.h"
 
 #include <cmath>
 #include <cstdio>
@@ -35,6 +38,8 @@ int main() {
     setenv("GGML_CUDA_AIF25_MMQ_MIN", "9", 0);
     setenv("GGML_CUDA_AIF25_MMQ_CHECK", "2", 1);
     const int min_n = std::atoi(std::getenv("GGML_CUDA_AIF25_MMQ_MIN"));
+    const char * pp_env = std::getenv("GGML_CUDA_AIF25_PP_MIN_N");
+    const int pp_min = pp_env ? std::atoi(pp_env) : 0;
     ggml_log_set(log_cb, nullptr);
     ggml_backend_load_all();
     ggml_backend_dev_t dev = ggml_backend_dev_by_name("CUDA0");
@@ -99,7 +104,7 @@ int main() {
         const int before = g_checked;
         ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS && ok;
         ggml_backend_synchronize(backend);
-        const int want = s.n >= min_n ? 1 : 0;
+        const int want = s.n >= min_n && !(pp_min > 0 && s.n >= pp_min) ? 1 : 0;
         expected += want;
         std::vector<float> yb(ggml_nelements(y));
         ggml_backend_tensor_get(y, yb.data(), 0, ggml_nbytes(y));
@@ -108,17 +113,36 @@ int main() {
             finite = finite && std::isfinite(v);
             nonzero = nonzero || v != 0.0f;
         }
-        const bool pass = finite && nonzero && g_checked - before == want;
-        std::fprintf(stderr, "M=%lld K=%lld N=%lld checks=%d (want %d) finite=%d nonzero=%d %s\n", (long long) s.m,
-                (long long) s.k, (long long) s.n, g_checked - before, want, finite, nonzero, pass ? "OK" : "FAIL");
+        // CPU reference on three slabs (first, middle, last): W rows dequantized and unrotated, double sums
+        double err = 0.0, ref2 = 0.0;
+        const int64_t slab_bytes = s.k / 128 * AIF25_UNIT_BYTES, n_slabs = s.m / 16;
+        std::vector<float> wr(16 * s.k);
+        for (int64_t sl : { (int64_t) 0, n_slabs / 2, n_slabs - 1 }) {
+            aif25_dequantize_slab(wb.data() + sl * slab_bytes, wr.data(), s.k);
+            for (int64_t t = 0; t < s.n; ++t) {
+                for (int r = 0; r < 16; ++r) {
+                    double acc = 0.0;
+                    for (int64_t k = 0; k < s.k; ++k) {
+                        acc += (double) wr[r * s.k + k] * xb[t * s.k + k];
+                    }
+                    const double e = yb[t * s.m + sl * 16 + r] - acc;
+                    err += e * e;
+                    ref2 += acc * acc;
+                }
+            }
+        }
+        const double nmse = ref2 > 0.0 ? err / ref2 : 1.0;
+        const bool pass = finite && nonzero && g_checked - before == want && nmse <= 1e-3;
+        std::fprintf(stderr, "M=%lld K=%lld N=%lld checks=%d (want %d) finite=%d nonzero=%d nmse=%.3g %s\n", (long long) s.m,
+                (long long) s.k, (long long) s.n, g_checked - before, want, finite, nonzero, nmse, pass ? "OK" : "FAIL");
         ok = ok && pass;
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
     }
     ggml_backend_free(backend);
     ok = ok && g_bad == 0 && g_checked == expected;
-    std::fprintf(stderr, "test-aif25-mmq: tile=%s strips=%s min=%d: %d of %d expected calls checked bit-identical, %d differ: %s\n",
+    std::fprintf(stderr, "test-aif25-mmq: tile=%s strips=%s min=%d pp_min=%d: %d of %d expected calls checked bit-identical, %d differ: %s\n",
             std::getenv("GGML_CUDA_AIF25_MMQ"), std::getenv("GGML_CUDA_AIF25_MMQ_STRIPS") ? std::getenv("GGML_CUDA_AIF25_MMQ_STRIPS") : "1",
-            min_n, g_checked, expected, g_bad, ok ? "PASS" : "FAIL");
+            min_n, pp_min, g_checked, expected, g_bad, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
