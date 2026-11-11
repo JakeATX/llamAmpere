@@ -4677,6 +4677,9 @@ static ggml_tensor * build_attn_scale_kv_output(
 // op, so the scheduler copies the tiny tensor over each step (probe only). Logs the running kept share at WARN level
 // (llama-server filters libllama INFO) every 256 calls of a layer.
 // LLAMA_LSA_DUMP: write one tensor of one layer as raw f32 (once per layer and tensor), plus a line in <prefix>.index.txt
+static const char * const lsa_dump_names[] = {"q", "k", "v", "score", "mask", "cell_pos", "q_pos"};
+static std::atomic<bool> lsa_dump_done[256][7];
+
 // v0.7 keeps the K/V rotations per layer; LSA keeps its per-cache rule: any rotated layer keeps the whole cache dense
 static bool llama_lsa_any_rot(const std::vector<ggml_tensor *> & rot) {
     for (const ggml_tensor * t : rot) {
@@ -4686,8 +4689,6 @@ static bool llama_lsa_any_rot(const std::vector<ggml_tensor *> & rot) {
     }
     return false;
 }
-static const char * const lsa_dump_names[] = {"q", "k", "v", "score", "mask", "cell_pos", "q_pos"};
-static std::atomic<bool> lsa_dump_done[256][7];
 
 // LLAMA_LSA_RESIDENT_STICKY (opt-in): hand a select node the layer's page body (src 7) and SJ-KVaRN desc (src 8),
 // the bonus (param 10) and the cells per scored element (param 11); the CUDA select adds the bonus to units whose
