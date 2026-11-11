@@ -139,8 +139,22 @@ uint32_t llama_hparams::n_embd_out() const {
     return n_embd_out_impl > 0 ? n_embd_out_impl : n_embd;
 }
 
+// The fused kernels use matching widths. Compact projections are padded after normalization.
+static uint32_t mix_attn_cache_dim(uint32_t dk, uint32_t dv) {
+    const uint32_t d = std::max(dk, dv);
+    for (uint32_t width : {64u, 80u, 96u, 112u, 128u, 256u, 512u}) {
+        if (d <= width) {
+            return width;
+        }
+    }
+    GGML_ABORT("unsupported mixed attention width");
+}
+
 uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
     if (il < n_layer_all) {
+        if (mix_enabled && (mix_attn_k_dim[il] != n_embd_head_k_full || mix_attn_v_dim[il] != n_embd_head_v_full)) {
+            return mix_attn_cache_dim(mix_attn_k_dim[il], mix_attn_v_dim[il]);
+        }
         return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full;
     }
 
@@ -149,6 +163,9 @@ uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
 
 uint32_t llama_hparams::n_embd_head_v(uint32_t il) const {
     if (il < n_layer_all) {
+        if (mix_enabled && (mix_attn_k_dim[il] != n_embd_head_k_full || mix_attn_v_dim[il] != n_embd_head_v_full)) {
+            return mix_attn_cache_dim(mix_attn_k_dim[il], mix_attn_v_dim[il]);
+        }
         return is_swa(il) ? n_embd_head_v_swa : n_embd_head_v_full;
     }
 
@@ -207,7 +224,26 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
     return val;
 }
 
-uint32_t llama_hparams::n_embd_r() const {
+uint32_t llama_hparams::ssm_state_dim_l(uint32_t il) const {
+    if (!mix_enabled || il >= n_layer_all) {
+        return ssm_d_state;
+    }
+    const uint32_t width = std::max(ssm_k_dim_l(il), ssm_v_dim_l(il));
+    uint32_t padded = 16;
+    while (padded < width) {
+        padded *= 2;
+    }
+    return padded;
+}
+
+uint32_t llama_hparams::ssm_d_inner_l(uint32_t il) const {
+    if (mix_enabled && il < n_layer_all && is_recr(il)) {
+        return mix_ssm_v_heads[il] * ssm_v_dim_l(il);
+    }
+    return ssm_d_inner;
+}
+
+uint32_t llama_hparams::n_embd_r(uint32_t il) const {
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;
@@ -228,14 +264,14 @@ uint32_t llama_hparams::n_embd_r() const {
     // TODO: maybe support other convolution strides than 1
     // NOTE: since the first column of the conv_state is shifted out each time, it's not actually needed
     // Corresponds to Mamba's conv_states size
-    const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
+    const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner_l(il) + 2*ssm_k_heads_l(il)*ssm_k_dim_l(il));
 
     // PLE conv history needs its own row: Meta splits cache_r_l by head, so a history packed behind the first is unaddressable
     // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module
     return n_conv;
 }
 
-uint32_t llama_hparams::n_embd_s() const {
+uint32_t llama_hparams::n_embd_s(uint32_t il) const {
     if (wkv_head_size != 0) {
         // corresponds to RWKV's wkv_states size
         return n_embd * wkv_head_size;
@@ -255,8 +291,13 @@ uint32_t llama_hparams::n_embd_s() const {
         return n_embd_head_la * n_embd_head_la * n_head();  // 128 * 128 * 64 = 1048576
     }
 
+    if (mix_enabled && il < n_layer_all) {
+        const uint32_t d = ssm_state_dim_l(il);
+        return d * d * mix_ssm_v_heads[il];
+    }
+
     // corresponds to Mamba's ssm_states size
-    return ssm_d_state * ssm_d_inner;
+    return ssm_d_state * ssm_d_inner_l(il);
 }
 
 int32_t llama_gdn_ingr_emit_mode() {
@@ -267,7 +308,7 @@ int32_t llama_gdn_ingr_emit_mode() {
     return mode;
 }
 
-uint32_t llama_hparams::n_embd_s_ingredient() const {
+uint32_t llama_hparams::n_embd_s_ingredient(uint32_t il) const {
     // per-token ingredients (k, v, g, beta) instead of a full [S_v, S_v, H_v] state -- see
     // ggml_gated_delta_net's emit_mode 1/2 output contract (ggml.h). Mirrors n_embd_s()'s
     // branches, but returns 0 for wkv (RWKV's recurrence is not a delta-net rank-1 update, so
@@ -277,6 +318,10 @@ uint32_t llama_hparams::n_embd_s_ingredient() const {
     }
 
     const int32_t mode = llama_gdn_ingr_emit_mode();
+    if (mix_enabled && il < n_layer_all) {
+        return (uint32_t) ggml_gated_delta_net_ingr_width(ssm_state_dim_l(il), 1, mode) * mix_ssm_v_heads[il];
+    }
+
 
     if (n_embd_head_kda != 0) {
         // Kimi KDA layers: per-channel gate, head_dim wide (see n_embd_s()'s KDA branch above).
@@ -287,10 +332,11 @@ uint32_t llama_hparams::n_embd_s_ingredient() const {
     // ssm_d_inner by construction (see build_layer_attn_linear), and S_k == S_v is already
     // required by ggml_gated_delta_net, so 4 * S_v * H_v simplifies to 4 * ssm_d_inner. The
     // gate is one scalar per head, S_v = ssm_d_state.
-    if (mode == 2 && ssm_d_state != 0 && ssm_d_inner % ssm_d_state == 0) {
-        return (uint32_t) ggml_gated_delta_net_ingr_width(ssm_d_state, 1, mode) * (ssm_d_inner / ssm_d_state);
+    const uint32_t d_inner = ssm_d_inner_l(il);
+    if (mode == 2 && ssm_d_state != 0 && d_inner % ssm_d_state == 0) {
+        return (uint32_t) ggml_gated_delta_net_ingr_width(ssm_d_state, 1, mode) * (d_inner / ssm_d_state);
     }
-    return 4 * ssm_d_inner;
+    return 4 * d_inner;
 }
 
 bool llama_hparams::is_recr(uint32_t il) const {

@@ -112,6 +112,25 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
 
+    // mixed-shape pruned models (ngprune, qwen35 only): per-layer sublayer shapes. Unused (mix_enabled == false) for every
+    // other model, in which case all the per-layer accessors below return the global values.
+    // kind: 0 = removed (sublayer absent), 1 = full (reads/writes the residual directly), 2 = rank (own read/write
+    // matmuls around the sublayer, norm kept), 3 = span (read/write shared across the layers of a span, no norm weight)
+    enum : uint32_t { MIX_REMOVED = 0, MIX_FULL = 1, MIX_RANK = 2, MIX_SPAN = 3 };
+    bool mix_enabled = false;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_ssm_v_heads;     // GDN value heads kept in this layer
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_ssm_k_heads{};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_ssm_k_dim{};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_ssm_v_dim{};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_attn_k_dim{};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_attn_v_dim{};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_mixer_kind;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_mlp_kind;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_mixer_width;     // in/out width of the mixer: n_embd (full), k (rank), w (span)
+    std::array<uint32_t, LLAMA_MAX_LAYERS> mix_mlp_width;
+    std::array<int32_t,  LLAMA_MAX_LAYERS> mix_mixer_span;      // span id, or -1
+    std::array<int32_t,  LLAMA_MAX_LAYERS> mix_mlp_span;
+
     // per-layer expert feed-forward size
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_exp_arr;
     // per-layer top-k expert routing count
@@ -509,15 +528,27 @@ struct llama_hparams {
 
     // dimension of the rolling state embeddings
     // corresponds to Mamba's conv_states size or RWKV's token_shift states size
-    uint32_t n_embd_r() const;
+    // il = UINT32_MAX (default): the model-wide value; a layer index selects the per-layer value of a mixed-shape model
+    uint32_t n_embd_r(uint32_t il = UINT32_MAX) const;
 
     // dimension of the recurrent state embeddings
-    uint32_t n_embd_s() const;
+    uint32_t n_embd_s(uint32_t il = UINT32_MAX) const;
+
+    // GDN inner size (value heads * head dim) of layer il; ssm_d_inner unless a mixed-shape model cut this layer
+    uint32_t ssm_k_heads_l(uint32_t il) const { return mix_enabled && il < n_layer_all ? mix_ssm_k_heads[il] : ssm_n_group; }
+    uint32_t ssm_k_dim_l(uint32_t il) const { return mix_enabled && il < n_layer_all ? mix_ssm_k_dim[il] : ssm_d_state; }
+    uint32_t ssm_v_dim_l(uint32_t il) const { return mix_enabled && il < n_layer_all ? mix_ssm_v_dim[il] : ssm_d_state; }
+    uint32_t ssm_state_dim_l(uint32_t il) const;
+    uint32_t ssm_d_inner_l(uint32_t il) const;
+
+    // mixed-shape models: sublayer kinds (always MIX_FULL when mix_enabled is false)
+    uint32_t mixer_kind(uint32_t il) const { return mix_enabled && il < n_layer_all ? mix_mixer_kind[il] : (uint32_t) MIX_FULL; }
+    uint32_t mlp_kind  (uint32_t il) const { return mix_enabled && il < n_layer_all ? mix_mlp_kind  [il] : (uint32_t) MIX_FULL; }
 
     // dimension of one ggml_gated_delta_net ingredient slot in the layout llama_gdn_ingr_emit_mode()
     // selects: emit_mode 1 = 4 rows of head_dim (k/v/g/beta), emit_mode 2 = k, v, g, beta stored
     // once per head [#63] -- only meaningful for GDN/KDA-style layers.
-    uint32_t n_embd_s_ingredient() const;
+    uint32_t n_embd_s_ingredient(uint32_t il = UINT32_MAX) const;
 
     uint32_t n_pos_per_embd() const;
 

@@ -350,6 +350,18 @@ enum llm_kv {
     LLM_KV_ATTENTION_SHARED_KV_LAYERS,
     LLM_KV_ATTENTION_KV_SOURCE_MAP,
     LLM_KV_ATTENTION_RECURRENT_LAYERS,
+    LLM_KV_MIX_SSM_V_HEADS,
+    LLM_KV_MIX_SSM_K_HEADS,
+    LLM_KV_MIX_SSM_K_DIM,
+    LLM_KV_MIX_SSM_V_DIM,
+    LLM_KV_MIX_ATTN_K_DIM,
+    LLM_KV_MIX_ATTN_V_DIM,
+    LLM_KV_MIX_MIXER_KIND,
+    LLM_KV_MIX_MLP_KIND,
+    LLM_KV_MIX_MIXER_WIDTH,
+    LLM_KV_MIX_MLP_WIDTH,
+    LLM_KV_MIX_MIXER_SPAN,
+    LLM_KV_MIX_MLP_SPAN,
     LLM_KV_HYPER_CONNECTION_COUNT,
     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
     LLM_KV_HYPER_CONNECTION_EPSILON,
@@ -679,6 +691,16 @@ enum llm_tensor {
     LLM_TENSOR_SSM_F_A,             // kimi: forget gate projection A
     LLM_TENSOR_SSM_F_B,             // kimi: forget gate projection B
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
+    // mixed-shape pruned qwen3.5 (ngprune): rank/span read and write ramps, head index maps
+    LLM_TENSOR_MIX_MIXER_READ,
+    LLM_TENSOR_MIX_MIXER_WRITE,
+    LLM_TENSOR_MIX_MLP_READ,
+    LLM_TENSOR_MIX_MLP_WRITE,
+    LLM_TENSOR_MIX_SPAN_READ,
+    LLM_TENSOR_MIX_SPAN_WRITE,
+    LLM_TENSOR_MIX_SSM_KEY_IDX,
+    LLM_TENSOR_MIX_ATTN_Q_PAD_IDX,
+    LLM_TENSOR_MIX_ATTN_Q_INV_IDX,
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
     LLM_TENSOR_SSM_G,               // kimi-k3: full-rank KDA gate

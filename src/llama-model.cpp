@@ -3894,11 +3894,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_CLOVER_MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
+                        // mixed-shape pruned models (hparams.mix_enabled): a removed mixer has no KV cache / recurrent state
                         filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                            return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.mixer_kind(il) != llama_hparams::MIX_REMOVED;
                         };
                         filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                            return il < hparams.n_layer() && hparams.is_recr(il) && hparams.mixer_kind(il) != llama_hparams::MIX_REMOVED;
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {

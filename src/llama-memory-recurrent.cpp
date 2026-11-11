@@ -193,13 +193,13 @@ llama_memory_recurrent::llama_memory_recurrent(
         // s: with gdn_replay, only the authoritative state is kept here (no widening); the
         // (1 + n_rs_seq)-wide K-snapshot storage this replaces moves to ingr_l below.
         const uint32_t n_rows_s = gdn_replay ? mem_size : mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows_r);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(i), n_rows_r);
         // with gdn_replay the state rows and the checkpoint rows share one tensor (s_l = plane 0,
         // s_ckpt_l = plane 1, same bytes as two tensors): one gather can then pick either row by
         // index, which the rollback-independent verify graph uses as its replay base
-        ggml_tensor * s_pair = gdn_replay ? ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), 2 * (int64_t) mem_size) : nullptr;
-        ggml_tensor * s = s_pair ? ggml_view_2d(ctx, s_pair, hparams.n_embd_s(), mem_size, s_pair->nb[1], 0)
-                                 : ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows_s);
+        ggml_tensor * s_pair = gdn_replay ? ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(i), 2 * (int64_t) mem_size) : nullptr;
+        ggml_tensor * s = s_pair ? ggml_view_2d(ctx, s_pair, hparams.n_embd_s(i), mem_size, s_pair->nb[1], 0)
+                                 : ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(i), n_rows_s);
         if (s_pair) {
             ggml_format_name(s_pair, "cache_s2_l%d", i);
         }
@@ -212,12 +212,12 @@ llama_memory_recurrent::llama_memory_recurrent(
             // one row per cell, n_rs_seq ingredient slots back to back (see the header). Always F32,
             // whatever type_s is: the replay reads the gathered ring with this tensor's element size
             // (llm_build_delta_net_base::build_recurrent_attn), and k/v/g/beta are op inputs, not state.
-            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq, mem_size);
+            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) hparams.n_embd_s_ingredient(i) * n_rs_seq, mem_size);
             ggml_format_name(ingr, "cache_ingr_l%d", i);
             ingr_l[i] = ingr;
 
             // oldest-edge-of-window checkpoint to replay from -- see the field comment in the header.
-            ggml_tensor * ckpt = ggml_view_2d(ctx, s_pair, hparams.n_embd_s(), mem_size, s_pair->nb[1], (size_t) mem_size * s_pair->nb[1]);
+            ggml_tensor * ckpt = ggml_view_2d(ctx, s_pair, hparams.n_embd_s(i), mem_size, s_pair->nb[1], (size_t) mem_size * s_pair->nb[1]);
             ggml_format_name(ckpt, "cache_s_ckpt_l%d", i);
             s_ckpt_l[i] = ckpt;
         }
@@ -1517,8 +1517,8 @@ bool llama_memory_recurrent::state_read_replay(llama_io_read_i & io, uint32_t ce
         uint64_t ingr_size_row_ref;
         io.read(&ckpt_size_row_ref, sizeof(ckpt_size_row_ref));
         io.read(&ingr_size_row_ref, sizeof(ingr_size_row_ref));
-        const size_t ckpt_size_row = ggml_row_size(s_ckpt_l[il]->type, hparams.n_embd_s());
-        const size_t ingr_size_row = ggml_row_size(ingr_l[il]->type, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq);
+        const size_t ckpt_size_row = ggml_row_size(s_ckpt_l[il]->type, hparams.n_embd_s(il));
+        const size_t ingr_size_row = ggml_row_size(ingr_l[il]->type, (int64_t) hparams.n_embd_s_ingredient(il) * n_rs_seq);
         if (ckpt_size_row != ckpt_size_row_ref || ingr_size_row != ingr_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched replay row sizes (layer %d)\n", __func__, il);
             return false;
@@ -1569,7 +1569,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         io.write(&r_type_i, sizeof(r_type_i));
 
         // Write row size of R tensor
-        const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+        const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r(il));
         io.write(&r_size_row, sizeof(r_size_row));
 
         // Write each logical cell row range. With pending recurrent rollback,
@@ -1602,7 +1602,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             io.write(&s_type_i, sizeof(s_type_i));
 
             // Write row size of S tensor
-            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s(il));
             io.write(&s_size_row, sizeof(s_size_row));
 
             // Write each logical cell row range. With pending recurrent rollback,
@@ -1622,7 +1622,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
 
-            const uint32_t n_embd_s = hparams.n_embd_s();
+            const uint32_t n_embd_s = hparams.n_embd_s(il);
 
             // Write S tensor type
             const int32_t s_type_i = (int32_t)s_l[il]->type;
@@ -1665,8 +1665,8 @@ void llama_memory_recurrent::state_write_replay(llama_io_write_i & io, const std
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (s_ckpt_l[il] == nullptr) continue;
 
-        const uint64_t ckpt_size_row = ggml_row_size(s_ckpt_l[il]->type, hparams.n_embd_s());
-        const uint64_t ingr_size_row = ggml_row_size(ingr_l[il]->type, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq);
+        const uint64_t ckpt_size_row = ggml_row_size(s_ckpt_l[il]->type, hparams.n_embd_s(il));
+        const uint64_t ingr_size_row = ggml_row_size(ingr_l[il]->type, (int64_t) hparams.n_embd_s_ingredient(il) * n_rs_seq);
         io.write(&ckpt_size_row, sizeof(ckpt_size_row));
         io.write(&ingr_size_row, sizeof(ingr_size_row));
 
@@ -1818,7 +1818,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         // Read row size of key
         uint64_t r_size_row_ref;
         io.read(&r_size_row_ref, sizeof(r_size_row_ref));
-        const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+        const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r(il));
         if (r_size_row != r_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched r row size (%zu != %zu, layer %d)\n", __func__, r_size_row, (size_t) r_size_row_ref, il);
             return false;
@@ -1862,7 +1862,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // Read row size of value
             uint64_t s_size_row_ref;
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s(il));
             if (s_size_row != s_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
                 return false;
@@ -1879,7 +1879,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // skip null layers
             if (s_l[il] == nullptr) continue;
 
-            const uint32_t n_embd_s = hparams.n_embd_s();
+            const uint32_t n_embd_s = hparams.n_embd_s(il);
 
             // Read type of value
             int32_t s_type_i_ref;
@@ -1939,12 +1939,12 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (r_l[il] != nullptr) {
-            const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r(il));
             llama_clear_tensor_data(r_l[il], cell_head * r_size_row, cell_count * r_size_row);
         }
 
         if (s_l[il] != nullptr) {
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s(il));
             llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
         }
 

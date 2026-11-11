@@ -42,6 +42,79 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // Mixed-shape pruned model (ngprune): per-layer GDN value heads, sublayer kinds, rank/span widths. All seven keys are
+    // present together; a plain Qwen3.5 file has none of them and takes none of the paths gated on hparams.mix_enabled.
+    {
+        const uint32_t nl = hparams.n_layer();
+        std::array<uint32_t, LLAMA_MAX_LAYERS> v_heads{}, mixer_kind{}, mlp_kind{}, mixer_width{}, mlp_width{}, mixer_span{}, mlp_span{};
+        if (ml.get_key_or_arr(LLM_KV_MIX_MIXER_KIND, mixer_kind, nl, false)) {
+            if (hparams.ssm_dt_rank == 0 || hparams.ssm_d_inner % hparams.ssm_dt_rank != 0) {
+                throw std::runtime_error("invalid mixed-shape GDN head count");
+            }
+            ml.get_key_or_arr(LLM_KV_MIX_SSM_V_HEADS,  v_heads,     nl, true);
+            ml.get_key_or_arr(LLM_KV_MIX_MLP_KIND,     mlp_kind,    nl, true);
+            ml.get_key_or_arr(LLM_KV_MIX_MIXER_WIDTH,  mixer_width, nl, true);
+            ml.get_key_or_arr(LLM_KV_MIX_MLP_WIDTH,    mlp_width,   nl, true);
+            ml.get_key_or_arr(LLM_KV_MIX_MIXER_SPAN,   mixer_span,  nl, true); // span id + 1, 0 = none
+            ml.get_key_or_arr(LLM_KV_MIX_MLP_SPAN,     mlp_span,    nl, true);
+
+            hparams.mix_ssm_k_heads.fill(hparams.ssm_n_group);
+            hparams.mix_ssm_k_dim.fill(hparams.ssm_d_state);
+            hparams.mix_ssm_v_dim.fill(hparams.ssm_d_inner / hparams.ssm_dt_rank);
+            hparams.mix_attn_k_dim.fill(hparams.n_embd_head_k_full);
+            hparams.mix_attn_v_dim.fill(hparams.n_embd_head_v_full);
+            ml.get_key_or_arr(LLM_KV_MIX_SSM_K_HEADS, hparams.mix_ssm_k_heads, nl, false);
+            ml.get_key_or_arr(LLM_KV_MIX_SSM_K_DIM, hparams.mix_ssm_k_dim, nl, false);
+            ml.get_key_or_arr(LLM_KV_MIX_SSM_V_DIM, hparams.mix_ssm_v_dim, nl, false);
+            ml.get_key_or_arr(LLM_KV_MIX_ATTN_K_DIM, hparams.mix_attn_k_dim, nl, false);
+            ml.get_key_or_arr(LLM_KV_MIX_ATTN_V_DIM, hparams.mix_attn_v_dim, nl, false);
+
+            hparams.mix_enabled = true;
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                const bool trunk = il < nl;
+                hparams.mix_ssm_v_heads[il] = trunk ? v_heads[il] : hparams.ssm_dt_rank;
+                hparams.mix_mixer_kind [il] = trunk ? mixer_kind [il] : (uint32_t) llama_hparams::MIX_FULL;
+                hparams.mix_mlp_kind   [il] = trunk ? mlp_kind   [il] : (uint32_t) llama_hparams::MIX_FULL;
+                hparams.mix_mixer_width[il] = trunk ? mixer_width[il] : hparams.n_embd;
+                hparams.mix_mlp_width  [il] = trunk ? mlp_width  [il] : hparams.n_embd;
+                hparams.mix_mixer_span [il] = trunk ? (int32_t) mixer_span[il] - 1 : -1;
+                hparams.mix_mlp_span   [il] = trunk ? (int32_t) mlp_span  [il] - 1 : -1;
+
+                if (hparams.mix_mixer_kind[il] != llama_hparams::MIX_REMOVED && (hparams.mix_ssm_k_heads[il] == 0 || hparams.mix_ssm_k_heads[il] > hparams.ssm_n_group ||
+                    hparams.mix_ssm_k_dim[il] == 0 || hparams.mix_ssm_k_dim[il] > hparams.ssm_d_state ||
+                    hparams.mix_ssm_v_dim[il] == 0 || hparams.mix_ssm_v_dim[il] > hparams.ssm_d_inner / hparams.ssm_dt_rank ||
+                    hparams.mix_attn_k_dim[il] < hparams.n_rot_full || hparams.mix_attn_k_dim[il] > hparams.n_embd_head_k_full ||
+                    hparams.mix_attn_v_dim[il] == 0 || hparams.mix_attn_v_dim[il] > hparams.n_embd_head_v_full ||
+                    hparams.mix_ssm_v_heads[il] > hparams.ssm_dt_rank)) {
+                    throw std::runtime_error(format("invalid mixed-shape head dimensions in layer %u", il));
+                }
+                if (hparams.mix_mixer_kind[il] > llama_hparams::MIX_SPAN || hparams.mix_mlp_kind[il] > llama_hparams::MIX_SPAN) {
+                    throw std::runtime_error(format("invalid mixed-shape sublayer kind in layer %u", il));
+                }
+                if (trunk) {
+                    for (bool mixer : {true, false}) {
+                        const uint32_t kind = mixer ? mixer_kind[il] : mlp_kind[il];
+                        const uint32_t width = mixer ? mixer_width[il] : mlp_width[il];
+                        const uint32_t span = mixer ? mixer_span[il] : mlp_span[il];
+                        if ((kind != llama_hparams::MIX_REMOVED && (width == 0 || width > hparams.n_embd)) ||
+                            (kind == llama_hparams::MIX_FULL && width != hparams.n_embd) || span > LLAMA_MAX_LAYERS) {
+                            throw std::runtime_error(format("invalid mixed-shape width or span in layer %u", il));
+                        }
+                    }
+                }
+                if (trunk && hparams.is_recr(il) && hparams.mix_mixer_kind[il] != llama_hparams::MIX_REMOVED && hparams.mix_ssm_v_heads[il] == 0) {
+                    throw std::runtime_error(format("mixed-shape layer %u has a GDN mixer with no value heads", il));
+                }
+                if (trunk && (hparams.mix_mixer_kind[il] == llama_hparams::MIX_SPAN) != (hparams.mix_mixer_span[il] >= 0)) {
+                    throw std::runtime_error(format("mixed-shape layer %u: mixer span id does not match its kind", il));
+                }
+                if (trunk && (hparams.mix_mlp_kind[il] == llama_hparams::MIX_SPAN) != (hparams.mix_mlp_span[il] >= 0)) {
+                    throw std::runtime_error(format("mixed-shape layer %u: mlp span id does not match its kind", il));
+                }
+            }
+        }
+    }
+
     switch (hparams.n_layer()) {
         case 24: type = hparams.n_embd == 1024 ? LLM_TYPE_0_8B : LLM_TYPE_2B; break;
         case 32: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_9B; break;
@@ -133,8 +206,136 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         }
     };
 
+    // Mixed-shape pruned layer (ngprune, hparams.mix_enabled): per-layer head / neuron counts, absent sublayers, rank and
+    // span read/write ramps. A full sublayer of this path has the same tensors as load_block_trunk() creates.
+    mix_span_read.clear();
+    mix_span_write.clear();
+
+    auto load_block_trunk_mix = [&](int il, int flags) {
+        auto & layer = layers[il];
+
+        const uint32_t mixer_kind = hparams.mixer_kind(il);
+        const uint32_t mlp_kind   = hparams.mlp_kind(il);
+
+        // the read/write ramps of a sublayer: a rank sublayer owns them, a span sublayer shares them with the layers of its
+        // span (created once, at the first layer that uses the span, so they sit on that layer's device)
+        auto load_ramps = [&](uint32_t kind, int32_t span, int64_t width, bool is_mixer) {
+            if (kind == llama_hparams::MIX_RANK) {
+                ggml_tensor * rd = create_tensor(tn(is_mixer ? LLM_TENSOR_MIX_MIXER_READ  : LLM_TENSOR_MIX_MLP_READ,  "weight", il), { n_embd, width }, flags);
+                ggml_tensor * wr = create_tensor(tn(is_mixer ? LLM_TENSOR_MIX_MIXER_WRITE : LLM_TENSOR_MIX_MLP_WRITE, "weight", il), { width, n_embd }, flags);
+                (is_mixer ? layer.mixer_read  : layer.mlp_read)  = rd;
+                (is_mixer ? layer.mixer_write : layer.mlp_write) = wr;
+            } else if (kind == llama_hparams::MIX_SPAN) {
+                GGML_ASSERT(span >= 0);
+                if ((size_t) span >= mix_span_read.size()) {
+                    mix_span_read .resize(span + 1, nullptr);
+                    mix_span_write.resize(span + 1, nullptr);
+                }
+                if (mix_span_read[span] == nullptr) {
+                    mix_span_read [span] = create_tensor(tn(LLM_TENSOR_MIX_SPAN_READ,  "weight", il, span), { n_embd, width }, flags);
+                    mix_span_write[span] = create_tensor(tn(LLM_TENSOR_MIX_SPAN_WRITE, "weight", il, span), { width, n_embd }, flags);
+                }
+                if (mix_span_read[span] != nullptr && mix_span_read[span]->ne[1] != width) {
+                    throw std::runtime_error(format("mixed-shape span %d has mismatched widths", span));
+                }
+            }
+        };
+
+        // ---- mixer (GDN or attention)
+        if (mixer_kind != llama_hparams::MIX_REMOVED) {
+            const int64_t mw = hparams.mix_mixer_width[il]; // width the sublayer weights read and write
+            GGML_ASSERT(mixer_kind != llama_hparams::MIX_FULL || mw == n_embd);
+
+            // a span sublayer has no norm: its weight is folded into the input projections
+            if (mixer_kind != llama_hparams::MIX_SPAN) {
+                layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", il), { n_embd }, flags);
+            }
+            load_ramps(mixer_kind, hparams.mix_mixer_span[il], mw, true);
+
+            if (!hparams.is_recr(il)) {
+                const int64_t n_q  = hparams.n_head(il);
+                const int64_t n_kv = hparams.n_head_kv(il);
+                const int64_t dk = hparams.mix_attn_k_dim[il];
+                const int64_t dv = hparams.mix_attn_v_dim[il];
+                create_tensor_qkv(layer, il, mw, (dk + dv) * n_q, dk * n_kv, dv * n_kv, flags);
+                layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { dv * n_q, mw }, flags);
+
+                layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { dk }, flags);
+                layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { dk }, flags);
+
+                // uneven GQA groups: the converter pads every KV group to the largest group (see build_layer_attn)
+                const ggml_tensor * pad_meta = ml.get_tensor_meta(tn(LLM_TENSOR_MIX_ATTN_Q_PAD_IDX, "weight", il).str().c_str());
+                const ggml_tensor * inv_meta = ml.get_tensor_meta(tn(LLM_TENSOR_MIX_ATTN_Q_INV_IDX, "weight", il).str().c_str());
+                if (pad_meta != nullptr && inv_meta != nullptr) {
+                    if (pad_meta->type != GGML_TYPE_I32 || inv_meta->type != GGML_TYPE_I32 ||
+                        n_kv == 0 || pad_meta->ne[0] <= 0 || pad_meta->ne[0] % n_kv != 0 || pad_meta->ne[0] > n_q * n_kv) {
+                        throw std::runtime_error(format("invalid mixed-shape attention head map in layer %d", il));
+                    }
+                    layer.attn_q_pad_idx = create_tensor(tn(LLM_TENSOR_MIX_ATTN_Q_PAD_IDX, "weight", il), { pad_meta->ne[0] }, flags);
+                    layer.attn_q_inv_idx = create_tensor(tn(LLM_TENSOR_MIX_ATTN_Q_INV_IDX, "weight", il), { n_q }, flags);
+                } else {
+                    if (pad_meta != nullptr || inv_meta != nullptr || n_kv == 0 || n_q == 0 || n_q % n_kv != 0) {
+                        throw std::runtime_error(format("missing mixed-shape attention head map in layer %d", il));
+                    }
+                }
+            } else {
+                const int64_t head_k_dim = hparams.ssm_k_dim_l(il);
+                const int64_t head_v_dim = hparams.ssm_v_dim_l(il);
+                const int64_t n_k_heads  = hparams.ssm_k_heads_l(il);
+                const int64_t n_v_heads  = hparams.mix_ssm_v_heads[il];
+                const int64_t key_dim    = head_k_dim * n_k_heads;
+                const int64_t value_dim  = head_v_dim * n_v_heads;
+                const int64_t conv_dim   = key_dim * 2 + value_dim;
+
+                layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { mw, conv_dim }, flags);
+                layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { mw, value_dim }, flags);
+                layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
+                layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { n_v_heads }, flags);
+                layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { n_v_heads }, flags);
+                layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { mw, n_v_heads }, flags);
+                layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { mw, n_v_heads }, flags);
+                layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, flags);
+                layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, mw }, flags);
+
+                // value head -> key head map; absent when the layer keeps every value head (the usual tiled mapping applies)
+                const ggml_tensor * kidx_meta = ml.get_tensor_meta(tn(LLM_TENSOR_MIX_SSM_KEY_IDX, "weight", il).str().c_str());
+                if (kidx_meta != nullptr) {
+                    if (kidx_meta->type != GGML_TYPE_I32) {
+                        throw std::runtime_error(format("invalid mixed-shape GDN head map type in layer %d", il));
+                    }
+                    layer.ssm_key_idx = create_tensor(tn(LLM_TENSOR_MIX_SSM_KEY_IDX, "weight", il), { n_v_heads }, flags);
+                }
+            }
+        }
+
+        // ---- MLP
+        if (mlp_kind != llama_hparams::MIX_REMOVED) {
+            const int64_t fw   = hparams.mix_mlp_width[il];
+            const int64_t n_ff_l = hparams.n_ff(il);
+            GGML_ASSERT(n_ff_l > 0);
+            GGML_ASSERT(mlp_kind != llama_hparams::MIX_FULL || fw == n_embd);
+
+            if (mlp_kind != llama_hparams::MIX_SPAN) {
+                layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
+            }
+            load_ramps(mlp_kind, hparams.mix_mlp_span[il], fw, false);
+
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), { fw, n_ff_l }, flags);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), { n_ff_l, fw }, flags);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), { fw, n_ff_l }, flags);
+        } else {
+            GGML_ASSERT(hparams.n_ff(il) == 0);
+        }
+    };
+
     auto load_block_mtp = [&](int il) {
         auto & layer = layers[il];
+        const int64_t n_head = hparams.n_head(il);
+        const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+        const int64_t n_embd_head_v = hparams.n_embd_head_v(il);
+        const int64_t n_embd_k_gqa = n_embd_head_k * hparams.n_head_kv(il);
+        const int64_t n_embd_v_gqa = n_embd_head_v * hparams.n_head_kv(il);
+        const int64_t n_ff = hparams.n_ff(il);
 
         // MTP block looks like a full-attention Qwen3.5 decoder block.
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
@@ -163,7 +364,11 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     };
 
     for (int i = 0; i < n_layer; ++i) {
-        load_block_trunk(i, trunk_flags);
+        if (hparams.mix_enabled) {
+            load_block_trunk_mix(i, trunk_flags);
+        } else {
+            load_block_trunk(i, trunk_flags);
+        }
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
         load_block_mtp(i);
@@ -258,6 +463,11 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
+
+        if (hparams.mix_enabled) {
+            inpL = build_layer_mix(inp, inpL, inp_pos, inp_out_ids, il);
+            continue;
+        }
 
         ggml_tensor * inpSA = inpL;
 
@@ -376,6 +586,126 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     res->t_logits = cur;
 }
 
+// Heads of x [d, n_heads, ...] picked by idx [n_out] (I32), giving [d, n_out, ...]. ggml_get_rows picks along dim 1 of a
+// 2D view, so the head dim is moved to the outside, picked, and moved back.
+static ggml_tensor * qwen35_mix_gather_heads(ggml_context * ctx0, ggml_tensor * x, ggml_tensor * idx) {
+    GGML_ASSERT(x->ne[3] >= 1 && idx->type == GGML_TYPE_I32);
+    const int64_t d = x->ne[0], t = x->ne[2], sq = x->ne[3], n_out = idx->ne[0];
+
+    ggml_tensor * xp = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 3, 1, 2));          // [d, t, sq, n_heads]
+    xp = ggml_reshape_2d(ctx0, xp, d * t * sq, x->ne[1]);
+    xp = ggml_get_rows(ctx0, xp, idx);                                               // [d*t*sq, n_out]
+    xp = ggml_reshape_4d(ctx0, xp, d, t, sq, n_out);
+    return ggml_cont(ctx0, ggml_permute(ctx0, xp, 0, 2, 3, 1));                      // [d, n_out, t, sq]
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_mix_read(
+        ggml_tensor * h,
+        ggml_tensor * norm,
+        ggml_tensor * rank_read,
+           uint32_t   kind,
+            int32_t   span,
+                int   il) {
+    if (kind == llama_hparams::MIX_SPAN) {
+        // y = (h D_r) * rs(h): the span's norm weight is folded into the sublayer's input projections, so the
+        // read is a plain (weightless) rms scale of h followed by D_r^T
+        GGML_ASSERT(norm == nullptr && (size_t) span < model.mix_span_read.size() && model.mix_span_read[span] != nullptr);
+        ggml_tensor * y = build_norm(h, nullptr, nullptr, LLM_NORM_RMS, il);
+        cb(y, "mix_span_rms", il);
+        y = build_lora_mm(model.mix_span_read[span], y);
+        cb(y, "mix_span_read", il);
+        return y;
+    }
+
+    ggml_tensor * y = build_norm(h, norm, nullptr, LLM_NORM_RMS, il);
+    if (kind == llama_hparams::MIX_RANK) {
+        GGML_ASSERT(rank_read != nullptr);
+        y = build_lora_mm(rank_read, y);
+        cb(y, "mix_rank_read", il);
+    }
+    return y;
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_mix_write(
+        ggml_tensor * out,
+        ggml_tensor * rank_write,
+           uint32_t   kind,
+            int32_t   span,
+                int   il) {
+    if (kind == llama_hparams::MIX_SPAN) {
+        GGML_ASSERT((size_t) span < model.mix_span_write.size() && model.mix_span_write[span] != nullptr);
+        out = build_lora_mm(model.mix_span_write[span], out);
+        cb(out, "mix_span_write", il);
+    } else if (kind == llama_hparams::MIX_RANK) {
+        GGML_ASSERT(rank_write != nullptr);
+        out = build_lora_mm(rank_write, out);
+        cb(out, "mix_rank_write", il);
+    }
+    return out;
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_layer_mix(
+        llm_graph_input_mem_hybrid * inp,
+                      ggml_tensor * inpL,
+                      ggml_tensor * inp_pos,
+                      ggml_tensor * inp_out_ids,
+                              int   il) {
+    const auto & layer = model.layers[il];
+
+    const uint32_t mixer_kind = hparams.mixer_kind(il);
+    const uint32_t mlp_kind   = hparams.mlp_kind(il);
+
+    ggml_tensor * h   = inpL;
+    ggml_tensor * cur = nullptr;
+
+    const bool crop = il == n_layer - 1 && crop_before_nextn(inp_out_ids);
+
+    // ---- mixer (GDN or attention) with its residual; a removed mixer leaves the residual stream untouched
+    if (mixer_kind != llama_hparams::MIX_REMOVED) {
+        cur = build_mix_read(h, layer.attn_norm, layer.mixer_read, mixer_kind, hparams.mix_mixer_span[il], il);
+        cb(cur, "attn_norm", il);
+
+        ggml_build_forward_expand(gf, cur);
+
+        if (hparams.is_recr(il)) {
+            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+        } else {
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
+        }
+
+        cur = build_mix_write(cur, layer.mixer_write, mixer_kind, hparams.mix_mixer_span[il], il);
+
+        if (crop) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            h   = ggml_get_rows(ctx0, h,   inp_out_ids);
+        }
+
+        h = ggml_add(ctx0, cur, h);
+        cb(h, "attn_residual", il);
+    } else if (crop) {
+        h = ggml_get_rows(ctx0, h, inp_out_ids);
+    }
+
+    // ---- MLP with its residual
+    if (mlp_kind != llama_hparams::MIX_REMOVED) {
+        ggml_tensor * y = build_mix_read(h, layer.attn_post_norm, layer.mlp_read, mlp_kind, hparams.mix_mlp_span[il], il);
+        cb(y, "attn_post_norm", il);
+
+        cur = build_layer_ffn(y, il);
+        cb(cur, "ffn_out", il);
+
+        cur = build_mix_write(cur, layer.mlp_write, mlp_kind, hparams.mix_mlp_span[il], il);
+
+        h = ggml_add(ctx0, cur, h);
+        cb(h, "post_ffn", il);
+    }
+
+    h = build_cvec(h, il);
+    cb(h, "l_out", il);
+
+    return h;
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                 ggml_tensor * input,
                         int   il) {
@@ -492,24 +822,29 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int                       il) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    const int64_t dk = hparams.mix_enabled ? hparams.mix_attn_k_dim[il] : hparams.n_embd_head_k(il);
+    const int64_t dv = hparams.mix_enabled ? hparams.mix_attn_v_dim[il] : hparams.n_embd_head_v(il);
+    const int64_t cache_dim = hparams.n_embd_head_k(il);
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
+    // mixed-shape pruned models cut query heads per layer (KV heads are never cut)
+    const int64_t n_head_l    = hparams.mix_enabled ? hparams.n_head(il)    : n_head;
+    const int64_t n_head_kv_l = hparams.mix_enabled ? hparams.n_head_kv(il) : n_head_kv;
+
     auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
-            n_embd_head * 2, n_head,
-            n_embd_head,     n_head_kv,
-            n_embd_head,     n_head_kv,
+            dk + dv, n_head_l,
+            dk,             n_head_kv_l,
+            dv,             n_head_kv_l,
             il, false);
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, dk, n_head_l, n_tokens,
+        ggml_element_size(Qcur_full) * (dk + dv),
+        ggml_element_size(Qcur_full) * (dk + dv) * n_head_l, 0);
     cb(Qcur, "Qcur_reshaped", il);
 
     // Apply Q normalization
@@ -517,18 +852,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur, "Qcur_normed", il);
 
     // Apply K normalization
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, dk, n_head_kv_l, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, dv, n_head_l, n_tokens,
+        ggml_element_size(Qcur_full) * (dk + dv),
+        ggml_element_size(Qcur_full) * (dk + dv) * n_head_l,
+        ggml_element_size(Qcur_full) * dk);
+    gate = ggml_cont_2d(ctx0, gate, dv * n_head_l, n_tokens);
     cb(gate, "gate_reshaped", il);
 
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, dv, n_head_kv_l, n_tokens);
 
     // Apply MRoPE
     Qcur = build_rope(Qcur, inp_pos, il);
@@ -538,13 +873,46 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
+    // Uneven GQA groups (a mixed-shape model whose kept query heads are not the same count for every KV group): attention
+    // broadcasts KV head g over query heads [g*m, (g+1)*m), so every group is padded to the largest group size m. The
+    // padded slots repeat a real head of their group and their outputs are dropped again after attention.
+    const bool padded_q = model.layers[il].attn_q_pad_idx != nullptr;
+    GGML_ASSERT(padded_q || n_head_l % n_head_kv_l == 0);
+    if (padded_q) {
+        GGML_ASSERT(model.layers[il].attn_q_inv_idx != nullptr);
+        Qcur = qwen35_mix_gather_heads(ctx0, ggml_reshape_4d(ctx0, Qcur, dk, n_head_l, n_tokens, 1), model.layers[il].attn_q_pad_idx);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, dk, Qcur->ne[1], n_tokens);
+        cb(Qcur, "Qcur_padded", il);
+    }
+
     // Attention computation
-    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(dk)) : hparams.f_attention_scale;
+
+    if (dk != cache_dim) {
+        Qcur = ggml_pad(ctx0, Qcur, cache_dim - dk, 0, 0, 0);
+        Kcur = ggml_pad(ctx0, Kcur, cache_dim - dk, 0, 0, 0);
+    }
+    if (dv != cache_dim) {
+        Vcur = ggml_pad(ctx0, Vcur, cache_dim - dv, 0, 0, 0);
+    }
 
     cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
+
+    if (dv != cache_dim) {
+        cur = ggml_reshape_3d(ctx0, cur, cache_dim, cur->ne[0] / cache_dim, n_tokens);
+        cur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, dv, cur->ne[1], n_tokens, cur->nb[1], cur->nb[2], 0));
+        cur = ggml_reshape_2d(ctx0, cur, dv * cur->ne[1], n_tokens);
+    }
+
+    if (padded_q) {
+        cur = ggml_reshape_4d(ctx0, cur, dv, cur->ne[0] / dv, n_tokens, 1);
+        cur = qwen35_mix_gather_heads(ctx0, cur, model.layers[il].attn_q_inv_idx);
+        cur = ggml_reshape_2d(ctx0, cur, dv * n_head_l, n_tokens);
+        cb(cur, "attn_unpadded", il);
+    }
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
@@ -564,12 +932,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         int                  il) {
     const auto * mctx_cur = inp->mctx;
 
-    const int64_t d_inner      = hparams.ssm_d_inner;
+    // a mixed-shape pruned model cuts value heads per layer (the key heads are never cut)
+    const int64_t d_inner      = hparams.ssm_d_inner_l(il);
     const int64_t n_seqs       = ubatch.n_seqs;
-    const int64_t head_k_dim   = hparams.ssm_d_state;
-    const int64_t num_k_heads  = hparams.ssm_n_group;
-    const int64_t num_v_heads  = hparams.ssm_dt_rank;
+    const int64_t head_k_dim   = hparams.ssm_k_dim_l(il);
+    const int64_t num_k_heads  = hparams.ssm_k_heads_l(il);
+    const int64_t num_v_heads  = hparams.mix_enabled ? hparams.mix_ssm_v_heads[il] : hparams.ssm_dt_rank;
     const int64_t head_v_dim   = d_inner / num_v_heads;
+    const int64_t state_dim    = hparams.ssm_state_dim_l(il);
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     GGML_ASSERT(n_seqs != 0);
@@ -606,7 +976,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
     const int64_t conv_kernel_size = conv_kernel->ne[0];
-    const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+    const int64_t conv_channels    = d_inner + 2 * num_k_heads * head_k_dim;
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
@@ -614,10 +984,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // plan can let the gdn read the cache rows in place (see qwen4exp.cpp). Same rows, same bytes; default off.
     static const bool gdn_getter = [] { const char * e = getenv("LLAMA_GDN_STATE_GETTER"); return e != nullptr && atoi(e) != 0; }();
     ggml_tensor * state = gdn_getter ?
-        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs,
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(il), n_seqs,
                  [](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) { return ggml_get_rows(ctx, states, ids); }) :
-        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(il), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, state_dim, state_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
@@ -665,9 +1035,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
+    // a layer that lost value heads keeps an explicit value head -> key head map (the surviving heads no longer follow the
+    // tiled pattern): pick each kept head's key head here, after the per-key-head L2 norm, so the delta rule sees one
+    // key head per value head
+    bool keys_per_value = false;
+    if (model.layers[il].ssm_key_idx != nullptr) {
+        q_conv = qwen35_mix_gather_heads(ctx0, q_conv, model.layers[il].ssm_key_idx);
+        k_conv = qwen35_mix_gather_heads(ctx0, k_conv, model.layers[il].ssm_key_idx);
+        keys_per_value = true;
+    }
+
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     // note: need explicit repeat only if we are not using the fused GDN.
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+    if (!keys_per_value && num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -677,7 +1057,21 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
+    if (head_k_dim != state_dim) {
+        q_conv = ggml_pad(ctx0, q_conv, state_dim - head_k_dim, 0, 0, 0);
+        k_conv = ggml_pad(ctx0, k_conv, state_dim - head_k_dim, 0, 0, 0);
+        q_conv = ggml_scale(ctx0, q_conv, sqrtf(float(state_dim) / head_k_dim));
+    }
+    if (head_v_dim != state_dim) {
+        v_conv = ggml_pad(ctx0, v_conv, state_dim - head_v_dim, 0, 0, 0);
+    }
+
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+
+    if (head_v_dim != state_dim) {
+        output = ggml_cont(ctx0, ggml_view_4d(ctx0, output, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+            output->nb[1], output->nb[2], output->nb[3], 0));
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -727,13 +1121,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35 MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35 MTP currently only supports a single MTP block");
 
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-
     // hparams.n_layer includes both main model layers and MTP layers. The MTP
     // layer is stored immediately after the main layers in model.layers[].
     const int il = hparams.n_layer();
     const auto & layer = model.layers[il];
+    const int64_t n_embd_head = hparams.n_embd_head_v(il);
+    const int64_t n_head = hparams.n_head(il);
+    const int64_t n_head_kv = hparams.n_head_kv(il);
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(il));
 
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
