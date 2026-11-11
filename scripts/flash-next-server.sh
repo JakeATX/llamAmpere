@@ -48,6 +48,23 @@ for arg in "$@"; do
     esac
 done
 devices=$("$server" --list-devices 2>/dev/null) || devices=
+# The fixed shape (--fit off) is measured on one card: with several visible cards and no device named by the caller,
+# stay on the card with the most free memory (the drafter follows --device), where the device table works.
+# FLASH_NEXT_MULTI_GPU=1 keeps every card; -dev/--device or LLAMA_ARG_DEVICE also wins.
+if [[ -z $device_spec && ${FLASH_NEXT_MULTI_GPU-0} != 1 ]]; then
+    card_count=0; best_card=; best_free=-1
+    while IFS= read -r device; do
+        [[ $device =~ ^[[:space:]]*(CUDA[0-9]+):.*\(([0-9]+)\ MiB,\ ([0-9]+)\ MiB\ free\) ]] || continue
+        card_count=$(( card_count + 1 ))
+        (( BASH_REMATCH[3] > best_free )) || continue
+        best_card=${BASH_REMATCH[1]}; best_free=${BASH_REMATCH[3]}
+    done <<< "$devices"
+    if (( card_count > 1 )); then
+        device_spec=$best_card
+        shape+=(--device "$best_card")
+        echo "flash-next-server: $card_count CUDA cards visible; using $best_card ($best_free MiB free). --device or FLASH_NEXT_MULTI_GPU=1 overrides" >&2
+    fi
+fi
 while IFS= read -r device; do
     [[ $device =~ ^[[:space:]]*(CUDA[0-9]+):.*\(([0-9]+)\ MiB,\ ([0-9]+)\ MiB\ free\) ]] || continue
     name=${BASH_REMATCH[1],,}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
