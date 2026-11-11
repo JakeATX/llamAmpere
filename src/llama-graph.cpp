@@ -6304,7 +6304,7 @@ ggml_tensor * llm_graph_context::build_attn_lsa_j3_units(
                 int   pct) const {
     const auto & cfg = llama_lsa_cfg();
     const auto * mctx_cur = inp->mctx;
-    ggml_tensor * kq_mask = inp->lsa_kq_mask ? inp->lsa_kq_mask : inp->get_kq_mask();
+    ggml_tensor * kq_mask = inp->lsa_kq_mask ? inp->lsa_kq_mask : inp->self_attn_mask.raw;
     const int64_t T = sq->ne[2];
     if (!kq_mask || (kq_mask->type != GGML_TYPE_F16 && kq_mask->type != GGML_TYPE_F32) || kq_mask->ne[1] != T ||
             kq_mask->ne[2] != 1 || kq_mask->ne[3] != 1 || T > cfg.max_rows) {
