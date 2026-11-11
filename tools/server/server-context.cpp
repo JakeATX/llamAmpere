@@ -138,6 +138,8 @@ static common_speculative_output_limits server_output_limits(const common_params
     if (params.speculative.draft.dflash || params.speculative.draft.eagle3) {
         n_max = std::max(n_max, params.speculative.draft.n_max);
     }
+    // copy mode: a wide round verifies the drafter's block plus the lookup tail
+    n_max += common_speculative_copy_tail(&params.speculative);
 
     auto result = common_speculative_get_output_limits(common_context_n_batch(params), params.n_parallel, n_max);
 
@@ -5713,6 +5715,10 @@ private:
                         if (draft_budget[slot.id] >= 0) {
                             common_speculative_get_draft_params(spec.get(), slot.id).n_min =
                                 std::min(params_base.speculative.draft.n_min, n_draft_req);
+                        } else {
+                            // copy mode: the lookup tail may use what the context and the request still allow;
+                            // no tail under a shared verify budget (the rows are already rationed)
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_max_total = n_draft_max;
                         }
 
                         drafting.push_back(&slot);

@@ -11,6 +11,7 @@
 #include "sampling.h"
 #include "speculative-adaptive.h"
 #include "speculative-cdepth.h"
+#include "speculative-copy.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "../src/llama-mtp-chain-sample.h" // [#69] sampled chain: host re-derivation
@@ -4184,7 +4185,33 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // copy mode (--spec-copy-tail, default off), see speculative-copy.h
+    common_speculative_copy_params             copy;
+    std::vector<common_speculative_copy_state> copy_state; // [n_seq]
 };
+
+// drafters whose block the copy tail may follow; the n-gram drafters keep their own (narrow) width
+static bool common_speculative_copy_fuses(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+int32_t common_speculative_copy_tail(const common_params_speculative * spec) {
+    if (spec == nullptr || spec->copy_tail <= 0) {
+        return 0;
+    }
+    return common_speculative_copy_params::from_env(spec->copy_tail).tail;
+}
 
 static common_ngram_map get_common_ngram_map(
         common_speculative_type type,
@@ -4917,7 +4944,19 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .copy        = */ {},
+        /* .copy_state  = */ {},
     });
+
+    if (params.copy_tail > 0) {
+        result->copy = common_speculative_copy_params::from_env(params.copy_tail);
+        result->copy_state.assign(n_seq, common_speculative_copy_state());
+        for (auto & cs : result->copy_state) {
+            cs.reset();
+        }
+        LOG_INF("%s: copy mode: tail = %d, long = %d, short = %d, agree = %d, n_rs_seq = %u\n", __func__,
+                result->copy.tail, result->copy.long_min, result->copy.short_min, result->copy.agree, params.need_n_rs_seq());
+    }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
@@ -4973,6 +5012,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+
+    if (seq_id >= 0 && seq_id < (llama_seq_id) spec->copy_state.size()) {
+        spec->copy_state[seq_id].reset();
     }
 }
 
@@ -5123,6 +5166,14 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    std::vector<char> copy_seq; // sequences drafting in this call (copy mode only)
+    if (spec->copy.tail > 0) {
+        copy_seq.resize(dparams.size(), 0);
+        for (size_t i = 0; i < dparams.size(); ++i) {
+            copy_seq[i] = dparams[i].drafting;
+        }
+    }
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -5189,6 +5240,26 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+
+    // copy mode: append the context-lookup tail after the model drafter's block
+    for (size_t i = 0; i < copy_seq.size() && i < spec->copy_state.size(); ++i) {
+        if (!copy_seq[i]) {
+            continue;
+        }
+        auto & dp = dparams[i];
+        auto & cs = spec->copy_state[i];
+        const int32_t n_block = (int32_t) dp.result->size();
+        const common_speculative_impl * impl = spec->impl_last[i];
+
+        llama_tokens tail;
+        if (cs.wide() && n_block > 0 && impl != nullptr && common_speculative_copy_fuses(impl->type) && dp.prompt != nullptr) {
+            const int32_t room = std::min(spec->copy.tail, dp.n_max_total - n_block);
+            tail = common_speculative_copy_propose(spec->copy, dp.prompt->data(), (int32_t) dp.prompt->size(),
+                    dp.id_last, *dp.result, room);
+            common_speculative_copy_append(*dp.result, dp.result_q, tail);
+        }
+        cs.on_draft(n_block, (int32_t) tail.size());
+    }
 }
 
 void common_speculative_note_target_conf(common_speculative * spec, llama_seq_id seq_id, const float * p, size_t n) {
@@ -5211,6 +5282,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
 
+        // (per-position counts keep the tail positions: they are the acceptance of the fused draft)
         if (impl->n_acc_tokens_per_pos.size() < n_accepted) {
             impl->n_acc_tokens_per_pos.resize(n_accepted, 0);
         }
@@ -5219,9 +5291,24 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens_per_pos[i]++;
         }
 
-        if (n_accepted > 0) {
+        // copy mode: the drafter and its depth controller are judged on their own block; tokens accepted past
+        // it came from the lookup tail. accept() still gets the full count (it selects the verify row to resume from)
+        uint16_t n_acc_stat = n_accepted;
+        if (seq_id >= 0 && seq_id < (llama_seq_id) spec->copy_state.size()) {
+            auto & cs = spec->copy_state[seq_id];
+            const bool had_tail = cs.n_tail > 0;
+            const int32_t n_block = cs.n_block;
+            const int32_t acc_block = cs.on_accept(n_accepted);
+            if (had_tail) {
+                n_acc_stat      = (uint16_t) acc_block;
+                n_accepted_ctrl = n_accepted_ctrl >= 0 ? std::min(n_accepted_ctrl, acc_block) : acc_block;
+                n_drafted       = n_drafted >= 0 ? std::min(n_drafted, n_block) : n_block;
+            }
+        }
+
+        if (n_acc_stat > 0) {
             impl->n_acc_drafts++;
-            impl->n_acc_tokens += n_accepted;
+            impl->n_acc_tokens += n_acc_stat;
         }
 
         impl->n_accepted_ctrl = n_accepted_ctrl;
@@ -5301,6 +5388,14 @@ bool common_speculative_restore_state(common_speculative * spec, llama_seq_id se
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
+    }
+
+    for (size_t i = 0; i < spec->copy_state.size(); ++i) {
+        const auto & cs = spec->copy_state[i];
+        if (cs.n_rounds > 0) {
+            LOG_INF("statistics copy tail: seq = %zu, #rounds = %" PRIu64 ", #gen tokens = %" PRIu64 ", #acc tokens = %" PRIu64
+                    ", #block miss = %" PRIu64 "\n", i, cs.n_rounds, cs.n_gen, cs.n_acc, cs.n_miss_blk);
+        }
     }
 
     for (const auto & impl : spec->impls) {

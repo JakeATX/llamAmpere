@@ -46,6 +46,10 @@ struct common_speculative_output_limits {
     int32_t per_seq;
 };
 
+// copy mode (--spec-copy-tail): lookup tokens a draft can carry past the drafter's block (0 = off);
+// the caller adds it to the draft width when it sizes the verify batch
+int32_t common_speculative_copy_tail(const common_params_speculative * spec);
+
 // return the output limits needed for speculative decoding
 common_speculative_output_limits common_speculative_get_output_limits(
         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
@@ -91,6 +95,10 @@ struct common_speculative_draft_params {
 
     // A shared verify budget can require fewer drafts than the configured minimum.
     int32_t n_min = -1;
+
+    // copy mode: cap on the whole draft, model block plus lookup tail (<= 0: no tail for this sequence).
+    // n_max above bounds the model drafter only; this is what still fits the context and the request.
+    int32_t n_max_total = -1;
 
 };
 

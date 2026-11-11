@@ -539,6 +539,7 @@ llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 llama_build_and_test(test-speculative-adaptive.cpp)
+llama_build_and_test(test-speculative-copy.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks

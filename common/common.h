@@ -476,6 +476,12 @@ struct common_params_speculative {
     // recurrent-state snapshots requested per sequence (-1 = derive from the drafters, see need_n_rs_seq())
     int32_t n_rs_seq_override = -1;
 
+    // copy mode: context-lookup tokens appended after the model drafter's block (0 = off), see speculative-copy.h.
+    // copy_rs = false keeps need_n_rs_seq() as it is (no VRAM; a wide round that is not fully accepted restores
+    // its checkpoint); true adds one recurrent-state snapshot per tail token so every rollback is in place.
+    int32_t copy_tail = 0;
+    bool    copy_rs   = false;
+
     // per-token recurrent-state snapshots the target context must keep so that a partial draft
     // acceptance can roll the GDN/SSM state back in place (COMMON_CONTEXT_SEQ_RM_TYPE_RS).
     // Without them a hybrid/recurrent target falls back to a full checkpoint restore + replay
@@ -519,6 +525,10 @@ struct common_params_speculative {
                 default:
                     break;
             }
+        }
+
+        if (copy_rs && copy_tail > 0 && n > 0) {
+            n += (uint32_t) std::min(copy_tail, 16); // common_speculative_copy_params::TAIL_MAX
         }
 
         return n;
