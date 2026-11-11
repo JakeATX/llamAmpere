@@ -1344,7 +1344,7 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
             sj_lsa_vk vka = {};
             if (vk) {
                 const ggml_tensor * km = dst->src[7];
-                const ggml_tensor * vm = dst->src[9];
+                const ggml_tensor * vm = ggml_flash_attn_ext_get_lsa_vk_vm(dst);
                 const ggml_tensor * nd = dst->src[8];
                 // rows readable past the view: the mean caches are views of a larger [d, n_blk] tensor
                 auto rows = [](const ggml_tensor * t) -> int64_t {

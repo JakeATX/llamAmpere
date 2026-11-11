@@ -1521,7 +1521,7 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         }
 
         // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-        if (op->src[5] != nullptr || op->src[9] != nullptr) { // src[9] = kv_rows here, src[5] = SJ-KVaRN body
+        if (op->src[5] != nullptr || ggml_flash_attn_ext_uses_src9(op)) { // slot 9 = kv_rows / LSA here, src[5] = SJ-KVaRN body
             return {false, "FLASH_ATTN_EXT with K/V row lists is not supported"};
         }
 

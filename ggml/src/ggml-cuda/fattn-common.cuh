@@ -2228,7 +2228,7 @@ void launch_fattn(
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2,
-                 stream_k_lse ? (float *) KQV->src[9]->data : nullptr);
+                 stream_k_lse ? (float *) ggml_flash_attn_ext_get_lse(KQV)->data : nullptr);
         } else if (ntiles_dst % blocks_num.x != 0) {
             GGML_ASSERT(!stream_k_lse);
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
@@ -2258,7 +2258,7 @@ void launch_fattn(
                 flash_attn_combine_results<DV, true>
                     <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
                     (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks,
-                     ggml_flash_attn_ext_get_lse(KQV) ? (float *) KQV->src[9]->data : nullptr);
+                     ggml_flash_attn_ext_get_lse(KQV) ? (float *) ggml_flash_attn_ext_get_lse(KQV)->data : nullptr);
             } else {
                 GGML_ABORT("SJ-KVaRN fused rotation needs DV == 256");
             }
@@ -2266,7 +2266,7 @@ void launch_fattn(
         flash_attn_combine_results<DV>
             <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks,
-                     ggml_flash_attn_ext_get_lse(KQV) ? (float *) KQV->src[9]->data : nullptr);
+                     ggml_flash_attn_ext_get_lse(KQV) ? (float *) ggml_flash_attn_ext_get_lse(KQV)->data : nullptr);
         }
     }
     CUDA_CHECK(cudaGetLastError());

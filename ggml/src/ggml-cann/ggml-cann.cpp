@@ -2678,7 +2678,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-                if (op->src[5] != nullptr || op->src[9] != nullptr) { // src[9] = kv_rows here, src[5] = SJ-KVaRN body
+                if (op->src[5] != nullptr || ggml_flash_attn_ext_uses_src9(op)) { // slot 9 = kv_rows / LSA here, src[5] = SJ-KVaRN body
                     return false;
                 }
 #ifdef ASCEND_310P

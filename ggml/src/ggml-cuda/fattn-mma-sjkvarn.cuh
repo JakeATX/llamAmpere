@@ -182,7 +182,7 @@ static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(const ggml_ten
 // readable rows (the kernel stages 16 means per strip and clamps the last strip inside the allocation)
 static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_lsa_vk_ok(const ggml_tensor * dst) {
     const ggml_tensor * km = dst->src[7];
-    const ggml_tensor * vm = dst->src[9];
+    const ggml_tensor * vm = ggml_flash_attn_ext_get_lsa_vk_vm(dst);
     const ggml_tensor * nd = dst->src[8];
     if (km == nullptr || vm == nullptr || nd == nullptr) {
         return false;

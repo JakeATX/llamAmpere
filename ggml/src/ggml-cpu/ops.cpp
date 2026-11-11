@@ -9477,8 +9477,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
-            if (ggml_flash_attn_ext_get_lse(dst)) { // LSE [H, T, S]: natural log of the row's softmax denominator (scaled logits + mask)
-                ((float *) dst->src[9]->data)[i3*ne2*ne1 + i2 + i1*ne1] = S == 0.0f ? -INFINITY : M + logf(S);
+            if (ggml_tensor * lse = ggml_flash_attn_ext_get_lse(dst)) { // LSE [H, T, S]: natural log of the row's softmax denominator (scaled logits + mask)
+                ((float *) lse->data)[i3*ne2*ne1 + i2 + i1*ne1] = S == 0.0f ? -INFINITY : M + logf(S);
             }
         }
     }
@@ -10341,7 +10341,7 @@ static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
     // src[7]/src[9] = block mean K/V rows in the cache basis
     const bool          lsa_vk  = ggml_flash_attn_ext_get_lsa_vk(dst);
     const ggml_tensor * vk_km   = lsa_vk ? dst->src[7] : nullptr;
-    const ggml_tensor * vk_vm   = lsa_vk ? dst->src[9] : nullptr;
+    const ggml_tensor * vk_vm   = ggml_flash_attn_ext_get_lsa_vk_vm(dst);
     const float         vk_bias = lsa_vk ? ggml_get_op_params_f32(dst, 11) : 0.0f;
     GGML_ASSERT(!lsa_vk || lsa_blk > 0);
 
@@ -10530,8 +10530,8 @@ static void ggml_compute_forward_flash_attn_ext_sj_kvarn(
         if (fused_rot) {
             rot256(out);
         }
-        if (ggml_flash_attn_ext_get_lse(dst)) { // LSE [H, T]
-            ((float *) dst->src[9]->data)[iq2 + iq1*dst->ne[1]] = Ssum == 0.0f ? -INFINITY : M + logf(Ssum);
+        if (ggml_tensor * lse = ggml_flash_attn_ext_get_lse(dst)) { // LSE [H, T]
+            ((float *) lse->data)[iq2 + iq1*dst->ne[1]] = Ssum == 0.0f ? -INFINITY : M + logf(Ssum);
         }
     }
 }

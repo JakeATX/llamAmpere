@@ -6493,6 +6493,14 @@ struct ggml_tensor * ggml_flash_attn_ext_get_kv_rows(const struct ggml_tensor * 
     return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[9] != NULL && a->src[9]->type == GGML_TYPE_I32 ? a->src[9] : NULL;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_get_lsa_vk_vm(const struct ggml_tensor * a) {
+    return ggml_flash_attn_ext_get_lsa_vk(a) ? a->src[9] : NULL;
+}
+
+bool ggml_flash_attn_ext_uses_src9(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[9] != NULL;
+}
+
 int32_t ggml_flash_attn_ext_get_lsa_block(const struct ggml_tensor * a) {
     return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[8] != NULL && a->src[8]->type == GGML_TYPE_F32 ?
         ggml_get_op_params_i32(a, 9) : 0;

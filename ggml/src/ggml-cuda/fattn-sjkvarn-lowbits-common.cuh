@@ -2326,7 +2326,7 @@ void launch_fattn(
                 ((float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2,
-                 stream_k_lse ? (float *) KQV->src[9]->data : nullptr);
+                 stream_k_lse ? (float *) ggml_flash_attn_ext_get_lse(KQV)->data : nullptr);
         } else if (ntiles_dst % blocks_num.x != 0) {
             GGML_ASSERT(!stream_k_lse && "SJ-KVaRN low-bit FA LSE output: general fixup reached");
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.

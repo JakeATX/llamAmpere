@@ -1753,10 +1753,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_FLASH_ATTN_EXT:
             // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
             // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
-            if (op->src[9] != NULL) {
-                const struct ggml_tensor * kv_rows = op->src[9];
+            if (ggml_flash_attn_ext_uses_src9(op)) {
+                const struct ggml_tensor * kv_rows = ggml_flash_attn_ext_get_kv_rows(op); // NULL: LSA LSE / V means, not implemented
 
-                if (kv_rows->type != GGML_TYPE_I32 ||
+                if (kv_rows == NULL || kv_rows->type != GGML_TYPE_I32 ||
                     !ggml_is_contiguous(kv_rows) ||
                     kv_rows->ne[2] != 1 || kv_rows->ne[3] != 1 ||
                     kv_rows->ne[1] != op->src[0]->ne[3] ||

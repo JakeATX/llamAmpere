@@ -2871,6 +2871,11 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_lse(const struct ggml_tensor * a);
     // upstream kv_rows (I32, src[9]) of an FA node or NULL; NULL for an LSA LSE / virtual-key node (also src[9])
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_kv_rows(const struct ggml_tensor * a);
+    // LSA virtual-key V means (F16, ggml_flash_attn_ext_set_lsa_vk), NULL when the node has none
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_lsa_vk_vm(const struct ggml_tensor * a);
+    // true when FLASH_ATTN_EXT src[9] holds anything (kv_rows, LSA LSE or LSA V means): backends that implement none
+    // of the three refuse the node with this
+    GGML_API bool ggml_flash_attn_ext_uses_src9(const struct ggml_tensor * a);
     GGML_API int32_t ggml_flash_attn_ext_get_sj_kvarn_rot(const struct ggml_tensor * a);
     // compile default GGML_SJKVARN_FUSED_ROT_DEFAULT (CMake GGML_SJKVARN_FUSED_ROT, ON), env GGML_SJKVARN_FUSED_ROT=0|1 overrides
     GGML_API bool ggml_sj_kvarn_fused_rot_enabled(void);
