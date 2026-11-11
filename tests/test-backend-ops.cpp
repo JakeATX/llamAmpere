@@ -15356,6 +15356,20 @@ struct test_lsa_gather_attn : public test_case {
     }
 };
 
+// LSA select / unit-LSE tests set only their named inputs. The harness sentinels (op NONE tensors "sent_*" between the
+// tensors) then kept whatever bytes the allocator left; the graph copy carries the same bytes to the second backend, so
+// the sentinel byte compare passed, but the NaN scan flagged them on both sides ("[NONE] NaN ... (CPU=-nan CPU=-nan)",
+// a different case set every run). Zero every non-view tensor first (sentinels, inputs, outputs); the inputs are set
+// after this. The ops write every output element themselves.
+static void lsa_zero_tensors(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src == nullptr && t->buffer != nullptr) {
+            std::vector<uint8_t> zero(ggml_nbytes(t), 0);
+            ggml_backend_tensor_set(t, zero.data(), 0, zero.size());
+        }
+    }
+}
+
 // [LSA] per-layer overhead of the opt-in pick and compensation graphs, at decode/verify shapes (perf only; the ops are
 // the same ggml ops llama-graph builds for LLAMA_LSA_BLOCK=128 + LLAMA_LSA_REC_BLK=1 + LLAMA_LSA_COMP=2, one layer):
 // mode 1 = block record pick (index scores -> softmax(tau) -> block log-share -> window/sink exclusion -> top-k blocks
@@ -15420,6 +15434,7 @@ struct test_lsa_block_select : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        lsa_zero_tensors(ctx); // sentinels too, see lsa_zero_tensors
         std::mt19937 rng(1234 + nbs + 7*T + kb);
         std::uniform_real_distribution<float> u(-1.0f, 1.0f);
         const int64_t n_kv = nbs*B, n_used = n_kv - n_kv/32; // last ~3% of the cells empty (position 1e9)
@@ -15509,6 +15524,7 @@ struct test_lsa_block_select_sum : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        lsa_zero_tensors(ctx); // sentinels too, see lsa_zero_tensors
         std::mt19937 rng(4321 + nbs + 7*T + kb + 13*mode + B);
         std::uniform_int_distribution<int> uq(-3, 3), ux(-4, 4), uv(0, 4);
         const int64_t n_kv = nbs*B, n_used = n_kv - n_kv/32; // last ~3% of the cells empty (position 1e9)
@@ -15580,6 +15596,7 @@ struct test_lsa_unit_select : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        lsa_zero_tensors(ctx); // sentinels too, see lsa_zero_tensors
         std::mt19937 rng(4321 + n_kv + 7*T + U + ku + 1000*shared);
         const int64_t nu = n_kv/U, nb = n_kv/B, n_used = n_kv - n_kv/32;
         std::vector<int> lvl(nu);
@@ -15674,6 +15691,7 @@ struct test_lsa_unit_lse : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        lsa_zero_tensors(ctx); // sentinels too, see lsa_zero_tensors
         init_tensor_uniform(ggml_get_tensor(ctx, "kf"));
         init_tensor_uniform(ggml_get_tensor(ctx, "q"));
         const int64_t n_used = n_kv - n_kv/32;
