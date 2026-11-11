@@ -1480,6 +1480,9 @@ struct test_case {
     // Name of a backend fusion counter (see ggml_backend_cuda_fusion_count) that must advance while
     // the graph runs on the tested backend. Backends without the counter are not checked.
     virtual const char * required_fusion() { return nullptr; }
+    // Fork cases whose own CUDA path handles a -1 MUL_MAT_ID id (cold routes); exempts them from the upstream
+    // [TAG_MUL_MAT_ID_SKIP] guard below. Upstream cases keep the guard.
+    virtual bool handles_skipped_ids() { return false; }
     // Name of a backend fusion counter that must NOT advance (a guard that has to refuse the fusion).
     virtual const char * forbidden_fusion() { return nullptr; }
     virtual bool use_weight_context() { return false; }
@@ -1669,7 +1672,7 @@ struct test_case {
         }
 
         // TODO: [TAG_MUL_MAT_ID_SKIP] @ngxson : remove this once CUDA implements mul_mat_id with -1 = skipped
-        if (backend_lacks_skipped_ids(backend1, gf)) {
+        if (!handles_skipped_ids() && backend_lacks_skipped_ids(backend1, gf)) {
             test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", false, false, "not supported");
             print_test_result_locked(output_printer, result);
             return test_status_t::NOT_SUPPORTED;
@@ -12874,6 +12877,7 @@ struct test_moe_bank_mixed : public test_case {
                 "," + VAR_TO_STR(n_used);
     }
     std::string op_desc(ggml_tensor *) override { return "MOE_BANK_MIXED"; }
+    bool handles_skipped_ids() override { return true; } // mode 2 writes -1 bank ids on purpose
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     bool direct_mmvq_width() const {
