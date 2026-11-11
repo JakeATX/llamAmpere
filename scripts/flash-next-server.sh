@@ -62,7 +62,7 @@ if [[ -z $device_spec && ${FLASH_NEXT_MULTI_GPU-0} != 1 ]]; then
     if (( card_count > 1 )); then
         device_spec=$best_card
         shape+=(--device "$best_card")
-        echo "flash-next-server: $card_count CUDA cards visible; using $best_card ($best_free MiB free). --device or FLASH_NEXT_MULTI_GPU=1 overrides" >&2
+        echo "flash-next-server: $card_count CUDA cards visible; using $best_card ($best_free MiB free). --device overrides" >&2
     fi
 fi
 # Memory that another program already holds is not free for the fixed shape (#96: two busy 24 GB cards with about
@@ -72,15 +72,22 @@ fi
 fit_min_mib=${FLASH_NEXT_FIT_MIN_MIB-8192}
 [[ $fit_min_mib =~ ^[0-9]+$ ]] || { echo "flash-next-server: FLASH_NEXT_FIT_MIN_MIB must be a whole number of MiB" >&2; exit 2; }
 low_cards=
+used_cards=0
 while IFS= read -r device; do
     [[ $device =~ ^[[:space:]]*(CUDA[0-9]+):.*\(([0-9]+)\ MiB,\ ([0-9]+)\ MiB\ free\) ]] || continue
     name=${BASH_REMATCH[1]}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
     [[ -z $device_spec || ,${device_spec,,}, == *,"${name,,}",* ]] || continue
+    used_cards=$(( used_cards + 1 ))
     if (( card_mib - free_mib > 4096 )); then
         echo "flash-next-server: $name has $free_mib of $card_mib MiB free; other programs hold about $(( card_mib - free_mib )) MiB (see nvidia-smi)" >&2
     fi
     (( free_mib >= fit_min_mib )) || low_cards+=" $name"
 done <<< "$devices"
+# The card-side expert tables work on one card only; on several, experts run on the host (#96: on two idle 3090s a
+# 28-token prompt took 55 s and 512 tokens did not finish in 13 minutes, against 79 tokens/s on one of the same cards).
+if [[ ${FLASH_NEXT_MULTI_GPU-0} == 1 ]] || (( used_cards > 1 )); then
+    echo "flash-next-server: WARN two-card Flash-Next is experimental and very slow unless the host has enough RAM for the experts; this version runs Flash-Next on one card (name it with --device)" >&2
+fi
 if [[ -n $low_cards ]]; then
     for i in "${!shape[@]}"; do
         case ${shape[i]} in
