@@ -4410,10 +4410,15 @@ private:
     // need it: PARTIAL_ONLY does not apply to a KV cache, so the blob would be the drafter's whole KV of the
     // sequence, while the live drafter cache already holds every position below the checkpoint and a restore trims
     // the rest (slot.mem.seq_rm / the MTP process() trim). Only a drafter with recurrent state saves its part.
+    // A windowed drafter (--spec-draft-window: its KV is a ring) does not hold every position below the checkpoint: the
+    // ring has already evicted the oldest ones the drafter saw there, so a trim leaves fewer cells than a cold run has
+    // at that position and the drafts differ (8 GB 3/3t restore drift: 2145 vs 2304 drafter cells at 65280). It keeps
+    // its ring in every checkpoint too.
     // LLAMA_CKPT_DFT_KV=1 keeps the drafter KV in every checkpoint (the earlier behaviour, for A/B).
     bool ckpt_needs_dft() const {
         static const bool force = [] { const char * s = getenv("LLAMA_CKPT_DFT_KV"); return s && s[0] == '1'; }();
-        return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART);
+        return ctx_dft != nullptr && (force || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                params_base.speculative.draft.attn_window > 0);
     }
 
     // In-call checkpoints: on with B1 (LLAMA_B1=1, layer-major prefill), unless LLAMA_B1_CKPT=0. A prompt checkpoint
