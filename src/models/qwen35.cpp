@@ -402,10 +402,32 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
 
     // Target layer -> predictions captured one to three attention layers earlier (graph-local only).
     const auto & lsa = llama_lsa_cfg();
-    const bool spec_probe = lsa.spec_recall && lsa.mode != llama_lsa_config::OFF;
+    // Mixed-shape files (hparams.mix_enabled) take the recall probe and J3 only when every attention layer keeps a full
+    // mixer with full head counts and dims (stale_query reads that layer's own norm and wq straight off the residual and
+    // views it with the model-wide n_head / n_embd_head); otherwise both
+    // are off for this graph, with one warning. Either way the attention itself stays exact (J3 only prefetches).
+    bool lsa_side_ok = true;
+    if (hparams.mix_enabled && (lsa.spec_recall || lsa.j3) && lsa.mode != llama_lsa_config::OFF) {
+        for (int jl = 0; jl < n_layer; ++jl) {
+            if (!hparams.is_recr(jl) && (hparams.mixer_kind(jl) != llama_hparams::MIX_FULL ||
+                    hparams.mix_attn_k_dim[jl] != hparams.n_embd_head_k_full || hparams.mix_attn_v_dim[jl] != hparams.n_embd_head_v_full ||
+                    hparams.n_head(jl) != (uint32_t) n_head || hparams.n_head_kv(jl) != (uint32_t) n_head_kv ||
+                    model.layers[jl].attn_q_pad_idx != nullptr)) {
+                lsa_side_ok = false;
+            }
+        }
+        if (!lsa_side_ok) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: mixed-shape model with a cut attention layer: LLAMA_LSA_SPEC_RECALL and LLAMA_LSA_J3 off\n", __func__);
+            }
+        }
+    }
+    const bool spec_probe = lsa.spec_recall && lsa.mode != llama_lsa_config::OFF && lsa_side_ok;
     std::vector<ggml_tensor *> spec_q1(spec_probe ? n_layer : 0, nullptr), spec_q2(spec_probe ? n_layer : 0, nullptr);
     std::vector<ggml_tensor *> spec_q3(spec_probe ? n_layer : 0, nullptr);
-    if (lsa.spec_recall && lsa.mode != llama_lsa_config::OFF) {
+    if (spec_probe) {
         // Match the rs3 record pick or its 16-cell refinement, per row/union. Reject other arms, never silently
         // measure a different predictor. No prefetch, slot-map write or change to the real attention is made.
         GGML_ASSERT(lsa.mode == llama_lsa_config::KEY && lsa.idx_cache && !lsa.per_head &&
@@ -437,7 +459,7 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     // LLAMA_LSA_J3_LEAD: also several streams under LLAMA_LSA_MULTI (at most 8 rows each), built per stream
     const bool j3_rows = ubatch.n_seqs_unq == 1 ? n_tokens <= 8 : lsa.j3_lead && lsa.multi &&
             n_tokens % ubatch.n_seqs_unq == 0 && n_tokens/ubatch.n_seqs_unq <= 8;
-    if (lsa.j3 && lsa.mode != llama_lsa_config::OFF && j3_rows) {
+    if (lsa.j3 && lsa.mode != llama_lsa_config::OFF && lsa_side_ok && j3_rows) {
         const bool j3_cfg = lsa.mode == llama_lsa_config::KEY && lsa.idx_cache && !lsa.per_head &&
                 lsa.block == 128 && (lsa.refine == 128 || lsa.refine == 16) && lsa.fused_sel && !lsa.unit_op && !lsa.rec_blk &&
                 !lsa.block_sum && !lsa.fast && lsa.topp <= 0.0 && lsa.pick_every == 1 && !lsa.pick_check &&
@@ -464,23 +486,20 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
-        if (hparams.mix_enabled) {
-            inpL = build_layer_mix(inp, inpL, inp_pos, inp_out_ids, il);
-            continue;
-        }
-
         ggml_tensor * inpSA = inpL;
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+        if (!hparams.mix_enabled) {
+            cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
 
-        ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, cur);
+        }
 
         lsa_spec_q = spec_probe ? spec_q1[il] : nullptr;
         lsa_spec_q2 = spec_probe ? spec_q2[il] : nullptr;
         lsa_spec_q3 = spec_probe ? spec_q3[il] : nullptr;
         lsa_spec_sel = nullptr;
-        if (lsa.spec_recall && lsa.mode != llama_lsa_config::OFF && !hparams.is_recr(il) &&
+        if (spec_probe && !hparams.is_recr(il) &&
                 lsa.layer_enabled(il) && llama_lsa_map_has_layer(il) && n_tokens <= 8 && ubatch.n_seqs_unq == 1) {
             int next = il;
             for (int ahead = 1; ahead <= 3; ++ahead) {
@@ -514,6 +533,12 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
                             protect | (lsa.j3_prev ? GGML_LSA_PREFETCH_PREV : 0), 0);
                 }
             }
+        }
+
+        if (hparams.mix_enabled) {
+            // the recall-probe / J3 hooks above ran on this layer's input residual exactly as for a plain layer
+            inpL = build_layer_mix(inp, inpL, inp_pos, inp_out_ids, il);
+            continue;
         }
 
         // Determine layer type and build appropriate attention mechanism
