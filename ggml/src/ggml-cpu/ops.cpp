@@ -9728,7 +9728,10 @@ static void ggml_compute_forward_flash_attn_ext_grouped_chunk(
     float S[Q_TILE_SZ];
     float M[Q_TILE_SZ];
     float slope[Q_TILE_SZ];
-    const ggml_fp16_t * mp[Q_TILE_SZ];
+    const char * mp[Q_TILE_SZ];
+    // F16, packed one-bit (I32) and implicit-prefix (I64) masks, read as in the tiled path
+    const bool mask_packed = mask && ggml_flash_attn_ext_mask_packed(mask);
+    const bool mask_imp    = mask && mask->type == GGML_TYPE_I64;
 
     memset(Q_f32, 0, DK * QP * sizeof(float));
     for (int r = 0; r < R; r++) {
@@ -9738,7 +9741,7 @@ static void ggml_compute_forward_flash_attn_ext_grouped_chunk(
         S[r] = 0.0f;
         M[r] = -INFINITY;
         slope[r] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
-        mp[r] = mask ? (const ggml_fp16_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2]) : nullptr;
+        mp[r] = mask ? (const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] : nullptr;
         const float * pq = (const float *)((const char *) q->data + iq1*nbq1 + iq2*nbq2);
         for (int64_t dk = 0; dk < DK; dk++) {
             Q_f32[dk * QP + r] = pq[dk];
@@ -9755,8 +9758,11 @@ static void ggml_compute_forward_flash_attn_ext_grouped_chunk(
         if (mask) {
             bool can_skip = true;
             for (int r = 0; r < R; r++) {
+                const int64_t mlim = mask_imp ? *(const int64_t *) mp[r] : 0;
                 for (int tk = 0; tk < kv_tile; tk++) {
-                    const float mv = slope[r] * GGML_CPU_FP16_TO_FP32(mp[r][ic + tk]);
+                    const int64_t i = ic + tk;
+                    const float mv = slope[r] * (mask_packed ? ((((const uint32_t *) mp[r])[i >> 5] >> (i & 31)) & 1 ? 0.0f : -INFINITY) :
+                                                 mask_imp ? (i < mlim ? 0.0f : -INFINITY) : GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mp[r])[i]));
                     mask32[r * KV_TILE_SZ + tk] = mv;
                     can_skip &= (mv == -INFINITY);
                 }
