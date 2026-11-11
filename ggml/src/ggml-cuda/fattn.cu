@@ -4731,6 +4731,11 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
 
 static void ggml_cuda_fattn_sj_kvarn_rowsplit_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t n_q = dst->src[0]->ne[1];
+    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+    if (!logged.test_and_set()) { // proof of route for the gate logs (first node only)
+        GGML_LOG_WARN("%s: GGML_SJKVARN_ROWSPLIT=1: SJ-KVaRN 4/4 row split on (%d query rows in chunks of %d)\n",
+                __func__, (int) n_q, (int) SJ_KVARN_ROWSPLIT_CHUNK);
+    }
     for (int64_t r0 = 0; r0 < n_q; r0 += SJ_KVARN_ROWSPLIT_CHUNK) {
         ggml_tensor d, q, m;
         ggml_cuda_fattn_sj_kvarn_rowsplit_view(dst, dst->src[3], r0, std::min(SJ_KVARN_ROWSPLIT_CHUNK, n_q - r0), d, q, m);
