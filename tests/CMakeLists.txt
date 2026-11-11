@@ -186,6 +186,8 @@ target_include_directories(test-sjkvarn-split PRIVATE ${PROJECT_SOURCE_DIR}/ggml
 llama_build_and_test(test-sjkvarn-fill.cpp LABEL "turbo")
 # LLAMA_LSA_RESIDENT=auto slot sizing (pure function, no model)
 llama_build_and_test(test-lsa-resident-fit.cpp LABEL "turbo")
+# FLASH_ATTN_EXT src[9]: upstream kv_rows vs the LSA LSE output (accessors)
+llama_build_and_test(test-lsa-src9.cpp LABEL "turbo")
 # prompt-cache state round trip over every KV / drafter / recurrent-state type (needs an MTP model: -m)
 llama_build(test-prompt-cache-types.cpp)
 
