@@ -1504,8 +1504,9 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     k_ait_actq_t<<<(unsigned) (T * S), 64, 0, stream>>>(X, W, xq.get(), sa.get(), K, k, (int) T);
     const char * w = (const char *) W;
     // GGML_CUDA_AIT_MIDT_SPLIT (default 0 = off): 9..32 tokens of AIT2/3/4 run on a token tile that just covers T, with K
-    // split over CTAs when the row tiles alone leave SMs idle (ffn_down: 20 CTAs on 82 SMs). 1 = splits from the SM count
-    // (at most 8), n >= 2 = n splits. Differs from off by float summation order only when splits > 1; repeats are bitwise equal.
+    // split over CTAs when the row tiles alone leave SMs idle (ffn_down: 20 CTAs on 82 SMs). 1 = splits from the SM count,
+    // n >= 2 = n splits; both are clamped to [1, min(8, S/2)]. Differs from off by float summation order only when splits > 1;
+    // repeats are bitwise equal.
     static const int midt = ait_env_int("GGML_CUDA_AIT_MIDT_SPLIT", 0);
     if (midt > 0 && code == 0 && T >= 9 && T <= 32) {
         const int ctas = (M / 32 + 7) / 8;
