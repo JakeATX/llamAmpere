@@ -324,8 +324,8 @@ static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const fattn_sj
         }
     }
     if (kv.flags & GGML_SJKVARN_FLAG_STAGE_ALL) {
-        printf("LSA full-stage decode: record %d has no device copy\n", r);
-        __trap();
+        __trap(); // LSA full-stage decode: record r has no device copy (no device printf here: it is inlined into every
+                  // low-bit FA kernel and costs per-thread stack on the whole card)
     }
     return kv.body + (size_t) r*kv.rec_stride;
 }
