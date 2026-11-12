@@ -4440,6 +4440,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const auto & lsa_cfg = llama_lsa_cfg();
     const bool lsa_sj_ok = !mctx_cur->is_sj_kvarn() || (lsa_cfg.idx_cache && !lsa_cfg.fast &&
         (lsa_cfg.mode == llama_lsa_config::KEY || lsa_cfg.mode == llama_lsa_config::POS));
+    if (lsa_cfg.mode != llama_lsa_config::OFF && !cparams.training && lsa_sj_ok && mctx_cur->is_sj_kvarn()) {
+        const int32_t lsa_seq = llama_lsa_ubatch_seq(&ubatch);
+        llama_lsa_seq_guard(lsa_seq, ubatch.pos && ubatch.pos[0] == 0, ubatch.n_seqs_unq > 1 && ubatch.seq_id != nullptr);
+    }
     if (lsa_cfg.mode != llama_lsa_config::OFF && !cparams.training && lsa_sj_ok &&
             (cparams.kv_unified || ubatch.n_seqs_unq == 1)) {
         inp->lsa_graph_gen = llama_lsa_graph_gen();

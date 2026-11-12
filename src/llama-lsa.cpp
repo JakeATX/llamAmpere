@@ -896,6 +896,34 @@ bool llama_lsa_idx_trace() {
     return on;
 }
 
+// SJ-KVaRN keeps one index cache, one set of block means and one staging ring per K cache tensor, keyed by position:
+// they hold ONE sequence. The owner is the last sequence that started at position 0. A ubatch of another sequence, or
+// one that mixes sequences (LSA skips it, so its rows never reach the caches), makes every cache stale: LSA goes
+// dense and compensation off, with a warning, until a sequence restarts at position 0. One sequence: never fires.
+void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed) {
+    if (seq < 0 && !mixed) {
+        return; // graph reserve
+    }
+    static int32_t own = -1; // guarded by lsa_idx().mtx
+    auto & s = lsa_idx();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (!mixed && (fresh || own < 0 || seq == own)) {
+        own = seq;
+        return;
+    }
+    bool was_on = false;
+    for (auto & it : s.e)         { was_on = was_on || it.second.built == it.second.gen; it.second.gen++; }
+    for (auto & it : lsa_means()) { was_on = was_on || it.second.built == it.second.gen; it.second.gen++; }
+    for (auto & it : lsa_picks()) { it.second.gen++; }
+    g_lsa_graph_gen.fetch_add(1, std::memory_order_relaxed);
+    if (was_on) {
+        LLAMA_LOG_WARN("%s: LSA caches hold sequence %d, ubatch is %s %d: LSA dense and compensation OFF for every "
+                "sequence until one restarts at position 0 (LSA on SJ-KVaRN serves one sequence at a time)\n", __func__,
+                (int) own, mixed ? "mixed, first sequence" : "sequence", (int) seq);
+    }
+    own = -1;
+}
+
 void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, const char * why) {
     static const bool test_skip = lsa_env_i64("LLAMA_LSA_IDX_TEST_SKIP_INVALIDATE", 0) != 0; // negative control only
     // LLAMA_LSA_IDX_TEST_GLOBAL_INVALIDATE=1: old behaviour (any cache's restore/shift invalidates every layer of every

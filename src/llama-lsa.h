@@ -356,4 +356,5 @@ bool llama_lsa_log_once(uint32_t & seen);
 // LLAMA_LSA_COMP=2 state line, printed when it changes for a sequence (WARN, so server.log keeps it):
 // "lsa comp on mode=2 seq=N" / "lsa comp OFF mode=2 seq=N: why". A run that must keep compensation greps for these.
 // OFF is kept until `fresh` (a ubatch at position 0), so layers or contexts that disagree cannot flip the line.
+void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed); // one-owner rule of the SJ-KVaRN LSA caches
 void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why, bool fresh);
