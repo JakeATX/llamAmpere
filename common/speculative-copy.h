@@ -97,6 +97,15 @@ inline common_speculative_copy_match common_speculative_copy_find(
 }
 
 // The tail to append after `draft` (the model drafter's block), at most n_tail tokens; empty when the gate fails.
+// verify-row cap of a copy round: rows = drafted tokens (block + tail) + the sampled token. Returns the most
+// tokens the round may draft; n_rows <= 0 means no cap.
+inline int32_t common_speculative_copy_total_cap(int32_t n_draft_max, int32_t n_rows) {
+    if (n_rows <= 0) {
+        return n_draft_max;
+    }
+    return n_draft_max < n_rows - 1 ? n_draft_max : n_rows - 1;
+}
+
 // The continuation is read from the virtual stream hist ++ id_last ++ draft ++ tail, so a match that runs into
 // the tokens being proposed keeps repeating.
 inline std::vector<llama_token> common_speculative_copy_propose(

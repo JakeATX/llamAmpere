@@ -1,3 +1,4 @@
+#include <algorithm>
 // asserts must stay live in Release builds: undefine NDEBUG before <cassert>
 #undef NDEBUG
 
@@ -279,7 +280,33 @@ static void test_rollback_depth(void) {
     }
 }
 
+// the verify-row cap: block + tail + 1 never passes n_rows, whatever the block, the tail ask and the tail cap
+static void test_rows_cap(void) {
+    assert(common_speculative_copy_total_cap(12, 0) == 12);
+    assert(common_speculative_copy_total_cap(12, 8) == 7);
+    assert(common_speculative_copy_total_cap(4, 8) == 4);
+    for (int rows = 1; rows <= 16; ++rows) {
+        for (int block = 1; block <= 8; ++block) {
+            for (int tail = 0; tail <= 15; ++tail) {
+                for (int tail_cap = 0; tail_cap <= 8; ++tail_cap) {
+                    const int total = common_speculative_copy_total_cap(block + tail, rows);
+                    // speculative.cpp: room = min(tail, n_max_total - n_block, n_tail_max)
+                    const int room = std::max(0, std::min(std::min(tail, total - block), tail_cap));
+                    if (block + 1 <= rows) {
+                        assert(block + room + 1 <= rows);
+                    } else {
+                        assert(room == 0);
+                    }
+                }
+            }
+        }
+    }
+    // ship shape: block 4, tail ask 8, tail cap n_rs_seq 4, 8 rows -> tail 3
+    assert(std::min(std::min(8, common_speculative_copy_total_cap(12, 8) - 4), 4) == 3);
+}
+
 int main(void) {
+    test_rows_cap();
     test_find_matches_reference();
     test_gate();
     test_point_mass_rows();

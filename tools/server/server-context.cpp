@@ -142,6 +142,13 @@ static int32_t server_copy_tail_cap() {
     return v;
 }
 
+//   LLAMA_SPEC_COPY_ROWS       verify rows a copy round may use, block + tail + the sampled token (default 8: the
+//                              dense kernels switch path at 9 rows and a 9-row verify costs ~2x an 8-row one); 0: no cap
+static int32_t server_copy_rows() {
+    static const int32_t v = common_speculative_copy_params::env_int("LLAMA_SPEC_COPY_ROWS", 8, 0, 64);
+    return v;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -5779,7 +5786,10 @@ private:
                         } else {
                             // copy mode: the lookup tail may use what the context and the request still allow;
                             // no tail under a shared verify budget (the rows are already rationed)
-                            common_speculative_get_draft_params(spec.get(), slot.id).n_max_total = n_draft_max;
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_max_total =
+                                params_base.speculative.copy_tail > 0
+                                    ? common_speculative_copy_total_cap(n_draft_max, server_copy_rows())
+                                    : n_draft_max;
                             // a tail no longer than the recurrent snapshots: a miss inside it rolls back in place
                             int32_t tail_cap = server_copy_tail_cap();
                             if (tail_cap < 0) {
