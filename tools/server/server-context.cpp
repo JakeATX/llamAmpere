@@ -149,6 +149,17 @@ static int32_t server_copy_rows() {
     return v;
 }
 
+// with keep-base on, a copy round never passes the widest batch that keeps its pre-round plane, so every wide copy
+// round takes the keep-base branch (no round falls back to a checkpoint)
+static int32_t server_copy_rows_kb() {
+    const int32_t rows = server_copy_rows();
+    const int32_t kb   = (int32_t) llama_n_rs_keep_base();
+    if (kb <= 0) {
+        return rows;
+    }
+    return rows > 0 ? std::min(rows, kb) : kb;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -1049,6 +1060,8 @@ struct server_slot {
     uint64_t              spec_save_us          = 0;
     uint64_t              spec_save_reused      = 0;
     uint64_t              spec_inplace_rounds   = 0;
+    uint64_t              spec_wide_rounds      = 0; // rounds whose draft is longer than n_rs_seq (hybrid target)
+    uint64_t              spec_kb_rounds        = 0; // of those, rounds that kept the pre-round plane (no checkpoint)
     uint64_t              spec_replay_prefix_n  = 0;
 
     std::vector<double> verify_budget_accept;
@@ -1115,6 +1128,8 @@ struct server_slot {
         spec_save_us = 0;
         spec_save_reused = 0;
         spec_inplace_rounds = 0;
+        spec_wide_rounds = 0;
+        spec_kb_rounds = 0;
         spec_replay_prefix_n = 0;
         spec_adapt = {};
         verify_budget_accept.clear();
@@ -1558,6 +1573,12 @@ struct server_slot {
                         ", replayed committed tokens = %" PRIu64 "\n",
                         spec_save_rounds, spec_save_rounds > 0 ? (double) spec_save_us / 1000.0 / (double) spec_save_rounds : 0.0,
                         spec_save_reused, spec_inplace_rounds, spec_replay_prefix_n);
+            }
+            if (spec_wide_rounds > 0) {
+                // the fused GDN snapshot write needs min(n, K) rows; a keep-base round writes K - 1 (by the code, not a runtime probe)
+                SLT_INF(*this, " keep-base rounds = %lu / wide rounds = %lu, keep-base memory = %s, fused snapshot write = %s\n",
+                        spec_kb_rounds, spec_wide_rounds, llama_n_rs_keep_base() > 0 ? "on" : "off",
+                        spec_kb_rounds > 0 ? "no (keep-base rounds)" : "yes");
             }
             if (spec_adapt.active()) {
                 SLT_INF(*this, " adaptive depth (BL6a) = %s\n", spec_adapt.summary().c_str());
@@ -2239,7 +2260,9 @@ private:
 #if !defined(_WIN32)
         // copy mode: a wide verify batch keeps its pre-round recurrent plane, so a block miss needs no checkpoint
         // (LLAMA_RS_KEEP_BASE=0 in the environment keeps the per-round checkpoint)
-        if (params.speculative.copy_tail > 0) {
+        // Set only when every wide round of this server can take the keep-base branch (one slot, in-place rollback
+        // on): the memory must not keep a base plane while the server also saves checkpoints.
+        if (params.speculative.copy_tail > 0 && server_copy_inplace() && params.n_parallel == 1) {
             setenv("LLAMA_RS_KEEP_BASE", "1", 0);
         }
 #endif
@@ -5796,7 +5819,7 @@ private:
                             // no tail under a shared verify budget (the rows are already rationed)
                             common_speculative_get_draft_params(spec.get(), slot.id).n_max_total =
                                 params_base.speculative.copy_tail > 0
-                                    ? common_speculative_copy_total_cap(n_draft_max, server_copy_rows())
+                                    ? common_speculative_copy_total_cap(n_draft_max, server_copy_rows_kb())
                                     : n_draft_max;
                             // a tail no longer than the recurrent snapshots: a miss inside it rolls back in place
                             int32_t tail_cap = server_copy_tail_cap();
@@ -5873,10 +5896,16 @@ private:
                 // copy mode: the memory keeps the pre-round plane of this verify batch (one slot, draft + sampled token
                 // in one ubatch), so a reject deeper than the tail rolls the whole batch back in place and replays
                 const bool keep_base = use_ckpt_tgt && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
-                    params_base.speculative.copy_tail > 0 && server_copy_inplace() && ctx_dft == nullptr &&
-                    generating.size() == 1 && slot.spec_replay_prefix.empty() &&
+                    params_base.speculative.copy_tail > 0 && server_copy_inplace() &&
+                    slot.spec_replay_prefix.empty() &&
                     draft.size() + 1 <= llama_n_rs_keep_base();
+                // A draft context (MTP) keeps its own handling: its checkpoint below when it needs one, load_dft on
+                // the restore path, and the seq_rm above at the next round.
                 slot.spec_round_kb = keep_base;
+                if (use_ckpt_tgt && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                    slot.spec_wide_rounds += 1;
+                    slot.spec_kb_rounds   += keep_base ? 1 : 0;
+                }
 
                 if (keep_base) {
                     ckpt.clear_tgt();
