@@ -910,7 +910,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
     if (lsa_n_blk > 0 && lsa_u_blk) {
         llama_lsa_set_mean_inputs(lsa_u_blk, lsa_u_rblk, lsa_q_ring, lsa_q_cell ? lsa_q_cell : self_k_idxs, lsa_n_blk, lsa_ring_n,
-                lsa_ring_rows);
+                lsa_ring_rows, llama_lsa_ubatch_seq(ubatch));
     }
     for (const auto & c : lsa_idx_commit) {
         llama_lsa_idx_commit(c.first, c.second);
@@ -1535,7 +1535,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->lsa_n_blk > 0 && inp_attn->lsa_u_blk) {
         llama_lsa_set_mean_inputs(inp_attn->lsa_u_blk, inp_attn->lsa_u_rblk, inp_attn->lsa_q_ring,
                 inp_attn->lsa_q_cell ? inp_attn->lsa_q_cell : inp_attn->self_k_idxs, inp_attn->lsa_n_blk, inp_attn->lsa_ring_n,
-                inp_attn->lsa_ring_rows);
+                inp_attn->lsa_ring_rows, llama_lsa_ubatch_seq(ubatch));
     }
     for (const auto & c : inp_attn->lsa_idx_commit) {
         llama_lsa_idx_commit(c.first, c.second);
@@ -6045,17 +6045,19 @@ bool llm_graph_context::build_attn_lsa_mean_refresh(
     if (!valid && (!sj || fresh)) {
         inp->lsa_mean_commit.emplace_back(kb, epoch);
     }
-    const int32_t seq0 = ubatch.seq_id && ubatch.n_seq_id && ubatch.n_tokens > 0 && ubatch.n_seq_id[0] > 0 ? ubatch.seq_id[0][0] : -1;
+    const int32_t seq0 = llama_lsa_ubatch_seq(&ubatch);
     if (sj && !valid && !fresh) {
         static uint32_t warned_ep = 0;
         if (llama_lsa_log_once(warned_ep)) {
             LLAMA_LOG_WARN("%s: LSA block means on SJ-KVaRN are stale (restore or K shift); compensation off until a "
                     "sequence restarts at position 0\n", __func__);
         }
-        llama_lsa_comp_note(false, seq0, 2, "block means are stale (restore without means, K shift, or a rewind past the staging ring)");
+        llama_lsa_comp_note(false, seq0, 2, "block means are stale (restore without means, K shift, or a rewind past the staging ring)", false);
         return false;
     }
-    llama_lsa_comp_note(true, seq0, 2, nullptr);
+    if (sj && (nbs > 0 || fresh)) {
+        llama_lsa_comp_note(true, seq0, 2, nullptr, fresh);
+    }
     *kmv = kw;
     *vmv = vw;
     *nbs_out = nbs;

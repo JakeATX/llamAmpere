@@ -297,7 +297,10 @@ void llama_lsa_log_epoch_bump() {
     g_lsa_log_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
-void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why) {
+void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why, bool fresh) {
+    if (seq < 0) {
+        return; // graph reserve / mixed ubatch
+    }
     static std::mutex mtx;
     static std::map<int32_t, bool> st;
     static uint32_t ep = 0;
@@ -308,7 +311,7 @@ void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why) {
         st.clear();
     }
     auto it = st.find(seq);
-    if (it != st.end() && it->second == on) {
+    if (it != st.end() && (it->second == on || (on && !fresh))) {
         return;
     }
     st[seq] = on;
@@ -653,6 +656,7 @@ struct lsa_idx_store {
     std::mutex                                     mtx;
     std::map<const ggml_tensor *, lsa_idx_entry>   e;
     int64_t                                        ring_hi = 0; // LLAMA_LSA_COMP=2 on SJ-KVaRN: staging ring holds positions [ring_hi - n_ring, ring_hi)
+    int32_t                                        ring_seq = -1; // sequence of the last ubatch that moved ring_hi (-1: none or mixed)
     int64_t                                        ring_lo = 0; // ... but none below ring_lo: set by a far rewind to a block start, where the
                                                                 // ring rows under the rewind point still hold higher (old) positions
     uint64_t                                       seq     = 0; // invalidate counter (entry touch)
@@ -1335,6 +1339,18 @@ void llama_lsa_set_q_cell(ggml_tensor * q_cell, const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(q_cell, rows.data(), 0, rows.size()*sizeof(int64_t));
 }
 
+int32_t llama_lsa_ubatch_seq(const llama_ubatch * ubatch) {
+    if (!ubatch || !ubatch->seq_id || !ubatch->n_seq_id || ubatch->n_tokens == 0) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->n_seq_id[i] != 1 || ubatch->seq_id[i][0] != ubatch->seq_id[0][0]) {
+            return -1;
+        }
+    }
+    return ubatch->seq_id[0][0];
+}
+
 void llama_lsa_set_q_blk(ggml_tensor * q_blk, const ggml_tensor * rows_i64, int64_t n_blocks) {
     if (!q_blk || !q_blk->buffer || !rows_i64 || !rows_i64->buffer) {
         return;
@@ -1355,7 +1371,7 @@ void llama_lsa_set_q_blk(ggml_tensor * q_blk, const ggml_tensor * rows_i64, int6
 }
 
 void llama_lsa_set_mean_inputs(ggml_tensor * u_blk, ggml_tensor * u_rblk, ggml_tensor * q_ring, const ggml_tensor * rows_i64,
-        int64_t n_blocks, int64_t n_ring, bool ring_rows) {
+        int64_t n_blocks, int64_t n_ring, bool ring_rows, int32_t seq) {
     if (!u_blk || !u_blk->buffer || !rows_i64 || !rows_i64->buffer || n_blocks <= 0) {
         return;
     }
@@ -1404,7 +1420,8 @@ void llama_lsa_set_mean_inputs(ggml_tensor * u_blk, ggml_tensor * u_rblk, ggml_t
         const bool    far = (p0/B)*B < lo;
         if (p0 == 0) {
             s.ring_lo = 0;
-        } else if (far && p0 % B == 0 && p0 <= s.ring_hi) {
+        } else if (far && p0 % B == 0 && p0 <= s.ring_hi && seq >= 0 && seq == s.ring_seq) {
+            // same sequence only: the means and the ring are one set per K cache tensor, shared by all its sequences
             s.ring_lo = p0; // ring rows for positions below p0 are stale from now on
         } else if (far || p0 > s.ring_hi) {
             bool was_on = false;
@@ -1418,7 +1435,8 @@ void llama_lsa_set_mean_inputs(ggml_tensor * u_blk, ggml_tensor * u_rblk, ggml_t
                         (long long) std::max<int64_t>(lo, 0), (long long) s.ring_hi);
             }
         }
-        s.ring_hi = p1;
+        s.ring_hi  = p1;
+        s.ring_seq = seq;
     }
     if (ring_rows && n_ring > 0) {
         // carry ring: the graph gathers each block row by row from [carry ring (n_ring rows) ; this ubatch's rows]
