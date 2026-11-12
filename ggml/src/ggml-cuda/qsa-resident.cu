@@ -191,6 +191,10 @@ size_t ggml_backend_cuda_qsa_resident_device_bytes(ggml_backend_buffer_type_t bu
     return slots*(t->stride + sizeof(int32_t)) + sizeof(ggml_cuda_qsa_resident_map);
 }
 
+size_t ggml_backend_cuda_qsa_resident_shared_bytes(ggml_backend_buffer_type_t buft, const ggml_context * ctx) {
+    return ggml_cuda_qsa_clock_is_buft(buft) ? ggml_backend_cuda_qsa_clock_shared_bytes(buft, ctx) : 0;
+}
+
 const char * ggml_cuda_qsa_resident_body(const ggml_tensor * body) {
     const ggml_tensor * root = body;
     while (root->view_src) root = root->view_src;

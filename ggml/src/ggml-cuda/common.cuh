@@ -1352,6 +1352,7 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     uint64_t moe_cache_generation = 0;
+    uint64_t lsa_j3_generation = 0; // GGML_CUDA_LSA_J3_GRAPHS: see ggml_cuda_lsa_j3_generation
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;

@@ -5155,6 +5155,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
+        {"--attn-sparse"}, "{none,lsa,lsa-pos,lsa-oracle}",
+        "EXPERIMENTAL, lossy: latent sparse attention quality probe (default: none). Needs --attn-sparse-map; tuning "
+        "via LLAMA_LSA_KEEP/KEEP_FRAC/SINKS/WINDOW/MIN_POS/MAX_ROWS; LLAMA_LSA_FAST=1 attends over the kept cells only (see src/llama-lsa.h)",
+        [](common_params &, const std::string & value) {
+            if (value != "none" && value != "lsa" && value != "lsa-pos" && value != "lsa-oracle") {
+                throw std::invalid_argument("invalid value, must be one of: none, lsa, lsa-pos, lsa-oracle");
+            }
+#ifdef _WIN32
+            _putenv_s("LLAMA_LSA_MODE", value.c_str());
+#else
+            setenv("LLAMA_LSA_MODE", value.c_str(), 1);
+#endif
+        }
+    ));
+    add_opt(common_arg(
+        {"--attn-sparse-map"}, "FNAME",
+        "LSA index map sidecar GGUF (scripts/lsa_convert_map.py)",
+        [](common_params &, const std::string & value) {
+#ifdef _WIN32
+            _putenv_s("LLAMA_LSA_MAP", value.c_str());
+#else
+            setenv("LLAMA_LSA_MAP", value.c_str(), 1);
+#endif
+        }
+    ));
+    add_opt(common_arg(
         {"--spec-mb-mtp"},
         {"--no-spec-mb-mtp"},
         "mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling. Keep a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens; "

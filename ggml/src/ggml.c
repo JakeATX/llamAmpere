@@ -1361,6 +1361,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_DOWN",
     "DSV4_HC_UP",
     "TOP_K_MASK",
+    "LSA_BLOCK_SELECT",
+    "LSA_COMP_MERGE",
+    "LSA_UNIT_LSE",
+    "LSA_PREFETCH",
 
     "UNARY",
 
@@ -1378,7 +1382,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1481,6 +1485,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_down(x, w_norm, w_down, w_inject)",
     "dsv4_hc_up(x, w_norm, down, w_up)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "lsa_block_select(s, cell_pos, q_pos)",
+    "lsa_comp_merge(o, lse, q, kmean, vmean, nd)",
+    "lsa_unit_lse(k, q, mask)",
+    "lsa_prefetch(desc, body, units)",
 
     "unary(x)",
 
@@ -1498,7 +1506,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5944,6 +5952,264 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+// ggml_lsa_block_select
+
+struct ggml_tensor * ggml_lsa_block_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * q_pos,
+        int                   B,
+        int                   window,
+        int                   sinks,
+        int                   kb,
+        int                   shared) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && cell_pos->type == GGML_TYPE_F32 && q_pos->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(cell_pos) && ggml_is_contiguous(q_pos));
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(B >= 1 && kb >= 1);
+    GGML_ASSERT(ggml_nelements(cell_pos) >= a->ne[0]*B);
+    GGML_ASSERT(ggml_nelements(q_pos) == a->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1]);
+
+    int32_t params[] = { B, window, sinks, kb, shared < 0 ? 0 : shared > 2 ? 2 : shared, 0, 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_LSA_BLOCK_SELECT;
+    result->src[0] = a;
+    result->src[1] = cell_pos;
+    result->src[2] = q_pos;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lsa_block_select_cells(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * q_pos,
+        int                   B,
+        float                 tau,
+        int                   window,
+        int                   sinks,
+        int                   kb,
+        int                   shared) {
+    GGML_ASSERT(s->type == GGML_TYPE_F32 && cell_pos->type == GGML_TYPE_F32 && q_pos->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(s) && ggml_is_contiguous(cell_pos) && ggml_is_contiguous(q_pos));
+    GGML_ASSERT(s->ne[2] == 1 && s->ne[3] == 1);
+    GGML_ASSERT(B >= 1 && kb >= 1);
+    const int64_t nbs = (s->ne[0] + B - 1)/B;
+    GGML_ASSERT(ggml_nelements(cell_pos) >= s->ne[0]);
+    GGML_ASSERT(ggml_nelements(q_pos) == s->ne[1]);
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(mask->ne[0] == s->ne[0] && mask->ne[1] >= s->ne[1] && mask->nb[0] == ggml_type_size(mask->type));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nbs, s->ne[1]);
+
+    int32_t params[] = { B, window, sinks, kb, shared < 0 ? 0 : shared > 2 ? 2 : shared, 1, 0 };
+    memcpy(&params[6], &tau, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_LSA_BLOCK_SELECT;
+    result->src[0] = s;
+    result->src[1] = cell_pos;
+    result->src[2] = q_pos;
+    result->src[3] = mask;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lsa_block_select_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * smx,
+        struct ggml_tensor  * smn,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * q_pos,
+        int                   nbs,
+        int                   B,
+        float                 tau,
+        int                   sum_mode,
+        int                   window,
+        int                   sinks,
+        int                   kb,
+        int                   shared) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q) && q->ne[2] == 1 && q->ne[3] == 1);
+    GGML_ASSERT(smx->type == GGML_TYPE_F16 && smn->type == GGML_TYPE_F16);
+    GGML_ASSERT(smx->ne[0] == q->ne[0] && smn->ne[0] == q->ne[0] && smx->nb[0] == 2 && smn->nb[0] == 2);
+    GGML_ASSERT(smx->nb[1] == smn->nb[1] && smx->ne[1] >= nbs && smn->ne[1] >= nbs);
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_F32 && q_pos->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(cell_pos) && ggml_is_contiguous(q_pos));
+    GGML_ASSERT(B >= 1 && kb >= 1 && nbs >= 1 && (sum_mode == 1 || sum_mode == 2));
+    GGML_ASSERT(ggml_nelements(cell_pos) >= (int64_t) nbs*B);
+    GGML_ASSERT(ggml_nelements(q_pos) == q->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nbs, q->ne[1]);
+
+    int32_t params[] = { B, window, sinks, kb, shared < 0 ? 0 : shared > 2 ? 2 : shared, 2, 0, 1, sum_mode };
+    memcpy(&params[6], &tau, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_LSA_BLOCK_SELECT;
+    result->src[0] = q;
+    result->src[1] = cell_pos;
+    result->src[2] = q_pos;
+    result->src[5] = smx;
+    result->src[6] = smn;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lsa_block_select_cells_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * q_pos,
+        int                   B,
+        float                 tau,
+        int                   window,
+        int                   sinks,
+        int                   kb,
+        struct ggml_tensor  * gate,
+        int                   gate_div) {
+    return ggml_lsa_block_select_cells_gated_ext(ctx, s, mask, cell_pos, q_pos, B, tau, window, sinks, kb, gate, gate_div, 0);
+}
+
+struct ggml_tensor * ggml_lsa_block_select_cells_gated_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * q_pos,
+        int                   B,
+        float                 tau,
+        int                   window,
+        int                   sinks,
+        int                   kb,
+        struct ggml_tensor  * gate,
+        int                   gate_div,
+        int                   shared) {
+    struct ggml_tensor * result = ggml_lsa_block_select_cells(ctx, s, mask, cell_pos, q_pos, B, tau, window, sinks, kb, shared);
+    GGML_ASSERT(gate && gate->type == GGML_TYPE_F32 && ggml_is_contiguous(gate) && gate_div >= 1);
+    GGML_ASSERT(gate->ne[1] == s->ne[1] && gate->ne[2] == 1 && gate->ne[3] == 1);
+    GGML_ASSERT(gate->ne[0]*gate_div >= result->ne[0]);
+    ggml_set_op_params_i32(result, 7, gate_div);
+    result->src[4] = gate;
+    return result;
+}
+
+// ggml_lsa_unit_lse
+
+struct ggml_tensor * ggml_lsa_unit_lse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * mask,
+        int                   F,
+        float                 tau) {
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q));
+    GGML_ASSERT(k->ne[0] == q->ne[0] && k->nb[0] == ggml_type_size(k->type) && k->ne[2] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(q->ne[2] == 1 && q->ne[3] == 1);
+    GGML_ASSERT(F >= 1 && F <= 128 && (F & (F - 1)) == 0 && k->ne[1] % F == 0);
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(mask->ne[0] == k->ne[1] && mask->ne[1] >= q->ne[1] && mask->nb[0] == ggml_type_size(mask->type));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k->ne[1]/F, q->ne[1]);
+
+    int32_t params[2] = { F, 0 };
+    memcpy(&params[1], &tau, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_LSA_UNIT_LSE;
+    result->src[0] = k;
+    result->src[1] = q;
+    result->src[2] = mask;
+
+    return result;
+}
+
+// ggml_lsa_prefetch
+
+struct ggml_tensor * ggml_lsa_prefetch(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * desc,
+        struct ggml_tensor  * body,
+        struct ggml_tensor  * units,
+        int                   unit,
+        int                   flags,
+        int                   src) {
+    GGML_ASSERT(desc->type == GGML_TYPE_I32 && ggml_is_contiguous(desc));
+    GGML_ASSERT(src >= 0 && src < GGML_LSA_PREFETCH_SOURCES);
+    GGML_ASSERT((flags & ~(GGML_LSA_PREFETCH_UNITS | GGML_LSA_PREFETCH_PREV | GGML_LSA_PREFETCH_PROTECT_PREV)) == 0);
+    GGML_ASSERT(((flags & GGML_LSA_PREFETCH_UNITS) != 0) == (units != NULL));
+    if (units) {
+        GGML_ASSERT(units->type == GGML_TYPE_F32 && ggml_is_contiguous(units) && units->ne[2] == 1 && units->ne[3] == 1);
+        GGML_ASSERT(unit >= 1 && unit <= 128 && (unit & (unit - 1)) == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    int32_t params[3] = { unit, flags, src };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_LSA_PREFETCH;
+    result->src[0] = desc;
+    result->src[1] = body;
+    result->src[2] = units;
+
+    return result;
+}
+
+// ggml_lsa_comp_merge
+
+struct ggml_tensor * ggml_lsa_comp_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * o_kept,
+        struct ggml_tensor  * lse,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kmv,
+        struct ggml_tensor  * vmv,
+        struct ggml_tensor  * nd,
+        int                   H_kv,
+        float                 scale,
+        float                 bias) {
+    GGML_ASSERT(o_kept->type == GGML_TYPE_F32 && lse->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 &&
+                nd->type == GGML_TYPE_F32 && kmv->type == GGML_TYPE_F16 && vmv->type == GGML_TYPE_F16);
+    const int64_t D = q->ne[0], H = q->ne[1], T = q->ne[2], nbs = nd->ne[0];
+    GGML_ASSERT(H_kv >= 1 && H % H_kv == 0 && q->ne[3] == 1);
+    GGML_ASSERT(kmv->ne[0] == D*H_kv && vmv->ne[0] % H_kv == 0);
+    const int64_t Dv = vmv->ne[0]/H_kv;
+    GGML_ASSERT(kmv->ne[1] >= nbs && vmv->ne[1] >= nbs && nd->ne[1] == T && ggml_nrows(nd) == T);
+    GGML_ASSERT(o_kept->ne[0] == Dv*H && ggml_nrows(o_kept) == T && ggml_nelements(lse) == H*T && lse->ne[0] == H);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && o_kept->nb[0] == sizeof(float) && nd->nb[0] == sizeof(float) &&
+                kmv->nb[0] == sizeof(ggml_fp16_t) && vmv->nb[0] == sizeof(ggml_fp16_t) && ggml_is_contiguous(lse));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Dv*H, T);
+
+    int32_t params[3] = { H_kv, 0, 0 };
+    memcpy(&params[1], &scale, sizeof(float));
+    memcpy(&params[2], &bias,  sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_LSA_COMP_MERGE;
+    result->src[0] = o_kept;
+    result->src[1] = lse;
+    result->src[2] = q;
+    result->src[3] = kmv;
+    result->src[4] = vmv;
+    result->src[5] = nd;
+
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -6115,7 +6381,7 @@ void ggml_flash_attn_ext_set_sj_kvarn(
         int32_t              bits_v,
         int32_t              n_kv_pad) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(a->src[9] == NULL && "kv_rows (ggml_flash_attn_ext_rows) is not supported with SJ-KVaRN");
+    GGML_ASSERT(ggml_flash_attn_ext_get_kv_rows(a) == NULL && "kv_rows (ggml_flash_attn_ext_rows) is not supported with SJ-KVaRN");
     GGML_ASSERT(a->src[3] == NULL || a->src[3]->type == GGML_TYPE_F16 || a->src[3]->type == GGML_TYPE_I32); // standard FA mask convention (F16 or packed)
     GGML_ASSERT((a->src[1]->type == GGML_TYPE_F16 || a->src[1]->type == GGML_TYPE_Q8_0 || a->src[1]->type == GGML_TYPE_TQ6_0) && a->src[1]->type == a->src[2]->type);
     GGML_ASSERT(body->type == GGML_TYPE_I8 && ggml_is_contiguous(body));
@@ -6136,6 +6402,121 @@ void ggml_flash_attn_ext_set_sj_kvarn(
 
 bool ggml_flash_attn_ext_is_sj_kvarn(const struct ggml_tensor * a) {
     return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[6] != NULL;
+}
+
+#define GGML_LSA_VK_PARAM 10
+
+void ggml_flash_attn_ext_set_lse(struct ggml_tensor * a, struct ggml_tensor * lse) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(ggml_get_op_params_i32(a, GGML_LSA_VK_PARAM) == 0);
+    GGML_ASSERT(lse->type == GGML_TYPE_F32 && ggml_is_contiguous(lse));
+    GGML_ASSERT(a->src[9] == NULL); // src[9] is free: no kv_rows (ggml_flash_attn_ext_rows) on an LSE node
+    GGML_ASSERT(lse->ne[0] == a->src[0]->ne[2] && lse->ne[1] == a->src[0]->ne[1] && lse->ne[2] == a->src[0]->ne[3] && lse->ne[3] == 1);
+    a->src[9] = lse;
+}
+
+void ggml_flash_attn_ext_set_lsa_blocks(struct ggml_tensor * a, struct ggml_tensor * sel, int32_t block) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && a->src[8] == NULL);
+    GGML_ASSERT(sel->type == GGML_TYPE_F32 && ggml_is_contiguous(sel) && ggml_nelements(sel) == sel->ne[0] && sel->ne[0] >= 1);
+    GGML_ASSERT(block >= 1 && (block & (block - 1)) == 0); // any power of 2: the kernels resolve the pick per position
+    GGML_ASSERT(a->src[3] != NULL && a->src[3]->type == GGML_TYPE_F16);
+    a->src[8] = sel;
+    ggml_set_op_params_i32(a, 9, block);
+}
+
+static void ggml_flash_attn_ext_set_lsa_vk_impl(struct ggml_tensor * a, struct ggml_tensor * ndsel, int32_t block,
+        int32_t n_vk, struct ggml_tensor * km, struct ggml_tensor * vm, float bias) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && a->src[7] == NULL && a->src[8] == NULL && a->src[9] == NULL);
+    GGML_ASSERT(ggml_flash_attn_ext_is_sj_kvarn(a));
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * k = a->src[1];
+    GGML_ASSERT(ndsel->type == GGML_TYPE_F32 && ggml_is_contiguous(ndsel) && ndsel->ne[0] >= 1 && ndsel->ne[1] == q->ne[1] &&
+                ndsel->ne[2] == 1 && ndsel->ne[3] == 1);
+    // block = mean block (n_vk == 0, >= 16) or the unit of the pick after the means (n_vk > 0, any power of 2)
+    GGML_ASSERT(block >= (n_vk > 0 ? 1 : 16) && (block & (block - 1)) == 0);
+    GGML_ASSERT(n_vk >= 0 && n_vk < ndsel->ne[0]); // n_vk > 0: means [0, n_vk), unit pick after them
+    const int64_t nm = n_vk > 0 ? n_vk : ndsel->ne[0];
+    GGML_ASSERT(a->src[3] != NULL && a->src[3]->type == GGML_TYPE_F16 && q->ne[3] == 1);
+    for (int i = 0; i < 2; ++i) {
+        const struct ggml_tensor * m = i == 0 ? km : vm;
+        const int64_t d = i == 0 ? q->ne[0] : a->src[2]->ne[0];
+        GGML_ASSERT(m->type == GGML_TYPE_F16 && m->ne[0] == d*k->ne[2] && m->ne[1] >= nm && m->nb[0] == sizeof(ggml_fp16_t) &&
+                    m->ne[2] == 1 && m->ne[3] == 1);
+    }
+    float softcap;
+    memcpy(&softcap, (const float *) a->op_params + 2, sizeof(float));
+    GGML_ASSERT(softcap == 0.0f);
+    a->src[7] = km;
+    a->src[8] = ndsel;
+    a->src[9] = vm;
+    ggml_set_op_params_i32(a, 9, block);
+    ggml_set_op_params_i32(a, GGML_LSA_VK_PARAM, 1);
+    ggml_set_op_params_f32(a, GGML_LSA_VK_PARAM + 1, bias);
+    ggml_set_op_params_i32(a, GGML_LSA_VK_PARAM + 2, n_vk);
+}
+
+void ggml_flash_attn_ext_set_lsa_vk(struct ggml_tensor * a, struct ggml_tensor * ndsel, int32_t block,
+        struct ggml_tensor * km, struct ggml_tensor * vm, float bias) {
+    ggml_flash_attn_ext_set_lsa_vk_impl(a, ndsel, block, 0, km, vm, bias);
+}
+
+void ggml_flash_attn_ext_set_lsa_vk_units(struct ggml_tensor * a, struct ggml_tensor * ndsel, int32_t unit,
+        int32_t n_vk, struct ggml_tensor * km, struct ggml_tensor * vm, float bias) {
+    GGML_ASSERT(n_vk >= 1);
+    ggml_flash_attn_ext_set_lsa_vk_impl(a, ndsel, unit, n_vk, km, vm, bias);
+}
+
+int32_t ggml_flash_attn_ext_get_lsa_sel_off(const struct ggml_tensor * a) {
+    return ggml_flash_attn_ext_get_lsa_vk(a) ? ggml_get_op_params_i32(a, GGML_LSA_VK_PARAM + 2) : 0;
+}
+
+int32_t ggml_flash_attn_ext_get_lsa_vk_n(const struct ggml_tensor * a) {
+    if (!ggml_flash_attn_ext_get_lsa_vk(a)) {
+        return 0;
+    }
+    const int32_t off = ggml_flash_attn_ext_get_lsa_sel_off(a);
+    return off > 0 ? off : (int32_t) a->src[8]->ne[0];
+}
+
+bool ggml_flash_attn_ext_get_lsa_vk(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(a, GGML_LSA_VK_PARAM) != 0;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_get_lse(const struct ggml_tensor * a) {
+    return ggml_flash_attn_ext_get_lsa_vk(a) || ggml_flash_attn_ext_get_kv_rows(a) ? NULL : a->src[9];
+}
+
+// FLASH_ATTN_EXT src[9] has three users in this tree: upstream kv_rows (I32 row lists, ggml_flash_attn_ext_rows), the
+// LSA LSE output (F32, ggml_flash_attn_ext_set_lse) and the LSA virtual-key V means (F16, ggml_flash_attn_ext_set_lsa_vk).
+// Each setter asserts src[9] is free and fixes the type, so the type tells them apart.
+struct ggml_tensor * ggml_flash_attn_ext_get_kv_rows(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[9] != NULL && a->src[9]->type == GGML_TYPE_I32 ? a->src[9] : NULL;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_get_lsa_vk_vm(const struct ggml_tensor * a) {
+    return ggml_flash_attn_ext_get_lsa_vk(a) ? a->src[9] : NULL;
+}
+
+bool ggml_flash_attn_ext_uses_src9(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[9] != NULL;
+}
+
+int32_t ggml_flash_attn_ext_get_lsa_block(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT && a->src[8] != NULL && a->src[8]->type == GGML_TYPE_F32 ?
+        ggml_get_op_params_i32(a, 9) : 0;
+}
+
+void ggml_flash_attn_ext_set_lsa_spec_recall(struct ggml_tensor * a, struct ggml_tensor * sel) {
+    GGML_ASSERT(ggml_flash_attn_ext_is_sj_kvarn(a) && a->src[8] == NULL);
+    GGML_ASSERT(ggml_get_op_params_i32(a, 9) == 0 && !ggml_flash_attn_ext_get_lsa_vk(a));
+    GGML_ASSERT(sel->type == GGML_TYPE_F32 && ggml_is_contiguous(sel) &&
+            sel->ne[1] == a->src[0]->ne[1] && sel->ne[2] == 3 && sel->ne[3] == 4);
+    a->src[8] = sel;
+    ggml_set_op_params_i32(a, 14, 1);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_get_lsa_spec_recall(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(a, 14) == 1 ? a->src[8] : NULL;
 }
 
 #define GGML_SJKVARN_ROT_PARAM 8

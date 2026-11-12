@@ -1047,7 +1047,7 @@ class tensor_traits_common : public tensor_traits_base {
                 }
             case GGML_OP_FLASH_ATTN_EXT:
                 // K/V row lists are handled by the generic CPU path
-                if (op->src[5] != nullptr || op->src[9] != nullptr) { // src[9] = kv_rows here, src[5] = SJ-KVaRN body
+                if (op->src[5] != nullptr || ggml_flash_attn_ext_uses_src9(op)) { // slot 9 = kv_rows / LSA here, src[5] = SJ-KVaRN body
                     return false;
                 }
                 forward_flash_attn_ext_f16(params, op);

@@ -652,6 +652,10 @@ extern "C" {
         GGML_OP_DSV4_HC_DOWN,
         GGML_OP_DSV4_HC_UP,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_LSA_BLOCK_SELECT,
+        GGML_OP_LSA_COMP_MERGE,
+        GGML_OP_LSA_UNIT_LSE,
+        GGML_OP_LSA_PREFETCH,
 
         GGML_OP_UNARY,
 
@@ -2595,6 +2599,144 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // fork (LSA block pick, opt-in): one op for "rank the 128-cell blocks, take the best kb per row".
+    // a: block scores F32 [nbs, T]; cell_pos: F32 [n_kv] (n_kv >= nbs*B) cell positions; q_pos: F32 [T] row positions.
+    // Block b (first cell position p = cell_pos[b*B]) may not take a pick when it lies in row t's window
+    // (p - q_pos[t] + window - 0.5 > 0, also future/empty cells) or wholly in the sinks (sinks - B + 0.5 - p > 0).
+    // Each row selects the min(kb, eligible) eligible blocks with the highest score, ties to the lower block index.
+    // shared (T > 1): 0 = per row; 1 = the score summed over all rows; 2 = max over rows r of a[r][b] - lse_r, lse_r =
+    // logsumexp of row r over all blocks (rows whose lse is -inf skipped): one pick for every row in which a block one
+    // row needs strongly stays in. Result F32 [nbs, T]: 1 selected, 0 not.
+    GGML_API struct ggml_tensor * ggml_lsa_block_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * cell_pos,
+            struct ggml_tensor  * q_pos,
+            int                   B,
+            int                   window,
+            int                   sinks,
+            int                   kb,
+            int                   shared);
+
+    // same pick from per-cell scores s: F32 [n_kv, T] (+ mask F16/F32 [n_kv, T], may be NULL): block b covers cells
+    // [b*B, min((b+1)*B, n_kv)) and scores logsumexp(tau*s + mask) over them (the row's softmax normalizer is common to
+    // every block, so this ranks like the log of the block's softmax share). Result F32 [ceil(n_kv/B), T].
+    GGML_API struct ggml_tensor * ggml_lsa_block_select_cells(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * cell_pos,
+            struct ggml_tensor  * q_pos,
+            int                   B,
+            float                 tau,
+            int                   window,
+            int                   sinks,
+            int                   kb,
+            int                   shared);
+
+    // same pick from per-block summaries (LLAMA_LSA_SUM_OP): q F32 [d, T] contiguous query index rows; smx, smn F16
+    // [d, >= nbs] (nb[0] = 2, same nb[1]) the two summary planes of each block. Block score of row t:
+    // sum_mode 1: sum_c max(q_c*smx_c, q_c*smn_c) (upper bound of the cells' dot products from channel max / min);
+    // sum_mode 2: tau*(q.smx) + tau^2/2*((q*q).smn) (Gaussian log-mass estimate from channel mean / variance).
+    // The scores are computed inside the select (no [nbs, T] score tensor). Result F32 [nbs, T].
+    GGML_API struct ggml_tensor * ggml_lsa_block_select_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * smx,
+            struct ggml_tensor  * smn,
+            struct ggml_tensor  * cell_pos,
+            struct ggml_tensor  * q_pos,
+            int                   nbs,
+            int                   B,
+            float                 tau,
+            int                   sum_mode,
+            int                   window,
+            int                   sinks,
+            int                   kb,
+            int                   shared);
+
+    // two-stage (refine) pick: same as ggml_lsa_block_select_cells with units of B cells, plus a gate: unit u of row t
+    // may take a pick only if gate[t][u/gate_div] > 0.5 (gate F32 [>= ceil(nunits/gate_div), T], e.g. the 0/1 output
+    // of a coarser block select). Not shared. Result F32 [ceil(n_kv/B), T].
+    GGML_API struct ggml_tensor * ggml_lsa_block_select_cells_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * cell_pos,
+            struct ggml_tensor  * q_pos,
+            int                   B,
+            float                 tau,
+            int                   window,
+            int                   sinks,
+            int                   kb,
+            struct ggml_tensor  * gate,
+            int                   gate_div);
+
+    // same with a shared mode (as ggml_lsa_block_select_cells): with a gate that is equal for every row (e.g. the output
+    // of a shared coarse select) every row gets the same unit pick
+    GGML_API struct ggml_tensor * ggml_lsa_block_select_cells_gated_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * cell_pos,
+            struct ggml_tensor  * q_pos,
+            int                   B,
+            float                 tau,
+            int                   window,
+            int                   sinks,
+            int                   kb,
+            struct ggml_tensor  * gate,
+            int                   gate_div,
+            int                   shared);
+
+    // fork (LSA fast compensation, opt-in): merge the masked attention output with the dropped blocks' stand-ins.
+    // o_kept: F32 [Dv*H, T] masked FA output; lse: F32 [H, T] its row log-sum-exp; q: F32 [D, H, T] (unscaled);
+    // kmv/vmv: F16 [D*H_kv, >= nbs] / [Dv*H_kv, >= nbs] block mean K/V; nd: F32 [nbs, T] dropped cells per block.
+    // Per row t and head h (kv head g = h/(H/H_kv)): s_b = scale*q.Kmean_b + log(nd_b) + bias for nd_b >= 0.5 (else
+    // left out), P = softmax([s_b | lse]), out = P_lse*o_kept + sum_b P_b*Vmean_b. Result F32 [Dv*H, T].
+    GGML_API struct ggml_tensor * ggml_lsa_comp_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * o_kept,
+            struct ggml_tensor  * lse,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kmv,
+            struct ggml_tensor  * vmv,
+            struct ggml_tensor  * nd,
+            int                   H_kv,
+            float                 scale,
+            float                 bias);
+
+    // fork (LSA pick, opt-in LLAMA_LSA_UNIT_OP): index scoring and unit logsumexp in one op, so the [n_kv, T] score
+    // tensor is never written. k: F16/F32 [d, n_kv] index keys (rows may be strided); q: F32 [d, T] query latents;
+    // mask: F16/F32 [n_kv, >= T] or NULL. x_c = tau*dot(k_c, q_t) + mask[t][c]; result F32 [n_kv/F, T] with
+    // out[t][u] = logsumexp over the F cells of unit u of x (-inf if all -inf). F: power of 2, 1..128, divides n_kv.
+    GGML_API struct ggml_tensor * ggml_lsa_unit_lse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * mask,
+            int                   F,
+            float                 tau);
+
+    // LLAMA_LSA_J3 (opt-in): side-stream prefetch into the record-page slots of a later LSA layer's resident SJ-KVaRN
+    // body. desc: that layer's SJ-KVaRN descriptor (I32); body: its body tensor; units: F32 [n_units, rows] 0/1
+    // prediction over unit-cell groups of the cell axis (1 = predicted read), or NULL. flags: GGML_LSA_PREFETCH_*.
+    // src: per-source scratch index, 0..GGML_LSA_PREFETCH_SOURCES-1. Result: F32 [1] set to 0. Only the slot
+    // map changes, never what attention reads (a record without a slot is read from the master), so output does not
+    // depend on it. Backends without record-page slots treat it as a no-op.
+#define GGML_LSA_PREFETCH_UNITS        1 // mark the records the units predict
+#define GGML_LSA_PREFETCH_PREV         2 // also mark the records the layer's previous own resolve picked
+#define GGML_LSA_PREFETCH_PROTECT_PREV 4 // never evict the previous own pick's slots for a prefetch
+#define GGML_LSA_PREFETCH_SOURCES      2
+    GGML_API struct ggml_tensor * ggml_lsa_prefetch(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * desc,
+            struct ggml_tensor  * body,
+            struct ggml_tensor  * units,
+            int                   unit,
+            int                   flags,
+            int                   src);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2690,6 +2832,50 @@ extern "C" {
     // basis and applies the plain 256-point Hadamard H/16 to Q and to the output itself (op_params[8]), replacing the
     // two GGML_OP_TURBO_WHT nodes around it. Bit-identical to the unfused graph. Only for the plain-256 body bases.
     GGML_API void ggml_flash_attn_ext_set_sj_kvarn_rot(struct ggml_tensor * a, int32_t group);
+
+    // fork (LSA compensation, opt-in): the op also writes each output row's log-sum-exp (natural log of the softmax
+    // denominator over scaled logits + mask) to lse, F32 [n_head, n_tokens, n_seq] contiguous (src[9]). Served by the
+    // CPU reference and by CUDA launches that combine parallel KV blocks (not stream-k fixup launches).
+    GGML_API void ggml_flash_attn_ext_set_lse(struct ggml_tensor * a, struct ggml_tensor * lse);
+    // fork (LSA block list, opt-in, SJ-KVaRN decode): sel is F32 [nbs] contiguous, one block pick shared by all query
+    // rows (src[8]); block = cells per pick block (power of two >= 16, op_params[9]). A mask entry equal to
+    // GGML_LSA_MASK_SEL at position p means "visible iff sel[p / block] > 0.5" (blocks past nbs: hidden); every other
+    // entry keeps its usual meaning. One layer-independent F16 mask then serves every LSA layer of the graph instead of a
+    // per-layer full-width mask. Served by the CPU SJ-KVaRN reference and the CUDA SJ-KVaRN stream kernel (n_q <= 8).
+#define GGML_LSA_MASK_SEL (-32768.0f)
+    GGML_API void    ggml_flash_attn_ext_set_lsa_blocks(struct ggml_tensor * a, struct ggml_tensor * sel, int32_t block);
+    GGML_API int32_t ggml_flash_attn_ext_get_lsa_block(const struct ggml_tensor * a);
+    // Logging-only 16/128-cell predicted picks in an otherwise unused source; never consumed by attention.
+    // Diagnostic picks [n_units, n_query_rows, 3 look-ahead horizons, 2 budgets (1.0x, 1.5x)].
+    GGML_API void ggml_flash_attn_ext_set_lsa_spec_recall(struct ggml_tensor * a, struct ggml_tensor * sel);
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_lsa_spec_recall(const struct ggml_tensor * a);
+    // fork (LSA compensation as virtual keys, opt-in, SJ-KVaRN decode): replaces set_lsa_blocks + set_lse +
+    // ggml_lsa_comp_merge with one FA call. ndsel is F32 [nbs, n_q] contiguous: entry (b, t) < 0.5 = block b picked
+    // (its GGML_LSA_MASK_SEL cells are visible; every row holds the same pick, row 0 is read for it), else 1 + the number
+    // of row t's visible cells dropped from block b. km/vm (src[7]/src[9]) are F16 [D*H_kv, >= nbs] block mean K/V rows in
+    // the cache basis (rotated with the SJ-KVaRN cache). Each dropped block with n >= 0.5 enters row t's softmax as one
+    // extra key: logit scale*q.Kmean_b + log(n) + bias, value Vmean_b. No LSE output (src[9] holds vm).
+    GGML_API void    ggml_flash_attn_ext_set_lsa_vk(struct ggml_tensor * a, struct ggml_tensor * ndsel, int32_t block,
+            struct ggml_tensor * km, struct ggml_tensor * vm, float bias);
+    GGML_API bool    ggml_flash_attn_ext_get_lsa_vk(const struct ggml_tensor * a);
+    // same with a finer pick than the mean blocks (LLAMA_LSA_REFINE units): ndsel is F32 [n_vk + nu, n_q]; entries
+    // [0, n_vk) of row t = 1 + row t's visible cells dropped from mean block b (< 1.5: no extra key), entries
+    // [n_vk, n_vk + nu) of row 0 = the unit pick (> 0.5 = picked; every row holds the same pick); unit = cells per unit
+    // (power of two >= 16, the mask's GGML_LSA_MASK_SEL cells resolve by unit); km/vm hold >= n_vk mean rows.
+    GGML_API void    ggml_flash_attn_ext_set_lsa_vk_units(struct ggml_tensor * a, struct ggml_tensor * ndsel, int32_t unit,
+            int32_t n_vk, struct ggml_tensor * km, struct ggml_tensor * vm, float bias);
+    // virtual-key mean blocks of a virtual-key node; offset (floats) of the pick in ndsel row 0 (0: the plane is the pick)
+    GGML_API int32_t ggml_flash_attn_ext_get_lsa_vk_n(const struct ggml_tensor * a);
+    GGML_API int32_t ggml_flash_attn_ext_get_lsa_sel_off(const struct ggml_tensor * a);
+    // LSE output tensor of an FA node (src[9]) or NULL; NULL for a virtual-key node
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_lse(const struct ggml_tensor * a);
+    // upstream kv_rows (I32, src[9]) of an FA node or NULL; NULL for an LSA LSE / virtual-key node (also src[9])
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_kv_rows(const struct ggml_tensor * a);
+    // LSA virtual-key V means (F16, ggml_flash_attn_ext_set_lsa_vk), NULL when the node has none
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_get_lsa_vk_vm(const struct ggml_tensor * a);
+    // true when FLASH_ATTN_EXT src[9] holds anything (kv_rows, LSA LSE or LSA V means): backends that implement none
+    // of the three refuse the node with this
+    GGML_API bool ggml_flash_attn_ext_uses_src9(const struct ggml_tensor * a);
     GGML_API int32_t ggml_flash_attn_ext_get_sj_kvarn_rot(const struct ggml_tensor * a);
     // compile default GGML_SJKVARN_FUSED_ROT_DEFAULT (CMake GGML_SJKVARN_FUSED_ROT, ON), env GGML_SJKVARN_FUSED_ROT=0|1 overrides
     GGML_API bool ggml_sj_kvarn_fused_rot_enabled(void);

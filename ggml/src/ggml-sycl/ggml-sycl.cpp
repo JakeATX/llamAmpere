@@ -7787,7 +7787,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_FLASH_ATTN_EXT:
             // K/V row lists (ggml_flash_attn_ext_rows) are not supported
             // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
-            return op->src[9] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
+            return !ggml_flash_attn_ext_uses_src9(op) && ggml_sycl_flash_attn_ext_supported(device, op);
         case GGML_OP_TURBO_WHT:
             {
                 const ggml_tensor * scale = op->src[1];

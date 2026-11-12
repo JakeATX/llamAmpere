@@ -41,6 +41,7 @@ struct llama_layer;
 struct llama_model;
 struct llama_prec_policy;
 struct llama_hadamard;
+struct llama_lsa_idx_slot;
 
 class llama_moe_cache;
 class llama_ple_prefetch;
@@ -477,6 +478,80 @@ public:
     // multi-stream SJ-KVaRN: attended (padded) position count per stream of the ubatch; one FA node per stream
     std::vector<uint32_t> sj_kvarn_n_kv_streams;
     bool skip_unused = false; // fork: KV-only device-input graphs do not consume attention geometry
+
+    // LSA probe (llama-lsa.h): F32 [n_kv, 1] position of each KV cell (1e9 for empty cells) and F32 [1, n_tokens]
+    // position of each query row; nullptr unless LLAMA_LSA_MODE is set
+    ggml_tensor * lsa_cell_pos = nullptr;
+    ggml_tensor * lsa_q_pos    = nullptr;
+    // LLAMA_LSA_PACKED=1 with the packed (I32 bit) KQ mask on: F16 dense mask [n_kv, n_tokens/n_stream, 1, n_stream]
+    // that only the LSA layers start from; every other layer keeps the packed mask. nullptr otherwise
+    ggml_tensor * lsa_kq_mask  = nullptr;
+    // SJ-KVaRN cache (index cache only): I64 [n_tokens] index-cache row of each query row (cell == position there,
+    // while the K store goes to ring rows); nullptr on plain caches
+    ggml_tensor * lsa_q_cell   = nullptr;
+    // LLAMA_LSA_J3: built once per graph and shared by every stale-query prediction (each fresh reshape of a host
+    // input is its own split input, so per-target views uploaded the mask and cell positions 26 times per token)
+    ggml_tensor * lsa_j3_mk2   = nullptr; // [n_kv, T] view of the KQ mask
+    ggml_tensor * lsa_j3_force = nullptr; // [n_kv/F, T or 1] units forced by sinks and the window
+    // what the two were built from: reused only while every key matches (a layer with another mask, position
+    // input, window, sinks or unit size builds its own)
+    const ggml_tensor * lsa_j3_mk2_src  = nullptr; // kq_mask
+    const ggml_tensor * lsa_j3_force_cp = nullptr; // lsa_cell_pos
+    const ggml_tensor * lsa_j3_force_qp = nullptr; // lsa_q_pos
+    int64_t lsa_j3_force_key[3] = {0, 0, 0};       // F, window, sinks
+    // LSA index cache (LLAMA_LSA_IDX_CACHE=1): layers this graph rebuilds from the K cache; committed as valid
+    // in set_input (so reserve graphs, which never run set_input, cannot mark a cache valid)
+    std::vector<std::pair<const ggml_tensor *, uint64_t>> lsa_idx_commit;
+    std::vector<std::pair<const ggml_tensor *, uint64_t>> lsa_mean_commit; // LLAMA_LSA_COMP=2 block-mean caches rebuilt
+    // LLAMA_LSA_PICK_EVERY: per layer pick/reuse decisions of this graph, committed in set_input
+    // expire = a ubatch with more than one sequence touched this layer without the pick cache: the next graph re-picks
+    struct lsa_pick_rec { const ggml_tensor * k; uint64_t gen; bool reuse; int64_t pos0, edge, nbs; int32_t seq; bool expire = false; };
+    mutable std::vector<lsa_pick_rec> lsa_pick_commit; // filled while the graph is built (const inp)
+    // LLAMA_LSA_BLOCK_SUM: I32 [n_tokens] summary block of each row's index row (filled after the row tensor), the
+    // summary block count it is clamped to, and the current layer's updated summaries (set by build_attn_lsa_idx for
+    // layer lsa_sum_il, read by build_attn_lsa_mask of the same layer)
+    ggml_tensor * lsa_q_blk    = nullptr;
+    int64_t       lsa_n_blk    = 0;
+    // LLAMA_LSA_COMP=2 block-mean refresh (llama_lsa_set_mean_inputs): distinct blocks of this ubatch, their staging-ring
+    // blocks and each row's staging-ring row (the last two on SJ-KVaRN only, ring of lsa_ring_n rows)
+    ggml_tensor * lsa_u_blk    = nullptr;
+    ggml_tensor * lsa_u_rblk   = nullptr;
+    ggml_tensor * lsa_q_ring   = nullptr;
+    int64_t       lsa_ring_n   = 0;
+    uint64_t      lsa_graph_gen = 0;  // llama_lsa_graph_gen() and first position at graph build (LLAMA_LSA_GRAPH_REUSE)
+    int64_t       lsa_pos0      = 0;
+    bool          lsa_ring_rows = false; // carry ring (not LLAMA_LSA_RING_LEGACY): u_rblk/q_ring as in llama_lsa_set_mean_inputs
+    ggml_tensor * lsa_smax_cur = nullptr;
+    ggml_tensor * lsa_smin_cur = nullptr;
+    int           lsa_sum_il   = -1;
+    // per-KV-head summaries (LLAMA_LSA_PER_HEAD=1 on SJ-KVaRN): one updated F16 [d_idx, n_blk] plane per head
+    std::vector<ggml_tensor *> lsa_smax_h;
+    std::vector<ggml_tensor *> lsa_smin_h;
+    // LLAMA_LSA_BLOCK_SUM: per-ubatch base mask F32 [n_kv, T] (kq_mask at sinks / window / rows before min_pos,
+    // kq_mask - 1e30 elsewhere), built by the first LSA layer and shared by the rest; keyed by the kq_mask it came from
+    mutable ggml_tensor *       lsa_blk_base     = nullptr;
+    mutable const ggml_tensor * lsa_blk_base_src = nullptr;
+    // LLAMA_LSA_COMP=2: causally visible cells per B-cell block F32 [nbs, T] (sum of exp(kq_mask), kq_mask is 0 / -inf),
+    // built by the first compensated layer and shared by the rest; keyed by the kq_mask it came from
+    mutable ggml_tensor *       lsa_comp_vis     = nullptr;
+    mutable const ggml_tensor * lsa_comp_vis_src = nullptr;
+    // block pick -> COMP=2: visible droppable cells per block (once per graph) and the layer's dropped counts, valid
+    // only for the mask tensor they were built with (lsa_comp_nd_mask)
+    mutable ggml_tensor *       lsa_blk_dcnt     = nullptr;
+    mutable const ggml_tensor * lsa_blk_dcnt_src = nullptr;
+    mutable ggml_tensor *       lsa_comp_nd      = nullptr;
+    mutable const ggml_tensor * lsa_comp_nd_mask = nullptr;
+    // LLAMA_LSA_VK: lsa_blk_dcnt + 1 (once per graph), keyed by the count it came from
+    mutable ggml_tensor *       lsa_vk_dcnt1     = nullptr;
+    mutable const ggml_tensor * lsa_vk_dcnt1_src = nullptr;
+    // LLAMA_LSA_BLKLIST: the per-graph F16 mask with GGML_LSA_MASK_SEL at visible droppable cells (keyed by the base A)
+    mutable ggml_tensor *       lsa_blk_m3       = nullptr;
+    mutable const ggml_tensor * lsa_blk_m3_src   = nullptr;
+    // LLAMA_LSA_REFINE + FUSED_SEL: visible droppable cells per F-cell unit (once per graph, keyed by the base mask)
+    mutable ggml_tensor *       lsa_unit_dcnt     = nullptr;
+    mutable const ggml_tensor * lsa_unit_dcnt_src = nullptr;
+    mutable ggml_tensor *       lsa_cpos_u        = nullptr; // LLAMA_LSA_UNIT_OP: first-cell position of each F-cell unit
+    mutable int64_t             lsa_cpos_u_f      = 0;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -1343,6 +1418,36 @@ struct llm_graph_context {
     // QSA prompt (LLAMA_QSA_DIRECT_LISTS): final selected-cell rows [n_sel, n_tokens] for the next flash attention node's
     // src[8], so the CUDA sparse path builds its per-tile cell lists from them instead of scanning the n_kv-wide mask
     mutable ggml_tensor * fa_sel_rows = nullptr;
+    // LSA compensation (LLAMA_LSA_COMP=2): when set, the next plain flash attention node also writes its row
+    // log-sum-exp to lsa_lse (F32 [n_head, n_tokens, n_seq]); the caller takes it and clears both
+    mutable bool          lsa_lse_req = false;
+    // Logging only: an earlier full-attention layer's residual projected through this layer's exact Q weights.
+    mutable ggml_tensor * lsa_spec_q = nullptr;
+    mutable ggml_tensor * lsa_spec_q2 = nullptr; // same target, residual from two attention layers earlier
+    mutable ggml_tensor * lsa_spec_q3 = nullptr; // same target, residual from three attention layers earlier
+    mutable ggml_tensor * lsa_spec_sel = nullptr;
+    // LLAMA_LSA_PICK_EVERY: K cache tensor of the layer whose LSA mask is being built (key of its pick cache); set by
+    // build_attn_lsa_mask, taken and cleared by build_attn_lsa_mask_sb
+    mutable const ggml_tensor * lsa_pick_kbase = nullptr;
+    // LLAMA_LSA_SUM_OP: query index rows + summary plane views handed from build_attn_lsa_mask_blk to the fused select
+    mutable ggml_tensor * lsa_sum_q = nullptr;
+    mutable ggml_tensor * lsa_sum_x = nullptr;
+    mutable ggml_tensor * lsa_sum_n = nullptr;
+    // LLAMA_LSA_BLKLIST: block pick [nbs] and block size for the layer's SJ-KVaRN flash attention node; set by
+    // build_attn_lsa_mask_sb, taken and cleared by build_attn_mha (cleared by build_attn if no node took it)
+    mutable ggml_tensor * lsa_fa_sel = nullptr;
+    mutable int32_t       lsa_fa_blk = 0;
+    mutable const ggml_tensor * lsa_fa_m3 = nullptr; // the mask the pick belongs to (attached only to an FA node on it)
+    mutable ggml_tensor * lsa_lse     = nullptr;
+    // LLAMA_LSA_VK: the layer's rotated block means ([D*H_kv, lsa_vk_nbs] views, set by build_attn before the mask
+    // build when virtual keys can run); the block-list branch then hands the FA node the virtual-key plane instead of
+    // the pick (lsa_fa_vk), and build_attn_mha attaches both (lsa_vk_done: the node took them, no merge follows)
+    mutable ggml_tensor * lsa_vk_km  = nullptr;
+    mutable ggml_tensor * lsa_vk_vm  = nullptr;
+    mutable int64_t       lsa_vk_nbs = 0;
+    mutable bool          lsa_fa_vk   = false;
+    mutable int32_t       lsa_fa_vk_n = 0;     // > 0: the plane holds lsa_fa_vk_n mean-block counts, then the unit pick
+    mutable bool          lsa_vk_done = false;
     // multi-stream SJ-KVaRN: per-stream mask views cut to the stream's own n_kv are not contiguous when the ubatch
     // has more than one token row, and FA needs a contiguous mask; the contiguous copies are made once per graph
     // (the mask is shared by every layer)
@@ -1570,6 +1675,162 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
+                  float   kq_scale,
+                    int   il) const;
+
+    // LSA probe (llama-lsa.h): replacement KQ mask that keeps sinks + window + the best-scoring cells per query
+    // row, or nullptr when the layer stays dense. *n_kv_max gets the kept count when LLAMA_LSA_FA_SPARSE=1.
+    // LLAMA_LSA_FAST=1: *k and *v are replaced by the gathered kept cells and the returned mask covers only them.
+    ggml_tensor * build_attn_lsa_mask(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * q,       // [n_embd_head, n_head, n_tokens] post-RoPE
+            ggml_tensor ** k,      // KV cache view [n_embd_head, n_head_kv, n_kv, n_stream]
+            ggml_tensor ** v,      // same layout as k (fast path only)
+            ggml_tensor * kq_mask, // [n_kv, n_tokens, 1, n_stream]
+                    int   il,
+                int64_t * n_kv_max,
+            ggml_tensor * idx = nullptr,        // F16 [d_idx, n_kv] cached index keys, or nullptr = recompute
+                  float   kq_scale_lsa = 1.0f,  // mode=mass: softmax scale
+            std::vector<ggml_tensor *> * masks_h = nullptr) const; // per-head picks (LLAMA_LSA_PER_HEAD=1) land here
+
+    // LSA index cache (LLAMA_LSA_IDX_CACHE=1): stores the new tokens' index keys (or rebuilds the layer from the K
+    // cache after an invalidation) and returns the F16 [d_idx, n_kv] view the scoring reads, or nullptr
+    ggml_tensor * build_attn_lsa_idx(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,   // [n_embd_head, n_head_kv, n_tokens] as stored
+            ggml_tensor * k,       // KV cache view after the store
+                    int   il) const;
+
+    // LLAMA_LSA_BLOCK_SUM: refresh the block summaries after the index store w (full = every whole block below n_kv,
+    // else only the blocks of this ubatch's rows) and publish them for this layer's mask
+    void build_attn_lsa_sum(
+            llm_graph_input_attn_kv * inp,
+            const llama_lsa_idx_slot & slot,
+            ggml_tensor * w,       // index cache after this graph's store
+                int64_t   n_kv,
+                   bool   full,
+                    int   il) const;
+
+    // LLAMA_LSA_BLOCK_SUM mask: blocks ranked by the summary upper bound max.q+ + min.q-, top keep/block blocks
+    // kept whole, plus sinks + window per cell; nullptr = fall back to the per-cell path
+    ggml_tensor * build_attn_lsa_mask_blk(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * qi,      // F32 [d_idx, T] index queries
+            ggml_tensor * kq_mask,
+                int64_t   n_kv,
+                int64_t   keep_lr,
+                    int   il,
+            ggml_tensor * smax = nullptr,  // summaries to rank (default: inp->lsa_smax_cur / lsa_smin_cur)
+            ggml_tensor * smin = nullptr,
+                   bool   keep_f32 = false) const; // return the F32 mask (caller casts)
+
+    // block scores -> mask: top keep_lr/B blocks per row (blocks inside the window or the sinks excluded), whole blocks
+    // kept, the causal/sink/window part from the shared per-graph base (decode/verify widths); hands COMP=2 its dropped
+    // counts (inp->lsa_comp_nd). Used by the block-sum pick and by the record pick's LLAMA_LSA_REC_BLK=1.
+    ggml_tensor * build_attn_lsa_mask_sb(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * Sb,      // F32 [nbs, T] block scores, nbs = ceil(n_kv/B) or fewer; nullptr: S_cells
+            ggml_tensor * kq_mask,
+                int64_t   n_kv,
+                int64_t   keep_lr,
+                    int   il,
+                   bool   keep_f32 = false,
+            ggml_tensor * S_cells  = nullptr, // F32 [n_kv, T] cell scores (LLAMA_LSA_FUSED_SEL: block logsumexp in the op)
+                  float   tau      = 1.0f) const;
+
+    // per-graph base mask of the block/unit picks (inp->lsa_blk_base at decode/verify widths)
+    ggml_tensor * build_attn_lsa_blk_base(
+            const llm_graph_input_attn_kv * inp, ggml_tensor * kq_mask, int64_t n_kv, int64_t T, int il) const;
+
+    // LLAMA_LSA_REFINE + FUSED_SEL: mask (+ COMP=2 dropped counts) from a 0/1 selection of U-cell units
+    // (shared_pick: every row of selu holds the same pick, so LLAMA_LSA_BLKLIST may hand it to the SJ-KVaRN node)
+    ggml_tensor * build_attn_lsa_mask_units(
+            const llm_graph_input_attn_kv * inp, ggml_tensor * selu, int64_t U, ggml_tensor * kq_mask, int64_t n_kv,
+            int il, bool shared_pick = false) const;
+
+    // LLAMA_LSA_BLKLIST helpers: node/shape conditions for a block list of B-cell blocks; per-graph sentinel mask M3
+    bool lsa_blist_ok(int64_t T, int64_t B, const ggml_tensor * kq_mask) const;
+    ggml_tensor * build_attn_lsa_blk_m3(
+            const llm_graph_input_attn_kv * inp, ggml_tensor * A, ggml_tensor * kq_mask, int64_t n_kv, int64_t T, int il) const;
+
+    // SJ-KVaRN variant of build_attn_lsa_idx (k_cur before the SJ-KVaRN rotation; rows = positions)
+    ggml_tensor * build_attn_lsa_idx_sj(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * k,
+                    int   il) const;
+
+    // LLAMA_LSA_J3: side-stream slot prefetch for LSA layer il, built at an earlier (source) layer so it runs there in
+    // graph order. sq: [d_head, n_head, T] query of layer il computed from the source layer's residual (or nullptr: the
+    // previous-pick source only); pct: pick budget in percent; flags: GGML_LSA_PREFETCH_PREV/_PROTECT_PREV; src: scratch.
+    void build_attn_lsa_j3(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * sq,
+                    int   il,
+                    int   pct,
+                    int   flags,
+                    int   src) const;
+    // the [n_kv/F, T] 0/1 unit prediction of layer il's record pick from sq (nullptr: layer il would not pick)
+    ggml_tensor * build_attn_lsa_j3_units(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * sq,
+                    int   il,
+                    int   pct) const;
+
+    // LSA fast path (LLAMA_LSA_FAST=1): S = [n_kv, T] index scores; gathers the kept cells into *k / *v and returns
+    // their mask, or nullptr when the layer stays dense
+    ggml_tensor * build_attn_lsa_fast(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * S,
+            ggml_tensor ** k,
+            ggml_tensor ** v,
+            ggml_tensor * kq_mask,
+                int64_t   keep_lr,
+                    int   il) const;
+
+    // LSA centroid compensation (LLAMA_LSA_COMP=1): o_kept = the masked FA output [Dv*H, T]; adds the dropped blocks'
+    // stand-in keys/values to the softmax and returns the corrected output, or nullptr if the shapes are not supported
+    // LLAMA_LSA_COMP=2: the same correction from the masked FA output's log-sum-exp and the cached block means (no dense
+    // scores); nullptr if the shapes/cache are not supported
+    // Refresh (every ubatch, any width): plain caches recompute this ubatch's blocks from the K/V cache (all whole
+    // blocks when the cache is invalid); SJ-KVaRN (k_new/v_new = this ubatch's un-rotated K/V) writes them to the
+    // staging ring and recomputes this ubatch's blocks from it, valid only once built from position 0. Returns false
+    // when unsupported or not valid for use; *kmv/*vmv = [D*H_kv, *nbs] views ordered after the refresh.
+    // rot: k_new/v_new are in the rotated SJ-KVaRN basis (LLAMA_LSA_VK), so are the means (separate cache tag).
+    bool build_attn_lsa_mean_refresh(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * k_new,
+            ggml_tensor * v_new,
+                int64_t   n_kv,
+            ggml_tensor ** kmv,
+            ggml_tensor ** vmv,
+                int64_t * nbs,
+                    int   il,
+                   bool   rot = false) const;
+
+    ggml_tensor * build_attn_lsa_comp_fast(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * o_kept,
+            ggml_tensor * lse,
+            ggml_tensor * q,
+            ggml_tensor * kmv,
+            ggml_tensor * vmv,
+                int64_t   nbs,
+                int64_t   H_kv,
+            ggml_tensor * lsa_mask,
+            ggml_tensor * kq_mask,
+                  float   kq_scale,
+                    int   il) const;
+
+    ggml_tensor * build_attn_lsa_comp(
+            ggml_tensor * o_kept,
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * lsa_mask,
+            ggml_tensor * kq_mask,
                   float   kq_scale,
                     int   il) const;
 

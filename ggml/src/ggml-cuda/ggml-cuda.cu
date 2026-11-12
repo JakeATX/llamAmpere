@@ -84,6 +84,8 @@
 #include "ggml-cuda/set-rows-sjkvarn-rot.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
+#include "ggml-cuda/lsa-select.cuh"
+#include "ggml-cuda/lsa-comp.cuh"
 #include "ggml-cuda/sjkvarn-seal.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/ai4-mm.cuh"
@@ -4421,6 +4423,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SJKVARN_SEAL:
             ggml_cuda_sj_kvarn_seal(ctx, dst);
             break;
+        case GGML_OP_LSA_BLOCK_SELECT:
+            ggml_cuda_lsa_block_select(ctx, dst);
+            break;
+        case GGML_OP_LSA_COMP_MERGE:
+            ggml_cuda_lsa_comp_merge(ctx, dst);
+            break;
+        case GGML_OP_LSA_UNIT_LSE:
+            ggml_cuda_lsa_unit_lse(ctx, dst);
+            break;
+        case GGML_OP_LSA_PREFETCH:
+            ggml_cuda_lsa_prefetch(ctx, dst); // no-op unless the body has record-page slots
+            break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -5630,6 +5644,12 @@ static bool ggml_cuda_graph_check_compability_fast(ggml_cgraph * cgraph) {
                 ggml_cuda_flash_attn_ext_bounded_prefill_applies(device, node)) {
             return false;
         }
+        if (node->op == GGML_OP_LSA_PREFETCH) {
+            if (!ggml_cuda_lsa_j3_graphs()) {
+                return false; // same rule as the plain check
+            }
+            ggml_cuda_lsa_prefetch_reserve(node); // all J3 host setup before capture
+        }
     }
     return true;
 }
@@ -5732,6 +5752,16 @@ static bool ggml_cuda_graph_check_compability_plain(ggml_cgraph * cgraph) {
             use_cuda_graph = false;
         }
 
+        // LLAMA_LSA_J3: the prefetch forks a side stream and decides on the host per call (scratch growth, pending joins).
+        // GGML_CUDA_LSA_J3_GRAPHS=1 moves that setup here, before capture, and keeps the graph.
+        if (node->op == GGML_OP_LSA_PREFETCH) {
+            if (ggml_cuda_lsa_j3_graphs()) {
+                ggml_cuda_lsa_prefetch_reserve(node);
+            } else {
+                use_cuda_graph = false;
+            }
+        }
+
         if (!use_cuda_graph) {
             break;
         }
@@ -5786,6 +5816,20 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->moe_cache_generation = moe_cache_generation;
         res = true;
     }
+    // J3 scratch moved (generation bump): every graph holding the old pointers re-captures, including one reused by uid
+    bool lsa_j3_changed = false;
+    if (ggml_cuda_lsa_j3_graphs()) {
+        const uint64_t lsa_j3_generation = ggml_cuda_lsa_j3_generation();
+        if (graph->lsa_j3_generation != lsa_j3_generation) {
+            static std::atomic<int64_t> n_recapture{0};
+            GGML_LOG_WARN("%s: LSA J3 scratch generation %llu -> %llu: graph re-capture %lld (uid %zu)\n", __func__,
+                    (unsigned long long) graph->lsa_j3_generation, (unsigned long long) lsa_j3_generation,
+                    (long long) ++n_recapture, (size_t) cgraph->uid);
+            graph->lsa_j3_generation = lsa_j3_generation;
+            lsa_j3_changed = true;
+            res = true;
+        }
+    }
 
     // A live tensor can only reference a KV streaming runtime by holding a
     // reference to its buffer, which in turn holds a reference to the
@@ -5814,7 +5858,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
-    if (!moe_cache_changed && cgraph->uid != 0 &&
+    if (!moe_cache_changed && !lsa_j3_changed && cgraph->uid != 0 &&
         cgraph->uid == graph->uid &&
         kv_stream_generation == previous_kv_stream_generation) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -12150,6 +12194,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_moe_cache_table_graph_end(*cuda_ctx);
             }
 #endif
+            if (ggml_cuda_lsa_j3_graphs()) {
+                ggml_cuda_lsa_j3_graph_end(*cuda_ctx); // LLAMA_LSA_J3 side stream rejoins before cudaStreamEndCapture
+            }
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -13215,7 +13262,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         if (src && src->buffer && ggml_cuda_qsa_resident_is_buft(src->buffer->buft)) {
             if (src->buffer->buft->device != dev ||
-                !((op->op == GGML_OP_FLASH_ATTN_EXT && i == 5) || op->op == GGML_OP_SJKVARN_SEAL)) {
+                !((op->op == GGML_OP_FLASH_ATTN_EXT && i == 5) || op->op == GGML_OP_SJKVARN_SEAL ||
+                  (op->op == GGML_OP_LSA_PREFETCH && i == 1))) { // LLAMA_LSA_J3: the slot map of the target body
                 return false;
             }
         }
@@ -13757,10 +13805,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_SJKVARN_SEAL:
             return ggml_cuda_sj_kvarn_seal_supported(op);
+        case GGML_OP_LSA_BLOCK_SELECT:
+            return ggml_cuda_lsa_block_select_supported(op);
+        case GGML_OP_LSA_COMP_MERGE:
+            return ggml_cuda_lsa_comp_merge_supported(op);
+        case GGML_OP_LSA_UNIT_LSE:
+            return ggml_cuda_lsa_unit_lse_supported(op);
+        case GGML_OP_LSA_PREFETCH:
+            return true;
         case GGML_OP_FLASH_ATTN_EXT:
             // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN). Only the generic MMA f16 route reads it:
             // refuse it with TurboQuant/TQ K/V, SJ-KVaRN (src[6]), QSA selected rows (src[8]) and kv-stream K/V buffers.
-            if (op->src[9] != nullptr) {
+            if (ggml_flash_attn_ext_get_kv_rows(op) != nullptr) {
                 auto kv_rows_turbo = [](ggml_type t) {
                     return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0 ||
                            t == GGML_TYPE_TQ5_0    || t == GGML_TYPE_TQ6_0;
@@ -13775,6 +13831,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
             if (uses_streamed_kv) {
                 return ggml_cuda_kv_stream_fattn_fits(op);
+            }
+            if (op->src[5] && op->src[5]->buffer && ggml_cuda_qsa_resident_is_buft(op->src[5]->buffer->buft) &&
+                    !ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op)) {
+                // a resident (pinned-master) body the card can not read here: the scheduler would run this attention on
+                // the CPU, copying the body every step; say so once instead of failing silently slow
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    GGML_LOG_WARN("%s: %s on a resident KV body is not supported by CUDA (rows %lld, LSA blocks %d); it will run on the CPU\n",
+                        __func__, op->name, (long long) op->src[0]->ne[1], ggml_flash_attn_ext_get_lsa_block(op));
+                }
+                return false;
             }
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -14177,6 +14245,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_qsa_resident_device_bytes") == 0) {
         return (void *) ggml_backend_cuda_qsa_resident_device_bytes;
     }
+    if (strcmp(name, "ggml_backend_cuda_qsa_resident_shared_bytes") == 0) {
+        return (void *) ggml_backend_cuda_qsa_resident_shared_bytes;
+    }
+    if (strcmp(name, "ggml_backend_cuda_lsa_resident_set_stage") == 0) {
+        return (void *) ggml_backend_cuda_lsa_resident_set_stage;
+    }
     if (strcmp(name, "ggml_backend_cuda_qsa_raw_host_buffer_type") == 0) {
         return (void *) ggml_backend_cuda_qsa_raw_host_buffer_type;
     }
@@ -14188,6 +14262,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_comm_init_rank;
     }
 #endif // GGML_USE_NCCL
+    if (strcmp(name, "ggml_backend_cuda_qsa_strip_buffer_type") == 0) { // LLAMA_LSA_RESIDENT (opt-in)
+        return (void *) ggml_backend_cuda_qsa_strip_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_qsa_page_buffer_type") == 0) { // LLAMA_LSA_RESIDENT on low-bit bodies (opt-in)
+        return (void *) ggml_backend_cuda_qsa_page_buffer_type;
+    }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }

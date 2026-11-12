@@ -1402,6 +1402,19 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             !common_get_env("DISPLAY").empty() || !common_get_env("WAYLAND_DISPLAY").empty());
 #endif
         auto fit_targets = common_fit_vram_targets(params, vram_floor);
+        // LSA resident auto sizing (opt-in) keeps the same free margin as an explicit --fit-target; it reads its config
+        // once, so set this before the fit's memory-check context. An explicit LLAMA_LSA_RESIDENT_MARGIN_MIB wins.
+        if (params.fit_params_target_explicit && common_get_env("LLAMA_LSA_RESIDENT") == "auto" &&
+                std::getenv("LLAMA_LSA_RESIDENT_MARGIN_MIB") == nullptr && !fit_targets.empty()) {
+            size_t n_gpu = 0;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                n_gpu += ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
+            }
+            n_gpu = std::min(std::max<size_t>(n_gpu, 1), fit_targets.size());
+            const size_t m = *std::max_element(fit_targets.begin(), fit_targets.begin() + n_gpu);
+            common_set_env("LLAMA_LSA_RESIDENT_MARGIN_MIB", std::to_string(m >> 20));
+            common_set_env("LLAMA_LSA_RESIDENT_MARGIN_FROM", "--fit-target");
+        }
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         // Snapshot the pre-fit state so a failed fit can be rolled back to a

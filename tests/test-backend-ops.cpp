@@ -23,8 +23,10 @@
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-ai4.h"
 #include "../ggml/src/ggml-ait.h"
+#include "../src/llama-lsa-gather.h"
 
 #include <algorithm>
+#include <numeric>
 #include <atomic>
 #include <array>
 #include <cfloat>
@@ -14323,7 +14325,25 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     // Stream s sees n_ring - 37*s ring positions; logical groups map to shuffled pool records.
     const int ns;
     bool packed_pair = false;
+    bool lse_out = false; // LSA compensation: the node also writes its row log-sum-exp (ggml_flash_attn_ext_set_lse), appended to out
+    int lsa_blk = 128;    // mask_mode 9: LSA block size of the block list (ggml_flash_attn_ext_set_lsa_blocks)
+    bool lsa_vk = false;  // mask_mode 9: virtual keys (ggml_flash_attn_ext_set_lsa_vk): "lsa_nd" [nbs, n_q] instead of
+                          // "lsa_sel" (0 = picked, same blocks in every row; else 1 + a per-row dropped count, 0 for some),
+                          // block means "lsa_km"/"lsa_vm" with 3 rows past nbs (the last strip clamps inside them)
+    int lsa_vk_unit = 0;  // mask_mode 9 + vk (ggml_flash_attn_ext_set_lsa_vk_units): "lsa_nd" [nbs + nu, n_q] = per-row
+                          // counts of the lsa_blk mean blocks, then a unit pick of lsa_vk_unit cells (row 0 read)
     const int mask_mode; // 1 = empty body partitions, 2 = sparse body tiles and query-dependent boundaries
+                         // 3/4 = one shared LSA-style pick: every 20th/100th body cell live (5%/1% keep), same for all rows
+                         // 5/6 = LSA block pick: whole records live (~25%/~5%, irregular) plus one row-dependent record
+                         //       per 13 (union differs by row); dead records are skipped under GGML_SJKVARN_LIVE_RECORDS=1
+                         // 7 = per-KV-head LSA block pick: mask [n_kv, n_q, nh], the q heads of one KV group share a
+                         //     mask, each group keeps its own ~25% of the records (+ one row-dependent record per 13)
+                         // 8 = LSA per-cell pick as strips: ~half the records live, inside them ~3/8 of the 16-cell strips
+                         //     live plus one row-dependent strip per 11, partial cells inside live strips; dead strips of
+                         //     live records are skipped under GGML_SJKVARN_LIVE_STRIPS=1
+                         // 9 = LSA block list (LLAMA_LSA_BLKLIST): visible body and ring cells hold GGML_LSA_MASK_SEL
+                         //     (seen iff their lsa_blk block is picked in the F32 "lsa_sel" [nbs], ~half picked, blocks
+                         //     past nbs hidden), with some plain 0 / -0.25k cells that pass through unchanged
     const int data_case; // nonzero cases are CUDA differential checks over exceptional Q/K/V data
     const int compact_bound;
     unsigned init_epoch = 0; // changed device inputs at fixed captured pointers on replay
@@ -14353,9 +14373,15 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             result += ",ns=" + std::to_string(ns);
         }
         if (packed_pair) { result += ",packed=1"; }
+        if (lse_out) { result += ",lse=1"; }
         if (mask_mode != 0) {
             result += ",mask_mode=" + std::to_string(mask_mode);
         }
+        if (mask_mode == 9) {
+            result += ",lsa_blk=" + std::to_string(lsa_blk);
+        }
+        if (lsa_vk) { result += ",vk=1"; }
+        if (lsa_vk_unit > 0) { result += ",vku=" + std::to_string(lsa_vk_unit); }
         if (data_case != 0) {
             result += ",data_case=" + std::to_string(data_case);
         }
@@ -14368,12 +14394,14 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         return result;
     }
 
-    bool run_whole_graph() override { return rot == 2 || data_case != 0 || ns > 1 || packed_pair; }
+    bool run_whole_graph() override { return rot == 2 || data_case != 0 || ns > 1 || packed_pair || lse_out; } // lse: output is CONCAT(out, lse), time the FA too
     // Repeat the producer attention nodes each time, as well as the final CONCAT.
     bool perf_whole_graph() override { return ns > 1; }
     const char * required_fusion() override {
         const char * compact = getenv("GGML_SJKVARN_COMPACT");
-        if (compact_bound != 0 && compact && (strcmp(compact, "1") == 0 || strcmp(compact, "2") == 0)) {
+        const char * heads4 = getenv("GGML_SJKVARN_COMPACT_HEADS4"); // 4 KV heads compact only when asked (LSA sets it)
+        if (compact_bound != 0 && compact && (strcmp(compact, "1") == 0 || strcmp(compact, "2") == 0) &&
+                (hkv != 4 || (heads4 && strcmp(heads4, "1") == 0))) {
             return "sj_compact";
         }
         const char * skip = getenv("GGML_SJKVARN_MMA_MASK_SKIP");
@@ -14384,6 +14412,13 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     double err(const float * a, const float * b, size_t n) override {
         if (packed_pair && !kq_mask_packed_pair_equal(a, b, n, 2*(size_t) D)) { return INFINITY; }
         if (rot != 2) {
+            // A5 trellis + LSE: output and LSE checked separately, so the LSE values (about 8-10 each) do not dilute
+            // the output error in one NMSE over CONCAT(out, lse)
+            if (lse_out && body_type == GGML_TYPE_I16 && ns == 0) {
+                const size_t nl = (size_t) nh * n_q;
+                GGML_ASSERT(n > nl);
+                return std::max(nmse(a, b, n - nl), nmse(a + (n - nl), b + (n - nl), nl));
+            }
             return test_case::err(a, b, n);
         }
         double m = 0.0; // the difference itself; any nonzero element fails
@@ -14403,10 +14438,14 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         if (packed_pair) {
             return "FLASH_ATTN_EXT";
         }
+        if (body_type == GGML_TYPE_I16 && lse_out) {
+            return "FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE"; // A5: own name, so no filter can select a different set
+        }
         if (body_type == GGML_TYPE_I16) {
             return "FLASH_ATTN_EXT_SJKVARN_TRELLIS";
         }
-        return ns > 1 ? "FLASH_ATTN_EXT" : ggml_op_desc(t); // ns > 1: the output node is the CONCAT of the per-stream FA nodes
+        // ns > 1 / lse_out: the output node is a CONCAT (per-stream FA nodes, or FA output + its log-sum-exp)
+        return ns > 1 || lse_out ? "FLASH_ATTN_EXT" : ggml_op_desc(t);
     }
 
     double max_nmse_err() override {
@@ -14418,7 +14457,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
           cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
         GGML_ASSERT(n_ring <= cap && n_ring - 37*(n_streams() - 1) >= n_q);
         GGML_ASSERT(ns == 0 || rot != 2);
-        GGML_ASSERT(mask_mode >= 0 && mask_mode <= 2);
+        GGML_ASSERT(mask_mode >= 0 && mask_mode <= 9);
+        GGML_ASSERT(mask_mode != 7 || (ns == 0 && compact_bound == 0));
+        GGML_ASSERT(mask_mode != 9 || (ns == 0 && compact_bound == 0 && rot != 2 && !row_mask));
         GGML_ASSERT(data_case >= 0 && data_case <= 15);
         GGML_ASSERT(data_case == 0 || (hkv == 2 && ns == 0 && rot == 0 && mask_mode == 2));
         GGML_ASSERT(compact_bound >= 0);
@@ -14455,7 +14496,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         ggml_set_name(v, "v");
         // Packed masks must also cover the physical ring passed to the generic FA constructor.
         const int64_t mask_kv = packed_pair ? std::max(n_kv_pad(), k->ne[1]) : n_kv_pad();
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, 1, n_streams());
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, mask_mode == 7 ? nh : 1, n_streams());
         ggml_set_name(m, "m");
         ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_rec_pool());
         body->op_params[7] = body_type;
@@ -14494,7 +14535,45 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 ggml_flash_attn_ext_set_sj_kvarn(o, body, desc, bits_k, bits_v, (int32_t) n_kv_pad());
                 ggml_flash_attn_ext_set_n_kv_max(o, compact_bound);
                 ggml_prec_set_acc(o, GGML_PREC_F32);
+                if (mask_mode == 9) {
+                    GGML_ASSERT(!packed_pair && lsa_blk >= (lsa_vk ? 16 : 1) && (lsa_blk & (lsa_blk - 1)) == 0);
+                    const int64_t nbs = std::max<int64_t>(1, n_kv_pad()/lsa_blk - 1);
+                    if (lsa_vk) {
+                        GGML_ASSERT(!lse_out);
+                        GGML_ASSERT(lsa_vk_unit == 0 || (lsa_vk_unit >= 1 && (lsa_vk_unit & (lsa_vk_unit - 1)) == 0 && lsa_blk % lsa_vk_unit == 0));
+                        const int64_t nu = lsa_vk_unit > 0 ? nbs*(lsa_blk/lsa_vk_unit) : 0;
+                        ggml_tensor * nd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nbs + nu, n_q);
+                        ggml_set_name(nd, "lsa_nd");
+                        ggml_tensor * km = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*hkv, std::max<int64_t>(nbs + 3, 16));
+                        ggml_set_name(km, "lsa_km");
+                        ggml_tensor * vm = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*hkv, std::max<int64_t>(nbs + 3, 16));
+                        ggml_set_name(vm, "lsa_vm");
+                        if (lsa_vk_unit > 0) {
+                            ggml_flash_attn_ext_set_lsa_vk_units(o, nd, lsa_vk_unit, (int32_t) nbs,
+                                    ggml_view_2d(ctx, km, D*hkv, nbs, km->nb[1], 0), ggml_view_2d(ctx, vm, D*hkv, nbs, vm->nb[1], 0),
+                                    0.25f);
+                        } else {
+                            ggml_flash_attn_ext_set_lsa_vk(o, nd, lsa_blk, ggml_view_2d(ctx, km, D*hkv, nbs, km->nb[1], 0),
+                                    ggml_view_2d(ctx, vm, D*hkv, nbs, vm->nb[1], 0), 0.25f);
+                        }
+                    } else {
+                        ggml_tensor * sel = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nbs);
+                        ggml_set_name(sel, "lsa_sel");
+                        ggml_flash_attn_ext_set_lsa_blocks(o, sel, lsa_blk);
+                    }
+                }
                 out = o;
+                if (lse_out) {
+                    // A5: the rotation flag belongs on the FA node, not on the CONCAT below (rot = 2 has no LSE form)
+                    GGML_ASSERT(rot != 2);
+                    if (rot == 1) {
+                        ggml_flash_attn_ext_set_sj_kvarn_rot(o, 256);
+                    }
+                    ggml_tensor * lse = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nh, n_q, 1);
+                    ggml_set_name(lse, "lse");
+                    ggml_flash_attn_ext_set_lse(o, lse);
+                    out = ggml_concat(ctx, ggml_reshape_1d(ctx, o, ggml_nelements(o)), ggml_reshape_1d(ctx, lse, nh*n_q), 0);
+                }
             }
             return out;
         };
@@ -14508,7 +14587,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             m = m_f16;
             out = ggml_concat(ctx, out, out_p, 0);
         }
-        if (rot != 0 && ns == 0) {
+        if (rot != 0 && ns == 0 && !lse_out) {
             ggml_flash_attn_ext_set_sj_kvarn_rot(out, 256);
         }
         if (rot == 2) {
@@ -14524,6 +14603,17 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         }
         ggml_set_name(out, "out");
         return out;
+    }
+
+    // pick of unit u (cells u*unit ..) for units below the 16-cell strip (LLAMA_LSA_BLKLIST_FINE): per strip, dead (no
+    // picked unit, the kernel skips it), full, or ~half of its units picked, so the strip skip and the per-position
+    // resolution inside live strips are both exercised
+    static float lsa_fine_pick(int64_t u, int unit, int salt) {
+        const int64_t strip = u*unit/16;
+        const uint32_t st = (uint32_t(strip + salt)*2654435761u) >> 30; // 0..3
+        if (st == 0) { return 0.0f; }
+        if (st == 1) { return 1.0f; }
+        return ((uint32_t(u + 3*salt)*2246822519u) >> 31) ? 1.0f : 0.0f;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -14559,9 +14649,12 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 }
                 set_tensor_kq_mask_binary(t, vis, mask_kv);
             } else if (strcmp(t->name, "m") == 0) {
-                std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q * n_streams());
+                const int64_t nhm = t->ne[2]; // nh for the per-head mode 7, else 1
+                std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q * nhm * n_streams());
                 for (int64_t s = 0; s < n_streams(); ++s) {
                     const int64_t Ns = ns > 0 ? N_s(s) : N();
+                    for (int64_t hm = 0; hm < nhm; ++hm) {
+                    const uint32_t kvh = uint32_t(hm / (nh/hkv)); // KV group of q head hm
                     for (int64_t j = 0; j < n_q; ++j) {
                         const int64_t pos = Ns - n_q + j;
                         for (int64_t p = 0; p < n_kv_pad(); ++p) {
@@ -14572,18 +14665,37 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                             if (mask_mode != 0 && p >= S && p < B()) {
                                 const int64_t body_pos = p - S;
                                 const int64_t within = body_pos % 512;
-                                const bool live = mask_mode == 2 && (body_pos < 4 ||
-                                    (within >= 32 + 4*j + 16*(epoch%4) && within < 36 + 4*j + 16*(epoch%4)) || p == B() - 1 - j);
+                                const bool live = (mask_mode == 2 && (body_pos < 4 ||
+                                    (within >= 32 + 4*j + 16*(epoch%4) && within < 36 + 4*j + 16*(epoch%4)) || p == B() - 1 - j)) ||
+                                    (mask_mode == 3 && body_pos % 20 == 0) || (mask_mode == 4 && body_pos % 100 == 0);
+                                const uint32_t rh = uint32_t(body_pos / G)*2654435761u;
+                                const uint32_t rhh = (uint32_t(body_pos / G) + 7919u*kvh)*2654435761u;
+                                const bool rec_live = (mask_mode == 5 && (rh >> 28) < 4) || (mask_mode == 6 && (rh >> 24) < 13) ||
+                                    (mask_mode == 7 && (rhh >> 28) < 4) ||
+                                    (mask_mode >= 5 && (body_pos / G + 5*j + 3*kvh) % 13 == 0);
                                 value = live ? 0.0f : -INFINITY;
+                                if (mask_mode == 8) {
+                                    const uint32_t sh = uint32_t(body_pos / 16)*2246822519u;
+                                    const bool strip_live = (rh >> 31) == 0 && ((sh >> 29) < 3 || (body_pos/16 + 3*j) % 11 == 0);
+                                    value = strip_live && (p + j) % 5 != 0 ? -0.25f*float((p + 3*j)%11) : -INFINITY;
+                                } else if (mask_mode >= 5) {
+                                    value = rec_live ? -0.25f*float((p + 3*j)%11) : -INFINITY;
+                                }
                                 if (compact_bound != 0 && live) {
                                     value = -0.25f*float((p + 3*j)%11);
                                 }
                             }
+                            if (mask_mode == 9 && p >= S && p <= pos && p < Ns) {
+                                // body and ring: mostly block-list cells, a few always-kept ones pass through
+                                value = (p/16 + j) % 7 == 0 ? -0.25f*float((p + 3*j)%11) :
+                                        p % 97 == 5 ? 0.0f : GGML_LSA_MASK_SEL;
+                            }
                             if (data_case == 8 && j == 0 && p == S + 95) {
                                 value = std::numeric_limits<float>::quiet_NaN();
                             }
-                            mask[(s*n_q + j)*n_kv_pad() + p] = ggml_fp32_to_fp16(value);
+                            mask[((s*nhm + hm)*n_q + j)*n_kv_pad() + p] = ggml_fp32_to_fp16(value);
                         }
+                    }
                     }
                 }
                 ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
@@ -14603,6 +14715,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                     d[GGML_SJKVARN_DESC_TYPE_K] = staging_type;
                     d[GGML_SJKVARN_DESC_TYPE_V] = staging_type;
                     d[GGML_SJKVARN_DESC_SINK_TYPE] = f16_sink ? GGML_TYPE_F16 : 0;
+                    // fork: entry 15 = kernel flags, as llama-kv-cache.cpp writes it (bit 0: GGML_SJKVARN_TILE_SKIP=1)
+                    static const bool tile_skip = getenv("GGML_SJKVARN_TILE_SKIP") && atoi(getenv("GGML_SJKVARN_TILE_SKIP")) != 0;
+                    d[15] = tile_skip ? 1 : 0;
                     if (ns > 0) {
                         d[GGML_SJKVARN_DESC_TABLE] = 1;
                         for (int64_t g = 0; g < n_groups; ++g) d[GGML_SJKVARN_DESC_N_ENTRIES + g] = perm[s*n_groups + g];
@@ -14676,6 +14791,29 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+            } else if (strcmp(t->name, "lsa_sel") == 0) {
+                std::vector<float> sel(ggml_nelements(t));
+                for (size_t b = 0; b < sel.size(); ++b) {
+                    sel[b] = lsa_blk < 16 ? lsa_fine_pick(int64_t(b), lsa_blk, int(13*epoch)) :
+                             ((uint32_t(b + 13*epoch)*2654435761u) >> 31) ? 1.0f : 0.0f;
+                }
+                ggml_backend_tensor_set(t, sel.data(), 0, sel.size()*sizeof(float));
+            } else if (strcmp(t->name, "lsa_nd") == 0) {
+                const int64_t ne0 = t->ne[0];
+                const int64_t nbs = lsa_vk_unit > 0 ? std::max<int64_t>(1, n_kv_pad()/lsa_blk - 1) : ne0;
+                std::vector<float> nd(ggml_nelements(t));
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    for (int64_t b = 0; b < nbs; ++b) {
+                        // units: no "picked" code in the counts (1 = nothing dropped), the pick follows them
+                        const bool picked = lsa_vk_unit == 0 && (uint32_t(b + 13*epoch)*2654435761u) >> 31;
+                        nd[r*ne0 + b] = picked ? 0.0f : (b*7 + r*3 + epoch) % 5 == 0 ? 1.0f : float(2 + (b + r) % lsa_blk);
+                    }
+                    for (int64_t u = nbs; u < ne0; ++u) { // unit pick, ~half picked, same in every row
+                        nd[r*ne0 + u] = lsa_vk_unit < 16 ? lsa_fine_pick(u - nbs, lsa_vk_unit, int(7*epoch)) :
+                                        ((uint32_t(u - nbs + 7*epoch)*2654435761u) >> 31) ? 1.0f : 0.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, nd.data(), 0, nd.size()*sizeof(float));
             } else {
                 init_tensor_uniform(t);
             }
@@ -14903,9 +15041,15 @@ struct test_flash_attn_ext : public test_case {
     // mode 0 = causal prefix per row, 1 = random 0/-inf blocks (plus a random sparse set with n_kv_max)
     int packed_mode = -1;
     std::vector<uint8_t> packed_vis;
+    bool lse_out = false; // LSA compensation: the node also writes its row log-sum-exp (src[9]), appended to out
+
+    std::string op_desc(ggml_tensor * t) override {
+        return lse_out ? "FLASH_ATTN_EXT" : ggml_op_desc(t); // lse_out: the output node is CONCAT(FA output, LSE)
+    }
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
+               (lse_out ? ",lse=1" : "");
     }
 
     double max_nmse_err() override {
@@ -14990,6 +15134,12 @@ struct test_flash_attn_ext : public test_case {
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, prec);
+        if (lse_out) {
+            ggml_tensor * lse = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[2], q->ne[1], q->ne[3]);
+            ggml_set_name(lse, "lse");
+            ggml_flash_attn_ext_set_lse(out, lse);
+            out = ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)), ggml_reshape_1d(ctx, lse, ggml_nelements(lse)), 0);
+        }
 
         if (packed_mode >= 0) {
             GGML_ASSERT(mask && max_bias == 0.0f);
@@ -15126,6 +15276,795 @@ struct test_flash_attn_ext_implicit : public test_flash_attn_ext {
             }
         }
         return test_case::err(a, b, n);
+    }
+};
+
+// [LSA] fast path (src/llama-lsa-gather.h, LLAMA_LSA_FAST=1), built with the engine's own helpers: attention over the
+// gathered kept cells (raw cell copy of K and V, gathered mask columns) against attention over the whole cache with
+// the unselected cells masked to -inf. mode 0 checks the two inside each backend and across backends; modes 1 (fast
+// only) and 2 (dense masked only) are perf cases. Cache layout as the engine's: [hs, n_head_kv, n_kv].
+struct test_lsa_gather_attn : public test_case {
+    const ggml_type type_kv;
+    const int64_t   hs;     // head size
+    const int64_t   nh;     // KV heads
+    const int64_t   nr;     // query heads per KV head
+    const int64_t   kv;     // cache cells
+    const int64_t   nq;     // query rows (decode width)
+    const int64_t   n_sel;  // gathered cells (one selection for all rows)
+    const int       mode;
+
+    test_lsa_gather_attn(ggml_type type_kv, int64_t hs, int64_t nh, int64_t nr, int64_t kv, int64_t nq, int64_t n_sel, int mode = 0)
+        : type_kv(type_kv), hs(hs), nh(nh), nr(nr), kv(kv), nq(nq), n_sel(n_sel), mode(mode) {}
+
+    std::string vars() override { return VARS_TO_STR8(type_kv, hs, nh, nr, kv, nq, n_sel, mode); }
+    std::string op_desc(ggml_tensor *) override { return "LSA_GATHER_ATTN"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        return 2*2*(uint64_t) nq*hs*(uint64_t) (mode == 2 ? kv : n_sel)*nh*nr;
+    }
+
+    ggml_tensor * attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * m32) {
+        ggml_tensor * m = ggml_reshape_4d(ctx, ggml_cast(ctx, m32, GGML_TYPE_F16), m32->ne[0], m32->ne[1], 1, 1);
+        ggml_tensor * o = ggml_flash_attn_ext(ctx, q, ggml_permute(ctx, k, 0, 2, 1, 3), ggml_permute(ctx, v, 0, 2, 1, 3), m,
+                1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_prec_set_acc(o, GGML_PREC_F32);
+        return o;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nq, nh*nr, 1);
+        ggml_set_name(q, "q");
+        // a cache twice the attended length, like the engine's view of the first n_kv cells
+        ggml_tensor * kc = ggml_new_tensor_3d(ctx, type_kv, hs, nh, 2*kv);
+        ggml_tensor * vc = ggml_new_tensor_3d(ctx, type_kv, hs, nh, 2*kv);
+        ggml_set_name(kc, "kc");
+        ggml_set_name(vc, "vc");
+        ggml_tensor * k = ggml_view_3d(ctx, kc, hs, nh, kv, kc->nb[1], kc->nb[2], 0);
+        ggml_tensor * v = ggml_view_3d(ctx, vc, hs, nh, kv, vc->nb[1], vc->nb[2], 0);
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv, nq);
+        ggml_set_name(m, "m");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, 1);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * of = nullptr;
+        if (mode != 2) {
+            ggml_tensor * kg = llama_lsa_gather_cells(ctx, k, ids);
+            ggml_tensor * vg = llama_lsa_gather_cells(ctx, v, ids);
+            GGML_ASSERT(kg && vg);
+            of = attn(ctx, q, kg, vg, llama_lsa_gather_mask(ctx, m, ids));
+        }
+        ggml_tensor * od = mode != 1 ? attn(ctx, q, k, v, llama_lsa_dense_mask(ctx, m, ids)) : nullptr;
+        return mode == 0 ? ggml_concat(ctx, of, od, 0) : of ? of : od;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x15A0 + (uint32_t) kv + 7*(uint32_t) nq);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                // causal: row r sits at position kv - nq + r; a few empty cells (-inf for every row)
+                std::vector<float> mask(kv*nq, 0.0f);
+                for (int64_t r = 0; r < nq; ++r) {
+                    for (int64_t c = 0; c < kv; ++c) {
+                        if (c > kv - nq + r || (c % 97 == 41)) {
+                            mask[r*kv + c] = -INFINITY;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(float));
+            } else if (strcmp(t->name, "ids") == 0) {
+                // the engine's pick: the first sinks, the last window (incl. every row's own cell), then random others;
+                // distinct, in no particular order
+                const int64_t sinks = std::min<int64_t>(16, n_sel/4), window = std::min<int64_t>(64 + nq, n_sel/2);
+                std::vector<int32_t> ids;
+                std::vector<char> used(kv, 0);
+                auto add = [&](int64_t c) { if (!used[c]) { used[c] = 1; ids.push_back((int32_t) c); } };
+                for (int64_t c = 0; c < sinks; ++c) { add(c); }
+                for (int64_t c = kv - window; c < kv; ++c) { add(c); }
+                while ((int64_t) ids.size() < n_sel) { add(gen() % kv); }
+                std::shuffle(ids.begin(), ids.end(), gen);
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size()*sizeof(int32_t));
+            } else if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (mode == 0) {
+            // within each backend: gathered vs dense masked (summation order differs, so a tolerance, not memcmp)
+            const size_t row = 2*hs;
+            GGML_ASSERT(n % row == 0);
+            for (const float * x : {a, b}) {
+                std::vector<float> f, d;
+                for (size_t r = 0; r < n/row; ++r) {
+                    f.insert(f.end(), x + r*row, x + r*row + hs);
+                    d.insert(d.end(), x + r*row + hs, x + r*row + 2*hs);
+                }
+                const double e = nmse(f.data(), d.data(), f.size());
+                if (!(e <= max_nmse_err())) {
+                    printf("gathered attention differs from dense masked attention (nmse %g) ", e);
+                    return INFINITY;
+                }
+            }
+        }
+        return test_case::err(a, b, n);
+    }
+};
+
+// LSA select / unit-LSE tests set only their named inputs. The harness sentinels (op NONE tensors "sent_*" between the
+// tensors) then kept whatever bytes the allocator left; the graph copy carries the same bytes to the second backend, so
+// the sentinel byte compare passed, but the NaN scan flagged them on both sides ("[NONE] NaN ... (CPU=-nan CPU=-nan)",
+// a different case set every run). Zero every non-view tensor first (sentinels, inputs, outputs); the inputs are set
+// after this. The ops write every output element themselves.
+static void lsa_zero_tensors(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src == nullptr && t->buffer != nullptr) {
+            std::vector<uint8_t> zero(ggml_nbytes(t), 0);
+            ggml_backend_tensor_set(t, zero.data(), 0, zero.size());
+        }
+    }
+}
+
+// [LSA] per-layer overhead of the opt-in pick and compensation graphs, at decode/verify shapes (perf only; the ops are
+// the same ggml ops llama-graph builds for LLAMA_LSA_BLOCK=128 + LLAMA_LSA_REC_BLK=1 + LLAMA_LSA_COMP=2, one layer):
+// mode 1 = block record pick (index scores -> softmax(tau) -> block log-share -> window/sink exclusion -> top-k blocks
+// -> f16 mask from the per-graph base -> dropped counts), mode 2 = fast compensation (block-mean stand-ins merged with
+// the kept attention via its log-sum-exp), mode 3 = mode 1 index scores + softmax + block sums only (pick front half), 7 / 8 = fused refine pick (LLAMA_LSA_REFINE=16 / =1 + FUSED_SEL: 2 x keep/B blocks, then
+// keep/U units inside them, unit mask + per-block dropped counts).
+// Inputs are random; only the time matters (sizes: d_idx 64, D 256, 24 q heads / 4 KV heads).
+// GGML_OP_LSA_BLOCK_SELECT: the CUDA pick must mark exactly the CPU's blocks (0/1 output, max_nmse_err 0), ties
+// (ties = 1: scores on a coarse grid) to the lower block index on both
+// cells = 1: per-cell scores + f16 causal mask, the op takes each block's logsumexp(2 s + mask); block levels are
+// 0.05 apart (cells add < 0.001 of noise) so the GPU's fast exp cannot reorder blocks and the pick must match exactly
+struct test_lsa_block_select : public test_case {
+    const int64_t nbs, T;
+    const int     kb, ties, shared, cells, sticky, slice;
+    static constexpr int B = 128, window = 8192, sinks = 256;
+    static constexpr int stk_s0 = 320; // record start not on a unit edge: units straddling two records get half shares
+
+    // sticky: LLAMA_LSA_RESIDENT_STICKY test mode (I32 slot table in src 7, desc in src 8, bonus 0.375): every third
+    // record "on the card"; CPU and CUDA add the same bonus before the pick
+    // slice > 0: LLAMA_LSA_SLICE slice-local quota pick, slice units per slice (op param 13)
+    test_lsa_block_select(int64_t nbs, int64_t T, int kb, int ties, int shared, int cells = 0, int sticky = 0, int slice = 0)
+        : nbs(nbs), T(T), kb(kb), ties(ties), shared(shared), cells(cells), sticky(sticky), slice(slice) {}
+
+    std::string vars() override { return slice ? VARS_TO_STR8(nbs, T, kb, ties, shared, cells, sticky, slice) :
+                                         sticky ? VARS_TO_STR7(nbs, T, kb, ties, shared, cells, sticky) :
+                                                  VARS_TO_STR6(nbs, T, kb, ties, shared, cells); }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * s    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cells ? nbs*B : nbs, T);
+        ggml_tensor * cp   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nbs*B);
+        ggml_tensor * qpos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T);
+        ggml_set_name(s, "s");
+        ggml_set_name(cp, "cp");
+        ggml_set_name(qpos, "qpos");
+        ggml_tensor * out;
+        if (cells) {
+            ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, nbs*B, T);
+            ggml_set_name(m, "m");
+            out = ggml_lsa_block_select_cells(ctx, s, m, cp, qpos, B, 2.0f, window, sinks, kb, shared);
+        } else {
+            out = ggml_lsa_block_select(ctx, s, cp, qpos, B, window, sinks, kb, shared);
+        }
+        if (slice) {
+            const int32_t u = slice;
+            memcpy((char *) out->op_params + 13*sizeof(int32_t), &u, sizeof(u));
+        }
+        if (sticky) {
+            ggml_tensor * tab  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (nbs*B - stk_s0)/128);
+            ggml_tensor * desc = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, GGML_SJKVARN_DESC_N_ENTRIES);
+            ggml_set_name(tab, "stk_table");
+            ggml_set_name(desc, "stk_desc");
+            const float   bonus = 0.375f;
+            const int32_t one = 1, test = 1;
+            memcpy((char *) out->op_params + 10*sizeof(int32_t), &bonus, sizeof(bonus));
+            memcpy((char *) out->op_params + 11*sizeof(int32_t), &one, sizeof(one));
+            memcpy((char *) out->op_params + 12*sizeof(int32_t), &test, sizeof(test));
+            out->src[7] = tab;
+            out->src[8] = desc;
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        lsa_zero_tensors(ctx); // sentinels too, see lsa_zero_tensors
+        std::mt19937 rng(1234 + nbs + 7*T + kb);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        const int64_t n_kv = nbs*B, n_used = n_kv - n_kv/32; // last ~3% of the cells empty (position 1e9)
+        std::vector<float> s((cells ? n_kv : nbs)*T), cp(n_kv), qp(T);
+        if (cells) {
+            std::vector<int> lvl(nbs);
+            std::iota(lvl.begin(), lvl.end(), 0);
+            std::shuffle(lvl.begin(), lvl.end(), rng);
+            std::uniform_real_distribution<float> noise(0.0f, 0.001f);
+            for (int64_t r = 0; r < T; ++r) {
+                if (shared == 2 && r > 0) {
+                    std::shuffle(lvl.begin(), lvl.end(), rng); // rows disagree on the order
+                }
+                // shared = 2: per-row level step 0.05*(1 + 0.13 r) (rows' normalized levels do not coincide, so the
+                // GPU's fast exp cannot flip a cross-row tie) and a row offset 0.5 r (removed by the normalization)
+                const float step = shared == 2 ? 0.05f*(1.0f + 0.13f*(float) r) : 0.05f;
+                for (int64_t c = 0; c < n_kv; ++c) {
+                    s[r*n_kv + c] = step*(float) lvl[c/B] - 0.5f*step*(float) nbs + (shared == 2 ? 0.5f*(float) r : 0.0f) + noise(rng);
+                }
+            }
+        } else {
+            for (auto & x : s) {
+                x = ties ? std::round(u(rng)*4.0f)/4.0f : u(rng);
+            }
+        }
+        for (int64_t c = 0; c < n_kv; ++c) {
+            cp[c] = c < n_used ? (float) c : 1e9f;
+        }
+        for (int64_t r = 0; r < T; ++r) {
+            qp[r] = (float) (n_used - T + r);
+        }
+        if (cells) {
+            std::vector<ggml_fp16_t> m(n_kv*T);
+            for (int64_t r = 0; r < T; ++r) {
+                for (int64_t c = 0; c < n_kv; ++c) {
+                    m[r*n_kv + c] = ggml_fp32_to_fp16(cp[c] > qp[r] ? -INFINITY : 0.0f);
+                }
+            }
+            ggml_backend_tensor_set(ggml_get_tensor(ctx, "m"), m.data(), 0, m.size()*sizeof(ggml_fp16_t));
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "s"), s.data(), 0, s.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "cp"), cp.data(), 0, cp.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "qpos"), qp.data(), 0, qp.size()*sizeof(float));
+        if (sticky) {
+            const int64_t records = (n_kv - stk_s0)/128;
+            std::vector<int32_t> tab(records), desc(GGML_SJKVARN_DESC_N_ENTRIES, 0);
+            for (int64_t r = 0; r < records; ++r) {
+                tab[r] = r % 3 == 0 ? (int32_t) (r/3) : -1;
+            }
+            desc[GGML_SJKVARN_DESC_S] = stk_s0;
+            desc[GGML_SJKVARN_DESC_B] = (int32_t) (stk_s0 + records*128);
+            desc[GGML_SJKVARN_DESC_G] = 128;
+            ggml_backend_tensor_set(ggml_get_tensor(ctx, "stk_table"), tab.data(), 0, tab.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(ggml_get_tensor(ctx, "stk_desc"), desc.data(), 0, desc.size()*sizeof(int32_t));
+        }
+    }
+};
+
+// GGML_OP_LSA_BLOCK_SELECT summary mode (LLAMA_LSA_SUM_OP): the op scores each block from its two F16 summary planes
+// (mode 1 channel max / min bound, mode 2 mean / variance Gaussian) against d = 64 query channels. Inputs are small
+// integers and tau = 0.5, so every score is exact in f32 on both backends and the pick must match exactly. The planes
+// hold 3 blocks more than nbs (a view of the per-layer plane in the graph). same_rows: all rows use row 0's query
+// (shared = 2 then has bit-equal row normalizers up to rounding, so the threshold cannot flip on the GPU's fast exp).
+struct test_lsa_block_select_sum : public test_case {
+    const int64_t nbs, T;
+    const int     kb, shared, mode, B, same_rows;
+    static constexpr int d = 64, window = 8192, sinks = 256;
+
+    test_lsa_block_select_sum(int64_t nbs, int64_t T, int kb, int shared, int mode, int B, int same_rows = 0)
+        : nbs(nbs), T(T), kb(kb), shared(shared), mode(mode), B(B), same_rows(same_rows) {}
+
+    std::string vars() override { return VARS_TO_STR7(nbs, T, kb, shared, mode, B, same_rows); }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, T);
+        ggml_tensor * sx   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, nbs + 3);
+        ggml_tensor * sn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, nbs + 3);
+        ggml_tensor * cp   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nbs*B);
+        ggml_tensor * qpos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T);
+        ggml_set_name(q, "q");
+        ggml_set_name(sx, "sx");
+        ggml_set_name(sn, "sn");
+        ggml_set_name(cp, "cp");
+        ggml_set_name(qpos, "qpos");
+        return ggml_lsa_block_select_sum(ctx, q, sx, sn, cp, qpos, (int) nbs, B, 0.5f, mode, window, sinks, kb, shared);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        lsa_zero_tensors(ctx); // sentinels too, see lsa_zero_tensors
+        std::mt19937 rng(4321 + nbs + 7*T + kb + 13*mode + B);
+        std::uniform_int_distribution<int> uq(-3, 3), ux(-4, 4), uv(0, 4);
+        const int64_t n_kv = nbs*B, n_used = n_kv - n_kv/32; // last ~3% of the cells empty (position 1e9)
+        std::vector<float> q(d*T), cp(n_kv), qp(T);
+        std::vector<ggml_fp16_t> sx(d*(nbs + 3)), sn(d*(nbs + 3));
+        for (int64_t r = 0; r < T; ++r) {
+            for (int i = 0; i < d; ++i) {
+                q[r*d + i] = same_rows && r > 0 ? q[i] : (float) uq(rng);
+            }
+        }
+        for (size_t i = 0; i < sx.size(); ++i) {
+            int x = ux(rng), n = mode == 2 ? uv(rng) : ux(rng);
+            if (mode == 1 && n > x) {
+                std::swap(x, n); // max >= min
+            }
+            sx[i] = ggml_fp32_to_fp16((float) x);
+            sn[i] = ggml_fp32_to_fp16((float) n);
+        }
+        for (int64_t c = 0; c < n_kv; ++c) {
+            cp[c] = c < n_used ? (float) c : 1e9f;
+        }
+        for (int64_t r = 0; r < T; ++r) {
+            qp[r] = (float) (n_used - T + r);
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "q"), q.data(), 0, q.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "sx"), sx.data(), 0, sx.size()*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "sn"), sn.data(), 0, sn.size()*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "cp"), cp.data(), 0, cp.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "qpos"), qp.data(), 0, qp.size()*sizeof(float));
+    }
+};
+
+// GGML_OP_LSA_BLOCK_SELECT gated (LLAMA_LSA_REFINE=U + FUSED_SEL): units of U cells, eligible only inside the gate's
+// selected 128-cell blocks (random ~30% of the blocks per row). CUDA must mark exactly the CPU's units (max_nmse_err
+// 0). Unit levels are 0.05 apart so the GPU's fast exp cannot reorder units; U = 1 at 200K takes the global-key path
+// (n_units > 12288); ku > gated-eligible units covers the min(kb, eligible) rule.
+// shared > 0 (LLAMA_LSA_REFINE_SH): the select's shared mode with a row-identical gate (as from a shared coarse pick).
+struct test_lsa_unit_select : public test_case {
+    const int64_t n_kv, T, U;
+    const int     ku;
+    const int     shared;
+    const int     slice; // > 0: LLAMA_LSA_SLICE quota pick, slice units per slice (op param 13)
+    static constexpr int B = 128, window = 8192, sinks = 256;
+
+    test_lsa_unit_select(int64_t n_kv, int64_t T, int64_t U, int ku, int shared = 0, int slice = 0) :
+        n_kv(n_kv), T(T), U(U), ku(ku), shared(shared), slice(slice) {}
+
+    std::string vars() override { return slice ? VARS_TO_STR6(n_kv, T, U, ku, shared, slice) : VARS_TO_STR5(n_kv, T, U, ku, shared); }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * s    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, T);
+        ggml_tensor * m    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);
+        ggml_tensor * cp   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_kv);
+        ggml_tensor * qpos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T);
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv/B, T);
+        ggml_set_name(s, "s");
+        ggml_set_name(m, "m");
+        ggml_set_name(cp, "cp");
+        ggml_set_name(qpos, "qpos");
+        ggml_set_name(gate, "gate");
+        ggml_tensor * out = ggml_lsa_block_select_cells_gated_ext(ctx, s, m, cp, qpos, (int) U, 2.0f, window, sinks, ku, gate,
+                (int) (B/U), shared);
+        if (slice) {
+            const int32_t u = slice;
+            memcpy((char *) out->op_params + 13*sizeof(int32_t), &u, sizeof(u));
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        lsa_zero_tensors(ctx); // sentinels too, see lsa_zero_tensors
+        std::mt19937 rng(4321 + n_kv + 7*T + U + ku + 1000*shared);
+        const int64_t nu = n_kv/U, nb = n_kv/B, n_used = n_kv - n_kv/32;
+        std::vector<int> lvl(nu);
+        std::iota(lvl.begin(), lvl.end(), 0);
+        std::shuffle(lvl.begin(), lvl.end(), rng);
+        std::uniform_real_distribution<float> noise(0.0f, 0.001f);
+        std::bernoulli_distribution on(0.3);
+        std::vector<float> sv(n_kv*T), cp(n_kv), qp(T), g(nb*T);
+        std::vector<ggml_fp16_t> mv(n_kv*T);
+        for (int64_t c = 0; c < n_kv; ++c) {
+            cp[c] = c < n_used ? (float) c : 1e9f;
+        }
+        for (int64_t r = 0; r < T; ++r) {
+            qp[r] = (float) (n_used - T + r);
+            for (int64_t c = 0; c < n_kv; ++c) {
+                sv[r*n_kv + c] = 0.05f*(float) lvl[c/U] - 0.025f*(float) nu + (U > 1 ? noise(rng) : 0.0f);
+                mv[r*n_kv + c] = ggml_fp32_to_fp16(cp[c] > qp[r] ? -INFINITY : 0.0f);
+            }
+            for (int64_t b = 0; b < nb; ++b) {
+                g[r*nb + b] = shared && r > 0 ? g[b] : on(rng) ? 1.0f : 0.0f;
+            }
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "s"), sv.data(), 0, sv.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "m"), mv.data(), 0, mv.size()*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "cp"), cp.data(), 0, cp.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "qpos"), qp.data(), 0, qp.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "gate"), g.data(), 0, g.size()*sizeof(float));
+    }
+};
+
+// GGML_OP_LSA_COMP_MERGE (LLAMA_LSA_FUSED_COMP=1). Output row = [fused | the COMP=2 graph chain it replaces]; err():
+// CUDA fused vs CPU fused (nmse <= 1e-6) and, on each backend, fused vs the chain (nmse <= 1e-5: the chain feeds an
+// f16 q to mul_mat). nd: dropped counts 0..128, ~1/4 zero (left out); zero_all: no stand-in, out must equal o_kept.
+static ggml_tensor * lsa_comp_chain(ggml_context * ctx, ggml_tensor * ok0, ggml_tensor * lse, ggml_tensor * q,
+        ggml_tensor * kmv, ggml_tensor * vmv, ggml_tensor * nd, int64_t H_kv, float scale, float cbias) {
+    const int64_t D = q->ne[0], H = q->ne[1], T = q->ne[2], nbs = nd->ne[0], Dv = vmv->ne[0]/H_kv;
+    ggml_tensor * Kb = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, kmv, D, H_kv, nbs), 0, 2, 1, 3));
+    ggml_tensor * Vb = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, vmv, Dv, H_kv, nbs), 1, 2, 0, 3));
+    ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    ggml_tensor * ks = ggml_mul_mat(ctx, Kb, qp);
+    ggml_prec_set_acc(ks, GGML_PREC_F32);
+    ggml_tensor * off  = ggml_scale_bias(ctx, ggml_step(ctx, ggml_scale_bias(ctx, nd, 1.0f, -0.5f)), 1e30f, -1e30f);
+    ggml_tensor * bias = ggml_add(ctx, ggml_scale_bias(ctx, ggml_log(ctx, ggml_scale_bias(ctx, nd, 1.0f, 1e-30f)), 1.0f, cbias), off);
+    ggml_tensor * Lk = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, lse, H, T, 1), 2, 1, 0, 3));
+    ggml_tensor * S  = ggml_concat(ctx, ggml_add(ctx, ggml_scale(ctx, ks, scale), bias), Lk, 0);
+    ggml_tensor * P  = ggml_soft_max(ctx, S);
+    ggml_tensor * Ps = ggml_cont(ctx, ggml_view_3d(ctx, P, nbs, T, H, P->nb[1], P->nb[2], 0));
+    ggml_tensor * al = ggml_cont(ctx, ggml_view_3d(ctx, P, 1, T, H, P->nb[1], P->nb[2], nbs*ggml_element_size(P)));
+    ggml_tensor * os = ggml_cont(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, Vb, Ps), 0, 2, 1, 3));
+    al = ggml_cont(ctx, ggml_permute(ctx, al, 0, 2, 1, 3));
+    return ggml_reshape_2d(ctx, ggml_add(ctx, ggml_mul(ctx, ggml_reshape_3d(ctx, ok0, Dv, H, T), al), os), Dv*H, T);
+}
+
+static void lsa_comp_init_nd_lse(ggml_context * ctx, bool zero_all) {
+    std::mt19937 rng(1234);
+    ggml_tensor * nd  = ggml_get_tensor(ctx, "nd");
+    ggml_tensor * lse = ggml_get_tensor(ctx, "lse");
+    std::vector<float> v(ggml_nelements(nd));
+    for (auto & x : v) {
+        const uint32_t r = rng();
+        x = zero_all || r % 4 == 0 ? 0.0f : (float) (1 + (r >> 2) % 128);
+    }
+    ggml_backend_tensor_set(nd, v.data(), 0, v.size()*sizeof(float));
+    std::uniform_real_distribution<float> ul(9.0f, 13.0f);
+    v.resize(ggml_nelements(lse));
+    for (auto & x : v) {
+        x = ul(rng);
+    }
+    ggml_backend_tensor_set(lse, v.data(), 0, v.size()*sizeof(float));
+}
+
+// GGML_OP_LSA_UNIT_LSE (LLAMA_LSA_UNIT_OP) vs CPU: random F16/F32 index keys with strided rows (d = 64: 16-byte rows,
+// vector loads; d = 60: scalar loads), causal F16 mask with empty cells (fully masked units give -inf on both).
+struct test_lsa_unit_lse : public test_case {
+    const int64_t n_kv, T, F, d;
+    const ggml_type kt;
+
+    test_lsa_unit_lse(int64_t n_kv, int64_t T, int64_t F, int64_t d = 64, ggml_type kt = GGML_TYPE_F16) :
+        n_kv(n_kv), T(T), F(F), d(d), kt(kt) {}
+
+    std::string vars() override { return VARS_TO_STR5(n_kv, T, F, d, kt); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kf = ggml_new_tensor_2d(ctx, kt, d + 16, n_kv);
+        ggml_tensor * q  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, T);
+        ggml_tensor * m  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);
+        ggml_set_name(kf, "kf");
+        ggml_set_name(q, "q");
+        ggml_set_name(m, "m");
+        ggml_tensor * k = ggml_view_2d(ctx, kf, d, n_kv, kf->nb[1], 0);
+        return ggml_lsa_unit_lse(ctx, k, q, m, (int) F, 2.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        lsa_zero_tensors(ctx); // sentinels too, see lsa_zero_tensors
+        init_tensor_uniform(ggml_get_tensor(ctx, "kf"));
+        init_tensor_uniform(ggml_get_tensor(ctx, "q"));
+        const int64_t n_used = n_kv - n_kv/32;
+        std::vector<ggml_fp16_t> m(n_kv*T);
+        for (int64_t r = 0; r < T; ++r) {
+            const int64_t qp = n_used - T + r;
+            for (int64_t c = 0; c < n_kv; ++c) {
+                m[r*n_kv + c] = ggml_fp32_to_fp16(c > qp ? -INFINITY : 0.0f);
+            }
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "m"), m.data(), 0, m.size()*sizeof(ggml_fp16_t));
+    }
+};
+
+// LLAMA_LSA_UNIT_OP wiring: the unit-lse pick (unit_lse -> block select over units with unit first-cell positions and
+// sinks' = sinks - B + B/F -> gated select over units, U = 1, sinks' = sinks - F + 1) must mark exactly the units of
+// the chain it replaces (S = mul_mat -> block select cells B -> gated select cells F). Scores are exact integers
+// (row t: q = e_t, k[t][c] = level of c's unit, distinct per row), so no rounding can reorder anything. Output =
+// number of differing units; err() requires 0 on both backends (CPU and CUDA each check their own wiring).
+struct test_lsa_unit_pick : public test_case {
+    const int64_t n_kv, T, F;
+    const int     shared;
+    static constexpr int B = 128, window = 512, sinks = 256, d = 64;
+
+    test_lsa_unit_pick(int64_t n_kv, int64_t T, int64_t F, int shared) : n_kv(n_kv), T(T), F(F), shared(shared) {}
+
+    std::string vars() override { return VARS_TO_STR4(n_kv, T, F, shared); }
+    std::string op_desc(ggml_tensor *) override { return "LSA_UNIT_PICK"; }
+    bool run_whole_graph() override { return true; }
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_UNUSED(n);
+        return a[0] == 0.0f && b[0] == 0.0f ? 0.0 : 1.0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d, n_kv);
+        ggml_tensor * q    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, T);
+        ggml_tensor * m    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);
+        ggml_tensor * cp   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_kv);
+        ggml_tensor * qpos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T);
+        ggml_set_name(k, "k");
+        ggml_set_name(q, "q");
+        ggml_set_name(m, "m");
+        ggml_set_name(cp, "cp");
+        ggml_set_name(qpos, "qpos");
+        const int64_t nu = n_kv/F, nbs = n_kv/B, mid = (n_kv - n_kv/32) - window - sinks;
+        const int kc = (int) std::max<int64_t>(1, std::min<int64_t>(nbs, 2*(mid/4)/B));
+        const int ku = (int) std::max<int64_t>(1, (mid/4)/F);
+        const float tau = 2.0f;
+        // old chain
+        ggml_tensor * S    = ggml_mul_mat(ctx, k, q);
+        ggml_tensor * sel1 = ggml_lsa_block_select_cells(ctx, S, m, cp, qpos, B, tau, window, sinks, kc, shared);
+        ggml_tensor * selo = ggml_lsa_block_select_cells_gated_ext(ctx, S, m, cp, qpos, (int) F, tau, window, sinks, ku, sel1,
+                (int) (B/F), shared);
+        // unit-lse pick
+        ggml_tensor * U    = ggml_lsa_unit_lse(ctx, k, q, m, (int) F, tau);
+        ggml_tensor * cpu  = F == 1 ? cp : ggml_reshape_1d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, cp, 1, nu, F*sizeof(float), 0)), nu);
+        ggml_tensor * sn1  = ggml_lsa_block_select_cells(ctx, U, nullptr, cpu, qpos, (int) (B/F), 1.0f, window,
+                (int) (sinks - B + B/F), kc, shared);
+        ggml_tensor * seln = ggml_lsa_block_select_cells_gated_ext(ctx, U, nullptr, cpu, qpos, 1, 1.0f, window,
+                (int) (sinks - F + 1), ku, sn1, (int) (B/F), shared);
+        return ggml_sum(ctx, ggml_abs(ctx, ggml_sub(ctx, seln, selo)));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(777 + n_kv + 7*T + F + 100*shared);
+        const int64_t nu = n_kv/F, n_used = n_kv - n_kv/32;
+        GGML_ASSERT(nu <= 2048 && T <= d); // integer levels < 2048 are exact in F16
+        std::vector<ggml_fp16_t> kv(d*n_kv);
+        std::vector<float> qv(d*T, 0.0f), cpv(n_kv), qp(T);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        std::vector<int> lvl(nu);
+        std::iota(lvl.begin(), lvl.end(), 0);
+        for (int64_t j = 0; j < d; ++j) {
+            if (j < T) {
+                std::shuffle(lvl.begin(), lvl.end(), rng);
+            }
+            for (int64_t c = 0; c < n_kv; ++c) {
+                kv[c*d + j] = ggml_fp32_to_fp16(j < T ? (float) lvl[c/F] : u(rng));
+            }
+        }
+        for (int64_t t = 0; t < T; ++t) {
+            qv[t*d + t] = 1.0f;
+            qp[t] = (float) (n_used - T + t);
+        }
+        for (int64_t c = 0; c < n_kv; ++c) {
+            cpv[c] = c < n_used ? (float) c : 1e9f;
+        }
+        std::vector<ggml_fp16_t> m(n_kv*T);
+        for (int64_t r = 0; r < T; ++r) {
+            for (int64_t c = 0; c < n_kv; ++c) {
+                m[r*n_kv + c] = ggml_fp32_to_fp16(cpv[c] > qp[r] ? -INFINITY : 0.0f);
+            }
+        }
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "k"), kv.data(), 0, kv.size()*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "q"), qv.data(), 0, qv.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "m"), m.data(), 0, m.size()*sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "cp"), cpv.data(), 0, cpv.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "qpos"), qp.data(), 0, qp.size()*sizeof(float));
+    }
+};
+
+struct test_lsa_comp_merge : public test_case {
+    const int64_t nbs, T, H, H_kv, D, zero_all;
+    static constexpr float scale = 0.0625f, cbias = 0.25f;
+
+    test_lsa_comp_merge(int64_t nbs, int64_t T, int64_t H, int64_t H_kv, int64_t D, int64_t zero_all = 0)
+        : nbs(nbs), T(T), H(H), H_kv(H_kv), D(D), zero_all(zero_all) {}
+
+    std::string vars() override { return VARS_TO_STR6(nbs, T, H, H_kv, D, zero_all); }
+    std::string op_desc(ggml_tensor *) override { return "LSA_COMP_MERGE"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1.0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t R = (size_t) (D*H); // Dv == D here
+        std::vector<float> af, au, bf, bu;
+        for (size_t r = 0; r*2*R < n; ++r) {
+            af.insert(af.end(), a + 2*R*r, a + 2*R*r + R);
+            au.insert(au.end(), a + 2*R*r + R, a + 2*R*(r + 1));
+            bf.insert(bf.end(), b + 2*R*r, b + 2*R*r + R);
+            bu.insert(bu.end(), b + 2*R*r + R, b + 2*R*(r + 1));
+        }
+        const double e_ff = nmse(af.data(), bf.data(), af.size());
+        const double e_a  = nmse(af.data(), au.data(), af.size());
+        const double e_b  = nmse(bf.data(), bu.data(), bf.size());
+        return std::max({e_ff/1e-6, e_a/1e-5, e_b/1e-5});
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kmv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*H_kv, nbs + 3); // mean cache wider than nbs
+        ggml_tensor * vmv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*H_kv, nbs + 3);
+        ggml_tensor * q   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, T);
+        ggml_tensor * ok0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D*H, T);
+        ggml_tensor * lse = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+        ggml_tensor * nd  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nbs, T);
+        ggml_set_name(lse, "lse");
+        ggml_set_name(nd, "nd");
+        ggml_tensor * km = ggml_view_2d(ctx, kmv, D*H_kv, nbs, kmv->nb[1], 0);
+        ggml_tensor * vm = ggml_view_2d(ctx, vmv, D*H_kv, nbs, vmv->nb[1], 0);
+        ggml_tensor * f = ggml_lsa_comp_merge(ctx, ok0, lse, q, km, vm, nd, (int) H_kv, scale, cbias);
+        ggml_tensor * u = lsa_comp_chain(ctx, ok0, lse, q, km, vm, nd, H_kv, scale, cbias);
+        return ggml_concat(ctx, f, u, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+        lsa_comp_init_nd_lse(ctx, zero_all != 0);
+    }
+};
+
+struct test_lsa_overhead : public test_case {
+    const int64_t n_kv;
+    const int64_t T;
+    const int     mode;
+    const int64_t keep;
+    static constexpr int64_t B = 128, d_idx = 64, D = 256, H = 24, H_kv = 4;
+
+    test_lsa_overhead(int64_t n_kv, int64_t T, int mode, int64_t keep) : n_kv(n_kv), T(T), mode(mode), keep(keep) {}
+
+    std::string vars() override { return VARS_TO_STR4(n_kv, T, mode, keep); }
+    std::string op_desc(ggml_tensor *) override { return "LSA_OVERHEAD"; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nbs = n_kv/B;
+        if (mode == 6) { // LLAMA_LSA_FUSED_COMP=1: mode 2 as one op
+            ggml_tensor * kmv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*H_kv, nbs);
+            ggml_tensor * vmv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*H_kv, nbs);
+            ggml_tensor * q   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, T);
+            ggml_tensor * ok0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D*H, T);
+            ggml_tensor * lse = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+            ggml_tensor * nd  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nbs, T);
+            ggml_set_name(lse, "lse");
+            ggml_set_name(nd, "nd");
+            return ggml_lsa_comp_merge(ctx, ok0, lse, q, kmv, vmv, nd, (int) H_kv, 0.0625f, 0.0f);
+        }
+        if (mode == 2) {
+            ggml_tensor * kmv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*H_kv, nbs);
+            ggml_tensor * vmv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D*H_kv, nbs);
+            ggml_tensor * q   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, T);
+            ggml_tensor * ok0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D*H, T);
+            ggml_tensor * lse = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
+            ggml_tensor * nd  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nbs, T);
+            ggml_set_name(lse, "lse");
+            ggml_set_name(nd, "nd");
+            ggml_tensor * Kb = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, kmv, D, H_kv, nbs), 0, 2, 1, 3));
+            ggml_tensor * Vb = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, vmv, D, H_kv, nbs), 1, 2, 0, 3));
+            ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+            ggml_tensor * ks = ggml_mul_mat(ctx, Kb, qp);
+            ggml_prec_set_acc(ks, GGML_PREC_F32);
+            ggml_tensor * off  = ggml_scale_bias(ctx, ggml_step(ctx, ggml_scale_bias(ctx, nd, 1.0f, -0.5f)), 1e30f, -1e30f);
+            ggml_tensor * bias = ggml_add(ctx, ggml_log(ctx, ggml_scale_bias(ctx, nd, 1.0f, 1e-30f)), off);
+            ggml_tensor * Lk = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, lse, H, T, 1), 2, 1, 0, 3));
+            ggml_tensor * S  = ggml_concat(ctx, ggml_add(ctx, ggml_scale(ctx, ks, 0.0625f), bias), Lk, 0);
+            ggml_tensor * P  = ggml_soft_max(ctx, S);
+            ggml_tensor * Ps = ggml_cont(ctx, ggml_view_3d(ctx, P, nbs, T, H, P->nb[1], P->nb[2], 0));
+            ggml_tensor * al = ggml_cont(ctx, ggml_view_3d(ctx, P, 1, T, H, P->nb[1], P->nb[2], nbs*ggml_element_size(P)));
+            ggml_tensor * os = ggml_cont(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, Vb, Ps), 0, 2, 1, 3));
+            al = ggml_cont(ctx, ggml_permute(ctx, al, 0, 2, 1, 3));
+            return ggml_add(ctx, ggml_mul(ctx, ggml_reshape_3d(ctx, ok0, D, H, T), al), os);
+        }
+        ggml_tensor * PT  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, d_idx, n_kv); // index cache
+        ggml_tensor * qi  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_idx, T);
+        ggml_tensor * kqm = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);     // causal mask, 0 / -inf
+        ggml_tensor * A   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, T);     // per-graph base (not timed per layer)
+        ggml_tensor * Dc  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nbs, T);      // per-graph droppable counts
+        ggml_tensor * cp  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_kv);        // cell positions
+        ggml_tensor * qpos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T);
+        ggml_set_name(kqm, "m");
+        ggml_set_name(cp, "cp");
+        ggml_set_name(qpos, "qpos");
+        if (mode >= 9 && mode <= 17) { // pick alone (no mask, no counts): 9/10 = LLAMA_LSA_UNIT_OP U 16/1, 11/12 = chain
+            // pieces at U 16: 13 = unit op alone, 14 = unit op + block select; 15 = index matmul alone, 16 = + block select;
+            // 17 = the gated unit select alone (inputs given)
+            const int64_t U  = mode == 10 || mode == 12 ? 1 : 16, nu = n_kv/U;
+            const int64_t kc = std::min<int64_t>(nbs, (2*keep + B - 1)/B);
+            const int64_t ku = std::max<int64_t>(1, std::min<int64_t>(nu, keep/U));
+            if (mode == 17) { // the gated unit select of mode 9 alone: unit scores and the block pick are inputs
+                ggml_tensor * Ui = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nu, T);
+                ggml_tensor * gi = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nbs, T);
+                ggml_set_name(gi, "g17");
+                ggml_tensor * cpu = ggml_reshape_1d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, cp, 1, nu, U*sizeof(float), 0)), nu);
+                return ggml_lsa_block_select_cells_gated(ctx, Ui, nullptr, cpu, qpos, 1, 1.0f, 8192, (int) (128 - U + 1),
+                        (int) ku, gi, (int) (B/U));
+            }
+            if (mode == 11 || mode == 12 || mode == 15 || mode == 16) {
+                ggml_tensor * Sx   = ggml_mul_mat(ctx, PT, qi);
+                if (mode == 15) {
+                    return Sx;
+                }
+                ggml_tensor * sel1 = ggml_lsa_block_select_cells(ctx, Sx, kqm, cp, qpos, (int) B, 2.0f, 8192, 128, (int) kc, false);
+                if (mode == 16) {
+                    return sel1;
+                }
+                return ggml_lsa_block_select_cells_gated(ctx, Sx, kqm, cp, qpos, (int) U, 2.0f, 8192, 128, (int) ku, sel1, (int) (B/U));
+            }
+            ggml_tensor * Ul   = ggml_lsa_unit_lse(ctx, PT, qi, kqm, (int) U, 2.0f);
+            if (mode == 13) {
+                return Ul;
+            }
+            ggml_tensor * cpu  = U == 1 ? cp : ggml_reshape_1d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, cp, 1, nu, U*sizeof(float), 0)), nu);
+            ggml_tensor * sel1 = ggml_lsa_block_select_cells(ctx, Ul, nullptr, cpu, qpos, (int) (B/U), 1.0f, 8192,
+                    (int) (128 - B + B/U), (int) kc, false);
+            if (mode == 14) {
+                return sel1;
+            }
+            return ggml_lsa_block_select_cells_gated(ctx, Ul, nullptr, cpu, qpos, 1, 1.0f, 8192, (int) (128 - U + 1), (int) ku,
+                    sel1, (int) (B/U));
+        }
+        ggml_tensor * S  = ggml_mul_mat(ctx, PT, qi);                                                  // [n_kv, T]
+        if (mode == 7 || mode == 8) { // LLAMA_LSA_REFINE=16 / =1 + FUSED_SEL: kc = 2 x keep/B blocks, then keep/U units
+            const int64_t U  = mode == 7 ? 16 : 1, nu = n_kv/U;
+            const int64_t kc = std::min<int64_t>(nbs, (2*keep + B - 1)/B);
+            const int64_t ku = std::max<int64_t>(1, std::min<int64_t>(nu, keep/U));
+            ggml_tensor * Du   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nu, T);                         // per-graph
+            ggml_tensor * sel1 = ggml_lsa_block_select_cells(ctx, S, kqm, cp, qpos, (int) B, 2.0f, 8192, 128, (int) kc, false);
+            ggml_tensor * selu = ggml_lsa_block_select_cells_gated(ctx, S, kqm, cp, qpos, (int) U, 2.0f, 8192, 128, (int) ku,
+                    sel1, (int) (B/U));
+            ggml_tensor * m = ggml_add(ctx, ggml_reshape_3d(ctx, A, U, nu, T),
+                                            ggml_reshape_3d(ctx, ggml_scale_bias(ctx, selu, 1e30f, 0.0f), 1, nu, T));
+            m = ggml_cast(ctx, ggml_clamp(ctx, ggml_reshape_2d(ctx, m, n_kv, T), -INFINITY, 0.0f), GGML_TYPE_F16);
+            ggml_tensor * ndu = ggml_mul(ctx, Du, ggml_scale_bias(ctx, selu, -1.0f, 1.0f));
+            ggml_tensor * nd  = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_reshape_3d(ctx, ndu, B/U, nbs, T)), nbs, T);
+            return ggml_concat(ctx, ggml_cast(ctx, m, GGML_TYPE_F32), nd, 0);
+        }
+        ggml_tensor * Mb = nullptr;
+        if (mode != 5) {
+            ggml_tensor * Pc = ggml_soft_max_ext(ctx, S, ggml_cast(ctx, kqm, GGML_TYPE_F32), 2.0f, 0.0f);
+            Mb = ggml_sum_rows(ctx, ggml_reshape_3d(ctx, Pc, B, nbs, T));
+            Mb = ggml_reshape_2d(ctx, ggml_log(ctx, ggml_scale_bias(ctx, Mb, 1.0f, 1e-30f)), nbs, T);
+            if (mode == 3) {
+                return Mb;
+            }
+        }
+        const int64_t kb = std::max<int64_t>(1, std::min<int64_t>(nbs, keep/B));
+        ggml_tensor * selb = nullptr, * sel1 = nullptr;
+        if (mode == 4 || mode == 5) { // LLAMA_LSA_FUSED_SEL=1 (5: record pick, block logsumexp inside the op)
+            ggml_tensor * sel = mode == 5 ?
+                ggml_lsa_block_select_cells(ctx, S, kqm, cp, qpos, (int) B, 2.0f, 8192, 128, (int) kb, false) :
+                ggml_lsa_block_select(ctx, Mb, cp, qpos, (int) B, 8192, 128, (int) kb, false);
+            selb = ggml_reshape_4d(ctx, ggml_scale_bias(ctx, sel, 1e30f, 0.0f), 1, nbs, T, 1);
+            sel1 = ggml_reshape_4d(ctx, ggml_scale_bias(ctx, sel, -1.0f, 1.0f), 1, nbs, T, 1);
+        } else {
+            ggml_tensor * bpos = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, cp, 1, nbs, B*cp->nb[0], 0)), nbs, 1);
+            ggml_tensor * dq    = ggml_sub(ctx, ggml_repeat(ctx, bpos, Mb), qpos);
+            ggml_tensor * inwin = ggml_step(ctx, ggml_scale_bias(ctx, dq, 1.0f, 8192.0f - 0.5f));
+            ggml_tensor * insnk = ggml_step(ctx, ggml_scale_bias(ctx, bpos, -1.0f, (float) (128 - B) + 0.5f));
+            Mb = ggml_add(ctx, Mb, ggml_scale(ctx, ggml_add(ctx, inwin, insnk), -1e30f));
+            ggml_tensor * topb = ggml_top_k(ctx, Mb, (int) kb);
+            selb = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, nbs, T, 1), 0.0f);
+            selb = ggml_set_rows(ctx, selb, ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, kb, T, 1), 1e30f), topb);
+            sel1 = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, nbs, T, 1), 1.0f);
+            sel1 = ggml_set_rows(ctx, sel1, ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, kb, T, 1), 0.0f), topb);
+        }
+        ggml_tensor * m = ggml_add(ctx, ggml_reshape_3d(ctx, A, B, nbs, T), ggml_reshape_3d(ctx, selb, 1, nbs, T));
+        m = ggml_cast(ctx, ggml_clamp(ctx, ggml_reshape_2d(ctx, m, n_kv, T), -INFINITY, 0.0f), GGML_TYPE_F16);
+        ggml_tensor * nd = ggml_mul(ctx, Dc, ggml_reshape_2d(ctx, sel1, nbs, T));
+        // one output: the f16 mask row block plus the counts (both are live in the engine)
+        return ggml_concat(ctx, ggml_cast(ctx, m, GGML_TYPE_F32), nd, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> mask(n_kv*T);
+                for (int64_t r = 0; r < T; ++r) {
+                    for (int64_t c = 0; c < n_kv; ++c) {
+                        mask[r*n_kv + c] = ggml_fp32_to_fp16(c > n_kv - T + r ? -INFINITY : 0.0f);
+                    }
+                }
+                ggml_backend_tensor_set(t, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "cp") == 0) {
+                std::vector<float> p(n_kv);
+                for (int64_t c = 0; c < n_kv; ++c) { p[c] = (float) c; }
+                ggml_backend_tensor_set(t, p.data(), 0, p.size()*sizeof(float));
+            } else if (strcmp(t->name, "qpos") == 0) {
+                std::vector<float> p(T);
+                for (int64_t r = 0; r < T; ++r) { p[r] = (float) (n_kv - T + r); }
+                ggml_backend_tensor_set(t, p.data(), 0, p.size()*sizeof(float));
+            } else if (strcmp(t->name, "g17") == 0) { // block pick as mode 9 makes it: kc = 2 x keep/B of nbs blocks on
+                const int64_t nbs = n_kv/B, kc = std::min<int64_t>(nbs, (2*keep + B - 1)/B);
+                std::vector<float> g(nbs*T);
+                for (int64_t r = 0; r < T; ++r) {
+                    for (int64_t b = 0; b < nbs; ++b) { g[r*nbs + b] = (b*7919 + r*31) % nbs < kc ? 1.0f : 0.0f; }
+                }
+                ggml_backend_tensor_set(t, g.data(), 0, g.size()*sizeof(float));
+            } else if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        if (mode == 2 || mode == 6) {
+            lsa_comp_init_nd_lse(ctx, false);
+        }
     }
 };
 
@@ -20256,6 +21195,167 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // [LSA] gathered kept cells vs dense masked attention (Swift 1.5 full-attention shape: 4 KV heads x 6, head 256)
+    for (ggml_type type_kv : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nq : {1, 4, 5}) {
+            for (auto [kv, n_sel] : std::vector<std::pair<int64_t, int64_t>>{{1024, 256}, {4096, 768}, {16384, 2048}}) {
+                test_cases.emplace_back(new test_lsa_gather_attn(type_kv, 256, 4, 6, kv, nq, n_sel));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_lsa_gather_attn(GGML_TYPE_Q8_0, 128, 2, 4, 3000, 3, 700)); // n_sel not a multiple of 256
+    // [LSA] fused block select vs CPU (100K / 200K / 1M-ish blocks, decode and verify widths, kb > eligible, ties, shared)
+    for (auto [nbs, kb] : std::vector<std::pair<int64_t, int>>{{784, 129}, {1568, 327}, {1568, 1500}, {7800, 1900}, {80, 3}}) {
+        for (int64_t T : {1, 5}) {
+            test_cases.emplace_back(new test_lsa_block_select(nbs, T, kb, 0, 0));
+            test_cases.emplace_back(new test_lsa_block_select(nbs, T, kb, 1, 0));
+        }
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 1, 1));
+        for (int64_t T : {1, 5}) {
+            test_cases.emplace_back(new test_lsa_block_select(nbs, T, kb, 0, 0, 1));
+        }
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 0, 1, 1));
+        // shared = 2 (max over rows of the row-normalized score): random per-row scores; cells mode adds per-row level
+        // offsets (rows rank the blocks differently) so the max-row rule changes the pick
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 0, 2));
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 4, kb, 0, 2, 1));
+    }
+    // Full/empty eligible sets and a partial quota must match the CPU.
+    for (int sh : {0, 1, 2}) {
+        for (auto [nbs, kb] : std::vector<std::pair<int64_t, int>>{{32, 32}, {96, 1}, {96, 96}}) {
+            test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 1, sh));
+            test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 0, sh, 1));
+        }
+        test_cases.emplace_back(new test_lsa_unit_select(12288, 5, 16, 768, sh));
+    }
+    // [LSA] LLAMA_LSA_RESIDENT_STICKY bonus (test-mode slot table) vs CPU: block / cell scores, per row / shared 1 / 2,
+    // and the multi-CTA global-key path (block scores copied before the bonus)
+    for (auto [nbs, kb] : std::vector<std::pair<int64_t, int>>{{784, 129}, {1568, 327}, {20000, 5000}}) {
+        for (int64_t T : {1, 5}) {
+            test_cases.emplace_back(new test_lsa_block_select(nbs, T, kb, 0, 0, 0, 1));
+            if (nbs < 20000) {
+                test_cases.emplace_back(new test_lsa_block_select(nbs, T, kb, 0, 0, 1, 1));
+            }
+        }
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 0, 1, 0, 1));
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 0, 2, 0, 1));
+    }
+    // [LSA] LLAMA_LSA_SLICE slice-local quota pick vs CPU: slices that divide / do not divide the units, per row and
+    // shared 1 / 2, cell scores, heavy ties (equal keys straddle a slice's threshold), kb > eligible, a global-key size,
+    // one slice (== the global pick), sticky bonus
+    for (auto [nbs, kb, sl] : std::vector<std::tuple<int64_t, int, int>>{{784, 129, 32}, {784, 392, 100}, {1568, 327, 128},
+            {1568, 1500, 64}, {80, 3, 16}, {20000, 5000, 4096}, {784, 196, 784}}) {
+        for (int64_t T : {1, 5}) {
+            test_cases.emplace_back(new test_lsa_block_select(nbs, T, kb, 0, 0, 0, 0, sl));
+            test_cases.emplace_back(new test_lsa_block_select(nbs, T, kb, 1, 0, 0, 0, sl));
+        }
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 1, 1, 0, 0, sl));
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 0, 2, 0, 0, sl));
+        if (nbs < 20000) {
+            test_cases.emplace_back(new test_lsa_block_select(nbs, 1, kb, 0, 0, 1, 0, sl));
+            test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 0, 1, 1, 0, sl));
+        }
+    }
+    test_cases.emplace_back(new test_lsa_block_select(1568, 5, 327, 0, 0, 0, 1, 64));
+    // [LSA] global-key path (nbs > 12288): the single-CTA kernel and the multi-CTA one (GGML_LSA_SEL_MULTI=1) vs CPU,
+    // incl. heavy ties (equal keys straddle the threshold: the ordered tie walk), kb > eligible, shared 1 / 2
+    for (auto [nbs, kb] : std::vector<std::pair<int64_t, int>>{{20000, 5000}, {20000, 19900}}) {
+        for (int64_t T : {1, 5}) {
+            for (int ties : {0, 1}) {
+                test_cases.emplace_back(new test_lsa_block_select(nbs, T, kb, ties, 0));
+            }
+        }
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 1, 1));
+        test_cases.emplace_back(new test_lsa_block_select(nbs, 5, kb, 0, 2));
+    }
+    // [LSA] summary-scored select (LLAMA_LSA_SUM_OP) vs CPU: 100K at 16-cell blocks (6,272) and 128 (784), 200K at 16
+    // (12,544 > 12,288: global keys), modes 1 / 2, per row / summed (scores inside the select launch), shared = 2
+    // (scratch pass), keep 25% / 50%
+    for (auto [nbs, B] : std::vector<std::pair<int64_t, int>>{{6272, 16}, {784, 128}, {12544, 16}}) {
+        for (int mode : {1, 2}) {
+            for (int keep4 : {1, 2}) {
+                const int kb = (int) (nbs*keep4/4);
+                test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 1, kb, 0, mode, B));
+                test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 5, kb, 0, mode, B));
+                test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 5, kb, 1, mode, B));
+            }
+            test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 4, (int) (nbs/4), 2, mode, B, 1));
+        }
+    }
+    // [LSA] the tiled summary prepass (GGML_LSA_SUM_TILE=1) on a unit count that is not a multiple of its 64-unit tile
+    // (6,250 = 97 x 64 + 42): last CTA partly empty; per row / summed / best-row, both summary modes
+    for (int mode : {1, 2}) {
+        const int64_t nbs = 6250;
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 1, (int) (nbs/4), 0, mode, 16));
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 5, (int) (nbs/4), 0, mode, 16));
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 5, (int) (nbs/2), 1, mode, 16));
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 5, (int) (nbs/4), 2, mode, 16));
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 4, (int) (nbs/4), 2, mode, 16, 1));
+    }
+    // [LSA] gated unit select (refine stage 2) vs CPU: 100K / 200K, U 16 (strips) and 1 (cells, global keys), ku at
+    // 25% / 15% keep, and ku above the gated-eligible count
+    for (int64_t n_kv : {100352, 200704}) {
+        for (int64_t U : {16, 1}) {
+            for (int64_t T : {1, 5}) {
+                const int64_t keep = (n_kv - 8320)/4;
+                test_cases.emplace_back(new test_lsa_unit_select(n_kv, T, U, (int) (keep/U)));
+                test_cases.emplace_back(new test_lsa_unit_select(n_kv, T, U, (int) (keep*3/5/U)));
+            }
+            test_cases.emplace_back(new test_lsa_unit_select(n_kv, 5, U, (int) (n_kv/U)));
+        }
+    }
+    test_cases.emplace_back(new test_lsa_unit_select(4096, 3, 16, 40));
+    // LLAMA_LSA_REFINE_SH: shared unit pick (modes 1 and 2) at mb-MTP verify widths, 100K and 200K
+    for (int sh : {1, 2}) {
+        for (int64_t n_kv : {102400, 204800}) {
+            for (int64_t T : {4, 5}) {
+                test_cases.emplace_back(new test_lsa_unit_select(n_kv, T, 16, (int) (n_kv/4/16), sh));
+            }
+        }
+        test_cases.emplace_back(new test_lsa_unit_select(4096, 3, 32, 20, sh));
+    }
+    // per-cell (U = 1, global keys) shared unit pick: shared 1 = inline one-cell logsumexp in the multi-CTA P1, shared 2 =
+    // logsumexp kernel + row logsumexp first
+    for (int sh : {1, 2}) {
+        test_cases.emplace_back(new test_lsa_unit_select(102400, 5, 1, 102400/4, sh));
+    }
+    // LLAMA_LSA_SLICE quota pick on the gated stage: 16-cell units in 16,384 / 4,096-cell slices, cells in 16,384-cell
+    // slices (global-key size), per row and shared 1
+    test_cases.emplace_back(new test_lsa_unit_select(100352, 1, 16, (int) ((100352 - 8320)/4/16), 0, 1024));
+    test_cases.emplace_back(new test_lsa_unit_select(100352, 5, 16, (int) ((100352 - 8320)/4/16), 0, 256));
+    test_cases.emplace_back(new test_lsa_unit_select(102400, 5, 16, 102400/4/16, 1, 1024));
+    test_cases.emplace_back(new test_lsa_unit_select(100352, 1, 1, (int) ((100352 - 8320)/4), 0, 16384));
+    // [LSA] LLAMA_LSA_UNIT_OP: unit logsumexp op vs CPU (100K at decode/verify widths, F 16/1/128, F32 and scalar-load
+    // keys, a width above 8 rows), and the unit-lse pick vs the chain it replaces (exact, shared 0/1/2)
+    for (int64_t F : {16, 1, 128}) {
+        for (int64_t T : {1, 5}) {
+            test_cases.emplace_back(new test_lsa_unit_lse(100352, T, F));
+        }
+    }
+    test_cases.emplace_back(new test_lsa_unit_lse(4096, 5, 16, 64, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lsa_unit_lse(4096, 5, 16, 60));
+    test_cases.emplace_back(new test_lsa_unit_lse(4096, 11, 64));
+    // GGML_LSA_ULSE_COOP=1 lane-shared kernel: d 128/256 (16/32 lanes per cell), a partial last CTA, 1..8 rows (n_kv must divide by F)
+    test_cases.emplace_back(new test_lsa_unit_lse(4144, 5, 16, 128));
+    test_cases.emplace_back(new test_lsa_unit_lse(4144, 3, 1, 256));
+    test_cases.emplace_back(new test_lsa_unit_lse(4160, 8, 64, 64));
+    for (int sh : {0, 1, 2}) {
+        for (int64_t T : {1, 5}) {
+            test_cases.emplace_back(new test_lsa_unit_pick(16384, T, 16, sh));
+            test_cases.emplace_back(new test_lsa_unit_pick(2048, T, 1, sh));
+        }
+        test_cases.emplace_back(new test_lsa_unit_pick(16384, 5, 128, sh));
+    }
+    // [LSA] fused compensation merge vs CPU and vs the COMP=2 chain (100K / 200K blocks, decode/verify/prefill-tail
+    // widths, Swift heads 24/4 x 256; G = 8 x 128; a small odd case; no stand-in at all)
+    for (int64_t nbs : {784, 1568, 37}) {
+        for (int64_t T : {1, 5, 17}) {
+            test_cases.emplace_back(new test_lsa_comp_merge(nbs, T, 24, 4, 256));
+        }
+    }
+    test_cases.emplace_back(new test_lsa_comp_merge(1568, 5, 32, 4, 128));
+    test_cases.emplace_back(new test_lsa_comp_merge(300, 3, 6, 6, 64));
+    test_cases.emplace_back(new test_lsa_comp_merge(784, 5, 24, 4, 256, 1));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
@@ -20805,6 +21905,120 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 2, 792, 1024, false, true,
             GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 2, 0, 2051));
     }
+    // LSA on SJ-KVaRN (Swift: 24 q / 4 KV heads): 100K-like body, 8,192-row ring, union ~9-12K cells; n_q = 1 needs a
+    // bound over 4096 (run with GGML_SJKVARN_COMPACT_MAX_BOUND=65536 GGML_SJKVARN_COMPACT=2 GGML_SJKVARN_COMPACT_HEADS4=1 to require the compact path)
+    for (auto [n_q, bound] : std::vector<std::pair<int64_t, int>>{{1, 12000}, {4, 3500}, {5, 3000}}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 792, 8192, false, false,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 2, 0, bound));
+    }
+    // LSA shared pick on SJ-KVaRN, 5%/1% body keep at 100K (792 groups): the per-row bound is the graph's shared-pick
+    // bound, (union + slack)/n_q, and the union holds the 8,192-row ring and the sinks besides the kept body cells
+    // (the old body-only bound broke the n_kv_max promise: union 9,334 > capacity 5,632 -> intended trap)
+    for (int mm : {3, 4}) {
+        const int union_max = 792*128/(mm == 3 ? 20 : 100) + 1 + 8192 + 128 + 4;
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 8192, false, false,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mm, 0, (union_max + 256 + 4)/5));
+    }
+    // LSA block pick on SJ-KVaRN (whole records dead): the stream decode kernel's record skip
+    // (GGML_SJKVARN_LIVE_RECORDS=1) against the CPU dense masked result; without the env these are plain masked cases
+    for (int mm : {5, 6, 8}) {
+        for (int64_t n_q : {1, 4, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 96, 1153, false, false,
+                GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mm));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 8192, false, false,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mm));
+    }
+    // per-KV-head LSA block pick (mask ne[2] == n_head): stream decode kernel reads its group's mask; under
+    // GGML_SJKVARN_LIVE_RECORDS=1 each KV head walks its own live-record list. Against the CPU per-head masked result.
+    for (int64_t n_q : {1, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 96, 1153, false, false,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 7));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 8192, false, false,
+        GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 7));
+    // LSA compensation: FA also writes the row log-sum-exp (parallel-block combine) - dense, record pick, strip pick,
+    // per-KV-head masks; output and LSE against the CPU reference
+    {
+        auto sjl = [&](test_flash_attn_ext_sj_kvarn * t) { t->lse_out = true; test_cases.emplace_back(t); };
+        for (int mm : {0, 6, 7, 8}) {
+            for (int64_t n_q : {1, 5}) {
+                sjl(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 96, 1153, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mm));
+            }
+        }
+        sjl(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 8192, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 6));
+        // widths above the stream kernel (9..127 rows) take the stream-k MMA launch: LSE written by the uniform fixup
+        // (the mask-loader route of resident bodies; it aborted before, rr2)
+        for (int mm : {0, 6}) {
+            for (int64_t n_q : {16, 40}) {
+                sjl(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 96, 1153, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mm));
+            }
+        }
+        sjl(new test_flash_attn_ext_sj_kvarn(16, 24, 4, 792, 8192, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 0));
+    }
+    // LSA block list (LLAMA_LSA_BLKLIST): sentinel mask cells resolved by the block pick in the SJ-KVaRN stream kernel,
+    // record (128) and strip-sized (32) blocks, with and without the LSE output, against the CPU reference
+    for (int blk : {128, 32, 16, 8, 1}) { // 16: LLAMA_LSA_REFINE=16 unit pick; 8/1: LLAMA_LSA_BLKLIST_FINE unit picks
+        for (int64_t n_q : {1, 4, 5}) {
+            for (int lse : {0, 1}) {
+                auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 96, 1153, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 9);
+                t->lsa_blk = blk;
+                t->lse_out = lse != 0;
+                test_cases.emplace_back(t);
+            }
+        }
+    }
+    // LSA virtual keys (LLAMA_LSA_VK): the dropped blocks' means as extra keys inside the stream kernel, plain and
+    // fused-rotation nodes, decode / MTP widths, against the CPU reference
+    for (int blk : {128, 32}) {
+        for (int64_t n_q : {1, 4, 5, 8}) {
+            for (int rot : {0, 1}) {
+                auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 96, 1153, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, rot, 0, 9);
+                t->lsa_blk = blk;
+                t->lsa_vk  = true;
+                test_cases.emplace_back(t);
+            }
+        }
+    }
+    // virtual keys with the 16-cell unit pick (LLAMA_LSA_REFINE_SH + BLKLIST + VK): 128-cell mean blocks, unit list
+    for (int64_t n_q : {1, 4, 5, 8}) {
+        for (int rot : {0, 1}) {
+            auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 96, 1153, false, false,
+                GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, rot, 0, 9);
+            t->lsa_blk     = 128;
+            t->lsa_vk      = true;
+            t->lsa_vk_unit = 16;
+            test_cases.emplace_back(t);
+        }
+    }
+    // virtual keys with finer unit picks (LLAMA_LSA_BLKLIST_FINE: REFINE = 4 / 1 cells, dead/full/partial strips)
+    for (int vku : {4, 1}) {
+        for (int64_t n_q : {1, 5}) {
+            for (int rot : {0, 1}) {
+                auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 96, 1153, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, rot, 0, 9);
+                t->lsa_blk     = 128;
+                t->lsa_vk      = true;
+                t->lsa_vk_unit = vku;
+                test_cases.emplace_back(t);
+            }
+        }
+    }
+    // LSA compensation on a plain cache (LLAMA_LSA_COMP=2): LSE output through the vec (n_q 1/5) and tile (n_q 40,
+    // rerouted from MMA) kernels, f16 and q8_0 K/V, 27B attention shape
+    for (ggml_type tkv : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nbq : {1, 5, 40}) {
+            for (int64_t kvn : {1024, 8192}) {
+                auto * t = new test_flash_attn_ext(256, 256, 4, {6, 1}, kvn, nbq, true, false, 0, 0, GGML_PREC_F32, tkv, tkv);
+                t->lse_out = true;
+                test_cases.emplace_back(t);
+            }
+        }
+    }
     // [KVRP] tq6 ring at 1024/4096/8192 rows with the f16 sink: the cp.async-pipelined exact strips
     for (int64_t n_ring : {1024, 4096, 8192}) {
         for (int64_t n_q : {1, 4, 5, 8}) {
@@ -20854,6 +22068,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(64, 24, 4, 3, 301, true, true, GGML_TYPE_F16, 128, false, GGML_TYPE_I16, bk, bv));
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(4, 24, 4, 3, 1024, true, false, GGML_TYPE_Q8_0, 256, false, GGML_TYPE_I16, bk, bv));
+    }
+    // fork (GGML_SJKVARN_TILE_SKIP=1 A/B): trellis bodies under LSA-style picks, the low-bit tile kernel skips body tiles
+    // masked -inf for every column: mode 5 = whole records dead (~75%, plus row-dependent ones), mode 8 = dead 16-cell
+    // strips inside half the records (a 32/64-cell tile is dead only where its strips all are), mode 3 = every 20th cell
+    // live (no tile dead: the check must not skip). Same CPU reference with and without the flag.
+    for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}}) {
+        for (int64_t n_q : {1, 4, 5}) {
+            for (int mask_mode : {3, 5, 8}) {
+                test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 40, 300, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, 0, mask_mode));
+            }
+        }
+    }
+    // fork (LSAKV): 4/4 scalar F32 body under the same picks; GGML_SJKVARN_TILE_SKIP=1 now also turns on the stream
+    // kernel's exact live-strip walk (dead records / strips skipped), same CPU reference with and without the flag
+    for (int64_t n_q : {1, 4, 5}) {
+        for (int mask_mode : {3, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 40, 300, false, false,
+                GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mask_mode));
+        }
+    }
+    // A5 (LLAMA_LSA_COMP_LB=1): trellis bodies 3/2 and 3/3 with the LSE output (uniform stream-k fixup of the low-bit tile
+    // kernel), fused rotation off / on, decode widths 1 and 5, dense and an LSA record pick (mode 5), plus a 100K body;
+    // output and LSE (checked separately) against the CPU reference. Filter: -o FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE (18 cases)
+    for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 2}, {3, 3}}) {
+        for (int rot : {0, 1}) {
+            for (int64_t n_q : {1, 5}) {
+                for (int mm : {0, 5}) {
+                    auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 40, 300, false, false,
+                        GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, rot, 0, mm);
+                    t->lse_out = true;
+                    test_cases.emplace_back(t);
+                }
+            }
+        }
+        auto * t = new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 1024, false, false,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, 0, 0);
+        t->lse_out = true;
+        test_cases.emplace_back(t);
     }
     // [TRPF] trellis prefill (n_q >= 128) takes the expand-once f16 path (fattn-sjkvarn-prefill.cu): bodies with tq6 /
     // f16 / q8 staging, f16 and staging sinks, GQA 6 and 8, a partial last ubatch; GGML_SJKVARN_PREFILL_MIB=1 runs the
@@ -22372,6 +23625,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 792, 4096, false, false, GGML_TYPE_TQ6_0, 128, true));
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(4, 24, 4, 792, 8192, false, false, GGML_TYPE_TQ6_0, 128, true));
+    // LSA block pick on SJ-KVaRN (~25%/~5% of the body records live): run once plain (dense masked walk) and once with
+    // GGML_SJKVARN_LIVE_RECORDS=1 (record skip); 100K / ~200K, widths 1/4/5
+    for (int64_t n_groups : {716, 1497}) {
+        for (int mm : {5, 6, 7, 8}) {
+            for (int64_t n_q : {1, 4, 5}) {
+                test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, n_groups, 8192, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mm));
+            }
+        }
+    }
+    // LSA on SJ-KVaRN: one shared pick keeps 5%/1% of the body (+128 sink, 8,192 ring); compact (bound = kept body cells)
+    // vs dense masked (bound 0) at 100K / ~200K, widths 1/4/5. Run with GGML_SJKVARN_COMPACT=1 GGML_SJKVARN_COMPACT_MAX_BOUND=65536 GGML_SJKVARN_COMPACT_HEADS4=1.
+    for (int64_t n_groups : {792, 1497}) {
+        for (int mm : {3, 4}) {
+            for (int64_t n_q : {1, 4, 5}) {
+                const int bound = (int) (n_groups*128/(mm == 3 ? 20 : 100) + 64);
+                for (int b : {0, bound}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, n_groups, 8192, false, false,
+                        GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, mm, 0, b));
+                }
+            }
+        }
+    }
     // Compare exact-tail traffic at the same 32896 visible positions.
     for (int64_t n_q : {4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 255, 128));
@@ -22393,6 +23669,69 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 102528, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // [LSA] attention share at 100K/200K and the cost left after key selection. Production SJ-KVaRN 4/4 (tq6 staging, f16
+    // sink, 8192 exact tail): depth D -> (D - 128 - 8192)/128 records; kept = the first 128 + last 8192 + k% of the middle
+    // as records (what a gather path would read). Drafter attention (tq5_0/turbo4) at the same depths.
+    for (int64_t depth : {102400, 204800}) {
+        const int64_t mid = (depth - 128 - 8192)/128;
+        for (int64_t n_groups : {mid, mid/100, (3*mid)/100, (5*mid)/100, mid/10, mid/4, mid/2}) {
+            for (int64_t n_q : {1, 4, 5}) {
+                test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, std::max<int64_t>(n_groups, 1), 8192, false, false, GGML_TYPE_TQ6_0, 128, true));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, depth - 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0));
+    }
+    // [LSA] per-layer pick / compensation overhead (r100 config: block record pick + COMP=2) at 100K / ~200K, width 1/5,
+    // 25%/50% keep; and the SJ-KVaRN 4/4 record-pick FA (mask_mode 5) with vs without the log-sum-exp output COMP=2 asks for
+    for (int64_t n_kv : {100352, 200704}) {
+        for (int64_t T : {1, 5}) {
+            for (int64_t divisor : {4, 2}) {
+                for (int mode : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}) {
+                    test_cases.emplace_back(new test_lsa_overhead(n_kv, T, mode, (n_kv - 8320)/divisor));
+                }
+            }
+        }
+    }
+    // [LSA] summary-scored pick alone (LLAMA_LSA_SUM_OP, mode 2 Gaussian summaries), 25% keep: 100K at 16-cell blocks
+    // (6,272) and 128-cell (784), 200K at 16 (12,544); width 1/5, own vs shared pick; shared=2 = best-row rule at T=4.
+    // (These were only in the eval list, so so1's perf step timed nothing.)
+    for (auto [nbs, B] : std::vector<std::pair<int64_t,int>>{{6272, 16}, {784, 128}, {12544, 16}}) {
+        const int kb = (int) (nbs/4);
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 1, kb, 0, 2, B));
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 5, kb, 0, 2, B));
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 5, kb, 1, 2, B));
+        test_cases.emplace_back(new test_lsa_block_select_sum(nbs, 4, kb, 2, 2, B, 1));
+    }
+    // [LSA] slice-local quota pick alone (LLAMA_LSA_SLICE), 25% keep, 100K/200K at 16-cell units (6,272 / 12,544),
+    // 16,384- and 4,096-cell slices (1,024 / 256 units), per row T 1/5 and shared T 5; run with GGML_LSA_SLICE_FUSED=0/1
+    // to time the 2-launch route against the one-launch kernel (same masks)
+    for (int64_t nbs : {6272, 12544}) {
+        for (int sl : {1024, 256}) {
+            test_cases.emplace_back(new test_lsa_block_select(nbs, 1, (int) (nbs/4), 0, 0, 0, 0, sl));
+            test_cases.emplace_back(new test_lsa_block_select(nbs, 5, (int) (nbs/4), 0, 0, 0, 0, sl));
+            test_cases.emplace_back(new test_lsa_block_select(nbs, 5, (int) (nbs/4), 0, 1, 0, 0, sl));
+        }
+    }
+    for (int64_t n_groups : {716, 1497}) {
+        for (int64_t n_q : {1, 5}) {
+            for (int lse : {0, 1}) {
+                auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, n_groups, 8192, false, false,
+                    GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 5);
+                t->lse_out = lse != 0;
+                test_cases.emplace_back(t);
+            }
+        }
+    }
+    // [LSA] fast path cost at 100K/200K: gather + attention over sinks 128 + window 8192 + 5% of the middle (rounded to
+    // 256) vs dense masked attention over the whole cache, q8_0 cache, decode widths 1 and 5
+    for (int64_t depth : {102400, 204800}) {
+        const int64_t n_sel = GGML_PAD(128 + 8192 + 4 + (5*(depth - 128 - 8192))/100, 256);
+        for (int64_t nq : {1, 5}) {
+            for (int mode : {1, 2}) {
+                test_cases.emplace_back(new test_lsa_gather_attn(GGML_TYPE_Q8_0, 256, 4, 6, depth, nq, n_sel, mode));
+            }
+        }
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

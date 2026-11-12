@@ -163,6 +163,53 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(const ggml_tensor * dst)
 void ggml_cuda_flash_attn_ext_sj_kvarn_direct(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// Per-query-head mask (mask ne[2] == n_head; LSA per-KV-head pick, the q heads of a KV group share one mask): only the
+// 4/4 stream decode kernel (fattn-sjkvarn-stream.cuh) reads the head slice, so it is served at decode / verify widths
+// that kernel takes and refused everywhere else (the graph splits per KV group there).
+static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    static const int stream_max = getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") != nullptr
+                                ? atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8; // fattn-sjkvarn-direct.cuh
+    return mask != nullptr && mask->type == GGML_TYPE_F16 && mask->ne[2] == Q->ne[2] && mask->ne[3] == 1 &&
+        ggml_get_op_params_i32(dst, 5) == ((4 << 8) | 4) && ggml_get_op_params_i32(dst, 7) != GGML_TYPE_I16 &&
+        Q->ne[1] >= 1 && Q->ne[1] <= std::min(stream_max, 8) && ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(dst);
+}
+
+// LSA block list (ggml_flash_attn_ext_set_lsa_blocks): only the 4/4 stream decode kernel resolves the mask's
+// GGML_LSA_MASK_SEL entries, so the node is served at the widths that kernel takes and refused everywhere else
+// LSA virtual keys (ggml_flash_attn_ext_set_lsa_vk): 4/4 stream kernel only, F16 mean rows with 16-byte rows and >= 16
+// readable rows (the kernel stages 16 means per strip and clamps the last strip inside the allocation)
+static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_lsa_vk_ok(const ggml_tensor * dst) {
+    const ggml_tensor * km = dst->src[7];
+    const ggml_tensor * vm = ggml_flash_attn_ext_get_lsa_vk_vm(dst);
+    const ggml_tensor * nd = dst->src[8];
+    if (km == nullptr || vm == nullptr || nd == nullptr) {
+        return false;
+    }
+    for (const ggml_tensor * m : {km, vm}) {
+        const ggml_tensor * b = m->view_src;
+        const int64_t rows = b && b->nb[1] == m->nb[1] && b->ne[0] == m->ne[0] ? (int64_t) (ggml_nbytes(b) - m->view_offs)/m->nb[1] : m->ne[1];
+        if (m->type != GGML_TYPE_F16 || m->nb[1] % 16 != 0 || m->view_offs % 16 != 0 || rows < 16 || rows < ggml_flash_attn_ext_get_lsa_vk_n(dst) ||
+                m->ne[0] != 256*dst->src[1]->ne[2]) {
+            return false;
+        }
+    }
+    return nd->type == GGML_TYPE_F32 && nd->ne[1] == dst->src[0]->ne[1] && nd->nb[0] == sizeof(float);
+}
+
+static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_lsa_blocks_ok(const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    static const int stream_max = getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") != nullptr
+                                ? atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8; // fattn-sjkvarn-direct.cuh
+    const int body_type = ggml_get_op_params_i32(dst, 7);
+    return mask != nullptr && mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+        ggml_get_op_params_i32(dst, 5) == ((4 << 8) | 4) && body_type != GGML_TYPE_I16 && body_type != GGML_TYPE_TURBO4_0 &&
+        Q->ne[1] >= 1 && Q->ne[1] <= std::min(stream_max, 8) && ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(dst) &&
+        (!ggml_flash_attn_ext_get_lsa_vk(dst) || ggml_cuda_flash_attn_ext_sj_kvarn_lsa_vk_ok(dst));
+}
+
 template <int DKQ, int DV>
 static void ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
@@ -182,6 +229,16 @@ static void ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2(ggml_backend_cud
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     if (ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16) {
         ggml_cuda_sj_kvarn_trellis_cb_init();
+    }
+    if (mask->ne[2] != 1) {
+        GGML_ASSERT(ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst));
+        ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, dst); // -> stream kernel (n_q <= stream_max)
+        return;
+    }
+    if (ggml_flash_attn_ext_get_lsa_block(dst) > 0) {
+        GGML_ASSERT(ggml_cuda_flash_attn_ext_sj_kvarn_lsa_blocks_ok(dst));
+        ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, dst); // -> stream kernel (n_q <= stream_max)
+        return;
     }
     if (ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ctx, dst)) {
         return;
@@ -252,6 +309,12 @@ static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_supported(const int cc, con
         return false;
     }
     if (Q->nb[1] % 16 != 0 || mask->nb[1] % 16 != 0) {
+        return false;
+    }
+    if (ggml_flash_attn_ext_get_lsa_block(dst) > 0 && !ggml_cuda_flash_attn_ext_sj_kvarn_lsa_blocks_ok(dst)) {
+        return false;
+    }
+    if (mask->ne[2] != 1 && !ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst)) {
         return false;
     }
     for (const ggml_tensor * kv : {K, V}) {
