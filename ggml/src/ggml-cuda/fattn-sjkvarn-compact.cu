@@ -403,6 +403,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     for (int i : {4, 5, 6, 7}) {
         ggml_set_op_params_i32(&out, i, 0);
     }
+    GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr && "SJ-KVaRN compact gather writes no LSE output");
     // one query tile and one sequence: the kernel stops at live_count[1] instead of walking the whole capacity
     ggml_cuda_fattn_kv_max_override = live_count.ptr + 1;
     if (queries == 1) {

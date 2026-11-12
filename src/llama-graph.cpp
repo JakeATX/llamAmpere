@@ -4155,7 +4155,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                                      (n_kv_packed > 0 ? n_kv_packed : kq_mask->ne[0]*32) :
                                      kq_mask ? kq_mask->ne[0] : 0;
             GGML_ASSERT(kq_mask && n_kv_pad > 0 && n_kv_pad % 64 == 0);
-            GGML_ASSERT(kv_rows == nullptr && cur->src[9] == nullptr &&
+            // src[9] may hold the LSA LSE output set above (F32, LLAMA_LSA_COMP=2): only kv_rows (I32) is refused
+            GGML_ASSERT(kv_rows == nullptr && ggml_flash_attn_ext_get_kv_rows(cur) == nullptr &&
                     "kv_rows (FA src[9]) cannot be combined with an SJ-KVaRN body (src[5]) on one FA node");
             cur->src[7] = sj_kvarn_pending.selected;
             ggml_flash_attn_ext_set_sj_kvarn(cur, sj_kvarn_pending.body, sj_kvarn_pending.desc,
@@ -7470,9 +7471,9 @@ ggml_tensor * llm_graph_context::build_attn(
                 sinks == nullptr && v_mla == nullptr && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
                 (!is_sj_kvarn || (lcfg.comp_fast && lsa_means_ok && !sj_no_lse));
         const bool vk_pending = lsa_fa_vk && lsa_fa_sel != nullptr; // LLAMA_LSA_VK: compensation inside the FA node
-        // A5: no LSE at >= 128 rows on a trellis body (the [TRPF] expand path would take it and writes none)
+        // no LSE at >= 128 rows on any SJ-KVaRN body (the expand-to-f16 prefill path would take it and writes none)
         lsa_lse_req = lsa_comp && !vk_pending && lcfg.comp_fast && lsa_means_ok && q->ne[2] <= lcfg.comp_max_t &&
-                !(sj_lb_lse && q->ne[2] >= 128);
+                !(is_sj_kvarn && q->ne[2] >= 128);
         cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, lsa_n_kv_max, kq_scale, il);
         ggml_tensor * lse = lsa_lse;
         lsa_lse     = nullptr;
