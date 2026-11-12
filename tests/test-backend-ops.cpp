@@ -8475,6 +8475,37 @@ struct test_mul_mat_ai4 : public test_mul_mat {
     }
 };
 
+// [PP27] AIF25_U (2.625 bpw computed pair, 672-byte 16 x 128 units: 16 fp16 row scales 0.002..0.02, pad, random tile
+// words) for the prompt speed list. The CPU backend has no AIF25_U matmul, so this case is perf-only; the exactness of
+// the prompt kernel against the 8-token kernel is tests/test-aif25-mmq.cpp.
+struct test_mul_mat_aif25 : public test_mul_mat {
+    test_mul_mat_aif25(int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(GGML_TYPE_AIF25_U, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_AIF25_U) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::mt19937 rng(1234);
+            std::uniform_real_distribution<float> rs(0.002f, 0.02f);
+            std::vector<uint8_t> buf(ggml_nbytes(t));
+            for (size_t b = 0; b + 672 <= buf.size(); b += 672) {
+                ggml_fp16_t * d = (ggml_fp16_t *) (buf.data() + b);
+                for (int i = 0; i < 16; ++i) {
+                    d[i] = ggml_fp32_to_fp16(rs(rng));
+                }
+                uint32_t * w = (uint32_t *) (buf.data() + b + 32);
+                for (int i = 0; i < 160; ++i) {
+                    w[i] = (uint32_t) rng();
+                }
+            }
+            ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+        }
+    }
+};
+
 // [AIV2] AI+ tile types (AIT2/3/4): random trellis words and sane fp16 scales per 32 x 512 chunk (row scales 0.002..0.02,
 // column scales 0.5..2), for the gate-2 speed list (decode correctness is run_ait_check against the Python reference)
 struct test_mul_mat_ait : public test_mul_mat {
@@ -21704,6 +21735,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                         if (mk.second % ggml_blck_size(t) != 0) { continue; }
                         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
                         test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, broadcast, mk.first, n, mk.second));
+                    }
+                }
+            }
+            return test_cases;
+        }
+        // [PP27] GGML_TEST_AIV2_PERF=pp27: dense Swift 1.5 27B prompt widths at its matmul shapes (FFN up/gate and down,
+        // GDN qkv, GDN out), the AIF25_U, AIT2 and AIT3 layers of the AI2 file against IQ4_XS and Q6_K
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "pp27") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 5120, 6144 } }) {
+                for (int64_t n : { 64, 512, 1024, 2048, 4096 }) {
+                    test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second));
+                    for (ggml_type t : { GGML_TYPE_AIT2, GGML_TYPE_AIT3 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K }) {
+                        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
                     }
                 }
             }

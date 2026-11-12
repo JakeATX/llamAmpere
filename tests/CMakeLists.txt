@@ -534,6 +534,20 @@ if (GGML_CUDA)
     target_include_directories(test-kv-stream-cuda-attn PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     llama_build_and_test(test-kv-stream-cuda-set-rows.cpp LABEL cuda)
     target_include_directories(test-kv-stream-cuda-set-rows PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    # [PP27] AIF25_U exact prompt kernel vs the 8-token kernel, bit for bit (exits 77 without a CUDA device)
+    llama_build_and_test(test-aif25-mmq.cpp LABEL cuda)
+    target_include_directories(test-aif25-mmq PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    set_tests_properties(test-aif25-mmq PROPERTIES SKIP_RETURN_CODE 77)
+    # the kernel variant is read once per process: one ctest entry per built tile/strips variant
+    foreach(v 32_1 128_1 32_2 64_2)
+        string(REPLACE "_" ";" vp ${v})
+        list(GET vp 0 v_tile)
+        list(GET vp 1 v_strips)
+        add_test(NAME test-aif25-mmq-${v} COMMAND $<TARGET_FILE:test-aif25-mmq>)
+        set_tests_properties(test-aif25-mmq-${v} PROPERTIES
+            ENVIRONMENT "GGML_CUDA_AIF25_MMQ=${v_tile};GGML_CUDA_AIF25_MMQ_STRIPS=${v_strips}"
+            SKIP_RETURN_CODE 77 LABELS cuda)
+    endforeach()
 endif()
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately

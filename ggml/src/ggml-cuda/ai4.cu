@@ -4,6 +4,7 @@
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
 #include "magic2-v2.cuh"
+#include "aif25-mmq.cuh"
 #include "../ggml-aif25.h"
 #include "rpb-knobs.h"
 #include "quantize.cuh"
@@ -2693,6 +2694,53 @@ bool ggml_cuda_aif25_supported(const ggml_tensor * op) {
         ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op);
 }
 
+// [PP27] Exact prompt path for AIF25_U. GGML_CUDA_AIF25_MMQ = token tile of magic2::mmq (0 = off, the default; 32, 64
+// or 128), used at N >= GGML_CUDA_AIF25_MMQ_MIN tokens (default 64); GGML_CUDA_AIF25_MMQ_STRIPS = 16-row strips per
+// block (1, the default, or 2; tile 128 takes 1). The output is bit-identical to magic2::mmv, which decodes the weights
+// once per 8 tokens. GGML_CUDA_AIF25_MMQ_CHECK=1 (debug; synchronizes, so run it with CUDA graphs off) also runs mmv
+// into a scratch buffer and aborts on the first call whose outputs differ in any bit (logs calls 1-4 and every power of
+// two; =2 logs every call).
+static int aif25_mmq_tile() {
+    static const int v = ai4_env_int("GGML_CUDA_AIF25_MMQ", nullptr, 0);
+    return v;
+}
+
+static int aif25_mmq_min() {
+    static const int v = std::max(9, ai4_env_int("GGML_CUDA_AIF25_MMQ_MIN", nullptr, 64));
+    return v;
+}
+
+static int aif25_mmq_strips() {
+    static const int v = ai4_env_int("GGML_CUDA_AIF25_MMQ_STRIPS", nullptr, 1);
+    return v;
+}
+
+static int aif25_mmq_check() {
+    static const int v = ai4_env_int("GGML_CUDA_AIF25_MMQ_CHECK", nullptr, 0);
+    return v;
+}
+
+template <int XSH>
+static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales, float * y, int M, int K, int64_t N,
+                      cudaStream_t stream) {
+    // CUDA grid.y is limited to 65535; each block handles eight activation rows.
+    for (int64_t n0 = 0; n0 < N; n0 += 8*65535) {
+        const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
+        const dim3 grid(M/16, (nr+7)/8);
+        const float * xs = scales + (size_t)n0*(K >> (7+XSH));
+        magic2::mmv<5,2,AIF25_MUL,XSH><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+static __global__ void k_aif25_bits_differ(const float * __restrict__ a, const float * __restrict__ b, const int64_t n,
+                                           unsigned long long * __restrict__ count) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && __float_as_uint(a[i]) != __float_as_uint(b[i])) {
+        atomicAdd(count, 1ULL);
+    }
+}
+
 void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
                             const ggml_tensor * x, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_aif25_supported(dst));
@@ -2706,18 +2754,51 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     ggml_cuda_pool_alloc<float> scales(ctx.pool(), (size_t)N*(K >> (7+xsh)));
     // The pair kernel reads rotated columns in their original order.
     ai4_quantize_x<false, false, true>((const float *)x->data, N, K, xsh, q.get(), scales.get(), stream);
-    // CUDA grid.y is limited to 65535; each block handles eight activation rows.
-    for (int64_t n0 = 0; n0 < N; n0 += 8*65535) {
-        const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
-        const dim3 grid(M/16, (nr+7)/8);
-        const float * xs = scales.get() + (size_t)n0*(K >> (7+xsh));
-        if (xsh) {
-            magic2::mmv<5,2,AIF25_MUL,1><<<grid,128,0,stream>>>((const uint8_t *)w->data,
-                q.get()+(size_t)n0*K, xs, (float *)dst->data+(size_t)n0*M, M,K,nr);
-        } else {
-            magic2::mmv<5,2,AIF25_MUL,0><<<grid,128,0,stream>>>((const uint8_t *)w->data,
-                q.get()+(size_t)n0*K, xs, (float *)dst->data+(size_t)n0*M, M,K,nr);
+    const uint8_t * wd = (const uint8_t *) w->data;
+    float * y = (float *) dst->data;
+    const int tile = aif25_mmq_tile();
+    if (tile > 0 && N >= aif25_mmq_min() &&
+            ggml_cuda_aif25_mmq(xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (aif25_mmq_check()) {
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+            if (capture != cudaStreamCaptureStatusNone) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    GGML_LOG_WARN("[AIF25_MMQ] check skipped during CUDA graph capture; set GGML_CUDA_DISABLE_GRAPHS=1\n");
+                }
+            }
         }
-        CUDA_CHECK(cudaGetLastError());
+        if (aif25_mmq_check() && capture == cudaStreamCaptureStatusNone) {
+            const int64_t n_out = N*M;
+            ggml_cuda_pool_alloc<float> ref(ctx.pool(), (size_t) n_out);
+            ggml_cuda_pool_alloc<unsigned long long> count(ctx.pool(), 1);
+            CUDA_CHECK(cudaMemsetAsync(count.get(), 0, sizeof(unsigned long long), stream));
+            if (xsh) {
+                aif25_mmv<1>(wd, q.get(), scales.get(), ref.get(), M, K, N, stream);
+            } else {
+                aif25_mmv<0>(wd, q.get(), scales.get(), ref.get(), M, K, N, stream);
+            }
+            k_aif25_bits_differ<<<(unsigned) ((n_out + 255)/256), 256, 0, stream>>>(y, ref.get(), n_out, count.get());
+            CUDA_CHECK(cudaGetLastError());
+            unsigned long long differ = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&differ, count.get(), sizeof(differ), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            static std::atomic<long long> checked{0};
+            const long long n_checked = ++checked;
+            if (differ != 0 || aif25_mmq_check() >= 2 || n_checked <= 4 || (n_checked & (n_checked - 1)) == 0) {
+                GGML_LOG_INFO("[AIF25_MMQ] check %lld: %s M=%d K=%d N=%lld tile=%d strips=%d: %llu of %lld outputs differ from mmv\n",
+                        n_checked, dst->name, M, K, (long long) N, tile, aif25_mmq_strips(), differ, (long long) n_out);
+            }
+            if (differ != 0) {
+                GGML_ABORT("AIF25_MMQ check failed");
+            }
+        }
+        return;
+    }
+    if (xsh) {
+        aif25_mmv<1>(wd, q.get(), scales.get(), y, M, K, N, stream);
+    } else {
+        aif25_mmv<0>(wd, q.get(), scales.get(), y, M, K, N, stream);
     }
 }
