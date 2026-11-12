@@ -362,6 +362,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         ggml_cuda_lsa_page_prepare(ctx, dst);
     }
     const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
+    GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr && "SJ-KVaRN expand prefill writes no LSE output (graph: no LSE at >= 128 rows)");
     GGML_ASSERT(!ggml_cuda_fattn_sj_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
     const int gqa = Q->ne[2]/K->ne[2];
     const bool grouped = plan.grouped;

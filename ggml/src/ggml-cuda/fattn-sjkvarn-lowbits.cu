@@ -310,6 +310,7 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
             GGML_ABORT("SJ-KVaRN trellis body on a %d/%d pair (trellis needs 3/3, 3/2, 2/2 or the 4/4 trellis4 body)", bits_k, bits_v);
         }
     } else if (dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct() && !ggml_cuda_lsa_page_full_stage(dst->src[5])) {
+        GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr && "SJ-KVaRN scalar low-bit width kernel writes no LSE output");
         ggml_cuda_sj_kvarn_lowbits_width<bits_k,bits_v,rot>(ctx,dst);
     } else {
         ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k,bits_v,rot>(ctx,dst);

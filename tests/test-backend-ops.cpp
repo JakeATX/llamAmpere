@@ -14325,6 +14325,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     // Stream s sees n_ring - 37*s ring positions; logical groups map to shuffled pool records.
     const int ns;
     bool packed_pair = false;
+    bool lse_fix = false; // COMPFIX: SJ + LSE route cases, own op name (FLASH_ATTN_EXT_SJKVARN_LSE_ROUTES)
     bool lse_out = false; // LSA compensation: the node also writes its row log-sum-exp (ggml_flash_attn_ext_set_lse), appended to out
     int lsa_blk = 128;    // mask_mode 9: LSA block size of the block list (ggml_flash_attn_ext_set_lsa_blocks)
     bool lsa_vk = false;  // mask_mode 9: virtual keys (ggml_flash_attn_ext_set_lsa_vk): "lsa_nd" [nbs, n_q] instead of
@@ -14414,7 +14415,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         if (rot != 2) {
             // A5 trellis + LSE: output and LSE checked separately, so the LSE values (about 8-10 each) do not dilute
             // the output error in one NMSE over CONCAT(out, lse)
-            if (lse_out && body_type == GGML_TYPE_I16 && ns == 0) {
+            if (lse_out && (body_type == GGML_TYPE_I16 || lse_fix) && ns == 0) {
                 const size_t nl = (size_t) nh * n_q;
                 GGML_ASSERT(n > nl);
                 return std::max(nmse(a, b, n - nl), nmse(a + (n - nl), b + (n - nl), nl));
@@ -14434,6 +14435,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         }
         if (rot == 2) {
             return "FLASH_ATTN_EXT_SJKVARN_ROT_EXACT";
+        }
+        if (lse_fix) {
+            return "FLASH_ATTN_EXT_SJKVARN_LSE_ROUTES"; // own name: the older filters keep their case sets
         }
         if (packed_pair) {
             return "FLASH_ATTN_EXT";
@@ -21957,6 +21961,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         sjl(new test_flash_attn_ext_sj_kvarn(16, 24, 4, 792, 8192, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 0, 0));
+    }
+    // COMPFIX (LLAMA_LSA_COMP=2 on SJ-KVaRN, the routes the graph asks an LSE from): output and LSE, checked separately,
+    // against the CPU reference. 4/4 scalar: stream kernel (1, 5, 8 rows) and stream-k MMA (9, 16, 64 rows), fused
+    // rotation off / on, dense, record pick and per-KV-head masks (stream widths only). 3/3t and 3/2t: tile kernel at
+    // 1, 5, 8, 16, 64 rows, rotation off / on, dense and record pick. Filter: -o FLASH_ATTN_EXT_SJKVARN_LSE_ROUTES (72 cases)
+    {
+        auto fix = [&](test_flash_attn_ext_sj_kvarn * t) { t->lse_out = true; t->lse_fix = true; test_cases.emplace_back(t); };
+        for (int rot : {0, 1}) {
+            for (int64_t n_q : {1, 5, 8, 9, 16, 64}) {
+                for (int mm : {0, 5, 7}) {
+                    if (mm == 7 && n_q > 8) {
+                        continue; // per-head masks: stream kernel widths only on 4/4
+                    }
+                    fix(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 40, 300, false, false,
+                        GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, rot, 0, mm));
+                }
+            }
+            for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 3}, {3, 2}}) {
+                for (int64_t n_q : {1, 5, 8, 16, 64}) {
+                    for (int mm : {0, 5}) {
+                        fix(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 40, 300, false, false,
+                            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, rot, 0, mm));
+                    }
+                }
+            }
+        }
+        fix(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 1024, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 1, 0, 5));
+        fix(new test_flash_attn_ext_sj_kvarn(16, 24, 4, 792, 1024, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 3, 3, 1, 0, 5));
     }
     // LSA block list (LLAMA_LSA_BLKLIST): sentinel mask cells resolved by the block pick in the SJ-KVaRN stream kernel,
     // record (128) and strip-sized (32) blocks, with and without the LSE output, against the CPU reference
