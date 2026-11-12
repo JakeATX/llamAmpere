@@ -21709,6 +21709,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // GGML_TEST_AIV2_PERF=aitmid: AIT3/AIT4 at the multi-user verify widths (GGML_CUDA_AIT_MIDT_SPLIT A/B), 8 and 33 as controls
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "aitmid") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
+                for (int64_t n : { 8, 9, 16, 22, 24, 32, 33 }) {
+                    for (ggml_type t : { GGML_TYPE_AIT3, GGML_TYPE_AIT4 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                }
+            }
+            return test_cases;
+        }
         // GGML_TEST_AIV2_PERF=ait: only AIT2/3/4 with adjacent controls (AIT2_U, AIT4_U, EXL3 2/4 with glue)
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "ait") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
@@ -23260,8 +23271,8 @@ static int run_ait_check(const char * dir) {
         fails += !dec_ok;
         printf("%s decode host vs python: max rel %.3g %s\n", nm.c_str(), maxrel, dec_ok ? "OK" : "FAIL");
         // (2) GPU mul_mat vs host reference
-        for (int64_t N : {1, 2, 3, 4, 5, 6, 7, 8, 33, 512}) {
-            if (shape && N > 8) {
+        for (int64_t N : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 22, 24, 25, 32, 33, 512}) {
+            if (shape && N > 32) {
                 continue;
             }
             ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -23287,7 +23298,7 @@ static int run_ait_check(const char * dir) {
                 continue;
             }
             ggml_backend_tensor_get(y, yg.data(), 0, yg.size() * 4);
-            if (N <= 8) {
+            if (N <= 32) {
                 const char * repeat_env = getenv("GGML_TEST_AIT_REPEAT");
                 const int repeats = repeat_env ? std::max(1, std::min(64, atoi(repeat_env))) : 8;
                 std::vector<float> again(yg.size());
