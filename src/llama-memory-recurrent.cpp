@@ -12,6 +12,14 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <atomic>
+
+// [TAG_RECURRENT_KEEP_BASE] widest ubatch (tokens per seq) that keeps its pre-ubatch plane; 0 = no memory has it on
+static std::atomic<uint32_t> g_rs_keep_base_rows{0};
+
+uint32_t llama_n_rs_keep_base(void) {
+    return g_rs_keep_base_rows.load();
+}
 
 //
 // llama_memory_recurrent
@@ -76,6 +84,16 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
     }
     rs_base.assign(mem_size, 0);
+    {
+        const char * env = getenv("LLAMA_RS_KEEP_BASE");
+        this->rs_keep_base = this->rs_ring && n_rs_seq >= 2 && env != nullptr && strcmp(env, "1") == 0;
+        if (this->rs_keep_base) {
+            g_rs_keep_base_rows.store(2 * (n_rs_seq + 1));
+            LLAMA_LOG_INFO("%s: rollback keep-base = on (ubatches of %u..%u tokens keep the pre-ubatch plane)\n", __func__,
+                    n_rs_seq + 2, 2 * (n_rs_seq + 1));
+        }
+    }
+    rs_keep_n.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -323,6 +341,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     const uint32_t ring_have = ckpt_span[seq_id] - std::min(ckpt_span[seq_id], replay_len[seq_id]);
                     have = std::min(have, ring_have);
                 }
+                // [TAG_RECURRENT_KEEP_BASE] the whole last ubatch goes: its pre-ubatch plane is group K - 1
+                if (rs_keep_base && (size_t) seq_id < rs_keep_n.size() && rs_keep_n[seq_id] > 0 &&
+                        rollback == (llama_pos) rs_keep_n[seq_id] && rs_valid[seq_id] == n_rs_seq - 1 && rs_idx[seq_id] == 0) {
+                    set_rs_idx(seq_id, n_rs_seq);
+                    rs_valid[seq_id]  = 0;
+                    rs_keep_n[seq_id] = 0;
+                    cell.pos = p0 - 1;
+                    return true;
+                }
                 if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq && rollback <= (llama_pos) have) {
                     if (gdn_replay) {
                         replay_len[seq_id] += (uint32_t) rollback;
@@ -439,6 +466,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         if ((size_t) seq_id_src < nrs && (size_t) seq_id_dst < nrs) {
             rs_idx[seq_id_dst]     = rs_idx[seq_id_src];
             rs_valid[seq_id_dst]   = rs_valid[seq_id_src];
+            rs_keep_n[seq_id_dst]  = 0;
             replay_len[seq_id_dst] = replay_len[seq_id_src];
             ckpt_span[seq_id_dst]  = ckpt_span[seq_id_src];
             s_stale[seq_id_dst]    = s_stale[seq_id_src];
@@ -748,6 +776,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     // find_slot credits each sequence's rs_valid with the ubatch's tokens; this dry run must not,
     // or apply() credits them a second time and a rollback deeper than the real history is accepted
     auto org_rs_valid = rs_valid;
+    auto org_rs_keep_n = rs_keep_n;
 
     bool success = true;
 
@@ -763,6 +792,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     used = org_used;
     head = org_head;
     rs_valid = std::move(org_rs_valid);
+    rs_keep_n = std::move(org_rs_keep_n);
 
     return success;
 }
@@ -956,6 +986,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // [VSHIFT] without the shift only the groups this ubatch wrote (0..n-1) are real
                 if (rs_shift_skip && n_seq_tokens <= n_rs_seq) {
                     rs_valid[seq_id] = n_seq_tokens - 1;
+                }
+                // [TAG_RECURRENT_KEEP_BASE] groups 0..K-2 are this ubatch, group K-1 is the state before it
+                rs_keep_n[seq_id] = 0;
+                if (keep_base_width(n_seq_tokens)) {
+                    rs_valid[seq_id]  = n_rs_seq - 1;
+                    rs_keep_n[seq_id] = n_seq_tokens;
                 }
             }
         }
@@ -2032,6 +2068,9 @@ uint32_t llama_memory_recurrent_context::get_n_written() const {
     }
     const uint32_t K = mem->n_rs_seq + 1;
     const uint32_t n = get_ubatch().n_seq_tokens;
+    if (mem->keep_base_width(n)) {
+        return K - 1; // [TAG_RECURRENT_KEEP_BASE] the newest K - 1 groups go to ring planes, the old logical plane stays
+    }
     if (n >= K && !mem->rs_ring_rows_all) {
         return 0; // fills the ring: b' = 0, the static copies write group g at plane g
     }
@@ -2061,7 +2100,7 @@ uint32_t llama_memory_recurrent_context::get_n_older() const {
     }
     const llama_ubatch & ubatch = get_ubatch();
     const uint32_t K = mem->n_rs_seq + 1;
-    const uint32_t n = ubatch.n_seq_tokens;
+    const uint32_t n = mem->keep_base_width(ubatch.n_seq_tokens) ? K - 1 : ubatch.n_seq_tokens; // [TAG_RECURRENT_KEEP_BASE]
     uint32_t rows = 0;
     if (n < K) {
         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
@@ -2082,7 +2121,7 @@ void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, 
     GGML_ASSERT(get_rs_ring());
     const llama_ubatch & ubatch = get_ubatch();
     const uint32_t K         = mem->n_rs_seq + 1;
-    const uint32_t n         = ubatch.n_seq_tokens;
+    const uint32_t n         = mem->keep_base_width(ubatch.n_seq_tokens) ? K - 1 : ubatch.n_seq_tokens; // [TAG_RECURRENT_KEEP_BASE]
     const uint32_t n_seqs    = ubatch.n_seqs;
     const uint32_t n_rs      = get_n_rs();
     const uint32_t size      = mem->size;

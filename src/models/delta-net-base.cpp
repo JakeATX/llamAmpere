@@ -584,7 +584,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // Writing them anyway with s_idx clamped to 0 overwrites every older conv snapshot with the
         // pre-ubatch window, which destroys the rollback history of a sequence that is decoded one
         // token at a time and makes a later rollback restore a state that never existed.
-        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+        const int64_t n_written = inp->rs_wr != nullptr ? (int64_t) inp->n_written : std::min<int64_t>(n_seq_tokens, K);
 
         if (inp->rs_wr != nullptr) {
             // [TAG_RECURRENT_ROLLBACK_RING] a ubatch shorter than the ring: groups live at ring planes
@@ -721,7 +721,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         const size_t row_size = ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
 
         // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+        const int64_t n_written = inp->rs_wr != nullptr ? (int64_t) inp->n_written : std::min<int64_t>(n_seq_tokens, K);
 
         if (inp->rs_wr != nullptr) {
             // [TAG_RECURRENT_ROLLBACK_RING] a ubatch shorter than the ring: snapshot slot g -> cache row

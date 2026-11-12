@@ -89,6 +89,17 @@ public:
     // invalidates the snapshots: clear(), rm_all, and state_read.
     std::vector<uint32_t> rs_valid;
 
+    // [TAG_RECURRENT_KEEP_BASE] LLAMA_RS_KEEP_BASE=1 (ring layout only; the server sets it for copy mode): a ubatch
+    // of K < n <= 2K tokens per seq writes its newest K - 1 groups only, so the plane that held the state BEFORE the
+    // ubatch survives as group K - 1. A rollback of 1..K-2 tokens works as usual, and a rollback of exactly n tokens
+    // (the whole ubatch) selects that plane: no state copy, no extra memory. rs_keep_n[seq] = n of such a ubatch
+    // while that plane is still the pre-ubatch state (rs_valid == K - 2 and no pending rollback), else stale.
+    bool rs_keep_base = false;
+    std::vector<uint32_t> rs_keep_n;
+    bool keep_base_width(uint32_t n) const {
+        return rs_keep_base && n > n_rs_seq + 1 && n <= 2 * (n_rs_seq + 1);
+    }
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // [TAG_RECURRENT_ROLLBACK_RING] ring-indexed snapshot groups. When true, rollback group g of

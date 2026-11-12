@@ -793,6 +793,7 @@ struct server_slot {
     llama_pos spec_ckpt_tgt_pos_max  = -1;
     llama_tokens spec_replay_prefix;       // committed tokens to re-decode ahead of the replayed draft (no output)
     bool spec_is_replay = false;
+    bool spec_round_kb  = false; // copy mode: this wide round keeps its pre-round state plane on the card (no checkpoint)
     common_sampler_ptr spec_smpl_after_verify;
     llama_token spec_replay_token = LLAMA_TOKEN_NULL;
     size_t spec_verify_width = 0;
@@ -2235,6 +2236,13 @@ private:
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
+#if !defined(_WIN32)
+        // copy mode: a wide verify batch keeps its pre-round recurrent plane, so a block miss needs no checkpoint
+        // (LLAMA_RS_KEEP_BASE=0 in the environment keeps the per-round checkpoint)
+        if (params.speculative.copy_tail > 0) {
+            setenv("LLAMA_RS_KEEP_BASE", "1", 0);
+        }
+#endif
         const bool is_resume = sleeping;
         if (!is_resume) {
             params_load = params;
@@ -5862,7 +5870,18 @@ private:
                     ctx_dft == nullptr && !slot.prompt.tokens.has_mtmd &&
                     params_base.sj_kvarn_bits_k == 0 && !params_base.speculative.draft.sj_kvarn;
 
-                if (reuse_ckpt_tgt) {
+                // copy mode: the memory keeps the pre-round plane of this verify batch (one slot, draft + sampled token
+                // in one ubatch), so a reject deeper than the tail rolls the whole batch back in place and replays
+                const bool keep_base = use_ckpt_tgt && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                    params_base.speculative.copy_tail > 0 && server_copy_inplace() && ctx_dft == nullptr &&
+                    generating.size() == 1 && slot.spec_replay_prefix.empty() &&
+                    draft.size() + 1 <= llama_n_rs_keep_base();
+                slot.spec_round_kb = keep_base;
+
+                if (keep_base) {
+                    ckpt.clear_tgt();
+                    slot.spec_ckpt_tgt_n_tokens = -1;
+                } else if (reuse_ckpt_tgt) {
                     slot.spec_save_reused += 1;
                 } else if (use_ckpt_tgt) {
                     const int64_t t_save0 = ggml_time_us();
@@ -7502,7 +7521,7 @@ private:
                 // replay pass (nothing is rejected there) and not when the draft context would need its checkpoint.
                 if (n_rollback > 0 && use_ckpt_tgt && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
                         params_base.speculative.copy_tail > 0 && server_copy_inplace() && !slot.spec_is_replay &&
-                        n_rollback <= llama_n_rs_seq(ctx_tgt) &&
+                        n_rollback + (slot.spec_round_kb ? 1 : 0) <= llama_n_rs_seq(ctx_tgt) &&
                         (slot.ctx_dft == nullptr || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                          n_draft <= llama_n_rs_seq(slot.ctx_dft))) {
                     use_ckpt_tgt = false;
@@ -7558,6 +7577,11 @@ private:
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt_pos_max + 1, -1);
+                        if (slot.spec_round_kb &&
+                                llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.id) != ckpt_pos_max) {
+                            GGML_ABORT("failed to remove sequence %d (keep-base rollback refused)\n", slot.id);
+                        }
+                        slot.spec_round_kb = false;
 
                         slot.prompt.tokens.keep_first(ckpt_n_tokens);
                         GGML_ASSERT(smpl_save);

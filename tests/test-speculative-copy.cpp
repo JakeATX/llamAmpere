@@ -305,7 +305,35 @@ static void test_rows_cap(void) {
     assert(std::min(std::min(8, common_speculative_copy_total_cap(12, 8) - 4), 4) == 3);
 }
 
+// keep-base rule (server-context.cpp + llama-memory-recurrent.cpp): a wide round of n = draft + 1 rows keeps groups
+// 0..K-2 and the pre-round plane, so a reject is rolled back in place when <= n_rs - 1 deep, else the whole batch goes
+static void test_keep_base_rule(void) {
+    for (int n_rs = 2; n_rs <= 8; ++n_rs) {
+        const int K = n_rs + 1;
+        for (int block = 1; block <= n_rs; ++block) {
+            for (int tail = 1; tail <= n_rs - 1; ++tail) {
+                const int n_draft = block + tail;
+                if (n_draft <= n_rs || n_draft + 1 > 2 * K) {
+                    continue; // narrow round, or wider than the keep-base window
+                }
+                for (int n_acc = 0; n_acc <= n_draft; ++n_acc) {
+                    const int n_rollback = n_draft - n_acc;
+                    const bool in_place = n_rollback + 1 <= n_rs;
+                    if (n_acc >= block) {
+                        assert(in_place);          // a tail miss never needs the base plane
+                    }
+                    if (!in_place) {
+                        assert(n_acc < block);     // only a block miss does
+                        assert(n_acc + 1 <= n_rs); // and its replay (sampled + accepted) is a narrow batch
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main(void) {
+    test_keep_base_rule();
     test_rows_cap();
     test_find_matches_reference();
     test_gate();
