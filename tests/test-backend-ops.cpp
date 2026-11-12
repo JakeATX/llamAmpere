@@ -21723,7 +21723,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // GGML_TEST_AIV2_PERF=ai5mid: AIT5_U at the 27B dense shapes and multi-user verify widths (GGML_CUDA_AI5_MIDT_SPLIT A/B),
         // 8 and 65 as controls
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "ai5mid") {
-            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 1024, 5120 }, { 5120, 5120 }, { 6144, 5120 }, { 10240, 5120 }, { 5120, 6144 } }) {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 1024, 5120 }, { 5120, 5120 }, { 6144, 5120 }, { 10240, 5120 }, { 12288, 5120 }, { 5120, 6144 } }) {
                 for (int64_t n : { 8, 9, 16, 22, 32, 33, 64, 65 }) {
                     test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, GGML_TYPE_AIT5_U));
                 }
@@ -23386,7 +23386,7 @@ static int run_ai5_midt_check(const char * dir) {
     const char * repeat_env = getenv("GGML_TEST_AIT_REPEAT");
     const int repeats = repeat_env ? std::max(1, std::min(64, atoi(repeat_env))) : 8;
     int fails = 0;
-    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 1024, 5120 }, { 5120, 5120 }, { 6144, 5120 }, { 10240, 5120 }, { 5120, 6144 }, { 640, 2560 }, { 48, 1024 } }) {
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 1024, 5120 }, { 5120, 5120 }, { 6144, 5120 }, { 10240, 5120 }, { 12288, 5120 }, { 5120, 6144 }, { 1024, 4224 }, { 640, 2560 }, { 48, 1024 } }) {
         const int64_t M = mk.first, K = mk.second;
         for (int64_t N : { 1, 8, 9, 15, 16, 17, 22, 32, 33, 47, 64, 65, 128 }) {
             ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };

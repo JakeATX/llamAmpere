@@ -718,7 +718,8 @@ static int ai5_midt_splits(int M, int N, int K, int sms) {
     }
     const int ctas = (M/16 + ai4k::GEMM_SLABS - 1)/ai4k::GEMM_SLABS;
     const int want = v < 0 ? 1 : v > 1 ? v : sms/ctas;
-    // every split keeps at least four 128-column chunks (the cp.async ring holds three)
+    // at most one split per four 128-column chunks; ceil-sized slices can leave a tail split empty (K = 4224, 8 splits):
+    // the kernel then writes a zero plane
     return std::max(1, std::min(want, std::min(8, K/512)));
 }
 
