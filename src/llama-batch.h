@@ -255,6 +255,9 @@ private:
     // batch indices of the output
     std::vector<int32_t> out_ids;
 
+    // the data of the ubatches built by ubatch_add(), reused once no ubatch holds it (see ubatch_add)
+    std::vector<std::shared_ptr<llama_ubatch::data_t>> udata_pool;
+
     uint32_t n_used;
 
     // used[i] indicates if token i has already been used in a previous ubatch
