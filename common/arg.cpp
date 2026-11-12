@@ -5010,7 +5010,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-copy-tail"}, "N",
         string_format("copy mode: append up to N tokens looked up in the context after the model drafter's block, "
-            "verified by exact match; scheduled only while a copy is running (0 = off, max %d, default: %d)",
+            "verified by exact match; scheduled only while a copy is running; capped at n_rs_seq on hybrid models "
+            "(0 = off, max %d, default: %d)",
             (int) common_speculative_copy_params::TAIL_MAX, params.speculative.copy_tail),
         [](common_params & params, int value) {
             if (value < 0 || value > common_speculative_copy_params::TAIL_MAX) {

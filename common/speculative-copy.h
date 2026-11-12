@@ -17,9 +17,15 @@
 //              (narrow = depth 1, wide = depth 2); any miss inside the block leaves wide at once.
 // A match may overlap its own suffix, which makes a periodic repeat continue.
 //
-// Rollback on a recurrent/hybrid target: a draft longer than n_rs_seq is verified under a checkpoint, and a
-// partial accept of it restores and replays. By default copy mode keeps n_rs_seq (no VRAM), so only a wide
-// round that is not fully accepted pays that; --spec-copy-rs sizes the snapshots for block + tail instead.
+//   - credit:  a tail of which less than half was accepted starts a cool-down (no tail for cool, 2x cool, ...
+//              rounds, doubling per poor tail in a row, up to COOL_MAX); a tail accepted for at least half clears it.
+//
+// Rollback on a recurrent/hybrid target (the server side, see server-context.cpp): the recurrent state can be
+// rolled back in place by up to n_rs_seq tokens from the end of the verify batch. The server caps the tail at
+// n_rs_seq, so a miss inside the tail always rolls back in place; only a miss inside the block of a wide round
+// is deeper, and that one restores a checkpoint and replays. The checkpoint is not taken every wide round: one
+// taken at most LLAMA_SPEC_COPY_CKPT_STALE tokens ago is reused, and the replay then re-decodes from it.
+// --spec-copy-rs sizes the snapshots for block + tail instead (more VRAM).
 
 #include "llama.h"
 #include "speculative-adaptive.h"
@@ -32,11 +38,13 @@
 struct common_speculative_copy_params {
     int32_t tail      = 0;  // lookup tokens appended per round (0 = off)
     int32_t long_min  = 8;  // LLAMA_SPEC_COPY_LONG:  match length that needs no agreement
-    int32_t short_min = 4;  // LLAMA_SPEC_COPY_SHORT: shortest match considered at all
+    int32_t short_min = 8;  // LLAMA_SPEC_COPY_SHORT: shortest match considered at all (= long_min: no short rule)
     int32_t agree     = 2;  // LLAMA_SPEC_COPY_AGREE: block tokens that must repeat a short match
     int32_t scan_max  = 0;  // LLAMA_SPEC_COPY_SCAN:  history tokens searched, newest first (0 = all)
+    int32_t cool      = 4;  // LLAMA_SPEC_COPY_COOL:  rounds without a tail after a poor tail (0 = no cool-down)
 
     static constexpr int32_t TAIL_MAX = 16;
+    static constexpr int32_t COOL_MAX = 64;
 
     static int32_t env_int(const char * name, int32_t def, int32_t lo, int32_t hi) {
         const char * s = std::getenv(name);
@@ -50,6 +58,7 @@ struct common_speculative_copy_params {
         p.short_min = env_int("LLAMA_SPEC_COPY_SHORT", p.short_min, 1, p.long_min);
         p.agree     = env_int("LLAMA_SPEC_COPY_AGREE", p.agree,     1, 16);
         p.scan_max  = env_int("LLAMA_SPEC_COPY_SCAN",  p.scan_max,  0, INT32_MAX);
+        p.cool      = env_int("LLAMA_SPEC_COPY_COOL",  p.cool,      0, COOL_MAX);
         return p;
     }
 };
@@ -150,6 +159,13 @@ struct common_speculative_copy_state {
     uint64_t n_gen      = 0; // tail tokens proposed
     uint64_t n_acc      = 0; // tail tokens accepted
     uint64_t n_miss_blk = 0; // wide rounds that missed inside the block
+    uint64_t n_poor     = 0; // tails accepted for less than half (each starts a cool-down)
+    uint64_t n_cooled   = 0; // rounds on a full-accept streak that carried no tail because of a cool-down
+
+    // tail credit: cool-down after a poor tail (cool_base is configuration, it survives reset())
+    int32_t cool_base = 0; // 0 = no cool-down
+    int32_t cool      = 0; // rounds left without a tail
+    int32_t n_fail    = 0; // poor tails in a row
 
     // per request (common_speculative_begin): the statistics line printed at the end of a request covers that request
     void reset() {
@@ -160,10 +176,14 @@ struct common_speculative_copy_state {
         n_gen      = 0;
         n_acc      = 0;
         n_miss_blk = 0;
+        n_poor     = 0;
+        n_cooled   = 0;
+        cool       = 0;
+        n_fail     = 0;
     }
 
     bool wide() const {
-        return ctrl.n_cur >= 2;
+        return ctrl.n_cur >= 2 && cool <= 0;
     }
 
     void on_draft(int32_t block, int32_t tail) {
@@ -172,6 +192,8 @@ struct common_speculative_copy_state {
         if (tail > 0) {
             n_rounds++;
             n_gen += tail;
+        } else if (cool > 0 && ctrl.n_cur >= 2) {
+            n_cooled++;
         }
     }
 
@@ -182,7 +204,19 @@ struct common_speculative_copy_state {
         }
         const int32_t acc_block = std::min(n_accepted, n_block);
         if (n_tail > 0) {
-            n_acc += std::max(0, std::min(n_accepted - n_block, n_tail));
+            const int32_t acc_tail = std::max(0, std::min(n_accepted - n_block, n_tail));
+            n_acc += acc_tail;
+            if (acc_tail * 2 >= n_tail) {
+                n_fail = 0;
+            } else {
+                n_poor++;
+                if (cool_base > 0) {
+                    n_fail = std::min(n_fail + 1, 8);
+                    cool   = std::min(common_speculative_copy_params::COOL_MAX, cool_base << (n_fail - 1));
+                }
+            }
+        } else if (cool > 0) {
+            cool--;
         }
         if (acc_block < n_block) {
             // a miss inside the block ends the full-accept streak at once, with or without a tail this round

@@ -53,6 +53,15 @@ static void test_find_matches_reference(void) {
 
 static void test_gate(void) {
     common_speculative_copy_params cp;
+    // default: no short rule, a tail needs a match of long_min tokens
+    assert(cp.short_min == cp.long_min);
+    {
+        toks s = { 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 99, 12, 13, 14 };
+        assert(common_speculative_copy_propose(cp, s.data(), (int32_t) s.size(), 15, { 16, 17, 18, 19 }, 4).empty());
+        s = { 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 99, 11, 12, 13, 14, 15, 16, 17 }; // 8 with id_last
+        assert((common_speculative_copy_propose(cp, s.data(), (int32_t) s.size(), 18, { 19 }, 2) == toks{ 20, 21 }));
+    }
+    cp.short_min = 4; // the rest exercises the short rule (LLAMA_SPEC_COPY_SHORT=4)
     //            0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
     toks src = { 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 };
 
@@ -152,11 +161,131 @@ static void test_trigger(void) {
     assert(cs.on_accept(5) == 5 && !cs.wide() && cs.n_miss_blk == 1);
 }
 
+// tail credit: a tail accepted for less than half starts a cool-down that doubles per poor tail in a row
+static void test_cooldown(void) {
+    common_speculative_copy_state cs;
+    cs.cool_base = 4;
+    cs.reset();
+    assert(cs.cool_base == 4); // configuration survives the per-request reset
+    for (int i = 0; i < 2; ++i) {
+        cs.on_draft(4, 0);
+        cs.on_accept(4);
+    }
+    assert(cs.wide());
+
+    // half of the tail accepted: good enough, no cool-down
+    cs.on_draft(4, 4);
+    assert(cs.on_accept(6) == 4 && cs.cool == 0 && cs.n_poor == 0);
+    // the whole tail accepted
+    cs.on_draft(4, 4);
+    assert(cs.on_accept(8) == 4 && cs.cool == 0 && cs.wide());
+
+    // one of four: poor, no tail for 4 rounds even though the blocks keep being accepted in full
+    cs.on_draft(4, 4);
+    assert(cs.on_accept(5) == 4 && cs.cool == 4 && cs.n_poor == 1 && !cs.wide());
+    for (int i = 0; i < 4; ++i) {
+        assert(!cs.wide());
+        cs.on_draft(4, 0);
+        cs.on_accept(4);
+    }
+    assert(cs.cool == 0 && cs.wide() && cs.n_cooled == 4);
+
+    // a second poor tail in a row doubles it, a third doubles again
+    cs.on_draft(4, 4);
+    cs.on_accept(4);
+    assert(cs.cool == 8 && cs.n_fail == 2);
+    for (int i = 0; i < 8; ++i) {
+        cs.on_draft(4, 0);
+        cs.on_accept(4);
+    }
+    assert(cs.wide());
+    cs.on_draft(4, 4);
+    cs.on_accept(4);
+    assert(cs.cool == 16);
+    for (int i = 0; i < 16; ++i) {
+        cs.on_draft(4, 0);
+        cs.on_accept(4);
+    }
+    // a good tail clears the count: the next poor one starts at the base again
+    assert(cs.wide());
+    cs.on_draft(4, 4);
+    cs.on_accept(8);
+    assert(cs.n_fail == 0 && cs.cool == 0);
+    if (!cs.wide()) { // regain the streak if the controller dropped
+        for (int i = 0; i < 4 && !cs.wide(); ++i) {
+            cs.on_draft(4, 0);
+            cs.on_accept(4);
+        }
+    }
+    assert(cs.wide());
+    cs.on_draft(4, 4);
+    cs.on_accept(5);
+    assert(cs.cool == 4);
+
+    // the cool-down is capped
+    cs.reset();
+    for (int k = 0; k < 12; ++k) {
+        for (int i = 0; i < 200 && !cs.wide(); ++i) {
+            cs.on_draft(4, 0);
+            cs.on_accept(4);
+        }
+        assert(cs.wide());
+        cs.on_draft(4, 4);
+        cs.on_accept(4);
+        assert(cs.cool <= common_speculative_copy_params::COOL_MAX);
+    }
+    assert(cs.cool == common_speculative_copy_params::COOL_MAX);
+
+    // a block miss on a tail round is a poor tail too, and it also ends the streak
+    cs.reset();
+    for (int i = 0; i < 2; ++i) {
+        cs.on_draft(4, 0);
+        cs.on_accept(4);
+    }
+    cs.on_draft(4, 4);
+    assert(cs.on_accept(2) == 2 && cs.cool == 4 && cs.n_miss_blk == 1 && !cs.wide());
+
+    // cool_base 0 (the state's default): no cool-down at all
+    common_speculative_copy_state c0;
+    c0.reset();
+    for (int i = 0; i < 2; ++i) {
+        c0.on_draft(4, 0);
+        c0.on_accept(4);
+    }
+    c0.on_draft(4, 4);
+    c0.on_accept(4);
+    assert(c0.cool == 0 && c0.n_poor == 1);
+}
+
+// the server's rollback rule (server-context.cpp): with the tail capped at n_rs_seq, a wide round whose block was
+// accepted in full never rejects more than n_rs_seq tokens, so it rolls back in place; only a block miss is deeper
+static void test_rollback_depth(void) {
+    for (int n_rs = 1; n_rs <= 8; ++n_rs) {
+        for (int block = 1; block <= n_rs; ++block) {
+            for (int tail = 1; tail <= n_rs; ++tail) {
+                const int n_draft = block + tail;
+                for (int n_acc = 0; n_acc <= n_draft; ++n_acc) {
+                    const int n_rollback = n_draft - n_acc; // = spec_draft.size() + 1 - accepted.size()
+                    const bool in_place = n_rollback <= n_rs;
+                    if (n_acc >= block) {
+                        assert(in_place);
+                    }
+                    if (!in_place) {
+                        assert(n_acc < block);
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main(void) {
     test_find_matches_reference();
     test_gate();
     test_point_mass_rows();
     test_trigger();
+    test_cooldown();
+    test_rollback_depth();
     printf("test-speculative-copy: all tests OK\n");
     return 0;
 }

@@ -4953,9 +4953,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         result->copy_state.assign(n_seq, common_speculative_copy_state());
         for (auto & cs : result->copy_state) {
             cs.reset();
+            cs.cool_base = result->copy.cool;
         }
-        LOG_INF("%s: copy mode: tail = %d, long = %d, short = %d, agree = %d, n_rs_seq = %u\n", __func__,
-                result->copy.tail, result->copy.long_min, result->copy.short_min, result->copy.agree, params.need_n_rs_seq());
+        LOG_INF("%s: copy mode: tail = %d, long = %d, short = %d, agree = %d, cool = %d, n_rs_seq = %u\n", __func__,
+                result->copy.tail, result->copy.long_min, result->copy.short_min, result->copy.agree, result->copy.cool,
+                params.need_n_rs_seq());
     }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
@@ -5253,7 +5255,10 @@ void common_speculative_draft(common_speculative * spec) {
 
         llama_tokens tail;
         if (cs.wide() && n_block > 0 && impl != nullptr && common_speculative_copy_fuses(impl->type) && dp.prompt != nullptr) {
-            const int32_t room = std::min(spec->copy.tail, dp.n_max_total - n_block);
+            int32_t room = std::min(spec->copy.tail, dp.n_max_total - n_block);
+            if (dp.n_tail_max >= 0) {
+                room = std::min(room, dp.n_tail_max);
+            }
             tail = common_speculative_copy_propose(spec->copy, dp.prompt->data(), (int32_t) dp.prompt->size(),
                     dp.id_last, *dp.result, room);
             common_speculative_copy_append(*dp.result, dp.result_q, tail);
@@ -5394,7 +5399,8 @@ void common_speculative_print_stats(const common_speculative * spec) {
         const auto & cs = spec->copy_state[i];
         if (cs.n_rounds > 0) {
             LOG_INF("statistics copy tail: seq = %zu, #rounds = %" PRIu64 ", #gen tokens = %" PRIu64 ", #acc tokens = %" PRIu64
-                    ", #block miss = %" PRIu64 "\n", i, cs.n_rounds, cs.n_gen, cs.n_acc, cs.n_miss_blk);
+                    ", #block miss = %" PRIu64 ", #poor tails = %" PRIu64 ", #cooled rounds = %" PRIu64 "\n",
+                    i, cs.n_rounds, cs.n_gen, cs.n_acc, cs.n_miss_blk, cs.n_poor, cs.n_cooled);
         }
     }
 

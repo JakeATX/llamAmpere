@@ -100,6 +100,10 @@ struct common_speculative_draft_params {
     // n_max above bounds the model drafter only; this is what still fits the context and the request.
     int32_t n_max_total = -1;
 
+    // copy mode: cap on the lookup tail alone (< 0: none). The server sets it to the recurrent snapshots the
+    // target keeps, so a miss inside the tail can always be rolled back in place.
+    int32_t n_tail_max = -1;
+
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
