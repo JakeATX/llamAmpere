@@ -297,14 +297,34 @@ void llama_lsa_log_epoch_bump() {
     g_lsa_log_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
+// state of the "lsa comp on/OFF" line per sequence (llama_lsa_comp_note)
+static std::mutex g_lsa_comp_mtx;
+static std::map<int32_t, bool> g_lsa_comp_st;
+static uint32_t g_lsa_comp_ep = 0;
+
+// the one-owner guard fired: every sequence that printed "lsa comp on" gets its OFF line (same format), so a restart at
+// position 0 prints "lsa comp on" again. No sequence is on (compensation not in use, or one slot): prints nothing.
+static void lsa_comp_note_all_off(const char * why) {
+    std::lock_guard<std::mutex> lock(g_lsa_comp_mtx);
+    if (g_lsa_log_epoch.load(std::memory_order_relaxed) != g_lsa_comp_ep) {
+        return; // a new context: llama_lsa_comp_note starts again
+    }
+    for (auto & it : g_lsa_comp_st) {
+        if (it.second) {
+            it.second = false;
+            LLAMA_LOG_WARN("llama_lsa_comp_note: lsa comp OFF mode=%d seq=%d: %s; compensation off until this sequence "
+                    "restarts at position 0\n", 2, (int) it.first, why);
+        }
+    }
+}
+
 void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why, bool fresh) {
     if (seq < 0) {
         return; // graph reserve / mixed ubatch
     }
-    static std::mutex mtx;
-    static std::map<int32_t, bool> st;
-    static uint32_t ep = 0;
-    std::lock_guard<std::mutex> lock(mtx);
+    auto & st = g_lsa_comp_st;
+    auto & ep = g_lsa_comp_ep;
+    std::lock_guard<std::mutex> lock(g_lsa_comp_mtx);
     const uint32_t e = g_lsa_log_epoch.load(std::memory_order_relaxed);
     if (e != ep) { // a new context: say it again (the fit dry run drops WARN, see llama_lsa_log_once)
         ep = e;
@@ -900,9 +920,9 @@ bool llama_lsa_idx_trace() {
 // they hold ONE sequence. The owner is the last sequence that started at position 0. A ubatch of another sequence, or
 // one that mixes sequences (LSA skips it, so its rows never reach the caches), makes every cache stale: LSA goes
 // dense and compensation off, with a warning, until a sequence restarts at position 0. One sequence: never fires.
-void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed) {
-    if (seq < 0 && !mixed) {
-        return; // graph reserve
+void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed, bool is_reserve) {
+    if (is_reserve || (seq < 0 && !mixed)) {
+        return; // graph reserve / measure: placeholder sequences, the graph never runs
     }
     static int32_t own = -1; // guarded by lsa_idx().mtx
     auto & s = lsa_idx();
@@ -921,6 +941,7 @@ void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed) {
                 "sequence until one restarts at position 0 (LSA on SJ-KVaRN serves one sequence at a time)\n", __func__,
                 (int) own, mixed ? "mixed, first sequence" : "sequence", (int) seq);
     }
+    lsa_comp_note_all_off("the LSA caches hold another sequence (one-owner guard)");
     own = -1;
 }
 
