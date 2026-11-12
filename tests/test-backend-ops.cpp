@@ -23058,6 +23058,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // GGML_TEST_AIV2_PERF=kern: AIT2/3/4 at the 27B decode widths. FFN gate/up and down, attention qkv / gate, and the
+        // row-stacked sibling shapes (gate+up 34816, qkv+gate 16384) next to their parts, to time one launch against two
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "kern") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 34816, 5120 }, { 10240, 5120 },
+                                                                     { 6144, 5120 }, { 16384, 5120 }, { 5120, 17408 } }) {
+                for (int64_t n : { 1, 4, 5 }) {
+                    for (ggml_type t : { GGML_TYPE_AIT2, GGML_TYPE_AIT3, GGML_TYPE_AIT4 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                }
+            }
+            return test_cases;
+        }
         // GGML_TEST_AIV2_PERF=p2: the 2-bit class only (AIT2P, AIT2, IQ2_XXS, IQ2_XS, AIT2_U, EXL3 2 with glue), decode widths
         // 1 / 4 / 5 / 8 and prompt width 512 (AIT2P table layout: GGML_CUDA_AIT_PLDS)
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "p2") {
