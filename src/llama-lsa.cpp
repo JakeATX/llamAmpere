@@ -297,6 +297,29 @@ void llama_lsa_log_epoch_bump() {
     g_lsa_log_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
+void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why) {
+    static std::mutex mtx;
+    static std::map<int32_t, bool> st;
+    static uint32_t ep = 0;
+    std::lock_guard<std::mutex> lock(mtx);
+    const uint32_t e = g_lsa_log_epoch.load(std::memory_order_relaxed);
+    if (e != ep) { // a new context: say it again (the fit dry run drops WARN, see llama_lsa_log_once)
+        ep = e;
+        st.clear();
+    }
+    auto it = st.find(seq);
+    if (it != st.end() && it->second == on) {
+        return;
+    }
+    st[seq] = on;
+    if (on) {
+        LLAMA_LOG_WARN("%s: lsa comp on mode=%d seq=%d\n", __func__, mode, (int) seq);
+    } else {
+        LLAMA_LOG_WARN("%s: lsa comp OFF mode=%d seq=%d: %s; compensation off until this sequence restarts at "
+                "position 0\n", __func__, mode, (int) seq, why ? why : "?");
+    }
+}
+
 bool llama_lsa_log_once(uint32_t & seen) {
     const uint32_t e = g_lsa_log_epoch.load(std::memory_order_relaxed);
     if (seen == e) {
@@ -630,6 +653,8 @@ struct lsa_idx_store {
     std::mutex                                     mtx;
     std::map<const ggml_tensor *, lsa_idx_entry>   e;
     int64_t                                        ring_hi = 0; // LLAMA_LSA_COMP=2 on SJ-KVaRN: staging ring holds positions [ring_hi - n_ring, ring_hi)
+    int64_t                                        ring_lo = 0; // ... but none below ring_lo: set by a far rewind to a block start, where the
+                                                                // ring rows under the rewind point still hold higher (old) positions
     uint64_t                                       seq     = 0; // invalidate counter (entry touch)
 };
 lsa_idx_store & lsa_idx() {
@@ -1010,7 +1035,8 @@ void llama_lsa_idx_state_write(llama_io_write_i & io, int64_t n_rows) {
             // the ring must still hold the tail block [B*floor((n_rows-1)/B), n_rows); rows past n_rows are rejected
             // draft rows (seq_rm after verify) and count as stale after the restore
             const int64_t B = llama_lsa_cfg().block > 1 ? llama_lsa_cfg().block : 128;
-            const bool tail_in_ring = en.kr && n_rows <= s.ring_hi && ((n_rows - 1)/B)*B >= s.ring_hi - en.kr->ne[1];
+            const bool tail_in_ring = en.kr && n_rows <= s.ring_hi &&
+                    ((n_rows - 1)/B)*B >= std::max<int64_t>(s.ring_hi - en.kr->ne[1], s.ring_lo);
             if (en.km && en.kr && en.built == en.gen && tail_in_ring && (ring_n == 0 || en.kr->ne[1] == ring_n)) {
                 ring_n = en.kr->ne[1];
                 means.push_back({ en.name, en.km, en.vm, en.kr, en.vr });
@@ -1163,6 +1189,8 @@ static void lsa_means_state_read(llama_io_read_i & io, int64_t n_rows) {
             std::lock_guard<std::mutex> lock(s.mtx);
             en->built = en->gen; // the K restore already bumped this layer's generation
             s.ring_hi = n_rows;
+            // the saved ring is only known good from the tail block on (the save rule; ring_lo is not in the state)
+            s.ring_lo = ((n_rows - 1)/B)*B;
             ++n_ok;
         } else {
             for (size_t done = 0; done < nbytes; ) {
@@ -1369,16 +1397,25 @@ void llama_lsa_set_mean_inputs(ggml_tensor * u_blk, ggml_tensor * u_rblk, ggml_t
         const int64_t p1 = *std::max_element(rows.begin(), rows.end()) + 1;
         auto & s = lsa_idx();
         std::lock_guard<std::mutex> lock(s.mtx);
-        if (p0 > 0 && ((p0/B)*B < s.ring_hi - n_ring || p0 > s.ring_hi)) {
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                LLAMA_LOG_WARN("%s: ubatch at position %lld is outside the LSA staging ring [%lld, %lld); compensation "
-                        "off until a sequence restarts at position 0\n", __func__, (long long) p0,
-                        (long long) std::max<int64_t>(s.ring_hi - n_ring, 0), (long long) s.ring_hi);
-            }
+        // a rewind to a block start needs no ring row: the blocks below p0 keep their means (their rows did not
+        // change) and every block from p0 on is gathered from rows decoded from here on. This is the server's
+        // rollback to a context checkpoint (multi-turn prompt reuse), which sits at a batch start.
+        const int64_t lo  = std::max<int64_t>(s.ring_hi - n_ring, s.ring_lo);
+        const bool    far = (p0/B)*B < lo;
+        if (p0 == 0) {
+            s.ring_lo = 0;
+        } else if (far && p0 % B == 0 && p0 <= s.ring_hi) {
+            s.ring_lo = p0; // ring rows for positions below p0 are stale from now on
+        } else if (far || p0 > s.ring_hi) {
+            bool was_on = false;
             for (auto & en : lsa_means()) {
+                was_on = was_on || en.second.built != UINT64_MAX;
                 en.second.built = UINT64_MAX;
+            }
+            if (was_on) { // once per loss, not once per process: a later sequence that loses it says so too
+                LLAMA_LOG_WARN("%s: ubatch at position %lld is outside the LSA staging ring [%lld, %lld) and not at a "
+                        "block start; compensation off until a sequence restarts at position 0\n", __func__, (long long) p0,
+                        (long long) std::max<int64_t>(lo, 0), (long long) s.ring_hi);
             }
         }
         s.ring_hi = p1;

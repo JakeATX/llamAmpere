@@ -351,3 +351,6 @@ std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type bo
 // epoch (a few repeats at most: dry run, main, MTP draft context).
 void llama_lsa_log_epoch_bump();
 bool llama_lsa_log_once(uint32_t & seen);
+// LLAMA_LSA_COMP=2 state line, printed when it changes for a sequence (WARN, so server.log keeps it):
+// "lsa comp on mode=2 seq=N" / "lsa comp OFF mode=2 seq=N: why". A run that must keep compensation greps for these.
+void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why);

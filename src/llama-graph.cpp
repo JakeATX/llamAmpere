@@ -6045,14 +6045,17 @@ bool llm_graph_context::build_attn_lsa_mean_refresh(
     if (!valid && (!sj || fresh)) {
         inp->lsa_mean_commit.emplace_back(kb, epoch);
     }
+    const int32_t seq0 = ubatch.seq_id && ubatch.n_seq_id && ubatch.n_tokens > 0 && ubatch.n_seq_id[0] > 0 ? ubatch.seq_id[0][0] : -1;
     if (sj && !valid && !fresh) {
         static uint32_t warned_ep = 0;
         if (llama_lsa_log_once(warned_ep)) {
             LLAMA_LOG_WARN("%s: LSA block means on SJ-KVaRN are stale (restore or K shift); compensation off until a "
                     "sequence restarts at position 0\n", __func__);
         }
+        llama_lsa_comp_note(false, seq0, 2, "block means are stale (restore without means, K shift, or a rewind past the staging ring)");
         return false;
     }
+    llama_lsa_comp_note(true, seq0, 2, nullptr);
     *kmv = kw;
     *vmv = vw;
     *nbs_out = nbs;
