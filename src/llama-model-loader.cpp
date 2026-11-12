@@ -1676,8 +1676,10 @@ llama_model_loader::llama_model_loader(
         }
         for (const auto & role : roles) { supported = supported && role.second == 3; }
         const size_t available = llama_moe_arena::available_memory();
-        // Owner floor is 7 GiB.
-        const size_t reserve = 7ull << 30;
+        // Owner floor is 7 GiB. RAMSAFE (opt-in): LLAMA_MOE_RAM_HEADROOM=auto scales it with host RAM (one sixth,
+        // 8..16 GiB) and LLAMA_MOE_RAM_HEADROOM_MIB overrides it; with neither set it stays 7 GiB.
+        const bool custom_headroom = llama_moe_arena::ram_headroom_custom();
+        const size_t reserve = llama_moe_arena::ram_headroom();
         // Keep host placement and defaults when pinning is unsafe. The existing mmap
         // loader can supply the unchanged experts as reclaimable, unpinned file pages.
         use_moe_arena = supported && bytes && llama_mmap::SUPPORTED;
@@ -1686,8 +1688,25 @@ llama_model_loader::llama_model_loader(
         if (use_moe_arena && !no_alloc) {
             use_mmap = true; // also permits a late fallback after other startup allocations
         }
-        LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 7 GiB startup headroom\n",
-                __func__, can_pin ? "enabled" : "unpinned mmap fallback", bytes / double(GiB), available / double(GiB));
+        if (!custom_headroom) {
+            LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, 7 GiB startup headroom\n",
+                    __func__, can_pin ? "enabled" : "unpinned mmap fallback", bytes / double(GiB), available / double(GiB));
+        } else {
+            LLAMA_LOG_INFO("%s: expert arena %s: %.2f GiB experts, %.2f GiB available, %.2f GiB RAM headroom (%.2f GiB RAM; LLAMA_MOE_RAM_HEADROOM / LLAMA_MOE_RAM_HEADROOM_MIB)\n",
+                    __func__, can_pin ? "enabled" : "unpinned mmap fallback", bytes / double(GiB), available / double(GiB),
+                    reserve / double(GiB), llama_moe_arena::total_memory() / double(GiB));
+            // RAMSAFE: the in-place locked mappings behind the arena (CUDA MoE cache, at startup and on eviction) keep
+            // the same headroom unless the user set theirs. Set once per process, by the first model loaded with the
+            // arena not switched off; later loads (drafter) keep it. Only on the opt-in path.
+            if (!getenv("GGML_MOE_DEVICE_RAM_FLOOR_MIB")) {
+                const std::string mib = std::to_string(reserve >> 20);
+#ifdef _WIN32
+                _putenv_s("GGML_MOE_DEVICE_RAM_FLOOR_MIB", mib.c_str());
+#else
+                setenv("GGML_MOE_DEVICE_RAM_FLOOR_MIB", mib.c_str(), 0);
+#endif
+            }
+        }
         if (use_moe_arena && llm_kv.arch == LLM_ARCH_QWEN4EXP) {
             llama_moe_arena_apply_flashnext_defaults();
         }
@@ -3054,7 +3073,22 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         }
         largest_layer = std::max(largest_layer, layer_bytes);
     }
-    size_t reserve = 7ull << 30;
+    // RAMSAFE (opt-in): 7 GiB unless LLAMA_MOE_RAM_HEADROOM / LLAMA_MOE_RAM_HEADROOM_MIB is set.
+    const bool custom_headroom = llama_moe_arena::ram_headroom_custom();
+    size_t reserve = llama_moe_arena::ram_headroom();
+    const size_t ram_target = reserve;
+    const char * const func = __func__; // the lambda's own __func__ would read "operator()"
+    const auto warn_ram_target = [&]() {
+        const size_t now = llama_moe_arena::available_memory();
+        if (now >= ram_target) { return; }
+        if (!custom_headroom) {
+            LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", func,
+                    now / double(GiB));
+        } else {
+            LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target %.2f GiB, stop below 5 GiB)\n", func,
+                    now / double(GiB), ram_target / double(GiB));
+        }
+    };
     const char * shared_mtp = getenv("GGML_MOE_CACHE_MTP_SHARED");
     if (shared_mtp && strcmp(shared_mtp, "1") == 0) {
         // fork: Keep one expert layer and the device mapper's 2 GiB margin available after full-arena pinning.
@@ -3200,10 +3234,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
         if (llama_moe_arena::available_memory() < (5ull << 30)) {
             throw std::runtime_error("expert arena pinning left less than 5 GiB MemAvailable");
         }
-        if (llama_moe_arena::available_memory() < (7ull << 30)) {
-            LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
-                    llama_moe_arena::available_memory() / double(GiB));
-        }
+        warn_ram_target();
         arena->report_thp();
         LLAMA_LOG_INFO("%s: %.2f GiB pinned (%s, registration took %.2f s), load+pin %.2f s, gate/up/down grouped by expert, original weight blocks preserved\n",
                 __func__, total / double(GiB), pin_early ? "registered beside the reads" : "registered after the reads", pin_seconds,
@@ -3287,10 +3318,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
     if (llama_moe_arena::available_memory() < (5ull << 30)) {
         throw std::runtime_error("expert arena pinning left less than 5 GiB MemAvailable");
     }
-    if (llama_moe_arena::available_memory() < (7ull << 30)) {
-        LLAMA_LOG_WARN("%s: RAM target missed: %.2f GiB MemAvailable after pinning (target 7 GiB, stop below 5 GiB)\n", __func__,
-                llama_moe_arena::available_memory() / double(GiB));
-    }
+    warn_ram_target();
     arena->report_thp();
     LLAMA_LOG_INFO("%s: %.2f GiB pinned, gate/up/down grouped by expert, original weight blocks preserved\n", __func__, total / double(GiB));
     return arena;

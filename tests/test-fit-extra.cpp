@@ -1141,6 +1141,48 @@ static void test_ram_fit() {
                 !llama_moe_arena::fits_ram_budget(MiB, available, true, false),
                 "unknown or low RAM disables automatic pinned expert storage");
     }
+    // RAMSAFE (opt-in): pinning headroom scales with host RAM, 8..16 GiB; unknown RAM keeps the 7 GiB
+    expect(llama_moe_arena::ram_headroom_for(0) == 7 * GiB && llama_moe_arena::ram_headroom_for(16 * GiB) == 8 * GiB &&
+            llama_moe_arena::ram_headroom_for(48 * GiB) == 8 * GiB && llama_moe_arena::ram_headroom_for(60 * GiB) == 10 * GiB &&
+            llama_moe_arena::ram_headroom_for(96 * GiB) == 16 * GiB && llama_moe_arena::ram_headroom_for(UINT64_MAX) == 16 * GiB,
+            "expert pinning headroom is one sixth of RAM held to 8..16 GiB");
+    expect(llama_moe_arena::available_memory() <= llama_moe_arena::total_memory() ||
+            llama_moe_arena::total_memory() == 0, "available RAM stays within the (cgroup-capped) total");
+    {
+        const char * headroom_names[] = {"LLAMA_MOE_RAM_HEADROOM", "LLAMA_MOE_RAM_HEADROOM_MIB"};
+        std::string saved_headroom[2];
+        bool had_headroom[2];
+        for (size_t i = 0; i < 2; ++i) {
+            const char * value = std::getenv(headroom_names[i]);
+            had_headroom[i] = value != nullptr;
+            if (value) { saved_headroom[i] = value; }
+            set_stage(headroom_names[i], nullptr);
+        }
+        expect(!llama_moe_arena::ram_headroom_custom() && llama_moe_arena::ram_headroom() == 7 * GiB,
+                "with no RAMSAFE setting the pinning headroom stays the fixed 7 GiB");
+        for (const char * value : {"auto", "1"}) {
+            set_stage("LLAMA_MOE_RAM_HEADROOM", value);
+            expect(llama_moe_arena::ram_headroom_custom() &&
+                    llama_moe_arena::ram_headroom() == llama_moe_arena::ram_headroom_for(llama_moe_arena::total_memory()),
+                    "LLAMA_MOE_RAM_HEADROOM=auto|1 scales the headroom with host RAM");
+        }
+        set_stage("LLAMA_MOE_RAM_HEADROOM", "0");
+        expect(!llama_moe_arena::ram_headroom_custom() && llama_moe_arena::ram_headroom() == 7 * GiB,
+                "LLAMA_MOE_RAM_HEADROOM=0 keeps the fixed 7 GiB");
+        set_stage("LLAMA_MOE_RAM_HEADROOM_MIB", "12288");
+        expect(llama_moe_arena::ram_headroom_custom() && llama_moe_arena::ram_headroom() == 12 * GiB,
+                "LLAMA_MOE_RAM_HEADROOM_MIB sets the headroom");
+        set_stage("LLAMA_MOE_RAM_HEADROOM_MIB", "1024");
+        expect(llama_moe_arena::ram_headroom() == 5 * GiB, "LLAMA_MOE_RAM_HEADROOM_MIB keeps the 5 GiB floor");
+        for (const char * value : {"bad", "-1", "12G", "99999999999"}) {
+            set_stage("LLAMA_MOE_RAM_HEADROOM_MIB", value);
+            expect(!llama_moe_arena::ram_headroom_custom() && llama_moe_arena::ram_headroom() == 7 * GiB,
+                    "a malformed LLAMA_MOE_RAM_HEADROOM_MIB keeps the default");
+        }
+        for (size_t i = 0; i < 2; ++i) {
+            set_stage(headroom_names[i], had_headroom[i] ? saved_headroom[i].c_str() : nullptr);
+        }
+    }
     expect(llama_moe_arena::fit_memory_budget(UINT64_MAX) <= UINT64_MAX - 5 * GiB,
             "extreme host RAM cannot overflow the expert budget");
     for (uint64_t available : {uint64_t(0), 4 * GiB, 5 * GiB}) {

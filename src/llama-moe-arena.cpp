@@ -338,10 +338,12 @@ static bool ram_file_value(const std::string & path, uint64_t & out) {
 llama_moe_arena::ram_view llama_moe_arena::read_ram_view(const std::string & meminfo_path,
         const std::string & cgroup_root, const std::string & cgroup_rel) {
     ram_view view;
-    static const char * const mem_keys[] = { "MemAvailable:" };
-    uint64_t kib = 0;
-    if (ram_file_keys(meminfo_path, mem_keys, &kib, 1) != 1 || kib > UINT64_MAX / 1024) { return view; }
-    view.meminfo = kib * 1024;
+    static const char * const mem_keys[] = { "MemAvailable:", "MemTotal:" };
+    uint64_t kib[2] = { UINT64_MAX, UINT64_MAX }; // UINT64_MAX = not found
+    ram_file_keys(meminfo_path, mem_keys, kib, 2);
+    if (kib[0] == UINT64_MAX || kib[0] > UINT64_MAX / 1024) { return view; }
+    view.meminfo = kib[0] * 1024;
+    view.memtotal = kib[1] <= UINT64_MAX / 1024 ? kib[1] * 1024 : 0;
     // Walk from our group up to the root: a parent limit binds its children, and MemAvailable sees none of them.
     std::string rel = cgroup_rel;
     while (!rel.empty() && rel[0] == '/') {
@@ -349,6 +351,7 @@ llama_moe_arena::ram_view llama_moe_arena::read_ram_view(const std::string & mem
         uint64_t limit = UINT64_MAX, high = 0, current = 0;
         ram_file_value(dir + "/memory.max", limit); // "max" or no file leaves UINT64_MAX
         if (ram_file_value(dir + "/memory.high", high) && high < limit) { limit = high; }
+        if (limit < view.limit) { view.limit = limit; } // RAMSAFE: caps total_memory(); does not touch available
         if (limit != UINT64_MAX && ram_file_value(dir + "/memory.current", current)) {
             // The group's file LRU (active + inactive) is page cache the kernel reclaims at the limit, as MemAvailable
             // assumes system-wide. shmem sits on the anon LRU in cgroup v2 and mlocked pages on unevictable, so both
@@ -366,15 +369,16 @@ llama_moe_arena::ram_view llama_moe_arena::read_ram_view(const std::string & mem
         rel = cut == 0 ? "/" : rel.substr(0, cut);
     }
     view.available = std::min(view.meminfo, view.cgroup);
+    view.total = std::min(view.memtotal, view.limit);
     if (view.cgroup >= view.meminfo) { view.group.clear(); }
     return view;
 }
 
-size_t llama_moe_arena::available_memory() {
 #ifdef __linux__
-    // The group path cannot change under us without a restart of the unit: read it once. A path that is gone or not
-    // under /sys/fs/cgroup (no cgroup namespace in a container) has no limit files, which reads as no limit: today's
-    // behavior.
+// The group path cannot change under us without a restart of the unit: read it once. A path that is gone or not
+// under /sys/fs/cgroup (no cgroup namespace in a container) has no limit files, which reads as no limit: today's
+// behavior.
+static const std::string & arena_cgroup_rel() {
     static const std::string rel = [] {
         const char * source = getenv("LLAMA_RAM_AVAIL_SOURCE");
         if (source && strcmp(source, "meminfo") == 0) { return std::string(); }
@@ -392,7 +396,57 @@ size_t llama_moe_arena::available_memory() {
         }
         return std::string(); // cgroup v1 or none: MemAvailable only, as before
     }();
-    const ram_view view = read_ram_view("/proc/meminfo", "/sys/fs/cgroup", rel);
+    return rel;
+}
+#endif
+
+size_t llama_moe_arena::total_memory() {
+#ifdef __linux__
+    const uint64_t total = read_ram_view("/proc/meminfo", "/sys/fs/cgroup", arena_cgroup_rel()).total;
+    return total > SIZE_MAX ? SIZE_MAX : (size_t) total;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX st;
+    st.dwLength = sizeof(st);
+    if (GlobalMemoryStatusEx(&st)) { return (size_t) st.ullTotalPhys; }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+// LLAMA_MOE_RAM_HEADROOM_MIB as bytes (never below the 5 GiB floor); 0 when unset, empty or not a plain MiB count.
+static size_t arena_headroom_mib_override() {
+    constexpr unsigned long long floor_mib = 5120, max_mib = 1ull << 20;
+    const char * v = getenv("LLAMA_MOE_RAM_HEADROOM_MIB");
+    if (!v || !*v) { return 0; }
+    unsigned long long mib = 0;
+    bool ok = true;
+    for (const char * c = v; ok && *c; ++c) {
+        ok = *c >= '0' && *c <= '9' && (mib = mib * 10 + (unsigned long long) (*c - '0')) <= max_mib;
+    }
+    if (ok) { return (size_t) (std::max(mib, floor_mib) << 20); }
+    LLAMA_LOG_WARN("%s: LLAMA_MOE_RAM_HEADROOM_MIB='%s' is not a plain MiB count; using the default\n", __func__, v);
+    return 0;
+}
+
+static bool arena_headroom_auto() {
+    const char * v = getenv("LLAMA_MOE_RAM_HEADROOM");
+    return v && (strcmp(v, "auto") == 0 || strcmp(v, "1") == 0);
+}
+
+bool llama_moe_arena::ram_headroom_custom() {
+    return arena_headroom_mib_override() != 0 || arena_headroom_auto();
+}
+
+size_t llama_moe_arena::ram_headroom() {
+    if (const size_t bytes = arena_headroom_mib_override()) { return bytes; }
+    if (arena_headroom_auto()) { return ram_headroom_for(total_memory()); }
+    return size_t(7ull << 30); // default: the fixed 7 GiB startup headroom
+}
+
+size_t llama_moe_arena::available_memory() {
+#ifdef __linux__
+    const ram_view view = read_ram_view("/proc/meminfo", "/sys/fs/cgroup", arena_cgroup_rel());
     // Say it once, the first time the group limit is the tighter figure: from then on every RAM gate may decide
     // differently from what MemAvailable alone would give.
     static std::atomic<bool> said { false };

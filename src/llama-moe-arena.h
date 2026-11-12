@@ -78,11 +78,31 @@ struct llama_moe_arena {
         uint64_t cgroup    = UINT64_MAX; // tightest group headroom; UINT64_MAX = no limit found
         uint64_t available = 0;          // min of the two
         std::string group;               // the group directory that binds, when one does
+        uint64_t memtotal  = 0;          // MemTotal (0 when not found)
+        uint64_t limit     = UINT64_MAX; // tightest min(memory.max, memory.high) on the path; UINT64_MAX = none
+        uint64_t total     = 0;          // min(memtotal, limit): host RAM this process may use; 0 when unknown
     };
     // Pure reader behind available_memory(): meminfo_path is a /proc/meminfo, cgroup_root a /sys/fs/cgroup and
     // cgroup_rel the "0::" path of /proc/self/cgroup ("" skips the group check). Tests pass fake files.
     static ram_view read_ram_view(const std::string & meminfo_path, const std::string & cgroup_root,
             const std::string & cgroup_rel);
+    // RAMSAFE: host RAM from the same reader, capped by the tightest cgroup v2 limit; 0 when unknown.
+    static size_t total_memory();
+    // RAMSAFE (opt-in): RAM left free when page-locked expert storage is admitted (the arena, and the in-place
+    // locked mappings behind it). One sixth of RAM, held to 8..16 GiB: 64 GB -> about 10.4 GiB, 96 GB and up ->
+    // 16 GiB. The 5 GiB stop is separate and unchanged.
+    static size_t ram_headroom_for(uint64_t total) {
+        constexpr uint64_t GiB = 1ull << 30;
+        if (total == 0) { return size_t(7 * GiB); } // unknown host size: the fixed 7 GiB reserve
+        const uint64_t share = total / 6;
+        return size_t(share < 8 * GiB ? 8 * GiB : share > 16 * GiB ? 16 * GiB : share);
+    }
+    // The startup / pinning RAM headroom. Default OFF: a fixed 7 GiB, as before. LLAMA_MOE_RAM_HEADROOM=auto (or
+    // =1) uses ram_headroom_for(total_memory()). LLAMA_MOE_RAM_HEADROOM_MIB=<MiB> overrides either (plain MiB,
+    // never below the 5 GiB floor; 7168 is the fixed default).
+    static size_t ram_headroom();
+    // True when either variable above changes the headroom from the fixed 7 GiB path.
+    static bool ram_headroom_custom();
     // Automatic expert storage owns half the 80% spare-RAM budget above 5 GiB.
     // Explicit arena settings retain the existing pinning admission checks.
     static size_t fit_memory_budget(uint64_t available) {
