@@ -5811,14 +5811,10 @@ private:
         }();
         int32_t mix_prompt_cap = -1; // prompt tokens this call may still take; -1 = no cap
         const int32_t mix_batch0 = batch.size();
-        if (mix_prompt_ubatches > 0) {
-            int32_t n_writers = 0;
-            for (const auto & s : slots) {
-                n_writers += s.state == SLOT_STATE_GENERATING ? 1 : 0;
-            }
-            if (n_writers > 0) {
-                mix_prompt_cap = mix_prompt_ubatches * n_ubatch;
-            }
+        // only when writer rows are in this batch: a round where the writers sit out (checkpoint-restored prompt,
+        // non-batched GENERATING slots) gives the prompt its full batch, as without the knob
+        if (mix_prompt_ubatches > 0 && !generating.empty() && mix_batch0 > 0) {
+            mix_prompt_cap = mix_prompt_ubatches * n_ubatch;
         }
         auto mix_capped = [&]() {
             return mix_prompt_cap >= 0 && batch.size() - mix_batch0 >= mix_prompt_cap;
@@ -6452,7 +6448,7 @@ private:
                     int32_t ckpt_min_tail = -1;
                     if (do_checkpoint && sj_align && ckpt_in_call_enabled() && n_tokens_prev == 0 && !has_mtmd && !input_tokens.has_mtmd &&
                             alora_scale <= 0.0f && slot.task->decision.order.empty() && n_decision_first < 0 &&
-                            !wait_shared && (!ckpt_needs_dft() || ckpt_mtp_ranges)) {
+                            !wait_shared && (!ckpt_needs_dft() || ckpt_mtp_ranges) && mix_prompt_cap < 0) {
                         std::vector<uint8_t> spec_state;
                         if (ckpt_mtp_ranges || (!common_speculative_get_state(spec.get(), slot.id, spec_state) && spec_state.empty())) {
                             ckpt_min_tail = llama_state_seq_capture_min_tail(ctx_tgt);
@@ -6486,7 +6482,9 @@ private:
                         }
 
                         // writers are waiting: this call's prompt share is used up (LLAMA_SERVER_MIX_PROMPT_UBATCHES)
-                        if (mix_capped()) {
+                        // never for a DECISION prompt (kept in one call), a cold eval-cache builder (keeps the cold
+                        // prefill's batch boundaries) or a shared-wait slot
+                        if (mix_capped() && n_decision_first < 0 && eval_cache_end == 0 && !wait_shared) {
                             SLT_INF(slot, "mix prompt cap: %d prompt tokens this call, %d of %d read, writers waiting\n",
                                     (int) (batch.size() - mix_batch0), (int) slot.prompt.n_tokens(), (int) slot.task->n_tokens());
                             break;
