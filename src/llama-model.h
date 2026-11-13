@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-d1.h"
 
 #include <map>
 #include <atomic>
@@ -995,6 +996,8 @@ struct llama_model {
     // so the layer-major prefill can borrow resident expert VRAM and copy the weights back from the file)
     std::unordered_map<std::string, llama_b1_file_src> b1_src;
     std::vector<int> b1_fds; // dup()ed file descriptors, closed by the destructor
+    // [D1] LLAMA_D1_HEAD: the exact-row sidecar, opened once and shared by every context of this model
+    mutable llama_d1_model_slot d1;
     std::vector<const void *> moe_bank_registered; // expert tensors registered with ggml_moe_bank_register
 
     // for keeping track of associated LoRA adapters

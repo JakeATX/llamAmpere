@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mtp-vocab.h"
 #include "llama-moe-cache.h"
+#include "llama-d1.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -489,6 +490,9 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+
+    // [D1] exact rescore of the coarse head (LLAMA_D1_HEAD); nullptr when off for this context
+    std::unique_ptr<llama_d1_ctx> d1;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

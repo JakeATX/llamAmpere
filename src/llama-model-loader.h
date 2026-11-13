@@ -7,6 +7,7 @@
 #include "llama-hparams.h"
 #include "llama-mmap.h"
 #include "llama-moe-arena.h"
+#include "llama-d1.h"
 
 #include "ggml-cpp.h"
 
@@ -135,6 +136,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::vector<std::string> d1_paths; // [D1] path of files[i] when opened by name (base file and splits)
+    llama_d1_src d1_src;               // [D1] base output.weight fingerprint (LLAMA_D1_HEAD only)
     llama_ftype ftype;
     llama_fver  fver;
 
