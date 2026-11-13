@@ -477,7 +477,7 @@ struct common_params_speculative {
     int32_t n_rs_seq_override = -1;
 
     // copy mode: context-lookup tokens appended after the model drafter's block (0 = off), see speculative-copy.h.
-    // -1 = auto (default): the server resolves it at load to 8 for one slot with an MTP drafter, else 0;
+    // -1 = auto (default): the server resolves it at load to 8 for one slot with the model's MTP head (no -md), else 0;
     // LLAMA_SPEC_COPY=0 turns auto off (the old default). An explicit --spec-copy-tail N always wins.
     // copy_rs = false keeps need_n_rs_seq() as it is (no VRAM; the server caps the tail at n_rs_seq so a tail miss
     // rolls back in place, and only a block miss of a wide round restores a checkpoint); true adds one
