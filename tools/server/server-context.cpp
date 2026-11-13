@@ -24,6 +24,7 @@
 #include "ngram-cache.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-copy.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "../../src/llama-ext.h"
@@ -34,6 +35,7 @@ extern "C" {
 #include "base64.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -119,6 +121,46 @@ static bool server_mtp_gpu_verify_sampled_enabled() {
     return gpu_verify != nullptr && std::strcmp(gpu_verify, "1") == 0;
 }
 
+// copy mode rollback knobs (read once; they only act when --spec-copy-tail > 0)
+//   LLAMA_SPEC_COPY_INPLACE    1 (default): a draft longer than n_rs_seq whose reject is <= n_rs_seq deep is rolled
+//                              back in place; 0: every partial accept of such a draft restores its checkpoint
+//   LLAMA_SPEC_COPY_CKPT_STALE tokens a wide-round checkpoint may lag behind the round that reuses it (default 128;
+//                              0: checkpoint every wide round). A restore from a reused checkpoint re-decodes the gap.
+//   LLAMA_SPEC_COPY_TAIL_CAP   -1 (default): cap the tail at n_rs_seq on a recurrent/hybrid target; 0: no cap;
+//                              N > 0: cap at N
+static bool server_copy_inplace() {
+    static const bool v = common_speculative_copy_params::env_int("LLAMA_SPEC_COPY_INPLACE", 1, 0, 1) != 0;
+    return v;
+}
+
+static int32_t server_copy_ckpt_stale() {
+    static const int32_t v = common_speculative_copy_params::env_int("LLAMA_SPEC_COPY_CKPT_STALE", 128, 0, 1024);
+    return v;
+}
+
+static int32_t server_copy_tail_cap() {
+    static const int32_t v = common_speculative_copy_params::env_int("LLAMA_SPEC_COPY_TAIL_CAP", -1, -1, 64);
+    return v;
+}
+
+//   LLAMA_SPEC_COPY_ROWS       verify rows a copy round may use, block + tail + the sampled token (default 8: the
+//                              dense kernels switch path at 9 rows and a 9-row verify costs ~2x an 8-row one); 0: no cap
+static int32_t server_copy_rows() {
+    static const int32_t v = common_speculative_copy_params::env_int("LLAMA_SPEC_COPY_ROWS", 8, 0, 64);
+    return v;
+}
+
+// with keep-base on, a copy round never passes the widest batch that keeps its pre-round plane, so every wide copy
+// round takes the keep-base branch (no round falls back to a checkpoint)
+static int32_t server_copy_rows_kb() {
+    const int32_t rows = server_copy_rows();
+    const int32_t kb   = (int32_t) llama_n_rs_keep_base();
+    if (kb <= 0) {
+        return rows;
+    }
+    return rows > 0 ? std::min(rows, kb) : kb;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -138,6 +180,8 @@ static common_speculative_output_limits server_output_limits(const common_params
     if (params.speculative.draft.dflash || params.speculative.draft.eagle3) {
         n_max = std::max(n_max, params.speculative.draft.n_max);
     }
+    // copy mode: a wide round verifies the drafter's block plus the lookup tail
+    n_max += common_speculative_copy_tail(&params.speculative);
 
     auto result = common_speculative_get_output_limits(common_context_n_batch(params), params.n_parallel, n_max);
 
@@ -754,7 +798,14 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+    // copy mode: where spec_ckpt.data_tgt was taken. spec_ckpt's own position fields follow the current round
+    // (update_pos), the target state may be older: a wide round reuses a recent checkpoint instead of saving a
+    // new one, and a restore from it replays the committed tokens in between (spec_replay_prefix).
+    int64_t   spec_ckpt_tgt_n_tokens = -1; // -1 = no valid target checkpoint
+    llama_pos spec_ckpt_tgt_pos_max  = -1;
+    llama_tokens spec_replay_prefix;       // committed tokens to re-decode ahead of the replayed draft (no output)
     bool spec_is_replay = false;
+    bool spec_round_kb  = false; // copy mode: this wide round keeps its pre-round state plane on the card (no checkpoint)
     common_sampler_ptr spec_smpl_after_verify;
     llama_token spec_replay_token = LLAMA_TOKEN_NULL;
     size_t spec_verify_width = 0;
@@ -1004,6 +1055,15 @@ struct server_slot {
     // above, they land in the next bucketed round's "other". Counted here so that cost stays visible.
     uint64_t              spec_restore_rounds   = 0;
     uint64_t              spec_restore_us       = 0;   // state load + seq_rm + sampler copy only
+    // checkpoint path split (copy mode rollback): saves made / reused before verify, wide drafts rolled back in
+    // place, committed tokens re-decoded after a restore from a reused checkpoint
+    uint64_t              spec_save_rounds      = 0;
+    uint64_t              spec_save_us          = 0;
+    uint64_t              spec_save_reused      = 0;
+    uint64_t              spec_inplace_rounds   = 0;
+    uint64_t              spec_wide_rounds      = 0; // rounds whose draft is longer than n_rs_seq (hybrid target)
+    uint64_t              spec_kb_rounds        = 0; // of those, rounds that kept the pre-round plane (no checkpoint)
+    uint64_t              spec_replay_prefix_n  = 0;
 
     std::vector<double> verify_budget_accept;
     spec_adapt_ctrl       spec_adapt; // BL6a controller (inactive unless LLAMA_SPEC_ADAPT_COST=1)
@@ -1022,6 +1082,9 @@ struct server_slot {
         spec_smpl_after_verify.reset();
         spec_replay_token = LLAMA_TOKEN_NULL;
         spec_verify_width = 0;
+        spec_ckpt_tgt_n_tokens = -1;
+        spec_ckpt_tgt_pos_max  = -1;
+        spec_replay_prefix.clear();
 
         last_nl_pos    = 0;
         generated      = {};
@@ -1062,6 +1125,13 @@ struct server_slot {
         spec_sample_end_us = 0;
         spec_restore_rounds = 0;
         spec_restore_us = 0;
+        spec_save_rounds = 0;
+        spec_save_us = 0;
+        spec_save_reused = 0;
+        spec_inplace_rounds = 0;
+        spec_wide_rounds = 0;
+        spec_kb_rounds = 0;
+        spec_replay_prefix_n = 0;
         spec_adapt = {};
         verify_budget_accept.clear();
 
@@ -1250,6 +1320,15 @@ struct server_slot {
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
             GGML_ASSERT(spec_i_batch.empty());
+
+            // copy mode: a restore from a reused (older) checkpoint first re-decodes the committed tokens between
+            // the checkpoint and this round, in the same pass as the replayed draft and without output rows
+            for (auto token : spec_replay_prefix) {
+                add_ok &= batch.add(this->id, token, prompt.tokens.pos_next(), false, false);
+                prompt.tokens.push_back(token);
+            }
+            spec_replay_prefix_n += spec_replay_prefix.size();
+            spec_replay_prefix.clear();
 
             spec_i_batch.push_back(batch.size());
             for (size_t i = 0; i < spec_draft.size(); i++) {
@@ -1488,6 +1567,19 @@ struct server_slot {
                 SLT_INF(*this,
                         " checkpoint restores = %" PRIu64 " rounds (%.2f ms/restore state load; their verify + replay decode is folded into the next round's other)\n",
                         spec_restore_rounds, (double) spec_restore_us / 1000.0 / (double) spec_restore_rounds);
+            }
+            if (spec_save_rounds + spec_save_reused + spec_inplace_rounds > 0) {
+                SLT_INF(*this,
+                        " checkpoint saves = %" PRIu64 " (%.2f ms/save), reused = %" PRIu64 ", wide in-place rollbacks = %" PRIu64
+                        ", replayed committed tokens = %" PRIu64 "\n",
+                        spec_save_rounds, spec_save_rounds > 0 ? (double) spec_save_us / 1000.0 / (double) spec_save_rounds : 0.0,
+                        spec_save_reused, spec_inplace_rounds, spec_replay_prefix_n);
+            }
+            if (spec_wide_rounds > 0) {
+                // the fused GDN snapshot write needs min(n, K) rows; a keep-base round writes K - 1 (by the code, not a runtime probe)
+                SLT_INF(*this, " keep-base rounds = %lu / wide rounds = %lu, keep-base memory = %s, fused snapshot write = %s\n",
+                        spec_kb_rounds, spec_wide_rounds, llama_n_rs_keep_base() > 0 ? "on" : "off",
+                        spec_kb_rounds > 0 ? "no (keep-base rounds)" : "yes");
             }
             if (spec_adapt.active()) {
                 SLT_INF(*this, " adaptive depth (BL6a) = %s\n", spec_adapt.summary().c_str());
@@ -2166,6 +2258,36 @@ private:
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
+        // copy mode default: auto (-1) is on (tail 8) only in the measured shape, one slot with the model's own MTP
+        // head (no -md drafter file); LLAMA_SPEC_COPY=0 (or off/false/no) restores the old default (off).
+        // An explicit --spec-copy-tail N is kept as given.
+        if (params.speculative.copy_tail < 0) {
+            const auto & types = params.speculative.types;
+            const bool mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
+                             std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
+            const char * ks  = std::getenv("LLAMA_SPEC_COPY");
+            std::string kv = ks ? ks : "";
+            std::transform(kv.begin(), kv.end(), kv.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+            const bool kill = kv == "0" || kv == "off" || kv == "false" || kv == "no";
+            const bool ext  = params.speculative.has_dft();
+            params.speculative.copy_tail = (!kill && mtp && !ext && params.n_parallel == 1) ? 8 : 0;
+            SRV_INF("copy mode: %s (auto%s)\n", params.speculative.copy_tail > 0 ? "on, tail = 8" : "off",
+                    kill ? ", LLAMA_SPEC_COPY=0" : !mtp ? ", no MTP drafter" : ext ? ", drafter file" :
+                    params.n_parallel != 1 ? ", n_parallel > 1" : "");
+        } else {
+            SRV_INF("copy mode: %s (--spec-copy-tail %d)\n", params.speculative.copy_tail > 0 ? "on" : "off",
+                    params.speculative.copy_tail);
+        }
+
+#if !defined(_WIN32)
+        // copy mode: a wide verify batch keeps its pre-round recurrent plane, so a block miss needs no checkpoint
+        // (LLAMA_RS_KEEP_BASE=0 in the environment keeps the per-round checkpoint)
+        // Set only when every wide round of this server can take the keep-base branch (one slot, in-place rollback
+        // on): the memory must not keep a base plane while the server also saves checkpoints.
+        if (params.speculative.copy_tail > 0 && server_copy_inplace() && params.n_parallel == 1) {
+            setenv("LLAMA_RS_KEEP_BASE", "1", 0);
+        }
+#endif
         const bool is_resume = sleeping;
         if (!is_resume) {
             params_load = params;
@@ -5556,6 +5678,7 @@ private:
 
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                slot.spec_ckpt_tgt_n_tokens = -1; // positions moved: a reused speculative checkpoint is void
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -5731,6 +5854,22 @@ private:
                         if (draft_budget[slot.id] >= 0) {
                             common_speculative_get_draft_params(spec.get(), slot.id).n_min =
                                 std::min(params_base.speculative.draft.n_min, n_draft_req);
+                        } else {
+                            // copy mode: the lookup tail may use what the context and the request still allow;
+                            // no tail under a shared verify budget (the rows are already rationed)
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_max_total =
+                                params_base.speculative.copy_tail > 0
+                                    ? common_speculative_copy_total_cap(n_draft_max, server_copy_rows_kb())
+                                    : n_draft_max;
+                            // a tail no longer than the recurrent snapshots: a miss inside it rolls back in place
+                            int32_t tail_cap = server_copy_tail_cap();
+                            if (tail_cap < 0) {
+                                tail_cap = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && server_copy_inplace()
+                                    ? (int32_t) llama_n_rs_seq(ctx_tgt) : -1;
+                            } else if (tail_cap == 0) {
+                                tail_cap = -1;
+                            }
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_tail_max = tail_cap;
                         }
 
                         drafting.push_back(&slot);
@@ -5782,13 +5921,46 @@ private:
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
-                if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
+                // copy mode: a recent checkpoint of this request is reused instead of saving one every wide round.
+                // It is only needed when the reject is deeper than the snapshots (a miss inside the block), and the
+                // restore then re-decodes the committed tokens since the checkpoint. Text-only sequences, no KV
+                // sealing (SJ-KVaRN rows cannot be re-decoded in place), single-context drafters.
+                const int64_t ckpt_lag = slot.spec_ckpt_tgt_n_tokens >= 0 ? ckpt.n_tokens - slot.spec_ckpt_tgt_n_tokens : -1;
+                const bool reuse_ckpt_tgt = use_ckpt_tgt &&
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                    params_base.speculative.copy_tail > 0 && server_copy_inplace() && server_copy_ckpt_stale() > 0 &&
+                    !ckpt.data_tgt.empty() && ckpt_lag >= 0 && ckpt_lag <= server_copy_ckpt_stale() &&
+                    ctx_dft == nullptr && !slot.prompt.tokens.has_mtmd &&
+                    params_base.sj_kvarn_bits_k == 0 && !params_base.speculative.draft.sj_kvarn;
+
+                // copy mode: the memory keeps the pre-round plane of this verify batch (one slot, draft + sampled token
+                // in one ubatch), so a reject deeper than the tail rolls the whole batch back in place and replays
+                const bool keep_base = use_ckpt_tgt && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                    params_base.speculative.copy_tail > 0 && server_copy_inplace() &&
+                    slot.spec_replay_prefix.empty() &&
+                    draft.size() + 1 <= llama_n_rs_keep_base();
+                // A draft context (MTP) keeps its own handling: its checkpoint below when it needs one, load_dft on
+                // the restore path, and the seq_rm above at the next round.
+                slot.spec_round_kb = keep_base;
+                if (use_ckpt_tgt && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                    slot.spec_wide_rounds += 1;
+                    slot.spec_kb_rounds   += keep_base ? 1 : 0;
+                }
+
+                if (keep_base) {
+                    ckpt.clear_tgt();
+                    slot.spec_ckpt_tgt_n_tokens = -1;
+                } else if (reuse_ckpt_tgt) {
+                    slot.spec_save_reused += 1;
+                } else if (use_ckpt_tgt) {
+                    const int64_t t_save0 = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    slot.spec_ckpt_tgt_n_tokens = ckpt.n_tokens;
+                    slot.spec_ckpt_tgt_pos_max  = ckpt.pos_max;
 
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+                    slot.spec_save_rounds += 1;
+                    slot.spec_save_us     += (uint64_t) (ggml_time_us() - t_save0);
 
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
@@ -7414,9 +7586,21 @@ private:
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
-                const bool use_ckpt_tgt =
+                bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+
+                // copy mode: the snapshots cover the last n_rs_seq + 1 tokens of the verify batch whatever its
+                // width, so a reject of up to n_rs_seq tokens is rolled back in place like a narrow draft. Not on a
+                // replay pass (nothing is rejected there) and not when the draft context would need its checkpoint.
+                if (n_rollback > 0 && use_ckpt_tgt && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                        params_base.speculative.copy_tail > 0 && server_copy_inplace() && !slot.spec_is_replay &&
+                        n_rollback + (slot.spec_round_kb ? 1 : 0) <= llama_n_rs_seq(ctx_tgt) &&
+                        (slot.ctx_dft == nullptr || ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                         n_draft <= llama_n_rs_seq(slot.ctx_dft))) {
+                    use_ckpt_tgt = false;
+                    slot.spec_inplace_rounds += 1;
+                }
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -7452,9 +7636,28 @@ private:
 
                         common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        // the target state may come from an earlier wide round (copy mode): go back to where it was
+                        // taken and queue the committed tokens in between for the replay pass
+                        int64_t   ckpt_n_tokens = ckpt.n_tokens;
+                        llama_pos ckpt_pos_max  = ckpt.pos_max;
+                        GGML_ASSERT(slot.spec_replay_prefix.empty());
+                        if (slot.spec_ckpt_tgt_n_tokens >= 0 && slot.spec_ckpt_tgt_n_tokens < ckpt.n_tokens) {
+                            GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                            const auto & toks = slot.prompt.tokens.get_tokens();
+                            GGML_ASSERT((int64_t) toks.size() >= ckpt.n_tokens);
+                            slot.spec_replay_prefix.assign(toks.begin() + slot.spec_ckpt_tgt_n_tokens, toks.begin() + ckpt.n_tokens);
+                            ckpt_n_tokens = slot.spec_ckpt_tgt_n_tokens;
+                            ckpt_pos_max  = slot.spec_ckpt_tgt_pos_max;
+                        }
 
-                        slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        slot.mem.seq_rm(slot.id, ckpt_pos_max + 1, -1);
+                        if (slot.spec_round_kb &&
+                                llama_memory_seq_pos_max(llama_get_memory(slot.ctx_tgt), slot.id) != ckpt_pos_max) {
+                            GGML_ABORT("failed to remove sequence %d (keep-base rollback refused)\n", slot.id);
+                        }
+                        slot.spec_round_kb = false;
+
+                        slot.prompt.tokens.keep_first(ckpt_n_tokens);
                         GGML_ASSERT(smpl_save);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 

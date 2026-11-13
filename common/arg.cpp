@@ -3,6 +3,7 @@
 #include "build-info.h"
 #include "chat.h"
 #include "common.h"
+#include "speculative-copy.h"
 #include "download.h"
 #include "http.h"
 #include "json-schema-to-grammar.h"
@@ -5005,6 +5006,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.synth_rates = std::move(rates);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
+
+    add_opt(common_arg(
+        {"--spec-copy-tail"}, "N",
+        string_format("copy mode: append up to N tokens looked up in the context after the model drafter's block, "
+            "verified by exact match; scheduled only while a copy is running; capped at n_rs_seq on hybrid models "
+            "(0 = off, max %d, default: auto = 8 with one slot and the model's MTP head, no -md, else 0; LLAMA_SPEC_COPY=0 turns auto off)",
+            (int) common_speculative_copy_params::TAIL_MAX),
+        [](common_params & params, int value) {
+            if (value < 0 || value > common_speculative_copy_params::TAIL_MAX) {
+                throw std::invalid_argument(string_format("error: --spec-copy-tail must be in [0, %d]",
+                    (int) common_speculative_copy_params::TAIL_MAX));
+            }
+            params.speculative.copy_tail = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_COPY_TAIL"));
+
+    add_opt(common_arg(
+        {"--spec-copy-rs"},
+        "copy mode: keep one recurrent-state snapshot per tail token, so a wide round rolls back in place "
+        "instead of restoring a checkpoint (more VRAM on hybrid models; default: off)",
+        [](common_params & params) {
+            params.speculative.copy_rs = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_COPY_RS"));
 
     add_opt(common_arg(
         {"--spec-draft-n-min-adaptive"}, "N",
