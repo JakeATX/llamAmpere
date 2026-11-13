@@ -100,6 +100,28 @@ static int exercise(const std::string & dir, const std::string & mode) {
         assert(llama_lsa_check_cache(4, 4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
         return 0;
     }
+    if (mode == "lead" || mode == "lead_off") {
+        // LLAMA_LSA_J3_LEAD: look-ahead and first = RESIDENT_FIRST; with it J3 runs per stream and on 4/4 strips.
+        // Without RESIDENT_FIRST the knob is dropped and J3 + multi (and J3 on 4/4) stay refused.
+        setenv("LLAMA_LSA_RESIDENT", "50", 1);
+        setenv("LLAMA_LSA_J3", "1", 1);
+        setenv("LLAMA_LSA_J3_LEAD", "1", 1);
+        if (mode == "lead") {
+            setenv("LLAMA_LSA_RESIDENT_FIRST", "6", 1);
+        }
+        const auto & c = llama_lsa_cfg();
+        assert(c.j3 && c.multi);
+        if (mode == "lead") {
+            assert(c.j3_lead && c.j3_first == 6 && c.j3_ahead == 6);
+            assert(llama_lsa_describe().find(" j3_first=6 j3_lead=1 j3_ahead=6") != std::string::npos);
+            assert(llama_lsa_check_cache(4, 4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
+        } else {
+            assert(!c.j3_lead && c.j3_first == 3 && c.j3_ahead == 3);
+            assert(llama_lsa_describe().find("j3_lead") == std::string::npos);
+            assert(!llama_lsa_check_cache(4, 4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
+        }
+        return 0;
+    }
 
     auto * ctx = ggml_init({ ggml_tensor_overhead(), nullptr, true });
     assert(ctx);
@@ -188,7 +210,7 @@ int main(int argc, char ** argv) {
     char dir[] = "/tmp/test-lsa-multi-XXXXXX";
     assert(mkdtemp(dir));
     make_map(std::string(dir) + "/a.gguf");
-    for (const char * mode : { "multi", "off", "refuse", "accept" }) {
+    for (const char * mode : { "multi", "off", "refuse", "accept", "lead", "lead_off" }) {
         const pid_t pid = fork();
         assert(pid >= 0);
         if (pid == 0) { execl(argv[0], argv[0], dir, mode, (char *) nullptr); _exit(127); }
@@ -201,6 +223,6 @@ int main(int argc, char ** argv) {
     }
     assert(remove((std::string(dir) + "/a.gguf").c_str()) == 0);
     assert(rmdir(dir) == 0);
-    puts("LSA multi: per-stream index caches, commit, invalidate, owner guard, state suffix, forget, off path, refusals PASS");
+    puts("LSA multi: per-stream index caches, commit, invalidate, owner guard, state suffix, forget, off path, refusals, J3 lead PASS");
     return 0;
 }

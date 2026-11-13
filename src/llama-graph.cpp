@@ -966,6 +966,20 @@ static llama_ubatch lsa_sub_ubatch(const llama_ubatch & ub, int64_t s, int64_t n
     return r;
 }
 
+// LLAMA_LSA_MULTI=1: stream s's [n_kv_s, T/ns] slice of the KQ mask of inp_all, made once per graph (every layer)
+static ggml_tensor * lsa_stream_mask(ggml_context * ctx0, const llm_graph_input_attn_kv * inp_all, llm_graph_input_attn_kv * x,
+        int64_t s, int64_t ns) {
+    ggml_tensor * m_all = inp_all->self_attn_mask.raw;
+    GGML_ASSERT(m_all && m_all->type != GGML_TYPE_I32 && m_all->ne[3] == ns);
+    GGML_ASSERT(x->lsa_n_kv_s > 0 && x->lsa_n_kv_s % 64 == 0 && x->lsa_n_kv_s <= m_all->ne[0]);
+    if (x->lsa_sub_mask == nullptr || x->lsa_sub_mask_src != m_all) {
+        x->lsa_sub_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, m_all, x->lsa_n_kv_s, m_all->ne[1], 1, 1,
+                m_all->nb[1], m_all->nb[2], m_all->nb[3], s*m_all->nb[3]));
+        x->lsa_sub_mask_src = m_all;
+    }
+    return x->lsa_sub_mask;
+}
+
 void llm_graph_input_attn_kv::set_input_lsa(const llama_kv_cache_context * kv, const llama_ubatch * ubatch) {
     if (!lsa_streams.empty()) {
         // LLAMA_LSA_MULTI=1: every stream's input set from its own rows, its caches current
@@ -6481,7 +6495,7 @@ ggml_tensor * llm_graph_context::build_attn_lsa_j3_units(
                 int   pct) const {
     const auto & cfg = llama_lsa_cfg();
     const auto * mctx_cur = inp->mctx;
-    ggml_tensor * kq_mask = inp->lsa_kq_mask ? inp->lsa_kq_mask : inp->self_attn_mask.raw;
+    ggml_tensor * kq_mask = inp->lsa_kq_mask ? inp->lsa_kq_mask : inp->lsa_sub_mask ? inp->lsa_sub_mask : inp->self_attn_mask.raw;
     const int64_t T = sq->ne[2];
     if (!kq_mask || (kq_mask->type != GGML_TYPE_F16 && kq_mask->type != GGML_TYPE_F32) || kq_mask->ne[1] != T ||
             kq_mask->ne[2] != 1 || kq_mask->ne[3] != 1 || T > cfg.max_rows) {
@@ -6602,13 +6616,37 @@ void llm_graph_context::build_attn_lsa_j3(
                 int   il,
                 int   pct,
                 int   flags,
-                int   src) const {
+                int   src,
+        llm_graph_input_attn_kv * shadow,
+            int64_t   s) const {
     const auto & cfg = llama_lsa_cfg();
-    if (!cfg.j3 || cfg.mode == llama_lsa_config::OFF || !inp || !inp->self_sj_kvarn_desc || !inp->lsa_cell_pos ||
-            !inp->lsa_q_pos || !inp->lsa_q_cell || !lsa_ubatch().pos) {
+    if (!shadow && inp && !inp->lsa_streams.empty()) {
+        // LLAMA_LSA_J3_LEAD under LLAMA_LSA_MULTI: one pass per stream (its rows of sq, mask slice, descriptor row,
+        // LSA caches and scratch src + 2*stream), exactly the one-stream pass of that stream
+        const int64_t ns = (int64_t) inp->lsa_streams.size();
+        if (!cfg.j3_lead || (sq && sq->ne[2] % ns != 0)) {
+            return;
+        }
+        for (int64_t u = 0; u < ns; ++u) {
+            llm_graph_input_attn_kv * x = inp->lsa_streams[u].get();
+            lsa_stream_mask(ctx0, inp, x, u, ns);
+            const llama_lsa_stream_scope scope(x->lsa_stream);
+            lsa_ub = &x->lsa_sub_ub;
+            const int64_t Ts = sq ? sq->ne[2]/ns : 0;
+            ggml_tensor * sq_u = sq ? ggml_view_3d(ctx0, sq, sq->ne[0], sq->ne[1], Ts, sq->nb[1], sq->nb[2], u*Ts*sq->nb[2]) : nullptr;
+            build_attn_lsa_j3(inp, sq_u, il, pct, flags, src + 2*(int) (u % (GGML_LSA_PREFETCH_SOURCES/2)), x, u);
+        }
+        lsa_ub = nullptr;
         return;
     }
-    const auto * mctx_cur = inp->mctx;
+    llm_graph_input_attn_kv * x = shadow ? shadow : inp;
+    if (!cfg.j3 || cfg.mode == llama_lsa_config::OFF || !inp || !inp->self_sj_kvarn_desc || !x->lsa_cell_pos ||
+            !x->lsa_q_pos || !x->lsa_q_cell || !lsa_ubatch().pos) {
+        return;
+    }
+    // ns == 1 under LLAMA_LSA_MULTI=1: the one input set addresses its sequence's caches (no-op otherwise)
+    const llama_lsa_stream_scope scope(shadow ? llama_lsa_stream() : inp->lsa_stream);
+    const auto * mctx_cur = x->mctx;
     ggml_tensor * body = mctx_cur->get_sj_kvarn_body(il);
     uint32_t bits_k = 0, bits_v = 0;
     const int tier = mctx_cur->get_sj_kvarn_layer_tier(il, bits_k, bits_v);
@@ -6616,7 +6654,11 @@ void llm_graph_context::build_attn_lsa_j3(
     if (!body || !desc) {
         return;
     }
-    ggml_tensor * units = sq && pct > 0 ? build_attn_lsa_j3_units(inp, sq, il, pct) : nullptr;
+    if (shadow) {
+        GGML_ASSERT(desc->ne[1] > s);
+        desc = ggml_view_1d(ctx0, desc, desc->ne[0], s*desc->nb[1]); // the stream's descriptor row
+    }
+    ggml_tensor * units = sq && pct > 0 ? build_attn_lsa_j3_units(x, sq, il, pct) : nullptr;
     flags &= GGML_LSA_PREFETCH_PREV | GGML_LSA_PREFETCH_PROTECT_PREV;
     if (units) {
         flags |= GGML_LSA_PREFETCH_UNITS;
@@ -7578,15 +7620,7 @@ ggml_tensor * llm_graph_context::build_attn(
             v = ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], v_all->ne[2], 1, v_all->nb[1], v_all->nb[2], v_all->nb[3],
                     lsa_u*v_all->nb[3]);
             // the stream's [n_kv_s, T/ns] slice of the KQ mask, once per graph (shared by every layer)
-            ggml_tensor * m_all = inp_all->self_attn_mask.raw;
-            GGML_ASSERT(m_all && m_all->type != GGML_TYPE_I32 && m_all->ne[3] == lsa_n_units);
-            GGML_ASSERT(inp->lsa_n_kv_s > 0 && inp->lsa_n_kv_s % 64 == 0 && inp->lsa_n_kv_s <= m_all->ne[0]);
-            if (inp->lsa_sub_mask == nullptr || inp->lsa_sub_mask_src != m_all) {
-                inp->lsa_sub_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, m_all, inp->lsa_n_kv_s, m_all->ne[1], 1, 1,
-                        m_all->nb[1], m_all->nb[2], m_all->nb[3], lsa_u*m_all->nb[3]));
-                inp->lsa_sub_mask_src = m_all;
-            }
-            lsa_mask_u = inp->lsa_sub_mask;
+            lsa_mask_u = lsa_stream_mask(ctx0, inp_all, inp, lsa_u, lsa_n_units);
             // the stream's descriptor row; the single-stream FA node reads its attended length from the mask width
             sj_kvarn_pending = sj_pending_all;
             if (sj_kvarn_pending.body) {

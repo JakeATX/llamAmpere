@@ -1789,7 +1789,9 @@ struct llm_graph_context {
                     int   il,
                     int   pct,
                     int   flags,
-                    int   src) const;
+                    int   src,
+            llm_graph_input_attn_kv * shadow = nullptr, // LLAMA_LSA_J3_LEAD + LLAMA_LSA_MULTI: stream s input set of inp
+                int64_t   s = 0) const;
     // the [n_kv/F, T] 0/1 unit prediction of layer il's record pick from sq (nullptr: layer il would not pick)
     ggml_tensor * build_attn_lsa_j3_units(
             llm_graph_input_attn_kv * inp,

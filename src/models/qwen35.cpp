@@ -229,7 +229,10 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     // (look-ahead, with the target's previous-step pick) on the side stream; mapped layers before j3_first keep the
     // whole body on the card. Decode-sized single-sequence ubatches with the record pick the stale query predicts.
     std::vector<int> j3_mapped;
-    if (lsa.j3 && lsa.mode != llama_lsa_config::OFF && n_tokens <= 8 && ubatch.n_seqs_unq == 1) {
+    // LLAMA_LSA_J3_LEAD: also several streams under LLAMA_LSA_MULTI (at most 8 rows each), built per stream
+    const bool j3_rows = ubatch.n_seqs_unq == 1 ? n_tokens <= 8 : lsa.j3_lead && lsa.multi &&
+            n_tokens % ubatch.n_seqs_unq == 0 && n_tokens/ubatch.n_seqs_unq <= 8;
+    if (lsa.j3 && lsa.mode != llama_lsa_config::OFF && j3_rows) {
         const bool j3_cfg = lsa.mode == llama_lsa_config::KEY && lsa.idx_cache && !lsa.per_head &&
                 lsa.block == 128 && (lsa.refine == 128 || lsa.refine == 16) && lsa.fused_sel && !lsa.unit_op && !lsa.rec_blk &&
                 !lsa.block_sum && !lsa.fast && lsa.topp <= 0.0 && lsa.pick_every == 1 && !lsa.pick_check &&
@@ -286,15 +289,16 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
             if (it != j3_mapped.end()) {
                 const int i = (int) (it - j3_mapped.begin()), first = lsa.j3_first, n_map = (int) j3_mapped.size();
                 const int protect = lsa.j3_prev ? GGML_LSA_PREFETCH_PROTECT_PREV : 0;
+                const int ahead = lsa.j3_lead ? lsa.j3_ahead : 3; // LLAMA_LSA_J3_LEAD: RESIDENT_FIRST layers ahead
                 // nearest target first: the side stream runs the passes in issue order
-                if (i + 1 < n_map && i + 1 >= first) {
+                if (ahead > 1 && i + 1 < n_map && i + 1 >= first) {
                     const int t = j3_mapped[i + 1];
-                    const bool prev_here = lsa.j3_prev && i + 1 < 3; // no ahead-3 source for this target
+                    const bool prev_here = lsa.j3_prev && i + 1 < ahead; // no look-ahead source for this target
                     build_attn_lsa_j3(j3_inp, lsa.j3_a1 > 0 ? stale_query(inpL, t) : nullptr, t, lsa.j3_a1,
                             protect | (prev_here ? GGML_LSA_PREFETCH_PREV : 0), 1);
                 }
-                if (i + 3 < n_map && i + 3 >= first) {
-                    const int t = j3_mapped[i + 3];
+                if (i + ahead < n_map && i + ahead >= first) {
+                    const int t = j3_mapped[i + ahead];
                     build_attn_lsa_j3(j3_inp, lsa.j3_a3 > 0 ? stale_query(inpL, t) : nullptr, t, lsa.j3_a3,
                             protect | (lsa.j3_prev ? GGML_LSA_PREFETCH_PREV : 0), 0);
                 }

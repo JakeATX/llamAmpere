@@ -116,6 +116,7 @@ const llama_lsa_config & llama_lsa_cfg() {
         c.j3_a1     = (int) lsa_env_i64("LLAMA_LSA_J3_A1",    150);
         c.j3_prev   = lsa_env_i64("LLAMA_LSA_J3_PREV",  1) != 0;
         c.j3_first  = (int) std::max<int64_t>(0, lsa_env_i64("LLAMA_LSA_J3_FIRST", 3));
+        c.j3_lead   = lsa_env_i64("LLAMA_LSA_J3_LEAD",  0) != 0;
         c.multi     = lsa_env_i64("LLAMA_LSA_MULTI",    0) != 0;
         c.resident_first = (int) std::max<int64_t>(0, lsa_env_i64("LLAMA_LSA_RESIDENT_FIRST", 0));
         c.recall    = lsa_env_i64("LLAMA_LSA_RECALL",    0) != 0;
@@ -214,9 +215,19 @@ const llama_lsa_config & llama_lsa_cfg() {
                 LLAMA_LOG_WARN("%s: LLAMA_LSA_J3 needs LLAMA_LSA_RESIDENT (record-page slots): J3 off\n", __func__);
                 c.j3 = false;
             }
+            if (c.j3 && c.j3_lead) {
+                if (c.resident_first < 1) {
+                    LLAMA_LOG_WARN("%s: LLAMA_LSA_J3_LEAD needs LLAMA_LSA_RESIDENT_FIRST=N >= 1: J3_LEAD off\n", __func__);
+                    c.j3_lead = false;
+                } else {
+                    c.j3_first = c.resident_first; // the leading N layers have no source N ahead of them
+                    c.j3_ahead = c.resident_first;
+                }
+            }
         }
         if (c.mode == llama_lsa_config::OFF) {
             c.j3 = false;
+            c.j3_lead = false;
             c.multi = false;
         }
         if (c.mode != llama_lsa_config::OFF && c.map_path.empty() && !c.mapless_probe()) {
@@ -247,7 +258,7 @@ static std::string llama_lsa_describe_cfg(const llama_lsa_config & c) {
        << " topp=" << c.topp << " topp_tau=" << c.topp_tau << " topp_min=" << c.topp_min << " stats=" << (c.stats ? 1 : 0) << " recall=" << (c.recall ? 1 : 0)
        << " spec_recall=" << (c.spec_recall ? 1 : 0)
        << " j3=" << (c.j3 ? 1 : 0) << " j3_a3=" << c.j3_a3 << " j3_a1=" << c.j3_a1 << " j3_prev=" << (c.j3_prev ? 1 : 0)
-       << " j3_first=" << c.j3_first << (c.gather ? " gather=1" : "") << (c.multi ? " multi=1" : "") << (c.resident_first > 0 ? " resident_first=" + std::to_string(c.resident_first) : std::string()) << " map=" << c.map_path;
+       << " j3_first=" << c.j3_first << (c.j3 && c.j3_lead ? " j3_lead=1 j3_ahead=" + std::to_string(c.j3_ahead) : std::string()) << (c.gather ? " gather=1" : "") << (c.multi ? " multi=1" : "") << (c.resident_first > 0 ? " resident_first=" + std::to_string(c.resident_first) : std::string()) << " map=" << c.map_path;
     return os.str();
 }
 
@@ -386,11 +397,11 @@ std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type bo
         // the gather path is not part of this build: plain f16 / q8_0 run the masked LSA node
         return "LLAMA_LSA_GATHER=1 is not available in this build (plain f16/q8_0 LSA runs the masked path; unset it)";
     }
-    if (c.multi && (!sj || c.packed || c.j3)) {
+    if (c.multi && (!sj || c.packed || (c.j3 && !c.j3_lead))) {
         // per-stream side caches are wired for the SJ-KVaRN masked path only; the packed mask (LLAMA_LSA_PACKED,
-        // LLAMA_LSA_BLKLIST) and the J3 prefetch still assume one stream
+        // LLAMA_LSA_BLKLIST) and the plain J3 prefetch still assume one stream (LLAMA_LSA_J3_LEAD runs per stream)
         return !sj ? "LLAMA_LSA_MULTI=1 needs an SJ-KVaRN cache (plain caches keep one stream of LSA caches)" :
-                     "LLAMA_LSA_MULTI=1 does not combine with LLAMA_LSA_PACKED / LLAMA_LSA_BLKLIST or LLAMA_LSA_J3";
+                     "LLAMA_LSA_MULTI=1 does not combine with LLAMA_LSA_PACKED / LLAMA_LSA_BLKLIST, or LLAMA_LSA_J3 without LLAMA_LSA_J3_LEAD";
     }
     if (sj && c.fa_sparse) {
         return "LLAMA_LSA_FA_SPARSE is for plain K/V (an SJ-KVaRN node ignores the sparse bound)";
@@ -432,8 +443,8 @@ std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type bo
         LLAMA_LOG_WARN("%s: LLAMA_LSA_SJ_SKIP has no effect on SJ-KVaRN %u/%u trellis (GGML_SJKVARN_TILE_SKIP=1 skips "
                        "dead tiles there)\n", __func__, bits_k, bits_v);
     }
-    if (s44 && c.j3) {
-        return "LLAMA_LSA_J3 needs record pages (SJ-KVaRN 3/2t or 3/3t); the 4/4 scalar body keeps 16-cell strips";
+    if (s44 && c.j3 && !c.j3_lead) {
+        return "LLAMA_LSA_J3 needs record pages (SJ-KVaRN 3/2t or 3/3t); the 4/4 scalar 16-cell strips need LLAMA_LSA_J3_LEAD=1";
     }
     return {};
 }

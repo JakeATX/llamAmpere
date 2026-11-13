@@ -1260,14 +1260,16 @@ static __global__ void qsa_strip_resolve(ggml_cuda_qsa_clock_map m, const int32_
         c[2] += 1;
         c[3] += over;
         if (m.log_every && c[2] % m.log_every == 0) {
-            printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u strip_bytes=%u\n",
-                m.layer, c[2], c[1], c[0], c[3], m.slots, m.heads*GGML_LSA_STRIP_HEAD_BYTES);
+            printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u strip_bytes=%u "
+                "prefetched=%u pf_passes=%u pf_hits=%u pf_dropped=%u\n", m.layer, c[2], c[1], c[0], c[3], m.slots,
+                m.heads*GGML_LSA_STRIP_HEAD_BYTES, m.ctl[5], m.ctl[6], m.ctl[17], m.ctl[18]);
         }
     }
 }
 
-static __global__ void qsa_strip_copy_misses(ggml_cuda_qsa_clock_map m) {
-    for (uint32_t i = blockIdx.x; i < m.ctl[2]; i += gridDim.x) {
+// count: ctl word with the copy count (2 after qsa_strip_resolve, 4 after lsa_page_assign)
+static __global__ void qsa_strip_copy_misses(ggml_cuda_qsa_clock_map m, int count = 2) {
+    for (uint32_t i = blockIdx.x; i < m.ctl[count]; i += gridDim.x) {
         qsa_strip_copy(m, m.miss_page[i], m.miss_slot[i], blockIdx.y);
     }
 }
@@ -1282,6 +1284,7 @@ void ggml_cuda_qsa_strip_prepare(ggml_backend_cuda_context & ctx, const ggml_ten
         const int32_t * list) {
     auto * e = body ? qsa_clock_entry(body) : nullptr;
     if (!e || e->map.cells != GGML_LSA_STRIP_CELLS || !desc || !list) return;
+    lsa_pf_join(ctx.stream(), e); // LLAMA_LSA_J3_LEAD: the strip prefetch for this layer lands before its resolve
     qsa_strip_resolve<<<1, 1024, 0, ctx.stream()>>>(e->map, desc, list);
     CUDA_CHECK(cudaGetLastError());
     qsa_strip_copy_misses<<<dim3(128, e->map.heads), 128, 0, ctx.stream()>>>(e->map);
@@ -1483,7 +1486,8 @@ static void lsa_page_prefetch(ggml_backend_cuda_context & ctx, qsa_clock_tensor 
     {
         std::lock_guard<std::mutex> lock(lsa_pf_mutex);
         for (auto * c : lsa_pf_entries) {
-            if (c != e && c->device == e->device && c->map.layer > e->map.layer && c->map.records == e->map.records &&
+            if (c != e && c->device == e->device && c->map.cells == GGML_LSA_PAGE_CELLS && c->map.layer > e->map.layer &&
+                    c->map.records == e->map.records &&
                     (!next || c->map.layer < next->map.layer)) {
                 next = c;
             }
@@ -1565,6 +1569,49 @@ static __global__ void lsa_j3_mark(ggml_cuda_qsa_clock_map m, const int32_t * de
     }
 }
 
+// LLAMA_LSA_J3_LEAD on 16-cell strip slots: one thread per (sealed body group, strip) of the target layer. A strip is
+// marked if a unit of the prediction that overlaps its 16 cells is set in any row. Records sealed by this ubatch are
+// skipped (their master bytes are being written now). Hits get the pass's epoch and ref; misses are queued for
+// lsa_page_assign (pf 1: table index = strip page) and qsa_strip_copy_misses on the side stream. The previous pick is
+// not used: the strips the last own resolve picked already hold slots.
+static __global__ void lsa_j3_strip_mark(ggml_cuda_qsa_clock_map m, const int32_t * desc, const float * units,
+        int64_t nunits, int nrows, int unit, uint32_t limit) {
+    constexpr int P = GGML_LSA_PAGE_CELLS/GGML_LSA_STRIP_CELLS;
+    const int i = blockIdx.x*blockDim.x + threadIdx.x, g = i/P, sl = i%P;
+    const int S = desc[GGML_SJKVARN_DESC_S], G = desc[GGML_SJKVARN_DESC_G];
+    if (G != GGML_LSA_PAGE_CELLS || g >= (desc[GGML_SJKVARN_DESC_B_OLD] - S)/G) return;
+    const int64_t c0 = int64_t(S) + int64_t(g)*G + sl*GGML_LSA_STRIP_CELLS;
+    const int64_t u0 = c0/unit, u1 = min(nunits - 1, (c0 + GGML_LSA_STRIP_CELLS - 1)/unit);
+    bool live = false;
+    for (int r = 0; r < nrows && !live; ++r) {
+        for (int64_t u = u0; u <= u1 && !live; ++u) live = units[r*nunits + u] > 0.5f;
+    }
+    const int record = desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + g] : g;
+    if (!live || record < 0 || record >= int(m.records)) return;
+    const int page = record*P + sl;
+    const uint32_t epoch = m.ctl[0] + 1;
+    int cur = m.table[page];
+    for (;;) {
+        if (cur >= 0) {
+            m.stamp[cur] = epoch;
+            m.ref[cur] = 1;
+            atomicAdd(m.ctl + 17, 1u);
+            return;
+        }
+        if (cur == -2) return; // queued by this pass already
+        const int old = atomicCAS(m.table + page, cur, -2);
+        if (old == cur) break;
+        cur = old;
+    }
+    const uint32_t miss = atomicAdd(m.ctl + 2, 1u);
+    if (miss < limit) {
+        m.miss_page[miss] = page;
+    } else {
+        m.table[page] = -1;
+        atomicAdd(m.ctl + 18, 1u);
+    }
+}
+
 // grow a J3 scratch buffer; cudaFree waits for the device, so an old copy still read by the side stream is safe
 template <typename T>
 static void lsa_j3_reserve(T *& p, size_t & cap, size_t n) {
@@ -1575,17 +1622,26 @@ static void lsa_j3_reserve(T *& p, size_t & cap, size_t n) {
     lsa_j3_gen.fetch_add(1, std::memory_order_relaxed); // captured graphs hold the old pointer
 }
 
+// a J3 target: record-page slots, or (LLAMA_LSA_J3_LEAD) 16-cell strip slots; never the unpublished strip-master source
+static bool lsa_j3_body(const qsa_clock_tensor * e) {
+    return (e->map.cells == GGML_LSA_PAGE_CELLS || e->map.cells == GGML_LSA_STRIP_CELLS) && !e->map.strip_master;
+}
+
 // Host setup of one J3 pass that never runs during capture: side stream, events, prev/j3_src, scratch. Returns the
 // entry, or nullptr when the op is a no-op for this body (same rule as ggml_cuda_lsa_prefetch).
 static qsa_clock_tensor * lsa_j3_setup(const ggml_tensor * dst, int device, cudaStream_t stream) {
     const ggml_tensor * desc = dst->src[0];
     const ggml_tensor * units = dst->src[2];
     auto * e = dst->src[1] ? qsa_clock_entry(dst->src[1]) : nullptr;
-    if (!e || e->map.cells != GGML_LSA_PAGE_CELLS || e->map.strip_master || e->device != device) {
+    if (!e || !lsa_j3_body(e) || e->device != device) {
         return nullptr;
     }
+    const bool strip = e->map.cells == GGML_LSA_STRIP_CELLS;
     {
         std::lock_guard<std::mutex> lock(lsa_pf_mutex);
+        if (strip && std::find(lsa_pf_entries.begin(), lsa_pf_entries.end(), e) == lsa_pf_entries.end()) {
+            lsa_pf_entries.push_back(e); // joined by ggml_cuda_lsa_j3_graph_end; the next-layer lookup takes pages only
+        }
         if (!e->pf_done) {
             CUDA_CHECK(cudaEventCreateWithFlags(&e->pf_done, cudaEventDisableTiming));
         }
@@ -1596,7 +1652,10 @@ static qsa_clock_tensor * lsa_j3_setup(const ggml_tensor * dst, int device, cuda
             CUDA_CHECK(cudaEventCreateWithFlags(&lsa_pf_fork[e->device], cudaEventDisableTiming));
         }
     }
-    if (!e->map.prev) {
+    if (strip && !units) {
+        return e; // strips use the units only
+    }
+    if (!strip && !e->map.prev) {
         // the own mark fills both from the next own resolve on (prev: the previous-pick source; j3_src: the cascade
         // log), so this first call marks no previous pick
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&e->map.prev), size_t(e->map.records)*sizeof(uint32_t)));
@@ -1661,10 +1720,11 @@ void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     if (capturing) {
         // ggml_cuda_lsa_prefetch_reserve ran from the graph check for this graph: no allocation, only the join
         e = dst->src[1] ? qsa_clock_entry(dst->src[1]) : nullptr;
-        if (!e || e->map.cells != GGML_LSA_PAGE_CELLS || e->map.strip_master || e->device != ctx.device) {
+        if (!e || !lsa_j3_body(e) || e->device != ctx.device) {
             return;
         }
-        GGML_ASSERT(e->pf_done && lsa_pf_stream[e->device] && e->map.prev && e->map.j3_src);
+        if (e->map.cells == GGML_LSA_STRIP_CELLS && !units) return;
+        GGML_ASSERT(e->pf_done && lsa_pf_stream[e->device] && (e->map.cells == GGML_LSA_STRIP_CELLS || (e->map.prev && e->map.j3_src)));
         if (!units && !use_prev) return;
         if (e->j3_issued[src]) {
             lsa_pf_join(ctx.stream(), e);
@@ -1673,8 +1733,8 @@ void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         GGML_ASSERT(!units || size_t(ggml_nelements(units)) <= e->j3_units_cap[src]);
     } else {
         e = lsa_j3_setup(dst, ctx.device, ctx.stream());
-        if (!e) return; // no record-page slots (the whole body is on the card), or the unpublished strip-master source
-        if (!units && !use_prev) return;
+        if (!e) return; // no record-page or strip slots (the whole body is on the card), or the unpublished strip-master source
+        if (!units && (!use_prev || e->map.cells == GGML_LSA_STRIP_CELLS)) return;
     }
     const size_t ndesc = size_t(ggml_nelements(desc));
     CUDA_CHECK(cudaMemcpyAsync(e->j3_desc[src], desc->data, ndesc*sizeof(int32_t), cudaMemcpyDeviceToDevice, ctx.stream()));
@@ -1690,8 +1750,21 @@ void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     CUDA_CHECK(cudaEventRecord(lsa_pf_fork[e->device], ctx.stream()));
     CUDA_CHECK(cudaStreamWaitEvent(side, lsa_pf_fork[e->device], 0));
     const uint32_t cap = e->map.slots;
+    if (e->map.cells == GGML_LSA_STRIP_CELLS) {
+        // LLAMA_LSA_J3_LEAD: the predicted strips of the target, joined by its ggml_cuda_qsa_strip_prepare
+        const int n = int(e->map.records)*(GGML_LSA_PAGE_CELLS/GGML_LSA_STRIP_CELLS);
+        lsa_j3_strip_mark<<<(n + 127)/128, 128, 0, side>>>(e->map, e->j3_desc[src], e->j3_units[src], nunits, nrows, unit, cap);
+        CUDA_CHECK(cudaGetLastError());
+        lsa_page_assign<<<1, 1024, 0, side>>>(e->map, cap, 1);
+        CUDA_CHECK(cudaGetLastError());
+        qsa_strip_copy_misses<<<dim3(lsa_j3_copy_blocks(), e->map.heads), 128, 0, side>>>(e->map, 4);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(e->pf_done, side));
+        e->pf_pending = true;
+        return;
+    }
     lsa_j3_mark<<<(e->map.records + 127)/128, 128, 0, side>>>(e->map, e->j3_desc[src], units ? e->j3_units[src] : nullptr,
-        nunits, nrows, unit, use_prev, cap, src == 0 ? 1u : 2u); // src 0 = ahead-3, src 1 = ahead-1 top-up
+        nunits, nrows, unit, use_prev, cap, src % 2 == 0 ? 1u : 2u); // even src = look-ahead, odd = ahead-1 top-up
     CUDA_CHECK(cudaGetLastError());
     lsa_page_assign<<<1, 1024, 0, side>>>(e->map, cap, (flags & GGML_LSA_PREFETCH_PROTECT_PREV) ? 2 : 3);
     CUDA_CHECK(cudaGetLastError());

@@ -164,6 +164,11 @@ struct llama_lsa_config {
     int         j3_a1     = 150;
     bool        j3_prev   = true;
     int         j3_first  = 3;
+    // LLAMA_LSA_J3_LEAD=1 (opt-in, needs J3 and LLAMA_LSA_RESIDENT_FIRST=N): look-ahead N mapped layers instead of 3
+    // (j3_first = N too), so the N whole-body leading layers are the lead time of every prefetch; also runs on 4/4
+    // strip slots and per stream under LLAMA_LSA_MULTI
+    bool        j3_lead   = false;
+    int         j3_ahead  = 3;
     // LLAMA_LSA_MULTI=1 (opt-in, MULTI4LSA): SJ-KVaRN with several streams (one per sequence, -np > 1) keeps one set of
     // LSA side caches (index, block means, staging ring, pick, owner) per stream and builds the LSA mask per stream, so
     // every slot runs LSA at once. Off: one set, one owner (unchanged). Refused with LLAMA_LSA_PACKED, _J3 and _GATHER.
