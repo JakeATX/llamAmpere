@@ -758,6 +758,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_link_libraries(test-moe-arena PRIVATE llama ggml ggml-cpu ggml-base)
     llama_test(test-moe-arena LABEL "main;cpu")
     llama_test(test-moe-arena NAME test-moe-arena-thp ARGS --thp LABEL "main;cpu")
+    llama_test(test-moe-arena NAME test-moe-arena-ram ARGS --ram LABEL "main;cpu")
 endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT LLAMA_USE_SYSTEM_GGML)

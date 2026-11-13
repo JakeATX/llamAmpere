@@ -40,25 +40,13 @@ static int64_t ple_pf_env(const char * name, int64_t def) {
     return v && *v ? (int64_t) strtoll(v, nullptr, 10) : def;
 }
 
-// MemAvailable in MiB, -1 when unknown
+// usable RAM in MiB (the shared cgroup-aware reader), -1 when unknown
 static int64_t ple_pf_mem_avail_mib() {
 #if defined(__linux__)
-    FILE * f = fopen("/proc/meminfo", "r");
-    if (!f) {
-        return -1;
-    }
-    char line[256];
-    int64_t kib = -1;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "MemAvailable:", 13) == 0) {
-            kib = strtoll(line + 13, nullptr, 10);
-            break;
-        }
-    }
-    fclose(f);
-    return kib < 0 ? -1 : kib/1024;
+    const size_t avail = llama_moe_arena::available_memory();
+    return avail > 0 ? (int64_t) (avail >> 20) : -1;
 #else
-    return -1;
+    return -1; // as before: this gate had a Linux reader only
 #endif
 }
 
@@ -125,7 +113,7 @@ std::unique_ptr<llama_ple_prefetch> llama_ple_prefetch::create(const llama_model
     if (!explicit_thr && model.arch == LLM_ARCH_QWEN4EXP && t) {
         const int64_t avail = ple_pf_mem_avail_mib();
         if (avail >= 0 && avail < PLE_PF_DEFAULT_MIN_AVAIL_MIB) {
-            LLAMA_LOG_WARN("%s: [PLEPF] default PLE prefetch off: MemAvailable %" PRId64 " MiB < %" PRId64 " MiB (LLAMA_PLE_PREFETCH=N forces it)\n",
+            LLAMA_LOG_WARN("%s: [PLEPF] default PLE prefetch off: usable RAM %" PRId64 " MiB < %" PRId64 " MiB (LLAMA_PLE_PREFETCH=N forces it)\n",
                     __func__, avail, PLE_PF_DEFAULT_MIN_AVAIL_MIB);
             return nullptr;
         }
