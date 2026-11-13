@@ -164,6 +164,10 @@ struct llama_lsa_config {
     int         j3_a1     = 150;
     bool        j3_prev   = true;
     int         j3_first  = 3;
+    // LLAMA_LSA_MULTI=1 (opt-in, MULTI4LSA): SJ-KVaRN with several streams (one per sequence, -np > 1) keeps one set of
+    // LSA side caches (index, block means, staging ring, pick, owner) per stream and builds the LSA mask per stream, so
+    // every slot runs LSA at once. Off: one set, one owner (unchanged). Refused with LLAMA_LSA_PACKED, _J3 and _GATHER.
+    bool        multi     = false;
     std::string layers;             // LLAMA_LSA_LAYERS: comma list of layer ids to sparsify (default: all mapped)
     std::string keep_frac_layers;   // LLAMA_LSA_KEEP_FRAC_LAYERS: "il:frac,il:frac" per-layer override of keep_frac
                                     // (frac of n_kv; 1 or more = that layer stays dense)
@@ -271,7 +275,8 @@ bool llama_lsa_idx_get(const ggml_tensor * kcache, int64_t d_idx, ggml_backend_b
 void llama_lsa_idx_commit(const ggml_tensor * kcache, uint64_t epoch);
 // kcaches = the K cache tensors whose cells changed outside the graph (each KV cache passes only its own layers, so the
 // MTP drafter's restore or shift no longer marks the main model's layers stale); nullptr = every layer of every context
-void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, const char * why = nullptr);
+// strm >= 0 (LLAMA_LSA_MULTI=1 only): that stream's caches only (a restore of one sequence); -1: every stream
+void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, const char * why = nullptr, int32_t strm = -1);
 // the K caches are being destroyed: drop their index/mean entries and free the buffers
 void llama_lsa_idx_forget(const ggml_tensor * const * kcaches, size_t n);
 bool llama_lsa_idx_trace(); // LLAMA_LSA_IDX_TRACE=1: invalidate/save/restore/stale events logged at WARN
@@ -358,3 +363,16 @@ bool llama_lsa_log_once(uint32_t & seen);
 // OFF is kept until `fresh` (a ubatch at position 0), so layers or contexts that disagree cannot flip the line.
 void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed, bool is_reserve); // one-owner rule of the SJ-KVaRN LSA caches
 void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why, bool fresh);
+
+// LLAMA_LSA_MULTI=1: the stream whose side caches the calls above act on (this thread). Always 0 unless multi is on,
+// so a default build keeps one set. Graph build, set_input and the state suffix of a sequence scope it to the stream.
+constexpr int32_t LLAMA_LSA_MAX_STREAMS = 64;
+int32_t llama_lsa_stream();
+void    llama_lsa_set_stream(int32_t strm); // no-op unless multi; strm outside [0, LLAMA_LSA_MAX_STREAMS) aborts
+struct llama_lsa_stream_scope {
+    int32_t prev;
+    explicit llama_lsa_stream_scope(int32_t strm) : prev(llama_lsa_stream()) { llama_lsa_set_stream(strm); }
+    ~llama_lsa_stream_scope() { llama_lsa_set_stream(prev); }
+    llama_lsa_stream_scope(const llama_lsa_stream_scope &) = delete;
+    llama_lsa_stream_scope & operator=(const llama_lsa_stream_scope &) = delete;
+};

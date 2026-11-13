@@ -5597,7 +5597,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     scratch_cancel();
-    lsa_idx_invalidate("state_read"); // restored K bypasses the graph: LSA index cache rebuilds on the next graph
+    // restored K bypasses the graph: LSA index cache rebuilds on the next graph. LLAMA_LSA_MULTI=1: only the restored
+    // sequence's stream (its caches are keyed by the sequence id; the other slots keep theirs)
+    lsa_idx_invalidate("state_read", llama_lsa_cfg().multi && seq_id >= 0 && seq_id < LLAMA_LSA_MAX_STREAMS ? (int32_t) seq_id : -1);
     if (sj_kvarn.enabled() && !other) {
         // see the matching refusal in state_read_sinfo (block KV streaming is refused at construction anyway)
         if (kv_stream_runtime.runtime != nullptr) {
@@ -6706,7 +6708,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
-void llama_kv_cache::lsa_idx_invalidate(const char * why) const {
+void llama_kv_cache::lsa_idx_invalidate(const char * why, int32_t strm) const {
     std::vector<const ggml_tensor *> ks;
     ks.reserve(layers.size());
     for (const auto & l : layers) {
@@ -6720,7 +6722,7 @@ void llama_kv_cache::lsa_idx_invalidate(const char * why) const {
     if (ks.empty()) {
         return; // no layers here: nothing of this cache is indexed (never the global rule, see llama_lsa_idx_invalidate)
     }
-    llama_lsa_idx_invalidate(ks.data(), ks.size(), why);
+    llama_lsa_idx_invalidate(ks.data(), ks.size(), why, strm);
 }
 
 void llama_kv_cache::lsa_idx_forget() const {

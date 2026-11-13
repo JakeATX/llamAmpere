@@ -221,7 +221,8 @@ public:
     bool scratch_safe(uint32_t n_tokens) const;
     void scratch_release();
     void scratch_cancel();
-    void lsa_idx_invalidate(const char * why) const; // LSA index/mean caches of this cache's layers only
+    void lsa_idx_invalidate(const char * why, int32_t strm = -1) const; // LSA index/mean caches of this cache's layers only
+                                                                        // (strm >= 0: that LLAMA_LSA_MULTI stream only)
     void lsa_idx_forget() const; // destructor: free the LSA index/mean caches of the layers this cache owns
 
     bool kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens);

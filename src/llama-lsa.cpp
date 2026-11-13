@@ -19,6 +19,7 @@ extern "C" {
 #include <map>
 #include <unordered_map>
 #include <mutex>
+#include <iterator>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -115,6 +116,7 @@ const llama_lsa_config & llama_lsa_cfg() {
         c.j3_a1     = (int) lsa_env_i64("LLAMA_LSA_J3_A1",    150);
         c.j3_prev   = lsa_env_i64("LLAMA_LSA_J3_PREV",  1) != 0;
         c.j3_first  = (int) std::max<int64_t>(0, lsa_env_i64("LLAMA_LSA_J3_FIRST", 3));
+        c.multi     = lsa_env_i64("LLAMA_LSA_MULTI",    0) != 0;
         c.recall    = lsa_env_i64("LLAMA_LSA_RECALL",    0) != 0;
         c.block     = lsa_env_i64("LLAMA_LSA_BLOCK",     0);
         c.block_tau = lsa_env_f64("LLAMA_LSA_BLOCK_TAU", c.block_tau);
@@ -214,6 +216,7 @@ const llama_lsa_config & llama_lsa_cfg() {
         }
         if (c.mode == llama_lsa_config::OFF) {
             c.j3 = false;
+            c.multi = false;
         }
         if (c.mode != llama_lsa_config::OFF && c.map_path.empty() && !c.mapless_probe()) {
             LLAMA_LOG_WARN("%s: LLAMA_LSA_MODE set but LLAMA_LSA_MAP is empty, LSA stays off\n", __func__);
@@ -243,7 +246,7 @@ static std::string llama_lsa_describe_cfg(const llama_lsa_config & c) {
        << " topp=" << c.topp << " topp_tau=" << c.topp_tau << " topp_min=" << c.topp_min << " stats=" << (c.stats ? 1 : 0) << " recall=" << (c.recall ? 1 : 0)
        << " spec_recall=" << (c.spec_recall ? 1 : 0)
        << " j3=" << (c.j3 ? 1 : 0) << " j3_a3=" << c.j3_a3 << " j3_a1=" << c.j3_a1 << " j3_prev=" << (c.j3_prev ? 1 : 0)
-       << " j3_first=" << c.j3_first << (c.gather ? " gather=1" : "") << " map=" << c.map_path;
+       << " j3_first=" << c.j3_first << (c.gather ? " gather=1" : "") << (c.multi ? " multi=1" : "") << " map=" << c.map_path;
     return os.str();
 }
 
@@ -381,6 +384,12 @@ std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type bo
     if (c.gather) {
         // the gather path is not part of this build: plain f16 / q8_0 run the masked LSA node
         return "LLAMA_LSA_GATHER=1 is not available in this build (plain f16/q8_0 LSA runs the masked path; unset it)";
+    }
+    if (c.multi && (!sj || c.packed || c.j3)) {
+        // per-stream side caches are wired for the SJ-KVaRN masked path only; the packed mask (LLAMA_LSA_PACKED,
+        // LLAMA_LSA_BLKLIST) and the J3 prefetch still assume one stream
+        return !sj ? "LLAMA_LSA_MULTI=1 needs an SJ-KVaRN cache (plain caches keep one stream of LSA caches)" :
+                     "LLAMA_LSA_MULTI=1 does not combine with LLAMA_LSA_PACKED / LLAMA_LSA_BLKLIST or LLAMA_LSA_J3";
     }
     if (sj && c.fa_sparse) {
         return "LLAMA_LSA_FA_SPARSE is for plain K/V (an SJ-KVaRN node ignores the sparse bound)";
@@ -681,11 +690,38 @@ struct lsa_idx_store {
                                                                 // ring rows under the rewind point still hold higher (old) positions
     uint64_t                                       seq     = 0; // invalidate counter (entry touch)
 };
+// LLAMA_LSA_MULTI=1: one store (and one block-mean / pick map, one owner) per KV stream; stream 0 otherwise
+thread_local int32_t g_lsa_stream = 0;
 lsa_idx_store & lsa_idx() {
-    static lsa_idx_store * s = new lsa_idx_store(); // leaked on purpose, like the map buffers
-    return *s;
+    static lsa_idx_store * s = new lsa_idx_store[LLAMA_LSA_MAX_STREAMS]; // leaked on purpose, like the map buffers
+    return s[g_lsa_stream];
+}
+// run f once per stream (strm < 0: every stream that may hold entries; else that stream), with it current
+template <typename F> void lsa_for_streams(int32_t strm, F && f) {
+    const int32_t prev = g_lsa_stream;
+    const int32_t n = llama_lsa_cfg().multi ? LLAMA_LSA_MAX_STREAMS : 1;
+    for (int32_t i = 0; i < n; ++i) {
+        if (strm >= 0 && i != strm) {
+            continue;
+        }
+        g_lsa_stream = i;
+        f();
+    }
+    g_lsa_stream = prev;
 }
 } // namespace
+
+int32_t llama_lsa_stream() {
+    return g_lsa_stream;
+}
+
+void llama_lsa_set_stream(int32_t strm) {
+    if (!llama_lsa_cfg().multi) {
+        return; // one set of caches: always stream 0
+    }
+    GGML_ASSERT(strm >= 0 && strm < LLAMA_LSA_MAX_STREAMS && "LLAMA_LSA_MULTI=1 serves at most 64 streams");
+    g_lsa_stream = strm;
+}
 
 bool llama_lsa_idx_get(const ggml_tensor * kcache, int64_t d_idx, ggml_backend_buffer_type_t buft, llama_lsa_idx_slot * out,
         int64_t kv_size, int64_t n_head) {
@@ -763,9 +799,9 @@ struct lsa_mean_entry {
     bool                  rot   = false;
     ggml_context *        ctx   = nullptr;
 };
-std::map<const ggml_tensor *, lsa_mean_entry> & lsa_means() { // guarded by lsa_idx().mtx
-    static auto * m = new std::map<const ggml_tensor *, lsa_mean_entry>();
-    return *m;
+std::map<const ggml_tensor *, lsa_mean_entry> & lsa_means() { // guarded by lsa_idx().mtx (same stream)
+    static auto * m = new std::map<const ggml_tensor *, lsa_mean_entry>[LLAMA_LSA_MAX_STREAMS];
+    return m[g_lsa_stream];
 }
 } // namespace
 
@@ -844,9 +880,9 @@ struct lsa_pick_entry {
     int64_t               n_use = 0;          // graphs that used this pick (1 = the pick itself)
     int32_t               seq   = -1;         // sequence of the pick graph
 };
-std::map<const ggml_tensor *, lsa_pick_entry> & lsa_picks() { // guarded by lsa_idx().mtx
-    static auto * m = new std::map<const ggml_tensor *, lsa_pick_entry>();
-    return *m;
+std::map<const ggml_tensor *, lsa_pick_entry> & lsa_picks() { // guarded by lsa_idx().mtx (same stream)
+    static auto * m = new std::map<const ggml_tensor *, lsa_pick_entry>[LLAMA_LSA_MAX_STREAMS];
+    return m[g_lsa_stream];
 }
 } // namespace
 
@@ -924,7 +960,10 @@ void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed, bool is_reserve) {
     if (is_reserve || (seq < 0 && !mixed)) {
         return; // graph reserve / measure: placeholder sequences, the graph never runs
     }
-    static int32_t own = -1; // guarded by lsa_idx().mtx
+    static int32_t owners[LLAMA_LSA_MAX_STREAMS] = { -1 }; // guarded by lsa_idx().mtx; LLAMA_LSA_MULTI=1: per stream
+    static bool owners_init = [] { std::fill(std::begin(owners), std::end(owners), -1); return true; }();
+    (void) owners_init;
+    int32_t & own = owners[g_lsa_stream];
     auto & s = lsa_idx();
     std::lock_guard<std::mutex> lock(s.mtx);
     if (!mixed && (fresh || own < 0 || seq == own)) {
@@ -945,7 +984,7 @@ void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed, bool is_reserve) {
     own = -1;
 }
 
-void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, const char * why) {
+void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, const char * why, int32_t strm) {
     static const bool test_skip = lsa_env_i64("LLAMA_LSA_IDX_TEST_SKIP_INVALIDATE", 0) != 0; // negative control only
     // LLAMA_LSA_IDX_TEST_GLOBAL_INVALIDATE=1: old behaviour (any cache's restore/shift invalidates every layer of every
     // context, e.g. the MTP drafter's restore after the main one left SJ-KVaRN dense); negative control only
@@ -954,6 +993,7 @@ void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, con
         return;
     }
     g_lsa_graph_gen.fetch_add(1, std::memory_order_relaxed);
+    lsa_for_streams(strm, [&] {
     auto & s = lsa_idx();
     std::lock_guard<std::mutex> lock(s.mtx);
     if (test_global) {
@@ -992,6 +1032,7 @@ void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, con
         LLAMA_LOG_WARN("%s: [lsa-trace] %s: %zu K tensors, bumped %zu/%zu index + %zu/%zu mean entries\n", __func__,
                 why ? why : "?", n, n_idx, s.e.size(), n_mean, lsa_means().size());
     }
+    });
 }
 
 void llama_lsa_idx_forget(const ggml_tensor * const * kcaches, size_t n) {
@@ -1002,6 +1043,7 @@ void llama_lsa_idx_forget(const ggml_tensor * const * kcaches, size_t n) {
     if (kcaches == nullptr || n == 0) {
         return;
     }
+    lsa_for_streams(-1, [&] {
     auto & s = lsa_idx();
     std::lock_guard<std::mutex> lock(s.mtx);
     size_t n_idx = 0, n_mean = 0;
@@ -1031,6 +1073,7 @@ void llama_lsa_idx_forget(const ggml_tensor * const * kcaches, size_t n) {
         LLAMA_LOG_WARN("%s: [lsa-trace] forget: %zu index + %zu mean entries freed, %zu + %zu left\n", __func__,
                 n_idx, n_mean, s.e.size(), lsa_means().size());
     }
+    });
 }
 
 static const uint32_t LSA_IDX_STATE_MAGIC   = 0x4941534c; // "LSAI"

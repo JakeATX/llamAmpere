@@ -556,6 +556,20 @@ public:
     mutable ggml_tensor *       lsa_cpos_u        = nullptr; // LLAMA_LSA_UNIT_OP: first-cell position of each F-cell unit
     mutable int64_t             lsa_cpos_u_f      = 0;
 
+    // LLAMA_LSA_MULTI=1 (opt-in): the stream (= sequence; SJ-KVaRN keeps one stream per sequence) whose LSA side caches
+    // this input set addresses; a ubatch with several streams gets one LSA input set per stream in lsa_streams (only
+    // their lsa_* fields are used, sized for that stream's rows and attended length) and none of its own
+    int32_t lsa_stream = 0;
+    std::vector<std::shared_ptr<llm_graph_input_attn_kv>> lsa_streams; // shared: the input is copied by some model builders
+    int64_t lsa_sub_s  = 0; // this set's stream chunk of the parent ubatch (rows [s*T/ns, (s+1)*T/ns))
+    int64_t lsa_n_kv_s = 0; // attended (padded) positions of that stream
+    std::vector<llama_pos> lsa_sub_pos; // build-time sub-ubatch of that chunk (llm_graph_context::lsa_ubatch)
+    llama_ubatch           lsa_sub_ub = {};
+    mutable ggml_tensor *       lsa_sub_mask     = nullptr; // the stream's [n_kv_s, T/ns] slice of the KQ mask (once per graph)
+    mutable const ggml_tensor * lsa_sub_mask_src = nullptr;
+    // the LSA part of set_input (also used by llm_graph_input_mem_hybrid): positions, rows, ring slots, commits
+    void set_input_lsa(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -1322,6 +1336,9 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
+    // LLAMA_LSA_MULTI=1: the LSA builders read lsa_ubatch(), the stream's own rows while a per-stream LSA layer is built
+    mutable const llama_ubatch * lsa_ub = nullptr;
+    const llama_ubatch & lsa_ubatch() const { return lsa_ub ? *lsa_ub : ubatch; }
 
     const int64_t n_embd;
     const int64_t n_layer;

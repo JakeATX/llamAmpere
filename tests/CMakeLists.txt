@@ -212,6 +212,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-unicode.cpp  LABEL behavior  LINK llama)
     if (NOT WIN32)
         llama_build_and_test(test-lsa-state.cpp LABEL "turbo")
+        llama_build_and_test(test-lsa-multi.cpp LABEL "turbo")
     endif()
     llama_build_and_test(test-sampling.cpp  LABEL behavior)   # fork: uses common/sampling.h, so keep the llama-common default link
     llama_build_and_test(test-sampler-topk-exact.cpp)
