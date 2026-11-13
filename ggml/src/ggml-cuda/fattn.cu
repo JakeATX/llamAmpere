@@ -4695,7 +4695,7 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() {
 }
 
 static constexpr int64_t SJ_KVARN_ROWSPLIT_CHUNK = 8;
-static constexpr int64_t SJ_KVARN_ROWSPLIT_MAX   = 16;
+static constexpr int64_t SJ_KVARN_ROWSPLIT_MAX   = 9; // MERGE2 T1: 9 rows PASS (0.849/0.847 x OFF verify), 16 rows 0.957 vs bar 0.95; 10..15 untested
 
 // rows [r0, r0 + nr) of a flash_attn_ext node: d (with d.src[0] = &q, d.src[3] = &m) writes dst rows r0.. in place
 static void ggml_cuda_fattn_sj_kvarn_rowsplit_view(const ggml_tensor * dst, const ggml_tensor * mask, int64_t r0, int64_t nr,
@@ -4723,7 +4723,8 @@ static void ggml_cuda_fattn_sj_kvarn_rowsplit_view(const ggml_tensor * dst, cons
 // true when every chunk of this node is served by the n_q <= 8 decode kernel (a packed mask is judged by its f16
 // expansion, which ggml_cuda_fattn_mask_packed_native then selects for this node)
 static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
-    if (!ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() || dst->src[6] == nullptr || ggml_cuda_fattn_sj_kvarn_is_lowbits(dst)) {
+    if (!ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() || dst->src[6] == nullptr || ggml_cuda_fattn_sj_kvarn_is_lowbits(dst) ||
+            ggml_flash_attn_ext_get_lsa_block(dst) > 0) { // LSA guard: a block-list node keeps its per-node selection bits whole
         return false;
     }
     const ggml_tensor * Q    = dst->src[0];
