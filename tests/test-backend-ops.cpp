@@ -23209,9 +23209,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // [MULTI4] GGML_TEST_AIV2_PERF=multi4: 27B decode shapes at 1 / 2 / 4 streams x 6 rows
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "multi4") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 },
-                                                                     { 6144, 5120 }, { 5120, 6144 } }) {
+                                                                     { 6144, 5120 }, { 5120, 6144 }, { 12288, 5120 } }) {
                 for (int64_t n : { 6, 12, 24 }) {
-                    for (ggml_type t : { GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U }) {
+                    for (ggml_type t : { GGML_TYPE_AIT5_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U }) {
                         test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, t));
                     }
                     for (ggml_type t : { GGML_TYPE_AIT4, GGML_TYPE_AIT3 }) {
