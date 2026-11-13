@@ -4495,6 +4495,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_ubatch = std::min(params.n_ubatch == 0 ? params.n_batch : params.n_ubatch, 64);
     }
 
+    // LLAMA_MTP_DRAFT_UB_MULTI=1 (opt-in, MULTI4LSA W1): with several slots and no -ubd, cap the built-in MTP draft
+    // ubatch at 8 rows per slot. Each stream's attention then has <= 8 query rows and stays on the fused quantized-KV
+    // kernel; a wider draft ubatch falls to the generic path, which copies every stream's K and V to F16 at once
+    // (1,168 MiB at 4 slots x 64K, linear in context). Same as -ubd 8*n_parallel; an explicit -ubd wins.
+    const char * ub_multi = std::getenv("LLAMA_MTP_DRAFT_UB_MULTI");
+    if (ub_multi && std::strcmp(ub_multi, "1") == 0 && spec_mtp && !has_draft && params.n_parallel > 1 &&
+            params_spec.n_ubatch < 0) {
+        result.n_ubatch = std::min(params.n_ubatch == 0 ? params.n_batch : params.n_ubatch, 8*params.n_parallel);
+    }
+
     if (has_draft) {
         // default to global devices value
         if (!params_spec.devices.empty()) {
