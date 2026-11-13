@@ -233,6 +233,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--cache-prompt, --no-cache-prompt` | whether to enable prompt caching (default: enabled)<br/>(env: LLAMA_ARG_CACHE_PROMPT) |
 | `--cache-reuse N` | min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: 0)<br/>[(card)](https://ggml.ai/f0.png)<br/>(env: LLAMA_ARG_CACHE_REUSE) |
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
+| `--expert-stats` | enable the MoE expert routing statistics endpoint; reads the router output of every MoE layer, which forces a sync per layer and disables CUDA graphs and fusion, so generation gets slower (default: disabled)<br/>(env: LLAMA_ARG_EXPERT_STATS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
@@ -1177,6 +1178,40 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
+
+### GET `/experts`: MoE expert routing statistics
+
+This endpoint is only accessible if `--expert-stats` is set, and only reports data for mixture-of-experts models.
+
+It shows which experts the router picked for the most recent tokens, per MoE layer. The server reads the router output of every MoE layer after each graph evaluation, so the flag forces a sync per layer and turns off CUDA graphs and fusion. Generation gets slower while it is on, so use it to inspect routing, not to benchmark.
+
+The query param `?total=1` adds lifetime hit counts per expert to each layer.
+
+```json
+{
+  "n_expert": 8,
+  "n_expert_used": 2,
+  "n_tokens": 1024,
+  "window": 256,
+  "tail": 16,
+  "layers": [
+    {
+      "il": 1,
+      "n_tokens": 1024,
+      "tokens": [[0, 5], [5, 7], [0, 1]],
+      "recent": [120, 40, 0, 0, 0, 210, 0, 130],
+      "total": [510, 130, 0, 0, 0, 900, 0, 460]
+    }
+  ]
+}
+```
+
+- `il`: layer index; layers with no traffic yet are omitted.
+- `tokens`: expert ids picked for the most recent `tail` tokens, oldest first, in router order.
+- `recent`: hits per expert over the most recent `window` tokens.
+- `total`: hits per expert since the server started, only with `?total=1`.
+
+Counts include draft tokens that were later rejected, so with speculative decoding they cover a few tokens that were never kept.
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
