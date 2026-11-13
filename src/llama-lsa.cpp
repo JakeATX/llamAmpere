@@ -117,6 +117,7 @@ const llama_lsa_config & llama_lsa_cfg() {
         c.j3_prev   = lsa_env_i64("LLAMA_LSA_J3_PREV",  1) != 0;
         c.j3_first  = (int) std::max<int64_t>(0, lsa_env_i64("LLAMA_LSA_J3_FIRST", 3));
         c.multi     = lsa_env_i64("LLAMA_LSA_MULTI",    0) != 0;
+        c.resident_first = (int) std::max<int64_t>(0, lsa_env_i64("LLAMA_LSA_RESIDENT_FIRST", 0));
         c.recall    = lsa_env_i64("LLAMA_LSA_RECALL",    0) != 0;
         c.block     = lsa_env_i64("LLAMA_LSA_BLOCK",     0);
         c.block_tau = lsa_env_f64("LLAMA_LSA_BLOCK_TAU", c.block_tau);
@@ -246,7 +247,7 @@ static std::string llama_lsa_describe_cfg(const llama_lsa_config & c) {
        << " topp=" << c.topp << " topp_tau=" << c.topp_tau << " topp_min=" << c.topp_min << " stats=" << (c.stats ? 1 : 0) << " recall=" << (c.recall ? 1 : 0)
        << " spec_recall=" << (c.spec_recall ? 1 : 0)
        << " j3=" << (c.j3 ? 1 : 0) << " j3_a3=" << c.j3_a3 << " j3_a1=" << c.j3_a1 << " j3_prev=" << (c.j3_prev ? 1 : 0)
-       << " j3_first=" << c.j3_first << (c.gather ? " gather=1" : "") << (c.multi ? " multi=1" : "") << " map=" << c.map_path;
+       << " j3_first=" << c.j3_first << (c.gather ? " gather=1" : "") << (c.multi ? " multi=1" : "") << (c.resident_first > 0 ? " resident_first=" + std::to_string(c.resident_first) : std::string()) << " map=" << c.map_path;
     return os.str();
 }
 

@@ -79,6 +79,7 @@ static int exercise(const std::string & dir, const std::string & mode) {
                               "LLAMA_LSA_IDX_TEST_NO_STATE", "LLAMA_LSA_IDX_TEST_SKIP_INVALIDATE" }) {
         setenv(name, "0", 1);
     }
+    unsetenv("LLAMA_LSA_RESIDENT_FIRST");
     setenv("LLAMA_LSA_MODE", "key", 1);
     setenv("LLAMA_LSA_MAP", (dir + "/a.gguf").c_str(), 1);
     setenv("LLAMA_LSA_IDX_CACHE", "1", 1);
@@ -92,7 +93,10 @@ static int exercise(const std::string & dir, const std::string & mode) {
         return 0;
     }
     if (mode == "accept") {
+        setenv("LLAMA_LSA_RESIDENT_FIRST", "6", 1);
         assert(llama_lsa_cfg().multi);
+        assert(llama_lsa_cfg().resident_first == 6);
+        assert(llama_lsa_describe().find(" multi=1 resident_first=6") != std::string::npos);
         assert(llama_lsa_check_cache(4, 4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
         return 0;
     }
@@ -105,7 +109,8 @@ static int exercise(const std::string & dir, const std::string & mode) {
     const std::vector<uint16_t> expected = { 0x3c00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600, 0x4700, 0x4800 };
 
     if (mode == "off") {
-        assert(!llama_lsa_cfg().multi);
+        assert(!llama_lsa_cfg().multi && llama_lsa_cfg().resident_first == 0);
+        assert(llama_lsa_describe().find("multi=") == std::string::npos);
         llama_lsa_set_stream(3);
         assert(llama_lsa_stream() == 0); // ignored: one set of caches
         llama_lsa_idx_slot s0 = get_in(0, k);

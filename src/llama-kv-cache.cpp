@@ -1017,6 +1017,21 @@ llama_kv_cache::llama_kv_cache(
             // LLAMA_LSA_J3: the first j3_first mapped LSA layers have no layer three ahead of them to predict their
             // reads, so their bodies stay whole on the card (same bytes as LSA_RESIDENT off for those layers)
             bool lsa_j3_whole = false;
+            // LLAMA_LSA_RESIDENT_FIRST=N (opt-in): the first N mapped LSA layers keep the whole body on the card
+            bool lsa_first_whole = false;
+            if (llama_lsa_cfg().resident_first > 0 && llama_lsa_cfg().resident > 0.0 && llama_lsa_cfg().mode != llama_lsa_config::OFF &&
+                    llama_lsa_map_has_layer((int32_t) il)) {
+                const auto & lc = llama_lsa_cfg();
+                int before = 0;
+                for (uint32_t jl = 0; jl < il; ++jl) {
+                    before += !hparams.is_recr(jl) && lc.layer_enabled((int) jl) && llama_lsa_map_has_layer((int) jl);
+                }
+                lsa_first_whole = !hparams.is_recr(il) && lc.layer_enabled((int) il) && before < lc.resident_first;
+                if (lsa_first_whole) {
+                    LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT_FIRST: layer %u is mapped LSA layer %d of the first %d: whole body on the card\n",
+                        __func__, il, before, lc.resident_first);
+                }
+            }
             if (llama_lsa_cfg().j3 && llama_lsa_cfg().mode != llama_lsa_config::OFF && llama_lsa_map_has_layer((int32_t) il)) {
                 const auto & lc = llama_lsa_cfg();
                 int before = 0;
@@ -1030,7 +1045,7 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
             if (body_ctx == ctx && llama_lsa_cfg().resident > 0.0 && offload && llama_lsa_map_has_layer((int32_t) il) &&
-                    !lsa_j3_whole && ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    !lsa_j3_whole && !lsa_first_whole && ggml_backend_dev_type(model.dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 static bool warned = false;
                 // slots per layer: <pct> of the records, or LLAMA_LSA_RESIDENT_MIB split evenly over the layers that can
                 // be resident (mapped, offloaded, interior tier), capped at the whole body
@@ -1040,9 +1055,12 @@ llama_kv_cache::llama_kv_cache(
                         return (uint32_t) std::max<double>(1.0, std::ceil(lc.resident/100.0*sj_kvarn_n_groups));
                     }
                     uint32_t n_res = 0;
+                    int n_lead = 0; // LLAMA_LSA_RESIDENT_FIRST: leading whole layers take no share of the slot budget
                     for (uint32_t jl = 0; jl < hparams.n_layer(); ++jl) {
                         const bool jedge = sj_kvarn.edge_layers > 0 && (jl < sj_kvarn.edge_layers || jl + sj_kvarn.edge_layers >= sj_kvarn_n_layers_model);
-                        n_res += !jedge && llama_lsa_map_has_layer((int) jl) && model.dev_layer(jl) &&
+                        const bool lead = lc.resident_first > 0 && !hparams.is_recr(jl) && lc.layer_enabled((int) jl) &&
+                            llama_lsa_map_has_layer((int) jl) && n_lead++ < lc.resident_first;
+                        n_res += !jedge && !lead && llama_lsa_map_has_layer((int) jl) && model.dev_layer(jl) &&
                             ggml_backend_dev_type(model.dev_layer(jl)) != GGML_BACKEND_DEVICE_TYPE_CPU;
                     }
                     const double per = lc.resident_mib*1024.0*1024.0/std::max<uint32_t>(1, n_res);
@@ -1075,10 +1093,14 @@ llama_kv_cache::llama_kv_cache(
                 const bool scalar44 = layer_new.sj_kvarn_bits_k == 4 && layer_new.sj_kvarn_bits_v == 4 && layer_new.sj_kvarn_body_type == GGML_TYPE_F32;
                 const bool lowbit = !scalar44 && layer_new.sj_kvarn_body_type != GGML_TYPE_TURBO4_0 &&
                     (layer_new.sj_kvarn_bits_k < 4 || layer_new.sj_kvarn_bits_v < 4) && rb % 16 == 0;
-                if (n_stream != 1 || D != 256 || sj_kvarn.group != 128 || layer_new.sj_kvarn_tier != 0 || (!scalar44 && !lowbit)) {
+                // several streams (one per sequence) share the layer's record pool: the CLOCK slots are keyed by pool
+                // record, every per-stream FA node resolves its own records through its descriptor's group table, and
+                // the per-stream seal refreshes the slots of the records it writes (LLAMA_LSA_MULTI=1, opt-in)
+                const bool streams_ok = n_stream == 1 || llama_lsa_cfg().multi;
+                if (!streams_ok || D != 256 || sj_kvarn.group != 128 || layer_new.sj_kvarn_tier != 0 || (!scalar44 && !lowbit)) {
                     if (!warned) {
                         warned = true;
-                        LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT needs one stream, SJ-KVaRN scalar 4/4 or a low-bit (3/3t, 3/2t) body, D 256, G 128; the body stays on the card\n", __func__);
+                        LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT needs one stream (or LLAMA_LSA_MULTI=1), SJ-KVaRN scalar 4/4 or a low-bit (3/3t, 3/2t) body, D 256, G 128; the body stays on the card\n", __func__);
                     }
                 } else if (lowbit) {
                     auto * dev = model.dev_layer(il);

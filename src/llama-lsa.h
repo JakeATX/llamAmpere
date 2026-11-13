@@ -168,6 +168,9 @@ struct llama_lsa_config {
     // LSA side caches (index, block means, staging ring, pick, owner) per stream and builds the LSA mask per stream, so
     // every slot runs LSA at once. Off: one set, one owner (unchanged). Refused with LLAMA_LSA_PACKED, _J3 and _GATHER.
     bool        multi     = false;
+    // LLAMA_LSA_RESIDENT_FIRST=N (opt-in, MULTI4LSA W4): with LLAMA_LSA_RESIDENT the first N mapped LSA layers keep their
+    // whole body on the card (no slots, no fetch), independent of J3; 0 = off (J3 keeps its own _J3_FIRST rule)
+    int         resident_first = 0;
     std::string layers;             // LLAMA_LSA_LAYERS: comma list of layer ids to sparsify (default: all mapped)
     std::string keep_frac_layers;   // LLAMA_LSA_KEEP_FRAC_LAYERS: "il:frac,il:frac" per-layer override of keep_frac
                                     // (frac of n_kv; 1 or more = that layer stays dense)
