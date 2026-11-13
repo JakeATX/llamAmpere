@@ -1535,26 +1535,32 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
+    // GGML_CUDA_AIT_MMQ_FIT (default 1; 0 = off), AIT2P (code 1) only: 9..16 tokens run a 16-token tile, 17..32 a 32-token tile
+    // (1..8 tokens never reach here; ait_fast takes them). Token columns are independent (exact int32 per slice, the same float
+    // order per token), so the output is the same bits as the wide tile (MERGE2 m2-amp2pid: llama-perplexity log-probs
+    // byte-identical FIT on/off at -ub 12/16/24/32 on the 8 GB file). AIT2/3/4 (code 0) at 9..32 tokens take the mid-T path above;
+    // with GGML_CUDA_AIT_MIDT_SPLIT=0 they fall back to the wide tile (GGML_CUDA_AIT_MMQ), not to FIT.
+    static const bool fit = ait_env_int("GGML_CUDA_AIT_MMQ_FIT", 1) != 0;
+#define AIT_MMQ_GO(...) ait_mmq_launch<__VA_ARGS__>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream)
     if (code == 1) {
-        if (tn == 32) {
-            if (ait_plds() == 2) { ait_mmq_launch<2, 4, 2>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); }
-            else                 { ait_mmq_launch<2, 4, 1, 16>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); }
-        } else {
-            ait_mmq_launch<2, 8, 1, 8>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream);
-        }
+        const int nb = fit && T >= 9 && T <= 16 ? 2 : fit && T >= 9 && T <= 32 ? 4 : tn / 8;
+        if (nb == 8)               { AIT_MMQ_GO(2, 8, 1, 8); }
+        else if (ait_plds() == 2)  { if (nb == 4) { AIT_MMQ_GO(2, 4, 2); }     else { AIT_MMQ_GO(2, 2, 2); } }
+        else                       { if (nb == 4) { AIT_MMQ_GO(2, 4, 1, 16); } else { AIT_MMQ_GO(2, 2, 1, 16); } }
     } else if (tn == 32) {
         switch (k) {
-            case 2:  ait_mmq_launch<2, 4>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); break;
-            case 3:  ait_mmq_launch<3, 4>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); break;
-            default: ait_mmq_launch<4, 4>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); break;
+            case 2:  AIT_MMQ_GO(2, 4); break;
+            case 3:  AIT_MMQ_GO(3, 4); break;
+            default: AIT_MMQ_GO(4, 4); break;
         }
     } else {
         switch (k) {
-            case 2:  ait_mmq_launch<2, 8>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); break;
-            case 3:  ait_mmq_launch<3, 8>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); break;
-            default: ait_mmq_launch<4, 8>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); break;
+            case 2:  AIT_MMQ_GO(2, 8); break;
+            case 3:  AIT_MMQ_GO(3, 8); break;
+            default: AIT_MMQ_GO(4, 8); break;
         }
     }
+#undef AIT_MMQ_GO
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

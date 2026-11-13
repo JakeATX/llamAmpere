@@ -18145,6 +18145,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_ai4(128, 1, 1280, type));
         test_cases.emplace_back(new test_mul_mat_ai4(144, 4, 5120, type));
     }
+    // AI+ dense tile types, 9..32 tokens: the right-sized batch tile (GGML_CUDA_AIT_MMQ_FIT), every width, CUDA vs CPU.
+    for (ggml_type type : {GGML_TYPE_AIT2, GGML_TYPE_AIT2P, GGML_TYPE_AIT3, GGML_TYPE_AIT4}) {
+        for (int n = 9; n <= 32; ++n) {
+            test_cases.emplace_back(new test_mul_mat_ait(type, 1024, n, 1024));
+        }
+        for (int n : {9, 16, 17, 24, 32}) {
+            test_cases.emplace_back(new test_mul_mat_ait(type, 1056, n, 2048));
+        }
+    }
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int64_t n : {1, 9, 512}) {
