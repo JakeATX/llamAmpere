@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <set>
 #include <numeric>
 #include <stdexcept>
@@ -1413,14 +1414,42 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
     };
 
     // redirect elements in stacks to point to new rules
+    //
+    // Each rule is one contiguous array, so a stack pointer belongs to the rule
+    // whose [begin, end) range holds it. Sort the rule starts once and find the
+    // rule with a binary search instead of scanning every rule element for
+    // every stack element. A pointer that is in no rule is left as it is,
+    // same as the old scan.
+    const std::less<const llama_grammar_element *> ptr_less;
+    std::vector<std::pair<const llama_grammar_element *, size_t>> rule_starts;
+    rule_starts.reserve(grammar.rules.size());
+    for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
+        if (!grammar.rules[ir0].empty()) {
+            rule_starts.emplace_back(grammar.rules[ir0].data(), ir0);
+        }
+    }
+    std::sort(rule_starts.begin(), rule_starts.end(),
+        [&](const std::pair<const llama_grammar_element *, size_t> & a,
+            const std::pair<const llama_grammar_element *, size_t> & b) {
+            return ptr_less(a.first, b.first);
+        });
+
     for (size_t is = 0; is < result->stacks.size(); is++) {
         for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
-            for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
-                for (size_t ir1 = 0; ir1 < grammar.rules[ir0].size(); ir1++) {
-                    if (grammar.stacks[is][ie] == &grammar.rules[ir0][ir1]) {
-                        result->stacks[is][ie] =  &result->rules[ir0][ir1];
-                    }
-                }
+            const llama_grammar_element * p = grammar.stacks[is][ie];
+            // first rule start that is greater than p; the one before it is the candidate
+            auto it = std::upper_bound(rule_starts.begin(), rule_starts.end(), p,
+                [&](const llama_grammar_element * v, const std::pair<const llama_grammar_element *, size_t> & e) {
+                    return ptr_less(v, e.first);
+                });
+            if (it == rule_starts.begin()) {
+                continue;
+            }
+            --it;
+            const size_t ir0 = it->second;
+            const llama_grammar_rule & rule = grammar.rules[ir0];
+            if (ptr_less(p, rule.data() + rule.size())) {
+                result->stacks[is][ie] = &result->rules[ir0][p - rule.data()];
             }
         }
     }
