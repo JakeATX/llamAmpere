@@ -2491,6 +2491,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include "../ggml-sjkvarn.h"
 
@@ -4685,12 +4686,23 @@ static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor 
     m2.data      = nullptr;
 }
 
-// [ROWSPLIT] fork, default off. GGML_SJKVARN_ROWSPLIT=1: SJ-KVaRN 4/4 verify widths 9..16 run as chunks of at most 8
+// [ROWSPLIT] fork, default on (Jake 2026-11-13); GGML_SJKVARN_ROWSPLIT=0 (or off/false/no) turns it off. Never on an
+// LSA block-list node (see the guard below). SJ-KVaRN 4/4 verify widths 9..16 run as chunks of at most 8
 // query rows through the n_q <= 8 decode kernel (one launch per chunk) instead of the shared-memory tile kernel, which
 // above 8 rows walks two 8-row query tiles over the whole body. Every query row is independent, so a chunk is a view of
 // Q, mask and dst rows; K, V, body and descriptor are shared.
 static bool ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() {
-    static const bool v = [] { const char * e = getenv("GGML_SJKVARN_ROWSPLIT"); return e != nullptr && strcmp(e, "1") == 0; }();
+    static const bool v = [] {
+        const char * e = getenv("GGML_SJKVARN_ROWSPLIT");
+        if (e == nullptr || *e == 0) {
+            return true;
+        }
+        std::string w(e);
+        for (char & c : w) {
+            c = (char) tolower((unsigned char) c);
+        }
+        return !(w == "0" || w == "off" || w == "false" || w == "no");
+    }();
     return v;
 }
 
@@ -4755,7 +4767,8 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
 
 static void ggml_cuda_fattn_sj_kvarn_rowsplit_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t n_q = dst->src[0]->ne[1];
-    static std::atomic<uint32_t> logged{0}; // proof of route for the gate logs: once per distinct width 9..16
+    // proof of route for the gate logs: once per distinct width 9..16 (the text is kept as the route checks read it)
+    static std::atomic<uint32_t> logged{0};
     const uint32_t bit = 1u << (n_q & 31);
     if (!(logged.fetch_or(bit) & bit)) {
         GGML_LOG_WARN("%s: GGML_SJKVARN_ROWSPLIT=1: SJ-KVaRN 4/4 row split on (%d query rows in chunks of %d)\n",
