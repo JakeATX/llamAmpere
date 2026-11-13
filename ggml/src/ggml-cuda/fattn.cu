@@ -4695,7 +4695,7 @@ static bool ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() {
 }
 
 static constexpr int64_t SJ_KVARN_ROWSPLIT_CHUNK = 8;
-static constexpr int64_t SJ_KVARN_ROWSPLIT_MAX   = 9; // MERGE2 T1: 9 rows PASS (0.849/0.847 x OFF verify), 16 rows 0.957 vs bar 0.95; 10..15 untested
+static constexpr int64_t SJ_KVARN_ROWSPLIT_MAX   = 16; // 3090 Ti verify ON/OFF: 9 rows 0.85, 12 rows 0.89, 16 rows 0.96; 10, 11, 13..15 untested
 
 // rows [r0, r0 + nr) of a flash_attn_ext node: d (with d.src[0] = &q, d.src[3] = &m) writes dst rows r0.. in place
 static void ggml_cuda_fattn_sj_kvarn_rowsplit_view(const ggml_tensor * dst, const ggml_tensor * mask, int64_t r0, int64_t nr,
