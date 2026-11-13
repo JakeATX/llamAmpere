@@ -42,6 +42,11 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+// GGML_CUDA_VRAM_CAP_MIB test switch (ggml-cuda.cu): memory readers that make decisions use these so a capped run
+// sees an N MiB card (total = N, free less the slack above the ceiling). No-op when the switch is off.
+void        ggml_cuda_vram_cap_adjust(int physical_device, size_t * free, size_t * total);
+cudaError_t ggml_cuda_mem_get_info_capped(size_t * free, size_t * total);
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 

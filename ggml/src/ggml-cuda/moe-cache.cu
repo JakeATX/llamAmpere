@@ -1946,7 +1946,7 @@ struct moe_cache_memory_view {
 
 static bool moe_cache_memory_query(moe_cache_device & device, moe_cache_memory_view & view) {
     ggml_cuda_set_device(device.logical);
-    if (!moe_cache_cuda_ok(device, cudaMemGetInfo(&view.free, &view.total), "live memory query", false)) {
+    if (!moe_cache_cuda_ok(device, ggml_cuda_mem_get_info_capped(&view.free, &view.total), "live memory query", false)) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_budget_mu);
@@ -2897,7 +2897,7 @@ static bool moe_cache_prepare_budget(
     ggml_cuda_set_device(device.logical);
     size_t free_memory = 0;
     size_t total_memory = 0;
-    cudaError_t error = cudaMemGetInfo(&free_memory, &total_memory);
+    cudaError_t error = ggml_cuda_mem_get_info_capped(&free_memory, &total_memory);
     if (!moe_cache_cuda_ok(device, error, "memory query", false)) {
         device.dead.store(true);
         return false;
@@ -6069,7 +6069,7 @@ static void * moe_resident_create(void * device, const ggml_moe_cache_tensor_des
     ggml_cuda_set_device(resident->device);
     size_t free = 0, total = 0;
     const size_t card_cap = 23552ull << 20;
-    if (cudaMemGetInfo(&free, &total) != cudaSuccess || total < free ||
+    if (ggml_cuda_mem_get_info_capped(&free, &total) != cudaSuccess || total < free ||
             free < resident->bytes + (1ull << 30) ||
             total - free > card_cap || resident->bytes > card_cap - (total - free)) {
         MOE_CACHE_LOG("[moe-cache] permanent residency refused: VRAM capacity\n");
@@ -10098,7 +10098,7 @@ static void moe_missjoin_retained_prepare(moe_cache_session & session) {
     if (bytes == 256) { return; }
     size_t free_bytes = 0, total_bytes = 0;
     const size_t free_floor = moe_cache_physical_free_floor();
-    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess || free_bytes < bytes || free_bytes - bytes < free_floor) {
+    if (ggml_cuda_mem_get_info_capped(&free_bytes, &total_bytes) != cudaSuccess || free_bytes < bytes || free_bytes - bytes < free_floor) {
         (void) cudaGetLastError();
         MOE_CACHE_LOG("[moe-cache] missjoin retain disabled: physical free floor\n");
         return;
@@ -13859,7 +13859,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         const size_t table_workspace_cap = 64u << 20;
         const size_t physical_free_floor = moe_cache_physical_free_floor();
         moe_cache_memory_view table_memory;
-        const cudaError_t table_query = cudaMemGetInfo(&free_bytes, &total_bytes);
+        const cudaError_t table_query = ggml_cuda_mem_get_info_capped(&free_bytes, &total_bytes);
         const bool budget_query = table_query == cudaSuccess && moe_cache_memory_query(device, table_memory);
         const char * table_failure = table_query != cudaSuccess ? "cuda-memory-query" :
                 !budget_query ? "budget-query" : table_bytes > table_workspace_cap ? "table-cap" :
