@@ -2556,10 +2556,17 @@ static void run_image_rows(llama_model * model, const cache_config & base, bool 
             rows.add_embd({ h.data() + (size_t) i*n_embd, 1, (size_t) n_embd }, pos, 0, false);
         }
         require(llama_process(by_hand->dft, LLAMA_PROCESS_TYPE_DECODE, rows.get()) == 0, "draft decode of the rows built by hand");
+        const auto dft_by_hand = save(*by_hand, 0).dft;
         auto driver = make(true);
         prefill(*driver, 0, q, 0);
         decode_image(*driver, q, nx, ny, 0);
-        require(save(*driver, 0).dft == save(*by_hand, 0).dft, "the draft state equals the rows built by hand");
+        require(save(*driver, 0).dft == dft_by_hand, "the draft state equals the rows built by hand");
+        // the same image in batches of 20, 20 and 8 rows: each later batch pairs its first row with the last row of the
+        // batch before (the carry), also when the image starts at position 0, and keeps the rows before it
+        auto split = make(true);
+        prefill(*split, 0, q, 0);
+        decode_image(*split, q, nx, ny, 0, 20);
+        require(save(*split, 0).dft == dft_by_hand, "an image in several batches gives the rows built by hand");
     }
 
     auto reference = build(true, 0, true);
@@ -2575,8 +2582,9 @@ static void run_image_rows(llama_model * model, const cache_config & base, bool 
         prefill(plain, p_txt, prompt_end, 0);
         require(save(plain, 0).dft.size() == dft_off, "the image rows are off by default");
     }
-    // an image larger than the batch arrives in several batches with one position: the later ones must not trim the earlier rows
-    require(save(*build(true, 20, true), 0).dft.size() == prompt.dft.size(), "an image in several batches keeps all its rows");
+    // an image larger than the batch arrives in several batches with one position: the later ones must not trim the earlier
+    // rows, and the text after it sees the same draft cache
+    require(save(*build(true, 20, true), 0).dft == prompt.dft, "an image in several batches gives the same draft state");
 
     common_speculative_begin(reference->spec, 0, llama_tokens(prompt_end, 0));
     llama_pos pos_ref = prompt_end;

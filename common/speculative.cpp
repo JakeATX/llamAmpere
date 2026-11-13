@@ -1665,6 +1665,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // the draft takes the rows of an image only with LLAMA_MTP_IMAGE_ROWS=1 and an M-RoPE draft (the only one tested). Off by
         // default: the rows add about 30 ms per image to the prompt, which only answers that copy from the image win back
         image_pos.assign(n_seq, -1);
+        image_cont.assign(n_seq, 0);
         {
             const char * env = getenv("LLAMA_MTP_IMAGE_ROWS");
             const enum llama_rope_type rope = llama_model_rope_type(llama_get_model(ctx_dft));
@@ -2188,13 +2189,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     // An image batch has embeddings and no token ids. The draft gets its rows as an embedding batch of the hidden states of the
-    // target (the target keeps one nextn row per token), which carry the image.
+    // target (the target keeps one nextn row per token), which the target computed from the image.
     bool               image_rows = false;
     std::vector<float> img_h;
 
     // [per-seq] position of the image whose rows the last process() call added, -1 after any other batch: an image that
     // arrives in several batches has one position, and the next batch must not trim the rows of the one before
     std::vector<llama_pos> image_pos;
+
+    // [per-seq] this batch is the next part of the image added last (same position, the draft cache ends there): it keeps
+    // the carry and the rows of the part before, also at position 0
+    std::vector<char> image_cont;
 
     bool process(const llama_batch & batch_in) override {
         return process_range(batch_in, 0);
@@ -2239,11 +2244,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // The next part of an image arrives with the first position of the image (the rows share it). Decide it once: such a
+        // batch keeps the carry and the draft rows of the part before.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            image_cont[seq_id] = 0;
+            if (is_image && i_batch_beg[seq_id] >= 0) {
+                const llama_pos pos_min_in = batch_in.pos[i_batch_beg[seq_id]];
+                image_cont[seq_id] = image_pos[seq_id] == pos_min_in &&
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) == pos_min_in;
+            }
+        }
+
         // A sequence that starts again at position 0 has no previous target row. Clear the
         // carry the last request on this slot left behind, so a reused server drafts the
-        // same way as a fresh one (a fresh server starts with zeros).
+        // same way as a fresh one (a fresh server starts with zeros). The next part of an
+        // image at position 0 is not a new start: it keeps the last row of the part before.
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] >= 0 && batch_in.pos[i_batch_beg[seq_id]] == 0) {
+            if (i_batch_beg[seq_id] >= 0 && batch_in.pos[i_batch_beg[seq_id]] == 0 && !image_cont[seq_id]) {
                 std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
             }
         }
@@ -2261,7 +2278,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // draft, so overlap here means an unidentified stale-state producer.
                 // Log it: a silently firing trim leaves no forensic signal.
                 const llama_pos pos_max_pre = llama_memory_seq_pos_max(mem_dft, seq_id);
-                if (is_image && image_pos[seq_id] == pos_min_in && pos_max_pre == pos_min_in) {
+                if (image_cont[seq_id]) {
                     continue; // the next part of the same image
                 }
                 if (pos_max_pre >= pos_min_in) {
