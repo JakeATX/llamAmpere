@@ -7002,6 +7002,12 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 
     seq_rm(seq_id, -1, -1);
 
+    // SJ-KVaRN cells are positions, not k/v_stream rows: the row clear below would write out of bounds.
+    // The seq_rm above reset the stream, as in state_read_sj_kvarn's own failure path.
+    if (sj_kvarn.enabled()) {
+        return;
+    }
+
     // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
     if (sinfo.empty() || sinfo.size() == 0) {
         return;

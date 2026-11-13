@@ -19,6 +19,7 @@
 //   test-sjkvarn-state --device-bytes   CPU device-snapshot packed-byte regression
 //   test-sjkvarn-state --exact-sink   CPU exact checkpoints below and across the sink boundary
 //   test-sjkvarn-state --compact [tmp_dir]   CUDA compact attention on saved and truncated SJ state
+//   test-sjkvarn-state --failed-restore-clear   CPU state_clear after a restore (failed hybrid restore undo)
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -383,6 +384,20 @@ static void exact_sink_case(llama_model * model) {
 }
 
 #include "test-sjkvarn-compact-state.h"
+
+// A failed hybrid restore (e.g. mismatched n_rs_seq in the recurrent part) undoes the attention part with
+// state_clear(seq): on SJ-KVaRN that must release the sequence without per-cell row writes.
+static void failed_restore_clear_case(llama_model * model) {
+    const sj_cfg cfg = { "4/4 failed-restore clear", 4, 4, GGML_TYPE_F32 };
+    llama_context_ptr src(make_ctx(model, cfg)), dst(make_ctx(model, cfg)), ref(make_ctx(model, cfg));
+    require(src && dst && ref, "contexts");
+    decode(src.get(), 0, 2600, 128); // well past the sink + ring rows, so the old row clear wrote out of bounds
+    const auto blob = seq_state(src.get());
+    require(llama_state_seq_set_data(dst.get(), blob.data(), blob.size(), 0) == blob.size(), "restore");
+    cache_of(dst.get())->state_clear(0);
+    require(llama_memory_seq_pos_max(llama_get_memory(dst.get()), 0) == -1, "sequence released");
+    require(same_logits(decode(dst.get(), 0, 1537, 128, 3), decode(ref.get(), 0, 1537, 128, 3)), "cleared cache decodes like a fresh one");
+}
 
 static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_cfg> & mismatches, const char * tmp_dir) {
     llama_context * src = make_ctx(model, c);
@@ -1842,6 +1857,19 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return result;
     }
+    if (argc > 1 && strcmp(argv[1], "--failed-restore-clear") == 0) {
+        int result = 0;
+        try {
+            failed_restore_clear_case(model);
+            printf("OK: failed-restore clear\n");
+        } catch (const std::exception & e) {
+            fprintf(stderr, "failed-restore clear: FAIL: %s\n", e.what());
+            result = 1;
+        }
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
+    }
     if (scratch_views) {
         int result = 0;
         try {
@@ -1934,7 +1962,16 @@ int main(int argc, char ** argv) {
         ++cases_run;
         fails += run_case(model, c.first, c.second, tmp_dir);
     }
-    if (!multi_only) { plain_mixed_control(model); }
+    if (!multi_only) {
+        plain_mixed_control(model);
+        ++cases_run;
+        try {
+            failed_restore_clear_case(model);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "failed-restore clear: FAIL: %s\n", e.what());
+            ++fails;
+        }
+    }
     int fails_multi = 0;
     int multi_run = 0;
     for (const auto & c : { s44, s33t, s32t }) {
