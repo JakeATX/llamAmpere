@@ -1033,6 +1033,16 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         if (llama_lsa_cfg().mode != llama_lsa_config::OFF) {
             LLAMA_LOG_WARN("%s: LSA probe ON (lossy): %s\n", __func__, llama_lsa_describe().c_str());
             llama_lsa_log_epoch_bump(); // one-shot graph-build lines fire again for this context
+            // the SJ-KVaRN row split (CUDA, default on) stays off while LSA is on; an explicit GGML_SJKVARN_ROWSPLIT wins.
+            // Set before any graph runs: the CUDA backend reads the variable once, at its first verify node.
+            if (getenv("GGML_SJKVARN_ROWSPLIT") == nullptr) {
+#ifdef _WIN32
+                _putenv_s("GGML_SJKVARN_ROWSPLIT", "0");
+#else
+                setenv("GGML_SJKVARN_ROWSPLIT", "0", 0);
+#endif
+                LLAMA_LOG_INFO("%s: LSA on: SJ-KVaRN row split off (GGML_SJKVARN_ROWSPLIT=0)\n", __func__);
+            }
         }
 
         // create a list of the set_n_threads functions in the backends

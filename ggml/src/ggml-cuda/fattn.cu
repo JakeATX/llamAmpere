@@ -4686,8 +4686,8 @@ static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor 
     m2.data      = nullptr;
 }
 
-// [ROWSPLIT] fork, default on (Jake 2026-11-13); GGML_SJKVARN_ROWSPLIT=0 (or off/false/no) turns it off. Never on an
-// LSA block-list node (see the guard below). SJ-KVaRN 4/4 verify widths 9..16 run as chunks of at most 8
+// [ROWSPLIT] fork, default on (Jake 2026-11-13); GGML_SJKVARN_ROWSPLIT=0 (or off/false/no) turns it off. Off while
+// LSA is on (see the guard below). SJ-KVaRN 4/4 verify widths 9..16 run as chunks of at most 8
 // query rows through the n_q <= 8 decode kernel (one launch per chunk) instead of the shared-memory tile kernel, which
 // above 8 rows walks two 8-row query tiles over the whole body. Every query row is independent, so a chunk is a view of
 // Q, mask and dst rows; K, V, body and descriptor are shared.
@@ -4736,7 +4736,9 @@ static void ggml_cuda_fattn_sj_kvarn_rowsplit_view(const ggml_tensor * dst, cons
 // expansion, which ggml_cuda_fattn_mask_packed_native then selects for this node)
 static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
     if (!ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() || dst->src[6] == nullptr || ggml_cuda_fattn_sj_kvarn_is_lowbits(dst) ||
-            ggml_flash_attn_ext_get_lsa_block(dst) > 0) { // LSA guard: a block-list node keeps its per-node selection bits whole
+            ggml_flash_attn_ext_get_lsa_block(dst) > 0 || dst->src[7] != nullptr || dst->src[8] != nullptr || dst->src[9] != nullptr) {
+        // LSA guard: block-list / value-key / selected-row / LSE nodes keep their per-node inputs whole. With LSA on, the
+        // context also sets GGML_SJKVARN_ROWSPLIT=0 when it is unset (llama-context.cpp), so no LSA node splits by default.
         return false;
     }
     const ggml_tensor * Q    = dst->src[0];
