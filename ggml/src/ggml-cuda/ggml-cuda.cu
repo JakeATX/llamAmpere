@@ -464,6 +464,8 @@ static int ggml_cuda_parse_id(const char * devName) {
 // With C below the card total, an allocation past the N MiB room still succeeds physically (up to total - C more): the
 // harness must judge fit by card-wide use <= C (e.g. a watchdog at C), not only by allocation failures.
 // Fit testing only: SM count, memory speed, L2 and the PCIe link stay the big card's. Single-process, all cards capped.
+// Fit rule: a "fits on an N MiB card" claim reads (card-wide peak use - ballast) <= N minus the desktop share. The
+// health check passing alone is not a fit claim (bl-vramcap: c2 peak 21,118 - ballast 11,588 = c3 peak 9,530 MiB).
 static int64_t g_ggml_cuda_vram_cap_mib = -1;   // -1 = not read yet, 0 = off
 static size_t  g_ggml_cuda_vram_ballast[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  g_ggml_cuda_vram_slack[GGML_CUDA_MAX_DEVICES]   = {}; // card total - C
