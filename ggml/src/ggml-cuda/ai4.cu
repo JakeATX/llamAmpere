@@ -2694,14 +2694,14 @@ bool ggml_cuda_aif25_supported(const ggml_tensor * op) {
         ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op);
 }
 
-// [PP27] Exact prompt path for AIF25_U. GGML_CUDA_AIF25_MMQ = token tile of magic2::mmq (0 = off, the default; 32, 64
-// or 128), used at N >= GGML_CUDA_AIF25_MMQ_MIN tokens (default 64); GGML_CUDA_AIF25_MMQ_STRIPS = 16-row strips per
-// block (1, the default, or 2; tile 128 takes 1). The output is bit-identical to magic2::mmv, which decodes the weights
-// once per 8 tokens. GGML_CUDA_AIF25_MMQ_CHECK=1 (debug; synchronizes, so run it with CUDA graphs off) also runs mmv
-// into a scratch buffer and aborts on the first call whose outputs differ in any bit (logs calls 1-4 and every power of
-// two; =2 logs every call).
+// [PP27] Exact prompt path for AIF25_U. GGML_CUDA_AIF25_MMQ = token tile of magic2::mmq (64, the default; 32 or 128;
+// 0 = off, the old mmv loop), used at N >= GGML_CUDA_AIF25_MMQ_MIN tokens (default 64); GGML_CUDA_AIF25_MMQ_STRIPS =
+// 16-row strips per block (1, the default, or 2; tile 128 takes 1). The output is bit-identical to magic2::mmv, which
+// decodes the weights once per 8 tokens. GGML_CUDA_AIF25_MMQ_CHECK=1 (debug; synchronizes, so run it with CUDA graphs
+// off) also runs mmv into a scratch buffer and aborts on the first call whose outputs differ in any bit (logs calls 1-4
+// and every power of two; =2 logs every call).
 static int aif25_mmq_tile() {
-    static const int v = ai4_env_int("GGML_CUDA_AIF25_MMQ", nullptr, 0);
+    static const int v = ai4_env_int("GGML_CUDA_AIF25_MMQ", nullptr, 64);
     return v;
 }
 
