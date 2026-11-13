@@ -457,6 +457,60 @@ static int ggml_cuda_parse_id(const char * devName) {
 }
 #endif // defined(GGML_USE_HIP)
 
+// GGML_CUDA_VRAM_CAP_MIB=N (test switch, default off): make each physical card act like an N MiB card. At start a
+// ballast block of (card total - N) MiB is taken with cudaMalloc and never freed, so every later allocation (weights,
+// KV, compute buffers, pools, cuBLAS, other processes' share) competes for the room it would have on an N MiB card,
+// and the reported total is N. Fit testing only: SM count, memory speed and the PCIe link stay the big card's.
+static int64_t g_ggml_cuda_vram_cap_mib = -1;   // -1 = not read yet, 0 = off
+static size_t  g_ggml_cuda_vram_ballast[GGML_CUDA_MAX_DEVICES] = {};
+
+static int64_t ggml_cuda_vram_cap_mib() {
+    if (g_ggml_cuda_vram_cap_mib < 0) {
+        const char * e = getenv("GGML_CUDA_VRAM_CAP_MIB");
+        const long long v = e ? atoll(e) : 0;
+        g_ggml_cuda_vram_cap_mib = v > 0 ? (int64_t) v : 0;
+    }
+    return g_ggml_cuda_vram_cap_mib;
+}
+
+static void ggml_cuda_vram_cap_apply(const ggml_cuda_device_info & info) {
+    const int64_t cap_mib = ggml_cuda_vram_cap_mib();
+    if (cap_mib <= 0) {
+        return;
+    }
+    for (int id = 0; id < info.physical_device_count; ++id) {
+        CUDA_CHECK(cudaSetDevice(id));
+        size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        const size_t cap = (size_t) cap_mib * 1024 * 1024;
+        if (cap >= total) {
+            GGML_LOG_WARN("%s: GGML_CUDA_VRAM_CAP_MIB=%lld is not below device %d total %zu MiB: no cap\n",
+                          __func__, (long long) cap_mib, id, total / (1024 * 1024));
+            continue;
+        }
+        const size_t ballast = total - cap;
+        void * ptr = nullptr;
+        const cudaError_t err = ballast <= free ? cudaMalloc(&ptr, ballast) : cudaErrorMemoryAllocation;
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            GGML_LOG_ERROR("%s: GGML_CUDA_VRAM_CAP_MIB=%lld: device %d cannot take a %zu MiB ballast (free %zu of %zu MiB)\n",
+                           __func__, (long long) cap_mib, id, ballast / (1024 * 1024), free / (1024 * 1024),
+                           total / (1024 * 1024));
+            GGML_ABORT("VRAM cap ballast failed");
+        }
+        g_ggml_cuda_vram_ballast[id] = ballast;
+        GGML_LOG_INFO("%s: VRAM cap: device %d acts as a %lld MiB card (ballast %zu MiB held, %zu MiB free after it)\n",
+                      __func__, id, (long long) cap_mib, ballast / (1024 * 1024), (free - ballast) / (1024 * 1024));
+    }
+}
+
+// with a cap the reported total is the cap (free already excludes the ballast)
+static void ggml_cuda_vram_cap_total(int physical_device, size_t * total) {
+    if (physical_device >= 0 && physical_device < GGML_CUDA_MAX_DEVICES && g_ggml_cuda_vram_ballast[physical_device] > 0) {
+        *total -= std::min(*total, g_ggml_cuda_vram_ballast[physical_device]);
+    }
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -638,6 +692,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
             }
         }
     }
+
+    ggml_cuda_vram_cap_apply(info);
 
     return info;
 }
@@ -1501,6 +1557,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         // clear the error
         (void)cudaGetLastError();
         GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+        if (ggml_cuda_vram_cap_mib() > 0) {
+            GGML_LOG_ERROR("%s: this config does not fit the GGML_CUDA_VRAM_CAP_MIB=%lld MiB card\n", __func__, (long long) ggml_cuda_vram_cap_mib());
+        }
         return nullptr;
     }
 
@@ -12984,6 +13043,7 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     ggml_cuda_set_device(device);
 
     CUDA_CHECK(cudaMemGetInfo(free, total));
+    ggml_cuda_vram_cap_total(ggml_cuda_get_physical_device(device), total);
 
     // virtual devices sharing one physical GPU share its memory pool; split it between them
     const int share_count = ggml_cuda_physical_device_share_count(device);
@@ -13152,6 +13212,8 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
         }
     }
 #endif // defined(__linux__) && !defined(GGML_USE_HIP)
+
+    ggml_cuda_vram_cap_total(ggml_cuda_get_physical_device(ctx->device), total);
 
     // virtual devices sharing one physical GPU share its memory pool; split it between them
     const int share_count = ggml_cuda_physical_device_share_count(ctx->device);
