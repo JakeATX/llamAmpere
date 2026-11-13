@@ -75,6 +75,10 @@
 //   GGML_CUDA_AI5_REF=1        AIT5_U takes the rate-k reference path (reconstruct + SGEMM) instead of its rate-5 IMMA
 //                             kernels (an A/B check of those kernels)
 //   GGML_CUDA_AI23_FAST=1      rates 2 and 3 run their IMMA kernels (default: rate-k reference path)
+//   GGML_CUDA_AI5_MIDT_SPLIT=1|n|-1  AIT5_U dense GEMM at 9..64 tokens on Ampere: token tile 16/32/64 that just covers N,
+//                             and K split over blockIdx.z with fixed-order fp32 partials (default 0 = off)
+//                             1 = splits from the SM count, n >= 2 = n splits (both clamped to [1, min(8, K/512)]),
+//                             -1 = token tile only (no split)
 static int ai4_env_int(const char * name, const char * /*unused*/, int def) {
     const char * e = getenv(name);
     return e ? atoi(e) : def;
@@ -705,6 +709,43 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
     }
 }
 
+// GGML_CUDA_AI5_MIDT_SPLIT: K splits for the AIT5_U dense GEMM at 9..64 tokens; 0 = keep the default launch.
+// One CTA covers 128 rows, so M = 1024 uses 8 CTAs and M = 5120 uses 40 on an 82-SM card; the split fills the idle SMs.
+// The count depends on the SM count: results are fixed per card model, not across models.
+static int ai5_midt_splits(int M, int N, int K, int sms) {
+    static const int v = ai4_env_int("GGML_CUDA_AI5_MIDT_SPLIT", nullptr, 0);
+    if (!v || !sms || N <= 8 || N > 64 || N >= ai4_bn128_min()) {
+        return 0;
+    }
+    const int ctas = (M/16 + ai4k::GEMM_SLABS - 1)/ai4k::GEMM_SLABS;
+    const int want = v < 0 ? 1 : v > 1 ? v : sms/ctas;
+    // at most one split per four 128-column chunks; ceil-sized slices can leave a tail split empty (K = 4224, 8 splits):
+    // the kernel then writes a zero plane
+    return std::max(1, std::min(want, std::min(8, K/512)));
+}
+
+// splits > 1: Y is the partial buffer [splits][N][M]; the caller reduces it in split order.
+template <int BN, int XSH>
+static void ai5_midt_launch(const uint8_t * W, const int8_t * q, const float * s, float * Y,
+                            int M, int N, int K, int splits, cudaStream_t stream) {
+    constexpr int L = ai4k::LAY_AIT5_U;
+    constexpr int NTB = BN <= 16 ? 2 : 4;
+    if (splits > 1) {
+        ai23_launch_gemm<BN, 3, NTB, L, XSH, false, 1, ai4k::GEMM_SLABS, false, 1, false, false, false, false, true>(
+            W, q, s, Y, M, M, N, K, stream, ai4k::idmap{}, 0, nullptr, splits);
+    } else {
+        ai23_launch_gemm<BN, 3, NTB, L, XSH>(W, q, s, Y, M, M, N, K, stream);
+    }
+}
+
+template <int XSH>
+static void ai5_midt_width(const uint8_t * W, const int8_t * q, const float * s, float * Y,
+                           int M, int N, int K, int splits, cudaStream_t stream) {
+    if (N <= 16) { ai5_midt_launch<16, XSH>(W, q, s, Y, M, N, K, splits, stream); }
+    else if (N <= 32) { ai5_midt_launch<32, XSH>(W, q, s, Y, M, N, K, splits, stream); }
+    else { ai5_midt_launch<64, XSH>(W, q, s, Y, M, N, K, splits, stream); }
+}
+
 // ai4-kern LAY of an AI+ unit type; xsh = 1 unless K % 256 != 0.
 static int ai4_lay_of(ggml_type t) {
     switch (t) {
@@ -853,6 +894,25 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             ai4k::launch_prefill_v2<ai4k::LAY_AIT4_U, 0>(W, q.get(), s.get(), decoded.get(), Y, M, M, N, K, stream);
         }
         return;
+    }
+    if (t == GGML_TYPE_AIT5_U) {
+        // Off (0) falls through to the default launch below. On vs off differs by fp32 summation order only when
+        // splits > 1; repeats are bitwise equal (no atomics, the reduce adds the planes in split order).
+        const int midt = ai5_midt_splits(M, N, K, ai4_ampere_sms(ctx));
+        if (midt > 0) {
+            ggml_cuda_pool_alloc<float> partial(ctx.pool());
+            float * out = Y;
+            if (midt > 1) {
+                out = partial.alloc((size_t) M*N*midt);
+            }
+            if (xsh) { ai5_midt_width<1>(W, q.get(), s.get(), out, M, N, K, midt, stream); }
+            else     { ai5_midt_width<0>(W, q.get(), s.get(), out, M, N, K, midt, stream); }
+            if (midt > 1) {
+                ai4k::split_k_reduce<<<((int64_t) M*N + 255)/256, 256, 0, stream>>>(out, Y, (int64_t) M*N, midt);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            return;
+        }
     }
     switch (ai4_lay_of(t)) {
 #define AI4_MM_U(L) \

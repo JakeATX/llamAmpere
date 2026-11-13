@@ -1328,7 +1328,9 @@ static __device__ __forceinline__ void ait_group_mq(uint4 (&buf)[4][2], const in
     }
 }
 
-template <int KB, int NB, int PC = 0, int NC = 16>
+// SPL (GGML_CUDA_AIT_MIDT_SPLIT, 9..32 tokens): split-K. blockIdx.z owns the K slices [S z / nz, S (z + 1) / nz) and writes its
+// fp32 partial to plane z of Y ([nz][T][M]); k_ait_mmq_red adds the planes in z order. nz = 1 writes Y itself.
+template <int KB, int NB, int PC = 0, int NC = 16, bool SPL = false>
 static __global__ void __launch_bounds__(256, 1) k_ait_mmq(const char * __restrict__ W, const int8_t * __restrict__ X,
         const float * __restrict__ SA, float * __restrict__ Y, const int M, const int K, const int T) {
     using namespace aitk;
@@ -1345,6 +1347,14 @@ static __global__ void __launch_bounds__(256, 1) k_ait_mmq(const char * __restri
     }
     const int n0 = blockIdx.x * TN, rt = blockIdx.y * 8 + wid;
     const bool active = rt < M / 32;
+    int ks0 = 0, ks1 = S;
+    float * Yo = Y;
+    if constexpr (SPL) {
+        const int nz = (int) gridDim.z, z = (int) blockIdx.z;
+        ks0 = (int) ((int64_t) S * z / nz);
+        ks1 = (int) ((int64_t) S * (z + 1) / nz);
+        Yo = Y + (int64_t) z * T * M;
+    }
 
     // staging with cp.async (no registers held across the compute): element e = tid + 256 i -> group G = e / (2 TN),
     // token e % (2 TN) / 2, 16-byte half e % 2; tokens past T are zero-filled (src size 0)
@@ -1359,13 +1369,13 @@ static __global__ void __launch_bounds__(256, 1) k_ait_mmq(const char * __restri
         }
         asm volatile("cp.async.commit_group;");
     };
-    issue_slice(0, 0);
+    issue_slice(ks0, ks0 & 1);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
 
     const int wq = (lane * BQ) >> 5, r = (lane * BQ) & 31;
     const int off[2] = { 16 * (wq % BQ), 16 * ((wq + 1) % BQ) };
-    const char * gp = W + (int64_t) (active ? rt : 0) * S * CS;
+    const char * gp = W + ((int64_t) (active ? rt : 0) * S + ks0) * CS;
     uint4 buf[4][2];
     if (active) {
 #pragma unroll
@@ -1384,8 +1394,8 @@ static __global__ void __launch_bounds__(256, 1) k_ait_mmq(const char * __restri
         }
     }
 #pragma unroll 1
-    for (int ks = 0; ks < S; ++ks) {
-        const bool more = ks + 1 < S;
+    for (int ks = ks0; ks < ks1; ++ks) {
+        const bool more = ks + 1 < ks1;
         if (more) {
             issue_slice(ks + 1, (ks + 1) & 1);
         }
@@ -1438,8 +1448,8 @@ static __global__ void __launch_bounds__(256, 1) k_ait_mmq(const char * __restri
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
             const int m0 = rt * 32 + 16 * u + g, m1 = m0 + 8;
-            if (na < T)     { Y[(int64_t) na * M + m0] = cf[u][nb][0];       Y[(int64_t) na * M + m1] = cf[u][nb][2]; }
-            if (na + 1 < T) { Y[(int64_t) (na + 1) * M + m0] = cf[u][nb][1]; Y[(int64_t) (na + 1) * M + m1] = cf[u][nb][3]; }
+            if (na < T)     { Yo[(int64_t) na * M + m0] = cf[u][nb][0];       Yo[(int64_t) na * M + m1] = cf[u][nb][2]; }
+            if (na + 1 < T) { Yo[(int64_t) (na + 1) * M + m0] = cf[u][nb][1]; Yo[(int64_t) (na + 1) * M + m1] = cf[u][nb][3]; }
         }
     }
 }
@@ -1452,6 +1462,38 @@ static void ait_mmq_launch(const char * W, const int8_t * xq, const float * sa, 
     CUDA_SET_SHARED_MEMORY_LIMIT((k_ait_mmq<KB, NB, PC, NC>), SMEM);
     const dim3 grid((unsigned) ((T + TN - 1) / TN), (unsigned) ((M / 32 + 7) / 8)), block(256);
     k_ait_mmq<KB, NB, PC, NC><<<grid, block, SMEM, stream>>>(W, xq, sa, Y, M, K, T);
+}
+
+// split-K reduce: Y[i] = P[0][i] + P[1][i] + ... in plane order (one fixed order per element, no atomics)
+static __global__ void k_ait_mmq_red(const float * __restrict__ P, float * __restrict__ Y, const int64_t n, const int sp) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float a = P[i];
+    for (int z = 1; z < sp; ++z) {
+        a += P[(int64_t) z * n + i];
+    }
+    Y[i] = a;
+}
+
+// mid-T launch (9..32 tokens, AIT2/3/4): token tile 8 NB >= T (one token tile) and sp K splits on blockIdx.z
+template <int KB, int NB>
+static void ait_mmq_launch_midt(ggml_backend_cuda_context & ctx, const char * W, const int8_t * xq, const float * sa, float * Y,
+        int M, int K, int T, int sp, cudaStream_t stream) {
+    constexpr int TN = 8 * NB, SMEM = 2 * 16 * TN * 32;
+    GGML_ASSERT(T <= TN && sp >= 1 && sp <= K / 512);
+    CUDA_SET_SHARED_MEMORY_LIMIT((k_ait_mmq<KB, NB, 0, 16, true>), SMEM);
+    const unsigned gy = (unsigned) ((M / 32 + 7) / 8);
+    const dim3 block(256);
+    if (sp == 1) {
+        k_ait_mmq<KB, NB, 0, 16, true><<<dim3(1, gy, 1), block, SMEM, stream>>>(W, xq, sa, Y, M, K, T);
+        return;
+    }
+    const int64_t n = (int64_t) T * M;
+    ggml_cuda_pool_alloc<float> part(ctx.pool(ggml_cuda_get_device()), (size_t) (sp * n));
+    k_ait_mmq<KB, NB, 0, 16, true><<<dim3(1, gy, (unsigned) sp), block, SMEM, stream>>>(W, xq, sa, part.get(), M, K, T);
+    k_ait_mmq_red<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(part.get(), Y, n, sp);
 }
 
 // GGML_CUDA_AIT_MMQ = token tile of the batch kernel: 64 (default; mmq1 2026-10-23: 512 tokens ait4 729 vs 1052 us at 32, ait2 651 vs 880) or 32; 0 = the reference path (reconstruct + SGEMM)
@@ -1469,6 +1511,30 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     ggml_cuda_pool_alloc<float>  sa(ctx.pool(id), (size_t) T * S);
     k_ait_actq_t<<<(unsigned) (T * S), 64, 0, stream>>>(X, W, xq.get(), sa.get(), K, k, (int) T);
     const char * w = (const char *) W;
+    // GGML_CUDA_AIT_MIDT_SPLIT (default 0 = off): 9..32 tokens of AIT2/3/4 run on a token tile that just covers T, with K
+    // split over CTAs when the row tiles alone leave SMs idle (ffn_down: 20 CTAs on 82 SMs). 1 = splits from the SM count,
+    // n >= 2 = n splits; both are clamped to [1, min(8, S/2)]. Differs from off by float summation order only when splits > 1;
+    // repeats are bitwise equal.
+    static const int midt = ait_env_int("GGML_CUDA_AIT_MIDT_SPLIT", 0);
+    if (midt > 0 && code == 0 && T >= 9 && T <= 32) {
+        const int ctas = (M / 32 + 7) / 8;
+        int sp = midt > 1 ? midt : ggml_cuda_info().devices[id].nsm / ctas;
+        sp = std::max(1, std::min(sp, std::min(8, S / 2)));
+        const int nb = T <= 16 ? 2 : T <= 24 ? 3 : 4, t = (int) T;
+        switch (k * 8 + nb) {
+            case 2 * 8 + 2: ait_mmq_launch_midt<2, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 2 * 8 + 3: ait_mmq_launch_midt<2, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 2 * 8 + 4: ait_mmq_launch_midt<2, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 8 + 2: ait_mmq_launch_midt<3, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 8 + 3: ait_mmq_launch_midt<3, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 8 + 4: ait_mmq_launch_midt<3, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 4 * 8 + 2: ait_mmq_launch_midt<4, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 4 * 8 + 3: ait_mmq_launch_midt<4, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            default:        ait_mmq_launch_midt<4, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     if (code == 1) {
         if (tn == 32) {
             if (ait_plds() == 2) { ait_mmq_launch<2, 4, 2>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream); }

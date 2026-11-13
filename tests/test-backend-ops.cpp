@@ -23041,6 +23041,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // GGML_TEST_AIV2_PERF=aitmid: AIT3/AIT4 at the multi-user verify widths (GGML_CUDA_AIT_MIDT_SPLIT A/B), 8 and 33 as controls
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "aitmid") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
+                for (int64_t n : { 8, 9, 16, 22, 24, 32, 33 }) {
+                    for (ggml_type t : { GGML_TYPE_AIT3, GGML_TYPE_AIT4 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                }
+            }
+            return test_cases;
+        }
+        // GGML_TEST_AIV2_PERF=ai5mid: AIT5_U at the 27B dense shapes and multi-user verify widths (GGML_CUDA_AI5_MIDT_SPLIT A/B),
+        // 8 and 65 as controls
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "ai5mid") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 1024, 5120 }, { 5120, 5120 }, { 6144, 5120 }, { 10240, 5120 }, { 12288, 5120 }, { 5120, 6144 } }) {
+                for (int64_t n : { 8, 9, 16, 22, 32, 33, 64, 65 }) {
+                    test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, GGML_TYPE_AIT5_U));
+                }
+            }
+            return test_cases;
+        }
         // GGML_TEST_AIV2_PERF=ait: only AIT2/3/4 with adjacent controls (AIT2_U, AIT4_U, EXL3 2/4 with glue)
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "ait") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
@@ -24624,7 +24645,8 @@ static void usage(char ** argv) {
 // [AIV2] GGML_TEST_AIT_DIR=<dir>: AI+ tile layout cross-check. <dir>/ait{2,3,4}.bin are packed 1024 x 2048 tensors and
 // ait{k}.w their decoded rotated weights from the Python reference (AIV2/sim/aitref.py dump). Checks (1) host decoder
 // (ggml-ait.h) == Python decode, (2) the GPU mul_mat == host reference with the same activation emulation (rotate, x col
-// scale, int8 round trip per (token, 512 slice)) at N = 1-8, 33, 512, with 128-row slabs (8 slabs).
+// scale, int8 round trip per (token, 512 slice)) at N = 1-9, 16, 17, 22, 24, 25, 32, 33, 512 (shape up/down: N <= 32), with 128-row
+// slabs (8 slabs). N <= 32 also repeats the compute (GGML_TEST_AIT_REPEAT, default 8) and needs bitwise equal outputs.
 static int run_ait_check(const char * dir) {
     setenv("GGML_CUDA_AIT_SLAB_MIB", "1", 1);
     ggml_backend_load_all();
@@ -24691,8 +24713,8 @@ static int run_ait_check(const char * dir) {
         fails += !dec_ok;
         printf("%s decode host vs python: max rel %.3g %s\n", nm.c_str(), maxrel, dec_ok ? "OK" : "FAIL");
         // (2) GPU mul_mat vs host reference
-        for (int64_t N : {1, 2, 3, 4, 5, 6, 7, 8, 33, 512}) {
-            if (shape && N > 8) {
+        for (int64_t N : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 22, 24, 25, 32, 33, 512}) {
+            if (shape && N > 32) {
                 continue;
             }
             ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -24718,7 +24740,7 @@ static int run_ait_check(const char * dir) {
                 continue;
             }
             ggml_backend_tensor_get(y, yg.data(), 0, yg.size() * 4);
-            if (N <= 8) {
+            if (N <= 32) {
                 const char * repeat_env = getenv("GGML_TEST_AIT_REPEAT");
                 const int repeats = repeat_env ? std::max(1, std::min(64, atoi(repeat_env))) : 8;
                 std::vector<float> again(yg.size());
@@ -24784,6 +24806,76 @@ static int run_ait_check(const char * dir) {
     return fails ? 1 : 0;
 }
 
+// GGML_TEST_AI5_MIDT_OUT=<dir>: AIT5_U dense mul_mat with fixed-seed weights and activations at the 27B shapes, N around the
+// 9..64 window of GGML_CUDA_AI5_MIDT_SPLIT. Each case is computed GGML_TEST_AIT_REPEAT times (default 8) and must repeat
+// bitwise; the first output goes to <dir>/ait5u_m<M>_k<K>_n<N>.f32, so two runs (env off / on) can be compared with cmp.
+static int run_ai5_midt_check(const char * dir) {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) { fprintf(stderr, "ai5mid: no GPU backend\n"); return 1; }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    const char * repeat_env = getenv("GGML_TEST_AIT_REPEAT");
+    const int repeats = repeat_env ? std::max(1, std::min(64, atoi(repeat_env))) : 8;
+    int fails = 0;
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 1024, 5120 }, { 5120, 5120 }, { 6144, 5120 }, { 10240, 5120 }, { 12288, 5120 }, { 5120, 6144 }, { 1024, 4224 }, { 640, 2560 }, { 48, 1024 } }) {
+        const int64_t M = mk.first, K = mk.second;
+        for (int64_t N : { 1, 8, 9, 15, 16, 17, 22, 32, 33, 47, 64, 65, 128 }) {
+            ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_AIT5_U, K, M);
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+            ggml_tensor * y = ggml_mul_mat(ctx, a, b);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, y);
+            if (!ggml_backend_supports_op(be, y)) {
+                printf("ai5mid M=%lld K=%lld N=%lld: not supported FAIL\n", (long long) M, (long long) K, (long long) N);
+                ++fails;
+                ggml_free(ctx);
+                continue;
+            }
+            ggml_backend_buffer_t bb = ggml_backend_alloc_ctx_tensors(ctx, be);
+            // one unit = 16 rows x 128 K: [fp16 row scales d[16]][160 x 8-byte trellis tiles] (1312 B)
+            std::mt19937 rng(4321 + (uint32_t) (M + 7 * K + 131 * N));
+            std::uniform_real_distribution<float> ud(0.002f, 0.02f), ux(-1.0f, 1.0f);
+            std::vector<uint8_t> wb(ggml_nbytes(a));
+            GGML_ASSERT(wb.size() == (size_t) (M / 16) * (K / 128) * 1312);
+            for (size_t u = 0; u < wb.size() / 1312; ++u) {
+                uint8_t * blk = wb.data() + u * 1312;
+                for (int i = 0; i < 16; ++i) { ((ggml_fp16_t *) blk)[i] = ggml_fp32_to_fp16(ud(rng)); }
+                for (int i = 0; i < 320; ++i) { ((uint32_t *) (blk + 32))[i] = (uint32_t) rng(); }
+            }
+            std::vector<float> x((size_t) (N * K));
+            for (auto & v : x) { v = ux(rng); }
+            ggml_backend_tensor_set(a, wb.data(), 0, wb.size());
+            ggml_backend_tensor_set(b, x.data(), 0, x.size() * sizeof(float));
+            std::vector<float> yg((size_t) (N * M)), again((size_t) (N * M));
+            bool ok = true, identical = true;
+            for (int repeat = 0; repeat < repeats && ok; ++repeat) {
+                std::vector<float> & dst = repeat ? again : yg;
+                std::fill(dst.begin(), dst.end(), std::numeric_limits<float>::quiet_NaN());
+                ggml_backend_tensor_set(y, dst.data(), 0, dst.size() * sizeof(float));
+                ok = ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(y, dst.data(), 0, dst.size() * sizeof(float));
+                if (repeat) { identical &= memcmp(yg.data(), again.data(), yg.size() * sizeof(float)) == 0; }
+            }
+            bool finite = true;
+            for (float v : yg) { finite &= std::isfinite(v); }
+            const std::string file = std::string(dir) + "/ait5u_m" + std::to_string(M) + "_k" + std::to_string(K) + "_n" + std::to_string(N) + ".f32";
+            std::ofstream dump(file, std::ios::binary);
+            const bool wrote = (bool) dump.write((const char *) yg.data(), yg.size() * sizeof(float));
+            const bool pass = ok && identical && finite && wrote;
+            fails += !pass;
+            printf("ai5mid M=%lld K=%lld N=%lld: compute %s, %d repeats %s, finite %s, dump %s\n", (long long) M, (long long) K, (long long) N,
+                   ok ? "OK" : "FAIL", repeats, identical ? "IDENTICAL" : "FAIL", finite ? "OK" : "FAIL", wrote ? "OK" : "FAIL");
+            ggml_backend_buffer_free(bb);
+            ggml_free(ctx);
+        }
+    }
+    ggml_backend_free(be);
+    printf("ai5mid: %s (%d fails)\n", fails ? "FAIL" : "PASS", fails);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     // the expert-bank MUL_MAT_ID cases pass skipped (-1 / out-of-stack) ids without loading a bank model; the CUDA
     // backend zeroes their outputs only when told to (or when a hot-bank model is loaded)
@@ -24794,6 +24886,9 @@ int main(int argc, char ** argv) {
 #endif
     if (const char * ad = getenv("GGML_TEST_AIT_DIR")) {
         return run_ait_check(ad);
+    }
+    if (const char * od = getenv("GGML_TEST_AI5_MIDT_OUT")) {
+        return run_ai5_midt_check(od);
     }
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
