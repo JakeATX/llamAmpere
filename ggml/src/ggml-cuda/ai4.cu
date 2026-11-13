@@ -76,7 +76,7 @@
 //                             kernels (an A/B check of those kernels)
 //   GGML_CUDA_AI23_FAST=1      rates 2 and 3 run their IMMA kernels (default: rate-k reference path)
 //   GGML_CUDA_AI5_MIDT_SPLIT=1|n|-1  AIT5_U dense GEMM at 9..64 tokens on Ampere: token tile 16/32/64 that just covers N,
-//                             and K split over blockIdx.z with fixed-order fp32 partials (default 0 = off)
+//                             and K split over blockIdx.z with fixed-order fp32 partials (default 1 = on; 0 = off)
 //                             1 = splits from the SM count, n >= 2 = n splits (both clamped to [1, min(8, K/512)]),
 //                             -1 = token tile only (no split)
 static int ai4_env_int(const char * name, const char * /*unused*/, int def) {
@@ -709,11 +709,11 @@ static void ai4_mm_kernels(const uint8_t * W, const int8_t * q, const float * s,
     }
 }
 
-// GGML_CUDA_AI5_MIDT_SPLIT: K splits for the AIT5_U dense GEMM at 9..64 tokens; 0 = keep the default launch.
+// GGML_CUDA_AI5_MIDT_SPLIT: K splits for the AIT5_U dense GEMM at 9..64 tokens (default 1); 0 = the old launch.
 // One CTA covers 128 rows, so M = 1024 uses 8 CTAs and M = 5120 uses 40 on an 82-SM card; the split fills the idle SMs.
 // The count depends on the SM count: results are fixed per card model, not across models.
 static int ai5_midt_splits(int M, int N, int K, int sms) {
-    static const int v = ai4_env_int("GGML_CUDA_AI5_MIDT_SPLIT", nullptr, 0);
+    static const int v = ai4_env_int("GGML_CUDA_AI5_MIDT_SPLIT", nullptr, 1);
     if (!v || !sms || N <= 8 || N > 64 || N >= ai4_bn128_min()) {
         return 0;
     }
