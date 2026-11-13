@@ -4638,6 +4638,27 @@ static bool ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ggml_backend_cuda_context & c
 // One-bit KQ masks are read by the MMA loaders. Other routes expand the same values into the pool.
 bool ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(const ggml_tensor * dst); // fattn-sjkvarn-lowbits.cu
 
+// [#195] GGML_SJKVARN_DIRECT_Q5G6 (fattn-sjkvarn-stream.cuh) covers the 4/4 stream decode kernel only. Say so once when
+// it is set and an SJ-KVaRN decode node takes another route (low-bit 3/3, 3/2t, ... caches, trellis bodies, the tile
+// loader), instead of silently doing nothing.
+static bool ggml_cuda_fattn_sj_kvarn_q5g6_set() {
+    static const bool set = [] { const char * e = getenv("GGML_SJKVARN_DIRECT_Q5G6"); return e != nullptr && *e != '\0' && strcmp(e, "0") != 0; }();
+    return set;
+}
+
+static void ggml_cuda_fattn_sj_kvarn_q5g6_refuse(const ggml_tensor * dst, const char * route) {
+    if (!ggml_cuda_fattn_sj_kvarn_q5g6_set() || dst->src[0]->ne[1] > 8) {
+        return;
+    }
+    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+    if (!warned.test_and_set()) {
+        const int bits = ggml_get_op_params_i32(dst, 5);
+        GGML_LOG_WARN("%s: GGML_SJKVARN_DIRECT_Q5G6 is set but this SJ-KVaRN cache (K%d/V%d, body %s) decodes through %s, "
+                      "which it does not cover (4/4 stream kernel only): compact Q5/G6 tile OFF\n",
+                      __func__, bits >> 8, bits & 0xff, ggml_type_name((ggml_type) ggml_get_op_params_i32(dst, 7)), route);
+    }
+}
+
 static bool ggml_cuda_fattn_mask_is_packed(const ggml_tensor * dst) {
     return dst->src[3] != nullptr && dst->src[3]->type == GGML_TYPE_I32;
 }
@@ -4841,8 +4862,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // 4/4 token-axis trellis4 body (I16 under an explicit nonzero GGML_SJKVARN_TRELLIS_TOKENS; the low-bit token-axis default does not apply to 4/4): the low-bit tile loader
         if (ggml_get_op_params_i32(dst,5) != ((4 << 8) | 4) || (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_sj_kvarn::trellis3::tokens4())) {
             ggml_cuda_lsa_page_prepare(ctx, dst); // LLAMA_LSA_RESIDENT record pages only (no-op otherwise)
+            ggml_cuda_fattn_sj_kvarn_q5g6_refuse(dst, "the low-bit kernels");
             ggml_cuda_flash_attn_sj_kvarn_lowbits(ctx,dst);
             return;
+        }
+        if (ggml_cuda_fattn_sj_kvarn_q5g6_set() && !ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(dst)) {
+            ggml_cuda_fattn_sj_kvarn_q5g6_refuse(dst, "the 4/4 tile loader");
         }
         // fork: compact only the main model's sparse scalar4/4 verify rows; default dispatch stays unchanged.
         if (ggml_cuda_flash_attn_ext_sj_kvarn_compact(ctx, dst, ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2<256, 256>)) {
