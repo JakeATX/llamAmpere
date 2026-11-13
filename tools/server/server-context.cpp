@@ -2257,6 +2257,21 @@ private:
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
+        // copy mode default: auto (-1) is on (tail 8) only in the measured shape, one slot with an MTP drafter;
+        // LLAMA_SPEC_COPY=0 restores the old default (off). An explicit --spec-copy-tail N is kept as given.
+        if (params.speculative.copy_tail < 0) {
+            const auto & types = params.speculative.types;
+            const bool mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
+                             std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
+            const bool kill = common_speculative_copy_params::env_int("LLAMA_SPEC_COPY", 1, 0, 1) == 0;
+            params.speculative.copy_tail = (!kill && mtp && params.n_parallel == 1) ? 8 : 0;
+            SRV_INF("copy mode: %s (auto%s)\n", params.speculative.copy_tail > 0 ? "on, tail = 8" : "off",
+                    kill ? ", LLAMA_SPEC_COPY=0" : !mtp ? ", no MTP drafter" : params.n_parallel != 1 ? ", n_parallel > 1" : "");
+        } else {
+            SRV_INF("copy mode: %s (--spec-copy-tail %d)\n", params.speculative.copy_tail > 0 ? "on" : "off",
+                    params.speculative.copy_tail);
+        }
+
 #if !defined(_WIN32)
         // copy mode: a wide verify batch keeps its pre-round recurrent plane, so a block miss needs no checkpoint
         // (LLAMA_RS_KEEP_BASE=0 in the environment keeps the per-round checkpoint)

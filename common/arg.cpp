@@ -5011,8 +5011,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-copy-tail"}, "N",
         string_format("copy mode: append up to N tokens looked up in the context after the model drafter's block, "
             "verified by exact match; scheduled only while a copy is running; capped at n_rs_seq on hybrid models "
-            "(0 = off, max %d, default: %d)",
-            (int) common_speculative_copy_params::TAIL_MAX, params.speculative.copy_tail),
+            "(0 = off, max %d, default: auto = 8 with one slot and an MTP drafter, else 0; LLAMA_SPEC_COPY=0 turns auto off)",
+            (int) common_speculative_copy_params::TAIL_MAX),
         [](common_params & params, int value) {
             if (value < 0 || value > common_speculative_copy_params::TAIL_MAX) {
                 throw std::invalid_argument(string_format("error: --spec-copy-tail must be in [0, %d]",
