@@ -23206,6 +23206,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // [AIV2] GGML_TEST_AIV2_PERF=1: only the AI+ gate-2 rival list (IQ2_XXS..IQ4_XS, today's AI+, EXL3 2/3/4 with and
     // without the Hadamard glue) at the 27B FFN shapes 17408 x 5120 and 5120 x 17408, widths 1 / 4 / 5 / 8
     if (getenv("GGML_TEST_AIV2_PERF") != nullptr) {
+        // [MULTI4] GGML_TEST_AIV2_PERF=multi4: 27B decode shapes at 1 / 2 / 4 streams x 6 rows
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "multi4") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 },
+                                                                     { 6144, 5120 }, { 5120, 6144 } }) {
+                for (int64_t n : { 6, 12, 24 }) {
+                    for (ggml_type t : { GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U }) {
+                        test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, t));
+                    }
+                    for (ggml_type t : { GGML_TYPE_AIT4, GGML_TYPE_AIT3 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+                        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                    }
+                }
+            }
+            return test_cases;
+        }
         // Unit formats at Flash-Next expert shapes, including the 640-wide H128 tail.
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "unit") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{640, 2560}, {2560, 640}}) {
