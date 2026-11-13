@@ -7740,9 +7740,11 @@ ggml_tensor * llm_graph_context::build_attn(
         }
         cur_all = cur_all ? ggml_concat(ctx0, cur_all, cur, 1) : cur;
     }
-    inp   = inp_all;
+    inp    = inp_all;
     lsa_ub = nullptr;
-    v = v_all;
+    if (lsa_n_units > 1) {
+        v = v_all; // build_attn_turbo_v_out below: the cache view (one pass keeps whatever the LSA path left in v)
+    }
     ggml_tensor * cur = cur_all;
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
