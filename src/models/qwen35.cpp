@@ -291,7 +291,8 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
                 const int protect = lsa.j3_prev ? GGML_LSA_PREFETCH_PROTECT_PREV : 0;
                 const int ahead = lsa.j3_lead ? lsa.j3_ahead : 3; // LLAMA_LSA_J3_LEAD: RESIDENT_FIRST layers ahead
                 // nearest target first: the side stream runs the passes in issue order
-                if (ahead > 1 && i + 1 < n_map && i + 1 >= first) {
+                // LLAMA_LSA_J3_LEAD with J3_A1 0 (its default): no top-up at all (it would queue behind the far passes)
+                if (ahead > 1 && (!lsa.j3_lead || lsa.j3_a1 > 0) && i + 1 < n_map && i + 1 >= first) {
                     const int t = j3_mapped[i + 1];
                     const bool prev_here = lsa.j3_prev && i + 1 < ahead; // no look-ahead source for this target
                     build_attn_lsa_j3(j3_inp, lsa.j3_a1 > 0 ? stale_query(inpL, t) : nullptr, t, lsa.j3_a1,

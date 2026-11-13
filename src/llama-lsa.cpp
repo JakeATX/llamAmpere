@@ -222,6 +222,11 @@ const llama_lsa_config & llama_lsa_cfg() {
                 } else {
                     c.j3_first = c.resident_first; // the leading N layers have no source N ahead of them
                     c.j3_ahead = c.resident_first;
+                    // the side stream is one FIFO: an ahead-1 top-up queues behind the far passes and its join stalls
+                    // the target, so under LEAD it is off unless LLAMA_LSA_J3_A1 is set (review B-S3)
+                    if (getenv("LLAMA_LSA_J3_A1") == nullptr) {
+                        c.j3_a1 = 0;
+                    }
                 }
             }
         }
@@ -319,13 +324,14 @@ static uint32_t g_lsa_comp_ep = 0;
 
 // the one-owner guard fired: every sequence that printed "lsa comp on" gets its OFF line (same format), so a restart at
 // position 0 prints "lsa comp on" again. No sequence is on (compensation not in use, or one slot): prints nothing.
-static void lsa_comp_note_all_off(const char * why) {
+// only >= 0 (LLAMA_LSA_MULTI=1): just that sequence, the owner of the stream whose guard fired; the others keep theirs
+static void lsa_comp_note_all_off(const char * why, int32_t only = -1) {
     std::lock_guard<std::mutex> lock(g_lsa_comp_mtx);
     if (g_lsa_log_epoch.load(std::memory_order_relaxed) != g_lsa_comp_ep) {
         return; // a new context: llama_lsa_comp_note starts again
     }
     for (auto & it : g_lsa_comp_st) {
-        if (it.second) {
+        if (it.second && (only < 0 || it.first == only)) {
             it.second = false;
             LLAMA_LOG_WARN("llama_lsa_comp_note: lsa comp OFF mode=%d seq=%d: %s; compensation off until this sequence "
                     "restarts at position 0\n", 2, (int) it.first, why);
@@ -397,11 +403,11 @@ std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type bo
         // the gather path is not part of this build: plain f16 / q8_0 run the masked LSA node
         return "LLAMA_LSA_GATHER=1 is not available in this build (plain f16/q8_0 LSA runs the masked path; unset it)";
     }
-    if (c.multi && (!sj || c.packed || (c.j3 && !c.j3_lead))) {
+    if (c.multi && (!sj || c.packed || (c.j3 && !c.j3_lead) || c.spec_recall)) {
         // per-stream side caches are wired for the SJ-KVaRN masked path only; the packed mask (LLAMA_LSA_PACKED,
         // LLAMA_LSA_BLKLIST) and the plain J3 prefetch still assume one stream (LLAMA_LSA_J3_LEAD runs per stream)
         return !sj ? "LLAMA_LSA_MULTI=1 needs an SJ-KVaRN cache (plain caches keep one stream of LSA caches)" :
-                     "LLAMA_LSA_MULTI=1 does not combine with LLAMA_LSA_PACKED / LLAMA_LSA_BLKLIST, or LLAMA_LSA_J3 without LLAMA_LSA_J3_LEAD";
+                     "LLAMA_LSA_MULTI=1 does not combine with LLAMA_LSA_PACKED / LLAMA_LSA_BLKLIST, LLAMA_LSA_SPEC_RECALL, or LLAMA_LSA_J3 without LLAMA_LSA_J3_LEAD";
     }
     if (sj && c.fa_sparse) {
         return "LLAMA_LSA_FA_SPARSE is for plain K/V (an SJ-KVaRN node ignores the sparse bound)";
@@ -727,6 +733,18 @@ int32_t llama_lsa_stream() {
     return g_lsa_stream;
 }
 
+int32_t llama_lsa_stream_of(int32_t seq) {
+    return llama_lsa_cfg().multi && seq >= 0 && seq < LLAMA_LSA_MAX_STREAMS ? seq : -1;
+}
+
+std::string llama_lsa_check_streams(uint32_t n_seq_max) {
+    if (llama_lsa_cfg().multi && n_seq_max > (uint32_t) LLAMA_LSA_MAX_STREAMS) {
+        return "LLAMA_LSA_MULTI=1 serves at most " + std::to_string(LLAMA_LSA_MAX_STREAMS) + " sequences (n_seq_max " +
+               std::to_string(n_seq_max) + "): a sequence past that would share sequence 0's LSA caches";
+    }
+    return {};
+}
+
 void llama_lsa_set_stream(int32_t strm) {
     if (!llama_lsa_cfg().multi) {
         return; // one set of caches: always stream 0
@@ -992,7 +1010,8 @@ void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed, bool is_reserve) {
                 "sequence until one restarts at position 0 (LSA on SJ-KVaRN serves one sequence at a time)\n", __func__,
                 (int) own, mixed ? "mixed, first sequence" : "sequence", (int) seq);
     }
-    lsa_comp_note_all_off("the LSA caches hold another sequence (one-owner guard)");
+    // LLAMA_LSA_MULTI=1: the stream is its sequence's (stream = sequence id); only that sequence's caches went stale
+    lsa_comp_note_all_off("the LSA caches hold another sequence (one-owner guard)", llama_lsa_cfg().multi ? g_lsa_stream : -1);
     own = -1;
 }
 

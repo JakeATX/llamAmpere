@@ -1019,7 +1019,9 @@ static void qsa_clock_written_range(ggml_backend_buffer_t buffer, qsa_clock_tens
         static const bool no_refresh = getenv("GGML_CUDA_LSA_RESIDENT_TEST_NO_REFRESH") != nullptr;
         if (no_refresh) return;
     }
-    if (e->pf_pending) {
+    if (e->pf_done) {
+        // unconditional: a stream-side join (lsa_pf_join) clears pf_pending after only queueing its wait, so the host
+        // write must wait for the last recorded pass itself (an event never recorded returns at once)
         CUDA_CHECK(cudaEventSynchronize(e->pf_done));
         e->pf_pending = false;
         for (bool & issued : e->j3_issued) issued = false;
@@ -1259,6 +1261,14 @@ static __global__ void qsa_strip_resolve(ggml_cuda_qsa_clock_map m, const int32_
         c[1] += picked;
         c[2] += 1;
         c[3] += over;
+        // LLAMA_LSA_J3_LEAD (PROTECT_PREV): the own picks since the last strip prefetch pass of this layer (every stream's
+        // resolve of the step) keep their slots in the next pass: ctl 16 = epoch of the first such resolve, 24 = picked
+        if (m.ctl[7] == 0) {
+            m.ctl[7] = 1;
+            m.ctl[16] = epoch;
+            m.ctl[24] = 0;
+        }
+        m.ctl[24] += picked;
         if (m.log_every && c[2] % m.log_every == 0) {
             printf("LSA RESIDENT: layer %d resolves=%llu picked=%llu fetched=%llu over_slots=%llu slots=%u strip_bytes=%u "
                 "prefetched=%u pf_passes=%u pf_hits=%u pf_dropped=%u\n", m.layer, c[2], c[1], c[0], c[3], m.slots,
@@ -1272,6 +1282,11 @@ static __global__ void qsa_strip_copy_misses(ggml_cuda_qsa_clock_map m, int coun
     for (uint32_t i = blockIdx.x; i < m.ctl[count]; i += gridDim.x) {
         qsa_strip_copy(m, m.miss_page[i], m.miss_slot[i], blockIdx.y);
     }
+}
+
+void ggml_cuda_qsa_strip_join(ggml_backend_cuda_context & ctx, const ggml_tensor * body) {
+    auto * e = body ? qsa_clock_entry(body) : nullptr;
+    if (e && e->map.cells == GGML_LSA_STRIP_CELLS) lsa_pf_join(ctx.stream(), e);
 }
 
 bool ggml_cuda_qsa_strip_body(const ggml_tensor * body) {
@@ -1753,10 +1768,15 @@ void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     if (e->map.cells == GGML_LSA_STRIP_CELLS) {
         // LLAMA_LSA_J3_LEAD: the predicted strips of the target, joined by its ggml_cuda_qsa_strip_prepare
         const int n = int(e->map.records)*(GGML_LSA_PAGE_CELLS/GGML_LSA_STRIP_CELLS);
+        // qsa_strip_resolve leaves its copy count in ctl 2: start the miss queue empty
+        CUDA_CHECK(cudaMemsetAsync(e->map.ctl + 2, 0, sizeof(uint32_t), side));
         lsa_j3_strip_mark<<<(n + 127)/128, 128, 0, side>>>(e->map, e->j3_desc[src], e->j3_units[src], nunits, nrows, unit, cap);
         CUDA_CHECK(cudaGetLastError());
-        lsa_page_assign<<<1, 1024, 0, side>>>(e->map, cap, 1);
+        // PROTECT_PREV: pf 2 keeps the slots of the own picks since the last pass (ctl 16/24, while they fit the pool)
+        const bool protect = (flags & GGML_LSA_PREFETCH_PROTECT_PREV) != 0;
+        lsa_page_assign<<<1, 1024, 0, side>>>(e->map, cap, protect ? 2 : 1);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemsetAsync(e->map.ctl + 7, 0, sizeof(uint32_t), side)); // the next own resolve opens a new window
         qsa_strip_copy_misses<<<dim3(lsa_j3_copy_blocks(), e->map.heads), 128, 0, side>>>(e->map, 4);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(e->pf_done, side));

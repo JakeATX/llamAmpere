@@ -10597,6 +10597,9 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
                 why = "edge tier: " + why;
             }
         }
+        if (why.empty()) {
+            why = llama_lsa_check_streams(params.n_seq_max); // LLAMA_LSA_MULTI: stream = sequence id < 64
+        }
         if (!why.empty()) {
             LLAMA_LOG_ERROR("%s: LSA refused for this KV cache: %s\n", __func__, why.c_str());
             return nullptr;

@@ -101,3 +101,6 @@ const int32_t * ggml_cuda_lsa_page_table(const ggml_tensor * body, uint32_t * re
 // resolve the strips of a live-record list (sj_live_record_list, entries g | strip mask << 24) and copy the misses
 void ggml_cuda_qsa_strip_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * body, const int32_t * desc,
         const int32_t * list);
+// LLAMA_LSA_J3_LEAD: wait (on the compute stream) for an in-flight strip prefetch of this body; every FA on a strip body
+// calls it, whatever walk it takes, since the kernel reads the slot table
+void ggml_cuda_qsa_strip_join(ggml_backend_cuda_context & ctx, const ggml_tensor * body);

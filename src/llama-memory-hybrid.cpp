@@ -231,7 +231,7 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
         const llama_pos pmax = mem_attn->seq_pos_max(seq_id);
         if (pmax >= 0) {
             // LLAMA_LSA_MULTI=1: the side caches of this sequence's stream (no-op scope otherwise)
-            llama_lsa_stream_scope lsa_scope(seq_id < LLAMA_LSA_MAX_STREAMS ? seq_id : 0);
+            llama_lsa_stream_scope lsa_scope(std::max<int32_t>(0, llama_lsa_stream_of(seq_id))); // n_seq_max > 64 refused
             llama_lsa_idx_state_write(io, (int64_t) pmax + 1);
         }
     }
@@ -263,7 +263,8 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         mem_recr->state_read(io, seq_id, flags);
         state_read_sj_exact(io, seq_id, flags);
         if (read_attn && io.n_left() >= 2*sizeof(uint32_t) && mem_attn->is_sj_kvarn()) {
-            llama_lsa_stream_scope lsa_scope(seq_id >= 0 && seq_id < LLAMA_LSA_MAX_STREAMS ? seq_id : 0); // LLAMA_LSA_MULTI=1
+            // LLAMA_LSA_MULTI=1 (n_seq_max > 64 refused); seq_id -1 (whole state) keeps stream 0 as before
+            llama_lsa_stream_scope lsa_scope(std::max<int32_t>(0, llama_lsa_stream_of(seq_id)));
             llama_lsa_idx_state_read(io); // LSA index cache suffix (see state_write)
         } else if (read_attn && mem_attn->is_sj_kvarn() && seq_id >= 0 && mem_attn->seq_pos_max(seq_id) >= 0) {
             llama_lsa_warn_restore_dense("the saved state has no LSA index suffix (saved with LSA off or an older build)", 0, 0);

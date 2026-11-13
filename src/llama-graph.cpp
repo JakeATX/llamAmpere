@@ -4557,7 +4557,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
                 return -1;
             }
         }
-        return seq >= 0 && seq < LLAMA_LSA_MAX_STREAMS ? seq : -1;
+        return llama_lsa_stream_of(seq);
     };
     bool lsa_multi_ok = lsa_multi;
     for (int64_t s = 0; lsa_multi_ok && s < lsa_ns; ++s) {
@@ -4658,7 +4658,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
             inp->lsa_streams.push_back(std::move(x));
         }
     } else if (lsa_cfg.mode != llama_lsa_config::OFF && !cparams.training && lsa_sj_ok &&
-            (cparams.kv_unified || ubatch.n_seqs_unq == 1 || lsa_multi_ok)) {
+            (lsa_multi ? lsa_multi_ok : (cparams.kv_unified || ubatch.n_seqs_unq == 1))) {
+        // LLAMA_LSA_MULTI: LSA inputs only when every chunk is one in-range sequence (never stream 0's caches for another)
         inp->lsa_stream = lsa_multi_ok ? lsa_chunk_seq(0) : 0;
         lsa_make_inputs(inp.get(), mctx_cur->get_n_kv(), ubatch.n_tokens, ubatch);
     }

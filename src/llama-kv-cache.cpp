@@ -1028,8 +1028,19 @@ llama_kv_cache::llama_kv_cache(
                 }
                 lsa_first_whole = !hparams.is_recr(il) && lc.layer_enabled((int) il) && before < lc.resident_first;
                 if (lsa_first_whole) {
-                    LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT_FIRST: layer %u is mapped LSA layer %d of the first %d: whole body on the card\n",
-                        __func__, il, before, lc.resident_first);
+                    LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT_FIRST: layer %u is mapped LSA layer %d of the first %d: whole body on the card (%.1f MiB)\n",
+                        __func__, il, before, lc.resident_first, (double) sj_kvarn_n_groups*rb*hparams.n_head_kv(il)/(1024.0*1024.0));
+                }
+                static bool said_all = false;
+                int n_mapped = 0;
+                for (uint32_t jl = 0; jl < hparams.n_layer(); ++jl) {
+                    n_mapped += !hparams.is_recr(jl) && lc.layer_enabled((int) jl) && llama_lsa_map_has_layer((int) jl);
+                }
+                if (!said_all && lc.resident_first >= n_mapped) {
+                    said_all = true;
+                    LLAMA_LOG_WARN("%s: LLAMA_LSA_RESIDENT_FIRST=%d covers all %d mapped LSA layers: every body stays whole on the card "
+                        "(dense KV, no host offload)%s\n", __func__, lc.resident_first, n_mapped,
+                        lc.j3 && lc.j3_lead ? "; LLAMA_LSA_J3_LEAD issues no prefetch" : "");
                 }
             }
             if (llama_lsa_cfg().j3 && llama_lsa_cfg().mode != llama_lsa_config::OFF && llama_lsa_map_has_layer((int32_t) il)) {
@@ -2314,7 +2325,19 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     }
 
     if (!sc_info.empty() || do_shift) {
-        lsa_idx_invalidate(do_shift ? "K shift" : "stream copy"); // K changes outside the graph: LSA index cache rebuilds on the next graph
+        // K changes outside the graph: LSA index cache rebuilds on the next graph. LLAMA_LSA_MULTI=1 (stream = sequence):
+        // only the shifted streams and the copy destinations, so one user's shift leaves the others' LSA on
+        if (llama_lsa_cfg().multi && n_stream > 1) {
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                const bool hit = (do_shift && v_cells[s].get_has_shift()) ||
+                        std::find(sc_info.sdst.begin(), sc_info.sdst.end(), s) != sc_info.sdst.end();
+                if (hit && llama_lsa_stream_of((int32_t) s) >= 0) {
+                    lsa_idx_invalidate(do_shift ? "K shift" : "stream copy", (int32_t) s);
+                }
+            }
+        } else {
+            lsa_idx_invalidate(do_shift ? "K shift" : "stream copy");
+        }
     }
 
     bool updated = false;
@@ -5621,7 +5644,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     scratch_cancel();
     // restored K bypasses the graph: LSA index cache rebuilds on the next graph. LLAMA_LSA_MULTI=1: only the restored
     // sequence's stream (its caches are keyed by the sequence id; the other slots keep theirs)
-    lsa_idx_invalidate("state_read", llama_lsa_cfg().multi && seq_id >= 0 && seq_id < LLAMA_LSA_MAX_STREAMS ? (int32_t) seq_id : -1);
+    lsa_idx_invalidate("state_read", llama_lsa_stream_of(seq_id)); // -1 (every stream) unless LLAMA_LSA_MULTI
     if (sj_kvarn.enabled() && !other) {
         // see the matching refusal in state_read_sinfo (block KV streaming is refused at construction anyway)
         if (kv_stream_runtime.runtime != nullptr) {

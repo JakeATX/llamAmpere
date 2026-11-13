@@ -92,12 +92,22 @@ static int exercise(const std::string & dir, const std::string & mode) {
         assert(!llama_lsa_check_cache(0, 0, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
         return 0;
     }
+    if (mode == "spec") {
+        setenv("LLAMA_LSA_SPEC_RECALL", "1", 1); // whole-ubatch stale queries: refused under multi
+        assert(llama_lsa_cfg().multi && llama_lsa_cfg().spec_recall);
+        assert(!llama_lsa_check_cache(4, 4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
+        return 0;
+    }
     if (mode == "accept") {
         setenv("LLAMA_LSA_RESIDENT_FIRST", "6", 1);
         assert(llama_lsa_cfg().multi);
         assert(llama_lsa_cfg().resident_first == 6);
         assert(llama_lsa_describe().find(" multi=1 resident_first=6") != std::string::npos);
         assert(llama_lsa_check_cache(4, 4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
+        // stream = sequence id, 0..63; n_seq_max 65 is refused at startup (a sequence past 63 would share stream 0)
+        assert(llama_lsa_stream_of(0) == 0 && llama_lsa_stream_of(63) == 63);
+        assert(llama_lsa_stream_of(64) == -1 && llama_lsa_stream_of(-1) == -1);
+        assert(llama_lsa_check_streams(64).empty() && !llama_lsa_check_streams(65).empty());
         return 0;
     }
     if (mode == "lead" || mode == "lead_off") {
@@ -112,11 +122,11 @@ static int exercise(const std::string & dir, const std::string & mode) {
         const auto & c = llama_lsa_cfg();
         assert(c.j3 && c.multi);
         if (mode == "lead") {
-            assert(c.j3_lead && c.j3_first == 6 && c.j3_ahead == 6);
+            assert(c.j3_lead && c.j3_first == 6 && c.j3_ahead == 6 && c.j3_a1 == 0); // top-up off by default under LEAD
             assert(llama_lsa_describe().find(" j3_first=6 j3_lead=1 j3_ahead=6") != std::string::npos);
             assert(llama_lsa_check_cache(4, 4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
         } else {
-            assert(!c.j3_lead && c.j3_first == 3 && c.j3_ahead == 3);
+            assert(!c.j3_lead && c.j3_first == 3 && c.j3_ahead == 3 && c.j3_a1 == 150);
             assert(llama_lsa_describe().find("j3_lead") == std::string::npos);
             assert(!llama_lsa_check_cache(4, 4, GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16).empty());
         }
@@ -133,6 +143,7 @@ static int exercise(const std::string & dir, const std::string & mode) {
     if (mode == "off") {
         assert(!llama_lsa_cfg().multi && llama_lsa_cfg().resident_first == 0);
         assert(llama_lsa_describe().find("multi=") == std::string::npos);
+        assert(llama_lsa_stream_of(5) == -1 && llama_lsa_check_streams(65).empty()); // MULTI off: no limit
         llama_lsa_set_stream(3);
         assert(llama_lsa_stream() == 0); // ignored: one set of caches
         llama_lsa_idx_slot s0 = get_in(0, k);
@@ -210,7 +221,7 @@ int main(int argc, char ** argv) {
     char dir[] = "/tmp/test-lsa-multi-XXXXXX";
     assert(mkdtemp(dir));
     make_map(std::string(dir) + "/a.gguf");
-    for (const char * mode : { "multi", "off", "refuse", "accept", "lead", "lead_off" }) {
+    for (const char * mode : { "multi", "off", "refuse", "accept", "lead", "lead_off", "spec" }) {
         const pid_t pid = fork();
         assert(pid >= 0);
         if (pid == 0) { execl(argv[0], argv[0], dir, mode, (char *) nullptr); _exit(127); }
@@ -223,6 +234,6 @@ int main(int argc, char ** argv) {
     }
     assert(remove((std::string(dir) + "/a.gguf").c_str()) == 0);
     assert(rmdir(dir) == 0);
-    puts("LSA multi: per-stream index caches, commit, invalidate, owner guard, state suffix, forget, off path, refusals, J3 lead PASS");
+    puts("LSA multi: per-stream index caches, commit, invalidate, owner guard, state suffix, forget, off path, refusals, stream limit, J3 lead PASS");
     return 0;
 }

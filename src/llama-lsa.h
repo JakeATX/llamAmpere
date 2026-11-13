@@ -377,6 +377,11 @@ void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why, bool 
 constexpr int32_t LLAMA_LSA_MAX_STREAMS = 64;
 int32_t llama_lsa_stream();
 void    llama_lsa_set_stream(int32_t strm); // no-op unless multi; strm outside [0, LLAMA_LSA_MAX_STREAMS) aborts
+// the one rule "stream = sequence id" under LLAMA_LSA_MULTI=1: SJ-KVaRN runs non-unified (seq_to_stream[s] = s) when
+// n_seq_max > 1 (llama-context forces kv_unified off). -1 when MULTI is off or seq is outside [0, MAX_STREAMS)
+int32_t llama_lsa_stream_of(int32_t seq);
+// startup check of the sequence count: empty when served (MULTI off, or n_seq_max <= LLAMA_LSA_MAX_STREAMS)
+std::string llama_lsa_check_streams(uint32_t n_seq_max);
 struct llama_lsa_stream_scope {
     int32_t prev;
     explicit llama_lsa_stream_scope(int32_t strm) : prev(llama_lsa_stream()) { llama_lsa_set_stream(strm); }

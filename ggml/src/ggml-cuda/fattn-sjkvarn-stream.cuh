@@ -1502,6 +1502,9 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     // LLAMA_LSA_RESIDENT body (16-cell strip slots): take the live-strip walk, so the strips about to be read are known
     // and resolved into slots before the kernel (a strip without a slot reads the pinned master)
     const bool strip_res = !turbo4_body && ggml_cuda_qsa_strip_body(dst->src[5]);
+    if (strip_res) {
+        ggml_cuda_qsa_strip_join(ctx, dst->src[5]); // LLAMA_LSA_J3_LEAD: before any read of the slot table (no-op otherwise)
+    }
     if (!turbo4_body && (live_env || lsa_blk > 0 || strip_res) && ggml_cuda_fattn_sj_live_records == nullptr) {
         const ggml_tensor * mask = dst->src[3];
         const int64_t positions = ggml_get_op_params_i32(dst, 6);
