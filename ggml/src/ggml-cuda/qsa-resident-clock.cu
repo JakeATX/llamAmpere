@@ -412,6 +412,8 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
         if (l && sscanf(l, "l%d", &il) == 1) m.layer = il;
         const char * every = getenv("GGML_CUDA_LSA_RESIDENT_LOG");
         m.log_every = every ? uint32_t(std::max(0, atoi(every))) : 0;
+        const char * prot = getenv("GGML_CUDA_LSA_RESIDENT_PROTECT");
+        m.protect = prot ? uint32_t(std::max(1, atoi(prot))) : 1;
     }
     if (!m.slots) {
         return GGML_STATUS_FAILED;
@@ -1178,14 +1180,35 @@ void ggml_cuda_qsa_clock_prepare(ggml_backend_cuda_context & ctx, const ggml_ten
     CUDA_CHECK(cudaGetLastError());
 }
 
+// CLOCK victim rule of the LSA strip resolve and the record-page assign. protect 1 (default): any slot this resolve did not
+// stamp, as before. protect n > 1: an empty slot, or one no resolve of the last n stamped. The map is shared by the streams
+// of a layer and every stream's resolve is a new epoch, so n = active streams keeps the strips the other streams picked
+// this round. A miss that finds no victim is read from the master, so residency never changes results.
+static __device__ __forceinline__ bool lsa_victim_ok(const ggml_cuda_qsa_clock_map & m, uint32_t slot, uint32_t epoch) {
+    return m.protect <= 1 ? m.stamp[slot] != epoch : m.tags[slot] < 0 || epoch - m.stamp[slot] >= m.protect;
+}
+
+// protect > 1: true (block-uniform) when a full CLOCK lap ended with no slot past the protect window, so the scan
+// stops instead of running its 3-lap bound; the misses left read the master. Call after the loop's __syncthreads.
+static __device__ __forceinline__ bool lsa_lap_dry(const ggml_cuda_qsa_clock_map & m, uint32_t scanned, uint32_t lanes,
+        uint32_t & cand) {
+    if (m.protect <= 1 || scanned/m.slots == (scanned - lanes)/m.slots) return false;
+    const bool dry = cand == 0;
+    __syncthreads();
+    if (threadIdx.x == 0) cand = 0;
+    __syncthreads();
+    return dry;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // LLAMA_LSA_RESIDENT (opt-in): CLOCK over 16-cell strip slots, driven by the live-record list of the SJ-KVaRN stream
 // kernel (the strips it is about to read). Hits are stamped with this resolve's epoch (never evicted by it), misses
 // take CLOCK victims and are copied from the pinned master. Unlike the QSA resolve it never traps: picked strips past
 // the free slots keep table entry -1 and the kernel reads them from the master over the bus (counted, ctl 14).
 static __global__ void qsa_strip_resolve(ggml_cuda_qsa_clock_map m, const int32_t * desc, const int32_t * list) {
-    __shared__ uint32_t epoch, assigned, hand, nmiss, picked;
+    __shared__ uint32_t epoch, assigned, hand, nmiss, picked, cand;
     if (threadIdx.x == 0) {
+        cand = 0;
         epoch = m.ctl[0] + 1;
         m.ctl[0] = epoch;
         m.ctl[2] = 0;
@@ -1232,7 +1255,9 @@ static __global__ void qsa_strip_resolve(ggml_cuda_qsa_clock_map m, const int32_
     uint32_t scanned = 0;
     while (assigned < nmiss && scanned < 3*m.slots + lanes) {
         const uint32_t slot = (hand + scanned + threadIdx.x)%m.slots;
-        if (threadIdx.x < lanes && m.stamp[slot] != epoch && atomicExch(m.ref + slot, 0) == 0) {
+        const bool ok = threadIdx.x < lanes && lsa_victim_ok(m, slot, epoch);
+        if (ok && m.protect > 1) cand = 1;
+        if (ok && atomicExch(m.ref + slot, 0) == 0) {
             const uint32_t item = atomicAdd(&assigned, 1u);
             if (item < nmiss) {
                 const int old = m.tags[slot];
@@ -1247,6 +1272,7 @@ static __global__ void qsa_strip_resolve(ggml_cuda_qsa_clock_map m, const int32_
         }
         scanned += lanes;
         __syncthreads();
+        if (lsa_lap_dry(m, scanned, lanes, cand)) break;
     }
     const uint32_t got = min(assigned, nmiss);
     for (uint32_t i = got + threadIdx.x; i < nmiss; i += blockDim.x) {
@@ -1388,8 +1414,9 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
 // A J3 prefetch never evicts a slot stamped after the target's last own resolve (an earlier source of the same step
 // put or found it there), so the sources of one step add up instead of evicting each other.
 static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit, int pf, bool stage_all = false) {
-    __shared__ uint32_t epoch, assigned, hand, nmiss, keep_from;
+    __shared__ uint32_t epoch, assigned, hand, nmiss, keep_from, cand;
     if (threadIdx.x == 0) {
+        cand = 0;
         epoch = m.ctl[0] + 1;
         assigned = 0;
         hand = m.ctl[1];
@@ -1403,7 +1430,8 @@ static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit
     uint32_t scanned = 0;
     while (assigned < nmiss && scanned < 3*m.slots + lanes) {
         const uint32_t slot = (hand + scanned + threadIdx.x)%m.slots;
-        const bool free_slot = pf >= 2 ? m.tags[slot] < 0 || m.stamp[slot] < keep_from : m.stamp[slot] != epoch;
+        const bool free_slot = pf >= 2 ? m.tags[slot] < 0 || m.stamp[slot] < keep_from : lsa_victim_ok(m, slot, epoch);
+        if (threadIdx.x < lanes && (free_slot || pf >= 2) && m.protect > 1) cand = 1; // pf >= 2 keeps its own rule: never dry
         if (threadIdx.x < lanes && free_slot && atomicExch(m.ref + slot, 0) == 0) {
             const uint32_t item = atomicAdd(&assigned, 1u);
             if (item < nmiss) {
@@ -1419,6 +1447,7 @@ static __global__ void lsa_page_assign(ggml_cuda_qsa_clock_map m, uint32_t limit
         }
         scanned += lanes;
         __syncthreads();
+        if (lsa_lap_dry(m, scanned, lanes, cand)) break;
     }
     const uint32_t got = min(assigned, nmiss);
     for (uint32_t i = got + threadIdx.x; i < nmiss; i += blockDim.x) {

@@ -35,6 +35,9 @@ struct ggml_cuda_qsa_clock_map {
     uint32_t cells = GGML_QSA_PAGE_CELLS; // cells per page: 4 (QSA CLOCK pages), 16 (LSA strip slots), 128 (LSA record pages)
     int32_t layer = -1;                   // LSA strip mode: layer id for the counter log
     uint32_t log_every = 0;               // LSA strip mode: device log every N resolves (GGML_CUDA_LSA_RESIDENT_LOG)
+    uint32_t protect = 1;                 // LSA strip slots / record pages: a victim needs epoch - stamp >= protect, so slots any of the
+                                          // last `protect` resolves of this layer (other streams' resolves of the round) touched stay
+                                          // (GGML_CUDA_LSA_RESIDENT_PROTECT, opt-in; 1 = only this resolve's picks, as before)
     uint32_t * seen = nullptr;            // LSA record pages, GGML_CUDA_LSA_RESIDENT_ADMIT=1: per record, last own resolve that picked it
     // LSA record pages, GGML_CUDA_LSA_RESIDENT_STAGE=<records> (opt-in): one on-card staging area per buffer, shared by
     // its layers (they run one after another on one stream). A picked record that gets no CLOCK slot is copied into stage
