@@ -5802,12 +5802,34 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // LLAMA_SERVER_MIX_PROMPT_UBATCHES=N (default 0 = off): while another slot is writing, prompts add at most
+        // N ubatches in total to one call, so a writer waits for at most N ubatches of prompt work per round; the rest
+        // of the prompt follows in the next calls. Off (or no writer): unchanged.
+        static const int32_t mix_prompt_ubatches = [] {
+            const char * e = getenv("LLAMA_SERVER_MIX_PROMPT_UBATCHES");
+            return e ? std::max(0, atoi(e)) : 0;
+        }();
+        int32_t mix_prompt_cap = -1; // prompt tokens this call may still take; -1 = no cap
+        const int32_t mix_batch0 = batch.size();
+        if (mix_prompt_ubatches > 0) {
+            int32_t n_writers = 0;
+            for (const auto & s : slots) {
+                n_writers += s.state == SLOT_STATE_GENERATING ? 1 : 0;
+            }
+            if (n_writers > 0) {
+                mix_prompt_cap = mix_prompt_ubatches * n_ubatch;
+            }
+        }
+        auto mix_capped = [&]() {
+            return mix_prompt_cap >= 0 && batch.size() - mix_batch0 >= mix_prompt_cap;
+        };
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch || mix_capped()) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -6460,6 +6482,13 @@ private:
                         // warm prefill adds at most one ubatch per iteration, so a request that
                         // arrives meanwhile waits for at most one ubatch
                         if (slot.task->params.warm && batch.size() - n_tokens_prev >= n_ubatch) {
+                            break;
+                        }
+
+                        // writers are waiting: this call's prompt share is used up (LLAMA_SERVER_MIX_PROMPT_UBATCHES)
+                        if (mix_capped()) {
+                            SLT_INF(slot, "mix prompt cap: %d prompt tokens this call, %d of %d read, writers waiting\n",
+                                    (int) (batch.size() - mix_batch0), (int) slot.prompt.n_tokens(), (int) slot.task->n_tokens());
                             break;
                         }
 
