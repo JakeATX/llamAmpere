@@ -790,6 +790,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                 V_b = llama_mul_mat_hadamard(ctx0, V_b, inp_attn->self_v_rot);
             }
 
+            // SJ-KVaRN: the same Q/K/V rotation build_attn applies; the FA node gets the cache's descriptor below
+            const bool sj       = inp_attn->self_sj_kvarn_desc != nullptr;
+            const bool sj_fused = sj && build_attn_sj_kvarn_rot(inp_attn, Q_b, K_b, V_b, il);
+
             ggml_build_forward_expand(gf, Q_b);
             ggml_build_forward_expand(gf, V_b);
             ggml_build_forward_expand(gf, K_b);
@@ -808,6 +812,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             ggml_tensor * v_view = mctx_kv->get_v(ctx0, il);
 
             ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
+
+            // SJ-KVaRN: build_attn_mha reads the sealed records and un-rotates the output through this descriptor
+            if (sj) {
+                build_attn_sj_kvarn_pend(inp_attn, sj_fused, il);
+            }
 
             // TurboQuant/TQ K caches hold WHT-rotated K: Q must be rotated to match
             Q_b = build_attn_turbo_q(Q_b, k_view, mctx_kv);

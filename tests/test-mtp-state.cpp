@@ -245,6 +245,8 @@ struct cache_config {
     ggml_type k, v;
     uint32_t sj_k = 0, sj_v = 0;
     ggml_type body = GGML_TYPE_F32;
+    bool sj_draft = false; // the draft cache inherits the trunk's SJ-KVaRN (--spec-draft-sjkvarn)
+    bool sequential = false; // the draft decodes one token at a time (no chained drafting)
 };
 
 struct contexts {
@@ -290,8 +292,10 @@ struct contexts {
         if (tail_chunks) {
             cp.n_outputs_max = 8;
         }
-        cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 0;
-        if (config.sj_k) {
+        if (!config.sj_draft) {
+            cp.sj_kvarn_bits_k = cp.sj_kvarn_bits_v = 0;
+        }
+        if (config.sj_k && !config.sj_draft) {
             cp.type_k = COMMON_SJKVARN_MTP_DRAFT_KV[0];
             cp.type_v = COMMON_SJKVARN_MTP_DRAFT_KV[1];
         }
@@ -304,7 +308,7 @@ struct contexts {
         params.draft.n_max = draft_max;
         params.draft.n_min_adaptive = tail_chunks ? 8 : 3;
         params.draft.p_min = 0.0f;
-        params.draft.chain = tail_chunks || !bookkeep_sequential;
+        params.draft.chain = (tail_chunks || !bookkeep_sequential) && !config.sequential;
         params.draft.backend_sampling = backend_sampling;
         spec = common_speculative_init(params, parallel);
         require(spec != nullptr, "create MTP driver");
@@ -2420,6 +2424,106 @@ static void run_case(llama_model * model, const cache_config & config, bool defe
     printf("PASS %s: %s, fresh driver and sequence 0 -> 1, 24 matching draft rounds\n", config.name, deferred ? "deferred carry" : "batch carry");
 }
 
+// An image chunk is decoded by the target only: the MTP driver skips embedding batches. positions as mtmd builds them for M-RoPE
+static void decode_image(contexts & ctx, llama_pos p0, int nx, int ny, llama_seq_id seq) {
+    const int n = nx*ny;
+    std::vector<float> embd((size_t) n*n_embd);
+    std::mt19937 rng(1);
+    std::normal_distribution<float> dist(0.0f, 0.1f);
+    for (auto & value : embd) {
+        value = dist(rng);
+    }
+    common_batch batch(ctx.tgt);
+    for (int i = 0; i < n; ++i) {
+        const llama_pos pos[GGML_MROPE_SECTIONS] = { p0, p0 + i/nx, p0 + i%nx, 0 };
+        batch.add_embd({ embd.data() + (size_t) i*n_embd, 1, (size_t) n_embd }, pos, seq, false);
+    }
+    require(llama_process(ctx.tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "target image decode");
+    require(common_speculative_process(ctx.spec, batch), "MTP process skips the image");
+}
+
+// The draft cache has no rows for the image, so its first text row after the image sits far ahead of its last cell (position
+// 3, then 12 here). An SJ-KVaRN draft cache (--spec-draft-sjkvarn) has to take that row, draft, save and restore. The target keeps
+// refusing a row that does not continue its sequence.
+// Chained drafting builds the attention of the MTP block itself. With an SJ-KVaRN draft cache it must read the cache as
+// build_attn does (rotated Q/K/V, the sealed records), or the draft attention is NaN and every draft is token 0. The first
+// chained round, drafted from the prompt, must equal the first round of a sequential draft (one token per decode through
+// build_attn), and the chained drafts must not all be token 0. Later rounds are not compared: chained and sequential
+// drafting can part after the first round with any draft cache.
+static void run_sj_draft_chain(llama_model * model, const cache_config & sj_config, llama_pos prompt_end) {
+    cache_config config = sj_config;
+    config.sj_draft = true;
+    cache_config config_seq = config;
+    config_seq.sequential = true;
+
+    contexts chained(model, config);
+    contexts sequential(model, config_seq);
+    schedule got[2];
+    contexts * ctxs[2] = { &chained, &sequential };
+    for (int i = 0; i < 2; ++i) {
+        prefill(*ctxs[i], 0, prompt_end, 0);
+        common_speculative_begin(ctxs[i]->spec, 0, llama_tokens(prompt_end, 0));
+        llama_pos pos = prompt_end;
+        got[i] = generate(*ctxs[i], 0, pos, 0, 8);
+    }
+    for (int i = 0; i < 2; ++i) {
+        bool any_nonzero = false;
+        for (const auto & round : got[i].tokens) {
+            for (llama_token token : round) {
+                any_nonzero = any_nonzero || token != 0;
+            }
+        }
+        require(any_nonzero, i == 0 ? "chained SJ-KVaRN drafts are not all token 0" : "sequential SJ-KVaRN drafts are not all token 0");
+    }
+    require(!got[0].tokens.empty() && !got[1].tokens.empty(), "both drafts ran");
+    if (got[0].tokens[0] != got[1].tokens[0]) {
+        fprintf(stderr, "first round: chained");
+        for (llama_token token : got[0].tokens[0]) { fprintf(stderr, " %d", token); }
+        fprintf(stderr, "; sequential");
+        for (llama_token token : got[1].tokens[0]) { fprintf(stderr, " %d", token); }
+        fprintf(stderr, "\n");
+    }
+    require(got[0].tokens[0] == got[1].tokens[0], "the first chained SJ-KVaRN round equals the sequential round");
+    printf("PASS %s: chained drafting with an SJ-KVaRN draft cache to %d, first round equal to sequential drafting\n", config.name, (int) prompt_end);
+}
+
+static void run_image_gap(llama_model * model, const cache_config & sj_config, llama_pos p_img) {
+    cache_config config = sj_config;
+    config.sj_draft = true;
+    const int nx = 8, ny = 6;
+    const llama_pos p_txt = p_img + std::max(nx, ny); // the next position after an image is its larger side
+    const llama_pos prompt_end = p_txt + 200;
+
+    contexts reference(model, config);
+    prefill(reference, 0, p_img, 0);
+    decode_image(reference, p_img, nx, ny, 0);
+    prefill(reference, p_txt, prompt_end, 0);
+    const snapshot prompt = save(reference, 0);
+    common_speculative_begin(reference.spec, 0, llama_tokens(prompt_end, 0));
+    llama_pos pos_ref = prompt_end;
+    const schedule expected = generate(reference, 0, pos_ref, 0, 8);
+    require(llama_memory_seq_pos_max(llama_get_memory(reference.dft), 0) >= p_txt, "draft cache holds the text after the image");
+
+    contexts restored(model, config);
+    restore(restored, prompt, 1);
+    common_speculative_begin(restored.spec, 1, llama_tokens(prompt_end, 0));
+    llama_pos pos_got = prompt_end;
+    require_schedule(generate(restored, 1, pos_got, 0, 8), expected, "image gap: restored draft cache drafts the same tokens");
+
+    // an ordinary prompt (no image) still drafts with an SJ-KVaRN draft cache
+    contexts plain(model, config);
+    prefill(plain, 0, prompt_end, 0);
+    common_speculative_begin(plain.spec, 0, llama_tokens(prompt_end, 0));
+    llama_pos pos_plain = prompt_end;
+    generate(plain, 0, pos_plain, 0, 4);
+
+    // the target keeps its guard
+    common_batch skip(reference.tgt);
+    skip.add(token_at(pos_ref + 5), pos_ref + 5, 0, true);
+    require(llama_process(reference.tgt, LLAMA_PROCESS_TYPE_DECODE, skip.get()) != 0, "the target refuses a row that does not continue its sequence");
+    printf("PASS %s: image at %d in an SJ-KVaRN draft cache, restore, 8 matching draft rounds, target guard kept\n", config.name, (int) p_img);
+}
+
 static void run_deferred_overflow(llama_model * model, const cache_config & config) {
     contexts reference(model, config, 64);
     prefill(reference, 0, 124, 0);
@@ -3688,6 +3792,44 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return failed ? 1 : 0;
         }
+        if (argc >= 2 && std::strcmp(argv[1], "--sj-draft") == 0) {
+            // the SJ-KVaRN draft cache cases (chained drafting, image gap with save/restore) on one device
+            ggml_backend_dev_t device = nullptr;
+            if (argc == 4 && std::strcmp(argv[2], "--device") == 0) {
+                ggml_backend_load_all();
+                device = ggml_backend_dev_by_name(argv[3]);
+                require(device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU, "requested GPU device exists");
+            } else {
+                require(argc == 2, "usage: --sj-draft [--device CUDA0]");
+            }
+            model = make_model(false, {}, LLM_ARCH_QWEN35, device);
+            const cache_config configs[] = {
+                { "SJ-KVaRN 4/4", GGML_TYPE_F16, GGML_TYPE_F16, 4, 4 },
+                { "SJ-KVaRN 3/3t", GGML_TYPE_F16, GGML_TYPE_F16, 3, 3, GGML_TYPE_I16 },
+                { "SJ-KVaRN 3/2t", GGML_TYPE_F16, GGML_TYPE_F16, 3, 2, GGML_TYPE_I16 },
+            };
+            for (const auto & config : configs) {
+                for (llama_pos prompt_end : { 212, 100 }) {
+                    try {
+                        run_sj_draft_chain(model, config, prompt_end);
+                    } catch (const std::exception & error) {
+                        fprintf(stderr, "FAIL %s (SJ-KVaRN draft chain to %d): %s\n", config.name, (int) prompt_end, error.what());
+                        ++failed;
+                    }
+                }
+                for (llama_pos p_img : { 4, 0 }) {
+                    try {
+                        run_image_gap(model, config, p_img);
+                    } catch (const std::exception & error) {
+                        fprintf(stderr, "FAIL %s (image gap at %d): %s\n", config.name, (int) p_img, error.what());
+                        ++failed;
+                    }
+                }
+            }
+            llama_model_free(model);
+            llama_backend_free();
+            return failed ? 1 : 0;
+        }
         if (reserve_probe) {
             run_reserve_probe(std::stoul(argv[2]), std::stoul(argv[3]), argc == 5 ? argv[4] : nullptr);
             llama_backend_free();
@@ -3823,6 +3965,22 @@ int main(int argc, char ** argv) {
                     run_case(model, config, deferred);
                 } catch (const std::exception & error) {
                     fprintf(stderr, "FAIL %s (%s): %s\n", config.name, deferred ? "deferred" : "batch", error.what());
+                    ++failed;
+                }
+            }
+            if (config.sj_k) {
+                try {
+                    run_sj_draft_chain(model, config, 212); // past the sink: sealed records
+                    run_sj_draft_chain(model, config, 100); // inside the sink
+                } catch (const std::exception & error) {
+                    fprintf(stderr, "FAIL %s (SJ-KVaRN draft chain): %s\n", config.name, error.what());
+                    ++failed;
+                }
+                try {
+                    run_image_gap(model, config, 4); // text before the image
+                    run_image_gap(model, config, 0); // the image first: the first draft cell is not at position 0
+                } catch (const std::exception & error) {
+                    fprintf(stderr, "FAIL %s (image gap): %s\n", config.name, error.what());
                     ++failed;
                 }
             }
