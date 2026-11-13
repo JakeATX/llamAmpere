@@ -910,7 +910,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
     if (lsa_n_blk > 0 && lsa_u_blk) {
         llama_lsa_set_mean_inputs(lsa_u_blk, lsa_u_rblk, lsa_q_ring, lsa_q_cell ? lsa_q_cell : self_k_idxs, lsa_n_blk, lsa_ring_n,
-                lsa_ring_rows);
+                lsa_ring_rows, llama_lsa_ubatch_seq(ubatch));
     }
     for (const auto & c : lsa_idx_commit) {
         llama_lsa_idx_commit(c.first, c.second);
@@ -1535,7 +1535,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->lsa_n_blk > 0 && inp_attn->lsa_u_blk) {
         llama_lsa_set_mean_inputs(inp_attn->lsa_u_blk, inp_attn->lsa_u_rblk, inp_attn->lsa_q_ring,
                 inp_attn->lsa_q_cell ? inp_attn->lsa_q_cell : inp_attn->self_k_idxs, inp_attn->lsa_n_blk, inp_attn->lsa_ring_n,
-                inp_attn->lsa_ring_rows);
+                inp_attn->lsa_ring_rows, llama_lsa_ubatch_seq(ubatch));
     }
     for (const auto & c : inp_attn->lsa_idx_commit) {
         llama_lsa_idx_commit(c.first, c.second);
@@ -4411,7 +4411,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    bool is_reserve) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -4440,6 +4441,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const auto & lsa_cfg = llama_lsa_cfg();
     const bool lsa_sj_ok = !mctx_cur->is_sj_kvarn() || (lsa_cfg.idx_cache && !lsa_cfg.fast &&
         (lsa_cfg.mode == llama_lsa_config::KEY || lsa_cfg.mode == llama_lsa_config::POS));
+    if (lsa_cfg.mode != llama_lsa_config::OFF && !cparams.training && lsa_sj_ok && mctx_cur->is_sj_kvarn()) {
+        const int32_t lsa_seq = llama_lsa_ubatch_seq(&ubatch);
+        llama_lsa_seq_guard(lsa_seq, ubatch.pos && ubatch.pos[0] == 0, ubatch.n_seqs_unq > 1 && ubatch.seq_id != nullptr, is_reserve);
+    }
     if (lsa_cfg.mode != llama_lsa_config::OFF && !cparams.training && lsa_sj_ok &&
             (cparams.kv_unified || ubatch.n_seqs_unq == 1)) {
         inp->lsa_graph_gen = llama_lsa_graph_gen();
@@ -4494,7 +4499,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, is_reserve);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -6045,13 +6050,18 @@ bool llm_graph_context::build_attn_lsa_mean_refresh(
     if (!valid && (!sj || fresh)) {
         inp->lsa_mean_commit.emplace_back(kb, epoch);
     }
+    const int32_t seq0 = llama_lsa_ubatch_seq(&ubatch);
     if (sj && !valid && !fresh) {
         static uint32_t warned_ep = 0;
         if (llama_lsa_log_once(warned_ep)) {
             LLAMA_LOG_WARN("%s: LSA block means on SJ-KVaRN are stale (restore or K shift); compensation off until a "
                     "sequence restarts at position 0\n", __func__);
         }
+        llama_lsa_comp_note(false, seq0, 2, "block means are stale (restore without means, K shift, or a rewind past the staging ring)", false);
         return false;
+    }
+    if (sj && (nbs > 0 || fresh)) {
+        llama_lsa_comp_note(true, seq0, 2, nullptr, fresh);
     }
     *kmv = kw;
     *vmv = vw;
@@ -8474,7 +8484,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), is_reserve);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

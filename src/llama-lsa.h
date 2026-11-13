@@ -321,7 +321,9 @@ void llama_lsa_set_q_blk(ggml_tensor * q_blk, const ggml_tensor * rows_i64, int6
 // [carry ring ; this ubatch's rows] concat (n_ring + ubatch row, else row mod n_ring), q_ring I64 [m] = carry-ring rows
 // of the ubatch's last m = min(n_tokens, n_ring) rows.
 void llama_lsa_set_mean_inputs(ggml_tensor * u_blk, ggml_tensor * u_rblk, ggml_tensor * q_ring, const ggml_tensor * rows_i64,
-        int64_t n_blocks, int64_t n_ring, bool ring_rows = false);
+        int64_t n_blocks, int64_t n_ring, bool ring_rows = false, int32_t seq = -1);
+// the one sequence of a ubatch, -1 when it holds several (or none): the staging ring follows one sequence at a time
+int32_t llama_lsa_ubatch_seq(const llama_ubatch * ubatch);
 
 // SJ-KVaRN + index cache: the prompt cache carries the index cache, because an invalid layer cannot be rebuilt from
 // the sealed K. Written by llama_memory_hybrid as an optional suffix behind the recurrent state, only when
@@ -351,3 +353,8 @@ std::string llama_lsa_check_cache(uint32_t bits_k, uint32_t bits_v, ggml_type bo
 // epoch (a few repeats at most: dry run, main, MTP draft context).
 void llama_lsa_log_epoch_bump();
 bool llama_lsa_log_once(uint32_t & seen);
+// LLAMA_LSA_COMP=2 state line, printed when it changes for a sequence (WARN, so server.log keeps it):
+// "lsa comp on mode=2 seq=N" / "lsa comp OFF mode=2 seq=N: why". A run that must keep compensation greps for these.
+// OFF is kept until `fresh` (a ubatch at position 0), so layers or contexts that disagree cannot flip the line.
+void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed, bool is_reserve); // one-owner rule of the SJ-KVaRN LSA caches
+void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why, bool fresh);

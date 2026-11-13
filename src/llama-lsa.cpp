@@ -297,6 +297,52 @@ void llama_lsa_log_epoch_bump() {
     g_lsa_log_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
+// state of the "lsa comp on/OFF" line per sequence (llama_lsa_comp_note)
+static std::mutex g_lsa_comp_mtx;
+static std::map<int32_t, bool> g_lsa_comp_st;
+static uint32_t g_lsa_comp_ep = 0;
+
+// the one-owner guard fired: every sequence that printed "lsa comp on" gets its OFF line (same format), so a restart at
+// position 0 prints "lsa comp on" again. No sequence is on (compensation not in use, or one slot): prints nothing.
+static void lsa_comp_note_all_off(const char * why) {
+    std::lock_guard<std::mutex> lock(g_lsa_comp_mtx);
+    if (g_lsa_log_epoch.load(std::memory_order_relaxed) != g_lsa_comp_ep) {
+        return; // a new context: llama_lsa_comp_note starts again
+    }
+    for (auto & it : g_lsa_comp_st) {
+        if (it.second) {
+            it.second = false;
+            LLAMA_LOG_WARN("llama_lsa_comp_note: lsa comp OFF mode=%d seq=%d: %s; compensation off until this sequence "
+                    "restarts at position 0\n", 2, (int) it.first, why);
+        }
+    }
+}
+
+void llama_lsa_comp_note(bool on, int32_t seq, int mode, const char * why, bool fresh) {
+    if (seq < 0) {
+        return; // graph reserve / mixed ubatch
+    }
+    auto & st = g_lsa_comp_st;
+    auto & ep = g_lsa_comp_ep;
+    std::lock_guard<std::mutex> lock(g_lsa_comp_mtx);
+    const uint32_t e = g_lsa_log_epoch.load(std::memory_order_relaxed);
+    if (e != ep) { // a new context: say it again (the fit dry run drops WARN, see llama_lsa_log_once)
+        ep = e;
+        st.clear();
+    }
+    auto it = st.find(seq);
+    if (it != st.end() && (it->second == on || (on && !fresh))) {
+        return;
+    }
+    st[seq] = on;
+    if (on) {
+        LLAMA_LOG_WARN("%s: lsa comp on mode=%d seq=%d\n", __func__, mode, (int) seq);
+    } else {
+        LLAMA_LOG_WARN("%s: lsa comp OFF mode=%d seq=%d: %s; compensation off until this sequence restarts at "
+                "position 0\n", __func__, mode, (int) seq, why ? why : "?");
+    }
+}
+
 bool llama_lsa_log_once(uint32_t & seen) {
     const uint32_t e = g_lsa_log_epoch.load(std::memory_order_relaxed);
     if (seen == e) {
@@ -630,6 +676,9 @@ struct lsa_idx_store {
     std::mutex                                     mtx;
     std::map<const ggml_tensor *, lsa_idx_entry>   e;
     int64_t                                        ring_hi = 0; // LLAMA_LSA_COMP=2 on SJ-KVaRN: staging ring holds positions [ring_hi - n_ring, ring_hi)
+    int32_t                                        ring_seq = -1; // sequence of the last ubatch that moved ring_hi (-1: none or mixed)
+    int64_t                                        ring_lo = 0; // ... but none below ring_lo: set by a far rewind to a block start, where the
+                                                                // ring rows under the rewind point still hold higher (old) positions
     uint64_t                                       seq     = 0; // invalidate counter (entry touch)
 };
 lsa_idx_store & lsa_idx() {
@@ -867,6 +916,35 @@ bool llama_lsa_idx_trace() {
     return on;
 }
 
+// SJ-KVaRN keeps one index cache, one set of block means and one staging ring per K cache tensor, keyed by position:
+// they hold ONE sequence. The owner is the last sequence that started at position 0. A ubatch of another sequence, or
+// one that mixes sequences (LSA skips it, so its rows never reach the caches), makes every cache stale: LSA goes
+// dense and compensation off, with a warning, until a sequence restarts at position 0. One sequence: never fires.
+void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed, bool is_reserve) {
+    if (is_reserve || (seq < 0 && !mixed)) {
+        return; // graph reserve / measure: placeholder sequences, the graph never runs
+    }
+    static int32_t own = -1; // guarded by lsa_idx().mtx
+    auto & s = lsa_idx();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (!mixed && (fresh || own < 0 || seq == own)) {
+        own = seq;
+        return;
+    }
+    bool was_on = false;
+    for (auto & it : s.e)         { was_on = was_on || it.second.built == it.second.gen; it.second.gen++; }
+    for (auto & it : lsa_means()) { was_on = was_on || it.second.built == it.second.gen; it.second.gen++; }
+    for (auto & it : lsa_picks()) { it.second.gen++; }
+    g_lsa_graph_gen.fetch_add(1, std::memory_order_relaxed);
+    if (was_on) {
+        LLAMA_LOG_WARN("%s: LSA caches hold sequence %d, ubatch is %s %d: LSA dense and compensation OFF for every "
+                "sequence until one restarts at position 0 (LSA on SJ-KVaRN serves one sequence at a time)\n", __func__,
+                (int) own, mixed ? "mixed, first sequence" : "sequence", (int) seq);
+    }
+    lsa_comp_note_all_off("the LSA caches hold another sequence (one-owner guard)");
+    own = -1;
+}
+
 void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, const char * why) {
     static const bool test_skip = lsa_env_i64("LLAMA_LSA_IDX_TEST_SKIP_INVALIDATE", 0) != 0; // negative control only
     // LLAMA_LSA_IDX_TEST_GLOBAL_INVALIDATE=1: old behaviour (any cache's restore/shift invalidates every layer of every
@@ -1010,7 +1088,8 @@ void llama_lsa_idx_state_write(llama_io_write_i & io, int64_t n_rows) {
             // the ring must still hold the tail block [B*floor((n_rows-1)/B), n_rows); rows past n_rows are rejected
             // draft rows (seq_rm after verify) and count as stale after the restore
             const int64_t B = llama_lsa_cfg().block > 1 ? llama_lsa_cfg().block : 128;
-            const bool tail_in_ring = en.kr && n_rows <= s.ring_hi && ((n_rows - 1)/B)*B >= s.ring_hi - en.kr->ne[1];
+            const bool tail_in_ring = en.kr && n_rows <= s.ring_hi &&
+                    ((n_rows - 1)/B)*B >= std::max<int64_t>(s.ring_hi - en.kr->ne[1], s.ring_lo);
             if (en.km && en.kr && en.built == en.gen && tail_in_ring && (ring_n == 0 || en.kr->ne[1] == ring_n)) {
                 ring_n = en.kr->ne[1];
                 means.push_back({ en.name, en.km, en.vm, en.kr, en.vr });
@@ -1163,6 +1242,8 @@ static void lsa_means_state_read(llama_io_read_i & io, int64_t n_rows) {
             std::lock_guard<std::mutex> lock(s.mtx);
             en->built = en->gen; // the K restore already bumped this layer's generation
             s.ring_hi = n_rows;
+            // the saved ring is only known good from the tail block on (the save rule; ring_lo is not in the state)
+            s.ring_lo = ((n_rows - 1)/B)*B;
             ++n_ok;
         } else {
             for (size_t done = 0; done < nbytes; ) {
@@ -1307,6 +1388,18 @@ void llama_lsa_set_q_cell(ggml_tensor * q_cell, const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(q_cell, rows.data(), 0, rows.size()*sizeof(int64_t));
 }
 
+int32_t llama_lsa_ubatch_seq(const llama_ubatch * ubatch) {
+    if (!ubatch || !ubatch->seq_id || !ubatch->n_seq_id || ubatch->n_tokens == 0) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->n_seq_id[i] != 1 || ubatch->seq_id[i][0] != ubatch->seq_id[0][0]) {
+            return -1;
+        }
+    }
+    return ubatch->seq_id[0][0];
+}
+
 void llama_lsa_set_q_blk(ggml_tensor * q_blk, const ggml_tensor * rows_i64, int64_t n_blocks) {
     if (!q_blk || !q_blk->buffer || !rows_i64 || !rows_i64->buffer) {
         return;
@@ -1327,7 +1420,7 @@ void llama_lsa_set_q_blk(ggml_tensor * q_blk, const ggml_tensor * rows_i64, int6
 }
 
 void llama_lsa_set_mean_inputs(ggml_tensor * u_blk, ggml_tensor * u_rblk, ggml_tensor * q_ring, const ggml_tensor * rows_i64,
-        int64_t n_blocks, int64_t n_ring, bool ring_rows) {
+        int64_t n_blocks, int64_t n_ring, bool ring_rows, int32_t seq) {
     if (!u_blk || !u_blk->buffer || !rows_i64 || !rows_i64->buffer || n_blocks <= 0) {
         return;
     }
@@ -1369,19 +1462,30 @@ void llama_lsa_set_mean_inputs(ggml_tensor * u_blk, ggml_tensor * u_rblk, ggml_t
         const int64_t p1 = *std::max_element(rows.begin(), rows.end()) + 1;
         auto & s = lsa_idx();
         std::lock_guard<std::mutex> lock(s.mtx);
-        if (p0 > 0 && ((p0/B)*B < s.ring_hi - n_ring || p0 > s.ring_hi)) {
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                LLAMA_LOG_WARN("%s: ubatch at position %lld is outside the LSA staging ring [%lld, %lld); compensation "
-                        "off until a sequence restarts at position 0\n", __func__, (long long) p0,
-                        (long long) std::max<int64_t>(s.ring_hi - n_ring, 0), (long long) s.ring_hi);
-            }
+        // a rewind to a block start needs no ring row: the blocks below p0 keep their means (their rows did not
+        // change) and every block from p0 on is gathered from rows decoded from here on. This is the server's
+        // rollback to a context checkpoint (multi-turn prompt reuse), which sits at a batch start.
+        const int64_t lo  = std::max<int64_t>(s.ring_hi - n_ring, s.ring_lo);
+        const bool    far = (p0/B)*B < lo;
+        if (p0 == 0) {
+            s.ring_lo = 0;
+        } else if (far && p0 % B == 0 && p0 <= s.ring_hi && seq >= 0 && seq == s.ring_seq) {
+            // same sequence only: the means and the ring are one set per K cache tensor, shared by all its sequences
+            s.ring_lo = p0; // ring rows for positions below p0 are stale from now on
+        } else if (far || p0 > s.ring_hi) {
+            bool was_on = false;
             for (auto & en : lsa_means()) {
+                was_on = was_on || en.second.built != UINT64_MAX;
                 en.second.built = UINT64_MAX;
             }
+            if (was_on) { // once per loss, not once per process: a later sequence that loses it says so too
+                LLAMA_LOG_WARN("%s: ubatch at position %lld is outside the LSA staging ring [%lld, %lld) and not at a "
+                        "block start; compensation off until a sequence restarts at position 0\n", __func__, (long long) p0,
+                        (long long) std::max<int64_t>(lo, 0), (long long) s.ring_hi);
+            }
         }
-        s.ring_hi = p1;
+        s.ring_hi  = p1;
+        s.ring_seq = seq;
     }
     if (ring_rows && n_ring > 0) {
         // carry ring: the graph gathers each block row by row from [carry ring (n_ring rows) ; this ubatch's rows]
