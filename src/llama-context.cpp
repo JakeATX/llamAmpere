@@ -6249,7 +6249,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // prompt_buffers_resize kept at writing size because this publish follows the output reserve above.
         b1_cache_warm();
         b1_cache_device_prepare();
-        if (n_tokens_all > sched_reserve_tokens && !b1_cache_device_active) {
+        // Only a model with experts has host experts to fall back to, and sched_reserve_tokens == 0 means the scratch
+        // was never resized (full ubatch), so no call was "kept" small. A dense model used to log this on every
+        // writing call of at most 8 rows; nothing ran on the host there.
+        if (model.hparams.n_expert > 0 && sched_reserve_tokens > 0 && n_tokens_all > sched_reserve_tokens &&
+                !b1_cache_device_active) {
             LLAMA_LOG_WARN("%s: device expert prepare failed before a %u-row call kept at %u scratch rows; it runs on "
                     "host experts (LLAMA_PENDING_PUBLISH=0 restores the grow)\n", __func__, n_tokens_all, sched_reserve_tokens);
         }
