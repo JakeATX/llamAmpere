@@ -4685,6 +4685,88 @@ static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor 
     m2.data      = nullptr;
 }
 
+// [ROWSPLIT] fork, default off. GGML_SJKVARN_ROWSPLIT=1: SJ-KVaRN 4/4 verify widths 9..16 run as chunks of at most 8
+// query rows through the n_q <= 8 decode kernel (one launch per chunk) instead of the shared-memory tile kernel, which
+// above 8 rows walks two 8-row query tiles over the whole body. Every query row is independent, so a chunk is a view of
+// Q, mask and dst rows; K, V, body and descriptor are shared.
+static bool ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() {
+    static const bool v = [] { const char * e = getenv("GGML_SJKVARN_ROWSPLIT"); return e != nullptr && strcmp(e, "1") == 0; }();
+    return v;
+}
+
+static constexpr int64_t SJ_KVARN_ROWSPLIT_CHUNK = 8;
+static constexpr int64_t SJ_KVARN_ROWSPLIT_MAX   = 16;
+
+// rows [r0, r0 + nr) of a flash_attn_ext node: d (with d.src[0] = &q, d.src[3] = &m) writes dst rows r0.. in place
+static void ggml_cuda_fattn_sj_kvarn_rowsplit_view(const ggml_tensor * dst, const ggml_tensor * mask, int64_t r0, int64_t nr,
+        ggml_tensor & d, ggml_tensor & q, ggml_tensor & m) {
+    const ggml_tensor * Q = dst->src[0];
+    q = *Q;
+    q.ne[1] = nr;
+    q.data  = Q->data ? (char *) Q->data + r0*Q->nb[1] : nullptr;
+    q.view_src  = Q->view_src ? Q->view_src : const_cast<ggml_tensor *>(Q);
+    q.view_offs = Q->view_offs + r0*Q->nb[1];
+    m = *mask;
+    m.ne[1] = mask->ne[1] - r0;
+    m.data  = mask->data ? (char *) mask->data + r0*mask->nb[1] : nullptr;
+    m.view_src  = mask->view_src ? mask->view_src : const_cast<ggml_tensor *>(mask);
+    m.view_offs = mask->view_offs + r0*mask->nb[1];
+    d = *dst;
+    d.ne[2] = nr;
+    d.data  = dst->data ? (char *) dst->data + r0*dst->nb[2] : nullptr;
+    d.view_src  = dst->view_src ? dst->view_src : const_cast<ggml_tensor *>(dst);
+    d.view_offs = dst->view_offs + r0*dst->nb[2];
+    d.src[0] = &q;
+    d.src[3] = &m;
+}
+
+// true when every chunk of this node is served by the n_q <= 8 decode kernel (a packed mask is judged by its f16
+// expansion, which ggml_cuda_fattn_mask_packed_native then selects for this node)
+static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() || dst->src[6] == nullptr || ggml_cuda_fattn_sj_kvarn_is_lowbits(dst)) {
+        return false;
+    }
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    const int64_t n_q = Q->ne[1];
+    if (n_q <= SJ_KVARN_ROWSPLIT_CHUNK || n_q > SJ_KVARN_ROWSPLIT_MAX || mask == nullptr || mask->ne[1] < n_q ||
+            Q->ne[3] != 1 || dst->ne[3] != 1 || dst->ne[2] != n_q || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            ggml_get_op_params_i32(dst, 6) % FATTN_KQ_STRIDE != 0 || Q->nb[1] % 16 != 0) {
+        // the last two: the decode kernel contract that ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2 asserts
+        return false;
+    }
+    ggml_tensor m16;
+    if (ggml_cuda_fattn_mask_is_packed(dst)) {
+        ggml_cuda_fattn_mask_f16_desc(mask, m16);
+        mask = &m16;
+    } else if (mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    for (int64_t r0 = 0; r0 < n_q; r0 += SJ_KVARN_ROWSPLIT_CHUNK) {
+        ggml_tensor d, q, m;
+        ggml_cuda_fattn_sj_kvarn_rowsplit_view(dst, mask, r0, std::min(SJ_KVARN_ROWSPLIT_CHUNK, n_q - r0), d, q, m);
+        if (!ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(&d)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ggml_cuda_fattn_sj_kvarn_rowsplit_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int64_t n_q = dst->src[0]->ne[1];
+    static std::atomic<uint32_t> logged{0}; // proof of route for the gate logs: once per distinct width 9..16
+    const uint32_t bit = 1u << (n_q & 31);
+    if (!(logged.fetch_or(bit) & bit)) {
+        GGML_LOG_WARN("%s: GGML_SJKVARN_ROWSPLIT=1: SJ-KVaRN 4/4 row split on (%d query rows in chunks of %d)\n",
+                __func__, (int) n_q, (int) SJ_KVARN_ROWSPLIT_CHUNK);
+    }
+    for (int64_t r0 = 0; r0 < n_q; r0 += SJ_KVARN_ROWSPLIT_CHUNK) {
+        ggml_tensor d, q, m;
+        ggml_cuda_fattn_sj_kvarn_rowsplit_view(dst, dst->src[3], r0, std::min(SJ_KVARN_ROWSPLIT_CHUNK, n_q - r0), d, q, m);
+        ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, &d);
+    }
+}
+
 // GGML_CUDA_MASK_PACKED_NATIVE=0: every route takes the f16 expansion (A/B of the native loader)
 static bool ggml_cuda_fattn_mask_packed_native(const ggml_tensor * dst) {
     static const bool enabled = [] { const char * e = getenv("GGML_CUDA_MASK_PACKED_NATIVE"); return e == nullptr || atoi(e) != 0; }();
@@ -4704,7 +4786,8 @@ static bool ggml_cuda_fattn_mask_packed_native(const ggml_tensor * dst) {
         if (ggml_cuda_fattn_sj_kvarn_is_lowbits(dst)) {
             return ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(dst);
         }
-        return dst->src[0]->ne[1] > 8; // the 4/4 direct decode reader still needs F16
+        // the 4/4 direct decode reader (also each GGML_SJKVARN_ROWSPLIT chunk) still needs F16
+        return dst->src[0]->ne[1] > 8 && !ggml_cuda_fattn_sj_kvarn_rowsplit(dst);
     }
     ggml_tensor m2;
     ggml_cuda_fattn_mask_f16_desc(mask, m2);
@@ -4871,6 +4954,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         // fork: compact only the main model's sparse scalar4/4 verify rows; default dispatch stays unchanged.
         if (ggml_cuda_flash_attn_ext_sj_kvarn_compact(ctx, dst, ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2<256, 256>)) {
+            return;
+        }
+        if (ggml_cuda_fattn_sj_kvarn_rowsplit(dst)) {
+            ggml_cuda_fattn_sj_kvarn_rowsplit_run(ctx, dst);
             return;
         }
         ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2<256, 256>(ctx, dst);

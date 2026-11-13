@@ -8445,7 +8445,8 @@ static void init_tensor_ai4_random(ggml_tensor * t, const std::vector<bool> * us
     const bool v2 = ggml_ai4v2_rate(t->type) != 0;   // row-scale block = 16 rows x 640 K: [d[16]][5 x 16k-byte tiles]
     GGML_ASSERT(is_ai4_family(t->type) && ggml_is_contiguous(t) && t->ne[0] % (v2 ? 640 : 128) == 0 && t->ne[1] % 16 == 0);
     std::random_device rd;
-    std::mt19937 rng(rd());
+    const char * seed_env = getenv("GGML_TEST_SEED");
+    std::mt19937 rng(seed_env ? (unsigned) strtoul(seed_env, nullptr, 10) : rd());
     std::uniform_real_distribution<float> ud(0.002f, 0.02f);
     std::vector<uint8_t> buf(ggml_nbytes(t));
     // one unit = 16 rows x 128 K: [fp16 row scales d[16]][16k-byte trellis tiles]
@@ -8513,6 +8514,58 @@ struct test_mul_mat_aif25 : public test_mul_mat {
             }
             ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
         }
+    }
+};
+
+// fork: changing only the token tile must preserve each column's K accumulation order.
+struct test_ai_parw_pair : public test_mul_mat_ai4 {
+    const bool indexed;
+
+    test_ai_parw_pair(ggml_type type, int64_t n, int64_t k, bool indexed)
+        : test_mul_mat_ai4(144, n, k, type), indexed(indexed) {}
+
+    std::string op_desc(ggml_tensor *) override { return "AI_PARW_PAIR"; }
+    std::string vars() override { return test_mul_mat::vars() + ",indexed=" + std::to_string(indexed); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, type_a, k, m, 1);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, 33);
+        ggml_tensor * small;
+        ggml_tensor * large;
+        if (indexed) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 33);
+            ggml_tensor * ids_n = ggml_view_2d(ctx, ids, 1, n, ids->nb[1], 0);
+            ggml_tensor * x_n = ggml_view_3d(ctx, x, k, 1, n, x->nb[1], x->nb[2], 0);
+            small = ggml_reshape_2d(ctx, ggml_mul_mat_id(ctx, w, x_n, ids_n), m, n);
+            large = ggml_reshape_2d(ctx, ggml_mul_mat_id(ctx, w, x, ids), m, 33);
+        } else {
+            ggml_tensor * x_2d = ggml_reshape_2d(ctx, x, k, 33);
+            ggml_tensor * x_n = ggml_view_2d(ctx, x_2d, k, n, x_2d->nb[1], 0);
+            small = ggml_mul_mat(ctx, w, x_n);
+            large = ggml_mul_mat(ctx, w, x_2d);
+        }
+        return ggml_concat(ctx, small, ggml_view_2d(ctx, large, m, n, large->nb[1], 0), 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else {
+                init_tensor_uniform(t, t->type == GGML_TYPE_I32 ? 0.0f : -1.0f, t->type == GGML_TYPE_I32 ? 0.0f : 1.0f);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t count) override {
+        if (!kq_mask_packed_pair_equal(a, b, count, 2*m)) {
+            return INFINITY;
+        }
+        return test_case::err(a, b, count);
     }
 };
 
@@ -9170,7 +9223,9 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
 static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = false) {
 
     std::random_device rd;
-    std::default_random_engine rng(rd());
+    // With fixed inputs, redraw the same routes after each timed batch too.
+    const char * seed_env = getenv("GGML_TEST_SEED");
+    std::default_random_engine rng(seed_env ? (unsigned) strtoul(seed_env, nullptr, 10) : rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
             continue;
@@ -14854,7 +14909,7 @@ struct test_flash_attn_ext_sj_fill : public test_flash_attn_ext_sj_kvarn {
 
 static void add_sj_fill_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     for (int64_t n_kv : {4096, 32768, 102400}) {
-        for (int64_t n_q : {1, 2, 4, 8, 9}) {
+        for (int64_t n_q : {1, 2, 4, 8, 9, 12, 16}) {
             for (int n_seqs : {1, 4}) {
                 cases.emplace_back(new test_flash_attn_ext_sj_fill(n_q, n_kv, n_seqs));
             }
@@ -14862,7 +14917,7 @@ static void add_sj_fill_cases(std::vector<std::unique_ptr<test_case>> & cases, b
     }
     if (!perf) {
         // Partial body visibility, paged records, and the specialized five-row stream kernel.
-        for (int64_t n_q : {3, 5, 6, 7}) {
+        for (int64_t n_q : {3, 5, 6, 7, 12, 16}) {
             cases.emplace_back(new test_flash_attn_ext_sj_fill(n_q, 32768, 1, true));
             cases.emplace_back(new test_flash_attn_ext_sj_fill(n_q, 32768, 4, true));
         }
@@ -18074,8 +18129,44 @@ static void add_fn_dense_cases(std::vector<std::unique_ptr<test_case>> & test_ca
     }
 }
 
+static void add_ai_parw_shape_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (ggml_type type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{640, 2560}, {2560, 640}}) {
+            for (int64_t n : {8, 9, 16, 24, 32}) {
+                cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, type));
+                cases.emplace_back(new test_mul_mat_id_ai4(type, 512, 10, mk.second == 2560,
+                                                         mk.first, n, mk.second, false, true));
+            }
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
+        add_ai_parw_shape_cases(test_cases);
+        return test_cases;
+    }
+    if (getenv("GGML_TEST_AI_PARW")) {
+        for (ggml_type type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2}) {
+            for (int k : {640, 1280}) {
+                for (int n : {9, 16, 17, 24, 31, 32}) {
+                    for (bool indexed : {false, true}) {
+                        test_cases.emplace_back(new test_ai_parw_pair(type, n, k, indexed));
+                    }
+                }
+                for (int n : {1, 8, 33}) {
+                    test_cases.emplace_back(new test_mul_mat_ai4(144, n, k, type));
+                }
+            }
+            for (int n : {1, 8, 9, 32, 33}) {
+                for (bool broadcast : {false, true}) {
+                    test_cases.emplace_back(new test_mul_mat_id_ai4(type, 4, 3, broadcast, 144, n, 640, true));
+                }
+            }
+        }
+        return test_cases;
+    }
     // [PFGAP-U3] GGML_TEST_FN_DENSE_PERF=1 also limits the eval list to the Flash-Next dense shapes
     if (getenv("GGML_TEST_FN_DENSE_PERF") != nullptr) {
         add_fn_dense_cases(test_cases);
@@ -21836,6 +21927,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 24, 4, 24,  700)); // GQA 6, 24 records
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(4, 24, 4, 24, 1100)); // GQA 6, 24 records, 4 rows
+    // verify widths 9..16 above the decode kernel (GGML_SJKVARN_ROWSPLIT=1 runs them as 8-row chunks of it)
+    for (int64_t n_q : {9, 12, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 24, 1100));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 300, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 16, 2));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12, 16, 4, 2, 200)); // GQA 4, 12 rows
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12,  4, 4, 2, 200)); // GQA 1, 12 rows
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 16, 4,  2,  200)); // GQA 4
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(2,  4, 4,  2,  200)); // GQA 1
     // prefill ubatches: query rows tiled in ncols1 blocks (stream-k fixup across jt), all GQA classes
@@ -22230,6 +22330,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, std::max<int64_t>(n_q, 301), true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 3, 3));
             sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, std::max<int64_t>(n_q, 300), false, false, GGML_TYPE_F16, 128, false, GGML_TYPE_F32, 4, 4));
             sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, std::max<int64_t>(n_q, 1024), false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0, 4, 4));
+        }
+        // verify widths 9..16: packed scalar and turbo4 masks (GGML_SJKVARN_ROWSPLIT=1 expands them for the decode kernel)
+        for (int64_t n_q : {9, 16}) {
+            sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 300, false, false, GGML_TYPE_F16, 128, false, GGML_TYPE_F32, 4, 4));
+            sjp(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 1024, false, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0, 4, 4));
         }
         for (int ns : {1, 2, 3}) {
             for (int64_t n_q : {5, 129, 512}) {
@@ -22973,6 +23078,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
+        add_ai_parw_shape_cases(test_cases);
+        return test_cases;
+    }
     // [AIPTAB] mixed-bank hot expert launches at the Flash-Next shapes, AIT2_U vs AIT2P_U: GGML_TEST_AIPTAB_PERF=1
     if (getenv("GGML_TEST_AIPTAB_PERF") != nullptr && std::string(getenv("GGML_TEST_AIPTAB_PERF")) == "types") {
         // placement table: expert types at the Flash-Next shapes, MUL_MAT_ID top-10 of 512, widths 1 / 4 / 5.
