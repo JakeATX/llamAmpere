@@ -95,7 +95,7 @@ def test_short_requests_never_take_long_slot():
         assert res.status_code == 200
         assert res.body["id_slot"] in (1, 2)
     # three at once: the third waits for a short slot instead of taking slot 0
-    results = parallel_function_calls([(complete, (prompt_of(200, seed=s), -1, 32)) for s in range(3)])
+    results = parallel_function_calls([(complete, (prompt_of(200, seed=s), -1, 200)) for s in range(3)])
     for res in results:
         assert res.status_code == 200
         assert res.body["id_slot"] in (1, 2)
@@ -103,10 +103,22 @@ def test_short_requests_never_take_long_slot():
 
 def test_busy_long_slot_defers_not_errors():
     server.start()
-    results = parallel_function_calls([(complete, (prompt_of(700, seed=s), -1, 32)) for s in range(2)])
+    results = parallel_function_calls([(complete, (prompt_of(700, seed=s), -1, 200)) for s in range(2)])
     for res in results:
         assert res.status_code == 200
         assert res.body["id_slot"] == 0
+
+
+def test_headroom_is_fixed_not_n_predict():
+    # a large n_predict does not push a short prompt onto the long slot
+    server.start()
+    res = complete(prompt_of(200), n_predict=2000)
+    assert res.status_code == 200
+    assert res.body["id_slot"] in (1, 2)
+    # a prompt that fits only the long slot (less than 64 tokens of room) goes there instead of a 400
+    res = complete(prompt_of(1000, seed=2), n_predict=8)
+    assert res.status_code == 200
+    assert res.body["id_slot"] == 0
 
 
 def test_short_request_keeps_long_slot_cache():

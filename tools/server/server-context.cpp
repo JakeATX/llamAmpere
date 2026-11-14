@@ -2753,7 +2753,7 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
-                queue_tasks.pop_deferred_task(id_slot);
+                queue_tasks.pop_deferred_task(id_slot, !params_base.slot_ctx.empty());
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -3147,11 +3147,14 @@ private:
         if (params_base.slot_ctx.empty()) {
             return allowed;
         }
-        const int64_t need = (int64_t) task.tokens.size() + std::max<int64_t>(64, task.params.n_predict > 0 ? task.params.n_predict : 0);
         int cap_max = 0;
         for (const auto & slot : slots) {
             cap_max = std::max(cap_max, slot.n_ctx);
         }
+        // fixed 64-token headroom (not n_predict: clients that always send a large max_tokens would skip the short
+        // slots); a prompt that fits the largest cap is always routed to a slot that holds it
+        const int64_t n_tok = (int64_t) task.tokens.size();
+        const int64_t need  = n_tok < cap_max ? std::min<int64_t>(n_tok + 64, cap_max) : n_tok + 64;
         bool fits_smaller = false;
         bool fits_any     = false;
         for (const auto & slot : slots) {
@@ -3518,7 +3521,7 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
-                if (!params_base.slot_ctx.empty() && slot.n_ctx == n_ctx_slot()) {
+                if (!params_base.slot_ctx.empty() && slot.n_ctx == n_ctx_slot() && n_ctx_slot_min() < n_ctx_slot()) {
                     // --slot-ctx: the largest-cap slot holds the long conversation; never purge it to make room
                     SRV_WRN("--slot-ctx: KV pool full, NOT purging reserved slot %d (cap %d, %zu tokens)\n",
                             slot.id, slot.n_ctx, slot.prompt.tokens.size());
@@ -4875,12 +4878,21 @@ private:
                         if (!params_base.slot_ctx.empty()) {
                             // --slot-ctx: children take slots whose cap fits the parent prompt; error if too few exist
                             const std::vector<char> allowed = slot_ctx_allowed(task, slot->id);
+                            bool any_size = allowed.empty(); // true: any slot whose cap holds the prompt (long slot too)
                             const auto fits = [&](const server_slot & s) {
-                                return allowed.empty() ? s.n_ctx >= (int) task.tokens.size() : (bool) allowed[s.id];
+                                return any_size ? s.n_ctx >= (int) task.tokens.size() : (bool) allowed[s.id];
                             };
-                            size_t n_fit = 0;
-                            for (const auto & s : slots) {
-                                n_fit += s.id != slot->id && fits(s);
+                            const auto count_fit = [&]() {
+                                size_t n = 0;
+                                for (const auto & s : slots) {
+                                    n += s.id != slot->id && fits(s);
+                                }
+                                return n;
+                            };
+                            size_t n_fit = count_fit();
+                            if (n_fit < n_child_tasks && !any_size) {
+                                any_size = true; // too few short slots: the long slot is the fallback
+                                n_fit = count_fit();
                             }
                             if (n_fit < n_child_tasks) {
                                 send_error(task, string_format("--slot-ctx: %zu child tasks need slots that fit %zu tokens, only %zu exist",
