@@ -286,7 +286,7 @@ static bool sj_kvarn_trellis_width_applies(const ggml_tensor * dst) {
 static void sj_kvarn_trellis_width_note(const bool taken, const int n_q) {
     static std::atomic_flag done_on = ATOMIC_FLAG_INIT, done_off = ATOMIC_FLAG_INIT;
     if (taken ? !done_on.test_and_set() : !done_off.test_and_set()) {
-        GGML_LOG_INFO("%s: SJ-KVaRN trellis width route %s (n_q=%d)\n", __func__, taken ? "ON" : "OFF", n_q);
+        GGML_LOG_WARN("%s: SJ-KVaRN trellis width route %s (n_q=%d)\n", __func__, taken ? "ON" : "OFF", n_q);
     }
 }
 
