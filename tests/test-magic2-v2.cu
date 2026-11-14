@@ -23,7 +23,7 @@ static void require(bool value, const char * message) {
 template<int B, int V, uint32_t C>
 static int reference(const uint8_t * tile, int index) {
     constexpr int NB = 128 * B / V;
-    const int step = index / V;
+    const int step = index / (V == 4 ? 2 : V);
     uint32_t state = 0;
     for (int j = 0; j < 16; ++j) {
         const int end = V == 4 ? 7*(step/2) + (step%2 ? 7 : 3) : B*(step + 1);
@@ -280,6 +280,10 @@ int main(int argc, char ** argv) {
         test<3,1,0x87D8D12Du>(rng, perf);
     }
     if (!perf) {
+        const uint32_t words[7] = {0xf0000000u, 0, 0, 0, 0, 0, 0};
+        const auto * tile = reinterpret_cast<const uint8_t *>(words);
+        require(reference<7,4,AIF175_MUL>(tile, 2) == -35, "1.75 oracle uses pair windows");
+        require(aif175_level(tile, 2) == -35, "1.75 CPU uses pair windows");
         test<7,4,AIF175_MUL>(rng, false);
         test<7,4,AIF175_MUL,1>(rng, false);
         test_backend(rng);
