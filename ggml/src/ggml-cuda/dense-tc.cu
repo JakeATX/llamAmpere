@@ -20,7 +20,8 @@ static int dense_tc_mode() {
 static int64_t dense_tc_min() {
     static const int64_t v = [] {
         const char * e = getenv("GGML_CUDA_DENSE_TC_MIN");
-        return e ? (int64_t) atoll(e) : (int64_t) 4096;
+        const long long v = e && *e ? atoll(e) : 4096; // empty or <= 0 keeps the 4096 floor (0 would send decode to bf16 cuBLAS)
+        return (int64_t) (v > 0 ? v : 4096);
     }();
     return v;
 }

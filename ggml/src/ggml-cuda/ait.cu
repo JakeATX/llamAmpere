@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 static int ait_env_int(const char * name, int def) {
     const char * v = getenv(name);
@@ -1512,7 +1513,8 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     ggml_cuda_pool_alloc<float>  sa(ctx.pool(id), (size_t) T * S);
     k_ait_actq_t<<<(unsigned) (T * S), 64, 0, stream>>>(X, W, xq.get(), sa.get(), K, k, (int) T);
     const char * w = (const char *) W;
-    // GGML_CUDA_AIT_MIDT_SPLIT (default 1 = on; 0 = off): 9..32 tokens of AIT2/3/4 run on a token tile that just covers T, with K
+    // GGML_CUDA_AIT_MIDT_SPLIT (default 1 = on; 0 = off): 9..64 tokens (9..32 with GGML_CUDA_AIT_MIDT_MAX_T=32) of AIT2/3/4 run on a
+    // token tile that just covers T, with K
     // split over CTAs when the row tiles alone leave SMs idle (ffn_down: 20 CTAs on 82 SMs). 1 = splits from the SM count,
     // n >= 2 = n splits; both are clamped to [1, min(8, S/2)]. Differs from off by float summation order only when splits > 1;
     // repeats are bitwise equal.
@@ -1522,9 +1524,14 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     // tile) with the same split rule, instead of the unsplit 64-token tile. 9..32 rows are unchanged (same NB, same
     // instances). Any other value is rejected (abort) so a typo cannot pass as a measured arm.
     static const int midt_max = [] {
-        const int v = ait_env_int("GGML_CUDA_AIT_MIDT_MAX_T", 64);
-        GGML_ASSERT((v == 0 || v == 32 || v == 64) && "GGML_CUDA_AIT_MIDT_MAX_T must be 0, 32 or 64");
-        return v == 0 ? 32 : v;
+        const char * e = getenv("GGML_CUDA_AIT_MIDT_MAX_T");
+        if (e == nullptr || *e == '\0') {
+            return 64;
+        }
+        char * end = nullptr;
+        const long v = strtol(e, &end, 10);
+        GGML_ASSERT(*end == '\0' && (v == 0 || v == 32 || v == 64) && "GGML_CUDA_AIT_MIDT_MAX_T must be 0, 32 or 64");
+        return v == 0 ? 32 : (int) v;
     }();
     if (midt > 0 && code == 0 && T >= 9 && T <= midt_max) {
         const int ctas = (M / 32 + 7) / 8;
@@ -1563,7 +1570,17 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     // byte-identical FIT on/off at -ub 12/16/24/32 on the 8 GB file). AIT2/3/4 (code 0) at 9..64 tokens (9..32 with
     // GGML_CUDA_AIT_MIDT_MAX_T=32) take the mid-T path above;
     // with GGML_CUDA_AIT_MIDT_SPLIT=0 they fall back to the wide tile (GGML_CUDA_AIT_MMQ), not to FIT.
-    static const bool fit = ait_env_int("GGML_CUDA_AIT_MMQ_FIT", 1) != 0; // read only in the code == 1 (AIT2P) branch below
+    static const bool fit = [] { // read only in the code == 1 (AIT2P) branch below
+        const char * e = getenv("GGML_CUDA_AIT_MMQ_FIT");
+        if (e == nullptr || *e == '\0' || strcmp(e, "1") == 0) {
+            return true;
+        }
+        if (strcmp(e, "0") == 0) {
+            return false;
+        }
+        GGML_LOG_WARN("ait_mmq: GGML_CUDA_AIT_MMQ_FIT=\"%s\" is not 0 or 1: FIT stays on (the default)\n", e);
+        return true;
+    }();
 #define AIT_MMQ_GO(...) ait_mmq_launch<__VA_ARGS__>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream)
     if (code == 1) {
         const int nb = fit && T >= 9 && T <= 16 ? 2 : fit && T >= 9 && T <= 32 ? 4 : tn / 8;

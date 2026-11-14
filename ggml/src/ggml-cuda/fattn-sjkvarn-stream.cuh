@@ -1460,9 +1460,8 @@ static void ggml_cuda_fattn_sj_kvarn_stream_q5g6(ggml_backend_cuda_context & ctx
         GGML_ASSERT(blocks5 > 0);
         parallel_blocks = ggml_cuda_fattn_sj_kvarn_stream_parallel_blocks(dst, blocks5);
     }
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
+    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+    if (!logged.test_and_set()) {
         GGML_LOG_INFO("%s: SJ-KVaRN compact Q5/G6 decode tile on (mode %d, parallel_blocks %d on the first node)\n", __func__, mode, parallel_blocks);
     }
     ggml_cuda_fattn_sj_kvarn_stream_select<4, turbo4_body, rot, sj_kvarn_tile::q5g6>(ctx, dst, 4, 1, nstage_env, parallel_blocks);
