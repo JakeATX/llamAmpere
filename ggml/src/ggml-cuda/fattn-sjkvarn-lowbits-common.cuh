@@ -1881,7 +1881,8 @@ static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
         const float2 * __restrict__ VKQ_meta,
         float * __restrict__ dst,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        float * __restrict__ lse = nullptr) { // [TRW-LSE] [H, T, S] row log-sum-exp, same row order as the fixup
     // Dimension 0: threadIdx.x
     // Dimension 1: blockIdx.x
     // Dimension 2: blockIdx.y
@@ -1923,6 +1924,10 @@ static __global__ void flash_attn_combine_results(
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
         VKQ_denominator += KQ_max_scale * meta[l].y;
+    }
+
+    if (lse != nullptr && tid == 0) { // rotation-invariant (orthonormal), as the uniform fixup
+        lse[j_dst_unrolled] = VKQ_denominator > 0.0f ? kqmax + logf(VKQ_denominator) : -INFINITY;
     }
 
     if constexpr (rot) {
@@ -2171,7 +2176,10 @@ void launch_fattn(
     // fork (A5, LLAMA_LSA_COMP_LB=1): an LSE output is written by the uniform fixup only, so with one requested every
     // output tile is split into the same number (>= 2) of stream-k blocks; no LSE = the launch shape is unchanged
     const bool stream_k_lse = stream_k && ggml_flash_attn_ext_get_lse(KQV) != nullptr;
-    GGML_ASSERT((stream_k || ggml_flash_attn_ext_get_lse(KQV) == nullptr) && "SJ-KVaRN low-bit FA LSE output needs stream-k");
+    // [TRW-LSE] the trellis width route (no stream-k, I16 trellis body; GGML_SJKVARN_TRELLIS_WIDTH_LSE=1) writes the LSE
+    // through the parallel-block combine; every other non-stream-k low-bit launch (the scalar width kernel) still refuses it
+    const bool combine_lse = !stream_k && ggml_flash_attn_ext_get_lse(KQV) != nullptr && ggml_get_op_params_i32(KQV, 7) == GGML_TYPE_I16;
+    GGML_ASSERT((stream_k || combine_lse || ggml_flash_attn_ext_get_lse(KQV) == nullptr) && "SJ-KVaRN low-bit FA LSE output needs stream-k");
     GGML_ASSERT((!stream_k_lse || ntiles_KV >= 2) && "SJ-KVaRN low-bit FA LSE output: stream-k needs >= 2 KV tiles");
     if (stream_k) {
         auto should_use_stream_k = [](const int cc, const int ntiles_dst, const int max_blocks, const int DKQ) {
@@ -2241,6 +2249,10 @@ void launch_fattn(
 
         if (parallel_blocks_override > 0) {
             parallel_blocks = std::min(parallel_blocks_override, ntiles_KV);
+        }
+        if (combine_lse) { // [TRW-LSE] the LSE is written by the combine only, so keep >= 2 blocks (as fattn-common.cuh)
+            GGML_ASSERT(ntiles_KV >= 2 && "SJ-KVaRN trellis width LSE output needs the parallel-block combine");
+            parallel_blocks = std::max(parallel_blocks, 2);
         }
 
         blocks_num.x = ntiles_x;
@@ -2365,7 +2377,8 @@ void launch_fattn(
         }
         combine
             <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
-            (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks,
+             combine_lse ? (float *) ggml_flash_attn_ext_get_lse(KQV)->data : nullptr);
     }
     CUDA_CHECK(cudaGetLastError());
 }
