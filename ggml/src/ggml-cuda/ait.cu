@@ -1517,13 +1517,14 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     // n >= 2 = n splits; both are clamped to [1, min(8, S/2)]. Differs from off by float summation order only when splits > 1;
     // repeats are bitwise equal.
     static const int midt = ait_env_int("GGML_CUDA_AIT_MIDT_SPLIT", 1);
-    // GGML_CUDA_AIT_MIDT_MAX_T (default 32 = unchanged; 64 = opt-in, MIDT64): upper row count of the mid-T path. 33..64 rows
-    // then take a token tile of 8 * ceil(T / 8) (NB 5..8, smem <= 64 KB like the 64-token tile) with the same split rule,
-    // instead of the unsplit 64-token tile. Any other value is rejected (abort) so a typo cannot pass as a measured arm.
+    // GGML_CUDA_AIT_MIDT_MAX_T (default 64, MIDT64, Jake 2026-11-14; 32 or 0 = kill switch, the old 9..32 range): upper row
+    // count of the mid-T path. 33..64 rows take a token tile of 8 * ceil(T / 8) (NB 5..8, smem <= 64 KB like the 64-token
+    // tile) with the same split rule, instead of the unsplit 64-token tile. 9..32 rows are unchanged (same NB, same
+    // instances). Any other value is rejected (abort) so a typo cannot pass as a measured arm.
     static const int midt_max = [] {
-        const int v = ait_env_int("GGML_CUDA_AIT_MIDT_MAX_T", 32);
-        GGML_ASSERT((v == 32 || v == 64) && "GGML_CUDA_AIT_MIDT_MAX_T must be 32 or 64");
-        return v;
+        const int v = ait_env_int("GGML_CUDA_AIT_MIDT_MAX_T", 64);
+        GGML_ASSERT((v == 0 || v == 32 || v == 64) && "GGML_CUDA_AIT_MIDT_MAX_T must be 0, 32 or 64");
+        return v == 0 ? 32 : v;
     }();
     if (midt > 0 && code == 0 && T >= 9 && T <= midt_max) {
         const int ctas = (M / 32 + 7) / 8;
@@ -1559,7 +1560,8 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     // GGML_CUDA_AIT_MMQ_FIT (default 0 = off; 1 = on), AIT2P (code 1) only: 9..16 tokens run a 16-token tile, 17..32 a 32-token tile
     // (1..8 tokens never reach here; ait_fast takes them). Token columns are independent (exact int32 per slice, the same float
     // order per token), so the output is the same bits as the wide tile (MERGE2 m2-amp2pid: llama-perplexity log-probs
-    // byte-identical FIT on/off at -ub 12/16/24/32 on the 8 GB file). AIT2/3/4 (code 0) at 9..32 tokens take the mid-T path above;
+    // byte-identical FIT on/off at -ub 12/16/24/32 on the 8 GB file). AIT2/3/4 (code 0) at 9..64 tokens (9..32 with
+    // GGML_CUDA_AIT_MIDT_MAX_T=32) take the mid-T path above;
     // with GGML_CUDA_AIT_MIDT_SPLIT=0 they fall back to the wide tile (GGML_CUDA_AIT_MMQ), not to FIT.
     static const bool fit = ait_env_int("GGML_CUDA_AIT_MMQ_FIT", 0) != 0;
 #define AIT_MMQ_GO(...) ait_mmq_launch<__VA_ARGS__>(w, xq.get(), sa.get(), Y, M, K, (int) T, stream)
