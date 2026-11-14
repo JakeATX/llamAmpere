@@ -270,9 +270,9 @@ static bool sj_kvarn_trellis_words() {
 }
 // [TRW] GGML_SJKVARN_TRELLIS_WIDTH=1 (opt-in, default off): 3/3 trellis decode/verify (n_q <= 8) takes the width kernel
 // (fattn-sjkvarn-lowbits-stream.cuh, template bits_k | 8) instead of the tile build. Same exclusions as the scalar width
-// route (GGML_SJKVARN_NO_DIRECT, LSA full stage incl. the compact strip stage). LSE nodes (LLAMA_LSA_COMP=2) take it too:
-// fattn-common.cuh launch_fattn keeps >= 2 parallel blocks for them, the kernel writes (max, sum) per block in natural-exp
-// units and flash_attn_combine_results writes lse = max + log(sum) (fattn-common.cuh:1781).
+// route (GGML_SJKVARN_NO_DIRECT, LSA full stage incl. the compact strip stage). LSE nodes (LLAMA_LSA_COMP=2 + COMP_LB=1)
+// stay on the tile build unless GGML_SJKVARN_TRELLIS_WIDTH_LSE=1 (below): the width launch is the low-bit launch_fattn
+// (fattn-sjkvarn-lowbits-common.cuh), which then keeps >= 2 parallel blocks and its combine writes lse = max + log(sum).
 static bool sj_kvarn_trellis_width() {
     static const bool v = [] { const char * e = getenv("GGML_SJKVARN_TRELLIS_WIDTH"); return e != nullptr && e[0] == '1'; }();
     return v;
