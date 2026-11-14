@@ -280,7 +280,8 @@ static bool sj_kvarn_trellis_width() {
 static bool sj_kvarn_trellis_width_applies(const ggml_tensor * dst) {
     const int bits = ggml_get_op_params_i32(dst,5);
     return sj_kvarn_trellis_width() && bits == ((3 << 8) | 3) && ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 &&
-        dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct() && !ggml_cuda_lsa_page_full_stage(dst->src[5]);
+        dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct() && !ggml_cuda_lsa_page_full_stage(dst->src[5]) &&
+        ggml_flash_attn_ext_get_lse(dst) == nullptr; // LSE nodes (LLAMA_LSA_COMP=2 + COMP_LB=1) stay on the tile build: its stream-k fixup writes the LSE
 }
 // route proof for the gate: one line per process on the first n_q <= 8 call that takes it, one on the first that does not
 static void sj_kvarn_trellis_width_note(const bool taken, const int n_q) {
