@@ -13845,9 +13845,16 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 hot_bytes >> 20, pin_bytes >> 20, new_bytes >> 20, ranges.size(), available >> 20);
         // The RAM floor guards new pinning only: with no ranges there is nothing to pin, so a host just under
         // 7 GiB free must not fall back to legacy host routing (~35% slower writing at home, 2026-10-22).
-        if (pin_bytes > SIZE_MAX - floor - margin || (!ranges.empty() && available < pin_bytes + floor + margin) ||
-                new_bytes > SIZE_MAX - margin || !moe_cache_cgroup_headroom(new_bytes + margin, retained_registered)) {
-            MOE_CACHE_LOG("[moe-cache] device tables skipped: pinning would exceed RAM floor or service headroom\n");
+        const bool ram_short = pin_bytes > SIZE_MAX - floor - margin || (!ranges.empty() && available < pin_bytes + floor + margin);
+        if (ram_short || new_bytes > SIZE_MAX - margin || !moe_cache_cgroup_headroom(new_bytes + margin, retained_registered)) {
+            // A warning, not info: the fallback below is much slower, and the reason must show at the default log level.
+            if (ram_short) {
+                GGML_LOG_WARN("[moe-cache] device tables skipped: pinning would exceed RAM floor or service headroom"
+                        " (available=%zu MiB, needs map=%zu MiB + floor=%zu MiB + margin=%zu MiB; GGML_MOE_DEVICE_RAM_FLOOR_MIB and GGML_MOE_DEVICE_RAM_MARGIN_MIB set the floor and margin)\n",
+                        available >> 20, pin_bytes >> 20, floor >> 20, margin >> 20);
+            } else {
+                GGML_LOG_WARN("[moe-cache] device tables skipped: pinning would exceed RAM floor or service headroom (container or service memory limit)\n");
+            }
             return fail();
         }
         ggml_cuda_set_device(device.logical);
