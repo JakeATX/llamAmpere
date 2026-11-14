@@ -6203,8 +6203,21 @@ bool llm_graph_context::build_attn_lsa_mean_refresh(
             if (nbs <= 0) {
                 return (ggml_tensor *) nullptr;
             }
-            ggml_tensor * x = ggml_cast(ctx0, ggml_view_2d(ctx0, base, dx*B, nbs, base->nb[1]*B, 0), GGML_TYPE_F32);
-            w = ggml_cpy(ctx0, mean_rows(x, dx), ggml_view_2d(ctx0, mc, dx, nbs, mc->nb[1], 0));
+            // LLAMA_LSA_MEAN_CHUNKS=1 (opt-in): full rebuild in at most 8 chunks of CB >= 16 blocks: only one chunk's F32
+            // copy and its permuted copy are live at a time (2*CB*B*dx*4 B instead of 2*nbs*B*dx*4 B, 130 MiB for a 16K MTP
+            // draft window); the cap keeps the extra graph nodes bounded on a large non-SJ main cache. Each block's mean is
+            // the same ops on the same rows and concat only moves the F32 results, so the means are the bits of one pass.
+            // Off (default): one chunk of all nbs blocks, the same graph as before.
+            const int64_t CB = llama_lsa_cfg().mean_chunks ? std::max<int64_t>(16, (nbs + 7)/8) : nbs;
+            ggml_tensor * m = nullptr;
+            for (int64_t c0 = 0; c0 < nbs; c0 += CB) {
+                const int64_t nc = std::min<int64_t>(CB, nbs - c0);
+                ggml_tensor * x  = ggml_cast(ctx0, ggml_view_2d(ctx0, base, dx*B, nc, base->nb[1]*B, (size_t) c0*B*base->nb[1]),
+                                             GGML_TYPE_F32);
+                ggml_tensor * mx = mean_rows(x, dx);
+                m = m ? ggml_concat(ctx0, m, mx, 1) : mx;
+            }
+            w = ggml_cpy(ctx0, m, ggml_view_2d(ctx0, mc, dx, nbs, mc->nb[1], 0));
         } else {
             ggml_tensor * g = ggml_get_rows(ctx0, ggml_view_2d(ctx0, base, dx*B, nbm, base->nb[1]*B, 0), inp->lsa_u_blk);
             w = ggml_set_rows(ctx0, mc, mean_rows(g, dx), inp->lsa_u_blk);
