@@ -7099,6 +7099,53 @@ struct test_gated_delta_net_verify : public test_gated_delta_net {
     }
 };
 
+// [TAG_GDN_REPLAY_LANES] ggml_gated_delta_net_set_prefix with one mask per seq (w [K, n_seqs]) or, with per_lane false,
+// one 1-D mask for all seqs (prefix stride 0, the default form). accepted[s] = the slots lane s replays.
+struct test_gated_delta_net_lanes : public test_gated_delta_net {
+    const std::vector<int64_t> accepted;
+    const bool per_lane;
+
+    test_gated_delta_net_lanes(int64_t tokens, int64_t K, int32_t emit, std::vector<int64_t> accepted, bool per_lane)
+        : test_gated_delta_net(GGML_TYPE_F32, 4, 128, tokens, (int64_t) accepted.size(), 3, false, false, K, emit),
+          accepted(std::move(accepted)), per_lane(per_lane) {}
+
+    std::string vars() override {
+        std::string acc;
+        for (int64_t a : accepted) {
+            acc += (acc.empty() ? "" : "/") + std::to_string(a);
+        }
+        return test_gated_delta_net::vars() + ",accepted=" + acc + ",per_lane=" + std::to_string(per_lane);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "GATED_DELTA_NET_LANES"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_gated_delta_net::build_graph(ctx);
+        const int64_t H = head_count * v_repeat;
+        ggml_tensor * ring = ggml_new_tensor_2d(ctx, type, K * H * ggml_gated_delta_net_ingr_width(head_size, 1, emit_mode), n_seqs);
+        ggml_tensor * w    = per_lane ? ggml_new_tensor_2d(ctx, type, K, n_seqs) : ggml_new_tensor_1d(ctx, type, K);
+        ggml_set_name(ring, "ring");
+        ggml_set_name(w, "w");
+        ggml_gated_delta_net_set_prefix(out, ring, w, emit_mode);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_gated_delta_net::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ring") == 0) {
+                init_tensor_uniform(t, -0.05f, 0.0f);
+            } else if (strcmp(t->name, "w") == 0) {
+                std::vector<float> w(ggml_nelements(t), 0.0f);
+                for (int64_t s = 0; s < t->ne[1]; ++s) {
+                    std::fill(w.begin() + s * K, w.begin() + s * K + std::min(accepted[s], K), 1.0f);
+                }
+                ggml_backend_tensor_set(t, w.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 static void add_gated_delta_net_range_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     if (!perf) {
         for (int emit : {0, 1, 2}) {
@@ -22770,6 +22817,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128,  72, 1, 4, false, false, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  65, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 520, 1, 3, false, false, 4));
+
+    // [TAG_GDN_REPLAY_LANES] GGML_TEST_GDN_LANES=1: prefix masks per lane (w [K, 2..4]) and the 1-D form (stride 0)
+    if (const char * e = getenv("GGML_TEST_GDN_LANES"); e != nullptr && atoi(e) != 0) {
+        for (int32_t emit : { 1, 2 }) {
+            for (int64_t n : { 4, 5 }) { // n == K and n == K + 1 (fold path), K = 4
+                test_cases.emplace_back(new test_gated_delta_net_lanes(n, 4, emit, { 2 }, false));
+                test_cases.emplace_back(new test_gated_delta_net_lanes(n, 4, emit, { 3, 3, 3 }, false));
+                test_cases.emplace_back(new test_gated_delta_net_lanes(n, 4, emit, { 0, 3 }, true));
+                test_cases.emplace_back(new test_gated_delta_net_lanes(n, 4, emit, { 4, 1, 0 }, true));
+                test_cases.emplace_back(new test_gated_delta_net_lanes(n, 4, emit, { 1, 4, 2, 0 }, true));
+                test_cases.emplace_back(new test_gated_delta_net_lanes(n, 4, emit, { 2, 2, 2, 2 }, true));
+            }
+        }
+    }
 
     // fork: long CPU reference runs are opt-in; tail cases straddle the 32-token chunk boundary.
     const char * gdn_tc_tests = getenv("GGML_TEST_GDN_TC");

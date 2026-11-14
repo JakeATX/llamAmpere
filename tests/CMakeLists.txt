@@ -170,10 +170,12 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-gdn-replay-lanes.cpp) # [TAG_GDN_REPLAY_LANES] joint vs split replay; needs a GDN model (-m)
 llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
+llama_build_and_test(test-gdn-prefix-lanes.cpp LABEL "turbo") # [TAG_GDN_REPLAY_LANES] per-lane prefix mask
 llama_build_and_test(test-sjkvarn-codec.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-sjkvarn-attn.cpp LABEL "turbo")
@@ -343,6 +345,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-gdn-replay-lanes
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-gdn-replay-lanes PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 

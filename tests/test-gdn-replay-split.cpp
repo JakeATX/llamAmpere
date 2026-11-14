@@ -5,6 +5,7 @@
 //   - lanes that disagree are split, including after earlier ubatches of the same batch changed them,
 //   - every token is used and each seq's trailing n_keep_tail tokens stay in one ubatch,
 //   - with the constraint off (fn() == nullptr) the split is the old one.
+// [TAG_GDN_REPLAY_LANES] with lanes on, seqs that differ share a ubatch only at >= n_rs_seq tokens per seq (B1).
 #include "../src/llama-batch.h"
 #include "../src/llama-memory-recurrent.h"
 #include "../src/llama-vocab.h"
@@ -27,10 +28,11 @@ struct split_result {
     std::vector<std::vector<llama_seq_id>> seqs; // per ubatch, its seqs
     uint32_t n_used   = 0;
     uint32_t n_tokens = 0;
+    uint32_t n_mixed  = 0; // ubatches whose lanes differ (lanes on)
 };
 
 // runs the init_batch loop; fails the process on any broken invariant
-static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch, uint32_t n_rs_seq, bool constrain) {
+static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch, uint32_t n_rs_seq, bool constrain, bool lanes_on = false) {
     const uint32_t n_seq = lanes.size();
 
     int32_t n_tokens = 0;
@@ -60,6 +62,7 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
 
     llama_memory_recurrent::replay_split rs;
     rs.active   = constrain;
+    rs.lanes    = constrain && lanes_on;
     rs.n_rs_seq = n_rs_seq;
     for (const lane & l : lanes) {
         rs.replay_len.push_back(l.replay_len);
@@ -69,6 +72,12 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
     if (!constrain) {
         GGML_ASSERT(rs.fn() == nullptr);
     }
+    if (!rs.lanes) {
+        GGML_ASSERT(rs.strict_fn() == nullptr && rs.n_mixed_min() == 0);
+    }
+    rs.count_tokens(balloc.get_batch());
+    llama_memory_recurrent::lanes_stats stats;
+    rs.stats = rs.lanes ? &stats : nullptr;
 
     const uint32_t n_keep_tail = n_rs_seq > 0 ? n_rs_seq + 1 : 0;
 
@@ -80,7 +89,7 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
 
     balloc.split_reset();
     while (true) {
-        llama_ubatch ub = balloc.split_equal(n_ubatch, true, n_keep_tail, rs.fn());
+        llama_ubatch ub = balloc.split_equal(n_ubatch, true, n_keep_tail, rs.fn(), rs.strict_fn(), rs.n_mixed_min());
         if (ub.n_tokens == 0) {
             break;
         }
@@ -89,9 +98,14 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
         std::vector<llama_seq_id> ids(ub.seq_id_unq, ub.seq_id_unq + ub.n_seqs_unq);
         if (constrain) {
             // the values the graph would see for this ubatch agree across its lanes
+            // with lanes: or the ubatch is at least n_rs_seq wide (the static verify graph)
+            bool mixed = false;
             for (llama_seq_id s : ids) {
                 GGML_ASSERT(rs.compat(ids[0], s));
+                mixed |= !rs.strict(ids[0], s);
             }
+            GGML_ASSERT(!mixed || (rs.lanes && ub.n_seq_tokens >= n_rs_seq));
+            res.n_mixed += mixed;
         }
         const size_t k = res.seqs.size();
         for (uint32_t i = 0; i < ub.n_tokens; ++i) {
@@ -102,7 +116,7 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
                 last_ub[s] = k;
             }
         }
-        rs.advance(ub);
+        rs.advance(ub, balloc.get_split_cut());
         res.seqs.push_back(ids);
     }
     res.n_used = balloc.get_n_used();
@@ -175,9 +189,39 @@ int main() {
         printf("\n");
     }
 
+    // [TAG_GDN_REPLAY_LANES] lanes on: 4 verify lanes of n_rs_seq + 1 tokens with 4 different replays share one ubatch
+    {
+        const std::vector<lane> four = { { 4, 0, 3, 0 }, { 4, 1, 3, 0 }, { 4, 3, 3, 0 }, { 4, 0, 3, 1 } };
+        auto r = run_split(four, 512, n_rs_seq, true, true);
+        GGML_ASSERT(r.seqs.size() == 1 && r.seqs[0].size() == 4 && r.n_mixed == 1);
+        auto r0 = run_split(four, 512, n_rs_seq, true, false);
+        GGML_ASSERT(r0.seqs.size() == 4);
+        // n == n_rs_seq (drafter one short) is still static width
+        r = run_split({ { 3, 1, 3, 0 }, { 3, 2, 3, 0 } }, 512, n_rs_seq, true, true);
+        GGML_ASSERT(r.seqs.size() == 1 && r.seqs[0].size() == 2);
+        // a short round (n < n_rs_seq) keeps the strict rule
+        r = run_split({ { 2, 1, 3, 0 }, { 2, 2, 3, 0 } }, 512, n_rs_seq, true, true);
+        GGML_ASSERT(r.seqs.size() == 2);
+        // agreeing short lanes still share
+        r = run_split({ { 2, 1, 3, 0 }, { 2, 1, 3, 0 } }, 512, n_rs_seq, true, true);
+        GGML_ASSERT(r.seqs.size() == 1);
+        printf("lanes: 4 different replays in 1 ubatch, short rounds strict\n");
+    }
+    // B1: two long prompts with different replays and a small n_ubatch: the width (5 / 2 = 2) is below n_rs_seq, so
+    // no mixed ubatch; at n_ubatch 6 (width 3 == n_rs_seq) they may mix. run_split checks the width of every mixed ubatch
+    {
+        auto r = run_split({ { 20, 1, 3, 0 }, { 20, 2, 3, 0 } }, 5, n_rs_seq, true, true);
+        GGML_ASSERT(r.n_mixed == 0);
+        auto r6 = run_split({ { 20, 1, 3, 0 }, { 20, 2, 3, 0 } }, 6, n_rs_seq, true, true);
+        GGML_ASSERT(r6.n_mixed > 0);
+        printf("B1: n_ubatch 5 -> %zu ubatches, none mixed; n_ubatch 6 -> %zu ubatches, %u mixed\n", r.seqs.size(), r6.seqs.size(), r6.n_mixed);
+    }
+
     // random batches: the invariants are checked inside run_split
     std::mt19937 rng(1234);
     int n_split_cases = 0;
+    int n_lanes_saved = 0;
+    int n_mixed       = 0;
     for (int it = 0; it < 20000; ++it) {
         const uint32_t n_seq = 1 + rng() % 4;
         std::vector<lane> lanes(n_seq);
@@ -190,9 +234,13 @@ int main() {
         const uint32_t n_ubatch = n_rs_seq + 2 + rng() % 40;
         auto r = run_split(lanes, n_ubatch, n_rs_seq, true);
         auto r0 = run_split(lanes, n_ubatch, n_rs_seq, false);
+        auto rl = run_split(lanes, n_ubatch, n_rs_seq, true, true);
         n_split_cases += r.seqs.size() > r0.seqs.size();
+        n_lanes_saved += r.seqs.size() > rl.seqs.size();
+        n_mixed       += rl.n_mixed;
     }
-    printf("random: 20000 batches passed, %d needed extra ubatches\n", n_split_cases);
+    printf("random: 20000 batches passed, %d needed extra ubatches; lanes: %d needed fewer, %d mixed ubatches\n",
+            n_split_cases, n_lanes_saved, n_mixed);
     printf("OK\n");
     return 0;
 }
