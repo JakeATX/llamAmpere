@@ -239,6 +239,16 @@ int main() {
         // agreeing lanes keep today's rule (strict ubatch, bystander not checked)
         r = run_split({ { 4, 1, 3, 0 }, { 4, 1, 3, 0 }, { 4, 1, 3, 0 }, { 0, 2, 3, 0 } }, 512, n_rs_seq, true, true, cells);
         GGML_ASSERT(r.seqs.size() == 1 && r.n_bystand == 0);
+        // keep-tail defers a member (seq 2: 4 tokens, 1 left < n_keep_tail 4) that sits in cell 1 between seqs 0 and 1
+        // (cells 0, 2) with a pending replay: the kept {0, 1} must not go out mixed
+        r = run_split({ { 3, 1, 3, 0 }, { 3, 2, 3, 0 }, { 4, 3, 3, 0 } }, 512, n_rs_seq, true, true, { 0, 2, 1 });
+        for (const auto & ids : r.seqs) {
+            GGML_ASSERT(ids.size() == 1);
+        }
+        GGML_ASSERT(r.n_mixed == 0 && r.n_bystand == 1);
+        // same lengths, cells in order: seq 2 is outside the range of {0, 1}, which goes out mixed
+        r = run_split({ { 3, 1, 3, 0 }, { 3, 2, 3, 0 }, { 4, 3, 3, 0 } }, 512, n_rs_seq, true, true, { 0, 1, 2 });
+        GGML_ASSERT(r.n_mixed == 1 && r.n_bystand == 0);
         printf("lanes: bystander guard\n");
     }
     // B1: two long prompts with different replays and a small n_ubatch: the width (5 / 2 = 2) is below n_rs_seq, so
@@ -256,6 +266,8 @@ int main() {
     int n_split_cases = 0;
     int n_lanes_saved = 0;
     int n_mixed       = 0;
+    int n_mixed_cells = 0;
+    uint64_t n_bystand = 0;
     for (int it = 0; it < 20000; ++it) {
         const uint32_t n_seq = 1 + rng() % 4;
         std::vector<lane> lanes(n_seq);
@@ -272,9 +284,23 @@ int main() {
         n_split_cases += r.seqs.size() > r0.seqs.size();
         n_lanes_saved += r.seqs.size() > rl.seqs.size();
         n_mixed       += rl.n_mixed;
+        // with cells: permuted, plus a bystander outside the batch (run_split checks set_ok on every final mixed ubatch)
+        lanes.push_back({ 0, 0, 0, 0 });
+        lanes.back().ckpt_span  = rng() % (n_rs_seq + 1);
+        lanes.back().replay_len = rng() % (lanes.back().ckpt_span + 1);
+        lanes.back().s_stale    = (rng() % 4) == 0;
+        std::vector<int32_t> cells(lanes.size());
+        for (size_t q = 0; q < cells.size(); ++q) {
+            cells[q] = (int32_t) q;
+        }
+        std::shuffle(cells.begin(), cells.end(), rng);
+        auto rc = run_split(lanes, n_ubatch, n_rs_seq, true, true, cells);
+        n_mixed_cells += rc.n_mixed;
+        n_bystand     += rc.n_bystand;
     }
-    printf("random: 20000 batches passed, %d needed extra ubatches; lanes: %d needed fewer, %d mixed ubatches\n",
-            n_split_cases, n_lanes_saved, n_mixed);
+    printf("random: 20000 batches passed, %d needed extra ubatches; lanes: %d needed fewer, %d mixed ubatches; "
+           "with cells: %d mixed, %llu bystander cuts\n",
+            n_split_cases, n_lanes_saved, n_mixed, n_mixed_cells, (unsigned long long) n_bystand);
     printf("OK\n");
     return 0;
 }

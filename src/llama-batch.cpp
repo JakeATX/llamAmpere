@@ -893,6 +893,29 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         n_seqs = n_keep;
     }
 
+    // keep-tail may have deferred a member: it is a bystander now, so check the kept list again
+    if (strict && set_ok && n_seqs > 1 && (split_cut & SPLIT_CUT_TAIL)) {
+        std::vector<llama_seq_id> seqs;
+        bool all_strict = true;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            const int32_t i0 = idxs_per_seq[s][0];
+            for (int32_t k = 0; k < batch.n_seq_id[i0]; ++k) {
+                seqs.push_back(batch.seq_id[i0][k]);
+                all_strict = all_strict && (s == 0 || strict(first_seq_id, batch.seq_id[i0][k]));
+            }
+        }
+        if (!all_strict && !set_ok(seqs)) {
+            for (uint32_t s = 1; s < n_seqs; ++s) {
+                for (const int32_t idx : idxs_per_seq[s]) {
+                    used[idx] = false;
+                    --n_used;
+                }
+            }
+            n_seqs = 1;
+            split_cut |= SPLIT_CUT_SET;
+        }
+    }
+
     // concat the per-sequence-set lists
     std::vector<int32_t> idxs;
 
