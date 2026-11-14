@@ -292,6 +292,9 @@ struct fattn_sj_kvarn_lowbits_ctx {
     const char * page_stage; // GGML_CUDA_LSA_RESIDENT_STAGE: table entry -3 - k = stage index k (page_stage + k*rec_stride)
     const ggml_cuda_qsa_clock_map * page_map = nullptr; // compact-stage metadata only
     int page_head = 0;
+    // GGML_SJKVARN_LIVE_TILES (opt-in, nullptr otherwise): [0] = count, then the physical KV tile ids that some query
+    // row can see, ascending; the tile kernel's kb0 then counts list entries (flash_attn_ext_f16_iter maps it)
+    const int * live_tiles = nullptr;
 };
 
 // fork: descriptor entry 15 (zero in every writer, below GGML_SJKVARN_DESC_N_ENTRIES) carries per-call flags without a
@@ -1939,6 +1942,11 @@ static __global__ void flash_attn_combine_results(
     }
 }
 
+// SJ-KVaRN live-tile list ([0] = count, then the live KV tile ids in order) for the stream-k tile kernel, passed in its
+// KV_max slot; set around the launch by the opt-in tile walk (GGML_SJKVARN_LIVE_TILES=1, fattn-sjkvarn-lowbits.cu).
+// The kernel splits the live tiles evenly, so the launch must give every output tile the same number of blocks.
+inline thread_local const int * ggml_cuda_fattn_sj_live_tiles = nullptr;
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -2216,6 +2224,10 @@ void launch_fattn(
                 : nblocks_stream_k_raw;
 
             blocks_num.x = stream_k_lse ? std::max(2, nblocks_stream_k_raw / ntiles_dst) * ntiles_dst : nblocks_stream_k;
+            if (ggml_cuda_fattn_sj_live_tiles != nullptr) {
+                // live-tile walk: the kernel divides max(live count, blocks per tile) evenly, so whole multiples only
+                blocks_num.x = std::max(stream_k_lse ? 2 : 1, nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
+            }
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
@@ -2287,13 +2299,15 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
+    // the live-tile list replaces the KV bound, which an SJ-KVaRN launch never computes (no mask scan for SJ, no sparse path)
+    GGML_ASSERT(ggml_cuda_fattn_sj_live_tiles == nullptr || (is_sj_kvarn && stream_k && !use_sparse && KV_max.ptr == nullptr));
     fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         (const char *) Q->data,
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
-        KV_max.ptr,
+        ggml_cuda_fattn_sj_live_tiles != nullptr ? ggml_cuda_fattn_sj_live_tiles : KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
