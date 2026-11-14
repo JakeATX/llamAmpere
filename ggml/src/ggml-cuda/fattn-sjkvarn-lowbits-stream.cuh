@@ -1072,6 +1072,17 @@ static void ggml_cuda_sj_kvarn_lowbits_launch(ggml_backend_cuda_context & ctx, g
         false, false, false, false, WARP_SIZE, 0, rot ? plain : nullptr);
 }
 
+// trellis width route only: GGML_SJKVARN_TRELLIS_W5_MW8=1 runs n_q = 5 on the mw = 8 instance (ptxas: mw 5 spills ~2x mw 8)
+static bool sj_kvarn_trellis_w5_mw8() {
+    // the first read happens on the first trellis n_q = 5 call, so the line proves the mw 8 launch was taken
+    static const bool v = [] {
+        const char * e = getenv("GGML_SJKVARN_TRELLIS_W5_MW8");
+        const bool on = e && e[0] == '1';
+        if (on) { GGML_LOG_WARN("%s: SJ-KVaRN trellis width n_q=5 runs on the mw 8 instance\n", __func__); }
+        return on;
+    }();
+    return v;
+}
 template<int bits_k, int bits_v, bool rot = false>
 static void ggml_cuda_sj_kvarn_lowbits_width(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int nt = dst->src[0]->ne[1];
@@ -1090,7 +1101,7 @@ static void ggml_cuda_sj_kvarn_lowbits_width(ggml_backend_cuda_context & ctx, gg
     }
     if (nt <= 4) {
         ggml_cuda_sj_kvarn_lowbits_launch<4,bits_k,bits_v,rot>(ctx,dst,nt,nt == 1 ? 2 : 4/nt);
-    } else if (nt == 5) {
+    } else if (nt == 5 && !((bits_k & 8) && sj_kvarn_trellis_w5_mw8())) {
         ggml_cuda_sj_kvarn_lowbits_launch<5,bits_k,bits_v,rot>(ctx,dst,nt,1);
     } else {
         ggml_cuda_sj_kvarn_lowbits_launch<8,bits_k,bits_v,rot>(ctx,dst,nt,1);
