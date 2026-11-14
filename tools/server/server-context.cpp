@@ -3319,6 +3319,11 @@ private:
         }
 
         if (ret) {
+            if (ret->ctx_shared && !ret->is_processing()) {
+                // D-share: make the room this task needs before a prompt-cache load writes into the slot
+                slot_ctx_share_update(ret, (int64_t) task.tokens.size() + 64);
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for the tasks that reuse them
@@ -5523,30 +5528,37 @@ private:
     }
 
     // D-share (--slot-ctx with 0 entries): the shared slots' caps follow what the other shared users hold.
-    // A busy shared slot claims max(cells held, its prompt); an idle shared slot's cells are reclaimable: they are
-    // cleared (LRU) only when the busy shared users need them. Reserved slots are never touched.
-    void slot_ctx_share_update() {
+    // A busy shared slot claims its task's prompt while it starts (the old cache tail past the common prefix is trimmed
+    // before any new cell is written; admission checks the same number + 64) and the cells it holds once generating.
+    // An idle shared slot's cells are reclaimable: saved to the prompt cache (if on) and cleared, LRU first, only when
+    // the busy shared users need them. Reserved slots are never touched. `incoming` = an idle shared slot about to take
+    // a task needing `incoming_need` cells: it counts as busy, and its cap also leaves out the idle cells still held,
+    // so a prompt-cache load into it stays inside the shared room.
+    void slot_ctx_share_update(server_slot * incoming = nullptr, int64_t incoming_need = 0) {
         if (slot_ctx_share_budget <= 0) {
             return;
         }
-        const auto claim = [](const server_slot & s) -> int64_t {
-            int64_t u = s.prompt.n_tokens();
-            if (s.task && (s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT)) {
-                u = std::max<int64_t>(u, s.task->n_tokens());
+        const auto busy_of = [&](const server_slot & s) { return &s == incoming || s.is_processing(); };
+        const auto claim = [&](const server_slot & s) -> int64_t {
+            if (&s == incoming) {
+                return incoming_need;
             }
-            return u;
+            if (s.task && (s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT)) {
+                return s.task->n_tokens();
+            }
+            return s.prompt.n_tokens();
         };
         int64_t busy = 0;
         int64_t idle = 0;
         for (const auto & s : slots) {
             if (s.ctx_shared) {
-                (s.is_processing() ? busy : idle) += s.is_processing() ? claim(s) : s.prompt.n_tokens();
+                (busy_of(s) ? busy : idle) += busy_of(s) ? claim(s) : s.prompt.n_tokens();
             }
         }
         while (busy + idle > slot_ctx_share_budget) {
             server_slot * lru = nullptr;
             for (auto & s : slots) {
-                if (s.ctx_shared && !s.is_processing() && s.prompt.n_tokens() > 0 && (!lru || s.t_last_used < lru->t_last_used)) {
+                if (s.ctx_shared && !busy_of(s) && s.prompt.n_tokens() > 0 && (!lru || s.t_last_used < lru->t_last_used)) {
                     lru = &s;
                 }
             }
@@ -5555,6 +5567,10 @@ private:
             }
             SRV_WRN("--slot-ctx: clearing idle shared slot %d (%d tokens) for the busy shared users\n", lru->id, lru->prompt.n_tokens());
             idle -= lru->prompt.n_tokens();
+            if (prompt_cache) {
+                lru->prompt_save(*prompt_cache);
+                prompt_cache->update();
+            }
             lru->prompt_clear();
         }
         for (auto & s : slots) {
@@ -5563,9 +5579,12 @@ private:
             }
             int64_t others = 0;
             for (const auto & t : slots) {
-                if (t.ctx_shared && t.id != s.id && t.is_processing()) {
+                if (t.ctx_shared && t.id != s.id && busy_of(t)) {
                     others += claim(t);
                 }
+            }
+            if (&s == incoming) {
+                others += std::max<int64_t>(idle, 0);
             }
             const int64_t cap = std::clamp<int64_t>(slot_ctx_share_budget - others, 0, n_ctx_slot());
             s.n_ctx     = (int32_t) cap;

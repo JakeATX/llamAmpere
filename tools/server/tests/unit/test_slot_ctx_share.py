@@ -1,4 +1,5 @@
 import os
+import time
 import pytest
 from utils import *
 
@@ -11,8 +12,11 @@ POOL, LONG, BUDGET = 4096, 2048, 1536
 
 
 @pytest.fixture(autouse=True)
-def create_server(tmp_path):
+def create_server(tmp_path, monkeypatch):
     global server
+    # no prompt cache (RAM or disk tier): a cached prompt from an earlier test would hide the prefill counts below
+    monkeypatch.setenv("LLAMA_ARG_NO_CACHE_DISK", "1")
+    monkeypatch.setenv("LLAMA_ARG_CACHE_RAM", "0")
     server = ServerPreset.tinyllama2()
     server.n_ctx = POOL
     server.n_slots = 3
@@ -43,8 +47,9 @@ def prompt_of(n: int, seed: int = 0) -> str:
     return " ".join(out)
 
 
-def complete(prompt: str, id_slot: int = -1, n_predict: int = 8):
-    data = {"prompt": prompt, "n_predict": n_predict, "cache_prompt": True, "temperature": 0.0, "top_k": 1}
+def complete(prompt: str, id_slot: int = -1, n_predict: int = 8, ignore_eos: bool = False):
+    data = {"prompt": prompt, "n_predict": n_predict, "cache_prompt": True, "temperature": 0.0, "top_k": 1,
+            "ignore_eos": ignore_eos}
     if id_slot >= 0:
         data["id_slot"] = id_slot
     return server.make_request("POST", "/completion", data=data)
@@ -99,10 +104,13 @@ def test_share_reserved_slot_never_purged():
     res = complete(prompt_of(1300, seed=4), id_slot=2, n_predict=4)   # needs slot 1's idle cells: slot 1 is cleared
     assert res.status_code == 200
     assert slots()[1]["n_prompt_tokens"] == 0
-    results = parallel_function_calls([(complete, (prompt_of(700, seed=s), s, 600)) for s in (1, 2)])
+    # two shared users at once, each asking for more than the whole shared budget: whatever the overlap, each stops
+    # with truncated (finish_reason length) inside the shared room, never an error, never a purge of slot 0
+    results = parallel_function_calls([(complete, (prompt_of(700, seed=s), s, 2000, True)) for s in (1, 2)])
     for res in results:
-        assert res.status_code == 200
-    assert any(r.body.get("truncated") or r.body.get("stop_type") == "limit" for r in results)
+        assert res.status_code == 200, res.body
+        assert res.body["truncated"], res.body
+        assert res.body["timings"]["prompt_n"] + res.body["timings"]["predicted_n"] <= BUDGET + 8
     assert sum(s["n_prompt_tokens"] for s in slots()[1:]) <= BUDGET
     # the reserved slot kept every cell: the long user continues without a re-prefill
     assert slots()[0]["n_prompt_tokens"] == n_long
@@ -158,5 +166,50 @@ def test_share_no_room_left_refused():
 
 def test_share_kill_switch_refuses_zero(monkeypatch):
     monkeypatch.setenv("LLAMA_SLOT_CTX_SHARE", "0")
+    with pytest.raises(RuntimeError):
+        server.start()
+
+
+def later(delay_s: float, fn, *args):
+    time.sleep(delay_s)
+    return fn(*args)
+
+
+def test_share_admitted_user_never_errors():
+    # slot 2 idles with an old 1300-token conversation; two new shared users start at once on slots 1 and 2: the old
+    # cells are trimmed or reclaimed, both requests succeed (200), none gets a context-size error
+    server.start()
+    res = complete(prompt_of(1300, seed=4), id_slot=2, n_predict=4)
+    assert res.status_code == 200
+    for order in ((1, 2), (2, 1)):
+        results = parallel_function_calls([
+            (complete, (prompt_of(600, seed=order[0]), order[0], 2000, True)),
+            (complete, (prompt_of(500, seed=order[1] + 5), order[1], 8)),
+        ])
+        for res in results:
+            assert res.status_code == 200, res.body
+        assert sum(s["n_prompt_tokens"] for s in slots()[1:]) <= BUDGET + 8
+
+
+def test_share_full_room_short_waits_not_reserved():
+    # slot 0 idles with its long conversation; slot 1 runs until it holds the whole shared room; an unpinned short
+    # request arriving meanwhile waits for shared room and never takes the reserved slot
+    server.start()
+    res = complete(prompt_of(1500, seed=1), id_slot=0, n_predict=4)
+    assert res.status_code == 200
+    n_long = slots()[0]["n_prompt_tokens"]
+    results = parallel_function_calls([
+        (complete, (prompt_of(700, seed=2), 1, 2000, True)),
+        (later, (0.3, complete, prompt_of(1000, seed=3), -1, 8)),
+    ])
+    for res in results:
+        assert res.status_code == 200, res.body
+    assert results[0].body["truncated"]
+    assert results[1].body["id_slot"] in (1, 2)
+    assert slots()[0]["n_prompt_tokens"] == n_long
+
+
+def test_share_refuses_context_shift():
+    server.enable_ctx_shift = True
     with pytest.raises(RuntimeError):
         server.start()
