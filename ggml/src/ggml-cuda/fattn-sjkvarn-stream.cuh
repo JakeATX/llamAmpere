@@ -1367,16 +1367,18 @@ static int ggml_cuda_fattn_sj_kvarn_stream_parallel_blocks(const ggml_tensor * d
     return parallel_blocks;
 }
 
-// [#195] GGML_SJKVARN_DIRECT_Q5G6: unset or 0 = off (default); 1 = compact Q5/G6 tile on the five-query path with the
-// five-warp kernel's KV split (bit-identical output); 2 = compact tile with its own occupancy split (diagnostic, not
-// bit-identical).
+// [#195] GGML_SJKVARN_DIRECT_Q5G6: unset = 1 (default on, Jake 2026-11-14); 0 = off (kill switch); 1 = compact Q5/G6 tile
+// on the five-query path with the five-warp kernel's KV split (bit-identical output); 2 = compact tile with its own
+// occupancy split (diagnostic, not bit-identical). Unset with GGML_CUDA_SJ_FILL=1 = off (mode 1 is not bit-identical there).
+// The refusal warnings below are printed only when the variable is set explicitly; the default stays quiet.
 // Covered: the 4/4 stream decode path at width 5 and GQA 6 (scalar and turbo4 bodies, plain and fused rotation). Every
 // other cache type or shape runs its usual kernel; the refusals are logged once (fattn.cu logs the non-stream routes).
 static int ggml_cuda_fattn_sj_kvarn_q5g6_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_SJKVARN_DIRECT_Q5G6");
         if (e == nullptr) {
-            return 0;
+            const char * fill = getenv("GGML_CUDA_SJ_FILL");
+            return fill != nullptr && strcmp(fill, "1") == 0 ? 0 : 1;
         }
         char * end = nullptr;
         const long m = strtol(e, &end, 10);
@@ -1395,11 +1397,17 @@ static int ggml_cuda_fattn_sj_kvarn_q5g6_mode() {
     return mode;
 }
 
+// true when GGML_SJKVARN_DIRECT_Q5G6 is set explicitly to a non-zero value (refusal warnings are for that case only)
+static bool ggml_cuda_fattn_sj_kvarn_q5g6_explicit() {
+    static const bool v = [] { const char * e = getenv("GGML_SJKVARN_DIRECT_Q5G6"); return e != nullptr && *e != '\0' && strcmp(e, "0") != 0; }();
+    return v;
+}
+
 // one warning per process when the switch is set but a width-5 node takes a route without the compact tile (shared by
 // the shape reasons); a caller may pass its own flag so its reason is logged even after another one (LSA refusal)
 static void ggml_cuda_fattn_sj_kvarn_q5g6_off(const char * why, std::atomic_flag * own = nullptr) {
     static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-    if (ggml_cuda_fattn_sj_kvarn_q5g6_mode() != 0 && !(own ? own : &warned)->test_and_set()) {
+    if (ggml_cuda_fattn_sj_kvarn_q5g6_explicit() && ggml_cuda_fattn_sj_kvarn_q5g6_mode() != 0 && !(own ? own : &warned)->test_and_set()) {
         GGML_LOG_WARN("ggml_cuda_fattn_sj_kvarn_q5g6: GGML_SJKVARN_DIRECT_Q5G6 is set but a width-5 node runs %s: compact Q5/G6 tile OFF for it "
                       "(first such node; later ones are not logged)\n", why);
     }
@@ -1426,7 +1434,7 @@ static int ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(const ggml_tensor * dst) {
     const int64_t gqa = dst->src[0]->ne[2] / dst->src[1]->ne[2];
     if (dst->src[0]->ne[2] != 6*dst->src[1]->ne[2]) {
         static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-        if (!warned.test_and_set()) {
+        if (ggml_cuda_fattn_sj_kvarn_q5g6_explicit() && !warned.test_and_set()) {
             GGML_LOG_WARN("%s: GGML_SJKVARN_DIRECT_Q5G6=%d covers GQA 6 only, this model has GQA %" PRId64 ": compact Q5/G6 tile OFF\n",
                 "ggml_cuda_fattn_sj_kvarn_q5g6_mode_for", mode, gqa);
         }
