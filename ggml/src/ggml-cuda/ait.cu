@@ -1477,7 +1477,8 @@ static __global__ void k_ait_mmq_red(const float * __restrict__ P, float * __res
     Y[i] = a;
 }
 
-// mid-T launch (9..32 tokens, AIT2/3/4): token tile 8 NB >= T (one token tile) and sp K splits on blockIdx.z
+// mid-T launch (9..32 tokens, or 9..64 with GGML_CUDA_AIT_MIDT_MAX_T=64; AIT2/3/4): token tile 8 NB >= T (one token tile)
+// and sp K splits on blockIdx.z
 template <int KB, int NB>
 static void ait_mmq_launch_midt(ggml_backend_cuda_context & ctx, const char * W, const int8_t * xq, const float * sa, float * Y,
         int M, int K, int T, int sp, cudaStream_t stream) {
@@ -1516,21 +1517,41 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     // n >= 2 = n splits; both are clamped to [1, min(8, S/2)]. Differs from off by float summation order only when splits > 1;
     // repeats are bitwise equal.
     static const int midt = ait_env_int("GGML_CUDA_AIT_MIDT_SPLIT", 1);
-    if (midt > 0 && code == 0 && T >= 9 && T <= 32) {
+    // GGML_CUDA_AIT_MIDT_MAX_T (default 32 = unchanged; 64 = opt-in, MIDT64): upper row count of the mid-T path. 33..64 rows
+    // then take a token tile of 8 * ceil(T / 8) (NB 5..8, smem <= 64 KB like the 64-token tile) with the same split rule,
+    // instead of the unsplit 64-token tile. Any other value is rejected (abort) so a typo cannot pass as a measured arm.
+    static const int midt_max = [] {
+        const int v = ait_env_int("GGML_CUDA_AIT_MIDT_MAX_T", 32);
+        GGML_ASSERT((v == 32 || v == 64) && "GGML_CUDA_AIT_MIDT_MAX_T must be 32 or 64");
+        return v;
+    }();
+    if (midt > 0 && code == 0 && T >= 9 && T <= midt_max) {
         const int ctas = (M / 32 + 7) / 8;
         int sp = midt > 1 ? midt : ggml_cuda_info().devices[id].nsm / ctas;
         sp = std::max(1, std::min(sp, std::min(8, S / 2)));
-        const int nb = T <= 16 ? 2 : T <= 24 ? 3 : 4, t = (int) T;
-        switch (k * 8 + nb) {
-            case 2 * 8 + 2: ait_mmq_launch_midt<2, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
-            case 2 * 8 + 3: ait_mmq_launch_midt<2, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
-            case 2 * 8 + 4: ait_mmq_launch_midt<2, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
-            case 3 * 8 + 2: ait_mmq_launch_midt<3, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
-            case 3 * 8 + 3: ait_mmq_launch_midt<3, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
-            case 3 * 8 + 4: ait_mmq_launch_midt<3, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
-            case 4 * 8 + 2: ait_mmq_launch_midt<4, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
-            case 4 * 8 + 3: ait_mmq_launch_midt<4, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
-            default:        ait_mmq_launch_midt<4, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+        const int nb = T <= 16 ? 2 : (int) ((T + 7) / 8), t = (int) T;
+        switch (k * 16 + nb) {
+            case 2 * 16 + 2: ait_mmq_launch_midt<2, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 2 * 16 + 3: ait_mmq_launch_midt<2, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 2 * 16 + 4: ait_mmq_launch_midt<2, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 2 * 16 + 5: ait_mmq_launch_midt<2, 5>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 2 * 16 + 6: ait_mmq_launch_midt<2, 6>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 2 * 16 + 7: ait_mmq_launch_midt<2, 7>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 2 * 16 + 8: ait_mmq_launch_midt<2, 8>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 16 + 2: ait_mmq_launch_midt<3, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 16 + 3: ait_mmq_launch_midt<3, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 16 + 4: ait_mmq_launch_midt<3, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 16 + 5: ait_mmq_launch_midt<3, 5>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 16 + 6: ait_mmq_launch_midt<3, 6>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 16 + 7: ait_mmq_launch_midt<3, 7>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 3 * 16 + 8: ait_mmq_launch_midt<3, 8>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 4 * 16 + 2: ait_mmq_launch_midt<4, 2>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 4 * 16 + 3: ait_mmq_launch_midt<4, 3>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 4 * 16 + 4: ait_mmq_launch_midt<4, 4>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 4 * 16 + 5: ait_mmq_launch_midt<4, 5>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 4 * 16 + 6: ait_mmq_launch_midt<4, 6>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            case 4 * 16 + 7: ait_mmq_launch_midt<4, 7>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
+            default:         ait_mmq_launch_midt<4, 8>(ctx, w, xq.get(), sa.get(), Y, M, K, t, sp, stream); break;
         }
         CUDA_CHECK(cudaGetLastError());
         return true;
