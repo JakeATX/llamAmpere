@@ -29,7 +29,7 @@
 //     mul_mat(head, x) on the backend gathered at the selected ids. Bound = the (c) bound of the compact type widened
 //     to at least rel 2e-2 / NMSE 2e-4 for the reference's own activation quantization (measured for the byte-exact
 //     f32 compact rows on the 3090 Ti box: rel 5.0e-3..8.3e-3, NMSE 2.5e-5..4.9e-5, CPU and CUDA, T = 1..8).
-// (e) AI+ U2 2/3/4-bit heads (random trellis words with sane fp16 row scales = a valid AI+ tensor, as
+// (e) AI+ heads, the AIT4_U / AIT5_U unit types and the U2 2/3/4-bit row-scale types (random trellis words with sane fp16 row scales = a valid AI+ tensor, as
 //     test-backend-ops init_tensor_ai4_random builds them): (d) with the rows of ggml_ai4_dequantize_slab (whole-slab
 //     decode, original basis) as the reference, then (c) and (c2). On CUDA (c2) is the independent check: the full-head
 //     mul_mat runs the AI+ kernel on the ROTATED weights with H256-rotated int8 activations, so a compact head built in
@@ -464,6 +464,9 @@ int main() {
     run_head(make_exl3(3, 1024, 2048, 333, 8102), backends);
     run_head(make_plain(GGML_TYPE_Q6_K, 1024, 2048, 333, 8103), backends);
     // (e) K = 2048 (16 units), N = 2048 (128 slabs)
+    run_head(make_ai(GGML_TYPE_AIT5_U, 2048, 2048, 333, 8104), backends);
+    run_head(make_ai(GGML_TYPE_AIT4_U, 2048, 2048, 333, 8105), backends);
+    // U2 row-scale heads: K = 5120 (8 blocks of 640)
     run_head(make_ai(GGML_TYPE_AIT2_U2, 5120, 2048, 333, 8104), backends);
     run_head(make_ai(GGML_TYPE_AIT3_U2, 5120, 2048, 333, 8105), backends);
     run_head(make_ai(GGML_TYPE_AIT4_U2, 5120, 2048, 333, 8106), backends);
