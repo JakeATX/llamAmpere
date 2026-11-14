@@ -273,7 +273,7 @@ static bool sj_kvarn_trellis_words() {
 // [TRW] GGML_SJKVARN_TRELLIS_WIDTH (default on, Jake 2026-11-14; =0/off/false/no turns it off): 3/3 trellis decode/verify (n_q <= 8) takes the width kernel
 // (fattn-sjkvarn-lowbits-stream.cuh, template bits_k | 8) instead of the tile build. Same exclusions as the scalar width
 // route (GGML_SJKVARN_NO_DIRECT, LSA full stage incl. the compact strip stage). LSE nodes (LLAMA_LSA_COMP=2 + COMP_LB=1)
-// stay on the tile build unless GGML_SJKVARN_TRELLIS_WIDTH_LSE=1 (below): the width launch is the low-bit launch_fattn
+// also take it while GGML_SJKVARN_TRELLIS_WIDTH_LSE is on (default on; =0/off/false/no keeps them on the tile build): the width launch is the low-bit launch_fattn
 // (fattn-sjkvarn-lowbits-common.cuh), which then keeps >= 2 parallel blocks and its combine writes lse = max + log(sum).
 static bool sj_kvarn_trellis_width() {
     static const bool v = [] {
@@ -285,11 +285,16 @@ static bool sj_kvarn_trellis_width() {
     }();
     return v;
 }
-// opt-in on top of the width route: FA nodes with an LSE output also take it (LSE from the parallel-block combine)
+// on top of the width route (default on, Jake 2026-11-14 prep; =0/off/false/no turns it off): FA nodes with an LSE output also take it (LSE from the parallel-block combine)
 static bool sj_kvarn_trellis_width_lse() {
     static const bool v = [] {
         const char * e = getenv("GGML_SJKVARN_TRELLIS_WIDTH_LSE");
-        const bool on = e && e[0] == '1';
+        bool on = true;
+        if (e != nullptr && *e != 0) {
+            std::string w(e);
+            for (char & c : w) { c = (char) tolower((unsigned char) c); }
+            on = !(w == "0" || w == "off" || w == "false" || w == "no");
+        }
         if (on) { GGML_LOG_WARN("%s: SJ-KVaRN trellis width route also takes LSE nodes (combine LSE)\n", __func__); }
         return on;
     }();
@@ -300,8 +305,8 @@ static bool sj_kvarn_trellis_width_applies(const ggml_tensor * dst) {
     return sj_kvarn_trellis_width() && bits == ((3 << 8) | 3) && ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 &&
         dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct() && !ggml_cuda_lsa_page_full_stage(dst->src[5]) &&
         (ggml_flash_attn_ext_get_lse(dst) == nullptr || sj_kvarn_trellis_width_lse());
-    // LSE nodes (LLAMA_LSA_COMP=2 + COMP_LB=1) stay on the tile build (its stream-k fixup writes the LSE) unless
-    // GGML_SJKVARN_TRELLIS_WIDTH_LSE=1: then the width launch writes it through the parallel-block combine
+    // LSE nodes (LLAMA_LSA_COMP=2 + COMP_LB=1): with GGML_SJKVARN_TRELLIS_WIDTH_LSE on (default) the width launch writes the
+    // LSE through the parallel-block combine; =0/off/false/no keeps them on the tile build (its stream-k fixup writes the LSE)
 }
 // route proof for the gate: one line per process on the first n_q <= 8 call that takes it, one on the first that does not
 static void sj_kvarn_trellis_width_note(const bool taken, const int n_q) {
