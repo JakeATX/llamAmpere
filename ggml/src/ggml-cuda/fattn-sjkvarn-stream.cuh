@@ -53,6 +53,8 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <string>
 
 // [#195] decode tile of the stream kernel. An enum class, not a bool, so that no positional `true`/`false` meant for
 // another trailing template flag can select the compact tile by accident.
@@ -314,7 +316,7 @@ static __device__ unsigned int fattn_sj_kvarn_stream_dbg_run = 0;
 
 // lsa: opt-in LSA build (live-record walk, strip skip, per-head mask). The default instance (lsa = false) compiles that
 // code out, so the default decode kernel is the pre-LSA code (registers/stack checked with cuobjdump).
-// max_warps 6 (GGML_SJKVARN_NT6_OCC=1): the 6-row twin of the max_warps 5 body, held to 2 CTAs/SM (<= 168 regs)
+// max_warps 6 (GGML_SJKVARN_NT6_OCC, default on): the 6-row twin of the max_warps 5 body, held to 2 CTAs/SM (<= 168 regs)
 // q5g6 [#195]: compact width-5 / GQA-6 tile. The 30 (query, head) pairs of a KV head fill 4 warps x 8 columns (pairs
 // 30 and 31 pad) instead of 5 warps x 8 columns with 6 heads each. Every column keeps its own Q, mask row, online
 // softmax and output; the KV split partition is the host's choice (forced to the five-warp one), so the result is
@@ -1612,9 +1614,20 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
         ggml_cuda_fattn_sj_kvarn_q5g6_off(nt5_mode < 0 ? "the generic half (<= 5,376 positions on SM86, by design)"
                                                        : "the generic half (GGML_SJKVARN_DIRECT_NT5_GENERIC=1)");
     }
-    // GGML_SJKVARN_NT6_OCC=1: 6 rows on the max_warps 6 instance (2 CTAs/SM) instead of max_warps 8 (1 CTA/SM). Same
-    // math per element; launch_fattn sizes parallel_blocks from the instance's occupancy, so the combine order differs.
-    static const bool nt6_occ = getenv("GGML_SJKVARN_NT6_OCC") != nullptr && atoi(getenv("GGML_SJKVARN_NT6_OCC")) != 0;
+    // GGML_SJKVARN_NT6_OCC, default on (Jake 2026-11-14): 6 rows on the max_warps 6 instance (2 CTAs/SM) instead of
+    // max_warps 8 (1 CTA/SM). Same math per element; launch_fattn sizes parallel_blocks from the instance's occupancy, so
+    // the combine order differs. GGML_SJKVARN_NT6_OCC=0 (or off/false/no) turns it off.
+    static const bool nt6_occ = [] {
+        const char * e = getenv("GGML_SJKVARN_NT6_OCC");
+        if (e == nullptr || *e == 0) {
+            return true;
+        }
+        std::string w(e);
+        for (char & c : w) {
+            c = (char) tolower((unsigned char) c);
+        }
+        return !(w == "0" || w == "off" || w == "false" || w == "no");
+    }();
     if (NT == 5 && !nt5_generic) {
         // [#195] the compact tile replaces the five-warp specialization only (GQA 6: 30 pairs in 4 x 8 columns)
         const int q5g6_mode = ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(dst);
