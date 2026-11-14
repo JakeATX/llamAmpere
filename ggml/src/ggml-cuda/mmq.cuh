@@ -1454,6 +1454,10 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_high = tsj.col_high;
     const int j_sup    = col_high - col_low;
 
+    if (j_sup <= 0) {
+        return;
+    }
+
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
         ids_dst_shared[j] = ids_dst[col_low + j];
     }
