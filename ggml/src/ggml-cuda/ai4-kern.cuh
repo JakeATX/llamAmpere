@@ -49,8 +49,8 @@ constexpr int LAY_AIT3_U = 13;   // rate-3 units ([d 16][16 tiles x 12 words], 8
 constexpr int LAY_AIT4_U = 14;   // rate-4 units ([d 16][16 tiles x 16 words], 1056 B)
 constexpr int LAY_AIT2P_U = 15;  // AIT2_U bytes, AIT2P pair-table levels (ggml-ai4.h); no trellis constant
 constexpr int LAY_AIT2_U2 = 16;  // AIT2_U levels, one fp16 scale per row per 640 K: block = [d 16][5 chunks x 16 tiles x 8 words] (ggml.h AIT2_U2)
-constexpr int LAY_AIT4_U2 = 20;  // 4-bit tiles in the 640-K row-scale block
 constexpr int LAY_AIT3_U2 = 17;  // AIT3_U levels, same block shape (rate 3)
+constexpr int LAY_AIT4_U2 = 18;  // AIT4_U levels, same block shape (rate 4)
 
 // mmv-ID columns per block: lanes g = 0..7 of the mmv kernel each own one token column
 constexpr int MMV_ID_BN = 8;
@@ -160,6 +160,8 @@ static_assert(ch_bytes<LAY_AIT4_U>() == CH_BYTES && u_bytes<LAY_AIT4_U>() == U_B
               u_bytes<LAY_AIT2_U>() == 544 && u_bytes<LAY_AIT2P_U>() == 544 && u_bytes<LAY_AIT3_U>() == 800, "ai4k layout sizes");
 constexpr int V2_CHUNKS = 5;   // 128-K chunks per row-scale block
 template <int LAY> constexpr __host__ __device__ int v2_block_bytes() { return U_SC + V2_CHUNKS*ch_bytes<LAY>(); }
+static_assert(v2_block_bytes<LAY_AIT4_U2>() == 5152 && lay_mul<LAY_AIT4_U2>() == 0xAA73876Bu,
+              "4-bit row-scale layout");
 template <int LAY> static __host__ __device__ __forceinline__ int64_t slab_bytes_l(int K) {
     if constexpr (lay_v2<LAY>()) { return (int64_t) (K/(128*V2_CHUNKS))*v2_block_bytes<LAY>(); }
     else { return (int64_t) (K/128)*u_bytes<LAY>(); }

@@ -948,7 +948,7 @@ static bool ai4_is_type(ggml_type t) {
 static bool ai4_ref_only_type(ggml_type t) {
     static const bool v = ai4_env_int("GGML_CUDA_AI5_REF", nullptr, 0) != 0;
     if (ggml_ai4v2_rate(t) != 0) {
-        return false;   // row-scale layouts use native kernels when available
+        return false;   // row-scale layouts use fast kernels unless the global reference override is set
     }
     if (t == GGML_TYPE_AIT5_U) {
         return v;
@@ -1010,8 +1010,8 @@ static void ai4_zero_skipped(const ggml_tensor * ids, int n_used, int n_tok, int
 }
 
 static void ai4_reconstruct_any(const void * src, float * W, int64_t K, int64_t M, cudaStream_t stream, ggml_type t) {
-    GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t),
-                                          ggml_ai4v2_rate(t) != 0));
+    GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream,
+                                          ggml_ai4_trellis_mul(t), ggml_ai4v2_rate(t) != 0));
 }
 
 // fork AIPFIX ONEPATH check: the f32 image [M][K] of an AI+ unit matrix in the original basis (reference only)
@@ -2301,7 +2301,7 @@ void ggml_cuda_moe_ai_quantize(const float * x, int64_t rows, int64_t K, char * 
 bool ggml_cuda_moe_ai_table_supported(ggml_type type, int64_t K, int64_t M, int64_t n_tok) {
     const int rate = ggml_ai4_rate(type);
     return ggml_ai4_is_unit(type) && rate >= 2 && rate <= 4 && (rate == 4 ? ai4_aikern() : ai4_mmvr_on_id()) &&
-        K % 128 == 0 && M % 16 == 0 && n_tok >= 1 && n_tok <= 64;
+        K % 128 == 0 && (ggml_ai4v2_rate(type) == 0 || K % 640 == 0) && M % 16 == 0 && n_tok >= 1 && n_tok <= 64;
 }
 
 bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, const char * act, const int32_t * ids,

@@ -29,7 +29,7 @@
 //     mul_mat(head, x) on the backend gathered at the selected ids. Bound = the (c) bound of the compact type widened
 //     to at least rel 2e-2 / NMSE 2e-4 for the reference's own activation quantization (measured for the byte-exact
 //     f32 compact rows on the 3090 Ti box: rel 5.0e-3..8.3e-3, NMSE 2.5e-5..4.9e-5, CPU and CUDA, T = 1..8).
-// (e) an AI+ head (AIT4_U / AIT5_U unit types; random trellis words with sane fp16 row scales = a valid AI+ tensor, as
+// (e) AI+ U2 2/3/4-bit heads (random trellis words with sane fp16 row scales = a valid AI+ tensor, as
 //     test-backend-ops init_tensor_ai4_random builds them): (d) with the rows of ggml_ai4_dequantize_slab (whole-slab
 //     decode, original basis) as the reference, then (c) and (c2). On CUDA (c2) is the independent check: the full-head
 //     mul_mat runs the AI+ kernel on the ROTATED weights with H256-rotated int8 activations, so a compact head built in
@@ -262,7 +262,11 @@ static void run_logits(ggml_backend_t be, const head_case & h,
     std::mt19937 rng(911 + (uint32_t) h.type);
     std::normal_distribution<float> nd(0.0f, 1.0f);
 
-    for (int64_t T = 1; T <= 8; ++T) {
+    std::vector<int64_t> widths = {1, 2, 3, 4, 5, 6, 7, 8};
+    if (ggml_ai4v2_rate(h.type)) {
+        widths.insert(widths.end(), {16, 64}); // exercise dense GEMM as well as decode
+    }
+    for (int64_t T : widths) {
         const int n_c = (int) compact.size() + (exl3 ? 1 : 0);
         ggml_init_params pw = { ggml_tensor_overhead() * (8 + n_c), nullptr, true };
         ggml_context * cw = ggml_init(pw);
@@ -346,6 +350,13 @@ static void run_logits(ggml_backend_t be, const head_case & h,
             }
         }
         const std::vector<float> & yc_ref = exl3 ? ysel : yref;
+        if (ggml_ai4v2_rate(h.type)) {
+            const err e = compare(ysel.data(), yref.data(), ysel.size());
+            const bool ok = e.rel_max <= 3e-2 && e.nmse <= 5e-4 && std::isfinite(e.nmse);
+            printf("  (U2-full) %-6s %-10s T=%lld rel %.3e nmse %.3e vs f64 host: %s\n",
+                    bname, h.name.c_str(), (long long) T, e.rel_max, e.nmse, ok ? "ok" : "FAIL");
+            check(ok, "U2 full-head logits vs host reference");
+        }
         std::vector<float> yv((size_t) n_sel * T);
         for (size_t i = 0; i < compact.size(); ++i) {
             ggml_backend_tensor_get(yc[i], yv.data(), 0, ggml_nbytes(yc[i]));
