@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -736,7 +737,13 @@ void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch, 
         stats->n_width  += (split_cut & llama_batch_allocr::SPLIT_CUT_WIDTH)  != 0;
         stats->n_tail   += (split_cut & llama_batch_allocr::SPLIT_CUT_TAIL)   != 0;
         stats->n_bystand += (split_cut & llama_batch_allocr::SPLIT_CUT_SET)   != 0;
-        if ((stats->n_ubatch & 4095) == 0) {
+        // LLAMA_GDN_REPLAY_LANES_LOG=N: print the counts every N ubatches instead of every 4096 (diagnostics only)
+        static const uint64_t log_every = [] {
+            const char * e = getenv("LLAMA_GDN_REPLAY_LANES_LOG");
+            const unsigned long long v = e != nullptr ? strtoull(e, nullptr, 10) : 0;
+            return v > 0 ? (uint64_t) v : (uint64_t) 4096;
+        }();
+        if (stats->n_ubatch % log_every == 0) {
             LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu, bystander %llu\n", __func__,
                     (unsigned long long) stats->n_ubatch, (unsigned long long) stats->n_joint, (unsigned long long) stats->n_strict,
                     (unsigned long long) stats->n_width, (unsigned long long) stats->n_tail, (unsigned long long) stats->n_bystand);
