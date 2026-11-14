@@ -127,6 +127,16 @@ struct llama_d1_ctx {
     std::atomic<uint64_t> ns_rescore{0}; // wall of rescore calls (caller thread)
     std::atomic<uint64_t> ns_select{0};  // sum of per-row select time (all threads)
     uint64_t              n_h_mismatch = 0;
+    // [D0] split of the rescore wall (per-request deltas via llama_d1_log_counters)
+    std::atomic<uint64_t> n_calls{0};
+    std::atomic<uint64_t> ns_dot{0};     // sum of per-row dot time (all threads)
+    std::atomic<uint64_t> ns_wait{0};    // caller wait for the pool after its own share
+    std::atomic<uint64_t> n_minflt{0};   // process page faults during rescore calls (getrusage RUSAGE_SELF)
+    std::atomic<uint64_t> n_majflt{0};
+    std::atomic<uint64_t> n_nvcsw{0};    // process context switches during rescore calls (voluntary / involuntary)
+    std::atomic<uint64_t> n_nivcsw{0};
+    uint64_t              last[11] = {};  // values at the previous summary_delta
+    std::string summary_delta();         // counters since the previous call (not thread safe: one reader)
 
     // a new set of output rows (output_reserve): all rows NONE, seen cleared
     void reset(int64_t n_rows_max);

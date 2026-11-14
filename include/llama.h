@@ -957,6 +957,9 @@ extern "C" {
     // same ubatch boundaries cold and after a checkpoint restore, so the restored turn computes bit-identically.
     LLAMA_API llama_pos llama_sj_kvarn_ckpt_floor(struct llama_context * ctx, llama_pos pos);
 
+    // [D0] log the d1 rescore counters since the previous call ("d1 req: <tag> ..."); no-op without d1
+    LLAMA_API void llama_d1_log_counters(struct llama_context * ctx, const char * tag);
+
     // Call before re-prefilling seq_id from pos (a prompt restored from the prompt cache or a context checkpoint, pos on
     // the seal grid, see llama_sj_kvarn_ckpt_floor): puts the SJ-KVaRN cache into the state a cold prefill of [0, pos)
     // has there (reopens groups sealed after that point, drops an unfinished decode flush), so the re-prefill computes

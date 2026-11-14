@@ -3186,6 +3186,13 @@ int32_t llama_sj_kvarn_ckpt_sealed_end(const uint8_t * data, size_t size, llama_
     return (int32_t) t[0];
 }
 
+void llama_d1_log_counters(llama_context * ctx, const char * tag) {
+    const std::string s = ctx ? ctx->d1_counters_delta() : std::string();
+    if (!s.empty()) {
+        LLAMA_LOG_INFO("d1 req: %s %s\n", tag ? tag : "", s.c_str());
+    }
+}
+
 llama_pos llama_sj_kvarn_ckpt_floor(llama_context * ctx, llama_pos pos) {
     auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
     if (!kv || !kv->is_sj_kvarn() || pos < 0) { return pos; }

@@ -381,6 +381,9 @@ public:
     int32_t draft_vocab_n_hot()        const { return draft_vocab.n_hot; }
     size_t  draft_vocab_n_candidates() const { return draft_vocab.hot.cands.size(); }
 
+    // [D0] d1 rescore counters since the previous call; empty without d1
+    std::string d1_counters_delta() { return d1 ? d1->summary_delta() : std::string(); }
+
 private:
     llm_graph_result * get_gf_res_prev();
 

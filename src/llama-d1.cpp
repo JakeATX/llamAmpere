@@ -25,6 +25,7 @@
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -433,6 +434,16 @@ llama_d1_ctx::~llama_d1_ctx() {
     }
 }
 
+std::string llama_d1_ctx::summary_delta() {
+    const uint64_t v[11] = { n_calls.load(), n_rescored.load(), ns_rescore.load(), ns_select.load(), ns_dot.load(), ns_wait.load(),
+                             n_minflt.load(), n_majflt.load(), n_read_coarse.load(), n_nvcsw.load(), n_nivcsw.load() };
+    uint64_t d[11];
+    for (int i = 0; i < 11; ++i) { d[i] = v[i] - last[i]; last[i] = v[i]; }
+    return format("calls=%" PRIu64 " rows=%" PRIu64 " rescore_ms=%.3f select_ms=%.3f dot_ms=%.3f wait_ms=%.3f minflt=%" PRIu64
+                  " majflt=%" PRIu64 " coarse=%" PRIu64 " nvcsw=%" PRIu64 " nivcsw=%" PRIu64,
+                  d[0], d[1], d[2] / 1e6, d[3] / 1e6, d[4] / 1e6, d[5] / 1e6, d[6], d[7], d[8], d[9], d[10]);
+}
+
 std::string llama_d1_ctx::summary() const {
     return format("d1: rows_rescored=%" PRIu64 " rows_read_distinct=%" PRIu64 " rows_read_coarse=%" PRIu64
                   " rescore_ms=%.3f select_ms=%.3f h_mismatch=%" PRIu64,
@@ -483,6 +494,7 @@ void llama_d1_ctx::rescore_one(float * logits, int64_t n_vocab, int64_t r, std::
         row[id] = head->dot(hr, id);
     }
     ns_select += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    ns_dot    += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count();
 }
 
 void llama_d1_ctx::run_job() {
@@ -522,6 +534,10 @@ void llama_d1_ctx::rescore_rows(float * logits, int64_t n_vocab, const std::vect
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
+#ifndef _WIN32
+    struct rusage ru0 = {};
+    getrusage(RUSAGE_SELF, &ru0);
+#endif
     if (rows.size() == 1 || pool.threads.empty()) {
         thread_local std::vector<int32_t> ids;
         for (const int64_t r : rows) {
@@ -540,10 +556,21 @@ void llama_d1_ctx::rescore_rows(float * logits, int64_t n_vocab, const std::vect
         pool.cv_work.notify_all();
         run_job();
         // block until every worker is done: the sampler must never see a half-written row
+        const auto tw = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lk(pool.mtx);
         pool.cv_done.wait(lk, [&] { return pool.n_busy == 0; });
         pool.rows = nullptr;
+        ns_wait += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count();
     }
+#ifndef _WIN32
+    struct rusage ru1 = {};
+    getrusage(RUSAGE_SELF, &ru1);
+    n_minflt += (uint64_t) (ru1.ru_minflt - ru0.ru_minflt);
+    n_majflt += (uint64_t) (ru1.ru_majflt - ru0.ru_majflt);
+    n_nvcsw  += (uint64_t) (ru1.ru_nvcsw  - ru0.ru_nvcsw);
+    n_nivcsw += (uint64_t) (ru1.ru_nivcsw - ru0.ru_nivcsw);
+#endif
+    ++n_calls;
     for (const int64_t r : rows) {
         state[r] = ROW_EXACT;
     }
