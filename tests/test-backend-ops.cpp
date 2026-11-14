@@ -22327,7 +22327,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // A5 (LLAMA_LSA_COMP_LB=1): trellis bodies 3/2 and 3/3 with the LSE output (uniform stream-k fixup of the low-bit tile
     // kernel), fused rotation off / on, decode widths 1 and 5, dense and an LSA record pick (mode 5), plus a 100K body;
-    // output and LSE (checked separately) against the CPU reference. Filter: -o FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE (18 cases)
+    // output and LSE (checked separately) against the CPU reference. Filter: -o FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE (19 cases)
     for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 2}, {3, 3}}) {
         for (int rot : {0, 1}) {
             for (int64_t n_q : {1, 5}) {
@@ -22341,6 +22341,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         auto * t = new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 1024, false, false,
             GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, 0, 0);
+        t->lse_out = true;
+        test_cases.emplace_back(t);
+    }
+    {   // live-tile walk (GGML_SJKVARN_LIVE_TILES=1, width off): fewer live tiles than stream-k blocks per output tile, so
+        // some blocks get no list entry and write an empty partial (max -FLT_MAX/2, rowsum 0) that the LSE fixup must drop
+        auto * t = new test_flash_attn_ext_sj_kvarn(4, 24, 4, 1, 64, false, false,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 3, 3, 0, 0, 3);
         t->lse_out = true;
         test_cases.emplace_back(t);
     }
