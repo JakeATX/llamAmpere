@@ -6938,6 +6938,10 @@ class GGMLQuantizationType(IntEnum):
     F8_E4M3 = 60  # local ID (upstream ggml uses 43 = our TURBO2_0)
     AIF25_U2 = 125
     AIF175_U2 = 126
+    AIF25_U2_512 = 127
+    AIT2_U2_512 = 128
+    AIT3_U2_512 = 129
+    AIT4_U2_512 = 130
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -7217,6 +7221,10 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F8_E4M3: (1, 1),
     GGMLQuantizationType.AIF25_U2: (640, 202),
     GGMLQuantizationType.AIF175_U2: (512, 114),
+    GGMLQuantizationType.AIF25_U2_512: (512, 162),
+    GGMLQuantizationType.AIT2_U2_512: (512, 130),   # 2 + 64k bytes per row per 512 K (one fp16 row scale)
+    GGMLQuantizationType.AIT3_U2_512: (512, 194),
+    GGMLQuantizationType.AIT4_U2_512: (512, 258),
 }
 
 

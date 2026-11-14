@@ -893,6 +893,30 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // 16-row blocks, not row-addressable
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_AIT2_U2_512] = {
+        .type_name                = "ait2_u2_512",
+        .blck_size                = 512,
+        .type_size                = 130,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT3_U2_512] = {
+        .type_name                = "ait3_u2_512",
+        .blck_size                = 512,
+        .type_size                = 194,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIT4_U2_512] = {
+        .type_name                = "ait4_u2_512",
+        .blck_size                = 512,
+        .type_size                = 258,
+        .is_quantized             = true,
+        .to_float                 = NULL, // 16-row blocks, not row-addressable
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_AIT4_U2] = {
         .type_name                = "ait4_u2",
         .blck_size                = 640,
@@ -929,6 +953,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_name                = "aif25_u2",
         .blck_size                = 640,
         .type_size                = 202,
+        .is_quantized             = true,
+        .to_float                 = NULL, // whole 16-row blocks
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_AIF25_U2_512] = {
+        .type_name                = "aif25_u2_512",
+        .blck_size                = 512,
+        .type_size                = 162,
         .is_quantized             = true,
         .to_float                 = NULL, // whole 16-row blocks
         .from_float_ref           = NULL,
@@ -1676,10 +1708,13 @@ int ggml_ai4_rate(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_AIT2_U:
         case GGML_TYPE_AIT2_U2:
+        case GGML_TYPE_AIT2_U2_512:
         case GGML_TYPE_AIT2P_U: return 2;
         case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2_512:
         case GGML_TYPE_AIT3_U2: return 3;
         case GGML_TYPE_AIT4_U:
+        case GGML_TYPE_AIT4_U2_512:
         case GGML_TYPE_AIT4_U2: return 4;
         case GGML_TYPE_AIT5_U:  return 5;
         default:                return 0;
@@ -1688,17 +1723,35 @@ int ggml_ai4_rate(enum ggml_type type) {
 
 int ggml_ai4v2_rate(enum ggml_type type) {
     switch (type) {
+        case GGML_TYPE_AIT2_U2_512:
         case GGML_TYPE_AIT2_U2: return 2;
+        case GGML_TYPE_AIT3_U2_512:
         case GGML_TYPE_AIT3_U2: return 3;
+        case GGML_TYPE_AIT4_U2_512:
         case GGML_TYPE_AIT4_U2: return 4;
         default:                return 0;
     }
 }
 
+int ggml_ai4v2_chunks(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_AIT2_U2:
+        case GGML_TYPE_AIT3_U2:
+        case GGML_TYPE_AIT4_U2:     return 5;   // one row scale per 640 K
+        case GGML_TYPE_AIT2_U2_512:
+        case GGML_TYPE_AIT3_U2_512:
+        case GGML_TYPE_AIT4_U2_512: return 4;   // one row scale per 512 K
+        default:                    return 0;
+    }
+}
+
 uint32_t ggml_ai4v2_trellis_mul(enum ggml_type type) {
     switch (type) {
+        case GGML_TYPE_AIT2_U2_512:
         case GGML_TYPE_AIT2_U2: return 0xC3CCD12Du;
+        case GGML_TYPE_AIT3_U2_512:
         case GGML_TYPE_AIT3_U2: return 0x87D8D12Du;
+        case GGML_TYPE_AIT4_U2_512:
         case GGML_TYPE_AIT4_U2: return 0xAA73876Bu;
         default:                return 0u;
     }
@@ -1745,11 +1798,14 @@ int ggml_ai4_code(enum ggml_type type) {
 uint32_t ggml_ai4_trellis_mul(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_AIT2_U:
+        case GGML_TYPE_AIT2_U2_512:
         case GGML_TYPE_AIT2_U2: return 0xC3CCD12Du;
         case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2_512:
         case GGML_TYPE_AIT3_U2: return 0x87D8D12Du;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT4_U2:
+        case GGML_TYPE_AIT4_U2_512:
         case GGML_TYPE_AIT5_U:  return 0xAA73876Bu;
         default:                return 0u;
     }
@@ -1760,11 +1816,14 @@ float ggml_ai4_scale_mul(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_AIT2_U:
         case GGML_TYPE_AIT2_U2:
+        case GGML_TYPE_AIT2_U2_512:
         case GGML_TYPE_AIT2P_U: return 1.00f;
         case GGML_TYPE_AIT3_U:
+        case GGML_TYPE_AIT3_U2_512:
         case GGML_TYPE_AIT3_U2: return 1.05f;
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT4_U2:
+        case GGML_TYPE_AIT4_U2_512:
         case GGML_TYPE_AIT5_U:  return 1.09f;
         default:                return 0.0f;
     }

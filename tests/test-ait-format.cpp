@@ -544,6 +544,185 @@ static void check_aif175_windows() {
         }
     }
 }
+// Types 128 / 129 / 130: the AIT2_U2 / AIT3_U2 / AIT4_U2 tiles with one FP16 row scale per 512 columns (four 128-column chunks per block).
+static void check_ai4_u2_512() {
+    for (ggml_type T : {GGML_TYPE_AIT2_U2_512, GGML_TYPE_AIT3_U2_512, GGML_TYPE_AIT4_U2_512}) {
+        const int k = T == GGML_TYPE_AIT2_U2_512 ? 2 : T == GGML_TYPE_AIT3_U2_512 ? 3 : 4;
+        // the 640-column type of the same rate (122 / 123 / 124) and the per-128 unit type (115 / 116 / 117)
+        const ggml_type wide = k == 2 ? GGML_TYPE_AIT2_U2 : k == 3 ? GGML_TYPE_AIT3_U2 : GGML_TYPE_AIT4_U2;
+        const ggml_type unit = k == 2 ? GGML_TYPE_AIT2_U : k == 3 ? GGML_TYPE_AIT3_U : GGML_TYPE_AIT4_U;
+        const size_t cb = size_t(256)*k, bb = 32 + 4*cb, wb = 32 + 5*cb, ub = 32 + cb;
+        require(ggml_blck_size(T) == 512 && ggml_row_size(T, 512) == size_t(2 + 64*k) && 16*ggml_row_size(T, 512) == bb,
+                "row512 2/3-bit exact stored bytes");
+        require(ggml_ai4_rate(T) == k && ggml_ai4v2_rate(T) == k && ggml_ai4v2_chunks(T) == 4 &&
+                ggml_ai4v2_chunks(wide) == 5 && ggml_ai4v2_chunks(unit) == 0 && ggml_ai4v2_chunks(GGML_TYPE_F32) == 0,
+                "row512 2/3-bit rate and chunk count");
+        require(ggml_ai4_trellis_mul(T) == ggml_ai4_trellis_mul(wide) && ggml_ai4v2_trellis_mul(T) == ggml_ai4_trellis_mul(wide) &&
+                ggml_ai4_scale_mul(T) == ggml_ai4_scale_mul(wide), "row512 2/3-bit constants equal the 640 type");
+        for (int64_t K : {int64_t(0), int64_t(-512), int64_t(128), int64_t(256), int64_t(640), int64_t(1280)}) {
+            require(ggml_ai4_slab_nbytes(T, K) == 0, "row512 2/3-bit rejects partial or invalid widths");
+        }
+        // Widths of the dense 27B body that do not divide by 640 (3072, 4096, 6144, 9216, 17408) and some that do.
+        for (int K : {512, 1024, 2560, 3072, 4096, 6144, 9216, 17408}) {
+            // Per-128 unit form with random tiles; every unit of a 512 block carries that block's 16 row scales.
+            std::vector<uint8_t> units(size_t(K/128)*ub), packed(size_t(K/512)*bb + 1, 0x5a);
+            uint32_t state = 4100u + 7u*uint32_t(k) + uint32_t(K);
+            for (auto & b : units) { state = state*1664525u + 1013904223u; b = state >> 24; }
+            for (int block = 0; block < K/512; ++block) {
+                uint8_t * p = packed.data() + size_t(block)*bb;
+                for (int r = 0; r < 16; ++r) {
+                    const uint16_t scale = uint16_t(0x2800 + ((17*block + 5*r + k) & 0x3ff));
+                    p[2*r] = uint8_t(scale); p[2*r+1] = uint8_t(scale >> 8);
+                }
+                for (int u = 0; u < 4; ++u) {
+                    uint8_t * q = units.data() + size_t(4*block + u)*ub;
+                    std::memcpy(q, p, 32);
+                    std::memcpy(p + 32 + u*cb, q + 32, cb);
+                }
+            }
+            const auto before = packed;
+            std::vector<float> a(size_t(16)*K, 1.0f), b(size_t(16)*K + 1, 123.0f);
+            require(ggml_ai4_slab_nbytes(T, K) == packed.size() - 1 && ggml_ai4_slab_nbytes(unit, K) == units.size(),
+                    "row512 2/3-bit slab bytes");
+            require(ggml_ai4_dequantize_slab(unit, units.data(), K, 0, a.data()), "per-128 unit decode for the row512 oracle");
+            require(ggml_ai4_dequantize_slab(T, packed.data(), K, 0, b.data()), "row512 2/3-bit public slab decoder");
+            require(std::memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0,
+                    "row512 2/3-bit matches the per-128 unit decode exactly");
+            bool nonzero = false;
+            for (float v : a) { nonzero = nonzero || v != 0.0f; }
+            require(nonzero && b.back() == 123.0f && packed == before, "row512 2/3-bit decode is non-trivial and preserves canaries and packed bytes");
+        }
+        // GATE: on a width both layouts can hold, the same tiles and the same row scales decode to the same bits
+        // through the 640-column type (122 / 123) and the 512-column type (128 / 129).
+        for (int K : {2560, 5120, 7680}) {
+            const int chunks = K/128;
+            std::vector<uint8_t> tiles(size_t(chunks)*cb), scales(32);
+            uint32_t state = 911u + 3u*uint32_t(k) + uint32_t(K);
+            for (auto & b : tiles) { state = state*1664525u + 1013904223u; b = state >> 24; }
+            for (int r = 0; r < 16; ++r) {
+                const uint16_t scale = uint16_t(0x2c00 + 37*r);
+                scales[2*r] = uint8_t(scale); scales[2*r+1] = uint8_t(scale >> 8);
+            }
+            std::vector<uint8_t> w640(size_t(K/640)*wb), w512(size_t(K/512)*bb);
+            for (int c = 0; c < chunks; ++c) {
+                uint8_t * w = w640.data() + size_t(c/5)*wb;
+                uint8_t * n = w512.data() + size_t(c/4)*bb;
+                std::memcpy(w, scales.data(), 32); std::memcpy(n, scales.data(), 32);
+                std::memcpy(w + 32 + size_t(c%5)*cb, tiles.data() + size_t(c)*cb, cb);
+                std::memcpy(n + 32 + size_t(c%4)*cb, tiles.data() + size_t(c)*cb, cb);
+            }
+            require(ggml_ai4_slab_nbytes(wide, K) == w640.size() && ggml_ai4_slab_nbytes(T, K) == w512.size(),
+                    "row640 and row512 2/3-bit slab sizes on a shared width");
+            std::vector<float> a(size_t(16)*K, 1.0f), b(size_t(16)*K, 2.0f);
+            require(ggml_ai4_dequantize_slab(wide, w640.data(), K, 0, a.data()), "row640 2/3-bit decode on a shared width");
+            require(ggml_ai4_dequantize_slab(T, w512.data(), K, 0, b.data()), "row512 2/3-bit decode on a shared width");
+            require(std::memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0,
+                    "row512 2/3-bit decodes bit for bit like row640 for equal tiles and scales");
+        }
+    }
+}
+
+// Type 127: the 2.5-bit pair stream of AIF25_U2 with one FP16 row scale per 512 columns (four chunks per block).
+static void check_aif25_u2_512() {
+    const ggml_type T = GGML_TYPE_AIF25_U2_512;
+    require(ggml_blck_size(T) == 512 && ggml_row_size(T, 512) == 162 && 16*162 == AIF25_V2_512_BLOCK_BYTES,
+            "2.5 row512 exact 2.53125-bpw bytes");
+    require(ggml_ai4_rate(T) == 0, "2.5 row512 stays outside integer-rate kernels");
+    for (int64_t K : {int64_t(0), int64_t(-512), int64_t(128), int64_t(256), int64_t(640), int64_t(1280)}) {
+        require(ggml_ai4_slab_nbytes(T, K) == 0, "2.5 row512 rejects partial or invalid widths");
+    }
+    // Widths of the dense 27B body that do not divide by 640 (3072, 4096, 6144, 9216, 17408) and some that do.
+    for (int K : {512, 1024, 2560, 3072, 4096, 6144, 9216, 17408}) {
+        // Expand each stored row scale to four unit headers; the decoded matrix must stay exact,
+        // including the rotation that crosses the boundary between 512-column blocks.
+        const size_t sb = size_t(K/512)*AIF25_V2_512_BLOCK_BYTES;
+        std::vector<uint8_t> packed(2*sb + 1);
+        std::vector<uint8_t> expanded(size_t(K/128)*AIF25_UNIT_BYTES);
+        std::vector<float> oracle(size_t(16)*K);
+        uint32_t state = 7300u + uint32_t(K);
+        for (auto & b : packed) { state = state*1664525u + 1013904223u; b = state >> 24; }
+        uint8_t * src = packed.data() + 1 + sb;
+        for (int block = 0; block < K/512; ++block) {
+            uint8_t * p = src + size_t(block)*AIF25_V2_512_BLOCK_BYTES;
+            for (int r = 0; r < 16; ++r) {
+                const uint16_t scale = r == 6 ? 0 : r == 7 ? 0x8000 : r == 8 ? 0xb800 :
+                    r == 9 ? 0x0001 : r == 10 ? 0x03ff : 0x2800 + 16*block + r;
+                p[2*r] = uint8_t(scale); p[2*r+1] = uint8_t(scale >> 8);
+                for (int k = 0; k < 512; ++k) {
+                    oracle[size_t(r)*K + block*512 + k] =
+                        ai4_fp16_to_fp32(scale)*aif25_level_reference(p + 32 + (k/8)*40, r*8 + k%8);
+                }
+            }
+            for (int u = 0; u < 4; ++u) {
+                uint8_t * q = expanded.data() + size_t(4*block + u)*AIF25_UNIT_BYTES;
+                std::memcpy(q, p, 32);
+                std::memcpy(q + 32, p + 32 + u*640, 640);
+            }
+        }
+        const auto before = packed;
+        require(ggml_ai4_slab_nbytes(T, K) == sb, "2.5 row512 slab bytes");
+        require(ggml_validate_row_data(T, src, sb), "2.5 row512 validates finite scales in unaligned multi-block storage");
+        require(!ggml_validate_row_data(T, src, sb-162), "2.5 row512 validation rejects a partial interleaved block");
+        require(!ggml_validate_row_data(T, nullptr, sb), "2.5 row512 validation rejects missing block data");
+        std::vector<float> a(size_t(16)*K), b(size_t(16)*K+2, 123.0f);
+        const auto output_before = b;
+        for (int edge = 0; edge < (K == 512 ? 1 : 2); ++edge) {
+            const int block = edge ? K/512-1 : 0;
+            for (int r : {0, 15}) {
+                uint8_t * scale = src + size_t(block)*AIF25_V2_512_BLOCK_BYTES + 2*r;
+                const uint8_t lo = scale[0], hi = scale[1];
+                for (uint16_t bad : {0x7c00, 0xfc00, 0x7e00, 0xfc01}) {
+                    scale[0] = uint8_t(bad); scale[1] = uint8_t(bad >> 8);
+                    require(!ggml_validate_row_data(T, src, sb), "2.5 row512 validation rejects nonfinite scales at edge rows and blocks");
+                    require(!ggml_ai4_dequantize_slab(T, packed.data()+1, K, 1, b.data()+1),
+                            "2.5 row512 direct decode rejects nonfinite scales in the selected slab");
+                    require(b == output_before, "2.5 row512 rejected decode leaves all output and canaries unchanged");
+                }
+                scale[0] = lo; scale[1] = hi;
+            }
+        }
+        require(packed == before && ggml_validate_row_data(T, src, sb), "2.5 row512 validation preserves payload");
+        const int rb = ai4u_rot_size(K);
+        for (int r = 0; r < 16; ++r) {
+            for (int k = 0; k < K; k += rb) { ai4_unrotate_n(oracle.data() + size_t(r)*K + k, rb); }
+        }
+        aif25_dequantize_slab(expanded.data(), a.data(), K);
+        require(ggml_ai4_dequantize_slab(T, packed.data()+1, K, 1, b.data()+1), "2.5 row512 public slab decoder");
+        require(std::memcmp(a.data(), b.data()+1, a.size()*sizeof(float)) == 0,
+                "2.5 row512 matches expanded independent scale headers exactly");
+        require(std::memcmp(oracle.data(), b.data()+1, oracle.size()*sizeof(float)) == 0,
+                "2.5 row512 decoded scales match canonical values independent of host byte order");
+        require(b.front() == 123.0f && b.back() == 123.0f && packed == before, "2.5 row512 valid decode preserves canaries and packed bytes");
+    }
+    // GATE: on a width both layouts can hold, the same pair chunks and the same row scales decode to the same bits
+    // through type 125 (one scale per 640 columns) and type 127 (one scale per 512 columns).
+    for (int K : {2560, 5120, 7680}) {
+        const int chunks = K/128;
+        std::vector<uint8_t> payload(size_t(chunks)*640), scales(32);
+        uint32_t state = 91u + uint32_t(K);
+        for (auto & b : payload) { state = state*1664525u + 1013904223u; b = state >> 24; }
+        for (int r = 0; r < 16; ++r) {
+            const uint16_t scale = r == 3 ? 0 : r == 4 ? 0x8000 : uint16_t(0x2c00 + 37*r);
+            scales[2*r] = uint8_t(scale); scales[2*r+1] = uint8_t(scale >> 8);
+        }
+        std::vector<uint8_t> wide(size_t(K/640)*AIF25_V2_BLOCK_BYTES), narrow(size_t(K/512)*AIF25_V2_512_BLOCK_BYTES);
+        for (int c = 0; c < chunks; ++c) {
+            uint8_t * w = wide.data() + size_t(c/5)*AIF25_V2_BLOCK_BYTES;
+            uint8_t * n = narrow.data() + size_t(c/4)*AIF25_V2_512_BLOCK_BYTES;
+            std::memcpy(w, scales.data(), 32); std::memcpy(n, scales.data(), 32);
+            std::memcpy(w + 32 + size_t(c%5)*640, payload.data() + size_t(c)*640, 640);
+            std::memcpy(n + 32 + size_t(c%4)*640, payload.data() + size_t(c)*640, 640);
+        }
+        require(ggml_ai4_slab_nbytes(GGML_TYPE_AIF25_U2, K) == wide.size() && ggml_ai4_slab_nbytes(T, K) == narrow.size(),
+                "2.5 row640 and row512 slab sizes on a shared width");
+        std::vector<float> a(size_t(16)*K, 1.0f), b(size_t(16)*K, 2.0f);
+        require(ggml_ai4_dequantize_slab(GGML_TYPE_AIF25_U2, wide.data(), K, 0, a.data()), "2.5 row640 decode on a shared width");
+        require(ggml_ai4_dequantize_slab(T, narrow.data(), K, 0, b.data()), "2.5 row512 decode on a shared width");
+        require(std::memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0,
+                "2.5 row512 decodes bit for bit like row640 for equal chunks and scales");
+    }
+}
+
 static void check_fractional_copy(ggml_type type, int64_t K, int64_t M) {
 #if defined(__linux__)
     FILE * input = std::tmpfile(), * output = std::tmpfile();
@@ -556,7 +735,8 @@ static void check_fractional_copy(ggml_type type, int64_t K, int64_t M) {
     auto * tensor = ggml_new_tensor_2d(ctx, type, K, M);
     ggml_set_name(tensor, "blk.0.attn_q.weight");
     std::vector<uint8_t> bytes(ggml_nbytes(tensor), 0x5a);
-    const size_t block_bytes = type == GGML_TYPE_AIF175_U2 ? AIF175_BLOCK_BYTES : AIF25_V2_BLOCK_BYTES;
+    const size_t block_bytes = type == GGML_TYPE_AIF175_U2 ? AIF175_BLOCK_BYTES :
+        type == GGML_TYPE_AIF25_U2_512 ? AIF25_V2_512_BLOCK_BYTES : AIF25_V2_BLOCK_BYTES;
     for (size_t block = 0; block < bytes.size(); block += block_bytes) {
         for (int row = 0; row < 16; ++row) {
             bytes[block+2*row] = 0; bytes[block+2*row+1] = 0x3c;
@@ -639,6 +819,9 @@ int main() {
     check_aif175_windows();
     check_fractional_copy(GGML_TYPE_AIF175_U2, 4096, 4096);
     check_fractional_copy(GGML_TYPE_AIF25_U2, 5120, 2048);
+    check_fractional_copy(GGML_TYPE_AIF25_U2_512, 6144, 2048);
+    check_aif25_u2_512();
+    check_ai4_u2_512();
     const uint32_t multipliers[3] = {0xC3CCD12Du, 0x87D8D12Du, 0xAA73876Bu};
     const char * keys[3] = {"ait.multiplier.110", "ait.multiplier.111", "ait.multiplier.112"};
     for (int k = 2; k <= 4; ++k) {
@@ -749,8 +932,8 @@ int main() {
         require(cpu != nullptr, "CPU backend available for support checks");
         auto * ctx = ggml_init({64*ggml_tensor_overhead(), nullptr, true});
         require(ctx != nullptr, "CPU support-check context");
-        for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2}) {
-            const int K = type == GGML_TYPE_AIF175_U2 ? 512 : 640;
+        for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2_512}) {
+            const int K = type == GGML_TYPE_AIF25_U2 ? 640 : 512;
             auto * packed = ggml_new_tensor_2d(ctx, type, K, 16);
             auto * plain = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 16);
             auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 16);
@@ -854,8 +1037,8 @@ int main() {
         require(llama_ait_format_error(meta) == nullptr, "1.75 versioned contract accepted");
         gguf_free(meta);
     }
-    for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2}) {
-        const int64_t columns = type == GGML_TYPE_AIF175_U2 ? 512 : 640;
+    for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2_512}) {
+        const int64_t columns = type == GGML_TYPE_AIF25_U2 ? 640 : 512;
         const int64_t widths[] = {columns, 2*columns, 3*columns, 8*columns, 10*columns, 12*columns, 34*columns};
         for (int64_t M : {1, 15, 17, 31, 1025}) {
             auto * meta = fixture(type, columns, M);
@@ -1149,7 +1332,7 @@ int main() {
                 "1.75 late failure releases its single owned buffer");
         require(packed == failed_before && src == source_before, "1.75 late failure preserves every input and output byte");
     }
-    for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2}) {
+    for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2_512}) {
         const int64_t width = type == GGML_TYPE_AIF25_U2 ? 640 : 512;
         const size_t sb = ggml_ai4_slab_nbytes(type, width);
         const int64_t large_width = int64_t(SIZE_MAX/(16*sizeof(float))/width + 1)*width;

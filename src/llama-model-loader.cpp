@@ -1533,7 +1533,11 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_AIT2_U2:
             case GGML_TYPE_AIT3_U2:
             case GGML_TYPE_AIT4_U2:
+            case GGML_TYPE_AIT2_U2_512:
+            case GGML_TYPE_AIT3_U2_512:
+            case GGML_TYPE_AIT4_U2_512:
             case GGML_TYPE_AIF25_U2:
+            case GGML_TYPE_AIF25_U2_512:
             case GGML_TYPE_AIF175_U2:
             case GGML_TYPE_AIT2:
             case GGML_TYPE_AIT3:

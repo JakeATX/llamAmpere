@@ -477,7 +477,7 @@ extern "C" {
         // AITk_U2 (k = 2/3/4), expert unit layout v2: same 128-weight tiles, constants and level rule as AITk_U, but ONE fp16
         // scale per row per 640 K (block = 16 rows x 640 K = [16 fp16 scales][5 chunks x 16 tiles x 16k bytes], 80k + 2 bytes
         // per row and block, k + 0.025 bpw instead of k + 0.125). K % 640 == 0 (Flash-Next experts 2560 / 640). k = 2/3 are
-        // ggml_ai4_is_unit types with CUDA kernels; k = 4 (124) is registered only (no kernel, ggml_ai4_rate 0).
+        // ggml_ai4_is_unit types with CUDA kernels; k = 4 (124) has the dense MUL_MAT kernels (ggml_ai4_rate 4) and no expert-bank table.
         GGML_TYPE_AIT2_U2 = 122,
         GGML_TYPE_AIT3_U2 = 123,
         GGML_TYPE_AIT4_U2 = 124,
@@ -485,6 +485,15 @@ extern "C" {
         GGML_TYPE_AIF25_U2 = 125,
         // Alternating 3/4-bit pairs, one FP16 row scale per 512 columns: 1.78125 bpw.
         GGML_TYPE_AIF175_U2 = 126,
+        // AIF25_U2 with one FP16 row scale per 512 columns: four 640-byte pair-stream chunks share 16 row scales,
+        // 2592 bytes per 16x512 block (2.53125 bpw). For matrix widths that divide by 512 but not by 640.
+        GGML_TYPE_AIF25_U2_512 = 127,
+        // AITk_U2 (k = 2/3) with one fp16 row scale per 512 K: block = 16 rows x 512 K = [16 fp16 scales][4 chunks x 16 tiles x 16k bytes],
+        // 64k + 2 bytes per row and block, k + 0.03125 bpw. Same tiles, constants and level rule as AITk_U2. For matrix widths that
+        // divide by 512 but not by 640. Dense MUL_MAT kernels only (no expert-bank / MUL_MAT_ID kernels).
+        GGML_TYPE_AIT2_U2_512 = 128,
+        GGML_TYPE_AIT3_U2_512 = 129,
+        GGML_TYPE_AIT4_U2_512 = 130, // the 4-bit sibling: 258 bytes per row and block, 4.03125 bpw
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         // FP8 E4M3 weights/KV (upstream ggml 68d20b884 uses 43, which is our TURBO2_0 - local ID 60 here;
@@ -867,6 +876,8 @@ extern "C" {
     // AITk_U2 expert layout v2: trellis rate k for GGML_TYPE_AIT2_U2..AIT4_U2, 0 otherwise (decoder constants = those of the AITk_U type)
     GGML_API int      ggml_ai4v2_rate     (enum ggml_type type);
     GGML_API uint32_t ggml_ai4v2_trellis_mul(enum ggml_type type);
+    // 128-K chunks that share one row-scale header: 5 (640 K) for AITk_U2, 4 (512 K) for AITk_U2_512 (k = 2/3/4), 0 for every other type
+    GGML_API int      ggml_ai4v2_chunks   (enum ggml_type type);
 
     GGML_API int     ggml_exl3_bits   (enum ggml_type type); // bits/weight for GGML_TYPE_EXL3_*, 0 otherwise
     // EXL3 reference decode of trellis rows 16*g .. 16*g+15 of a [K, N] EXL3 tensor (bits 2..8) into y[16][K]

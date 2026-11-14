@@ -172,7 +172,7 @@ static std::vector<float> backend_product(ggml_backend_t backend, int K, int M, 
     ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
     require(out->ne[0] == M && out->ne[1] == tokens && out->ne[2] == seqs && out->ne[3] == groups, "backend output shape mismatch");
     require(ggml_backend_supports_op(backend, out), "fractional backend dispatch rejected activation shape");
-    if (type == GGML_TYPE_AIF25_U2 || type == GGML_TYPE_AIF175_U2) {
+    if (type == GGML_TYPE_AIF25_U2 || type == GGML_TYPE_AIF175_U2 || type == GGML_TYPE_AIF25_U2_512) {
         require(ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(backend), weight) == w.size(),
                 "fractional U2 allocation uses whole slabs without generic row padding");
     }
@@ -193,10 +193,10 @@ static std::vector<float> backend_product(ggml_backend_t backend, int K, int M, 
 static void test_backend(std::mt19937 & rng) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     require(backend != nullptr, "CUDA backend initialization failed");
-    for (auto type : {GGML_TYPE_AIF25_U, GGML_TYPE_AIF175_U2}) for (bool wide_k : {false, true}) {
+    for (auto type : {GGML_TYPE_AIF25_U, GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2_512}) for (bool wide_k : {false, true}) {
         ggml_context * ctx = ggml_init({ggml_tensor_overhead()*4, nullptr, true});
         require(ctx != nullptr, "shape-only context allocation failed");
-        const int64_t K = wide_k ? int64_t(INT32_MAX)+1 : type == GGML_TYPE_AIF175_U2 ? 512 : 128;
+        const int64_t K = wide_k ? int64_t(INT32_MAX)+1 : type == GGML_TYPE_AIF25_U ? 128 : 512;
         const int64_t M = wide_k ? 16 : int64_t(INT32_MAX)+1;
         ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, K, M);
         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
@@ -204,12 +204,15 @@ static void test_backend(std::mt19937 & rng) {
         ggml_free(ctx);
     }
     constexpr int M = 32;
-    for (ggml_type type : {GGML_TYPE_AIF25_U, GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2}) {
+    for (ggml_type type : {GGML_TYPE_AIF25_U, GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2_512}) {
         const bool f175 = type == GGML_TYPE_AIF175_U2;
         const bool row_scale = type == GGML_TYPE_AIF25_U2;
-        const int chunk_k = f175 ? 512 : row_scale ? 640 : 128;
-        const int block_bytes = f175 ? AIF175_BLOCK_BYTES : row_scale ? AIF25_V2_BLOCK_BYTES : AIF25_UNIT_BYTES;
-        for (int K : f175 ? std::vector<int>{512, 1024, 4096, 5120, 6144, 17408} :
+        const bool row512 = type == GGML_TYPE_AIF25_U2_512;
+        const int chunk_k = f175 || row512 ? 512 : row_scale ? 640 : 128;
+        const int block_bytes = f175 ? AIF175_BLOCK_BYTES : row512 ? AIF25_V2_512_BLOCK_BYTES :
+                                row_scale ? AIF25_V2_BLOCK_BYTES : AIF25_UNIT_BYTES;
+        for (int K : row512 ? std::vector<int>{512, 1024, 3072, 4096, 5120, 6144, 9216, 17408} :
+                     f175 ? std::vector<int>{512, 1024, 4096, 5120, 6144, 17408} :
                      row_scale ? std::vector<int>{640, 1280, 1920, 5120} : std::vector<int>{128, 256, 6144}) {
             std::vector<uint8_t> w(size_t(M/16)*(K/chunk_k)*block_bytes);
             for (uint8_t & v : w) v = rng();
@@ -224,6 +227,7 @@ static void test_backend(std::mt19937 & rng) {
                 const uint8_t * src = w.data()+size_t(slab)*(K/chunk_k)*block_bytes;
                 float * dst = decoded.data()+size_t(slab)*16*K;
                 if (f175) { aif175_dequantize_slab(src, dst, K); }
+                else if (row512) { aif25_dequantize_slab_v2_512(src, dst, K); }
                 else if (row_scale) { aif25_dequantize_slab_v2(src, dst, K); }
                 else { aif25_dequantize_slab(src, dst, K); }
             }

@@ -12,9 +12,9 @@ static inline const char * llama_ait_format_error(const gguf_context * meta) {
     bool pair_u = false;   // 121 = AIT2P_U: unit bytes, AIT2P pair table
     for (int64_t i = 0; i < gguf_get_n_tensors(meta); ++i) {
         const int type = (int) gguf_get_tensor_type(meta, i);
-        if (type == GGML_TYPE_AIF175_U2 || type == GGML_TYPE_AIF25_U2) {
+        if (type == GGML_TYPE_AIF175_U2 || type == GGML_TYPE_AIF25_U2 || type == GGML_TYPE_AIF25_U2_512) {
             const int64_t * ne = gguf_get_tensor_ne(meta, i);
-            const int columns = type == GGML_TYPE_AIF175_U2 ? 512 : 640;
+            const int columns = type == GGML_TYPE_AIF25_U2 ? 640 : 512;
             if (ne[0] <= 0 || ne[0] > INT32_MAX || ne[0] % columns != 0 ||
                 ne[1] <= 0 || ne[1] > INT32_MAX || ne[1] % 16 != 0 || ne[2] != 1 || ne[3] != 1) {
                 return "fractional U2 weights require a matrix with complete 16-row storage blocks and int32 dimensions";

@@ -5,6 +5,7 @@
 #define AIF25_MUL 0x87D8D12Du
 #define AIF25_UNIT_BYTES 672 // 16 fp16 scales + 16 circular 320-bit tile streams
 #define AIF25_V2_BLOCK_BYTES 3232 // 16 fp16 scales + five 640-byte pair-stream chunks
+#define AIF25_V2_512_BLOCK_BYTES 2592 // 16 fp16 scales + four 640-byte pair-stream chunks (one scale per row per 512 columns)
 #define AIF25_CONTRACT "pair5-l16-magic2-unit128-v1"
 
 // Physical words are little-endian; each word's stream bits run most-significant first.
@@ -79,4 +80,8 @@ static inline void aif25_dequantize_slab(const uint8_t * src, float * dst, int64
 
 static inline void aif25_dequantize_slab_v2(const uint8_t * src, float * dst, int64_t K) {
     aif25_dequantize_slab_impl(src, dst, K, 5);
+}
+
+static inline void aif25_dequantize_slab_v2_512(const uint8_t * src, float * dst, int64_t K) {
+    aif25_dequantize_slab_impl(src, dst, K, 4);
 }

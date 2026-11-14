@@ -176,12 +176,14 @@ static inline void aik_dequantize_slab_c(int k, uint32_t C, const uint8_t * src,
 #define AI4V2_BK             640
 #define AI4V2_UNITS          (AI4V2_BK/AI4U_UK)                      // 5 units of 128 K per block
 #define AI4V2_BLOCK_BYTES(k) (AI4U_SCALE_BYTES + AI4V2_UNITS*(AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k))   // 32 + 1280 k
+// the same block with `units` 128-K chunks per row-scale header: 5 (640 K, AITk_U2) or 4 (512 K, AITk_U2_512: 32 + 1024 k)
+#define AI4V2_BLOCK_BYTES_N(k, units) (AI4U_SCALE_BYTES + (units)*(AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k))
 
-// block = 16 rows x 640 K at src (AI4V2_BLOCK_BYTES(k) bytes); dst rows stride K; tiles are the AITk_U tiles (no pair code)
-static inline void aik_dequantize_block_v2_rotated(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K) {
+// block = 16 rows x (128 units) K at src (AI4V2_BLOCK_BYTES_N(k, units) bytes); dst rows stride K; tiles are the AITk_U tiles (no pair code)
+static inline void aik_dequantize_block_v2_rotated(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K, int units) {
     const int tw = AIK_TILE_WORDS(k);
     const uint16_t * dh = (const uint16_t *) src;
-    for (int u = 0; u < AI4V2_UNITS; ++u) {
+    for (int u = 0; u < units; ++u) {
         const uint32_t * wd = (const uint32_t *) (src + AI4U_SCALE_BYTES + (int64_t) u*(AI4U_UK/AI4_TC)*AI4U_TILE_BYTES(k));
         for (int ct = 0; ct < AI4U_UK/AI4_TC; ++ct) {
             for (int n = 0; n < AI4_TILE; ++n) {
@@ -193,9 +195,11 @@ static inline void aik_dequantize_block_v2_rotated(int k, uint32_t C, const uint
 }
 
 // slab = 16 rows x K (K % 640 == 0): K/640 blocks; dst[16][K] after the inverse rotation (H256 if K % 256 == 0, else H128)
-static inline void aik_dequantize_slab_v2_c(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K) {
-    for (int64_t b = 0; b < K/AI4V2_BK; ++b) {
-        aik_dequantize_block_v2_rotated(k, C, src + b*AI4V2_BLOCK_BYTES(k), dst + b*AI4V2_BK, K);
+// units = 128-K chunks per row-scale block (5 or 4); K % (128*units) == 0
+static inline void aik_dequantize_slab_v2_n(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K, int units) {
+    const int64_t bk = (int64_t) units*AI4U_UK;
+    for (int64_t b = 0; b < K/bk; ++b) {
+        aik_dequantize_block_v2_rotated(k, C, src + b*AI4V2_BLOCK_BYTES_N(k, units), dst + b*bk, K, units);
     }
     const int rb = ai4u_rot_size(K);
     for (int r = 0; r < AI4_TR; ++r) {
@@ -205,9 +209,18 @@ static inline void aik_dequantize_slab_v2_c(int k, uint32_t C, const uint8_t * s
     }
 }
 
+static inline void aik_dequantize_slab_v2_c(int k, uint32_t C, const uint8_t * src, float * dst, int64_t K) {
+    aik_dequantize_slab_v2_n(k, C, src, dst, K, AI4V2_UNITS);
+}
+
 // row-scale slab (K % 640 == 0): K/640 blocks
 static inline int64_t ai4x_slab_bytes_v2(int64_t K, int k) {
     return (K/AI4V2_BK)*AI4V2_BLOCK_BYTES(k);
+}
+
+// row-scale slab with `units` chunks per block (K % (128*units) == 0)
+static inline int64_t ai4x_slab_bytes_v2n(int64_t K, int k, int units) {
+    return (K/((int64_t) units*AI4U_UK))*AI4V2_BLOCK_BYTES_N(k, units);
 }
 
 static inline int64_t ai4x_slab_bytes_k(int64_t K, int k) {

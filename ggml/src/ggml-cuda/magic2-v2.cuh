@@ -46,7 +46,7 @@ template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false, int SCAL
 static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const int8_t * x,
         const float * xs, float * y, int M, int K, int N) {
     static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
-    static_assert(!ROW_SCALE || (B == 5 && V == 2 && SCALE_CHUNKS == 5) ||
+    static_assert(!ROW_SCALE || (B == 5 && V == 2 && (SCALE_CHUNKS == 5 || SCALE_CHUNKS == 4)) ||
         (B == 7 && V == 4 && SCALE_CHUNKS == 4), "row-scale pair layout");
     constexpr int UW = unit_bytes<B, V> / 4, TW = tile_words<B, V>;
     __shared__ uint32_t tiles[4][UW];
