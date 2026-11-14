@@ -268,6 +268,28 @@ static bool sj_kvarn_trellis_words() {
     static const bool v = [] { const char * e = getenv("GGML_SJKVARN_TRELLIS_WORDS"); return e == nullptr || e[0] != '0'; }();
     return v;
 }
+// [TRW] GGML_SJKVARN_TRELLIS_WIDTH=1 (opt-in, default off): 3/3 trellis decode/verify (n_q <= 8) takes the width kernel
+// (fattn-sjkvarn-lowbits-stream.cuh, template bits_k | 8) instead of the tile build. Same exclusions as the scalar width
+// route (GGML_SJKVARN_NO_DIRECT, LSA full stage incl. the compact strip stage). LSE nodes (LLAMA_LSA_COMP=2) take it too:
+// fattn-common.cuh launch_fattn keeps >= 2 parallel blocks for them, the kernel writes (max, sum) per block in natural-exp
+// units and flash_attn_combine_results writes lse = max + log(sum) (fattn-common.cuh:1781).
+static bool sj_kvarn_trellis_width() {
+    static const bool v = [] { const char * e = getenv("GGML_SJKVARN_TRELLIS_WIDTH"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+static bool sj_kvarn_trellis_width_applies(const ggml_tensor * dst) {
+    const int bits = ggml_get_op_params_i32(dst,5);
+    return sj_kvarn_trellis_width() && bits == ((3 << 8) | 3) && ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 &&
+        dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct() && !ggml_cuda_lsa_page_full_stage(dst->src[5]);
+}
+// route proof for the gate: one line per process on the first n_q <= 8 call that takes it, one on the first that does not
+static void sj_kvarn_trellis_width_note(const bool taken, const int n_q) {
+    static std::atomic_flag done_on = ATOMIC_FLAG_INIT, done_off = ATOMIC_FLAG_INIT;
+    if (taken ? !done_on.test_and_set() : !done_off.test_and_set()) {
+        GGML_LOG_INFO("%s: SJ-KVaRN trellis width route %s (n_q=%d)\n", __func__, taken ? "ON" : "OFF", n_q);
+    }
+}
+
 // route proof for end-to-end gates: one line on the first trellis attention call that takes the word-load build
 static void sj_kvarn_trellis_words_note() {
     static std::atomic_flag done = ATOMIC_FLAG_INIT;
@@ -298,6 +320,18 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
                 }
             }
             ggml_cuda_sj_kvarn_trellis_cb_init();
+            if constexpr (bits_k == 3 && bits_v == 3) {
+                if (sj_kvarn_trellis_width()) {
+                    const bool taken = sj_kvarn_trellis_width_applies(dst);
+                    if (dst->src[0]->ne[1] <= 8) { // prompt batches never take it; an OFF line means an n_q <= 8 call missed it
+                        sj_kvarn_trellis_width_note(taken, (int) dst->src[0]->ne[1]);
+                    }
+                    if (taken) {
+                        ggml_cuda_sj_kvarn_lowbits_width<bits_k | 8,bits_v,rot>(ctx,dst);
+                        return;
+                    }
+                }
+            }
             if (sj_kvarn_trellis_words()) {
                 sj_kvarn_trellis_words_note();
                 ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k | 8,bits_v,rot>(ctx,dst);
@@ -356,7 +390,7 @@ static void ggml_cuda_lowbits_case_rot(ggml_backend_cuda_context & ctx, ggml_ten
 bool ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(const ggml_tensor * dst) {
     const int bits = ggml_get_op_params_i32(dst,5);
     if (bits == ((4 << 8) | 4) || ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {
-        return true;
+        return !sj_kvarn_trellis_width_applies(dst); // [TRW] the width kernel reads the f16 mask expansion
     }
     return !(dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct());
 }
