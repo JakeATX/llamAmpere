@@ -54,7 +54,9 @@
 
 #include <cfloat>
 #include <climits>
+#include <cctype>
 #include <cstdlib>
+#include <string>
 
 namespace fattn_sj_kvarn_lowbits_stream {
 
@@ -1072,12 +1074,18 @@ static void ggml_cuda_sj_kvarn_lowbits_launch(ggml_backend_cuda_context & ctx, g
         false, false, false, false, WARP_SIZE, 0, rot ? plain : nullptr);
 }
 
-// trellis width route only: GGML_SJKVARN_TRELLIS_W5_MW8=1 runs n_q = 5 on the mw = 8 instance (ptxas: mw 5 spills ~2x mw 8)
+// trellis width route only: GGML_SJKVARN_TRELLIS_W5_MW8 (default on, Jake 2026-11-14; =0/off/false/no turns it off) runs
+// n_q = 5 on the mw = 8 instance (ptxas: mw 5 spills ~2x mw 8)
 static bool sj_kvarn_trellis_w5_mw8() {
     // the first read happens on the first trellis n_q = 5 call, so the line proves the mw 8 launch was taken
     static const bool v = [] {
         const char * e = getenv("GGML_SJKVARN_TRELLIS_W5_MW8");
-        const bool on = e && e[0] == '1';
+        bool on = true;
+        if (e != nullptr && *e != 0) {
+            std::string w(e);
+            for (char & c : w) { c = (char) tolower((unsigned char) c); }
+            on = !(w == "0" || w == "off" || w == "false" || w == "no");
+        }
         if (on) { GGML_LOG_WARN("%s: SJ-KVaRN trellis width n_q=5 runs on the mw 8 instance\n", __func__); }
         return on;
     }();

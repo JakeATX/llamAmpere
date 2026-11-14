@@ -1,7 +1,9 @@
 #include "fattn-sjkvarn-lowbits-stream.cuh"
 #include "sjkvarn-seal.cuh"
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
+#include <string>
 
 template <int DKQ, int DV, int ncols1, int ncols2, int bits_k, int bits_v, bool rot = false>
 void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -268,13 +270,19 @@ static bool sj_kvarn_trellis_words() {
     static const bool v = [] { const char * e = getenv("GGML_SJKVARN_TRELLIS_WORDS"); return e == nullptr || e[0] != '0'; }();
     return v;
 }
-// [TRW] GGML_SJKVARN_TRELLIS_WIDTH=1 (opt-in, default off): 3/3 trellis decode/verify (n_q <= 8) takes the width kernel
+// [TRW] GGML_SJKVARN_TRELLIS_WIDTH (default on, Jake 2026-11-14; =0/off/false/no turns it off): 3/3 trellis decode/verify (n_q <= 8) takes the width kernel
 // (fattn-sjkvarn-lowbits-stream.cuh, template bits_k | 8) instead of the tile build. Same exclusions as the scalar width
 // route (GGML_SJKVARN_NO_DIRECT, LSA full stage incl. the compact strip stage). LSE nodes (LLAMA_LSA_COMP=2 + COMP_LB=1)
 // stay on the tile build unless GGML_SJKVARN_TRELLIS_WIDTH_LSE=1 (below): the width launch is the low-bit launch_fattn
 // (fattn-sjkvarn-lowbits-common.cuh), which then keeps >= 2 parallel blocks and its combine writes lse = max + log(sum).
 static bool sj_kvarn_trellis_width() {
-    static const bool v = [] { const char * e = getenv("GGML_SJKVARN_TRELLIS_WIDTH"); return e != nullptr && e[0] == '1'; }();
+    static const bool v = [] {
+        const char * e = getenv("GGML_SJKVARN_TRELLIS_WIDTH");
+        if (e == nullptr || *e == 0) { return true; }
+        std::string w(e);
+        for (char & c : w) { c = (char) tolower((unsigned char) c); }
+        return !(w == "0" || w == "off" || w == "false" || w == "no");
+    }();
     return v;
 }
 // opt-in on top of the width route: FA nodes with an LSE output also take it (LSE from the parallel-block combine)
