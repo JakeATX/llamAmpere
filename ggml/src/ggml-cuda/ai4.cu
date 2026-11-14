@@ -16,7 +16,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <array>
 #include <atomic>
+#include <mutex>
 #include <cstring>
 #include <vector>
 
@@ -780,6 +782,23 @@ static bool ai4_midt_u_on() {
     return v;
 }
 
+// GGML_CUDA_AI4_FEWPORT_LOG=1: one stderr line per distinct (port, type, M, N, K) that a FEWPORT path ran (engagement proof)
+static void ai4_fewport_log(int port, ggml_type t, int M, int N, int K, int sp) {
+    static const bool on = ai4_env_int("GGML_CUDA_AI4_FEWPORT_LOG", nullptr, 0) != 0;
+    if (!on) {
+        return;
+    }
+    static std::mutex mu;
+    static std::vector<std::array<int, 5>> seen;
+    std::lock_guard<std::mutex> lock(mu);
+    const std::array<int, 5> key{ port, (int) t, M, N, K };
+    if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+        return;
+    }
+    seen.push_back(key);
+    fprintf(stderr, "[ai4-fewport] port %d %s M=%d N=%d K=%d splits=%d\n", port, ggml_type_name(t), M, N, K, sp);
+}
+
 // port 2: N 9..16 -> 2 column groups, 17..24 -> 3
 template <int LAY>
 static void ai4_mmv_cg_width(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K, cudaStream_t stream) {
@@ -980,6 +999,7 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
                 default: GGML_ABORT("not an AI+ unit type");
             }
             CUDA_CHECK(cudaGetLastError());
+            ai4_fewport_log(2, t, M, N, K, 1);
             return;
         }
         const int lay = ai4_lay_of(t);
@@ -1003,6 +1023,7 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
                 ai4k::split_k_reduce<<<((int64_t) M*N + 255)/256, 256, 0, stream>>>(out, Y, (int64_t) M*N, sp);
             }
             CUDA_CHECK(cudaGetLastError());
+            ai4_fewport_log(3, t, M, N, K, sp);
             return;
         }
     }
