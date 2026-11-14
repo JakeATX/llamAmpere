@@ -43,7 +43,7 @@ def prompt_of(n: int, seed: int = 0) -> str:
 
 
 def complete(prompt: str, id_slot: int = -1, n_predict: int = 8):
-    data = {"prompt": prompt, "n_predict": n_predict, "cache_prompt": True}
+    data = {"prompt": prompt, "n_predict": n_predict, "cache_prompt": True, "temperature": 0.0, "top_k": 1}
     if id_slot >= 0:
         data["id_slot"] = id_slot
     return server.make_request("POST", "/completion", data=data)
