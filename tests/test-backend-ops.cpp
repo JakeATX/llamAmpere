@@ -23235,6 +23235,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // [FEWROW] GGML_TEST_AIV2_PERF=fewrow: P76 AI4 dense types at the 27B shapes (M x K), verify widths 4..24: is there
+        // a step from 8 to 9 rows (k_ait_mmv / ai4k::mmv -> MIDT tile) on AIT4 / AIT3 / AIT5_U, and the Q8_0 / Q6_K curve
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "fewrow") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 5120, 5120 }, { 17408, 5120 }, { 5120, 17408 } }) {
+                for (int64_t n : { 4, 5, 6, 8, 9, 12, 16, 24 }) {
+                    for (ggml_type t : { GGML_TYPE_AIT4, GGML_TYPE_AIT3 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                    test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, GGML_TYPE_AIT5_U));
+                    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+                        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                    }
+                }
+            }
+            return test_cases;
+        }
         // Unit formats at Flash-Next expert shapes, including the 640-wide H128 tail.
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "unit") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{640, 2560}, {2560, 640}}) {
