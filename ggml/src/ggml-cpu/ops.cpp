@@ -12223,8 +12223,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         // ggml_gated_delta_net_set_prefix: masked ring tokens ahead of the batch, state only
         const int64_t n_prefix = ggml_get_op_params_i32(dst, 2);
+        const int64_t w_s1     = n_prefix > 0 && dst->src[7]->ne[1] > 1 ? n_prefix : 0; // per-seq mask
         for (int64_t t = 0; t < n_prefix; t++) {
-            const float w_t = ((const float *) dst->src[7]->data)[t];
+            const float w_t = ((const float *) dst->src[7]->data)[iv3 * w_s1 + t];
             if (w_t == 0.0f) {
                 continue;
             }

@@ -144,7 +144,7 @@ gated_delta_net_cuda(const float * q,
         const float * g_t;
         float         w_t = 1.0f;
         if (t < 0) {
-            w_t = state_src.prefix_w[t + n_prefix];
+            w_t = state_src.prefix_w[sequence * state_src.prefix_w_s1 + t + n_prefix];
             if (w_t == 0.0f) {
                 continue;
             }
@@ -447,7 +447,7 @@ gated_delta_net_cuda_ilp(const float * q,
                 (int64_t) (t + state_src.prefix_n) * state_src.prefix_ingr_w * H + h_idx * state_src.prefix_ingr_w;
             k_t = slot;
             v_t = slot + S_v + col0;
-            const float w = state_src.prefix_w[t + state_src.prefix_n];
+            const float w = state_src.prefix_w[sequence * state_src.prefix_w_s1 + t + state_src.prefix_n];
             gr = slot[2 * S_v] * w;
             br = slot[state_src.prefix_off_b] * w;
         } else {
@@ -471,14 +471,14 @@ gated_delta_net_cuda_ilp(const float * q,
     const int n_prefix = emit_ingredients_t ? state_src.prefix_n : 0;
     int first_t = -n_prefix;
     if constexpr (PREFETCH) {
-        while (first_t < 0 && state_src.prefix_w[first_t + n_prefix] == 0.0f) {
+        while (first_t < 0 && state_src.prefix_w[sequence * state_src.prefix_w_s1 + first_t + n_prefix] == 0.0f) {
             first_t++;
         }
         load_tok(first_t, k_reg, q_reg, v_reg, g_raw, beta_val);
         g_prefetched = expf(g_raw);
     }
     for (int t = first_t; t < n_tokens; t++) {
-        if (t < 0 && state_src.prefix_w[t + n_prefix] == 0.0f) {
+        if (t < 0 && state_src.prefix_w[sequence * state_src.prefix_w_s1 + t + n_prefix] == 0.0f) {
             continue;
         }
         if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens <= K) {
@@ -502,7 +502,7 @@ gated_delta_net_cuda_ilp(const float * q,
         int next_t = t + 1;
         if constexpr (PREFETCH) {
             // A masked slot may contain NaNs. Stage the next active slot, or the first new token.
-            while (next_t < 0 && state_src.prefix_w[next_t + n_prefix] == 0.0f) {
+            while (next_t < 0 && state_src.prefix_w[sequence * state_src.prefix_w_s1 + next_t + n_prefix] == 0.0f) {
                 next_t++;
             }
             if (next_t < n_tokens) {
@@ -2062,6 +2062,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         const int pmode = ggml_get_op_params_i32(dst, 3);
         state_src.prefix        = (const float *) ring->data;
         state_src.prefix_w      = (const float *) dst->src[7]->data;
+        state_src.prefix_w_s1   = dst->src[7]->ne[1] > 1 ? dst->src[7]->ne[0] : 0; // per-sequence mask
         state_src.prefix_s1     = ring->nb[1] / sizeof(float);
         state_src.prefix_n      = n_prefix;
         state_src.prefix_ingr_w = (int) ggml_gated_delta_net_ingr_width(S_v, src_g->ne[0], pmode);

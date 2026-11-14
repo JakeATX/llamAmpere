@@ -7489,7 +7489,9 @@ void ggml_gated_delta_net_set_prefix(
     GGML_ASSERT(ring->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
     GGML_ASSERT(ring->nb[0] == sizeof(float) && ggml_is_contiguous(w));
     const struct ggml_tensor * v = gdn->src[2];
-    const int64_t P = ggml_nelements(w);
+    // w is [P] (one mask for all seqs) or [P, n_seqs] (one mask per seq)
+    const int64_t P = w->ne[0];
+    GGML_ASSERT(ggml_n_dims(w) <= 2 && (w->ne[1] == 1 || w->ne[1] == v->ne[3]));
     GGML_ASSERT(P >= 1 && ring->ne[1] == v->ne[3]);
     GGML_ASSERT(P * ggml_gated_delta_net_ingr_width(v->ne[0], gdn->src[3]->ne[0], ring_mode) * v->ne[1] <= ring->ne[0]);
     // n_tokens <= K: the state after the prefix is the checkpoint, so the output gains the trailing block that

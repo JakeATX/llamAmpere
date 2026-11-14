@@ -651,6 +651,13 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
         data[i] = m->s_copy((int) i);
     }
 
+    // [TAG_GDN_REPLAY_LANES] per-lane replay: lane i reads its own (r, S, stale) through lane_seq(i)
+    if (replay_w != nullptr && replay_w->buffer && replay_w->ne[1] > 1) {
+        fill_replay_lanes(m, data, n_rs);
+        set_input_shift(m);
+        return;
+    }
+
     if (s_copy_conv != nullptr && s_copy_conv->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_conv->buffer));
         int32_t *     conv = (int32_t *) s_copy_conv->data;
@@ -685,6 +692,43 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
     set_input_shift(m);
 }
 
+void llm_graph_input_rs::fill_replay_lanes(const llama_memory_recurrent_context * m, const int32_t * data, int64_t n_rs) {
+    GGML_ASSERT(ggml_backend_buffer_is_host(replay_w->buffer));
+    GGML_ASSERT(s_copy_conv && s_copy_conv->buffer && ggml_backend_buffer_is_host(s_copy_conv->buffer));
+    GGML_ASSERT(s_copy_pair && s_copy_pair->buffer && ggml_backend_buffer_is_host(s_copy_pair->buffer));
+    float *        w    = (float *) replay_w->data;
+    int32_t *      conv = (int32_t *) s_copy_conv->data;
+    int32_t *      pair = (int32_t *) s_copy_pair->data;
+    const uint32_t K    = m->get_n_rs_seq();
+    const int64_t  n_seqs   = replay_w->ne[1];
+    const int64_t  mem_size = m->get_size();
+    GGML_ASSERT((int64_t) K == replay_w->ne[0] && s_copy_pair_main->ne[0] == n_seqs && n_rs >= n_seqs);
+
+    bool differ = false;
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        const llama_seq_id seq = m->lane_seq((int) s);
+        const uint32_t r = m->replay_len_seq(seq);
+        const uint32_t S = m->ckpt_span_seq(seq);
+        const bool     z = m->s_stale_seq(seq);
+        GGML_ASSERT(r <= S && S <= K);
+        const llama_seq_id seq0 = m->lane_seq(0);
+        differ |= r != m->replay_len_seq(seq0) || S != m->ckpt_span_seq(seq0) || z != m->s_stale_seq(seq0);
+        const bool need_base = r > 0 || z;
+        for (uint32_t j = 0; j < K; ++j) {
+            w[s * K + j] = need_base && j < S - r ? 1.0f : 0.0f;
+        }
+        conv[s] = (int32_t) (data[s] + (int64_t) r * mem_size);
+        pair[s] = (int32_t) (data[s] + (need_base ? mem_size : 0));
+    }
+    // rows past n_seqs have no lane: same rule as the 1-D form (scalar conv offset, state row)
+    GGML_ASSERT(!differ || n_rs == n_seqs);
+    const int64_t off = (int64_t) m->get_replay_len() * mem_size;
+    for (int64_t i = n_seqs; i < n_rs; ++i) {
+        conv[i] = (int32_t) (data[i] + off);
+        pair[i] = data[i];
+    }
+}
+
 void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * m) {
     // read by the shift-layout snapshot writers (delta-net, Mamba2, and the kimi-k3 / bailingmoe3 / qwen4exp / lfm2
     // conv); a graph with no shift-layout writer never reads it and leaves it without a buffer
@@ -710,9 +754,12 @@ void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * 
     // at most rs_valid - r_s + n <= n + K - 1 - r_s. In replay mode s_copy carries no rollback group
     // (rs_idx stays 0, plane0 = replay_len) and the lanes agree, so every lane moves snap_shift groups.
     // replay mode reads the pending rollback's plane through the indices (the gather's view starts at plane 0)
-    const int64_t plane0 = m->get_gdn_replay() ? (int64_t) m->get_replay_len() * mem_size : 0;
+    // [TAG_GDN_REPLAY_LANES] per-lane replay: each lane reads its own pending replay's plane
+    const bool    lanes  = replay_w != nullptr && replay_w->ne[1] > 1;
     const int64_t n_seqs = s_copy_shift->ne[0] / snap_shift;
     for (int64_t s = 0; s < n_seqs; ++s) {
+        const int64_t plane0 = !m->get_gdn_replay() ? 0 :
+            (int64_t) (lanes ? m->replay_len_seq(m->lane_seq((int) s)) : m->get_replay_len()) * mem_size;
         uint32_t n_move = snap_shift;
         if (replay_len == 0) {
             const uint32_t r_s = (uint32_t) main[s] / mem_size;
@@ -8285,7 +8332,10 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_copy_pair);
         ggml_set_name(inp->s_copy_pair, "rs_s_copy_pair");
         inp->s_copy_pair_main = ggml_view_1d(ctx0, inp->s_copy_pair, n_seqs, 0);
-        inp->replay_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t) mctx_cur->get_n_rs_seq());
+        // [TAG_GDN_REPLAY_LANES] one K-slot mask per lane; 1-D (one mask for all lanes) otherwise
+        inp->replay_w = mctx_cur->get_replay_lanes() && n_seqs > 1
+            ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) mctx_cur->get_n_rs_seq(), n_seqs)
+            : ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, (int64_t) mctx_cur->get_n_rs_seq());
         ggml_set_input(inp->replay_w);
         ggml_set_name(inp->replay_w, "rs_replay_w");
     }

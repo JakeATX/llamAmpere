@@ -70,6 +70,15 @@ llama_memory_recurrent::llama_memory_recurrent(
         const bool   arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
                                model.arch == LLM_ARCH_QWEN3NEXT;
         this->rs_ring = n_rs_seq > 0 && !this->gdn_replay && arch_ok && !env_off;
+        // [TAG_GDN_REPLAY_LANES] same archs: their conv and replay go through llm_build_delta_net_base. qwen4exp,
+        // kimi-k3 and bailingmoe3 read the scalar get_replay_len() in snapshot_shift_gather, so they keep the strict rule
+        const char * env_lanes = getenv("LLAMA_GDN_REPLAY_LANES");
+        const bool   lanes_req = env_lanes != nullptr && strcmp(env_lanes, "1") == 0;
+        this->gdn_replay_lanes = this->gdn_replay && lanes_req && arch_ok;
+        if (this->gdn_replay && lanes_req) {
+            LLAMA_LOG_INFO("%s: gdn_replay lanes = %s\n", __func__,
+                    arch_ok ? "on (LLAMA_GDN_REPLAY_LANES=1)" : "off (LLAMA_GDN_REPLAY_LANES=1 ignored: arch not supported)");
+        }
         const char * env_rows = getenv("LLAMA_RS_RING_ROWS");
         this->rs_ring_rows_all = this->rs_ring && env_rows != nullptr && strcmp(env_rows, "1") == 0;
         const char * env_skip = getenv("LLAMA_RS_SHIFT_SKIP");
@@ -232,6 +241,14 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+    }
+}
+
+llama_memory_recurrent::~llama_memory_recurrent() {
+    if (gdn_replay_lanes && lstats.n_ubatch > 0) {
+        LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu\n", __func__,
+                (unsigned long long) lstats.n_ubatch, (unsigned long long) lstats.n_joint, (unsigned long long) lstats.n_strict,
+                (unsigned long long) lstats.n_width, (unsigned long long) lstats.n_tail);
     }
 }
 
@@ -632,16 +649,63 @@ uint32_t llama_memory_recurrent::replay_span_new(uint32_t ckpt_span, uint32_t re
     return std::min(m + n_seq_tokens, n_rs_seq);
 }
 
-bool llama_memory_recurrent::replay_split::compat(llama_seq_id a, llama_seq_id b) const {
+void llama_memory_recurrent::replay_split::count_tokens(const llama_batch & batch) {
+    n_tokens.assign(replay_len.size(), 0);
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t k = 0; k < batch.n_seq_id[i]; ++k) {
+            const llama_seq_id seq = batch.seq_id[i][k];
+            if (seq >= 0 && (size_t) seq < n_tokens.size()) {
+                n_tokens[seq]++;
+            }
+        }
+    }
+}
+
+bool llama_memory_recurrent::replay_split::strict(llama_seq_id a, llama_seq_id b) const {
     if (a < 0 || b < 0 || (size_t) a >= replay_len.size() || (size_t) b >= replay_len.size()) {
         return true;
     }
     return replay_len[a] == replay_len[b] && ckpt_span[a] == ckpt_span[b] && s_stale[a] == s_stale[b];
 }
 
-void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch) {
+bool llama_memory_recurrent::replay_split::compat(llama_seq_id a, llama_seq_id b) const {
+    if (strict(a, b)) {
+        return true;
+    }
+    // [TAG_GDN_REPLAY_LANES] both seqs can fill a static-width ubatch; split_equal's strict guard checks the real width
+    if (lanes && (size_t) a < n_tokens.size() && (size_t) b < n_tokens.size()) {
+        const uint32_t na = n_tokens[a];
+        const uint32_t nb = n_tokens[b];
+        return na >= n_rs_seq && nb >= n_rs_seq && replay_static_width(na, n_rs_seq) && replay_static_width(nb, n_rs_seq);
+    }
+    return false;
+}
+
+void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch, uint32_t split_cut) {
     if (!active || ubatch.n_tokens == 0) {
         return;
+    }
+    const uint32_t n_seq_tokens = ubatch.n_seqs > 0 ? ubatch.n_tokens / ubatch.n_seqs : 0;
+    // [TAG_GDN_REPLAY_LANES] lanes that differ only on the static verify graph (checked before the values below are
+    // overwritten). Without lanes compat == strict, so this check is skipped there.
+    bool mixed = false;
+    for (uint32_t i = 1; lanes && i < ubatch.n_seqs_unq && !mixed; ++i) {
+        mixed = !strict(ubatch.seq_id_unq[0], ubatch.seq_id_unq[i]);
+    }
+    if (mixed) {
+        GGML_ASSERT(n_seq_tokens >= n_rs_seq && replay_static_width(n_seq_tokens, n_rs_seq));
+    }
+    if (stats != nullptr) {
+        stats->n_ubatch++;
+        stats->n_joint  += mixed;
+        stats->n_strict += (split_cut & llama_batch_allocr::SPLIT_CUT_COMPAT) != 0;
+        stats->n_width  += (split_cut & llama_batch_allocr::SPLIT_CUT_WIDTH)  != 0;
+        stats->n_tail   += (split_cut & llama_batch_allocr::SPLIT_CUT_TAIL)   != 0;
+        if ((stats->n_ubatch & 4095) == 0) {
+            LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu\n", __func__,
+                    (unsigned long long) stats->n_ubatch, (unsigned long long) stats->n_joint, (unsigned long long) stats->n_strict,
+                    (unsigned long long) stats->n_width, (unsigned long long) stats->n_tail);
+        }
     }
     // same values the graph input takes (max over the ubatch's lanes), same update as consume_replay()
     uint32_t r = 0;
@@ -653,8 +717,7 @@ void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch) 
             span = std::max(span, ckpt_span[seq]);
         }
     }
-    const uint32_t n_seq_tokens = ubatch.n_seqs > 0 ? ubatch.n_tokens / ubatch.n_seqs : 0;
-    const uint32_t span_new     = replay_span_new(span, r, n_seq_tokens, n_rs_seq);
+    const uint32_t span_new = replay_span_new(span, r, n_seq_tokens, n_rs_seq);
     for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
         const llama_seq_id seq = ubatch.seq_id_unq[i];
         if (seq >= 0 && (size_t) seq < replay_len.size()) {
@@ -672,19 +735,32 @@ llama_batch_allocr::seq_compat_fn llama_memory_recurrent::replay_split::fn() con
     return [this](llama_seq_id a, llama_seq_id b) { return compat(a, b); };
 }
 
+llama_batch_allocr::seq_compat_fn llama_memory_recurrent::replay_split::strict_fn() const {
+    if (!active || !lanes) {
+        return nullptr;
+    }
+    return [this](llama_seq_id a, llama_seq_id b) { return strict(a, b); };
+}
+
 llama_memory_recurrent::replay_split llama_memory_recurrent::make_replay_split(const llama_batch_allocr & balloc) const {
     replay_split rs;
     if (!gdn_replay) {
         return rs;
     }
     rs.active     = true;
+    rs.lanes      = gdn_replay_lanes;
     rs.n_rs_seq   = n_rs_seq;
     rs.replay_len = replay_len;
     rs.ckpt_span  = ckpt_span;
     rs.s_stale    = s_stale;
 
-    // is anything kept apart in this batch? only for the log
     const llama_batch & batch = balloc.get_batch();
+    if (rs.lanes) {
+        rs.count_tokens(batch);
+        rs.stats = &lstats;
+    }
+
+    // is anything kept apart in this batch? only for the log
     llama_seq_id first = -1;
     bool disagree = false;
     for (int32_t i = 0; i < batch.n_tokens && !disagree; ++i) {
@@ -729,14 +805,15 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn(),
+                        rsplit.strict_fn(), rsplit.n_mixed_min());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
 
-            rsplit.advance(ubatch);
+            rsplit.advance(ubatch, balloc.get_split_cut());
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
@@ -1997,6 +2074,11 @@ uint32_t llama_memory_recurrent_context::get_ckpt_span() const {
             span = std::max(span, mem->ckpt_span[seq]);
         }
     }
+    // [TAG_GDN_REPLAY_LANES] a static-width lanes ubatch reads the per-lane values (lane_seq), not this maximum
+    if (disagree && mem->gdn_replay_lanes && ubatch.n_seq_tokens >= mem->n_rs_seq &&
+            llama_memory_recurrent::replay_static_width(ubatch.n_seq_tokens, mem->n_rs_seq)) {
+        disagree = false;
+    }
     if (disagree) {
         // init_batch keeps such lanes apart ([TAG_GDN_REPLAY_SPLIT]); reaching this is a bug
         static bool warned = false;
@@ -2027,6 +2109,27 @@ uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
     return mem->n_rs_seq;
 }
 
+bool llama_memory_recurrent_context::get_replay_lanes() const {
+    return mem->gdn_replay_lanes && !is_full;
+}
+
+llama_seq_id llama_memory_recurrent_context::lane_seq(int i) const {
+    const auto & cell = mem->cells[i + mem->head];
+    return cell.seq_id.empty() ? -1 : *cell.seq_id.begin();
+}
+
+uint32_t llama_memory_recurrent_context::replay_len_seq(llama_seq_id seq) const {
+    return seq >= 0 && (size_t) seq < mem->replay_len.size() ? mem->replay_len[seq] : 0;
+}
+
+uint32_t llama_memory_recurrent_context::ckpt_span_seq(llama_seq_id seq) const {
+    return seq >= 0 && (size_t) seq < mem->ckpt_span.size() ? mem->ckpt_span[seq] : 0;
+}
+
+bool llama_memory_recurrent_context::s_stale_seq(llama_seq_id seq) const {
+    return seq >= 0 && (size_t) seq < mem->s_stale.size() && mem->s_stale[seq] != 0;
+}
+
 uint32_t llama_memory_recurrent_context::get_snap_shift() const {
     if (mem->n_rs_seq == 0 || is_full || mem->rs_ring || mem->rs_shift_skip) {
         return 0;
@@ -2043,7 +2146,8 @@ uint32_t llama_memory_recurrent_context::get_snap_shift() const {
     // llm_graph_input_rs::set_input_shift turns the surplus groups of the other lanes into
     // copies of their own destination rows. Sizing it for the largest r instead moved too few
     // groups for the other lanes, whose rs_valid still credited them (test gate G).
-    // In replay mode the lanes agree ([TAG_GDN_REPLAY_SPLIT]), so min == max there.
+    // In replay mode the lanes agree ([TAG_GDN_REPLAY_SPLIT]), so min == max there. Lanes that differ
+    // ([TAG_GDN_REPLAY_LANES]) have n >= n_rs_seq, where this is 1 for every r (0 for n >= K).
     uint32_t r = 0;
     bool     first = true;
     const auto & group_of = mem->gdn_replay ? mem->replay_len : mem->rs_idx;

@@ -882,7 +882,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         replay_fold = fold_env && n <= 2 * K;
         if (!replay_fold) {
             ggml_tensor * w      = inp->replay_w;
-            ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
+            // [TAG_GDN_REPLAY_LANES] a 2-D w ([K, n_seqs]) gives each lane its own mask through the mul's broadcast
+            ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, w->ne[1], w->nb[0], w->nb[0], w->nb[0] * K, 0);
             auto comp = [&](int64_t ne0, int64_t off) {
                 return ggml_view_4d(ctx0, ring, ne0, H_v, K, n_seqs,
                     ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1], (size_t) off * ingr_elemsize);

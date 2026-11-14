@@ -3060,7 +3060,7 @@ extern "C" {
     // emit_mode 1 or 2 only: before its n_tokens, `gdn` runs w->ne[0] prefix tokens read from `ring`,
     // [n_rows, n_seqs] rows of packed ingredient slots in the layout of emit_mode `ring_mode` (slot j
     // of seq s at row s, offset j * ingr_width * H, as this op emits them), with g and beta
-    // multiplied by w[j]. A prefix token only advances the state: no attention output, no slot,
+    // multiplied by w[j] (w [P] for all seqs, or w[j, s] per seq with w [P, n_seqs]). A prefix token only advances the state: no attention output, no slot,
     // and it does not count towards the checkpoint block. w[j] == 0 leaves the state bit-exact,
     // so a masked ring prefix replays the accepted slots ahead of the batch in the same call.
     // With n_tokens <= K the output gains the checkpoint block: the state after the prefix.

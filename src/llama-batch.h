@@ -197,8 +197,21 @@ public:
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
     // compat      = optional filter: compat(a, b) == false keeps seq b out of a ubatch whose first seq is a
+    // strict      = optional second filter for ubatches narrower than n_mixed_min tokens per seq: when the
+    //               width comes out below it and any seq b has strict(a, b) == false, seqs 1.. go back to the
+    //               pool and the first seq is emitted alone (compat may admit seqs that only share a ubatch
+    //               of at least n_mixed_min tokens, see llama_memory_recurrent::replay_split). nullptr = no guard
     using seq_compat_fn = std::function<bool(llama_seq_id a, llama_seq_id b)>;
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail = 0, const seq_compat_fn & compat = nullptr);
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail = 0, const seq_compat_fn & compat = nullptr,
+            const seq_compat_fn & strict = nullptr, uint32_t n_mixed_min = 0);
+
+    // why the last split_equal call left seqs out of its ubatch (SPLIT_CUT_* bits, 0 = nothing left out)
+    enum : uint32_t {
+        SPLIT_CUT_COMPAT = 1u << 0, // compat kept a seq out
+        SPLIT_CUT_WIDTH  = 1u << 1, // the strict guard: width < n_mixed_min
+        SPLIT_CUT_TAIL   = 1u << 2, // n_keep_tail deferred a seq
+    };
+    uint32_t get_split_cut() const { return split_cut; }
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     // TODO: extend to support multiple _full_ sequences in the ubatch
@@ -212,6 +225,7 @@ private:
     void clear();
 
     uint32_t split_pos_grid = 0;
+    uint32_t split_cut      = 0;
 
     // true if the token at batch index idx starts a new grid cell (a ubatch must not continue into it)
     bool split_on_grid(int32_t idx) const {

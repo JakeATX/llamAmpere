@@ -28,7 +28,7 @@ public:
                          bool   gdn_replay_req,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent();
 
     //
     // llama_memory_i
@@ -130,6 +130,24 @@ public:
     // set_rs_idx. Only meaningful for GDN/KDA-style recurrent layers.
     bool gdn_replay = false;
 
+    // [TAG_GDN_REPLAY_LANES] LLAMA_GDN_REPLAY_LANES=1 (opt-in, default off, =0 off): seqs with different pending
+    // replays may share a ubatch of n >= n_rs_seq tokens per seq (the static verify graph). replay_w is then
+    // [n_rs_seq, n_seqs] and s_copy_pair / s_copy_conv / the shift planes are set per lane (lane_seq), so 4 users
+    // verify in one pass instead of one pass each. Only for archs whose replay goes through llm_build_delta_net_base
+    // (qwen35, qwen35moe, qwen3next); others ignore the env and keep the strict rule.
+    bool gdn_replay_lanes = false;
+
+    // [TAG_GDN_REPLAY_LANES] counters for the log: ubatches, joint passes (lanes that differ in one ubatch) and why
+    // seqs were left out of a ubatch (llama_batch_allocr::SPLIT_CUT_*)
+    struct lanes_stats {
+        uint64_t n_ubatch  = 0;
+        uint64_t n_joint   = 0;
+        uint64_t n_strict  = 0;
+        uint64_t n_width   = 0;
+        uint64_t n_tail    = 0;
+    };
+    mutable lanes_stats lstats;
+
     // per-seq pending replay length (0 = no replay pending); parallel to rs_idx, cleared on
     // full seq_rm/clear so a released slot can't leave a dangling replay for its next occupant.
     std::vector<uint32_t> replay_len;
@@ -173,19 +191,32 @@ public:
     // fn() to split_equal and calls advance() on every ubatch it keeps, which applies to a copy
     // what consume_replay() will do to the real values when that ubatch's graph runs, so later
     // ubatches of the same batch are grouped by the values they will actually see.
+    // [TAG_GDN_REPLAY_LANES] with lanes on, compat also admits two seqs that both have >= n_rs_seq tokens in the
+    // batch (relaxed), and split_equal's strict guard (strict_fn, n_mixed_min) keeps the real ubatch at that width.
+    // Short static rounds (LLAMA_GDN_REPLAY_SHORT, n < n_rs_seq) stay strict: get_snap_shift sizes by the min r.
     struct replay_split {
         bool     active   = false;
+        bool     lanes    = false;
         uint32_t n_rs_seq = 0;
 
         std::vector<uint32_t> replay_len;
         std::vector<uint32_t> ckpt_span;
         std::vector<uint8_t>  s_stale;
+        std::vector<uint32_t> n_tokens; // per seq, tokens in the batch (lanes only)
 
+        lanes_stats * stats = nullptr;
+
+        void count_tokens(const llama_batch & batch);
+
+        bool strict(llama_seq_id a, llama_seq_id b) const;
         bool compat(llama_seq_id a, llama_seq_id b) const;
-        void advance(const llama_ubatch & ubatch);
+        void advance(const llama_ubatch & ubatch, uint32_t split_cut = 0);
 
         // the split_equal filter, or nullptr when the constraint does not apply
         llama_batch_allocr::seq_compat_fn fn() const;
+        // the split_equal width guard (strict, n_mixed_min), or nullptr / 0 without lanes
+        llama_batch_allocr::seq_compat_fn strict_fn() const;
+        uint32_t n_mixed_min() const { return lanes ? n_rs_seq : 0; }
     };
 
     // logs once when the batch's seqs disagree
@@ -345,6 +376,15 @@ public:
     uint32_t get_ckpt_span() const;
     bool     get_s_stale()   const;
     uint32_t get_n_rs_seq()  const;
+
+    // [TAG_GDN_REPLAY_LANES] mem->gdn_replay_lanes and not a full-state context
+    bool get_replay_lanes() const;
+    // seq of s_copy row i (the cell head + i, as s_copy() reads it), -1 for an empty cell
+    llama_seq_id lane_seq(int i) const;
+    // per-seq pending replay; seq < 0 gives 0 / 0 / false (all-zero w, state row)
+    uint32_t replay_len_seq(llama_seq_id seq) const;
+    uint32_t ckpt_span_seq(llama_seq_id seq)  const;
+    bool     s_stale_seq(llama_seq_id seq)    const;
 
     // [TAG_RECURRENT_ROLLBACK_SHIFT] number of older snapshot groups (conv in both modes, the
     // recurrent state in the non-replay mode) the builder must move back by n_seq_tokens for the

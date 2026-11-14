@@ -389,11 +389,14 @@ public:
     ggml_tensor * s_copy_conv_main = nullptr; // I32 [n_seqs] view
     ggml_tensor * s_copy_pair      = nullptr; // I32 [n_rs]
     ggml_tensor * s_copy_pair_main = nullptr; // I32 [n_seqs] view
-    ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq]
+    ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq], or [n_rs_seq, n_seqs] per lane ([TAG_GDN_REPLAY_LANES])
 
     // fill every rs input (s_copy and the shift or ring tensors) from the memory context; exactly
     // once per ubatch -- both fills consume the pending rollback
     void fill_s_copy(const llama_memory_recurrent_context * m);
+
+    // [TAG_GDN_REPLAY_LANES] 2-D replay_w: w, s_copy_conv and s_copy_pair per lane, from the filled s_copy data
+    void fill_replay_lanes(const llama_memory_recurrent_context * m, const int32_t * data, int64_t n_rs);
 
     // can_reuse's replay check: the replay fields must match unless replay_w makes them data (then
     // they and span_new are refreshed from the new context)

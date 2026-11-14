@@ -660,7 +660,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, const seq_compat_fn & compat) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, const seq_compat_fn & compat,
+        const seq_compat_fn & strict, uint32_t n_mixed_min) {
+    split_cut = 0;
+
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -698,6 +701,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             for (int32_t k = 0; k < batch.n_seq_id[i]; ++k) {
                 if (!compat(first_seq_id, batch.seq_id[i][k])) {
                     add = false;
+                    split_cut |= SPLIT_CUT_COMPAT;
                     break;
                 }
             }
@@ -781,6 +785,31 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
     }
 
+    // compat may admit seqs that can only share a ubatch of n_mixed_min or more tokens per seq: if the width came out
+    //   smaller (n_ubatch, position grid, a short seq), keep the first seq alone unless all seqs pass strict
+    if (strict && n_seqs > 1 && idxs_per_seq[0].size() < n_mixed_min) {
+        bool all_strict = true;
+        for (uint32_t s = 1; s < n_seqs && all_strict; ++s) {
+            const int32_t i0 = idxs_per_seq[s][0];
+            for (int32_t k = 0; k < batch.n_seq_id[i0]; ++k) {
+                if (!strict(first_seq_id, batch.seq_id[i0][k])) {
+                    all_strict = false;
+                    break;
+                }
+            }
+        }
+        if (!all_strict) {
+            for (uint32_t s = 1; s < n_seqs; ++s) {
+                for (const int32_t idx : idxs_per_seq[s]) {
+                    used[idx] = false;
+                    --n_used;
+                }
+            }
+            n_seqs = 1;
+            split_cut |= SPLIT_CUT_WIDTH;
+        }
+    }
+
     // if n_keep_tail > 0, keep only the seqs that either finish in this ubatch or have at least
     //   n_keep_tail tokens remaining for a future ubatch, so that the trailing n_keep_tail tokens
     //   of each seq are never split across ubatches
@@ -834,6 +863,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             }
 
             n_keep = 1;
+        }
+
+        if (n_keep < n_seqs) {
+            split_cut |= SPLIT_CUT_TAIL;
         }
 
         // return the tokens of the deferred seqs back to the pool

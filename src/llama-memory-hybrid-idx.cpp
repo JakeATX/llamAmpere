@@ -158,14 +158,15 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn(),
+                        rsplit.strict_fn(), rsplit.n_mixed_min());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
 
-            rsplit.advance(ubatch);
+            rsplit.advance(ubatch, balloc.get_split_cut());
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
