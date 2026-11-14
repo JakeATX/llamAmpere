@@ -2743,6 +2743,74 @@ static std::vector<ggml_backend_cuda_kv_stream_runtime_t> ggml_cuda_kv_stream_pr
     return runtimes;
 }
 
+// CUDA_Host_W: pinned host memory for weights only; CUDA does not claim it, so the scheduler copies these weights to the device per split
+// separate from CUDA_Host, which also holds model inputs: CUDA never accepts CUDA_Host_W, so the scheduler keeps its input copies and sync barrier
+static const char * ggml_backend_cuda_host_weights_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_Host_W";
+
+    GGML_UNUSED(buft);
+}
+
+static size_t ggml_backend_cuda_host_weights_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return 128;
+
+    GGML_UNUSED(buft);
+}
+
+// same row padding as the CUDA buffer type; the GPU never reads this buffer, it reads the scheduler's device copy
+static size_t ggml_backend_cuda_host_weights_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    size_t size = ggml_nbytes(tensor);
+    if (ggml_is_quantized(tensor->type) && tensor->ne[0] % MATRIX_ROW_PADDING != 0) {
+        size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - tensor->ne[0] % MATRIX_ROW_PADDING);
+    }
+    return size;
+
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_host_weights_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    void * ptr = ggml_cuda_host_malloc(size);
+
+    if (ptr == nullptr) {
+        // pinned memory only, no pageable fallback: the caller uses device memory instead, or fails the load after a memory fit
+        GGML_LOG_WARN("%s: failed to pin %.2f MiB of host memory for weights\n",
+                __func__, size / 1024.0 / 1024.0);
+        return nullptr;
+    }
+
+    memset(ptr, 0, size); // zero the row padding too, so CPU fallback ops never see uninitialized bytes
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_host_weights_buffer_type() {
+    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host_weights = {
+        /* .iface    = */ {
+            /* .get_name            = */ ggml_backend_cuda_host_weights_buffer_type_name,
+            /* .alloc_buffer        = */ ggml_backend_cuda_host_weights_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n      = */ NULL,
+            /* .get_alignment       = */ ggml_backend_cuda_host_weights_buffer_type_get_alignment,
+            /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size      = */ ggml_backend_cuda_host_weights_buffer_type_get_alloc_size,
+            /* .get_alloc_size_n    = */ NULL,
+            /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+
+    return &ggml_backend_cuda_buffer_type_host_weights;
+}
+
+// only reachable through get_proc_address (tools/mtmd, --mmproj-host-weights), so no other tensor can land in CUDA_Host_W
+static ggml_backend_buffer_type_t ggml_backend_cuda_get_host_weights_buffer_type(void) {
+    return ggml_backend_cuda_host_weights_buffer_type();
+}
+
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
@@ -13604,6 +13672,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_host_weights_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_get_host_weights_buffer_type;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
