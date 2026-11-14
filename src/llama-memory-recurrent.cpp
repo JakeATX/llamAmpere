@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <atomic>
 
 // [TAG_RECURRENT_KEEP_BASE] widest ubatch (tokens per seq) that keeps its pre-ubatch plane; 0 = no memory has it on
@@ -72,12 +74,24 @@ llama_memory_recurrent::llama_memory_recurrent(
         this->rs_ring = n_rs_seq > 0 && !this->gdn_replay && arch_ok && !env_off;
         // [TAG_GDN_REPLAY_LANES] same archs: their conv and replay go through llm_build_delta_net_base. qwen4exp,
         // kimi-k3 and bailingmoe3 read the scalar get_replay_len() in snapshot_shift_gather, so they keep the strict rule
-        const char * env_lanes = getenv("LLAMA_GDN_REPLAY_LANES");
-        const bool   lanes_req = env_lanes != nullptr && strcmp(env_lanes, "1") == 0;
+        // Default on (Jake 2026-11-14); LLAMA_GDN_REPLAY_LANES=0 (or off/false/no) turns it off. One sequence never
+        // differs from itself, so with one user the splits and the 1-D replay mask are the same as with lanes off.
+        const bool lanes_req = [] {
+            const char * e = getenv("LLAMA_GDN_REPLAY_LANES");
+            if (e == nullptr || *e == 0) {
+                return true;
+            }
+            std::string w(e);
+            for (char & c : w) {
+                c = (char) tolower((unsigned char) c);
+            }
+            return !(w == "0" || w == "off" || w == "false" || w == "no");
+        }();
         this->gdn_replay_lanes = this->gdn_replay && lanes_req && arch_ok;
-        if (this->gdn_replay && lanes_req) {
+        if (this->gdn_replay) {
             LLAMA_LOG_INFO("%s: gdn_replay lanes = %s\n", __func__,
-                    arch_ok ? "on (LLAMA_GDN_REPLAY_LANES=1)" : "off (LLAMA_GDN_REPLAY_LANES=1 ignored: arch not supported)");
+                    !lanes_req ? "off (LLAMA_GDN_REPLAY_LANES=0)" :
+                    arch_ok    ? "on (default; LLAMA_GDN_REPLAY_LANES=0 turns it off)" : "off (arch not supported)");
         }
         const char * env_rows = getenv("LLAMA_RS_RING_ROWS");
         this->rs_ring_rows_all = this->rs_ring && env_rows != nullptr && strcmp(env_rows, "1") == 0;

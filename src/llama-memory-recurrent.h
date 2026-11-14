@@ -130,7 +130,7 @@ public:
     // set_rs_idx. Only meaningful for GDN/KDA-style recurrent layers.
     bool gdn_replay = false;
 
-    // [TAG_GDN_REPLAY_LANES] LLAMA_GDN_REPLAY_LANES=1 (opt-in, default off, =0 off): seqs with different pending
+    // [TAG_GDN_REPLAY_LANES] LLAMA_GDN_REPLAY_LANES (default on, =0/off/false/no off): seqs with different pending
     // replays may share a ubatch of n >= n_rs_seq tokens per seq (the static verify graph). replay_w is then
     // [n_rs_seq, n_seqs] and s_copy_pair / s_copy_conv / the shift planes are set per lane (lane_seq), so 4 users
     // verify in one pass instead of one pass each. Only for archs whose replay goes through llm_build_delta_net_base
