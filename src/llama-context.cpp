@@ -6253,7 +6253,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         pp_nlog.cc0 = g_pp_cache_copies.load(std::memory_order_relaxed);
         pp_nlog.t0 = ggml_time_us();
     }
-    if (b1_mode == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && (n_tokens_all <= 8 ||
+    // expert cache only: a dense model has no host experts, so it neither prepares nor warns
+    if (b1_mode == 0 && model.hparams.n_expert > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && (n_tokens_all <= 8 ||
             (b1_cache_device_pending && sched_reserve_tokens <= 16 && b1_pending_publish_enabled()))) {
         // At writing scratch with tables pending, the call is either 9-16 rows or a short prompt that
         // prompt_buffers_resize kept at writing size because this publish follows the output reserve above.
