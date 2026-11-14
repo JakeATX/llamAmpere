@@ -762,7 +762,8 @@ void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * 
     // remaining groups are gathered from its own destination rows (n + j) * mem_size + head + s, so the
     // write puts back what is there. Those planes stay stale and uncredited: rs_valid after the ubatch is
     // at most rs_valid - r_s + n <= n + K - 1 - r_s. In replay mode s_copy carries no rollback group
-    // (rs_idx stays 0, plane0 = replay_len) and the lanes agree, so every lane moves snap_shift groups.
+    // (rs_idx stays 0, plane0 = replay_len) and the lanes agree, so every lane moves snap_shift groups,
+    // except for joined short rounds (replay_short_join), which take the per-lane count.
     // replay mode reads the pending rollback's plane through the indices (the gather's view starts at plane 0)
     // [TAG_GDN_REPLAY_LANES] per-lane replay: each lane reads its own pending replay's plane
     const bool    lanes  = replay_w != nullptr && replay_w->ne[1] > 1;
@@ -771,7 +772,13 @@ void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * 
         const int64_t plane0 = !m->get_gdn_replay() ? 0 :
             (int64_t) (lanes ? m->replay_len_seq(m->lane_seq((int) s)) : m->get_replay_len()) * mem_size;
         uint32_t n_move = snap_shift;
-        if (replay_len == 0) {
+        if (lanes && m->get_gdn_replay() && llama_memory_recurrent::replay_short_join()) {
+            // a joined short static round: lanes differ in r, so lane s has K - max(n, r_s) older groups
+            // (plane r_s + j <= K - 1); the surplus groups are self-copies, as in the non-replay form below
+            const uint32_t r_s = m->replay_len_seq(m->lane_seq((int) s));
+            n_move = K - std::max(n, r_s);
+            GGML_ASSERT(r_s < K && n_move >= 1 && n_move <= snap_shift);
+        } else if (replay_len == 0) {
             const uint32_t r_s = (uint32_t) main[s] / mem_size;
             n_move = K - std::max(n, r_s);
             GGML_ASSERT(n_move <= snap_shift);
