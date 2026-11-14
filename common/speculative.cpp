@@ -1460,11 +1460,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) row[predecessor]);
                 }
 
-                if (result.size() < (size_t) params.n_min) {
+                // a sampled draft must not be dropped because of its own tokens: the p_min stop at position i depends on
+                // the token drawn at i - 1, so discarding a short draft would bias the output (exact only when greedy)
+                if (!sample && result.size() < (size_t) params.n_min) {
                     result.clear();
-                    if (sample) {
-                        dp.result_q->clear();
-                    }
                 }
                 continue;
             }
