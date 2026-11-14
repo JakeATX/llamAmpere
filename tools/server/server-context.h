@@ -30,6 +30,8 @@ struct server_context_meta {
     std::vector<std::string> tts_voices; // predefined voices of the audio generation model
     json json_ui_settings;
     int slot_n_ctx;
+    int slot_n_ctx_min;                  // --slot-ctx: the smallest slot cap (slot_n_ctx when unset)
+    std::vector<int> slot_n_ctx_list;    // --slot-ctx: every slot's cap; empty when unset
     enum llama_pooling_type pooling_type;
 
     // chat params

@@ -827,6 +827,7 @@ struct server_slot {
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
+    int32_t n_ctx_cap = 0; // --slot-ctx: n_ctx is a reserved cap (prompt-cache loads stay under it); 0 = unset
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
@@ -982,7 +983,7 @@ struct server_slot {
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         loop_guard = {};
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, spec, n_ctx_cap);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -2605,6 +2606,29 @@ private:
                 }
             }
 
+            if (!params_base.slot_ctx.empty()) {
+                // --slot-ctx: each slot reserves its cap in the one unified pool; sum(caps) <= pool means no slot can
+                // take another slot's cells (unified cells are addressed one by one, so there is no fragmentation)
+                if (!params_base.kv_unified || params_base.kv_unified_per_slot > 0 ||
+                        (int) params_base.slot_ctx.size() != params_base.n_parallel) {
+                    SRV_ERR("%s", "--slot-ctx needs --kv-unified, one value per slot and no --kv-unified-per-slot\n");
+                    return false;
+                }
+                int64_t sum = 0;
+                for (const int32_t n : params_base.slot_ctx) {
+                    sum += n;
+                }
+                if (sum > n_ctx_seq) {
+                    SRV_ERR("--slot-ctx: the caps sum to %lld, more than the KV pool (%d); raise -c or lower the caps\n",
+                            (long long) sum, n_ctx_seq);
+                    return false;
+                }
+                if (sum < n_ctx_seq) {
+                    SRV_WRN("--slot-ctx: the caps sum to %lld, the KV pool holds %d; %lld cells are never used\n",
+                            (long long) sum, n_ctx_seq, (long long) (n_ctx_seq - sum));
+                }
+            }
+
             const int n_ctx_capped = params_base.kv_unified_per_slot > 0 ?
                 std::min(n_ctx_seq, params_base.kv_unified_per_slot) : n_ctx_seq;
 
@@ -2713,7 +2737,11 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
-            slot.n_ctx   = n_ctx_slot();
+            slot.n_ctx   = params_base.slot_ctx.empty() ? n_ctx_slot() : std::min(params_base.slot_ctx[i], n_ctx_slot());
+            if (!params_base.slot_ctx.empty()) {
+                slot.n_ctx_cap = slot.n_ctx;
+                SLT_INF(slot, "--slot-ctx: reserved context %d\n", slot.n_ctx);
+            }
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -3111,10 +3139,44 @@ private:
         return nullptr;
     }
 
+    // --slot-ctx routing: which slots may take a task that names no slot. Empty = no filter (flag unset, or no slot
+    // is large enough, in which case the usual "exceeds the context" error follows). A task that fits a smaller slot
+    // never takes a largest-cap slot, so the long slot stays free for long requests.
+    std::vector<char> slot_ctx_allowed(const server_task & task, const int exclude_id_slot = -1) const {
+        std::vector<char> allowed;
+        if (params_base.slot_ctx.empty()) {
+            return allowed;
+        }
+        const int64_t need = (int64_t) task.tokens.size() + std::max<int64_t>(64, task.params.n_predict > 0 ? task.params.n_predict : 0);
+        int cap_max = 0;
+        for (const auto & slot : slots) {
+            cap_max = std::max(cap_max, slot.n_ctx);
+        }
+        bool fits_smaller = false;
+        bool fits_any     = false;
+        for (const auto & slot : slots) {
+            if (slot.id != exclude_id_slot && slot.n_ctx >= need) {
+                fits_any = true;
+                fits_smaller = fits_smaller || slot.n_ctx < cap_max;
+            }
+        }
+        if (!fits_any) {
+            return allowed;
+        }
+        allowed.assign(slots.size(), 0);
+        for (const auto & slot : slots) {
+            allowed[slot.id] = slot.id != exclude_id_slot && slot.n_ctx >= need && !(fits_smaller && slot.n_ctx == cap_max);
+        }
+        return allowed;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+
+        // --slot-ctx: one size filter for both the LCP and the LRU pick (a pinned id_slot is not filtered)
+        const std::vector<char> allowed = task.id_slot == -1 ? slot_ctx_allowed(task) : std::vector<char>();
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -3141,6 +3203,11 @@ private:
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
+                    continue;
+                }
+
+                if (!allowed.empty() && !allowed[slot.id]) {
+                    SLT_TRC(slot, " - skipping, --slot-ctx size class (n_ctx = %d)\n", slot.n_ctx);
                     continue;
                 }
 
@@ -3185,7 +3252,14 @@ private:
 
         // find an empty slot, or the one that has been least recently used
         if (ret == nullptr) {
-            const auto free_slots = get_free_slots(1, -1);
+            auto free_slots = get_free_slots(allowed.empty() ? 1 : slots.size(), -1);
+            if (!allowed.empty()) {
+                // --slot-ctx: the smallest fitting idle slot, LRU within a size; none idle = defer (nullptr)
+                free_slots.erase(std::remove_if(free_slots.begin(), free_slots.end(),
+                    [&](const server_slot * s) { return !allowed[s->id]; }), free_slots.end());
+                std::stable_sort(free_slots.begin(), free_slots.end(),
+                    [](const server_slot * a, const server_slot * b) { return a->n_ctx < b->n_ctx; });
+            }
 
             if (!free_slots.empty()) {
                 ret = free_slots[0];
@@ -3280,6 +3354,9 @@ private:
             return;
         }
         const server_eval_cache_entry & e = eval_cache->entries[idx];
+        if (slot.n_ctx_cap > 0 && e.tokens.size() > (size_t) slot.n_ctx_cap) {
+            return; // --slot-ctx: larger than this slot's reserved context
+        }
 
         const int64_t t_start = ggml_time_us();
 
@@ -3441,6 +3518,12 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
+                if (!params_base.slot_ctx.empty() && slot.n_ctx == n_ctx_slot()) {
+                    // --slot-ctx: the largest-cap slot holds the long conversation; never purge it to make room
+                    SRV_WRN("--slot-ctx: KV pool full, NOT purging reserved slot %d (cap %d, %zu tokens)\n",
+                            slot.id, slot.n_ctx, slot.prompt.tokens.size());
+                    continue;
+                }
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
                 slot.prompt_clear();
@@ -4789,6 +4872,26 @@ private:
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        if (!params_base.slot_ctx.empty()) {
+                            // --slot-ctx: children take slots whose cap fits the parent prompt; error if too few exist
+                            const std::vector<char> allowed = slot_ctx_allowed(task, slot->id);
+                            const auto fits = [&](const server_slot & s) {
+                                return allowed.empty() ? s.n_ctx >= (int) task.tokens.size() : (bool) allowed[s.id];
+                            };
+                            size_t n_fit = 0;
+                            for (const auto & s : slots) {
+                                n_fit += s.id != slot->id && fits(s);
+                            }
+                            if (n_fit < n_child_tasks) {
+                                send_error(task, string_format("--slot-ctx: %zu child tasks need slots that fit %zu tokens, only %zu exist",
+                                        n_child_tasks, task.tokens.size(), n_fit), ERROR_TYPE_INVALID_REQUEST);
+                                break;
+                            }
+                            child_slots = get_free_slots(slots.size(), slot->id);
+                            child_slots.erase(std::remove_if(child_slots.begin(), child_slots.end(),
+                                [&](const server_slot * s) { return !fits(*s); }), child_slots.end());
+                            child_slots.resize(std::min(child_slots.size(), n_child_tasks));
+                        }
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
@@ -4814,8 +4917,8 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified && saved) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
+                                if (params_base.kv_unified && saved && params_base.slot_ctx.empty()) {
+                                    // [TAG_IDLE_SLOT_CLEAR] (--slot-ctx: off, every slot owns its reserved cells)
                                     // only clear when the state actually made it into the
                                     // prompt cache - a failed save means the cache cannot
                                     // hold it, and clearing would destroy the only copy
@@ -5110,6 +5213,12 @@ private:
                         // A non-null token buffer loads the state instead of only probing its token count.
                         llama_token tok_dft_dummy = 0;
                         has_dft_state = llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, &tok_dft_dummy, 1, &n_tok_dft) > 0;
+                        if (has_dft_state && slot->n_ctx_cap > 0 && n_tok_dft > (size_t) slot->n_ctx_cap) {
+                            // --slot-ctx: the drafter state is larger than the slot's cap; the error path below clears
+                            // the target and drafter memory of the slot
+                            SLT_WRN(*slot, "drafter state has %zu tokens, more than the slot cap %d\n", n_tok_dft, slot->n_ctx_cap);
+                            has_dft_state = false;
+                        }
                         if (has_dft_state) {
                             SLT_INF(*slot, "restored the drafter state from %s\n", path_dft.c_str());
                         } else {
@@ -7824,7 +7933,29 @@ private:
             res = std::min(res, params_base.kv_unified_per_slot);
         }
 
+        if (!params_base.slot_ctx.empty()) {
+            res = std::min(res, *std::max_element(params_base.slot_ctx.begin(), params_base.slot_ctx.end()));
+        }
+
         return res;
+    }
+
+    std::vector<int> slot_ctx_list() const {
+        std::vector<int> res;
+        if (!params_base.slot_ctx.empty()) {
+            for (const auto & slot : slots) {
+                res.push_back(slot.n_ctx);
+            }
+        }
+        return res;
+    }
+
+    // --slot-ctx: the smallest slot cap (n_ctx_slot() when unset)
+    int n_ctx_slot_min() const {
+        if (params_base.slot_ctx.empty()) {
+            return n_ctx_slot();
+        }
+        return std::min(n_ctx_slot(), *std::min_element(params_base.slot_ctx.begin(), params_base.slot_ctx.end()));
     }
 
     server_response_reader get_response_reader() {
@@ -8008,6 +8139,8 @@ server_context_meta server_context::get_meta() const {
         /* tts_voices              */ std::move(tts_voices),
         /* json_ui_settings        */ impl->json_ui_settings,
         /* slot_n_ctx              */ impl->n_ctx_slot(),
+        /* slot_n_ctx_min          */ impl->n_ctx_slot_min(),
+        /* slot_n_ctx_list         */ impl->slot_ctx_list(),
         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
 
         /* chat_params             */ impl->chat_params,
@@ -8687,6 +8820,10 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
     };
 
+    if (!meta.slot_n_ctx_list.empty()) {
+        props["slot_n_ctx"] = meta.slot_n_ctx_list; // --slot-ctx: each slot's reserved context (n_ctx above is the max)
+    }
+
     if (!params.server_connect_code.empty()) {
         props["connect_code"] = params.server_connect_code;
     }
@@ -8967,7 +9104,7 @@ void server_routes::init_routes() {
             data.at("input_extra"),
             params.n_batch,
             params.n_predict,
-            meta->slot_n_ctx,
+            meta->slot_n_ctx_min, // --slot-ctx: an infill prompt must fit any slot it may land on
             params.spm_infill,
             tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
         );

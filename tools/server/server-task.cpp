@@ -2073,7 +2073,10 @@ bool server_prompt_cache::restore(server_prompt_cache_state & state, llama_conte
     return true;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec, int32_t n_ctx_max) {
+    // --slot-ctx: an entry larger than the slot's cap would hold cells the slot does not own
+    const auto too_big = [n_ctx_max](size_t n_tokens) { return n_ctx_max > 0 && n_tokens > (size_t) n_ctx_max; };
+
     int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2094,7 +2097,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
         // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+        if (f_keep_cur < 0.25f || too_big(it->prompt.tokens.size())) {
             continue;
         }
 
@@ -2115,7 +2118,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const float f_keep_cur = float(lcp_cur) / staging.prompt.tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-        if (f_keep_cur >= 0.25f && f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        if (f_keep_cur >= 0.25f && !too_big(staging.prompt.tokens.size()) && f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
@@ -2144,7 +2147,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
             SRV_TRC("   - disk prompt with length %7zu, lcp = %7zu, f_keep = %.3f, f_sim = %.3f\n", it->tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
-            if (f_keep_cur < 0.25f) {
+            if (f_keep_cur < 0.25f || too_big(it->tokens.size())) {
                 continue;
             }
 

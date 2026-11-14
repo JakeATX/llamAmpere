@@ -1798,6 +1798,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--slot-ctx" }, "N0,N1,...",
+        "reserved context per slot, one value per --parallel slot (default: unset, behavior unchanged).\n"
+        "needs --kv-unified; the sum must fit the KV pool, which is sized to the sum when -c is not given.\n"
+        "requests go to the smallest idle slot that fits; the largest slot is kept free for long requests",
+        [](common_params & params, const std::string & value) {
+            params.slot_ctx.clear();
+            for (const auto & item : string_split<std::string>(value, ',')) {
+                size_t pos = 0;
+                long long v = -1;
+                try {
+                    v = std::stoll(item, &pos);
+                } catch (const std::exception &) {
+                    pos = 0;
+                }
+                if (pos == 0 || pos != item.size() || v <= 0 || v > INT32_MAX) {
+                    throw std::invalid_argument("--slot-ctx: every value must be a positive integer, got '" + item + "'");
+                }
+                params.slot_ctx.push_back((int32_t) v);
+            }
+            if (params.slot_ctx.empty()) {
+                throw std::invalid_argument("--slot-ctx: empty list");
+            }
+        }
+    ).set_env("LLAMA_ARG_SLOT_CTX").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

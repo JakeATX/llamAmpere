@@ -88,6 +88,7 @@ class ServerProcess:
     server_reranking: bool | None = False
     server_metrics: bool | None = False
     kv_unified: bool | None = False
+    slot_ctx: str | None = None  # --slot-ctx N0,N1,...
     swa_full: bool | None = False
     server_slots: bool | None = False
     pooling: str | None = None
@@ -218,6 +219,8 @@ class ServerProcess:
             server_args.append("--metrics")
         if self.kv_unified:
             server_args.append("--kv-unified")
+        if self.slot_ctx:
+            server_args.extend(["--slot-ctx", self.slot_ctx])
         if self.swa_full:
             server_args.append("--swa-full")
         if self.server_slots:
