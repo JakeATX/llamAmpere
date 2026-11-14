@@ -5874,6 +5874,29 @@ static bool ggml_cuda_graph_check_compability_plain(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// rows of the first matmul against a weight buffer (= tokens in the batch), -1 if there is none (allowed). Weights the
+// scheduler copied into a compute buffer are skipped (usage COMPUTE). MUL_MAT_ID src1 is [n_embd, n_used, n_tokens].
+static int64_t ggml_cuda_graph_batch_rows(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && n->src[0] != nullptr && n->src[1] != nullptr &&
+                n->src[0]->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(n->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return n->op == GGML_OP_MUL_MAT_ID ? n->src[1]->ne[2] : n->src[1]->ne[1] * n->src[1]->ne[2] * n->src[1]->ne[3];
+        }
+    }
+    return -1;
+}
+
+// GGML_CUDA_GRAPH_MAX_ROWS=N (default 0 = off): no CUDA graph, and no cache entry, for a batch of more than N rows (prefill)
+static bool ggml_cuda_graph_rows_reject(const ggml_cgraph * cgraph) {
+    static const int64_t max_rows = [] {
+        const char * s = getenv("GGML_CUDA_GRAPH_MAX_ROWS");
+        return (int64_t) (s ? atoll(s) : 0);
+    }();
+    return max_rows > 0 && ggml_cuda_graph_batch_rows(cgraph) > max_rows;
+}
+
 // a captured graph hard-codes its shapes, so with one key per split an alternating shape
 // (a speculative verify batch) resets warmup forever. O(1) on purpose: walking nodes undoes the
 // point of a cuda graph. A shape this fails to separate re-captures as before, so it cannot regress.
@@ -12391,22 +12414,41 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     uint64_t graph_key = 0;
 
 #ifdef USE_CUDA_GRAPH
-    if (!cuda_ctx->scratch_borrowed) {
+    if (!cuda_ctx->scratch_borrowed && !ggml_cuda_graph_rows_reject(cgraph)) {   // a rejected batch runs eagerly, as when borrowed
         graph_key = ggml_cuda_graph_get_key(cgraph);
 
         ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->is_enabled()) {
+            // GGML_CUDA_GRAPH_WARMUP=K (default 2 = as before): capture on the K-th call, after K-1 calls in a row
+            // with no property change
+            static const int warmup_calls = [] {
+                const char * s = getenv("GGML_CUDA_GRAPH_WARMUP");
+                const int k = s ? atoi(s) : 2;
+                return k >= 2 ? k : 2;
+            }();
             const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
             if (graph_compatible) {
                 const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
                 if (!graph->warmup_complete) {
                     // Warmup: need at least 2 calls with no property change on the 2nd call
-                    if (!properties_changed) {
+                    graph->stable_calls = properties_changed ? 0 : graph->stable_calls + 1;
+                    if (graph->stable_calls >= warmup_calls - 1) {
                         graph->warmup_complete = true;
                         GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                        if (ggml_cuda_graph_log_on() && cgraph->n_nodes > 0) {
+                            const ggml_tensor * f = cgraph->nodes[0];
+                            const ggml_tensor * l = cgraph->nodes[cgraph->n_nodes - 1];
+                            GGML_LOG_INFO("cuda_graph: capture key %016llx n_nodes %d rows %lld first %s %s [%lld,%lld,%lld,%lld]"
+                                " last %s %s [%lld,%lld,%lld,%lld] cached %zu\n", (unsigned long long) graph_key, cgraph->n_nodes,
+                                (long long) ggml_cuda_graph_batch_rows(cgraph), ggml_op_desc(f), f->name,
+                                (long long) f->ne[0], (long long) f->ne[1], (long long) f->ne[2], (long long) f->ne[3],
+                                ggml_op_desc(l), l->name,
+                                (long long) l->ne[0], (long long) l->ne[1], (long long) l->ne[2], (long long) l->ne[3],
+                                cuda_ctx->cuda_graphs.size());
+                        }
                         use_cuda_graph = true;
                         cuda_graph_update_required = true;
                     }
@@ -12416,6 +12458,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     if (properties_changed) {
                         // Properties changed - reset warmup, execute directly until stable again
                         graph->warmup_complete = false;
+                        graph->stable_calls    = 0;
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                     } else {
                         use_cuda_graph = true;
@@ -12787,8 +12830,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    // GGML_CUDA_GRAPH_MAX_ROWS: same rule as graph_compute, so a rejected batch makes no cache entry here either
+    const bool use_cuda_graph = !ggml_cuda_graph_rows_reject(cgraph) &&
+        ggml_cuda_graph_set_enabled(cuda_ctx, ggml_cuda_graph_get_key(cgraph));
 #else
     const bool use_cuda_graph = false;
     GGML_UNUSED(cuda_ctx);
