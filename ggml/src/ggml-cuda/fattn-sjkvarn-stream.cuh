@@ -314,12 +314,13 @@ static __device__ unsigned int fattn_sj_kvarn_stream_dbg_run = 0;
 
 // lsa: opt-in LSA build (live-record walk, strip skip, per-head mask). The default instance (lsa = false) compiles that
 // code out, so the default decode kernel is the pre-LSA code (registers/stack checked with cuobjdump).
+// max_warps 6 (GGML_SJKVARN_NT6_OCC=1): the 6-row twin of the max_warps 5 body, held to 2 CTAs/SM (<= 168 regs)
 // q5g6 [#195]: compact width-5 / GQA-6 tile. The 30 (query, head) pairs of a KV head fill 4 warps x 8 columns (pairs
 // 30 and 31 pad) instead of 5 warps x 8 columns with 6 heads each. Every column keeps its own Q, mask row, online
 // softmax and output; the KV split partition is the host's choice (forced to the five-warp one), so the result is
 // bit-identical to the five-warp kernel while the block issues 4 instead of 5 MMA rows per strip.
 template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
-__launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 ? 2 : 1)
+__launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 || max_warps == 6 ? 2 : 1)
 static __global__ void flash_attn_ext_sj_kvarn_stream(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -364,8 +365,8 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const int n_q    = int(ne01.z);
     constexpr bool q5g6 = tile == sj_kvarn_tile::q5g6;
     static_assert(!q5g6 || max_warps == 4, "the compact Q5/G6 tile runs 4 warps");
-    constexpr bool fixed_nt = max_warps == 5 || q5g6;
-    const int NT     = q5g6 ? 4 : max_warps == 5 ? 5 : n_q; // specialize MTP-4 verification
+    constexpr bool fixed_nt = max_warps == 5 || max_warps == 6 || q5g6; // MTP-4 verification (5), 6 rows (NT6_OCC), q5g6
+    const int NT     = q5g6 ? 4 : (max_warps == 5 || max_warps == 6) ? max_warps : n_q;
     const int KW     = fixed_nt ? 1 : nwarps / NT;  // KV splits inside the block (host: nwarps == NT*KW, KW a power of two)
     const int nt     = fixed_nt ? warp : warp % NT;    // this warp's query row (q5g6: its column tile)
     const int kw     = fixed_nt ? 0 : warp / NT;    // this warp's KV split
@@ -947,7 +948,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         (((uintptr_t) Kh | (uintptr_t) Vh | (uintptr_t) nb11 | (uintptr_t) nb21 | (uintptr_t) rb_k | (uintptr_t) rb_v) & 3) == 0;
     // the MTP-4 verification kernel (max_warps 5) sits at its register cap; the queue's state costs its body loop
     // more than the pipeline saves (measured +30-35 us/call at 102K), so it keeps the direct path
-    constexpr bool raw_pipe = max_warps != 5;
+    constexpr bool raw_pipe = max_warps != 5 && max_warps != 6; // q5g6 (4 warps) keeps the pipeline, as before
     const int nraw = raw_pipe && raw_ok ? min(RAW_MAX, raw_avail/raw_slot) : 0;
     int e_pipe = n_ex; // first strip of the pipelined range (n_ex: none)
     if (nraw > 0) {
@@ -1280,6 +1281,8 @@ static int ggml_cuda_fattn_sj_kvarn_stream_occupancy(const int NT, const int KW)
     return blocks;
 }
 
+static bool ggml_cuda_fattn_sj_nt6_logged = false; // GGML_SJKVARN_NT6_OCC log, one line per process
+
 template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
 static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, const int parallel_blocks) {
     using namespace fattn_sj_kvarn_stream;
@@ -1290,6 +1293,19 @@ static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_co
             // the compact Q5/G6 tile has no LSA build: ggml_cuda_fattn_sj_kvarn_q5g6_mode_for refuses it before the launch
             GGML_ASSERT(tile == sj_kvarn_tile::rows);
             kernel = ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot, true>();
+        }
+    }
+    if constexpr (max_warps == 6) {
+        // GGML_SJKVARN_NT6_OCC: one line on the first launch (any instance), so a run can confirm it is engaged
+        if (!ggml_cuda_fattn_sj_nt6_logged) {
+            ggml_cuda_fattn_sj_nt6_logged = true;
+            cudaFuncAttributes attr;
+            CUDA_CHECK(cudaFuncGetAttributes(&attr, reinterpret_cast<const void *>(kernel)));
+            int ctas = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, kernel, WARP_SIZE*NT*KW,
+                ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body)));
+            GGML_LOG_INFO("SJKVARN NT6_OCC: 6-row instance at %d CTA/SM (regs %d, local %zu B, nstage %d)\n",
+                ctas, attr.numRegs, attr.localSizeBytes, NSTAGE);
         }
     }
     launch_fattn<D, NCOLS2, NCOLS2>
@@ -1596,6 +1612,9 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
         ggml_cuda_fattn_sj_kvarn_q5g6_off(nt5_mode < 0 ? "the generic half (<= 5,376 positions on SM86, by design)"
                                                        : "the generic half (GGML_SJKVARN_DIRECT_NT5_GENERIC=1)");
     }
+    // GGML_SJKVARN_NT6_OCC=1: 6 rows on the max_warps 6 instance (2 CTAs/SM) instead of max_warps 8 (1 CTA/SM). Same
+    // math per element; launch_fattn sizes parallel_blocks from the instance's occupancy, so the combine order differs.
+    static const bool nt6_occ = getenv("GGML_SJKVARN_NT6_OCC") != nullptr && atoi(getenv("GGML_SJKVARN_NT6_OCC")) != 0;
     if (NT == 5 && !nt5_generic) {
         // [#195] the compact tile replaces the five-warp specialization only (GQA 6: 30 pairs in 4 x 8 columns)
         const int q5g6_mode = ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(dst);
@@ -1604,6 +1623,8 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
             return;
         }
         ggml_cuda_fattn_sj_kvarn_stream_select<5, turbo4_body, rot>(ctx, dst, NT, KW, nstage_env, 0);
+    } else if (NT == 6 && nt6_occ) {
+        ggml_cuda_fattn_sj_kvarn_stream_select<6, turbo4_body, rot>(ctx, dst, NT, KW, nstage_env, 0);
     } else if (NT*KW <= 4) {
         ggml_cuda_fattn_sj_kvarn_stream_select<4, turbo4_body, rot>(ctx, dst, NT, KW, nstage_env, 0);
     } else {
