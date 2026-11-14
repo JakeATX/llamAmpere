@@ -41,10 +41,11 @@ static __device__ __forceinline__ void mma(int (&c)[4], const uint32_t (&a)[4], 
 }
 
 // Rotated, quantized activations; per-token scales are indexed by 128-column unit.
-template<int B, int V, uint32_t C, int XSH = 0>
+template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false>
 static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const int8_t * x,
         const float * xs, float * y, int M, int K, int N) {
     static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
+    static_assert(!ROW_SCALE || (B == 5 && V == 2), "row-scale pair layout");
     constexpr int UW = unit_bytes<B, V> / 4, TW = tile_words<B, V>;
     __shared__ uint32_t tiles[4][UW];
     __shared__ float partial[4][8][16];
@@ -53,8 +54,18 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
     const int64_t nbase = int64_t(blockIdx.y) * 8, mbase = int64_t(blockIdx.x) * 16;
     float sum[4] = {0, 0, 0, 0};
     for (int u = warp; u < nu; u += 4) {
-        const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (int64_t(blockIdx.x) * nu + u) * UW;
-        for (int i = lane; i < UW; i += 32) tiles[warp][i] = __ldg(source + i);
+        if constexpr (ROW_SCALE) {
+            constexpr int BW = 8 + 5*(UW - 8);
+            const uint32_t * block = reinterpret_cast<const uint32_t *>(weights) +
+                (int64_t(blockIdx.x)*(nu/5) + u/5)*BW;
+            const uint32_t * payload = block + 8 + (u%5)*(UW - 8);
+            for (int i = lane; i < UW; i += 32) {
+                tiles[warp][i] = __ldg(i < 8 ? block + i : payload + i - 8);
+            }
+        } else {
+            const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (int64_t(blockIdx.x) * nu + u) * UW;
+            for (int i = lane; i < UW; i += 32) tiles[warp][i] = __ldg(source + i);
+        }
         __syncwarp();
         int c[4] = {0, 0, 0, 0};
 #pragma unroll

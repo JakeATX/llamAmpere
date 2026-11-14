@@ -430,6 +430,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // No CPU arithmetic or conversion callbacks exist for fractional row-scale weights.
+    if (op->type == GGML_TYPE_AIF25_U2) {
+        return false;
+    }
+    for (const auto * src : op->src) {
+        if (src && src->type == GGML_TYPE_AIF25_U2) {
+            return false;
+        }
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {

@@ -1,11 +1,14 @@
 // Format-version and independent exhaustive CPU level checks. No GPU needed.
 #include "../src/llama-ait-format.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "../ggml/src/ggml-ai4.h"
+#include "ggml-ai4-decode.h"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <initializer_list>
+#include <vector>
 
 static int checks = 0;
 static void require(bool ok, const char * message) {
@@ -136,6 +139,69 @@ int main() {
     gguf_set_val_str(fractional, "ait.fractional.contract", AIF25_CONTRACT);
     require(llama_ait_format_error(fractional) == nullptr, "fractional own-constant contract accepted");
     gguf_free(fractional);
+    require(ggml_row_size(GGML_TYPE_AIF25_U2, 640) == 202, "fractional U2 exact 2.525-bpw bytes");
+    require(ggml_ai4_rate(GGML_TYPE_AIF25_U2) == 0, "fractional U2 stays outside integer-rate kernels");
+    require(ggml_ai4_slab_nbytes(GGML_TYPE_AIF25_U2, 128) == 0, "fractional U2 rejects partial blocks");
+    {
+        // Query routing only: unsupported callbacks must never be scheduled on CPU.
+        ggml_backend_load_all();
+        auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        require(cpu != nullptr, "CPU backend available for support checks");
+        auto * ctx = ggml_init({32*ggml_tensor_overhead(), nullptr, true});
+        require(ctx != nullptr, "CPU support-check context");
+        auto * packed = ggml_new_tensor_2d(ctx, GGML_TYPE_AIF25_U2, 640, 16);
+        auto * plain = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 640, 16);
+        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 16);
+        require(!ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, plain, GGML_TYPE_AIF25_U2)),
+                "CPU refuses cast into fractional U2");
+        require(!ggml_backend_dev_supports_op(cpu, ggml_cpy(ctx, plain, packed)),
+                "CPU refuses copy into fractional U2");
+        require(!ggml_backend_dev_supports_op(cpu, ggml_set_rows(ctx, packed, plain, ids)),
+                "CPU refuses fractional U2 row destination");
+        require(!ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, packed, GGML_TYPE_F32)),
+                "CPU refuses cast from fractional U2");
+        require(!ggml_backend_dev_supports_op(cpu, ggml_mul_mat(ctx, packed, plain)),
+                "CPU refuses fractional U2 matrix product");
+        require(ggml_backend_dev_supports_op(cpu, packed), "CPU accepts fractional U2 leaf metadata");
+        auto * view = ggml_view_2d(ctx, packed, 640, 16, packed->nb[1], 0);
+        require(view->op == GGML_OP_VIEW, "CPU support check uses a real view operation");
+        require(ggml_backend_dev_supports_op(cpu, view),
+                "CPU accepts fractional U2 view metadata");
+        require(ggml_backend_dev_supports_op(cpu, ggml_reshape_2d(ctx, packed, 640, 16)),
+                "CPU accepts fractional U2 reshape metadata");
+        require(ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, plain, GGML_TYPE_F16)),
+                "CPU still accepts ordinary casts");
+        require(ggml_backend_dev_supports_op(cpu, ggml_set_rows(ctx, plain, plain, ids)),
+                "CPU still accepts ordinary row destinations");
+        ggml_free(ctx);
+    }
+    for (int K : {640, 1280, 1920, 5120}) {
+        // Expand each stored row scale to five headers; the decoded matrix must stay exact,
+        // including the H256 rotation that crosses the boundary between 640-column blocks.
+        std::vector<uint8_t> packed((K/640)*AIF25_V2_BLOCK_BYTES);
+        std::vector<uint8_t> expanded((K/128)*AIF25_UNIT_BYTES);
+        uint32_t state = 7300;
+        for (auto & b : packed) { state = state*1664525u + 1013904223u; b = state >> 24; }
+        for (int block = 0; block < K/640; ++block) {
+            uint8_t * p = packed.data() + block*AIF25_V2_BLOCK_BYTES;
+            for (int r = 0; r < 16; ++r) {
+                const uint16_t scale = 0x2800 + 16*block + r;
+                std::memcpy(p + 2*r, &scale, 2);
+            }
+            for (int u = 0; u < 5; ++u) {
+                uint8_t * q = expanded.data() + (5*block + u)*AIF25_UNIT_BYTES;
+                std::memcpy(q, p, 32);
+                std::memcpy(q + 32, p + 32 + u*640, 640);
+            }
+        }
+        std::vector<float> a(16*K), b(16*K);
+        aif25_dequantize_slab(expanded.data(), a.data(), K);
+        require(ggml_ai4_slab_nbytes(GGML_TYPE_AIF25_U2, K) == packed.size(), "fractional U2 slab bytes");
+        require(ggml_ai4_dequantize_slab(GGML_TYPE_AIF25_U2, packed.data(), K, 0, b.data()),
+                "fractional U2 public slab decoder");
+        require(std::memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0,
+                "fractional U2 matches expanded independent scale headers exactly");
+    }
     std::printf("PASS %d checks\n", checks);
     return 0;
 }

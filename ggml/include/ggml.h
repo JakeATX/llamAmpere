@@ -481,6 +481,8 @@ extern "C" {
         GGML_TYPE_AIT2_U2 = 122,
         GGML_TYPE_AIT3_U2 = 123,
         GGML_TYPE_AIT4_U2 = 124,
+        // Five 640-byte pair-stream chunks share 16 FP16 row scales: 3232 bytes per 16x640 block.
+        GGML_TYPE_AIF25_U2 = 125,
         GGML_TYPE_PQ2_0   = 142, // Prism group-128 ternary weights
         GGML_TYPE_PTQ1_0  = 143, // Prism packed group-128 ternary weights
         // FP8 E4M3 weights/KV (upstream ggml 68d20b884 uses 43, which is our TURBO2_0 - local ID 60 here;

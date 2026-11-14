@@ -157,15 +157,20 @@ static void test_large_row_offsets(std::mt19937 & rng) {
 }
 
 static std::vector<float> backend_product(ggml_backend_t backend, int K, int M, int tokens, int seqs, int groups,
-                                         const std::vector<uint8_t> & w, const std::vector<float> & x) {
+                                         const std::vector<uint8_t> & w, const std::vector<float> & x,
+                                         ggml_type type = GGML_TYPE_AIF25_U) {
     ggml_context * ctx = ggml_init({ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true});
     require(ctx != nullptr, "backend context allocation failed");
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_AIF25_U, K, M);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, K, M);
     ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, K, tokens, seqs, groups);
     ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
     require(out->ne[0] == M && out->ne[1] == tokens && out->ne[2] == seqs && out->ne[3] == groups, "backend output shape mismatch");
     require(ggml_backend_supports_op(backend, out), "fractional backend dispatch rejected activation shape");
+    if (type == GGML_TYPE_AIF25_U2) {
+        require(ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(backend), weight) == w.size(),
+                "fractional U2 allocation uses whole slabs without generic row padding");
+    }
     ggml_build_forward_expand(graph, out);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     require(buffer != nullptr, "backend tensor allocation failed");
@@ -194,46 +199,53 @@ static void test_backend(std::mt19937 & rng) {
         ggml_free(ctx);
     }
     constexpr int M = 32;
-    for (int K : {128, 256, 6144}) {
-        std::vector<uint8_t> w(size_t(M/16)*(K/128)*AIF25_UNIT_BYTES);
-        for (uint8_t & v : w) v = rng();
-        for (size_t offset = 0; offset < w.size(); offset += AIF25_UNIT_BYTES) {
-            for (int m = 0; m < 16; ++m) {
-                const __half scale = __float2half((int(rng()%19)-9)/128.0f);
-                std::memcpy(w.data()+offset+2*m, &scale, sizeof(scale));
-            }
-        }
-        std::vector<float> decoded(size_t(M)*K);
-        for (int slab = 0; slab < M/16; ++slab) {
-            aif25_dequantize_slab(w.data()+size_t(slab)*(K/128)*AIF25_UNIT_BYTES,
-                                  decoded.data()+size_t(slab)*16*K, K);
-        }
-        for (int tokens : {1, 5}) for (int seqs : {1, 3}) for (int groups : {1, 2}) {
-            const int rows = tokens*seqs*groups;
-            std::vector<float> x(rows*K);
-            for (float & v : x) v = (int(rng()%255)-127)/64.0f;
-            const auto y = backend_product(backend, K, M, tokens, seqs, groups, w, x);
-            // Compare raw inputs with the CPU bit decoder and inverse rotation.
-            double error = 0, norm = 0;
-            for (int row = 0; row < rows; ++row) for (int m = 0; m < M; ++m) {
-                double expected = 0;
-                for (int k = 0; k < K; ++k) expected += double(decoded[m*K+k])*x[row*K+k];
-                const double delta = y[row*M+m]-expected;
-                error += delta*delta;
-                norm += expected*expected;
-            }
-            const double relative = std::sqrt(error/std::max(norm, 1e-30));
-            if (!(relative < .02)) std::fprintf(stderr, "fractional raw-input mismatch K=%d rows=%d relative=%.8g\n", K, rows, relative);
-            require(relative < .02, "fractional raw-input CPU reference mismatch");
-            // Each row gets its own graph so a dropped or mixed sequence cannot match.
-            for (int row = 0; row < rows; ++row) {
-                const std::vector<float> xi(x.begin()+row*K, x.begin()+(row+1)*K);
-                const auto ref = backend_product(backend, K, M, 1, 1, 1, w, xi);
-                for (int m = 0; m < M; ++m) {
-                    require(std::isfinite(y[row*M+m]) && y[row*M+m] == ref[m], "backend sequence row mismatch");
+    for (ggml_type type : {GGML_TYPE_AIF25_U, GGML_TYPE_AIF25_U2}) {
+        const bool row_scale = type == GGML_TYPE_AIF25_U2;
+        const int chunk_k = row_scale ? 640 : 128;
+        const int block_bytes = row_scale ? AIF25_V2_BLOCK_BYTES : AIF25_UNIT_BYTES;
+        for (int K : row_scale ? std::vector<int>{640, 1280, 1920, 5120} : std::vector<int>{128, 256, 6144}) {
+            std::vector<uint8_t> w(size_t(M/16)*(K/chunk_k)*block_bytes);
+            for (uint8_t & v : w) v = rng();
+            for (size_t offset = 0; offset < w.size(); offset += block_bytes) {
+                for (int m = 0; m < 16; ++m) {
+                    const __half scale = __float2half((int(rng()%19)-9)/128.0f);
+                    std::memcpy(w.data()+offset+2*m, &scale, sizeof(scale));
                 }
             }
-            std::printf("BACKEND PASS K=%d tokens=%d seqs=%d groups=%d rows=%d\n", K, tokens, seqs, groups, rows);
+            std::vector<float> decoded(size_t(M)*K);
+            for (int slab = 0; slab < M/16; ++slab) {
+                const uint8_t * src = w.data()+size_t(slab)*(K/chunk_k)*block_bytes;
+                float * dst = decoded.data()+size_t(slab)*16*K;
+                if (row_scale) { aif25_dequantize_slab_v2(src, dst, K); }
+                else { aif25_dequantize_slab(src, dst, K); }
+            }
+            for (int tokens : {1, 5}) for (int seqs : {1, 3}) for (int groups : {1, 2}) {
+                const int rows = tokens*seqs*groups;
+                std::vector<float> x(rows*K);
+                for (float & v : x) v = (int(rng()%255)-127)/64.0f;
+                const auto y = backend_product(backend, K, M, tokens, seqs, groups, w, x, type);
+                // Compare raw inputs with the CPU bit decoder and inverse rotation.
+                double error = 0, norm = 0;
+                for (int row = 0; row < rows; ++row) for (int m = 0; m < M; ++m) {
+                    double expected = 0;
+                    for (int k = 0; k < K; ++k) expected += double(decoded[m*K+k])*x[row*K+k];
+                    const double delta = y[row*M+m]-expected;
+                    error += delta*delta;
+                    norm += expected*expected;
+                }
+                const double relative = std::sqrt(error/std::max(norm, 1e-30));
+                if (!(relative < .02)) std::fprintf(stderr, "fractional raw-input mismatch K=%d rows=%d relative=%.8g\n", K, rows, relative);
+                require(relative < .02, "fractional raw-input CPU reference mismatch");
+                // Each row gets its own graph so a dropped or mixed sequence cannot match.
+                for (int row = 0; row < rows; ++row) {
+                    const std::vector<float> xi(x.begin()+row*K, x.begin()+(row+1)*K);
+                    const auto ref = backend_product(backend, K, M, 1, 1, 1, w, xi, type);
+                    for (int m = 0; m < M; ++m) {
+                        require(std::isfinite(y[row*M+m]) && y[row*M+m] == ref[m], "backend sequence row mismatch");
+                    }
+                }
+                std::printf("BACKEND PASS type=%s K=%d tokens=%d seqs=%d groups=%d rows=%d\n", ggml_type_name(type), K, tokens, seqs, groups, rows);
+            }
         }
     }
     ggml_backend_free(backend);

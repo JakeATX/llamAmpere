@@ -2759,11 +2759,12 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 // activation rotation; keep the fractional rate separate from integer AI+ dispatch.
 bool ggml_cuda_aif25_supported(const ggml_tensor * op) {
     const auto * w = op->src[0]; const auto * x = op->src[1];
-    return op->op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_AIF25_U &&
+    return op->op == GGML_OP_MUL_MAT && (w->type == GGML_TYPE_AIF25_U || w->type == GGML_TYPE_AIF25_U2) &&
         x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
         w->ne[0] > 0 && w->ne[0] <= INT32_MAX && w->ne[1] > 0 && w->ne[1] <= INT32_MAX &&
         w->ne[2] == 1 && w->ne[3] == 1 &&
         w->ne[0] % 128 == 0 && w->ne[1] % 16 == 0 &&
+        (w->type != GGML_TYPE_AIF25_U2 || w->ne[0] % 640 == 0) &&
         ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op);
 }
 
@@ -2793,7 +2794,7 @@ static int aif25_mmq_check() {
     return v;
 }
 
-template <int XSH>
+template <int XSH, bool ROW_SCALE = false>
 static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales, float * y, int M, int K, int64_t N,
                       cudaStream_t stream) {
     // CUDA grid.y is limited to 65535; each block handles eight activation rows.
@@ -2801,7 +2802,7 @@ static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales,
         const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
         const dim3 grid(M/16, (nr+7)/8);
         const float * xs = scales + (size_t)n0*(K >> (7+XSH));
-        magic2::mmv<5,2,AIF25_MUL,XSH><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        magic2::mmv<5,2,AIF25_MUL,XSH,ROW_SCALE><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -2830,7 +2831,9 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const uint8_t * wd = (const uint8_t *) w->data;
     float * y = (float *) dst->data;
     const int tile = aif25_mmq_tile();
-    if (tile > 0 && N >= aif25_mmq_min() &&
+    // AIF25_U2 (per-row scales) is not a layout magic2::mmq knows: it always takes the mmv loop
+    const bool row_scale = w->type == GGML_TYPE_AIF25_U2;
+    if (!row_scale && tile > 0 && N >= aif25_mmq_min() &&
             ggml_cuda_aif25_mmq(xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (aif25_mmq_check()) {
@@ -2869,7 +2872,11 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         return;
     }
-    if (xsh) {
+    if (row_scale && xsh) {
+        aif25_mmv<1, true>(wd, q.get(), scales.get(), y, M, K, N, stream);
+    } else if (row_scale) {
+        aif25_mmv<0, true>(wd, q.get(), scales.get(), y, M, K, N, stream);
+    } else if (xsh) {
         aif25_mmv<1>(wd, q.get(), scales.get(), y, M, K, N, stream);
     } else {
         aif25_mmv<0>(wd, q.get(), scales.get(), y, M, K, N, stream);
