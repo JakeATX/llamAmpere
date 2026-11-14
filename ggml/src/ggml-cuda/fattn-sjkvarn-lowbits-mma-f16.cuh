@@ -653,7 +653,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
                 const int bits = is_V ? kv.bits_v : kv.bits_k;
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
-                if (kv.stage_token_strip) {
+                if (GGML_CUDA_LSA_STAGE_STRIPS_KERNEL && kv.stage_token_strip) {
 #pragma unroll
                     for (int l = 0; l < 4; ++l) {
                         half vals[2];
@@ -715,7 +715,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
                 const int bits = is_V ? kv.bits_v : kv.bits_k;
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
-                if (kv.stage_token_strip) {
+                if (GGML_CUDA_LSA_STAGE_STRIPS_KERNEL && kv.stage_token_strip) {
 #pragma unroll
                     for (int l = 0; l < 4; ++l) {
                         half vals[2];
@@ -781,6 +781,10 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
 template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool is_V>
 static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
         const char * rec, int t0, const fattn_sj_kvarn_lowbits_ctx & kv, half2 * tile, int i_sup) {
+#if !GGML_CUDA_LSA_STAGE_STRIPS_KERNEL
+    // -DGGML_CUDA_LSA_STAGE_STRIPS=OFF build: no compact-strip path in the kernel (see qsa-resident-clock.cuh), raw loader frame
+    flash_attn_ext_sj_kvarn_load_tile_raw<stride_tile, swz, nbatch_fa, nthreads, D2, oob_check, is_V>(rec, t0, kv, tile, i_sup);
+#else
     const auto * map = kv.page_map;
     const uintptr_t delta = reinterpret_cast<uintptr_t>(rec) - reinterpret_cast<uintptr_t>(kv.page_stage);
     if (!map || delta >= size_t(map->stage_n)*map->stage_stride || delta%map->stage_stride != 0) {
@@ -809,6 +813,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
         c.k_tok = c.v_payload + vb; c.v_scale = c.k_tok + 32; c.v_zero = c.v_scale + 32;
         flash_attn_ext_sj_kvarn_load_tile_raw<stride_tile, swz, 16, nthreads, D2, oob_check, is_V>(rec, 0, c, tile, i_sup - s*16, s*16);
     }
+#endif // GGML_CUDA_LSA_STAGE_STRIPS_KERNEL
 }
 
 

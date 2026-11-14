@@ -320,7 +320,7 @@ static __device__ __forceinline__ const char * fattn_sj_kvarn_rec(const fattn_sj
             return kv.page_card + (size_t) slot*kv.rec_stride;
         }
         if (slot <= -3) { // staged for this resolve only (never written unless GGML_CUDA_LSA_RESIDENT_STAGE is set)
-            return kv.page_stage + (size_t) (-3 - slot)*(kv.page_map ? kv.page_map->stage_stride : kv.rec_stride);
+            return kv.page_stage + (size_t) (-3 - slot)*(GGML_CUDA_LSA_STAGE_STRIPS_KERNEL && kv.page_map ? kv.page_map->stage_stride : kv.rec_stride);
         }
     }
     if (kv.flags & GGML_SJKVARN_FLAG_STAGE_ALL) {
@@ -363,7 +363,7 @@ static __device__ __forceinline__ fattn_sj_kvarn_lowbits_ctx fattn_sj_kvarn_lowb
         c.page_card  = map->card + (size_t) z_KV * rec_bytes;
         c.page_table = map->table;
         c.page_stage = map->stage ? map->stage + (size_t) z_KV * rec_bytes : nullptr;
-        if (map->stage_stride) {
+        if (GGML_CUDA_LSA_STAGE_STRIPS_KERNEL && map->stage_stride) {
             c.page_map = map;
             c.page_head = z_KV;
             c.page_stage = map->stage + size_t(z_KV)*(map->stage_stride/map->heads);
