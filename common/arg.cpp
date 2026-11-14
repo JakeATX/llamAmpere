@@ -1801,9 +1801,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         { "--slot-ctx" }, "N0,N1,...",
         "reserved context per slot, one value per --parallel slot (default: unset, behavior unchanged).\n"
         "needs --kv-unified; the sum must fit the KV pool, which is sized to the sum when -c is not given.\n"
-        "requests go to the smallest idle slot that fits; the largest slot is kept free for long requests",
+        "requests go to the smallest idle slot that fits; the largest slot is kept free for long requests.\n"
+        "a value of 0 makes a shared slot: the shared slots take whatever the reserved slots leave of the pool (-c is required);\n"
+        "LLAMA_SLOT_CTX_SHARE=0 turns shared slots off (0 is then refused)",
         [](common_params & params, const std::string & value) {
             params.slot_ctx.clear();
+            const char * share_env = getenv("LLAMA_SLOT_CTX_SHARE");
+            const bool share_on = !share_env || !(std::string(share_env) == "0" || std::string(share_env) == "off" ||
+                                                  std::string(share_env) == "false" || std::string(share_env) == "no");
             for (const auto & item : string_split<std::string>(value, ',')) {
                 size_t pos = 0;
                 long long v = -1;
@@ -1812,8 +1817,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 } catch (const std::exception &) {
                     pos = 0;
                 }
-                if (pos == 0 || pos != item.size() || v <= 0 || v > INT32_MAX) {
-                    throw std::invalid_argument("--slot-ctx: every value must be a positive integer, got '" + item + "'");
+                if (pos == 0 || pos != item.size() || v < (share_on ? 0 : 1) || v > INT32_MAX) {
+                    throw std::invalid_argument(share_on ?
+                        "--slot-ctx: every value must be a positive integer or 0 (shared), got '" + item + "'" :
+                        "--slot-ctx: every value must be a positive integer (shared slots are off: LLAMA_SLOT_CTX_SHARE=0), got '" + item + "'");
                 }
                 params.slot_ctx.push_back((int32_t) v);
             }

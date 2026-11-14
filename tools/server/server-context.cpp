@@ -828,6 +828,7 @@ struct server_slot {
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_ctx_cap = 0; // --slot-ctx: n_ctx is a reserved cap (prompt-cache loads stay under it); 0 = unset
+    bool    ctx_shared = false; // --slot-ctx 0: n_ctx follows the shared budget (set by slot_ctx_share_update)
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
@@ -2615,15 +2616,30 @@ private:
                     return false;
                 }
                 int64_t sum = 0;
+                int32_t n_shared = 0;
                 for (const int32_t n : params_base.slot_ctx) {
                     sum += n;
+                    n_shared += n == 0;
+                }
+                if (n_shared > 0) {
+                    // D-share: the shared slots split what the reserved slots leave, minus a fixed per-slot margin for
+                    // one decode step (draft + verify rows) and one partly filled record group per stream
+                    const int64_t budget = (int64_t) n_ctx_seq - sum - (int64_t) n_shared * SLOT_CTX_SHARE_MARGIN;
+                    if (budget < SLOT_CTX_SHARE_MARGIN) {
+                        SRV_ERR("--slot-ctx: the reserved caps (%lld) leave no room for %d shared slots in the KV pool (%d); raise -c\n",
+                                (long long) sum, n_shared, n_ctx_seq);
+                        return false;
+                    }
+                    slot_ctx_share_budget = (int32_t) budget;
+                    SRV_INF("--slot-ctx: %d shared slots split %d cells (pool %d - reserved %lld - margin %d x %d)\n",
+                            n_shared, slot_ctx_share_budget, n_ctx_seq, (long long) sum, SLOT_CTX_SHARE_MARGIN, n_shared);
                 }
                 if (sum > n_ctx_seq) {
                     SRV_ERR("--slot-ctx: the caps sum to %lld, more than the KV pool (%d); raise -c or lower the caps\n",
                             (long long) sum, n_ctx_seq);
                     return false;
                 }
-                if (sum < n_ctx_seq) {
+                if (sum < n_ctx_seq && n_shared == 0) {
                     SRV_WRN("--slot-ctx: the caps sum to %lld, the KV pool holds %d; %lld cells are never used\n",
                             (long long) sum, n_ctx_seq, (long long) (n_ctx_seq - sum));
                 }
@@ -2738,7 +2754,12 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = params_base.slot_ctx.empty() ? n_ctx_slot() : std::min(params_base.slot_ctx[i], n_ctx_slot());
-            if (!params_base.slot_ctx.empty()) {
+            if (!params_base.slot_ctx.empty() && params_base.slot_ctx[i] == 0) {
+                slot.ctx_shared = true;
+                slot.n_ctx      = std::min(slot_ctx_share_budget, n_ctx_slot());
+                slot.n_ctx_cap  = slot.n_ctx;
+                SLT_INF(slot, "--slot-ctx: shared slot, up to %d of the %d shared cells\n", slot.n_ctx, slot_ctx_share_budget);
+            } else if (!params_base.slot_ctx.empty()) {
                 slot.n_ctx_cap = slot.n_ctx;
                 SLT_INF(slot, "--slot-ctx: reserved context %d\n", slot.n_ctx);
             }
@@ -3151,6 +3172,8 @@ private:
         for (const auto & slot : slots) {
             cap_max = std::max(cap_max, slot.n_ctx);
         }
+        // the long class: a reserved (not shared) slot with the largest cap
+        const auto is_long = [&](const server_slot & s) { return !s.ctx_shared && s.n_ctx == cap_max; };
         // fixed 64-token headroom (not n_predict: clients that always send a large max_tokens would skip the short
         // slots); a prompt that fits the largest cap is always routed to a slot that holds it
         const int64_t n_tok = (int64_t) task.tokens.size();
@@ -3160,15 +3183,26 @@ private:
         for (const auto & slot : slots) {
             if (slot.id != exclude_id_slot && slot.n_ctx >= need) {
                 fits_any = true;
-                fits_smaller = fits_smaller || slot.n_ctx < cap_max;
+                fits_smaller = fits_smaller || !is_long(slot);
             }
+        }
+        // D-share: a request that fits the shared budget waits for shared room (all-zero filter = defer); it never
+        // takes a reserved slot, whose cells hold that user's conversation
+        const bool share_fit = slot_ctx_share_budget > 0 && need <= std::min(slot_ctx_share_budget, n_ctx_slot());
+        if (share_fit) {
+            allowed.assign(slots.size(), 0);
+            for (const auto & slot : slots) {
+                allowed[slot.id] = slot.id != exclude_id_slot && slot.ctx_shared && slot.n_ctx >= need;
+            }
+            return allowed;
         }
         if (!fits_any) {
             return allowed;
         }
         allowed.assign(slots.size(), 0);
         for (const auto & slot : slots) {
-            allowed[slot.id] = slot.id != exclude_id_slot && slot.n_ctx >= need && !(fits_smaller && slot.n_ctx == cap_max);
+            allowed[slot.id] = slot.id != exclude_id_slot && slot.n_ctx >= need && !(fits_smaller && is_long(slot)) &&
+                !(slot_ctx_share_budget > 0 && slot.ctx_shared); // D-share: larger than the shared budget -> reserved only
         }
         return allowed;
     }
@@ -3177,6 +3211,8 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+
+        slot_ctx_share_update();
 
         // --slot-ctx: one size filter for both the LCP and the LRU pick (a pinned id_slot is not filtered)
         const std::vector<char> allowed = task.id_slot == -1 ? slot_ctx_allowed(task) : std::vector<char>();
@@ -3188,6 +3224,15 @@ private:
                 // a busy slot is returned untouched, the caller defers the task
                 if (ret->is_processing()) {
                     return ret;
+                }
+
+                if (ret->ctx_shared) {
+                    // D-share: the other shared users hold the room right now; wait for it (it frees when they finish)
+                    const int64_t need = (int64_t) task.tokens.size() + 64;
+                    if (need > ret->n_ctx && need <= std::min(slot_ctx_share_budget, n_ctx_slot())) {
+                        SLT_INF(*ret, "--slot-ctx: shared room %d < %lld tokens, defer\n", ret->n_ctx, (long long) need);
+                        return nullptr;
+                    }
                 }
 
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
@@ -3521,7 +3566,8 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
-                if (!params_base.slot_ctx.empty() && slot.n_ctx == n_ctx_slot() && n_ctx_slot_min() < n_ctx_slot()) {
+                if (!params_base.slot_ctx.empty() && !slot.ctx_shared &&
+                        (slot_ctx_share_budget > 0 || (slot.n_ctx == n_ctx_slot() && n_ctx_slot_min() < n_ctx_slot()))) {
                     // --slot-ctx: the largest-cap slot holds the long conversation; never purge it to make room
                     SRV_WRN("--slot-ctx: KV pool full, NOT purging reserved slot %d (cap %d, %zu tokens)\n",
                             slot.id, slot.n_ctx, slot.prompt.tokens.size());
@@ -5476,7 +5522,60 @@ private:
         return false;
     }
 
+    // D-share (--slot-ctx with 0 entries): the shared slots' caps follow what the other shared users hold.
+    // A busy shared slot claims max(cells held, its prompt); an idle shared slot's cells are reclaimable: they are
+    // cleared (LRU) only when the busy shared users need them. Reserved slots are never touched.
+    void slot_ctx_share_update() {
+        if (slot_ctx_share_budget <= 0) {
+            return;
+        }
+        const auto claim = [](const server_slot & s) -> int64_t {
+            int64_t u = s.prompt.n_tokens();
+            if (s.task && (s.state == SLOT_STATE_STARTED || s.state == SLOT_STATE_PROCESSING_PROMPT)) {
+                u = std::max<int64_t>(u, s.task->n_tokens());
+            }
+            return u;
+        };
+        int64_t busy = 0;
+        int64_t idle = 0;
+        for (const auto & s : slots) {
+            if (s.ctx_shared) {
+                (s.is_processing() ? busy : idle) += s.is_processing() ? claim(s) : s.prompt.n_tokens();
+            }
+        }
+        while (busy + idle > slot_ctx_share_budget) {
+            server_slot * lru = nullptr;
+            for (auto & s : slots) {
+                if (s.ctx_shared && !s.is_processing() && s.prompt.n_tokens() > 0 && (!lru || s.t_last_used < lru->t_last_used)) {
+                    lru = &s;
+                }
+            }
+            if (!lru) {
+                break;
+            }
+            SRV_WRN("--slot-ctx: clearing idle shared slot %d (%d tokens) for the busy shared users\n", lru->id, lru->prompt.n_tokens());
+            idle -= lru->prompt.n_tokens();
+            lru->prompt_clear();
+        }
+        for (auto & s : slots) {
+            if (!s.ctx_shared) {
+                continue;
+            }
+            int64_t others = 0;
+            for (const auto & t : slots) {
+                if (t.ctx_shared && t.id != s.id && t.is_processing()) {
+                    others += claim(t);
+                }
+            }
+            const int64_t cap = std::clamp<int64_t>(slot_ctx_share_budget - others, 0, n_ctx_slot());
+            s.n_ctx     = (int32_t) cap;
+            s.n_ctx_cap = (int32_t) cap;
+        }
+    }
+
     void update_slots() {
+        slot_ctx_share_update();
+
         llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_AUTOMATIC);
         if (ctx_dft) {
             llama_set_decode_phase(ctx_dft, LLAMA_DECODE_PHASE_AUTOMATIC);
@@ -5760,6 +5859,18 @@ private:
                 return;
             }
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+                if (slot.ctx_shared && !params_base.ctx_shift) {
+                    // D-share: the other shared users grew since this slot last checked its cap; stop it like a full
+                    // context (finish_reason length), never an error and never a purge of another slot
+                    slot.truncated      = true;
+                    slot.stop           = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+                    SLT_INF(slot, "--slot-ctx: shared room %d reached at %d tokens, stop\n", slot.n_ctx, slot.prompt.n_tokens());
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
+                    return;
+                }
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -7938,6 +8049,9 @@ private:
     // context size of a single slot, capped by --kv-unified-per-slot
     // note: not capped by the training context of the model - the caller may have configured rope scaling
     //       (--rope-scale / --rope-scaling yarn) to extend it
+    static constexpr int32_t SLOT_CTX_SHARE_MARGIN = 256; // D-share: per shared slot, one decode step + one record group
+    int32_t slot_ctx_share_budget = 0;                     // D-share: cells the shared slots split; 0 = no shared slots
+
     int n_ctx_slot() const {
         int res = llama_n_ctx_seq(ctx_tgt);
 
@@ -7946,7 +8060,8 @@ private:
         }
 
         if (!params_base.slot_ctx.empty()) {
-            res = std::min(res, *std::max_element(params_base.slot_ctx.begin(), params_base.slot_ctx.end()));
+            const int32_t mx = *std::max_element(params_base.slot_ctx.begin(), params_base.slot_ctx.end());
+            res = std::min(res, mx > 0 ? mx : slot_ctx_share_budget); // all shared: the shared budget
         }
 
         return res;
@@ -7967,7 +8082,11 @@ private:
         if (params_base.slot_ctx.empty()) {
             return n_ctx_slot();
         }
-        return std::min(n_ctx_slot(), *std::min_element(params_base.slot_ctx.begin(), params_base.slot_ctx.end()));
+        int res = n_ctx_slot();
+        for (const int32_t n : params_base.slot_ctx) {
+            res = std::min(res, n > 0 ? n : slot_ctx_share_budget); // shared: the most a shared slot can get
+        }
+        return res;
     }
 
     server_response_reader get_response_reader() {

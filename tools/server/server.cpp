@@ -146,6 +146,10 @@ static bool server_prepare_params(common_params & params, server_role_type role_
             SRV_ERR("--slot-ctx has %zu values but --parallel is %d\n", params.slot_ctx.size(), params.n_parallel);
             return false;
         }
+        if (std::find(params.slot_ctx.begin(), params.slot_ctx.end(), 0) != params.slot_ctx.end() && params.n_ctx == 0) {
+            SRV_ERR("%s", "--slot-ctx: shared slots (0) take the rest of the pool, so the pool size must be given with -c\n");
+            return false;
+        }
         if (params.n_ctx == 0 && (uint32_t) params.fit_params_min_ctx != UINT32_MAX) {
             int64_t sum = 0;
             for (const int32_t n : params.slot_ctx) {
