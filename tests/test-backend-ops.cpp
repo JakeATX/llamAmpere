@@ -18326,6 +18326,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_ai4(type, 4, 3, false, 32, n, 1024, true));
         }
     }
+    // [FEWPORT] 9..24 tokens: port 2 (GGML_CUDA_AIT_CG / GGML_CUDA_AI4_MMV_CG column groups) and port 3 (GGML_CUDA_AI4_MIDT_U)
+    // against the CPU reference. AIT 5120 x 5120 takes the CTA sum, 1024 x 1024 and 5120 x 6144 (K) the ordered slots.
+    for (ggml_type type : {GGML_TYPE_AIT2, GGML_TYPE_AIT3, GGML_TYPE_AIT4}) {
+        for (int n : {9, 12, 16, 24}) {
+            test_cases.emplace_back(new test_mul_mat_ait(type, 5120, n, 5120));
+            test_cases.emplace_back(new test_mul_mat_ait(type, 1024, n, 1024));
+            test_cases.emplace_back(new test_mul_mat_ait(type, 5120, n, 6144));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT4_U2, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U,
+                           GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
+        for (int n : {9, 12, 16, 24}) {
+            test_cases.emplace_back(new test_mul_mat_ai4(1024, n, 2560, type));
+            test_cases.emplace_back(new test_mul_mat_ai4(48, n, 5120, type));
+        }
+    }
 
     add_sj_fill_cases(test_cases, false);
     add_exl3_cpu_cases(test_cases, false);
@@ -23246,6 +23262,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, GGML_TYPE_AIT5_U));
                     for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
                         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                    }
+                }
+            }
+            return test_cases;
+        }
+        // [FEWPORT] GGML_TEST_AIV2_PERF=fewport: ports 2 / 3 A/B (GGML_CUDA_AIT_CG, GGML_CUDA_AI4_MMV_CG, GGML_CUDA_AI4_MIDT_U) at the
+        // 27B dense shapes (M x K) and the Flash-Next dense shapes, n = 8 (control) and 9, 12, 16, 24
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "fewport") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 5120, 5120 }, { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 5120, 6144 } }) {
+                for (int64_t n : { 8, 9, 12, 16, 24 }) {
+                    for (ggml_type t : { GGML_TYPE_AIT2, GGML_TYPE_AIT3, GGML_TYPE_AIT4 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                    for (ggml_type t : { GGML_TYPE_AIT5_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT4_U2, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+                        if (t != GGML_TYPE_AIT4_U2 || mk.second % 640 == 0) {   // U2 blocks are 640 K
+                            test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, t));
+                        }
+                    }
+                }
+            }
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 2560, 2560 }, { 640, 2560 }, { 2560, 640 }, { 10240, 2560 } }) {
+                for (int64_t n : { 8, 9, 12, 16, 24 }) {
+                    for (ggml_type t : { GGML_TYPE_AIT5_U, GGML_TYPE_AIT4_U, GGML_TYPE_AIT4_U2, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U }) {
+                        if (t != GGML_TYPE_AIT4_U2 || mk.second % 640 == 0) {   // U2 blocks are 640 K
+                            test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, t));
+                        }
                     }
                 }
             }

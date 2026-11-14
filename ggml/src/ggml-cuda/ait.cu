@@ -1213,6 +1213,288 @@ static bool ait_fast(ggml_backend_cuda_context & ctx, const uint8_t * W, const f
     }
 }
 
+// ---------------------------------------------------------------- FEWPORT port 2: column groups, 9..24 tokens (GGML_CUDA_AIT_CG)
+// GGML_CUDA_AIT_CG=1 (default 0 = off, the mid-T path below): AIT2/3/4 (code 0) at 9..24 tokens run the tile-chain register
+// kernel with CG = ceil(T / 8) column groups of 8 tokens (2 or 3). A warp decodes each weight group once and runs CG IMMAs on
+// it (one per 8-token B fragment), so weights are read once for all T columns with no staged activation tile, no K split and
+// no reduce launch. Activations are k_ait_actq_t's [K/32][T][32] (the same bytes k_ait_actq<T> would write). int32 per
+// (tile, 512-K slice) is exact and equal to the mid-T kernel's; the float sum order is k_ait_mmv's (item chain per warp, then
+// the CTA sum in warp order or the ordered slots + sum kernel), so outputs differ from the mid-T path by fp32 order only and
+// repeats are bitwise equal. Shapes need GGML_CUDA_AIT_WARPS <= 12 and GGML_CUDA_AIT_ORDERED on; others keep the mid-T path.
+// GGML_CUDA_AIT_CG_LOG=1 prints one line per distinct (M, K, T, k) that took this path.
+template <int KB, int CG, int Gi>
+static __device__ __forceinline__ void ait_group_cg(uint4 (&buf)[4][2], const int G, const bool pf, const char * gp, const int (&off)[2],
+        const int r, const char * xs, const int NT, const int g, int (&c)[CG][2][4]) {
+    using namespace aitk;
+    constexpr int GB = 128 * KB, DEPTH = 4;
+    constexpr bool ONE = 7 * KB + 16 <= 32;
+    const uint4 cur0 = buf[Gi][0], cur1 = buf[Gi][1];
+    if (pf) {
+        // groups past this chunk continue in the next one, after its 64 side bytes
+        const char * p = gp + (G + DEPTH) * GB + (G + DEPTH >= 16 ? 64 : 0);
+        buf[Gi][0] = ldw16(p + off[0]);
+        buf[Gi][1] = ldw16(p + off[1]);
+    }
+    uint32_t Lv[4][8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t R0 = comp(cur0, i), R1 = comp(cur1, i);
+        const uint32_t A = __funnelshift_r(R0, R1, r);
+        uint32_t F1 = A;
+        if constexpr (!ONE) {
+            F1 = __funnelshift_r(A, R1 >> r, 4 * KB);
+        }
+        Lv[i][0] = st1<KB, 0>(A, F1); Lv[i][1] = st1<KB, 1>(A, F1); Lv[i][2] = st1<KB, 2>(A, F1); Lv[i][3] = st1<KB, 3>(A, F1);
+        Lv[i][4] = st1<KB, 4>(A, F1); Lv[i][5] = st1<KB, 5>(A, F1); Lv[i][6] = st1<KB, 6>(A, F1); Lv[i][7] = st1<KB, 7>(A, F1);
+    }
+    // B fragment of column group cg: tokens 8 cg .. 8 cg + 7 of 32-K block G (token 8 cg + g of this lane)
+    uint2 b[CG];
+#pragma unroll
+    for (int cg = 0; cg < CG; ++cg) {
+        b[cg] = 8 * cg + g < NT ? __ldg((const uint2 *) (xs + G * NT * 32 + cg * 256)) : make_uint2(0, 0);
+    }
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        uint32_t a[4];
+#pragma unroll
+        for (int hs = 0; hs < 2; ++hs) {
+#pragma unroll
+            for (int h8 = 0; h8 < 2; ++h8) {
+                const int j = (2 * u + h8) * 2;
+                a[2 * hs + h8] = pack4(Lv[2 * hs][j], Lv[2 * hs][j + 1], Lv[2 * hs + 1][j], Lv[2 * hs + 1][j + 1]);
+            }
+        }
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+            mma_s8(c[cg][u], a[0], a[1], a[2], a[3], b[cg].x, b[cg].y);
+        }
+    }
+}
+
+// grid nsm x (32 warps) as k_ait_mmv; NT = T (9..8 CG) at run time. det != 0: CTA sum (host-checked by ait_cta_ok, dynamic smem
+// [warp][2][NT][33] floats + 2 ints per warp); det == 0: ordered slots in partial, summed by k_ait_mmv_cg_sum.
+template <int KB, int CG>
+static __global__ void __launch_bounds__(384, 1) k_ait_mmv_cg(const char * __restrict__ W, const int8_t * __restrict__ X,
+        const float * __restrict__ SA, float * __restrict__ Y, const int M, const int K, const int NT, float * __restrict__ partial,
+        const int det) {
+    using namespace aitk;
+    constexpr int BQ = 8 * KB, GB = 16 * BQ, CS = 2048 * KB + 64, MU = 2, DEPTH = 4;
+    const int S = K / 512, lane = threadIdx.x & 31, nw = blockDim.x >> 5, wl = threadIdx.x >> 5;
+    extern __shared__ uint32_t ait_cg_smem[];
+    const int items = (M / 32) * S, W_ = gridDim.x * nw, w = blockIdx.x * nw + wl;
+    const int i0 = (int) ((int64_t) w * items / W_), i1 = (int) ((int64_t) (w + 1) * items / W_);
+    if (i0 >= i1) {
+        return;
+    }
+    float * dfs = (float *) ait_cg_smem;
+    int * dti = (int *) (dfs + nw * 2 * NT * 33);
+    if (det != 0 && lane == 0) {
+        dti[2 * wl] = i0 / S;
+        dti[2 * wl + 1] = (i1 - 1) / S - i0 / S + 1;
+    }
+    const int wq = (lane * BQ) >> 5, r = (lane * BQ) & 31;
+    const int off[2] = { 16 * (wq % BQ), 16 * ((wq + 1) % BQ) };
+    const char * gp = W + (int64_t) i0 * CS;
+    uint4 buf[DEPTH][2];
+#pragma unroll
+    for (int d = 0; d < DEPTH; ++d) {
+        buf[d][0] = ldw16(gp + d * GB + off[0]);
+        buf[d][1] = ldw16(gp + d * GB + off[1]);
+    }
+    const int g = lane >> 2, q = lane & 3, n0 = q * 2;
+    const char * xb = (const char *) X + g * 32 + q * 8;
+    const int xstep = 16 * NT * 32;
+    int t = i0 / S, ks = i0 - t * S;
+    const char * xs = xb + (int64_t) ks * xstep;
+    float cf[CG][MU][4];
+#pragma unroll
+    for (int cg = 0; cg < CG; ++cg) {
+#pragma unroll
+        for (int u = 0; u < MU; ++u) {
+            cf[cg][u][0] = cf[cg][u][1] = cf[cg][u][2] = cf[cg][u][3] = 0.0f;
+        }
+    }
+#pragma unroll 1
+    for (int it = i0; it < i1; ++it) {
+        const bool more = it + 1 < i1;
+        int c[CG][MU][4];
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+#pragma unroll
+            for (int u = 0; u < MU; ++u) {
+                c[cg][u][0] = c[cg][u][1] = c[cg][u][2] = c[cg][u][3] = 0;
+            }
+        }
+#pragma unroll
+        for (int G4 = 0; G4 < 16; G4 += 4) {
+            ait_group_cg<KB, CG, 0>(buf, G4 + 0, G4 + DEPTH + 0 < 16 || more, gp, off, r, xs, NT, g, c);
+            ait_group_cg<KB, CG, 1>(buf, G4 + 1, G4 + DEPTH + 1 < 16 || more, gp, off, r, xs, NT, g, c);
+            ait_group_cg<KB, CG, 2>(buf, G4 + 2, G4 + DEPTH + 2 < 16 || more, gp, off, r, xs, NT, g, c);
+            ait_group_cg<KB, CG, 3>(buf, G4 + 3, G4 + DEPTH + 3 < 16 || more, gp, off, r, xs, NT, g, c);
+        }
+        gp += CS;
+        // row scales of rows 32t + 16u + g (+8) for K block ks / 2: chunk (t, 2 (ks / 2) + u), slots g and g + 8
+        uint32_t rp[MU];
+#pragma unroll
+        for (int u = 0; u < MU; ++u) {
+            const unsigned short * sb = (const unsigned short *) (W + ((int64_t) t * S + (ks & ~1) + u) * CS + 2048 * KB);
+            rp[u] = (uint32_t) __ldg(sb + g) | ((uint32_t) __ldg(sb + g + 8) << 16);
+        }
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+            const int na = 8 * cg + n0;
+            const float s0 = na < NT ? __ldg(SA + na * S + ks) : 0.0f;
+            const float s1 = na + 1 < NT ? __ldg(SA + (na + 1) * S + ks) : 0.0f;
+#pragma unroll
+            for (int u = 0; u < MU; ++u) {
+                const float r0 = __half2float(__ushort_as_half((unsigned short) (rp[u] & 0xFFFFu)));
+                const float r1 = __half2float(__ushort_as_half((unsigned short) (rp[u] >> 16)));
+                cf[cg][u][0] += s0 * r0 * (float) c[cg][u][0]; cf[cg][u][1] += s1 * r0 * (float) c[cg][u][1];
+                cf[cg][u][2] += s0 * r1 * (float) c[cg][u][2]; cf[cg][u][3] += s1 * r1 * (float) c[cg][u][3];
+            }
+        }
+        xs += xstep;
+        ++ks;
+        if (it + 1 == i1 || ks == S) {
+#pragma unroll
+            for (int cg = 0; cg < CG; ++cg) {
+                const int na = 8 * cg + n0;
+#pragma unroll
+                for (int u = 0; u < MU; ++u) {
+                    const int m0 = t * 32 + 16 * u + g, m1 = m0 + 8;
+                    if (det != 0) {
+                        float * fs = dfs + (wl * 2 + (t - i0 / S)) * NT * 33;
+                        const int rr = 16 * u + g;
+                        if (na < NT)     { fs[na * 33 + rr] = cf[cg][u][0];       fs[na * 33 + rr + 8] = cf[cg][u][2]; }
+                        if (na + 1 < NT) { fs[(na + 1) * 33 + rr] = cf[cg][u][1]; fs[(na + 1) * 33 + rr + 8] = cf[cg][u][3]; }
+                    } else {
+                        const int first = (int) ((int64_t) t * S * W_ / items);
+                        float * out = partial + (int64_t) (w - first) * NT * M;
+                        if (na < NT)     { out[na * M + m0] = cf[cg][u][0];       out[na * M + m1] = cf[cg][u][2]; }
+                        if (na + 1 < NT) { out[(na + 1) * M + m0] = cf[cg][u][1]; out[(na + 1) * M + m1] = cf[cg][u][3]; }
+                    }
+                    cf[cg][u][0] = cf[cg][u][1] = cf[cg][u][2] = cf[cg][u][3] = 0.0f;
+                }
+            }
+            ks = 0;
+            ++t;
+            xs = xb;
+        }
+    }
+    if (det != 0) {
+        // the CTA sum of k_ait_mmv (det 2: one warp per (tile, token), contributing warps in ascending order; det 1: one thread per
+        // output, same order and bits), then at most two float atomics per output on a zeroed Y
+        __syncthreads();
+        const int w0 = blockIdx.x * nw;
+        const int c0 = (int) ((int64_t) w0 * items / W_), c1 = (int) ((int64_t) (w0 + nw) * items / W_);
+        const int ta = c0 / S, ntl = (c1 - 1) / S - ta + 1;
+        if (det == 2) {
+            const int ws = lane < nw ? dti[2 * lane] : 0, wc = lane < nw ? dti[2 * lane + 1] : 0;
+            for (int pr = wl; pr < ntl * NT; pr += nw) {
+                const int tile = ta + pr / NT, n = pr % NT;
+                unsigned int m = __ballot_sync(0xffffffffu, lane < nw && tile >= ws && tile < ws + wc);
+                float sum = 0.0f;
+                while (m != 0) {
+                    const int wi = __ffs(m) - 1;
+                    m &= m - 1;
+                    sum += dfs[((wi * 2 + (tile - dti[2 * wi])) * NT + n) * 33 + lane];
+                }
+                atomicAdd(Y + (int64_t) n * M + tile * 32 + lane, sum);
+            }
+            return;
+        }
+        for (int e = threadIdx.x; e < ntl * NT * 32; e += blockDim.x) {
+            const int tile = ta + e / (NT * 32), n = (e / 32) % NT, row = e & 31;
+            float sum = 0.0f;
+            for (int wi = 0; wi < nw; ++wi) {
+                const int sl = tile - dti[2 * wi];
+                if (sl >= 0 && sl < dti[2 * wi + 1]) {
+                    sum += dfs[((wi * 2 + sl) * NT + n) * 33 + row];
+                }
+            }
+            atomicAdd(Y + (int64_t) n * M + tile * 32 + row, sum);
+        }
+    }
+}
+
+// ordered slots -> Y in warp order (k_ait_mmv_sum<NT, false> with NT at run time); block = 32 NT threads, one tile
+static __global__ void k_ait_mmv_cg_sum(const float * __restrict__ partial, float * __restrict__ Y, int M, int S, int warps, int NT) {
+    const int tile = blockIdx.x, items = (M / 32) * S;
+    int first, last, live;
+    ait_tile_slots(tile, S, items, warps, first, last, live);
+    ait_tile_sum(partial, Y, tile, threadIdx.x >> 5, threadIdx.x & 31, NT * M, M, S, items, warps, first, last);
+}
+
+static bool ait_cg_on() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CUDA_AIT_CG");
+        if (e == nullptr || *e == '\0' || strcmp(e, "0") == 0) {
+            return false;
+        }
+        GGML_ASSERT(strcmp(e, "1") == 0 && "GGML_CUDA_AIT_CG must be 0 or 1");
+        return true;
+    }();
+    return v;
+}
+
+// port 2 plan, before k_ait_actq_t: -1 = not taken; else the det mode (0 = ordered slots + sum kernel, 1 / 2 = CTA sum on a Y
+// that k_ait_actq_t<true> zeroes)
+static int ait_cg_plan(int64_t T, int M, int K, int code) {
+    static const int warps = std::max(1, std::min(16, ait_env_int("GGML_CUDA_AIT_WARPS", 12)));
+    static const bool ordered = ait_env_int("GGML_CUDA_AIT_ORDERED", 1) != 0;
+    static const int cta_env = ait_env_int("GGML_CUDA_AIT_CTA", 2);
+    if (!ait_cg_on() || code != 0 || T < 9 || T > 24 || warps > 12 || !ordered) {
+        return -1;
+    }
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    return cta_env != 0 && ait_cta_ok(M, K, nsm, warps) ? (cta_env == 1 ? 1 : 2) : 0;
+}
+
+template <int KB, int CG>
+static void ait_cg_launch(ggml_backend_cuda_context & ctx, const char * w, const int8_t * xq, const float * sa, float * Y, int M, int K,
+        int T, int det) {
+    static const int warps = std::max(1, std::min(16, ait_env_int("GGML_CUDA_AIT_WARPS", 12)));
+    const int id = ggml_cuda_get_device(), S = K / 512;
+    cudaStream_t stream = ctx.stream();
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    // the attribute is set once per kernel instance, so it covers the largest T of this CG at 12 warps
+    constexpr int SMEM_MAX = 12 * 2 * (8 * CG * 33 + 2) * (int) sizeof(float);
+    CUDA_SET_SHARED_MEMORY_LIMIT((k_ait_mmv_cg<KB, CG>), SMEM_MAX);
+    const dim3 grid(nsm), block(32 * warps);
+    if (det != 0) {
+        const size_t smem = (size_t) warps * 2 * (T * 33 + 2) * sizeof(float);
+        k_ait_mmv_cg<KB, CG><<<grid, block, smem, stream>>>(w, xq, sa, Y, M, K, T, nullptr, det);
+    } else {
+        const int total_warps = nsm * warps;
+        const size_t slots = (total_warps + M / 32 - 1) / (M / 32) + 2;
+        ggml_cuda_pool_alloc<float> scratch(ctx.pool(id), slots * T * (size_t) M);
+        k_ait_mmv_cg<KB, CG><<<grid, block, 0, stream>>>(w, xq, sa, Y, M, K, T, scratch.get(), 0);
+        CUDA_CHECK(cudaGetLastError());
+        k_ait_mmv_cg_sum<<<M / 32, 32 * T, 0, stream>>>(scratch.get(), Y, M, S, total_warps, T);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    static const bool log = ait_env_int("GGML_CUDA_AIT_CG_LOG", 0) != 0;
+    if (log) {
+        static thread_local std::set<std::tuple<int, int, int, int>> seen;
+        if (seen.insert(std::make_tuple(M, K, T, KB)).second) {
+            fprintf(stderr, "[ait-cg] M=%d K=%d T=%d k=%d CG=%d: %s\n", M, K, T, KB, CG, det ? "CTA sum" : "ordered slots");
+        }
+    }
+}
+
+// port 2 launch (plan >= 0), after k_ait_actq_t
+static void ait_cg_run(ggml_backend_cuda_context & ctx, const char * w, const int8_t * xq, const float * sa, float * Y, int T, int M,
+        int K, int k, int det) {
+    switch (k * 4 + (T <= 16 ? 2 : 3)) {
+        case 2 * 4 + 2: ait_cg_launch<2, 2>(ctx, w, xq, sa, Y, M, K, T, det); break;
+        case 2 * 4 + 3: ait_cg_launch<2, 3>(ctx, w, xq, sa, Y, M, K, T, det); break;
+        case 3 * 4 + 2: ait_cg_launch<3, 2>(ctx, w, xq, sa, Y, M, K, T, det); break;
+        case 3 * 4 + 3: ait_cg_launch<3, 3>(ctx, w, xq, sa, Y, M, K, T, det); break;
+        case 4 * 4 + 2: ait_cg_launch<4, 2>(ctx, w, xq, sa, Y, M, K, T, det); break;
+        default:        ait_cg_launch<4, 3>(ctx, w, xq, sa, Y, M, K, T, det); break;
+    }
+}
+
 // ---------------------------------------------------------------- batch path (N > 8 tokens): tile-chain IMMA, token tiles
 // CTA = 8 warps = 8 row tiles (256 rows) x TN = 8 NB tokens. Per 512-K slice the CTA stages the TN-token int8 activation
 // slice (fragment order, [16 groups][TN][32 B]) in shared memory (double buffered); each warp decodes its chunk once and runs
@@ -1221,8 +1503,11 @@ static bool ait_fast(ggml_backend_cuda_context & ctx, const uint8_t * W, const f
 // blockIdx.x = token tile (fastest), so the CTAs that run together share their row tiles' weights in L2.
 
 // activations for any T: k_ait_actq without the Y zeroing, T at run time ([K/32][T][32] fragment order)
+// ZERO (FEWPORT port 2 CTA sum only): also zero Y[T][M], as k_ait_actq does for k_ait_mmv
+template <bool ZERO = false>
 static __global__ void __launch_bounds__(64) k_ait_actq_t(const float * __restrict__ X, const uint8_t * __restrict__ W,
-        int8_t * __restrict__ XQ, float * __restrict__ SA, const int K, const int k, const int T) {
+        int8_t * __restrict__ XQ, float * __restrict__ SA, const int K, const int k, const int T, float * __restrict__ Y = nullptr,
+        const int M = 0) {
     const int S = K / 512, n = blockIdx.x / S, ks = blockIdx.x - n * S;
     const int h = threadIdx.x >> 5, l = threadIdx.x & 31;
     const int k0 = ks * 512 + h * 256 + l * 8;
@@ -1259,6 +1544,11 @@ static __global__ void __launch_bounds__(64) k_ait_actq_t(const float * __restri
     for (int q = 0; q < 4; ++q) {
         const uint32_t lo = (uint8_t) (int8_t) __float2int_rn(v[2 * q] * id), hi = (uint8_t) (int8_t) __float2int_rn(v[2 * q + 1] * id);
         *reinterpret_cast<uint16_t *>(dst + 8 * q) = (uint16_t) (lo | (hi << 8));
+    }
+    if constexpr (ZERO) {
+        for (int64_t i = (int64_t) blockIdx.x * 64 + threadIdx.x; i < (int64_t) T * M; i += (int64_t) gridDim.x * 64) {
+            Y[i] = 0.0f;
+        }
     }
 }
 
@@ -1511,8 +1801,18 @@ static bool ait_mmq(ggml_backend_cuda_context & ctx, const uint8_t * W, const fl
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool_alloc<int8_t> xq(ctx.pool(id), (size_t) T * K);
     ggml_cuda_pool_alloc<float>  sa(ctx.pool(id), (size_t) T * S);
-    k_ait_actq_t<<<(unsigned) (T * S), 64, 0, stream>>>(X, W, xq.get(), sa.get(), K, k, (int) T);
     const char * w = (const char *) W;
+    // FEWPORT port 2 (GGML_CUDA_AIT_CG=1): 9..24 tokens on the column-group register kernel instead of the mid-T tile below
+    const int cg_det = ait_cg_plan(T, M, K, code);
+    if (cg_det > 0) {
+        k_ait_actq_t<true><<<(unsigned) (T * S), 64, 0, stream>>>(X, W, xq.get(), sa.get(), K, k, (int) T, Y, M);
+    } else {
+        k_ait_actq_t<false><<<(unsigned) (T * S), 64, 0, stream>>>(X, W, xq.get(), sa.get(), K, k, (int) T);
+    }
+    if (cg_det >= 0) {
+        ait_cg_run(ctx, w, xq.get(), sa.get(), Y, (int) T, M, K, k, cg_det);
+        return true;
+    }
     // GGML_CUDA_AIT_MIDT_SPLIT (default 1 = on; 0 = off): 9..64 tokens (9..32 with GGML_CUDA_AIT_MIDT_MAX_T=32) of AIT2/3/4 run on a
     // token tile that just covers T, with K
     // split over CTAs when the row tiles alone leave SMs idle (ffn_down: 20 CTAs on 82 SMs). 1 = splits from the SM count,
