@@ -145,6 +145,7 @@ public:
         uint64_t n_strict  = 0;
         uint64_t n_width   = 0;
         uint64_t n_tail    = 0;
+        uint64_t n_bystand = 0;
     };
     mutable lanes_stats lstats;
 
@@ -194,6 +195,8 @@ public:
     // [TAG_GDN_REPLAY_LANES] with lanes on, compat also admits two seqs that both have >= n_rs_seq tokens in the
     // batch (relaxed), and split_equal's strict guard (strict_fn, n_mixed_min) keeps the real ubatch at that width.
     // Short static rounds (LLAMA_GDN_REPLAY_SHORT, n < n_rs_seq) stay strict: get_snap_shift sizes by the min r.
+    // A mixed ubatch also must not span the cell of a seq outside it that has a pending replay (set_fn): find_slot
+    // can move that cell, and only its plane-0 conv row moves with it (stale conv planes for its replay).
     struct replay_split {
         bool     active   = false;
         bool     lanes    = false;
@@ -204,12 +207,20 @@ public:
         std::vector<uint8_t>  s_stale;
         std::vector<uint32_t> n_tokens; // per seq, tokens in the batch (lanes only)
 
+        // (lanes only) per seq: its cell as find_slot will see it, -1 = none or shared (cell unknown).
+        // advance() applies the find_slot gather to it.
+        std::vector<int32_t> tail;
+        // (lanes only) per cell: the seq that owns it, -1 = empty, -2 = shared
+        std::vector<int32_t> owner;
+
         lanes_stats * stats = nullptr;
 
         void count_tokens(const llama_batch & batch);
 
         bool strict(llama_seq_id a, llama_seq_id b) const;
         bool compat(llama_seq_id a, llama_seq_id b) const;
+        bool pending(llama_seq_id s) const;
+        bool set_ok(const std::vector<llama_seq_id> & seqs) const;
         void advance(const llama_ubatch & ubatch, uint32_t split_cut = 0);
 
         // the split_equal filter, or nullptr when the constraint does not apply
@@ -217,6 +228,8 @@ public:
         // the split_equal width guard (strict, n_mixed_min), or nullptr / 0 without lanes
         llama_batch_allocr::seq_compat_fn strict_fn() const;
         uint32_t n_mixed_min() const { return lanes ? n_rs_seq : 0; }
+        // the split_equal bystander guard, or nullptr without lanes
+        llama_batch_allocr::seq_set_fn set_fn() const;
     };
 
     // logs once when the batch's seqs disagree

@@ -661,7 +661,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 }
 
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, const seq_compat_fn & compat,
-        const seq_compat_fn & strict, uint32_t n_mixed_min) {
+        const seq_compat_fn & strict, uint32_t n_mixed_min, const seq_set_fn & set_ok) {
     split_cut = 0;
 
     if (sequential && has_cpl) {
@@ -786,10 +786,23 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     }
 
     // compat may admit seqs that can only share a ubatch of n_mixed_min or more tokens per seq: if the width came out
-    //   smaller (n_ubatch, position grid, a short seq), keep the first seq alone unless all seqs pass strict
-    if (strict && n_seqs > 1 && idxs_per_seq[0].size() < n_mixed_min) {
+    //   smaller (n_ubatch, position grid, a short seq), or set_ok rejects the seq list, keep the first seq alone
+    //   unless all seqs pass strict
+    if (strict && n_seqs > 1) {
+        const bool narrow = idxs_per_seq[0].size() < n_mixed_min;
+        bool set_bad = false;
+        if (!narrow && set_ok) {
+            std::vector<llama_seq_id> seqs;
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                const int32_t i0 = idxs_per_seq[s][0];
+                for (int32_t k = 0; k < batch.n_seq_id[i0]; ++k) {
+                    seqs.push_back(batch.seq_id[i0][k]);
+                }
+            }
+            set_bad = !set_ok(seqs);
+        }
         bool all_strict = true;
-        for (uint32_t s = 1; s < n_seqs && all_strict; ++s) {
+        for (uint32_t s = 1; s < n_seqs && all_strict && (narrow || set_bad); ++s) {
             const int32_t i0 = idxs_per_seq[s][0];
             for (int32_t k = 0; k < batch.n_seq_id[i0]; ++k) {
                 if (!strict(first_seq_id, batch.seq_id[i0][k])) {
@@ -806,7 +819,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                 }
             }
             n_seqs = 1;
-            split_cut |= SPLIT_CUT_WIDTH;
+            split_cut |= narrow ? SPLIT_CUT_WIDTH : SPLIT_CUT_SET;
         }
     }
 

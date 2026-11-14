@@ -201,15 +201,19 @@ public:
     //               width comes out below it and any seq b has strict(a, b) == false, seqs 1.. go back to the
     //               pool and the first seq is emitted alone (compat may admit seqs that only share a ubatch
     //               of at least n_mixed_min tokens, see llama_memory_recurrent::replay_split). nullptr = no guard
+    // set_ok      = optional check of the full seq list of the ubatch (needs strict): when it returns false and
+    //               any seq b has strict(a, b) == false, the first seq is emitted alone (same as the width guard)
     using seq_compat_fn = std::function<bool(llama_seq_id a, llama_seq_id b)>;
+    using seq_set_fn    = std::function<bool(const std::vector<llama_seq_id> & seqs)>;
     llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail = 0, const seq_compat_fn & compat = nullptr,
-            const seq_compat_fn & strict = nullptr, uint32_t n_mixed_min = 0);
+            const seq_compat_fn & strict = nullptr, uint32_t n_mixed_min = 0, const seq_set_fn & set_ok = nullptr);
 
     // why the last split_equal call left seqs out of its ubatch (SPLIT_CUT_* bits, 0 = nothing left out)
     enum : uint32_t {
         SPLIT_CUT_COMPAT = 1u << 0, // compat kept a seq out
         SPLIT_CUT_WIDTH  = 1u << 1, // the strict guard: width < n_mixed_min
         SPLIT_CUT_TAIL   = 1u << 2, // n_keep_tail deferred a seq
+        SPLIT_CUT_SET    = 1u << 3, // set_ok kept seqs 1.. out
     };
     uint32_t get_split_cut() const { return split_cut; }
 

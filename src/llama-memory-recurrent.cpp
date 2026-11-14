@@ -246,9 +246,9 @@ llama_memory_recurrent::llama_memory_recurrent(
 
 llama_memory_recurrent::~llama_memory_recurrent() {
     if (gdn_replay_lanes && lstats.n_ubatch > 0) {
-        LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu\n", __func__,
+        LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu, bystander %llu\n", __func__,
                 (unsigned long long) lstats.n_ubatch, (unsigned long long) lstats.n_joint, (unsigned long long) lstats.n_strict,
-                (unsigned long long) lstats.n_width, (unsigned long long) lstats.n_tail);
+                (unsigned long long) lstats.n_width, (unsigned long long) lstats.n_tail, (unsigned long long) lstats.n_bystand);
     }
 }
 
@@ -701,10 +701,44 @@ void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch, 
         stats->n_strict += (split_cut & llama_batch_allocr::SPLIT_CUT_COMPAT) != 0;
         stats->n_width  += (split_cut & llama_batch_allocr::SPLIT_CUT_WIDTH)  != 0;
         stats->n_tail   += (split_cut & llama_batch_allocr::SPLIT_CUT_TAIL)   != 0;
+        stats->n_bystand += (split_cut & llama_batch_allocr::SPLIT_CUT_SET)   != 0;
         if ((stats->n_ubatch & 4095) == 0) {
-            LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu\n", __func__,
+            LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu, bystander %llu\n", __func__,
                     (unsigned long long) stats->n_ubatch, (unsigned long long) stats->n_joint, (unsigned long long) stats->n_strict,
-                    (unsigned long long) stats->n_width, (unsigned long long) stats->n_tail);
+                    (unsigned long long) stats->n_width, (unsigned long long) stats->n_tail, (unsigned long long) stats->n_bystand);
+        }
+    }
+    // [TAG_GDN_REPLAY_LANES] the cells after find_slot's gather (members move to [min, min + n_seqs))
+    if (lanes && !tail.empty()) {
+        int32_t cmin = -1;
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            const uint32_t i = s*n_seq_tokens;
+            const llama_seq_id seq = ubatch.seq_id[i][0];
+            if (ubatch.n_seq_id[i] != 1 || seq < 0 || (size_t) seq >= tail.size() || tail[seq] < 0) {
+                cmin = -1; // a new or shared cell: find_slot takes an empty cell, not tracked here
+                break;
+            }
+            cmin = cmin < 0 ? tail[seq] : std::min(cmin, tail[seq]);
+        }
+        if (cmin < 0) {
+            tail.clear();
+            owner.clear();
+        }
+        for (uint32_t s = 0; s < ubatch.n_seqs && !tail.empty(); ++s) {
+            const llama_seq_id seq = ubatch.seq_id[s*n_seq_tokens][0];
+            const int32_t dst = cmin + (int32_t) s;
+            const int32_t src = tail[seq];
+            if (dst == src) {
+                continue;
+            }
+            std::swap(owner[dst], owner[src]);
+            tail[seq] = dst;
+            if (owner[src] >= 0) {
+                tail[owner[src]] = src;
+            } else if (owner[src] == -2) {
+                tail.clear();
+                owner.clear();
+            }
         }
     }
     // same values the graph input takes (max over the ubatch's lanes), same update as consume_replay()
@@ -726,6 +760,47 @@ void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch, 
             s_stale[seq]    = 0;
         }
     }
+}
+
+bool llama_memory_recurrent::replay_split::pending(llama_seq_id s) const {
+    return s >= 0 && (size_t) s < replay_len.size() && (replay_len[s] > 0 || s_stale[s] != 0);
+}
+
+bool llama_memory_recurrent::replay_split::set_ok(const std::vector<llama_seq_id> & seqs) const {
+    if (!lanes) {
+        return true;
+    }
+    auto member = [&](llama_seq_id q) {
+        return std::find(seqs.begin(), seqs.end(), q) != seqs.end();
+    };
+    // the cell range find_slot will use; unknown cells: any pending seq outside the ubatch blocks it
+    bool known = !tail.empty();
+    int32_t cmin = -1;
+    int32_t cmax = -1;
+    for (const llama_seq_id seq : seqs) {
+        if (!known || seq < 0 || (size_t) seq >= tail.size() || tail[seq] < 0) {
+            known = false;
+            break;
+        }
+        cmin = cmin < 0 ? tail[seq] : std::min(cmin, tail[seq]);
+        cmax = std::max(cmax, tail[seq]);
+    }
+    for (llama_seq_id q = 0; (size_t) q < replay_len.size(); ++q) {
+        if (!pending(q) || member(q)) {
+            continue;
+        }
+        if (!known || (size_t) q >= tail.size() || tail[q] < 0 || (tail[q] >= cmin && tail[q] <= cmax)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+llama_batch_allocr::seq_set_fn llama_memory_recurrent::replay_split::set_fn() const {
+    if (!active || !lanes) {
+        return nullptr;
+    }
+    return [this](const std::vector<llama_seq_id> & seqs) { return set_ok(seqs); };
 }
 
 llama_batch_allocr::seq_compat_fn llama_memory_recurrent::replay_split::fn() const {
@@ -758,6 +833,21 @@ llama_memory_recurrent::replay_split llama_memory_recurrent::make_replay_split(c
     if (rs.lanes) {
         rs.count_tokens(batch);
         rs.stats = &lstats;
+        rs.owner.assign(size, -1);
+        for (uint32_t i = 0; i < size; ++i) {
+            if (cells[i].seq_id.size() == 1) {
+                rs.owner[i] = *cells[i].seq_id.begin();
+            } else if (cells[i].seq_id.size() > 1) {
+                rs.owner[i] = -2;
+            }
+        }
+        rs.tail.assign(size, -1);
+        for (uint32_t q = 0; q < size; ++q) {
+            const int32_t t = cells[q].tail;
+            if (t >= 0 && rs.owner[t] == (int32_t) q) {
+                rs.tail[q] = t;
+            }
+        }
     }
 
     // is anything kept apart in this batch? only for the log
@@ -806,7 +896,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
                 ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn(),
-                        rsplit.strict_fn(), rsplit.n_mixed_min());
+                        rsplit.strict_fn(), rsplit.n_mixed_min(), rsplit.set_fn());
             }
 
             if (ubatch.n_tokens == 0) {

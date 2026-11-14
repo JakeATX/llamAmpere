@@ -159,7 +159,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
                 ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn(),
-                        rsplit.strict_fn(), rsplit.n_mixed_min());
+                        rsplit.strict_fn(), rsplit.n_mixed_min(), rsplit.set_fn());
             }
 
             if (ubatch.n_tokens == 0) {
