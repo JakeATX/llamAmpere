@@ -19,6 +19,11 @@ extern "C" {
     // Returns false (y untouched) for a non-AI+ type or a K the type's layout does not allow.
     GGML_API bool ggml_ai4_dequantize_slab(enum ggml_type type, const void * data, int64_t K, int64_t g, float * y);
 
+    // Encode 16 original-basis F32 rows as versioned type126, K a positive multiple of 512.
+    // nbytes must equal ggml_ai4_slab_nbytes(GGML_TYPE_AIF175_U2, K).
+    // Returns false without changing data on invalid input or allocation/search failure.
+    GGML_API bool ggml_aif175_quantize_slab(const float * x, int64_t K, void * data, size_t nbytes);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,5 +1,6 @@
 #include "../ggml/src/ggml-cuda/magic2-v2.cuh"
 #include "../ggml/src/ggml-aif25.h"
+#include "../ggml/src/ggml-aif175.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -25,11 +26,12 @@ static int reference(const uint8_t * tile, int index) {
     const int step = index / V;
     uint32_t state = 0;
     for (int j = 0; j < 16; ++j) {
-        const int bit = (B * (step + 1) - 16 + j + NB) % NB;
+        const int end = V == 4 ? 7*(step/2) + (step%2 ? 7 : 3) : B*(step + 1);
+        const int bit = (end - 16 + j + NB) % NB;
         const int byte = (bit / 32) * 4 + 3 - (bit % 32) / 8;
         state = (state << 1) | ((tile[byte] >> (7 - bit % 8)) & 1);
     }
-    uint32_t z = state * ((V == 2 && (index & 1)) ? uint32_t(uint64_t(C) * C) : C);
+    uint32_t z = state * (((V == 2 || V == 4) && (index & 1)) ? uint32_t(uint64_t(C) * C) : C);
     int total = 0;
     for (int j = 0; j < 4; ++j) { total += z & 255; z >>= 8; }
     return ((total + 2) >> 2) - 128;
@@ -61,6 +63,9 @@ static void test(std::mt19937 & rng, bool perf) {
         CK(cudaMemcpy(q.data(), dq, q.size(), cudaMemcpyDeviceToHost));
         for (size_t i = 0; i < q.size(); ++i) {
             require(q[i] == reference<B,V,C>(tiles.data() + i / 128 * TB, i % 128), "decoder mismatch");
+            if constexpr (B == 7 && V == 4 && C == AIF175_MUL) {
+                require(q[i] == aif175_level(tiles.data() + i / 128 * TB, i % 128), "1.75 CPU decoder mismatch");
+            }
             if constexpr (B == 5 && V == 2 && C == AIF25_MUL) {
                 require(q[i] == aif25_level(tiles.data() + i / 128 * TB, i % 128), "model CPU decoder mismatch");
             }
@@ -167,7 +172,7 @@ static std::vector<float> backend_product(ggml_backend_t backend, int K, int M, 
     ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
     require(out->ne[0] == M && out->ne[1] == tokens && out->ne[2] == seqs && out->ne[3] == groups, "backend output shape mismatch");
     require(ggml_backend_supports_op(backend, out), "fractional backend dispatch rejected activation shape");
-    if (type == GGML_TYPE_AIF25_U2) {
+    if (type == GGML_TYPE_AIF25_U2 || type == GGML_TYPE_AIF175_U2) {
         require(ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(backend), weight) == w.size(),
                 "fractional U2 allocation uses whole slabs without generic row padding");
     }
@@ -188,22 +193,24 @@ static std::vector<float> backend_product(ggml_backend_t backend, int K, int M, 
 static void test_backend(std::mt19937 & rng) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     require(backend != nullptr, "CUDA backend initialization failed");
-    for (bool wide_k : {false, true}) {
+    for (auto type : {GGML_TYPE_AIF25_U, GGML_TYPE_AIF175_U2}) for (bool wide_k : {false, true}) {
         ggml_context * ctx = ggml_init({ggml_tensor_overhead()*4, nullptr, true});
         require(ctx != nullptr, "shape-only context allocation failed");
-        const int64_t K = wide_k ? int64_t(INT32_MAX)+1 : 128;
+        const int64_t K = wide_k ? int64_t(INT32_MAX)+1 : type == GGML_TYPE_AIF175_U2 ? 512 : 128;
         const int64_t M = wide_k ? 16 : int64_t(INT32_MAX)+1;
-        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_AIF25_U, K, M);
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, type, K, M);
         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
         require(!ggml_backend_supports_op(backend, ggml_mul_mat(ctx, weight, input)), "fractional dispatch narrowed an oversized dimension");
         ggml_free(ctx);
     }
     constexpr int M = 32;
-    for (ggml_type type : {GGML_TYPE_AIF25_U, GGML_TYPE_AIF25_U2}) {
+    for (ggml_type type : {GGML_TYPE_AIF25_U, GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2}) {
+        const bool f175 = type == GGML_TYPE_AIF175_U2;
         const bool row_scale = type == GGML_TYPE_AIF25_U2;
-        const int chunk_k = row_scale ? 640 : 128;
-        const int block_bytes = row_scale ? AIF25_V2_BLOCK_BYTES : AIF25_UNIT_BYTES;
-        for (int K : row_scale ? std::vector<int>{640, 1280, 1920, 5120} : std::vector<int>{128, 256, 6144}) {
+        const int chunk_k = f175 ? 512 : row_scale ? 640 : 128;
+        const int block_bytes = f175 ? AIF175_BLOCK_BYTES : row_scale ? AIF25_V2_BLOCK_BYTES : AIF25_UNIT_BYTES;
+        for (int K : f175 ? std::vector<int>{512, 1024, 4096, 5120, 6144, 17408} :
+                     row_scale ? std::vector<int>{640, 1280, 1920, 5120} : std::vector<int>{128, 256, 6144}) {
             std::vector<uint8_t> w(size_t(M/16)*(K/chunk_k)*block_bytes);
             for (uint8_t & v : w) v = rng();
             for (size_t offset = 0; offset < w.size(); offset += block_bytes) {
@@ -216,7 +223,8 @@ static void test_backend(std::mt19937 & rng) {
             for (int slab = 0; slab < M/16; ++slab) {
                 const uint8_t * src = w.data()+size_t(slab)*(K/chunk_k)*block_bytes;
                 float * dst = decoded.data()+size_t(slab)*16*K;
-                if (row_scale) { aif25_dequantize_slab_v2(src, dst, K); }
+                if (f175) { aif175_dequantize_slab(src, dst, K); }
+                else if (row_scale) { aif25_dequantize_slab_v2(src, dst, K); }
                 else { aif25_dequantize_slab(src, dst, K); }
             }
             for (int tokens : {1, 5}) for (int seqs : {1, 3}) for (int groups : {1, 2}) {
@@ -268,6 +276,8 @@ int main(int argc, char ** argv) {
         test<3,1,0x87D8D12Du>(rng, perf);
     }
     if (!perf) {
+        test<7,4,AIF175_MUL>(rng, false);
+        test<7,4,AIF175_MUL,1>(rng, false);
         test_backend(rng);
         test_large_row_offsets(rng);
     }

@@ -14,7 +14,7 @@ static __device__ __forceinline__ uint32_t level_byte(uint32_t state) {
 
 template<int B, int V, uint32_t C>
 static __device__ __forceinline__ uint32_t fragment(const uint32_t * tile, int row, int half) {
-    static_assert(V == 1 || V == 2, "computed scalar or pair");
+    static_assert(V == 1 || V == 2 || (B == 7 && V == 4), "computed scalar or pair schedule");
     static_assert(4 * B % V == 0 && B * (4 / V - 1) + 16 <= 32, "four weights fit one window");
     constexpr int bits = 128 * B / V, words = tile_words<B, V>;
     int start = B * ((8 * row + 4 * half + 4) / V) - 32;
@@ -24,8 +24,9 @@ static __device__ __forceinline__ uint32_t fragment(const uint32_t * tile, int r
     uint32_t q[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const uint32_t state = (f >> (B * ((3 - j) / V))) & 0xffffu;
-        if constexpr (V == 2) {
+        const int shift = V == 4 ? (j < 2 ? 4 : 0) : B * ((3 - j) / V);
+        const uint32_t state = (f >> shift) & 0xffffu;
+        if constexpr (V == 2 || V == 4) {
             q[j] = (j & 1) ? level_byte<uint32_t(uint64_t(C) * C)>(state) : level_byte<C>(state);
         } else {
             q[j] = level_byte<C>(state);
@@ -41,11 +42,12 @@ static __device__ __forceinline__ void mma(int (&c)[4], const uint32_t (&a)[4], 
 }
 
 // Rotated, quantized activations; per-token scales are indexed by 128-column unit.
-template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false>
+template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false, int SCALE_CHUNKS = 5>
 static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const int8_t * x,
         const float * xs, float * y, int M, int K, int N) {
     static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
-    static_assert(!ROW_SCALE || (B == 5 && V == 2), "row-scale pair layout");
+    static_assert(!ROW_SCALE || (B == 5 && V == 2 && SCALE_CHUNKS == 5) ||
+        (B == 7 && V == 4 && SCALE_CHUNKS == 4), "row-scale pair layout");
     constexpr int UW = unit_bytes<B, V> / 4, TW = tile_words<B, V>;
     __shared__ uint32_t tiles[4][UW];
     __shared__ float partial[4][8][16];
@@ -55,10 +57,10 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
     float sum[4] = {0, 0, 0, 0};
     for (int u = warp; u < nu; u += 4) {
         if constexpr (ROW_SCALE) {
-            constexpr int BW = 8 + 5*(UW - 8);
+            constexpr int BW = 8 + SCALE_CHUNKS*(UW - 8);
             const uint32_t * block = reinterpret_cast<const uint32_t *>(weights) +
-                (int64_t(blockIdx.x)*(nu/5) + u/5)*BW;
-            const uint32_t * payload = block + 8 + (u%5)*(UW - 8);
+                (int64_t(blockIdx.x)*(nu/SCALE_CHUNKS) + u/SCALE_CHUNKS)*BW;
+            const uint32_t * payload = block + 8 + (u%SCALE_CHUNKS)*(UW - 8);
             for (int i = lane; i < UW; i += 32) {
                 tiles[warp][i] = __ldg(i < 8 ? block + i : payload + i - 8);
             }

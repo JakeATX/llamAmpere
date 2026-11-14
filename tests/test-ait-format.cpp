@@ -4,6 +4,8 @@
 #include "ggml-backend.h"
 #include "../ggml/src/ggml-ai4.h"
 #include "ggml-ai4-decode.h"
+#include "../ggml/src/ggml-impl.h"
+#include "../ggml/src/ggml-aif175-encode.h"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -15,12 +17,496 @@ static void require(bool ok, const char * message) {
     ++checks;
     if (!ok) { std::fprintf(stderr, "FAIL %s\n", message); std::exit(1); }
 }
-static gguf_context * fixture(int type) {
+static int allocation_calls = 0;
+static int release_calls = 0;
+static void * deny_allocation(size_t) {
+    ++allocation_calls;
+    return nullptr;
+}
+static void count_release(void * ptr) {
+    require(ptr == nullptr, "denied encoder allocation has no storage to release");
+    ++release_calls;
+}
+static int fail_allocation_at = 0;
+static int live_allocations = 0;
+static void * fail_allocation(size_t size) {
+    if (++allocation_calls == fail_allocation_at) { return nullptr; }
+    void * ptr = std::malloc(size);
+    require(ptr != nullptr, "encoder failure fixture allocates small scratch buffers");
+    ++live_allocations;
+    return ptr;
+}
+static void release_allocation(void * ptr) {
+    ++release_calls;
+    if (ptr) { --live_allocations; }
+    std::free(ptr);
+}
+static void check_aif175_predecessors() {
+    std::vector<float> current(65536);
+    std::vector<float> best(8192+2, -1234.0f);
+    std::vector<uint8_t> trace(8192+2, 0xa5);
+    std::vector<uint8_t> levels(2*65536);
+    aif175_level_map(levels.data());
+    float error0[256], error1[256];
+    for (int level = 0; level < 256; ++level) {
+        error0[level] = (level%13)*0.0625f;
+        error1[level] = (level%17)*0.03125f;
+    }
+    for (int width : {3, 4}) {
+        const int tails = 1 << (16-width), heads = 1 << width;
+        for (int head = 0; head < heads; ++head) {
+            for (int tail = 0; tail < tails; ++tail) {
+                const int winner = (tail*7)%heads;
+                current[head*tails+tail] = tail%11 == 0 ? INFINITY :
+                    head == winner || (tail%7 == 0 && head == (winner+1)%heads) ? 0.0f :
+                    1.0f + ((head+tail)%23)*0.25f;
+                if (head && tail%31 == 0) { current[head*tails+tail] = NAN; }
+                if (head && tail%37 == 0) { current[head*tails+tail] = -INFINITY; }
+                if (head == winner && tail%13 == 0 && tail%11 != 0 && tail%31 != 0 && tail%37 != 0) {
+                    current[head*tails+tail] = -0.0f;
+                }
+            }
+        }
+        const auto full = current;
+        for (int count : {8, 16, 128, 1024, tails/2, tails, 2*tails, 4*tails, 65536}) {
+            for (int first : {0, (32768/count)*count, 65536-count}) {
+                current = full;
+                for (int s = 0; s < first; ++s) { current[s] = INFINITY; }
+                for (int s = first+count; s < 65536; ++s) { current[s] = INFINITY; }
+                const auto unchanged = current;
+                std::fill(best.begin(), best.end(), -1234.0f);
+                std::fill(trace.begin(), trace.end(), 0xa5);
+                aif175_predecessors(current.data(), width, first, count, best.data()+1, trace.data()+1);
+                // Original scalar recurrence is independent of the new loop order.
+                for (int tail = 0; tail < tails; ++tail) {
+                    const int begin = first%tails;
+                    if (count < tails && (tail < begin || tail >= begin+count)) {
+                        require(best[tail+1] == -1234.0f && trace[tail+1] == 0xa5,
+                                "1.75 predecessor leaves inactive tail scratch unchanged");
+                        continue;
+                    }
+                    float expected = current[tail];
+                    int winner_head = 0;
+                    for (int head = 1; head < heads; ++head) {
+                        if (current[head*tails+tail] < expected) {
+                            expected = current[head*tails+tail];
+                            winner_head = head;
+                        }
+                    }
+                    require(std::memcmp(&best[tail+1], &expected, sizeof(float)) == 0,
+                            "1.75 predecessor minimum retains exact signed zero and infinity bits");
+                    require(trace[tail+1] == winner_head, "1.75 predecessor retains first tied head");
+                }
+                require(best[0] == -1234.0f && trace[0] == 0xa5, "1.75 predecessor leading canaries");
+                for (size_t j = tails+1; j < best.size(); ++j) {
+                    require(best[j] == -1234.0f && trace[j] == 0xa5, "1.75 predecessor tail bounds");
+                }
+                if (count == 65536) {
+                    for (int state = 0; state < 65536; ++state) {
+                        const int tail = state >> width;
+                        const float error = (state%37)*0.03125f;
+                        uint8_t last_trace[3] = {0xa5, 0xa5, 0xa5};
+                        const float last = aif175_terminal_cost(current.data(), width, state, error, last_trace+1);
+                        require(last == best[tail+1] + error, "1.75 fixed end matches full scalar state cost");
+                        require(last_trace[1] == trace[tail+1], "1.75 fixed end keeps first ties and infinite heads");
+                        require(last_trace[0] == 0xa5 && last_trace[2] == 0xa5, "1.75 fixed end writes only its trace byte");
+                    }
+                    for (bool infinite : {false, true}) {
+                        std::vector<float> next(65536), all_infinite(infinite ? 65536 : 0, INFINITY);
+                        const float * input = infinite ? all_infinite.data() : current.data();
+                        for (int s = 0; s < 65536; ++s) {
+                            const float error = error0[levels[2*s]] + error1[levels[2*s+1]];
+                            next[s] = infinite ? INFINITY : best[(s >> width)+1] + error;
+                        }
+                        const int last_width = 7-width, last_tails = 1 << (16-last_width);
+                        std::vector<float> second(65536), next_best(last_tails);
+                        std::vector<uint8_t> next_heads(last_tails, 0);
+                        for (int tail = 0; tail < last_tails; ++tail) {
+                            next_best[tail] = next[tail];
+                            for (int head = 1; head < (1 << last_width); ++head) {
+                                if (next[head*last_tails+tail] < next_best[tail]) {
+                                    next_best[tail] = next[head*last_tails+tail]; next_heads[tail] = uint8_t(head);
+                                }
+                            }
+                        }
+                        for (int s = 0; s < 65536; ++s) {
+                            const float error = error1[levels[2*s]] + error0[levels[2*s+1]];
+                            second[s] = next_best[s >> last_width] + error;
+                        }
+                        for (int state : {0, 1, 7, 15, 31, 8191, 32768, 65535}) {
+                            std::vector<uint8_t> saved_trace(8192+2, 0xa5), expected_trace = saved_trace;
+                            const int tail = state >> last_width;
+                            float expected = next[tail];
+                            int winner = 0;
+                            for (int head = 0; head < (1 << last_width); ++head) {
+                                const int s = head*last_tails+tail;
+                                if (next[s] < expected) { expected = next[s]; winner = head; }
+                                expected_trace[(s >> width)+1] = infinite ? 0 : trace[(s >> width)+1];
+                            }
+                            const float error = (state%37)*0.03125f;
+                            uint8_t last_trace[3] = {0xa5, 0xa5, 0xa5};
+                            const float last = aif175_fixed_tail_cost(input, levels.data(), width, state,
+                                                                     error0, error1, error, saved_trace.data()+1, last_trace+1);
+                            require(last == expected + error, "1.75 fixed two-step tail matches full scalar recurrence");
+                            require(last_trace[1] == winner, "1.75 fixed two-step tail retains first tied head");
+                            require(last_trace[0] == 0xa5 && last_trace[2] == 0xa5, "1.75 fixed two-step final trace bounds");
+                            require(saved_trace == expected_trace, "1.75 fixed two-step writes only needed earlier traces");
+                            std::fill(saved_trace.begin(), saved_trace.end(), 0xa5);
+                            std::fill(expected_trace.begin(), expected_trace.end(), 0xa5);
+                            std::vector<uint8_t> middle_trace(8192+2, 0xa5), expected_middle = middle_trace;
+                            const int final_tail = state >> width;
+                            float expected_three = second[final_tail];
+                            int final_winner = 0;
+                            for (int head = 0; head < heads; ++head) {
+                                const int s = head*tails+final_tail;
+                                if (second[s] < expected_three) { expected_three = second[s]; final_winner = head; }
+                                expected_middle[(s >> last_width)+1] = next_heads[s >> last_width];
+                                for (int previous = 0; previous < (1 << last_width); ++previous) {
+                                    const int before = previous*last_tails+(s >> last_width);
+                                    expected_trace[(before >> width)+1] = infinite ? 0 : trace[(before >> width)+1];
+                                }
+                            }
+                            const float three = aif175_fixed_three_cost(input, levels.data(), width, state,
+                                error0, error1, error1, error0, error, saved_trace.data()+1, middle_trace.data()+1, last_trace+1);
+                            require(three == expected_three + error && last_trace[1] == final_winner,
+                                    "1.75 fixed three-step tail matches full scalar costs and tie order");
+                            require(saved_trace == expected_trace && middle_trace == expected_middle && last_trace[0] == 0xa5 && last_trace[2] == 0xa5,
+                                    "1.75 fixed three-step writes only required traces and keeps guards");
+                        }
+                    }
+                }
+                require(std::memcmp(current.data(), unchanged.data(), current.size()*sizeof(float)) == 0,
+                        "1.75 predecessor keeps all input costs unchanged");
+                const auto expected_best = best;
+                const auto expected_trace = trace;
+                for (int s = 0; s < first; ++s) { current[s] = -INFINITY; }
+                for (int s = first+count; s < 65536; ++s) { current[s] = -INFINITY; }
+                const auto poisoned = current;
+                std::fill(best.begin(), best.end(), -1234.0f);
+                std::fill(trace.begin(), trace.end(), 0xa5);
+                aif175_predecessors(current.data(), width, first, count, best.data()+1, trace.data()+1);
+                require(best == expected_best && trace == expected_trace, "1.75 predecessor ignores stale costs outside the live range");
+                require(std::memcmp(current.data(), poisoned.data(), current.size()*sizeof(float)) == 0,
+                        "1.75 predecessor keeps stale costs and NaN source bits unchanged");
+            }
+        }
+    }
+    // These errors round differently when added to the prior one at a time.
+    const float prior = 1e8f, error0_value = 4.01f, error1_value = 4.01f;
+    const float pair_error = error0_value + error1_value;
+    const float expected = prior + pair_error;
+    const float split_first = prior + error0_value;
+    require(split_first + error1_value != expected, "1.75 non-dyadic fixture detects reassociation");
+    std::fill(current.begin(), current.end(), prior);
+    std::fill(error0, error0+256, error0_value);
+    std::fill(error1, error1+256, error1_value);
+    std::fill(best.begin(), best.end(), prior);
+    std::vector<float> costs(65536);
+    for (int width : {3, 4}) {
+        aif175_state_costs(error0, error1, levels.data(), width, 0, 65536, false, best.data(), costs.data());
+        for (float cost : costs) { require(cost == expected, "1.75 state cost keeps paired-error rounding"); }
+        std::fill(trace.begin(), trace.end(), 0xa5);
+        uint8_t last_trace[3] = {0xa5, 0xa5, 0xa5};
+        const float final_error = 0.1f;
+        const float last = aif175_fixed_tail_cost(current.data(), levels.data(), width, 0,
+                                                 error0, error1, final_error, trace.data()+1, last_trace+1);
+        require(last == expected + final_error, "1.75 fixed tail keeps non-dyadic rounding");
+        require(last_trace[1] == 0, "1.75 non-dyadic tail keeps first tied head");
+        require(last_trace[0] == 0xa5 && last_trace[2] == 0xa5 && trace.front() == 0xa5 && trace.back() == 0xa5,
+                "1.75 non-dyadic tail trace canaries");
+        std::vector<uint8_t> middle_trace(8192+2, 0xa5);
+        float three_errors[256];
+        std::fill(three_errors, three_errors+256, 2.005f);
+        const float three_pair = three_errors[0] + three_errors[0];
+        const float first_expected = prior + three_pair;
+        const float second_expected = first_expected + three_pair;
+        require(second_expected != prior + (three_pair+three_pair), "1.75 three-step fixture detects merging step errors");
+        const float three = aif175_fixed_three_cost(current.data(), levels.data(), width, 0,
+            three_errors, three_errors, three_errors, three_errors, final_error, trace.data()+1, middle_trace.data()+1, last_trace+1);
+        require(three == second_expected + final_error && last_trace[1] == 0, "1.75 three-step tail keeps paired rounding and first ties");
+        require(middle_trace.front() == 0xa5 && middle_trace.back() == 0xa5 && trace.front() == 0xa5 && trace.back() == 0xa5 &&
+                last_trace[0] == 0xa5 && last_trace[2] == 0xa5, "1.75 three-step rounded tail trace guards");
+    }
+}
+static void check_aif175_trace_bounds() {
+    require(AIF175_TRACE_BYTES == 393216, "1.75 trace holds 32 steps of each width");
+    struct guarded_workspace { uint32_t before; aif175_workspace data; uint32_t after; };
+    std::vector<guarded_workspace> storage(1);
+    auto & workspace = storage[0];
+    workspace.before = workspace.after = 0x76543210;
+    uint8_t * levels = workspace.data.levels;
+    aif175_level_map(levels);
+    std::vector<uint8_t> unchanged_levels(levels, levels+2*65536);
+    const std::vector<float> unchanged_rotated(16*512, -1234.0f);
+    std::memcpy(workspace.data.rotated, unchanged_rotated.data(), sizeof(workspace.data.rotated));
+    float * costs = workspace.data.costs;
+    float * best = workspace.data.best;
+    aif175_errors * tables = workspace.data.tables;
+    std::vector<uint8_t> trace(393216+2, 0xa5);
+    float target[128], metric[128];
+    for (int j = 0; j < 128; ++j) { target[j] = -128; metric[j] = 1; }
+    for (int p = 0; p < 64; ++p) { aif175_error_tables(target + 2*p, metric + 2*p, tables[p].values); }
+    std::vector<aif175_errors> unchanged_tables(tables, tables+64);
+    for (int offset : {0, 31}) {
+        uint16_t path[66];
+        for (int j = 0; j < 66; ++j) { path[j] = 0xbeef; }
+        std::fill(trace.begin(), trace.end(), 0xa5);
+        std::fill(costs, costs+65536, NAN);
+        std::fill(best, best+8192, NAN);
+        // State zero has exactly zero error; every other cost is nonnegative.
+        require(aif175_path(target, metric, tables, levels, offset, offset ? -1 : 0,
+                            costs, best, trace.data()+1, path+1), "1.75 bounded trace finds the zero-cost ring");
+        require(std::memcmp(levels, unchanged_levels.data(), sizeof(workspace.data.levels)) == 0 &&
+                std::memcmp(workspace.data.rotated, unchanged_rotated.data(), sizeof(workspace.data.rotated)) == 0,
+                "1.75 zero ring preserves adjacent levels and rotated weights");
+        require(std::memcmp(tables, unchanged_tables.data(), sizeof(workspace.data.tables)) == 0,
+                "1.75 zero ring does not overwrite adjacent cached tables");
+        require(workspace.before == 0x76543210 && workspace.after == 0x76543210, "1.75 zero ring keeps workspace guards");
+        require(trace.front() == 0xa5 && trace.back() == 0xa5, "1.75 both trace parities keep byte guards");
+        require(path[0] == 0xbeef && path[65] == 0xbeef, "1.75 bounded traceback keeps state guards");
+        for (int p = 1; p <= 64; ++p) { require(path[p] == 0, "1.75 bounded traceback keeps known optimal states"); }
+    }
+    // A one-to-one test map gives each pair one zero-cost state in a nonzero ring.
+    uint8_t tile[28];
+    uint32_t rng = 229;
+    for (auto & byte : tile) { rng = rng*1664525u+1013904223u; byte = uint8_t(rng >> 24); }
+    uint16_t expected[64];
+    for (int p = 0; p < 64; ++p) {
+        const int end = 7*(p/2)+(p%2 ? 7 : 3);
+        uint16_t state = 0;
+        for (int b = end-16; b < end; ++b) {
+            const int bit = (b+224)%224;
+            const int byte = bit/32*4+3-bit%32/8;
+            state = uint16_t((state << 1) | ((tile[byte] >> (7-bit%8)) & 1));
+        }
+        expected[p] = state;
+        target[2*p] = int(state >> 8)-128;
+        target[2*p+1] = int(state & 255)-128;
+        metric[2*p] = 1; metric[2*p+1] = 0.25f;
+    }
+    for (int s = 0; s < 65536; ++s) { levels[2*s] = uint8_t(s >> 8); levels[2*s+1] = uint8_t(s); }
+    unchanged_levels.assign(levels, levels+2*65536);
+    for (int p = 0; p < 64; ++p) { aif175_error_tables(target + 2*p, metric + 2*p, tables[p].values); }
+    unchanged_tables.assign(tables, tables+64);
+    uint8_t * owned_trace = workspace.data.trace;
+    for (int offset : {0, 31}) {
+        for (bool fixed : {false, true}) {
+            uint16_t path[66];
+            for (auto & state : path) { state = 0xbeef; }
+            std::fill(costs, costs+65536, NAN);
+            std::fill(best, best+8192, NAN);
+            std::memset(owned_trace, 0xa5, sizeof(workspace.data.trace));
+            const int boundary = fixed ? expected[(offset+63)%64] : -1;
+            require(aif175_path(target, metric, tables, levels, offset, boundary,
+                                costs, best, owned_trace, path+1), "1.75 nonzero ring is reachable for both start parities");
+            require(std::memcmp(levels, unchanged_levels.data(), sizeof(workspace.data.levels)) == 0 &&
+                    std::memcmp(workspace.data.rotated, unchanged_rotated.data(), sizeof(workspace.data.rotated)) == 0,
+                    "1.75 nonzero ring preserves adjacent levels and rotated weights");
+            require(std::memcmp(tables, unchanged_tables.data(), sizeof(workspace.data.tables)) == 0,
+                    "1.75 nonzero ring reuses adjacent read-only tables across both boundaries and offsets");
+            require(workspace.before == 0x76543210 && workspace.after == 0x76543210, "1.75 nonzero ring keeps workspace guards");
+            require(std::memcmp(path+1, expected, sizeof(expected)) == 0, "1.75 traceback finds each unique nonzero optimal state");
+            require(path[0] == 0xbeef && path[65] == 0xbeef, "1.75 nonzero traceback keeps state guards");
+            uint8_t packed[28];
+            require(aif175_pack(path+1, packed) && std::memcmp(packed, tile, sizeof(tile)) == 0,
+                    "1.75 nonzero optimal ring keeps independent literal bytes");
+        }
+    }
+}
+static void check_aif175_errors() {
+    std::vector<uint8_t> guarded_levels(2*65536+2, 0xa5);
+    uint8_t * levels = guarded_levels.data()+1;
+    const double rms = aif175_level_map(levels);
+    double square_sum = 0;
+    for (uint32_t state = 0; state < 65536; ++state) {
+        for (int odd = 0; odd < 2; ++odd) {
+            const uint32_t c = odd ? uint32_t(uint64_t(0x87D8D12Du)*0x87D8D12Du) : 0x87D8D12Du;
+            const uint32_t z = state*c;
+            const unsigned sum = (z & 255)+((z >> 8) & 255)+((z >> 16) & 255)+(z >> 24);
+            const int level = int((sum+2)/4)-128;
+            require(levels[2*state+odd] == level+128, "1.75 production map matches independent MAGIC2 bytes");
+            if (!odd) { square_sum += double(level)*level; }
+        }
+    }
+    require(rms == std::sqrt(square_sum/65536), "1.75 production map keeps level RMS");
+    require(guarded_levels.front() == 0xa5 && guarded_levels.back() == 0xa5, "1.75 production map bounds");
+    const auto unchanged_levels = guarded_levels;
+    const float targets[8][2] = {{0, 0}, {-1.125f, 53.75f}, {149.5f, -217.25f},
+                                {0.1f, -17.3f}, {127.0001f, -127.9999f}, {-0.000031f, 0.000071f}, {-0.0f, 0}, {0, -0.0f}};
+    const float metrics[8][2] = {{0, 1}, {0.125f, 0.75f}, {1, 1.0f/65536},
+                                {0.13f, 0.59f}, {0.3333333f, 0.000017f}, {1e-20f, 0.97f}, {0, -0.0f}, {-0.0f, -0.0f}};
+    for (int test = 0; test < 8; ++test) {
+        struct { float before; float tables[2][256]; float after; } guarded;
+        guarded.before = guarded.after = -1234.0f;
+        aif175_error_tables(targets[test], metrics[test], guarded.tables);
+        for (uint32_t state = 0; state < 65536; ++state) {
+            float scalar[2];
+            unsigned index[2];
+            double exact_pair = 0;
+            for (int odd = 0; odd < 2; ++odd) {
+                index[odd] = levels[2*state+odd];
+                const float delta = float(int(index[odd])-128) - targets[test][odd];
+                scalar[odd] = (delta*delta)*metrics[test][odd];
+                require(test >= 3 || guarded.tables[odd][index[odd]] == scalar[odd], "1.75 table matches scalar error for every dyadic state");
+                const double exact_delta = double(int(index[odd])-128) - double(targets[test][odd]);
+                const double exact = exact_delta*exact_delta*double(metrics[test][odd]);
+                exact_pair += exact;
+                require(std::isfinite(guarded.tables[odd][index[odd]]) &&
+                        std::fabs(double(guarded.tables[odd][index[odd]])-exact) <= 2e-6*exact+1e-38,
+                        "1.75 production map error stays within float budget against double oracle");
+            }
+            const float pair = guarded.tables[0][index[0]]+guarded.tables[1][index[1]];
+            require(test >= 3 || pair == scalar[0]+scalar[1],
+                    "1.75 table preserves paired error with zero and unequal metrics");
+            require(std::fabs(double(pair)-exact_pair) <= 3e-6*exact_pair+1e-38,
+                    "1.75 paired production lookup stays within float budget against double oracle");
+        }
+        require(guarded.before == -1234.0f && guarded.after == -1234.0f, "1.75 error table canaries");
+        std::vector<float> costs(65536+2), best(8192);
+        for (int width : {3, 4}) {
+            for (int tail = 0; tail < (65536 >> width); ++tail) {
+                best[tail] = tail%11 == 0 ? INFINITY : (tail%37)*0.25f;
+            }
+            best[1] = -0.0f; best[2] = -INFINITY;
+            const auto unchanged_best = best;
+            for (int count : {1 << width, 128, 1024, 8192, 65536}) {
+                for (int first : {0, (32768/count)*count, 65536-count}) {
+                    for (bool initial : {false, true}) {
+                        std::fill(costs.begin(), costs.end(), -1234.0f);
+                        aif175_state_costs(guarded.tables[0], guarded.tables[1], levels, width, first, count,
+                                          test == 6, initial ? nullptr : best.data(), costs.data()+1);
+                        for (int s = 0; s < 65536; ++s) {
+                            float expected = -1234.0f;
+                            if (s >= first && s < first+count) {
+                                const float error = guarded.tables[0][levels[2*s]] + guarded.tables[1][levels[2*s+1]];
+                                expected = initial ? error : best[s >> width] + error;
+                            }
+                            require(std::memcmp(&costs[s+1], &expected, sizeof(float)) == 0,
+                                    "1.75 grouped and padded state costs match scalar bits in live range");
+                        }
+                        require(costs.front() == -1234.0f && costs.back() == -1234.0f, "1.75 grouped state cost guards");
+                        require(best == unchanged_best, "1.75 grouped state costs leave prior minima unchanged");
+                    }
+                }
+            }
+        }
+    }
+    require(guarded_levels == unchanged_levels, "1.75 error lookup leaves production map and guards unchanged");
+    for (float target : {0.0f, -0.0f, 1.0f, 0x1.fffffep127f}) {
+        for (float metric : {0.0f, -0.0f}) {
+            const float pair_target[2] = {target, -target}, pair_metric[2] = {metric, -metric};
+            struct { float before; float tables[2][256]; float after; } guarded;
+            guarded.before = guarded.after = -1234.0f;
+            aif175_error_tables(pair_target, pair_metric, guarded.tables);
+            for (int j = 0; j < 2; ++j) {
+                for (int level = 0; level < 256; ++level) {
+                    const float delta = float(level-128) - pair_target[j];
+                    const float expected = (delta*delta)*pair_metric[j];
+                    const float actual = guarded.tables[j][level];
+                    require(std::isnan(expected) ? std::isnan(actual) : std::memcmp(&actual, &expected, sizeof(float)) == 0,
+                            "1.75 zero metric tables keep scalar signed zeros and overflowing nonzero targets");
+                }
+            }
+            require(guarded.before == -1234.0f && guarded.after == -1234.0f, "1.75 zero metric table bounds");
+        }
+    }
+}
+static void check_aif175_windows() {
+    uint8_t storage[28+4];
+    for (int alignment = 0; alignment < 4; ++alignment) {
+        uint8_t * tile = storage + alignment;
+        // Every stream bit, and its complement, test each wrap and word split.
+        for (int pattern = -2; pattern < 2*224; ++pattern) {
+            std::memset(storage, 0xa5, sizeof(storage));
+            std::memset(tile, pattern == -1 || pattern >= 224 ? 255 : 0, 28);
+            if (pattern >= 0) {
+                const int bit = pattern%224;
+                tile[4*(bit/32)+3-(bit%32)/8] ^= uint8_t(1u << (7-bit%8));
+            }
+            const std::vector<uint8_t> before(storage, storage+sizeof(storage));
+            uint16_t path[64];
+            for (int pair = 0; pair < 64; ++pair) {
+                const int end = 7*(pair/2) + (pair%2 ? 7 : 3);
+                uint32_t expected = 0;
+                for (int j = end-16; j < end; ++j) {
+                    const int bit = (j+224)%224;
+                    expected = 2*expected + ((tile[4*(bit/32)+3-(bit%32)/8] >> (7-bit%8)) & 1);
+                }
+                path[pair] = uint16_t(expected);
+                require(aif175_state(tile, pair) == expected, "1.75 word window matches every single-bit basis");
+                for (int odd = 0; odd < 2; ++odd) {
+                    const uint32_t c = odd ? uint32_t(uint64_t(0x87D8D12Du)*0x87D8D12Du) : 0x87D8D12Du;
+                    const uint32_t z = expected*c;
+                    const int sum = int(z & 255)+int((z >> 8) & 255)+int((z >> 16) & 255)+int(z >> 24);
+                    require(aif175_level(tile, 2*pair+odd) == (sum+2)/4-128, "1.75 word window keeps both decoded levels");
+                }
+            }
+            for (int pair = 0; pair < 64; pair += 2) {
+                const uint32_t expected = (uint32_t(path[pair]) << 4) | (path[pair+1] & 15u);
+                const uint32_t states = aif175_state_pair(tile, pair);
+                require(states == expected, "1.75 paired window matches independent stream bits");
+                require((states >> 4) == path[pair] && (states & 0xffffu) == path[pair+1],
+                        "1.75 paired window retains both complete states");
+            }
+            uint8_t packed[28+2];
+            std::memset(packed, 0xa5, sizeof(packed));
+            const std::vector<uint16_t> path_before(path, path+64);
+            require(aif175_pack(path, packed+1), "1.75 pack accepts independent closed bit paths");
+            require(std::memcmp(packed+1, tile, 28) == 0, "1.75 packing retains independent literal tile bytes");
+            require(packed[0] == 0xa5 && packed[29] == 0xa5, "1.75 packing keeps unaligned output guards");
+            require(std::memcmp(path, path_before.data(), sizeof(path)) == 0, "1.75 packing keeps input states unchanged");
+            for (int b = 0; b < 28; ++b) { packed[b+1] = uint8_t(~tile[b]); }
+            const std::vector<uint8_t> packed_before(packed, packed+sizeof(packed));
+            if (alignment == 0 && (pattern == -2 || pattern == -1 || pattern == 121)) {
+                for (int offset : {0, 1, 31, 65, 100}) {
+                    uint16_t shared[64+16];
+                    std::memset(shared, 0xa5, sizeof(shared));
+                    std::memcpy(shared+1, path, sizeof(path));
+                    const auto * raw = reinterpret_cast<const uint8_t *>(shared);
+                    const std::vector<uint8_t> shared_before(raw, raw+sizeof(shared));
+                    auto * dst = reinterpret_cast<uint8_t *>(shared+1)+offset;
+                    require(aif175_pack(shared+1, dst), "1.75 pair pack reads all states before overlapping writes");
+                    require(std::memcmp(dst, tile, 28) == 0, "1.75 overlapping pair pack retains literal bytes");
+                    for (size_t j = 0; j < sizeof(shared); ++j) {
+                        if (raw+j < dst || raw+j >= dst+28) {
+                            require(raw[j] == shared_before[j], "1.75 overlapping pack writes only its output span");
+                        }
+                    }
+                    std::memcpy(shared+1, path, sizeof(path));
+                    shared[64] ^= 0x8000;
+                    const std::vector<uint8_t> invalid_shared(raw, raw+sizeof(shared));
+                    require(!aif175_pack(shared+1, dst), "1.75 overlapping pack rejects a broken final link");
+                    require(std::memcmp(shared, invalid_shared.data(), sizeof(shared)) == 0,
+                            "1.75 rejected overlapping pack keeps every source and destination byte");
+                }
+                for (int pair = 0; pair < 64; ++pair) {
+                    for (int bit = 0; bit < 16; ++bit) {
+                        path[pair] ^= uint16_t(1u << bit);
+                        const std::vector<uint16_t> invalid_before(path, path+64);
+                        require(!aif175_pack(path, packed+1), "1.75 pack rejects each changed state bit at both widths and wrap");
+                        require(std::memcmp(packed, packed_before.data(), sizeof(packed)) == 0,
+                                "1.75 every rejected state bit keeps output and canaries");
+                        require(std::memcmp(path, invalid_before.data(), sizeof(path)) == 0,
+                                "1.75 path check keeps rejected states unchanged");
+                        path[pair] ^= uint16_t(1u << bit);
+                    }
+                }
+                require(std::memcmp(path, path_before.data(), sizeof(path)) == 0, "1.75 corruption fixture restores independent closed states");
+            }
+            // High state bits are not emitted symbols, so this breaks only closure.
+            path[(pattern+2)%64] ^= 0x8000;
+            require(!aif175_pack(path, packed+1), "1.75 pack rejects an open path at every pair");
+            require(std::memcmp(packed, packed_before.data(), sizeof(packed)) == 0, "1.75 rejected path leaves output and guards unchanged");
+            require(std::memcmp(storage, before.data(), sizeof(storage)) == 0, "1.75 window leaves tile and guards unchanged");
+        }
+    }
+}
+static gguf_context * fixture(int type, int64_t K = 1024, int64_t M = 1024, int64_t n2 = 1, int64_t n3 = 1) {
     auto * meta = gguf_init_empty();
     if (type >= 0) {
         ggml_init_params params = {ggml_tensor_overhead(), nullptr, true};
         auto * ctx = ggml_init(params);
-        auto * tensor = ggml_new_tensor_2d(ctx, (ggml_type) type, 1024, 1024);
+        auto * tensor = ggml_new_tensor_4d(ctx, (ggml_type) type, K, M, n2, n3);
         ggml_set_name(tensor, "test.weight");
         gguf_add_tensor(meta, tensor);
         ggml_free(ctx);
@@ -39,6 +525,10 @@ static void stamp(gguf_context * meta) {
     gguf_set_val_str(meta, AIT2P_HASH_KEY, "quadratic20-table1024-v1");
 }
 int main() {
+    check_aif175_predecessors();
+    check_aif175_trace_bounds();
+    check_aif175_errors();
+    check_aif175_windows();
     const uint32_t multipliers[3] = {0xC3CCD12Du, 0x87D8D12Du, 0xAA73876Bu};
     const char * keys[3] = {"ait.multiplier.110", "ait.multiplier.111", "ait.multiplier.112"};
     for (int k = 2; k <= 4; ++k) {
@@ -147,32 +637,35 @@ int main() {
         ggml_backend_load_all();
         auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         require(cpu != nullptr, "CPU backend available for support checks");
-        auto * ctx = ggml_init({32*ggml_tensor_overhead(), nullptr, true});
+        auto * ctx = ggml_init({64*ggml_tensor_overhead(), nullptr, true});
         require(ctx != nullptr, "CPU support-check context");
-        auto * packed = ggml_new_tensor_2d(ctx, GGML_TYPE_AIF25_U2, 640, 16);
-        auto * plain = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 640, 16);
-        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 16);
-        require(!ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, plain, GGML_TYPE_AIF25_U2)),
-                "CPU refuses cast into fractional U2");
-        require(!ggml_backend_dev_supports_op(cpu, ggml_cpy(ctx, plain, packed)),
-                "CPU refuses copy into fractional U2");
-        require(!ggml_backend_dev_supports_op(cpu, ggml_set_rows(ctx, packed, plain, ids)),
-                "CPU refuses fractional U2 row destination");
-        require(!ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, packed, GGML_TYPE_F32)),
-                "CPU refuses cast from fractional U2");
-        require(!ggml_backend_dev_supports_op(cpu, ggml_mul_mat(ctx, packed, plain)),
-                "CPU refuses fractional U2 matrix product");
-        require(ggml_backend_dev_supports_op(cpu, packed), "CPU accepts fractional U2 leaf metadata");
-        auto * view = ggml_view_2d(ctx, packed, 640, 16, packed->nb[1], 0);
-        require(view->op == GGML_OP_VIEW, "CPU support check uses a real view operation");
-        require(ggml_backend_dev_supports_op(cpu, view),
-                "CPU accepts fractional U2 view metadata");
-        require(ggml_backend_dev_supports_op(cpu, ggml_reshape_2d(ctx, packed, 640, 16)),
-                "CPU accepts fractional U2 reshape metadata");
-        require(ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, plain, GGML_TYPE_F16)),
-                "CPU still accepts ordinary casts");
-        require(ggml_backend_dev_supports_op(cpu, ggml_set_rows(ctx, plain, plain, ids)),
-                "CPU still accepts ordinary row destinations");
+        for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2}) {
+            const int K = type == GGML_TYPE_AIF175_U2 ? 512 : 640;
+            auto * packed = ggml_new_tensor_2d(ctx, type, K, 16);
+            auto * plain = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 16);
+            auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 16);
+            require(!ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, plain, type)),
+                    "CPU refuses cast into fractional U2");
+            require(!ggml_backend_dev_supports_op(cpu, ggml_cpy(ctx, plain, packed)),
+                    "CPU refuses copy into fractional U2");
+            require(!ggml_backend_dev_supports_op(cpu, ggml_set_rows(ctx, packed, plain, ids)),
+                    "CPU refuses fractional U2 row destination");
+            require(!ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, packed, GGML_TYPE_F32)),
+                    "CPU refuses cast from fractional U2");
+            require(!ggml_backend_dev_supports_op(cpu, ggml_mul_mat(ctx, packed, plain)),
+                    "CPU refuses fractional U2 matrix product");
+            require(ggml_backend_dev_supports_op(cpu, packed), "CPU accepts fractional U2 leaf metadata");
+            auto * view = ggml_view_2d(ctx, packed, K, 16, packed->nb[1], 0);
+            require(view->op == GGML_OP_VIEW, "CPU support check uses a real view operation");
+            require(ggml_backend_dev_supports_op(cpu, view),
+                    "CPU accepts fractional U2 view metadata");
+            require(ggml_backend_dev_supports_op(cpu, ggml_reshape_2d(ctx, packed, K, 16)),
+                    "CPU accepts fractional U2 reshape metadata");
+            require(ggml_backend_dev_supports_op(cpu, ggml_cast(ctx, plain, GGML_TYPE_F16)),
+                    "CPU still accepts ordinary casts");
+            require(ggml_backend_dev_supports_op(cpu, ggml_set_rows(ctx, plain, plain, ids)),
+                    "CPU still accepts ordinary row destinations");
+        }
         ggml_free(ctx);
     }
     for (int K : {640, 1280, 1920, 5120}) {
@@ -201,6 +694,311 @@ int main() {
                 "fractional U2 public slab decoder");
         require(std::memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0,
                 "fractional U2 matches expanded independent scale headers exactly");
+    }
+    {
+        auto * meta = fixture(GGML_TYPE_AIF175_U2);
+        require(llama_ait_format_error(meta) != nullptr, "1.75 missing contract rejected");
+        gguf_set_val_u32(meta, "ait.fractional.175.contract", 1);
+        require(llama_ait_format_error(meta) != nullptr, "1.75 mistyped contract rejected");
+        gguf_set_val_str(meta, "ait.fractional.175.contract", "wrong");
+        require(llama_ait_format_error(meta) != nullptr, "1.75 wrong contract rejected");
+        gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT);
+        require(llama_ait_format_error(meta) == nullptr, "1.75 versioned contract accepted");
+        gguf_free(meta);
+    }
+    for (int64_t M : {1, 15, 17, 31, 1025}) {
+        auto * meta = fixture(GGML_TYPE_AIF175_U2, 512, M);
+        gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT);
+        require(llama_ait_format_error(meta) != nullptr, "1.75 rejects partial stored row slabs");
+        gguf_free(meta);
+    }
+    for (int K : {512, 1024, 4096, 5120, 6144, 17408}) {
+        for (int M : {16, 32, 4096}) {
+            auto * meta = fixture(GGML_TYPE_AIF175_U2, K, M);
+            gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT);
+            require(llama_ait_format_error(meta) == nullptr, "1.75 accepts complete stored row slabs");
+            gguf_free(meta);
+        }
+    }
+    const int64_t shapes[][4] = {
+        {512, 16, 2, 1}, {512, 16, 1, 2},
+        {int64_t(INT32_MAX)+1, 16, 1, 1}, {512, int64_t(INT32_MAX)+1, 1, 1},
+    };
+    for (const auto & shape : shapes) {
+        auto * meta = fixture(GGML_TYPE_AIF175_U2, shape[0], shape[1], shape[2], shape[3]);
+        gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT);
+        require(llama_ait_format_error(meta) != nullptr, "1.75 rejects batched or oversized stored matrices");
+        gguf_free(meta);
+    }
+    require(ggml_row_size(GGML_TYPE_AIF175_U2, 512) == 114, "1.75 stored row bytes");
+    require(ggml_ai4_rate(GGML_TYPE_AIF175_U2) == 0, "1.75 avoids integer-rate dispatch");
+    for (int K : {512, 1024, 4096, 5120, 6144, 17408}) {
+        const size_t sb = (K/512)*AIF175_BLOCK_BYTES;
+        std::vector<uint8_t> packed(2*sb + 1);
+        uint32_t state = 7300;
+        for (auto & b : packed) { state = state*1664525u + 1013904223u; b = state >> 24; }
+        uint8_t * src = packed.data() + 1 + sb;
+        for (int block = 0; block < K/512; ++block) {
+            for (int r = 0; r < 16; ++r) {
+                const uint16_t scale = r == 7 ? 0 : r == 8 ? 0x8000 : r == 9 ? 0xb800 :
+                    r == 10 ? 0x0001 : r == 11 ? 0x03ff : 0x2800 + 16*block + r;
+                src[block*AIF175_BLOCK_BYTES + 2*r] = uint8_t(scale);
+                src[block*AIF175_BLOCK_BYTES + 2*r+1] = uint8_t(scale >> 8);
+            }
+        }
+        const auto before = packed;
+        std::vector<float> expected(16*K), actual(16*K+2, 123.0f);
+        for (int r = 0; r < 16; ++r) {
+            for (int k = 0; k < K; ++k) {
+                const uint8_t * block = src + (k/512)*AIF175_BLOCK_BYTES;
+                const uint8_t * tile = block + 32 + ((k%512)/128)*448 + ((k%128)/8)*28;
+                const int n = 8*r + k%8, p = n/2;
+                const int end = (p/2)*7 + (p%2 ? 7 : 3);
+                uint32_t bits = 0;
+                for (int j = end-16; j < end; ++j) {
+                    const int bit = (j + 224)%224;
+                    const int byte = bit/32*4+3-bit%32/8;
+                    bits = (bits << 1) | ((tile[byte] >> (7-bit%8)) & 1);
+                }
+                const uint32_t C = n%2 ? uint32_t(uint64_t(AIF175_MUL)*AIF175_MUL) : AIF175_MUL;
+                const uint32_t z = bits*C;
+                int sum = 0;
+                for (int j = 0; j < 4; ++j) { sum += (z >> (8*j)) & 255; }
+                const int level = ((sum + 2) >> 2) - 128;
+                require(aif175_level(tile, n) == level, "1.75 independent bit window and level");
+                const uint16_t h = uint16_t(block[2*r]) | (uint16_t(block[2*r+1]) << 8);
+                expected[r*K + k] = ai4_fp16_to_fp32(h)*level;
+            }
+            for (int k = 0; k < K; k += 256) { ai4_unrotate_n(expected.data() + r*K + k, 256); }
+        }
+        require(ggml_ai4_slab_nbytes(GGML_TYPE_AIF175_U2, K) == sb, "1.75 whole slab size");
+        require(ggml_ai4_dequantize_slab(GGML_TYPE_AIF175_U2, packed.data()+1, K, 1, actual.data()+1),
+                "1.75 unaligned later-slab public decode");
+        require(std::memcmp(expected.data(), actual.data()+1, expected.size()*sizeof(float)) == 0,
+                "1.75 exact independent row-scale decode");
+        require(actual.front() == 123.0f && actual.back() == 123.0f && packed == before,
+                "1.75 canaries and packed input unchanged");
+        const auto unchanged = actual;
+        require(!ggml_ai4_dequantize_slab(GGML_TYPE_AIF175_U2, packed.data(), K, -1, actual.data()),
+                "1.75 rejects negative slab");
+        require(actual == unchanged, "1.75 negative slab preserves output");
+        require(!ggml_ai4_dequantize_slab(GGML_TYPE_AIF175_U2, nullptr, K, 0, actual.data()),
+                "1.75 rejects null input");
+        require(actual == unchanged, "1.75 null input preserves output");
+        const int64_t overflow_slab = int64_t(SIZE_MAX/sb);
+        require(!ggml_ai4_dequantize_slab(GGML_TYPE_AIF175_U2, packed.data(), K, overflow_slab, actual.data()),
+                "1.75 rejects a slab whose start fits but end overflows");
+        require(!ggml_ai4_dequantize_slab(GGML_TYPE_AIF175_U2, packed.data(), K, 0, nullptr),
+                "1.75 rejects null output");
+        require(actual == unchanged && packed == before, "1.75 rejected decode changes no input or output");
+        require(actual.front() == 123.0f, "1.75 rejected decode writes nothing");
+    }
+    for (int64_t K : {int64_t(0), int64_t(-512), int64_t(128), int64_t(640), INT64_MAX}) {
+        require(ggml_ai4_slab_nbytes(GGML_TYPE_AIF175_U2, K) == 0, "1.75 rejects partial or invalid widths");
+    }
+    for (int K : {512, 6144}) {
+        std::vector<float> zero(16*K);
+        std::vector<uint8_t> bytes(ggml_ai4_slab_nbytes(GGML_TYPE_AIF175_U2, K)+2, 0x5a);
+        for (size_t i = 1; i < zero.size(); i += 2) { zero[i] = -0.0f; }
+        const auto zero_before = zero;
+        allocation_calls = release_calls = 0;
+        require(aif175_quantize_slab_impl(zero.data(), K, bytes.data()+1, bytes.size()-2,
+                deny_allocation, count_release), "1.75 zero slab needs no trellis allocation");
+        require(allocation_calls == 0 && release_calls == 0, "1.75 zero slab skips all scratch allocation and cleanup");
+        require(std::memcmp(zero.data(), zero_before.data(), zero.size()*sizeof(float)) == 0,
+                "1.75 zero slab preserves source signed zeros");
+        require(bytes.front() == 0x5a && bytes.back() == 0x5a, "1.75 zero fast path output canaries");
+        for (size_t i = 1; i+1 < bytes.size(); ++i) { require(bytes[i] == 0, "1.75 zero fast path canonical bytes"); }
+        std::fill(bytes.begin()+1, bytes.end()-1, 0x5a);
+        require(ggml_aif175_quantize_slab(zero.data(), K, bytes.data()+1, bytes.size()-2), "1.75 native zero encode");
+        require(bytes.front() == 0x5a && bytes.back() == 0x5a, "1.75 encoder output canaries");
+        for (size_t i = 1; i+1 < bytes.size(); ++i) { require(bytes[i] == 0, "1.75 canonical zero payload"); }
+        std::fill(bytes.begin()+1, bytes.end()-1, 0xa7);
+        const auto before = bytes;
+        zero.back() = 1.0f;
+        const auto trailing_before = zero;
+        allocation_calls = release_calls = 0;
+        require(!aif175_quantize_slab_impl(zero.data(), K, bytes.data()+1, bytes.size()-2,
+                deny_allocation, count_release), "1.75 trailing finite nonzero enters ordinary encoder");
+        require(allocation_calls == 1 && release_calls == 1 && bytes == before,
+                "1.75 trailing nonzero cannot take the zero fast path");
+        require(std::memcmp(zero.data(), trailing_before.data(), zero.size()*sizeof(float)) == 0,
+                "1.75 trailing nonzero failure keeps source bytes");
+        zero.back() = 0.0f;
+        for (size_t index : {size_t(0), zero.size()/2, zero.size()-1}) {
+            for (float invalid : {INFINITY, -INFINITY, NAN}) {
+                // A nonzero first block must not hide a bad weight in a later block.
+                zero[0] = 1.0f;
+                zero[index] = invalid;
+                const auto invalid_before = zero;
+                allocation_calls = release_calls = 0;
+                require(!aif175_quantize_slab_impl(zero.data(), K, bytes.data()+1, bytes.size()-2,
+                        deny_allocation, count_release), "1.75 rejects nonfinite weights before trellis allocation");
+                require(allocation_calls == 0 && release_calls == 0, "1.75 invalid input needs no scratch or cleanup");
+                require(bytes == before && std::memcmp(zero.data(), invalid_before.data(), zero.size()*sizeof(float)) == 0,
+                        "1.75 nonfinite preflight preserves source and output bytes");
+                zero[index] = 0.0f;
+                zero[0] = 0.0f;
+            }
+        }
+        zero[3] = INFINITY;
+        require(!ggml_aif175_quantize_slab(zero.data(), K, bytes.data()+1, bytes.size()-2), "1.75 rejects nonfinite encode");
+        require(bytes == before, "1.75 infinite encode leaves bytes unchanged");
+        zero[3] = NAN;
+        require(!ggml_aif175_quantize_slab(zero.data(), K, bytes.data()+1, bytes.size()-2), "1.75 rejects NaN encode");
+        require(bytes == before, "1.75 NaN encode leaves bytes unchanged");
+        zero[3] = 0;
+        require(!ggml_aif175_quantize_slab(nullptr, K, bytes.data()+1, bytes.size()-2), "1.75 rejects null encode input");
+        require(!ggml_aif175_quantize_slab(zero.data(), K, nullptr, bytes.size()-2), "1.75 rejects null encode output");
+        require(!ggml_aif175_quantize_slab(zero.data(), K, bytes.data()+1, bytes.size()-3), "1.75 rejects short encode output");
+        require(!ggml_aif175_quantize_slab(zero.data(), K, bytes.data()+1, bytes.size()-1), "1.75 rejects long encode output");
+        require(!ggml_aif175_quantize_slab(zero.data(), K-1, bytes.data()+1, bytes.size()-2), "1.75 rejects partial encode width");
+        for (int64_t invalid : {int64_t(0), int64_t(-512), INT64_MAX}) {
+            require(!ggml_aif175_quantize_slab(zero.data(), invalid, bytes.data()+1, bytes.size()-2), "1.75 rejects invalid encode dimensions");
+        }
+        require(bytes == before, "1.75 failed encode leaves all bytes unchanged");
+        std::fill(zero.begin(), zero.end(), 1e30f);
+        require(!ggml_aif175_quantize_slab(zero.data(), K, bytes.data()+1, bytes.size()-2), "1.75 rejects finite FP16 scale overflow");
+        require(bytes == before, "1.75 scale overflow leaves bytes unchanged");
+    }
+    {
+        constexpr int K = 1024;
+        std::vector<float> src(16*K), decoded(16*K);
+        uint32_t rng = 7300;
+        for (int r = 0; r < 16; ++r) {
+            for (int k = 0; k < K; ++k) {
+                rng = rng*1664525u + 1013904223u;
+                const bool zero_row = r == 7 || (r == 0 && k < 512) || (r == 15 && k >= 512);
+                src[r*K+k] = zero_row ? (k%2 ? -0.0f : 0.0f) : (int(rng >> 16)-32768)/32768.0f * (r+1) * (k < 512 ? 0.1f : 0.3f);
+            }
+        }
+        const auto before = src;
+        std::vector<uint8_t> packed(ggml_ai4_slab_nbytes(GGML_TYPE_AIF175_U2, K)+2, 0x5a);
+        require(ggml_aif175_quantize_slab(src.data(), K, packed.data()+1, packed.size()-2), "1.75 native trellis encode");
+        require(std::memcmp(src.data(), before.data(), src.size()*sizeof(float)) == 0 && packed.front() == 0x5a && packed.back() == 0x5a,
+                "1.75 encode source signed zeros and canaries unchanged");
+        for (int block = 0; block < K/512; ++block) {
+            for (int r : {0, 7, 15}) {
+                if (r == 7 || (r == 0 && block == 0) || (r == 15 && block == 1)) {
+                    const size_t scale = 1 + block*1824 + 2*r;
+                    require(packed[scale] == 0 && packed[scale+1] == 0, "1.75 zero row keeps canonical zero scale in each block");
+                }
+            }
+            const int r = block == 0 ? 15 : 0;
+            const size_t scale = 1 + block*1824 + 2*r;
+            require(packed[scale] != 0 || packed[scale+1] != 0, "1.75 opposite block keeps nonzero row scale");
+        }
+        require(ggml_ai4_dequantize_slab(GGML_TYPE_AIF175_U2, packed.data()+1, K, 0, decoded.data()), "1.75 encoded native decode");
+        // Independent stream reader and dense inverse H256, separate from native decoder helpers.
+        const uint32_t signs[8] = {0x9E3779B9, 0x7F4A7C15, 0xF39CC060, 0x5CED2A1B,
+                                    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A};
+        double energy = 0, error = 0;
+        for (int r = 0; r < 16; ++r) {
+            for (int base = 0; base < K; base += 256) {
+                double rotated[256];
+                for (int k = 0; k < 256; ++k) {
+                    const int col = base+k, pair = (8*r+col%8)/2;
+                    const uint8_t * block = packed.data()+1+(col/512)*1824;
+                    const uint8_t * tile = block+32+(col%512/128)*448+(col%128/8)*28;
+                    const int end = 7*(pair/2)+(pair%2 ? 7 : 3);
+                    uint32_t state = 0;
+                    for (int b = end-16; b < end; ++b) {
+                        const int bit = (b+224)%224, offset = bit/32*4+3-bit%32/8;
+                        state = (state << 1) | ((tile[offset] >> (7-bit%8)) & 1);
+                    }
+                    const uint32_t c = col%2 ? uint32_t(uint64_t(0x87D8D12Du)*0x87D8D12Du) : 0x87D8D12Du;
+                    const uint32_t z = state*c;
+                    const int level = (int((z & 255)+((z >> 8) & 255)+((z >> 16) & 255)+(z >> 24))+2)/4-128;
+                    const uint16_t h = uint16_t(block[2*r]) | (uint16_t(block[2*r+1]) << 8);
+                    rotated[k] = double(ai4_fp16_to_fp32(h))*level;
+                }
+                for (int k = 0; k < 256; ++k) {
+                    double sum = 0;
+                    for (int j = 0; j < 256; ++j) {
+                        unsigned parity = unsigned(k & j); parity ^= parity >> 4; parity ^= parity >> 2; parity ^= parity >> 1;
+                        sum += parity & 1 ? -rotated[j] : rotated[j];
+                    }
+                    const double value = sum/16*((signs[k/32] >> (k%32)) & 1 ? -1 : 1);
+                    require(std::abs(value-decoded[r*K+base+k]) < 2e-5*(1+std::abs(value)), "1.75 encoded independent original-basis oracle");
+                    const double d = value-src[r*K+base+k]; error += d*d; energy += double(src[r*K+base+k])*src[r*K+base+k];
+                    if (r == 7 || (r == 0 && base < 512) || (r == 15 && base >= 512)) {
+                        require(value == 0, "1.75 native encoder preserves zero row");
+                    }
+                }
+            }
+        }
+        require(error/energy < 0.5, "1.75 native encode nontrivial distortion bound");
+        // The first nonzero block finishes its trellis before the second block's scale overflows.
+        for (int r = 0; r < 16; ++r) {
+            std::fill(src.begin()+r*K+512, src.begin()+(r+1)*K, 1e30f);
+        }
+        std::fill(packed.begin()+1, packed.end()-1, 0xa7);
+        const auto failed_before = packed;
+        const auto source_before = src;
+        allocation_calls = release_calls = live_allocations = fail_allocation_at = 0;
+        require(!aif175_quantize_slab_impl(src.data(), K, packed.data()+1, packed.size()-2,
+                fail_allocation, release_allocation), "1.75 rejects later-block scale overflow");
+        require(allocation_calls == 1 && release_calls == 1 && live_allocations == 0,
+                "1.75 late failure releases its single owned buffer");
+        require(packed == failed_before && src == source_before, "1.75 late failure preserves every input and output byte");
+    }
+    for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2}) {
+        const int64_t width = type == GGML_TYPE_AIF25_U2 ? 640 : 512;
+        const size_t sb = ggml_ai4_slab_nbytes(type, width);
+        const int64_t large_width = int64_t(SIZE_MAX/(16*sizeof(float))/width + 1)*width;
+        const int64_t packed_overflow = INT64_MAX - INT64_MAX%width;
+        std::vector<uint8_t> packed(8, 0xa5);
+        std::vector<float> output(8, 123.0f);
+        const auto packed_before = packed;
+        const auto output_before = output;
+        require(sb > 0, "fractional U2 valid slab size");
+        require(ggml_ai4_slab_nbytes(type, packed_overflow) == 0, "fractional U2 packed size overflow rejected");
+        require(ggml_ai4_slab_nbytes(type, large_width) > 0, "fractional U2 output overflow has valid packed size");
+        if (type == GGML_TYPE_AIF175_U2) {
+            const auto source_before = output;
+            allocation_calls = release_calls = 0;
+            require(!aif175_quantize_slab_impl(output.data(), large_width, packed.data(),
+                    ggml_ai4_slab_nbytes(type, large_width), deny_allocation, count_release),
+                    "1.75 instrumented encoder rejects input span overflow");
+            require(allocation_calls == 0 && release_calls == 0,
+                    "1.75 input span guard runs before every allocation");
+            require(output == source_before && packed == packed_before,
+                    "1.75 instrumented span rejection preserves buffers");
+            require(!ggml_aif175_quantize_slab(output.data(), large_width, packed.data(),
+                    ggml_ai4_slab_nbytes(type, large_width)),
+                    "1.75 encoder rejects input span overflow before allocation or read");
+            require(output == source_before && packed == packed_before,
+                    "1.75 encoder input overflow preserves buffers");
+            const std::vector<float> nonzero(16*width, 123.0f);
+            require(!aif175_quantize_slab_impl(nonzero.data(), width, packed.data(), sb,
+                    deny_allocation, count_release), "1.75 denied allocation returns failure");
+            require(allocation_calls == 1 && release_calls == 1,
+                    "1.75 valid width reaches the instrumented allocator and cleanup");
+            require(output == source_before && packed == packed_before,
+                    "1.75 denied allocation preserves buffers");
+            for (float value : nonzero) { require(value == 123.0f, "1.75 denied allocation preserves nonzero source"); }
+            std::vector<uint8_t> failed_bytes(sb+2, 0xa7);
+            const auto failed_before = failed_bytes;
+            fail_allocation_at = 1;
+            allocation_calls = release_calls = live_allocations = 0;
+            require(!aif175_quantize_slab_impl(nonzero.data(), width, failed_bytes.data()+1, sb,
+                    fail_allocation, release_allocation), "1.75 scratch allocation failure returns false");
+            require(allocation_calls == 1 && release_calls == 1 && live_allocations == 0,
+                    "1.75 allocation failure stops requests and leaves no live buffer");
+            require(failed_bytes == failed_before, "1.75 allocation failure preserves output and canaries");
+            for (float value : nonzero) { require(value == 123.0f, "1.75 allocation failure preserves source"); }
+        }
+        require(!ggml_ai4_dequantize_slab(type, packed.data(), large_width, 0, output.data()),
+                "fractional U2 output span overflow rejected before memory access");
+        require(output == output_before && packed == packed_before, "fractional U2 output overflow preserves buffers");
+        require(!ggml_ai4_dequantize_slab(type, packed.data(), width, int64_t(SIZE_MAX/sb), output.data()),
+                "fractional U2 input span overflow rejected before memory access");
+        require(output == output_before && packed == packed_before, "fractional U2 input overflow preserves buffers");
+        for (int64_t K : {int64_t(0), int64_t(-1), width - 1, packed_overflow}) {
+            require(!ggml_ai4_dequantize_slab(type, packed.data(), K, 0, output.data()),
+                    "fractional U2 invalid width rejected before memory access");
+            require(output == output_before && packed == packed_before, "fractional U2 invalid width preserves buffers");
+        }
     }
     std::printf("PASS %d checks\n", checks);
     return 0;

@@ -917,6 +917,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL, // 16-row units; not row-addressable
         .from_float_ref           = NULL,
     },
+    [GGML_TYPE_AIF175_U2] = {
+        .type_name                = "aif175_u2",
+        .blck_size                = 512,
+        .type_size                = 114,
+        .is_quantized             = true,
+        .to_float                 = NULL, // whole 16-row blocks
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_AIF25_U2] = {
         .type_name                = "aif25_u2",
         .blck_size                = 640,

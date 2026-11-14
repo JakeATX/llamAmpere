@@ -396,6 +396,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_AIF175_U2] = {
+        .from_float               = NULL,
+        .vec_dot                  = NULL, // host slab decode only
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_AIF25_U2] = {
         .from_float               = NULL,
         .vec_dot                  = NULL, // dense CUDA dispatch; host slab decode is separate

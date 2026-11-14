@@ -431,11 +431,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     // No CPU arithmetic or conversion callbacks exist for fractional row-scale weights.
-    if (op->type == GGML_TYPE_AIF25_U2) {
+    if ((op->type == GGML_TYPE_AIF25_U2 || op->type == GGML_TYPE_AIF175_U2)) {
         return false;
     }
     for (const auto * src : op->src) {
-        if (src && src->type == GGML_TYPE_AIF25_U2) {
+        if (src && (src->type == GGML_TYPE_AIF25_U2 || src->type == GGML_TYPE_AIF175_U2)) {
             return false;
         }
     }
