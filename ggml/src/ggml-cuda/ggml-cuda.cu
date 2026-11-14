@@ -11533,6 +11533,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // ordinary CUDA ones do).
                 const ggml_backend_dev_t expected_dev =
                     ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), cuda_ctx->device);
+                // moe-cache device dispatch: an accepted MUL_MAT_ID stays on the card while its expert
+                // src stays in the host arena; the kernels read it through the session pointer tables
+                const bool moe_device_src = node->op == GGML_OP_MUL_MAT_ID &&
+                        ggml_cuda_moe_cache_device_supports(node, cuda_ctx->device);
                 assert(((ggml_backend_buft_is_cuda(node->buffer->buft) ||
                          ggml_backend_buft_is_cuda_kv_stream(node->buffer->buft) ||
                          ggml_backend_buft_is_cuda_qsa_raw_host(node->buffer->buft) ||
@@ -11549,7 +11553,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                  ggml_cuda_qsa_resident_is_buft(node->src[j]->buffer->buft)) &&
                                 node->src[j]->buffer->buft->device == expected_dev) ||
                                ((integrated || ggml_cuda_host_weights_enabled()) &&
-                                ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                                ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
+                               (moe_device_src && ggml_backend_buft_is_host(node->src[j]->buffer->buft)));
                     }
                 }
 #else
