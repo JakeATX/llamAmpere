@@ -40,6 +40,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/dense-tc.cuh"
 #include "ggml-cuda/mmq-prefill.cuh"
 #include "ggml-cuda/mmv-cr.cuh"
@@ -3776,6 +3777,8 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
     return turing_mma_available(ggml_cuda_info().devices[device].cc);
 }
 
+static bool ggml_cuda_mmq_few_takes(const ggml_tensor * src0, const ggml_tensor * src1, int cc);
+
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu,
         const ggml_tensor * up_scale = nullptr, const ggml_tensor * gate_scale = nullptr) {
     // A hinted matmul can be fused, but its unfused path may be faster (e.g. FWHT for GGML_HINT_SRC0_IS_HADAMARD).
@@ -3803,12 +3806,50 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
     const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
     const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
+    // [MMQFEW] do not fuse the matmuls that few-row MMQ takes in ggml_cuda_mul_mat
+    if (!is_id && ggml_cuda_mmq_few_takes(x_up, y, cc)) {
+        return false;
+    }
     if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
         return false;
     }
 
     // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
+}
+
+// [MMQFEW] upstream few-row MMQ (#31533): int8 MMA for 2..24 src1 columns of Q8_0, Q3_K..Q6_K, IQ3_S, IQ4_NL, IQ4_XS
+// (spec-decoding verify widths). AI4 / AI+ (AIT) / CR / TQ weights never reach it: ggml_cuda_mul_mat dispatches them
+// before the route. GGML_CUDA_MMQ_FEW: 1 (default) = on, except the IQ4_XS widths [PARW] already takes (9..its max);
+// 2 = on for every width it supports, PARW included; 0 = off (the pre-merge routes).
+static int ggml_cuda_mmq_few_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_FEW");
+        if (e == nullptr || *e == '\0' || strcmp(e, "1") == 0) {
+            return 1;
+        }
+        if (strcmp(e, "0") == 0) {
+            return 0;
+        }
+        if (strcmp(e, "2") == 0) {
+            return 2;
+        }
+        GGML_LOG_WARN("%s: GGML_CUDA_MMQ_FEW=\"%s\" is not 0, 1 or 2: few-row MMQ stays at 1 (the default)\n", __func__, e);
+        return 1;
+    }();
+    return mode;
+}
+
+static bool ggml_cuda_mmq_few_takes(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
+    const int mode = ggml_cuda_mmq_few_mode();
+    if (mode == 0 || !ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
+        return false;
+    }
+    if (mode == 1 && src0->type == GGML_TYPE_IQ4_XS && src1->ne[1] > MMVQ_MAX_BATCH_SIZE &&
+            src1->ne[1] <= ggml_cuda_iq4xs_wide_max_ncols()) {
+        return false; // [PARW] keeps its widths
+    }
+    return true;
 }
 
 static bool ggml_cuda_tq_mmq_supported(const ggml_tensor * src0, const int cc) {
@@ -3829,6 +3870,7 @@ enum ggml_cuda_mm_route {
     GGML_CUDA_MM_ROUTE_MMVF,
     GGML_CUDA_MM_ROUTE_MMVF_TRANSPOSED, // f32 src0 with one row: src1 is the matrix
     GGML_CUDA_MM_ROUTE_MMF,
+    GGML_CUDA_MM_ROUTE_MMQ_FEW,         // [MMQFEW] upstream few-row MMQ (quantizes src1 itself; not through the q8_cache)
     GGML_CUDA_MM_ROUTE_MMVQ,            // ggml_cuda_mul_mat_vec_q with the plain src1 (q8_1 through the q8_cache)
     GGML_CUDA_MM_ROUTE_MMQ,
     GGML_CUDA_MM_ROUTE_OTHER,           // TQ weights and the cuBLAS tail, decided in ggml_cuda_mul_mat
@@ -3873,6 +3915,10 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
     if (!is_tq_weight && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
             ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], ne11)) {
         return GGML_CUDA_MM_ROUTE_MMVQ;
+    }
+    // [MMQFEW] upstream order: MMVQ below the per-type minimum width, few-row MMQ from it up to 24, MMQ above
+    if (!is_tq_weight && ggml_cuda_mmq_few_takes(src0, src1, cc)) {
+        return GGML_CUDA_MM_ROUTE_MMQ_FEW;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
         return GGML_CUDA_MM_ROUTE_MMVQ;
@@ -4074,6 +4120,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_kqrows_wants(src0->type, cc, src0->ne[0], src0->ne[1], src1->ne[1]);
     if (!kqrows_claims && (route == GGML_CUDA_MM_ROUTE_MMVQ || route == GGML_CUDA_MM_ROUTE_MMQ) &&
             ggml_cuda_mul_mat_kq_tc_try(ctx, src0, src1, dst)) {
+        return;
+    }
+    if (route == GGML_CUDA_MM_ROUTE_MMQ_FEW) {
+        ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMVQ) {
@@ -5240,6 +5290,8 @@ static bool ggml_cuda_borrowed_plan(ggml_backend_cuda_context & ctx, const ggml_
                 const auto route = ggml_cuda_mul_mat_route(w, x, node, cc, warp_size);
                 if (route == GGML_CUDA_MM_ROUTE_MMVQ) {
                     allocs.push_back(size_t(x->ne[1]) * GGML_PAD(x->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1) / QK8_1);
+                } else if (route == GGML_CUDA_MM_ROUTE_MMQ_FEW) {
+                    allocs.push_back(ggml_cuda_mmq_few_pool_bytes(w, x));
                 } else if (route == GGML_CUDA_MM_ROUTE_MMQ) {
                     const bool fallback = w->ne[1] % 128 != 0;
                     allocs.push_back(size_t(x->ne[1]) * GGML_PAD(x->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1_mmq) / QK8_1_MMQ +

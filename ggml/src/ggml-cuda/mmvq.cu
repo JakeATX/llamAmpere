@@ -74,10 +74,6 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
             return false;
     }
 }
-
-static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
-    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
-}
 #endif
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1253,10 +1249,10 @@ static __global__ void mul_mat_vec_q(
                         if (uint32_t(row0 + i) >= nrows_x) { continue; }
                     }
                     const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
-                    mmvq_prefetch_l2((const char *) vx + off);
+                    ggml_cuda_prefetch_l2((const char *) vx + off);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            mmvq_prefetch_l2((const char *) vgate + off);
+                            ggml_cuda_prefetch_l2((const char *) vgate + off);
                         }
                     }
                 }
@@ -3631,6 +3627,17 @@ char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tens
     qe->ne10_padded = ne10_padded;
     qe->swizzle_iq4 = ggml_cuda_q8_cache_swizzle(type_src0);
     return qe->ptr;
+}
+
+int ggml_cuda_iq4xs_wide_max_ncols() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ggml_cuda_iq4xs_wide_mr() == 0) {
+        return 0;
+    }
+    return ggml_cuda_iq4xs_wide_48_enabled() ? IQ4XS_WIDE_MAX_N_EXT : IQ4XS_WIDE_MAX_N;
+#else
+    return 0;
+#endif
 }
 
 bool ggml_cuda_mul_mat_iq4xs_wide_try(ggml_backend_cuda_context & ctx,
