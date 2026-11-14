@@ -49,7 +49,7 @@ def prompt_of(n: int, seed: int = 0) -> str:
 
 def complete(prompt: str, id_slot: int = -1, n_predict: int = 8, ignore_eos: bool = False):
     data = {"prompt": prompt, "n_predict": n_predict, "cache_prompt": True, "temperature": 0.0, "top_k": 1,
-            "ignore_eos": ignore_eos}
+            "ignore_eos": ignore_eos, "loop_guard": not ignore_eos}  # long runs: the tiny model repeats, keep it going
     if id_slot >= 0:
         data["id_slot"] = id_slot
     return server.make_request("POST", "/completion", data=data)
