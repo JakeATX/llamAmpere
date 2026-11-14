@@ -1398,8 +1398,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 new_size = tensor_size;
                 LLAMA_LOG_INFO("size = %8.3f MiB\n", tensor_size/1024.0/1024.0);
 
-                // copy in slabs of whole rows, so that each slab can be validated
-                const size_t row_size   = ggml_row_size(tensor->type, tensor->ne[0]);
+                // Interleaved scales need complete physical blocks for validation.
+                const bool row_scales   = tensor->type == GGML_TYPE_AIF175_U2 || tensor->type == GGML_TYPE_AIF25_U2;
+                const size_t row_size   = row_scales ? 16*ggml_type_size(tensor->type) :
+                                          ggml_row_size(tensor->type, tensor->ne[0]);
                 const size_t slab_size  = std::max<size_t>(row_size, (max_buf_size/row_size)*row_size);
 
                 for (size_t offs = 0; offs < tensor_size; offs += slab_size) {

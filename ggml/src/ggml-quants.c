@@ -18,7 +18,7 @@
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
-#include "ggml-aif175-encode.h"
+#include "ggml-aif175-trellis.h"
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -5993,6 +5993,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I64:
             // nothing to validate
             break;
+        case GGML_TYPE_AIF175_U2:
+        case GGML_TYPE_AIF25_U2:
+            {
+                // Row scales are interleaved in complete 16-row storage blocks.
+                const size_t block_bytes = type == GGML_TYPE_AIF175_U2 ? AIF175_BLOCK_BYTES : AIF25_V2_BLOCK_BYTES;
+                if (nbytes % block_bytes != 0 || (nbytes != 0 && data == NULL)) {
+                    fprintf(stderr, "%s: incomplete or missing fractional U2 storage blocks\n", __func__);
+                    return false;
+                }
+                const uint8_t * bytes = (const uint8_t *) data;
+                for (size_t b = 0; b < nbytes/block_bytes; ++b) {
+                    const uint8_t * block = bytes + b*block_bytes;
+                    for (size_t r = 0; r < 16; ++r) {
+                        const ggml_fp16_t scale = (ggml_fp16_t) ((uint16_t) block[2*r] | ((uint16_t) block[2*r+1] << 8));
+                        if (!validate_fp16(scale, 16*b+r)) { return false; }
+                    }
+                }
+            } break;
         case GGML_TYPE_TQ3_1S:
         case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_TURBO3_0:
@@ -6006,8 +6024,6 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_AIT2_U2:
         case GGML_TYPE_AIT3_U2:
         case GGML_TYPE_AIT4_U2:
-        case GGML_TYPE_AIF25_U2:
-        case GGML_TYPE_AIF175_U2:
         case GGML_TYPE_AIT3_U:
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT2:
@@ -6073,16 +6089,17 @@ bool ggml_ai4_dequantize_slab(enum ggml_type type, const void * data, int64_t K,
     if (sb == 0 || data == NULL || y == NULL || g < 0) {
         return false;
     }
-    if ((type == GGML_TYPE_AIF175_U2 || type == GGML_TYPE_AIF25_U2) &&
-        ((uint64_t)g > (SIZE_MAX - sb)/sb || (uint64_t)K > SIZE_MAX/(16*sizeof(float)))) {
-        return false;
-    }
-    if (type == GGML_TYPE_AIF175_U2) {
-        aif175_dequantize_slab((const uint8_t *)data + (size_t)g*sb, y, K);
-        return true;
-    }
-    if (type == GGML_TYPE_AIF25_U2) {
-        aif25_dequantize_slab_v2((const uint8_t *) data + (size_t) g*sb, y, K);
+    if (type == GGML_TYPE_AIF175_U2 || type == GGML_TYPE_AIF25_U2) {
+        if ((uint64_t)g > (SIZE_MAX - sb)/sb || (uint64_t)K > SIZE_MAX/(16*sizeof(float))) {
+            return false;
+        }
+        const uint8_t * slab = (const uint8_t *)data + (size_t)g*sb;
+        if (!ggml_validate_row_data(type, slab, sb)) { return false; }
+        if (type == GGML_TYPE_AIF175_U2) {
+            aif175_dequantize_slab(slab, y, K);
+        } else {
+            aif25_dequantize_slab_v2(slab, y, K);
+        }
         return true;
     }
     if (ggml_ait_rate(type) != 0) {

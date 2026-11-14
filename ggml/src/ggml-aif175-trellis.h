@@ -20,9 +20,9 @@ typedef struct {
 static double aif175_level_map(uint8_t * levels) {
     double square_sum = 0;
     for (int s = 0; s < 65536; ++s) {
-        const int level = aik_level_c((uint32_t)s, AIF175_MUL);
+        const int level = aif175_level_state((uint32_t)s, AIF175_MUL);
         levels[2*s] = (uint8_t)(level+128);
-        levels[2*s+1] = (uint8_t)(aik_level_c((uint32_t)s, (uint32_t)((uint64_t)AIF175_MUL*AIF175_MUL))+128);
+        levels[2*s+1] = (uint8_t)(aif175_level_state((uint32_t)s, (uint32_t)((uint64_t)AIF175_MUL*AIF175_MUL))+128);
         square_sum += (double)level*level;
     }
     return sqrt(square_sum/65536);

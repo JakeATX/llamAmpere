@@ -2,10 +2,11 @@
 #include "../src/llama-ait-format.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "llama.h"
 #include "../ggml/src/ggml-ai4.h"
 #include "ggml-ai4-decode.h"
 #include "../ggml/src/ggml-impl.h"
-#include "../ggml/src/ggml-aif175-encode.h"
+#include "../ggml/src/ggml-aif175-trellis.h"
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -16,6 +17,40 @@ static int checks = 0;
 static void require(bool ok, const char * message) {
     ++checks;
     if (!ok) { std::fprintf(stderr, "FAIL %s\n", message); std::exit(1); }
+}
+static int aif25_level_reference(const uint8_t * tile, int index) {
+    uint32_t state = 0;
+    for (int j = 0; j < 16; ++j) {
+        const int bit = (5*(index/2 + 1) - 16 + j + 320)%320;
+        const int byte = (bit/32)*4 + 3 - (bit%32)/8;
+        state = (state << 1) | ((tile[byte] >> (7-bit%8)) & 1);
+    }
+    const uint32_t mul = index%2 ? uint32_t(uint64_t(0x87D8D12Du)*0x87D8D12Du) : 0x87D8D12Du;
+    const uint32_t x = state*mul;
+    const unsigned sum = (x & 255)+((x >> 8) & 255)+((x >> 16) & 255)+(x >> 24);
+    return int((sum+2)/4)-128;
+}
+static void check_aif25_windows() {
+    for (int offset = 0; offset < 4; ++offset) {
+        uint8_t guarded[46];
+        uint8_t * tile = guarded + 1 + offset;
+        for (int pattern = 0; pattern < 354; ++pattern) {
+            std::memset(guarded, 0xa5, sizeof(guarded));
+            uint32_t random = uint32_t(pattern+1);
+            for (int b = 0; b < 40; ++b) {
+                random = random*1664525u + 1013904223u;
+                tile[b] = pattern == 321 ? 255 : pattern > 321 ? uint8_t(random >> 24) : 0;
+            }
+            if (pattern < 320) { tile[pattern/8] = uint8_t(1u << (pattern%8)); }
+            uint8_t before[46];
+            std::memcpy(before, guarded, sizeof(guarded));
+            for (int index = 0; index < 128; ++index) {
+                require(aif25_level(tile, index) == aif25_level_reference(tile, index),
+                        "2.5 word windows match independent circular bits at every pair and alignment");
+            }
+            require(std::memcmp(before, guarded, sizeof(guarded)) == 0, "2.5 word windows preserve tile and guards");
+        }
+    }
 }
 static int allocation_calls = 0;
 static int release_calls = 0;
@@ -324,6 +359,7 @@ static void check_aif175_errors() {
             const uint32_t z = state*c;
             const unsigned sum = (z & 255)+((z >> 8) & 255)+((z >> 16) & 255)+(z >> 24);
             const int level = int((sum+2)/4)-128;
+            require(aif175_level_state(state, c) == level, "1.75 packed byte sums match independent levels for both multipliers");
             require(levels[2*state+odd] == level+128, "1.75 production map matches independent MAGIC2 bytes");
             if (!odd) { square_sum += double(level)*level; }
         }
@@ -441,12 +477,19 @@ static void check_aif175_windows() {
                     require(aif175_level(tile, 2*pair+odd) == (sum+2)/4-128, "1.75 word window keeps both decoded levels");
                 }
             }
-            for (int pair = 0; pair < 64; pair += 2) {
-                const uint32_t expected = (uint32_t(path[pair]) << 4) | (path[pair+1] & 15u);
-                const uint32_t states = aif175_state_pair(tile, pair);
-                require(states == expected, "1.75 paired window matches independent stream bits");
-                require((states >> 4) == path[pair] && (states & 0xffffu) == path[pair+1],
-                        "1.75 paired window retains both complete states");
+            uint32_t words[7] = {};
+            for (int w = 0; w < 7; ++w) {
+                for (int byte = 3; byte >= 0; --byte) { words[w] = 256*words[w] + tile[4*w+byte]; }
+            }
+            for (int row = 0; row < 16; ++row) {
+                const int pair = 4*row;
+                const uint32_t expected = (uint32_t(path[pair]) << 11) | (uint32_t(path[pair+1] & 15u) << 7) |
+                    (uint32_t(path[pair+2] & 7u) << 4) | (path[pair+3] & 15u);
+                const uint32_t states = aif175_state_quad(words, row);
+                require(states == expected, "1.75 four-state window matches independent stream bits");
+                require((states >> 11) == path[pair] && ((states >> 7) & 0xffffu) == path[pair+1] &&
+                        ((states >> 4) & 0xffffu) == path[pair+2] && (states & 0xffffu) == path[pair+3],
+                        "1.75 four-state window retains all complete states");
             }
             uint8_t packed[28+2];
             std::memset(packed, 0xa5, sizeof(packed));
@@ -501,6 +544,70 @@ static void check_aif175_windows() {
         }
     }
 }
+static void check_fractional_copy(ggml_type type, int64_t K, int64_t M) {
+#if defined(__linux__)
+    FILE * input = std::tmpfile(), * output = std::tmpfile();
+    require(input && output, "fractional copy creates private temporary files");
+    char input_path[64], output_path[64];
+    std::snprintf(input_path, sizeof(input_path), "/proc/self/fd/%d", fileno(input));
+    std::snprintf(output_path, sizeof(output_path), "/proc/self/fd/%d", fileno(output));
+    ggml_init_params init = {ggml_tensor_overhead(), nullptr, true};
+    auto * ctx = ggml_init(init);
+    auto * tensor = ggml_new_tensor_2d(ctx, type, K, M);
+    ggml_set_name(tensor, "blk.0.attn_q.weight");
+    std::vector<uint8_t> bytes(ggml_nbytes(tensor), 0x5a);
+    const size_t block_bytes = type == GGML_TYPE_AIF175_U2 ? AIF175_BLOCK_BYTES : AIF25_V2_BLOCK_BYTES;
+    for (size_t block = 0; block < bytes.size(); block += block_bytes) {
+        for (int row = 0; row < 16; ++row) {
+            bytes[block+2*row] = 0; bytes[block+2*row+1] = 0x3c;
+        }
+    }
+    tensor->data = bytes.data();
+    auto * meta = gguf_init_empty();
+    gguf_set_val_str(meta, "general.architecture", "llama");
+    gguf_set_val_u32(meta, "general.file_type", LLAMA_FTYPE_ALL_F32);
+    gguf_set_val_u32(meta, "llama.context_length", 512);
+    gguf_set_val_u32(meta, "llama.embedding_length", K);
+    gguf_set_val_u32(meta, "llama.block_count", 1);
+    gguf_set_val_u32(meta, "llama.feed_forward_length", 11008);
+    gguf_set_val_u32(meta, "llama.attention.head_count", 32);
+    gguf_set_val_f32(meta, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    if (type == GGML_TYPE_AIF175_U2) {
+        gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT);
+    }
+    gguf_add_tensor(meta, tensor);
+    require(gguf_write_to_file_ptr(meta, input, false) && std::fflush(input) == 0,
+            "fractional copy writes finite interleaved fixture");
+    auto params = llama_model_quantize_default_params();
+    params.only_copy = true;
+    params.nthread = 1;
+    for (size_t limit : {size_t(1), size_t(1024*1024), size_t(2*1024*1024)}) {
+        params.max_buf_size = limit;
+        require(llama_model_quantize(input_path, output_path, &params) == 0,
+                "fractional actual COPY accepts tiny and odd-row chunk limits");
+        ggml_context * copied_ctx = nullptr;
+        gguf_init_params read = {false, &copied_ctx};
+        auto * copied = gguf_init_from_file(output_path, read);
+        require(copied && copied_ctx && llama_ait_format_error(copied) == nullptr,
+                "fractional actual COPY output parses with its versioned contract");
+        auto * actual = ggml_get_tensor(copied_ctx, "blk.0.attn_q.weight");
+        require(actual && actual->type == tensor->type && ggml_are_same_shape(actual, tensor) &&
+                ggml_nbytes(actual) == bytes.size() && actual->data && std::memcmp(actual->data, bytes.data(), bytes.size()) == 0,
+                "fractional actual COPY retains every stored scale and payload byte");
+        gguf_free(copied); ggml_free(copied_ctx);
+    }
+    bytes[bytes.size()-block_bytes+31] = 0x7c;
+    std::rewind(input);
+    require(gguf_write_to_file_ptr(meta, input, false) && std::fflush(input) == 0,
+            "fractional copy writes final-block nonfinite scale");
+    require(llama_model_quantize(input_path, output_path, &params) != 0,
+            "fractional actual COPY still rejects a nonfinite scale in its final chunk");
+    gguf_free(meta); ggml_free(ctx);
+    std::fclose(input); std::fclose(output);
+#else
+    (void) type; (void) K; (void) M;
+#endif
+}
 static gguf_context * fixture(int type, int64_t K = 1024, int64_t M = 1024, int64_t n2 = 1, int64_t n3 = 1) {
     auto * meta = gguf_init_empty();
     if (type >= 0) {
@@ -525,10 +632,13 @@ static void stamp(gguf_context * meta) {
     gguf_set_val_str(meta, AIT2P_HASH_KEY, "quadratic20-table1024-v1");
 }
 int main() {
+    check_aif25_windows();
     check_aif175_predecessors();
     check_aif175_trace_bounds();
     check_aif175_errors();
     check_aif175_windows();
+    check_fractional_copy(GGML_TYPE_AIF175_U2, 4096, 4096);
+    check_fractional_copy(GGML_TYPE_AIF25_U2, 5120, 2048);
     const uint32_t multipliers[3] = {0xC3CCD12Du, 0x87D8D12Du, 0xAA73876Bu};
     const char * keys[3] = {"ait.multiplier.110", "ait.multiplier.111", "ait.multiplier.112"};
     for (int k = 2; k <= 4; ++k) {
@@ -671,15 +781,22 @@ int main() {
     for (int K : {640, 1280, 1920, 5120}) {
         // Expand each stored row scale to five headers; the decoded matrix must stay exact,
         // including the H256 rotation that crosses the boundary between 640-column blocks.
-        std::vector<uint8_t> packed((K/640)*AIF25_V2_BLOCK_BYTES);
+        const size_t sb = (K/640)*AIF25_V2_BLOCK_BYTES;
+        std::vector<uint8_t> packed(2*sb + 1);
         std::vector<uint8_t> expanded((K/128)*AIF25_UNIT_BYTES);
+        std::vector<float> oracle(16*K);
         uint32_t state = 7300;
         for (auto & b : packed) { state = state*1664525u + 1013904223u; b = state >> 24; }
+        uint8_t * src = packed.data() + 1 + sb;
         for (int block = 0; block < K/640; ++block) {
-            uint8_t * p = packed.data() + block*AIF25_V2_BLOCK_BYTES;
+            uint8_t * p = src + block*AIF25_V2_BLOCK_BYTES;
             for (int r = 0; r < 16; ++r) {
-                const uint16_t scale = 0x2800 + 16*block + r;
-                std::memcpy(p + 2*r, &scale, 2);
+                const uint16_t scale = r == 6 ? 0 : r == 7 ? 0x8000 : r == 8 ? 0xb800 :
+                    r == 9 ? 0x0001 : r == 10 ? 0x03ff : 0x2800 + 16*block + r;
+                p[2*r] = uint8_t(scale); p[2*r+1] = uint8_t(scale >> 8);
+                for (int k = 0; k < 640; ++k) {
+                    oracle[r*K + block*640 + k] = ai4_fp16_to_fp32(scale)*aif25_level_reference(p + 32 + (k/8)*40, r*8 + k%8);
+                }
             }
             for (int u = 0; u < 5; ++u) {
                 uint8_t * q = expanded.data() + (5*block + u)*AIF25_UNIT_BYTES;
@@ -687,13 +804,44 @@ int main() {
                 std::memcpy(q + 32, p + 32 + u*640, 640);
             }
         }
-        std::vector<float> a(16*K), b(16*K);
+        const auto before = packed;
+        require(ggml_validate_row_data(GGML_TYPE_AIF25_U2, src, sb), "2.5 validates finite scales in unaligned multi-block storage");
+        require(!ggml_validate_row_data(GGML_TYPE_AIF25_U2, src, sb-202), "2.5 validation rejects a partial interleaved block");
+        require(!ggml_validate_row_data(GGML_TYPE_AIF25_U2, nullptr, sb), "2.5 validation rejects missing block data");
+        std::vector<float> a(16*K), b(16*K+2, 123.0f);
+        const auto output_before = b;
+        for (int edge = 0; edge < (K == 640 ? 1 : 2); ++edge) {
+            const int block = edge ? K/640-1 : 0;
+            for (int r = 0; r < 16; ++r) {
+                uint8_t * scale = src + block*AIF25_V2_BLOCK_BYTES + 2*r;
+                const uint8_t lo = scale[0], hi = scale[1];
+                for (uint16_t bad : {0x7c00, 0xfc00, 0x7e00, 0xfc01}) {
+                    scale[0] = uint8_t(bad); scale[1] = uint8_t(bad >> 8);
+                    require(!ggml_validate_row_data(GGML_TYPE_AIF25_U2, src, sb), "2.5 validation rejects nonfinite scales at every row and edge block");
+                    if (r == 0 || r == 15) {
+                        require(!ggml_ai4_dequantize_slab(GGML_TYPE_AIF25_U2, packed.data()+1, K, 1, b.data()+1),
+                                "2.5 direct decode rejects nonfinite scales in the selected slab");
+                        require(b == output_before, "2.5 rejected decode leaves all output and canaries unchanged");
+                        require(scale[0] == uint8_t(bad) && scale[1] == uint8_t(bad >> 8), "2.5 rejected decode preserves invalid scale bytes");
+                    }
+                }
+                scale[0] = lo; scale[1] = hi;
+            }
+        }
+        require(packed == before && ggml_validate_row_data(GGML_TYPE_AIF25_U2, src, sb), "2.5 validation preserves payload and accepts restored finite scales");
+        const int rb = ai4u_rot_size(K);
+        for (int r = 0; r < 16; ++r) {
+            for (int k = 0; k < K; k += rb) { ai4_unrotate_n(oracle.data() + r*K + k, rb); }
+        }
         aif25_dequantize_slab(expanded.data(), a.data(), K);
-        require(ggml_ai4_slab_nbytes(GGML_TYPE_AIF25_U2, K) == packed.size(), "fractional U2 slab bytes");
-        require(ggml_ai4_dequantize_slab(GGML_TYPE_AIF25_U2, packed.data(), K, 0, b.data()),
+        require(ggml_ai4_slab_nbytes(GGML_TYPE_AIF25_U2, K) == sb, "fractional U2 slab bytes");
+        require(ggml_ai4_dequantize_slab(GGML_TYPE_AIF25_U2, packed.data()+1, K, 1, b.data()+1),
                 "fractional U2 public slab decoder");
-        require(std::memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0,
+        require(std::memcmp(a.data(), b.data()+1, a.size()*sizeof(float)) == 0,
                 "fractional U2 matches expanded independent scale headers exactly");
+        require(std::memcmp(oracle.data(), b.data()+1, oracle.size()*sizeof(float)) == 0,
+                "2.5 decoded scales match canonical values independent of host byte order");
+        require(b.front() == 123.0f && b.back() == 123.0f && packed == before, "2.5 valid decode preserves canaries and packed bytes");
     }
     {
         auto * meta = fixture(GGML_TYPE_AIF175_U2);
@@ -706,28 +854,37 @@ int main() {
         require(llama_ait_format_error(meta) == nullptr, "1.75 versioned contract accepted");
         gguf_free(meta);
     }
-    for (int64_t M : {1, 15, 17, 31, 1025}) {
-        auto * meta = fixture(GGML_TYPE_AIF175_U2, 512, M);
-        gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT);
-        require(llama_ait_format_error(meta) != nullptr, "1.75 rejects partial stored row slabs");
-        gguf_free(meta);
-    }
-    for (int K : {512, 1024, 4096, 5120, 6144, 17408}) {
-        for (int M : {16, 32, 4096}) {
-            auto * meta = fixture(GGML_TYPE_AIF175_U2, K, M);
-            gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT);
-            require(llama_ait_format_error(meta) == nullptr, "1.75 accepts complete stored row slabs");
+    for (auto type : {GGML_TYPE_AIF25_U2, GGML_TYPE_AIF175_U2}) {
+        const int64_t columns = type == GGML_TYPE_AIF175_U2 ? 512 : 640;
+        const int64_t widths[] = {columns, 2*columns, 3*columns, 8*columns, 10*columns, 12*columns, 34*columns};
+        for (int64_t M : {1, 15, 17, 31, 1025}) {
+            auto * meta = fixture(type, columns, M);
+            if (type == GGML_TYPE_AIF175_U2) { gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT); }
+            require(llama_ait_format_error(meta) != nullptr, "fractional U2 rejects partial stored row slabs");
+            gguf_free(meta);
+        }
+        for (int64_t K : widths) {
+            for (int M : {16, 32, 4096}) {
+                auto * meta = fixture(type, K, M);
+                if (type == GGML_TYPE_AIF175_U2) { gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT); }
+                require(llama_ait_format_error(meta) == nullptr, "fractional U2 accepts complete stored row slabs");
+                gguf_free(meta);
+            }
+        }
+        const int64_t shapes[][4] = {
+            {columns, 16, 2, 1}, {columns, 16, 1, 2},
+            {(INT32_MAX/columns+1)*columns, 16, 1, 1}, {columns, int64_t(INT32_MAX)+1, 1, 1},
+        };
+        for (const auto & shape : shapes) {
+            auto * meta = fixture(type, shape[0], shape[1], shape[2], shape[3]);
+            if (type == GGML_TYPE_AIF175_U2) { gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT); }
+            require(llama_ait_format_error(meta) != nullptr, "fractional U2 rejects batched or oversized stored matrices");
             gguf_free(meta);
         }
     }
-    const int64_t shapes[][4] = {
-        {512, 16, 2, 1}, {512, 16, 1, 2},
-        {int64_t(INT32_MAX)+1, 16, 1, 1}, {512, int64_t(INT32_MAX)+1, 1, 1},
-    };
-    for (const auto & shape : shapes) {
-        auto * meta = fixture(GGML_TYPE_AIF175_U2, shape[0], shape[1], shape[2], shape[3]);
-        gguf_set_val_str(meta, "ait.fractional.175.contract", AIF175_CONTRACT);
-        require(llama_ait_format_error(meta) != nullptr, "1.75 rejects batched or oversized stored matrices");
+    {
+        auto * meta = fixture(GGML_TYPE_F16, 640, 17, 2);
+        require(llama_ait_format_error(meta) == nullptr, "fractional shape rules leave ordinary batched tensors unchanged");
         gguf_free(meta);
     }
     require(ggml_row_size(GGML_TYPE_AIF175_U2, 512) == 114, "1.75 stored row bytes");
@@ -739,14 +896,50 @@ int main() {
         for (auto & b : packed) { state = state*1664525u + 1013904223u; b = state >> 24; }
         uint8_t * src = packed.data() + 1 + sb;
         for (int block = 0; block < K/512; ++block) {
+            // An interior zero block must not stop the next nonzero block.
+            const bool zero_block = K > 512 && (block == K/512-1 || (K >= 4096 && block == 1));
+            const bool full_block = K > 512 && block == 0;
             for (int r = 0; r < 16; ++r) {
-                const uint16_t scale = r == 7 ? 0 : r == 8 ? 0x8000 : r == 9 ? 0xb800 :
+                const uint16_t scale = zero_block ? (r%2 ? 0x8000 : 0) :
+                    full_block ? 0x2800 + r :
+                    r == 6 && block%2 == 0 ? 0 : r == 7 ? 0 : r == 8 ? 0x8000 : r == 9 ? 0xb800 :
                     r == 10 ? 0x0001 : r == 11 ? 0x03ff : 0x2800 + 16*block + r;
                 src[block*AIF175_BLOCK_BYTES + 2*r] = uint8_t(scale);
                 src[block*AIF175_BLOCK_BYTES + 2*r+1] = uint8_t(scale >> 8);
             }
         }
         const auto before = packed;
+        require(ggml_validate_row_data(GGML_TYPE_AIF175_U2, src, sb),
+                "1.75 validates finite scales in unaligned multi-block storage");
+        require(!ggml_validate_row_data(GGML_TYPE_AIF175_U2, src, sb-114),
+                "1.75 validation rejects a partial interleaved block");
+        require(!ggml_validate_row_data(GGML_TYPE_AIF175_U2, nullptr, sb),
+                "1.75 validation rejects missing block data");
+        std::vector<float> invalid_output(16*K+2, 123.0f);
+        const auto invalid_before = invalid_output;
+        for (int edge = 0; edge < (K == 512 ? 1 : 2); ++edge) {
+            const int block = edge ? K/512-1 : 0;
+            for (int r = 0; r < 16; ++r) {
+                uint8_t * scale = src + block*AIF175_BLOCK_BYTES + 2*r;
+                const uint8_t lo = scale[0], hi = scale[1];
+                for (uint16_t bad : {0x7c00, 0xfc00, 0x7e00, 0xfc01}) {
+                    scale[0] = uint8_t(bad); scale[1] = uint8_t(bad >> 8);
+                    require(!ggml_validate_row_data(GGML_TYPE_AIF175_U2, src, sb),
+                            "1.75 validation rejects nonfinite scales at every row and edge block");
+                    if (r == 0 || r == 15) {
+                        require(!ggml_ai4_dequantize_slab(GGML_TYPE_AIF175_U2, packed.data()+1, K, 1, invalid_output.data()+1),
+                                "1.75 direct decode rejects nonfinite scales in the selected slab");
+                        require(invalid_output == invalid_before,
+                                "1.75 rejected scale leaves all output and canaries unchanged");
+                        require(scale[0] == uint8_t(bad) && scale[1] == uint8_t(bad >> 8),
+                                "1.75 rejected decode preserves the invalid scale bytes");
+                    }
+                }
+                scale[0] = lo; scale[1] = hi;
+            }
+        }
+        require(packed == before && ggml_validate_row_data(GGML_TYPE_AIF175_U2, src, sb),
+                "1.75 validation preserves payload and accepts restored finite scales");
         std::vector<float> expected(16*K), actual(16*K+2, 123.0f);
         for (int r = 0; r < 16; ++r) {
             for (int k = 0; k < K; ++k) {
@@ -774,8 +967,22 @@ int main() {
         require(ggml_ai4_slab_nbytes(GGML_TYPE_AIF175_U2, K) == sb, "1.75 whole slab size");
         require(ggml_ai4_dequantize_slab(GGML_TYPE_AIF175_U2, packed.data()+1, K, 1, actual.data()+1),
                 "1.75 unaligned later-slab public decode");
-        require(std::memcmp(expected.data(), actual.data()+1, expected.size()*sizeof(float)) == 0,
-                "1.75 exact independent row-scale decode");
+        for (int block = 0; block < K/512; ++block) {
+            for (int r = 0; r < 16; ++r) {
+                const uint8_t * scale = src + block*AIF175_BLOCK_BYTES + 2*r;
+                const bool zero_scale = (scale[0] | ((scale[1] & 0x7f) << 8)) == 0;
+                const size_t begin = r*K + block*512;
+                if (zero_scale) {
+                    for (int k = 0; k < 512; ++k) {
+                        require(expected[begin+k] == 0.0f && actual[begin+k+1] == 0.0f && !std::signbit(actual[begin+k+1]),
+                                "1.75 both zero scales produce canonical zeros with arbitrary payload");
+                    }
+                } else {
+                    require(std::memcmp(expected.data()+begin, actual.data()+begin+1, 512*sizeof(float)) == 0,
+                            "1.75 nonzero scale decode keeps exact independent results");
+                }
+            }
+        }
         require(actual.front() == 123.0f && actual.back() == 123.0f && packed == before,
                 "1.75 canaries and packed input unchanged");
         const auto unchanged = actual;

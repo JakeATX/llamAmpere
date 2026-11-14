@@ -12,12 +12,15 @@ static inline const char * llama_ait_format_error(const gguf_context * meta) {
     bool pair_u = false;   // 121 = AIT2P_U: unit bytes, AIT2P pair table
     for (int64_t i = 0; i < gguf_get_n_tensors(meta); ++i) {
         const int type = (int) gguf_get_tensor_type(meta, i);
-        if (type == GGML_TYPE_AIF175_U2) {
+        if (type == GGML_TYPE_AIF175_U2 || type == GGML_TYPE_AIF25_U2) {
             const int64_t * ne = gguf_get_tensor_ne(meta, i);
-            if (ne[0] <= 0 || ne[0] > INT32_MAX || ne[0] % 512 != 0 ||
+            const int columns = type == GGML_TYPE_AIF175_U2 ? 512 : 640;
+            if (ne[0] <= 0 || ne[0] > INT32_MAX || ne[0] % columns != 0 ||
                 ne[1] <= 0 || ne[1] > INT32_MAX || ne[1] % 16 != 0 || ne[2] != 1 || ne[3] != 1) {
-                return "AIF175_U2 requires a matrix with complete 16-row by 512-column blocks and int32 dimensions";
+                return "fractional U2 weights require a matrix with complete 16-row storage blocks and int32 dimensions";
             }
+        }
+        if (type == GGML_TYPE_AIF175_U2) {
             const int key = gguf_find_key(meta, "ait.fractional.175.contract");
             if (key < 0 || gguf_get_kv_type(meta, key) != GGUF_TYPE_STRING ||
                 std::strcmp(gguf_get_val_str(meta, key), AIF175_CONTRACT) != 0) {
