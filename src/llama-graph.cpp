@@ -694,38 +694,48 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
 
 void llm_graph_input_rs::fill_replay_lanes(const llama_memory_recurrent_context * m, const int32_t * data, int64_t n_rs) {
     GGML_ASSERT(ggml_backend_buffer_is_host(replay_w->buffer));
-    GGML_ASSERT(s_copy_conv && s_copy_conv->buffer && ggml_backend_buffer_is_host(s_copy_conv->buffer));
-    GGML_ASSERT(s_copy_pair && s_copy_pair->buffer && ggml_backend_buffer_is_host(s_copy_pair->buffer));
+    // conv / pair are optional, as in the 1-D form
+    auto host_data = [](ggml_tensor * t) -> int32_t * {
+        if (t == nullptr || t->buffer == nullptr) {
+            return nullptr;
+        }
+        GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+        return (int32_t *) t->data;
+    };
     float *        w    = (float *) replay_w->data;
-    int32_t *      conv = (int32_t *) s_copy_conv->data;
-    int32_t *      pair = (int32_t *) s_copy_pair->data;
+    int32_t *      conv = host_data(s_copy_conv);
+    int32_t *      pair = host_data(s_copy_pair);
     const uint32_t K    = m->get_n_rs_seq();
     const int64_t  n_seqs   = replay_w->ne[1];
     const int64_t  mem_size = m->get_size();
-    GGML_ASSERT((int64_t) K == replay_w->ne[0] && s_copy_pair_main->ne[0] == n_seqs && n_rs >= n_seqs);
+    GGML_ASSERT((int64_t) K == replay_w->ne[0] && n_rs >= n_seqs);
 
-    bool differ = false;
     for (int64_t s = 0; s < n_seqs; ++s) {
         const llama_seq_id seq = m->lane_seq((int) s);
         const uint32_t r = m->replay_len_seq(seq);
         const uint32_t S = m->ckpt_span_seq(seq);
         const bool     z = m->s_stale_seq(seq);
         GGML_ASSERT(r <= S && S <= K);
-        const llama_seq_id seq0 = m->lane_seq(0);
-        differ |= r != m->replay_len_seq(seq0) || S != m->ckpt_span_seq(seq0) || z != m->s_stale_seq(seq0);
         const bool need_base = r > 0 || z;
         for (uint32_t j = 0; j < K; ++j) {
             w[s * K + j] = need_base && j < S - r ? 1.0f : 0.0f;
         }
-        conv[s] = (int32_t) (data[s] + (int64_t) r * mem_size);
-        pair[s] = (int32_t) (data[s] + (need_base ? mem_size : 0));
+        if (conv) {
+            conv[s] = (int32_t) (data[s] + (int64_t) r * mem_size);
+        }
+        if (pair) {
+            pair[s] = (int32_t) (data[s] + (need_base ? mem_size : 0));
+        }
     }
-    // rows past n_seqs have no lane: same rule as the 1-D form (scalar conv offset, state row)
-    GGML_ASSERT(!differ || n_rs == n_seqs);
-    const int64_t off = (int64_t) m->get_replay_len() * mem_size;
+    // rows past n_seqs are bystander cells (seqs not in this ubatch, e.g. an idle slot between two that verify):
+    // plain move of plane 0 / the state row. Their own pending replay stays in replay_len for their next decode.
     for (int64_t i = n_seqs; i < n_rs; ++i) {
-        conv[i] = (int32_t) (data[i] + off);
-        pair[i] = data[i];
+        if (conv) {
+            conv[i] = data[i];
+        }
+        if (pair) {
+            pair[i] = data[i];
+        }
     }
 }
 
