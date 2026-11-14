@@ -23206,6 +23206,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // [AIV2] GGML_TEST_AIV2_PERF=1: only the AI+ gate-2 rival list (IQ2_XXS..IQ4_XS, today's AI+, EXL3 2/3/4 with and
     // without the Hadamard glue) at the 27B FFN shapes 17408 x 5120 and 5120 x 17408, widths 1 / 4 / 5 / 8
     if (getenv("GGML_TEST_AIV2_PERF") != nullptr) {
+        // [MULTI4] GGML_TEST_AIV2_PERF=fakeep: SJ-KVaRN decode attention at the Qwen3.8 27B shape (24 q heads, 4 KV heads, tq6_0
+        // ring, f16 sink, 4/4 scalar body) over a dense body of KEEP + window cells, KEEP 12,288 / 24,576 / 49,152 + 8,192
+        // (160 / 256 / 448 records of 128), at 1 / 3 / 6 query rows: is FA linear in KEEP and flat in rows?
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "fakeep") {
+            for (int64_t ng : { 160, 256, 448 }) {
+                for (int64_t n_q : { 1, 3, 6 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, ng, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
+                }
+            }
+            return test_cases;
+        }
         // [MULTI4] GGML_TEST_AIV2_PERF=multi4: 27B decode shapes at 1 / 2 / 4 streams x 6 rows
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "multi4") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 },
