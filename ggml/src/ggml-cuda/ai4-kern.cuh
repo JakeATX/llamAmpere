@@ -49,8 +49,11 @@ constexpr int LAY_AIT3_U = 13;   // rate-3 units ([d 16][16 tiles x 12 words], 8
 constexpr int LAY_AIT4_U = 14;   // rate-4 units ([d 16][16 tiles x 16 words], 1056 B)
 constexpr int LAY_AIT2P_U = 15;  // AIT2_U bytes, AIT2P pair-table levels (ggml-ai4.h); no trellis constant
 constexpr int LAY_AIT2_U2 = 16;  // AIT2_U levels, one fp16 scale per row per 640 K: block = [d 16][5 chunks x 16 tiles x 8 words] (ggml.h AIT2_U2)
-constexpr int LAY_AIT4_U2 = 20;  // 4-bit tiles in the 640-K row-scale block
 constexpr int LAY_AIT3_U2 = 17;  // AIT3_U levels, same block shape (rate 3)
+constexpr int LAY_AIT4_U2 = 18;  // AIT4_U levels, same block shape (rate 4)
+constexpr int LAY_AIT2_U2_512 = 19;  // AIT2_U2 with one scale per row per 512 K: block = [d 16][4 chunks x 16 tiles x 8 words] (ggml.h AIT2_U2_512)
+constexpr int LAY_AIT3_U2_512 = 20;  // AIT3_U2 with the same 4-chunk block shape (rate 3)
+constexpr int LAY_AIT4_U2_512 = 21;  // AIT4_U2 with the same 4-chunk block shape (rate 4)
 
 // mmv-ID columns per block: lanes g = 0..7 of the mmv kernel each own one token column
 constexpr int MMV_ID_BN = 8;
@@ -140,16 +143,21 @@ constexpr int U_SC      = 32;     // fp16 d[16]
 // symbol rate of a layout (bits per weight in the tile stream) and its trellis constant
 template <int LAY> constexpr __host__ __device__ int lay_rate() {
     static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U ||
-                  LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2, "ai4k layout");
-    return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT2_U2 ? 2 :
-           LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 ? 3 : 4;
+                  LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2 ||
+                  LAY == LAY_AIT2_U2_512 || LAY == LAY_AIT3_U2_512 || LAY == LAY_AIT4_U2_512, "ai4k layout");
+    return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT2_U2 || LAY == LAY_AIT2_U2_512 ? 2 :
+           LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 || LAY == LAY_AIT3_U2_512 ? 3 : 4;
 }
 template <int LAY> constexpr __host__ __device__ bool lay_pair() { return LAY == LAY_AIT2P_U; }
-// row-scale layouts: one scale header per 5 chunks (640 K) instead of one per chunk
-template <int LAY> constexpr __host__ __device__ bool lay_v2() { return LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2; }
+// row-scale layouts: one scale header per 5 chunks (640 K) or per 4 chunks (512 K, the _512 layouts) instead of one per chunk
+template <int LAY> constexpr __host__ __device__ bool lay_v2() {
+    return LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2 || LAY == LAY_AIT2_U2_512 || LAY == LAY_AIT3_U2_512 ||
+           LAY == LAY_AIT4_U2_512;
+}
 template <int LAY> constexpr __host__ __device__ uint32_t lay_mul() {
     static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U || lay_v2<LAY>(), "ai4k layout");
-    return LAY == LAY_AIT2_U || LAY == LAY_AIT2_U2 ? 0xC3CCD12Du : LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 ? 0x87D8D12Du : 0xAA73876Bu;
+    return LAY == LAY_AIT2_U || LAY == LAY_AIT2_U2 || LAY == LAY_AIT2_U2_512 ? 0xC3CCD12Du :
+           LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 || LAY == LAY_AIT3_U2_512 ? 0x87D8D12Du : 0xAA73876Bu;
 }
 template <int LAY> constexpr __host__ __device__ bool lay_k5()  { return lay_rate<LAY>() == 5; }
 
@@ -158,24 +166,36 @@ template <int LAY> constexpr __host__ __device__ int ch_bytes() { return 256*lay
 template <int LAY> constexpr __host__ __device__ int u_bytes()  { return ch_bytes<LAY>() + U_SC; }
 static_assert(ch_bytes<LAY_AIT4_U>() == CH_BYTES && u_bytes<LAY_AIT4_U>() == U_BYTES && u_bytes<LAY_AIT5_U>() == 1312 &&
               u_bytes<LAY_AIT2_U>() == 544 && u_bytes<LAY_AIT2P_U>() == 544 && u_bytes<LAY_AIT3_U>() == 800, "ai4k layout sizes");
-constexpr int V2_CHUNKS = 5;   // 128-K chunks per row-scale block
-template <int LAY> constexpr __host__ __device__ int v2_block_bytes() { return U_SC + V2_CHUNKS*ch_bytes<LAY>(); }
+constexpr int V2_CHUNKS = 5;   // 128-K chunks per row-scale block of the 640 K layouts
+// 128-K chunks per row-scale block of a layout: 5 (640 K), or 4 for the 512 K siblings
+template <int LAY> constexpr __host__ __device__ int v2_chunks() {
+    return LAY == LAY_AIT2_U2_512 || LAY == LAY_AIT3_U2_512 || LAY == LAY_AIT4_U2_512 ? 4 : V2_CHUNKS;
+}
+template <int LAY> constexpr __host__ __device__ int v2_block_bytes() { return U_SC + v2_chunks<LAY>()*ch_bytes<LAY>(); }
+static_assert(v2_block_bytes<LAY_AIT4_U2>() == 5152 && lay_mul<LAY_AIT4_U2>() == 0xAA73876Bu,
+              "4-bit row-scale layout");
+static_assert(v2_block_bytes<LAY_AIT2_U2>() == 2592 && v2_block_bytes<LAY_AIT3_U2>() == 3872 &&
+              v2_block_bytes<LAY_AIT2_U2_512>() == 2080 && v2_block_bytes<LAY_AIT3_U2_512>() == 3104 &&
+              lay_mul<LAY_AIT2_U2_512>() == lay_mul<LAY_AIT2_U2>() && lay_mul<LAY_AIT3_U2_512>() == lay_mul<LAY_AIT3_U2>() &&
+              lay_rate<LAY_AIT2_U2_512>() == 2 && lay_rate<LAY_AIT3_U2_512>() == 3 &&
+              v2_block_bytes<LAY_AIT4_U2_512>() == 4128 && lay_rate<LAY_AIT4_U2_512>() == 4 &&
+              lay_mul<LAY_AIT4_U2_512>() == lay_mul<LAY_AIT4_U2>(), "row-scale layout sizes and constants");
 template <int LAY> static __host__ __device__ __forceinline__ int64_t slab_bytes_l(int K) {
-    if constexpr (lay_v2<LAY>()) { return (int64_t) (K/(128*V2_CHUNKS))*v2_block_bytes<LAY>(); }
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (K/(128*v2_chunks<LAY>()))*v2_block_bytes<LAY>(); }
     else { return (int64_t) (K/128)*u_bytes<LAY>(); }
 }
 
 // byte offset of chunk kc's 16 tiles inside a slab
 template <int LAY>
 static __device__ __forceinline__ int64_t chunk_off(int kc) {
-    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/V2_CHUNKS)*v2_block_bytes<LAY>() + U_SC + (int64_t) (kc % V2_CHUNKS)*ch_bytes<LAY>(); }
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/v2_chunks<LAY>())*v2_block_bytes<LAY>() + U_SC + (int64_t) (kc % v2_chunks<LAY>())*ch_bytes<LAY>(); }
     else { return (int64_t) kc*u_bytes<LAY>() + U_SC; }
 }
 
 // byte offset of chunk kc's scale header inside a slab
 template <int LAY>
 static __device__ __forceinline__ int64_t sc_off(int kc) {
-    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/V2_CHUNKS)*v2_block_bytes<LAY>(); }
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/v2_chunks<LAY>())*v2_block_bytes<LAY>(); }
     else { return (int64_t) kc*u_bytes<LAY>(); }
 }
 

@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-d1.h"
 
 #include <map>
 #include <atomic>
@@ -607,6 +608,15 @@ struct llama_layer {
     struct ggml_tensor * ssm_f_a    = nullptr;
     struct ggml_tensor * ssm_f_b    = nullptr;
     struct ggml_tensor * ssm_beta   = nullptr;
+
+    // mixed-shape pruned qwen35 (ngprune): own read/write matmuls of a rank sublayer, and head index maps (int32)
+    struct ggml_tensor * mixer_read  = nullptr; // [n_embd -> k]
+    struct ggml_tensor * mixer_write = nullptr; // [k -> n_embd]
+    struct ggml_tensor * mlp_read    = nullptr;
+    struct ggml_tensor * mlp_write   = nullptr;
+    struct ggml_tensor * ssm_key_idx     = nullptr; // [n_v_l] GDN value head -> key head (cut GDN layers)
+    struct ggml_tensor * attn_q_pad_idx  = nullptr; // [n_kv * m_max] padded slot -> q head (uneven GQA groups)
+    struct ggml_tensor * attn_q_inv_idx  = nullptr; // [n_q_l] q head -> padded slot
     struct ggml_tensor * ssm_g_a    = nullptr;
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
@@ -956,6 +966,10 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // mixed-shape pruned qwen35: read/write matmuls shared by the layers of a span, indexed by span id (nullptr = unused id)
+    std::vector<struct ggml_tensor *> mix_span_read;
+    std::vector<struct ggml_tensor *> mix_span_write;
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
@@ -982,6 +996,8 @@ struct llama_model {
     // so the layer-major prefill can borrow resident expert VRAM and copy the weights back from the file)
     std::unordered_map<std::string, llama_b1_file_src> b1_src;
     std::vector<int> b1_fds; // dup()ed file descriptors, closed by the destructor
+    // [D1] LLAMA_D1_HEAD: the exact-row sidecar, opened once and shared by every context of this model
+    mutable llama_d1_model_slot d1;
     std::vector<const void *> moe_bank_registered; // expert tensors registered with ggml_moe_bank_register
 
     // for keeping track of associated LoRA adapters

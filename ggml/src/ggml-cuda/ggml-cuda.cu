@@ -1632,7 +1632,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
         size = n_blocks * sizeof(block_q8_0);
     }
 
-    if (ggml_is_quantized(tensor->type)) {
+    // Fractional row-scale kernels read complete slabs, with no generic row padding.
+    if (ggml_is_quantized(tensor->type) && tensor->type != GGML_TYPE_AIF25_U2 && tensor->type != GGML_TYPE_AIF175_U2 &&
+        tensor->type != GGML_TYPE_AIF25_U2_512) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
@@ -3612,7 +3614,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool
 
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight &&
-                             ggml_exl3_bits(src0->type) == 0 && ggml_ai4_rate(src0->type) == 0 && ggml_ait_rate(src0->type) == 0 && src0->type != GGML_TYPE_AIF25_U &&
+                             ggml_exl3_bits(src0->type) == 0 && ggml_ai4_rate(src0->type) == 0 && ggml_ait_rate(src0->type) == 0 && src0->type != GGML_TYPE_AIF25_U && src0->type != GGML_TYPE_AIF25_U2 && src0->type != GGML_TYPE_AIF175_U2 && src0->type != GGML_TYPE_AIF25_U2_512 &&
                              src0->type != GGML_TYPE_Q8_CR &&
                              src0->type != GGML_TYPE_Q5_CR &&
                              src0->type != GGML_TYPE_Q6_CR &&
@@ -4015,7 +4017,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
-    if (src0->type == GGML_TYPE_AIF25_U) {
+    if (src0->type == GGML_TYPE_AIF25_U || src0->type == GGML_TYPE_AIF25_U2 || src0->type == GGML_TYPE_AIF175_U2 || src0->type == GGML_TYPE_AIF25_U2_512) {
         ggml_cuda_mul_mat_aif25(ctx, src0, src1, dst);
         return;
     }
@@ -5870,6 +5872,29 @@ static bool ggml_cuda_graph_check_compability_plain(ggml_cgraph * cgraph) {
     }
 
     return use_cuda_graph;
+}
+
+// rows of the first matmul against a weight buffer (= tokens in the batch), -1 if there is none (allowed). Weights the
+// scheduler copied into a compute buffer are skipped (usage COMPUTE). MUL_MAT_ID src1 is [n_embd, n_used, n_tokens].
+static int64_t ggml_cuda_graph_batch_rows(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && n->src[0] != nullptr && n->src[1] != nullptr &&
+                n->src[0]->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(n->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return n->op == GGML_OP_MUL_MAT_ID ? n->src[1]->ne[2] : n->src[1]->ne[1] * n->src[1]->ne[2] * n->src[1]->ne[3];
+        }
+    }
+    return -1;
+}
+
+// GGML_CUDA_GRAPH_MAX_ROWS=N (default 0 = off): no CUDA graph, and no cache entry, for a batch of more than N rows (prefill)
+static bool ggml_cuda_graph_rows_reject(const ggml_cgraph * cgraph) {
+    static const int64_t max_rows = [] {
+        const char * s = getenv("GGML_CUDA_GRAPH_MAX_ROWS");
+        return (int64_t) (s ? atoll(s) : 0);
+    }();
+    return max_rows > 0 && ggml_cuda_graph_batch_rows(cgraph) > max_rows;
 }
 
 // a captured graph hard-codes its shapes, so with one key per split an alternating shape
@@ -9189,7 +9214,7 @@ static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_cont
         }
         const ggml_tensor * w = node->src[0];
         const bool rotated = w->type == GGML_TYPE_Q8_CR || w->type == GGML_TYPE_Q5_CR || w->type == GGML_TYPE_Q6_CR;
-        if (rotated || w->buffer == nullptr || ggml_exl3_bits(w->type) != 0 || ggml_ai4_rate(w->type) != 0 || ggml_ait_rate(w->type) != 0 || w->type == GGML_TYPE_AIF25_U ||
+        if (rotated || w->buffer == nullptr || ggml_exl3_bits(w->type) != 0 || ggml_ai4_rate(w->type) != 0 || ggml_ait_rate(w->type) != 0 || (w->type == GGML_TYPE_AIF25_U || w->type == GGML_TYPE_AIF25_U2 || w->type == GGML_TYPE_AIF175_U2 || w->type == GGML_TYPE_AIF25_U2_512) ||
                 ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
                 ggml_cuda_mul_mat_route(w, act, node, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
             return GGML_TYPE_COUNT;
@@ -12389,22 +12414,41 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     uint64_t graph_key = 0;
 
 #ifdef USE_CUDA_GRAPH
-    if (!cuda_ctx->scratch_borrowed) {
+    if (!cuda_ctx->scratch_borrowed && !ggml_cuda_graph_rows_reject(cgraph)) {   // a rejected batch runs eagerly, as when borrowed
         graph_key = ggml_cuda_graph_get_key(cgraph);
 
         ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->is_enabled()) {
+            // GGML_CUDA_GRAPH_WARMUP=K (default 2 = as before): capture on the K-th call, after K-1 calls in a row
+            // with no property change
+            static const int warmup_calls = [] {
+                const char * s = getenv("GGML_CUDA_GRAPH_WARMUP");
+                const int k = s ? atoi(s) : 2;
+                return k >= 2 ? k : 2;
+            }();
             const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
             if (graph_compatible) {
                 const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
                 if (!graph->warmup_complete) {
                     // Warmup: need at least 2 calls with no property change on the 2nd call
-                    if (!properties_changed) {
+                    graph->stable_calls = properties_changed ? 0 : graph->stable_calls + 1;
+                    if (graph->stable_calls >= warmup_calls - 1) {
                         graph->warmup_complete = true;
                         GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                        if (ggml_cuda_graph_log_on() && cgraph->n_nodes > 0) {
+                            const ggml_tensor * f = cgraph->nodes[0];
+                            const ggml_tensor * l = cgraph->nodes[cgraph->n_nodes - 1];
+                            GGML_LOG_INFO("cuda_graph: capture key %016llx n_nodes %d rows %lld first %s %s [%lld,%lld,%lld,%lld]"
+                                " last %s %s [%lld,%lld,%lld,%lld] cached %zu\n", (unsigned long long) graph_key, cgraph->n_nodes,
+                                (long long) ggml_cuda_graph_batch_rows(cgraph), ggml_op_desc(f), f->name,
+                                (long long) f->ne[0], (long long) f->ne[1], (long long) f->ne[2], (long long) f->ne[3],
+                                ggml_op_desc(l), l->name,
+                                (long long) l->ne[0], (long long) l->ne[1], (long long) l->ne[2], (long long) l->ne[3],
+                                cuda_ctx->cuda_graphs.size());
+                        }
                         use_cuda_graph = true;
                         cuda_graph_update_required = true;
                     }
@@ -12414,6 +12458,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     if (properties_changed) {
                         // Properties changed - reset warmup, execute directly until stable again
                         graph->warmup_complete = false;
+                        graph->stable_calls    = 0;
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                     } else {
                         use_cuda_graph = true;
@@ -12785,8 +12830,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    // GGML_CUDA_GRAPH_MAX_ROWS: same rule as graph_compute, so a rejected batch makes no cache entry here either
+    const bool use_cuda_graph = !ggml_cuda_graph_rows_reject(cgraph) &&
+        ggml_cuda_graph_set_enabled(cuda_ctx, ggml_cuda_graph_get_key(cgraph));
 #else
     const bool use_cuda_graph = false;
     GGML_UNUSED(cuda_ctx);
@@ -13466,7 +13512,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     !(is_hadamard && a->type == GGML_TYPE_F32)) {
                     return false;
                 }
-                if (a->type == GGML_TYPE_AIF25_U) {
+                if (a->type == GGML_TYPE_AIF25_U || a->type == GGML_TYPE_AIF25_U2 || a->type == GGML_TYPE_AIF175_U2 || a->type == GGML_TYPE_AIF25_U2_512) {
                     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && ggml_cuda_aif25_supported(op);
                 }

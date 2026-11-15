@@ -5,6 +5,85 @@
 #include <cstdlib>
 #include <string>
 
+// GGML_SJKVARN_LIVE_TILES=1 (opt-in): the trellis tile kernel walks only the KV tiles (nbatch_fa positions) that some query
+// row can see, split evenly over its stream-k blocks. Without it every block gets an even share of ALL tiles and the
+// dead-tile check runs after the split, so with an LSA mask (sink + KEEP picks + tail) a few blocks carry the live tiles.
+// A dead tile adds exp(-inf) = 0 and leaves the running max alone, so the sum is the same; the block split moves, so the
+// float grouping (and possibly the last bits) can differ from the dense walk.
+static bool sj_kvarn_live_tiles() {
+    static const bool v = [] { const char * e = getenv("GGML_SJKVARN_LIVE_TILES"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+
+// flags[t] = 1 iff some row q < n_q has a visible entry in columns [t*nbatch_fa, (t+1)*nbatch_fa): one warp per tile.
+// F16 mask: entry != -inf (the tile kernel's TILE_SKIP test). Packed I32 mask [#175]: one bit per column, set = visible,
+// tiles start on a word (nbatch_fa % 32 == 0), so a nonzero word is a visible column.
+static __global__ void sj_kvarn_live_tile_flags(const char * __restrict__ mask, const int64_t row_bytes, const int n_q,
+        const int packed, const int nbatch_fa, const int n_tiles, uint8_t * __restrict__ flags) {
+    const int t    = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (t >= n_tiles) {
+        return;
+    }
+    bool live = false;
+    for (int q = 0; q < n_q && !live; ++q) {
+        const char * row = mask + q*row_bytes;
+        bool f = false;
+        if (packed) {
+            for (int w = lane; w < nbatch_fa/32; w += WARP_SIZE) {
+                f |= ((const uint32_t *) row)[t*(nbatch_fa/32) + w] != 0u;
+            }
+        } else {
+            for (int c = lane; c < nbatch_fa; c += WARP_SIZE) {
+                f |= __half2float(((const half *) row)[t*nbatch_fa + c]) != -INFINITY;
+            }
+        }
+        live = __any_sync(0xFFFFFFFF, f);
+    }
+    if (lane == 0) {
+        flags[t] = live ? 1 : 0;
+    }
+}
+
+// list[0] = live count, list[1 ..] = live tile ids ascending (one block of 1024: ballot scan per 1024 tiles, the
+// sj_live_record_list pattern of the 4/4 stream kernel)
+static __global__ void __launch_bounds__(1024) sj_kvarn_live_tile_list(const uint8_t * __restrict__ flags, const int n_tiles,
+        int32_t * __restrict__ list) {
+    __shared__ int warp_counts[32];
+    __shared__ int base;
+    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE, nwarps = blockDim.x / WARP_SIZE;
+    if (tid == 0) {
+        base = 0;
+    }
+    __syncthreads();
+    for (int t0 = 0; t0 < n_tiles; t0 += blockDim.x) {
+        const int t = t0 + tid;
+        const bool live = t < n_tiles && flags[t] != 0;
+        const uint32_t bal = __ballot_sync(0xFFFFFFFF, live);
+        if (lane == 0) {
+            warp_counts[warp] = __popc(bal);
+        }
+        __syncthreads();
+        int before = base;
+        for (int w = 0; w < warp; ++w) {
+            before += warp_counts[w];
+        }
+        if (live) {
+            list[1 + before + __popc(bal & ((1u << lane) - 1u))] = t;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            for (int w = 0; w < nwarps; ++w) {
+                base += warp_counts[w];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        list[0] = base;
+    }
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2, int bits_k, int bits_v, bool rot = false>
 void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -86,10 +165,48 @@ void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor
 #endif // !defined(GGML_USE_MUSA)
     }
 
+    // GGML_SJKVARN_LIVE_TILES: trellis build, one shared mask (no per-head or per-sequence mask), no LSA block list
+    ggml_cuda_pool_alloc<uint8_t> live_flags(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> live_list(ctx.pool());
+    if constexpr ((bits_k & 24) != 0 && ncols2 > 1) {
+        const ggml_tensor * mask = dst->src[3];
+        const int64_t positions = ggml_get_op_params_i32(KQV, 6);
+        const int64_t n_tiles   = (positions + nbatch_fa - 1) / nbatch_fa;
+        const bool    packed    = mask && mask->type == GGML_TYPE_I32;
+        // columns a row holds: f16 entries, or 32 per I32 word
+        const int64_t mask_cols = !mask ? 0 : packed ? (mask->nb[1]/4)*32 : mask->ne[0];
+        // the kernel reads mask plane 0 for every head (mask + nb33*sequence, no nb32 term), so the flags read plane 0 too
+        const bool use = mask && (mask->type == GGML_TYPE_F16 || packed) && mask->ne[3] == 1 &&
+                dst->src[0]->ne[3] == 1 && mask->ne[1] >= dst->src[0]->ne[1] && positions > 0 && n_tiles*nbatch_fa <= mask_cols &&
+                nbatch_fa % 32 == 0 && ggml_flash_attn_ext_get_lsa_block(KQV) == 0 && !ggml_flash_attn_ext_get_lsa_vk(KQV);
+        if (sj_kvarn_live_tiles()) {
+            // route proof for end-to-end gates: one line for the first launch that takes the walk, one for the first that cannot
+            static std::atomic_flag noted[2] = {ATOMIC_FLAG_INIT, ATOMIC_FLAG_INIT};
+            if (!noted[use ? 1 : 0].test_and_set()) {
+                GGML_LOG_INFO("%s: SJ-KVaRN trellis live-tile walk %s (mask %s, n_q %d, tiles %d)\n", __func__,
+                    use ? "ON" : "OFF: unsupported mask/shape", mask ? ggml_type_name(mask->type) : "none",
+                    (int) dst->src[0]->ne[1], (int) n_tiles);
+            }
+        }
+        if (sj_kvarn_live_tiles() && use) {
+            live_flags.alloc(n_tiles);
+            live_list.alloc(n_tiles + 1);
+            constexpr int warps_per_block = 8;
+            sj_kvarn_live_tile_flags<<<(n_tiles + warps_per_block - 1)/warps_per_block, warps_per_block*WARP_SIZE, 0, ctx.stream()>>>(
+                (const char *) mask->data, (int64_t) mask->nb[1], (int) dst->src[0]->ne[1], packed ? 1 : 0, nbatch_fa, (int) n_tiles,
+                live_flags.ptr);
+            CUDA_CHECK(cudaGetLastError());
+            sj_kvarn_live_tile_list<<<1, 1024, 0, ctx.stream()>>>(live_flags.ptr, (int) n_tiles, live_list.ptr);
+            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_fattn_sj_live_tiles = live_list.ptr;
+        }
+    }
+
     // K/V stay in their ring storage format; only shared tiles are decoded. stream_k = true.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host);
+    ggml_cuda_fattn_sj_live_tiles = nullptr;
 }
 
 

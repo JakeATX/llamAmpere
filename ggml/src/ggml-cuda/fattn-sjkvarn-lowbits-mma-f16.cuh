@@ -653,7 +653,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
                 const int bits = is_V ? kv.bits_v : kv.bits_k;
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
-                if (kv.stage_token_strip) {
+                if (GGML_CUDA_LSA_STAGE_STRIPS_KERNEL && kv.stage_token_strip) {
 #pragma unroll
                     for (int l = 0; l < 4; ++l) {
                         half vals[2];
@@ -715,7 +715,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
                 const int bits = is_V ? kv.bits_v : kv.bits_k;
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
-                if (kv.stage_token_strip) {
+                if (GGML_CUDA_LSA_STAGE_STRIPS_KERNEL && kv.stage_token_strip) {
 #pragma unroll
                     for (int l = 0; l < 4; ++l) {
                         half vals[2];
@@ -781,6 +781,10 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
 template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool is_V>
 static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
         const char * rec, int t0, const fattn_sj_kvarn_lowbits_ctx & kv, half2 * tile, int i_sup) {
+#if !GGML_CUDA_LSA_STAGE_STRIPS_KERNEL
+    // -DGGML_CUDA_LSA_STAGE_STRIPS=OFF build: no compact-strip path in the kernel (see qsa-resident-clock.cuh), raw loader frame
+    flash_attn_ext_sj_kvarn_load_tile_raw<stride_tile, swz, nbatch_fa, nthreads, D2, oob_check, is_V>(rec, t0, kv, tile, i_sup);
+#else
     const auto * map = kv.page_map;
     const uintptr_t delta = reinterpret_cast<uintptr_t>(rec) - reinterpret_cast<uintptr_t>(kv.page_stage);
     if (!map || delta >= size_t(map->stage_n)*map->stage_stride || delta%map->stage_stride != 0) {
@@ -809,6 +813,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
         c.k_tok = c.v_payload + vb; c.v_scale = c.k_tok + 32; c.v_zero = c.v_scale + 32;
         flash_attn_ext_sj_kvarn_load_tile_raw<stride_tile, swz, 16, nthreads, D2, oob_check, is_V>(rec, 0, c, tile, i_sup - s*16, s*16);
     }
+#endif // GGML_CUDA_LSA_STAGE_STRIPS_KERNEL
 }
 
 
@@ -1834,12 +1839,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         float        * const __restrict__ KQ_max,
         float        * const __restrict__ KQ_rowsum,
         const int jt,
-        const int kb0,
+        const int kb0_in,
         const int k_VKQ_sup,
         char         * const __restrict__ raw_K,
         char         * const __restrict__ raw_V,
         const fattn_sj_kvarn_lowbits_ctx & kv) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+    // GGML_SJKVARN_LIVE_TILES: kb0_in is an index into the live-tile list; past its end (a block with less than one live
+    // tile) there is nothing to add. Every thread reads the same entry, so the early return is block-uniform; the previous
+    // iteration ended on a barrier (nstages == 0 here).
+    int kb0 = kb0_in;
+    if constexpr (type_K == GGML_TYPE_I8 && ncols2 > 1 && !use_sparse) {
+        if (kv.live_tiles != nullptr) {
+            if (kb0_in >= kv.live_tiles[0]) {
+                return;
+            }
+            kb0 = kv.live_tiles[1 + kb0_in];
+        }
+    }
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
@@ -2488,7 +2505,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         scale, slope, logit_softcap, ne01, ne02,
         stride_K, stride_V, stride_mask,
         tile_Q, tile_K, tile_V, tile_mask,
-        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0, kv);
+        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0_in, kv);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -3300,7 +3317,9 @@ static __global__ void flash_attn_ext_f16(
     const char * GGML_CUDA_RESTRICT V              = V_ptr;
     const char * GGML_CUDA_RESTRICT mask           = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks          = sinks_ptr;
-    const int  * GGML_CUDA_RESTRICT KV_max         = use_sparse ? nullptr : KV_max_ptr;
+    // SJ-KVaRN: the KV_max slot carries the live-tile list (GGML_SJKVARN_LIVE_TILES) or nullptr, never a KV bound
+    const int  * GGML_CUDA_RESTRICT KV_max         = use_sparse || type_K == GGML_TYPE_I8 ? nullptr : KV_max_ptr;
+    const int  * GGML_CUDA_RESTRICT live_tiles     = type_K == GGML_TYPE_I8 && ncols2 > 1 && !use_sparse ? KV_max_ptr : nullptr;
     const int  * GGML_CUDA_RESTRICT sparse_indices = use_sparse ? KV_max_ptr : nullptr;
     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
@@ -3375,9 +3394,12 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_V = V_is_K_view ? stride_K : (is_turbo_kv ? nb21 : nb21 / sizeof(half2));
 
-    const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
+    // live-tile walk: the k axis is the live list, at least one entry per block of an output tile (the launch gives each
+    // output tile gridDim.x/ntiles_dst blocks), so no block spans two output tiles and the uniform fixup applies
+    const int iter_k     = live_tiles == nullptr ? (ne11 + (nbatch_fa - 1)) / nbatch_fa :
+        max(live_tiles[0], int(gridDim.x) / (iter_j*iter_z_gqa*ne12*ne03));
 
     // kbc == k block continuous, current index in continuous ijk space.
     int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
@@ -3415,6 +3437,7 @@ static __global__ void flash_attn_ext_f16(
         fattn_sj_kvarn_lowbits_ctx kv = {};
         if constexpr (is_sj_kvarn) {
             kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, bits_k, bits_v, nb12, nb22, ne01.z);
+            kv.live_tiles = live_tiles;
         }
 
         if (KV_max) {
@@ -3467,6 +3490,7 @@ static __global__ void flash_attn_ext_f16(
     fattn_sj_kvarn_lowbits_ctx kv = {};
     if constexpr (is_sj_kvarn) {
         kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, bits_k, bits_v, nb12, nb22, ne01.z);
+        kv.live_tiles = live_tiles;
     }
 
     if (KV_max) {

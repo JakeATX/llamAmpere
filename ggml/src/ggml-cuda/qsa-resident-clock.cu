@@ -150,7 +150,18 @@ static bool lsa_stage_strips() {
         const char * v = getenv("GGML_CUDA_LSA_RESIDENT_STAGE_STRIPS");
         return v && atoi(v) > 0;
     }();
+#if !GGML_CUDA_LSA_STAGE_STRIPS_KERNEL
+    static const bool warned = [] {
+        if (on) {
+            GGML_LOG_WARN("%s: GGML_CUDA_LSA_RESIDENT_STAGE_STRIPS ignored: built without GGML_CUDA_LSA_STAGE_STRIPS_KERNEL (whole-record stage)\n", __func__);
+        }
+        return true;
+    }();
+    GGML_UNUSED(warned);
+    return false;
+#else
     return lsa_stage_all() && on;
+#endif
 }
 static bool lsa_overflow_log() {
     static const bool on = [] {

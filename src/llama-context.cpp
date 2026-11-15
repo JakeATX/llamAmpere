@@ -787,6 +787,45 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
+    // [D1] LLAMA_D1_HEAD scope decision (design 3.1). It is made before the backend samplers below call set_sampler,
+    // so the d1 refusal there also covers -bs.
+    {
+        llama_d1_scope_in din;
+        din.head_path   = getenv("LLAMA_D1_HEAD");
+        din.ctx_default = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+        din.embeddings  = cparams.embeddings;
+        din.mtp_chain   = cparams.mtp_chain;
+        din.no_alloc    = model.no_alloc();
+        if (model.output) {
+            din.out_type = (int) model.output->type;
+            din.out_ne0  = model.output->ne[0];
+            din.out_ne1  = model.output->ne[1];
+        }
+        din.n_embd  = model.hparams.n_embd;
+        din.n_vocab = model.vocab.n_tokens();
+        std::shared_ptr<llama_d1_head> d1_head;
+        std::string d1_msg;
+        const auto env_int = [](const char * name, long def) {
+            const char * v = getenv(name);
+            return v && v[0] ? strtol(v, nullptr, 10) : def;
+        };
+        switch (llama_d1_scope(din, model.d1, d1_head, d1_msg)) {
+            case LLAMA_D1_SCOPE_UNSET: break;
+            case LLAMA_D1_SCOPE_OFF:   LLAMA_LOG_INFO("d1: off for this context (%s)\n", d1_msg.c_str()); break;
+            case LLAMA_D1_SCOPE_WARN:  LLAMA_LOG_WARN("d1: off for this context (%s)\n", d1_msg.c_str()); break;
+            case LLAMA_D1_SCOPE_ERROR: throw std::runtime_error("d1: " + d1_msg);
+            case LLAMA_D1_SCOPE_ON:
+                {
+                    const int n_top = (int) std::max(0L, env_int("LLAMA_D1_N", 256));
+                    const int eager = (int) std::max(0L, env_int("LLAMA_D1_EAGER_MAX", std::max<long>(64, 8L * cparams.n_seq_max)));
+                    const int n_thr = (int) std::max(1L, env_int("LLAMA_D1_THREADS", std::min<long>(cparams.n_threads, 8)));
+                    d1 = std::make_unique<llama_d1_ctx>(d1_head, n_top, eager, n_thr);
+                    LLAMA_LOG_INFO("d1: AIT2 head + exact rescore of top N=%d from %s (rows %s, eager_max %d, threads %d)\n",
+                            n_top, d1_head->path.c_str(), d1_head->type == GGML_TYPE_F16 ? "f16" : "q8_0", eager, n_thr);
+                } break;
+        }
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -1644,6 +1683,9 @@ void llama_context::ple_hint_add(const llama_token * window, int32_t n_window) {
 }
 
 llama_context::~llama_context() {
+    if (d1) {
+        LLAMA_LOG_INFO("%s\n", d1->summary().c_str()); // [D1] exit counters (gate 8.0(d))
+    }
     if (pp_warm_thread.joinable()) {
         pp_warm_thread.join();
         g_pp_overlap_prompt = false;
@@ -1799,8 +1841,13 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
         const int force = env != nullptr && env[0] != '\0' ? atoi(env) : -1;
         const bool is_exl3 = ggml_exl3_bits(head->type) != 0;
         const bool is_ai   = ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0; // AI+ tiles too
+        const bool full_head = llama_draft_vocab_full_head(head);
         const bool want = !model.no_alloc() && !model.hadamard_rotations.count(head) &&
-                n_sel < head->ne[1] && (force == 1 || (force != 0 && (is_exl3 || is_ai)));
+                !full_head && n_sel < head->ne[1] && (force == 1 || (force != 0 && (is_exl3 || is_ai)));
+        if (full_head) {
+            LLAMA_LOG_WARN("%s: draft shortlist uses existing %s head (%s), no compact weight copy\n",
+                    __func__, ggml_get_name(head), ggml_type_name(head->type));
+        }
         if (want) {
             compact_type = is_ai ? GGML_TYPE_Q6_K : GGML_TYPE_IQ4_XS;
             if (const char * te = getenv("LLAMA_DRAFT_VOCAB_COMPACT_TYPE"); te != nullptr && te[0] != '\0') {
@@ -3139,6 +3186,13 @@ int32_t llama_sj_kvarn_ckpt_sealed_end(const uint8_t * data, size_t size, llama_
     return (int32_t) t[0];
 }
 
+void llama_d1_log_counters(llama_context * ctx, const char * tag) {
+    const std::string s = ctx ? ctx->d1_counters_delta() : std::string();
+    if (!s.empty()) {
+        LLAMA_LOG_INFO("d1 req: %s %s\n", tag ? tag : "", s.c_str());
+    }
+}
+
 llama_pos llama_sj_kvarn_ckpt_floor(llama_context * ctx, llama_pos pos) {
     auto * kv = ctx ? llama_sj_kvarn_cache(ctx->get_memory()) : nullptr;
     if (!kv || !kv->is_sj_kvarn() || pos < 0) { return pos; }
@@ -3227,6 +3281,10 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
+    if (d1 && logits.data) {
+        d1->on_read_all(logits.data, model.vocab.n_tokens(), n_outputs); // [D1] callers synchronize first
+    }
+
     return logits.data;
 }
 
@@ -3268,6 +3326,9 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        if (d1) {
+            d1->on_read_row(logits.data, model.vocab.n_tokens(), j, n_outputs); // [D1] callers synchronize first
+        }
         return logits.data + j * model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -5061,6 +5122,20 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
+    if (sampler && d1) {
+        // [D1] backend sampling (-bs, GPU greedy/sampled verify, top-K verify) would sample coarse logits on the card
+        static bool warned = false;
+        if (!warned) {
+            LLAMA_LOG_WARN("d1: backend sampling refused, using CPU sampling\n");
+            warned = true;
+        }
+        if (sampling.samplers.count(seq_id) > 0) {
+            sched_need_reserve = true;
+        }
+        sampling.samplers.erase(seq_id);
+        return false;
+    }
+
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         static bool warned = false;
         if (!warned) {
@@ -6493,7 +6568,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        const bool raw_logits_copied = logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers);
+        if (raw_logits_copied) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -6506,6 +6582,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     cparams.mtp_chain ? ggml_nbytes(t_logits) : (size_t) n_outputs * n_vocab * sizeof(float);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, extract_bytes);
             }
+        }
+
+        // [D1] full-vocab rows of this ubatch: copy their post-norm hidden rows (res->t_embd, before any pooled swap)
+        if (d1 && raw_logits_copied && !cparams.mtp_chain && res->t_logits_ids == nullptr) {
+            ggml_tensor * th = res->get_embd();
+            const bool has_h = th && th->type == GGML_TYPE_F32 && ggml_is_contiguous(th) &&
+                    th->ne[0] == d1->head->n_embd && th->ne[1] == n_outputs &&
+                    t_logits->ne[0] == (int64_t) n_vocab && t_logits->ne[1] == n_outputs;
+            if (has_h) {
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), th);
+                GGML_ASSERT(backend_h != nullptr);
+                ggml_backend_tensor_get_async(backend_h, th, d1->h_row(n_outputs_prev), 0,
+                        (size_t) n_outputs * d1->head->n_embd * sizeof(float));
+            }
+            d1->mark_copied(n_outputs_prev, n_outputs, has_h);
         }
 
         // extract embeddings
@@ -7042,6 +7133,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
     this->n_outputs = 0;
     GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
     n_outputs_reserved = (uint32_t) n_outputs_max;
+    if (d1) {
+        d1->reset(n_outputs_max); // [D1] like the logits, every row of the previous call is invalid now
+    }
     return n_outputs_max;
 }
 
@@ -7094,6 +7188,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0 * n_vocab + k], logits.data[i1 * n_vocab + k]);
             }
+        }
+
+        if (d1) {
+            d1->swap_rows((int64_t) i0, (int64_t) i1); // [D1] h, row state and read flag follow their logits row
         }
 
         if (embd.size > 0) {

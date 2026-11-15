@@ -6,6 +6,8 @@
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-ai4.h"
+#include "ggml-aif25.h"
+#include "ggml-aif175.h"
 #include "ggml-ai4-decode.h"
 #include "ggml-ait.h"
 
@@ -15,6 +17,8 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+
+#include "ggml-aif175-trellis.h"
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -5989,6 +5993,26 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I64:
             // nothing to validate
             break;
+        case GGML_TYPE_AIF175_U2:
+        case GGML_TYPE_AIF25_U2:
+        case GGML_TYPE_AIF25_U2_512:
+            {
+                // Row scales are interleaved in complete 16-row storage blocks.
+                const size_t block_bytes = type == GGML_TYPE_AIF175_U2 ? AIF175_BLOCK_BYTES :
+                    type == GGML_TYPE_AIF25_U2_512 ? AIF25_V2_512_BLOCK_BYTES : AIF25_V2_BLOCK_BYTES;
+                if (nbytes % block_bytes != 0 || (nbytes != 0 && data == NULL)) {
+                    fprintf(stderr, "%s: incomplete or missing fractional U2 storage blocks\n", __func__);
+                    return false;
+                }
+                const uint8_t * bytes = (const uint8_t *) data;
+                for (size_t b = 0; b < nbytes/block_bytes; ++b) {
+                    const uint8_t * block = bytes + b*block_bytes;
+                    for (size_t r = 0; r < 16; ++r) {
+                        const ggml_fp16_t scale = (ggml_fp16_t) ((uint16_t) block[2*r] | ((uint16_t) block[2*r+1] << 8));
+                        if (!validate_fp16(scale, 16*b+r)) { return false; }
+                    }
+                }
+            } break;
         case GGML_TYPE_TQ3_1S:
         case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_TURBO3_0:
@@ -6002,6 +6026,9 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_AIT2_U2:
         case GGML_TYPE_AIT3_U2:
         case GGML_TYPE_AIT4_U2:
+        case GGML_TYPE_AIT2_U2_512:
+        case GGML_TYPE_AIT3_U2_512:
+        case GGML_TYPE_AIT4_U2_512:
         case GGML_TYPE_AIT3_U:
         case GGML_TYPE_AIT4_U:
         case GGML_TYPE_AIT2:
@@ -6035,7 +6062,23 @@ static inline float ggml_exl3_mul1_decode(uint32_t code) {
 }
 
 // ---- AI+ host slab decoder (ggml-ai4-decode.h) ----
+bool ggml_aif175_quantize_slab(const float * x, int64_t K, void * data, size_t nbytes) {
+    return aif175_quantize_slab_impl(x, K, data, nbytes, malloc, free);
+}
+
 size_t ggml_ai4_slab_nbytes(enum ggml_type type, int64_t K) {
+    if (type == GGML_TYPE_AIF175_U2) {
+        return K > 0 && K % 512 == 0 && (uint64_t)(K/512) <= SIZE_MAX/AIF175_BLOCK_BYTES ?
+            (size_t)(K/512)*AIF175_BLOCK_BYTES : 0;
+    }
+    if (type == GGML_TYPE_AIF25_U2) {
+        return K > 0 && K % 640 == 0 && (uint64_t)(K/640) <= SIZE_MAX/AIF25_V2_BLOCK_BYTES ?
+            (size_t)(K/640)*AIF25_V2_BLOCK_BYTES : 0;
+    }
+    if (type == GGML_TYPE_AIF25_U2_512) {
+        return K > 0 && K % 512 == 0 && (uint64_t)(K/512) <= SIZE_MAX/AIF25_V2_512_BLOCK_BYTES ?
+            (size_t)(K/512)*AIF25_V2_512_BLOCK_BYTES : 0;
+    }
     if (ggml_ait_rate(type) != 0) {
         // AIT: chunks are 32 rows x 512 K, so a 16-row slab is half a chunk row; the decoder addresses (row, col) directly
         return K > 0 && K % AIT_KB == 0 ? (size_t) 16 * (size_t) (K / AIT_KS) * (64 * ggml_ait_rate(type) + 2) : 0;
@@ -6045,7 +6088,8 @@ size_t ggml_ai4_slab_nbytes(enum ggml_type type, int64_t K) {
         return 0;
     }
     if (ggml_ai4v2_rate(type) != 0) {
-        return K % AI4V2_BK == 0 ? (size_t) ai4x_slab_bytes_v2(K, k) : 0;
+        const int units = ggml_ai4v2_chunks(type);   // 5 (640 K) or 4 (512 K)
+        return units > 0 && K % ((int64_t) units*AI4U_UK) == 0 ? (size_t) ai4x_slab_bytes_v2n(K, k, units) : 0;
     }
     return (size_t) ai4x_slab_bytes_k(K, k);
 }
@@ -6054,6 +6098,21 @@ bool ggml_ai4_dequantize_slab(enum ggml_type type, const void * data, int64_t K,
     const size_t sb = ggml_ai4_slab_nbytes(type, K);
     if (sb == 0 || data == NULL || y == NULL || g < 0) {
         return false;
+    }
+    if (type == GGML_TYPE_AIF175_U2 || type == GGML_TYPE_AIF25_U2 || type == GGML_TYPE_AIF25_U2_512) {
+        if ((uint64_t)g > (SIZE_MAX - sb)/sb || (uint64_t)K > SIZE_MAX/(16*sizeof(float))) {
+            return false;
+        }
+        const uint8_t * slab = (const uint8_t *)data + (size_t)g*sb;
+        if (!ggml_validate_row_data(type, slab, sb)) { return false; }
+        if (type == GGML_TYPE_AIF175_U2) {
+            aif175_dequantize_slab(slab, y, K);
+        } else if (type == GGML_TYPE_AIF25_U2_512) {
+            aif25_dequantize_slab_v2_512(slab, y, K);
+        } else {
+            aif25_dequantize_slab_v2(slab, y, K);
+        }
+        return true;
     }
     if (ggml_ait_rate(type) != 0) {
         // AIT: rotated-basis weight (level x row scale x col scale / 64), then undo the H256 rotation per 256-K block
@@ -6071,7 +6130,8 @@ bool ggml_ai4_dequantize_slab(enum ggml_type type, const void * data, int64_t K,
         return true;
     }
     if (ggml_ai4v2_rate(type) != 0) {
-        aik_dequantize_slab_v2_c(ggml_ai4_rate(type), ggml_ai4_trellis_mul(type), (const uint8_t *) data + (size_t) g * sb, y, K);
+        aik_dequantize_slab_v2_n(ggml_ai4_rate(type), ggml_ai4_trellis_mul(type), (const uint8_t *) data + (size_t) g * sb, y, K,
+                                 ggml_ai4v2_chunks(type));
         return true;
     }
     aik_dequantize_slab_c(ggml_ai4_rate(type), ggml_ai4_trellis_mul(type), (const uint8_t *) data + (size_t) g * sb, y, K);

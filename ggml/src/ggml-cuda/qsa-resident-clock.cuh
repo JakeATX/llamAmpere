@@ -2,6 +2,16 @@
 
 #include "common.cuh"
 
+// Compact token-strip stage decode (GGML_CUDA_LSA_RESIDENT_STAGE_STRIPS=1) inside the low-bit SJ-KVaRN tile loader.
+// Compiled in by default (unchanged). With it in, every low-bit flash_attn_ext_f16 kernel carries the strip loader inline
+// and its per-thread stack frame grows from ~240 to 830-1000 bytes. The driver keeps that stack for every thread of the
+// card (SMs x 1536), so the first low-bit FA launch takes ~74 MiB more device memory (84 SMs), stage strips used or not.
+// Small-card builds (8 GB) opt out with cmake -DGGML_CUDA_LSA_STAGE_STRIPS=OFF (defines this macro as 0); such a
+// build refuses GGML_CUDA_LSA_RESIDENT_STAGE_STRIPS=1 with a warning and stages whole records.
+#ifndef GGML_CUDA_LSA_STAGE_STRIPS_KERNEL
+#define GGML_CUDA_LSA_STAGE_STRIPS_KERNEL 1
+#endif
+
 // Four-token pages keep the scalar codec's record metadata resident without changing its bytes.
 constexpr int GGML_QSA_PAGE_CELLS = 4;
 constexpr int GGML_QSA_PAGE_HEAD_BYTES = 1048;

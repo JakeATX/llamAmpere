@@ -165,6 +165,10 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()
 
+    if (NOT GGML_CUDA_LSA_STAGE_STRIPS)
+        add_compile_definitions(GGML_CUDA_LSA_STAGE_STRIPS_KERNEL=0)
+    endif()
+
     if (GGML_CUDA_FORCE_MMQ)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()

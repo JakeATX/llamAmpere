@@ -100,6 +100,9 @@ const llama_lsa_config & llama_lsa_cfg() {
         c.fast      = lsa_env_i64("LLAMA_LSA_FAST",      0) != 0;
         c.idx_cache = lsa_env_i64("LLAMA_LSA_IDX_CACHE", 0) != 0;
         c.idx_q8    = lsa_env_i64("LLAMA_LSA_IDX_Q8",    0) != 0 && c.idx_cache;
+        c.idx_q4    = lsa_env_i64("LLAMA_LSA_IDX_Q4",    0) != 0 && c.idx_cache;
+        c.idx_skip_dense = lsa_env_i64("LLAMA_LSA_IDX_SKIP_DENSE", 0) != 0;
+        c.mean_chunks = lsa_env_i64("LLAMA_LSA_MEAN_CHUNKS", 0) != 0;
         c.sj_compact = lsa_env_i64("LLAMA_LSA_SJ_COMPACT", 0) != 0;
         if (c.sj_compact) {
             setenv("GGML_SJKVARN_COMPACT_MAX_BOUND", "262144", 0); // the kept set is 10-20K cells; ggml's default cap is 4096
@@ -125,9 +128,10 @@ const llama_lsa_config & llama_lsa_cfg() {
         c.block_sum = lsa_env_i64("LLAMA_LSA_BLOCK_SUM", 0) != 0 && c.block > 1 && c.idx_cache && c.mode == llama_lsa_config::KEY;
         c.block_sum_mode = lsa_env_i64("LLAMA_LSA_BLOCK_SUM", 0) == 2 ? 2 : 1;
         c.sum_op    = c.block_sum && lsa_env_i64("LLAMA_LSA_SUM_OP", 0) != 0;
-        if (c.block_sum && c.idx_q8) {
-            LLAMA_LOG_WARN("%s: LLAMA_LSA_IDX_Q8 is not supported with LLAMA_LSA_BLOCK_SUM, index cache stays f16\n", __func__);
+        if (c.block_sum && (c.idx_q8 || c.idx_q4)) {
+            LLAMA_LOG_WARN("%s: LLAMA_LSA_IDX_Q8/Q4 is not supported with LLAMA_LSA_BLOCK_SUM, index cache stays f16\n", __func__);
             c.idx_q8 = false;
+            c.idx_q4 = false;
         }
         const int64_t comp_lvl = lsa_env_i64("LLAMA_LSA_COMP", 0);
         c.comp       = comp_lvl != 0;
@@ -257,7 +261,7 @@ static std::string llama_lsa_describe_cfg(const llama_lsa_config & c) {
     std::ostringstream os;
     os << "mode=" << names[c.mode] << " keep=" << c.keep << " keep_frac=" << c.keep_frac << " sinks=" << c.sinks
        << " window=" << c.window << " bucket=" << c.bucket << " max_rows=" << c.max_rows << " min_pos=" << c.min_pos
-       << " graph_reuse=" << (c.graph_reuse ? 1 : 0) << " fa_sparse=" << (c.fa_sparse ? 1 : 0) << " shared=" << (c.shared_union ? 3 : c.shared ? (c.shared_max ? 2 : 1) : 0) << " smax_chain=" << (c.smax_chain ? 1 : 0) << " elig=" << (c.elig_drop ? 1 : 0) << " pick_every=" << c.pick_every << " pick_check=" << (c.pick_check ? 1 : 0) << " blist_lean=" << (c.blist_lean ? 1 : 0) << " packed=" << (c.packed ? 1 : 0) << " blk_list=" << (c.blk_list ? 1 : 0) << " vk=" << (c.vk ? 1 : 0) << " fast=" << (c.fast ? 1 : 0) << " idx_cache=" << (c.idx_cache ? 1 : 0) << " idx_q8=" << (c.idx_q8 ? 1 : 0) << " sj_compact=" << (c.sj_compact ? 1 : 0) << " block=" << c.block << " block_tau=" << c.block_tau << " block_sum=" << (c.block_sum ? c.block_sum_mode : 0) << " comp=" << (c.comp ? (c.comp_fast ? 2 : 1) : 0) << " comp_bias=" << c.comp_bias << " comp_max_t=" << c.comp_max_t << " comp_lb=" << (c.comp_lb ? 1 : 0) << " blk_mask_legacy=" << (c.blk_mask_legacy ? 1 : 0) << " comp_cnt_legacy=" << (c.comp_cnt_legacy ? 1 : 0) << " comp_cnt_exp=" << (c.comp_cnt_exp ? 1 : 0) << " rec_blk=" << (c.rec_blk ? 1 : 0) << " fused_sel=" << (c.fused_sel ? 1 : 0) << " unit_op=" << (c.unit_op ? 1 : 0) << " fused_comp=" << (c.fused_comp ? 1 : 0) << " ring=" << (c.ring_legacy ? std::string("legacy") : std::to_string(c.ring_rows)) << " blk_lse=" << (c.blk_lse ? 1 : 0) << " refine=" << c.refine << " refine_mult=" << c.refine_mult << " refine_sh=" << (c.refine_sh ? 1 : 0) << " blist_fine=" << (c.blist_min_unit < 16 ? 1 : 0) << " dump=" << (c.dump.empty() ? 0 : 1) << " sj_skip=" << (c.sj_skip ? 1 : 0) << " per_head=" << (c.per_head ? 1 : 0) << " resident=" << c.resident << " res_auto=" << (c.resident_auto ? 1 : 0) << " layers=" << (c.layers.empty() ? "all" : c.layers)
+       << " graph_reuse=" << (c.graph_reuse ? 1 : 0) << " fa_sparse=" << (c.fa_sparse ? 1 : 0) << " shared=" << (c.shared_union ? 3 : c.shared ? (c.shared_max ? 2 : 1) : 0) << " smax_chain=" << (c.smax_chain ? 1 : 0) << " elig=" << (c.elig_drop ? 1 : 0) << " pick_every=" << c.pick_every << " pick_check=" << (c.pick_check ? 1 : 0) << " blist_lean=" << (c.blist_lean ? 1 : 0) << " packed=" << (c.packed ? 1 : 0) << " blk_list=" << (c.blk_list ? 1 : 0) << " vk=" << (c.vk ? 1 : 0) << " fast=" << (c.fast ? 1 : 0) << " idx_cache=" << (c.idx_cache ? 1 : 0) << " idx_q8=" << (c.idx_q8 ? 1 : 0) << " idx_q4=" << (c.idx_q4 ? 1 : 0) << " idx_skip_dense=" << (c.idx_skip_dense ? 1 : 0) << " mean_chunks=" << (c.mean_chunks ? 1 : 0) << " sj_compact=" << (c.sj_compact ? 1 : 0) << " block=" << c.block << " block_tau=" << c.block_tau << " block_sum=" << (c.block_sum ? c.block_sum_mode : 0) << " comp=" << (c.comp ? (c.comp_fast ? 2 : 1) : 0) << " comp_bias=" << c.comp_bias << " comp_max_t=" << c.comp_max_t << " comp_lb=" << (c.comp_lb ? 1 : 0) << " blk_mask_legacy=" << (c.blk_mask_legacy ? 1 : 0) << " comp_cnt_legacy=" << (c.comp_cnt_legacy ? 1 : 0) << " comp_cnt_exp=" << (c.comp_cnt_exp ? 1 : 0) << " rec_blk=" << (c.rec_blk ? 1 : 0) << " fused_sel=" << (c.fused_sel ? 1 : 0) << " unit_op=" << (c.unit_op ? 1 : 0) << " fused_comp=" << (c.fused_comp ? 1 : 0) << " ring=" << (c.ring_legacy ? std::string("legacy") : std::to_string(c.ring_rows)) << " blk_lse=" << (c.blk_lse ? 1 : 0) << " refine=" << c.refine << " refine_mult=" << c.refine_mult << " refine_sh=" << (c.refine_sh ? 1 : 0) << " blist_fine=" << (c.blist_min_unit < 16 ? 1 : 0) << " dump=" << (c.dump.empty() ? 0 : 1) << " sj_skip=" << (c.sj_skip ? 1 : 0) << " per_head=" << (c.per_head ? 1 : 0) << " resident=" << c.resident << " res_auto=" << (c.resident_auto ? 1 : 0) << " layers=" << (c.layers.empty() ? "all" : c.layers)
        << " keep_frac_layers=" << (c.keep_frac_layers.empty() ? "none" : c.keep_frac_layers)
        << " keep_sched=" << (c.keep_sched.empty() ? "none" : c.keep_sched) << " resident_mib=" << c.resident_mib << " sticky=" << c.resident_sticky
        << " topp=" << c.topp << " topp_tau=" << c.topp_tau << " topp_min=" << c.topp_min << " stats=" << (c.stats ? 1 : 0) << " recall=" << (c.recall ? 1 : 0)
@@ -764,7 +768,8 @@ bool llama_lsa_idx_get(const ggml_tensor * kcache, int64_t d_idx, ggml_backend_b
     auto & s = lsa_idx();
     std::lock_guard<std::mutex> lock(s.mtx);
     auto & en = s.e[kcache];
-    const ggml_type type = llama_lsa_cfg().idx_q8 && d_idx % ggml_blck_size(GGML_TYPE_Q8_0) == 0 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+    const ggml_type type = llama_lsa_cfg().idx_q4 && d_idx % ggml_blck_size(GGML_TYPE_Q4_0) == 0 ? GGML_TYPE_Q4_0 :
+                           llama_lsa_cfg().idx_q8 && d_idx % ggml_blck_size(GGML_TYPE_Q8_0) == 0 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
     if (en.t && (en.t->ne[0] != d_idx || en.t->ne[1] != kv_size || en.t->ne[2] != n_head)) {
         return false; // shape changed under the same tensor: never expected, stay on the recompute path
     }
@@ -1397,7 +1402,7 @@ void llama_lsa_idx_state_read(llama_io_read_i & io) {
             io.read(&type,   sizeof(type));
         }
         if (d_idx <= 0 || d_idx > 4096 || n_head <= 0 || n_head > 64 ||
-                (type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0) || d_idx % ggml_blck_size((ggml_type) type) != 0) {
+                (type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q4_0) || d_idx % ggml_blck_size((ggml_type) type) != 0) {
             throw std::runtime_error("corrupt LSA index cache state layer");
         }
         const size_t row_bytes = ggml_row_size((ggml_type) type, d_idx);

@@ -1339,6 +1339,15 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+// GGML_CUDA_GRAPH_LOG=1 (opt-in): one INFO line per CUDA graph capture and per LRU graph eviction (cap GGML_CUDA_GRAPH_MAX)
+static inline bool ggml_cuda_graph_log_on() {
+    static const bool on = [] {
+        const char * s = getenv("GGML_CUDA_GRAPH_LOG");
+        return s != nullptr && atoi(s) > 0;
+    }();
+    return on;
+}
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1359,6 +1368,7 @@ struct ggml_cuda_graph {
     uint64_t moe_cache_generation = 0;
     uint64_t lsa_j3_generation = 0; // GGML_CUDA_LSA_J3_GRAPHS: see ggml_cuda_lsa_j3_generation
     int64_t last_used_time = 0;
+    int stable_calls = 0; // warmup: calls in a row with no property change (GGML_CUDA_GRAPH_WARMUP)
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1762,9 +1772,18 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    static const size_t max_cuda_graphs = 64;
+    // GGML_CUDA_GRAPH_MAX=N (default 64): most graphs kept; the least recently used is evicted (and logged) past it
+    static size_t max_cuda_graphs() {
+        static const size_t v = [] {
+            const char * s = getenv("GGML_CUDA_GRAPH_MAX");
+            const int n = s ? atoi(s) : 64;
+            return (size_t) (n > 0 ? n : 64);
+        }();
+        return v;
+    }
 
     int64_t last_graph_eviction_sweep = 0;
+    uint64_t n_lru_evictions = 0;
 
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
         const int64_t time_now = ggml_time_us();
@@ -1790,12 +1809,20 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            while (cuda_graphs.size() >= max_cuda_graphs) {
+            while (cuda_graphs.size() >= max_cuda_graphs()) {
                 auto lru = cuda_graphs.begin();
                 for (auto c = cuda_graphs.begin(); c != cuda_graphs.end(); ++c) {
                     if (c->second->last_used_time < lru->second->last_used_time) {
                         lru = c;
                     }
+                }
+                // the cap must be >= the graphs one token uses on this device (splits x compute/optimize), else every
+                // eval misses and no graph is ever used; the count in the log line (GGML_CUDA_GRAPH_LOG=1) shows that thrash
+                ++n_lru_evictions;
+                if (ggml_cuda_graph_log_on() && (n_lru_evictions <= 256 || n_lru_evictions % 1024 == 0)) {
+                    GGML_LOG_INFO("cuda_graph: evict lru key %016llx (cap %zu, eviction %llu), unused %lld ms, instance %d\n",
+                        (unsigned long long) lru->first, max_cuda_graphs(), (unsigned long long) n_lru_evictions,
+                        (long long) ((time_now - lru->second->last_used_time) / 1000), (int) (lru->second->instance != nullptr));
                 }
                 cuda_graphs.erase(lru);
             }

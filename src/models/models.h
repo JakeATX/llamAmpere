@@ -2638,6 +2638,32 @@ struct llama_model_qwen35 : public llama_model_base {
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
                             int   il);
+
+        // mixed-shape pruned models (hparams.mix_enabled): one decoder layer with its own sublayer kinds and ramps
+        ggml_tensor * build_layer_mix(
+         llm_graph_input_mem_hybrid * inp,
+                    ggml_tensor * inpL,
+                    ggml_tensor * inp_pos,
+                    ggml_tensor * inp_out_ids,
+                            int   il);
+
+        // input of a mixed-shape sublayer: norm (none for a span), then the rank/span read matmul
+        ggml_tensor * build_mix_read(
+                    ggml_tensor * h,
+                    ggml_tensor * norm,
+                    ggml_tensor * rank_read,
+                       uint32_t   kind,
+                        int32_t   span,
+                            int   il);
+
+        // output of a mixed-shape sublayer: the rank/span write matmul
+        ggml_tensor * build_mix_write(
+                    ggml_tensor * out,
+                    ggml_tensor * rank_write,
+                       uint32_t   kind,
+                        int32_t   span,
+                            int   il);
+
     };
 
     struct graph_mtp : public llm_graph_context {

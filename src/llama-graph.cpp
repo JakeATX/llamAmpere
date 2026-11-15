@@ -5,6 +5,7 @@
 #include "llama-sampler.h"
 #include "llama-ext.h"
 #include "llama-mtp-chain-sample.h"
+#include "llama-draft-vocab-compact.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -6209,8 +6210,21 @@ bool llm_graph_context::build_attn_lsa_mean_refresh(
             if (nbs <= 0) {
                 return (ggml_tensor *) nullptr;
             }
-            ggml_tensor * x = ggml_cast(ctx0, ggml_view_2d(ctx0, base, dx*B, nbs, base->nb[1]*B, 0), GGML_TYPE_F32);
-            w = ggml_cpy(ctx0, mean_rows(x, dx), ggml_view_2d(ctx0, mc, dx, nbs, mc->nb[1], 0));
+            // LLAMA_LSA_MEAN_CHUNKS=1 (opt-in): full rebuild in at most 8 chunks of CB >= 16 blocks: only one chunk's F32
+            // copy and its permuted copy are live at a time (2*CB*B*dx*4 B instead of 2*nbs*B*dx*4 B, 130 MiB for a 16K MTP
+            // draft window); the cap keeps the extra graph nodes bounded on a large non-SJ main cache. Each block's mean is
+            // the same ops on the same rows and concat only moves the F32 results, so the means are the bits of one pass.
+            // Off (default): one chunk of all nbs blocks, the same graph as before.
+            const int64_t CB = llama_lsa_cfg().mean_chunks ? std::max<int64_t>(16, (nbs + 7)/8) : nbs;
+            ggml_tensor * m = nullptr;
+            for (int64_t c0 = 0; c0 < nbs; c0 += CB) {
+                const int64_t nc = std::min<int64_t>(CB, nbs - c0);
+                ggml_tensor * x  = ggml_cast(ctx0, ggml_view_2d(ctx0, base, dx*B, nc, base->nb[1]*B, (size_t) c0*B*base->nb[1]),
+                                             GGML_TYPE_F32);
+                ggml_tensor * mx = mean_rows(x, dx);
+                m = m ? ggml_concat(ctx0, m, mx, 1) : mx;
+            }
+            w = ggml_cpy(ctx0, m, ggml_view_2d(ctx0, mc, dx, nbs, mc->nb[1], 0));
         } else {
             ggml_tensor * g = ggml_get_rows(ctx0, ggml_view_2d(ctx0, base, dx*B, nbm, base->nb[1]*B, 0), inp->lsa_u_blk);
             w = ggml_set_rows(ctx0, mc, mean_rows(g, dx), inp->lsa_u_blk);
@@ -6366,6 +6380,11 @@ ggml_tensor * llm_graph_context::build_attn_lsa_idx(
     inp->lsa_smin_cur = nullptr;
     inp->lsa_sum_il   = -1;
     if (!cfg.idx_cache || (cfg.mode != llama_lsa_config::KEY && cfg.mode != llama_lsa_config::POS)) {
+        return nullptr;
+    }
+    // LLAMA_LSA_IDX_SKIP_DENSE: a KEEP_FRAC_LAYERS L:1 layer never picks (build_attn_lsa_mask returns before scoring),
+    // so its index is not allocated or written. Only without a keep schedule, which can change the fraction per context.
+    if (cfg.idx_skip_dense && cfg.keep_sched.empty() && cfg.keep_frac_for(il) >= 1.0) {
         return nullptr;
     }
     if (inp->lsa_q_cell) {
@@ -9303,6 +9322,7 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     }
     // [#81] a compact head built from this head replaces the hadamard_head / head_layout outcomes
     const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    const bool full_head = !compact && llama_draft_vocab_full_head(head_w);
     if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
@@ -9315,7 +9335,7 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
     if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
     }
-    if (!compact) {
+    if (!compact && !full_head) {
         if (const char * why = draft_vocab_direct(head_w)) {
             return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
         }
@@ -9332,6 +9352,14 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits(
         }
     }
     GGML_ASSERT(cur->ne[1] == n_outputs);
+
+    if (full_head) {
+        ggml_tensor * logits = llama_draft_vocab_gather_logits(
+                ctx0, build_lora_mm(head_w, cur, head_s), draft_vocab_ids);
+        cb(logits, "draft_vocab_logits", -1);
+        res->t_logits_ids = draft_vocab_ids;
+        return logits;
+    }
 
     if (compact) {
         ggml_tensor * logits = build_draft_vocab_compact(head_w, head_s, cur); // [n_sel, n_outputs]
@@ -9385,6 +9413,7 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
         return nullptr;
     }
     const bool compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == head_w;
+    const bool full_head = !compact && llama_draft_vocab_full_head(head_w);
     if (!compact && hadamard_rotations && hadamard_rotations->count(head_w)) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HADAMARD, "the output head is Hadamard-rotated");
     }
@@ -9397,12 +9426,15 @@ ggml_tensor * llm_graph_context::build_draft_vocab_logits_chain(
     if (draft_vocab_ids->ne[0] >= head_w->ne[1]) {
         return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_NOT_SMALLER, "the map has as many rows as the head");
     }
-    if (!compact) {
+    if (!compact && !full_head) {
         if (const char * why = draft_vocab_direct(head_w)) {
             return draft_vocab_fallback(DRAFT_VOCAB_FALLBACK_HEAD_LAYOUT, why);
         }
     }
     GGML_ASSERT(cur->ne[1] == 1);
+    if (full_head) {
+        return llama_draft_vocab_gather_logits(ctx0, build_lora_mm(head_w, cur, head_s), draft_vocab_ids);
+    }
     if (compact) {
         return build_draft_vocab_compact(head_w, head_s, cur);
     }

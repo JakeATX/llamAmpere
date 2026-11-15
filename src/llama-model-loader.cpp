@@ -1083,6 +1083,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        d1_paths.resize(files.size()); d1_paths.back() = fname;
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -1217,6 +1218,7 @@ llama_model_loader::llama_model_loader(
             }
 
             files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+            d1_paths.resize(files.size()); d1_paths.back() = fname_split;
             contexts.emplace_back(std::move(ctx_ptr));
             if (idx < n_backbone) {
                 n_backbone_files = files.size();
@@ -1377,6 +1379,17 @@ llama_model_loader::llama_model_loader(
         }
     }
 
+    // [D1] LLAMA_D1_HEAD: fingerprint the base output.weight before an overlay patch replaces it (2 x 1 MiB read)
+    if (const char * d1p = getenv("LLAMA_D1_HEAD"); d1p && d1p[0] && !no_alloc) {
+        auto it = weights_map.find("output.weight");
+        if (it != weights_map.end() && it->second.idx < d1_paths.size() && !d1_paths[it->second.idx].empty()) {
+            if (!llama_d1_src_from_file(d1_paths[it->second.idx], it->second.offs, ggml_nbytes(it->second.tensor),
+                                        (int) it->second.tensor->type, d1_src)) {
+                LLAMA_LOG_WARN("%s: d1: cannot read the base output.weight for its fingerprint\n", __func__);
+            }
+        }
+    }
+
     // LLAMA_MODEL_OVERLAY_PATCH=A.gguf[,B.gguf...]: tensors that replace same-named, same-shape model or overlay
     // tensors (a re-encode of part of a bank, or re-encoded attention weights, without a full copy of either);
     // every patch tensor must replace one tensor. Without LLAMA_MODEL_OVERLAY the patch applies to the base model files; a
@@ -1532,7 +1545,13 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_AIT4_U:
             case GGML_TYPE_AIT2_U2:
             case GGML_TYPE_AIT3_U2:
-        case GGML_TYPE_AIT4_U2:
+            case GGML_TYPE_AIT4_U2:
+            case GGML_TYPE_AIT2_U2_512:
+            case GGML_TYPE_AIT3_U2_512:
+            case GGML_TYPE_AIT4_U2_512:
+            case GGML_TYPE_AIF25_U2:
+            case GGML_TYPE_AIF25_U2_512:
+            case GGML_TYPE_AIF175_U2:
             case GGML_TYPE_AIT2:
             case GGML_TYPE_AIT3:
             case GGML_TYPE_AIT4:

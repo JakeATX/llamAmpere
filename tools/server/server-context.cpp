@@ -1597,6 +1597,7 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+        llama_d1_log_counters(ctx_tgt, string_format("slot %d task %d", id, task ? task->id : -1).c_str()); // [D0]
     }
 
     json to_json(bool only_metrics = false) const {

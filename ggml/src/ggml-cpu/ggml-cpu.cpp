@@ -430,6 +430,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // No CPU arithmetic or conversion callbacks exist for fractional row-scale weights.
+    if ((op->type == GGML_TYPE_AIF25_U2 || op->type == GGML_TYPE_AIF175_U2 || op->type == GGML_TYPE_AIF25_U2_512)) {
+        return false;
+    }
+    for (const auto * src : op->src) {
+        if (src && (src->type == GGML_TYPE_AIF25_U2 || src->type == GGML_TYPE_AIF175_U2 || src->type == GGML_TYPE_AIF25_U2_512)) {
+            return false;
+        }
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
@@ -459,7 +469,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 // reference path only (unit slab dequantize + f32 dot): 2-D weights, f32 activations
                 return src1->type == GGML_TYPE_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
                        src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0 &&
-                       (ggml_ai4v2_rate(src0->type) == 0 || src0->ne[0] % 640 == 0);
+                       (ggml_ai4v2_rate(src0->type) == 0 || src0->ne[0] % (128*ggml_ai4v2_chunks(src0->type)) == 0);
             }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
@@ -482,7 +492,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 // unit slab reference path: 3-D expert stack, f32 activations
                 return src1->type == GGML_TYPE_F32 && src0->ne[3] == 1 &&
                        src0->ne[0] % 128 == 0 && src0->ne[1] % 16 == 0 &&
-                       (ggml_ai4v2_rate(src0->type) == 0 || src0->ne[0] % 640 == 0);
+                       (ggml_ai4v2_rate(src0->type) == 0 || src0->ne[0] % (128*ggml_ai4v2_chunks(src0->type)) == 0);
             }
             return true;
         case GGML_OP_SOFT_MAX_BACK: {

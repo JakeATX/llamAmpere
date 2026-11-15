@@ -6,6 +6,7 @@
 #include "magic2-v2.cuh"
 #include "aif25-mmq.cuh"
 #include "../ggml-aif25.h"
+#include "../ggml-aif175.h"
 #include "rpb-knobs.h"
 #include "quantize.cuh"
 #include "moe-weighted-reduction.cuh"
@@ -840,6 +841,9 @@ static int ai4_lay_of(ggml_type t) {
         case GGML_TYPE_AIT2_U2: return ai4k::LAY_AIT2_U2;
         case GGML_TYPE_AIT3_U2: return ai4k::LAY_AIT3_U2;
         case GGML_TYPE_AIT4_U2: return ai4k::LAY_AIT4_U2;
+        case GGML_TYPE_AIT2_U2_512: return ai4k::LAY_AIT2_U2_512;
+        case GGML_TYPE_AIT3_U2_512: return ai4k::LAY_AIT3_U2_512;
+        case GGML_TYPE_AIT4_U2_512: return ai4k::LAY_AIT4_U2_512;
         case GGML_TYPE_AIT4_U: return ai4k::LAY_AIT4_U;
         case GGML_TYPE_AIT5_U: return ai4k::LAY_AIT5_U;
         default: GGML_ABORT("not an AI+ unit type");
@@ -964,6 +968,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             AI23_SPLIT_U(ai4k::LAY_AIT3_U)
             AI23_SPLIT_U(ai4k::LAY_AIT2_U2)
             AI23_SPLIT_U(ai4k::LAY_AIT3_U2)
+            AI23_SPLIT_U(ai4k::LAY_AIT2_U2_512)
+            AI23_SPLIT_U(ai4k::LAY_AIT3_U2_512)
 #undef AI23_SPLIT_U
             default: GGML_ABORT("unsupported AI23 split layout");
         }
@@ -1057,6 +1063,9 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
         AI4_MM_U(ai4k::LAY_AIT2_U2)
         AI4_MM_U(ai4k::LAY_AIT3_U2)
         AI4_MM_U(ai4k::LAY_AIT4_U2)
+        AI4_MM_U(ai4k::LAY_AIT2_U2_512)
+        AI4_MM_U(ai4k::LAY_AIT3_U2_512)
+        AI4_MM_U(ai4k::LAY_AIT4_U2_512)
         AI4_MM_U(ai4k::LAY_AIT4_U)
         AI4_MM_U(ai4k::LAY_AIT5_U)
 #undef AI4_MM_U
@@ -1073,7 +1082,7 @@ static bool ai4_is_type(ggml_type t) {
 static bool ai4_ref_only_type(ggml_type t) {
     static const bool v = ai4_env_int("GGML_CUDA_AI5_REF", nullptr, 0) != 0;
     if (ggml_ai4v2_rate(t) != 0) {
-        return false;   // row-scale layouts use native kernels when available
+        return false;   // row-scale layouts use fast kernels unless the global reference override is set
     }
     if (t == GGML_TYPE_AIT5_U) {
         return v;
@@ -1135,8 +1144,8 @@ static void ai4_zero_skipped(const ggml_tensor * ids, int n_used, int n_tok, int
 }
 
 static void ai4_reconstruct_any(const void * src, float * W, int64_t K, int64_t M, cudaStream_t stream, ggml_type t) {
-    GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream, ggml_ai4_trellis_mul(t),
-                                          ggml_ai4v2_rate(t) != 0));
+    GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(t), src, W, K, M, true, stream,
+                                          ggml_ai4_trellis_mul(t), ggml_ai4v2_chunks(t)));
 }
 
 // fork AIPFIX ONEPATH check: the f32 image [M][K] of an AI+ unit matrix in the original basis (reference only)
@@ -1219,7 +1228,7 @@ static void ai4_ref_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             ai4_reconstruct_any(src, w.get(), K, mm, stream, src0->type);
         } else {
             GGML_ASSERT(aik_reconstruct_rate<float>(ggml_ai4_rate(src0->type), src, w.get(), K, mm, !emul, stream,
-                                                    ggml_ai4_trellis_mul(src0->type), ggml_ai4v2_rate(src0->type) != 0));
+                                                    ggml_ai4_trellis_mul(src0->type), ggml_ai4v2_chunks(src0->type)));
         }
         // C(mm x T) at row m0 of the M x T result. ldc = M, so column t lands at Y[t*M + m0].
         CUBLAS_CHECK(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1246,8 +1255,11 @@ bool ggml_cuda_ai4_supported(const ggml_tensor * op) {
         a->nb[2] >= a->nb[1]*a->ne[1] && a->nb[2] % 16 == 0 && a->nb[3] == a->nb[2]*a->ne[2];
     const bool a_ok = op->op == GGML_OP_MUL_MAT_ID ? a_rows_dense : ggml_is_contiguous(a);
     if (b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[1] % 16 != 0 ||
-            (ggml_ai4v2_rate(a->type) != 0 && a->ne[0] % 640 != 0) || a->ne[3] != 1 || !a_ok || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
+            (ggml_ai4v2_rate(a->type) != 0 && a->ne[0] % (128*ggml_ai4v2_chunks(a->type)) != 0) || a->ne[3] != 1 || !a_ok || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
         return false;
+    }
+    if (op->op != GGML_OP_MUL_MAT && ggml_ai4v2_chunks(a->type) == 4) {
+        return false;   // 512-K row-scale siblings: dense MUL_MAT only, no expert-bank kernels are built for them
     }
     if (op->op == GGML_OP_MUL_MAT) {
         return a->ne[2] == 1;
@@ -2426,7 +2438,7 @@ void ggml_cuda_moe_ai_quantize(const float * x, int64_t rows, int64_t K, char * 
 bool ggml_cuda_moe_ai_table_supported(ggml_type type, int64_t K, int64_t M, int64_t n_tok) {
     const int rate = ggml_ai4_rate(type);
     return ggml_ai4_is_unit(type) && rate >= 2 && rate <= 4 && (rate == 4 ? ai4_aikern() : ai4_mmvr_on_id()) &&
-        K % 128 == 0 && M % 16 == 0 && n_tok >= 1 && n_tok <= 64;
+        K % 128 == 0 && (ggml_ai4v2_rate(type) == 0 || (ggml_ai4v2_chunks(type) == 5 && K % 640 == 0)) && M % 16 == 0 && n_tok >= 1 && n_tok <= 64;
 }
 
 bool ggml_cuda_moe_ai_table_mmv(const void * const * table, ggml_type type, const char * act, const int32_t * ids,
@@ -2884,11 +2896,15 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
 // activation rotation; keep the fractional rate separate from integer AI+ dispatch.
 bool ggml_cuda_aif25_supported(const ggml_tensor * op) {
     const auto * w = op->src[0]; const auto * x = op->src[1];
-    return op->op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_AIF25_U &&
+    return op->op == GGML_OP_MUL_MAT && (w->type == GGML_TYPE_AIF25_U || w->type == GGML_TYPE_AIF25_U2 || w->type == GGML_TYPE_AIF175_U2 ||
+         w->type == GGML_TYPE_AIF25_U2_512) &&
         x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
         w->ne[0] > 0 && w->ne[0] <= INT32_MAX && w->ne[1] > 0 && w->ne[1] <= INT32_MAX &&
         w->ne[2] == 1 && w->ne[3] == 1 &&
         w->ne[0] % 128 == 0 && w->ne[1] % 16 == 0 &&
+        (w->type != GGML_TYPE_AIF25_U2 || w->ne[0] % 640 == 0) &&
+        (w->type != GGML_TYPE_AIF175_U2 || w->ne[0] % 512 == 0) &&
+        (w->type != GGML_TYPE_AIF25_U2_512 || w->ne[0] % 512 == 0) &&
         ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op);
 }
 
@@ -2918,7 +2934,7 @@ static int aif25_mmq_check() {
     return v;
 }
 
-template <int XSH>
+template <int XSH, bool ROW_SCALE = false, int B = 5, int V = 2, uint32_t C = AIF25_MUL, int SCALE_CHUNKS = 5>
 static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales, float * y, int M, int K, int64_t N,
                       cudaStream_t stream) {
     // CUDA grid.y is limited to 65535; each block handles eight activation rows.
@@ -2926,7 +2942,7 @@ static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales,
         const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
         const dim3 grid(M/16, (nr+7)/8);
         const float * xs = scales + (size_t)n0*(K >> (7+XSH));
-        magic2::mmv<5,2,AIF25_MUL,XSH><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -2955,7 +2971,9 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const uint8_t * wd = (const uint8_t *) w->data;
     float * y = (float *) dst->data;
     const int tile = aif25_mmq_tile();
-    if (tile > 0 && N >= aif25_mmq_min() &&
+    // the row-scale types (AIF25_U2, AIF175_U2, AIF25_U2_512) are not a layout magic2::mmq knows: they always take the mmv loop
+    const bool row_scale = w->type != GGML_TYPE_AIF25_U;
+    if (!row_scale && tile > 0 && N >= aif25_mmq_min() &&
             ggml_cuda_aif25_mmq(xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (aif25_mmq_check()) {
@@ -2994,7 +3012,16 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         return;
     }
-    if (xsh) {
+    if (w->type == GGML_TYPE_AIF175_U2) {
+        aif25_mmv<1, true, 7, 4, AIF175_MUL, 4>(wd, q.get(), scales.get(), y, M, K, N, stream);
+    } else if (w->type == GGML_TYPE_AIF25_U2_512) {
+        // K % 512 == 0, so activation scales always cover 256 columns (xsh == 1); four chunks share the row scales.
+        aif25_mmv<1, true, 5, 2, AIF25_MUL, 4>(wd, q.get(), scales.get(), y, M, K, N, stream);
+    } else if (w->type == GGML_TYPE_AIF25_U2 && xsh) {
+        aif25_mmv<1, true>(wd, q.get(), scales.get(), y, M, K, N, stream);
+    } else if (w->type == GGML_TYPE_AIF25_U2) {
+        aif25_mmv<0, true>(wd, q.get(), scales.get(), y, M, K, N, stream);
+    } else if (xsh) {
         aif25_mmv<1>(wd, q.get(), scales.get(), y, M, K, N, stream);
     } else {
         aif25_mmv<0>(wd, q.get(), scales.get(), y, M, K, N, stream);

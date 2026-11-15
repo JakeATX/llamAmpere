@@ -8489,15 +8489,15 @@ static bool is_ai4_family(ggml_type t) {
 }
 
 static void init_tensor_ai4_random(ggml_tensor * t, const std::vector<bool> * used = nullptr) {
-    const bool v2 = ggml_ai4v2_rate(t->type) != 0;   // row-scale block = 16 rows x 640 K: [d[16]][5 x 16k-byte tiles]
-    GGML_ASSERT(is_ai4_family(t->type) && ggml_is_contiguous(t) && t->ne[0] % (v2 ? 640 : 128) == 0 && t->ne[1] % 16 == 0);
+    const int v2 = ggml_ai4v2_chunks(t->type);   // row-scale block = 16 rows x 640 K (5 chunks) or 512 K (4 chunks): [d[16]][chunks x 16k-byte tiles]; 0 = unit layout
+    GGML_ASSERT(is_ai4_family(t->type) && ggml_is_contiguous(t) && t->ne[0] % (v2 ? 128*v2 : 128) == 0 && t->ne[1] % 16 == 0);
     std::random_device rd;
     const char * seed_env = getenv("GGML_TEST_SEED");
     std::mt19937 rng(seed_env ? (unsigned) strtoul(seed_env, nullptr, 10) : rd());
     std::uniform_real_distribution<float> ud(0.002f, 0.02f);
     std::vector<uint8_t> buf(ggml_nbytes(t));
     // one unit = 16 rows x 128 K: [fp16 row scales d[16]][16k-byte trellis tiles]
-    const size_t bb  = (size_t) (32 + (v2 ? 5 : 1)*256*ggml_ai4_rate(t->type));
+    const size_t bb  = (size_t) (32 + (v2 ? v2 : 1)*256*ggml_ai4_rate(t->type));
     const size_t nsc = 16;
     const size_t nblk = buf.size() / bb;
     for (size_t b = 0; b < nblk; ++b) {
@@ -18064,6 +18064,31 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     }
 }
 
+// AIT2_U2_512 / AIT3_U2_512 (one row scale per 512 K): dense MUL_MAT only, at the dense 27B widths (3072, 4096, 6144, 9216,
+// 17408 do not divide by 640) and at widths both layouts hold; decode widths 1-9 and prompt widths.
+static void add_ai4_u2_512_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (ggml_type t : {GGML_TYPE_AIT2_U2_512, GGML_TYPE_AIT3_U2_512, GGML_TYPE_AIT4_U2_512}) {
+        for (int64_t k : {512, 1024, 3072, 4096, 5120, 6144, 9216, 17408}) {
+            for (int64_t n : {1, 4, 8, 9, 33, 64, 65, 600}) {
+                cases.emplace_back(new test_mul_mat_ai4(48, n, k, t));
+            }
+        }
+        cases.emplace_back(new test_mul_mat_ai4(1024, 5, 6144, t));
+        cases.emplace_back(new test_mul_mat_ai4(1024, 130, 6144, t));
+    }
+}
+
+// AIT4_U2 (type 124, one row scale per 640 K): dense MUL_MAT at 640-divisible widths. It had no backend case before.
+static void add_ait4_u2_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    for (int64_t k : {640, 2560, 5120}) {
+        for (int64_t n : {1, 4, 8, 9, 33, 64, 65, 600}) {
+            cases.emplace_back(new test_mul_mat_ai4(48, n, k, GGML_TYPE_AIT4_U2));
+        }
+    }
+    cases.emplace_back(new test_mul_mat_ai4(1024, 5, 5120, GGML_TYPE_AIT4_U2));
+    cases.emplace_back(new test_mul_mat_ai4(1024, 130, 5120, GGML_TYPE_AIT4_U2));
+}
+
 // AIT2P_U (unit bytes, AIT2P pair-table levels) at the Flash-Next expert shapes: gate/up K 2560 x M 640 (H256, broadcast
 // src1), down K 640 x M 2560 (H128); decode / MTP-verify widths 1-8, then prompt widths; MUL_MAT_ID on a 221-expert bank
 // stack top 10 with repeated and skipped ids. Also small shapes and partial row tiles.
@@ -18292,6 +18317,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_ait(type, 1056, n, 2048));
         }
     }
+    add_ai4_u2_512_cases(test_cases);
+    add_ait4_u2_cases(test_cases);
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int64_t n : {1, 9, 512}) {
@@ -22336,7 +22363,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // A5 (LLAMA_LSA_COMP_LB=1): trellis bodies 3/2 and 3/3 with the LSE output (uniform stream-k fixup of the low-bit tile
     // kernel), fused rotation off / on, decode widths 1 and 5, dense and an LSA record pick (mode 5), plus a 100K body;
-    // output and LSE (checked separately) against the CPU reference. Filter: -o FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE (18 cases)
+    // output and LSE (checked separately) against the CPU reference. Filter: -o FLASH_ATTN_EXT_SJKVARN_TRELLIS_LSE (19 cases)
     for (auto [bk, bv] : std::vector<std::pair<int,int>>{{3, 2}, {3, 3}}) {
         for (int rot : {0, 1}) {
             for (int64_t n_q : {1, 5}) {
@@ -22350,6 +22377,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         auto * t = new test_flash_attn_ext_sj_kvarn(5, 24, 4, 792, 1024, false, false,
             GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, bk, bv, 0, 0, 0);
+        t->lse_out = true;
+        test_cases.emplace_back(t);
+    }
+    {   // live-tile walk (GGML_SJKVARN_LIVE_TILES=1, width off): fewer live tiles than stream-k blocks per output tile, so
+        // some blocks get no list entry and write an empty partial (max -FLT_MAX/2, rowsum 0) that the LSE fixup must drop
+        auto * t = new test_flash_attn_ext_sj_kvarn(4, 24, 4, 1, 64, false, false,
+            GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_I16, 3, 3, 0, 0, 3);
         t->lse_out = true;
         test_cases.emplace_back(t);
     }

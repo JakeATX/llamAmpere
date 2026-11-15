@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -34,6 +35,23 @@ struct llama_draft_compact_src {
     const float   * svh  = nullptr;   // EXL3 only: [N] output scales
     const float   * had  = nullptr;   // EXL3 only: [128*128] exl3_had128.weight as stored (ne0 fastest)
 };
+
+// Score the existing AI+ head, then gather shortlist logits. This trades extra
+// projection work for avoiding a second resident weight matrix; opt-in only.
+inline bool llama_draft_vocab_full_head(const ggml_tensor * head) {
+    const char * env = std::getenv("LLAMA_DRAFT_VOCAB_FULL_HEAD");
+    return env && std::atoi(env) == 1 && head &&
+        (ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0);
+}
+
+inline ggml_tensor * llama_draft_vocab_gather_logits(
+        ggml_context * ctx, ggml_tensor * logits, ggml_tensor * ids) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->ne[2] == 1 && logits->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_vector(ids));
+    // GET_ROWS selects ne[1], so transpose vocabulary into that dimension.
+    ggml_tensor * rows = ggml_cont(ctx, ggml_transpose(ctx, logits));
+    return ggml_cont(ctx, ggml_transpose(ctx, ggml_get_rows(ctx, rows, ids)));
+}
 
 // row types the compact head may use: no imatrix needed, a CUDA mul_mat path at widths 1-8
 inline bool llama_draft_compact_type_ok(ggml_type t, int64_t K) {

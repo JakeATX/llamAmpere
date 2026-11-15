@@ -364,6 +364,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
 
         model->load_stats(ml);
+        model->d1.src = ml.d1_src; // [D1]
         model->print_info();
 
         if (params.vocab_only) {
