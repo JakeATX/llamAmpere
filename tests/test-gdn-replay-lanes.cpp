@@ -6,7 +6,13 @@
 //   C. only seqs {0, 2, 3} verify while seq 1 is idle (bystander cell between them), with seq 1 at replay 0 or with a
 //      pending rollback; then seq 1 decodes again. Unified and per-seq KV.
 //   B. (B1) two long prompts with different pending replays and a small n_ubatch: no mixed ubatch narrower than
-//      n_rs_seq (llama_memory_recurrent::replay_split::advance asserts it).
+//      n_rs_seq (llama_memory_recurrent::replay_split::advance asserts it), or than 2 with short join.
+//   D. short verify rounds (n = 2..4 with n_rs_seq 4) with mixed rollbacks, including r > n (a lane that rejected a
+//      whole n = 4 round next to lanes with r = 0: the per-lane conv shift count), uneven widths in one batch, a
+//      1-token lane, and an idle seq 1 with a pending rollback between active seqs.
+// With LLAMA_GDN_REPLAY_SHORT=1 in the environment the test also runs a third child, lanes on with
+// LLAMA_GDN_REPLAY_SHORT_JOIN=0 (short rounds split), and needs: off == split == joined (logits) and more joint
+// ubatches when joined than split.
 // Needs a GDN model, e.g. the generated qwen35-dense.gguf: test-gdn-replay-lanes -m <MODEL_DIR>/qwen35-dense.gguf
 #include "arg.h"
 #include "common.h"
@@ -163,6 +169,40 @@ static int run_child(const common_params & params, llama_model * model, const ch
         }
     }
 
+    // D: short rounds with mixed rollbacks (static under LLAMA_GDN_REPLAY_SHORT=1, joined unless SHORT_JOIN=0)
+    for (bool unified : { false, true }) {
+        llama_context_ptr ctx(make_ctx(params, model, 64, unified));
+        if (!ctx) {
+            return 1;
+        }
+        std::vector<llama_pos> pos(N_SEQS, 0);
+        bool ok = decode_round(ctx.get(), pos, { 12, 15, 18, 21 }, rng, n_vocab, out);
+        // widths per round (0 = idle); rollback of seq s after round i: rb[i][s] (<= its width)
+        const std::vector<std::vector<uint32_t>> widths = {
+            { K, K, K, K }, { 2, 2, 2, 2 }, { 3, 3, 3, 3 }, { K, K, K, K }, { 3, 3, 3, 3 }, { 2, 2, 2, 2 },
+            { 3, 0, 3, 3 }, { 2, 0, 2, 2 }, { 3, 3, 2, 2 }, { 1, 3, 3, 3 }, { K, K, K, K }, { 2, 2, 2, 2 },
+        };
+        const std::vector<std::vector<uint32_t>> rb = {
+            { K, 0, 1, 2 }, { 2, 0, 1, 0 }, { 0, 3, 1, 2 }, { 0, K, 3, K }, { 3, 1, 0, 2 }, { 1, 2, 0, 2 },
+            { 2, 0, 0, 3 }, { 1, 0, 2, 0 }, { 3, 1, 2, 0 }, { 0, 3, 2, 1 }, { K, 1, 0, 2 }, { 0, 0, 0, 0 },
+        };
+        for (size_t i = 0; ok && i < widths.size(); ++i) {
+            ok = decode_round(ctx.get(), pos, widths[i], rng, n_vocab, out);
+            for (int s = 0; ok && s < N_SEQS; ++s) {
+                // seq 1 keeps the rollback of round 5 pending through its idle rounds 6, 7
+                ok = widths[i][s] == 0 || rollback(ctx.get(), pos, s, std::min(rb[i][s], widths[i][s]));
+            }
+        }
+        ok = ok && decode_round(ctx.get(), pos, { K + 1, K + 1, K + 1, K + 1 }, rng, n_vocab, out);
+        if (!ok) {
+            fprintf(stderr, "scenario D (unified %d) failed\n", unified);
+            return 1;
+        }
+        llama_memory_recurrent * recr = get_recr(ctx.get());
+        n_joint   += recr ? recr->lstats.n_joint   : 0;
+        n_bystand += recr ? recr->lstats.n_bystand : 0;
+    }
+
     // B: two long prompts with different pending replays, n_ubatch 6 (width 3 < K) and 10 (width 5)
     for (uint32_t n_ubatch : { 6u, 10u }) {
         llama_context_ptr ctx(make_ctx(params, model, n_ubatch));
@@ -194,10 +234,13 @@ static int run_child(const common_params & params, llama_model * model, const ch
 }
 
 #ifndef _WIN32
-static bool spawn(char ** argv, const char * lanes, const std::string & path) {
+static bool spawn(char ** argv, const char * lanes, const std::string & path, const char * join = nullptr) {
     const pid_t pid = fork();
     if (pid == 0) {
         setenv("LLAMA_GDN_REPLAY_LANES", lanes, 1);
+        if (join != nullptr) {
+            setenv("LLAMA_GDN_REPLAY_SHORT_JOIN", join, 1);
+        }
         setenv("LLAMA_TEST_LANES_DUMP", path.c_str(), 1);
         execv("/proc/self/exe", argv);
         _exit(127);
@@ -234,7 +277,12 @@ int main(int argc, char ** argv) {
         const std::string base = std::string("test-gdn-replay-lanes.") + std::to_string(getpid());
         const std::string p_off = base + ".off";
         const std::string p_on  = base + ".on";
-        if (!spawn(argv, "0", p_off) || !spawn(argv, "1", p_on)) {
+        const std::string p_spl = base + ".split";
+        const char *      sh    = getenv("LLAMA_GDN_REPLAY_SHORT");
+        const bool        short_on = sh != nullptr && strcmp(sh, "1") == 0;
+        // with SHORT=1: lanes on runs joined (SHORT_JOIN=1) and split (SHORT_JOIN=0); without it the env is left alone
+        if (!spawn(argv, "0", p_off) || !spawn(argv, "1", p_on, short_on ? "1" : nullptr) ||
+                (short_on && !spawn(argv, "1", p_spl, "0"))) {
             fprintf(stderr, "FAIL: a child run failed\n");
             return 1;
         }
@@ -244,10 +292,15 @@ int main(int argc, char ** argv) {
         uint64_t b_on  = 0;
         std::vector<float> off;
         std::vector<float> on;
-        const bool ok_load = load(p_off, j_off, b_off, off) && load(p_on, j_on, b_on, on);
+        uint64_t j_spl = 0;
+        uint64_t b_spl = 0;
+        std::vector<float> spl;
+        const bool ok_load = load(p_off, j_off, b_off, off) && load(p_on, j_on, b_on, on) &&
+                             (!short_on || load(p_spl, j_spl, b_spl, spl));
         remove(p_off.c_str());
         remove(p_on.c_str());
-        if (!ok_load || off.size() != on.size() || off.empty()) {
+        remove(p_spl.c_str());
+        if (!ok_load || off.size() != on.size() || off.empty() || (short_on && spl.size() != off.size())) {
             fprintf(stderr, "FAIL: dumps missing or of different size\n");
             return 1;
         }
@@ -277,7 +330,17 @@ int main(int argc, char ** argv) {
         const char *  tol_env = getenv("LLAMA_TEST_LANES_TOL");
         const double  tol     = tol_env ? atof(tol_env) : 0.0;
         // scenario C (unified, seq 1 with a pending replay) must hit the bystander cut with lanes on
-        const bool ok = j_off == 0 && j_on > 0 && b_off == 0 && b_on > 0 && d.max_diff <= tol;
+        bool ok = j_off == 0 && j_on > 0 && b_off == 0 && b_on > 0 && d.max_diff <= tol;
+        if (short_on) {
+            // short join: same logits as the split runs, and the short rounds of D (and C) add joint ubatches
+            const diff_stats ds = compare(off, spl);
+            const diff_stats dj = compare(spl, on);
+            printf("short (SHORT=1): split vs off %zu differ, max diff %.3e; joined vs split %zu differ, max diff %.3e; "
+                   "joint ubatches: split %llu, joined %llu; bystander cuts: split %llu\n",
+                    ds.n_diff, ds.max_diff, dj.n_diff, dj.max_diff, (unsigned long long) j_spl, (unsigned long long) j_on,
+                    (unsigned long long) b_spl);
+            ok = ok && j_spl > 0 && j_on > j_spl && b_spl > 0 && ds.max_diff <= tol && dj.max_diff <= tol;
+        }
         printf("%s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
 #endif

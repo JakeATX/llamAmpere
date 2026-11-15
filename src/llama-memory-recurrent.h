@@ -185,6 +185,13 @@ public:
     // stopped early. Graph and bookkeeping must agree, so both ask here.
     static bool replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq);
 
+    // [TAG_GDN_REPLAY_LANES] whether lanes with different pending replays may share a ubatch of n_seq_tokens per seq:
+    // a static width of n >= n_rs_seq, or, with replay_short_join(), any short static width too.
+    // replay_short_join(): LLAMA_GDN_REPLAY_SHORT=1 and LLAMA_GDN_REPLAY_SHORT_JOIN not 0 (default on with SHORT).
+    // With SHORT off (or JOIN=0) replay_join_width(n) is exactly the old n >= n_rs_seq && replay_static_width(n).
+    static bool replay_short_join();
+    static bool replay_join_width(uint32_t n_seq_tokens, uint32_t n_rs_seq);
+
     // [TAG_GDN_REPLAY_SPLIT] the replay subtree of a ubatch is built from one (replay_len,
     // ckpt_span, s_stale) -- see llama_memory_recurrent_context::get_replay_len() -- so seqs that
     // disagree on any of the three must not share a ubatch (a server with several slots
@@ -194,7 +201,8 @@ public:
     // ubatches of the same batch are grouped by the values they will actually see.
     // [TAG_GDN_REPLAY_LANES] with lanes on, compat also admits two seqs that both have >= n_rs_seq tokens in the
     // batch (relaxed), and split_equal's strict guard (strict_fn, n_mixed_min) keeps the real ubatch at that width.
-    // Short static rounds (LLAMA_GDN_REPLAY_SHORT, n < n_rs_seq) stay strict: get_snap_shift sizes by the min r.
+    // Short static rounds (LLAMA_GDN_REPLAY_SHORT, n < n_rs_seq) join too with replay_short_join() (n_mixed_min 2;
+    // set_input_shift moves K - max(n, r_s) conv groups per lane); with LLAMA_GDN_REPLAY_SHORT_JOIN=0 they stay strict.
     // A mixed ubatch also must not span the cell of a seq outside it that has a pending replay (set_fn): find_slot
     // can move that cell, and only its plane-0 conv row moves with it (stale conv planes for its replay).
     struct replay_split {
@@ -227,7 +235,7 @@ public:
         llama_batch_allocr::seq_compat_fn fn() const;
         // the split_equal width guard (strict, n_mixed_min), or nullptr / 0 without lanes
         llama_batch_allocr::seq_compat_fn strict_fn() const;
-        uint32_t n_mixed_min() const { return lanes ? n_rs_seq : 0; }
+        uint32_t n_mixed_min() const { return !lanes ? 0 : replay_short_join() && n_rs_seq > 2 ? 2u : n_rs_seq; }
         // the split_equal bystander guard, or nullptr without lanes
         llama_batch_allocr::seq_set_fn set_fn() const;
     };

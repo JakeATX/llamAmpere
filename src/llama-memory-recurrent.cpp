@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -643,16 +644,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     return ctxs_bufs.memory_breakdown();
 }
 
-bool llama_memory_recurrent::replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+static bool replay_static_on() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_GDN_REPLAY_STATIC"); // =0: the rollback-shaped graph (A/B)
         return e == nullptr || strcmp(e, "0") != 0;
     }();
+    return on;
+}
+
+static bool replay_short_on() {
     static const bool short_on = [] {
         const char * e = getenv("LLAMA_GDN_REPLAY_SHORT");
         return e != nullptr && strcmp(e, "1") == 0;
     }();
-    return on && n_rs_seq > 0 && (n_seq_tokens >= n_rs_seq || (short_on && n_seq_tokens >= 2));
+    return short_on;
+}
+
+bool llama_memory_recurrent::replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+    return replay_static_on() && n_rs_seq > 0 && (n_seq_tokens >= n_rs_seq || (replay_short_on() && n_seq_tokens >= 2));
+}
+
+bool llama_memory_recurrent::replay_short_join() {
+    static const bool join = [] {
+        const char * e = getenv("LLAMA_GDN_REPLAY_SHORT_JOIN"); // =0: short rounds stay strict (split, A/B)
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    return join && replay_static_on() && replay_short_on();
+}
+
+bool llama_memory_recurrent::replay_join_width(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+    return replay_static_width(n_seq_tokens, n_rs_seq) && (n_seq_tokens >= n_rs_seq || replay_short_join());
 }
 
 uint32_t llama_memory_recurrent::replay_span_new(uint32_t ckpt_span, uint32_t replay_len, uint32_t n_seq_tokens, uint32_t n_rs_seq) {
@@ -690,7 +711,7 @@ bool llama_memory_recurrent::replay_split::compat(llama_seq_id a, llama_seq_id b
     if (lanes && (size_t) a < n_tokens.size() && (size_t) b < n_tokens.size()) {
         const uint32_t na = n_tokens[a];
         const uint32_t nb = n_tokens[b];
-        return na >= n_rs_seq && nb >= n_rs_seq && replay_static_width(na, n_rs_seq) && replay_static_width(nb, n_rs_seq);
+        return replay_join_width(na, n_rs_seq) && replay_join_width(nb, n_rs_seq);
     }
     return false;
 }
@@ -707,7 +728,7 @@ void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch, 
         mixed = !strict(ubatch.seq_id_unq[0], ubatch.seq_id_unq[i]);
     }
     if (mixed) {
-        GGML_ASSERT(n_seq_tokens >= n_rs_seq && replay_static_width(n_seq_tokens, n_rs_seq));
+        GGML_ASSERT(replay_join_width(n_seq_tokens, n_rs_seq));
     }
     if (stats != nullptr) {
         stats->n_ubatch++;
@@ -716,7 +737,13 @@ void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch, 
         stats->n_width  += (split_cut & llama_batch_allocr::SPLIT_CUT_WIDTH)  != 0;
         stats->n_tail   += (split_cut & llama_batch_allocr::SPLIT_CUT_TAIL)   != 0;
         stats->n_bystand += (split_cut & llama_batch_allocr::SPLIT_CUT_SET)   != 0;
-        if ((stats->n_ubatch & 4095) == 0) {
+        // LLAMA_GDN_REPLAY_LANES_LOG=N: print the counts every N ubatches instead of every 4096 (diagnostics only)
+        static const uint64_t log_every = [] {
+            const char * e = getenv("LLAMA_GDN_REPLAY_LANES_LOG");
+            const unsigned long long v = e != nullptr ? strtoull(e, nullptr, 10) : 0;
+            return v > 0 ? (uint64_t) v : (uint64_t) 4096;
+        }();
+        if (stats->n_ubatch % log_every == 0) {
             LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu, bystander %llu\n", __func__,
                     (unsigned long long) stats->n_ubatch, (unsigned long long) stats->n_joint, (unsigned long long) stats->n_strict,
                     (unsigned long long) stats->n_width, (unsigned long long) stats->n_tail, (unsigned long long) stats->n_bystand);
@@ -2179,8 +2206,8 @@ uint32_t llama_memory_recurrent_context::get_ckpt_span() const {
         }
     }
     // [TAG_GDN_REPLAY_LANES] a static-width lanes ubatch reads the per-lane values (lane_seq), not this maximum
-    if (disagree && mem->gdn_replay_lanes && ubatch.n_seq_tokens >= mem->n_rs_seq &&
-            llama_memory_recurrent::replay_static_width(ubatch.n_seq_tokens, mem->n_rs_seq)) {
+    if (disagree && mem->gdn_replay_lanes &&
+            llama_memory_recurrent::replay_join_width(ubatch.n_seq_tokens, mem->n_rs_seq)) {
         disagree = false;
     }
     if (disagree) {
@@ -2251,7 +2278,8 @@ uint32_t llama_memory_recurrent_context::get_snap_shift() const {
     // copies of their own destination rows. Sizing it for the largest r instead moved too few
     // groups for the other lanes, whose rs_valid still credited them (test gate G).
     // In replay mode the lanes agree ([TAG_GDN_REPLAY_SPLIT]), so min == max there. Lanes that differ
-    // ([TAG_GDN_REPLAY_LANES]) have n >= n_rs_seq, where this is 1 for every r (0 for n >= K).
+    // ([TAG_GDN_REPLAY_LANES]) have n >= n_rs_seq, where this is 1 for every r (0 for n >= K), or, with
+    // replay_short_join, a short static round, where set_input_shift moves K - max(n, r_s) groups per lane.
     uint32_t r = 0;
     bool     first = true;
     const auto & group_of = mem->gdn_replay ? mem->replay_len : mem->rs_idx;
