@@ -41,7 +41,8 @@
 //   GGML_CUDA_AI4_AMPERE_MMV_MIN_N/MAX_N   inclusive per-card tuning range within 1-64 (defaults 9/32)
 //   GGML_CUDA_AI4_AMPERE_GEMM    retired; keeps baseline prefill after measured regressions
 //   GGML_CUDA_AI4_PREFILL_V2=1  experimental rate-4 decode-once dense prefill, N >= 512 (default off)
-//   GGML_CUDA_AI23_MMVR=1    rate-2/3 decode with fixed stage offsets (default off)
+//   GGML_CUDA_AI23_MMVR=1    rate-2/3 decode with fixed stage offsets (default: on for dense U2 row-scale layouts, off for
+//                            the others; GGML_CUDA_AI23_MMVR=0 is the kill switch for U2 too)
 //   GGML_CUDA_AI23_MMVR_ID=1 rate-2/3 mmvr for expert stacks (MUL_MAT_ID) only (default: follows GGML_CUDA_AI23_MMVR)
 //   GGML_CUDA_AI23_ID_REF=0  AIT2_U/AIT3_U MUL_MAT_ID run the device-routed IMMA kernels (default 1 = reference path)
 //   GGML_CUDA_AI_ID_SKIP_ZERO=1  zero the outputs of skipped (out-of-stack) expert ids even without an expert bank
@@ -369,6 +370,13 @@ static bool ai4_mmvr_on() {
     static const bool v = ai4_env_int("GGML_CUDA_AI23_MMVR", nullptr, ai4_ai23_tuned() ? 1 : 0) != 0;
     return v;
 }
+// Dense U2 row-scale layouts (lay_v2: AIT2/3_U2 and their _512 siblings) take mmvr by default: on a 3090 the generic mmv path
+// was 6-12% slower than the AIT tile kernels at N = 1 (SPV2 zero-weight proxies, 2026-11-15). GGML_CUDA_AI23_MMVR set (0 or 1)
+// overrides; unset, GGML_CUDA_AIKERN=0 (the prior path) also turns it off. MUL_MAT_ID keeps ai4_mmvr_on_id().
+static bool ai4_mmvr_dense_v2() {
+    static const bool v = getenv("GGML_CUDA_AI23_MMVR") ? ai4_mmvr_on() : ai4_aikern();
+    return v;
+}
 // GGML_CUDA_AI23_MMVR_ID=1 (opt-in): expert stacks (MUL_MAT_ID) take mmvr. Lane note: on a 3090 the rate-2/3 mmvr
 // direct path was 28-42% faster than the mmv-ID kernel at widths 1-6 for 640x2560 / 2560x640 experts (kernel-only,
 // no end-to-end speed test yet). Unset: follows GGML_CUDA_AI23_MMVR, as before.
@@ -555,7 +563,7 @@ static bool ai4_mmvr_go(const uint8_t * W, const int8_t * q, const float * s, fl
     }
 }
 
-// true when mmvr ran (rate 2 / 3 layouts with GGML_CUDA_AI23_MMVR=1)
+// true when mmvr ran (rate 2 / 3 layouts with GGML_CUDA_AI23_MMVR=1; dense U2 row-scale layouts unless GGML_CUDA_AI23_MMVR=0)
 template <int LAY, int XSH, bool ID>
 static bool ai4_mmvr_try(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int N, int K,
                          cudaStream_t stream, const ai4k::idmap & idm = ai4k::idmap{}, int max_tiles = 1) {
@@ -564,7 +572,7 @@ static bool ai4_mmvr_try(const uint8_t * W, const int8_t * q, const float * s, f
     if constexpr (rate != 2 && rate != 3 && !r4) {
         return false;
     } else {
-        if (r4 ? !ai4_aikern() : !(ID ? ai4_mmvr_on_id() : ai4_mmvr_on())) {
+        if (r4 ? !ai4_aikern() : !(ID ? ai4_mmvr_on_id() : (ai4k::lay_v2<LAY>() ? ai4_mmvr_dense_v2() : ai4_mmvr_on()))) {
             return false;
         }
         const int cfg = ai4_mmvr_cfg();

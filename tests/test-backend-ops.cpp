@@ -18301,6 +18301,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT2_U2);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT3_U2);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT4_U2);
+    // Dense U2 decode widths 1..8 at M > 128 (the mmv / mmvr kernels, not the small-output f32 path), CUDA vs CPU;
+    // run with GGML_CUDA_AI23_MMVR=0 and =1 (fn/v07-u2-mmvr: mmvr is the default for these layouts).
+    for (ggml_type type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
+        for (int n = 1; n <= 8; ++n) { test_cases.emplace_back(new test_mul_mat_ai4(1024, n, 5120, type)); }
+    }
+    for (ggml_type type : {GGML_TYPE_AIT2_U2_512, GGML_TYPE_AIT3_U2_512}) {
+        for (int64_t k : {3072, 6144, 9216, 17408}) {
+            for (int n = 1; n <= 8; ++n) { test_cases.emplace_back(new test_mul_mat_ai4(512, n, k, type)); }
+        }
+    }
     // U2 reference decoding: odd chunk count, multiple slabs, and the small-output fallback.
     // The last case must also work with GGML_CUDA_AI23_SMALL_SPLIT=2/4.
     for (ggml_type type : {GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2}) {
@@ -25139,6 +25149,88 @@ static int run_ai5_midt_check(const char * dir) {
     return fails ? 1 : 0;
 }
 
+// GGML_TEST_U2_MMV_OUT=<dir>: dense U2 row-scale mul_mat (AIT2/3/4_U2 and _512) with fixed-seed weights and activations at the
+// 27B shapes, N = 1..8 (the mmv / mmvr decode window). Each case is computed GGML_TEST_AIT_REPEAT times (default 8) and must
+// repeat bitwise; the first output goes to <dir>/u2t<type>_m<M>_k<K>_n<N>.f32, so runs with GGML_CUDA_AI23_MMVR=0 / 1 can be
+// compared with cmp. Block = 16 rows x one K chunk: [fp16 row scales d[16]][payload] (ai4-kern.cuh v2_block_bytes).
+static int run_u2_mmv_check(const char * dir) {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) { fprintf(stderr, "u2mmv: no GPU backend\n"); return 1; }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    const char * repeat_env = getenv("GGML_TEST_AIT_REPEAT");
+    const int repeats = repeat_env ? std::max(1, std::min(64, atoi(repeat_env))) : 8;
+    struct u2case { ggml_type t; int64_t M, K; };
+    std::vector<u2case> cases;
+    for (ggml_type t : { GGML_TYPE_AIT2_U2, GGML_TYPE_AIT3_U2, GGML_TYPE_AIT4_U2 }) {
+        for (int64_t M : { 1024, 6144, 10240, 17408 }) { cases.push_back({ t, M, 5120 }); }
+    }
+    for (ggml_type t : { GGML_TYPE_AIT2_U2_512, GGML_TYPE_AIT3_U2_512, GGML_TYPE_AIT4_U2_512 }) {
+        for (int64_t K : { 3072, 6144, 9216, 17408 }) { cases.push_back({ t, 5120, K }); }
+        cases.push_back({ t, 3072, 17408 });
+    }
+    int fails = 0;
+    for (const u2case & c : cases) {
+        const int64_t M = c.M, K = c.K;
+        const int64_t kb = c.t == GGML_TYPE_AIT2_U2 || c.t == GGML_TYPE_AIT3_U2 || c.t == GGML_TYPE_AIT4_U2 ? 640 : 512;
+        for (int64_t N = 1; N <= 8; ++N) {
+            ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, c.t, K, M);
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+            ggml_tensor * y = ggml_mul_mat(ctx, a, b);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, y);
+            const std::string nm = std::string("u2mmv ") + ggml_type_name(c.t) + " M=" + std::to_string(M) + " K=" + std::to_string(K) + " N=" + std::to_string(N);
+            if (!ggml_backend_supports_op(be, y)) {
+                printf("%s: not supported FAIL\n", nm.c_str());
+                ++fails;
+                ggml_free(ctx);
+                continue;
+            }
+            ggml_backend_buffer_t bb = ggml_backend_alloc_ctx_tensors(ctx, be);
+            std::mt19937 rng(9173 + (uint32_t) (M + 7 * K + 131 * N + 1009 * (int) c.t));
+            std::uniform_real_distribution<float> ud(0.002f, 0.02f), ux(-1.0f, 1.0f);
+            std::vector<uint8_t> wb(ggml_nbytes(a));
+            const size_t ub = (size_t) 16 * ggml_row_size(c.t, kb);
+            GGML_ASSERT(wb.size() == (size_t) (M / 16) * (size_t) (K / kb) * ub);
+            for (size_t u = 0; u < wb.size() / ub; ++u) {
+                uint8_t * blk = wb.data() + u * ub;
+                for (int i = 0; i < 16; ++i) { ((ggml_fp16_t *) blk)[i] = ggml_fp32_to_fp16(ud(rng)); }
+                for (size_t i = 32; i < ub; ++i) { blk[i] = (uint8_t) rng(); }
+            }
+            std::vector<float> x((size_t) (N * K));
+            for (auto & v : x) { v = ux(rng); }
+            ggml_backend_tensor_set(a, wb.data(), 0, wb.size());
+            ggml_backend_tensor_set(b, x.data(), 0, x.size() * sizeof(float));
+            std::vector<float> yg((size_t) (N * M)), again((size_t) (N * M));
+            bool ok = true, identical = true;
+            for (int repeat = 0; repeat < repeats && ok; ++repeat) {
+                std::vector<float> & dst = repeat ? again : yg;
+                std::fill(dst.begin(), dst.end(), std::numeric_limits<float>::quiet_NaN());
+                ggml_backend_tensor_set(y, dst.data(), 0, dst.size() * sizeof(float));
+                ok = ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(y, dst.data(), 0, dst.size() * sizeof(float));
+                if (repeat) { identical &= memcmp(yg.data(), again.data(), yg.size() * sizeof(float)) == 0; }
+            }
+            bool finite = true;
+            for (float v : yg) { finite &= std::isfinite(v); }
+            const std::string file = std::string(dir) + "/u2t" + std::to_string((int) c.t) + "_m" + std::to_string(M) + "_k" + std::to_string(K) + "_n" + std::to_string(N) + ".f32";
+            std::ofstream dump(file, std::ios::binary);
+            const bool wrote = (bool) dump.write((const char *) yg.data(), yg.size() * sizeof(float));
+            const bool pass = ok && identical && finite && wrote;
+            fails += !pass;
+            printf("%s: compute %s, %d repeats %s, finite %s, dump %s\n", nm.c_str(), ok ? "OK" : "FAIL", repeats,
+                   identical ? "IDENTICAL" : "FAIL", finite ? "OK" : "FAIL", wrote ? "OK" : "FAIL");
+            ggml_backend_buffer_free(bb);
+            ggml_free(ctx);
+        }
+    }
+    ggml_backend_free(be);
+    printf("u2mmv: %s (%d fails)\n", fails ? "FAIL" : "PASS", fails);
+    return fails ? 1 : 0;
+}
+
 // GGML_TEST_AIT_MIDT_OUT=<dir> (MIDT64): AIT2/3/4 dense mul_mat with fixed-seed weights (the test_mul_mat_ait layout) and
 // activations at the 27B shapes, N around the 9..64 window of GGML_CUDA_AIT_MIDT_SPLIT / GGML_CUDA_AIT_MIDT_MAX_T. Each case is
 // computed GGML_TEST_AIT_REPEAT times (default 8) and must repeat bitwise; the first output goes to <dir>/ait<k>_m<M>_k<K>_n<N>.f32,
@@ -25225,6 +25317,9 @@ int main(int argc, char ** argv) {
 #endif
     if (const char * ad = getenv("GGML_TEST_AIT_DIR")) {
         return run_ait_check(ad);
+    }
+    if (const char * od = getenv("GGML_TEST_U2_MMV_OUT")) {
+        return run_u2_mmv_check(od);
     }
     if (const char * od = getenv("GGML_TEST_AI5_MIDT_OUT")) {
         return run_ai5_midt_check(od);
