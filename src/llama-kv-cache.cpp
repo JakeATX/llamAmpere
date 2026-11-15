@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kq-mask-pack.h"
 #include "llama-kv-stream-plan.h"
 
 #include "llama-impl.h"
@@ -5171,22 +5172,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
         uint32_t * words = (uint32_t *) dst->data;
-        for (int64_t r = 0; r < n_rows; ++r) {
-            const ggml_fp16_t * row = scratch.data() + r*n_kv;
-            uint32_t          * w   = words + r*n_w;
-            for (int64_t iw = 0; iw < n_w; ++iw) {
-                const int64_t j0 = iw*32;
-                const int64_t nj = std::min<int64_t>(32, n_kv - j0);
-                uint32_t bits = 0;
-                for (int64_t b = 0; b < nj; ++b) {
-                    const ggml_fp16_t v = row[j0 + b];
-                    // the f16 mask holds 0 or -INF here (ALiBi masks never take this path)
-                    GGML_ASSERT(v == keep || v == drop);
-                    bits |= (uint32_t) (v == keep) << b;
-                }
-                w[iw] = bits;
-            }
-        }
+        llama_kq_mask_pack_rows(scratch.data(), words, n_rows, n_kv, n_w, keep, drop);
         return;
     }
 
