@@ -833,7 +833,8 @@ struct server_prompt_cache {
     // [#187] true while `state` is a RAM entry of this cache (not loaded, evicted or staged)
     bool holds(const server_prompt_cache_state * state) const;
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec = nullptr);
+    // n_ctx_max > 0 (--slot-ctx): entries with more tokens than the slot's cap are never loaded
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec = nullptr, int32_t n_ctx_max = 0);
 
     void update();
 

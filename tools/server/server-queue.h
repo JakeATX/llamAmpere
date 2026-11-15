@@ -69,7 +69,9 @@ public:
 
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
-    void pop_deferred_task(int id_slot);
+    // all = true (--slot-ctx): every deferred task is tried again, so a task that waits for the long slot does not
+    // hold back a short task that fits the slot just released
+    void pop_deferred_task(int id_slot, bool all = false);
 
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping

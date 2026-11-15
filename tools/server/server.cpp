@@ -132,6 +132,42 @@ static bool server_prepare_params(common_params & params, server_role_type role_
         }
     }
 
+    // --slot-ctx: per-slot reserved context in one unified pool (opt-in; unset = unchanged)
+    if (!params.slot_ctx.empty() && role_type != SERVER_ROLE_ROUTER) {
+        if (params.kv_unified_per_slot > 0) {
+            SRV_ERR("%s", "--slot-ctx and --kv-unified-per-slot cannot be combined; --slot-ctx sets every slot's cap\n");
+            return false;
+        }
+        if (!params.kv_unified) {
+            SRV_ERR("%s", "--slot-ctx needs --kv-unified (one shared KV pool)\n");
+            return false;
+        }
+        if ((int) params.slot_ctx.size() != params.n_parallel) {
+            SRV_ERR("--slot-ctx has %zu values but --parallel is %d\n", params.slot_ctx.size(), params.n_parallel);
+            return false;
+        }
+        if (std::find(params.slot_ctx.begin(), params.slot_ctx.end(), 0) != params.slot_ctx.end() && params.n_ctx == 0) {
+            SRV_ERR("%s", "--slot-ctx: shared slots (0) take the rest of the pool, so the pool size must be given with -c\n");
+            return false;
+        }
+        if (std::find(params.slot_ctx.begin(), params.slot_ctx.end(), 0) != params.slot_ctx.end() && params.ctx_shift) {
+            SRV_ERR("%s", "--slot-ctx: shared slots (0) have a room that shrinks while they run, so --context-shift is not supported with them\n");
+            return false;
+        }
+        if (params.n_ctx == 0 && (uint32_t) params.fit_params_min_ctx != UINT32_MAX) {
+            int64_t sum = 0;
+            for (const int32_t n : params.slot_ctx) {
+                sum += n;
+            }
+            if (sum > INT32_MAX) {
+                SRV_ERR("--slot-ctx: the sum %lld is too large\n", (long long) sum);
+                return false;
+            }
+            params.n_ctx = (int32_t) sum;
+            SRV_INF("--slot-ctx: sizing KV pool to the sum of the slot caps = %d\n", params.n_ctx);
+        }
+    }
+
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
     // or with -c 0 for max context
     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&

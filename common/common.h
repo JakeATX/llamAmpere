@@ -829,6 +829,7 @@ struct common_params {
     bool    warm_prefill        = false; // after a chat reply, prefill the next turn's shared prefix in the background (opt-in)
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
+    std::vector<int32_t> slot_ctx;       // --slot-ctx: reserved context per slot (needs --kv-unified); empty = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = COMMON_CACHE_RAM_AUTO; // auto = sized from host RAM (see common_prompt_cache_ram_auto_mib),
                                                              // -1 = half of the free host memory, 0 = disable, N = N MiB

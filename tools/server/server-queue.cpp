@@ -87,9 +87,14 @@ int server_queue::get_new_id() {
     return new_id;
 }
 
-void server_queue::pop_deferred_task(int id_slot) {
+void server_queue::pop_deferred_task(int id_slot, bool all) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    if (!queue_tasks_deferred.empty()) {
+    if (all) {
+        while (!queue_tasks_deferred.empty()) {
+            queue_tasks.emplace_front(std::move(queue_tasks_deferred.back()));
+            queue_tasks_deferred.pop_back();
+        }
+    } else if (!queue_tasks_deferred.empty()) {
         // try to find a task that uses the specified slot
         bool found = false;
         for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
