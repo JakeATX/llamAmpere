@@ -175,6 +175,7 @@ llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
+llama_build_and_test(test-kq-mask-pack.cpp)
 llama_build_and_test(test-gdn-prefix-lanes.cpp LABEL "turbo") # [TAG_GDN_REPLAY_LANES] per-lane prefix mask
 llama_build_and_test(test-sjkvarn-codec.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
