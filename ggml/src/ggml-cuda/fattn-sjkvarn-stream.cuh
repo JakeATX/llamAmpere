@@ -1480,7 +1480,7 @@ static int ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(const ggml_tensor * dst) {
 }
 
 // [KVROWS] GGML_SJKVARN_COMPACT_ALL / GGML_SJKVARN_COMPACT_OCC: the compact tile at widths 4 and 6 (mode 1) or 4, 6, 7, 8
-// (mode 2); width 5 stays on GGML_SJKVARN_DIRECT_Q5G6. COMPACT_ALL: unset = off (opt-in until its QC); 1 (on/true/yes) = mode 1, the rows kernel's
+// (mode 2); width 5 stays on GGML_SJKVARN_DIRECT_Q5G6. COMPACT_ALL: unset = mode 1 (default on since the KVROWS QC); 1 (on/true/yes) = mode 1, the rows kernel's
 // KV split (bit-identical output); 0 (off/false/no) = off, the kill switch for both modes. COMPACT_OCC=1 (on/true/yes) =
 // mode 2, the compact instance's own occupancy split (more KV splits, combine order differs: NMSE class like
 // GGML_SJKVARN_NT6_OCC); it needs no COMPACT_ALL, but COMPACT_ALL=0 still turns it off. Mode 1 with GGML_CUDA_SJ_FILL=1 = off.
@@ -1503,7 +1503,7 @@ static int ggml_cuda_fattn_sj_kvarn_env_bool(const char * name) { // -1 unset, 0
     return 0;
 }
 
-static constexpr int GGML_SJKVARN_COMPACT_ALL_DEFAULT = 0;
+static constexpr int GGML_SJKVARN_COMPACT_ALL_DEFAULT = 1;  // KVROWS QC 2026-11-15: lossless (bit-identical), 1u paired +0.20%, 4u +1.36%
 
 static int ggml_cuda_fattn_sj_kvarn_compact_mode() {
     static const int mode = [] {
