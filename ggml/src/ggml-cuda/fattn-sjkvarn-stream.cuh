@@ -1479,8 +1479,8 @@ static int ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(const ggml_tensor * dst) {
     return mode;
 }
 
-// [KVROWS] GGML_SJKVARN_COMPACT_ALL / GGML_SJKVARN_COMPACT_OCC: the compact tile at widths 4, 6, 7, 8 (width 5 stays on
-// GGML_SJKVARN_DIRECT_Q5G6). COMPACT_ALL: unset = off (opt-in until its QC); 1 (on/true/yes) = mode 1, the rows kernel's
+// [KVROWS] GGML_SJKVARN_COMPACT_ALL / GGML_SJKVARN_COMPACT_OCC: the compact tile at widths 4 and 6 (mode 1) or 4, 6, 7, 8
+// (mode 2); width 5 stays on GGML_SJKVARN_DIRECT_Q5G6. COMPACT_ALL: unset = off (opt-in until its QC); 1 (on/true/yes) = mode 1, the rows kernel's
 // KV split (bit-identical output); 0 (off/false/no) = off, the kill switch for both modes. COMPACT_OCC=1 (on/true/yes) =
 // mode 2, the compact instance's own occupancy split (more KV splits, combine order differs: NMSE class like
 // GGML_SJKVARN_NT6_OCC); it needs no COMPACT_ALL, but COMPACT_ALL=0 still turns it off. Mode 1 with GGML_CUDA_SJ_FILL=1 = off.
@@ -1756,7 +1756,13 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     // [KVROWS] widths 4, 6, 7, 8: the compact tile (GGML_SJKVARN_COMPACT_ALL / _OCC); widths 1-3 already fill ceil(6*n_q/8)
     // == n_q warps, width 5 is the Q5/G6 case below
     if (NT == 4 || NT >= 6) {
-        const int cmode = ggml_cuda_fattn_sj_kvarn_compact_mode_for(dst, NT == 4 && kw8);
+        int cmode = ggml_cuda_fattn_sj_kvarn_compact_mode_for(dst, NT == 4 && kw8);
+        if (cmode == 1 && NT >= 7) {
+            // KVROWS step b (fakeep99, 3090 Ti): mode 1 at widths 7/8 is 12-14% slower than the rows kernel (the copied
+            // 8-warp split gives the 6-warp compact grid half the blocks it can hold), so mode 1 stays on rows there.
+            // Mode 2 (own split) is 20% faster at 7/8 and keeps them.
+            cmode = 0;
+        }
         if (cmode != 0) {
             ggml_cuda_fattn_sj_kvarn_stream_compact<turbo4_body, rot>(ctx, dst, nstage_env, cmode, NT == 4 ? 4 : NT == 6 && nt6_occ ? 6 : 8);
             return;
