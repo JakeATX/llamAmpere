@@ -2852,6 +2852,24 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    const char * verify_env = getenv("LLAMA_RESERVE_VERIFY_ROWS");
+    const int verify_rows = verify_env ? atoi(verify_env) : 0;
+    if (verify_rows > 0) {
+        const uint32_t R = std::min(uint32_t(verify_rows), cparams.n_outputs_max);
+        const char * reason = cparams.training ? "training" : cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ? "non-default context" :
+            R == 0 ? "zero output capacity" : R < n_seqs ? "rows below n_seqs" :
+            R >= n_tokens ? "covered by pp reserve" : R > llama_lsa_cfg().max_rows ? "rows exceed LSA max_rows" : nullptr;
+        if (reason) {
+            LLAMA_LOG_WARN("%s: verify reserve skipped: %s (LLAMA_RESERVE_VERIFY_ROWS)\n", __func__, reason);
+        } else {
+            std::vector<size_t> sizes(model.no_alloc() ? backend_ptrs.size() : 0);
+            auto * gf = graph_reserve(R, n_seqs, R, mctx.get(), model.no_alloc(), model.no_alloc() ? sizes.data() : nullptr);
+            if (!gf) { throw std::runtime_error("failed to allocate compute verify buffers"); }
+            for (size_t i = 0; i < sizes.size(); ++i) { backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes[i]); }
+            LLAMA_LOG_INFO("%s: verify reserve: %u rows, %d nodes, n_kv full (LLAMA_RESERVE_VERIFY_ROWS)\n", __func__, R, ggml_graph_n_nodes(gf));
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
