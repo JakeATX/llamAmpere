@@ -5011,7 +5011,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-copy-tail"}, "N",
         string_format("copy mode: append up to N tokens looked up in the context after the model drafter's block, "
             "verified by exact match; scheduled only while a copy is running; capped at n_rs_seq on hybrid models "
-            "(0 = off, max %d, default: auto = 8 with one slot and the model's MTP head, no -md, else 0; LLAMA_SPEC_COPY=0 turns auto off)",
+            "(0 = off, max %d, default: auto = 8 with one slot and the model's MTP head, no -md, else 0; LLAMA_SPEC_COPY=0 turns auto off; auto is off with --gdn-replay unless LLAMA_SPEC_COPY=1)",
             (int) common_speculative_copy_params::TAIL_MAX),
         [](common_params & params, int value) {
             if (value < 0 || value > common_speculative_copy_params::TAIL_MAX) {
