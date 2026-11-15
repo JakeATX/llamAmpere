@@ -22258,6 +22258,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 2));
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0, 4, 4, 0, 2));
+    // [KVROWS] the compact tile at widths 4, 6, 7, 8 (GGML_SJKVARN_COMPACT_ALL=1 mode 1 / GGML_SJKVARN_COMPACT_OCC=1 mode 2):
+    // the width-5 set above at the other widths (widths 1-3 as unchanged controls), and 775 records + 300 ring rows
+    // (99,628 positions, the P76 1u verify length) for the real KV split counts. Mode 1 bit-identity: GGML_TEST_SEED +
+    // GGML_TEST_DUMP_HASH hashes, switch off vs on.
+    for (int64_t n_q : {1, 2, 3, 4, 6, 7, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true));
+        if (n_q < 4) {
+            continue;
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, true, false, GGML_TYPE_Q8_0, 256));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+        for (int rot : {1, 2}) {
+            test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, rot));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 775, 300, true, false, GGML_TYPE_TQ6_0, 128, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 775, 300, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 1));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 775, 300, true, false, GGML_TYPE_TQ6_0, 128, true));
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 0*128, 128 + 2*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0, true));
@@ -23209,6 +23229,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // [MULTI4] GGML_TEST_AIV2_PERF=fakeep: SJ-KVaRN decode attention at the Qwen3.8 27B shape (24 q heads, 4 KV heads, tq6_0
         // ring, f16 sink, 4/4 scalar body) over a dense body of KEEP + window cells, KEEP 12,288 / 24,576 / 49,152 + 8,192
         // (160 / 256 / 448 records of 128), at 1 / 3 / 6 query rows: is FA linear in KEEP and flat in rows?
+        // [KVROWS] GGML_TEST_AIV2_PERF=fakeep99: the same decode attention at 775 records + 300 ring rows (99,628 positions,
+        // the P76 1u verify length) at widths 1..8 (GGML_SJKVARN_COMPACT_ALL / _OCC A/B)
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "fakeep99") {
+            for (int64_t n_q = 1; n_q <= 8; ++n_q) {
+                test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 775, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
+            }
+            return test_cases;
+        }
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "fakeep") {
             for (int64_t ng : { 160, 256, 448 }) {
                 for (int64_t n_q : { 1, 3, 6 }) {
