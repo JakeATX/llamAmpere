@@ -83,7 +83,7 @@
 //                             and K split over blockIdx.z with fixed-order fp32 partials (default 1 = on; 0 = off)
 //                             1 = splits from the SM count, n >= 2 = n splits (both clamped to [1, min(8, K/512)]),
 //                             -1 = token tile only (no split)
-//   GGML_CUDA_AI4_MMV_CG=1     FEWPORT port 2 (default 0 = off): dense 9..24 tokens of the unit layouts (not AIT2P_U), H256
+//   GGML_CUDA_AI4_MMV_CG=1     FEWPORT port 2 (default 0 = off): dense 9..24 tokens of the unit layouts (not AIT2P_U, not the *_U2_512 types), H256
 //                             activations, default dense policy: the mmv kernel with 2 or 3 column groups of 8 tokens
 //                             (ai4k::mmv_cg), instead of the gemm / AI5 MIDT launch. fp32 sum order differs, no atomics.
 //                             GGML_CUDA_AI4_MMV_CG_MINB=2|4 (default 4) sets its launch_bounds min blocks.
