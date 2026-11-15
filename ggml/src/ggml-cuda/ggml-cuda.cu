@@ -3820,22 +3820,22 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 
 // [MMQFEW] upstream few-row MMQ (#31533): int8 MMA for 2..24 src1 columns of Q8_0, Q3_K..Q6_K, IQ3_S, IQ4_NL, IQ4_XS
 // (spec-decoding verify widths). AI4 / AI+ (AIT) / CR / TQ weights never reach it: ggml_cuda_mul_mat dispatches them
-// before the route. GGML_CUDA_MMQ_FEW: 1 (default) = on, except the IQ4_XS widths [PARW] already takes (9..its max);
-// 2 = on for every width it supports, PARW included; 0 = off (the pre-merge routes).
+// before the route. GGML_CUDA_MMQ_FEW: 1 (set explicitly) = on, except the IQ4_XS widths [PARW] already takes (9..its max);
+// 2 = on for every width it supports, PARW included; 0 (default) = off (the pre-merge routes).
 static int ggml_cuda_mmq_few_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_CUDA_MMQ_FEW");
-        if (e == nullptr || *e == '\0' || strcmp(e, "1") == 0) {
-            return 1;
-        }
-        if (strcmp(e, "0") == 0) {
+        if (e == nullptr || *e == '\0' || strcmp(e, "0") == 0) {
             return 0;
+        }
+        if (strcmp(e, "1") == 0) {
+            return 1;
         }
         if (strcmp(e, "2") == 0) {
             return 2;
         }
-        GGML_LOG_WARN("%s: GGML_CUDA_MMQ_FEW=\"%s\" is not 0, 1 or 2: few-row MMQ stays at 1 (the default)\n", __func__, e);
-        return 1;
+        GGML_LOG_WARN("%s: GGML_CUDA_MMQ_FEW=\"%s\" is not 0, 1 or 2: few-row MMQ falls back to 0 (the default)\n", __func__, e);
+        return 0;
     }();
     return mode;
 }
