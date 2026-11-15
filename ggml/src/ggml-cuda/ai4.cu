@@ -989,7 +989,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     // FEWPORT ports 2 and 3 (both default off): dense 9..24 tokens, H256 activations, only where the default dense policy
     // holds (no rate-2/3 tile / narrow / split controls, no AMPERE_MMV / PARW route), so the activations are the plain
     // quantize_act layout that mmv reads
-    if (N >= 9 && N <= 24 && xsh && !tile && !narrow && !split_active && t != GGML_TYPE_AIT2P_U &&
+    // INTEG3: the 512-K U2 layouts (types 128-130, smallcard) have no port-2/3 kernel, so they stay on the default path
+    if (N >= 9 && N <= 24 && xsh && !tile && !narrow && !split_active && t != GGML_TYPE_AIT2P_U && ggml_ai4v2_chunks(t) != 4 &&
             !(t == GGML_TYPE_AIT4_U && ai4_ampere_sms(ctx) && ai4_ampere_mmv(N)) && !(ggml_ai4v2_rate(t) && ai4_parw(N))) {
         if (ai4_mmv_cg_on()) {
             switch (ai4_lay_of(t)) {
