@@ -864,6 +864,7 @@ static void test(void) {
         auto automatic = dkv_sj_kvarn_inh;
         automatic.speculative.draft.sj_kvarn = false;
         automatic.speculative.draft.sj_kvarn_explicit = false;
+        automatic.speculative.draft.attn_window = 0;
         assert(common_speculative_draft_sj_kvarn_error(automatic) == nullptr);
         const auto draft = common_base_params_to_speculative(automatic);
         assert(draft.speculative.draft.sj_kvarn);
@@ -872,6 +873,35 @@ static void test(void) {
         assert(draft.cache_type_k == automatic.sj_kvarn_staging_type);
         assert(draft.cache_type_v == automatic.sj_kvarn_staging_type);
         assert(draft.speculative.draft.vocab_map == "auto:rm24h" && draft.speculative.draft.vocab_hot == 0);
+
+        auto window = automatic;
+        window.speculative.draft.attn_window = 4096;
+        window.speculative.draft.attn_sink = 64;
+        for (bool explicit_choice : { false, true }) {
+            window.speculative.draft.sj_kvarn_explicit = explicit_choice;
+            assert(common_speculative_draft_sj_kvarn_error(window) != nullptr);
+            const auto fallback = common_base_params_to_speculative(window);
+            assert(!fallback.speculative.draft.sj_kvarn);
+            assert(fallback.sj_kvarn_bits_k == 0 && fallback.sj_kvarn_bits_v == 0);
+            assert(fallback.cache_type_k == COMMON_SJKVARN_MTP_DRAFT_KV[0]);
+            assert(fallback.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
+            assert(fallback.speculative.draft.cache_type_sj_kvarn_default);
+            assert(fallback.speculative.draft.vocab_map == "auto");
+            auto cparams = common_context_params_to_llama(fallback);
+            common_speculative_mtp_cparams(fallback, cparams);
+            assert(cparams.sj_kvarn_bits_k == 0 && cparams.sj_kvarn_bits_v == 0);
+            assert(cparams.draft_attn_window == 4096 && cparams.draft_attn_sink == 64);
+        }
+        window.speculative.draft.sj_kvarn = true;
+        bool rejected = false;
+        try {
+            common_base_params_to_speculative(window);
+        } catch (const std::invalid_argument & e) {
+            rejected = true;
+            assert(std::string(e.what()).find("--spec-draft-window") != std::string::npos);
+        }
+        assert(rejected);
+
         for (int mode = 0; mode < 9; ++mode) {
             auto unsupported = automatic;
             switch (mode) {

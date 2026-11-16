@@ -4481,6 +4481,9 @@ const char * common_speculative_draft_sj_kvarn_error(const common_params & param
     if (draft.cache_type_k != GGML_TYPE_COUNT || draft.cache_type_v != GGML_TYPE_COUNT) {
         return "--spec-draft-sjkvarn cannot be combined with -ctkd/-ctvd";
     }
+    if (draft.attn_window > 0) {
+        return "--spec-draft-sjkvarn cannot be combined with a positive --spec-draft-window";
+    }
     if (draft.n_max < 0 || params.sj_kvarn_tail < (uint32_t) draft.n_max + 1) {
         return "--spec-draft-sjkvarn requires a tail larger than the maximum draft width";
     }
