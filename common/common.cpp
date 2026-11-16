@@ -12,6 +12,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "preset.h"
 #include "unicode.h"
 
 #include <algorithm>
@@ -1521,6 +1522,13 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    if (!params.card_preset.empty()) {
+        const auto & card = common_card_preset_get(params.card_preset);
+        const std::string preset_env = common_card_preset_apply_env(params);
+        LOG_INF("card preset %s v%s [%s]; applied defaults:%s; effective -c %d -np %d -b %d -ub %d; profile env:%s; recheck all presets before ship; 24dense packed/dynamic ub pending QC, DSJ/RM24H pending integration; small-card dynamic ub pending ASYMCTX\n",
+                card.name.c_str(), card.version.c_str(), card.status.c_str(), params.card_preset_flags.c_str(),
+                params.n_ctx, params.n_parallel, params.n_batch, params.n_ubatch, preset_env.c_str());
+    }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
     bool verify_compact_fit_safe = false;
@@ -1553,6 +1561,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->model.reset(model);
+
+    if (!params.card_preset.empty()) {
+        char arch[64] = {};
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+        if (std::string(arch) != "qwen35" || llama_model_n_layer(model) != 64 || llama_model_n_embd(model) != 5120) {
+            LOG_WRN("card preset %s was made for dense Qwen 27B; this model differs, continuing with the chosen settings\n",
+                    params.card_preset.c_str());
+        }
+    }
 
     if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
         // Flash-Next keeps 928 MiB free with trimmed prompt scratch and host-backed raw indexer history.

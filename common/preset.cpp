@@ -9,6 +9,154 @@
 #include <filesystem>
 #include <regex>
 
+// fork: runtime card profiles. Values stay here so each QC change has one table to update.
+const common_card_preset & common_card_preset_get(const std::string & name) {
+    static const std::vector<common_card_preset> profiles = [] {
+        // QC: V07/INTEG3/QC_READY_integ3.md, out-s10-ident-r8; ASYMCTX/MERGE_NOTE_kqpack_f2.md.
+        common_card_preset large {
+            "24dense", "2026-11-16.5", "best known/recheck before ship", "", {
+                {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"},
+                {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
+                {"--spec-type", "draft-mtp-adaptive"},
+                {"--spec-draft-n-min-adaptive", "4"}, {"--spec-draft-n-max", "5"}, {"--spec-draft-n-min", "4"},
+                {"--spec-draft-p-min", "0"}, {"--spec-draft-window", "4096"},
+                {"--spec-draft-vocab-map", "auto"}, {"--gdn-replay", "1"}, {"--kv-unified", "1"}
+            }, {
+                {"LLAMA_GDN_REPLAY_LANES", "1"}
+            }
+        };
+        // Pending: ASYMCTX packed-default and dynamic ub/mask QC. DSJ/RM24H QC passed; INTEG3 owns the eligible-path default integration.
+        // QC sources: LSA/REAL10GB/RESULT_speed10.md and speed10/s10.sh:55-66 + s10.py:62-74 (D2HA U then X).
+        // 12dense: DENSE8/opus-12gb-path/r205s3/r205s3.sh:27,46-56 + r205b.py:55-65; omit diagnostic RESIDENT_LOG.
+        // Small profiles keep the measured source's packed mask; the 24dense packed-default gate does not clear them.
+        // Recheck before ship: 12dense d28a3c00 + SHARED=3; R205S3 used L0 4cde6151.
+        // TODO: multi-user for small cards (future).
+        // Owner 2026-11-16T01:58Z: dynamic ub pending ASYMCTX; keep static ub until its ladder lands.
+        common_card_preset small {
+            "10dense", "2026-11-16.5", "best known/recheck before ship", "", {
+                {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
+                {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                {"--fit", "off"}, {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
+                {"--sjkvarn-body-type", "sjkvarn4"}, {"--cache-type-s", "q8_0"},
+                {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
+                {"--override-tensor", "token_embd.weight=CPU"}, {"--threads", "6"},
+                {"--load-mode", "none"}, {"--spec-type", "draft-mtp"},
+                {"--spec-draft-n-max", "4"}, {"--spec-draft-p-min", "0"},
+                {"--spec-draft-vocab-map", "auto:65536"}, {"--spec-draft-window", "2048"},
+                {"--spec-draft-type-k", "q8_0"}, {"--spec-draft-type-v", "q8_0"},
+                {"--sjkvarn-sink", "128"}, {"--sjkvarn-sink-type", "f16"},
+                {"--sjkvarn-staging-type", "tq6_0"}, {"--sjkvarn-tail", "4096"},
+                {"--sjkvarn-tail-max", "8192"}
+            }, {
+                {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "1"}, {"LLAMA_KQ_MASK_PACKED", "1"},
+                {"LLAMA_DRAFT_VOCAB_COMPACT", "0"}, {"LLAMA_LSA_MODE", "key"},
+                {"LLAMA_LSA_MAP", "@model/lsa-qwen38-27b-d2048.gguf"},
+                {"LLAMA_LSA_IDX_CACHE", "1"}, {"LLAMA_LSA_PACKED", "1"},
+                {"LLAMA_LSA_KEEP", "51072"}, {"LLAMA_LSA_RESIDENT_MIB", "300.0"},
+                {"LLAMA_LSA_IDX_Q8", "1"}, {"LLAMA_LSA_BLOCK", "128"},
+                {"LLAMA_LSA_BLOCK_TAU", "2"}, {"LLAMA_LSA_SJ_SKIP", "1"},
+                {"LLAMA_LSA_REFINE", "128"}, {"LLAMA_LSA_REFINE_MULT", "2"},
+                {"LLAMA_LSA_SHARED", "1"}, {"LLAMA_LSA_FUSED_SEL", "1"},
+                {"LLAMA_LSA_COMP", "0"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
+                {"GGML_SJKVARN_TILE_SKIP", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
+                {"GGML_CUDA_LSA_RESIDENT_STAGE", "0"}, {"LLAMA_LSA_KEEP_FRAC", "0.195"},
+                {"LLAMA_LSA_REFINE_SH", "1"}
+            }
+        };
+        auto medium = small;
+        medium.name = "12dense";
+        medium.options.front().second = "262144";
+        for (auto & kv : medium.env) {
+            if (kv.first == "LLAMA_LSA_SHARED") {
+                kv.second = "3";
+            }
+        }
+        // Source: LSA/REAL8GB/card8/lsa-8gb.env; SMALLPORT owner addendum 15 accepts the F2 fit profile.
+        common_card_preset tiny {
+            "8dense", "2026-11-16.6", "best known/recheck before ship", "", {
+                {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
+                {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                {"--fit", "off"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
+                {"--cache-type-k", "sjkvarn3"}, {"--cache-type-v", "sjkvarn3"},
+                {"--sjkvarn-body-type", "sjkvarn4t"}, {"--cache-type-s", "q8_0"},
+                {"--override-tensor", "token_embd.weight=CPU"}, {"--load-mode", "none"},
+                {"--spec-type", "draft-mtp"}, {"--spec-draft-n-max", "3"},
+                {"--spec-n-rs-seq", "3"}, {"--spec-draft-p-min", "0"},
+                {"--spec-draft-window", "20480"}, {"--spec-draft-n-ubatch", "8"},
+                {"--spec-draft-vocab-map", "auto:65536"},
+                {"--spec-draft-type-k", "q8_0"}, {"--spec-draft-type-v", "q8_0"}
+            }, {
+                {"LLAMA_LSA_MODE", "key"}, {"LLAMA_LSA_MAP", "@model/lsa-qwen38-27b-d2048.gguf"},
+                {"LLAMA_LSA_KEEP", "16384"}, {"LLAMA_LSA_SHARED", "3"},
+                {"LLAMA_LSA_IDX_CACHE", "1"}, {"LLAMA_LSA_PACKED", "1"},
+                {"LLAMA_LSA_IDX_Q8", "1"}, {"LLAMA_LSA_IDX_Q4", "1"},
+                {"LLAMA_LSA_BLOCK", "128"}, {"LLAMA_LSA_BLOCK_TAU", "2"},
+                {"LLAMA_LSA_SJ_SKIP", "1"}, {"LLAMA_LSA_REFINE", "128"},
+                {"LLAMA_LSA_REFINE_MULT", "2"}, {"LLAMA_LSA_RING_ROWS", "512"},
+                {"LLAMA_LSA_MEAN_CHUNKS", "1"}, {"LLAMA_RESERVE_VERIFY_ROWS", "7"},
+                {"GGML_CUDA_DISABLE_GRAPHS", "1"}, {"GGML_ALLOC_GROW_PCT", "1"},
+                {"LLAMA_LSA_FUSED_SEL", "1"}, {"LLAMA_LSA_COMP", "2"},
+                {"LLAMA_LSA_COMP_LB", "1"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
+                {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "256"},
+                {"LLAMA_KQ_MASK_PACKED", "1"}, {"GGML_SJKVARN_TILE_SKIP", "1"},
+                {"GGML_SJKVARN_TRELLIS_PREFILL_MIB", "16"}, {"GGML_SJKVARN_TRELLIS_WIDTH", "1"},
+                {"GGML_SJKVARN_TRELLIS_WIDTH_LSE", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
+                {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "0"}, {"LLAMA_DRAFT_VOCAB_FULL_HEAD", "1"},
+                {"LLAMA_MODEL_OVERLAY_PATCH", "@model/mtp-dm.gguf,@model/head-ait2.gguf"},
+                {"LLAMA_D1_HEAD", "@model/head-exact-f16.gguf"}, {"GGML_CUDA_GRAPH_MAX_ROWS", "16"}
+            }
+        };
+        return std::vector<common_card_preset> {large, medium, small, tiny};
+    }();
+    for (const auto & profile : profiles) {
+        if (profile.name == name) {
+            return profile;
+        }
+    }
+    throw std::invalid_argument("unknown card preset: expected 24dense, 12dense, 10dense, or 8dense");
+}
+
+std::string common_card_preset_apply_env(const common_params & params) {
+    std::string applied;
+    if (params.card_preset.empty()) {
+        return applied;
+    }
+    const auto & card = common_card_preset_get(params.card_preset);
+    for (const auto & kv : card.env) {
+        if (!params.card_preset_kv_default && (kv.first.compare(0, 10, "LLAMA_LSA_") == 0 ||
+            kv.first.compare(0, 14, "GGML_CUDA_LSA_") == 0 || kv.first == "GGML_SJKVARN_TILE_SKIP")) {
+            continue;
+        }
+        if (!std::getenv(kv.first.c_str())) {
+            auto model_path = [&](const std::string & value) {
+                return value.compare(0, 7, "@model/") == 0 ?
+                    (std::filesystem::path(params.model.path).parent_path() / value.substr(7)).string() : value;
+            };
+            std::string value;
+            if (kv.first == "LLAMA_MODEL_OVERLAY_PATCH") {
+                std::istringstream paths(kv.second);
+                std::string path;
+                while (std::getline(paths, path, ',')) {
+                    if (!value.empty()) {
+                        value += ",";
+                    }
+                    value += model_path(path);
+                }
+            } else {
+                value = model_path(kv.second);
+            }
+            common_set_env(kv.first, value);
+        }
+        const char * value = std::getenv(kv.first.c_str());
+        if (!value) {
+            throw std::runtime_error("cannot set card preset environment: " + kv.first);
+        }
+        applied += " " + kv.first + "=" + value;
+    }
+    return applied;
+}
+
 static std::string rm_leading_dashes(const std::string & str) {
     size_t pos = 0;
     while (pos < str.size() && str[pos] == '-') {

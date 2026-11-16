@@ -14,6 +14,18 @@
 
 constexpr const char * COMMON_PRESET_DEFAULT_NAME = "default";
 
+struct common_card_preset {
+    std::string name;
+    std::string version;
+    std::string status;
+    std::string pending;
+    std::vector<std::pair<std::string, std::string>> options;
+    std::vector<std::pair<std::string, std::string>> env;
+};
+
+const common_card_preset & common_card_preset_get(const std::string & name);
+std::string common_card_preset_apply_env(const common_params & params);
+
 struct common_preset_context;
 
 struct common_preset {
