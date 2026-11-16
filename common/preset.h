@@ -24,6 +24,7 @@ struct common_card_preset {
 };
 
 const common_card_preset & common_card_preset_get(const std::string & name);
+std::string common_card_preset_apply_env(const common_params & params);
 
 struct common_preset_context;
 

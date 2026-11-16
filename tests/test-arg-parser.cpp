@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "speculative.h"
 #include "spec-defaults.h"
+#include "preset.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -251,9 +252,9 @@ static void test(void) {
     std::vector<std::string> argv;
 
     {
-        auto parse_card = [&](std::vector<std::string> args, common_params & out) {
+        auto parse_card = [&](std::vector<std::string> args, common_params & out, llama_example ex = LLAMA_EXAMPLE_SERVER) {
             args.insert(args.begin(), "test-arg-parser");
-            return common_params_parse(args.size(), list_str_to_char(args).data(), out, LLAMA_EXAMPLE_SERVER);
+            return common_params_parse(args.size(), list_str_to_char(args).data(), out, ex);
         };
         for (const auto & name : {"24dense", "12dense", "10dense"}) {
             common_params selected;
@@ -263,6 +264,9 @@ static void test(void) {
             assert(selected.card_preset == name && bare.card_preset == name);
             assert(selected.n_ctx == bare.n_ctx && selected.n_parallel == 1);
             assert(!selected.card_preset_flags.empty());
+            if (selected.card_preset == "24dense") {
+                assert(selected.cache_type_s == GGML_TYPE_F32);
+            }
             for (bool preset_first : {false, true}) {
                 std::vector<std::string> args = {"-c", "8192", "-ub", "256", "--spec-type", "none", "--no-spec-mb-mtp"};
                 args.insert(preset_first ? args.begin() : args.end(), {"--preset", name});
@@ -318,12 +322,16 @@ static void test(void) {
         assert(per_slot.n_ctx == 0 && per_slot.kv_unified_per_slot == 65536);
         for (const auto & literal : {"24dense", "--preset", "8dense"}) {
             common_params prompt;
-            assert(parse_card({"-p", literal}, prompt));
+            assert(parse_card({"-p", literal}, prompt, LLAMA_EXAMPLE_CLI));
             assert(prompt.prompt == literal && prompt.card_preset.empty());
+            common_params with_preset;
+            assert(parse_card({"--preset", "24dense", "-p", literal}, with_preset, LLAMA_EXAMPLE_CLI));
+            assert(with_preset.prompt == literal && with_preset.card_preset == "24dense");
         }
-        common_params two_values;
-        assert(parse_card({"--lora-scaled", "24dense", "0.5", "--preset", "24dense"}, two_values));
-        assert(two_values.lora_adapters.size() == 1);
+        common_params adapter;
+        assert(parse_card({"--lora-scaled", "24dense:0.5", "--preset", "24dense"}, adapter));
+        assert(adapter.lora_adapters.size() == 1);
+        assert(adapter.lora_adapters.front().path == "24dense" && adapter.lora_adapters.front().scale == 0.5f);
         common_params invalid;
         assert(!parse_card({"--preset", "unknown"}, invalid));
         assert(!parse_card({"--preset"}, invalid));
@@ -343,6 +351,60 @@ static void test(void) {
             setenv("LLAMA_ARG_CTX_SIZE", saved_ctx.c_str(), 1);
         } else {
             unsetenv("LLAMA_ARG_CTX_SIZE");
+        }
+
+        std::set<std::string> env_keys;
+        std::map<std::string, std::string> saved_env;
+        for (const auto & name : {"24dense", "10dense"}) {
+            for (const auto & entry : common_card_preset_get(name).env) {
+                env_keys.insert(entry.first);
+            }
+        }
+        for (const auto & key : env_keys) {
+            if (const char * value = std::getenv(key.c_str())) {
+                saved_env[key] = value;
+            }
+            unsetenv(key.c_str());
+        }
+        common_params no_preset;
+        assert(common_card_preset_apply_env(no_preset).empty());
+        common_params small_env;
+        assert(parse_card({"--preset", "10dense", "-m", "/models/public-AI2.gguf"}, small_env));
+        setenv("LLAMA_LSA_RESIDENT_MIB", "123", 1);
+        const auto applied = common_card_preset_apply_env(small_env);
+        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/lsa-qwen38-27b-d2048.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_RESIDENT_MIB")) == "123");
+        assert(std::string(std::getenv("LLAMA_LSA_MODE")) == "key");
+        assert(applied.find(" LLAMA_LSA_RESIDENT_MIB=123") != std::string::npos);
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
+        common_params explicit_env;
+        assert(parse_card({"--attn-sparse", "none", "--attn-sparse-map", "/explicit/map.gguf",
+                           "--preset", "10dense"}, explicit_env));
+        common_card_preset_apply_env(explicit_env);
+        assert(std::string(std::getenv("LLAMA_LSA_MODE")) == "none");
+        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/explicit/map.gguf");
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
+        common_card_preset_apply_env(kv);
+        for (const auto & key : env_keys) {
+            if (key.compare(0, 10, "LLAMA_LSA_") == 0 || key == "GGML_CUDA_LSA_RESIDENT_STAGE" || key == "GGML_SJKVARN_TILE_SKIP") {
+                assert(!std::getenv(key.c_str()));
+            }
+            unsetenv(key.c_str());
+        }
+        common_params large_env;
+        assert(parse_card({"--preset", "24dense"}, large_env));
+        common_card_preset_apply_env(large_env);
+        assert(std::string(std::getenv("LLAMA_GDN_REPLAY_LANES")) == "1");
+        for (const auto & key : env_keys) {
+            if (saved_env.count(key)) {
+                setenv(key.c_str(), saved_env.at(key).c_str(), 1);
+            } else {
+                unsetenv(key.c_str());
+            }
         }
 #endif
     }
