@@ -268,11 +268,11 @@ static void test(void) {
                 assert(selected.cache_type_s == GGML_TYPE_F32);
             }
             for (bool preset_first : {false, true}) {
-                std::vector<std::string> args = {"-c", "8192", "-ub", "256", "--spec-type", "none", "--no-spec-mb-mtp"};
+                std::vector<std::string> args = {"-c", "8192", "-ub", "128", "--spec-type", "none", "--no-spec-mb-mtp"};
                 args.insert(preset_first ? args.begin() : args.end(), {"--preset", name});
                 common_params overrides;
                 assert(parse_card(args, overrides));
-                assert(overrides.n_ctx == 8192 && overrides.n_ubatch == 256);
+                assert(overrides.n_ctx == 8192 && overrides.n_ubatch == 128);
                 assert(!overrides.sampling.spec_lossy);
                 assert(std::find(overrides.speculative.types.begin(), overrides.speculative.types.end(),
                                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == overrides.speculative.types.end());

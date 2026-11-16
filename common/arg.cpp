@@ -5749,7 +5749,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--preset"}, "24dense|12dense|10dense|8dense",
-        "dense 27B card profile (dev/pending QC); explicit flags override profile values in either order",
+        "dense 27B card profile (best known/recheck before ship); explicit flags override profile values in either order",
         [](common_params & params, const std::string & value) {
             params.card_preset = common_card_preset_get(value).name;
         }
@@ -5757,13 +5757,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg({"24dense"}, "alias for --preset 24dense",
         [](common_params & params) { params.card_preset = "24dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"12dense"}, "alias for --preset 12dense (dev/pending; one slot)",
+    add_opt(common_arg({"12dense"}, "alias for --preset 12dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "12dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"10dense"}, "alias for --preset 10dense (dev/pending; one slot)",
+    add_opt(common_arg({"10dense"}, "alias for --preset 10dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "10dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"8dense"}, "alias for --preset 8dense (held for speed QC)",
+    add_opt(common_arg({"8dense"}, "alias for --preset 8dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "8dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

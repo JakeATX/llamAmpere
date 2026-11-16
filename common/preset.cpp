@@ -14,7 +14,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
     static const std::vector<common_card_preset> profiles = [] {
         // QC: V07/INTEG3/QC_READY_integ3.md, out-s10-ident-r8; ASYMCTX/MERGE_NOTE_kqpack_f2.md.
         common_card_preset large {
-            "24dense", "2026-11-16.3", "best known/recheck before ship", "", {
+            "24dense", "2026-11-16.4", "best known/recheck before ship", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -32,8 +32,9 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
         // Small profiles keep the measured source's packed mask; the 24dense packed-default gate does not clear them.
         // Recheck before ship: 12dense d28a3c00 + SHARED=3; R205S3 used L0 4cde6151.
         // TODO: multi-user for small cards (future).
+        // Owner 2026-11-16T01:58Z: dynamic ub pending ASYMCTX; keep static ub until its ladder lands.
         common_card_preset small {
-            "10dense", "2026-11-16.3", "best known/recheck before ship", "", {
+            "10dense", "2026-11-16.4", "best known/recheck before ship", "", {
                 {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "off"}, {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -73,7 +74,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
         }
         // Source: LSA/REAL8GB/card8/lsa-8gb.env; owner 2026-11-16T01:50Z enables this base until the F2 f205 pair is posted.
         common_card_preset tiny {
-            "8dense", "2026-11-16.3", "best known/recheck before ship", "", {
+            "8dense", "2026-11-16.4", "best known/recheck before ship", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "off"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
