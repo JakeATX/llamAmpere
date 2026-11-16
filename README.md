@@ -1,9 +1,8 @@
 # llamAmpere
 
-llamAmpere is a fast version of llama.cpp (the open-source program that runs AI language models on your own computer),
-tuned for NVIDIA RTX 30-series "Ampere" graphics cards, especially the RTX 3090 and 3090 Ti. It runs Qwen3.8 models,
-including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model
-writes faster) and Qwen3.8 Flash-Next.
+llamAmpere is based on mainline llama.cpp (v1.0), tuned for NVIDIA RTX 30-series Ampere cards. With 1.0 we prioritize keeping up with mainline. It includes TheTom TurboQuant work, credited below.
+
+It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model writes faster) and Qwen3.8 Flash-Next.
 
 ## What's new in v0.6.3.11
 
@@ -143,9 +142,7 @@ Numbers for this release (Swift 1.5 27B, v0.6 against v0.5) are in the [v0.6 rel
 
 ## License and credits
 
-llamAmpere is MIT licensed (see [LICENSE](LICENSE)). It is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
-by the ggml authors and includes work from TheTom's TurboQuant fork. It is the successor of
-[llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
+llamAmpere is MIT licensed (see [LICENSE](LICENSE)) and is based on mainline [llama.cpp](https://github.com/ggml-org/llama.cpp) by the ggml authors. It includes TheTom's TurboQuant KV-cache work and contributions from that fork. Original authors and license headers are retained. It is the successor of [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere). See [CREDITS.md](CREDITS.md) for contribution links. Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Third-party libraries (from upstream llama.cpp):
 
