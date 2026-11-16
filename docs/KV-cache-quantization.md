@@ -159,6 +159,8 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 llama-server -m model.gguf -c 204800 -ngl 99 -fa 
     --spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-sjkvarn
 ```
 
+The exact ordered RM24H map is also shipped as `src/mtp/atxr_24576_h2048.txt`, copied beside build binaries and installed under `share/llama/mtp` (or the configured data directory). Release bundles carry it beside `llama-server`. Its SHA-256 is `effc628f23d9a357ac31c73e6560ee7ff81a99fe76db913c21cc72362e1a7e9a`. To load that file explicitly, use `--spec-draft-vocab-map /path/to/atxr_24576_h2048.txt --spec-draft-vocab-hot 2048`. The default uses the matching built-in IDs, so moving the binaries does not require a data path.
+
 The tail must exceed the maximum draft width so speculative rollback stays in unsealed rows. The server reprocesses an edited prompt if it reaches sealed rows in either context. Draft sealing runs during decode; server idle compression still applies only to the trunk. State serialization retains the existing SJ-KVaRN restrictions. Server slot saves include a `.dft` draft-state file and a `.ckpt` sidecar that binds both state files with SHA-256. Draft saves made before this binding must be saved again with the current server before they can be restored; non-draft version-2 checkpoint sidecars remain readable. Cache compression changes draft probabilities and needs acceptance/quality validation separately from the lean microbatch switch.
 
 ### Small-card overhead switches
