@@ -72,9 +72,9 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 kv.second = "3";
             }
         }
-        // Source: LSA/REAL8GB/card8/lsa-8gb.env + owner 2026-11-16T02:18Z MEAN_CHUNKS; F2 remains held.
+        // Source: LSA/REAL8GB/card8/lsa-8gb.env; SMALLPORT owner addendum 15 accepts the F2 fit profile.
         common_card_preset tiny {
-            "8dense", "2026-11-16.5", "best known/recheck before ship", "", {
+            "8dense", "2026-11-16.6", "best known/recheck before ship", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "off"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
@@ -94,7 +94,8 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 {"LLAMA_LSA_BLOCK", "128"}, {"LLAMA_LSA_BLOCK_TAU", "2"},
                 {"LLAMA_LSA_SJ_SKIP", "1"}, {"LLAMA_LSA_REFINE", "128"},
                 {"LLAMA_LSA_REFINE_MULT", "2"}, {"LLAMA_LSA_RING_ROWS", "512"},
-                {"LLAMA_LSA_MEAN_CHUNKS", "1"},
+                {"LLAMA_LSA_MEAN_CHUNKS", "1"}, {"LLAMA_RESERVE_VERIFY_ROWS", "7"},
+                {"GGML_CUDA_DISABLE_GRAPHS", "1"}, {"GGML_ALLOC_GROW_PCT", "1"},
                 {"LLAMA_LSA_FUSED_SEL", "1"}, {"LLAMA_LSA_COMP", "2"},
                 {"LLAMA_LSA_COMP_LB", "1"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
                 {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "256"},

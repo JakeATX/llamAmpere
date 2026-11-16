@@ -264,6 +264,9 @@ static void test(void) {
             assert(selected.card_preset == name && bare.card_preset == name);
             assert(selected.n_ctx == bare.n_ctx && selected.n_parallel == 1);
             assert(!selected.card_preset_flags.empty());
+            for (const auto & entry : common_card_preset_get(name).env) {
+                assert(entry.first != "LLAMA_SPEC_COPY");
+            }
             const uint32_t bits = selected.card_preset == "8dense" ? 3 : 4;
             assert(selected.cache_type_k == GGML_TYPE_F16 && selected.cache_type_v == GGML_TYPE_F16);
             assert(selected.sj_kvarn_bits_k == bits && selected.sj_kvarn_bits_v == bits);
@@ -426,16 +429,25 @@ static void test(void) {
         assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/models/tiny/head-exact-f16.gguf");
         assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/tiny/lsa-qwen38-27b-d2048.gguf");
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "1");
+        assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "7");
+        assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "1");
+        assert(std::string(std::getenv("GGML_ALLOC_GROW_PCT")) == "1");
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
         setenv("LLAMA_MODEL_OVERLAY_PATCH", "/explicit/mtp.gguf,/explicit/head.gguf", 1);
         setenv("LLAMA_D1_HEAD", "/explicit/exact.gguf", 1);
         setenv("LLAMA_LSA_MEAN_CHUNKS", "0", 1);
+        setenv("LLAMA_RESERVE_VERIFY_ROWS", "9", 1);
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "0", 1);
+        setenv("GGML_ALLOC_GROW_PCT", "5", 1);
         common_card_preset_apply_env(tiny_env);
         assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/explicit/mtp.gguf,/explicit/head.gguf");
         assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/explicit/exact.gguf");
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "0");
+        assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "9");
+        assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "0");
+        assert(std::string(std::getenv("GGML_ALLOC_GROW_PCT")) == "5");
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
