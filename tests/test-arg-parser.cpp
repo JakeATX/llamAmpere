@@ -860,6 +860,71 @@ static void test(void) {
         assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
     }
 
+    {
+        auto automatic = dkv_sj_kvarn_inh;
+        automatic.speculative.draft.sj_kvarn = false;
+        automatic.speculative.draft.sj_kvarn_explicit = false;
+        assert(common_speculative_draft_sj_kvarn_error(automatic) == nullptr);
+        const auto draft = common_base_params_to_speculative(automatic);
+        assert(draft.speculative.draft.sj_kvarn);
+        assert(draft.sj_kvarn_bits_k == automatic.sj_kvarn_bits_k);
+        assert(draft.sj_kvarn_bits_v == automatic.sj_kvarn_bits_v);
+        assert(draft.cache_type_k == automatic.sj_kvarn_staging_type);
+        assert(draft.cache_type_v == automatic.sj_kvarn_staging_type);
+        assert(draft.speculative.draft.vocab_map == "auto:rm24h" && draft.speculative.draft.vocab_hot == 0);
+        for (int mode = 0; mode < 9; ++mode) {
+            auto unsupported = automatic;
+            switch (mode) {
+                case 0: unsupported.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE }; break;
+                case 1: unsupported.speculative.draft.mparams.path = "draft.gguf"; break;
+                case 2: unsupported.n_parallel = 2; break;
+                case 3: unsupported.sj_kvarn_bits_k = 0; break;
+                case 4: unsupported.sj_kvarn_bits_v = 0; break;
+                case 5: unsupported.speculative.draft.cache_type_k = GGML_TYPE_F16; break;
+                case 6: unsupported.speculative.draft.cache_type_v = GGML_TYPE_Q8_0; break;
+                case 7: unsupported.sj_kvarn_tail = unsupported.speculative.draft.n_max; break;
+                case 8: unsupported.speculative.draft.n_max = -1; break;
+            }
+            assert(common_speculative_draft_sj_kvarn_error(unsupported) != nullptr);
+            const auto fallback = common_base_params_to_speculative(unsupported);
+            assert(!fallback.speculative.draft.sj_kvarn && fallback.speculative.draft.vocab_map == "auto");
+        }
+        for (int mode = 0; mode < 4; ++mode) {
+            auto overridden = automatic;
+            switch (mode) {
+                case 0: overridden.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP; break;
+                case 1: overridden.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT; break;
+                case 2: overridden.speculative.draft.vocab_map = "custom.txt"; break;
+                case 3: overridden.speculative.draft.vocab_hot = 17; break;
+            }
+            const auto kept = common_base_params_to_speculative(overridden);
+            assert(kept.speculative.draft.vocab_map == overridden.speculative.draft.vocab_map);
+            assert(kept.speculative.draft.vocab_hot == overridden.speculative.draft.vocab_hot);
+        }
+        automatic.sj_kvarn_tail = automatic.speculative.draft.n_max + 1;
+        assert(common_speculative_draft_sj_kvarn_error(automatic) == nullptr);
+        automatic.speculative.draft.sj_kvarn_explicit = true;
+        const auto disabled = common_base_params_to_speculative(automatic);
+        assert(!disabled.speculative.draft.sj_kvarn);
+        assert(disabled.sj_kvarn_bits_k == 0 && disabled.sj_kvarn_bits_v == 0);
+        assert(disabled.cache_type_k == COMMON_SJKVARN_MTP_DRAFT_KV[0]);
+        assert(disabled.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
+        assert(disabled.speculative.draft.vocab_map == "auto");
+
+        for (bool enabled : { false, true }) {
+            argv = {"binary_name", enabled ? "--no-spec-draft-sjkvarn" : "--spec-draft-sjkvarn",
+                    enabled ? "--spec-draft-sjkvarn" : "--no-spec-draft-sjkvarn",
+                    "--spec-draft-vocab-map", "auto", "--spec-draft-vocab-hot", "0"};
+            common_params parsed;
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), parsed, LLAMA_EXAMPLE_SERVER));
+            assert(parsed.speculative.draft.sj_kvarn == enabled);
+            assert(parsed.speculative.draft.sj_kvarn_explicit);
+            assert(parsed.speculative.draft.vocab_map == "auto" && parsed.speculative.draft.vocab_hot == 0);
+            assert(parsed.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP);
+            assert(parsed.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT);
+        }
+    }
+
     // n-gram drafters request recurrent-state snapshots for in-place rollback (draft width, capped at 8);
     // --spec-n-rs-seq overrides, 0 = checkpoint restore on every partial acceptance
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-ngram-cache-n-max", "7"};
@@ -1144,6 +1209,43 @@ static void test(void) {
     printf("test-arg-parser: skip on windows build\n");
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
+
+    for (const char * value : { "0", "1" }) {
+        setenv("LLAMA_ARG_SPEC_DRAFT_SJKVARN", value, true);
+        setenv("LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP", "auto:24576", true);
+        setenv("LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT", "2048", true);
+        common_params from_env;
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), from_env, LLAMA_EXAMPLE_SERVER));
+        assert(from_env.speculative.draft.sj_kvarn == (value[0] == '1'));
+        assert(from_env.speculative.draft.sj_kvarn_explicit);
+        assert(from_env.speculative.draft.vocab_map == "auto:24576" && from_env.speculative.draft.vocab_hot == 2048);
+        assert(from_env.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP);
+        assert(from_env.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT);
+        common_params from_cli;
+        argv = {"binary_name", value[0] == '1' ? "--no-spec-draft-sjkvarn" : "--spec-draft-sjkvarn",
+                "--spec-draft-vocab-map", "auto", "--spec-draft-vocab-hot", "0"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), from_cli, LLAMA_EXAMPLE_SERVER));
+        assert(from_cli.speculative.draft.sj_kvarn == (value[0] == '0'));
+        assert(from_cli.speculative.draft.sj_kvarn_explicit);
+        assert(from_cli.speculative.draft.vocab_map == "auto" && from_cli.speculative.draft.vocab_hot == 0);
+    }
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_SJKVARN");
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP");
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT");
+    setenv("LLAMA_ARG_SPEC_DRAFT_SJKVARN", "1", true);
+    setenv("LLAMA_ARG_NO_SPEC_DRAFT_SJKVARN", "1", true);
+    {
+        common_params negated;
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), negated, LLAMA_EXAMPLE_SERVER));
+        assert(negated.speculative.draft.sj_kvarn_explicit && !negated.speculative.draft.sj_kvarn);
+        argv = {"binary_name", "--spec-draft-sjkvarn"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), negated, LLAMA_EXAMPLE_SERVER));
+        assert(negated.speculative.draft.sj_kvarn_explicit && negated.speculative.draft.sj_kvarn);
+    }
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_SJKVARN");
+    unsetenv("LLAMA_ARG_NO_SPEC_DRAFT_SJKVARN");
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};

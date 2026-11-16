@@ -197,6 +197,7 @@ enum common_params_speculative_user_field : uint32_t {
     COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE = 1 << 2, // --spec-draft-n-min-adaptive
     COMMON_PARAMS_SPECULATIVE_USER_DRAFT_P_MIN          = 1 << 3, // --spec-draft-p-min
     COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP      = 1 << 4, // --spec-draft-vocab-map
+    COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT      = 1 << 5, // --spec-draft-vocab-hot
 };
 
 // Grammar type enumeration
@@ -389,6 +390,7 @@ struct common_params_speculative_draft {
     ggml_type cache_type_v = GGML_TYPE_COUNT; // KV cache data type for the V
     bool      cache_type_sj_kvarn_default = false; // set on the resolved copy: an unset type took the SJ-KVaRN-trunk default
     bool sj_kvarn = false; // inherit the trunk's SJ-KVaRN body, sink and tail for MTP
+    bool sj_kvarn_explicit = false; // fork: distinguish an explicit off from an unset DSJ option
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

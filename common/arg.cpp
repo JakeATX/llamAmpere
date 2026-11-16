@@ -4889,7 +4889,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a SJ-KVaRN trunk, including a separate MTP draft file; a quantized trunk is copied instead of f16; pass f16 to force f16)",
+            "(default: SJ-KVaRN regions for eligible internal MTP; otherwise the main model's K cache type from -ctk, or %s for MTP over a SJ-KVaRN trunk; pass f16 to force f16)",
             get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[0])
         ),
         [](common_params & params, const std::string & value) {
@@ -4901,7 +4901,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a SJ-KVaRN trunk, including a separate MTP draft file; a quantized trunk is copied instead of f16; pass f16 to force f16)",
+            "(default: SJ-KVaRN regions for eligible internal MTP; otherwise the main model's V cache type from -ctv, or %s for MTP over a SJ-KVaRN trunk; pass f16 to force f16)",
             get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[1])
         ),
         [](common_params & params, const std::string & value) {
@@ -4910,11 +4910,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--spec-draft-sjkvarn"},
-        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for MTP (one stream per --parallel slot) (incompatible with -ctkd/-ctvd)",
-        [](common_params & params) {
-            params.speculative.draft.sj_kvarn = true;
+        {"--no-spec-draft-sjkvarn"},
+        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for MTP (default: on for single-sequence internal MTP with a SJ-KVaRN trunk, no -ctkd/-ctvd and sufficient tail)",
+        [](common_params & params, bool value) {
+            params.speculative.draft.sj_kvarn = value;
+            params.speculative.draft.sj_kvarn_explicit = true;
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SJKVARN"));
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
@@ -5155,7 +5157,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "draft-only vocabulary shortlist for the MTP draft head; the target is unaffected. 'auto' uses the list compiled in for this "
         "model's tokenizer and architecture (every quant of a supported base model, e.g. Qwen3.8-27B), 'auto:N' the one of size N, "
         "FNAME a llama-mtp-vocab-v1 map, 'none' the full vocabulary (default: auto; a model with no built-in list "
-        "drafts over the full vocabulary)",
+        "drafts over the full vocabulary). With eligible DSJ and no map/hot overrides, compatible models use ordered RM24H with 2048 hot slots; explicit auto and hot 0 keep the prior shortlist",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.vocab_map = value;
             params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP;
@@ -5168,6 +5170,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                       params.speculative.draft.vocab_hot),
         [](common_params & params, int value) {
             params.speculative.draft.vocab_hot = value;
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT"));
     add_opt(common_arg(

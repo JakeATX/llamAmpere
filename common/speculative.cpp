@@ -4469,6 +4469,24 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
     return spec->synth_probs;
 }
 
+const char * common_speculative_draft_sj_kvarn_error(const common_params & params) {
+    const auto & draft = params.speculative.draft;
+    const bool mtp = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
+            });
+    if (!mtp || params.speculative.has_dft() || params.n_parallel != 1 || params.sj_kvarn_bits_k == 0 || params.sj_kvarn_bits_v == 0) {
+        return "--spec-draft-sjkvarn requires single-sequence MTP and a SJ-KVaRN trunk";
+    }
+    if (draft.cache_type_k != GGML_TYPE_COUNT || draft.cache_type_v != GGML_TYPE_COUNT) {
+        return "--spec-draft-sjkvarn cannot be combined with -ctkd/-ctvd";
+    }
+    if (draft.n_max < 0 || params.sj_kvarn_tail < (uint32_t) draft.n_max + 1) {
+        return "--spec-draft-sjkvarn requires a tail larger than the maximum draft width";
+    }
+    return nullptr;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
@@ -4564,17 +4582,20 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_arena_mib = 0;
-    if (params_spec.sj_kvarn) {
-        if (!spec_mtp || has_draft || params.n_parallel != 1 || params.sj_kvarn_bits_k == 0 || params.sj_kvarn_bits_v == 0) {
-            throw std::invalid_argument("--spec-draft-sjkvarn requires single-sequence MTP and a SJ-KVaRN trunk");
+    // fork: the automatic default has the same parameter bounds as explicit DSJ.
+    const char * sj_kvarn_error = common_speculative_draft_sj_kvarn_error(params);
+    result.speculative.draft.sj_kvarn = params_spec.sj_kvarn ||
+        (!params_spec.sj_kvarn_explicit && sj_kvarn_error == nullptr);
+    if (result.speculative.draft.sj_kvarn) {
+        if (sj_kvarn_error != nullptr) {
+            throw std::invalid_argument(sj_kvarn_error);
         }
-        if (params_spec.cache_type_k != GGML_TYPE_COUNT || params_spec.cache_type_v != GGML_TYPE_COUNT) {
-            throw std::invalid_argument("--spec-draft-sjkvarn cannot be combined with -ctkd/-ctvd");
+        // fork: resolve the ordered shortlist against the loaded tokenizer, keeping explicit map and hot values.
+        if (!(params.speculative.user_set & (COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP | COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT)) &&
+                params_spec.vocab_map == "auto" && params_spec.vocab_hot == 0) {
+            result.speculative.draft.vocab_map = "auto:rm24h";
         }
-        if (params_spec.n_max < 0 || params.sj_kvarn_tail < (uint32_t) params_spec.n_max + 1) {
-            throw std::invalid_argument("--spec-draft-sjkvarn requires a tail larger than the maximum draft width");
-        }
-        // opt-in: the drafter keeps the trunk's SJ-KVaRN regions instead of the tq5_0/turbo4 default above
+        // the drafter keeps the trunk's SJ-KVaRN regions instead of the tq5_0/turbo4 default above
         result.cache_type_k = params.sj_kvarn_staging_type;
         result.cache_type_v = params.sj_kvarn_staging_type;
         result.speculative.draft.cache_type_sj_kvarn_default = false;
