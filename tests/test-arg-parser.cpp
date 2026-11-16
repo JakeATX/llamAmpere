@@ -264,6 +264,10 @@ static void test(void) {
             assert(selected.card_preset == name && bare.card_preset == name);
             assert(selected.n_ctx == bare.n_ctx && selected.n_parallel == 1);
             assert(!selected.card_preset_flags.empty());
+            const uint32_t bits = selected.card_preset == "8dense" ? 3 : 4;
+            assert(selected.cache_type_k == GGML_TYPE_F16 && selected.cache_type_v == GGML_TYPE_F16);
+            assert(selected.sj_kvarn_bits_k == bits && selected.sj_kvarn_bits_v == bits);
+            assert(bare.sj_kvarn_bits_k == bits && bare.sj_kvarn_bits_v == bits);
             if (selected.card_preset == "24dense") {
                 assert(selected.cache_type_s == GGML_TYPE_F32);
             }
@@ -353,7 +357,9 @@ static void test(void) {
         common_params tiny;
         assert(parse_card({"--preset", "8dense"}, tiny));
         assert(tiny.n_ctx == 204800 && tiny.n_ubatch == 256);
-        assert(tiny.cache_type_k == common_kv_cache_type_from_name("sjkvarn3") && tiny.cache_type_v == common_kv_cache_type_from_name("sjkvarn3"));
+        assert(tiny.cache_type_k == GGML_TYPE_F16 && tiny.cache_type_v == GGML_TYPE_F16);
+        assert(tiny.sj_kvarn_bits_k == 3 && tiny.sj_kvarn_bits_v == 3);
+        assert(tiny.sj_kvarn_body_type == GGML_TYPE_I16);
         assert(tiny.speculative.draft.n_max == 3 && tiny.speculative.draft.n_ubatch == 8);
         assert(tiny.speculative.n_rs_seq_override == 3);
 #ifndef _WIN32
