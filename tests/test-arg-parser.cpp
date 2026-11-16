@@ -256,7 +256,7 @@ static void test(void) {
             args.insert(args.begin(), "test-arg-parser");
             return common_params_parse(args.size(), list_str_to_char(args).data(), out, ex);
         };
-        for (const auto & name : {"24dense", "12dense", "10dense"}) {
+        for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
             common_params selected;
             assert(parse_card({"--preset", name}, selected));
             common_params bare;
@@ -280,7 +280,7 @@ static void test(void) {
                                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) == overrides.speculative.types.end());
             }
         }
-        for (const auto & name : {"12dense", "10dense"}) {
+        for (const auto & name : {"12dense", "10dense", "8dense"}) {
             for (int slots : {2, 3, 4, -1}) {
                 common_params invalid;
                 assert(!parse_card({"-np", std::to_string(slots), "--preset", name}, invalid));
@@ -290,7 +290,7 @@ static void test(void) {
         for (int slots : {2, 3, 4}) {
             common_params multi;
             assert(parse_card({"-np", std::to_string(slots), "--preset", "24dense"}, multi));
-            assert(multi.n_parallel == slots && multi.kv_unified);
+            assert(multi.n_parallel == slots && multi.kv_unified && multi.speculative.draft.n_min == 4);
         }
         common_params depth;
         assert(parse_card({"--spec-draft-n-max", "3", "--preset", "24dense"}, depth));
@@ -316,6 +316,12 @@ static void test(void) {
             assert(parse_card({"--preset", name, "--spec-draft-n-min-adaptive", "6"}, plain_mtp));
             assert(plain_mtp.speculative.draft.n_max == 4 && plain_mtp.speculative.draft.n_min_adaptive == 6);
         }
+        common_params min_depth;
+        assert(parse_card({"--preset", "24dense", "--spec-draft-n-max", "3"}, min_depth));
+        assert(min_depth.speculative.draft.n_min == 3);
+        common_params explicit_min;
+        assert(parse_card({"--spec-draft-n-min", "1", "--preset", "24dense"}, explicit_min));
+        assert(explicit_min.speculative.draft.n_min == 1);
         common_params kv;
         assert(parse_card({"-ctk", "q8_0", "-ctv", "q8_0", "--preset", "10dense"}, kv));
         assert(kv.cache_type_k == GGML_TYPE_Q8_0 && kv.cache_type_v == GGML_TYPE_Q8_0 && !kv.card_preset_kv_default);
@@ -344,8 +350,12 @@ static void test(void) {
         assert(!parse_card({"--preset", "unknown"}, invalid));
         assert(!parse_card({"--preset"}, invalid));
         assert(!parse_card({"24dense", "--preset", "10dense"}, invalid));
-        assert(!parse_card({"8dense"}, invalid));
-        assert(!parse_card({"--preset", "8dense"}, invalid));
+        common_params tiny;
+        assert(parse_card({"--preset", "8dense"}, tiny));
+        assert(tiny.n_ctx == 204800 && tiny.n_ubatch == 256);
+        assert(tiny.cache_type_k == common_kv_cache_type_from_name("sjkvarn3") && tiny.cache_type_v == common_kv_cache_type_from_name("sjkvarn3"));
+        assert(tiny.speculative.draft.n_max == 3 && tiny.speculative.draft.n_ubatch == 8);
+        assert(tiny.speculative.n_rs_seq_override == 3);
 #ifndef _WIN32
         const char * old_ctx = std::getenv("LLAMA_ARG_CTX_SIZE");
         const bool had_ctx = old_ctx != nullptr;
@@ -363,7 +373,7 @@ static void test(void) {
 
         std::set<std::string> env_keys;
         std::map<std::string, std::string> saved_env;
-        for (const auto & name : {"24dense", "10dense"}) {
+        for (const auto & name : {"24dense", "10dense", "8dense"}) {
             for (const auto & entry : common_card_preset_get(name).env) {
                 env_keys.insert(entry.first);
             }
@@ -401,6 +411,23 @@ static void test(void) {
             if (key.compare(0, 10, "LLAMA_LSA_") == 0 || key == "GGML_CUDA_LSA_RESIDENT_STAGE" || key == "GGML_SJKVARN_TILE_SKIP") {
                 assert(!std::getenv(key.c_str()));
             }
+            unsetenv(key.c_str());
+        }
+        common_params tiny_env;
+        assert(parse_card({"8dense", "-m", "/models/tiny/healed.gguf"}, tiny_env));
+        common_card_preset_apply_env(tiny_env);
+        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/models/tiny/mtp-dm.gguf,/models/tiny/head-ait2.gguf");
+        assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/models/tiny/head-exact-f16.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/tiny/lsa-qwen38-27b-d2048.gguf");
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
+        setenv("LLAMA_MODEL_OVERLAY_PATCH", "/explicit/mtp.gguf,/explicit/head.gguf", 1);
+        setenv("LLAMA_D1_HEAD", "/explicit/exact.gguf", 1);
+        common_card_preset_apply_env(tiny_env);
+        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/explicit/mtp.gguf,/explicit/head.gguf");
+        assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/explicit/exact.gguf");
+        for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
         common_params large_env;

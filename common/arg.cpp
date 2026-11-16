@@ -1087,6 +1087,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             params.speculative.draft.n_max = std::max(params.speculative.draft.n_max,
                     params.speculative.draft.n_min_adaptive);
         }
+        if (params.card_preset == "24dense" && explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min")) {
+            params.speculative.draft.n_min = std::min(params.speculative.draft.n_min, params.speculative.draft.n_max);
+        }
         if (explicit_or_env("--batch-size") && !explicit_or_env("--ubatch-size")) {
             params.n_ubatch = std::min(params.n_ubatch, params.n_batch);
         }
