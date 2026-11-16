@@ -12,7 +12,6 @@
 // fork: runtime card profiles. Values stay here so each QC change has one table to update.
 const common_card_preset & common_card_preset_get(const std::string & name) {
     static const std::vector<common_card_preset> profiles = [] {
-        // QC: V07/INTEG3/QC_READY_integ3.md, out-s10-ident-r8; ASYMCTX/MERGE_NOTE_kqpack_f2.md.
         common_card_preset large {
             "24dense", "2026-11-16.5", "best known/recheck before ship", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"},
@@ -26,13 +25,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 {"LLAMA_GDN_REPLAY_LANES", "1"}
             }
         };
-        // Pending: ASYMCTX packed-default and dynamic ub/mask QC. DSJ/RM24H QC passed; INTEG3 owns the eligible-path default integration.
-        // QC sources: LSA/REAL10GB/RESULT_speed10.md and speed10/s10.sh:55-66 + s10.py:62-74 (D2HA U then X).
-        // 12dense: DENSE8/opus-12gb-path/r205s3/r205s3.sh:27,46-56 + r205b.py:55-65; omit diagnostic RESIDENT_LOG.
-        // Small profiles keep the measured source's packed mask; the 24dense packed-default gate does not clear them.
-        // Recheck before ship: 12dense d28a3c00 + SHARED=3; R205S3 used L0 4cde6151.
-        // TODO: multi-user for small cards (future).
-        // Owner 2026-11-16T01:58Z: dynamic ub pending ASYMCTX; keep static ub until its ladder lands.
+        // Small-card profiles keep packed masks, static microbatches and one sequence.
         common_card_preset small {
             "10dense", "2026-11-16.5", "best known/recheck before ship", "", {
                 {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
@@ -72,7 +65,6 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 kv.second = "3";
             }
         }
-        // Source: LSA/REAL8GB/card8/lsa-8gb.env; SMALLPORT owner addendum 15 accepts the F2 fit profile.
         common_card_preset tiny {
             "8dense", "2026-11-16.6", "best known/recheck before ship", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},

@@ -1525,7 +1525,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (!params.card_preset.empty()) {
         const auto & card = common_card_preset_get(params.card_preset);
         const std::string preset_env = common_card_preset_apply_env(params);
-        LOG_INF("card preset %s v%s [%s]; applied defaults:%s; effective -c %d -np %d -b %d -ub %d; profile env:%s; recheck all presets before ship; 24dense packed/dynamic ub pending QC, DSJ/RM24H pending integration; small-card dynamic ub pending ASYMCTX\n",
+        LOG_INF("card preset %s v%s [%s]; applied defaults:%s; effective -c %d -np %d -b %d -ub %d; profile env:%s\n",
                 card.name.c_str(), card.version.c_str(), card.status.c_str(), params.card_preset_flags.c_str(),
                 params.n_ctx, params.n_parallel, params.n_batch, params.n_ubatch, preset_env.c_str());
     }
