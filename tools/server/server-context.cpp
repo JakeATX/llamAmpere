@@ -2496,6 +2496,8 @@ private:
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+                // fork: checkpoint reachability and cache identity need the effective DSJ mode.
+                params_base.speculative.draft.sj_kvarn = params_dft.speculative.draft.sj_kvarn;
             }
 
             load_progress_callback(1.0f, &load_progress_spec);

@@ -293,6 +293,11 @@ set_target_properties(llama
 
 install(TARGETS llama LIBRARY PUBLIC_HEADER)
 
+# fork: ship the ordered map beside build outputs and in installed data.
+configure_file(src/mtp/atxr_24576_h2048.txt "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/atxr_24576_h2048.txt" COPYONLY)
+install(FILES src/mtp/atxr_24576_h2048.txt
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/llama/mtp" COMPONENT mtp-vocab)
+
 if (LLAMA_BUILD_COMMON)
     install(TARGETS llama-common LIBRARY)
 endif()

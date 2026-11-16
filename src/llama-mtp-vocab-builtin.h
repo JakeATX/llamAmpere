@@ -42,19 +42,24 @@ struct llama_mtp_vocab_builtin {
     const char *         arch;    // llm_arch name the list applies to
     uint64_t             tok_fp;  // tokenizer fingerprint (see above)
     int64_t              n_vocab;
-    int64_t              n_sel;   // number of set bits
+    int64_t              n_sel;   // number of selected ids
     const char * const * hex;     // n_vocab-bit bitmap, bit i of byte i/8 = token i, hex chunks, nullptr-terminated
+    const int32_t *      ordered_ids = nullptr; // fork: ordered entries instead of a bitmap, when present
 };
 
-// all built-in lists, terminated by an entry whose name is nullptr
+// Bitmap built-in lists, terminated by an entry whose name is nullptr.
+// The ordered RM24H list is selected with an exact size of 24576.
 const llama_mtp_vocab_builtin * llama_mtp_vocab_builtins();
 
-// ascending token ids of a built-in list; throws if the embedded bitmap is malformed
+// Ordered token ids when supplied, otherwise ascending bitmap ids; throws for malformed embedded data.
 std::vector<int32_t> llama_mtp_vocab_builtin_ids(const llama_mtp_vocab_builtin & b);
 
 // Pick the built-in list for a tokenizer and architecture. `size` > 0 asks for that exact shortlist size;
-// 0 takes the family's preferred size (65,536 when present, else the largest). nullptr when nothing matches.
+// 0 takes the family's preferred bitmap size (65,536 when present, else the largest). nullptr when nothing matches.
 const llama_mtp_vocab_builtin * llama_mtp_vocab_builtin_find(uint64_t tok_fp, int64_t n_vocab, const char * arch, int64_t size);
+
+// fork: ordered RM24H with 2048 hot slots for a matching model, otherwise the prior auto shortlist with no hot slots.
+const llama_mtp_vocab_builtin * llama_mtp_vocab_builtin_find_rm24h(uint64_t tok_fp, int64_t n_vocab, const char * arch, int32_t & n_hot);
 
 // Parse a `--spec-draft-vocab-map` value: "auto" or "auto:N" -> true with N (0 for "auto").
 bool llama_mtp_vocab_parse_auto(const char * value, int64_t & size);

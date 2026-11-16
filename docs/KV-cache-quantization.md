@@ -145,7 +145,11 @@ Both switches are off by default and require the exact value `1`. They apply to 
 
 `--spec-draft-ubatch N` (`-ubd`, env `LLAMA_ARG_SPEC_DRAFT_UBATCH`) sets the physical microbatch of an MTP draft loaded from its own file (`-md` with `--spec-type draft-mtp` or `draft-mtp-adaptive`). The default, -1, caps it at 2,048 rows; 0 keeps the main `-ub`; N caps it at N. The draft's compute buffer grows with its microbatch (on Flash-Next about 0.8 MiB per row: 1,672 MiB at 2,048 and 6,634 MiB at 8,192), and the fit counts it, so with a large main `-ub` an uncapped draft buffer pushes layers off the GPU. The cap only changes how the draft's prompt pass is split; decode-time draft calls work on a few rows at a time (at most 64 deferred catch-up rows) and stay below it.
 
-`--spec-draft-sjkvarn` gives the MTP context its own SJ-KVaRN cache with the trunk's body bits, body codec, sink, staging type and tail policy. It requires a SJ-KVaRN trunk, one sequence, and no separate draft model or explicit `-ctkd`/`-ctvd`. The draft layer uses the trunk's main body precision, without trunk edge tiers. Existing SJ-KVaRN head-dimension and flash-attention restrictions apply. For example:
+`--spec-draft-sjkvarn` gives the MTP context its own SJ-KVaRN cache with the trunk's body bits, body codec, sink, staging type and tail policy. It requires a SJ-KVaRN trunk, one sequence, and no draft attention window, separate draft model or explicit `-ctkd`/`-ctvd`. The draft layer uses the trunk's main body precision, without trunk edge tiers. Existing SJ-KVaRN head-dimension and flash-attention restrictions apply.
+
+DSJ is selected automatically when these conditions hold and the tail exceeds the maximum draft width. `--no-spec-draft-sjkvarn` disables it; `LLAMA_ARG_SPEC_DRAFT_SJKVARN=0` does the same. Command-line choices override the environment, and the last command-line choice wins. An explicit positive switch retains the existing validation errors for unsupported configurations.
+
+With eligible DSJ and no explicit vocabulary map or hot count, the draft uses an ordered 24,576-token shortlist with 2,048 trailing hot slots for the Qwen3.8-27B tokenizer and `qwen35` architecture. Other tokenizer/architecture combinations retain the prior automatic shortlist and no hot slots. Tensor-split contexts retain the full-head fallback. Explicit map or hot settings, including environment settings, keep their existing values. `--spec-draft-vocab-map auto:24576 --spec-draft-vocab-hot 2048` selects the ordered map explicitly on that tokenizer and architecture. The complete rollback is `--no-spec-draft-sjkvarn --spec-draft-vocab-map auto --spec-draft-vocab-hot 0`; mb-MTP has its own independent switch. For example:
 
 ```bash
 LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 llama-server -m model.gguf -c 204800 -ngl 99 -fa on --parallel 1 \
@@ -154,6 +158,8 @@ LLAMA_MTP_DRAFT_COMPUTE_LEAN=1 llama-server -m model.gguf -c 204800 -ngl 99 -fa 
     --sjkvarn-sink 128 --sjkvarn-tail 4096 --sjkvarn-tail-max 8192 \
     --spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-sjkvarn
 ```
+
+The exact ordered RM24H map is also shipped as `src/mtp/atxr_24576_h2048.txt`, copied beside build binaries and installed under `share/llama/mtp` (or the configured data directory). Release bundles carry it beside `llama-server`. Its SHA-256 is `effc628f23d9a357ac31c73e6560ee7ff81a99fe76db913c21cc72362e1a7e9a`. To load that file explicitly, use `--spec-draft-vocab-map /path/to/atxr_24576_h2048.txt --spec-draft-vocab-hot 2048`. The default uses the matching built-in IDs, so moving the binaries does not require a data path.
 
 The tail must exceed the maximum draft width so speculative rollback stays in unsealed rows. The server reprocesses an edited prompt if it reaches sealed rows in either context. Draft sealing runs during decode; server idle compression still applies only to the trunk. State serialization retains the existing SJ-KVaRN restrictions. Server slot saves include a `.dft` draft-state file and a `.ckpt` sidecar that binds both state files with SHA-256. Draft saves made before this binding must be saved again with the current server before they can be restored; non-draft version-2 checkpoint sidecars remain readable. Cache compression changes draft probabilities and needs acceptance/quality validation separately from the lean microbatch switch.
 

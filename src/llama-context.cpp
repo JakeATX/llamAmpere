@@ -544,8 +544,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // draft-only vocabulary shortlist: parsed once, kept as a persistent I32 map on the head's device
     {
         const char * path = params.draft_vocab_map;
-        // the environment override also replaces common's default ("auto"), which a caller cannot tell from an explicit auto
-        if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        // fork: the legacy environment override also replaces the resolved automatic shortlist.
+        if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0 || std::strcmp(path, "auto:rm24h") == 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
             if (const char * env = getenv("LLAMA_SPEC_DRAFT_VOCAB"); env != nullptr && env[0] != '\0') {
                 path = env;
             }
@@ -1785,11 +1785,13 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     std::string source = path;
 
     int64_t auto_size = 0;
-    if (llama_mtp_vocab_parse_auto(path, auto_size)) {
+    const bool rm24h = std::strcmp(path, "auto:rm24h") == 0;
+    if (rm24h || llama_mtp_vocab_parse_auto(path, auto_size)) {
         // pick the list compiled into the binary for this tokenizer + architecture, if there is one
         const uint64_t fp   = llama_model_tokenizer_fingerprint(&model);
         const char *   arch = llm_arch_name(model.arch);
-        const llama_mtp_vocab_builtin * b = llama_mtp_vocab_builtin_find(fp, n_vocab, arch, auto_size);
+        const llama_mtp_vocab_builtin * b = rm24h ? llama_mtp_vocab_builtin_find_rm24h(fp, n_vocab, arch, n_hot) :
+                                                  llama_mtp_vocab_builtin_find(fp, n_vocab, arch, auto_size);
         if (b == nullptr) {
             LLAMA_LOG_INFO("%s: draft vocabulary '%s': no built-in shortlist for this tokenizer (fingerprint %016" PRIx64
                     ", %lld tokens, arch %s), the draft scores the full head\n",
