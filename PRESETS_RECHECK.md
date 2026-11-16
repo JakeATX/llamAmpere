@@ -1,29 +1,16 @@
-# Presets: recheck before 0.7 ships
+# Preset checks before release
 
-Jake enabled all four best-known profiles on 2026-11-16T01:50Z. This lifts the old small-card approval hold. No speed or final-build fit claim is made.
+Each preset needs validation on the final combined build with its matching model and sidecar files. Historical results do not validate a new build.
 
-| Preset | Source | Recheck before ship | Owner |
-| --- | --- | --- | --- |
-| 24dense | V07/INTEG3/QC_READY_integ3.md; ASYMCTX/MERGE_NOTE_kqpack_f2.md; DECODE20/QC_decode20_dsjrm24h.md | Final combined defaults; 1u load/decode under 23,552 MiB; 3u asymmetric slots and populated prompt-cache save/restore. Packed mask and dynamic ub/mask wait for their QC. DSJ/RM24H passed design QC; inherit INTEG3's eligible-path default after integration, with its kill switch. | COORD-taichi / INTEG3 |
-| 12dense | DENSE8/opus-12gb-path/r205s3/r205s3.sh, U then X, plus driver extras; L0 d28a3c00 | Short launch PASS on presets-r16-parser6: Taichi1794822539,64tokens,peak11,507/12,288MiB,server0/queue0 (RESULT_r53.md); LSA/map/index and mb-MTP engaged. CPU no samples/full-head drafter fallback; no physical12GB/full-context/final-build claim. Pairing L0 d28a3c00 + R205S3 is already confirmed by COORD-bc 00:18Z / LCBCOMP OWNER1 (KLDCMP A12 precedent). Source model and map pins recovered in round52; short launch completed under PASS review094552Z-3658899. Dynamic ub pending ASYMCTX; no final/full-context fit claim. | COORD-bc |
-| 10dense | LSA/REAL10GB/RESULT_speed10.md line 5; speed10/s10.sh and s10.py D2HA | Short launch PASS on presets-r16-parser6: HOME1794812527, 64 tokens, peak 9,471/10,240 MiB, D2HA map/index + mb-MTP active, queue/server 0 (RESULT_r41.md). CPU meter had no samples; full-head drafter fallback logged. Final combined build and full-context/real10GB fit still unverified; dynamic ub pending ASYMCTX. | COORD-bc |
-| 8dense | LSA/REAL8GB/card8/lsa-8gb.env; SMALLPORT OWNER ADDENDUM 15 (Jake acceptance, 2026-11-16) | Accepted F2 profile: E8 cfb2ece5, ctx204800, ub256, LLAMA_RESERVE_VERIFY_ROWS=7, strips ON, GGML_CUDA_DISABLE_GRAPHS=1, GGML_ALLOC_GROW_PCT=1, LLAMA_LSA_MEAN_CHUNKS=1. Version2026-11-16.6 replaces the old graphs-ON profile. Final combined build MUST carry F2 reserve code (953beed0f line); presets parent8ea2df1fa lacks its reader. Prior short start RESULT_r54.md used the old profile and does not validate this update. Recheck launch/decode under8192MiB, populated cache save/restore, model/map/overlays/head discovery, and final-build full-context fit. Copy is engine default OFF; historical SMALLPORT evidence ran copy ON, so B8 must remeasure copy OFF. SMALLPORT owns that evidence audit; no new speed claim here. Dynamic ub pending ASYMCTX. | COORD-bc |
+| Preset | Required checks |
+| --- | --- |
+| 24dense | Load and decode below 23,552 MiB; one to four users, asymmetric context reservations, populated prompt-cache save/restore. The preset uses draft window 4096; automatic DSJ/RM24H applies to eligible window-0 paths. Packed masks remain opt-in. |
+| 12dense | Launch, decode and full-context fit below 12,288 MiB on the matching hardware; model, map and index discovery; populated prompt-cache save/restore. |
+| 10dense | Launch, decode and full-context fit below 10,240 MiB on the matching hardware; model, map and index discovery; populated prompt-cache save/restore; confirm the inherited `LLAMA_SPEC_MB_KL=8` setting. |
+| 8dense | Launch, decode and full-context fit below 8,192 MiB on the matching hardware; model, map, overlay and head discovery; populated prompt-cache save/restore. Use the accepted F2 profile with reserve 7 rows, stage strips on, graphs off, 1% buffer growth and mean chunks on. Remeasure with copy off and check the CPU thread count: earlier measurements used six threads. |
 
-When ASYMCTX lands, enable its small-card ladder by default, starting at the highest microbatch that fits and cascading down with fill. ASYMCTX owns the code/bundle; COORD-bc/SMALLPORT owns its GPU gates. Until then, retain static microbatches 256/512/512 for 8/10/12dense.
+The small-card presets support one user and keep static microbatches 256/512/512 for 8/10/12dense. Dynamic microbatch selection and small-card multi-user support are pending.
 
-All small profiles enforce one user. TODO: multi-user for small cards (future). Explicit user flags and shell environment override preset defaults. The caller supplies the matching model; presets do not download models.
+Explicit flags and shell environment values override profile defaults. Presets do not download models. A launch with explicit sidecar paths does not validate default path discovery. Check natural server and queue exits, actual peak memory, and completed token output.
 
-The minimum acceptance is launch plus a short decode for each preset under its class cap, and a 24dense three-user asymmetric check. Preserve prompt caching. No old-binary speed or quality result validates the final combined build. Deeper fit/fidelity work remains a pre-ship recheck, not a new blocker on enabling the flags.
-
-10dense review follow-up (2026-11-16): recheck the inherited LLAMA_SPEC_MB_KL=8 diagnostic audit setting before ship. The short launch check uses its mb-MTP activity message; it makes no speed claim. Its LSA map is explicitly supplied, so default map discovery remains untested.
-
-
-10dense input audit (round34, hold CLOSED round39): HOME public AI2 d4b73c62 (9,138,303,264 bytes) contains 92 AIF25_U118 tensors. The header finding remains true. Jake's November 13 shipped-file approval, relayed in MULTIDIAG/SOL_HANDOFF.md COORD note 2026-11-16T06:24Z, accepts this exact public AI2 file as ship evidence. Supporting sources: DENSETC/SOL_HANDOFF.md item 4, INTEG3/GATE_integ3_p1.md model list, the already-shipped route-2 exception in the November 5 rule, and MULTIDIAG's approval closure in COORD.md. Fresh PRESETS review REVIEWS/20261116T064803Z-3.md PASS accepts this scope for the existing D2HA short-launch gate. No U2 replacement is owed for this check. No new deprecated encode or kernel is authorized. Do not resume the legacy r30 job or destroyed rental60883031. No fit or speed result is credited by the approval.
-
-Round38 input update: MULTIDIAG/SOL_HANDOFF.md COORD-taichi0624 explicitly accepts publicAI2 d4b73c62 as ship evidence (Jake11-13), so a U2 replacement is no longer assumed necessary. Fresh review REVIEWS/20261116T064803Z-3.md checks the approval scope and r38 short-launch gate before any submit. Header audit above remains true; no new deprecated encode or kernel is introduced. No fit or speed result inferred.
-
-Round39: launch review PASS. Audit natural server exit 0 and queue exit 0 after the run; result.passed alone is insufficient. Actual 10 GB hardware, full-context fit, default sidecar discovery and final combined build remain untested.
-
-Round52 correction: owner approval and source inputs were already available. No additional owner delivery is needed for the minimum 8/12 startup checks. 12dense uses Taichi L0 d28a3c00 and map5489a4f2; 8dense uses E8cfb2ece5 and the map/mtp-dm/head-ait2/exact-head pins in SMALLPORT graphs-speed-v4/inputs.sha256. Existing F2 switch and final integration holds stay open. Explicit sidecar paths in these checks do not validate default path discovery.
-
-Owner update 2026-11-16T13:27Z: copy mode defaults OFF in the engine. Presets set no copy value; LLAMA_SPEC_COPY stays an explicit opt-in. INTEG3 owns the source default and its unit test. The accepted 8dense profile replaces the earlier F2 hold; ASYMCTX dynamic-ub production gates and final combined checks remain open.
+Copy defaults off. `LLAMA_SPEC_COPY=N` is an explicit opt-in. `GGML_CUDA_DISABLE_GRAPHS` is presence-based: even `0` disables graphs; the 8dense profile sets it.
