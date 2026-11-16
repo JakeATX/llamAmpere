@@ -291,6 +291,16 @@ static void test(void) {
         common_params depth;
         assert(parse_card({"--spec-draft-n-max", "3", "--preset", "24dense"}, depth));
         assert(depth.speculative.draft.n_max == 3 && depth.speculative.draft.n_min_adaptive == 3);
+        for (bool preset_first : {false, true}) {
+            std::vector<std::string> args = {"--spec-draft-n-min-adaptive", "6"};
+            args.insert(preset_first ? args.begin() : args.end(), {"--preset", "24dense"});
+            common_params minimum;
+            assert(parse_card(args, minimum));
+            assert(minimum.speculative.draft.n_min_adaptive == 6 && minimum.speculative.draft.n_max == 6);
+        }
+        common_params conflict;
+        assert(!parse_card({"--preset", "24dense", "--spec-draft-n-min-adaptive", "6",
+                           "--spec-draft-n-max", "5"}, conflict));
         common_params batch;
         assert(parse_card({"--preset", "24dense", "-b", "128"}, batch));
         assert(batch.n_batch == 128 && batch.n_ubatch <= 128);

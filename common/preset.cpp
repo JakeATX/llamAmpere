@@ -29,6 +29,8 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
         // Pending: ASYMCTX/GATE.md Addendum 13 and QC_kqpack_f2.md (packed default); QC_READY_deepctx_ladder.md (dynamic ub/mask); DECODE20 DSJ/RM24H QC.
         // QC sources: LSA/REAL10GB/RESULT_speed10.md and speed10/s10.sh:55-66 + s10.py:62-74 (D2HA U then X).
         // 12dense: DENSE8/opus-12gb-path/r205s3/r205s3.sh:27,46-56 + r205b.py:55-65; omit diagnostic RESIDENT_LOG.
+        // Small profiles keep the measured source's packed mask; the 24dense packed-default gate does not clear them.
+        // 12dense d28a3c00 + SHARED=3 still needs owner QC: R205S3 used L0 4cde6151.
         // TODO: multi-user for small cards (future).
         common_card_preset small {
             "10dense", "2026-11-15.1", "dev/pending Jake approval", "", {

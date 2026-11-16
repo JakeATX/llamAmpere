@@ -1524,6 +1524,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     if (!params.card_preset.empty()) {
         const auto & card = common_card_preset_get(params.card_preset);
+        std::string preset_env;
         for (const auto & kv : card.env) {
             if (!params.card_preset_kv_default && (kv.first.compare(0, 10, "LLAMA_LSA_") == 0 ||
                 kv.first.compare(0, 14, "GGML_CUDA_LSA_") == 0 || kv.first == "GGML_SJKVARN_TILE_SKIP")) {
@@ -1536,10 +1537,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 }
                 common_set_env(kv.first, value);
             }
+            preset_env += " " + kv.first + "=" + std::getenv(kv.first.c_str());
         }
-        LOG_INF("card preset %s v%s [%s]; applied defaults:%s; effective -c %d -np %d -b %d -ub %d; packed default, dynamic ub/mask and DSJ/RM24H pending QC\n",
+        LOG_INF("card preset %s v%s [%s]; applied defaults:%s; effective -c %d -np %d -b %d -ub %d; profile env:%s; 24dense packed default, dynamic ub/mask and DSJ/RM24H pending QC\n",
                 card.name.c_str(), card.version.c_str(), card.status.c_str(), params.card_preset_flags.c_str(),
-                params.n_ctx, params.n_parallel, params.n_batch, params.n_ubatch);
+                params.n_ctx, params.n_parallel, params.n_batch, params.n_ubatch, preset_env.c_str());
     }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
