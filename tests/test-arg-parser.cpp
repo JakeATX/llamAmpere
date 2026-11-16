@@ -250,6 +250,93 @@ static void test(void) {
 
     std::vector<std::string> argv;
 
+    {
+        auto parse_card = [&](std::vector<std::string> args, common_params & out) {
+            args.insert(args.begin(), "test-arg-parser");
+            return common_params_parse(args.size(), list_str_to_char(args).data(), out, LLAMA_EXAMPLE_SERVER);
+        };
+        for (const auto & name : {"24dense", "12dense", "10dense"}) {
+            common_params selected;
+            assert(parse_card({"--preset", name}, selected));
+            common_params bare;
+            assert(parse_card({name}, bare));
+            assert(selected.card_preset == name && bare.card_preset == name);
+            assert(selected.n_ctx == bare.n_ctx && selected.n_parallel == 1);
+            assert(!selected.card_preset_flags.empty());
+            for (bool preset_first : {false, true}) {
+                std::vector<std::string> args = {"-c", "8192", "-ub", "256", "--spec-type", "none", "--no-spec-mb-mtp"};
+                args.insert(preset_first ? args.begin() : args.end(), {"--preset", name});
+                common_params overrides;
+                assert(parse_card(args, overrides));
+                assert(overrides.n_ctx == 8192 && overrides.n_ubatch == 256);
+                assert(!overrides.sampling.spec_lossy);
+                assert(std::find(overrides.speculative.types.begin(), overrides.speculative.types.end(),
+                                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == overrides.speculative.types.end());
+                assert(std::find(overrides.speculative.types.begin(), overrides.speculative.types.end(),
+                                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) == overrides.speculative.types.end());
+            }
+        }
+        for (const auto & name : {"12dense", "10dense"}) {
+            for (int slots : {2, 3, 4, -1}) {
+                common_params invalid;
+                assert(!parse_card({"-np", std::to_string(slots), "--preset", name}, invalid));
+                assert(invalid.card_preset.empty());
+            }
+        }
+        for (int slots : {2, 3, 4}) {
+            common_params multi;
+            assert(parse_card({"-np", std::to_string(slots), "--preset", "24dense"}, multi));
+            assert(multi.n_parallel == slots && multi.kv_unified);
+        }
+        common_params depth;
+        assert(parse_card({"--spec-draft-n-max", "3", "--preset", "24dense"}, depth));
+        assert(depth.speculative.draft.n_max == 3 && depth.speculative.draft.n_min_adaptive == 3);
+        common_params batch;
+        assert(parse_card({"--preset", "24dense", "-b", "128"}, batch));
+        assert(batch.n_batch == 128 && batch.n_ubatch <= 128);
+        common_params kv;
+        assert(parse_card({"-ctk", "q8_0", "-ctv", "q8_0", "--preset", "10dense"}, kv));
+        assert(kv.cache_type_k == GGML_TYPE_Q8_0 && kv.cache_type_v == GGML_TYPE_Q8_0 && !kv.card_preset_kv_default);
+        common_params asym;
+        assert(parse_card({"--slot-ctx", "262144,0,0", "--preset", "24dense", "-np", "3", "-c", "352256"}, asym));
+        assert(asym.slot_ctx == std::vector<int32_t>({262144, 0, 0}) && asym.n_ctx == 352256);
+        common_params derived;
+        assert(parse_card({"--preset", "24dense", "--slot-ctx", "65536,32768,32768", "-np", "3"}, derived));
+        assert(derived.n_ctx == 0);
+        common_params per_slot;
+        assert(parse_card({"--kv-unified-per-slot", "65536", "--preset", "24dense", "-np", "4"}, per_slot));
+        assert(per_slot.n_ctx == 0 && per_slot.kv_unified_per_slot == 65536);
+        for (const auto & literal : {"24dense", "--preset", "8dense"}) {
+            common_params prompt;
+            assert(parse_card({"-p", literal}, prompt));
+            assert(prompt.prompt == literal && prompt.card_preset.empty());
+        }
+        common_params two_values;
+        assert(parse_card({"--lora-scaled", "24dense", "0.5", "--preset", "24dense"}, two_values));
+        assert(two_values.lora_adapters.size() == 1);
+        common_params invalid;
+        assert(!parse_card({"--preset", "unknown"}, invalid));
+        assert(!parse_card({"--preset"}, invalid));
+        assert(!parse_card({"24dense", "--preset", "10dense"}, invalid));
+        assert(!parse_card({"8dense"}, invalid));
+        assert(!parse_card({"--preset", "8dense"}, invalid));
+#ifndef _WIN32
+        const char * old_ctx = std::getenv("LLAMA_ARG_CTX_SIZE");
+        const bool had_ctx = old_ctx != nullptr;
+        const std::string saved_ctx = old_ctx ? old_ctx : "";
+        setenv("LLAMA_ARG_CTX_SIZE", "16384", 1);
+        common_params env;
+        assert(parse_card({"--preset", "24dense"}, env) && env.n_ctx == 16384);
+        common_params cli;
+        assert(parse_card({"-c", "8192", "--preset", "24dense"}, cli) && cli.n_ctx == 8192);
+        if (had_ctx) {
+            setenv("LLAMA_ARG_CTX_SIZE", saved_ctx.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_ARG_CTX_SIZE");
+        }
+#endif
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     {

@@ -67,6 +67,21 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ## Quick start
 
+### Quick start: pick your card
+
+Card profiles target dense Swift 1.5 Qwen 27B. Choose the matching model file and use one profile:
+
+```bash
+llama-server --preset 24dense -m /path/to/P76-AI4.gguf
+llama-server --preset 24dense -m /path/to/P76-AI4.gguf -np 3 -c 352256 --slot-ctx 262144,0,0
+llama-server --preset 12dense -m /path/to/L0.gguf
+llama-server --preset 10dense -m /path/to/public-AI2.gguf
+```
+
+Bare names work too: `llama-server 24dense -m MODEL`. `-p` still takes a prompt. Explicit flags override profile values in either order. Lowering the maximum draft depth also lowers the profile's minimum depth unless you set both. Changing a K/V cache type or SJ body type drops the profile's related KV/LSA defaults; supply the full cache configuration you want. A smaller batch caps the default microbatch. Profiles do not download models. Place `lsa-qwen38-27b-d2048.gguf` beside the 10/12 GB model, or set `LLAMA_LSA_MAP` / `--lsa-map` to its path. Shell environment values override profile environment defaults. Startup prints the profile version and expanded defaults; a different model family gets a warning.
+
+These profiles are **development settings pending QC**, not release recommendations or full-context fit guarantees on this build. The 24 GB profile supports one to four slots and asymmetric context reservations; `0` gives a slot a share of the remaining pool. The 12/10 GB profiles require `-np 1` and remain pending Jake's approval. `8dense` is reserved and reports its pending F2 speed gate until that gate clears; use the current `lsa-8gb.env` profile meanwhile. TODO: multi-user for small cards (future). The 24 GB packed-mask default, dynamic microbatch sizing and dynamic mask selection wait for their QC gates; the current profile uses a fixed microbatch. Context and memory fit still depend on the chosen model and overrides.
+
 **Build and run (v0.6.3.11, Qwen3.8 Flash-Next, Linux).** For one RTX 30-series card with enough system RAM for the model and prompt workspace. Small-card tests used a 3090 limited to 12 GB with about 90 GiB of system RAM; native 12/16 GB cards remain unmeasured, and 64 GB of system RAM is not a fit promise. Small cards use memory-bounded prompt passes; see the [hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md). The launcher keeps the tested `--fit off` setting; its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
 compiler, the `hf` download tool (`pip install -U huggingface_hub`) and 81.63 GB for the model and drafter, plus space for the build, prompt scratch and saved prompts. The launcher uses a 5 GiB free-RAM floor. This
 one paste clones or updates llamAmpere at v0.6.3.11, builds `llama-server`, downloads the model and its drafter and starts the server:

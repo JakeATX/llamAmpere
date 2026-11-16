@@ -887,6 +887,89 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    // fork: inspect option arities without running handlers; explicit aliases beat card defaults.
+    std::set<const common_arg *> explicit_options;
+    std::string card_name = params.card_preset;
+    int card_selectors = 0;
+    for (int i = 1; i < argc; ++i) {
+        std::string key = argv[i];
+        if (key.compare(0, 2, "--") == 0) {
+            std::replace(key.begin(), key.end(), '_', '-');
+        }
+        auto found = arg_to_options.find(key);
+        if (found == arg_to_options.end()) {
+            throw std::invalid_argument("error: invalid argument: " + key);
+        }
+        const auto * opt = found->second.first;
+        explicit_options.insert(opt);
+        std::string value;
+        if (!opt->handler_void && !opt->handler_bool) {
+            if (opt->value_optional_default && (i + 1 == argc || argv[i + 1][0] == '-')) {
+                value = opt->value_optional_default;
+            } else {
+                if (++i >= argc) {
+                    throw std::invalid_argument("expected value for argument " + key);
+                }
+                value = argv[i];
+            }
+            if (opt->handler_str_str && ++i >= argc) {
+                throw std::invalid_argument("expected second value for argument " + key);
+            }
+        }
+        if (key == "--preset" || key == "24dense" || key == "12dense" || key == "10dense" || key == "8dense") {
+            if (++card_selectors > 1) {
+                throw std::invalid_argument("select only one card preset");
+            }
+            card_name = key == "--preset" ? value : key;
+        }
+    }
+    if (!card_name.empty()) {
+        const auto & card = common_card_preset_get(card_name);
+        if (!card.pending.empty()) {
+            throw std::invalid_argument(card.pending);
+        }
+        params.card_preset = card.name;
+        params.card_preset_flags.clear();
+        common_preset defaults;
+        auto is_explicit = [&](const std::string & key) {
+            auto found = arg_to_options.find(key);
+            if (found == arg_to_options.end()) {
+                return false;
+            }
+            const auto * opt = found->second.first;
+            return explicit_options.count(opt) || opt->has_value_from_env();
+        };
+        params.card_preset_kv_default = !is_explicit("--cache-type-k") && !is_explicit("--cache-type-v") &&
+                !is_explicit("--sjkvarn-body-type");
+        for (const auto & kv : card.options) {
+            if (ctx_arg.ex == LLAMA_EXAMPLE_CLI &&
+                (kv.first == "--kv-unified" || kv.first == "--cache-ram" || kv.first == "--no-cache-disk")) {
+                continue;
+            }
+            if (!params.card_preset_kv_default && (kv.first == "--cache-type-k" || kv.first == "--cache-type-v" ||
+                kv.first.compare(0, 10, "--sjkvarn-") == 0)) {
+                continue;
+            }
+            if (kv.first == "--ubatch-size" && is_explicit("--batch-size")) {
+                continue;
+            }
+            if (is_explicit(kv.first)) {
+                continue;
+            }
+            if (kv.first == "--ctx-size" &&
+                (is_explicit("--slot-ctx") || is_explicit("--kv-unified-per-slot"))) {
+                continue;
+            }
+            const auto & opt = *arg_to_options.at(kv.first).first;
+            defaults.options[opt] = kv.second;
+            params.card_preset_flags += " " + kv.first;
+            if (opt.value_hint) {
+                params.card_preset_flags += " " + kv.second;
+            }
+        }
+        defaults.apply_to_params(params);
+    }
+
     // handle environment variables
     for (auto & opt : ctx_arg.options) {
         std::string value;
@@ -990,6 +1073,25 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
+
+    if (!params.card_preset.empty()) {
+        auto explicit_or_env = [&](const std::string & key) {
+            auto found = arg_to_options.find(key);
+            return found != arg_to_options.end() &&
+                (explicit_options.count(found->second.first) || found->second.first->has_value_from_env());
+        };
+        if (explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive")) {
+            params.speculative.draft.n_min_adaptive = std::min(params.speculative.draft.n_min_adaptive,
+                    params.speculative.draft.n_max);
+        }
+        if (explicit_or_env("--batch-size") && !explicit_or_env("--ubatch-size")) {
+            params.n_ubatch = std::min(params.n_ubatch, params.n_batch);
+        }
+    }
+
+    if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {
+        throw std::invalid_argument("small-card presets require --parallel 1; multi-user support is planned");
+    }
 
     if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON && !params.no_extra_bufts) {
         LOG_INF("explicit MoE cache mode disables weight repacking\n");
@@ -5638,6 +5740,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
 
     // presets
+
+    add_opt(common_arg(
+        {"--preset"}, "24dense|12dense|10dense|8dense",
+        "dense 27B card profile (dev/pending QC); explicit flags override profile values in either order",
+        [](common_params & params, const std::string & value) {
+            params.card_preset = common_card_preset_get(value).name;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"24dense"}, "alias for --preset 24dense",
+        [](common_params & params) { params.card_preset = "24dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"12dense"}, "alias for --preset 12dense (dev/pending; one slot)",
+        [](common_params & params) { params.card_preset = "12dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"10dense"}, "alias for --preset 10dense (dev/pending; one slot)",
+        [](common_params & params) { params.card_preset = "10dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"8dense"}, "alias for --preset 8dense (held for speed QC)",
+        [](common_params & params) { params.card_preset = "8dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--embd-gemma-default"},
