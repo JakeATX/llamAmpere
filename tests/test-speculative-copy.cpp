@@ -332,7 +332,27 @@ static void test_keep_base_rule(void) {
     }
 }
 
+static void test_copy_default_off(void) {
+    const char * off[] = {nullptr, "", "0", "off", "false", "no", "invalid", "-1"};
+    for (const bool eligible : {false, true}) {
+        for (const char * env : off) {
+            assert(common_speculative_copy_params::resolve_tail(-1, eligible, env) == 0);
+        }
+        assert(common_speculative_copy_params::resolve_tail(0, eligible, "8") == 0);
+        assert(common_speculative_copy_params::resolve_tail(4, eligible, "0") == 4);
+        assert(common_speculative_copy_params::resolve_tail(16, eligible, nullptr) == 16);
+    }
+    for (const char * env : {"1", "on", "TRUE", "yes", "8"}) {
+        assert(common_speculative_copy_params::resolve_tail(-1, true, env) == 8);
+        assert(common_speculative_copy_params::resolve_tail(-1, false, env) == 0);
+    }
+    assert(common_speculative_copy_params::resolve_tail(-1, true, "4") == 4);
+    assert(common_speculative_copy_params::resolve_tail(-1, true, "999999999999999999999999") == 16);
+    assert(common_speculative_copy_params::resolve_tail(-1, true, "8bad") == 0);
+}
+
 int main(void) {
+    test_copy_default_off();
     test_keep_base_rule();
     test_rows_cap();
     test_find_matches_reference();

@@ -2261,35 +2261,14 @@ private:
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
-        // copy mode default: auto (-1) is on (tail 8) only in the measured shape, one slot with the model's own MTP
-        // head (no -md drafter file) and no gdn_replay; LLAMA_SPEC_COPY=0 (or off/false/no) restores the old default (off).
-        // An explicit --spec-copy-tail N is kept as given.
-        if (params.speculative.copy_tail < 0) {
-            const auto & types = params.speculative.types;
-            const bool mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
-                             std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
-            const char * ks  = std::getenv("LLAMA_SPEC_COPY");
-            std::string kv = ks ? ks : "";
-            std::transform(kv.begin(), kv.end(), kv.begin(), [](unsigned char c) { return (char) std::tolower(c); });
-            const bool kill = kv == "0" || kv == "off" || kv == "false" || kv == "no";
-            const bool ext  = params.speculative.has_dft();
-            // [COPYCK] --gdn-replay (or LLAMA_GDN_REPLAY) takes the recurrent memory off the ring layout, so it has
-            // no keep-base plane: every wide copy round would then save a full target checkpoint (~40 ms at 100K).
-            // Auto stays off there; LLAMA_SPEC_COPY=1 (or on/true/yes) keeps the old auto-on for A/B tests.
-            const bool force = kv == "1" || kv == "on" || kv == "true" || kv == "yes";
-            const char * gs  = std::getenv("LLAMA_GDN_REPLAY");
-            const bool gdn   = params.gdn_replay || (gs != nullptr && std::strcmp(gs, "0") != 0);
-            const bool gdn_off = gdn && !force;
-            params.speculative.copy_tail = (!kill && mtp && !ext && params.n_parallel == 1 && !gdn_off) ? 8 : 0;
-            SRV_INF("copy mode: %s (auto%s)\n", params.speculative.copy_tail > 0 ? "on, tail = 8" : "off",
-                    kill ? ", LLAMA_SPEC_COPY=0" : !mtp ? ", no MTP drafter" : ext ? ", drafter file" :
-                    params.n_parallel != 1 ? ", n_parallel > 1" :
-                    gdn_off ? ", gdn_replay: a wide copy round would save a checkpoint; LLAMA_SPEC_COPY=1 forces it on" :
-                    gdn ? ", forced by LLAMA_SPEC_COPY=1 under gdn_replay" : "");
-        } else {
-            SRV_INF("copy mode: %s (--spec-copy-tail %d)\n", params.speculative.copy_tail > 0 ? "on" : "off",
-                    params.speculative.copy_tail);
-        }
+        // Auto is off; explicit CLI and environment opt-ins keep copy available.
+        const auto & types = params.speculative.types;
+        const bool mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
+                         std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
+        params.speculative.copy_tail = common_speculative_copy_params::resolve_tail(
+                params.speculative.copy_tail, mtp && !params.speculative.has_dft() && params.n_parallel == 1,
+                std::getenv("LLAMA_SPEC_COPY"));
+        SRV_INF("copy mode: %s (tail = %d)\n", params.speculative.copy_tail > 0 ? "on" : "off", params.speculative.copy_tail);
 
 #if !defined(_WIN32)
         // copy mode: a wide verify batch keeps its pre-round recurrent plane, so a block miss needs no checkpoint

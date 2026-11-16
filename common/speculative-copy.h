@@ -31,8 +31,10 @@
 #include "speculative-adaptive.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 struct common_speculative_copy_params {
@@ -49,6 +51,24 @@ struct common_speculative_copy_params {
     static int32_t env_int(const char * name, int32_t def, int32_t lo, int32_t hi) {
         const char * s = std::getenv(name);
         return s && s[0] ? std::max(lo, std::min(hi, (int32_t) std::atoi(s))) : def;
+    }
+
+    static int32_t resolve_tail(int32_t requested, bool eligible, const char * env) {
+        if (requested >= 0) {
+            return requested;
+        }
+        if (!eligible || env == nullptr || env[0] == '\0') {
+            return 0;
+        }
+        std::string value(env);
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        // Keep the old boolean opt-in at tail 8.
+        if (value == "1" || value == "on" || value == "true" || value == "yes") {
+            return 8;
+        }
+        char * end = nullptr;
+        const long tail = std::strtol(value.c_str(), &end, 10);
+        return end != value.c_str() && *end == '\0' && tail > 0 ? (int32_t) std::min(tail, (long) TAIL_MAX) : 0;
     }
 
     static common_speculative_copy_params from_env(int32_t tail) {
