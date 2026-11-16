@@ -1731,6 +1731,16 @@ static void set_rows_cuda(
             nb1, nb2, nb3,
             stream, dst_row_base
         );
+    } else if (dst->type == GGML_TYPE_F8_E4M3) {
+        set_rows_cuda<src_t, idx_t, ggml_fp8_e4m3_t, DstRowBase>(
+            src0_d, src1_d, (ggml_fp8_e4m3_t *) dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream, dst_row_base
+        );
     } else if (dst->type == GGML_TYPE_Q4_0) {
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block, DstRowBase>(
             src0_d, src1_d, (block_q4_0*)dst->data,

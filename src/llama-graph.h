@@ -1289,7 +1289,8 @@ public:
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    std::unique_ptr<uint8_t[]> buf_compute_meta;
+    size_t buf_compute_meta_size = 0;
 
     ggml_cgraph * gf;
 
@@ -1660,7 +1661,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
     ggml_tensor * build_hadamard_inverse(ggml_tensor * table, ggml_tensor * cur) const;
 
-    // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_embd_state_src()),
+    // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_ctx_state_src()),
     // or uploaded from ubatch.embd_state
     ggml_tensor * build_inp_embd_state(llm_graph_input_embd_h * inp, int64_t n_embd_state) const;
 

@@ -1918,11 +1918,16 @@ void llm_graph_result::reset() {
     fused_nodes.clear();
     hdmd_inputs.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    const size_t meta_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    if (meta_size != buf_compute_meta_size) {
+        // not make_unique: it would zero the whole reserve and make its pages resident
+        buf_compute_meta.reset(new uint8_t[meta_size]);
+        buf_compute_meta_size = meta_size;
+    }
 
     ggml_init_params params = {
-        /*.mem_size   =*/ buf_compute_meta.size(),
-        /*.mem_buffer =*/ buf_compute_meta.data(),
+        /*.mem_size   =*/ buf_compute_meta_size,
+        /*.mem_buffer =*/ buf_compute_meta.get(),
         /*.no_alloc   =*/ true,
     };
 
@@ -2044,7 +2049,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used()),
+    n_expert_used    (hparams.n_expert_used()),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),

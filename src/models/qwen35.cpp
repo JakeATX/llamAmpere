@@ -173,18 +173,25 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
-            // EXL3 fused layout: attn_qkv = [in_proj_qkv | in_proj_z] (ne1 = conv_dim + value_dim) and attn_gate absent;
-            // the graph splits the fused output with views (build_qkvz).
-            const ggml_tensor * qkv_meta = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_QKV, "weight", il).str().c_str());
-            const bool fused_qkvz = qkv_meta != nullptr && qkv_meta->ne[1] == conv_dim + value_dim;
-            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, fused_qkvz ? conv_dim + value_dim : conv_dim }, TENSOR_NOT_REQUIRED);
-            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
-            GGML_ASSERT(!fused_qkvz || layer.wqkv_gate == nullptr);
+            // three layouts: upstream merged attn_qkv_gate (wqkv_z), our EXL3 fused attn_qkv = [in_proj_qkv | in_proj_z]
+            // (ne1 = conv_dim + value_dim, attn_gate absent; the graph splits it with views in build_qkvz), or separate
+            const int separate_flags = flags & TENSOR_SKIP ? flags | TENSOR_NOT_REQUIRED : flags;
+            layer.wqkv_z = create_tensor(tn(LLM_TENSOR_ATTN_QKV_GATE, "weight", il), { n_embd, key_dim * 2 + value_dim * 2 }, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+            if (!layer.wqkv_z) {
+                const ggml_tensor * qkv_meta = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_QKV, "weight", il).str().c_str());
+                const bool fused_qkvz = qkv_meta != nullptr && qkv_meta->ne[1] == conv_dim + value_dim;
+                layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, fused_qkvz ? conv_dim + value_dim : conv_dim }, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+                GGML_ASSERT(!fused_qkvz || layer.wqkv_gate == nullptr);
+            }
             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
             layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
-            layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
-            layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
+            layer.ssm_beta_alpha_cat = create_tensor(tn(LLM_TENSOR_SSM_BETA_ALPHA_CAT, "weight", il), { n_embd, n_v_heads * 2 }, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+            if (!layer.ssm_beta_alpha_cat) {
+                layer.ssm_beta  = create_tensor(tn(LLM_TENSOR_SSM_BETA,  "weight", il), { n_embd, n_v_heads }, separate_flags);
+                layer.ssm_alpha = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "weight", il), { n_embd, n_v_heads }, separate_flags);
+            }
             layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", il), { head_v_dim }, flags);
             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
         }
@@ -737,6 +744,22 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
+    if (model.layers[il].wqkv_z) {
+        ggml_tensor * qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
+        cb(qkvz, "linear_attn_qkvz", il);
+
+        const int64_t n_z   = hparams.ssm_d_state * hparams.ssm_dt_rank;
+        const int64_t n_qkv = qkvz->ne[0] - n_z;
+
+        ggml_tensor * qkv_mixed = ggml_view_3d(ctx0, qkvz, n_qkv, n_seq_tokens, n_seqs, qkvz->nb[1], qkvz->nb[1] * n_seq_tokens, 0);
+        cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+
+        ggml_tensor * z = ggml_view_2d(ctx0, qkvz, n_z, n_seq_tokens * n_seqs, qkvz->nb[1], ggml_row_size(qkvz->type, n_qkv));
+        cb(z, "z", il);
+
+        return { qkv_mixed, z };
+    }
+
     if (model.layers[il].wqkv_gate == nullptr) {
         // EXL3 fused [in_proj_qkv | in_proj_z]: one matmul, split by views
         const int64_t n_tok     = n_seq_tokens * n_seqs;
@@ -976,15 +999,29 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * beta  = nullptr;
+    ggml_tensor * alpha = nullptr;
+    if (model.layers[il].ssm_beta_alpha_cat) {
+        ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
+        cb(ba, "beta_alpha", il);
+
+        beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_element_size(ba), ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
+        alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
+                ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
+    } else {
+        beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    if (!model.layers[il].ssm_beta_alpha_cat) {   // separate tensors: same node order as before the v1.0 merge
+        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    }
     cb(alpha, "alpha", il);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
@@ -1099,7 +1136,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
-    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    // z is a strided view of the merged qkv_gate output with wqkv_z (upstream layout), contiguous otherwise (graph as before)
+    ggml_tensor * z_2d = model.layers[il].wqkv_z
+        ? ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0)
+        : ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);

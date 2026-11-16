@@ -217,8 +217,8 @@ def test_slot_erase():
 # Erase remains gated on the slot's content.
 #
 
-IMG_URL_CAT = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/91_cat.png"
-IMG_URL_TRUCK = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png"
+IMG_URL_CAT = "https://huggingface.co/ggml-org-dev/tinygemma3-GGUF/resolve/main/test/91_cat.png"
+IMG_URL_TRUCK = "https://huggingface.co/ggml-org-dev/tinygemma3-GGUF/resolve/main/test/11_truck.png"
 
 
 def _get_img_base64(url: str) -> str:
