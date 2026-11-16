@@ -419,14 +419,17 @@ static void test(void) {
         assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/models/tiny/mtp-dm.gguf,/models/tiny/head-ait2.gguf");
         assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/models/tiny/head-exact-f16.gguf");
         assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/tiny/lsa-qwen38-27b-d2048.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "1");
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
         setenv("LLAMA_MODEL_OVERLAY_PATCH", "/explicit/mtp.gguf,/explicit/head.gguf", 1);
         setenv("LLAMA_D1_HEAD", "/explicit/exact.gguf", 1);
+        setenv("LLAMA_LSA_MEAN_CHUNKS", "0", 1);
         common_card_preset_apply_env(tiny_env);
         assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/explicit/mtp.gguf,/explicit/head.gguf");
         assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/explicit/exact.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "0");
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }

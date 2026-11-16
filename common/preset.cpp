@@ -14,7 +14,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
     static const std::vector<common_card_preset> profiles = [] {
         // QC: V07/INTEG3/QC_READY_integ3.md, out-s10-ident-r8; ASYMCTX/MERGE_NOTE_kqpack_f2.md.
         common_card_preset large {
-            "24dense", "2026-11-16.4", "best known/recheck before ship", "", {
+            "24dense", "2026-11-16.5", "best known/recheck before ship", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -34,7 +34,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
         // TODO: multi-user for small cards (future).
         // Owner 2026-11-16T01:58Z: dynamic ub pending ASYMCTX; keep static ub until its ladder lands.
         common_card_preset small {
-            "10dense", "2026-11-16.4", "best known/recheck before ship", "", {
+            "10dense", "2026-11-16.5", "best known/recheck before ship", "", {
                 {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "off"}, {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -72,9 +72,9 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 kv.second = "3";
             }
         }
-        // Source: LSA/REAL8GB/card8/lsa-8gb.env; owner 2026-11-16T01:50Z enables this base until the F2 f205 pair is posted.
+        // Source: LSA/REAL8GB/card8/lsa-8gb.env + owner 2026-11-16T02:18Z MEAN_CHUNKS; F2 remains held.
         common_card_preset tiny {
-            "8dense", "2026-11-16.4", "best known/recheck before ship", "", {
+            "8dense", "2026-11-16.5", "best known/recheck before ship", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "off"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
@@ -94,6 +94,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 {"LLAMA_LSA_BLOCK", "128"}, {"LLAMA_LSA_BLOCK_TAU", "2"},
                 {"LLAMA_LSA_SJ_SKIP", "1"}, {"LLAMA_LSA_REFINE", "128"},
                 {"LLAMA_LSA_REFINE_MULT", "2"}, {"LLAMA_LSA_RING_ROWS", "512"},
+                {"LLAMA_LSA_MEAN_CHUNKS", "1"},
                 {"LLAMA_LSA_FUSED_SEL", "1"}, {"LLAMA_LSA_COMP", "2"},
                 {"LLAMA_LSA_COMP_LB", "1"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
                 {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "256"},
