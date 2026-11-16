@@ -308,6 +308,14 @@ static void test(void) {
         common_params batch;
         assert(parse_card({"--preset", "24dense", "-b", "128"}, batch));
         assert(batch.n_batch == 128 && batch.n_ubatch <= 128);
+        common_params large_batch;
+        assert(parse_card({"-b", "8192", "--preset", "24dense"}, large_batch));
+        assert(large_batch.n_batch == 8192 && large_batch.n_ubatch == 1024);
+        for (const auto & name : {"10dense", "12dense"}) {
+            common_params plain_mtp;
+            assert(parse_card({"--preset", name, "--spec-draft-n-min-adaptive", "6"}, plain_mtp));
+            assert(plain_mtp.speculative.draft.n_max == 4 && plain_mtp.speculative.draft.n_min_adaptive == 6);
+        }
         common_params kv;
         assert(parse_card({"-ctk", "q8_0", "-ctv", "q8_0", "--preset", "10dense"}, kv));
         assert(kv.cache_type_k == GGML_TYPE_Q8_0 && kv.cache_type_v == GGML_TYPE_Q8_0 && !kv.card_preset_kv_default);
@@ -322,10 +330,10 @@ static void test(void) {
         assert(per_slot.n_ctx == 0 && per_slot.kv_unified_per_slot == 65536);
         for (const auto & literal : {"24dense", "--preset", "8dense"}) {
             common_params prompt;
-            assert(parse_card({"-p", literal}, prompt, LLAMA_EXAMPLE_CLI));
+            assert(parse_card({"-m", "model_file.gguf", "-p", literal}, prompt, LLAMA_EXAMPLE_CLI));
             assert(prompt.prompt == literal && prompt.card_preset.empty());
             common_params with_preset;
-            assert(parse_card({"--preset", "24dense", "-p", literal}, with_preset, LLAMA_EXAMPLE_CLI));
+            assert(parse_card({"--preset", "24dense", "-m", "model_file.gguf", "-p", literal}, with_preset, LLAMA_EXAMPLE_CLI));
             assert(with_preset.prompt == literal && with_preset.card_preset == "24dense");
         }
         common_params adapter;

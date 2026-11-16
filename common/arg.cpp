@@ -950,9 +950,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 kv.first.compare(0, 10, "--sjkvarn-") == 0)) {
                 continue;
             }
-            if (kv.first == "--ubatch-size" && is_explicit("--batch-size")) {
-                continue;
-            }
             if (is_explicit(kv.first)) {
                 continue;
             }
@@ -1080,11 +1077,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             return found != arg_to_options.end() &&
                 (explicit_options.count(found->second.first) || found->second.first->has_value_from_env());
         };
-        if (explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive")) {
+        const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        if (adaptive_mtp && explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive")) {
             params.speculative.draft.n_min_adaptive = std::min(params.speculative.draft.n_min_adaptive,
                     params.speculative.draft.n_max);
         }
-        if (explicit_or_env("--spec-draft-n-min-adaptive") && !explicit_or_env("--spec-draft-n-max")) {
+        if (adaptive_mtp && explicit_or_env("--spec-draft-n-min-adaptive") && !explicit_or_env("--spec-draft-n-max")) {
             params.speculative.draft.n_max = std::max(params.speculative.draft.n_max,
                     params.speculative.draft.n_min_adaptive);
         }

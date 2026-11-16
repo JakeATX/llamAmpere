@@ -14,7 +14,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
     static const std::vector<common_card_preset> profiles = [] {
         // QC: V07/INTEG3/QC_READY_integ3.md, out-s10-ident-r8; ASYMCTX/MERGE_NOTE_kqpack_f2.md.
         common_card_preset large {
-            "24dense", "2026-11-16.1", "dev/pending release QC", "", {
+            "24dense", "2026-11-16.2", "dev/pending release QC", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -33,7 +33,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
         // 12dense d28a3c00 + SHARED=3 still needs owner QC: R205S3 used L0 4cde6151.
         // TODO: multi-user for small cards (future).
         common_card_preset small {
-            "10dense", "2026-11-16.1", "dev/pending Jake approval", "", {
+            "10dense", "2026-11-16.2", "dev/pending Jake approval", "", {
                 {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "off"}, {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -73,7 +73,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
         }
         // QC: LSA/REAL8GB/card8/lsa-8gb.env; owner 2026-11-15T23:48Z holds the F2 delta.
         common_card_preset tiny {
-            "8dense", "2026-11-16.1", "dev/pending Jake approval",
+            "8dense", "2026-11-16.2", "dev/pending Jake approval",
             "8dense waits for COORD-bc F2 speed QC versus c3dd1f28a; use the current lsa-8gb.env profile", {}, {}
         };
         return std::vector<common_card_preset> {large, medium, small, tiny};
