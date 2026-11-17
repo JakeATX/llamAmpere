@@ -48,6 +48,58 @@ for arg in "$@"; do
     esac
 done
 devices=$("$server" --list-devices 2>/dev/null) || devices=
+# The fixed shape (--fit off) is measured on one card: with several visible cards and no device named by the caller,
+# stay on the card with the most free memory (the drafter follows --device), where the device table works.
+# FLASH_NEXT_MULTI_GPU=1 keeps every card; -dev/--device or LLAMA_ARG_DEVICE also wins.
+if [[ -z $device_spec && ${FLASH_NEXT_MULTI_GPU-0} != 1 ]]; then
+    card_count=0; best_card=; best_free=-1
+    while IFS= read -r device; do
+        [[ $device =~ ^[[:space:]]*(CUDA[0-9]+):.*\(([0-9]+)\ MiB,\ ([0-9]+)\ MiB\ free\) ]] || continue
+        card_count=$(( card_count + 1 ))
+        (( BASH_REMATCH[3] > best_free )) || continue
+        best_card=${BASH_REMATCH[1]}; best_free=${BASH_REMATCH[3]}
+    done <<< "$devices"
+    if (( card_count > 1 )); then
+        device_spec=$best_card
+        shape+=(--device "$best_card")
+        echo "flash-next-server: $card_count CUDA cards visible; using $best_card ($best_free MiB free). --device overrides" >&2
+    fi
+fi
+# Memory that another program already holds is not free for the fixed shape (#96: two busy 24 GB cards with about
+# 3.4 GB free each failed late with an out-of-memory error). Name each such card, and when a card in use has less free
+# memory than 8 GiB (below the 10 and 12 GB card shapes), let the memory planner choose the layers and the context.
+# FLASH_NEXT_FIT_MIN_MIB=0 keeps the fixed shape; the caller's own -ngl, --fit or -c come later and still win.
+fit_min_mib=${FLASH_NEXT_FIT_MIN_MIB-8192}
+[[ $fit_min_mib =~ ^[0-9]+$ ]] || { echo "flash-next-server: FLASH_NEXT_FIT_MIN_MIB must be a whole number of MiB" >&2; exit 2; }
+low_cards=
+used_cards=0
+while IFS= read -r device; do
+    [[ $device =~ ^[[:space:]]*(CUDA[0-9]+):.*\(([0-9]+)\ MiB,\ ([0-9]+)\ MiB\ free\) ]] || continue
+    name=${BASH_REMATCH[1]}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
+    [[ -z $device_spec || ,${device_spec,,}, == *,"${name,,}",* ]] || continue
+    used_cards=$(( used_cards + 1 ))
+    if (( card_mib - free_mib > 4096 )); then
+        echo "flash-next-server: $name has $free_mib of $card_mib MiB free; other programs hold about $(( card_mib - free_mib )) MiB (see nvidia-smi)" >&2
+    fi
+    (( free_mib >= fit_min_mib )) || low_cards+=" $name"
+done <<< "$devices"
+# The card-side expert tables work on one card only; on several, experts run on the host (#96: on two idle 3090s a
+# 28-token prompt took 55 s and 512 tokens did not finish in 13 minutes, against 79 tokens/s on one of the same cards).
+if [[ ${FLASH_NEXT_MULTI_GPU-0} == 1 ]] || (( used_cards > 1 )); then
+    echo "flash-next-server: WARN two-card Flash-Next is experimental and very slow unless the host has enough RAM for the experts; this version runs Flash-Next on one card (name it with --device)" >&2
+fi
+if [[ -n $low_cards ]]; then
+    for i in "${!shape[@]}"; do
+        case ${shape[i]} in
+            -ngl) shape[i+1]=auto ;;
+            --fit) shape[i+1]=on ;;
+        esac
+    done
+    # Skipping light experts needs the card-side expert tables, which a nearly full card cannot hold; the host path
+    # computes every expert (#96: a 2x3090 rental with 3.2 GB free stopped on an assertion with skipping on).
+    shape+=(--moe-skip off)
+    echo "flash-next-server: less than $fit_min_mib MiB free on$low_cards; using the memory planner (-ngl auto --fit on --moe-skip off), which can keep layers in RAM and pick a shorter context (slower). Close the other programs for full speed" >&2
+fi
 while IFS= read -r device; do
     [[ $device =~ ^[[:space:]]*(CUDA[0-9]+):.*\(([0-9]+)\ MiB,\ ([0-9]+)\ MiB\ free\) ]] || continue
     name=${BASH_REMATCH[1],,}; card_mib=${BASH_REMATCH[2]}; free_mib=${BASH_REMATCH[3]}
@@ -67,7 +119,8 @@ while IFS= read -r device; do
         break
     fi
 done <<< "$devices"
-[[ " $* " == *" -c "* || " $* " == *" --ctx-size"* ]] || shape+=(-c 110592)
+# With the planner, the context is left to it (it keeps the largest that fits).
+[[ " $* " == *" -c "* || " $* " == *" --ctx-size"* || -n $low_cards ]] || shape+=(-c 110592)
 threads=0
 (( $(nproc --all) < 16 )) || threads=8
 if [[ -r /sys/devices/cpu_core/cpus ]]; then
