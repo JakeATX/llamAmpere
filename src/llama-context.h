@@ -653,7 +653,12 @@ private:
     size_t sched_cache_budget_mib = 0;
     bool sched_pipeline_parallel = false;
     bool sched_op_offload = false;
-    bool prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch);
+    bool prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch,
+            enum llama_decode_phase phase = LLAMA_DECODE_PHASE_UNKNOWN);
+    bool dynamic_ubatch = false;
+    uint32_t dynamic_ubatch_rows = 0;
+    int64_t dynamic_ubatch_pp_check_us = 0;
+    int64_t dynamic_ubatch_decode_check_us = 0;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

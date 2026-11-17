@@ -659,6 +659,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    const char * ladder = getenv("LLAMA_DEEPCTX_LADDER");
+    dynamic_ubatch = ladder && strcmp(ladder, "1") == 0;
 
     // fork: small-card prompt ubatch. An MoE model asked for -ub > 6144 on a card with less than
     // LLAMA_UB_SMALL_CARD_FREE_MIB (default 14336) free here (after the weights, before KV and the expert cache;
@@ -5845,10 +5847,12 @@ static bool b1_pending_publish_enabled() {
     return enabled;
 }
 
-bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch) {
+bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch,
+        enum llama_decode_phase phase) {
     const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
-    if (!rotate || rotate[0] != '1' || !cparams.causal_attn || cparams.training ||
-            cparams.embeddings || kv_stream_phase_arena.configured || cparams.n_ubatch <= 512) {
+    if ((!dynamic_ubatch && (!rotate || rotate[0] != '1' || cparams.n_ubatch <= 512)) ||
+            !cparams.causal_attn || cparams.training || cparams.embeddings ||
+            kv_stream_phase_arena.configured || cparams.n_ubatch < 256) {
         return true;
     }
     bool alone = batch != nullptr;
@@ -5964,8 +5968,56 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         rows = std::min(512u, cparams.n_ubatch);
         b1_layer_scratch_active = true;
     }
+    if (dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            !b1_ffn_scratch_active && !b1_layer_scratch_active) {
+        const bool prompt = phase == LLAMA_DECODE_PHASE_PROMPT ||
+                (phase == LLAMA_DECODE_PHASE_UNKNOWN && n_tokens > std::max(64u, cparams.n_seq_max));
+        int64_t & deadline = prompt ? dynamic_ubatch_pp_check_us : dynamic_ubatch_decode_check_us;
+        const int64_t now = ggml_time_us();
+        if (!dynamic_ubatch_rows) {
+            dynamic_ubatch_rows = 256;
+            while (dynamic_ubatch_rows < 4096 && dynamic_ubatch_rows * 2 <= cparams.n_ubatch) {
+                dynamic_ubatch_rows *= 2;
+            }
+        }
+        if (now >= deadline) {
+            deadline = now + (prompt ? 2000000 : 10000000);
+            bool cut = false;
+            bool grow = true;
+            bool gpu = false;
+            const uint32_t next = std::min(std::min(cparams.n_ubatch, 4096u), dynamic_ubatch_rows * 2);
+            for (auto backend : backend_ptrs) {
+                auto dev = ggml_backend_get_device(backend);
+                if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
+                gpu = true;
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                const size_t margin = total >= (size_t(16) << 30) ? size_t(2) << 30 : size_t(64) << 20;
+                cut = cut || free < margin;
+                // fork: budget from allocated rows, which may be writing-sized after a turn.
+                const size_t bytes = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+                const uint32_t allocated = std::max(1u, sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch);
+                const double extra = double(bytes) * (next - std::min(next, allocated)) / allocated;
+                const double current_extra = double(bytes) *
+                        (dynamic_ubatch_rows - std::min(dynamic_ubatch_rows, allocated)) / allocated;
+                cut = cut || (dynamic_ubatch_rows > allocated &&
+                        current_extra + margin + (size_t(64) << 20) >= double(free));
+                grow = grow && free > margin && extra + (size_t(64) << 20) < double(free - margin);
+            }
+            const uint32_t previous = dynamic_ubatch_rows;
+            if (gpu && cut) {
+                dynamic_ubatch_rows = std::max(std::max(256u, cparams.n_seq_max), dynamic_ubatch_rows / 2);
+            } else if (gpu && grow) {
+                dynamic_ubatch_rows = next;
+            }
+            if (previous != dynamic_ubatch_rows) {
+                LLAMA_LOG_INFO("%s: dynamic prompt ceiling %u -> %u rows\n", __func__, previous, dynamic_ubatch_rows);
+            }
+        }
+        if (prompt) { rows = std::min(rows, dynamic_ubatch_rows); }
+    }
     const bool trim_packed = n_tokens == 0 && (b1_ffn_scratch_active || b1_layer_scratch_active);
-    if (rows == sched_reserve_tokens && !trim_packed) {
+    if (rows == sched_reserve_tokens && !trim_packed && !sched_need_reserve) {
         return true;
     }
     synchronize();
@@ -5986,14 +6038,26 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     }
     gf_res_prev_active = nullptr;
     const uint32_t previous = sched_reserve_tokens;
-    sched_reserve_tokens = rows;
-    sched_need_reserve = true;
     const char * suspend_early = getenv("LLAMA_B1_EARLY_CACHE_SUSPEND");
     const char * suspend_cache = getenv("LLAMA_B1_MOE_CACHE_SUSPEND");
     const bool suspend_prompt_cache = b1 && alone && n_tokens >= 16384 &&
         (b1_ffn_scratch_active || b1_layer_scratch_active) && suspend_early && suspend_early[0] == '1' &&
         suspend_cache && suspend_cache[0] == '1';
-    sched_reserve(suspend_prompt_cache);
+    for (;;) {
+        sched_reserve_tokens = rows;
+        sched_need_reserve = true;
+        try {
+            sched_reserve(suspend_prompt_cache);
+            break;
+        } catch (const std::exception & error) {
+            if (!dynamic_ubatch || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) { throw; }
+            const uint32_t floor = std::min(cparams.n_ubatch, std::max(256u, cparams.n_seq_max));
+            LLAMA_LOG_WARN("%s: dynamic scratch %u rows failed: %s\n", __func__, rows, error.what());
+            if (rows <= floor) { sched_need_reserve = true; return false; }
+            rows = std::max(floor, rows / 2);
+            dynamic_ubatch_rows = rows;
+        }
+    }
     if (rows < previous || trim_packed) {
         b1_cache_needs_refresh = true;
     }
@@ -6173,7 +6237,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ~b1_cache_guard() { ctx.b1_cache_resume(); }
     } b1_cache_guard_ { *this };
     pp_setup_clock pp_dec;
-    if (!prompt_buffers_resize(n_tokens_all, &batch_inp)) {
+    if (!prompt_buffers_resize(n_tokens_all, &batch_inp, tagged)) {
         return -2;
     }
     pp_dec.mark("scratch_resize");
