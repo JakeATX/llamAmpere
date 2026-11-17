@@ -597,6 +597,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* host_weights      */ false,
     };
     return params;
 }
@@ -604,6 +605,16 @@ mtmd_context_params mtmd_context_params_default() {
 // chatterbox multilingual has a perceiver in its conditioning encoder (speaker encoding context)
 static bool cbx_is_mtl(const mtmd_model & model) {
     return model.cbx_read_tensor("a.cenc.perceiver.pre_attention_query", nullptr, 0) > 0;
+}
+
+// CUDA_Host_W buffer type of the device, nullptr when the backend has none
+static ggml_backend_buffer_type_t mtmd_host_weights_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    typedef ggml_backend_buffer_type_t (*host_weights_buft_fn)(void);
+    auto get_host_weights_buft = reg
+        ? (host_weights_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_weights_buffer_type")
+        : nullptr;
+    return get_host_weights_buft ? get_host_weights_buft() : nullptr;
 }
 
 struct mtmd_context {
@@ -674,7 +685,8 @@ struct mtmd_context {
     mtmd_context(const char * mmproj_fname,
                    const llama_model * text_model,
                    const mtmd_context_params & ctx_params,
-                   bool no_alloc = false) :
+                   bool no_alloc = false,
+                   bool host_weights_strict = false) :
         print_timings   (ctx_params.print_timings),
         n_threads       (ctx_params.n_threads),
         media_marker    (ctx_params.media_marker),
@@ -722,6 +734,14 @@ struct mtmd_context {
         ggml_backend_buffer_type_t buft = device
             ? ggml_backend_dev_buffer_type(device)
             : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        if (ctx_params.host_weights && device) {
+            model_params.host_weights_buft   = mtmd_host_weights_buft(device);
+            model_params.host_weights_strict = host_weights_strict;
+            if (!model_params.host_weights_buft) {
+                LOG_WRN("%s: --mmproj-host-weights set, but device \"%s\" has no host weights buffer type\n",
+                        __func__, ggml_backend_dev_name(device));
+            }
+        }
         models = mtmd_model_load(mmproj_fname, model_params, buft);
 
         // soprano and pocket-tts without voice cloning have no encoder
@@ -1370,8 +1390,15 @@ private:
 mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct llama_model * text_model,
         const struct mtmd_context_params ctx_params) {
+    return mtmd_init_from_file_impl(mmproj_fname, text_model, ctx_params, false);
+}
+
+mtmd_context * mtmd_init_from_file_impl(const char * mmproj_fname,
+        const llama_model * text_model,
+        const mtmd_context_params & ctx_params,
+        bool host_weights_strict) {
     try {
-        return new mtmd_context(mmproj_fname, text_model, ctx_params);
+        return new mtmd_context(mmproj_fname, text_model, ctx_params, false, host_weights_strict);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;
