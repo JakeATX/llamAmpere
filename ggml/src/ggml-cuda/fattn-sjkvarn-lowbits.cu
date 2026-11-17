@@ -1,6 +1,88 @@
 #include "fattn-sjkvarn-lowbits-stream.cuh"
+#include "sjkvarn-seal.cuh"
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
+#include <string>
+
+// GGML_SJKVARN_LIVE_TILES=1 (opt-in): the trellis tile kernel walks only the KV tiles (nbatch_fa positions) that some query
+// row can see, split evenly over its stream-k blocks. Without it every block gets an even share of ALL tiles and the
+// dead-tile check runs after the split, so with an LSA mask (sink + KEEP picks + tail) a few blocks carry the live tiles.
+// A dead tile adds exp(-inf) = 0 and leaves the running max alone, so the sum is the same; the block split moves, so the
+// float grouping (and possibly the last bits) can differ from the dense walk.
+static bool sj_kvarn_live_tiles() {
+    static const bool v = [] { const char * e = getenv("GGML_SJKVARN_LIVE_TILES"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+
+// flags[t] = 1 iff some row q < n_q has a visible entry in columns [t*nbatch_fa, (t+1)*nbatch_fa): one warp per tile.
+// F16 mask: entry != -inf (the tile kernel's TILE_SKIP test). Packed I32 mask [#175]: one bit per column, set = visible,
+// tiles start on a word (nbatch_fa % 32 == 0), so a nonzero word is a visible column.
+static __global__ void sj_kvarn_live_tile_flags(const char * __restrict__ mask, const int64_t row_bytes, const int n_q,
+        const int packed, const int nbatch_fa, const int n_tiles, uint8_t * __restrict__ flags) {
+    const int t    = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (t >= n_tiles) {
+        return;
+    }
+    bool live = false;
+    for (int q = 0; q < n_q && !live; ++q) {
+        const char * row = mask + q*row_bytes;
+        bool f = false;
+        if (packed) {
+            for (int w = lane; w < nbatch_fa/32; w += WARP_SIZE) {
+                f |= ((const uint32_t *) row)[t*(nbatch_fa/32) + w] != 0u;
+            }
+        } else {
+            for (int c = lane; c < nbatch_fa; c += WARP_SIZE) {
+                f |= __half2float(((const half *) row)[t*nbatch_fa + c]) != -INFINITY;
+            }
+        }
+        live = __any_sync(0xFFFFFFFF, f);
+    }
+    if (lane == 0) {
+        flags[t] = live ? 1 : 0;
+    }
+}
+
+// list[0] = live count, list[1 ..] = live tile ids ascending (one block of 1024: ballot scan per 1024 tiles, the
+// sj_live_record_list pattern of the 4/4 stream kernel)
+static __global__ void __launch_bounds__(1024) sj_kvarn_live_tile_list(const uint8_t * __restrict__ flags, const int n_tiles,
+        int32_t * __restrict__ list) {
+    __shared__ int warp_counts[32];
+    __shared__ int base;
+    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE, nwarps = blockDim.x / WARP_SIZE;
+    if (tid == 0) {
+        base = 0;
+    }
+    __syncthreads();
+    for (int t0 = 0; t0 < n_tiles; t0 += blockDim.x) {
+        const int t = t0 + tid;
+        const bool live = t < n_tiles && flags[t] != 0;
+        const uint32_t bal = __ballot_sync(0xFFFFFFFF, live);
+        if (lane == 0) {
+            warp_counts[warp] = __popc(bal);
+        }
+        __syncthreads();
+        int before = base;
+        for (int w = 0; w < warp; ++w) {
+            before += warp_counts[w];
+        }
+        if (live) {
+            list[1 + before + __popc(bal & ((1u << lane) - 1u))] = t;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            for (int w = 0; w < nwarps; ++w) {
+                base += warp_counts[w];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        list[0] = base;
+    }
+}
 
 template <int DKQ, int DV, int ncols1, int ncols2, int bits_k, int bits_v, bool rot = false>
 void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -24,6 +106,9 @@ void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor
     const int  nbatch_K2      = ggml_cuda_fattn_mma_get_nbatch_K2     (DKQ, DV, ncols, cc);
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
+    if (dst->src[0]->ne[1] <= 8 && ggml_cuda_lsa_page_full_stage(dst->src[5])) {
+        GGML_ASSERT(nbatch_fa <= GGML_LSA_PAGE_CELLS && GGML_LSA_PAGE_CELLS % nbatch_fa == 0);
+    }
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
 
     const int cols_per_warp  = std::min(ncols, get_cols_per_warp(cc));
@@ -80,10 +165,48 @@ void ggml_cuda_lowbits_prefill_case(ggml_backend_cuda_context & ctx, ggml_tensor
 #endif // !defined(GGML_USE_MUSA)
     }
 
+    // GGML_SJKVARN_LIVE_TILES: trellis build, one shared mask (no per-head or per-sequence mask), no LSA block list
+    ggml_cuda_pool_alloc<uint8_t> live_flags(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> live_list(ctx.pool());
+    if constexpr ((bits_k & 24) != 0 && ncols2 > 1) {
+        const ggml_tensor * mask = dst->src[3];
+        const int64_t positions = ggml_get_op_params_i32(KQV, 6);
+        const int64_t n_tiles   = (positions + nbatch_fa - 1) / nbatch_fa;
+        const bool    packed    = mask && mask->type == GGML_TYPE_I32;
+        // columns a row holds: f16 entries, or 32 per I32 word
+        const int64_t mask_cols = !mask ? 0 : packed ? (mask->nb[1]/4)*32 : mask->ne[0];
+        // the kernel reads mask plane 0 for every head (mask + nb33*sequence, no nb32 term), so the flags read plane 0 too
+        const bool use = mask && (mask->type == GGML_TYPE_F16 || packed) && mask->ne[3] == 1 &&
+                dst->src[0]->ne[3] == 1 && mask->ne[1] >= dst->src[0]->ne[1] && positions > 0 && n_tiles*nbatch_fa <= mask_cols &&
+                nbatch_fa % 32 == 0 && ggml_flash_attn_ext_get_lsa_block(KQV) == 0 && !ggml_flash_attn_ext_get_lsa_vk(KQV);
+        if (sj_kvarn_live_tiles()) {
+            // route proof for end-to-end gates: one line for the first launch that takes the walk, one for the first that cannot
+            static std::atomic_flag noted[2] = {ATOMIC_FLAG_INIT, ATOMIC_FLAG_INIT};
+            if (!noted[use ? 1 : 0].test_and_set()) {
+                GGML_LOG_INFO("%s: SJ-KVaRN trellis live-tile walk %s (mask %s, n_q %d, tiles %d)\n", __func__,
+                    use ? "ON" : "OFF: unsupported mask/shape", mask ? ggml_type_name(mask->type) : "none",
+                    (int) dst->src[0]->ne[1], (int) n_tiles);
+            }
+        }
+        if (sj_kvarn_live_tiles() && use) {
+            live_flags.alloc(n_tiles);
+            live_list.alloc(n_tiles + 1);
+            constexpr int warps_per_block = 8;
+            sj_kvarn_live_tile_flags<<<(n_tiles + warps_per_block - 1)/warps_per_block, warps_per_block*WARP_SIZE, 0, ctx.stream()>>>(
+                (const char *) mask->data, (int64_t) mask->nb[1], (int) dst->src[0]->ne[1], packed ? 1 : 0, nbatch_fa, (int) n_tiles,
+                live_flags.ptr);
+            CUDA_CHECK(cudaGetLastError());
+            sj_kvarn_live_tile_list<<<1, 1024, 0, ctx.stream()>>>(live_flags.ptr, (int) n_tiles, live_list.ptr);
+            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_fattn_sj_live_tiles = live_list.ptr;
+        }
+    }
+
     // K/V stay in their ring storage format; only shared tiles are decoded. stream_k = true.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host);
+    ggml_cuda_fattn_sj_live_tiles = nullptr;
 }
 
 
@@ -151,6 +274,101 @@ void ggml_cuda_sj_kvarn_trellis_expand_body(const int bits_pair, const char * bo
     CUDA_CHECK(cudaGetLastError());
 }
 
+template<int bits_k, int bits_v, bool expand>
+static __global__ void __launch_bounds__(256) fattn_sj_kvarn_strip_master_expand_kernel(
+        ggml_cuda_qsa_clock_map map, const int32_t * desc, size_t table_records, size_t k_head_stride, size_t v_head_stride,
+        uint8_t * scratch, half2 * K_out, half2 * V_out, int n_out, int p_begin, int head_first) {
+    constexpr int record_bytes = 4096*(bits_k + bits_v) + 2304;
+    const int head = head_first + int(blockIdx.y), pb = p_begin + int(blockIdx.x)*64;
+    const int sink = desc[GGML_SJKVARN_DESC_S], end = desc[GGML_SJKVARN_DESC_B];
+    if (sink < 0 || sink%128 || end < sink || (end - sink)%128 ||
+        desc[GGML_SJKVARN_DESC_D] != 256 || desc[GGML_SJKVARN_DESC_G] != 128 ||
+        desc[GGML_SJKVARN_DESC_HKV] != int(map.heads) || desc[GGML_SJKVARN_DESC_RECBYTES] != record_bytes ||
+        desc[GGML_SJKVARN_DESC_BODY_TYPE] != GGML_TYPE_I16 ||
+        (desc[GGML_SJKVARN_DESC_TABLE] != 0 && desc[GGML_SJKVARN_DESC_TABLE] != 1) || !(fattn_sj_kvarn_trtok & 1)) { __trap(); return; }
+    if (pb + 64 <= sink || pb >= end) return;
+    const int32_t * table = desc[GGML_SJKVARN_DESC_TABLE] ? desc + GGML_SJKVARN_DESC_N_ENTRIES : nullptr;
+    int record;
+    if (!sj_kvarn_lowbits::strip_master_expand_location(sink, end, pb, table, table_records, map.records, record)) { __trap(); return; }
+    uint8_t * rec = scratch + (size_t(blockIdx.y)*gridDim.x + blockIdx.x)*record_bytes;
+    const int tid = threadIdx.y*ggml_cuda_get_physical_warp_size() + threadIdx.x;
+    if constexpr (!expand) {
+        const int slot = map.table[record];
+        if (slot < -1 || (slot >= 0 && uint32_t(slot) >= map.slots)) { __trap(); return; }
+        if (slot >= 0) {
+            const auto * src = reinterpret_cast<const uint4 *>(map.card + (size_t(slot)*map.heads + head)*record_bytes);
+            for (int q = tid; q < record_bytes/16; q += 256) reinterpret_cast<uint4 *>(rec)[q] = src[q];
+        } else {
+            sj_kvarn_lowbits::strip_master_layout l;
+            sj_kvarn_lowbits::make_strip_master_layout(bits_k, bits_v, l);
+            const auto * src = reinterpret_cast<const uint4 *>(map.strip_master + (size_t(record)*map.heads + head)*l.bytes);
+            for (int q = tid; q < l.bytes/16; q += 256) {
+                const uint4 value = src[q];
+                const uint8_t * bytes = reinterpret_cast<const uint8_t *>(&value);
+                for (int b = 0; b < 16; ++b) {
+                    const int from = sj_kvarn_lowbits::strip_master_source_byte(l, q*16 + b);
+                    if (from >= 0 && sj_kvarn_lowbits::strip_master_byte(l, from) == q*16 + b) rec[from] = bytes[b];
+                }
+            }
+        }
+    } else {
+        __shared__ __align__(16) half2 tile_K[16*128], tile_V[16*128];
+        // A prior launch wrote the canonical scratch; the old decoder's read-only loads are safe here.
+        const auto kv = fattn_sj_kvarn_lowbits_make_ctx(map.card, desc, head, 256, bits_k | 8, bits_v, k_head_stride, v_head_stride);
+        fattn_sj_kvarn_trellis_cb_stage<bits_k, bits_v>();
+        for (int p0 = pb; p0 < pb + 64; p0 += 16) {
+            const int token = (p0 - sink)%128;
+            flash_attn_ext_sj_kvarn_load_tile_raw<128, false, 16, 256, 128, false, false>(reinterpret_cast<const char *>(rec), token, kv, tile_K, 16);
+            flash_attn_ext_sj_kvarn_load_tile_raw<128, false, 16, 256, 128, false, true >(reinterpret_cast<const char *>(rec), token, kv, tile_V, 16);
+            __syncthreads();
+            const size_t out = (size_t(blockIdx.y)*n_out + p0 - p_begin)*128;
+            for (int i = tid; i < 16*128/4; i += 256) {
+                reinterpret_cast<uint4 *>(K_out + out)[i] = reinterpret_cast<const uint4 *>(tile_K)[i];
+                reinterpret_cast<uint4 *>(V_out + out)[i] = reinterpret_cast<const uint4 *>(tile_V)[i];
+            }
+            __syncthreads();
+        }
+    }
+}
+
+bool ggml_cuda_sj_kvarn_strip_master_expand(ggml_backend_cuda_context & ctx, const ggml_cuda_qsa_clock_map & map,
+        const ggml_tensor * desc, void * scratch, size_t scratch_capacity, half2 * K_out, half2 * V_out, size_t output_capacity,
+        int n_out, int p_begin, int heads, int head_first, size_t k_head_stride, size_t v_head_stride) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_LSA_RESIDENT_STRIP_MASTER"); return e && e[0] == '1' && !e[1]; }();
+    sj_kvarn_lowbits::strip_master_layout l;
+    sj_kvarn_lowbits::strip_master_expand_plan plan;
+    if (!enabled || ggml_cuda_info().devices[ctx.device].warp_size != 32 || !ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc) ||
+        !map.strip_master || !map.card || !map.table || map.cells != 128 || map.group != 128 ||
+        !map.stage_all || map.stage_n < map.records || !map.slots || map.slots > map.records || map.stride > size_t(INT32_MAX) ||
+        !sj_kvarn_lowbits::strip_master_clock_layout(map.strip_master_bits >> 8, map.strip_master_bits & 255,
+            map.records, map.heads, map.stride, map.stage_stride, map.strip_master_capacity, l) ||
+        map.heads > uint32_t(INT32_MAX/512) || !desc || desc->type != GGML_TYPE_I32 || !ggml_is_contiguous(desc) ||
+        desc->ne[0] < GGML_SJKVARN_DESC_N_ENTRIES || desc->ne[0] > INT32_MAX || desc->ne[1] != 1 || desc->ne[2] != 1 || desc->ne[3] != 1 ||
+        !desc->data || !scratch || !K_out || !V_out || n_out <= 0 || n_out%64 || p_begin < 0 || p_begin%64 || n_out > INT32_MAX - p_begin ||
+        heads <= 0 || heads > 65535 || head_first < 0 || uint32_t(head_first) >= map.heads || uint32_t(heads) > map.heads - uint32_t(head_first) ||
+        k_head_stride > size_t(INT32_MAX) || v_head_stride > size_t(INT32_MAX) ||
+        !sj_kvarn_lowbits::make_strip_master_expand_plan(map.strip_master_bits >> 8, map.strip_master_bits & 255,
+            n_out, heads, SIZE_MAX, plan) || plan.rows != n_out ||
+        output_capacity < plan.output_bytes || scratch_capacity < plan.scratch_bytes ||
+        reinterpret_cast<uintptr_t>(map.strip_master)%16 || reinterpret_cast<uintptr_t>(map.card)%16 ||
+        reinterpret_cast<uintptr_t>(map.table)%alignof(int32_t) || reinterpret_cast<uintptr_t>(desc->data)%alignof(int32_t) ||
+        reinterpret_cast<uintptr_t>(scratch)%16 || reinterpret_cast<uintptr_t>(K_out)%16 || reinterpret_cast<uintptr_t>(V_out)%16) return false;
+    ggml_cuda_sj_kvarn_trellis_cb_init();
+    const dim3 blocks(n_out/64, heads, 1), threads(32, 8, 1);
+    const size_t table_records = size_t(desc->ne[0]) - GGML_SJKVARN_DESC_N_ENTRIES;
+#define LSA_MASTER_EXPAND(K, V, EXPAND) do { fattn_sj_kvarn_strip_master_expand_kernel<K,V,EXPAND><<<blocks, threads, 0, ctx.stream()>>>(map, static_cast<const int32_t *>(desc->data), table_records, k_head_stride, v_head_stride, static_cast<uint8_t *>(scratch), K_out, V_out, n_out, p_begin, head_first); CUDA_CHECK(cudaGetLastError()); } while (0)
+    switch (map.strip_master_bits) {
+        case (3 << 8) | 3: LSA_MASTER_EXPAND(3, 3, false); LSA_MASTER_EXPAND(3, 3, true); break;
+        case (3 << 8) | 2: LSA_MASTER_EXPAND(3, 2, false); LSA_MASTER_EXPAND(3, 2, true); break;
+        case (2 << 8) | 3: LSA_MASTER_EXPAND(2, 3, false); LSA_MASTER_EXPAND(2, 3, true); break;
+        case (2 << 8) | 2: LSA_MASTER_EXPAND(2, 2, false); LSA_MASTER_EXPAND(2, 2, true); break;
+        default: return false;
+    }
+#undef LSA_MASTER_EXPAND
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);         // fattn-sjkvarn-prefill.cu
 bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill_applies(int device, const ggml_tensor * dst);              // fattn-sjkvarn-prefill.cu
 
@@ -169,6 +387,52 @@ static bool sj_kvarn_trellis_words() {
     static const bool v = [] { const char * e = getenv("GGML_SJKVARN_TRELLIS_WORDS"); return e == nullptr || e[0] != '0'; }();
     return v;
 }
+// [TRW] GGML_SJKVARN_TRELLIS_WIDTH (default on, Jake 2026-11-14; =0/off/false/no turns it off): 3/3 trellis decode/verify (n_q <= 8) takes the width kernel
+// (fattn-sjkvarn-lowbits-stream.cuh, template bits_k | 8) instead of the tile build. Same exclusions as the scalar width
+// route (GGML_SJKVARN_NO_DIRECT, LSA full stage incl. the compact strip stage). LSE nodes (LLAMA_LSA_COMP=2 + COMP_LB=1)
+// also take it while GGML_SJKVARN_TRELLIS_WIDTH_LSE is on (default on; =0/off/false/no keeps them on the tile build): the width launch is the low-bit launch_fattn
+// (fattn-sjkvarn-lowbits-common.cuh), which then keeps >= 2 parallel blocks and its combine writes lse = max + log(sum).
+static bool sj_kvarn_trellis_width() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SJKVARN_TRELLIS_WIDTH");
+        if (e == nullptr || *e == 0) { return true; }
+        std::string w(e);
+        for (char & c : w) { c = (char) tolower((unsigned char) c); }
+        return !(w == "0" || w == "off" || w == "false" || w == "no");
+    }();
+    return v;
+}
+// on top of the width route (default on, Jake 2026-11-14 prep; =0/off/false/no turns it off): FA nodes with an LSE output also take it (LSE from the parallel-block combine)
+static bool sj_kvarn_trellis_width_lse() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_SJKVARN_TRELLIS_WIDTH_LSE");
+        bool on = true;
+        if (e != nullptr && *e != 0) {
+            std::string w(e);
+            for (char & c : w) { c = (char) tolower((unsigned char) c); }
+            on = !(w == "0" || w == "off" || w == "false" || w == "no");
+        }
+        if (on) { GGML_LOG_WARN("%s: SJ-KVaRN trellis width route also takes LSE nodes (combine LSE)\n", __func__); }
+        return on;
+    }();
+    return v;
+}
+static bool sj_kvarn_trellis_width_applies(const ggml_tensor * dst) {
+    const int bits = ggml_get_op_params_i32(dst,5);
+    return sj_kvarn_trellis_width() && bits == ((3 << 8) | 3) && ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 &&
+        dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct() && !ggml_cuda_lsa_page_full_stage(dst->src[5]) &&
+        (ggml_flash_attn_ext_get_lse(dst) == nullptr || sj_kvarn_trellis_width_lse());
+    // LSE nodes (LLAMA_LSA_COMP=2 + COMP_LB=1): with GGML_SJKVARN_TRELLIS_WIDTH_LSE on (default) the width launch writes the
+    // LSE through the parallel-block combine; =0/off/false/no keeps them on the tile build (its stream-k fixup writes the LSE)
+}
+// route proof for the gate: one line per process on the first n_q <= 8 call that takes it, one on the first that does not
+static void sj_kvarn_trellis_width_note(const bool taken, const int n_q) {
+    static std::atomic_flag done_on = ATOMIC_FLAG_INIT, done_off = ATOMIC_FLAG_INIT;
+    if (taken ? !done_on.test_and_set() : !done_off.test_and_set()) {
+        GGML_LOG_WARN("%s: SJ-KVaRN trellis width route %s (n_q=%d)\n", __func__, taken ? "ON" : "OFF", n_q);
+    }
+}
+
 // route proof for end-to-end gates: one line on the first trellis attention call that takes the word-load build
 static void sj_kvarn_trellis_words_note() {
     static std::atomic_flag done = ATOMIC_FLAG_INIT;
@@ -189,13 +453,28 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
         // trellis-coded body: the stream kernel has no codebook path, the tile loader decodes every width from the
         // codebooks staged in shared memory (#126). Only 3/3, 3/2 and 2/2 seal a 2/3-bit trellis body (llama-context.cpp).
         if constexpr (bits_k <= 3 && bits_v <= 3) {
+            // A5: an LSE node never has >= 128 rows (graph guard); with a strip master the tile kernel would reject it
+            GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr || dst->src[0]->ne[1] < 128);
             if constexpr (!rot) {
                 // [TRPF] n_q >= 128: expand each record once into f16, then the plain f16 MMA kernel (fattn-sjkvarn-prefill.cu)
-                if (ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ctx, dst)) {
+                // fork (A5): the expand path writes no LSE output; the graph never asks for one at n_q >= 128
+                if (ggml_flash_attn_ext_get_lse(dst) == nullptr && ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ctx, dst)) {
                     return;
                 }
             }
             ggml_cuda_sj_kvarn_trellis_cb_init();
+            if constexpr (bits_k == 3 && bits_v == 3) {
+                if (sj_kvarn_trellis_width()) {
+                    const bool taken = sj_kvarn_trellis_width_applies(dst);
+                    if (dst->src[0]->ne[1] <= 8) { // prompt batches never take it; an OFF line means an n_q <= 8 call missed it
+                        sj_kvarn_trellis_width_note(taken, (int) dst->src[0]->ne[1]);
+                    }
+                    if (taken) {
+                        ggml_cuda_sj_kvarn_lowbits_width<bits_k | 8,bits_v,rot>(ctx,dst);
+                        return;
+                    }
+                }
+            }
             if (sj_kvarn_trellis_words()) {
                 sj_kvarn_trellis_words_note();
                 ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k | 8,bits_v,rot>(ctx,dst);
@@ -207,7 +486,8 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
         } else {
             GGML_ABORT("SJ-KVaRN trellis body on a %d/%d pair (trellis needs 3/3, 3/2, 2/2 or the 4/4 trellis4 body)", bits_k, bits_v);
         }
-    } else if (dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct()) {
+    } else if (dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct() && !ggml_cuda_lsa_page_full_stage(dst->src[5])) {
+        GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr && "SJ-KVaRN scalar low-bit width kernel writes no LSE output");
         ggml_cuda_sj_kvarn_lowbits_width<bits_k,bits_v,rot>(ctx,dst);
     } else {
         ggml_cuda_lowbits_prefill_case<256,256,8,8,bits_k,bits_v,rot>(ctx,dst);
@@ -253,12 +533,17 @@ static void ggml_cuda_lowbits_case_rot(ggml_backend_cuda_context & ctx, ggml_ten
 bool ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(const ggml_tensor * dst) {
     const int bits = ggml_get_op_params_i32(dst,5);
     if (bits == ((4 << 8) | 4) || ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {
-        return true;
+        return !sj_kvarn_trellis_width_applies(dst); // [TRW] the width kernel reads the f16 mask expansion
     }
     return !(dst->src[0]->ne[1] <= 8 && !sj_kvarn_lowbits_no_direct());
 }
 
 void ggml_cuda_flash_attn_sj_kvarn_lowbits(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const bool master = ggml_cuda_qsa_clock_strip_master_map(ctx, dst->src[5]) != nullptr;
+    if (!sj_kvarn_lowbits::strip_master_prefill_fallback_safe(master, dst->src[0]->ne[1])) {
+        // Reject before fused rotation can bypass the expand executor.
+        GGML_ASSERT(ggml_cuda_flash_attn_ext_sj_kvarn_prefill_applies(ctx.device, dst));
+    }
     switch (ggml_get_op_params_i32(dst,5)) {
         case (4 << 8) | 3: ggml_cuda_lowbits_case_rot<4,3>(ctx,dst); break;
         case (3 << 8) | 3: ggml_cuda_lowbits_case_rot<3,3>(ctx,dst); break;

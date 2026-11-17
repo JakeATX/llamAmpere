@@ -1,5 +1,6 @@
 // AITk_U2 reference decode vs AITk_U (same tiles, same scale in every unit of a block, same level rule): must match exactly.
-#include "ggml-ai4.h"
+#include "../ggml/src/ggml-ai4.h"
+#include "ggml-ai4-decode.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -8,7 +9,12 @@
 int main() {
     int bad = 0;
     for (int k = 2; k <= 4; ++k) {
+        const ggml_type type = k == 2 ? GGML_TYPE_AIT2_U2 : k == 3 ? GGML_TYPE_AIT3_U2 : GGML_TYPE_AIT4_U2;
         const uint32_t C = k == 2 ? 0xC3CCD12Du : k == 3 ? 0x87D8D12Du : 0xAA73876Bu;
+        const bool registered = ggml_ai4_rate(type) == k && ggml_ai4v2_rate(type) == k && ggml_ai4_trellis_mul(type) == C &&
+            ggml_ai4_is_unit(type) && ggml_ai4_layout(type) == 1 && ggml_ai4_code(type) == 0 && ggml_ai4_scale_mul(type) > 0.0f;
+        printf("%s rate/decoder registration %s\n", ggml_type_name(type), registered ? "OK" : "FAIL");
+        bad += !registered;
         for (int64_t K : { 640, 2560 }) {
             const int64_t nb = K/AI4V2_BK;
             std::vector<uint8_t> uu(ai4x_slab_bytes_k(K, k)), v2(nb*AI4V2_BLOCK_BYTES(k));
@@ -27,6 +33,12 @@ int main() {
             std::vector<float> a(16*K), b(16*K);
             aik_dequantize_slab_c(k, C, uu.data(), a.data(), K);
             aik_dequantize_slab_v2_c(k, C, v2.data(), b.data(), K);
+            std::vector<float> decoded(16*K);
+            const bool public_decode = ggml_ai4_slab_nbytes(type, K) == v2.size() &&
+                ggml_ai4_dequantize_slab(type, v2.data(), K, 0, decoded.data()) &&
+                memcmp(decoded.data(), b.data(), b.size()*sizeof(float)) == 0;
+            printf("%s K=%lld public slab decode %s\n", ggml_type_name(type), (long long) K, public_decode ? "OK" : "FAIL");
+            bad += !public_decode;
             double ee = 0, ss = 0;
             for (size_t i = 0; i < a.size(); ++i) { ee += (a[i]-b[i])*(double)(a[i]-b[i]); ss += (double) a[i]*a[i]; }
             const double rel = sqrt(ee/ss);

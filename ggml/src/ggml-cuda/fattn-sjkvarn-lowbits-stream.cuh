@@ -54,7 +54,9 @@
 
 #include <cfloat>
 #include <climits>
+#include <cctype>
 #include <cstdlib>
+#include <string>
 
 namespace fattn_sj_kvarn_lowbits_stream {
 
@@ -80,6 +82,11 @@ constexpr int RMETA_KZ    = 2*D;                        // per-record vectors st
 constexpr int RMETA_VCH   = 4*D;
 constexpr int RMETA_BYTES = 6*D;                        // 1536, double-buffered per split
 constexpr int RMETA_CHUNKS = RMETA_BYTES/16;
+// [TRW] trellis body (template bits_k | 8, opt-in GGML_SJKVARN_TRELLIS_WIDTH=1): the issuing warps decode each fragment
+// word through the staged codebooks (fattn_sj_kvarn_trellis_lb_word_w) into four fp16 pairs, 16 bytes per word
+constexpr int TR_STRIP_BYTES = NTC*WARP_SIZE*16;           // one decoded K or V strip (8192)
+constexpr int TR_STAGE_BYTES = 2*TR_STRIP_BYTES + META_BYTES; // 16480
+constexpr int TR_NSTAGE      = 2;                           // the decode is synchronous: the ring only covers the meta copies
 
 constexpr int COL_STRIDE = D + 4; // fp32 stride of one head column in the combine buffer (bank spread)
 constexpr int SLOT_FLOATS = NCOLS2*COL_STRIDE + 2*NCOLS2; // acc + (max, sum) per column
@@ -89,11 +96,11 @@ typedef tile<16, 8, half2> T_A;  // K strip (tokens x channels) / V^T strip (cha
 typedef tile< 8, 8, half2> T_B;  // Q'^T (heads x channels) / P (heads x tokens)
 typedef tile<16, 8, float> T_C;  // KQ (tokens x heads) / O (channels x heads), fp32
 
-static __host__ __device__ __forceinline__ size_t split_bytes(const int nstage, const bool turbo4_body = false) {
-    return turbo4_body ? (size_t) nstage*TURBO4_STAGE_BYTES : (size_t) nstage*STAGE_BYTES + 2*RMETA_BYTES;
+static __host__ __device__ __forceinline__ size_t split_bytes(const int nstage, const bool turbo4_body = false, const bool trellis = false) {
+    return turbo4_body ? (size_t) nstage*TURBO4_STAGE_BYTES : (size_t) nstage*(trellis ? TR_STAGE_BYTES : STAGE_BYTES) + 2*RMETA_BYTES;
 }
-static __host__ __device__ __forceinline__ size_t ring_bytes(const int nsplit, const int nstage, const bool turbo4_body = false) {
-    return (size_t) nsplit * split_bytes(nstage, turbo4_body);
+static __host__ __device__ __forceinline__ size_t ring_bytes(const int nsplit, const int nstage, const bool turbo4_body = false, const bool trellis = false) {
+    return (size_t) nsplit * split_bytes(nstage, turbo4_body, trellis);
 }
 
 // barrier among the NT row-warps of one KV split (named barriers 1..KW; 0 is __syncthreads)
@@ -229,7 +236,15 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
     const int hcol  = lane >> 2;     // the lane's head column (B/C fragment row)
     const bool hvalid = hcol < gqa;
 
+    // [TRW] bits_k | 8: 2/3-bit trellis body, values from the staged codebooks (make_ctx strips the flag; record layout,
+    // metadata offsets and the fragment (token, channel) map are those of the scalar 3/3 record)
+    constexpr bool trellis = (bits_k & 8) != 0;
+    constexpr int  BK      = bits_k & 7;
+    static_assert(!trellis || (!turbo4_body && BK >= 2 && BK <= 3 && bits_v >= 2 && bits_v <= 3), "trellis width body: 2/3-bit pairs");
     const fattn_sj_kvarn_lowbits_ctx kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, D, bits_k, bits_v, nb12, nb22);
+    if constexpr (trellis) {
+        fattn_sj_kvarn_trellis_cb_stage<BK, bits_v>(); // block-wide, ends in __syncthreads (no thread has returned yet)
+    }
     const int n_kv_pad = ne11;
     const int G16 = kv.G/16;
 
@@ -252,13 +267,15 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
     const char  * Kh = K + (size_t) z_KV*nb12;
     const char  * Vh = V + (size_t) z_KV*nb22;
 
-    constexpr int stage_bytes = turbo4_body ? TURBO4_STAGE_BYTES : STAGE_BYTES;
+    constexpr int stage_bytes = turbo4_body ? TURBO4_STAGE_BYTES : trellis ? TR_STAGE_BYTES : STAGE_BYTES;
+    constexpr int body_stage_bytes = trellis ? TR_STAGE_BYTES : STAGE_BYTES; // rmeta offset (turbo4 has no rmeta)
+    constexpr int meta_off  = trellis ? 2*TR_STRIP_BYTES : 2*STRIP_BYTES;    // Ktok, Vscale, Vzero inside a stage
     static_assert(NSTAGE*stage_bytes >= EXACT_BYTES, "the ring must hold one exact K or V strip");
     static_assert(NSTAGE <= 6, "a record (G >= 96 tokens) must span more strips than the issue lead, see rmeta");
-    char * ring = smem + (size_t) kw*split_bytes(NSTAGE, turbo4_body); // shared by the NT row-warps of this split
-    char * rmeta = ring + NSTAGE*STAGE_BYTES;              // [2][RMETA_BYTES]: record g's vectors in buffer g&1
+    char * ring = smem + (size_t) kw*split_bytes(NSTAGE, turbo4_body, trellis); // shared by the NT row-warps of this split
+    char * rmeta = ring + NSTAGE*body_stage_bytes;         // [2][RMETA_BYTES]: record g's vectors in buffer g&1
     const uint32_t ring_s = ggml_cuda_cvta_generic_to_shared(ring);
-    const uint32_t rmeta_s = ring_s + NSTAGE*STAGE_BYTES;
+    const uint32_t rmeta_s = ring_s + NSTAGE*body_stage_bytes;
     auto sync_split = [&]() {
         if (NT == 1) {
             __syncwarp();
@@ -278,6 +295,13 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
     float kq_sum[2] = {0.0f, 0.0f};
     float ps[2] = {0.0f, 0.0f}; // sum of the fp16 P' values of the record (per head column, lane partial)
     float pz[2] = {0.0f, 0.0f}; // sum of P*Vzero of the record
+    // [TRW] trellis: the current record's Vch pairs (channels 16c + lane/4, +8) in registers, so record_change never reads
+    // the old record's rmeta buffer (with dead-strip skipping, the 1-strip issue lead may already have refilled it)
+    uint32_t vch_reg[NTC];
+#pragma unroll
+    for (int c = 0; c < NTC; ++c) {
+        vch_reg[c] = 0;
+    }
 
     // Q for the lane's column, scaled: channel pairs 16c + 2(lane%4) (+8) as fp32
     auto load_q = [&](const int c, float2 & q0, float2 & q1) {
@@ -308,6 +332,13 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
             qp[c].x[0] = __hmul2(__floats2half2_rn(q0.x, q0.y), ks0);
             qp[c].x[1] = __hmul2(__floats2half2_rn(q1.x, q1.y), ks1);
             cr += q0.x*kz0.x + q0.y*kz0.y + q1.x*kz1.x + q1.y*kz1.y;
+        }
+        if constexpr (trellis) {
+            const uint32_t * vn = (const uint32_t *) (rm + RMETA_VCH + 2*((lane >> 2)*(D/8)));
+#pragma unroll
+            for (int c = 0; c < NTC; ++c) {
+                vch_reg[c] = vn[c];
+            }
         }
         cr += __shfl_xor_sync(0xFFFFFFFF, cr, 1, WARP_SIZE);
         cr += __shfl_xor_sync(0xFFFFFFFF, cr, 2, WARP_SIZE);
@@ -349,8 +380,9 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
                 printf("[dbg] bias p0s=%g z0s=%g acc0=%g acc2=%g\n", p0s, z0s, acc[0].x[0], acc[0].x[2]);
             }
 #endif
-            const float lo0 = z0s - 1024.0f*p0s, lo1 = z1s - 1024.0f*p1s;
-            const float hi0 = 16.0f*z0s - 1024.0f*p0s, hi1 = 16.0f*z1s - 1024.0f*p1s;
+            // [TRW] trellis: the MMA saw the codebook values themselves (no 1024 bias, s = 1 on both channel halves)
+            const float lo0 = trellis ? z0s : z0s - 1024.0f*p0s, lo1 = trellis ? z1s : z1s - 1024.0f*p1s;
+            const float hi0 = trellis ? z0s : 16.0f*z0s - 1024.0f*p0s, hi1 = trellis ? z1s : 16.0f*z1s - 1024.0f*p1s;
 #pragma unroll
             for (int c = 0; c < NTC; ++c) {
                 acc[c].x[0] += lo0; acc[c].x[1] += lo1; acc[c].x[2] += hi0; acc[c].x[3] += hi1;
@@ -364,12 +396,12 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
         for (int c = 0; c < NTC; ++c) {
             float r_lo = 1.0f, r_hi = 1.0f;
             if (vo != nullptr) {
-                const float2 v = __half22float2(fattn_sj_kvarn_lowbits_u32_as_half2(vo[c])); // Vch[lo channel], Vch[hi channel]
-                r_lo = v.x; r_hi = 0.0625f*v.y;
+                const float2 v = __half22float2(fattn_sj_kvarn_lowbits_u32_as_half2(trellis ? vch_reg[c] : vo[c])); // Vch[lo channel], Vch[hi channel]
+                r_lo = v.x; r_hi = trellis ? v.y : 0.0625f*v.y;
             }
             if (vn != nullptr) {
                 const float2 v = __half22float2(fattn_sj_kvarn_lowbits_u32_as_half2(vn[c]));
-                r_lo = __fdividef(r_lo, v.x); r_hi = __fdividef(r_hi, 0.0625f*v.y);
+                r_lo = __fdividef(r_lo, v.x); r_hi = __fdividef(r_hi, trellis ? v.y : 0.0625f*v.y);
             }
 #ifdef SJKVARN_DBG
             if (c == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warp == 0 && lane == 0) {
@@ -443,10 +475,12 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
     };
 
     // Issue packed bytes and shared metadata across the split; masks remain private to each query.
-    // with_meta: also stage the record's Kscale/Kzero/Vch into rmeta buffer g&1 (first strip of a record, or the
+    // with_meta: also stage the record's Kscale/Kzero/Vch into rmeta buffer `buf` = g&1 (first strip of a record, or the
     // split's first strip); the buffer of record g-1 stays intact until record g+1 is issued, i.e. while record g
-    // has more strips than the issue lead (G/16 > NSTAGE-1)
-    auto issue = [&](const cursor & cu, const int stage, const bool with_meta) {
+    // has more strips than the issue lead (G/16 > NSTAGE-1). [TRW] trellis: buf = parity of the record's position in the
+    // walk of live records (dead strips are skipped, so g parity no longer alternates); the 1-strip lead can then reach
+    // at most the next live record, and the old record's Vch lives in vch_reg
+    auto issue = [&](const cursor & cu, const int stage, const bool with_meta, const int buf) {
         const char * rec  = rec_of(cu);
         if constexpr (turbo4_body) {
             const char * ks = rec + cu.sl*TURBO4_STRIP_BYTES;
@@ -459,7 +493,7 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
             return;
         }
         if (with_meta) {
-            half * metadata = reinterpret_cast<half *>(ring + NSTAGE*STAGE_BYTES + (cu.g & 1)*RMETA_BYTES);
+            half * metadata = reinterpret_cast<half *>(ring + NSTAGE*body_stage_bytes + buf*RMETA_BYTES);
             for (int i = nt*WARP_SIZE + lane; i < 3*D; i += NT*WARP_SIZE) {
                 const bool is_v = i >= 2*D;
                 const int slot = i % D;
@@ -469,19 +503,37 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
                 metadata[i] = reinterpret_cast<const half *>(rec + offset)[channel];
             }
         }
-        uint32_t * codes = reinterpret_cast<uint32_t *>(ring + stage*STAGE_BYTES);
-        for (int word = nt*WARP_SIZE + lane; word < STRIP_BYTES/4; word += NT*WARP_SIZE) {
-            const int source_word = cu.sl*(STRIP_BYTES/4) + word;
-            codes[word] = sj_kvarn_lowbits::fragment_word<bits_k, false>(reinterpret_cast<const uint8_t *>(rec), source_word);
-            codes[STRIP_BYTES/4 + word] = sj_kvarn_lowbits::fragment_word<bits_v, true>(reinterpret_cast<const uint8_t *>(rec + kv.v_payload), source_word);
+        if constexpr (trellis) {
+            // [TRW] word w of the strip -> 16 bytes at 16*w (K) and TR_STRIP_BYTES + 16*w (V): the lane's four A pairs
+            uint4 * vals = reinterpret_cast<uint4 *>(ring + stage*TR_STAGE_BYTES);
+            const uint8_t * kp = reinterpret_cast<const uint8_t *>(rec);
+            const uint8_t * vp = reinterpret_cast<const uint8_t *>(rec + kv.v_payload);
+            for (int word = nt*WARP_SIZE + lane; word < STRIP_BYTES/4; word += NT*WARP_SIZE) {
+                const int source_word = cu.sl*(STRIP_BYTES/4) + word;
+                half2 qk[4], qv[4];
+                fattn_sj_kvarn_trellis_lb_word_w<BK, false>(kp, source_word, qk);
+                fattn_sj_kvarn_trellis_lb_word_w<bits_v, true>(vp, source_word, qv);
+                uint4 uk, uv;
+                memcpy(&uk, qk, 16);
+                memcpy(&uv, qv, 16);
+                vals[word] = uk;
+                vals[STRIP_BYTES/4 + word] = uv;
+            }
+        } else {
+            uint32_t * codes = reinterpret_cast<uint32_t *>(ring + stage*STAGE_BYTES);
+            for (int word = nt*WARP_SIZE + lane; word < STRIP_BYTES/4; word += NT*WARP_SIZE) {
+                const int source_word = cu.sl*(STRIP_BYTES/4) + word;
+                codes[word] = sj_kvarn_lowbits::fragment_word<bits_k, false>(reinterpret_cast<const uint8_t *>(rec), source_word);
+                codes[STRIP_BYTES/4 + word] = sj_kvarn_lowbits::fragment_word<bits_v, true>(reinterpret_cast<const uint8_t *>(rec + kv.v_payload), source_word);
+            }
         }
-        const uint32_t dst_s = ring_s + stage*STAGE_BYTES;
+        const uint32_t dst_s = ring_s + stage*body_stage_bytes;
         for (int m = nt*WARP_SIZE + lane; m < META_BYTES/16; m += NT*WARP_SIZE) {
             const int half_off = 16*(m & 1);
             const char * src = m < 2 ? rec + kv.k_tok + cu.sl*32 + half_off
                 : m < 4 ? rec + kv.v_scale + cu.sl*32 + half_off
                 : rec + kv.v_zero + cu.sl*32 + half_off;
-            cp_async_cg_16<0>(dst_s + 2*STRIP_BYTES + 16*m, src);
+            cp_async_cg_16<0>(dst_s + meta_off + 16*m, src);
         }
         cp_async_commit();
     };
@@ -566,16 +618,49 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
         setup_exact();
     }
 
-    cursor ci = cursor_init(16*s_lo);   // issue cursor, NSTAGE-1 strips ahead
+    // [TRW] trellis: body strips whose mask is -inf for every query row of the block are skipped before any byte of
+    // them is read (exact: such a strip adds exp(-inf) = 0 to the sums and leaves the running max alone; the tile
+    // build's GGML_SJKVARN_TILE_SKIP). LSA drops unpicked records this way, so their records are never fetched. Every
+    // warp of the split reads the same NT mask rows, so all of them walk the same strips.
+    const int p_end = 16*s_hi;
+    auto strip_live = [&](const int p0) -> bool {
+        bool live = false;
+        for (int r = lane >> 4; r < NT; r += 2) {
+            live |= __half2float(((const half *) (mask + (size_t) r*nb31))[p0 + (lane & 15)]) != -INFINITY;
+        }
+        return __any_sync(0xFFFFFFFF, live);
+    };
+    auto skip_dead = [&](cursor & cu) {
+        if constexpr (trellis) {
+            while (cu.p0 < p_end && !strip_live(cu.p0)) {
+                cursor_next(cu);
+            }
+        }
+    };
+
+    cursor ci = cursor_init(16*s_lo);   // issue cursor, NSTAGE-1 (live) strips ahead
+    skip_dead(ci);
     cursor cc = ci;                      // compute cursor
     int stage_i = 0;                     // ring stage of the issue cursor
     int stage_c = 0;                     // ring stage of the compute cursor
+    int g_i = INT_MIN, seq_i = -1;       // [TRW] last issued record and its position in the live-record walk
+    auto issue_next = [&](const bool first) {
+        if constexpr (trellis) {
+            const bool new_rec = ci.g != g_i;
+            seq_i += new_rec ? 1 : 0;
+            g_i = ci.g;
+            issue(ci, stage_i, new_rec, seq_i & 1);
+        } else {
+            issue(ci, stage_i, first || ci.sl == 0, ci.g & 1);
+        }
+        cursor_next(ci);
+        skip_dead(ci);
+        stage_i = stage_i + 1 == NSTAGE ? 0 : stage_i + 1;
+    };
 #pragma unroll
     for (int i = 0; i < NSTAGE - 1; ++i) {
-        if (s_lo + i < s_hi) {
-            issue(ci, stage_i, i == 0 || ci.sl == 0);
-            cursor_next(ci);
-            stage_i = stage_i + 1 == NSTAGE ? 0 : stage_i + 1;
+        if (ci.p0 < p_end) { // non-trellis: == s_lo + i < s_hi
+            issue_next(i == 0);
         } else {
             cp_async_commit();
         }
@@ -583,13 +668,12 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
 
     int          cur_id  = INT_MIN; // record index
     const char * cur_rm  = nullptr; // its staged vectors
+    int          seq_c   = -1;      // [TRW] position of cur_id in the live-record walk
 
-    for (int s = s_lo; s < s_hi; ++s) {
+    while (cc.p0 < p_end) { // non-trellis: strips s = s_lo .. s_hi-1 with cc.p0 = 16*s
         // refill the stage consumed by strip s-1 (freed by the barrier that ended it)
-        if (s + NSTAGE - 1 < s_hi) {
-            issue(ci, stage_i, ci.sl == 0);
-            cursor_next(ci);
-            stage_i = stage_i + 1 == NSTAGE ? 0 : stage_i + 1;
+        if (ci.p0 < p_end) { // non-trellis: == s + NSTAGE - 1 < s_hi
+            issue_next(false);
         } else {
             cp_async_commit();
         }
@@ -603,7 +687,7 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
 #endif
 
         const int    id = cc.g;
-        const char * rm = rmeta + (id & 1)*RMETA_BYTES;
+        const char * rm = rmeta + ((trellis ? seq_c + (id != cur_id ? 1 : 0) : id) & 1)*RMETA_BYTES;
 #ifdef SJKVARN_STREAM_DBG_TIME
         dbg_nrec += id != cur_id ? 1 : 0;
 #endif
@@ -614,6 +698,7 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
             setup_body(rm);
             cur_id = id;
             cur_rm = rm;
+            seq_c += 1;
         }
 #ifdef SJKVARN_STREAM_DBG_TIME
         { const long long t = clock64(); dbg_rec += t - dbg_ts; dbg_ts = t; }
@@ -651,21 +736,28 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
             }
         } else {
             T_C kq;
-            const char * st = ring + stage_c*STAGE_BYTES;
+            const char * st = ring + stage_c*body_stage_bytes;
             const uint32_t * kwp = (const uint32_t *) st + lane;
             const uint32_t * vwp = (const uint32_t *) (st + STRIP_BYTES) + lane;
+            const uint4    * kvp = (const uint4 *) st + lane;                   // [TRW] decoded K words
+            const uint4    * vvp = (const uint4 *) (st + TR_STRIP_BYTES) + lane; // [TRW] decoded V words
 
             // KQ = Ktok[t] * (q . Q' + c_r) + mask
 #pragma unroll
             for (int c = 0; c < NTC; ++c) {
                 T_A a;
-                decode_pairs(kwp[c*WARP_SIZE], magic, a.x);
+                if constexpr (trellis) {
+                    const uint4 u = kvp[c*WARP_SIZE];
+                    memcpy(a.x, &u, 16);
+                } else {
+                    decode_pairs(kwp[c*WARP_SIZE], magic, a.x);
+                }
                 mma(kq, a, qp[c]);
             }
-            const half * ktok = (const half *) (st + META_KTOK);
+            const half * ktok = (const half *) (st + meta_off);
             const half * mk   = (const half *) mrow + cc.p0;
-            const half * vsh  = (const half *) (st + META_VS);
-            const half * vzh  = (const half *) (st + META_VZ);
+            const half * vsh  = (const half *) (st + meta_off + 32);
+            const half * vzh  = (const half *) (st + meta_off + 64);
             const float tok0 = __half2float(ktok[lane >> 2]);
             const float tok1 = __half2float(ktok[(lane >> 2) + 8]);
             const float mk0  = __half2float(mk[lane >> 2]);
@@ -683,20 +775,27 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
             const half2 vs_b1 = *(const half2 *) (vsh + 2*(lane & 3) + 8);
             P.x[0] = __hmul2(P.x[0], vs_b0);
             P.x[1] = __hmul2(P.x[1], vs_b1);
-            const half2 vs_c = __halves2half2(vsh[lane >> 2], vsh[(lane >> 2) + 8]);
             const float2 vz_c = make_float2(__half2float(vzh[lane >> 2]), __half2float(vzh[(lane >> 2) + 8]));
-            const float2 pe0 = __half22float2(__hmul2(make_half2(kq.x[0], kq.x[2]), vs_c));
-            const float2 pe1 = __half22float2(__hmul2(make_half2(kq.x[1], kq.x[3]), vs_c));
-            ps[0] += pe0.x + pe0.y;
-            ps[1] += pe1.x + pe1.y;
+            if constexpr (!trellis) { // [TRW] no code bias to cancel
+                const half2 vs_c = __halves2half2(vsh[lane >> 2], vsh[(lane >> 2) + 8]);
+                const float2 pe0 = __half22float2(__hmul2(make_half2(kq.x[0], kq.x[2]), vs_c));
+                const float2 pe1 = __half22float2(__hmul2(make_half2(kq.x[1], kq.x[3]), vs_c));
+                ps[0] += pe0.x + pe0.y;
+                ps[1] += pe1.x + pe1.y;
+            }
             pz[0] += kq.x[0]*vz_c.x + kq.x[2]*vz_c.y;
             pz[1] += kq.x[1]*vz_c.x + kq.x[3]*vz_c.y;
 
-            // acc += raw V codes . P' (units Vch*s)
+            // acc += raw V codes . P' (units Vch*s); [TRW] trellis: codebook values . P' (units Vch)
 #pragma unroll
             for (int c = 0; c < NTC; ++c) {
                 T_A a;
-                raw_pairs(vwp[c*WARP_SIZE], magic, a.x);
+                if constexpr (trellis) {
+                    const uint4 u = vvp[c*WARP_SIZE];
+                    memcpy(a.x, &u, 16);
+                } else {
+                    raw_pairs(vwp[c*WARP_SIZE], magic, a.x);
+                }
                 mma(acc[c], a, P);
             }
         }
@@ -705,6 +804,7 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
 #endif
         sync_split(); // everyone is done with the stage of strip s
         cursor_next(cc);
+        skip_dead(cc);
         stage_c = stage_c + 1 == NSTAGE ? 0 : stage_c + 1;
     }
     if (!turbo4_body && cur_id != INT_MIN) {
@@ -944,22 +1044,29 @@ static __global__ void flash_attn_ext_sj_kvarn_lowbits_stream(
 
 
 // Dedicated lower-bit instantiations leave the selected 4/4 kernels unchanged.
+// [TRW] bits_k | 8: trellis body (2-stage ring of decoded strips, staged codebooks in static shared memory)
 template<int max_warps, int bits_k, int bits_v, bool rot = false>
 static void ggml_cuda_sj_kvarn_lowbits_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int nt, int kw) {
     using namespace fattn_sj_kvarn_lowbits_stream;
-    constexpr int stages = 6;
+    constexpr bool trellis = (bits_k & 8) != 0;
+    constexpr int stages = trellis ? TR_NSTAGE : 6;
     fattn_kernel_t kernel = flash_attn_ext_sj_kvarn_lowbits_stream<max_warps, stages, bits_k, bits_v, false, rot>;
     const int id = ggml_cuda_get_device();
     // #139: the rot build plans its grid from the plain build's occupancy (register counts differ), so both launch alike
     fattn_kernel_t plain = flash_attn_ext_sj_kvarn_lowbits_stream<max_warps, stages, bits_k, bits_v, false, false>;
-    const size_t shared = std::max(ring_bytes(kw, stages), (size_t) nt*(kw/2)*SLOT_BYTES);
+    const size_t shared = std::max(ring_bytes(kw, stages, false, trellis), (size_t) nt*(kw/2)*SLOT_BYTES);
     static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
     if (!initialized[id]) {
-        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                       (int) ggml_cuda_info().devices[id].smpbo));
+        // [TRW] the dynamic limit plus the kernel's static shared memory (trellis: the 2 KB codebook copy) must fit smpbo
+        auto raise = [&](fattn_kernel_t k) {
+            cudaFuncAttributes attr;
+            CUDA_CHECK(cudaFuncGetAttributes(&attr, reinterpret_cast<const void *>(k)));
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(k), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           (int) (ggml_cuda_info().devices[id].smpbo - (trellis ? attr.sharedSizeBytes : 0))));
+        };
+        raise(kernel);
         if (rot) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(plain), cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           (int) ggml_cuda_info().devices[id].smpbo));
+            raise(plain);
         }
         initialized[id] = true;
     }
@@ -967,6 +1074,23 @@ static void ggml_cuda_sj_kvarn_lowbits_launch(ggml_backend_cuda_context & ctx, g
         false, false, false, false, WARP_SIZE, 0, rot ? plain : nullptr);
 }
 
+// trellis width route only: GGML_SJKVARN_TRELLIS_W5_MW8 (default on, Jake 2026-11-14; =0/off/false/no turns it off) runs
+// n_q = 5 on the mw = 8 instance (ptxas: mw 5 spills ~2x mw 8)
+static bool sj_kvarn_trellis_w5_mw8() {
+    // the first read happens on the first trellis n_q = 5 call, so the line proves the mw 8 launch was taken
+    static const bool v = [] {
+        const char * e = getenv("GGML_SJKVARN_TRELLIS_W5_MW8");
+        bool on = true;
+        if (e != nullptr && *e != 0) {
+            std::string w(e);
+            for (char & c : w) { c = (char) tolower((unsigned char) c); }
+            on = !(w == "0" || w == "off" || w == "false" || w == "no");
+        }
+        if (on) { GGML_LOG_WARN("%s: SJ-KVaRN trellis width n_q=5 runs on the mw 8 instance\n", __func__); }
+        return on;
+    }();
+    return v;
+}
 template<int bits_k, int bits_v, bool rot = false>
 static void ggml_cuda_sj_kvarn_lowbits_width(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int nt = dst->src[0]->ne[1];
@@ -985,7 +1109,7 @@ static void ggml_cuda_sj_kvarn_lowbits_width(ggml_backend_cuda_context & ctx, gg
     }
     if (nt <= 4) {
         ggml_cuda_sj_kvarn_lowbits_launch<4,bits_k,bits_v,rot>(ctx,dst,nt,nt == 1 ? 2 : 4/nt);
-    } else if (nt == 5) {
+    } else if (nt == 5 && !((bits_k & 8) && sj_kvarn_trellis_w5_mw8())) {
         ggml_cuda_sj_kvarn_lowbits_launch<5,bits_k,bits_v,rot>(ctx,dst,nt,1);
     } else {
         ggml_cuda_sj_kvarn_lowbits_launch<8,bits_k,bits_v,rot>(ctx,dst,nt,1);

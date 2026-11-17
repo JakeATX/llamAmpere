@@ -22,6 +22,7 @@ struct ggml_cuda_gated_delta_net_state_src {
     // prefix_s1 floats per sequence, slots of prefix_ingr_w floats per head, beta at prefix_off_b.
     const float *   prefix        = nullptr;
     const float *   prefix_w      = nullptr;
+    int64_t         prefix_w_s1   = 0; // floats per sequence in prefix_w: 0 = one mask for all sequences
     int64_t         prefix_s1     = 0;
     int             prefix_n      = 0;
     int             prefix_ingr_w = 0;

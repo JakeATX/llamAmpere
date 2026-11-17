@@ -38,7 +38,10 @@ using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_h
 struct llama_cparams;
 struct llama_model;
 struct llama_layer;
+struct llama_model;
 struct llama_prec_policy;
+struct llama_hadamard;
+struct llama_lsa_idx_slot;
 
 class llama_moe_cache;
 class llama_ple_prefetch;
@@ -67,12 +70,14 @@ enum llm_graph_type {
 
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
+    LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
     LLM_FUSED_OP_GDN_AR,
     LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_TOP_K_MASK,
 };
 
 
@@ -80,10 +85,12 @@ enum llm_ffn_op_type : int {
     LLM_FFN_NONE = 0,           // sentinel: unset; archs must assign before use
     LLM_FFN_SILU,
     LLM_FFN_GELU,
+    LLM_FFN_GELU_ERF,
     LLM_FFN_RELU,
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
     LLM_FFN_GEGLU,
+    LLM_FFN_GEGLU_ERF,
     LLM_FFN_REGLU,
     LLM_FFN_SWIGLU_OAI_MOE,
     LLM_FFN_SITU,           // kimi-k3
@@ -164,16 +171,17 @@ public:
     ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], mixed path: batch index of the token rows
     ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
+    ggml_tensor * embd_rows    = nullptr; // I32 [n_batch], embd row path: rows of ctx_other's layer input device buffer
 
     float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
 };
 
-// similar to llm_graph_input_embd but with an additional hidden state input
+// similar to llm_graph_input_embd but with an additional hidden state input, fed from ubatch.embd_state
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
-    llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd) {}
+    llm_graph_input_embd_h(int64_t n_embd, int64_t n_embd_state) : n_embd(n_embd), n_embd_state(n_embd_state) {}
     virtual ~llm_graph_input_embd_h() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -182,18 +190,34 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
-    ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch], the host input or the rows gathered with h_rows
+    ggml_tensor * h_rows = nullptr; // I32 [n_batch], rows of the h_nextn device buffer of ctx_state_src, nullptr on the host path
     bool h_device = false; // fork: the context supplies hidden rows by backend copy
     // [RTPORT] LLAMA_MTP_PIPELINE: the token embedding row as a device input, written on the stream by the
     // context (llama_context::mtp_pipe_input) instead of a host get_rows; F32 [n_embd_inp, 1], or nullptr
     ggml_tensor * tok_row = nullptr;
 
-    const int64_t n_embd = 0;
+    const int64_t n_embd       = 0;
+    const int64_t n_embd_state = 0;
+};
+
+// original batch index of each ubatch token, used as set_rows destination rows
+class llm_graph_input_batch_idxs : public llm_graph_input_i {
+public:
+    llm_graph_input_batch_idxs() = default;
+    virtual ~llm_graph_input_batch_idxs() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * idxs = nullptr; // I64 [n_batch]
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
-    llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
+    llm_graph_input_pos(uint32_t n_pos_per_embd, llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ)
+        : n_pos_per_embd(n_pos_per_embd), rope_section_order(rope_section_order) {}
     virtual ~llm_graph_input_pos() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -203,22 +227,26 @@ public:
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
     const uint32_t n_pos_per_embd = 1;
+    const llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ;
 };
 
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
-    llm_graph_input_attn_temp(uint32_t n_attn_temp_floor_scale, float f_attn_temp_scale, float f_attn_temp_offset)
-        : n_attn_temp_floor_scale(n_attn_temp_floor_scale), f_attn_temp_scale(f_attn_temp_scale), f_attn_temp_offset(f_attn_temp_offset) {}
+    llm_graph_input_attn_temp(uint32_t n_attn_temp_floor_scale, float f_attn_temp_scale, float f_attn_temp_offset, bool attn_temp_pow = false)
+        : n_attn_temp_floor_scale(n_attn_temp_floor_scale), f_attn_temp_scale(f_attn_temp_scale), f_attn_temp_offset(f_attn_temp_offset), attn_temp_pow(attn_temp_pow) {}
     virtual ~llm_graph_input_attn_temp() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * attn_scale = nullptr; // F32 [n_batch]
 
     const uint32_t n_attn_temp_floor_scale;
     const float    f_attn_temp_scale;
     const float    f_attn_temp_offset;
+    const bool     attn_temp_pow;
 };
 
 class llm_graph_input_pos_bucket : public llm_graph_input_i {
@@ -361,11 +389,14 @@ public:
     ggml_tensor * s_copy_conv_main = nullptr; // I32 [n_seqs] view
     ggml_tensor * s_copy_pair      = nullptr; // I32 [n_rs]
     ggml_tensor * s_copy_pair_main = nullptr; // I32 [n_seqs] view
-    ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq]
+    ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq], or [n_rs_seq, n_seqs] per lane ([TAG_GDN_REPLAY_LANES])
 
     // fill every rs input (s_copy and the shift or ring tensors) from the memory context; exactly
     // once per ubatch -- both fills consume the pending rollback
     void fill_s_copy(const llama_memory_recurrent_context * m);
+
+    // [TAG_GDN_REPLAY_LANES] 2-D replay_w: w, s_copy_conv and s_copy_pair per lane, from the filled s_copy data
+    void fill_replay_lanes(const llama_memory_recurrent_context * m, const int32_t * data, int64_t n_rs);
 
     // can_reuse's replay check: the replay fields must match unless replay_w makes them data (then
     // they and span_new are refreshed from the new context)
@@ -385,6 +416,19 @@ public:
     const llama_cross * cross;
 };
 
+// KQ mask and the optional per-sequence cell rows of a unified cache (see ggml_flash_attn_ext_rows)
+// the mask has two shapes depending on whether `rows` is used:
+//   rows != nullptr: [n_kv_rows, n_batch/n_slices, 1, n_slices]
+//   rows == nullptr: [n_kv,      n_batch/n_stream, 1, n_stream]
+struct llm_attn_mask {
+    ggml_tensor * raw  = nullptr;
+    ggml_tensor * rows = nullptr; // I32 [n_kv_rows, n_slices]
+    uint32_t      n_kv = 0;
+
+    // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
+    bool block_uniform = false;
+};
+
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
 public:
     llm_graph_input_attn_no_cache(const llama_hparams & hparams, const llama_cparams & cparams) :
@@ -395,14 +439,9 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
-    ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
-
-    // n_tokens == n_batch
-    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_tokens, n_batch/n_stream, 1, n_stream]
+    // n_tokens == n_batch, n_kv == n_tokens padded to 256
+    llm_attn_mask self_attn_mask;
+    llm_attn_mask self_attn_mask_swa;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -427,17 +466,14 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
-    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
-
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    llm_attn_mask self_attn_mask;
 
     // note: assumes v_rot^2 == I
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_v_rot = nullptr;
+    std::vector<ggml_tensor *> self_k_rot;
+    std::vector<ggml_tensor *> self_v_rot;
 
     // SJ-KVaRN: I32 region descriptor (sink/ring/body bounds for this ubatch), nullptr unless the cache is SJ-KVaRN
     ggml_tensor * self_sj_kvarn_desc = nullptr;
@@ -445,6 +481,94 @@ public:
     // multi-stream SJ-KVaRN: attended (padded) position count per stream of the ubatch; one FA node per stream
     std::vector<uint32_t> sj_kvarn_n_kv_streams;
     bool skip_unused = false; // fork: KV-only device-input graphs do not consume attention geometry
+
+    // LSA probe (llama-lsa.h): F32 [n_kv, 1] position of each KV cell (1e9 for empty cells) and F32 [1, n_tokens]
+    // position of each query row; nullptr unless LLAMA_LSA_MODE is set
+    ggml_tensor * lsa_cell_pos = nullptr;
+    ggml_tensor * lsa_q_pos    = nullptr;
+    // LLAMA_LSA_PACKED=1 with the packed (I32 bit) KQ mask on: F16 dense mask [n_kv, n_tokens/n_stream, 1, n_stream]
+    // that only the LSA layers start from; every other layer keeps the packed mask. nullptr otherwise
+    ggml_tensor * lsa_kq_mask  = nullptr;
+    // SJ-KVaRN cache (index cache only): I64 [n_tokens] index-cache row of each query row (cell == position there,
+    // while the K store goes to ring rows); nullptr on plain caches
+    ggml_tensor * lsa_q_cell   = nullptr;
+    // LLAMA_LSA_J3: built once per graph and shared by every stale-query prediction (each fresh reshape of a host
+    // input is its own split input, so per-target views uploaded the mask and cell positions 26 times per token)
+    ggml_tensor * lsa_j3_mk2   = nullptr; // [n_kv, T] view of the KQ mask
+    ggml_tensor * lsa_j3_force = nullptr; // [n_kv/F, T or 1] units forced by sinks and the window
+    // what the two were built from: reused only while every key matches (a layer with another mask, position
+    // input, window, sinks or unit size builds its own)
+    const ggml_tensor * lsa_j3_mk2_src  = nullptr; // kq_mask
+    const ggml_tensor * lsa_j3_force_cp = nullptr; // lsa_cell_pos
+    const ggml_tensor * lsa_j3_force_qp = nullptr; // lsa_q_pos
+    int64_t lsa_j3_force_key[3] = {0, 0, 0};       // F, window, sinks
+    // LSA index cache (LLAMA_LSA_IDX_CACHE=1): layers this graph rebuilds from the K cache; committed as valid
+    // in set_input (so reserve graphs, which never run set_input, cannot mark a cache valid)
+    std::vector<std::pair<const ggml_tensor *, uint64_t>> lsa_idx_commit;
+    std::vector<std::pair<const ggml_tensor *, uint64_t>> lsa_mean_commit; // LLAMA_LSA_COMP=2 block-mean caches rebuilt
+    // LLAMA_LSA_PICK_EVERY: per layer pick/reuse decisions of this graph, committed in set_input
+    // expire = a ubatch with more than one sequence touched this layer without the pick cache: the next graph re-picks
+    struct lsa_pick_rec { const ggml_tensor * k; uint64_t gen; bool reuse; int64_t pos0, edge, nbs; int32_t seq; bool expire = false; };
+    mutable std::vector<lsa_pick_rec> lsa_pick_commit; // filled while the graph is built (const inp)
+    // LLAMA_LSA_BLOCK_SUM: I32 [n_tokens] summary block of each row's index row (filled after the row tensor), the
+    // summary block count it is clamped to, and the current layer's updated summaries (set by build_attn_lsa_idx for
+    // layer lsa_sum_il, read by build_attn_lsa_mask of the same layer)
+    ggml_tensor * lsa_q_blk    = nullptr;
+    int64_t       lsa_n_blk    = 0;
+    // LLAMA_LSA_COMP=2 block-mean refresh (llama_lsa_set_mean_inputs): distinct blocks of this ubatch, their staging-ring
+    // blocks and each row's staging-ring row (the last two on SJ-KVaRN only, ring of lsa_ring_n rows)
+    ggml_tensor * lsa_u_blk    = nullptr;
+    ggml_tensor * lsa_u_rblk   = nullptr;
+    ggml_tensor * lsa_q_ring   = nullptr;
+    int64_t       lsa_ring_n   = 0;
+    uint64_t      lsa_graph_gen = 0;  // llama_lsa_graph_gen() and first position at graph build (LLAMA_LSA_GRAPH_REUSE)
+    int64_t       lsa_pos0      = 0;
+    bool          lsa_ring_rows = false; // carry ring (not LLAMA_LSA_RING_LEGACY): u_rblk/q_ring as in llama_lsa_set_mean_inputs
+    ggml_tensor * lsa_smax_cur = nullptr;
+    ggml_tensor * lsa_smin_cur = nullptr;
+    int           lsa_sum_il   = -1;
+    // per-KV-head summaries (LLAMA_LSA_PER_HEAD=1 on SJ-KVaRN): one updated F16 [d_idx, n_blk] plane per head
+    std::vector<ggml_tensor *> lsa_smax_h;
+    std::vector<ggml_tensor *> lsa_smin_h;
+    // LLAMA_LSA_BLOCK_SUM: per-ubatch base mask F32 [n_kv, T] (kq_mask at sinks / window / rows before min_pos,
+    // kq_mask - 1e30 elsewhere), built by the first LSA layer and shared by the rest; keyed by the kq_mask it came from
+    mutable ggml_tensor *       lsa_blk_base     = nullptr;
+    mutable const ggml_tensor * lsa_blk_base_src = nullptr;
+    // LLAMA_LSA_COMP=2: causally visible cells per B-cell block F32 [nbs, T] (sum of exp(kq_mask), kq_mask is 0 / -inf),
+    // built by the first compensated layer and shared by the rest; keyed by the kq_mask it came from
+    mutable ggml_tensor *       lsa_comp_vis     = nullptr;
+    mutable const ggml_tensor * lsa_comp_vis_src = nullptr;
+    // block pick -> COMP=2: visible droppable cells per block (once per graph) and the layer's dropped counts, valid
+    // only for the mask tensor they were built with (lsa_comp_nd_mask)
+    mutable ggml_tensor *       lsa_blk_dcnt     = nullptr;
+    mutable const ggml_tensor * lsa_blk_dcnt_src = nullptr;
+    mutable ggml_tensor *       lsa_comp_nd      = nullptr;
+    mutable const ggml_tensor * lsa_comp_nd_mask = nullptr;
+    // LLAMA_LSA_VK: lsa_blk_dcnt + 1 (once per graph), keyed by the count it came from
+    mutable ggml_tensor *       lsa_vk_dcnt1     = nullptr;
+    mutable const ggml_tensor * lsa_vk_dcnt1_src = nullptr;
+    // LLAMA_LSA_BLKLIST: the per-graph F16 mask with GGML_LSA_MASK_SEL at visible droppable cells (keyed by the base A)
+    mutable ggml_tensor *       lsa_blk_m3       = nullptr;
+    mutable const ggml_tensor * lsa_blk_m3_src   = nullptr;
+    // LLAMA_LSA_REFINE + FUSED_SEL: visible droppable cells per F-cell unit (once per graph, keyed by the base mask)
+    mutable ggml_tensor *       lsa_unit_dcnt     = nullptr;
+    mutable const ggml_tensor * lsa_unit_dcnt_src = nullptr;
+    mutable ggml_tensor *       lsa_cpos_u        = nullptr; // LLAMA_LSA_UNIT_OP: first-cell position of each F-cell unit
+    mutable int64_t             lsa_cpos_u_f      = 0;
+
+    // LLAMA_LSA_MULTI=1 (opt-in): the stream (= sequence; SJ-KVaRN keeps one stream per sequence) whose LSA side caches
+    // this input set addresses; a ubatch with several streams gets one LSA input set per stream in lsa_streams (only
+    // their lsa_* fields are used, sized for that stream's rows and attended length) and none of its own
+    int32_t lsa_stream = 0;
+    std::vector<std::shared_ptr<llm_graph_input_attn_kv>> lsa_streams; // shared: the input is copied by some model builders
+    int64_t lsa_sub_s  = 0; // this set's stream chunk of the parent ubatch (rows [s*T/ns, (s+1)*T/ns))
+    int64_t lsa_n_kv_s = 0; // attended (padded) positions of that stream
+    std::vector<llama_pos> lsa_sub_pos; // build-time sub-ubatch of that chunk (llm_graph_context::lsa_ubatch)
+    llama_ubatch           lsa_sub_ub = {};
+    mutable ggml_tensor *       lsa_sub_mask     = nullptr; // the stream's [n_kv_s, T/ns] slice of the KQ mask (once per graph)
+    mutable const ggml_tensor * lsa_sub_mask_src = nullptr;
+    // the LSA part of set_input (also used by llm_graph_input_mem_hybrid): positions, rows, ring slots, commits
+    void set_input_lsa(const llama_kv_cache_context * kv, const llama_ubatch * ubatch);
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -478,12 +602,9 @@ public:
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
-    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
-
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    llm_attn_mask self_attn_mask;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -513,18 +634,13 @@ public:
     ggml_tensor * get_k_idxs_mla() const { return self_k_idxs_mla; }
     ggml_tensor * get_k_idxs_lid() const { return self_k_idxs_lid; }
 
-    ggml_tensor * get_kq_mask_mla() const { return self_kq_mask_mla_cnv; }
-    ggml_tensor * get_kq_mask_lid() const { return self_kq_mask_lid; }
-
     ggml_tensor * self_k_idxs_mla = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_lid = nullptr; // I64 [n_batch]
 
-    ggml_tensor * self_kq_mask_mla     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_mla_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_lid     = nullptr; // F32     [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_lid_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    llm_attn_mask self_attn_mask_mla;
+    llm_attn_mask self_attn_mask_lid;
 
-    ggml_tensor * self_k_rot_lid = nullptr;
+    std::vector<ggml_tensor *> self_k_rot_lid;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -599,24 +715,19 @@ public:
     ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
     ggml_tensor * get_v_idxs_swa() const { return self_v_idxs_swa; }
 
-    ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
-    ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
-
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs_swa = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    llm_attn_mask self_attn_mask;
+    llm_attn_mask self_attn_mask_swa;
 
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_v_rot = nullptr;
+    std::vector<ggml_tensor *> self_k_rot;
+    std::vector<ggml_tensor *> self_v_rot;
 
-    ggml_tensor * self_k_rot_swa = nullptr;
-    ggml_tensor * self_v_rot_swa = nullptr;
+    std::vector<ggml_tensor *> self_k_rot_swa;
+    std::vector<ggml_tensor *> self_v_rot_swa;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -643,19 +754,14 @@ public:
     ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
     ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
 
-    ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
-    ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
-
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
 
-    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    llm_attn_mask self_attn_mask;
+    llm_attn_mask self_attn_mask_swa;
 
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_k_rot_swa = nullptr;
+    std::vector<ggml_tensor *> self_k_rot;
+    std::vector<ggml_tensor *> self_k_rot_swa;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -677,14 +783,12 @@ public:
     void set_input(const llama_ubatch * ubatch);
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
-    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    llm_attn_mask self_attn_mask;
 
-    ggml_tensor * self_k_rot = nullptr;
+    std::vector<ggml_tensor *> self_k_rot;
 
     const llama_cparams cparams;
 
@@ -707,7 +811,7 @@ public:
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
 
-        ggml_tensor * k_rot      = nullptr;
+        std::vector<ggml_tensor *> k_rot;
     };
 
     llm_graph_input_dsv4(
@@ -747,10 +851,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * get_kq_mask_cross() const { return cross_kq_mask_cnv; }
 
-    ggml_tensor * cross_kq_mask     = nullptr; // F32/F16 [n_outputs_enc, n_batch, 1, 1]
-    ggml_tensor * cross_kq_mask_cnv = nullptr; // F32/F16 [n_outputs_enc, n_batch, 1, 1]
+    llm_attn_mask cross_attn_mask;
 
     const llama_cross * cross = nullptr;
 };
@@ -914,7 +1016,7 @@ struct llm_b1_ffn {
 };
 
 struct llm_graph_params {
-    llm_arch arch = LLM_ARCH_UNKNOWN;
+    const llama_model * model = nullptr;
 
     llama_hparams hparams;
     llama_cparams cparams;
@@ -935,6 +1037,13 @@ struct llm_graph_params {
     const llama_moe_cache        * moe_cache;
 
     const llama_prec_policy * prec_policy = nullptr;
+
+    const llama_hadamard * hdmd = nullptr;
+
+    ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
+    ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
+    ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
+    ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -973,8 +1082,7 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
-    // owning model (EXL3 side tensors for build_lora_mm); may be null for graphs that carry no EXL3 weights
-    const llama_model * model = nullptr;
+    // fork: the owning model (EXL3 side tensors for build_lora_mm) is the upstream `model` member at the top
 
     // [B1] layer-major prefill (LLAMA_B1, qwen4exp): build only the layers [b1_il0, b1_il1) (b1_il1 < 0: to the end).
     // A range that starts above layer 0 reads the hidden state from b1_carry, a range that stops before the last layer
@@ -1015,7 +1123,9 @@ struct llm_graph_params {
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
                 (ubatch.token && other.ubatch.token && ubatch.embd && other.ubatch.embd)
-            );
+            ) &&
+            (!ubatch.embd_state == !other.ubatch.embd_state) &&
+            (!ubatch.embd_row   == !other.ubatch.embd_row);
 
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
@@ -1081,7 +1191,11 @@ struct llm_graph_params {
             cparams.mtp_chain               == other.cparams.mtp_chain               &&
             cparams.mtp_chain_top_k         == other.cparams.mtp_chain_top_k         &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
-            arch  == other.arch  &&
+            layer_inp_dev == other.layer_inp_dev &&
+            layer_inp_src == other.layer_inp_src &&
+            h_nextn_dev   == other.h_nextn_dev   &&
+            h_nextn_src   == other.h_nextn_src   &&
+            model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
@@ -1128,6 +1242,10 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    // Hadamard-transformed activations, keyed by (input, rotation): folded weights that read the same activation share one transform
+    ggml_tensor * get_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot) const;
+    void          set_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, ggml_tensor * res);
+
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
     void set_params(const llm_graph_params & params);
@@ -1161,13 +1279,18 @@ public:
     std::vector<llm_graph_fused_node> fused_nodes;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 
+    std::vector<ggml_tensor *> t_sampling_all;
+
     std::vector<llm_graph_input_ptr> inputs;
     bool mtp_device_input = false; // fork: device-input and host-input allocations cannot share a graph
+
+    std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    std::unique_ptr<uint8_t[]> buf_compute_meta;
+    size_t buf_compute_meta_size = 0;
 
     ggml_cgraph * gf;
 
@@ -1198,12 +1321,25 @@ struct llm_graph_qkv {
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
 
+struct llm_graph_amax_src1 {
+    ggml_tensor * res;     // cur rescaled
+    ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
+};
+
+struct llm_graph_moe_cache_slots {
+    ggml_tensor * slots;   // [n_expert_used, n_tokens] slots of the selected experts in the MoE cache, or nullptr
+    ggml_tensor * cpu_ids; // [n_expert_used, n_tokens] misses computed from the host experts, -1 for the other experts, or nullptr
+};
+
 struct llm_graph_context {
-    const llm_arch arch;
+    const llama_model & model;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
+    // LLAMA_LSA_MULTI=1: the LSA builders read lsa_ubatch(), the stream's own rows while a per-stream LSA layer is built
+    mutable const llama_ubatch * lsa_ub = nullptr;
+    const llama_ubatch & lsa_ubatch() const { return lsa_ub ? *lsa_ub : ubatch; }
 
     const int64_t n_embd;
     const int64_t n_layer;
@@ -1248,6 +1384,13 @@ struct llm_graph_context {
     const llama_moe_cache        * moe_cache;
 
     const llama_prec_policy * prec_policy;
+
+    const llama_hadamard * hdmd;
+
+    ggml_tensor * layer_inp_dev;
+    ggml_tensor * layer_inp_src;
+    ggml_tensor * h_nextn_dev;
+    ggml_tensor * h_nextn_src;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1296,6 +1439,36 @@ struct llm_graph_context {
     // QSA prompt (LLAMA_QSA_DIRECT_LISTS): final selected-cell rows [n_sel, n_tokens] for the next flash attention node's
     // src[8], so the CUDA sparse path builds its per-tile cell lists from them instead of scanning the n_kv-wide mask
     mutable ggml_tensor * fa_sel_rows = nullptr;
+    // LSA compensation (LLAMA_LSA_COMP=2): when set, the next plain flash attention node also writes its row
+    // log-sum-exp to lsa_lse (F32 [n_head, n_tokens, n_seq]); the caller takes it and clears both
+    mutable bool          lsa_lse_req = false;
+    // Logging only: an earlier full-attention layer's residual projected through this layer's exact Q weights.
+    mutable ggml_tensor * lsa_spec_q = nullptr;
+    mutable ggml_tensor * lsa_spec_q2 = nullptr; // same target, residual from two attention layers earlier
+    mutable ggml_tensor * lsa_spec_q3 = nullptr; // same target, residual from three attention layers earlier
+    mutable ggml_tensor * lsa_spec_sel = nullptr;
+    // LLAMA_LSA_PICK_EVERY: K cache tensor of the layer whose LSA mask is being built (key of its pick cache); set by
+    // build_attn_lsa_mask, taken and cleared by build_attn_lsa_mask_sb
+    mutable const ggml_tensor * lsa_pick_kbase = nullptr;
+    // LLAMA_LSA_SUM_OP: query index rows + summary plane views handed from build_attn_lsa_mask_blk to the fused select
+    mutable ggml_tensor * lsa_sum_q = nullptr;
+    mutable ggml_tensor * lsa_sum_x = nullptr;
+    mutable ggml_tensor * lsa_sum_n = nullptr;
+    // LLAMA_LSA_BLKLIST: block pick [nbs] and block size for the layer's SJ-KVaRN flash attention node; set by
+    // build_attn_lsa_mask_sb, taken and cleared by build_attn_mha (cleared by build_attn if no node took it)
+    mutable ggml_tensor * lsa_fa_sel = nullptr;
+    mutable int32_t       lsa_fa_blk = 0;
+    mutable const ggml_tensor * lsa_fa_m3 = nullptr; // the mask the pick belongs to (attached only to an FA node on it)
+    mutable ggml_tensor * lsa_lse     = nullptr;
+    // LLAMA_LSA_VK: the layer's rotated block means ([D*H_kv, lsa_vk_nbs] views, set by build_attn before the mask
+    // build when virtual keys can run); the block-list branch then hands the FA node the virtual-key plane instead of
+    // the pick (lsa_fa_vk), and build_attn_mha attaches both (lsa_vk_done: the node took them, no merge follows)
+    mutable ggml_tensor * lsa_vk_km  = nullptr;
+    mutable ggml_tensor * lsa_vk_vm  = nullptr;
+    mutable int64_t       lsa_vk_nbs = 0;
+    mutable bool          lsa_fa_vk   = false;
+    mutable int32_t       lsa_fa_vk_n = 0;     // > 0: the plane holds lsa_fa_vk_n mean-block counts, then the unit pick
+    mutable bool          lsa_vk_done = false;
     // multi-stream SJ-KVaRN: per-stream mask views cut to the stream's own n_kv are not contiguous when the ubatch
     // has more than one token row, and FA needs a contiguous mask; the contiguous copies are made once per graph
     // (the mask is shared by every layer)
@@ -1344,6 +1517,11 @@ struct llm_graph_context {
              ggml_tensor * cur,
                      int   il) const;
 
+    // apply the activation-side transform of a Hadamard-folded weight, if any
+    ggml_tensor * build_hadamard_input(
+              ggml_tensor * w,
+              ggml_tensor * cur) const;
+
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
@@ -1351,13 +1529,19 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * w_s    = nullptr,
+              ggml_tensor * slots  = nullptr,
+                     bool   cached = true) const;
+
+    // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
+    // keep both individual values and Q8 activation block sums within F16 range
+    llm_graph_amax_src1 build_amax_src1_f16(
+              ggml_tensor * cur) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1426,7 +1610,9 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * post_exp_norm = nullptr,
+                   float   post_exp_norm_eps = 1e-5f) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1452,15 +1638,19 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * post_exp_norm = nullptr,
+                   float   post_exp_norm_eps = 1e-5f) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
-    ggml_tensor * build_moe_cache_slots(
+    // with cpu_part, also the misses computed from the host experts, if the cache leaves any to the CPU
+    llm_graph_moe_cache_slots build_moe_cache_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
+                    bool   cpu_part,
                      int   il) const;
 
     //
@@ -1470,7 +1660,18 @@ struct llm_graph_context {
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
     ggml_tensor * build_hadamard_inverse(ggml_tensor * table, ggml_tensor * cur) const;
+
+    // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_ctx_state_src()),
+    // or uploaded from ubatch.embd_state
+    ggml_tensor * build_inp_embd_state(llm_graph_input_embd_h * inp, int64_t n_embd_state) const;
+
     ggml_tensor * build_inp_pos() const;
+
+    // applies the RoPE of layer il, cur is returned as is if the layer has none
+    ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il) const;
+
+    // same, for the lightning indexer
+    ggml_tensor * build_rope_indexer(ggml_tensor * cur, ggml_tensor * pos, int il) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
@@ -1491,9 +1692,168 @@ struct llm_graph_context {
             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
+            ggml_tensor * kv_rows, // [n_kv, n_stream], k and v are shared by the streams
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
+                  float   kq_scale,
+                    int   il) const;
+
+    // LSA probe (llama-lsa.h): replacement KQ mask that keeps sinks + window + the best-scoring cells per query
+    // row, or nullptr when the layer stays dense. *n_kv_max gets the kept count when LLAMA_LSA_FA_SPARSE=1.
+    // LLAMA_LSA_FAST=1: *k and *v are replaced by the gathered kept cells and the returned mask covers only them.
+    ggml_tensor * build_attn_lsa_mask(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * q,       // [n_embd_head, n_head, n_tokens] post-RoPE
+            ggml_tensor ** k,      // KV cache view [n_embd_head, n_head_kv, n_kv, n_stream]
+            ggml_tensor ** v,      // same layout as k (fast path only)
+            ggml_tensor * kq_mask, // [n_kv, n_tokens, 1, n_stream]
+                    int   il,
+                int64_t * n_kv_max,
+            ggml_tensor * idx = nullptr,        // F16 [d_idx, n_kv] cached index keys, or nullptr = recompute
+                  float   kq_scale_lsa = 1.0f,  // mode=mass: softmax scale
+            std::vector<ggml_tensor *> * masks_h = nullptr) const; // per-head picks (LLAMA_LSA_PER_HEAD=1) land here
+
+    // LSA index cache (LLAMA_LSA_IDX_CACHE=1): stores the new tokens' index keys (or rebuilds the layer from the K
+    // cache after an invalidation) and returns the F16 [d_idx, n_kv] view the scoring reads, or nullptr
+    ggml_tensor * build_attn_lsa_idx(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,   // [n_embd_head, n_head_kv, n_tokens] as stored
+            ggml_tensor * k,       // KV cache view after the store
+                    int   il) const;
+
+    // LLAMA_LSA_BLOCK_SUM: refresh the block summaries after the index store w (full = every whole block below n_kv,
+    // else only the blocks of this ubatch's rows) and publish them for this layer's mask
+    void build_attn_lsa_sum(
+            llm_graph_input_attn_kv * inp,
+            const llama_lsa_idx_slot & slot,
+            ggml_tensor * w,       // index cache after this graph's store
+                int64_t   n_kv,
+                   bool   full,
+                    int   il) const;
+
+    // LLAMA_LSA_BLOCK_SUM mask: blocks ranked by the summary upper bound max.q+ + min.q-, top keep/block blocks
+    // kept whole, plus sinks + window per cell; nullptr = fall back to the per-cell path
+    ggml_tensor * build_attn_lsa_mask_blk(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * qi,      // F32 [d_idx, T] index queries
+            ggml_tensor * kq_mask,
+                int64_t   n_kv,
+                int64_t   keep_lr,
+                    int   il,
+            ggml_tensor * smax = nullptr,  // summaries to rank (default: inp->lsa_smax_cur / lsa_smin_cur)
+            ggml_tensor * smin = nullptr,
+                   bool   keep_f32 = false) const; // return the F32 mask (caller casts)
+
+    // block scores -> mask: top keep_lr/B blocks per row (blocks inside the window or the sinks excluded), whole blocks
+    // kept, the causal/sink/window part from the shared per-graph base (decode/verify widths); hands COMP=2 its dropped
+    // counts (inp->lsa_comp_nd). Used by the block-sum pick and by the record pick's LLAMA_LSA_REC_BLK=1.
+    ggml_tensor * build_attn_lsa_mask_sb(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * Sb,      // F32 [nbs, T] block scores, nbs = ceil(n_kv/B) or fewer; nullptr: S_cells
+            ggml_tensor * kq_mask,
+                int64_t   n_kv,
+                int64_t   keep_lr,
+                    int   il,
+                   bool   keep_f32 = false,
+            ggml_tensor * S_cells  = nullptr, // F32 [n_kv, T] cell scores (LLAMA_LSA_FUSED_SEL: block logsumexp in the op)
+                  float   tau      = 1.0f) const;
+
+    // per-graph base mask of the block/unit picks (inp->lsa_blk_base at decode/verify widths)
+    ggml_tensor * build_attn_lsa_blk_base(
+            const llm_graph_input_attn_kv * inp, ggml_tensor * kq_mask, int64_t n_kv, int64_t T, int il) const;
+
+    // LLAMA_LSA_REFINE + FUSED_SEL: mask (+ COMP=2 dropped counts) from a 0/1 selection of U-cell units
+    // (shared_pick: every row of selu holds the same pick, so LLAMA_LSA_BLKLIST may hand it to the SJ-KVaRN node)
+    ggml_tensor * build_attn_lsa_mask_units(
+            const llm_graph_input_attn_kv * inp, ggml_tensor * selu, int64_t U, ggml_tensor * kq_mask, int64_t n_kv,
+            int il, bool shared_pick = false) const;
+
+    // LLAMA_LSA_BLKLIST helpers: node/shape conditions for a block list of B-cell blocks; per-graph sentinel mask M3
+    bool lsa_blist_ok(int64_t T, int64_t B, const ggml_tensor * kq_mask) const;
+    ggml_tensor * build_attn_lsa_blk_m3(
+            const llm_graph_input_attn_kv * inp, ggml_tensor * A, ggml_tensor * kq_mask, int64_t n_kv, int64_t T, int il) const;
+
+    // SJ-KVaRN variant of build_attn_lsa_idx (k_cur before the SJ-KVaRN rotation; rows = positions)
+    ggml_tensor * build_attn_lsa_idx_sj(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * k,
+                    int   il) const;
+
+    // LLAMA_LSA_J3: side-stream slot prefetch for LSA layer il, built at an earlier (source) layer so it runs there in
+    // graph order. sq: [d_head, n_head, T] query of layer il computed from the source layer's residual (or nullptr: the
+    // previous-pick source only); pct: pick budget in percent; flags: GGML_LSA_PREFETCH_PREV/_PROTECT_PREV; src: scratch.
+    void build_attn_lsa_j3(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * sq,
+                    int   il,
+                    int   pct,
+                    int   flags,
+                    int   src,
+            llm_graph_input_attn_kv * shadow = nullptr, // LLAMA_LSA_J3_LEAD + LLAMA_LSA_MULTI: stream s input set of inp
+                int64_t   s = 0) const;
+    // the [n_kv/F, T] 0/1 unit prediction of layer il's record pick from sq (nullptr: layer il would not pick)
+    ggml_tensor * build_attn_lsa_j3_units(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * sq,
+                    int   il,
+                    int   pct) const;
+
+    // LSA fast path (LLAMA_LSA_FAST=1): S = [n_kv, T] index scores; gathers the kept cells into *k / *v and returns
+    // their mask, or nullptr when the layer stays dense
+    ggml_tensor * build_attn_lsa_fast(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * S,
+            ggml_tensor ** k,
+            ggml_tensor ** v,
+            ggml_tensor * kq_mask,
+                int64_t   keep_lr,
+                    int   il) const;
+
+    // LSA centroid compensation (LLAMA_LSA_COMP=1): o_kept = the masked FA output [Dv*H, T]; adds the dropped blocks'
+    // stand-in keys/values to the softmax and returns the corrected output, or nullptr if the shapes are not supported
+    // LLAMA_LSA_COMP=2: the same correction from the masked FA output's log-sum-exp and the cached block means (no dense
+    // scores); nullptr if the shapes/cache are not supported
+    // Refresh (every ubatch, any width): plain caches recompute this ubatch's blocks from the K/V cache (all whole
+    // blocks when the cache is invalid); SJ-KVaRN (k_new/v_new = this ubatch's un-rotated K/V) writes them to the
+    // staging ring and recomputes this ubatch's blocks from it, valid only once built from position 0. Returns false
+    // when unsupported or not valid for use; *kmv/*vmv = [D*H_kv, *nbs] views ordered after the refresh.
+    // rot: k_new/v_new are in the rotated SJ-KVaRN basis (LLAMA_LSA_VK), so are the means (separate cache tag).
+    bool build_attn_lsa_mean_refresh(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * k_new,
+            ggml_tensor * v_new,
+                int64_t   n_kv,
+            ggml_tensor ** kmv,
+            ggml_tensor ** vmv,
+                int64_t * nbs,
+                    int   il,
+                   bool   rot = false) const;
+
+    ggml_tensor * build_attn_lsa_comp_fast(
+            const llm_graph_input_attn_kv * inp,
+            ggml_tensor * o_kept,
+            ggml_tensor * lse,
+            ggml_tensor * q,
+            ggml_tensor * kmv,
+            ggml_tensor * vmv,
+                int64_t   nbs,
+                int64_t   H_kv,
+            ggml_tensor * lsa_mask,
+            ggml_tensor * kq_mask,
+                  float   kq_scale,
+                    int   il) const;
+
+    ggml_tensor * build_attn_lsa_comp(
+            ggml_tensor * o_kept,
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * lsa_mask,
+            ggml_tensor * kq_mask,
                   float   kq_scale,
                     int   il) const;
 
@@ -1605,6 +1965,18 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // ggml_top_k_mask with top_k viewed in the row layout of kq_mask, see ggml.h
+    ggml_tensor * build_fused_top_k_mask(
+            ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
+            ggml_tensor * top_k,   // [n_top, n_tokens]
+                    int   il) const;
+
+    // kq_mask with only the cells named by top_k left visible, for sparse attention
+    ggml_tensor * build_top_k_mask(
+            ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
+            ggml_tensor * top_k,   // [n_top, n_tokens]
+                    int   il) const;
+
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 
     llm_graph_input_dsv4 * build_inp_dsv4() const;
@@ -1696,6 +2068,14 @@ struct llm_graph_context {
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs) const;
+    // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels, n_seqs},
+    // at byte offset offs of each row of s, and with n_rs_seq > 0 once per rollback slot of this ubatch
+    void build_conv_state_store(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+            ggml_tensor * conv_x,
+                int64_t   n_cols,
+                 size_t   offs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
@@ -1727,6 +2107,12 @@ struct llm_graph_context {
             ggml_tensor * cls_norm) const;
 
     //
+    // logits
+    //
+
+    void build_logits() const;
+
+    //
     // sampling (backend sampling)
     //
 
@@ -1745,6 +2131,11 @@ struct llm_graph_context {
             ggml_tensor * head_w,
             ggml_tensor * head_s,
             ggml_tensor * cur) const;
+    // write enabled layer inputs into layer_inp_dev at their batch rows
+    void build_layer_inp_dev() const;
+
+    // write the unmasked h_nextn rows into h_nextn_dev at their batch rows
+    void build_h_nextn_dev() const;
 
     //
     // dense (out)

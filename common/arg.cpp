@@ -3,7 +3,9 @@
 #include "build-info.h"
 #include "chat.h"
 #include "common.h"
+#include "speculative-copy.h"
 #include "download.h"
+#include "http.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
@@ -13,16 +15,6 @@
 #include "spec-defaults.h"
 #include "preset.h"
 #include "../src/llama-ext.h" // llama_parse_moe_keep_map
-
-// fix problem with std::min and std::max
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#   define NOMINMAX
-#endif
-#include <windows.h>
-#include <shellapi.h>
-#endif
 
 #include <algorithm>
 #include <cctype>
@@ -43,20 +35,6 @@
 #include <system_error>
 #include <thread> // for hardware_concurrency
 #include <vector>
-
-#ifndef __EMSCRIPTEN__
-#ifdef __linux__
-#include <linux/limits.h>
-#elif defined(_WIN32)
-#   if !defined(PATH_MAX)
-#   define PATH_MAX MAX_PATH
-#   endif
-#elif defined(_AIX)
-#include <sys/limits.h>
-#else
-#include <sys/syslimits.h>
-#endif
-#endif
 
 #define LLAMA_MAX_URL_LENGTH 2084 // Maximum URL Length in Chrome: 2083
 
@@ -320,6 +298,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_F32,
     GGML_TYPE_F16,
     GGML_TYPE_BF16,
+    GGML_TYPE_F8_E4M3,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1,
@@ -436,7 +415,7 @@ static bool parse_bool_value(const std::string & value) {
 static std::string get_default_local_path(const std::string & url) {
     auto f = string_split<std::string>(url, '#').front();
     f = string_split<std::string>(f, '?').front();
-    return fs_path_to_utf8(fs_get_cache_file(string_split<std::string>(f, '/').back()));
+    return fs_get_cache_file(string_split<std::string>(f, '/').back()).string();
 }
 
 static bool spec_types_is_default(const common_params & params) {
@@ -511,7 +490,26 @@ bool common_models_handler_is_preset_repo(const common_models_handler & handler)
     return !handler.plan.preset.url.empty();
 }
 
+static common_download_opts download_opts_for_url(const common_download_opts & opts, const std::string & url) {
+    common_download_opts result = opts;
+    try {
+        const auto hf    = common_http_parse_url(common_get_model_endpoint());
+        const auto parts = common_http_parse_url(url);
+
+        if (parts.scheme == hf.scheme &&
+            parts.host   == hf.host &&
+            parts.port   == hf.port &&
+            string_starts_with(result.bearer_token, "hf_")) {
+            return result;
+        }
+    } catch (const std::exception &) {
+    }
+    result.bearer_token.clear();
+    return result;
+}
+
 static std::vector<common_download_task> build_url_tasks(const common_params_model & model, common_download_opts opts) {
+    opts = download_opts_for_url(opts, model.url);
     auto parts = common_download_get_all_parts(model.url);
     std::vector<common_download_task> tasks;
 
@@ -558,6 +556,14 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     auto opts = handler.opts; // copy
     opts.callback = callback;
 
+    // another process may hold the cache lock during finalization:
+    // let the download callback cancel that wait too
+    auto finalize = [callback](const hf_cache::hf_file & f) {
+        return hf_cache::finalize_file(f, [callback]() {
+            return !(callback && callback->is_cancelled());
+        });
+    };
+
     // handle plain "url" if needed
     auto handle_url = [&](common_params_model & model) {
         if (!model.url.empty()) {
@@ -592,7 +598,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         common_download_task task;
         task.url        = params.mmproj.url;
         task.local_path = params.mmproj.path;
-        task.opts       = opts;
+        task.opts       = download_opts_for_url(opts, task.url);
         tasks.push_back(task);
     }
     // an SJ-KVaRN transform given as a URL (e.g. a Hugging Face resolve link) is downloaded to the cache like --mmproj-url
@@ -609,13 +615,13 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         common_download_task task;
         task.url        = params.speculative.draft.mparams.url;
         task.local_path = params.speculative.draft.mparams.path;
-        task.opts       = opts;
+        task.opts       = download_opts_for_url(opts, task.url);
         tasks.push_back(task);
         had_spec_url = true;
     }
 
     // handle hf_plan tasks
-    auto add_tasks = [&opts, &tasks](const hf_cache::hf_files  & model_files,
+    auto add_tasks = [&opts, &tasks, &finalize](const hf_cache::hf_files  & model_files,
                                     const hf_cache::hf_file    & primary,
                                     common_params_model        & model) {
         for (size_t i = 0; i < model_files.size(); ++i) {
@@ -624,9 +630,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             tasks.emplace_back(model_file, opts, [&, is_primary]() {
                 if (is_primary) {
                     // the primary file is the first split (00001-of), use it as model path
-                    model.path = hf_cache::finalize_file(model_file);
+                    model.path = finalize(model_file);
                 } else {
-                    hf_cache::finalize_file(model_file);
+                    finalize(model_file);
                 }
             });
         }
@@ -678,9 +684,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         tasks.emplace_back(plan_spec.mtp, opts, [&]() {
             // only use the discovered MTP head when no draft path is set yet
             if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.mtp);
+                params.speculative.draft.mparams.path = finalize(plan_spec.mtp);
             } else {
-                hf_cache::finalize_file(plan_spec.mtp);
+                finalize(plan_spec.mtp);
             }
         });
     }
@@ -688,9 +694,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         tasks.emplace_back(plan_spec.dflash, opts, [&]() {
             // only use the discovered DFlash sidecar when no draft path is set yet
             if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.dflash);
+                params.speculative.draft.mparams.path = finalize(plan_spec.dflash);
             } else {
-                hf_cache::finalize_file(plan_spec.dflash);
+                finalize(plan_spec.dflash);
             }
         });
     }
@@ -698,9 +704,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         tasks.emplace_back(plan_spec.eagle3, opts, [&]() {
             // only use the discovered Eagle3 sidecar when no draft path is set yet
             if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.eagle3);
+                params.speculative.draft.mparams.path = finalize(plan_spec.eagle3);
             } else {
-                hf_cache::finalize_file(plan_spec.eagle3);
+                finalize(plan_spec.eagle3);
             }
         });
     }
@@ -708,9 +714,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         tasks.emplace_back(plan_spec.dspark, opts, [&]() {
             // only use the discovered DSpark sidecar when no draft path is set yet
             if (params.speculative.draft.mparams.path.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.dspark);
+                params.speculative.draft.mparams.path = finalize(plan_spec.dspark);
             } else {
-                hf_cache::finalize_file(plan_spec.dspark);
+                finalize(plan_spec.dspark);
             }
         });
     }
@@ -731,16 +737,16 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     }
     if (!plan.mmproj.local_path.empty()) {
         tasks.emplace_back(plan.mmproj, opts, [&]() {
-            params.mmproj.path = hf_cache::finalize_file(plan.mmproj);
+            params.mmproj.path = finalize(plan.mmproj);
         });
     }
     if (!plan.mtp.local_path.empty() && !had_spec_url) {
         tasks.emplace_back(plan.mtp, opts, [&]() {
             // only fall back to the discovered MTP head when no draft was explicitly provided
             if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.mtp);
+                params.speculative.draft.mparams.path = finalize(plan.mtp);
             } else {
-                hf_cache::finalize_file(plan.mtp);
+                finalize(plan.mtp);
             }
         });
     }
@@ -748,9 +754,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         tasks.emplace_back(plan.dflash, opts, [&]() {
             // only fall back to the discovered DFlash sidecar when no draft was explicitly provided
             if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.dflash);
+                params.speculative.draft.mparams.path = finalize(plan.dflash);
             } else {
-                hf_cache::finalize_file(plan.dflash);
+                finalize(plan.dflash);
             }
         });
     }
@@ -758,9 +764,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         tasks.emplace_back(plan.eagle3, opts, [&]() {
             // only fall back to the discovered Eagle3 sidecar when no draft was explicitly provided
             if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.eagle3);
+                params.speculative.draft.mparams.path = finalize(plan.eagle3);
             } else {
-                hf_cache::finalize_file(plan.eagle3);
+                finalize(plan.eagle3);
             }
         });
     }
@@ -768,9 +774,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         tasks.emplace_back(plan.dspark, opts, [&]() {
             // only fall back to the discovered DSpark sidecar when no draft was explicitly provided
             if (params.speculative.draft.mparams.empty()) {
-                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.dspark);
+                params.speculative.draft.mparams.path = finalize(plan.dspark);
             } else {
-                hf_cache::finalize_file(plan.dspark);
+                finalize(plan.dspark);
             }
         });
     }
@@ -778,7 +784,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         tasks.emplace_back(plan.preset, opts, [&]() {
             // if HF repo is a preset repo, we simply run server in router mode with the preset.ini file
             params.models_preset_hf = params.model.hf_repo; // only for showing a warning
-            params.models_preset    = hf_cache::finalize_file(plan.preset);
+            params.models_preset    = finalize(plan.preset);
             // clear the model so the server starts in router mode
             params.model.path.clear();
             params.model.hf_repo.clear();
@@ -823,7 +829,7 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     std::vector<std::filesystem::path> paths;
 
 #if defined(_WIN32)
-    const std::filesystem::path program_data = common_get_path_from_env("PROGRAMDATA");
+    const std::filesystem::path program_data = common_get_env("PROGRAMDATA");
     if (!program_data.empty()) {
         paths.push_back(program_data / "llama.cpp" / "config.ini");
     }
@@ -851,7 +857,7 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     common_preset_context ctx(ex);
     ctx.ignore_unknown_keys = true; // the same config file is shared by all programs
     for (const auto & path : found) {
-        LOG_INF("using config file: %s\n", fs_path_to_utf8(path).c_str());
+        LOG_INF("using config file: %s\n", path.string().c_str());
         common_preset global;
         common_presets presets = ctx.load_from_ini(path, global);
         global.apply_to_params(params);
@@ -879,6 +885,113 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         for (const auto & arg : opt.args_neg) {
             arg_to_options[arg] = {&opt, /* is_positive */ false};
         }
+    }
+
+    // fork: inspect option arities without running handlers; explicit aliases beat card defaults.
+    std::set<const common_arg *> explicit_options;
+    std::string card_name = params.card_preset;
+    int card_selectors = 0;
+    bool card_headless = false;
+    bool card_headed = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string key = argv[i];
+        if (key.compare(0, 2, "--") == 0) {
+            std::replace(key.begin(), key.end(), '_', '-');
+        }
+        auto found = arg_to_options.find(key);
+        if (found == arg_to_options.end()) {
+            throw std::invalid_argument("error: invalid argument: " + key);
+        }
+        const auto * opt = found->second.first;
+        explicit_options.insert(opt);
+        std::string value;
+        if (!opt->handler_void && !opt->handler_bool) {
+            if (opt->value_optional_default && (i + 1 == argc || argv[i + 1][0] == '-')) {
+                value = opt->value_optional_default;
+            } else {
+                if (++i >= argc) {
+                    throw std::invalid_argument("expected value for argument " + key);
+                }
+                value = argv[i];
+            }
+            if (opt->handler_str_str && ++i >= argc) {
+                throw std::invalid_argument("expected second value for argument " + key);
+            }
+        }
+        if (key == "headless") {
+            card_headless = true;
+        } else if (key == "headed") {
+            card_headed = true;
+        }
+        const std::string card_key = string_ends_with(key, "-headless") ? key.substr(0, key.size() - 9) : key;
+        if (key == "--preset" || card_key == "24dense" || card_key == "12dense" ||
+            card_key == "10dense" || card_key == "8dense") {
+            if (++card_selectors > 1) {
+                throw std::invalid_argument("select only one card preset");
+            }
+            card_name = key == "--preset" ? value : key;
+        }
+    }
+    if ((card_headless || card_headed) && card_name.empty()) {
+        throw std::invalid_argument("headed/headless requires a card preset");
+    }
+    card_headless = card_headless || string_ends_with(card_name, "-headless");
+    if (card_headless && card_headed) {
+        throw std::invalid_argument("select only one headed/headless mode");
+    }
+    if (!card_name.empty()) {
+        const auto & card = common_card_preset_get(card_name, card_headless);
+        if (card.name == "8dense" && card_headed) {
+            LOG_INF("8dense is headless-only; using the same 500 MiB margin and 204800 context defaults\n");
+        }
+        if (!card.pending.empty()) {
+            throw std::invalid_argument(card.pending);
+        }
+        params.card_preset = card.name;
+        params.card_preset_headless = card_headless || card.name == "8dense";
+        params.card_preset_flags.clear();
+        common_preset defaults;
+        auto is_explicit = [&](const std::string & key) {
+            auto found = arg_to_options.find(key);
+            if (found == arg_to_options.end()) {
+                return false;
+            }
+            const auto * opt = found->second.first;
+            return explicit_options.count(opt) || opt->has_value_from_env();
+        };
+        params.card_preset_ctx_default = !is_explicit("--ctx-size") &&
+                !is_explicit("--slot-ctx") && !is_explicit("--kv-unified-per-slot");
+        if (!is_explicit("--fit-target")) {
+            const std::string margin = std::to_string(card_headless ? card.fit_margin_headless_mib : card.fit_margin_mib);
+            defaults.options[*arg_to_options.at("--fit-target").first] = margin;
+            params.card_preset_flags += " --fit-target " + margin;
+        }
+        params.card_preset_kv_default = !is_explicit("--cache-type-k") && !is_explicit("--cache-type-v") &&
+                !is_explicit("--sjkvarn-body-type");
+        for (const auto & kv : card.options) {
+            if (ctx_arg.ex == LLAMA_EXAMPLE_CLI &&
+                (kv.first == "--kv-unified" || kv.first == "--cache-ram" || kv.first == "--no-cache-disk")) {
+                continue;
+            }
+            if (!params.card_preset_kv_default && (kv.first == "--cache-type-k" || kv.first == "--cache-type-v" ||
+                kv.first.compare(0, 10, "--sjkvarn-") == 0)) {
+                continue;
+            }
+            if (is_explicit(kv.first)) {
+                continue;
+            }
+            if (kv.first == "--ctx-size" &&
+                (is_explicit("--slot-ctx") || is_explicit("--kv-unified-per-slot"))) {
+                continue;
+            }
+            const auto & opt = *arg_to_options.at(kv.first).first;
+            defaults.options[opt] = kv.second;
+            params.card_preset_flags += " " + kv.first;
+            if (opt.value_hint) {
+                params.card_preset_flags += " " + kv.second;
+            }
+        }
+        defaults.apply_to_params(params);
     }
 
     // handle environment variables
@@ -985,6 +1098,34 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    if (!params.card_preset.empty()) {
+        auto explicit_or_env = [&](const std::string & key) {
+            auto found = arg_to_options.find(key);
+            return found != arg_to_options.end() &&
+                (explicit_options.count(found->second.first) || found->second.first->has_value_from_env());
+        };
+        const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        if (adaptive_mtp && explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive")) {
+            params.speculative.draft.n_min_adaptive = std::min(params.speculative.draft.n_min_adaptive,
+                    params.speculative.draft.n_max);
+        }
+        if (adaptive_mtp && explicit_or_env("--spec-draft-n-min-adaptive") && !explicit_or_env("--spec-draft-n-max")) {
+            params.speculative.draft.n_max = std::max(params.speculative.draft.n_max,
+                    params.speculative.draft.n_min_adaptive);
+        }
+        if (params.card_preset == "24dense" && explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min")) {
+            params.speculative.draft.n_min = std::min(params.speculative.draft.n_min, params.speculative.draft.n_max);
+        }
+        if (explicit_or_env("--batch-size") && !explicit_or_env("--ubatch-size")) {
+            params.n_ubatch = std::min(params.n_ubatch, params.n_batch);
+        }
+    }
+
+    if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {
+        throw std::invalid_argument("small-card presets require --parallel 1; multi-user support is planned");
+    }
+
     if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON && !params.no_extra_bufts) {
         LOG_INF("explicit MoE cache mode disables weight repacking\n");
         params.no_extra_bufts = true;
@@ -1023,7 +1164,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // TODO @ngxson : maybe show a list of available models in CLI in this case
         bool can_skip_model = params.usage || params.completion || !params.server_base.empty();
         if (!can_skip_model && params.model.path.empty()) {
-            throw std::invalid_argument("error: --model is required\n");
+            throw std::invalid_argument("error: --model or -hf is required\n");
         }
     }
 
@@ -1045,8 +1186,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
 
     const bool mcp_enabled = !params.mcp_servers_config.empty() || !params.mcp_servers_json.empty();
-    if ((!params.server_tools.empty() || mcp_enabled) && !params.cors_origins_explicit) {
-        LOG_WRN("server tools or MCP servers are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
+    if ((!params.server_tools.empty() || mcp_enabled || params.ui_mcp_proxy) && !params.cors_origins_explicit) {
+        LOG_WRN("server tools, MCP servers or MCP proxy are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
         params.cors_origins = "localhost";
     }
 
@@ -1367,44 +1508,7 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
     return true;
 }
 
-#ifdef _WIN32
-struct utf8_argv {
-    std::vector<std::string> buf;
-    std::vector<char*> ptrs;
-};
-
-static utf8_argv make_utf8_argv() {
-    utf8_argv out;
-    int wargc = 0;
-    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-    if (!wargv) return out;
-
-    out.buf.reserve(wargc);
-    for (int i = 0; i < wargc; ++i) {
-        int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wargv[i], -1, nullptr, 0, nullptr, nullptr);
-        if (n <= 0) { out.buf.emplace_back(); continue; }
-        auto& s = out.buf.emplace_back();
-        s.resize(static_cast<size_t>(n - 1));
-        (void)WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), n, nullptr, nullptr);
-    }
-    LocalFree(wargv);
-
-    out.ptrs.reserve(out.buf.size() + 1);
-    for (auto& s : out.buf) out.ptrs.push_back(s.data());
-    out.ptrs.push_back(nullptr);
-    return out;
-}
-#endif
-
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
-#ifdef _WIN32
-    auto utf8 = make_utf8_argv();
-    // repair argv only when it matches the process command line
-    if (static_cast<int>(utf8.buf.size()) == argc) {
-        argv = utf8.ptrs.data();
-    }
-#endif
-
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
 
@@ -1622,7 +1726,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--server-base"}, "URL",
-        string_format("connect to this server instead of starting a new one, example: 'http://localhost:8080' (default: none)"),
+        string_format("connect to this server instead of starting a new one, example: 'http://localhost:9931' (default: none)"),
         [](common_params & params, const std::string & value) {
             params.server_base = value;
         }
@@ -1829,6 +1933,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--slot-ctx" }, "N0,N1,...",
+        "reserved context per slot, one value per --parallel slot (default: unset, behavior unchanged).\n"
+        "needs --kv-unified; the sum must fit the KV pool, which is sized to the sum when -c is not given.\n"
+        "requests go to the smallest idle slot that fits; the largest slot is kept free for long requests.\n"
+        "a value of 0 makes a shared slot: the shared slots take whatever the reserved slots leave of the pool (-c is required);\n"
+        "LLAMA_SLOT_CTX_SHARE=0 turns shared slots off (0 is then refused)",
+        [](common_params & params, const std::string & value) {
+            params.slot_ctx.clear();
+            const char * share_env = getenv("LLAMA_SLOT_CTX_SHARE");
+            const bool share_on = !share_env || !(std::string(share_env) == "0" || std::string(share_env) == "off" ||
+                                                  std::string(share_env) == "false" || std::string(share_env) == "no");
+            for (const auto & item : string_split<std::string>(value, ',')) {
+                size_t pos = 0;
+                long long v = -1;
+                try {
+                    v = std::stoll(item, &pos);
+                } catch (const std::exception &) {
+                    pos = 0;
+                }
+                if (pos == 0 || pos != item.size() || v < (share_on ? 0 : 1) || v > INT32_MAX) {
+                    throw std::invalid_argument(share_on ?
+                        "--slot-ctx: every value must be a positive integer or 0 (shared), got '" + item + "'" :
+                        "--slot-ctx: every value must be a positive integer (shared slots are off: LLAMA_SLOT_CTX_SHARE=0), got '" + item + "'");
+                }
+                params.slot_ctx.push_back((int32_t) v);
+            }
+            if (params.slot_ctx.empty()) {
+                throw std::invalid_argument("--slot-ctx: empty list");
+            }
+        }
+    ).set_env("LLAMA_ARG_SLOT_CTX").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION
@@ -1890,13 +2026,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-cram", "--cache-ram"}, "N",
         "maximum RAM size of the prompt cache in MiB (default: sized from total host RAM: <16 GB 2048, 16 GB 4096, "
         "32 GB 8192, 64 GB 12288, 96 GB 16384, 128 GB+ 20480, at most half of the available memory at startup; --fit also reserves 5 GiB and shared RAM headroom; "
-        "-1 = half of the free host memory at startup, 0 = disable)"
+        "0 for decision models unless --cache-ram is given, -1 = half of the free host memory at startup, 0 = disable)"
         "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)",
         [](common_params & params, int value) {
             if (value < -1) {
                 throw std::invalid_argument("cache-ram must be -1, 0 or a size in MiB");
             }
             params.cache_ram_mib = value;
+            params.cache_ram_explicit = true;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -2037,7 +2174,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_unified = value;
         }
-    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
@@ -3026,15 +3163,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.ppl_output_type = value;
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
-    add_opt(common_arg(
-        {"-dt", "--defrag-thold"}, "N",
-        string_format("KV cache defragmentation threshold (DEPRECATED)"),
-        [](common_params & params, const std::string & value) {
-            GGML_UNUSED(params);
-            GGML_UNUSED(value);
-            LOG_WRN("DEPRECATED: --defrag-thold is deprecated and no longer necessary to specify\n");
-        }
-    ).set_env("LLAMA_ARG_DEFRAG_THOLD"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(
@@ -3437,7 +3565,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_SKIP_RANK_FLOOR"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU (default: 0, disabled)",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -3445,6 +3573,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_cache_size = (size_t) value*1024*1024;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-cpu-share"}, "F",
+        string_format("share of the MoE cache misses that the CPU computes from the host experts instead of uploading them to the GPU once the cache is full, from 0 to 1 (default: %.2f)", (double) params.moe_cache_cpu_share),
+        [](common_params & params, const std::string & value) {
+            const float share = std::stof(value);
+            if (share < 0.0f || share > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_cpu_share = share;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
@@ -3725,6 +3864,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.path = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_MODEL"));
+    add_opt(common_arg(
+        {"--ple", "--shard"}, "FNAME,...",
+        "extra GGUF shards for the model, comma separated; may be given more than once\n"
+        "paths may live anywhere, including on different drives; --ple is an alias for --shard",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                params.model.shards.push_back(item);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_SHARD"));
     add_opt(common_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",
@@ -4043,7 +4192,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--cors-origins"}, "ORIGINS",
         string_format(
             "comma-separated list of allowed origins for CORS (default: %s)\n"
-            "if set to special value 'localhost', reflect the Origin header only if it is localhost",
+            "if set to special value 'localhost', only allow same-origin requests (e.g. the built-in UI)",
         params.cors_origins.c_str()),
         [](common_params & params, const std::string & value) {
             params.cors_origins = value;
@@ -4099,7 +4248,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--ui-mcp-proxy", "--webui-mcp-proxy"},
         {"--no-ui-mcp-proxy", "--no-webui-mcp-proxy"},
-        "experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments (default: disabled)",
+        "experimental: whether to enable MCP CORS proxy, for the Web UI to reach public MCP servers without CORS headers; local and private addresses are refused - do not enable in untrusted environments (default: disabled)\n"
+        "note: for security reasons, this will limit --cors-origins to localhost by default",
         [](common_params & params, bool value) {
             params.ui_mcp_proxy = value;
         }
@@ -4125,6 +4275,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.server_tools_runtime = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TOOLS_RUNTIME"));
+    add_opt(common_arg(
+        {"--allow-unauthenticated-tools"},
+        "allow server tools, MCP servers or MCP proxy on a non-loopback address without an API key - only for trusted networks (default: disabled)",
+        [](common_params & params) {
+            params.server_tools_allow_unauth = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ALLOW_UNAUTHENTICATED_TOOLS"));
     add_opt(common_arg(
         {"--mcp-servers-config"}, "PATH",
         "experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)\n"
@@ -4165,6 +4322,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.ui = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI"));
+    add_opt(common_arg(
+        {"--connect"},
+        string_format("(experimental) open a peer-to-peer tunnel for server using llama-connect (default: %s)", params.server_connect ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.server_connect = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONNECT"));
+    add_opt(common_arg(
+        {"--connect-code"}, "CODE",
+        "manually specify a 40-character code for --connect (default: generate a new one for each run)",
+        [](common_params & params, const std::string & value) {
+            std::string val = value;
+            string_replace_all(val, "-", "");
+            string_replace_all(val, " ", "");
+            if (val.size() != 40) {
+                throw std::invalid_argument(string_format("error: invalid connect code '%s', must be 40 characters\n", value.c_str()));
+            }
+            params.server_connect_code = val;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONNECT_CODE"));
     add_opt(common_arg(
         {"--embedding", "--embeddings"},
         string_format("restrict to only support embedding use case; use only with dedicated embedding models (default: %s)", params.embedding ? "enabled" : "disabled"),
@@ -4357,7 +4534,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.slot_save_path += DIRECTORY_SEPARATOR;
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
     add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
@@ -4372,6 +4549,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--media-allow-private-urls"},
+        "allow http(s) media URLs (e.g. image_url) that point to local or private addresses (default: disabled, only public addresses)",
+        [](common_params & params) {
+            params.media_allow_private_urls = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MEDIA_ALLOW_PRIVATE_URLS"));
     add_opt(common_arg(
         {"--models-dir"}, "PATH",
         "directory containing models for the router server (default: disabled)",
@@ -4393,6 +4577,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.models_max = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX"));
+    add_opt(common_arg(
+        {"--models-memory-margin"}, "N",
+        string_format("for router server, MiB of device memory to keep free per device, unload LRU models until a new one fits (default: %d, 0 = disabled)", params.models_memory_margin),
+        [](common_params & params, int value) {
+            params.models_memory_margin = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MEMORY_MARGIN"));
     add_opt(common_arg(
         {"--models-autoload"},
         {"--no-models-autoload"},
@@ -4839,7 +5030,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's K cache type from -ctk; %s for an MTP drafter over a SJ-KVaRN trunk, including a separate MTP draft file; a quantized trunk is copied instead of f16; pass f16 to force f16)",
+            "(default: SJ-KVaRN regions for eligible internal MTP; otherwise the main model's K cache type from -ctk, or %s for MTP over a SJ-KVaRN trunk; pass f16 to force f16)",
             get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[0])
         ),
         [](common_params & params, const std::string & value) {
@@ -4851,7 +5042,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: the main model's V cache type from -ctv; %s for an MTP drafter over a SJ-KVaRN trunk, including a separate MTP draft file; a quantized trunk is copied instead of f16; pass f16 to force f16)",
+            "(default: SJ-KVaRN regions for eligible internal MTP; otherwise the main model's V cache type from -ctv, or %s for MTP over a SJ-KVaRN trunk; pass f16 to force f16)",
             get_all_kv_cache_types().c_str(), ggml_type_name(COMMON_SJKVARN_MTP_DRAFT_KV[1])
         ),
         [](common_params & params, const std::string & value) {
@@ -4860,11 +5051,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--spec-draft-sjkvarn"},
-        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for MTP (one stream per --parallel slot) (incompatible with -ctkd/-ctvd)",
-        [](common_params & params) {
-            params.speculative.draft.sj_kvarn = true;
+        {"--no-spec-draft-sjkvarn"},
+        "inherit the trunk's SJ-KVaRN body, sink, staging and tail for MTP (default: on for single-sequence internal MTP with a SJ-KVaRN trunk, no -ctkd/-ctvd and sufficient tail)",
+        [](common_params & params, bool value) {
+            params.speculative.draft.sj_kvarn = value;
+            params.speculative.draft.sj_kvarn_explicit = true;
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SJKVARN"));
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
@@ -4947,6 +5140,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-n-ubatch"}, "N",
+        string_format("physical maximum batch size of the draft context, use a smaller value to spare VRAM; same field as --spec-draft-ubatch (default: %d = auto, 0 = same as --n-ubatch)", params.speculative.draft.n_ubatch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {
@@ -4978,6 +5181,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.synth_rates = std::move(rates);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
+
+    add_opt(common_arg(
+        {"--spec-copy-tail"}, "N",
+        string_format("copy mode: append up to N tokens looked up in the context after the model drafter's block, "
+            "verified by exact match; scheduled only while a copy is running; capped at n_rs_seq on hybrid models "
+            "(0 = off, max %d, default: auto = 0; LLAMA_SPEC_COPY=N opts in for one slot with the model's MTP head and no -md; 1/on/true/yes selects tail 8)",
+            (int) common_speculative_copy_params::TAIL_MAX),
+        [](common_params & params, int value) {
+            if (value < 0 || value > common_speculative_copy_params::TAIL_MAX) {
+                throw std::invalid_argument(string_format("error: --spec-copy-tail must be in [0, %d]",
+                    (int) common_speculative_copy_params::TAIL_MAX));
+            }
+            params.speculative.copy_tail = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_COPY_TAIL"));
+
+    add_opt(common_arg(
+        {"--spec-copy-rs"},
+        "copy mode: keep one recurrent-state snapshot per tail token, so a wide round rolls back in place "
+        "instead of restoring a checkpoint (more VRAM on hybrid models; default: off)",
+        [](common_params & params) {
+            params.speculative.copy_rs = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_COPY_RS"));
 
     add_opt(common_arg(
         {"--spec-draft-n-min-adaptive"}, "N",
@@ -5071,7 +5298,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "draft-only vocabulary shortlist for the MTP draft head; the target is unaffected. 'auto' uses the list compiled in for this "
         "model's tokenizer and architecture (every quant of a supported base model, e.g. Qwen3.8-27B), 'auto:N' the one of size N, "
         "FNAME a llama-mtp-vocab-v1 map, 'none' the full vocabulary (default: auto; a model with no built-in list "
-        "drafts over the full vocabulary)",
+        "drafts over the full vocabulary). With eligible DSJ and no map/hot overrides, compatible models use ordered RM24H with 2048 hot slots; explicit auto and hot 0 keep the prior shortlist",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.vocab_map = value;
             params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP;
@@ -5084,6 +5311,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                       params.speculative.draft.vocab_hot),
         [](common_params & params, int value) {
             params.speculative.draft.vocab_hot = value;
+            params.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT"));
     add_opt(common_arg(
@@ -5120,13 +5348,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.draft.probabilistic = false;
             } else if (value == "probabilistic") {
                 params.speculative.draft.probabilistic = true;
-                LOG_WRN("--spec-draft-sampling probabilistic: not wired in this tree; the sampled-draft path here is "
-                        "exact p/q drafting (LLAMA_SPEC_PQ=1)\n");
+                LOG_WRN("--spec-draft-sampling probabilistic: only DFlash2 drafts sample here; for the other drafters "
+                        "the sampled-draft path is exact p/q drafting (LLAMA_SPEC_PQ=1)\n");
             } else {
                 throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
+    add_opt(common_arg(
+        {"--attn-sparse"}, "{none,lsa,lsa-pos,lsa-oracle}",
+        "EXPERIMENTAL, lossy: latent sparse attention quality probe (default: none). Needs --attn-sparse-map; tuning "
+        "via LLAMA_LSA_KEEP/KEEP_FRAC/SINKS/WINDOW/MIN_POS/MAX_ROWS; LLAMA_LSA_FAST=1 attends over the kept cells only (see src/llama-lsa.h)",
+        [](common_params &, const std::string & value) {
+            if (value != "none" && value != "lsa" && value != "lsa-pos" && value != "lsa-oracle") {
+                throw std::invalid_argument("invalid value, must be one of: none, lsa, lsa-pos, lsa-oracle");
+            }
+#ifdef _WIN32
+            _putenv_s("LLAMA_LSA_MODE", value.c_str());
+#else
+            setenv("LLAMA_LSA_MODE", value.c_str(), 1);
+#endif
+        }
+    ));
+    add_opt(common_arg(
+        {"--attn-sparse-map"}, "FNAME",
+        "LSA index map sidecar GGUF (scripts/lsa_convert_map.py)",
+        [](common_params &, const std::string & value) {
+#ifdef _WIN32
+            _putenv_s("LLAMA_LSA_MAP", value.c_str());
+#else
+            setenv("LLAMA_LSA_MAP", value.c_str(), 1);
+#endif
+        }
+    ));
     add_opt(common_arg(
         {"--spec-mb-mtp"},
         {"--no-spec-mb-mtp"},
@@ -5395,7 +5649,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.tts_lang = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tts-voice"}, "VOICE",
+        "voice for audio generation (model-dependent)\n"
+        "see tts/README.md for per-model usage notes",
+        [](common_params & params, const std::string & value) {
+            params.tts_voice = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--tts-speaker-file"}, "FNAME",
         "speaker file path for audio generation",
@@ -5520,6 +5782,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
 
     // presets
+
+    add_opt(common_arg({"headed", "headless"}, "card preset mode: headed leaves 1024 MiB free; headless leaves 500 MiB (8dense is headless-only)",
+        [](common_params &) {}
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--preset"}, "24dense|12dense|10dense|8dense",
+        "dense 27B card profile; append headless or -headless for a 500 MiB margin (default: 1024; 8dense: always 500); explicit flags override",
+        [](common_params & params, const std::string & value) {
+            params.card_preset = common_card_preset_get(value).name;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"24dense", "24dense-headless"}, "alias for --preset 24dense",
+        [](common_params & params) { params.card_preset = "24dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"12dense", "12dense-headless"}, "alias for --preset 12dense (best known/recheck before ship; one slot)",
+        [](common_params & params) { params.card_preset = "12dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"10dense", "10dense-headless"}, "alias for --preset 10dense (best known/recheck before ship; one slot)",
+        [](common_params & params) { params.card_preset = "10dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"8dense", "8dense-headless"}, "alias for --preset 8dense (best known/recheck before ship; one slot)",
+        [](common_params & params) { params.card_preset = "8dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--embd-gemma-default"},

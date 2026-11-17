@@ -24,6 +24,9 @@ char * ggml_cuda_q8_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_ten
 bool ggml_cuda_mul_mat_iq4xs_wide_try(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// [PARW] widest src1 column count the IQ4_XS wide kernel takes (0 = PARW off); its narrowest is MMVQ_MAX_BATCH_SIZE + 1
+int ggml_cuda_iq4xs_wide_max_ncols();
+
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr, bool convrot = false);

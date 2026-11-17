@@ -7,6 +7,7 @@
 #include "llama-hparams.h"
 #include "llama-mmap.h"
 #include "llama-moe-arena.h"
+#include "llama-d1.h"
 
 #include "ggml-cpp.h"
 
@@ -15,9 +16,10 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
-
-using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+#include <utility>
+#include <vector>
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -29,6 +31,14 @@ enum llama_fver {
 };
 
 const char * llama_file_version_name(llama_fver version);
+
+// [FP8-GUARD] Refuses tensor types and file types whose IDs collide with upstream llama.cpp. Throws std::runtime_error when
+//  - a tensor has GGML_TYPE_TURBO2_0 (= upstream's F8_E4M3 ID), or another KV-cache-only type (TURBO3_0, TURBO4_0)
+//  - file_type is LLAMA_FTYPE_MOSTLY_Q8_CR (= upstream's MOSTLY_F8_E4M3 ID) and no tensor is GGML_TYPE_Q8_CR
+// tensors: (name, type) of every tensor considered; file_type: general.file_type, or -1 to skip the file type check.
+// The loader runs it on each GGUF right after gguf_init_from_file (file_type -1), and on the whole model with
+// general.file_type once every file is indexed.
+void llama_model_loader_check_type_ids(const std::vector<std::pair<std::string, ggml_type>> & tensors, int32_t file_type);
 
 struct llama_model_loader {
     // Holds information on a model weight
@@ -126,6 +136,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    std::vector<std::string> d1_paths; // [D1] path of files[i] when opened by name (base file and splits)
+    llama_d1_src d1_src;               // [D1] base output.weight fingerprint (LLAMA_D1_HEAD only)
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -255,7 +267,16 @@ struct llama_model_loader {
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr, bool private_dense = false, bool fit_ram = false);
 
-    void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+    // byte range within a mapped file
+    struct mapping_range {
+        size_t first; // inclusive
+        size_t last;  // exclusive
+    };
+
+    // sorted, non-overlapping ranges of file 'idx' that back the tensors of 'ctx'
+    // ranges owned by other contexts are excluded, so that a buffer wrapping them won't pin
+    // data that this context never reads (lazy tensors, -cmoe tensors, ...)
+    std::vector<mapping_range> get_mapping_ranges(uint32_t idx, ggml_context * ctx) const;
 
     // release a weight's mmap pages
     void unmap_weight(const llama_tensor_weight & w) const;
@@ -267,7 +288,7 @@ struct llama_model_loader {
     // Returns false if cancelled by progress_callback
     bool load_all_data(
             struct ggml_context * ctx,
-            llama_buf_map & bufs,
+            std::vector<ggml_backend_buffer_t> & bufs,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);

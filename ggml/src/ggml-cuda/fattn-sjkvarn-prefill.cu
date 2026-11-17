@@ -3,6 +3,9 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-i8qk.cuh"
 #include "fattn-prefill-policy.h"
+#include "qsa-resident-clock.cuh"
+#include "sjkvarn-lowbits.cuh"
+#include "sjkvarn-seal.cuh"
 
 #include <cstdlib>
 
@@ -189,6 +192,8 @@ struct fattn_sj_kvarn_prefill_plan {
     // behind the output temporary; the head grouping counts those bytes, so the scratch stays within the same budget.
     bool   i8qk             = false;
     size_t i8qk_offset      = 0;     // bytes from the scratch start to the int8 K
+    size_t master_offset    = 0;
+    size_t master_bytes     = 0;
 };
 
 static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc, const ggml_tensor * dst) {
@@ -199,7 +204,14 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const int n_kv = ggml_get_op_params_i32(dst, 6);
     const int bits_pair = ggml_get_op_params_i32(dst, 5);
     const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
-    const size_t budget = trellis ? fattn_sj_kvarn_prefill_trellis_budget() : fattn_sj_kvarn_prefill_budget();
+    const size_t budget_cap = trellis ? fattn_sj_kvarn_prefill_trellis_budget() : fattn_sj_kvarn_prefill_budget();
+    static const bool master_enabled = [] {
+        const char * value = getenv("GGML_CUDA_LSA_RESIDENT_STRIP_MASTER");
+        return value && value[0] == '1' && !value[1];
+    }();
+    const bool master = trellis && master_enabled;
+    // Canonical scratch is at most 41% of f16 K/V. Leave a third of the cap for it and alignment.
+    const size_t budget = master ? budget_cap/3*2 : budget_cap;
     if (budget == 0 || Q->ne[1] < 128 || !ampere_mma_available(cc) || (ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 && !trellis) ||
             Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
             Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 ||
@@ -210,6 +222,17 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
             (bits_pair != ((4 << 8) | 4) && !trellis) || n_kv <= 0 || n_kv % 256 != 0) {
         return p;
     }
+    auto finish = [&]() {
+        if (master) {
+            size_t total;
+            if (!sj_kvarn_lowbits::strip_master_prefill_workspace(bits_pair >> 8, bits_pair & 255,
+                    p.chunked ? p.chunk_kv : n_kv, p.heads_per_group, p.scratch_bytes, budget_cap,
+                    p.master_offset, total)) return fattn_sj_kvarn_prefill_plan{};
+            p.master_bytes = total - p.master_offset;
+            p.scratch_bytes = total;
+        }
+        return p;
+    };
     // [#139] a fused-rotation node is planned like the unflagged copy that ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused
     // dispatches, so the allocator reserves the same scratch; the executor below asserts the flag is gone.
 
@@ -264,7 +287,7 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
             p.output_elements_per_head = output_elements_per_head;
             p.scratch_bytes = GGML_PAD(2*p.kv_elements*sizeof(half), 128) + GGML_PAD(p.parts_bytes, 128) +
                 GGML_PAD(p.meta_bytes, 128) + acc_meta_bytes;
-            return p;
+            return finish();
         }
     }
     if (grouped) {
@@ -296,7 +319,7 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
         p.i8qk_offset = GGML_PAD(p.scratch_bytes, 128);
         p.scratch_bytes = p.i8qk_offset + i8qk_bytes_per_head*heads_per_group;
     }
-    return p;
+    return finish();
 }
 
 // Bytes to reserve behind dst in the compute buffer for the expand scratch: dst padded to 128, then an upper bound on
@@ -328,10 +351,18 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
     const ggml_tensor * V = dst->src[2];
     const int n_kv = ggml_get_op_params_i32(dst, 6);
     const fattn_sj_kvarn_prefill_plan plan = fattn_sj_kvarn_prefill_make_plan(ggml_cuda_info().devices[ctx.device].cc, dst);
+    const auto * master = ggml_cuda_qsa_clock_strip_master_map(ctx, dst->src[5]);
     if (!plan.ok) {
+        GGML_ASSERT(sj_kvarn_lowbits::strip_master_prefill_fallback_safe(master != nullptr, Q->ne[1]));
         return false;
     }
+    if (master) {
+        GGML_ASSERT(plan.master_bytes && master->strip_master_bits == uint32_t(ggml_get_op_params_i32(dst, 5)));
+        // The main dispatch already prepares the page map. Repeat only its prefill join/reset for direct callers.
+        ggml_cuda_lsa_page_prepare(ctx, dst);
+    }
     const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
+    GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr && "SJ-KVaRN expand prefill writes no LSE output (graph: no LSE at >= 128 rows)");
     GGML_ASSERT(!ggml_cuda_fattn_sj_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
     const int gqa = Q->ne[2]/K->ne[2];
     const bool grouped = plan.grouped;
@@ -348,6 +379,17 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
     ggml_cuda_pool_alloc<half> scratch_pool(ctx.pool());
     half * scratch_ptr = reserved ? (half *) ((char *) dst->data + offset) :
         scratch_pool.alloc((plan.scratch_bytes + sizeof(half) - 1)/sizeof(half));
+
+    auto expand_body = [&](half2 * k, half2 * v, size_t elements, int rows, int first, int heads, int head_first) {
+        if (master) {
+            GGML_ASSERT(ggml_cuda_sj_kvarn_strip_master_expand(ctx, *master, dst->src[6],
+                reinterpret_cast<char *>(scratch_ptr) + plan.master_offset, plan.master_bytes,
+                k, v, elements*sizeof(half), rows, first, heads, head_first, K->nb[2], V->nb[2]));
+        } else {
+            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
+                (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2], k, v, rows, first, heads, head_first, ctx.stream());
+        }
+    };
 
     float * output = grouped ? (float *) (scratch_ptr + 2*kv_elements) : (float *) dst->data;
 
@@ -377,9 +419,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
                 dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
                 dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1], dst->src[3] && dst->src[3]->type == GGML_TYPE_I32);
             CUDA_CHECK(cudaGetLastError());
-            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
-                (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
-                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, heads, 0, ctx.stream());
+            expand_body((half2 *) K_chunk, (half2 *) (K_chunk + elements), elements, cn, c0, heads, 0);
 
             ggml_tensor k = *K;
             ggml_tensor v = *V;
@@ -458,9 +498,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
             dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1], dst->src[3] && dst->src[3]->type == GGML_TYPE_I32);
         CUDA_CHECK(cudaGetLastError());
         if (trellis) {
-            ggml_cuda_sj_kvarn_trellis_expand_body(ggml_get_op_params_i32(dst, 5), ggml_cuda_qsa_resident_body(dst->src[5]),
-                (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
-                (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, heads, head_first, ctx.stream());
+            expand_body((half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), elements, n_kv, 0, heads, head_first);
         }
 
         ggml_tensor q = *Q;

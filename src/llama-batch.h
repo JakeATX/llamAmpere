@@ -49,10 +49,12 @@ struct llama_ubatch {
     // seq_idx:    indices of the unique sequence ids in the ubatch in [0, n_seqs_unq)
     //             used for extracting sequence pooled embeddings
 
-    //                          // size               | idx | val
-    llama_token  *  token;      // [n_tokens]         | i   | id, token
-    float        *  embd;       // [n_embd, n_tokens] | i   | embd
-    llama_pos    *  pos;        // [n_tokens*n_pos]   | i   | pos
+    //                          // size                     | idx | val
+    llama_token  *  token;      // [n_tokens]               | i   | id, token
+    float        *  embd;       // [n_embd, n_tokens]       | i   | embd
+    float        *  embd_state; // [n_embd_state, n_tokens] | i   | hidden state carried over from a previous stage (e.g. MTP)
+    int32_t      *  embd_row;   // [n_tokens]               | i   | embd is this row of ctx_other's layer input device buffer
+    llama_pos    *  pos;        // [n_tokens*n_pos]         | i   | pos
     int32_t      *  n_seq_id;   // [n_tokens]         | i   | -
     llama_seq_id ** seq_id;     // [n_tokens]         | s   | s0, s1, seq_id
     llama_seq_id *  seq_id_unq; // [n_seqs_unq]       | s   | seq_id
@@ -64,6 +66,9 @@ struct llama_ubatch {
     struct data_t {
         std::vector<llama_token>    token;
         std::vector<float>          embd;
+        std::vector<float>          embd_state;
+        std::vector<int32_t>        embd_row;
+        std::vector<int32_t>        embd_state_row; // the state is this row of ctx_state_src's h_nextn device buffer, empty if none
         std::vector<llama_pos>      pos;
         std::vector<int32_t>        n_seq_id;
         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
@@ -86,15 +91,18 @@ struct llama_ubatch {
 
 struct llama_hparams;
 
-// MTP hook batches carry the target model's hidden state (n_embd_out size).
 // DFlash batches carry the fused target features at the encoder input width (n_embd_inp_enc size).
-// Normal batches carry token embeddings (n_embd_inp size).
+// Other batches carry token embeddings (n_embd_inp size).
 size_t llama_batch_ext_select_n_embd_inp(llama_context_type ctx_type, llm_arch arch, const llama_hparams & hparams);
+
+// MTP contexts also take the target model's hidden state (n_embd_out size), 0 = no state input
+size_t llama_batch_ext_select_n_embd_state(llama_context_type ctx_type, const llama_hparams & hparams);
 
 struct llama_batch_ext {
     const size_t n_tokens_max;     // max number of tokens that can be stored in the batch
     const size_t n_embd_inp;       // decoder embd row width
     const size_t n_embd_inp_enc;   // encoder embd row width (e.g. eagle3/dflash extracted features)
+    const size_t n_embd_state;     // state embd row width, 0 if the context takes no state
     const llama_seq_id n_seq_max;  // max number of sequences
     llama_memory_i * mem;          // memory for position inference
     const llama_token n_vocab;     // max token ID that we accept
@@ -108,6 +116,10 @@ struct llama_batch_ext {
         llama_token  id = LLAMA_TOKEN_NULL;
         bool         has_embd = false; // whether embd_off is set
         size_t       embd_off = 0; // index offset in the embd array
+        bool         has_state = false; // whether state_off is set
+        size_t       state_off = 0; // index offset in the state array
+        int32_t      embd_row = -1; // row of ctx_other's layer input device buffer used as embd, -1 if none
+        int32_t      state_row = -1; // row of ctx_state_src's h_nextn device buffer used as state, -1 if none
         bool         output = false; // TODO: have dedicated output flags
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         std::unordered_set<llama_seq_id> seq_ids;
@@ -115,6 +127,7 @@ struct llama_batch_ext {
     };
     std::vector<token> tokens;
     std::vector<float> embd;
+    std::vector<float> state;
 
     llama_batch_ext(llama_context * ctx);
 
@@ -137,6 +150,9 @@ struct llama_batch_ext {
     bool add_seq(int32_t idx, llama_seq_id seq_id);
     bool set_token_id(int32_t idx, llama_token id);
     bool set_token_embd(int32_t idx, llama_embd embd_in);
+    bool set_token_state(int32_t idx, llama_embd state_in);
+    bool set_token_embd_row(int32_t idx, int32_t row);
+    bool set_token_state_row(int32_t idx, int32_t row);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
@@ -181,10 +197,28 @@ public:
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
     // compat      = optional filter: compat(a, b) == false keeps seq b out of a ubatch whose first seq is a
+    // strict      = optional second filter for ubatches narrower than n_mixed_min tokens per seq: when the
+    //               width comes out below it and any seq b has strict(a, b) == false, seqs 1.. go back to the
+    //               pool and the first seq is emitted alone (compat may admit seqs that only share a ubatch
+    //               of at least n_mixed_min tokens, see llama_memory_recurrent::replay_split). nullptr = no guard
+    // set_ok      = optional check of the full seq list of the ubatch (needs strict): when it returns false and
+    //               any seq b has strict(a, b) == false, the first seq is emitted alone (same as the width guard)
     using seq_compat_fn = std::function<bool(llama_seq_id a, llama_seq_id b)>;
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail = 0, const seq_compat_fn & compat = nullptr);
+    using seq_set_fn    = std::function<bool(const std::vector<llama_seq_id> & seqs)>;
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail = 0, const seq_compat_fn & compat = nullptr,
+            const seq_compat_fn & strict = nullptr, uint32_t n_mixed_min = 0, const seq_set_fn & set_ok = nullptr);
+
+    // why the last split_equal call left seqs out of its ubatch (SPLIT_CUT_* bits, 0 = nothing left out)
+    enum : uint32_t {
+        SPLIT_CUT_COMPAT = 1u << 0, // compat kept a seq out
+        SPLIT_CUT_WIDTH  = 1u << 1, // the strict guard: width < n_mixed_min
+        SPLIT_CUT_TAIL   = 1u << 2, // n_keep_tail deferred a seq
+        SPLIT_CUT_SET    = 1u << 3, // set_ok kept seqs 1.. out
+    };
+    uint32_t get_split_cut() const { return split_cut; }
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
+    // TODO: extend to support multiple _full_ sequences in the ubatch
     llama_ubatch split_seq(uint32_t n_ubatch);
 
     // a helper method for creating a well-defined ubatch of tokens
@@ -195,6 +229,7 @@ private:
     void clear();
 
     uint32_t split_pos_grid = 0;
+    uint32_t split_cut      = 0;
 
     // true if the token at batch index idx starts a new grid cell (a ubatch must not continue into it)
     bool split_on_grid(int32_t idx) const {
@@ -220,12 +255,16 @@ private:
     const bool allow_mixed;
 
     uint32_t n_embd;
+    uint32_t n_embd_state;
     uint32_t n_seq_max;
     uint32_t n_outputs;
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
+    std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
+    std::vector<int32_t>        embd_row_vec; // owned embd rows built from llama_batch_ext, llama_batch has no slot for them
+    std::vector<int32_t>        state_row_vec; // owned state rows built from llama_batch_ext, llama_batch has no slot for them
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

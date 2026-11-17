@@ -39,6 +39,7 @@
 #include "../src/llama-model.h"
 #include "../src/llama-mmap.h"
 #include "../src/llama-model-saver.h"
+#include "test-kv-writer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -176,7 +177,7 @@ struct model_geometry {
 
 static llama_model * make_model(bool no_alloc = false, const model_geometry & g = {}, llm_arch arch = LLM_ARCH_QWEN35, ggml_backend_dev_t device = nullptr) {
     gguf_context * meta = gguf_init_empty();
-    llama_model_saver ms(arch, meta);
+    test_kv_writer ms(arch, meta); // the saver no longer takes (arch, ctx)
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE, llm_arch_name(arch));
     ms.add_kv(LLM_KV_VOCAB_SIZE, g.vocab);
     ms.add_kv(LLM_KV_CONTEXT_LENGTH, uint32_t(2048));
@@ -2501,7 +2502,7 @@ static void run_draft_vocab_reserve(llama_model * model) {
         for (bool reserve : { false, true }) {
             llm_graph_result result(32);
             llm_graph_params params {};
-            params.arch = model->arch;
+            params.model = model; // upstream: llm_graph_params carries the model, not the arch
             params.hparams = model->hparams;
             params.gtype = LLM_GRAPH_TYPE_DECODER_MTP;
             params.res = &result;
@@ -2857,8 +2858,8 @@ static void run_common_sampler(llama_model * model) {
 
 // fork (bookkeep): compare production range removal with a physical-cell scan.
 static void run_kv_removal_metadata(llama_model * model) {
-    llama_kv_cache cache(*model, model->hparams, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true,
-            16, 3, 1, 0, LLAMA_SWA_TYPE_NONE, nullptr, [](uint32_t il) { return il == 1; }, nullptr, nullptr);
+    llama_kv_cache cache(*model, /*no_alloc*/ false, model->hparams, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true,
+            16, 3, 0, LLAMA_SWA_TYPE_NONE, nullptr, [](uint32_t il) { return il == 1; }, nullptr, nullptr);
     const std::vector<uint32_t> slots = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 12 };
     const llama_pos pos_by_slot[] = { 30, 0, 8, 4, 5, 2, 9, 3, 1, 5, 7, 12, 6, -1, 15, 5 };
     std::vector<llama_token> tokens(slots.size());
@@ -2994,8 +2995,8 @@ static void run_kv_removal_metadata(llama_model * model) {
 }
 
 static void run_scratch_empty_region(llama_model * model) {
-    llama_kv_cache cache(*model, model->hparams, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true,
-            1, 1, 1, 0, LLAMA_SWA_TYPE_NONE, nullptr, [](uint32_t il) { return il == 1; }, nullptr, nullptr);
+    llama_kv_cache cache(*model, /*no_alloc*/ false, model->hparams, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true,
+            1, 1, 0, LLAMA_SWA_TYPE_NONE, nullptr, [](uint32_t il) { return il == 1; }, nullptr, nullptr);
     const auto layers = cache.get_layer_ids();
     require(layers.size() == 1, "empty scratch fixture has one attention layer");
     const auto * key = cache.get_k_storage(layers[0]);
@@ -3358,7 +3359,7 @@ static void run_weight_borrow(llama_model * source, bool cuda = false, bool pin_
     saver.add_tensors_from_model();
     const bool recurrent[] = { true, false, false };
     gguf_set_arr_data(saver.gguf_ctx, saver.llm_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS).c_str(), GGUF_TYPE_BOOL, recurrent, 3);
-    saver.save(file.get());
+    require(gguf_write_to_file_ptr(saver.gguf_ctx, file.get(), false), "write borrowed-weight fixture"); // saver.save(FILE *) was removed
     fflush(file.get());
     llama_model_params mp = llama_model_default_params();
     ggml_backend_dev_t devices[] = { nullptr };

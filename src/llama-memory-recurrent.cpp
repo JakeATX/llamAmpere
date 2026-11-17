@@ -8,10 +8,21 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
+#include <atomic>
+
+// [TAG_RECURRENT_KEEP_BASE] widest ubatch (tokens per seq) that keeps its pre-ubatch plane; 0 = no memory has it on
+static std::atomic<uint32_t> g_rs_keep_base_rows{0};
+
+uint32_t llama_n_rs_keep_base(void) {
+    return g_rs_keep_base_rows.load();
+}
 
 //
 // llama_memory_recurrent
@@ -19,6 +30,7 @@
 
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
+                 bool   no_alloc,
                 ggml_type   type_r,
                 ggml_type   type_s,
                      bool   offload,
@@ -26,7 +38,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   gdn_replay_req,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -61,6 +73,27 @@ llama_memory_recurrent::llama_memory_recurrent(
         const bool   arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE ||
                                model.arch == LLM_ARCH_QWEN3NEXT;
         this->rs_ring = n_rs_seq > 0 && !this->gdn_replay && arch_ok && !env_off;
+        // [TAG_GDN_REPLAY_LANES] same archs: their conv and replay go through llm_build_delta_net_base. qwen4exp,
+        // kimi-k3 and bailingmoe3 read the scalar get_replay_len() in snapshot_shift_gather, so they keep the strict rule
+        // Default on (Jake 2026-11-14); LLAMA_GDN_REPLAY_LANES=0 (or off/false/no) turns it off. One sequence never
+        // differs from itself, so with one user the splits and the 1-D replay mask are the same as with lanes off.
+        const bool lanes_req = [] {
+            const char * e = getenv("LLAMA_GDN_REPLAY_LANES");
+            if (e == nullptr || *e == 0) {
+                return true;
+            }
+            std::string w(e);
+            for (char & c : w) {
+                c = (char) tolower((unsigned char) c);
+            }
+            return !(w == "0" || w == "off" || w == "false" || w == "no");
+        }();
+        this->gdn_replay_lanes = this->gdn_replay && lanes_req && arch_ok;
+        if (this->gdn_replay) {
+            LLAMA_LOG_INFO("%s: gdn_replay lanes = %s\n", __func__,
+                    !lanes_req ? "off (LLAMA_GDN_REPLAY_LANES=0)" :
+                    arch_ok    ? "on (default; LLAMA_GDN_REPLAY_LANES=0 turns it off)" : "off (arch not supported)");
+        }
         const char * env_rows = getenv("LLAMA_RS_RING_ROWS");
         this->rs_ring_rows_all = this->rs_ring && env_rows != nullptr && strcmp(env_rows, "1") == 0;
         const char * env_skip = getenv("LLAMA_RS_SHIFT_SKIP");
@@ -75,6 +108,16 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
     }
     rs_base.assign(mem_size, 0);
+    {
+        const char * env = getenv("LLAMA_RS_KEEP_BASE");
+        this->rs_keep_base = this->rs_ring && n_rs_seq >= 2 && env != nullptr && strcmp(env, "1") == 0;
+        if (this->rs_keep_base) {
+            g_rs_keep_base_rows.store(2 * (n_rs_seq + 1));
+            LLAMA_LOG_INFO("%s: rollback keep-base = on (ubatches of %u..%u tokens keep the pre-ubatch plane)\n", __func__,
+                    n_rs_seq + 2, 2 * (n_rs_seq + 1));
+        }
+    }
+    rs_keep_n.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -151,13 +194,13 @@ llama_memory_recurrent::llama_memory_recurrent(
         // s: with gdn_replay, only the authoritative state is kept here (no widening); the
         // (1 + n_rs_seq)-wide K-snapshot storage this replaces moves to ingr_l below.
         const uint32_t n_rows_s = gdn_replay ? mem_size : mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows_r);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(i), n_rows_r);
         // with gdn_replay the state rows and the checkpoint rows share one tensor (s_l = plane 0,
         // s_ckpt_l = plane 1, same bytes as two tensors): one gather can then pick either row by
         // index, which the rollback-independent verify graph uses as its replay base
-        ggml_tensor * s_pair = gdn_replay ? ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), 2 * (int64_t) mem_size) : nullptr;
-        ggml_tensor * s = s_pair ? ggml_view_2d(ctx, s_pair, hparams.n_embd_s(), mem_size, s_pair->nb[1], 0)
-                                 : ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows_s);
+        ggml_tensor * s_pair = gdn_replay ? ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(i), 2 * (int64_t) mem_size) : nullptr;
+        ggml_tensor * s = s_pair ? ggml_view_2d(ctx, s_pair, hparams.n_embd_s(i), mem_size, s_pair->nb[1], 0)
+                                 : ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(i), n_rows_s);
         if (s_pair) {
             ggml_format_name(s_pair, "cache_s2_l%d", i);
         }
@@ -170,12 +213,12 @@ llama_memory_recurrent::llama_memory_recurrent(
             // one row per cell, n_rs_seq ingredient slots back to back (see the header). Always F32,
             // whatever type_s is: the replay reads the gathered ring with this tensor's element size
             // (llm_build_delta_net_base::build_recurrent_attn), and k/v/g/beta are op inputs, not state.
-            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq, mem_size);
+            ggml_tensor * ingr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) hparams.n_embd_s_ingredient(i) * n_rs_seq, mem_size);
             ggml_format_name(ingr, "cache_ingr_l%d", i);
             ingr_l[i] = ingr;
 
             // oldest-edge-of-window checkpoint to replay from -- see the field comment in the header.
-            ggml_tensor * ckpt = ggml_view_2d(ctx, s_pair, hparams.n_embd_s(), mem_size, s_pair->nb[1], (size_t) mem_size * s_pair->nb[1]);
+            ggml_tensor * ckpt = ggml_view_2d(ctx, s_pair, hparams.n_embd_s(i), mem_size, s_pair->nb[1], (size_t) mem_size * s_pair->nb[1]);
             ggml_format_name(ckpt, "cache_s_ckpt_l%d", i);
             s_ckpt_l[i] = ckpt;
         }
@@ -191,21 +234,9 @@ llama_memory_recurrent::llama_memory_recurrent(
     // with no_alloc (the -fit memory probe) the state is only sized, like the KV cache: a real allocation here would
     // lower the device free memory the probe measures while the same bytes are also reported by memory_breakdown()
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                t->buffer = buf; // set dummy buffer so that the backend scheduler won't try to allocate the state
-            }
-        } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
-        }
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for rs cache");
-        }
-        ggml_backend_buffer_clear(buf, 0);
+        ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "rs cache");
+
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
     if (is_empty()) {
@@ -228,12 +259,21 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+llama_memory_recurrent::~llama_memory_recurrent() {
+    if (gdn_replay_lanes && lstats.n_ubatch > 0) {
+        LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu, bystander %llu\n", __func__,
+                (unsigned long long) lstats.n_ubatch, (unsigned long long) lstats.n_joint, (unsigned long long) lstats.n_strict,
+                (unsigned long long) lstats.n_width, (unsigned long long) lstats.n_tail, (unsigned long long) lstats.n_bystand);
+    }
+}
+
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
+        cells[i].rs_max = 0;
     }
 
     head = 0;
@@ -307,8 +347,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
-            // partial rollback via per-token snapshot index (bounded by n_rs_seq), or (gdn_replay)
-            // via a pending replay of the last `rollback` ingredient-ring steps.
+            // partial rollback via per-token snapshot index (bounded by the snapshots this seq really has, RB1b), or
+            // (gdn_replay) via a pending replay of the last `rollback` ingredient-ring steps.
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 // a cell shared by several sequences cannot move back for only one of them
                 if (cell.seq_id.size() > 1) {
@@ -332,6 +372,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     // consumed. rs_valid keeps bounding the conv snapshot groups separately.
                     const uint32_t ring_have = ckpt_span[seq_id] - std::min(ckpt_span[seq_id], replay_len[seq_id]);
                     have = std::min(have, ring_have);
+                }
+                // [TAG_RECURRENT_KEEP_BASE] the whole last ubatch goes: its pre-ubatch plane is group K - 1
+                if (rs_keep_base && (size_t) seq_id < rs_keep_n.size() && rs_keep_n[seq_id] > 0 &&
+                        rollback == (llama_pos) rs_keep_n[seq_id] && rs_valid[seq_id] == n_rs_seq - 1 && rs_idx[seq_id] == 0) {
+                    set_rs_idx(seq_id, n_rs_seq);
+                    rs_valid[seq_id]  = 0;
+                    rs_keep_n[seq_id] = 0;
+                    cell.pos = p0 - 1;
+                    return true;
                 }
                 if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq && rollback <= (llama_pos) have) {
                     if (gdn_replay) {
@@ -449,6 +498,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         if ((size_t) seq_id_src < nrs && (size_t) seq_id_dst < nrs) {
             rs_idx[seq_id_dst]     = rs_idx[seq_id_src];
             rs_valid[seq_id_dst]   = rs_valid[seq_id_src];
+            rs_keep_n[seq_id_dst]  = 0;
             replay_len[seq_id_dst] = replay_len[seq_id_src];
             ckpt_span[seq_id_dst]  = ckpt_span[seq_id_src];
             s_stale[seq_id_dst]    = s_stale[seq_id_src];
@@ -591,30 +641,39 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
-    std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [ctx, buf] : ctxs_bufs) {
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
-
-        if (hparams.no_alloc) {
-            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
-        } else {
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
-        }
-    }
-    return ret;
+    return ctxs_bufs.memory_breakdown();
 }
 
-bool llama_memory_recurrent::replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+static bool replay_static_on() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_GDN_REPLAY_STATIC"); // =0: the rollback-shaped graph (A/B)
         return e == nullptr || strcmp(e, "0") != 0;
     }();
+    return on;
+}
+
+static bool replay_short_on() {
     static const bool short_on = [] {
         const char * e = getenv("LLAMA_GDN_REPLAY_SHORT");
         return e != nullptr && strcmp(e, "1") == 0;
     }();
-    return on && n_rs_seq > 0 && (n_seq_tokens >= n_rs_seq || (short_on && n_seq_tokens >= 2));
+    return short_on;
+}
+
+bool llama_memory_recurrent::replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+    return replay_static_on() && n_rs_seq > 0 && (n_seq_tokens >= n_rs_seq || (replay_short_on() && n_seq_tokens >= 2));
+}
+
+bool llama_memory_recurrent::replay_short_join() {
+    static const bool join = [] {
+        const char * e = getenv("LLAMA_GDN_REPLAY_SHORT_JOIN"); // =0: short rounds stay strict (split, A/B)
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+    return join && replay_static_on() && replay_short_on();
+}
+
+bool llama_memory_recurrent::replay_join_width(uint32_t n_seq_tokens, uint32_t n_rs_seq) {
+    return replay_static_width(n_seq_tokens, n_rs_seq) && (n_seq_tokens >= n_rs_seq || replay_short_join());
 }
 
 uint32_t llama_memory_recurrent::replay_span_new(uint32_t ckpt_span, uint32_t replay_len, uint32_t n_seq_tokens, uint32_t n_rs_seq) {
@@ -625,16 +684,103 @@ uint32_t llama_memory_recurrent::replay_span_new(uint32_t ckpt_span, uint32_t re
     return std::min(m + n_seq_tokens, n_rs_seq);
 }
 
-bool llama_memory_recurrent::replay_split::compat(llama_seq_id a, llama_seq_id b) const {
+void llama_memory_recurrent::replay_split::count_tokens(const llama_batch & batch) {
+    n_tokens.assign(replay_len.size(), 0);
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        for (int32_t k = 0; k < batch.n_seq_id[i]; ++k) {
+            const llama_seq_id seq = batch.seq_id[i][k];
+            if (seq >= 0 && (size_t) seq < n_tokens.size()) {
+                n_tokens[seq]++;
+            }
+        }
+    }
+}
+
+bool llama_memory_recurrent::replay_split::strict(llama_seq_id a, llama_seq_id b) const {
     if (a < 0 || b < 0 || (size_t) a >= replay_len.size() || (size_t) b >= replay_len.size()) {
         return true;
     }
     return replay_len[a] == replay_len[b] && ckpt_span[a] == ckpt_span[b] && s_stale[a] == s_stale[b];
 }
 
-void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch) {
+bool llama_memory_recurrent::replay_split::compat(llama_seq_id a, llama_seq_id b) const {
+    if (strict(a, b)) {
+        return true;
+    }
+    // [TAG_GDN_REPLAY_LANES] both seqs can fill a static-width ubatch; split_equal's strict guard checks the real width
+    if (lanes && (size_t) a < n_tokens.size() && (size_t) b < n_tokens.size()) {
+        const uint32_t na = n_tokens[a];
+        const uint32_t nb = n_tokens[b];
+        return replay_join_width(na, n_rs_seq) && replay_join_width(nb, n_rs_seq);
+    }
+    return false;
+}
+
+void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch, uint32_t split_cut) {
     if (!active || ubatch.n_tokens == 0) {
         return;
+    }
+    const uint32_t n_seq_tokens = ubatch.n_seqs > 0 ? ubatch.n_tokens / ubatch.n_seqs : 0;
+    // [TAG_GDN_REPLAY_LANES] lanes that differ only on the static verify graph (checked before the values below are
+    // overwritten). Without lanes compat == strict, so this check is skipped there.
+    bool mixed = false;
+    for (uint32_t i = 1; lanes && i < ubatch.n_seqs_unq && !mixed; ++i) {
+        mixed = !strict(ubatch.seq_id_unq[0], ubatch.seq_id_unq[i]);
+    }
+    if (mixed) {
+        GGML_ASSERT(replay_join_width(n_seq_tokens, n_rs_seq));
+    }
+    if (stats != nullptr) {
+        stats->n_ubatch++;
+        stats->n_joint  += mixed;
+        stats->n_strict += (split_cut & llama_batch_allocr::SPLIT_CUT_COMPAT) != 0;
+        stats->n_width  += (split_cut & llama_batch_allocr::SPLIT_CUT_WIDTH)  != 0;
+        stats->n_tail   += (split_cut & llama_batch_allocr::SPLIT_CUT_TAIL)   != 0;
+        stats->n_bystand += (split_cut & llama_batch_allocr::SPLIT_CUT_SET)   != 0;
+        // LLAMA_GDN_REPLAY_LANES_LOG=N: print the counts every N ubatches instead of every 4096 (diagnostics only)
+        static const uint64_t log_every = [] {
+            const char * e = getenv("LLAMA_GDN_REPLAY_LANES_LOG");
+            const unsigned long long v = e != nullptr ? strtoull(e, nullptr, 10) : 0;
+            return v > 0 ? (uint64_t) v : (uint64_t) 4096;
+        }();
+        if (stats->n_ubatch % log_every == 0) {
+            LLAMA_LOG_INFO("%s: gdn_replay lanes: %llu ubatches, %llu joint; cuts: strict %llu, width < n_rs_seq %llu, keep-tail %llu, bystander %llu\n", __func__,
+                    (unsigned long long) stats->n_ubatch, (unsigned long long) stats->n_joint, (unsigned long long) stats->n_strict,
+                    (unsigned long long) stats->n_width, (unsigned long long) stats->n_tail, (unsigned long long) stats->n_bystand);
+        }
+    }
+    // [TAG_GDN_REPLAY_LANES] the cells after find_slot's gather (members move to [min, min + n_seqs))
+    if (lanes && !tail.empty()) {
+        int32_t cmin = -1;
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            const uint32_t i = s*n_seq_tokens;
+            const llama_seq_id seq = ubatch.seq_id[i][0];
+            if (ubatch.n_seq_id[i] != 1 || seq < 0 || (size_t) seq >= tail.size() || tail[seq] < 0) {
+                cmin = -1; // a new or shared cell: find_slot takes an empty cell, not tracked here
+                break;
+            }
+            cmin = cmin < 0 ? tail[seq] : std::min(cmin, tail[seq]);
+        }
+        if (cmin < 0) {
+            tail.clear();
+            owner.clear();
+        }
+        for (uint32_t s = 0; s < ubatch.n_seqs && !tail.empty(); ++s) {
+            const llama_seq_id seq = ubatch.seq_id[s*n_seq_tokens][0];
+            const int32_t dst = cmin + (int32_t) s;
+            const int32_t src = tail[seq];
+            if (dst == src) {
+                continue;
+            }
+            std::swap(owner[dst], owner[src]);
+            tail[seq] = dst;
+            if (owner[src] >= 0) {
+                tail[owner[src]] = src;
+            } else if (owner[src] == -2) {
+                tail.clear();
+                owner.clear();
+            }
+        }
     }
     // same values the graph input takes (max over the ubatch's lanes), same update as consume_replay()
     uint32_t r = 0;
@@ -646,8 +792,7 @@ void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch) 
             span = std::max(span, ckpt_span[seq]);
         }
     }
-    const uint32_t n_seq_tokens = ubatch.n_seqs > 0 ? ubatch.n_tokens / ubatch.n_seqs : 0;
-    const uint32_t span_new     = replay_span_new(span, r, n_seq_tokens, n_rs_seq);
+    const uint32_t span_new = replay_span_new(span, r, n_seq_tokens, n_rs_seq);
     for (uint32_t i = 0; i < ubatch.n_seqs_unq; ++i) {
         const llama_seq_id seq = ubatch.seq_id_unq[i];
         if (seq >= 0 && (size_t) seq < replay_len.size()) {
@@ -658,11 +803,59 @@ void llama_memory_recurrent::replay_split::advance(const llama_ubatch & ubatch) 
     }
 }
 
+bool llama_memory_recurrent::replay_split::pending(llama_seq_id s) const {
+    return s >= 0 && (size_t) s < replay_len.size() && (replay_len[s] > 0 || s_stale[s] != 0);
+}
+
+bool llama_memory_recurrent::replay_split::set_ok(const std::vector<llama_seq_id> & seqs) const {
+    if (!lanes) {
+        return true;
+    }
+    auto member = [&](llama_seq_id q) {
+        return std::find(seqs.begin(), seqs.end(), q) != seqs.end();
+    };
+    // the cell range find_slot will use; unknown cells: any pending seq outside the ubatch blocks it
+    bool known = !tail.empty();
+    int32_t cmin = -1;
+    int32_t cmax = -1;
+    for (const llama_seq_id seq : seqs) {
+        if (!known || seq < 0 || (size_t) seq >= tail.size() || tail[seq] < 0) {
+            known = false;
+            break;
+        }
+        cmin = cmin < 0 ? tail[seq] : std::min(cmin, tail[seq]);
+        cmax = std::max(cmax, tail[seq]);
+    }
+    for (llama_seq_id q = 0; (size_t) q < replay_len.size(); ++q) {
+        if (!pending(q) || member(q)) {
+            continue;
+        }
+        if (!known || (size_t) q >= tail.size() || tail[q] < 0 || (tail[q] >= cmin && tail[q] <= cmax)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+llama_batch_allocr::seq_set_fn llama_memory_recurrent::replay_split::set_fn() const {
+    if (!active || !lanes) {
+        return nullptr;
+    }
+    return [this](const std::vector<llama_seq_id> & seqs) { return set_ok(seqs); };
+}
+
 llama_batch_allocr::seq_compat_fn llama_memory_recurrent::replay_split::fn() const {
     if (!active) {
         return nullptr;
     }
     return [this](llama_seq_id a, llama_seq_id b) { return compat(a, b); };
+}
+
+llama_batch_allocr::seq_compat_fn llama_memory_recurrent::replay_split::strict_fn() const {
+    if (!active || !lanes) {
+        return nullptr;
+    }
+    return [this](llama_seq_id a, llama_seq_id b) { return strict(a, b); };
 }
 
 llama_memory_recurrent::replay_split llama_memory_recurrent::make_replay_split(const llama_batch_allocr & balloc) const {
@@ -671,13 +864,34 @@ llama_memory_recurrent::replay_split llama_memory_recurrent::make_replay_split(c
         return rs;
     }
     rs.active     = true;
+    rs.lanes      = gdn_replay_lanes;
     rs.n_rs_seq   = n_rs_seq;
     rs.replay_len = replay_len;
     rs.ckpt_span  = ckpt_span;
     rs.s_stale    = s_stale;
 
-    // is anything kept apart in this batch? only for the log
     const llama_batch & batch = balloc.get_batch();
+    if (rs.lanes) {
+        rs.count_tokens(batch);
+        rs.stats = &lstats;
+        rs.owner.assign(size, -1);
+        for (uint32_t i = 0; i < size; ++i) {
+            if (cells[i].seq_id.size() == 1) {
+                rs.owner[i] = *cells[i].seq_id.begin();
+            } else if (cells[i].seq_id.size() > 1) {
+                rs.owner[i] = -2;
+            }
+        }
+        rs.tail.assign(size, -1);
+        for (uint32_t q = 0; q < size; ++q) {
+            const int32_t t = cells[q].tail;
+            if (t >= 0 && rs.owner[t] == (int32_t) q) {
+                rs.tail[q] = t;
+            }
+        }
+    }
+
+    // is anything kept apart in this batch? only for the log
     llama_seq_id first = -1;
     bool disagree = false;
     for (int32_t i = 0; i < batch.n_tokens && !disagree; ++i) {
@@ -722,14 +936,15 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn(),
+                        rsplit.strict_fn(), rsplit.n_mixed_min(), rsplit.set_fn());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
 
-            rsplit.advance(ubatch);
+            rsplit.advance(ubatch, balloc.get_split_cut());
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
@@ -769,6 +984,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     // find_slot credits each sequence's rs_valid with the ubatch's tokens; this dry run must not,
     // or apply() credits them a second time and a rollback deeper than the real history is accepted
     auto org_rs_valid = rs_valid;
+    auto org_rs_keep_n = rs_keep_n;
 
     bool success = true;
 
@@ -784,6 +1000,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     used = org_used;
     head = org_head;
     rs_valid = std::move(org_rs_valid);
+    rs_keep_n = std::move(org_rs_keep_n);
 
     return success;
 }
@@ -949,6 +1166,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
+        cell.rs_max = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens - 1 : 0;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
@@ -976,6 +1194,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // [VSHIFT] without the shift only the groups this ubatch wrote (0..n-1) are real
                 if (rs_shift_skip && n_seq_tokens <= n_rs_seq) {
                     rs_valid[seq_id] = n_seq_tokens - 1;
+                }
+                // [TAG_RECURRENT_KEEP_BASE] groups 0..K-2 are this ubatch, group K-1 is the state before it
+                rs_keep_n[seq_id] = 0;
+                if (keep_base_width(n_seq_tokens)) {
+                    rs_valid[seq_id]  = n_rs_seq - 1;
+                    rs_keep_n[seq_id] = n_seq_tokens;
                 }
             }
         }
@@ -1320,8 +1544,8 @@ bool llama_memory_recurrent::state_read_replay(llama_io_read_i & io, uint32_t ce
         uint64_t ingr_size_row_ref;
         io.read(&ckpt_size_row_ref, sizeof(ckpt_size_row_ref));
         io.read(&ingr_size_row_ref, sizeof(ingr_size_row_ref));
-        const size_t ckpt_size_row = ggml_row_size(s_ckpt_l[il]->type, hparams.n_embd_s());
-        const size_t ingr_size_row = ggml_row_size(ingr_l[il]->type, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq);
+        const size_t ckpt_size_row = ggml_row_size(s_ckpt_l[il]->type, hparams.n_embd_s(il));
+        const size_t ingr_size_row = ggml_row_size(ingr_l[il]->type, (int64_t) hparams.n_embd_s_ingredient(il) * n_rs_seq);
         if (ckpt_size_row != ckpt_size_row_ref || ingr_size_row != ingr_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched replay row sizes (layer %d)\n", __func__, il);
             return false;
@@ -1372,7 +1596,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         io.write(&r_type_i, sizeof(r_type_i));
 
         // Write row size of R tensor
-        const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+        const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r(il));
         io.write(&r_size_row, sizeof(r_size_row));
 
         // Write each logical cell row range. With pending recurrent rollback,
@@ -1405,7 +1629,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             io.write(&s_type_i, sizeof(s_type_i));
 
             // Write row size of S tensor
-            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s(il));
             io.write(&s_size_row, sizeof(s_size_row));
 
             // Write each logical cell row range. With pending recurrent rollback,
@@ -1425,7 +1649,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
 
-            const uint32_t n_embd_s = hparams.n_embd_s();
+            const uint32_t n_embd_s = hparams.n_embd_s(il);
 
             // Write S tensor type
             const int32_t s_type_i = (int32_t)s_l[il]->type;
@@ -1468,8 +1692,8 @@ void llama_memory_recurrent::state_write_replay(llama_io_write_i & io, const std
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (s_ckpt_l[il] == nullptr) continue;
 
-        const uint64_t ckpt_size_row = ggml_row_size(s_ckpt_l[il]->type, hparams.n_embd_s());
-        const uint64_t ingr_size_row = ggml_row_size(ingr_l[il]->type, (int64_t) hparams.n_embd_s_ingredient() * n_rs_seq);
+        const uint64_t ckpt_size_row = ggml_row_size(s_ckpt_l[il]->type, hparams.n_embd_s(il));
+        const uint64_t ingr_size_row = ggml_row_size(ingr_l[il]->type, (int64_t) hparams.n_embd_s_ingredient(il) * n_rs_seq);
         io.write(&ckpt_size_row, sizeof(ckpt_size_row));
         io.write(&ingr_size_row, sizeof(ingr_size_row));
 
@@ -1621,7 +1845,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         // Read row size of key
         uint64_t r_size_row_ref;
         io.read(&r_size_row_ref, sizeof(r_size_row_ref));
-        const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+        const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r(il));
         if (r_size_row != r_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched r row size (%zu != %zu, layer %d)\n", __func__, r_size_row, (size_t) r_size_row_ref, il);
             return false;
@@ -1665,7 +1889,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // Read row size of value
             uint64_t s_size_row_ref;
             io.read(&s_size_row_ref, sizeof(s_size_row_ref));
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s(il));
             if (s_size_row != s_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched s row size (%zu != %zu, layer %d)\n", __func__, s_size_row, (size_t) s_size_row_ref, il);
                 return false;
@@ -1682,7 +1906,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             // skip null layers
             if (s_l[il] == nullptr) continue;
 
-            const uint32_t n_embd_s = hparams.n_embd_s();
+            const uint32_t n_embd_s = hparams.n_embd_s(il);
 
             // Read type of value
             int32_t s_type_i_ref;
@@ -1742,12 +1966,12 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (r_l[il] != nullptr) {
-            const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+            const size_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r(il));
             llama_clear_tensor_data(r_l[il], cell_head * r_size_row, cell_count * r_size_row);
         }
 
         if (s_l[il] != nullptr) {
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s(il));
             llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
         }
 
@@ -1981,6 +2205,11 @@ uint32_t llama_memory_recurrent_context::get_ckpt_span() const {
             span = std::max(span, mem->ckpt_span[seq]);
         }
     }
+    // [TAG_GDN_REPLAY_LANES] a static-width lanes ubatch reads the per-lane values (lane_seq), not this maximum
+    if (disagree && mem->gdn_replay_lanes &&
+            llama_memory_recurrent::replay_join_width(ubatch.n_seq_tokens, mem->n_rs_seq)) {
+        disagree = false;
+    }
     if (disagree) {
         // init_batch keeps such lanes apart ([TAG_GDN_REPLAY_SPLIT]); reaching this is a bug
         static bool warned = false;
@@ -2011,6 +2240,27 @@ uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
     return mem->n_rs_seq;
 }
 
+bool llama_memory_recurrent_context::get_replay_lanes() const {
+    return mem->gdn_replay_lanes && !is_full;
+}
+
+llama_seq_id llama_memory_recurrent_context::lane_seq(int i) const {
+    const auto & cell = mem->cells[i + mem->head];
+    return cell.seq_id.empty() ? -1 : *cell.seq_id.begin();
+}
+
+uint32_t llama_memory_recurrent_context::replay_len_seq(llama_seq_id seq) const {
+    return seq >= 0 && (size_t) seq < mem->replay_len.size() ? mem->replay_len[seq] : 0;
+}
+
+uint32_t llama_memory_recurrent_context::ckpt_span_seq(llama_seq_id seq) const {
+    return seq >= 0 && (size_t) seq < mem->ckpt_span.size() ? mem->ckpt_span[seq] : 0;
+}
+
+bool llama_memory_recurrent_context::s_stale_seq(llama_seq_id seq) const {
+    return seq >= 0 && (size_t) seq < mem->s_stale.size() && mem->s_stale[seq] != 0;
+}
+
 uint32_t llama_memory_recurrent_context::get_snap_shift() const {
     if (mem->n_rs_seq == 0 || is_full || mem->rs_ring || mem->rs_shift_skip) {
         return 0;
@@ -2027,7 +2277,9 @@ uint32_t llama_memory_recurrent_context::get_snap_shift() const {
     // llm_graph_input_rs::set_input_shift turns the surplus groups of the other lanes into
     // copies of their own destination rows. Sizing it for the largest r instead moved too few
     // groups for the other lanes, whose rs_valid still credited them (test gate G).
-    // In replay mode the lanes agree ([TAG_GDN_REPLAY_SPLIT]), so min == max there.
+    // In replay mode the lanes agree ([TAG_GDN_REPLAY_SPLIT]), so min == max there. Lanes that differ
+    // ([TAG_GDN_REPLAY_LANES]) have n >= n_rs_seq, where this is 1 for every r (0 for n >= K), or, with
+    // replay_short_join, a short static round, where set_input_shift moves K - max(n, r_s) groups per lane.
     uint32_t r = 0;
     bool     first = true;
     const auto & group_of = mem->gdn_replay ? mem->replay_len : mem->rs_idx;
@@ -2052,6 +2304,9 @@ uint32_t llama_memory_recurrent_context::get_n_written() const {
     }
     const uint32_t K = mem->n_rs_seq + 1;
     const uint32_t n = get_ubatch().n_seq_tokens;
+    if (mem->keep_base_width(n)) {
+        return K - 1; // [TAG_RECURRENT_KEEP_BASE] the newest K - 1 groups go to ring planes, the old logical plane stays
+    }
     if (n >= K && !mem->rs_ring_rows_all) {
         return 0; // fills the ring: b' = 0, the static copies write group g at plane g
     }
@@ -2081,7 +2336,7 @@ uint32_t llama_memory_recurrent_context::get_n_older() const {
     }
     const llama_ubatch & ubatch = get_ubatch();
     const uint32_t K = mem->n_rs_seq + 1;
-    const uint32_t n = ubatch.n_seq_tokens;
+    const uint32_t n = mem->keep_base_width(ubatch.n_seq_tokens) ? K - 1 : ubatch.n_seq_tokens; // [TAG_RECURRENT_KEEP_BASE]
     uint32_t rows = 0;
     if (n < K) {
         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
@@ -2102,7 +2357,7 @@ void llama_memory_recurrent_context::fill_rs_ring(int32_t * copy, int32_t * wr, 
     GGML_ASSERT(get_rs_ring());
     const llama_ubatch & ubatch = get_ubatch();
     const uint32_t K         = mem->n_rs_seq + 1;
-    const uint32_t n         = ubatch.n_seq_tokens;
+    const uint32_t n         = mem->keep_base_width(ubatch.n_seq_tokens) ? K - 1 : ubatch.n_seq_tokens; // [TAG_RECURRENT_KEEP_BASE]
     const uint32_t n_seqs    = ubatch.n_seqs;
     const uint32_t n_rs      = get_n_rs();
     const uint32_t size      = mem->size;

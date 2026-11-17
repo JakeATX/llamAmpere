@@ -21,6 +21,8 @@ add_library(${TARGET} STATIC
     server-decision.h
     server-context.cpp
     server-context.h
+    server-realtime.cpp
+    server-realtime.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
@@ -46,10 +48,14 @@ set(TARGET llama-server-impl)
 
 add_library(${TARGET}
     server.cpp
+    server-connect.cpp
+    server-connect.h
     server-http.cpp
     server-http.h
     server-models.cpp
     server-models.h
+    server-models-sched.cpp
+    server-models-sched.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 

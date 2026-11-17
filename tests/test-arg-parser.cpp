@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "speculative.h"
 #include "spec-defaults.h"
+#include "preset.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -112,10 +113,20 @@ static void test(void) {
         common_params base;
         base.n_parallel = 4;
         base.n_outputs_max_per_seq = 8;
+        base.n_ubatch = 512;
 
-        const auto draft = common_base_params_to_speculative(base);
-        assert(draft.n_outputs_max == 4);
-        assert(draft.n_outputs_max_per_seq == 1);
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_outputs_max == 4);
+            assert(draft.n_outputs_max_per_seq == 1);
+            assert(draft.n_ubatch == 512); // inherits the target by default
+        }
+
+        base.speculative.draft.n_ubatch = 8;
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_ubatch == 8);
+        }
     }
 
 #ifndef _WIN32
@@ -239,6 +250,291 @@ static void test(void) {
     };
 
     std::vector<std::string> argv;
+
+    {
+        auto parse_card = [&](std::vector<std::string> args, common_params & out, llama_example ex = LLAMA_EXAMPLE_SERVER) {
+            args.insert(args.begin(), "test-arg-parser");
+            return common_params_parse(args.size(), list_str_to_char(args).data(), out, ex);
+        };
+        for (const std::string name : {"24dense", "12dense", "10dense", "8dense"}) {
+            for (const auto & args : std::vector<std::vector<std::string>>{
+                    {"--preset", name}, {name}, {"--preset", name, "headless"},
+                    {name, "headless"}, {name + "-headless"}, {"--preset", name + "-headless"},
+                    {name, "headed"}, {"--preset", name, "headed"}}) {
+                common_params selected;
+                assert(parse_card(args, selected));
+                const bool headless = name == "8dense" || args.back() == "headless" || string_ends_with(args.back(), "-headless");
+                assert(selected.card_preset == name && selected.card_preset_ctx_default && selected.fit_params);
+                assert(selected.card_preset_headless == headless);
+                const int expected_ctx = name == "8dense" ? 204800 : name == "10dense" ?
+                        (headless ? 212992 : 180224) : name == "12dense" ? (headless ? 262144 : 196608) : 262144;
+                assert(selected.n_ctx == expected_ctx);
+                if (name != "24dense") {
+                    assert(selected.speculative.draft.vocab_map == "auto:65536");
+                    assert(selected.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP);
+                }
+                assert(selected.fit_params_target_explicit);
+                assert(selected.sampling.temp == 1.0f && selected.sampling.top_k == 20);
+                assert(selected.sampling.top_p == 0.95f && selected.sampling.min_p == 0.0f);
+                assert(selected.sampling.spec_lossy == (name != "8dense"));
+                for (size_t target : selected.fit_params_target) {
+                    assert(target == size_t(headless ? 500 : 1024) * 1024 * 1024);
+                }
+                for (bool preset_first : {false, true}) {
+                    std::vector<std::string> combined = {"-c", "8192", "-fitt", "768", "-fit", "off",
+                            "--temperature", "0.7", "--top-k", "32", "--top-p", "0.9", "--min-p", "0.1", "--spec-mb-mtp",
+                            "--spec-draft-vocab-map", "none"};
+                    combined.insert(preset_first ? combined.begin() : combined.end(), args.begin(), args.end());
+                    common_params overridden;
+                    assert(parse_card(combined, overridden));
+                    assert(overridden.n_ctx == 8192 && !overridden.card_preset_ctx_default && !overridden.fit_params);
+                    assert(overridden.fit_params_target.front() == size_t(768) * 1024 * 1024);
+                    assert(overridden.sampling.temp == 0.7f && overridden.sampling.top_k == 32);
+                    assert(overridden.sampling.top_p == 0.9f && overridden.sampling.min_p == 0.1f);
+                    assert(overridden.sampling.spec_lossy);
+                    assert(overridden.speculative.draft.vocab_map == "none");
+                }
+            }
+        }
+        common_params no_card;
+        assert(!parse_card({"headless"}, no_card));
+        assert(!parse_card({"headed"}, no_card));
+        common_params cli_headless;
+        assert(parse_card({"8dense-headless", "-m", "model_file.gguf"}, cli_headless, LLAMA_EXAMPLE_CLI));
+        assert(cli_headless.fit_params_target.front() == size_t(500) * 1024 * 1024);
+        common_params full_context;
+        assert(parse_card({"--preset", "8dense", "-c", "0"}, full_context));
+        assert(full_context.n_ctx == 0 && !full_context.card_preset_ctx_default);
+        for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
+            common_params selected;
+            assert(parse_card({"--preset", name}, selected));
+            common_params bare;
+            assert(parse_card({name}, bare));
+            assert(selected.card_preset == name && bare.card_preset == name);
+            assert(selected.n_ctx == bare.n_ctx && selected.n_parallel == 1);
+            assert(!selected.card_preset_flags.empty());
+            for (const auto & entry : common_card_preset_get(name).env) {
+                assert(entry.first != "LLAMA_SPEC_COPY");
+            }
+            const uint32_t bits = selected.card_preset == "8dense" ? 3 : 4;
+            assert(selected.cache_type_k == GGML_TYPE_F16 && selected.cache_type_v == GGML_TYPE_F16);
+            assert(selected.sj_kvarn_bits_k == bits && selected.sj_kvarn_bits_v == bits);
+            assert(bare.sj_kvarn_bits_k == bits && bare.sj_kvarn_bits_v == bits);
+            if (selected.card_preset == "24dense") {
+                assert(selected.cache_type_s == GGML_TYPE_F32);
+            }
+            for (bool preset_first : {false, true}) {
+                std::vector<std::string> args = {"-c", "8192", "-ub", "128", "--spec-type", "none", "--no-spec-mb-mtp"};
+                args.insert(preset_first ? args.begin() : args.end(), {"--preset", name});
+                common_params overrides;
+                assert(parse_card(args, overrides));
+                assert(overrides.n_ctx == 8192 && overrides.n_ubatch == 128);
+                assert(!overrides.sampling.spec_lossy);
+                assert(std::find(overrides.speculative.types.begin(), overrides.speculative.types.end(),
+                                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == overrides.speculative.types.end());
+                assert(std::find(overrides.speculative.types.begin(), overrides.speculative.types.end(),
+                                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) == overrides.speculative.types.end());
+            }
+        }
+        for (const auto & name : {"12dense", "10dense", "8dense"}) {
+            for (int slots : {2, 3, 4, -1}) {
+                common_params invalid;
+                assert(!parse_card({"-np", std::to_string(slots), "--preset", name}, invalid));
+                assert(invalid.card_preset.empty());
+            }
+        }
+        for (int slots : {2, 3, 4}) {
+            common_params multi;
+            assert(parse_card({"-np", std::to_string(slots), "--preset", "24dense"}, multi));
+            assert(multi.n_parallel == slots && multi.kv_unified && multi.speculative.draft.n_min == 4);
+        }
+        common_params depth;
+        assert(parse_card({"--spec-draft-n-max", "3", "--preset", "24dense"}, depth));
+        assert(depth.speculative.draft.n_max == 3 && depth.speculative.draft.n_min_adaptive == 3);
+        for (bool preset_first : {false, true}) {
+            std::vector<std::string> args = {"--spec-draft-n-min-adaptive", "6"};
+            args.insert(preset_first ? args.begin() : args.end(), {"--preset", "24dense"});
+            common_params minimum;
+            assert(parse_card(args, minimum));
+            assert(minimum.speculative.draft.n_min_adaptive == 6 && minimum.speculative.draft.n_max == 6);
+        }
+        common_params conflict;
+        assert(!parse_card({"--preset", "24dense", "--spec-draft-n-min-adaptive", "6",
+                           "--spec-draft-n-max", "5"}, conflict));
+        common_params batch;
+        assert(parse_card({"--preset", "24dense", "-b", "128"}, batch));
+        assert(batch.n_batch == 128 && batch.n_ubatch <= 128);
+        common_params large_batch;
+        assert(parse_card({"-b", "8192", "--preset", "24dense"}, large_batch));
+        assert(large_batch.n_batch == 8192 && large_batch.n_ubatch == 1024);
+        for (const auto & name : {"10dense", "12dense"}) {
+            common_params plain_mtp;
+            assert(parse_card({"--preset", name, "--spec-draft-n-min-adaptive", "6"}, plain_mtp));
+            assert(plain_mtp.speculative.draft.n_max == 4 && plain_mtp.speculative.draft.n_min_adaptive == 6);
+        }
+        common_params min_depth;
+        assert(parse_card({"--preset", "24dense", "--spec-draft-n-max", "3"}, min_depth));
+        assert(min_depth.speculative.draft.n_min == 3);
+        common_params explicit_min;
+        assert(parse_card({"--spec-draft-n-min", "1", "--preset", "24dense"}, explicit_min));
+        assert(explicit_min.speculative.draft.n_min == 1);
+        common_params kv;
+        assert(parse_card({"-ctk", "q8_0", "-ctv", "q8_0", "--preset", "10dense"}, kv));
+        assert(kv.cache_type_k == GGML_TYPE_Q8_0 && kv.cache_type_v == GGML_TYPE_Q8_0 && !kv.card_preset_kv_default);
+        common_params asym;
+        assert(parse_card({"--slot-ctx", "262144,0,0", "--preset", "24dense", "-np", "3", "-c", "352256"}, asym));
+        assert(asym.slot_ctx == std::vector<int32_t>({262144, 0, 0}) && asym.n_ctx == 352256);
+        common_params derived;
+        assert(parse_card({"--preset", "24dense", "--slot-ctx", "65536,32768,32768", "-np", "3"}, derived));
+        assert(derived.n_ctx == 0);
+        common_params per_slot;
+        assert(parse_card({"--kv-unified-per-slot", "65536", "--preset", "24dense", "-np", "4"}, per_slot));
+        assert(per_slot.n_ctx == 0 && per_slot.kv_unified_per_slot == 65536);
+        for (const auto & literal : {"24dense", "--preset", "8dense", "headless", "headed"}) {
+            common_params prompt;
+            assert(parse_card({"-m", "model_file.gguf", "-p", literal}, prompt, LLAMA_EXAMPLE_CLI));
+            assert(prompt.prompt == literal && prompt.card_preset.empty());
+            common_params with_preset;
+            assert(parse_card({"--preset", "24dense", "-m", "model_file.gguf", "-p", literal}, with_preset, LLAMA_EXAMPLE_CLI));
+            assert(with_preset.prompt == literal && with_preset.card_preset == "24dense");
+        }
+        common_params adapter;
+        assert(parse_card({"--lora-scaled", "24dense:0.5", "--preset", "24dense"}, adapter));
+        assert(adapter.lora_adapters.size() == 1);
+        assert(adapter.lora_adapters.front().path == "24dense" && adapter.lora_adapters.front().scale == 0.5f);
+        common_params invalid;
+        assert(!parse_card({"--preset", "unknown"}, invalid));
+        assert(!parse_card({"--preset"}, invalid));
+        assert(!parse_card({"24dense", "--preset", "10dense"}, invalid));
+        common_params tiny;
+        assert(parse_card({"--preset", "8dense"}, tiny));
+        assert(tiny.n_ctx == 204800 && tiny.n_ubatch == 256);
+        assert(tiny.cache_type_k == GGML_TYPE_F16 && tiny.cache_type_v == GGML_TYPE_F16);
+        assert(tiny.sj_kvarn_bits_k == 3 && tiny.sj_kvarn_bits_v == 3);
+        assert(tiny.sj_kvarn_body_type == GGML_TYPE_I16);
+        assert(tiny.speculative.draft.n_max == 3 && tiny.speculative.draft.n_ubatch == 8);
+        assert(tiny.speculative.n_rs_seq_override == 3);
+#ifndef _WIN32
+        const char * old_ctx = std::getenv("LLAMA_ARG_CTX_SIZE");
+        const bool had_ctx = old_ctx != nullptr;
+        const std::string saved_ctx = old_ctx ? old_ctx : "";
+        setenv("LLAMA_ARG_CTX_SIZE", "16384", 1);
+        common_params env;
+        assert(parse_card({"--preset", "24dense"}, env) && env.n_ctx == 16384);
+        common_params cli;
+        assert(parse_card({"-c", "8192", "--preset", "24dense"}, cli) && cli.n_ctx == 8192);
+        if (had_ctx) {
+            setenv("LLAMA_ARG_CTX_SIZE", saved_ctx.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_ARG_CTX_SIZE");
+        }
+
+        std::set<std::string> env_keys;
+        std::map<std::string, std::string> saved_env;
+        for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
+            for (const auto & entry : common_card_preset_get(name).env) {
+                env_keys.insert(entry.first);
+            }
+        }
+        for (const auto & key : env_keys) {
+            if (const char * value = std::getenv(key.c_str())) {
+                saved_env[key] = value;
+            }
+            unsetenv(key.c_str());
+        }
+        common_params no_preset;
+        assert(common_card_preset_apply_env(no_preset).empty());
+        for (bool headless : {false, true}) {
+            common_params medium_env;
+            assert(parse_card({"12dense", headless ? "headless" : "headed"}, medium_env));
+            common_card_preset_apply_env(medium_env);
+            assert((std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) == headless);
+            assert(std::string(std::getenv("GGML_CUDA_GRAPH_MAX_ROWS")) == "16");
+            for (const auto & key : env_keys) {
+                unsetenv(key.c_str());
+            }
+        }
+        for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
+            common_params dynamic;
+            assert(parse_card({"--preset", name}, dynamic));
+            const auto enabled = common_card_preset_apply_env(dynamic);
+            assert(enabled.find(" LLAMA_DEEPCTX_LADDER=1") != std::string::npos);
+            setenv("LLAMA_DEEPCTX_LADDER", "0", 1);
+            const auto disabled = common_card_preset_apply_env(dynamic);
+            assert(disabled.find(" LLAMA_DEEPCTX_LADDER=0") != std::string::npos);
+            for (const auto & key : env_keys) {
+                unsetenv(key.c_str());
+            }
+        }
+        common_params small_env;
+        assert(parse_card({"--preset", "10dense", "-m", "/models/public-AI2.gguf"}, small_env));
+        setenv("LLAMA_LSA_RESIDENT_MIB", "123", 1);
+        const auto applied = common_card_preset_apply_env(small_env);
+        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/lsa-qwen38-27b-d2048.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_RESIDENT_MIB")) == "123");
+        assert(std::string(std::getenv("LLAMA_LSA_MODE")) == "key");
+        assert(applied.find(" LLAMA_LSA_RESIDENT_MIB=123") != std::string::npos);
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
+        common_params explicit_env;
+        assert(parse_card({"--attn-sparse", "none", "--attn-sparse-map", "/explicit/map.gguf",
+                           "--preset", "10dense"}, explicit_env));
+        common_card_preset_apply_env(explicit_env);
+        assert(std::string(std::getenv("LLAMA_LSA_MODE")) == "none");
+        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/explicit/map.gguf");
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
+        common_card_preset_apply_env(kv);
+        for (const auto & key : env_keys) {
+            if (key.compare(0, 10, "LLAMA_LSA_") == 0 || key == "GGML_CUDA_LSA_RESIDENT_STAGE" || key == "GGML_SJKVARN_TILE_SKIP") {
+                assert(!std::getenv(key.c_str()));
+            }
+            unsetenv(key.c_str());
+        }
+        common_params tiny_env;
+        assert(parse_card({"8dense", "-m", "/models/tiny/healed.gguf"}, tiny_env));
+        common_card_preset_apply_env(tiny_env);
+        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/models/tiny/mtp-dm.gguf,/models/tiny/head-ait2.gguf");
+        assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/models/tiny/head-exact-f16.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/tiny/lsa-qwen38-27b-d2048.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "1");
+        assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "7");
+        assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "1");
+        assert(std::string(std::getenv("GGML_ALLOC_GROW_PCT")) == "1");
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
+        setenv("LLAMA_MODEL_OVERLAY_PATCH", "/explicit/mtp.gguf,/explicit/head.gguf", 1);
+        setenv("LLAMA_D1_HEAD", "/explicit/exact.gguf", 1);
+        setenv("LLAMA_LSA_MEAN_CHUNKS", "0", 1);
+        setenv("LLAMA_RESERVE_VERIFY_ROWS", "9", 1);
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "0", 1);
+        setenv("GGML_ALLOC_GROW_PCT", "5", 1);
+        common_card_preset_apply_env(tiny_env);
+        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/explicit/mtp.gguf,/explicit/head.gguf");
+        assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/explicit/exact.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "0");
+        assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "9");
+        assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "0");
+        assert(std::string(std::getenv("GGML_ALLOC_GROW_PCT")) == "5");
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
+        common_params large_env;
+        assert(parse_card({"--preset", "24dense"}, large_env));
+        common_card_preset_apply_env(large_env);
+        assert(std::string(std::getenv("LLAMA_GDN_REPLAY_LANES")) == "1");
+        for (const auto & key : env_keys) {
+            if (saved_env.count(key)) {
+                setenv(key.c_str(), saved_env.at(key).c_str(), 1);
+            } else {
+                unsetenv(key.c_str());
+            }
+        }
+#endif
+    }
 
     printf("test-arg-parser: test invalid usage\n\n");
 
@@ -467,6 +763,26 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
+
+    {
+        auto parse_shards = [&list_str_to_char](std::vector<std::string> args) {
+            common_params shard_params;
+            args.insert(args.begin(), {"binary_name", "-m", "model_file.gguf"});
+            assert(common_params_parse(args.size(), list_str_to_char(args).data(), shard_params, LLAMA_EXAMPLE_COMMON));
+            auto paths = shard_params.model.get_paths();
+            assert(paths.front() == "model_file.gguf");
+            return std::vector<std::string>(paths.begin() + 1, paths.end());
+        };
+        assert(parse_shards({"--shard", "a.gguf"}) == std::vector<std::string>({"a.gguf"}));
+        const std::vector<std::string> two = {"a.gguf", "b.gguf"};
+        assert(parse_shards({"--shard", "a.gguf", "--shard", "b.gguf"}) == two);
+        assert(parse_shards({"--shard", "a.gguf,b.gguf"}) == two);
+        const std::vector<std::string> three = {"a.gguf", "b.gguf", "c.gguf"};
+        assert(parse_shards({"--shard", "a.gguf,b.gguf", "--shard", "c.gguf"}) == three);
+        assert(parse_shards({"--shard", "a.gguf", "--shard", "b.gguf", "--shard", "c.gguf"}) == three);
+        assert(parse_shards({"--ple", "p.gguf"}) == parse_shards({"--shard", "p.gguf"}));
+        assert(parse_shards({"--shard", "model_file.gguf,a.gguf,b.gguf,a.gguf"}) == two);
+    }
 
     argv = {"binary_name", "-t", "1234"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -830,6 +1146,101 @@ static void test(void) {
         assert(!draft.speculative.draft.cache_type_sj_kvarn_default);
     }
 
+    {
+        auto automatic = dkv_sj_kvarn_inh;
+        automatic.speculative.draft.sj_kvarn = false;
+        automatic.speculative.draft.sj_kvarn_explicit = false;
+        automatic.speculative.draft.attn_window = 0;
+        assert(common_speculative_draft_sj_kvarn_error(automatic) == nullptr);
+        const auto draft = common_base_params_to_speculative(automatic);
+        assert(draft.speculative.draft.sj_kvarn);
+        assert(draft.sj_kvarn_bits_k == automatic.sj_kvarn_bits_k);
+        assert(draft.sj_kvarn_bits_v == automatic.sj_kvarn_bits_v);
+        assert(draft.cache_type_k == automatic.sj_kvarn_staging_type);
+        assert(draft.cache_type_v == automatic.sj_kvarn_staging_type);
+        assert(draft.speculative.draft.vocab_map == "auto:rm24h" && draft.speculative.draft.vocab_hot == 0);
+
+        auto window = automatic;
+        window.speculative.draft.attn_window = 4096;
+        window.speculative.draft.attn_sink = 64;
+        for (bool explicit_choice : { false, true }) {
+            window.speculative.draft.sj_kvarn_explicit = explicit_choice;
+            assert(common_speculative_draft_sj_kvarn_error(window) != nullptr);
+            const auto fallback = common_base_params_to_speculative(window);
+            assert(!fallback.speculative.draft.sj_kvarn);
+            assert(fallback.sj_kvarn_bits_k == 0 && fallback.sj_kvarn_bits_v == 0);
+            assert(fallback.cache_type_k == COMMON_SJKVARN_MTP_DRAFT_KV[0]);
+            assert(fallback.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
+            assert(fallback.speculative.draft.cache_type_sj_kvarn_default);
+            assert(fallback.speculative.draft.vocab_map == "auto");
+            auto cparams = common_context_params_to_llama(fallback);
+            common_speculative_mtp_cparams(fallback, cparams);
+            assert(cparams.sj_kvarn_bits_k == 0 && cparams.sj_kvarn_bits_v == 0);
+            assert(cparams.draft_attn_window == 4096 && cparams.draft_attn_sink == 64);
+        }
+        window.speculative.draft.sj_kvarn = true;
+        bool rejected = false;
+        try {
+            common_base_params_to_speculative(window);
+        } catch (const std::invalid_argument & e) {
+            rejected = true;
+            assert(std::string(e.what()).find("--spec-draft-window") != std::string::npos);
+        }
+        assert(rejected);
+
+        for (int mode = 0; mode < 9; ++mode) {
+            auto unsupported = automatic;
+            switch (mode) {
+                case 0: unsupported.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE }; break;
+                case 1: unsupported.speculative.draft.mparams.path = "draft.gguf"; break;
+                case 2: unsupported.n_parallel = 2; break;
+                case 3: unsupported.sj_kvarn_bits_k = 0; break;
+                case 4: unsupported.sj_kvarn_bits_v = 0; break;
+                case 5: unsupported.speculative.draft.cache_type_k = GGML_TYPE_F16; break;
+                case 6: unsupported.speculative.draft.cache_type_v = GGML_TYPE_Q8_0; break;
+                case 7: unsupported.sj_kvarn_tail = unsupported.speculative.draft.n_max; break;
+                case 8: unsupported.speculative.draft.n_max = -1; break;
+            }
+            assert(common_speculative_draft_sj_kvarn_error(unsupported) != nullptr);
+            const auto fallback = common_base_params_to_speculative(unsupported);
+            assert(!fallback.speculative.draft.sj_kvarn && fallback.speculative.draft.vocab_map == "auto");
+        }
+        for (int mode = 0; mode < 4; ++mode) {
+            auto overridden = automatic;
+            switch (mode) {
+                case 0: overridden.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP; break;
+                case 1: overridden.speculative.user_set |= COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT; break;
+                case 2: overridden.speculative.draft.vocab_map = "custom.txt"; break;
+                case 3: overridden.speculative.draft.vocab_hot = 17; break;
+            }
+            const auto kept = common_base_params_to_speculative(overridden);
+            assert(kept.speculative.draft.vocab_map == overridden.speculative.draft.vocab_map);
+            assert(kept.speculative.draft.vocab_hot == overridden.speculative.draft.vocab_hot);
+        }
+        automatic.sj_kvarn_tail = automatic.speculative.draft.n_max + 1;
+        assert(common_speculative_draft_sj_kvarn_error(automatic) == nullptr);
+        automatic.speculative.draft.sj_kvarn_explicit = true;
+        const auto disabled = common_base_params_to_speculative(automatic);
+        assert(!disabled.speculative.draft.sj_kvarn);
+        assert(disabled.sj_kvarn_bits_k == 0 && disabled.sj_kvarn_bits_v == 0);
+        assert(disabled.cache_type_k == COMMON_SJKVARN_MTP_DRAFT_KV[0]);
+        assert(disabled.cache_type_v == COMMON_SJKVARN_MTP_DRAFT_KV[1]);
+        assert(disabled.speculative.draft.vocab_map == "auto");
+
+        for (bool enabled : { false, true }) {
+            argv = {"binary_name", enabled ? "--no-spec-draft-sjkvarn" : "--spec-draft-sjkvarn",
+                    enabled ? "--spec-draft-sjkvarn" : "--no-spec-draft-sjkvarn",
+                    "--spec-draft-vocab-map", "auto", "--spec-draft-vocab-hot", "0"};
+            common_params parsed;
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), parsed, LLAMA_EXAMPLE_SERVER));
+            assert(parsed.speculative.draft.sj_kvarn == enabled);
+            assert(parsed.speculative.draft.sj_kvarn_explicit);
+            assert(parsed.speculative.draft.vocab_map == "auto" && parsed.speculative.draft.vocab_hot == 0);
+            assert(parsed.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP);
+            assert(parsed.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT);
+        }
+    }
+
     // n-gram drafters request recurrent-state snapshots for in-place rollback (draft width, capped at 8);
     // --spec-n-rs-seq overrides, 0 = checkpoint restore on every partial acceptance
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-type", "ngram-cache", "--spec-ngram-cache-n-max", "7"};
@@ -1114,6 +1525,43 @@ static void test(void) {
     printf("test-arg-parser: skip on windows build\n");
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
+
+    for (const char * value : { "0", "1" }) {
+        setenv("LLAMA_ARG_SPEC_DRAFT_SJKVARN", value, true);
+        setenv("LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP", "auto:24576", true);
+        setenv("LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT", "2048", true);
+        common_params from_env;
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), from_env, LLAMA_EXAMPLE_SERVER));
+        assert(from_env.speculative.draft.sj_kvarn == (value[0] == '1'));
+        assert(from_env.speculative.draft.sj_kvarn_explicit);
+        assert(from_env.speculative.draft.vocab_map == "auto:24576" && from_env.speculative.draft.vocab_hot == 2048);
+        assert(from_env.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP);
+        assert(from_env.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_HOT);
+        common_params from_cli;
+        argv = {"binary_name", value[0] == '1' ? "--no-spec-draft-sjkvarn" : "--spec-draft-sjkvarn",
+                "--spec-draft-vocab-map", "auto", "--spec-draft-vocab-hot", "0"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), from_cli, LLAMA_EXAMPLE_SERVER));
+        assert(from_cli.speculative.draft.sj_kvarn == (value[0] == '0'));
+        assert(from_cli.speculative.draft.sj_kvarn_explicit);
+        assert(from_cli.speculative.draft.vocab_map == "auto" && from_cli.speculative.draft.vocab_hot == 0);
+    }
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_SJKVARN");
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_VOCAB_MAP");
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_VOCAB_HOT");
+    setenv("LLAMA_ARG_SPEC_DRAFT_SJKVARN", "1", true);
+    setenv("LLAMA_ARG_NO_SPEC_DRAFT_SJKVARN", "1", true);
+    {
+        common_params negated;
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), negated, LLAMA_EXAMPLE_SERVER));
+        assert(negated.speculative.draft.sj_kvarn_explicit && !negated.speculative.draft.sj_kvarn);
+        argv = {"binary_name", "--spec-draft-sjkvarn"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), negated, LLAMA_EXAMPLE_SERVER));
+        assert(negated.speculative.draft.sj_kvarn_explicit && negated.speculative.draft.sj_kvarn);
+    }
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_SJKVARN");
+    unsetenv("LLAMA_ARG_NO_SPEC_DRAFT_SJKVARN");
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};

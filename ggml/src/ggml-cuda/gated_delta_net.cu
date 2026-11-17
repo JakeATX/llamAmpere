@@ -1,8 +1,10 @@
 #include "gated_delta_net.cuh"
+#include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 #include "convert.cuh"
 #include "gated_delta_net_chunked_tc.cuh"
 
+#include <cstdint>
 #include <cstdlib>
 #include <algorithm>
 #include <vector>
@@ -142,7 +144,7 @@ gated_delta_net_cuda(const float * q,
         const float * g_t;
         float         w_t = 1.0f;
         if (t < 0) {
-            w_t = state_src.prefix_w[t + n_prefix];
+            w_t = state_src.prefix_w[sequence * state_src.prefix_w_s1 + t + n_prefix];
             if (w_t == 0.0f) {
                 continue;
             }
@@ -445,7 +447,7 @@ gated_delta_net_cuda_ilp(const float * q,
                 (int64_t) (t + state_src.prefix_n) * state_src.prefix_ingr_w * H + h_idx * state_src.prefix_ingr_w;
             k_t = slot;
             v_t = slot + S_v + col0;
-            const float w = state_src.prefix_w[t + state_src.prefix_n];
+            const float w = state_src.prefix_w[sequence * state_src.prefix_w_s1 + t + state_src.prefix_n];
             gr = slot[2 * S_v] * w;
             br = slot[state_src.prefix_off_b] * w;
         } else {
@@ -469,14 +471,14 @@ gated_delta_net_cuda_ilp(const float * q,
     const int n_prefix = emit_ingredients_t ? state_src.prefix_n : 0;
     int first_t = -n_prefix;
     if constexpr (PREFETCH) {
-        while (first_t < 0 && state_src.prefix_w[first_t + n_prefix] == 0.0f) {
+        while (first_t < 0 && state_src.prefix_w[sequence * state_src.prefix_w_s1 + first_t + n_prefix] == 0.0f) {
             first_t++;
         }
         load_tok(first_t, k_reg, q_reg, v_reg, g_raw, beta_val);
         g_prefetched = expf(g_raw);
     }
     for (int t = first_t; t < n_tokens; t++) {
-        if (t < 0 && state_src.prefix_w[t + n_prefix] == 0.0f) {
+        if (t < 0 && state_src.prefix_w[sequence * state_src.prefix_w_s1 + t + n_prefix] == 0.0f) {
             continue;
         }
         if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens <= K) {
@@ -500,7 +502,7 @@ gated_delta_net_cuda_ilp(const float * q,
         int next_t = t + 1;
         if constexpr (PREFETCH) {
             // A masked slot may contain NaNs. Stage the next active slot, or the first new token.
-            while (next_t < 0 && state_src.prefix_w[next_t + n_prefix] == 0.0f) {
+            while (next_t < 0 && state_src.prefix_w[sequence * state_src.prefix_w_s1 + next_t + n_prefix] == 0.0f) {
                 next_t++;
             }
             if (next_t < n_tokens) {
@@ -1908,6 +1910,44 @@ static void gated_delta_net_dispatch(
 #undef GDN_ARGS
 }
 
+static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    return {
+        (const float *) q->data,
+        (const float *) k->data,
+        (const float *) v->data,
+        (const float *) g->data,
+        (const float *) beta->data,
+        (const float *) state->data,
+        (float *) dst->data,
+        nullptr,
+        H,
+        q->ne[1],
+        v->ne[2],
+        v->ne[3],
+        v->ne[3] / q->ne[3],
+        (int64_t) (q->nb[1] / sizeof(float)),
+        (int64_t) (q->nb[2] / sizeof(float)),
+        (int64_t) (q->nb[3] / sizeof(float)),
+        (int64_t) (v->nb[1] / sizeof(float)),
+        (int64_t) (v->nb[2] / sizeof(float)),
+        (int64_t) (v->nb[3] / sizeof(float)),
+        (int64_t) (beta->nb[1] / sizeof(float)),
+        (int64_t) (beta->nb[2] / sizeof(float)),
+        (int64_t) (beta->nb[3] / sizeof(float)),
+        1.0f / sqrtf((float) S_v),
+        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
+    };
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -1935,6 +1975,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
     GGML_ASSERT(neq1 == nek1);
     const int64_t neqk1 = neq1;
 
+    GGML_ASSERT(neq3 > 0 && nev3 >= neq3 && nev3 % neq3 == 0);
+    GGML_ASSERT(nek3 == neq3);
     const int64_t rq3 = nev3 / neq3;
 
     const float * q_d = (const float *) src_q->data;
@@ -2020,6 +2062,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         const int pmode = ggml_get_op_params_i32(dst, 3);
         state_src.prefix        = (const float *) ring->data;
         state_src.prefix_w      = (const float *) dst->src[7]->data;
+        state_src.prefix_w_s1   = dst->src[7]->ne[1] > 1 ? dst->src[7]->ne[0] : 0; // per-sequence mask
         state_src.prefix_s1     = ring->nb[1] / sizeof(float);
         state_src.prefix_n      = n_prefix;
         state_src.prefix_ingr_w = (int) ggml_gated_delta_net_ingr_width(S_v, src_g->ne[0], pmode);
@@ -2062,6 +2105,24 @@ static void ggml_cuda_op_gated_delta_net_impl(
         return;
     }
 #endif
+
+    // upstream chunked MMA prompt kernel (62df1815b). It writes only the final state (upstream's
+    // ggml.h: "when n_tokens > K only slot 0 is guaranteed"), so it is restricted to the cases where
+    // our snapshot contract asks for nothing more: K == 1 and emit_mode 0 (!keep_rs), the op's own
+    // contiguous F32 output (no fused cache / slot_rows) and src[5] read as-is (no [#87] row redirect).
+    // Prefix calls (src[6]/src[7]) returned above. Upstream's chunked MMA path is opt-in (GGML_CUDA_GDN_MMA=1):
+    // its summation order differs from our kernels, and the release gate needs outputs bit-identical to v0.6.3.
+    {
+        static const bool mma_off = [] { const char * e = getenv("GGML_CUDA_GDN_MMA"); return !(e && atoi(e) != 0); }();
+        if (!mma_off && !keep_rs && cache == nullptr && state_type == GGML_TYPE_F32 && slot_rows == nullptr &&
+                state_src.rows == nullptr) {
+            ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+            args.state_out = (float *) state_d;
+            if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+                return;
+            }
+        }
+    }
 
 #define GDN_DISPATCH(T_) \
     gated_delta_net_dispatch<T_>(kda, keep_rs, emit_ingr, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, \

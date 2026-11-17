@@ -1,13 +1,8 @@
 # llamAmpere
 
-llamAmpere is a fast version of llama.cpp (the open-source program that runs AI language models on your own computer),
-tuned for NVIDIA RTX 30-series "Ampere" graphics cards, especially the RTX 3090 and 3090 Ti. It runs Qwen3.8 models,
-including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model
-writes faster) and Qwen3.8 Flash-Next.
+llamAmpere is based on mainline llama.cpp (v1.0), tuned for NVIDIA RTX 30-series Ampere cards. With 1.0 we prioritize keeping up with mainline. It includes TheTom TurboQuant work, credited below.
 
-## What's new in v0.6.4
-
-- Fix: Flash-Next ran out of memory or stalled on machines with two or more NVIDIA cards, or on a card that another program was already using (#96). v0.6.4 runs Flash-Next on one card, the one with the most free memory (`--device` picks another); splitting it across two cards is not supported yet. On a busy card with less than 8 GiB free, the launcher uses the memory planner, which runs but is slow. One idle card: unchanged. [Release notes](docs/llamampere-v0.6.4/RELEASE_NOTES.md).
+It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model writes faster) and Qwen3.8 Flash-Next.
 
 ## What's new in v0.6.3.11
 
@@ -71,15 +66,33 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ## Quick start
 
-**Build and run (v0.6.4, Qwen3.8 Flash-Next, Linux).** For one RTX 30-series card with enough system RAM for the model and prompt workspace. Small-card tests used a 3090 limited to 12 GB with about 90 GiB of system RAM; native 12/16 GB cards remain unmeasured, and 64 GB of system RAM is not a fit promise. Small cards use memory-bounded prompt passes; see the [hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md). The launcher keeps the tested `--fit off` setting on a card with at least 8 GiB free (see the [v0.6.4 notes](docs/llamampere-v0.6.4/RELEASE_NOTES.md)); its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
+### Quick start: pick your card
+
+Card presets assume a display is attached and reserve 1,024 MiB of GPU memory, except 8dense, which is headless-only and reserves 500 MiB. `8dense headed` prints a note and uses the same headless settings. Append `headless` (`--preset 12dense headless`) or use `12dense-headless` for a 500 MiB margin on 10dense, 12dense, and 24dense. Headed defaults are 180,224 tokens for 10dense and 196,608 for 12dense, with CUDA graphs off for headed 12dense. Headless defaults remain 212,992 for 10dense, 262,144 for 12dense, and 204,800 for 8dense; full-context headless 12dense fit is unverified. Fitting is on: the dynamic microbatch ladder remains enabled, and fitting may reduce a preset context to honor the margin. An explicit `-c`, `-fitt`, or `-fit` wins in either order. Startup reports the chosen context. Small cards still support one user only; multi-user support is future work. Re-check / update every preset against final 0.7 measurements before ship.
+
+Card profiles target dense Swift 1.5 Qwen 27B. All four set sampler defaults to temperature 1.0, top-k 20, top-p 0.95, and min-p 0; explicit CLI flags and per-request sampler fields override them. The 8dense profile disables mb-MTP by default; add `--spec-mb-mtp` to enable it. The other three profiles keep mb-MTP on with MTP. Choose the matching model file and use one profile:
+
+```bash
+llama-server --preset 24dense -m /path/to/P76-AI4.gguf
+llama-server --preset 24dense -m /path/to/P76-AI4.gguf -np 3 -c 352256 --slot-ctx 262144,0,0
+llama-server --preset 12dense -m /path/to/L0.gguf
+llama-server --preset 10dense -m /path/to/public-AI2.gguf
+llama-server --preset 8dense -m /path/to/healed-a2p-infile-mtp-r123-drafter-iq4xs.gguf
+```
+
+Bare names work too: `llama-server 24dense -m MODEL`. `llama-cli -p TEXT` still takes a prompt; the server does not accept `-p`. Explicit flags override profile values in either order. Card profiles override config.ini defaults; environment values and CLI flags override the card profile. For adaptive MTP, lowering the maximum draft depth also lowers the profile's minimum depth unless you set both. Raising the minimum also raises the profile's maximum unless you set both. Changing a K/V cache type or SJ body type drops the profile's related KV/LSA defaults; supply the full cache configuration you want. A smaller batch caps the default microbatch. Profiles do not download models. Place `lsa-qwen38-27b-d2048.gguf` beside the 8/10/12 GB model, or set `LLAMA_LSA_MAP` / `--attn-sparse-map` to its path. For 8dense also place `mtp-dm.gguf`, `head-ait2.gguf`, and `head-exact-f16.gguf` beside the model; `LLAMA_MODEL_OVERLAY_PATCH` and `LLAMA_D1_HEAD` override these paths. Shell environment values override profile environment defaults. Startup prints the profile version and expanded defaults; a different model family gets a warning.
+
+All four profiles are enabled and need final 0.7 validation; see [the preset checks](PRESETS_RECHECK.md). These are not full-context fit guarantees. The 24 GB profile keeps f32 recurrent state and supports one to four slots with asymmetric context reservations; `0` gives a slot a share of the remaining pool. The 8/10/12 GB profiles require `-np 1`. TODO: multi-user for small cards (future). All four profiles enable dynamic microbatch sizing, with checks at most every 2 seconds of prompt processing and 10 seconds of decode. Set `LLAMA_DEEPCTX_LADDER=0` for static sizing. The microbatch ceilings stay at 1024/512/512/256 for 24/12/10/8dense; an explicit `-ub` overrides the ceiling. The 8 GB profile uses the accepted F2 settings: reserve 7 rows, stage strips on, CUDA graphs off, 1% buffer growth, and mean chunks on. This build includes the reserve reader. Copy defaults off; earlier 8 GB measurements used copy on, so final measurements must be repeated with copy off. Packed masks remain opt-in. Eligible window-0 paths select DSJ/RM24H automatically, with `--no-spec-draft-sjkvarn` as the opt-out; the 24dense profile sets window 4096 and therefore does not select that automatic path. Context and memory fit depend on the model and overrides.
+
+**Build and run (v0.6.3.11, Qwen3.8 Flash-Next, Linux).** For one RTX 30-series card with enough system RAM for the model and prompt workspace. Small-card tests used a 3090 limited to 12 GB with about 90 GiB of system RAM; native 12/16 GB cards remain unmeasured, and 64 GB of system RAM is not a fit promise. Small cards use memory-bounded prompt passes; see the [hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md). The launcher keeps the tested `--fit off` setting; its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
 compiler, the `hf` download tool (`pip install -U huggingface_hub`) and 81.63 GB for the model and drafter, plus space for the build, prompt scratch and saved prompts. The launcher uses a 5 GiB free-RAM floor. This
-one paste clones or updates llamAmpere at v0.6.4, builds `llama-server`, downloads the model and its drafter and starts the server:
+one paste clones or updates llamAmpere at v0.6.3.11, builds `llama-server`, downloads the model and its drafter and starts the server:
 
 ```bash
 if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.4
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.11
 else
-  git clone -b v0.6.4 https://github.com/JakeATX/llamAmpere.git
+  git clone -b v0.6.3.11 https://github.com/JakeATX/llamAmpere.git
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
@@ -92,15 +105,15 @@ scripts/flash-next-server.sh -m models/flash-next/qwen3.8-flash-next-Swift1.5-AT
 
 To start it again later, run the last three lines from the `llamAmpere` folder. The server listens on http://127.0.0.1:8080 (OpenAI-compatible API).
 
-**Build and run (v0.6.4, Swift 1.5 27B at 2.3 bpw, 200K context, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
+**Build and run (v0.6.3.11, Swift 1.5 27B at 2.3 bpw, 200K context, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
 toolkit (`nvcc`), CMake, git and a C++ compiler. The model (about 9.1 GB) downloads on first start. This one paste clones or
-updates llamAmpere at v0.6.4, builds `llama-server` and starts it:
+updates llamAmpere at v0.6.3.11, builds `llama-server` and starts it:
 
 ```bash
 if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.4
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.11
 else
-  git clone -b v0.6.4 https://github.com/JakeATX/llamAmpere.git
+  git clone -b v0.6.3.11 https://github.com/JakeATX/llamAmpere.git
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
@@ -131,9 +144,11 @@ Numbers for this release (Swift 1.5 27B, v0.6 against v0.5) are in the [v0.6 rel
 
 ## License and credits
 
-llamAmpere is MIT licensed (see [LICENSE](LICENSE)). It is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
-by the ggml authors and includes work from TheTom's TurboQuant fork. It is the successor of
-[llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
+llamAmpere is MIT licensed (see [LICENSE](LICENSE)) and is based on mainline [llama.cpp](https://github.com/ggml-org/llama.cpp) by the ggml authors. It includes TheTom's TurboQuant KV-cache work and contributions from that fork. Original authors and license headers are retained. It is the successor of [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere). See [CREDITS.md](CREDITS.md) for contribution links. Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Our attention selector is derived from Distilled Latent Sparse Attention (D-LSA), introduced by Ales Kubicek and colleagues in [Latent Sparse Attention: Towards Subquadratic Ultra-Long Context Attention](https://arxiv.org/abs/2610.42147v2). The paper projects queries and keys into a learned index space, groups keys by similarity, searches group summaries, and applies attention to the selected original keys plus a local window and sink tokens. We use the authors' [released Qwen d2048 projection map](https://github.com/Prefrontal-AI/latent-sparse-attention/releases/tag/d-lsa-weights-v1). Our implementation adapts this approach with fixed blocks of 128 or 16 tokens, finer selection, and host KV offload; these are our adaptations, rather than a reproduction of the paper's semantic clustering or tree search. Attention on selected keys uses the stored KV representation; selection, KV quantization, and compensation still introduce approximation. The map's actual index width is 64; d2048 is its release name.
+
+See the [published evaluation](https://huggingface.co/datasets/jakeatx/long-context-lsa-qsa-evaluation) and [measured quality and limits](docs/KV-cache-quantization.md#lsa-attribution-and-measured-quality).
 
 Third-party libraries (from upstream llama.cpp):
 

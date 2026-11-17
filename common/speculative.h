@@ -35,16 +35,23 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 // return the conditional synthetic acceptance probabilities
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
-// MTP drafter KV cache types over a SJ-KVaRN trunk when --spec-draft-type-k/-v are not given ({K, V}).
+// MTP drafter KV cache types over a SJ-KVaRN trunk when DSJ is off and --spec-draft-type-k/-v are not given ({K, V}).
 // Provisional: one line to change (tq6_0/tq6_0 once its fused verify-width kernel lands).
 inline constexpr ggml_type COMMON_SJKVARN_MTP_DRAFT_KV[2] = { GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0 };
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+// fork: nullptr when the parameters allow DSJ; otherwise the existing validation error.
+const char * common_speculative_draft_sj_kvarn_error(const common_params & params);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;
 };
+
+// copy mode (--spec-copy-tail): lookup tokens a draft can carry past the drafter's block (0 = off);
+// the caller adds it to the draft width when it sizes the verify batch
+int32_t common_speculative_copy_tail(const common_params_speculative * spec);
 
 // return the output limits needed for speculative decoding
 common_speculative_output_limits common_speculative_get_output_limits(
@@ -81,15 +88,24 @@ struct common_speculative_draft_params {
     // that samples its draft from a matching distribution records that distribution per draft position
     // (candidate ids with normalised probabilities, aligned with *result; an empty row means id-match)
     const common_params_sampling * sampling = nullptr;
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash (DFlash2 only) sample
     std::vector<std::vector<llama_token_data>> * result_q = nullptr;
 
-    // upstream #27694 fields (probabilistic draft sampling); kept for API compatibility. In this tree the
-    // exact p/q path above (LLAMA_SPEC_PQ=1, `sampling`) is the sampled-draft implementation.
+    // upstream #27694 fields (probabilistic draft sampling): read by DFlash2 drafts (--spec-draft-sampling
+    // probabilistic); for the other drafters the exact p/q path above (LLAMA_SPEC_PQ=1, `sampling`) is the sampled draft.
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 
     // A shared verify budget can require fewer drafts than the configured minimum.
     int32_t n_min = -1;
+
+    // copy mode: cap on the whole draft, model block plus lookup tail (<= 0: no tail for this sequence).
+    // n_max above bounds the model drafter only; this is what still fits the context and the request.
+    int32_t n_max_total = -1;
+
+    // copy mode: cap on the lookup tail alone (< 0: none). The server sets it to the recurrent snapshots the
+    // target keeps, so a miss inside the tail can always be rolled back in place.
+    int32_t n_tail_max = -1;
 
 };
 

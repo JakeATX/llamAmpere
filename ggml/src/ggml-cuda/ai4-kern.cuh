@@ -49,8 +49,11 @@ constexpr int LAY_AIT3_U = 13;   // rate-3 units ([d 16][16 tiles x 12 words], 8
 constexpr int LAY_AIT4_U = 14;   // rate-4 units ([d 16][16 tiles x 16 words], 1056 B)
 constexpr int LAY_AIT2P_U = 15;  // AIT2_U bytes, AIT2P pair-table levels (ggml-ai4.h); no trellis constant
 constexpr int LAY_AIT2_U2 = 16;  // AIT2_U levels, one fp16 scale per row per 640 K: block = [d 16][5 chunks x 16 tiles x 8 words] (ggml.h AIT2_U2)
-constexpr int LAY_AIT4_U2 = 20;  // 4-bit tiles in the 640-K row-scale block
 constexpr int LAY_AIT3_U2 = 17;  // AIT3_U levels, same block shape (rate 3)
+constexpr int LAY_AIT4_U2 = 18;  // AIT4_U levels, same block shape (rate 4)
+constexpr int LAY_AIT2_U2_512 = 19;  // AIT2_U2 with one scale per row per 512 K: block = [d 16][4 chunks x 16 tiles x 8 words] (ggml.h AIT2_U2_512)
+constexpr int LAY_AIT3_U2_512 = 20;  // AIT3_U2 with the same 4-chunk block shape (rate 3)
+constexpr int LAY_AIT4_U2_512 = 21;  // AIT4_U2 with the same 4-chunk block shape (rate 4)
 
 // mmv-ID columns per block: lanes g = 0..7 of the mmv kernel each own one token column
 constexpr int MMV_ID_BN = 8;
@@ -140,16 +143,21 @@ constexpr int U_SC      = 32;     // fp16 d[16]
 // symbol rate of a layout (bits per weight in the tile stream) and its trellis constant
 template <int LAY> constexpr __host__ __device__ int lay_rate() {
     static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U ||
-                  LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2, "ai4k layout");
-    return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT2_U2 ? 2 :
-           LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 ? 3 : 4;
+                  LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2 ||
+                  LAY == LAY_AIT2_U2_512 || LAY == LAY_AIT3_U2_512 || LAY == LAY_AIT4_U2_512, "ai4k layout");
+    return LAY == LAY_AIT5_U ? 5 : LAY == LAY_AIT2_U || LAY == LAY_AIT2P_U || LAY == LAY_AIT2_U2 || LAY == LAY_AIT2_U2_512 ? 2 :
+           LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 || LAY == LAY_AIT3_U2_512 ? 3 : 4;
 }
 template <int LAY> constexpr __host__ __device__ bool lay_pair() { return LAY == LAY_AIT2P_U; }
-// row-scale layouts: one scale header per 5 chunks (640 K) instead of one per chunk
-template <int LAY> constexpr __host__ __device__ bool lay_v2() { return LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2; }
+// row-scale layouts: one scale header per 5 chunks (640 K) or per 4 chunks (512 K, the _512 layouts) instead of one per chunk
+template <int LAY> constexpr __host__ __device__ bool lay_v2() {
+    return LAY == LAY_AIT2_U2 || LAY == LAY_AIT3_U2 || LAY == LAY_AIT4_U2 || LAY == LAY_AIT2_U2_512 || LAY == LAY_AIT3_U2_512 ||
+           LAY == LAY_AIT4_U2_512;
+}
 template <int LAY> constexpr __host__ __device__ uint32_t lay_mul() {
     static_assert(LAY == LAY_AIT2_U || LAY == LAY_AIT3_U || LAY == LAY_AIT4_U || LAY == LAY_AIT5_U || lay_v2<LAY>(), "ai4k layout");
-    return LAY == LAY_AIT2_U || LAY == LAY_AIT2_U2 ? 0xC3CCD12Du : LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 ? 0x87D8D12Du : 0xAA73876Bu;
+    return LAY == LAY_AIT2_U || LAY == LAY_AIT2_U2 || LAY == LAY_AIT2_U2_512 ? 0xC3CCD12Du :
+           LAY == LAY_AIT3_U || LAY == LAY_AIT3_U2 || LAY == LAY_AIT3_U2_512 ? 0x87D8D12Du : 0xAA73876Bu;
 }
 template <int LAY> constexpr __host__ __device__ bool lay_k5()  { return lay_rate<LAY>() == 5; }
 
@@ -158,24 +166,36 @@ template <int LAY> constexpr __host__ __device__ int ch_bytes() { return 256*lay
 template <int LAY> constexpr __host__ __device__ int u_bytes()  { return ch_bytes<LAY>() + U_SC; }
 static_assert(ch_bytes<LAY_AIT4_U>() == CH_BYTES && u_bytes<LAY_AIT4_U>() == U_BYTES && u_bytes<LAY_AIT5_U>() == 1312 &&
               u_bytes<LAY_AIT2_U>() == 544 && u_bytes<LAY_AIT2P_U>() == 544 && u_bytes<LAY_AIT3_U>() == 800, "ai4k layout sizes");
-constexpr int V2_CHUNKS = 5;   // 128-K chunks per row-scale block
-template <int LAY> constexpr __host__ __device__ int v2_block_bytes() { return U_SC + V2_CHUNKS*ch_bytes<LAY>(); }
+constexpr int V2_CHUNKS = 5;   // 128-K chunks per row-scale block of the 640 K layouts
+// 128-K chunks per row-scale block of a layout: 5 (640 K), or 4 for the 512 K siblings
+template <int LAY> constexpr __host__ __device__ int v2_chunks() {
+    return LAY == LAY_AIT2_U2_512 || LAY == LAY_AIT3_U2_512 || LAY == LAY_AIT4_U2_512 ? 4 : V2_CHUNKS;
+}
+template <int LAY> constexpr __host__ __device__ int v2_block_bytes() { return U_SC + v2_chunks<LAY>()*ch_bytes<LAY>(); }
+static_assert(v2_block_bytes<LAY_AIT4_U2>() == 5152 && lay_mul<LAY_AIT4_U2>() == 0xAA73876Bu,
+              "4-bit row-scale layout");
+static_assert(v2_block_bytes<LAY_AIT2_U2>() == 2592 && v2_block_bytes<LAY_AIT3_U2>() == 3872 &&
+              v2_block_bytes<LAY_AIT2_U2_512>() == 2080 && v2_block_bytes<LAY_AIT3_U2_512>() == 3104 &&
+              lay_mul<LAY_AIT2_U2_512>() == lay_mul<LAY_AIT2_U2>() && lay_mul<LAY_AIT3_U2_512>() == lay_mul<LAY_AIT3_U2>() &&
+              lay_rate<LAY_AIT2_U2_512>() == 2 && lay_rate<LAY_AIT3_U2_512>() == 3 &&
+              v2_block_bytes<LAY_AIT4_U2_512>() == 4128 && lay_rate<LAY_AIT4_U2_512>() == 4 &&
+              lay_mul<LAY_AIT4_U2_512>() == lay_mul<LAY_AIT4_U2>(), "row-scale layout sizes and constants");
 template <int LAY> static __host__ __device__ __forceinline__ int64_t slab_bytes_l(int K) {
-    if constexpr (lay_v2<LAY>()) { return (int64_t) (K/(128*V2_CHUNKS))*v2_block_bytes<LAY>(); }
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (K/(128*v2_chunks<LAY>()))*v2_block_bytes<LAY>(); }
     else { return (int64_t) (K/128)*u_bytes<LAY>(); }
 }
 
 // byte offset of chunk kc's 16 tiles inside a slab
 template <int LAY>
 static __device__ __forceinline__ int64_t chunk_off(int kc) {
-    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/V2_CHUNKS)*v2_block_bytes<LAY>() + U_SC + (int64_t) (kc % V2_CHUNKS)*ch_bytes<LAY>(); }
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/v2_chunks<LAY>())*v2_block_bytes<LAY>() + U_SC + (int64_t) (kc % v2_chunks<LAY>())*ch_bytes<LAY>(); }
     else { return (int64_t) kc*u_bytes<LAY>() + U_SC; }
 }
 
 // byte offset of chunk kc's scale header inside a slab
 template <int LAY>
 static __device__ __forceinline__ int64_t sc_off(int kc) {
-    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/V2_CHUNKS)*v2_block_bytes<LAY>(); }
+    if constexpr (lay_v2<LAY>()) { return (int64_t) (kc/v2_chunks<LAY>())*v2_block_bytes<LAY>(); }
     else { return (int64_t) kc*u_bytes<LAY>(); }
 }
 
@@ -945,6 +965,206 @@ static void launch_mmv(const uint8_t * W, const int8_t * Xq, const float * Xs, f
     }
     const dim3 grid(M/16, ID ? max_experts : 1);
     mmv<STAGES, MINB, XREG, LAY, XSH, ID, WARPS><<<grid, WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm);
+}
+
+// FEWPORT port 2 (GGML_CUDA_AI4_MMV_CG=1, ai4.cu): mmv with CG column groups of 8 tokens (CG = 2: 9..16, 3: 17..24). The block
+// still owns one slab and its warps split the K chunks; each A fragment is decoded once and multiplied with CG B fragments
+// (tokens 8 cg + g), so the weights are read once for all N columns with no K-split planes and no reduce launch. Stage =
+// chunk tiles + the 16 rows' scale words (64 B) + the 8 CG tokens' activation scales (32 CG B). Exact int32 per chunk as
+// mmv / gemm; the float order is mmv's (chunk order per warp, then warps 0..WARPS-1 in shared memory), so 9..24-token
+// outputs differ from the gemm / MIDT path by fp32 order only. Repeats are bitwise equal (no atomics). Dense only (no ID).
+template <int CG, int LAY>
+constexpr __host__ __device__ int mmv_cg_stage_bytes() { return ch_bytes<LAY>() + 64 + 32*CG; }
+
+template <int CG, int STAGES, int MINB, int LAY, int XSH, int WARPS>
+static __global__ void __launch_bounds__(WARPS*32, MINB) mmv_cg(
+        const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
+        float * __restrict__ Y, int64_t ldy, int M, int N, int K) {
+    static_assert(CG >= 2 && CG <= 3, "ai4 mmv_cg: 2 or 3 column groups");
+    static_assert(WARPS >= 2 && WARPS*32*MINB <= 1536, "ai4 mmv_cg launch bounds");
+    constexpr int ST  = mmv_cg_stage_bytes<CG, LAY>();
+    constexpr int CHB = ch_bytes<LAY>();
+    constexpr int OSC = CHB;   // scale words of a stage
+    static_assert(ST % 16 == 0, "stage alignment");
+    extern __shared__ __align__(16) uint8_t smem[];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int slab = blockIdx.x;
+    const int nk = K/RQ4_CHUNK;
+    const int XSN = K >> (7 + XSH);
+    if constexpr (lay_pair<LAY>()) {
+        pair_tab_fill(threadIdx.x, WARPS*32);
+        __syncthreads();
+    }
+    const uint8_t * ws = W + (int64_t) slab*slab_bytes_l<LAY>(K);
+    const k5win k5a = lay_win<LAY>(g, t & 1), k5b = lay_win<LAY>(g + 8, t & 1);
+    (void) k5a; (void) k5b;
+    uint8_t * ring = smem + warp*STAGES*ST;
+
+    bool has_n[CG];
+    const int8_t * xr[CG];
+#pragma unroll
+    for (int cg = 0; cg < CG; ++cg) {
+        has_n[cg] = 8*cg + g < N;
+        xr[cg] = Xq + (int64_t) (has_n[cg] ? 8*cg + g : 0)*K + t*32;
+    }
+    // activation scale of the token this lane loads: lanes 8 .. 8 + 8 CG - 1 load tokens 0 .. 8 CG - 1 (lanes 0..7: the d words)
+    const int sn = lane - 8;
+    const bool s_ok = sn >= 0 && sn < 8*CG && sn < N;
+    const float * xsr = Xs + (int64_t) (s_ok ? sn : 0)*XSN;
+
+    const int nmy = (nk - warp + WARPS - 1)/WARPS;
+
+    auto load = [&](int i) {
+        const int kc = warp + i*WARPS;
+        uint8_t * st = ring + (i % STAGES)*ST;
+        const uint8_t * tiles = ws + chunk_off<LAY>(kc);
+        constexpr int CHP = CHB/16;
+#pragma unroll
+        for (int r = 0; r < (CHP + 31)/32; ++r) {
+            if (CHP % 32 == 0 || lane + 32*r < CHP) {
+                cp_async16(st + r*512 + lane*16, tiles + r*512 + lane*16, true);
+            }
+        }
+        if (lane < 8) {
+            cp_async4(st + OSC + lane*4, ws + sc_off<LAY>(kc) + lane*4, true);
+        } else if (sn < 8*CG) {
+            cp_async4(st + OSC + 64 + sn*4, s_ok ? (const void *) (xsr + (kc >> XSH)) : (const void *) Xs, s_ok);
+        }
+    };
+    auto ldx = [&](int i, uint4 (&v0)[CG], uint4 (&v1)[CG]) {
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+            if (has_n[cg] && i < nmy) {
+                const uint4 * src = (const uint4 *) (xr[cg] + (int64_t) (warp + i*WARPS)*RQ4_CHUNK);
+                v0[cg] = __ldg(src);
+                v1[cg] = __ldg(src + 1);
+            } else {
+                v0[cg] = make_uint4(0, 0, 0, 0);
+                v1[cg] = v0[cg];
+            }
+        }
+    };
+
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < nmy) {
+            load(s);
+        }
+        cp_async_commit();
+    }
+    uint4 nx0[CG], nx1[CG];
+    ldx(0, nx0, nx1);
+
+    float acc[CG][4];
+#pragma unroll
+    for (int cg = 0; cg < CG; ++cg) {
+        acc[cg][0] = acc[cg][1] = acc[cg][2] = acc[cg][3] = 0.0f;
+    }
+    for (int i = 0; i < nmy; ++i) {
+        cp_async_wait<STAGES - 2>();
+        __syncwarp();
+        if (i + STAGES - 1 < nmy) {
+            load(i + STAGES - 1);
+        }
+        cp_async_commit();
+
+        const uint8_t * st = ring + (i % STAGES)*ST;
+        const uint32_t * tw = (const uint32_t *) st;
+        uint4 x0[CG], x1[CG];
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+            x0[cg] = nx0[cg]; x1[cg] = nx1[cg];
+        }
+        ldx(i + 1, nx0, nx1);
+        const half * sdw = (const half *) (st + OSC);
+        const float * sdx = (const float *) (st + OSC + 64);
+        const float d0  = __half2float(sdw[g]);
+        const float d1  = __half2float(sdw[g + 8]);
+
+        // per column group the two IMMA chains of mmv (j = 0, 1 and j = 2, 3), summed exactly in int32
+        int p[CG][4], q[CG][4];
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+            p[cg][0] = p[cg][1] = p[cg][2] = p[cg][3] = 0;
+            q[cg][0] = q[cg][1] = q[cg][2] = q[cg][3] = 0;
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint32_t a[4];
+            a_regs_lay<LAY>(tw, j, g, t, k5a, k5b, a);
+#pragma unroll
+            for (int cg = 0; cg < CG; ++cg) {
+                const uint4 & xv = j < 2 ? x0[cg] : x1[cg];
+                if (j < 2) {
+                    mma_s8(p[cg], a, (j & 1) ? xv.z : xv.x, (j & 1) ? xv.w : xv.y);
+                } else {
+                    mma_s8(q[cg], a, (j & 1) ? xv.z : xv.x, (j & 1) ? xv.w : xv.y);
+                }
+            }
+        }
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+            const float dx0 = sdx[8*cg + 2*t], dx1 = sdx[8*cg + 2*t + 1];
+            acc[cg][0] += magic_i2f(p[cg][0] + q[cg][0]) * (d0*dx0);
+            acc[cg][1] += magic_i2f(p[cg][1] + q[cg][1]) * (d0*dx1);
+            acc[cg][2] += magic_i2f(p[cg][2] + q[cg][2]) * (d1*dx0);
+            acc[cg][3] += magic_i2f(p[cg][3] + q[cg][3]) * (d1*dx1);
+        }
+    }
+    cp_async_wait<0>();
+
+    __shared__ float red[WARPS - 1][CG*4][32];
+    if (warp > 0) {
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                red[warp - 1][4*cg + i][lane] = acc[cg][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+        for (int w = 0; w < WARPS - 1; ++w) {
+#pragma unroll
+            for (int cg = 0; cg < CG; ++cg) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    acc[cg][i] += red[w][4*cg + i][lane];
+                }
+            }
+        }
+        const int r = slab*16 + g;
+#pragma unroll
+        for (int cg = 0; cg < CG; ++cg) {
+            const int c = 8*cg + 2*t;
+            if (c < N) {
+                Y[(int64_t) c*ldy + r]     = acc[cg][0];
+                Y[(int64_t) c*ldy + r + 8] = acc[cg][2];
+            }
+            if (c + 1 < N) {
+                Y[(int64_t) (c + 1)*ldy + r]     = acc[cg][1];
+                Y[(int64_t) (c + 1)*ldy + r + 8] = acc[cg][3];
+            }
+        }
+    }
+    (void) M;
+}
+
+template <int CG, int STAGES = 2, int MINB = 4, int LAY = LAY_AIT4_U, int XSH = 1, int WARPS = MMV_WARPS>
+static void launch_mmv_cg(const uint8_t * W, const int8_t * Xq, const float * Xs, float * Y, int64_t ldy,
+                          int M, int N, int K, cudaStream_t stream) {
+    constexpr int smem = WARPS*STAGES*mmv_cg_stage_bytes<CG, LAY>();
+    static bool attr_set[64] = {};
+    int dev = 0;
+    CUDA_CHECK_AI4K(cudaGetDevice(&dev));
+    if (!attr_set[dev & 63]) {
+        CUDA_CHECK_AI4K(cudaFuncSetAttribute(mmv_cg<CG, STAGES, MINB, LAY, XSH, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        attr_set[dev & 63] = true;
+    }
+    mmv_cg<CG, STAGES, MINB, LAY, XSH, WARPS><<<dim3(M/16), WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K);
 }
 
 // ---------------------------------------------------------------------------------------------

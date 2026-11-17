@@ -67,6 +67,7 @@ if (Vulkan_FOUND)
                              ggml-vulkan-push-constants.h
                              ggml-vulkan-common.h
                              ggml-vulkan-buffers.cpp
+                             ggml-vulkan-comm.cpp
                              ggml-vulkan-debug.cpp
                             )
 

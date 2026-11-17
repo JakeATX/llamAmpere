@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-lsa.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -11,12 +12,12 @@
 
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -39,6 +40,7 @@ llama_memory_hybrid::llama_memory_hybrid(
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
+        no_alloc,
         model.hparams,
         type_k,
         type_v,
@@ -47,7 +49,6 @@ llama_memory_hybrid::llama_memory_hybrid(
         unified,
         kv_size,
         n_seq_max,
-        n_pad,
         n_swa,
         swa_type,
         nullptr,
@@ -64,6 +65,7 @@ llama_memory_hybrid::llama_memory_hybrid(
     )),
     mem_recr(new llama_memory_recurrent(
         model,
+        no_alloc,
         type_r,
         type_s,
         offload,
@@ -102,14 +104,15 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn(),
+                        rsplit.strict_fn(), rsplit.n_mixed_min(), rsplit.set_fn());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
 
-            rsplit.advance(ubatch);
+            rsplit.advance(ubatch, balloc.get_split_cut());
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
@@ -223,6 +226,15 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
     }
     mem_recr->state_write(io, seq_id, flags);
     state_write_sj_exact(io, seq_id, flags);
+    // LSA index cache on SJ-KVaRN (opt-in LLAMA_LSA_IDX_CACHE=1): optional suffix, absent unless LSA wrote a valid layer
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && mem_attn->is_sj_kvarn() && seq_id >= 0) {
+        const llama_pos pmax = mem_attn->seq_pos_max(seq_id);
+        if (pmax >= 0) {
+            // LLAMA_LSA_MULTI=1: the side caches of this sequence's stream (no-op scope otherwise)
+            llama_lsa_stream_scope lsa_scope(std::max<int32_t>(0, llama_lsa_stream_of(seq_id))); // n_seq_max > 64 refused
+            llama_lsa_idx_state_write(io, (int64_t) pmax + 1);
+        }
+    }
 }
 
 void llama_memory_hybrid::state_write_sj_exact(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -250,6 +262,13 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     try {
         mem_recr->state_read(io, seq_id, flags);
         state_read_sj_exact(io, seq_id, flags);
+        if (read_attn && io.n_left() >= 2*sizeof(uint32_t) && mem_attn->is_sj_kvarn()) {
+            // LLAMA_LSA_MULTI=1 (n_seq_max > 64 refused); seq_id -1 (whole state) keeps stream 0 as before
+            llama_lsa_stream_scope lsa_scope(std::max<int32_t>(0, llama_lsa_stream_of(seq_id)));
+            llama_lsa_idx_state_read(io); // LSA index cache suffix (see state_write)
+        } else if (read_attn && mem_attn->is_sj_kvarn() && seq_id >= 0 && mem_attn->seq_pos_max(seq_id) >= 0) {
+            llama_lsa_warn_restore_dense("the saved state has no LSA index suffix (saved with LSA off or an older build)", 0, 0);
+        }
     } catch (...) {
         // the attention part is already restored - undo it
         if (read_attn) {

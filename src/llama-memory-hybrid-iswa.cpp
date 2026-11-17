@@ -10,6 +10,7 @@
 
 llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         const llama_model & model,
+                      bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
@@ -17,7 +18,6 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   swa_full,
                  uint32_t   kv_size,
                  uint32_t   n_ubatch,
-                 uint32_t   n_pad,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -37,6 +37,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
+        no_alloc,
         type_k,
         type_v,
         v_trans,
@@ -46,7 +47,6 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         kv_size,
         n_seq_max,
         n_ubatch,
-        n_pad,
         nullptr,
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recr(il); }
@@ -59,6 +59,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     )),
     mem_recr(new llama_memory_recurrent(
         model,
+        no_alloc,
         type_r,
         type_s,
         offload,
@@ -96,14 +97,15 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn());
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn(),
+                        rsplit.strict_fn(), rsplit.n_mixed_min(), rsplit.set_fn());
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
 
-            rsplit.advance(ubatch);
+            rsplit.advance(ubatch, balloc.get_split_cut());
 
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }

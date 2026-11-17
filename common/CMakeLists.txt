@@ -66,6 +66,8 @@ add_library(${TARGET}
     chat-diff-analyzer.cpp
     chat-peg-parser.cpp
     chat-peg-parser.h
+    chat-tts-norm.cpp
+    chat-tts-norm.h
     chat.cpp
     chat.h
     common.cpp
@@ -78,6 +80,8 @@ add_library(${TARGET}
     download.h
     fit.cpp
     fit.h
+    file-lock.cpp
+    file-lock.h
     hf-cache.cpp
     hf-cache.h
     http.h
@@ -194,3 +198,8 @@ target_compile_definitions(${TARGET} PRIVATE
     LLAMA_MOE_PROFILE_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/llama/moe/flash-next.profile")
 install(FILES "${PROJECT_SOURCE_DIR}/data/moe/flash-next.profile"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/llama/moe" OPTIONAL)
+
+if (CMAKE_SYSTEM_NAME MATCHES "AIX")
+    # AIX's flock() function comes from libbsd.a
+    target_link_libraries(${TARGET} PRIVATE -lbsd)
+endif()

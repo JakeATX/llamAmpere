@@ -9,6 +9,172 @@
 #include <filesystem>
 #include <regex>
 
+// fork: runtime card profiles. Values stay here so each QC change has one table to update.
+const common_card_preset & common_card_preset_get(const std::string & name, bool headless) {
+    static const std::vector<common_card_preset> headless_profiles = [] {
+        // Timed ub QC: V07/ASYMCTX/QC_READY_asymctx_24gb.md; ceiling stays bounded by -ub.
+        common_card_preset large {
+            "24dense", "2026-11-17.3", "best known/recheck before ship", "", {
+                {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"}, {"--fit", "on"},
+                {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
+                {"--spec-type", "draft-mtp-adaptive"},
+                {"--spec-draft-n-min-adaptive", "4"}, {"--spec-draft-n-max", "5"}, {"--spec-draft-n-min", "4"},
+                {"--spec-draft-p-min", "0"}, {"--spec-draft-window", "4096"},
+                {"--spec-draft-vocab-map", "auto"}, {"--gdn-replay", "1"}, {"--kv-unified", "1"}
+            }, {
+                {"LLAMA_GDN_REPLAY_LANES", "1"}, {"LLAMA_DEEPCTX_LADDER", "1"}
+            }
+        };
+        // Small-card profiles keep packed masks and one sequence.
+        // TODO: multi-user for small cards (future).
+        common_card_preset small {
+            "10dense", "2026-11-17.3", "best known/recheck before ship", "", {
+                {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
+                {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                {"--fit", "on"}, {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
+                {"--sjkvarn-body-type", "sjkvarn4"}, {"--cache-type-s", "q8_0"},
+                {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
+                {"--override-tensor", "token_embd.weight=CPU"}, {"--threads", "6"},
+                {"--load-mode", "none"}, {"--spec-type", "draft-mtp"},
+                {"--spec-draft-n-max", "4"}, {"--spec-draft-p-min", "0"},
+                {"--spec-draft-vocab-map", "auto:65536"}, {"--spec-draft-window", "2048"},
+                {"--spec-draft-type-k", "q8_0"}, {"--spec-draft-type-v", "q8_0"},
+                {"--sjkvarn-sink", "128"}, {"--sjkvarn-sink-type", "f16"},
+                {"--sjkvarn-staging-type", "tq6_0"}, {"--sjkvarn-tail", "4096"},
+                {"--sjkvarn-tail-max", "8192"}
+            }, {
+                {"LLAMA_DEEPCTX_LADDER", "1"},
+                {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "1"}, {"LLAMA_KQ_MASK_PACKED", "1"},
+                {"LLAMA_DRAFT_VOCAB_COMPACT", "0"}, {"LLAMA_LSA_MODE", "key"},
+                {"LLAMA_LSA_MAP", "@model/lsa-qwen38-27b-d2048.gguf"},
+                {"LLAMA_LSA_IDX_CACHE", "1"}, {"LLAMA_LSA_PACKED", "1"},
+                {"LLAMA_LSA_KEEP", "51072"}, {"LLAMA_LSA_RESIDENT_MIB", "300.0"},
+                {"LLAMA_LSA_IDX_Q8", "1"}, {"LLAMA_LSA_BLOCK", "128"},
+                {"LLAMA_LSA_BLOCK_TAU", "2"}, {"LLAMA_LSA_SJ_SKIP", "1"},
+                {"LLAMA_LSA_REFINE", "128"}, {"LLAMA_LSA_REFINE_MULT", "2"},
+                {"LLAMA_LSA_SHARED", "1"}, {"LLAMA_LSA_FUSED_SEL", "1"},
+                {"LLAMA_LSA_COMP", "0"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
+                {"GGML_SJKVARN_TILE_SKIP", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
+                {"GGML_CUDA_LSA_RESIDENT_STAGE", "0"}, {"LLAMA_LSA_KEEP_FRAC", "0.195"},
+                {"LLAMA_LSA_REFINE_SH", "1"}
+            }
+        };
+        auto medium = small;
+        medium.name = "12dense";
+        medium.options.front().second = "262144";
+        medium.env.emplace_back("GGML_CUDA_GRAPH_MAX_ROWS", "16");
+        // 8 GB loop check: V07/PRESETS/SOL_HANDOFF.md, owner order 2026-11-17T04:03Z.
+        common_card_preset tiny {
+            "8dense", "2026-11-17.4", "best known/recheck before ship", "", {
+                {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
+                {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                {"--fit", "on"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
+                {"--cache-type-k", "sjkvarn3"}, {"--cache-type-v", "sjkvarn3"},
+                {"--sjkvarn-body-type", "sjkvarn4t"}, {"--cache-type-s", "q8_0"},
+                {"--override-tensor", "token_embd.weight=CPU"}, {"--load-mode", "none"},
+                {"--spec-type", "draft-mtp"}, {"--no-spec-mb-mtp", "0"}, {"--spec-draft-n-max", "3"},
+                {"--spec-n-rs-seq", "3"}, {"--spec-draft-p-min", "0"},
+                {"--spec-draft-vocab-map", "auto:65536"},
+                {"--spec-draft-window", "20480"}, {"--spec-draft-n-ubatch", "8"},
+                {"--spec-draft-type-k", "q8_0"}, {"--spec-draft-type-v", "q8_0"}
+            }, {
+                {"LLAMA_DEEPCTX_LADDER", "1"},
+                {"LLAMA_LSA_MODE", "key"}, {"LLAMA_LSA_MAP", "@model/lsa-qwen38-27b-d2048.gguf"},
+                {"LLAMA_LSA_KEEP", "16384"}, {"LLAMA_LSA_SHARED", "1"},
+                {"LLAMA_LSA_IDX_CACHE", "1"}, {"LLAMA_LSA_PACKED", "1"},
+                {"LLAMA_LSA_IDX_Q8", "1"}, {"LLAMA_LSA_IDX_Q4", "1"},
+                {"LLAMA_LSA_BLOCK", "128"}, {"LLAMA_LSA_BLOCK_TAU", "2"},
+                {"LLAMA_LSA_SJ_SKIP", "1"}, {"LLAMA_LSA_REFINE", "128"},
+                {"LLAMA_LSA_REFINE_SH", "1"},
+                {"LLAMA_LSA_REFINE_MULT", "2"}, {"LLAMA_LSA_RING_ROWS", "512"},
+                {"LLAMA_LSA_MEAN_CHUNKS", "1"}, {"LLAMA_RESERVE_VERIFY_ROWS", "7"},
+                {"GGML_CUDA_DISABLE_GRAPHS", "1"}, {"GGML_ALLOC_GROW_PCT", "1"},
+                {"LLAMA_LSA_FUSED_SEL", "1"}, {"LLAMA_LSA_COMP", "2"},
+                {"LLAMA_LSA_COMP_LB", "1"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
+                {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "256"},
+                {"LLAMA_KQ_MASK_PACKED", "1"}, {"GGML_SJKVARN_TILE_SKIP", "1"},
+                {"GGML_SJKVARN_TRELLIS_PREFILL_MIB", "16"}, {"GGML_SJKVARN_TRELLIS_WIDTH", "1"},
+                {"GGML_SJKVARN_TRELLIS_WIDTH_LSE", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
+                {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "0"}, {"LLAMA_DRAFT_VOCAB_FULL_HEAD", "1"},
+                {"LLAMA_MODEL_OVERLAY_PATCH", "@model/mtp-dm.gguf,@model/head-ait2.gguf"},
+                {"LLAMA_D1_HEAD", "@model/head-exact-f16.gguf"}, {"GGML_CUDA_GRAPH_MAX_ROWS", "16"}
+            }
+        };
+        tiny.fit_margin_mib = 500;
+        std::vector<common_card_preset> cards {large, medium, small, tiny};
+        for (auto & card : cards) {
+            card.version = "2026-11-17.6";
+            card.options.insert(card.options.end(), {
+                {"--temp", "1.0"}, {"--top-k", "20"}, {"--top-p", "0.95"}, {"--min-p", "0"}
+            });
+        }
+        return cards;
+    }();
+    // Headed fit evidence: V07/SMALLUB/RESULT.md; owner order 2026-11-17T04:48Z.
+    static const std::vector<common_card_preset> headed_profiles = [] {
+        auto cards = headless_profiles;
+        for (auto & card : cards) {
+            if (card.name == "10dense") {
+                card.options.front().second = "180224";
+            } else if (card.name == "12dense") {
+                card.options.front().second = "196608";
+                card.env.emplace_back("GGML_CUDA_DISABLE_GRAPHS", "1");
+            }
+        }
+        return cards;
+    }();
+    headless = headless || string_ends_with(name, "-headless");
+    const auto & profiles = headless ? headless_profiles : headed_profiles;
+    const std::string base_name = string_ends_with(name, "-headless") ? name.substr(0, name.size() - 9) : name;
+    for (const auto & profile : profiles) {
+        if (profile.name == base_name) {
+            return profile;
+        }
+    }
+    throw std::invalid_argument("unknown card preset: expected 24dense, 12dense, 10dense, or 8dense");
+}
+
+std::string common_card_preset_apply_env(const common_params & params) {
+    std::string applied;
+    if (params.card_preset.empty()) {
+        return applied;
+    }
+    const auto & card = common_card_preset_get(params.card_preset, params.card_preset_headless);
+    for (const auto & kv : card.env) {
+        if (!params.card_preset_kv_default && (kv.first.compare(0, 10, "LLAMA_LSA_") == 0 ||
+            kv.first.compare(0, 14, "GGML_CUDA_LSA_") == 0 || kv.first == "GGML_SJKVARN_TILE_SKIP")) {
+            continue;
+        }
+        if (!std::getenv(kv.first.c_str())) {
+            auto model_path = [&](const std::string & value) {
+                return value.compare(0, 7, "@model/") == 0 ?
+                    (std::filesystem::path(params.model.path).parent_path() / value.substr(7)).string() : value;
+            };
+            std::string value;
+            if (kv.first == "LLAMA_MODEL_OVERLAY_PATCH") {
+                std::istringstream paths(kv.second);
+                std::string path;
+                while (std::getline(paths, path, ',')) {
+                    if (!value.empty()) {
+                        value += ",";
+                    }
+                    value += model_path(path);
+                }
+            } else {
+                value = model_path(kv.second);
+            }
+            common_set_env(kv.first, value);
+        }
+        const char * value = std::getenv(kv.first.c_str());
+        if (!value) {
+            throw std::runtime_error("cannot set card preset environment: " + kv.first);
+        }
+        applied += " " + kv.first + "=" + value;
+    }
+    return applied;
+}
+
 static std::string rm_leading_dashes(const std::string & str) {
     size_t pos = 0;
     while (pos < str.size() && str[pos] == '-') {
@@ -171,12 +337,12 @@ static std::map<std::string, std::map<std::string, std::string>> parse_ini_from_
     std::map<std::string, std::map<std::string, std::string>> parsed;
 
     if (!std::filesystem::exists(path)) {
-        throw std::runtime_error("preset file does not exist: " + fs_path_to_utf8(path));
+        throw std::runtime_error("preset file does not exist: " + path.string());
     }
 
     std::ifstream file(path);
     if (!file.good()) {
-        throw std::runtime_error("failed to open server preset file: " + fs_path_to_utf8(path));
+        throw std::runtime_error("failed to open server preset file: " + path.string());
     }
 
     std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -225,7 +391,7 @@ static std::map<std::string, std::map<std::string, std::string>> parse_ini_from_
     common_peg_parse_context ctx(contents);
     const auto result = parser.parse(ctx);
     if (!result.success()) {
-        throw std::runtime_error("failed to parse server config file: " + fs_path_to_utf8(path));
+        throw std::runtime_error("failed to parse server config file: " + path.string());
     }
 
     std::string current_section = COMMON_PRESET_DEFAULT_NAME;
@@ -323,7 +489,7 @@ common_presets common_preset_context::load_from_ini(const std::filesystem::path 
                 }
                 LOG_DBG("accepted option: %s = %s\n", key.c_str(), preset.options[opt].c_str());
             } else if (ignore_unknown_keys) {
-                LOG_WRN("ignoring option '%s' from %s: not supported by this program\n", key.c_str(), fs_path_to_utf8(path).c_str());
+                LOG_WRN("ignoring option '%s' from %s: not supported by this program\n", key.c_str(), path.string().c_str());
             } else {
                 throw std::runtime_error(string_format(
                     "option '%s' not recognized in preset '%s'",
@@ -385,7 +551,7 @@ static bool is_draft_file(const std::string & fname) {
 }
 
 common_presets common_preset_context::load_from_models_dir(const std::string & models_dir) const {
-    const std::filesystem::path dir = std::filesystem::u8path(models_dir);
+    const std::filesystem::path dir = models_dir;
     if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
         throw std::runtime_error(string_format("error: '%s' does not exist or is not a directory\n", models_dir.c_str()));
     }
@@ -401,7 +567,7 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
             if (!entry.is_regular_file(ec)) {
                 continue;
             }
-            const std::string fname = fs_path_to_utf8(entry.path().filename());
+            const std::string fname = entry.path().filename().string();
             if (!string_ends_with(fname, ".gguf")) {
                 continue;
             }
@@ -422,9 +588,9 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
         if (!path.empty()) {
             models.push_back({
                 /* name        */ name,
-                /* path        */ fs_path_to_utf8(path),
-                /* path_mmproj */ fs_path_to_utf8(mmproj_file), // can be empty
-                /* path_draft  */ fs_path_to_utf8(draft_file)    // can be empty
+                /* path        */ path.string(),
+                /* path_mmproj */ mmproj_file.string(), // can be empty
+                /* path_draft  */ draft_file.string()   // can be empty
             });
         }
     };
@@ -432,13 +598,13 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
     for (const auto & entry : std::filesystem::directory_iterator(dir)) {
         std::error_code ec;
         if (entry.is_directory(ec)) {
-            scan_subdir(entry.path(), fs_path_to_utf8(entry.path().filename()));
+            scan_subdir(entry.path(), entry.path().filename().string());
             continue;
         }
         if (!entry.is_regular_file(ec)) {
             continue;
         }
-        const std::string fname = fs_path_to_utf8(entry.path().filename());
+        const std::string fname = entry.path().filename().string();
         if (!string_ends_with(fname, ".gguf")) {
             continue;
         }
@@ -450,7 +616,7 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
         string_replace_all(name, ".gguf", "");
         models.push_back({
             /* name        */ name,
-            /* path        */ fs_path_to_utf8(entry.path()),
+            /* path        */ entry.path().string(),
             /* path_mmproj */ "",
             /* path_draft  */ ""
         });

@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 static void check_parse() {
@@ -68,9 +69,53 @@ static void check_builtins() {
     GGML_ASSERT(flash32 != nullptr && flash32->n_sel == 32768 && std::strcmp(flash32->arch, "qwen4exp") == 0);
 }
 
+static void check_ordered() {
+    const uint64_t fp = 0x4f951848e41f4b37ULL;
+    const auto * b = llama_mtp_vocab_builtin_find(fp, 248320, "qwen35", 24576);
+    GGML_ASSERT(b != nullptr && b->ordered_ids != nullptr && b->hex == nullptr);
+    const auto ids = llama_mtp_vocab_builtin_ids(*b);
+    GGML_ASSERT(ids.size() == 24576);
+    GGML_ASSERT(ids.front() == 0 && ids[22527] == 248076 && ids[22528] == 399 && ids.back() == 246696);
+    llama_fnv1a64 h;
+    for (const int32_t id : ids) {
+        const uint8_t bytes[] = { uint8_t(id), uint8_t(id >> 8), uint8_t(id >> 16), uint8_t(id >> 24) };
+        h.add(bytes, sizeof(bytes));
+    }
+    // Hash every id in order as LE32, including the last 2048 hot slots.
+    GGML_ASSERT(h.h == 0x7328d4051c382504ULL);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find(fp, 248320, "qwen35", 0)->n_sel == 65536);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find(fp, 248320, "qwen4exp", 24576) == nullptr);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find(fp, 248320, "llama", 24576) == nullptr);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find(fp, 248320, nullptr, 24576) == nullptr);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find(fp ^ 1, 248320, "qwen35", 24576) == nullptr);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find(fp, 248321, "qwen35", 24576) == nullptr);
+    int32_t n_hot = -1;
+    GGML_ASSERT(llama_mtp_vocab_builtin_find_rm24h(fp, 248320, "qwen35", n_hot) == b && n_hot == 2048);
+    const auto * flash = llama_mtp_vocab_builtin_find_rm24h(fp, 248320, "qwen4exp", n_hot);
+    GGML_ASSERT(flash != nullptr && flash->n_sel == 65536 && n_hot == 0);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find_rm24h(fp ^ 1, 248320, "qwen35", n_hot) == nullptr && n_hot == 0);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find_rm24h(fp, 248321, "qwen35", n_hot) == nullptr && n_hot == 0);
+    GGML_ASSERT(llama_mtp_vocab_builtin_find_rm24h(fp, 248320, "llama", n_hot) == nullptr && n_hot == 0);
+
+    for (const auto & bad_ids : { std::vector<int32_t>{ 1, 1, 2 }, std::vector<int32_t>{ 0, -1, 2 }, std::vector<int32_t>{ 0, 1, 8 } }) {
+        auto bad = *b;
+        bad.n_vocab = 8;
+        bad.n_sel = bad_ids.size();
+        bad.ordered_ids = bad_ids.data();
+        bool rejected = false;
+        try {
+            llama_mtp_vocab_builtin_ids(bad);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        GGML_ASSERT(rejected);
+    }
+}
+
 int main(int argc, char ** argv) {
     check_parse();
     check_builtins();
+    check_ordered();
 
     const char * expect = nullptr;
     int n_fail = 0;

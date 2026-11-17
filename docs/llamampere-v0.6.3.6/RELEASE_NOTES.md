@@ -1,6 +1,6 @@
 # llamAmpere v0.6.3.6
 
-Flash-Next can now run AI4, a four-bit AI+ model file (qwen3.8-flash-next-Swift1.5-ATX-AI4). This release adds native card kernels and expert-cache support for the four-bit row-scale layout (type 124). AI4 is 84.97 GiB, 2.27 GiB smaller than UD-IQ4_XS, and closer to the Swift-Q8 reference (KL divergence 0.068353 vs 0.080886 over 2,286 positions). On one RTX 3090, single-seed screens at a 100K prompt wrote 15-22% faster than Strata v0.2.12 with UD-IQ4_XS, with 5-16% slower prompt reading. On the 89 GiB test machine the server peaked at 58.6-75.3 GiB of RAM. AI4 is not recommended on 64 GB RAM machines unless you pin a large share of experts on the GPU and move backup copies out of VRAM to cut RAM use; otherwise keep using AI3.
+Flash-Next can now run AI4, a four-bit AI+ model file (qwen3.8-flash-next-Swift1.5-ATX-AI4). This release adds native card kernels and expert-cache support for the four-bit row-scale layout (type 124). AI4 is 84.97 GiB, 2.27 GiB smaller than UD-IQ4_XS, and closer to the Swift-Q8 reference (KL divergence 0.068353 vs 0.080886 over 2,286 positions). On the 89 GiB test machine the server peaked at 58.6-75.3 GiB of RAM. AI4 is not recommended on 64 GB RAM machines unless you pin a large share of experts on the GPU and move backup copies out of VRAM to cut RAM use; otherwise keep using AI3.
 
 AI4 model file: https://huggingface.co/jakeatx/qwen3.8-flash-next-Swift1.5-ATX-AI4
 All Flash-Next files: https://huggingface.co/collections/jakeatx/qwen38-flash-next-6ae148b9e743c8905b00c70d

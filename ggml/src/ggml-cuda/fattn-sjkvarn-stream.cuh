@@ -47,9 +47,19 @@
 #include "mma.cuh"
 #include "fattn-sjkvarn-rot.cuh"
 
+#include <atomic>
 #include <cfloat>
+#include <cinttypes>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
+#include <cctype>
+#include <string>
+
+// [#195] decode tile of the stream kernel. An enum class, not a bool, so that no positional `true`/`false` meant for
+// another trailing template flag can select the compact tile by accident. compact: the (query, head) pairs of GQA 6
+// packed 8 per warp (q5g6 [#195] at width 5, KVROWS at widths 4, 6, 7, 8).
+enum class sj_kvarn_tile : int { rows = 0, compact = 1 };
 
 namespace fattn_sj_kvarn_stream {
 
@@ -75,6 +85,8 @@ constexpr int RMETA_KZ    = 2*D;                        // per-record vectors st
 constexpr int RMETA_VCH   = 4*D;
 constexpr int RMETA_BYTES = 6*D;                        // 1536, double-buffered per split
 constexpr int RMETA_CHUNKS = RMETA_BYTES/16;
+static_assert(STAGE_BYTES == GGML_LSA_STRIP_HEAD_BYTES && RMETA_BYTES == GGML_QSA_META_HEAD_BYTES && RMETA_VCH == 1024,
+              "LLAMA_LSA_RESIDENT strip slots and card meta hold the stage and RMETA byte images");
 
 constexpr int COL_STRIDE = D + 4; // fp32 stride of one head column in the combine buffer (bank spread)
 constexpr int SLOT_FLOATS = NCOLS2*COL_STRIDE + 2*NCOLS2; // acc + (max, sum) per column
@@ -164,14 +176,155 @@ struct cursor {
     int p0;
     int g;
     int sl;
+    int o;  // ordinal of the record in the walk (== g on the dense walk); picks the rmeta buffer
+    int sm; // live strips of record g (bit sl), all ones unless GGML_SJKVARN_LIVE_STRIPS=1
 };
+
+// Opt-in record skip (GGML_SJKVARN_LIVE_RECORDS=1): the body walk visits only the records that some query row can see
+// (any finite mask entry in the record's G positions). Flags: one warp per record. List: [0] = count, then the live
+// record ids in order (one block, ordered by a ballot scan per 1024 records). Exact strips (sink, ring) are unchanged.
+// Per-head mask (ne[2] == n_head, the q heads of a KV group share one mask): one flag row and one list per KV head
+// (blockIdx.y / blockIdx.x), read from the group's first q head; head_pitch = halfs between KV heads' masks.
+// Strip skip (strips != 0, GGML_SJKVARN_LIVE_STRIPS=1): the flag is the record's live-strip mask (bit sl = some row sees
+// a finite entry in strip sl), and the walk skips the dead strips of a live record (no load, no MMA). A dead strip
+// adds exactly zero (exp(-inf) = 0 and the running max is unchanged), so the output is the dense masked result.
+// Without it the flag is all ones for a live record. List entries: g | flag << 24.
+// LSA block list (ggml_flash_attn_ext_set_lsa_blocks): mask entry GGML_LSA_MASK_SEL at position p = visible iff bit
+// p >> sel_sh of selb is set (blocks >= nbs hidden); any other entry keeps its value
+static __device__ __forceinline__ float sj_lsa_mask_value(const half h, const int p, const uint32_t * selb, const int sel_sh,
+        const int nbs) {
+    const float m = __half2float(h);
+    if (selb != nullptr && m == GGML_LSA_MASK_SEL) {
+        const int b = p >> sel_sh;
+        return b < nbs && ((selb[b >> 5] >> (b & 31)) & 1u) ? 0.0f : -INFINITY;
+    }
+    return m;
+}
+
+// LSA virtual keys (ggml_flash_attn_ext_set_lsa_vk), stored by sj_live_record_list at list - SJ_LIST_HDR: block mean
+// K/V rows of the KV group (head z at + z*D), row pitch in halves; nd row t at nd + t*nd_pitch (< 0.5 picked, else 1 +
+// the dropped count); n = blocks (0: off); alloc = mean rows readable from k/v (>= 16)
+struct sj_lsa_vk {
+    const half  * k;
+    const half  * v;
+    const float * nd;
+    int   k_pitch;
+    int   v_pitch;
+    int   nd_pitch;
+    int   n;
+    int   alloc;
+    float bias;
+};
+constexpr int SJ_LIST_HDR = 16; // ints before the lists: sj_lsa_vk, then list[-4 .. -1]
+static_assert(sizeof(sj_lsa_vk) <= (SJ_LIST_HDR - 4)*sizeof(int32_t), "list header");
+
+// sel F32 [nbs] -> bit words (vk: row 0 of the virtual-key plane, picked = entry < 0.5)
+static __global__ void sj_lsa_sel_bits(const float * sel, const int nbs, uint32_t * bits, const int vk = 0) {
+    const int w = blockIdx.x*blockDim.x + threadIdx.x;
+    if (w*32 >= nbs) {
+        return;
+    }
+    uint32_t x = 0;
+    for (int i = 0; i < 32 && w*32 + i < nbs; ++i) {
+        const float f = sel[w*32 + i];
+        x |= ((vk ? f < 0.5f : f > 0.5f) ? 1u : 0u) << i;
+    }
+    bits[w] = x;
+}
+
+static __global__ void sj_live_record_flags(const half * mask, const int pitch, const int n_q, const int32_t * desc,
+        int32_t * flags, const int nrec_max, const int64_t head_pitch, const int strips,
+        const uint32_t * selb = nullptr, const int sel_sh = 0, const int sel_nbs = 0) {
+    const int g = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    mask  += blockIdx.y*head_pitch;
+    flags += (size_t) blockIdx.y*nrec_max;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int S = desc[GGML_SJKVARN_DESC_S], B = desc[GGML_SJKVARN_DESC_B], G = desc[GGML_SJKVARN_DESC_G];
+    const int nrec = min(nrec_max, (B - S)/G);
+    if (g >= nrec) {
+        return;
+    }
+    const uint32_t full = (1u << (G/16)) - 1u;
+    uint32_t sm = 0;
+    for (int q = 0; q < n_q && sm != full && (strips || sm == 0); ++q) {
+        for (int t0 = 0; t0 < G; t0 += WARP_SIZE) { // 32 positions = strips t0/16 and t0/16 + 1
+            const int t = t0 + lane;
+            const bool f = t < G && sj_lsa_mask_value(mask[(size_t) q*pitch + S + g*G + t], S + g*G + t, selb, sel_sh,
+                                                        sel_nbs) != -INFINITY;
+            const uint32_t bal = __ballot_sync(0xFFFFFFFF, f);
+            sm |= ((bal & 0xFFFFu) ? 1u : 0u) << (t0/16);
+            sm |= ((bal >> 16)     ? 1u : 0u) << (t0/16 + 1);
+        }
+        sm &= full;
+    }
+    if (lane == 0) {
+        flags[g] = sm == 0 ? 0 : (strips ? (int32_t) sm : (int32_t) full);
+    }
+}
+
+// header read by the decode kernel: list[-1] = stride between KV heads' lists; list[-2] = offset (ints, from list) of
+// the LSA selection bits or 0; list[-3] = log2(LSA block); list[-4] = LSA block count
+static __global__ void sj_live_record_list(const int32_t * desc, const int32_t * flags, int32_t * list, const int nrec_max,
+        const int head_stride, const int sel_off = 0, const int sel_sh = 0, const int sel_nbs = 0, const sj_lsa_vk vk = {}) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *(sj_lsa_vk *) (list - SJ_LIST_HDR) = vk;
+        list[-1] = head_stride; // read by the decode kernel: list of KV head z at list + z*head_stride
+        list[-2] = sel_off;
+        list[-3] = sel_sh;
+        list[-4] = sel_nbs;
+    }
+    flags += (size_t) blockIdx.x*nrec_max;
+    list  += (size_t) blockIdx.x*(nrec_max + 1);
+    __shared__ int warp_counts[32];
+    __shared__ int base;
+    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE, nwarps = blockDim.x / WARP_SIZE;
+    const int nrec = min(nrec_max, (desc[GGML_SJKVARN_DESC_B] - desc[GGML_SJKVARN_DESC_S])/desc[GGML_SJKVARN_DESC_G]);
+    if (tid == 0) {
+        base = 0;
+    }
+    __syncthreads();
+    for (int g0 = 0; g0 < nrec; g0 += blockDim.x) {
+        const int g = g0 + tid;
+        const bool live = g < nrec && flags[g] != 0;
+        const uint32_t bal = __ballot_sync(0xFFFFFFFF, live);
+        if (lane == 0) {
+            warp_counts[warp] = __popc(bal);
+        }
+        __syncthreads();
+        int before = base;
+        for (int w = 0; w < warp; ++w) {
+            before += warp_counts[w];
+        }
+        if (live) {
+            list[1 + before + __popc(bal & ((1u << lane) - 1u))] = (int32_t) ((uint32_t) g | ((uint32_t) flags[g] << 24));
+        }
+        __syncthreads();
+        if (tid == 0) {
+            for (int w = 0; w < nwarps; ++w) {
+                base += warp_counts[w];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        list[0] = base;
+    }
+}
 
 #ifdef SJKVARN_STREAM_DBG_TIME
 static __device__ unsigned int fattn_sj_kvarn_stream_dbg_run = 0;
 #endif
 
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false>
-__launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 ? 2 : 1)
+// lsa: opt-in LSA build (live-record walk, strip skip, per-head mask). The default instance (lsa = false) compiles that
+// code out, so the default decode kernel is the pre-LSA code (registers/stack checked with cuobjdump).
+// max_warps 6 (GGML_SJKVARN_NT6_OCC, default on): the 6-row twin of the max_warps 5 body, held to 2 CTAs/SM (<= 168 regs)
+// compact (q5g6 [#195], KVROWS): compact GQA-6 tile. The 6*n_q (query, head) pairs of a KV head fill ceil(6*n_q/8) warps
+// x 8 columns (the pairs past 6*n_q pad) instead of n_q warps x 8 columns with 6 heads each: width 4 -> 3 warps,
+// 5 -> 4, 6 -> 5, 7 and 8 -> 6. Every column keeps its own Q, mask row, online softmax and output; the KV split partition
+// is the host's choice (mode 1: forced to the rows kernel's), so the result is bit-identical to the rows kernel while the
+// block issues fewer MMA rows per strip. Instances: max_warps 3 (width 4), 4 (width 5), 5 (width 6), 6 (widths 7, 8).
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
+__launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 || max_warps == 6 || (max_warps == 3 && tile == sj_kvarn_tile::compact) ? 2 : 1)
 static __global__ void flash_attn_ext_sj_kvarn_stream(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -179,6 +332,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_rows,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -197,7 +351,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         const char    * __restrict__ sj_kvarn_body,
         const int32_t * __restrict__ sj_kvarn_desc) {
 #if defined(FLASH_ATTN_AVAILABLE) && defined(TURING_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
-    GGML_UNUSED_VARS(sinks, KV_max, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, nb03, ne10, ne13,
+    GGML_UNUSED_VARS(sinks, KV_max, KV_rows, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, nb03, ne10, ne13,
                      nb13, nb23, ne31, ne32, ne33, nb32, nb33);
 
     extern __shared__ __align__(16) char smem[];
@@ -213,16 +367,26 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const int warp   = threadIdx.y;
     const int nwarps = blockDim.y;
     const int n_q    = int(ne01.z);
-    const int NT     = max_warps == 5 ? 5 : n_q; // specialize MTP-4 verification
-    const int KW     = max_warps == 5 ? 1 : nwarps / NT;  // KV splits inside the block (host: nwarps == NT*KW, KW a power of two)
-    const int nt     = max_warps == 5 ? warp : warp % NT;    // this warp's query row
-    const int kw     = max_warps == 5 ? 0 : warp / NT;    // this warp's KV split
+    constexpr bool compact = tile == sj_kvarn_tile::compact;
+    static_assert(!compact || (max_warps >= 3 && max_warps <= 6), "the compact tile runs 3..6 warps");
+    constexpr bool fixed_nt = max_warps == 5 || max_warps == 6 || compact; // MTP-4 verification (5), 6 rows (NT6_OCC), compact
+    // compact: max_warps == ceil(6*n_q/8) == nwarps (ggml_cuda_fattn_sj_kvarn_stream_compact launches it so), compile-time
+    const int NT     = compact || max_warps == 5 || max_warps == 6 ? max_warps : n_q;
+    const int KW     = fixed_nt ? 1 : nwarps / NT;  // KV splits inside the block (host: nwarps == NT*KW, KW a power of two)
+    const int nt     = fixed_nt ? warp : warp % NT;    // this warp's query row (compact: its column tile)
+    const int kw     = fixed_nt ? 0 : warp / NT;    // this warp's KV split
 
     const int z_KV  = blockIdx.z;    // KV head (ne03 == 1)
     const int gqa   = ne02 / ne12;
     const int head0 = z_KV*gqa;
     const int hcol  = lane >> 2;     // the lane's head column (B/C fragment row)
-    const bool hvalid = hcol < gqa;
+    // column col of this warp -> query row, head in the group, and whether it is a real pair (compact: pair 8*nt + col
+    // of the n_q x 6 grid, pad pairs read query row 0's mask and a zero Q and are never stored)
+    const int npair = 6*n_q;
+    auto col_query = [&](const int col) -> int { return compact ? (8*nt + col < npair ? (8*nt + col)/6 : 0) : nt; };
+    auto col_head  = [&](const int col) -> int { return compact ? (8*nt + col) % 6 : col; };
+    auto col_valid = [&](const int col) -> bool { return compact ? 8*nt + col < npair : col < gqa; };
+    const bool hvalid = col_valid(hcol);
 
     const fattn_sj_kvarn_ctx kv = fattn_sj_kvarn_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, D, 4, 4, nb12, nb22);
     const int n_kv_pad = ne11;
@@ -233,17 +397,45 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     // warp becomes the tail of the kernel
     const int nsplit = gridDim.y * KW;
     const int split  = blockIdx.y * KW + kw;
-    const int sb0    = kv.S/16, sb1 = kv.B/16;
+    // record skip: KV_max carries the live-record list; the walk is then over virtual strips 0 .. n_live*G/16
+    // live[-1] = stride between the KV heads' lists (0: one list shared by all heads)
+    const int * live = lsa && KV_max ? KV_max + z_KV*KV_max[-1] : nullptr;
+    const int n_live = live ? live[0] : 0;
+    // LSA block list: selection bits after the lists (header list[-2..-4], sj_live_record_list)
+    const uint32_t * selb = nullptr;
+    int sel_sh = 0, sel_nbs = 0;
+    if constexpr (lsa) {
+        if (live && KV_max[-2] > 0) {
+            selb    = (const uint32_t *) (KV_max + KV_max[-2]);
+            sel_sh  = KV_max[-3];
+            sel_nbs = KV_max[-4];
+        }
+    }
+    auto mask_at = [&](const half * m, const int p) -> float {
+        if constexpr (lsa) {
+            return sj_lsa_mask_value(m[p], p, selb, sel_sh, sel_nbs);
+        } else {
+            return __half2float(m[p]);
+        }
+    };
+    const int sb0    = live ? 0 : kv.S/16, sb1 = live ? n_live*G16 : kv.B/16;
     const int nbody  = sb1 - sb0;
     const int s_lo   = sb0 + (int) (((int64_t) nbody *  split     ) / nsplit);
     const int s_hi   = sb0 + (int) (((int64_t) nbody * (split + 1)) / nsplit);
     const int n_ex_sink = kv.S/16;
     const int n_ex      = n_ex_sink + (n_kv_pad - kv.B)/16; // padded positions are masked
 
-    const float * Qf = (const float *) (Q + (size_t) nt*nb01 + (size_t) (head0 + (hvalid ? hcol : 0))*nb02);
+    const float * Qf = (const float *) (Q + (size_t) col_query(hcol)*nb01 + (size_t) (head0 + (hvalid ? col_head(hcol) : 0))*nb02);
     // [#139] rot build: Q arrives rotated (ggml_cuda_sj_kvarn_rot256_q_pass in the launcher); only the output is rotated here
     static_assert(!rot || !turbo4_body, "turbo4 bodies use the grouped signed basis");
-    const char  * mrow = mask + (size_t) nt*nb31;
+    // mask row of the lane's two C columns 2(lane%4) and +1. compact: pair n = 8nt + 2(lane%4) is even, so n and n + 1
+    // have the same query row n/6 (n + 1 is odd, never a multiple of 6; npair is even, so both pads read row 0): one row
+    // per lane.
+    static_assert(6 % 2 == 0, "compact column pairs must share a query row");
+    // per-head mask (ne32 == n_head, LSA build, rows tile only): the KV group's first q head (the graph gives a group's
+    // q heads one mask)
+    static_assert(!lsa || tile == sj_kvarn_tile::rows, "the LSA build has no compact tile");
+    const char  * mrow = mask + (size_t) col_query(2*(lane & 3))*nb31 + (lsa && ne32 > 1 ? (size_t) head0*nb32 : 0);
     const char  * Kh = K + (size_t) z_KV*nb12;
     const char  * Vh = V + (size_t) z_KV*nb22;
 
@@ -412,25 +604,51 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 
     auto is_body = [&](const int p0) { return p0 >= kv.S && p0 < kv.B; };
     auto rec_of  = [&](const cursor & cu) { return fattn_sj_kvarn_rec(kv, cu.g); };
-    auto cursor_init = [&](const int p0) {
+    auto cursor_init = [&](const int s) { // s = strip index of the walk
         cursor cu;
+        if (live) {
+            cu.o  = s / G16;
+            cu.sl = s - cu.o*G16;
+            const uint32_t e = cu.o < n_live ? (uint32_t) live[1 + cu.o] : 0u;
+            cu.g  = (int) (e & 0xFFFFFFu);
+            cu.sm = (int) (e >> 24);
+            cu.p0 = kv.S + cu.g*kv.G + 16*cu.sl;
+            return cu;
+        }
+        const int p0 = 16*s;
         cu.p0 = p0;
         cu.g  = 0;
         cu.sl = 0;
+        cu.sm = 0xFF;
         if (is_body(p0)) {
             cu.g  = (p0 - kv.S) / kv.G;
             cu.sl = ((p0 - kv.S) - cu.g*kv.G) / 16;
         }
+        cu.o = cu.g;
         return cu;
     };
     auto cursor_next = [&](cursor & cu) {
+        if (live) {
+            if (++cu.sl == G16) {
+                cu.sl = 0;
+                ++cu.o;
+                if (cu.o < n_live) {
+                    const uint32_t e = (uint32_t) live[1 + cu.o];
+                    cu.g  = (int) (e & 0xFFFFFFu);
+                    cu.sm = (int) (e >> 24);
+                }
+            }
+            cu.p0 = kv.S + cu.g*kv.G + 16*cu.sl;
+            return;
+        }
         cu.p0 += 16;
         if (cu.p0 == kv.S) {
-            cu.g = 0; cu.sl = 0;
+            cu.g = 0; cu.sl = 0; cu.o = 0;
         } else if (is_body(cu.p0)) {
             if (++cu.sl == G16) {
                 cu.sl = 0;
                 ++cu.g;
+                ++cu.o;
             }
         }
     };
@@ -453,16 +671,36 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         }
         const char * ks   = rec + cu.sl*STRIP_BYTES;
         const uint32_t dst_s = ring_s + stage*STAGE_BYTES;
+        // LLAMA_LSA_RESIDENT: record vectors from the card meta (same 1,536-byte image as RMETA), a resident strip from
+        // its slot (same 4,192-byte image as the stage); a strip without a slot reads the pinned master
+        const char * meta_card = nullptr;
+        const char * slot_card = nullptr;
+        if (kv.strip_map != nullptr) {
+            const ggml_cuda_qsa_clock_map & smap = *kv.strip_map;
+            const int record = kv.table ? kv.table[cu.g] : cu.g;
+            meta_card = smap.meta + ((size_t) record*smap.heads + kv.resident_head)*GGML_QSA_META_HEAD_BYTES;
+            const int slot = smap.table[record*(128/GGML_LSA_STRIP_CELLS) + cu.sl];
+            if (slot >= 0) {
+                slot_card = smap.card + ((size_t) slot*smap.heads + kv.resident_head)*GGML_LSA_STRIP_HEAD_BYTES;
+            }
+        }
         if (with_meta) {
-            const uint32_t dst_m = rmeta_s + (cu.g & 1)*RMETA_BYTES;
+            const uint32_t dst_m = rmeta_s + ((lsa ? cu.o : cu.g) & 1)*RMETA_BYTES;
             for (int q = nt*WARP_SIZE + lane; q < RMETA_CHUNKS; q += NT*WARP_SIZE) {
-                const char * src = q < RMETA_VCH/16 ? rec + kv.k_scale + 16*q : rec + kv.v_ch + 16*(q - RMETA_VCH/16);
+                const char * src = meta_card ? meta_card + 16*q :
+                    q < RMETA_VCH/16 ? rec + kv.k_scale + 16*q : rec + kv.v_ch + 16*(q - RMETA_VCH/16);
                 cp_async_cg_16<0>(dst_m + 16*q, src);
             }
         }
+        if (lsa && cu.sl < 8 && !((cu.sm >> cu.sl) & 1)) { // dead strip (strip skip): record vectors only, empty group keeps the count
+            cp_async_commit();
+            return;
+        }
         for (int q = nt*WARP_SIZE + lane; q < STAGE_CHUNKS; q += NT*WARP_SIZE) {
             const char * src;
-            if (q < STRIP_BYTES/16) {
+            if (slot_card != nullptr) {
+                src = slot_card + 16*q;
+            } else if (q < STRIP_BYTES/16) {
                 src = ks + 16*q;
             } else if (q < 2*STRIP_BYTES/16) {
                 src = ks + kv.v_payload + 16*(q - STRIP_BYTES/16);
@@ -506,7 +744,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         setup_exact();
     }
 
-    cursor ci = cursor_init(16*s_lo);   // issue cursor, NSTAGE-1 strips ahead
+    cursor ci = cursor_init(s_lo);      // issue cursor, NSTAGE-1 strips ahead
     cursor cc = ci;                      // compute cursor
     int stage_i = 0;                     // ring stage of the issue cursor
     int stage_c = 0;                     // ring stage of the compute cursor
@@ -543,7 +781,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 #endif
 
         const int    id = cc.g;
-        const char * rm = rmeta + (id & 1)*RMETA_BYTES;
+        const char * rm = rmeta + ((lsa ? cc.o : cc.g) & 1)*RMETA_BYTES;
 #ifdef SJKVARN_STREAM_DBG_TIME
         dbg_nrec += id != cur_id ? 1 : 0;
 #endif
@@ -572,9 +810,8 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 }
                 mma(kq, a, qp[c]);
             }
-            const half * mk = (const half *) mrow + cc.p0;
-            const float mk0 = __half2float(mk[lane >> 2]);
-            const float mk1 = __half2float(mk[(lane >> 2) + 8]);
+            const float mk0 = mask_at((const half *) mrow, cc.p0 + (lane >> 2));
+            const float mk1 = mask_at((const half *) mrow, cc.p0 + (lane >> 2) + 8);
             kq.x[0] += mk0; kq.x[1] += mk0;
             kq.x[2] += mk1; kq.x[3] += mk1;
             const T_B P = softmax(kq);
@@ -589,7 +826,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 }
                 mma(acc[c], a, P);
             }
-        } else {
+        } else if (!lsa || cc.sl >= 8 || ((cc.sm >> cc.sl) & 1)) { // dead strips (strip skip) add nothing: skipped; G > 128: strips 8+ always walked
             T_C kq;
             const char * st = ring + stage_c*STAGE_BYTES;
             const uint32_t * kwp = (const uint32_t *) st + lane;
@@ -603,13 +840,12 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 mma(kq, a, qp[c]);
             }
             const half * ktok = (const half *) (st + META_KTOK);
-            const half * mk   = (const half *) mrow + cc.p0;
             const half * vsh  = (const half *) (st + META_VS);
             const half * vzh  = (const half *) (st + META_VZ);
             const float tok0 = __half2float(ktok[lane >> 2]);
             const float tok1 = __half2float(ktok[(lane >> 2) + 8]);
-            const float mk0  = __half2float(mk[lane >> 2]);
-            const float mk1  = __half2float(mk[(lane >> 2) + 8]);
+            const float mk0  = mask_at((const half *) mrow, cc.p0 + (lane >> 2));
+            const float mk1  = mask_at((const half *) mrow, cc.p0 + (lane >> 2) + 8);
             kq.x[0] = tok0*(kq.x[0] + c_r[0]) + mk0;
             kq.x[1] = tok0*(kq.x[1] + c_r[1]) + mk0;
             kq.x[2] = tok1*(kq.x[2] + c_r[0]) + mk1;
@@ -660,10 +896,9 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const half * mrow_h = (const half *) mrow;
 
     // KQ of the exact strip staged in the ring (fragment order, K straight) + mask, online softmax -> P
-    auto exact_kq = [&](const int p0) -> T_B {
+    // mk0/mk1: additive term of token rows lane/4 and lane/4 + 8
+    auto kq_add = [&](const float mk0, const float mk1) -> T_B {
         T_C kq;
-        const float mk0 = __half2float(mrow_h[p0 + (lane >> 2)]);
-        const float mk1 = __half2float(mrow_h[p0 + (lane >> 2) + 8]);
 #pragma unroll
         for (int c = 0; c < NTC; ++c) {
             T_A a;
@@ -680,6 +915,9 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         kq.x[2] += mk1;
         kq.x[3] += mk1;
         return softmax(kq);
+    };
+    auto exact_kq = [&](const int p0) -> T_B {
+        return kq_add(mask_at(mrow_h, p0 + (lane >> 2)), mask_at(mrow_h, p0 + (lane >> 2) + 8));
     };
     // acc += V^T P from the V strip staged in the ring (8x8 transposes)
     auto exact_pv = [&](const T_B & P) {
@@ -717,7 +955,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         (((uintptr_t) Kh | (uintptr_t) Vh | (uintptr_t) nb11 | (uintptr_t) nb21 | (uintptr_t) rb_k | (uintptr_t) rb_v) & 3) == 0;
     // the MTP-4 verification kernel (max_warps 5) sits at its register cap; the queue's state costs its body loop
     // more than the pipeline saves (measured +30-35 us/call at 102K), so it keeps the direct path
-    constexpr bool raw_pipe = max_warps != 5;
+    constexpr bool raw_pipe = max_warps != 5 && max_warps != 6; // compact at max_warps 3 and 4 keeps the pipeline, as before
     const int nraw = raw_pipe && raw_ok ? min(RAW_MAX, raw_avail/raw_slot) : 0;
     int e_pipe = n_ex; // first strip of the pipelined range (n_ex: none)
     if (nraw > 0) {
@@ -839,6 +1077,43 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         cp_async_wait_all();
         sync_split(); // everyone has read V before the combine reuses the ring
     }
+
+    // LSA virtual keys (ggml_flash_attn_ext_set_lsa_vk): the dropped blocks' mean K/V rows, 16 blocks per strip, go
+    // through the exact-strip path (f16 rows, same staging, KQ, softmax and PV) with log(n dropped) + bias as the
+    // additive term instead of the mask (-inf: picked block, nothing dropped, or past the block count). Strips continue
+    // the exact round-robin after strip n_ex - 1, so the extra work lands on the splits with the fewest exact strips.
+    if constexpr (lsa) {
+        const sj_lsa_vk * vkp = live && KV_max[-2] > 0 ? (const sj_lsa_vk *) (KV_max - SJ_LIST_HDR) : nullptr;
+        const int vk_n = vkp ? vkp->n : 0;
+        if (vk_n > 0) {
+            const int nvs = (vk_n + 15)/16;
+            int v = (split - n_ex) % nsplit;
+            v += v < 0 ? nsplit : 0;
+            if (v < nvs && split >= n_ex) {
+                setup_exact();
+            }
+            const float * ndr = vkp->nd + (size_t) (nt < n_q ? nt : 0)*vkp->nd_pitch;
+            for (; v < nvs; v += nsplit) {
+                const int b0 = min(16*v, vkp->alloc - 16); // a short last strip re-reads earlier rows (masked below)
+                issue_exact((const char *) (vkp->k + (size_t) b0*vkp->k_pitch + (size_t) z_KV*D), 2*(size_t) vkp->k_pitch,
+                            GGML_TYPE_F16);
+                cp_async_wait_all();
+                sync_split();
+                auto vk_term = [&](const int b) -> float {
+                    const float n = b >= 16*v && b < vk_n && nt < n_q ? ndr[b] - 1.0f : 0.0f; // dropped cells
+                    return n >= 0.5f ? logf(n) + vkp->bias : -INFINITY;
+                };
+                const T_B P = kq_add(vk_term(b0 + (lane >> 2)), vk_term(b0 + (lane >> 2) + 8));
+                sync_split(); // everyone has read K
+                issue_exact((const char *) (vkp->v + (size_t) b0*vkp->v_pitch + (size_t) z_KV*D), 2*(size_t) vkp->v_pitch,
+                            GGML_TYPE_F16);
+                cp_async_wait_all();
+                sync_split();
+                exact_pv(P);
+                sync_split(); // everyone has read V
+            }
+        }
+    }
 #ifdef SJKVARN_STREAM_DBG_TIME
     {
         const long long dbg_t1 = clock64();
@@ -936,12 +1211,12 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
             const int col = 2*(lane & 3) + e;
-            if (col >= gqa) {
+            if (!col_valid(col)) {
                 continue;
             }
-            const int head = head0 + col;
+            const int head = head0 + col_head(col);
             const float inv = single ? 1.0f/kq_sum[e] : 1.0f;
-            float * out = dst + ((size_t) (nt*ne02 + head)*gridDim.y + blockIdx.y)*D;
+            float * out = dst + ((size_t) (col_query(col)*ne02 + head)*gridDim.y + blockIdx.y)*D;
 #pragma unroll
             for (int c = 0; c < NTC; ++c) {
                 const int d = 16*c + (lane >> 2) + 8*(l >> 1);
@@ -965,13 +1240,13 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
             const int col = 2*lane + e;
-            if (col < gqa) {
-                dst_meta[(size_t) (nt*ne02 + head0 + col)*gridDim.y + blockIdx.y] = make_float2(kq_max[e], kq_sum[e]);
+            if (col_valid(col)) {
+                dst_meta[(size_t) (col_query(col)*ne02 + head0 + col_head(col))*gridDim.y + blockIdx.y] = make_float2(kq_max[e], kq_sum[e]);
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_rows, dst, dst_meta, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
                      ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23,
                      ne31, ne32, ne33, nb31, nb32, nb33, sj_kvarn_body, sj_kvarn_desc);
     NO_DEVICE_CODE;
@@ -981,10 +1256,10 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 } // namespace fattn_sj_kvarn_stream
 
 // Each query warp shares a packed-data ring with the other query warps in its KV split.
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false>
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
 static fattn_kernel_t ggml_cuda_fattn_sj_kvarn_stream_kernel() {
     using namespace fattn_sj_kvarn_stream;
-    fattn_kernel_t kernel = flash_attn_ext_sj_kvarn_stream<max_warps, NSTAGE, turbo4_body, rot>;
+    fattn_kernel_t kernel = flash_attn_ext_sj_kvarn_stream<max_warps, NSTAGE, turbo4_body, rot, lsa, tile>;
     const int id = ggml_cuda_get_device();
     static bool initialized[GGML_CUDA_MAX_DEVICES] = {false};
     if (!initialized[id]) {
@@ -1000,7 +1275,7 @@ static size_t ggml_cuda_fattn_sj_kvarn_stream_shared(const int NT, const int KW,
     return std::max(ring_bytes(KW, nstage, turbo4_body), (size_t) NT*(KW/2)*SLOT_BYTES);
 }
 
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false>
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
 static int ggml_cuda_fattn_sj_kvarn_stream_occupancy(const int NT, const int KW) {
     const size_t shared = ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body);
     if (shared > ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
@@ -1009,26 +1284,64 @@ static int ggml_cuda_fattn_sj_kvarn_stream_occupancy(const int NT, const int KW)
     int blocks = 0;
     // #139: always the plain build, so the rot build picks the same stage count and KV split
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,
-        ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, false>(), WARP_SIZE*NT*KW, shared));
+        ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, false, false, tile>(), WARP_SIZE*NT*KW, shared));
     return blocks;
 }
 
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false>
+static bool ggml_cuda_fattn_sj_nt6_logged = false; // GGML_SJKVARN_NT6_OCC log, one line per process
+
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
 static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, const int parallel_blocks) {
     using namespace fattn_sj_kvarn_stream;
+    // the LSA instance only when the opt-in live-record list is set (never for turbo4 bodies)
+    fattn_kernel_t kernel = ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot, false, tile>();
+    if constexpr (!turbo4_body) {
+        if (ggml_cuda_fattn_sj_live_records != nullptr || (dst->src[3] && dst->src[3]->ne[2] > 1)) {
+            // the compact tile has no LSA build: ggml_cuda_fattn_sj_kvarn_q5g6_mode_for / _compact_mode_for refuse it first
+            GGML_ASSERT(tile == sj_kvarn_tile::rows);
+            kernel = ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot, true>();
+        }
+    }
+    if constexpr (tile == sj_kvarn_tile::compact) {
+        // KVROWS: one line per compact instance (warp count x ring depth), so a run can confirm the CTAs/SM it gets
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            cudaFuncAttributes attr;
+            CUDA_CHECK(cudaFuncGetAttributes(&attr, reinterpret_cast<const void *>(kernel)));
+            int ctas = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, kernel, WARP_SIZE*NT*KW,
+                ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body)));
+            GGML_LOG_INFO("SJKVARN COMPACT: %d-warp compact instance at %d CTA/SM (regs %d, local %zu B, nstage %d, rot %d, turbo4 %d)\n",
+                NT, ctas, attr.numRegs, attr.localSizeBytes, NSTAGE, (int) rot, (int) turbo4_body);
+        }
+    } else if constexpr (max_warps == 6) {
+        // GGML_SJKVARN_NT6_OCC: one line on the first launch (any rows instance), so a run can confirm it is engaged
+        if (!ggml_cuda_fattn_sj_nt6_logged) {
+            ggml_cuda_fattn_sj_nt6_logged = true;
+            cudaFuncAttributes attr;
+            CUDA_CHECK(cudaFuncGetAttributes(&attr, reinterpret_cast<const void *>(kernel)));
+            int ctas = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, kernel, WARP_SIZE*NT*KW,
+                ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body)));
+            GGML_LOG_INFO("SJKVARN NT6_OCC: 6-row instance at %d CTA/SM (regs %d, local %zu B, nstage %d)\n",
+                ctas, attr.numRegs, attr.localSizeBytes, NSTAGE);
+        }
+    }
     launch_fattn<D, NCOLS2, NCOLS2>
-        (ctx, dst, ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot>(), NT*KW,
+        (ctx, dst, kernel, NT*KW,
          ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body), UNIT,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/false, /*use_sparse=*/false, WARP_SIZE, nullptr, nullptr, parallel_blocks,
          /*async_kv_preload=*/false, /*sj_fill_kv_splits=*/turbo4_body ? 0 : KW);
 }
 
-template <int max_warps, bool turbo4_body = false, bool rot = false>
-static void ggml_cuda_fattn_sj_kvarn_stream_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, int nstage, const int parallel_blocks) {
+// Ring depth for a launch: a requested depth if it can launch, else the occupancy choice cached per device and width.
+template <int max_warps, bool turbo4_body = false, bool rot = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
+static int ggml_cuda_fattn_sj_kvarn_stream_nstage(const int NT, const int KW, int nstage) {
     if (nstage != 0) {
-        const int blocks = nstage >= 6 ? ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 6, turbo4_body, rot>(NT, KW)
-                         : nstage >= 4 ? ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 4, turbo4_body, rot>(NT, KW)
-                                       : ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 2, turbo4_body, rot>(NT, KW);
+        const int blocks = nstage >= 6 ? ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 6, turbo4_body, rot, tile>(NT, KW)
+                         : nstage >= 4 ? ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 4, turbo4_body, rot, tile>(NT, KW)
+                                       : ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 2, turbo4_body, rot, tile>(NT, KW);
         if (blocks == 0) {
             nstage = 0;
         }
@@ -1038,26 +1351,354 @@ static void ggml_cuda_fattn_sj_kvarn_stream_select(ggml_backend_cuda_context & c
         static int stages[GGML_CUDA_MAX_DEVICES][9] = {};
         int & cached = stages[id][NT];
         if (cached == 0) {
-            const int blocks2 = ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 2, turbo4_body, rot>(NT, KW);
-            const int blocks4 = ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 4, turbo4_body, rot>(NT, KW);
-            const int blocks6 = ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 6, turbo4_body, rot>(NT, KW);
+            const int blocks2 = ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 2, turbo4_body, rot, tile>(NT, KW);
+            const int blocks4 = ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 4, turbo4_body, rot, tile>(NT, KW);
+            const int blocks6 = ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 6, turbo4_body, rot, tile>(NT, KW);
             GGML_ASSERT(std::max(blocks2, std::max(blocks4, blocks6)) > 0);
             // Preserve resident warps first, then allow more strips in flight.
             cached = blocks6 >= blocks4 && blocks6 >= blocks2 ? 6 : blocks4 >= blocks2 ? 4 : 2;
         }
         nstage = cached;
     }
+    return nstage >= 6 ? 6 : nstage >= 4 ? 4 : 2;
+}
+
+template <int max_warps, bool turbo4_body = false, bool rot = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
+static void ggml_cuda_fattn_sj_kvarn_stream_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, int nstage, const int parallel_blocks) {
+    nstage = ggml_cuda_fattn_sj_kvarn_stream_nstage<max_warps, turbo4_body, rot, tile>(NT, KW, nstage);
     if (nstage >= 6) {
-        ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch<max_warps, 6, turbo4_body, rot>(ctx, dst, NT, KW, parallel_blocks);
+        ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch<max_warps, 6, turbo4_body, rot, tile>(ctx, dst, NT, KW, parallel_blocks);
     } else if (nstage >= 4) {
-        ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch<max_warps, 4, turbo4_body, rot>(ctx, dst, NT, KW, parallel_blocks);
+        ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch<max_warps, 4, turbo4_body, rot, tile>(ctx, dst, NT, KW, parallel_blocks);
     } else {
-        ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch<max_warps, 2, turbo4_body, rot>(ctx, dst, NT, KW, parallel_blocks);
+        ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch<max_warps, 2, turbo4_body, rot, tile>(ctx, dst, NT, KW, parallel_blocks);
+    }
+}
+
+// [#195] The KV split count launch_fattn derives for a kernel with max_blocks_per_sm resident blocks (its non-stream-k
+// branch: ntiles_x = 1 and one GQA tile per KV head at n_q <= 8, GQA <= 8). The compact Q5/G6 launch passes the value of
+// the five-warp kernel so both walk the same KV ranges and combine the same parts.
+static int ggml_cuda_fattn_sj_kvarn_stream_parallel_blocks(const ggml_tensor * dst, const int max_blocks_per_sm) {
+    const int nsm        = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int n_kv       = ggml_get_op_params_i32(dst, 6);
+    const int ntiles_KV  = (n_kv + fattn_sj_kvarn_stream::UNIT - 1) / fattn_sj_kvarn_stream::UNIT;
+    const int ntiles_dst = (int) (dst->src[1]->ne[2] * dst->src[0]->ne[3]);
+    int parallel_blocks = std::min(max_blocks_per_sm, ntiles_KV);
+    const int blocks_per_wave = nsm * max_blocks_per_sm;
+    int nwaves_best = 0;
+    int efficiency_percent_best = 0;
+    for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        const int nblocks_total = ntiles_dst * parallel_blocks_test;
+        const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+        const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+        if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+            break;
+        }
+        if (efficiency_percent > efficiency_percent_best) {
+            nwaves_best = nwaves;
+            efficiency_percent_best = efficiency_percent;
+            parallel_blocks = parallel_blocks_test;
+        }
+    }
+    return parallel_blocks;
+}
+
+// [#195] GGML_SJKVARN_DIRECT_Q5G6: unset = 1 (default on, Jake 2026-11-14); 0 = off (kill switch); 1 = compact Q5/G6 tile
+// on the five-query path with the five-warp kernel's KV split (bit-identical output); 2 = compact tile with its own
+// occupancy split (diagnostic, not bit-identical). Unset with GGML_CUDA_SJ_FILL=1 = off (mode 1 is not bit-identical there).
+// The refusal warnings below are printed only when the variable is set explicitly; the default stays quiet.
+// Covered: the 4/4 stream decode path at width 5 and GQA 6 (scalar and turbo4 bodies, plain and fused rotation). Every
+// other cache type or shape runs its usual kernel; the refusals are logged once (fattn.cu logs the non-stream routes).
+static int ggml_cuda_fattn_sj_kvarn_q5g6_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_SJKVARN_DIRECT_Q5G6");
+        if (e == nullptr) {
+            const char * fill = getenv("GGML_CUDA_SJ_FILL");
+            return fill != nullptr && strcmp(fill, "1") == 0 ? 0 : 1;
+        }
+        char * end = nullptr;
+        const long m = strtol(e, &end, 10);
+        if (*e == '\0' || *end != '\0' || (m != 0 && m != 1 && m != 2)) {
+            GGML_LOG_WARN("ggml_cuda_fattn_sj_kvarn_q5g6_mode: GGML_SJKVARN_DIRECT_Q5G6=\"%s\" is not 0, 1 or 2: compact Q5/G6 tile OFF\n", e);
+            return 0;
+        }
+        // GGML_CUDA_SJ_FILL=1 changes the five-warp KV split inside launch_fattn; mode 1 copies only the default split
+        const char * fill = getenv("GGML_CUDA_SJ_FILL");
+        if (m == 1 && fill != nullptr && strcmp(fill, "1") == 0) {
+            GGML_LOG_WARN("ggml_cuda_fattn_sj_kvarn_q5g6_mode: GGML_SJKVARN_DIRECT_Q5G6=1 is not bit-identical under GGML_CUDA_SJ_FILL=1: compact Q5/G6 tile OFF\n");
+            return 0;
+        }
+        return (int) m;
+    }();
+    return mode;
+}
+
+// true when GGML_SJKVARN_DIRECT_Q5G6 is set explicitly to a non-zero value (refusal warnings are for that case only)
+static bool ggml_cuda_fattn_sj_kvarn_q5g6_explicit() {
+    static const bool v = [] { const char * e = getenv("GGML_SJKVARN_DIRECT_Q5G6"); return e != nullptr && *e != '\0' && strcmp(e, "0") != 0; }();
+    return v;
+}
+
+// one warning per process when the switch is set but a width-5 node takes a route without the compact tile (shared by
+// the shape reasons); a caller may pass its own flag so its reason is logged even after another one (LSA refusal)
+static void ggml_cuda_fattn_sj_kvarn_q5g6_off(const char * why, std::atomic_flag * own = nullptr) {
+    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+    if (ggml_cuda_fattn_sj_kvarn_q5g6_explicit() && ggml_cuda_fattn_sj_kvarn_q5g6_mode() != 0 && !(own ? own : &warned)->test_and_set()) {
+        GGML_LOG_WARN("ggml_cuda_fattn_sj_kvarn_q5g6: GGML_SJKVARN_DIRECT_Q5G6 is set but a width-5 node runs %s: compact Q5/G6 tile OFF for it "
+                      "(first such node; later ones are not logged)\n", why);
+    }
+}
+
+// mode for this node: 0 (with one warning per process) when the shape is not the covered width-5 / GQA-6 one
+static int ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(const ggml_tensor * dst) {
+    const int mode = ggml_cuda_fattn_sj_kvarn_q5g6_mode();
+    if (mode == 0) {
+        return 0;
+    }
+    // per-head masks (mask ne[2] > 1) are not mapped per column by the compact tile
+    if (dst->src[3] != nullptr && dst->src[3]->ne[2] > 1) {
+        ggml_cuda_fattn_sj_kvarn_q5g6_off("with a per-head mask");
+        return 0;
+    }
+    // LSA live-record walk (GGML_SJKVARN_TILE_SKIP / LIVE_RECORDS / LIVE_STRIPS, block list, resident strips): only the
+    // rows tile has the LSA build, and the compact launcher would ignore the record list
+    if (ggml_cuda_fattn_sj_live_records != nullptr) {
+        static std::atomic_flag warned_lsa = ATOMIC_FLAG_INIT;
+        ggml_cuda_fattn_sj_kvarn_q5g6_off("with the LSA live-record walk", &warned_lsa);
+        return 0;
+    }
+    const int64_t gqa = dst->src[0]->ne[2] / dst->src[1]->ne[2];
+    if (dst->src[0]->ne[2] != 6*dst->src[1]->ne[2]) {
+        static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (ggml_cuda_fattn_sj_kvarn_q5g6_explicit() && !warned.test_and_set()) {
+            GGML_LOG_WARN("%s: GGML_SJKVARN_DIRECT_Q5G6=%d covers GQA 6 only, this model has GQA %" PRId64 ": compact Q5/G6 tile OFF\n",
+                "ggml_cuda_fattn_sj_kvarn_q5g6_mode_for", mode, gqa);
+        }
+        return 0;
+    }
+    return mode;
+}
+
+// [KVROWS] GGML_SJKVARN_COMPACT_ALL / GGML_SJKVARN_COMPACT_OCC: the compact tile at widths 4 and 6 (mode 1) or 4, 6, 7, 8
+// (mode 2); width 5 stays on GGML_SJKVARN_DIRECT_Q5G6. COMPACT_ALL: unset = mode 1 (default on since the KVROWS QC); 1 (on/true/yes) = mode 1, the rows kernel's
+// KV split (bit-identical output); 0 (off/false/no) = off, the kill switch for both modes. COMPACT_OCC=1 (on/true/yes) =
+// mode 2, the compact instance's own occupancy split (more KV splits, combine order differs: NMSE class like
+// GGML_SJKVARN_NT6_OCC); it needs no COMPACT_ALL, but COMPACT_ALL=0 still turns it off. Mode 1 with GGML_CUDA_SJ_FILL=1 = off.
+static int ggml_cuda_fattn_sj_kvarn_env_bool(const char * name) { // -1 unset, 0 / 1, or 0 with a warning when unparsable
+    const char * e = getenv(name);
+    if (e == nullptr || *e == '\0') {
+        return -1;
+    }
+    std::string w(e);
+    for (char & c : w) {
+        c = (char) tolower((unsigned char) c);
+    }
+    if (w == "0" || w == "off" || w == "false" || w == "no") {
+        return 0;
+    }
+    if (w == "1" || w == "on" || w == "true" || w == "yes") {
+        return 1;
+    }
+    GGML_LOG_WARN("%s: %s=\"%s\" is not 0/1/on/off/true/false/yes/no: read as 0\n", __func__, name, e);
+    return 0;
+}
+
+static constexpr int GGML_SJKVARN_COMPACT_ALL_DEFAULT = 1;  // KVROWS QC 2026-11-15: lossless (bit-identical), 1u paired +0.20%, 4u +1.36%
+
+static int ggml_cuda_fattn_sj_kvarn_compact_mode() {
+    static const int mode = [] {
+        const int all = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT_ALL");
+        const int occ = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT_OCC");
+        if (all == 0) {
+            return 0;
+        }
+        if (occ == 1) {
+            return 2;
+        }
+        if ((all == 1 || GGML_SJKVARN_COMPACT_ALL_DEFAULT) && !(getenv("GGML_CUDA_SJ_FILL") && strcmp(getenv("GGML_CUDA_SJ_FILL"), "1") == 0)) {
+            return 1;
+        }
+        if (all == 1) {
+            GGML_LOG_WARN("ggml_cuda_fattn_sj_kvarn_compact_mode: GGML_SJKVARN_COMPACT_ALL=1 is not bit-identical under GGML_CUDA_SJ_FILL=1: compact tile OFF\n");
+        }
+        return 0;
+    }();
+    return mode;
+}
+
+// mode for a width-4/6/7/8 node: 0 when the shape is not covered (one warning per process when a switch is set)
+static int ggml_cuda_fattn_sj_kvarn_compact_mode_for(const ggml_tensor * dst, const bool kw8) {
+    const int mode = ggml_cuda_fattn_sj_kvarn_compact_mode();
+    if (mode == 0) {
+        return 0;
+    }
+    const char * why = nullptr;
+    if (dst->src[3] != nullptr && dst->src[3]->ne[2] > 1) {
+        why = "a per-head mask";
+    } else if (ggml_cuda_fattn_sj_live_records != nullptr) {
+        why = "the LSA live-record walk";
+    } else if (dst->src[0]->ne[2] != 6*dst->src[1]->ne[2]) {
+        why = "GQA other than 6";
+    } else if (kw8 && mode == 1) {
+        why = "GGML_SJKVARN_DIRECT_KW8 (width 4 runs 2 KV splits per block)";
+    }
+    if (why != nullptr) {
+        static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+        const bool set = getenv("GGML_SJKVARN_COMPACT_ALL") != nullptr || getenv("GGML_SJKVARN_COMPACT_OCC") != nullptr;
+        if (set && !warned.test_and_set()) {
+            GGML_LOG_WARN("ggml_cuda_fattn_sj_kvarn_compact: a width-%d node runs with %s: compact tile OFF for it (first such node)\n",
+                (int) dst->src[0]->ne[1], why);
+        }
+        return 0;
+    }
+    return mode;
+}
+
+// occupancy (CTAs/SM) of the rows launch this node would take (max_warps ref_mw, NT rows, KW 1, its ring depth)
+template <int ref_mw, bool turbo4_body, bool rot>
+static int ggml_cuda_fattn_sj_kvarn_stream_ref_blocks(const ggml_tensor * dst, const int nstage_env) {
+    const int NT = (int) dst->src[0]->ne[1];
+    const int nst = ggml_cuda_fattn_sj_kvarn_stream_nstage<ref_mw, turbo4_body, rot>(NT, 1, nstage_env);
+    const fattn_kernel_t k = nst >= 6 ? ggml_cuda_fattn_sj_kvarn_stream_kernel<ref_mw, 6, turbo4_body, rot>()
+                           : nst >= 4 ? ggml_cuda_fattn_sj_kvarn_stream_kernel<ref_mw, 4, turbo4_body, rot>()
+                                      : ggml_cuda_fattn_sj_kvarn_stream_kernel<ref_mw, 2, turbo4_body, rot>();
+    int blocks = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k, WARP_SIZE*NT, ggml_cuda_fattn_sj_kvarn_stream_shared(NT, 1, nst, turbo4_body)));
+    GGML_ASSERT(blocks > 0);
+    return blocks;
+}
+
+// compact launch for widths 4..8 at GQA 6. ref_mw: the max_warps of the rows launch it replaces (4 at width 4, 5 at
+// width 5, 6 or 8 at width 6 by GGML_SJKVARN_NT6_OCC, 8 at widths 7 and 8). mode 1 copies that launch's KV split, mode 2
+// lets launch_fattn size it from the compact instance's occupancy.
+template <bool turbo4_body, bool rot>
+static void ggml_cuda_fattn_sj_kvarn_stream_compact(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int nstage_env, const int mode, const int ref_mw) {
+    const int n_q = (int) dst->src[0]->ne[1];
+    GGML_ASSERT(n_q >= 4 && n_q <= 8 && dst->src[0]->ne[2] == 6*dst->src[1]->ne[2]); // 6*n_q pairs in ceil(6*n_q/8) warps
+    const int W = (6*n_q + 7)/8;
+    int parallel_blocks = 0; // mode 2: launch_fattn's own choice for the compact kernel
+    if (mode == 1) {
+        // the rows launch's occupancy (with the ring depth it would pick) fed to launch_fattn's split rule; the compact
+        // launch then picks its own ring depth, which does not change the arithmetic
+        const int blocks = ref_mw == 4 ? ggml_cuda_fattn_sj_kvarn_stream_ref_blocks<4, turbo4_body, rot>(dst, nstage_env)
+                         : ref_mw == 5 ? ggml_cuda_fattn_sj_kvarn_stream_ref_blocks<5, turbo4_body, rot>(dst, nstage_env)
+                         : ref_mw == 6 ? ggml_cuda_fattn_sj_kvarn_stream_ref_blocks<6, turbo4_body, rot>(dst, nstage_env)
+                                       : ggml_cuda_fattn_sj_kvarn_stream_ref_blocks<8, turbo4_body, rot>(dst, nstage_env);
+        parallel_blocks = ggml_cuda_fattn_sj_kvarn_stream_parallel_blocks(dst, blocks);
+    }
+    if (n_q == 5) {
+        static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+        if (!logged.test_and_set()) {
+            GGML_LOG_INFO("%s: SJ-KVaRN compact Q5/G6 decode tile on (mode %d, parallel_blocks %d on the first node)\n", "ggml_cuda_fattn_sj_kvarn_stream_q5g6", mode, parallel_blocks);
+        }
+    } else {
+        static std::atomic<uint32_t> logged{0};
+        const uint32_t bit = 1u << n_q;
+        if (!(logged.fetch_or(bit) & bit)) {
+            GGML_LOG_INFO("%s: SJ-KVaRN compact decode tile on at width %d (%d warps, mode %d, ref max_warps %d, parallel_blocks %d on the first node)\n",
+                __func__, n_q, W, mode, ref_mw, parallel_blocks);
+        }
+    }
+    switch (W) {
+        case 3:  ggml_cuda_fattn_sj_kvarn_stream_select<3, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 3, 1, nstage_env, parallel_blocks); break;
+        case 4:  ggml_cuda_fattn_sj_kvarn_stream_select<4, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 4, 1, nstage_env, parallel_blocks); break;
+        case 5:  ggml_cuda_fattn_sj_kvarn_stream_select<5, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 5, 1, nstage_env, parallel_blocks); break;
+        default: ggml_cuda_fattn_sj_kvarn_stream_select<6, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 6, 1, nstage_env, parallel_blocks); break;
     }
 }
 
 template <bool turbo4_body = false, bool rot = false>
 inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // opt-in record skip (LSA on SJ-KVaRN sets it): build the live-record list from the mask, then walk only those
+    // GGML_SJKVARN_TILE_SKIP=1 (the low-bit tile kernel's skip of fully masked body tiles, the switch LSA uses on 3/2t
+    // and 3/3t) takes the same exact skip here: the live-strip walk (dead records and dead 16-cell strips not read)
+    static const bool tile_skip_env = getenv("GGML_SJKVARN_TILE_SKIP") != nullptr && atoi(getenv("GGML_SJKVARN_TILE_SKIP")) != 0;
+    static const bool strip_env = tile_skip_env ||
+        (getenv("GGML_SJKVARN_LIVE_STRIPS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_STRIPS")) != 0);
+    static const bool live_env  = strip_env ||
+        (getenv("GGML_SJKVARN_LIVE_RECORDS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_RECORDS")) != 0);
+    // LSA block list (ggml_flash_attn_ext_set_lsa_blocks): the mask's GGML_LSA_MASK_SEL entries resolve through the
+    // selection bits, so the node always takes the live-record walk (dead records skipped, mapped mask everywhere)
+    const int32_t lsa_blk = ggml_flash_attn_ext_get_lsa_block(dst);
+    GGML_ASSERT(lsa_blk == 0 || !turbo4_body);
+    // LLAMA_LSA_RESIDENT body (16-cell strip slots): take the live-strip walk, so the strips about to be read are known
+    // and resolved into slots before the kernel (a strip without a slot reads the pinned master)
+    const bool strip_res = !turbo4_body && ggml_cuda_qsa_strip_body(dst->src[5]);
+    if (strip_res) {
+        ggml_cuda_qsa_strip_join(ctx, dst->src[5]); // LLAMA_LSA_J3_LEAD: before any read of the slot table (no-op otherwise)
+    }
+    if (!turbo4_body && (live_env || lsa_blk > 0 || strip_res) && ggml_cuda_fattn_sj_live_records == nullptr) {
+        const ggml_tensor * mask = dst->src[3];
+        const int64_t positions = ggml_get_op_params_i32(dst, 6);
+        const bool head_mask = mask && mask->ne[2] > 1;
+        if (mask && mask->type == GGML_TYPE_F16 && (!head_mask || mask->ne[2] == dst->src[0]->ne[2]) && mask->ne[3] == 1 &&
+                dst->src[0]->ne[3] == 1 && (lsa_blk == 0 || !head_mask) &&
+                positions > 0 && mask->ne[0] >= positions && mask->ne[1] >= dst->src[0]->ne[1] && dst->src[6] != nullptr) {
+            using namespace fattn_sj_kvarn_stream;
+            const int nrec_max = int(positions/16) + 1;
+            const int n_lists  = head_mask ? int(dst->src[1]->ne[2]) : 1;            // one per KV head
+            const int gqa      = int(dst->src[0]->ne[2]/dst->src[1]->ne[2]);
+            const int32_t * desc = (const int32_t *) dst->src[6]->data;
+            // set_lsa_vk_units: the unit pick sits after the n_vk mean-block counts in row 0 of src[8]
+            const int sel_off  = lsa_blk > 0 ? int(ggml_flash_attn_ext_get_lsa_sel_off(dst)) : 0;
+            const int sel_nbs  = lsa_blk > 0 ? int(dst->src[8]->ne[0]) - sel_off : 0;
+            int sel_sh = 0;
+            for (int32_t b = lsa_blk; b > 1; b >>= 1) {
+                ++sel_sh;
+            }
+            const int sel_w    = (sel_nbs + 31)/32;
+            const int hdr      = SJ_LIST_HDR;
+            const bool vk      = ggml_flash_attn_ext_get_lsa_vk(dst);
+            sj_lsa_vk vka = {};
+            if (vk) {
+                const ggml_tensor * km = dst->src[7];
+                const ggml_tensor * vm = ggml_flash_attn_ext_get_lsa_vk_vm(dst);
+                const ggml_tensor * nd = dst->src[8];
+                // rows readable past the view: the mean caches are views of a larger [d, n_blk] tensor
+                auto rows = [](const ggml_tensor * t) -> int64_t {
+                    const ggml_tensor * b = t->view_src;
+                    return b && b->nb[1] == t->nb[1] && b->ne[0] == t->ne[0] ? (int64_t) (ggml_nbytes(b) - t->view_offs)/t->nb[1] : t->ne[1];
+                };
+                vka.k        = (const half *) km->data;
+                vka.v        = (const half *) vm->data;
+                vka.nd       = (const float *) nd->data;
+                vka.k_pitch  = int(km->nb[1]/sizeof(half));
+                vka.v_pitch  = int(vm->nb[1]/sizeof(half));
+                vka.nd_pitch = int(nd->nb[1]/sizeof(float));
+                vka.n        = int(ggml_flash_attn_ext_get_lsa_vk_n(dst));
+                vka.alloc    = int(std::min(rows(km), rows(vm)));
+                vka.bias     = ggml_get_op_params_f32(dst, 11);
+                GGML_ASSERT(vka.alloc >= 16 && vka.alloc >= vka.n && "LSA virtual keys need >= 16 readable mean rows");
+                GGML_ASSERT(km->nb[1] % 16 == 0 && vm->nb[1] % 16 == 0 && ((uintptr_t) km->data % 16) == 0 &&
+                            ((uintptr_t) vm->data % 16) == 0);
+            }
+            const size_t lists = (size_t) (nrec_max + 1)*n_lists;
+            ggml_cuda_pool_alloc<int32_t> flags(ctx.pool(), (size_t) nrec_max*n_lists);
+            ggml_cuda_pool_alloc<int32_t> list(ctx.pool(), hdr + lists + sel_w); // header, lists, selection bits
+            const uint32_t * selb = nullptr;
+            if (lsa_blk > 0) {
+                selb = (const uint32_t *) (list.ptr + hdr + lists);
+                sj_lsa_sel_bits<<<(sel_w + 127)/128, 128, 0, ctx.stream()>>>((const float *) dst->src[8]->data + sel_off,
+                    sel_nbs, (uint32_t *) selb, vk && sel_off == 0 ? 1 : 0);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            sj_live_record_flags<<<dim3((nrec_max + 7)/8, n_lists), 8*WARP_SIZE, 0, ctx.stream()>>>((const half *) mask->data,
+                int(mask->nb[1]/sizeof(half)), int(dst->src[0]->ne[1]), desc, flags.ptr, nrec_max,
+                head_mask ? int64_t(gqa)*int64_t(mask->nb[2]/sizeof(half)) : 0, strip_env || strip_res ? 1 : 0, selb, sel_sh, sel_nbs);
+            CUDA_CHECK(cudaGetLastError());
+            sj_live_record_list<<<n_lists, 1024, 0, ctx.stream()>>>(desc, flags.ptr, list.ptr + hdr, nrec_max,
+                head_mask ? nrec_max + 1 : 0, lsa_blk > 0 ? int(lists) : 0, sel_sh, sel_nbs, vka);
+            CUDA_CHECK(cudaGetLastError());
+            if (strip_res && n_lists == 1) {
+                ggml_cuda_qsa_strip_prepare(ctx, dst->src[5], desc, list.ptr + hdr);
+            }
+            ggml_cuda_fattn_sj_live_records = list.ptr + hdr;
+            ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl<turbo4_body, rot>(ctx, dst);
+            ggml_cuda_fattn_sj_live_records = nullptr;
+            return;
+        }
+        GGML_ASSERT(lsa_blk == 0 && "LSA block list needs a plain F16 [n_kv, n_q] mask on the SJ-KVaRN stream kernel");
+    }
     if constexpr (!turbo4_body && !rot) {
         if (ggml_cuda_fattn_sj_kvarn_rot(dst)) { // [#139] fused rotation: Q pre-pass here, output rotation in the kernel
             ggml_cuda_pool_alloc<float> q_rot(ctx.pool(), ggml_nelements(dst->src[0]));
@@ -1078,6 +1719,9 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     const int NT = dst->src[0]->ne[1];
     GGML_ASSERT(NT >= 1 && NT <= 8);
     if (stable) {
+        if (NT == 5) {
+            ggml_cuda_fattn_sj_kvarn_q5g6_off("the GGML_SJKVARN_DIRECT_STABLE launch");
+        }
         // Fix both KV ranges and reduction order across query widths; useful for verification checks.
         const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
         const int blocks = ggml_cuda_fattn_sj_kvarn_stream_occupancy<8, 6, turbo4_body, rot>(4, 1);
@@ -1091,8 +1735,49 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     const bool short_nt5 = !turbo4_body && ggml_cuda_info().devices[ctx.device].cc == 860 &&
         dst->src[0]->ne[2] == 24 && dst->src[1]->ne[2] == 4 && ggml_get_op_params_i32(dst, 6) <= 5376;
     const bool nt5_generic = nt5_mode < 0 ? short_nt5 : nt5_mode != 0;
+    if (NT == 5 && nt5_generic) {
+        ggml_cuda_fattn_sj_kvarn_q5g6_off(nt5_mode < 0 ? "the generic half (<= 5,376 positions on SM86, by design)"
+                                                       : "the generic half (GGML_SJKVARN_DIRECT_NT5_GENERIC=1)");
+    }
+    // GGML_SJKVARN_NT6_OCC, default on (Jake 2026-11-14): 6 rows on the max_warps 6 instance (2 CTAs/SM) instead of
+    // max_warps 8 (1 CTA/SM). Same math per element; launch_fattn sizes parallel_blocks from the instance's occupancy, so
+    // the combine order differs. GGML_SJKVARN_NT6_OCC=0 (or off/false/no) turns it off.
+    static const bool nt6_occ = [] {
+        const char * e = getenv("GGML_SJKVARN_NT6_OCC");
+        if (e == nullptr || *e == 0) {
+            return true;
+        }
+        std::string w(e);
+        for (char & c : w) {
+            c = (char) tolower((unsigned char) c);
+        }
+        return !(w == "0" || w == "off" || w == "false" || w == "no");
+    }();
+    // [KVROWS] widths 4, 6, 7, 8: the compact tile (GGML_SJKVARN_COMPACT_ALL / _OCC); widths 1-3 already fill ceil(6*n_q/8)
+    // == n_q warps, width 5 is the Q5/G6 case below
+    if (NT == 4 || NT >= 6) {
+        int cmode = ggml_cuda_fattn_sj_kvarn_compact_mode_for(dst, NT == 4 && kw8);
+        if (cmode == 1 && NT >= 7) {
+            // KVROWS step b (fakeep99, 3090 Ti): mode 1 at widths 7/8 is 12-14% slower than the rows kernel (the copied
+            // 8-warp split gives the 6-warp compact grid half the blocks it can hold), so mode 1 stays on rows there.
+            // Mode 2 (own split) is 20% faster at 7/8 and keeps them.
+            cmode = 0;
+        }
+        if (cmode != 0) {
+            ggml_cuda_fattn_sj_kvarn_stream_compact<turbo4_body, rot>(ctx, dst, nstage_env, cmode, NT == 4 ? 4 : NT == 6 && nt6_occ ? 6 : 8);
+            return;
+        }
+    }
     if (NT == 5 && !nt5_generic) {
+        // [#195] the compact tile replaces the five-warp specialization only (GQA 6: 30 pairs in 4 x 8 columns)
+        const int q5g6_mode = ggml_cuda_fattn_sj_kvarn_q5g6_mode_for(dst);
+        if (q5g6_mode != 0) {
+            ggml_cuda_fattn_sj_kvarn_stream_compact<turbo4_body, rot>(ctx, dst, nstage_env, q5g6_mode, 5);
+            return;
+        }
         ggml_cuda_fattn_sj_kvarn_stream_select<5, turbo4_body, rot>(ctx, dst, NT, KW, nstage_env, 0);
+    } else if (NT == 6 && nt6_occ) {
+        ggml_cuda_fattn_sj_kvarn_stream_select<6, turbo4_body, rot>(ctx, dst, NT, KW, nstage_env, 0);
     } else if (NT*KW <= 4) {
         ggml_cuda_fattn_sj_kvarn_stream_select<4, turbo4_body, rot>(ctx, dst, NT, KW, nstage_env, 0);
     } else {

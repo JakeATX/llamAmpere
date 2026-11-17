@@ -5,6 +5,10 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // [HCPC] out != nullptr: the result goes to out (same shape, f32), dst is not written (GGML_CUDA_HC_POST_CPY)
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * out = nullptr);
+// upstream: gate_scale_in/gate_scale_out: the SCALE nodes of a fused SCALE -> SIGMOID -> SCALE chain feeding src[2].
+// Separate overload (4+ args) so the 3-arg [HCPC] call and the 4-arg gated call cannot bind to the wrong parameter.
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out, ggml_tensor * out = nullptr);
 
 // [HCPN] GGML_CUDA_HC_POST_NORM / GGML_CUDA_HC_PRE_XN (opt-in, matched in ggml-cuda.cu).
 // One pass over each row of the next hyper-connection norm: post (nullable) is an identity-comb DSV4_HC_POST whose

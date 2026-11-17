@@ -16,8 +16,14 @@ extern "C" {
 
     // Decodes slab g (rows 16g .. 16g + 15) of the AI+ tensor `data` (row length K) into y[r*K + k] as f32 in the
     // ORIGINAL basis (the offline rotation undone), the weights the CUDA reference path and the CPU backend multiply.
+    // Type126 row blocks with either zero scale decode to canonical positive zeros.
     // Returns false (y untouched) for a non-AI+ type or a K the type's layout does not allow.
     GGML_API bool ggml_ai4_dequantize_slab(enum ggml_type type, const void * data, int64_t K, int64_t g, float * y);
+
+    // Encode 16 original-basis F32 rows as versioned type126, K a positive multiple of 512.
+    // nbytes must equal ggml_ai4_slab_nbytes(GGML_TYPE_AIF175_U2, K).
+    // Returns false without changing data on invalid input or allocation/search failure.
+    GGML_API bool ggml_aif175_quantize_slab(const float * x, int64_t K, void * data, size_t nbytes);
 
 #ifdef __cplusplus
 }

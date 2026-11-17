@@ -42,6 +42,11 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+// GGML_CUDA_VRAM_CAP_MIB test switch (ggml-cuda.cu): memory readers that make decisions use these so a capped run
+// sees an N MiB card (total = N, free less the slack above the ceiling). No-op when the switch is off.
+void        ggml_cuda_vram_cap_adjust(int physical_device, size_t * free, size_t * total);
+cudaError_t ggml_cuda_mem_get_info_capped(size_t * free, size_t * total);
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -54,6 +59,7 @@
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
+#define GGML_CUDA_CC_AMPERE_GA10X    860
 #define GGML_CUDA_CC_ORIN            870
 #define GGML_CUDA_CC_ADA_LOVELACE    890
 #define GGML_CUDA_CC_HOPPER          900
@@ -83,6 +89,7 @@
 #define GGML_CUDA_CC_RDNA2      (GGML_CUDA_CC_OFFSET_AMD + 0x1030) // RX 6000, minimum for dp4a
 #define GGML_CUDA_CC_RDNA3      (GGML_CUDA_CC_OFFSET_AMD + 0x1100) // RX 7000, minimum for WMMA
 #define GGML_CUDA_CC_RDNA3_5    (GGML_CUDA_CC_OFFSET_AMD + 0x1150) // AI 370, AI Max 395 laptops.
+#define GGML_CUDA_CC_RDNA4_M    (GGML_CUDA_CC_OFFSET_AMD + 0x1170) // gfx117X
 #define GGML_CUDA_CC_RDNA4      (GGML_CUDA_CC_OFFSET_AMD + 0x1200) // RX 9000
 
 #define GGML_CUDA_CC_IS_AMD(cc)     (cc >= GGML_CUDA_CC_OFFSET_AMD)
@@ -90,8 +97,9 @@
 #define GGML_CUDA_CC_IS_RDNA1(cc)   (cc >= GGML_CUDA_CC_RDNA1 && cc < GGML_CUDA_CC_RDNA2)
 #define GGML_CUDA_CC_IS_RDNA2(cc)   (cc >= GGML_CUDA_CC_RDNA2 && cc < GGML_CUDA_CC_RDNA3)
 #define GGML_CUDA_CC_IS_RDNA3_0(cc) (cc >= GGML_CUDA_CC_RDNA3 && cc < GGML_CUDA_CC_RDNA3_5)
-#define GGML_CUDA_CC_IS_RDNA3_5(cc) (cc >= GGML_CUDA_CC_RDNA3_5 && cc < GGML_CUDA_CC_RDNA4)
+#define GGML_CUDA_CC_IS_RDNA3_5(cc) (cc >= GGML_CUDA_CC_RDNA3_5 && cc < GGML_CUDA_CC_RDNA4_M)
 #define GGML_CUDA_CC_IS_RDNA3(cc)   (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc))
+#define GGML_CUDA_CC_IS_RDNA4_M(cc) (cc >= GGML_CUDA_CC_RDNA4_M && cc < GGML_CUDA_CC_RDNA4)
 #define GGML_CUDA_CC_IS_RDNA4(cc)   (cc >= GGML_CUDA_CC_RDNA4)
 #define GGML_CUDA_CC_IS_GCN_APU(cc) ((cc) == GGML_CUDA_CC_GFX909 || (cc) == GGML_CUDA_CC_GFX90C)
 #define GGML_CUDA_CC_IS_GCN(cc)     ((cc > GGML_CUDA_CC_OFFSET_AMD && cc < GGML_CUDA_CC_CDNA1) || GGML_CUDA_CC_IS_GCN_APU(cc))
@@ -130,6 +138,14 @@ static __device__ __forceinline__ void ggml_cuda_syncwarp() {
 #ifndef GGML_USE_HIP
     __syncwarp();
 #endif // GGML_USE_HIP
+}
+
+static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const void * p) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+#else
+    GGML_UNUSED(p);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
@@ -278,9 +294,17 @@ static const char * cu_get_error_str(CUresult err) {
 #define AMD_MFMA_AVAILABLE
 #endif // defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA)
 
-#if defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3))
+#if defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA4_M))
+#define AMD_WMMA_128B_AVAILABLE
+#endif // defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA4_M))
+
+#if defined(GGML_USE_HIP) && defined(RDNA3)
+#define AMD_WMMA_256B_AVAILABLE
+#endif // defined(GGML_USE_HIP) && defined(RDNA3)
+
+#if defined(AMD_WMMA_128B_AVAILABLE) || defined(AMD_WMMA_256B_AVAILABLE)
 #define AMD_WMMA_AVAILABLE
-#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+#endif // defined(AMD_WMMA_128B_AVAILABLE) || defined(AMD_WMMA_256B_AVAILABLE)
 
 // The Volta instructions are in principle available on Turing or newer but they are effectively unusable:
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
@@ -327,7 +351,7 @@ static bool fast_fp16_hardware_available(const int cc) {
 // To be used for feature selection of external libraries, e.g. cuBLAS.
 static bool fp16_mma_hardware_available(const int cc) {
     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+        GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 }
 
@@ -356,7 +380,7 @@ static bool amd_mfma_available(const int cc) {
 }
 
 static bool amd_wmma_available(const int cc) {
-    return (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc));
+    return GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
 }
 
 static bool volta_mma_available(const int cc) {
@@ -378,6 +402,10 @@ static bool cp_async_available(const int cc) {
 static bool blackwell_mma_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
+}
+
+static bool fp8_mma_hardware_available(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_RUBIN;
 }
 
 // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
@@ -714,7 +742,7 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #if defined(GGML_USE_HIP)
 #if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
     c = __builtin_amdgcn_sdot4(a, b, c, false);
-#elif defined(RDNA3) || defined(RDNA4)
+#elif defined(RDNA3) || defined(RDNA4_M) || defined(RDNA4)
     c = __builtin_amdgcn_sudot4( true, a, true, b, c, false);
 #elif defined(RDNA1) || defined(__gfx900__)
     int tmp1;
@@ -759,9 +787,9 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float2 v
     acc += v.y*u.y;
 }
 
-#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4) || defined(__gfx906__) || defined(CDNA))
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4_M) || defined(RDNA4) || defined(__gfx906__) || defined(CDNA))
 #define V_DOT2_F32_F16_AVAILABLE
-#endif // defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4) || defined(__gfx906__) || defined(CDNA))
+#endif // defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4_M) || defined(RDNA4) || defined(__gfx906__) || defined(CDNA))
 
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v, const half2 u) {
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -875,6 +903,67 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+static __host__ __device__ __forceinline__ float ggml_cuda_f8_e4m3_to_fp32(uint8_t x) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    __nv_fp8_e4m3 xf;
+    xf.__x = x;
+    return static_cast<float>(xf);
+#else
+    const uint8_t magnitude = x & 0x7F;
+    if (magnitude == 0x7F) {
+        return NAN;
+    }
+
+    const int exp = (magnitude >> 3) & 0x0F;
+    const int man = magnitude & 0x07;
+    float value;
+    if (exp == 0) {
+        value = ldexpf((float) man, -9);
+    } else {
+        value = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return x & 0x80 ? -value : value;
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+static __host__ __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_f8_e4m3(float x) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+#elif !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__MUSA_ARCH__)
+    // ggml_cuda_cast also runs on the host, where __float2int_rn is not available.
+    return ggml_fp32_to_f8_e4m3(x);
+#else
+    const uint8_t sign = signbit(x) ? 0x80 : 0;
+    x = fabsf(x);
+
+    if (isnan(x)) {
+        return sign | 0x7F;
+    }
+    if (x == 0.0f) {
+        return sign;
+    }
+    if (isinf(x) || x >= 448.0f) {
+        return sign | 0x7E;
+    }
+    if (x < 0.015625f) {
+        return sign | (uint8_t) __float2int_rn(x * 512.0f);
+    }
+
+    int exp;
+    const float mantissa = frexpf(x, &exp) * 2.0f;
+    int encoded_exp = exp + 6;
+    int encoded_man = __float2int_rn((mantissa - 1.0f) * 8.0f);
+    if (encoded_man == 8) {
+        encoded_man = 0;
+        encoded_exp++;
+    }
+    if (encoded_exp > 15 || (encoded_exp == 15 && encoded_man > 6)) {
+        return sign | 0x7E;
+    }
+    return sign | (uint8_t) (encoded_exp << 3) | (uint8_t) encoded_man;
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
     if (!(x > 0.0f)) {
@@ -883,6 +972,7 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
     const __nv_fp8_e4m3 xf(x);
     return xf.__x;
 #else
+     GGML_UNUSED(x);
      NO_DEVICE_CODE; // Used only for NVFP4 Scales for Activations, only for Blackwell
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
@@ -1258,6 +1348,8 @@ void ggml_cuda_host_unregister(void * ptr);
 // raw device allocation, honors GGML_CUDA_ENABLE_UNIFIED_MEMORY. free with cudaFree
 cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
 
+bool ggml_cuda_pool_debug_enabled();
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -1322,6 +1414,15 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+// GGML_CUDA_GRAPH_LOG=1 (opt-in): one INFO line per CUDA graph capture and per LRU graph eviction (cap GGML_CUDA_GRAPH_MAX)
+static inline bool ggml_cuda_graph_log_on() {
+    static const bool on = [] {
+        const char * s = getenv("GGML_CUDA_GRAPH_LOG");
+        return s != nullptr && atoi(s) > 0;
+    }();
+    return on;
+}
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1340,7 +1441,9 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     uint64_t moe_cache_generation = 0;
+    uint64_t lsa_j3_generation = 0; // GGML_CUDA_LSA_J3_GRAPHS: see ggml_cuda_lsa_j3_generation
     int64_t last_used_time = 0;
+    int stable_calls = 0; // warmup: calls in a row with no property change (GGML_CUDA_GRAPH_WARMUP)
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1542,6 +1645,9 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
+    cublasLtHandle_t cublaslt_handles[GGML_CUDA_MAX_DEVICES] = {};
+#endif
     bool scratch_borrowed = false;
     void * borrowed_blas_workspace = nullptr;
 
@@ -1744,9 +1850,18 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    static const size_t max_cuda_graphs = 64;
+    // GGML_CUDA_GRAPH_MAX=N (default 64): most graphs kept; the least recently used is evicted (and logged) past it
+    static size_t max_cuda_graphs() {
+        static const size_t v = [] {
+            const char * s = getenv("GGML_CUDA_GRAPH_MAX");
+            const int n = s ? atoi(s) : 64;
+            return (size_t) (n > 0 ? n : 64);
+        }();
+        return v;
+    }
 
     int64_t last_graph_eviction_sweep = 0;
+    uint64_t n_lru_evictions = 0;
 
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
         const int64_t time_now = ggml_time_us();
@@ -1772,12 +1887,20 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            while (cuda_graphs.size() >= max_cuda_graphs) {
+            while (cuda_graphs.size() >= max_cuda_graphs()) {
                 auto lru = cuda_graphs.begin();
                 for (auto c = cuda_graphs.begin(); c != cuda_graphs.end(); ++c) {
                     if (c->second->last_used_time < lru->second->last_used_time) {
                         lru = c;
                     }
+                }
+                // the cap must be >= the graphs one token uses on this device (splits x compute/optimize), else every
+                // eval misses and no graph is ever used; the count in the log line (GGML_CUDA_GRAPH_LOG=1) shows that thrash
+                ++n_lru_evictions;
+                if (ggml_cuda_graph_log_on() && (n_lru_evictions <= 256 || n_lru_evictions % 1024 == 0)) {
+                    GGML_LOG_INFO("cuda_graph: evict lru key %016llx (cap %zu, eviction %llu), unused %lld ms, instance %d\n",
+                        (unsigned long long) lru->first, max_cuda_graphs(), (unsigned long long) n_lru_evictions,
+                        (long long) ((time_now - lru->second->last_used_time) / 1000), (int) (lru->second->instance != nullptr));
                 }
                 cuda_graphs.erase(lru);
             }
@@ -1839,10 +1962,14 @@ struct ggml_backend_cuda_context {
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+#if (defined(GGML_USE_HIP) && HIP_VERSION >= 70000000) || (!defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2)))
             if (cublas_workspace_sizes[device] == 0) {
+#if defined(GGML_USE_HIP)
+                cublas_workspace_sizes[device] = 32 * 1024 * 1024;
+#else
                 const int cc = ggml_cuda_info().devices[device].cc;
                 cublas_workspace_sizes[device] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
+#endif
             }
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
@@ -1850,6 +1977,16 @@ struct ggml_backend_cuda_context {
         }
         return cublas_handles[device][curr_stream_no];
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
+    cublasLtHandle_t cublaslt_handle() {
+        if (cublaslt_handles[device] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUBLAS_CHECK(cublasLtCreate(&cublaslt_handles[device]));
+        }
+        return cublaslt_handles[device];
+    }
+#endif
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
@@ -1879,6 +2016,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    ggml_prec prec_src1 = GGML_PREC_UNDEFINED; // src1 precision requested by the fused MUL_MATs (MMQ)
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;

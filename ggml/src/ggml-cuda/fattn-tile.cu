@@ -2,6 +2,9 @@
 #include "fattn-tile.cuh"
 
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
+        GGML_ABORT("flash_attn_ext: the tile kernel does not read kv_rows (src[9]); only the MMA f16 kernel supports it");
+    }
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     switch (K->ne[0]) {
@@ -61,8 +64,7 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             ggml_cuda_flash_attn_ext_tile_case<640, 512>(ctx, dst);
         } break;
 #endif
-        default: {
+        default:
             GGML_ABORT("Unsupported head size");
-        } break;
     }
 }

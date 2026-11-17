@@ -8,7 +8,6 @@ llm_build_mamba_base::llm_build_mamba_base(const llm_graph_params & params) : ll
 
 ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
                                                          ggml_tensor *        cur,
-                                                         const llama_model &  model,
                                                          const llama_ubatch & ubatch,
                                                          int                  il) {
     const auto * mctx_cur = inp->mctx;
@@ -152,7 +151,6 @@ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
 
 ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
                                                           ggml_tensor *        cur,
-                                                          const llama_model &  model,
                                                           const llama_ubatch & ubatch,
                                                           int                  il) const {
     const auto * mctx_cur = inp->mctx;
@@ -306,7 +304,11 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         // grouped RMS norm
         if (model.layers[il].ssm_norm) {
             y = ggml_reshape_4d(ctx0, y, d_inner / n_group, n_group, n_seq_tokens, n_seqs);
-            y = build_norm(y, model.layers[il].ssm_norm, NULL, LLM_NORM_RMS, il);
+            if (hparams.ssm_norm_eps > 0.0f) {
+                y = ggml_mul(ctx0, ggml_rms_norm(ctx0, y, hparams.ssm_norm_eps), model.layers[il].ssm_norm);
+            } else {
+                y = build_norm(y, model.layers[il].ssm_norm, NULL, LLM_NORM_RMS, il);
+            }
         }
 
         y = ggml_reshape_2d(ctx0, y, d_inner, n_seq_tokens * n_seqs);

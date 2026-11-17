@@ -296,6 +296,18 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
         const char * value = getenv("GGML_SJKVARN_COMPACT");
         return !value || !*value ? 1 : strcmp(value, "1") == 0 ? 1 : strcmp(value, "2") == 0 ? 2 : 0;
     }();
+    // GGML_SJKVARN_COMPACT_MAX_BOUND: largest per-row n_kv_max bound taken (default 4096; the opt-in LSA probe on
+    // SJ-KVaRN sets it, its kept set is ~10-20K cells); larger bounds keep the dense SJ-KVaRN kernels
+    static const int64_t max_bound = [] {
+        const char * value = getenv("GGML_SJKVARN_COMPACT_MAX_BOUND");
+        return value && *value ? std::min<int64_t>(std::max<int64_t>(atoll(value), 1), 1 << 18) : 4096;
+    }();
+    // GGML_SJKVARN_COMPACT_HEADS4=1: also take 4 KV heads (Swift / Qwen3.8-27B). Set only by the opt-in LSA probe
+    // (LLAMA_LSA_SJ_COMPACT=1); unset = the shipped 2-KV-head behaviour, so default runs never compact a 4-head cache
+    static const bool heads4 = [] {
+        const char * value = getenv("GGML_SJKVARN_COMPACT_HEADS4");
+        return value && strcmp(value, "1") == 0;
+    }();
     if (mode == 0) {
         return false;
     }
@@ -312,12 +324,12 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
             ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4) || ggml_get_op_params_i32(dst, 7) != GGML_TYPE_F32 ||
             ggml_cuda_fattn_sj_kvarn_rot(dst) || Q->type != GGML_TYPE_F32 || Q->ne[0] != 256 || Q->nb[0] != sizeof(float) ||
             Q->ne[1] < 1 || Q->ne[1] > 5 || Q->ne[2] != 24 || Q->ne[3] != 1 ||
-            K->ne[0] != 256 || V->ne[0] != 256 || K->ne[2] != 2 || V->ne[2] != 2 || K->ne[3] != 1 || V->ne[3] != 1 ||
+            K->ne[0] != 256 || V->ne[0] != 256 || (K->ne[2] != 2 && !(heads4 && K->ne[2] == 4)) || V->ne[2] != K->ne[2] || K->ne[3] != 1 || V->ne[3] != 1 ||
             (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_TQ6_0) || V->type != K->type ||
             dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || mask == nullptr || mask->type != GGML_TYPE_F16 ||
             mask->nb[0] != sizeof(half) || mask->ne[0] < positions || mask->ne[1] < Q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1 ||
             Q->nb[1]%16 != 0 || mask->nb[1]%16 != 0 || mask->nb[1]/sizeof(half) > INT32_MAX ||
-            bound <= 0 || bound > 4096 || positions <= 0 || positions > (1 << 20) || positions%256 != 0) {
+            bound <= 0 || bound > max_bound || positions <= 0 || positions > (1 << 20) || positions%256 != 0) {
         return false;
     }
     const int capacity = int(GGML_PAD(std::min(positions, bound*Q->ne[1]), 256));
@@ -325,7 +337,8 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
         return false;
     }
     const int queries = int(Q->ne[1]);
-    const size_t elements = size_t(capacity)*256*2;
+    const int hkv = int(K->ne[2]); // 2 (main model of the QSA lane) or 4 (Swift / Qwen3.8-27B)
+    const size_t elements = size_t(capacity)*256*hkv;
     ggml_cuda_pool_alloc<int32_t> indices(ctx.pool(), capacity);
     ggml_cuda_pool_alloc<half> compact_mask(ctx.pool(), size_t(capacity)*queries);
     ggml_cuda_pool_alloc<half> kv(ctx.pool(), 2*elements);
@@ -348,12 +361,12 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     fattn_sj_compact_mask<<<(capacity*queries + 255)/256, 256, 0, ctx.stream()>>>(
         (const half *) mask->data, int(mask->nb[1]/sizeof(half)), indices.ptr, compact_mask.ptr, capacity, queries);
     CUDA_CHECK(cudaGetLastError());
-    fattn_sj_compact_gather<<<dim3((capacity + 3)/4, 2), dim3(32, 4), 0, ctx.stream()>>>(
+    fattn_sj_compact_gather<<<dim3((capacity + 3)/4, hkv), dim3(32, 4), 0, ctx.stream()>>>(
         (const char *) K->data, (const char *) V->data, ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
         K->nb[1], K->nb[2], V->nb[1], V->nb[2], indices.ptr, (half2 *) kv.ptr, (half2 *) (kv.ptr + elements), capacity);
     CUDA_CHECK(cudaGetLastError());
     if (mode == 2) {
-        fattn_sj_compact_gather_check<<<dim3(capacity, 2), dim3(32, 4), 16*128*sizeof(half2), ctx.stream()>>>(
+        fattn_sj_compact_gather_check<<<dim3(capacity, hkv), dim3(32, 4), 16*128*sizeof(half2), ctx.stream()>>>(
             ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data, K->nb[2], V->nb[2],
             indices.ptr, (const half2 *) kv.ptr, (const half2 *) (kv.ptr + elements), capacity);
         CUDA_CHECK(cudaGetLastError());
@@ -390,6 +403,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_compact(ggml_backend_cuda_context & ctx, 
     for (int i : {4, 5, 6, 7}) {
         ggml_set_op_params_i32(&out, i, 0);
     }
+    GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr && "SJ-KVaRN compact gather writes no LSE output");
     // one query tile and one sequence: the kernel stops at live_count[1] instead of walking the whole capacity
     ggml_cuda_fattn_kv_max_override = live_count.ptr + 1;
     if (queries == 1) {

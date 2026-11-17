@@ -18,6 +18,7 @@ class llama_memory_recurrent : public llama_memory_i {
 public:
     llama_memory_recurrent(
             const llama_model & model,
+                         bool   no_alloc,
                     ggml_type   type_r,
                     ggml_type   type_s,
                          bool   offload,
@@ -27,7 +28,7 @@ public:
                          bool   gdn_replay_req,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent();
 
     //
     // llama_memory_i
@@ -88,6 +89,17 @@ public:
     // invalidates the snapshots: clear(), rm_all, and state_read.
     std::vector<uint32_t> rs_valid;
 
+    // [TAG_RECURRENT_KEEP_BASE] LLAMA_RS_KEEP_BASE=1 (ring layout only; the server sets it for copy mode): a ubatch
+    // of K < n <= 2K tokens per seq writes its newest K - 1 groups only, so the plane that held the state BEFORE the
+    // ubatch survives as group K - 1. A rollback of 1..K-2 tokens works as usual, and a rollback of exactly n tokens
+    // (the whole ubatch) selects that plane: no state copy, no extra memory. rs_keep_n[seq] = n of such a ubatch
+    // while that plane is still the pre-ubatch state (rs_valid == K - 2 and no pending rollback), else stale.
+    bool rs_keep_base = false;
+    std::vector<uint32_t> rs_keep_n;
+    bool keep_base_width(uint32_t n) const {
+        return rs_keep_base && n > n_rs_seq + 1 && n <= 2 * (n_rs_seq + 1);
+    }
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // [TAG_RECURRENT_ROLLBACK_RING] ring-indexed snapshot groups. When true, rollback group g of
@@ -117,6 +129,25 @@ public:
     // `replay_len[seq]` (steps to replay from the ingredient ring) rather than calling
     // set_rs_idx. Only meaningful for GDN/KDA-style recurrent layers.
     bool gdn_replay = false;
+
+    // [TAG_GDN_REPLAY_LANES] LLAMA_GDN_REPLAY_LANES (default on, =0/off/false/no off): seqs with different pending
+    // replays may share a ubatch of n >= n_rs_seq tokens per seq (the static verify graph). replay_w is then
+    // [n_rs_seq, n_seqs] and s_copy_pair / s_copy_conv / the shift planes are set per lane (lane_seq), so 4 users
+    // verify in one pass instead of one pass each. Only for archs whose replay goes through llm_build_delta_net_base
+    // (qwen35, qwen35moe, qwen3next); others ignore the env and keep the strict rule.
+    bool gdn_replay_lanes = false;
+
+    // [TAG_GDN_REPLAY_LANES] counters for the log: ubatches, joint passes (lanes that differ in one ubatch) and why
+    // seqs were left out of a ubatch (llama_batch_allocr::SPLIT_CUT_*)
+    struct lanes_stats {
+        uint64_t n_ubatch  = 0;
+        uint64_t n_joint   = 0;
+        uint64_t n_strict  = 0;
+        uint64_t n_width   = 0;
+        uint64_t n_tail    = 0;
+        uint64_t n_bystand = 0;
+    };
+    mutable lanes_stats lstats;
 
     // per-seq pending replay length (0 = no replay pending); parallel to rs_idx, cleared on
     // full seq_rm/clear so a released slot can't leave a dangling replay for its next occupant.
@@ -154,6 +185,13 @@ public:
     // stopped early. Graph and bookkeeping must agree, so both ask here.
     static bool replay_static_width(uint32_t n_seq_tokens, uint32_t n_rs_seq);
 
+    // [TAG_GDN_REPLAY_LANES] whether lanes with different pending replays may share a ubatch of n_seq_tokens per seq:
+    // a static width of n >= n_rs_seq, or, with replay_short_join(), any short static width too.
+    // replay_short_join(): LLAMA_GDN_REPLAY_SHORT=1 and LLAMA_GDN_REPLAY_SHORT_JOIN not 0 (default on with SHORT).
+    // With SHORT off (or JOIN=0) replay_join_width(n) is exactly the old n >= n_rs_seq && replay_static_width(n).
+    static bool replay_short_join();
+    static bool replay_join_width(uint32_t n_seq_tokens, uint32_t n_rs_seq);
+
     // [TAG_GDN_REPLAY_SPLIT] the replay subtree of a ubatch is built from one (replay_len,
     // ckpt_span, s_stale) -- see llama_memory_recurrent_context::get_replay_len() -- so seqs that
     // disagree on any of the three must not share a ubatch (a server with several slots
@@ -161,19 +199,45 @@ public:
     // fn() to split_equal and calls advance() on every ubatch it keeps, which applies to a copy
     // what consume_replay() will do to the real values when that ubatch's graph runs, so later
     // ubatches of the same batch are grouped by the values they will actually see.
+    // [TAG_GDN_REPLAY_LANES] with lanes on, compat also admits two seqs that both have >= n_rs_seq tokens in the
+    // batch (relaxed), and split_equal's strict guard (strict_fn, n_mixed_min) keeps the real ubatch at that width.
+    // Short static rounds (LLAMA_GDN_REPLAY_SHORT, n < n_rs_seq) join too with replay_short_join() (n_mixed_min 2;
+    // set_input_shift moves K - max(n, r_s) conv groups per lane); with LLAMA_GDN_REPLAY_SHORT_JOIN=0 they stay strict.
+    // A mixed ubatch also must not span the cell of a seq outside it that has a pending replay (set_fn): find_slot
+    // can move that cell, and only its plane-0 conv row moves with it (stale conv planes for its replay).
     struct replay_split {
         bool     active   = false;
+        bool     lanes    = false;
         uint32_t n_rs_seq = 0;
 
         std::vector<uint32_t> replay_len;
         std::vector<uint32_t> ckpt_span;
         std::vector<uint8_t>  s_stale;
+        std::vector<uint32_t> n_tokens; // per seq, tokens in the batch (lanes only)
 
+        // (lanes only) per seq: its cell as find_slot will see it, -1 = none or shared (cell unknown).
+        // advance() applies the find_slot gather to it.
+        std::vector<int32_t> tail;
+        // (lanes only) per cell: the seq that owns it, -1 = empty, -2 = shared
+        std::vector<int32_t> owner;
+
+        lanes_stats * stats = nullptr;
+
+        void count_tokens(const llama_batch & batch);
+
+        bool strict(llama_seq_id a, llama_seq_id b) const;
         bool compat(llama_seq_id a, llama_seq_id b) const;
-        void advance(const llama_ubatch & ubatch);
+        bool pending(llama_seq_id s) const;
+        bool set_ok(const std::vector<llama_seq_id> & seqs) const;
+        void advance(const llama_ubatch & ubatch, uint32_t split_cut = 0);
 
         // the split_equal filter, or nullptr when the constraint does not apply
         llama_batch_allocr::seq_compat_fn fn() const;
+        // the split_equal width guard (strict, n_mixed_min), or nullptr / 0 without lanes
+        llama_batch_allocr::seq_compat_fn strict_fn() const;
+        uint32_t n_mixed_min() const { return !lanes ? 0 : replay_short_join() && n_rs_seq > 2 ? 2u : n_rs_seq; }
+        // the split_equal bystander guard, or nullptr without lanes
+        llama_batch_allocr::seq_set_fn set_fn() const;
     };
 
     // logs once when the batch's seqs disagree
@@ -191,6 +255,10 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // largest rollback whose snapshot the last ubatch guarantees: a ubatch of n <= n_rs_seq + 1 tokens
+        // writes snapshots 0..n-1, a longer one only guarantees the final state (ggml_gated_delta_net)
+        uint32_t rs_max = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -238,8 +306,8 @@ private:
 
     const uint32_t n_seq_max = 1;
 
-    // ggml contexts for the KV cache along with the allocated backend buffers:
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    // ggml contexts for the RS cache along with the allocated backend buffers:
+    llama_memory_bufs ctxs_bufs;
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
@@ -329,6 +397,15 @@ public:
     uint32_t get_ckpt_span() const;
     bool     get_s_stale()   const;
     uint32_t get_n_rs_seq()  const;
+
+    // [TAG_GDN_REPLAY_LANES] mem->gdn_replay_lanes and not a full-state context
+    bool get_replay_lanes() const;
+    // seq of s_copy row i (the cell head + i, as s_copy() reads it), -1 for an empty cell
+    llama_seq_id lane_seq(int i) const;
+    // per-seq pending replay; seq < 0 gives 0 / 0 / false (all-zero w, state row)
+    uint32_t replay_len_seq(llama_seq_id seq) const;
+    uint32_t ckpt_span_seq(llama_seq_id seq)  const;
+    bool     s_stale_seq(llama_seq_id seq)    const;
 
     // [TAG_RECURRENT_ROLLBACK_SHIFT] number of older snapshot groups (conv in both modes, the
     // recurrent state in the non-replay mode) the builder must move back by n_seq_tokens for the

@@ -1,11 +1,14 @@
 #include "models.h"
 #include "llama-impl.h"
+#include "llama-lsa.h"
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 #include "llama-mtp-chain-sample.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <vector>
 
 // Output-row gather indices, or nullptr when every row is an output (decode, speculative verify,
 // MTP drafts): the gather would then be an identity copy. The graph topology still depends only on
@@ -36,6 +39,79 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
+        }
+    }
+
+    // Mixed-shape pruned model (ngprune): per-layer GDN value heads, sublayer kinds, rank/span widths. All seven keys are
+    // present together; a plain Qwen3.5 file has none of them and takes none of the paths gated on hparams.mix_enabled.
+    {
+        const uint32_t nl = hparams.n_layer();
+        std::array<uint32_t, LLAMA_MAX_LAYERS> v_heads{}, mixer_kind{}, mlp_kind{}, mixer_width{}, mlp_width{}, mixer_span{}, mlp_span{};
+        if (ml.get_key_or_arr(LLM_KV_MIX_MIXER_KIND, mixer_kind, nl, false)) {
+            if (hparams.ssm_dt_rank == 0 || hparams.ssm_d_inner % hparams.ssm_dt_rank != 0) {
+                throw std::runtime_error("invalid mixed-shape GDN head count");
+            }
+            ml.get_key_or_arr(LLM_KV_MIX_SSM_V_HEADS,  v_heads,     nl, true);
+            ml.get_key_or_arr(LLM_KV_MIX_MLP_KIND,     mlp_kind,    nl, true);
+            ml.get_key_or_arr(LLM_KV_MIX_MIXER_WIDTH,  mixer_width, nl, true);
+            ml.get_key_or_arr(LLM_KV_MIX_MLP_WIDTH,    mlp_width,   nl, true);
+            ml.get_key_or_arr(LLM_KV_MIX_MIXER_SPAN,   mixer_span,  nl, true); // span id + 1, 0 = none
+            ml.get_key_or_arr(LLM_KV_MIX_MLP_SPAN,     mlp_span,    nl, true);
+
+            hparams.mix_ssm_k_heads.fill(hparams.ssm_n_group);
+            hparams.mix_ssm_k_dim.fill(hparams.ssm_d_state);
+            hparams.mix_ssm_v_dim.fill(hparams.ssm_d_inner / hparams.ssm_dt_rank);
+            hparams.mix_attn_k_dim.fill(hparams.n_embd_head_k_full);
+            hparams.mix_attn_v_dim.fill(hparams.n_embd_head_v_full);
+            ml.get_key_or_arr(LLM_KV_MIX_SSM_K_HEADS, hparams.mix_ssm_k_heads, nl, false);
+            ml.get_key_or_arr(LLM_KV_MIX_SSM_K_DIM, hparams.mix_ssm_k_dim, nl, false);
+            ml.get_key_or_arr(LLM_KV_MIX_SSM_V_DIM, hparams.mix_ssm_v_dim, nl, false);
+            ml.get_key_or_arr(LLM_KV_MIX_ATTN_K_DIM, hparams.mix_attn_k_dim, nl, false);
+            ml.get_key_or_arr(LLM_KV_MIX_ATTN_V_DIM, hparams.mix_attn_v_dim, nl, false);
+
+            hparams.mix_enabled = true;
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                const bool trunk = il < nl;
+                hparams.mix_ssm_v_heads[il] = trunk ? v_heads[il] : hparams.ssm_dt_rank;
+                hparams.mix_mixer_kind [il] = trunk ? mixer_kind [il] : (uint32_t) llama_hparams::MIX_FULL;
+                hparams.mix_mlp_kind   [il] = trunk ? mlp_kind   [il] : (uint32_t) llama_hparams::MIX_FULL;
+                hparams.mix_mixer_width[il] = trunk ? mixer_width[il] : hparams.n_embd;
+                hparams.mix_mlp_width  [il] = trunk ? mlp_width  [il] : hparams.n_embd;
+                hparams.mix_mixer_span [il] = trunk ? (int32_t) mixer_span[il] - 1 : -1;
+                hparams.mix_mlp_span   [il] = trunk ? (int32_t) mlp_span  [il] - 1 : -1;
+
+                if (hparams.mix_mixer_kind[il] != llama_hparams::MIX_REMOVED && (hparams.mix_ssm_k_heads[il] == 0 || hparams.mix_ssm_k_heads[il] > hparams.ssm_n_group ||
+                    hparams.mix_ssm_k_dim[il] == 0 || hparams.mix_ssm_k_dim[il] > hparams.ssm_d_state ||
+                    hparams.mix_ssm_v_dim[il] == 0 || hparams.mix_ssm_v_dim[il] > hparams.ssm_d_inner / hparams.ssm_dt_rank ||
+                    hparams.mix_attn_k_dim[il] < hparams.n_rot_full || hparams.mix_attn_k_dim[il] > hparams.n_embd_head_k_full ||
+                    hparams.mix_attn_v_dim[il] == 0 || hparams.mix_attn_v_dim[il] > hparams.n_embd_head_v_full ||
+                    hparams.mix_ssm_v_heads[il] > hparams.ssm_dt_rank)) {
+                    throw std::runtime_error(format("invalid mixed-shape head dimensions in layer %u", il));
+                }
+                if (hparams.mix_mixer_kind[il] > llama_hparams::MIX_SPAN || hparams.mix_mlp_kind[il] > llama_hparams::MIX_SPAN) {
+                    throw std::runtime_error(format("invalid mixed-shape sublayer kind in layer %u", il));
+                }
+                if (trunk) {
+                    for (bool mixer : {true, false}) {
+                        const uint32_t kind = mixer ? mixer_kind[il] : mlp_kind[il];
+                        const uint32_t width = mixer ? mixer_width[il] : mlp_width[il];
+                        const uint32_t span = mixer ? mixer_span[il] : mlp_span[il];
+                        if ((kind != llama_hparams::MIX_REMOVED && (width == 0 || width > hparams.n_embd)) ||
+                            (kind == llama_hparams::MIX_FULL && width != hparams.n_embd) || span > LLAMA_MAX_LAYERS) {
+                            throw std::runtime_error(format("invalid mixed-shape width or span in layer %u", il));
+                        }
+                    }
+                }
+                if (trunk && hparams.is_recr(il) && hparams.mix_mixer_kind[il] != llama_hparams::MIX_REMOVED && hparams.mix_ssm_v_heads[il] == 0) {
+                    throw std::runtime_error(format("mixed-shape layer %u has a GDN mixer with no value heads", il));
+                }
+                if (trunk && (hparams.mix_mixer_kind[il] == llama_hparams::MIX_SPAN) != (hparams.mix_mixer_span[il] >= 0)) {
+                    throw std::runtime_error(format("mixed-shape layer %u: mixer span id does not match its kind", il));
+                }
+                if (trunk && (hparams.mix_mlp_kind[il] == llama_hparams::MIX_SPAN) != (hparams.mix_mlp_span[il] >= 0)) {
+                    throw std::runtime_error(format("mixed-shape layer %u: mlp span id does not match its kind", il));
+                }
+            }
         }
     }
 
@@ -97,18 +173,25 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
-            // EXL3 fused layout: attn_qkv = [in_proj_qkv | in_proj_z] (ne1 = conv_dim + value_dim) and attn_gate absent;
-            // the graph splits the fused output with views (build_qkvz).
-            const ggml_tensor * qkv_meta = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_QKV, "weight", il).str().c_str());
-            const bool fused_qkvz = qkv_meta != nullptr && qkv_meta->ne[1] == conv_dim + value_dim;
-            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, fused_qkvz ? conv_dim + value_dim : conv_dim }, TENSOR_NOT_REQUIRED);
-            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
-            GGML_ASSERT(!fused_qkvz || layer.wqkv_gate == nullptr);
+            // three layouts: upstream merged attn_qkv_gate (wqkv_z), our EXL3 fused attn_qkv = [in_proj_qkv | in_proj_z]
+            // (ne1 = conv_dim + value_dim, attn_gate absent; the graph splits it with views in build_qkvz), or separate
+            const int separate_flags = flags & TENSOR_SKIP ? flags | TENSOR_NOT_REQUIRED : flags;
+            layer.wqkv_z = create_tensor(tn(LLM_TENSOR_ATTN_QKV_GATE, "weight", il), { n_embd, key_dim * 2 + value_dim * 2 }, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+            if (!layer.wqkv_z) {
+                const ggml_tensor * qkv_meta = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_QKV, "weight", il).str().c_str());
+                const bool fused_qkvz = qkv_meta != nullptr && qkv_meta->ne[1] == conv_dim + value_dim;
+                layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, fused_qkvz ? conv_dim + value_dim : conv_dim }, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+                GGML_ASSERT(!fused_qkvz || layer.wqkv_gate == nullptr);
+            }
             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
             layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
-            layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
-            layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
+            layer.ssm_beta_alpha_cat = create_tensor(tn(LLM_TENSOR_SSM_BETA_ALPHA_CAT, "weight", il), { n_embd, n_v_heads * 2 }, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+            if (!layer.ssm_beta_alpha_cat) {
+                layer.ssm_beta  = create_tensor(tn(LLM_TENSOR_SSM_BETA,  "weight", il), { n_embd, n_v_heads }, separate_flags);
+                layer.ssm_alpha = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "weight", il), { n_embd, n_v_heads }, separate_flags);
+            }
             layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", il), { head_v_dim }, flags);
             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
         }
@@ -130,8 +213,136 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         }
     };
 
+    // Mixed-shape pruned layer (ngprune, hparams.mix_enabled): per-layer head / neuron counts, absent sublayers, rank and
+    // span read/write ramps. A full sublayer of this path has the same tensors as load_block_trunk() creates.
+    mix_span_read.clear();
+    mix_span_write.clear();
+
+    auto load_block_trunk_mix = [&](int il, int flags) {
+        auto & layer = layers[il];
+
+        const uint32_t mixer_kind = hparams.mixer_kind(il);
+        const uint32_t mlp_kind   = hparams.mlp_kind(il);
+
+        // the read/write ramps of a sublayer: a rank sublayer owns them, a span sublayer shares them with the layers of its
+        // span (created once, at the first layer that uses the span, so they sit on that layer's device)
+        auto load_ramps = [&](uint32_t kind, int32_t span, int64_t width, bool is_mixer) {
+            if (kind == llama_hparams::MIX_RANK) {
+                ggml_tensor * rd = create_tensor(tn(is_mixer ? LLM_TENSOR_MIX_MIXER_READ  : LLM_TENSOR_MIX_MLP_READ,  "weight", il), { n_embd, width }, flags);
+                ggml_tensor * wr = create_tensor(tn(is_mixer ? LLM_TENSOR_MIX_MIXER_WRITE : LLM_TENSOR_MIX_MLP_WRITE, "weight", il), { width, n_embd }, flags);
+                (is_mixer ? layer.mixer_read  : layer.mlp_read)  = rd;
+                (is_mixer ? layer.mixer_write : layer.mlp_write) = wr;
+            } else if (kind == llama_hparams::MIX_SPAN) {
+                GGML_ASSERT(span >= 0);
+                if ((size_t) span >= mix_span_read.size()) {
+                    mix_span_read .resize(span + 1, nullptr);
+                    mix_span_write.resize(span + 1, nullptr);
+                }
+                if (mix_span_read[span] == nullptr) {
+                    mix_span_read [span] = create_tensor(tn(LLM_TENSOR_MIX_SPAN_READ,  "weight", il, span), { n_embd, width }, flags);
+                    mix_span_write[span] = create_tensor(tn(LLM_TENSOR_MIX_SPAN_WRITE, "weight", il, span), { width, n_embd }, flags);
+                }
+                if (mix_span_read[span] != nullptr && mix_span_read[span]->ne[1] != width) {
+                    throw std::runtime_error(format("mixed-shape span %d has mismatched widths", span));
+                }
+            }
+        };
+
+        // ---- mixer (GDN or attention)
+        if (mixer_kind != llama_hparams::MIX_REMOVED) {
+            const int64_t mw = hparams.mix_mixer_width[il]; // width the sublayer weights read and write
+            GGML_ASSERT(mixer_kind != llama_hparams::MIX_FULL || mw == n_embd);
+
+            // a span sublayer has no norm: its weight is folded into the input projections
+            if (mixer_kind != llama_hparams::MIX_SPAN) {
+                layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", il), { n_embd }, flags);
+            }
+            load_ramps(mixer_kind, hparams.mix_mixer_span[il], mw, true);
+
+            if (!hparams.is_recr(il)) {
+                const int64_t n_q  = hparams.n_head(il);
+                const int64_t n_kv = hparams.n_head_kv(il);
+                const int64_t dk = hparams.mix_attn_k_dim[il];
+                const int64_t dv = hparams.mix_attn_v_dim[il];
+                create_tensor_qkv(layer, il, mw, (dk + dv) * n_q, dk * n_kv, dv * n_kv, flags);
+                layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { dv * n_q, mw }, flags);
+
+                layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { dk }, flags);
+                layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { dk }, flags);
+
+                // uneven GQA groups: the converter pads every KV group to the largest group (see build_layer_attn)
+                const ggml_tensor * pad_meta = ml.get_tensor_meta(tn(LLM_TENSOR_MIX_ATTN_Q_PAD_IDX, "weight", il).str().c_str());
+                const ggml_tensor * inv_meta = ml.get_tensor_meta(tn(LLM_TENSOR_MIX_ATTN_Q_INV_IDX, "weight", il).str().c_str());
+                if (pad_meta != nullptr && inv_meta != nullptr) {
+                    if (pad_meta->type != GGML_TYPE_I32 || inv_meta->type != GGML_TYPE_I32 ||
+                        n_kv == 0 || pad_meta->ne[0] <= 0 || pad_meta->ne[0] % n_kv != 0 || pad_meta->ne[0] > n_q * n_kv) {
+                        throw std::runtime_error(format("invalid mixed-shape attention head map in layer %d", il));
+                    }
+                    layer.attn_q_pad_idx = create_tensor(tn(LLM_TENSOR_MIX_ATTN_Q_PAD_IDX, "weight", il), { pad_meta->ne[0] }, flags);
+                    layer.attn_q_inv_idx = create_tensor(tn(LLM_TENSOR_MIX_ATTN_Q_INV_IDX, "weight", il), { n_q }, flags);
+                } else {
+                    if (pad_meta != nullptr || inv_meta != nullptr || n_kv == 0 || n_q == 0 || n_q % n_kv != 0) {
+                        throw std::runtime_error(format("missing mixed-shape attention head map in layer %d", il));
+                    }
+                }
+            } else {
+                const int64_t head_k_dim = hparams.ssm_k_dim_l(il);
+                const int64_t head_v_dim = hparams.ssm_v_dim_l(il);
+                const int64_t n_k_heads  = hparams.ssm_k_heads_l(il);
+                const int64_t n_v_heads  = hparams.mix_ssm_v_heads[il];
+                const int64_t key_dim    = head_k_dim * n_k_heads;
+                const int64_t value_dim  = head_v_dim * n_v_heads;
+                const int64_t conv_dim   = key_dim * 2 + value_dim;
+
+                layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { mw, conv_dim }, flags);
+                layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { mw, value_dim }, flags);
+                layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
+                layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { n_v_heads }, flags);
+                layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { n_v_heads }, flags);
+                layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { mw, n_v_heads }, flags);
+                layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { mw, n_v_heads }, flags);
+                layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, flags);
+                layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, mw }, flags);
+
+                // value head -> key head map; absent when the layer keeps every value head (the usual tiled mapping applies)
+                const ggml_tensor * kidx_meta = ml.get_tensor_meta(tn(LLM_TENSOR_MIX_SSM_KEY_IDX, "weight", il).str().c_str());
+                if (kidx_meta != nullptr) {
+                    if (kidx_meta->type != GGML_TYPE_I32) {
+                        throw std::runtime_error(format("invalid mixed-shape GDN head map type in layer %d", il));
+                    }
+                    layer.ssm_key_idx = create_tensor(tn(LLM_TENSOR_MIX_SSM_KEY_IDX, "weight", il), { n_v_heads }, flags);
+                }
+            }
+        }
+
+        // ---- MLP
+        if (mlp_kind != llama_hparams::MIX_REMOVED) {
+            const int64_t fw   = hparams.mix_mlp_width[il];
+            const int64_t n_ff_l = hparams.n_ff(il);
+            GGML_ASSERT(n_ff_l > 0);
+            GGML_ASSERT(mlp_kind != llama_hparams::MIX_FULL || fw == n_embd);
+
+            if (mlp_kind != llama_hparams::MIX_SPAN) {
+                layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
+            }
+            load_ramps(mlp_kind, hparams.mix_mlp_span[il], fw, false);
+
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), { fw, n_ff_l }, flags);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), { n_ff_l, fw }, flags);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), { fw, n_ff_l }, flags);
+        } else {
+            GGML_ASSERT(hparams.n_ff(il) == 0);
+        }
+    };
+
     auto load_block_mtp = [&](int il) {
         auto & layer = layers[il];
+        const int64_t n_head = hparams.n_head(il);
+        const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+        const int64_t n_embd_head_v = hparams.n_embd_head_v(il);
+        const int64_t n_embd_k_gqa = n_embd_head_k * hparams.n_head_kv(il);
+        const int64_t n_embd_v_gqa = n_embd_head_v * hparams.n_head_kv(il);
+        const int64_t n_ff = hparams.n_ff(il);
 
         // MTP block looks like a full-attention Qwen3.5 decoder block.
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
@@ -160,7 +371,11 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     };
 
     for (int i = 0; i < n_layer; ++i) {
-        load_block_trunk(i, trunk_flags);
+        if (hparams.mix_enabled) {
+            load_block_trunk_mix(i, trunk_flags);
+        } else {
+            load_block_trunk(i, trunk_flags);
+        }
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
         load_block_mtp(i);
@@ -169,19 +384,16 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        return std::make_unique<graph_mtp>(*this, params);
+        return std::make_unique<graph_mtp>(params);
     }
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), model(model) {
+llama_model_qwen35::graph::graph(const llm_graph_params & params) :
+    llm_build_delta_net_base(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-
-    int sections[4];
-    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -195,16 +407,146 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = qwen35_build_inp_out_ids(*this);
 
+    // Target layer -> predictions captured one to three attention layers earlier (graph-local only).
+    const auto & lsa = llama_lsa_cfg();
+    // Mixed-shape files (hparams.mix_enabled) take the recall probe and J3 only when every attention layer keeps a full
+    // mixer with full head counts and dims (stale_query reads that layer's own norm and wq straight off the residual and
+    // views it with the model-wide n_head / n_embd_head); otherwise both
+    // are off for this graph, with one warning. Either way the attention itself stays exact (J3 only prefetches).
+    bool lsa_side_ok = true;
+    if (hparams.mix_enabled && (lsa.spec_recall || lsa.j3) && lsa.mode != llama_lsa_config::OFF) {
+        for (int jl = 0; jl < n_layer; ++jl) {
+            if (!hparams.is_recr(jl) && (hparams.mixer_kind(jl) != llama_hparams::MIX_FULL ||
+                    hparams.mix_attn_k_dim[jl] != hparams.n_embd_head_k_full || hparams.mix_attn_v_dim[jl] != hparams.n_embd_head_v_full ||
+                    hparams.n_head(jl) != (uint32_t) n_head || hparams.n_head_kv(jl) != (uint32_t) n_head_kv ||
+                    model.layers[jl].attn_q_pad_idx != nullptr)) {
+                lsa_side_ok = false;
+            }
+        }
+        if (!lsa_side_ok) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: mixed-shape model with a cut attention layer: LLAMA_LSA_SPEC_RECALL and LLAMA_LSA_J3 off\n", __func__);
+            }
+        }
+    }
+    const bool spec_probe = lsa.spec_recall && lsa.mode != llama_lsa_config::OFF && lsa_side_ok;
+    std::vector<ggml_tensor *> spec_q1(spec_probe ? n_layer : 0, nullptr), spec_q2(spec_probe ? n_layer : 0, nullptr);
+    std::vector<ggml_tensor *> spec_q3(spec_probe ? n_layer : 0, nullptr);
+    if (spec_probe) {
+        // Match the rs3 record pick or its 16-cell refinement, per row/union. Reject other arms, never silently
+        // measure a different predictor. No prefetch, slot-map write or change to the real attention is made.
+        GGML_ASSERT(lsa.mode == llama_lsa_config::KEY && lsa.idx_cache && !lsa.per_head &&
+                lsa.block == 128 && (lsa.refine == 128 || lsa.refine == 16) && lsa.fused_sel && !lsa.unit_op && !lsa.rec_blk &&
+                !lsa.block_sum && !lsa.fast && lsa.topp <= 0.0 && lsa.pick_every == 1 && !lsa.pick_check &&
+                !lsa.blk_list && !lsa.vk && !lsa.sj_compact && lsa.resident_sticky == 0.0 &&
+                lsa.slice == 0 && lsa.window >= 8192 && lsa.sinks >= 128 && (!lsa.shared || lsa.shared_union));
+    }
+
+    // Query of LSA layer `target` from an earlier layer's residual: its norm, projection, q-norm and rope.
+    auto stale_query = [&](ggml_tensor * resid, int target) -> ggml_tensor * {
+        const auto & layer = model.layers[target];
+        GGML_ASSERT(layer.wq && !layer.wqkv); // Swift's separate joint query/gate projection
+        ggml_tensor * sq = build_norm(resid, layer.attn_norm, nullptr, LLM_NORM_RMS, target);
+        sq = build_lora_mm(layer.wq, sq, layer.wq_s);
+        if (layer.wq_b) {
+            sq = ggml_add(ctx0, sq, layer.wq_b);
+        }
+        sq = ggml_view_3d(ctx0, sq, n_embd_head, n_head, n_tokens,
+                ggml_element_size(sq)*n_embd_head*2, ggml_element_size(sq)*n_embd_head*2*n_head, 0);
+        sq = build_norm(sq, layer.attn_q_norm, nullptr, LLM_NORM_RMS, target);
+        return build_rope(sq, inp_pos, target); // the same rope the target layer applies to its own Q
+    };
+
+    // LLAMA_LSA_J3 (opt-in): at mapped LSA layer i, prefetch into the slots of mapped layer i+1 (top-up) and i+3
+    // (look-ahead, with the target's previous-step pick) on the side stream; mapped layers before j3_first keep the
+    // whole body on the card. Decode-sized single-sequence ubatches with the record pick the stale query predicts.
+    std::vector<int> j3_mapped;
+    // LLAMA_LSA_J3_LEAD: also several streams under LLAMA_LSA_MULTI (at most 8 rows each), built per stream
+    const bool j3_rows = ubatch.n_seqs_unq == 1 ? n_tokens <= 8 : lsa.j3_lead && lsa.multi &&
+            n_tokens % ubatch.n_seqs_unq == 0 && n_tokens/ubatch.n_seqs_unq <= 8;
+    if (lsa.j3 && lsa.mode != llama_lsa_config::OFF && lsa_side_ok && j3_rows) {
+        const bool j3_cfg = lsa.mode == llama_lsa_config::KEY && lsa.idx_cache && !lsa.per_head &&
+                lsa.block == 128 && (lsa.refine == 128 || lsa.refine == 16) && lsa.fused_sel && !lsa.unit_op && !lsa.rec_blk &&
+                !lsa.block_sum && !lsa.fast && lsa.topp <= 0.0 && lsa.pick_every == 1 && !lsa.pick_check &&
+                !lsa.blk_list && !lsa.vk && !lsa.sj_compact && lsa.resident_sticky == 0.0 && lsa.slice == 0 &&
+                (!lsa.shared || lsa.shared_union);
+        if (j3_cfg) {
+            for (int jl = 0; jl < n_layer; ++jl) {
+                if (!hparams.is_recr(jl) && lsa.layer_enabled(jl) && llama_lsa_map_has_layer(jl)) {
+                    j3_mapped.push_back(jl);
+                }
+            }
+        } else {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: LLAMA_LSA_J3 needs the key-mode fused record pick (BLOCK 128, REFINE 16/128, FUSED_SEL, "
+                        "IDX_CACHE, SHARED 0/3, no PER_HEAD/UNIT_OP/BLOCK_SUM/PICK_EVERY/VK/SJ_COMPACT/STICKY/SLICE): J3 off\n", __func__);
+            }
+        }
+    }
+    auto * j3_inp = j3_mapped.empty() ? nullptr : inp->get_attn();
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+        if (!hparams.mix_enabled) {
+            cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
 
-        ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, cur);
+        }
+
+        lsa_spec_q = spec_probe ? spec_q1[il] : nullptr;
+        lsa_spec_q2 = spec_probe ? spec_q2[il] : nullptr;
+        lsa_spec_q3 = spec_probe ? spec_q3[il] : nullptr;
+        lsa_spec_sel = nullptr;
+        if (spec_probe && !hparams.is_recr(il) &&
+                lsa.layer_enabled(il) && llama_lsa_map_has_layer(il) && n_tokens <= 8 && ubatch.n_seqs_unq == 1) {
+            int next = il;
+            for (int ahead = 1; ahead <= 3; ++ahead) {
+                do { ++next; } while (next < n_layer && (hparams.is_recr(next) ||
+                        !lsa.layer_enabled(next) || !llama_lsa_map_has_layer(next)));
+                if (next == n_layer) { break; }
+                ggml_tensor * sq = stale_query(inpL, next);
+                (ahead == 1 ? spec_q1 : ahead == 2 ? spec_q2 : spec_q3)[next] = sq;
+                cb(sq, ahead == 1 ? "lsa_spec_q" : ahead == 2 ? "lsa_spec_q2" : "lsa_spec_q3", next);
+                ggml_build_forward_expand(gf, sq); // capture before this source layer runs
+            }
+        }
+
+        if (j3_inp) {
+            const auto it = std::find(j3_mapped.begin(), j3_mapped.end(), il);
+            if (it != j3_mapped.end()) {
+                const int i = (int) (it - j3_mapped.begin()), first = lsa.j3_first, n_map = (int) j3_mapped.size();
+                const int protect = lsa.j3_prev ? GGML_LSA_PREFETCH_PROTECT_PREV : 0;
+                const int ahead = lsa.j3_lead ? lsa.j3_ahead : 3; // LLAMA_LSA_J3_LEAD: RESIDENT_FIRST layers ahead
+                // nearest target first: the side stream runs the passes in issue order
+                // LLAMA_LSA_J3_LEAD with J3_A1 0 (its default): no top-up at all (it would queue behind the far passes)
+                if (ahead > 1 && (!lsa.j3_lead || lsa.j3_a1 > 0) && i + 1 < n_map && i + 1 >= first) {
+                    const int t = j3_mapped[i + 1];
+                    const bool prev_here = lsa.j3_prev && i + 1 < ahead; // no look-ahead source for this target
+                    build_attn_lsa_j3(j3_inp, lsa.j3_a1 > 0 ? stale_query(inpL, t) : nullptr, t, lsa.j3_a1,
+                            protect | (prev_here ? GGML_LSA_PREFETCH_PREV : 0), 1);
+                }
+                if (i + ahead < n_map && i + ahead >= first) {
+                    const int t = j3_mapped[i + ahead];
+                    build_attn_lsa_j3(j3_inp, lsa.j3_a3 > 0 ? stale_query(inpL, t) : nullptr, t, lsa.j3_a3,
+                            protect | (lsa.j3_prev ? GGML_LSA_PREFETCH_PREV : 0), 0);
+                }
+            }
+        }
+
+        if (hparams.mix_enabled) {
+            // the recall-probe / J3 hooks above ran on this layer's input residual exactly as for a plain layer
+            inpL = build_layer_mix(inp, inpL, inp_pos, inp_out_ids, il);
+            continue;
+        }
 
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
@@ -212,7 +554,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
         }
 
         if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
@@ -274,8 +616,126 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+}
 
-    ggml_build_forward_expand(gf, cur);
+// Heads of x [d, n_heads, ...] picked by idx [n_out] (I32), giving [d, n_out, ...]. ggml_get_rows picks along dim 1 of a
+// 2D view, so the head dim is moved to the outside, picked, and moved back.
+static ggml_tensor * qwen35_mix_gather_heads(ggml_context * ctx0, ggml_tensor * x, ggml_tensor * idx) {
+    GGML_ASSERT(x->ne[3] >= 1 && idx->type == GGML_TYPE_I32);
+    const int64_t d = x->ne[0], t = x->ne[2], sq = x->ne[3], n_out = idx->ne[0];
+
+    ggml_tensor * xp = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 3, 1, 2));          // [d, t, sq, n_heads]
+    xp = ggml_reshape_2d(ctx0, xp, d * t * sq, x->ne[1]);
+    xp = ggml_get_rows(ctx0, xp, idx);                                               // [d*t*sq, n_out]
+    xp = ggml_reshape_4d(ctx0, xp, d, t, sq, n_out);
+    return ggml_cont(ctx0, ggml_permute(ctx0, xp, 0, 2, 3, 1));                      // [d, n_out, t, sq]
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_mix_read(
+        ggml_tensor * h,
+        ggml_tensor * norm,
+        ggml_tensor * rank_read,
+           uint32_t   kind,
+            int32_t   span,
+                int   il) {
+    if (kind == llama_hparams::MIX_SPAN) {
+        // y = (h D_r) * rs(h): the span's norm weight is folded into the sublayer's input projections, so the
+        // read is a plain (weightless) rms scale of h followed by D_r^T
+        GGML_ASSERT(norm == nullptr && (size_t) span < model.mix_span_read.size() && model.mix_span_read[span] != nullptr);
+        ggml_tensor * y = build_norm(h, nullptr, nullptr, LLM_NORM_RMS, il);
+        cb(y, "mix_span_rms", il);
+        y = build_lora_mm(model.mix_span_read[span], y);
+        cb(y, "mix_span_read", il);
+        return y;
+    }
+
+    ggml_tensor * y = build_norm(h, norm, nullptr, LLM_NORM_RMS, il);
+    if (kind == llama_hparams::MIX_RANK) {
+        GGML_ASSERT(rank_read != nullptr);
+        y = build_lora_mm(rank_read, y);
+        cb(y, "mix_rank_read", il);
+    }
+    return y;
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_mix_write(
+        ggml_tensor * out,
+        ggml_tensor * rank_write,
+           uint32_t   kind,
+            int32_t   span,
+                int   il) {
+    if (kind == llama_hparams::MIX_SPAN) {
+        GGML_ASSERT((size_t) span < model.mix_span_write.size() && model.mix_span_write[span] != nullptr);
+        out = build_lora_mm(model.mix_span_write[span], out);
+        cb(out, "mix_span_write", il);
+    } else if (kind == llama_hparams::MIX_RANK) {
+        GGML_ASSERT(rank_write != nullptr);
+        out = build_lora_mm(rank_write, out);
+        cb(out, "mix_rank_write", il);
+    }
+    return out;
+}
+
+ggml_tensor * llama_model_qwen35::graph::build_layer_mix(
+        llm_graph_input_mem_hybrid * inp,
+                      ggml_tensor * inpL,
+                      ggml_tensor * inp_pos,
+                      ggml_tensor * inp_out_ids,
+                              int   il) {
+    const auto & layer = model.layers[il];
+
+    const uint32_t mixer_kind = hparams.mixer_kind(il);
+    const uint32_t mlp_kind   = hparams.mlp_kind(il);
+
+    ggml_tensor * h   = inpL;
+    ggml_tensor * cur = nullptr;
+
+    const bool crop = il == n_layer - 1 && crop_before_nextn(inp_out_ids);
+
+    // ---- mixer (GDN or attention) with its residual; a removed mixer leaves the residual stream untouched
+    if (mixer_kind != llama_hparams::MIX_REMOVED) {
+        cur = build_mix_read(h, layer.attn_norm, layer.mixer_read, mixer_kind, hparams.mix_mixer_span[il], il);
+        cb(cur, "attn_norm", il);
+
+        ggml_build_forward_expand(gf, cur);
+
+        if (hparams.is_recr(il)) {
+            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+        } else {
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
+        }
+
+        cur = build_mix_write(cur, layer.mixer_write, mixer_kind, hparams.mix_mixer_span[il], il);
+
+        if (crop) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            h   = ggml_get_rows(ctx0, h,   inp_out_ids);
+        }
+
+        h = ggml_add(ctx0, cur, h);
+        cb(h, "attn_residual", il);
+    } else if (crop) {
+        h = ggml_get_rows(ctx0, h, inp_out_ids);
+    }
+
+    // ---- MLP with its residual
+    if (mlp_kind != llama_hparams::MIX_REMOVED) {
+        ggml_tensor * y = build_mix_read(h, layer.attn_post_norm, layer.mlp_read, mlp_kind, hparams.mix_mlp_span[il], il);
+        cb(y, "attn_post_norm", il);
+
+        cur = build_layer_ffn(y, il);
+        cb(cur, "ffn_out", il);
+
+        cur = build_mix_write(cur, layer.mlp_write, mlp_kind, hparams.mix_mlp_span[il], il);
+
+        h = ggml_add(ctx0, cur, h);
+        cb(h, "post_ffn", il);
+    }
+
+    h = build_cvec(h, il);
+    cb(h, "l_out", il);
+
+    return h;
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
@@ -283,6 +743,22 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
                         int   il) {
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    if (model.layers[il].wqkv_z) {
+        ggml_tensor * qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
+        cb(qkvz, "linear_attn_qkvz", il);
+
+        const int64_t n_z   = hparams.ssm_d_state * hparams.ssm_dt_rank;
+        const int64_t n_qkv = qkvz->ne[0] - n_z;
+
+        ggml_tensor * qkv_mixed = ggml_view_3d(ctx0, qkvz, n_qkv, n_seq_tokens, n_seqs, qkvz->nb[1], qkvz->nb[1] * n_seq_tokens, 0);
+        cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+
+        ggml_tensor * z = ggml_view_2d(ctx0, qkvz, n_z, n_seq_tokens * n_seqs, qkvz->nb[1], ggml_row_size(qkvz->type, n_qkv));
+        cb(z, "z", il);
+
+        return { qkv_mixed, z };
+    }
 
     if (model.layers[il].wqkv_gate == nullptr) {
         // EXL3 fused [in_proj_qkv | in_proj_z]: one matmul, split by views
@@ -393,26 +869,30 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
-        int *                     sections,
         int                       il) {
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    const int64_t dk = hparams.mix_enabled ? hparams.mix_attn_k_dim[il] : hparams.n_embd_head_k(il);
+    const int64_t dv = hparams.mix_enabled ? hparams.mix_attn_v_dim[il] : hparams.n_embd_head_v(il);
+    const int64_t cache_dim = hparams.n_embd_head_k(il);
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
+    // mixed-shape pruned models cut query heads per layer (KV heads are never cut)
+    const int64_t n_head_l    = hparams.mix_enabled ? hparams.n_head(il)    : n_head;
+    const int64_t n_head_kv_l = hparams.mix_enabled ? hparams.n_head_kv(il) : n_head_kv;
+
     auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
-            n_embd_head * 2, n_head,
-            n_embd_head,     n_head_kv,
-            n_embd_head,     n_head_kv,
+            dk + dv, n_head_l,
+            dk,             n_head_kv_l,
+            dv,             n_head_kv_l,
             il, false);
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, dk, n_head_l, n_tokens,
+        ggml_element_size(Qcur_full) * (dk + dv),
+        ggml_element_size(Qcur_full) * (dk + dv) * n_head_l, 0);
     cb(Qcur, "Qcur_reshaped", il);
 
     // Apply Q normalization
@@ -420,43 +900,67 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur, "Qcur_normed", il);
 
     // Apply K normalization
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, dk, n_head_kv_l, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, dv, n_head_l, n_tokens,
+        ggml_element_size(Qcur_full) * (dk + dv),
+        ggml_element_size(Qcur_full) * (dk + dv) * n_head_l,
+        ggml_element_size(Qcur_full) * dk);
+    gate = ggml_cont_2d(ctx0, gate, dv * n_head_l, n_tokens);
     cb(gate, "gate_reshaped", il);
 
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, dv, n_head_kv_l, n_tokens);
 
     // Apply MRoPE
-    Qcur = ggml_rope_multi(
-            ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
-
-    Kcur = ggml_rope_multi(
-            ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
+    Qcur = build_rope(Qcur, inp_pos, il);
+    Kcur = build_rope(Kcur, inp_pos, il);
 
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
+    // Uneven GQA groups (a mixed-shape model whose kept query heads are not the same count for every KV group): attention
+    // broadcasts KV head g over query heads [g*m, (g+1)*m), so every group is padded to the largest group size m. The
+    // padded slots repeat a real head of their group and their outputs are dropped again after attention.
+    const bool padded_q = model.layers[il].attn_q_pad_idx != nullptr;
+    GGML_ASSERT(padded_q || n_head_l % n_head_kv_l == 0);
+    if (padded_q) {
+        GGML_ASSERT(model.layers[il].attn_q_inv_idx != nullptr);
+        Qcur = qwen35_mix_gather_heads(ctx0, ggml_reshape_4d(ctx0, Qcur, dk, n_head_l, n_tokens, 1), model.layers[il].attn_q_pad_idx);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, dk, Qcur->ne[1], n_tokens);
+        cb(Qcur, "Qcur_padded", il);
+    }
+
     // Attention computation
-    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(dk)) : hparams.f_attention_scale;
+
+    if (dk != cache_dim) {
+        Qcur = ggml_pad(ctx0, Qcur, cache_dim - dk, 0, 0, 0);
+        Kcur = ggml_pad(ctx0, Kcur, cache_dim - dk, 0, 0, 0);
+    }
+    if (dv != cache_dim) {
+        Vcur = ggml_pad(ctx0, Vcur, cache_dim - dv, 0, 0, 0);
+    }
 
     cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
+
+    if (dv != cache_dim) {
+        cur = ggml_reshape_3d(ctx0, cur, cache_dim, cur->ne[0] / cache_dim, n_tokens);
+        cur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, dv, cur->ne[1], n_tokens, cur->nb[1], cur->nb[2], 0));
+        cur = ggml_reshape_2d(ctx0, cur, dv * cur->ne[1], n_tokens);
+    }
+
+    if (padded_q) {
+        cur = ggml_reshape_4d(ctx0, cur, dv, cur->ne[0] / dv, n_tokens, 1);
+        cur = qwen35_mix_gather_heads(ctx0, cur, model.layers[il].attn_q_inv_idx);
+        cur = ggml_reshape_2d(ctx0, cur, dv * n_head_l, n_tokens);
+        cb(cur, "attn_unpadded", il);
+    }
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
@@ -476,12 +980,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         int                  il) {
     const auto * mctx_cur = inp->mctx;
 
-    const int64_t d_inner      = hparams.ssm_d_inner;
+    // a mixed-shape pruned model cuts value heads per layer (the key heads are never cut)
+    const int64_t d_inner      = hparams.ssm_d_inner_l(il);
     const int64_t n_seqs       = ubatch.n_seqs;
-    const int64_t head_k_dim   = hparams.ssm_d_state;
-    const int64_t num_k_heads  = hparams.ssm_n_group;
-    const int64_t num_v_heads  = hparams.ssm_dt_rank;
+    const int64_t head_k_dim   = hparams.ssm_k_dim_l(il);
+    const int64_t num_k_heads  = hparams.ssm_k_heads_l(il);
+    const int64_t num_v_heads  = hparams.mix_enabled ? hparams.mix_ssm_v_heads[il] : hparams.ssm_dt_rank;
     const int64_t head_v_dim   = d_inner / num_v_heads;
+    const int64_t state_dim    = hparams.ssm_state_dim_l(il);
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     GGML_ASSERT(n_seqs != 0);
@@ -493,15 +999,29 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * beta  = nullptr;
+    ggml_tensor * alpha = nullptr;
+    if (model.layers[il].ssm_beta_alpha_cat) {
+        ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
+        cb(ba, "beta_alpha", il);
+
+        beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_element_size(ba), ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
+        alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
+                ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
+    } else {
+        beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    if (!model.layers[il].ssm_beta_alpha_cat) {   // separate tensors: same node order as before the v1.0 merge
+        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    }
     cb(alpha, "alpha", il);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
@@ -518,7 +1038,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
     const int64_t conv_kernel_size = conv_kernel->ne[0];
-    const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+    const int64_t conv_channels    = d_inner + 2 * num_k_heads * head_k_dim;
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
@@ -526,10 +1046,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // plan can let the gdn read the cache rows in place (see qwen4exp.cpp). Same rows, same bytes; default off.
     static const bool gdn_getter = [] { const char * e = getenv("LLAMA_GDN_STATE_GETTER"); return e != nullptr && atoi(e) != 0; }();
     ggml_tensor * state = gdn_getter ?
-        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs,
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(il), n_seqs,
                  [](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) { return ggml_get_rows(ctx, states, ids); }) :
-        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(il), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, state_dim, state_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
@@ -577,9 +1097,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
+    // a layer that lost value heads keeps an explicit value head -> key head map (the surviving heads no longer follow the
+    // tiled pattern): pick each kept head's key head here, after the per-key-head L2 norm, so the delta rule sees one
+    // key head per value head
+    bool keys_per_value = false;
+    if (model.layers[il].ssm_key_idx != nullptr) {
+        q_conv = qwen35_mix_gather_heads(ctx0, q_conv, model.layers[il].ssm_key_idx);
+        k_conv = qwen35_mix_gather_heads(ctx0, k_conv, model.layers[il].ssm_key_idx);
+        keys_per_value = true;
+    }
+
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     // note: need explicit repeat only if we are not using the fused GDN.
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+    if (!keys_per_value && num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -589,24 +1119,39 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
+    if (head_k_dim != state_dim) {
+        q_conv = ggml_pad(ctx0, q_conv, state_dim - head_k_dim, 0, 0, 0);
+        k_conv = ggml_pad(ctx0, k_conv, state_dim - head_k_dim, 0, 0, 0);
+        q_conv = ggml_scale(ctx0, q_conv, sqrtf(float(state_dim) / head_k_dim));
+    }
+    if (head_v_dim != state_dim) {
+        v_conv = ggml_pad(ctx0, v_conv, state_dim - head_v_dim, 0, 0, 0);
+    }
+
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
+    if (head_v_dim != state_dim) {
+        output = ggml_cont(ctx0, ggml_view_4d(ctx0, output, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+            output->nb[1], output->nb[2], output->nb[3], 0));
+    }
+
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
-    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    // z is a strided view of the merged qkv_gate output with wqkv_z (upstream layout), contiguous otherwise (graph as before)
+    ggml_tensor * z_2d = model.layers[il].wqkv_z
+        ? ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0)
+        : ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
-
-    // Reshape back to original dimensions
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
 
     return cur;
 }
@@ -637,28 +1182,26 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
-llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     : llm_graph_context(params) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35 MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35 MTP currently only supports a single MTP block");
-
-    const int64_t n_embd_head = hparams.n_embd_head_v();
-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // hparams.n_layer includes both main model layers and MTP layers. The MTP
     // layer is stored immediately after the main layers in model.layers[].
     const int il = hparams.n_layer();
     const auto & layer = model.layers[il];
+    const int64_t n_embd_head = hparams.n_embd_head_v(il);
+    const int64_t n_head = hparams.n_head(il);
+    const int64_t n_head_kv = hparams.n_head_kv(il);
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(il));
 
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
 
-    int sections[4];
-    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
-
     // TODO: extract in a common llm_graph_context::build_inp_embd_h()
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
@@ -680,9 +1223,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     }
     cb(tok_embd, "mtp_tok_embd", il);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+    inp->h = build_inp_embd_state(inp.get(), hparams.n_embd);
 
     ggml_tensor * h_embd = inp->h;
 
@@ -719,7 +1260,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
         // per-step causal masks: row j of the stock kq mask (the mask builder pads
         // masks to exactly n_tokens rows, so plain row views work)
-        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+        GGML_ASSERT(inp_attn->self_attn_mask.rows == nullptr && "the MTP chain needs the plain [n_kv, n_tokens] mask");
+        ggml_tensor * kq_mask = inp_attn->self_attn_mask.raw;
         const int64_t n_kv = kq_mask->ne[0];
 
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
@@ -772,22 +1314,19 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     (size_t) n_tokens*inp_pos->nb[0], (size_t) row0*inp_pos->nb[0]));
             pos_b = ggml_reshape_1d(ctx0, pos_b, 4*width);
 
-            Q_b = ggml_rope_multi(ctx0, Q_b, pos_b, nullptr,
-                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
-            K_b = ggml_rope_multi(ctx0, K_b, pos_b, nullptr,
-                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow);
+            // the same rope as the single-row path (build_rope: rope_multi with the M-RoPE sections)
+            Q_b = build_rope(Q_b, pos_b, il);
+            K_b = build_rope(K_b, pos_b, il);
 
             // attention below reads the cache through build_attn_mha directly, so it applies the
             // same rotations build_attn(llm_graph_input_attn_kv *) does, in the same order
-            if (inp_attn->self_k_rot) {
-                Q_b = llama_mul_mat_hadamard(ctx0, Q_b, inp_attn->self_k_rot);
-                K_b = llama_mul_mat_hadamard(ctx0, K_b, inp_attn->self_k_rot);
+            if (inp_attn->self_k_rot[il]) {
+                Q_b = llama_mul_mat_hadamard(ctx0, Q_b, inp_attn->self_k_rot[il]);
+                K_b = llama_mul_mat_hadamard(ctx0, K_b, inp_attn->self_k_rot[il]);
             }
 
-            if (inp_attn->self_v_rot) {
-                V_b = llama_mul_mat_hadamard(ctx0, V_b, inp_attn->self_v_rot);
+            if (inp_attn->self_v_rot[il]) {
+                V_b = llama_mul_mat_hadamard(ctx0, V_b, inp_attn->self_v_rot[il]);
             }
 
             ggml_build_forward_expand(gf, Q_b);
@@ -812,12 +1351,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             // TurboQuant/TQ K caches hold WHT-rotated K: Q must be rotated to match
             Q_b = build_attn_turbo_q(Q_b, k_view, mctx_kv);
 
-            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, 0, kq_scale, il);
+            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr /* kv_rows */, nullptr, nullptr, 0, kq_scale, il);
 
             cur_b = build_attn_turbo_v_out(cur_b, v_view, il);
 
-            if (inp_attn->self_v_rot) {
-                cur_b = llama_mul_mat_hadamard(ctx0, cur_b, inp_attn->self_v_rot);
+            if (inp_attn->self_v_rot[il]) {
+                cur_b = llama_mul_mat_hadamard(ctx0, cur_b, inp_attn->self_v_rot[il]);
             }
 
             cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
@@ -1009,12 +1548,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     cb(Vcur, "mtp_Vcur", il);
 
-    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
+    Qcur = build_rope(Qcur, inp_pos, il);
+    Kcur = build_rope(Kcur, inp_pos, il);
 
     if (kv_only) {
         // the Q/gate nodes built above are not expanded, so they drop out of the graph
@@ -1072,5 +1607,4 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
-    ggml_build_forward_expand(gf, cur);
 }

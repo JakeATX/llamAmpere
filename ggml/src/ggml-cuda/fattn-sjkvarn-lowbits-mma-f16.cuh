@@ -598,9 +598,9 @@ static __device__ __forceinline__ void fattn_sj_kvarn_lowbits_decode_word(const 
 // of the tile, so the per-channel metadata of a tile is loaded once per warp. This is the fallback (shared-memory
 // tile) path; the decode kernel in fattn-sjkvarn-direct.cuh consumes the same words straight into registers.
 template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool is_V>
-static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
+static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
         const char * const __restrict__ rec, const int t0, const fattn_sj_kvarn_lowbits_ctx & kv,
-        half2 * const __restrict__ tile_KV, const int i_sup) {
+        half2 * const __restrict__ tile_KV, const int i_sup, const int tile_row = 0) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int D         = 2*D2;
     constexpr int ntiles_c  = D/16;
@@ -620,12 +620,12 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
             const float norm = __half2float(block->norm);
             const half2 value = oob_check && row >= i_sup ? make_half2(0.0f, 0.0f) :
                 __floats2half2_rn(turbo4_dequant_element(block, col, norm), turbo4_dequant_element(block, col+1, norm));
-            turbo_store_h2<stride_tile, swz>(tile_KV, row, pair, value);
+            turbo_store_h2<stride_tile, swz>(tile_KV, tile_row + row, pair, value);
         }
         return;
     }
     const int s0   = t0/16; // first strip of the record covered by this tile
-    const uint32_t * payload = (const uint32_t *) (rec + (is_V ? kv.v_payload : 0));
+    const uint32_t * payload = (const uint32_t *) (rec + (is_V ? kv.v_payload : kv.k_payload));
 
     for (int c = wg; c < ntiles_c; c += nwarps) {
         if constexpr (!is_V) {
@@ -653,7 +653,22 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
                 const int bits = is_V ? kv.bits_v : kv.bits_k;
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
-                if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 3) { // staged codebooks (#126)
+                if (GGML_CUDA_LSA_STAGE_STRIPS_KERNEL && kv.stage_token_strip) {
+#pragma unroll
+                    for (int l = 0; l < 4; ++l) {
+                        half vals[2];
+#pragma unroll
+                        for (int e = 0; e < 2; ++e) {
+                            const int row = (l & 1)*8 + (lane >> 2);
+                            const int col = 2*((l >> 1)*4 + (lane & 3)) + e;
+                            const int token = is_V ? col : row, channel = c*16 + (is_V ? row : col);
+                            const uint32_t win = bits == 3 ? sj_kvarn_lowbits::stage_window<3>(packed, token, channel)
+                                                          : sj_kvarn_lowbits::stage_window<2>(packed, token, channel);
+                            vals[e] = __ushort_as_half(fattn_sj_kvarn_trellis_cb_at<is_V>(win));
+                        }
+                        q[l] = __halves2half2(vals[0], vals[1]);
+                    }
+                } else if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 3) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_sj_kvarn_trellis_lb_word_w<3,is_V>(packed, word, q); } else { fattn_sj_kvarn_trellis_lb_word<3,is_V>(packed, word, q); }
                 } else if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 2) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_sj_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_sj_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
@@ -676,7 +691,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
                     if (oob_check && row >= i_sup) {
                         v = make_half2(0.0f, 0.0f);
                     }
-                    turbo_store_h2<stride_tile, swz>(tile_KV, row, col, v);
+                    turbo_store_h2<stride_tile, swz>(tile_KV, tile_row + row, col, v);
                 }
             }
         } else {
@@ -700,7 +715,22 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
                 const int bits = is_V ? kv.bits_v : kv.bits_k;
                 const uint8_t * packed = reinterpret_cast<const uint8_t *>(payload);
                 half2 q[4];
-                if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 3) { // staged codebooks (#126)
+                if (GGML_CUDA_LSA_STAGE_STRIPS_KERNEL && kv.stage_token_strip) {
+#pragma unroll
+                    for (int l = 0; l < 4; ++l) {
+                        half vals[2];
+#pragma unroll
+                        for (int e = 0; e < 2; ++e) {
+                            const int row = (l & 1)*8 + (lane >> 2);
+                            const int col = 2*((l >> 1)*4 + (lane & 3)) + e;
+                            const int token = is_V ? col : row, channel = c*16 + (is_V ? row : col);
+                            const uint32_t win = bits == 3 ? sj_kvarn_lowbits::stage_window<3>(packed, token, channel)
+                                                          : sj_kvarn_lowbits::stage_window<2>(packed, token, channel);
+                            vals[e] = __ushort_as_half(fattn_sj_kvarn_trellis_cb_at<is_V>(win));
+                        }
+                        q[l] = __halves2half2(vals[0], vals[1]);
+                    }
+                } else if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 3) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_sj_kvarn_trellis_lb_word_w<3,is_V>(packed, word, q); } else { fattn_sj_kvarn_trellis_lb_word<3,is_V>(packed, word, q); }
                 } else if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 2) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_sj_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_sj_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
@@ -733,11 +763,11 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
                     half * h0;
                     half * h1;
                     if constexpr (swz) {
-                        h0 = (half *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row,     d/2)) + (d & 1);
-                        h1 = (half *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(row + 1, d/2)) + (d & 1);
+                        h0 = (half *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(tile_row + row,     d/2)) + (d & 1);
+                        h1 = (half *) ((char *) tile_KV + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(tile_row + row + 1, d/2)) + (d & 1);
                     } else {
-                        h0 = (half *) (tile_KV + row*stride_tile + d/2) + (d & 1);
-                        h1 = (half *) (tile_KV + (row + 1)*stride_tile + d/2) + (d & 1);
+                        h0 = (half *) (tile_KV + (tile_row + row)*stride_tile + d/2) + (d & 1);
+                        h1 = (half *) (tile_KV + (tile_row + row + 1)*stride_tile + d/2) + (d & 1);
                     }
                     *h0 = v0;
                     *h1 = v1;
@@ -745,6 +775,45 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
             }
         }
     }
+}
+
+
+template<int stride_tile, bool swz, int nbatch_fa, int nthreads, int D2, bool oob_check, bool is_V>
+static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile(
+        const char * rec, int t0, const fattn_sj_kvarn_lowbits_ctx & kv, half2 * tile, int i_sup) {
+#if !GGML_CUDA_LSA_STAGE_STRIPS_KERNEL
+    // -DGGML_CUDA_LSA_STAGE_STRIPS=OFF build: no compact-strip path in the kernel (see qsa-resident-clock.cuh), raw loader frame
+    flash_attn_ext_sj_kvarn_load_tile_raw<stride_tile, swz, nbatch_fa, nthreads, D2, oob_check, is_V>(rec, t0, kv, tile, i_sup);
+#else
+    const auto * map = kv.page_map;
+    const uintptr_t delta = reinterpret_cast<uintptr_t>(rec) - reinterpret_cast<uintptr_t>(kv.page_stage);
+    if (!map || delta >= size_t(map->stage_n)*map->stage_stride || delta%map->stage_stride != 0) {
+        flash_attn_ext_sj_kvarn_load_tile_raw<stride_tile, swz, nbatch_fa, nthreads, D2, oob_check, is_V>(rec, t0, kv, tile, i_sup);
+        return;
+    }
+    const size_t index = delta/map->stage_stride;
+    const uint32_t wanted = map->stage_mask[map->stage_page[index]];
+    const uint32_t valid = map->stage_valid[index*map->heads + kv.page_head];
+    if ((valid & wanted) != wanted || t0%16 || t0 + nbatch_fa > 128) __trap();
+    const int kb = 256*(2*kv.bits_k + 1), vb = 256*(2*kv.bits_v + 1);
+    for (int s = 0; s < nbatch_fa/16; ++s) {
+        const int strip = t0/16 + s;
+        if (!(wanted & (1u << strip))) {
+            for (int i = threadIdx.y*ggml_cuda_get_physical_warp_size() + threadIdx.x; i < 16*D2; i += nthreads) {
+                turbo_store_h2<stride_tile, swz>(tile, s*16 + i/D2, i%D2, make_half2(0.0f, 0.0f));
+            }
+            continue;
+        }
+        const int rank = __popc(wanted & ((1u << strip) - 1));
+        fattn_sj_kvarn_lowbits_ctx c = kv;
+        c.stage_token_strip = true;
+        c.k_scale = 0; c.k_zero = 512; c.v_ch = 1024;
+        c.k_payload = 1536 + rank*sj_kvarn_lowbits::stage_strip_bytes(kv.bits_k, kv.bits_v);
+        c.v_payload = c.k_payload + kb;
+        c.k_tok = c.v_payload + vb; c.v_scale = c.k_tok + 32; c.v_zero = c.v_scale + 32;
+        flash_attn_ext_sj_kvarn_load_tile_raw<stride_tile, swz, 16, nthreads, D2, oob_check, is_V>(rec, 0, c, tile, i_sup - s*16, s*16);
+    }
+#endif // GGML_CUDA_LSA_STAGE_STRIPS_KERNEL
 }
 
 
@@ -1770,12 +1839,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         float        * const __restrict__ KQ_max,
         float        * const __restrict__ KQ_rowsum,
         const int jt,
-        const int kb0,
+        const int kb0_in,
         const int k_VKQ_sup,
         char         * const __restrict__ raw_K,
         char         * const __restrict__ raw_V,
         const fattn_sj_kvarn_lowbits_ctx & kv) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+    // GGML_SJKVARN_LIVE_TILES: kb0_in is an index into the live-tile list; past its end (a block with less than one live
+    // tile) there is nothing to add. Every thread reads the same entry, so the early return is block-uniform; the previous
+    // iteration ended on a barrier (nstages == 0 here).
+    int kb0 = kb0_in;
+    if constexpr (type_K == GGML_TYPE_I8 && ncols2 > 1 && !use_sparse) {
+        if (kv.live_tiles != nullptr) {
+            if (kb0_in >= kv.live_tiles[0]) {
+                return;
+            }
+            kb0 = kv.live_tiles[1 + kb0_in];
+        }
+    }
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
@@ -1824,6 +1905,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
+        }
+        if constexpr (is_sj_kvarn) {
+            // GGML_SJKVARN_TILE_SKIP=1 (opt-in): a body tile whose mask is -inf for every column of this block (e.g. cells
+            // an LSA pick dropped on the masked path) adds exp(-inf) = 0 to the row sums and 0*V to the accumulators and
+            // leaves the running max alone, so it is skipped before its K/V records are read: same result, fewer bytes.
+            // Padding columns repeat real rows (fastmodulo), tail elements past k_VKQ_sup load 0 and never skip.
+            if ((kv.flags & GGML_SJKVARN_FLAG_TILE_SKIP) && mask_h && k_VKQ_0 >= kv.S && k_VKQ_0 < kv.B) {
+                __syncthreads(); // the synchronous mask stores are visible
+                bool live = false;
+                for (int e = threadIdx.y*warp_size + threadIdx.x; e < ncols1*nbatch_fa; e += nwarps*warp_size) {
+                    live |= __half2float(tile_mask[(e/nbatch_fa)*(nbatch_fa + 8) + e%nbatch_fa]) != -INFINITY;
+                }
+                if (!__syncthreads_or(live)) {
+                    return;
+                }
+            }
         }
     }
 
@@ -2408,7 +2505,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         scale, slope, logit_softcap, ne01, ne02,
         stride_K, stride_V, stride_mask,
         tile_Q, tile_K, tile_V, tile_mask,
-        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0, kv);
+        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0_in, kv);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
@@ -3220,7 +3317,9 @@ static __global__ void flash_attn_ext_f16(
     const char * GGML_CUDA_RESTRICT V              = V_ptr;
     const char * GGML_CUDA_RESTRICT mask           = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks          = sinks_ptr;
-    const int  * GGML_CUDA_RESTRICT KV_max         = use_sparse ? nullptr : KV_max_ptr;
+    // SJ-KVaRN: the KV_max slot carries the live-tile list (GGML_SJKVARN_LIVE_TILES) or nullptr, never a KV bound
+    const int  * GGML_CUDA_RESTRICT KV_max         = use_sparse || type_K == GGML_TYPE_I8 ? nullptr : KV_max_ptr;
+    const int  * GGML_CUDA_RESTRICT live_tiles     = type_K == GGML_TYPE_I8 && ncols2 > 1 && !use_sparse ? KV_max_ptr : nullptr;
     const int  * GGML_CUDA_RESTRICT sparse_indices = use_sparse ? KV_max_ptr : nullptr;
     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
@@ -3295,9 +3394,12 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_V = V_is_K_view ? stride_K : (is_turbo_kv ? nb21 : nb21 / sizeof(half2));
 
-    const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
     const int iter_z_gqa = (gqa_ratio + (ncols2    - 1)) / ncols2;
+    // live-tile walk: the k axis is the live list, at least one entry per block of an output tile (the launch gives each
+    // output tile gridDim.x/ntiles_dst blocks), so no block spans two output tiles and the uniform fixup applies
+    const int iter_k     = live_tiles == nullptr ? (ne11 + (nbatch_fa - 1)) / nbatch_fa :
+        max(live_tiles[0], int(gridDim.x) / (iter_j*iter_z_gqa*ne12*ne03));
 
     // kbc == k block continuous, current index in continuous ijk space.
     int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
@@ -3334,7 +3436,8 @@ static __global__ void flash_attn_ext_f16(
 
         fattn_sj_kvarn_lowbits_ctx kv = {};
         if constexpr (is_sj_kvarn) {
-            kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, bits_k, bits_v, nb12, nb22);
+            kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, bits_k, bits_v, nb12, nb22, ne01.z);
+            kv.live_tiles = live_tiles;
         }
 
         if (KV_max) {
@@ -3386,7 +3489,8 @@ static __global__ void flash_attn_ext_f16(
 
     fattn_sj_kvarn_lowbits_ctx kv = {};
     if constexpr (is_sj_kvarn) {
-        kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, bits_k, bits_v, nb12, nb22);
+        kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, bits_k, bits_v, nb12, nb22, ne01.z);
+        kv.live_tiles = live_tiles;
     }
 
     if (KV_max) {

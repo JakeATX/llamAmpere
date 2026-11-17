@@ -5,6 +5,9 @@
 //   - lanes that disagree are split, including after earlier ubatches of the same batch changed them,
 //   - every token is used and each seq's trailing n_keep_tail tokens stay in one ubatch,
 //   - with the constraint off (fn() == nullptr) the split is the old one.
+// [TAG_GDN_REPLAY_LANES] with lanes on, seqs that differ share a ubatch only at >= n_rs_seq tokens per seq (B1), or, with
+// LLAMA_GDN_REPLAY_SHORT=1 (and LLAMA_GDN_REPLAY_SHORT_JOIN not 0), at any short static width >= 2.
+// Run it with SHORT unset, SHORT=1 and SHORT=1 SHORT_JOIN=0: the expectations follow replay_short_join().
 #include "../src/llama-batch.h"
 #include "../src/llama-memory-recurrent.h"
 #include "../src/llama-vocab.h"
@@ -27,10 +30,14 @@ struct split_result {
     std::vector<std::vector<llama_seq_id>> seqs; // per ubatch, its seqs
     uint32_t n_used   = 0;
     uint32_t n_tokens = 0;
+    uint32_t n_mixed  = 0; // ubatches whose lanes differ (lanes on)
+    uint64_t n_bystand = 0; // bystander cuts (lanes on, with cells)
 };
 
 // runs the init_batch loop; fails the process on any broken invariant
-static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch, uint32_t n_rs_seq, bool constrain) {
+// cells: optional cell of each seq (a seq with 0 tokens is a bystander outside the batch); turns on the bystander guard
+static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch, uint32_t n_rs_seq, bool constrain, bool lanes_on = false,
+        const std::vector<int32_t> & cells = {}) {
     const uint32_t n_seq = lanes.size();
 
     int32_t n_tokens = 0;
@@ -60,6 +67,7 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
 
     llama_memory_recurrent::replay_split rs;
     rs.active   = constrain;
+    rs.lanes    = constrain && lanes_on;
     rs.n_rs_seq = n_rs_seq;
     for (const lane & l : lanes) {
         rs.replay_len.push_back(l.replay_len);
@@ -68,6 +76,19 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
     }
     if (!constrain) {
         GGML_ASSERT(rs.fn() == nullptr);
+    }
+    if (!rs.lanes) {
+        GGML_ASSERT(rs.strict_fn() == nullptr && rs.n_mixed_min() == 0);
+    }
+    rs.count_tokens(balloc.get_batch());
+    llama_memory_recurrent::lanes_stats stats;
+    rs.stats = rs.lanes ? &stats : nullptr;
+    if (rs.lanes && !cells.empty()) {
+        rs.tail = cells;
+        rs.owner.assign(cells.size(), -1);
+        for (size_t q = 0; q < cells.size(); ++q) {
+            rs.owner[cells[q]] = (int32_t) q;
+        }
     }
 
     const uint32_t n_keep_tail = n_rs_seq > 0 ? n_rs_seq + 1 : 0;
@@ -80,7 +101,8 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
 
     balloc.split_reset();
     while (true) {
-        llama_ubatch ub = balloc.split_equal(n_ubatch, true, n_keep_tail, rs.fn());
+        llama_ubatch ub = balloc.split_equal(n_ubatch, true, n_keep_tail, rs.fn(), rs.strict_fn(), rs.n_mixed_min(),
+                cells.empty() ? nullptr : rs.set_fn());
         if (ub.n_tokens == 0) {
             break;
         }
@@ -89,9 +111,17 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
         std::vector<llama_seq_id> ids(ub.seq_id_unq, ub.seq_id_unq + ub.n_seqs_unq);
         if (constrain) {
             // the values the graph would see for this ubatch agree across its lanes
+            // with lanes: or the ubatch is at least n_rs_seq wide (the static verify graph)
+            bool mixed = false;
             for (llama_seq_id s : ids) {
                 GGML_ASSERT(rs.compat(ids[0], s));
+                mixed |= !rs.strict(ids[0], s);
             }
+            GGML_ASSERT(!mixed || (rs.lanes && llama_memory_recurrent::replay_join_width(ub.n_seq_tokens, n_rs_seq)));
+            GGML_ASSERT(!mixed || ub.n_seq_tokens >= n_rs_seq || llama_memory_recurrent::replay_short_join());
+            // a mixed ubatch never spans the cell of a bystander with a pending replay
+            GGML_ASSERT(!mixed || cells.empty() || rs.set_ok(ids));
+            res.n_mixed += mixed;
         }
         const size_t k = res.seqs.size();
         for (uint32_t i = 0; i < ub.n_tokens; ++i) {
@@ -102,7 +132,7 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
                 last_ub[s] = k;
             }
         }
-        rs.advance(ub);
+        rs.advance(ub, balloc.get_split_cut());
         res.seqs.push_back(ids);
     }
     res.n_used = balloc.get_n_used();
@@ -119,14 +149,17 @@ static split_result run_split(const std::vector<lane> & lanes, uint32_t n_ubatch
     if (constrain) {
         // every lane left the batch consumed
         for (uint32_t s = 0; s < n_seq; ++s) {
-            GGML_ASSERT(rs.replay_len[s] == 0 && rs.s_stale[s] == 0);
+            GGML_ASSERT(lanes[s].n_tokens == 0 || (rs.replay_len[s] == 0 && rs.s_stale[s] == 0));
         }
     }
+    res.n_bystand = stats.n_bystand;
     return res;
 }
 
 int main() {
     const uint32_t n_rs_seq = 3; // MTP depth 3-4 verify: K = 4 snapshot groups
+    const bool     join     = llama_memory_recurrent::replay_short_join();
+    printf("short join: %s\n", join ? "on" : "off");
 
     // two verify lanes of 4 tokens that agree: one ubatch with both
     {
@@ -175,9 +208,97 @@ int main() {
         printf("\n");
     }
 
+    // [TAG_GDN_REPLAY_LANES] lanes on: 4 verify lanes of n_rs_seq + 1 tokens with 4 different replays share one ubatch
+    {
+        const std::vector<lane> four = { { 4, 0, 3, 0 }, { 4, 1, 3, 0 }, { 4, 3, 3, 0 }, { 4, 0, 3, 1 } };
+        auto r = run_split(four, 512, n_rs_seq, true, true);
+        GGML_ASSERT(r.seqs.size() == 1 && r.seqs[0].size() == 4 && r.n_mixed == 1);
+        auto r0 = run_split(four, 512, n_rs_seq, true, false);
+        GGML_ASSERT(r0.seqs.size() == 4);
+        // n == n_rs_seq (drafter one short) is still static width
+        r = run_split({ { 3, 1, 3, 0 }, { 3, 2, 3, 0 } }, 512, n_rs_seq, true, true);
+        GGML_ASSERT(r.seqs.size() == 1 && r.seqs[0].size() == 2);
+        // a short round (n < n_rs_seq): strict without short join, one mixed ubatch with it
+        r = run_split({ { 2, 1, 3, 0 }, { 2, 2, 3, 0 } }, 512, n_rs_seq, true, true);
+        GGML_ASSERT(join ? r.seqs.size() == 1 && r.n_mixed == 1 : r.seqs.size() == 2);
+        // agreeing short lanes still share
+        r = run_split({ { 2, 1, 3, 0 }, { 2, 1, 3, 0 } }, 512, n_rs_seq, true, true);
+        GGML_ASSERT(r.seqs.size() == 1);
+        // width 1 is never static: strict either way
+        r = run_split({ { 1, 1, 3, 0 }, { 1, 2, 3, 0 } }, 512, n_rs_seq, true, true);
+        GGML_ASSERT(r.seqs.size() == 2 && r.n_mixed == 0);
+        printf("lanes: 4 different replays in 1 ubatch, short rounds %s\n", join ? "joined" : "strict");
+    }
+    // short join, mixed r at n = 2..4 (n_rs_seq 3: 2 is short, 3 and 4 static): 4 lanes, every r in 0..3 and stale
+    {
+        for (uint32_t n = 2; n <= 4; ++n) {
+            const std::vector<lane> four = { { n, 0, 3, 0 }, { n, 3, 3, 0 }, { n, 1, 3, 0 }, { n, 0, 3, 1 } };
+            auto r = run_split(four, 512, n_rs_seq, true, true);
+            const bool want_join = n >= n_rs_seq || join;
+            GGML_ASSERT(want_join ? r.seqs.size() == 1 && r.seqs[0].size() == 4 && r.n_mixed == 1 : r.seqs.size() == 4);
+            // lanes off: one ubatch per lane whatever the width
+            GGML_ASSERT(run_split(four, 512, n_rs_seq, true, false).seqs.size() == 4);
+        }
+        // uneven widths in one batch: keep-tail keeps each seq's last n_rs_seq + 1 tokens in one ubatch, so a 2-row lane
+        // next to a 3-row lane goes out alone; two 2-row lanes after it still join
+        auto r = run_split({ { 3, 1, 3, 0 }, { 2, 2, 3, 0 }, { 2, 0, 3, 0 } }, 512, n_rs_seq, true, true);
+        GGML_ASSERT(join ? r.n_mixed >= 1 : r.n_mixed == 0);
+        // n_ubatch 4 with 2 lanes: width 2 (short): joined only with short join
+        r = run_split({ { 6, 1, 3, 0 }, { 6, 2, 3, 0 } }, 5, n_rs_seq, true, true);
+        GGML_ASSERT(join ? r.n_mixed > 0 : r.n_mixed == 0);
+        // a short mixed ubatch never spans a pending bystander (cells 0, 2 with seq 2 in cell 1)
+        r = run_split({ { 2, 1, 3, 0 }, { 2, 2, 3, 0 }, { 0, 3, 3, 0 } }, 512, n_rs_seq, true, true, { 0, 2, 1 });
+        GGML_ASSERT(r.n_mixed == 0 && r.seqs.size() == 2 && r.n_bystand == (join ? 1u : 0u));
+        printf("short join (%s): mixed r at n = 2..4, uneven widths, bystander guard\n", join ? "on" : "off");
+    }
+    // bystander: seq 3 is not in the batch and sits in cell 1, between the cells of seqs 0 (0) and 1, 2 (2, 3).
+    // With a pending replay it must not be spanned by a mixed ubatch: seq 0 goes alone, then {1, 2} (cells 2..3).
+    {
+        const std::vector<int32_t> cells = { 0, 2, 3, 1 };
+        auto r = run_split({ { 4, 1, 3, 0 }, { 4, 2, 3, 0 }, { 4, 3, 3, 0 }, { 0, 2, 3, 0 } }, 512, n_rs_seq, true, true, cells);
+        GGML_ASSERT(r.seqs.size() == 2 && r.seqs[0].size() == 1 && r.seqs[1].size() == 2 && r.n_bystand == 1);
+        // s_stale counts as pending too
+        r = run_split({ { 4, 1, 3, 0 }, { 4, 2, 3, 0 }, { 4, 3, 3, 0 }, { 0, 0, 3, 1 } }, 512, n_rs_seq, true, true, cells);
+        GGML_ASSERT(r.seqs.size() == 2 && r.n_bystand == 1);
+        // nothing pending: one joint ubatch
+        r = run_split({ { 4, 1, 3, 0 }, { 4, 2, 3, 0 }, { 4, 3, 3, 0 }, { 0, 0, 3, 0 } }, 512, n_rs_seq, true, true, cells);
+        GGML_ASSERT(r.seqs.size() == 1 && r.seqs[0].size() == 3 && r.n_bystand == 0);
+        // pending bystander outside the range [0, 2]: one joint ubatch
+        r = run_split({ { 4, 1, 3, 0 }, { 4, 2, 3, 0 }, { 4, 3, 3, 0 }, { 0, 2, 3, 0 } }, 512, n_rs_seq, true, true, { 0, 2, 1, 3 });
+        GGML_ASSERT(r.seqs.size() == 1 && r.seqs[0].size() == 3 && r.n_bystand == 0);
+        // agreeing lanes keep today's rule (strict ubatch, bystander not checked)
+        r = run_split({ { 4, 1, 3, 0 }, { 4, 1, 3, 0 }, { 4, 1, 3, 0 }, { 0, 2, 3, 0 } }, 512, n_rs_seq, true, true, cells);
+        GGML_ASSERT(r.seqs.size() == 1 && r.n_bystand == 0);
+        // keep-tail defers a member (seq 2: 4 tokens, 1 left < n_keep_tail 4) that sits in cell 1 between seqs 0 and 1
+        // (cells 0, 2) with a pending replay: the kept {0, 1} must not go out mixed
+        r = run_split({ { 3, 1, 3, 0 }, { 3, 2, 3, 0 }, { 4, 3, 3, 0 } }, 512, n_rs_seq, true, true, { 0, 2, 1 });
+        for (const auto & ids : r.seqs) {
+            GGML_ASSERT(ids.size() == 1);
+        }
+        GGML_ASSERT(r.n_mixed == 0 && r.n_bystand == 1);
+        // same lengths, cells in order: seq 2 is outside the range of {0, 1}, which goes out mixed
+        r = run_split({ { 3, 1, 3, 0 }, { 3, 2, 3, 0 }, { 4, 3, 3, 0 } }, 512, n_rs_seq, true, true, { 0, 1, 2 });
+        GGML_ASSERT(r.n_mixed == 1 && r.n_bystand == 0);
+        printf("lanes: bystander guard\n");
+    }
+    // B1: two long prompts with different replays and a small n_ubatch: the width (5 / 2 = 2) is below n_rs_seq, so
+    // no mixed ubatch (with short join: width 2 is static, so they may mix); at n_ubatch 6 (width 3 == n_rs_seq) they
+    // may mix. run_split checks the width of every mixed ubatch
+    {
+        auto r = run_split({ { 20, 1, 3, 0 }, { 20, 2, 3, 0 } }, 5, n_rs_seq, true, true);
+        GGML_ASSERT(join || r.n_mixed == 0);
+        auto r6 = run_split({ { 20, 1, 3, 0 }, { 20, 2, 3, 0 } }, 6, n_rs_seq, true, true);
+        GGML_ASSERT(r6.n_mixed > 0);
+        printf("B1: n_ubatch 5 -> %zu ubatches, none mixed; n_ubatch 6 -> %zu ubatches, %u mixed\n", r.seqs.size(), r6.seqs.size(), r6.n_mixed);
+    }
+
     // random batches: the invariants are checked inside run_split
     std::mt19937 rng(1234);
     int n_split_cases = 0;
+    int n_lanes_saved = 0;
+    int n_mixed       = 0;
+    int n_mixed_cells = 0;
+    uint64_t n_bystand = 0;
     for (int it = 0; it < 20000; ++it) {
         const uint32_t n_seq = 1 + rng() % 4;
         std::vector<lane> lanes(n_seq);
@@ -190,9 +311,27 @@ int main() {
         const uint32_t n_ubatch = n_rs_seq + 2 + rng() % 40;
         auto r = run_split(lanes, n_ubatch, n_rs_seq, true);
         auto r0 = run_split(lanes, n_ubatch, n_rs_seq, false);
+        auto rl = run_split(lanes, n_ubatch, n_rs_seq, true, true);
         n_split_cases += r.seqs.size() > r0.seqs.size();
+        n_lanes_saved += r.seqs.size() > rl.seqs.size();
+        n_mixed       += rl.n_mixed;
+        // with cells: permuted, plus a bystander outside the batch (run_split checks set_ok on every final mixed ubatch)
+        lanes.push_back({ 0, 0, 0, 0 });
+        lanes.back().ckpt_span  = rng() % (n_rs_seq + 1);
+        lanes.back().replay_len = rng() % (lanes.back().ckpt_span + 1);
+        lanes.back().s_stale    = (rng() % 4) == 0;
+        std::vector<int32_t> cells(lanes.size());
+        for (size_t q = 0; q < cells.size(); ++q) {
+            cells[q] = (int32_t) q;
+        }
+        std::shuffle(cells.begin(), cells.end(), rng);
+        auto rc = run_split(lanes, n_ubatch, n_rs_seq, true, true, cells);
+        n_mixed_cells += rc.n_mixed;
+        n_bystand     += rc.n_bystand;
     }
-    printf("random: 20000 batches passed, %d needed extra ubatches\n", n_split_cases);
+    printf("random: 20000 batches passed, %d needed extra ubatches; lanes: %d needed fewer, %d mixed ubatches; "
+           "with cells: %d mixed, %llu bystander cuts\n",
+            n_split_cases, n_lanes_saved, n_mixed, n_mixed_cells, (unsigned long long) n_bystand);
     printf("OK\n");
     return 0;
 }

@@ -6,6 +6,7 @@
 #include "src/llama-model.h"
 #include "ggml/src/ggml-backend-moe-cache.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -96,6 +97,9 @@ static void server_setup_report(const common_params & params, llama_context * ct
     uint32_t context = llama_n_ctx_seq(ctx);
     if (params.kv_unified_per_slot > 0) {
         context = std::min(context, (uint32_t) params.kv_unified_per_slot);
+    }
+    if (!params.slot_ctx.empty()) {
+        context = std::min(context, (uint32_t) *std::max_element(params.slot_ctx.begin(), params.slot_ctx.end()));
     }
     const uint32_t batch = llama_n_batch(ctx);
     const uint32_t ubatch = llama_n_ubatch(ctx);

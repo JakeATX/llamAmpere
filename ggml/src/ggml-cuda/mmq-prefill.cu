@@ -262,7 +262,7 @@ bool ggml_cuda_should_use_mmq_prefill(const mmq_args & args) {
         return env && strcmp(env, "1") == 0;
     }();
     if (!enabled || (args.type_x != GGML_TYPE_IQ4_XS && args.type_x != GGML_TYPE_Q5_0) ||
-            args.ids_dst || args.expert_bounds || args.y_scale ||
+            args.ids_dst || args.tile_spec || args.y_scale || args.fusion.gate ||
             args.nchannels_x != 1 || args.nchannels_y != 1 || args.nsamples_x != 1 || args.nsamples_y != 1 ||
             args.ncols_dst < 256 || args.ncols_dst != args.ncols_y || args.ncols_max != args.ncols_dst ||
             args.ncols_x <= 0 || args.ncols_x%256 != 0 || args.nrows_x <= 0 ||

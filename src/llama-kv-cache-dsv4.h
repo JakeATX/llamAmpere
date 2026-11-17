@@ -16,14 +16,15 @@ public:
 
     llama_dsv4_comp_state(
             const llama_model & model,
-            bool            offload,
-            bool            unified,
-            uint32_t        n_seq_max,
-            uint32_t        ratio,
-            uint32_t        state_size,
-            uint32_t        n_embd_state,
-            uint32_t        n_rs_seq,
-            const char    * name,
+                         bool   no_alloc,
+                         bool   offload,
+                         bool   unified,
+                     uint32_t   n_seq_max,
+                     uint32_t   ratio,
+                     uint32_t   state_size,
+                     uint32_t   n_embd_state,
+                     uint32_t   n_rs_seq,
+                   const char * name,
         const llama_memory_i::layer_filter_cb & filter);
 
     void clear(llama_seq_id seq_id, bool data);
@@ -31,6 +32,7 @@ public:
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()      const;
+    bool     is_overlap()     const; // V4 CSA: state holds 2*ratio rows of 2x width
     uint32_t get_state_size() const;
     uint32_t get_n_stream()   const;
     uint32_t get_n_rs_seq()   const;
@@ -66,10 +68,7 @@ private:
     const uint32_t n_stream;
     const uint32_t n_rs_seq;
 
-    // the model was loaded with no_alloc (-fit probe): the state is sized but not allocated
-    const bool no_alloc;
-
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    llama_memory_bufs ctxs_bufs;
 
     std::vector<layer> layers;
 
@@ -92,6 +91,7 @@ class llama_kv_cache_dsv4 : public llama_memory_i {
 public:
     llama_kv_cache_dsv4(
             const llama_model & model,
+                         bool   no_alloc,
                     ggml_type   type_k,
                     ggml_type   type_v,
                          bool   v_trans,
@@ -101,7 +101,6 @@ public:
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
-                     uint32_t   n_pad,
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
@@ -154,9 +153,15 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    // layer whose compressed-KV storage `il` reads, -1 = no compressed KV
+    int32_t get_comp_read_layer(int32_t il) const;
+
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
-    void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+    void update_rs_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+
+    // copy the sources into their mirrors after a state read
+    void refill_comp_mirrors();
 
 private:
     llama_hparams hparams_raw;
@@ -174,6 +179,16 @@ private:
     // ring capacity; after a state restore, a seq_cp into a fresh stream or rollbacks that consumed the ring, fewer
     // (or none) are real, and a rollback deeper than this must be refused instead of restoring a stale plane
     std::vector<uint32_t> rs_valid;
+
+    // (upstream's rs_max, ab3768cdc, is subsumed by rs_valid: our snapshot ring shifts older planes back)
+
+    // [n_layer] storage layer -> layer whose rows it holds (itself, or the source of a mirror)
+    std::vector<int32_t> comp_il_src;
+
+    // [n_layer] layer -> layer whose compressed-KV storage it reads (itself, its V4.1 kv source or a mirror), -1 = none
+    std::vector<int32_t> comp_read;
+
+    bool comp_mirrors_stale = false;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
@@ -220,11 +235,13 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst) const;
-    void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_k_rot(ggml_tensor * dst) const;
+    void set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // token history of the raw (window) cells, for host-side n-gram hashing (deepseek41 Engram)
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     size_t i_next = 0;
@@ -264,8 +281,7 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    void set_input_k_rot(ggml_tensor * dst) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
 
 private:
     llama_kv_cache * kv;
@@ -383,6 +399,8 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    int32_t get_comp_read_layer(int32_t il) const;
+
 private:
     size_t i_next = 0;
 
@@ -415,4 +433,6 @@ private:
     mutable comp_plan reserve_plan_lid;
 
     const llama_memory_status status;
+
+    llama_kv_cache_dsv4 * kv = nullptr;
 };

@@ -205,9 +205,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(g_cs->type, g_cs->ne[0] - 1));
     cb(g_last, "g_last", il);
 
-    // TODO: remove this cont when CUDA supports non-cont unary ops
-    g_last = ggml_cont(ctx0, g_last);
-
     // [1, 1, n_chunks, H_v * n_seqs] KDA: [S_k, 1, n_chunks, H_v * n_seqs]
     ggml_tensor * g_last_exp_t = ggml_transpose(ctx0, ggml_exp(ctx0, g_last));
     cb(g_last_exp_t, "g_last_exp_t", il);
@@ -536,7 +533,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                 (size_t) conv_rollback * mem_size * conv_states_all->nb[1]);
     }
 
-    ggml_tensor * conv_states = build_rs_conv(inp, conv_src, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_states = build_rs_conv(inp, conv_src, hparams.n_embd_r(il), n_seqs);
     cb(conv_states, "conv_states", il);
 
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
@@ -587,7 +584,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // Writing them anyway with s_idx clamped to 0 overwrites every older conv snapshot with the
         // pre-ubatch window, which destroys the rollback history of a sequence that is decoded one
         // token at a time and makes a later rollback restore a state that never existed.
-        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+        const int64_t n_written = inp->rs_wr != nullptr ? (int64_t) inp->n_written : std::min<int64_t>(n_seq_tokens, K);
 
         if (inp->rs_wr != nullptr) {
             // [TAG_RECURRENT_ROLLBACK_RING] a ubatch shorter than the ring: groups live at ring planes
@@ -678,8 +675,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * ggml_row_size(ssm_states_all->type, hparams.n_embd_s()))));
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(il), n_seqs, ssm_states_all->nb[1],
+                        kv_head * ggml_row_size(ssm_states_all->type, hparams.n_embd_s(il)))));
 
         return output;
     }
@@ -721,10 +718,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             0);
         cb(output, "attn_output", il);
 
-        const size_t row_size = ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
+        const size_t row_size = ggml_row_size(ssm_states_all->type, hparams.n_embd_s(il));
 
         // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+        const int64_t n_written = inp->rs_wr != nullptr ? (int64_t) inp->n_written : std::min<int64_t>(n_seq_tokens, K);
 
         if (inp->rs_wr != nullptr) {
             // [TAG_RECURRENT_ROLLBACK_RING] a ubatch shorter than the ring: snapshot slot g -> cache row
@@ -736,14 +733,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             ggml_tensor * src = ggml_view_2d(ctx0, gdn_out, D, n_seqs * n_written,
                 ggml_row_size(gdn_out->type, D),
                 ggml_row_size(gdn_out->type, attn_score_elems));
-            ggml_tensor * all2d = ggml_reshape_2d(ctx0, ssm_states_all, hparams.n_embd_s(), ssm_states_all->ne[1]);
+            ggml_tensor * all2d = ggml_reshape_2d(ctx0, ssm_states_all, hparams.n_embd_s(il), ssm_states_all->ne[1]);
             ggml_build_forward_expand(gf, ggml_set_rows(ctx0, all2d, src, inp->rs_wr));
             return output;
         }
 
         // the older groups move back by n_seq_tokens (see snapshot_shift_gather; no-op for n >= K)
         std::vector<ggml_tensor *> older;
-        snapshot_shift_gather(ctx0, gf, inp, ssm_states_all, hparams.n_embd_s(), 0, mem_size, older);
+        snapshot_shift_gather(ctx0, gf, inp, ssm_states_all, hparams.n_embd_s(il), 0, mem_size, older);
 
         // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
         ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
@@ -760,7 +757,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
 
-        snapshot_shift_write(ctx0, gf, inp, ssm_states_all, hparams.n_embd_s(), n_seq_tokens, kv_head, mem_size, older);
+        snapshot_shift_write(ctx0, gf, inp, ssm_states_all, hparams.n_embd_s(il), n_seq_tokens, kv_head, mem_size, older);
 
         return output;
     }
@@ -808,9 +805,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // [#63] the ring's slot layout: emit_mode 1 (k, v, g, beta each S_v wide) or 2 (compact: g and
     // beta once per head), as llama_gdn_ingr_emit_mode() sized the ring
     const size_t  ingr_elemsize   = ggml_element_size(ingr_all);
-    const size_t  ingr_row        = (size_t) hparams.n_embd_s_ingredient(); // elements per slot
+    const size_t  ingr_row        = (size_t) hparams.n_embd_s_ingredient(il); // elements per slot
     const size_t  ring_row        = ingr_row * K;                            // elements per cell
-    const size_t  state_row_bytes = ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
+    const size_t  state_row_bytes = ggml_row_size(ssm_states_all->type, hparams.n_embd_s(il));
     const int32_t ingr_mode       = (int64_t) ingr_row == 4 * S_v * H_v ? 1 : llama_gdn_ingr_emit_mode();
     const int64_t ingr_w          = ggml_gated_delta_net_ingr_width(S_v, g->ne[0], ingr_mode); // per head
     GGML_ASSERT((int64_t) ingr_row == ingr_w * H_v); // the op's per-slot ingredient block
@@ -822,7 +819,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const bool replay_static = inp->replay_w != nullptr; // n >= K, or a short round under LLAMA_GDN_REPLAY_SHORT=1
     ggml_tensor * s_ckpt = nullptr;
     if (!replay_static) {
-        s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
+        s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(il), n_seqs);
         s_ckpt = ggml_reshape_4d(ctx0, s_ckpt, S_v, S_v, H_v, n_seqs);
     }
 
@@ -885,7 +882,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         replay_fold = fold_env && n <= 2 * K;
         if (!replay_fold) {
             ggml_tensor * w      = inp->replay_w;
-            ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, 1, w->nb[0], w->nb[0], w->nb[0] * K, 0);
+            // [TAG_GDN_REPLAY_LANES] a 2-D w ([K, n_seqs]) gives each lane its own mask through the mul's broadcast
+            ggml_tensor * w_slot = ggml_view_4d(ctx0, w, 1, 1, K, w->ne[1], w->nb[0], w->nb[0], w->nb[0] * K, 0);
             auto comp = [&](int64_t ne0, int64_t off) {
                 return ggml_view_4d(ctx0, ring, ne0, H_v, K, n_seqs,
                     ingr_w * ingr_elemsize, ingr_row * ingr_elemsize, ring->nb[1], (size_t) off * ingr_elemsize);
@@ -902,7 +900,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         }
         // the checkpoint rows' own bookkeeping (cleared row, extra states of moved cells), without
         // gathering the ubatch's rows: the getter hands back an empty view
-        ggml_build_forward_expand(gf, build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs,
+        ggml_build_forward_expand(gf, build_rs(inp, ckpt_all, hparams.n_embd_s(il), n_seqs,
             [](ggml_context * ctx, ggml_tensor * states, ggml_tensor *) {
                 return ggml_view_2d(ctx, states, states->ne[0], 0, states->nb[1], 0);
             }));
@@ -996,10 +994,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     ggml_tensor * final_state = ggml_view_2d(ctx0, gdn_out, S_v * H_v, S_v * n_seqs,
         ggml_row_size(gdn_out->type, S_v * H_v),
         (attn_score_elems + ingr_elems_total) * ggml_element_size(gdn_out));
-    ggml_tensor * final_dst = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs,
+    ggml_tensor * final_dst = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(il), n_seqs,
         ssm_states_all->nb[1], (size_t) kv_head * state_row_bytes);
     ggml_build_forward_expand(gf,
-        ggml_cpy(ctx0, ggml_reshape_2d(ctx0, final_state, hparams.n_embd_s(), n_seqs), final_dst));
+        ggml_cpy(ctx0, ggml_reshape_2d(ctx0, final_state, hparams.n_embd_s(il), n_seqs), final_dst));
 
     // the checkpoint for the NEXT decode's replay base.
     //
@@ -1015,10 +1013,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             (attn_score_elems + ingr_elems_total + S_v * S_v * H_v * n_seqs) * ggml_element_size(gdn_out));
     }
     if (ckpt_new != nullptr) {
-        ggml_tensor * ckpt_dst = ggml_view_2d(ctx0, ckpt_all, hparams.n_embd_s(), n_seqs,
+        ggml_tensor * ckpt_dst = ggml_view_2d(ctx0, ckpt_all, hparams.n_embd_s(il), n_seqs,
             ckpt_all->nb[1], (size_t) kv_head * state_row_bytes);
         ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, ggml_reshape_2d(ctx0, ckpt_new, hparams.n_embd_s(), n_seqs), ckpt_dst));
+            ggml_cpy(ctx0, ggml_reshape_2d(ctx0, ckpt_new, hparams.n_embd_s(il), n_seqs), ckpt_dst));
     }
 
     return output;

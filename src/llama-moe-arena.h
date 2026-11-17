@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include "ggml-cpp.h"
 #include "../include/llama.h"
 #include <cstddef>
@@ -66,7 +67,22 @@ void llama_moe_arena_apply_flashnext_defaults();
 struct llama_moe_arena {
     static bool is_expert(const char * name);
     static bool is_trunk_expert(const char * name, uint32_t trunk_layers);
+    // RAM we can really use, in bytes (0 when unknown; 1 when a group limit is reached). The single reader for
+    // every RAM gate: min(MemAvailable, cgroup v2 headroom), where the headroom is the smallest of
+    // limit - memory.current + inactive_file + active_file over our group and all its parents
+    // (limit = min(memory.max, memory.high)). With no group limit it is MemAvailable, as before.
+    // LLAMA_RAM_AVAIL_SOURCE=meminfo skips the group check.
     static size_t available_memory();
+    struct ram_view {
+        uint64_t meminfo   = 0;          // MemAvailable
+        uint64_t cgroup    = UINT64_MAX; // tightest group headroom; UINT64_MAX = no limit found
+        uint64_t available = 0;          // min of the two
+        std::string group;               // the group directory that binds, when one does
+    };
+    // Pure reader behind available_memory(): meminfo_path is a /proc/meminfo, cgroup_root a /sys/fs/cgroup and
+    // cgroup_rel the "0::" path of /proc/self/cgroup ("" skips the group check). Tests pass fake files.
+    static ram_view read_ram_view(const std::string & meminfo_path, const std::string & cgroup_root,
+            const std::string & cgroup_rel);
     // Automatic expert storage owns half the 80% spare-RAM budget above 5 GiB.
     // Explicit arena settings retain the existing pinning admission checks.
     static size_t fit_memory_budget(uint64_t available) {

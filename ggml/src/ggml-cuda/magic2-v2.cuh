@@ -14,7 +14,7 @@ static __device__ __forceinline__ uint32_t level_byte(uint32_t state) {
 
 template<int B, int V, uint32_t C>
 static __device__ __forceinline__ uint32_t fragment(const uint32_t * tile, int row, int half) {
-    static_assert(V == 1 || V == 2, "computed scalar or pair");
+    static_assert(V == 1 || V == 2 || (B == 7 && V == 4), "computed scalar or pair schedule");
     static_assert(4 * B % V == 0 && B * (4 / V - 1) + 16 <= 32, "four weights fit one window");
     constexpr int bits = 128 * B / V, words = tile_words<B, V>;
     int start = B * ((8 * row + 4 * half + 4) / V) - 32;
@@ -24,8 +24,9 @@ static __device__ __forceinline__ uint32_t fragment(const uint32_t * tile, int r
     uint32_t q[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const uint32_t state = (f >> (B * ((3 - j) / V))) & 0xffffu;
-        if constexpr (V == 2) {
+        const int shift = V == 4 ? (j < 2 ? 4 : 0) : B * ((3 - j) / V);
+        const uint32_t state = (f >> shift) & 0xffffu;
+        if constexpr (V == 2 || V == 4) {
             q[j] = (j & 1) ? level_byte<uint32_t(uint64_t(C) * C)>(state) : level_byte<C>(state);
         } else {
             q[j] = level_byte<C>(state);
@@ -41,10 +42,12 @@ static __device__ __forceinline__ void mma(int (&c)[4], const uint32_t (&a)[4], 
 }
 
 // Rotated, quantized activations; per-token scales are indexed by 128-column unit.
-template<int B, int V, uint32_t C, int XSH = 0>
+template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false, int SCALE_CHUNKS = 5>
 static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const int8_t * x,
         const float * xs, float * y, int M, int K, int N) {
     static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
+    static_assert(!ROW_SCALE || (B == 5 && V == 2 && (SCALE_CHUNKS == 5 || SCALE_CHUNKS == 4)) ||
+        (B == 7 && V == 4 && SCALE_CHUNKS == 4), "row-scale pair layout");
     constexpr int UW = unit_bytes<B, V> / 4, TW = tile_words<B, V>;
     __shared__ uint32_t tiles[4][UW];
     __shared__ float partial[4][8][16];
@@ -53,8 +56,18 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
     const int64_t nbase = int64_t(blockIdx.y) * 8, mbase = int64_t(blockIdx.x) * 16;
     float sum[4] = {0, 0, 0, 0};
     for (int u = warp; u < nu; u += 4) {
-        const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (int64_t(blockIdx.x) * nu + u) * UW;
-        for (int i = lane; i < UW; i += 32) tiles[warp][i] = __ldg(source + i);
+        if constexpr (ROW_SCALE) {
+            constexpr int BW = 8 + SCALE_CHUNKS*(UW - 8);
+            const uint32_t * block = reinterpret_cast<const uint32_t *>(weights) +
+                (int64_t(blockIdx.x)*(nu/SCALE_CHUNKS) + u/SCALE_CHUNKS)*BW;
+            const uint32_t * payload = block + 8 + (u%SCALE_CHUNKS)*(UW - 8);
+            for (int i = lane; i < UW; i += 32) {
+                tiles[warp][i] = __ldg(i < 8 ? block + i : payload + i - 8);
+            }
+        } else {
+            const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (int64_t(blockIdx.x) * nu + u) * UW;
+            for (int i = lane; i < UW; i += 32) tiles[warp][i] = __ldg(source + i);
+        }
         __syncwarp();
         int c[4] = {0, 0, 0, 0};
 #pragma unroll
@@ -85,5 +98,82 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
     const int n = threadIdx.x / 16, r = threadIdx.x % 16;
     if (nbase + n < N) y[(nbase + n) * M + mbase + r] =
         (partial[0][n][r] + partial[1][n][r]) + (partial[2][n][r] + partial[3][n][r]);
+}
+
+// [PP27] Prompt widths. mmv decodes a 16-row weight unit once per 8 tokens, so a 1,024-token prompt batch decodes the
+// whole matrix 128 times. mmq is the same unit loop with each block covering S strips of 16 rows and TN = 8 NB tokens:
+// a warp decodes its unit once and runs it against NB 8-token blocks. Every (row, token) output takes exactly the mmv
+// arithmetic: the same exact int32 IMMA sum per unit, the same float scaling, the same split of units over the four
+// warps of a strip (u = warp, warp + 4, ...) and the same (p0 + p1) + (p2 + p3) partial sum, so y is bit-identical
+// to the mmv result. grid (ceil(M/16 / S), ceil(N / TN)), 128 S threads.
+template<int B, int V, uint32_t C, int XSH, int NB, int S>
+static __global__ void __launch_bounds__(128 * S) mmq(const uint8_t * weights, const int8_t * x,
+        const float * xs, float * y, int M, int K, int N) {
+    static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
+    static_assert(S == 1 || S == 2, "one or two 16-row strips per block");
+    constexpr int UW = unit_bytes<B, V> / 4, TW = tile_words<B, V>, TN = 8 * NB;
+    __shared__ uint32_t tiles[S][4][UW];
+    __shared__ float partial[S][4][TN][16];
+    const int lane = threadIdx.x & 31, warp = (threadIdx.x >> 5) & 3, strip = threadIdx.x >> 7;
+    const int row = lane >> 2, col = lane & 3, nu = K / 128;
+    const int64_t ms = int64_t(blockIdx.x) * S + strip, nbase = int64_t(blockIdx.y) * TN;
+    float sum[NB][4];
+#pragma unroll
+    for (int nb = 0; nb < NB; ++nb) {
+        sum[nb][0] = sum[nb][1] = sum[nb][2] = sum[nb][3] = 0;
+    }
+    if (ms < M / 16) {
+        for (int u = warp; u < nu; u += 4) {
+            const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (ms * nu + u) * UW;
+            for (int i = lane; i < UW; i += 32) tiles[strip][warp][i] = __ldg(source + i);
+            __syncwarp();
+            int c[NB][4];
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                c[nb][0] = c[nb][1] = c[nb][2] = c[nb][3] = 0;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t * a0 = tiles[strip][warp] + 8 + (4 * j + (col >> 1)) * TW;
+                const uint32_t * a1 = a0 + 2 * TW;
+                const uint32_t a[4] = {fragment<B,V,C>(a0, row, col & 1), fragment<B,V,C>(a0, row + 8, col & 1),
+                    fragment<B,V,C>(a1, row, col & 1), fragment<B,V,C>(a1, row + 8, col & 1)};
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb) {
+                    const int64_t t = nbase + 8 * nb + row;
+                    uint32_t b0 = 0, b1 = 0;
+                    if (t < N) {
+                        const int8_t * p = x + t * K + int64_t(u) * 128 + j * 32 + col * 4;
+                        b0 = __ldg(reinterpret_cast<const uint32_t *>(p));
+                        b1 = __ldg(reinterpret_cast<const uint32_t *>(p + 16));
+                    }
+                    mma(c[nb], a, b0, b1);
+                }
+            }
+            const __half * scales = reinterpret_cast<const __half *>(tiles[strip][warp]);
+            const float d0 = __half2float(scales[row]), d1 = __half2float(scales[row + 8]);
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                const int64_t t = nbase + 8 * nb + 2 * col;
+                const float s0 = t < N ? xs[t * (nu >> XSH) + (u >> XSH)] : 0;
+                const float s1 = t + 1 < N ? xs[(t + 1) * (nu >> XSH) + (u >> XSH)] : 0;
+                sum[nb][0] += c[nb][0] * d0 * s0; sum[nb][1] += c[nb][1] * d0 * s1;
+                sum[nb][2] += c[nb][2] * d1 * s0; sum[nb][3] += c[nb][3] * d1 * s1;
+            }
+            __syncwarp();
+        }
+    }
+#pragma unroll
+    for (int nb = 0; nb < NB; ++nb) {
+        partial[strip][warp][8 * nb + 2 * col][row] = sum[nb][0]; partial[strip][warp][8 * nb + 2 * col + 1][row] = sum[nb][1];
+        partial[strip][warp][8 * nb + 2 * col][row + 8] = sum[nb][2]; partial[strip][warp][8 * nb + 2 * col + 1][row + 8] = sum[nb][3];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < S * TN * 16; i += 128 * S) {
+        const int s = i / (TN * 16), n = (i / 16) % TN, r = i % 16;
+        const int64_t m = (int64_t(blockIdx.x) * S + s) * 16 + r, t = nbase + n;
+        if (m < M && t < N) y[t * M + m] =
+            (partial[s][0][n][r] + partial[s][1][n][r]) + (partial[s][2][n][r] + partial[s][3][n][r]);
+    }
 }
 }

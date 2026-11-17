@@ -305,14 +305,106 @@ bool llama_moe_arena::is_trunk_expert(const char * name, uint32_t trunk_layers) 
             layer >= 0 && (uint32_t) layer < trunk_layers;
 }
 
+// The "<key> <number>" lines of a meminfo / memory.stat style file, in one pass: out[i] is set for each key found.
+// Returns how many keys were found.
+static int ram_file_keys(const std::string & path, const char * const * keys, uint64_t * out, int n_keys) {
+    std::ifstream input(path);
+    std::string line;
+    int found = 0;
+    while (found < n_keys && std::getline(input, line)) {
+        for (int i = 0; i < n_keys; ++i) {
+            const size_t n = strlen(keys[i]);
+            if (line.compare(0, n, keys[i]) == 0 && line.size() > n && (line[n] == ' ' || line[n] == '\t')) {
+                char * end = nullptr;
+                const char * p = line.c_str() + n;
+                const unsigned long long v = strtoull(p, &end, 10);
+                if (end != p) { out[i] = v; ++found; }
+                break;
+            }
+        }
+    }
+    return found;
+}
+
+// A single-number cgroup file. "max" (no limit) and a missing file both give false.
+static bool ram_file_value(const std::string & path, uint64_t & out) {
+    std::ifstream input(path);
+    std::string word;
+    if (!(input >> word) || word.empty() || word[0] < '0' || word[0] > '9') { return false; }
+    out = strtoull(word.c_str(), nullptr, 10);
+    return true;
+}
+
+llama_moe_arena::ram_view llama_moe_arena::read_ram_view(const std::string & meminfo_path,
+        const std::string & cgroup_root, const std::string & cgroup_rel) {
+    ram_view view;
+    static const char * const mem_keys[] = { "MemAvailable:" };
+    uint64_t kib = 0;
+    if (ram_file_keys(meminfo_path, mem_keys, &kib, 1) != 1 || kib > UINT64_MAX / 1024) { return view; }
+    view.meminfo = kib * 1024;
+    // Walk from our group up to the root: a parent limit binds its children, and MemAvailable sees none of them.
+    std::string rel = cgroup_rel;
+    while (!rel.empty() && rel[0] == '/') {
+        const std::string dir = cgroup_root + (rel == "/" ? "" : rel);
+        uint64_t limit = UINT64_MAX, high = 0, current = 0;
+        ram_file_value(dir + "/memory.max", limit); // "max" or no file leaves UINT64_MAX
+        if (ram_file_value(dir + "/memory.high", high) && high < limit) { limit = high; }
+        if (limit != UINT64_MAX && ram_file_value(dir + "/memory.current", current)) {
+            // The group's file LRU (active + inactive) is page cache the kernel reclaims at the limit, as MemAvailable
+            // assumes system-wide. shmem sits on the anon LRU in cgroup v2 and mlocked pages on unevictable, so both
+            // stay counted as used.
+            static const char * const stat_keys[] = { "inactive_file", "active_file" };
+            uint64_t file[2] = { 0, 0 };
+            ram_file_keys(dir + "/memory.stat", stat_keys, file, 2);
+            const uint64_t cache = file[0] + file[1];
+            const uint64_t used = current > cache ? current - cache : 0;
+            const uint64_t room = limit > used ? limit - used : 0;
+            if (room < view.cgroup) { view.cgroup = room; view.group = dir; }
+        }
+        if (rel == "/") { break; }
+        const size_t cut = rel.find_last_of('/');
+        rel = cut == 0 ? "/" : rel.substr(0, cut);
+    }
+    view.available = std::min(view.meminfo, view.cgroup);
+    if (view.cgroup >= view.meminfo) { view.group.clear(); }
+    return view;
+}
+
 size_t llama_moe_arena::available_memory() {
 #ifdef __linux__
-    std::ifstream input("/proc/meminfo");
-    std::string key, unit;
-    size_t kib;
-    while (input >> key >> kib >> unit) {
-        if (key == "MemAvailable:" && kib <= SIZE_MAX / 1024) { return kib * 1024; }
+    // The group path cannot change under us without a restart of the unit: read it once. A path that is gone or not
+    // under /sys/fs/cgroup (no cgroup namespace in a container) has no limit files, which reads as no limit: today's
+    // behavior.
+    static const std::string rel = [] {
+        const char * source = getenv("LLAMA_RAM_AVAIL_SOURCE");
+        if (source && strcmp(source, "meminfo") == 0) { return std::string(); }
+        std::ifstream input("/proc/self/cgroup");
+        std::string line;
+        while (std::getline(input, line)) {
+            if (line.compare(0, 3, "0::") == 0) {
+                std::string path = line.substr(3);
+                const std::string deleted = " (deleted)";
+                if (path.size() > deleted.size() && path.compare(path.size() - deleted.size(), deleted.size(), deleted) == 0) {
+                    path.resize(path.size() - deleted.size());
+                }
+                return path;
+            }
+        }
+        return std::string(); // cgroup v1 or none: MemAvailable only, as before
+    }();
+    const ram_view view = read_ram_view("/proc/meminfo", "/sys/fs/cgroup", rel);
+    // Say it once, the first time the group limit is the tighter figure: from then on every RAM gate may decide
+    // differently from what MemAvailable alone would give.
+    static std::atomic<bool> said { false };
+    if (!view.group.empty() && !said.exchange(true)) {
+        LLAMA_LOG_WARN("%s: [RAM] usable RAM is %.1f GiB, not MemAvailable %.1f GiB: cgroup limit in %s "
+                "(LLAMA_RAM_AVAIL_SOURCE=meminfo ignores the group)\n", __func__,
+                view.available / double(1ull << 30), view.meminfo / double(1ull << 30), view.group.c_str());
     }
+    // 0 means "unknown" to the callers. A group at or over its limit is known and exhausted, so it reports 1 byte and
+    // every RAM gate refuses instead of turning itself off.
+    if (view.meminfo > 0 && view.available == 0) { return 1; }
+    return view.available > SIZE_MAX ? SIZE_MAX : (size_t) view.available;
 #elif defined(_WIN32)
     // Windows has no /proc/meminfo: without this every RAM-fit / prefetch budget sees 0 bytes available, so
     // read-ahead is disabled and cold expert pages fault in one by one. ullAvailPhys counts free + standby,
@@ -320,8 +412,10 @@ size_t llama_moe_arena::available_memory() {
     MEMORYSTATUSEX st;
     st.dwLength = sizeof(st);
     if (GlobalMemoryStatusEx(&st)) { return (size_t) st.ullAvailPhys; }
-#endif
     return 0;
+#else
+    return 0;
+#endif
 }
 
 static ggml_backend_reg_t arena_cuda_reg() {
