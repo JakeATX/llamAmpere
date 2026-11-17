@@ -1,5 +1,9 @@
 # Preset checks before release
 
+Current owner order (2026-11-17T04:48Z): 8dense is headless-only, with 204800 configured context and 500 MiB free. `8dense headed` notes this and uses the same defaults. Headed 10dense uses 180224 context; headed 12dense uses 196608 with CUDA graphs off. Headless 10/12 retain 212992/262144; 12dense headless full-context fit is unverified. Explicit CLI flags and shell environment retain precedence. Sources: common/preset.cpp and the SMALLUB real-card results in V07/PRESETS/SOL_HANDOFF.md; owner COORD-bc. Re-check / update every preset against final 0.7 measurements before ship.
+
+Owner ruling 2026-11-17T05:24Z cancels the small-card RM24H change and its smoke test. All small presets retain auto:65536, explicit q8_0 draft K/V and their existing draft windows to preserve memory fit. RM24H needs full-context draft KV, estimated to add at least 150 MiB at 204800, beyond the measured small-card margins. The 24dense profile is unchanged. No speed or final fit claim.
+
 Each preset needs validation on the final combined build with its matching model and sidecar files. Historical results do not validate a new build.
 
 | Preset | Required checks |

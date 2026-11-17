@@ -891,6 +891,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     std::set<const common_arg *> explicit_options;
     std::string card_name = params.card_preset;
     int card_selectors = 0;
+    bool card_headless = false;
+    bool card_headed = false;
     for (int i = 1; i < argc; ++i) {
         std::string key = argv[i];
         if (key.compare(0, 2, "--") == 0) {
@@ -916,19 +918,37 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument("expected second value for argument " + key);
             }
         }
-        if (key == "--preset" || key == "24dense" || key == "12dense" || key == "10dense" || key == "8dense") {
+        if (key == "headless") {
+            card_headless = true;
+        } else if (key == "headed") {
+            card_headed = true;
+        }
+        const std::string card_key = string_ends_with(key, "-headless") ? key.substr(0, key.size() - 9) : key;
+        if (key == "--preset" || card_key == "24dense" || card_key == "12dense" ||
+            card_key == "10dense" || card_key == "8dense") {
             if (++card_selectors > 1) {
                 throw std::invalid_argument("select only one card preset");
             }
             card_name = key == "--preset" ? value : key;
         }
     }
+    if ((card_headless || card_headed) && card_name.empty()) {
+        throw std::invalid_argument("headed/headless requires a card preset");
+    }
+    card_headless = card_headless || string_ends_with(card_name, "-headless");
+    if (card_headless && card_headed) {
+        throw std::invalid_argument("select only one headed/headless mode");
+    }
     if (!card_name.empty()) {
-        const auto & card = common_card_preset_get(card_name);
+        const auto & card = common_card_preset_get(card_name, card_headless);
+        if (card.name == "8dense" && card_headed) {
+            LOG_INF("8dense is headless-only; using the same 500 MiB margin and 204800 context defaults\n");
+        }
         if (!card.pending.empty()) {
             throw std::invalid_argument(card.pending);
         }
         params.card_preset = card.name;
+        params.card_preset_headless = card_headless || card.name == "8dense";
         params.card_preset_flags.clear();
         common_preset defaults;
         auto is_explicit = [&](const std::string & key) {
@@ -939,6 +959,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             const auto * opt = found->second.first;
             return explicit_options.count(opt) || opt->has_value_from_env();
         };
+        params.card_preset_ctx_default = !is_explicit("--ctx-size") &&
+                !is_explicit("--slot-ctx") && !is_explicit("--kv-unified-per-slot");
+        if (!is_explicit("--fit-target")) {
+            const std::string margin = std::to_string(card_headless ? card.fit_margin_headless_mib : card.fit_margin_mib);
+            defaults.options[*arg_to_options.at("--fit-target").first] = margin;
+            params.card_preset_flags += " --fit-target " + margin;
+        }
         params.card_preset_kv_default = !is_explicit("--cache-type-k") && !is_explicit("--cache-type-v") &&
                 !is_explicit("--sjkvarn-body-type");
         for (const auto & kv : card.options) {
@@ -5756,23 +5783,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     // presets
 
+    add_opt(common_arg({"headed", "headless"}, "card preset mode: headed leaves 1024 MiB free; headless leaves 500 MiB (8dense is headless-only)",
+        [](common_params &) {}
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
     add_opt(common_arg(
         {"--preset"}, "24dense|12dense|10dense|8dense",
-        "dense 27B card profile (best known/recheck before ship); explicit flags override profile values in either order",
+        "dense 27B card profile; append headless or -headless for a 500 MiB margin (default: 1024; 8dense: always 500); explicit flags override",
         [](common_params & params, const std::string & value) {
             params.card_preset = common_card_preset_get(value).name;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"24dense"}, "alias for --preset 24dense",
+    add_opt(common_arg({"24dense", "24dense-headless"}, "alias for --preset 24dense",
         [](common_params & params) { params.card_preset = "24dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"12dense"}, "alias for --preset 12dense (best known/recheck before ship; one slot)",
+    add_opt(common_arg({"12dense", "12dense-headless"}, "alias for --preset 12dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "12dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"10dense"}, "alias for --preset 10dense (best known/recheck before ship; one slot)",
+    add_opt(common_arg({"10dense", "10dense-headless"}, "alias for --preset 10dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "10dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"8dense"}, "alias for --preset 8dense (best known/recheck before ship; one slot)",
+    add_opt(common_arg({"8dense", "8dense-headless"}, "alias for --preset 8dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "8dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

@@ -68,7 +68,9 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ### Quick start: pick your card
 
-Card profiles target dense Swift 1.5 Qwen 27B. Choose the matching model file and use one profile:
+Card presets assume a display is attached and reserve 1,024 MiB of GPU memory, except 8dense, which is headless-only and reserves 500 MiB. `8dense headed` prints a note and uses the same headless settings. Append `headless` (`--preset 12dense headless`) or use `12dense-headless` for a 500 MiB margin on 10dense, 12dense, and 24dense. Headed defaults are 180,224 tokens for 10dense and 196,608 for 12dense, with CUDA graphs off for headed 12dense. Headless defaults remain 212,992 for 10dense, 262,144 for 12dense, and 204,800 for 8dense; full-context headless 12dense fit is unverified. Fitting is on: the dynamic microbatch ladder remains enabled, and fitting may reduce a preset context to honor the margin. An explicit `-c`, `-fitt`, or `-fit` wins in either order. Startup reports the chosen context. Small cards still support one user only; multi-user support is future work. Re-check / update every preset against final 0.7 measurements before ship.
+
+Card profiles target dense Swift 1.5 Qwen 27B. All four set sampler defaults to temperature 1.0, top-k 20, top-p 0.95, and min-p 0; explicit CLI flags and per-request sampler fields override them. The 8dense profile disables mb-MTP by default; add `--spec-mb-mtp` to enable it. The other three profiles keep mb-MTP on with MTP. Choose the matching model file and use one profile:
 
 ```bash
 llama-server --preset 24dense -m /path/to/P76-AI4.gguf
