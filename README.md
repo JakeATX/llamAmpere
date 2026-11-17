@@ -4,6 +4,14 @@ llamAmpere is based on mainline llama.cpp (v1.0), tuned for NVIDIA RTX 30-series
 
 It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model writes faster) and Qwen3.8 Flash-Next.
 
+## What's new in v0.7
+
+- Built on mainline llama.cpp v1.0, with card presets for Swift 1.5 Qwen3.8-27B: `--preset 24dense`, `12dense`, `10dense` and `8dense` pick the context length, memory settings and sampling for each card size. The 24 GB, 12 GB and 10 GB models ship with this release; the 8 GB model file comes in v0.7.1. [Release notes](docs/llamampere-v0.7/RELEASE_NOTES.md).
+
+## What's new in v0.6.4
+
+- Fix: Flash-Next ran out of memory or stalled on machines with two or more NVIDIA cards, or on a card that another program was already using (#96). v0.6.4 runs Flash-Next on one card, the one with the most free memory (`--device` picks another); splitting it across two cards is not supported yet. On a busy card with less than 8 GiB free, the launcher uses the memory planner, which runs but is slow. One idle card: unchanged. [Release notes](docs/llamampere-v0.6.4/RELEASE_NOTES.md).
+
 ## What's new in v0.6.3.11
 
 - Fix: faster first token on short follow-up messages (up to 256 new tokens) after a long first message, on Flash-Next. Longer follow-ups are unchanged. [Release notes](docs/llamampere-v0.6.3.11/RELEASE_NOTES.md).
@@ -136,7 +144,7 @@ Numbers for this release (Swift 1.5 27B, v0.6 against v0.5) are in the [v0.6 rel
 
 ## Links
 
-- Release notes: [v0.6.4](docs/llamampere-v0.6.4/RELEASE_NOTES.md), [v0.6.3.11](docs/llamampere-v0.6.3.11/RELEASE_NOTES.md), [v0.6.3.10](docs/llamampere-v0.6.3.10/RELEASE_NOTES.md), [v0.6.3.9](docs/llamampere-v0.6.3.9/RELEASE_NOTES.md), [v0.6.3.8](docs/llamampere-v0.6.3.8/RELEASE_NOTES.md), [v0.6.3.6](docs/llamampere-v0.6.3.6/RELEASE_NOTES.md), [v0.6.3.5](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md), [v0.6.3.3](docs/llamampere-v0.6.3.3/RELEASE_NOTES.md), [v0.6.3.2](docs/llamampere-v0.6.3.2/RELEASE_NOTES.md), [v0.6.3.1](docs/llamampere-v0.6.3.1/RELEASE_NOTES.md), [v0.6.3](docs/llamampere-v0.6.3/RELEASE_NOTES.md), [v0.6.2](docs/llamampere-v0.6.2/RELEASE_NOTES.md), [v0.6.1](docs/llamampere-v0.6.1/RELEASE_NOTES.md), [v0.6](docs/llamampere-v0.6/RELEASE_NOTES.md), [v0.5](docs/llamampere-v0.5/RELEASE_NOTES.md), [v0.4](docs/llamampere-v0.4/RELEASE_NOTES.md), [v0.3.1](docs/llamampere-v0.3.1/RELEASE_NOTES.md); recommended settings for each card size: [v0.5 RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md)
+- Release notes: [v0.7](docs/llamampere-v0.7/RELEASE_NOTES.md), [v0.6.4](docs/llamampere-v0.6.4/RELEASE_NOTES.md), [v0.6.3.11](docs/llamampere-v0.6.3.11/RELEASE_NOTES.md), [v0.6.3.10](docs/llamampere-v0.6.3.10/RELEASE_NOTES.md), [v0.6.3.9](docs/llamampere-v0.6.3.9/RELEASE_NOTES.md), [v0.6.3.8](docs/llamampere-v0.6.3.8/RELEASE_NOTES.md), [v0.6.3.6](docs/llamampere-v0.6.3.6/RELEASE_NOTES.md), [v0.6.3.5](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md), [v0.6.3.3](docs/llamampere-v0.6.3.3/RELEASE_NOTES.md), [v0.6.3.2](docs/llamampere-v0.6.3.2/RELEASE_NOTES.md), [v0.6.3.1](docs/llamampere-v0.6.3.1/RELEASE_NOTES.md), [v0.6.3](docs/llamampere-v0.6.3/RELEASE_NOTES.md), [v0.6.2](docs/llamampere-v0.6.2/RELEASE_NOTES.md), [v0.6.1](docs/llamampere-v0.6.1/RELEASE_NOTES.md), [v0.6](docs/llamampere-v0.6/RELEASE_NOTES.md), [v0.5](docs/llamampere-v0.5/RELEASE_NOTES.md), [v0.4](docs/llamampere-v0.4/RELEASE_NOTES.md), [v0.3.1](docs/llamampere-v0.3.1/RELEASE_NOTES.md); recommended settings for each card size: [v0.5 RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md)
 - Models: [huggingface.co/jakeatx](https://huggingface.co/jakeatx), [Qwen3.8 Flash-Next collection](https://huggingface.co/collections/jakeatx/qwen38-flash-next-6ae148b9e743c8905b00c70d)
 - Background: [QWEN_AMPERE.md](QWEN_AMPERE.md), [write-up](docs/llamampere-v0.3/ARTICLE.md), flags in [docs/speculative.md](docs/speculative.md) and [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md)
 - SJ-KVaRN paper: [paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper), codec [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT)
