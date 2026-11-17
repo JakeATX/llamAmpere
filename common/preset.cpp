@@ -12,8 +12,9 @@
 // fork: runtime card profiles. Values stay here so each QC change has one table to update.
 const common_card_preset & common_card_preset_get(const std::string & name) {
     static const std::vector<common_card_preset> profiles = [] {
+        // Timed ub QC: V07/ASYMCTX/QC_READY_asymctx_24gb.md; ceiling stays bounded by -ub.
         common_card_preset large {
-            "24dense", "2026-11-16.5", "best known/recheck before ship", "", {
+            "24dense", "2026-11-17.1", "best known/recheck before ship", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -22,12 +23,13 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 {"--spec-draft-p-min", "0"}, {"--spec-draft-window", "4096"},
                 {"--spec-draft-vocab-map", "auto"}, {"--gdn-replay", "1"}, {"--kv-unified", "1"}
             }, {
-                {"LLAMA_GDN_REPLAY_LANES", "1"}
+                {"LLAMA_GDN_REPLAY_LANES", "1"}, {"LLAMA_DEEPCTX_LADDER", "1"}
             }
         };
-        // Small-card profiles keep packed masks, static microbatches and one sequence.
+        // Small-card profiles keep packed masks and one sequence.
+        // TODO: multi-user for small cards (future).
         common_card_preset small {
-            "10dense", "2026-11-16.5", "best known/recheck before ship", "", {
+            "10dense", "2026-11-17.1", "best known/recheck before ship", "", {
                 {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "off"}, {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -42,6 +44,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 {"--sjkvarn-staging-type", "tq6_0"}, {"--sjkvarn-tail", "4096"},
                 {"--sjkvarn-tail-max", "8192"}
             }, {
+                {"LLAMA_DEEPCTX_LADDER", "1"},
                 {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "1"}, {"LLAMA_KQ_MASK_PACKED", "1"},
                 {"LLAMA_DRAFT_VOCAB_COMPACT", "0"}, {"LLAMA_LSA_MODE", "key"},
                 {"LLAMA_LSA_MAP", "@model/lsa-qwen38-27b-d2048.gguf"},
@@ -66,7 +69,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
             }
         }
         common_card_preset tiny {
-            "8dense", "2026-11-16.6", "best known/recheck before ship", "", {
+            "8dense", "2026-11-17.1", "best known/recheck before ship", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "off"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
@@ -79,6 +82,7 @@ const common_card_preset & common_card_preset_get(const std::string & name) {
                 {"--spec-draft-vocab-map", "auto:65536"},
                 {"--spec-draft-type-k", "q8_0"}, {"--spec-draft-type-v", "q8_0"}
             }, {
+                {"LLAMA_DEEPCTX_LADDER", "1"},
                 {"LLAMA_LSA_MODE", "key"}, {"LLAMA_LSA_MAP", "@model/lsa-qwen38-27b-d2048.gguf"},
                 {"LLAMA_LSA_KEEP", "16384"}, {"LLAMA_LSA_SHARED", "3"},
                 {"LLAMA_LSA_IDX_CACHE", "1"}, {"LLAMA_LSA_PACKED", "1"},

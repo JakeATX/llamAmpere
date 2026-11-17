@@ -382,7 +382,7 @@ static void test(void) {
 
         std::set<std::string> env_keys;
         std::map<std::string, std::string> saved_env;
-        for (const auto & name : {"24dense", "10dense", "8dense"}) {
+        for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
             for (const auto & entry : common_card_preset_get(name).env) {
                 env_keys.insert(entry.first);
             }
@@ -395,6 +395,18 @@ static void test(void) {
         }
         common_params no_preset;
         assert(common_card_preset_apply_env(no_preset).empty());
+        for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
+            common_params dynamic;
+            assert(parse_card({"--preset", name}, dynamic));
+            const auto enabled = common_card_preset_apply_env(dynamic);
+            assert(enabled.find(" LLAMA_DEEPCTX_LADDER=1") != std::string::npos);
+            setenv("LLAMA_DEEPCTX_LADDER", "0", 1);
+            const auto disabled = common_card_preset_apply_env(dynamic);
+            assert(disabled.find(" LLAMA_DEEPCTX_LADDER=0") != std::string::npos);
+            for (const auto & key : env_keys) {
+                unsetenv(key.c_str());
+            }
+        }
         common_params small_env;
         assert(parse_card({"--preset", "10dense", "-m", "/models/public-AI2.gguf"}, small_env));
         setenv("LLAMA_LSA_RESIDENT_MIB", "123", 1);
