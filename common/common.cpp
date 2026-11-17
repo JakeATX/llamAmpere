@@ -1469,6 +1469,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             /*.shares_compute =*/ spec_mtp && shared_compute,
         };
 
+        bool fit_margins_verified = false;
         const common_params_fit_status fit_status = common_fit_params(
             params.model.get_paths(), &mparams, &cparams,
             params.tensor_split,
@@ -1478,7 +1479,8 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
-            verify_compact_fit_safe);
+            &fit_margins_verified, params.card_preset_ctx_default ? cparams.n_ctx : 0);
+        *verify_compact_fit_safe = fit_margins_verified;
         // fork: compact verify also needs every margin to cover the detected display or headless floor
         for (size_t target : fit_targets) {
             *verify_compact_fit_safe = *verify_compact_fit_safe && target >= vram_floor;
@@ -1490,6 +1492,9 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         if (fit_status == COMMON_PARAMS_FIT_STATUS_NO_ROOM) {
             throw std::runtime_error(
                 "not enough device memory for these settings, even with every layer in system memory (see the fit message above)");
+        }
+        if (!params.card_preset.empty() && (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || !fit_margins_verified)) {
+            throw std::runtime_error("card preset fit could not prove the memory margin; adjust -c/-ub or use -fit off");
         }
         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");
@@ -1534,6 +1539,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     bool verify_compact_fit_safe = false;
 
     common_fit_apply(params, mparams, cparams, &verify_compact_fit_safe);
+    if (!params.card_preset.empty()) {
+        params.n_ctx = cparams.n_ctx;
+        LOG_INF("card preset %s: chosen context %u, ubatch %u; fit margin %zu MiB\n",
+                params.card_preset.c_str(), cparams.n_ctx, cparams.n_ubatch, params.fit_params_target.front() >> 20);
+    }
 
     if (!verify_compact_fit_safe) {
         // fork: a smaller requested margin or an unproven fit cannot enable compact verification.

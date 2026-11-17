@@ -256,6 +256,55 @@ static void test(void) {
             args.insert(args.begin(), "test-arg-parser");
             return common_params_parse(args.size(), list_str_to_char(args).data(), out, ex);
         };
+        for (const std::string name : {"24dense", "12dense", "10dense", "8dense"}) {
+            for (const auto & args : std::vector<std::vector<std::string>>{
+                    {"--preset", name}, {name}, {"--preset", name, "headless"},
+                    {name, "headless"}, {name + "-headless"}, {"--preset", name + "-headless"},
+                    {name, "headed"}, {"--preset", name, "headed"}}) {
+                common_params selected;
+                assert(parse_card(args, selected));
+                const bool headless = name == "8dense" || args.back() == "headless" || string_ends_with(args.back(), "-headless");
+                assert(selected.card_preset == name && selected.card_preset_ctx_default && selected.fit_params);
+                assert(selected.card_preset_headless == headless);
+                const int expected_ctx = name == "8dense" ? 204800 : name == "10dense" ?
+                        (headless ? 212992 : 180224) : name == "12dense" ? (headless ? 262144 : 196608) : 262144;
+                assert(selected.n_ctx == expected_ctx);
+                if (name != "24dense") {
+                    assert(selected.speculative.draft.vocab_map == "auto:65536");
+                    assert(selected.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP);
+                }
+                assert(selected.fit_params_target_explicit);
+                assert(selected.sampling.temp == 1.0f && selected.sampling.top_k == 20);
+                assert(selected.sampling.top_p == 0.95f && selected.sampling.min_p == 0.0f);
+                assert(selected.sampling.spec_lossy == (name != "8dense"));
+                for (size_t target : selected.fit_params_target) {
+                    assert(target == size_t(headless ? 500 : 1024) * 1024 * 1024);
+                }
+                for (bool preset_first : {false, true}) {
+                    std::vector<std::string> combined = {"-c", "8192", "-fitt", "768", "-fit", "off",
+                            "--temperature", "0.7", "--top-k", "32", "--top-p", "0.9", "--min-p", "0.1", "--spec-mb-mtp",
+                            "--spec-draft-vocab-map", "none"};
+                    combined.insert(preset_first ? combined.begin() : combined.end(), args.begin(), args.end());
+                    common_params overridden;
+                    assert(parse_card(combined, overridden));
+                    assert(overridden.n_ctx == 8192 && !overridden.card_preset_ctx_default && !overridden.fit_params);
+                    assert(overridden.fit_params_target.front() == size_t(768) * 1024 * 1024);
+                    assert(overridden.sampling.temp == 0.7f && overridden.sampling.top_k == 32);
+                    assert(overridden.sampling.top_p == 0.9f && overridden.sampling.min_p == 0.1f);
+                    assert(overridden.sampling.spec_lossy);
+                    assert(overridden.speculative.draft.vocab_map == "none");
+                }
+            }
+        }
+        common_params no_card;
+        assert(!parse_card({"headless"}, no_card));
+        assert(!parse_card({"headed"}, no_card));
+        common_params cli_headless;
+        assert(parse_card({"8dense-headless", "-m", "model_file.gguf"}, cli_headless, LLAMA_EXAMPLE_CLI));
+        assert(cli_headless.fit_params_target.front() == size_t(500) * 1024 * 1024);
+        common_params full_context;
+        assert(parse_card({"--preset", "8dense", "-c", "0"}, full_context));
+        assert(full_context.n_ctx == 0 && !full_context.card_preset_ctx_default);
         for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
             common_params selected;
             assert(parse_card({"--preset", name}, selected));
@@ -341,7 +390,7 @@ static void test(void) {
         common_params per_slot;
         assert(parse_card({"--kv-unified-per-slot", "65536", "--preset", "24dense", "-np", "4"}, per_slot));
         assert(per_slot.n_ctx == 0 && per_slot.kv_unified_per_slot == 65536);
-        for (const auto & literal : {"24dense", "--preset", "8dense"}) {
+        for (const auto & literal : {"24dense", "--preset", "8dense", "headless", "headed"}) {
             common_params prompt;
             assert(parse_card({"-m", "model_file.gguf", "-p", literal}, prompt, LLAMA_EXAMPLE_CLI));
             assert(prompt.prompt == literal && prompt.card_preset.empty());
@@ -395,6 +444,16 @@ static void test(void) {
         }
         common_params no_preset;
         assert(common_card_preset_apply_env(no_preset).empty());
+        for (bool headless : {false, true}) {
+            common_params medium_env;
+            assert(parse_card({"12dense", headless ? "headless" : "headed"}, medium_env));
+            common_card_preset_apply_env(medium_env);
+            assert((std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) == headless);
+            assert(std::string(std::getenv("GGML_CUDA_GRAPH_MAX_ROWS")) == "16");
+            for (const auto & key : env_keys) {
+                unsetenv(key.c_str());
+            }
+        }
         for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
             common_params dynamic;
             assert(parse_card({"--preset", name}, dynamic));

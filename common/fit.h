@@ -155,7 +155,7 @@ common_fit_extra_memory common_fit_extra_memory_at(
 //   - returns true if the parameters could be successfully modified to fit device memory
 //   - this function is NOT thread safe because it modifies the global llama logger state
 //   - only parameters that have the same value as in llama_default_model_params are modified
-//     with the exception of the context size which is modified if and only if equal to 0
+//     with the exception of the context size which may be reduced when unset or bounded by n_ctx_preset_max
 common_params_fit_status common_fit_params(
      const std::vector<std::string> & paths_model,
                  llama_model_params * mparams,
@@ -167,7 +167,8 @@ common_params_fit_status common_fit_params(
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
-                               bool * margins_verified = nullptr);
+                               bool * margins_verified = nullptr,
+                           uint32_t   n_ctx_preset_max = 0);
 
 // print estimated memory to stdout
 void common_fit_print(

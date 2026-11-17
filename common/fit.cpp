@@ -847,7 +847,7 @@ static void common_params_fit_impl(
         const std::vector<std::string> & paths_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min,
-        const common_fit_extra_model * extra, enum ggml_log_level log_level, bool * margins_verified) {
+        const common_fit_extra_model * extra, enum ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -869,7 +869,7 @@ static void common_params_fit_impl(
     // with non-unified kv, we need to take into account n_streams
     // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
-    const bool     n_ctx_auto = cparams->n_ctx == 0;
+    const bool     n_ctx_auto = cparams->n_ctx == 0 || n_ctx_preset_max != 0;
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
@@ -991,8 +991,13 @@ static void common_params_fit_impl(
                 headroom.push_back(final_memory[id].free - int64_t(final_memory[id].mb.total()));
                 targets.push_back(margins_s[id]);
             }
-            if (!common_fit_verify_compact_safe(extra_complete, headroom, targets)) {
+            if (!extra_complete) {
                 return;
+            }
+            for (size_t id = 0; id < devs.size(); id++) {
+                if (headroom[id] < targets[id]) {
+                    return;
+                }
             }
             if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF && !final_tensors.empty() &&
                 !common_moe_cache_evaluate_fit(moe_cache, final_tensors, devs, final_memory, targets).feasible) {
@@ -1011,7 +1016,7 @@ static void common_params_fit_impl(
             paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level, &moe_tensors);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
-    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
+    const uint32_t n_ctx_max       = n_ctx_preset_max ? n_ctx_preset_max : (uint32_t) std::min<uint64_t>(uint64_t(hp_nct) * n_streams, UINT32_MAX);
     const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
 
     // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
@@ -2004,14 +2009,14 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
-        ggml_log_level log_level, bool * margins_verified) {
+        ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max) {
     const int64_t t0_us = llama_time_us();
     if (margins_verified) {
         *margins_verified = false;
     }
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level, margins_verified);
+        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level, margins_verified, n_ctx_preset_max);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_no_room & e) {
         LOG_ERR("%s: no placement fits in device memory: %s\n", __func__, e.what());
