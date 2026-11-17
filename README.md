@@ -144,6 +144,10 @@ Numbers for this release (Swift 1.5 27B, v0.6 against v0.5) are in the [v0.6 rel
 
 llamAmpere is MIT licensed (see [LICENSE](LICENSE)) and is based on mainline [llama.cpp](https://github.com/ggml-org/llama.cpp) by the ggml authors. It includes TheTom's TurboQuant KV-cache work and contributions from that fork. Original authors and license headers are retained. It is the successor of [llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere). See [CREDITS.md](CREDITS.md) for contribution links. Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
+Our attention selector is derived from Distilled Latent Sparse Attention (D-LSA), introduced by Ales Kubicek and colleagues in [Latent Sparse Attention: Towards Subquadratic Ultra-Long Context Attention](https://arxiv.org/abs/2610.42147v2). The paper projects queries and keys into a learned index space, groups keys by similarity, searches group summaries, and applies attention to the selected original keys plus a local window and sink tokens. We use the authors' [released Qwen d2048 projection map](https://github.com/Prefrontal-AI/latent-sparse-attention/releases/tag/d-lsa-weights-v1). Our implementation adapts this approach with fixed blocks of 128 or 16 tokens, finer selection, and host KV offload; these are our adaptations, rather than a reproduction of the paper's semantic clustering or tree search. Attention on selected keys uses the stored KV representation; selection, KV quantization, and compensation still introduce approximation. The map's actual index width is 64; d2048 is its release name.
+
+See the [published evaluation](https://huggingface.co/datasets/jakeatx/long-context-lsa-qsa-evaluation) and [measured quality and limits](docs/KV-cache-quantization.md#lsa-attribution-and-measured-quality).
+
 Third-party libraries (from upstream llama.cpp):
 
 
