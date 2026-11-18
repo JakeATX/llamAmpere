@@ -171,6 +171,7 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-gdn-replay-lanes.cpp) # [TAG_GDN_REPLAY_LANES] joint vs split replay; needs a GDN model (-m)
+llama_build(test-dspine-rollback.cpp)
 llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 llama_build(test-peer-experts.cpp LINK ggml) # GGML_PEER_EXPERTS transport; needs a CUDA device (same device twice is fine)
@@ -374,6 +375,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-gdn-replay-lanes-short PROPERTIES
         FIXTURES_REQUIRED generate-models
         ENVIRONMENT "LLAMA_GDN_REPLAY_SHORT=1"
+    )
+
+    # [DSPINE-V07] 16-row verify rounds rolled back to every depth, ring and gdn_replay layouts
+    llama_test(
+        test-dspine-rollback
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-dspine-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
     )
 
     # the -fit probe (no_alloc) must size the recurrent state without allocating it
@@ -601,6 +612,8 @@ llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 llama_build_and_test(test-speculative-adaptive.cpp)
 llama_build_and_test(test-speculative-copy.cpp)
+# [DSPINE-V07] lattice walk, verify-length planner, p/q exactness at T=1 (pure CPU, no model)
+llama_build_and_test(test-spec-lattice.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks

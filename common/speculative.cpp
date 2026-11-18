@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "spec-lattice.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1027,6 +1028,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<std::mt19937> dflash2_rng;
     std::vector<int64_t>      dflash2_seed;
 
+    // [DSPINE-V07] verify-length planner over the lattice (LLAMA_SPEC_LATTICE_PLAN=1, default off): cost model
+    // (LLAMA_SPEC_VERIFY_COST="rows:ms,...", LLAMA_SPEC_DRAFT_MS), per-seq acceptance calibration, the drafted
+    // tokens' probabilities of the last draft, and a histogram of planned draft lengths
+    bool                              lattice_plan = false;
+    common_lattice_cost               lattice_cost;
+    std::vector<common_lattice_calib> lattice_calib;
+    std::vector<std::vector<float>>   lattice_conf;
+    std::vector<uint64_t>             lattice_n_plan;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1100,6 +1110,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_dflash2     = selector_top_k > 0;
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
+        if (const char * env = getenv("LLAMA_SPEC_LATTICE_PLAN"); is_dflash2 && env && atoi(env) != 0) {
+            lattice_plan = true;
+            lattice_cost = common_lattice_cost::defaults();
+            if (const char * c = getenv("LLAMA_SPEC_VERIFY_COST"); c && !common_lattice_cost::parse(c, lattice_cost)) {
+                throw std::runtime_error("LLAMA_SPEC_VERIFY_COST must be \"rows:ms,rows:ms,...\" with rows increasing");
+            }
+            if (const char * d = getenv("LLAMA_SPEC_DRAFT_MS")) {
+                char * end = nullptr;
+                const float v = std::strtof(d, &end);
+                if (end == d || *end != '\0' || !(v >= 0.0f) || !std::isfinite(v)) {
+                    throw std::runtime_error("LLAMA_SPEC_DRAFT_MS must be a number >= 0");
+                }
+                lattice_cost.draft_ms = v;
+            }
+            lattice_calib.assign(n_seq, common_lattice_calib{});
+            lattice_conf.assign(n_seq, {});
+            lattice_n_plan.assign(33, 0);
+            std::string pts;
+            for (const auto & p : lattice_cost.pts) {
+                pts += string_format("%s%d:%.2f", pts.empty() ? "" : ",", p.first, p.second);
+            }
+            LOG_INF("%s: lattice verify-length planner on (LLAMA_SPEC_LATTICE_PLAN): verify ms by rows %s, draft %.2f ms\n",
+                    __func__, pts.c_str(), lattice_cost.draft_ms);
+        }
         char lilicorr_meta[32] = {};
         lilicorr_top_k = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0
                 ? std::atoi(lilicorr_meta) : 0;
@@ -1279,17 +1313,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         {
             bool causal = causal_attn;
             char buf[32] = {};
-            // DFlash2 (lattice selector) drafters are always non-causal: the
-            // decoder_arch metadata only applies to the plain DFlash decoder.
+            // the decoder_arch fallback applies only to the plain DFlash decoder; lattice drafters take
+            // dflash.attention.causal as written (DFlash2: absent = non-causal, DSpine: true)
             if (!causal && !is_dflash2 && llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
                 causal = strcmp(buf, "laguna") == 0;
             }
             llama_set_causal_attn(ctx_dft, causal);
+            LOG_INF("%s: - block attention causal=%d%s\n", __func__, causal ? 1 : 0,
+                    is_dflash2 && causal ? " (causal lattice drafter, e.g. DSpine)" : "");
         }
     }
 
     ~common_speculative_impl_draft_dflash() override {
         flush_pending_rnn();
+        if (lattice_plan) {
+            std::string hist;
+            for (size_t n = 0; n < lattice_n_plan.size(); ++n) {
+                if (lattice_n_plan[n] > 0) {
+                    hist += string_format(" %zu:%llu", n, (unsigned long long) lattice_n_plan[n]);
+                }
+            }
+            LOG_INF("lattice planner: drafts by planned length (len:count):%s\n", hist.c_str());
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1345,6 +1390,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (ds_adaptive && seq_id < (llama_seq_id) ds_ctrl.size()) {
             ds_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
             ds_last[seq_id] = 0;
+        }
+        if (lattice_plan) {
+            // per request, like the seed, so two identical requests plan identically
+            lattice_calib[seq_id].reset();
+            lattice_conf[seq_id].clear();
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -1693,7 +1743,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
-                const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
+                // (a request at temperature <= 0 is verified by id-match, so its walk stays greedy)
+                const bool sample = is_dflash2 && params.probabilistic && dp.result_q && dp.temp > 0.0f;
 
                 // greedy keeps temperature 1, sampling uses the target's
                 const float temp = sample ? dp.temp : 1.0f;
@@ -1704,63 +1755,39 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
                 }
 
-                std::vector<float>   probs;
-                std::vector<int32_t> sorted_idx;
+                common_lattice_walk_params wp;
+                wp.top_k  = is_dflash2 ? selector_top_k : lilicorr_top_k;
+                wp.temp   = temp;
+                wp.p_min  = params.p_min;
+                wp.sample = sample;
 
-                int32_t predecessor = 0;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
-                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
-                    const float * scores = row + top_k + (size_t) predecessor * top_k;
+                int32_t n_pos = (is_dflash2 ? n_block_tokens : params.n_max + 1) - 1;
 
-                    predecessor = (int32_t) std::distance(scores,
-                            std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f || sample) {
-                        // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
-                        probs.resize(top_k);
-                        float sum = 0.0f;
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
-                            sum += probs[k];
-                        }
-                        if (1.0f / sum < params.p_min) {
-                            break;
-                        }
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            probs[k] /= sum;
-                        }
+                // [DSPINE-V07] opt-in verify-length planner (LLAMA_SPEC_LATTICE_PLAN=1); off = the plain walk above
+                const bool plan = is_dflash2 && lattice_plan;
+                if (plan) {
+                    wp.cost  = &lattice_cost;
+                    wp.calib = &lattice_calib[seq_id];
+                    wp.l_min = std::max(0, params.n_min);
+                    if (dp.n_max > 0) {
+                        // plan within the cap the caller will apply, so the draft is never cut after planning
+                        n_pos = std::min(n_pos, dp.n_max);
                     }
-                    if (sample) {
-                        // ggml_top_k leaves candidates unordered, so walk them by token id to keep a seed's draft stable
-                        sorted_idx.resize(top_k);
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            sorted_idx[k] = k;
-                        }
-                        std::sort(sorted_idx.begin(), sorted_idx.end(), [row](int32_t a, int32_t b) { return row[a] < row[b]; });
-
-                        // a round-off overshoot keeps the argmax, which has q > 0
-                        double u = std::uniform_real_distribution<double>(0.0, 1.0)(dflash2_rng[seq_id]);
-                        for (const int32_t k : sorted_idx) {
-                            u -= probs[k];
-                            if (u < 0.0) {
-                                predecessor = k;
-                                break;
-                            }
-                        }
-
-                        auto & q = dp.result_q->emplace_back();
-                        q.reserve(top_k);
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            q.push_back({ (llama_token) row[k], scores[k], probs[k] });
-                        }
-                    }
-                    result.push_back((llama_token) row[predecessor]);
+                    lattice_conf[seq_id].clear();
                 }
+
+                common_lattice_walk(lattice + (size_t) beg * n_embd_dec, (size_t) n_embd_dec, n_pos, wp,
+                        sample ? &dflash2_rng[seq_id] : nullptr, result,
+                        sample ? dp.result_q : nullptr, plan ? &lattice_conf[seq_id] : nullptr);
 
                 // a sampled draft must not be dropped because of its own tokens: the p_min stop at position i depends on
                 // the token drawn at i - 1, so discarding a short draft would bias the output (exact only when greedy)
                 if (!sample && result.size() < (size_t) params.n_min) {
                     result.clear();
+                }
+                if (plan) {
+                    lattice_conf[seq_id].resize(result.size());
+                    lattice_n_plan[std::min(result.size(), lattice_n_plan.size() - 1)]++;
                 }
                 continue;
             }
@@ -1903,6 +1930,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (lattice_plan && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            auto & conf = lattice_conf[seq_id];
+            // n_drafted_ctrl: the width the server verified (it can be shorter than the draft); -1 = the whole draft
+            const int32_t n_drafted = n_drafted_ctrl >= 0 ? std::min<int32_t>(n_drafted_ctrl, (int32_t) conf.size()) : (int32_t) conf.size();
+            lattice_calib[seq_id].update(conf.data(), n_drafted, n_accepted);
+            conf.clear();
+        }
         // INKSPEC2: feed the adaptive depth controller with this seq's own draft; under mode-biased accept the
         // count is capped at the exact-rule count (the first rescue, [MBFIX]) so mb drafts at the depths exact would
         if (!ds_adaptive || is_other || seq_id < 0 || seq_id >= (llama_seq_id) ds_ctrl.size()) {
