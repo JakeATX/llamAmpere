@@ -2950,6 +2950,13 @@ static int aif25_mmq_check() {
     return v;
 }
 
+// [K126] GGML_CUDA_AIF_MMV_PF=0: the mmv weight loads without the one-unit register prefetch (pre-K126; A/B and kill
+// switch). Default 1. Bit-identical either way.
+static int aif_mmv_pf() {
+    static const int v = ai4_env_int("GGML_CUDA_AIF_MMV_PF", nullptr, 1);
+    return v;
+}
+
 template <int XSH, bool ROW_SCALE = false, int B = 5, int V = 2, uint32_t C = AIF25_MUL, int SCALE_CHUNKS = 5>
 static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales, float * y, int M, int K, int64_t N,
                       cudaStream_t stream) {
@@ -2958,7 +2965,11 @@ static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales,
         const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
         const dim3 grid(M/16, (nr+7)/8);
         const float * xs = scales + (size_t)n0*(K >> (7+XSH));
-        magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        if (aif_mmv_pf()) {
+            magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS,true><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        } else {
+            magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 }
