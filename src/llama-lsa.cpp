@@ -29,6 +29,18 @@ extern "C" {
 
 static std::string llama_lsa_describe_cfg(const llama_lsa_config & c);
 
+// setenv(name, value, 0) on every platform: set only when not already set (MSVC/MinGW have no setenv)
+static void llama_lsa_setenv(const char * name, const char * value, int overwrite) {
+#ifdef _WIN32
+    if (!overwrite && std::getenv(name) != nullptr) {
+        return;
+    }
+    _putenv_s(name, value);
+#else
+    setenv(name, value, overwrite);
+#endif
+}
+
 ggml_tensor * llama_lsa_build_recall_pick(ggml_context * ctx, ggml_tensor * scores, ggml_tensor * mask,
         ggml_tensor * cell_pos, ggml_tensor * q_pos, int block, int refine, float tau,
         int window, int sinks, int coarse_keep, int fine_keep, int budget_pct) {
@@ -105,8 +117,8 @@ const llama_lsa_config & llama_lsa_cfg() {
         c.mean_chunks = lsa_env_i64("LLAMA_LSA_MEAN_CHUNKS", 0) != 0;
         c.sj_compact = lsa_env_i64("LLAMA_LSA_SJ_COMPACT", 0) != 0;
         if (c.sj_compact) {
-            setenv("GGML_SJKVARN_COMPACT_MAX_BOUND", "262144", 0); // the kept set is 10-20K cells; ggml's default cap is 4096
-            setenv("GGML_SJKVARN_COMPACT_HEADS4", "1", 0); // ggml takes 4 KV heads only when asked
+            llama_lsa_setenv("GGML_SJKVARN_COMPACT_MAX_BOUND", "262144", 0); // the kept set is 10-20K cells; ggml's default cap is 4096
+            llama_lsa_setenv("GGML_SJKVARN_COMPACT_HEADS4", "1", 0); // ggml takes 4 KV heads only when asked
         }
         c.per_head  = lsa_env_i64("LLAMA_LSA_PER_HEAD",  0) != 0;
         c.topp      = lsa_env_f64("LLAMA_LSA_TOPP",      c.topp);
@@ -161,10 +173,10 @@ const llama_lsa_config & llama_lsa_cfg() {
         const int64_t sj_skip_lvl = lsa_env_i64("LLAMA_LSA_SJ_SKIP", 0);
         c.sj_skip   = sj_skip_lvl != 0;
         if (sj_skip_lvl >= 2 && c.mode != llama_lsa_config::OFF) {
-            setenv("GGML_SJKVARN_LIVE_STRIPS", "1", 0); // 2 = also skip the dead 16-cell strips of a live record
+            llama_lsa_setenv("GGML_SJKVARN_LIVE_STRIPS", "1", 0); // 2 = also skip the dead 16-cell strips of a live record
         }
         if (c.sj_skip && c.mode != llama_lsa_config::OFF) {
-            setenv("GGML_SJKVARN_LIVE_RECORDS", "1", 0);
+            llama_lsa_setenv("GGML_SJKVARN_LIVE_RECORDS", "1", 0);
         }
         c.refine      = lsa_env_i64("LLAMA_LSA_REFINE", 0);
         c.refine_mult = std::max(1.0, lsa_env_f64("LLAMA_LSA_REFINE_MULT", c.refine_mult));
@@ -247,7 +259,7 @@ const llama_lsa_config & llama_lsa_cfg() {
             // exact radix select for the wide index-score rows (k = thousands of cells); without it ggml-cuda sorts
             // whole 100K-200K rows. Same kept set as the sort (ggml-cuda top-k.cu), rows it does not take are unchanged.
             // An explicit GGML_CUDA_TOPK_SELECT (0 = off) wins.
-            setenv("GGML_CUDA_TOPK_SELECT", "1", 0);
+            llama_lsa_setenv("GGML_CUDA_TOPK_SELECT", "1", 0);
             // the "LSA probe ON" WARN line is logged per context (llama_context ctor), not here: this static is first
             // built inside the server's memory-fit dry run, whose logger drops WARN
         }
