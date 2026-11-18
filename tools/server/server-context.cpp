@@ -175,6 +175,17 @@ static int32_t server_think_loop_close() {
 //
 // The sampled path holds a [n_vocab, n_rows] working set per sequence, which is too much memory to take by
 // default at long context, so it stays behind "1". Any other value is treated as off.
+// DSPINE-FU S4 probe: LLAMA_SPEC_ROUND_LOG=<file> appends one line per generation step of every slot:
+//   "R <task> <n_gen before the step> <draft width, 0 = plain step> <tokens committed> <us since the previous step, -1 = first>"
+// so two runs that generate the same text can be aligned by generated-token index. Unset (default): no file, no cost.
+static FILE * server_spec_round_log() {
+    static FILE * f = [] {
+        const char * p = getenv("LLAMA_SPEC_ROUND_LOG");
+        return p && *p ? fopen(p, "a") : nullptr;
+    }();
+    return f;
+}
+
 static bool server_mtp_gpu_verify_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
     return gpu_verify != nullptr &&
@@ -8435,6 +8446,11 @@ private:
             // a plain (undrafted) step also ends the interval the next speculative round is charged from; otherwise
             // drafters that only draft on a match (n-gram) would have the plain steps in between folded into
             // "round cost by draft width"
+            if (FILE * rl = server_spec_round_log()) {
+                fprintf(rl, "R %d %d 0 1 %lld\n", slot.task->id, (int) slot.stats.n_gen,
+                        slot.t_spec_round_last > 0 ? (long long) (t_now - slot.t_spec_round_last) : -1LL);
+                fflush(rl);
+            }
             slot.t_spec_round_last = t_now;
 
             slot.stats.n_gen += 1;
@@ -8708,6 +8724,11 @@ private:
                 }
                 if (slot.spec_adapt.active()) {
                     slot.spec_adapt.observe((int) verify_width, (int) n_accepted, slot.t_spec_round_last > 0 ? t_now - slot.t_spec_round_last : 0);
+                }
+                if (FILE * rl = server_spec_round_log()) {
+                    fprintf(rl, "R %d %d %zu %zu %lld\n", slot.task->id, (int) slot.stats.n_gen, (size_t) verify_width, ids.size(),
+                            slot.t_spec_round_last > 0 ? (long long) (t_now - slot.t_spec_round_last) : -1LL);
+                    fflush(rl);
                 }
                 slot.t_spec_round_last = t_now;
                 slot.spec_draft_us_pending = 0;
