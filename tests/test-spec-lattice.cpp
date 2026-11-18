@@ -360,6 +360,7 @@ static bool run_exactness(const exact_cfg & cfg, int64_t * len_hist_out = nullpt
             n_rounds++;
             bool all = true;
             int32_t n_acc = 0;
+            int32_t first_rescue = -1; // [DSPINE2] mb: the server feeds the controller the exact-rule count
             for (size_t i = 0; i < d.size() && (int32_t) outv.size() < N_OUT; ++i) {
                 const auto p = target_row(prev);
                 for (int32_t v = 0; v < V; ++v) {
@@ -370,6 +371,9 @@ static bool run_exactness(const exact_cfg & cfg, int64_t * len_hist_out = nullpt
                 const auto res = common_sampler_verify_pq(arr, q[i], d[i], x, g_ver, cfg.beat, stats);
                 outv.push_back(res.id);
                 prev = res.id;
+                if (res.rescued && first_rescue < 0) {
+                    first_rescue = (int32_t) i;
+                }
                 if (!res.accepted) {
                     all = false;
                     break;
@@ -384,7 +388,7 @@ static bool run_exactness(const exact_cfg & cfg, int64_t * len_hist_out = nullpt
             if (cfg.feedback && cfg.plan) {
                 // as accept(): the verified width is the whole draft
                 conf.resize(d.size());
-                calib.update(conf.data(), (int32_t) d.size(), n_acc);
+                calib.update(conf.data(), (int32_t) d.size(), first_rescue >= 0 ? std::min(first_rescue, n_acc) : n_acc);
             }
         }
         c123[outv[0] * V * V + outv[1] * V + outv[2]]++;
@@ -535,23 +539,25 @@ static void test_mb() {
         }
         const auto law = common_sampler_pq_mode_distribution(arr, q0);
         double chi_law = 0.0, chi_p = 0.0, tv = 0.0;
-        int cells = 0;
+        int cells = 0, cells_p = 0;
         for (int32_t v = 0; v < V; ++v) {
             const double e = beat ? law[v] : p[v]; // exact emits p; mb emits its local law
             tv += std::fabs(law[v] - p[v]) / 2;
             if (e * n >= 5.0) { chi_law += std::pow(cnt[v] - e * n, 2) / (e * n); cells++; }
             else { CHECK(cnt[v] == 0 || e > 0.0, "a token with zero expected mass was emitted"); }
-            if (p[v] * n >= 5.0) { chi_p += std::pow(cnt[v] - p[v] * n, 2) / (p[v] * n); }
+            if (p[v] * n >= 5.0) { chi_p += std::pow(cnt[v] - p[v] * n, 2) / (p[v] * n); cells_p++; }
         }
         const double df = cells - 1, bound = df + 6.0 * std::sqrt(2.0 * df);
         fprintf(stderr, "mb lattice pos 0 (beat %d): chi2 vs expected law %.1f, vs p %.1f (df %.0f, bound %.1f); "
                 "predicted law TV from p %.4f; kept by mb %zu\n", beat, chi_law, chi_p, df, bound, tv, stats.n_lossy);
         CHECK(chi_law < bound, "lattice + verify_pq (beat %d) does not follow the predicted local law", beat);
+        const double df_p = cells_p - 1, bound_p = df_p + 6.0 * std::sqrt(2.0 * df_p);
         if (beat) {
-            CHECK(tv > 0.01 && chi_p > bound, "mb lattice: the mb law is not distinguishable from p (no power)");
+            CHECK(tv > 0.01 && chi_p > bound_p, "mb lattice: the mb law is not distinguishable from p (no power)");
             CHECK(stats.n_lossy > 0, "mb lattice: no draft kept by the mb rule");
         } else {
-            CHECK(chi_p < bound, "exact lattice: emitted law differs from p");
+            CHECK(chi_p < bound_p, "exact lattice: emitted law differs from p");
+            CHECK(stats.n_lossy == 0, "exact lattice: mb kept a draft with beat off");
         }
     }
     // (b) whole rounds with the planner and calibration feedback

@@ -1971,6 +1971,12 @@ uint64_t llama_model_tokenizer_fingerprint(const llama_model * model) {
 void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
+    // Inkling2 DSpark (Markov rank > 0) keeps its own shortlist path through the target head below
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dspark_markov_rank == 0 && (model.dspine_codebook == nullptr || model.no_alloc())) {
+        LLAMA_LOG_INFO("%s: draft vocabulary '%s' not used: only an allocated DSpine lattice drafter reads a shortlist\n", __func__, path);
+        return;
+    }
+
     llama_mtp_vocab_map map;
     std::string source = path;
 
@@ -2004,11 +2010,6 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     if (map.n_vocab != n_vocab) {
         throw std::runtime_error(format("draft vocabulary map '%s' is for a %lld-token vocabulary, model has %lld",
                     path, (long long) map.n_vocab, (long long) n_vocab));
-    }
-
-    if (model.arch == LLM_ARCH_DFLASH && model.dspine_codebook == nullptr && model.hparams.dspark_markov_rank == 0) {
-        LLAMA_LOG_INFO("%s: draft vocabulary '%s' not used: only the DSpine lattice drafter (or DSpark) reads a shortlist\n", __func__, path);
-        return;
     }
 
     // the map lives next to the head it indexes (DSpark borrows the target model's output head via ctx_other)
@@ -2048,7 +2049,11 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     if (model.arch == LLM_ARCH_DFLASH && model.dspine_codebook != nullptr) {
         ggml_backend_buffer_type_t hb = ggml_backend_buffer_get_type(head->buffer);
         ggml_backend_dev_t hd = ggml_backend_buft_get_device(hb);
+        // raw row copies are only valid for plain row-major heads: no rotation folded into the head, no EXL3 rows
+        // (rebuilt by llama_draft_compact_build), no AI+ slab layouts
         if (n_sel >= head->ne[1] || !ggml_is_contiguous(head) || ggml_get_type_traits(head->type)->to_float == nullptr ||
+                model.hadamard_rotations.count(head) || model.hadamard_inverses.count(head) ||
+                ggml_exl3_bits(head->type) != 0 || ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0 ||
                 (!ggml_backend_buft_is_host(hb) && (hd == nullptr || ggml_backend_dev_buffer_type(hd) != hb))) {
             LLAMA_LOG_WARN("%s: DSpine draft vocabulary shortlist not applied (head %s %s), the lattice scores the full head\n",
                     __func__, ggml_get_name(head), ggml_type_name(head->type));
@@ -2271,6 +2276,7 @@ int32_t llama_context::draft_vocab_apply(const std::vector<llama_mtp_hot_vocab::
         const size_t row = draft_vocab.compact->nb[1];
         std::vector<uint8_t> buf(row);
         for (const auto & rep : reps) {
+            GGML_ASSERT(rep.id >= 0 && rep.id < draft_vocab.compact_src->ne[1]);
             ggml_backend_tensor_get(draft_vocab.compact_src, buf.data(), (size_t) rep.id * row, row);
             ggml_backend_tensor_set(draft_vocab.compact, buf.data(), (size_t) (base + rep.slot) * row, row);
         }

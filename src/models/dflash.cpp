@@ -1549,7 +1549,8 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
     // [DSPINE2] DSpine with a draft vocabulary shortlist: every block row scores only the shortlisted rows (compact
     // raw-copy head, see llama_context::init_draft_vocab); the lattice maps the top-k back to token ids
     const bool dspine_short = model.dspine_codebook && draft_vocab_ids && draft_vocab_compact &&
-            draft_vocab_compact_src == output && !model.d2t && n_outputs == 0; // lattice-only decode: no logits read back
+            draft_vocab_compact_src == output && !model.d2t && n_outputs == 0 &&
+            !model.dflash_selector_hidden && !model.dspark_markov_w1 && !model.lilicorr_pass_hidden_proj; // lattice-only decode: no logits read back
     if (dspine_short) {
         cur = build_draft_vocab_compact(output, output_s, cur); // [n_sel, n_tokens]
         res->t_logits_ids = draft_vocab_ids;
