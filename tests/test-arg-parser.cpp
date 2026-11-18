@@ -275,7 +275,7 @@ static void test(void) {
                 const bool headless = name == "8dense" || args.back() == "headless" || string_ends_with(args.back(), "-headless");
                 assert(selected.card_preset == name && selected.card_preset_ctx_default && selected.fit_params);
                 assert(selected.card_preset_headless == headless);
-                const int expected_ctx = name == "8dense" ? 204800 : name == "10dense" ?
+                const int expected_ctx = name == "8dense" ? 114688 : name == "10dense" ?
                         (headless ? 212992 : 180224) : name == "12dense" ? (headless ? 262144 : 196608) : 262144;
                 assert(selected.n_ctx == expected_ctx);
                 if (name != "24dense") {
@@ -446,7 +446,7 @@ static void test(void) {
         assert(!parse_card({"24dense", "--preset", "10dense"}, invalid));
         common_params tiny;
         assert(parse_card({"--preset", "8dense"}, tiny));
-        assert(tiny.n_ctx == 204800 && tiny.n_ubatch == 256);
+        assert(tiny.n_ctx == 114688 && tiny.n_ubatch == 256);
         assert(tiny.cache_type_k == GGML_TYPE_F16 && tiny.cache_type_v == GGML_TYPE_F16);
         assert(tiny.sj_kvarn_bits_k == 3 && tiny.sj_kvarn_bits_v == 3);
         assert(tiny.sj_kvarn_body_type == GGML_TYPE_I16);

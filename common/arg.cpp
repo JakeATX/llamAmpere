@@ -942,7 +942,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (!card_name.empty()) {
         const auto & card = common_card_preset_get(card_name, card_headless);
         if (card.name == "8dense" && card_headed) {
-            LOG_INF("8dense is headless-only; using the same 500 MiB margin and 204800 context defaults\n");
+            LOG_INF("8dense is headless-only; using the same 500 MiB margin and 114688 context defaults\n");
         }
         if (!card.pending.empty()) {
             throw std::invalid_argument(card.pending);

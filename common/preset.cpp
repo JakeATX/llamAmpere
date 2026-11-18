@@ -66,10 +66,12 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         medium.env.emplace_back("GGML_CUDA_GRAPH_MAX_ROWS", "16");
         // 8 GB loop check: V07/PRESETS/SOL_HANDOFF.md, owner order 2026-11-17T04:03Z.
         // 0.7.1: the AI2M10-iw file carries its own MTP layer and head (no sidecars); mb-MTP stays on as in the
-        // other profiles (owner small-card design: LSA + MTP).
+        // other profiles (owner small-card design: LSA + MTP). Default context 114688: on a real RTX 3070 (CUDA total
+        // 7,840 MiB) this file peaks at 7,819 MiB nvidia-smi at 204800 and 7,697 at 131072, over the 7,692 headless
+        // line (8,192 - 500); fit does not count the 146.68 MiB writing scratch. V07/REL071/STATUS.md.
         common_card_preset tiny {
             "8dense", "2026-11-17.4", "best known/recheck before ship", "", {
-                {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
+                {"--ctx-size", "114688"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "on"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
                 {"--cache-type-k", "sjkvarn3"}, {"--cache-type-v", "sjkvarn3"},
@@ -105,7 +107,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         tiny.fit_margin_mib = 500;
         std::vector<common_card_preset> cards {large, medium, small, tiny};
         for (auto & card : cards) {
-            card.version = card.name == "8dense" ? "2026-11-18.1" : "2026-11-17.6";
+            card.version = card.name == "8dense" ? "2026-11-18.2" : "2026-11-17.6";
             card.options.insert(card.options.end(), {
                 {"--temp", "1.0"}, {"--top-k", "20"}, {"--top-p", "0.95"}, {"--min-p", "0"}
             });
