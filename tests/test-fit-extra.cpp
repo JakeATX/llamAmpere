@@ -1379,6 +1379,19 @@ static void test_vram_fit_floor() {
     expect(!common_fit_verify_compact_safe(true, {int64_t(800 * MiB)}, {int64_t(300 * MiB)}, int64_t(800 * MiB)), "display floor disables compact verify with an explicit headless margin");
     expect(!common_fit_verify_compact_safe(true, {1}, {1}, 0), "compact verify retains its minimum safety floor");
 
+    common_params headless_preset;
+    headless_preset.fit_params_target = {500 * MiB};
+    headless_preset.fit_params_target_explicit = true;
+    headless_preset.card_preset_fit_target = true;
+    const auto requested = common_fit_vram_targets(headless_preset, 300 * MiB);
+    const size_t free_target = common_fit_preset_target(9873 * MiB, 9542 * MiB, requested[0]);
+    expect(free_target == 169 * MiB, "preset target discounts memory already in use");
+    expect(common_fit_verify_compact_margins(true, requested, 300 * MiB, true, 300 * MiB), "preset compact gate accepts measured headroom at the floor");
+    expect(!common_fit_verify_compact_margins(true, requested, 300 * MiB, true, 300 * MiB - 1), "preset compact gate rejects measured headroom below the floor with the same requested margin");
+    expect(!common_fit_verify_compact_margins(true, {free_target}, 300 * MiB, true, 500 * MiB), "adjusted free target must not replace the compact safety margin");
+    expect(!common_fit_verify_compact_margins(false, requested, 300 * MiB, true, 500 * MiB), "unverified fit cannot enable compact verification");
+    expect(common_fit_verify_compact_margins(true, requested, 300 * MiB, false, 0), "plain fit keeps its verified margin behavior");
+
     const std::string old_target = common_get_env("LLAMA_ARG_FIT_TARGET");
     common_set_env("LLAMA_ARG_FIT_TARGET", "");
     char program[] = "test-fit-extra";

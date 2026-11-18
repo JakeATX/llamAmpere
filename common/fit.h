@@ -39,6 +39,8 @@ size_t common_fit_vram_floor(bool display_attached);
 size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_session);
 struct common_params;
 std::vector<size_t> common_fit_vram_targets(const common_params & params, size_t floor);
+size_t common_fit_preset_target(size_t total, size_t free, size_t margin);
+bool common_fit_verify_compact_margins(bool verified, const std::vector<size_t> & margins, size_t floor, bool preset_total_margin, size_t verified_free_min);
 
 uint64_t common_fit_eval_cache_ram_bytes(uint64_t available, bool fit);
 uint64_t common_fit_eval_cache_load_bytes(uint64_t available, bool fit, uint64_t n_tokens);
@@ -163,12 +165,14 @@ common_params_fit_status common_fit_params(
                               float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
    llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
            common_moe_cache_params * moe_cache,
-                             size_t * margins,               // margins of memory to leave per device in bytes
+                       const size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
                                bool * margins_verified = nullptr,
-                           uint32_t   n_ctx_preset_max = 0);
+                           uint32_t   n_ctx_preset_max = 0,
+                               bool   preset_total_margin = false,
+                             size_t * verified_free_min = nullptr);
 
 // print estimated memory to stdout
 void common_fit_print(

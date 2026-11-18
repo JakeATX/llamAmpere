@@ -992,6 +992,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             }
         }
         defaults.apply_to_params(params);
+        params.card_preset_fit_target = !is_explicit("--fit-target");
     }
 
     // handle environment variables
@@ -3730,6 +3731,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 }
                 targets.push_back(size_t(mib) * 1024 * 1024);
             }
+            params.card_preset_fit_target = false;
             if (targets.size() == 1) {
                 std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), targets[0]);
                 params.fit_params_target_explicit = true;
