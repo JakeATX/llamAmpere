@@ -124,6 +124,23 @@ size_t common_fit_vram_floor_detect(const std::string & drm_root, bool display_s
     return ec || !connector_seen ? safe : common_fit_vram_floor(false);
 }
 
+size_t common_fit_preset_target(size_t total, size_t free, size_t margin) {
+    const size_t occupied = total - std::min(total, free);
+    return margin - std::min(margin, occupied);
+}
+
+bool common_fit_verify_compact_margins(bool verified, const std::vector<size_t> & margins, size_t floor, bool preset_total_margin, size_t verified_free_min) {
+    if (!verified || (preset_total_margin && verified_free_min < floor)) {
+        return false;
+    }
+    for (size_t margin : margins) {
+        if (margin < floor) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<size_t> common_fit_vram_targets(const common_params & params, size_t floor) {
     auto targets = params.fit_params_target;
     if ((!params.fit_params && !params.n_cpu_moe_auto) || params.fit_params_target_explicit) {
@@ -846,8 +863,9 @@ bool common_fit_verify_compact_safe(bool complete, const std::vector<int64_t> & 
 static void common_params_fit_impl(
         const std::vector<std::string> & paths_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min,
-        const common_fit_extra_model * extra, enum ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max) {
+        common_moe_cache_params * moe_cache, const size_t * margins_s, uint32_t n_ctx_min,
+        const common_fit_extra_model * extra, enum ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max,
+        bool preset_total_margin, size_t * verified_free_min) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -874,6 +892,9 @@ static void common_params_fit_impl(
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
     bool extra_complete = true;
+    std::vector<int64_t> preset_free;
+    std::vector<size_t> preset_lines;
+    std::vector<size_t> preset_targets;
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes: both its KV cache and its compute graph
@@ -881,6 +902,10 @@ static void common_params_fit_impl(
     // a context that shares the compute buffers of the main context (MTP, single device) adds its KV cache and only the
     // growth of the shared compute buffer beyond the main context's own need (common_fit_extra_memory_at)
     auto add_extra_memory = [&](dmds_t & dmds) {
+        // fork: a dry-run probe must not raise the preset's initial memory budget.
+        for (size_t id = 0; id < preset_free.size(); ++id) {
+            dmds[id].free = std::min(dmds[id].free, preset_free[id]);
+        }
         if (extra == nullptr) {
             return;
         }
@@ -1003,6 +1028,9 @@ static void common_params_fit_impl(
                 !common_moe_cache_evaluate_fit(moe_cache, final_tensors, devs, final_memory, targets).feasible) {
                 return;
             }
+            if (verified_free_min) {
+                *verified_free_min = size_t(std::max(int64_t(0), *std::min_element(headroom.begin(), headroom.end())));
+            }
             *margins_verified = true;
         } catch (const std::runtime_error & e) {
             LOG_WRN("%s: cannot verify final memory margins: %s\n", __func__, e.what());
@@ -1014,6 +1042,26 @@ static void common_params_fit_impl(
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     dmds_t dmds_full = common_get_device_memory_data_impl(
             paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level, &moe_tensors);
+
+    if (preset_total_margin) {
+        for (size_t id = 0; id < devs.size(); ++id) {
+            const auto & memory = dmds_full[id];
+            if (memory.free < 0 || memory.total < 0) {
+                throw common_params_fit_exception("invalid device memory for preset line");
+            }
+            const size_t margin = margins_s[id];
+            preset_free.push_back(memory.free);
+            preset_lines.push_back(size_t(memory.total) - std::min(size_t(memory.total), margin));
+            preset_targets.push_back(common_fit_preset_target(memory.total, memory.free, margin));
+            LOG_INF("preset line %zu MiB = total %zu - margin %zu on %s; free target %zu MiB\n",
+                preset_lines.back()/MiB, size_t(memory.total)/MiB, margin/MiB,
+                ggml_backend_dev_name(devs[id]), preset_targets.back()/MiB);
+        }
+        // fork: keep the requested margins for the caller's compact verification gate.
+        if (!preset_targets.empty()) {
+            margins_s = preset_targets.data();
+        }
+    }
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = n_ctx_preset_max ? n_ctx_preset_max : (uint32_t) std::min<uint64_t>(uint64_t(hp_nct) * n_streams, UINT32_MAX);
@@ -1176,6 +1224,20 @@ static void common_params_fit_impl(
                     cparams->n_ctx = n_ctx_min_total;
                     dmds_t dmds_min_ctx = common_get_device_memory_data_impl(paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
                     add_extra_memory(dmds_min_ctx);
+                    if (preset_total_margin && mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
+                        for (size_t id = 0; id < nd; ++id) {
+                            if (dmds_min_ctx[id].mb.total() > INT64_MAX) {
+                                throw common_params_fit_exception("device memory accounting exceeds the supported size");
+                            }
+                            const int64_t overage = -common_fit_vram_margin_surplus(dmds_min_ctx[id].free,
+                                {int64_t(dmds_min_ctx[id].mb.total()), margins[id]});
+                            if (overage > 0) {
+                                throw common_params_fit_exception("preset line " + std::to_string(preset_lines[id]/MiB) +
+                                    " MiB exceeded by " + std::to_string((overage + MiB - 1)/MiB) +
+                                    " MiB even at minimum context; lower -ub or change model/placement");
+                            }
+                        }
+                    }
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -2006,17 +2068,21 @@ enum common_params_fit_status common_fit_params(
         float * tensor_split,
         llama_model_tensor_buft_override * tensor_buft_overrides,
         common_moe_cache_params * moe_cache,
-        size_t * margins,
+        const size_t * margins,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
-        ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max) {
+        ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max, bool preset_total_margin,
+        size_t * verified_free_min) {
     const int64_t t0_us = llama_time_us();
     if (margins_verified) {
         *margins_verified = false;
     }
+    if (verified_free_min) {
+        *verified_free_min = 0;
+    }
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level, margins_verified, n_ctx_preset_max);
+        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level, margins_verified, n_ctx_preset_max, preset_total_margin, verified_free_min);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_no_room & e) {
         LOG_ERR("%s: no placement fits in device memory: %s\n", __func__, e.what());

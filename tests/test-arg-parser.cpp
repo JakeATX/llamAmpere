@@ -5,6 +5,7 @@
 #include "speculative.h"
 #include "spec-defaults.h"
 #include "preset.h"
+#include "fit.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -21,6 +22,14 @@
 
 static void test(void) {
     common_params params;
+    {
+        const size_t MiB = 1024 * 1024;
+        assert(common_fit_preset_target(9873 * MiB, 9542 * MiB, 1024 * MiB) == 693 * MiB);
+        assert(common_fit_preset_target(9873 * MiB, 9542 * MiB, 500 * MiB) == 169 * MiB);
+        assert(common_fit_preset_target(9873 * MiB, 9873 * MiB, 1024 * MiB) == 1024 * MiB);
+        assert(common_fit_preset_target(8192 * MiB, 7000 * MiB, 500 * MiB) == 0);
+        assert(common_fit_preset_target(0, 0, 500 * MiB) == 500 * MiB);
+    }
 
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
                                    int32_t total, int32_t per_seq) {
@@ -274,6 +283,7 @@ static void test(void) {
                     assert(selected.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP);
                 }
                 assert(selected.fit_params_target_explicit);
+                assert(selected.card_preset_fit_target);
                 assert(selected.sampling.temp == 1.0f && selected.sampling.top_k == 20);
                 assert(selected.sampling.top_p == 0.95f && selected.sampling.min_p == 0.0f);
                 assert(selected.sampling.spec_lossy == (name != "8dense"));
@@ -289,6 +299,7 @@ static void test(void) {
                     assert(parse_card(combined, overridden));
                     assert(overridden.n_ctx == 8192 && !overridden.card_preset_ctx_default && !overridden.fit_params);
                     assert(overridden.fit_params_target.front() == size_t(768) * 1024 * 1024);
+                    assert(!overridden.card_preset_fit_target && overridden.fit_params_target_explicit);
                     assert(overridden.sampling.temp == 0.7f && overridden.sampling.top_k == 32);
                     assert(overridden.sampling.top_p == 0.9f && overridden.sampling.min_p == 0.1f);
                     assert(overridden.sampling.spec_lossy);
@@ -299,6 +310,33 @@ static void test(void) {
         common_params no_card;
         assert(!parse_card({"headless"}, no_card));
         assert(!parse_card({"headed"}, no_card));
+        common_params plain_fit;
+        assert(parse_card({"-fitt", "1024"}, plain_fit));
+        assert(!plain_fit.card_preset_fit_target && plain_fit.fit_params_target_explicit);
+        const char * fit_env = std::getenv("LLAMA_ARG_FIT_TARGET");
+        const bool had_fit_env = fit_env != nullptr;
+        const std::string saved_fit_env = fit_env ? fit_env : "";
+        common_params reused_fit;
+        assert(parse_card({"10dense", "headless"}, reused_fit));
+        assert(reused_fit.card_preset_fit_target);
+        reused_fit.n_gpu_layers = -1; // A CPU-only parse sets this to 0; parser init requires a negative default.
+        assert(parse_card({"-fitt", "500"}, reused_fit));
+        assert(!reused_fit.card_preset_fit_target && reused_fit.fit_params_target.front() == size_t(500) * 1024 * 1024);
+        common_params reused_env_fit;
+        assert(parse_card({"10dense", "headless"}, reused_env_fit));
+        assert(reused_env_fit.card_preset_fit_target);
+        setenv("LLAMA_ARG_FIT_TARGET", "500", 1);
+        common_params env_fit;
+        assert(parse_card({"10dense"}, env_fit));
+        assert(!env_fit.card_preset_fit_target && env_fit.fit_params_target.front() == size_t(500) * 1024 * 1024);
+        reused_env_fit.n_gpu_layers = -1;
+        assert(parse_card({}, reused_env_fit));
+        assert(!reused_env_fit.card_preset_fit_target && reused_env_fit.fit_params_target.front() == size_t(500) * 1024 * 1024);
+        if (had_fit_env) {
+            setenv("LLAMA_ARG_FIT_TARGET", saved_fit_env.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_ARG_FIT_TARGET");
+        }
         common_params cli_headless;
         assert(parse_card({"8dense-headless", "-m", "model_file.gguf"}, cli_headless, LLAMA_EXAMPLE_CLI));
         assert(cli_headless.fit_params_target.front() == size_t(500) * 1024 * 1024);

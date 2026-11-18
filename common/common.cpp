@@ -1470,6 +1470,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         };
 
         bool fit_margins_verified = false;
+        size_t verified_free_min = 0;
         const common_params_fit_status fit_status = common_fit_params(
             params.model.get_paths(), &mparams, &cparams,
             params.tensor_split,
@@ -1479,12 +1480,10 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
-            &fit_margins_verified, params.card_preset_ctx_default ? cparams.n_ctx : 0);
-        *verify_compact_fit_safe = fit_margins_verified;
-        // fork: compact verify also needs every margin to cover the detected display or headless floor
-        for (size_t target : fit_targets) {
-            *verify_compact_fit_safe = *verify_compact_fit_safe && target >= vram_floor;
-        }
+            &fit_margins_verified, params.card_preset_ctx_default ? cparams.n_ctx : 0, params.card_preset_fit_target,
+            params.card_preset_fit_target ? &verified_free_min : nullptr);
+        *verify_compact_fit_safe = common_fit_verify_compact_margins(fit_margins_verified, fit_targets,
+            vram_floor, params.card_preset_fit_target, verified_free_min);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
             throw std::runtime_error(
                 "failed to fit parameters to device memory (hard error); retry with -fit off");
