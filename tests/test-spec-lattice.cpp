@@ -7,6 +7,11 @@
 //     loop, cost tables that give draft lengths 0..4), with p_min, and with n_min + p_min under the F1 rule (a sampled
 //     draft is never dropped). Two negative controls (truncate on the drawn token; the pre-F1 n_min discard) must be
 //     detected.
+//  5. [DSPINE2] mb (mode biasing, the mb-MTP accept rule, common_sampler_verify_pq beat=true) on the DSpine lattice path:
+//     the first emitted token follows the mb local law common_sampler_pq_mode_distribution(p, q) (chi-square), and
+//     the joint law of tokens 1-3 differs from the target's (the exact chi-square must catch it). The mb tolerance is
+//     documented as in mb-MTP: a local law per position, its TV from p printed; the server's LLAMA_SPEC_MB_KL audit
+//     lines (mb-mtp local-law) report the same per-position divergence on real text.
 #include "sampling.h"
 #include "spec-lattice.h"
 
@@ -255,6 +260,8 @@ struct exact_cfg {
     int    n_min          = 0;     // engine floor: planner l_min; with discard_short the pre-fix "too short -> empty draft"
     bool   discard_short  = false; // negative control: the pre-F1 rule (drop a sampled draft shorter than n_min)
     bool   trunc_on_draw  = false; // negative control: drop a position after seeing the drawn token
+    bool   beat           = false; // [DSPINE2] mb accept rule: not exact by design (expected to DIFFER)
+    double * tv123_out    = nullptr; // [DSPINE2] TV of the tokens 1-3 joint law from the target's
 };
 
 static constexpr int32_t N_OUT = 5;
@@ -360,7 +367,7 @@ static bool run_exactness(const exact_cfg & cfg, int64_t * len_hist_out = nullpt
                 }
                 llama_token_data_array arr = { pd.data(), (size_t) V, -1, false };
                 const int32_t x = draw(p, g_tgt);
-                const auto res = common_sampler_verify_pq(arr, q[i], d[i], x, g_ver, false, stats);
+                const auto res = common_sampler_verify_pq(arr, q[i], d[i], x, g_ver, cfg.beat, stats);
                 outv.push_back(res.id);
                 prev = res.id;
                 if (!res.accepted) {
@@ -411,6 +418,9 @@ static bool run_exactness(const exact_cfg & cfg, int64_t * len_hist_out = nullpt
             cfg.name, chi2_a, df_a, tv_a / 2, chi2_b, df_b, tv_b / 2,
             100.0 * len_hist[0] / n_rounds, 100.0 * len_hist[1] / n_rounds, 100.0 * len_hist[2] / n_rounds,
             100.0 * len_hist[3] / n_rounds, 100.0 * len_hist[4] / n_rounds, ok ? "matches target" : "DIFFERS from target");
+    if (cfg.tv123_out) {
+        *cfg.tv123_out = tv_a / 2;
+    }
     if (len_hist_out) {
         for (int i = 0; i < 8; ++i) {
             len_hist_out[i] = len_hist[i] * 1000 / std::max<int64_t>(1, n_rounds); // per mille
@@ -472,12 +482,77 @@ static void test_exactness() {
     CHECK(!run_exactness(b2), "biased control (pre-F1 n_min discard of a sampled draft) was not detected");
 }
 
+// [DSPINE2] mb on the lattice path. (a) First position: walk the anchor lattice (planner off), verify position 0 with
+// beat on; the emitted token must follow common_sampler_pq_mode_distribution(p, q0), the mb-MTP local law, and not p.
+// (b) Whole rounds with the planner: mb is detected as non-exact by the tokens 1-3 / 3-5 chi-square; its TV is printed.
+static void test_mb() {
+    const int32_t top_k = 4, n_pos = 4;
+    const size_t  stride = top_k + top_k * top_k;
+    const auto lat = make_lattice(n_pos, top_k, V, stride, 1000 + V, 1.5f);
+    const auto p = target_row(-1);
+    std::vector<llama_token_data> pd(V);
+    for (int32_t v = 0; v < V; ++v) {
+        pd[v] = { v, 0.0f, (float) p[v] };
+    }
+    llama_token_data_array arr = { pd.data(), (size_t) V, -1, false };
+    std::mt19937 g_draft(5), g_tgt(6), g_ver(7);
+    common_sampler_pq_stats stats;
+    const int64_t n = 400000;
+    for (int beat = 0; beat < 2; ++beat) {
+        std::vector<int64_t> cnt(V, 0);
+        std::vector<llama_token_data> q0;
+        for (int64_t t = 0; t < n; ++t) {
+            common_lattice_walk_params wp;
+            wp.top_k = top_k; wp.temp = 1.0f; wp.sample = true;
+            std::vector<llama_token> d;
+            std::vector<std::vector<llama_token_data>> q;
+            common_lattice_walk(lat.data(), stride, n_pos, wp, &g_draft, d, &q, nullptr);
+            if (t == 0) {
+                q0 = q[0];
+            }
+            const auto res = common_sampler_verify_pq(arr, q[0], d[0], draw(p, g_tgt), g_ver, beat != 0, stats);
+            cnt[res.id]++;
+        }
+        const auto law = common_sampler_pq_mode_distribution(arr, q0);
+        double chi_law = 0.0, chi_p = 0.0, tv = 0.0;
+        int cells = 0;
+        for (int32_t v = 0; v < V; ++v) {
+            const double e = beat ? law[v] : p[v]; // exact emits p; mb emits its local law
+            tv += std::fabs(law[v] - p[v]) / 2;
+            if (e * n >= 5.0) { chi_law += std::pow(cnt[v] - e * n, 2) / (e * n); cells++; }
+            else { CHECK(cnt[v] == 0 || e > 0.0, "a token with zero expected mass was emitted"); }
+            if (p[v] * n >= 5.0) { chi_p += std::pow(cnt[v] - p[v] * n, 2) / (p[v] * n); }
+        }
+        const double df = cells - 1, bound = df + 6.0 * std::sqrt(2.0 * df);
+        fprintf(stderr, "mb lattice pos 0 (beat %d): chi2 vs expected law %.1f, vs p %.1f (df %.0f, bound %.1f); "
+                "predicted law TV from p %.4f; kept by mb %zu\n", beat, chi_law, chi_p, df, bound, tv, stats.n_lossy);
+        CHECK(chi_law < bound, "lattice + verify_pq (beat %d) does not follow the predicted local law", beat);
+        if (beat) {
+            CHECK(tv > 0.01 && chi_p > bound, "mb lattice: the mb law is not distinguishable from p (no power)");
+            CHECK(stats.n_lossy > 0, "mb lattice: no draft kept by the mb rule");
+        } else {
+            CHECK(chi_p < bound, "exact lattice: emitted law differs from p");
+        }
+    }
+    // (b) whole rounds with the planner and calibration feedback
+    exact_cfg cb;
+    cb.name = "mb planner, calib feedback";
+    cb.feedback = true;
+    cb.mixed_cost = true;
+    cb.beat = true;
+    double tv = 0.0;
+    cb.tv123_out = &tv;
+    CHECK(!run_exactness(cb), "mb was not detected as non-exact (no power)");
+    fprintf(stderr, "mb planner rounds: tokens 1-3 joint TV from the target %.4f (mb tolerance, documented; not exact)\n", tv);
+}
+
 int main() {
     test_cost_and_calib();
     test_best_len();
     test_walk_matches_reference();
     test_planner_walk();
     test_exactness();
+    test_mb();
     if (n_fail) {
         fprintf(stderr, "test-spec-lattice: %d FAIL\n", n_fail);
         return 1;

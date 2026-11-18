@@ -1940,7 +1940,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & conf = lattice_conf[seq_id];
             // n_drafted_ctrl: the width the server verified (it can be shorter than the draft); -1 = the whole draft
             const int32_t n_drafted = n_drafted_ctrl >= 0 ? std::min<int32_t>(n_drafted_ctrl, (int32_t) conf.size()) : (int32_t) conf.size();
-            lattice_calib[seq_id].update(conf.data(), n_drafted, n_accepted);
+            // [DSPINE2] with mb (mode biasing) the server passes the exact-rule count (first rescue) as n_accepted_ctrl, as it
+            // does for the adaptive MTP depth controller (LLAMA_SPEC_MB_CTRL=beat passes the kept count instead)
+            const int32_t n_acc = n_accepted_ctrl >= 0 ? std::min<int32_t>(n_accepted_ctrl, n_accepted) : n_accepted;
+            lattice_calib[seq_id].update(conf.data(), n_drafted, n_acc);
             conf.clear();
         }
         // INKSPEC2: feed the adaptive depth controller with this seq's own draft; under mode-biased accept the
