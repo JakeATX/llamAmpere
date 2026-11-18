@@ -1204,6 +1204,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+        if (is_dflash2 && (this->params.n_max < 1 || this->params.n_max + 1 > block_size)) {
+            // [DSPINE-V07] the lattice graph needs a block of 2..block_size rows; refuse here rather than abort mid-request
+            throw std::runtime_error(string_format("lattice drafter: draft n_max %d must be in 1..%d (block size %d)",
+                    this->params.n_max, block_size - 1, block_size));
+        }
 
         if (has_rnn_context) {
             if (ds_adaptive) {

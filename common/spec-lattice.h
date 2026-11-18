@@ -83,11 +83,13 @@ struct common_lattice_cost {
         return true;
     }
 
-    // DSPINE 11-09 measurement (Taichi 3090, Swift 27B IQ4_XS-M, SJ-KVaRN 4/4, coding 64K, verify ms by rows);
-    // only the shape matters to the planner. Set LLAMA_SPEC_VERIFY_COST for another file, card or context.
+    // DSPINE 11-09 measurement (Taichi 3090, Swift 27B IQ4_XS-M, SJ-KVaRN 4/4, coding 64K, verify ms by rows 5..16);
+    // the 1-row point is extrapolated from the 5..8 slope (about 1.6 ms per row) so that short drafts are priced too.
+    // Only the shape matters to the planner. Set LLAMA_SPEC_VERIFY_COST (measured, stage A1) for another file, card or
+    // context.
     static common_lattice_cost defaults() {
         common_lattice_cost c;
-        c.pts = { { 5, 31.2f }, { 6, 32.7f }, { 8, 36.4f }, { 9, 49.6f }, { 16, 54.3f } };
+        c.pts = { { 1, 24.8f }, { 5, 31.2f }, { 6, 32.7f }, { 8, 36.4f }, { 9, 49.6f }, { 16, 54.3f } };
         c.draft_ms = 5.5f;
         return c;
     }

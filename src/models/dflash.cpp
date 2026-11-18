@@ -512,12 +512,39 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     // DSpine: code bridge after every layer, its last write is refined over the top-k lattice
     const struct ggml_tensor * dspine_codebook_meta = ml->get_tensor_meta("dspine_codebook.weight");
     const struct ggml_tensor * dspine_gate_meta     = ml->get_tensor_meta("dspine_gate.weight");
+    {
+        // [DSPINE-V07] a file with any DSpine tensor must carry the whole code bridge
+        const char * dspine_names[] = { "dspine_codebook.weight", "dspine_gate.weight", "dspine_gate.bias",
+                                        "dspine_pred_gate.weight", "dspine_prev.weight" };
+        int n_found = 0;
+        for (const char * name : dspine_names) {
+            n_found += ml->get_tensor_meta(name) ? 1 : 0;
+        }
+        for (int i = 0; i < n_layer; ++i) {
+            n_found += ml->get_tensor_meta(tn(LLM_TENSOR_DSPINE_READ,  "weight", i).str().c_str()) ? 1 : 0;
+            n_found += ml->get_tensor_meta(tn(LLM_TENSOR_DSPINE_WRITE, "weight", i).str().c_str()) ? 1 : 0;
+        }
+        const int n_want = 5 + 2 * n_layer;
+        if (n_found != 0 && n_found != n_want) {
+            throw std::runtime_error(format("incomplete DSpine drafter: %d of %d dspine tensors present", n_found, n_want));
+        }
+    }
     if (dspine_codebook_meta && dspine_gate_meta) {
+        if (ggml_n_dims(dspine_codebook_meta) != 2 || ggml_n_dims(dspine_gate_meta) != 2) {
+            throw std::runtime_error("invalid DSpine tensors: codebook and gate must be 2-D");
+        }
         const int64_t code = dspine_codebook_meta->ne[0];
         const int64_t rank = dspine_gate_meta->ne[1];
         const int64_t top_k = hparams.dflash_selector_top_k;
-        if (top_k < 2 || n_embd < top_k * (top_k + 1) || selector_meta || hparams.dflash_block_size < 2) {
+        if (top_k < 2 || top_k > n_vocab || n_embd < top_k * (top_k + 1) || selector_meta || hparams.dflash_block_size < 2) {
             throw std::runtime_error("invalid DSpine metadata");
+        }
+        // the code bridge carries each position's predecessor, so the block must be causal; a file converted without
+        // dflash.attention.causal = true would run non-causal (still exact, but acceptance collapses silently)
+        bool dspine_causal = false;
+        ml->get_key(LLM_KV_ATTENTION_CAUSAL, dspine_causal, false);
+        if (!dspine_causal) {
+            throw std::runtime_error("DSpine drafter requires dflash.attention.causal = true");
         }
 
         dspine_codebook  = create_tensor(tn(LLM_TENSOR_DSPINE_CODEBOOK,  "weight"), { code, n_vocab }, 0);
