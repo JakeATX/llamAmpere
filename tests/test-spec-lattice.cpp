@@ -131,7 +131,8 @@ static void test_best_len() {
     CHECK(common_lattice_best_len(a.data(), 15, 6, c) >= 6, "floor respected");
     common_lattice_cost flat;
     flat.pts = { { 1, 10.0f } };
-    std::fill(a.begin(), a.end(), 0.01f);
+    // a = 0.5 keeps every extra position's gain (0.5^15 ~ 3e-5) above double round-off, so each row strictly helps
+    std::fill(a.begin(), a.end(), 0.5f);
     CHECK(common_lattice_best_len(a.data(), 15, 0, flat) == 15, "free rows: draft everything");
     // hand check: a = {1, 0} with cost 10 ms flat, draft 0: L=1 gives 2 tokens / 10 > L=0 gives 1 / 10
     common_lattice_cost f2;
