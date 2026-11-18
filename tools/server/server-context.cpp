@@ -8729,8 +8729,8 @@ private:
                         (!slot.spec_draft_q.empty() || replayed_verify) && synth_probs.empty()) {
                     n_ctrl = common_sampler_get_first_rescue(slot.smpl.get());
                 }
-                if (slot.spec_forced && n_ctrl < 0) {
-                    n_ctrl = (int32_t) slot.spec_n_nat - 1;  // the controller sees what the real rule accepted
+                if (slot.spec_forced) {  // the controller sees what the real rule accepted (n_ctrl only caps it)
+                    common_speculative_set_accepted_real(spec.get(), slot.id, (int32_t) slot.spec_n_nat - 1);
                 }
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, n_ctrl, verify_width);
 

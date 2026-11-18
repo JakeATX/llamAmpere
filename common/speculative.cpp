@@ -213,6 +213,7 @@ struct common_speculative_impl {
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
     int32_t n_accepted_ctrl = -1; // [MBFIX] cap on the accepted count the adaptive controller sees (-1 = none), set per accept call
     int32_t n_drafted_ctrl = -1;
+    int32_t n_accepted_real = -1; // DSPINE-FU S4 forced probe: the real-rule count the controller sees instead of n_accepted (-1 = none)
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -3862,7 +3863,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // the own depth is what a draft of that depth would have returned
             const int attempted = n_drafted_ctrl >= 0 ? n_drafted_ctrl : n_last[seq_id];
             const int own = n_own[seq_id] > 0 ? std::min(attempted, n_own[seq_id]) : attempted;
-            int n_acc = std::min<int>(n_accepted, own);
+            int n_acc = std::min<int>(n_accepted_real >= 0 ? n_accepted_real : n_accepted, own);
             if (n_accepted_ctrl >= 0) {
                 n_acc = std::min<int>(n_acc, n_accepted_ctrl); // [MBFIX] exact-rule count under mode-biased MTP
             }
@@ -5942,6 +5943,13 @@ void common_speculative_note_target_conf(common_speculative * spec, llama_seq_id
     }
 }
 
+// DSPINE-FU S4 forced probe: the next common_speculative_accept on this seq feeds the adaptive controller n_real, not its n_accepted
+void common_speculative_set_accepted_real(common_speculative * spec, llama_seq_id seq_id, int32_t n_real) {
+    if (common_speculative_impl * impl = spec->impl_last[seq_id]) {
+        impl->n_accepted_real = n_real;
+    }
+}
+
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t n_accepted_ctrl, int32_t n_drafted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
@@ -6001,6 +6009,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         impl->accept(seq_id, n_accepted, false);
         impl->n_accepted_ctrl = -1;
         impl->n_drafted_ctrl = -1;
+        impl->n_accepted_real = -1;
         impl->n_call_accept++;
     }
 
