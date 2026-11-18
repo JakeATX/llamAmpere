@@ -1570,6 +1570,20 @@ static int ggml_cuda_fattn_sj_kvarn_compact_nstage(const int W) {
     return c - 1;
 }
 
+// [DSPINE2 B0] GGML_SJKVARN_COMPACT_W78: widths 7/8 on the mode-2 compact tile when the compact mode is 1 (the default).
+// unset/1 = on (default), 0 (off/false/no) = the rows kernel at 7/8 as before. Logged once when the switch is set.
+static bool ggml_cuda_fattn_sj_kvarn_compact_w78() {
+    static const bool on = [] {
+        const int v = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT_W78");
+        if (v >= 0) {
+            GGML_LOG_INFO("ggml_cuda_fattn_sj_kvarn_compact: GGML_SJKVARN_COMPACT_W78=%d: widths 7/8 on %s\n", v,
+                v ? "the mode-2 compact tile" : "the rows kernel");
+        }
+        return v != 0;
+    }();
+    return on;
+}
+
 // mode for a width-4/6/7/8 node: 0 when the shape is not covered (one warning per process when a switch is set)
 static int ggml_cuda_fattn_sj_kvarn_compact_mode_for(const ggml_tensor * dst, const bool kw8) {
     const int mode = ggml_cuda_fattn_sj_kvarn_compact_mode();
@@ -1805,9 +1819,12 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
         int cmode = ggml_cuda_fattn_sj_kvarn_compact_mode_for(dst, NT == 4 && kw8);
         if (cmode == 1 && NT >= 7) {
             // KVROWS step b (fakeep99, 3090 Ti): mode 1 at widths 7/8 is 12-14% slower than the rows kernel (the copied
-            // 8-warp split gives the 6-warp compact grid half the blocks it can hold), so mode 1 stays on rows there.
-            // Mode 2 (own split) is 20% faster at 7/8 and keeps them.
-            cmode = 0;
+            // 8-warp split gives the 6-warp compact grid half the blocks it can hold), so mode 1 never runs there.
+            // [DSPINE2 B0] widths 7/8 take mode 2 (own split) by default instead of the rows kernel: DSpine 8-row verify at a
+            // 103K prompt (Taichi 3090, 6 seeds) -6.4% ms/round; not bit-identical (combine order), KLD vs a q8_0-KV reference
+            // not worse than the rows kernel (DSPINE2 OCCREF/OCCX4). GGML_SJKVARN_COMPACT_W78=0 = rows kernel at 7/8 (kill
+            // switch); COMPACT_ALL=0 still turns every compact tile off. Widths 4/6 keep mode 1 (bit-identical).
+            cmode = ggml_cuda_fattn_sj_kvarn_compact_w78() ? 2 : 0;
         }
         if (cmode != 0) {
             ggml_cuda_fattn_sj_kvarn_stream_compact<turbo4_body, rot>(ctx, dst, nstage_env, cmode, NT == 4 ? 4 : NT == 6 && nt6_occ ? 6 : 8);

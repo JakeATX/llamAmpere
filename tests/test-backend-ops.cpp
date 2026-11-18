@@ -23644,7 +23644,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // [KVROWS] the compact tile at widths 4, 6, 7, 8 (GGML_SJKVARN_COMPACT_ALL=1 mode 1 / GGML_SJKVARN_COMPACT_OCC=1 mode 2):
     // the width-5 set above at the other widths (widths 1-3 as unchanged controls), and 775 records + 300 ring rows
     // (99,628 positions, the P76 1u verify length) for the real KV split counts. Mode 1 bit-identity: GGML_TEST_SEED +
-    // GGML_TEST_DUMP_HASH hashes, switch off vs on.
+    // GGML_TEST_DUMP_HASH hashes, switch off vs on. [DSPINE2 B0] widths 7/8 run mode 2 by default (COMPACT_ALL default 1);
+    // GGML_SJKVARN_COMPACT_W78=0 runs the same cases on the rows kernel: both settings must pass vs the CPU reference.
     for (int64_t n_q : {1, 2, 3, 4, 6, 7, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true));
         if (n_q < 4) {
