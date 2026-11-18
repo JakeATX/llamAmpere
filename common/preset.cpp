@@ -65,6 +65,8 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         medium.options.front().second = "262144";
         medium.env.emplace_back("GGML_CUDA_GRAPH_MAX_ROWS", "16");
         // 8 GB loop check: V07/PRESETS/SOL_HANDOFF.md, owner order 2026-11-17T04:03Z.
+        // 0.7.1: the AI2M10-iw file carries its own MTP layer and head (no sidecars); mb-MTP stays on as in the
+        // other profiles (owner small-card design: LSA + MTP).
         common_card_preset tiny {
             "8dense", "2026-11-17.4", "best known/recheck before ship", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
@@ -73,7 +75,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--cache-type-k", "sjkvarn3"}, {"--cache-type-v", "sjkvarn3"},
                 {"--sjkvarn-body-type", "sjkvarn4t"}, {"--cache-type-s", "q8_0"},
                 {"--override-tensor", "token_embd.weight=CPU"}, {"--load-mode", "none"},
-                {"--spec-type", "draft-mtp"}, {"--no-spec-mb-mtp", "0"}, {"--spec-draft-n-max", "3"},
+                {"--spec-type", "draft-mtp"}, {"--spec-draft-n-max", "3"},
                 {"--spec-n-rs-seq", "3"}, {"--spec-draft-p-min", "0"},
                 {"--spec-draft-vocab-map", "auto:65536"},
                 {"--spec-draft-window", "20480"}, {"--spec-draft-n-ubatch", "8"},
@@ -97,14 +99,13 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"GGML_SJKVARN_TRELLIS_PREFILL_MIB", "16"}, {"GGML_SJKVARN_TRELLIS_WIDTH", "1"},
                 {"GGML_SJKVARN_TRELLIS_WIDTH_LSE", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
                 {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "0"}, {"LLAMA_DRAFT_VOCAB_FULL_HEAD", "1"},
-                {"LLAMA_MODEL_OVERLAY_PATCH", "@model/mtp-dm.gguf,@model/head-ait2.gguf"},
-                {"LLAMA_D1_HEAD", "@model/head-exact-f16.gguf"}, {"GGML_CUDA_GRAPH_MAX_ROWS", "16"}
+                {"GGML_CUDA_GRAPH_MAX_ROWS", "16"}
             }
         };
         tiny.fit_margin_mib = 500;
         std::vector<common_card_preset> cards {large, medium, small, tiny};
         for (auto & card : cards) {
-            card.version = "2026-11-17.6";
+            card.version = card.name == "8dense" ? "2026-11-18.1" : "2026-11-17.6";
             card.options.insert(card.options.end(), {
                 {"--temp", "1.0"}, {"--top-k", "20"}, {"--top-p", "0.95"}, {"--min-p", "0"}
             });

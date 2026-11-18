@@ -286,7 +286,7 @@ static void test(void) {
                 assert(selected.card_preset_fit_target);
                 assert(selected.sampling.temp == 1.0f && selected.sampling.top_k == 20);
                 assert(selected.sampling.top_p == 0.95f && selected.sampling.min_p == 0.0f);
-                assert(selected.sampling.spec_lossy == (name != "8dense"));
+                assert(selected.sampling.spec_lossy);
                 for (size_t target : selected.fit_params_target) {
                     assert(target == size_t(headless ? 500 : 1024) * 1024 * 1024);
                 }
@@ -531,11 +531,17 @@ static void test(void) {
             }
             unsetenv(key.c_str());
         }
+        // 8dense targets a file with its own MTP layer and head: the profile sets no overlay or D1 sidecars.
+        const std::string saved_overlay = std::getenv("LLAMA_MODEL_OVERLAY_PATCH") ? std::getenv("LLAMA_MODEL_OVERLAY_PATCH") : "";
+        const std::string saved_d1 = std::getenv("LLAMA_D1_HEAD") ? std::getenv("LLAMA_D1_HEAD") : "";
+        unsetenv("LLAMA_MODEL_OVERLAY_PATCH");
+        unsetenv("LLAMA_D1_HEAD");
         common_params tiny_env;
-        assert(parse_card({"8dense", "-m", "/models/tiny/healed.gguf"}, tiny_env));
-        common_card_preset_apply_env(tiny_env);
-        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/models/tiny/mtp-dm.gguf,/models/tiny/head-ait2.gguf");
-        assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/models/tiny/head-exact-f16.gguf");
+        assert(parse_card({"8dense", "-m", "/models/tiny/AI2M10-iw.gguf"}, tiny_env));
+        const auto tiny_applied = common_card_preset_apply_env(tiny_env);
+        assert(!std::getenv("LLAMA_MODEL_OVERLAY_PATCH") && !std::getenv("LLAMA_D1_HEAD"));
+        assert(tiny_applied.find("OVERLAY") == std::string::npos && tiny_applied.find("D1_HEAD") == std::string::npos);
+        assert(tiny_env.sampling.spec_lossy);
         assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/tiny/lsa-qwen38-27b-d2048.gguf");
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "1");
         assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "7");
@@ -544,15 +550,12 @@ static void test(void) {
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
-        setenv("LLAMA_MODEL_OVERLAY_PATCH", "/explicit/mtp.gguf,/explicit/head.gguf", 1);
-        setenv("LLAMA_D1_HEAD", "/explicit/exact.gguf", 1);
         setenv("LLAMA_LSA_MEAN_CHUNKS", "0", 1);
         setenv("LLAMA_RESERVE_VERIFY_ROWS", "9", 1);
         setenv("GGML_CUDA_DISABLE_GRAPHS", "0", 1);
         setenv("GGML_ALLOC_GROW_PCT", "5", 1);
         common_card_preset_apply_env(tiny_env);
-        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/explicit/mtp.gguf,/explicit/head.gguf");
-        assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/explicit/exact.gguf");
+        assert(!std::getenv("LLAMA_MODEL_OVERLAY_PATCH") && !std::getenv("LLAMA_D1_HEAD"));
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "0");
         assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "9");
         assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "0");
@@ -570,6 +573,12 @@ static void test(void) {
             } else {
                 unsetenv(key.c_str());
             }
+        }
+        if (!saved_overlay.empty()) {
+            setenv("LLAMA_MODEL_OVERLAY_PATCH", saved_overlay.c_str(), 1);
+        }
+        if (!saved_d1.empty()) {
+            setenv("LLAMA_D1_HEAD", saved_d1.c_str(), 1);
         }
 #endif
     }
