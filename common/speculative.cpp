@@ -5259,6 +5259,17 @@ common_speculative_init_result::common_speculative_init_result(
                 LOG_INF("%s: the last %d entries of the shortlist are adaptive hot slots\n", __func__, cparams.draft_vocab_hot);
             }
         }
+    } else if (has_draft && (params.speculative.draft.dflash || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) &&
+            !params.speculative.draft.vocab_map.empty() &&
+            params.speculative.draft.vocab_map != "none") {
+        // [DSPINE2] the DSpine lattice drafter scores the same shortlist mechanism as MTP (the context ignores it
+        // for other DFlash drafters); "auto" resolves like an MTP draft SJ-KVaRN context: the ordered 24K list
+        // with its 2K hot tail
+        const std::string & vm = params.speculative.draft.vocab_map;
+        cparams.draft_vocab_map = vm == "auto" && params.speculative.draft.vocab_hot == 0 ? "auto:rm24h" : vm.c_str();
+        cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;
+        LOG_INF("%s: DFlash draft context: draft vocabulary shortlist '%s' (DSpine only)\n", __func__, cparams.draft_vocab_map);
     }
 
     // the draft context holds as many tokens per sequence as the target context

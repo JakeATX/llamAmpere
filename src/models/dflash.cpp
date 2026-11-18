@@ -1168,7 +1168,7 @@ static ggml_tensor * build_dspine_write(llm_graph_context & g, const llama_model
 // DSpine serial refinement: redo the last bridge write once per exact predecessor candidate and score the top-k
 // candidates of every row, packed like the DFlash2 lattice: [cand (k), scores (k x k, predecessor-major)]
 static void build_dspine_lattice(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
-        ggml_tensor * output, const dspine_stash & stash) {
+        ggml_tensor * output, const dspine_stash & stash, ggml_tensor * vocab_ids) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -1193,7 +1193,14 @@ static void build_dspine_lattice(llm_graph_context & g, const llama_model & mode
         return ggml_reshape_4d(ctx0, t3, t->ne[0], 1, n_pos, n_blocks);
     };
 
-    ggml_tensor * cand = ggml_reshape_3d(ctx0, ggml_top_k(ctx0, res->t_logits, top_k), top_k, block, n_blocks);
+    ggml_tensor * cand = ggml_top_k(ctx0, res->t_logits, top_k); // [top_k, n_tokens]
+    if (vocab_ids) {
+        // [DSPINE2] top-k positions in the shortlist -> token ids (GET_ROWS of the I32 map viewed as [1, n_sel] rows)
+        GGML_ASSERT(res->t_logits->ne[0] == vocab_ids->ne[0]);
+        ggml_tensor * id_rows = ggml_reshape_2d(ctx0, vocab_ids, 1, vocab_ids->ne[0]);
+        cand = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, id_rows, ggml_reshape_1d(ctx0, cand, top_k * n_tokens)), top_k, n_tokens);
+    }
+    cand = ggml_reshape_3d(ctx0, cand, top_k, block, n_blocks);
     ggml_tensor * cand_run = ggml_cont(ctx0, ggml_view_3d(ctx0, cand, top_k, n_pos, n_blocks, cand->nb[1], cand->nb[2], cand->nb[1]));
 
     // exact predecessor codes: the anchor for row 1, the candidates of row t-1 for row t
@@ -1539,7 +1546,16 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
         output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    // [DSPINE2] DSpine with a draft vocabulary shortlist: every block row scores only the shortlisted rows (compact
+    // raw-copy head, see llama_context::init_draft_vocab); the lattice maps the top-k back to token ids
+    const bool dspine_short = model.dspine_codebook && draft_vocab_ids && draft_vocab_compact &&
+            draft_vocab_compact_src == output && !model.d2t && n_outputs == 0; // lattice-only decode: no logits read back
+    if (dspine_short) {
+        cur = build_draft_vocab_compact(output, output_s, cur); // [n_sel, n_tokens]
+        res->t_logits_ids = draft_vocab_ids;
+    } else {
+        cur = build_lora_mm(output, cur, output_s);
+    }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -1582,7 +1598,7 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
     } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
         build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
     } else if (model.dspine_codebook) {
-        build_dspine_lattice(*this, model, inp_tokens, output, dspine);
+        build_dspine_lattice(*this, model, inp_tokens, output, dspine, dspine_short ? draft_vocab_ids : nullptr);
     }
 }
 
