@@ -186,6 +186,46 @@ static FILE * server_spec_round_log() {
     return f;
 }
 
+// DSPINE-FU S4 forced probe: LLAMA_SPEC_FORCE_TOKENS=<file of whitespace-separated token ids> makes the committed
+// tokens follow the file (one cursor across requests; LLAMA_SPEC_FORCE_SKIP_TASKS=<n> leaves the first n tasks
+// unforced, e.g. a warm request). Drafts are still verified by the real rule: that count feeds the depth controllers
+// and the round log, only the committed text is replaced. Unset (default): no effect.
+struct server_spec_force {
+    std::vector<llama_token> toks;
+    int skip = 0, n_tasks = 0, task = -1;
+    size_t base = 0, end = 0;
+    static server_spec_force & get() {
+        static server_spec_force f = [] {
+            server_spec_force r;
+            if (const char * p = getenv("LLAMA_SPEC_FORCE_TOKENS"); p && *p) {
+                FILE * fp = fopen(p, "r");
+                GGML_ASSERT(fp && "LLAMA_SPEC_FORCE_TOKENS");
+                for (int t; fscanf(fp, "%d", &t) == 1;) { r.toks.push_back(t); }
+                fclose(fp);
+                const char * k = getenv("LLAMA_SPEC_FORCE_SKIP_TASKS");
+                r.skip = k ? atoi(k) : 0;
+                fprintf(stderr, "spec force: %zu tokens, skip %d tasks\n", r.toks.size(), r.skip);
+            }
+            return r;
+        }();
+        return f;
+    }
+    // rewrite ids (the accepted draft prefix + the target token) to follow the file; false = this task is not forced
+    bool apply(int task_id, int n_gen, const llama_tokens & draft, llama_tokens & ids) {
+        if (toks.empty()) { return false; }
+        if (task_id != task) { task = task_id; n_tasks++; base = end; }
+        if (n_tasks <= skip || base + n_gen >= toks.size()) { return false; }
+        llama_tokens out;
+        for (size_t i = 0; base + n_gen + i < toks.size(); ++i) {
+            out.push_back(toks[base + n_gen + i]);
+            if (i >= draft.size() || draft[i] != out.back()) { break; }
+        }
+        ids = std::move(out);
+        end = base + n_gen + ids.size();
+        return true;
+    }
+};
+
 static bool server_mtp_gpu_verify_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
     return gpu_verify != nullptr &&
@@ -938,6 +978,9 @@ struct server_slot {
     common_sampler_ptr spec_smpl_after_verify;
     llama_token spec_replay_token = LLAMA_TOKEN_NULL;
     size_t spec_verify_width = 0;
+    bool spec_forced = false;          // DSPINE-FU S4: this round's committed tokens came from LLAMA_SPEC_FORCE_TOKENS
+    bool spec_round_restored = false;  // DSPINE-FU S4: this round needed a checkpoint restore + replay pass
+    size_t spec_n_nat = 0;             // DSPINE-FU S4: tokens the real rule committed (= ids.size() when not forced)
     // Invalid while a decode or speculative transaction is unresolved.
     llama_pos sj_kvarn_accepted_end = -1;
     bool sj_kvarn_idle_pending = false;
@@ -8429,6 +8472,9 @@ private:
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
+            if (llama_tokens f; server_spec_force::get().apply(slot.task->id, slot.stats.n_gen, {}, f)) {
+                id = f[0];
+            }
 
             slot.i_batch = -1;
 
@@ -8447,7 +8493,7 @@ private:
             // drafters that only draft on a match (n-gram) would have the plain steps in between folded into
             // "round cost by draft width"
             if (FILE * rl = server_spec_round_log()) {
-                fprintf(rl, "R %d %d 0 1 %lld\n", slot.task->id, (int) slot.stats.n_gen,
+                fprintf(rl, "R %d %d 0 1 %lld 1 0\n", slot.task->id, (int) slot.stats.n_gen,
                         slot.t_spec_round_last > 0 ? (long long) (t_now - slot.t_spec_round_last) : -1LL);
                 fflush(rl);
             }
@@ -8557,7 +8603,10 @@ private:
                             ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, false, is_stop)
                             : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, spec_i_batch,
                                     slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay, slot.id, slot.stats.n_gen, is_stop));
+                    slot.spec_n_nat = accepted.size();
+                    slot.spec_forced = server_spec_force::get().apply(slot.task->id, slot.stats.n_gen, slot.spec_draft, accepted);
                 }
+                slot.spec_round_restored = replayed_verify;
 
                 slot.spec_sample_end_us = ggml_time_us();
                 slot.spec_sample_us += (uint64_t) (slot.spec_sample_end_us - t_sample0);
@@ -8680,6 +8729,9 @@ private:
                         (!slot.spec_draft_q.empty() || replayed_verify) && synth_probs.empty()) {
                     n_ctrl = common_sampler_get_first_rescue(slot.smpl.get());
                 }
+                if (slot.spec_forced && n_ctrl < 0) {
+                    n_ctrl = (int32_t) slot.spec_n_nat - 1;  // the controller sees what the real rule accepted
+                }
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, n_ctrl, verify_width);
 
                 slot.spec_draft = std::move(accepted);
@@ -8689,6 +8741,7 @@ private:
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
+            const size_t n_acc_ctl = slot.spec_forced ? slot.spec_n_nat - 1 : n_accepted;  // DSPINE-FU S4
             if (slot.spec_is_replay && !common_speculative_get_synth_probs(spec.get()).empty() && n_accepted > 0) {
                 n_accepted--;
             }
@@ -8723,11 +8776,12 @@ private:
                     }
                 }
                 if (slot.spec_adapt.active()) {
-                    slot.spec_adapt.observe((int) verify_width, (int) n_accepted, slot.t_spec_round_last > 0 ? t_now - slot.t_spec_round_last : 0);
+                    slot.spec_adapt.observe((int) verify_width, (int) n_acc_ctl, slot.t_spec_round_last > 0 ? t_now - slot.t_spec_round_last : 0);
                 }
                 if (FILE * rl = server_spec_round_log()) {
-                    fprintf(rl, "R %d %d %zu %zu %lld\n", slot.task->id, (int) slot.stats.n_gen, (size_t) verify_width, ids.size(),
-                            slot.t_spec_round_last > 0 ? (long long) (t_now - slot.t_spec_round_last) : -1LL);
+                    fprintf(rl, "R %d %d %zu %zu %lld %zu %d\n", slot.task->id, (int) slot.stats.n_gen, (size_t) verify_width, ids.size(),
+                            slot.t_spec_round_last > 0 ? (long long) (t_now - slot.t_spec_round_last) : -1LL,
+                            slot.spec_forced ? slot.spec_n_nat : ids.size(), (int) slot.spec_round_restored);
                     fflush(rl);
                 }
                 slot.t_spec_round_last = t_now;
@@ -8735,10 +8789,10 @@ private:
             }
 
             for (size_t k = 0; k < slot.verify_budget_accept.size() && k < n_draft; ++k) {
-                if (k > n_accepted) {
+                if (k > n_acc_ctl) {
                     break;
                 }
-                const double accepted = k < n_accepted ? 1.0 : 0.0;
+                const double accepted = k < n_acc_ctl ? 1.0 : 0.0;
                 slot.verify_budget_accept[k] += 0.05 * (accepted - slot.verify_budget_accept[k]);
             }
 
