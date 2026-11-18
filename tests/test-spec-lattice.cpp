@@ -2,9 +2,11 @@
 //  1. cost table parse + interpolation, calibration update
 //  2. planner length choice (step cost at 9 rows, flat cost, floors)
 //  3. the walk with the planner off is the pre-DSPINE-V07 inline walk, token for token and q for q (greedy, p_min, sampled)
-//  4. T=1 exactness end to end: lattice walk (sampled, planner on) + common_sampler_verify_pq, repeated rounds, must
-//     reproduce the target's joint law of the first 3 tokens (chi-square); a negative control that truncates on the
-//     drawn token must be detectably biased
+//  4. T=1 exactness end to end: lattice walk (sampled) + common_sampler_verify_pq, repeated rounds, must reproduce the
+//     target's joint law of tokens 1-3 and 3-5 (chi-square) with the planner (fixed calibration, the accept() feedback
+//     loop, cost tables that give draft lengths 0..4), with p_min, and with n_min + p_min under the F1 rule (a sampled
+//     draft is never dropped). Two negative controls (truncate on the drawn token; the pre-F1 n_min discard) must be
+//     detected.
 #include "sampling.h"
 #include "spec-lattice.h"
 
@@ -104,7 +106,7 @@ static void test_cost_and_calib() {
     CHECK(!common_lattice_cost::parse("0:31", bad), "rows >= 1");
     CHECK(!common_lattice_cost::parse("5:-1", bad), "ms > 0");
     CHECK(!common_lattice_cost::parse("", bad), "empty");
-    CHECK(bad.pts.size() == 5, "failed parse leaves out untouched");
+    CHECK(bad.pts.size() == common_lattice_cost::defaults().pts.size() && bad.pts.front().first == 1, "failed parse leaves out untouched");
 
     common_lattice_calib cal;
     CHECK(std::fabs(cal.beta(0) - 1.0f) < 1e-6f, "prior beta 1");
@@ -127,7 +129,10 @@ static void test_best_len() {
     std::fill(a.begin(), a.end(), 0.995f);
     CHECK(common_lattice_best_len(a.data(), 15, 0, c) == 15, "a~1 takes the full block");
     std::fill(a.begin(), a.end(), 0.05f);
-    CHECK(common_lattice_best_len(a.data(), 15, 0, c) <= 4, "low confidence drafts little");
+    CHECK(common_lattice_best_len(a.data(), 15, 0, c) <= 1, "low confidence drafts little (the default table prices 1..4 rows, F6)");
+    std::fill(a.begin(), a.end(), 0.45f);
+    const int32_t l_low = common_lattice_best_len(a.data(), 15, 0, c);
+    CHECK(l_low >= 1 && l_low <= 3, "a=0.45 drafts 1..3 with the default table, got %d", l_low);
     CHECK(common_lattice_best_len(a.data(), 15, 6, c) >= 6, "floor respected");
     common_lattice_cost flat;
     flat.pts = { { 1, 10.0f } };
@@ -206,7 +211,7 @@ static void test_planner_walk() {
 // target: a Markov chain over V tokens, p(x_t | x_{t-1}); the drafter's lattice for a round is a seeded function of
 // the round's anchor (the last emitted token). One round: walk (sampled, planner on) -> p/q verification of each
 // position (target draw x from p, common_sampler_verify_pq) -> on a rejection emit the replacement and end the round,
-// after a full acceptance emit a bonus draw from p. Rounds repeat until 3 tokens are out.
+// after a full acceptance emit a bonus draw from p. Rounds repeat until N_OUT tokens are out.
 static constexpr int32_t V = 6;
 
 static std::vector<double> target_row(int32_t prev) {
@@ -240,54 +245,115 @@ static int32_t draw(const std::vector<double> & p, std::mt19937 & g) {
     return (int32_t) p.size() - 1;
 }
 
-static double run_exactness(bool biased, double * chi2_out) {
+// one exactness configuration (DSPINE-V07 review F2)
+struct exact_cfg {
+    const char * name     = "";
+    bool   plan           = true;  // planner on
+    bool   mixed_cost     = false; // per round, a cost table drawn from an independent RNG (covers lengths 0..4)
+    bool   feedback       = false; // calibration updated from each round's accept count (reset per trial), as accept() does
+    float  p_min          = 0.0f;
+    int    n_min          = 0;     // engine floor: planner l_min; with discard_short the pre-fix "too short -> empty draft"
+    bool   discard_short  = false; // negative control: the pre-F1 rule (drop a sampled draft shorter than n_min)
+    bool   trunc_on_draw  = false; // negative control: drop a position after seeing the drawn token
+};
+
+static constexpr int32_t N_OUT = 5;
+
+// chi-square of observed counts vs expected probabilities, cells with expectation < 5 left out (checked for 0 instead)
+static void chi2_add(double pe, double n, int64_t n_trials, double & chi2, int & cells, double & tv) {
+    tv += std::fabs(n / n_trials - pe);
+    if (pe * n_trials >= 5.0) {
+        chi2 += (n - pe * n_trials) * (n - pe * n_trials) / (pe * n_trials);
+        cells++;
+    } else {
+        CHECK(pe > 0.0 || n == 0, "a zero-probability sequence was emitted");
+    }
+}
+
+// returns false if the emitted law differs from the target's (two chi-squares: tokens 1-3 and tokens 3-5)
+static bool run_exactness(const exact_cfg & cfg, int64_t * len_hist_out = nullptr) {
     const int32_t top_k = 4;
     const int32_t n_pos = 4;
     const size_t  stride = top_k + top_k * top_k;
     common_lattice_cost cost;
     cost.pts = { { 1, 10.0f }, { 2, 10.5f }, { 3, 11.0f }, { 4, 16.0f }, { 5, 16.5f } };
     cost.draft_ms = 2.0f;
-    common_lattice_calib calib; // fixed, uneven betas so the stopping rule varies
+    // forced tables: flat up to k + 1 rows, then a wall, so the planner drafts up to k (k = 0..4)
+    std::vector<common_lattice_cost> forced(5);
+    for (int32_t k = 0; k < 5; ++k) {
+        forced[k].pts = { { k + 1, 10.0f }, { k + 2, 1000.0f } };
+        forced[k].draft_ms = 0.0f;
+    }
+    common_lattice_calib calib0; // fixed, uneven betas so the stopping rule varies
     {
         const float c[4] = { 0.4f, 0.6f, 0.2f, 0.9f };
-        calib.update(c, 4, 3);
-        calib.update(c, 4, 1);
+        calib0.update(c, 4, 3);
+        calib0.update(c, 4, 1);
     }
     std::vector<std::vector<float>> lat_by_anchor;
     for (int32_t a = 0; a <= V; ++a) {
         lat_by_anchor.push_back(make_lattice(n_pos, top_k, V, stride, 1000 + a, 1.5f));
     }
 
-    std::mt19937 g_draft(11), g_tgt(22), g_ver(33);
+    std::mt19937 g_draft(11), g_tgt(22), g_ver(33), g_cost(44);
     common_sampler_pq_stats stats;
     const int64_t n_trials = 300000;
-    std::map<int32_t, int64_t> counts;
+    std::map<int32_t, int64_t> c123, c345;
     std::vector<llama_token_data> pd(V);
     int64_t len_hist[8] = {};
+    int64_t n_rounds = 0;
     for (int64_t t = 0; t < n_trials; ++t) {
         std::vector<int32_t> outv;
         int32_t prev = -1;
-        while (outv.size() < 3) {
+        common_lattice_calib calib = calib0;
+        if (cfg.feedback) {
+            calib.reset();
+        }
+        while ((int32_t) outv.size() < N_OUT) {
             const auto & lat = lat_by_anchor[prev < 0 ? V : prev];
             common_lattice_walk_params wp;
-            wp.top_k = top_k; wp.temp = 1.0f; wp.sample = true; wp.cost = &cost; wp.calib = &calib;
+            wp.top_k = top_k; wp.temp = 1.0f; wp.sample = true; wp.p_min = cfg.p_min;
+            if (cfg.plan) {
+                wp.cost  = &cost;
+                wp.calib = &calib;
+                wp.l_min = cfg.n_min;
+                if (cfg.mixed_cost) {
+                    // independent of the draft: half the rounds use the data-dependent table, half a forced length
+                    const int32_t r = std::uniform_int_distribution<int32_t>(0, 9)(g_cost);
+                    if (r < 5) {
+                        wp.cost = &forced[r];
+                    }
+                }
+            }
             std::vector<llama_token> d;
             std::vector<std::vector<llama_token_data>> q;
             std::vector<float> conf;
-            common_lattice_walk(lat.data(), stride, n_pos, wp, &g_draft, d, &q, &conf);
-            if (biased) {
-                // negative control: drop a position after seeing the drawn token (not a stopping time)
+            common_lattice_walk(lat.data(), stride, n_pos, wp, &g_draft, d, &q, cfg.plan ? &conf : nullptr);
+            if (cfg.trunc_on_draw) {
                 for (size_t i = 0; i < d.size(); ++i) {
-                    if (conf[i] < 0.35f) {
+                    if (q[i].empty()) {
+                        break;
+                    }
+                    float qd = 0.0f;
+                    for (const auto & e : q[i]) {
+                        qd = e.id == d[i] ? e.p : qd;
+                    }
+                    if (qd < 0.35f) {
                         d.resize(i);
                         q.resize(i);
                         break;
                     }
                 }
             }
+            if (cfg.discard_short && (int) d.size() < cfg.n_min) {
+                d.clear();
+                q.clear();
+            }
             len_hist[std::min<size_t>(d.size(), 7)]++;
+            n_rounds++;
             bool all = true;
-            for (size_t i = 0; i < d.size() && outv.size() < 3; ++i) {
+            int32_t n_acc = 0;
+            for (size_t i = 0; i < d.size() && (int32_t) outv.size() < N_OUT; ++i) {
                 const auto p = target_row(prev);
                 for (int32_t v = 0; v < V; ++v) {
                     pd[v] = { v, 0.0f, (float) p[v] };
@@ -301,50 +367,109 @@ static double run_exactness(bool biased, double * chi2_out) {
                     all = false;
                     break;
                 }
+                n_acc++;
             }
-            if (all && outv.size() < 3) {
+            if (all && (int32_t) outv.size() < N_OUT) {
                 const int32_t x = draw(target_row(prev), g_tgt);
                 outv.push_back(x);
                 prev = x;
             }
+            if (cfg.feedback && cfg.plan) {
+                // as accept(): the verified width is the whole draft
+                conf.resize(d.size());
+                calib.update(conf.data(), (int32_t) d.size(), n_acc);
+            }
         }
-        counts[outv[0] * V * V + outv[1] * V + outv[2]]++;
+        c123[outv[0] * V * V + outv[1] * V + outv[2]]++;
+        c345[outv[2] * V * V + outv[3] * V + outv[4]]++;
     }
-    double chi2 = 0.0;
-    double tv   = 0.0;
-    int    cells = 0;
+    // marginal of token 3 under the target chain
+    std::vector<double> m(V, 0.0);
     for (int32_t a = 0; a < V; ++a) {
         for (int32_t b = 0; b < V; ++b) {
             for (int32_t c = 0; c < V; ++c) {
-                const double pe = target_row(-1)[a] * target_row(a)[b] * target_row(b)[c];
-                const double n  = (double) counts[a * V * V + b * V + c];
-                tv += std::fabs(n / n_trials - pe);
-                if (pe * n_trials >= 5.0) {
-                    chi2 += (n - pe * n_trials) * (n - pe * n_trials) / (pe * n_trials);
-                    cells++;
-                } else {
-                    CHECK(pe > 0.0 || n == 0, "a zero-probability sequence was emitted");
-                }
+                m[c] += target_row(-1)[a] * target_row(a)[b] * target_row(b)[c];
             }
         }
     }
-    fprintf(stderr, "exactness%s: chi2 %.1f over %d cells (df %d), TV %.4f, draft lengths 0..4: %lld %lld %lld %lld %lld\n",
-            biased ? " (biased control)" : "", chi2, cells, cells - 1, tv / 2, (long long) len_hist[0], (long long) len_hist[1],
-            (long long) len_hist[2], (long long) len_hist[3], (long long) len_hist[4]);
-    *chi2_out = chi2;
-    return (double) cells - 1;
+    double chi2_a = 0.0, chi2_b = 0.0, tv_a = 0.0, tv_b = 0.0;
+    int    cells_a = 0, cells_b = 0;
+    for (int32_t a = 0; a < V; ++a) {
+        for (int32_t b = 0; b < V; ++b) {
+            for (int32_t c = 0; c < V; ++c) {
+                const int32_t key = a * V * V + b * V + c;
+                chi2_add(target_row(-1)[a] * target_row(a)[b] * target_row(b)[c], (double) c123[key], n_trials, chi2_a, cells_a, tv_a);
+                chi2_add(m[a] * target_row(a)[b] * target_row(b)[c], (double) c345[key], n_trials, chi2_b, cells_b, tv_b);
+            }
+        }
+    }
+    const double df_a = cells_a - 1, df_b = cells_b - 1;
+    // mean df, sd sqrt(2 df); 6 sd is a fixed-seed bound with no false alarms in practice
+    const bool ok = chi2_a < df_a + 6.0 * std::sqrt(2.0 * df_a) && chi2_b < df_b + 6.0 * std::sqrt(2.0 * df_b);
+    fprintf(stderr, "exactness %-28s: tokens 1-3 chi2 %8.1f (df %3.0f) TV %.4f | tokens 3-5 chi2 %8.1f (df %3.0f) TV %.4f | "
+            "draft lengths 0..4 (%%): %.1f %.1f %.1f %.1f %.1f -> %s\n",
+            cfg.name, chi2_a, df_a, tv_a / 2, chi2_b, df_b, tv_b / 2,
+            100.0 * len_hist[0] / n_rounds, 100.0 * len_hist[1] / n_rounds, 100.0 * len_hist[2] / n_rounds,
+            100.0 * len_hist[3] / n_rounds, 100.0 * len_hist[4] / n_rounds, ok ? "matches target" : "DIFFERS from target");
+    if (len_hist_out) {
+        for (int i = 0; i < 8; ++i) {
+            len_hist_out[i] = len_hist[i] * 1000 / std::max<int64_t>(1, n_rounds); // per mille
+        }
+    }
+    return ok;
 }
 
 static void test_exactness() {
-    double chi2 = 0.0;
-    const double df = run_exactness(false, &chi2);
-    // mean df, sd sqrt(2 df); 6 sd is a fixed-seed bound with no false alarms in practice
-    CHECK(chi2 < df + 6.0 * std::sqrt(2.0 * df), "planned sampled walk + p/q verify is not exact: chi2 %.1f df %.0f", chi2, df);
-    double chi2_b = 0.0;
-    const double df_b = run_exactness(true, &chi2_b);
-    if (!(chi2_b > df_b + 6.0 * std::sqrt(2.0 * df_b))) {
-        fprintf(stderr, "WARN: the biased control was not detected (chi2 %.1f): the exactness check has little power here\n", chi2_b);
+    exact_cfg c;
+    c.name = "planner, fixed calib";
+    CHECK(run_exactness(c), "planned sampled walk + p/q verify is not exact (%s)", c.name);
+
+    // (a) lengths 0..4 all exercised
+    exact_cfg cm;
+    cm.name = "planner, mixed cost tables";
+    cm.mixed_cost = true;
+    int64_t h[8] = {};
+    CHECK(run_exactness(cm, h), "not exact (%s)", cm.name);
+    for (int L = 0; L <= 4; ++L) {
+        CHECK(h[L] >= 10, "mixed cost tables: draft length %d in only %lld per mille of rounds", L, (long long) h[L]);
     }
+
+    // (b) the calibration feedback loop of accept()
+    exact_cfg cf;
+    cf.name = "planner, calib feedback";
+    cf.feedback = true;
+    cf.mixed_cost = true;
+    CHECK(run_exactness(cf), "not exact (%s)", cf.name);
+
+    // (c) p_min stop (planner off, and planner on)
+    exact_cfg cp;
+    cp.name = "p_min 0.5, no planner";
+    cp.plan = false;
+    cp.p_min = 0.5f;
+    CHECK(run_exactness(cp), "not exact (%s)", cp.name);
+    exact_cfg cpp = cp;
+    cpp.name = "p_min 0.5 + planner";
+    cpp.plan = true;
+    cpp.feedback = true;
+    CHECK(run_exactness(cpp), "not exact (%s)", cpp.name);
+
+    // (d) n_min 2 with p_min: the fixed rule keeps short sampled drafts (planner floor l_min = n_min)
+    exact_cfg cn = cpp;
+    cn.name = "n_min 2 + p_min 0.5 (fixed)";
+    cn.n_min = 2;
+    CHECK(run_exactness(cn), "not exact (%s)", cn.name);
+
+    // negative controls: each must be detected, else the check has no power for that failure
+    exact_cfg b1;
+    b1.name = "CONTROL truncate on draw";
+    b1.trunc_on_draw = true;
+    CHECK(!run_exactness(b1), "biased control (truncate on the drawn token) was not detected");
+    exact_cfg b2 = cn;
+    b2.name = "CONTROL n_min discard (pre-F1)";
+    b2.plan = false;
+    b2.feedback = false;
+    b2.discard_short = true;
+    CHECK(!run_exactness(b2), "biased control (pre-F1 n_min discard of a sampled draft) was not detected");
 }
 
 int main() {

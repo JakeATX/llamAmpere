@@ -4,7 +4,7 @@
 // A DSpine round verifies 1 + 15 rows and keeps 1 + a of them (a = accepted drafts, 0..15). With n_rs_seq = 15 every
 // a must roll back in place. For the default ring layout (one full state plane per snapshot) and for --gdn-replay
 // (one checkpoint plane + per-token ingredients), and for several rounds in a row, the next-token logits after the
-// rollback must match a context that decoded only the kept tokens.
+// rollback must match a context that decoded only the kept tokens. Also 4 sequences interleaved in one context (F8).
 //
 // usage: test-dspine-rollback -m qwen35-dense.gguf
 #include "arg.h"
@@ -21,10 +21,10 @@
 static constexpr uint32_t N_RS  = 15;
 static constexpr int32_t  BLOCK = 16;
 
-static llama_context * make_ctx(const common_params & params, llama_model * model, bool gdn_replay) {
+static llama_context * make_ctx(const common_params & params, llama_model * model, bool gdn_replay, uint32_t n_seq = 1) {
     auto cparams = common_context_params_to_llama(params);
-    cparams.n_seq_max  = 1;
-    cparams.n_ctx      = 512;
+    cparams.n_seq_max  = n_seq;
+    cparams.n_ctx      = 512 * n_seq;
     cparams.n_batch    = 64;
     cparams.n_ubatch   = 64;
     cparams.n_rs_seq   = N_RS;
@@ -120,6 +120,94 @@ static double run(const common_params & params, llama_model * model, bool gdn_re
     return ok ? worst : std::numeric_limits<double>::infinity();
 }
 
+// [review F8] 4 sequences in one context: every round verifies a 16-row block per sequence in ONE batch, then rolls each
+// sequence back to its own depth, then decodes one next token per sequence in one batch. Each sequence's logits must
+// match a fresh single-sequence context that decoded only that sequence's kept tokens.
+static double run_multi(const common_params & params, llama_model * model, bool gdn_replay,
+        const std::vector<std::vector<int32_t>> & kept_by_seq, uint32_t seed, int n_vocab) {
+    const int32_t n_seq = (int32_t) kept_by_seq.size();
+    std::mt19937 g(seed);
+    std::uniform_int_distribution<int32_t> tok(1, std::max(2, std::min(n_vocab - 1, 1000)));
+
+    llama_context * ctx = make_ctx(params, model, gdn_replay, (uint32_t) n_seq);
+    if (!ctx || llama_n_rs_seq(ctx) < N_RS) {
+        fprintf(stderr, "multi: context init failed or n_rs_seq too small (gdn_replay=%d)\n", gdn_replay);
+        if (ctx) {
+            llama_free(ctx);
+        }
+        return std::numeric_limits<double>::infinity();
+    }
+    auto * mem = llama_get_memory(ctx);
+
+    std::vector<std::vector<llama_token>> hist(n_seq);
+    llama_batch b = llama_batch_init(BLOCK * n_seq, 0, 1);
+    bool ok = true;
+
+    // prefixes of different lengths, one batch
+    common_batch_clear(b);
+    for (int32_t s = 0; s < n_seq; ++s) {
+        hist[s].resize(9 + 2 * s);
+        for (size_t i = 0; i < hist[s].size(); ++i) {
+            hist[s][i] = tok(g);
+            common_batch_add(b, hist[s][i], (llama_pos) i, { s }, i + 1 == hist[s].size());
+        }
+    }
+    ok = llama_decode(ctx, b) == 0;
+
+    double worst = 0.0;
+    const size_t n_rounds = kept_by_seq[0].size();
+    for (size_t r = 0; ok && r < n_rounds; ++r) {
+        // one 16-row verify block per sequence, all in one batch
+        std::vector<std::vector<llama_token>> blk(n_seq, std::vector<llama_token>(BLOCK));
+        common_batch_clear(b);
+        for (int32_t s = 0; s < n_seq; ++s) {
+            for (int32_t i = 0; i < BLOCK; ++i) {
+                blk[s][i] = tok(g);
+                common_batch_add(b, blk[s][i], (llama_pos) (hist[s].size() + i), { s }, true);
+            }
+        }
+        ok = llama_decode(ctx, b) == 0;
+        for (int32_t s = 0; ok && s < n_seq; ++s) {
+            const int32_t a = kept_by_seq[s][r];
+            const llama_pos p0 = (llama_pos) hist[s].size();
+            ok = llama_memory_seq_rm(mem, s, p0 + 1 + a, -1) && llama_memory_seq_pos_max(mem, s) == p0 + a;
+            if (!ok) {
+                fprintf(stderr, "multi round %zu seq %d (a=%d, gdn_replay=%d): rollback refused\n", r, s, a, gdn_replay);
+            }
+            hist[s].insert(hist[s].end(), blk[s].begin(), blk[s].begin() + 1 + a);
+        }
+        if (!ok) {
+            break;
+        }
+        // one next token per sequence, one batch
+        std::vector<llama_token> nxt(n_seq);
+        common_batch_clear(b);
+        for (int32_t s = 0; s < n_seq; ++s) {
+            nxt[s] = tok(g);
+            common_batch_add(b, nxt[s], (llama_pos) hist[s].size(), { s }, true);
+        }
+        ok = llama_decode(ctx, b) == 0;
+        for (int32_t s = 0; ok && s < n_seq; ++s) {
+            llama_context * ref = make_ctx(params, model, gdn_replay);
+            ok = ref && decode(ref, hist[s], 0, false) && decode(ref, { nxt[s] }, (llama_pos) hist[s].size(), true);
+            if (ok) {
+                const double e = nmse(llama_get_logits_ith(ctx, s), llama_get_logits_ith(ref, -1), n_vocab);
+                fprintf(stderr, "  multi gdn_replay=%d round %zu seq %d kept 1+%2d: nmse %.3e\n", gdn_replay, r, s, kept_by_seq[s][r], e);
+                worst = std::max(worst, e);
+            } else {
+                fprintf(stderr, "multi round %zu seq %d: reference decode failed\n", r, s);
+            }
+            if (ref) {
+                llama_free(ref);
+            }
+            hist[s].push_back(nxt[s]);
+        }
+    }
+    llama_batch_free(b);
+    llama_free(ctx);
+    return ok ? worst : std::numeric_limits<double>::infinity();
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     common_params params;
@@ -161,6 +249,19 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s layout=%s plan %zu: worst nmse %.3e\n", pass ? "PASS" : "FAIL", replay ? "gdn_replay" : "ring", i, e);
             fails += pass ? 0 : 1;
         }
+    }
+    // 4 sequences, different accept counts per sequence and round (incl. 0 and the full block)
+    const std::vector<std::vector<int32_t>> multi = {
+        { 0, 15,  3,  7 },
+        { 15, 0,  8,  1 },
+        { 4,  4, 14,  0 },
+        { 7,  2,  0, 15 },
+    };
+    for (const bool replay : { false, true }) {
+        const double e = run_multi(params, model, replay, multi, 900, n_vocab);
+        const bool pass = e <= tol;
+        fprintf(stderr, "%s layout=%s 4-seq interleaved: worst nmse %.3e\n", pass ? "PASS" : "FAIL", replay ? "gdn_replay" : "ring", e);
+        fails += pass ? 0 : 1;
     }
     llama_model_free(model);
     fprintf(stderr, "test-dspine-rollback: %s\n", fails ? "FAIL" : "PASS");
