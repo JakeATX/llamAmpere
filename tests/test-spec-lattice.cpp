@@ -488,7 +488,6 @@ static void test_exactness() {
 static void test_mb() {
     const int32_t top_k = 4, n_pos = 4;
     const size_t  stride = top_k + top_k * top_k;
-    const auto lat = make_lattice(n_pos, top_k, V, stride, 1000 + V, 1.5f);
     const auto p = target_row(-1);
     std::vector<llama_token_data> pd(V);
     for (int32_t v = 0; v < V; ++v) {
@@ -496,6 +495,27 @@ static void test_mb() {
     }
     llama_token_data_array arr = { pd.data(), (size_t) V, -1, false };
     std::mt19937 g_draft(5), g_tgt(6), g_ver(7);
+    // row 1's predecessors all equal the anchor, so q0 is the same for every walk: pick the first lattice seed whose
+    // q0 gives the mb law a TV >= 0.03 from p (otherwise no rescue is possible and the test has no power)
+    std::vector<float> lat;
+    for (uint32_t seed = 1000; ; ++seed) {
+        if (seed >= 1200) { fprintf(stderr, "FAIL: no lattice seed with an mb-visible q0\n"); n_fail++; break; }
+        lat = make_lattice(n_pos, top_k, V, stride, seed, 1.5f);
+        common_lattice_walk_params wp;
+        wp.top_k = top_k; wp.temp = 1.0f; wp.sample = true;
+        std::vector<llama_token> d;
+        std::vector<std::vector<llama_token_data>> q;
+        std::mt19937 g0(seed);
+        common_lattice_walk(lat.data(), stride, n_pos, wp, &g0, d, &q, nullptr);
+        const auto law = common_sampler_pq_mode_distribution(arr, q[0]);
+        double tv = 0.0;
+        for (int32_t v = 0; v < V; ++v) {
+            tv += std::fabs(law[v] - p[v]) / 2;
+        }
+        if (tv >= 0.03) {
+            break;
+        }
+    }
     common_sampler_pq_stats stats;
     const int64_t n = 400000;
     for (int beat = 0; beat < 2; ++beat) {
