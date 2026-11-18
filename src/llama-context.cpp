@@ -2021,7 +2021,9 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
             head = nextn.shared_head_head;
         }
     }
-    if (head == nullptr && model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr) {
+    // [DSPINE2] a DFlash drafter without its own head (DSpine, DSpark) scores the target's head via ctx_other:
+    // the shortlist rows are copied from that head
+    if ((head == nullptr || head->buffer == nullptr) && model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr) {
         const llama_model * model_other = llama_get_model(cparams.ctx_other);
         if (model_other != nullptr) {
             head = model_other->output;
@@ -2029,7 +2031,7 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
         }
     }
     if ((head == nullptr || head->buffer == nullptr) && model.arch == LLM_ARCH_DFLASH && model.dspine_codebook != nullptr) {
-        LLAMA_LOG_WARN("%s: DSpine drafter has no own output head, the lattice scores the target head (no shortlist)\n", __func__);
+        LLAMA_LOG_WARN("%s: DSpine drafter has no output head to shortlist (no target context), full head\n", __func__);
         return;
     }
     if (head == nullptr || head->buffer == nullptr) {
@@ -2052,7 +2054,7 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
         // raw row copies are only valid for plain row-major heads: no rotation folded into the head, no EXL3 rows
         // (rebuilt by llama_draft_compact_build), no AI+ slab layouts
         if (n_sel >= head->ne[1] || !ggml_is_contiguous(head) || ggml_get_type_traits(head->type)->to_float == nullptr ||
-                model.hadamard_rotations.count(head) || model.hadamard_inverses.count(head) ||
+                head_model->hadamard_rotations.count(head) || head_model->hadamard_inverses.count(head) ||
                 ggml_exl3_bits(head->type) != 0 || ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0 ||
                 (!ggml_backend_buft_is_host(hb) && (hd == nullptr || ggml_backend_dev_buffer_type(hd) != hb))) {
             LLAMA_LOG_WARN("%s: DSpine draft vocabulary shortlist not applied (head %s %s), the lattice scores the full head\n",
