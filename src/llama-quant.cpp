@@ -396,6 +396,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find("indexer.proj")     == std::string::npos;
     }
 
+    // dspine: the code bridge projections are small and steer every draft row, keep them accurate
+    if (arch == LLM_ARCH_DFLASH) {
+        quantize &= name.find("dspine_") == std::string::npos || name.find("dspine_codebook") != std::string::npos;
+    }
+
     // glm5-next
     if (arch == LLM_ARCH_GLM5_NEXT) {
         quantize &= name.find("hc_")                     == std::string::npos;
