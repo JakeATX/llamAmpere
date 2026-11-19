@@ -142,7 +142,10 @@ static void server_setup_report(const common_params & params, llama_context * ct
         }
     }
     // fork (FNFALLBACK): repeat the load-time pin refusal at the end of startup, where it is seen
-    if (model.moe_unpinned_bytes) {
+    if (model.moe_unpinned_bytes && !model.moe_unpinned_need) {
+        warn(string_format("EXPERTS NOT PINNED (slower decode): %.2f GiB experts run from model file pages because this system cannot pin them",
+                model.moe_unpinned_bytes / 1073741824.0));
+    } else if (model.moe_unpinned_bytes) {
         warn(string_format("EXPERTS NOT PINNED (slower decode): %.2f GiB experts run from model file pages because RAM was short at load "
                 "(%.2f GiB usable, %.2f GiB needed to pin); free %.2f GiB more RAM and restart for full speed",
                 model.moe_unpinned_bytes / 1073741824.0, model.moe_unpinned_avail / 1073741824.0, model.moe_unpinned_need / 1073741824.0,

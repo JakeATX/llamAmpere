@@ -3066,7 +3066,7 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
             need = std::max<size_t>(need, (size_t(5) << 30) + total / 2 * 5);
         }
         moe_unpinned_bytes = total;
-        moe_unpinned_need  = need;
+        moe_unpinned_need  = pin_ok ? need : 0; // 0: not a RAM shortfall, this system cannot pin
         moe_unpinned_avail = available;
         if (!pin_ok) {
             LLAMA_LOG_WARN("%s: EXPERTS NOT PINNED (slower decode): this system cannot pin %.2f GiB of expert memory; "
