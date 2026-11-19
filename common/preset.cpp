@@ -55,7 +55,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"LLAMA_LSA_REFINE", "128"}, {"LLAMA_LSA_REFINE_MULT", "2"},
                 {"LLAMA_LSA_SHARED", "1"}, {"LLAMA_LSA_FUSED_SEL", "1"},
                 {"LLAMA_LSA_COMP", "0"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
-                {"GGML_SJKVARN_TILE_SKIP", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
+                {"GGML_SJKVARN_TILE_SKIP", "1"},
                 {"GGML_CUDA_LSA_RESIDENT_STAGE", "0"}, {"LLAMA_LSA_KEEP_FRAC", "0.195"},
                 {"LLAMA_LSA_REFINE_SH", "1"}
             }
@@ -100,7 +100,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "256"},
                 {"LLAMA_KQ_MASK_PACKED", "1"}, {"GGML_SJKVARN_TILE_SKIP", "1"},
                 {"GGML_SJKVARN_TRELLIS_PREFILL_MIB", "16"}, {"GGML_SJKVARN_TRELLIS_WIDTH", "1"},
-                {"GGML_SJKVARN_TRELLIS_WIDTH_LSE", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
+                {"GGML_SJKVARN_TRELLIS_WIDTH_LSE", "1"},
                 {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "0"}, {"LLAMA_DRAFT_VOCAB_FULL_HEAD", "1"},
                 {"GGML_CUDA_GRAPH_MAX_ROWS", "16"}
             }
