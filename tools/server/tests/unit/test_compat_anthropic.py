@@ -502,6 +502,7 @@ def test_anthropic_tool_reference():
     """Anthropic defer_loading and tool_reference convert to their OpenAI forms (behaviour: test_tool_call.py)"""
     server.jinja = True
     server.chat_template_file = '../../../models/templates/LFM3.jinja'
+    server.anthropic_thinking = "template"  # compares against the OpenAI endpoint: same thinking default
     server.start()
 
     search = {"name": "tool_search", "description": "Search for available tools by keyword",
@@ -849,6 +850,77 @@ def test_anthropic_thinking():
 
     assert res.status_code == 200
     assert res.body["type"] == "message"
+
+
+def _anthropic_input_tokens(extra):
+    body = {
+        "model": "test",
+        "max_tokens": 1,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Write a short title for this session."}],
+    }
+    body.update(extra)
+    res = server.make_request("POST", "/v1/messages", data=body)
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+    usage = res.body["usage"]
+    # input_tokens counts only the uncached part; a repeated prompt is mostly read from the cache
+    return usage["input_tokens"] + usage.get("cache_read_input_tokens", 0)
+
+
+def test_anthropic_think_only_when_asked():
+    """--anthropic-thinking on-request (default): no "thinking" (or type "disabled") renders the template with
+    thinking off (Qwen3 adds an empty think block to the generation prompt); "enabled"/"adaptive" keep thinking on;
+    an explicit chat_template_kwargs.enable_thinking from the client wins."""
+    global server
+    server.jinja = True
+    server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
+    server.start()
+
+    n_none     = _anthropic_input_tokens({})
+    n_disabled = _anthropic_input_tokens({"thinking": {"type": "disabled"}})
+    n_enabled  = _anthropic_input_tokens({"thinking": {"type": "enabled", "budget_tokens": 64}})
+    n_adaptive = _anthropic_input_tokens({"thinking": {"type": "adaptive"}})
+    n_kwargs   = _anthropic_input_tokens({"chat_template_kwargs": {"enable_thinking": True}})
+
+    assert n_none == n_disabled, (n_none, n_disabled)
+    assert n_enabled == n_adaptive == n_kwargs, (n_enabled, n_adaptive, n_kwargs)
+    # thinking off adds "<think>\n\n</think>\n\n" to the generation prompt
+    assert n_none > n_enabled, (n_none, n_enabled)
+
+    # count_tokens uses the same conversion
+    def count(extra):
+        body = {"model": "test", "messages": [{"role": "user", "content": "Write a short title for this session."}]}
+        body.update(extra)
+        res = server.make_request("POST", "/v1/messages/count_tokens", data=body)
+        assert res.status_code == 200, res.body
+        return res.body["input_tokens"]
+    assert count({}) > count({"thinking": {"type": "enabled", "budget_tokens": 64}})
+
+
+def test_anthropic_thinking_operator_flag_wins():
+    """--reasoning on from the operator keeps thinking on for requests without "thinking"."""
+    global server
+    server.jinja = True
+    server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
+    server.reasoning = "on"
+    server.start()
+
+    n_none    = _anthropic_input_tokens({})
+    n_enabled = _anthropic_input_tokens({"thinking": {"type": "enabled", "budget_tokens": 64}})
+    assert n_none == n_enabled, (n_none, n_enabled)
+
+
+def test_anthropic_thinking_template_mode():
+    """--anthropic-thinking template: a request without "thinking" keeps the template default (thinking on)."""
+    global server
+    server.jinja = True
+    server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
+    server.anthropic_thinking = "template"
+    server.start()
+
+    n_none    = _anthropic_input_tokens({})
+    n_enabled = _anthropic_input_tokens({"thinking": {"type": "enabled", "budget_tokens": 64}})
+    assert n_none == n_enabled, (n_none, n_enabled)
 
 
 def test_anthropic_metadata():

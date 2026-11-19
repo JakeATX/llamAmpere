@@ -16,6 +16,16 @@ Model file: TBD (AI2M10-iw or its healed version from HEALM10; the file name, si
   `LLAMA_MODEL_OVERLAY_PATCH=` (empty) and `-c 114688`: that layer peaks at 7,819 MiB at 204,800 (over the line) and
   7,663 MiB at 114,688. `-c` still sets any context you want. 8dense stays headless-only: `8dense headed` prints a
   note and uses the same settings.
+- **Anthropic API requests think only when they ask.** `/v1/messages` without `"thinking"` (or with
+  `"type": "disabled"`) now runs with thinking off, as the Anthropic API does; `"enabled"` or `"adaptive"` turns it
+  on. Before, Qwen3.8 thought on every request, and Claude Code's short helper calls (session titles) spent their
+  tokens thinking. Apps that never send `"thinking"` now get no thinking: `--anthropic-thinking template` restores
+  the old behaviour, and an explicit `--reasoning` or `enable_thinking` in `--chat-template-kwargs` still wins. The
+  OpenAI endpoints are unchanged.
+- **Windows: the Flash-Next CPU split threads ask not to be power-throttled**, like ggml's own CPU threads already
+  did, so Windows does not move them to efficiency cores or park them.
+- **docs/AI_SETUP.md**: a setup guide to paste into a coding agent (checks the card, picks the preset, builds, starts
+  and tests the server).
 - **mb-MTP is on for 8dense**, as on the other three presets. `--no-spec-mb-mtp` turns it off.
 - **Faster prompt reading on the small-card weight types** (AIF175_U2, AIF25_U2, AIF25_U2_512). These ran the
   one-token kernel even for prompt batches, so each weight was decoded again for every 8 tokens. They now use the
