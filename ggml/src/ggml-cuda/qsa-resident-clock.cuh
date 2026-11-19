@@ -64,6 +64,11 @@ struct ggml_cuda_qsa_clock_map {
     uint32_t * stage_valid = nullptr; // copied strips by stage index and head
     unsigned long long * stage_stats = nullptr; // exact bytes, strips (all heads), records
     unsigned long long * overflow_hist = nullptr; // diagnostic: staged records with 0..8 live strips, union over rows/heads
+    // GGML_CUDA_LSA_STAGE_AHEAD (default on with a whole-record stage; =0 off): the layers of a buffer alternate between
+    // two stages, and while the previous LSA layer computes, a side stream copies this layer's last staged pick
+    // (ahead_list, stage_ctl 7 entries) into this layer's stage at indices 0.. so the resolve copies only the new misses.
+    // Speed only: a reused entry holds the same master bytes (records sealed by this ubatch are never reused).
+    int32_t * ahead_list = nullptr;
     // No publisher yet. Bind only after all host/state/prefill paths support the opt-in master; keep its map immutable in flight.
     const char * strip_master = nullptr; // opt-in source only; CLOCK slots stay canonical
     size_t strip_master_capacity = 0;
@@ -97,6 +102,8 @@ bool ggml_cuda_qsa_strip_body(const ggml_tensor * body);
 ggml_backend_buffer_type_t ggml_backend_cuda_qsa_page_buffer_type(ggml_backend_dev_t dev, size_t stride, uint32_t slots, uint32_t heads);
 const char * ggml_cuda_lsa_page_body(const ggml_tensor * body); // tagged map for a page body, else body->data
 void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+// GGML_CUDA_LSA_STAGE_AHEAD: after a decode attention on a record-page body is queued; no-op otherwise
+void ggml_cuda_lsa_page_ahead(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 // GGML_OP_LSA_PREFETCH (LLAMA_LSA_J3): mark the target body's predicted (and/or previously picked) records, give them
 // CLOCK slots and copy them in on the low-priority side stream; the target's next prepare/refresh joins it. No-op for a
 // body without record-page slots.

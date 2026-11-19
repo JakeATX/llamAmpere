@@ -46,6 +46,8 @@ struct qsa_clock_tensor {
     char * host = nullptr; // host address of the root tensor; map.host is a device mapping
     ggml_cuda_qsa_clock_map * device_map = nullptr;
     int device = -1;
+    uint64_t ahead_seq = 0; // GGML_CUDA_LSA_STAGE_AHEAD: prepare number of the layer that queued this layer's ahead copy
+    uint64_t prep_seq = 0;  // GGML_CUDA_LSA_STAGE_AHEAD: this layer's last prepare number
     // GGML_CUDA_LSA_PREFETCH (opt-in, record pages): the previous LSA layer's pick fills this layer's slots on a side
     // stream; pf_done joins it back before this layer's seal refresh or resolve touches the map.
     cudaEvent_t pf_done = nullptr;
@@ -170,6 +172,33 @@ static bool lsa_overflow_log() {
     }();
     return lsa_stage_all() && on;
 }
+// stage_ctl words: 0 entries this resolve, 1 first entry this resolve copies (the ahead entries sit below it), u64 at 2
+// copied total, u64 at 4 stage full, 7 ahead_list entries for the next ahead copy, u64 at 8 ahead entries picked again,
+// u64 at 10 ahead entries offered
+constexpr int LSA_STAGE_CTL_WORDS = 12;
+// GGML_CUDA_LSA_STAGE_AHEAD (default on; =0 off): see ggml_cuda_qsa_clock_map::ahead_list. Needs the whole-record stage
+// (GGML_CUDA_LSA_RESIDENT_STAGE) and stays off with STAGE_ALL, stage strips and GGML_CUDA_LSA_PREFETCH; a J3 prefetch
+// (LLAMA_LSA_J3) turns it off for the process. Costs a second stage of the same size per buffer.
+static bool lsa_stage_ahead_env() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_LSA_STAGE_AHEAD");
+        return v == nullptr || *v == 0 || atoi(v) > 0;
+    }();
+    return on;
+}
+// GGML_CUDA_LSA_STAGE_AHEAD_BLOCKS: blocks per KV head of the ahead copy (default 8: few SMs, the link is the limit)
+static uint32_t lsa_stage_ahead_blocks() {
+    static const uint32_t n = [] {
+        const char * v = getenv("GGML_CUDA_LSA_STAGE_AHEAD_BLOCKS");
+        return v && atoi(v) > 0 ? uint32_t(std::min(atoi(v), 256)) : 8u;
+    }();
+    return n;
+}
+static int lsa_prefetch_cap();
+static bool lsa_stage_ahead_on(const ggml_cuda_qsa_clock_map & m) {
+    return lsa_stage_ahead_env() && m.cells == GGML_LSA_PAGE_CELLS && m.stage_n > 0 && !m.stage_all && !m.stage_stride &&
+        !m.strip_master && lsa_prefetch_cap() == 0;
+}
 static size_t lsa_stage_stride(size_t stride, uint32_t heads) {
     GGML_ASSERT(heads > 0 && stride <= SIZE_MAX - size_t(heads)*4096);
     return lsa_stage_strips() ? stride + size_t(heads)*4096 : stride;
@@ -178,6 +207,25 @@ static std::mutex lsa_pf_mutex;
 static std::vector<qsa_clock_tensor *> lsa_pf_entries; // record-page entries, for the next-layer lookup
 static cudaStream_t lsa_pf_stream[GGML_CUDA_MAX_DEVICES] = {};
 static cudaEvent_t lsa_pf_fork[GGML_CUDA_MAX_DEVICES] = {};
+
+// GGML_CUDA_LSA_STAGE_AHEAD: one low-priority side stream per device; at most one ahead copy in flight, joined by the
+// next record-page prepare on the device whatever layer it is. A prepare counter tells the target layer whether the copy
+// was queued by the prepare right before its own (else the copy is dropped and the resolve copies as before).
+static cudaStream_t lsa_ahead_stream[GGML_CUDA_MAX_DEVICES] = {};
+static cudaEvent_t lsa_ahead_fork[GGML_CUDA_MAX_DEVICES] = {};
+static cudaEvent_t lsa_ahead_done[GGML_CUDA_MAX_DEVICES] = {};
+static bool lsa_ahead_pending[GGML_CUDA_MAX_DEVICES] = {};
+static uint64_t lsa_ahead_seq[GGML_CUDA_MAX_DEVICES] = {};
+static std::vector<qsa_clock_tensor *> lsa_ahead_entries; // under lsa_pf_mutex
+static std::atomic<bool> lsa_ahead_blocked{false};         // set by the first J3 prefetch
+static bool lsa_ahead_logged = false;
+
+static void lsa_ahead_join(cudaStream_t stream, int device) {
+    if (device >= 0 && lsa_ahead_pending[device]) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, lsa_ahead_done[device], 0));
+        lsa_ahead_pending[device] = false;
+    }
+}
 
 static void lsa_pf_join(cudaStream_t stream, qsa_clock_tensor * e) {
     if (e && e->pf_pending) {
@@ -198,6 +246,8 @@ struct qsa_clock_buffer {
     bool pool_tried = false;
     std::vector<void *> blocks;
     char * stage = nullptr; // GGML_CUDA_LSA_RESIDENT_STAGE: shared by this buffer's record-page layers
+    char * stage2 = nullptr; // GGML_CUDA_LSA_STAGE_AHEAD: the second stage (odd record-page layers of the buffer)
+    uint32_t page_layers = 0; // record-page layers given a stage so far (parity)
     size_t stage_bytes = 0;
 };
 
@@ -220,7 +270,8 @@ static size_t qsa_clock_layout(ggml_cuda_qsa_clock_map & m, ggml_cuda_qsa_clock_
     char * ctl = take(QSA_CLOCK_CTL_WORDS*sizeof(uint32_t));
     char * seen = take(m.cells == GGML_LSA_PAGE_CELLS && lsa_admit_filter() ? size_t(m.records)*sizeof(uint32_t) : 0);
     char * stage_page = take(size_t(m.stage_n)*sizeof(int32_t));
-    char * stage_ctl = take(m.stage_n ? 8*sizeof(uint32_t) : 0);
+    char * stage_ctl = take(m.stage_n ? LSA_STAGE_CTL_WORDS*sizeof(uint32_t) : 0);
+    char * ahead_list = take(lsa_stage_ahead_on(m) ? size_t(m.stage_n)*sizeof(int32_t) : 0);
     const bool overflow_log = m.cells == GGML_LSA_PAGE_CELLS && m.stage_n && lsa_overflow_log();
     const bool strip_mask = m.stage_stride || overflow_log;
     char * stage_mask = take(strip_mask ? size_t(m.records)*sizeof(uint32_t) : 0);
@@ -235,6 +286,7 @@ static size_t qsa_clock_layout(ggml_cuda_qsa_clock_map & m, ggml_cuda_qsa_clock_
         m.seen = m.cells == GGML_LSA_PAGE_CELLS && lsa_admit_filter() ? (uint32_t *) seen : nullptr;
         m.stage_page = m.stage_n ? (int32_t *) stage_page : nullptr;
         m.stage_ctl = m.stage_n ? (uint32_t *) stage_ctl : nullptr;
+        m.ahead_list = lsa_stage_ahead_on(m) ? (int32_t *) ahead_list : nullptr;
         m.stage_mask = strip_mask ? (uint32_t *) stage_mask : nullptr;
         m.stage_valid = m.stage_stride ? (uint32_t *) stage_valid : nullptr;
         m.stage_stats = m.stage_stride ? (unsigned long long *) stage_stats : nullptr;
@@ -267,6 +319,11 @@ static void qsa_clock_sync(ggml_backend_buffer_t buffer) {
 
 static void qsa_clock_reset(ggml_backend_buffer_t buffer) {
     qsa_clock_sync(buffer);
+    {
+        const int device = static_cast<qsa_clock_buffer *>(buffer->context)->device;
+        lsa_ahead_pending[device] = false; // the device is idle: any ahead copy has landed
+        ++lsa_ahead_seq[device];           // and none is applied after the reset
+    }
     for (const auto & entry : static_cast<qsa_clock_buffer *>(buffer->context)->tensors) {
         auto & m = entry->map;
         if (entry->recall_history) {
@@ -287,7 +344,7 @@ static void qsa_clock_reset(ggml_backend_buffer_t buffer) {
             CUDA_CHECK(cudaMemset(m.j3_src, 0, size_t(m.records)*sizeof(uint32_t)));
         }
         if (m.stage_ctl) {
-            CUDA_CHECK(cudaMemset(m.stage_ctl, 0, 8*sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemset(m.stage_ctl, 0, LSA_STAGE_CTL_WORDS*sizeof(uint32_t)));
         }
         if (m.stage_mask) {
             CUDA_CHECK(cudaMemset(m.stage_mask, 0, size_t(m.records)*sizeof(uint32_t)));
@@ -310,6 +367,7 @@ static void qsa_clock_free(ggml_backend_buffer_t buffer) {
         std::lock_guard<std::mutex> lock(lsa_pf_mutex);
         for (const auto & e : b->tensors) {
             lsa_pf_entries.erase(std::remove(lsa_pf_entries.begin(), lsa_pf_entries.end(), e.get()), lsa_pf_entries.end());
+            lsa_ahead_entries.erase(std::remove(lsa_ahead_entries.begin(), lsa_ahead_entries.end(), e.get()), lsa_ahead_entries.end());
             if (e->pf_done) CUDA_CHECK(cudaEventDestroy(e->pf_done));
             if (e->recall_history) CUDA_CHECK(cudaFree(e->recall_history));
             if (e->map.prev) CUDA_CHECK(cudaFree(e->map.prev));
@@ -351,8 +409,13 @@ static void qsa_clock_free(ggml_backend_buffer_t buffer) {
                     e->map.layer, pf[7], pf[7]/calls);
             }
             if (e->map.stage_ctl) {
-                uint64_t st[4]{}; // u64 at stage_ctl 2 staged, 4 stage full (totals lag the last resolve)
+                uint64_t st[LSA_STAGE_CTL_WORDS/2]{}; // u64 at stage_ctl 2 staged, 4 stage full (totals lag the last resolve)
                 CUDA_CHECK(cudaMemcpy(st, e->map.stage_ctl, sizeof(st), cudaMemcpyDeviceToHost));
+                if (e->map.ahead_list) {
+                    GGML_LOG_WARN("LSA STAGE AHEAD: layer %d offered=%llu reused=%llu, per resolve: %.2f MiB copied ahead, "
+                        "%.2f MiB reused (not copied by the resolve)\n", e->map.layer, (unsigned long long) st[5],
+                        (unsigned long long) st[4], st[5]*rec_mib/calls, st[4]*rec_mib/calls);
+                }
                 GGML_LOG_WARN("LSA RESIDENT: layer %d stage=%u records, staged=%llu stage_full=%llu, per resolve: %.2f MiB "
                     "%s, %.2f MiB still read from host\n", e->map.layer, e->map.stage_n,
                     (unsigned long long) st[1], (unsigned long long) st[2], st[1]*rec_mib/calls,
@@ -387,6 +450,7 @@ static void qsa_clock_free(ggml_backend_buffer_t buffer) {
     for (void * block : b->blocks) CUDA_CHECK(cudaFree(block));
     if (b->pool) CUDA_CHECK(cudaFree(b->pool));
     if (b->stage) CUDA_CHECK(cudaFree(b->stage));
+    if (b->stage2) CUDA_CHECK(cudaFree(b->stage2));
     if (b->host) CUDA_CHECK(cudaFreeHost(b->host));
     delete b;
 }
@@ -457,6 +521,25 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
             m.stage_n = stage_n;
             m.stage_all = lsa_stage_all();
             m.stage_stride = lsa_stage_strips() ? stride : 0;
+            if (lsa_stage_ahead_on(m) && !lsa_ahead_blocked) {
+                // GGML_CUDA_LSA_STAGE_AHEAD: odd record-page layers of the buffer take the second stage, so a layer's
+                // ahead copy never writes the stage the layer before it is reading
+                if (!b->stage2) {
+                    if (cudaMalloc((void **) &b->stage2, b->stage_bytes) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        b->stage2 = nullptr;
+                        lsa_ahead_blocked = true;
+                        GGML_LOG_WARN("LSA STAGE AHEAD: could not allocate the second stage (%.1f MiB); off\n",
+                            b->stage_bytes/1048576.0);
+                    } else {
+                        GGML_LOG_WARN("LSA STAGE AHEAD: on, second stage of %u records (%.1f MiB); "
+                            "GGML_CUDA_LSA_STAGE_AHEAD=0 turns it off\n", stage_n, b->stage_bytes/1048576.0);
+                    }
+                }
+                if (b->stage2 && (b->page_layers++ & 1u)) {
+                    m.stage = b->stage2;
+                }
+            }
         } else if (lsa_stage_all()) {
             GGML_LOG_ERROR("LSA RESIDENT: shared full stage is too small for this layer\n");
             return GGML_STATUS_ALLOC_FAILED;
@@ -495,7 +578,7 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
         CUDA_CHECK(cudaMemset(m.seen, 0, size_t(m.records)*sizeof(uint32_t)));
     }
     if (m.stage_ctl) {
-        CUDA_CHECK(cudaMemset(m.stage_ctl, 0, 8*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(m.stage_ctl, 0, LSA_STAGE_CTL_WORDS*sizeof(uint32_t)));
     }
     if (m.stage_mask) {
         CUDA_CHECK(cudaMemset(m.stage_mask, 0, size_t(m.records)*sizeof(uint32_t)));
@@ -521,6 +604,18 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
             CUDA_CHECK(cudaEventCreateWithFlags(&lsa_pf_fork[t->device], cudaEventDisableTiming));
         }
         lsa_pf_entries.push_back(entry.get());
+    }
+    if (m.ahead_list) {
+        // stream and events are made here, never while a CUDA graph is being captured
+        std::lock_guard<std::mutex> lock(lsa_pf_mutex);
+        if (!lsa_ahead_stream[t->device]) {
+            int lo = 0, hi = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&lsa_ahead_stream[t->device], cudaStreamNonBlocking, lo));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lsa_ahead_fork[t->device], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lsa_ahead_done[t->device], cudaEventDisableTiming));
+        }
+        lsa_ahead_entries.push_back(entry.get());
     }
     tensor->extra = entry.get();
     static_cast<qsa_clock_buffer *>(buffer->context)->tensors.push_back(std::move(entry));
@@ -873,6 +968,15 @@ static __device__ void lsa_record_copy(const ggml_cuda_qsa_clock_map & m, int re
 static __device__ void lsa_page_copy(const ggml_cuda_qsa_clock_map & m, int record, int slot, int head) {
     lsa_record_copy(m, record, m.card, slot, head);
 }
+// GGML_CUDA_LSA_STAGE_AHEAD: on the side stream, ahead_list entry i (this layer's last staged pick) to stage index i
+static __global__ void lsa_stage_ahead_copy(ggml_cuda_qsa_clock_map m) {
+    const uint32_t n = min(m.stage_ctl[7], m.stage_n);
+    for (uint32_t i = blockIdx.x; i < n; i += gridDim.x) {
+        const int record = m.ahead_list[i];
+        if (record < 0 || uint32_t(record) >= m.records) continue;
+        lsa_record_copy(m, record, m.stage, int(i), blockIdx.y);
+    }
+}
 
 // GGML_CUDA_LSA_RESIDENT_STAGE: a picked record without a CLOCK slot takes the next stage index for this resolve
 // (table -3 - k); with no stage, or the stage full, it is read from the master (table -1) exactly as before.
@@ -882,6 +986,10 @@ static __device__ void lsa_stage_or_master(const ggml_cuda_qsa_clock_map & m, in
         if (k < m.stage_n) {
             m.stage_page[k] = record;
             m.table[record] = -3 - int(k);
+            if (m.ahead_list) { // GGML_CUDA_LSA_STAGE_AHEAD: offered to the next ahead copy of this layer
+                const uint32_t a = atomicAdd(m.stage_ctl + 7, 1u);
+                if (a < m.stage_n) m.ahead_list[a] = record;
+            }
             return;
         }
     }
@@ -890,19 +998,35 @@ static __device__ void lsa_stage_or_master(const ggml_cuda_qsa_clock_map & m, in
 
 // start of a resolve (and of a prefill call): the previous resolve's stage entries go back to -1, so nothing reads the
 // stage after another layer has overwritten it; counters. One block.
-static __global__ void lsa_stage_reset(ggml_cuda_qsa_clock_map m) {
+// apply (GGML_CUDA_LSA_STAGE_AHEAD, decode only, the ahead copy of this layer has landed): ahead_list entry j now sits
+// at stage index j, so its record takes table entry -3 - j and the resolve's new stage entries start after them. The
+// mark drops an entry whose record this ubatch seals (and the resolve copies it again).
+static __global__ void lsa_stage_reset(ggml_cuda_qsa_clock_map m, int apply) {
     const uint32_t n = m.stage_ctl[0];
     const uint32_t used = min(n, m.stage_n);
+    const uint32_t first = min(m.stage_ctl[1], used);
     for (uint32_t i = threadIdx.x; i < used; i += blockDim.x) {
         const int record = m.stage_page[i];
         if (m.table[record] == -3 - int(i)) m.table[record] = -1;
     }
     __syncthreads();
+    const uint32_t keep = m.ahead_list && apply ? min(m.stage_ctl[7], m.stage_n) : 0;
+    for (uint32_t j = threadIdx.x; j < keep; j += blockDim.x) {
+        const int record = m.ahead_list[j];
+        m.stage_page[j] = record;
+        if (record >= 0 && uint32_t(record) < m.records) atomicCAS(m.table + record, -1, -3 - int(j));
+    }
+    __syncthreads();
     if (threadIdx.x == 0) {
         auto * c = reinterpret_cast<unsigned long long *>(m.stage_ctl + 2);
-        c[0] += used;
+        c[0] += used - first; // copied by the resolve (ahead entries below first were not)
         c[1] += n - used;
-        m.stage_ctl[0] = 0;
+        if (m.ahead_list) {
+            reinterpret_cast<unsigned long long *>(m.stage_ctl + 8)[1] += keep;
+            m.stage_ctl[7] = 0; // this resolve offers the next list
+        }
+        m.stage_ctl[0] = keep;
+        m.stage_ctl[1] = keep;
     }
 }
 
@@ -914,7 +1038,8 @@ static __global__ void lsa_stage_copy(ggml_cuda_qsa_clock_map m, int bits_k, int
             bits_k != int(m.strip_master_bits >> 8) || bits_v != int(m.strip_master_bits & 255)) { __trap(); return; }
     }
     const uint32_t used = min(m.stage_ctl[0], m.stage_n);
-    for (uint32_t i = blockIdx.x; i < used; i += gridDim.x) {
+    const uint32_t first = min(m.stage_ctl[1], used); // GGML_CUDA_LSA_STAGE_AHEAD: entries below first are in place
+    for (uint32_t i = first + blockIdx.x; i < used; i += gridDim.x) {
         if (m.strip_master && (m.stage_page[i] < 0 || uint32_t(m.stage_page[i]) >= m.records)) { __trap(); return; }
         if (m.overflow_hist && blockIdx.y == 0 && threadIdx.x == 0) {
             const uint32_t wanted = m.stage_mask[m.stage_page[i]] & 255u;
@@ -1038,6 +1163,11 @@ static void qsa_clock_written_range(ggml_backend_buffer_t buffer, qsa_clock_tens
         CUDA_CHECK(cudaEventSynchronize(e->pf_done));
         e->pf_pending = false;
         for (bool & issued : e->j3_issued) issued = false;
+    }
+    if (e->device >= 0 && lsa_ahead_done[e->device]) {
+        // GGML_CUDA_LSA_STAGE_AHEAD: the master changes under any queued ahead copy, so none is applied
+        CUDA_CHECK(cudaEventSynchronize(lsa_ahead_done[e->device]));
+        ++lsa_ahead_seq[e->device];
     }
     GGML_ASSERT(e->map.stride && size_t(e->map.records) <= SIZE_MAX/e->map.stride);
     const size_t bytes = size_t(e->map.records)*e->map.stride;
@@ -1374,6 +1504,9 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
     if (lane != 0) return;
     const int record = desc[GGML_SJKVARN_DESC_TABLE] ? desc[GGML_SJKVARN_DESC_N_ENTRIES + g] : g;
     if (record < 0 || record >= int(m.records)) return;
+    if (m.ahead_list && !pf && g >= (desc[GGML_SJKVARN_DESC_B_OLD] - S)/G && m.table[record] <= -3) {
+        m.table[record] = -1; // GGML_CUDA_LSA_STAGE_AHEAD: this ubatch seals the record, the ahead copy may be stale
+    }
     if (m.stage_mask) {
         m.stage_mask[record] = strips;
         live = strips != 0;
@@ -1418,6 +1551,11 @@ static __global__ void lsa_page_mark(ggml_cuda_qsa_clock_map m, const int32_t * 
         } else {
             lsa_stage_or_master(m, record); // past the slots: stage, else the master
         }
+    } else if (slot <= -3 && !pf && m.ahead_list) {
+        // GGML_CUDA_LSA_STAGE_AHEAD: picked again, read in place from its ahead entry and offered to the next list
+        const uint32_t a = atomicAdd(m.stage_ctl + 7, 1u);
+        if (a < m.stage_n) m.ahead_list[a] = record;
+        atomicAdd(reinterpret_cast<unsigned long long *>(m.stage_ctl + 8), 1ull);
     }
 }
 
@@ -1759,6 +1897,7 @@ void ggml_cuda_lsa_j3_graph_end(ggml_backend_cuda_context & ctx) {
 }
 
 void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    lsa_ahead_blocked = true; // GGML_CUDA_LSA_STAGE_AHEAD: J3 claims stage entries on its own side stream
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, sizeof(float), ctx.stream())); // the result is a placeholder
     const ggml_tensor * desc = dst->src[0];
     const ggml_tensor * units = dst->src[2];
@@ -1960,8 +2099,16 @@ void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tens
         GGML_ASSERT(layout.v_zero == layout.v_scale + 256);
     }
     lsa_pf_join(ctx.stream(), e);
+    // GGML_CUDA_LSA_STAGE_AHEAD: every prepare joins the in-flight ahead copy (it writes a stage); the copy is applied
+    // only by its target, and only when the target's prepare comes right after the prepare that queued it
+    lsa_ahead_join(ctx.stream(), e->device);
+    const uint64_t seq = ++lsa_ahead_seq[e->device];
+    const bool apply = e->map.ahead_list && e->ahead_seq != 0 && e->ahead_seq + 1 == seq && !lsa_ahead_blocked &&
+        dst->src[0]->ne[1] <= 8;
+    e->ahead_seq = 0;
+    e->prep_seq = seq;
     if (e->map.stage_n) {
-        lsa_stage_reset<<<1, 256, 0, ctx.stream()>>>(e->map); // before anything reads this layer's table again
+        lsa_stage_reset<<<1, 256, 0, ctx.stream()>>>(e->map, apply ? 1 : 0); // before anything reads this layer's table again
         CUDA_CHECK(cudaGetLastError());
     }
     if (dst->src[0]->ne[1] > 8) return; // prefill reads every record: slots as they are, the rest from the master
@@ -2022,4 +2169,43 @@ void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tens
         lsa_stage_copy<<<dim3(copy_blocks, e->map.heads), 256, 0, ctx.stream()>>>(e->map, bits >> 8, bits & 255);
         CUDA_CHECK(cudaGetLastError());
     }
+}
+
+// GGML_CUDA_LSA_STAGE_AHEAD: called right after a decode attention on a record-page body is queued. The next LSA layer
+// (by layer number, same device, the other stage) gets its last staged pick copied into its stage on the side stream,
+// after everything queued so far (this attention included: the copy then overlaps the layers in between, not the
+// attention kernel, which fills every SM). Its prepare joins the copy before the stage reset applies it.
+void ggml_cuda_lsa_page_ahead(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    if (!dst->src[5] || !dst->src[6] || dst->src[0]->ne[1] > 8 || lsa_ahead_blocked) return;
+    auto * e = qsa_clock_entry(dst->src[5]);
+    if (!e || e->map.cells != GGML_LSA_PAGE_CELLS || !e->map.ahead_list || e->device < 0) return;
+    const int dev = e->device;
+    if (e->prep_seq != lsa_ahead_seq[dev] || lsa_ahead_pending[dev] || !lsa_ahead_stream[dev]) return;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+    if (cap != cudaStreamCaptureStatusNone) return; // CUDA graphs: the resolve copies as before
+    qsa_clock_tensor * next = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(lsa_pf_mutex);
+        for (auto * c : lsa_ahead_entries) {
+            if (c != e && c->device == dev && c->map.layer > e->map.layer && c->map.records == e->map.records &&
+                    c->map.stage != e->map.stage && (!next || c->map.layer < next->map.layer)) {
+                next = c;
+            }
+        }
+    }
+    if (!next) return;
+    if (!lsa_ahead_logged) {
+        lsa_ahead_logged = true;
+        GGML_LOG_WARN("LSA STAGE AHEAD: first ahead copy, layer %d -> layer %d (%u blocks per head)\n", e->map.layer,
+            next->map.layer, lsa_stage_ahead_blocks());
+    }
+    cudaStream_t side = lsa_ahead_stream[dev];
+    CUDA_CHECK(cudaEventRecord(lsa_ahead_fork[dev], ctx.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(side, lsa_ahead_fork[dev], 0));
+    lsa_stage_ahead_copy<<<dim3(lsa_stage_ahead_blocks(), next->map.heads), 256, 0, side>>>(next->map);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(lsa_ahead_done[dev], side));
+    lsa_ahead_pending[dev] = true;
+    next->ahead_seq = lsa_ahead_seq[dev];
 }
