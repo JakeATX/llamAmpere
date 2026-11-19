@@ -117,11 +117,14 @@ one 512-token chat reply, 120 to 146 tokens/s). Their settings are unchanged fro
 and Bash tool calls) on v0.7.1; on the build before this fix the first request of each session fails (HTTP 500).
 
 **Linux build:** `llamampere-v0.7.1-linux-x86_64-cuda12-server.tar` runs on Ubuntu 22.04 or newer (glibc 2.35+) with
-an NVIDIA driver and the CUDA 12 runtime and cuBLAS. It brings its own GCC runtime libraries (libstdc++, libgcc_s,
-libgomp; GPL with the GCC Runtime Library Exception, licence and source notes inside), so no newer compiler packages
-are needed; checked on stock Ubuntu 22.04 with an RTX 3060 Ti. Building from source needs GCC 13 or newer. The source
+an NVIDIA driver for CUDA 12.4 or newer (R550+); no CUDA toolkit is needed. It is built for RTX 30-series cards
+(sm_86). It brings the CUDA 12.4 runtime and cuBLAS libraries (NVIDIA redistributables, CUDA-EULA.txt inside) and its
+own GCC runtime libraries (libstdc++, libgcc_s, libgomp; GPL with the GCC Runtime Library Exception, licence and source
+notes inside), so no newer compiler packages are needed; checked in a plain Ubuntu 22.04 container that has only the
+NVIDIA driver. Building from source needs GCC 13 or newer. The source
 of those GCC runtime libraries (gcc-16 16-20260315-1ubuntu1~22~ppa1, Ubuntu Toolchain PPA) is attached to the release.
 
-**Windows build:** `llamampere-v0.7.1-windows-x86_64-cuda12-server.zip` holds `llama-server.exe` with the CUDA 12
-runtime and cuBLAS DLLs and the web UI; it needs an NVIDIA driver. Windows build made by CI; not yet run on a GPU by
-us, report issues.
+**Windows build:** `llamampere-v0.7.1-windows-x86_64-cuda12-server.zip` holds `llama-server.exe` with the CUDA 12.4
+runtime and cuBLAS DLLs (NVIDIA redistributables), the Microsoft C++ runtime DLLs and the web UI. It is built for
+RTX 30-series cards (sm_86) and needs an NVIDIA driver for CUDA 12.4 or newer (R550+). Windows build made by CI; not
+yet run on a GPU by us, report issues.

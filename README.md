@@ -128,8 +128,8 @@ To start it again later, run the last three lines from the `llamAmpere` folder. 
 
 **Build and run (v0.7.1, Swift 1.5 27B, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
 toolkit (`nvcc`), CMake, git and a C++ compiler. Get the model file for 24 GB cards first:
-[qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4) (P76 AI4, 14.4 GB), for example with
-`hf download jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4 qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf --local-dir models`. Then replace `/path/to/` below with the folder you saved it in. This one paste clones or updates llamAmpere at v0.7.1, builds
+[qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4) (P76 AI4, 14.4 GB), for example with the `hf` tool (`pip install -U huggingface_hub`):
+`hf download jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4 qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf --local-dir models`. Then replace `/path/to/` below with the full path of the folder you saved it in. This one paste clones or updates llamAmpere at v0.7.1, builds
 `llama-server` and starts it with the 24 GB preset:
 
 ```bash
