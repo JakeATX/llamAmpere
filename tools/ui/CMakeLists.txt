@@ -17,16 +17,21 @@ if(DEFINED LLAMA_WEBUI_HF_BUCKET)
     message(DEPRECATION "LLAMA_WEBUI_HF_BUCKET is deprecated, use LLAMA_UI_HF_BUCKET instead")
 endif()
 
-# Resolve HF asset version: explicit env var > derived from build number > unset
+# Upstream llama.cpp build whose prebuilt UI matches tools/ui and this server.
+# Our build number counts this fork's commits, not upstream's, so "b<build number>"
+# names an unrelated upstream UI (or none, and the download falls back to "latest").
+# Bump this when tools/ui is synced from upstream.
+# A plain variable, not a cache entry, so a bump reaches existing build dirs; set HF_UI_VERSION to override.
+set(LLAMA_UI_UPSTREAM_VERSION "b12359")
+
+# Resolve HF asset version: explicit env var > pinned upstream build
 if(DEFINED ENV{HF_WEBUI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_WEBUI_VERSION}")
     message(DEPRECATION "HF_WEBUI_VERSION env var is deprecated, use HF_UI_VERSION instead")
 elseif(DEFINED ENV{HF_UI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
-elseif(DEFINED LLAMA_BUILD_NUMBER)
-    set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
 else()
-    set(HF_UI_VERSION "")
+    set(HF_UI_VERSION "${LLAMA_UI_UPSTREAM_VERSION}")
 endif()
 
 if(NOT "${HF_UI_VERSION}" STREQUAL "" AND NOT HF_UI_VERSION MATCHES "^[A-Za-z0-9._-]+$")
