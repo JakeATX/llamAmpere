@@ -16,8 +16,9 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // Window 4096 and GDN replay are multi-user values: with one slot arg.cpp turns both off unless set
         // explicitly (V07/SPEEDREG). No vocab map here, so a one-slot DSJ drafter resolves the ordered RM24H list.
         common_card_preset large {
-            "24dense", "2026-11-17.3", "checked for v0.7.1", "", {
+            "24dense", "2026-11-19.1", "checked for v0.7.1", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"}, {"--fit", "on"},
+                // 1024 is the multi-user ceiling; arg.cpp raises it to 2048 with one slot (V07/SPEEDREG).
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
                 {"--spec-type", "draft-mtp-adaptive"},

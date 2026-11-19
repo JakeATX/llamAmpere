@@ -1138,9 +1138,20 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 params.speculative.draft.n_min_adaptive = 3;
                 params.speculative.draft.n_max = 7;
             }
-            LOG_INF("card preset 24dense, one slot: draft window %d, gdn-replay %s, adaptive depth %d..%d "
+            // ub ceiling 2048 at one user (the deep-ctx ladder still steps down): 98,766 cold prefill +5.4%, full fill
+            // 256,696 +3.3%, decode ms/round unchanged, full-fill peak 21,116 MiB on a 3090. Multi-user keeps 1024.
+            if (!explicit_or_env("--ubatch-size")) {
+                params.n_ubatch = std::min(2048, params.n_batch);
+                const std::string preset_ub = " --ubatch-size 1024";
+                const size_t pos = params.card_preset_flags.find(preset_ub);
+                if (pos != std::string::npos) {
+                    params.card_preset_flags.replace(pos, preset_ub.size(), " --ubatch-size " + std::to_string(params.n_ubatch));
+                }
+            }
+            LOG_INF("card preset 24dense, one slot: draft window %d, gdn-replay %s, adaptive depth %d..%d, ubatch %d "
                     "(multi-user values apply with -np > 1)\n", params.speculative.draft.attn_window,
-                    params.gdn_replay ? "on" : "off", params.speculative.draft.n_min_adaptive, params.speculative.draft.n_max);
+                    params.gdn_replay ? "on" : "off", params.speculative.draft.n_min_adaptive, params.speculative.draft.n_max,
+                    params.n_ubatch);
         }
     }
 
