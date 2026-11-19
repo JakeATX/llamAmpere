@@ -90,11 +90,11 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 Card presets assume a display is attached and reserve 1,024 MiB of GPU memory, except 8dense, which is headless-only and reserves 500 MiB. The reserve comes off the card's total memory (a 10 GB card stays at or under 9,216 MiB headed); memory already in use, such as a desktop, counts toward it. An explicit `--fit-target` keeps its free-memory meaning. `8dense headed` prints a note and uses the same headless settings. Append `headless` (`--preset 12dense headless`) or use `12dense-headless` for a 500 MiB margin on 10dense, 12dense, and 24dense. Headed defaults are 180,224 tokens for 10dense and 196,608 for 12dense, with CUDA graphs off for headed 12dense. Headless defaults remain 212,992 for 10dense, 262,144 for 12dense, and 204,800 for 8dense (with `mtp-dm.gguf` the 0.7.1 file peaks at 7,607 MiB on an RTX 3070, under the 7,692 MiB headless line). Headless 12dense at the full 262,144 tokens is tested on an RTX 3080 Ti 12 GB: a 262,142-token fill completed with 11,642 MiB peak (500 MiB margin line 11,788), 1,009 prompt tokens/s and 70.8 writing tokens/s at a 100K prompt. Fitting is on: the dynamic microbatch ladder remains enabled, and fitting may reduce a preset context to honor the margin. An explicit `-c`, `-fitt`, or `-fit` wins in either order. Startup reports the chosen context. Small cards still support one user only; multi-user support is future work.
 
-Card profiles target dense Swift 1.5 Qwen 27B. All four set sampler defaults to temperature 1.0, top-k 20, top-p 0.95, and min-p 0; explicit CLI flags and per-request sampler fields override them. All four profiles keep mb-MTP on with MTP; `--no-spec-mb-mtp` turns it off. Choose the matching model file and use one profile:
+Card profiles target dense Swift 1.5 Qwen 27B. All four set sampler defaults to temperature 1.0, top-k 20, top-p 0.95, and min-p 0; explicit CLI flags and per-request sampler fields override them. All four profiles keep mb-MTP on with MTP; `--no-spec-mb-mtp` turns it off. Choose the matching model file and use one profile. The 24 GB file (P76 AI4, 14.4 GB) is [qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4).
 
 ```bash
-llama-server --preset 24dense -m /path/to/P76-AI4.gguf
-llama-server --preset 24dense -m /path/to/P76-AI4.gguf -np 3 -c 352256 --slot-ctx 262144,0,0
+llama-server --preset 24dense -m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf
+llama-server --preset 24dense -m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf -np 3 -c 352256 --slot-ctx 262144,0,0
 llama-server --preset 12dense -m /path/to/L0.gguf
 llama-server --preset 12dense headless -m /path/to/L0.gguf   # no display on the card: full 262,144 context
 llama-server --preset 10dense -m /path/to/public-AI2.gguf
@@ -127,8 +127,9 @@ scripts/flash-next-server.sh -m models/flash-next/qwen3.8-flash-next-Swift1.5-AT
 To start it again later, run the last three lines from the `llamAmpere` folder. The server listens on http://127.0.0.1:8080 (OpenAI-compatible API).
 
 **Build and run (v0.7.1, Swift 1.5 27B, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
-toolkit (`nvcc`), CMake, git and a C++ compiler. Get the model file for 24 GB cards (P76 AI4) first, and replace
-`/path/to/P76-AI4.gguf` below with where you saved it. This one paste clones or updates llamAmpere at v0.7.1, builds
+toolkit (`nvcc`), CMake, git and a C++ compiler. Get the model file for 24 GB cards first:
+[qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4) (P76 AI4, 14.4 GB), for example with
+`hf download jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4 qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf --local-dir models`. Then replace `/path/to/` below with the folder you saved it in. This one paste clones or updates llamAmpere at v0.7.1, builds
 `llama-server` and starts it with the 24 GB preset:
 
 ```bash
@@ -139,7 +140,7 @@ else
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
-./build-sm86/bin/llama-server --preset 24dense -m /path/to/P76-AI4.gguf
+./build-sm86/bin/llama-server --preset 24dense -m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf
 ```
 
 The preset sets the context, cache types, MTP drafting and the microbatch ladder; do not add `-b` or `-ub`.
@@ -147,7 +148,7 @@ For 12, 10 and 8 GB cards, swap in the matching preset and model file from **Qui
 
 The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
 To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp; not re-measured with the v0.7.1 preset) instead,
-replace `-m /path/to/P76-AI4.gguf` with
+replace `-m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf` with
 `--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
 ## Headline results

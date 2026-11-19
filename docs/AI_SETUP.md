@@ -76,6 +76,7 @@ If the build fails, show the user the first error, not the last lines.
 python3 -m venv .venv && . .venv/bin/activate   # never use pip --break-system-packages
 pip install -U huggingface_hub                   # gives the `hf` command
 hf download jakeatx/<repository> <file>.gguf --local-dir models
+# 24 GB preset (P76 AI4): hf download jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4 qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf --local-dir models
 # 8/10/12 GB presets: also the LSA map, into the same folder
 hf download jakeatx/<repository> lsa-qwen38-27b-d2048.gguf --local-dir models
 # 8 GB preset: also the small MTP drafter, into the same folder
