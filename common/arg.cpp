@@ -1121,6 +1121,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (explicit_or_env("--batch-size") && !explicit_or_env("--ubatch-size")) {
             params.n_ubatch = std::min(params.n_ubatch, params.n_batch);
         }
+        // fork: 24dense draft window 4096 and GDN replay are multi-user values. One slot drafts with full attention
+        // (which also makes the SJ-KVaRN draft cache + RM24H list eligible) and rolls back without replay; explicit
+        // flags and environment still win. V07/SPEEDREG.
+        if (params.card_preset == "24dense" && params.n_parallel == 1) {
+            if (!explicit_or_env("--spec-draft-window")) {
+                params.speculative.draft.attn_window = 0;
+            }
+            if (!explicit_or_env("--gdn-replay")) {
+                params.gdn_replay = false;
+            }
+        }
     }
 
     if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {

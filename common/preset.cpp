@@ -13,6 +13,8 @@
 const common_card_preset & common_card_preset_get(const std::string & name, bool headless) {
     static const std::vector<common_card_preset> headless_profiles = [] {
         // Timed ub QC: V07/ASYMCTX/QC_READY_asymctx_24gb.md; ceiling stays bounded by -ub.
+        // Window 4096 and GDN replay are multi-user values: with one slot arg.cpp turns both off unless set
+        // explicitly (V07/SPEEDREG). No vocab map here, so a one-slot DSJ drafter resolves the ordered RM24H list.
         common_card_preset large {
             "24dense", "2026-11-17.3", "best known/recheck before ship", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"}, {"--fit", "on"},
@@ -21,7 +23,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--spec-type", "draft-mtp-adaptive"},
                 {"--spec-draft-n-min-adaptive", "4"}, {"--spec-draft-n-max", "5"}, {"--spec-draft-n-min", "4"},
                 {"--spec-draft-p-min", "0"}, {"--spec-draft-window", "4096"},
-                {"--spec-draft-vocab-map", "auto"}, {"--gdn-replay", "1"}, {"--kv-unified", "1"}
+                {"--gdn-replay", "1"}, {"--kv-unified", "1"}
             }, {
                 {"LLAMA_GDN_REPLAY_LANES", "1"}, {"LLAMA_DEEPCTX_LADDER", "1"}
             }
