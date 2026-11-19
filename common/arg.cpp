@@ -4655,7 +4655,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--anthropic-thinking"}, "MODE",
         "thinking for Anthropic API requests (/v1/messages): 'on-request' thinks only when the request has "
         "\"thinking\": {\"type\": \"enabled\"} (or \"adaptive\"), as the Anthropic API does; 'template' keeps the "
-        "chat template's default (default: on-request)",
+        "chat template's default; an explicit --reasoning or enable_thinking in --chat-template-kwargs wins (default: on-request)",
         [](common_params & params, const std::string & value) {
             if (value == "on-request") {
                 params.anthropic_think_on_request = true;

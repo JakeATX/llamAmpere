@@ -46,8 +46,13 @@ Use the card's total memory from step 1:
 | 10 GB (3080 10 GB) | `10dense` | one user |
 | 8 GB (3060 Ti, 3070, 3070 Ti) | `8dense` | one user, headless only (no display on the card) |
 
+Other sizes (16 GB or 20 GB cards such as the A4000 or A4500) have no preset: ask the user which one to try rather
+than picking one yourself.
+
 Each preset needs its own model file. Take the file for the chosen preset from the **Quick start: pick your
 card** section of the repository README for the release you build. Do not mix a preset with another preset's file.
+If the README gives no file name for the chosen preset (for example "name TBD"), stop and tell the user that this
+card size has no released model file yet.
 The model files are on https://huggingface.co/jakeatx.
 
 ### 3. Get the code and build
@@ -57,7 +62,7 @@ Use the newest release tag (not `master`):
 ```bash
 git clone https://github.com/JakeATX/llamAmpere.git
 cd llamAmpere
-tag=$(git tag --list 'v*' --sort=-v:refname | head -1); echo "$tag"
+tag=$(git tag --list 'v0.[0-9]*' --sort=-v:refname | head -1); echo "$tag"   # llamAmpere tags are v0.x
 git checkout "$tag"
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON
 cmake --build build-sm86 -j8 --target llama-server
@@ -68,7 +73,8 @@ If the build fails, show the user the first error, not the last lines.
 ### 4. Download the model file
 
 ```bash
-pip install -U huggingface_hub            # gives the `hf` command; use a virtual environment if the user prefers
+python3 -m venv .venv && . .venv/bin/activate   # never use pip --break-system-packages
+pip install -U huggingface_hub                   # gives the `hf` command
 hf download jakeatx/<repository> <file>.gguf --local-dir models
 ```
 
@@ -102,7 +108,7 @@ card name, the preset and the prompt length.
 - OpenAI-compatible apps: base URL `http://127.0.0.1:8080/v1`, any model name, any key (or the `--api-key` value).
 - Anthropic-compatible apps such as Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`. The server thinks
   only when the request asks for thinking, as the Anthropic API does (`--anthropic-thinking template` keeps the
-  model's default instead).
+  model's default instead). Older builds lack this option; check `llama-server --help` for `--anthropic-thinking`.
 
 ### 8. Tell the user
 

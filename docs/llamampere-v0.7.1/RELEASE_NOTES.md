@@ -7,6 +7,16 @@ Model file: TBD (AI2M10-iw or its healed version from HEALM10; the file name, si
 
 ## What changed
 
+- **Anthropic API requests think only when they ask.** `/v1/messages` without `"thinking"` (or with
+  `"type": "disabled"`) now runs with thinking off, as the Anthropic API does; `"enabled"` or `"adaptive"` turns it
+  on. Before, Qwen3.8 thought on every request, and Claude Code's short helper calls (session titles) spent their
+  tokens thinking. Apps that never send `"thinking"` now get no thinking: `--anthropic-thinking template` restores
+  the old behaviour, and an explicit `--reasoning` or `enable_thinking` in `--chat-template-kwargs` still wins. The
+  OpenAI endpoints are unchanged.
+- **Windows: the Flash-Next CPU split threads ask not to be power-throttled**, like ggml's own CPU threads already
+  did, so Windows does not move them to efficiency cores or park them.
+- **docs/AI_SETUP.md**: a setup guide to paste into a coding agent (checks the card, picks the preset, builds, starts
+  and tests the server).
 - **8dense needs only the model file and the LSA map** (`lsa-qwen38-27b-d2048.gguf`). The 0.7.1 file carries its own
   MTP draft layer and output head, so the preset no longer looks for `mtp-dm.gguf`, `head-ait2.gguf` or
   `head-exact-f16.gguf`. In v0.7.0.1, `--preset 8dense` with this file stopped at start with "failed to load overlay
