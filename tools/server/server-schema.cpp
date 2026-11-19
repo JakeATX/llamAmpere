@@ -362,6 +362,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("reasoning_control", params.sampling.reasoning_control))
         ->set_desc("Create the budget sampler on demand so reasoning can be ended at runtime"));
 
+    add((new field_num("reasoning_answer_reserve", params.sampling.reasoning_answer_reserve))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Tokens kept for the answer: the think block is closed when max_tokens or the context is this near (-1 = auto, 0 = off)"));
+
     add((new field_num("reasoning_budget_tokens", params.sampling.reasoning_budget_tokens))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Number of tokens in the reasoning budget (-1 = disabled)"));
