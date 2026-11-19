@@ -16,6 +16,11 @@ Faster writing for one user on 24 GB cards, the 8 GB model file, and faster smal
   `--spec-draft-window 4096 --gdn-replay 1 --spec-draft-n-min-adaptive 4 --spec-draft-n-max 5`; `--no-spec-draft-sjkvarn`
   turns off only the faster draft cache and shortlist. Saved slot files from v0.7.0.1 one-user runs do not reload,
   because the draft settings changed.
+- **24dense with one user reads long prompts faster.** The prompt-batch ceiling is 2048 tokens with one slot (it was
+  1024); the batch ladder still steps down near full context. A cold 98,766-token prompt reads at 1,350 tokens/s instead
+  of 1,277 (+5.8%, RTX 3090, P76 AI4); writing speed is unchanged within noise. Peak card memory rises to 21,354 MiB at
+  that prompt. With `-np 2` to `4` the ceiling stays 1024. `-ub 1024` (or `LLAMA_ARG_UBATCH=1024`) restores the old
+  ceiling.
 - **8dense needs three files in one folder:** the model file, the LSA map (`lsa-qwen38-27b-d2048.gguf`) and the small
   MTP drafter `mtp-dm.gguf` (127,489,024 bytes, sha256 `4a8e9a5cfb6b1395088bd88b26400b504e47a10fad5a109e4cbee3276f9d5cae`).
   The preset loads `mtp-dm.gguf` in place of the model file's own MTP layer and no longer looks for `head-ait2.gguf`
@@ -63,6 +68,11 @@ setup" is the fastest one-user setup measured before this release (R16 flags, 11
 | Peak card memory | 19,564 MiB | 17,450 MiB (smaller context) | 20,708 MiB | under the 23,552 MiB line |
 
 At a 256,696-token prompt (full 262,144 context) v0.7.1 wrote 89.56 tokens/s with a 21,440 MiB peak (one seed).
+
+The table above was measured with a 1024 prompt-batch ceiling. With the final 2048 ceiling, same card, model and prompt,
+6 seeds alternated against the 1024 build: writing 112.03 vs 115.58 tokens/s (per-seed ratio 0.97, 95% range 0.84 to
+1.13: no difference shown; a separate 12-seed run measured 110.90 vs 111.05), prompt reading 1,350 vs 1,277 tokens/s,
+peak 21,354 vs 20,708 MiB. At the full 256,696-token fill the 2048 ceiling reads the prompt 3.3% faster.
 
 **24 GB, three users.** Same card and model, the shipped multi-user command (`--preset 24dense -np 3 -c 352256
 --slot-ctx 262144,0,0`), prompts of 99,984, 32,766 and 32,766 tokens written at the same time, 21 runs per build over
