@@ -1,4 +1,5 @@
 #include "reasoning-budget.h"
+#include "sampling.h"
 #include "unicode.h"
 
 #include "llama.h"
@@ -375,6 +376,61 @@ static void test_utf8_boundary_detection() {
     GGML_ASSERT(common_utf8_is_complete(std::string("hello\xC3\xA9", 7)));    // ASCII + complete 2-byte
 }
 
+// fork NOCUTOFF: answer reserve sizing and the passthrough think tracker
+static void test_answer_reserve() {
+    GGML_ASSERT(common_answer_reserve(-1, -1) == 0);        // no limit: nothing to reserve
+    GGML_ASSERT(common_answer_reserve(4096, 0) == 0);       // kill switch
+    GGML_ASSERT(common_answer_reserve(4096, -1) == 1024);   // auto: 1/4 of the limit
+    GGML_ASSERT(common_answer_reserve(1024, -1) == 512);    // auto: at least 512
+    GGML_ASSERT(common_answer_reserve(600, -1) == 300);     // auto: at most half of a small limit
+    GGML_ASSERT(common_answer_reserve(131072, -1) == 32768);
+    GGML_ASSERT(common_answer_reserve(4096, 200) == 200);   // fixed
+    GGML_ASSERT(common_answer_reserve(100, 200) == 100);    // fixed, clamped to the limit
+
+    common_params_sampling params;
+    params.reasoning_budget_start  = {100};
+    params.reasoning_budget_end    = {{101}};
+    params.reasoning_budget_forced = {102, 101};
+
+    params.reasoning_answer_reserve = 0;
+    GGML_ASSERT(common_reasoning_tracker_init(nullptr, params) == nullptr && "reserve 0 = no tracker");
+    params.reasoning_answer_reserve = -1;
+    {
+        common_params_sampling no_tags = params;
+        no_tags.reasoning_budget_end.clear();
+        GGML_ASSERT(common_reasoning_tracker_init(nullptr, no_tags) == nullptr && "no think tags = no tracker");
+    }
+
+    auto * tracker = common_reasoning_tracker_init(nullptr, params);
+    GGML_ASSERT(tracker != nullptr);
+    GGML_ASSERT(common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_IDLE);
+    GGML_ASSERT(!common_reasoning_budget_force(tracker) && "outside the think block nothing is forced");
+
+    llama_sampler_accept(tracker, 100);
+    for (int i = 0; i < 10000; ++i) {
+        llama_sampler_accept(tracker, 50);
+    }
+    GGML_ASSERT(common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING && "tracker never forces on its own");
+
+    // passthrough while counting: logits untouched
+    llama_token_data data[3] = {{50, 1.0f, 0.0f}, {101, 2.0f, 0.0f}, {102, 3.0f, 0.0f}};
+    llama_token_data_array arr = {data, 3, -1, false};
+    llama_sampler_apply(tracker, &arr);
+    GGML_ASSERT(data[0].logit == 1.0f && data[1].logit == 2.0f && data[2].logit == 3.0f);
+
+    // closing forces the end sequence
+    GGML_ASSERT(common_reasoning_budget_force(tracker));
+    llama_sampler_apply(tracker, &arr);
+    GGML_ASSERT(std::isinf(data[0].logit) && std::isinf(data[1].logit) && data[2].logit == 3.0f);
+    llama_sampler_accept(tracker, 102);
+    llama_sampler_accept(tracker, 101);
+    GGML_ASSERT(common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_DONE);
+
+    // the chain-level close needs a chain
+    GGML_ASSERT(!common_sampler_reasoning_close(nullptr, &tracker));
+    llama_sampler_free(tracker);
+}
+
 int main(void) {
     // Reasoning budget sampler tests
     printf("Testing reasoning budget sampler... ");
@@ -511,8 +567,9 @@ int main(void) {
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
+    test_answer_reserve();
 
-    printf("OK (12 tests passed)\n");
+    printf("OK (13 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

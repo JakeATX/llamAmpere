@@ -19,6 +19,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "src/llama-ext.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -835,6 +836,10 @@ struct server_slot {
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
+    // fork NOCUTOFF: think-block tracker (outside the sampler chain) and the answer reserve, sized at the first token
+    llama_sampler_ptr think_tracker;
+    int32_t answer_reserve = -1;
+
     size_t last_nl_pos = 0;
 
     common_chat_input generated;
@@ -1138,6 +1143,8 @@ struct server_slot {
         verify_budget_accept.clear();
 
         n_predict_max = -1;
+        think_tracker.reset();
+        answer_reserve = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -3784,6 +3791,8 @@ private:
         // the per-request limit takes priority over the global one
         slot.loop_guard = {};
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+        slot.answer_reserve = -1;
+        slot.think_tracker.reset(slot.smpl ? common_reasoning_tracker_init(model_tgt, task.params.sampling) : nullptr);
 
         slot.sj_kvarn_accepted_end = -1;
         slot.sj_kvarn_idle_pending = false;
@@ -3832,6 +3841,9 @@ private:
         // Keep token bytes apart from text buffered for UTF-8 and stop strings.
         slot.add_token(result);
         slot.sampled = result.tok;
+        if (slot.think_tracker) {
+            llama_sampler_accept(slot.think_tracker.get(), result.tok);
+        }
 
         slot.generated.append(token_str, result.tok);
         if (slot.task->params.return_tokens) {
@@ -3896,6 +3908,33 @@ private:
 
             SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
                     slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+        }
+
+        // fork NOCUTOFF: close the think block while the answer still has room before max_tokens or a full context
+        // (LLAMA_ARG_REASONING_ANSWER_RESERVE / --reasoning-answer-reserve 0 turns it off)
+        if (last_in_group && slot.has_next_token && slot.smpl && tp.sampling.reasoning_answer_reserve != 0) {
+            int32_t left = slot.n_remaining();
+            if (!params_base.ctx_shift) {
+                const int32_t ctx_left = slot.n_ctx - slot.prompt.n_tokens() - 1;
+                left = left < 0 ? ctx_left : std::min(left, ctx_left);
+            }
+            if (left >= 0) {
+                if (slot.answer_reserve < 0) {
+                    slot.answer_reserve = common_answer_reserve(left + slot.stats.n_gen, tp.sampling.reasoning_answer_reserve);
+                }
+                if (left <= slot.answer_reserve + (int32_t) tp.sampling.reasoning_budget_forced.size()) {
+                    llama_sampler * tracker = slot.think_tracker.release();
+                    const bool had_tracker = tracker != nullptr;
+                    if (common_sampler_reasoning_close(slot.smpl.get(), &tracker)) {
+                        if (had_tracker && tracker == nullptr) {
+                            llama_set_sampler(slot.ctx_tgt, slot.id, nullptr); // the chain now holds a budget sampler
+                        }
+                        SLT_INF(slot, "answer reserve: closing the think block, n_gen = %d, left = %d, reserve = %d\n",
+                                (int) slot.stats.n_gen, left, slot.answer_reserve);
+                    }
+                    slot.think_tracker.reset(tracker);
+                }
+            }
         }
 
         // check the limits
