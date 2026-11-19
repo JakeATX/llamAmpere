@@ -76,7 +76,14 @@ If the build fails, show the user the first error, not the last lines.
 python3 -m venv .venv && . .venv/bin/activate   # never use pip --break-system-packages
 pip install -U huggingface_hub                   # gives the `hf` command
 hf download jakeatx/<repository> <file>.gguf --local-dir models
+# 8/10/12 GB presets: also the LSA map, into the same folder
+hf download jakeatx/<repository> lsa-qwen38-27b-d2048.gguf --local-dir models
+# 8 GB preset: also the small MTP drafter, into the same folder
+hf download jakeatx/<repository> mtp-dm.gguf --local-dir models
 ```
+
+The 8, 10 and 12 GB presets stop at start and name the missing file if `lsa-qwen38-27b-d2048.gguf` (and, for 8 GB,
+`mtp-dm.gguf`) is not beside the model file. Use the files listed on the model page.
 
 Check the free disk from step 1 against the file size on the model page first.
 
@@ -97,7 +104,7 @@ build-sm86/bin/llama-server --preset <preset> -m models/<file>.gguf --host 127.0
 ```bash
 curl -s http://127.0.0.1:8080/health
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":64}'
+  -d '{"messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":64,"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 
 The log line `eval time` gives the writing speed in tokens per second. Report it to the user together with the

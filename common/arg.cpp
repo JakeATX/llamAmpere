@@ -5841,7 +5841,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg({"10dense", "10dense-headless"}, "alias for --preset 10dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "10dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"8dense", "8dense-headless"}, "alias for --preset 8dense (best known/recheck before ship; one slot)",
+    add_opt(common_arg({"8dense", "8dense-headless"}, "alias for --preset 8dense (one slot)",
         [](common_params & params) { params.card_preset = "8dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

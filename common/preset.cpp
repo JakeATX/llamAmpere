@@ -16,7 +16,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // Window 4096 and GDN replay are multi-user values: with one slot arg.cpp turns both off unless set
         // explicitly (V07/SPEEDREG). No vocab map here, so a one-slot DSJ drafter resolves the ordered RM24H list.
         common_card_preset large {
-            "24dense", "2026-11-17.3", "best known/recheck before ship", "", {
+            "24dense", "2026-11-17.3", "checked for v0.7.1", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"}, {"--fit", "on"},
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -74,7 +74,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // Draft window 20480 and vocab map auto:65536 stay (small-card memory ruling, V07/PRESETS/SOL_HANDOFF.md).
         // V07/REL071/STATUS.md.
         common_card_preset tiny {
-            "8dense", "2026-11-17.4", "best known/recheck before ship", "", {
+            "8dense", "2026-11-17.4", "checked for v0.7.1", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "on"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
