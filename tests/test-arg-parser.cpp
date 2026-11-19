@@ -406,6 +406,9 @@ static void test(void) {
         common_params depth_max;
         assert(parse_card({"--preset", "24dense", "--spec-draft-n-max", "6"}, depth_max));
         assert(depth_max.speculative.draft.n_max == 6 && depth_max.speculative.draft.n_min_adaptive == 4);
+        common_params fixed_depth;
+        assert(parse_card({"--preset", "24dense", "--spec-type", "draft-mtp"}, fixed_depth));
+        assert(fixed_depth.speculative.draft.n_max == 5);
         for (bool preset_first : {false, true}) {
             std::vector<std::string> args = {"--spec-draft-n-min-adaptive", "6"};
             args.insert(preset_first ? args.begin() : args.end(), {"--preset", "24dense"});

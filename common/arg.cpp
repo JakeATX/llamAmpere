@@ -1133,7 +1133,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             }
             // adaptive depth 3..7 at one user: +5.2% tok/s vs 4..5 (P76, 98,766 and 8K chat, 12 seed pairs, 11 faster);
             // floor 4 / max 5 are multi-user values (W3 split with 2+ users). V07/SPEEDREG, V07/MTPFLOOR_20261119.md.
-            if (!explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive")) {
+            if (adaptive_mtp && !explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive") &&
+                    !explicit_or_env("--spec-chain")) {
                 params.speculative.draft.n_min_adaptive = 3;
                 params.speculative.draft.n_max = 7;
             }
