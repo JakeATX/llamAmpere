@@ -8,7 +8,7 @@ It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (
 
 - Faster for one user on 24 GB cards: `--preset 24dense` with one slot writes 115.6 tokens/s at a 98,766-token prompt (v0.7.0.1: 99.8, RTX 3090, P76 AI4 model, +15.8%) and 138.8 at 8,000 (v0.7.0.1: 123.1).
 - The 8 GB model: `--preset 8dense` runs [the 8 GB file](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2-8GB) with the small `mtp-dm.gguf` MTP drafter and mb-MTP on, at a 204,800-token default context: 41.4 tokens/s at a 99,984-token prompt on an RTX 3070 (v0.7.0.1 with the same settings: 39.6). Prompt reading and writing are faster on the small-card weight types. [Release notes](docs/llamampere-v0.7.1/RELEASE_NOTES.md).
-- Claude Code works with Qwen3.8 (before, every request failed with HTTP 500). A Linux build for Ubuntu 22.04 and newer comes with the release.
+- Claude Code works with Qwen3.8 (before, every request failed with HTTP 500). A Linux build for Ubuntu 22.04 and newer and a Windows build (made by CI, not yet run on a GPU by us) come with the release.
 
 ## What's new in v0.7.0.1
 
