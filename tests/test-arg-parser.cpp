@@ -401,6 +401,14 @@ static void test(void) {
             common_params ub_kept;
             assert(parse_card({"--preset", "24dense", "-ub", "1024"}, ub_kept));
             assert(ub_kept.n_ubatch == 1024);
+            common_params multi_large;
+            assert(parse_card({"-np", "2", "-b", "8192", "--preset", "24dense"}, multi_large));
+            assert(multi_large.n_ubatch == 1024);
+            setenv("LLAMA_ARG_UBATCH", "1024", 1);
+            common_params ub_env;
+            assert(parse_card({"--preset", "24dense"}, ub_env));
+            unsetenv("LLAMA_ARG_UBATCH");
+            assert(ub_env.n_ubatch == 1024);
             common_params kept;
             assert(parse_card({"--preset", "24dense", "--spec-draft-window", "4096", "--gdn-replay"}, kept));
             assert(kept.speculative.draft.attn_window == 4096 && kept.gdn_replay);
@@ -426,7 +434,7 @@ static void test(void) {
                            "--spec-draft-n-max", "5"}, conflict));
         common_params batch;
         assert(parse_card({"--preset", "24dense", "-b", "128"}, batch));
-        assert(batch.n_batch == 128 && batch.n_ubatch <= 128);
+        assert(batch.n_batch == 128 && batch.n_ubatch == 128);
         common_params large_batch;
         assert(parse_card({"-b", "8192", "--preset", "24dense"}, large_batch));
         assert(large_batch.n_batch == 8192 && large_batch.n_ubatch == 2048);
