@@ -126,29 +126,28 @@ scripts/flash-next-server.sh -m models/flash-next/qwen3.8-flash-next-Swift1.5-AT
 
 To start it again later, run the last three lines from the `llamAmpere` folder. The server listens on http://127.0.0.1:8080 (OpenAI-compatible API).
 
-**Build and run (v0.6.3.11, Swift 1.5 27B at 2.3 bpw, 200K context, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
-toolkit (`nvcc`), CMake, git and a C++ compiler. The model (about 9.1 GB) downloads on first start. This one paste clones or
-updates llamAmpere at v0.6.3.11, builds `llama-server` and starts it:
+**Build and run (v0.7.1, Swift 1.5 27B, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
+toolkit (`nvcc`), CMake, git and a C++ compiler. Get the model file for 24 GB cards (P76 AI4) first, and replace
+`/path/to/P76-AI4.gguf` below with where you saved it. This one paste clones or updates llamAmpere at v0.7.1, builds
+`llama-server` and starts it with the 24 GB preset:
 
 ```bash
 if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.11
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.7.1
 else
-  git clone -b v0.6.3.11 https://github.com/JakeATX/llamAmpere.git
+  git clone -b v0.7.1 https://github.com/JakeATX/llamAmpere.git
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
-./build-sm86/bin/llama-server -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
-  -c 204800 -ngl 99 -fa on -b 4096 -ub 1024 --parallel 1 --jinja --no-context-shift \
-  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
-  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 \
-  --spec-draft-p-min 0 --spec-mb-mtp
+./build-sm86/bin/llama-server --preset 24dense -m /path/to/P76-AI4.gguf
 ```
 
-Commands for 12 and 10 GB cards (not yet run on this model) are in the [v0.6.2 release notes](https://github.com/JakeATX/llamAmpere/releases/tag/v0.6.2).
+The preset sets the context, cache types, MTP drafting and the microbatch ladder; do not add `-b` or `-ub`.
+For 12, 10 and 8 GB cards, swap in the matching preset and model file from **Quick start: pick your card**.
 
 The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
-To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, use
+To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp; not re-measured with the v0.7.1 preset) instead,
+replace `-m /path/to/P76-AI4.gguf` with
 `--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
 ## Headline results

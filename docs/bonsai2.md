@@ -80,7 +80,7 @@ Reproduce the short reference comparison with each build and checkpoint:
 ```sh
 build-bonsai/bin/llama-completion \
   -m models/bonsai2/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
-  -ngl 99 -c 512 -b 64 -ub 64 -t 6 --temp 0 --seed 42 -n 16 \
+  -ngl 99 -c 512 -b 64 -t 6 --temp 0 --seed 42 -n 16 \
   --no-conversation --no-display-prompt -p 'The capital of France is'
 ```
 
