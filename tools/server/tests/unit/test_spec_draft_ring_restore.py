@@ -36,6 +36,8 @@ def fixture_model(tmp_path_factory) -> str:
 def create_server(tmp_path_factory):
     global server
     server = ServerProcess()
+    server.model_hf_repo = None
+    server.model_hf_file = None
     server.model_file = fixture_model(tmp_path_factory)
     server.model_alias = "mtp-fixture"
     server.n_ctx = 2048
