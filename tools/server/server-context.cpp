@@ -24,6 +24,7 @@
 #include "log.h"
 #include "ngram-cache.h"
 #include "sampling.h"
+#include "reasoning-budget.h"
 #include "speculative.h"
 #include "speculative-copy.h"
 #include "mtmd.h"
@@ -3924,11 +3925,11 @@ private:
                 }
                 if (left <= slot.answer_reserve + (int32_t) tp.sampling.reasoning_budget_forced.size()) {
                     llama_sampler * tracker = slot.think_tracker.release();
-                    const bool had_tracker = tracker != nullptr;
+                    if (tracker && common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING) {
+                        // the tracker moves into the chain: sampling continues on the CPU from here
+                        llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
+                    }
                     if (common_sampler_reasoning_close(slot.smpl.get(), &tracker)) {
-                        if (had_tracker && tracker == nullptr) {
-                            llama_set_sampler(slot.ctx_tgt, slot.id, nullptr); // the chain now holds a budget sampler
-                        }
                         SLT_INF(slot, "answer reserve: closing the think block, n_gen = %d, left = %d, reserve = %d\n",
                                 (int) slot.stats.n_gen, left, slot.answer_reserve);
                     }

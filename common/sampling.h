@@ -208,7 +208,8 @@ int32_t common_answer_reserve(int32_t limit, int32_t reserve);
 // the fast sampling paths stay on. nullptr when the request has no think tags or the reserve is off
 llama_sampler * common_reasoning_tracker_init(const struct llama_model * model, const common_params_sampling & params);
 // close the think block now: force the chain's own budget sampler or, if the chain has none, move *tracker into the
-// chain and force it (the caller must then stop backend sampling for the sequence). true when forcing started
+// chain and force it. Before a move the caller must drop any backend sampler of the sequence (llama_set_sampler
+// nullptr): the chain is replaced by a CPU copy. true when forcing started
 bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler ** tracker);
 
 // helpers

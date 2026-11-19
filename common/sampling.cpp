@@ -1675,6 +1675,9 @@ llama_sampler * common_reasoning_tracker_init(const struct llama_model * model, 
             params.reasoning_budget_end.empty() || params.reasoning_budget_forced.empty()) {
         return nullptr;
     }
+    if (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control) {
+        return nullptr; // common_sampler_init builds the chain's own budget sampler; closing forces that one
+    }
     // no vocab: the tracker never runs out of budget on its own, so it never waits for UTF-8 completion
     llama_sampler * tracker = common_reasoning_budget_init(nullptr, {params.reasoning_budget_start},
             params.reasoning_budget_end, params.reasoning_budget_forced, INT_MAX);
@@ -1698,6 +1701,11 @@ bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler
     gsmpl->rbudget = *tracker;
     *tracker = nullptr;
     gsmpl->params.backend_sampling = false;
+    // a chain that was offloaded to a backend skips its offloaded samplers on the CPU forever: continue on a CPU
+    // copy (same sampler states). The caller has already dropped the backend sampler, so the old chain is unused
+    llama_sampler * chain = llama_sampler_clone(gsmpl->chain);
+    llama_sampler_free(gsmpl->chain);
+    gsmpl->chain = chain;
     return true;
 }
 
