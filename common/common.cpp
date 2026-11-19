@@ -2077,6 +2077,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
     mparams.fit_ram         = params.fit_params;
+    mparams.sj_kvarn        = params.sj_kvarn_bits_k > 0 || params.sj_kvarn_bits_v > 0;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

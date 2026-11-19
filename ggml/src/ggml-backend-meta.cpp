@@ -1133,7 +1133,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_TURBO_WHT: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+                // the rotation mixes whole dim-0 groups; the optional InnerQ scale is a mirrored parameter
+                GGML_ASSERT(tensor->src[1] == nullptr || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = handle_per_row(src_ss);
+            } break;
+            case GGML_OP_SJKVARN_SEAL: {
+                // the seal packs whole KV heads into the mirrored body, so the attention subgraph runs replicated
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
