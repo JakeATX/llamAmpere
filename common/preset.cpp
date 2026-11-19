@@ -68,7 +68,8 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // 0.7.1: the AI2M10-iw file carries its own MTP layer and head (no sidecars); mb-MTP stays on as in the
         // other profiles (owner small-card design: LSA + MTP). Default context 114688: on a real RTX 3070 (CUDA total
         // 7,840 MiB) this file peaks at 7,819 MiB nvidia-smi at 204800 and 7,697 at 131072, over the 7,692 headless
-        // line (8,192 - 500); fit does not count the 146.68 MiB writing scratch. V07/REL071/STATUS.md.
+        // line (8,192 - 500); fit does not count the 146.68 MiB writing scratch. 114688 peaks at 7,663 MiB with
+        // 100K and 109K prompts. V07/REL071/STATUS.md.
         common_card_preset tiny {
             "8dense", "2026-11-17.4", "best known/recheck before ship", "", {
                 {"--ctx-size", "114688"}, {"--parallel", "1"}, {"--batch-size", "4096"},
