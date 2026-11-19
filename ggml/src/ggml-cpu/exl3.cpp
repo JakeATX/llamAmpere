@@ -18,7 +18,7 @@
 #endif
 
 static bool exl3_avx2_usable() {
-#if GGML_EXL3_AVX2 && (defined(__GNUC__) || defined(__clang__))
+#if GGML_EXL3_AVX2 && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER) // __cpu_model is not linked for MSVC targets
     static const bool usable = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
     return usable;
 #else
