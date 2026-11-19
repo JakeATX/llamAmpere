@@ -1916,7 +1916,6 @@ static void ggml_sched_xs_willneed(const struct ggml_tensor * t) {
 
 // streamer thread: one graph
 static void ggml_sched_xs_stream_graph(struct ggml_sched_xstream * x) {
-    using clk = std::chrono::steady_clock;
     struct live_t { size_t off; size_t size; int item; };
     std::vector<live_t> live;
 
