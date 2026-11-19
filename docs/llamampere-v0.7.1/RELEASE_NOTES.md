@@ -7,14 +7,17 @@ Model file: TBD (AI2M10-iw or its healed version from HEALM10; the file name, si
 
 ## What changed
 
-- **8dense needs only the model file and the LSA map** (`lsa-qwen38-27b-d2048.gguf`). The 0.7.1 file carries its own
-  MTP draft layer and output head, so the preset no longer looks for `mtp-dm.gguf`, `head-ait2.gguf` or
-  `head-exact-f16.gguf`. In v0.7.0.1, `--preset 8dense` with this file stopped at start with "failed to load overlay
-  patch". You can still load sidecar files by setting `LLAMA_MODEL_OVERLAY_PATCH` or `LLAMA_D1_HEAD`.
+- **8dense needs three files in one folder:** the model file, the LSA map (`lsa-qwen38-27b-d2048.gguf`) and the small
+  MTP drafter `mtp-dm.gguf` (127,489,024 bytes, sha256 `4a8e9a5cfb6b1395088bd88b26400b504e47a10fad5a109e4cbee3276f9d5cae`;
+  download link TBD). The preset loads `mtp-dm.gguf` in place of the model file's own MTP layer. It no longer looks for
+  `head-ait2.gguf` or `head-exact-f16.gguf`. If `mtp-dm.gguf` is missing, the server stops at start and names the
+  path. In v0.7.0.1, `--preset 8dense` with this file stopped with "failed to load overlay patch".
+- **The 8dense default context is 204,800 tokens.** With `mtp-dm.gguf` the peak on an RTX 3070 is 7,607 MiB, under the
+  7,692 MiB headless line (8,192 minus 500). To use the model file's own MTP layer instead, set
+  `LLAMA_MODEL_OVERLAY_PATCH=` (empty) and `-c 114688`: that layer peaks at 7,819 MiB at 204,800 (over the line) and
+  7,663 MiB at 114,688. `-c` still sets any context you want. 8dense stays headless-only: `8dense headed` prints a
+  note and uses the same settings.
 - **mb-MTP is on for 8dense**, as on the other three presets. `--no-spec-mb-mtp` turns it off.
-- **The 8dense default context is 114,688 tokens.** At 204,800 the 0.7.1 file with its own MTP layer peaks at 7,819 MiB
-  on an RTX 3070, over the 7,692 MiB headless line (8,192 minus 500). At 114,688 it peaks at 7,663 MiB. `-c` still
-  sets any context you want. 8dense stays headless-only: `8dense headed` prints a note and uses the same settings.
 - **Faster prompt reading on the small-card weight types** (AIF175_U2, AIF25_U2, AIF25_U2_512). These ran the
   one-token kernel even for prompt batches, so each weight was decoded again for every 8 tokens. They now use the
   batch kernel with the same arithmetic (34 of 34 checked calls bit-identical). Off switch: `GGML_CUDA_AIF_RS_MMQ=0`.
@@ -28,7 +31,7 @@ temperature 1, 5,120-token replies, 6 seeds, builds alternated (v0.7.0.1 run wit
 
 | Check | v0.7.0.1 | v0.7.1 |
 |---|---|---|
-| Bare `--preset 8dense` start with this file | stops: "failed to load overlay patch" | starts at 114,688 tokens |
+| Bare `--preset 8dense` start with this file | stops: "failed to load overlay patch" | starts (own MTP layer at 114,688; with mtp-dm.gguf at 204,800) |
 | Peak card memory, 100K and 109K prompts (line 7,692) | 7,663 MiB | 7,663 MiB |
 | Writing speed, 99,984-token prompt | 39.30 tokens/s | 41.35 tokens/s (+5.2%, every seed faster) |
 | Writing speed, 109,288-token prompt | 37.16 tokens/s | 36.32 tokens/s (within seed spread, see below) |
@@ -47,10 +50,18 @@ Context ladder for this file on the 3070 (new build, one seed, prompt about 5,40
 |---|---|---|
 | 65,536 | 7,629 | 43.4 (60,136) |
 | 98,304 | 7,663 | 39.1 (92,904) |
-| 114,688 (default) | 7,663 | 36.3 to 41.4 (see above) |
+| 114,688 | 7,663 | 36.3 to 41.4 (see above) |
 | 131,072 | 7,697 (over) | 38.5 (125,661) |
 | 204,800 | 7,819 (over) | 37.0 (199,387) |
 
-The 8 GB card still misses the 40 tokens/s writing goal at deep prompts with this file.
+The rows above, and the v0.7.0.1 vs v0.7.1 table, use the file's own MTP layer. The 0.7.1 default, `mtp-dm.gguf` at
+204,800 tokens, same 3070, new build, mb-MTP on:
+
+| Prompt | Peak MiB (line 7,692) | Writing tokens/s |
+|---|---|---|
+| 100,000 tokens, 6 seeds | 7,607 | 41.85 |
+| 199,400 tokens, 3 seeds | 7,607 | 36.53 |
+
+The 8 GB card still misses the 40 tokens/s writing goal at deep prompts (36.53 at 199,400).
 
 Source-only release.
