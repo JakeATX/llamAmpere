@@ -55,8 +55,11 @@ def test_spec_vocab_hot_reset_per_request(tmp_path, monkeypatch, temperature):
         finally:
             s.stop()
         with open(s.log_path) as f:
-            if "adaptive hot slots" not in f.read():
-                pytest.skip("this model has no built-in shortlist with a hot tail")
+            log = f.read()
+            # the per-request line only appears when the tail is live (compact draft heads, e.g. EXL3, disable
+            # it); without it the test would pass without testing anything
+            if "draft vocab hot: reset" not in log:
+                pytest.skip("the hot tail is not active for this model (no per-request reset line)")
     ref = {}
     for name, rows in runs.items():
         for t, content, drafts in rows:

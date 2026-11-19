@@ -1684,7 +1684,8 @@ extern "C" {
     LLAMA_API int32_t llama_draft_vocab_refresh(struct llama_context * ctx);
 
     // forget all earlier requests: the hot slots go back to their load-time ids and the statistics are
-    // cleared (same call rules as refresh); returns the number of slots rewritten
+    // cleared (same call rules as refresh); returns the number of slots rewritten. It also drops what other
+    // sequences contributed, so call it only when no other request is in flight on this context
     LLAMA_API int32_t llama_draft_vocab_reset(struct llama_context * ctx);
 
     // number of hot slots (0 when the tail is disabled) and of tracked candidate ids
