@@ -1660,7 +1660,6 @@ static void ggml_compute_forward_mul_mat_ai4(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int      aik  = ggml_ai4_rate(src0->type);
     const uint32_t aimul = ggml_ai4_trellis_mul(src0->type);
     GGML_ASSERT(ne02 == 1 && ne03 == 1);
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
@@ -1704,7 +1703,6 @@ static void ggml_compute_forward_mul_mat_id_ai4(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int      aik  = ggml_ai4_rate(src0->type);
     const uint32_t aimul = ggml_ai4_trellis_mul(src0->type);
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(nb10 == sizeof(float) && nb0 == sizeof(float) && ne03 == 1);
