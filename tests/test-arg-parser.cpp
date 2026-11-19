@@ -387,6 +387,7 @@ static void test(void) {
             assert(multi.n_parallel == slots && multi.kv_unified && multi.speculative.draft.n_min == 4);
             assert(multi.speculative.draft.attn_window == 4096 && multi.gdn_replay);
             assert(multi.speculative.draft.n_max == 5 && multi.speculative.draft.n_min_adaptive == 4);
+            assert(multi.n_ubatch == 1024);
             assert(!(multi.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP));
         }
         {
@@ -396,6 +397,10 @@ static void test(void) {
             assert(one.speculative.draft.vocab_map == "auto" &&
                    !(one.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP));
             assert(one.speculative.draft.n_max == 7 && one.speculative.draft.n_min_adaptive == 3);
+            assert(one.n_batch == 4096 && one.n_ubatch == 2048);
+            common_params ub_kept;
+            assert(parse_card({"--preset", "24dense", "-ub", "1024"}, ub_kept));
+            assert(ub_kept.n_ubatch == 1024);
             common_params kept;
             assert(parse_card({"--preset", "24dense", "--spec-draft-window", "4096", "--gdn-replay"}, kept));
             assert(kept.speculative.draft.attn_window == 4096 && kept.gdn_replay);
@@ -424,7 +429,7 @@ static void test(void) {
         assert(batch.n_batch == 128 && batch.n_ubatch <= 128);
         common_params large_batch;
         assert(parse_card({"-b", "8192", "--preset", "24dense"}, large_batch));
-        assert(large_batch.n_batch == 8192 && large_batch.n_ubatch == 1024);
+        assert(large_batch.n_batch == 8192 && large_batch.n_ubatch == 2048);
         for (const auto & name : {"10dense", "12dense"}) {
             common_params plain_mtp;
             assert(parse_card({"--preset", name, "--spec-draft-n-min-adaptive", "6"}, plain_mtp));
