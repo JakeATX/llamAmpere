@@ -43,6 +43,12 @@ Faster writing for one user on 24 GB cards, the 8 GB model file, and faster smal
   tokens thinking. Apps that never send `"thinking"` now get no thinking: `--anthropic-thinking template` restores
   the old behaviour, and an explicit `--reasoning` or `enable_thinking` in `--chat-template-kwargs` still wins. The
   OpenAI endpoints are unchanged.
+- **Claude Code works with Qwen3.8.** Claude Code (2.1.327) got HTTP 500 on every request: it puts a system message
+  inside the conversation, which the Qwen3.8 template rejects, and asks for effort "high", which the template does not
+  have. System messages before the first reply now join the leading system message (a later one becomes a
+  `<system-reminder>` user turn, so the cached prompt start stays the same), and an effort level a template does not
+  take maps to its nearest level (high and max to xhigh, minimal to low; logged once). Templates that take any value
+  are unchanged. v0.7.0.1 has the same failure.
 - **Windows: the Flash-Next CPU split threads ask not to be power-throttled**, like ggml's own CPU threads already
   did, so Windows does not move them to efficiency cores or park them.
 - **docs/AI_SETUP.md**: a setup guide to paste into a coding agent (checks the card, picks the preset, downloads the
@@ -51,7 +57,8 @@ Faster writing for one user on 24 GB cards, the 8 GB model file, and faster smal
   the 8/10/12 GB presets no longer set the diagnostic `LLAMA_SPEC_MB_KL=8`; the fit step warns when other programs
   already use the whole preset margin; the prompt-batch ladder no longer fails on non-CUDA GPUs;
   `LLAMA_MTP_DRAFT_COMPUTE_LEAN=1` keeps an explicit smaller `--spec-draft-n-ubatch`; the UI accepts the prebuilt
-  service worker (#120); a Windows CI build fix (#116).
+  service worker (#120); building from source works again with the current upstream prebuilt UI (the build now
+  fetches the UI build that matches the server, b12359, #121); a Windows CI build fix (#116).
 
 ## Measured
 
@@ -105,4 +112,12 @@ The 8 GB card still misses the 40 tokens/s writing goal at deep prompts (37.24 a
 one 512-token chat reply, 120 to 146 tokens/s). Their settings are unchanged from v0.7.0.1 except that
 `LLAMA_SPEC_MB_KL=8` is no longer set; they were not re-measured on 10 and 12 GB cards for this release.
 
-Source-only release.
+**Claude Code check** (bare `--preset 8dense`, the 8 GB release file, RTX 3090 Ti): captured Claude Code requests
+(three sessions, streamed and not, three turns each, about 11,400-token prompts) get 18 of 18 answers (thinking, text
+and Bash tool calls) on v0.7.1; on the build before this fix the first request of each session fails (HTTP 500).
+
+**Linux build:** `llamampere-v0.7.1-linux-x86_64-cuda12-server.tar` runs on Ubuntu 22.04 or newer (glibc 2.35+) with
+an NVIDIA driver and the CUDA 12 runtime and cuBLAS. It brings its own GCC runtime libraries (libstdc++, libgcc_s,
+libgomp; GPL with the GCC Runtime Library Exception, licence and source notes inside), so no newer compiler packages
+are needed; checked on stock Ubuntu 22.04 with an RTX 3060 Ti. Building from source needs GCC 13 or newer. Windows:
+build from source.
