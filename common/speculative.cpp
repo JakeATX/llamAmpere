@@ -5073,8 +5073,11 @@ struct spec_batch_view {
         const bool has_tok  = cb.has_token();
         const bool has_embd = cb.has_embd();
 
+        // an embedding batch of an M-RoPE model carries every position section, one after the other as llama_decode reads them; a token batch carries one position per token
+        const int32_t n_pos = has_embd ? std::max<int32_t>(1, cb.n_pos) : 1;
+
         token.resize(has_tok ? n : 0);
-        pos.resize(n);
+        pos.resize((size_t) n * n_pos);
         n_seq_id.resize(n);
         logits.resize(n);
         seq_id.resize(n);
@@ -5099,7 +5102,9 @@ struct spec_batch_view {
             if (has_embd && t.embd.data != nullptr) {
                 std::memcpy(embd.data() + (size_t) i * n_embd, t.embd.data, t.embd.n_embd * sizeof(float));
             }
-            pos[i]      = t.pos[0];
+            for (int32_t j = 0; j < n_pos; ++j) {
+                pos[(size_t) j * n + i] = t.pos[j];
+            }
             logits[i]   = t.output ? 1 : 0;
             n_seq_id[i] = 1 + (int32_t) t.seq_ids_extra.size();
             seq_id[i]   = seq_flat.data() + o;
