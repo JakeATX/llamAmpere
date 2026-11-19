@@ -147,8 +147,8 @@ static std::atomic<uint64_t> g_h2d_bounced{0};
 static cudaError_t moe_h2d_bounce_copy(void * dst, const void * src, size_t bytes, cudaStream_t stream, bool blocking) {
     (void) cudaGetLastError();
     if (g_h2d_bounced.fetch_add(1, std::memory_order_relaxed) == 0) {
-        GGML_LOG_WARN("[moe-cache] an expert copy was refused (its source mixes page-locked and pageable pages); "
-                "such copies now go through a bounce buffer\n");
+        GGML_LOG_WARN("[moe-cache] an expert copy was refused with invalid value (expected cause: its source mixes "
+                "page-locked and pageable pages); such copies now go through a bounce buffer\n");
     }
     static thread_local moe_h2d_bounce bounce;
     static constexpr size_t bounce_bytes = 8u << 20;
@@ -191,7 +191,10 @@ static cudaError_t moe_h2d_bounce_copy(void * dst, const void * src, size_t byte
         memcpy(buffer, (const char *) src + off, n);
         err = blocking ? cudaMemcpy((char *) dst + off, buffer, n, cudaMemcpyHostToDevice)
                        : cudaMemcpyAsync((char *) dst + off, buffer, n, cudaMemcpyHostToDevice, stream);
-        if (err != cudaSuccess) { return err; }
+        if (err != cudaSuccess) {
+            if (!blocking) { (void) cudaStreamSynchronize(stream); } // earlier chunks stop reading the shared buffer
+            return err;
+        }
     }
     return blocking ? cudaSuccess : cudaStreamSynchronize(stream);
 }
