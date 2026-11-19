@@ -386,6 +386,7 @@ static void test(void) {
             assert(parse_card({"-np", std::to_string(slots), "--preset", "24dense"}, multi));
             assert(multi.n_parallel == slots && multi.kv_unified && multi.speculative.draft.n_min == 4);
             assert(multi.speculative.draft.attn_window == 4096 && multi.gdn_replay);
+            assert(multi.speculative.draft.n_max == 5 && multi.speculative.draft.n_min_adaptive == 4);
             assert(!(multi.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP));
         }
         {
@@ -394,7 +395,7 @@ static void test(void) {
             assert(one.n_parallel == 1 && one.speculative.draft.attn_window == 0 && !one.gdn_replay);
             assert(one.speculative.draft.vocab_map == "auto" &&
                    !(one.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP));
-            assert(one.speculative.draft.n_max == 5 && one.speculative.draft.n_min == 4);
+            assert(one.speculative.draft.n_max == 7 && one.speculative.draft.n_min_adaptive == 3);
             common_params kept;
             assert(parse_card({"--preset", "24dense", "--spec-draft-window", "4096", "--gdn-replay"}, kept));
             assert(kept.speculative.draft.attn_window == 4096 && kept.gdn_replay);
@@ -402,6 +403,9 @@ static void test(void) {
         common_params depth;
         assert(parse_card({"--spec-draft-n-max", "3", "--preset", "24dense"}, depth));
         assert(depth.speculative.draft.n_max == 3 && depth.speculative.draft.n_min_adaptive == 3);
+        common_params depth_max;
+        assert(parse_card({"--preset", "24dense", "--spec-draft-n-max", "6"}, depth_max));
+        assert(depth_max.speculative.draft.n_max == 6 && depth_max.speculative.draft.n_min_adaptive == 4);
         for (bool preset_first : {false, true}) {
             std::vector<std::string> args = {"--spec-draft-n-min-adaptive", "6"};
             args.insert(preset_first ? args.begin() : args.end(), {"--preset", "24dense"});
