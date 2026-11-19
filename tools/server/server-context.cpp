@@ -3850,7 +3850,8 @@ private:
             if (tok != LLAMA_TOKEN_NULL) {
                 SLT_INF(slot, "answer reserve: end of generation inside the think block, closing it, n_gen = %d\n", (int) slot.stats.n_gen);
                 result.tok          = tok;
-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, tok, accept_special_token(slot, tok));
+                const bool special = params_base.special || slot.task->params.sampling.preserved_tokens.count(tok) > 0;
+                result.text_to_send = common_token_to_piece(slot.ctx_tgt, tok, special);
                 result.probs.clear();
             }
         }
