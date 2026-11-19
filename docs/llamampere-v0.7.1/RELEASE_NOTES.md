@@ -65,12 +65,13 @@ setup" is the fastest one-user setup measured before this release (R16 flags, 11
 At a 256,696-token prompt (full 262,144 context) v0.7.1 wrote 89.56 tokens/s with a 21,440 MiB peak (one seed).
 
 **24 GB, three users.** Same card and model, the shipped multi-user command (`--preset 24dense -np 3 -c 352256
---slot-ctx 262144,0,0`), prompts of 99,984, 32,766 and 32,766 tokens written at the same time, 9 runs per build. The
-multi-user settings did not change, so both builds write the same text.
+--slot-ctx 262144,0,0`), prompts of 99,984, 32,766 and 32,766 tokens written at the same time, 21 runs per build over
+18 seeds. The multi-user settings did not change. Per seed, v0.7.1 / v0.7.0.1 = 0.993 (95% range 0.980 to 1.007, faster
+on 7 of 18 seeds): no difference shown.
 
 | | v0.7.0.1 | v0.7.1 |
 |---|---|---|
-| All three users together | 197.4 tokens/s | 196.2 tokens/s (-0.6%) |
+| All three users together | 196.1 tokens/s | 194.9 tokens/s |
 | Peak card memory | 22,474 MiB | 22,452 MiB |
 
 **8 GB.** Rented RTX 3070 8 GB (220 W, PCIe 4 x16, Core i5-12400F), AI2M10-iw test file (the unhealed parent of the
