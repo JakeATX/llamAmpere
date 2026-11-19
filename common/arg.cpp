@@ -4652,6 +4652,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
     add_opt(common_arg(
+        {"--anthropic-thinking"}, "MODE",
+        "thinking for Anthropic API requests (/v1/messages): 'on-request' thinks only when the request has "
+        "\"thinking\": {\"type\": \"enabled\"} (or \"adaptive\"), as the Anthropic API does; 'template' keeps the "
+        "chat template's default (default: on-request)",
+        [](common_params & params, const std::string & value) {
+            if (value == "on-request") {
+                params.anthropic_think_on_request = true;
+            } else if (value == "template") {
+                params.anthropic_think_on_request = false;
+            } else {
+                throw std::invalid_argument("invalid value: expected on-request or template");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ANTHROPIC_THINKING"));
+    add_opt(common_arg(
         {"--reasoning-budget-message"}, "MESSAGE",
         "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
         [](common_params & params, const std::string & value) {

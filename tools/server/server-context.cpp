@@ -9657,7 +9657,7 @@ void server_routes::init_routes() {
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body), params.anthropic_think_on_request);
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         auto warm_src = warm_source(body); // copy before parsing, which edits body
@@ -10511,7 +10511,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
             } break;
         case TASK_RESPONSE_TYPE_ANTHROPIC:
             {
-                body = server_chat_convert_anthropic_to_oai(body);
+                body = server_chat_convert_anthropic_to_oai(body, params.anthropic_think_on_request);
             } break;
         default:
             res->error(format_error_response("invalid res_type", ERROR_TYPE_INVALID_REQUEST));

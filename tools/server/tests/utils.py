@@ -114,6 +114,7 @@ class ServerProcess:
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
     reasoning: Literal['on', 'off', 'auto'] | None = None
+    anthropic_thinking: Literal['on-request', 'template'] | None = None
     chat_template: str | None = None
     chat_template_file: str | None = None
     server_path: str | None = None
@@ -298,6 +299,8 @@ class ServerProcess:
             server_args.extend(("--reasoning-format", self.reasoning_format))
         if self.reasoning is not None:
             server_args.extend(("--reasoning", self.reasoning))
+        if self.anthropic_thinking is not None:
+            server_args.extend(("--anthropic-thinking", self.anthropic_thinking))
         if self.chat_template:
             server_args.extend(["--chat-template", self.chat_template])
         if self.chat_template_file:

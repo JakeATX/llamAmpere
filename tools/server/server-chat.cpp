@@ -388,7 +388,7 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
     }
 }
 
-json server_chat_convert_anthropic_to_oai(const json & body) {
+json server_chat_convert_anthropic_to_oai(const json & body, bool think_on_request) {
     json oai_body;
 
     // Convert system prompt
@@ -650,12 +650,25 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     }
 
     // Handle Anthropic-specific thinking param
+    std::string thinking_type;
     if (body.contains("thinking")) {
         json thinking = json_value(body, "thinking", json::object());
-        std::string thinking_type = json_value(thinking, "type", std::string());
+        thinking_type = json_value(thinking, "type", std::string());
         if (thinking_type == "enabled") {
             int budget_tokens = json_value(thinking, "budget_tokens", 10000);
             oai_body["thinking_budget_tokens"] = budget_tokens;
+        }
+    }
+    // --anthropic-thinking on-request: the Anthropic API thinks only when asked ("enabled" or "adaptive"). Without
+    // this, a request with no "thinking" (Claude Code's short helper calls, e.g. a session title with 512 tokens of
+    // room) gets the template default and can spend its whole budget thinking. An explicit
+    // chat_template_kwargs.enable_thinking from the client still wins.
+    if (think_on_request && thinking_type != "enabled" && thinking_type != "adaptive") {
+        if (!oai_body.contains("chat_template_kwargs") || !oai_body.at("chat_template_kwargs").is_object()) {
+            oai_body["chat_template_kwargs"] = json::object();
+        }
+        if (!oai_body["chat_template_kwargs"].contains("enable_thinking")) {
+            oai_body["chat_template_kwargs"]["enable_thinking"] = false;
         }
     }
 
