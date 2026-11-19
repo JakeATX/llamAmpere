@@ -104,6 +104,7 @@ const char * ggml_cuda_lsa_page_body(const ggml_tensor * body); // tagged map fo
 void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 // GGML_CUDA_LSA_STAGE_AHEAD: after a decode attention on a record-page body is queued; no-op otherwise
 void ggml_cuda_lsa_page_ahead(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+void ggml_cuda_lsa_ahead_graph_begin(ggml_backend_cuda_context & ctx);
 // GGML_OP_LSA_PREFETCH (LLAMA_LSA_J3): mark the target body's predicted (and/or previously picked) records, give them
 // CLOCK slots and copy them in on the low-priority side stream; the target's next prepare/refresh joins it. No-op for a
 // body without record-page slots.

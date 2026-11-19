@@ -47,6 +47,7 @@ struct llama_lsa_resident_fit_in {
     bool    stage_all    = false; // one shared stage holds the worst-case read set (all records); never changes keep
     int64_t records      = 0;     // records per layer (stage sizing unit)
     int64_t stage_rec_bytes = 0;  // card bytes of one stage record (0 = no stage possible)
+    int64_t stage_copies    = 1;  // stages of that size on the card (2 with GGML_CUDA_LSA_STAGE_AHEAD, auto stage only)
     int64_t stage_max    = 4096;  // cap on stage records
 };
 
@@ -143,14 +144,15 @@ static inline llama_lsa_resident_fit_out llama_lsa_resident_fit(const llama_lsa_
             // stage = the read-set excess over the slots; its bytes come out of the slot room, so solve twice
             double ss = s;
             int64_t st = 0;
+            const int64_t sc = std::max<int64_t>(1, in.stage_copies);
             for (int it = 0; it < 3; ++it) {
                 st = std::min<int64_t>(in.stage_max, (int64_t) std::ceil(std::max(0.0, need - ss)*(double) in.records));
-                ss = std::max(0.0, std::min(1.0, (double) (room - in.fixed_bytes - st*in.stage_rec_bytes)/(double) in.slots_full));
+                ss = std::max(0.0, std::min(1.0, (double) (room - in.fixed_bytes - st*sc*in.stage_rec_bytes)/(double) in.slots_full));
             }
-            if (st > 0 && room - in.fixed_bytes - st*in.stage_rec_bytes > 0) {
+            if (st > 0 && room - in.fixed_bytes - st*sc*in.stage_rec_bytes > 0) {
                 out.share = ss;
                 out.stage_records = st;
-                out.card_bytes = in.fixed_bytes + (int64_t) std::floor(ss*in.slots_full) + st*in.stage_rec_bytes;
+                out.card_bytes = in.fixed_bytes + (int64_t) std::floor(ss*in.slots_full) + st*sc*in.stage_rec_bytes;
                 snprintf(buf, sizeof(buf), "; stage %lld records (%.1f MiB, shared by the layers) for the reads past the slots, slots now %.1f%% "
                     "(LLAMA_LSA_RESIDENT_AUTO_STAGE=0 turns it off)", (long long) st, st*in.stage_rec_bytes/MiB, 100.0*ss);
                 out.why += buf;

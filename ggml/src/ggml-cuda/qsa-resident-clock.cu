@@ -48,6 +48,7 @@ struct qsa_clock_tensor {
     int device = -1;
     uint64_t ahead_seq = 0; // GGML_CUDA_LSA_STAGE_AHEAD: prepare number of the layer that queued this layer's ahead copy
     uint64_t prep_seq = 0;  // GGML_CUDA_LSA_STAGE_AHEAD: this layer's last prepare number
+    const void * owner = nullptr; // GGML_CUDA_LSA_STAGE_AHEAD: the buffer (an ahead copy never leaves its buffer)
     // GGML_CUDA_LSA_PREFETCH (opt-in, record pages): the previous LSA layer's pick fills this layer's slots on a side
     // stream; pf_done joins it back before this layer's seal refresh or resolve touches the map.
     cudaEvent_t pf_done = nullptr;
@@ -615,6 +616,7 @@ static ggml_status qsa_clock_init(ggml_backend_buffer_t buffer, ggml_tensor * te
             CUDA_CHECK(cudaEventCreateWithFlags(&lsa_ahead_fork[t->device], cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&lsa_ahead_done[t->device], cudaEventDisableTiming));
         }
+        entry->owner = buffer->context;
         lsa_ahead_entries.push_back(entry.get());
     }
     tensor->extra = entry.get();
@@ -1897,7 +1899,7 @@ void ggml_cuda_lsa_j3_graph_end(ggml_backend_cuda_context & ctx) {
 }
 
 void ggml_cuda_lsa_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    lsa_ahead_blocked = true; // GGML_CUDA_LSA_STAGE_AHEAD: J3 claims stage entries on its own side stream
+    lsa_ahead_blocked = true; // GGML_CUDA_LSA_STAGE_AHEAD: off for the process (J3 marks this layer's table on its own side stream)
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, sizeof(float), ctx.stream())); // the result is a placeholder
     const ggml_tensor * desc = dst->src[0];
     const ggml_tensor * units = dst->src[2];
@@ -2188,7 +2190,8 @@ void ggml_cuda_lsa_page_ahead(ggml_backend_cuda_context & ctx, const ggml_tensor
     {
         std::lock_guard<std::mutex> lock(lsa_pf_mutex);
         for (auto * c : lsa_ahead_entries) {
-            if (c != e && c->device == dev && c->map.layer > e->map.layer && c->map.records == e->map.records &&
+            if (c != e && c->owner == e->owner && c->device == dev && c->map.layer > e->map.layer &&
+                    c->map.records == e->map.records &&
                     c->map.stage != e->map.stage && (!next || c->map.layer < next->map.layer)) {
                 next = c;
             }
@@ -2208,4 +2211,14 @@ void ggml_cuda_lsa_page_ahead(ggml_backend_cuda_context & ctx, const ggml_tensor
     CUDA_CHECK(cudaEventRecord(lsa_ahead_done[dev], side));
     lsa_ahead_pending[dev] = true;
     next->ahead_seq = lsa_ahead_seq[dev];
+}
+
+// GGML_CUDA_LSA_STAGE_AHEAD: at the start of every graph compute on the device. An ahead copy never carries across
+// graphs (device-side master writes such as K-shift or defrag graphs do not pass through the host write path): the
+// stream waits for any copy still in flight, and the prepare counter moves so it is not applied.
+void ggml_cuda_lsa_ahead_graph_begin(ggml_backend_cuda_context & ctx) {
+    const int dev = ctx.device;
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES || !lsa_ahead_stream[dev]) return;
+    lsa_ahead_join(ctx.stream(), dev);
+    ++lsa_ahead_seq[dev];
 }
