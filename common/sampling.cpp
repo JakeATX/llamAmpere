@@ -21,7 +21,8 @@
 #include <utility>
 #include <vector>
 
-#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+// not with an MSVC target: __builtin_cpu_supports needs the compiler-rt __cpu_model, which is not linked there
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
 #include <immintrin.h>
 #define COMMON_TOPK_AVX2 1
 #else
