@@ -257,7 +257,7 @@ struct contexts {
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, uint32_t ubatch_size = 0, uint32_t parallel = 2, uint32_t context_per_seq = 4096, llama_model * draft_model = nullptr,
             const char * draft_vocab_map = nullptr, bool backend_sampling = true,
             ggml_backend_sched_eval_callback eval_callback = nullptr, void * eval_user_data = nullptr, int draft_max = 4,
-            bool tail_chunks = false) {
+            bool tail_chunks = false, uint32_t draft_window = 0, bool kv_unified = false) {
         llama_context_params cp = llama_context_default_params();
         cp.cb_eval = eval_callback;
         cp.cb_eval_user_data = eval_user_data;
@@ -265,7 +265,7 @@ struct contexts {
         cp.n_ubatch = ubatch_size ? ubatch_size : batch_size;
         cp.n_seq_max = parallel;
         cp.n_ctx = context_per_seq * parallel;
-        cp.kv_unified = false;
+        cp.kv_unified = kv_unified;
         cp.n_rs_seq = tail_chunks ? 8 : 4;
         cp.n_threads = cp.n_threads_batch = 2;
         cp.offload_kqv = model->n_devices() > 0;
@@ -287,6 +287,8 @@ struct contexts {
         cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         cp.ctx_other = tgt;
         cp.draft_vocab_map = draft_vocab_map;
+        cp.draft_attn_window = (int32_t) draft_window;
+        cp.draft_attn_sink = draft_window ? 4 : 0;
         cp.n_rs_seq = 0;
         if (tail_chunks) {
             cp.n_outputs_max = 8;
@@ -492,6 +494,66 @@ static schedule generate(contexts & ctx, llama_seq_id seq, llama_pos & pos, int 
         require(llama_memory_seq_rm(llama_get_memory(ctx.dft), seq, pos, -1), "draft rollback");
     }
     return result;
+}
+
+// [KVRESTORE] Two sequences share one unified MTP draft ring (--spec-draft-window with --kv-unified). Sequence 0
+// prefills alone and fills the whole ring; its server-style checkpoint (target PARTIAL_ONLY, drafter PARTIAL_ONLY |
+// KEEP_LAYOUT) then carries every ring cell, masked ones included. Sequence 1 prefills next and takes most of the
+// ring. Restoring sequence 0 must still succeed (it used to fail: "failed to find N available cells") and draft
+// exactly what an uninterrupted sequence 0 drafts.
+static void run_draft_ring_restore(llama_model * model) {
+    const cache_config config { "draft ring", GGML_TYPE_F16, GGML_TYPE_F16 };
+    const uint32_t window = 64;
+    const llama_pos n_prompt = 384;
+    const auto flags_tgt = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    const auto flags_dft = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT;
+    const auto get = [](llama_context * ctx, llama_seq_id seq, llama_state_seq_flags flags) {
+        std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx, seq, flags));
+        require(!state.empty(), "ring checkpoint state exists");
+        require(llama_state_seq_get_data_ext(ctx, state.data(), state.size(), seq, flags) == state.size(), "save ring checkpoint");
+        return state;
+    };
+
+    schedule reference;
+    {
+        contexts ctx(model, config, 32, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 0, 2, 1024, nullptr, nullptr, true,
+                nullptr, nullptr, 4, false, window, true);
+        prefill(ctx, 0, n_prompt - 1, 0);
+        llama_pos pos = n_prompt - 1;
+        reference = generate(ctx, 0, pos, 0, 6);
+    }
+
+    contexts ctx(model, config, 32, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 0, 2, 1024, nullptr, nullptr, true,
+            nullptr, nullptr, 4, false, window, true);
+    prefill(ctx, 0, n_prompt - 1, 0);
+    const auto tgt0 = get(ctx.tgt, 0, flags_tgt);
+    const auto dft0 = get(ctx.dft, 0, flags_dft);
+    std::vector<uint8_t> spec0;
+    require(common_speculative_get_state(ctx.spec, 0, spec0), "save MTP host state");
+
+    // sequence 1 takes the ring cells sequence 0 no longer attends to
+    for (llama_pos from = 0; from < n_prompt; ) {
+        llama_tokens tokens;
+        const llama_pos end = std::min<llama_pos>(from + 32, n_prompt);
+        for (llama_pos p = from; p < end; ++p) {
+            tokens.push_back(token_at(p + 5));
+        }
+        process(ctx, tokens, from, 1);
+        from = end;
+    }
+
+    // what the server does on a rollback: load the checkpoint over the live caches
+    require(llama_state_seq_set_data_ext(ctx.tgt, tgt0.data(), tgt0.size(), 0, flags_tgt) == tgt0.size(),
+            "restore the target checkpoint of sequence 0");
+    require(llama_state_seq_set_data_ext(ctx.dft, dft0.data(), dft0.size(), 0, flags_dft) == dft0.size(),
+            "restore the draft ring checkpoint of sequence 0 after sequence 1 wrote the ring");
+    require(common_speculative_restore_state(ctx.spec, 0, spec0), "restore MTP host state");
+    require(llama_memory_seq_pos_max(llama_get_memory(ctx.dft), 1) == n_prompt - 1, "sequence 1 keeps its draft window");
+
+    llama_pos pos = n_prompt - 1;
+    const schedule restored = generate(ctx, 0, pos, 0, 6);
+    require_schedule(restored, reference, "restored ring drafts like an uninterrupted sequence");
+    printf("DRAFT_RING_RESTORE PASS: window %u, prompt %d, checkpoint %zu bytes\n", window, n_prompt - 1, dft0.size());
 }
 
 struct prefill_env_restore {
@@ -3744,6 +3806,12 @@ int main(int argc, char ** argv) {
         model = make_model();
         if (argc == 3 && std::strcmp(argv[1], "--memoryless-state-only") == 0) {
             run_memoryless_state(model, argv[2]);
+            llama_model_free(model);
+            llama_backend_free();
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--draft-ring-restore-only") == 0) {
+            run_draft_ring_restore(model);
             llama_model_free(model);
             llama_backend_free();
             return 0;

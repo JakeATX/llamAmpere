@@ -278,6 +278,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-mtp-qsa-compact.cpp)
     target_include_directories(test-mtp-qsa-compact PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_test(test-mtp-state NAME test-prompt-tail-chunks ARGS --tail-chunks)
+    llama_test(test-mtp-state NAME test-mtp-draft-ring-restore ARGS --draft-ring-restore-only)
 endif()
 
 llama_build(test-llama-archs.cpp)
