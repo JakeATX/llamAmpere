@@ -415,6 +415,14 @@ json server_chat_convert_anthropic_to_oai(const json & body, bool think_on_reque
             {"content", system_content}
         });
     }
+    const bool has_system_param = !oai_messages.empty();
+
+    // Claude Code 2.x also sends system messages inside "messages" (its environment block comes after the first user
+    // turn). Most chat templates (Qwen3.8 included) accept a system message only at the beginning. Those before the
+    // first assistant turn are hoisted into the leading system message, in order; a later one becomes a user turn in
+    // place (<system-reminder>), so the prompt prefix of the earlier turns stays the same and stays cached.
+    std::string inline_system;
+    bool seen_assistant = false;
 
     // Convert messages
     if (!body.contains("messages")) {
@@ -424,6 +432,33 @@ json server_chat_convert_anthropic_to_oai(const json & body, bool think_on_reque
     if (messages.is_array()) {
         for (const auto & msg : messages) {
             std::string role = json_value(msg, "role", std::string());
+
+            if (role == "system") {
+                std::string text;
+                const json content = json_value(msg, "content", json());
+                if (content.is_string()) {
+                    text = content.get<std::string>();
+                } else if (content.is_array()) {
+                    for (const auto & block : content) {
+                        if (json_value(block, "type", std::string()) == "text") {
+                            text += json_value(block, "text", std::string());
+                        }
+                    }
+                }
+                normalize_anthropic_billing_header(text);
+                if (text.empty()) {
+                    continue;
+                }
+                if (!seen_assistant) {
+                    inline_system += (inline_system.empty() ? "" : "\n\n") + text;
+                } else {
+                    oai_messages.push_back({{"role", "user"}, {"content", "<system-reminder>\n" + text + "\n</system-reminder>"}});
+                }
+                continue;
+            }
+            if (role == "assistant") {
+                seen_assistant = true;
+            }
 
             if (!msg.contains("content")) {
                 if (role == "assistant") {
@@ -590,6 +625,20 @@ json server_chat_convert_anthropic_to_oai(const json & body, bool think_on_reque
             for (const auto & tool_msg : tool_results) {
                 oai_messages.push_back(tool_msg);
             }
+        }
+    }
+
+    if (!inline_system.empty()) {
+        if (has_system_param) {
+            std::string front = oai_messages[0].at("content").get<std::string>();
+            oai_messages[0]["content"] = front.empty() ? inline_system : front + "\n\n" + inline_system;
+        } else {
+            json front = json::array();
+            front.push_back({{"role", "system"}, {"content", inline_system}});
+            for (const auto & m : oai_messages) {
+                front.push_back(m);
+            }
+            oai_messages = std::move(front);
         }
     }
 

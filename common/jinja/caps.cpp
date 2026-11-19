@@ -626,9 +626,13 @@ caps caps_get(jinja::program & prog) {
         // an unknown level shows the render of the template fallback, a level that renders the same is not honored
         // levels sharing a render are aliases and the highest one is kept
         const auto unknown = render("REASONING_EFFORT_UNKNOWN");
+        result.reasoning_effort_strict = !unknown.has_value();
         std::vector<std::string> renders;
         for (const auto & level : candidates) {
             const auto rendered = render(level);
+            if (rendered && result.reasoning_effort_strict) {
+                result.reasoning_effort_accepted.push_back(level);
+            }
             if (!rendered || rendered == unknown) {
                 continue;
             }

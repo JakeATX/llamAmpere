@@ -8549,6 +8549,27 @@ static void test_reasoning_effort_caps() {
     assert_effort_levels("models/templates/openai-gpt-oss-120b.jinja", all_levels);
     assert_effort_levels("models/templates/Cohere2MoE.jinja", {});
     assert_effort_levels("models/templates/Qwen-Qwen3-0.6B.jinja", {});
+    assert_effort_levels("models/templates/Qwen-Qwen3.8-27B.jinja", { "low", "medium", "xhigh" });
+
+    // Qwen3.8 raises on levels it does not know: the others go to the nearest level it takes (ties upward), a word
+    // outside the scale to the template default (xhigh); templates that take any value keep it (DeepSeek V4 "high").
+    {
+        auto tmpls = read_templates("models/templates/Qwen-Qwen3.8-27B.jinja");
+        auto render = [&](const std::string & effort) {
+            common_chat_templates_inputs inputs;
+            common_chat_msg user;
+            user.role    = "user";
+            user.content = "Hey there!";
+            inputs.messages = { user };
+            inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
+            return common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+        };
+        assert_contains(render("high"),    "Reasoning effort is set to xhigh");
+        assert_contains(render("max"),     "Reasoning effort is set to xhigh");
+        assert_contains(render("minimal"), "Reasoning effort is set to low");
+        assert_contains(render("banana"),  "Reasoning effort is set to xhigh");
+        assert_not_contains(render("medium"), "Reasoning effort is set to");
+    }
 }
 
 static void test_msg_diffs_compute() {
