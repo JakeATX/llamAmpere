@@ -1131,6 +1131,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             if (!explicit_or_env("--gdn-replay")) {
                 params.gdn_replay = false;
             }
+            LOG_INF("card preset 24dense, one slot: draft window %d, gdn-replay %s (multi-user values apply with -np > 1)\n",
+                    params.speculative.draft.attn_window, params.gdn_replay ? "on" : "off");
         }
     }
 
