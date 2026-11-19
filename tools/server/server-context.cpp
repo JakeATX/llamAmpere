@@ -2844,7 +2844,7 @@ private:
             cache_ram_mib = common_fit_prompt_cache_ram_mib(total_host, avail_host,
                     cache_ram_mib, params_base.fit_params, why, explicit_free);
             if (!params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO &&
-                    llama_model_moe_arena_size(model_tgt) > 0) {
+                    (llama_model_moe_arena_size(model_tgt) > 0 || llama_model_moe_unpinned_size(model_tgt) > 0)) {
                 const uint64_t reserve = 11ull << 30;
                 const uint64_t spare = avail_host > reserve ? avail_host - reserve : 0;
                 cache_ram_mib = (int32_t) std::min<uint64_t>(cache_ram_mib, spare >> 20);

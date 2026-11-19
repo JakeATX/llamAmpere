@@ -722,6 +722,8 @@ extern "C" {
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
     // Resident pinned expert storage, excluded from prompt-cache RAM budgets.
     LLAMA_API uint64_t llama_model_moe_arena_size(const struct llama_model * model);
+    // Expert bytes an expert-arena model left unpinned in file pages because RAM was short at load (0 when pinned).
+    LLAMA_API uint64_t llama_model_moe_unpinned_size(const struct llama_model * model);
 
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
