@@ -6671,6 +6671,22 @@ private:
                         // adaptive draft-vocabulary tail: make this prompt's own ids hot before it is
                         // decoded, then re-rank the slots. Request granularity, no graph in flight.
                         if (ctx_dft && llama_draft_vocab_n_hot(ctx_dft) > 0) {
+                            // [REPEAT] the tail is shared by all slots and used to carry the ids of earlier
+                            // requests, so the drafts (and with them the sampled text, and at temp 0 the verify
+                            // widths) of a request depended on what the server served before. Start from the
+                            // load-time tail when no other slot is mid-request, so a request is a function of its
+                            // own prompt. LLAMA_SPEC_VOCAB_HOT_CARRY=1 keeps the old cross-request memory.
+                            static const bool hot_carry = [] {
+                                const char * e = getenv("LLAMA_SPEC_VOCAB_HOT_CARRY");
+                                return e && atoi(e) != 0;
+                            }();
+                            bool others_busy = false;
+                            for (const auto & other : slots) {
+                                others_busy = others_busy || (other.id != slot.id && other.is_processing());
+                            }
+                            if (!hot_carry && !others_busy) {
+                                common_speculative_vocab_reset(spec_init.get());
+                            }
                             common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
 
                             const int32_t n_replaced = common_speculative_refresh(spec_init.get());

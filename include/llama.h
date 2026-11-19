@@ -1683,6 +1683,10 @@ extern "C" {
     // re-rank the hot slots and upload the changed ids; returns the number of replaced slots
     LLAMA_API int32_t llama_draft_vocab_refresh(struct llama_context * ctx);
 
+    // forget all earlier requests: the hot slots go back to their load-time ids and the statistics are
+    // cleared (same call rules as refresh); returns the number of slots rewritten
+    LLAMA_API int32_t llama_draft_vocab_reset(struct llama_context * ctx);
+
     // number of hot slots (0 when the tail is disabled) and of tracked candidate ids
     LLAMA_API int32_t llama_draft_vocab_n_hot(const struct llama_context * ctx);
     LLAMA_API size_t  llama_draft_vocab_n_candidates(const struct llama_context * ctx);

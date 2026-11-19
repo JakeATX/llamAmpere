@@ -177,6 +177,7 @@ using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_in
 // called from the decoding thread at a request boundary.
 void    common_speculative_observe(common_speculative_init_result * spec, const llama_tokens & toks);
 int32_t common_speculative_refresh(common_speculative_init_result * spec);
+int32_t common_speculative_vocab_reset(common_speculative_init_result * spec);
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
 
