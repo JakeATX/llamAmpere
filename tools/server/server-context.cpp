@@ -3837,6 +3837,24 @@ private:
     }
 
     bool process_token(completion_token_output & result, server_slot & slot, bool last_in_group = true) {
+        // fork NOCUTOFF: end of generation inside an open think block (no answer yet, no limit hit): emit the end tag
+        // instead and let the answer follow. Only the last token of a group is not yet decoded, so only it is swapped
+        if (last_in_group && slot.smpl && slot.task->params.sampling.reasoning_answer_reserve != 0 &&
+                llama_vocab_is_eog(vocab, result.tok)) {
+            llama_sampler * tracker = slot.think_tracker.release();
+            if (tracker && common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING) {
+                llama_set_sampler(slot.ctx_tgt, slot.id, nullptr); // the tracker moves into the chain
+            }
+            const llama_token tok = common_sampler_reasoning_rescue_eog(slot.smpl.get(), &tracker);
+            slot.think_tracker.reset(tracker);
+            if (tok != LLAMA_TOKEN_NULL) {
+                SLT_INF(slot, "answer reserve: end of generation inside the think block, closing it, n_gen = %d\n", (int) slot.stats.n_gen);
+                result.tok          = tok;
+                result.text_to_send = common_token_to_piece(slot.ctx_tgt, tok, accept_special_token(slot, tok));
+                result.probs.clear();
+            }
+        }
+
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         // Keep token bytes apart from text buffered for UTF-8 and stop strings.

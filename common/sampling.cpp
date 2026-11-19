@@ -1709,6 +1709,21 @@ bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler
     return true;
 }
 
+llama_token common_sampler_reasoning_rescue_eog(struct common_sampler * gsmpl, llama_sampler ** tracker) {
+    if (!gsmpl || gsmpl->params.reasoning_budget_forced.empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const llama_sampler * think = gsmpl->rbudget ? gsmpl->rbudget : (tracker ? *tracker : nullptr);
+    if (common_reasoning_budget_get_state(think) != REASONING_BUDGET_COUNTING ||
+            !common_sampler_reasoning_close(gsmpl, tracker)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    // the chain already took the end-of-generation token; it now takes the first forced token in its place
+    const llama_token first = gsmpl->params.reasoning_budget_forced.front();
+    common_sampler_accept(gsmpl, first, true);
+    return first;
+}
+
 // helpers
 
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
