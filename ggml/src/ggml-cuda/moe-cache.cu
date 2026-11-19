@@ -95,8 +95,8 @@ static void moe_cache_register_stub(const void * owner) {
 
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
 
-#if defined(_WIN32)
-// Bounce buffers for moe_h2d_async (Windows only). A thread_local destructor runs under the loader lock on Windows,
+// Bounce buffers for moe_h2d_async / moe_h2d_sync (Windows; since FNFALLBACK also Linux, see below). A thread_local
+// destructor runs under the loader lock on Windows,
 // where a call into the CUDA runtime (cudaFreeHost) can deadlock or touch an already unloaded runtime. So no CUDA
 // call is made there: an exiting thread hands its pinned buffer to this process-wide free list and the next thread
 // that needs one reuses it. The pool is never destroyed; the OS releases the pinned pages at process exit.
@@ -130,23 +130,26 @@ struct moe_h2d_bounce {
         }
     }
 };
-#endif
 
 // Host-to-device copy from an expert source, always on the caller's stream.
-// Windows (WDDM): cudaMemcpyAsync rejects a host range that mixes cudaHostRegister'ed pages with unregistered ones
-// (cudaErrorInvalidValue) instead of staging it like Linux does. Only in that case the copy goes through a
-// per-thread bounce buffer: every chunk is queued on the caller's stream, and the stream is synchronized before the
-// buffer is refilled and before returning, so the copy honors the stream's event waits and has completed when the call
-// returns. The buffer is pinned when possible; if pinned memory cannot be allocated a pageable buffer is used, which
-// is still copied on the same stream (only slower). No copy is ever made on another stream.
-// Other platforms: exactly cudaMemcpyAsync.
-static cudaError_t moe_h2d_async(void * dst, const void * src, size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
-    cudaError_t err = cudaMemcpyAsync(dst, src, bytes, kind, stream);
-#if defined(_WIN32)
-    if (err != cudaErrorInvalidValue || kind != cudaMemcpyHostToDevice || !dst || !src || !bytes) {
-        return err;
-    }
+// CUDA rejects a host range that mixes cudaHostRegister'ed pages with unregistered ones (cudaErrorInvalidValue).
+// Windows (WDDM) does it for any such range. Linux does it too once the RAM-short in-place tier has page-locked the
+// missed experts in the weight file view: their page-rounded edges reach into neighbouring experts, so a cache fill
+// or survivor refill of a neighbour is refused (FNFALLBACK 2026-11-19, rc3 on Taichi with experts not pinned: the
+// cache was marked dead and trimmed, VRAM 23.3 -> 6.8 GB, decode 0.64 tok/s on the host; same cause as RAMSAFE r4).
+// Only in that case the copy goes through a per-thread bounce buffer: blocking=false queues every chunk on the
+// caller's stream and synchronizes it before the buffer is refilled and before returning, so the copy honors the
+// stream's event waits and has completed when the call returns; blocking=true uses plain cudaMemcpy. The buffer is
+// pinned when possible; if pinned memory cannot be allocated a pageable buffer is used (only slower). Same bytes on
+// the device as one copy. Any other copy is exactly cudaMemcpyAsync / cudaMemcpy.
+static std::atomic<uint64_t> g_h2d_bounced{0};
+
+static cudaError_t moe_h2d_bounce_copy(void * dst, const void * src, size_t bytes, cudaStream_t stream, bool blocking) {
     (void) cudaGetLastError();
+    if (g_h2d_bounced.fetch_add(1, std::memory_order_relaxed) == 0) {
+        GGML_LOG_WARN("[moe-cache] an expert copy was refused (its source mixes page-locked and pageable pages); "
+                "such copies now go through a bounce buffer\n");
+    }
     static thread_local moe_h2d_bounce bounce;
     static constexpr size_t bounce_bytes = 8u << 20;
     if (!bounce.pinned) {
@@ -178,18 +181,36 @@ static cudaError_t moe_h2d_async(void * dst, const void * src, size_t bytes, cud
         }
         buffer = bounce.pageable.data();
     }
+    cudaError_t err = cudaSuccess;
     for (size_t off = 0; off < bytes; off += bounce_bytes) {
         const size_t n = bytes - off < bounce_bytes ? bytes - off : bounce_bytes;
-        err = cudaStreamSynchronize(stream);   // the previous chunk has finished reading the bounce buffer
-        if (err != cudaSuccess) { return err; }
+        if (!blocking) {
+            err = cudaStreamSynchronize(stream);   // the previous chunk has finished reading the bounce buffer
+            if (err != cudaSuccess) { return err; }
+        }
         memcpy(buffer, (const char *) src + off, n);
-        err = cudaMemcpyAsync((char *) dst + off, buffer, n, cudaMemcpyHostToDevice, stream);
+        err = blocking ? cudaMemcpy((char *) dst + off, buffer, n, cudaMemcpyHostToDevice)
+                       : cudaMemcpyAsync((char *) dst + off, buffer, n, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) { return err; }
     }
-    return cudaStreamSynchronize(stream);
-#else
-    return err;
-#endif
+    return blocking ? cudaSuccess : cudaStreamSynchronize(stream);
+}
+
+static cudaError_t moe_h2d_async(void * dst, const void * src, size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
+    const cudaError_t err = cudaMemcpyAsync(dst, src, bytes, kind, stream);
+    if (err != cudaErrorInvalidValue || kind != cudaMemcpyHostToDevice || !dst || !src || !bytes) {
+        return err;
+    }
+    return moe_h2d_bounce_copy(dst, src, bytes, stream, false);
+}
+
+// Blocking host-to-device copy from an expert source: exactly cudaMemcpy, with the same bounce on a refused copy.
+static cudaError_t moe_h2d_sync(void * dst, const void * src, size_t bytes) {
+    const cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaErrorInvalidValue || !dst || !src || !bytes) {
+        return err;
+    }
+    return moe_h2d_bounce_copy(dst, src, bytes, nullptr, true);
 }
 
 // MiB-valued environment override: plain decimal digits only, at most 1 TiB. Anything else (empty, signed, trailing
@@ -1925,7 +1946,8 @@ static bool moe_cache_cuda_ok(
 
     (void)cudaGetLastError();
     if (device.error_logs.fetch_add(1) < 8) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d %s failed: %s\n",
+        // a warning: a failed cache copy can mark the cache dead, which makes decode much slower
+        GGML_LOG_WARN("[moe-cache] CUDA%d %s failed: %s\n",
                 device.physical, operation, cudaGetErrorString(error));
     }
     if (fatal && error != cudaErrorMemoryAllocation) {
@@ -2780,8 +2802,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     error = cudaStreamSynchronize(stream);
                 }
             } else if (!expired && error == cudaSuccess) {
-                error = cudaMemcpy(
-                        destination, job.source, job.bytes, cudaMemcpyHostToDevice);
+                error = moe_h2d_sync(destination, job.source, job.bytes);
             }
         }
 
@@ -5840,7 +5861,7 @@ static size_t moe_cache_trim_session(
     moe_cache_budget_unregister(*selected);
 
     if (freed > 0) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d trimmed %zu MiB after a cache failure or allocator pressure\n",
+        GGML_LOG_WARN("[moe-cache] CUDA%d trimmed %zu MiB after a cache failure or allocator pressure\n",
                 physical_device, freed >> 20);
     }
     return freed;
@@ -6084,7 +6105,7 @@ static void * moe_resident_create(void * device, const ggml_moe_cache_tensor_des
     size_t offset = 0;
     for (const auto & c : selected) {
         void * destination = (char *)resident->slab + offset;
-        if (cudaMemcpy(destination, c.host, c.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        if (moe_h2d_sync(destination, c.host, c.bytes) != cudaSuccess) {
             (void) cudaFree(resident->slab);
             return nullptr;
         }
@@ -6443,8 +6464,8 @@ static bool moe_cache_resize_pool(moe_cache_device & device, moe_cache_pool & po
         }
         const void * source = (const char *)retained[i].key.tensor +
             (size_t)retained[i].key.expert * moe_cache_host_stride(device, retained[i].key.tensor, pool.expert_size);
-        if (!moe_cache_cuda_ok(device, cudaMemcpy(pool.slab + i * pool.expert_size,
-                source, (end - i) * pool.expert_size, cudaMemcpyHostToDevice), "lend survivor refill", false)) {
+        if (!moe_cache_cuda_ok(device, moe_h2d_sync(pool.slab + i * pool.expert_size,
+                source, (end - i) * pool.expert_size), "lend survivor refill", false)) {
             for (int j = 0; j < (int)retained.size(); ++j) {
                 moe_cache_slot_reset(pool, j, true);
             }
@@ -8107,7 +8128,7 @@ static void moe_cache_device_adapt(moe_cache_session & session) {
             cudaError_t copy_error = cudaSuccess;
             if (!session.device_adapt_stream) {
                 for (const auto & fill : queued) {
-                    copy_error = cudaMemcpy(fill.destination, fill.source, fill.bytes, cudaMemcpyHostToDevice);
+                    copy_error = moe_h2d_sync(fill.destination, fill.source, fill.bytes);
                     if (copy_error != cudaSuccess) {
                         break;
                     }
