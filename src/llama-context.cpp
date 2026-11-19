@@ -6028,7 +6028,8 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         }
         using reset_fn = bool (*)(ggml_backend_t);
         auto reset = (reset_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_reset");
-        if (!reset || !reset(backend)) {
+        // fork: a non-CUDA GPU backend has no CUDA graphs holding scratch addresses; resize it like the CPU backends.
+        if (reset && !reset(backend)) {
             LLAMA_LOG_ERROR("%s: cannot reset graphs on %s before scratch resize\n", __func__, ggml_backend_name(backend));
             return false;
         }

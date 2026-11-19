@@ -9594,7 +9594,12 @@ static int moe_cache_device_supports(void * opaque, void * backend, const ggml_t
 }
 
 bool ggml_cuda_moe_cache_device_supports(const ggml_tensor * op, int logical) {
-    if (!op || op->op != GGML_OP_MUL_MAT_ID || !getenv("GGML_MOE_CACHE_DEVICE")) {
+    // op check first: this runs for every graph node, and getenv is a linear scan of the environment
+    if (!op || op->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    const char * device_on = getenv("GGML_MOE_CACHE_DEVICE");
+    if (!device_on || strcmp(device_on, "1") != 0) {
         return false;
     }
     if (g_session_suppressed > 0) {

@@ -167,6 +167,12 @@ static void test(void) {
         base.n_ubatch = 0;
         assert(common_base_params_to_speculative(base).n_ubatch == 64);
         base.n_ubatch = 1024;
+        // an explicit smaller --spec-draft-n-ubatch stays; a larger one is still capped at 64
+        base.speculative.draft.n_ubatch = 8;
+        assert(common_base_params_to_speculative(base).n_ubatch == 8);
+        base.speculative.draft.n_ubatch = 512;
+        assert(common_base_params_to_speculative(base).n_ubatch == 64);
+        base.speculative.draft.n_ubatch = -1;
         base.n_parallel = 2;
         assert(common_base_params_to_speculative(base).n_ubatch == 1024);
         base.n_parallel = 1;
