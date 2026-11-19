@@ -10,8 +10,7 @@ Model file: TBD (AI2M10-iw or its healed version from HEALM10; the file name, si
 - **8dense needs three files in one folder:** the model file, the LSA map (`lsa-qwen38-27b-d2048.gguf`) and the small
   MTP drafter `mtp-dm.gguf` (127,489,024 bytes, sha256 `4a8e9a5cfb6b1395088bd88b26400b504e47a10fad5a109e4cbee3276f9d5cae`;
   download link TBD). The preset loads `mtp-dm.gguf` in place of the model file's own MTP layer. It no longer looks for
-  `head-ait2.gguf` or `head-exact-f16.gguf`. If `mtp-dm.gguf` is missing, the server stops at start and names the
-  path. In v0.7.0.1, `--preset 8dense` with this file stopped with "failed to load overlay patch".
+  `head-ait2.gguf` or `head-exact-f16.gguf`. If `mtp-dm.gguf` is missing, startup stops and names the path. In v0.7.0.1, `--preset 8dense` with this file stopped with "failed to load overlay patch".
 - **The 8dense default context is 204,800 tokens.** With `mtp-dm.gguf` the peak on an RTX 3070 is 7,607 MiB, under the
   7,692 MiB headless line (8,192 minus 500). To use the model file's own MTP layer instead, set
   `LLAMA_MODEL_OVERLAY_PATCH=` (empty) and `-c 114688`: that layer peaks at 7,819 MiB at 204,800 (over the line) and
@@ -31,7 +30,7 @@ temperature 1, 5,120-token replies, 6 seeds, builds alternated (v0.7.0.1 run wit
 
 | Check | v0.7.0.1 | v0.7.1 |
 |---|---|---|
-| Bare `--preset 8dense` start with this file | stops: "failed to load overlay patch" | starts (own MTP layer at 114,688; with mtp-dm.gguf at 204,800) |
+| Bare `--preset 8dense` start with this file | stops: "failed to load overlay patch" | starts at 204,800 with `mtp-dm.gguf` beside the model; without it, startup stops and names the path (opt-out: `LLAMA_MODEL_OVERLAY_PATCH=` with `-c 114688`) |
 | Peak card memory, 100K and 109K prompts (line 7,692) | 7,663 MiB | 7,663 MiB |
 | Writing speed, 99,984-token prompt | 39.30 tokens/s | 41.35 tokens/s (+5.2%, every seed faster) |
 | Writing speed, 109,288-token prompt | 37.16 tokens/s | 36.32 tokens/s (within seed spread, see below) |

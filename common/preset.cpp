@@ -172,8 +172,8 @@ std::string common_card_preset_apply_env(const common_params & params) {
                     e = value.find(',', b);
                     e = e == std::string::npos ? value.size() : e;
                     const std::string file = value.substr(b, e - b);
-                    if (!file.empty() && !std::filesystem::exists(file, ec)) {
-                        throw std::runtime_error("card preset " + card.name + " needs " + file +
+                    if (!file.empty() && !std::filesystem::is_regular_file(file, ec)) {
+                        throw std::runtime_error("card preset " + card.name + " needs " + file + (ec ? " (" + ec.message() + ")" : std::string()) +
                             " beside the model (download it with the release), or set LLAMA_MODEL_OVERLAY_PATCH= (empty)"
                             " to use the model file's own MTP layer, with -c 114688 on an 8 GB card");
                     }
