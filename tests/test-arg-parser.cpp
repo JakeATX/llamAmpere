@@ -14,6 +14,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+#include <random>
 #include <sstream>
 #include <unordered_set>
 
@@ -275,7 +278,7 @@ static void test(void) {
                 const bool headless = name == "8dense" || args.back() == "headless" || string_ends_with(args.back(), "-headless");
                 assert(selected.card_preset == name && selected.card_preset_ctx_default && selected.fit_params);
                 assert(selected.card_preset_headless == headless);
-                const int expected_ctx = name == "8dense" ? 114688 : name == "10dense" ?
+                const int expected_ctx = name == "8dense" ? 204800 : name == "10dense" ?
                         (headless ? 212992 : 180224) : name == "12dense" ? (headless ? 262144 : 196608) : 262144;
                 assert(selected.n_ctx == expected_ctx);
                 if (name != "24dense") {
@@ -446,7 +449,7 @@ static void test(void) {
         assert(!parse_card({"24dense", "--preset", "10dense"}, invalid));
         common_params tiny;
         assert(parse_card({"--preset", "8dense"}, tiny));
-        assert(tiny.n_ctx == 114688 && tiny.n_ubatch == 256);
+        assert(tiny.n_ctx == 204800 && tiny.n_ubatch == 256);
         assert(tiny.cache_type_k == GGML_TYPE_F16 && tiny.cache_type_v == GGML_TYPE_F16);
         assert(tiny.sj_kvarn_bits_k == 3 && tiny.sj_kvarn_bits_v == 3);
         assert(tiny.sj_kvarn_body_type == GGML_TYPE_I16);
@@ -482,6 +485,14 @@ static void test(void) {
         }
         common_params no_preset;
         assert(common_card_preset_apply_env(no_preset).empty());
+        // 8dense loads the mtp-dm.gguf overlay from the model directory: give it a model dir that has one.
+        const auto tiny_dir = std::filesystem::temp_directory_path() /
+                ("test-arg-parser-8dense-" + std::to_string(std::random_device{}()));
+        std::filesystem::create_directories(tiny_dir);
+        const std::string tiny_model = (tiny_dir / "AI2M10-iw.gguf").string();
+        const std::string tiny_overlay = (tiny_dir / "mtp-dm.gguf").string();
+        std::ofstream(tiny_model).put('x');
+        std::ofstream(tiny_overlay).put('x');
         for (bool headless : {false, true}) {
             common_params medium_env;
             assert(parse_card({"12dense", headless ? "headless" : "headed"}, medium_env));
@@ -494,7 +505,7 @@ static void test(void) {
         }
         for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
             common_params dynamic;
-            assert(parse_card({"--preset", name}, dynamic));
+            assert(parse_card({"--preset", name, "-m", tiny_model}, dynamic));
             const auto enabled = common_card_preset_apply_env(dynamic);
             assert(enabled.find(" LLAMA_DEEPCTX_LADDER=1") != std::string::npos);
             setenv("LLAMA_DEEPCTX_LADDER", "0", 1);
@@ -531,18 +542,31 @@ static void test(void) {
             }
             unsetenv(key.c_str());
         }
-        // 8dense targets a file with its own MTP layer and head: the profile sets no overlay or D1 sidecars.
+        // 8dense loads the mtp-dm.gguf drafter overlay beside the model and no D1 head; a missing overlay stops with a hint.
         const std::string saved_overlay = std::getenv("LLAMA_MODEL_OVERLAY_PATCH") ? std::getenv("LLAMA_MODEL_OVERLAY_PATCH") : "";
         const std::string saved_d1 = std::getenv("LLAMA_D1_HEAD") ? std::getenv("LLAMA_D1_HEAD") : "";
         unsetenv("LLAMA_MODEL_OVERLAY_PATCH");
         unsetenv("LLAMA_D1_HEAD");
+        common_params tiny_missing;
+        assert(parse_card({"8dense", "-m", "/models/tiny-missing/AI2M10-iw.gguf"}, tiny_missing));
+        bool missing_threw = false;
+        try {
+            common_card_preset_apply_env(tiny_missing);
+        } catch (const std::runtime_error & e) {
+            missing_threw = std::string(e.what()).find("/models/tiny-missing/mtp-dm.gguf") != std::string::npos;
+        }
+        assert(missing_threw);
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
         common_params tiny_env;
-        assert(parse_card({"8dense", "-m", "/models/tiny/AI2M10-iw.gguf"}, tiny_env));
+        assert(parse_card({"8dense", "-m", tiny_model}, tiny_env));
         const auto tiny_applied = common_card_preset_apply_env(tiny_env);
-        assert(!std::getenv("LLAMA_MODEL_OVERLAY_PATCH") && !std::getenv("LLAMA_D1_HEAD"));
-        assert(tiny_applied.find("OVERLAY") == std::string::npos && tiny_applied.find("D1_HEAD") == std::string::npos);
+        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == tiny_overlay && !std::getenv("LLAMA_D1_HEAD"));
+        assert(tiny_applied.find(" LLAMA_MODEL_OVERLAY_PATCH=" + tiny_overlay) != std::string::npos);
+        assert(tiny_applied.find("D1_HEAD") == std::string::npos);
         assert(tiny_env.sampling.spec_lossy);
-        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/tiny/lsa-qwen38-27b-d2048.gguf");
+        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == (tiny_dir / "lsa-qwen38-27b-d2048.gguf").string());
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "1");
         assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "7");
         assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "1");
@@ -550,12 +574,14 @@ static void test(void) {
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
+        // shell values win; an empty overlay value selects the file's own MTP layer and skips the file check
+        setenv("LLAMA_MODEL_OVERLAY_PATCH", "", 1);
         setenv("LLAMA_LSA_MEAN_CHUNKS", "0", 1);
         setenv("LLAMA_RESERVE_VERIFY_ROWS", "9", 1);
         setenv("GGML_CUDA_DISABLE_GRAPHS", "0", 1);
         setenv("GGML_ALLOC_GROW_PCT", "5", 1);
-        common_card_preset_apply_env(tiny_env);
-        assert(!std::getenv("LLAMA_MODEL_OVERLAY_PATCH") && !std::getenv("LLAMA_D1_HEAD"));
+        common_card_preset_apply_env(tiny_missing);
+        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")).empty() && !std::getenv("LLAMA_D1_HEAD"));
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "0");
         assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "9");
         assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "0");
@@ -563,6 +589,7 @@ static void test(void) {
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
+        std::filesystem::remove_all(tiny_dir);
         common_params large_env;
         assert(parse_card({"--preset", "24dense"}, large_env));
         common_card_preset_apply_env(large_env);
