@@ -3052,13 +3052,32 @@ std::unique_ptr<llama_moe_arena> llama_model_loader::load_moe_arena(llama_progre
     const size_t available = llama_moe_arena::available_memory();
     const bool quota_ok = llama_moe_arena::fits_ram_budget(total, available, fit_ram,
             getenv("LLAMA_MOE_ARENA") != nullptr);
-    if (available < reserve || total > available - reserve || !llama_moe_arena::pin_supported() || !quota_ok) {
+    const bool pin_ok = llama_moe_arena::pin_supported();
+    if (available < reserve || total > available - reserve || !pin_ok || !quota_ok) {
         if (!quota_ok) {
             LLAMA_LOG_INFO("RAM fit: pinned expert storage disabled because %.2f GiB exceeds its %.2f GiB RAM share; using unpinned model pages to leave 5 GiB free and room for other caches\n",
                     total / double(GiB), llama_moe_arena::fit_memory_budget(available) / double(GiB));
         }
-        LLAMA_LOG_WARN("%s: %.2f GiB experts use unpinned mmap storage; %.2f GiB available, %.2f GiB pinning headroom required\n",
-                __func__, total / double(GiB), available / double(GiB), reserve / double(GiB));
+        // fork (FNFALLBACK): this used to be one quiet line, and the slower expert path that follows ran without
+        // anything saying why. Say what was chosen, why, and how much RAM would avoid it. RAM needed to pin: the
+        // experts plus the headroom, or under --fit the RAM whose automatic share (half of 80% above 5 GiB) holds them.
+        size_t need = total + reserve;
+        if (!quota_ok) {
+            need = std::max<size_t>(need, (size_t(5) << 30) + total / 2 * 5);
+        }
+        moe_unpinned_bytes = total;
+        moe_unpinned_need  = pin_ok ? need : 0; // 0: not a RAM shortfall, this system cannot pin
+        moe_unpinned_avail = available;
+        if (!pin_ok) {
+            LLAMA_LOG_WARN("%s: EXPERTS NOT PINNED (slower decode): this system cannot pin %.2f GiB of expert memory; "
+                    "experts stay in model file pages\n", __func__, total / double(GiB));
+        } else {
+            LLAMA_LOG_WARN("%s: EXPERTS NOT PINNED (slower decode): %.2f GiB experts need %.2f GiB usable RAM to pin "
+                    "(%.2f GiB headroom%s), %.2f GiB usable now; free %.2f GiB more RAM and restart for full speed. "
+                    "Experts stay in model file pages\n", __func__, total / double(GiB), need / double(GiB),
+                    reserve / double(GiB), quota_ok ? "" : " and the --fit RAM share", available / double(GiB),
+                    (need > available ? need - available : 0) / double(GiB));
+        }
 #ifdef __linux__
         const char * device_cache = getenv("GGML_MOE_CACHE_DEVICE");
         if (device_cache && strcmp(device_cache, "1") == 0) {
