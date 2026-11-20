@@ -188,5 +188,5 @@ static void server_setup_report(const common_params & params, llama_context * ct
             guarded, cache_status < 0 ? "unknown" : cache_on ? "on" : "off", cache_bytes / 1048576.0, cache_status,
             b1 < 0 ? "pending" : b1 ? "on" : "off", passes, llama_n_threads(ctx), llama_n_threads_batch(ctx), draft ? llama_n_threads(draft) : 0, draft ? llama_n_threads_batch(draft) : 0, cores,
             batch, ubatch, context, draft_device, server_setup_kv(ctx).c_str(), server_setup_kv(draft).c_str(), warnings,
-            model.moe_arena_size() ? "pinned" : model.moe_unpinned_bytes ? "file-pages" : "n/a");
+            llama_model_moe_arena_size(&model) ? "pinned" : model.moe_unpinned_bytes ? "file-pages" : "n/a");
 }
