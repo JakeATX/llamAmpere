@@ -1,0 +1,73 @@
+{
+  "variant": "458k_b512_ub128",
+  "ctx": "458k",
+  "batch": 512,
+  "ubatch": 128,
+  "rep": 1,
+  "load_seconds": 65,
+  "probe_seconds": 10766,
+  "rss_mb": null,
+  "peak_vram_mib": 24039,
+  "headroom_mib": -63,
+  "oom_lines": 0,
+  "status": "killed_mid_maxctx",
+  "pass": false,
+  "fail_reasons": "peak=24039>23650",
+  "record_note": "recovered from probe.err; max_ctx killed at 442368/450000 tokens",
+  "results": [
+    {
+      "task": "coding_16k",
+      "pp_tok_s": 1127.97,
+      "tg_tok_s": 109.41,
+      "prompt_tokens": 16458
+    },
+    {
+      "task": "coding_64k",
+      "pp_tok_s": 796.31,
+      "tg_tok_s": 103.8,
+      "prompt_tokens": 65535
+    },
+    {
+      "task": "coding_128k",
+      "pp_tok_s": 412.63,
+      "tg_tok_s": 92.6,
+      "prompt_tokens": 130987
+    },
+    {
+      "task": "coding_160k",
+      "pp_tok_s": 315.03,
+      "tg_tok_s": 91.5,
+      "prompt_tokens": 163719
+    },
+    {
+      "task": "coding_200k",
+      "pp_tok_s": 246.12,
+      "tg_tok_s": 80.12,
+      "prompt_tokens": 204697
+    },
+    {
+      "task": "coding_250k",
+      "pp_tok_s": 234.06,
+      "tg_tok_s": 76.37,
+      "prompt_tokens": 255848
+    },
+    {
+      "task": "coding_300k",
+      "pp_tok_s": 221.23,
+      "tg_tok_s": 70.58,
+      "prompt_tokens": 306982
+    },
+    {
+      "task": "coding_350k",
+      "pp_tok_s": 208.22,
+      "tg_tok_s": 66.83,
+      "prompt_tokens": 358118
+    },
+    {
+      "task": "coding_400k",
+      "pp_tok_s": 194.52,
+      "tg_tok_s": 61.87,
+      "prompt_tokens": 409346
+    }
+  ]
+}

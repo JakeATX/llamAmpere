@@ -1,0 +1,121 @@
+{
+  "variant": "432k_b2048_ub512",
+  "ctx": "432k",
+  "batch": 2048,
+  "ubatch": 512,
+  "rep": 1,
+  "load_seconds": 64,
+  "probe_seconds": 6879,
+  "rss_mb": 15865,
+  "peak_vram_mib": 23527,
+  "headroom_mib": 449,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "coding_16k",
+      "prompt_tokens": 16474,
+      "prompt_ms": 10122.5,
+      "pp_tok_s": 1627.46,
+      "gen_tokens": 512,
+      "gen_ms": 4099.8,
+      "tg_tok_s": 124.64,
+      "wall_s": 14.34
+    },
+    {
+      "task": "coding_64k",
+      "prompt_tokens": 65508,
+      "prompt_ms": 49414.7,
+      "pp_tok_s": 1325.68,
+      "gen_tokens": 512,
+      "gen_ms": 4910.3,
+      "tg_tok_s": 104.07,
+      "wall_s": 55.9
+    },
+    {
+      "task": "coding_128k",
+      "prompt_tokens": 131026,
+      "prompt_ms": 138479.7,
+      "pp_tok_s": 946.17,
+      "gen_tokens": 512,
+      "gen_ms": 5516.5,
+      "tg_tok_s": 92.63,
+      "wall_s": 148.25
+    },
+    {
+      "task": "coding_160k",
+      "prompt_tokens": 163769,
+      "prompt_ms": 206229.5,
+      "pp_tok_s": 794.11,
+      "gen_tokens": 512,
+      "gen_ms": 6170.6,
+      "tg_tok_s": 82.81,
+      "wall_s": 218.14
+    },
+    {
+      "task": "coding_200k",
+      "prompt_tokens": 204632,
+      "prompt_ms": 305586.1,
+      "pp_tok_s": 669.64,
+      "gen_tokens": 512,
+      "gen_ms": 6242.5,
+      "tg_tok_s": 81.86,
+      "wall_s": 320.39
+    },
+    {
+      "task": "coding_250k",
+      "prompt_tokens": 255818,
+      "prompt_ms": 553020.7,
+      "pp_tok_s": 462.58,
+      "gen_tokens": 512,
+      "gen_ms": 6754.9,
+      "tg_tok_s": 75.65,
+      "wall_s": 577.69
+    },
+    {
+      "task": "coding_300k",
+      "prompt_tokens": 306963,
+      "prompt_ms": 853637.0,
+      "pp_tok_s": 359.59,
+      "gen_tokens": 512,
+      "gen_ms": 7686.2,
+      "tg_tok_s": 66.48,
+      "wall_s": 883.08
+    },
+    {
+      "task": "coding_350k",
+      "prompt_tokens": 357961,
+      "prompt_ms": 1203004.1,
+      "pp_tok_s": 297.56,
+      "gen_tokens": 512,
+      "gen_ms": 7139.9,
+      "tg_tok_s": 71.57,
+      "wall_s": 1242.71
+    },
+    {
+      "task": "coding_400k",
+      "prompt_tokens": 409314,
+      "prompt_ms": 1601189.8,
+      "pp_tok_s": 255.63,
+      "gen_tokens": 512,
+      "gen_ms": 8375.1,
+      "tg_tok_s": 61.01,
+      "wall_s": 1648.42
+    },
+    {
+      "task": "max_ctx",
+      "prompt_tokens": 423686,
+      "prompt_ms": 1719724.4,
+      "pp_tok_s": 246.37,
+      "gen_tokens": 64,
+      "gen_ms": 1020.2,
+      "tg_tok_s": 61.75,
+      "wall_s": 1763.29,
+      "max_ctx_request": 424000
+    }
+  ],
+  "max_ctx_pp": 246.37,
+  "max_ctx_tg": 61.75,
+  "max_ctx_tokens": 423686,
+  "pass": true
+}

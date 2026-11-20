@@ -1,0 +1,81 @@
+{
+  "variant": "432k_b2560_ub640",
+  "ctx": "432k",
+  "batch": 2560,
+  "ubatch": 640,
+  "rep": 1,
+  "load_seconds": 66,
+  "probe_seconds": 5452,
+  "rss_mb": 16133,
+  "peak_vram_mib": 23655,
+  "headroom_mib": 321,
+  "oom_lines": 0,
+  "status": "probe_failed_rc124",
+  "results": [
+    {
+      "task": "coding_128k",
+      "pp_tok_s": 982.69,
+      "tg_tok_s": 94.01,
+      "prompt_tokens": 131004,
+      "partial": true
+    },
+    {
+      "task": "coding_160k",
+      "pp_tok_s": 844.72,
+      "tg_tok_s": 80.53,
+      "prompt_tokens": 163737,
+      "partial": true
+    },
+    {
+      "task": "coding_16k",
+      "pp_tok_s": 1609.85,
+      "tg_tok_s": 116.9,
+      "prompt_tokens": 16401,
+      "partial": true
+    },
+    {
+      "task": "coding_200k",
+      "pp_tok_s": 726.26,
+      "tg_tok_s": 79.25,
+      "prompt_tokens": 204689,
+      "partial": true
+    },
+    {
+      "task": "coding_250k",
+      "pp_tok_s": 515.91,
+      "tg_tok_s": 74.54,
+      "prompt_tokens": 255916,
+      "partial": true
+    },
+    {
+      "task": "coding_300k",
+      "pp_tok_s": 408.34,
+      "tg_tok_s": 72.27,
+      "prompt_tokens": 307021,
+      "partial": true
+    },
+    {
+      "task": "coding_350k",
+      "pp_tok_s": 345.32,
+      "tg_tok_s": 65.96,
+      "prompt_tokens": 358051,
+      "partial": true
+    },
+    {
+      "task": "coding_400k",
+      "pp_tok_s": 299.72,
+      "tg_tok_s": 63.8,
+      "prompt_tokens": 409312,
+      "partial": true
+    },
+    {
+      "task": "coding_64k",
+      "pp_tok_s": 1305.09,
+      "tg_tok_s": 113.44,
+      "prompt_tokens": 65475,
+      "partial": true
+    }
+  ],
+  "error": "Expecting value: line 1 column 1 (char 0)",
+  "recovered_tasks": 9
+}
