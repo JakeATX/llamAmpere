@@ -96,6 +96,10 @@ struct llama_model_loader {
     bool load_mtp;
     bool use_moe_arena = false;
     uint32_t moe_arena_layers = 0;
+    // fork (FNFALLBACK): set when load_moe_arena refused to pin the experts (0 = pinned or no arena model)
+    size_t moe_unpinned_bytes = 0;  // expert bytes left in model file pages
+    size_t moe_unpinned_need  = 0;  // usable RAM the pin needed at load
+    size_t moe_unpinned_avail = 0;  // usable RAM at load
     // fork: per-tensor answer to "is every F32 router value exactly BF16-representable" (low 16 bits zero)
     mutable std::unordered_map<std::string, bool> router_bf16_exact;
     bool router_bf16_exact_check(const char * name) const;

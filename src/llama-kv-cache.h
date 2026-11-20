@@ -687,9 +687,12 @@ private:
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
+    // dropped, when set: a KEEP_LAYOUT save whose layout does not fit leaves out its masked SWA cells (marked here)
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr,
-            const std::vector<uint32_t> * layout = nullptr, uint32_t layout_head = 0);
-    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+            const std::vector<uint32_t> * layout = nullptr, uint32_t layout_head = 0, std::vector<bool> * dropped = nullptr);
+    // dropped (empty = none): the saved cells state_read_meta did not place; their rows are read and discarded
+    bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo,
+            const std::vector<bool> & dropped = {});
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
 

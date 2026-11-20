@@ -19,10 +19,12 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "src/llama-ext.h"
 #include "log.h"
 #include "ngram-cache.h"
 #include "sampling.h"
+#include "reasoning-budget.h"
 #include "speculative.h"
 #include "speculative-copy.h"
 #include "mtmd.h"
@@ -835,6 +837,10 @@ struct server_slot {
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
+    // fork NOCUTOFF: think-block tracker (outside the sampler chain) and the answer reserve, sized at the first token
+    llama_sampler_ptr think_tracker;
+    int32_t answer_reserve = -1;
+
     size_t last_nl_pos = 0;
 
     common_chat_input generated;
@@ -1138,6 +1144,8 @@ struct server_slot {
         verify_budget_accept.clear();
 
         n_predict_max = -1;
+        think_tracker.reset();
+        answer_reserve = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -1354,6 +1362,8 @@ struct server_slot {
     // adaptive draft-vocabulary tail: fold this request's output into the hot statistics.
     // generated_tokens is only filled when the task asked for its tokens back, so take the generated
     // tail of the slot's own sequence instead. The refresh happens at the next request's prompt.
+    // [REPEAT] by default the next request resets the tail first when no other slot is busy, so this
+    // only reaches a request that starts while another slot is mid-request (or with HOT_CARRY=1).
     void draft_vocab_observe_generated() {
         if (ctx_dft == nullptr || draft_vocab_observed || stats.n_gen <= 0) {
             return;
@@ -2844,7 +2854,7 @@ private:
             cache_ram_mib = common_fit_prompt_cache_ram_mib(total_host, avail_host,
                     cache_ram_mib, params_base.fit_params, why, explicit_free);
             if (!params_base.fit_params && params_base.cache_ram_mib == COMMON_CACHE_RAM_AUTO &&
-                    llama_model_moe_arena_size(model_tgt) > 0) {
+                    (llama_model_moe_arena_size(model_tgt) > 0 || llama_model_moe_unpinned_size(model_tgt) > 0)) {
                 const uint64_t reserve = 11ull << 30;
                 const uint64_t spare = avail_host > reserve ? avail_host - reserve : 0;
                 cache_ram_mib = (int32_t) std::min<uint64_t>(cache_ram_mib, spare >> 20);
@@ -3784,6 +3794,8 @@ private:
         // the per-request limit takes priority over the global one
         slot.loop_guard = {};
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+        slot.answer_reserve = -1;
+        slot.think_tracker.reset(slot.smpl ? common_reasoning_tracker_init(model_tgt, task.params.sampling) : nullptr);
 
         slot.sj_kvarn_accepted_end = -1;
         slot.sj_kvarn_idle_pending = false;
@@ -3827,11 +3839,33 @@ private:
     }
 
     bool process_token(completion_token_output & result, server_slot & slot, bool last_in_group = true) {
+        // fork NOCUTOFF: end of generation inside an open think block (no answer yet, no limit hit): emit the end tag
+        // instead and let the answer follow. Only the last token of a group is not yet decoded, so only it is swapped
+        if (last_in_group && slot.smpl && slot.task->params.sampling.reasoning_answer_reserve != 0 &&
+                llama_vocab_is_eog(vocab, result.tok)) {
+            llama_sampler * tracker = slot.think_tracker.release();
+            if (tracker && common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING) {
+                llama_set_sampler(slot.ctx_tgt, slot.id, nullptr); // the tracker moves into the chain
+            }
+            const llama_token tok = common_sampler_reasoning_rescue_eog(slot.smpl.get(), &tracker);
+            slot.think_tracker.reset(tracker);
+            if (tok != LLAMA_TOKEN_NULL) {
+                SLT_INF(slot, "answer reserve: end of generation inside the think block, closing it, n_gen = %d\n", (int) slot.stats.n_gen);
+                result.tok          = tok;
+                const bool special = params_base.special || slot.task->params.sampling.preserved_tokens.count(tok) > 0;
+                result.text_to_send = common_token_to_piece(slot.ctx_tgt, tok, special);
+                result.probs.clear();
+            }
+        }
+
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         // Keep token bytes apart from text buffered for UTF-8 and stop strings.
         slot.add_token(result);
         slot.sampled = result.tok;
+        if (slot.think_tracker) {
+            llama_sampler_accept(slot.think_tracker.get(), result.tok);
+        }
 
         slot.generated.append(token_str, result.tok);
         if (slot.task->params.return_tokens) {
@@ -3896,6 +3930,33 @@ private:
 
             SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
                     slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+        }
+
+        // fork NOCUTOFF: close the think block while the answer still has room before max_tokens or a full context
+        // (LLAMA_ARG_REASONING_ANSWER_RESERVE / --reasoning-answer-reserve 0 turns it off)
+        if (last_in_group && slot.has_next_token && slot.smpl && tp.sampling.reasoning_answer_reserve != 0) {
+            int32_t left = slot.n_remaining();
+            if (!params_base.ctx_shift) {
+                const int32_t ctx_left = slot.n_ctx - slot.prompt.n_tokens() - 1;
+                left = left < 0 ? ctx_left : std::min(left, ctx_left);
+            }
+            if (left >= 0) {
+                if (slot.answer_reserve < 0) {
+                    slot.answer_reserve = common_answer_reserve(left + slot.stats.n_gen, tp.sampling.reasoning_answer_reserve);
+                }
+                if (left <= slot.answer_reserve + (int32_t) tp.sampling.reasoning_budget_forced.size()) {
+                    llama_sampler * tracker = slot.think_tracker.release();
+                    if (tracker && common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING) {
+                        // the tracker moves into the chain: sampling continues on the CPU from here
+                        llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
+                    }
+                    if (common_sampler_reasoning_close(slot.smpl.get(), &tracker)) {
+                        SLT_INF(slot, "answer reserve: closing the think block, n_gen = %d, left = %d, reserve = %d\n",
+                                (int) slot.stats.n_gen, left, slot.answer_reserve);
+                    }
+                    slot.think_tracker.reset(tracker);
+                }
+            }
         }
 
         // check the limits
@@ -6671,11 +6732,31 @@ private:
                         // adaptive draft-vocabulary tail: make this prompt's own ids hot before it is
                         // decoded, then re-rank the slots. Request granularity, no graph in flight.
                         if (ctx_dft && llama_draft_vocab_n_hot(ctx_dft) > 0) {
+                            // [REPEAT] the tail is shared by all slots and used to carry the ids of earlier
+                            // requests, so the drafts (and with them the sampled text, and at temp 0 the verify
+                            // widths) of a request depended on what the server served before. Start from the
+                            // load-time tail when no other slot is mid-request, so a request is a function of its
+                            // own prompt. LLAMA_SPEC_VOCAB_HOT_CARRY=1 keeps the old cross-request memory.
+                            static const bool hot_carry = [] {
+                                const char * e = getenv("LLAMA_SPEC_VOCAB_HOT_CARRY");
+                                return e && atoi(e) != 0;
+                            }();
+                            // conservative: two requests started in one pass, or n>1 / shared-prefix children
+                            // waiting in WAIT_OTHER, count as busy and keep the shared tail (no reset)
+                            bool others_busy = false;
+                            for (const auto & other : slots) {
+                                others_busy = others_busy || (other.id != slot.id && other.is_processing());
+                            }
+                            int32_t n_reset = 0;
+                            if (!hot_carry && !others_busy) {
+                                n_reset = common_speculative_vocab_reset(spec_init.get());
+                            }
                             common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
 
                             const int32_t n_replaced = common_speculative_refresh(spec_init.get());
 
-                            SLT_INF(slot, "draft vocab hot: %d/%d slots replaced, %zu candidates\n",
+                            SLT_INF(slot, "draft vocab hot: %s (%d back to load ids), %d/%d slots replaced, %zu candidates\n",
+                                    hot_carry ? "carry" : (others_busy ? "shared, other slot busy" : "reset"), n_reset,
                                     n_replaced, llama_draft_vocab_n_hot(ctx_dft),
                                     llama_draft_vocab_n_candidates(ctx_dft));
                         }

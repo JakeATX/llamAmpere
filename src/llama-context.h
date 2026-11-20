@@ -377,6 +377,8 @@ public:
     // adaptive draft-vocabulary tail (request granularity, must not race with a graph)
     void    draft_vocab_observe(const llama_token * toks, size_t n);
     int32_t draft_vocab_refresh();
+    int32_t draft_vocab_reset();
+    int32_t draft_vocab_apply(const std::vector<llama_mtp_hot_vocab::replacement> & reps);
     int32_t draft_vocab_n_hot()        const { return draft_vocab.n_hot; }
     size_t  draft_vocab_n_candidates() const { return draft_vocab.hot.cands.size(); }
 

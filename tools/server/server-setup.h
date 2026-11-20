@@ -141,6 +141,16 @@ static void server_setup_report(const common_params & params, llama_context * ct
             warn(string_format("host experts need %.2f GiB, available RAM/job headroom is %.2f GiB; disk paging is likely", (host_experts + draft_experts) / 1073741824.0, available / 1073741824.0));
         }
     }
+    // fork (FNFALLBACK): repeat the load-time pin refusal at the end of startup, where it is seen
+    if (model.moe_unpinned_bytes && !model.moe_unpinned_need) {
+        warn(string_format("EXPERTS NOT PINNED (slower decode): %.2f GiB experts run from model file pages because this system cannot pin them",
+                model.moe_unpinned_bytes / 1073741824.0));
+    } else if (model.moe_unpinned_bytes) {
+        warn(string_format("EXPERTS NOT PINNED (slower decode): %.2f GiB experts run from model file pages because RAM was short at load "
+                "(%.2f GiB usable, %.2f GiB needed to pin); free %.2f GiB more RAM and restart for full speed",
+                model.moe_unpinned_bytes / 1073741824.0, model.moe_unpinned_avail / 1073741824.0, model.moe_unpinned_need / 1073741824.0,
+                (model.moe_unpinned_need > model.moe_unpinned_avail ? model.moe_unpinned_need - model.moe_unpinned_avail : 0) / 1073741824.0));
+    }
     std::set<std::string> files = {params.model.path};
     if (!params.speculative.draft.mparams.path.empty()) { files.insert(params.speculative.draft.mparams.path); }
 #if defined(__linux__)
@@ -174,8 +184,9 @@ static void server_setup_report(const common_params & params, llama_context * ct
 #endif
     }
     const int b1 = ctx->b1_status();
-    SRV_INF("[FNGUARD] effective setup: guarded=%d cache=%s cache_MiB=%.2f cache_status=%d B1=%s passes_min=%u passes_basis=slot-context B1_groups=runtime threads=%d/%d draft_threads=%d/%d physical_cores=%d batch=%u ubatch=%u context=%u draft=%s KV=%s draft_KV=%s warnings=%d\n",
+    SRV_INF("[FNGUARD] effective setup: guarded=%d cache=%s cache_MiB=%.2f cache_status=%d B1=%s passes_min=%u passes_basis=slot-context B1_groups=runtime threads=%d/%d draft_threads=%d/%d physical_cores=%d batch=%u ubatch=%u context=%u draft=%s KV=%s draft_KV=%s warnings=%d experts=%s\n",
             guarded, cache_status < 0 ? "unknown" : cache_on ? "on" : "off", cache_bytes / 1048576.0, cache_status,
             b1 < 0 ? "pending" : b1 ? "on" : "off", passes, llama_n_threads(ctx), llama_n_threads_batch(ctx), draft ? llama_n_threads(draft) : 0, draft ? llama_n_threads_batch(draft) : 0, cores,
-            batch, ubatch, context, draft_device, server_setup_kv(ctx).c_str(), server_setup_kv(draft).c_str(), warnings);
+            batch, ubatch, context, draft_device, server_setup_kv(ctx).c_str(), server_setup_kv(draft).c_str(), warnings,
+            model.moe_arena_size() ? "pinned" : model.moe_unpinned_bytes ? "file-pages" : "n/a");
 }

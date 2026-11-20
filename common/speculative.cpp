@@ -4804,6 +4804,14 @@ int32_t common_speculative_refresh(common_speculative_init_result * spec) {
     return ctx == nullptr ? 0 : llama_draft_vocab_refresh(ctx);
 }
 
+int32_t common_speculative_vocab_reset(common_speculative_init_result * spec) {
+    if (spec == nullptr) {
+        return 0;
+    }
+    llama_context * ctx = spec->context();
+    return ctx == nullptr ? 0 : llama_draft_vocab_reset(ctx);
+}
+
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
     return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
 }

@@ -4,6 +4,11 @@ llamAmpere is based on mainline llama.cpp (v1.0), tuned for NVIDIA RTX 30-series
 
 It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model writes faster) and Qwen3.8 Flash-Next.
 
+## What's new in v0.7.2
+
+- Small MoE models stay on the card: Mellum2.1-12B-A2.5B-Thinking IQ3_XS writes 155.1 tokens/s with default flags (v0.7.1: 10.8, RTX 3090, 8,072-token prompt). Flash-Next no longer drops to 0.63 tokens/s when there is too little RAM to pin its experts (89.82 in the same state). [Release notes](docs/llamampere-v0.7.2/RELEASE_NOTES.md).
+- Thinking replies keep room for the answer, a second user no longer forces a full prompt re-read (`-np 2`, 28,301-token follow-up: 0.6 s instead of 17.9 s), and earlier requests no longer change later replies. 27B and Flash-Next speed is the same as v0.7.1.
+
 ## What's new in v0.7.1
 
 - Faster for one user on 24 GB cards: `--preset 24dense` with one slot writes 115.6 tokens/s at a 98,766-token prompt (v0.7.0.1: 99.8, RTX 3090, P76 AI4 model, +15.8%) and 138.8 at 8,000 (v0.7.0.1: 123.1).

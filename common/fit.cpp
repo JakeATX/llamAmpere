@@ -13,6 +13,8 @@
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -1084,7 +1086,48 @@ static void common_params_fit_impl(
             paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level, &moe_tensors);
         }
     }
-    add_extra_memory(dmds_full);
+
+    // fork (MOEPLACE): an MoE model whose experts, other weights and KV all fit on the GPUs keeps stock GPU
+    // placement; the expert arena (experts in pinned host RAM) and the MoE cache engage only when they do not.
+    // Only with every layer on the GPU and no expert overrides. LLAMA_MOEPLACE=0 restores the old always-arena default.
+    bool stock_kept = false;
+    if (hp_nex > 0 && !devs.empty() && std::getenv("LLAMA_MOE_ARENA") == nullptr && common_get_env("LLAMA_MOEPLACE") != "0" &&
+            (!mparams->tensor_buft_overrides || !mparams->tensor_buft_overrides[0].pattern) &&
+            (mparams->n_gpu_layers < 0 || mparams->n_gpu_layers >= int32_t(hp_ngl)) &&
+            (!moe_cache || !moe_cache->mode_explicit || moe_cache->mode == COMMON_MOE_CACHE_MODE_OFF)) {
+        common_set_env("LLAMA_MOE_ARENA", "off");
+        dmds_t dmds_stock = common_get_device_memory_data_impl(
+            paths_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmds_stock);
+        bool fits = extra_complete;
+        int64_t free_min = INT64_MAX;
+        for (size_t id = 0; id < devs.size(); id++) {
+            const int64_t left = dmds_stock[id].free - int64_t(dmds_stock[id].mb.total());
+            free_min = std::min(free_min, left);
+            fits = fits && left >= int64_t(margins_s[id]);
+        }
+        if (fits) {
+            stock_kept = true;
+            dmds_full = std::move(dmds_stock);
+            if (moe_cache) {
+                moe_cache->mode          = COMMON_MOE_CACHE_MODE_OFF;
+                moe_cache->mode_explicit = true;
+            }
+            cparams->moe_cache_mode = LLAMA_MOE_CACHE_MODE_OFF;
+            LOG_INF("%s: MoE placement: all experts, weights and KV at ctx %" PRIu32 " fit on the GPU (%" PRId64
+                " MiB left): stock GPU placement, expert arena and MoE cache off (LLAMA_MOEPLACE=0 restores them)\n",
+                __func__, cparams->n_ctx, free_min/MiB);
+        } else {
+            common_set_env("LLAMA_MOE_ARENA", "");
+            dmds_extra.clear();
+            extra_complete = true;
+            LOG_INF("%s: MoE placement: experts do not fit on the GPU at ctx %" PRIu32 " (%" PRId64
+                " MiB left): expert arena placement kept\n", __func__, cparams->n_ctx, free_min/MiB);
+        }
+    }
+    if (!stock_kept) {
+        add_extra_memory(dmds_full);
+    }
 
     const size_t nd = devs.size(); // number of devices
 
@@ -1092,7 +1135,9 @@ static void common_params_fit_impl(
         if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF &&
             !moe_tensors.empty() &&
             (!mparams->tensor_buft_overrides || !mparams->tensor_buft_overrides[0].pattern)) {
-            LOG_INF("%s: MoE cache fit kept stock placement because the complete model already meets the fit targets\n", __func__);
+            const char * arena = std::getenv("LLAMA_MOE_ARENA");
+            LOG_INF("%s: MoE cache fit: the model meets the fit targets %s\n", __func__, arena && strcmp(arena, "off") == 0 ?
+                "with stock placement" : "with routed experts in the host expert arena (not on the GPU)");
         }
     };
 

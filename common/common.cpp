@@ -1580,7 +1580,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
-    if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
+    // fork (FNFALLBACK): an expert-arena model whose experts could not be pinned (RAM short at load) keeps the same
+    // cache defaults. Keying them on the pinned size dropped them on the fallback: the card cache kept the 3072 MiB
+    // built-in reserve (about 2 GiB smaller) and started without the usage profile, so fewer experts hit the card.
+    const bool moe_arena_model = llama_model_moe_arena_size(model) || llama_model_moe_unpinned_size(model);
+    if (moe_arena_model && !std::getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
         // Flash-Next keeps 928 MiB free with trimmed prompt scratch and host-backed raw indexer history.
         // Other arena models keep 2560 MiB.
         char arch[64] = {0};
@@ -1595,7 +1599,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // user peaks at 23,397. So the reserve grows by LLAMA_MOE_CACHE_SLOT_RESERVE_MB
     // (default 256, 0 = off) for each slot past the first. One slot: unchanged.
     static bool slot_reserve_applied = false;
-    if (llama_model_moe_arena_size(model) && params.n_parallel > 1 && !slot_reserve_applied) {
+    if (moe_arena_model && params.n_parallel > 1 && !slot_reserve_applied) {
         slot_reserve_applied = true;
         long long slot_mb = 256;
         if (const char * text = std::getenv("LLAMA_MOE_CACHE_SLOT_RESERVE_MB")) {
@@ -1615,10 +1619,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.n_parallel, reserve_mb, slot_mb, total_mb);
         }
     }
-    if (llama_model_moe_arena_size(model) && !std::getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) {
+    if (moe_arena_model && !std::getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) {
         common_set_env("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", "1");
     }
-    if (llama_model_moe_arena_size(model) && !std::getenv("GGML_MOE_CACHE_PROFILE_LOAD")) {
+    if (moe_arena_model && !std::getenv("GGML_MOE_CACHE_PROFILE_LOAD")) {
 #ifdef LLAMA_MOE_PROFILE_SOURCE
         const char * profiles[] = { LLAMA_MOE_PROFILE_SOURCE, LLAMA_MOE_PROFILE_INSTALL };
         for (const char * profile : profiles) {

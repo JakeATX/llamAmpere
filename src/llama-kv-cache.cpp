@@ -5793,13 +5793,17 @@ const slot_info_vec_t *   sinfos_in) {
             }
         }
 
+        // [KVRESTORE] masked cells of a KEEP_LAYOUT save that cannot go back to their saved indices are dropped,
+        // except when another cache mirrors this layout cell for cell
+        std::vector<bool> dropped;
+
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[strm] : nullptr,
-                layout.empty() ? nullptr : &layout, layout_head);
+                layout.empty() ? nullptr : &layout, layout_head, sinfos_out ? nullptr : &dropped);
         mirror_used = true;
 
         try {
-            res = res && state_read_data(io, strm, cell_count, sinfo);
+            res = res && state_read_data(io, strm, cell_count, sinfo, dropped);
         } catch (...) {
             res = false;
         }
@@ -6535,7 +6539,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 }
 
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in,
-        const std::vector<uint32_t> * layout, uint32_t layout_head) {
+        const std::vector<uint32_t> * layout, uint32_t layout_head, std::vector<bool> * dropped) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -6643,11 +6647,59 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             } else {
                 if (layout != nullptr) {
                     LLAMA_LOG_WARN("%s: the saved cell layout does not fit this cache, the cells are placed anew\n", __func__);
+
+                    // [KVRESTORE] the masked SWA cells a KEEP_LAYOUT save carries only matter at their saved indices.
+                    // Placed anew they hold nothing the sequence attends again, and they may not fit: a ring shared
+                    // by several sequences (MTP draft window, --kv-unified) lets one sequence fill the whole ring
+                    // while the others are idle, and after another sequence wrote its window the restore of such
+                    // a checkpoint needs more cells than are free. Drop them (state_read_data skips their rows).
+                    if (dropped != nullptr && swa_type != LLAMA_SWA_TYPE_NONE) {
+                        llama_pos pos_max = -1;
+                        for (uint32_t i = 0; i < cell_count; ++i) {
+                            pos_max = std::max(pos_max, ubatch.pos[i]);
+                        }
+                        dropped->assign(cell_count, false);
+                        uint32_t n_keep = 0;
+                        for (uint32_t i = 0; i < cell_count; ++i) {
+                            // the rule state_write applies to a save without KEEP_LAYOUT
+                            (*dropped)[i] = ubatch.pos[i] >= (llama_pos) n_swa_sink &&
+                                llama_hparams::is_masked_swa(n_swa, swa_type, ubatch.pos[i], pos_max);
+                            n_keep += (*dropped)[i] ? 0 : 1;
+                        }
+                        if (n_keep == cell_count) {
+                            dropped->clear();
+                        } else {
+                            const llama_ubatch full = ubatch;
+                            const uint32_t n_pos = hparams.n_pos_per_embd();
+                            ubatch = balloc.ubatch_reserve(n_keep, 1);
+                            ubatch.seq_id_unq[0] = dest_seq_id;
+                            for (uint32_t i = 0, k = 0; i < cell_count; ++i) {
+                                if ((*dropped)[i]) {
+                                    continue;
+                                }
+                                for (uint32_t d = 0; d < n_pos; ++d) {
+                                    ubatch.pos[k + d*n_keep] = full.pos[i + d*cell_count];
+                                }
+                                ubatch.token[k]    = full.token[i];
+                                ubatch.n_seq_id[k] = 1;
+                                ubatch.seq_id[k]   = &dest_seq_id;
+                                if (!exts.empty()) {
+                                    exts[k] = exts[i];
+                                }
+                                ++k;
+                            }
+                            if (!exts.empty()) {
+                                exts.resize(n_keep);
+                            }
+                            LLAMA_LOG_INFO("%s: %u of %u saved cells are outside the attention window and are not restored\n",
+                                    __func__, cell_count - n_keep, cell_count);
+                        }
+                    }
                 }
                 sinfo = find_slot(ubatch, false);
             }
             if (sinfo.empty()) {
-                LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
+                LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  ubatch.n_tokens);
                 return false;
             }
         }
@@ -6673,8 +6725,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         // DEBUG CHECK: verify that all cells were allocated and have correct seq_id and pos values
         GGML_ASSERT(sinfo.n_stream() == 1);
-        GGML_ASSERT(sinfo.idxs[0].size() == cell_count);
-        for (uint32_t i = 0; i < cell_count; ++i) {
+        GGML_ASSERT(sinfo.idxs[0].size() == ubatch.n_tokens);
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             const uint32_t idx = sinfo.idxs[0][i];
             GGML_ASSERT(cells.pos_get(idx) == ubatch.pos[i]);
             GGML_ASSERT(cells.seq_has(idx, dest_seq_id));
@@ -6772,27 +6824,68 @@ void llama_kv_cache::lsa_idx_forget() const {
     llama_lsa_idx_forget(ks.data(), ks.size());
 }
 
-bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo,
+        const std::vector<bool> & dropped) {
     lsa_idx_invalidate("state_read_data");
     auto & cells = v_cells[strm];
+
+    if (!dropped.empty() && dropped.size() != cell_count) {
+        LLAMA_LOG_ERROR("%s: dropped-cell mask has %zu entries for %u cells\n", __func__, dropped.size(), cell_count);
+        return false;
+    }
+    const auto is_dropped = [&](uint32_t i) { return !dropped.empty() && dropped[i]; };
 
     // batch the scatter reads per contiguous run of destination indices
     // from inclusive, to exclusive - same convention as cell_ranges_t
     // contiguous cells yield a single run covering the whole block
-    struct cell_run { uint32_t from; uint32_t to; };
+    // [KVRESTORE] a skip run covers to - from saved cells that were dropped: their bytes are read and discarded
+    struct cell_run { uint32_t from; uint32_t to; bool skip; };
     std::vector<cell_run> runs;
     if (cell_count > 0) {
         const auto & idxs = sinfo.idxs[0];
         uint32_t i0 = 0;
+        uint32_t k  = 0; // next placed cell
         while (i0 < cell_count) {
             uint32_t i1 = i0 + 1;
-            while (i1 < cell_count && idxs[i1] == idxs[i1 - 1] + 1) {
-                ++i1;
+            if (is_dropped(i0)) {
+                while (i1 < cell_count && is_dropped(i1)) {
+                    ++i1;
+                }
+                runs.push_back({0, i1 - i0, true});
+                i0 = i1;
+                continue;
             }
-            runs.push_back({idxs[i0], idxs[i1 - 1] + 1});
+            if (k >= idxs.size()) {
+                LLAMA_LOG_ERROR("%s: the slot holds %zu cells, fewer than the restored cells\n", __func__, idxs.size());
+                return false;
+            }
+            const uint32_t k0 = k++;
+            while (i1 < cell_count && !is_dropped(i1) && k < idxs.size() && idxs[k] == idxs[k - 1] + 1) {
+                ++i1;
+                ++k;
+            }
+            runs.push_back({idxs[k0], idxs[k - 1] + 1, false});
             i0 = i1;
         }
+        if (k != idxs.size()) {
+            LLAMA_LOG_ERROR("%s: the slot holds %zu cells, %u were restored\n", __func__, idxs.size(), k);
+            return false;
+        }
     }
+
+    std::vector<uint8_t> skip_buf;
+    const auto read_run = [&](ggml_tensor * t, const cell_run & r, size_t offset, size_t size) {
+        if (!r.skip) {
+            io.read_tensor(t, offset, size);
+            return;
+        }
+        skip_buf.resize(std::min<size_t>(size, 1u << 20));
+        for (size_t done = 0; done < size; ) {
+            const size_t n = std::min(size - done, skip_buf.size());
+            io.read(skip_buf.data(), n);
+            done += n;
+        }
+    };
 
     uint32_t v_trans;
     uint32_t n_layer;
@@ -6863,7 +6956,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
 
         for (const auto & r : runs) {
-            io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
+            read_run(k, r, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
         }
     }
 
@@ -6898,7 +6991,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             }
 
             for (const auto & r : runs) {
-                io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
+                read_run(v, r, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
             }
         }
     } else {
@@ -6942,7 +7035,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                 for (const auto & r : runs) {
                     const size_t dst_offset = ((size_t) r.from + j * cells.size()) * v_size_el;
-                    io.read_tensor(v, dst_offset, (size_t) (r.to - r.from) * v_size_el);
+                    read_run(v, r, dst_offset, (size_t) (r.to - r.from) * v_size_el);
                 }
             }
         }
