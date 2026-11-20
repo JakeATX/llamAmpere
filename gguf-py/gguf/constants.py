@@ -175,6 +175,7 @@ class Keys:
         CONV_GROUP_SIZE                   = "{arch}.conv_group_size"
         SELECTOR_RANK                     = "{arch}.selector_rank"
         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
+        DSPARK_MARKOV_RANK                = "{arch}.dspark.markov_rank"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
@@ -846,6 +847,9 @@ class MODEL_TENSOR(IntEnum):
     ATTN_V_CONV_PROJ     = auto()
     ATTN_POST_CONV       = auto()
     ATTN_RES_QUERY       = auto()
+    ATTN_K_CTX           = auto()
+    ATTN_V_CTX           = auto()
+    ATTN_K_CTX_NORM      = auto()
     FFN_GATE_INP         = auto()
     FFN_GATE_INP_SHEXP   = auto()
     FFN_NORM             = auto()
@@ -1485,6 +1489,10 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_CONF_PROJ       = auto()  # confidence head
     DSPARK_JOINT_PROJ      = auto()  # rnn markov head
     DSPARK_MASK_EMBD       = auto()  # per-slot mask embeddings
+    DSPARK_FUSE            = auto()
+    DSPARK_NORM            = auto()
+    DSPARK_HIDDEN_OUT      = auto()
+    DFLARE_NORM            = auto()
     ENGRAM_KV              = auto()
     ENGRAM_GATE            = auto()
     DFLASH_ATTN_CONV_BASE  = auto()
@@ -1806,6 +1814,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_V_CONV_PROJ:          "blk.{bid}.attn_v_conv_proj",
     MODEL_TENSOR.ATTN_POST_CONV:            "blk.{bid}.attn_post_conv",
     MODEL_TENSOR.ATTN_RES_QUERY:            "blk.{bid}.attn_res_query",
+    MODEL_TENSOR.ATTN_K_CTX:                "blk.{bid}.attn_k_ctx",
+    MODEL_TENSOR.ATTN_V_CTX:                "blk.{bid}.attn_v_ctx",
+    MODEL_TENSOR.ATTN_K_CTX_NORM:           "blk.{bid}.attn_k_ctx_norm",
     MODEL_TENSOR.ATTN_Q_NORM:               "blk.{bid}.attn_q_norm",
     MODEL_TENSOR.ATTN_K_NORM:               "blk.{bid}.attn_k_norm",
     MODEL_TENSOR.ATTN_OUT_NORM:             "blk.{bid}.attn_output_norm",
@@ -2488,6 +2499,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
     MODEL_TENSOR.DSPARK_JOINT_PROJ:         "joint_proj",
     MODEL_TENSOR.DSPARK_MASK_EMBD:          "mask_embd",
+    MODEL_TENSOR.DSPARK_FUSE:               "dspark_fuse",
+    MODEL_TENSOR.DSPARK_NORM:               "dspark_norm",
+    MODEL_TENSOR.DSPARK_HIDDEN_OUT:         "dspark_hidden_out",
+    MODEL_TENSOR.DFLARE_NORM:               "blk.{bid}.dflare_norm",
     MODEL_TENSOR.ENGRAM_KV:                 "blk.{bid}.engram_kv",
     MODEL_TENSOR.ENGRAM_GATE:               "blk.{bid}.engram_gate",
     MODEL_TENSOR.DFLASH_ATTN_CONV_BASE:     "blk.{bid}.attn_conv_base",
@@ -6292,6 +6307,9 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_KV_A_NORM,
         MODEL_TENSOR.ATTN_K_B,
         MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_K_CTX,
+        MODEL_TENSOR.ATTN_V_CTX,
+        MODEL_TENSOR.ATTN_K_CTX_NORM,
         MODEL_TENSOR.HC_ATTN_FN,
         MODEL_TENSOR.HC_ATTN_BASE,
         MODEL_TENSOR.HC_ATTN_SCALE,
@@ -6324,6 +6342,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ENC_AUX_NORM,
         MODEL_TENSOR.DSPARK_JOINT_PROJ,
         MODEL_TENSOR.DSPARK_MASK_EMBD,
+        MODEL_TENSOR.DSPARK_FUSE,
+        MODEL_TENSOR.DSPARK_NORM,
+        MODEL_TENSOR.DSPARK_HIDDEN_OUT,
+        MODEL_TENSOR.DFLARE_NORM,
         MODEL_TENSOR.DFLASH_ATTN_CONV_BASE,
         MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ,
         MODEL_TENSOR.DFLASH_FFN_CONV_BASE,
