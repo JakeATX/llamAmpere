@@ -1985,7 +1985,7 @@ void ggml_cuda_lsa_page_prepare(ggml_backend_cuda_context & ctx, const ggml_tens
         }
     }
     if (const ggml_tensor * prediction = ggml_flash_attn_ext_get_lsa_spec_recall(dst)) {
-        GGML_ASSERT(getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr); // diagnostic allocation/logging only
+        GGML_ASSERT(ggml_cuda_graphs_disabled_by_env()); // diagnostic allocation/logging only
         GGML_ASSERT(m16 && nrows == dst->src[0]->ne[1] && mask->ne[2] == 1 && lsa_prefetch_cap() == 0);
         GGML_ASSERT(prediction->type == GGML_TYPE_F32 && ggml_is_contiguous(prediction) &&
                 mask->ne[0] % prediction->ne[0] == 0 && prediction->ne[1] == nrows &&

@@ -14,8 +14,10 @@ json server_chat_convert_responses_to_chatcmpl(const json & body);
 // Convert OpenAI Responses API tools to OpenAI Chat Completions API tools, non-function tools are skipped
 json server_chat_convert_responses_tools(const json & tools);
 
-// Convert Anthropic Messages API format to OpenAI Chat Completions API format
-json server_chat_convert_anthropic_to_oai(const json & body);
+// Convert Anthropic Messages API format to OpenAI Chat Completions API format.
+// think_on_request: a request without "thinking" (or with type "disabled") turns the template's thinking off, as the
+// Anthropic API does; an explicit chat_template_kwargs.enable_thinking still wins.
+json server_chat_convert_anthropic_to_oai(const json & body, bool think_on_request = false);
 
 // convert OpenAI transcriptions API format to OpenAI Chat Completions API format
 json convert_transcriptions_to_chatcmpl(

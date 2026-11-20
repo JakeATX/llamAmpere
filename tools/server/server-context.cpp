@@ -9011,6 +9011,13 @@ static json parse_tts_body(const server_http_req & req) {
     return body;
 }
 
+// --anthropic-thinking on-request applies only while the operator left thinking at the template default: an explicit
+// --reasoning on/off or --chat-template-kwargs '{"enable_thinking":...}' keeps its meaning for /v1/messages too.
+static bool anthropic_think_on_request(const common_params & params) {
+    return params.anthropic_think_on_request && params.enable_reasoning == -1 &&
+           params.default_template_kwargs.find("enable_thinking") == params.default_template_kwargs.end();
+}
+
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
@@ -9657,7 +9664,7 @@ void server_routes::init_routes() {
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body), anthropic_think_on_request(params));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         auto warm_src = warm_source(body); // copy before parsing, which edits body
@@ -10511,7 +10518,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
             } break;
         case TASK_RESPONSE_TYPE_ANTHROPIC:
             {
-                body = server_chat_convert_anthropic_to_oai(body);
+                body = server_chat_convert_anthropic_to_oai(body, anthropic_think_on_request(params));
             } break;
         default:
             res->error(format_error_response("invalid res_type", ERROR_TYPE_INVALID_REQUEST));

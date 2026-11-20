@@ -1086,6 +1086,20 @@ void pin_thread(int cpu) {
 #endif
 }
 
+// Windows: ask the OS not to throttle this pool thread (EcoQoS). Windows 10/11 can move threads of a background
+// process to efficiency cores or park them at low clocks; ggml-cpu opts its own threads out the same way
+// (ggml_thread_apply_priority), but the pool's threads are plain std::threads and did not. No-op elsewhere.
+static void moe_cs_no_power_throttling() {
+#if defined(_WIN32) && _WIN32_WINNT >= 0x0602 && defined(THREAD_POWER_THROTTLING_CURRENT_VERSION) && defined(THREAD_POWER_THROTTLING_EXECUTION_SPEED)
+    THREAD_POWER_THROTTLING_STATE t;
+    ZeroMemory(&t, sizeof(t));
+    t.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    t.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    t.StateMask   = 0;   // control the setting, state off = never throttle
+    (void) SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &t, sizeof(t));
+#endif
+}
+
 // First logical CPU of each physical core, in core order (Linux sysfs); empty when unknown.
 std::vector<int> core_leaders() {
     std::vector<int> out;
@@ -1132,6 +1146,7 @@ void sleep_us(int us) {
 void worker_main(pool_state * sp, int idx, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+    moe_cs_no_power_throttling();
     if (idx < 64) { s.wst[idx].cpu = cpu; }
     unsigned long long seen = 0;
     for (;;) {
@@ -1159,6 +1174,7 @@ void worker_main(pool_state * sp, int idx, int cpu) {
 void leader_main(pool_state * sp, int cpu) {
     pool_state & s = *sp;
     pin_thread(cpu);
+    moe_cs_no_power_throttling();
     s.wst[0].cpu = cpu;
 #if defined(__linux__)
     (void) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);   // naps end within ~1 us of the asked time, not +50 us

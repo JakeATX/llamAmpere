@@ -28,6 +28,10 @@ and Agnes 3.0 Flash ([docs/agnes-3.0-flash.md](docs/agnes-3.0-flash.md)).
 
 ## Build and run
 
+For current builds, use the card presets in the [README quick start](README.md#quick-start-pick-your-card) (`--preset 24dense` and friends); they set the microbatch ladder for you.
+
+*Historical v0.4 command, kept for reference as tested (fixed `-ub 1024`, before the ladder):*
+
 Needs Linux, an NVIDIA card with 24 GB (RTX 3090 / 3090 Ti), the CUDA toolkit (tested with 12.4), CMake, git and a C++
 compiler. Paste into a terminal; the model download is 15.6 GB.
 

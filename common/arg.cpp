@@ -1121,6 +1121,38 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (explicit_or_env("--batch-size") && !explicit_or_env("--ubatch-size")) {
             params.n_ubatch = std::min(params.n_ubatch, params.n_batch);
         }
+        // fork: 24dense draft window 4096 and GDN replay are multi-user values. One slot drafts with full attention
+        // (which also makes the SJ-KVaRN draft cache + RM24H list eligible) and rolls back without replay; explicit
+        // flags and environment still win. V07/SPEEDREG.
+        if (params.card_preset == "24dense" && params.n_parallel == 1) {
+            if (!explicit_or_env("--spec-draft-window")) {
+                params.speculative.draft.attn_window = 0;
+            }
+            if (!explicit_or_env("--gdn-replay")) {
+                params.gdn_replay = false;
+            }
+            // adaptive depth 3..7 at one user: +5.2% tok/s vs 4..5 (P76, 98,766 and 8K chat, 12 seed pairs, 11 faster);
+            // floor 4 / max 5 are multi-user values (W3 split with 2+ users). V07/SPEEDREG, V07/MTPFLOOR_20261119.md.
+            if (adaptive_mtp && !explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive") &&
+                    !explicit_or_env("--spec-chain")) {
+                params.speculative.draft.n_min_adaptive = 3;
+                params.speculative.draft.n_max = 7;
+            }
+            // ub ceiling 2048 at one user (the deep-ctx ladder still steps down): 98,766 cold prefill +5.4%, full fill
+            // 256,696 +3.3%, decode ms/round unchanged, full-fill peak 21,116 MiB on a 3090. Multi-user keeps 1024.
+            if (!explicit_or_env("--ubatch-size")) {
+                params.n_ubatch = std::min(2048, params.n_batch);
+                const std::string preset_ub = " --ubatch-size 1024";
+                const size_t pos = params.card_preset_flags.find(preset_ub);
+                if (pos != std::string::npos) {
+                    params.card_preset_flags.replace(pos, preset_ub.size(), " --ubatch-size " + std::to_string(params.n_ubatch));
+                }
+            }
+            LOG_INF("card preset 24dense, one slot: draft window %d, gdn-replay %s, adaptive depth %d..%d, ubatch %d "
+                    "(multi-user values apply with -np > 1)\n", params.speculative.draft.attn_window,
+                    params.gdn_replay ? "on" : "off", params.speculative.draft.n_min_adaptive, params.speculative.draft.n_max,
+                    params.n_ubatch);
+        }
     }
 
     if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {
@@ -4652,6 +4684,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
     add_opt(common_arg(
+        {"--anthropic-thinking"}, "MODE",
+        "thinking for Anthropic API requests (/v1/messages): 'on-request' thinks only when the request has "
+        "\"thinking\": {\"type\": \"enabled\"} (or \"adaptive\"), as the Anthropic API does; 'template' keeps the "
+        "chat template's default; an explicit --reasoning or enable_thinking in --chat-template-kwargs wins (default: on-request)",
+        [](common_params & params, const std::string & value) {
+            if (value == "on-request") {
+                params.anthropic_think_on_request = true;
+            } else if (value == "template") {
+                params.anthropic_think_on_request = false;
+            } else {
+                throw std::invalid_argument("invalid value: expected on-request or template");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ANTHROPIC_THINKING"));
+    add_opt(common_arg(
         {"--reasoning-budget-message"}, "MESSAGE",
         "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
         [](common_params & params, const std::string & value) {
@@ -5805,7 +5852,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg({"10dense", "10dense-headless"}, "alias for --preset 10dense (best known/recheck before ship; one slot)",
         [](common_params & params) { params.card_preset = "10dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    add_opt(common_arg({"8dense", "8dense-headless"}, "alias for --preset 8dense (best known/recheck before ship; one slot)",
+    add_opt(common_arg({"8dense", "8dense-headless"}, "alias for --preset 8dense (one slot)",
         [](common_params & params) { params.card_preset = "8dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

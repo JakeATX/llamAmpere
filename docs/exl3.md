@@ -143,13 +143,15 @@ Same flags as any other model in [QWEN_AMPERE.md](../QWEN_AMPERE.md#build-and-ru
 in place of the ATX file:
 
 ```bash
-./build-sm86/bin/llama-server -m models/Qwen3.8-27B-EXL3-4.0bpw.gguf \
-  -c 32768 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
+LLAMA_DEEPCTX_LADDER=1 ./build-sm86/bin/llama-server -m models/Qwen3.8-27B-EXL3-4.0bpw.gguf \
+  -c 32768 -b 4096 -ub 2048 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
   --parallel 1 --jinja --fit off \
   --cache-prompt --cache-ram 8192 --ctx-checkpoints 24 --checkpoint-min-step 10240 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0 \
   --spec-draft-type-k q8_0 --spec-draft-type-v q8_0
 ```
+
+`LLAMA_DEEPCTX_LADDER=1` turns on the microbatch ladder and `-ub 2048` is its ceiling. If it does not fit on your card, lower the ceiling (`-ub 1024` or `-ub 512`).
 
 The MTP flags are the ones the measurements below used: `--spec-draft-n-max 4 --spec-draft-p-min 0`, the
 model's own MTP head, exact p/q verification on by default. `--spec-draft-vocab-map` is not used with
@@ -159,7 +161,7 @@ the `tq2` to `tq6` spellings (and `tq3_0` to `tq6_0`) are accepted too ([KV-cach
 
 On the v0.4 tree the MTP drafter is on by default for a Qwen3.8 GGUF with the MTP head (adaptive depth
 3-4, see [speculative.md](speculative.md#--spec-type-type)), and the drafter's KV cache follows `-ctk`/`-ctv`
-unless `--spec-draft-type-k/-v` are given. The command above keeps the measured flags. `--spec-type draft-mtp`
+unless `--spec-draft-type-k/-v` are given. The measurements below used a fixed `-ub 1024` without the ladder; otherwise the command above keeps the measured flags. `--spec-type draft-mtp`
 is still needed to get the measured fixed depth 4 instead of the adaptive default; `--spec-draft-p-min 0` and
 `--spec-draft-type-k q8_0` are now redundant (p-min 0 is the default and the drafter K cache inherits
 `-ctk q8_0`); `--spec-draft-type-v q8_0` is not, because without it the drafter V cache would follow

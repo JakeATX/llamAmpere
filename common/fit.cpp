@@ -1056,6 +1056,13 @@ static void common_params_fit_impl(
             LOG_INF("preset line %zu MiB = total %zu - margin %zu on %s; free target %zu MiB\n",
                 preset_lines.back()/MiB, size_t(memory.total)/MiB, margin/MiB,
                 ggml_backend_dev_name(devs[id]), preset_targets.back()/MiB);
+            if (preset_targets.back() == 0 && margin > 0) {
+                LOG_WRN("%s: other programs already use %zu MiB of %s, at or over the preset margin of %zu MiB: "
+                    "the fit keeps no spare memory and the server may run out of memory while writing; "
+                    "close them or pass a smaller --ctx-size\n", __func__,
+                    (size_t(memory.total) - std::min(size_t(memory.total), size_t(memory.free)))/MiB,
+                    ggml_backend_dev_name(devs[id]), margin/MiB);
+            }
         }
         // fork: keep the requested margins for the caller's compact verification gate.
         if (!preset_targets.empty()) {

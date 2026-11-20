@@ -185,7 +185,8 @@ static void compact_state_case(llama_model * model, const sj_cfg & cfg, const ch
     const char * mode = getenv("GGML_SJKVARN_COMPACT");
     require(mode && (!strcmp(mode, "1") || !strcmp(mode, "2")), "--compact requires GGML_SJKVARN_COMPACT=1 or 2 before startup");
     require(getenv("SJ_TEST_GPU") != nullptr, "--compact requires SJ_TEST_GPU=1");
-    require(getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr, "compact state replay requires CUDA graphs enabled");
+    const char * graphs_off = getenv("GGML_CUDA_DISABLE_GRAPHS");
+    require(!graphs_off || !graphs_off[0] || !strcmp(graphs_off, "0"), "compact state replay requires CUDA graphs enabled");
     llama_context_ptr source(make_ctx(model, cfg, 1, false, compact_state_probe::positions));
     llama_context_ptr restored(make_ctx(model, cfg, 1, false, compact_state_probe::positions));
     llama_context_ptr oracle(make_ctx(model, cfg, 1, false, compact_state_probe::positions));

@@ -502,6 +502,7 @@ def test_anthropic_tool_reference():
     """Anthropic defer_loading and tool_reference convert to their OpenAI forms (behaviour: test_tool_call.py)"""
     server.jinja = True
     server.chat_template_file = '../../../models/templates/LFM3.jinja'
+    server.anthropic_thinking = "template"  # compares against the OpenAI endpoint: same thinking default
     server.start()
 
     search = {"name": "tool_search", "description": "Search for available tools by keyword",
@@ -849,6 +850,222 @@ def test_anthropic_thinking():
 
     assert res.status_code == 200
     assert res.body["type"] == "message"
+
+
+def _anthropic_input_tokens(extra):
+    body = {
+        "model": "test",
+        "max_tokens": 1,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Write a short title for this session."}],
+    }
+    body.update(extra)
+    res = server.make_request("POST", "/v1/messages", data=body)
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+    usage = res.body["usage"]
+    # input_tokens counts only the uncached part; a repeated prompt is mostly read from the cache
+    return usage["input_tokens"] + usage.get("cache_read_input_tokens", 0)
+
+
+def test_anthropic_think_only_when_asked():
+    """--anthropic-thinking on-request (default): no "thinking" (or type "disabled") renders the template with
+    thinking off (Qwen3 adds an empty think block to the generation prompt); "enabled"/"adaptive" keep thinking on;
+    an explicit chat_template_kwargs.enable_thinking from the client wins."""
+    global server
+    server.jinja = True
+    server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
+    server.start()
+
+    n_none     = _anthropic_input_tokens({})
+    n_disabled = _anthropic_input_tokens({"thinking": {"type": "disabled"}})
+    n_enabled  = _anthropic_input_tokens({"thinking": {"type": "enabled", "budget_tokens": 64}})
+    n_adaptive = _anthropic_input_tokens({"thinking": {"type": "adaptive"}})
+    n_kwargs   = _anthropic_input_tokens({"chat_template_kwargs": {"enable_thinking": True}})
+
+    assert n_none == n_disabled, (n_none, n_disabled)
+    assert n_enabled == n_adaptive == n_kwargs, (n_enabled, n_adaptive, n_kwargs)
+    # thinking off adds "<think>\n\n</think>\n\n" to the generation prompt
+    assert n_none > n_enabled, (n_none, n_enabled)
+
+    # count_tokens uses the same conversion
+    def count(extra):
+        body = {"model": "test", "messages": [{"role": "user", "content": "Write a short title for this session."}]}
+        body.update(extra)
+        res = server.make_request("POST", "/v1/messages/count_tokens", data=body)
+        assert res.status_code == 200, res.body
+        return res.body["input_tokens"]
+    assert count({}) > count({"thinking": {"type": "enabled", "budget_tokens": 64}})
+
+
+def test_anthropic_thinking_operator_flag_wins():
+    """--reasoning on from the operator keeps thinking on for requests without "thinking"."""
+    global server
+    server.jinja = True
+    server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
+    server.reasoning = "on"
+    server.start()
+
+    n_none    = _anthropic_input_tokens({})
+    n_enabled = _anthropic_input_tokens({"thinking": {"type": "enabled", "budget_tokens": 64}})
+    assert n_none == n_enabled, (n_none, n_enabled)
+
+
+def test_anthropic_thinking_template_mode():
+    """--anthropic-thinking template: a request without "thinking" keeps the template default (thinking on)."""
+    global server
+    server.jinja = True
+    server.chat_template_file = '../../../models/templates/Qwen-Qwen3-0.6B.jinja'
+    server.anthropic_thinking = "template"
+    server.start()
+
+    n_none    = _anthropic_input_tokens({})
+    n_enabled = _anthropic_input_tokens({"thinking": {"type": "enabled", "budget_tokens": 64}})
+    assert n_none == n_enabled, (n_none, n_enabled)
+
+
+QWEN38_TEMPLATE = '../../../models/templates/Qwen-Qwen3.8-27B.jinja'
+
+
+def _claude_code_request(effort="medium", thinking=True, model="atx-swift-27b-8gb", turns=1):
+    """Shaped like a Claude Code 2.1.327 /v1/messages request (captured 2026-11-19): system blocks with the billing
+    header, a system message *inside* messages after the first user turn (the environment block), adaptive thinking
+    with display omitted, output_config effort, context_management, metadata and tools with a $schema. Text is
+    shortened; the structure is unchanged."""
+    body = {
+        "model": model,
+        "max_tokens": 8,
+        "temperature": 1,
+        "stream": False,
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.327.8c9; cc_entrypoint=sdk-cli; cch=a5145;"},
+            {"type": "text", "text": "You are a coding agent.", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "\nUse the tools to help the user.", "cache_control": {"type": "ephemeral"}},
+        ],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "<system-reminder>\nKeep commits short.\n</system-reminder>\n"},
+                {"type": "text", "text": "say hi"},
+            ]},
+            {"role": "system", "content": [
+                {"type": "text", "text": "# Environment\n - Primary working directory: /work\n - Platform: linux\n\nToday's date is 2026-11-19.",
+                 "cache_control": {"type": "ephemeral"}},
+            ]},
+        ],
+        "tools": [
+            {"name": "Bash", "description": "Executes a bash command and returns its output.",
+             "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                              "properties": {"command": {"type": "string", "description": "The command to execute"},
+                                             "timeout": {"type": "number", "description": "Timeout in ms"}},
+                              "required": ["command"], "additionalProperties": False}},
+            {"name": "Read", "description": "Reads a file from the local filesystem.",
+             "input_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                              "properties": {"file_path": {"type": "string"}}, "required": ["file_path"],
+                              "additionalProperties": False}},
+        ],
+        "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        "metadata": {"user_id": "{\"device_id\":\"0\",\"account_uuid\":\"\",\"session_id\":\"0\"}"},
+    }
+    if thinking:
+        body["thinking"] = {"type": "adaptive", "display": "omitted"}
+    if effort is not None:
+        body["output_config"] = {"effort": effort}
+    for i in range(1, turns):
+        body["messages"].append({"role": "assistant", "content": [{"type": "text", "text": f"Hi! (turn {i})"}]})
+        body["messages"].append({"role": "user", "content": [{"type": "text", "text": "list the files"}]})
+    return body
+
+
+def _cc_count(body):
+    b = dict(body)
+    for k in ("max_tokens", "stream", "temperature"):
+        b.pop(k, None)
+    res = server.make_request("POST", "/v1/messages/count_tokens", data=b)
+    assert res.status_code == 200, res.body
+    return res.body["input_tokens"]
+
+
+def test_anthropic_claude_code_session_qwen38():
+    """A Claude Code session against the Qwen3.8 template: the system message inside "messages" is hoisted (the
+    template raises "System message must be at the beginning" otherwise), effort "high" is taken (the template knows
+    low/medium/xhigh), and thinking is on by default (adaptive)."""
+    global server
+    server.jinja = True
+    server.chat_template_file = QWEN38_TEMPLATE
+    server.n_ctx = 8192
+    server.start()
+
+    for turns in (1, 2, 3):
+        for effort in ("medium", "high"):
+            res = server.make_request("POST", "/v1/messages", data=_claude_code_request(effort=effort, turns=turns))
+            assert res.status_code == 200, f"turns={turns} effort={effort}: {res.body}"
+            assert res.body["type"] == "message"
+
+    # streaming, as Claude Code sends it
+    body = _claude_code_request(effort="high", turns=2)
+    body["stream"] = True
+    events = [e for e in server.make_stream_request("POST", "/v1/messages", data=body)]
+    assert any(e.get("type") == "message_stop" for e in events), events[-3:]
+
+    # thinking on by default: adaptive renders "<think>\n", no thinking renders the empty think block
+    n_adaptive = _cc_count(_claude_code_request(effort="medium"))
+    n_nothink = _cc_count(_claude_code_request(effort="medium", thinking=False))
+    assert n_nothink > n_adaptive, (n_nothink, n_adaptive)
+
+    # effort: high and max take the xhigh level, minimal takes low, medium stays medium (no instruction line)
+    n = {e: _cc_count(_claude_code_request(effort=e)) for e in ("minimal", "low", "medium", "high", "xhigh", "max")}
+    assert n["high"] == n["xhigh"] == n["max"], n
+    assert n["minimal"] == n["low"], n
+    assert n["medium"] < n["low"] < n["xhigh"], n
+
+
+def test_anthropic_inline_system_hoisted_in_order():
+    """Inline system messages before the first assistant turn join the leading system message in order, after the
+    "system" parameter; a later one becomes a <system-reminder> user turn in place (the earlier prefix stays cached)."""
+    global server
+    server.jinja = True
+    server.chat_template_file = QWEN38_TEMPLATE
+    server.start()
+
+    base = {"model": "test", "system": "S0",
+            "messages": [{"role": "user", "content": "hi"}, {"role": "system", "content": "S1"},
+                         {"role": "system", "content": [{"type": "text", "text": "S2"}]},
+                         {"role": "assistant", "content": "hello"}, {"role": "system", "content": "S3"},
+                         {"role": "user", "content": "again"}]}
+    flat = {"model": "test", "system": "S0\n\nS1\n\nS2",
+            "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"},
+                         {"role": "user", "content": "<system-reminder>\nS3\n</system-reminder>"},
+                         {"role": "user", "content": "again"}]}
+    assert _cc_count(base) == _cc_count(flat)
+    # no "system" parameter: the inline ones become the leading system message
+    only_inline = {"model": "test", "messages": [{"role": "user", "content": "hi"}, {"role": "system", "content": "S1"}]}
+    assert _cc_count(only_inline) == _cc_count({"model": "test", "system": "S1", "messages": [{"role": "user", "content": "hi"}]})
+    # the order is kept: swapping S1 and S2 changes nothing in the count, so check the hoisted text renders at all
+    long_inline = {"model": "test", "messages": [{"role": "user", "content": "hi"},
+                                                 {"role": "system", "content": "a much longer environment block " * 8}]}
+    assert _cc_count(long_inline) > _cc_count(only_inline)
+
+
+def test_reasoning_effort_clamped_to_template_levels():
+    """common/chat: an effort the template does not take goes to the nearest level it takes (ties upward); a word
+    outside the scale falls back to the template default, never an error."""
+    global server
+    server.jinja = True
+    server.chat_template_file = QWEN38_TEMPLATE
+    server.start()
+
+    def render(effort):
+        res = server.make_request("POST", "/apply-template", data={
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"reasoning_effort": effort},
+        })
+        assert res.status_code == 200, f"{effort}: {res.body}"
+        return res.body["prompt"]
+
+    assert "effort is set to xhigh" in render("high")
+    assert "effort is set to xhigh" in render("max")
+    assert "effort is set to low" in render("minimal")
+    assert "effort is set to" not in render("medium")
+    assert "effort is set to xhigh" in render("banana")   # template default
 
 
 def test_anthropic_metadata():

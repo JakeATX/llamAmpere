@@ -3,10 +3,11 @@
 #include "aif25-mmq.cuh"
 #include "magic2-v2.cuh"
 #include "../ggml-aif25.h"
+#include "../ggml-aif175.h"
 
 #include <atomic>
 
-template <int XSH>
+template <int XSH, int B = 5, int V = 2, uint32_t C = AIF25_MUL, bool ROW_SCALE = false, int SCALE_CHUNKS = 5>
 static bool aif25_mmq_launch(int tile, int strips, const uint8_t * w, const int8_t * q, const float * scales, float * y,
                       int M, int K, int64_t N, cudaStream_t stream) {
     const int64_t gy = (N + tile - 1) / tile;
@@ -23,7 +24,7 @@ static bool aif25_mmq_launch(int tile, int strips, const uint8_t * w, const int8
     }
     const dim3 grid((unsigned) ((M/16 + strips - 1)/strips), (unsigned) gy);
 #define AIF25_MMQ_LAUNCH(NB, S) \
-    magic2::mmq<5,2,AIF25_MUL,XSH,NB,S><<<grid,128*(S),0,stream>>>(w, q, scales, y, M, K, (int) N)
+    magic2::mmq<B,V,C,XSH,NB,S,ROW_SCALE,SCALE_CHUNKS><<<grid,128*(S),0,stream>>>(w, q, scales, y, M, K, (int) N)
     if (strips == 2) {
         if (tile == 32) { AIF25_MMQ_LAUNCH(4, 2); } else { AIF25_MMQ_LAUNCH(8, 2); }
     } else {
@@ -34,8 +35,22 @@ static bool aif25_mmq_launch(int tile, int strips, const uint8_t * w, const int8
     return true;
 }
 
-bool ggml_cuda_aif25_mmq(int xsh, int tile, int strips, const uint8_t * w, const int8_t * q, const float * scales, float * y,
-                         int M, int K, int64_t N, cudaStream_t stream) {
-    return xsh ? aif25_mmq_launch<1>(tile, strips, w, q, scales, y, M, K, N, stream)
-               : aif25_mmq_launch<0>(tile, strips, w, q, scales, y, M, K, N, stream);
+bool ggml_cuda_aif25_mmq(ggml_type type, int xsh, int tile, int strips, const uint8_t * w, const int8_t * q, const float * scales,
+                         float * y, int M, int K, int64_t N, cudaStream_t stream) {
+    // [K126] the row-scale types take the same template arguments as their mmv call in ggml_cuda_mul_mat_aif25
+    switch (type) {
+        case GGML_TYPE_AIF25_U:
+            return xsh ? aif25_mmq_launch<1>(tile, strips, w, q, scales, y, M, K, N, stream)
+                       : aif25_mmq_launch<0>(tile, strips, w, q, scales, y, M, K, N, stream);
+        case GGML_TYPE_AIF25_U2:
+            return xsh ? aif25_mmq_launch<1, 5, 2, AIF25_MUL, true, 5>(tile, strips, w, q, scales, y, M, K, N, stream)
+                       : aif25_mmq_launch<0, 5, 2, AIF25_MUL, true, 5>(tile, strips, w, q, scales, y, M, K, N, stream);
+        // K % 512 == 0: always one activation scale per 256 columns
+        case GGML_TYPE_AIF25_U2_512:
+            return xsh && aif25_mmq_launch<1, 5, 2, AIF25_MUL, true, 4>(tile, strips, w, q, scales, y, M, K, N, stream);
+        case GGML_TYPE_AIF175_U2:
+            return xsh && aif25_mmq_launch<1, 7, 4, AIF175_MUL, true, 4>(tile, strips, w, q, scales, y, M, K, N, stream);
+        default:
+            return false;
+    }
 }

@@ -2938,8 +2938,22 @@ static int aif25_mmq_strips() {
     return v;
 }
 
+// [K126] GGML_CUDA_AIF_RS_MMQ=0: keep the row-scale types (AIF25_U2, AIF25_U2_512, AIF175_U2) on the mmv loop at prompt
+// widths (the pre-K126 path; kill switch). Default 1: they take magic2::mmq like AIF25_U, bit-identical to mmv.
+static int aif_rs_mmq() {
+    static const int v = ai4_env_int("GGML_CUDA_AIF_RS_MMQ", nullptr, 1);
+    return v;
+}
+
 static int aif25_mmq_check() {
     static const int v = ai4_env_int("GGML_CUDA_AIF25_MMQ_CHECK", nullptr, 0);
+    return v;
+}
+
+// [K126] GGML_CUDA_AIF_MMV_PF=0: the mmv weight loads without the one-unit register prefetch (pre-K126; A/B and kill
+// switch). Default 1. Bit-identical either way.
+static int aif_mmv_pf() {
+    static const int v = ai4_env_int("GGML_CUDA_AIF_MMV_PF", nullptr, 1);
     return v;
 }
 
@@ -2951,8 +2965,31 @@ static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales,
         const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
         const dim3 grid(M/16, (nr+7)/8);
         const float * xs = scales + (size_t)n0*(K >> (7+XSH));
-        magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        if (aif_mmv_pf()) {
+            magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS,true><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        } else {
+            magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
+        }
         CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// The mmv call for each fractional type (also the reference of GGML_CUDA_AIF25_MMQ_CHECK).
+static void aif25_mmv_type(ggml_type type, int xsh, const uint8_t * w, const int8_t * q, const float * scales, float * y,
+                           int M, int K, int64_t N, cudaStream_t stream) {
+    if (type == GGML_TYPE_AIF175_U2) {
+        aif25_mmv<1, true, 7, 4, AIF175_MUL, 4>(w, q, scales, y, M, K, N, stream);
+    } else if (type == GGML_TYPE_AIF25_U2_512) {
+        // K % 512 == 0, so activation scales always cover 256 columns (xsh == 1); four chunks share the row scales.
+        aif25_mmv<1, true, 5, 2, AIF25_MUL, 4>(w, q, scales, y, M, K, N, stream);
+    } else if (type == GGML_TYPE_AIF25_U2 && xsh) {
+        aif25_mmv<1, true>(w, q, scales, y, M, K, N, stream);
+    } else if (type == GGML_TYPE_AIF25_U2) {
+        aif25_mmv<0, true>(w, q, scales, y, M, K, N, stream);
+    } else if (xsh) {
+        aif25_mmv<1>(w, q, scales, y, M, K, N, stream);
+    } else {
+        aif25_mmv<0>(w, q, scales, y, M, K, N, stream);
     }
 }
 
@@ -2980,10 +3017,10 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const uint8_t * wd = (const uint8_t *) w->data;
     float * y = (float *) dst->data;
     const int tile = aif25_mmq_tile();
-    // the row-scale types (AIF25_U2, AIF175_U2, AIF25_U2_512) are not a layout magic2::mmq knows: they always take the mmv loop
+    // [K126] the row-scale types (AIF25_U2, AIF175_U2, AIF25_U2_512) take mmq too, unless GGML_CUDA_AIF_RS_MMQ=0
     const bool row_scale = w->type != GGML_TYPE_AIF25_U;
-    if (!row_scale && tile > 0 && N >= aif25_mmq_min() &&
-            ggml_cuda_aif25_mmq(xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) {
+    if ((!row_scale || aif_rs_mmq()) && tile > 0 && N >= aif25_mmq_min() &&
+            ggml_cuda_aif25_mmq(w->type, xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (aif25_mmq_check()) {
             CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
@@ -2999,11 +3036,7 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
             ggml_cuda_pool_alloc<float> ref(ctx.pool(), (size_t) n_out);
             ggml_cuda_pool_alloc<unsigned long long> count(ctx.pool(), 1);
             CUDA_CHECK(cudaMemsetAsync(count.get(), 0, sizeof(unsigned long long), stream));
-            if (xsh) {
-                aif25_mmv<1>(wd, q.get(), scales.get(), ref.get(), M, K, N, stream);
-            } else {
-                aif25_mmv<0>(wd, q.get(), scales.get(), ref.get(), M, K, N, stream);
-            }
+            aif25_mmv_type(w->type, xsh, wd, q.get(), scales.get(), ref.get(), M, K, N, stream);
             k_aif25_bits_differ<<<(unsigned) ((n_out + 255)/256), 256, 0, stream>>>(y, ref.get(), n_out, count.get());
             CUDA_CHECK(cudaGetLastError());
             unsigned long long differ = 0;
@@ -3021,18 +3054,5 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         return;
     }
-    if (w->type == GGML_TYPE_AIF175_U2) {
-        aif25_mmv<1, true, 7, 4, AIF175_MUL, 4>(wd, q.get(), scales.get(), y, M, K, N, stream);
-    } else if (w->type == GGML_TYPE_AIF25_U2_512) {
-        // K % 512 == 0, so activation scales always cover 256 columns (xsh == 1); four chunks share the row scales.
-        aif25_mmv<1, true, 5, 2, AIF25_MUL, 4>(wd, q.get(), scales.get(), y, M, K, N, stream);
-    } else if (w->type == GGML_TYPE_AIF25_U2 && xsh) {
-        aif25_mmv<1, true>(wd, q.get(), scales.get(), y, M, K, N, stream);
-    } else if (w->type == GGML_TYPE_AIF25_U2) {
-        aif25_mmv<0, true>(wd, q.get(), scales.get(), y, M, K, N, stream);
-    } else if (xsh) {
-        aif25_mmv<1>(wd, q.get(), scales.get(), y, M, K, N, stream);
-    } else {
-        aif25_mmv<0>(wd, q.get(), scales.get(), y, M, K, N, stream);
-    }
+    aif25_mmv_type(w->type, xsh, wd, q.get(), scales.get(), y, M, K, N, stream);
 }

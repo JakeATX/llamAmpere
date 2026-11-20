@@ -4,6 +4,12 @@ llamAmpere is based on mainline llama.cpp (v1.0), tuned for NVIDIA RTX 30-series
 
 It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model writes faster) and Qwen3.8 Flash-Next.
 
+## What's new in v0.7.1
+
+- Faster for one user on 24 GB cards: `--preset 24dense` with one slot writes 115.6 tokens/s at a 98,766-token prompt (v0.7.0.1: 99.8, RTX 3090, P76 AI4 model, +15.8%) and 138.8 at 8,000 (v0.7.0.1: 123.1).
+- The 8 GB model: `--preset 8dense` runs [the 8 GB file](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2-8GB) with the small `mtp-dm.gguf` MTP drafter and mb-MTP on, at a 204,800-token default context: 41.4 tokens/s at a 99,984-token prompt on an RTX 3070 (v0.7.0.1 with the same settings: 39.6). Prompt reading and writing are faster on the small-card weight types. [Release notes](docs/llamampere-v0.7.1/RELEASE_NOTES.md).
+- Claude Code works with Qwen3.8 (before, every request failed with HTTP 500). A Linux build for Ubuntu 22.04 and newer comes with the release; a Windows build (made by CI, not yet run on a GPU by us) follows on the release page.
+
 ## What's new in v0.7.0.1
 
 - Fix: the 10 GB headed preset (`--preset 10dense`) failed to start on RTX 3080 cards. [Release notes](docs/llamampere-v0.7.0.1/RELEASE_NOTES.md).
@@ -78,24 +84,26 @@ Details, speed tables and everything older: [v0.6 release notes](docs/llamampere
 
 ## Quick start
 
+**Let your coding agent set it up:** paste this into Claude Code, Codex, Cursor or Copilot: *"Set up llamAmpere on this PC for me: https://github.com/JakeATX/llamAmpere - follow docs/AI_SETUP.md in that repository. Ask me before you install system packages or use sudo."* ([what it does](docs/AI_SETUP.md))
+
 ### Quick start: pick your card
 
-Card presets assume a display is attached and reserve 1,024 MiB of GPU memory, except 8dense, which is headless-only and reserves 500 MiB. The reserve comes off the card's total memory (a 10 GB card stays at or under 9,216 MiB headed); memory already in use, such as a desktop, counts toward it. An explicit `--fit-target` keeps its free-memory meaning. `8dense headed` prints a note and uses the same headless settings. Append `headless` (`--preset 12dense headless`) or use `12dense-headless` for a 500 MiB margin on 10dense, 12dense, and 24dense. Headed defaults are 180,224 tokens for 10dense and 196,608 for 12dense, with CUDA graphs off for headed 12dense. Headless defaults remain 212,992 for 10dense, 262,144 for 12dense, and 204,800 for 8dense. Headless 12dense at the full 262,144 tokens is tested on an RTX 3080 Ti 12 GB: a 262,142-token fill completed with 11,642 MiB peak (500 MiB margin line 11,788), 1,009 prompt tokens/s and 70.8 writing tokens/s at a 100K prompt. Fitting is on: the dynamic microbatch ladder remains enabled, and fitting may reduce a preset context to honor the margin. An explicit `-c`, `-fitt`, or `-fit` wins in either order. Startup reports the chosen context. Small cards still support one user only; multi-user support is future work. Re-check / update every preset against final 0.7 measurements before ship.
+Card presets assume a display is attached and reserve 1,024 MiB of GPU memory, except 8dense, which is headless-only and reserves 500 MiB. The reserve comes off the card's total memory (a 10 GB card stays at or under 9,216 MiB headed); memory already in use, such as a desktop, counts toward it. An explicit `--fit-target` keeps its free-memory meaning. `8dense headed` prints a note and uses the same headless settings. Append `headless` (`--preset 12dense headless`) or use `12dense-headless` for a 500 MiB margin on 10dense, 12dense, and 24dense. Headed defaults are 180,224 tokens for 10dense and 196,608 for 12dense, with CUDA graphs off for headed 12dense. Headless defaults remain 212,992 for 10dense, 262,144 for 12dense, and 204,800 for 8dense (with `mtp-dm.gguf` the 0.7.1 file peaks at 7,607 MiB on an RTX 3070, under the 7,692 MiB headless line). Headless 12dense at the full 262,144 tokens is tested on an RTX 3080 Ti 12 GB: a 262,142-token fill completed with 11,642 MiB peak (500 MiB margin line 11,788), 1,009 prompt tokens/s and 70.8 writing tokens/s at a 100K prompt. Fitting is on: the dynamic microbatch ladder remains enabled, and fitting may reduce a preset context to honor the margin. An explicit `-c`, `-fitt`, or `-fit` wins in either order. Startup reports the chosen context. Small cards still support one user only; multi-user support is future work.
 
-Card profiles target dense Swift 1.5 Qwen 27B. All four set sampler defaults to temperature 1.0, top-k 20, top-p 0.95, and min-p 0; explicit CLI flags and per-request sampler fields override them. The 8dense profile disables mb-MTP by default; add `--spec-mb-mtp` to enable it. The other three profiles keep mb-MTP on with MTP. Choose the matching model file and use one profile:
+Card profiles target dense Swift 1.5 Qwen 27B. All four set sampler defaults to temperature 1.0, top-k 20, top-p 0.95, and min-p 0; explicit CLI flags and per-request sampler fields override them. All four profiles keep mb-MTP on with MTP; `--no-spec-mb-mtp` turns it off. Choose the matching model file and use one profile. The 24 GB file (P76 AI4, 14.4 GB) is [qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4).
 
 ```bash
-llama-server --preset 24dense -m /path/to/P76-AI4.gguf
-llama-server --preset 24dense -m /path/to/P76-AI4.gguf -np 3 -c 352256 --slot-ctx 262144,0,0
+llama-server --preset 24dense -m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf
+llama-server --preset 24dense -m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf -np 3 -c 352256 --slot-ctx 262144,0,0
 llama-server --preset 12dense -m /path/to/L0.gguf
 llama-server --preset 12dense headless -m /path/to/L0.gguf   # no display on the card: full 262,144 context
 llama-server --preset 10dense -m /path/to/public-AI2.gguf
-llama-server --preset 8dense -m /path/to/healed-a2p-infile-mtp-r123-drafter-iq4xs.gguf
+llama-server --preset 8dense -m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2-8GB.gguf   # mtp-dm.gguf + LSA map in the same folder
 ```
 
-Bare names work too: `llama-server 24dense -m MODEL`. `llama-cli -p TEXT` still takes a prompt; the server does not accept `-p`. Explicit flags override profile values in either order. Card profiles override config.ini defaults; environment values and CLI flags override the card profile. For adaptive MTP, lowering the maximum draft depth also lowers the profile's minimum depth unless you set both. Raising the minimum also raises the profile's maximum unless you set both. Changing a K/V cache type or SJ body type drops the profile's related KV/LSA defaults; supply the full cache configuration you want. A smaller batch caps the default microbatch. Profiles do not download models. Place `lsa-qwen38-27b-d2048.gguf` beside the 8/10/12 GB model, or set `LLAMA_LSA_MAP` / `--attn-sparse-map` to its path. For 8dense also place `mtp-dm.gguf`, `head-ait2.gguf`, and `head-exact-f16.gguf` beside the model; `LLAMA_MODEL_OVERLAY_PATCH` and `LLAMA_D1_HEAD` override these paths. Shell environment values override profile environment defaults. Startup prints the profile version and expanded defaults; a different model family gets a warning.
+Bare names work too: `llama-server 24dense -m MODEL`. `llama-cli -p TEXT` still takes a prompt; the server does not accept `-p`. Explicit flags override profile values in either order. Card profiles override config.ini defaults; environment values and CLI flags override the card profile. For adaptive MTP, lowering the maximum draft depth also lowers the profile's minimum depth unless you set both. Raising the minimum also raises the profile's maximum unless you set both. Changing a K/V cache type or SJ body type drops the profile's related KV/LSA defaults; supply the full cache configuration you want. A smaller batch caps the default microbatch. Profiles do not download models. Place `lsa-qwen38-27b-d2048.gguf` beside the 8/10/12 GB model, or set `LLAMA_LSA_MAP` / `--attn-sparse-map` to its path. 8dense also needs `mtp-dm.gguf` (127 MB MTP drafter) beside the model; startup stops and names the path if it is missing. Set `LLAMA_MODEL_OVERLAY_PATCH=` (empty) with `-c 114688` to use the model file's own MTP layer instead. Shell environment values override profile environment defaults. Startup prints the profile version and expanded defaults; a different model family gets a warning.
 
-All four profiles are enabled and need final 0.7 validation; see [the preset checks](PRESETS_RECHECK.md). These are not full-context fit guarantees. The 24 GB profile keeps f32 recurrent state and supports one to four slots with asymmetric context reservations; `0` gives a slot a share of the remaining pool. The 8/10/12 GB profiles require `-np 1`. TODO: multi-user for small cards (future). All four profiles enable dynamic microbatch sizing, with checks at most every 2 seconds of prompt processing and 10 seconds of decode. Set `LLAMA_DEEPCTX_LADDER=0` for static sizing. The microbatch ceilings stay at 1024/512/512/256 for 24/12/10/8dense; an explicit `-ub` overrides the ceiling. The 8 GB profile uses the accepted F2 settings: reserve 7 rows, stage strips on, CUDA graphs off, 1% buffer growth, and mean chunks on. This build includes the reserve reader. Copy defaults off; earlier 8 GB measurements used copy on, so final measurements must be repeated with copy off. Packed masks remain opt-in. Eligible window-0 paths select DSJ/RM24H automatically, with `--no-spec-draft-sjkvarn` as the opt-out; the 24dense profile sets window 4096 and therefore does not select that automatic path. Context and memory fit depend on the model and overrides.
+24dense and 8dense were re-measured for v0.7.1; 10dense and 12dense keep their v0.7.0.1 measurements; see [the preset checks](PRESETS_RECHECK.md). These are not full-context fit guarantees. The 24 GB profile keeps f32 recurrent state and supports one to four slots with asymmetric context reservations; `0` gives a slot a share of the remaining pool. The 8/10/12 GB profiles require `-np 1`. TODO: multi-user for small cards (future). All four profiles enable dynamic microbatch sizing, with checks at most every 2 seconds of prompt processing and 10 seconds of decode. Set `LLAMA_DEEPCTX_LADDER=0` for static sizing. The microbatch ceilings are 2048 for 24dense with one slot (1024 with `-np 2` to `4`) and 512/512/256 for 12/10/8dense; an explicit `-ub` or `LLAMA_ARG_UBATCH` overrides the ceiling. The 8 GB profile uses the accepted F2 settings: reserve 7 rows, stage strips on, CUDA graphs off, 1% buffer growth, and mean chunks on. This build includes the reserve reader. Copy defaults off; earlier 8 GB measurements used copy on, so final measurements must be repeated with copy off. Packed masks remain opt-in. Eligible window-0 paths select DSJ/RM24H automatically, with `--no-spec-draft-sjkvarn` as the opt-out; 24dense with one slot drafts with window 0, gdn-replay off and adaptive depth 3 to 7, so it selects that path; with `-np 2` to `4` it uses the multi-user values (window 4096, gdn-replay on, depth 4 to 5). Context and memory fit depend on the model and overrides.
 
 **Build and run (v0.6.3.11, Qwen3.8 Flash-Next, Linux).** For one RTX 30-series card with enough system RAM for the model and prompt workspace. Small-card tests used a 3090 limited to 12 GB with about 90 GiB of system RAM; native 12/16 GB cards remain unmeasured, and 64 GB of system RAM is not a fit promise. Small cards use memory-bounded prompt passes; see the [hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md). The launcher keeps the tested `--fit off` setting; its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
 compiler, the `hf` download tool (`pip install -U huggingface_hub`) and 81.63 GB for the model and drafter, plus space for the build, prompt scratch and saved prompts. The launcher uses a 5 GiB free-RAM floor. This
@@ -118,29 +126,29 @@ scripts/flash-next-server.sh -m models/flash-next/qwen3.8-flash-next-Swift1.5-AT
 
 To start it again later, run the last three lines from the `llamAmpere` folder. The server listens on http://127.0.0.1:8080 (OpenAI-compatible API).
 
-**Build and run (v0.6.3.11, Swift 1.5 27B at 2.3 bpw, 200K context, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
-toolkit (`nvcc`), CMake, git and a C++ compiler. The model (about 9.1 GB) downloads on first start. This one paste clones or
-updates llamAmpere at v0.6.3.11, builds `llama-server` and starts it:
+**Build and run (v0.7.1, Swift 1.5 27B, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
+toolkit (`nvcc`), CMake, git and a C++ compiler. Get the model file for 24 GB cards first:
+[qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf](https://huggingface.co/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4) (P76 AI4, 14.4 GB), for example with the `hf` tool (`pip install -U huggingface_hub`):
+`hf download jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4 qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf --local-dir models`. Then replace `/path/to/` below with the full path of the folder you saved it in. This one paste clones or updates llamAmpere at v0.7.1, builds
+`llama-server` and starts it with the 24 GB preset:
 
 ```bash
 if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.3.11
+  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.7.1
 else
-  git clone -b v0.6.3.11 https://github.com/JakeATX/llamAmpere.git
+  git clone -b v0.7.1 https://github.com/JakeATX/llamAmpere.git
 fi && cd llamAmpere && \
 cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
 cmake --build build-sm86 -j8 --target llama-server && \
-./build-sm86/bin/llama-server -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
-  -c 204800 -ngl 99 -fa on -b 4096 -ub 1024 --parallel 1 --jinja --no-context-shift \
-  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
-  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 \
-  --spec-draft-p-min 0 --spec-mb-mtp
+./build-sm86/bin/llama-server --preset 24dense -m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf
 ```
 
-Commands for 12 and 10 GB cards (not yet run on this model) are in the [v0.6.2 release notes](https://github.com/JakeATX/llamAmpere/releases/tag/v0.6.2).
+The preset sets the context, cache types, MTP drafting and the microbatch ladder; do not add `-b` or `-ub`.
+For 12, 10 and 8 GB cards, swap in the matching preset and model file from **Quick start: pick your card**.
 
 The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
-To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, use
+To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp; not re-measured with the v0.7.1 preset) instead,
+replace `-m /path/to/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf` with
 `--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
 
 ## Headline results

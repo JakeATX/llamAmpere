@@ -1,4 +1,5 @@
-// [PP27] AIF25_U exact prompt kernel (magic2::mmq) against the 8-token kernel (magic2::mmv), on the GPU.
+// [PP27] AIF25_U exact prompt kernel (magic2::mmq) against the 8-token kernel (magic2::mmv), on the GPU. [K126] Also the
+// row-scale types AIF175_U2, AIF25_U2 and AIF25_U2_512 (GGML_CUDA_AIF_RS_MMQ, default on), with their CPU slab decoders.
 // Runs dense AIF25_U MUL_MATs at prompt widths with GGML_CUDA_AIF25_MMQ_CHECK=2, so the backend runs both kernels on
 // every qualifying call and aborts if any output differs in any bit; the test then checks that every expected call was
 // checked, and compares three 16-row slabs of every output with a CPU reference (aif25_dequantize_slab, double sums):
@@ -9,6 +10,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-aif25.h"
+#include "ggml-aif175.h"
 
 #include <algorithm>
 #include <cmath>
@@ -50,7 +52,7 @@ int main() {
         std::fprintf(stderr, "CUDA0 init failed\n");
         return 1;
     }
-    struct shape { int64_t m, k, n; };
+    struct shape { int64_t m, k, n; ggml_type type = GGML_TYPE_AIF25_U; };
     // K = 5120 / 17408: activation scale per 256 columns; K = 640 / 384: per 128 (the XSH = 0 kernels).
     // M = 48 leaves a partial two-strip block; widths cover partial, exact and multi-tile token tiles.
     const std::vector<shape> shapes = {
@@ -60,6 +62,14 @@ int main() {
         {2560, 640, 65}, {2560, 640, 127}, {2560, 640, 129}, {2560, 640, 256},
         {640, 2560, 33}, {640, 2560, 130},
         {48, 384, 77}, {48, 384, 200},
+        // [K126] the row-scale types on the same mmq path: AIF175_U2 / AIF25_U2_512 (K % 512, 4 chunks per row scale),
+        // AIF25_U2 (K % 640, 5 chunks; K = 1920 is the XSH = 0 kernel); M = 48 = a partial two-strip block
+        {17408, 5120, 64, GGML_TYPE_AIF175_U2}, {17408, 5120, 256, GGML_TYPE_AIF175_U2}, {5120, 17408, 100, GGML_TYPE_AIF175_U2},
+        {10240, 5120, 512, GGML_TYPE_AIF175_U2}, {5120, 6144, 2048, GGML_TYPE_AIF175_U2}, {48, 512, 77, GGML_TYPE_AIF175_U2},
+        {6144, 5120, 9, GGML_TYPE_AIF175_U2}, {6144, 5120, 8, GGML_TYPE_AIF175_U2},
+        {17408, 5120, 65, GGML_TYPE_AIF25_U2}, {12288, 5120, 256, GGML_TYPE_AIF25_U2}, {1024, 5120, 1024, GGML_TYPE_AIF25_U2},
+        {48, 1920, 130, GGML_TYPE_AIF25_U2}, {2560, 1920, 33, GGML_TYPE_AIF25_U2},
+        {17408, 5120, 64, GGML_TYPE_AIF25_U2_512}, {5120, 6144, 300, GGML_TYPE_AIF25_U2_512}, {48, 512, 129, GGML_TYPE_AIF25_U2_512},
     };
     std::mt19937 rng(20261111);
     std::uniform_real_distribution<float> scale(0.002f, 0.02f), act(-1.0f, 1.0f);
@@ -68,7 +78,7 @@ int main() {
     for (const shape & s : shapes) {
         ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(ip);
-        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_AIF25_U, s.k, s.m);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, s.type, s.k, s.m);
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, s.k, s.n);
         ggml_tensor * y = ggml_mul_mat(ctx, w, x);
         ggml_set_name(y, "aif25_test");
@@ -81,15 +91,19 @@ int main() {
             ggml_free(ctx);
             break;
         }
-        // 672-byte units: 16 fp16 row scales (32 bytes), then 640 bytes of random tile words
+        // units / blocks: 16 fp16 row scales (32 bytes), then random tile words. AIF25_U 672-byte 16 x 128 units;
+        // AIF25_U2 3232-byte 16 x 640, AIF25_U2_512 2592-byte 16 x 512, AIF175_U2 1824-byte 16 x 512 blocks
+        const int64_t unit = s.type == GGML_TYPE_AIF25_U2 ? 3232 : s.type == GGML_TYPE_AIF25_U2_512 ? 2592 :
+                             s.type == GGML_TYPE_AIF175_U2 ? AIF175_BLOCK_BYTES : AIF25_UNIT_BYTES;
+        const int64_t unit_k = s.type == GGML_TYPE_AIF25_U2 ? 640 : s.type == GGML_TYPE_AIF25_U ? 128 : 512;
         std::vector<uint8_t> wb(ggml_nbytes(w));
-        for (size_t b = 0; b + 672 <= wb.size(); b += 672) {
+        for (size_t b = 0; b + unit <= wb.size(); b += unit) {
             ggml_fp16_t * d = (ggml_fp16_t *) (wb.data() + b);
             for (int i = 0; i < 16; ++i) {
                 d[i] = ggml_fp32_to_fp16(scale(rng));
             }
             uint32_t * t = (uint32_t *) (wb.data() + b + 32);
-            for (int i = 0; i < 160; ++i) {
+            for (int64_t i = 0; i < (unit - 32)/4; ++i) {
                 t[i] = (uint32_t) rng();
             }
         }
@@ -100,7 +114,7 @@ int main() {
         ggml_backend_tensor_set(w, wb.data(), 0, wb.size());
         ggml_backend_tensor_set(x, xb.data(), 0, ggml_nbytes(x));
         if (!ggml_backend_supports_op(backend, y)) {
-            std::fprintf(stderr, "CUDA0 does not run AIF25_U MUL_MAT (needs Ampere or newer); this test was not run\n");
+            std::fprintf(stderr, "CUDA0 does not run %s MUL_MAT (needs Ampere or newer); this test was not run\n", ggml_type_name(s.type));
             ggml_backend_buffer_free(buf);
             ggml_free(ctx);
             ggml_backend_free(backend);
@@ -120,10 +134,19 @@ int main() {
         }
         // CPU reference on three slabs (first, middle, last): W rows dequantized and unrotated, double sums
         double err = 0.0, ref2 = 0.0;
-        const int64_t slab_bytes = s.k / 128 * AIF25_UNIT_BYTES, n_slabs = s.m / 16;
+        const int64_t slab_bytes = s.k / unit_k * unit, n_slabs = s.m / 16;
         std::vector<float> wr(16 * s.k);
         for (int64_t sl : { (int64_t) 0, n_slabs / 2, n_slabs - 1 }) {
-            aif25_dequantize_slab(wb.data() + sl * slab_bytes, wr.data(), s.k);
+            const uint8_t * slab = wb.data() + sl * slab_bytes;
+            if (s.type == GGML_TYPE_AIF175_U2) {
+                aif175_dequantize_slab(slab, wr.data(), s.k);
+            } else if (s.type == GGML_TYPE_AIF25_U2) {
+                aif25_dequantize_slab_v2(slab, wr.data(), s.k);
+            } else if (s.type == GGML_TYPE_AIF25_U2_512) {
+                aif25_dequantize_slab_v2_512(slab, wr.data(), s.k);
+            } else {
+                aif25_dequantize_slab(slab, wr.data(), s.k);
+            }
             for (int64_t t = 0; t < s.n; ++t) {
                 for (int r = 0; r < 16; ++r) {
                     double acc = 0.0;
@@ -138,7 +161,7 @@ int main() {
         }
         const double nmse = ref2 > 0.0 ? err / ref2 : 1.0;
         const bool pass = finite && nonzero && g_checked - before == want && nmse <= 1e-3;
-        std::fprintf(stderr, "M=%lld K=%lld N=%lld checks=%d (want %d) finite=%d nonzero=%d nmse=%.3g %s\n", (long long) s.m,
+        std::fprintf(stderr, "%s M=%lld K=%lld N=%lld checks=%d (want %d) finite=%d nonzero=%d nmse=%.3g %s\n", ggml_type_name(s.type), (long long) s.m,
                 (long long) s.k, (long long) s.n, g_checked - before, want, finite, nonzero, nmse, pass ? "OK" : "FAIL");
         ok = ok && pass;
         ggml_backend_buffer_free(buf);

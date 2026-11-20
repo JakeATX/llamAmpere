@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 
@@ -1423,6 +1424,13 @@ static inline bool ggml_cuda_graph_log_on() {
     return on;
 }
 
+// fork: GGML_CUDA_DISABLE_GRAPHS is read by value. Unset, empty or "0" keeps graphs on; any other value turns them
+// off. A set "0" used to turn graphs off too (presence check), so a card preset's "1" could not be undone with "=0".
+static inline bool ggml_cuda_graphs_disabled_by_env() {
+    const char * e = getenv("GGML_CUDA_DISABLE_GRAPHS");
+    return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+}
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1454,7 +1462,7 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        static const bool disable_cuda_graphs_due_to_env = ggml_cuda_graphs_disabled_by_env();
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
     }
 #endif
