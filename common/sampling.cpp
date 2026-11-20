@@ -425,6 +425,25 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+// tokens of the generation prompt that the template already placed in the prompt
+static std::vector<llama_token> common_sampler_prefill_tokens(const llama_vocab * vocab, const common_params_sampling & params) {
+    std::vector<llama_token> prefill_tokens;
+    if (!params.generation_prompt.empty()) {
+        GGML_ASSERT(vocab != nullptr);
+        auto tokens = common_tokenize(vocab, params.generation_prompt, false, true);
+        for (size_t i = 0; i < tokens.size(); i++) {
+            std::string piece = common_token_to_piece(vocab, tokens[i], true);
+            if (i == 0 && std::isspace(piece[0]) && !std::isspace(params.generation_prompt[0])) {
+                // Some tokenizers will add a space before the first special token, need to exclude
+                continue;
+            }
+            LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
+            prefill_tokens.push_back(tokens[i]);
+        }
+    }
+    return prefill_tokens;
+}
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params) {
@@ -517,20 +536,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // Compute prefill tokens from the generation prompt
-    std::vector<llama_token> prefill_tokens;
-    if (!params.generation_prompt.empty()) {
-        GGML_ASSERT(vocab != nullptr);
-        auto tokens = common_tokenize(vocab, params.generation_prompt, false, true);
-        for (size_t i = 0; i < tokens.size(); i++) {
-            std::string piece = common_token_to_piece(vocab, tokens[i], true);
-            if (i == 0 && std::isspace(piece[0]) && !std::isspace(params.generation_prompt[0])) {
-                // Some tokenizers will add a space before the first special token, need to exclude
-                continue;
-            }
-            LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
-            prefill_tokens.push_back(tokens[i]);
-        }
-    }
+    const std::vector<llama_token> prefill_tokens = common_sampler_prefill_tokens(vocab, params);
 
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
@@ -1650,6 +1656,72 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+// fork NOCUTOFF: answer reserve
+
+int32_t common_answer_reserve(int32_t limit, int32_t reserve) {
+    if (limit <= 0 || reserve == 0) {
+        return 0;
+    }
+    if (reserve < 0) {
+        reserve = std::max(limit / 4, std::min(512, limit / 2));
+    }
+    return std::min(reserve, limit);
+}
+
+llama_sampler * common_reasoning_tracker_init(const struct llama_model * model, const common_params_sampling & params) {
+    if (params.reasoning_answer_reserve == 0 || params.reasoning_budget_start.empty() ||
+            params.reasoning_budget_end.empty() || params.reasoning_budget_forced.empty()) {
+        return nullptr;
+    }
+    if (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control) {
+        return nullptr; // common_sampler_init builds the chain's own budget sampler; closing forces that one
+    }
+    // no vocab: the tracker never runs out of budget on its own, so it never waits for UTF-8 completion
+    llama_sampler * tracker = common_reasoning_budget_init(nullptr, {params.reasoning_budget_start},
+            params.reasoning_budget_end, params.reasoning_budget_forced, INT_MAX);
+    for (const llama_token token : common_sampler_prefill_tokens(model ? llama_model_get_vocab(model) : nullptr, params)) {
+        llama_sampler_accept(tracker, token);
+    }
+    return tracker;
+}
+
+bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler ** tracker) {
+    if (!gsmpl) {
+        return false;
+    }
+    if (gsmpl->rbudget) {
+        return common_reasoning_budget_force(gsmpl->rbudget);
+    }
+    if (!tracker || !*tracker || !common_reasoning_budget_force(*tracker)) {
+        return false;
+    }
+    // the tracker has seen exactly the tokens this chain accepted, so it can take the budget sampler's place
+    gsmpl->rbudget = *tracker;
+    *tracker = nullptr;
+    gsmpl->params.backend_sampling = false;
+    // a chain that was offloaded to a backend skips its offloaded samplers on the CPU forever: continue on a CPU
+    // copy (same sampler states). The caller has already dropped the backend sampler, so the old chain is unused
+    llama_sampler * chain = llama_sampler_clone(gsmpl->chain);
+    llama_sampler_free(gsmpl->chain);
+    gsmpl->chain = chain;
+    return true;
+}
+
+llama_token common_sampler_reasoning_rescue_eog(struct common_sampler * gsmpl, llama_sampler ** tracker) {
+    if (!gsmpl || gsmpl->params.reasoning_budget_forced.empty()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const llama_sampler * think = gsmpl->rbudget ? gsmpl->rbudget : (tracker ? *tracker : nullptr);
+    if (common_reasoning_budget_get_state(think) != REASONING_BUDGET_COUNTING ||
+            !common_sampler_reasoning_close(gsmpl, tracker)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    // the chain already took the end-of-generation token; it now takes the first forced token in its place
+    const llama_token first = gsmpl->params.reasoning_budget_forced.front();
+    common_sampler_accept(gsmpl, first, true);
+    return first;
 }
 
 // helpers
