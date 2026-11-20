@@ -1113,6 +1113,7 @@ static void common_params_fit_impl(
                 moe_cache->mode          = COMMON_MOE_CACHE_MODE_OFF;
                 moe_cache->mode_explicit = true;
             }
+            cparams->moe_cache_mode = LLAMA_MOE_CACHE_MODE_OFF;
             LOG_INF("%s: MoE placement: all experts, weights and KV at ctx %" PRIu32 " fit on the GPU (%" PRId64
                 " MiB left): stock GPU placement, expert arena and MoE cache off (LLAMA_MOEPLACE=0 restores them)\n",
                 __func__, cparams->n_ctx, free_min/MiB);
