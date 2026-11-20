@@ -1,0 +1,92 @@
+{
+  "variant": "262k_b4864_ub4864",
+  "ctx": "262k",
+  "batch": 4864,
+  "ubatch": 4864,
+  "rep": 1,
+  "load_seconds": 67,
+  "probe_seconds": 1527,
+  "rss_mb": 1665,
+  "peak_vram_mib": 23514,
+  "headroom_mib": 462,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "coding_16k",
+      "prompt_tokens": 16475,
+      "prompt_ms": 10012.8,
+      "pp_tok_s": 1645.4,
+      "gen_tokens": 512,
+      "gen_ms": 4639.2,
+      "tg_tok_s": 110.15,
+      "wall_s": 14.77
+    },
+    {
+      "task": "coding_64k",
+      "prompt_tokens": 66057,
+      "prompt_ms": 45978.1,
+      "pp_tok_s": 1436.7,
+      "gen_tokens": 512,
+      "gen_ms": 4832.8,
+      "tg_tok_s": 105.74,
+      "wall_s": 51.33
+    },
+    {
+      "task": "coding_128k",
+      "prompt_tokens": 130954,
+      "prompt_ms": 108647.0,
+      "pp_tok_s": 1205.32,
+      "gen_tokens": 512,
+      "gen_ms": 5587.2,
+      "tg_tok_s": 91.46,
+      "wall_s": 115.92
+    },
+    {
+      "task": "coding_160k",
+      "prompt_tokens": 163723,
+      "prompt_ms": 146867.9,
+      "pp_tok_s": 1114.76,
+      "gen_tokens": 512,
+      "gen_ms": 5710.6,
+      "tg_tok_s": 89.48,
+      "wall_s": 155.07
+    },
+    {
+      "task": "coding_200k",
+      "prompt_tokens": 204761,
+      "prompt_ms": 247322.8,
+      "pp_tok_s": 827.91,
+      "gen_tokens": 512,
+      "gen_ms": 6802.0,
+      "tg_tok_s": 75.12,
+      "wall_s": 257.28
+    },
+    {
+      "task": "coding_250k",
+      "prompt_tokens": 255828,
+      "prompt_ms": 466318.6,
+      "pp_tok_s": 548.61,
+      "gen_tokens": 512,
+      "gen_ms": 7085.6,
+      "tg_tok_s": 72.12,
+      "wall_s": 480.9
+    },
+    {
+      "task": "max_ctx",
+      "prompt_tokens": 249763,
+      "prompt_ms": 438816.0,
+      "pp_tok_s": 569.17,
+      "gen_tokens": 64,
+      "gen_ms": 1024.2,
+      "tg_tok_s": 61.51,
+      "wall_s": 446.1,
+      "max_ctx_request": 250000
+    }
+  ],
+  "max_ctx_pp": 569.17,
+  "max_ctx_tg": 61.51,
+  "max_ctx_tokens": 249763,
+  "pass": true,
+  "record_note": "tune_run4.sh final serializer crashed (ValueError: expected 13 args, got 11) after probe completed; record rebuilt from last_probe2.json + vram.json + run log. peak_vram_mib from vram.json; load_seconds/rss from log; probe_seconds from probe window (07:20:19 -> 07:45:46)."
+}
