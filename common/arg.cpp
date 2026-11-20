@@ -970,7 +970,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 !is_explicit("--sjkvarn-body-type");
         for (const auto & kv : card.options) {
             if (ctx_arg.ex == LLAMA_EXAMPLE_CLI &&
-                (kv.first == "--kv-unified" || kv.first == "--cache-ram" || kv.first == "--no-cache-disk")) {
+                (kv.first == "--kv-unified" || kv.first == "--cache-ram" || kv.first == "--no-cache-disk" ||
+                 kv.first == "--warm-prefill")) {
                 continue;
             }
             if (!params.card_preset_kv_default && (kv.first == "--cache-type-k" || kv.first == "--cache-type-v" ||

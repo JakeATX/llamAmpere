@@ -79,7 +79,9 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 // 0.7.2.1: 512 keeps 204800 and prefills faster; stage 128 pays for it (V07/UB512/RESULT.md).
                 {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
-                {"--fit", "on"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
+                // 0.7.2.1: RAM + disk prompt cache at their defaults, warm-prefill on (V07/CACHE8).
+                // Kill switches: --cache-ram 0, --no-cache-disk, --no-warm-prefill.
+                {"--fit", "on"}, {"--warm-prefill", "1"},
                 {"--cache-type-k", "sjkvarn3"}, {"--cache-type-v", "sjkvarn3"},
                 {"--sjkvarn-body-type", "sjkvarn4t"}, {"--cache-type-s", "q8_0"},
                 {"--override-tensor", "token_embd.weight=CPU"}, {"--load-mode", "none"},
@@ -113,7 +115,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         tiny.fit_margin_mib = 500;
         std::vector<common_card_preset> cards {large, medium, small, tiny};
         for (auto & card : cards) {
-            card.version = card.name == "8dense" ? "2026-11-20.1" : "2026-11-17.6";
+            card.version = card.name == "8dense" ? "2026-11-20.2" : "2026-11-17.6";
             card.options.insert(card.options.end(), {
                 {"--temp", "1.0"}, {"--top-k", "20"}, {"--top-p", "0.95"}, {"--min-p", "0"}
             });

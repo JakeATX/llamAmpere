@@ -494,6 +494,13 @@ static void test(void) {
         assert(tiny.sj_kvarn_body_type == GGML_TYPE_I16);
         assert(tiny.speculative.draft.n_max == 3 && tiny.speculative.draft.n_ubatch == 8);
         assert(tiny.speculative.n_rs_seq_override == 3);
+        // 8dense keeps the RAM + disk prompt cache defaults and turns warm-prefill on; the kill switches still win
+        assert(tiny.warm_prefill && tiny.cache_disk && tiny.cache_ram_mib == COMMON_CACHE_RAM_AUTO && !tiny.cache_ram_explicit);
+        common_params tiny_off;
+        assert(parse_card({"--preset", "8dense", "--no-warm-prefill", "--cache-ram", "0", "--no-cache-disk"}, tiny_off));
+        assert(!tiny_off.warm_prefill && !tiny_off.cache_disk && tiny_off.cache_ram_mib == 0);
+        common_params tiny_off_first;
+        assert(parse_card({"--no-warm-prefill", "8dense"}, tiny_off_first) && !tiny_off_first.warm_prefill);
 #ifndef _WIN32
         const char * old_ctx = std::getenv("LLAMA_ARG_CTX_SIZE");
         const bool had_ctx = old_ctx != nullptr;
