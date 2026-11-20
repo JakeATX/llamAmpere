@@ -488,7 +488,7 @@ static void test(void) {
         assert(!parse_card({"24dense", "--preset", "10dense"}, invalid));
         common_params tiny;
         assert(parse_card({"--preset", "8dense"}, tiny));
-        assert(tiny.n_ctx == 204800 && tiny.n_ubatch == 256);
+        assert(tiny.n_ctx == 204800 && tiny.n_ubatch == 512);
         assert(tiny.cache_type_k == GGML_TYPE_F16 && tiny.cache_type_v == GGML_TYPE_F16);
         assert(tiny.sj_kvarn_bits_k == 3 && tiny.sj_kvarn_bits_v == 3);
         assert(tiny.sj_kvarn_body_type == GGML_TYPE_I16);

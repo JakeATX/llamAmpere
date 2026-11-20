@@ -77,7 +77,8 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         common_card_preset tiny {
             "8dense", "2026-11-17.4", "checked for v0.7.1", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
-                {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                // 0.7.2.1: 512 keeps 204800 and prefills faster; stage 128 pays for it (V07/UB512/RESULT.md).
+                {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "on"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
                 {"--cache-type-k", "sjkvarn3"}, {"--cache-type-v", "sjkvarn3"},
                 {"--sjkvarn-body-type", "sjkvarn4t"}, {"--cache-type-s", "q8_0"},
@@ -101,7 +102,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"GGML_CUDA_DISABLE_GRAPHS", "1"}, {"GGML_ALLOC_GROW_PCT", "1"},
                 {"LLAMA_LSA_FUSED_SEL", "1"}, {"LLAMA_LSA_COMP", "2"},
                 {"LLAMA_LSA_COMP_LB", "1"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
-                {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "256"},
+                {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "128"},
                 {"LLAMA_KQ_MASK_PACKED", "1"}, {"GGML_SJKVARN_TILE_SKIP", "1"},
                 {"GGML_SJKVARN_TRELLIS_PREFILL_MIB", "16"}, {"GGML_SJKVARN_TRELLIS_WIDTH", "1"},
                 {"GGML_SJKVARN_TRELLIS_WIDTH_LSE", "1"},
@@ -112,7 +113,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         tiny.fit_margin_mib = 500;
         std::vector<common_card_preset> cards {large, medium, small, tiny};
         for (auto & card : cards) {
-            card.version = card.name == "8dense" ? "2026-11-19.1" : "2026-11-17.6";
+            card.version = card.name == "8dense" ? "2026-11-20.1" : "2026-11-17.6";
             card.options.insert(card.options.end(), {
                 {"--temp", "1.0"}, {"--top-k", "20"}, {"--top-p", "0.95"}, {"--min-p", "0"}
             });
