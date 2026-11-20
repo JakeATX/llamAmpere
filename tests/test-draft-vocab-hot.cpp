@@ -155,6 +155,43 @@ int main() {
         check_invariants(hv);
     }
 
+    // [REPEAT] reset() forgets earlier requests: after reset + the same request, the slots and the
+    // replacements equal those of a fresh table that saw only that request (history-free drafts)
+    {
+        const std::vector<int32_t> req_a = {30, 30, 31, 32, 33, 34, 35, 35, 36};
+        const std::vector<int32_t> req_b = {40, 41, 41, 42, 30, 43};
+        llama_mtp_hot_vocab fresh = make(64, 12, 4);
+        observe(fresh, req_b);
+        const auto rep_fresh = fresh.select();
+
+        llama_mtp_hot_vocab hv = make(64, 12, 4);
+        observe(hv, req_a);
+        hv.select();
+        observe(hv, req_b);
+        hv.select();
+        GGML_ASSERT(hv.slots != fresh.slots); // history changed the tail
+        const auto back = hv.reset();
+        GGML_ASSERT(!back.empty());
+        GGML_ASSERT(hv.slots == std::vector<int32_t>({12, 13, 14, 15}));
+        GGML_ASSERT(hv.cands.empty() && hv.req_counter == 0);
+        check_invariants(hv);
+        for (const auto & r : back) {
+            GGML_ASSERT(hv.slots[r.slot] == r.id);
+        }
+        observe(hv, req_b);
+        const auto rep = hv.select();
+        GGML_ASSERT(hv.slots == fresh.slots);
+        GGML_ASSERT(rep.size() == rep_fresh.size());
+        for (size_t i = 0; i < rep.size(); ++i) {
+            GGML_ASSERT(rep[i].slot == rep_fresh[i].slot && rep[i].id == rep_fresh[i].id);
+        }
+        check_invariants(hv);
+        // a second reset right after load changes nothing
+        llama_mtp_hot_vocab hv2 = make(64, 12, 4);
+        GGML_ASSERT(hv2.reset().empty());
+        check_invariants(hv2);
+    }
+
     printf("%s: OK\n", __func__);
     return 0;
 }

@@ -1983,11 +1983,21 @@ void llama_context::draft_vocab_observe(const llama_token * toks, size_t n) {
     draft_vocab.hot.observe(toks, n);
 }
 
+int32_t llama_context::draft_vocab_reset() {
+    if (draft_vocab.n_hot <= 0 || draft_vocab.ids == nullptr) {
+        return 0;
+    }
+    return draft_vocab_apply(draft_vocab.hot.reset());
+}
+
 int32_t llama_context::draft_vocab_refresh() {
     if (draft_vocab.n_hot <= 0 || draft_vocab.ids == nullptr) {
         return 0;
     }
-    const auto reps = draft_vocab.hot.select();
+    return draft_vocab_apply(draft_vocab.hot.select());
+}
+
+int32_t llama_context::draft_vocab_apply(const std::vector<llama_mtp_hot_vocab::replacement> & reps) {
     if (reps.empty()) {
         return 0;
     }
@@ -11198,6 +11208,10 @@ void llama_draft_vocab_observe(llama_context * ctx, const llama_token * toks, si
 
 int32_t llama_draft_vocab_refresh(llama_context * ctx) {
     return ctx->draft_vocab_refresh();
+}
+
+int32_t llama_draft_vocab_reset(llama_context * ctx) {
+    return ctx->draft_vocab_reset();
 }
 
 int32_t llama_draft_vocab_n_hot(const llama_context * ctx) {
