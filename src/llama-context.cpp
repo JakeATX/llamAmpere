@@ -2871,7 +2871,10 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
         const char * reason = cparams.training ? "training" : cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ? "non-default context" :
             R == 0 ? "zero output capacity" : R < n_seqs ? "rows below n_seqs" :
             R >= n_tokens ? "covered by pp reserve" : R > llama_lsa_cfg().max_rows ? "rows exceed LSA max_rows" : nullptr;
-        if (reason) {
+        if (reason && !cparams.training && cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            // the MTP drafter context takes this path on every reserve: expected, so debug only
+            LLAMA_LOG_DEBUG("%s: verify reserve skipped: %s (LLAMA_RESERVE_VERIFY_ROWS)\n", __func__, reason);
+        } else if (reason) {
             LLAMA_LOG_WARN("%s: verify reserve skipped: %s (LLAMA_RESERVE_VERIFY_ROWS)\n", __func__, reason);
         } else {
             std::vector<size_t> sizes(model.no_alloc() ? backend_ptrs.size() : 0);
