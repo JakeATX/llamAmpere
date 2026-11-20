@@ -2,6 +2,8 @@ name: CI (CUDA, windows)
 
 # llamAmpere release zip: builds llama-server for Windows x64 with CUDA 12.4 from one exact commit.
 on:
+  push:
+    branches: [ "ci/v0.7.1-windows-3" ]
   workflow_dispatch:
     inputs:
       sha:
@@ -14,6 +16,10 @@ on:
 permissions:
   contents: read
 
+env:
+  BUILD_SHA: ${{ inputs.sha || '374a89e7511dd65d258fdcb7de2e52bd3f4ee2d8' }}
+  ZIP_NAME: ${{ inputs.name || 'llamampere-v0.7.1-windows-x86_64-cuda12-server' }}
+
 jobs:
   windows-cuda-server:
     runs-on: windows-2022
@@ -23,13 +29,13 @@ jobs:
       - name: Clone
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.sha }}
+          ref: ${{ env.BUILD_SHA }}
           fetch-depth: 0
 
       - name: Check commit
         shell: bash
         run: |
-          test "$(git rev-parse HEAD)" = "${{ inputs.sha }}"
+          test "$(git rev-parse HEAD)" = "${{ env.BUILD_SHA }}"
           test -z "$(git status --porcelain)"
 
       - name: Install Cuda Toolkit
@@ -57,7 +63,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $n = "${{ inputs.name }}"
+          $n = "${{ env.ZIP_NAME }}"
           $d = "pack\$n"
           New-Item -ItemType Directory -Force $d, "$d\licenses" | Out-Null
           Copy-Item build\bin\*.exe, build\bin\*.dll $d
@@ -81,19 +87,19 @@ jobs:
             "under the Microsoft Visual Studio license terms for redistributable code."
           ) | Set-Content "$d\licenses\THIRD-PARTY-DLLS.txt"
           Copy-Item "docs\llamampere-v0.7.1\RELEASE_NOTES.md" $d
-          "${{ inputs.sha }}" | Set-Content "$d\COMMIT"
+          "${{ env.BUILD_SHA }}" | Set-Content "$d\COMMIT"
           Get-ChildItem $d -Recurse | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Version check (no GPU on the runner)
         shell: pwsh
         run: |
-          $n = "${{ inputs.name }}"
+          $n = "${{ env.ZIP_NAME }}"
           $exe = "pack\$n\llama-server.exe"
           $out = & $exe --version 2>&1 | Out-String
           Write-Host "exit=$LASTEXITCODE"
           Write-Host $out
           $out | Set-Content "pack\version.txt"
-          $short = "${{ inputs.sha }}".Substring(0, 9)
+          $short = "${{ env.BUILD_SHA }}".Substring(0, 9)
           $hit = Select-String -Path "pack\$n\*.dll", "pack\$n\*.exe" -Pattern $short -SimpleMatch -List | Select-Object -ExpandProperty Filename
           Write-Host "commit $short found in: $hit"
           "strings: $hit" | Add-Content "pack\version.txt"
@@ -107,7 +113,7 @@ jobs:
       - name: Zip
         shell: pwsh
         run: |
-          $n = "${{ inputs.name }}"
+          $n = "${{ env.ZIP_NAME }}"
           Push-Location pack
           7z a -tzip "..\$n.zip" $n | Out-Null
           Pop-Location
@@ -118,9 +124,9 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.name }}
+          name: ${{ env.ZIP_NAME }}
           path: |
-            ${{ inputs.name }}.zip
-            ${{ inputs.name }}.zip.sha256
+            ${{ env.ZIP_NAME }}.zip
+            ${{ env.ZIP_NAME }}.zip.sha256
             pack/version.txt
           retention-days: 14
