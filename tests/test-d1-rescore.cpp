@@ -308,11 +308,149 @@ static void test_ctx(const std::string & dir) {
     std::printf("%s\n", llama_d1_ctx(head, 1, 1, 1).summary().c_str());
 }
 
+// [EXACTHEAD] bf16 rows + output_exact.gl2 + the certificate. With sigma = sqrt(32 * G) the bound is a hard
+// (Cauchy-Schwarz) bound, so after certify the row's top k must equal the exact top k over the whole vocab.
+struct cert_sidecar {
+    std::string        path;
+    std::vector<float> w;      // [V][E] exact rows (bf16 values)
+    std::vector<float> coarse; // [V][E] coarse rows
+    llama_d1_src       src;
+};
+
+static cert_sidecar make_cert_sidecar(const std::string & dir, const char * name, int tamper) {
+    cert_sidecar sc;
+    sc.path = dir + "/" + name;
+    const int64_t G = E / 32;
+    std::mt19937 rng(77);
+    std::normal_distribution<float> nd(0.0f, 0.05f);
+    std::vector<float> wf(V * E);
+    for (auto & x : wf) { x = nd(rng); }
+    std::vector<ggml_bf16_t> wb(V * E);
+    ggml_fp32_to_bf16_row(wf.data(), wb.data(), V * E);
+    sc.w.resize(V * E);
+    ggml_bf16_to_fp32_row(wb.data(), sc.w.data(), V * E);
+    // coarse = exact + per-row noise; every 50th row gets a large error (the rows the certificate has to catch)
+    sc.coarse = sc.w;
+    std::vector<float> gl2(V * G);
+    for (int64_t i = 0; i < V; ++i) {
+        const float scale = i % 50 == 7 ? 0.08f : 0.004f;
+        std::normal_distribution<float> ne(0.0f, scale);
+        for (int64_t g = 0; g < G; ++g) {
+            double s2 = 0;
+            for (int q = 0; q < 32; ++q) {
+                const float e = ne(rng);
+                sc.coarse[i * E + g * 32 + q] += e;
+                s2 += (double) e * e;
+            }
+            gl2[i * G + g] = (float) std::sqrt(s2) * 1.0001f; // rounded up
+        }
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead() * 4 + (size_t) V * E * 2 + (size_t) V * G * 4 + 8192, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, E, V);
+    ggml_set_name(t, "output_exact.weight");
+    std::memcpy(t->data, wb.data(), ggml_nbytes(t));
+    ggml_tensor * tg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, G, V);
+    ggml_set_name(tg, "output_exact.gl2");
+    std::memcpy(tg->data, gl2.data(), ggml_nbytes(tg));
+
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_str(g, "d1.rows_type", tamper == 1 ? "f16" : "bf16");
+    gguf_set_val_u64(g, "d1.source_bytes", 4096);
+    gguf_set_val_u64(g, "d1.source_fnv64", 7);
+    gguf_set_val_u64(g, "d1.self_bytes", ggml_nbytes(t));
+    gguf_set_val_u64(g, "d1.self_fnv64", llama_d1_fnv64_ends((const uint8_t *) t->data, ggml_nbytes(t)));
+    gguf_set_val_u64(g, "d1.gl2_fnv64", llama_d1_fnv64_ends((const uint8_t *) tg->data, ggml_nbytes(tg)) ^ (tamper == 2 ? 1 : 0));
+    gguf_add_tensor(g, t);
+    gguf_add_tensor(g, tg);
+    CHECK(gguf_write_to_file(g, sc.path.c_str(), false), "write %s", sc.path.c_str());
+    gguf_free(g);
+    ggml_free(ctx);
+
+    sc.src.valid  = true;
+    sc.src.type   = GGML_TYPE_AIF25_U2;
+    sc.src.nbytes = 4096;
+    sc.src.fnv    = 7;
+    return sc;
+}
+
+static void test_cert(const std::string & dir) {
+    std::string err;
+    {
+        cert_sidecar bad = make_cert_sidecar(dir, "d1-test-bf16-bad1.gguf", 1);
+        CHECK(!llama_d1_head_open(bad.path.c_str(), bad.src, E, V, err), "bf16 with rows_type f16 refused");
+        cert_sidecar bad2 = make_cert_sidecar(dir, "d1-test-bf16-bad2.gguf", 2);
+        CHECK(!llama_d1_head_open(bad2.path.c_str(), bad2.src, E, V, err), "gl2 fingerprint mismatch refused");
+        std::remove(bad.path.c_str());
+        std::remove(bad2.path.c_str());
+    }
+    cert_sidecar sc = make_cert_sidecar(dir, "d1-test-bf16.gguf", 0);
+    auto head = llama_d1_head_open(sc.path.c_str(), sc.src, E, V, err);
+    CHECK(head != nullptr, "bf16 open: %s", err.c_str());
+    if (!head) { return; }
+    CHECK(head->type == GGML_TYPE_BF16 && head->gl2 && head->n_group == E / 32, "bf16 head with gl2");
+
+    // scope: the 8 GB file's own AIF25_U2 head is a coarse head
+    {
+        llama_d1_model_slot slot; slot.src = sc.src;
+        llama_d1_scope_in in;
+        in.head_path = sc.path.c_str(); in.out_type = GGML_TYPE_AIF25_U2; in.out_ne0 = E; in.out_ne1 = V;
+        in.n_embd = E; in.n_vocab = V;
+        std::shared_ptr<llama_d1_head> got; std::string msg;
+        CHECK(llama_d1_scope(in, slot, got, msg) == LLAMA_D1_SCOPE_ON && got, "AIF25_U2 head on: %s", msg.c_str());
+    }
+
+    const int R = 40, NTOP = 8, K = 4;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> H(R * E), L0(R * V), X(R * V);
+    for (auto & x : H) { x = nd(rng); }
+    for (int r = 0; r < R; ++r) {
+        for (int64_t i = 0; i < V; ++i) {
+            double c = 0, e = 0;
+            for (int64_t k = 0; k < E; ++k) {
+                c += (double) sc.coarse[i * E + k] * H[r * E + k];
+                e += (double) sc.w[i * E + k] * H[r * E + k];
+            }
+            L0[r * V + i] = (float) c;
+            X[r * V + i]  = (float) e;
+        }
+    }
+    const auto top_ids = [&](const float * row, int n) { return ref_top(row, V, n); };
+
+    llama_d1_cert cert;
+    cert.on = true; cert.k = K; cert.sigma = std::sqrt(32.0f * (E / 32)); cert.margin = 1e-3f;
+    int miss_plain = 0, miss_cert = 0;
+    for (const bool on : { false, true }) {
+        llama_d1_cert c0 = cert; c0.on = on;
+        llama_d1_ctx c(head, NTOP, 64, 1, c0);
+        c.reset(R);
+        std::memcpy(c.h_row(0), H.data(), sizeof(float) * R * E);
+        c.mark_copied(0, R, true);
+        std::vector<float> L = L0;
+        c.on_read_all(L.data(), V, R);
+        for (int r = 0; r < R; ++r) {
+            const bool same = top_ids(&L[r * V], K) == top_ids(&X[r * V], K);
+            (on ? miss_cert : miss_plain) += same ? 0 : 1;
+        }
+        if (on) {
+            CHECK(c.n_cert_rows == (uint64_t) R, "cert ran on every row");
+            CHECK(c.n_cert_forced > 0, "cert forced some rows (%llu)", (unsigned long long) c.n_cert_forced.load());
+            std::printf("%s\n", c.summary().c_str());
+        }
+    }
+    CHECK(miss_cert == 0, "certified top %d == exact top %d on every row (%d misses)", K, K, miss_cert);
+    std::printf("cert test: top-%d misses plain N=%d: %d/%d, certified: %d/%d\n", K, NTOP, miss_plain, R, miss_cert, R);
+    std::remove(sc.path.c_str());
+}
+
 int main(int argc, char ** argv) {
     const std::string dir = argc > 1 ? argv[1] : ".";
     test_select();
     test_head_and_scope(dir);
     test_ctx(dir);
+    test_cert(dir);
     std::remove((dir + "/d1-test-f16.gguf").c_str());
     std::remove((dir + "/d1-test-q8.gguf").c_str());
     if (g_fail) {

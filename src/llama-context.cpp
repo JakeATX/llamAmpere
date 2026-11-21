@@ -872,12 +872,41 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             case LLAMA_D1_SCOPE_ERROR: throw std::runtime_error("d1: " + d1_msg);
             case LLAMA_D1_SCOPE_ON:
                 {
-                    const int n_top = (int) std::max(0L, env_int("LLAMA_D1_N", 256));
+                    // [EXACTHEAD] the 8 GB AIF25 head needs only the top 64 (study: sampled TV 0 at R=64)
+                    const bool aif25 = din.out_type == (int) GGML_TYPE_AIF25_U2;
+                    const int n_top = (int) std::max(0L, env_int("LLAMA_D1_N", aif25 ? 64 : 256));
                     const int eager = (int) std::max(0L, env_int("LLAMA_D1_EAGER_MAX", std::max<long>(64, 8L * cparams.n_seq_max)));
                     const int n_thr = (int) std::max(1L, env_int("LLAMA_D1_THREADS", std::min<long>(cparams.n_threads, 8)));
-                    d1 = std::make_unique<llama_d1_ctx>(d1_head, n_top, eager, n_thr);
-                    LLAMA_LOG_INFO("d1: AIT2 head + exact rescore of top N=%d from %s (rows %s, eager_max %d, threads %d)\n",
-                            n_top, d1_head->path.c_str(), d1_head->type == GGML_TYPE_F16 ? "f16" : "q8_0", eager, n_thr);
+                    // [EXACTHEAD] LLAMA_D1_CERT=1: the sigma certificate (default off; needs output_exact.gl2 in the sidecar)
+                    llama_d1_cert cert;
+                    cert.on = env_int("LLAMA_D1_CERT", 0) != 0;
+                    if (cert.on) {
+                        if (!d1_head->gl2) {
+                            throw std::runtime_error("d1: LLAMA_D1_CERT=1 but the sidecar " + d1_head->path +
+                                    " has no output_exact.gl2 (remake it with d1_make_sidecar.py --stats)");
+                        }
+                        const auto env_float = [](const char * name, float def) {
+                            const char * v = getenv(name);
+                            return v && v[0] ? strtof(v, nullptr) : def;
+                        };
+                        cert.k      = (int) std::max(1L, env_int("LLAMA_D1_CERT_K", 20));
+                        cert.sigma  = std::max(0.0f, env_float("LLAMA_D1_CERT_SIGMA", 6.0f));
+                        cert.margin = std::max(0.0f, env_float("LLAMA_D1_CERT_MARGIN", 0.1f));
+                    }
+                    d1 = std::make_unique<llama_d1_ctx>(d1_head, n_top, eager, n_thr, cert);
+                    LLAMA_LOG_INFO("d1: %s head + exact rescore of top N=%d from %s (rows %s, eager_max %d, threads %d)\n",
+                            ggml_type_name(model.output->type), n_top, d1_head->path.c_str(),
+                            ggml_type_name(d1_head->type), eager, n_thr);
+                    if (cert.on) {
+                        LLAMA_LOG_INFO("d1: certificate on: k=%d sigma=%.2f margin=%.3f (head max group error %.4g)\n",
+                                cert.k, cert.sigma, cert.margin, d1_head->gl2_max);
+                    }
+                    const char * gv = getenv("LLAMA_MTP_GPU_VERIFY");
+                    const char * tv = getenv("LLAMA_MTP_TOPK_VERIFY");
+                    if ((gv && gv[0] && strcmp(gv, "0") != 0) || (tv && tv[0] && atoi(tv) != 0)) {
+                        LLAMA_LOG_WARN("d1: LLAMA_MTP_GPU_VERIFY / LLAMA_MTP_TOPK_VERIFY are set, but they would verify on the "
+                                "coarse card head: refused, verification stays on the CPU with the exact rows\n");
+                    }
                 } break;
         }
     }
@@ -5586,7 +5615,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         // [D1] backend sampling (-bs, GPU greedy/sampled verify, top-K verify) would sample coarse logits on the card
         static bool warned = false;
         if (!warned) {
-            LLAMA_LOG_WARN("d1: backend sampling refused, using CPU sampling\n");
+            LLAMA_LOG_WARN("d1: backend sampling refused (-bs, LLAMA_MTP_GPU_VERIFY, LLAMA_MTP_TOPK_VERIFY would sample the "
+                    "coarse card head), using CPU sampling\n");
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {

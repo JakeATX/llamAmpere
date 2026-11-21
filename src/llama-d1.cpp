@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <functional>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -120,6 +122,36 @@ float llama_d1_head::dot(const float * h, int64_t id) const {
         }
         return sum;
     }
+    if (type == GGML_TYPE_BF16) {
+        // [EXACTHEAD] bf16 -> f32 is a 16-bit shift, so the products are exact in f32 before accumulation
+        const uint16_t * w = (const uint16_t *) row;
+        int64_t k = 0;
+        float sum = 0.0f;
+#ifdef LLAMA_D1_AVX2
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        const auto ld = [&](int64_t o) {
+            return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *) (w + o))), 16));
+        };
+        for (; k + 32 <= n; k += 32) {
+            a0 = _mm256_fmadd_ps(ld(k +  0), _mm256_loadu_ps(h + k +  0), a0);
+            a1 = _mm256_fmadd_ps(ld(k +  8), _mm256_loadu_ps(h + k +  8), a1);
+            a2 = _mm256_fmadd_ps(ld(k + 16), _mm256_loadu_ps(h + k + 16), a2);
+            a3 = _mm256_fmadd_ps(ld(k + 24), _mm256_loadu_ps(h + k + 24), a3);
+        }
+        const __m256 s = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        __m128 r = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+        r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+        r = _mm_add_ss(r, _mm_movehdup_ps(r));
+        sum = _mm_cvtss_f32(r);
+#endif
+        for (; k < n; ++k) {
+            uint32_t u = (uint32_t) w[k] << 16;
+            float f;
+            std::memcpy(&f, &u, sizeof(f));
+            sum += f * h[k];
+        }
+        return sum;
+    }
     // Q8_0: blocks of { fp16 d; int8 qs[32] }
     constexpr int QK = 32;
     constexpr size_t BS = sizeof(ggml_fp16_t) + QK;
@@ -223,8 +255,8 @@ std::shared_ptr<llama_d1_head> llama_d1_head_open(const char * path, const llama
                      t->ne[0], t->ne[1], n_embd, n_vocab);
         return nullptr;
     }
-    if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0) {
-        err = format("sidecar rows type %s is not f16 or q8_0", ggml_type_name(t->type));
+    if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_Q8_0) {
+        err = format("sidecar rows type %s is not f16, bf16 or q8_0", ggml_type_name(t->type));
         return nullptr;
     }
     if (t->type == GGML_TYPE_Q8_0 && n_embd % 32 != 0) {
@@ -232,7 +264,8 @@ std::shared_ptr<llama_d1_head> llama_d1_head_open(const char * path, const llama
         return nullptr;
     }
     std::string rows_type;
-    if (!d1_kv_str(g, "d1.rows_type", rows_type) || rows_type != (t->type == GGML_TYPE_F16 ? "f16" : "q8_0")) {
+    const char * want_rows_type = t->type == GGML_TYPE_F16 ? "f16" : t->type == GGML_TYPE_BF16 ? "bf16" : "q8_0";
+    if (!d1_kv_str(g, "d1.rows_type", rows_type) || rows_type != want_rows_type) {
         err = format("sidecar KV d1.rows_type '%s' does not match tensor type %s", rows_type.c_str(), ggml_type_name(t->type));
         return nullptr;
     }
@@ -264,6 +297,24 @@ std::shared_ptr<llama_d1_head> llama_d1_head_open(const char * path, const llama
     if (nbytes != (size_t) n_vocab * head->row_bytes || nbytes != self_bytes) {
         err = format("sidecar tensor bytes %zu != d1.self_bytes %" PRIu64, nbytes, self_bytes);
         return nullptr;
+    }
+
+    // [EXACTHEAD] optional certificate stats
+    const int64_t gid = gguf_find_tensor(g, "output_exact.gl2");
+    size_t gl2_offs = 0;
+    uint64_t gl2_fnv = 0;
+    if (gid >= 0) {
+        ggml_tensor * tg = meta ? ggml_get_tensor(meta, "output_exact.gl2") : nullptr;
+        if (!tg || tg->type != GGML_TYPE_F32 || ggml_n_dims(tg) != 2 || n_embd % 32 != 0 ||
+            tg->ne[0] != n_embd / 32 || tg->ne[1] != n_vocab) {
+            err = "sidecar output_exact.gl2 is not F32 [n_embd/32, n_vocab]";
+            return nullptr;
+        }
+        if (!d1_kv_u64(g, "d1.gl2_fnv64", gl2_fnv)) {
+            err = "sidecar has output_exact.gl2 but no d1.gl2_fnv64";
+            return nullptr;
+        }
+        gl2_offs = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, gid);
     }
 
 #ifdef _WIN32
@@ -302,6 +353,37 @@ std::shared_ptr<llama_d1_head> llama_d1_head_open(const char * path, const llama
     }
     head->src_fnv = src_fnv;
 
+    if (gid >= 0) {
+        const int64_t G = n_embd / 32;
+        const size_t gbytes = (size_t) G * n_vocab * sizeof(float);
+        if (gl2_offs + gbytes > head->map_size) {
+            err = "sidecar output_exact.gl2 data is outside the file";
+            return nullptr;
+        }
+        head->gl2     = (const float *) ((const uint8_t *) head->map_base + gl2_offs);
+        head->n_group = G;
+        if (llama_d1_fnv64_ends((const uint8_t *) head->gl2, gbytes) != gl2_fnv) {
+            err = "sidecar output_exact.gl2 fingerprint mismatch";
+            return nullptr;
+        }
+        head->gl2_rowmax.resize(n_vocab);
+        float gmax = 0.0f;
+        for (int64_t i = 0; i < n_vocab; ++i) {
+            const float * e = head->gl2 + i * G;
+            float m = 0.0f;
+            for (int64_t gg = 0; gg < G; ++gg) {
+                if (!(e[gg] >= 0.0f) || !std::isfinite(e[gg])) {
+                    err = format("sidecar output_exact.gl2 row %" PRId64 " has a negative or non-finite value", i);
+                    return nullptr;
+                }
+                m = std::max(m, e[gg]);
+            }
+            head->gl2_rowmax[i] = m;
+            gmax = std::max(gmax, m);
+        }
+        head->gl2_max = gmax;
+    }
+
 #ifndef _WIN32
     // rows are read at random token ids: no read-around; optional async read-ahead of the whole tensor (default on)
     madvise((void *) ((uintptr_t) head->rows & ~(uintptr_t) 4095), nbytes + ((uintptr_t) head->rows & 4095), MADV_RANDOM);
@@ -311,8 +393,9 @@ std::shared_ptr<llama_d1_head> llama_d1_head_open(const char * path, const llama
     }
 #endif
 
-    LLAMA_LOG_INFO("d1: fingerprint ok src=%016" PRIx64 " self=%016" PRIx64 " rows=%s (%.2f MiB, %s)\n",
-                   src_fnv, head->self_fnv, rows_type.c_str(), nbytes / 1048576.0, path);
+    LLAMA_LOG_INFO("d1: fingerprint ok src=%016" PRIx64 " self=%016" PRIx64 " rows=%s (%.2f MiB, %s)%s\n",
+                   src_fnv, head->self_fnv, rows_type.c_str(), nbytes / 1048576.0, path,
+                   head->gl2 ? format("; certificate stats ok (max group error %.4g)", head->gl2_max).c_str() : "");
     return head;
 }
 
@@ -327,9 +410,10 @@ llama_d1_scope_result llama_d1_scope(const llama_d1_scope_in & in, llama_d1_mode
     if (in.mtp_chain)    { msg = "mtp_chain context";                   return LLAMA_D1_SCOPE_OFF; }
     if (in.no_alloc)     { msg = "no_alloc model (memory-fit probe)";   return LLAMA_D1_SCOPE_OFF; }
 
-    const bool is128 = in.out_type == (int) GGML_TYPE_AIT2_U2_512;
-    if (!is128 || in.out_ne0 != in.n_embd || in.out_ne1 != in.n_vocab) {
-        msg = format("head type %s [%" PRId64 ", %" PRId64 "], not AIT2_U2_512 [%" PRId64 ", %" PRId64 "]",
+    // coarse card heads: the AIT2 overlay (type 128), or [EXACTHEAD] the 8 GB file's own AIF25_U2 head (type 125)
+    const bool coarse = in.out_type == (int) GGML_TYPE_AIT2_U2_512 || in.out_type == (int) GGML_TYPE_AIF25_U2;
+    if (!coarse || in.out_ne0 != in.n_embd || in.out_ne1 != in.n_vocab) {
+        msg = format("head type %s [%" PRId64 ", %" PRId64 "], not AIT2_U2_512 or AIF25_U2 [%" PRId64 ", %" PRId64 "]",
                      in.out_type >= 0 ? ggml_type_name((ggml_type) in.out_type) : "none",
                      in.out_ne0, in.out_ne1, in.n_embd, in.n_vocab);
         // the model this sidecar was made from, still on its own base head: the type-128 overlay did not load
@@ -416,8 +500,10 @@ void llama_d1_select_top(const float * row, int64_t n_vocab, int n, std::vector<
 
 // ---- per-context state --------------------------------------------------------------------------------------------
 
-llama_d1_ctx::llama_d1_ctx(std::shared_ptr<llama_d1_head> head_, int n_top_, int eager_max_, int n_threads)
-    : head(std::move(head_)), n_top(n_top_), eager_max(eager_max_) {
+llama_d1_ctx::llama_d1_ctx(std::shared_ptr<llama_d1_head> head_, int n_top_, int eager_max_, int n_threads,
+                           const llama_d1_cert & cert_)
+    : head(std::move(head_)), n_top(n_top_), eager_max(eager_max_), cert(cert_) {
+    GGML_ASSERT(!cert.on || head->gl2 != nullptr);
     for (int t = 1; t < n_threads; ++t) {
         pool.threads.emplace_back(&llama_d1_ctx::worker, this, t);
     }
@@ -435,20 +521,31 @@ llama_d1_ctx::~llama_d1_ctx() {
 }
 
 std::string llama_d1_ctx::summary_delta() {
-    const uint64_t v[11] = { n_calls.load(), n_rescored.load(), ns_rescore.load(), ns_select.load(), ns_dot.load(), ns_wait.load(),
-                             n_minflt.load(), n_majflt.load(), n_read_coarse.load(), n_nvcsw.load(), n_nivcsw.load() };
-    uint64_t d[11];
-    for (int i = 0; i < 11; ++i) { d[i] = v[i] - last[i]; last[i] = v[i]; }
-    return format("calls=%" PRIu64 " rows=%" PRIu64 " rescore_ms=%.3f select_ms=%.3f dot_ms=%.3f wait_ms=%.3f minflt=%" PRIu64
+    const uint64_t v[14] = { n_calls.load(), n_rescored.load(), ns_rescore.load(), ns_select.load(), ns_dot.load(), ns_wait.load(),
+                             n_minflt.load(), n_majflt.load(), n_read_coarse.load(), n_nvcsw.load(), n_nivcsw.load(),
+                             n_cert_rows.load(), n_cert_sigma.load(), n_cert_forced.load() };
+    uint64_t d[14];
+    for (int i = 0; i < 14; ++i) { d[i] = v[i] - last[i]; last[i] = v[i]; }
+    std::string out = format("calls=%" PRIu64 " rows=%" PRIu64 " rescore_ms=%.3f select_ms=%.3f dot_ms=%.3f wait_ms=%.3f minflt=%" PRIu64
                   " majflt=%" PRIu64 " coarse=%" PRIu64 " nvcsw=%" PRIu64 " nivcsw=%" PRIu64,
                   d[0], d[1], d[2] / 1e6, d[3] / 1e6, d[4] / 1e6, d[5] / 1e6, d[6], d[7], d[8], d[9], d[10]);
+    if (cert.on) {
+        out += format(" cert_rows=%" PRIu64 " cert_sigma=%" PRIu64 " cert_forced=%" PRIu64 " cert_maxrow=%" PRIu64,
+                      d[11], d[12], d[13], n_cert_maxrow.load());
+    }
+    return out;
 }
 
 std::string llama_d1_ctx::summary() const {
-    return format("d1: rows_rescored=%" PRIu64 " rows_read_distinct=%" PRIu64 " rows_read_coarse=%" PRIu64
+    std::string out = format("d1: rows_rescored=%" PRIu64 " rows_read_distinct=%" PRIu64 " rows_read_coarse=%" PRIu64
                   " rescore_ms=%.3f select_ms=%.3f h_mismatch=%" PRIu64,
                   n_rescored.load(), n_read_distinct.load(), n_read_coarse.load(),
                   ns_rescore.load() / 1e6, ns_select.load() / 1e6, n_h_mismatch);
+    if (cert.on) {
+        out += format(" cert_rows=%" PRIu64 " cert_sigma=%" PRIu64 " cert_forced=%" PRIu64 " cert_maxrow=%" PRIu64,
+                      n_cert_rows.load(), n_cert_sigma.load(), n_cert_forced.load(), n_cert_maxrow.load());
+    }
+    return out;
 }
 
 void llama_d1_ctx::reset(int64_t n_rows_max) {
@@ -493,8 +590,77 @@ void llama_d1_ctx::rescore_one(float * logits, int64_t n_vocab, int64_t r, std::
     for (const int32_t id : ids) {
         row[id] = head->dot(hr, id);
     }
+    if (cert.on && !ids.empty()) {
+        certify(row, n_vocab, hr, ids);
+    }
     ns_select += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     ns_dot    += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count();
+}
+
+// [EXACTHEAD] ids are exact in row; rescore every other row whose bound reaches the k-th exact logit (see llama_d1_cert)
+void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids) {
+    const int64_t G = head->n_group;
+    thread_local std::vector<float>   top;
+    thread_local std::vector<float>   hg;    // ||h_g||^2 / 32
+    thread_local std::vector<uint8_t> cand;  // [n_vocab] 1 = exact already
+    top.resize(ids.size());
+    for (size_t j = 0; j < ids.size(); ++j) { top[j] = row[ids[j]]; }
+    const size_t k = (size_t) std::max(1, std::min<int>(cert.k, (int) ids.size()));
+    std::nth_element(top.begin(), top.begin() + (k - 1), top.end(), std::greater<float>());
+    const float T = top[k - 1];
+
+    hg.resize(G);
+    double hn2 = 0.0;
+    for (int64_t gg = 0; gg < G; ++gg) {
+        float s2 = 0.0f;
+        for (int q = 0; q < 32; ++q) { s2 += hr[gg * 32 + q] * hr[gg * 32 + q]; }
+        hg[gg] = s2 / 32.0f;
+        hn2 += hg[gg];
+    }
+    const float hn = (float) std::sqrt(hn2);  // s_i <= gl2_rowmax[i] * hn
+    // a row below pre cannot pass even with the largest group error of the whole head
+    const float pre = T - cert.margin - cert.sigma * head->gl2_max * hn;
+
+    if (cand.size() < (size_t) n_vocab) { cand.assign(n_vocab, 0); }
+    for (const int32_t id : ids) { cand[id] = 1; }
+
+    uint64_t n_sigma = 0, n_forced = 0;
+    const auto check = [&](int64_t i) {
+        if (cand[i]) { return; }
+        const float c = row[i] + cert.margin;
+        if (c + cert.sigma * head->gl2_rowmax[i] * hn < T) { return; }
+        const float * e = head->gl2 + i * G;
+        float s2 = 0.0f;
+        for (int64_t gg = 0; gg < G; ++gg) { s2 += hg[gg] * e[gg] * e[gg]; }
+        ++n_sigma;
+        if (c + cert.sigma * std::sqrt(s2) >= T) {
+            row[i] = head->dot(hr, i);
+            ++n_forced;
+        }
+    };
+    int64_t i = 0;
+#ifdef LLAMA_D1_AVX2
+    const __m256 pv = _mm256_set1_ps(pre);
+    for (; i + 8 <= n_vocab; i += 8) {
+        // NaN coarse logits are never selected by the sampler's top-k either
+        int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(row + i), pv, _CMP_GE_OQ));
+        while (m) {
+            const int b = __builtin_ctz(m);
+            m &= m - 1;
+            check(i + b);
+        }
+    }
+#endif
+    for (; i < n_vocab; ++i) {
+        if (row[i] >= pre) { check(i); }
+    }
+    for (const int32_t id : ids) { cand[id] = 0; }
+
+    ++n_cert_rows;
+    n_cert_sigma  += n_sigma;
+    n_cert_forced += n_forced;
+    uint64_t prev = n_cert_maxrow.load();
+    while (n_forced > prev && !n_cert_maxrow.compare_exchange_weak(prev, n_forced)) {}
 }
 
 void llama_d1_ctx::run_job() {
