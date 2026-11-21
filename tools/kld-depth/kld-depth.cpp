@@ -31,6 +31,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "kld-topk.h"
 
 #include <algorithm>
 #include <cmath>
@@ -75,6 +76,9 @@ struct pos_result {
     float   nll;        // -log p_q(tok)
     float   nll_base;
     int     same_top;
+    double  kl10 = NAN; // full mode only (kld-topk.h)
+    double  ear10 = NAN;
+    double  ear = NAN;
 };
 
 static int integer_env(const char * name, int fallback, int minimum = 1) {
@@ -160,14 +164,25 @@ static pos_result score_record(const float * logits, int n_vocab, const sparse_r
         const float lp_q    = logits[rec.ids[k]] - shift;
         kld += expf(lp_base) * (double) (lp_base - lp_q);
     }
+    double ear = NAN, kl10 = NAN, ear10 = NAN;
     if (full) {
         const double shift_full = (double) max_logit + lse;
+        kld_topk::top_k top;
+        ear = 0.0;
         for (int i = 0; i < n_vocab; ++i) {
             const double lp = rec.full_logp[i];
-            kld += exp(lp) * (lp - ((double) logits[i] - shift_full));
+            const double lq = (double) logits[i] - shift_full;
+            kld += exp(lp) * (lp - lq);
+            ear += exp(lp < lq ? lp : lq);
+            top.push(i, (float) lp);
         }
+        float tq[kld_topk::K];
+        for (int k = 0; k < top.n; ++k) tq[k] = (float) ((double) logits[top.id[k]] - shift_full);
+        const kld_topk::result t = kld_topk::over(top.lp, tq, top.n);
+        kl10 = t.kl; ear10 = t.ear;
     }
     pos_result r;
+    r.kl10 = kl10; r.ear10 = ear10; r.ear = ear;
     r.pos      = rec.pos;
     r.tok      = rec.tok;
     r.kld      = (float) kld;
@@ -488,9 +503,9 @@ int main(int argc, char ** argv) {
         if (env_out && *env_out) {
             std::ofstream csv(env_out);
             csv << std::setprecision(9);
-            csv << "pos,tok,kld,p_diff,nll_q,nll_base,same_top\n";
+            csv << "pos,tok,kld,p_diff,nll_q,nll_base,same_top,kl10,ear10,ear\n";
             for (const auto & r : results) {
-                csv << r.pos << "," << r.tok << "," << r.kld << "," << r.p_diff << "," << r.nll << "," << r.nll_base << "," << r.same_top << "\n";
+                csv << r.pos << "," << r.tok << "," << r.kld << "," << r.p_diff << "," << r.nll << "," << r.nll_base << "," << r.same_top << "," << r.kl10 << "," << r.ear10 << "," << r.ear << "\n";
             }
             csv.close();
             if (!csv) { LOG_ERR("CSV write failed\n"); return 1; }
