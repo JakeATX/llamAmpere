@@ -543,7 +543,7 @@ static void test(void) {
             common_params medium_env;
             assert(parse_card({"12dense", headless ? "headless" : "headed"}, medium_env));
             common_card_preset_apply_env(medium_env);
-            assert((std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) == headless);
+            assert(std::getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr);
             assert(std::string(std::getenv("GGML_CUDA_GRAPH_MAX_ROWS")) == "16");
             for (const auto & key : env_keys) {
                 unsetenv(key.c_str());
@@ -615,7 +615,7 @@ static void test(void) {
         assert(std::string(std::getenv("LLAMA_LSA_MAP")) == (tiny_dir / "lsa-qwen38-27b-d2048.gguf").string());
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "1");
         assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "7");
-        assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "1");
+        assert(!std::getenv("GGML_CUDA_DISABLE_GRAPHS"));
         assert(std::string(std::getenv("GGML_ALLOC_GROW_PCT")) == "1");
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());

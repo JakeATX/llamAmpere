@@ -101,7 +101,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"LLAMA_LSA_REFINE_SH", "1"},
                 {"LLAMA_LSA_REFINE_MULT", "2"}, {"LLAMA_LSA_RING_ROWS", "512"},
                 {"LLAMA_LSA_MEAN_CHUNKS", "1"}, {"LLAMA_RESERVE_VERIFY_ROWS", "7"},
-                {"GGML_CUDA_DISABLE_GRAPHS", "1"}, {"GGML_ALLOC_GROW_PCT", "1"},
+                {"GGML_ALLOC_GROW_PCT", "1"},
                 {"LLAMA_LSA_FUSED_SEL", "1"}, {"LLAMA_LSA_COMP", "2"},
                 {"LLAMA_LSA_COMP_LB", "1"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
                 {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "128"},
@@ -166,7 +166,8 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
             if (string_ends_with(card.name, "ink")) {
                 continue; // fork (INKSMALL2): Inkling profiles keep their own version and the model's sampling defaults
             }
-            card.version = card.name == "8dense" ? "2026-11-20.2" : "2026-11-17.6";
+            // 8dense and 12dense: CUDA graphs back on (HOSTGAP08 gates, V07/HOSTGAP08/RESULT.md)
+            card.version = card.name == "8dense" || card.name == "12dense" ? "2026-11-21.1" : "2026-11-17.6";
             card.options.insert(card.options.end(), {
                 {"--temp", "1.0"}, {"--top-k", "20"}, {"--top-p", "0.95"}, {"--min-p", "0"}
             });
@@ -181,7 +182,6 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 card.options.front().second = "180224";
             } else if (card.name == "12dense") {
                 card.options.front().second = "196608";
-                card.env.emplace_back("GGML_CUDA_DISABLE_GRAPHS", "1");
             }
         }
         return cards;
