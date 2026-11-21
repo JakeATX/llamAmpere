@@ -2154,18 +2154,13 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
     };
     auto * context  = column(f_rnn, 0);
-    auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
-    tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
     for (int64_t i = 1; i < block; ++i) {
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
         states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
         logits = ggml_concat(ctx0, logits, col, 1);
-        // select the first maximum, independent of the backend argmax tie order
-        auto * valid   = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
-        auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
-        auto * is_max  = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
-        prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
+        // first maximum of the slot (the CUDA and CPU argmax both keep the lowest index on ties, like the host argmax)
+        prev = ggml_argmax(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0)));
     }
     const auto block_order = [&](ggml_tensor * t) {
         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, block);
