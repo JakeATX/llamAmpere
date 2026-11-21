@@ -136,6 +136,124 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
         (partial[0][n][r] + partial[1][n][r]) + (partial[2][n][r] + partial[3][n][r]);
 }
 
+// [WREAD08] Decode widths (N <= 8 rows per 8-token block) at small M. mmv gives each 16-row strip four warps, one per sum
+// chain k (units u = k, k + 4, k + 8, ...), each decoding one unit at a time; where M is small (ffn_down and ssm_out,
+// M = 5120: 320 strips = 15 warps per SM on a 3090) too few warps are in flight and the 27B decode reads weights at
+// 250-340 GB/s. mmvx runs G groups of four warps per strip. A step covers 4 G consecutive units; group g decodes unit
+// 4 (G s + g) + k and hands its exact int32 IMMA sums and fp16 row scales to the group-0 warp of chain k through shared
+// memory (double-buffered, one barrier per step); that warp adds every term in unit order with the mmv expression
+// (sum += c * d * s). Same terms, same order, same final (p0 + p1) + (p2 + p3): y is bit-identical to mmv.
+// Needs nu % (4 G) == 0 (host-checked). grid (M / 16, ceil(N / 8)), 128 G threads.
+template<int B, int V, uint32_t C, int XSH, bool ROW_SCALE, int SCALE_CHUNKS, int G>
+static __global__ void __launch_bounds__(128 * G) mmvx(const uint8_t * weights, const int8_t * x,
+        const float * xs, float * y, int M, int K, int N) {
+    static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
+    static_assert(!ROW_SCALE || (B == 5 && V == 2 && (SCALE_CHUNKS == 5 || SCALE_CHUNKS == 4)) ||
+        (B == 7 && V == 4 && SCALE_CHUNKS == 4), "row-scale pair layout");
+    static_assert(G >= 2 && G <= 4, "two to four groups");
+    constexpr int UW = unit_bytes<B, V> / 4, TW = tile_words<B, V>, LW = (UW + 31) / 32, STEP = 4 * G;
+    __shared__ uint32_t tiles[4 * G][UW];
+    __shared__ int4 xc[2][G - 1][4][32];
+    __shared__ float2 xd[2][G - 1][4][32];
+    __shared__ float partial[4][8][16];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, k = wid & 3, g = wid >> 2;
+    const int row = lane >> 2, col = lane & 3, nu = K / 128;
+    const int64_t nbase = int64_t(blockIdx.y) * 8;
+    float sum[4] = {0, 0, 0, 0};
+    uint32_t pre[LW];
+    auto fetch = [&](int uu) {
+#pragma unroll
+        for (int q = 0; q < LW; ++q) {
+            const int i = lane + 32 * q;
+            if (i < UW) {
+                if constexpr (ROW_SCALE) {
+                    constexpr int BW = 8 + SCALE_CHUNKS*(UW - 8);
+                    const uint32_t * block = reinterpret_cast<const uint32_t *>(weights) +
+                        (int64_t(blockIdx.x)*(nu/SCALE_CHUNKS) + uu/SCALE_CHUNKS)*BW;
+                    pre[q] = __ldg(i < 8 ? block + i : block + 8 + (uu%SCALE_CHUNKS)*(UW - 8) + i - 8);
+                } else {
+                    pre[q] = __ldg(reinterpret_cast<const uint32_t *>(weights) + (int64_t(blockIdx.x) * nu + uu) * UW + i);
+                }
+            }
+        }
+    };
+    auto add = [&](int uu, const int (&c)[4], float d0, float d1) {
+        const float s0 = nbase + 2 * col < N ? xs[(nbase + 2 * col) * (nu >> XSH) + (uu >> XSH)] : 0;
+        const float s1 = nbase + 2 * col + 1 < N ? xs[(nbase + 2 * col + 1) * (nu >> XSH) + (uu >> XSH)] : 0;
+        sum[0] += c[0] * d0 * s0; sum[1] += c[1] * d0 * s1;
+        sum[2] += c[2] * d1 * s0; sum[3] += c[3] * d1 * s1;
+    };
+    fetch(4 * g + k);
+    for (int base = 0; base < nu; base += STEP) {
+        const int u = base + 4 * g + k;
+#pragma unroll
+        for (int q = 0; q < LW; ++q) {
+            if (lane + 32 * q < UW) tiles[wid][lane + 32 * q] = pre[q];
+        }
+        __syncwarp();
+        if (u + STEP < nu) fetch(u + STEP);
+        int c[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t * a0 = tiles[wid] + 8 + (4 * j + (col >> 1)) * TW;
+            const uint32_t * a1 = a0 + 2 * TW;
+            const uint32_t a[4] = {fragment<B,V,C>(a0, row, col & 1), fragment<B,V,C>(a0, row + 8, col & 1),
+                fragment<B,V,C>(a1, row, col & 1), fragment<B,V,C>(a1, row + 8, col & 1)};
+            uint32_t b0 = 0, b1 = 0;
+            if (nbase + row < N) {
+                const int8_t * p = x + (nbase + row) * K + int64_t(u) * 128 + j * 32 + col * 4;
+                b0 = __ldg(reinterpret_cast<const uint32_t *>(p));
+                b1 = __ldg(reinterpret_cast<const uint32_t *>(p + 16));
+            }
+            mma(c, a, b0, b1);
+        }
+        const __half * scales = reinterpret_cast<const __half *>(tiles[wid]);
+        const float d0 = __half2float(scales[row]), d1 = __half2float(scales[row + 8]);
+        const int buf = (base / STEP) & 1;
+        if (g > 0) {
+            xc[buf][g - 1][k][lane] = make_int4(c[0], c[1], c[2], c[3]);
+            xd[buf][g - 1][k][lane] = make_float2(d0, d1);
+        }
+        __syncthreads();
+        if (g == 0) {
+            add(u, c, d0, d1);
+#pragma unroll
+            for (int gg = 1; gg < G; ++gg) {
+                const int4 v = xc[buf][gg - 1][k][lane];
+                const float2 dd = xd[buf][gg - 1][k][lane];
+                const int cc[4] = {v.x, v.y, v.z, v.w};
+                add(base + 4 * gg + k, cc, dd.x, dd.y);
+            }
+        }
+        __syncwarp();
+    }
+    if (g == 0) {
+        partial[k][2 * col][row] = sum[0]; partial[k][2 * col + 1][row] = sum[1];
+        partial[k][2 * col][row + 8] = sum[2]; partial[k][2 * col + 1][row + 8] = sum[3];
+    }
+    __syncthreads();
+    if (threadIdx.x < 128) {
+        const int n = threadIdx.x / 16, r = threadIdx.x % 16;
+        const int64_t mbase = int64_t(blockIdx.x) * 16;
+        if (nbase + n < N) y[(nbase + n) * M + mbase + r] =
+            (partial[0][n][r] + partial[1][n][r]) + (partial[2][n][r] + partial[3][n][r]);
+    }
+}
+
+// [WREAD08] mmvx launcher: G groups (2..4); false if the shape does not qualify (caller runs mmv).
+template<int B, int V, uint32_t C, int XSH, bool ROW_SCALE, int SCALE_CHUNKS>
+static bool mmvx_launch(int G, const uint8_t * w, const int8_t * x, const float * xs, float * y, int M, int K, int N,
+                        cudaStream_t stream) {
+    if ((K / 128) % (4 * G) != 0) return false;
+    const dim3 grid(M / 16, (N + 7) / 8);
+    switch (G) {
+        case 2: mmvx<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS,2><<<grid, 256, 0, stream>>>(w, x, xs, y, M, K, N); return true;
+        case 3: mmvx<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS,3><<<grid, 384, 0, stream>>>(w, x, xs, y, M, K, N); return true;
+        case 4: mmvx<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS,4><<<grid, 512, 0, stream>>>(w, x, xs, y, M, K, N); return true;
+        default: return false;
+    }
+}
+
 // [PP27] Prompt widths. mmv decodes a 16-row weight unit once per 8 tokens, so a 1,024-token prompt batch decodes the
 // whole matrix 128 times. mmq is the same unit loop with each block covering S strips of 16 rows and TN = 8 NB tokens:
 // a warp decodes its unit once and runs it against NB 8-token blocks. Every (row, token) output takes exactly the mmv
