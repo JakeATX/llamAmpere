@@ -1618,6 +1618,28 @@ static void ggml_backend_meta_buffer_exl3_op(ggml_backend_buffer_t buffer, const
 // `slab` nominal rows: slab*nb[1] bytes, a block column of it slab*nb[0] bytes). Axis-1 slices must hold whole slabs
 // (the split granularity in llama-model.cpp guarantees it). GGML_META_AI_SLAB=0 restores the nominal-row copy (wrong
 // for these types; kept only to reproduce the old behaviour).
+// An AITk row slice starts at a multiple of 1024 rows (32 row tiles) and its kernels read the column scales from its own
+// first 32 row tiles. That is only right if every group of 32 row tiles carries the same column scales, which the AI+
+// encoder writes (P76 AI4: all 206 AIT tensors). Check it on the host data before the slice is uploaded.
+static void ggml_backend_meta_ait_check_col_scales(const ggml_tensor * tensor, const uint8_t * data, size_t offset, size_t size) {
+    if (offset != 0 || size != ggml_nbytes(tensor) || tensor->ne[1] < 2048) {
+        return; // partial writes are not produced by the loader for split weights; one group has nothing to compare
+    }
+    const int     k  = ggml_ait_rate(tensor->type);
+    const int64_t S  = tensor->ne[0] / 512, G = tensor->ne[1] / 32;
+    const size_t  cb = 32 * (64 * (size_t) k + 2), cs_off = 2048 * (size_t) k + 32;
+    for (int64_t rt = 32; rt < G; rt++) {
+        for (int64_t ks = 0; ks < S; ks++) {
+            const uint8_t * a = data + (size_t) ((rt % 32) * S + ks) * cb + cs_off;
+            const uint8_t * b = data + (size_t) (rt * S + ks) * cb + cs_off;
+            if (memcmp(a, b, 32) != 0) {
+                GGML_ABORT("%s: AIT column scales differ between row-tile groups (row tile %lld, K slice %lld): "
+                    "this tensor cannot be tensor-split by rows", tensor->name, (long long) rt, (long long) ks);
+            }
+        }
+    }
+}
+
 static size_t ggml_backend_meta_slab_rows(const ggml_tensor * tensor) {
     static const bool on = [] { const char * e = getenv("GGML_META_AI_SLAB"); return !(e && e[0] == '0'); }();
     size_t slab = 1;
@@ -1747,6 +1769,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     const size_t slab = ggml_backend_meta_slab_rows(tensor);
+    if (ggml_ait_rate(tensor->type) != 0 && split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+        ggml_backend_meta_ait_check_col_scales(tensor, (const uint8_t *) data, offset, size);
+    }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (ggml_exl3_bits(tensor->type) != 0 &&
