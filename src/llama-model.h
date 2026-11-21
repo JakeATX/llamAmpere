@@ -1025,7 +1025,7 @@ struct llama_model {
     llama_ftype ftype() const;
 
     size_t size() const; // file size
-    size_t moe_arena_size() const;
+    LLAMA_API size_t moe_arena_size() const;
     // fork (FNFALLBACK): expert bytes the arena could not pin and left in file pages, with the usable RAM the pin
     // needed and had at load (all 0 when the experts are pinned or the model has no expert arena)
     size_t moe_unpinned_bytes = 0;
