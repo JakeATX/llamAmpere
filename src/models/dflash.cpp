@@ -215,6 +215,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ,  "bias"),   {3*rank}, 0);
         dspark_hidden_out   = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT,  "weight"), {rank, n_embd}, 0);
         dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT,  "bias"),   {n_embd}, 0);
+        // optional, offline: the target lm head folded through hidden_out (ink_dspark_fold.py)
+        dspark_head_fold    = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT,  "fold"),   {rank, hparams.n_vocab_padded}, TENSOR_NOT_REQUIRED);
+        dspark_head_fold_b  = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT,  "fold_bias"), {hparams.n_vocab_padded}, dspark_head_fold ? 0 : TENSOR_NOT_REQUIRED);
         for (int i = 0; i < n_layer; ++i) {
             auto & l = layers[i];
             const int64_t hd = hparams.n_embd_head_k(i);
@@ -2004,9 +2007,18 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     auto * candidate = ggml_tanh(ctx0, chunk(1));
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent     = ggml_tanh(ctx0, chunk(2));
-    auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    auto * bias = g.build_lora_mm(target.output, correction, target.output_s);
-    ggml_prec_set_acc(bias, GGML_PREC_F32);
+    // folded head (lm_head . hidden_out, precomputed): reads [rank, n_vocab] instead of the whole lm head per step
+    static const bool use_fold = [] { const char * e = getenv("LLAMA_DSPARK_HEAD_FOLD"); return !e || atoi(e) != 0; }();
+    ggml_tensor * bias = nullptr;
+    if (use_fold && model.dspark_head_fold) {
+        bias = g.build_lora_mm(model.dspark_head_fold, latent);
+        ggml_prec_set_acc(bias, GGML_PREC_F32);
+        bias = ggml_add(ctx0, bias, model.dspark_head_fold_b);
+    } else {
+        auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+        bias = g.build_lora_mm(target.output, correction, target.output_s);
+        ggml_prec_set_acc(bias, GGML_PREC_F32);
+    }
     if (bias->ne[0] != base->ne[0]) {
         bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
     }
@@ -2155,7 +2167,14 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     };
     auto * context  = column(f_rnn, 0);
     auto * prev = ids;
+    // the driver reads slots 1..n_max only (llama_set_dspark_walk); later slots carry the backbone logits, unused
+    const int64_t walk = cparams.dspark_walk > 0 ? std::min<int64_t>(block - 1, cparams.dspark_walk) : block - 1;
     for (int64_t i = 1; i < block; ++i) {
+        if (i > walk) {
+            states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
+            logits = ggml_concat(ctx0, logits, column(base, i), 1);
+            continue;
+        }
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
         states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
         logits = ggml_concat(ctx0, logits, col, 1);

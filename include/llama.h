@@ -1389,6 +1389,9 @@ extern "C" {
     // chain multiple trained NextN heads. Default 0 (first head).
     LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+    // Inkling2 DSpark draft context: run the markov head over block slots 1..n only (0 = the whole block)
+    LLAMA_API void llama_set_dspark_walk(struct llama_context * ctx, int32_t n);
+
     // Get all nextn embeddings, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 

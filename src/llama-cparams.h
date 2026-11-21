@@ -21,6 +21,7 @@ struct llama_cparams {
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+    int32_t  dspark_walk        = 0; // Inkling2 DSpark: markov head steps per block (0 = the whole block)
 
     enum llama_moe_cache_mode moe_cache_mode;
     size_t moe_cache_budget_mib;

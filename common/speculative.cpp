@@ -1420,6 +1420,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // Inkling2 DSpark: walk the markov head only over the slots read below (1..n_max); LLAMA_DSPARK_WALK_STOP=0 = whole block
+        if (has_rnn_context) {
+            static const bool walk_stop = [] { const char * e = getenv("LLAMA_DSPARK_WALK_STOP"); return !e || atoi(e) != 0; }();
+            llama_set_dspark_walk(ctx_dft, walk_stop ? params.n_max : 0);
+        }
+
         // decode all sequence's noise block in a single batch
         int ret = has_rnn_context ? llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_rnn.get())
                                   : llama_decode(ctx_dft, batch);

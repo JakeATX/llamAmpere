@@ -947,6 +947,8 @@ struct llama_model {
     struct ggml_tensor * dspark_norm         = nullptr;
     struct ggml_tensor * dspark_hidden_out   = nullptr;
     struct ggml_tensor * dspark_hidden_out_b = nullptr;
+    struct ggml_tensor * dspark_head_fold    = nullptr; // Inkling2: target lm head x hidden_out [rank, n_vocab], F16
+    struct ggml_tensor * dspark_head_fold_b  = nullptr; // Inkling2: target lm head x hidden_out bias [n_vocab]
 
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;

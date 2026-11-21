@@ -5097,6 +5097,10 @@ bool llama_mtp_pipe_stats(llama_context * draft, uint64_t * n_steps, uint64_t * 
     return draft->mtp_pipe_stats(n_steps, n_deferred, n_cancel);
 }
 
+void llama_context::set_dspark_walk(int32_t n) {
+    cparams.dspark_walk = n > 0 ? n : 0;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -11124,6 +11128,10 @@ bool llama_supports_embd_row(const llama_context * ctx) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_dspark_walk(llama_context * ctx, int32_t n) {
+    ctx->set_dspark_walk(n);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
