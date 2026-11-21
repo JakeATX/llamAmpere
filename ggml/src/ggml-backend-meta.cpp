@@ -341,6 +341,64 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
     return max_alloc_size;
 }
 
+// Size of what alloc_buffer_n would allocate on its LARGEST device: each device gets its own slice of every split tensor
+// (the default per-tensor get_alloc_size counts every tensor whole on every device, so a no-alloc dry run such as the
+// fit saw the whole model on each card). Mirrored / unsplit tensors count whole on every device. GGML_META_ALLOC_SIZE_N=0
+// restores the old whole-tensor estimate.
+static size_t ggml_backend_meta_buffer_type_get_alloc_size_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
+    static const bool on = [] { const char * e = getenv("GGML_META_ALLOC_SIZE_N"); return !(e && e[0] == '0'); }();
+    const size_t n_bufs = ggml_backend_meta_buft_n_bufts(buft);
+    if (!on || n_tensors <= 0) {
+        size_t total = 0;
+        for (int i = 0; i < n_tensors; i++) {
+            total += GGML_PAD(ggml_backend_meta_buffer_type_get_alloc_size(buft, tensors[i]), ggml_backend_meta_buffer_type_get_alignment(buft));
+        }
+        return total;
+    }
+    const ggml_backend_dev_t dev = buft->device;
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    const ggml_init_params params = {
+        /*.mem_size   =*/ (size_t) n_tensors * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    size_t max_size = 0;
+    for (size_t j = 0; j < n_bufs; j++) {
+        ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx);
+        std::vector<ggml_tensor *> slices;
+        slices.reserve(n_tensors);
+        for (int i = 0; i < n_tensors; i++) {
+            const ggml_tensor * t = tensors[i];
+            int64_t ne[GGML_MAX_DIMS];
+            for (int k = 0; k < GGML_MAX_DIMS; k++) {
+                ne[k] = t->ne[k];
+            }
+            if (t->view_src == nullptr && ggml_nelements(t) != 0) {
+                const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(t, dev_ctx->get_split_state_ud);
+                if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                    int64_t n = 0;
+                    for (size_t s = 0; s < ss.n_segments; s++) {
+                        n += ss.ne[s*n_bufs + j] * ss.nr[s];
+                    }
+                    ne[ss.axis] = n;
+                }
+            }
+            ggml_tensor * tj = ggml_new_tensor(ctx, t->type, GGML_MAX_DIMS, ne);
+            tj->op = t->op;
+            ggml_set_name(tj, t->name);
+            if (t->view_src == nullptr && ggml_nelements(tj) != 0) {
+                slices.push_back(tj);
+            }
+        }
+        const size_t size_j = slices.empty() ? 0 :
+            ggml_backend_buft_get_alloc_size_n(ggml_backend_meta_buft_simple_buft(buft, j), slices.data(), (int) slices.size());
+        max_size = std::max(max_size, size_j);
+        ggml_free(ctx);
+    }
+    return max_size;
+}
+
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
     for (size_t i = 0; i < n_simple_bufts; i++) {
@@ -358,7 +416,7 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
     /* .get_alignment       = */ ggml_backend_meta_buffer_type_get_alignment,
     /* .get_max_size        = */ ggml_backend_meta_buffer_type_get_max_size,
     /* .get_alloc_size      = */ ggml_backend_meta_buffer_type_get_alloc_size,
-    /* .get_alloc_size_n    = */ NULL,
+    /* .get_alloc_size_n    = */ ggml_backend_meta_buffer_type_get_alloc_size_n,
     /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
 };
 
