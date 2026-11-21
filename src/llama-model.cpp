@@ -958,11 +958,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             while (blck_size_perf < 128 && blck_size_perf*ud->n_devices < n_embd_q) {
                 blck_size_perf *= 2;
             }
-            if (const int64_t h = ai_attn_heads(il); h > 1) {
-                blck_size_perf = std::lcm(blck_size_perf, h*int64_t(n_embd_q));
+            const int64_t ai_h = ai_attn_heads(il);
+            if (ai_h > 1) {
+                blck_size_perf = std::lcm(blck_size_perf, ai_h*int64_t(n_embd_q));
             }
 
             const int64_t granularity_q    = std::lcm(n_embd_q, blck_size_perf);
+            // gated Q (Q and gate interleaved per head): twice the Q unit, so the gated Q keeps the same KV-head groups as
+            // K/V. With an AI+ head unit the old lcm(2*n_embd_q, blck_size_perf) can be half the K/V groups (h even).
+            const int64_t granularity_qg   = ai_h > 1 ? 2*granularity_q : std::lcm(2*int64_t(n_embd_q), blck_size_perf);
             const int64_t granularity_head = granularity_q / hparams.n_embd_head_k(il); // for tensors with one value per head
             if (std::regex_match(tensor_name, pattern_attn_gate_bias)) {
                 GGML_ASSERT(segments.size() == 1);
@@ -1000,7 +1004,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF || ud->model->arch == LLM_ARCH_CLOVER_MOE ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
-                    return {std::lcm(2*n_embd_q, blck_size_perf)};
+                    return {granularity_qg};
                 }
                 return {granularity_q};
             }
@@ -1034,7 +1038,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF || ud->model->arch == LLM_ARCH_CLOVER_MOE ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
-                    return {std::lcm(2*n_embd_q, blck_size_perf), granularity_kv};
+                    return {granularity_qg, granularity_kv};
                 }
                 if (segments.size() == 3) {
                     // uneven K/V head sizes: per-segment granularity, V aligned to whole V heads
@@ -1108,7 +1112,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // AI+ attention weights whose constraints leave fewer split units than devices (e.g. an AITk attn_k with 4 KV heads
     // x 256 = 1024 rows: a slice needs 1024 rows, so 4 heads per unit) run the attention of that layer replicated
     if (is_attention_tensor && !hparams.is_recr(tc.il) && hparams.n_head_kv(tc.il) > 0 &&
-            int64_t(hparams.n_head_kv(tc.il)) < ai_attn_heads(tc.il) * int64_t(ud->n_devices)) {
+            (int64_t(hparams.n_head_kv(tc.il)) < ai_attn_heads(tc.il) * int64_t(ud->n_devices) ||
+             int64_t(hparams.n_head_kv(tc.il)) % ai_attn_heads(tc.il) != 0)) {
         tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
     }
 
@@ -1152,12 +1157,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 g = std::lcm(g, g_ai);
             }
         }
+        const int64_t g_self_ai = ai_split_req(self_ref, split_state.axis);
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
             const int64_t  g_s  = granularity[is];
 
             GGML_ASSERT(g_s > 0);
+            if (g_self_ai > 1 && ne_s % g_s != 0) {
+                // a partial last unit would start the next segment's slices off an AI+ unit boundary
+                GGML_ABORT("cannot tensor-split %s: segment %zu (%lld) is not a multiple of its AI+ split unit %lld",
+                        tensor_name.c_str(), is, (long long) ne_s, (long long) g_s);
+            }
             const int64_t n_units = (ne_s + g_s - 1) / g_s;
             if (n_units < (int64_t) ud->n_devices) {
                 if (n_units == 1) {
