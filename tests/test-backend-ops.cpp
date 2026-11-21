@@ -19358,6 +19358,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     add_ai4_u2_512_cases(test_cases);
     add_ait4_u2_cases(test_cases);
+    // [TSPLIT] the per-device slices of P76 AI4 under -sm tensor on 2 cards: FFN 17408 -> 8192 / 9216 (gate/up rows,
+    // down K), GDN attn_gate 3072 rows, ssm_out K 3072, Q 6144 rows (AIT5_U)
+    for (ggml_type type : {GGML_TYPE_AIT3, GGML_TYPE_AIT4}) {
+        for (int n : {1, 4, 16}) {
+            for (int64_t ff : {8192, 9216}) {
+                test_cases.emplace_back(new test_mul_mat_ait(type, ff, n, 5120));
+                test_cases.emplace_back(new test_mul_mat_ait(type, 5120, n, ff));
+            }
+            test_cases.emplace_back(new test_mul_mat_ait(type, 3072, n, 5120));
+        }
+    }
+    for (int n : {1, 4, 16}) {
+        test_cases.emplace_back(new test_mul_mat_ai4(5120, n, 3072, GGML_TYPE_AIT5_U));
+        test_cases.emplace_back(new test_mul_mat_ai4(6144, n, 5120, GGML_TYPE_AIT5_U));
+    }
     // Public AI+ layouts: decode, GEMM, H128 tails, and routed expert reads.
     for (ggml_type type : {GGML_TYPE_AIT5_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT4_U}) {
         for (int64_t n : {1, 9, 512}) {
