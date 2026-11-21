@@ -1376,17 +1376,24 @@ static int ggml_cuda_fattn_sj_kvarn_stream_occupancy(const int NT, const int KW)
 
 static bool ggml_cuda_fattn_sj_nt6_logged = false; // GGML_SJKVARN_NT6_OCC log, one line per process
 
-// [SPLITATTN] split-KV launch heuristic for long contexts. The stream kernel already splits the body records of a KV head
-// over gridDim.y blocks and merges the parts with flash_attn_combine_results (log-sum-exp: max, rescale, sum). launch_fattn
-// sizes that split from occupancy only (one wave: nsm * CTAs/SM blocks), so at 100K+ positions each block walks a long
-// serial record range. Above LLAMA_FA_SPLITKV_MIN_KV positions the split is raised to LLAMA_FA_SPLITKV_WAVES waves of the
-// launched instance, keeping >= LLAMA_FA_SPLITKV_MIN_REC records per block. Only the KV split (and so the reduction order)
-// changes: rounding-level differences. LLAMA_FA_SPLITKV=0 (off/false/no) = the v0.7.2.1 split everywhere (kill switch).
-// LLAMA_FA_SPLITKV_PB=n forces n blocks per KV head above the threshold (diagnostic sweeps).
-// Above the threshold the compact tile's mode 1 no longer copies the rows kernel's split bit for bit (each launch raises
-// its split from its own occupancy); both stay rounding-level equal. LLAMA_FA_SPLITKV=0 restores the mode 1 contract.
-// Not applied to: GGML_SJKVARN_DIRECT_STABLE (fixed split by design) and the LSA live-record walk (the host does not know
-// the live record count, so the cap below would be wrong).
+// [SPLITATTN] long-context decode/verify attention (V08PLAN item A). Two parts, one kill switch (LLAMA_FA_SPLITKV=0 =
+// the v0.7.2.1 launch everywhere):
+// 1. Widths 7/8 above LLAMA_FA_SPLITKV_MIN_KV positions (default 16384) run the 6-warp compact tile at 2 CTA/SM with its
+//    own one-wave KV split (compact mode 2, as GGML_SJKVARN_COMPACT_OCC=1 takes it) instead of the 8-warp rows kernel,
+//    which its 253 registers hold to 1 CTA/SM. HOME 3090 Ti microbench (fakeep, test-backend-ops perf): -11/-14% kernel
+//    time at 28K, -20/-21% at 99K, -22/-24% at 200K (widths 7/8). The KV split and so the reduction order change:
+//    rounding-level differences. Opt-in: LLAMA_FA_SPLITKV_W78=1 (default off; measured -6.4% at 98,766 in the gate,
+//    and GGML_SJKVARN_COMPACT_W78=1 already gives widths 7/8 the mode-2 compact tile at every length). It rides on compact mode 1 being on,
+//    so GGML_CUDA_SJ_FILL=1 / GGML_SJKVARN_COMPACT_ALL=0 also turn it off; an explicit GGML_SJKVARN_COMPACT_OCC=1 takes
+//    mode 2 at every width and length regardless of LLAMA_FA_SPLITKV. The route switches once as n_kv crosses the
+//    threshold during a generation (one graph re-instantiation, rounding-level change).
+// 2. Diagnostic only, off by default: LLAMA_FA_SPLITKV_WAVES=w raises the KV split (blocks per KV head, merged by
+//    flash_attn_combine_results' log-sum-exp) to w waves of the launched instance above the threshold, keeping
+//    >= LLAMA_FA_SPLITKV_MIN_REC records per block; LLAMA_FA_SPLITKV_PB=n forces n. Measured slower: launch_fattn's
+//    one-wave split already fills the card, and more blocks add combine work and shorter streams (waves 2: +16..37% at
+//    28K widths 1-6, +3..4% at 99K; waves 4: +8..18% at 99K).
+// Not applied to: GGML_SJKVARN_DIRECT_STABLE (fixed split by design) and the LSA live-record walk (compact tile is off
+// there, and the host does not know the live record count).
 struct ggml_cuda_fattn_sj_splitkv_cfg {
     bool  on;
     float waves;
@@ -1424,7 +1431,7 @@ static const ggml_cuda_fattn_sj_splitkv_cfg & ggml_cuda_fattn_sj_splitkv_get_cfg
         };
         ggml_cuda_fattn_sj_splitkv_cfg c;
         c.on       = env_on("LLAMA_FA_SPLITKV", true);
-        c.waves    = (float) env_num("LLAMA_FA_SPLITKV_WAVES", 2.0);
+        c.waves    = (float) env_num("LLAMA_FA_SPLITKV_WAVES", 0.0);
         c.min_kv   = (int) env_num("LLAMA_FA_SPLITKV_MIN_KV", 16384);
         c.min_rec  = std::max(1, (int) env_num("LLAMA_FA_SPLITKV_MIN_REC", 4));
         c.pb_force = (int) env_num("LLAMA_FA_SPLITKV_PB", 0);
@@ -1444,7 +1451,7 @@ static int ggml_cuda_fattn_sj_kvarn_stream_parallel_blocks(const ggml_tensor * d
 static int ggml_cuda_fattn_sj_splitkv_pb(const void * kernel, const ggml_tensor * dst, const int nthreads, const size_t shared,
         const int pb_in, const int NT) {
     const ggml_cuda_fattn_sj_splitkv_cfg & cfg = ggml_cuda_fattn_sj_splitkv_get_cfg();
-    if (!cfg.on || ggml_cuda_fattn_sj_live_records != nullptr) {
+    if (!cfg.on || ggml_cuda_fattn_sj_live_records != nullptr || (cfg.waves <= 0.0f && cfg.pb_force <= 0)) {
         return pb_in;
     }
     const int n_kv = ggml_get_op_params_i32(dst, 6);
@@ -2104,7 +2111,17 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     // == n_q warps, width 5 is the Q5/G6 case below
     if (NT == 4 || NT >= 6) {
         int cmode = ggml_cuda_fattn_sj_kvarn_compact_mode_for(dst, NT == 4 && kw8);
-        if (cmode == 1 && NT >= 7 && !(ggml_cuda_fattn_sj_splitkv_get_cfg().w78 && ggml_get_op_params_i32(dst, 6) >= ggml_cuda_fattn_sj_splitkv_get_cfg().min_kv)) {
+        const ggml_cuda_fattn_sj_splitkv_cfg & skv = ggml_cuda_fattn_sj_splitkv_get_cfg();
+        if (cmode == 1 && NT >= 7 && skv.w78 && ggml_get_op_params_i32(dst, 6) >= skv.min_kv) {
+            // [SPLITATTN] long context: widths 7/8 on the compact tile with its own split (mode 2), see the note at
+            // ggml_cuda_fattn_sj_splitkv_cfg. Not bit-identical to the rows kernel (rounding-level).
+            static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+            if (!logged.test_and_set()) {
+                GGML_LOG_INFO("ggml_cuda_fattn_sj_splitkv: widths 7/8 at >= %d positions on the compact tile, own KV split "
+                              "(LLAMA_FA_SPLITKV_W78=1 set; unset restores the rows kernel)\n", skv.min_kv);
+            }
+            cmode = 2;
+        } else if (cmode == 1 && NT >= 7) {
             // KVROWS step b (fakeep99, 3090 Ti): mode 1 at widths 7/8 is 12-14% slower than the rows kernel (the copied
             // 8-warp split gives the 6-warp compact grid half the blocks it can hold), so mode 1 never runs there.
             // [DSPINE2 B0] widths 7/8 take mode 2 (own split) by default instead of the rows kernel: DSpine 8-row verify at a

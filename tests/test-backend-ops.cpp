@@ -23605,13 +23605,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(t);
         }
     }
-    // [SPLITATTN] long contexts (>= LLAMA_FA_SPLITKV_MIN_KV positions): the split-KV launch raises the KV split to two
-    // waves; widths 1..8 at the Qwen3.8 shape with the production staging, plus fused rotation and two streams
+    // [SPLITATTN] long contexts (>= LLAMA_FA_SPLITKV_MIN_KV positions): widths 7/8 take the compact tile with its own KV
+    // split there; widths 1..8 at the Qwen3.8 shape with the production staging, plus fused rotation and two streams
     for (int64_t n_q = 1; n_q <= 8; ++n_q) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 160, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 400, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
     }
-    for (int64_t n_q : {1, 5, 8}) {
+    for (int64_t n_q : {1, 5, 7, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 160, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 1));
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 160, 400, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 0, 2));
     }
@@ -25286,10 +25286,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
-        // [SPLITATTN] GGML_TEST_AIV2_PERF=splitkv: the same decode attention at ~8K / ~28K / ~99K / ~200K positions
-        // (62 / 220 / 775 / 1,560 records + 300 ring), widths 1 and 4..8 (LLAMA_FA_SPLITKV A/B and split sweeps)
+        // [SPLITATTN] GGML_TEST_AIV2_PERF=splitkv: the same decode attention at ~4K / ~8K / ~16K / ~28K / ~99K / ~200K positions
+        // (30 / 62 / 126 / 220 / 775 / 1,560 records + 300 ring), widths 1 and 4..8 (LLAMA_FA_SPLITKV A/B and split sweeps)
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "splitkv") {
-            for (int64_t ng : { 62, 220, 775, 1560 }) {
+            for (int64_t ng : { 30, 62, 126, 220, 775, 1560 }) {
                 for (int64_t n_q : { 1, 4, 5, 6, 7, 8 }) {
                     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, ng, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
                 }
