@@ -3122,6 +3122,8 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     ggml_cuda_pool_alloc<float> sa(ctx.pool());
     int8_t * qp = nullptr;
     float  * sp = nullptr;
+    // quantize_act's float4 loads need 16-B aligned rows (K % 128 == 0 keeps every row aligned; as ggml_cuda_mul_mat_ai4)
+    GGML_ASSERT(((uintptr_t) x->data & 15) == 0);
     // The pair kernel reads rotated columns in their original order. [KAIFUSE R1] shared per input group.
     ai4_prep(ctx, dst->src[1] == x ? x : nullptr, (const float *) x->data, N, K, xsh, AI4_PREP_LINEAR, qa, sa, qp, sp);
     const uint8_t * wd = (const uint8_t *) w->data;
