@@ -202,6 +202,13 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     // fork (INKFLAGS): rms_norm is per row, so norming the cached block stack and cur apart is bit-identical to the old
     // concat chain + one norm, with 1 concat per mix instead of one per block. LLAMA_INKLING2_MIX_STACK=0 = old graph.
     static const bool mix_cache = [] { const char * e = getenv("LLAMA_INKLING2_MIX_STACK"); return !e || atoi(e) != 0; }();
+    // fork (INKFLAGS): the norm of cur, the scores, the softmax and the weighted sum in one op (GGML_OP_DEPTH_MIX), 1 kernel
+    // per mix instead of 7 at decode. LLAMA_INKLING2_MIX_FUSED=0 = the unfused graph below.
+    static const bool mix_fused = [] { const char * e = getenv("LLAMA_INKLING2_MIX_FUSED"); return !e || atoi(e) != 0; }();
+    if (mix_fused && mix_cache && query->type == GGML_TYPE_F32 && query->ne[1] <= 4) {
+        return ggml_depth_mix(ctx0, blocks.empty() ? nullptr : mix_stack(blocks), ggml_reshape_2d(ctx0, cur, n_embd, n_tokens),
+            query, 1e-6f, 1.0f/sqrtf(n_embd));
+    }
     if (mix_cache) {
         states = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
         if (!blocks.empty()) {

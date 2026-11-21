@@ -15849,6 +15849,39 @@ static void lsa_comp_init_nd_lse(ggml_context * ctx, bool zero_all) {
     ggml_backend_tensor_set(lse, v.data(), 0, v.size()*sizeof(float));
 }
 
+// GGML_OP_DEPTH_MIX (Inkling 2 attention over depth, LLAMA_INKLING2_MIX_FUSED) vs CPU: k normed stack rows (a strided
+// view of a wider stack when padded) plus cur, nq queries
+struct test_depth_mix : public test_case {
+    const int64_t n, k, nq, T;
+    const bool padded;
+
+    test_depth_mix(int64_t n, int64_t k, int64_t nq, int64_t T, bool padded = false) :
+        n(n), k(k), nq(nq), T(T), padded(padded) {}
+
+    std::string vars() override { return VARS_TO_STR5(n, k, nq, T, padded); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * stack = nullptr;
+        if (k > 0) {
+            ggml_tensor * raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, k + (padded ? 2 : 0), T);
+            ggml_set_name(raw, "stack");
+            stack = ggml_rms_norm(ctx, padded ? ggml_view_3d(ctx, raw, n, k, T, raw->nb[1], raw->nb[2], raw->nb[1]) : raw, 1e-6f);
+        }
+        ggml_tensor * cur   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, nq);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(query, "query");
+        return ggml_depth_mix(ctx, stack, cur, query, 1e-6f, 1.0f/sqrtf((float) n));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // sharp but finite softmax: queries ~ U(-1, 1) give scores of a few units on 2304-wide rows
+            init_tensor_uniform(t, strcmp(t->name, "cur") == 0 ? -40.0f : -1.0f, strcmp(t->name, "cur") == 0 ? 40.0f : 1.0f);
+        }
+    }
+};
+
 // GGML_OP_LSA_UNIT_LSE (LLAMA_LSA_UNIT_OP) vs CPU: random F16/F32 index keys with strided rows (d = 64: 16-byte rows,
 // vector loads; d = 60: scalar loads), causal F16 mask with empty cells (fully masked units give -inf on both).
 struct test_lsa_unit_lse : public test_case {
@@ -21658,6 +21691,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lsa_unit_lse(4096, 5, 16, 64, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lsa_unit_lse(4096, 5, 16, 60));
     test_cases.emplace_back(new test_lsa_unit_lse(4096, 11, 64));
+    // [INKFLAGS] LLAMA_INKLING2_MIX_FUSED: depth mix vs CPU (k = 0 empty stack, nq 1/3/4, decode and prompt widths)
+    for (int64_t k : {0, 1, 9, 13}) {
+        for (int64_t nq : {1, 3, 4}) {
+            for (int64_t T : {1, 7, 512}) {
+                test_cases.emplace_back(new test_depth_mix(2304, k, nq, T));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_depth_mix(2304, 5, 3, 3, true));
+    test_cases.emplace_back(new test_depth_mix(100, 2, 2, 4));
     // GGML_LSA_ULSE_COOP=1 lane-shared kernel: d 128/256 (16/32 lanes per cell), a partial last CTA, 1..8 rows (n_kv must divide by F)
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 5, 16, 128));
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 3, 1, 256));

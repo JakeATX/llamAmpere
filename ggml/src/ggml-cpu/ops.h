@@ -84,6 +84,7 @@ void ggml_compute_forward_top_k(const struct ggml_compute_params * params, struc
 void ggml_compute_forward_lsa_block_select(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_lsa_comp_merge(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_lsa_unit_lse(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_depth_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);

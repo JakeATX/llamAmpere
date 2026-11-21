@@ -14041,3 +14041,68 @@ void ggml_compute_forward_lsa_comp_merge(
         }
     }
 }
+
+// ggml_compute_forward_depth_mix (fork, Inkling 2 attention over depth; see ggml.h). Tokens are split over the threads.
+
+void ggml_compute_forward_depth_mix(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * cur   = dst->src[0];
+    const ggml_tensor * query = dst->src[1];
+    const ggml_tensor * stack = dst->src[2];
+
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n  = cur->ne[0];
+    const int64_t T  = cur->ne[1];
+    const int64_t nq = query->ne[1];
+    const int64_t k  = stack ? stack->ne[1] : 0;
+
+    std::vector<const float *> rows(k + 1);
+    std::vector<float> p((k + 1)*nq);
+
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        const float * x = (const float *) ((const char *) cur->data + t*cur->nb[1]);
+        ggml_float ss = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            ss += (ggml_float) (x[i]*x[i]);
+        }
+        const float r = 1.0f/sqrtf((float) (ss/n) + eps);
+        for (int64_t j = 0; j < k; ++j) {
+            rows[j] = (const float *) ((const char *) stack->data + t*stack->nb[2] + j*stack->nb[1]);
+        }
+        rows[k] = x;
+        for (int64_t q = 0; q < nq; ++q) {
+            const float * w = (const float *) ((const char *) query->data + q*query->nb[1]);
+            float mx = -INFINITY;
+            for (int64_t j = 0; j <= k; ++j) {
+                float d = 0.0f;
+                for (int64_t i = 0; i < n; ++i) {
+                    d += rows[j][i]*w[i];
+                }
+                p[j*nq + q] = scale*(j == k ? r : 1.0f)*d;
+                mx = std::max(mx, p[j*nq + q]);
+            }
+            float sum = 0.0f;
+            for (int64_t j = 0; j <= k; ++j) {
+                p[j*nq + q] = expf(p[j*nq + q] - mx);
+                sum += p[j*nq + q];
+            }
+            for (int64_t j = 0; j <= k; ++j) {
+                p[j*nq + q] /= sum;
+            }
+        }
+        float * out = (float *) ((char *) dst->data + t*dst->nb[2]);
+        for (int64_t q = 0; q < nq; ++q) {
+            for (int64_t i = 0; i < n; ++i) {
+                float acc = 0.0f;
+                for (int64_t j = 0; j <= k; ++j) {
+                    acc += p[j*nq + q]*(j == k ? rows[j][i]*r : rows[j][i]);
+                }
+                out[q*n + i] = acc;
+            }
+        }
+    }
+}
