@@ -31,8 +31,12 @@ struct llama_inklsa_config {
     int64_t sinks   = 128;   // LLAMA_INKLSA_SINKS: multiple of BLOCK
     int64_t min_kv  = 16384; // LLAMA_INKLSA_MIN_KV: below this n_kv the visit stays dense
     int64_t max_t   = 16;    // LLAMA_INKLSA_MAX_T: wider ubatches stay dense
-    int     reuse_pass = 0;  // LLAMA_INKLSA_REUSE_PASS=1: loop passes 1 and 2 reuse pass 0's pick of the same layer
     bool    stats   = false; // LLAMA_INKLSA_STATS: log the configuration once
+    double  keep_frac = 0.0; // LLAMA_INKLSA_KEEP_FRAC: keep max(KEEP, frac x n_kv) cells
+    int     pick    = 0;     // LLAMA_INKLSA_PICK: 0 block-mean index; 1 oracle (exact attention mass per block from
+                             // every key, same shared pick: diagnostic, reads all of K)
+    bool    comp    = false; // LLAMA_INKLSA_COMP=1 (lossy, opt-in): every eligible block that is not picked joins the
+                             // sparse attention as one virtual cell (mean K, mean V, logit + log B), a third LSE term
     // INKREL (REL-SPLIT, lossless, default on; independent of LLAMA_INKLSA; F16 K/V, no kv-stream; positions of a ubatch
     // contiguous per sequence, else set_input asserts): ubatches of >= rel_min_t rows attend
     // to the full-attention visits in two flash-attention calls instead of one call with a per-head F32 bias mask
@@ -46,10 +50,14 @@ struct llama_inklsa_config {
 
 const llama_inklsa_config & llama_inklsa_cfg();
 
+// index rows per K cache of kv_size cells: blocks rounded up to 256 (the COMP attention pads to it), twice with COMP
+// (mean V in rows [cap/2, cap))
+int64_t llama_inklsa_idx_rows(int64_t kv_size, int64_t B);
+
 // fixed-cell capacity of a sparse graph with up to max_t rows: sinks + window + one partial block + rows, to 256
 int64_t llama_inklsa_n_fix();
-// kept middle cells per sparse graph (multiple of 256 and of the block)
-int64_t llama_inklsa_n_keep();
+// kept middle cells per sparse graph over n_kv cells (multiple of 256 and of the block)
+int64_t llama_inklsa_n_keep(int64_t n_kv);
 
 struct llama_inklsa_idx {
     ggml_tensor * t     = nullptr; // F16 [d, kv_size/B]
@@ -87,6 +95,7 @@ struct llama_inklsa_inputs {
     int64_t       n_blk    = 0;       // n_kv / B
     int64_t       n_fix    = 0;
     int64_t       n_u      = 0;       // blocks the ubatch may write
+    int64_t       n_keep   = 0;       // kept middle cells of this graph: max(KEEP, KEEP_FRAC x n_kv), to 256
     ggml_tensor * fix_ids  = nullptr; // I32 [n_fix]           fixed cells (sinks + window), padding = cell 0
     ggml_tensor * fix_rel  = nullptr; // I32 [n_fix, T]        bias-table row of each fixed cell per query row
     ggml_tensor * fix_mask = nullptr; // F32 [n_fix, T]        0 visible, -inf padding / future / other sequence

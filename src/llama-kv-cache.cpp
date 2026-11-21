@@ -5442,10 +5442,13 @@ void llama_kv_cache::set_input_inklsa(const llama_inklsa_inputs & in, const llam
     const int64_t b_lo = cfg.sinks/B;
     const int64_t b_hi = std::max<int64_t>(b_lo, ((int64_t) p0 - cfg.window + 1)/B);
     std::vector<float> elig(in.n_blk, -INFINITY);
+    // every cell of the block is checked: a sequence removal or another sequence can leave holes inside a block
     for (int64_t b = b_lo; b < std::min(b_hi, in.n_blk); ++b) {
-        const uint32_t c0 = b*B, c1 = b*B + B - 1;
-        if (!cells.is_empty(c0) && !cells.is_empty(c1) && cells.pos_get(c0) == (llama_pos) c0 && cells.pos_get(c1) == (llama_pos) c1 &&
-                cells.seq_has(c0, ubatch->seq_id[0][0]) && cells.seq_has(c1, ubatch->seq_id[0][0])) {
+        bool ok = true;
+        for (uint32_t c = b*B; ok && c < (uint32_t) (b*B + B); ++c) {
+            ok = !cells.is_empty(c) && cells.pos_get(c) == (llama_pos) c && cells.seq_has(c, ubatch->seq_id[0][0]);
+        }
+        if (ok) {
             elig[b] = 0.0f;
         }
     }

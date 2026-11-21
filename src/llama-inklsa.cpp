@@ -23,10 +23,14 @@ const llama_inklsa_config & llama_inklsa_cfg() {
         c.sinks      = inklsa_env("LLAMA_INKLSA_SINKS", c.sinks);
         c.min_kv     = inklsa_env("LLAMA_INKLSA_MIN_KV", c.min_kv);
         c.max_t      = inklsa_env("LLAMA_INKLSA_MAX_T", c.max_t);
-        c.reuse_pass = (int) inklsa_env("LLAMA_INKLSA_REUSE_PASS", 0);
         c.stats      = inklsa_env("LLAMA_INKLSA_STATS", 0) != 0;
+        c.pick       = (int) inklsa_env("LLAMA_INKLSA_PICK", 0);
+        c.comp       = inklsa_env("LLAMA_INKLSA_COMP", 0) != 0;
+        if (const char * f = getenv("LLAMA_INKLSA_KEEP_FRAC"); f && *f) {
+            c.keep_frac = std::clamp(atof(f), 0.0, 1.0);
+        }
         c.relsplit   = inklsa_env("LLAMA_INKREL", 1) != 0;
-        c.rel_min_t  = std::max<int64_t>(2, inklsa_env("LLAMA_INKREL_MIN_T", c.rel_min_t));
+        c.rel_min_t  = std::max<int64_t>(1, inklsa_env("LLAMA_INKREL_MIN_T", c.rel_min_t));
         if (c.on) {
             if (c.block <= 0 || 256 % c.block != 0 || c.sinks < 0 || c.sinks % c.block != 0 || c.keep <= 0 ||
                     c.window <= 0 || c.max_t <= 0) {
@@ -34,10 +38,10 @@ const llama_inklsa_config & llama_inklsa_cfg() {
                         " - INKLSA off\n", __func__, (long long) c.block, (long long) c.sinks);
                 c.on = false;
             } else {
-                LLAMA_LOG_WARN("%s: INKLSA on: keep %lld (%lld) block %lld window %lld sinks %lld min_kv %lld max_t %lld"
-                        " reuse_pass %d\n", __func__, (long long) c.keep, (long long) ((c.keep + 255)/256*256),
+                LLAMA_LOG_WARN("%s: INKLSA on: keep %lld (%lld) keep_frac %.3f pick %d comp %d block %lld window %lld sinks %lld"
+                        " min_kv %lld max_t %lld\n", __func__, (long long) c.keep, (long long) ((c.keep + 255)/256*256), c.keep_frac, c.pick, (int) c.comp,
                         (long long) c.block, (long long) c.window, (long long) c.sinks, (long long) c.min_kv,
-                        (long long) c.max_t, c.reuse_pass);
+                        (long long) c.max_t);
             }
         }
         return c;
@@ -56,8 +60,14 @@ int64_t llama_inklsa_n_fix() {
     return (c.sinks + c.window + c.block + c.max_t + 255)/256*256;
 }
 
-int64_t llama_inklsa_n_keep() {
-    return (llama_inklsa_cfg().keep + 255)/256*256;
+int64_t llama_inklsa_idx_rows(int64_t kv_size, int64_t B) {
+    return (kv_size/B + 255)/256*256*(llama_inklsa_cfg().comp ? 2 : 1);
+}
+
+int64_t llama_inklsa_n_keep(int64_t n_kv) {
+    const auto & c = llama_inklsa_cfg();
+    const int64_t k = std::max<int64_t>(c.keep, (int64_t) (c.keep_frac*(double) n_kv));
+    return (k + 255)/256*256;
 }
 
 namespace {

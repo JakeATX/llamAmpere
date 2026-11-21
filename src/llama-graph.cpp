@@ -1906,7 +1906,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
         res &= params.ubatch.n_seqs_unq == 1 || !inklsa.sparse;
         for (const ggml_tensor * kc : inklsa_kcaches) {
             llama_inklsa_idx idx;
-            res &= llama_inklsa_idx_get(kc, kc->ne[0], kc->ne[1]/inklsa.B, ggml_backend_buffer_get_type(kc->buffer), &idx) && idx.valid;
+            res &= llama_inklsa_idx_get(kc, kc->ne[0], llama_inklsa_idx_rows(kc->ne[1], inklsa.B), ggml_backend_buffer_get_type(kc->buffer), &idx) && idx.valid;
         }
     }
 
@@ -9041,7 +9041,8 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
             in.n_fix = llama_inklsa_n_fix();
             in.n_u   = std::min<int64_t>(in.n_blk, (T + in.B - 1)/in.B + 1);
             in.sparse = T <= icfg.max_t && n_kv >= icfg.min_kv && ubatch.n_seqs_unq == 1 &&
-                        n_kv >= in.n_fix + llama_inklsa_n_keep() + icfg.sinks;
+                        n_kv >= in.n_fix + llama_inklsa_n_keep(n_kv) + icfg.sinks;
+            in.n_keep = llama_inklsa_n_keep(n_kv);
             in.u_blk   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, in.n_u);
             in.u_blk64 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, in.n_u);
             ggml_set_input(in.u_blk);
@@ -9172,6 +9173,23 @@ static ggml_tensor * inklsa_block_mean(ggml_context * ctx, ggml_tensor * x) {
     return ggml_reshape_2d(ctx, ggml_scale(ctx, f, 1.0f/B), D, n);
 }
 
+// two attention outputs [dv*n_head, T] with their LSE [n_head, T] and the zero-logit sink: softmax over
+// (l_a, l_b, 0) per head and row weighs o_a and o_b
+static ggml_tensor * inkrel_merge(ggml_context * ctx0, ggml_tensor * o_a, ggml_tensor * l_a, ggml_tensor * o_b,
+        ggml_tensor * l_b, int64_t n_head, int64_t T) {
+    ggml_tensor * l0 = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_head, T), 0.0f);
+    ggml_tensor * l3 = ggml_concat(ctx0, ggml_concat(ctx0, ggml_reshape_3d(ctx0, l_a, 1, n_head, T),
+            ggml_reshape_3d(ctx0, l_b, 1, n_head, T), 0), ggml_reshape_3d(ctx0, l0, 1, n_head, T), 0);  // [3, n_head, T]
+    ggml_tensor * w = ggml_soft_max(ctx0, l3);
+    ggml_tensor * w_a = ggml_view_3d(ctx0, w, 1, n_head, T, w->nb[1], w->nb[2], 0);
+    ggml_tensor * w_b = ggml_view_3d(ctx0, w, 1, n_head, T, w->nb[1], w->nb[2], w->nb[0]);
+    const int64_t dv = o_a->ne[0]/n_head;
+    ggml_tensor * cur = ggml_add(ctx0,
+            ggml_mul(ctx0, ggml_reshape_3d(ctx0, o_a, dv, n_head, T), ggml_cont(ctx0, w_a)),
+            ggml_mul(ctx0, ggml_reshape_3d(ctx0, o_b, dv, n_head, T), ggml_cont(ctx0, w_b)));
+    return ggml_reshape_2d(ctx0, cur, dv*n_head, T);
+}
+
 ggml_tensor * llm_graph_context::build_attn_inkrel(
         llm_graph_input_mem_hybrid_iswa_rel * inp,
         ggml_tensor * q_cur,
@@ -9211,18 +9229,7 @@ ggml_tensor * llm_graph_context::build_attn_inkrel(
     GGML_ASSERT(l_n != nullptr);
     l_n = ggml_reshape_2d(ctx0, l_n, n_head, T);
 
-    // merge: softmax over (far, near, sink = 0) per head and row
-    ggml_tensor * l0 = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_head, T), 0.0f);
-    ggml_tensor * l3 = ggml_concat(ctx0, ggml_concat(ctx0, ggml_reshape_3d(ctx0, l_f, 1, n_head, T),
-            ggml_reshape_3d(ctx0, l_n, 1, n_head, T), 0), ggml_reshape_3d(ctx0, l0, 1, n_head, T), 0);  // [3, n_head, T]
-    ggml_tensor * w = ggml_soft_max(ctx0, l3);
-    ggml_tensor * w_f = ggml_view_3d(ctx0, w, 1, n_head, T, w->nb[1], w->nb[2], 0);
-    ggml_tensor * w_n = ggml_view_3d(ctx0, w, 1, n_head, T, w->nb[1], w->nb[2], w->nb[0]);
-    const int64_t dv = o_f->ne[0]/n_head;
-    ggml_tensor * cur = ggml_add(ctx0,
-            ggml_mul(ctx0, ggml_reshape_3d(ctx0, o_f, dv, n_head, T), ggml_cont(ctx0, w_f)),
-            ggml_mul(ctx0, ggml_reshape_3d(ctx0, o_n, dv, n_head, T), ggml_cont(ctx0, w_n)));
-    cur = ggml_reshape_2d(ctx0, cur, dv*n_head, T);
+    ggml_tensor * cur = inkrel_merge(ctx0, o_f, l_f, o_n, l_n, n_head, T);
     cb(cur, "kqv_out", il);
     return cur;
 }
@@ -9248,6 +9255,16 @@ ggml_tensor * llm_graph_context::build_attn_rel(
         if (!kc->buffer || kv->type != GGML_TYPE_F16 || kv->ne[3] != 1 || inp_attn->self_k_rot[il] || inp_attn->self_v_rot[il] ||
                 mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il)) {
             kc = nullptr; // memory-fit dry run, or a cache INKLSA does not cover: dense
+        }
+    }
+
+    // INKLSA on but this graph does not keep the index (n_kv % B != 0, no flash attention, several sequences, ...):
+    // the K it writes is not folded into the index, so mark the index stale (rebuilt by the next INKLSA graph)
+    if (!is_swa && !inp->inklsa_on && llama_inklsa_cfg().on) {
+        ggml_tensor * kv = mctx_cur->get_k(ctx0, il);
+        const ggml_tensor * kst = kv->view_src ? kv->view_src : kv;
+        if (kst->buffer) {
+            llama_inklsa_invalidate(&kst, 1);
         }
     }
 
@@ -9299,7 +9316,9 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     const int64_t D = k->ne[0]*k->ne[1];
 
     llama_inklsa_idx idx;
-    GGML_ASSERT(llama_inklsa_idx_get(kc, D, kc->ne[1]/B, ggml_backend_buffer_get_type(kc->buffer), &idx));
+    GGML_ASSERT(llama_inklsa_idx_get(kc, D, llama_inklsa_idx_rows(kc->ne[1], B), ggml_backend_buffer_get_type(kc->buffer), &idx));
+    const bool    comp  = llama_inklsa_cfg().comp;
+    const int64_t vrow0 = comp ? idx.t->ne[1]/2 : 0; // first mean-V row
     inp->inklsa_kcaches.push_back(kc);
     if (!idx.valid) {
         // rebuild every block [0, n_blk) from K, in chunks that bound the F32 scratch
@@ -9309,6 +9328,11 @@ ggml_tensor * llm_graph_context::build_attn_rel(
             ggml_tensor * x = ggml_view_3d(ctx0, k, D, B, nb, k->nb[2], k->nb[2]*B, k->nb[2]*B*b0);
             ggml_tensor * dst = ggml_view_2d(ctx0, idx.t, D, nb, idx.t->nb[1], idx.t->nb[1]*b0);
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, inklsa_block_mean(ctx0, x), dst));
+            if (comp) {
+                ggml_tensor * xv = ggml_view_3d(ctx0, v, D, B, nb, v->nb[2], v->nb[2]*B, v->nb[2]*B*b0);
+                ggml_tensor * dv = ggml_view_2d(ctx0, idx.t, D, nb, idx.t->nb[1], idx.t->nb[1]*(vrow0 + b0));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, inklsa_block_mean(ctx0, xv), dv));
+            }
         }
         inp->inklsa_commit.emplace_back(kc, idx.epoch);
         inp->inklsa_rebuild = true;
@@ -9319,6 +9343,13 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     ub = ggml_reshape_3d(ctx0, ub, D, B, in.n_u);
     ggml_tensor * index = ggml_set_rows(ctx0, idx.t, inklsa_block_mean(ctx0, ub), in.u_blk64); // view of idx.t
     ggml_build_forward_expand(gf, index);
+    ggml_tensor * vindex = nullptr; // COMP: mean-V rows, refreshed the same way
+    if (comp) {
+        ggml_tensor * uv = ggml_reshape_3d(ctx0, inklsa_gather(ctx0, v, B, in.u_blk), D, B, in.n_u);
+        ggml_tensor * vrows = ggml_view_2d(ctx0, idx.t, D, vrow0, idx.t->nb[1], idx.t->nb[1]*vrow0);
+        vindex = ggml_set_rows(ctx0, vrows, inklsa_block_mean(ctx0, uv), in.u_blk64);
+        ggml_build_forward_expand(gf, vindex);
+    }
 
     if (!in.sparse && inp->inkrel.on) {
         return build_attn_inkrel(inp, q_cur, k, v, table, kq_scale, il);
@@ -9345,7 +9376,7 @@ ggml_tensor * llm_graph_context::build_attn_rel(
         static std::atomic<int> n_logged{0};
         if (n_logged.fetch_add(1) == 0) {
             LLAMA_LOG_WARN("%s: INKLSA sparse attention active (first sparse graph: n_kv %lld, T %lld, keep %lld, fixed %lld)\n",
-                    __func__, (long long) (in.n_blk*B), (long long) n_tokens, (long long) llama_inklsa_n_keep(), (long long) in.n_fix);
+                    __func__, (long long) (in.n_blk*B), (long long) n_tokens, (long long) in.n_keep, (long long) in.n_fix);
         }
     }
 
@@ -9359,9 +9390,21 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     ggml_tensor * iview = ggml_view_2d(ctx0, index, D, in.n_blk, idx.t->nb[1], 0);
     ggml_tensor * sc = ggml_mul_mat(ctx0, iview, qbd);                                       // [n_blk, n_head*T]
     sc = ggml_soft_max(ctx0, ggml_add(ctx0, ggml_scale(ctx0, sc, kq_scale), in.elig));
+    if (llama_inklsa_cfg().pick == 1) {
+        // oracle (diagnostic): the exact attention mass of each eligible block from every key, softmax over the
+        // eligible cells per (q head, row), summed like the index votes
+        const int64_t H = n_head;
+        ggml_tensor * kq = ggml_mul_mat(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3), ggml_permute(ctx0, q_cur, 0, 2, 1, 3)); // [n_kv, T, H]
+        kq = ggml_reshape_3d(ctx0, ggml_scale(ctx0, kq, kq_scale), B, in.n_blk, T*H);
+        kq = ggml_add(ctx0, kq, ggml_reshape_3d(ctx0, in.elig, 1, in.n_blk, 1));
+        kq = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, kq, B*in.n_blk, T*H));
+        kq = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, kq, B, in.n_blk, T*H));                // [1, n_blk, T*H]
+        sc = ggml_reshape_2d(ctx0, kq, in.n_blk, T*H);
+    }
     ggml_tensor * votes = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, sc)));    // [1, n_blk]
-    votes = ggml_reshape_2d(ctx0, votes, in.n_blk, 1);
-    const int64_t nk = llama_inklsa_n_keep()/B;
+    // ineligible blocks vote 0 after the softmax, like eligible blocks whose scores underflow: keep them last
+    votes = ggml_add(ctx0, ggml_reshape_2d(ctx0, votes, in.n_blk, 1), in.elig);
+    const int64_t nk = in.n_keep/B;
     ggml_tensor * pick = ggml_top_k(ctx0, votes, (int) nk);                                   // I32 [nk, 1]
     pick = ggml_reshape_1d(ctx0, pick, nk);
     cb(pick, "inklsa_pick", il);
@@ -9384,7 +9427,41 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     ggml_tensor * mask = ggml_cast(ctx0, ggml_concat(ctx0, mf, mb, 0), GGML_TYPE_F16);
     cb(mask, "inklsa_mask", il);
 
-    ggml_tensor * cur = build_attn_mha(q_cur, ks, vs, nullptr, mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+    if (!comp) {
+        ggml_tensor * cur = build_attn_mha(q_cur, ks, vs, nullptr, mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        return cur;
+    }
+
+    // COMP (assumes the zero sink of inkling2.cpp, which folds the sink logit into table): the compact set without
+    // the sink, then every eligible unpicked block as one virtual cell
+    // (mean K, mean V, logit + log B + the far bias), merged with the zero sink by log-sum-exp
+    lsa_lse_req = true;
+    ggml_tensor * o_s = build_attn_mha(q_cur, ks, vs, nullptr, mask, nullptr, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * l_s = lsa_lse;
+    lsa_lse = nullptr;
+    const int64_t n_pad = GGML_PAD(in.n_blk, 256);
+    GGML_ASSERT(l_s && n_pad <= vrow0);
+    ggml_tensor * kc3 = ggml_view_3d(ctx0, index,  dh, Hkv, n_pad, dh*ggml_element_size(index), index->nb[1], 0);
+    ggml_tensor * vc3 = ggml_view_3d(ctx0, vindex, dh, Hkv, n_pad, dh*ggml_element_size(vindex), vindex->nb[1], 0);
+    // per-block mask [n_pad]: log B for an eligible unpicked block, -inf for picked / ineligible / padding
+    ggml_tensor * bm = ggml_scale_bias(ctx0, in.elig, 1.0f, logf((float) B));                 // [n_blk, 1]
+    bm = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, bm, 1, in.n_blk),
+            ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, nk), -INFINITY), pick);
+    bm = ggml_reshape_2d(ctx0, bm, in.n_blk, 1);
+    if (n_pad > in.n_blk) {
+        bm = ggml_concat(ctx0, bm, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pad - in.n_blk, 1), -INFINITY), 0);
+    }
+    ggml_tensor * mc = ggml_add(ctx0, ggml_repeat_4d(ctx0, far, n_pad, T, n_head, 1), bm);  // [n_pad, T, n_head]
+    // a row with no unpicked eligible block would be all -inf (0/0 in FA): -30000 keeps it finite at LSE ~ -30000,
+    // which the merge weighs as zero
+    mc = ggml_cast(ctx0, ggml_clamp(ctx0, mc, -30000.0f, INFINITY), GGML_TYPE_F16);
+    lsa_lse_req = true;
+    ggml_tensor * o_c = build_attn_mha(q_cur, kc3, vc3, nullptr, mc, nullptr, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * l_c = lsa_lse;
+    lsa_lse = nullptr;
+    GGML_ASSERT(l_c);
+    ggml_tensor * cur = inkrel_merge(ctx0, o_s, l_s, o_c, l_c, n_head, T);
     cb(cur, "kqv_out", il);
     return cur;
 }
