@@ -104,7 +104,7 @@ bool ggml_cuda_sj_kvarn_strip_master_stage(ggml_backend_cuda_context & ctx, cons
 
 #define SJKVARN_SEAL_THREADS 256
 #define SJKVARN_SEAL_MAX_DIM 256
-#define SJKVARN_SEAL_WIDE_DEFAULT 1024
+#define SJKVARN_SEAL_WIDE_DEFAULT 512
 
 // trellis-coded 4-bit body (body type GGML_TYPE_I16, ggml-sjkvarn.h "sjkvarn4t"): warp-parallel Viterbi, one warp per
 // (channel tile, fragment lane) sequence of G/2 values. Lane owns windows w = lane + 32*i (i < NWIN/32), i.e. states
@@ -286,7 +286,7 @@ static __device__ __forceinline__ float sj_kvarn_cur(const half * tile, const fl
 // (col_pass) or the row of the tile; updates log_s[vec] and s_out[vec] (the vector's own scale only)
 template <int CHUNK, bool col_pass, int NT>
 static __device__ __forceinline__ void sj_kvarn_std_pass(const half * tile, float * s_row, float * s_col,
-                                                      double * log_s, float * s_out,
+                                                      double * log_s, float * s_out, double * m2_buf,
                                                       const int n_vec, const int sr, const int sc) {
     constexpr int n = CHUNK*SJKVARN_RED_LANES;
     for (int task = threadIdx.x; task < n_vec*SJKVARN_RED_LANES; task += NT) {
@@ -320,25 +320,32 @@ static __device__ __forceinline__ void sj_kvarn_std_pass(const half * tile, floa
             m2 += __shfl_xor_sync(0xFFFFFFFF, m2, w, 32);
         }
         if (lane == 0) {
-            float sd = (float) sqrt(m2 / (double) (n - 1));
-            sd = fminf(fmaxf(sd, 1e-3f), 1e3f);
-            double ls = log_s[vec] + log((double) sd);
-            ls = fmin(fmax(ls, -0.3), 10.0);
-            log_s[vec] = ls;
-            s_out[vec] = (float) exp(ls);
+            m2_buf[vec] = m2;
         }
+    }
+    // [SEAL08] the per-vector FP64 tail (sqrt, log, exp) runs one vector per lane after the reductions instead of
+    // on 1 lane in 8 inside them: same operations on the same m2, so the same bits, at 1/8 of the FP64 warp issues.
+    // No vector of this pass reads another vector's scale, so publishing them after the loop changes nothing.
+    __syncthreads();
+    for (int vec = threadIdx.x; vec < n_vec; vec += NT) {
+        float sd = (float) sqrt(m2_buf[vec] / (double) (n - 1));
+        sd = fminf(fmaxf(sd, 1e-3f), 1e3f);
+        double ls = log_s[vec] + log((double) sd);
+        ls = fmin(fmax(ls, -0.3), 10.0);
+        log_s[vec] = ls;
+        s_out[vec] = (float) exp(ls);
     }
 }
 
 template <bool col_pass, int NT>
 static __device__ __forceinline__ void sj_kvarn_std_pass_n(const half * tile, float * s_row, float * s_col,
-                                                        double * log_s, float * s_out,
+                                                        double * log_s, float * s_out, double * m2_buf,
                                                         const int n_vec, const int n, const int sr, const int sc) {
     switch (n) {
-        case  32: sj_kvarn_std_pass< 4, col_pass, NT>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
-        case  64: sj_kvarn_std_pass< 8, col_pass, NT>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
-        case 128: sj_kvarn_std_pass<16, col_pass, NT>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
-        case 256: sj_kvarn_std_pass<32, col_pass, NT>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
+        case  32: sj_kvarn_std_pass< 4, col_pass, NT>(tile, s_row, s_col, log_s, s_out, m2_buf, n_vec, sr, sc); break;
+        case  64: sj_kvarn_std_pass< 8, col_pass, NT>(tile, s_row, s_col, log_s, s_out, m2_buf, n_vec, sr, sc); break;
+        case 128: sj_kvarn_std_pass<16, col_pass, NT>(tile, s_row, s_col, log_s, s_out, m2_buf, n_vec, sr, sc); break;
+        case 256: sj_kvarn_std_pass<32, col_pass, NT>(tile, s_row, s_col, log_s, s_out, m2_buf, n_vec, sr, sc); break;
         default: break; // rejected by supports_op
     }
 }
@@ -551,6 +558,7 @@ static __global__ void __launch_bounds__(NT, 1) k_sj_kvarn_seal(const char * __r
     __shared__ float  s_col[SJKVARN_SEAL_MAX_DIM];
     __shared__ double log_sr[SJKVARN_SEAL_MAX_DIM];
     __shared__ double log_sc[SJKVARN_SEAL_MAX_DIM];
+    __shared__ double red_m2[SJKVARN_SEAL_MAX_DIM]; // per-vector m2 of the current balancing pass
     __shared__ float  q_lo[SJKVARN_SEAL_MAX_DIM];
     __shared__ float  q_step[SJKVARN_SEAL_MAX_DIM];
     constexpr bool trellis_ok = NT == SJKVARN_SEAL_THREADS;
@@ -628,9 +636,9 @@ static __global__ void __launch_bounds__(NT, 1) k_sj_kvarn_seal(const char * __r
     __syncthreads();
 
     for (int it = 0; it < p.iters; ++it) {
-        sj_kvarn_std_pass_n<true,  NT>(tile, s_row, s_col, log_sc, s_col, C, R, sr, sc); // columns: vectors over rows
+        sj_kvarn_std_pass_n<true,  NT>(tile, s_row, s_col, log_sc, s_col, red_m2, C, R, sr, sc); // columns: vectors over rows
         __syncthreads();
-        sj_kvarn_std_pass_n<false, NT>(tile, s_row, s_col, log_sr, s_row, R, C, sr, sc); // rows: vectors over columns
+        sj_kvarn_std_pass_n<false, NT>(tile, s_row, s_col, log_sr, s_row, red_m2, R, C, sr, sc); // rows: vectors over columns
         __syncthreads();
     }
 
@@ -927,7 +935,8 @@ static void sj_kvarn_seal_impl(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         smem_set[id] = true;
     }
     // [SEAL08] block width of the scalar (non-trellis) sealer; bytes are identical at every width.
-    // GGML_SJKVARN_SEAL_THREADS=256 restores the v0.7.2.1 launch (kill switch).
+    // GGML_SJKVARN_SEAL_THREADS=256 restores the v0.7.2.1 block width (kill switch for the width; the deferred FP64
+    // tail in sj_kvarn_std_pass is always on and is bit-identical by construction).
     static const int seal_threads = [] {
         const char * e = getenv("GGML_SJKVARN_SEAL_THREADS");
         const int v = e ? atoi(e) : SJKVARN_SEAL_WIDE_DEFAULT;
