@@ -109,6 +109,25 @@ static void ggml_backend_meta_device_get_memory(ggml_backend_dev_t dev, size_t *
     }
 }
 
+// the smallest free and total memory of any simple device: a tensor-split buffer allocates its largest slice on every
+// device, so this (not the sum above) is the budget a fit must compare a meta buffer size against
+void ggml_backend_meta_device_get_memory_min(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    *free  = SIZE_MAX;
+    *total = SIZE_MAX;
+    for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
+        size_t tmp_free, tmp_total;
+        ggml_backend_dev_memory(simple_dev, &tmp_free, &tmp_total);
+        *free  = std::min(*free,  tmp_free);
+        *total = std::min(*total, tmp_total);
+    }
+    if (meta_dev_ctx->simple_devs.empty()) {
+        *free  = 0;
+        *total = 0;
+    }
+}
+
 static enum ggml_backend_dev_type ggml_backend_meta_device_get_type(ggml_backend_dev_t dev) {
     return GGML_BACKEND_DEVICE_TYPE_META;
 

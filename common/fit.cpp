@@ -674,6 +674,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t free;
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
+            // tensor split: the meta buffers report their largest per-device slice, so compare against the smallest card
+            ggml_backend_meta_device_get_memory_min(dev, &free, &total);
+        }
 
         // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
         // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
@@ -897,7 +901,11 @@ static void common_params_fit_impl(
         common_moe_cache_params * moe_cache, const size_t * margins_s, uint32_t n_ctx_min,
         const common_fit_extra_model * extra, enum ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max,
         bool preset_total_margin, size_t * verified_free_min) {
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+    // tensor split: every device holds a slice of every layer, so the only free variable is the context. The model is one
+    // meta device whose buffers report their largest per-device slice and whose memory is that of the smallest card
+    // (common_get_device_memory_data_impl), so the single-device context fit applies. LLAMA_FIT_SM_TENSOR=0: old refusal.
+    const bool sm_tensor = mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR;
+    if (sm_tensor && common_get_env("LLAMA_FIT_SM_TENSOR") == "0") {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
     constexpr int64_t MiB = 1024*1024;
@@ -941,7 +949,8 @@ static void common_params_fit_impl(
             return;
         }
 
-        const bool shares_compute = extra->shares_compute && devs.size() == 1;
+        // tensor split never shares the compute buffers between the target and the draft context (llama-context.cpp)
+        const bool shares_compute = extra->shares_compute && devs.size() == 1 && !sm_tensor;
 
         const uint32_t n_ctx_measure = cparams->n_ctx;
 
@@ -1413,6 +1422,10 @@ static void common_params_fit_impl(
     }
     if (nd == 0) {
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
+    }
+    if (sm_tensor) {
+        throw common_params_fit_exception("tensor split: the model does not fit on every device at the minimum context; "
+            "layer placement is not changed with SPLIT_MODE_TENSOR, abort");
     }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
