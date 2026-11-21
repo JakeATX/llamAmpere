@@ -915,17 +915,117 @@ static void ai2p_mm_kernels(const uint8_t * W, const int8_t * q, const float * s
     }
 }
 
+// [KAIFUSE R1] Shared AI+ activation prep. Every dense AI+ / AIF matmul rotates and int8-quantizes its activation
+// (ai4_quantize_x) before the weight kernel, and the matmuls of one input group (GDN qkv + z, attention q/k/v, FFN
+// gate + up) quantized the same activation once each. The prep of (src1, layout) is kept for the rest of the graph eval
+// in a persistent buffer (ai_prep_cache in common.cuh, the q8_cache discipline), so the group runs one prep. A hit
+// returns the bytes the skipped launch would have written: the weight kernels see identical inputs, so the output is
+// bit-identical. LLAMA_KAIFUSE=0 (or GGML_CUDA_AI_PREP_CACHE=0) is the kill switch.
+enum ai4_prep_variant { AI4_PREP_PLAIN = 0, AI4_PREP_SWAP8 = 1, AI4_PREP_XPERM = 2, AI4_PREP_LINEAR = 3 };
+
+static bool ai4_prep_cache_on() {
+    static const bool v = ai4_env_int("LLAMA_KAIFUSE", nullptr, 1) != 0 && ai4_env_int("GGML_CUDA_AI_PREP_CACHE", nullptr, 1) != 0;
+    return v;
+}
+
+static void ai4_quantize_variant(int variant, const float * X, int64_t N, int K, int xsh, int8_t * q, float * s, cudaStream_t stream) {
+    switch (variant) {
+        case AI4_PREP_SWAP8:  ai4_quantize_x<true>(X, N, K, xsh, q, s, stream); break;
+        case AI4_PREP_XPERM:  ai4_quantize_x<false, true>(X, N, K, xsh, q, s, stream); break;
+        case AI4_PREP_LINEAR: ai4_quantize_x<false, false, true>(X, N, K, xsh, q, s, stream); break;
+        default:              ai4_quantize_x(X, N, K, xsh, q, s, stream); break;
+    }
+}
+
+// Activation prep of X [N rows of K] for one AI+ matmul. key: the graph src1 tensor X belongs to (nullptr = not
+// cacheable: a 65535-row piece of a longer batch, or a temporary tensor such as a MUL_MAT_ID expert slice on the stack,
+// whose address and data pointer may repeat with other contents). Returns the prep in q / s: the cached buffer, or the pool buffers qa / sa
+// (allocated here) after a fresh launch.
+// per-entry buffer: decode and MTP verify widths (N <= 8) at every K of the 27B fit easily (8 x 17,408 x 1 B + scales);
+// larger preps (prefill ubatches) keep their own pool buffers. 3 entries = 768 KiB per device, allocated on first use.
+static constexpr size_t AI4_PREP_CACHE_BYTES = 256u << 10;
+
+static void ai4_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * key, const float * X, int64_t N, int K, int xsh,
+                     int variant, ggml_cuda_pool_alloc<int8_t> & qa, ggml_cuda_pool_alloc<float> & sa,
+                     int8_t * & q, float * & s) {
+    cudaStream_t stream = ctx.stream();
+    const size_t ns     = (size_t) N*(K >> (7 + xsh));
+    const size_t q_off  = GGML_PAD(ns*sizeof(float), 256);
+    const size_t bytes  = q_off + (size_t) N*K;
+    const int    layout = xsh | variant << 1;
+    auto & pc = ctx.ai_prep_cache;
+    // main stream only (a sibling stream could read the buffer with no ordering), never inside a borrowed scratch plan
+    const bool cacheable = key != nullptr && ai4_prep_cache_on() && !ctx.scratch_borrowed && ctx.curr_stream_no == 0 &&
+                           bytes <= AI4_PREP_CACHE_BYTES && key->data == (const void *) X;
+    if (cacheable) {
+        ggml_backend_cuda_context::ai_prep_entry * e = nullptr;
+        for (auto & c : pc.entries) {
+            if (c.epoch == ctx.graph_epoch && c.src1 == key && c.data == key->data && c.n_rows == N && c.k == K &&
+                    c.layout == layout && c.dev == ctx.device) {
+                e = &c;
+                break;
+            }
+        }
+        if (e != nullptr) {
+            e->last_use = ++pc.tick;
+            ctx.fusion_stats.ai_prep_hits++;
+        } else {
+            // an entry from an older graph eval first, else the least recently used one
+            e = &pc.entries[0];
+            for (auto & c : pc.entries) {
+                if (c.epoch != ctx.graph_epoch) {
+                    e = &c;
+                    break;
+                }
+                if (c.last_use < e->last_use) {
+                    e = &c;
+                }
+            }
+            if (e->dev != ctx.device || e->cap < bytes) {
+                // one fixed-size buffer per entry, allocated once; never freed here: a captured CUDA graph may still
+                // replay kernels that use it (see q8_cache)
+                if (e->ptr != nullptr) {
+                    pc.retired.push_back({ e->ptr, e->cap, e->dev });
+                }
+                CUDA_CHECK(ggml_cuda_device_malloc((void **) &e->ptr, AI4_PREP_CACHE_BYTES, ctx.device));
+                e->cap = AI4_PREP_CACHE_BYTES;
+                e->dev = ctx.device;
+            }
+            e->src1     = key;
+            e->data     = key->data;
+            e->epoch    = ctx.graph_epoch;
+            e->n_rows   = N;
+            e->k        = K;
+            e->layout   = layout;
+            e->last_use = ++pc.tick;
+            ai4_quantize_variant(variant, X, N, K, xsh, (int8_t *) (e->ptr + q_off), (float *) e->ptr, stream);
+            ctx.fusion_stats.ai_prep_runs++;
+        }
+        s = (float *) e->ptr;
+        q = (int8_t *) (e->ptr + q_off);
+        return;
+    }
+    qa.alloc((size_t) N*K);
+    sa.alloc(ns);
+    ai4_quantize_variant(variant, X, N, K, xsh, qa.get(), sa.get(), stream);
+    ctx.fusion_stats.ai_prep_runs++;
+    q = qa.get();
+    s = sa.get();
+}
+
 // W4A8 fast path: rotate+quantize the activations, then the AI+ decode-to-IMMA kernels
 static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const uint8_t * W, const float * X, float * Y,
-                            int M, int N, int K) {
+                            int M, int N, int K, const ggml_tensor * key = nullptr) {
     cudaStream_t stream = ctx.stream();
     const int xsh = K % 256 == 0 ? 1 : 0;
-    ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) N*K);
-    ggml_cuda_pool_alloc<float>  s(ctx.pool(), (size_t) N*(K >> (7 + xsh)));
+    ggml_cuda_pool_alloc<int8_t> qa(ctx.pool());
+    ggml_cuda_pool_alloc<float>  sa(ctx.pool());
+    int8_t * xq_p = nullptr;   // the prep (cached or in qa / sa); the weight kernels only read it
+    float  * xs_p = nullptr;
     if (t == GGML_TYPE_AIT2P_U) {
-        ai4_quantize_x(X, N, K, xsh, q.get(), s.get(), stream);
-        if (xsh) { ai2p_mm_kernels<1>(W, q.get(), s.get(), Y, M, N, K, stream); }
-        else     { ai2p_mm_kernels<0>(W, q.get(), s.get(), Y, M, N, K, stream); }
+        ai4_prep(ctx, key, X, N, K, xsh, AI4_PREP_PLAIN, qa, sa, xq_p, xs_p);
+        if (xsh) { ai2p_mm_kernels<1>(W, xq_p, xs_p, Y, M, N, K, stream); }
+        else     { ai2p_mm_kernels<0>(W, xq_p, xs_p, Y, M, N, K, stream); }
         return;
     }
     const ai23_dense_policy policy = ai23_dense_config(M, N, K, ai4_ampere_sms(ctx), ggml_ai4_rate(t));
@@ -938,9 +1038,7 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
                        (tile == 18 || tile == 19 || tile == 21 || (!tile && narrow >= 3 && (K == 5120 || K == 17408) && ai4_ampere_sms(ctx)));
     const bool xperm = ggml_ai4_rate(t) == 2 && N > 8 && N <= 64 && whole &&
                        ai4_env_int("GGML_CUDA_AI23_XPERM", nullptr, 0);
-    if (swap8) { ai4_quantize_x<true>(X, N, K, xsh, q.get(), s.get(), stream); }
-    else if (xperm) { ai4_quantize_x<false, true>(X, N, K, xsh, q.get(), s.get(), stream); }
-    else { ai4_quantize_x(X, N, K, xsh, q.get(), s.get(), stream); }
+    ai4_prep(ctx, key, X, N, K, xsh, swap8 ? AI4_PREP_SWAP8 : xperm ? AI4_PREP_XPERM : AI4_PREP_PLAIN, qa, sa, xq_p, xs_p);
     const int rate = ggml_ai4_rate(t);
     static const int small_splits = ai4_env_int("GGML_CUDA_AI23_SMALL_SPLIT", nullptr, 0);
     // This optional launch expects a scale header for every 128-column chunk.
@@ -950,12 +1048,12 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
         // All valid two/three-bit layouts use H256 at these fixed K values.
         switch (ai4_lay_of(t)) {
             case ai4k::LAY_AIT2_U:
-                if (K == 5120) ai23_small_split<ai4k::LAY_AIT2_U, 1, 5120>(W, q.get(), s.get(), partial.get(), M, N, K, small_splits, stream);
-                else ai23_small_split<ai4k::LAY_AIT2_U, 1, 17408>(W, q.get(), s.get(), partial.get(), M, N, K, small_splits, stream);
+                if (K == 5120) ai23_small_split<ai4k::LAY_AIT2_U, 1, 5120>(W, xq_p, xs_p, partial.get(), M, N, K, small_splits, stream);
+                else ai23_small_split<ai4k::LAY_AIT2_U, 1, 17408>(W, xq_p, xs_p, partial.get(), M, N, K, small_splits, stream);
                 break;
             case ai4k::LAY_AIT3_U:
-                if (K == 5120) ai23_small_split<ai4k::LAY_AIT3_U, 1, 5120>(W, q.get(), s.get(), partial.get(), M, N, K, small_splits, stream);
-                else ai23_small_split<ai4k::LAY_AIT3_U, 1, 17408>(W, q.get(), s.get(), partial.get(), M, N, K, small_splits, stream);
+                if (K == 5120) ai23_small_split<ai4k::LAY_AIT3_U, 1, 5120>(W, xq_p, xs_p, partial.get(), M, N, K, small_splits, stream);
+                else ai23_small_split<ai4k::LAY_AIT3_U, 1, 17408>(W, xq_p, xs_p, partial.get(), M, N, K, small_splits, stream);
                 break;
             default: GGML_ABORT("invalid small split layout");
         }
@@ -969,8 +1067,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
         switch (ai4_lay_of(t)) {
 #define AI23_SPLIT_U(L) \
             case L: \
-                if (xsh) { ai23_split_width<L, 1>(W, q.get(), s.get(), partial.get(), M, N, K, splits, tile, stream); } \
-                else { ai23_split_width<L, 0>(W, q.get(), s.get(), partial.get(), M, N, K, splits, tile, stream); } \
+                if (xsh) { ai23_split_width<L, 1>(W, xq_p, xs_p, partial.get(), M, N, K, splits, tile, stream); } \
+                else { ai23_split_width<L, 0>(W, xq_p, xs_p, partial.get(), M, N, K, splits, tile, stream); } \
                 break;
             AI23_SPLIT_U(ai4k::LAY_AIT2_U)
             AI23_SPLIT_U(ai4k::LAY_AIT3_U)
@@ -988,9 +1086,9 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
         GGML_ASSERT(M > 0 && K > 0 && (size_t) M <= SIZE_MAX / (size_t) K);
         ggml_cuda_pool_alloc<int8_t> decoded(ctx.pool(), (size_t) M*K);
         if (xsh) {
-            ai4k::launch_prefill_v2<ai4k::LAY_AIT4_U, 1>(W, q.get(), s.get(), decoded.get(), Y, M, M, N, K, stream);
+            ai4k::launch_prefill_v2<ai4k::LAY_AIT4_U, 1>(W, xq_p, xs_p, decoded.get(), Y, M, M, N, K, stream);
         } else {
-            ai4k::launch_prefill_v2<ai4k::LAY_AIT4_U, 0>(W, q.get(), s.get(), decoded.get(), Y, M, M, N, K, stream);
+            ai4k::launch_prefill_v2<ai4k::LAY_AIT4_U, 0>(W, xq_p, xs_p, decoded.get(), Y, M, M, N, K, stream);
         }
         return;
     }
@@ -1002,7 +1100,7 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             !(t == GGML_TYPE_AIT4_U && ai4_ampere_sms(ctx) && ai4_ampere_mmv(N)) && !(ggml_ai4v2_rate(t) && ai4_parw(N))) {
         if (ai4_mmv_cg_on()) {
             switch (ai4_lay_of(t)) {
-#define AI4_CG_U(L) case L: ai4_mmv_cg_width<L>(W, q.get(), s.get(), Y, M, N, K, stream); break;
+#define AI4_CG_U(L) case L: ai4_mmv_cg_width<L>(W, xq_p, xs_p, Y, M, N, K, stream); break;
                 AI4_CG_U(ai4k::LAY_AIT2_U)
                 AI4_CG_U(ai4k::LAY_AIT3_U)
                 AI4_CG_U(ai4k::LAY_AIT2_U2)
@@ -1025,8 +1123,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             float * out = sp > 1 ? partial.alloc((size_t) M*N*sp) : Y;
             switch (lay * 2 + (N <= 16 ? 0 : 1)) {
 #define AI4_MIDT_U(L) \
-                case L * 2:     ai4_midt_u_launch<16, L>(W, q.get(), s.get(), out, M, N, K, sp, stream); break; \
-                case L * 2 + 1: ai4_midt_u_launch<32, L>(W, q.get(), s.get(), out, M, N, K, sp, stream); break;
+                case L * 2:     ai4_midt_u_launch<16, L>(W, xq_p, xs_p, out, M, N, K, sp, stream); break; \
+                case L * 2 + 1: ai4_midt_u_launch<32, L>(W, xq_p, xs_p, out, M, N, K, sp, stream); break;
                 AI4_MIDT_U(ai4k::LAY_AIT4_U)
                 AI4_MIDT_U(ai4k::LAY_AIT4_U2)
                 AI4_MIDT_U(ai4k::LAY_AIT2_U)
@@ -1052,8 +1150,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             if (midt > 1) {
                 out = partial.alloc((size_t) M*N*midt);
             }
-            if (xsh) { ai5_midt_width<1>(W, q.get(), s.get(), out, M, N, K, midt, stream); }
-            else     { ai5_midt_width<0>(W, q.get(), s.get(), out, M, N, K, midt, stream); }
+            if (xsh) { ai5_midt_width<1>(W, xq_p, xs_p, out, M, N, K, midt, stream); }
+            else     { ai5_midt_width<0>(W, xq_p, xs_p, out, M, N, K, midt, stream); }
             if (midt > 1) {
                 ai4k::split_k_reduce<<<((int64_t) M*N + 255)/256, 256, 0, stream>>>(out, Y, (int64_t) M*N, midt);
                 CUDA_CHECK(cudaGetLastError());
@@ -1064,8 +1162,8 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     switch (ai4_lay_of(t)) {
 #define AI4_MM_U(L) \
         case L: \
-            if (xsh) { ai4_mm_kernels<L, 1>(W, q.get(), s.get(), Y, M, N, K, stream, ai4_ampere_sms(ctx)); } \
-            else     { ai4_mm_kernels<L, 0>(W, q.get(), s.get(), Y, M, N, K, stream, ai4_ampere_sms(ctx)); } \
+            if (xsh) { ai4_mm_kernels<L, 1>(W, xq_p, xs_p, Y, M, N, K, stream, ai4_ampere_sms(ctx)); } \
+            else     { ai4_mm_kernels<L, 0>(W, xq_p, xs_p, Y, M, N, K, stream, ai4_ampere_sms(ctx)); } \
             break;
         AI4_MM_U(ai4k::LAY_AIT2_U)
         AI4_MM_U(ai4k::LAY_AIT3_U)
@@ -1314,7 +1412,7 @@ void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         for (int64_t t0 = 0; t0 < T; t0 += 65535) {
             const int nt = (int) std::min<int64_t>(65535, T - t0);
             ai4_mul_mat_fast(ctx, src0->type, (const uint8_t *) src0->data, (const float *) src1->data + t0*K,
-                            (float *) dst->data + t0*M, (int) M, nt, (int) K);
+                            (float *) dst->data + t0*M, (int) M, nt, (int) K, T <= 65535 && dst->src[1] == src1 ? src1 : nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -2969,13 +3067,16 @@ static int aif_mmv_pf() {
 
 template <int XSH, bool ROW_SCALE = false, int B = 5, int V = 2, uint32_t C = AIF25_MUL, int SCALE_CHUNKS = 5>
 static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales, float * y, int M, int K, int64_t N,
-                      cudaStream_t stream) {
+                      cudaStream_t stream, const uint8_t * group_mask = nullptr) {
     // CUDA grid.y is limited to 65535; each block handles eight activation rows.
     for (int64_t n0 = 0; n0 < N; n0 += 8*65535) {
         const int nr = (int) std::min<int64_t>(N-n0, 8*65535);
         const dim3 grid(M/16, (nr+7)/8);
         const float * xs = scales + (size_t)n0*(K >> (7+XSH));
-        if (aif_mmv_pf()) {
+        if (group_mask != nullptr) {
+            // [KAIFUSE R2] row-group subset (draft shortlist); the PF kernel, bit-identical to the plain one
+            magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS,true,true><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr, group_mask);
+        } else if (aif_mmv_pf()) {
             magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS,true><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
         } else {
             magic2::mmv<B,V,C,XSH,ROW_SCALE,SCALE_CHUNKS><<<grid,128,0,stream>>>(w, q+(size_t)n0*K, xs, y+(size_t)n0*M, M,K,nr);
@@ -2986,20 +3087,20 @@ static void aif25_mmv(const uint8_t * w, const int8_t * q, const float * scales,
 
 // The mmv call for each fractional type (also the reference of GGML_CUDA_AIF25_MMQ_CHECK).
 static void aif25_mmv_type(ggml_type type, int xsh, const uint8_t * w, const int8_t * q, const float * scales, float * y,
-                           int M, int K, int64_t N, cudaStream_t stream) {
+                           int M, int K, int64_t N, cudaStream_t stream, const uint8_t * group_mask = nullptr) {
     if (type == GGML_TYPE_AIF175_U2) {
-        aif25_mmv<1, true, 7, 4, AIF175_MUL, 4>(w, q, scales, y, M, K, N, stream);
+        aif25_mmv<1, true, 7, 4, AIF175_MUL, 4>(w, q, scales, y, M, K, N, stream, group_mask);
     } else if (type == GGML_TYPE_AIF25_U2_512) {
         // K % 512 == 0, so activation scales always cover 256 columns (xsh == 1); four chunks share the row scales.
-        aif25_mmv<1, true, 5, 2, AIF25_MUL, 4>(w, q, scales, y, M, K, N, stream);
+        aif25_mmv<1, true, 5, 2, AIF25_MUL, 4>(w, q, scales, y, M, K, N, stream, group_mask);
     } else if (type == GGML_TYPE_AIF25_U2 && xsh) {
-        aif25_mmv<1, true>(w, q, scales, y, M, K, N, stream);
+        aif25_mmv<1, true>(w, q, scales, y, M, K, N, stream, group_mask);
     } else if (type == GGML_TYPE_AIF25_U2) {
-        aif25_mmv<0, true>(w, q, scales, y, M, K, N, stream);
+        aif25_mmv<0, true>(w, q, scales, y, M, K, N, stream, group_mask);
     } else if (xsh) {
-        aif25_mmv<1>(w, q, scales, y, M, K, N, stream);
+        aif25_mmv<1>(w, q, scales, y, M, K, N, stream, group_mask);
     } else {
-        aif25_mmv<0>(w, q, scales, y, M, K, N, stream);
+        aif25_mmv<0>(w, q, scales, y, M, K, N, stream, group_mask);
     }
 }
 
@@ -3020,10 +3121,12 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t N = ggml_nrows(x);
     const int xsh = K % 256 == 0 ? 1 : 0;
     auto stream = ctx.stream();
-    ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t)N*K);
-    ggml_cuda_pool_alloc<float> scales(ctx.pool(), (size_t)N*(K >> (7+xsh)));
-    // The pair kernel reads rotated columns in their original order.
-    ai4_quantize_x<false, false, true>((const float *)x->data, N, K, xsh, q.get(), scales.get(), stream);
+    ggml_cuda_pool_alloc<int8_t> qa(ctx.pool());
+    ggml_cuda_pool_alloc<float> sa(ctx.pool());
+    int8_t * qp = nullptr;
+    float  * sp = nullptr;
+    // The pair kernel reads rotated columns in their original order. [KAIFUSE R1] shared per input group.
+    ai4_prep(ctx, dst->src[1] == x ? x : nullptr, (const float *) x->data, N, K, xsh, AI4_PREP_LINEAR, qa, sa, qp, sp);
     const uint8_t * wd = (const uint8_t *) w->data;
     float * y = (float *) dst->data;
     const int tile = aif25_mmq_tile();
@@ -3032,8 +3135,8 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // [KAIMULTI] the narrow kernel obeys the same kill switches (GGML_CUDA_AIF25_MMQ=0, GGML_CUDA_AIF_RS_MMQ=0) plus its own
     const bool mmq_ok = (!row_scale || aif_rs_mmq()) && tile > 0;
     const bool wide = mmq_ok && N >= aif25_mmq_min();
-    if ((wide && ggml_cuda_aif25_mmq(w->type, xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) ||
-            (mmq_ok && aif_narrow(N) && ggml_cuda_aif25_mmq_narrow(w->type, xsh, wd, q.get(), scales.get(), y, M, K, N, stream))) {
+    if ((wide && ggml_cuda_aif25_mmq(w->type, xsh, tile, aif25_mmq_strips(), wd, qp, sp, y, M, K, N, stream)) ||
+            (mmq_ok && aif_narrow(N) && ggml_cuda_aif25_mmq_narrow(w->type, xsh, wd, qp, sp, y, M, K, N, stream))) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (aif25_mmq_check()) {
             CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
@@ -3049,7 +3152,7 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
             ggml_cuda_pool_alloc<float> ref(ctx.pool(), (size_t) n_out);
             ggml_cuda_pool_alloc<unsigned long long> count(ctx.pool(), 1);
             CUDA_CHECK(cudaMemsetAsync(count.get(), 0, sizeof(unsigned long long), stream));
-            aif25_mmv_type(w->type, xsh, wd, q.get(), scales.get(), ref.get(), M, K, N, stream);
+            aif25_mmv_type(w->type, xsh, wd, qp, sp, ref.get(), M, K, N, stream);
             k_aif25_bits_differ<<<(unsigned) ((n_out + 255)/256), 256, 0, stream>>>(y, ref.get(), n_out, count.get());
             CUDA_CHECK(cudaGetLastError());
             unsigned long long differ = 0;
@@ -3067,5 +3170,88 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         return;
     }
-    aif25_mmv_type(w->type, xsh, wd, q.get(), scales.get(), y, M, K, N, stream);
+    aif25_mmv_type(w->type, xsh, wd, qp, sp, y, M, K, N, stream);
+}
+
+// [KAIFUSE R2] Draft vocabulary shortlist on a fractional AI+ head (AIF25_U / AIF25_U2 / AIF175_U2 / AIF25_U2_512).
+// The graph scores the shortlisted rows as one-row experts: dst [1, n_sel, n_out] = MUL_MAT_ID(head viewed as
+// [K, 1, n_vocab], x [K, 1, n_out], ids [n_sel, n_out], ids row stride 0 when one list serves every output). The head
+// is stored in 16-row units, so the rows cannot be read one by one: mark the 16-row groups that hold a shortlisted id,
+// run the head's own mmv on those groups only (the others exit at once), and gather the shortlisted logits. Every
+// computed row is the full-head kernel's arithmetic on the same inputs, so the shortlisted logits are bit-identical to
+// scoring the full head and gathering (the reference path, LLAMA_RM24H_AIHEAD=2). Out-of-range ids read 0.0f here
+// (the graph only passes vocab ids < n_rows). The x prep goes through the R1 cache like any other AI+ consumer.
+static __global__ void k_aif_rows_mark(const int32_t * __restrict__ ids, int64_t ids_nb1, int n_sel, int n_out,
+                                       int n_rows, uint8_t * __restrict__ group_mask) {
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (j >= n_sel || t >= n_out) {
+        return;
+    }
+    const int32_t id = *(const int32_t *) ((const char *) ids + t*ids_nb1 + (int64_t) j*sizeof(int32_t));
+    if (id >= 0 && id < n_rows) {
+        group_mask[id >> 4] = 1;
+    }
+}
+
+static __global__ void k_aif_rows_gather(const float * __restrict__ y, const int32_t * __restrict__ ids, int64_t ids_nb1,
+                                         int n_sel, int n_rows, float * __restrict__ dst, int64_t dst_nb2) {
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (j >= n_sel) {
+        return;
+    }
+    const int32_t id = *(const int32_t *) ((const char *) ids + t*ids_nb1 + (int64_t) j*sizeof(int32_t));
+    float * d = (float *) ((char *) dst + t*dst_nb2) + j;
+    *d = id >= 0 && id < n_rows ? y[(int64_t) t*n_rows + id] : 0.0f;
+}
+
+bool ggml_cuda_aif_rows_supported(const ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    const ggml_tensor * w = op->src[0], * x = op->src[1], * ids = op->src[2];
+    const ggml_type t = w->type;
+    if (!(t == GGML_TYPE_AIF25_U || t == GGML_TYPE_AIF25_U2 || t == GGML_TYPE_AIF175_U2 || t == GGML_TYPE_AIF25_U2_512)) {
+        return false;
+    }
+    const int64_t K = w->ne[0], n_rows = w->ne[2];
+    return w->ne[1] == 1 && w->ne[3] == 1 && K % 128 == 0 && K <= INT32_MAX && n_rows % 16 == 0 && n_rows <= INT32_MAX &&
+        (t != GGML_TYPE_AIF25_U2 || K % 640 == 0) && (t != GGML_TYPE_AIF175_U2 || K % 512 == 0) &&
+        (t != GGML_TYPE_AIF25_U2_512 || K % 512 == 0) &&
+        ggml_is_contiguous(w) &&
+        x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+        x->ne[0] == K && x->ne[1] == 1 && x->ne[3] == 1 && ggml_is_contiguous(x) &&
+        ids->ne[1] == x->ne[2] && ids->ne[2] == 1 && ids->nb[0] == sizeof(int32_t) &&
+        op->ne[0] == 1 && op->ne[1] == ids->ne[0] && op->ne[2] == x->ne[2] && op->nb[1] == sizeof(float) &&
+        x->ne[2] <= 8;
+}
+
+void ggml_cuda_mul_mat_id_aif_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_aif_rows_supported(dst));
+    const ggml_tensor * w = dst->src[0], * x = dst->src[1], * ids = dst->src[2];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    GGML_ASSERT(GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE);
+    cudaStream_t stream = ctx.stream();
+    const int K = (int) w->ne[0], n_rows = (int) w->ne[2];
+    const int n_out = (int) x->ne[2], n_sel = (int) ids->ne[0];
+    const int xsh = K % 256 == 0 ? 1 : 0;
+
+    ggml_cuda_pool_alloc<int8_t> qa(ctx.pool());
+    ggml_cuda_pool_alloc<float>  sa(ctx.pool());
+    int8_t * qp = nullptr;
+    float  * sp = nullptr;
+    // the same prep the full-head MUL_MAT runs (aif25: linear layout), keyed like any other AI+ consumer
+    ai4_prep(ctx, dst->src[1] == x ? x : nullptr, (const float *) x->data, n_out, K, xsh, AI4_PREP_LINEAR, qa, sa, qp, sp);
+
+    ggml_cuda_pool_alloc<uint8_t> mask(ctx.pool(), (size_t) n_rows/16);
+    ggml_cuda_pool_alloc<float>   y(ctx.pool(), (size_t) n_out*n_rows);
+    CUDA_CHECK(cudaMemsetAsync(mask.get(), 0, (size_t) n_rows/16, stream));
+    const dim3 gs((n_sel + 255)/256, n_out);
+    k_aif_rows_mark<<<gs, 256, 0, stream>>>((const int32_t *) ids->data, ids->nb[1], n_sel, n_out, n_rows, mask.get());
+    CUDA_CHECK(cudaGetLastError());
+    aif25_mmv_type(w->type, xsh, (const uint8_t *) w->data, qp, sp, y.get(), n_rows, K, n_out, stream, mask.get());
+    k_aif_rows_gather<<<gs, 256, 0, stream>>>(y.get(), (const int32_t *) ids->data, ids->nb[1], n_sel, n_rows,
+                                              (float *) dst->data, dst->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
 }

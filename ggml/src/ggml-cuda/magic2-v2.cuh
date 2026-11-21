@@ -44,9 +44,14 @@ static __device__ __forceinline__ void mma(int (&c)[4], const uint32_t (&a)[4], 
 // Rotated, quantized activations; per-token scales are indexed by 128-column unit.
 // [K126] PF: each warp loads its next weight unit into registers while it decodes the current one (the loads of unit
 // u + 4 are issued right after unit u is in shared memory). Same bytes, same arithmetic and order: y is bit-identical.
-template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false, int SCALE_CHUNKS = 5, bool PF = false>
+// [KAIFUSE R2] MASK: blocks whose 16-row unit has group_mask[blockIdx.x] == 0 exit at once (whole block, before any
+// barrier) and write nothing; the other blocks run unchanged, so their rows are bit-identical to the unmasked launch.
+template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false, int SCALE_CHUNKS = 5, bool PF = false, bool MASK = false>
 static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const int8_t * x,
-        const float * xs, float * y, int M, int K, int N) {
+        const float * xs, float * y, int M, int K, int N, const uint8_t * __restrict__ group_mask = nullptr) {
+    if constexpr (MASK) {
+        if (group_mask[blockIdx.x] == 0) return;
+    }
     static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
     static_assert(!ROW_SCALE || (B == 5 && V == 2 && (SCALE_CHUNKS == 5 || SCALE_CHUNKS == 4)) ||
         (B == 7 && V == 4 && SCALE_CHUNKS == 4), "row-scale pair layout");

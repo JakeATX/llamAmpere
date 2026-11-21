@@ -1193,6 +1193,12 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
         free_buf(r.ptr, r.dev);
     }
     free_buf(tq_rot_cache.ptr, tq_rot_cache.dev);
+    for (const auto & e : ai_prep_cache.entries) {
+        free_buf(e.ptr, e.dev);
+    }
+    for (const auto & r : ai_prep_cache.retired) {
+        free_buf(r.ptr, r.dev);
+    }
     for (const auto & r : tq_rot_cache.retired) {
         free_buf(r.ptr, r.dev);
     }
@@ -1216,6 +1222,7 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
     q8_cache = {};
     mmq_prefill_cache = {};
     tq_rot_cache = {};
+    ai_prep_cache = {};
     moe_tables.clear();
     moe_tables_retired.clear();
     moe_slabs.clear();
@@ -4281,6 +4288,9 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     if (ggml_ai4_rate(src0->type) != 0) {
         return ggml_cuda_ai4_id_needs_sync(cc, src0->type);
     }
+    if (ggml_cuda_aif_rows_supported(dst)) {
+        return false;   // [KAIFUSE R2] device-side row groups, no host sync
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weights take the capture-safe device-routed matvec (ggml_cuda_mul_mat_id_tq) at small
@@ -4333,6 +4343,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     if (ggml_ai4_rate(src0->type) != 0) {
         ggml_cuda_mul_mat_id_ai4(ctx, dst);
+        return;
+    }
+    if (ggml_cuda_aif_rows_supported(dst)) {
+        ggml_cuda_mul_mat_id_aif_rows(ctx, dst);
         return;
     }
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -12529,6 +12543,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         } else {
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
         }
+        if (!cuda_graph_update_required) {
+            cuda_ctx->fusion_stats.cuda_graph_replays++;   // a launch with no host-side op code run this eval
+        }
         ggml_cuda_moe_cache_device_graph_record(cuda_ctx->device, cuda_graph_update_required, cgraph);
 #else
         GGML_UNUSED(graph_key);
@@ -13676,7 +13693,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 if (a->type == GGML_TYPE_AIF25_U || a->type == GGML_TYPE_AIF25_U2 || a->type == GGML_TYPE_AIF175_U2 || a->type == GGML_TYPE_AIF25_U2_512) {
                     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
-                    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && ggml_cuda_aif25_supported(op);
+                    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
+                        (ggml_cuda_aif25_supported(op) || ggml_cuda_aif_rows_supported(op));
                 }
                 if (ggml_ai4_rate(a->type) != 0) {
                     return ggml_cuda_ai4_supported(op);
@@ -14322,6 +14340,15 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "q8_cache_hits") == 0) {
         return ctx->fusion_stats.q8_cache_hits;
+    }
+    if (strcmp(name, "ai_prep_runs") == 0) {
+        return ctx->fusion_stats.ai_prep_runs;
+    }
+    if (strcmp(name, "ai_prep_hits") == 0) {
+        return ctx->fusion_stats.ai_prep_hits;
+    }
+    if (strcmp(name, "cuda_graph_replays") == 0) {
+        return ctx->fusion_stats.cuda_graph_replays;
     }
     if (strcmp(name, "moe_onechain_fill") == 0) {
         return ctx->fusion_stats.moe_onechain_fill;

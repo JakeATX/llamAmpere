@@ -36,9 +36,28 @@ struct llama_draft_compact_src {
     const float   * had  = nullptr;   // EXL3 only: [128*128] exl3_had128.weight as stored (ne0 fastest)
 };
 
+// [KAIFUSE R2] fractional AI+ head types (AIF25_U / AIF25_U2 / AIF175_U2 / AIF25_U2_512: the 8 GB file's head)
+inline bool llama_draft_vocab_aif_head(ggml_type t) {
+    return t == GGML_TYPE_AIF25_U || t == GGML_TYPE_AIF25_U2 || t == GGML_TYPE_AIF175_U2 || t == GGML_TYPE_AIF25_U2_512;
+}
+
+// [KAIFUSE R2] LLAMA_RM24H_AIHEAD: 1 (default) = a fractional AI+ head takes the shortlist as one-row experts (the CUDA
+// row-group kernel, ggml_cuda_mul_mat_id_aif_rows); 2 = reference: score the full head, then gather (bit-identical
+// shortlist logits, for the equivalence test); 0 = kill switch, the head is not eligible as before (head_layout).
+inline int llama_draft_vocab_aihead_mode() {
+    static const int v = [] {
+        const char * env = std::getenv("LLAMA_RM24H_AIHEAD");
+        return env ? std::atoi(env) : 1;
+    }();
+    return v;
+}
+
 // Score the existing AI+ head, then gather shortlist logits. This trades extra
 // projection work for avoiding a second resident weight matrix; opt-in only.
 inline bool llama_draft_vocab_full_head(const ggml_tensor * head) {
+    if (head && llama_draft_vocab_aif_head(head->type)) {
+        return llama_draft_vocab_aihead_mode() == 2;
+    }
     const char * env = std::getenv("LLAMA_DRAFT_VOCAB_FULL_HEAD");
     return env && std::atoi(env) == 1 && head &&
         (ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0);

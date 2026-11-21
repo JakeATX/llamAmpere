@@ -586,6 +586,10 @@ if (GGML_CUDA)
     add_test(NAME test-aif25-mmq-narrow COMMAND $<TARGET_FILE:test-aif25-mmq>)
     set_tests_properties(test-aif25-mmq-narrow PROPERTIES
         ENVIRONMENT "GGML_CUDA_AIF25_MMQ_MIN=64" SKIP_RETURN_CODE 77 LABELS cuda)
+    # [KAIFUSE] shared AI+ prep (R1) and the AIF draft shortlist rows (R2), bit for bit (exits 77 without a CUDA device)
+    llama_build_and_test(test-kaifuse.cpp LABEL cuda)
+    set_tests_properties(test-kaifuse PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build(test-kaifuse-logits.cpp) # [KAIFUSE] real-model logit hashes for the R1 identity check (needs a model)
 endif()
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately

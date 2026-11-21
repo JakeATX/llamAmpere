@@ -89,3 +89,6 @@ void ggml_cuda_mul_mat_id_mixed(ggml_backend_cuda_context & ctx, const ggml_tens
         const ggml_cuda_moe_mixed_pair * pair = nullptr, const ggml_cuda_moe_mixed_reduce * red = nullptr);
 bool ggml_cuda_aif25_supported(const ggml_tensor * op);
 void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst);
+// [KAIFUSE R2] MUL_MAT_ID over one-row experts of a fractional AI+ head (draft vocabulary shortlist)
+bool ggml_cuda_aif_rows_supported(const ggml_tensor * op);
+void ggml_cuda_mul_mat_id_aif_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
