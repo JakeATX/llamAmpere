@@ -25433,6 +25433,53 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // [WREAD08] GGML_TEST_AIV2_PERF=wread (or wread24 / wread8): weight-read GB/s per type at the real 27B shapes of the
+        // P76 AI4 file (AIT3, AIT4, AIT5_U, Q6_K head) and the 8 GB AI2 file (AIF175_U2, AIF25_U2, AIF25_U, AIT2_U2,
+        // AIT3), at decode / verify / multi-user widths 1..32 (GGML_TEST_WREAD_N="1,4,8" overrides the widths)
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")).rfind("wread", 0) == 0) {
+            const std::string mode = getenv("GGML_TEST_AIV2_PERF");
+            std::vector<int64_t> ns = { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 24, 32 };
+            if (const char * e = getenv("GGML_TEST_WREAD_N")) {
+                ns.clear();
+                for (const char * p = e; *p; ) {
+                    ns.push_back(strtoll(p, (char **) &p, 10));
+                    while (*p == ',') { ++p; }
+                }
+            }
+            const bool p24 = mode != "wread8", p8 = mode != "wread24";
+            for (int64_t n : ns) {
+                if (p24) {
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
+                        for (ggml_type t : { GGML_TYPE_AIT3, GGML_TYPE_AIT4 }) {
+                            test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                        }
+                    }
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 10240, 5120 }, { 6144, 5120 }, { 12288, 5120 }, { 5120, 6144 } }) {
+                        test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, GGML_TYPE_AIT5_U));
+                    }
+                    if (n <= 8) {
+                        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
+                    }
+                }
+                if (p8) {
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 6144, 5120 }, { 10240, 5120 }, { 5120, 6144 } }) {
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, GGML_TYPE_AIF175_U2));
+                    }
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 10240, 5120 }, { 12288, 5120 } }) {
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, GGML_TYPE_AIF25_U2));
+                    }
+                    if (n <= 8) {
+                        test_cases.emplace_back(new test_mul_mat_aif25(248320, n, 5120, GGML_TYPE_AIF25_U2));
+                    }
+                    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 5120, 17408 }, { 5120, 6144 } }) {
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, GGML_TYPE_AIF25_U));
+                        test_cases.emplace_back(new test_mul_mat_ait(GGML_TYPE_AIT3, mk.first, n, mk.second));
+                    }
+                    test_cases.emplace_back(new test_mul_mat_ai4(17408, n, 5120, GGML_TYPE_AIT2_U2));
+                }
+            }
+            return test_cases;
+        }
         // GGML_TEST_AIV2_PERF=aitmid: AIT3/AIT4 at the multi-user verify widths (GGML_CUDA_AIT_MIDT_SPLIT A/B), 8 and 33 as controls
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "aitmid") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
