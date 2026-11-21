@@ -180,6 +180,14 @@ static int test_law() {
             same = ref[i].first == got[i].first && std::memcmp(&ref[i].second, &got[i].second, sizeof(float)) == 0;
         }
         const bool ties = kept_has_ties(xb, 20);
+        if (ties) {  // equal-logit swaps only: the kept logits, sorted, must still be the full row's
+            std::vector<float> lr, lg;
+            for (const auto & r : ref) { lr.push_back(r.second); }
+            for (const auto & r : got) { lg.push_back(r.second); }
+            std::sort(lr.begin(), lr.end());
+            std::sort(lg.begin(), lg.end());
+            same = lr == lg;
+        }
         const auto & lawsrc = ties ? got : ref;  // with ties at the cut the law is checked on the card's own set
 
         double mx = -INFINITY;
@@ -218,11 +226,11 @@ static int test_law() {
         const int    dof = std::max<int>(1, (int) law.size() - 1);
         const double zs  = (chi2 - dof) / std::sqrt(2.0 * dof);
         // rows with equal logits at the cut may keep a different (equal-logit) token than the full row: law only
-        const bool   ok  = (same || ties) && outside == 0 && zs < 6.0;
+        const bool   ok  = same && outside == 0 && zs < 6.0;
         n_bad += !ok;
         printf("test-sampler-topk-law law: row kind %d%s, kept %zu (full row) / %zu (card), same tokens+logits %s%s, %d draws: "
                "chi2 %.2f dof %d (z %.2f), outside the law %d: %s\n",
-               mode % 3, bias.empty() ? "" : " + bans", ref.size(), got.size(), same ? "yes" : "no", ties ? " (ties at the cut)" : "",
+               mode % 3, bias.empty() ? "" : " + bans", ref.size(), got.size(), same ? "yes" : "no", ties ? " (ties at the cut: kept logits as a multiset)" : "",
                M, chi2, dof, zs, outside, ok ? "ok" : "FAIL");
     }
     return n_bad;

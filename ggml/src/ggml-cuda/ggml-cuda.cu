@@ -15712,8 +15712,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     bool headroom = false;
                     if (properties_changed && fast_recapture && graph->instance != nullptr && !graph->recaptured_last) {
                         size_t free_b = 0, total_b = 0;
-                        headroom = ggml_cuda_mem_get_info_capped(&free_b, &total_b) == cudaSuccess && free_b >= fast_recapture_min_free;
-                        (void) cudaGetLastError();
+                        const cudaError_t err = ggml_cuda_mem_get_info_capped(&free_b, &total_b);
+                        if (err != cudaSuccess) {
+                            (void) cudaGetLastError();  // only this query's error
+                        }
+                        headroom = err == cudaSuccess && free_b >= fast_recapture_min_free;
                     }
                     if (headroom) {
                         graph->recaptured_last = true;

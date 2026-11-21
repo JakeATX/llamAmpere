@@ -1139,7 +1139,7 @@ struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * g
         // (the old behavior was 64, which went to the radix select).
         static const int k_min = [] {
             const char * e = std::getenv("LLAMA_MTP_TOPK_K");
-            return e ? std::max(0, std::atoi(e)) : 0;
+            return e ? std::min(64, std::max(0, std::atoi(e))) : 0;  // K <= 64: wider rows go to the slow full-row sort
         }();
         const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
         llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_top_k(std::min(n_vocab, std::max(gsmpl->fused_top_k, k_min))));
