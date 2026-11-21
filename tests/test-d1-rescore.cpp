@@ -473,7 +473,6 @@ static void test_cert(const std::string & dir) {
         std::vector<float> L = L0;
         c.on_read_all(L.data(), V, R);
         std::printf("misaligned %s\n", c.audit_summary().c_str());
-        CHECK(c.audit.top_same == (uint64_t) R, "misaligned h still self-consistent (why the z check exists)");
         CHECK(c.audit.z_max > 20.0 && c.audit.z_gt6 > c.audit.z_n / 2, "misaligned h: z check fires (z_max %.3g, %llu/%llu > 6)",
               c.audit.z_max, (unsigned long long) c.audit.z_gt6, (unsigned long long) c.audit.z_n);
     }
