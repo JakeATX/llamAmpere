@@ -980,6 +980,9 @@ public:
     std::vector<const ggml_tensor *> inklsa_kcaches;
     mutable std::vector<std::pair<const ggml_tensor *, uint64_t>> inklsa_commit;
 
+    // INKREL (llama-inklsa.h, default on): split full-attention inputs for wide ubatches
+    llama_inkrel_inputs inkrel;
+
     // distance from the token to the cell, extent for the empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
@@ -2162,6 +2165,17 @@ struct llm_graph_context {
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
             ggml_tensor * table, // [n_head_q, extent + 1, n_tokens]
             ggml_tensor * sinks, // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
+
+    // INKREL (llama-inklsa.h): full-attention visit as far + near flash attention merged by log-sum-exp; k and v are
+    // the cache views with this ubatch already stored, the sink logit is zero (folded into table)
+    ggml_tensor * build_attn_inkrel(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * table,
                   float   kq_scale,
                     int   il) const;
 

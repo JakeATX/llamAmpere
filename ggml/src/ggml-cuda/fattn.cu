@@ -1332,8 +1332,9 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
-    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
-        return false; // kv_rows (src[9]): the kv-stream streamed FA reads K/V pages in cell order only
+    if (ggml_flash_attn_ext_uses_src9(dst)) {
+        return false; // kv_rows or an LSE output (src[9]): the kv-stream streamed FA reads K/V pages in cell order
+                      // only and writes no LSE
     }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -5009,12 +5010,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     // fork (LSA compensation, opt-in): an LSE output (src[9]) is written only by the parallel-block combine of the
-    // generic kernels, so skip the fused / i8qk / bounded routes and take tile instead of MMA (MMA launches stream-k)
+    // generic kernels or the MMA stream-k uniform fixup, so skip the fused / i8qk / bounded routes
     if (ggml_flash_attn_ext_get_lse(dst) != nullptr) {
         const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
         GGML_ASSERT(k != BEST_FATTN_KERNEL_NONE);
+        // MMA f16 with the stream-k uniform fixup writing the LSE (INKREL 32K gate: within the batch-split rounding
+        // floor, prefill faster than tile); GGML_CUDA_FA_LSE_MMA=0 restores the tile route
+        static const bool lse_mma = [] { const char * e = getenv("GGML_CUDA_FA_LSE_MMA"); return !(e && *e) || atoi(e) != 0; }();
         if (k == BEST_FATTN_KERNEL_VEC) {
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        } else if (k == BEST_FATTN_KERNEL_MMA_F16 && lse_mma) {
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
         } else {
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
         }

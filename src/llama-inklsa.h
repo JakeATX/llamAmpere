@@ -33,6 +33,15 @@ struct llama_inklsa_config {
     int64_t max_t   = 16;    // LLAMA_INKLSA_MAX_T: wider ubatches stay dense
     int     reuse_pass = 0;  // LLAMA_INKLSA_REUSE_PASS=1: loop passes 1 and 2 reuse pass 0's pick of the same layer
     bool    stats   = false; // LLAMA_INKLSA_STATS: log the configuration once
+    // INKREL (REL-SPLIT, lossless, default on; independent of LLAMA_INKLSA; F16 K/V, no kv-stream; positions of a ubatch
+    // contiguous per sequence, else set_input asserts): ubatches of >= rel_min_t rows attend
+    // to the full-attention visits in two flash-attention calls instead of one call with a per-head F32 bias mask
+    // [n_head, n_kv, T]: (a) every cell at distance >= the relative extent E, broadcast mask, no bias (the bias row
+    // there is a per-(head,row) constant, added to that call's log-sum-exp); (b) the cells at distance < E, gathered,
+    // with the exact per-head bias. The two outputs and the zero-logit sink are merged by their log-sum-exp.
+    bool    relsplit  = true; // LLAMA_INKREL (0 = old single-call path)
+    int64_t rel_min_t = 2;    // LLAMA_INKREL_MIN_T: narrower ubatches keep the single call (decode T = 1 always does:
+                              // its dense mask is small; verify widths split too, so the reserve covers them)
 };
 
 const llama_inklsa_config & llama_inklsa_cfg();
@@ -58,6 +67,20 @@ void llama_inklsa_forget(const ggml_tensor * const * kcaches, size_t n);
 
 // per-graph inputs of the INKLSA path, shared by every full-attention visit of the graph (llama-graph.cpp builds
 // them, llama_kv_cache::set_input_inklsa fills them)
+// INKREL per-graph inputs (llama-graph.cpp builds them when llama_inkrel_want(), llama_kv_cache::set_input_inkrel
+// fills them); one sequence per ubatch
+struct llama_inkrel_inputs {
+    bool          on        = false;
+    int64_t       n_near    = 0;       // near-cell capacity: extent - 1 + T, rounded up to 256
+    ggml_tensor * far_mask  = nullptr; // F16 [n_kv, T]   0 for a visible cell at distance >= extent, else -inf; a row
+                                       //                 with no such cell sees its own cell at -30000 (weight 0)
+    ggml_tensor * near_ids  = nullptr; // I32 [n_near]    cells within extent of some row, padding = a valid cell
+    ggml_tensor * near_rel  = nullptr; // I32 [n_near, T] bias-table row (distance) per near cell and row
+    ggml_tensor * near_mask = nullptr; // F32 [n_near, T] 0 for 0 <= distance < extent, else -inf
+};
+// INKREL applies to a graph with T rows over n_kv cells (single sequence, flash attention)
+bool llama_inkrel_want(int64_t n_kv, int64_t T, int64_t extent);
+
 struct llama_inklsa_inputs {
     bool          sparse   = false;   // this graph attends over the compact set (else: dense, index refresh only)
     int64_t       B        = 0;

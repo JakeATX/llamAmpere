@@ -1835,6 +1835,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
+    if (inkrel.on && inkrel.far_mask->buffer) {
+        attn_ctx->get_base()->set_input_inkrel(inkrel, ubatch, extent);
+    }
+
     if (inklsa_on) {
         attn_ctx->get_base()->set_input_inklsa(inklsa, ubatch, extent);
         for (const auto & c : inklsa_commit) {
@@ -1885,6 +1889,16 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    {
+        const int64_t n_kv = attn_ctx->get_base()->get_n_kv();
+        const bool want = params.cparams.flash_attn && !params.cparams.training && params.cparams.n_seq_max == 1 &&
+                params.ubatch.n_seqs_unq <= 1 && llama_inkrel_want(n_kv, params.ubatch.n_tokens, extent);
+        res &= want == inkrel.on;
+        if (inkrel.on) {
+            res &= inkrel.far_mask->ne[0] == n_kv && inkrel.far_mask->ne[1] == params.ubatch.n_tokens;
+        }
+    }
 
     if (inklsa_on) {
         // a rebuild graph is never reused; a graph built on a valid index only while every index is still valid
@@ -9052,6 +9066,30 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
         }
     }
 
+    // INKREL (llama-inklsa.h): far + near inputs for wide ubatches (decided from the shapes only, so the reserve graph
+    // sizes the same split)
+    {
+        const int64_t n_kv = attn_ctx->get_base()->get_n_kv();
+        const int64_t T    = ubatch.n_tokens;
+        auto & in = inp->inkrel;
+        if (cparams.flash_attn && !cparams.training && cparams.n_seq_max == 1 && ubatch.n_seqs_unq <= 1 &&
+                llama_inkrel_want(n_kv, T, extent)) {
+            in.on        = true;
+            in.n_near    = (extent - 1 + T + 255)/256*256;
+            in.far_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, T);
+            in.near_ids  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, in.n_near);
+            in.near_rel  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, in.n_near, T);
+            in.near_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in.n_near, T);
+            for (ggml_tensor * t : {in.far_mask, in.near_ids, in.near_rel, in.near_mask}) {
+                ggml_set_input(t);
+            }
+            ggml_set_name(in.far_mask,  "inkrel_far_mask");
+            ggml_set_name(in.near_ids,  "inkrel_near_ids");
+            ggml_set_name(in.near_rel,  "inkrel_near_rel");
+            ggml_set_name(in.near_mask, "inkrel_near_mask");
+        }
+    }
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -9134,6 +9172,61 @@ static ggml_tensor * inklsa_block_mean(ggml_context * ctx, ggml_tensor * x) {
     return ggml_reshape_2d(ctx, ggml_scale(ctx, f, 1.0f/B), D, n);
 }
 
+ggml_tensor * llm_graph_context::build_attn_inkrel(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * table,
+              float   kq_scale,
+                int   il) const {
+    const auto & in = inp->inkrel;
+    const int64_t n_head = table->ne[0];
+    const int64_t E      = table->ne[1] - 1;
+    const int64_t T      = n_tokens;
+    GGML_ASSERT(in.on && k->ne[3] == 1 && in.far_mask->ne[0] == k->ne[2] && E == (int64_t) inp->extent);
+    // ordering: the LSE outputs are leaves written through FA src[9] (no graph edge); build_attn_mha expands each FA
+    // node before the merge below is built, so the default in-order schedule runs both FA calls first
+
+    // (a) far: every cell at distance >= E, broadcast mask; its bias is the per-(head,row) constant table[:, E, :]
+    lsa_lse_req = true;
+    ggml_tensor * o_f = build_attn_mha(q_cur, k, v, nullptr, in.far_mask, nullptr, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * l_f = lsa_lse;                                                              // [n_head, T]
+    lsa_lse = nullptr;
+    GGML_ASSERT(l_f != nullptr);
+    ggml_tensor * c_far = ggml_view_2d(ctx0, table, n_head, T, table->nb[2], E*table->nb[1]);
+    l_f = ggml_add(ctx0, ggml_reshape_2d(ctx0, l_f, n_head, T), c_far);
+
+    // (b) near: the cells within E of some row, gathered, with the per-head bias
+    ggml_tensor * kn = inklsa_gather(ctx0, k, 1, in.near_ids);
+    ggml_tensor * vn = inklsa_gather(ctx0, v, 1, in.near_ids);
+    ggml_tensor * mn = ggml_get_rows(ctx0, table, in.near_rel);                               // [n_head, n_near, T]
+    mn = ggml_cont(ctx0, ggml_permute(ctx0, mn, 2, 0, 1, 3));                                 // [n_near, T, n_head]
+    mn = ggml_cast(ctx0, ggml_add(ctx0, mn, in.near_mask), GGML_TYPE_F16);
+    cb(mn, "inkrel_near_mask", il);
+    lsa_lse_req = true;
+    ggml_tensor * o_n = build_attn_mha(q_cur, kn, vn, nullptr, mn, nullptr, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * l_n = lsa_lse;
+    lsa_lse = nullptr;
+    GGML_ASSERT(l_n != nullptr);
+    l_n = ggml_reshape_2d(ctx0, l_n, n_head, T);
+
+    // merge: softmax over (far, near, sink = 0) per head and row
+    ggml_tensor * l0 = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_head, T), 0.0f);
+    ggml_tensor * l3 = ggml_concat(ctx0, ggml_concat(ctx0, ggml_reshape_3d(ctx0, l_f, 1, n_head, T),
+            ggml_reshape_3d(ctx0, l_n, 1, n_head, T), 0), ggml_reshape_3d(ctx0, l0, 1, n_head, T), 0);  // [3, n_head, T]
+    ggml_tensor * w = ggml_soft_max(ctx0, l3);
+    ggml_tensor * w_f = ggml_view_3d(ctx0, w, 1, n_head, T, w->nb[1], w->nb[2], 0);
+    ggml_tensor * w_n = ggml_view_3d(ctx0, w, 1, n_head, T, w->nb[1], w->nb[2], w->nb[0]);
+    const int64_t dv = o_f->ne[0]/n_head;
+    ggml_tensor * cur = ggml_add(ctx0,
+            ggml_mul(ctx0, ggml_reshape_3d(ctx0, o_f, dv, n_head, T), ggml_cont(ctx0, w_f)),
+            ggml_mul(ctx0, ggml_reshape_3d(ctx0, o_n, dv, n_head, T), ggml_cont(ctx0, w_n)));
+    cur = ggml_reshape_2d(ctx0, cur, dv*n_head, T);
+    cb(cur, "kqv_out", il);
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_attn_rel(
         llm_graph_input_mem_hybrid_iswa_rel * inp,
         ggml_tensor * q_cur,
@@ -9155,6 +9248,24 @@ ggml_tensor * llm_graph_context::build_attn_rel(
         if (!kc->buffer || kv->type != GGML_TYPE_F16 || kv->ne[3] != 1 || inp_attn->self_k_rot[il] || inp_attn->self_v_rot[il] ||
                 mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il)) {
             kc = nullptr; // memory-fit dry run, or a cache INKLSA does not cover: dense
+        }
+    }
+
+    // INKREL: a cache the split covers (plain K/V types, no rotation or scales, one stream)
+    if (!is_swa && kc == nullptr && inp->inkrel.on) {
+        ggml_tensor * kv = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * vv = mctx_cur->get_v(ctx0, il);
+        // F16 only: other types lose the bounded-prefill FA plan once an LSE output is attached (larger reserve);
+        // no kv-stream (host-paged K/V: the near gather and the LSE need device-resident K/V)
+        if (kv->type == GGML_TYPE_F16 && vv->type == GGML_TYPE_F16 && cparams.kv_stream_arena_mib == 0 && kv->ne[3] == 1 && vv->nb[1] < vv->nb[2] && !inp_attn->self_k_rot[il] &&
+                !inp_attn->self_v_rot[il] && !mctx_cur->get_k_scale(il) && !mctx_cur->get_v_scale(il)) {
+            ggml_build_forward_expand(gf, q_cur);
+            ggml_build_forward_expand(gf, k_cur);
+            ggml_build_forward_expand(gf, v_cur);
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp_attn->get_k_idxs(), il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp_attn->get_v_idxs(), il));
+            GGML_UNUSED(sinks); // zero sink logit (folded into table)
+            return build_attn_inkrel(inp, q_cur, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il), table, kq_scale, il);
         }
     }
 
@@ -9208,6 +9319,10 @@ ggml_tensor * llm_graph_context::build_attn_rel(
     ub = ggml_reshape_3d(ctx0, ub, D, B, in.n_u);
     ggml_tensor * index = ggml_set_rows(ctx0, idx.t, inklsa_block_mean(ctx0, ub), in.u_blk64); // view of idx.t
     ggml_build_forward_expand(gf, index);
+
+    if (!in.sparse && inp->inkrel.on) {
+        return build_attn_inkrel(inp, q_cur, k, v, table, kq_scale, il);
+    }
 
     if (!in.sparse) {
         // dense attention over the full cache (K/V already stored: pass no k_cur / v_cur)

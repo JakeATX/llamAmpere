@@ -5325,6 +5325,76 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+// INKREL (llama-inklsa.h): far mask over every cell, near cells (within extent of some row) with their bias rows
+void llama_kv_cache::set_input_inkrel(const llama_inkrel_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const {
+    const int64_t T    = ubatch->n_tokens;
+    const int64_t n_kv = in.far_mask->ne[0];
+    const llama_seq_id seq = ubatch->seq_id[0][0];
+    const auto & cells = v_cells.at(seq_to_stream.at(seq));
+    GGML_ASSERT(in.far_mask->ne[1] == T && in.near_rel->ne[1] == T);
+
+    llama_pos p0 = ubatch->pos[0], p1 = ubatch->pos[0];
+    for (int64_t i = 0; i < T; ++i) {
+        GGML_ASSERT(ubatch->seq_id[i][0] == seq && "INKREL: one sequence per ubatch");
+        p0 = std::min(p0, ubatch->pos[i]);
+        p1 = std::max(p1, ubatch->pos[i]);
+    }
+
+    // cell positions of this sequence (-1: empty or another sequence), the near cells and each row's own cell
+    std::vector<llama_pos> cp(n_kv, -1);
+    std::vector<int32_t> ids;
+    ids.reserve(in.n_near);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (!cells.is_empty(j) && cells.seq_has(j, seq)) {
+            cp[j] = cells.pos_get(j);
+            if (cp[j] > p0 - (llama_pos) extent && cp[j] <= p1) {
+                ids.push_back((int32_t) j);
+            }
+        }
+    }
+    GGML_ASSERT(!ids.empty() && (int64_t) ids.size() <= in.n_near && "INKREL: more near cells than planned");
+    const int64_t n_real = (int64_t) ids.size();
+    while ((int64_t) ids.size() < in.n_near) {
+        ids.push_back(ids[0]);
+    }
+
+    const ggml_fp16_t f16_zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
+    const ggml_fp16_t f16_dead = ggml_fp32_to_fp16(-30000.0f);
+    std::vector<ggml_fp16_t> far(n_kv*T);
+    std::vector<int32_t> rel(in.n_near*T);
+    std::vector<float>   msk(in.n_near*T);
+    for (int64_t i = 0; i < T; ++i) {
+        const llama_pos p = ubatch->pos[i];
+        ggml_fp16_t * fr = far.data() + i*n_kv;
+        int64_t own = -1;
+        bool any = false;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const bool vis = cp[j] >= 0 && p - cp[j] >= (llama_pos) extent;
+            fr[j] = vis ? f16_zero : f16_ninf;
+            any |= vis;
+            if (cp[j] == p) {
+                own = j;
+            }
+        }
+        if (!any) {
+            // no far cell: the row's own cell at a logit the merge weighs as zero keeps the row finite
+            GGML_ASSERT(own >= 0 && "INKREL: row without its own cell");
+            fr[own] = f16_dead;
+        }
+        for (int64_t c = 0; c < in.n_near; ++c) {
+            const llama_pos d = p - cp[ids[c]];
+            const bool vis = c < n_real && d >= 0 && d < (llama_pos) extent;
+            rel[i*in.n_near + c] = vis ? d : (int32_t) extent;
+            msk[i*in.n_near + c] = vis ? 0.0f : -INFINITY;
+        }
+    }
+    ggml_backend_tensor_set(in.far_mask,  far.data(), 0, ggml_nbytes(in.far_mask));
+    ggml_backend_tensor_set(in.near_ids,  ids.data(), 0, ggml_nbytes(in.near_ids));
+    ggml_backend_tensor_set(in.near_rel,  rel.data(), 0, ggml_nbytes(in.near_rel));
+    ggml_backend_tensor_set(in.near_mask, msk.data(), 0, ggml_nbytes(in.near_mask));
+}
+
 // INKLSA (llama-inklsa.h): fixed cells, their bias rows and masks, block eligibility and the blocks this ubatch writes.
 // One sequence per ubatch and cells == positions (the block structure is over cells); both are checked.
 void llama_kv_cache::set_input_inklsa(const llama_inklsa_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const {
@@ -7560,6 +7630,10 @@ void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const lla
 
 void llama_kv_cache_context::set_input_inklsa(const llama_inklsa_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_inklsa(in, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_inkrel(const llama_inkrel_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_inkrel(in, ubatch, extent);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

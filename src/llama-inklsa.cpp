@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -24,6 +25,8 @@ const llama_inklsa_config & llama_inklsa_cfg() {
         c.max_t      = inklsa_env("LLAMA_INKLSA_MAX_T", c.max_t);
         c.reuse_pass = (int) inklsa_env("LLAMA_INKLSA_REUSE_PASS", 0);
         c.stats      = inklsa_env("LLAMA_INKLSA_STATS", 0) != 0;
+        c.relsplit   = inklsa_env("LLAMA_INKREL", 1) != 0;
+        c.rel_min_t  = std::max<int64_t>(2, inklsa_env("LLAMA_INKREL_MIN_T", c.rel_min_t));
         if (c.on) {
             if (c.block <= 0 || 256 % c.block != 0 || c.sinks < 0 || c.sinks % c.block != 0 || c.keep <= 0 ||
                     c.window <= 0 || c.max_t <= 0) {
@@ -40,6 +43,12 @@ const llama_inklsa_config & llama_inklsa_cfg() {
         return c;
     }();
     return cfg;
+}
+
+bool llama_inkrel_want(int64_t n_kv, int64_t T, int64_t extent) {
+    const auto & c = llama_inklsa_cfg();
+    // both calls need >= 2 KV tiles (the LSE comes from the parallel-block combine), and the near set fits in the view
+    return c.relsplit && extent > 0 && T >= c.rel_min_t && n_kv >= 2*extent + T && n_kv % 256 == 0;
 }
 
 int64_t llama_inklsa_n_fix() {
