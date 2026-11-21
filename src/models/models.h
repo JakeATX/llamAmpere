@@ -1596,6 +1596,11 @@ struct llama_model_dflash : public llama_model_base {
         graph_mistral_large4(const llm_graph_params & params);
     };
 
+    // Inkling2 DSpark: block backbone decoded once, then one recurrent markov head step per drafted token
+    struct graph_inkling2 : public llm_graph_context {
+        graph_inkling2(const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
@@ -2453,6 +2458,10 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // layer visits built so far: a looped model visits its core layers once per pass, in visit order
+        // (cache slot ids are not), so layer-input features (DSpark drafter) are indexed by visit
+        int n_visit = 0;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

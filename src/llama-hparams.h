@@ -637,6 +637,7 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size         = 0;
     uint32_t dflash_selector_rank           = 0;
     uint32_t dflash_selector_top_k          = 0;
+    uint32_t dspark_markov_rank             = 0; // Inkling2 DSpark rnn context head
 
 
 

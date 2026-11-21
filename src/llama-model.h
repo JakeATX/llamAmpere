@@ -725,6 +725,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_post_conv    = nullptr;
     struct ggml_tensor * ffn_res_query    = nullptr;
 
+    // inkling2 dspark
+    struct ggml_tensor * attn_k_ctx      = nullptr;
+    struct ggml_tensor * attn_v_ctx      = nullptr;
+    struct ggml_tensor * attn_k_ctx_norm = nullptr;
+    struct ggml_tensor * dflare_norm     = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -937,6 +943,10 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
     struct ggml_tensor * dspark_joint_proj_b = nullptr;
     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
+    struct ggml_tensor * dspark_fuse         = nullptr; // inkling2: per-layer target feature mixture logits
+    struct ggml_tensor * dspark_norm         = nullptr;
+    struct ggml_tensor * dspark_hidden_out   = nullptr;
+    struct ggml_tensor * dspark_hidden_out_b = nullptr;
 
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
