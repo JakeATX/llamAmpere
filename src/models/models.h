@@ -2440,6 +2440,10 @@ struct llama_model_inkling2 : public llama_model_base {
                 int64_t offset);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
 
+        // fork (INKFLAGS): rms-normed block stacks [n_embd, n_blocks, n_tokens] keyed by the block list, built once per graph
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks;
+        ggml_tensor * mix_stack(const std::vector<ggml_tensor *> & blocks);
+
     protected:
         // the helpers alone, a derived graph builds its own body
         struct no_build {};

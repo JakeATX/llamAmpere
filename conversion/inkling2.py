@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from functools import partial
@@ -28,6 +29,10 @@ def _e4m3_table() -> np.ndarray:
 _E4M3 = _e4m3_table()
 _E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
 _EXPERT_CHUNK_ROWS = 128
+# INKLING2_EXPERT_SCALE_TENSOR=1: keep the NVFP4 experts' per-expert outer scale (amax / denominator) out of the weights and
+# write it as the ffn_*_exps.scale tensor (applied by build_moe_ffn), so the dequantized weights are e2m1 x e4m3 products,
+# exact in BF16 (a lossless "truth" file). Default off = the upstream behaviour (scale folded in, rounded to the out type).
+_SCALE_TENSOR = os.environ.get("INKLING2_EXPERT_SCALE_TENSOR", "0") == "1"
 
 
 def _dequant_expert_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tensor], amax: Callable[[], Tensor] | None, denominator: Callable[[], Tensor] | None, name: str, expert: int, rows: slice) -> np.ndarray:
@@ -49,8 +54,9 @@ def _dequant_expert_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tens
             raise ValueError(f"Inkling2: {name}_amax expert {expert}: expected finite nonnegative value")
         if not np.isfinite(d) or d <= 0:
             raise ValueError(f"Inkling2: {name}_outer_scale_denominator expert {expert}: expected finite positive value")
-        with np.errstate(over="ignore", invalid="ignore"):
-            values *= np.float32(a) / np.float32(d)
+        if not _SCALE_TENSOR:
+            with np.errstate(over="ignore", invalid="ignore"):
+                values *= np.float32(a) / np.float32(d)
     else:
         if np.any(scales == 255):
             raise ValueError(f"Inkling2: {name}_scale expert {expert}: UE8M0 byte 255 is NaN")
@@ -101,6 +107,7 @@ class Inkling2Model(TextModel):
     def __init__(self, dir_model: Path, *args, **kwargs):
         self._expert_quant: dict[str, dict] = {}
         self._packed_experts: dict[str, gguf.LazyChunkedTensor] = {}
+        self._expert_scales: dict[str, Tensor] = {}
         quant_path = dir_model / "hf_quant_config.json"
         if quant_path.is_file():
             with open(quant_path, encoding="utf-8") as f:
@@ -188,6 +195,10 @@ class Inkling2Model(TextModel):
                         row_slice = slice(2 * start + half, 2 * stop + half, 2) if w13 else slice(start, stop)
                         chunks.append(partial(_dequant_expert_chunk, weight, scale, amax, denominator, name, expert, row_slice))
             self._packed_experts[name] = gguf.LazyChunkedTensor(chunks, shape, np.float32)
+            if nvfp4 and _SCALE_TENSOR:
+                a = LazyTorchTensor.to_eager(amax()).numpy().astype(np.float32)
+                d = np.float32(LazyTorchTensor.to_eager(denominator()).item())
+                self._expert_scales[name] = torch.from_numpy((a / d).astype(np.float32))
             self.model_tensors[name] = lambda shape=shape: torch.empty(shape, dtype=torch.float32, device="meta")
             for companion in required:
                 del self.model_tensors[companion]
@@ -255,6 +266,8 @@ class Inkling2Model(TextModel):
         if name in self._packed_experts:
             target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
             yield self.map_tensor_name(target, try_suffixes=()) + ".weight", cast("Tensor", self._packed_experts[name])
+            if name in self._expert_scales:
+                yield self.map_tensor_name(target, try_suffixes=()) + ".scale", self._expert_scales[name]
             return
         if name.endswith(".w13_weight"):
             shape = data_torch.shape
