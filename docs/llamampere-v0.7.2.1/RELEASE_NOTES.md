@@ -11,8 +11,9 @@ reading the whole chat again. Same model files as v0.7.2. The 24dense, 12dense a
   the sparse-attention cache (`GGML_CUDA_LSA_RESIDENT_STAGE=128`, was 256; the output is bit-identical). On the 8 GB
   file, reading a 99,984-token prompt from cold went from 441.8 to 507.4 tokens/s (+14.8%), and filling the rest of the
   context up to 204,640 tokens went 27% faster (RTX 3090 limited to a 3070's free memory).
-  @@PENDING UB512: real RTX 3070 numbers (prefill tok/s at 99,984, decode tok/s v0.7.2 vs v0.7.2.1, peak MiB vs the
-  7,692 MiB line)@@
+  On a real RTX 3070 (220 W, PCIe 3.0 x16 host) the cold 99,984-token prompt went from 205.1 to 256.8 tokens/s (+25%),
+  the fill up to 204,640 tokens from 94.6 to 134.7 tokens/s (+42%), and writing speed stayed the same (table below).
+  Peak card memory at the 204,640-token fill is 7,657 MiB (v0.7.2: 7,607), under the 7,692 MiB headless line.
   An explicit `-ub` or `GGML_CUDA_LSA_RESIDENT_STAGE` still overrides the preset.
 - **8 GB cards keep a prompt cache.** Before, `--preset 8dense` turned the prompt cache off. Now it uses the normal
   defaults: a RAM cache sized from your host memory (12 GiB on a 64 GB machine, at most half of the free memory) and a
@@ -34,6 +35,9 @@ reading the whole chat again. Same model files as v0.7.2. The 24dense, 12dense a
 - **Windows build from the tag.** The v0.7.2 source did not link on Windows (the server called a function the Windows
   DLL does not export), so the v0.7.2 Windows zip was built from a one-line fix on top of the tag. That fix is part of
   v0.7.2.1, and its Windows zip is built from the v0.7.2.1 tag itself.
+- **Source build fixes.** The CPU backend builds with warnings as errors again (an unused variable), and Windows builds
+  with clang no longer fail to link on `__cpu_model` (the AVX2 runtime checks are skipped on MSVC targets). Linux
+  binaries behave the same.
 
 ## Measured
 
@@ -41,12 +45,17 @@ Speed gate, v0.7.2.1 against v0.7.2: chat template, temperature 1, 6 seeds per b
 
 | card | model and setup | prompt | reply | v0.7.2 tokens/s (sd) | v0.7.2.1 tokens/s (sd) | v0.7.2.1 / v0.7.2 |
 |---|---|---:|---:|---:|---:|---:|
-| RTX 3090 | 27B AI4, `--preset 24dense`, disk cache off | 98,766 | 5,120 | @@PENDING G24 A@@ | @@PENDING G24 B@@ | @@PENDING@@ |
-| RTX 3090, limited to a 3070's memory | 8 GB file, `--preset 8dense` | 99,984 | 5,120+ | @@PENDING G8 A@@ | @@PENDING G8 B@@ | @@PENDING@@ |
-| RTX 3070 | 8 GB file, `--preset 8dense` | 99,984 | 5,120+ | @@PENDING UB512 real@@ | @@PENDING UB512 real@@ | @@PENDING@@ |
+| RTX 3090 Ti | 27B AI4, `--preset 24dense`, disk cache off | 98,766 | 5,120 | 123.46 (12.84) | 123.39 (12.85) | 0.999 |
+| RTX 3090 Ti, limited to a 3070's memory | 8 GB file, `--preset 8dense` | 99,984 | 5,120+ | 64.20 (2.74) | 63.91 (1.41) | 0.996 |
+| RTX 3070 (220 W, PCIe 3.0 x16 host) | 8 GB file, `--preset 8dense` | 99,984 | 5,120+ | 35.72 (0.86) | 35.70 (0.68) | 0.999 |
 
 - `--preset 8dense` with the 8 GB file starts at 204,800 tokens of context with batch 512; peak card memory at a
-  204,640-token fill: @@PENDING smoke peak@@ MiB (v0.7.2: @@PENDING@@; headless line 7,692 MiB).
+  204,640-token fill on the RTX 3070: 7,657 MiB (v0.7.2: 7,607; headless line 7,692 MiB).
+- On the RTX 3070 the v0.7.2.1 column is the v0.7.2 build with the v0.7.2.1 8dense settings (batch 512, staging 128,
+  prompt cache and warm prefill on); the two builds share the same GPU libraries. Writing speed there is 35.7
+  tokens/s in both builds. v0.7.1 measured 41.4 at the same prompt on an RTX 3070 in a different host (PCIe 4.0 x16).
+  On 8, 10 and 12 GB cards part of the context lives in host memory, so writing speed depends on the host's PCIe link
+  (see the PCIe note in the README).
 - The GPU libraries (`libggml*`) are byte-identical to v0.7.2.
 
 **Linux build:** `llamampere-v0.7.2.1-linux-x86_64-cuda12-server.tar`, same as v0.7.2: Ubuntu 22.04 or newer (glibc
@@ -56,7 +65,8 @@ libraries (licence and source notes inside; the GCC source is attached to the re
 
 **Ada and Blackwell build:** `llamampere-v0.7.2.1-linux-x86_64-cuda12.8-sm86-89-120-server-fat.tar` is built for RTX 30
 (sm_86), RTX 40 (sm_89) and RTX 50 (sm_120) cards with CUDA 12.8 and needs an NVIDIA driver 570 or newer. Its GPU
-libraries are the v0.7.2 ones. @@PENDING fat smoke: checked on an RTX 3090 (sm_86)@@
+libraries are the v0.7.2 ones. Checked on an RTX 3090 Ti (sm_86): Mellum2.1-12B IQ3_XS, 27B AI4 with `--preset 24dense`
+and the 8 GB file with `--preset 8dense` each load and answer.
 
 **Windows build:** `llamampere-v0.7.2.1-windows-x86_64-cuda12-server.zip`, built by CI like v0.7.2 (CUDA 12.4, sm_86,
 driver R550+); not run on a GPU by us.

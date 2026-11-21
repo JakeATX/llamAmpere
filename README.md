@@ -6,7 +6,7 @@ It runs Qwen3.8 models, including Qwen3.8-27B with its built-in MTP draft head (
 
 ## What's new in v0.7.2.1
 
-- 8 GB cards read prompts faster: `--preset 8dense` now reads prompts in batches of 512 tokens and still starts at the full 204,800-token context. A cold 99,984-token prompt reads at 507.4 tokens/s instead of 441.8 (+14.8%, 8 GB file, RTX 3090 limited to a 3070's memory). @@PENDING UB512 real RTX 3070 prefill + decode numbers@@ [Release notes](docs/llamampere-v0.7.2.1/RELEASE_NOTES.md).
+- 8 GB cards read prompts faster: `--preset 8dense` now reads prompts in batches of 512 tokens and still starts at the full 204,800-token context. A cold 99,984-token prompt reads at 507.4 tokens/s instead of 441.8 (+14.8%, 8 GB file, RTX 3090 limited to a 3070's memory); on a real RTX 3070 (PCIe 3.0 x16 host) at 256.8 instead of 205.1 (+25%), with the same writing speed (35.70 vs 35.72 tokens/s, 6 seeds) and a 7,657 MiB peak at a 204,640-token fill. [Release notes](docs/llamampere-v0.7.2.1/RELEASE_NOTES.md).
 - 8 GB cards keep a prompt cache (RAM and disk) and warm the next turn after each reply: switching back to an 11.6K-token chat, or resending after a server restart, waits about 0.5 to 1.9 s for the first token instead of about 17 to 18 s, and a 100K-token chat comes back in 0.89 s instead of 225 s (RTX 3090 Ti / 3090 limited to a 3070's memory). Turn off with `--cache-ram 0`, `--no-cache-disk` or `--no-warm-prefill`.
 - The Windows zip is built from the release tag again (v0.7.2 needed a one-line link fix on top), and the MTP drafter no longer prints a "verify reserve skipped" warning at every memory reserve. 24dense, 12dense and 10dense are unchanged.
 
