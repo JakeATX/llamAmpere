@@ -56,6 +56,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <cmath>
+#include <algorithm>
 #include <string>
 
 // [#195] decode tile of the stream kernel. An enum class, not a bool, so that no positional `true`/`false` meant for
@@ -1374,8 +1376,107 @@ static int ggml_cuda_fattn_sj_kvarn_stream_occupancy(const int NT, const int KW)
 
 static bool ggml_cuda_fattn_sj_nt6_logged = false; // GGML_SJKVARN_NT6_OCC log, one line per process
 
+// [SPLITATTN] split-KV launch heuristic for long contexts. The stream kernel already splits the body records of a KV head
+// over gridDim.y blocks and merges the parts with flash_attn_combine_results (log-sum-exp: max, rescale, sum). launch_fattn
+// sizes that split from occupancy only (one wave: nsm * CTAs/SM blocks), so at 100K+ positions each block walks a long
+// serial record range. Above LLAMA_FA_SPLITKV_MIN_KV positions the split is raised to LLAMA_FA_SPLITKV_WAVES waves of the
+// launched instance, keeping >= LLAMA_FA_SPLITKV_MIN_REC records per block. Only the KV split (and so the reduction order)
+// changes: rounding-level differences. LLAMA_FA_SPLITKV=0 (off/false/no) = the v0.7.2.1 split everywhere (kill switch).
+// LLAMA_FA_SPLITKV_PB=n forces n blocks per KV head above the threshold (diagnostic sweeps).
+// Not applied to: GGML_SJKVARN_DIRECT_STABLE (fixed split by design) and the LSA live-record walk (the host does not know
+// the live record count, so the cap below would be wrong).
+struct ggml_cuda_fattn_sj_splitkv_cfg {
+    bool  on;
+    float waves;
+    int   min_kv;
+    int   min_rec;
+    int   pb_force;
+    bool  w78; // widths 7/8 on the compact tile (its own split) instead of the 8-warp rows kernel
+};
+
+static const ggml_cuda_fattn_sj_splitkv_cfg & ggml_cuda_fattn_sj_splitkv_get_cfg() {
+    static const ggml_cuda_fattn_sj_splitkv_cfg cfg = [] {
+        auto env_on = [](const char * name, const bool def) {
+            const char * e = getenv(name);
+            if (e == nullptr || *e == '\0') {
+                return def;
+            }
+            std::string w(e);
+            for (char & c : w) {
+                c = (char) tolower((unsigned char) c);
+            }
+            return !(w == "0" || w == "off" || w == "false" || w == "no");
+        };
+        auto env_num = [](const char * name, const double def) {
+            const char * e = getenv(name);
+            if (e == nullptr || *e == '\0') {
+                return def;
+            }
+            char * end = nullptr;
+            const double v = strtod(e, &end);
+            if (end == e || *end != '\0' || !(v >= 0.0)) {
+                GGML_LOG_WARN("%s: %s=\"%s\" is not a number >= 0: using %g\n", "ggml_cuda_fattn_sj_splitkv", name, e, def);
+                return def;
+            }
+            return v;
+        };
+        ggml_cuda_fattn_sj_splitkv_cfg c;
+        c.on       = env_on("LLAMA_FA_SPLITKV", true);
+        c.waves    = (float) env_num("LLAMA_FA_SPLITKV_WAVES", 2.0);
+        c.min_kv   = (int) env_num("LLAMA_FA_SPLITKV_MIN_KV", 16384);
+        c.min_rec  = std::max(1, (int) env_num("LLAMA_FA_SPLITKV_MIN_REC", 4));
+        c.pb_force = (int) env_num("LLAMA_FA_SPLITKV_PB", 0);
+        c.w78      = c.on && env_on("LLAMA_FA_SPLITKV_W78", false);
+        if (!c.on) {
+            GGML_LOG_INFO("ggml_cuda_fattn_sj_splitkv: LLAMA_FA_SPLITKV=0: v0.7.2.1 KV split\n");
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+// KV split (blocks per KV head) for one stream launch; pb_in is the caller's split (0 = launch_fattn's occupancy rule).
+// Returns pb_in unchanged when the heuristic does not raise it, so short contexts keep the old launch bit for bit.
+static int ggml_cuda_fattn_sj_splitkv_pb(const void * kernel, const ggml_tensor * dst, const int nthreads, const size_t shared,
+        const int pb_in, const int NT) {
+    const ggml_cuda_fattn_sj_splitkv_cfg & cfg = ggml_cuda_fattn_sj_splitkv_get_cfg();
+    if (!cfg.on || ggml_cuda_fattn_sj_live_records != nullptr) {
+        return pb_in;
+    }
+    const int n_kv = ggml_get_op_params_i32(dst, 6);
+    if (n_kv < cfg.min_kv) {
+        return pb_in;
+    }
+    const int ntiles_KV  = (n_kv + fattn_sj_kvarn_stream::UNIT - 1) / fattn_sj_kvarn_stream::UNIT;
+    const int ntiles_dst = (int) (dst->src[1]->ne[2] * dst->src[0]->ne[3]);
+    const int nsm        = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    int occ = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kernel, nthreads, shared));
+    if (occ <= 0 || ntiles_dst <= 0) {
+        return pb_in;
+    }
+    // the split launch_fattn would take (its non-stream-k rule, or the caller's override capped by the record count)
+    const int pb0 = pb_in > 0 ? std::min(pb_in, ntiles_KV) : ggml_cuda_fattn_sj_kvarn_stream_parallel_blocks(dst, occ);
+    int pb = cfg.pb_force > 0 ? cfg.pb_force
+                              : (int) std::ceil(cfg.waves * (double) (nsm*occ) / (double) ntiles_dst);
+    pb = std::min(pb, std::max(1, ntiles_KV / cfg.min_rec));
+    pb = std::min(pb, ntiles_KV);
+    if (cfg.pb_force <= 0 && pb <= pb0) {
+        return pb_in;
+    }
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t bit = 1u << (NT & 15);
+    if (!(logged.fetch_or(bit) & bit)) {
+        GGML_LOG_INFO("ggml_cuda_fattn_sj_splitkv: width %d, %d positions: KV split %d -> %d blocks per KV head "
+                      "(%d CTA/SM, %d SMs, %d KV heads x seqs; LLAMA_FA_SPLITKV=0 restores it; first node only)\n",
+                      NT, n_kv, pb0, pb, occ, nsm, ntiles_dst);
+    }
+    return pb;
+}
+
 template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
-static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, const int parallel_blocks) {
+static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int NT, const int KW, int parallel_blocks,
+        const bool splitkv_ok = true) {
     using namespace fattn_sj_kvarn_stream;
     // the LSA instance only when the opt-in live-record list is set (never for turbo4 bodies)
     fattn_kernel_t kernel = ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot, false, tile>();
@@ -1422,6 +1523,10 @@ static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_co
              /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/false, /*use_sparse=*/false, WARP_SIZE, nullptr, nullptr, parallel_blocks,
              /*async_kv_preload=*/false, /*sj_fill_kv_splits=*/turbo4_body ? 0 : KW);
     } else {
+        if (splitkv_ok) {
+            parallel_blocks = ggml_cuda_fattn_sj_splitkv_pb(reinterpret_cast<const void *>(kernel), dst, WARP_SIZE*NT*KW,
+                ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body), parallel_blocks, (int) dst->src[0]->ne[1]);
+        }
     launch_fattn<D, NCOLS2, NCOLS2>
         (ctx, dst, kernel, NT*KW,
          ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body), UNIT,
@@ -1965,7 +2070,7 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
         const int blocks = ggml_cuda_fattn_sj_kvarn_stream_occupancy<8, 6, turbo4_body, rot>(4, 1);
         const int heads = dst->src[1]->ne[2];
         const int parallel_blocks = std::max(1, (device.nsm*blocks + heads - 1)/heads);
-        ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch<8, 6, turbo4_body, rot>(ctx, dst, NT, 1, parallel_blocks);
+        ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch<8, 6, turbo4_body, rot>(ctx, dst, NT, 1, parallel_blocks, /*splitkv_ok=*/false);
         return;
     }
     const int KW = NT <= 4 ? (kw8 ? 8/NT : 4/NT) : 1;
@@ -1995,7 +2100,7 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     // == n_q warps, width 5 is the Q5/G6 case below
     if (NT == 4 || NT >= 6) {
         int cmode = ggml_cuda_fattn_sj_kvarn_compact_mode_for(dst, NT == 4 && kw8);
-        if (cmode == 1 && NT >= 7) {
+        if (cmode == 1 && NT >= 7 && !(ggml_cuda_fattn_sj_splitkv_get_cfg().w78 && ggml_get_op_params_i32(dst, 6) >= ggml_cuda_fattn_sj_splitkv_get_cfg().min_kv)) {
             // KVROWS step b (fakeep99, 3090 Ti): mode 1 at widths 7/8 is 12-14% slower than the rows kernel (the copied
             // 8-warp split gives the 6-warp compact grid half the blocks it can hold), so mode 1 never runs there.
             // [DSPINE2 B0] widths 7/8 take mode 2 (own split) by default instead of the rows kernel: DSpine 8-row verify at a
