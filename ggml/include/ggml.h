@@ -493,6 +493,7 @@ extern "C" {
         GGML_OP_LSA_UNIT_LSE,
         GGML_OP_LSA_PREFETCH,
         GGML_OP_DEPTH_MIX,
+        GGML_OP_LOOP_GATE,
 
         GGML_OP_UNARY,
 
@@ -2479,6 +2480,18 @@ extern "C" {
             struct ggml_tensor  * query,
             float                 eps,
             float                 scale);
+
+    // fork (INKFLAGS, Inkling 2 loop gate, LLAMA_INKLING2_GATE_FUSED): x, m F32 [n, T] (rows may be strided);
+    // down [2n, R], gain and forget [R, n], F32/F16/BF16. g = down . concat(rms_norm(x), rms_norm(m)) (eps, no weight);
+    // result F32 [n, T] = x - tanh(forget . g)*x + tanh(gain . g)*m
+    GGML_API struct ggml_tensor * ggml_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget,
+            float                 eps);
 
     // LLAMA_LSA_J3 (opt-in): side-stream prefetch into the record-page slots of a later LSA layer's resident SJ-KVaRN
     // body. desc: that layer's SJ-KVaRN descriptor (I32); body: its body tensor; units: F32 [n_units, rows] 0/1

@@ -76,6 +76,24 @@ void llama_model_inkling2_loop::load_arch_tensors_post(llama_model_loader & ml) 
     }
 }
 
+void llama_model_inkling2_loop::load_arch_data_post() {
+    const ggml_tensor * q0 = loop_layers[0].msg_query;
+    for (const auto & l : loop_layers) {
+        if (l.msg_query->type != GGML_TYPE_F32 || !ggml_is_contiguous(l.msg_query) || !l.msg_query->buffer ||
+                ggml_backend_buffer_get_type(l.msg_query->buffer) != ggml_backend_buffer_get_type(q0->buffer)) {
+            return;
+        }
+    }
+    const size_t size = ggml_nbytes(q0);
+    msg_query_all = create_derived_tensor(ggml_backend_buffer_get_type(q0->buffer), GGML_TYPE_F32, q0->ne[0],
+            q0->ne[1]*loop_layers.size(), "loop_msg_query_all");
+    std::vector<uint8_t> data(size);
+    for (size_t i = 0; i < loop_layers.size(); ++i) {
+        ggml_backend_tensor_get(loop_layers[i].msg_query, data.data(), 0, size);
+        ggml_backend_tensor_set(msg_query_all, data.data(), i*size, size);
+    }
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }
@@ -104,6 +122,11 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
             cur = prelude;
             blocks = prelude_blocks;
         }
+        // fork (INKFLAGS): a message depends only on the previous pass, so all core layers' messages are mixed at the
+        // pass start in one op, [n_embd, 4*n_core, n_tokens]; layer ip reads its 4 rows. LLAMA_INKLING2_MSG_BATCH=0 = one mix
+        // per layer.
+        static const bool msg_batch = [] { const char * e = getenv("LLAMA_INKLING2_MSG_BATCH"); return !e || atoi(e) != 0; }();
+        ggml_tensor * msgs = pass > 0 && msg_batch && m.msg_query_all ? mix(bank, bank_out, m.msg_query_all) : nullptr;
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
             if (pass == 0) {
@@ -111,7 +134,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            ggml_tensor * messages = msgs ? ggml_view_3d(ctx0, msgs, n_embd, LOOP_CTRL_COUNT, n_tokens, msgs->nb[1], msgs->nb[2],
+                    (ip - start)*LOOP_CTRL_COUNT*msgs->nb[1]) : mix(bank, bank_out, loop.msg_query);
+            cur = build_layer(il, ip, cur, blocks, messages, &loop);
         }
     }
 

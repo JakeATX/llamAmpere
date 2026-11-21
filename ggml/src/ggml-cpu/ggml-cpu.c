@@ -2953,6 +2953,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_depth_mix(params, tensor);
             } break;
+        case GGML_OP_LOOP_GATE:
+            {
+                ggml_compute_forward_loop_gate(params, tensor);
+            } break;
         case GGML_OP_LSA_PREFETCH:
             {
                 // slot-map hint for a GPU record-page body: nothing to do on the CPU
@@ -3151,6 +3155,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_LSA_COMP_MERGE:
         case GGML_OP_LSA_UNIT_LSE:
         case GGML_OP_DEPTH_MIX:
+        case GGML_OP_LOOP_GATE:
             {
                 n_tasks = n_threads;
             } break;

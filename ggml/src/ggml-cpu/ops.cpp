@@ -14106,3 +14106,61 @@ void ggml_compute_forward_depth_mix(
         }
     }
 }
+
+// ggml_compute_forward_loop_gate (fork, Inkling 2 loop gate; see ggml.h). Tokens are split over the threads.
+
+static float loop_gate_w(const ggml_tensor * w, int64_t i) {
+    switch (w->type) {
+        case GGML_TYPE_F16:  return GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) w->data)[i]);
+        case GGML_TYPE_BF16: return GGML_BF16_TO_FP32(((const ggml_bf16_t *) w->data)[i]);
+        default:             return ((const float *) w->data)[i];
+    }
+}
+
+void ggml_compute_forward_loop_gate(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * m      = dst->src[1];
+    const ggml_tensor * down   = dst->src[2];
+    const ggml_tensor * gain   = dst->src[3];
+    const ggml_tensor * forget = dst->src[4];
+
+    const float   eps = ggml_get_op_params_f32(dst, 0);
+    const int64_t n   = x->ne[0];
+    const int64_t R   = down->ne[1];
+
+    std::vector<float> in(2*n), g(R);
+    for (int64_t t = params->ith; t < x->ne[1]; t += params->nth) {
+        const float * xr = (const float *) ((const char *) x->data + t*x->nb[1]);
+        const float * mr = (const float *) ((const char *) m->data + t*m->nb[1]);
+        ggml_float sx = 0.0, sm = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            sx += (ggml_float) (xr[i]*xr[i]);
+            sm += (ggml_float) (mr[i]*mr[i]);
+        }
+        const float rx = 1.0f/sqrtf((float) (sx/n) + eps);
+        const float rm = 1.0f/sqrtf((float) (sm/n) + eps);
+        for (int64_t i = 0; i < n; ++i) {
+            in[i]     = xr[i]*rx;
+            in[n + i] = mr[i]*rm;
+        }
+        for (int64_t r = 0; r < R; ++r) {
+            float d = 0.0f;
+            for (int64_t i = 0; i < 2*n; ++i) {
+                d += loop_gate_w(down, r*2*n + i)*in[i];
+            }
+            g[r] = d;
+        }
+        float * out = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = 0; i < n; ++i) {
+            float ag = 0.0f, af = 0.0f;
+            for (int64_t r = 0; r < R; ++r) {
+                ag += loop_gate_w(gain,   i*R + r)*g[r];
+                af += loop_gate_w(forget, i*R + r)*g[r];
+            }
+            out[i] = (xr[i] - tanhf(af)*xr[i]) + tanhf(ag)*mr[i];
+        }
+    }
+}

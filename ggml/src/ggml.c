@@ -1411,6 +1411,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LSA_UNIT_LSE",
     "LSA_PREFETCH",
     "DEPTH_MIX",
+    "LOOP_GATE",
 
     "UNARY",
 
@@ -1428,7 +1429,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1533,6 +1534,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "lsa_unit_lse(k, q, mask)",
     "lsa_prefetch(desc, body, units)",
     "depth_mix(stack, cur, query)",
+    "loop_gate(x, m, down, gain, forget)",
 
     "unary(x)",
 
@@ -1550,7 +1552,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6038,6 +6040,38 @@ struct ggml_tensor * ggml_depth_mix(
     result->src[0] = cur;
     result->src[1] = query;
     result->src[2] = stack;
+
+    return result;
+}
+
+// ggml_loop_gate
+
+struct ggml_tensor * ggml_loop_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * m,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * gain,
+        struct ggml_tensor  * forget,
+        float                 eps) {
+    const int64_t n = x->ne[0];
+    const int64_t R = down->ne[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && m->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(x, m) && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(down->ne[0] == 2*n && gain->ne[0] == R && gain->ne[1] == n && ggml_are_same_shape(gain, forget));
+    GGML_ASSERT(ggml_is_contiguous(down) && ggml_is_contiguous(gain) && ggml_is_contiguous(forget));
+    GGML_ASSERT(gain->type == forget->type);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, x->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_LOOP_GATE;
+    result->src[0] = x;
+    result->src[1] = m;
+    result->src[2] = down;
+    result->src[3] = gain;
+    result->src[4] = forget;
 
     return result;
 }

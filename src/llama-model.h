@@ -1117,10 +1117,15 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     // fork (INKFLAGS): after the generic optional-tensor pass (.scale etc.), e.g. to re-share aliased layer slots
     virtual void load_arch_tensors_post(llama_model_loader & ml) { GGML_UNUSED(ml); }
+    // fork (INKFLAGS): after the weights are loaded, e.g. to build derived weights with create_derived_tensor
+    virtual void load_arch_data_post() {}
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:
     llama_model_params params;
+
+    // fork (INKFLAGS): a weight-usage tensor of its own buffer (kept by the model), for weights derived after loading
+    ggml_tensor * create_derived_tensor(ggml_backend_buffer_type_t buft, ggml_type type, int64_t ne0, int64_t ne1, const char * name);
 
     struct impl;
     std::shared_ptr<impl> pimpl;

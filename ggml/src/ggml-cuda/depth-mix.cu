@@ -21,7 +21,7 @@ template <int NQ, int W>
 static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         const char * __restrict__ stack, const int64_t s_nb1, const int64_t s_nb2, const int k,
         const char * __restrict__ cur, const int64_t c_nb1, const char * __restrict__ query, const int64_t q_nb1,
-        float * __restrict__ dst, const int n, const float eps, const float scale) {
+        float * __restrict__ dst, const int n, const int nq_all, const float eps, const float scale) {
     __shared__ float part[DEPTH_MIX_MAX_ROWS*(NQ + 1)];
     __shared__ float p[DEPTH_MIX_MAX_ROWS*NQ];
     __shared__ float s_r;
@@ -34,6 +34,8 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
     const int nc     = max(1, nwarps/(k + 1));
     const int cl     = (nv + nc - 1)/nc;
 
+    query += blockIdx.y*NQ*q_nb1;
+
     const float * x = (const float *) (cur + t*c_nb1);
     const char  * s = stack + t*s_nb2;
 
@@ -43,6 +45,7 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         const float * row = j < k ? (const float *) (s + j*s_nb1) : x;
         float d[NQ] = {0.0f};
         float ss = 0.0f;
+#pragma unroll 4
         for (int v = c*cl + lane; v < min(nv, (c + 1)*cl); v += WARP_SIZE) {
             float a[W];
             depth_mix_load<W>(a, row + v*W);
@@ -116,17 +119,28 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
     __syncthreads();
 
     const float r = s_r;
-    float * out = dst + (int64_t) t*NQ*n;
+    float * out = dst + ((int64_t) t*nq_all + blockIdx.y*NQ)*n;
     for (int v = threadIdx.x; v < nv; v += blockDim.x) {
         float acc[NQ][W] = {{0.0f}};
-        for (int j = 0; j < k; ++j) {
-            float a[W];
-            depth_mix_load<W>(a, (const float *) (s + j*s_nb1) + v*W);
+        // 4 state rows in flight before any of them is used
+        for (int j0 = 0; j0 < k; j0 += 4) {
+            float a[4][W];
 #pragma unroll
-            for (int q = 0; q < NQ; ++q) {
+            for (int u = 0; u < 4; ++u) {
+                if (j0 + u < k) {
+                    depth_mix_load<W>(a[u], (const float *) (s + (j0 + u)*s_nb1) + v*W);
+                }
+            }
 #pragma unroll
-                for (int w = 0; w < W; ++w) {
-                    acc[q][w] += p[j*NQ + q]*a[w];
+            for (int u = 0; u < 4; ++u) {
+                if (j0 + u < k) {
+#pragma unroll
+                    for (int q = 0; q < NQ; ++q) {
+#pragma unroll
+                        for (int w = 0; w < W; ++w) {
+                            acc[q][w] += p[(j0 + u)*NQ + q]*a[u][w];
+                        }
+                    }
                 }
             }
         }
@@ -145,7 +159,8 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
 bool ggml_cuda_depth_mix_supported(const ggml_tensor * op) {
     const ggml_tensor * stack = op->src[2];
     const int64_t k = stack ? stack->ne[1] : 0;
-    return op->src[1]->ne[1] >= 1 && op->src[1]->ne[1] <= 4 && k + 1 <= DEPTH_MIX_MAX_ROWS && ggml_is_contiguous(op);
+    const int64_t nq = op->src[1]->ne[1];
+    return nq >= 1 && (nq <= 4 || (nq % 4 == 0 && nq/4 <= 65535)) && k + 1 <= DEPTH_MIX_MAX_ROWS && ggml_is_contiguous(op);
 }
 
 void ggml_cuda_depth_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -170,11 +185,14 @@ void ggml_cuda_depth_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
     const bool vec = n % 4 == 0 && (s1 | s2 | cur->nb[1] | query->nb[1]) % 16 == 0 &&
         ((uintptr_t) sd | (uintptr_t) cur->data | (uintptr_t) query->data | (uintptr_t) dst->data) % 16 == 0;
-#define DEPTH_MIX_LAUNCH(NQ) (vec ? k_depth_mix<NQ, 4><<<T, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, \
-        (const char *) cur->data, cur->nb[1], (const char *) query->data, query->nb[1], (float *) dst->data, n, eps, scale) : \
-    k_depth_mix<NQ, 1><<<T, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, \
-        (const char *) cur->data, cur->nb[1], (const char *) query->data, query->nb[1], (float *) dst->data, n, eps, scale))
-    switch (query->ne[1]) {
+    // more than 4 queries: groups of 4, one block row each (all groups read the same states)
+    const int  nq = (int) query->ne[1];
+    const dim3 grid((unsigned) T, nq > 4 ? nq/4 : 1);
+#define DEPTH_MIX_LAUNCH(NQ) (vec ? k_depth_mix<NQ, 4><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, \
+        (const char *) cur->data, cur->nb[1], (const char *) query->data, query->nb[1], (float *) dst->data, n, nq, eps, scale) : \
+    k_depth_mix<NQ, 1><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, \
+        (const char *) cur->data, cur->nb[1], (const char *) query->data, query->nb[1], (float *) dst->data, n, nq, eps, scale))
+    switch (nq > 4 ? 4 : nq) {
         case 1: DEPTH_MIX_LAUNCH(1); break;
         case 2: DEPTH_MIX_LAUNCH(2); break;
         case 3: DEPTH_MIX_LAUNCH(3); break;

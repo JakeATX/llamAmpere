@@ -2477,6 +2477,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
     void load_arch_tensors_post(llama_model_loader & ml) override;
+    void load_arch_data_post() override;
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;
@@ -2490,6 +2491,9 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     // indexed by physical layer - core_start
     std::vector<loop_layer> loop_layers;
+    // fork (INKFLAGS): the message queries of all core layers side by side [n_embd, 4*n_core], so a pass mixes all its
+    // messages in one op (LLAMA_INKLING2_MSG_BATCH); null if the queries are not F32 in one buffer type
+    ggml_tensor * msg_query_all = nullptr;
 
     struct graph : public llama_model_inkling2::graph {
         graph(const llm_graph_params & params);

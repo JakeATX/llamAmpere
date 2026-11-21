@@ -87,6 +87,7 @@
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/lsa-select.cuh"
 #include "ggml-cuda/depth-mix.cuh"
+#include "ggml-cuda/loop-gate.cuh"
 #include "ggml-cuda/lsa-comp.cuh"
 #include "ggml-cuda/sjkvarn-seal.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
@@ -4656,6 +4657,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DEPTH_MIX:
             ggml_cuda_depth_mix(ctx, dst);
+            break;
+        case GGML_OP_LOOP_GATE:
+            ggml_cuda_loop_gate(ctx, dst);
             break;
         case GGML_OP_LSA_PREFETCH:
             ggml_cuda_lsa_prefetch(ctx, dst); // no-op unless the body has record-page slots
@@ -14147,6 +14151,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lsa_unit_lse_supported(op);
         case GGML_OP_DEPTH_MIX:
             return ggml_cuda_depth_mix_supported(op);
+        case GGML_OP_LOOP_GATE:
+            return ggml_cuda_loop_gate_supported(op);
         case GGML_OP_LSA_PREFETCH:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:

@@ -205,7 +205,7 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     // fork (INKFLAGS): the norm of cur, the scores, the softmax and the weighted sum in one op (GGML_OP_DEPTH_MIX), 1 kernel
     // per mix instead of 7 at decode. LLAMA_INKLING2_MIX_FUSED=0 = the unfused graph below.
     static const bool mix_fused = [] { const char * e = getenv("LLAMA_INKLING2_MIX_FUSED"); return !e || atoi(e) != 0; }();
-    if (mix_fused && mix_cache && query->type == GGML_TYPE_F32 && query->ne[1] <= 4) {
+    if (mix_fused && mix_cache && query->type == GGML_TYPE_F32 && (query->ne[1] <= 4 || query->ne[1] % 4 == 0)) {
         return ggml_depth_mix(ctx0, blocks.empty() ? nullptr : mix_stack(blocks), ggml_reshape_2d(ctx0, cur, n_embd, n_tokens),
             query, 1e-6f, 1.0f/sqrtf(n_embd));
     }
@@ -278,6 +278,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
+    // fork (INKFLAGS): the whole gate in one op (2 kernels instead of 12) at decode/verify widths, with the weights read in
+    // their stored type. LLAMA_INKLING2_GATE_FUSED=0 = the graph below.
+    static const bool gate_fused = [] { const char * e = getenv("LLAMA_INKLING2_GATE_FUSED"); return !e || atoi(e) != 0; }();
+    if (gate_fused && n_tokens <= 8 && loop.ctrl_gain[ctrl]->type == loop.ctrl_forget[ctrl]->type &&
+            loop.ctrl_down[ctrl]->type == loop.ctrl_gain[ctrl]->type && ggml_is_contiguous(loop.ctrl_down[ctrl]) &&
+            (loop.ctrl_down[ctrl]->type == GGML_TYPE_F32 || loop.ctrl_down[ctrl]->type == GGML_TYPE_F16 ||
+             loop.ctrl_down[ctrl]->type == GGML_TYPE_BF16)) {
+        return ggml_loop_gate(ctx0, cur, message, loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl], 1e-6f);
+    }
     ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 

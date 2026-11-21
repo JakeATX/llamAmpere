@@ -15882,6 +15882,34 @@ struct test_depth_mix : public test_case {
     }
 };
 
+// GGML_OP_LOOP_GATE (Inkling 2 loop gate, LLAMA_INKLING2_GATE_FUSED) vs CPU: x and m as strided row views
+struct test_loop_gate : public test_case {
+    const int64_t n, R, T;
+    const ggml_type wt;
+
+    test_loop_gate(int64_t n, int64_t R, int64_t T, ggml_type wt) : n(n), R(R), T(T), wt(wt) {}
+
+    std::string vars() override { return VARS_TO_STR4(n, R, T, wt); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * xm     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 3, T);
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, wt, 2*n, R);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, wt, R, n);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, wt, R, n);
+        ggml_set_name(xm, "xm");
+        ggml_tensor * x = ggml_view_2d(ctx, xm, n, T, xm->nb[2], 0);
+        ggml_tensor * m = ggml_view_2d(ctx, xm, n, T, xm->nb[2], 2*xm->nb[1]);
+        return ggml_loop_gate(ctx, x, m, down, gain, forget, 1e-6f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // weights ~ U(-0.05, 0.05): gate products of order 1, tanh away from saturation
+            init_tensor_uniform(t, strcmp(t->name, "xm") == 0 ? -4.0f : -0.05f, strcmp(t->name, "xm") == 0 ? 4.0f : 0.05f);
+        }
+    }
+};
+
 // GGML_OP_LSA_UNIT_LSE (LLAMA_LSA_UNIT_OP) vs CPU: random F16/F32 index keys with strided rows (d = 64: 16-byte rows,
 // vector loads; d = 60: scalar loads), causal F16 mask with empty cells (fully masked units give -inf on both).
 struct test_lsa_unit_lse : public test_case {
@@ -21701,6 +21729,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_depth_mix(2304, 5, 3, 3, true));
     test_cases.emplace_back(new test_depth_mix(102, 2, 2, 4)); // scalar loads
+    // per-pass message batch: 12 layers x 4 queries in one op (groups of 4)
+    test_cases.emplace_back(new test_depth_mix(2304, 6, 48, 1));
+    test_cases.emplace_back(new test_depth_mix(2304, 6, 48, 5));
+    test_cases.emplace_back(new test_depth_mix(2304, 0, 8, 3));
+    // [INKFLAGS] LLAMA_INKLING2_GATE_FUSED: loop gate vs CPU (F32 / BF16 / F16 weights, decode and verify widths)
+    for (ggml_type wt : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        for (int64_t T : {1, 3, 8}) {
+            test_cases.emplace_back(new test_loop_gate(2304, 64, T, wt));
+        }
+    }
+    test_cases.emplace_back(new test_loop_gate(100, 24, 2, GGML_TYPE_F32));
     // GGML_LSA_ULSE_COOP=1 lane-shared kernel: d 128/256 (16/32 lanes per cell), a partial last CTA, 1..8 rows (n_kv must divide by F)
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 5, 16, 128));
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 3, 1, 256));
