@@ -23554,6 +23554,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // [KAIMULTI] GGML_TEST_AIV2_PERF=kaimulti: AIF175_U2 / AIF25_U2 / AIF25_U at the dense 27B shapes and the 2-4 user
+        // verify widths 9..32 (8 as the 1-user control), for the GGML_CUDA_AIF_NARROW A/B
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "kaimulti") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 }, { 5120, 6144 } }) {
+                for (int64_t n : { 8, 9, 12, 16, 20, 24, 28, 32 }) {
+                    for (ggml_type t : { GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2, GGML_TYPE_AIF25_U }) {
+                        if (mk.second % (t == GGML_TYPE_AIF25_U2 ? 640 : t == GGML_TYPE_AIF175_U2 ? 512 : 128) != 0) { continue; }
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, t));
+                    }
+                }
+            }
+            return test_cases;
+        }
         // GGML_TEST_AIV2_PERF=aitmid: AIT3/AIT4 at the multi-user verify widths (GGML_CUDA_AIT_MIDT_SPLIT A/B), 8 and 33 as controls
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "aitmid") {
             for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 } }) {
