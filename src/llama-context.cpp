@@ -1962,6 +1962,7 @@ llama_context::~llama_context() {
         ink_stream.reset();
     }
     if (d1) {
+        d1->drain(); // [EXACTHEAD] count the async rows still in flight
         LLAMA_LOG_WARN("%s\n", d1->summary().c_str()); // [D1] exit counters (gate 8.0(d))
         if (d1->audit_every > 0) {
             LLAMA_LOG_WARN("%s\n", d1->audit_summary().c_str());
@@ -8598,6 +8599,9 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
+    if (d1) {
+        d1->drain(); // [EXACTHEAD] no swap while the d1 pool still writes rows (callers synchronize first anyway)
+    }
     const uint64_t n_vocab    = model.vocab.n_tokens();
     const uint64_t n_embd     = model.hparams.n_embd;
     const uint64_t n_embd_out = model.hparams.n_embd_out();
