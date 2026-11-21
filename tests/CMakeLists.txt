@@ -179,6 +179,8 @@ llama_build(test-inkmiss-cpu.cpp LINK ggml) # [INKMISS] CPU MUL_MAT_ID hashes: r
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
 llama_build_and_test(test-kq-mask-pack.cpp)
+llama_build_and_test(test-kld-topk.cpp)
+target_include_directories(test-kld-topk PRIVATE ${PROJECT_SOURCE_DIR}/tools/perplexity)
 llama_build_and_test(test-gdn-prefix-lanes.cpp LABEL "turbo") # [TAG_GDN_REPLAY_LANES] per-lane prefix mask
 llama_build_and_test(test-sjkvarn-codec.cpp LABEL "turbo")
 target_include_directories(test-sjkvarn-codec PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)

@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "kld-topk.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -195,6 +196,12 @@ struct kl_divergence_result {
     float  max_p_diff       = 0.0f;
     size_t n_same_top       = 0.0;
     size_t count            = 0.0;
+    double sum_kl10         = 0.0; // KL@10, EAR@10, full-vocabulary EAR (1 - TV): see kld-topk.h
+    double sum_kl10_2       = 0.0;
+    double sum_ear10        = 0.0;
+    double sum_ear10_2      = 0.0;
+    double sum_ear          = 0.0;
+    double sum_ear2         = 0.0;
 };
 
 static std::pair<double, float> log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld) {
@@ -228,6 +235,8 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
 
     max_logit += log_sum_exp;
     double sum = 0;
+    double ear = 0;
+    kld_topk::top_k top;
     int imax_base = -1;
     float p_log_base_max = 0;
     for (int i = 0; i < n_vocab; ++i) {
@@ -236,6 +245,8 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
             p_log_base_max = p_log_base;
             imax_base = i;
         }
+        top.push(i, p_log_base);
+        ear += kld_topk::accept(p_log_base, logits[i] - max_logit);
         if (p_log_base > -16.f) {
             const float p_base = expf(p_log_base);
             sum += p_base * (p_log_base - logits[i] + max_logit);
@@ -243,6 +254,17 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     }
     kld.sum_kld  += sum;
     kld.sum_kld2 += sum*sum;
+    float top_q[kld_topk::K];
+    for (int k = 0; k < top.n; ++k) {
+        top_q[k] = logits[top.id[k]] - max_logit;
+    }
+    const kld_topk::result t = kld_topk::over(top.lp, top_q, top.n);
+    kld.sum_kl10    += t.kl;
+    kld.sum_kl10_2  += t.kl*t.kl;
+    kld.sum_ear10   += t.ear;
+    kld.sum_ear10_2 += t.ear*t.ear;
+    kld.sum_ear     += ear;
+    kld.sum_ear2    += ear*ear;
     ++kld.count;
     if (imax == imax_base) {
         ++kld.n_same_top;
@@ -285,6 +307,12 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 kld.n_same_top       += local_kld.n_same_top;
                 kld.max_p_diff        = std::max(kld.max_p_diff, local_kld.max_p_diff);
                 kld.count            += local_kld.count;
+                kld.sum_kl10         += local_kld.sum_kl10;
+                kld.sum_kl10_2       += local_kld.sum_kl10_2;
+                kld.sum_ear10        += local_kld.sum_ear10;
+                kld.sum_ear10_2      += local_kld.sum_ear10_2;
+                kld.sum_ear          += local_kld.sum_ear;
+                kld.sum_ear2         += local_kld.sum_ear2;
                 break;
             }
             lock.unlock();
@@ -1997,6 +2025,15 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const double same_top_p = 1.0*kld.n_same_top/kld.count;
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
+
+    LOG("\n");
+    LOG("====== Top-10 / acceptance statistics ======\n");
+    const auto kl10  = mean_and_uncertainty(kld.sum_kl10,  kld.sum_kl10_2,  kld.count);
+    const auto ear10 = mean_and_uncertainty(kld.sum_ear10, kld.sum_ear10_2, kld.count);
+    const auto ear   = mean_and_uncertainty(kld.sum_ear,   kld.sum_ear2,    kld.count);
+    LOG("Mean  KL@10: %10.6lf ± %10.6lf  (base top-10 tokens, both renormalized)\n", kl10.first, kl10.second);
+    LOG("Mean EAR@10: %6.3lf ± %5.3lf %%  (sum of min(p,q) over base top-10, both renormalized)\n", 100.0*ear10.first, 100.0*ear10.second);
+    LOG("Mean    EAR: %6.3lf ± %5.3lf %%  (1 - TV, full vocabulary)\n", 100.0*ear.first, 100.0*ear.second);
 }
 
 // satisfies -Wmissing-declarations
