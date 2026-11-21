@@ -1372,7 +1372,13 @@ struct server_slot {
         if (llama_draft_vocab_n_hot(ctx_dft) <= 0) {
             return;
         }
-        const auto & toks = prompt.tokens.get_tokens();
+        // with --mmproj the prompt holds media placeholders and get_tokens() asserts: observe the text ids only
+        // (the generated tail is always text)
+        llama_tokens text_toks;
+        if (prompt.tokens.has_mtmd) {
+            text_toks = prompt.tokens.get_text_tokens();
+        }
+        const auto & toks = prompt.tokens.has_mtmd ? text_toks : prompt.tokens.get_tokens();
         const size_t n    = std::min((size_t) stats.n_gen, toks.size());
         llama_draft_vocab_observe(ctx_dft, toks.data() + (toks.size() - n), n);
     }
@@ -6751,7 +6757,11 @@ private:
                             if (!hot_carry && !others_busy) {
                                 n_reset = common_speculative_vocab_reset(spec_init.get());
                             }
-                            common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
+                            if (input_tokens.has_mtmd) {
+                                common_speculative_observe(spec_init.get(), input_tokens.get_text_tokens());
+                            } else {
+                                common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
+                            }
 
                             const int32_t n_replaced = common_speculative_refresh(spec_init.get());
 
