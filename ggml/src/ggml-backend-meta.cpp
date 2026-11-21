@@ -974,6 +974,33 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        {
+            const bool ok = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_1 && (src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 ||
+                src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            if (!ok) {
+                // say which input broke the split contract (name, op, axis, and the op/axis chain of the state)
+                for (int i = 0; i < 6; i++) {
+                    const ggml_tensor * t = tensor->src[i];
+                    GGML_LOG_ERROR("%s: gated_delta_net %s src[%d] %s op %s ne [%lld %lld %lld %lld] axis %d\n", __func__,
+                        tensor->name, i, t ? t->name : "-", t ? ggml_op_desc(t) : "-", t ? (long long) t->ne[0] : 0LL,
+                        t ? (long long) t->ne[1] : 0LL, t ? (long long) t->ne[2] : 0LL, t ? (long long) t->ne[3] : 0LL, (int) src_ss[i].axis);
+                }
+                int depth = 0;
+                for (const ggml_tensor * t = tensor->src[5]; t != nullptr && depth < 12; t = t->src[0] ? t->src[0] : t->view_src, depth++) {
+                    GGML_LOG_ERROR("%s:   state chain: %s op %s ne [%lld %lld %lld %lld] view_src %s\n", __func__, t->name, ggml_op_desc(t),
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        t->view_src ? t->view_src->name : "-");
+                    if (t->src[0] == nullptr && t->view_src == nullptr) {
+                        break;
+                    }
+                    if (t->src[0] == nullptr && t->view_src == t) {
+                        break;
+                    }
+                }
+            }
+        }
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
