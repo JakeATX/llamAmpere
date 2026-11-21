@@ -1019,6 +1019,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // committed anchor, which comes back from the injection (h_nextn) and is kept per sequence by position in the
     // lilicorr_* rows; the draft block carries it as the state embedding of its entries (batch_rnn)
     bool         has_rnn_context = false;
+    int32_t      dspark_rank     = 0;     // markov rank; with ids_out the walked slots carry their id at h_nextn[rank]
+    bool         dspark_ids      = false; // ids_out was set for the last draft decode
     common_batch batch_rnn;
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
@@ -1088,6 +1090,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         {
             char buf[32] = {};
             has_rnn_context = is_dspark && llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", buf, sizeof(buf)) >= 0;
+            dspark_rank = has_rnn_context ? atoi(buf) : 0;
         }
         if (has_rnn_context) {
             if (n_embd_tgt != n_embd_dec || target_layer_ids[target_layer_ids_n - 1] != llama_model_n_layer(model_tgt)) {
@@ -1424,6 +1427,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (has_rnn_context) {
             static const bool walk_stop = [] { const char * e = getenv("LLAMA_DSPARK_WALK_STOP"); return !e || atoi(e) != 0; }();
             llama_set_dspark_walk(ctx_dft, walk_stop ? params.n_max : 0);
+            // LLAMA_DSPARK_IDS=0: copy the logits and take the argmax on the host (old path)
+            static const bool ids_env = [] { const char * e = getenv("LLAMA_DSPARK_IDS"); return !e || atoi(e) != 0; }();
+            dspark_ids = ids_env && walk_stop && dspark_rank > 0 && dspark_rank < n_embd_dec;
+            llama_set_dspark_ids_out(ctx_dft, dspark_ids);
         }
 
         // decode all sequence's noise block in a single batch
@@ -1529,6 +1536,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // the graph chained the markov head over the block with the first maximum of each slot; take the same
                 // token here (host argmax, first maximum), at most n_max of them
                 const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                if (dspark_ids) {
+                    // the graph's own argmax ids (same first maximum), read from the chain-state rows
+                    const float * h = llama_get_embeddings_nextn(ctx_dft);
+                    for (int32_t i = 1; h && i < std::min(n_block_tokens, params.n_max + 1); ++i) {
+                        result.push_back((llama_token) h[(size_t) (beg + i) * n_embd_dec + dspark_rank]);
+                    }
+                } else
                 for (int32_t i = 1; i < std::min(n_block_tokens, params.n_max + 1); ++i) {
                     const float * logits = llama_get_logits_ith(ctx_dft, beg + i);
                     if (!logits) {

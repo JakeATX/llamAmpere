@@ -22,6 +22,7 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
     int32_t  dspark_walk        = 0; // Inkling2 DSpark: markov head steps per block (0 = the whole block)
+    bool     dspark_ids_out     = false; // Inkling2 DSpark: walked slots output argmax ids in h_nextn, no logits
 
     enum llama_moe_cache_mode moe_cache_mode;
     size_t moe_cache_budget_mib;

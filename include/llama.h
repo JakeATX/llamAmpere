@@ -1391,6 +1391,8 @@ extern "C" {
 
     // Inkling2 DSpark draft context: run the markov head over block slots 1..n only (0 = the whole block)
     LLAMA_API void llama_set_dspark_walk(struct llama_context * ctx, int32_t n);
+    // Inkling2 DSpark: the walked slots return their argmax token id in h_nextn (element markov_rank, as float) and no logits
+    LLAMA_API void llama_set_dspark_ids_out(struct llama_context * ctx, bool on);
 
     // Get all nextn embeddings, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

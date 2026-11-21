@@ -2169,17 +2169,27 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     auto * prev = ids;
     // the driver reads slots 1..n_max only (llama_set_dspark_walk); later slots carry the backbone logits, unused
     const int64_t walk = cparams.dspark_walk > 0 ? std::min<int64_t>(block - 1, cparams.dspark_walk) : block - 1;
+    // ids_out: a walked slot carries its argmax id (as float, exact below 2^24) in state element `rank`, and the graph
+    // returns no logits, so the driver skips the [n_vocab, block] copy and the host argmax
+    const bool ids_out = cparams.dspark_ids_out && rank + 1 <= n_embd;
     for (int64_t i = 1; i < block; ++i) {
         if (i > walk) {
             states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
-            logits = ggml_concat(ctx0, logits, column(base, i), 1);
+            if (!ids_out) {
+                logits = ggml_concat(ctx0, logits, column(base, i), 1);
+            }
             continue;
         }
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
-        states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
-        logits = ggml_concat(ctx0, logits, col, 1);
         // first maximum of the slot (the CUDA and CPU argmax both keep the lowest index on ties, like the host argmax)
         prev = ggml_argmax(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0)));
+        if (ids_out) {
+            auto * id = ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, nb);
+            states = ggml_concat(ctx0, states, ggml_pad(ctx0, ggml_concat(ctx0, state, id, 0), n_embd - rank - 1, 0, 0, 0), 1);
+        } else {
+            states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
+            logits = ggml_concat(ctx0, logits, col, 1);
+        }
     }
     const auto block_order = [&](ggml_tensor * t) {
         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, block);
@@ -2188,6 +2198,10 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     res->t_h_nextn = block_order(states);
     cb(res->t_h_nextn, "dspark_chain_state", -1);
     ggml_build_forward_expand(gf, res->t_h_nextn);
+    if (ids_out) {
+        res->t_logits = nullptr;
+        return;
+    }
     logits = block_order(logits);
     res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_tokens, logits->nb[1], 0));
 }

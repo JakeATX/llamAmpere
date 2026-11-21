@@ -184,6 +184,7 @@ struct llama_context {
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_dspark_walk(int32_t n);
+    void set_dspark_ids_out(bool on);
     void set_mtp_chain(bool value);
     void set_mtp_chain_sampling(int32_t top_k, float temp, float top_p, float min_p, const float * u, int32_t n_u); // [#69]
     void set_causal_attn(bool value);

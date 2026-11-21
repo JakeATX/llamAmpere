@@ -5101,6 +5101,10 @@ void llama_context::set_dspark_walk(int32_t n) {
     cparams.dspark_walk = n > 0 ? n : 0;
 }
 
+void llama_context::set_dspark_ids_out(bool on) {
+    cparams.dspark_ids_out = on;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -11132,6 +11136,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_dspark_walk(llama_context * ctx, int32_t n) {
     ctx->set_dspark_walk(n);
+}
+
+void llama_set_dspark_ids_out(llama_context * ctx, bool on) {
+    ctx->set_dspark_ids_out(on);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
