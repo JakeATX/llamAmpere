@@ -3840,15 +3840,17 @@ static int aif_mmv_pf() {
 }
 
 // [WREAD08] GGML_CUDA_AIF_MMVX: decode widths (N <= 8) at small M take magic2::mmvx, G groups of four warps per 16-row
-// strip (bit-identical to mmv, see magic2-v2.cuh). Unset or -1 = auto: G = 2 when mmv would keep fewer than
-// 17 warps per SM in flight ((M / 16) * 4 < 17 * SMs, e.g. ffn_down and ssm_out, M = 5120, on 82/84-SM cards), else mmv.
+// strip (bit-identical to mmv, see magic2-v2.cuh). Unset or -1 = auto: G = 2 when mmv would keep fewer than L warps
+// per SM in flight ((M / 16) * 4 < L * SMs), else mmv. L = 30 for AIF175_U2 (its decode is the most latency-bound: on a
+// Taichi 3090 G = 2 is +42-55% at M = 5120 and +5-18% at M = 6144, N 2-8), 17 for AIF25_U / AIF25_U2 (+17-24% at
+// M = 5120; slower at M >= 10240).
 // 0 = off (release mmv everywhere; kill switch). 2, 3 or 4 = force that G wherever K / 128 is a multiple of 4 G.
 static int aif_mmvx_env() {
     static const int v = ai4_env_int("GGML_CUDA_AIF_MMVX", nullptr, -1);
     return v;
 }
 
-static int aif_mmvx_groups(int M, int K, int64_t N, int nsm) {
+static int aif_mmvx_groups(ggml_type type, int M, int K, int64_t N, int nsm) {
     const int e = aif_mmvx_env();
     if (e == 0 || N < 1 || N > 8 || nsm <= 0) {
         return 0;
@@ -3858,7 +3860,8 @@ static int aif_mmvx_groups(int M, int K, int64_t N, int nsm) {
         return e >= 2 && e <= 4 && (K / 128) % (4 * e) == 0 ? e : 0;
     }
     const int64_t warps = int64_t(M / 16) * 4;
-    return warps < 17LL * nsm && (K / 128) % 8 == 0 ? 2 : 0;
+    const int64_t limit = type == GGML_TYPE_AIF175_U2 ? 30 : 17;
+    return warps < limit * nsm && (K / 128) % 8 == 0 ? 2 : 0;
 }
 
 template <int XSH, bool ROW_SCALE = false, int B = 5, int V = 2, uint32_t C = AIF25_MUL, int SCALE_CHUNKS = 5>
@@ -3987,7 +3990,7 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     if (ggml_cuda_ai4_decode_fast_frac_try(ctx, w->type, xsh, wd, qp, sp, y, M, K, N)) {
         return;
     }
-    const int groups = aif_mmvx_groups(M, K, N, ggml_cuda_info().devices[ctx.device].nsm);
+    const int groups = aif_mmvx_groups(w->type, M, K, N, ggml_cuda_info().devices[ctx.device].nsm);
     aif25_mmv_type(w->type, xsh, wd, qp, sp, y, M, K, N, stream, nullptr, groups);
     // [WREAD08] GGML_CUDA_AIF25_MMQ_CHECK=1 also checks every mmvx call bitwise against mmv (graphs off) and aborts on a difference
     if (groups >= 2 && aif25_mmq_check()) {
