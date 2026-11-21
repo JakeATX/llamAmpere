@@ -9,3 +9,9 @@
 // their mmv); any other type returns false.
 bool ggml_cuda_aif25_mmq(ggml_type type, int xsh, int tile, int strips, const uint8_t * w, const int8_t * q, const float * scales,
                          float * y, int M, int K, int64_t N, cudaStream_t stream);
+
+// [KAIMULTI] verify widths 9..32: magic2::mmq with NB = ceil(N/8) token blocks in one tile and the mmv register prefetch,
+// so each weight unit is decoded once for all N tokens. Bit-identical to mmv. Returns false, without launching, for any
+// other N or type; the caller then runs mmv.
+bool ggml_cuda_aif25_mmq_narrow(ggml_type type, int xsh, const uint8_t * w, const int8_t * q, const float * scales, float * y,
+                                int M, int K, int64_t N, cudaStream_t stream);
