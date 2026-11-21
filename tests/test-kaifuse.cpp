@@ -5,8 +5,11 @@
 // processes, LLAMA_KAIFUSE=0 (every matmul preps its own input, as before) and the default (one prep per input group);
 // every output must be bit-identical, the default must report prep cache hits and the kill switch none, and
 // default preps + hits must equal the kill switch's preps. Each graph runs on the graph allocator and is computed
-// several times with new inputs (CUDA graph capture and replay, new eval epochs); one case interleaves five
-// activations so cache entries are evicted within an eval.
+// several times with new inputs (CUDA graph capture and replay, new eval epochs; the default must replay as often as the
+// kill switch, and at least once unless GGML_CUDA_DISABLE_GRAPHS is set); cases interleave four and five activations so
+// cache entries are evicted within an eval, cover K % 256 != 0 (the unshifted prep layout), 3-D activations (several
+// sequences), preps just under and over the cache's per-entry size (the larger ones keep pool buffers), and the whole
+// run is repeated with GGML_CUDA_AI23_XPERM=1 (the XPERM prep variant).
 //
 // R2 (draft shortlist on a fractional AI+ head): MUL_MAT_ID over one-row experts of an AIF head (the graph the draft
 // shortlist builds), with one id list broadcast to every output (row stride 0) and with one list per output, against
@@ -84,6 +87,7 @@ struct group_case {
     int64_t                n;
     int                    n_act = 1; // > 1: that many activations, their consumers interleaved (cache eviction in one eval)
     std::vector<int>       order = {}; // optional consumer order (activation index per matmul, types used round-robin)
+    int64_t                seqs  = 1;  // > 1: 3-D activation [k, n, seqs] (several sequences in one ubatch)
 };
 
 static constexpr int N_EVALS = 4;   // repeated evals of one graph with new inputs: CUDA graph capture + replay, epochs
@@ -103,7 +107,7 @@ static group_result run_group(ggml_backend_t backend, const group_case & c, uint
         ws.push_back(ggml_new_tensor_2d(wctx, c.types[i], c.k, c.rows[i]));
     }
     for (int a = 0; a < c.n_act; ++a) {
-        x0s.push_back(ggml_new_tensor_2d(gctx, GGML_TYPE_F32, c.k, c.n));
+        x0s.push_back(ggml_new_tensor_3d(gctx, GGML_TYPE_F32, c.k, c.n, c.seqs));
         ggml_set_input(x0s.back());
         xs.push_back(ggml_scale(gctx, x0s.back(), 0.75f + 0.125f*a));
     }
@@ -173,7 +177,8 @@ static group_result run_group(ggml_backend_t backend, const group_case & c, uint
 }
 
 static std::vector<group_case> group_cases() {
-    const ggml_type F175 = GGML_TYPE_AIF175_U2, F25 = GGML_TYPE_AIF25_U2, A5 = GGML_TYPE_AIT5_U, A2 = GGML_TYPE_AIT2_U2;
+    const ggml_type F175 = GGML_TYPE_AIF175_U2, F25 = GGML_TYPE_AIF25_U2, A5 = GGML_TYPE_AIT5_U, A2 = GGML_TYPE_AIT2_U2,
+                    F25U = GGML_TYPE_AIF25_U;
     std::vector<group_case> cs;
     for (int64_t n : { 1, 2, 4, 5, 8, 12, 33 }) {
         cs.push_back({ { F175, F175 }, { 10240, 6144 }, 5120, n });           // GDN qkv + z (8 GB file: 126 / 126)
@@ -186,6 +191,13 @@ static std::vector<group_case> group_cases() {
         cs.push_back({ { F175, F25 }, { 1024, 512 }, 5120, n, 5 });            // 5 activations in a cycle: evict on every miss
         cs.push_back({ { F175, F175, F175 }, { 512, 512, 512 }, 5120, n, 4, { 0, 1, 2, 3, 0, 3, 1, 2, 0, 3, 1 } });
                                                                                // 4 activations: hits next to evictions
+        cs.push_back({ { F25U, F25U }, { 1024, 512 }, 1920, n });            // K % 256 != 0: unshifted prep (xsh = 0)
+        cs.push_back({ { A5, A5, A2 }, { 1024, 512, 512 }, 5120, n, 1, {}, 2 }); // 3-D input: 2 sequences of n rows
+    }
+    // K = 5,120 prep sizes around the per-entry limit (256 KiB): 50 rows fit, 51 and 60 do not (pool buffers, no hits)
+    for (int64_t n : { 50, 51, 60 }) {
+        cs.push_back({ { F175, F175 }, { 1024, 512 }, 5120, n });
+        cs.push_back({ { A2, A2 }, { 1024, 512 }, 5120, n });
     }
     return cs;
 }
@@ -321,7 +333,7 @@ static int run_all(std::vector<uint8_t> & blob, bool rows) {
 }
 
 #ifndef _WIN32
-static int run_child(bool kaifuse, std::vector<uint8_t> & blob) {
+static int run_child(bool kaifuse, bool xperm, std::vector<uint8_t> & blob) {
     int fd[2];
     GGML_ASSERT(pipe(fd) == 0);
     const pid_t pid = fork();
@@ -329,8 +341,11 @@ static int run_child(bool kaifuse, std::vector<uint8_t> & blob) {
     if (pid == 0) {
         close(fd[0]);
         setenv("LLAMA_KAIFUSE", kaifuse ? "1" : "0", 1);
+        if (xperm) {
+            setenv("GGML_CUDA_AI23_XPERM", "1", 1);
+        }
         std::vector<uint8_t> b;
-        const int rc = run_all(b, kaifuse);
+        const int rc = run_all(b, kaifuse && !xperm);
         size_t done = 0;
         while (done < b.size()) {
             const ssize_t n = write(fd[1], b.data() + done, b.size() - done);
@@ -353,22 +368,19 @@ static int run_child(bool kaifuse, std::vector<uint8_t> & blob) {
     waitpid(pid, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
-#endif
 
-int main() {
-#ifdef _WIN32
-    std::fprintf(stderr, "test-kaifuse needs fork(); not run\n");
-    return 77;
-#else
+// one kill-switch / default pair of children; 0 = pass, 1 = fail, 77 = not run
+static int run_pair(bool xperm) {
+    const char * tag = xperm ? " (GGML_CUDA_AI23_XPERM=1)" : "";
     std::vector<uint8_t> ref, on;
-    const int rc_ref = run_child(false, ref);
+    const int rc_ref = run_child(false, xperm, ref);
     if (rc_ref == 77) {
         std::fprintf(stderr, "no CUDA device / AI+ kernels; not run\n");
         return 77;
     }
-    const int rc_on = run_child(true, on);
+    const int rc_on = run_child(true, xperm, on);
     if (rc_ref != 0 || rc_on != 0 || ref.size() != on.size() || ref.size() < 3*sizeof(int64_t)) {
-        std::fprintf(stderr, "test-kaifuse: child failed (rc %d / %d, %zu / %zu bytes): FAIL\n", rc_ref, rc_on, ref.size(), on.size());
+        std::fprintf(stderr, "test-kaifuse%s: child failed (rc %d / %d, %zu / %zu bytes): FAIL\n", tag, rc_ref, rc_on, ref.size(), on.size());
         return 1;
     }
     int64_t c_ref[3], c_on[3];
@@ -379,15 +391,32 @@ int main() {
     for (size_t i = 0; i < n_out; i += sizeof(float)) {
         diff += std::memcmp(ref.data() + i, on.data() + i, sizeof(float)) != 0;
     }
-    std::fprintf(stderr, "R1: %zu outputs; kill switch preps %" PRId64 " hits %" PRId64 "; default preps %" PRId64 " hits %" PRId64
+    std::fprintf(stderr, "R1%s: %zu outputs; kill switch preps %" PRId64 " hits %" PRId64 "; default preps %" PRId64 " hits %" PRId64
                  "; CUDA graph replays %" PRId64 " / %" PRId64 "; %zu outputs differ\n",
-                 n_out/sizeof(float), c_ref[0], c_ref[1], c_on[0], c_on[1], c_ref[2], c_on[2], diff);
-    if (c_on[2] <= 0) {
-        std::fprintf(stderr, "note: no CUDA graph replay happened (graphs off or not captured): replay not covered here\n");
+                 tag, n_out/sizeof(float), c_ref[0], c_ref[1], c_on[0], c_on[1], c_ref[2], c_on[2], diff);
+    // graph capture and replay must be covered (same count both ways) unless graphs were turned off on purpose
+    const char * no_graphs = std::getenv("GGML_CUDA_DISABLE_GRAPHS");
+    const bool graphs_off = no_graphs && std::atoi(no_graphs) != 0;
+    const bool replay_ok = c_on[2] == c_ref[2] && (graphs_off || c_on[2] > 0);
+    if (!replay_ok) {
+        std::fprintf(stderr, "CUDA graph replays missing or unequal (graphs not captured?)\n");
     }
     // every prep the kill switch launches is either launched or served from the cache by the default
-    const bool ok = diff == 0 && c_ref[1] == 0 && c_on[1] > 0 && c_on[0] + c_on[1] == c_ref[0];
-    std::fprintf(stderr, "test-kaifuse: %s\n", ok ? "PASS" : "FAIL");
+    const bool ok = diff == 0 && replay_ok && c_ref[1] == 0 && c_on[1] > 0 && c_on[0] + c_on[1] == c_ref[0];
+    std::fprintf(stderr, "test-kaifuse%s: %s\n", tag, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
+}
+#endif
+
+int main() {
+#ifdef _WIN32
+    std::fprintf(stderr, "test-kaifuse needs fork(); not run\n");
+    return 77;
+#else
+    const int rc = run_pair(false);
+    if (rc != 0) {
+        return rc;
+    }
+    return run_pair(true);
 #endif
 }

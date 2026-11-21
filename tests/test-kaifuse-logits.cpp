@@ -1,6 +1,7 @@
 // [KAIFUSE] Full-logit dump for the R1 identity check on a real model (needs -m, so not a ctest entry).
-// Prefills a fixed token sequence in 64-token ubatches, then teacher-forces it at decode widths 1, 2, 3, 4, 5 and 8
-// (the MTP verify widths). Writes one line per logit row to OUT: width, position, FNV-1a 64 of the row's float32 bytes,
+// For each width: prefills the first half of a fixed token sequence in one batch (ubatch 64 in the width-64 pass, else
+// one ubatch), then teacher-forces the rest one token at a time (width-64 pass) or at decode widths 1, 2, 3, 4, 5 and 8
+// (the MTP verify widths), with a new context each pass. Writes one line per logit row to OUT: width, position, FNV-1a 64 of the row's float32 bytes,
 // and the argmax. Run once with LLAMA_KAIFUSE=0 and once with the default, then compare the two files (cmp): equal
 // hashes = bit-identical logits.
 // usage: test-kaifuse-logits MODEL OUT [n_tokens=256]
@@ -33,7 +34,7 @@ int main(int argc, char ** argv) {
     uint32_t r = 20261121u;
     for (int i = 0; i < n_tok; ++i) {
         r = r*1664525u + 1013904223u;
-        toks[i] = (llama_token) (1000 + (r >> 8) % 60000);
+        toks[i] = (llama_token) (1000 + (r >> 8) % (uint32_t) std::max(1, std::min(60000, n_vocab - 1000)));
     }
     FILE * out = std::fopen(argv[2], "w");
     if (!out) {
@@ -49,7 +50,8 @@ int main(int argc, char ** argv) {
         if (!ctx) {
             return 1;
         }
-        // half the sequence as a 64-row prefill (the cached prep covers it too), then the rest at this width
+        // half the sequence as a prefill (preps of 64 rows and more at K >= 4096 exceed the cache entry size and keep
+        // their pool buffers), then the rest at this width
         const int pre = n_tok/2;
         llama_batch b = llama_batch_init(std::max(pre, 64), 0, 1);
         int pos = 0;
@@ -70,7 +72,7 @@ int main(int argc, char ** argv) {
                 if (b.logits[i]) {
                     const float * l = llama_get_logits_ith(ctx, i);
                     const unsigned char * p = (const unsigned char *) l;
-                    uint64_t h = 1469598103934665603ULL;
+                    uint64_t h = 14695981039346656037ULL;
                     for (size_t k = 0; k < (size_t) n_vocab*sizeof(float); ++k) {
                         h = (h ^ p[k])*1099511628211ULL;
                     }
