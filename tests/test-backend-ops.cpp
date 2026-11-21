@@ -21700,7 +21700,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_depth_mix(2304, 5, 3, 3, true));
-    test_cases.emplace_back(new test_depth_mix(100, 2, 2, 4));
+    test_cases.emplace_back(new test_depth_mix(102, 2, 2, 4)); // scalar loads
     // GGML_LSA_ULSE_COOP=1 lane-shared kernel: d 128/256 (16/32 lanes per cell), a partial last CTA, 1..8 rows (n_kv must divide by F)
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 5, 16, 128));
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 3, 1, 256));
