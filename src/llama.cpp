@@ -179,6 +179,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
             model->get_split_state_ud.n_devices = n_devs;
             model->get_split_state_ud.model = model;
+            model->get_split_state_ud.sj_kvarn = params.sj_kvarn;
             model->devices.push_back({
                 true, ggml_backend_meta_device(
                 params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
@@ -220,6 +221,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             GGML_ASSERT(!devs.empty());
             model->get_split_state_ud.n_devices = devs.size();
             model->get_split_state_ud.model     = model;
+            model->get_split_state_ud.sj_kvarn  = params.sj_kvarn;
             gpus.push_back({
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
