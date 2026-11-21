@@ -18,7 +18,8 @@ Needs numpy. Peak RAM about the output size plus threads x 16 MiB.
       --exact-from <bf16 checkpoint>/model-000NN-of-000NN.safetensors [--exact-tensor lm_head.weight] --stats
 --exact-from stores the source BF16 rows unchanged (rows type bf16, d1.rows_type "bf16"). --stats adds
 output_exact.gl2, F32 [n_embd/32, n_vocab]: the L2 norm of (decoded base row - exact row) over each 32-column group,
-fingerprinted as d1.gl2_fnv64 (LLAMA_D1_CERT=1 needs it).
+fingerprinted as d1.gl2_fnv64. With it the 6-sigma certificate is on by default (statistically exact: a row that
+belongs in the sampler's top 20 stays coarse with probability <= ~1e-9 per row); LLAMA_D1_CERT=0 turns it off.
 """
 import argparse, ctypes, json, os, random, struct, sys, threading, time
 

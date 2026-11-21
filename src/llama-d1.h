@@ -109,8 +109,11 @@ void llama_d1_select_top(const float * row, int64_t n_vocab, int n, std::vector<
 
 // [EXACTHEAD] certificate: after the top N are exact, any other row whose coarse logit could still reach the k-th
 // exact logit (coarse + margin + sigma * s_i >= T_k, s_i = sqrt(sum_g ||h_g||^2 * gl2[i][g]^2 / 32)) is rescored too.
+// Statistically exact (Jake 11-21): treating each row's coarse error as Gaussian with std s_i, a row that belongs in
+// the exact top k is left coarse with probability <= ~1e-9 (one-sided 6 sigma). Default on inside the add-on when the
+// sidecar has output_exact.gl2; LLAMA_D1_CERT=0 is the kill switch. Study: 0 misses in 16,200 positions.
 struct llama_d1_cert {
-    bool  on     = false;
+    bool  on     = false; // the context turns it on by default when the sidecar has gl2
     int   k      = 20;    // the sampler's top-k (all presets use 20)
     float sigma  = 6.0f;
     float margin = 0.1f;  // card activation quantization vs the host dot (measured max 0.071 on the 8 GB head)
@@ -170,6 +173,8 @@ struct llama_d1_ctx {
     struct audit_t {
         uint64_t rows = 0, top_same = 0, dist_same = 0, coarse_top_same = 0;
         double   tv_sum = 0, tv_max = 0, coarse_tv_sum = 0, coarse_tv_max = 0, dlogit_max = 0;
+        double   z_max = 0;           // max |coarse - exact| / s_i over the exact top 20 (needs gl2)
+        uint64_t z_gt6 = 0, z_n = 0;
     } audit;
     void audit_row(const float * served, const float * coarse, const float * hr, int64_t n_vocab);
     std::string audit_summary();  // values at the previous summary_delta

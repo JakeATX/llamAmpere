@@ -877,9 +877,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                     const int n_top = (int) std::max(0L, env_int("LLAMA_D1_N", aif25 ? 64 : 256));
                     const int eager = (int) std::max(0L, env_int("LLAMA_D1_EAGER_MAX", std::max<long>(64, 8L * cparams.n_seq_max)));
                     const int n_thr = (int) std::max(1L, env_int("LLAMA_D1_THREADS", std::min<long>(cparams.n_threads, 8)));
-                    // [EXACTHEAD] LLAMA_D1_CERT=1: the sigma certificate (default off; needs output_exact.gl2 in the sidecar)
+                    // [EXACTHEAD] the sigma certificate: statistically exact (Jake 11-21), so on by default whenever the
+                    // sidecar carries output_exact.gl2; LLAMA_D1_CERT=0 is its kill switch, LLAMA_D1_CERT=1 requires it
                     llama_d1_cert cert;
-                    cert.on = env_int("LLAMA_D1_CERT", 0) != 0;
+                    const long cert_env = env_int("LLAMA_D1_CERT", -1);
+                    cert.on = cert_env != 0 && (cert_env > 0 || d1_head->gl2 != nullptr);
                     if (cert.on) {
                         if (!d1_head->gl2) {
                             throw std::runtime_error("d1: LLAMA_D1_CERT=1 but the sidecar " + d1_head->path +
@@ -903,8 +905,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                             ggml_type_name(model.output->type), n_top, d1_head->path.c_str(),
                             ggml_type_name(d1_head->type), eager, n_thr);
                     if (cert.on) {
-                        LLAMA_LOG_INFO("d1: certificate on: k=%d sigma=%.2f margin=%.3f (head max group error %.4g)\n",
-                                cert.k, cert.sigma, cert.margin, d1_head->gl2_max);
+                        LLAMA_LOG_INFO("d1: certificate on (statistically exact: a missed top-%d row has probability <= ~1e-9 per "
+                                "row at %.1f sigma): k=%d sigma=%.2f margin=%.3f (head max group error %.4g); LLAMA_D1_CERT=0 turns it off\n",
+                                cert.k, cert.sigma, cert.k, cert.sigma, cert.margin, d1_head->gl2_max);
+                    } else {
+                        LLAMA_LOG_INFO("d1: certificate off (%s)\n", cert_env == 0 ? "LLAMA_D1_CERT=0" : "sidecar has no output_exact.gl2");
                     }
                     const char * gv = getenv("LLAMA_MTP_GPU_VERIFY");
                     const char * tv = getenv("LLAMA_MTP_TOPK_VERIFY");

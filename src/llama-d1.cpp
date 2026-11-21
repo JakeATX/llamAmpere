@@ -123,7 +123,7 @@ float llama_d1_head::dot(const float * h, int64_t id) const {
         return sum;
     }
     if (type == GGML_TYPE_BF16) {
-        // [EXACTHEAD] bf16 -> f32 is a 16-bit shift, so the products are exact in f32 before accumulation
+        // [EXACTHEAD] bf16 -> f32 is a 16-bit shift (exact); the served and audit paths share this dot
         const uint16_t * w = (const uint16_t *) row;
         int64_t k = 0;
         float sum = 0.0f;
@@ -656,7 +656,33 @@ void llama_d1_ctx::audit_row(const float * served, const float * coarse, const f
     const auto ds = d1_audit_dist(served, n_vocab);
     const auto dc = d1_audit_dist(coarse, n_vocab);
     const double tv = d1_tv(ds, dx), tvc = d1_tv(dc, dx);
+    // hidden-row alignment check, independent of the exact rows agreeing with themselves: the card's coarse logit
+    // (computed on the card from its own h) minus the host exact logit (from the copied h) must look like the coarse
+    // head's error, z = |coarse - exact| / s_i of order 1. A misaligned or wrong h gives z in the tens or more.
+    double zmax = 0;
+    uint64_t z6 = 0, zn = 0;
+    if (head->gl2) {
+        const int64_t G = head->n_group;
+        std::vector<float> hg(G);
+        for (int64_t gg = 0; gg < G; ++gg) {
+            float s2 = 0.0f;
+            for (int q = 0; q < 32; ++q) { s2 += hr[gg * 32 + q] * hr[gg * 32 + q]; }
+            hg[gg] = s2 / 32.0f;
+        }
+        for (const int32_t id : tx) {
+            const float * e = head->gl2 + (int64_t) id * G;
+            double s2 = 0;
+            for (int64_t gg = 0; gg < G; ++gg) { s2 += (double) hg[gg] * e[gg] * e[gg]; }
+            const double z = std::fabs((double) coarse[id] - x[id]) / std::max(std::sqrt(s2), 1e-9);
+            zmax = std::max(zmax, z);
+            z6 += z > 6.0;
+            ++zn;
+        }
+    }
     std::lock_guard<std::mutex> lk(audit_mtx);
+    audit.z_max = std::max(audit.z_max, zmax);
+    audit.z_gt6 += z6;
+    audit.z_n   += zn;
     audit.rows++;
     audit.top_same        += ts == tx;
     audit.coarse_top_same += tc == tx;
@@ -664,17 +690,17 @@ void llama_d1_ctx::audit_row(const float * served, const float * coarse, const f
     audit.tv_sum += tv;         audit.tv_max        = std::max(audit.tv_max, tv);
     audit.coarse_tv_sum += tvc; audit.coarse_tv_max = std::max(audit.coarse_tv_max, tvc);
     audit.dlogit_max = std::max(audit.dlogit_max, dl);
-    LLAMA_LOG_INFO("d1 audit row %" PRIu64 ": top20_same=%d dlogit_max=%.3g tv=%.3g coarse_top20_same=%d coarse_tv=%.4g\n",
-                   audit.rows, (int) (ts == tx), dl, tv, (int) (tc == tx), tvc);
+    LLAMA_LOG_INFO("d1 audit row %" PRIu64 ": top20_same=%d dlogit_max=%.3g tv=%.3g coarse_top20_same=%d coarse_tv=%.4g z_max=%.3g\n",
+                   audit.rows, (int) (ts == tx), dl, tv, (int) (tc == tx), tvc, zmax);
 }
 
 std::string llama_d1_ctx::audit_summary() {
     std::lock_guard<std::mutex> lk(audit_mtx);
     const double n = audit.rows ? (double) audit.rows : 1.0;
     return format("d1 audit: rows=%" PRIu64 " top20_same=%" PRIu64 " dist_same=%" PRIu64 " tv_mean=%.3g tv_max=%.3g "
-                  "dlogit_max=%.3g | coarse: top20_same=%" PRIu64 " tv_mean=%.4g tv_max=%.4g",
+                  "dlogit_max=%.3g | coarse: top20_same=%" PRIu64 " tv_mean=%.4g tv_max=%.4g | h check: z_max=%.3g z_gt6=%" PRIu64 "/%" PRIu64,
                   audit.rows, audit.top_same, audit.dist_same, audit.tv_sum / n, audit.tv_max, audit.dlogit_max,
-                  audit.coarse_top_same, audit.coarse_tv_sum / n, audit.coarse_tv_max);
+                  audit.coarse_top_same, audit.coarse_tv_sum / n, audit.coarse_tv_max, audit.z_max, audit.z_gt6, audit.z_n);
 }
 
 // [EXACTHEAD] ids are exact in row; rescore every other row whose bound reaches the k-th exact logit (see llama_d1_cert)

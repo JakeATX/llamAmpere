@@ -461,6 +461,21 @@ static void test_cert(const std::string & dir) {
             CHECK(c.audit.top_same < (uint64_t) R, "uncertified N = 20 misses some rows (negative control)");
         }
         CHECK(c.audit.coarse_top_same < (uint64_t) R, "coarse rows differ from exact (negative control)");
+        CHECK(c.audit.z_n == (uint64_t) R * 20 && c.audit.z_max < 6.0, "aligned h: z_max %.3g < 6", c.audit.z_max);
+    }
+    // misaligned h (row r gets h of row r+1): the z check must fire
+    {
+        llama_d1_ctx c(head, 20, 64, 1, cert);
+        c.audit_every = 1;
+        c.reset(R);
+        for (int r = 0; r < R; ++r) { std::memcpy(c.h_row(r), &H[((r + 1) % R) * E], sizeof(float) * E); }
+        c.mark_copied(0, R, true);
+        std::vector<float> L = L0;
+        c.on_read_all(L.data(), V, R);
+        std::printf("misaligned %s\n", c.audit_summary().c_str());
+        CHECK(c.audit.top_same == (uint64_t) R, "misaligned h still self-consistent (why the z check exists)");
+        CHECK(c.audit.z_max > 20.0 && c.audit.z_gt6 > c.audit.z_n / 2, "misaligned h: z check fires (z_max %.3g, %llu/%llu > 6)",
+              c.audit.z_max, (unsigned long long) c.audit.z_gt6, (unsigned long long) c.audit.z_n);
     }
     std::printf("cert test: top-%d misses plain N=%d: %d/%d, certified: %d/%d\n", K, NTOP, miss_plain, R, miss_cert, R);
     std::remove(sc.path.c_str());
