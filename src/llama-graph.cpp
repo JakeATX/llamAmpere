@@ -1835,6 +1835,13 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
+    if (inklsa_on) {
+        attn_ctx->get_base()->set_input_inklsa(inklsa, ubatch, extent);
+        for (const auto & c : inklsa_commit) {
+            llama_inklsa_idx_commit(c.first, c.second);
+        }
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1878,6 +1885,16 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    if (inklsa_on) {
+        // a rebuild graph is never reused; a graph built on a valid index only while every index is still valid
+        res &= !inklsa_rebuild;
+        res &= params.ubatch.n_seqs_unq == 1 || !inklsa.sparse;
+        for (const ggml_tensor * kc : inklsa_kcaches) {
+            llama_inklsa_idx idx;
+            res &= llama_inklsa_idx_get(kc, kc->ne[0], kc->ne[1]/inklsa.B, ggml_backend_buffer_get_type(kc->buffer), &idx) && idx.valid;
+        }
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -8990,6 +9007,51 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    // INKLSA (llama-inklsa.h): per-graph inputs shared by the full-attention visits
+    const auto & icfg = llama_inklsa_cfg();
+    if (icfg.on && cparams.flash_attn && !cparams.training && cparams.n_seq_max == 1) {
+        int64_t il_full = -1;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (!hparams.is_swa(il)) {
+                il_full = il;
+                break;
+            }
+        }
+        const int64_t n_kv = attn_ctx->get_base()->get_n_kv();
+        const int64_t T    = ubatch.n_tokens;
+        auto & in = inp->inklsa;
+        if (il_full >= 0 && n_kv % icfg.block == 0) {
+            inp->inklsa_on = true;
+            in.B     = icfg.block;
+            in.n_blk = n_kv/icfg.block;
+            in.n_fix = llama_inklsa_n_fix();
+            in.n_u   = std::min<int64_t>(in.n_blk, (T + in.B - 1)/in.B + 1);
+            in.sparse = T <= icfg.max_t && n_kv >= icfg.min_kv && ubatch.n_seqs_unq == 1 &&
+                        n_kv >= in.n_fix + llama_inklsa_n_keep() + icfg.sinks;
+            in.u_blk   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, in.n_u);
+            in.u_blk64 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, in.n_u);
+            ggml_set_input(in.u_blk);
+            ggml_set_input(in.u_blk64);
+            ggml_set_name(in.u_blk, "inklsa_u_blk");
+            ggml_set_name(in.u_blk64, "inklsa_u_blk64");
+            if (in.sparse) {
+                in.onehot   = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, hparams.n_head_kv(il_full), hparams.n_head(il_full), 1);
+                in.fix_ids  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, in.n_fix);
+                in.fix_rel  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, in.n_fix, T);
+                in.fix_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in.n_fix, T);
+                in.elig     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in.n_blk, 1);
+                for (ggml_tensor * t : {in.onehot, in.fix_ids, in.fix_rel, in.fix_mask, in.elig}) {
+                    ggml_set_input(t);
+                }
+                ggml_set_name(in.onehot, "inklsa_onehot");
+                ggml_set_name(in.fix_ids, "inklsa_fix_ids");
+                ggml_set_name(in.fix_rel, "inklsa_fix_rel");
+                ggml_set_name(in.fix_mask, "inklsa_fix_mask");
+                ggml_set_name(in.elig, "inklsa_elig");
+            }
+        }
+    }
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -9027,6 +9089,189 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(kq_mask, "kq_mask_rel_pos", il);
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+}
+
+// INKLSA: rows of a cache view [d, h, n_kv] (cells nb[2] apart, each cell's heads packed) grouped `cells` at a time,
+// reinterpreted as I32 words so GET_ROWS copies raw bytes ([cell_bytes*cells/4, n_kv/cells])
+static ggml_tensor * inklsa_words(ggml_context * ctx, ggml_tensor * t, int64_t cells) {
+    const size_t cell_bytes = ggml_row_size(t->type, t->ne[0])*t->ne[1];
+    GGML_ASSERT(t->nb[0] == ggml_type_size(t->type) && t->nb[1] == ggml_row_size(t->type, t->ne[0]) && t->nb[2] == cell_bytes);
+    GGML_ASSERT(t->ne[2] % cells == 0 && (cell_bytes*cells) % sizeof(int32_t) == 0);
+    ggml_tensor * w = ggml_view_2d(ctx, t, t->ne[0], t->ne[2]/cells, cell_bytes*cells, 0);
+    w->type  = GGML_TYPE_I32;
+    w->ne[0] = (int64_t) (cell_bytes*cells/sizeof(int32_t));
+    w->ne[1] = t->ne[2]/cells;
+    w->nb[0] = sizeof(int32_t);
+    w->nb[1] = cell_bytes*cells;
+    w->nb[2] = w->nb[1]*w->ne[1];
+    w->nb[3] = w->nb[2];
+    return w;
+}
+
+// gather rows of inklsa_words (ids I32 [n]) back as [d, h, n*cells] of t's type (contiguous)
+static ggml_tensor * inklsa_gather(ggml_context * ctx, ggml_tensor * t, int64_t cells, ggml_tensor * ids) {
+    ggml_tensor * g = ggml_get_rows(ctx, inklsa_words(ctx, t, cells), ids);
+    const size_t row_bytes = ggml_row_size(t->type, t->ne[0]);
+    ggml_tensor * r = ggml_view_2d(ctx, g, g->ne[0], g->ne[1], g->nb[1], 0);
+    r->type  = t->type;
+    r->ne[0] = t->ne[0];
+    r->ne[1] = t->ne[1];
+    r->ne[2] = ids->ne[0]*cells;
+    r->ne[3] = 1;
+    r->nb[0] = ggml_type_size(t->type);
+    r->nb[1] = row_bytes;
+    r->nb[2] = row_bytes*t->ne[1];
+    r->nb[3] = r->nb[2]*r->ne[2];
+    return r;
+}
+
+// mean over the B cells of each block: x F16 [D, B, n] (any strides) -> F32 [D, n]
+static ggml_tensor * inklsa_block_mean(ggml_context * ctx, ggml_tensor * x) {
+    const int64_t D = x->ne[0], B = x->ne[1], n = x->ne[2];
+    ggml_tensor * f = ggml_cast(ctx, x, GGML_TYPE_F32);                       // [D, B, n] contiguous
+    f = ggml_cont(ctx, ggml_permute(ctx, f, 1, 0, 2, 3));                     // [B, D, n]
+    f = ggml_sum_rows(ctx, f);                                                // [1, D, n]
+    return ggml_reshape_2d(ctx, ggml_scale(ctx, f, 1.0f/B), D, n);
+}
+
+ggml_tensor * llm_graph_context::build_attn_rel(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * sinks,
+              float   kq_scale,
+                int   il) const {
+    const bool is_swa = hparams.is_swa(il);
+    auto * inp_attn = inp->get_attn();
+    const int64_t n_head = table->ne[0];
+
+    const auto * mctx_cur = inp_attn->mctx->get_base();
+    ggml_tensor * kc = nullptr;
+    if (!is_swa && inp->inklsa_on) {
+        ggml_tensor * kv = mctx_cur->get_k(ctx0, il);
+        kc = kv->view_src ? kv->view_src : kv;
+        if (!kc->buffer || kv->type != GGML_TYPE_F16 || kv->ne[3] != 1 || inp_attn->self_k_rot[il] || inp_attn->self_v_rot[il] ||
+                mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il)) {
+            kc = nullptr; // memory-fit dry run, or a cache INKLSA does not cover: dense
+        }
+    }
+
+    if (kc == nullptr) {
+        // dense: gather the bias of every cell by its distance
+        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+        const int64_t n_stream = (is_swa ? inp_attn->self_attn_mask_swa.raw : inp_attn->self_attn_mask.raw)->ne[3];
+        const int64_t n_kv     = rel_pos->ne[0];
+
+        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        cb(kq_b, "kq_b", il);
+
+        return build_attn(inp, nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, kq_b, sinks, kq_scale, il);
+    }
+
+    auto & in = inp->inklsa;
+    const int64_t B = in.B;
+
+    // store K and V first: the index refresh below re-reads the blocks this ubatch writes
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp_attn->get_v_idxs(), il));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il); // [d, h_kv, n_kv, 1]
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    GGML_ASSERT(v->type == GGML_TYPE_F16 && v->nb[1] < v->nb[2] && "INKLSA: needs a non-transposed F16 V cache");
+    const int64_t D = k->ne[0]*k->ne[1];
+
+    llama_inklsa_idx idx;
+    GGML_ASSERT(llama_inklsa_idx_get(kc, D, kc->ne[1]/B, ggml_backend_buffer_get_type(kc->buffer), &idx));
+    inp->inklsa_kcaches.push_back(kc);
+    if (!idx.valid) {
+        // rebuild every block [0, n_blk) from K, in chunks that bound the F32 scratch
+        const int64_t CH = 1024;
+        for (int64_t b0 = 0; b0 < in.n_blk; b0 += CH) {
+            const int64_t nb = std::min(CH, in.n_blk - b0);
+            ggml_tensor * x = ggml_view_3d(ctx0, k, D, B, nb, k->nb[2], k->nb[2]*B, k->nb[2]*B*b0);
+            ggml_tensor * dst = ggml_view_2d(ctx0, idx.t, D, nb, idx.t->nb[1], idx.t->nb[1]*b0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, inklsa_block_mean(ctx0, x), dst));
+        }
+        inp->inklsa_commit.emplace_back(kc, idx.epoch);
+        inp->inklsa_rebuild = true;
+    }
+    // refresh the blocks this ubatch wrote (rows past the newest position are stale until written; such a block is
+    // never eligible before it is whole)
+    ggml_tensor * ub = inklsa_gather(ctx0, k, B, in.u_blk);                                   // [128, 8, n_u*B]
+    ub = ggml_reshape_3d(ctx0, ub, D, B, in.n_u);
+    ggml_tensor * index = ggml_set_rows(ctx0, idx.t, inklsa_block_mean(ctx0, ub), in.u_blk64); // view of idx.t
+    ggml_build_forward_expand(gf, index);
+
+    if (!in.sparse) {
+        // dense attention over the full cache (K/V already stored: pass no k_cur / v_cur)
+        ggml_tensor * rel_pos = inp->self_rel_pos;
+        const int64_t n_kv = rel_pos->ne[0];
+        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens, 1);
+        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        ggml_tensor * kq_mask = inp_attn->self_attn_mask.raw;
+        if (kq_mask->type != GGML_TYPE_F32) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = ggml_cast(ctx0, ggml_add(ctx0, kq_b, kq_mask), GGML_TYPE_F16);
+        ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        return cur;
+    }
+
+    {
+        static std::atomic<int> n_logged{0};
+        if (n_logged.fetch_add(1) == 0) {
+            LLAMA_LOG_WARN("%s: INKLSA sparse attention active (first sparse graph: n_kv %lld, T %lld, keep %lld, fixed %lld)\n",
+                    __func__, (long long) (in.n_blk*B), (long long) n_tokens, (long long) llama_inklsa_n_keep(), (long long) in.n_fix);
+        }
+    }
+
+    // pick: score every block by its mean key, softmax over blocks per (q head, row), sum the shares
+    const int64_t T   = n_tokens;
+    const int64_t Hkv = k->ne[1];
+    const int64_t dh  = k->ne[0];
+    ggml_tensor * qbd = ggml_reshape_4d(ctx0, q_cur, dh, 1, n_head, T);
+    qbd = ggml_mul(ctx0, ggml_repeat_4d(ctx0, qbd, dh, Hkv, n_head, T), in.onehot);           // block-diagonal per KV group
+    qbd = ggml_reshape_2d(ctx0, qbd, D, n_head*T);
+    ggml_tensor * iview = ggml_view_2d(ctx0, index, D, in.n_blk, idx.t->nb[1], 0);
+    ggml_tensor * sc = ggml_mul_mat(ctx0, iview, qbd);                                       // [n_blk, n_head*T]
+    sc = ggml_soft_max(ctx0, ggml_add(ctx0, ggml_scale(ctx0, sc, kq_scale), in.elig));
+    ggml_tensor * votes = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, sc)));    // [1, n_blk]
+    votes = ggml_reshape_2d(ctx0, votes, in.n_blk, 1);
+    const int64_t nk = llama_inklsa_n_keep()/B;
+    ggml_tensor * pick = ggml_top_k(ctx0, votes, (int) nk);                                   // I32 [nk, 1]
+    pick = ggml_reshape_1d(ctx0, pick, nk);
+    cb(pick, "inklsa_pick", il);
+
+    // compact K/V: fixed cells, then the picked blocks
+    ggml_tensor * ks = ggml_concat(ctx0, inklsa_gather(ctx0, k, 1, in.fix_ids), inklsa_gather(ctx0, k, B, pick), 2);
+    ggml_tensor * vs = ggml_concat(ctx0, inklsa_gather(ctx0, v, 1, in.fix_ids), inklsa_gather(ctx0, v, B, pick), 2);
+
+    // mask [n_sel, T, n_head]: fixed cells get their bias row (+ causal/padding mask), picked blocks the far row
+    // (index extent) of every head and row, -inf for an ineligible pick (fewer eligible blocks than nk)
+    const int64_t E = table->ne[1] - 1;
+    ggml_tensor * mf = ggml_get_rows(ctx0, table, in.fix_rel);                               // [n_head, n_fix, T]
+    mf = ggml_cont(ctx0, ggml_permute(ctx0, mf, 2, 0, 1, 3));                                 // [n_fix, T, n_head]
+    mf = ggml_add(ctx0, mf, in.fix_mask);
+    ggml_tensor * far = ggml_view_3d(ctx0, table, n_head, 1, T, table->nb[1], table->nb[2], E*table->nb[1]);
+    far = ggml_cont(ctx0, ggml_permute(ctx0, far, 2, 0, 1, 3));                              // [1, T, n_head]
+    ggml_tensor * pe = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, in.elig, 1, in.n_blk), pick); // [1, nk]
+    pe = ggml_reshape_4d(ctx0, ggml_repeat_4d(ctx0, pe, B, nk, 1, 1), B*nk, 1, 1, 1);
+    ggml_tensor * mb = ggml_add(ctx0, ggml_repeat_4d(ctx0, far, B*nk, T, n_head, 1), pe);    // [nk*B, T, n_head]
+    ggml_tensor * mask = ggml_cast(ctx0, ggml_concat(ctx0, mf, mb, 0), GGML_TYPE_F16);
+    cb(mask, "inklsa_mask", il);
+
+    ggml_tensor * cur = build_attn_mha(q_cur, ks, vs, nullptr, mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+    cb(cur, "kqv_out", il);
+    return cur;
 }
 
 void llm_graph_context::build_dense_out(

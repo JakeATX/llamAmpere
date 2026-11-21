@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-batch.h"
+#include "llama-inklsa.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
@@ -970,6 +971,14 @@ public:
 
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
+
+    // INKLSA (llama-inklsa.h, LLAMA_INKLSA=1): sparse full-attention inputs, the visits' index caches and the epochs a
+    // rebuild graph commits when it runs
+    bool inklsa_on      = false;
+    bool inklsa_rebuild = false;
+    llama_inklsa_inputs inklsa;
+    std::vector<const ggml_tensor *> inklsa_kcaches;
+    mutable std::vector<std::pair<const ggml_tensor *, uint64_t>> inklsa_commit;
 
     // distance from the token to the cell, extent for the empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
@@ -2142,6 +2151,19 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(
             uint32_t extent,
             uint32_t extent_swa) const;
+
+    // Inkling 2 attention: kq_b is gathered here from the per-query bias table [n_head_q, extent + 1, n_tokens]
+    // (row extent = the zero pad row minus the sink, used for every cell at distance >= extent); the full-attention
+    // visits take the INKLSA sparse path when it is on (llama-inklsa.h)
+    ggml_tensor * build_attn_rel(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * table, // [n_head_q, extent + 1, n_tokens]
+            ggml_tensor * sinks, // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
 
     // kq_b is added to the KQ mask, after the KQ scale
     ggml_tensor * build_attn(

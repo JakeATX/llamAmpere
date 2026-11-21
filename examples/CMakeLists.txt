@@ -19,6 +19,8 @@ else()
     add_subdirectory(drama3)
     add_subdirectory(embedding)
     add_subdirectory(eval-callback)
+    add_subdirectory(inklsa-dump)
+    add_subdirectory(inklsa-kld)
 
     add_subdirectory(gguf-hash)
     add_subdirectory(gguf)
