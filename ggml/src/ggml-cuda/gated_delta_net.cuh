@@ -34,6 +34,10 @@ struct ggml_cuda_gated_delta_net_state_src {
     // [GDNDIRECT] and the K ingredient slots here (the ring row: slot j, head h at (j * H + h) * ingr_w),
     // only when the call emits all K slots for one sequence; nullptr keeps the op output
     float *         ingr_dst      = nullptr;
+    // [MULTI08 B] n_seqs > 1 with rows (state read in place) and final_dst / ckpt_dst set: one sequence's input
+    // row can be another sequence's output row (find_slot cell swaps). Each block checks the rows first; on any
+    // such overlap every block stores in the op output instead and gdn_direct_fallback copies the blocks over.
+    int             guard_in_place = 0;
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -47,6 +47,51 @@ static __device__ __forceinline__ void gdn_store_state(void * state, const int64
 // type (f32/bf16/f16/q8_0, --cache-type-s) when the snapshot copy is fused (ggml_cuda_try_gdn_cache_fusion).
 // The recurrence itself always runs in F32 registers; only the stored state is rounded. `state` is
 // addressed in elements (gdn_store_state), so a q8_0 block is 32 consecutive elements of one column.
+// [MULTI08 B] guard_in_place: true when a sequence's input row (base + rows[t] * row_stride, D floats) shares bytes
+// with a final / checkpoint output block of another sequence, or with its own without being the same row (a row
+// read and stored by the same thread, element by element, is safe: [#87]). Every block computes the same answer.
+static __device__ __forceinline__ bool gdn_direct_rows_conflict(const float * base, const ggml_cuda_gated_delta_net_state_src & ss,
+                                                               const int64_t n_seqs, const int64_t D) {
+    if (ss.guard_in_place == 2) {
+        return true; // GGML_CUDA_GDN_DIRECT_FORCE_FALLBACK=1 (test only): take the fallback path every time
+    }
+    for (int64_t t = 0; t < n_seqs; ++t) {
+        const float * r0 = base + (int64_t) ss.rows[t] * ss.row_stride;
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            for (int j = 0; j < 2; ++j) {
+                const float * w = j == 0 ? ss.final_dst : ss.ckpt_dst;
+                if (w == nullptr) {
+                    continue;
+                }
+                const float * w0 = w + s * D;
+                if (r0 < w0 + D && w0 < r0 + D && !(t == s && r0 == w0)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// [MULTI08 B] after a guard_in_place launch: if the kernels found a conflict they stored the final / checkpoint
+// blocks in the op output (fin_src / ckpt_src); copy them to the cache rows. Otherwise nothing to do.
+static __global__ void gdn_direct_fallback(const float * base, const ggml_cuda_gated_delta_net_state_src ss, const int64_t n_seqs,
+                                           const int64_t D, const float * fin_src, const float * ckpt_src) {
+    ggml_cuda_pdl_sync();
+    if (!gdn_direct_rows_conflict(base, ss, n_seqs, D)) {
+        return;
+    }
+    const int64_t n = D * n_seqs;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        if (ss.final_dst) {
+            ss.final_dst[i] = fin_src[i];
+        }
+        if (ss.ckpt_dst) {
+            ss.ckpt_dst[i] = ckpt_src[i];
+        }
+    }
+}
+
 template <int S_v, bool KDA, bool keep_rs_t, bool emit_ingredients_t, typename state_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -115,6 +160,12 @@ gated_delta_net_cuda(const float * q,
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
+    float * fin_dst = state_src.final_dst;
+    float * ckp_dst = state_src.ckpt_dst;
+    if (state_src.guard_in_place && gdn_direct_rows_conflict(curr_state, state_src, n_seqs, H * S_v * S_v)) {
+        fin_dst = nullptr;
+        ckp_dst = nullptr;
+    }
     curr_state += (state_src.rows != nullptr
                        ? (int64_t) state_src.rows[sequence] * state_src.row_stride + h_idx * S_v * S_v
                        : state_in_offset) + col * S_v;
@@ -130,7 +181,7 @@ gated_delta_net_cuda(const float * q,
     for (int t = -n_prefix; t < n_tokens; t++) {
         if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens <= K) {
             // n_tokens <= K with a prefix: the checkpoint block is the state after the prefix
-            float * ckpt_slot = (state_src.ckpt_dst ? state_src.ckpt_dst : state_f + ingr_region + S_v * S_v * H * n_seqs) +
+            float * ckpt_slot = (ckp_dst ? ckp_dst : state_f + ingr_region + S_v * S_v * H * n_seqs) +
                 (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -311,7 +362,7 @@ gated_delta_net_cuda(const float * q,
                 // (n_tokens <= K with a prefix: at the top of token 0, above).
                 const int t_ckpt = (int) n_tokens - K - 1;
                 if (t_ckpt >= 0 && t == t_ckpt) {
-                    float * ckpt_slot = (state_src.ckpt_dst ? state_src.ckpt_dst : state_f + ingr_region + S_v * S_v * H * n_seqs) +
+                    float * ckpt_slot = (ckp_dst ? ckp_dst : state_f + ingr_region + S_v * S_v * H * n_seqs) +
                                          (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
                     for (int r = 0; r < rows_per_lane; r++) {
@@ -326,7 +377,7 @@ gated_delta_net_cuda(const float * q,
     if constexpr (emit_ingredients_t) {
         // fixed, once-per-call cost (not scaled by K): the true final state, for use as the next
         // decode's optimistic base state / this decode's own checkpoint update.
-        float * final_slot = (state_src.final_dst ? state_src.final_dst : state_f + ingr_region) + (sequence * H + h_idx) * S_v * S_v;
+        float * final_slot = (fin_dst ? fin_dst : state_f + ingr_region) + (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * warp_size + lane;
@@ -418,6 +469,12 @@ gated_delta_net_cuda_ilp(const float * q,
     };
 
     ggml_cuda_pdl_sync();
+    float * fin_dst = state_src.final_dst;
+    float * ckp_dst = state_src.ckpt_dst;
+    if (state_src.guard_in_place && gdn_direct_rows_conflict(curr_state, state_src, n_seqs, H * S_v * S_v)) {
+        fin_dst = nullptr;
+        ckp_dst = nullptr;
+    }
     // [#87] see gated_delta_net_cuda: cache row rows[sequence], or src[5] at sequence * D
     curr_state += (state_src.rows != nullptr
                        ? (int64_t) state_src.rows[sequence] * state_src.row_stride + h_idx * S_v * S_v
@@ -488,7 +545,7 @@ gated_delta_net_cuda_ilp(const float * q,
         }
         if (emit_ingredients_t && t == 0 && n_prefix > 0 && n_tokens <= K) {
             // n_tokens <= K with a prefix: the checkpoint block is the state after the prefix
-            float * ckpt = (state_src.ckpt_dst ? state_src.ckpt_dst : (float *) state + ingr_region + S_v * S_v * H * n_seqs) +
+            float * ckpt = (ckp_dst ? ckp_dst : (float *) state + ingr_region + S_v * S_v * H * n_seqs) +
                 (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
             for (int c = 0; c < NC; c++) {
@@ -627,7 +684,7 @@ gated_delta_net_cuda_ilp(const float * q,
             }
             if constexpr (emit_ingredients_t) {
                 if (n_tokens > K && t == n_tokens - K - 1) {
-                    float * ckpt = (state_src.ckpt_dst ? state_src.ckpt_dst : (float *) state + ingr_region + S_v * S_v * H * n_seqs) +
+                    float * ckpt = (ckp_dst ? ckp_dst : (float *) state + ingr_region + S_v * S_v * H * n_seqs) +
                 (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
                     for (int c = 0; c < NC; c++) {
@@ -644,7 +701,7 @@ gated_delta_net_cuda_ilp(const float * q,
     }
 
     if constexpr (emit_ingredients_t) {
-        float * fin = (state_src.final_dst ? state_src.final_dst : (float *) state + ingr_region) + (sequence * H + h_idx) * S_v * S_v;
+        float * fin = (fin_dst ? fin_dst : (float *) state + ingr_region) + (sequence * H + h_idx) * S_v * S_v;
 #pragma unroll
         for (int c = 0; c < NC; c++) {
 #pragma unroll
@@ -2086,6 +2143,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 break;
             }
         }
+        static const bool force_fallback = [] { const char * e = getenv("GGML_CUDA_GDN_DIRECT_FORCE_FALLBACK"); return e != nullptr && atoi(e) != 0; }();
+        state_src.guard_in_place = n_seqs > 1 && state_src.rows != nullptr && (state_src.final_dst || state_src.ckpt_dst)
+            ? (force_fallback ? 2 : 1) : 0;
         if (kda) {
             launch_gated_delta_net<true, true, true, float>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
@@ -2094,6 +2154,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
             launch_gated_delta_net<false, true, true, float>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
                 state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
+        }
+        if (state_src.guard_in_place) {
+            const int64_t D   = S_v * S_v * H;
+            const float * fin = (const float *) state_d + ingr_region;
+            gdn_direct_fallback<<<64, 256, 0, stream>>>(s_d, state_src, n_seqs, D, fin, fin + D * n_seqs);
+            CUDA_CHECK(cudaGetLastError());
         }
         return;
     }
