@@ -2945,6 +2945,16 @@ static int aif_rs_mmq() {
     return v;
 }
 
+// [KAIMULTI] GGML_CUDA_AIF_NARROW=0: widths 9..32 run the mmv loop (one weight decode per 8 tokens; kill switch). Default 1:
+// magic2::mmq with all N tokens in one tile, one decode per weight unit, bit-identical to mmv.
+// GGML_CUDA_AIF_NARROW_MIN / _MAX: the inclusive width range (defaults 9 / 32; clamped to 9..32).
+static bool aif_narrow(int64_t n) {
+    static const int on = ai4_env_int("GGML_CUDA_AIF_NARROW", nullptr, 1);
+    static const int lo = std::min(32, std::max(9, ai4_env_int("GGML_CUDA_AIF_NARROW_MIN", nullptr, 9)));
+    static const int hi = std::min(32, std::max(9, ai4_env_int("GGML_CUDA_AIF_NARROW_MAX", nullptr, 32)));
+    return on != 0 && n >= lo && n <= hi;
+}
+
 static int aif25_mmq_check() {
     static const int v = ai4_env_int("GGML_CUDA_AIF25_MMQ_CHECK", nullptr, 0);
     return v;
@@ -3019,8 +3029,11 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int tile = aif25_mmq_tile();
     // [K126] the row-scale types (AIF25_U2, AIF175_U2, AIF25_U2_512) take mmq too, unless GGML_CUDA_AIF_RS_MMQ=0
     const bool row_scale = w->type != GGML_TYPE_AIF25_U;
-    if ((!row_scale || aif_rs_mmq()) && tile > 0 && N >= aif25_mmq_min() &&
-            ggml_cuda_aif25_mmq(w->type, xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) {
+    // [KAIMULTI] the narrow kernel obeys the same kill switches (GGML_CUDA_AIF25_MMQ=0, GGML_CUDA_AIF_RS_MMQ=0) plus its own
+    const bool mmq_ok = (!row_scale || aif_rs_mmq()) && tile > 0;
+    const bool wide = mmq_ok && N >= aif25_mmq_min();
+    if ((wide && ggml_cuda_aif25_mmq(w->type, xsh, tile, aif25_mmq_strips(), wd, q.get(), scales.get(), y, M, K, N, stream)) ||
+            (mmq_ok && aif_narrow(N) && ggml_cuda_aif25_mmq_narrow(w->type, xsh, wd, q.get(), scales.get(), y, M, K, N, stream))) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (aif25_mmq_check()) {
             CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
