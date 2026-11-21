@@ -110,7 +110,7 @@ void llama_d1_select_top(const float * row, int64_t n_vocab, int n, std::vector<
 // [EXACTHEAD] certificate: after the top N are exact, any other row whose coarse logit could still reach the k-th
 // exact logit (coarse + margin + sigma * s_i >= T_k, s_i = sqrt(sum_g ||h_g||^2 * gl2[i][g]^2 / 32)) is rescored too.
 // Statistically exact (Jake 11-21): treating each row's coarse error as Gaussian with std s_i, a row that belongs in
-// the exact top k is left coarse with probability <= ~1e-9 (one-sided 6 sigma). Default on inside the add-on when the
+// the exact top k is left coarse with probability ~1e-9 (one-sided 6 sigma). Default on inside the add-on when the
 // sidecar has output_exact.gl2; LLAMA_D1_CERT=0 is the kill switch. Study: 0 misses in 16,200 positions.
 struct llama_d1_cert {
     bool  on     = false; // the context turns it on by default when the sidecar has gl2

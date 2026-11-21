@@ -905,7 +905,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                             ggml_type_name(model.output->type), n_top, d1_head->path.c_str(),
                             ggml_type_name(d1_head->type), eager, n_thr);
                     if (cert.on) {
-                        LLAMA_LOG_INFO("d1: certificate on (statistically exact: a missed top-%d row has probability <= ~1e-9 per "
+                        LLAMA_LOG_INFO("d1: certificate on (statistically exact: a missed top-%d row has probability ~1e-9 per "
                                 "row at %.1f sigma): k=%d sigma=%.2f margin=%.3f (head max group error %.4g); LLAMA_D1_CERT=0 turns it off\n",
                                 cert.k, cert.sigma, cert.k, cert.sigma, cert.margin, d1_head->gl2_max);
                     } else {
