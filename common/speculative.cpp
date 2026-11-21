@@ -2281,7 +2281,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<common_speculative_cdepth_state> cd_state; // [n_seq]
     bool cd_chain_warned = false;
 
-    // [WEAKCUT] weak-block cut (default on, LLAMA_SPEC_WEAK_CUT=0 turns it off; LLAMA_SPEC_WEAK_CUT_TAU, default 0.5):
+    // [WEAKCUT] weak-block cut (default OFF after the 11-21 gate failed: 8K -2.2%, f100 +0.2%; LLAMA_SPEC_WEAK_CUT=1 turns it on; LLAMA_SPEC_WEAK_CUT_TAU, default 0.5):
     // in a one-sequence adaptive round with a cap of 5 or more, when the product of the drafter's top-1 probabilities
     // at draft positions 0-2 is below tau, stop drafting 2 tokens early. Only the draft length changes; every drafted
     // token is verified as before (lossless). TREEVERIFY replay: +0.7% @8K, +1.1% @98,766 (model).
@@ -2289,7 +2289,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<uint8_t>  wc_cut;  // [n_seq] this round was cut
     uint64_t wc_n_cut = 0, wc_n_rounds = 0;
     static bool weak_cut_enabled() {
-        static const bool on = [] { const char * e = getenv("LLAMA_SPEC_WEAK_CUT"); return !e || atoi(e) != 0; }();
+        static const bool on = [] { const char * e = getenv("LLAMA_SPEC_WEAK_CUT"); return e && atoi(e) != 0; }();
         return on;
     }
     static float weak_cut_tau() {
@@ -2506,7 +2506,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             SPC_TRC("%s", "adaptive draft depth enabled (draft-mtp-adaptive)\n");
             if (n_seq == 1 && weak_cut_enabled()) {
                 LOG_INF("%s: weak-block cut on: one-sequence rounds with cap >= 5 draft 2 fewer when the top-1 product at "
-                        "positions 0-2 < %.2f (LLAMA_SPEC_WEAK_CUT=0 turns it off)\n", __func__, (double) weak_cut_tau());
+                        "positions 0-2 < %.2f (LLAMA_SPEC_WEAK_CUT=1, opt-in)\n", __func__, (double) weak_cut_tau());
             }
 
             if (this->params.depth_policy == "cdepth") {
