@@ -104,6 +104,7 @@ bool ggml_cuda_sj_kvarn_strip_master_stage(ggml_backend_cuda_context & ctx, cons
 
 #define SJKVARN_SEAL_THREADS 256
 #define SJKVARN_SEAL_MAX_DIM 256
+#define SJKVARN_SEAL_WIDE_DEFAULT 1024
 
 // trellis-coded 4-bit body (body type GGML_TYPE_I16, ggml-sjkvarn.h "sjkvarn4t"): warp-parallel Viterbi, one warp per
 // (channel tile, fragment lane) sequence of G/2 values. Lane owns windows w = lane + 32*i (i < NWIN/32), i.e. states
@@ -283,12 +284,12 @@ static __device__ __forceinline__ float sj_kvarn_cur(const half * tile, const fl
 
 // one balancing pass over n_vec vectors of n = CHUNK*SJKVARN_RED_LANES elements; vector index is the column
 // (col_pass) or the row of the tile; updates log_s[vec] and s_out[vec] (the vector's own scale only)
-template <int CHUNK, bool col_pass>
+template <int CHUNK, bool col_pass, int NT>
 static __device__ __forceinline__ void sj_kvarn_std_pass(const half * tile, float * s_row, float * s_col,
                                                       double * log_s, float * s_out,
                                                       const int n_vec, const int sr, const int sc) {
     constexpr int n = CHUNK*SJKVARN_RED_LANES;
-    for (int task = threadIdx.x; task < n_vec*SJKVARN_RED_LANES; task += SJKVARN_SEAL_THREADS) {
+    for (int task = threadIdx.x; task < n_vec*SJKVARN_RED_LANES; task += NT) {
         const int vec  = task / SJKVARN_RED_LANES;
         const int lane = task % SJKVARN_RED_LANES;
         float vals[CHUNK];
@@ -329,15 +330,15 @@ static __device__ __forceinline__ void sj_kvarn_std_pass(const half * tile, floa
     }
 }
 
-template <bool col_pass>
+template <bool col_pass, int NT>
 static __device__ __forceinline__ void sj_kvarn_std_pass_n(const half * tile, float * s_row, float * s_col,
                                                         double * log_s, float * s_out,
                                                         const int n_vec, const int n, const int sr, const int sc) {
     switch (n) {
-        case  32: sj_kvarn_std_pass< 4, col_pass>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
-        case  64: sj_kvarn_std_pass< 8, col_pass>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
-        case 128: sj_kvarn_std_pass<16, col_pass>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
-        case 256: sj_kvarn_std_pass<32, col_pass>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
+        case  32: sj_kvarn_std_pass< 4, col_pass, NT>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
+        case  64: sj_kvarn_std_pass< 8, col_pass, NT>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
+        case 128: sj_kvarn_std_pass<16, col_pass, NT>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
+        case 256: sj_kvarn_std_pass<32, col_pass, NT>(tile, s_row, s_col, log_s, s_out, n_vec, sr, sc); break;
         default: break; // rejected by supports_op
     }
 }
@@ -537,7 +538,12 @@ static __device__ void sj_kvarn_trellis_lb_refit(const half * tile, const float 
     }
 }
 
-static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const char * __restrict__ vsrc,
+// NT = threads per block. Every loop below hands out independent tasks (a vector's 8 reduction lanes stay one aligned
+// group of lanes in one warp for any NT that is a multiple of 32), so the record bytes do not depend on NT. The trellis
+// sealers keep the 256-thread instance (per-warp scratch); the scalar body uses a wider block (SEAL08: the 16 balancing
+// iterations are double-pipe bound, and 8 warps per SM leave that pipe idle on latency).
+template <int NT>
+static __global__ void __launch_bounds__(NT, 1) k_sj_kvarn_seal(const char * __restrict__ ksrc, const char * __restrict__ vsrc,
                                     uint8_t * __restrict__ body, const int32_t * __restrict__ desc,
                                     const sj_kvarn_seal_params p) {
     extern __shared__ half tile[]; // [G][D] token-major
@@ -547,10 +553,13 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
     __shared__ double log_sc[SJKVARN_SEAL_MAX_DIM];
     __shared__ float  q_lo[SJKVARN_SEAL_MAX_DIM];
     __shared__ float  q_step[SJKVARN_SEAL_MAX_DIM];
-    __shared__ float    tr_y[SJKVARN_SEAL_THREADS/32][SJKVARN_TR3_NVAL > SJKVARN_TR_NVAL ? SJKVARN_TR3_NVAL : SJKVARN_TR_NVAL];
-    __shared__ float    tr_M[SJKVARN_SEAL_THREADS/32][sj_kvarn_tr::NSTATE];
-    __shared__ uint32_t tr_arg[SJKVARN_SEAL_THREADS/32][SJKVARN_TR_ARGW];
+    constexpr bool trellis_ok = NT == SJKVARN_SEAL_THREADS;
+    constexpr int  TRW = trellis_ok ? SJKVARN_SEAL_THREADS/32 : 1; // trellis scratch only in the 256-thread instance
+    __shared__ float    tr_y[TRW][SJKVARN_TR3_NVAL > SJKVARN_TR_NVAL ? SJKVARN_TR3_NVAL : SJKVARN_TR_NVAL];
+    __shared__ float    tr_M[TRW][sj_kvarn_tr::NSTATE];
+    __shared__ uint32_t tr_arg[TRW][SJKVARN_TR_ARGW];
 
+    const bool trellis = trellis_ok && p.trellis; // the host launches trellis bodies on the 256-thread instance only
     const bool is_V = blockIdx.x & 1;
     const int  D = p.D, G = p.G;
     const int  tid = threadIdx.x;
@@ -587,7 +596,7 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
         const char * src = (is_V ? vsrc : ksrc) + (size_t) h*head_bytes;
         const size_t nb1 = is_V ? p.v_nb1 : p.k_nb1;
         const int chunks_per_row = D/8; // uint4 = 8 halves
-        for (int i = tid; i < G*chunks_per_row; i += SJKVARN_SEAL_THREADS) {
+        for (int i = tid; i < G*chunks_per_row; i += NT) {
             const int t = i / chunks_per_row, c = i % chunks_per_row;
             if (type == GGML_TYPE_TQ6_0) {
                 const block_tq6_0 * b = ((const block_tq6_0 *) (src + (size_t) (row0 + t)*nb1)) + c/(QK_TQ6/8);
@@ -613,15 +622,15 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
     const int C  = is_V ? D : G;
     const int sr = is_V ? D : 1;
     const int sc = is_V ? 1 : D;
-    for (int i = tid; i < SJKVARN_SEAL_MAX_DIM; i += SJKVARN_SEAL_THREADS) {
+    for (int i = tid; i < SJKVARN_SEAL_MAX_DIM; i += NT) {
         s_row[i] = 1.0f; s_col[i] = 1.0f; log_sr[i] = 0.0; log_sc[i] = 0.0;
     }
     __syncthreads();
 
     for (int it = 0; it < p.iters; ++it) {
-        sj_kvarn_std_pass_n<true >(tile, s_row, s_col, log_sc, s_col, C, R, sr, sc); // columns: vectors over rows
+        sj_kvarn_std_pass_n<true,  NT>(tile, s_row, s_col, log_sc, s_col, C, R, sr, sc); // columns: vectors over rows
         __syncthreads();
-        sj_kvarn_std_pass_n<false>(tile, s_row, s_col, log_sr, s_row, R, C, sr, sc); // rows: vectors over columns
+        sj_kvarn_std_pass_n<false, NT>(tile, s_row, s_col, log_sr, s_row, R, C, sr, sc); // rows: vectors over columns
         __syncthreads();
     }
 
@@ -637,7 +646,7 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
     const size_t   row_bytes = (size_t) D*bits/8;
 
     // phase A: per row lo/hi over the columns, 2 threads per row
-    for (int task = tid; task < 2*R; task += SJKVARN_SEAL_THREADS) {
+    for (int task = tid; task < 2*R; task += NT) {
         const int r = task >> 1, half_ = task & 1;
         const int c0 = half_*(C/2), c1 = c0 + C/2;
         float lo = sj_kvarn_cur(tile, s_row, s_col, r, c0, sr, sc), hi = lo;
@@ -648,7 +657,7 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
         }
         lo = fminf(lo, __shfl_xor_sync(0xFFFFFFFF, lo, 1, 32));
         hi = fmaxf(hi, __shfl_xor_sync(0xFFFFFFFF, hi, 1, 32));
-        if (!p.trellis && clipf < 0.0f) { // GGML_SJKVARN_SCALAR_CLIP=row: ggml_sj_kvarn::row_clip_search, this thread = one half
+        if (!trellis && clipf < 0.0f) { // GGML_SJKVARN_SCALAR_CLIP=row: ggml_sj_kvarn::row_clip_search, this thread = one half
             float best = 0.0f; int bi = 0;
             for (int i = 0; i < SJKVARN_CLIP_NCAND; ++i) {
                 float clo, cstep;
@@ -662,7 +671,7 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
                 if (i == 0 || e < best) { best = e; bi = i; }
             }
             if (bi > 0) { ggml_sj_kvarn::clip_range(lo, hi, ggml_sj_kvarn::clip_cand(bi)); }
-        } else if (!p.trellis && clipf != 1.0f) { ggml_sj_kvarn::clip_range(lo, hi, clipf); } // GGML_SJKVARN_SCALAR_CLIP
+        } else if (!trellis && clipf != 1.0f) { ggml_sj_kvarn::clip_range(lo, hi, clipf); } // GGML_SJKVARN_SCALAR_CLIP
         const float step = fmaxf(__fdiv_rn(__fsub_rn(hi, lo), qmaxf), 1e-10f);
         if (half_ == 0) {
             q_lo[r]   = lo;
@@ -673,7 +682,7 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
             ((half *) (out + o_zero))[ri]  = __float2half_rn(__fmul_rn(s_row[r], lo));
         }
     }
-    for (int c = tid; c < C; c += SJKVARN_SEAL_THREADS) {
+    for (int c = tid; c < C; c += NT) {
         // K columns are tokens (Ktok, natural order); V columns are channels (Vch, fragment order)
         const int ci = is_V ? ggml_sj_kvarn::v_ch_idx(c, D, G, bits) : c;
         ((half *) (out + o_col))[ci] = __float2half_rn(s_col[c]);
@@ -684,7 +693,7 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
     // other widths as a token-major bit stream, 2 threads per token row.
     if (ggml_sj_kvarn::frag_order(bits, D, G)) {
         uint32_t * dst32 = (uint32_t *) (out + payload);
-        if (p.trellis && (p.trtok & 2)) { // 4-bit token-axis trellis (trellis4, opt-in): low-bit sealer at BITS = 4, then the refit
+        if (trellis && (p.trtok & 2)) { // 4-bit token-axis trellis (trellis4, opt-in): low-bit sealer at BITS = 4, then the refit
             uint32_t * tr3_arg = p.tr3_arg + ((size_t) blockIdx.x*(SJKVARN_SEAL_THREADS/32) + (tid >> 5))*SJKVARN_TR3_ARGW;
             sj_kvarn_trellis_lb_phase_b<4>(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32, tr_y[tid >> 5], tr_M[tid >> 5], tr3_arg, true);
             if (p.refit) {
@@ -693,14 +702,14 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
             }
             return;
         }
-        if (p.trellis) {
+        if (trellis) {
             const int warp = tid >> 5;
             sj_kvarn_trellis_phase_b(tile, s_row, s_col, q_lo, q_step, sr, sc, is_V, D, G, dst32,
                                   tr_y[warp], tr_M[warp], tr_arg[warp]);
             return;
         }
         const int n_words = G*D/8;
-        for (int w = tid; w < n_words; w += SJKVARN_SEAL_THREADS) {
+        for (int w = tid; w < n_words; w += NT) {
             uint32_t word = 0;
 #pragma unroll
             for (int nib = 0; nib < 8; ++nib) {
@@ -712,7 +721,7 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
             }
             dst32[w] = word;
         }
-    } else if (p.trellis && (bits == 3 || bits == 2)) {
+    } else if (trellis && (bits == 3 || bits == 2)) {
         uint32_t * dst32 = (uint32_t *) (out + payload);
         uint32_t * tr3_arg = p.tr3_arg + ((size_t) blockIdx.x*(SJKVARN_SEAL_THREADS/32) + (tid >> 5))*SJKVARN_TR3_ARGW;
         if (bits == 3) {
@@ -729,7 +738,7 @@ static __global__ void k_sj_kvarn_seal(const char * __restrict__ ksrc, const cha
             }
         }
     } else {
-        for (int task = tid; task < 2*G; task += SJKVARN_SEAL_THREADS) {
+        for (int task = tid; task < 2*G; task += NT) {
             const int t = task >> 1, half_ = task & 1;
             const int i0 = half_*(D/2);
             uint8_t * dst = out + payload + (size_t) t*row_bytes + (size_t) half_*(row_bytes/2);
@@ -912,9 +921,18 @@ static void sj_kvarn_seal_impl(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     static bool smem_set[GGML_CUDA_MAX_DEVICES] = { false };
     const int id = ggml_cuda_get_device();
     if (!smem_set[id]) {
-        CUDA_CHECK(cudaFuncSetAttribute(k_sj_kvarn_seal, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
+        CUDA_CHECK(cudaFuncSetAttribute(k_sj_kvarn_seal<SJKVARN_SEAL_THREADS>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
+        CUDA_CHECK(cudaFuncSetAttribute(k_sj_kvarn_seal<512>,  cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
+        CUDA_CHECK(cudaFuncSetAttribute(k_sj_kvarn_seal<1024>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
         smem_set[id] = true;
     }
+    // [SEAL08] block width of the scalar (non-trellis) sealer; bytes are identical at every width.
+    // GGML_SJKVARN_SEAL_THREADS=256 restores the v0.7.2.1 launch (kill switch).
+    static const int seal_threads = [] {
+        const char * e = getenv("GGML_SJKVARN_SEAL_THREADS");
+        const int v = e ? atoi(e) : SJKVARN_SEAL_WIDE_DEFAULT;
+        return v == 256 || v == 512 || v == 1024 ? v : SJKVARN_SEAL_WIDE_DEFAULT;
+    }();
     GGML_ASSERT(smem <= smem_max);
 
     const int n_rec = p.hkv * n_groups;
@@ -935,9 +953,16 @@ static void sj_kvarn_seal_impl(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         p.source_rows = int(std::min(k->ne[1], v->ne[1]));
         output = scratch.alloc(size_t(n_rec)*p.rec_bytes);
     }
-    k_sj_kvarn_seal<<<2*n_rec, SJKVARN_SEAL_THREADS, smem, ctx.stream()>>>(
-        (const char *) k->data, (const char *) v->data, output,
-        p.n_groups_max > 0 ? (const int32_t *) desc->data : nullptr, p);
+    const int32_t * seal_desc = p.n_groups_max > 0 ? (const int32_t *) desc->data : nullptr;
+    const int nt = p.trellis ? SJKVARN_SEAL_THREADS : seal_threads;
+    if (nt == 1024) {
+        k_sj_kvarn_seal<1024><<<2*n_rec, 1024, smem, ctx.stream()>>>((const char *) k->data, (const char *) v->data, output, seal_desc, p);
+    } else if (nt == 512) {
+        k_sj_kvarn_seal<512><<<2*n_rec, 512, smem, ctx.stream()>>>((const char *) k->data, (const char *) v->data, output, seal_desc, p);
+    } else {
+        k_sj_kvarn_seal<SJKVARN_SEAL_THREADS><<<2*n_rec, SJKVARN_SEAL_THREADS, smem, ctx.stream()>>>(
+            (const char *) k->data, (const char *) v->data, output, seal_desc, p);
+    }
     CUDA_CHECK(cudaGetLastError());
     if (master) {
         sj_kvarn_lowbits::strip_master_layout ml;

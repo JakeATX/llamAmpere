@@ -22626,6 +22626,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sj_kvarn_seal(256, 128, 1, 1, 8, 8,  4, false));
     test_cases.emplace_back(new test_sj_kvarn_seal(128,  64, 2, 3, 4, 4, 16, true));
     test_cases.emplace_back(new test_sj_kvarn_seal( 64,  32, 2, 2, 3, 2, 16, false));
+    // [SEAL08] production 24dense flush: hkv 4 x 32 groups (256 blocks), tq6_0 staging, strided ring view
+    test_cases.emplace_back(new test_sj_kvarn_seal(256, 128, 4, 32, 4, 4, 16, true, GGML_TYPE_TQ6_0));
+    test_cases.emplace_back(new test_sj_kvarn_seal(256, 128, 4,  3, 4, 4, 16, false, GGML_TYPE_Q8_0));
     // dynamic (descriptor-driven) seal: wrap inside the ring, zero groups, one group, pool larger than the range
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn());                                          // 2 groups, ring wraps
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 5*128, 9, 3)); // nothing to seal
@@ -23957,6 +23960,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     if (getenv("GGML_TEST_INKATTN") != nullptr) {
         add_inkattn_cases(test_cases, true);
+        return test_cases;
+    }
+    // [SEAL08] one layer of the 24dense adaptive-tail flush (32 groups x 4 KV heads, tq6_0 ring): GGML_TEST_SEAL_PERF=1
+    if (getenv("GGML_TEST_SEAL_PERF") != nullptr) {
+        test_cases.emplace_back(new test_sj_kvarn_seal(256, 128, 4, 32, 4, 4, 16, true, GGML_TYPE_TQ6_0));
         return test_cases;
     }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
