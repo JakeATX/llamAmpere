@@ -12576,7 +12576,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_backend_cuda_upload_flush(backend);  // no-op unless GGML_SCHED_UPLOAD_BATCH=1 staged copies are waiting
-    ggml_cuda_lsa_ahead_graph_begin(*cuda_ctx); // GGML_CUDA_LSA_STAGE_AHEAD: no ahead copy is applied across graphs
+    ggml_cuda_lsa_ahead_graph_begin(*cuda_ctx, cgraph); // GGML_CUDA_LSA_STAGE_AHEAD: none applied across graphs; first layer queued here
     if (cuda_ctx->scratch_borrowed && !ggml_cuda_borrowed_plan_fits(*cuda_ctx, cgraph)) {
         GGML_LOG_ERROR("%s: graph does not fit borrowed CUDA scratch\n", __func__);
         return GGML_STATUS_ALLOC_FAILED;
