@@ -1009,7 +1009,20 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     assert(n_tokens%n_seqs == 0);
 
-    auto udata = std::make_shared<llama_ubatch::data_t>();
+    // reuse the buffers of a ubatch that is no longer held: new buffers for every split cost a new allocation and first touch of the rows
+    std::shared_ptr<llama_ubatch::data_t> udata;
+    for (const auto & d : udata_pool) {
+        if (d.use_count() == 1) {
+            udata = d;
+            break;
+        }
+    }
+    if (!udata) {
+        udata = std::make_shared<llama_ubatch::data_t>();
+        if (udata_pool.size() < UDATA_POOL_MAX) {
+            udata_pool.push_back(udata);
+        }
+    }
 
     const bool mixed_batch = !is_embd_vec.empty();
 
@@ -1040,12 +1053,18 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
     udata->seq_id_unq.resize(0);
-    udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
+    udata->seq_idx   .assign(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
     udata->type      .resize(mixed ? n_tokens : 0);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
 
+    // a block with more rows than the pool keeps is freed with its last ubatch
+    if ((udata->embd.capacity() + udata->embd_state.capacity())*sizeof(float) > UDATA_POOL_MAX_BYTES) {
+        udata_pool.erase(std::remove(udata_pool.begin(), udata_pool.end(), udata), udata_pool.end());
+    }
+
     udata->batch_idxs = idxs;
+    udata->seq_id_data.clear();
     udata->seq_id_data.reserve(n_tokens);
 
     seq_set_t seq_set_unq;
@@ -1695,7 +1714,7 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
             ? (batch_inp.logits[i] != 0)
             : (i == batch_inp.n_tokens - 1);
 
-        batch_ext->tokens.push_back(t);
+        batch_ext->tokens.push_back(std::move(t));
     }
 }
 

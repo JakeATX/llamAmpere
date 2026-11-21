@@ -3214,6 +3214,52 @@ static void run_eagle_boundary_restore(llama_model * model) {
     printf("PASS EAGLE: boundary state restores into a fresh driver; invalid snapshots preserve it\n");
 }
 
+static void run_draft_simple_embd(llama_model * model) {
+    // the classic draft model decodes an embedding batch (an image prompt): it must get the rows and every position section
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 256;
+    cp.n_batch = cp.n_ubatch = 64;
+    cp.n_seq_max = 1;
+    cp.n_threads = cp.n_threads_batch = 2;
+    llama_context_ptr tgt(llama_init_from_model(model, cp));
+    llama_context_ptr dft(llama_init_from_model(model, cp));
+    llama_context_ptr ref(llama_init_from_model(model, cp));
+    require(tgt && dft && ref, "create the draft-model contexts");
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
+    params.draft.ctx_tgt = tgt.get();
+    params.draft.ctx_dft = dft.get();
+    common_speculative * spec = common_speculative_init(params, 1);
+    require(spec != nullptr, "create the draft-model driver");
+
+    const int32_t n_rows = 8;
+    std::vector<float> rows((size_t) n_rows * n_embd);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        rows[i] = (float) ((i * 37) % 101) / 101.0f - 0.5f;
+    }
+    // a batch checks its positions against the memory of the context it was made for
+    auto make_batch = [&](llama_context * ctx) {
+        common_batch batch(ctx);
+        for (int32_t i = 0; i < n_rows; ++i) {
+            const llama_pos pos[GGML_MROPE_SECTIONS] = { i, i, i, 0 };
+            batch.add_embd({ rows.data() + (size_t) i * n_embd, 1, n_embd }, pos, 0, i + 1 == n_rows);
+        }
+        return batch;
+    };
+    const bool processed = common_speculative_process(spec, make_batch(dft.get()));
+    common_speculative_free(spec);
+    require(processed, "the draft model decodes an embedding batch");
+    require(llama_process(ref.get(), LLAMA_PROCESS_TYPE_DECODE, make_batch(ref.get()).get()) == 0, "decode the embedding batch directly");
+    const float * got  = llama_get_logits_ith(dft.get(), -1);
+    const float * want = llama_get_logits_ith(ref.get(), -1);
+    std::vector<uint8_t> state_dft(llama_state_seq_get_size(dft.get(), 0)), state_ref(llama_state_seq_get_size(ref.get(), 0));
+    llama_state_seq_get_data(dft.get(), state_dft.data(), state_dft.size(), 0);
+    llama_state_seq_get_data(ref.get(), state_ref.data(), state_ref.size(), 0);
+    require(got && want && std::memcmp(got, want, n_vocab * sizeof(float)) == 0 && state_dft == state_ref,
+            "the draft model gives the logits and state of a direct decode of the embedding batch");
+    printf("PASS draft model: an embedding batch reaches the draft context with its rows and positions\n");
+}
+
 static void model_ampere_reserve(ggml_cgraph * graph, const char * phase) {
     // Replay CPU placement with the Ampere attention allocation size; this does not measure a CUDA scheduler.
     struct model_state { bool supported = true; } state;
@@ -3951,6 +3997,12 @@ int main(int argc, char ** argv) {
             run_eagle_boundary_restore(model);
         } catch (const std::exception & error) {
             fprintf(stderr, "FAIL EAGLE boundary restore: %s\n", error.what());
+            ++failed;
+        }
+        try {
+            run_draft_simple_embd(model);
+        } catch (const std::exception & error) {
+            fprintf(stderr, "FAIL draft model embedding batch: %s\n", error.what());
             ++failed;
         }
     } catch (const std::exception & error) {
