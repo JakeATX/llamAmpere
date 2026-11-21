@@ -468,7 +468,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // tensor split: the GDN replay storage (cache_s2_l state/checkpoint pair, cache_ingr_l ingredient ring) has no split
     // rules yet, so it is placed mirrored and the replay graph cannot be split (gated_delta_net state assert with -np > 1).
     // Fall back to the widened snapshot state (cache_s_l, split by heads). LLAMA_SM_TENSOR_GDN_REPLAY=1 keeps replay on.
-    if (cparams.gdn_replay && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (cparams.gdn_replay && cparams.n_rs_seq > 0 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         const char * e = getenv("LLAMA_SM_TENSOR_GDN_REPLAY");
         if (!(e && e[0] == '1')) {
             LLAMA_LOG_WARN("%s: gdn_replay is not supported with tensor split yet, using snapshot rollback\n", __func__);

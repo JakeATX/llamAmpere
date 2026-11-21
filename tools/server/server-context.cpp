@@ -2268,7 +2268,12 @@ private:
         }
         add("swa_full", std::to_string(params_base.swa_full));
         add("n_rs_seq", std::to_string(params_base.speculative.need_n_rs_seq()));
-        add("gdn_replay", std::to_string(params_base.gdn_replay));
+        {
+            // the replay setting in effect: tensor split runs snapshot rollback (llama_context), a different state layout
+            const char * env_sm = getenv("LLAMA_SM_TENSOR_GDN_REPLAY");
+            const bool sm_veto = params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR && !(env_sm && env_sm[0] == '1');
+            add("gdn_replay", std::to_string(params_base.gdn_replay && !sm_veto));
+        }
         add("rope", string_format("%g,%g,%g,%g,%g,%g,%d,%d", params_base.rope_freq_base, params_base.rope_freq_scale,
                 params_base.yarn_ext_factor, params_base.yarn_attn_factor, params_base.yarn_beta_fast, params_base.yarn_beta_slow,
                 params_base.yarn_orig_ctx, (int) params_base.rope_scaling_type));
