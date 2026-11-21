@@ -894,6 +894,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                         cert.margin = std::max(0.0f, env_float("LLAMA_D1_CERT_MARGIN", 0.1f));
                     }
                     d1 = std::make_unique<llama_d1_ctx>(d1_head, n_top, eager, n_thr, cert);
+                    d1->audit_every = (int) std::max(0L, env_int("LLAMA_D1_AUDIT", 0));
+                    if (d1->audit_every > 0) {
+                        LLAMA_LOG_WARN("d1: LLAMA_D1_AUDIT=%d: every %d-th rescored row is checked against the full exact head "
+                                "(slow, exactness gate only)\n", d1->audit_every, d1->audit_every);
+                    }
                     LLAMA_LOG_INFO("d1: %s head + exact rescore of top N=%d from %s (rows %s, eager_max %d, threads %d)\n",
                             ggml_type_name(model.output->type), n_top, d1_head->path.c_str(),
                             ggml_type_name(d1_head->type), eager, n_thr);
@@ -1952,6 +1957,9 @@ llama_context::~llama_context() {
     }
     if (d1) {
         LLAMA_LOG_INFO("%s\n", d1->summary().c_str()); // [D1] exit counters (gate 8.0(d))
+        if (d1->audit_every > 0) {
+            LLAMA_LOG_INFO("%s\n", d1->audit_summary().c_str());
+        }
     }
     if (pp_warm_thread.joinable()) {
         pp_warm_thread.join();

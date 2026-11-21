@@ -441,6 +441,27 @@ static void test_cert(const std::string & dir) {
         }
     }
     CHECK(miss_cert == 0, "certified top %d == exact top %d on every row (%d misses)", K, K, miss_cert);
+    // audit (LLAMA_D1_AUDIT): with a hard certificate at k = 20 the served top 20 and the sampled distribution are
+    // the full exact head's, bit for bit; plain N = 20 without the certificate is not
+    for (const bool on : { false, true }) {
+        llama_d1_cert c0 = cert; c0.on = on; c0.k = 20;
+        llama_d1_ctx c(head, 20, 64, 2, c0);
+        c.audit_every = 1;
+        c.reset(R);
+        std::memcpy(c.h_row(0), H.data(), sizeof(float) * R * E);
+        c.mark_copied(0, R, true);
+        std::vector<float> L = L0;
+        c.on_read_all(L.data(), V, R);
+        std::printf("%s %s\n", on ? "cert" : "plain", c.audit_summary().c_str());
+        CHECK(c.audit.rows == (uint64_t) R, "audit saw every row");
+        if (on) {
+            CHECK(c.audit.top_same == (uint64_t) R && c.audit.dist_same == (uint64_t) R && c.audit.dlogit_max == 0.0,
+                  "certified rows match the full exact head");
+        } else {
+            CHECK(c.audit.top_same < (uint64_t) R, "uncertified N = 20 misses some rows (negative control)");
+        }
+        CHECK(c.audit.coarse_top_same < (uint64_t) R, "coarse rows differ from exact (negative control)");
+    }
     std::printf("cert test: top-%d misses plain N=%d: %d/%d, certified: %d/%d\n", K, NTOP, miss_plain, R, miss_cert, R);
     std::remove(sc.path.c_str());
 }

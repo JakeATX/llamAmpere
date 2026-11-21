@@ -159,7 +159,20 @@ struct llama_d1_ctx {
     std::atomic<uint64_t> n_cert_sigma{0};   // non-candidate rows whose s_i was computed
     std::atomic<uint64_t> n_cert_forced{0};  // non-candidate rows rescored by the certificate
     std::atomic<uint64_t> n_cert_maxrow{0};  // most rows forced in one row
-    uint64_t              last[14] = {};  // values at the previous summary_delta
+    uint64_t              last[14] = {};
+
+    // [EXACTHEAD] LLAMA_D1_AUDIT=n (default 0 = off; slow, for the exactness gate only): every n-th rescored row is
+    // also scored against all n_vocab exact rows. Compared on the preset sampler (top-k 20, temp 1, top-p 0.95):
+    // the served row vs the full exact row, and the coarse row as it was before the rescore vs the full exact row.
+    int audit_every = 0;
+    std::atomic<uint64_t> audit_tick{0};
+    std::mutex audit_mtx;
+    struct audit_t {
+        uint64_t rows = 0, top_same = 0, dist_same = 0, coarse_top_same = 0;
+        double   tv_sum = 0, tv_max = 0, coarse_tv_sum = 0, coarse_tv_max = 0, dlogit_max = 0;
+    } audit;
+    void audit_row(const float * served, const float * coarse, const float * hr, int64_t n_vocab);
+    std::string audit_summary();  // values at the previous summary_delta
     std::string summary_delta();         // counters since the previous call (not thread safe: one reader)
 
     // a new set of output rows (output_reserve): all rows NONE, seen cleared

@@ -533,6 +533,9 @@ std::string llama_d1_ctx::summary_delta() {
         out += format(" cert_rows=%" PRIu64 " cert_sigma=%" PRIu64 " cert_forced=%" PRIu64 " cert_maxrow=%" PRIu64,
                       d[11], d[12], d[13], n_cert_maxrow.load());
     }
+    if (audit_every > 0) {
+        out += " | " + audit_summary();
+    }
     return out;
 }
 
@@ -583,6 +586,11 @@ void llama_d1_ctx::swap_rows(int64_t i0, int64_t i1) {
 
 void llama_d1_ctx::rescore_one(float * logits, int64_t n_vocab, int64_t r, std::vector<int32_t> & ids) {
     float * row = logits + r * n_vocab;
+    thread_local std::vector<float> coarse;
+    const bool do_audit = audit_every > 0 && audit_tick.fetch_add(1) % (uint64_t) audit_every == 0;
+    if (do_audit) {
+        coarse.assign(row, row + n_vocab);
+    }
     const auto t0 = std::chrono::steady_clock::now();
     llama_d1_select_top(row, n_vocab, n_top, ids);
     const auto t1 = std::chrono::steady_clock::now();
@@ -595,6 +603,78 @@ void llama_d1_ctx::rescore_one(float * logits, int64_t n_vocab, int64_t r, std::
     }
     ns_select += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     ns_dot    += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count();
+    if (do_audit) {
+        audit_row(row, coarse.data(), hr, n_vocab);
+    }
+}
+
+// the preset sampler's distribution: top-k 20 (ties to the lower id), softmax at temp 1, top-p 0.95 (keep until the
+// cumulative probability reaches p), renormalized. Returns (id, p) sorted by id.
+static std::vector<std::pair<int32_t, double>> d1_audit_dist(const float * row, int64_t n_vocab) {
+    std::vector<int32_t> ids;
+    llama_d1_select_top(row, n_vocab, 20, ids);
+    std::sort(ids.begin(), ids.end(), [&](int32_t a, int32_t b) { return row[a] > row[b] || (row[a] == row[b] && a < b); });
+    std::vector<double> p(ids.size());
+    double z = 0;
+    for (size_t i = 0; i < ids.size(); ++i) { p[i] = std::exp((double) row[ids[i]] - row[ids[0]]); z += p[i]; }
+    double cum = 0;
+    size_t keep = ids.size();
+    for (size_t i = 0; i < ids.size(); ++i) {
+        cum += p[i] / z;
+        if (cum >= 0.95) { keep = i + 1; break; }
+    }
+    double zk = 0;
+    for (size_t i = 0; i < keep; ++i) { zk += p[i]; }
+    std::vector<std::pair<int32_t, double>> out;
+    for (size_t i = 0; i < keep; ++i) { out.emplace_back(ids[i], p[i] / zk); }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+static double d1_tv(const std::vector<std::pair<int32_t, double>> & a, const std::vector<std::pair<int32_t, double>> & b) {
+    double tv = 0;
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+        if (j == b.size() || (i < a.size() && a[i].first < b[j].first)) { tv += a[i++].second; }
+        else if (i == a.size() || b[j].first < a[i].first) { tv += b[j++].second; }
+        else { tv += std::fabs(a[i++].second - b[j++].second); }
+    }
+    return 0.5 * tv;
+}
+
+void llama_d1_ctx::audit_row(const float * served, const float * coarse, const float * hr, int64_t n_vocab) {
+    std::vector<float> x(n_vocab);
+    for (int64_t i = 0; i < n_vocab; ++i) { x[i] = head->dot(hr, i); }
+    std::vector<int32_t> ts, tx, tc;
+    llama_d1_select_top(served, n_vocab, 20, ts);
+    llama_d1_select_top(x.data(), n_vocab, 20, tx);
+    llama_d1_select_top(coarse, n_vocab, 20, tc);
+    std::sort(ts.begin(), ts.end()); std::sort(tx.begin(), tx.end()); std::sort(tc.begin(), tc.end());
+    double dl = 0;
+    for (const int32_t id : tx) { dl = std::max(dl, (double) std::fabs(served[id] - x[id])); }
+    const auto dx = d1_audit_dist(x.data(), n_vocab);
+    const auto ds = d1_audit_dist(served, n_vocab);
+    const auto dc = d1_audit_dist(coarse, n_vocab);
+    const double tv = d1_tv(ds, dx), tvc = d1_tv(dc, dx);
+    std::lock_guard<std::mutex> lk(audit_mtx);
+    audit.rows++;
+    audit.top_same        += ts == tx;
+    audit.coarse_top_same += tc == tx;
+    audit.dist_same       += tv == 0.0;
+    audit.tv_sum += tv;         audit.tv_max        = std::max(audit.tv_max, tv);
+    audit.coarse_tv_sum += tvc; audit.coarse_tv_max = std::max(audit.coarse_tv_max, tvc);
+    audit.dlogit_max = std::max(audit.dlogit_max, dl);
+    LLAMA_LOG_INFO("d1 audit row %" PRIu64 ": top20_same=%d dlogit_max=%.3g tv=%.3g coarse_top20_same=%d coarse_tv=%.4g\n",
+                   audit.rows, (int) (ts == tx), dl, tv, (int) (tc == tx), tvc);
+}
+
+std::string llama_d1_ctx::audit_summary() {
+    std::lock_guard<std::mutex> lk(audit_mtx);
+    const double n = audit.rows ? (double) audit.rows : 1.0;
+    return format("d1 audit: rows=%" PRIu64 " top20_same=%" PRIu64 " dist_same=%" PRIu64 " tv_mean=%.3g tv_max=%.3g "
+                  "dlogit_max=%.3g | coarse: top20_same=%" PRIu64 " tv_mean=%.4g tv_max=%.4g",
+                  audit.rows, audit.top_same, audit.dist_same, audit.tv_sum / n, audit.tv_max, audit.dlogit_max,
+                  audit.coarse_top_same, audit.coarse_tv_sum / n, audit.coarse_tv_max);
 }
 
 // [EXACTHEAD] ids are exact in row; rescore every other row whose bound reaches the k-th exact logit (see llama_d1_cert)
