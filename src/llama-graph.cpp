@@ -9264,8 +9264,8 @@ static const char * draft_vocab_direct(const ggml_tensor * head) {
             return nullptr;
         case GGML_TYPE_AIF25_U: case GGML_TYPE_AIF25_U2: case GGML_TYPE_AIF175_U2: case GGML_TYPE_AIF25_U2_512:
             {
-                // [KAIFUSE R2] the CUDA row-group kernel (ggml_cuda_mul_mat_id_aif_rows); LLAMA_RM24H_AIHEAD=0 turns
-                // it off. No other backend runs this op, so ask the head's device about the exact node shape first.
+                // [KAIFUSE R2] the CUDA row-group kernel (ggml_cuda_mul_mat_id_aif_rows), opt-in (LLAMA_RM24H_AIHEAD=1;
+                // default off). No other backend runs this op, so ask the head's device about the exact node shape.
                 if (llama_draft_vocab_aihead_mode() != 1) {
                     return "head type has no one-row MMVQ path";
                 }

@@ -41,13 +41,14 @@ inline bool llama_draft_vocab_aif_head(ggml_type t) {
     return t == GGML_TYPE_AIF25_U || t == GGML_TYPE_AIF25_U2 || t == GGML_TYPE_AIF175_U2 || t == GGML_TYPE_AIF25_U2_512;
 }
 
-// [KAIFUSE R2] LLAMA_RM24H_AIHEAD: 1 (default) = a fractional AI+ head takes the shortlist as one-row experts (the CUDA
+// [KAIFUSE R2] LLAMA_RM24H_AIHEAD: 1 = a fractional AI+ head takes the shortlist as one-row experts (the CUDA
 // row-group kernel, ggml_cuda_mul_mat_id_aif_rows); 2 = reference: score the full head, then gather (bit-identical
-// shortlist logits, for the equivalence test); 0 = kill switch, the head is not eligible as before (head_layout).
+// shortlist logits, for the equivalence test); 0 (default) = the head is not eligible, as before (head_layout), so the
+// draft scores the full head. Opt-in until its speed gate is settled (the first 8dense gate is under audit).
 inline int llama_draft_vocab_aihead_mode() {
     static const int v = [] {
         const char * env = std::getenv("LLAMA_RM24H_AIHEAD");
-        return env ? std::atoi(env) : 1;
+        return env ? std::atoi(env) : 0;
     }();
     return v;
 }
