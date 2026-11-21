@@ -444,7 +444,7 @@ llama_d1_scope_result llama_d1_scope(const llama_d1_scope_in & in, llama_d1_mode
 // ---- top-N select ------------------------------------------------------------------------------------------------
 
 namespace {
-struct d1_cand { float v; int32_t id; };
+using d1_cand = llama_d1_cand;
 // heap order: "a before b" when a is better, so the heap front is the worst kept candidate
 struct d1_better {
     bool operator()(const d1_cand & a, const d1_cand & b) const { return a.v > b.v || (a.v == b.v && a.id < b.id); }
@@ -498,6 +498,63 @@ void llama_d1_select_top(const float * row, int64_t n_vocab, int n, std::vector<
     for (int k = 0; k < n; ++k) { ids[k] = heap[k].id; }
 }
 
+float llama_d1_scan_chunk(const float * row, int64_t i0, int64_t i1, int n, float D, bool collect,
+                          std::vector<llama_d1_cand> & heap, std::vector<int32_t> & buf) {
+    heap.clear();
+    buf.clear();
+    const int64_t m = std::min<int64_t>(n, i1 - i0);
+    for (int64_t i = i0; i < i0 + m; ++i) {
+        heap.push_back({ row[i], (int32_t) i });
+        if (collect) { buf.push_back((int32_t) i); }
+    }
+    if (i1 - i0 <= n) {
+        return -INFINITY;
+    }
+    std::make_heap(heap.begin(), heap.end(), d1_better());
+    float thr = heap.front().v;
+    float lo  = collect ? thr - D : thr;
+    const size_t cap = 4096;
+    const auto visit = [&](int64_t i) {
+        const float x = row[i];
+        if (collect && x >= lo) { buf.push_back((int32_t) i); }
+        if (x > thr) {
+            std::pop_heap(heap.begin(), heap.end(), d1_better());
+            heap.back() = { x, (int32_t) i };
+            std::push_heap(heap.begin(), heap.end(), d1_better());
+            thr = heap.front().v;
+            if (collect) {
+                lo = thr - D;
+                // ids below the risen floor can never be needed (the floor only rises); keeps buf small
+                if (buf.size() > cap) {
+                    size_t w = 0;
+                    for (const int32_t id : buf) { if (row[id] >= lo) { buf[w++] = id; } }
+                    buf.resize(w);
+                }
+            }
+        }
+    };
+    // collect: x >= lo (lo <= thr) is the superset test; else x > thr
+    int64_t i = i0 + m;
+#ifdef LLAMA_D1_AVX2
+    for (; i < i1 && (i & 7); ++i) { visit(i); }
+    __m256 tv = _mm256_set1_ps(collect ? lo : thr);
+    for (; i + 8 <= i1; i += 8) {
+        const __m256 x = _mm256_loadu_ps(row + i);
+        int mk = _mm256_movemask_ps(collect ? _mm256_cmp_ps(x, tv, _CMP_GE_OQ) : _mm256_cmp_ps(x, tv, _CMP_GT_OQ));
+        if (mk) {
+            while (mk) {
+                const int b = __builtin_ctz(mk);
+                mk &= mk - 1;
+                visit(i + b);
+            }
+            tv = _mm256_set1_ps(collect ? lo : thr);
+        }
+    }
+#endif
+    for (; i < i1; ++i) { visit(i); }
+    return collect ? lo : thr;
+}
+
 // ---- per-context state --------------------------------------------------------------------------------------------
 
 llama_d1_ctx::llama_d1_ctx(std::shared_ptr<llama_d1_head> head_, int n_top_, int eager_max_, int n_threads,
@@ -510,6 +567,7 @@ llama_d1_ctx::llama_d1_ctx(std::shared_ptr<llama_d1_head> head_, int n_top_, int
 }
 
 llama_d1_ctx::~llama_d1_ctx() {
+    drain();
     {
         std::lock_guard<std::mutex> lk(pool.mtx);
         pool.quit = true;
@@ -548,10 +606,14 @@ std::string llama_d1_ctx::summary() const {
         out += format(" cert_rows=%" PRIu64 " cert_sigma=%" PRIu64 " cert_forced=%" PRIu64 " cert_maxrow=%" PRIu64,
                       n_cert_rows.load(), n_cert_sigma.load(), n_cert_forced.load(), n_cert_maxrow.load());
     }
+    if (fused) {
+        out += format(" fused_fallback=%" PRIu64, n_fused_fallback.load());
+    }
     return out;
 }
 
 void llama_d1_ctx::reset(int64_t n_rows_max) {
+    drain();
     const size_t need = (size_t) n_rows_max * head->n_embd;
     if (h.size() < need) {
         h.resize(need);
@@ -562,6 +624,7 @@ void llama_d1_ctx::reset(int64_t n_rows_max) {
 }
 
 void llama_d1_ctx::mark_copied(int64_t r0, int64_t n, bool has_h) {
+    drain();
     GGML_ASSERT(r0 >= 0 && r0 + n <= n_rows);
     const uint8_t s = (has_h && n_top > 0) ? ROW_PENDING : ROW_COARSE;
     if (!has_h) {
@@ -572,6 +635,7 @@ void llama_d1_ctx::mark_copied(int64_t r0, int64_t n, bool has_h) {
 }
 
 void llama_d1_ctx::swap_rows(int64_t i0, int64_t i1) {
+    drain();
     if (i0 >= n_rows || i1 >= n_rows) {
         return;
     }
@@ -704,7 +768,20 @@ std::string llama_d1_ctx::audit_summary() {
 }
 
 // [EXACTHEAD] ids are exact in row; rescore every other row whose bound reaches the k-th exact logit (see llama_d1_cert)
-void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids) {
+float llama_d1_ctx::cert_slack(const float * hr) const {
+    const int64_t G = head->n_group;
+    double hn2 = 0.0;
+    for (int64_t gg = 0; gg < G; ++gg) {
+        float s2 = 0.0f;
+        for (int q = 0; q < 32; ++q) { s2 += hr[gg * 32 + q] * hr[gg * 32 + q]; }
+        hn2 += s2 / 32.0f;
+    }
+    // 1e-4 relative below the bound: the prefilter only admits more rows, check() decides as before
+    return (cert.margin + cert.sigma * head->gl2_max * (float) std::sqrt(hn2)) * 1.0001f;
+}
+
+void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids,
+                           const std::vector<int32_t> * cands, float floor) {
     const int64_t G = head->n_group;
     thread_local std::vector<float>   top;
     thread_local std::vector<float>   hg;    // ||h_g||^2 / 32
@@ -725,7 +802,7 @@ void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const
     }
     const float hn = (float) std::sqrt(hn2);  // s_i <= gl2_rowmax[i] * hn
     // a row below pre cannot pass even with the largest group error of the whole head
-    const float pre = T - cert.margin - cert.sigma * head->gl2_max * hn;
+    const float pre = T - cert_slack(hr);
 
     if (cand.size() < (size_t) n_vocab) { cand.assign(n_vocab, 0); }
     for (const int32_t id : ids) { cand[id] = 1; }
@@ -745,6 +822,15 @@ void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const
         }
     };
     int64_t i = 0;
+    if (cands && pre >= floor) {
+        // fused pick: every id with row[i] >= floor (so >= pre) was kept by the chunk scans
+        for (const int32_t id : *cands) {
+            if (row[id] >= pre) { check(id); }
+        }
+        i = n_vocab;
+    } else if (cands) {
+        ++n_fused_fallback;
+    }
 #ifdef LLAMA_D1_AVX2
     const __m256 pv = _mm256_set1_ps(pre);
     for (; i + 8 <= n_vocab; i += 8) {
@@ -769,8 +855,122 @@ void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const
     while (n_forced > prev && !n_cert_maxrow.compare_exchange_weak(prev, n_forced)) {}
 }
 
+void llama_d1_ctx::fused_scan(int64_t k) {
+    const int64_t ri = k / n_chunk, c = k % n_chunk;
+    const int64_t nv = pool.n_vocab;
+    const int64_t step = ((nv + n_chunk - 1) / n_chunk + 7) & ~(int64_t) 7;
+    const int64_t i0 = std::min(nv, c * step), i1 = std::min(nv, i0 + step);
+    const float * row = pool.logits + (*pool.rows)[ri] * nv;
+    const auto t0 = std::chrono::steady_clock::now();
+    fchunk_t & fc = fch[k];
+    fc.floor = llama_d1_scan_chunk(row, i0, i1, n_top, frow[ri].D, cert.on, fc.heap, fc.buf);
+    ns_select += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    // the last chunk of the row merges (acq_rel: sees the other chunks' heaps and bufs)
+    if (frow[ri].left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        fused_merge(ri);
+    }
+}
+
+void llama_d1_ctx::fused_merge(int64_t ri) {
+    const auto t0 = std::chrono::steady_clock::now();
+    frow_t & fr = frow[ri];
+    thread_local std::vector<d1_cand> all;
+    all.clear();
+    fr.cands.clear();
+    fr.floor = -INFINITY;
+    for (int c = 0; c < n_chunk; ++c) {
+        const fchunk_t & fc = fch[ri * n_chunk + c];
+        all.insert(all.end(), fc.heap.begin(), fc.heap.end());
+        fr.cands.insert(fr.cands.end(), fc.buf.begin(), fc.buf.end());
+        fr.floor = std::max(fr.floor, fc.floor);
+    }
+    // the same set as llama_d1_select_top: the global order (value desc, then id asc), first n_top
+    if ((int64_t) all.size() > n_top) {
+        std::nth_element(all.begin(), all.begin() + (n_top - 1), all.end(), d1_better());
+        all.resize(n_top);
+    }
+    fr.ids.resize(all.size());
+    for (size_t j = 0; j < all.size(); ++j) { fr.ids[j] = all[j].id; }
+    fr.audit = audit_every > 0 && audit_tick.fetch_add(1) % (uint64_t) audit_every == 0;
+    if (fr.audit) {
+        const float * row = pool.logits + (*pool.rows)[ri] * pool.n_vocab;
+        fr.coarse.assign(row, row + pool.n_vocab);
+    }
+    ns_select += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    fr.ready.store(1, std::memory_order_release);
+}
+
+void llama_d1_ctx::fused_dots(int64_t k) {
+    const int64_t ri = k / n_chunk, c = k % n_chunk;
+    frow_t & fr = frow[ri];
+    // the row's chunks were all taken before any dot part (phase order), so this wait is short
+    while (!fr.ready.load(std::memory_order_acquire)) {
+#ifdef LLAMA_D1_AVX2
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    float * row = pool.logits + (*pool.rows)[ri] * pool.n_vocab;
+    const float * hr = h_row((*pool.rows)[ri]);
+    for (size_t j = c; j < fr.ids.size(); j += n_chunk) {
+        row[fr.ids[j]] = head->dot(hr, fr.ids[j]);
+    }
+    ns_dot += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (fr.dleft.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        fused_cert(ri);
+    }
+}
+
+void llama_d1_ctx::fused_cert(int64_t ri) {
+    const auto t0 = std::chrono::steady_clock::now();
+    frow_t & fr = frow[ri];
+    float * row = pool.logits + (*pool.rows)[ri] * pool.n_vocab;
+    const float * hr = h_row((*pool.rows)[ri]);
+    if (cert.on && !fr.ids.empty()) {
+        certify(row, pool.n_vocab, hr, fr.ids, &fr.cands, fr.floor);
+    }
+    ns_dot += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (fr.audit) {
+        audit_row(row, fr.coarse.data(), hr, pool.n_vocab);
+    }
+    fr.done.store(1, std::memory_order_release);
+}
+
+void llama_d1_ctx::fused_run(int64_t k) {
+    const int64_t ri = k / (2 * n_chunk), p = k % (2 * n_chunk);
+    if (p < n_chunk) {
+        fused_scan(ri * n_chunk + p);
+    } else {
+        fused_dots(ri * n_chunk + p - n_chunk);
+    }
+}
+
+void llama_d1_ctx::drain() {
+    if (!async_pending) {
+        return;
+    }
+    const auto tw = std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> lk(pool.mtx);
+        pool.cv_done.wait(lk, [&] { return pool.n_busy == 0; });
+        pool.rows = nullptr;
+    }
+    async_pending = false;
+    ns_wait += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count();
+}
+
 void llama_d1_ctx::run_job() {
     thread_local std::vector<int32_t> ids;
+    if (fused) {
+        // jobs in row order, each row's scans before its dot parts: a dot part only waits on scans already taken
+        const int64_t n_jobs = (int64_t) pool.rows->size() * 2 * n_chunk;
+        for (int64_t k; (k = pool.next.fetch_add(1)) < n_jobs; ) {
+            fused_run(k);
+        }
+        return;
+    }
     for (;;) {
         const int64_t k = pool.next.fetch_add(1);
         if (k >= (int64_t) pool.rows->size()) {
@@ -801,7 +1001,8 @@ void llama_d1_ctx::worker(int /*idx*/) {
     }
 }
 
-void llama_d1_ctx::rescore_rows(float * logits, int64_t n_vocab, const std::vector<int64_t> & rows) {
+void llama_d1_ctx::rescore_rows(float * logits, int64_t n_vocab, const std::vector<int64_t> & rows, int64_t need) {
+    drain();
     if (rows.empty()) {
         return;
     }
@@ -810,29 +1011,68 @@ void llama_d1_ctx::rescore_rows(float * logits, int64_t n_vocab, const std::vect
     struct rusage ru0 = {};
     getrusage(RUSAGE_SELF, &ru0);
 #endif
-    if (rows.size() == 1 || pool.threads.empty()) {
-        thread_local std::vector<int32_t> ids;
-        for (const int64_t r : rows) {
-            rescore_one(logits, n_vocab, r, ids);
+    arows = rows; // the pool may outlive the caller's list (async rows)
+    if (fused) {
+        // chunks per row: fill the pool, at least fused_min_chunk ids per chunk
+        const int64_t nr = (int64_t) rows.size();
+        n_chunk = (int) std::max<int64_t>(1, std::min<int64_t>((n_threads_total() + nr - 1) / nr, n_vocab / std::max<int64_t>(1, fused_min_chunk)));
+        if (fch.size() < (size_t) (nr * n_chunk)) { fch.resize(nr * n_chunk); }
+        if (frow_n < (size_t) nr) { frow.reset(new frow_t[nr]); frow_n = nr; }
+        for (int64_t ri = 0; ri < nr; ++ri) {
+            frow_t & fr = frow[ri];
+            fr.D = cert.on ? cert_slack(h_row(rows[ri])) : 0.0f;
+            fr.left.store(n_chunk);
+            fr.dleft.store(n_chunk);
+            fr.ready.store(0);
+            fr.done.store(0);
         }
+    }
+    if (pool.threads.empty() || (rows.size() == 1 && (!fused || n_chunk == 1))) {
+        pool.logits  = logits;
+        pool.n_vocab = n_vocab;
+        pool.rows    = &arows;
+        pool.next    = 0;
+        run_job();
+        pool.rows = nullptr;
     } else {
         {
             std::lock_guard<std::mutex> lk(pool.mtx);
             pool.logits  = logits;
             pool.n_vocab = n_vocab;
-            pool.rows    = &rows;
+            pool.rows    = &arows;
             pool.next    = 0;
             pool.n_busy  = (int) pool.threads.size();
             ++pool.gen;
         }
         pool.cv_work.notify_all();
-        run_job();
-        // block until every worker is done: the sampler must never see a half-written row
-        const auto tw = std::chrono::steady_clock::now();
-        std::unique_lock<std::mutex> lk(pool.mtx);
-        pool.cv_done.wait(lk, [&] { return pool.n_busy == 0; });
-        pool.rows = nullptr;
-        ns_wait += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count();
+        int64_t need_ri = -1;
+        for (size_t ri = 0; fused && need >= 0 && ri < rows.size(); ++ri) {
+            if (rows[ri] == need) { need_ri = (int64_t) ri; }
+        }
+        if (need_ri >= 0) {
+            // [EXACTHEAD] async rows: return once the row being read is exact; the pool finishes the later rows
+            // while the caller samples this one. Every other entry (and llama_context::synchronize) drains first.
+            async_pending = true;
+            const int64_t end = (need_ri + 1) * 2 * n_chunk;
+            for (int64_t k; pool.next.load() < end && (k = pool.next.fetch_add(1)) < (int64_t) rows.size() * 2 * n_chunk; ) {
+                fused_run(k);
+            }
+            while (!frow[need_ri].done.load(std::memory_order_acquire)) {
+#ifdef LLAMA_D1_AVX2
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+            }
+        } else {
+            run_job();
+            // block until every worker is done: the sampler must never see a half-written row
+            const auto tw = std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lk(pool.mtx);
+            pool.cv_done.wait(lk, [&] { return pool.n_busy == 0; });
+            pool.rows = nullptr;
+            ns_wait += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count();
+        }
     }
 #ifndef _WIN32
     struct rusage ru1 = {};
@@ -851,6 +1091,16 @@ void llama_d1_ctx::rescore_rows(float * logits, int64_t n_vocab, const std::vect
 }
 
 void llama_d1_ctx::on_read_row(float * logits, int64_t n_vocab, int64_t j, int64_t n_out) {
+    if (async_pending) {
+        // a row the pool already finished can be read; anything else waits for the pool
+        bool ok = false;
+        for (size_t ri = 0; ri < arows.size(); ++ri) {
+            if (arows[ri] == j) { ok = frow[ri].done.load(std::memory_order_acquire) != 0; }
+        }
+        if (!ok) {
+            drain();
+        }
+    }
     if (j < 0 || j >= n_rows) {
         return;
     }
@@ -866,7 +1116,7 @@ void llama_d1_ctx::on_read_row(float * logits, int64_t n_vocab, int64_t j, int64
         } else {
             rows.push_back(j);
         }
-        rescore_rows(logits, n_vocab, rows);
+        rescore_rows(logits, n_vocab, rows, j);
     }
     if (state[j] != ROW_NONE && !seen[j]) {
         seen[j] = 1;
@@ -878,6 +1128,7 @@ void llama_d1_ctx::on_read_row(float * logits, int64_t n_vocab, int64_t j, int64
 }
 
 void llama_d1_ctx::on_read_all(float * logits, int64_t n_vocab, int64_t n_out) {
+    drain();
     const int64_t n = std::min(n_out, n_rows);
     std::vector<int64_t> rows;
     for (int64_t r = 0; r < n; ++r) {

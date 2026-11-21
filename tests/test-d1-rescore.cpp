@@ -272,6 +272,10 @@ static void test_ctx(const std::string & dir) {
         }
         cs.on_read_row(Ls.data(), V, 2, R);
         ct.on_read_row(Lt.data(), V, 2, R);
+        // async rows: the row being read is exact on return; the rest after drain (llama_get_logits* synchronize)
+        expect_row(Lt, &L0[2 * V], &H0[2 * E], 2, true, "async read row");
+        CHECK(ct.async_pending, "threaded fused read returns before the pool is done");
+        ct.drain();
         CHECK(cs.n_rescored == R && ct.n_rescored == R, "eager rescored all %d rows on the first read", R);
         CHECK(cs.n_read_distinct == 1, "eager: distinct counts reads, not rescored rows");
         for (int r = 0; r < R; ++r) { expect_row(Lt, &L0[r * V], &H0[r * E], r, true, "threaded"); }
@@ -476,13 +480,93 @@ static void test_cert(const std::string & dir) {
         CHECK(c.audit.z_max > 20.0 && c.audit.z_gt6 > c.audit.z_n / 2, "misaligned h: z check fires (z_max %.3g, %llu/%llu > 6)",
               c.audit.z_max, (unsigned long long) c.audit.z_gt6, (unsigned long long) c.audit.z_n);
     }
+    // [EXACTHEAD] fused pick == separate select + full certificate scan, bit for bit (cert on and off, 1 and 4 threads,
+    // many chunks per row), including rows where the certificate falls back to the full scan (coarse shifted by +10
+    // puts T below every chunk's floor)
+    for (const float shift : { 0.0f, 10.0f }) {
+        std::vector<float> Ls = L0;
+        for (auto & x : Ls) { x += shift; }
+        for (const bool on : { false, true }) {
+            for (const int thr : { 1, 4 }) {
+              for (const int eager : { 64, 0 }) { // 0: lazy, one row per call, so 4 threads split each row in 4 chunks
+                llama_d1_cert c0 = cert; c0.on = on; c0.sigma = 6.0f; c0.margin = 0.05f;
+                std::vector<float> Lf = Ls, Lo = Ls;
+                llama_d1_ctx cf(head, NTOP, eager, thr, c0), co(head, NTOP, eager, thr, c0);
+                cf.fused_min_chunk = 37;
+                co.fused = false;
+                for (auto * c : { &cf, &co }) {
+                    c->reset(R);
+                    std::memcpy(c->h_row(0), H.data(), sizeof(float) * R * E);
+                    c->mark_copied(0, R, true);
+                }
+                for (int r = 0; r < R; ++r) {
+                    cf.on_read_row(Lf.data(), V, r, R);
+                    co.on_read_row(Lo.data(), V, r, R);
+                }
+                CHECK(cf.n_chunk == (thr == 4 && eager == 0 ? 4 : 1), "fused: %d chunks per row", cf.n_chunk);
+                cf.drain();
+                co.drain();
+                CHECK(std::memcmp(Lf.data(), Lo.data(), sizeof(float) * R * V) == 0,
+                      "fused == separate bit for bit (shift %g, cert %d, threads %d)", shift, (int) on, thr);
+                CHECK(cf.n_cert_forced == co.n_cert_forced, "fused forced %llu == separate %llu",
+                      (unsigned long long) cf.n_cert_forced.load(), (unsigned long long) co.n_cert_forced.load());
+                if (on) {
+                    // shift 0: a few noisy rows may fall back too (N = 8 here); shift 10: every row must
+                    CHECK(shift == 0.0f ? cf.n_fused_fallback < (uint64_t) R / 2 : cf.n_fused_fallback == (uint64_t) R,
+                          "fused fallback %llu (shift %g)", (unsigned long long) cf.n_fused_fallback.load(), shift);
+                    std::printf("fused shift %g threads %d chunks %d: %s\n", shift, thr, cf.n_chunk, cf.summary().c_str());
+                }
+              }
+            }
+        }
+    }
     std::printf("cert test: top-%d misses plain N=%d: %d/%d, certified: %d/%d\n", K, NTOP, miss_plain, R, miss_cert, R);
     std::remove(sc.path.c_str());
+}
+
+// [EXACTHEAD] llama_d1_scan_chunk: chunk heaps merge to the select_top set; buf holds every id >= the floor
+static void test_scan_chunk() {
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (const int64_t nv : { 5, 64, 1000, 40007 }) {
+        std::vector<float> row(nv);
+        for (auto & x : row) { x = std::round(nd(rng) * 8.0f) / 8.0f; } // ties
+        for (const int n : { 1, 8, 64 }) {
+            std::vector<int32_t> want;
+            llama_d1_select_top(row.data(), nv, n, want);
+            std::sort(want.begin(), want.end());
+            for (const int nc : { 1, 3, 8 }) {
+                for (const float D : { 0.0f, 0.5f, 3.0f }) {
+                    std::vector<llama_d1_cand> all, heap;
+                    std::vector<int32_t> buf;
+                    const int64_t step = ((nv + nc - 1) / nc + 7) & ~(int64_t) 7;
+                    int bad = 0;
+                    for (int c = 0; c < nc; ++c) {
+                        const int64_t i0 = std::min(nv, c * step), i1 = std::min(nv, i0 + step);
+                        const float floor = llama_d1_scan_chunk(row.data(), i0, i1, n, D, true, heap, buf);
+                        all.insert(all.end(), heap.begin(), heap.end());
+                        std::vector<uint8_t> in(nv, 0);
+                        for (const int32_t id : buf) { in[id] = 1; }
+                        for (int64_t i = i0; i < i1; ++i) { bad += row[i] >= floor && !in[i]; }
+                    }
+                    std::sort(all.begin(), all.end(), [](const llama_d1_cand & a, const llama_d1_cand & b) {
+                        return a.v > b.v || (a.v == b.v && a.id < b.id); });
+                    if ((int64_t) all.size() > n) { all.resize(n); }
+                    std::vector<int32_t> got;
+                    for (const auto & x : all) { got.push_back(x.id); }
+                    std::sort(got.begin(), got.end());
+                    CHECK(got == want && bad == 0, "scan_chunk nv %lld n %d chunks %d D %g: set %d, missing buf %d",
+                          (long long) nv, n, nc, D, (int) (got == want), bad);
+                }
+            }
+        }
+    }
 }
 
 int main(int argc, char ** argv) {
     const std::string dir = argc > 1 ? argv[1] : ".";
     test_select();
+    test_scan_chunk();
     test_head_and_scope(dir);
     test_ctx(dir);
     test_cert(dir);

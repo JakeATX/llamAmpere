@@ -107,6 +107,15 @@ llama_d1_scope_result llama_d1_scope(const llama_d1_scope_in & in, llama_d1_mode
 // top-n ids of a logits row (ties to the lower id), any order; n <= n_vocab
 void llama_d1_select_top(const float * row, int64_t n_vocab, int n, std::vector<int32_t> & ids);
 
+struct llama_d1_cand { float v; int32_t id; };
+
+// [EXACTHEAD] fused pick, one scan of row[i0, i1): heap = the range's top n (llama_d1_cand, any order); if collect,
+// buf (appended, ascending ids) = every id ever kept plus every id with row[i] >= fl(thr_t - D), thr_t the running
+// n-th value when i was read. Returns the final fl(thr - D) (-inf if the range has <= n ids): every id of the range
+// with row[i] >= that value is in buf.
+float llama_d1_scan_chunk(const float * row, int64_t i0, int64_t i1, int n, float D, bool collect,
+                          std::vector<llama_d1_cand> & heap, std::vector<int32_t> & buf);
+
 // [EXACTHEAD] certificate: after the top N are exact, any other row whose coarse logit could still reach the k-th
 // exact logit (coarse + margin + sigma * s_i >= T_k, s_i = sqrt(sum_g ||h_g||^2 * gl2[i][g]^2 / 32)) is rescored too.
 // Statistically exact (Jake 11-21): treating each row's coarse error as Gaussian with std s_i, a row that belongs in
@@ -193,9 +202,42 @@ struct llama_d1_ctx {
     void swap_rows(int64_t i0, int64_t i1);
 
     // rescore the PENDING rows in list (threaded when more than one)
-    void rescore_rows(float * logits, int64_t n_vocab, const std::vector<int64_t> & rows);
+    // need >= 0 (fused + pool): may return once row need is exact, the pool finishing the rest (drain() waits)
+    void rescore_rows(float * logits, int64_t n_vocab, const std::vector<int64_t> & rows, int64_t need = -1);
+    void drain();                // wait for async rows (every other entry and llama_context::synchronize call it)
+    bool async_pending = false;
+    std::vector<int64_t> arows;  // rows of the current pool job
     void rescore_one(float * logits, int64_t n_vocab, int64_t r, std::vector<int32_t> & ids);
-    void certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids);
+    // cands == nullptr or pre < floor: scan the whole row; else check only cands (fused pick, floor = its scan floor)
+    void certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids,
+                 const std::vector<int32_t> * cands = nullptr, float floor = 0.0f);
+    float cert_slack(const float * hr) const; // D: pre = T - D (a hair below margin + sigma * gl2_max * hn)
+
+    // [EXACTHEAD] fused pick (default on, LLAMA_D1_FUSED=0 = the old per-row select + full certificate scan). Each
+    // row is split in n_chunk parts over the pool: (1) one scan per chunk keeps its top N and the certificate's
+    // candidates; the last chunk of a row merges them into the row's ids; (2) the row's dots are split the same way;
+    // the last dot part certifies from the kept ids (full scan if T is below the scan floor). Same rows as the old path.
+    bool fused = true;
+    int64_t fused_min_chunk = 16384;           // ids per chunk at least (tests lower it)
+    std::atomic<uint64_t> n_fused_fallback{0}; // rows whose certificate needed the full scan
+    struct fchunk_t { std::vector<llama_d1_cand> heap; std::vector<int32_t> buf; float floor = 0.0f; };
+    struct frow_t {
+        float D = 0.0f, floor = 0.0f;
+        std::vector<int32_t> ids, cands;
+        std::vector<float>   coarse;           // audit only
+        bool audit = false;
+        std::atomic<int> left{0}, dleft{0}, ready{0}, done{0};
+    };
+    std::vector<fchunk_t> fch;                 // [rows x n_chunk]
+    std::unique_ptr<frow_t[]> frow;            // [rows]
+    size_t                frow_n = 0;
+    int                   n_chunk = 1;
+    std::atomic<int64_t>  next2{0};
+    void fused_scan(int64_t k);   // phase 1 job
+    void fused_merge(int64_t ri);
+    void fused_dots(int64_t k);   // phase 2 job
+    void fused_cert(int64_t ri);
+    void fused_run(int64_t k);    // job k of the row-ordered list (scans, then dot parts, per row)
 
     std::string summary() const;
 
@@ -216,4 +258,5 @@ struct llama_d1_ctx {
     } pool;
     void worker(int idx);
     void run_job();
+    int  n_threads_total() const { return (int) pool.threads.size() + 1; }
 };
