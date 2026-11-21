@@ -901,15 +901,15 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                         LLAMA_LOG_WARN("d1: LLAMA_D1_AUDIT=%d: every %d-th rescored row is checked against the full exact head "
                                 "(slow, exactness gate only)\n", d1->audit_every, d1->audit_every);
                     }
-                    LLAMA_LOG_INFO("d1: %s head + exact rescore of top N=%d from %s (rows %s, eager_max %d, threads %d)\n",
+                    LLAMA_LOG_WARN("d1: %s head + exact rescore of top N=%d from %s (rows %s, eager_max %d, threads %d)\n",
                             ggml_type_name(model.output->type), n_top, d1_head->path.c_str(),
                             ggml_type_name(d1_head->type), eager, n_thr);
                     if (cert.on) {
-                        LLAMA_LOG_INFO("d1: certificate on (statistically exact: a missed top-%d row has probability ~1e-9 per "
+                        LLAMA_LOG_WARN("d1: certificate on (statistically exact: a missed top-%d row has probability ~1e-9 per "
                                 "row at %.1f sigma): k=%d sigma=%.2f margin=%.3f (head max group error %.4g); LLAMA_D1_CERT=0 turns it off\n",
                                 cert.k, cert.sigma, cert.k, cert.sigma, cert.margin, d1_head->gl2_max);
                     } else {
-                        LLAMA_LOG_INFO("d1: certificate off (%s)\n", cert_env == 0 ? "LLAMA_D1_CERT=0" : "sidecar has no output_exact.gl2");
+                        LLAMA_LOG_WARN("d1: certificate off (%s)\n", cert_env == 0 ? "LLAMA_D1_CERT=0" : "sidecar has no output_exact.gl2");
                     }
                     const char * gv = getenv("LLAMA_MTP_GPU_VERIFY");
                     const char * tv = getenv("LLAMA_MTP_TOPK_VERIFY");
@@ -1961,9 +1961,9 @@ llama_context::~llama_context() {
         ink_stream.reset();
     }
     if (d1) {
-        LLAMA_LOG_INFO("%s\n", d1->summary().c_str()); // [D1] exit counters (gate 8.0(d))
+        LLAMA_LOG_WARN("%s\n", d1->summary().c_str()); // [D1] exit counters (gate 8.0(d))
         if (d1->audit_every > 0) {
-            LLAMA_LOG_INFO("%s\n", d1->audit_summary().c_str());
+            LLAMA_LOG_WARN("%s\n", d1->audit_summary().c_str());
         }
     }
     if (pp_warm_thread.joinable()) {
@@ -3640,7 +3640,7 @@ int32_t llama_sj_kvarn_ckpt_sealed_end(const uint8_t * data, size_t size, llama_
 void llama_d1_log_counters(llama_context * ctx, const char * tag) {
     const std::string s = ctx ? ctx->d1_counters_delta() : std::string();
     if (!s.empty()) {
-        LLAMA_LOG_INFO("d1 req: %s %s\n", tag ? tag : "", s.c_str());
+        LLAMA_LOG_WARN("d1 req: %s %s\n", tag ? tag : "", s.c_str());
     }
 }
 
