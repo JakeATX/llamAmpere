@@ -23609,6 +23609,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // waves; widths 1..8 at the Qwen3.8 shape with the production staging, plus fused rotation and two streams
     for (int64_t n_q = 1; n_q <= 8; ++n_q) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 160, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 400, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
     }
     for (int64_t n_q : {1, 5, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 160, 1100, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 1));

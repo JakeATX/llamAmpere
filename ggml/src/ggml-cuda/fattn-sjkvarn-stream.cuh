@@ -1383,6 +1383,8 @@ static bool ggml_cuda_fattn_sj_nt6_logged = false; // GGML_SJKVARN_NT6_OCC log, 
 // launched instance, keeping >= LLAMA_FA_SPLITKV_MIN_REC records per block. Only the KV split (and so the reduction order)
 // changes: rounding-level differences. LLAMA_FA_SPLITKV=0 (off/false/no) = the v0.7.2.1 split everywhere (kill switch).
 // LLAMA_FA_SPLITKV_PB=n forces n blocks per KV head above the threshold (diagnostic sweeps).
+// Above the threshold the compact tile's mode 1 no longer copies the rows kernel's split bit for bit (each launch raises
+// its split from its own occupancy); both stay rounding-level equal. LLAMA_FA_SPLITKV=0 restores the mode 1 contract.
 // Not applied to: GGML_SJKVARN_DIRECT_STABLE (fixed split by design) and the LSA live-record walk (the host does not know
 // the live record count, so the cap below would be wrong).
 struct ggml_cuda_fattn_sj_splitkv_cfg {
@@ -1414,8 +1416,8 @@ static const ggml_cuda_fattn_sj_splitkv_cfg & ggml_cuda_fattn_sj_splitkv_get_cfg
             }
             char * end = nullptr;
             const double v = strtod(e, &end);
-            if (end == e || *end != '\0' || !(v >= 0.0)) {
-                GGML_LOG_WARN("%s: %s=\"%s\" is not a number >= 0: using %g\n", "ggml_cuda_fattn_sj_splitkv", name, e, def);
+            if (end == e || *end != '\0' || !(v >= 0.0) || !(v <= 1.0e6)) {
+                GGML_LOG_WARN("%s: %s=\"%s\" is not a number in [0, 1e6]: using %g\n", "ggml_cuda_fattn_sj_splitkv", name, e, def);
                 return def;
             }
             return v;
@@ -1434,6 +1436,8 @@ static const ggml_cuda_fattn_sj_splitkv_cfg & ggml_cuda_fattn_sj_splitkv_get_cfg
     }();
     return cfg;
 }
+
+static int ggml_cuda_fattn_sj_kvarn_stream_parallel_blocks(const ggml_tensor * dst, const int max_blocks_per_sm); // below
 
 // KV split (blocks per KV head) for one stream launch; pb_in is the caller's split (0 = launch_fattn's occupancy rule).
 // Returns pb_in unchanged when the heuristic does not raise it, so short contexts keep the old launch bit for bit.
