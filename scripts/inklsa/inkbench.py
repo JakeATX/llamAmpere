@@ -99,7 +99,7 @@ def main():
     ap.add_argument('--mode', required=True, choices=['greedy', 'speed', 'chat']); ap.add_argument('--plen', type=int, default=3000)
     ap.add_argument('--seeds', default='1,2'); ap.add_argument('--npred', type=int, default=5120); ap.add_argument('--ctx', type=int, default=40960)
     ap.add_argument('--port', type=int, default=18611); ap.add_argument('--extra', default='')
-    ap.add_argument('--gprompt', type=int, default=0); ap.add_argument('--env', default=''); ap.add_argument('--gn', type=int, default=256); ap.add_argument('--warm', action='store_true'); ap.add_argument('--slot', default='')  # slot file name under --slot-save-path: restore if present, else save after the warm prefill  # one cached prefill, no per-seed cold prefill
+    ap.add_argument('--gprompt', type=int, default=0); ap.add_argument('--env', default=''); ap.add_argument('--gn', type=int, default=256); ap.add_argument('--warm', action='store_true'); ap.add_argument('--slot', default=''); ap.add_argument('--chain', action='store_true')  # seed k continues seed k-1's conversation (no cache rollback; fill grows per seed)  # slot file name under --slot-save-path: restore if present, else save after the warm prefill  # one cached prefill, no per-seed cold prefill
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True); base = f'http://127.0.0.1:{a.port}'
     stop_ev = threading.Event(); samples = []
@@ -121,14 +121,15 @@ def main():
             sdir = next((a.extra.split()[i + 1] for i, x in enumerate(a.extra.split()) if x == '--slot-save-path'), None)
             if a.slot and sdir and os.path.exists(os.path.join(sdir, a.slot)):
                 t0 = time.time(); res['slot_restore'] = post(base, '/slots/0?action=restore', dict(filename=a.slot)); res['slot_restore_s'] = time.time() - t0
-            t0 = time.time(); w = post(base, '/completion', dict(prompt=ids, n_predict=1, temperature=0.0, cache_prompt=a.warm))  # untimed warm-up
+            t0 = time.time(); w = {'timings': None} if 'slot_restore' in res else post(base, '/completion', dict(prompt=ids[:-1] if a.chain else ids, n_predict=1, temperature=0.0, cache_prompt=a.warm))  # untimed warm-up (chain: all but the last token, so seed 1 extends the cache without a rollback)
             if a.slot and sdir and 'slot_restore' not in res:
                 res['slot_save'] = post(base, '/slots/0?action=save', dict(filename=a.slot))
             res['warm_prefill'] = dict(wall_s=time.time() - t0, timings=w.get('timings'))
-            rows = []
-            for seed in [int(s) for s in a.seeds.split(',')]:
-                pf = res['warm_prefill']['timings'] if a.warm else post(base, '/completion', dict(prompt=ids, n_predict=1, temperature=0.0, cache_prompt=False))['timings']
-                toks = list(ids); gen_total = 0; turn = 0; turns = []
+            rows = []; chain_toks = list(ids)
+            for si, seed in enumerate([int(s) for s in a.seeds.split(',')]):
+                pf = (res['warm_prefill']['timings'] or {'prompt_n': 0, 'prompt_ms': 1}) if a.warm else post(base, '/completion', dict(prompt=ids, n_predict=1, temperature=0.0, cache_prompt=False))['timings']
+                toks = list(ids) if not a.chain else (chain_toks if si == 0 else chain_toks + tok(base, stpl.replace('FOLLOWUPMARKER', FOLLOWUPS[(si + 1) % len(FOLLOWUPS)])))
+                fill0 = len(toks); gen_total = 0; turn = 0; turns = []
                 while gen_total < a.npred and turn < 20 and len(toks) + (a.npred - gen_total) <= a.ctx - 16:
                     body = dict(prompt=toks, n_predict=a.npred - gen_total, temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, seed=seed + turn,
                                 repeat_penalty=1.0, return_tokens=True, cache_prompt=True, stream=False)
@@ -139,8 +140,10 @@ def main():
                     if r.get('stop_type') != 'eos' or gen_total >= a.npred:
                         break
                     turn += 1; toks += tok(base, stpl.replace('FOLLOWUPMARKER', FOLLOWUPS[turn % len(FOLLOWUPS)]))
+                if a.chain:
+                    chain_toks = toks
                 pn = sum(t['predicted_n'] or 0 for t in turns); pm = sum(t['predicted_ms'] or 0 for t in turns)
-                row = dict(seed=seed, prefill_n=pf.get('prompt_n'), prefill_ms=pf.get('prompt_ms'), prefill_tok_s=pf['prompt_n'] * 1000 / pf['prompt_ms'],
+                row = dict(seed=seed, fill_start=fill0, prefill_n=pf.get('prompt_n'), prefill_ms=pf.get('prompt_ms'), prefill_tok_s=pf['prompt_n'] * 1000 / pf['prompt_ms'],
                            generated=gen_total, decode_tok_s=pn * 1000 / pm if pm else None, turns=turns, valid=gen_total >= a.npred,
                            draft_n=sum(t['draft_n'] or 0 for t in turns), draft_n_accepted=sum(t['draft_n_accepted'] or 0 for t in turns))
                 rows.append(row); print('ROW', seed, round(row['prefill_tok_s'], 1), round(row['decode_tok_s'] or 0, 2), gen_total, flush=True)

@@ -30,6 +30,7 @@ struct dump_state {
     std::string dir;
     std::set<int> layers;
     int64_t stride = 256;
+    bool topk = false;
     std::map<std::string, int64_t> seen;   // tokens seen per tensor name
     std::map<std::string, FILE *> files;
     std::vector<float> buf;
@@ -42,7 +43,7 @@ static bool parse_name(const char * name, std::string & kind, int & il) {
         return false;
     }
     kind.assign(name, dash - name);
-    if (kind != "Qcur" && kind != "Kcur" && kind != "Vcur" && kind != "Rcur" && kind != "attn_sinks") {
+    if (kind != "Qcur" && kind != "Kcur" && kind != "Vcur" && kind != "Rcur" && kind != "attn_sinks" && kind != "ffn_moe_topk") {
         return false;
     }
     // exact "<kind>-<il>" only: views of these tensors inherit names like "Kcur-11 (permuted)"
@@ -73,10 +74,24 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto & st = *(dump_state *) user_data;
     std::string kind;
     int il = -1;
-    if (!parse_name(t->name, kind, il) || !st.layers.count(il)) {
+    if (!parse_name(t->name, kind, il) || (kind == "ffn_moe_topk" ? !st.topk : !st.layers.count(il))) {
         return ask ? false : true;
     }
     if (ask) {
+        return true;
+    }
+    if (kind == "ffn_moe_topk") {
+        // selected experts, I32 [n_used, n_tokens] (possibly a view): every token, every visit
+        GGML_ASSERT(t->type == GGML_TYPE_I32);
+        std::vector<uint8_t> raw(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+        std::vector<int32_t> ids(t->ne[0]*t->ne[1]);
+        for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+            memcpy(&ids[i1*t->ne[0] + i0], raw.data() + i0*t->nb[0] + i1*t->nb[1], sizeof(int32_t));
+        }
+        fwrite(ids.data(), sizeof(int32_t), ids.size(), get_file(st, "topk.L" + std::to_string(il) + ".i32"));
+        st.seen["topk-" + std::to_string(il)] += t->ne[1];
         return true;
     }
     GGML_ASSERT(t->type == GGML_TYPE_F32);
@@ -144,6 +159,7 @@ int main(int argc, char ** argv) {
     st.dir = dir;
     {
         const char * ls = getenv("INKDUMP_LAYERS");
+        st.topk = getenv("INKDUMP_TOPK") && atoi(getenv("INKDUMP_TOPK")) != 0;
         std::stringstream ss(ls ? ls : "5,11,17,23,29,35,41,47");
         std::string tok;
         while (std::getline(ss, tok, ',')) {
