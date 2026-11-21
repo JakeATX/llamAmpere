@@ -67,6 +67,15 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+// fork (INKFLAGS): the generic pass loads the optional per-expert ffn_*_exps.scale after load_arch_tensors, so the repeat
+// slots must copy the physical layers again or they run the NVFP4 experts without their scale
+void llama_model_inkling2_loop::load_arch_tensors_post(llama_model_loader & ml) {
+    GGML_UNUSED(ml);
+    for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
+        layers[il] = layers[layer_phys(il)];
+    }
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }

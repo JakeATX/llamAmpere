@@ -1113,6 +1113,8 @@ struct llama_model {
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+    // fork (INKFLAGS): after the generic optional-tensor pass (.scale etc.), e.g. to re-share aliased layer slots
+    virtual void load_arch_tensors_post(llama_model_loader & ml) { GGML_UNUSED(ml); }
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:

@@ -2145,6 +2145,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    load_arch_tensors_post(ml);
     // fork: EXL3 W[K,N,E] carries F16/F32 side tensors .suh[K,E] and .svh[N,E].
     // The file also carries the shared 128x128 Hadamard exl3_had128.weight. See build_lora_mm.
     {
