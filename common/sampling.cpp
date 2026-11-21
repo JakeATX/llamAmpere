@@ -1101,9 +1101,17 @@ struct llama_sampler * common_sampler_get_backend_verify(struct common_sampler *
 struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * gsmpl, const struct llama_model * model) {
     // fused_top_k > 0 means the CPU chain's first live samplers are [logit-bias,] top-k, so the CPU chain sees the same
     // candidates from the K best of the biased row as from the full row (the bias is applied on the card first)
-    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || gsmpl->fused_top_k <= 0 ||
+    // [HOSTGAP08] K > 64 keeps the full-row path: the card's wide-row top-k at K > 64 is the radix select or a full sort
+    if (!gsmpl || gsmpl->grmr || gsmpl->rbudget || gsmpl->fused_top_k <= 0 || gsmpl->fused_top_k > 64 ||
             gsmpl->params.temp <= 0.0f || gsmpl->params.mirostat != 0 || gsmpl->params.n_probs != 0) {
         return nullptr;
+    }
+    // [HOSTGAP08] the card exports biased logits and the CPU chain applies its own logit-bias sampler again, so only bans
+    // (-INFINITY, where twice is still -INFINITY) are exact here; a finite bias takes the full-row path
+    for (const auto & b : gsmpl->fused_topk_bias) {
+        if (b.bias != -INFINITY) {
+            return nullptr;
+        }
     }
     if (!gsmpl->topk_backend) {
         auto params = llama_sampler_chain_default_params();
@@ -1114,8 +1122,15 @@ struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * g
             llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_logit_bias(
                     llama_vocab_n_tokens(llama_model_get_vocab(model)), gsmpl->fused_topk_bias.size(), gsmpl->fused_topk_bias.data()));
         }
-        // K >= 64 takes the card's radix-select path (wide rows with a small K fall to a full-row sort)
-        llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_top_k(std::max(gsmpl->fused_top_k, 64)));
+        // [HOSTGAP08] K = the chain's own top-k: the CPU chain needs no more candidates than that, and the card's tiled /
+        // split top-k paths (ggml-cuda/top-k.cu) take wide rows at any K <= 64 (same set as the full row up to equal logits). LLAMA_MTP_TOPK_K=N raises K to N
+        // (the old behavior was 64, which went to the radix select).
+        static const int k_min = [] {
+            const char * e = std::getenv("LLAMA_MTP_TOPK_K");
+            return e ? std::max(0, std::atoi(e)) : 0;
+        }();
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_top_k(std::min(n_vocab, std::max(gsmpl->fused_top_k, k_min))));
     }
     return gsmpl->topk_backend;
 }

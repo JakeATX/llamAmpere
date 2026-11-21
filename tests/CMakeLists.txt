@@ -219,6 +219,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     endif()
     llama_build_and_test(test-sampling.cpp  LABEL behavior)   # fork: uses common/sampling.h, so keep the llama-common default link
     llama_build_and_test(test-sampler-topk-exact.cpp)
+    llama_build_and_test(test-sampler-topk-law.cpp)    # [HOSTGAP08]
     llama_build_and_test(test-spec-beat.cpp)
     llama_build_and_test(test-reasoning-budget.cpp  LABEL behavior)
     llama_build_and_test(test-grammar-parser.cpp  LABEL behavior  LINK llama)
