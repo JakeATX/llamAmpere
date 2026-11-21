@@ -3850,11 +3850,12 @@ static int aif_mmvx_env() {
 
 static int aif_mmvx_groups(int M, int K, int64_t N, int nsm) {
     const int e = aif_mmvx_env();
-    if (e == 0 || N > 8 || nsm <= 0) {
+    if (e == 0 || N < 1 || N > 8 || nsm <= 0) {
         return 0;
     }
     if (e > 0) {
-        return e;
+        // a forced G runs only where it qualifies (2..4 groups, K / 128 a multiple of 4 G); elsewhere mmv
+        return e >= 2 && e <= 4 && (K / 128) % (4 * e) == 0 ? e : 0;
     }
     const int64_t warps = int64_t(M / 16) * 4;
     return warps < 17LL * nsm && (K / 128) % 8 == 0 ? 2 : 0;
