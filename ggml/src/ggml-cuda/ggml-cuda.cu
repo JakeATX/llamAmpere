@@ -6891,8 +6891,24 @@ static bool ggml_cuda_gdn_replay_direct_enabled() {
     return on;
 }
 
-// the cpy that moves bytes [off, off + D floats) of gdn into the cache, or -1; refuses any other reader of that range
-static int ggml_cuda_gdn_replay_direct_cpy(const ggml_cgraph * cgraph, int gi, size_t off, int64_t D) {
+// [MULTI08 B] the same direct stores for n_seqs > 1 (multi-user verify, 12.6 MB final state + 12.6 MB checkpoint per
+// GDN layer at 4 users), default ON: GGML_CUDA_GDN_REPLAY_DIRECT_MULTI=0, or GGML_CUDA_GDN_REPLAY_DIRECT=0 set
+// explicitly, turns it off. Same floats stored at the same addresses, so the output is bit-identical.
+static bool ggml_cuda_gdn_replay_direct_multi_enabled() {
+    static const bool on = [] {
+        const char * m = getenv("GGML_CUDA_GDN_REPLAY_DIRECT_MULTI");
+        const char * d = getenv("GGML_CUDA_GDN_REPLAY_DIRECT");
+        return (m == nullptr || atoi(m) != 0) && (d == nullptr || atoi(d) != 0);
+    }();
+    return on;
+}
+
+// the cpy that moves bytes [off, off + D floats) of gdn into the cache, or -1; refuses any other reader of that range.
+// [MULTI08 B] ring_row > 0 (ingredient slots of n_seqs > 1 sequences): the destination may also be the strided ring
+// view [ring_row, n_seqs, n_slots = D / (ring_row * n_seqs)] whose sequences' rows are n_slots * ring_row floats apart,
+// exactly the layout the kernel stores at ingr_dst (sequence s, slot j at (s * K + j) * ring_row).
+static int ggml_cuda_gdn_replay_direct_cpy(const ggml_cgraph * cgraph, int gi, size_t off, int64_t D,
+                                           int64_t ring_row = 0, int64_t n_seqs = 1) {
     const ggml_tensor * gdn = cgraph->nodes[gi];
     const size_t end = off + D * sizeof(float);
     int ci = -1;
@@ -6930,8 +6946,23 @@ static int ggml_cuda_gdn_replay_direct_cpy(const ggml_cgraph * cgraph, int gi, s
         return -1;
     }
     const ggml_tensor * dst = cgraph->nodes[ci]->src[1];
-    if (dst->type != GGML_TYPE_F32 || dst->data == nullptr || !ggml_is_contiguous(dst) || ggml_nelements(dst) != D) {
+    if (dst->type != GGML_TYPE_F32 || dst->data == nullptr || ggml_nelements(dst) != D) {
         return -1;
+    }
+    // a contiguous ring destination matches the kernel's sequence-major slots only when one of n_seqs, K is 1
+    if (ggml_is_contiguous(dst) && ring_row > 0 && n_seqs > 1 && D != ring_row * n_seqs) {
+        return -1;
+    }
+    if (!ggml_is_contiguous(dst)) {
+        if (ring_row <= 0 || n_seqs <= 1 || D % (ring_row * n_seqs) != 0) {
+            return -1;
+        }
+        const int64_t n_slots = D / (ring_row * n_seqs);
+        if (dst->ne[0] != ring_row || dst->ne[1] != n_seqs || dst->ne[2] != n_slots || dst->ne[3] != 1 ||
+            dst->nb[0] != sizeof(float) || dst->nb[2] != (size_t) ring_row * sizeof(float) ||
+            dst->nb[1] != (size_t) (n_slots * ring_row) * sizeof(float)) {
+            return -1;
+        }
     }
     for (int j = gi + 1; j < ci; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
@@ -6955,7 +6986,9 @@ static void ggml_cuda_gdn_replay_direct_plan(ggml_backend_cuda_context * cuda_ct
                                              std::vector<uint8_t> & skip) {
     cuda_ctx->gdn_replay_directs.clear();
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion || !ggml_cuda_gdn_replay_direct_enabled()) {
+    const bool single_on = ggml_cuda_gdn_replay_direct_enabled();
+    const bool multi_on  = ggml_cuda_gdn_replay_direct_multi_enabled();
+    if (disable_fusion || (!single_on && !multi_on)) {
         return;
     }
     for (int gi = 0; gi < cgraph->n_nodes; ++gi) {
@@ -6966,28 +6999,56 @@ static void ggml_cuda_gdn_replay_direct_plan(ggml_backend_cuda_context * cuda_ct
         }
         const ggml_tensor * v = gdn->src[2];
         const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
-        if (n_seqs != 1) {
+        const bool multi = n_seqs > 1;
+        if (multi ? !multi_on : !single_on) {
             continue;
         }
+        // [MULTI08 B] n_seqs > 1: different blocks store different sequences' rows, so no block may read a row
+        // another block stores. The state must come from the gathered copy, not the cache in place ([#87]
+        // state read: one sequence's source row can be another's destination after a find_slot cell swap),
+        // and no src of the gdn may share bytes with any destination (checked per destination below).
+        if (multi) {
+            bool in_place = false;
+            for (const auto & r : cuda_ctx->gdn_state_reads) {
+                in_place = in_place || r.gdn == gdn;
+            }
+            if (in_place) {
+                continue;
+            }
+        }
+        auto srcs_clear = [&](const ggml_tensor * dst) {
+            for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                const ggml_tensor * src = gdn->src[si];
+                if (src != nullptr && (src->data == nullptr || ggml_cuda_gdn_state_read_overlap(src, dst))) {
+                    return false;
+                }
+            }
+            return true;
+        };
         const int64_t D       = S_v * S_v * H;
         const int64_t K       = ggml_get_op_params_i32(gdn, 0);
         const int64_t region  = ggml_gated_delta_net_ingr_region(S_v, gdn->src[3]->ne[0], H, n_seqs, K, ggml_get_op_params_i32(gdn, 1));
         const size_t  fin_off = (S_v * H * n_tokens * n_seqs + region) * sizeof(float);
-        const int fi = ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, fin_off, D);
-        if (fi < 0) {
+        // the final-state / checkpoint blocks hold n_seqs D-float states back to back, as do the cache rows
+        // [kv_head, kv_head + n_seqs) they are copied to
+        const int fi = ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, fin_off, D * n_seqs);
+        if (fi < 0 || (multi && !srcs_clear(cgraph->nodes[fi]->src[1]))) {
             continue;
         }
-        const int ci = ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, fin_off + D * sizeof(float), D);
+        int ci = ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, fin_off + D * n_seqs * sizeof(float), D * n_seqs);
+        if (ci >= 0 && multi && !srcs_clear(cgraph->nodes[ci]->src[1])) {
+            ci = -1;
+        }
         // the K new ingredient slots, right after the attention output, -> the ring row (one cpy of all K slots,
-        // n_tokens >= K; the layouts match for one sequence). The launch reads every src while it stores them,
-        // so none may share bytes with the ring row (the prefix reads the gathered ring copy, src 6).
-        const int64_t ingr_n = K * ggml_gated_delta_net_ingr_width(S_v, gdn->src[3]->ne[0], ggml_get_op_params_i32(gdn, 1)) * H;
-        int ii = n_tokens >= K ? ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, S_v * H * n_tokens * sizeof(float), ingr_n) : -1;
-        for (int si = 0; ii >= 0 && si < GGML_MAX_SRC; ++si) {
-            const ggml_tensor * src = gdn->src[si];
-            if (src != nullptr && (src->data == nullptr || ggml_cuda_gdn_state_read_overlap(src, cgraph->nodes[ii]->src[1]))) {
-                ii = -1;
-            }
+        // n_tokens >= K; the layouts match for one sequence, n_seqs > 1 lands in the strided ring view). The
+        // launch reads every src while it stores them, so none may share bytes with the ring row (the prefix
+        // reads the gathered ring copy, src 6).
+        const int64_t ingr_row = ggml_gated_delta_net_ingr_width(S_v, gdn->src[3]->ne[0], ggml_get_op_params_i32(gdn, 1)) * H;
+        const int64_t ingr_n   = K * ingr_row * n_seqs;
+        int ii = n_tokens >= K ? ggml_cuda_gdn_replay_direct_cpy(cgraph, gi, S_v * H * n_tokens * n_seqs * sizeof(float), ingr_n,
+                                                                 ingr_row, n_seqs) : -1;
+        if (ii >= 0 && !srcs_clear(cgraph->nodes[ii]->src[1])) {
+            ii = -1;
         }
         if (skip.empty()) {
             skip.assign(cgraph->n_nodes, 0);
@@ -7012,6 +7073,18 @@ static void ggml_cuda_gdn_replay_direct_plan(ggml_backend_cuda_context * cuda_ct
         GGML_LOG_INFO("[GDNDIRECT] %zu gated_delta_net calls store final state%s%s in the cache\n",
             cuda_ctx->gdn_replay_directs.size(), cuda_ctx->gdn_replay_directs[0].ckpt_dst ? " and checkpoint" : "",
             cuda_ctx->gdn_replay_directs[0].ingr_dst ? " and ingredient slots" : "");
+    }
+    static bool logged_multi = false;
+    if (!logged_multi) {
+        for (const auto & e : cuda_ctx->gdn_replay_directs) {
+            if (e.gdn->src[2]->ne[3] > 1) {
+                logged_multi = true;
+                GGML_LOG_INFO("[GDNDIRECT] multi-seq: %zu gated_delta_net calls (%" PRId64 " sequences) store final state%s%s in the cache\n",
+                    cuda_ctx->gdn_replay_directs.size(), e.gdn->src[2]->ne[3], e.ckpt_dst ? " and checkpoint" : "",
+                    e.ingr_dst ? " and ingredient slots" : "");
+                break;
+            }
+        }
     }
 }
 

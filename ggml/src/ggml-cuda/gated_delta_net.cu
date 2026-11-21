@@ -262,7 +262,12 @@ gated_delta_net_cuda(const float * q,
                     // every warp doing so redundantly would cost O(S_v) writes each, i.e. O(S_v^2)
                     // total per component, which is what this design is supposed to avoid.
                     // emit_mode 2 (compact) stores g and beta once: k, v, g (1 or S_v), beta.
-                    float * ingr_slot = (state_src.ingr_dst ? state_src.ingr_dst : state_f) + state_out_e + (int64_t) target_slot * state_slot_stride;
+                    // [MULTI08 B] direct: this sequence's ring row (K slots of H * ingr_w floats, rows back to back),
+                    // slot j at j * H * ingr_w. One sequence: the old state_out_e + j * state_slot_stride, as
+                    // state_slot_stride == ingr_w * H there.
+                    float * ingr_slot = state_src.ingr_dst
+                        ? state_src.ingr_dst + ((int64_t) sequence * K + target_slot) * ingr_w * H + (int64_t) h_idx * ingr_w
+                        : state_f + state_out_e + (int64_t) target_slot * state_slot_stride;
                     const bool compact = ingr_w != 4 * S_v;
                     if (col == 0) {
 #pragma unroll
@@ -582,7 +587,9 @@ gated_delta_net_cuda_ilp(const float * q,
             const int target_slot = emit_ingredients_t ? t - ((int) n_tokens - K) : (int) n_tokens - 1 - t;
             if (target_slot >= 0 && target_slot < K) {
                 if constexpr (emit_ingredients_t) {
-                    float * ingr = (state_src.ingr_dst ? state_src.ingr_dst : (float *) state) + state_out_e + (int64_t) target_slot * state_slot_stride;
+                    float * ingr = state_src.ingr_dst
+                        ? state_src.ingr_dst + ((int64_t) sequence * K + target_slot) * ingr_w * H + (int64_t) h_idx * ingr_w
+                        : (float *) state + state_out_e + (int64_t) target_slot * state_slot_stride;
                     const bool compact = ingr_w != 4 * S_v;
                     if (col0 == 0) {
 #pragma unroll
@@ -2070,7 +2077,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
         // [GDNDIRECT] the evaluator skipped this call's final-state / checkpoint cpy: store them in the cache
         for (auto & e : ctx.gdn_replay_directs) {
             if (e.gdn == dst) {
-                GGML_ASSERT(!e.used && n_seqs == 1);
+                // [MULTI08 B] n_seqs > 1 only when ggml_cuda_gdn_replay_direct_plan checked the multi-seq rules
+                GGML_ASSERT(!e.used);
                 state_src.final_dst = e.final_dst;
                 state_src.ckpt_dst  = e.ckpt_dst;
                 state_src.ingr_dst  = e.ingr_dst;
