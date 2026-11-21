@@ -1193,14 +1193,11 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
         free_buf(r.ptr, r.dev);
     }
     free_buf(tq_rot_cache.ptr, tq_rot_cache.dev);
-    for (const auto & e : ai_prep_cache.entries) {
-        free_buf(e.ptr, e.dev);
-    }
-    for (const auto & r : ai_prep_cache.retired) {
-        free_buf(r.ptr, r.dev);
-    }
     for (const auto & r : tq_rot_cache.retired) {
         free_buf(r.ptr, r.dev);
+    }
+    for (const auto & e : ai_prep_cache.entries) {
+        free_buf(e.ptr, e.dev);
     }
     for (const auto & t : moe_tables) {
         free_buf((char *) t.ptr, t.dev);
@@ -12584,8 +12581,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_ALLOC_FAILED;
     }
 
-    // New graph eval: invalidate the shared-quantize and TQ pre-rotation caches (see q8_cache and
-    // tq_rot_cache in common.cuh).
+    // New graph eval: invalidate the shared-quantize, TQ pre-rotation and AI+ prep caches (see q8_cache,
+    // tq_rot_cache and ai_prep_cache in common.cuh).
     cuda_ctx->graph_epoch++;
 
     bool use_cuda_graph             = false;

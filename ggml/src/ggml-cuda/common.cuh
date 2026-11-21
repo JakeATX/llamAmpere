@@ -1746,9 +1746,8 @@ struct ggml_backend_cuda_context {
         uint64_t            last_use = 0;
     };
     struct {
-        ai_prep_entry            entries[3];
-        uint64_t                 tick = 0;
-        std::vector<retired_buf> retired;
+        ai_prep_entry entries[3];    // fixed-size buffers (AI4_PREP_CACHE_BYTES in ai4.cu): never outgrown, so no retired list
+        uint64_t      tick = 0;
     } ai_prep_cache;
 
     // Per-expert address tables for the MoE weight indirection (see tq_build_expert_table). One

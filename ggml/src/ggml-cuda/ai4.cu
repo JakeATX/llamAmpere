@@ -981,12 +981,9 @@ static void ai4_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * key, c
                     e = &c;
                 }
             }
-            if (e->dev != ctx.device || e->cap < bytes) {
-                // one fixed-size buffer per entry, allocated once; never freed here: a captured CUDA graph may still
-                // replay kernels that use it (see q8_cache)
-                if (e->ptr != nullptr) {
-                    pc.retired.push_back({ e->ptr, e->cap, e->dev });
-                }
+            if (e->ptr == nullptr) {
+                // one fixed-size buffer per entry, allocated on first use and freed only at teardown: a captured CUDA
+                // graph may still replay kernels that use it (see q8_cache). Fixed size, so it never has to grow.
                 CUDA_CHECK(ggml_cuda_device_malloc((void **) &e->ptr, AI4_PREP_CACHE_BYTES, ctx.device));
                 e->cap = AI4_PREP_CACHE_BYTES;
                 e->dev = ctx.device;
