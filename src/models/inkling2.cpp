@@ -549,8 +549,17 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur);
+    // lm_head. fork (INKSTACK): only the n_vocab_unpadded real rows go through the matmul (the 966 padded rows were
+    // computed and then dropped). Lossless: every kept logit is the same row dot product. Off with LLAMA_INK_HEAD_FULL=1,
+    // and skipped when a LoRA or a Hadamard rotation is keyed on the full head tensor.
+    static const bool head_full = [] { const char * e = getenv("LLAMA_INK_HEAD_FULL"); return e && atoi(e) != 0; }();
+    ggml_tensor * head = model.output;
+    if (!head_full && hparams.n_vocab_unpadded > 0 && hparams.n_vocab_unpadded < head->ne[1] &&
+            (loras == nullptr || loras->empty()) &&
+            (hadamard_rotations == nullptr || hadamard_rotations->find(head) == hadamard_rotations->end())) {
+        head = ggml_view_2d(ctx0, head, head->ne[0], hparams.n_vocab_unpadded, head->nb[1], 0);
+    }
+    cur = build_lora_mm(head, cur);
     ggml_prec_set_acc(cur, GGML_PREC_F32);
 
     if (hparams.f_final_logit_softcapping != 0.0f) {
@@ -560,7 +569,9 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     }
 
     // drop the padded vocabulary
-    cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+    if (cur->ne[0] != (int64_t) hparams.n_vocab_unpadded) {
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
