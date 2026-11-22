@@ -6453,6 +6453,9 @@ private:
                                 first_cap = 0; // a target that restores a checkpoint per miss: no spans
                             }
                             common_speculative_get_draft_params(spec.get(), slot.id).n_first_max = first_cap;
+                            // copy-first source: the request prompt (the reply so far only with LLAMA_SPEC_COPY_FIRST_SRC=all)
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_first_src =
+                                    (int32_t) std::min<size_t>(spec_prompt->size(), (size_t) std::max(0, (int) slot.task->n_tokens()));
                         }
 
                         drafting.push_back(&slot);

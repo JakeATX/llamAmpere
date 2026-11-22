@@ -18,7 +18,8 @@
 // A match may overlap its own suffix, which makes a periodic repeat continue.
 //
 // Copy-first (--spec-copy-first N, LLAMA_SPEC_COPY_FIRST=N; 0 = off): a lookup span INSTEAD of the drafter's block.
-// When the last first_min tokens (id_last included) repeat an earlier stretch of the request, the round verifies up to
+// When the last first_min tokens (id_last included) repeat an earlier stretch of the request prompt (by default only
+// the prompt: LLAMA_SPEC_COPY_FIRST_SRC=all also searches the reply so far), the round verifies up to
 // N tokens read from that stretch and the model drafter does not run; otherwise the drafter drafts as usual. Same
 // point-mass verify as the tail. The span starts at first_start tokens and doubles after every full accept (up to N);
 // a partial accept drops it back to first_start, and an accept of less than half starts a cool-down (first_cool
@@ -42,6 +43,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -55,7 +57,8 @@ struct common_speculative_copy_params {
 
     // copy-first (see the header): 0 = off
     int32_t first       = 0;  // longest lookup span verified instead of the drafter's block
-    int32_t first_min   = 8;  // LLAMA_SPEC_COPY_FIRST_MIN:   match length (id_last included) that triggers a span
+    int32_t first_min   = 16; // LLAMA_SPEC_COPY_FIRST_MIN:   match length (id_last included) that triggers a span
+    bool    first_src_all = false; // LLAMA_SPEC_COPY_FIRST_SRC=all: matches may start in the reply (default: prompt only)
     int32_t first_start = 4;  // LLAMA_SPEC_COPY_FIRST_START: first span of a run (doubles per full accept)
     int32_t first_cool  = 4;  // LLAMA_SPEC_COPY_FIRST_COOL:  rounds without a span after a poor one (0 = none)
     static constexpr int32_t FIRST_MAX = 128;
@@ -103,6 +106,8 @@ struct common_speculative_copy_params {
         first_min   = env_int("LLAMA_SPEC_COPY_FIRST_MIN",   first_min,   2, 64);
         first_start = env_int("LLAMA_SPEC_COPY_FIRST_START", first_start, 1, FIRST_MAX);
         first_cool  = env_int("LLAMA_SPEC_COPY_FIRST_COOL",  first_cool,  0, COOL_MAX);
+        const char * src = std::getenv("LLAMA_SPEC_COPY_FIRST_SRC");
+        first_src_all = src != nullptr && std::strcmp(src, "all") == 0;
     }
 
     // --spec-copy-first: requested >= 0 wins; -1 = auto: LLAMA_SPEC_COPY_FIRST=N if set (0 = kill switch), else
@@ -131,10 +136,13 @@ struct common_speculative_copy_match {
 // History = hist[0, n) followed by id_last. Finds an earlier occurrence of its suffix: the most recent one of
 // at least long_min tokens, else the longest one of at least short_min tokens (the most recent on a tie).
 inline common_speculative_copy_match common_speculative_copy_find(
-        const common_speculative_copy_params & cp, const llama_token * hist, int32_t n, llama_token id_last) {
+        const common_speculative_copy_params & cp, const llama_token * hist, int32_t n, llama_token id_last,
+        int32_t n_src = -1) {
     common_speculative_copy_match best;
     const int32_t stop = cp.scan_max > 0 ? std::max(0, n - cp.scan_max) : 0;
-    for (int32_t p = n - 1; p >= stop; --p) {
+    // n_src >= 0: only occurrences ending before hist[n_src] (e.g. inside the request prompt)
+    const int32_t p_hi = n_src >= 0 ? std::min(n, n_src) : n;
+    for (int32_t p = p_hi - 1; p >= stop; --p) {
         if (hist[p] != id_last) {
             continue;
         }
@@ -219,9 +227,11 @@ inline void common_speculative_copy_append(
 
 // Copy-first span: up to n_span tokens that followed the most recent earlier occurrence of the last first_min tokens
 // (history hist[0, n) followed by id_last), read from the virtual stream hist ++ id_last ++ span so that a match
-// overlapping its own suffix keeps repeating. Empty when there is no such occurrence.
+// overlapping its own suffix keeps repeating. The occurrence must end before hist[n_src] (n_src < 0: anywhere).
+// Empty when there is no such occurrence.
 inline std::vector<llama_token> common_speculative_copy_first_propose(
-        const common_speculative_copy_params & cp, const llama_token * hist, int32_t n, llama_token id_last, int32_t n_span) {
+        const common_speculative_copy_params & cp, const llama_token * hist, int32_t n, llama_token id_last, int32_t n_span,
+        int32_t n_src = -1) {
     std::vector<llama_token> span;
     if (n_span <= 0 || n <= 0 || cp.first <= 0) {
         return span;
@@ -229,7 +239,7 @@ inline std::vector<llama_token> common_speculative_copy_first_propose(
     common_speculative_copy_params fp = cp;
     fp.long_min  = cp.first_min;
     fp.short_min = cp.first_min;
-    const auto m = common_speculative_copy_find(fp, hist, n, id_last);
+    const auto m = common_speculative_copy_find(fp, hist, n, id_last, cp.first_src_all ? -1 : n_src);
     if (m.next < 0 || m.len < cp.first_min) {
         return span;
     }

@@ -115,6 +115,8 @@ struct common_speculative_draft_params {
     // copy-first: cap on a lookup span verified instead of the drafter's block (<= 0: no span for this sequence).
     // The server sets it to what the context and the request still allow, capped at --spec-copy-first.
     int32_t n_first_max = -1;
+    // copy-first: history tokens a span may be copied from (the request prompt; < 0: the whole history)
+    int32_t n_first_src = -1;
 
 };
 

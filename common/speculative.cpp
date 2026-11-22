@@ -5380,8 +5380,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     result->copy.tail, result->copy.long_min, result->copy.short_min, result->copy.agree, result->copy.cool,
                     params.need_n_rs_seq());
         }
-        LOG_INF("%s: copy-first: max span = %d, min match = %d, start = %d, cool = %d (drafter %s)\n", __func__,
+        LOG_INF("%s: copy-first: max span = %d, min match = %d, start = %d, cool = %d, source = %s (drafter %s)\n", __func__,
                 result->copy.first, result->copy.first_min, result->copy.first_start, result->copy.first_cool,
+                result->copy.first_src_all ? "all" : "prompt",
                 result->first_impl ? common_speculative_type_to_str(result->first_impl->type).c_str() : "none: off");
     }
 
@@ -5607,7 +5608,7 @@ void common_speculative_draft(common_speculative * spec) {
             const int32_t want = dp.n_first_max > 0 && dp.prompt != nullptr ? std::min(cs.first_want(), dp.n_first_max) : 0;
             if (want > 0) {
                 llama_tokens span = common_speculative_copy_first_propose(spec->copy, dp.prompt->data(),
-                        (int32_t) dp.prompt->size(), dp.id_last, want);
+                        (int32_t) dp.prompt->size(), dp.id_last, want, dp.n_first_src);
                 if (!span.empty()) {
                     *dp.result = std::move(span);
                     if (dp.result_q) {
@@ -5746,11 +5747,11 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
 
-        // copy-first: a span round is not the drafter's; it feeds the span controller only (the drafter's accept() is
-        // a no-op, see common_speculative_copy_first_ok)
+        // copy-first: a span round is not the drafter's; it feeds the span controller only. The stand-in drafter gets
+        // is_other = true like the rest: DSpark's adaptive depth controller must not score a span it did not draft
         if (seq_id >= 0 && seq_id < (llama_seq_id) spec->copy_state.size() && spec->copy_state[seq_id].first_n > 0) {
             spec->copy_state[seq_id].on_first_accept(n_accepted);
-            impl->accept(seq_id, n_accepted, false);
+            impl->accept(seq_id, n_accepted, true);
             impl->n_call_accept++;
             for (auto & impl_other : spec->impls) {
                 if (impl_other.get() != impl) {
