@@ -10474,11 +10474,11 @@ static int ggml_cuda_try_moe_onechain_fill(ggml_backend_cuda_context & ctx, ggml
     return 2;
 }
 
-// [INKDENSE] GGML_CUDA_AI_MMV_GROUP=1 (default off): AI+ unit-type MUL_MATs that read the same activations (Inkling q / gate /
+// [INKDENSE] GGML_CUDA_AI_MMV_GROUP (default on, =0 off): AI+ unit-type MUL_MATs that read the same activations (Inkling q / gate /
 // rel of a visit, and k / v where they share the input) are moved next to each other at graph_optimize and run as one grouped
 // decode mmv launch (ggml_cuda_mul_mat_ai4_group; bitwise equal to the separate launches).
 static bool ggml_cuda_ai_mmv_group_on() {
-    static const bool on = [] { const char * e = getenv("GGML_CUDA_AI_MMV_GROUP"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_AI_MMV_GROUP"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 
