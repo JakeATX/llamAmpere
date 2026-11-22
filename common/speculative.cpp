@@ -1453,7 +1453,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // length, the noise stream and graph reuse do not follow it)
                 int32_t cap = ds_adaptive ? std::min(ds_ctrl[seq_id].n_cur, params.n_max) : params.n_max;
                 cap = std::max(cap, std::min(params.n_min, params.n_max)); // a draft below n_min would be cleared every round
-                ds_cap [seq_id] = std::max(1, cap);
+                ds_cap [seq_id] = std::max(0, cap); // n_max 0 drafts nothing, as before
                 ds_last[seq_id] = 0;
                 for (int32_t i = 0; i < block_size; ++i) {
                     const int32_t idx = batch_rnn.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
@@ -1789,7 +1789,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (!ds_adaptive || is_other || seq_id < 0 || seq_id >= (llama_seq_id) ds_ctrl.size()) {
             return;
         }
-        int own = ds_last[seq_id];
+        // a draft longer than the controller depth (raised to --spec-draft-n-min) is scored at that depth
+        int own = std::min(ds_last[seq_id], ds_ctrl[seq_id].n_cur);
         if (n_drafted_ctrl >= 0) {
             own = std::min(own, (int) n_drafted_ctrl);
         }
@@ -1808,7 +1809,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         ds_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
         if (ds_ctrl[seq_id].n_cur != before) {
             SPC_DBG("DSpark adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
-                    (int) seq_id, before, ds_ctrl[seq_id].n_cur, own, (int) n_accepted);
+                    (int) seq_id, before, ds_ctrl[seq_id].n_cur, own, n_acc);
         }
         ds_last[seq_id] = 0;
     }

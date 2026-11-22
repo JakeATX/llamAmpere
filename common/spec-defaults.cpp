@@ -1,4 +1,3 @@
-#include <cstdlib>
 #include "spec-defaults.h"
 
 #include "common.h"
@@ -8,6 +7,7 @@
 #include "speculative.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
 

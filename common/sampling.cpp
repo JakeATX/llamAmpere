@@ -1118,9 +1118,20 @@ struct llama_sampler * common_sampler_get_topk_backend(struct common_sampler * g
         params.no_perf = gsmpl->params.no_perf;
         gsmpl->topk_backend = llama_sampler_chain_init(params);
         if (!gsmpl->fused_topk_bias.empty()) {
-            // request bans (for example the end-of-turn ids) are forced to -INFINITY before the K best are kept
-            llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_logit_bias(
-                    llama_vocab_n_tokens(llama_model_get_vocab(model)), gsmpl->fused_topk_bias.size(), gsmpl->fused_topk_bias.data()));
+            // request bans (for example the end-of-turn ids) are forced to -INFINITY before the K best are kept.
+            // INKSPEC2: out-of-range ids (unchecked CLI --logit-bias) are dropped, as the CPU paths ignore them (the card
+            // sampler asserts on them), and repeated bans are kept once (no duplicate rows in the card's set_rows)
+            const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+            std::vector<llama_logit_bias> bans;
+            for (const auto & b : gsmpl->fused_topk_bias) {
+                if (b.token >= 0 && b.token < n_vocab &&
+                        std::none_of(bans.begin(), bans.end(), [&](const llama_logit_bias & x) { return x.token == b.token; })) {
+                    bans.push_back(b);
+                }
+            }
+            if (!bans.empty()) {
+                llama_sampler_chain_add(gsmpl->topk_backend, llama_sampler_init_logit_bias(n_vocab, bans.size(), bans.data()));
+            }
         }
         // [HOSTGAP08] K = the chain's own top-k: the CPU chain needs no more candidates than that, and the card's tiled /
         // split top-k paths (ggml-cuda/top-k.cu) take wide rows at any K <= 64 (same set as the full row up to equal logits). LLAMA_MTP_TOPK_K=N raises K to N
