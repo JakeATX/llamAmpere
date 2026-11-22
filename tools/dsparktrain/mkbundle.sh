@@ -29,7 +29,7 @@ EOF
 done
 rsync -a --delete --exclude __pycache__ $W/tools/dsparktrain $B/wt/tools/
 rsync -a --delete --exclude __pycache__ $W/gguf-py $B/wt/
-cp /mnt/data/inkflags/h/ink_dspark_fold.py $B/wt/
+cp /mnt/data/inkflags/h/ink_dspark_fold.py /mnt/data/inkflags/h/inkbench.py $B/wt/   # inkbench.py: gate.sh harness (wiki read from /mnt/data/inkflags/data on the box)
 cp /mnt/data/inkspec2/data/prompts.jsonl /mnt/data/inkflags/data/wiki.test.raw $B/data/
 for f in target.pt lm_truth.bf16 lm_truth.gguf prep_check.json; do cp -u /mnt/data/inkspec2/w0/$f $B/w0/; done
 ( cd $B && find . -type f -printf '%s\t%p\n' | sort -k2 ) > $B/STAGED.txt

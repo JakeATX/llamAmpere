@@ -4,7 +4,9 @@
 #   $R/wt/ink_dspark_fold.py, $R/data/{prompts.jsonl,wiki.test.raw}, $R/w0, $R/model/{target,Q8_0,Q8_0-fold,BF16}.gguf;
 #   python at /mnt/data/inkflags/venv (same absolute path as Taichi).
 # Outputs: $R/data (gens, seq, dumps), $R/run (train log, best.pt), $R/out (eval JSONs, exported drafter, server checks).
-# usage: run_rental.sh [phase ...]   (default: check gen seq dump base train rep export server)
+# usage: run_rental.sh [phase ...]   (default: check cal100k gen seq dump base train rep export server gate)
+# DSPARKQAT: main KV SJ-KVaRN 4/4 everywhere (KVF), cal100k = stop gate (offline vs server at ~100K fill, > CALTOL % -> stop),
+#   gate = gate.sh (100K headline + 32K + 3K, ABBA x6, d4).
 set -uo pipefail
 R=${R:-/root/dst}; T=$R/wt/tools/dsparktrain; D=$R/data; O=$R/out
 PY=${PY:-/mnt/data/inkflags/venv/bin/python}
@@ -13,15 +15,15 @@ DQ=$R/model/Inkling-2-Mini-DSpark-Q8_0.gguf; DF=$R/model/Inkling-2-Mini-DSpark-Q
 BUDGET=${BUDGET:-2000000}; NPRED=${NPRED:-4096}; MAXP=${MAXP:-2048}; NP=${NP:-10}; PORT=18480
 STEPS=${STEPS:-1000}; LR=${LR:-3e-5}; LOSS=${LOSS:-e4}; KL=${KL:-0.1}; SPS=${SPS:-4}; APS=${APS:-512}
 EVAL_EVERY=${EVAL_EVERY:-100}; EVAL_STRIDE=${EVAL_STRIDE:-8}; DTYPE=${DTYPE:-bf16}   # train dump dtype; sel/rep are f32
-# KVF: target KV flags for gen, dumps and server checks (empty = default KV, the config of the 134.1 tok/s baseline;
-# set e.g. KVF="-ctk sjkvarn4 -ctv sjkvarn4" to train/evaluate at the Inkling gate KV)
-KVF=${KVF:-}
+# KVF: target KV flags for gen, dumps and server checks: SJ-KVaRN 4/4 (the Inkling ship KV; never F16)
+KVF=${KVF:--ctk sjkvarn4 -ctv sjkvarn4}; GENUB=${GENUB:-256}; CALTOL=${CALTOL:-3.0}
 export PYTHONPATH=$R/wt/gguf-py LLAMA_ARG_NO_CACHE_DISK=1
 mkdir -p $D $O $R/run
 log() { echo "$(date -u +%FT%TZ) $*" | tee -a $R/run.log; }
 done_or() { [ -e $R/$1.done ] && { log "skip $1"; return 0; }; return 1; }
 TRAINARGS="--w0 $R/w0 --drafter $DF --bf16 $DB"
 DUMP="$R/bin/llama-dspark-dump -m $M -ngl 99 -fa on -t 8 -c 8192 -b 2048 -ub 512 $KVF"
+DUMPL="$R/bin/llama-dspark-dump -m $M -ngl 99 -fa on -t 8 -c 110592 -b 2048 -ub 512 $KVF"
 
 ph_check() {
   done_or check && return
@@ -36,7 +38,7 @@ ph_check() {
 
 ph_gen() {
   done_or gen && return
-  $R/bin/llama-server -m $M --host 127.0.0.1 --port $PORT -c $((NP * (MAXP + NPRED + 64))) -np $NP -ngl 99 -fa on -t 8 -tb 8 --jinja --no-webui $KVF \
+  $R/bin/llama-server -m $M --host 127.0.0.1 --port $PORT -c $((NP * (MAXP + NPRED + 64))) -np $NP -ngl 99 -fa on -t 8 -tb 8 --jinja --no-webui -ub $GENUB $KVF \
       > $R/gen_server.log 2>&1 &
   local sp=$!
   for i in $(seq 1 180); do curl -sf http://127.0.0.1:$PORT/health > /dev/null && break; sleep 2; done
@@ -125,6 +127,43 @@ ph_server() {
   touch $R/server.done
 }
 
-PHASES=${*:-check gen seq dump base train rep export server}
+ph_cal100k() {
+  # STOP GATE (COORD 11-22): the offline metric must track the server at ~100K fill (shipped drafter, d4, 4/4 main KV,
+  # ladder on, one 5,120-token temp-1 reply). |offline round-sim / server tok/round - 1| > CALTOL % in either mode -> stop.
+  done_or cal100k && return
+  local ub=${UB100:-2048} bad=0
+  for mode in mb exact; do
+    local x=""; [ $mode = exact ] && x=--exact
+    local c=$O/c100_$mode
+    [ -e $c/result.json ] || $PY $T/spec_check.py --bin $R/bin --model $M --drafter $DF --out $c $x --seeds 1 --plen 100000 --ctx 110592 \
+        --npred 5120 --wiki $D/wiki.test.raw --port $((PORT + 2)) --env "LLAMA_DEEPCTX_LADDER=1" --extra="$KVF -ub $ub -b 4096" > $c.log 2>&1 \
+        || { log "cal100k $mode server failed: $(tail -2 $c.log | tr '\n' ' ')"; return 1; }
+    [ -e $c/dump.ok ] || { $DUMPL --ds-in $c/calib.seq --ds-out $c/d --ds-dtype f32 > $c/dump.log 2>&1 && touch $c/dump.ok; } || { log "cal100k $mode dump failed"; return 1; }
+    DSPARK_EVAL_CHUNK=32 $PY $T/train.py $TRAINARGS --out $O/cev_$mode --eval-only --shipped-fold --rep $c/d:$c/calib.seq > $O/cev_$mode.log 2>&1 \
+        || { log "cal100k $mode eval failed"; return 1; }
+    local v=$($PY -c "
+import json, re
+r = json.load(open('$c/result.json')); e = json.loads([l for l in open('$O/cev_$mode.log') if '\"eval\"' in l][-1])
+srv = r['mean_len'][-1]; off = e['tok_round_sim_mb' if '$mode' == 'mb' else 'tok_round_sim']
+d = 100 * (off / srv - 1)
+print(f\"prompt {r['prompt_tokens']} reply {r['rows'][0]['n']} server_tok_round {srv:.3f} offline {off:.3f} diff {d:+.2f}% srv_acc_pos {r['acc_per_pos'][-1] if r['acc_per_pos'] else None} E {e['E_mb' if '$mode' == 'mb' else 'E']} tok_s {r['rows'][0]['tok_s']} BAD {int(abs(d) > $CALTOL)}\")")
+    [ -n "$v" ] || v="COMPARISON_FAILED BAD 1"
+    log "cal100k $mode $v"; echo "$mode $v" >> $O/cal100k.txt
+    [[ $v == *"BAD 0" ]] || bad=1
+  done
+  (( bad )) && { log "CAL100K_STOP: offline and server disagree by more than ${CALTOL}% at 100K: stop and report"; return 1; }
+  touch $R/cal100k.done
+}
+
+ph_gate() {
+  done_or gate && return
+  [ -e $O/dspark-new-Q8_0-fold.gguf ] || { log 'gate: no exported drafter (nothing beat step 0): DROP'; touch $R/gate.done; return 0; }
+  R=$R bash $T/gate.sh $O/gate $DF $O/dspark-new-Q8_0-fold.gguf > $O/gate.log 2>&1 || { log "gate failed: $(tail -2 $O/gate.log | tr '\n' ' ')"; return 1; }
+  log "gate $(grep -E '^(100k|32k|3k|VERDICT)' $O/gate.log | tr '\n' ' ')"
+  grep -q '^VERDICT' $O/gate.log || { log 'gate: no VERDICT (too few valid 100K pairs)'; return 1; }
+  touch $R/gate.done
+}
+
+PHASES=${*:-check cal100k gen seq dump base train rep export server gate}
 for p in $PHASES; do ph_$p || { log "PHASE $p FAILED"; exit 1; }; done
 log ALL_DONE

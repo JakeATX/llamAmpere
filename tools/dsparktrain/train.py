@@ -62,6 +62,9 @@ def slot_terms(l, S, rows, t, mb):
     return D.accept_terms(p, pid, q, qid, t, eog=S['eog'], want_mb=mb), p, pid
 
 
+EVAL_CHUNK = int(os.environ.get('DSPARK_EVAL_CHUNK', '128'))   # anchors per eval chunk (32 for ~100K-token sequences)
+
+
 @torch.no_grad()
 def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=True, tag=''):
     prev = torch.backends.cuda.matmul.allow_tf32
@@ -79,7 +82,7 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
         if an is None:
             continue
         cs, cms, valid_all = [], [], []
-        for a, logits, rows, tdat in D.seq_slots(W, fr, S, an, walk):
+        for a, logits, rows, tdat in D.seq_slots(W, fr, S, an, walk, chunk=EVAL_CHUNK):
             A, C, Am, Cm, Cmc = [], [], [], [], []
             for s, l in enumerate(logits):
                 r, _, _ = slot_terms(l, S, rows[:, s], tdat[:, s], True)

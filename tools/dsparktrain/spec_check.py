@@ -44,11 +44,14 @@ def main():
     ap.add_argument('--out', required=True); ap.add_argument('--exact', action='store_true')
     ap.add_argument('--seeds', default='1'); ap.add_argument('--plen', type=int, default=3000); ap.add_argument('--npred', type=int, default=3072)
     ap.add_argument('--wiki', default='/mnt/data/inkflags/data/wiki.test.raw'); ap.add_argument('--port', type=int, default=18631)
-    ap.add_argument('--ctx', type=int, default=16384); ap.add_argument('--depth', type=int, default=4); ap.add_argument('--extra', default='')
+    ap.add_argument('--ctx', type=int, default=16384); ap.add_argument('--timeout', type=int, default=7200); ap.add_argument('--depth', type=int, default=4); ap.add_argument('--extra', default='')
+    ap.add_argument('--env', default='', help='VAR=val ... added to the server env (after the GGML_/LLAMA_ strip)')
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('GGML_', 'LLAMA_', 'TURBO_'))}
     env['LD_LIBRARY_PATH'] = a.bin + ':' + env.get('LD_LIBRARY_PATH', ''); env['LLAMA_SPEC_ACCPOS'] = '1'; env['LLAMA_ARG_NO_CACHE_DISK'] = '1'
+    for kv in a.env.split():
+        k, v = kv.split('=', 1); env[k] = v
     cmd = [os.path.join(a.bin, 'llama-server'), '-m', a.model, '--host', '127.0.0.1', '--port', str(a.port), '-c', str(a.ctx), '-ngl', '99',
            '-fa', 'on', '--parallel', '1', '-t', '8', '-tb', '8', '--jinja', '--no-webui',
            '--model-draft', a.drafter, '--spec-type', 'draft-dspark', '-ngld', '99', '-ubd', '64', '--spec-draft-n-max', str(a.depth)] + (['--no-spec-mb-mtp'] if a.exact else []) + a.extra.split()
@@ -71,11 +74,11 @@ def main():
         res['load_s'] = round(time.time() - t0, 1)
         ids = build_prompt(base, a.plen, a.wiki)
         res['prompt_tokens'] = len(ids)
-        post(base, '/completion', dict(prompt=ids, n_predict=1, temperature=0.0, cache_prompt=False))  # warm-up
+        post(base, '/completion', dict(prompt=ids, n_predict=1, temperature=0.0, cache_prompt=False), a.timeout)  # warm-up
         for seed in [int(s) for s in a.seeds.split(',')]:
             body = dict(prompt=ids, n_predict=a.npred, temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, repeat_penalty=1.0, seed=seed,
                         return_tokens=True, cache_prompt=False, stream=False)
-            r = post(base, '/completion', body); tm = r.get('timings', {})
+            r = post(base, '/completion', body, a.timeout); tm = r.get('timings', {})
             res['rows'].append(dict(seed=seed, n=len(r['tokens']), stop_type=r.get('stop_type'), tok_s=tm.get('predicted_per_second'),
                                     draft_n=tm.get('draft_n'), draft_n_accepted=tm.get('draft_n_accepted')))
             seqs.append((ids, r['tokens']))
