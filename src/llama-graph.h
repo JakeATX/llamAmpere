@@ -986,6 +986,9 @@ public:
     // INKKV: SJ-KVaRN on the full-attention (base) cache: region descriptor and per-stream attended lengths
     ggml_tensor * self_sj_kvarn_desc = nullptr; // I32, see llama_kv_cache::build_input_sj_kvarn_desc
     std::vector<uint32_t> sj_kvarn_n_kv_streams;
+    // INKKV v2 far/near split: [n_kv, T] F16 mask of the cells at distance >= extent (null = the dense v1 path)
+    ggml_tensor * self_sj_far_mask = nullptr;
+    int32_t       sj_il_full       = -1; // a full-attention layer (the SWA cache window copy check)
 
     // distance from the token to the cell, extent for the empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
@@ -2197,7 +2200,8 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor ** lse_out = nullptr) const; // INKKV v2: also the row log-sum-exp [n_head, T]
 
     // INKREL (llama-inklsa.h): full-attention visit as far + near flash attention merged by log-sum-exp; k and v are
     // the cache views with this ubatch already stored, the sink logit is zero (folded into table)

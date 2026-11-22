@@ -326,6 +326,9 @@ public:
     // largest position <= pos that seq_rm(pos, -1) can truncate to: pos itself unless pos lies inside the sealed body
     // below the intact ring rows, then the group boundary below it
     llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const;
+    // INKKV v2: [n_kv, T] F16 mask of the cells at distance >= extent from each row (0), -inf elsewhere (one sequence)
+    void      set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    bool      has_layer(int32_t il) const { return map_layer_ids.count(il) != 0; }
     // INKKV: would seq_rm(seq_id, p0, p1) succeed? (no change; hybrid memories ask before touching the recurrent state)
     bool      sj_kvarn_can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_st[0].N; }
@@ -843,6 +846,9 @@ public:
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_lsa_pos   (ggml_tensor * cell_pos, ggml_tensor * q_pos, const llama_ubatch * ubatch) const; // LSA probe
+    void set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    bool has_layer(int32_t il) const;
+    llama_pos get_seq_pos_min(llama_seq_id seq_id) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_inklsa(const struct llama_inklsa_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_inkrel(const struct llama_inkrel_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const;

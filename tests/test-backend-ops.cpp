@@ -22421,6 +22421,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         t->sinks_only = true;
         test_cases.emplace_back(t);
     }
+    // INKKV v2 far part: broadcast causal mask, no sinks, row log-sum-exp out (merged with the F16 near part)
+    for (int64_t n_q : {1, 2, 4, 8, 9, 64, 257, 512}) {
+        for (int rot : {0, 1}) {
+            auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                    GGML_TYPE_F32, 4, 4, rot, 0, 0);
+            t->lse_out = true;
+            test_cases.emplace_back(t);
+        }
+    }
     // Flash-Next QSA shape (qwen4exp): 24 query heads over 2 KV heads (GQA 12) at the production staging (tq6_0 ring,
     // f16 sink, 4/4 scalar body): decode and MTP widths, prefill ubatches, and two sequences (--parallel 2)
     for (int64_t n_q : {1, 2, 4, 5, 8, 64, 257, 1024}) {

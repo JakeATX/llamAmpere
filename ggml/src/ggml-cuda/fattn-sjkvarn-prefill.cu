@@ -205,6 +205,11 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const int bits_pair = ggml_get_op_params_i32(dst, 5);
     const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
     const size_t budget_cap = trellis ? fattn_sj_kvarn_prefill_trellis_budget() : fattn_sj_kvarn_prefill_budget();
+    // INKKV v2: the expand prefill writes no LSE; an LSE node (Inkling far part at prefill widths) takes the stream-k
+    // MMA launch, which writes it through the uniform fixup
+    if (ggml_flash_attn_ext_get_lse(dst) != nullptr) {
+        return p;
+    }
     static const bool master_enabled = [] {
         const char * value = getenv("GGML_CUDA_LSA_RESIDENT_STRIP_MASTER");
         return value && value[0] == '1' && !value[1];

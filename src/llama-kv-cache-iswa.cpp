@@ -57,6 +57,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                      size_t kv_stream_maximum_pool_bytes,
        llama_sj_kvarn_config sj_kvarn) : unified(unified) {
 
+    // INKKV v2: with SJ-KVaRN the SWA cache also holds an F16 window copy of the full-attention layers (the near part of
+    // the far/near relative-bias split, llm_graph_context::build_attn_rel); set below, read by filter_swa
+    bool swa_near_copy = false;
+
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -71,7 +75,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             return false;
         }
 
-        return  model.hparams.is_swa(il);
+        return  model.hparams.is_swa(il) || swa_near_copy;
     };
 
     const uint32_t size_base = kv_size;
@@ -142,6 +146,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             }
             hparams_base = hparams_base_sj.get();
             LLAMA_LOG_INFO("%s: SJ-KVaRN full-attention cache: 128-wide heads packed in pairs as 256-wide heads\n", __func__);
+            const char * e = getenv("LLAMA_INKKV_SPLIT");
+            swa_near_copy = !(e && *e && atoi(e) == 0) && hparams.n_swa > 0 && hparams.n_relative_extent == hparams.n_swa && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD &&
+                    !swa_full && n_seq_max == 1; // the split runs on one sequence only; never a full-context F16 copy
+            if (swa_near_copy) {
+                LLAMA_LOG_INFO("%s: INKKV far/near split: the SWA cache keeps a window copy of the full-attention layers "
+                        "(LLAMA_INKKV_SPLIT=0 = off)\n", __func__);
+            }
         }
         type_k_swa = GGML_TYPE_F16;
         type_v_swa = GGML_TYPE_F16;
