@@ -17,6 +17,14 @@
 //              (narrow = depth 1, wide = depth 2); any miss inside the block leaves wide at once.
 // A match may overlap its own suffix, which makes a periodic repeat continue.
 //
+// Copy-first (--spec-copy-first N, LLAMA_SPEC_COPY_FIRST=N; 0 = off): a lookup span INSTEAD of the drafter's block.
+// When the last first_min tokens (id_last included) repeat an earlier stretch of the request, the round verifies up to
+// N tokens read from that stretch and the model drafter does not run; otherwise the drafter drafts as usual. Same
+// point-mass verify as the tail. The span starts at first_start tokens and doubles after every full accept (up to N);
+// a partial accept drops it back to first_start, and an accept of less than half starts a cool-down (first_cool
+// rounds, doubling per poor span in a row). Only for drafters whose state follows the target batches and whose
+// accept() keeps no per-draft state (DFlash, DSpark); the server sets the cap (context, request, shared budgets).
+//
 //   - credit:  a tail of which less than half was accepted starts a cool-down (no tail for cool, 2x cool, ...
 //              rounds, doubling per poor tail in a row, up to COOL_MAX); a tail accepted for at least half clears it.
 //
@@ -44,6 +52,13 @@ struct common_speculative_copy_params {
     int32_t agree     = 2;  // LLAMA_SPEC_COPY_AGREE: block tokens that must repeat a short match
     int32_t scan_max  = 0;  // LLAMA_SPEC_COPY_SCAN:  history tokens searched, newest first (0 = all)
     int32_t cool      = 4;  // LLAMA_SPEC_COPY_COOL:  rounds without a tail after a poor tail (0 = no cool-down)
+
+    // copy-first (see the header): 0 = off
+    int32_t first       = 0;  // longest lookup span verified instead of the drafter's block
+    int32_t first_min   = 8;  // LLAMA_SPEC_COPY_FIRST_MIN:   match length (id_last included) that triggers a span
+    int32_t first_start = 4;  // LLAMA_SPEC_COPY_FIRST_START: first span of a run (doubles per full accept)
+    int32_t first_cool  = 4;  // LLAMA_SPEC_COPY_FIRST_COOL:  rounds without a span after a poor one (0 = none)
+    static constexpr int32_t FIRST_MAX = 128;
 
     static constexpr int32_t TAIL_MAX = 16;
     static constexpr int32_t COOL_MAX = 64;
@@ -80,6 +95,31 @@ struct common_speculative_copy_params {
         p.scan_max  = env_int("LLAMA_SPEC_COPY_SCAN",  p.scan_max,  0, INT32_MAX);
         p.cool      = env_int("LLAMA_SPEC_COPY_COOL",  p.cool,      0, COOL_MAX);
         return p;
+    }
+
+    // copy-first knobs; `first` is the resolved span cap (0 = off)
+    void set_first(int32_t n) {
+        first       = std::max(0, std::min(n, FIRST_MAX));
+        first_min   = env_int("LLAMA_SPEC_COPY_FIRST_MIN",   first_min,   2, 64);
+        first_start = env_int("LLAMA_SPEC_COPY_FIRST_START", first_start, 1, FIRST_MAX);
+        first_cool  = env_int("LLAMA_SPEC_COPY_FIRST_COOL",  first_cool,  0, COOL_MAX);
+    }
+
+    // --spec-copy-first: requested >= 0 wins; -1 = auto: LLAMA_SPEC_COPY_FIRST=N if set (0 = kill switch), else
+    // def when the configuration is eligible (a DFlash/DSpark drafter, one slot), else 0
+    static int32_t resolve_first(int32_t requested, bool eligible, int32_t def) {
+        if (requested >= 0) {
+            return std::min(requested, FIRST_MAX);
+        }
+        const char * env = std::getenv("LLAMA_SPEC_COPY_FIRST");
+        if (env != nullptr && env[0] != '\0') {
+            char * end = nullptr;
+            const long v = std::strtol(env, &end, 10);
+            if (end != env && *end == '\0') {
+                return eligible ? (int32_t) std::max(0L, std::min(v, (long) FIRST_MAX)) : 0;
+            }
+        }
+        return eligible ? def : 0;
     }
 };
 
@@ -177,6 +217,30 @@ inline void common_speculative_copy_append(
     }
 }
 
+// Copy-first span: up to n_span tokens that followed the most recent earlier occurrence of the last first_min tokens
+// (history hist[0, n) followed by id_last), read from the virtual stream hist ++ id_last ++ span so that a match
+// overlapping its own suffix keeps repeating. Empty when there is no such occurrence.
+inline std::vector<llama_token> common_speculative_copy_first_propose(
+        const common_speculative_copy_params & cp, const llama_token * hist, int32_t n, llama_token id_last, int32_t n_span) {
+    std::vector<llama_token> span;
+    if (n_span <= 0 || n <= 0 || cp.first <= 0) {
+        return span;
+    }
+    common_speculative_copy_params fp = cp;
+    fp.long_min  = cp.first_min;
+    fp.short_min = cp.first_min;
+    const auto m = common_speculative_copy_find(fp, hist, n, id_last);
+    if (m.next < 0 || m.len < cp.first_min) {
+        return span;
+    }
+    span.reserve(n_span);
+    for (int32_t i = 0; i < n_span; ++i) {
+        const int32_t k = m.next + i;
+        span.push_back(k < n ? hist[k] : (k == n ? id_last : span[k - n - 1]));
+    }
+    return span;
+}
+
 // Per-sequence wide trigger and round bookkeeping. The streak rule is the adaptive depth controller on a
 // two-step range: depth 1 = narrow, depth 2 = wide (two full-accept rounds in a row climb, see climb_threshold(1)).
 struct common_speculative_copy_state {
@@ -196,6 +260,21 @@ struct common_speculative_copy_state {
     int32_t cool      = 0; // rounds left without a tail
     int32_t n_fail    = 0; // poor tails in a row
 
+    // copy-first (first_* configuration survives reset())
+    int32_t first_max   = 0; // span cap (0 = off)
+    int32_t first_start = 4;
+    int32_t first_cool_base = 0;
+    int32_t first_span  = 0; // span of the next run round (0 = first_start)
+    int32_t first_cool  = 0; // rounds left without a span
+    int32_t first_fail  = 0; // poor spans in a row
+    int32_t first_n     = 0; // span verified this round (0 = the drafter drafted)
+
+    uint64_t n_first_rounds = 0; // rounds that verified a span
+    uint64_t n_first_gen    = 0; // span tokens proposed
+    uint64_t n_first_acc    = 0; // span tokens accepted
+    uint64_t n_first_full   = 0; // spans accepted whole
+    uint64_t n_first_poor   = 0; // spans accepted for less than half
+
     // per request (common_speculative_begin): the statistics line printed at the end of a request covers that request
     void reset() {
         ctrl.reset(2, 1);
@@ -209,6 +288,60 @@ struct common_speculative_copy_state {
         n_cooled   = 0;
         cool       = 0;
         n_fail     = 0;
+        first_span = 0;
+        first_cool = 0;
+        first_fail = 0;
+        first_n    = 0;
+        n_first_rounds = 0;
+        n_first_gen    = 0;
+        n_first_acc    = 0;
+        n_first_full   = 0;
+        n_first_poor   = 0;
+    }
+
+    // copy-first: the span to try this round (0 = none, the drafter drafts); counts down a cool-down
+    int32_t first_want() {
+        if (first_max <= 0) {
+            return 0;
+        }
+        if (first_cool > 0) {
+            first_cool--;
+            return 0;
+        }
+        return std::min(first_max, first_span > 0 ? first_span : first_start);
+    }
+
+    void on_first_draft(int32_t n) {
+        first_n = n;
+        if (n > 0) {
+            n_first_rounds++;
+            n_first_gen += n;
+        }
+    }
+
+    // feed one verified copy-first round (first_n > 0)
+    void on_first_accept(int32_t n_accepted) {
+        const int32_t n   = first_n;
+        const int32_t acc = std::max(0, std::min(n_accepted, n));
+        first_n = 0;
+        n_first_acc += acc;
+        const int32_t cur = first_span > 0 ? first_span : first_start;
+        if (acc >= n) {
+            n_first_full++;
+            first_fail = 0;
+            first_span = std::min(first_max, std::max(cur, n) * 2);
+            return;
+        }
+        first_span = first_start;
+        if (acc * 2 < n) {
+            n_first_poor++;
+            if (first_cool_base > 0) {
+                first_fail = std::min(first_fail + 1, 8);
+                first_cool = std::min(common_speculative_copy_params::COOL_MAX, first_cool_base << (first_fail - 1));
+            }
+        } else {
+            first_fail = 0;
+        }
     }
 
     bool wide() const {

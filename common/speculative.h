@@ -112,6 +112,10 @@ struct common_speculative_draft_params {
     // target keeps, so a miss inside the tail can always be rolled back in place.
     int32_t n_tail_max = -1;
 
+    // copy-first: cap on a lookup span verified instead of the drafter's block (<= 0: no span for this sequence).
+    // The server sets it to what the context and the request still allow, capped at --spec-copy-first.
+    int32_t n_first_max = -1;
+
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

@@ -266,6 +266,8 @@ static common_speculative_output_limits server_output_limits(const common_params
     }
     // copy mode: a wide round verifies the drafter's block plus the lookup tail
     n_max += common_speculative_copy_tail(&params.speculative);
+    // copy-first: a span round verifies up to copy_first tokens instead of the block
+    n_max = std::max(n_max, params.speculative.copy_first);
 
     auto result = common_speculative_get_output_limits(common_context_n_batch(params), params.n_parallel, n_max);
 
@@ -2365,6 +2367,20 @@ private:
                 params.speculative.copy_tail, mtp && !params.speculative.has_dft() && params.n_parallel == 1,
                 std::getenv("LLAMA_SPEC_COPY"));
         SRV_INF("copy mode: %s (tail = %d)\n", params.speculative.copy_tail > 0 ? "on" : "off", params.speculative.copy_tail);
+        {
+            // copy-first: auto-on only for a DSpark drafter (Inkling2: its recurrent snapshot is a short-conv state of
+            // a few KiB per layer, so the n_rs_seq raise to the span cap is cheap) with one slot; an explicit
+            // --spec-copy-first N also serves DFlash. Never with synthetic acceptance (it would judge the spans).
+            const bool dspark = params.speculative.has_dft() &&
+                    std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+            params.speculative.copy_first = common_speculative_copy_params::resolve_first(
+                    params.speculative.copy_first, dspark && params.n_parallel == 1, 32);
+            if (params.speculative.has_synth()) {
+                params.speculative.copy_first = 0;
+            }
+            SRV_INF("copy-first: %s (max span = %d)\n", params.speculative.copy_first > 0 ? "on" : "off",
+                    params.speculative.copy_first);
+        }
 
 #if !defined(_WIN32)
         // copy mode: a wide verify batch keeps its pre-round recurrent plane, so a block miss needs no checkpoint
@@ -6428,6 +6444,15 @@ private:
                                 tail_cap = -1;
                             }
                             common_speculative_get_draft_params(spec.get(), slot.id).n_tail_max = tail_cap;
+                            // copy-first: a span up to what the context and the request allow (none under a shared budget)
+                            // and, on a recurrent/hybrid target, at its snapshots: every span miss rolls back in place
+                            int32_t first_cap = std::min(n_draft_max, params_base.speculative.copy_first);
+                            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                                first_cap = std::min(first_cap, (int32_t) llama_n_rs_seq(ctx_tgt));
+                            } else if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                                first_cap = 0; // a target that restores a checkpoint per miss: no spans
+                            }
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_first_max = first_cap;
                         }
 
                         drafting.push_back(&slot);
