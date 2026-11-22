@@ -1,0 +1,235 @@
+#include "inkmask.cuh"
+#include "convert.cuh"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
+static bool ink_relmask_enabled() {
+    static const bool v = [] { const char * e = getenv("GGML_CUDA_INK_MASK"); return e == nullptr || atoi(e) != 0; }();
+    return v;
+}
+
+namespace {
+struct ink_relmask_counter {
+    std::atomic<long long> n{0};
+    ~ink_relmask_counter() {
+        if (n.load() > 0) {
+            fprintf(stderr, "[INKMASK] fused rel-bias masks: %lld\n", n.load());
+        }
+    }
+};
+}
+static ink_relmask_counter g_ink_relmask_count;
+
+static bool ink_is_view_op(ggml_op op) {
+    return op == GGML_OP_RESHAPE || op == GGML_OP_VIEW || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
+
+// node positions of a matched chain, relative to the GET_ROWS node
+struct ink_relmask_chain {
+    int n_view = 0;   // view nodes between GET_ROWS and CONT
+    int cont   = 0;   // CONT
+    int mcast  = -1;  // CPY F16->F32 of the mask, or -1
+    int add    = 0;   // ADD
+    int out    = 0;   // CPY F32->F16 (last node)
+};
+
+static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_chain & ch) {
+    const ggml_tensor * G = cgraph->nodes[i];
+    if (G->op != GGML_OP_GET_ROWS || G->type != GGML_TYPE_F32 || G->view_src != nullptr) {
+        return false;
+    }
+    const ggml_tensor * A = G->src[0];
+    const ggml_tensor * I = G->src[1];
+    if (A == nullptr || I == nullptr || A->type != GGML_TYPE_F32 || I->type != GGML_TYPE_I32 ||
+            A->nb[0] != sizeof(float) || I->nb[0] != sizeof(int32_t) || A->ne[3] != 1 || I->ne[2] != 1 || I->ne[3] != 1 ||
+            A->ne[2] != I->ne[1] || A->ne[2] < 2 || A->ne[0] > 256 || !ggml_is_contiguous(G) ||
+            A->nb[1] % sizeof(float) != 0 || A->nb[2] % sizeof(float) != 0 || I->nb[1] % sizeof(int32_t) != 0) {
+        return false;
+    }
+    const int64_t H = G->ne[0], n_kv = G->ne[1], T = G->ne[2];
+    if (T > 65535 || G->ne[3] != 1) {
+        return false;
+    }
+
+    int j = i + 1;
+    const ggml_tensor * cur = G;
+    while (j < cgraph->n_nodes && ink_is_view_op(cgraph->nodes[j]->op) && cgraph->nodes[j]->src[0] == cur && j - i <= 3) {
+        cur = cgraph->nodes[j];
+        ++j;
+    }
+    ch.n_view = j - (i + 1);
+    if (ch.n_view == 0 || j >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * P = cur;
+    const ggml_tensor * C = cgraph->nodes[j];
+    if (C->op != GGML_OP_CONT || C->src[0] != P || C->type != GGML_TYPE_F32 || !ggml_is_contiguous(C)) {
+        return false;
+    }
+    ch.cont = j - i;
+
+    // the permuted view must be out[k, ts, h, s] = G[h, k, ts + Ts*s]
+    const int64_t Ts = P->ne[1], ns = P->ne[3];
+    if (P->view_src != G || P->view_offs != 0 || P->ne[0] != n_kv || P->ne[2] != H || Ts*ns != T ||
+            P->nb[0] != (size_t) H*sizeof(float) || P->nb[1] != (size_t) H*n_kv*sizeof(float) ||
+            P->nb[2] != sizeof(float) || P->nb[3] != (size_t) H*n_kv*Ts*sizeof(float)) {
+        return false;
+    }
+
+    ++j;
+    if (j >= cgraph->n_nodes) {
+        return false;
+    }
+    if (cgraph->nodes[j]->op == GGML_OP_CPY) {
+        const ggml_tensor * mc = cgraph->nodes[j];
+        if (mc->type != GGML_TYPE_F32 || mc->src[0] == nullptr || mc->src[0]->type != GGML_TYPE_F16 ||
+                !ggml_are_same_shape(mc, mc->src[0])) {
+            return false;
+        }
+        ch.mcast = j - i;
+        ++j;
+        if (j >= cgraph->n_nodes) {
+            return false;
+        }
+    }
+    const ggml_tensor * D = cgraph->nodes[j];
+    if (D->op != GGML_OP_ADD || D->type != GGML_TYPE_F32 || !ggml_are_same_shape(D, C) || !ggml_is_contiguous(D)) {
+        return false;
+    }
+    const ggml_tensor * M = D->src[0] == C ? D->src[1] : D->src[1] == C ? D->src[0] : nullptr;
+    if (M == nullptr || M == C) {
+        return false;
+    }
+    if (ch.mcast >= 0 && M != cgraph->nodes[i + ch.mcast]) {
+        return false;
+    }
+    if (ch.mcast < 0 && M->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * Mr = ch.mcast >= 0 ? M->src[0] : M; // the tensor the kernel reads
+    const size_t mts = ggml_type_size(Mr->type);
+    if (!ggml_can_repeat(M, C) || Mr->nb[0] != mts || Mr->nb[1] % mts || Mr->nb[2] % mts || Mr->nb[3] % mts) {
+        return false;
+    }
+    ch.add = j - i;
+
+    ++j;
+    if (j >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * O = cgraph->nodes[j];
+    if (O->op != GGML_OP_CPY || O->src[0] != D || O->type != GGML_TYPE_F16 || !ggml_are_same_shape(O, D) ||
+            !ggml_is_contiguous(O)) {
+        return false;
+    }
+    ch.out = j - i;
+
+    enum ggml_op ops[12];
+    int idxs[12];
+    const int count = ch.out + 1;
+    if (count > 12) {
+        return false;
+    }
+    for (int k = 0; k < count; ++k) {
+        idxs[k] = i + k;
+        ops[k]  = cgraph->nodes[i + k]->op;
+    }
+    const int outs[1] = { i + ch.out };
+    return ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, outs, 1);
+}
+
+int ggml_cuda_ink_relmask_match(const ggml_cgraph * cgraph, int i) {
+    if (!ink_relmask_enabled()) {
+        return 0;
+    }
+    ink_relmask_chain ch;
+    return ink_relmask_parse(cgraph, i, ch) ? ch.out : 0;
+}
+
+// one thread per key cell k of query row t (blockIdx.y = ts + Ts*s); loops over the heads
+template <typename mask_t, bool mask_per_head>
+static __global__ void k_ink_relmask(
+        const float * __restrict__ A, const int64_t a_s1, const int64_t a_s2,
+        const int32_t * __restrict__ I, const int64_t i_s1,
+        const mask_t * __restrict__ M, const int64_t m_ne0, const int64_t m_ne1, const int64_t m_ne2, const int64_t m_ne3,
+        const int64_t m_s0, const int64_t m_s1, const int64_t m_s2, const int64_t m_s3,
+        half * __restrict__ O, const int H, const int64_t n_kv, const int64_t Ts) {
+    const int64_t k = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n_kv) {
+        return;
+    }
+    const int64_t t  = blockIdx.y;
+    const int64_t ts = t % Ts;
+    const int64_t s  = t / Ts;
+
+    const int32_t r = I[k + t*i_s1];
+    const float * a = A + r*a_s1 + t*a_s2;
+
+    const int64_t m_base = (k % m_ne0)*m_s0 + (ts % m_ne1)*m_s1 + (s % m_ne3)*m_s3;
+    float m0 = 0.0f;
+    if constexpr (!mask_per_head) {
+        m0 = ggml_cuda_cast<float>(M[m_base]);
+    }
+    half * o = O + k + n_kv*(ts + Ts*H*s);
+    const int64_t o_sh = n_kv*Ts;
+    for (int h = 0; h < H; ++h) {
+        float m = m0;
+        if constexpr (mask_per_head) {
+            m = ggml_cuda_cast<float>(M[m_base + (h % m_ne2)*m_s2]);
+        }
+        o[h*o_sh] = ggml_cuda_cast<half>(a[h] + m);
+    }
+}
+
+template <typename mask_t>
+static void ink_relmask_launch_t(const ggml_tensor * A, const ggml_tensor * I, const ggml_tensor * Mr, const ggml_tensor * M,
+        ggml_tensor * O, int64_t H, int64_t n_kv, int64_t T, int64_t Ts, cudaStream_t stream) {
+    const size_t mts = ggml_type_size(Mr->type);
+    const int block = 256;
+    const dim3 grid((unsigned) ((n_kv + block - 1)/block), (unsigned) T, 1);
+    // M (the logical mask) and Mr (what is read) have the same shape
+    const bool per_head = M->ne[2] > 1;
+    auto launch = [&](auto kern) {
+        kern<<<grid, block, 0, stream>>>(
+                (const float *) A->data, (int64_t) (A->nb[1]/sizeof(float)), (int64_t) (A->nb[2]/sizeof(float)),
+                (const int32_t *) I->data, (int64_t) (I->nb[1]/sizeof(int32_t)),
+                (const mask_t *) Mr->data, M->ne[0], M->ne[1], M->ne[2], M->ne[3],
+                (int64_t) (Mr->nb[0]/mts), (int64_t) (Mr->nb[1]/mts), (int64_t) (Mr->nb[2]/mts), (int64_t) (Mr->nb[3]/mts),
+                (half *) O->data, (int) H, n_kv, Ts);
+    };
+    if (per_head) {
+        launch(k_ink_relmask<mask_t, true>);
+    } else {
+        launch(k_ink_relmask<mask_t, false>);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_ink_relmask_launch(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int n) {
+    ink_relmask_chain ch;
+    GGML_ASSERT(ink_relmask_parse(cgraph, i, ch) && ch.out == n);
+    const ggml_tensor * G = cgraph->nodes[i];
+    const ggml_tensor * A = G->src[0];
+    const ggml_tensor * I = G->src[1];
+    const ggml_tensor * C = cgraph->nodes[i + ch.cont];
+    const ggml_tensor * D = cgraph->nodes[i + ch.add];
+    const ggml_tensor * M = D->src[0] == C ? D->src[1] : D->src[0];
+    const ggml_tensor * Mr = ch.mcast >= 0 ? M->src[0] : M;
+    ggml_tensor * O = cgraph->nodes[i + ch.out];
+    const ggml_tensor * P = cgraph->nodes[i + ch.n_view];
+
+    const int64_t H = G->ne[0], n_kv = G->ne[1], T = G->ne[2], Ts = P->ne[1];
+    cudaStream_t stream = ctx.stream();
+    if (Mr->type == GGML_TYPE_F16) {
+        ink_relmask_launch_t<half>(A, I, Mr, M, O, H, n_kv, T, Ts, stream);
+    } else {
+        ink_relmask_launch_t<float>(A, I, Mr, M, O, H, n_kv, T, Ts, stream);
+    }
+    if (g_ink_relmask_count.n.fetch_add(1) == 0) {
+        GGML_LOG_WARN("[INKMASK] fused rel-bias mask on: H %lld, n_kv %lld, T %lld (%lld x %lld), mask %s%s, %d nodes\n",
+                (long long) H, (long long) n_kv, (long long) T, (long long) Ts, (long long) (T/Ts), ggml_type_name(Mr->type),
+                M->ne[2] > 1 ? " per head" : "", n + 1);
+    }
+}
