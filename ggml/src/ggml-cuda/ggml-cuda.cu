@@ -106,6 +106,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/inkmask.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -11846,6 +11847,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    // [INKPREFILL] Inkling rel-bias mask chain (GET_ROWS .. CPY F16) as one kernel (inkmask.cu, GGML_CUDA_INK_MASK=0 off)
+    if (node->op == GGML_OP_GET_ROWS && cuda_ctx->stream_context().concurrent_events.empty()) {
+        // the match checks the output against every tensor the kernel reads and stages it when they alias
+        const int n_rm = ggml_cuda_ink_relmask_match(cgraph, i);
+        if (n_rm > 0) {
+            ggml_cuda_ink_relmask_launch(*cuda_ctx, cgraph, i, n_rm);
+            return n_rm;
+        }
+    }
     if (node->op == GGML_OP_MUL_MAT) {
         const int n_grp = ggml_cuda_try_ai_mmv_group(*cuda_ctx, cgraph, i);
         if (n_grp > 0) {
