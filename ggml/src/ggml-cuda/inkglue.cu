@@ -455,12 +455,14 @@ bool ggml_cuda_ink_loop_gate_multi(ggml_backend_cuda_context & ctx, ggml_tensor 
 // RMS_NORM -> MUL(gamma) x G rows (one block per row): rms_norm_f32<block_size, 1, false, true>'s scalar path term for
 // term (tmp += xi*xi over col = tid + k*block_size, block_reduce SUM, rsqrtf(tmp/ncols + eps), scale*x*gamma). With q8 the
 // loop runs to ncols_padded and also writes q8_1 like quantize_q8_1 (the add_rms_norm_mul_f32 q8_mode 1 code, norm.cu).
+// one entry per row: G norms x nrows (1, or 5..8 at verify widths, INKGLUE NORMQV)
+#define INK_RN_MAX_JOBS 32
 struct ink_rn_args {
-    const float * x[INK_MULTI_MAX];
-    const float * g[INK_MULTI_MAX];
-    float       * dst[INK_MULTI_MAX];
-    block_q8_1  * q8[INK_MULTI_MAX];
-    float         eps[INK_MULTI_MAX];
+    const float * x[INK_RN_MAX_JOBS];
+    const float * g[INK_RN_MAX_JOBS];
+    float       * dst[INK_RN_MAX_JOBS];
+    block_q8_1  * q8[INK_RN_MAX_JOBS];
+    float         eps[INK_RN_MAX_JOBS];
 };
 
 template <int block_size>
@@ -518,18 +520,29 @@ bool ggml_cuda_ink_rms_norm_mul_multi(ggml_backend_cuda_context & ctx, const ggm
         return false;
     }
     const int64_t ncols = x[0]->ne[0];
-    if (ncols > INT_MAX) {
+    const int64_t nrows = ggml_nrows(x[0]);
+    if (ncols > INT_MAX || nrows < 1 || G*nrows > INK_RN_MAX_JOBS) {
         return false;
     }
+    const int ncols_padded = (int) GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    // q8[k] holds nrows q8_1 rows of ncols_padded values back to back (ggml_cuda_mul_mat_vec_q's src1 layout)
+    const size_t q8_row = (size_t) ncols_padded/QK8_1;
     ink_rn_args a{};
     for (int k = 0; k < G; ++k) {
-        a.x[k] = (const float *) x[k]->data;
-        a.g[k] = (const float *) gamma[k]->data;
-        a.dst[k] = (float *) dst[k]->data;
-        a.q8[k] = (block_q8_1 *) q8[k];
-        a.eps[k] = eps[k];
+        if (ggml_nrows(x[k]) != nrows || ggml_nrows(dst[k]) != nrows || x[k]->nb[1] != ncols*sizeof(float) ||
+                dst[k]->nb[1] != ncols*sizeof(float)) {
+            return false;
+        }
+        for (int64_t r = 0; r < nrows; ++r) {
+            const int j = (int) (k*nrows + r);
+            a.x[j]   = (const float *) x[k]->data + r*ncols;
+            a.g[j]   = (const float *) gamma[k]->data;
+            a.dst[j] = (float *) dst[k]->data + r*ncols;
+            a.q8[j]  = q8[k] ? (block_q8_1 *) q8[k] + r*q8_row : nullptr;
+            a.eps[j] = eps[k];
+        }
     }
-    const int ncols_padded = (int) GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    G = (int) (G*nrows);
     cudaStream_t stream = ctx.stream();
     // rms_norm_f32_cuda's block size choice (the reduction order depends on it)
     if (ncols < 1024) {

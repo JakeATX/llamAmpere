@@ -11358,6 +11358,13 @@ static int ggml_cuda_try_fuse_ink_normq(ggml_backend_cuda_context * ctx, ggml_cg
     if (ncols < 1024 || ncols > INT_MAX || ncols % QK8_1 != 0) {
         return 0;
     }
+    // [NORMQV] (INKGLUE) the same at verify widths: each norm is 5..8 contiguous rows (one per token), the products run
+    // grouped at that width (ggml_cuda_mul_mat_vec_q_group_nc_pre). GGML_CUDA_INKGLUE_NORMQV=0 = off
+    static const bool on_v = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_NORMQV");
+    const int64_t nr = ggml_nrows(cgraph->nodes[i]->src[0]);
+    if (!(nr == 1 || (on_v && nr >= 5 && nr <= 8 && cgraph->nodes[i]->src[0]->ne[1] == nr))) {
+        return 0;
+    }
     const ggml_tensor * xs[INK_MULTI_MAX];
     const ggml_tensor * gs[INK_MULTI_MAX];
     ggml_tensor *       outs[INK_MULTI_MAX];
@@ -11377,7 +11384,7 @@ static int ggml_cuda_try_fuse_ink_normq(ggml_backend_cuda_context * ctx, ggml_cg
             }
             const ggml_tensor * gamma = mul->src[0] == t ? mul->src[1] : mul->src[0];
             if (t->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 ||
-                    x->ne[0] != ncols || ggml_nrows(x) != 1 || !ggml_is_contiguous(x) || !ggml_are_same_shape(x, t) ||
+                    x->ne[0] != ncols || ggml_nrows(x) != nr || x->ne[1] != nr || !ggml_is_contiguous(x) || !ggml_are_same_shape(x, t) ||
                     !ggml_are_same_shape(mul, t) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(gamma) ||
                     gamma->ne[0] != ncols || ggml_nrows(gamma) != 1 || (t->flags & GGML_TENSOR_FLAG_OUTPUT) ||
                     ggml_node_get_use_count(cgraph, j) != 1) {
@@ -11416,6 +11423,7 @@ static int ggml_cuda_try_fuse_ink_normq(ggml_backend_cuda_context * ctx, ggml_cg
         }
         const ggml_tensor * w = mm->src[0];
         if (k < 0 || w->type != GGML_TYPE_Q8_0 || mm->type != GGML_TYPE_F32 || w->ne[0] != ncols || w->ne[2] != 1 || w->ne[3] != 1 ||
+                mm->ne[1] != nr || mm->ne[2] != 1 || mm->ne[3] != 1 ||
                 !ggml_is_contiguous(w) || !ggml_is_contiguous(mm) || w->ne[1] > INT_MAX || !w->buffer ||
                 ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
                 ggml_get_op_params_i32(mm, 1) != 0 || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
@@ -11457,15 +11465,18 @@ static int ggml_cuda_try_fuse_ink_normq(ggml_backend_cuda_context * ctx, ggml_cg
     if (!ctx) {
         return last - i;
     }
-    if (!ggml_cuda_mul_mat_vec_q_group_pre(*ctx, mms, n, nullptr)) {
+    auto group = [&](const void * const * vy) {
+        return nr == 1 ? ggml_cuda_mul_mat_vec_q_group_pre(*ctx, mms, n, vy) : ggml_cuda_mul_mat_vec_q_group_nc_pre(*ctx, mms, n, vy);
+    };
+    if (!group(nullptr)) {
         return 0;
     }
     const int64_t ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
     const size_t  q8_row       = ncols_padded*sizeof(block_q8_1)/QK8_1;
-    ggml_cuda_pool_alloc<char> q8(ctx->pool(), q8_row*G);
+    ggml_cuda_pool_alloc<char> q8(ctx->pool(), q8_row*G*nr);
     void * q8p[INK_MULTI_MAX];
     for (int k = 0; k < G; ++k) {
-        q8p[k] = used[k] ? q8.get() + k*q8_row : nullptr;
+        q8p[k] = used[k] ? q8.get() + k*nr*q8_row : nullptr;
     }
     const void * vy[8];
     for (int k = 0; k < n; ++k) {
@@ -11474,7 +11485,7 @@ static int ggml_cuda_try_fuse_ink_normq(ggml_backend_cuda_context * ctx, ggml_cg
     if (!ggml_cuda_ink_rms_norm_mul_multi(*ctx, xs, gs, outs, q8p, eps, G)) {
         return 0;
     }
-    if (!ggml_cuda_mul_mat_vec_q_group_pre(*ctx, mms, n, vy)) {
+    if (!group(vy)) {
         GGML_ABORT("INKGLUE NORMQ: grouped MMVQ refused after the norm ran");
     }
     return last - i;

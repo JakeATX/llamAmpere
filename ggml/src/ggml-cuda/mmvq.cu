@@ -4096,16 +4096,17 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
     return mmvq_group_launch(ctx, dsts, n, vy);
 }
 
-// fork (INKGLUE MMGV): n (2..8) Q8_0 products of one f32 src1 with 5..8 columns (a verify batch) in one launch. Same q8_1
-// activation (and q8 cache entry) as ggml_cuda_mul_mat_vec_q, same body and launch shape per member. GGML_CUDA_INKGLUE_MMGV=0 = off
-bool ggml_cuda_mul_mat_vec_q_group_nc(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n) {
-    if (n < 2 || n > MMVQ_GROUP_MAX) {
+// fork (INKGLUE MMGV): n (1..8) Q8_0 products of f32 src1s with 5..8 columns (a verify batch) in one launch, each member on
+// the plain ncols_dst 5..8 body and launch shape (bit-identical). vy[k] = member k's q8_1 activation in
+// ggml_cuda_mul_mat_vec_q's layout (column stride ne10_padded/QK8_1 blocks); vy == nullptr = support check only.
+static bool mmvq_group_nc_launch(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, const void * const * vy) {
+    if (n < 1 || n > MMVQ_GROUP_MAX) {
         return false;
     }
-    const ggml_tensor * src1 = dsts[0]->src[1];
     constexpr ggml_type type = GGML_TYPE_Q8_0;
-    const int NC = (int) src1->ne[1];
-    if (NC < 5 || NC > 8 || src1->type != GGML_TYPE_F32 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(src1)) {
+    const int NC = (int) dsts[0]->src[1]->ne[1];
+    const int64_t ne10 = dsts[0]->src[1]->ne[0];
+    if (NC < 5 || NC > 8) {
         return false;
     }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
@@ -4114,24 +4115,81 @@ bool ggml_cuda_mul_mat_vec_q_group_nc(ggml_backend_cuda_context & ctx, ggml_tens
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || table_id != MMVQ_PARAMETERS_GENERIC) {
         return false;
     }
-    const int64_t ne10 = src1->ne[0];
     for (int k = 0; k < n; ++k) {
         const ggml_tensor * src0 = dsts[k]->src[0];
+        const ggml_tensor * src1 = dsts[k]->src[1];
         const ggml_tensor * dst  = dsts[k];
-        if (dst->src[1] != src1 || src0->type != type || src0->ne[0] != ne10 || src0->ne[1] > INT_MAX ||
+        if (src1->type != GGML_TYPE_F32 || src1->ne[0] != ne10 || src1->ne[1] != NC || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+                src0->type != type || src0->ne[0] != ne10 || src0->ne[1] > INT_MAX ||
                 src0->ne[2] != 1 || src0->ne[3] != 1 || !ggml_is_contiguous(src0) ||
                 dst->type != GGML_TYPE_F32 || dst->ne[0] != src0->ne[1] || dst->ne[1] != NC || !ggml_is_contiguous(dst) ||
                 ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE ||
                 (int64_t) ggml_cuda_mmvq_thin_max_rows() >= src0->ne[1]) {
-            return false; // the [#45] thin launch would take this member
+            return false; // (the last: the [#45] thin launch would take this member)
         }
     }
+    if (vy == nullptr) {
+        return true;
+    }
+    cudaStream_t stream = ctx.stream();
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    auto launch = [&](auto nc_tag) {
+        constexpr int c_nc = decltype(nc_tag)::value;
+        mmvq_group_args g{};
+        g.n = n;
+        uint32_t blk = 0;
+        dim3 block_dims;
+        for (int k = 0; k < n; ++k) {
+            const int nrows = (int) dsts[k]->src[0]->ne[1];
+            const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_nc, nrows, 1, 1, warp_size, table_id);
+            blk += dims.first.x;
+            block_dims   = dims.second;
+            g.vx[k]      = dsts[k]->src[0]->data;
+            g.vy[k]      = vy[k];
+            g.dst[k]     = (float *) dsts[k]->data;
+            g.blk_end[k] = blk;
+            g.nrows[k]   = (uint32_t) nrows;
+        }
+        const ggml_cuda_kernel_launch_params lp(dim3(blk, 1, 1), block_dims, 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_group_nc<type, c_nc>, lp, g, (uint32_t) ne10,
+            (uint32_t) (ne10 / ggml_blck_size(type)), (uint32_t) (ne10_padded / QK8_1), init_fastdiv_values(1));
+    };
+    switch (NC) {
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        default: launch(std::integral_constant<int, 8>{}); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
 
+bool ggml_cuda_mul_mat_vec_q_group_nc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, const void * const * vy) {
+    return mmvq_group_nc_launch(ctx, dsts, n, vy);
+}
+
+// GGML_CUDA_INKGLUE_MMGV=0 = off (checked by the caller). All members share one src1: one quantization, through the same
+// shared-quantize cache entry ggml_cuda_mul_mat_vec_q would use.
+bool ggml_cuda_mul_mat_vec_q_group_nc(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n) {
+    if (n < 2 || n > MMVQ_GROUP_MAX) {
+        return false;
+    }
+    const ggml_tensor * src1 = dsts[0]->src[1];
+    constexpr ggml_type type = GGML_TYPE_Q8_0;
+    for (int k = 0; k < n; ++k) {
+        if (dsts[k]->src[1] != src1) {
+            return false;
+        }
+    }
+    if (!ggml_is_contiguous(src1) || !mmvq_group_nc_launch(ctx, dsts, n, nullptr)) {
+        return false;
+    }
+    const int NC = (int) src1->ne[1];
+    const int64_t ne10 = src1->ne[0];
     cudaStream_t stream = ctx.stream();
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_bytes    = NC * ne10_padded * sizeof(block_q8_1)/QK8_1;
 
-    // same as ggml_cuda_mul_mat_vec_q: reuse or fill the shared-quantize cache
     auto & qc = ctx.q8_cache;
     const bool q8_cacheable = ggml_cuda_q8_cacheable(ctx, q8_bytes);
     ggml_backend_cuda_context::q8_cache_entry * qe =
@@ -4150,36 +4208,11 @@ bool ggml_cuda_mul_mat_vec_q_group_nc(ggml_backend_cuda_context & ctx, ggml_tens
         quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1, type, ne10, s11, s12, s13,
             ne10_padded, NC, 1, 1, stream);
     }
-
-    auto launch = [&](auto nc_tag) {
-        constexpr int c_nc = decltype(nc_tag)::value;
-        mmvq_group_args g{};
-        g.n = n;
-        uint32_t blk = 0;
-        dim3 block_dims;
-        for (int k = 0; k < n; ++k) {
-            const int nrows = (int) dsts[k]->src[0]->ne[1];
-            const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_nc, nrows, 1, 1, warp_size, table_id);
-            blk += dims.first.x;
-            block_dims   = dims.second;
-            g.vx[k]      = dsts[k]->src[0]->data;
-            g.vy[k]      = src1_q8_1;
-            g.dst[k]     = (float *) dsts[k]->data;
-            g.blk_end[k] = blk;
-            g.nrows[k]   = (uint32_t) nrows;
-        }
-        const ggml_cuda_kernel_launch_params lp(dim3(blk, 1, 1), block_dims, 0, stream);
-        ggml_cuda_kernel_launch(mul_mat_vec_q_group_nc<type, c_nc>, lp, g, (uint32_t) ne10,
-            (uint32_t) (ne10 / ggml_blck_size(type)), (uint32_t) (ne10_padded / QK8_1), init_fastdiv_values(1));
-    };
-    switch (NC) {
-        case 5: launch(std::integral_constant<int, 5>{}); break;
-        case 6: launch(std::integral_constant<int, 6>{}); break;
-        case 7: launch(std::integral_constant<int, 7>{}); break;
-        default: launch(std::integral_constant<int, 8>{}); break;
+    const void * vy[MMVQ_GROUP_MAX];
+    for (int k = 0; k < n; ++k) {
+        vy[k] = src1_q8_1;
     }
-    CUDA_CHECK(cudaGetLastError());
-    return true;
+    return mmvq_group_nc_launch(ctx, dsts, n, vy);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
