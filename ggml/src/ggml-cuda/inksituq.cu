@@ -67,6 +67,8 @@ bool ggml_cuda_ink_situq_launch(ggml_backend_cuda_context & ctx, const ggml_tens
         // never freed here: a captured graph may still replay kernels that point at the old buffer
         if (e.ptr != nullptr) {
             e.retired.push_back({ e.ptr, e.cap, e.dev });
+            e.ptr = nullptr;
+            e.cap = 0;
         }
         CUDA_CHECK(ggml_cuda_device_malloc((void **) &e.ptr, bytes, ctx.device));
         e.cap = bytes;

@@ -10701,7 +10701,7 @@ static bool ink_match_tanh_cap(ggml_tensor * t, const ggml_tensor ** x, ggml_ten
 // [INKSITUQ] the down MUL_MAT_ID that reads the SITU output `out` (node last) as src1: the next compute node after last (no-op
 // views between), the output's only use, AI+ experts with the H128 activation (K % 256 != 0: quantize_act128), decode-size
 // (<= 8 tokens). nullptr = none (the SITU kernel runs alone). GGML_CUDA_INKSITUQ=0 = off
-static const ggml_tensor * g_ink_situq_plan_down = nullptr;   // plan mode: the consumer the last SITU match would feed
+static thread_local const ggml_tensor * g_ink_situq_plan_down = nullptr;   // plan mode: the consumer the last SITU match would feed
 
 static const ggml_tensor * ink_situq_consumer(const ggml_cgraph * cgraph, int last, const ggml_tensor * out) {
     static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKSITUQ");
