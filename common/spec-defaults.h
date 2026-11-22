@@ -48,3 +48,7 @@ bool common_speculative_apply_model_default(common_params & params);
 
 // Apply after each drafter resolution; an explicit mb-MTP choice is kept.
 void common_speculative_apply_mtp_sampling_default(common_params & params);
+
+// INKSPEC2: with a DSpark drafter, mb on and no depth flags: adaptive depth 3..5 (n_max 5, n_min_adaptive 3), as the
+// MTP mb default; an explicit --spec-draft-n-min-adaptive also turns the adaptive depth on. Idempotent.
+void common_speculative_apply_dspark_default(common_params & params);

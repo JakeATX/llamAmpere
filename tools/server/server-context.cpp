@@ -159,21 +159,13 @@ static bool server_mb_ctrl_exact() {
 }
 
 // Top-K candidate download for CPU p/q verification (works with mb-MTP): the card sends the K best logits of each
-// verification row instead of the whole 248K-wide row. LLAMA_MTP_TOPK_VERIFY=0 turns it off.
+// verification row instead of the whole 248K-wide row. On by default; LLAMA_MTP_TOPK_VERIFY=0 turns it off.
+// [HOSTGAP08] K is the chain's top-k (20 in the presets), which the card's tiled / split top-k takes in one pass, so the
+// radix select (GGML_CUDA_TOPK_SELECT, which also changes other top-k ops of the process) is no longer switched on here.
 static bool server_mtp_topk_verify_enabled() {
     static const bool on = [] {
         const char * e = std::getenv("LLAMA_MTP_TOPK_VERIFY");
-        const bool enabled = e != nullptr && std::atoi(e) != 0;
-        if (enabled) {
-#ifdef _WIN32
-            if (std::getenv("GGML_CUDA_TOPK_SELECT") == nullptr) {
-                common_set_env("GGML_CUDA_TOPK_SELECT", "1");
-            }
-#else
-            setenv("GGML_CUDA_TOPK_SELECT", "1", 0); // radix select for the wide rows; the default is a full-row sort
-#endif
-        }
-        return enabled;
+        return e == nullptr || std::atoi(e) != 0; // [HOSTGAP08] default on
     }();
     return on;
 }
@@ -1660,8 +1652,8 @@ struct server_slot {
                 const auto & pq = common_sampler_get_pq_stats(smpl.get());
                 if (pq.n_pos > 0) {
                     SLT_INF(*this,
-                            "spec pq: n=%zu match=%zu extra=%zu rej=%zu mean_p_d=%.4f mean_summin=%.4f\n",
-                            pq.n_pos, pq.n_match, pq.n_extra, pq.n_rej, pq.sum_p_d / pq.n_pos, pq.sum_min / pq.n_pos);
+                            "spec pq: n=%zu match=%zu extra=%zu rej=%zu mb_kept=%zu mean_p_d=%.4f mean_summin=%.4f\n",
+                            pq.n_pos, pq.n_match, pq.n_extra, pq.n_rej, pq.n_lossy, pq.sum_p_d / pq.n_pos, pq.sum_min / pq.n_pos);
                 }
             }
         }
