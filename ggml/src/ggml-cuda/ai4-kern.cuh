@@ -1804,21 +1804,11 @@ static void launch_mmvr(const uint8_t * W, const int8_t * Xq, const float * Xs, 
 // Activations for H128 tensors (AI+ units with K % 256 != 0): rotate each 128 block by (1/sqrt(128)) H128 D (D = the first 128
 // sign bits), int8-quantize with one fp32 scale per (token, 128 K) at s[tok*(K/128) + block], bytes in the same fragment
 // order as rq4::quantize_act inside a 128 chunk. One half-warp per (token, 128 block); 4 warps = 8 blocks per CTA.
+// quantize_act128_regs: the rotate + quantize + store of quantize_act128_body for the 8 values v (elements cb*128 + l*8 + e of
+// row tok) a lane already holds; a producer kernel that computes those values may call it in place of the load (INKSITUQ).
 template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
-static __device__ __forceinline__ void quantize_act128_body(
-        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
-        int bx, int tok) {
-    const int lane = threadIdx.x & 31;
-    const int l    = lane & 15;
-    const int cb   = (bx*4 + (threadIdx.x >> 5))*2 + (lane >> 4);
-    const bool live = cb*128 < K && tok < N;   // the whole warp runs the shuffles; dead half-warps only skip I/O
-    float v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    if (live) {
-        const float * xr = x + (int64_t) tok*sx + cb*128 + l*8;
-        const float4 u0 = *(const float4 *) xr;
-        const float4 u1 = *(const float4 *) (xr + 4);
-        v[0] = u0.x; v[1] = u0.y; v[2] = u0.z; v[3] = u0.w; v[4] = u1.x; v[5] = u1.y; v[6] = u1.z; v[7] = u1.w;
-    }
+static __device__ __forceinline__ void quantize_act128_regs(float (&v)[8], const bool live, const int l, const int cb,
+        int8_t * __restrict__ q, float * __restrict__ s, int K, int tok) {
     const uint32_t sw = rq4::d_sign_bits[l >> 2] >> ((l & 3)*8);
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
@@ -1884,6 +1874,24 @@ static __device__ __forceinline__ void quantize_act128_body(
     if (l == 0) {
         s[(int64_t) tok*(K/128) + cb] = d;
     }
+}
+
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
+static __device__ __forceinline__ void quantize_act128_body(
+        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
+        int bx, int tok) {
+    const int lane = threadIdx.x & 31;
+    const int l    = lane & 15;
+    const int cb   = (bx*4 + (threadIdx.x >> 5))*2 + (lane >> 4);
+    const bool live = cb*128 < K && tok < N;   // the whole warp runs the shuffles; dead half-warps only skip I/O
+    float v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    if (live) {
+        const float * xr = x + (int64_t) tok*sx + cb*128 + l*8;
+        const float4 u0 = *(const float4 *) xr;
+        const float4 u1 = *(const float4 *) (xr + 4);
+        v[0] = u0.x; v[1] = u0.y; v[2] = u0.z; v[3] = u0.w; v[4] = u1.x; v[5] = u1.y; v[6] = u1.z; v[7] = u1.w;
+    }
+    quantize_act128_regs<SWAP8, XPERM, LINEAR>(v, live, l, cb, q, s, K, tok);
 }
 
 template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>

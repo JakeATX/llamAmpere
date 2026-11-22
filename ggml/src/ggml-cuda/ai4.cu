@@ -1,5 +1,6 @@
 // AI+ unit types (AITk_U) CUDA backend entry: reference and fast-path matmul dispatch.
 #include "ai4-mm.cuh"
+#include "inksituq.cuh"
 #include "ai4.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
@@ -1717,9 +1718,19 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool direct_zero = direct && verify_compact && !y_into;
     const bool fused = direct && fused_x && n_tok == 1;
     const int xsh = K % 256 == 0 ? 1 : 0;
-    ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) n_rows*K);
-    ggml_cuda_pool_alloc<float>  s(ctx.pool(), (size_t) n_rows*(K >> (7 + xsh)));
-    if (!fused) ai4_quantize_x((const float *) src1->data, n_rows, K, xsh, q.get(), s.get(), stream);
+    // [INKSITUQ] the SITU producer already wrote this activation in quantize_act128's layout (one-shot, inksituq.cu)
+    const int8_t * pre_q = nullptr;
+    const float  * pre_s = nullptr;
+    const bool pre = !fused && xsh == 0 && ggml_cuda_ink_situq_take(ctx, dst, n_rows, K, &pre_q, &pre_s);
+    ggml_cuda_pool_alloc<int8_t> q_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float>  s_buf(ctx.pool());
+    if (!pre) {
+        q_buf.alloc((size_t) n_rows*K);
+        s_buf.alloc((size_t) n_rows*(K >> (7 + xsh)));
+        if (!fused) ai4_quantize_x((const float *) src1->data, n_rows, K, xsh, q_buf.get(), s_buf.get(), stream);
+    }
+    const int8_t * const xq = pre ? pre_q : q_buf.get();
+    const float  * const xs = pre ? pre_s : s_buf.get();
 
     // mmv-ID (n_tok <= 8) takes tiles of MMV_ID_BN pairs, so an expert repeated within a token still fits
     int bn = ai4_mmvid_route(n_tok, n_used, n_expert, ggml_ai4_rate(src0->type)) ? ai4k::MMV_ID_BN : (n_tok >= ai4_bn128_min() ? 128 : 64);
@@ -1789,8 +1800,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     switch (ai4_lay_of(src0->type)) {
 #define AI4_MMID_U(L) \
         case L: \
-            if (xsh) { ai4_mm_id_kernels<L, 1>(W, q.get(), s.get(), Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
-            else     { ai4_mm_id_kernels<L, 0>(W, q.get(), s.get(), Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
+            if (xsh) { ai4_mm_id_kernels<L, 1>(W, xq, xs, Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
+            else     { ai4_mm_id_kernels<L, 0>(W, xq, xs, Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
             break;
         AI4_MMID_U(ai4k::LAY_AIT2_U)
         AI4_MMID_U(ai4k::LAY_AIT2P_U)
