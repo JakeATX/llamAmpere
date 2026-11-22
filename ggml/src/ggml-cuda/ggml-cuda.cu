@@ -11222,17 +11222,25 @@ static int ggml_cuda_try_fuse_ink_mix_norm(ggml_backend_cuda_context * ctx, ggml
 // MMVQ launch (bit-identical; the model orders the products sharing an input next to each other).
 // GGML_CUDA_INKGLUE_MMG=0 = off
 static int ggml_cuda_try_fuse_ink_mmgroup(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
-    static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_MMG");
-    if (!on || cgraph->nodes[i]->op != GGML_OP_MUL_MAT || i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT) {
+    // [MMGV] (INKGLUE) the same at verify widths: a src1 of 5..8 columns, grouped by ggml_cuda_mul_mat_vec_q_group_nc.
+    // GGML_CUDA_INKGLUE_MMGV=0 = off
+    static const bool on   = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_MMG");
+    static const bool on_v = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_MMGV");
+    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT || i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT) {
         return 0;
     }
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const ggml_tensor * src1 = cgraph->nodes[i]->src[1];
+    const int64_t nc = src1->ne[1];
+    if (!(nc == 1 ? on : (on_v && nc >= 5 && nc <= 8))) {
+        return 0;
+    }
     auto ok = [&](const ggml_tensor * mm) {
         const ggml_tensor * w = mm->src[0];
         return mm->op == GGML_OP_MUL_MAT && mm->src[1] == src1 && w->type == GGML_TYPE_Q8_0 && mm->type == GGML_TYPE_F32 &&
-            src1->type == GGML_TYPE_F32 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) &&
+            src1->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) &&
+            mm->ne[1] == nc && mm->ne[2] == 1 && mm->ne[3] == 1 &&
             w->ne[0] == src1->ne[0] && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && ggml_is_contiguous(mm) &&
             w->ne[1] <= INT_MAX && w->buffer &&
             ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
@@ -11266,7 +11274,8 @@ static int ggml_cuda_try_fuse_ink_mmgroup(ggml_backend_cuda_context * ctx, ggml_
                 }
             }
         }
-        if (!ggml_cuda_mul_mat_vec_q_group(*ctx, cgraph->nodes + i, n)) {
+        if (!(nc == 1 ? ggml_cuda_mul_mat_vec_q_group(*ctx, cgraph->nodes + i, n)
+                      : ggml_cuda_mul_mat_vec_q_group_nc(*ctx, cgraph->nodes + i, n))) {
             return 0;
         }
     }
