@@ -11344,7 +11344,7 @@ static int ggml_cuda_try_fuse_ink_lgmulti(ggml_backend_cuda_context * ctx, ggml_
     return last - i;
 }
 
-// [NORMQ] (RMS_NORM -> MUL(gamma)) x G (1..4: one f32 row each, same width, no-op views between), then MUL_MAT x n (1..8,
+// [NORMQ] (RMS_NORM -> MUL(gamma)) x G (1..4: one f32 row each, or 5..8 rows each with NORMQV, same width, no-op views between), then MUL_MAT x n (1..8,
 // Q8_0, plain MMVQ route, each reading one of the MUL outputs) -> one norm kernel (rms_norm_f32's scalar arithmetic and
 // block size; writes the f32 rows and, for rows a product reads, their q8_1 exactly as quantize_q8_1) + one grouped MMVQ
 // (mul_mat_vec_q's body per product). Bit-identical. GGML_CUDA_INKGLUE_NORMQ=0 = off
