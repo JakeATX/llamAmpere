@@ -12,6 +12,7 @@
 // Precision: f16 Q (pre-scaled), f16 K/V, f32 scores and accumulators, f16 P, like the MMA FA kernel.
 
 #include "inkattn.cuh"
+#include "inkattn-fast.cuh"
 
 #include <cstdlib>
 #include <cstdint>
@@ -660,6 +661,16 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool inkrel = ggml_flash_attn_ext_is_inkrel(dst);
     float scale;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    if (ggml_cuda_inkattn_fast_enabled()) {
+        const ggml_tensor * tab  = inkrel ? ggml_flash_attn_ext_inkrel_table(dst) : nullptr;
+        const ggml_tensor * rp   = inkrel ? ggml_flash_attn_ext_inkrel_pos(dst)   : nullptr;
+        const ggml_tensor * gate = inkrel ? ggml_flash_attn_ext_inkrel_gate(dst)  : nullptr;
+        ggml_cuda_inkattn_fast_launch(ctx, Q, K, V, mask, snk, dst, lse, tab, rp, gate,
+                scale, inkrel, K->type == GGML_TYPE_Q8_0);
+        return true;
+    }
+
     const int T    = (int) Q->ne[1];
     const int H    = (int) Q->ne[2];
     const int Hkv  = (int) K->ne[2];

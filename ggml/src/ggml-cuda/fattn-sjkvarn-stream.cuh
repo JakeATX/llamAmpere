@@ -47,6 +47,7 @@
 #include "mma.cuh"
 #include "fattn-sjkvarn-rot.cuh"
 #include "ggml-inksj.h" // GGML_INKSJ_DESC_FLAGS, GGML_INKSJ_FAR_END_SHIFT (INKKV far visible end)
+#include "fattn-sjkvarn-fast.cuh"
 
 #include <atomic>
 #include <cfloat>
@@ -1757,6 +1758,11 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
         }
     }
     GGML_ASSERT(turbo4_body || rot || !ggml_cuda_fattn_sj_kvarn_rot(dst));
+    if constexpr (!turbo4_body) {
+        if (ggml_cuda_fattn_sj_kvarn_fast_try(ctx, dst, rot)) {
+            return;
+        }
+    }
     static const int nstage_env = getenv("GGML_SJKVARN_DIRECT_NSTAGE") != nullptr ? atoi(getenv("GGML_SJKVARN_DIRECT_NSTAGE")) : 0;
     static const bool kw8 = getenv("GGML_SJKVARN_DIRECT_KW8") != nullptr;
     static const bool stable = getenv("GGML_SJKVARN_DIRECT_STABLE") != nullptr && atoi(getenv("GGML_SJKVARN_DIRECT_STABLE")) != 0;
