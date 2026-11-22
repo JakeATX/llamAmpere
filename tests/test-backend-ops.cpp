@@ -18479,6 +18479,19 @@ static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, b
     }
     cases.emplace_back(new test_flash_attn_ext_inkrel(16, 4, 1536, 4, 129, true));
     cases.emplace_back(new test_flash_attn_ext_inkrel(8, 8, 300, 1, 17, true));
+    // INKPREFILL inkfa: prefill widths (g*T > 16), partial row blocks / key tiles, the 8-warp blocks (T >= 128)
+    for (int64_t kv : {48, 113, 1536, 3072}) {
+        for (int64_t T : {6, 17, 64, 200}) {
+            if (T > kv) {
+                continue; // rows that see no key
+            }
+            for (bool gt : {false, true}) {
+                cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, kv, T, 1025, gt));
+            }
+        }
+    }
+    cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, 3072, 512, 1025, true));
+    cases.emplace_back(new test_flash_attn_ext_inkrel(16, 4, 1000, 300, 129, false));
     // several sequences (mask ne[3] = S), other group sizes (g 1 / 4 / 8)
     for (int64_t kv : {113, 1536}) {
         for (int64_t nb : {1, 4}) {

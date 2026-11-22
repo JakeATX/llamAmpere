@@ -9493,6 +9493,17 @@ static int64_t llama_inkattn_min_kv() {
     return v;
 }
 
+// INKPREFILL (ggml-cuda/inkfa.cu): SWA prefill ubatches also take the INKREL node (wider than INKATTN's decode widths), so
+// the [n_kv, T, n_head] mask is not built. Off with LLAMA_INKFA=0 or GGML_CUDA_INKFA=0 (the dense prefill path then).
+static bool llama_inkfa_prefill_on() {
+    static const bool on = [] {
+        const char * a = getenv("LLAMA_INKFA");
+        const char * b = getenv("GGML_CUDA_INKFA");
+        return !(a && *a && atoi(a) == 0) && !(b && *b && atoi(b) == 0);
+    }();
+    return on;
+}
+
 ggml_tensor * llm_graph_context::build_attn_rel_base(
         llm_graph_input_mem_hybrid_iswa_rel * inp,
         ggml_tensor * q_cur,
@@ -9548,8 +9559,8 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
         if (am.rows == nullptr && raw->type == GGML_TYPE_F16 && raw->ne[2] == 1 && raw->ne[3] == 1 &&
                 kv->type == GGML_TYPE_F16 && vv->type == GGML_TYPE_F16 && kv->ne[3] == 1 && vv->nb[1] < vv->nb[2] &&
                 kv->ne[0] == 128 && vv->ne[0] == 128 && q_cur->ne[0] == 128 && n_head % n_head_kv == 0 &&
-                (n_head/n_head_kv)*n_tok <= 16 && rel_pos->ne[0] == kv->ne[2] && rel_pos->ne[1] == n_tok &&
-                kv->ne[2] >= llama_inkattn_min_kv() &&
+                (((n_head/n_head_kv)*n_tok <= 16 && kv->ne[2] >= llama_inkattn_min_kv()) || (is_swa && llama_inkfa_prefill_on())) &&
+                rel_pos->ne[0] == kv->ne[2] && rel_pos->ne[1] == n_tok &&
                 !rot && !mctx_l->get_k_scale(il) && !mctx_l->get_v_scale(il) &&
                 hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
                 sinks && sinks->type == GGML_TYPE_F32 && (!gate || gate->type == GGML_TYPE_F32)) {

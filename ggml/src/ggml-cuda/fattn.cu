@@ -12,6 +12,7 @@
 #include "convert.cuh"
 #include "kv-stream-span-tuner.h"
 #include "inkattn.cuh"
+#include "inkfa.cuh"
 
 #include <algorithm>
 #include <cstdlib>
@@ -4952,6 +4953,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
     // fork (INKATTN): relative bias table + gate inside the node (ggml-inkrel.h): no other route reads them
     if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        if (ggml_cuda_inkfa_try(ctx, dst)) { // [INKPREFILL] prefill widths (inkfa.cu, GGML_CUDA_INKFA=0 off)
+            return;
+        }
         GGML_ASSERT(ggml_cuda_inkattn_try(ctx, dst) && "INKREL flash attention node refused by INKATTN");
         return;
     }
@@ -5079,7 +5083,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (ggml_flash_attn_ext_is_inkrel(dst)) {
-        return ggml_cuda_inkattn_supported(device, dst);
+        return ggml_cuda_inkfa_supported(device, dst) || ggml_cuda_inkattn_supported(device, dst); // [INKPREFILL] inkfa.cu
     }
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         // kv_rows (src[9]): generic MMA f16 route only (see ggml_cuda_flash_attn_ext)
