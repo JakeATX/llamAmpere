@@ -239,8 +239,9 @@ struct common_speculative_copy_first_index {
     std::unordered_map<llama_token, int32_t> head; // newest position of each token
     std::vector<int32_t> prev;                       // previous position with the same token (-1 = none)
     int32_t n = 0;                                   // indexed prefix length
+    int32_t n_hist_last = 0;                         // history length at the last lookup (a drop = context shift)
 
-    void clear() { head.clear(); prev.clear(); n = 0; }
+    void clear() { head.clear(); prev.clear(); n = 0; n_hist_last = 0; }
 
     // extend to hist[0, n_src); a shorter source than indexed (context shift) rebuilds
     void update(const llama_token * hist, int32_t n_src) {
@@ -257,11 +258,16 @@ struct common_speculative_copy_first_index {
     }
 
     // most recent p < n with hist[p] == id_last and hist[p - i] == hist[n_hist - i] for i < len_min; next = p + 1
-    common_speculative_copy_match find(const llama_token * hist, int32_t n_hist, llama_token id_last, int32_t len_min) const {
+    // (positions below stop are not searched, as the scan's scan_max)
+    common_speculative_copy_match find(const llama_token * hist, int32_t n_hist, llama_token id_last, int32_t len_min,
+            int32_t stop = 0) const {
         common_speculative_copy_match m;
         auto it = head.find(id_last);
         for (int32_t p = it == head.end() ? -1 : it->second; p >= 0; p = prev[p]) {
-            if (p >= n_hist) {
+            if (p < stop) {
+                break; // the chain is newest first
+            }
+            if (p >= n_hist || hist[p] != id_last) {
                 continue;
             }
             int32_t len = 1;
@@ -287,8 +293,12 @@ inline std::vector<llama_token> common_speculative_copy_first_propose(
     }
     common_speculative_copy_match m;
     if (index != nullptr && !cp.first_src_all && n_src >= 0) {
+        if (n < index->n_hist_last) {
+            index->clear(); // the history shrank (context shift): the indexed prefix may have moved
+        }
+        index->n_hist_last = n;
         index->update(hist, std::min(n, n_src));
-        m = index->find(hist, n, id_last, cp.first_min);
+        m = index->find(hist, n, id_last, cp.first_min, cp.scan_max > 0 ? std::max(0, n - cp.scan_max) : 0);
     } else {
         common_speculative_copy_params fp = cp;
         fp.long_min  = cp.first_min;
