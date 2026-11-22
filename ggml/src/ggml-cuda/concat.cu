@@ -281,6 +281,18 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;
 
+        // fork INKPF3: dim 0/1 with fully contiguous inputs: fold ne[3] into the plane count, one launch instead of one
+        // per i3 (Inkling's 4/4 D128 Q pack [256, 2g, P, T] launched T kernels per full-attention visit). The flat kernel
+        // indexes planes only, so this is the same copy. GGML_CUDA_CONCAT_FOLD=0 = the per-i3 loop.
+        static const bool fold = [] { const char * e = getenv("GGML_CUDA_CONCAT_FOLD"); return !e || atoi(e) != 0; }();
+        if (fold && dim < 2 && dst->ne[3] > 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                dst->ne[0]*dst->ne[1]*dst->ne[2]*dst->ne[3] <= (int64_t) INT_MAX) {
+            concat_cont_cuda(src0_d, src1_d, dst_d,
+                    ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2]*src0->ne[3],
+                    ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2]*dst->ne[3], dim, stream);
+            return;
+        }
+
         for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
             concat_cont_cuda(
                     src0_d + i3*(src0->nb[3] / sizeof(T)),
