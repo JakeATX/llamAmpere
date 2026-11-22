@@ -17,11 +17,14 @@ static __device__ __forceinline__ void depth_mix_load(float (&a)[W], const float
 // scores its chunk against the nq queries (plus the sum of squares, used for cur's rms norm) and the chunk partials are
 // summed per row. Then the softmax over the rows and the weighted sum of the rows; the normed cur row is never written.
 // W = 4: float4 loads (rows 16-byte aligned, n % 4 == 0).
-template <int NQ, int W>
+// [INKGLUE] NORM (NQ == 1): then the rms norm of the mixed row times nw into ndst, with rms_norm_f32<1024>'s scalar sum
+// (col = tid, += 1024), block_reduce and expressions (bit-identical to the RMS_NORM + MUL nodes it replaces)
+template <int NQ, int W, bool NORM = false>
 static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         const char * __restrict__ stack, const int64_t s_nb1, const int64_t s_nb2, const int k,
         const char * __restrict__ cur, const int64_t c_nb1, const char * __restrict__ query, const int64_t q_nb1,
-        float * __restrict__ dst, const int n, const int nq_all, const float eps, const float scale) {
+        float * dst, const int n, const int nq_all, const float eps, const float scale,
+        const float * __restrict__ nw = nullptr, float * __restrict__ ndst = nullptr, const float neps = 0.0f) {
     __shared__ float part[DEPTH_MIX_MAX_ROWS*(NQ + 1)];
     __shared__ float p[DEPTH_MIX_MAX_ROWS*NQ];
     __shared__ float s_r;
@@ -154,6 +157,23 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
             }
         }
     }
+    if constexpr (NORM) {
+        static_assert(NQ == 1, "mix norm: one query");
+        __shared__ float s_red[32];
+        __syncthreads(); // the block's global writes of out are visible to the block after this
+        float tmp = 0.0f;
+        for (int col = threadIdx.x; col < n; col += DEPTH_MIX_THREADS) {
+            const float xi = out[col];
+            tmp += xi * xi;
+        }
+        tmp = block_reduce<block_reduce_method::SUM, DEPTH_MIX_THREADS>(tmp, s_red);
+        const float mean = tmp / n;
+        const float sc   = rsqrtf(mean + neps);
+        float * nd = ndst + (int64_t) t*n;
+        for (int col = threadIdx.x; col < n; col += DEPTH_MIX_THREADS) {
+            nd[col] = sc * out[col] * nw[col];
+        }
+    }
 }
 
 bool ggml_cuda_depth_mix_supported(const ggml_tensor * op) {
@@ -201,4 +221,38 @@ void ggml_cuda_depth_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #undef DEPTH_MIX_LAUNCH
     CUDA_CHECK(cudaGetLastError());
+}
+
+// [INKGLUE] depth mix (one query) + RMS_NORM(eps) + MUL(w) of the mixed rows into ndst; false: not this shape
+bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * w, ggml_tensor * ndst, float neps) {
+    if (!ggml_cuda_depth_mix_supported(dst) || dst->src[1]->ne[1] != 1) {
+        return false;
+    }
+    const ggml_tensor * cur   = dst->src[0];
+    const ggml_tensor * query = dst->src[1];
+    const ggml_tensor * stack = dst->src[2];
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+    const int     n  = (int) cur->ne[0];
+    const int64_t T  = cur->ne[1];
+    const int     k  = stack ? (int) stack->ne[1] : 0;
+    const char *  sd = stack ? (const char *) stack->data : nullptr;
+    const int64_t s1 = stack ? stack->nb[1] : 0;
+    const int64_t s2 = stack ? stack->nb[2] : 0;
+    if (T == 0) {
+        return true;
+    }
+    cudaStream_t stream = ctx.stream();
+    const bool vec = n % 4 == 0 && (s1 | s2 | cur->nb[1] | query->nb[1]) % 16 == 0 &&
+        ((uintptr_t) sd | (uintptr_t) cur->data | (uintptr_t) query->data | (uintptr_t) dst->data) % 16 == 0;
+    const dim3 grid((unsigned) T, 1);
+    if (vec) {
+        k_depth_mix<1, 4, true><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
+            (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps);
+    } else {
+        k_depth_mix<1, 1, true><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
+            (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }

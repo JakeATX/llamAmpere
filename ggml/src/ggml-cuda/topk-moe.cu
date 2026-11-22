@@ -10,6 +10,7 @@ struct topk_moe_config {
     bool use_sigmoid;
     bool use_sqrt_softplus;
     bool with_norm;
+    bool norm_eps;   // INKGLUE: w / (1*sum + eps), sum in reduce_rows order (bit-identical to SUM_ROWS -> SCALE -> DIV)
     bool delayed_softmax;
     int  n_groups;
     int  n_group_used;
@@ -317,7 +318,21 @@ __global__ void topk_moe_cuda(const float *         logits,
         }
     }
 
-    if (config.with_norm) {
+    if (config.norm_eps) {
+        // INKGLUE: weight k sits in lane k % 32 (slot k / 32): for n_expert_used <= 32 the warp butterfly adds the
+        // weights in the same order as reduce_rows_f32 does with one column per thread, and the epilogue repeats the
+        // SCALE (1*sum + eps) and DIV kernels' arithmetic, so the weights match the unfused nodes bit for bit
+        float s = 0.0f;
+#pragma unroll
+        for (int i = 0; i < experts_per_thread; i++) {
+            s += output_weights[i];
+        }
+        s = warp_reduce_sum(s);
+        s = 1.0f * s + clamp_val;
+        for (int i = 0; i < experts_per_thread; i++) {
+            output_weights[i] = output_weights[i] / s;
+        }
+    } else if (config.with_norm) {
         wt_sum              = warp_reduce_sum(wt_sum);
         wt_sum              = max(wt_sum, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
@@ -449,16 +464,18 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     const int n_expert_used = weights->ne[1];
 
     const bool with_norm = clamp != nullptr;
+    const bool norm_eps  = clamp != nullptr && clamp->op == GGML_OP_SCALE;
 
     float clamp_val = -INFINITY;
     if (clamp) {
-        clamp_val = ggml_get_op_params_f32(clamp, 0);
+        clamp_val = ggml_get_op_params_f32(clamp, norm_eps ? 1 : 0); // SCALE: its bias (eps)
     }
 
     topk_moe_config config;
     config.use_sigmoid       = args.sigmoid;
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
+    config.norm_eps          = norm_eps;
     config.delayed_softmax   = args.delayed_softmax;
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;

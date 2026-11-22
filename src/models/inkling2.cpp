@@ -360,10 +360,20 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         }
     }
 
+    // fork (INKGLUE): at decode the Q, K and V gates, then the three input norms, are put back to back so the CUDA backend
+    // runs each set in one launch (same values). LLAMA_INKLING2_MM_ORDER=0 = old node order
+    static const bool in_order = [] { const char * e = getenv("LLAMA_INKLING2_MM_ORDER"); return !e || atoi(e) != 0; }();
+    const bool group_inputs = in_order && n_tokens == 1;
+
     if (messages) {
         // the messages make the Q, K and V inputs of a SWA layer differ
         for (int j = 0; j < 3; ++j) {
             inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
+        }
+        if (group_inputs) {
+            for (int j = 0; j < 3; ++j) {
+                ggml_build_forward_expand(gf, inputs[j]);
+            }
         }
     }
 
@@ -379,15 +389,39 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         inputs[1] = build_norm(inputs[1], layer.attn_k_inp_norm, nullptr, LLM_NORM_RMS, il);
         inputs[2] = build_norm(inputs[2], layer.attn_v_inp_norm, nullptr, LLM_NORM_RMS, il);
     }
+    if (group_inputs) {
+        for (int j = 0; j < 3; ++j) {
+            ggml_build_forward_expand(gf, inputs[j]);
+        }
+    }
 
     // self-attention
     {
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
-                is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
-        ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+        // fork (INKGLUE): the projections that read the same input are made first and back to back, so the CUDA backend
+        // runs each such set as one grouped matvec (same products and values). LLAMA_INKLING2_MM_ORDER=0 = old node order
+        static const bool mm_order = [] { const char * e = getenv("LLAMA_INKLING2_MM_ORDER"); return !e || atoi(e) != 0; }();
+        ggml_tensor * q_mm  = build_lora_mm(layer.wq, inputs[0]);
+        ggml_tensor * r_mm  = build_lora_mm(layer.attn_rel, inputs[0]);
+        ggml_tensor * s_mm  = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        ggml_tensor * g_mm  = build_lora_mm(layer.wqkv_gate, inputs[0]);
+        ggml_tensor * k_mm  = build_lora_mm(layer.wk, inputs[1]);
+        ggml_tensor * kp_mm = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
+        ggml_tensor * v_mm  = build_lora_mm(layer.wv, inputs[2]);
+        ggml_tensor * vp_mm = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+        if (mm_order && n_tokens == 1) {
+            for (ggml_tensor * t : { q_mm, r_mm, s_mm, g_mm, k_mm, kp_mm, v_mm, vp_mm }) {
+                if (t) {
+                    ggml_build_forward_expand(gf, t);
+                }
+            }
+        }
+
+        ggml_tensor * Qcur = q_mm;
+        ggml_tensor * Kconv = convolve(k_mm, layer.attn_k_conv, kp_mm, state, history, recr, 0);
+        ggml_tensor * Vconv = convolve(v_mm, layer.attn_v_conv, vp_mm, state, history, recr, n_embd_k_gqa);
+        ggml_tensor * Kcur = Kconv;
+        ggml_tensor * Vcur = Vconv;
+        ggml_tensor * Rcur = r_mm;
 
         Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
         Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
@@ -399,27 +433,53 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             Rcur = ggml_mul(ctx0, Rcur, tau);
         }
 
+        // fork (INKGLUE): at decode the k / v convs first, then the q, k, v and r per-head steps back to back, so the CUDA
+        // backend runs the per-head steps (and the k / v cache stores) as one launch; same ops. LLAMA_INKLING2_MM_ORDER=0 = off
+        if (group_inputs) {
+            for (ggml_tensor * t : { Kconv, Vconv, Qcur, Kcur, Vcur, Rcur }) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+        ggml_tensor * sinks = s_mm;
         cb(sinks, "attn_sinks", il);
+
+        // fork (INKGLUE): r and the sink logits first, so the bias chain below (pad, table, sub, permute, gather, permute,
+        // mask add, cast) is one contiguous run of graph nodes that the CUDA backend can launch as one kernel; same ops.
+        // LLAMA_INKLING2_REL_ORDER=0 = old node order
+        static const bool rel_order = [] { const char * e = getenv("LLAMA_INKLING2_REL_ORDER"); return !e || atoi(e) != 0; }();
+        ggml_tensor * sinks_3d = ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens);
+        if (rel_order) {
+            ggml_build_forward_expand(gf, Rcur);
+            ggml_build_forward_expand(gf, sinks_3d);
+        }
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+        table = ggml_sub(ctx0, table, sinks_3d);
         table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3)); // [n_head, extent + 1, n_tokens]
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        // fork (INKGLUE): one zero-sink fill per graph instead of one per visit (same values). LLAMA_INKLING2_SINK_ONCE=0 = old
+        static const bool sink_once = [] { const char * e = getenv("LLAMA_INKLING2_SINK_ONCE"); return !e || atoi(e) != 0; }();
+        if (!sink_once) {
+            sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        } else {
+            if (!zero_sinks || zero_sinks->ne[0] != n_head) {
+                zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+            }
+            sinks = zero_sinks;
+        }
 
         // gathers the bias by distance (dense) or attends over the INKLSA compact set (full-attention visits)
-        // the output gate: out * sigmoid(gate), inside the attention when INKATTN takes the visit
-        cur = build_attn_rel(inp, Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il,
-                build_lora_mm(layer.wqkv_gate, inputs[0]));
+        // the output gate: out * sigmoid(gate), inside the attention when INKATTN takes the visit (g_mm is made early, INKGLUE order)
+        cur = build_attn_rel(inp, Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il, g_mm);
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
         cb(cur, "attn_out", il);
     }
@@ -464,6 +524,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     cur = ggml_add(ctx0, ffn_inp, cur);
     cb(cur, "l_out", il);
+
+    // fork (INKGLUE): at decode the FFN tail (weighted sum, conv, residual) is made before the next layer's state reads,
+    // so it is one contiguous run that the CUDA backend can launch as one kernel; same ops. LLAMA_INKLING2_MM_ORDER=0 = off
+    if (group_inputs) {
+        ggml_build_forward_expand(gf, cur);
+    }
 
     return cur;
 }
