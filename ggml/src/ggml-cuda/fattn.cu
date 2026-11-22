@@ -4980,6 +4980,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_lsa_page_prepare(ctx, dst); // LLAMA_LSA_RESIDENT record pages only (no-op otherwise)
             ggml_cuda_fattn_sj_kvarn_q5g6_refuse(dst, "the low-bit kernels");
             ggml_cuda_flash_attn_sj_kvarn_lowbits(ctx,dst);
+            ggml_cuda_lsa_page_ahead(ctx, dst); // GGML_CUDA_LSA_STAGE_AHEAD (no-op unless record pages + stage)
             return;
         }
         if (ggml_cuda_fattn_sj_kvarn_q5g6_set() && !ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(dst)) {

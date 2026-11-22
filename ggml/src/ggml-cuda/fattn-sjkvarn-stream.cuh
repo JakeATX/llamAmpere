@@ -1526,6 +1526,45 @@ static int ggml_cuda_fattn_sj_kvarn_compact_mode() {
     return mode;
 }
 
+// CTA/SM of the compact kernel that really launches (rot build included), as launch_fattn measures it for the mode-2 split
+template <int W, int NSTAGE, bool turbo4_body, bool rot>
+static int ggml_cuda_fattn_sj_kvarn_compact_ctas() {
+    int blocks = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,
+        ggml_cuda_fattn_sj_kvarn_stream_kernel<W, NSTAGE, turbo4_body, rot, false, sj_kvarn_tile::compact>(), WARP_SIZE*W,
+        ggml_cuda_fattn_sj_kvarn_stream_shared(W, 1, NSTAGE, turbo4_body)));
+    return blocks;
+}
+
+template <int W, bool turbo4_body, bool rot>
+static int ggml_cuda_fattn_sj_kvarn_compact_nstage_w() {
+    const int pick = ggml_cuda_fattn_sj_kvarn_stream_nstage<W, turbo4_body, rot, sj_kvarn_tile::compact>(W, 1, 0);
+    const int ctas_pick = pick >= 6 ? ggml_cuda_fattn_sj_kvarn_compact_ctas<W, 6, turbo4_body, rot>()
+                        : pick >= 4 ? ggml_cuda_fattn_sj_kvarn_compact_ctas<W, 4, turbo4_body, rot>()
+                                    : ggml_cuda_fattn_sj_kvarn_compact_ctas<W, 2, turbo4_body, rot>();
+    // same CTA/SM -> same mode-2 split, so the results do not change
+    return ggml_cuda_fattn_sj_kvarn_compact_ctas<W, 2, turbo4_body, rot>() == ctas_pick ? 2 : 0;
+}
+
+// [DSPINE3 B1] compact tile ring depth: 2 strips (fakeep99, 3090: widths 4/6/7/8 FA -1.2/-2.2/-2.1/-1.4%) when that keeps the CTA/SM count, else the occupancy pick (0). GGML_SJKVARN_COMPACT_NST2=0 = kill switch.
+template <bool turbo4_body, bool rot>
+static int ggml_cuda_fattn_sj_kvarn_compact_nstage(const int W) {
+    static const bool on = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT_NST2") != 0;
+    if (!on) {
+        return 0;
+    }
+    static int cached[GGML_CUDA_MAX_DEVICES][7] = {}; // 0 = not set yet, else nstage + 1
+    int & c = cached[ggml_cuda_get_device()][W];
+    if (c == 0) {
+        const int nst = W == 3 ? ggml_cuda_fattn_sj_kvarn_compact_nstage_w<3, turbo4_body, rot>()
+                      : W == 4 ? ggml_cuda_fattn_sj_kvarn_compact_nstage_w<4, turbo4_body, rot>()
+                      : W == 5 ? ggml_cuda_fattn_sj_kvarn_compact_nstage_w<5, turbo4_body, rot>()
+                               : ggml_cuda_fattn_sj_kvarn_compact_nstage_w<6, turbo4_body, rot>();
+        c = nst + 1;
+    }
+    return c - 1;
+}
+
 // mode for a width-4/6/7/8 node: 0 when the shape is not covered (one warning per process when a switch is set)
 static int ggml_cuda_fattn_sj_kvarn_compact_mode_for(const ggml_tensor * dst, const bool kw8) {
     const int mode = ggml_cuda_fattn_sj_kvarn_compact_mode();
@@ -1599,11 +1638,13 @@ static void ggml_cuda_fattn_sj_kvarn_stream_compact(ggml_backend_cuda_context & 
                 __func__, n_q, W, mode, ref_mw, parallel_blocks);
         }
     }
+    // an explicit GGML_SJKVARN_DIRECT_NSTAGE wins over the [DSPINE3 B1] depth
+    const int nst = nstage_env != 0 ? nstage_env : ggml_cuda_fattn_sj_kvarn_compact_nstage<turbo4_body, rot>(W);
     switch (W) {
-        case 3:  ggml_cuda_fattn_sj_kvarn_stream_select<3, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 3, 1, nstage_env, parallel_blocks); break;
-        case 4:  ggml_cuda_fattn_sj_kvarn_stream_select<4, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 4, 1, nstage_env, parallel_blocks); break;
-        case 5:  ggml_cuda_fattn_sj_kvarn_stream_select<5, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 5, 1, nstage_env, parallel_blocks); break;
-        default: ggml_cuda_fattn_sj_kvarn_stream_select<6, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 6, 1, nstage_env, parallel_blocks); break;
+        case 3:  ggml_cuda_fattn_sj_kvarn_stream_select<3, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 3, 1, nst, parallel_blocks); break;
+        case 4:  ggml_cuda_fattn_sj_kvarn_stream_select<4, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 4, 1, nst, parallel_blocks); break;
+        case 5:  ggml_cuda_fattn_sj_kvarn_stream_select<5, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 5, 1, nst, parallel_blocks); break;
+        default: ggml_cuda_fattn_sj_kvarn_stream_select<6, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 6, 1, nst, parallel_blocks); break;
     }
 }
 

@@ -1726,6 +1726,30 @@ struct ggml_backend_cuda_context {
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } tq_rot_cache;
 
+    // [KAIFUSE R1] AI+ activation prep (Hadamard rotate + int8 quantize, ai4_quantize_x) shared by the AI+ matmuls
+    // that read one activation: GDN qkv + z, attention q/k/v, FFN gate + up. Same keys and discipline as q8_cache
+    // (tensor identity, data pointer, graph-eval epoch, main stream only, raw buffers freed at teardown), plus the prep
+    // layout. A hit runs no kernel; the cached bytes are the ones the skipped launch would write. Assumes an AI+ matmul
+    // input is not rewritten in place between its first and last AI+ consumer within one graph eval (true of every
+    // model graph today: matmul inputs are norm / activation outputs, never state buffers). LLAMA_KAIFUSE=0 turns the
+    // cache off for every AI+ consumer, the R2 draft shortlist path included.
+    struct ai_prep_entry {
+        char *              ptr     = nullptr;
+        size_t              cap     = 0;
+        int                 dev     = -1;
+        const ggml_tensor * src1    = nullptr;
+        const void *        data    = nullptr;
+        uint64_t            epoch   = 0;
+        int64_t             n_rows  = 0;
+        int64_t             k       = 0;
+        int                 layout  = 0;     // ai4 prep layout: xsh | variant << 1
+        uint64_t            last_use = 0;
+    };
+    struct {
+        ai_prep_entry entries[3];    // fixed-size buffers (AI4_PREP_CACHE_BYTES in ai4.cu): never outgrown, so no retired list
+        uint64_t      tick = 0;
+    } ai_prep_cache;
+
     // Per-expert address tables for the MoE weight indirection (see tq_build_expert_table). One
     // entry per expert tensor, built on first use and kept for the life of the context: a captured
     // graph replays kernels that read this exact address, so it cannot be pool memory and cannot be
@@ -1770,6 +1794,9 @@ struct ggml_backend_cuda_context {
         int64_t gdn_state_read = 0;  // gated_delta_net launches that read the state through s_copy (#87)
         int64_t add_rms       = 0;   // fused ADD + RMS_NORM + MUL runs (ggml_cuda_op_add_rms_norm_mul) [#46]
         int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
+        int64_t ai_prep_runs  = 0;   // AI+ activation preps launched (cached or not) [KAIFUSE R1]
+        int64_t ai_prep_hits  = 0;   // ... AI+ matmuls that reused a cached prep instead
+        int64_t cuda_graph_replays = 0;   // CUDA graph launches that replayed without a re-capture [KAIFUSE test]
         int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
         int64_t exl3_fold_norm = 0;  // RMS_NORM+MUL that also wrote the EXL3 consumer's glued input [#136]
         int64_t exl3_fold_add  = 0;  // EXL3 glue_outs that added the residual ADD [#136]

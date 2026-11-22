@@ -9262,6 +9262,22 @@ static const char * draft_vocab_direct(const ggml_tensor * head) {
         case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
             return nullptr;
+        case GGML_TYPE_AIF25_U: case GGML_TYPE_AIF25_U2: case GGML_TYPE_AIF175_U2: case GGML_TYPE_AIF25_U2_512:
+            {
+                // [KAIFUSE R2] the CUDA row-group kernel (ggml_cuda_mul_mat_id_aif_rows), opt-in (LLAMA_RM24H_AIHEAD=1;
+                // default off). No other backend runs this op, so ask the head's device about the exact node shape.
+                if (llama_draft_vocab_aihead_mode() != 1) {
+                    return "head type has no one-row MMVQ path";
+                }
+                ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+                ggml_context * pctx = ggml_init(ip);
+                ggml_tensor * rows = ggml_new_tensor_3d(pctx, head->type, head->ne[0], 1, head->ne[1]);
+                ggml_tensor * x    = ggml_new_tensor_3d(pctx, GGML_TYPE_F32, head->ne[0], 1, 8);
+                ggml_tensor * ids  = ggml_new_tensor_2d(pctx, GGML_TYPE_I32, 1024, 8);
+                const bool ok = ggml_backend_dev_supports_op(dev, ggml_mul_mat_id(pctx, rows, x, ids));
+                ggml_free(pctx);
+                return ok ? nullptr : "fractional AI+ head shape or device not supported by the row-group kernel";
+            }
         default:
             return "head type has no one-row MMVQ path";
     }
