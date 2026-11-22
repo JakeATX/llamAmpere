@@ -112,6 +112,9 @@ class DocsGenerator:
         lines.append("")
         lines.append("List of GGML operations and backend support status.")
         lines.append("")
+        # llamAmpere: fork notes kept in the generated file (the ops-docs check compares byte for byte)
+        lines.append("Native EXL3 CPU `MUL_MAT_ID` is experimental and requires `GGML_CPU_EXL3=1`; see [CPU expert support](exl3.md#experimental-cpu-expert-kernel). CPU.csv records marked `cpu_exl3=1` were collected with this switch enabled. CUDA indexed EXL3 remains unsupported.")
+        lines.append("")
         lines.append("## How to add a backend to this table:")
         lines.append("")
         lines.append("1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)")
@@ -152,6 +155,8 @@ class DocsGenerator:
 
             lines.append(row)
 
+        lines.append("")
+        lines.append("CPU `FLASH_ATTN_EXT` also accepts an I64 mask `[1, n_query, 1, n_sequence]` of visible-prefix lengths, with `max_bias == 0`. Each query attends to KV indices below its limit. CUDA supports this prefix mask on the ordinary F16-KV MMA route; vector, SJ-KVaRN, selected, streamed and sparse routes remain unsupported. Other mask shapes continue to use F16.")
         lines.append("")
 
         return "\n".join(lines)
