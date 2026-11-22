@@ -29,6 +29,66 @@
 #include "speculative-copy.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+
+// INKSPEC_LOG=<path>: per verify round of a DSpark draft (needs LLAMA_DSPARK_IDS=0 so the drafter logits reach the host),
+// for every draft position j: drafted id, target p(d) under top_k 20 / top_p 0.95 / temp 1, target top-1 p, drafter
+// top-1 q (temp 1), and sum_x min(p(x), q(x)) for sampled drafting with q = softmax(l/T) over the full vocab
+// (T = 0.5, 0.7, 1.0) and over the drafter's top 20 (T = 0.7, 1.0). Pure logging: reads logits only.
+static void inkspec_log_round(llama_context * ctx, const std::vector<int32_t> & idxs, const llama_tokens & draft,
+                              size_t n_accepted) {
+    static FILE * f = [] { const char * e = getenv("INKSPEC_LOG"); return e ? fopen(e, "a") : (FILE *) nullptr; }();
+    if (!f || draft.empty() || common_inkspec_dft_logits.size() < draft.size()) {
+        return;
+    }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    fprintf(f, "R %zu %zu", draft.size(), n_accepted - 1);
+    std::vector<int32_t> ord;
+    for (size_t j = 0; j < draft.size(); ++j) {
+        const float * lt = llama_get_logits_ith(ctx, idxs[j]);
+        const auto & ld = common_inkspec_dft_logits[j];
+        // the captured row must be this draft's: same length and the same first-maximum token
+        if (!lt || (int) ld.size() != n_vocab || (llama_token) (std::max_element(ld.begin(), ld.end()) - ld.begin()) != draft[j]) {
+            break;
+        }
+        // target p: top 20, softmax, top_p 0.95 (smallest prefix reaching 0.95), renormalised
+        ord.resize(n_vocab);
+        for (int k = 0; k < n_vocab; ++k) ord[k] = k;
+        std::partial_sort(ord.begin(), ord.begin() + 20, ord.end(), [lt](int a, int b) { return lt[a] > lt[b]; });
+        std::vector<std::pair<int, double>> p;
+        double z = 0;
+        for (int k = 0; k < 20; ++k) { const double e = std::exp((double) lt[ord[k]] - lt[ord[0]]); p.push_back({ord[k], e}); z += e; }
+        double cum = 0; size_t keep = 0;
+        for (; keep < p.size(); ++keep) { cum += p[keep].second / z; if (cum >= 0.95) { ++keep; break; } }
+        p.resize(std::min(keep, p.size()));
+        z = 0; for (auto & e : p) z += e.second;
+        for (auto & e : p) e.second /= z;
+        double pd = 0; for (auto & e : p) if (e.first == draft[j]) pd = e.second;
+        // drafter q
+        const float lmax = *std::max_element(ld.begin(), ld.end());
+        const double Ts[3] = {0.5, 0.7, 1.0};
+        double lse[3] = {0, 0, 0};
+        for (int k = 0; k < n_vocab; ++k) for (int t = 0; t < 3; ++t) lse[t] += std::exp((ld[k] - lmax) / Ts[t]);
+        double S[3];
+        for (int t = 0; t < 3; ++t) { S[t] = 0; for (auto & e : p) S[t] += std::min(e.second, std::exp((ld[e.first] - lmax) / Ts[t]) / lse[t]); }
+        for (int k = 0; k < n_vocab; ++k) ord[k] = k;
+        std::partial_sort(ord.begin(), ord.begin() + 20, ord.end(), [&ld](int a, int b) { return ld[a] > ld[b]; });
+        double SK[2]; const double TK[2] = {0.7, 1.0};
+        for (int t = 0; t < 2; ++t) {
+            double zk = 0; for (int k = 0; k < 20; ++k) zk += std::exp((ld[ord[k]] - lmax) / TK[t]);
+            SK[t] = 0;
+            for (auto & e : p) {
+                if (std::find(ord.begin(), ord.begin() + 20, e.first) != ord.begin() + 20) {
+                    SK[t] += std::min(e.second, std::exp((ld[e.first] - lmax) / TK[t]) / zk);
+                }
+            }
+        }
+        fprintf(f, " | %d %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f", draft[j], pd, p[0].second, 1.0 / lse[2],
+                S[0], S[1], S[2], SK[0], SK[1]);
+    }
+    fprintf(f, "\n");
+    fflush(f);
+    common_inkspec_dft_logits.clear();
+}
 #include "../../src/llama-ext.h"
 
 extern "C" {
@@ -7920,6 +7980,9 @@ private:
                 slot.spec_sample_end_us = ggml_time_us();
                 slot.spec_sample_us += (uint64_t) (slot.spec_sample_end_us - t_sample0);
                 GGML_ASSERT(accepted.size() >= 1);
+                if (common_inkspec_log_on() && !slot.spec_is_replay && !replayed_verify) {
+                    inkspec_log_round(slot.ctx_tgt, spec_i_batch, slot.spec_draft, accepted.size());
+                }
                 if (!slot.spec_is_replay && params_base.speculative.draft.depth_policy == "cdepth") {
                     // CDEPTH history: target top-1 of the committed rows (the re-decode after a restore is not counted twice)
                     const auto & top1 = common_sampler_get_top1_trace(slot.smpl.get());

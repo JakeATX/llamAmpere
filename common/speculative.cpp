@@ -974,6 +974,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 };
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
+// INKSPEC_LOG=<path>: drafter slot logits of the last DSpark draft (host-argmax path, LLAMA_DSPARK_IDS=0), read by
+// the server's verify-side log. Pure logging: no RNG, no state change.
+std::vector<std::vector<float>> common_inkspec_dft_logits;
+bool common_inkspec_log_on() {
+    static const bool on = getenv("INKSPEC_LOG") != nullptr;
+    return on;
+}
+
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
 
@@ -1021,6 +1029,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool         has_rnn_context = false;
     int32_t      dspark_rank     = 0;     // markov rank; with ids_out the walked slots carry their id at h_nextn[rank]
     bool         dspark_ids      = false; // ids_out was set for the last draft decode
+    int32_t      dspark_sk       = 0;     // INKSPEC: K of the sampled walk of the last draft decode (0 = argmax)
+    float        dspark_st       = 1.0f;  // INKSPEC: its draw temperature
+    std::vector<float> dspark_noise;      // INKSPEC: Gumbel noise [K, n_blocks, walk]
     common_batch batch_rnn;
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
@@ -1431,6 +1442,59 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             static const bool ids_env = [] { const char * e = getenv("LLAMA_DSPARK_IDS"); return !e || atoi(e) != 0; }();
             dspark_ids = ids_env && walk_stop && dspark_rank > 0 && dspark_rank < n_embd_dec;
             llama_set_dspark_ids_out(ctx_dft, dspark_ids);
+            // INKSPEC sampled DSpark (LLAMA_DSPARK_SAMPLE=1): every walked slot draws its token from softmax(logit/T) over
+            // its top K (K = LLAMA_DSPARK_SAMPLE_K, default 20; T = request temp x LLAMA_DSPARK_SAMPLE_TSCALE, default 1)
+            // with Gumbel noise from a per-seq generator, and q goes to the verifier, which accepts with min(1, p/q)
+            // (exact p/q: the output keeps the target's distribution for any q). Needs ids_out, the same temp > 0 on
+            // every drafting seq, and no mirostat; otherwise the walk stays argmax.
+            dspark_sk = 0;
+            static const int  s_on = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE"); return e ? atoi(e) : 0; }();
+            static const int  s_k  = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE_K"); return e ? std::max(1, std::min(64, atoi(e))) : 20; }();
+            static const float s_ts = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE_TSCALE"); const float v = e ? (float) atof(e) : 1.0f; return v > 0.0f ? v : 1.0f; }();
+            const int32_t walk = walk_stop ? params.n_max : block_size - 1;
+            // one ubatch only: a split block batch would read the noise of block 0 in every ubatch
+            if (s_on && dspark_ids && dspark_rank + 1 + 2*s_k <= n_embd_dec && walk > 0 && walk <= 16 &&
+                    (int64_t) batch_rnn.size() <= (int64_t) llama_n_ubatch(ctx_dft)) {
+                float temp = -1.0f;
+                int nb = 0;
+                bool ok = true;
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq && ok; ++s) {
+                    if (i_block_beg[s] < 0) {
+                        continue;
+                    }
+                    const auto & dp = dparams[s];
+                    ok = dp.result_q && dp.sampling && dp.sampling->temp > 0.0f && dp.sampling->mirostat == 0 &&
+                         (temp < 0.0f || dp.sampling->temp == temp);
+                    temp = ok ? dp.sampling->temp : temp;
+                    nb++;
+                }
+                if (ok && nb > 0 && (size_t) s_k*nb*walk <= 64*16*64) {
+                    dspark_sk = s_k;
+                    dspark_st = temp*s_ts;
+                    dspark_noise.assign((size_t) s_k*nb*walk, 0.0f);
+                    std::uniform_real_distribution<double> uni(0.0, 1.0);
+                    int b = 0;
+                    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                        if (i_block_beg[s] < 0) {
+                            continue;
+                        }
+                        const auto & dp = dparams[s];
+                        if (dflash2_seed[s] != (int64_t) dp.seed) {
+                            dflash2_seed[s] = dp.seed;
+                            dflash2_rng[s].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                        }
+                        for (int w = 0; w < walk; ++w) {
+                            for (int k = 0; k < s_k; ++k) {
+                                double u = uni(dflash2_rng[s]);
+                                u = std::min(std::max(u, 1e-12), 1.0 - 1e-12);
+                                dspark_noise[(size_t) k + (size_t) s_k*(b + (size_t) nb*w)] = (float) -std::log(-std::log(u));
+                            }
+                        }
+                        b++;
+                    }
+                }
+            }
+            llama_set_dspark_sample(ctx_dft, dspark_sk, dspark_st, dspark_sk ? dspark_noise.data() : nullptr, dspark_noise.size());
         }
 
         // decode all sequence's noise block in a single batch
@@ -1536,7 +1600,55 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // the graph chained the markov head over the block with the first maximum of each slot; take the same
                 // token here (host argmax, first maximum), at most n_max of them
                 const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-                if (dspark_ids) {
+                if (common_inkspec_log_on()) {
+                    common_inkspec_dft_logits.clear();
+                }
+                if (dspark_ids && dspark_sk > 0) {
+                    // INKSPEC sampled walk: row = [state(rank), drawn id, K candidate ids, K candidate logits]
+                    // LLAMA_DSPARK_STOP=th: keep slot i >= 2 only while the product of the drafter's top-1 q over the
+                    // kept slots stays >= th (draft length depends on the drafter alone, so p/q stays exact).
+                    // INKSPEC accsim (Taichi 3090, 1,292 depth-7 rounds): max depth 5 + th 0.4 = est +5% over fixed depth 4.
+                    static const float stop_th = [] { const char * e = getenv("LLAMA_DSPARK_STOP"); return e ? (float) atof(e) : 0.0f; }();
+                    double conf = 1.0;
+                    const float * h = llama_get_embeddings_nextn(ctx_dft);
+                    for (int32_t i = 1; h && i < std::min(n_block_tokens, params.n_max + 1); ++i) {
+                        const float * row = h + (size_t) (beg + i) * n_embd_dec + dspark_rank;
+                        const llama_token id = (llama_token) row[0];
+                        float lmax = row[1 + dspark_sk];
+                        for (int k = 1; k < dspark_sk; ++k) {
+                            lmax = std::max(lmax, row[1 + dspark_sk + k]);
+                        }
+                        auto & q = dp.result_q->emplace_back();
+                        q.reserve(dspark_sk);
+                        double z = 0.0;
+                        bool found = false;
+                        for (int k = 0; k < dspark_sk; ++k) {
+                            const float l = row[1 + dspark_sk + k];
+                            const float e = std::exp((l - lmax)/dspark_st);
+                            q.push_back({ (llama_token) row[1 + k], l, e });
+                            z += e;
+                            found = found || (llama_token) row[1 + k] == id;
+                        }
+                        float qmax = 0.0f;
+                        for (auto & c : q) {
+                            c.p = (float) (c.p/z);
+                            qmax = std::max(qmax, c.p);
+                        }
+                        conf *= qmax;
+                        if (i >= 2 && stop_th > 0.0f && conf < stop_th) {
+                            dp.result_q->pop_back();
+                            break;
+                        }
+                        if (!found) {
+                            // the graph did not take the sampled layout: no draft this round (never a wrong q)
+                            LOG_WRN("%s: sampled DSpark slot %d: drawn id not among the candidates, dropping the draft\n", __func__, i);
+                            result.clear();
+                            dp.result_q->clear();
+                            break;
+                        }
+                        result.push_back(id);
+                    }
+                } else if (dspark_ids) {
                     // the graph's own argmax ids (same first maximum), read from the chain-state rows
                     const float * h = llama_get_embeddings_nextn(ctx_dft);
                     for (int32_t i = 1; h && i < std::min(n_block_tokens, params.n_max + 1); ++i) {
@@ -1550,6 +1662,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         break;
                     }
                     result.push_back((llama_token) (std::max_element(logits, logits + n_vocab) - logits));
+                    // INKSPEC_LOG: keep the slot's drafter logits for the verify-side log (pure logging)
+                    if (common_inkspec_log_on()) {
+                        common_inkspec_dft_logits.emplace_back(logits, logits + n_vocab);
+                    }
                 }
             } else if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
@@ -1606,6 +1722,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }

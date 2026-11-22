@@ -21,6 +21,7 @@ else()
     add_subdirectory(eval-callback)
     add_subdirectory(inklsa-dump)
     add_subdirectory(inklsa-kld)
+    add_subdirectory(inkspec-bench)
 
     add_subdirectory(gguf-hash)
     add_subdirectory(gguf)

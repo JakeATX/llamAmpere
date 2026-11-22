@@ -1223,7 +1223,8 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset || cparams.dspark_walk != other.cparams.dspark_walk ||
-            cparams.dspark_ids_out != other.cparams.dspark_ids_out) {
+            cparams.dspark_ids_out != other.cparams.dspark_ids_out || cparams.dspark_sample_k != other.cparams.dspark_sample_k ||
+            cparams.dspark_sample_t != other.cparams.dspark_sample_t) {
             return false;
         }
 

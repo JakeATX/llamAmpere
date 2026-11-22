@@ -185,6 +185,7 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_dspark_walk(int32_t n);
     void set_dspark_ids_out(bool on);
+    void set_dspark_sample(int32_t k, float temp, const float * noise, size_t n);
     void set_mtp_chain(bool value);
     void set_mtp_chain_sampling(int32_t top_k, float temp, float top_p, float min_p, const float * u, int32_t n_u); // [#69]
     void set_causal_attn(bool value);
@@ -552,6 +553,7 @@ private:
     draft_vocab_info draft_vocab;
 
     // [#69] sampled MTP chain inputs: the packed sampling params, then one uniform per chain step
+    std::vector<float> dspark_noise; // INKSPEC: fixed capacity, so the graph input pointer stays valid
     std::vector<float> mtp_chain_samp;
     bool mtp_chain_qwen4exp_reserve = false;
 
