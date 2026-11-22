@@ -18309,8 +18309,14 @@ static void add_ai_parw_shape_cases(std::vector<std::unique_ptr<test_case>> & ca
     }
 }
 
+static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc);
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GGML_TEST_INKGROUP") != nullptr) {
+        add_inkgroup_cases(test_cases);
+        return test_cases;
+    }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
         add_ai_parw_shape_cases(test_cases);
         return test_cases;
@@ -23465,8 +23471,138 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
+// [INKDENSE] Inkling 2 Mini non-expert matvecs: R distinct weights of one type (so the weights do not sit in L2,
+// like the 48 layer visits of a decode token) times one activation column set; perf only, time the kernels with nsys.
+struct test_inkdense : public test_case {
+    const ggml_type type; const int64_t m, k, n; const int reps;
+    test_inkdense(ggml_type type, int64_t m, int64_t k, int64_t n, int reps) : type(type), m(m), k(k), n(n), reps(reps) {}
+    std::string op_desc(ggml_tensor *) override { return "INKDENSE"; }
+    size_t max_tensors() override { return 3*reps + 8; }
+    std::string vars() override { return VARS_TO_STR5(type, m, k, n, reps); }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * out = nullptr;
+        for (int r = 0; r < reps; ++r) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else if (t->type == GGML_TYPE_AIF25_U || t->type == GGML_TYPE_AIF25_U2_512) {
+                const size_t unit = t->type == GGML_TYPE_AIF25_U2_512 ? 2592 : 672;
+                std::mt19937 rng(1234);
+                std::uniform_real_distribution<float> rs(0.002f, 0.02f);
+                std::vector<uint8_t> buf(ggml_nbytes(t));
+                for (size_t b = 0; b + unit <= buf.size(); b += unit) {
+                    ggml_fp16_t * d = (ggml_fp16_t *) (buf.data() + b);
+                    for (int i = 0; i < 16; ++i) { d[i] = ggml_fp32_to_fp16(rs(rng)); }
+                    uint32_t * w = (uint32_t *) (buf.data() + b + 32);
+                    for (size_t i = 0; i < (unit - 32)/4; ++i) { w[i] = (uint32_t) rng(); }
+                }
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// [INKDENSE] grouped decode mmv: members of different M that read one x, right-nested concats so the MUL_MATs are consecutive
+// nodes (the order the CUDA graph_optimize gives them); GGML_CUDA_AI_MMV_GROUP=1 groups them into one launch
+struct test_inkgroup : public test_case {
+    const ggml_type type; const std::vector<int64_t> ms; const int64_t k, n;
+    test_inkgroup(ggml_type type, std::vector<int64_t> ms, int64_t k, int64_t n) : type(type), ms(std::move(ms)), k(k), n(n) {}
+    std::string op_desc(ggml_tensor *) override { return "INKGROUP"; }
+    double max_nmse_err() override { return 5e-4; }   // int8 activations (W4A8) vs the CPU f32 reference, as the other AI+ tests
+    size_t max_tensors() override { return 4*ms.size() + 8; }
+    std::string vars() override {
+        std::string m;
+        for (int64_t v : ms) { m += (m.empty() ? "" : "+") + std::to_string(v); }
+        return VARS_TO_STR4(type, m, k, n);
+    }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        std::vector<ggml_tensor *> ys;
+        for (int64_t m : ms) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+            ys.push_back(ggml_mul_mat(ctx, w, x));
+        }
+        // one output: the products concatenated along M, right-nested (DFS emits the MUL_MATs first, with no view between)
+        ggml_tensor * out = ys.back();
+        for (int j = (int) ys.size() - 2; j >= 0; --j) {
+            out = ggml_concat(ctx, ys[j], out, 0);
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc) {
+    for (ggml_type t : { GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U }) {
+        for (int64_t n : { 1, 2, 8 }) {
+            tc.emplace_back(new test_inkgroup(t, { 3072, 3072, 384 }, 2304, n));            // q, gate, rel
+            tc.emplace_back(new test_inkgroup(t, { 3072, 1024, 1024, 384, 3072 }, 2304, n)); // q, k, v, rel, gate
+            tc.emplace_back(new test_inkgroup(t, { 2304, 256 }, 3072, n));
+            tc.emplace_back(new test_inkgroup(t, { 512, 640, 144, 160, 176, 192, 208, 224 }, 1152, n)); // 8 members, K % 256 != 0
+        }
+    }
+}
+
+static void add_inkdense_cases(std::vector<std::unique_ptr<test_case>> & tc) {
+    if (getenv("GGML_TEST_INKGROUP") != nullptr) {
+        add_inkgroup_cases(tc);
+        return;
+    }
+    const int64_t n = getenv("GGML_TEST_INKDENSE_N") ? atoll(getenv("GGML_TEST_INKDENSE_N")) : 1;
+    // (m, k, reps): q / gate (3072 x 2304), k / v (1024 x 2304), rel (384 x 2304), o (2304 x 3072), head (201024 x 2304)
+    struct shp { int64_t m, k; int reps; };
+    const shp dense[] = { {3072, 2304, 48}, {1024, 2304, 48}, {384, 2304, 48}, {2304, 3072, 48}, {201024, 2304, 2} };
+    for (const auto & s : dense) {
+        std::vector<ggml_type> ts = { GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIF25_U };
+        if (s.k % 512 == 0) {
+            ts.push_back(GGML_TYPE_AIT4_U2_512); ts.push_back(GGML_TYPE_AIT3_U2_512); ts.push_back(GGML_TYPE_AIT2_U2_512); ts.push_back(GGML_TYPE_AIF25_U2_512);
+        }
+        for (ggml_type t : ts) {
+            tc.emplace_back(new test_inkdense(t, s.m, s.k, n, s.reps));
+        }
+    }
+    // small: router 128 x 2304, ctrl down 64 x 4608, ctrl gain / forget 2304 x 64, sink 24 x 2304 (BF16 / Q8_0 / F32 / F16)
+    const shp small[] = { {128, 2304, 48}, {64, 4608, 48}, {2304, 64, 48}, {24, 2304, 48}, {32, 2304, 48}, {512, 2304, 48} };
+    for (const auto & s : small) {
+        for (ggml_type t : { GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0 }) {
+            if (ggml_blck_size(t) > 1 && s.k % ggml_blck_size(t) != 0) { continue; }
+            tc.emplace_back(new test_inkdense(t, s.m, s.k, n, s.reps));
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GGML_TEST_INKDENSE") != nullptr) {
+        add_inkdense_cases(test_cases);
+        return test_cases;
+    }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
         add_ai_parw_shape_cases(test_cases);
         return test_cases;

@@ -1324,6 +1324,87 @@ void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     ai4_ref_gemm(ctx, src0, (const float *) src1->data, (float *) dst->data, M, T, K, false, true);
 }
 
+// [INKDENSE] GGML_CUDA_AI_MMV_GROUP: dense decode products (N <= 8) of one unit layout and K that share their activations run
+// as one grouped mmv launch with one activation quantize (ai4k::mmv_grp). Taken only where each member alone would run the
+// default mmv kernel (stages 2, register activations, 4 warps x 6 blocks): the outputs are then bitwise equal to the
+// ungrouped launches. Returns false (nothing launched) when any member would take another path.
+static_assert(GGML_CUDA_AI4_GRP_MAX == ai4k::MMV_GRP_MAX, "group size");
+bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n) {
+    if (n < 2 || n > ai4k::MMV_GRP_MAX || !ai4_fast_ok(ctx)) {
+        return false;
+    }
+    const ggml_tensor * src1 = dsts[0]->src[1];
+    const ggml_type t = dsts[0]->src[0]->type;
+    const int64_t K = dsts[0]->src[0]->ne[0];
+    if (t != GGML_TYPE_AIT4_U && t != GGML_TYPE_AIT5_U && t != GGML_TYPE_AIT2_U && t != GGML_TYPE_AIT3_U) {
+        return false;
+    }
+    if (ai4_ref_only_type(t) || ai4_mmv_stages() != 2 || ai4_mmv_xsmem()) {
+        return false;
+    }
+    const rpb_ai4_mmv knobs = ai4_mmv_knobs();
+    if (knobs.warps != rpb_ai4_warps_default || knobs.minb != rpb_ai4_minb_default) {
+        return false;
+    }
+    if ((t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) && ai4_mmvr_on()) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[0] != K || K % 128 != 0 ||
+            ((uintptr_t) src1->data & 15) != 0) {
+        return false;
+    }
+    const int64_t N = src1->ne[1]*src1->ne[2]*src1->ne[3];
+    if (N < 1 || N > 8) {
+        return false;
+    }
+    if (t == GGML_TYPE_AIT4_U && ai4_ampere_sms(ctx) && ai4_ampere_mmv((int) N)) {
+        return false;   // AMPERE_MMV_MIN_N <= 8: the single path takes ai4_ampere_width
+    }
+    static const int small_splits = ai4_env_int("GGML_CUDA_AI23_SMALL_SPLIT", nullptr, 0);
+    if ((t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) && (K == 5120 || K == 17408) && (small_splits == 2 || small_splits == 4)) {
+        return false;   // the single path takes ai23_small_split
+    }
+    ai4k::mmv_group grp = {};
+    grp.n = n;
+    int blocks = 0;
+    for (int j = 0; j < n; ++j) {
+        const ggml_tensor * d = dsts[j];
+        const ggml_tensor * w = d->src[0];
+        if (d->src[1] != src1 || w->type != t || w->ne[0] != K || w->ne[2] != 1 || w->ne[3] != 1 ||
+                !ggml_is_contiguous(w) || !ggml_is_contiguous(d) || d->type != GGML_TYPE_F32 ||
+                w->ne[1] % 16 != 0 || w->ne[1] <= 128 || d->ne[0] != w->ne[1] || ggml_nelements(d) != w->ne[1]*N) {
+            return false;
+        }
+        grp.W[j]  = (const uint8_t *) w->data;
+        grp.Y[j]  = (float *) d->data;
+        grp.M[j]  = (int) w->ne[1];
+        grp.s0[j] = blocks;
+        blocks += (int) (w->ne[1]/16);
+    }
+    grp.s0[n] = blocks;
+    for (int j = n + 1; j <= ai4k::MMV_GRP_MAX; ++j) {
+        grp.s0[j] = blocks;
+    }
+    cudaStream_t stream = ctx.stream();
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) N*K);
+    ggml_cuda_pool_alloc<float>  s(ctx.pool(), (size_t) N*(K >> (7 + xsh)));
+    ai4_quantize_x((const float *) src1->data, N, (int) K, xsh, q.get(), s.get(), stream);
+    switch (ai4_lay_of(t)*2 + xsh) {
+#define AI4_GRP(L) \
+        case L*2:     ai4k::launch_mmv_grp<2, 6, true, L, 0>(grp, q.get(), s.get(), (int) N, (int) K, stream); break; \
+        case L*2 + 1: ai4k::launch_mmv_grp<2, 6, true, L, 1>(grp, q.get(), s.get(), (int) N, (int) K, stream); break;
+        AI4_GRP(ai4k::LAY_AIT4_U)
+        AI4_GRP(ai4k::LAY_AIT5_U)
+        AI4_GRP(ai4k::LAY_AIT2_U)
+        AI4_GRP(ai4k::LAY_AIT3_U)
+#undef AI4_GRP
+        default: GGML_ABORT("ai4 mmv group layout");
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // GGML_CUDA_AI4_MMVID_PAIRS = P > 0: MUL_MAT_ID also takes the mmv-ID kernel (tiles of <= 8 pairs) past n_tok = 8 while the
 // expected pairs per active expert (uniform top-k routing estimate from the shapes, no host sync) is <= P. Sparse MoE batches
 // (512 experts top-10: about 1.05 pairs per active expert at 16 tokens) then read each active expert once at the decode kernel's

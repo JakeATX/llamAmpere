@@ -10417,6 +10417,99 @@ static int ggml_cuda_try_moe_onechain_fill(ggml_backend_cuda_context & ctx, ggml
     return 2;
 }
 
+// [INKDENSE] GGML_CUDA_AI_MMV_GROUP=1 (default off): AI+ unit-type MUL_MATs that read the same activations (Inkling q / gate /
+// rel of a visit, and k / v where they share the input) are moved next to each other at graph_optimize and run as one grouped
+// decode mmv launch (ggml_cuda_mul_mat_ai4_group; bitwise equal to the separate launches).
+static bool ggml_cuda_ai_mmv_group_on() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_AI_MMV_GROUP"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// structural (no data pointers, no batch size): graph_optimize and the launch use the same test
+static bool ggml_cuda_ai_mmv_group_member(const ggml_tensor * n) {
+    if (n->op != GGML_OP_MUL_MAT || n->src[0] == nullptr || n->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * w = n->src[0];
+    const ggml_type t = w->type;
+    return (t == GGML_TYPE_AIT4_U || t == GGML_TYPE_AIT5_U || t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) &&
+           w->op == GGML_OP_NONE && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[1] > 128 && w->ne[1] % 16 == 0 &&
+           n->src[1]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32 && ggml_get_op_params_i32(n, 1) == 0;
+}
+
+static bool ggml_cuda_ai_mmv_group_pair(const ggml_tensor * a, const ggml_tensor * b) {
+    return ggml_cuda_ai_mmv_group_member(b) && b->src[1] == a->src[1] && b->src[0]->type == a->src[0]->type &&
+           b->src[0]->ne[0] == a->src[0]->ne[0];
+}
+
+// graph_optimize: move every later member that shares the first member's activations (and layout, K) up behind it. A member
+// reads only its weight (a leaf) and the shared activations, which are computed before the first member, so the order stays
+// valid.
+static void ggml_cuda_ai_mmv_group_optimize(ggml_cgraph * g) {
+    const int n = g->n_nodes;
+    std::vector<char> taken(n, 0);
+    std::vector<ggml_tensor *> order;
+    order.reserve(n);
+    int moved = 0;
+    for (int i = 0; i < n; ++i) {
+        if (taken[i]) {
+            continue;
+        }
+        ggml_tensor * a = g->nodes[i];
+        order.push_back(a);
+        if (!ggml_cuda_ai_mmv_group_member(a)) {
+            continue;
+        }
+        int cnt = 1;
+        const ggml_tensor * base = a->src[1]->view_src ? a->src[1]->view_src : a->src[1];
+        for (int j = i + 1; j < n && cnt < GGML_CUDA_AI4_GRP_MAX; ++j) {
+            const ggml_tensor * k = g->nodes[j];
+            const bool pure_view = k->op == GGML_OP_VIEW || k->op == GGML_OP_RESHAPE || k->op == GGML_OP_PERMUTE ||
+                                   k->op == GGML_OP_TRANSPOSE;
+            if (!taken[j] && k->view_src == base && !pure_view) {
+                break;   // writes the shared activations in place: no later member may move above it
+            }
+            if (!taken[j] && ggml_cuda_ai_mmv_group_pair(a, g->nodes[j])) {
+                taken[j] = 1;
+                order.push_back(g->nodes[j]);
+                moved += j != i + cnt;
+                ++cnt;
+            }
+        }
+    }
+    GGML_ASSERT((int) order.size() == n);
+    if (moved) {
+        std::copy(order.begin(), order.end(), g->nodes);
+    }
+}
+
+// launch: the run of consecutive members from node i (after graph_optimize); returns the nodes to skip
+static int ggml_cuda_try_ai_mmv_group(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * a = cgraph->nodes[i];
+    if (!ggml_cuda_ai_mmv_group_on() || !ctx.stream_context().concurrent_events.empty() || !ggml_cuda_ai_mmv_group_member(a)) {
+        return 0;
+    }
+    ggml_tensor * dsts[GGML_CUDA_AI4_GRP_MAX] = { a };
+    int n = 1;
+    while (i + n < cgraph->n_nodes && n < GGML_CUDA_AI4_GRP_MAX) {
+        ggml_tensor * b = cgraph->nodes[i + n];
+        if (!ggml_cuda_ai_mmv_group_pair(a, b) || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            break;
+        }
+        dsts[n++] = b;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    for (int j = 0; j < n; ++j) {
+        const ggml_tensor * w = dsts[j]->src[0];
+        if (!w->buffer || w->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) {
+            return 0;   // split / host / foreign weights keep their own path
+        }
+    }
+    return ggml_cuda_mul_mat_ai4_group(ctx, dsts, n) ? n - 1 : 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -10424,6 +10517,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int n_grp = ggml_cuda_try_ai_mmv_group(*cuda_ctx, cgraph, i);
+        if (n_grp > 0) {
+            return n_grp;
+        }
+    }
     if (node->op == GGML_OP_MUL) {
         const int n_fill = ggml_cuda_try_moe_onechain_fill(*cuda_ctx, cgraph, i);
         if (n_fill > 0) {
@@ -12697,6 +12796,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     if (!disable_fusion) {
         ggml_cuda_nemotron_ssm_prepare(cgraph, params);
+    }
+
+    if (!disable_fusion && ggml_cuda_ai_mmv_group_on()) {
+        ggml_cuda_ai_mmv_group_optimize(cgraph);
     }
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
