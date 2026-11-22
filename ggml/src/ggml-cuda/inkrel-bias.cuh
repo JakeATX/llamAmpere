@@ -19,16 +19,18 @@
 //   t      = flattened query row: ts + Ts*s, with Ts = Q->ne[1] (rows per stream) and s the stream (Q->ne[3] index).
 //   h      = query head, 0 .. H-1 (Q->ne[2]); the H query heads of one KV head (GQA) read their own bias.
 //
-// Where it goes
-//   The bias is added where the FA mask is added: to the scaled (and softcapped) logit, before the max/exp:
-//     logit = scale*q.k [-> softcap] + mask[c, t] + bias(h, c, t)
-//   mask[c, t] is the shared causal/SWA base mask (ne[2] == 1, -inf for masked cells). Sinks stay as today (src[4]).
-//   The sum is formed in F32. The materialised path instead rounds (bias + mask) to F16 before FA, so an in-kernel
-//   read is not bit-identical to it (it is the more exact one); gate it with KLD, not identity.
-//
+// Where it goes (the INKREL contract, ggml/include/ggml-inkrel.h, which the INKATTN decode kernel and the CPU
+// reference already follow):
+//     logit = scale*q.k + f16(mask[c, t] + bias(h, c, t))
+//   mask[c, t] is the shared causal/SWA base mask (F16, ne[2] == 1, -inf for masked cells); the sum is rounded to F16
+//   (ink_rel_bias_masked), the same value the dense path's per-head F16 mask holds, so a kernel that adds it differs
+//   from the dense route only by its own accumulation order. Sinks stay as today (src[4]). INKREL nodes carry the
+//   table [H, rows, T] (h fastest) in src[7] and rel_pos [n_kv, T] in src[8]: ink_rel_bias_from_inkrel() reads them.
+
 // Host side: ink_rel_bias_make() validates the two tensors and fills the POD below; pass it by value to the kernel.
 
 #include "common.cuh"
+#include "ggml-inkrel.h"
 
 #define INK_REL_BIAS_VERSION 1
 
@@ -60,6 +62,11 @@ static __device__ __forceinline__ int32_t ink_rel_bias_row(const ink_rel_bias & 
 
 static __device__ __forceinline__ float ink_rel_bias_at(const ink_rel_bias & b, const int32_t r, const int h, const int64_t t) {
     return __ldg(b.table + r*b.s_e + h*b.s_h + t*b.s_t);
+}
+
+// f16(mask + bias) as a float: what an INKREL kernel adds to the scaled logit (-inf stays -inf)
+static __device__ __forceinline__ float ink_rel_bias_masked(const float mask, const float bias) {
+    return __half2float(__float2half_rn(mask + bias));
 }
 
 static __device__ __forceinline__ float ink_rel_bias_load(const ink_rel_bias & b, const int h, const int64_t c, const int64_t t) {
@@ -133,4 +140,10 @@ static inline bool ink_rel_bias_make_pos(const ggml_tensor * table, const ggml_t
     b.T      = table->ne[2];
     out = b;
     return true;
+}
+
+// Host: from an INKREL-marked FLASH_ATTN_EXT node (rel mode, table [H, rows, T]).
+static inline bool ink_rel_bias_from_inkrel(const ggml_tensor * fa, ink_rel_bias & out) {
+    return ggml_flash_attn_ext_is_inkrel(fa) &&
+        ink_rel_bias_make(ggml_flash_attn_ext_inkrel_table(fa), ggml_flash_attn_ext_inkrel_pos(fa), true, out);
 }
