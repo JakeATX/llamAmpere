@@ -1442,13 +1442,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             static const bool ids_env = [] { const char * e = getenv("LLAMA_DSPARK_IDS"); return !e || atoi(e) != 0; }();
             dspark_ids = ids_env && walk_stop && dspark_rank > 0 && dspark_rank < n_embd_dec;
             llama_set_dspark_ids_out(ctx_dft, dspark_ids);
-            // INKSPEC sampled DSpark (LLAMA_DSPARK_SAMPLE=1): every walked slot draws its token from softmax(logit/T) over
+            // INKSPEC sampled DSpark (default on; LLAMA_DSPARK_SAMPLE=0 = argmax walk): every walked slot draws its token from softmax(logit/T) over
             // its top K (K = LLAMA_DSPARK_SAMPLE_K, default 20; T = request temp x LLAMA_DSPARK_SAMPLE_TSCALE, default 1)
             // with Gumbel noise from a per-seq generator, and q goes to the verifier, which accepts with min(1, p/q)
             // (exact p/q: the output keeps the target's distribution for any q). Needs ids_out, the same temp > 0 on
             // every drafting seq, and no mirostat; otherwise the walk stays argmax.
             dspark_sk = 0;
-            static const int  s_on = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE"); return e ? atoi(e) : 0; }();
+            static const int  s_on = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE"); return e ? atoi(e) : 1; }();
             static const int  s_k  = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE_K"); return e ? std::max(1, std::min(64, atoi(e))) : 20; }();
             static const float s_ts = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE_TSCALE"); const float v = e ? (float) atof(e) : 1.0f; return v > 0.0f ? v : 1.0f; }();
             const int32_t walk = walk_stop ? params.n_max : block_size - 1;
