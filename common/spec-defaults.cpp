@@ -1,4 +1,5 @@
 #include "spec-defaults.h"
+#include "speculative-inkdepth.h"
 
 #include "arch-defaults.h"
 
@@ -210,6 +211,12 @@ void common_speculative_apply_dspark_default(common_params & params) {
         } else if (depth > 0) {
             spec.draft.dspark_n_max_prev = spec.draft.n_max;
             spec.draft.n_max             = depth;
+            // INKDEPTH (LLAMA_INKDEPTH=0 = off): walk up to LLAMA_INKDEPTH_MAX slots and keep the best tokens/ms prefix
+            // per round; `depth` stays the fixed depth for rounds where several sequences draft
+            if (common_inkdepth::cfg().on && common_inkdepth::cfg().max_depth > depth) {
+                spec.draft.dspark_inkdepth_legacy = depth;
+                spec.draft.n_max                  = common_inkdepth::cfg().max_depth;
+            }
         }
     } else if (spec.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE) {
         spec.draft.dspark_adaptive = true; // an explicit adaptive floor asks for the adaptive depth

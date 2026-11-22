@@ -13,6 +13,7 @@
 #include "spec-tree.h"
 #include "speculative-adaptive.h"
 #include "speculative-cdepth.h"
+#include "speculative-inkdepth.h"
 #include "speculative-copy.h"
 #include "speculative-copy-ctl.h"
 
@@ -1101,6 +1102,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // UZU-1T (LLAMA_SPEC_TREE): candidates of every walked slot of the last draft, per seq; greedy requests then take
     // the sampled layout with zero noise (the same argmax walk) so the K candidates reach the host
     std::vector<common_spec_tree_marg> tree_margs;
+    // INKDEPTH: per-round kept depth from the sampled walk (speculative-inkdepth.h); idp_legacy = the fixed depth it
+    // replaces, used when several sequences draft in one round or the walk is not sampled
+    std::unique_ptr<common_inkdepth> idp;
+    int32_t      idp_legacy = 0;
+    llama_seq_id idp_seq    = -1; // the single drafting seq of the round in flight (-1: none)
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
@@ -1283,6 +1289,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             ds_cap.assign(n_seq, 0);
             ds_last.assign(n_seq, 0);
+            if (this->params.dspark_inkdepth_legacy > 0 && common_inkdepth::cfg().on && !ds_adaptive) {
+                idp_legacy = std::min(this->params.dspark_inkdepth_legacy, this->params.n_max);
+                idp = std::make_unique<common_inkdepth>();
+                idp->legacy = idp_legacy;
+                LOG_INF("%s: INKDEPTH per-round DSpark depth on: walk <= %d, fixed %d when several seqs draft (LLAMA_INKDEPTH=0 = off)\n",
+                        __func__, this->params.n_max, idp_legacy);
+            }
             LOG_INF("%s: DSpark draft depth %s %d..%d (LLAMA_DSPARK_MB_DEPTH=N, LLAMA_DSPARK_ADAPT=1)\n", __func__, ds_adaptive ? "adaptive" : "fixed",
                     ds_adaptive ? this->params.n_min_adaptive : this->params.n_max, this->params.n_max);
         }
@@ -1457,6 +1470,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // reseed per request rather than per round, or two identical requests differ
         dflash2_seed[seq_id] = -1;
+        if (idp) {
+            idp->cancel(); // the gap before a new request is not a round
+            idp_seq = -1;
+        }
         // INKSPEC2: a new request restarts the adaptive depth at its floor (as the MTP controller, #196)
         if (ds_adaptive && seq_id < (llama_seq_id) ds_ctrl.size()) {
             ds_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
@@ -1665,6 +1682,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> n_ctx_seq  (n_seq,  0);
+
+        // INKDEPTH: one drafting seq on the sampled walk -> walk W (picked between rounds), keep n chosen after the walk
+        int32_t idp_walk = 0;
+        idp_seq = -1;
+        if (idp) {
+            int nd = 0;
+            llama_seq_id one = -1;
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (dparams[s].drafting) {
+                    nd++;
+                    one = s;
+                }
+            }
+            const auto & dp1 = one >= 0 ? dparams[one] : dparams[0];
+            const bool sampled = nd == 1 && dp1.result_q && dp1.sampling && dp1.sampling->temp > 0.0f && dp1.sampling->mirostat == 0;
+            if (sampled) {
+                idp->begin_round(ggml_time_us());
+                idp_walk = std::min(idp->pick_walk(), params.n_max);
+                idp_seq  = one;
+            } else {
+                idp->cancel();
+            }
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1707,6 +1748,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // (the server's per-call bound dp.n_max is applied by the caller's truncation, as before, so the walk
                 // length, the noise stream and graph reuse do not follow it)
                 int32_t cap = ds_adaptive ? std::min(ds_ctrl[seq_id].n_cur, params.n_max) : params.n_max;
+                if (idp) {
+                    cap = seq_id == idp_seq ? idp_walk : idp_legacy;
+                }
+                n_ctx_seq[seq_id] = n;
                 cap = std::max(cap, std::min(params.n_min, params.n_max)); // a draft below n_min would be cleared every round
                 ds_cap [seq_id] = std::max(0, cap); // n_max 0 drafts nothing, as before
                 ds_last[seq_id] = 0;
@@ -1803,6 +1848,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         b++;
                     }
                 }
+            }
+            if (idp && idp_seq >= 0 && dspark_sk == 0) {
+                // INKDEPTH needs the sampled walk; an argmax round drafts at the old fixed depth
+                ds_cap[idp_seq] = std::max(std::min(ds_cap[idp_seq], idp_legacy), std::min(params.n_min, params.n_max));
+                idp->cancel();
+                idp_seq = -1;
+                int32_t wn = 0;
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    if (i_block_beg[s] >= 0) {
+                        wn = std::max(wn, ds_cap[s]);
+                    }
+                }
+                wn = wn > 0 ? std::min(wn, params.n_max) : params.n_max;
+                llama_set_dspark_walk(ctx_dft, walk_stop ? wn : 0);
             }
             llama_set_dspark_sample(ctx_dft, dspark_sk, dspark_st, dspark_sk ? dspark_noise.data() : nullptr, dspark_noise.size());
         }
@@ -1904,6 +1963,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     double conf = 1.0;
                     double conf_kept = 1.0; // CONF_STOP: product of q(d_i) over the kept slots
                     const float conf_stop = spec_conf_stop_th();
+                    float q_feat[common_inkdepth::MAXD] = {}; // INKDEPTH: slot qmax (pre-draw, depends on slots < i only)
                     const float * h = llama_get_embeddings_nextn(ctx_dft);
                     for (int32_t i = 1; h && i < std::min(n_block_tokens, ds_cap[seq_id] + 1); ++i) {
                         const float * row = h + (size_t) (beg + i) * n_embd_dec + dspark_rank;
@@ -1928,6 +1988,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         for (auto & c : q) {
                             c.p = (float) (c.p/z);
                             qmax = std::max(qmax, c.p);
+                        }
+                        if (i < common_inkdepth::MAXD) {
+                            q_feat[i] = qmax;
                         }
                         conf *= qmax;
                         if (i >= 2 && stop_th > 0.0f && conf < stop_th) {
@@ -1966,6 +2029,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (seq_id < (llama_seq_id) tree_margs.size()) {
                         auto & tm = tree_margs[seq_id];
                         tm.chain = tm.cand.size() == result.size() ? result : llama_tokens();
+                    }
+                    if (idp && seq_id == idp_seq) {
+                        if (result.empty()) {
+                            idp->cancel();
+                            idp_seq = -1;
+                        } else {
+                            const int keep = idp->choose(n_ctx_seq[seq_id], (int) result.size(), q_feat,
+                                    std::max(1, params.n_min), ggml_time_us());
+                            result.resize(keep);
+                            dp.result_q->resize(keep);
+                        }
                     }
                 } else if (dspark_ids) {
                     // the graph's own argmax ids (same first maximum), read from the chain-state rows
@@ -2086,6 +2160,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n_acc = n_accepted_ctrl >= 0 ? std::min<int32_t>(n_accepted_ctrl, n_accepted) : n_accepted;
             lattice_calib[seq_id].update(conf.data(), n_drafted, n_acc);
             conf.clear();
+        }
+        if (idp && !is_other && seq_id >= 0 && seq_id == idp_seq) {
+            // the kept count the verifier saw (the caller may cut the draft further near the context end)
+            int drafted = seq_id < (llama_seq_id) ds_last.size() ? ds_last[seq_id] : 0;
+            if (n_drafted_ctrl >= 0) {
+                drafted = std::min(drafted, (int) n_drafted_ctrl);
+            }
+            idp->accept(drafted, (int) n_accepted);
         }
         // INKSPEC2: feed the adaptive depth controller with this seq's own draft; under mode-biased accept the
         // count is capped at the exact-rule count (the first rescue, [MBFIX]) so mb drafts at the depths exact would
