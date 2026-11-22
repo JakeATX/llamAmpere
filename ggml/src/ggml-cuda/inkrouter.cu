@@ -5,9 +5,7 @@
 #include <mutex>
 #include <unordered_map>
 
-// Expert rows per block (one warp each). 128 experts -> 32 blocks.
-#define INKROUTER_ROWS_PER_BLOCK 4
-// The mul_mat_vec_f block size whose reduction the logit warps replay (mmvf picks it for ncols = 2304;
+// The mul_mat_vec_f block size whose launch the logit blocks repeat (mmvf picks it for ncols = 2304;
 // ggml_cuda_inkrouter_supported checks the pick for the actual ncols).
 #define INKROUTER_MMVF_BLOCK     256
 // Completion counters: one per backend context, so contexts on different streams never share one.
@@ -16,71 +14,61 @@
 // Zero at module load; the last block of every launch resets its slot, so a CUDA graph replays with no host work.
 static __device__ unsigned int g_inkrouter_done[INKROUTER_MAX_SLOTS];
 
+// Grid = n_experts blocks of INKROUTER_MMVF_BLOCK threads: block `row` is mul_mat_vec_f<nv_bfloat16, float, 1, 256,
+// false, false>'s block `row` (mmvf.cu: one dst column, no ids, no fusion, CUDA nv_bfloat162 branch), line for line.
 template <int n_experts, bool has_bias>
-static __global__ void __launch_bounds__(INKROUTER_ROWS_PER_BLOCK * WARP_SIZE)
+static __global__ void __launch_bounds__(INKROUTER_MMVF_BLOCK)
 k_inkrouter(const nv_bfloat16 * __restrict__ w, const float * __restrict__ y, float * logits, float * weights, int32_t * ids,
             const float * bias, const int ncols2, const int64_t stride_row, const int n_expert_used, const float clamp_val,
             const float scale_val, const topk_moe_config config, const int slot) {
-    constexpr int n_virt = INKROUTER_MMVF_BLOCK / WARP_SIZE; // warps of the mmvf block this warp stands in for
-    const int lane = threadIdx.x;
-    const int row  = blockIdx.x * INKROUTER_ROWS_PER_BLOCK + threadIdx.y;
+    constexpr int block_size = INKROUTER_MMVF_BLOCK;
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
 
     ggml_cuda_pdl_sync();
 
-    // mul_mat_vec_f<nv_bfloat16, float, 1, 256> (mmvf.cu, CUDA nv_bfloat162 branch): thread tid sums col2 = tid,
-    // tid + 256, ... with two ggml_cuda_mad per pair. Here sumf[v] is thread tid = v*32 + lane of that block.
-    const nv_bfloat162 * x2 = (const nv_bfloat162 *) (w + row * stride_row);
+    const nv_bfloat162 * x2 = (const nv_bfloat162 *) (w + row*stride_row);
     const float2       * y2 = (const float2 *) y;
 
-    float sumf[n_virt];
-#pragma unroll
-    for (int v = 0; v < n_virt; ++v) {
-        sumf[v] = 0.0f;
+    __shared__ float buf_iw[warp_size];
+    if (tid < warp_size) {
+        buf_iw[tid] = 0.0f;
     }
-    for (int base = 0; base < ncols2; base += INKROUTER_MMVF_BLOCK) {
-#pragma unroll
-        for (int v = 0; v < n_virt; ++v) {
-            const int col2 = base + v * WARP_SIZE + lane;
-            if (col2 < ncols2) {
-                const nv_bfloat162 tmpx = x2[col2];
-                const float2       tmpy = y2[col2];
-                ggml_cuda_mad(sumf[v], tmpx.x, tmpy.x);
-                ggml_cuda_mad(sumf[v], tmpx.y, tmpy.y);
-            }
-        }
+    __syncthreads();
+
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const nv_bfloat162 tmpx = x2[col2];
+        const float2       tmpy = y2[col2];
+        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
     }
 
     ggml_cuda_pdl_lc();
 
-    // mmvf's reduction: warp_reduce_sum in each warp, the warp sums into buf_iw[0..7] (buf_iw[8..31] stay 0.0f), then
-    // the first warp reads buf_iw[lane] and runs warp_reduce_sum again. Lane l < 8 holds warp l's sum here.
-    float s = 0.0f;
-#pragma unroll
-    for (int v = 0; v < n_virt; ++v) {
-        sumf[v] = warp_reduce_sum<WARP_SIZE>(sumf[v]);
-        if (lane == v) {
-            s = sumf[v];
-        }
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    buf_iw[tid/warp_size] = sumf;
+    __syncthreads();
+    if (tid >= warp_size) {
+        return; // mmvf's other warps are done here too (only thread 0 writes)
     }
-    s = warp_reduce_sum<WARP_SIZE>(s);
+    sumf = buf_iw[tid];
+    sumf = warp_reduce_sum<warp_size>(sumf);
 
-    if (lane == 0) {
-        logits[row] = s;
+    // completion count: thread 0 of every block; the warp learns by shuffle whether its block came last (no block barrier)
+    unsigned int prev = 0;
+    if (tid == 0) {
+        logits[row] = sumf;
         __threadfence();
+        prev = atomicAdd(&g_inkrouter_done[slot], 1u);
     }
-
-    __shared__ bool last;
-    __syncthreads();
-    if (lane == 0 && threadIdx.y == 0) {
-        const unsigned int prev = atomicAdd(&g_inkrouter_done[slot], 1u);
-        last = prev == gridDim.x - 1;
-        if (last) {
-            g_inkrouter_done[slot] = 0; // every block has counted: ready for the next launch
-        }
-    }
-    __syncthreads();
-    if (!last || threadIdx.y != 0) {
+    prev = __shfl_sync(0xFFFFFFFF, prev, 0, WARP_SIZE);
+    if (prev != gridDim.x - 1) {
         return;
+    }
+    if (tid == 0) {
+        g_inkrouter_done[slot] = 0; // every block has counted: ready for the next launch
     }
     __threadfence();
 
@@ -189,7 +177,7 @@ bool ggml_cuda_op_inkrouter(ggml_backend_cuda_context &     ctx,
 
     const int n_experts     = logits->ne[0];
     const int n_expert_used = weights->ne[1];
-    GGML_ASSERT(ggml_nrows(logits) == 1 && n_experts % INKROUTER_ROWS_PER_BLOCK == 0);
+    GGML_ASSERT(ggml_nrows(logits) == 1);
     GGML_ASSERT(ids->nb[1] / ggml_type_size(ids->type) == (size_t) n_experts);
 
     // ggml_cuda_op_topk_moe's arguments (topk-moe.cu)
@@ -210,8 +198,7 @@ bool ggml_cuda_op_inkrouter(ggml_backend_cuda_context &     ctx,
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;
 
-    const ggml_cuda_kernel_launch_params lp(dim3(n_experts / INKROUTER_ROWS_PER_BLOCK, 1, 1),
-                                            dim3(WARP_SIZE, INKROUTER_ROWS_PER_BLOCK, 1), 0, ctx.stream());
+    const ggml_cuda_kernel_launch_params lp(dim3(n_experts, 1, 1), dim3(INKROUTER_MMVF_BLOCK, 1, 1), 0, ctx.stream());
 
     const nv_bfloat16 * w_d       = (const nv_bfloat16 *) w->data;
     const float *       y_d       = (const float *) y->data;

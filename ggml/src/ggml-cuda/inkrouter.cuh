@@ -4,9 +4,9 @@
 #include "topk-moe.cuh"
 
 // [INKROUTER] decode MoE router in one launch: MUL_MAT(BF16 ffn_gate_inp [ncols, n_expert], x [ncols, 1]) followed by the
-// topk-moe chain (gating .. weights SCALE) that ggml_cuda_op_topk_moe runs. One warp per expert row replays the
-// mul_mat_vec_f reduction that ggml_cuda_mul_mat picks for this product (BF16, one column, block of 256), so the logits are
-// bit-identical to MMVF; the last block to finish runs topk_moe_cuda's per-row device code (topk-moe-device.cuh) on them,
+// topk-moe chain (gating .. weights SCALE) that ggml_cuda_op_topk_moe runs. One block of 256 threads per expert row runs
+// the mul_mat_vec_f block that ggml_cuda_mul_mat launches for this product (BF16, one column, block of 256), so the logits
+// are bit-identical to MMVF; the last block to finish runs topk_moe_cuda's per-row device code (topk-moe-device.cuh) on them,
 // so ids and weights are bit-identical to the topk-moe kernel.
 
 // Shape gate: n_expert is an instantiated count, the reduction replay matches the block size MMVF picks for ncols.
