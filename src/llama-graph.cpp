@@ -9504,6 +9504,29 @@ static bool llama_inkfa_prefill_on() {
     return on;
 }
 
+// can the K/V device run the prefill-width INKREL node (CUDA, inkfa)? Anything else (a CPU / host K/V buffer, another
+// backend, a pre-Ampere card) keeps the dense prefill path: the CPU reference of INKREL nodes is far slower than it.
+static bool llama_inkfa_device_ok(ggml_context * ctx0, ggml_tensor * q_cur, ggml_tensor * kv, ggml_tensor * vv, ggml_tensor * raw,
+        ggml_tensor * table, ggml_tensor * rel_pos, ggml_tensor * sinks, ggml_tensor * gate, float kq_scale) {
+    const ggml_tensor * ks = kv->view_src ? kv->view_src : kv;
+    if (!ks->buffer) {
+        return true; // memory-fit dry run: planned as the device run
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(ks->buffer));
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return false;
+    }
+    // a probe node, same shapes as the one build_attn_rel_base adds (not part of the graph)
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx0, ggml_permute(ctx0, q_cur, 0, 2, 1, 3), ggml_permute(ctx0, kv, 0, 2, 1, 3),
+            ggml_permute(ctx0, vv, 0, 2, 1, 3), raw, kq_scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_add_sinks(fa, sinks);
+    ggml_prec_set_acc(fa, GGML_PREC_F32);
+    ggml_tensor * g2 = gate && ggml_is_contiguous(gate) ? ggml_reshape_2d(ctx0, gate, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]) : nullptr;
+    ggml_flash_attn_ext_set_inkrel(fa, table, rel_pos, g2);
+    return ggml_backend_dev_supports_op(dev, fa);
+}
+
 ggml_tensor * llm_graph_context::build_attn_rel_base(
         llm_graph_input_mem_hybrid_iswa_rel * inp,
         ggml_tensor * q_cur,
@@ -9559,11 +9582,12 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
         if (am.rows == nullptr && raw->type == GGML_TYPE_F16 && raw->ne[2] == 1 && raw->ne[3] == 1 &&
                 kv->type == GGML_TYPE_F16 && vv->type == GGML_TYPE_F16 && kv->ne[3] == 1 && vv->nb[1] < vv->nb[2] &&
                 kv->ne[0] == 128 && vv->ne[0] == 128 && q_cur->ne[0] == 128 && n_head % n_head_kv == 0 &&
-                (((n_head/n_head_kv)*n_tok <= 16 && kv->ne[2] >= llama_inkattn_min_kv()) || (is_swa && llama_inkfa_prefill_on())) &&
                 rel_pos->ne[0] == kv->ne[2] && rel_pos->ne[1] == n_tok &&
                 !rot && !mctx_l->get_k_scale(il) && !mctx_l->get_v_scale(il) &&
                 hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
-                sinks && sinks->type == GGML_TYPE_F32 && (!gate || gate->type == GGML_TYPE_F32)) {
+                sinks && sinks->type == GGML_TYPE_F32 && (!gate || gate->type == GGML_TYPE_F32) &&
+                (((n_head/n_head_kv)*n_tok <= 16 && kv->ne[2] >= llama_inkattn_min_kv()) ||
+                 (is_swa && llama_inkfa_prefill_on() && llama_inkfa_device_ok(ctx0, q_cur, kv, vv, raw, table, rel_pos, sinks, gate, kq_scale)))) {
             ggml_build_forward_expand(gf, q_cur);
             ggml_build_forward_expand(gf, k_cur);
             ggml_build_forward_expand(gf, v_cur);

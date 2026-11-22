@@ -5,7 +5,7 @@
 //   K, V : [2][64 keys][128 + 8] f16 in shared memory, filled by cp.async one tile ahead
 //   S    = Q K^T  (B fragments by ldmatrix), logits in log2 units: (S + f16(mask + bias)) * log2(e)
 //   O   += P V    (P = the S accumulators as f16 A fragments, V fragments by ldmatrix.trans)
-// Only the key tiles some row of the block sees are visited (inkfa_tiles lists them from the base mask); a warp whose
+// Only the key tiles some row of the block sees are visited (inkfa_tile_flags + inkfa_tile_lists list them from the base mask); a warp whose
 // 16 rows see no key of a visited tile skips its MMAs.
 // Fragment layout (m16n8k16, lane = 4 gr + tq): A a0 (gr, 2tq..), a1 (gr+8, 2tq..), a2 (gr, 2tq+8..), a3 (gr+8, 2tq+8..);
 // B b0 (k 2tq.., n gr), b1 (k 2tq+8.., n gr); C c0,c1 (gr, 2tq..), c2,c3 (gr+8, 2tq..).
@@ -119,32 +119,42 @@ static __device__ __forceinline__ void fa_load_tile(half * Ks, half * Vs, const 
     }
 }
 
-// the key tiles that some row of each BM-row block sees: tiles[rb][0, n_tiles[rb]) in increasing order
+// live[rb][tile] = some row of the BM-row block rb sees some key of the tile (a non -inf base mask cell)
 template <int BM>
-static __global__ void inkfa_tiles(const half * __restrict__ M, const int64_t m_t, const int T, const int n_kv, const int NT,
-        int32_t * __restrict__ tiles, int32_t * __restrict__ n_tiles) {
-    const int rb  = blockIdx.x;
-    const int tid = threadIdx.x;
-    int cnt = 0;
-    for (int tile = 0; tile < NT; ++tile) {
-        const int k0 = tile*FA_BN;
-        bool live = false;
-        for (int e = tid; e < BM*FA_BN; e += blockDim.x) {
-            const int row = rb*BM + e / FA_BN;
-            const int key = k0 + e % FA_BN;
-            if (row < T && key < n_kv && __half2float(M[(int64_t) row*m_t + key]) != -INFINITY) {
-                live = true;
-            }
-        }
-        live = __syncthreads_or(live);
-        if (live) {
-            if (tid == 0) {
-                tiles[(int64_t) rb*NT + cnt] = tile;
-            }
-            ++cnt;
+static __global__ void inkfa_tile_flags(const half * __restrict__ M, const int64_t m_t, const int T, const int n_kv, const int NT,
+        uint8_t * __restrict__ live) {
+    const int tile = blockIdx.x;
+    const int rb   = blockIdx.y;
+    bool any = false;
+    for (int e = threadIdx.x; e < BM*FA_BN; e += blockDim.x) {
+        const int row = rb*BM + e / FA_BN;
+        const int key = tile*FA_BN + e % FA_BN;
+        if (row < T && key < n_kv && __half2float(M[(int64_t) row*m_t + key]) != -INFINITY) {
+            any = true;
         }
     }
-    if (tid == 0) {
+    any = __syncthreads_or(any);
+    if (threadIdx.x == 0) {
+        live[(int64_t) rb*NT + tile] = any;
+    }
+}
+
+// tiles[rb][0, n_tiles[rb]) = the live tiles of row block rb, in increasing order; one warp per row block
+static __global__ void inkfa_tile_lists(const uint8_t * __restrict__ live, const int NT, int32_t * __restrict__ tiles,
+        int32_t * __restrict__ n_tiles) {
+    const int rb   = blockIdx.x;
+    const int lane = threadIdx.x;
+    int cnt = 0;
+    for (int t0 = 0; t0 < NT; t0 += WARP_SIZE) {
+        const int  t = t0 + lane;
+        const bool l = t < NT && live[(int64_t) rb*NT + t];
+        const unsigned bal = __ballot_sync(0xFFFFFFFF, l);
+        if (l) {
+            tiles[(int64_t) rb*NT + cnt + __popc(bal & ((1u << lane) - 1))] = t;
+        }
+        cnt += __popc(bal);
+    }
+    if (lane == 0) {
         n_tiles[rb] = cnt;
     }
 }
@@ -377,6 +387,13 @@ static bool fa_aligned(const void * ptr, const int64_t a, const int64_t b, const
     return (reinterpret_cast<uintptr_t>(ptr) % n) == 0 && a % n == 0 && b % n == 0;
 }
 
+// as fa_aligned, for a tensor that may not be allocated yet (graph planning): then its offset in the view source
+// (buffers themselves are at least 32-byte aligned)
+static bool fa_aligned_t(const ggml_tensor * t, const int64_t n) {
+    const uintptr_t off = t->data ? reinterpret_cast<uintptr_t>(t->data) : (t->view_src ? (uintptr_t) t->view_offs : 0);
+    return off % n == 0 && t->nb[1] % n == 0 && t->nb[2] % n == 0;
+}
+
 // shape and type checks (no data pointers: also used while planning the graph)
 static bool inkfa_check(const int cc, const ggml_tensor * dst) {
     if (!ggml_cuda_inkfa_enabled() || !ggml_flash_attn_ext_is_inkrel(dst)) {
@@ -423,17 +440,15 @@ static bool inkfa_check(const int cc, const ggml_tensor * dst) {
             mask->nb[1] % sizeof(half) != 0) {
         return false;
     }
-    if (Q->nb[0] != sizeof(float) || !fa_aligned(Q->data, Q->nb[1], Q->nb[2], 8) ||
-            K->nb[0] != sizeof(half) || !fa_aligned(K->data, K->nb[1], K->nb[2], 16) ||
-            V->nb[0] != sizeof(half) || !fa_aligned(V->data, V->nb[1], V->nb[2], 16) ||
-            dst->nb[0] != sizeof(float) || dst->ne[0] != FA_D || dst->ne[1] != H || dst->ne[2] != T ||
-            !fa_aligned(dst->data, dst->nb[1], dst->nb[2], 8)) {
+    if (Q->nb[0] != sizeof(float) || !fa_aligned_t(Q, 8) || K->nb[0] != sizeof(half) || !fa_aligned_t(K, 16) ||
+            V->nb[0] != sizeof(half) || !fa_aligned_t(V, 16) ||
+            dst->nb[0] != sizeof(float) || dst->ne[0] != FA_D || dst->ne[1] != H || dst->ne[2] != T || !fa_aligned_t(dst, 8)) {
         return false;
     }
     if (tab->type != GGML_TYPE_F32 || !ggml_is_contiguous(tab) || tab->ne[0] != H || tab->ne[2] != T || tab->ne[3] != 1 ||
-            rp->type != GGML_TYPE_I32 || rp->nb[0] != sizeof(int32_t) || rp->ne[0] != n_kv || rp->ne[1] != T ||
-            rp->ne[2] != 1 || rp->ne[3] != 1) {
-        return false;
+            rp->type != GGML_TYPE_I32 || rp->nb[0] != sizeof(int32_t) || rp->nb[1] % sizeof(int32_t) != 0 ||
+            rp->ne[0] != n_kv || rp->ne[1] != T || rp->ne[2] != 1 || rp->ne[3] != 1 || H > 256) {
+        return false; // (the limits of ink_rel_bias_make, so that try() takes every node this accepts)
     }
     if (gate && (gate->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) || gate->ne[0] != FA_D*H || gate->ne[1] != T)) {
         return false;
@@ -447,10 +462,12 @@ static void inkfa_launch(ggml_backend_cuda_context & ctx, inkfa_params & p, cons
     cudaStream_t stream = ctx.stream();
     const int n_rb = (p.T + BM - 1) / BM;
     ggml_cuda_pool_alloc<int32_t> tiles(ctx.pool(), (size_t) n_rb*p.NT + n_rb);
+    ggml_cuda_pool_alloc<uint8_t> live(ctx.pool(), (size_t) n_rb*p.NT);
     p.tiles   = tiles.get();
     p.n_tiles = tiles.get() + (size_t) n_rb*p.NT;
-    inkfa_tiles<BM><<<n_rb, 256, 0, stream>>>((const half *) mask->data, p.m_t, p.T, p.n_kv, p.NT,
-        (int32_t *) p.tiles, (int32_t *) p.n_tiles);
+    inkfa_tile_flags<BM><<<dim3(p.NT, n_rb), 256, 0, stream>>>((const half *) mask->data, p.m_t, p.T, p.n_kv, p.NT, live.get());
+    CUDA_CHECK(cudaGetLastError());
+    inkfa_tile_lists<<<n_rb, WARP_SIZE, 0, stream>>>(live.get(), p.NT, (int32_t *) p.tiles, (int32_t *) p.n_tiles);
     CUDA_CHECK(cudaGetLastError());
 
     static bool smem_set[GGML_CUDA_MAX_DEVICES] = {false};
@@ -504,10 +521,11 @@ bool ggml_cuda_inkfa_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     p.NT = (p.n_kv + FA_BN - 1) / FA_BN;
     memcpy(&p.scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    // 8 warps (128 rows) share each K/V tile when that still gives >= 2 blocks per SM; 4 warps otherwise
+    // 8 warps (128 rows) share each K/V tile (one 69.6 KB block per SM on 100 KB/SM cards either way); 4 warps only when
+    // the 8-warp blocks would not cover the SMs. GGML_CUDA_INKFA_NW=4/8 forces one.
     static const int nw_env = [] { const char * e = getenv("GGML_CUDA_INKFA_NW"); return e ? atoi(e) : 0; }();
     const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
-    const bool wide = nw_env ? nw_env == 8 : (int64_t) ((p.T + 127)/128)*p.H >= 2*nsm;
+    const bool wide = nw_env ? nw_env == 8 : (int64_t) ((p.T + 127)/128)*p.H >= nsm;
     if (wide) {
         inkfa_launch<8>(ctx, p, mask);
     } else {

@@ -18327,11 +18327,12 @@ static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc);
 struct test_flash_attn_ext_inkrel : public test_case {
     const int64_t H, Hkv, kv, T, rows;
     const bool gate;
+    const int64_t win; // > 0: sliding-window band mask, row r sees keys [kv - T + r - win, kv - T + r] (whole tiles masked)
 
-    test_flash_attn_ext_inkrel(int64_t H, int64_t Hkv, int64_t kv, int64_t T, int64_t rows, bool gate)
-        : H(H), Hkv(Hkv), kv(kv), T(T), rows(rows), gate(gate) {}
+    test_flash_attn_ext_inkrel(int64_t H, int64_t Hkv, int64_t kv, int64_t T, int64_t rows, bool gate, int64_t win = 0)
+        : H(H), Hkv(Hkv), kv(kv), T(T), rows(rows), gate(gate), win(win) {}
 
-    std::string vars() override { return VARS_TO_STR6(H, Hkv, kv, T, rows, gate) + ",inkrel=1"; }
+    std::string vars() override { return VARS_TO_STR6(H, Hkv, kv, T, rows, gate) + (win ? ",win=" + std::to_string(win) : "") + ",inkrel=1"; }
     std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -18389,7 +18390,8 @@ struct test_flash_attn_ext_inkrel : public test_case {
                 const int64_t b0 = gen() % kv, b1 = std::min<int64_t>(kv, b0 + 1 + gen() % 40);
                 for (int64_t r = 0; r < t->ne[1]; ++r) {
                     for (int64_t c = 0; c < kv; ++c) {
-                        const bool vis = c <= kv - T + r && !(c >= b0 && c < b1 && c > 0);
+                        const bool vis = win > 0 ? (c <= kv - T + r && c >= kv - T + r - win) :
+                                                   (c <= kv - T + r && !(c >= b0 && c < b1 && c > 0));
                         d[r*kv + c] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
                     }
                 }
@@ -18491,6 +18493,11 @@ static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, b
         }
     }
     cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, 3072, 512, 1025, true));
+    for (int64_t w : {40, 300}) { // whole masked tiles: non-contiguous tile lists, warps that skip a tile
+        cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, 3072, 512, 1025, true, w));
+        cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, 1536, 200, 1025, false, w));
+        cases.emplace_back(new test_flash_attn_ext_inkrel(8, 8, 1000, 300, 129, true, w)); // H 8: 4-warp blocks
+    }
     cases.emplace_back(new test_flash_attn_ext_inkrel(16, 4, 1000, 300, 129, false));
     // several sequences (mask ne[3] = S), other group sizes (g 1 / 4 / 8)
     for (int64_t kv : {113, 1536}) {
