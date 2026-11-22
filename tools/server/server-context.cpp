@@ -2374,7 +2374,9 @@ private:
             const bool dspark = params.speculative.has_dft() &&
                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
             params.speculative.copy_first = common_speculative_copy_params::resolve_first(
-                    params.speculative.copy_first, dspark && params.n_parallel == 1, 32);
+                    params.speculative.copy_first, dspark && params.n_parallel == 1, 0);
+            // INKCOPY gate (HOME 3090 Ti, 4/4, DSpark d4): edit/quote tasks +33% but normal chat not faster (3K +0.2%,
+            // 100K -2.4% over 6 seeds), so auto stays off; opt in with --spec-copy-first 32 or LLAMA_SPEC_COPY_FIRST=32
             // an explicit N needs a drafter a span can stand in for, else it would only raise n_rs_seq / outputs
             const bool dflash = params.speculative.has_dft() &&
                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();

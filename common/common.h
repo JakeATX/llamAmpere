@@ -490,8 +490,8 @@ struct common_params_speculative {
     bool    copy_rs   = false;
 
     // copy-first (--spec-copy-first N): a lookup span of up to N tokens verified INSTEAD of the drafter's block when
-    // the last tokens repeat earlier text (DFlash/DSpark drafters, see speculative-copy.h). -1 = auto (default): on at
-    // 32 for a DSpark drafter with one slot; LLAMA_SPEC_COPY_FIRST=N overrides auto, 0 = off (kill switch).
+    // the last tokens repeat earlier text (DFlash/DSpark drafters, see speculative-copy.h). -1 = auto (default): off
+    // (opt-in: edit/quote work); LLAMA_SPEC_COPY_FIRST=N turns it on for a DSpark drafter with one slot, 0 = off.
     int32_t copy_first = -1;
 
     // per-token recurrent-state snapshots the target context must keep so that a partial draft
