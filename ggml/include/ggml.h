@@ -492,6 +492,8 @@ extern "C" {
         GGML_OP_LSA_COMP_MERGE,
         GGML_OP_LSA_UNIT_LSE,
         GGML_OP_LSA_PREFETCH,
+        GGML_OP_DEPTH_MIX,
+        GGML_OP_LOOP_GATE,
 
         GGML_OP_UNARY,
 
@@ -2466,6 +2468,30 @@ extern "C" {
             struct ggml_tensor  * mask,
             int                   F,
             float                 tau);
+
+    // fork (INKFLAGS, Inkling 2 attention over depth, LLAMA_INKLING2_MIX_FUSED): states = the rows of stack (F32 [n, k, T],
+    // already normed, newest first; NULL when k = 0) then rms_norm(cur) (cur F32 [n, T], eps, no weight);
+    // p[j, q, t] = softmax_j(scale * dot(states[:, j, t], query[:, q])), query F32 [n, nq];
+    // result F32 [n, nq, T] = sum_j p[j, q, t] * states[:, j, t]
+    GGML_API struct ggml_tensor * ggml_depth_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * stack,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * query,
+            float                 eps,
+            float                 scale);
+
+    // fork (INKFLAGS, Inkling 2 loop gate, LLAMA_INKLING2_GATE_FUSED): x, m F32 [n, T] (rows may be strided);
+    // down [2n, R], gain and forget [R, n], F32/F16/BF16. g = down . concat(rms_norm(x), rms_norm(m)) (eps, no weight);
+    // result F32 [n, T] = x - tanh(forget . g)*x + tanh(gain . g)*m
+    GGML_API struct ggml_tensor * ggml_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget,
+            float                 eps);
 
     // LLAMA_LSA_J3 (opt-in): side-stream prefetch into the record-page slots of a later LSA layer's resident SJ-KVaRN
     // body. desc: that layer's SJ-KVaRN descriptor (I32); body: its body tensor; units: F32 [n_units, rows] 0/1

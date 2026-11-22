@@ -11,6 +11,7 @@
 #include "fattn-i8qk.cuh"
 #include "convert.cuh"
 #include "kv-stream-span-tuner.h"
+#include "inkattn.cuh"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1332,8 +1333,9 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
-    if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
-        return false; // kv_rows (src[9]): the kv-stream streamed FA reads K/V pages in cell order only
+    if (ggml_flash_attn_ext_uses_src9(dst)) {
+        return false; // kv_rows or an LSE output (src[9]): the kv-stream streamed FA reads K/V pages in cell order
+                      // only and writes no LSE
     }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -2902,7 +2904,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     //     (incl. turbo2/3/4) are skipped here: their loaders dequantize into SMEM via the
     //     swizzled/padded tile helpers rather than reading nb[] directly, so the 16-byte-stride
     //     alignment this loop checks for doesn't apply to them.
-    bool use_gqa_opt = mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    // a mask with a head dimension is not shared by the Q heads of a K/V head
+    bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -3283,7 +3286,7 @@ static bool ggml_cuda_flash_attn_ext_mma_turbo_use_gqa(const ggml_tensor * dst) 
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // Mirror the f16 use_gqa_opt computation. Quantized tensors are skipped in the nb%16 loop.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -3767,8 +3770,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
-    // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    // The kernel versions without this optimization are also used for ALiBi, if there is no mask, if the mask has a head dimension,
+    //     or if the KV cache is not padded,
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -3860,7 +3864,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
+        // the kv_rows mask is compacted per sequence, it has no head dimension
+        if (kv_rows) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // the logit softcap kernels are compiled for these head sizes only
+        float logit_softcap;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        if (logit_softcap != 0.0f && Q->ne[0] != 128 && Q->ne[0] != 256) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 
     // only the MMA kernel reads K/V through kv_rows (fork: and only its generic f16 route, see ggml_cuda_fattn_kv_rows_route_ok)
@@ -3927,7 +3940,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 640 || Q->ne[0] == 192) ? 16 : 8);
     int gqa_ratio_eff = 1;
-    while (max_bias == 0.0f && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
+    while (max_bias == 0.0f && (!mask || mask->ne[2] == 1) && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
         gqa_ratio_eff *= 2;
     }
 
@@ -4367,6 +4380,9 @@ static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor 
 static bool ggml_cuda_fattn_mask_is_packed(const ggml_tensor * dst);            // [#175] below
 
 bool ggml_cuda_flash_attn_ext_bounded_prefill_applies(int device, const ggml_tensor * dst) {
+    if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        return false; // INKATTN only
+    }
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         return false; // kv_rows (src[9]): runs on the generic MMA route only
     }
@@ -4590,6 +4606,9 @@ size_t ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size(int device, const gg
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        return ggml_nbytes(dst); // INKATTN only: scratch from the pool
+    }
     if (ggml_cuda_fattn_mask_is_packed(dst)) {
         // [#175] reserve as for the f16 mask: the routes plan the same scratch either way (the expansion is pool memory)
         ggml_tensor m2;
@@ -4931,6 +4950,11 @@ static bool ggml_cuda_fattn_prefix_supported(int device, const ggml_tensor * dst
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    // fork (INKATTN): relative bias table + gate inside the node (ggml-inkrel.h): no other route reads them
+    if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        GGML_ASSERT(ggml_cuda_inkattn_try(ctx, dst) && "INKREL flash attention node refused by INKATTN");
+        return;
+    }
     // kv_rows (src[9]; upstream src[5]): only upstream's generic MMA f16 kernel reads K/V through the row lists.
     // The fork routes (SJ-KVaRN, QSA rows, TurboQuant/TQ, fused/i8qk/bounded prefill, vec/tile) would silently ignore them.
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
@@ -4998,13 +5022,23 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // fork (INKATTN): GQA-grouped tensor-core decode for D 128 F16 K/V, g*T <= 16 (GGML_CUDA_INKATTN=0 = off)
+    if (ggml_cuda_inkattn_try(ctx, dst)) {
+        return;
+    }
+
     // fork (LSA compensation, opt-in): an LSE output (src[9]) is written only by the parallel-block combine of the
-    // generic kernels, so skip the fused / i8qk / bounded routes and take tile instead of MMA (MMA launches stream-k)
+    // generic kernels or the MMA stream-k uniform fixup, so skip the fused / i8qk / bounded routes
     if (ggml_flash_attn_ext_get_lse(dst) != nullptr) {
         const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
         GGML_ASSERT(k != BEST_FATTN_KERNEL_NONE);
+        // MMA f16 with the stream-k uniform fixup writing the LSE (INKREL 32K gate: within the batch-split rounding
+        // floor, prefill faster than tile); GGML_CUDA_FA_LSE_MMA=0 restores the tile route
+        static const bool lse_mma = [] { const char * e = getenv("GGML_CUDA_FA_LSE_MMA"); return !(e && *e) || atoi(e) != 0; }();
         if (k == BEST_FATTN_KERNEL_VEC) {
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        } else if (k == BEST_FATTN_KERNEL_MMA_F16 && lse_mma) {
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
         } else {
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
         }
@@ -5044,6 +5078,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        return ggml_cuda_inkattn_supported(device, dst);
+    }
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         // kv_rows (src[9]): generic MMA f16 route only (see ggml_cuda_flash_attn_ext)
         return ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;

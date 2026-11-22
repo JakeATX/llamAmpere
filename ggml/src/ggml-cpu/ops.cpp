@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "ggml-inkrel.h"
 #include "../ggml-sjkvarn.h"
 
 #include "ggml-cpu.h"
@@ -9263,12 +9264,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        // INKREL (ggml-inkrel.h): bias table[h, rel_pos[ic, iq1], iq1] added to the mask, rounded to f16 like a per-head mask
+        const ggml_tensor * ir_tab = ggml_flash_attn_ext_inkrel_table(dst);
+        const ggml_tensor * ir_pos = ggml_flash_attn_ext_inkrel_pos(dst);
+        const float   * ir_trow = ir_tab ? (const float *) ((const char *) ir_tab->data + iq1*ir_tab->nb[2] + iq2*ir_tab->nb[0]) : nullptr;
+        const int32_t * ir_prow = ir_pos ? (const int32_t *) ((const char *) ir_pos->data + iq1*ir_pos->nb[1]) : nullptr;
+        const size_t    ir_tnb1 = ir_tab ? ir_tab->nb[1] : 0;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
+            const float mv = ir_trow ? GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(mp[ic]) +
+                                 *(const float *) ((const char *) ir_trow + ir_prow[ic]*ir_tnb1))) :
+                             mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
                              mw ? slope*((mw[ic >> 5] >> (ic & 31)) & 1 ? 0.0f : -INFINITY) :
                              mask_imp ? slope*(ic < mlim ? 0.0f : -INFINITY) : 0.0f;
             if (mv == -INFINITY) {
@@ -9355,6 +9365,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             // V /= S
             const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
             ggml_vec_scale_f32(DV, VKQ32, S_inv);
+            if (const ggml_tensor * gate = ggml_flash_attn_ext_inkrel_gate(dst)) { // INKREL output gate: * sigmoid(gate)
+                const float * gr = (const float *) ((const char *) gate->data + iq1*gate->nb[1]) + iq2*DV;
+                for (int64_t d = 0; d < DV; ++d) {
+                    VKQ32[d] *= 1.0f/(1.0f + expf(-gr[d]));
+                }
+            }
 
             // dst indices
             const int i1 = iq1;
@@ -10074,7 +10090,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     // an LSE output (src[9], LSA compensation) is written by the plain one-chunk path only
-    const bool use_ref = params->use_ref || ggml_flash_attn_ext_get_lse(dst) != nullptr;
+    const bool use_ref = params->use_ref || ggml_flash_attn_ext_get_lse(dst) != nullptr || ggml_flash_attn_ext_is_inkrel(dst);
 
     // with kv_rows the loops run over the mask columns, the split KV path does not support it
     const ggml_tensor * kv_rows = ggml_flash_attn_ext_get_kv_rows(dst); // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)
@@ -14038,6 +14054,129 @@ void ggml_compute_forward_lsa_comp_merge(
         }
         for (int64_t d = 0; d < Dv; ++d) {
             out[d] = (float) ((wk*orow[d] + acc[d])/z);
+        }
+    }
+}
+
+// ggml_compute_forward_depth_mix (fork, Inkling 2 attention over depth; see ggml.h). Tokens are split over the threads.
+
+void ggml_compute_forward_depth_mix(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * cur   = dst->src[0];
+    const ggml_tensor * query = dst->src[1];
+    const ggml_tensor * stack = dst->src[2];
+
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n  = cur->ne[0];
+    const int64_t T  = cur->ne[1];
+    const int64_t nq = query->ne[1];
+    const int64_t k  = stack ? stack->ne[1] : 0;
+
+    std::vector<const float *> rows(k + 1);
+    std::vector<float> p((k + 1)*nq);
+
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        const float * x = (const float *) ((const char *) cur->data + t*cur->nb[1]);
+        ggml_float ss = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            ss += (ggml_float) (x[i]*x[i]);
+        }
+        const float r = 1.0f/sqrtf((float) (ss/n) + eps);
+        for (int64_t j = 0; j < k; ++j) {
+            rows[j] = (const float *) ((const char *) stack->data + t*stack->nb[2] + j*stack->nb[1]);
+        }
+        rows[k] = x;
+        for (int64_t q = 0; q < nq; ++q) {
+            const float * w = (const float *) ((const char *) query->data + q*query->nb[1]);
+            float mx = -INFINITY;
+            for (int64_t j = 0; j <= k; ++j) {
+                float d = 0.0f;
+                for (int64_t i = 0; i < n; ++i) {
+                    d += rows[j][i]*w[i];
+                }
+                p[j*nq + q] = scale*(j == k ? r : 1.0f)*d;
+                mx = std::max(mx, p[j*nq + q]);
+            }
+            float sum = 0.0f;
+            for (int64_t j = 0; j <= k; ++j) {
+                p[j*nq + q] = expf(p[j*nq + q] - mx);
+                sum += p[j*nq + q];
+            }
+            for (int64_t j = 0; j <= k; ++j) {
+                p[j*nq + q] /= sum;
+            }
+        }
+        float * out = (float *) ((char *) dst->data + t*dst->nb[2]);
+        for (int64_t q = 0; q < nq; ++q) {
+            for (int64_t i = 0; i < n; ++i) {
+                float acc = 0.0f;
+                for (int64_t j = 0; j <= k; ++j) {
+                    acc += p[j*nq + q]*(j == k ? rows[j][i]*r : rows[j][i]);
+                }
+                out[q*n + i] = acc;
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_loop_gate (fork, Inkling 2 loop gate; see ggml.h). Tokens are split over the threads.
+
+static float loop_gate_w(const ggml_tensor * w, int64_t i) {
+    switch (w->type) {
+        case GGML_TYPE_F16:  return GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) w->data)[i]);
+        case GGML_TYPE_BF16: return GGML_BF16_TO_FP32(((const ggml_bf16_t *) w->data)[i]);
+        default:             return ((const float *) w->data)[i];
+    }
+}
+
+void ggml_compute_forward_loop_gate(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * m      = dst->src[1];
+    const ggml_tensor * down   = dst->src[2];
+    const ggml_tensor * gain   = dst->src[3];
+    const ggml_tensor * forget = dst->src[4];
+
+    const float   eps = ggml_get_op_params_f32(dst, 0);
+    const int64_t n   = x->ne[0];
+    const int64_t R   = down->ne[1];
+
+    std::vector<float> in(2*n), g(R);
+    for (int64_t t = params->ith; t < x->ne[1]; t += params->nth) {
+        const float * xr = (const float *) ((const char *) x->data + t*x->nb[1]);
+        const float * mr = (const float *) ((const char *) m->data + t*m->nb[1]);
+        ggml_float sx = 0.0, sm = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            sx += (ggml_float) (xr[i]*xr[i]);
+            sm += (ggml_float) (mr[i]*mr[i]);
+        }
+        const float rx = 1.0f/sqrtf((float) (sx/n) + eps);
+        const float rm = 1.0f/sqrtf((float) (sm/n) + eps);
+        for (int64_t i = 0; i < n; ++i) {
+            in[i]     = xr[i]*rx;
+            in[n + i] = mr[i]*rm;
+        }
+        for (int64_t r = 0; r < R; ++r) {
+            float d = 0.0f;
+            for (int64_t i = 0; i < 2*n; ++i) {
+                d += loop_gate_w(down, r*2*n + i)*in[i];
+            }
+            g[r] = d;
+        }
+        float * out = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = 0; i < n; ++i) {
+            float ag = 0.0f, af = 0.0f;
+            for (int64_t r = 0; r < R; ++r) {
+                ag += loop_gate_w(gain,   i*R + r)*g[r];
+                af += loop_gate_w(forget, i*R + r)*g[r];
+            }
+            out[i] = (xr[i] - tanhf(af)*xr[i]) + tanhf(ag)*mr[i];
         }
     }
 }

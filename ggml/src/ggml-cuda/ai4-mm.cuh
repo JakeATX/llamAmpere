@@ -6,6 +6,9 @@
 // GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 (dequant to f32 + the same cublasSgemm); without the second flag sm_86 runs the
 // quantized cuBLAS path in fp16 compute. No mmvq/mmq/mmf.
 void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+#define GGML_CUDA_AI4_GRP_MAX 8   // = ai4k::MMV_GRP_MAX
+// [INKDENSE] grouped decode mmv over n MUL_MATs that share src1 (false = not taken, nothing launched)
+bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);
 
 // AI+ unit types: shapes and layouts the CUDA backend runs (MUL_MAT and MUL_MAT_ID)
 bool ggml_cuda_ai4_supported(const ggml_tensor * op);

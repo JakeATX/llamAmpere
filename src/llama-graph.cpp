@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "ggml-inkrel.h"
 #include "llama-lsa.h"
 #include "../ggml/src/ggml-lsa-recall.h"
 #include "llama-lsa-gather.h"
@@ -1804,6 +1805,122 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     return res;
 }
 
+void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch) {
+    const auto * attn_ctx = mctx->get_attn();
+
+    // base tensors may not be allocated if there are no non-SWA attention layers
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        attn_ctx->get_base()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+        attn_ctx->get_base()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
+
+    if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
+        attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (self_rel_pos->buffer) {
+        attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+    }
+
+    // swa tensors may not be allocated if there are no SWA attention layers
+    if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
+        attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
+        attn_ctx->get_swa()->set_input_v_idxs(inp_attn->self_v_idxs_swa, ubatch);
+    }
+
+    if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
+        attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
+    }
+
+    if (self_rel_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
+    if (inkrel.on && inkrel.far_mask->buffer) {
+        attn_ctx->get_base()->set_input_inkrel(inkrel, ubatch, extent);
+    }
+
+    if (inklsa_on) {
+        attn_ctx->get_base()->set_input_inklsa(inklsa, ubatch, extent);
+        for (const auto & c : inklsa_commit) {
+            llama_inklsa_idx_commit(c.first, c.second);
+        }
+    }
+
+    const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    if (inp_rs->s_copy) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+        int32_t * data = (int32_t *) inp_rs->s_copy->data;
+
+        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx->get_recr()->s_copy(i);
+        }
+    }
+}
+
+bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx);
+
+    this->mctx = mctx;
+
+    bool res = true;
+
+    const auto * attn_ctx = mctx->get_attn();
+
+    // the masks are always dense, see build_inp_mem_hybrid_iswa_rel()
+
+    // base tensors may not be allocated if there are no non-SWA attention layers
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    }
+
+    res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
+
+    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+    res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+
+    // swa tensors may not be allocated if there are no SWA attention layers
+    if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
+        res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
+    }
+
+    res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
+
+    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    {
+        const int64_t n_kv = attn_ctx->get_base()->get_n_kv();
+        const bool want = params.cparams.flash_attn && !params.cparams.training && params.cparams.n_seq_max == 1 &&
+                params.ubatch.n_seqs_unq <= 1 && llama_inkrel_want(n_kv, params.ubatch.n_tokens, extent);
+        res &= want == inkrel.on;
+        if (inkrel.on) {
+            res &= inkrel.far_mask->ne[0] == n_kv && inkrel.far_mask->ne[1] == params.ubatch.n_tokens;
+        }
+    }
+
+    if (inklsa_on) {
+        // a rebuild graph is never reused; a graph built on a valid index only while every index is still valid
+        res &= !inklsa_rebuild;
+        res &= params.ubatch.n_seqs_unq == 1 || !inklsa.sparse;
+        for (const ggml_tensor * kc : inklsa_kcaches) {
+            llama_inklsa_idx idx;
+            res &= llama_inklsa_idx_get(kc, kc->ne[0], llama_inklsa_idx_rows(kc->ne[1], inklsa.B), ggml_backend_buffer_get_type(kc->buffer), &idx) && idx.valid;
+        }
+    }
+
+    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+
+    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+
+    res &= inp_rs->head == mctx->get_recr()->get_head();
+    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    return res;
+}
+
 void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
     // set the inputs only for the active samplers in the current ubatch
     std::unordered_set<llama_seq_id> active_samplers;
@@ -2948,7 +3065,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         // Compact router weights must not round the activations to BF16 during prefill.
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS ||
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || hparams.expert_router_f32 ||
                 (arch == LLM_ARCH_QWEN4EXP && gate_inp->type == GGML_TYPE_BF16)) {
             // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L565
             ggml_prec_set_acc(logits, GGML_PREC_F32);
@@ -3067,6 +3184,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (arch == LLM_ARCH_DEEPSEEK41) {
             // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
             weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+        } else if (hparams.expert_weights_norm_eps > 0.0f) {
+            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, hparams.expert_weights_norm_eps);
         } else {
             // Avoid division by zero, clamp to smallest number representable by F16
             weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
@@ -8084,7 +8203,9 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-ggml_tensor * llm_graph_context::build_attn(
+// the iswa build_attn with the KQ mask and kv_rows given by the caller, which has to keep them in sync
+static ggml_tensor * build_attn_iswa_impl(
+        const llm_graph_context & gctx,
         llm_graph_input_attn_kv_iswa * inp,
         ggml_tensor * wo,
         ggml_tensor * wo_b,
@@ -8093,10 +8214,18 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
         ggml_tensor * kq_b,
+        ggml_tensor * kq_mask,
+        ggml_tensor * kv_rows,
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il) {
+    ggml_context * ctx0 = gctx.ctx0;
+    ggml_cgraph  * gf   = gctx.gf;
+
+    const auto & hparams = gctx.hparams;
+    const auto & cparams = gctx.cparams;
+
     const bool is_swa = hparams.is_swa(il);
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa[il] : inp->self_k_rot[il];
@@ -8134,7 +8263,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // whole seq fits into batch in training mode
     const bool use_kv_cur = cparams.training && k_cur && v_cur;
     if (use_kv_cur) {
-        GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
+        GGML_ASSERT(mctx_cur->get_n_kv() == gctx.n_tokens);
     }
 
     const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
@@ -8152,28 +8281,25 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = is_swa ? inp->self_attn_mask_swa.raw : inp->self_attn_mask.raw;
-    const auto & kv_rows = is_swa ? inp->self_attn_mask_swa.rows : inp->self_attn_mask.rows;
-
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
-    q = build_attn_turbo_q(q, k, mctx_cur);
+    q = gctx.build_attn_turbo_q(q, k, mctx_cur);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
-    cb(cur, "kqv_out", il);
+    gctx.cb(cur, "kqv_out", il);
 
-    cur = build_attn_turbo_v_out(cur, v, il);
+    cur = gctx.build_attn_turbo_v_out(cur, v, il);
 
     if (v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = gctx.build_lora_mm(wo, cur, wo_s);
     }
 
     if (wo_b) {
@@ -8185,6 +8311,27 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn(
+        llm_graph_input_attn_kv_iswa * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            float     kq_scale,
+            int       il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    const auto & kq_mask = is_swa ? inp->self_attn_mask_swa.raw  : inp->self_attn_mask.raw;
+    const auto & kv_rows = is_swa ? inp->self_attn_mask_swa.rows : inp->self_attn_mask.rows;
+
+    return build_attn_iswa_impl(*this, inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, kq_mask, kv_rows, sinks, v_mla, kq_scale, il);
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -8812,6 +8959,43 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
 
+        inp_attn->self_attn_mask = build_attn_inp_attn_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
+    }
+
+    {
+        inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
+        inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
+
+        inp_attn->self_attn_mask_swa = build_attn_inp_attn_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
+    }
+
+    inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
+    inp_attn->self_v_rot = attn_ctx->get_base()->get_v_rot();
+
+    inp_attn->self_k_rot_swa = attn_ctx->get_swa()->get_k_rot();
+    inp_attn->self_v_rot_swa = attn_ctx->get_swa()->get_v_rot();
+
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+
+    return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_iswa_rel(
+        uint32_t extent,
+        uint32_t extent_swa) const {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
+
+    auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+
+    const auto * attn_ctx = mctx_cur->get_attn();
+
+    auto inp_attn = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, attn_ctx);
+
+    // dense masks: the bias is gathered by the distance to each cell of the K/V view
+    {
+        inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
+        inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
+
         inp_attn->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
     }
 
@@ -8828,9 +9012,534 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     inp_attn->self_k_rot_swa = attn_ctx->get_swa()->get_k_rot();
     inp_attn->self_v_rot_swa = attn_ctx->get_swa()->get_v_rot();
 
-    auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
-    return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));
+    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
+    ggml_set_input(inp->self_rel_pos);
+    ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+
+    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
+    ggml_set_input(inp->self_rel_pos_swa);
+    ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+
+    // INKLSA (llama-inklsa.h): per-graph inputs shared by the full-attention visits
+    const auto & icfg = llama_inklsa_cfg();
+    if (icfg.on && cparams.flash_attn && !cparams.training && cparams.n_seq_max == 1) {
+        int64_t il_full = -1;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (!hparams.is_swa(il)) {
+                il_full = il;
+                break;
+            }
+        }
+        const int64_t n_kv = attn_ctx->get_base()->get_n_kv();
+        const int64_t T    = ubatch.n_tokens;
+        auto & in = inp->inklsa;
+        if (il_full >= 0 && n_kv % icfg.block == 0) {
+            inp->inklsa_on = true;
+            in.B     = icfg.block;
+            in.n_blk = n_kv/icfg.block;
+            in.n_fix = llama_inklsa_n_fix();
+            in.n_u   = std::min<int64_t>(in.n_blk, (T + in.B - 1)/in.B + 1);
+            in.sparse = T <= icfg.max_t && n_kv >= icfg.min_kv && ubatch.n_seqs_unq == 1 &&
+                        n_kv >= in.n_fix + llama_inklsa_n_keep(n_kv) + icfg.sinks;
+            in.n_keep = llama_inklsa_n_keep(n_kv);
+            in.u_blk   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, in.n_u);
+            in.u_blk64 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, in.n_u);
+            ggml_set_input(in.u_blk);
+            ggml_set_input(in.u_blk64);
+            ggml_set_name(in.u_blk, "inklsa_u_blk");
+            ggml_set_name(in.u_blk64, "inklsa_u_blk64");
+            if (in.sparse) {
+                in.onehot   = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, hparams.n_head_kv(il_full), hparams.n_head(il_full), 1);
+                in.fix_ids  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, in.n_fix);
+                in.fix_rel  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, in.n_fix, T);
+                in.fix_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in.n_fix, T);
+                in.elig     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in.n_blk, 1);
+                for (ggml_tensor * t : {in.onehot, in.fix_ids, in.fix_rel, in.fix_mask, in.elig}) {
+                    ggml_set_input(t);
+                }
+                ggml_set_name(in.onehot, "inklsa_onehot");
+                ggml_set_name(in.fix_ids, "inklsa_fix_ids");
+                ggml_set_name(in.fix_rel, "inklsa_fix_rel");
+                ggml_set_name(in.fix_mask, "inklsa_fix_mask");
+                ggml_set_name(in.elig, "inklsa_elig");
+            }
+        }
+    }
+
+    // INKREL (llama-inklsa.h): far + near inputs for wide ubatches (decided from the shapes only, so the reserve graph
+    // sizes the same split)
+    {
+        const int64_t n_kv = attn_ctx->get_base()->get_n_kv();
+        const int64_t T    = ubatch.n_tokens;
+        auto & in = inp->inkrel;
+        if (cparams.flash_attn && !cparams.training && cparams.n_seq_max == 1 && ubatch.n_seqs_unq <= 1 &&
+                llama_inkrel_want(n_kv, T, extent)) {
+            in.on        = true;
+            in.n_near    = (extent - 1 + T + 255)/256*256;
+            in.far_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, T);
+            in.near_ids  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, in.n_near);
+            in.near_rel  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, in.n_near, T);
+            in.near_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in.n_near, T);
+            for (ggml_tensor * t : {in.far_mask, in.near_ids, in.near_rel, in.near_mask}) {
+                ggml_set_input(t);
+            }
+            ggml_set_name(in.far_mask,  "inkrel_far_mask");
+            ggml_set_name(in.near_ids,  "inkrel_near_ids");
+            ggml_set_name(in.near_rel,  "inkrel_near_rel");
+            ggml_set_name(in.near_mask, "inkrel_near_mask");
+        }
+    }
+
+    return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_attn(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+            float     kq_scale,
+            int       il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * inp_attn = inp->get_attn();
+
+    const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
+
+    // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
+    //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
+    GGML_ASSERT(attn_mask.rows == nullptr);
+
+    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+    ggml_tensor * kq_mask = attn_mask.raw;
+    if (kq_mask->type != GGML_TYPE_F32) {
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    }
+    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+    if (cparams.flash_attn) {
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+    }
+    cb(kq_mask, "kq_mask_rel_pos", il);
+
+    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+}
+
+// INKLSA: rows of a cache view [d, h, n_kv] (cells nb[2] apart, each cell's heads packed) grouped `cells` at a time,
+// reinterpreted as I32 words so GET_ROWS copies raw bytes ([cell_bytes*cells/4, n_kv/cells])
+static ggml_tensor * inklsa_words(ggml_context * ctx, ggml_tensor * t, int64_t cells) {
+    const size_t cell_bytes = ggml_row_size(t->type, t->ne[0])*t->ne[1];
+    GGML_ASSERT(t->nb[0] == ggml_type_size(t->type) && t->nb[1] == ggml_row_size(t->type, t->ne[0]) && t->nb[2] == cell_bytes);
+    GGML_ASSERT(t->ne[2] % cells == 0 && (cell_bytes*cells) % sizeof(int32_t) == 0);
+    ggml_tensor * w = ggml_view_2d(ctx, t, t->ne[0], t->ne[2]/cells, cell_bytes*cells, 0);
+    w->type  = GGML_TYPE_I32;
+    w->ne[0] = (int64_t) (cell_bytes*cells/sizeof(int32_t));
+    w->ne[1] = t->ne[2]/cells;
+    w->nb[0] = sizeof(int32_t);
+    w->nb[1] = cell_bytes*cells;
+    w->nb[2] = w->nb[1]*w->ne[1];
+    w->nb[3] = w->nb[2];
+    return w;
+}
+
+// gather rows of inklsa_words (ids I32 [n]) back as [d, h, n*cells] of t's type (contiguous)
+static ggml_tensor * inklsa_gather(ggml_context * ctx, ggml_tensor * t, int64_t cells, ggml_tensor * ids) {
+    ggml_tensor * g = ggml_get_rows(ctx, inklsa_words(ctx, t, cells), ids);
+    const size_t row_bytes = ggml_row_size(t->type, t->ne[0]);
+    ggml_tensor * r = ggml_view_2d(ctx, g, g->ne[0], g->ne[1], g->nb[1], 0);
+    r->type  = t->type;
+    r->ne[0] = t->ne[0];
+    r->ne[1] = t->ne[1];
+    r->ne[2] = ids->ne[0]*cells;
+    r->ne[3] = 1;
+    r->nb[0] = ggml_type_size(t->type);
+    r->nb[1] = row_bytes;
+    r->nb[2] = row_bytes*t->ne[1];
+    r->nb[3] = r->nb[2]*r->ne[2];
+    return r;
+}
+
+// mean over the B cells of each block: x F16 [D, B, n] (any strides) -> F32 [D, n]
+static ggml_tensor * inklsa_block_mean(ggml_context * ctx, ggml_tensor * x) {
+    const int64_t D = x->ne[0], B = x->ne[1], n = x->ne[2];
+    ggml_tensor * f = ggml_cast(ctx, x, GGML_TYPE_F32);                       // [D, B, n] contiguous
+    f = ggml_cont(ctx, ggml_permute(ctx, f, 1, 0, 2, 3));                     // [B, D, n]
+    f = ggml_sum_rows(ctx, f);                                                // [1, D, n]
+    return ggml_reshape_2d(ctx, ggml_scale(ctx, f, 1.0f/B), D, n);
+}
+
+// two attention outputs [dv*n_head, T] with their LSE [n_head, T] and the zero-logit sink: softmax over
+// (l_a, l_b, 0) per head and row weighs o_a and o_b
+static ggml_tensor * inkrel_merge(ggml_context * ctx0, ggml_tensor * o_a, ggml_tensor * l_a, ggml_tensor * o_b,
+        ggml_tensor * l_b, int64_t n_head, int64_t T) {
+    ggml_tensor * l0 = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_head, T), 0.0f);
+    ggml_tensor * l3 = ggml_concat(ctx0, ggml_concat(ctx0, ggml_reshape_3d(ctx0, l_a, 1, n_head, T),
+            ggml_reshape_3d(ctx0, l_b, 1, n_head, T), 0), ggml_reshape_3d(ctx0, l0, 1, n_head, T), 0);  // [3, n_head, T]
+    ggml_tensor * w = ggml_soft_max(ctx0, l3);
+    ggml_tensor * w_a = ggml_view_3d(ctx0, w, 1, n_head, T, w->nb[1], w->nb[2], 0);
+    ggml_tensor * w_b = ggml_view_3d(ctx0, w, 1, n_head, T, w->nb[1], w->nb[2], w->nb[0]);
+    const int64_t dv = o_a->ne[0]/n_head;
+    ggml_tensor * cur = ggml_add(ctx0,
+            ggml_mul(ctx0, ggml_reshape_3d(ctx0, o_a, dv, n_head, T), ggml_cont(ctx0, w_a)),
+            ggml_mul(ctx0, ggml_reshape_3d(ctx0, o_b, dv, n_head, T), ggml_cont(ctx0, w_b)));
+    return ggml_reshape_2d(ctx0, cur, dv*n_head, T);
+}
+
+ggml_tensor * llm_graph_context::build_attn_inkrel(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * table,
+              float   kq_scale,
+                int   il) const {
+    const auto & in = inp->inkrel;
+    const int64_t n_head = table->ne[0];
+    const int64_t E      = table->ne[1] - 1;
+    const int64_t T      = n_tokens;
+    GGML_ASSERT(in.on && k->ne[3] == 1 && in.far_mask->ne[0] == k->ne[2] && E == (int64_t) inp->extent);
+    // ordering: the LSE outputs are leaves written through FA src[9] (no graph edge); build_attn_mha expands each FA
+    // node before the merge below is built, so the default in-order schedule runs both FA calls first
+
+    // (a) far: every cell at distance >= E, broadcast mask; its bias is the per-(head,row) constant table[:, E, :]
+    lsa_lse_req = true;
+    ggml_tensor * o_f = build_attn_mha(q_cur, k, v, nullptr, in.far_mask, nullptr, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * l_f = lsa_lse;                                                              // [n_head, T]
+    lsa_lse = nullptr;
+    GGML_ASSERT(l_f != nullptr);
+    ggml_tensor * c_far = ggml_view_2d(ctx0, table, n_head, T, table->nb[2], E*table->nb[1]);
+    l_f = ggml_add(ctx0, ggml_reshape_2d(ctx0, l_f, n_head, T), c_far);
+
+    // (b) near: the cells within E of some row, gathered, with the per-head bias
+    ggml_tensor * kn = inklsa_gather(ctx0, k, 1, in.near_ids);
+    ggml_tensor * vn = inklsa_gather(ctx0, v, 1, in.near_ids);
+    ggml_tensor * mn = ggml_get_rows(ctx0, table, in.near_rel);                               // [n_head, n_near, T]
+    mn = ggml_cont(ctx0, ggml_permute(ctx0, mn, 2, 0, 1, 3));                                 // [n_near, T, n_head]
+    mn = ggml_cast(ctx0, ggml_add(ctx0, mn, in.near_mask), GGML_TYPE_F16);
+    cb(mn, "inkrel_near_mask", il);
+    lsa_lse_req = true;
+    ggml_tensor * o_n = build_attn_mha(q_cur, kn, vn, nullptr, mn, nullptr, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * l_n = lsa_lse;
+    lsa_lse = nullptr;
+    GGML_ASSERT(l_n != nullptr);
+    l_n = ggml_reshape_2d(ctx0, l_n, n_head, T);
+
+    ggml_tensor * cur = inkrel_merge(ctx0, o_f, l_f, o_n, l_n, n_head, T);
+    cb(cur, "kqv_out", il);
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_rel(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * sinks,
+              float   kq_scale,
+                int   il,
+        ggml_tensor * gate) const {
+    bool gated = false;
+    ggml_tensor * cur = build_attn_rel_base(inp, q_cur, k_cur, v_cur, table, sinks, kq_scale, il, gate, gated);
+    if (gate && !gated) {
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+    }
+    return cur;
+}
+
+// INKATTN (ggml-inkrel.h): the relative bias table, rel_pos and the output gate taken inside one FA node at decode-sized
+// ubatches. Off with LLAMA_INKATTN_REL=0 or GGML_CUDA_INKATTN=0 (the dense per-head mask path then).
+static bool llama_inkattn_rel_on() {
+    static const bool on = [] {
+        const char * a = getenv("LLAMA_INKATTN_REL");
+        const char * b = getenv("GGML_CUDA_INKATTN");
+        return !(a && *a && atoi(a) == 0) && !(b && *b && atoi(b) == 0);
+    }();
+    return on;
+}
+
+ggml_tensor * llm_graph_context::build_attn_rel_base(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * sinks,
+              float   kq_scale,
+                int   il,
+        ggml_tensor * gate,
+               bool & gated) const {
+    gated = false;
+    const bool is_swa = hparams.is_swa(il);
+    auto * inp_attn = inp->get_attn();
+    const int64_t n_head = table->ne[0];
+
+    const auto * mctx_cur = inp_attn->mctx->get_base();
+    ggml_tensor * kc = nullptr;
+    if (!is_swa && inp->inklsa_on) {
+        ggml_tensor * kv = mctx_cur->get_k(ctx0, il);
+        kc = kv->view_src ? kv->view_src : kv;
+        if (!kc->buffer || kv->type != GGML_TYPE_F16 || kv->ne[3] != 1 || inp_attn->self_k_rot[il] || inp_attn->self_v_rot[il] ||
+                mctx_cur->get_k_scale(il) || mctx_cur->get_v_scale(il)) {
+            kc = nullptr; // memory-fit dry run, or a cache INKLSA does not cover: dense
+        }
+    }
+
+    // INKLSA on but this graph does not keep the index (n_kv % B != 0, no flash attention, several sequences, ...):
+    // the K it writes is not folded into the index, so mark the index stale (rebuilt by the next INKLSA graph)
+    if (!is_swa && !inp->inklsa_on && llama_inklsa_cfg().on) {
+        ggml_tensor * kv = mctx_cur->get_k(ctx0, il);
+        const ggml_tensor * kst = kv->view_src ? kv->view_src : kv;
+        if (kst->buffer) {
+            llama_inklsa_invalidate(&kst, 1);
+        }
+    }
+
+    // INKATTN: decode-sized ubatches (q heads per KV head x tokens <= 16) on a plain F16 cache: one FA node with the
+    // bias table + rel_pos (+ the output gate) inside, no [n_kv, T, n_head] mask; same f16 bias values as the dense path
+    // (not under -sm tensor: the meta backend splits heads and does not split the table / gate)
+    if (kc == nullptr && llama_inkattn_rel_on() && cparams.flash_attn && !cparams.training && cparams.kv_stream_arena_mib == 0 &&
+            model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+        const auto * mctx_l = is_swa ? inp_attn->mctx->get_swa() : inp_attn->mctx->get_base();
+        const auto & am     = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
+        ggml_tensor * raw     = am.raw;
+        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+        ggml_tensor * kv = mctx_l->get_k(ctx0, il);
+        ggml_tensor * vv = mctx_l->get_v(ctx0, il);
+        const int64_t n_head_kv = kv->ne[1];
+        const int64_t n_tok     = q_cur->ne[2];
+        const bool rot = is_swa ? (inp_attn->self_k_rot_swa[il] || inp_attn->self_v_rot_swa[il]) :
+                                  (inp_attn->self_k_rot[il] || inp_attn->self_v_rot[il]);
+        if (am.rows == nullptr && raw->type == GGML_TYPE_F16 && raw->ne[2] == 1 && raw->ne[3] == 1 &&
+                kv->type == GGML_TYPE_F16 && vv->type == GGML_TYPE_F16 && kv->ne[3] == 1 && vv->nb[1] < vv->nb[2] &&
+                kv->ne[0] == 128 && vv->ne[0] == 128 && q_cur->ne[0] == 128 && n_head % n_head_kv == 0 &&
+                (n_head/n_head_kv)*n_tok <= 16 && rel_pos->ne[0] == kv->ne[2] && rel_pos->ne[1] == n_tok &&
+                !rot && !mctx_l->get_k_scale(il) && !mctx_l->get_v_scale(il) &&
+                hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+                sinks && sinks->type == GGML_TYPE_F32 && (!gate || gate->type == GGML_TYPE_F32)) {
+            ggml_build_forward_expand(gf, q_cur);
+            ggml_build_forward_expand(gf, k_cur);
+            ggml_build_forward_expand(gf, v_cur);
+            ggml_build_forward_expand(gf, mctx_l->cpy_k(ctx0, k_cur, is_swa ? inp_attn->get_k_idxs_swa() : inp_attn->get_k_idxs(), il));
+            ggml_build_forward_expand(gf, mctx_l->cpy_v(ctx0, v_cur, is_swa ? inp_attn->get_v_idxs_swa() : inp_attn->get_v_idxs(), il));
+            ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+            ggml_tensor * k = ggml_permute(ctx0, mctx_l->get_k(ctx0, il), 0, 2, 1, 3);
+            ggml_tensor * v = ggml_permute(ctx0, mctx_l->get_v(ctx0, il), 0, 2, 1, 3);
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q, k, v, raw, kq_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(fa, sinks);
+            ggml_prec_set_acc(fa, GGML_PREC_F32);
+            ggml_tensor * g2 = gate && ggml_is_contiguous(gate) ? ggml_reshape_2d(ctx0, gate, q_cur->ne[0]*n_head, n_tok) : nullptr;
+            ggml_flash_attn_ext_set_inkrel(fa, table, rel_pos, g2);
+            gated = g2 != nullptr;
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il}); // the auto-FA probe checks this node's device
+            ggml_tensor * cur = ggml_reshape_2d(ctx0, fa, fa->ne[0]*fa->ne[1], fa->ne[2]*fa->ne[3]);
+            cb(cur, "kqv_out", il);
+            return cur;
+        }
+    }
+
+    // INKREL: a cache the split covers (plain K/V types, no rotation or scales, one stream)
+    if (!is_swa && kc == nullptr && inp->inkrel.on) {
+        ggml_tensor * kv = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * vv = mctx_cur->get_v(ctx0, il);
+        // F16 only: other types lose the bounded-prefill FA plan once an LSE output is attached (larger reserve);
+        // no kv-stream (host-paged K/V: the near gather and the LSE need device-resident K/V)
+        if (kv->type == GGML_TYPE_F16 && vv->type == GGML_TYPE_F16 && cparams.kv_stream_arena_mib == 0 && kv->ne[3] == 1 && vv->nb[1] < vv->nb[2] && !inp_attn->self_k_rot[il] &&
+                !inp_attn->self_v_rot[il] && !mctx_cur->get_k_scale(il) && !mctx_cur->get_v_scale(il)) {
+            ggml_build_forward_expand(gf, q_cur);
+            ggml_build_forward_expand(gf, k_cur);
+            ggml_build_forward_expand(gf, v_cur);
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp_attn->get_k_idxs(), il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp_attn->get_v_idxs(), il));
+            GGML_UNUSED(sinks); // zero sink logit (folded into table)
+            return build_attn_inkrel(inp, q_cur, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il), table, kq_scale, il);
+        }
+    }
+
+    if (kc == nullptr) {
+        // dense: gather the bias of every cell by its distance
+        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+        const int64_t n_stream = (is_swa ? inp_attn->self_attn_mask_swa.raw : inp_attn->self_attn_mask.raw)->ne[3];
+        const int64_t n_kv     = rel_pos->ne[0];
+
+        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        cb(kq_b, "kq_b", il);
+
+        return build_attn(inp, nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, kq_b, sinks, kq_scale, il);
+    }
+
+    auto & in = inp->inklsa;
+    const int64_t B = in.B;
+
+    // store K and V first: the index refresh below re-reads the blocks this ubatch writes
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp_attn->get_v_idxs(), il));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il); // [d, h_kv, n_kv, 1]
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    GGML_ASSERT(v->type == GGML_TYPE_F16 && v->nb[1] < v->nb[2] && "INKLSA: needs a non-transposed F16 V cache");
+    const int64_t D = k->ne[0]*k->ne[1];
+
+    llama_inklsa_idx idx;
+    GGML_ASSERT(llama_inklsa_idx_get(kc, D, llama_inklsa_idx_rows(kc->ne[1], B), ggml_backend_buffer_get_type(kc->buffer), &idx));
+    const bool    comp  = llama_inklsa_cfg().comp;
+    const int64_t vrow0 = comp ? idx.t->ne[1]/2 : 0; // first mean-V row
+    inp->inklsa_kcaches.push_back(kc);
+    if (!idx.valid) {
+        // rebuild every block [0, n_blk) from K, in chunks that bound the F32 scratch
+        const int64_t CH = 1024;
+        for (int64_t b0 = 0; b0 < in.n_blk; b0 += CH) {
+            const int64_t nb = std::min(CH, in.n_blk - b0);
+            ggml_tensor * x = ggml_view_3d(ctx0, k, D, B, nb, k->nb[2], k->nb[2]*B, k->nb[2]*B*b0);
+            ggml_tensor * dst = ggml_view_2d(ctx0, idx.t, D, nb, idx.t->nb[1], idx.t->nb[1]*b0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, inklsa_block_mean(ctx0, x), dst));
+            if (comp) {
+                ggml_tensor * xv = ggml_view_3d(ctx0, v, D, B, nb, v->nb[2], v->nb[2]*B, v->nb[2]*B*b0);
+                ggml_tensor * dv = ggml_view_2d(ctx0, idx.t, D, nb, idx.t->nb[1], idx.t->nb[1]*(vrow0 + b0));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, inklsa_block_mean(ctx0, xv), dv));
+            }
+        }
+        inp->inklsa_commit.emplace_back(kc, idx.epoch);
+        inp->inklsa_rebuild = true;
+    }
+    // refresh the blocks this ubatch wrote (rows past the newest position are stale until written; such a block is
+    // never eligible before it is whole)
+    ggml_tensor * ub = inklsa_gather(ctx0, k, B, in.u_blk);                                   // [128, 8, n_u*B]
+    ub = ggml_reshape_3d(ctx0, ub, D, B, in.n_u);
+    ggml_tensor * index = ggml_set_rows(ctx0, idx.t, inklsa_block_mean(ctx0, ub), in.u_blk64); // view of idx.t
+    ggml_build_forward_expand(gf, index);
+    ggml_tensor * vindex = nullptr; // COMP: mean-V rows, refreshed the same way
+    if (comp) {
+        ggml_tensor * uv = ggml_reshape_3d(ctx0, inklsa_gather(ctx0, v, B, in.u_blk), D, B, in.n_u);
+        ggml_tensor * vrows = ggml_view_2d(ctx0, idx.t, D, vrow0, idx.t->nb[1], idx.t->nb[1]*vrow0);
+        vindex = ggml_set_rows(ctx0, vrows, inklsa_block_mean(ctx0, uv), in.u_blk64);
+        ggml_build_forward_expand(gf, vindex);
+    }
+
+    if (!in.sparse && inp->inkrel.on) {
+        return build_attn_inkrel(inp, q_cur, k, v, table, kq_scale, il);
+    }
+
+    if (!in.sparse) {
+        // dense attention over the full cache (K/V already stored: pass no k_cur / v_cur)
+        ggml_tensor * rel_pos = inp->self_rel_pos;
+        const int64_t n_kv = rel_pos->ne[0];
+        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens, 1);
+        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+        ggml_tensor * kq_mask = inp_attn->self_attn_mask.raw;
+        if (kq_mask->type != GGML_TYPE_F32) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = ggml_cast(ctx0, ggml_add(ctx0, kq_b, kq_mask), GGML_TYPE_F16);
+        ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        return cur;
+    }
+
+    {
+        static std::atomic<int> n_logged{0};
+        if (n_logged.fetch_add(1) == 0) {
+            LLAMA_LOG_WARN("%s: INKLSA sparse attention active (first sparse graph: n_kv %lld, T %lld, keep %lld, fixed %lld)\n",
+                    __func__, (long long) (in.n_blk*B), (long long) n_tokens, (long long) in.n_keep, (long long) in.n_fix);
+        }
+    }
+
+    // pick: score every block by its mean key, softmax over blocks per (q head, row), sum the shares
+    const int64_t T   = n_tokens;
+    const int64_t Hkv = k->ne[1];
+    const int64_t dh  = k->ne[0];
+    ggml_tensor * qbd = ggml_reshape_4d(ctx0, q_cur, dh, 1, n_head, T);
+    qbd = ggml_mul(ctx0, ggml_repeat_4d(ctx0, qbd, dh, Hkv, n_head, T), in.onehot);           // block-diagonal per KV group
+    qbd = ggml_reshape_2d(ctx0, qbd, D, n_head*T);
+    ggml_tensor * iview = ggml_view_2d(ctx0, index, D, in.n_blk, idx.t->nb[1], 0);
+    ggml_tensor * sc = ggml_mul_mat(ctx0, iview, qbd);                                       // [n_blk, n_head*T]
+    sc = ggml_soft_max(ctx0, ggml_add(ctx0, ggml_scale(ctx0, sc, kq_scale), in.elig));
+    if (llama_inklsa_cfg().pick == 1) {
+        // oracle (diagnostic): the exact attention mass of each eligible block from every key, softmax over the
+        // eligible cells per (q head, row), summed like the index votes
+        const int64_t H = n_head;
+        ggml_tensor * kq = ggml_mul_mat(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3), ggml_permute(ctx0, q_cur, 0, 2, 1, 3)); // [n_kv, T, H]
+        kq = ggml_reshape_3d(ctx0, ggml_scale(ctx0, kq, kq_scale), B, in.n_blk, T*H);
+        kq = ggml_add(ctx0, kq, ggml_reshape_3d(ctx0, in.elig, 1, in.n_blk, 1));
+        kq = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, kq, B*in.n_blk, T*H));
+        kq = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, kq, B, in.n_blk, T*H));                // [1, n_blk, T*H]
+        sc = ggml_reshape_2d(ctx0, kq, in.n_blk, T*H);
+    }
+    ggml_tensor * votes = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, sc)));    // [1, n_blk]
+    // ineligible blocks vote 0 after the softmax, like eligible blocks whose scores underflow: keep them last
+    votes = ggml_add(ctx0, ggml_reshape_2d(ctx0, votes, in.n_blk, 1), in.elig);
+    const int64_t nk = in.n_keep/B;
+    ggml_tensor * pick = ggml_top_k(ctx0, votes, (int) nk);                                   // I32 [nk, 1]
+    pick = ggml_reshape_1d(ctx0, pick, nk);
+    cb(pick, "inklsa_pick", il);
+
+    // compact K/V: fixed cells, then the picked blocks
+    ggml_tensor * ks = ggml_concat(ctx0, inklsa_gather(ctx0, k, 1, in.fix_ids), inklsa_gather(ctx0, k, B, pick), 2);
+    ggml_tensor * vs = ggml_concat(ctx0, inklsa_gather(ctx0, v, 1, in.fix_ids), inklsa_gather(ctx0, v, B, pick), 2);
+
+    // mask [n_sel, T, n_head]: fixed cells get their bias row (+ causal/padding mask), picked blocks the far row
+    // (index extent) of every head and row, -inf for an ineligible pick (fewer eligible blocks than nk)
+    const int64_t E = table->ne[1] - 1;
+    ggml_tensor * mf = ggml_get_rows(ctx0, table, in.fix_rel);                               // [n_head, n_fix, T]
+    mf = ggml_cont(ctx0, ggml_permute(ctx0, mf, 2, 0, 1, 3));                                 // [n_fix, T, n_head]
+    mf = ggml_add(ctx0, mf, in.fix_mask);
+    ggml_tensor * far = ggml_view_3d(ctx0, table, n_head, 1, T, table->nb[1], table->nb[2], E*table->nb[1]);
+    far = ggml_cont(ctx0, ggml_permute(ctx0, far, 2, 0, 1, 3));                              // [1, T, n_head]
+    ggml_tensor * pe = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, in.elig, 1, in.n_blk), pick); // [1, nk]
+    pe = ggml_reshape_4d(ctx0, ggml_repeat_4d(ctx0, pe, B, nk, 1, 1), B*nk, 1, 1, 1);
+    ggml_tensor * mb = ggml_add(ctx0, ggml_repeat_4d(ctx0, far, B*nk, T, n_head, 1), pe);    // [nk*B, T, n_head]
+    ggml_tensor * mask = ggml_cast(ctx0, ggml_concat(ctx0, mf, mb, 0), GGML_TYPE_F16);
+    cb(mask, "inklsa_mask", il);
+
+    if (!comp) {
+        ggml_tensor * cur = build_attn_mha(q_cur, ks, vs, nullptr, mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        return cur;
+    }
+
+    // COMP (assumes the zero sink of inkling2.cpp, which folds the sink logit into table): the compact set without
+    // the sink, then every eligible unpicked block as one virtual cell
+    // (mean K, mean V, logit + log B + the far bias), merged with the zero sink by log-sum-exp
+    lsa_lse_req = true;
+    ggml_tensor * o_s = build_attn_mha(q_cur, ks, vs, nullptr, mask, nullptr, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * l_s = lsa_lse;
+    lsa_lse = nullptr;
+    const int64_t n_pad = GGML_PAD(in.n_blk, 256);
+    GGML_ASSERT(l_s && n_pad <= vrow0);
+    ggml_tensor * kc3 = ggml_view_3d(ctx0, index,  dh, Hkv, n_pad, dh*ggml_element_size(index), index->nb[1], 0);
+    ggml_tensor * vc3 = ggml_view_3d(ctx0, vindex, dh, Hkv, n_pad, dh*ggml_element_size(vindex), vindex->nb[1], 0);
+    // per-block mask [n_pad]: log B for an eligible unpicked block, -inf for picked / ineligible / padding
+    ggml_tensor * bm = ggml_scale_bias(ctx0, in.elig, 1.0f, logf((float) B));                 // [n_blk, 1]
+    bm = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, bm, 1, in.n_blk),
+            ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, nk), -INFINITY), pick);
+    bm = ggml_reshape_2d(ctx0, bm, in.n_blk, 1);
+    if (n_pad > in.n_blk) {
+        bm = ggml_concat(ctx0, bm, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pad - in.n_blk, 1), -INFINITY), 0);
+    }
+    ggml_tensor * mc = ggml_add(ctx0, ggml_repeat_4d(ctx0, far, n_pad, T, n_head, 1), bm);  // [n_pad, T, n_head]
+    // a row with no unpicked eligible block would be all -inf (0/0 in FA): -30000 keeps it finite at LSE ~ -30000,
+    // which the merge weighs as zero
+    mc = ggml_cast(ctx0, ggml_clamp(ctx0, mc, -30000.0f, INFINITY), GGML_TYPE_F16);
+    lsa_lse_req = true;
+    ggml_tensor * o_c = build_attn_mha(q_cur, kc3, vc3, nullptr, mc, nullptr, nullptr, nullptr, 0, kq_scale, il);
+    ggml_tensor * l_c = lsa_lse;
+    lsa_lse = nullptr;
+    GGML_ASSERT(l_c);
+    ggml_tensor * cur = inkrel_merge(ctx0, o_s, l_s, o_c, l_c, n_head, T);
+    cb(cur, "kqv_out", il);
+    return cur;
 }
 
 void llm_graph_context::build_dense_out(

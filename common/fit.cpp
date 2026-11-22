@@ -943,8 +943,23 @@ static void common_params_fit_impl(
                         measured[i].mb.compute = data[i].compute;
                     }
                 } else {
-                    measured = common_get_device_memory_data_impl(
-                        extra->paths_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                    try {
+                        measured = common_get_device_memory_data_impl(
+                            extra->paths_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                    } catch (const std::runtime_error &) {
+                        // fork: a drafter that borrows the target's embedding/head (DFlash/DSpark without tok_embd)
+                        // needs a parent context to be created; measure it next to a no_alloc parent instead
+                        devs_extra.clear();
+                        const auto data = common_get_device_memory_data_with_parent(
+                            extra->paths_model, extra->mparams, extra->cparams, paths_model, mparams, cparams,
+                            devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                        measured.resize(data.size());
+                        for (size_t i = 0; i < data.size(); ++i) {
+                            measured[i].mb.model   = data[i].model;
+                            measured[i].mb.context = data[i].context;
+                            measured[i].mb.compute = data[i].compute;
+                        }
+                    }
                 }
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up

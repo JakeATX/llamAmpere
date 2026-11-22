@@ -1452,6 +1452,7 @@ struct ggml_cuda_graph {
     uint64_t lsa_j3_generation = 0; // GGML_CUDA_LSA_J3_GRAPHS: see ggml_cuda_lsa_j3_generation
     int64_t last_used_time = 0;
     int stable_calls = 0; // warmup: calls in a row with no property change (GGML_CUDA_GRAPH_WARMUP)
+    bool recaptured_last = false; // [HOSTGAP08] the last call re-captured a warm graph at once (GGML_CUDA_GRAPH_FAST_RECAPTURE)
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];

@@ -1410,6 +1410,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LSA_COMP_MERGE",
     "LSA_UNIT_LSE",
     "LSA_PREFETCH",
+    "DEPTH_MIX",
+    "LOOP_GATE",
 
     "UNARY",
 
@@ -1427,7 +1429,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1531,6 +1533,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "lsa_comp_merge(o, lse, q, kmean, vmean, nd)",
     "lsa_unit_lse(k, q, mask)",
     "lsa_prefetch(desc, body, units)",
+    "depth_mix(stack, cur, query)",
+    "loop_gate(x, m, down, gain, forget)",
 
     "unary(x)",
 
@@ -1548,7 +1552,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6007,6 +6011,68 @@ struct ggml_tensor * ggml_lsa_block_select_cells_gated_ext(
     GGML_ASSERT(gate->ne[0]*gate_div >= result->ne[0]);
     ggml_set_op_params_i32(result, 7, gate_div);
     result->src[4] = gate;
+    return result;
+}
+
+// ggml_depth_mix
+
+struct ggml_tensor * ggml_depth_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * stack,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * query,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && query->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->nb[0] == sizeof(float) && query->nb[0] == sizeof(float));
+    GGML_ASSERT(query->ne[0] == cur->ne[0] && query->ne[2] == 1 && query->ne[3] == 1 && cur->ne[2] == 1 && cur->ne[3] == 1);
+    if (stack) {
+        GGML_ASSERT(stack->type == GGML_TYPE_F32 && stack->nb[0] == sizeof(float) && stack->ne[3] == 1);
+        GGML_ASSERT(stack->ne[0] == cur->ne[0] && stack->ne[2] == cur->ne[1]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cur->ne[0], query->ne[1], cur->ne[1]);
+
+    float params[2] = { eps, scale };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DEPTH_MIX;
+    result->src[0] = cur;
+    result->src[1] = query;
+    result->src[2] = stack;
+
+    return result;
+}
+
+// ggml_loop_gate
+
+struct ggml_tensor * ggml_loop_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * m,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * gain,
+        struct ggml_tensor  * forget,
+        float                 eps) {
+    const int64_t n = x->ne[0];
+    const int64_t R = down->ne[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && m->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(x, m) && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(down->ne[0] == 2*n && gain->ne[0] == R && gain->ne[1] == n && ggml_are_same_shape(gain, forget));
+    GGML_ASSERT(ggml_is_contiguous(down) && ggml_is_contiguous(gain) && ggml_is_contiguous(forget));
+    GGML_ASSERT(gain->type == forget->type);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, x->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_LOOP_GATE;
+    result->src[0] = x;
+    result->src[1] = m;
+    result->src[2] = down;
+    result->src[3] = gain;
+    result->src[4] = forget;
+
     return result;
 }
 

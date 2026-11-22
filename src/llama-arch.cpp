@@ -179,6 +179,8 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_BEAM,             "beam"             },
     { LLM_ARCH_KOLIBRI1,         "kolibri1"         },
     { LLM_ARCH_RICURSIVE,        "ricursive"        },
+    { LLM_ARCH_INKLING2,         "inkling2"         },
+    { LLM_ARCH_INKLING2_LOOP,    "inkling2_loop"    },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -212,6 +214,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_GENERAL_TENSOR_EXTRA_PREC_A4,           "general.tensor_extra.prec_a4"          },
 
     { LLM_KV_VOCAB_SIZE,                        "%s.vocab_size"                        },
+    { LLM_KV_VOCAB_SIZE_UNPADDED,               "%s.vocab_size_unpadded"               },
     { LLM_KV_CONTEXT_LENGTH,                    "%s.context_length"                    },
     { LLM_KV_EMBEDDING_LENGTH,                  "%s.embedding_length"                  },
     { LLM_KV_EMBEDDING_LENGTH_OUT,              "%s.embedding_length_out"              },
@@ -278,6 +281,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_HRM_H_CYCLES,                      "%s.hrm.h_cycles"                      },
     { LLM_KV_HRM_L_CYCLES,                      "%s.hrm.l_cycles"                      },
     { LLM_KV_HRM_PREFIX_LM,                     "%s.hrm.prefix_lm"                     },
+    { LLM_KV_LOOP_START,                        "%s.loop.start"                        },
+    { LLM_KV_LOOP_END,                          "%s.loop.end"                          },
+    { LLM_KV_LOOP_COUNT,                        "%s.loop.count"                        },
+    { LLM_KV_LOOP_GATE_RANK,                    "%s.loop.gate_rank"                    },
+    { LLM_KV_LOOP_VARYING,                      "%s.loop.varying"                      },
     { LLM_KV_METIS_PASS_COUNT,                  "%s.metis.pass_count"                  },
     { LLM_KV_METIS_MEMORY_LENGTH,               "%s.metis.memory_length"               },
     { LLM_KV_METIS_ROUTE_LENGTH,                "%s.metis.route_length"                },
@@ -358,6 +366,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MIX_MLP_WIDTH,                          "%s.mix.mlp_width"                          },
     { LLM_KV_MIX_MIXER_SPAN,                         "%s.mix.mixer_span"                         },
     { LLM_KV_MIX_MLP_SPAN,                           "%s.mix.mlp_span"                           },
+    { LLM_KV_ATTENTION_RELATIVE_LENGTH,              "%s.attention.relative_length"              },
+    { LLM_KV_ATTENTION_RELATIVE_EXTENT,              "%s.attention.relative_extent"              },
+    { LLM_KV_ATTENTION_QK_CLIP,                      "%s.attention.qk_clip"                      },
+    { LLM_KV_ATTENTION_RELATIVE_CLIP,                "%s.attention.relative_clip"                },
+    { LLM_KV_ATTENTION_LOG_SCALE_FLOOR,              "%s.attention.log_scale_floor"              },
+    { LLM_KV_ATTENTION_LOG_SCALE_ALPHA,              "%s.attention.log_scale_alpha"              },
 
     { LLM_KV_HYPER_CONNECTION_COUNT,                 "%s.hyper_connection.count"                 },
     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,   "%s.hyper_connection.sinkhorn_iterations"   },
@@ -534,6 +548,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_CONV_GROUP_SIZE,     "%s.conv_group_size"       },
     { LLM_KV_DFLASH_SELECTOR_RANK,       "%s.selector_rank"         },
     { LLM_KV_DFLASH_SELECTOR_TOP_K,      "%s.selector_top_k"        },
+    { LLM_KV_DSPARK_MARKOV_RANK,         "%s.dspark.markov_rank"    },
 
 };
 
@@ -543,6 +558,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
     { LLM_TENSOR_EXL3_HAD128,                            "exl3_had128" },
     { LLM_TENSOR_OUTPUT,                                 "output" },
+    { LLM_TENSOR_OUTPUT_RES_QUERY,                       "output_res_query" },
     { LLM_TENSOR_ROPE_FREQS,                             "rope_freqs" },
     { LLM_TENSOR_HRM_Z_L_INIT,                           "hrm.z_l_init" },
     { LLM_TENSOR_ATTN_NORM,                              "blk.%d.attn_norm" },
@@ -577,6 +593,23 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ATTN_GATE,                              "blk.%d.attn_gate" },
     { LLM_TENSOR_ATTN_RESID_ALPHA,                       "blk.%d.attn_resid_alpha" },
     { LLM_TENSOR_ATTN_RESID_BETA,                        "blk.%d.attn_resid_beta" },
+    { LLM_TENSOR_ATTN_REL,                               "blk.%d.attn_rel" },
+    { LLM_TENSOR_ATTN_REL_BIAS,                          "blk.%d.attn_rel_bias" },
+    { LLM_TENSOR_ATTN_Q_CLIP,                            "blk.%d.attn_q_clip" },
+    { LLM_TENSOR_ATTN_REL_CLIP,                          "blk.%d.attn_rel_clip" },
+    { LLM_TENSOR_ATTN_SINK_PROJ,                         "blk.%d.attn_sink_proj" },
+    { LLM_TENSOR_ATTN_Q_INP_NORM,                        "blk.%d.attn_q_inp_norm" },
+    { LLM_TENSOR_ATTN_K_INP_NORM,                        "blk.%d.attn_k_inp_norm" },
+    { LLM_TENSOR_ATTN_V_INP_NORM,                        "blk.%d.attn_v_inp_norm" },
+    { LLM_TENSOR_ATTN_K_CONV,                            "blk.%d.attn_k_conv" },
+    { LLM_TENSOR_ATTN_V_CONV,                            "blk.%d.attn_v_conv" },
+    { LLM_TENSOR_ATTN_K_CONV_PROJ,                       "blk.%d.attn_k_conv_proj" },
+    { LLM_TENSOR_ATTN_V_CONV_PROJ,                       "blk.%d.attn_v_conv_proj" },
+    { LLM_TENSOR_ATTN_POST_CONV,                         "blk.%d.attn_post_conv" },
+    { LLM_TENSOR_ATTN_RES_QUERY,                         "blk.%d.attn_res_query" },
+    { LLM_TENSOR_ATTN_K_CTX,                             "blk.%d.attn_k_ctx" },
+    { LLM_TENSOR_ATTN_V_CTX,                             "blk.%d.attn_v_ctx" },
+    { LLM_TENSOR_ATTN_K_CTX_NORM,                        "blk.%d.attn_k_ctx_norm" },
     { LLM_TENSOR_FFN_POST_NORM,                          "blk.%d.post_ffw_norm" },
     { LLM_TENSOR_FFN_POST_NORM_1,                        "blk.%d.post_ffw_norm_1" },
     { LLM_TENSOR_FFN_POST_NORM_2,                        "blk.%d.post_ffw_norm_2" },
@@ -590,6 +623,21 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_FFN_EXP_PROBS_B_VL,                     "blk.%d.exp_probs_b_vl" },
     { LLM_TENSOR_FFN_LATENT_DOWN,                        "blk.%d.ffn_latent_down" },
     { LLM_TENSOR_FFN_LATENT_UP,                          "blk.%d.ffn_latent_up" },
+    { LLM_TENSOR_FFN_POST_CONV,                          "blk.%d.ffn_post_conv" },
+    { LLM_TENSOR_FFN_RES_QUERY,                          "blk.%d.ffn_res_query" },
+    { LLM_TENSOR_LOOP_MSG_QUERY,                         "blk.%d.loop_msg_query" },
+    { LLM_TENSOR_LOOP_Q_CTRL_DOWN,                       "blk.%d.loop_q_ctrl_down" },
+    { LLM_TENSOR_LOOP_Q_CTRL_GAIN,                       "blk.%d.loop_q_ctrl_gain" },
+    { LLM_TENSOR_LOOP_Q_CTRL_FORGET,                     "blk.%d.loop_q_ctrl_forget" },
+    { LLM_TENSOR_LOOP_K_CTRL_DOWN,                       "blk.%d.loop_k_ctrl_down" },
+    { LLM_TENSOR_LOOP_K_CTRL_GAIN,                       "blk.%d.loop_k_ctrl_gain" },
+    { LLM_TENSOR_LOOP_K_CTRL_FORGET,                     "blk.%d.loop_k_ctrl_forget" },
+    { LLM_TENSOR_LOOP_V_CTRL_DOWN,                       "blk.%d.loop_v_ctrl_down" },
+    { LLM_TENSOR_LOOP_V_CTRL_GAIN,                       "blk.%d.loop_v_ctrl_gain" },
+    { LLM_TENSOR_LOOP_V_CTRL_FORGET,                     "blk.%d.loop_v_ctrl_forget" },
+    { LLM_TENSOR_LOOP_FFN_CTRL_DOWN,                     "blk.%d.loop_ffn_ctrl_down" },
+    { LLM_TENSOR_LOOP_FFN_CTRL_GAIN,                     "blk.%d.loop_ffn_ctrl_gain" },
+    { LLM_TENSOR_LOOP_FFN_CTRL_FORGET,                   "blk.%d.loop_ffn_ctrl_forget" },
     { LLM_TENSOR_STREAM_EMBD,                            "stream_embd" },
     { LLM_TENSOR_DEPTH_MEM_STATE_WRITE,                  "depth_mem_state_write" },
     { LLM_TENSOR_DEPTH_MEM_META_WRITE,                   "depth_mem_meta_write" },
@@ -944,6 +992,10 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
 
     { LLM_TENSOR_DSPARK_JOINT_PROJ,                      "joint_proj" },
     { LLM_TENSOR_DSPARK_MASK_EMBD,                       "mask_embd" },
+    { LLM_TENSOR_DSPARK_FUSE,                            "dspark_fuse" },
+    { LLM_TENSOR_DSPARK_NORM,                            "dspark_norm" },
+    { LLM_TENSOR_DSPARK_HIDDEN_OUT,                      "dspark_hidden_out" },
+    { LLM_TENSOR_DFLARE_NORM,                            "blk.%d.dflare_norm" },
     { LLM_TENSOR_ENGRAM_KV,                              "blk.%d.engram_kv" },
     { LLM_TENSOR_ENGRAM_GATE,                            "blk.%d.engram_gate" },
     { LLM_TENSOR_DFLASH_ATTN_CONV_BASE,                  "blk.%d.attn_conv_base" },
@@ -1013,6 +1065,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_OUTPUT_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_OUTPUT_NORM_LFM2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_EXL3_HAD128,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_OUTPUT_RES_QUERY,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DEC_OUTPUT_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_ENC_OUTPUT_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_ENC_AUX_NORM,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
@@ -1027,6 +1080,23 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ATTN_GATE,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_RESID_ALPHA,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_ATTN_RESID_BETA,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_REL,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_REL_BIAS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_Q_CLIP,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_REL_CLIP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_SINK_PROJ,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_Q_INP_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_K_INP_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_V_INP_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ATTN_K_CONV,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+    {LLM_TENSOR_ATTN_V_CONV,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+    {LLM_TENSOR_ATTN_K_CONV_PROJ,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_V_CONV_PROJ,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_POST_CONV,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+    {LLM_TENSOR_ATTN_RES_QUERY,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_K_CTX,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_V_CTX,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_K_CTX_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_FFN_GATE,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_GATE_PAR,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_DOWN_PAR,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
@@ -1304,6 +1374,21 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_FFN_POST_CONV,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+    {LLM_TENSOR_FFN_RES_QUERY,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_MSG_QUERY,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_Q_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_Q_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_Q_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_K_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_K_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_K_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_V_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_V_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_V_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_FFN_CTRL_DOWN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_FFN_CTRL_GAIN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_LOOP_FFN_CTRL_FORGET,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_STREAM_EMBD,                {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_ADD}},
     {LLM_TENSOR_DEPTH_MEM_STATE_WRITE,      {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DEPTH_MEM_META_WRITE,       {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
@@ -1358,6 +1443,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
 
     {LLM_TENSOR_DSPARK_JOINT_PROJ,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DSPARK_MASK_EMBD,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_DSPARK_FUSE,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_DSPARK_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_DSPARK_HIDDEN_OUT,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLARE_NORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_ENGRAM_KV,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ENGRAM_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_DFLASH_ATTN_CONV_BASE,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
@@ -1485,6 +1574,8 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MINIMAX_01:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return true;
         default:
             return false;
@@ -1520,6 +1611,8 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_LFM3:
         case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return true;
         default:
             return false;
@@ -1537,6 +1630,8 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
         case LLM_ARCH_DFLASH:
         case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_LIMITE:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return false;
         default:
             return true;
@@ -1555,6 +1650,8 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MAMBA2:
         case LLM_ARCH_JAMBA:
         case LLM_ARCH_FALCON_H1:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DEEPSEEK2:
@@ -1598,6 +1695,7 @@ bool llama_arch_supports_save(llm_arch arch) {
         case LLM_ARCH_APERTUS:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_CLEF: // the head tensors are not saved
+        case LLM_ARCH_INKLING2_LOOP: // the loop tensors are not saved and the cache slots are expanded at load
         case LLM_ARCH_VLLM_DECISION2:
             return false;
         default:

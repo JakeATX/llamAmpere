@@ -1,4 +1,5 @@
 #include "llama-lsa.h"
+#include "llama-inklsa.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -1033,6 +1034,7 @@ void llama_lsa_seq_guard(int32_t seq, bool fresh, bool mixed, bool is_reserve) {
 }
 
 void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, const char * why, int32_t strm) {
+    llama_inklsa_invalidate(kcaches, n); // INKLSA block-mean index (its own switch, LLAMA_INKLSA)
     static const bool test_skip = lsa_env_i64("LLAMA_LSA_IDX_TEST_SKIP_INVALIDATE", 0) != 0; // negative control only
     // LLAMA_LSA_IDX_TEST_GLOBAL_INVALIDATE=1: old behaviour (any cache's restore/shift invalidates every layer of every
     // context, e.g. the MTP drafter's restore after the main one left SJ-KVaRN dense); negative control only
@@ -1084,6 +1086,7 @@ void llama_lsa_idx_invalidate(const ggml_tensor * const * kcaches, size_t n, con
 }
 
 void llama_lsa_idx_forget(const ggml_tensor * const * kcaches, size_t n) {
+    llama_inklsa_forget(kcaches, n);
     // a K cache is being destroyed (context freed, e.g. the server's memory-fit dry runs): drop its index/mean entries
     // and free their device buffers. Without this, dead entries kept VRAM, could be picked by a restore of the same
     // name, and a later tensor at the same address would inherit them.

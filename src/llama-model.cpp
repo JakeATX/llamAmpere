@@ -330,6 +330,10 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_openai_moe(params);
         case LLM_ARCH_FALCON_H1:
             return new llama_model_falcon_h1(params);
+        case LLM_ARCH_INKLING2:
+            return new llama_model_inkling2(params);
+        case LLM_ARCH_INKLING2_LOOP:
+            return new llama_model_inkling2_loop(params);
         case LLM_ARCH_LFM2:
             return new llama_model_lfm2(params);
         case LLM_ARCH_LFM2MOE:
@@ -1824,6 +1828,25 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+ggml_tensor * llama_model::create_derived_tensor(ggml_backend_buffer_type_t buft, ggml_type type, int64_t ne0, int64_t ne1, const char * name) {
+    ggml_init_params ip = { /*.mem_size =*/ ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create a derived tensor context");
+    }
+    ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), type, ne0, ne1);
+    ggml_set_name(t, name);
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        throw std::runtime_error(format("unable to allocate the %s buffer for %s", ggml_backend_buft_name(buft), name));
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+    return t;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -2034,6 +2057,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                if (layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                    throw std::runtime_error(format("ffn_up_exps.scale and ffn_gate_up_exps.weight both exist for layer %d", i));
+                }
+            }
+            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -2135,6 +2164,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    load_arch_tensors_post(ml);
     // fork: EXL3 W[K,N,E] carries F16/F32 side tensors .suh[K,E] and .svh[N,E].
     // The file also carries the shared 128x128 Hadamard exl3_had128.weight. See build_lora_mm.
     {
@@ -2381,6 +2411,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+    load_arch_data_post();
 
     if (const char * profile = getenv("LLAMA_PLE_PROFILE"); profile && *profile && per_layer_tok_embd) {
         if (arch != LLM_ARCH_QWEN4EXP || !can_prefetch.count(per_layer_tok_embd)) {
@@ -3898,7 +3929,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_idx = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                         };
-                    } else if (arch == LLM_ARCH_FALCON_H1) {
+                    } else if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -4316,6 +4347,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_KIMI_K31:
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STARCODER:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

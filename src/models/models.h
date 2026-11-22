@@ -1596,6 +1596,11 @@ struct llama_model_dflash : public llama_model_base {
         graph_mistral_large4(const llm_graph_params & params);
     };
 
+    // Inkling2 DSpark: block backbone decoded once, then one recurrent markov head step per drafted token
+    struct graph_inkling2 : public llm_graph_context {
+        graph_inkling2(const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
@@ -2400,6 +2405,101 @@ struct llama_model_falcon_h1 : public llama_model_base {
     };
 
     llama_rope_params get_rope_params(const llama_cparams & cparams, int il) const override;
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_inkling2 : public llama_model_base {
+    llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // the layers stored in the file
+    virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
+    enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
+
+    struct loop_layer {
+        ggml_tensor * msg_query = nullptr;
+        ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
+        ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
+        ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
+    };
+
+    struct graph : public llm_graph_context {
+        graph(const llm_graph_params & params);
+        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        ggml_tensor * convolve(
+                ggml_tensor * cur,
+                ggml_tensor * weight,
+                ggml_tensor * dynamic,
+                ggml_tensor * state,
+                ggml_tensor * history,
+                llm_graph_input_rs * inp,
+                int64_t offset);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+
+        // fork (INKFLAGS): rms-normed block stacks [n_embd, n_blocks, n_tokens] keyed by the block list, built once per graph
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks;
+        ggml_tensor * mix_stack(const std::vector<ggml_tensor *> & blocks);
+
+    protected:
+        // the helpers alone, a derived graph builds its own body
+        struct no_build {};
+        graph(const llm_graph_params & params, no_build) : llm_graph_context(params) {}
+
+        // the inputs and the token embeddings
+        ggml_tensor * build_inputs();
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
+        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
+                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
+        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+
+        llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
+        llm_graph_input_attn_kv_iswa        * attn = nullptr;
+        llm_graph_input_rs                  * recr = nullptr;
+
+        ggml_tensor * inp_out_ids = nullptr;
+        ggml_tensor * tau         = nullptr; // log-scaled positions
+        ggml_tensor * zero_sinks  = nullptr; // fork (INKGLUE): the zero sink logits, one fill per graph
+
+        // layer visits built so far: a looped model visits its core layers once per pass, in visit order
+        // (cache slot ids are not), so layer-input features (DSpark drafter) are indexed by visit
+        int n_visit = 0;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+// the cache slots after the physical layers repeat the core [core_start, core_end) for each later pass
+struct llama_model_inkling2_loop : public llama_model_inkling2 {
+    llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    void load_arch_tensors_post(llama_model_loader & ml) override;
+    void load_arch_data_post() override;
+
+    int n_layer_phys() const override { return n_phys; }
+    int layer_phys(int il) const;
+
+    int      n_phys     = 0;
+    uint32_t core_start = 0;
+    uint32_t core_end   = 0;
+    uint32_t n_passes   = 0;
+    uint32_t gate_rank  = 0;
+    bool     varying    = false; // trained for a varying number of passes
+
+    // indexed by physical layer - core_start
+    std::vector<loop_layer> loop_layers;
+    // fork (INKFLAGS): the message queries of all core layers side by side [n_embd, 4*n_core], so a pass mixes all its
+    // messages in one op (LLAMA_INKLING2_MSG_BATCH); null if the queries are not F32 in one buffer type
+    ggml_tensor * msg_query_all = nullptr;
+
+    struct graph : public llama_model_inkling2::graph {
+        graph(const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 

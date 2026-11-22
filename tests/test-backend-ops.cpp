@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-inkrel.h"
 #include "nmse-masked-inf.h"
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-ai4.h"
@@ -15163,6 +15164,7 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const int64_t mask_heads; // > 1: per-head mask (mask->ne[2] == mask_heads), e.g. a folded relative-position bias
 
     // [#175] packed mask pair (set by test_flash_attn_ext_packed): the graph computes the same attention with a binary F16
     // mask and with its one-bit I32 twin and concatenates the outputs; err() requires bitwise-equal halves.
@@ -15177,7 +15179,7 @@ struct test_flash_attn_ext : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
-               (lse_out ? ",lse=1" : "");
+               (lse_out ? ",lse=1" : "") + (mask_heads != 1 ? ",mask_heads=" + std::to_string(mask_heads) : "");
     }
 
     double max_nmse_err() override {
@@ -15198,9 +15200,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0,
+                        int64_t /* upstream q_head_padding, not ported */ = 0, int64_t mask_heads = 1)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), mask_heads(mask_heads) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -15248,7 +15251,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = new_mask(ctx, kv, nb, 1, nr23[1]);
+            m = new_mask(ctx, kv, nb, mask_heads, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -15337,7 +15340,21 @@ struct test_flash_attn_ext : public test_case {
                 }
                 set_tensor_kq_mask_binary(t, packed_vis, kv);
             } else if (strcmp(t->name, "m") == 0) {
-                if (n_kv_max > 0) {
+                if (mask_heads > 1) {
+                    std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                    for (int64_t b = 0; b < t->ne[3]; ++b) {
+                        for (int64_t h = 0; h < t->ne[2]; ++h) {
+                            for (int64_t q = 0; q < t->ne[1]; ++q) {
+                                for (int64_t k = 0; k < t->ne[0]; ++k) {
+                                    const int64_t i = ((b*t->ne[2] + h)*t->ne[1] + q)*t->ne[0] + k;
+                                    const float bias = 0.125f*((k + 3*q + 5*h + 7*b) % 17 - 8);
+                                    data[i] = ggml_fp32_to_fp16(k < (h + 1)*kv/mask_heads ? bias : -INFINITY);
+                                }
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+                } else if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
                 } else {
                     init_tensor_kq_mask(t);
@@ -15832,6 +15849,67 @@ static void lsa_comp_init_nd_lse(ggml_context * ctx, bool zero_all) {
     }
     ggml_backend_tensor_set(lse, v.data(), 0, v.size()*sizeof(float));
 }
+
+// GGML_OP_DEPTH_MIX (Inkling 2 attention over depth, LLAMA_INKLING2_MIX_FUSED) vs CPU: k normed stack rows (a strided
+// view of a wider stack when padded) plus cur, nq queries
+struct test_depth_mix : public test_case {
+    const int64_t n, k, nq, T;
+    const bool padded;
+
+    test_depth_mix(int64_t n, int64_t k, int64_t nq, int64_t T, bool padded = false) :
+        n(n), k(k), nq(nq), T(T), padded(padded) {}
+
+    std::string vars() override { return VARS_TO_STR5(n, k, nq, T, padded); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * stack = nullptr;
+        if (k > 0) {
+            ggml_tensor * raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, k + (padded ? 2 : 0), T);
+            ggml_set_name(raw, "stack");
+            stack = ggml_rms_norm(ctx, padded ? ggml_view_3d(ctx, raw, n, k, T, raw->nb[1], raw->nb[2], raw->nb[1]) : raw, 1e-6f);
+        }
+        ggml_tensor * cur   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+        ggml_tensor * query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, nq);
+        ggml_set_name(cur, "cur");
+        ggml_set_name(query, "query");
+        return ggml_depth_mix(ctx, stack, cur, query, 1e-6f, 1.0f/sqrtf((float) n));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // sharp but finite softmax: queries ~ U(-1, 1) give scores of a few units on 2304-wide rows
+            init_tensor_uniform(t, strcmp(t->name, "cur") == 0 ? -40.0f : -1.0f, strcmp(t->name, "cur") == 0 ? 40.0f : 1.0f);
+        }
+    }
+};
+
+// GGML_OP_LOOP_GATE (Inkling 2 loop gate, LLAMA_INKLING2_GATE_FUSED) vs CPU: x and m as strided row views
+struct test_loop_gate : public test_case {
+    const int64_t n, R, T;
+    const ggml_type wt;
+
+    test_loop_gate(int64_t n, int64_t R, int64_t T, ggml_type wt) : n(n), R(R), T(T), wt(wt) {}
+
+    std::string vars() override { return VARS_TO_STR4(n, R, T, wt); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * xm     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 3, T);
+        ggml_tensor * down   = ggml_new_tensor_2d(ctx, wt, 2*n, R);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, wt, R, n);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, wt, R, n);
+        ggml_set_name(xm, "xm");
+        ggml_tensor * x = ggml_view_2d(ctx, xm, n, T, xm->nb[2], 0);
+        ggml_tensor * m = ggml_view_2d(ctx, xm, n, T, xm->nb[2], 2*xm->nb[1]);
+        return ggml_loop_gate(ctx, x, m, down, gain, forget, 1e-6f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // weights ~ U(-0.05, 0.05): gate products of order 1, tanh away from saturation
+            init_tensor_uniform(t, strcmp(t->name, "xm") == 0 ? -4.0f : -0.05f, strcmp(t->name, "xm") == 0 ? 4.0f : 0.05f);
+        }
+    }
+};
 
 // GGML_OP_LSA_UNIT_LSE (LLAMA_LSA_UNIT_OP) vs CPU: random F16/F32 index keys with strided rows (d = 64: 16-byte rows,
 // vector loads; d = 60: scalar loads), causal F16 mask with empty cells (fully masked units give -inf on both).
@@ -18232,8 +18310,185 @@ static void add_ai_parw_shape_cases(std::vector<std::unique_ptr<test_case>> & ca
     }
 }
 
+static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc);
+// [INKATTN] Inkling 2 decode attention shapes: D 128, 8 KV heads x 3 q heads, F16 K/V, per-head (rel bias) or broadcast
+// mask, optional LSE output, T 1..6 (g*T > 16 at T 6 = old routes); GGML_CUDA_INKATTN=0/1/2 selects the route
+// INKATTN: FLASH_ATTN_EXT with the Inkling relative bias table + rel_pos (+ output gate) inside the node
+// (ggml-inkrel.h). Output = CONCAT(inkrel node, the dense-path reference: per-head f16 mask from GET_ROWS of the table,
+// FA, MUL by SIGMOID(gate)); err() also reports how far the halves are apart on each backend (CUDA: 0 expected).
+struct test_flash_attn_ext_inkrel : public test_case {
+    const int64_t H, Hkv, kv, T, rows;
+    const bool gate;
+
+    test_flash_attn_ext_inkrel(int64_t H, int64_t Hkv, int64_t kv, int64_t T, int64_t rows, bool gate)
+        : H(H), Hkv(Hkv), kv(kv), T(T), rows(rows), gate(gate) {}
+
+    std::string vars() override { return VARS_TO_STR6(H, Hkv, kv, T, rows, gate) + ",inkrel=1"; }
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor *) override { return 2*2*(uint64_t) (H*T*128*kv); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 128;
+        ggml_tensor * q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, T);            ggml_set_name(q, "q");
+        ggml_tensor * kc = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, Hkv, kv);         ggml_set_name(kc, "k");
+        ggml_tensor * vc = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, Hkv, kv);         ggml_set_name(vc, "v");
+        ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, T, 1, 1);        ggml_set_name(m, "m");
+        ggml_tensor * tb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, rows, T);         ggml_set_name(tb, "tab");
+        ggml_tensor * rp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, T);              ggml_set_name(rp, "rp");
+        ggml_tensor * sk = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);                  ggml_set_name(sk, "s");
+        ggml_tensor * gt = gate ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D*H, T) : nullptr;
+        if (gt) { ggml_set_name(gt, "gate"); }
+
+        ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);  // [D, T, H]
+        ggml_tensor * kp = ggml_permute(ctx, kc, 0, 2, 1, 3); // [D, kv, Hkv]
+        ggml_tensor * vp = ggml_permute(ctx, vc, 0, 2, 1, 3);
+        const float scale = 1.0f/sqrtf((float) D);
+
+        ggml_tensor * a = ggml_flash_attn_ext(ctx, qp, kp, vp, m, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(a, sk);
+        ggml_prec_set_acc(a, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_inkrel(a, tb, rp, gt);
+        a = ggml_reshape_2d(ctx, a, D*H, T);
+
+        // the dense path: kq_b = permute(get_rows(table, rel_pos)), mask = f16(kq_b + mask)
+        ggml_tensor * kb = ggml_get_rows(ctx, tb, rp);                              // [H, kv, T]
+        kb = ggml_cont(ctx, ggml_permute(ctx, kb, 2, 0, 1, 3));                     // [kv, T, H]
+        ggml_tensor * mh = ggml_cast(ctx, ggml_add(ctx, kb, ggml_cast(ctx, m, GGML_TYPE_F32)), GGML_TYPE_F16);
+        ggml_tensor * b = ggml_flash_attn_ext(ctx, qp, kp, vp, mh, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(b, sk);
+        ggml_prec_set_acc(b, GGML_PREC_F32);
+        b = ggml_reshape_2d(ctx, b, D*H, T);
+        if (gt) {
+            b = ggml_mul(ctx, b, ggml_sigmoid(ctx, gt));
+        }
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x1BAD5EED ^ (uint32_t) (kv*131 + T*17 + H));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "rp") == 0) {
+                std::vector<int32_t> d(ggml_nelements(t));
+                for (auto & x : d) { x = (int32_t) (gen() % rows); }
+                ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // causal-like: row t sees keys [0, kv - T + t], plus a random -inf block
+                std::vector<ggml_fp16_t> d(ggml_nelements(t));
+                const int64_t b0 = gen() % kv, b1 = std::min<int64_t>(kv, b0 + 1 + gen() % 40);
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    for (int64_t c = 0; c < kv; ++c) {
+                        const bool vis = c <= kv - T + r && !(c >= b0 && c < b1 && c > 0);
+                        d[r*kv + c] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, d.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "tab") == 0) {
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "gate") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t row = 2*128*H;
+        GGML_ASSERT(n % row == 0);
+        double dmax[2] = {0.0, 0.0};
+        for (int w = 0; w < 2; ++w) {
+            const float * x = w == 0 ? a : b;
+            for (size_t r = 0; r < n/row; ++r) {
+                for (size_t i = 0; i < row/2; ++i) {
+                    dmax[w] = std::max(dmax[w], (double) fabsf(x[r*row + i] - x[r*row + row/2 + i]));
+                }
+            }
+        }
+        if (dmax[0] != 0.0 || dmax[1] != 0.0) {
+            printf("[inkrel] halves max |diff| backend1 %.3g backend2 %.3g ", dmax[0], dmax[1]);
+        }
+        return nmse(a, b, n);
+    }
+};
+
+static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    auto add = [&](int64_t kv, int64_t nb, int64_t mh, bool sinks, bool lse, int64_t nh = 8, std::array<int64_t, 2> nr23 = {3, 1}) {
+        auto * t = new test_flash_attn_ext(128, 128, nh, nr23, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+            {0, 1, 2, 3}, true, false, 0, 0, mh);
+        t->lse_out = lse;
+        cases.emplace_back(t);
+    };
+    if (perf) {
+        for (int64_t kv : {1536, 65536, 131072}) {
+            cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, kv, 1, 1025, true));
+        }
+        for (int64_t kv : {1536, 8192, 65536, 131072}) {
+            for (int64_t mh : {1, 24}) {
+                for (bool lse : {false, true}) {
+                    add(kv, 1, mh, false, lse);
+                }
+            }
+            add(kv, 4, 24, false, false);
+        }
+        return;
+    }
+    for (int64_t kv : {48, 113, 256, 1000, 1536, 4096}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 6}) {
+            for (int64_t mh : {1, 24}) {
+                for (int sl = 0; sl < 3; ++sl) { // 0 plain, 1 sinks, 2 LSE (the old LSE routes need >= 2 KV tiles)
+                    if (sl == 2 && kv < 1000) {
+                        continue;
+                    }
+                    add(kv, nb, mh, sl == 1, sl == 2);
+                }
+            }
+        }
+    }
+    // per-head mask (Inkling rel bias, mask ne[2] = 24) over turbo / TQ K/V: the fused turbo MMA decode route must not
+    // pack the GQA group onto one mask row (n_kv % 256 == 0 so the packing would otherwise apply)
+    for (ggml_type tk : {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TQ6_0}) {
+        for (int64_t nb : {1, 2, 4}) {
+            cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1024, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tk,
+                {0, 1, 2, 3}, true, false, 0, 0, 24));
+        }
+    }
+    cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1024, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_TQ6_0,
+        GGML_TYPE_TURBO3_0, {0, 1, 2, 3}, true, false, 0, 0, 24));
+
+    // INKREL: bias table + rel_pos (+ gate) inside the node
+    for (int64_t kv : {48, 113, 1000, 1536, 4096}) {
+        for (int64_t T : {1, 2, 5}) {
+            for (bool gt : {false, true}) {
+                cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, kv, T, 1025, gt));
+            }
+        }
+    }
+    cases.emplace_back(new test_flash_attn_ext_inkrel(16, 4, 1536, 4, 129, true));
+    cases.emplace_back(new test_flash_attn_ext_inkrel(8, 8, 300, 1, 17, true));
+    // several sequences (mask ne[3] = S), other group sizes (g 1 / 4 / 8)
+    for (int64_t kv : {113, 1536}) {
+        for (int64_t nb : {1, 4}) {
+            add(kv, nb, 24, true, false, 8, {3, 2});
+            add(kv, nb, 24, false, kv >= 1000, 8, {3, 4});
+            add(kv, nb, 8, false, kv >= 1000, 8, {1, 1});
+            add(kv, nb, 16, true, kv >= 1000, 4, {4, 1});
+            add(kv, 2, 16, false, false, 2, {8, 1});
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GGML_TEST_INKGROUP") != nullptr) {
+        add_inkgroup_cases(test_cases);
+        return test_cases;
+    }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
         add_ai_parw_shape_cases(test_cases);
         return test_cases;
@@ -21642,6 +21897,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lsa_unit_lse(4096, 5, 16, 64, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lsa_unit_lse(4096, 5, 16, 60));
     test_cases.emplace_back(new test_lsa_unit_lse(4096, 11, 64));
+    // [INKFLAGS] LLAMA_INKLING2_MIX_FUSED: depth mix vs CPU (k = 0 empty stack, nq 1/3/4, decode and prompt widths)
+    for (int64_t k : {0, 1, 9, 13}) {
+        for (int64_t nq : {1, 3, 4}) {
+            for (int64_t T : {1, 7, 512}) {
+                test_cases.emplace_back(new test_depth_mix(2304, k, nq, T));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_depth_mix(2304, 5, 3, 3, true));
+    test_cases.emplace_back(new test_depth_mix(102, 2, 2, 4)); // scalar loads
+    // per-pass message batch: 12 layers x 4 queries in one op (groups of 4)
+    test_cases.emplace_back(new test_depth_mix(2304, 6, 48, 1));
+    test_cases.emplace_back(new test_depth_mix(2304, 6, 48, 5));
+    test_cases.emplace_back(new test_depth_mix(2304, 0, 8, 3));
+    // [INKFLAGS] LLAMA_INKLING2_GATE_FUSED: loop gate vs CPU (F32 / BF16 / F16 weights, decode and verify widths)
+    for (ggml_type wt : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        for (int64_t T : {1, 3, 8}) {
+            test_cases.emplace_back(new test_loop_gate(2304, 64, T, wt));
+        }
+    }
+    test_cases.emplace_back(new test_loop_gate(100, 24, 2, GGML_TYPE_F32));
     // GGML_LSA_ULSE_COOP=1 lane-shared kernel: d 128/256 (16/32 lanes per cell), a partial last CTA, 1..8 rows (n_kv must divide by F)
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 5, 16, 128));
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 3, 1, 256));
@@ -21663,6 +21939,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lsa_comp_merge(1568, 5, 32, 4, 128));
     test_cases.emplace_back(new test_lsa_comp_merge(300, 3, 6, 6, 64));
     test_cases.emplace_back(new test_lsa_comp_merge(784, 5, 24, 4, 256, 1));
+
+    add_inkattn_cases(test_cases, false);
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
@@ -22631,6 +22909,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, true));
 
+    // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) with sinks
+    for (int hs : {64, 80, 128, 256}) {
+        for (int nq : {1, 3, 35}) {
+            for (int mh : {2, 8}) {
+                for (ggml_type tv : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {4, 2}, 512, nq, true, true, 0, 0, GGML_PREC_F32,
+                        GGML_TYPE_F16, tv, {0, 2, 1, 3}, true, false, 0, 0, mh));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 1, {4, 1}, 512, 1024, true, true, 0, 0, GGML_PREC_F32,
+        GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {4, 1}, 512, 3, true, true, 8, 10, GGML_PREC_F32,
+        GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 4));
+
     // FLASH_ATTN_EXT: large logits
     test_cases.emplace_back(new test_flash_attn_ext_large_logits( 64,  64, 16, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -23351,8 +23645,142 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
+// [INKDENSE] Inkling 2 Mini non-expert matvecs: R distinct weights of one type (so the weights do not sit in L2,
+// like the 48 layer visits of a decode token) times one activation column set; perf only, time the kernels with nsys.
+struct test_inkdense : public test_case {
+    const ggml_type type; const int64_t m, k, n; const int reps;
+    test_inkdense(ggml_type type, int64_t m, int64_t k, int64_t n, int reps) : type(type), m(m), k(k), n(n), reps(reps) {}
+    std::string op_desc(ggml_tensor *) override { return "INKDENSE"; }
+    size_t max_tensors() override { return 3*reps + 8; }
+    std::string vars() override { return VARS_TO_STR5(type, m, k, n, reps); }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * out = nullptr;
+        for (int r = 0; r < reps; ++r) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else if (t->type == GGML_TYPE_AIF25_U || t->type == GGML_TYPE_AIF25_U2_512) {
+                const size_t unit = t->type == GGML_TYPE_AIF25_U2_512 ? 2592 : 672;
+                std::mt19937 rng(1234);
+                std::uniform_real_distribution<float> rs(0.002f, 0.02f);
+                std::vector<uint8_t> buf(ggml_nbytes(t));
+                for (size_t b = 0; b + unit <= buf.size(); b += unit) {
+                    ggml_fp16_t * d = (ggml_fp16_t *) (buf.data() + b);
+                    for (int i = 0; i < 16; ++i) { d[i] = ggml_fp32_to_fp16(rs(rng)); }
+                    uint32_t * w = (uint32_t *) (buf.data() + b + 32);
+                    for (size_t i = 0; i < (unit - 32)/4; ++i) { w[i] = (uint32_t) rng(); }
+                }
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// [INKDENSE] grouped decode mmv: members of different M that read one x, right-nested concats so the MUL_MATs are consecutive
+// nodes (the order the CUDA graph_optimize gives them); GGML_CUDA_AI_MMV_GROUP=1 groups them into one launch
+struct test_inkgroup : public test_case {
+    const ggml_type type; const std::vector<int64_t> ms; const int64_t k, n;
+    test_inkgroup(ggml_type type, std::vector<int64_t> ms, int64_t k, int64_t n) : type(type), ms(std::move(ms)), k(k), n(n) {}
+    std::string op_desc(ggml_tensor *) override { return "INKGROUP"; }
+    double max_nmse_err() override { return 5e-4; }   // int8 activations (W4A8) vs the CPU f32 reference, as the other AI+ tests
+    size_t max_tensors() override { return 4*ms.size() + 8; }
+    std::string vars() override {
+        std::string m;
+        for (int64_t v : ms) { m += (m.empty() ? "" : "+") + std::to_string(v); }
+        return VARS_TO_STR4(type, m, k, n);
+    }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        std::vector<ggml_tensor *> ys;
+        for (int64_t m : ms) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type, k, m);
+            ys.push_back(ggml_mul_mat(ctx, w, x));
+        }
+        // one output: the products concatenated along M, right-nested (DFS emits the MUL_MATs first, with no view between)
+        ggml_tensor * out = ys.back();
+        for (int j = (int) ys.size() - 2; j >= 0; --j) {
+            out = ggml_concat(ctx, ys[j], out, 0);
+        }
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (is_ai4_family(t->type)) {
+                init_tensor_ai4_random(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc) {
+    for (ggml_type t : { GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U }) {
+        for (int64_t n : { 1, 2, 8 }) {
+            tc.emplace_back(new test_inkgroup(t, { 3072, 3072, 384 }, 2304, n));            // q, gate, rel
+            tc.emplace_back(new test_inkgroup(t, { 3072, 1024, 1024, 384, 3072 }, 2304, n)); // q, k, v, rel, gate
+            tc.emplace_back(new test_inkgroup(t, { 2304, 256 }, 3072, n));
+            tc.emplace_back(new test_inkgroup(t, { 512, 640, 144, 160, 176, 192, 208, 224 }, 1152, n)); // 8 members, K % 256 != 0
+        }
+    }
+}
+
+static void add_inkdense_cases(std::vector<std::unique_ptr<test_case>> & tc) {
+    if (getenv("GGML_TEST_INKGROUP") != nullptr) {
+        add_inkgroup_cases(tc);
+        return;
+    }
+    const int64_t n = getenv("GGML_TEST_INKDENSE_N") ? atoll(getenv("GGML_TEST_INKDENSE_N")) : 1;
+    // (m, k, reps): q / gate (3072 x 2304), k / v (1024 x 2304), rel (384 x 2304), o (2304 x 3072), head (201024 x 2304)
+    struct shp { int64_t m, k; int reps; };
+    const shp dense[] = { {3072, 2304, 48}, {1024, 2304, 48}, {384, 2304, 48}, {2304, 3072, 48}, {201024, 2304, 2} };
+    for (const auto & s : dense) {
+        std::vector<ggml_type> ts = { GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_AIT4_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U, GGML_TYPE_AIF25_U };
+        if (s.k % 512 == 0) {
+            ts.push_back(GGML_TYPE_AIT4_U2_512); ts.push_back(GGML_TYPE_AIT3_U2_512); ts.push_back(GGML_TYPE_AIT2_U2_512); ts.push_back(GGML_TYPE_AIF25_U2_512);
+        }
+        for (ggml_type t : ts) {
+            tc.emplace_back(new test_inkdense(t, s.m, s.k, n, s.reps));
+        }
+    }
+    // small: router 128 x 2304, ctrl down 64 x 4608, ctrl gain / forget 2304 x 64, sink 24 x 2304 (BF16 / Q8_0 / F32 / F16)
+    const shp small[] = { {128, 2304, 48}, {64, 4608, 48}, {2304, 64, 48}, {24, 2304, 48}, {32, 2304, 48}, {512, 2304, 48} };
+    for (const auto & s : small) {
+        for (ggml_type t : { GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0 }) {
+            if (ggml_blck_size(t) > 1 && s.k % ggml_blck_size(t) != 0) { continue; }
+            tc.emplace_back(new test_inkdense(t, s.m, s.k, n, s.reps));
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GGML_TEST_INKDENSE") != nullptr) {
+        add_inkdense_cases(test_cases);
+        return test_cases;
+    }
+    if (getenv("GGML_TEST_INKATTN") != nullptr) {
+        add_inkattn_cases(test_cases, true);
+        return test_cases;
+    }
     if (getenv("GGML_TEST_AI_PARW") && std::string(getenv("GGML_TEST_AI_PARW")) == "shapes") {
         add_ai_parw_shape_cases(test_cases);
         return test_cases;

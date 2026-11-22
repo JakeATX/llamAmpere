@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-batch.h"
+#include "llama-inklsa.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
@@ -941,6 +942,59 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
+// hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling)
+// the KQ masks are always dense (rows == nullptr) and are filled from the same cells as the distances, so that the bias
+// gathered by distance lines up with the mask
+class llm_graph_input_mem_hybrid_iswa_rel : public llm_graph_input_i {
+public:
+    llm_graph_input_mem_hybrid_iswa_rel(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn,
+            std::unique_ptr<llm_graph_input_rs>          inp_rs,
+            const llama_memory_hybrid_iswa_context *     mctx,
+            uint32_t extent,
+            uint32_t extent_swa) :
+        inp_attn(std::move(inp_attn)),
+        inp_rs(std::move(inp_rs)),
+        extent(extent),
+        extent_swa(extent_swa),
+        cparams(cparams),
+        mctx(mctx) { }
+    virtual ~llm_graph_input_mem_hybrid_iswa_rel() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn;
+    std::unique_ptr<llm_graph_input_rs>          inp_rs;
+
+    llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
+    llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
+
+    // INKLSA (llama-inklsa.h, LLAMA_INKLSA=1): sparse full-attention inputs, the visits' index caches and the epochs a
+    // rebuild graph commits when it runs
+    bool inklsa_on      = false;
+    bool inklsa_rebuild = false;
+    llama_inklsa_inputs inklsa;
+    std::vector<const ggml_tensor *> inklsa_kcaches;
+    mutable std::vector<std::pair<const ggml_tensor *, uint64_t>> inklsa_commit;
+
+    // INKREL (llama-inklsa.h, default on): split full-attention inputs for wide ubatches
+    llama_inkrel_inputs inkrel;
+
+    // distance from the token to the cell, extent for the empty, future and more distant cells
+    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
+    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+
+    const uint32_t extent;
+    const uint32_t extent_swa;
+
+    const llama_cparams cparams;
+
+    const llama_memory_hybrid_iswa_context * mctx;
+};
+
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
@@ -1168,7 +1222,9 @@ struct llm_graph_params {
         }
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
-        if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+        if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset || cparams.dspark_walk != other.cparams.dspark_walk ||
+            cparams.dspark_ids_out != other.cparams.dspark_ids_out || cparams.dspark_sample_k != other.cparams.dspark_sample_k ||
+            cparams.dspark_sample_t != other.cparams.dspark_sample_t) {
             return false;
         }
 
@@ -2094,6 +2150,63 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    // extent, extent_swa: the distance that the bias tables of the full and the SWA layers stop at
+    llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(
+            uint32_t extent,
+            uint32_t extent_swa) const;
+
+    // Inkling 2 attention: kq_b is gathered here from the per-query bias table [n_head_q, extent + 1, n_tokens]
+    // (row extent = the zero pad row minus the sink, used for every cell at distance >= extent); the full-attention
+    // visits take the INKLSA sparse path when it is on (llama-inklsa.h)
+    ggml_tensor * build_attn_rel(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * table, // [n_head_q, extent + 1, n_tokens]
+            ggml_tensor * sinks, // [n_head_q]
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor * gate = nullptr) const; // [n_embd_head_v*n_head_q, n_tokens]: returns out * sigmoid(gate)
+
+    // the body of build_attn_rel; sets gated when the gate was applied inside the attention (INKATTN)
+    ggml_tensor * build_attn_rel_base(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * table,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor * gate,
+                   bool & gated) const;
+
+    // INKREL (llama-inklsa.h): full-attention visit as far + near flash attention merged by log-sum-exp; k and v are
+    // the cache views with this ubatch already stored, the sink logit is zero (folded into table)
+    ggml_tensor * build_attn_inkrel(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * table,
+                  float   kq_scale,
+                    int   il) const;
+
+    // kq_b is added to the KQ mask, after the KQ scale
+    ggml_tensor * build_attn(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
+            ggml_tensor * sinks, // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
 
     //
     // pooling

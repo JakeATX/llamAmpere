@@ -768,10 +768,11 @@ constexpr __host__ __device__ int mmv_stage_bytes() { return ch_bytes<LAY>() + 6
 template <int STAGES, bool XREG, int LAY = LAY_AIT4_U, int WARPS = MMV_WARPS>
 constexpr __host__ __device__ int mmv_smem_bytes() { return WARPS*STAGES*mmv_stage_bytes<XREG, LAY>(); }
 
-template <int STAGES, int MINB, bool XREG, int LAY, int XSH, bool ID, int WARPS = MMV_WARPS>
-static __global__ void __launch_bounds__(WARPS*32, MINB) mmv(
+// [INKDENSE] the mmv body with the slab passed in: mmv uses blockIdx.x, mmv_grp a block's slab within its group member
+template <int STAGES, int MINB, bool XREG, int LAY, int XSH, bool ID, int WARPS>
+static __device__ __forceinline__ void mmv_body(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
-        float * __restrict__ Y, int64_t ldy, int M, int N, int K, const idmap idm) {
+        float * __restrict__ Y, int64_t ldy, int M, int N, int K, const idmap & idm, const int slab) {
     constexpr int MMV_WARPS = WARPS;   // body below is written against this name
     static_assert(WARPS >= 2, "ai4 mmv needs at least 2 warps");
     static_assert(WARPS * 32 <= 1024, "ai4 mmv block");
@@ -783,7 +784,6 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmv(
     extern __shared__ __align__(16) uint8_t smem[];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
-    const int slab = blockIdx.x;
     const int nk = K/RQ4_CHUNK;
     const int XSN = K >> (7 + XSH);
     const int * prow = nullptr;
@@ -948,6 +948,53 @@ static __global__ void __launch_bounds__(WARPS*32, MINB) mmv(
         }
     }
     (void) M;
+}
+
+template <int STAGES, int MINB, bool XREG, int LAY, int XSH, bool ID, int WARPS = MMV_WARPS>
+static __global__ void __launch_bounds__(WARPS*32, MINB) mmv(
+        const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
+        float * __restrict__ Y, int64_t ldy, int M, int N, int K, const idmap idm) {
+    mmv_body<STAGES, MINB, XREG, LAY, XSH, ID, WARPS>(W, Xq, Xs, Y, ldy, M, N, K, idm, blockIdx.x);
+}
+
+// [INKDENSE] grouped dense mmv: up to MMV_GRP_MAX products of one layout and K that read the same activations
+// (Inkling q / gate / rel / k / v of one visit) in one launch. Block b runs member s = the last with s0[s] <= b, slab
+// b - s0[s]: the same per-slab arithmetic as one mmv launch per member, so the outputs are bitwise equal.
+constexpr int MMV_GRP_MAX = 8;
+struct mmv_group {
+    const uint8_t * W[MMV_GRP_MAX];
+    float *         Y[MMV_GRP_MAX];
+    int             M[MMV_GRP_MAX];
+    int             s0[MMV_GRP_MAX + 1];   // first block of each member; s0[n] = total blocks
+    int             n;
+};
+
+template <int STAGES, int MINB, bool XREG, int LAY, int XSH, int WARPS = MMV_WARPS>
+static __global__ void __launch_bounds__(WARPS*32, MINB) mmv_grp(
+        const mmv_group grp, const int8_t * __restrict__ Xq, const float * __restrict__ Xs, int N, int K) {
+    const int b = blockIdx.x;
+    int s = 0;
+#pragma unroll
+    for (int j = 1; j < MMV_GRP_MAX; ++j) {
+        if (j < grp.n && b >= grp.s0[j]) {
+            s = j;
+        }
+    }
+    mmv_body<STAGES, MINB, XREG, LAY, XSH, false, WARPS>(grp.W[s], Xq, Xs, grp.Y[s], grp.M[s], grp.M[s], N, K, idmap{},
+                                                         b - grp.s0[s]);
+}
+
+template <int STAGES = 2, int MINB = 6, bool XREG = true, int LAY = LAY_AIT4_U, int XSH = 1, int WARPS = MMV_WARPS>
+static void launch_mmv_grp(const mmv_group & grp, const int8_t * Xq, const float * Xs, int N, int K, cudaStream_t stream) {
+    constexpr int smem = mmv_smem_bytes<STAGES, XREG, LAY, WARPS>();
+    static bool attr_set[64] = {};
+    int dev = 0;
+    CUDA_CHECK_AI4K(cudaGetDevice(&dev));
+    if (!attr_set[dev & 63]) {
+        CUDA_CHECK_AI4K(cudaFuncSetAttribute(mmv_grp<STAGES, MINB, XREG, LAY, XSH, WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        attr_set[dev & 63] = true;
+    }
+    mmv_grp<STAGES, MINB, XREG, LAY, XSH, WARPS><<<grp.s0[grp.n], WARPS*32, smem, stream>>>(grp, Xq, Xs, N, K);
 }
 
 // ID = true: grid.y = max_experts = an upper bound of the token tiles (ids_max_tiles with bn = MMV_ID_BN; blocks past

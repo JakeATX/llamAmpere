@@ -13,6 +13,7 @@ struct ggml_cuda_topk_moe_args {
     bool delayed_softmax{};
     bool prob_bias{};
     bool norm{};
+    bool norm_eps{};     // INKGLUE: the norm is SUM_ROWS -> SCALE(1, eps) -> DIV instead of SUM_ROWS -> CLAMP -> DIV
     bool scale{};
     int  n_groups{};     // > 0: pick experts only from the top n_group_used expert groups
     int  n_group_used{};
