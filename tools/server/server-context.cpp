@@ -3297,7 +3297,8 @@ private:
 
     // --slot-ctx cap swap: a conversation that outgrows its reserved cap takes the cap of an idle reserved slot that
     // holds more; the unified pool addresses cells one by one, so a cap is accounting only and no cell moves. The
-    // other slot keeps its cached tokens, which must fit the smaller cap. LLAMA_SLOT_CTX_SWAP=0 turns it off.
+    // other slot keeps its cached tokens, which must fit the smaller cap with 64 tokens to spare. Not for tasks pinned with
+    // id_slot; /props keeps the boot caps, /slots shows the live ones. LLAMA_SLOT_CTX_SWAP=0 turns it off.
     static bool slot_ctx_swap_on() {
         static const bool on = [] {
             const char * e = getenv("LLAMA_SLOT_CTX_SWAP");
@@ -3312,7 +3313,7 @@ private:
         }
         server_slot * big = nullptr;
         for (auto & s : slots) {
-            if (&s == &own || s.is_processing() || s.ctx_shared || s.n_ctx < need || s.prompt.n_tokens() > own.n_ctx) {
+            if (&s == &own || s.is_processing() || s.ctx_shared || s.n_ctx < need || s.prompt.n_tokens() + 64 > own.n_ctx) {
                 continue;
             }
             if (big == nullptr || s.n_ctx < big->n_ctx) {
@@ -4092,7 +4093,15 @@ private:
                 if (slot.answer_reserve < 0) {
                     slot.answer_reserve = common_answer_reserve(left + slot.stats.n_gen, tp.sampling.reasoning_answer_reserve);
                 }
-                if (left <= slot.answer_reserve + (int32_t) tp.sampling.reasoning_budget_forced.size()) {
+                const int32_t n_forced = (int32_t) tp.sampling.reasoning_budget_forced.size();
+                // --slot-ctx cap swap: when the slot cap (not max_tokens) runs out, grow the cap before closing the think block
+                if (!params_base.ctx_shift && left <= slot.answer_reserve + n_forced &&
+                        (slot.n_remaining() < 0 || slot.n_remaining() > left) && slot_ctx_cap_grow(slot, (int64_t) slot.n_ctx + 1)) {
+                    const int32_t ctx_left = slot.n_ctx - slot.prompt.n_tokens() - 1;
+                    left = slot.n_remaining() < 0 ? ctx_left : std::min(slot.n_remaining(), ctx_left);
+                    slot.answer_reserve = common_answer_reserve(left + slot.stats.n_gen, tp.sampling.reasoning_answer_reserve);
+                }
+                if (left <= slot.answer_reserve + n_forced) {
                     llama_sampler * tracker = slot.think_tracker.release();
                     if (tracker && common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING) {
                         // the tracker moves into the chain: sampling continues on the CPU from here
