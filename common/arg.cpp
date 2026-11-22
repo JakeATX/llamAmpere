@@ -9,6 +9,7 @@
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
+#include "gguf.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -547,6 +548,33 @@ static std::vector<common_download_task> build_url_tasks(const common_params_mod
     return tasks;
 }
 
+// INKKV: Inkling 2 ships the SJ-KVaRN 4/4 KV cache (Jake 11-22). Applied here, once the model path is final and before
+// anything reads the KV settings, so the default run is the same as -ctk sjkvarn4 -ctv sjkvarn4. Only when K/V are left at
+// the default F16, no SJ-KVaRN bits are set and flash attention is not off. LLAMA_INK_KV44=0 = the plain F16 cache.
+static void common_ink_kv44_default(common_params & params) {
+    if (params.sj_kvarn_bits_k != 0 || params.sj_kvarn_bits_v != 0 || params.model.path.empty() ||
+            params.cache_type_k != GGML_TYPE_F16 || params.cache_type_v != GGML_TYPE_F16 ||
+            params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        return;
+    }
+    const char * e = getenv("LLAMA_INK_KV44");
+    if (e && atoi(e) == 0) {
+        return;
+    }
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(params.model.path.c_str(), gp);
+    if (!g) {
+        return;
+    }
+    const int64_t k = gguf_find_key(g, "general.architecture");
+    const std::string arch = k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_STRING ? gguf_get_val_str(g, k) : "";
+    gguf_free(g);
+    if (arch == "inkling2" || arch == "inkling2_loop") {
+        params.sj_kvarn_bits_k = params.sj_kvarn_bits_v = 4;
+        LOG_INF("%s: Inkling 2: SJ-KVaRN 4/4 KV cache (default; LLAMA_INK_KV44=0 = F16)\n", __func__);
+    }
+}
+
 void common_models_handler_apply(common_models_handler & handler, common_params & params, common_download_callback * callback) {
     std::vector<common_download_task> tasks;
 
@@ -820,6 +848,8 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             task.on_done();
         }
     }
+
+    common_ink_kv44_default(params);
 }
 
 //
