@@ -1452,14 +1452,24 @@ std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_a
     }
     if (total <= 0.0) { return law; }
     // Exact verification emits p. Rescue redirects each rejected-draft/replacement pair's
-    // joint mass, excess[d] * residual[y] / total, from y to d when p(d) >= p(y).
+    // joint mass, excess[d] * residual[y] / total, from y to d when kappa * p(d) >= p(y), scaled by alpha.
     // Drafts outside p have p(d)=0 and cannot beat a positive residual replacement.
+    static const double mb_kappa = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_KAPPA");
+        const double v = e && *e ? std::atof(e) : 1.0;
+        return (v >= 1.0 && std::isfinite(v)) ? v : 1.0;
+    }();
+    static const double mb_alpha = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_ALPHA");
+        const double v = e && *e ? std::atof(e) : 1.0;
+        return (v >= 0.0 && v <= 1.0 && std::isfinite(v)) ? v : 1.0;
+    }();
     for (size_t d = 0; d < p.size; ++d) {
-        if (excess[d] <= 0.0 || (is_stop && is_stop(p.data[d].id))) { continue; }
+        if (excess[d] <= 0.0 || p.data[d].p <= 0.0f || (is_stop && is_stop(p.data[d].id))) { continue; }
         for (size_t y = 0; y < p.size; ++y) {
-            if (residual[y] <= 0.0 || p.data[d].p < p.data[y].p ||
+            if (residual[y] <= 0.0 || mb_kappa * (double) p.data[d].p < (double) p.data[y].p ||
                     (is_stop && is_stop(p.data[y].id))) { continue; }
-            const double moved = excess[d] * residual[y] / total;
+            const double moved = mb_alpha * excess[d] * residual[y] / total;
             law[d] += moved;
             law[y] -= moved;
         }
@@ -1584,7 +1594,21 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
     const auto ends = [&](llama_token id) {
         return (vocab && llama_vocab_is_eog(vocab, id)) || (is_stop && is_stop(id));
     };
-    if (beat && !ends(d) && !ends(res.replacement) && p_d >= res.p_replacement) {
+    // Bounded-KL mode-biasing (OPT7): defaults (kappa=1.0, alpha=1.0) are bit-identical to stock p_d >= p_replacement.
+    // Opt-in knobs: LLAMA_SPEC_MB_KAPPA (e.g. 3.0) allows rescuing when kappa * p_d >= p_replacement (bounded ratio <= kappa),
+    // LLAMA_SPEC_MB_ALPHA (e.g. 0.5) throttles rescue probability to keep KL bounded.
+    static const double mb_kappa = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_KAPPA");
+        const double v = e && *e ? std::atof(e) : 1.0;
+        return (v >= 1.0 && std::isfinite(v)) ? v : 1.0;
+    }();
+    static const double mb_alpha = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_ALPHA");
+        const double v = e && *e ? std::atof(e) : 1.0;
+        return (v >= 0.0 && v <= 1.0 && std::isfinite(v)) ? v : 1.0;
+    }();
+    if (beat && !ends(d) && !ends(res.replacement) && p_d > 0.0 && mb_kappa * p_d >= res.p_replacement &&
+            (mb_alpha >= 1.0 || uniform(rng) < mb_alpha)) {
         res.id = d;
         res.accepted = true;
         res.rescued = true;

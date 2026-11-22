@@ -544,8 +544,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // draft-only vocabulary shortlist: parsed once, kept as a persistent I32 map on the head's device
     {
         const char * path = params.draft_vocab_map;
+        const bool is_dspark_ctx = model.arch == LLM_ARCH_DFLASH && model.hparams.dspark_markov_rank > 0;
         // fork: the legacy environment override also replaces the resolved automatic shortlist.
-        if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0 || std::strcmp(path, "auto:rm24h") == 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0 || std::strcmp(path, "auto:rm24h") == 0) &&
+                (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || is_dspark_ctx)) {
             if (const char * env = getenv("LLAMA_SPEC_DRAFT_VOCAB"); env != nullptr && env[0] != '\0') {
                 path = env;
             }
@@ -1870,12 +1872,20 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
                     path, (long long) map.n_vocab, (long long) n_vocab));
     }
 
-    // the map lives next to the head it indexes
+    // the map lives next to the head it indexes (DSpark borrows the target model's output head via ctx_other)
     const ggml_tensor * head = model.output;
+    const llama_model * head_model = &model;
     if (model.hparams.n_layer_nextn > 0 && model.hparams.n_layer() < model.layers.size()) {
         const auto & nextn = model.layers[model.hparams.n_layer()].nextn;
         if (nextn.shared_head_head) {
             head = nextn.shared_head_head;
+        }
+    }
+    if (head == nullptr && model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr) {
+        const llama_model * model_other = llama_get_model(cparams.ctx_other);
+        if (model_other != nullptr) {
+            head = model_other->output;
+            head_model = model_other;
         }
     }
     if (head == nullptr || head->buffer == nullptr) {
@@ -1900,7 +1910,7 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
         const bool is_exl3 = ggml_exl3_bits(head->type) != 0;
         const bool is_ai   = ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0; // AI+ tiles too
         const bool full_head = llama_draft_vocab_full_head(head);
-        const bool want = !model.no_alloc() && !model.hadamard_rotations.count(head) &&
+        const bool want = !head_model->no_alloc() && !head_model->hadamard_rotations.count(head) &&
                 !full_head && n_sel < head->ne[1] && (force == 1 || (force != 0 && (is_exl3 || is_ai)));
         if (full_head) {
             LLAMA_LOG_WARN("%s: draft shortlist uses existing %s head (%s), no compact weight copy\n",

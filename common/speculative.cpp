@@ -5126,6 +5126,9 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    const bool spec_dspark = has_draft && std::find(params.speculative.types.begin(),
+                                                    params.speculative.types.end(),
+                                                    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         if (!has_draft) {
@@ -5135,10 +5138,13 @@ common_speculative_init_result::common_speculative_init_result(
                         __func__, cparams.draft_attn_window, cparams.draft_attn_sink);
             }
         }
+    }
+    if (spec_mtp || spec_dspark) {
         if (!params.speculative.draft.vocab_map.empty() && params.speculative.draft.vocab_map != "none") {
             cparams.draft_vocab_map = params.speculative.draft.vocab_map.c_str();
             cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;
-            LOG_INF("%s: MTP draft context uses the draft-only vocabulary shortlist '%s'\n", __func__, cparams.draft_vocab_map);
+            LOG_INF("%s: %s draft context uses the draft-only vocabulary shortlist '%s'\n",
+                    __func__, spec_mtp ? "MTP" : "DSpark", cparams.draft_vocab_map);
             if (cparams.draft_vocab_hot > 0) {
                 LOG_INF("%s: the last %d entries of the shortlist are adaptive hot slots\n", __func__, cparams.draft_vocab_hot);
             }
