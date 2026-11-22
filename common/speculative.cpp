@@ -4910,14 +4910,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.kv_stream_arena_mib = 0;
     // INKKV: the Inkling DSpark drafter (-md DSpark file, draft-dspark) keeps the trunk's SJ-KVaRN 4/4 on its
     // full-attention layer (the SWA layers stay F16, as on the trunk; llama_kv_cache_iswa packs the 128-wide head
-    // pairs). Kill switch: LLAMA_DSPARK_DRAFT_SJKVARN=0, --no-spec-draft-sjkvarn, or an explicit -ctkd/-ctvd. A non-Inkling draft-dspark
+    // pairs). On with LLAMA_DSPARK_DRAFT_SJKVARN=1 or --spec-draft-sjkvarn; an explicit -ctkd/-ctvd keeps it off. A non-Inkling draft-dspark
     // model refuses the SJ-KVaRN cache at context creation (head size), so the switch is the way back there.
     const bool spec_dspark = has_draft && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
             [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; });
-    const bool dspark_sj = spec_dspark && !spec_mtp && !(params_spec.sj_kvarn_explicit && !params_spec.sj_kvarn) && [] {
+    // Opt-in (2026-11-22 speed gate, ABBA 6v6 vs the F16 drafter: 3K -0.2%, 32K -1.8%, 100K -3.0%; saves the
+    // drafter's 4,096 B/token F16 KV): LLAMA_DSPARK_DRAFT_SJKVARN=1 or --spec-draft-sjkvarn turns it on.
+    const bool dspark_sj = spec_dspark && !spec_mtp && (params_spec.sj_kvarn_explicit ? params_spec.sj_kvarn : [] {
             const char * e = std::getenv("LLAMA_DSPARK_DRAFT_SJKVARN");
-            return !(e && *e && std::atoi(e) == 0);
-        }() && params.sj_kvarn_bits_k == 4 && params.sj_kvarn_bits_v == 4 &&
+            return e && *e && std::atoi(e) != 0;
+        }()) && params.sj_kvarn_bits_k == 4 && params.sj_kvarn_bits_v == 4 &&
         params_spec.cache_type_k == GGML_TYPE_COUNT && params_spec.cache_type_v == GGML_TYPE_COUNT &&
         params.sj_kvarn_edge_layers == 0 && params.sj_kvarn_transform.empty();
     // fork: the automatic default has the same parameter bounds as explicit DSJ.
