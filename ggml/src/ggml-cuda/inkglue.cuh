@@ -45,3 +45,7 @@ bool ggml_cuda_ink_rms_norm_mul_multi(ggml_backend_cuda_context & ctx, const ggm
 // (mmvq.cu) grouped Q8_0 matvec, 1..8 members of one width, member k reading the prequantized q8_1 activation vy[k];
 // vy == nullptr: only answers whether the group is supported
 bool ggml_cuda_mul_mat_vec_q_group_pre(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, const void * const * vy);
+
+// LGTUNE launch shape of the loop-gate kernels (GGML_CUDA_LG_RB 1/2/4, GGML_CUDA_LG_ROWS 2/4/8), see inkglue.cu
+int ggml_cuda_lg_tune_rb();
+int ggml_cuda_lg_tune_rows();
