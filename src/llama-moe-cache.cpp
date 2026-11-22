@@ -185,7 +185,7 @@ struct moe_cache_lru {
     // returns false if the ids select more distinct experts than there are slots
     template <typename F>
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, F && n_cpu,
-            std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit) {
+            std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, bool advance = true) {
         fills.clear();
         cpu.clear();
         n_hit = 0;
@@ -281,7 +281,9 @@ struct moe_cache_lru {
             move(s, class_of(key));
             fills.push_back({ e, s });
         }
-        clock[il] += n_tokens;
+        if (advance) {
+            clock[il] += n_tokens; // fork (INKOFFLOAD): a looped layer's later visits do not age the clock again
+        }
         return true;
     }
 };
@@ -336,6 +338,7 @@ struct llama_moe_cache::impl {
         int32_t id;                       // device
         std::vector<ggml_tensor *> ref;   // expert tensors of the first layer
         std::vector<int32_t> layers;
+        int32_t n_canon = 0;              // layers that own their experts (looped layers reuse a canonical layer's)
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
@@ -365,7 +368,13 @@ struct llama_moe_cache::impl {
         size_t bytes  = 0;
     };
 
-    static constexpr int64_t max_batch = 32;
+    // fork (INKOFFLOAD): LLAMA_MOE_CACHE_MAX_BATCH raises the largest ubatch that runs through the cache (default 32).
+    // Without op offload (small cards with looped layers), larger prompt ubatches would otherwise run on the CPU.
+    const int64_t max_batch = [] {
+        const char * env = getenv("LLAMA_MOE_CACHE_MAX_BATCH");
+        const long long v = env ? atoll(env) : 32;
+        return (int64_t) std::max(1LL, std::min(v, 65536LL));
+    }();
 
     int32_t n_expert_used;
 
@@ -376,6 +385,10 @@ struct llama_moe_cache::impl {
     std::vector<device> devices;
     std::vector<group> groups;
     std::vector<layer> layers;
+    // fork (INKOFFLOAD): canon[il] is the first layer with the same expert tensors as il. Looped models (Inkling 2)
+    // run one physical layer several times per token; its visits share one LRU key space and one slot array, so a
+    // physical expert is cached once. LLAMA_MOE_CACHE_LOOP_SHARE=0 keys every visit on its own (the old behaviour).
+    std::vector<int32_t> canon;
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
     std::unordered_map<const ggml_tensor *, std::pair<int32_t, bool>> layer_of; // slot map -> layer, and if the graph that looks it up has a CPU part
 
@@ -398,6 +411,7 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
+
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -416,6 +430,23 @@ struct llama_moe_cache::impl {
         }
         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
             throw std::runtime_error("MoE cache requires a MoE model");
+        }
+
+        const char * loop_share_env = getenv("LLAMA_MOE_CACHE_LOOP_SHARE");
+        const bool loop_share = loop_share_env == nullptr || strcmp(loop_share_env, "0") != 0;
+        canon.resize(model.layers.size());
+        for (size_t il = 0; il < model.layers.size(); ++il) {
+            canon[il] = (int32_t) il;
+            if (!loop_share) {
+                continue;
+            }
+            const auto experts = llama_moe_cache_layer_experts(model.layers[il]);
+            for (size_t jl = 0; jl < il && !experts.empty(); ++jl) {
+                if (llama_moe_cache_layer_experts(model.layers[jl]) == experts) {
+                    canon[il] = (int32_t) jl;
+                    break;
+                }
+            }
         }
 
         // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
@@ -441,6 +472,20 @@ struct llama_moe_cache::impl {
                 it->ref = experts;
             }
             it->layers.push_back(il);
+            if (canon[il] != (int32_t) il) {
+                // a later visit of a looped layer: same host experts, counted once
+                const auto it_c = std::find(it->layers.begin(), it->layers.end(), canon[il]);
+                if (it_c == it->layers.end()) {
+                    // canonical layer cached in another group (another device): its bindings own these host
+                    // tensors, so this visit is not cached
+                    it->layers.pop_back();
+                    if (it->layers.empty()) {
+                        groups.erase(it);
+                    }
+                }
+                continue;
+            }
+            it->n_canon++;
             for (const ggml_tensor * t : experts) {
                 // EXL3 experts: nb[2] can exceed nb[1]*ne[1], so size an expert by its rows
                 const size_t bytes = t->nb[1] * t->ne[1] * t->ne[2];
@@ -510,7 +555,7 @@ struct llama_moe_cache::impl {
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
             const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
-            const int32_t max_slots = g.layers.size()*n_expert;
+            const int32_t max_slots = g.n_canon*n_expert;
             while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
                 g.n_slots++;
             }
@@ -566,7 +611,7 @@ struct llama_moe_cache::impl {
                 layer & l = layers[il];
                 l.ig      = (int32_t) ig;
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
-                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                for (size_t ip = 0; ip < l.experts.size() && canon[il] == il; ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
@@ -610,7 +655,9 @@ struct llama_moe_cache::impl {
                     if (layers[il].slot_map != nullptr) {
                         int32_t * slots = (int32_t *) layers[il].slot_map->data;
                         std::fill(slots, slots + layers[il].slot_map->ne[1], g.lru.empty);
-                        g.lru.slot_map[il] = slots;
+                        if (canon[il] == il) {
+                            g.lru.slot_map[il] = slots; // visits of a looped layer plan and upload this one
+                        }
                     }
                 }
             }
@@ -634,8 +681,12 @@ struct llama_moe_cache::impl {
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%, %.1f tokens worth)\n", __func__,
-                        g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]),
+                        g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.n_canon*g.ref[0]->ne[2]),
                         (double) g.n_slots/(g.layers.size()*n_expert_used));
+                    if (g.n_canon != (int32_t) g.layers.size()) {
+                        LLAMA_LOG_INFO("%s: %2zu layer visits share the experts of %d physical layers (LLAMA_MOE_CACHE_LOOP_SHARE=0 disables)\n",
+                            __func__, g.layers.size(), g.n_canon);
+                    }
                 }
             }
         }
@@ -770,6 +821,7 @@ struct llama_moe_cache::impl {
             return false;
         }
         const int32_t il      = it->second.first;
+        const int32_t ci      = canon[il];
         const bool    has_cpu = it->second.second;
         layer & l = layers[il];
         group & g = groups[l.ig];
@@ -817,7 +869,7 @@ struct llama_moe_cache::impl {
             return (size_t) (acc >> 16);
         };
         size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit)) {
+        if (!g.lru.plan(ci, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit, ci == il)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         if (has_cpu) {
@@ -856,7 +908,7 @@ struct llama_moe_cache::impl {
         st.bytes  += bytes;
 
         // the next copy synchronizes the backend before it changes the slot map again
-        ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
+        ggml_backend_tensor_set_async(backend, dst, g.lru.slot_map[ci], 0, ggml_nbytes(l.slot_map));
 
         return true;
     }
