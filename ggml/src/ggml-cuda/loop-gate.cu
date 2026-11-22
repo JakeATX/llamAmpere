@@ -7,11 +7,12 @@
 #define LOOP_GATE_MAX_R  128
 
 // part[t][c][r] = dot(down[r, half c], chunk c of x or m) for c < 2*CHUNKS; part[t][c][R] = its sum of squares
-template <typename TW>
+template <typename TW, int RB>
 static __global__ void k_loop_gate_down(
         const char * __restrict__ x, const int64_t x_nb1, const char * __restrict__ m, const int64_t m_nb1,
         const TW * __restrict__ down, float * __restrict__ part, const int n, const int R, const int T) {
-    const int r    = blockIdx.x;
+    // RB consecutive rows r per block (LGTUNE, GGML_CUDA_LG_RB); each (r, chunk) partial is bit-identical for any RB
+    const int r0   = blockIdx.x*RB;
     const int c    = blockIdx.y*LOOP_GATE_WARPS + threadIdx.x/WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int half = c / LOOP_GATE_CHUNKS;
@@ -21,18 +22,25 @@ static __global__ void k_loop_gate_down(
 
     const char   * src = half ? m : x;
     const int64_t  nb1 = half ? m_nb1 : x_nb1;
-    const TW     * w   = down + (int64_t) r*2*n + half*n;
+    const TW     * w   = down + (int64_t) r0*2*n + half*n;
 
-    float d[LOOP_GATE_MAX_T]  = {0.0f};
-    float ss[LOOP_GATE_MAX_T] = {0.0f};
+    float d[RB][LOOP_GATE_MAX_T] = {{0.0f}};
+    float ss[LOOP_GATE_MAX_T]    = {0.0f};
 #pragma unroll 4
     for (int i = i0 + lane; i < i1; i += WARP_SIZE) {
-        const float wi = ggml_cuda_cast<float>(w[i]);
+        float wi[RB];
+#pragma unroll
+        for (int b = 0; b < RB; ++b) {
+            wi[b] = r0 + b < R ? ggml_cuda_cast<float>(w[(int64_t) b*2*n + i]) : 0.0f;
+        }
 #pragma unroll
         for (int t = 0; t < LOOP_GATE_MAX_T; ++t) {
             if (t < T) {
                 const float v = ((const float *) (src + t*nb1))[i];
-                d[t]  += wi*v;
+#pragma unroll
+                for (int b = 0; b < RB; ++b) {
+                    d[b][t] += wi[b]*v;
+                }
                 ss[t] += v*v;
             }
         }
@@ -40,16 +48,19 @@ static __global__ void k_loop_gate_down(
 #pragma unroll
     for (int t = 0; t < LOOP_GATE_MAX_T; ++t) {
         if (t < T) {
-            d[t] = warp_reduce_sum(d[t]);
-            if (r == 0) {
+            if (r0 == 0) {
                 ss[t] = warp_reduce_sum(ss[t]);
             }
-            if (lane == 0) {
-                float * p = part + ((int64_t) t*2*LOOP_GATE_CHUNKS + c)*(R + 1);
-                p[r] = d[t];
-                if (r == 0) {
-                    p[R] = ss[t];
+            float * p = part + ((int64_t) t*2*LOOP_GATE_CHUNKS + c)*(R + 1);
+#pragma unroll
+            for (int b = 0; b < RB; ++b) {
+                d[b][t] = warp_reduce_sum(d[b][t]);
+                if (lane == 0 && r0 + b < R) {
+                    p[r0 + b] = d[b][t];
                 }
+            }
+            if (lane == 0 && r0 == 0) {
+                p[R] = ss[t];
             }
         }
     }
@@ -59,7 +70,7 @@ static __global__ void k_loop_gate_down(
 // lanes over r (coalesced weight reads), out = x - tanh(F g) x + tanh(G g) m
 #define LOOP_GATE_APPLY_WARPS 8
 #define LOOP_GATE_APPLY_ROWS  2   // rows per warp
-template <typename TW>
+template <typename TW, int ROWS>
 static __global__ void k_loop_gate_apply(
         const char * __restrict__ x, const int64_t x_nb1, const char * __restrict__ m, const int64_t m_nb1,
         const TW * __restrict__ gain, const TW * __restrict__ forget, const float * __restrict__ part,
@@ -91,9 +102,9 @@ static __global__ void k_loop_gate_apply(
     __syncthreads();
 
     const int lane = threadIdx.x % WARP_SIZE;
-    const int row0 = (blockIdx.x*LOOP_GATE_APPLY_WARPS + threadIdx.x/WARP_SIZE)*LOOP_GATE_APPLY_ROWS;
+    const int row0 = (blockIdx.x*LOOP_GATE_APPLY_WARPS + threadIdx.x/WARP_SIZE)*ROWS;
 #pragma unroll
-    for (int k = 0; k < LOOP_GATE_APPLY_ROWS; ++k) {
+    for (int k = 0; k < ROWS; ++k) {
         const int i = row0 + k;
         if (i >= n) {
             return;
@@ -134,8 +145,11 @@ bool ggml_cuda_loop_gate_supported(const ggml_tensor * op) {
         op->src[0]->ne[1] <= LOOP_GATE_MAX_T && op->src[2]->ne[1] <= LOOP_GATE_MAX_R;
 }
 
-template <typename TW>
-static void loop_gate_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+int ggml_cuda_lg_tune_rb();   // inkglue.cu (GGML_CUDA_LG_RB, GGML_CUDA_LG_ROWS)
+int ggml_cuda_lg_tune_rows();
+
+template <typename TW, int RB, int ROWS>
+static void loop_gate_launch_t(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * m = dst->src[1];
     const int n = (int) x->ne[0];
@@ -145,13 +159,31 @@ static void loop_gate_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) T*2*LOOP_GATE_CHUNKS*(R + 1));
     cudaStream_t stream = ctx.stream();
 
-    k_loop_gate_down<TW><<<dim3(R, 2*LOOP_GATE_CHUNKS/LOOP_GATE_WARPS), LOOP_GATE_WARPS*WARP_SIZE, 0, stream>>>(
+    k_loop_gate_down<TW, RB><<<dim3((R + RB - 1)/RB, 2*LOOP_GATE_CHUNKS/LOOP_GATE_WARPS), LOOP_GATE_WARPS*WARP_SIZE, 0, stream>>>(
         (const char *) x->data, x->nb[1], (const char *) m->data, m->nb[1], (const TW *) dst->src[2]->data, part.get(), n, R, T);
-    const int rows_per_block = LOOP_GATE_APPLY_WARPS*LOOP_GATE_APPLY_ROWS;
-    k_loop_gate_apply<TW><<<(n + rows_per_block - 1)/rows_per_block, LOOP_GATE_APPLY_WARPS*WARP_SIZE, 0, stream>>>(
+    const int rows_per_block = LOOP_GATE_APPLY_WARPS*ROWS;
+    k_loop_gate_apply<TW, ROWS><<<(n + rows_per_block - 1)/rows_per_block, LOOP_GATE_APPLY_WARPS*WARP_SIZE, 0, stream>>>(
         (const char *) x->data, x->nb[1], (const char *) m->data, m->nb[1], (const TW *) dst->src[3]->data,
         (const TW *) dst->src[4]->data, part.get(), (float *) dst->data, n, R, T, ggml_get_op_params_f32(dst, 0));
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename TW, int RB>
+static void loop_gate_launch_r(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (ggml_cuda_lg_tune_rows()) {
+        case 4:  loop_gate_launch_t<TW, RB, 4>(ctx, dst); break;
+        case 8:  loop_gate_launch_t<TW, RB, 8>(ctx, dst); break;
+        default: loop_gate_launch_t<TW, RB, 2>(ctx, dst); break;
+    }
+}
+
+template <typename TW>
+static void loop_gate_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (ggml_cuda_lg_tune_rb()) {
+        case 2:  loop_gate_launch_r<TW, 2>(ctx, dst); break;
+        case 4:  loop_gate_launch_r<TW, 4>(ctx, dst); break;
+        default: loop_gate_launch_r<TW, 1>(ctx, dst); break;
+    }
 }
 
 void ggml_cuda_loop_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

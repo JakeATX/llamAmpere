@@ -233,7 +233,7 @@ struct ink_lg_args {
     float        eps[INK_MULTI_MAX];
 };
 
-template <typename TW>
+template <typename TW, int RB>
 static __global__ void k_ink_lg_down(const ink_lg_args a, float * __restrict__ part_all, const int n, const int R, const int T) {
     const int g = blockIdx.z;
     const char * __restrict__ x = a.x[g];
@@ -243,7 +243,9 @@ static __global__ void k_ink_lg_down(const ink_lg_args a, float * __restrict__ p
     const TW * __restrict__ down = (const TW *) a.down[g];
     float * __restrict__ part = part_all + (int64_t) g*T*2*INK_LG_CHUNKS*(R + 1);
 
-    const int r    = blockIdx.x;
+    // RB consecutive rows r per block (one x / m load feeds all of them); each (r, chunk) partial keeps the original
+    // lane order and warp reduction, so the partials are bit-identical for any RB
+    const int r0   = blockIdx.x*RB;
     const int c    = blockIdx.y*INK_LG_WARPS + threadIdx.x/WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
     const int half = c / INK_LG_CHUNKS;
@@ -253,18 +255,25 @@ static __global__ void k_ink_lg_down(const ink_lg_args a, float * __restrict__ p
 
     const char   * src = half ? m : x;
     const int64_t  nb1 = half ? m_nb1 : x_nb1;
-    const TW     * w   = down + (int64_t) r*2*n + half*n;
+    const TW     * w   = down + (int64_t) r0*2*n + half*n;
 
-    float d[INK_LG_MAX_T]  = {0.0f};
-    float ss[INK_LG_MAX_T] = {0.0f};
+    float d[RB][INK_LG_MAX_T] = {{0.0f}};
+    float ss[INK_LG_MAX_T]    = {0.0f};
 #pragma unroll 4
     for (int i = i0 + lane; i < i1; i += WARP_SIZE) {
-        const float wi = ggml_cuda_cast<float>(w[i]);
+        float wi[RB];
+#pragma unroll
+        for (int b = 0; b < RB; ++b) {
+            wi[b] = r0 + b < R ? ggml_cuda_cast<float>(w[(int64_t) b*2*n + i]) : 0.0f;
+        }
 #pragma unroll
         for (int t = 0; t < INK_LG_MAX_T; ++t) {
             if (t < T) {
                 const float v = ((const float *) (src + t*nb1))[i];
-                d[t]  += wi*v;
+#pragma unroll
+                for (int b = 0; b < RB; ++b) {
+                    d[b][t] += wi[b]*v;
+                }
                 ss[t] += v*v;
             }
         }
@@ -272,22 +281,25 @@ static __global__ void k_ink_lg_down(const ink_lg_args a, float * __restrict__ p
 #pragma unroll
     for (int t = 0; t < INK_LG_MAX_T; ++t) {
         if (t < T) {
-            d[t] = warp_reduce_sum(d[t]);
-            if (r == 0) {
+            if (r0 == 0) {
                 ss[t] = warp_reduce_sum(ss[t]);
             }
-            if (lane == 0) {
-                float * p = part + ((int64_t) t*2*INK_LG_CHUNKS + c)*(R + 1);
-                p[r] = d[t];
-                if (r == 0) {
-                    p[R] = ss[t];
+            float * p = part + ((int64_t) t*2*INK_LG_CHUNKS + c)*(R + 1);
+#pragma unroll
+            for (int b = 0; b < RB; ++b) {
+                d[b][t] = warp_reduce_sum(d[b][t]);
+                if (lane == 0 && r0 + b < R) {
+                    p[r0 + b] = d[b][t];
                 }
+            }
+            if (lane == 0 && r0 == 0) {
+                p[R] = ss[t];
             }
         }
     }
 }
 
-template <typename TW>
+template <typename TW, int ROWS>
 static __global__ void k_ink_lg_apply(const ink_lg_args a, const float * __restrict__ part_all, const int n, const int R, const int T) {
     const int g = blockIdx.y;
     const char * __restrict__ x = a.x[g];
@@ -327,9 +339,9 @@ static __global__ void k_ink_lg_apply(const ink_lg_args a, const float * __restr
     __syncthreads();
 
     const int lane = threadIdx.x % WARP_SIZE;
-    const int row0 = (blockIdx.x*INK_LG_APPLY_WARPS + threadIdx.x/WARP_SIZE)*INK_LG_APPLY_ROWS;
+    const int row0 = (blockIdx.x*INK_LG_APPLY_WARPS + threadIdx.x/WARP_SIZE)*ROWS;
 #pragma unroll
-    for (int k = 0; k < INK_LG_APPLY_ROWS; ++k) {
+    for (int k = 0; k < ROWS; ++k) {
         const int i = row0 + k;
         if (i >= n) {
             return;
@@ -364,15 +376,44 @@ static __global__ void k_ink_lg_apply(const ink_lg_args a, const float * __restr
     }
 }
 
-template <typename TW>
-static void ink_lg_launch(ggml_backend_cuda_context & ctx, const ink_lg_args & a, int G, int n, int R, int T) {
+// LGTUNE: rows r per down block (GGML_CUDA_LG_RB 1/2/4) and output rows per apply warp (GGML_CUDA_LG_ROWS 2/4/8);
+// launch shape only, every output is bit-identical for any setting
+int ggml_cuda_lg_tune_rb() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_LG_RB"); const int k = e && *e ? atoi(e) : 1; return k == 2 || k == 4 ? k : 1; }();
+    return v;
+}
+int ggml_cuda_lg_tune_rows() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_LG_ROWS"); const int k = e && *e ? atoi(e) : 2; return k == 4 || k == 8 ? k : 2; }();
+    return v;
+}
+
+template <typename TW, int RB, int ROWS>
+static void ink_lg_launch_t(ggml_backend_cuda_context & ctx, const ink_lg_args & a, int G, int n, int R, int T) {
     ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) G*T*2*INK_LG_CHUNKS*(R + 1));
     cudaStream_t stream = ctx.stream();
-    k_ink_lg_down<TW><<<dim3(R, 2*INK_LG_CHUNKS/INK_LG_WARPS, G), INK_LG_WARPS*WARP_SIZE, 0, stream>>>(a, part.get(), n, R, T);
-    const int rows_per_block = INK_LG_APPLY_WARPS*INK_LG_APPLY_ROWS;
-    k_ink_lg_apply<TW><<<dim3((n + rows_per_block - 1)/rows_per_block, G, 1), INK_LG_APPLY_WARPS*WARP_SIZE, 0, stream>>>(
+    k_ink_lg_down<TW, RB><<<dim3((R + RB - 1)/RB, 2*INK_LG_CHUNKS/INK_LG_WARPS, G), INK_LG_WARPS*WARP_SIZE, 0, stream>>>(a, part.get(), n, R, T);
+    const int rows_per_block = INK_LG_APPLY_WARPS*ROWS;
+    k_ink_lg_apply<TW, ROWS><<<dim3((n + rows_per_block - 1)/rows_per_block, G, 1), INK_LG_APPLY_WARPS*WARP_SIZE, 0, stream>>>(
         a, part.get(), n, R, T);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename TW, int RB>
+static void ink_lg_launch_r(ggml_backend_cuda_context & ctx, const ink_lg_args & a, int G, int n, int R, int T) {
+    switch (ggml_cuda_lg_tune_rows()) {
+        case 4:  ink_lg_launch_t<TW, RB, 4>(ctx, a, G, n, R, T); break;
+        case 8:  ink_lg_launch_t<TW, RB, 8>(ctx, a, G, n, R, T); break;
+        default: ink_lg_launch_t<TW, RB, 2>(ctx, a, G, n, R, T); break;
+    }
+}
+
+template <typename TW>
+static void ink_lg_launch(ggml_backend_cuda_context & ctx, const ink_lg_args & a, int G, int n, int R, int T) {
+    switch (ggml_cuda_lg_tune_rb()) {
+        case 2:  ink_lg_launch_r<TW, 2>(ctx, a, G, n, R, T); break;
+        case 4:  ink_lg_launch_r<TW, 4>(ctx, a, G, n, R, T); break;
+        default: ink_lg_launch_r<TW, 1>(ctx, a, G, n, R, T); break;
+    }
 }
 
 bool ggml_cuda_ink_loop_gate_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * gates, int G) {
