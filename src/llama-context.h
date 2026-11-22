@@ -710,6 +710,18 @@ private:
     // requests left in the MoE cache (fixed prompt crossover; see llama-moe-cache.cpp for the cache side)
     bool     moe_cache_det = false;
     bool dynamic_ubatch = false;
+    // fork UBDEFAULT: prompt compute lent from the unused KV tail (Jake 11-20: start high, give the space back when
+    // the context needs it). Active only between a prompt reserve and the next reserve; LLAMA_UB_KV_LOAN=0 off.
+    std::vector<ggml_backend_buffer_ptr> ub_loan_views;
+    llama_kv_cache * ub_loan_cache = nullptr;
+    ggml_backend_t ub_loan_backend = nullptr;
+    bool ub_loan_active = false;
+    bool ub_path_logged = false;
+    uint32_t ub_memo_want = 0, ub_memo_rows = 0; // last exact fit that stepped down (want -> rows)
+    int64_t ub_memo_us = 0;
+    bool ub_loan_begin(uint32_t rows, uint32_t n_tokens, size_t gpu, size_t bytes, ggml_cgraph * gf);
+    void ub_loan_end();
+    uint32_t ub_fit_rows(uint32_t rows, uint32_t floor, uint32_t n_tokens);
     uint32_t dynamic_ubatch_rows = 0;
     int64_t dynamic_ubatch_pp_check_us = 0;
     // per-backend compute buffer bytes and rows of the last prompt-sized reserve (LLAMA_UB_LADDER_HOLD)

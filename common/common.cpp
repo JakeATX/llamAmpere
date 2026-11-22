@@ -1332,6 +1332,7 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     if (arch.empty()) {
         return info;
     }
+    info.arch = arch;
 
     const int64_t type_id = gguf_find_key(gguf_ctx.get(), (arch + ".decision.type").c_str());
     if (type_id < 0) {
@@ -1535,6 +1536,65 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         LOG_INF("card preset %s v%s [%s]; applied defaults:%s; effective -c %d -np %d -b %d -ub %d; profile env:%s\n",
                 card.name.c_str(), card.version.c_str(), card.status.c_str(), params.card_preset_flags.c_str(),
                 params.n_ctx, params.n_parallel, params.n_batch, params.n_ubatch, preset_env.c_str());
+    }
+    // fork UBDEFAULT (Jake 11-22): no -ub/-b given -> the dynamic ub ladder's ceiling follows the card. A 24 GB-class
+    // card (smallest used GPU total >= 23,552 MiB) gets -ub 4096 -b >= 4096; smaller cards keep the default (512) and
+    // their presets' values. The boot reserve and the memory fit stay at LLAMA_UB_FIT_ROWS (512) rows, so the ceiling
+    // costs no context, KV or expert cache: prompt rows above it come from free memory or the unused KV tail.
+    if (params.n_ubatch_auto) {
+        size_t min_total = 0;
+        auto consider = [&](ggml_backend_dev_t dev) {
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                return;
+            }
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            min_total = min_total ? std::min(min_total, total) : total;
+        };
+        if (!params.devices.empty()) {
+            for (auto * dev : params.devices) {
+                consider(dev);
+            }
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                consider(ggml_backend_dev_get(i));
+            }
+        }
+        const char * ladder = getenv("LLAMA_DEEPCTX_LADDER");
+        const bool ladder_on = !ladder || !ladder[0] || strcmp(ladder, "0") != 0;
+        // Inkling (iSWA + relative bias): each prompt row attends n_swa + n_ubatch SWA cells and the bias of those
+        // cells is materialised per head, so the work per row grows with the ub. UBDEFAULT sweep (3090, 4/4,
+        // c 131,072, cold prefill tok/s 3K/32K/100K): 512 1883/1835/1399, 1024 1772/2073/1514, 2048 1369/2082/1456,
+        // 4096 1851/1620/1191 -> 1024. LLAMA_UB_CEILING=<rows> overrides the auto ceiling for any model.
+        int32_t ceiling = 4096;
+        if (!params.model.path.empty()) {
+            const std::string arch = common_get_gguf_info(params.model.path).arch;
+            if (arch == "inkling2" || arch == "inkling2_loop") {
+                // The SWA cache grows by the ub (n_swa + n_ubatch cells). At the fitted default ctx the 512-row boot
+                // reserve leaves no room for wider prompt rows (the full-ctx reserve sizes the masks at every cell),
+                // so a wider ceiling would only cost context: raise it only when -c is given.
+                ceiling = params.n_ctx > 0 && !params.card_preset_ctx_default ? 1024 : params.n_ubatch;
+            }
+        }
+        if (const char * e = getenv("LLAMA_UB_CEILING"); e && e[0]) {
+            ceiling = std::max(64, std::min(65536, atoi(e)));
+        }
+        if (ladder_on && params.n_gpu_layers != 0 && (min_total >> 20) >= 23552 && ceiling > params.n_ubatch) {
+            // The draft contexts have no ladder of their own: an auto draft ub keeps the old ceiling (speculative.cpp).
+            params.speculative.draft.n_ubatch_auto_cap = params.n_ubatch;
+            params.n_ubatch = ceiling;
+            params.n_batch = std::max(params.n_batch, std::max(ceiling, 4096));
+            if (!params.card_preset.empty()) {
+                for (const char * from : {" --ubatch-size 2048", " --ubatch-size 1024"}) {
+                    const size_t pos = params.card_preset_flags.find(from);
+                    if (pos != std::string::npos) {
+                        params.card_preset_flags.replace(pos, strlen(from), " --ubatch-size " + std::to_string(ceiling));
+                    }
+                }
+            }
+        }
+        LOG_INF("%s: dynamic ub ceiling %d (-b %d) for the smallest GPU total %zu MiB (auto: no -ub/-b given; "
+                "24 GB-class >= 23552 MiB -> 4096, Inkling 1024, LLAMA_UB_CEILING)\n", __func__, params.n_ubatch, params.n_batch, min_total >> 20);
     }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);

@@ -4973,6 +4973,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_ubatch = std::min(params.n_ubatch == 0 ? params.n_batch : params.n_ubatch, 8*params.n_parallel);
     }
 
+    // fork UBDEFAULT: the main ub was raised to the 24 GB auto ceiling; an auto draft ub keeps the old one
+    if (params_spec.n_ubatch < 0 && params_spec.n_ubatch_auto_cap > 0) {
+        result.n_ubatch = std::min(result.n_ubatch == 0 ? params.n_batch : result.n_ubatch, params_spec.n_ubatch_auto_cap);
+    }
+
     if (has_draft) {
         // default to global devices value
         if (!params_spec.devices.empty()) {
