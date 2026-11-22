@@ -10732,6 +10732,20 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
         return nullptr;
     }
 
+    // INKKV: Inkling 2 ships the SJ-KVaRN 4/4 KV cache (Jake 11-22). With the default F16 K/V and no SJ-KVaRN bits given,
+    // Inkling takes 4/4; another -ctk/-ctv type keeps that type. LLAMA_INK_KV44=0 = the plain F16 cache.
+    if ((model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP) &&
+            params.sj_kvarn_bits_k == 0 && params.sj_kvarn_bits_v == 0 &&
+            params.type_k == GGML_TYPE_F16 && params.type_v == GGML_TYPE_F16 &&
+            params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        const char * e = getenv("LLAMA_INK_KV44");
+        if (!e || atoi(e) != 0) {
+            params.sj_kvarn_bits_k = 4;
+            params.sj_kvarn_bits_v = 4;
+            LLAMA_LOG_INFO("%s: Inkling 2: SJ-KVaRN 4/4 KV cache (default; LLAMA_INK_KV44=0 = F16)\n", __func__);
+        }
+    }
+
     // the adaptive tail is a SJ-KVaRN-only setting; the 8192 default must not block non-SJ-KVaRN caches
     if (params.sj_kvarn_tail_max > 0 && params.sj_kvarn_bits_k == 0 && params.sj_kvarn_bits_v == 0) {
         params.sj_kvarn_tail_max = 0;
