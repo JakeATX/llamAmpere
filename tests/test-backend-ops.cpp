@@ -23824,6 +23824,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         add_inkdense_cases(test_cases);
         return test_cases;
     }
+    // INKPF3: Inkling 2 Mini prefill expert GEMMs (AIT4_U, 128 experts, top-8): gate_up 2304 <- 2304, down 2304 <- 1152
+    if (getenv("GGML_TEST_INKPF3") != nullptr) {
+        for (int64_t n : {512, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT4_U, 128, 8, true, 2304, n, 2304));
+            test_cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT4_U, 128, 8, false, 2304, n, 1152));
+        }
+        return test_cases;
+    }
     if (getenv("GGML_TEST_INKATTN") != nullptr) {
         add_inkattn_cases(test_cases, true);
         return test_cases;

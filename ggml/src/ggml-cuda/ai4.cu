@@ -1597,6 +1597,18 @@ static void ai23_launch_id_gemm(const uint8_t * W, const int8_t * q, const float
     }
     if constexpr (ai4k::lay_rate<LAY>() == 2 || ai4k::lay_rate<LAY>() == 3) {
         ai23_launch_id_shape<BN, 3, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
+    } else if constexpr (ai4k::lay_rate<LAY>() == 4 && BN >= 64) {
+        // INKPF3: opt-in rate-4 (AIT4_U) expert prefill shapes for a perf sweep; unset = the default launch below
+        static const int s4 = ai4_env_int("GGML_CUDA_AI4_ID_SHAPE", nullptr, 0);   // 0 default, 1 slabs4, 2 stages2, 3 both
+        if (s4 == 1) {
+            ai23_launch_gemm<BN, 3, 4, LAY, XSH, true, 1, 4>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        } else if (s4 == 2) {
+            ai23_launch_gemm<BN, 2, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        } else if (s4 == 3) {
+            ai23_launch_gemm<BN, 2, 4, LAY, XSH, true, 1, 4>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        } else {
+            ai23_launch_gemm<BN, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
+        }
     } else {
         ai23_launch_gemm<BN, 3, 4, LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles);
     }
@@ -1799,6 +1811,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         idm = ai4k::launch_ids_helper(ids->data, ids->nb[0], ids->nb[1], n_used, n_tok, ne11, n_expert, bn,
                                     max_tiles, src0->nb[2], routing.get(), stream,
                                     zero_in_helper && ai4_id_skip_on() ? y_out : nullptr, M, aggregate, compact);
+        static const bool tail_skip = ai4_env_int("GGML_CUDA_AI4_TAIL_SKIP", nullptr, 1) != 0;   // INKPF3, exact
+        idm.tail_skip = tail_skip;
     }
     const uint8_t * W = (const uint8_t *) src0->data;
     float * Y = y_out;
