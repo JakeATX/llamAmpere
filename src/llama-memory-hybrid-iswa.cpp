@@ -1,4 +1,5 @@
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-io.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -33,11 +34,13 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     const layer_filter_cb & filter_recr,
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
-                     size_t kv_stream_maximum_pool_bytes) :
+                     size_t kv_stream_maximum_pool_bytes,
+      llama_sj_kvarn_config    sj_kvarn) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
         no_alloc,
+        model.hparams,
         type_k,
         type_v,
         v_trans,
@@ -55,7 +58,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         nullptr,
         kv_stream_stage_bytes,
         kv_stream_phase_arena,
-        kv_stream_maximum_pool_bytes
+        kv_stream_maximum_pool_bytes,
+        sj_kvarn
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -75,6 +79,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();
+        balloc.set_split_pos_grid(mem_attn->get_base()->get_sj_kvarn_split_grid()); // [#197] full grid mode only (INKKV)
 
         // [TAG_GDN_REPLAY_SPLIT]
         auto rsplit = mem_recr->make_replay_split(balloc);
@@ -161,6 +166,10 @@ void llama_memory_hybrid_iswa::clear(bool data) {
 }
 
 bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // INKKV: an SJ-KVaRN base can refuse the cut; ask it before the recurrent state is rolled back
+    if (!mem_attn->get_base()->sj_kvarn_can_seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
@@ -216,11 +225,48 @@ std::vector<llama_kv_stream_target> llama_memory_hybrid_iswa::get_kv_stream_targ
 }
 
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    llama_kv_cache * base = mem_attn->get_base();
+    if (base->is_sj_kvarn()) {
+        // INKKV: as llama_memory_hybrid: a partial state (server checkpoint) holds no full-attention cache, only the SWA
+        // window and the recurrent state, then the [#240] SJ-KVaRN exact section as a suffix
+        const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
+        const llama_state_seq_flags f = flags & ~LLAMA_STATE_SEQ_FLAGS_SJ_EXACT;
+        if (!partial) {
+            base->state_write(io, seq_id, f);
+        }
+        mem_attn->get_swa()->state_write(io, seq_id, f);
+        mem_recr->state_write(io, seq_id, flags);
+        if (partial && (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT)) {
+            base->state_write_sj_ckpt(io, seq_id);
+        }
+        return;
+    }
     mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    llama_kv_cache * base = mem_attn->get_base();
+    if (base->is_sj_kvarn()) {
+        const bool partial = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
+        const llama_state_seq_flags f = flags & ~LLAMA_STATE_SEQ_FLAGS_SJ_EXACT;
+        if (!partial) {
+            base->state_read(io, seq_id, f);
+        }
+        try {
+            mem_attn->get_swa()->state_read(io, seq_id, f);
+            mem_recr->state_read(io, seq_id, flags);
+            if (partial && io.n_left() > 0) {
+                base->state_read_sj_ckpt(io, seq_id); // checkpoints without the suffix end with the recurrent state
+            }
+        } catch (...) {
+            if (!partial) {
+                base->state_clear(seq_id); // the full-attention part is already restored - undo it
+            }
+            throw;
+        }
+        return;
+    }
     mem_attn->state_read(io, seq_id, flags);
     mem_recr->state_read(io, seq_id, flags);
 }

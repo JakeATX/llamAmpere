@@ -3115,6 +3115,14 @@ static enum ggml_type llama_memory_get_kv_type(const llama_memory_i * mem, bool 
 static llama_kv_cache * llama_sj_kvarn_cache(llama_memory_i * memory) {
     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) { return kv; }
     if (auto * hy = dynamic_cast<llama_memory_hybrid *>(memory)) { return hy->get_mem_attn(); }
+    // fork (INKKV): SJ-KVaRN lives on the full-attention (base) half of an iSWA memory
+    if (auto * hy = dynamic_cast<llama_memory_hybrid_iswa *>(memory)) {
+        llama_kv_cache * base = hy->get_mem_attn() ? hy->get_mem_attn()->get_base() : nullptr;
+        return base && base->is_sj_kvarn() ? base : nullptr;
+    }
+    if (auto * kv = dynamic_cast<llama_kv_cache_iswa *>(memory)) {
+        return kv->get_base()->is_sj_kvarn() ? kv->get_base() : nullptr;
+    }
     return nullptr;
 }
 
@@ -10842,9 +10850,21 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     }
     // (after the LSA check, so a refusal reports the LSA reason first)
     if (params.sj_kvarn_bits_k > 0 || params.sj_kvarn_bits_v > 0) {
+        const bool inkling = model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP;
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
                 continue;
+            }
+            if (inkling) {
+                // INKKV: Inkling's SWA layers keep an F16 cache; the full-attention layers pack two 128-channel KV heads
+                // into one 256-channel row (llama_kv_cache_iswa)
+                if (model->hparams.is_swa(il)) {
+                    continue;
+                }
+                if (model->hparams.n_embd_head_k(il) == 128 && model->hparams.n_embd_head_v(il) == 128 &&
+                        model->hparams.n_head_kv(il) % 2 == 0) {
+                    continue;
+                }
             }
             if (model->hparams.n_embd_head_k(il) != 256 || model->hparams.n_embd_head_v(il) != 256) {
                 LLAMA_LOG_ERROR("%s: SJ-KVaRN cache requires 256-channel K/V heads (layer %u has %u/%u)\n", __func__,

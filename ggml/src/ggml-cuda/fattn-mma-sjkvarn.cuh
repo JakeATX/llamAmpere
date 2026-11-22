@@ -176,6 +176,17 @@ static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(const ggml_ten
         Q->ne[1] >= 1 && Q->ne[1] <= std::min(stream_max, 8) && ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(dst);
 }
 
+// INKKV: a per-query-head mask the stream kernel does not take (attention sinks, wider ubatches: Inkling's relative
+// bias) runs on the tile kernel with one Q head per column group (ncols2 == 1), which reads mask and sink per head
+static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_tile_ok(const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    return mask != nullptr && mask->type == GGML_TYPE_F16 && mask->ne[2] == Q->ne[2] && mask->ne[2] > 1 && mask->ne[3] == 1 &&
+        ggml_get_op_params_i32(dst, 5) == ((4 << 8) | 4) && ggml_get_op_params_i32(dst, 7) != GGML_TYPE_I16 &&
+        ggml_flash_attn_ext_get_lsa_block(dst) == 0 && dst->src[7] == nullptr && dst->src[8] == nullptr &&
+        ggml_flash_attn_ext_get_lse(dst) == nullptr;
+}
+
 // LSA block list (ggml_flash_attn_ext_set_lsa_blocks): only the 4/4 stream decode kernel resolves the mask's
 // GGML_LSA_MASK_SEL entries, so the node is served at the widths that kernel takes and refused everywhere else
 // LSA virtual keys (ggml_flash_attn_ext_set_lsa_vk): 4/4 stream kernel only, F16 mean rows with 16-byte rows and >= 16
@@ -231,8 +242,12 @@ static void ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2(ggml_backend_cud
         ggml_cuda_sj_kvarn_trellis_cb_init();
     }
     if (mask->ne[2] != 1) {
-        GGML_ASSERT(ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst));
-        ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, dst); // -> stream kernel (n_q <= stream_max)
+        if (ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst)) {
+            ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, dst); // -> stream kernel (n_q <= stream_max)
+            return;
+        }
+        GGML_ASSERT(ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_tile_ok(dst));
+        ggml_cuda_flash_attn_ext_mma_sj_kvarn_case<DKQ, DV, 8, 1>(ctx, dst); // INKKV: per-head mask and sinks
         return;
     }
     if (ggml_flash_attn_ext_get_lsa_block(dst) > 0) {
@@ -314,7 +329,7 @@ static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_supported(const int cc, con
     if (ggml_flash_attn_ext_get_lsa_block(dst) > 0 && !ggml_cuda_flash_attn_ext_sj_kvarn_lsa_blocks_ok(dst)) {
         return false;
     }
-    if (mask->ne[2] != 1 && !ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst)) {
+    if (mask->ne[2] != 1 && !ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst) && !ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_tile_ok(dst)) {
         return false;
     }
     for (const ggml_tensor * kv : {K, V}) {
