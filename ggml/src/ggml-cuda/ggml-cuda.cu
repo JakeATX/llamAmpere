@@ -78,6 +78,7 @@
 #include "ggml-cuda/inkreltab.cuh"
 #include "ggml-cuda/inkprep.cuh"
 #include "ggml-cuda/inkcomb.cuh"
+#include "ggml-cuda/inkdyn.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -11921,6 +11922,314 @@ static int ggml_cuda_try_fuse_ink_router(ggml_backend_cuda_context * ctx, ggml_c
     return (int) ops.size() - 1;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// [INKGLUE DYN] the dynamic short convs (k and v) of an Inkling full-attention visit at decode in one launch (inkdyn.cu).
+// The unfused graph runs ~15 kernels per conv (concat, state cpy, ssm_conv, 4 x (cont, mul, add), epilogue). The run
+// starts at the k CONCAT and ends at the v SCALE; its compute nodes are exactly the nodes of the (one or two) units, plus
+// view/no-op nodes. GGML_CUDA_INKGLUE_DYN=0 = off
+struct ink_dyn_unit {
+    ggml_tensor *       concat = nullptr;
+    ggml_tensor *       sc     = nullptr;
+    int                 sc_idx = -1;
+    std::vector<ggml_tensor *> nodes;   // compute nodes of the unit
+    ink_dyn_unit_args   a = {};
+    const ggml_tensor * keep = nullptr, * xnew = nullptr, * w = nullptr, * store = nullptr, * xop = nullptr;
+    const ggml_tensor * tapv[INK_DYN_MAX_TERMS] = {};
+};
+
+static int ink_node_index(const ggml_cgraph * cgraph, const ggml_tensor * t, int from, int to) {
+    for (int j = from; j < cgraph->n_nodes && j < to; ++j) {
+        if (cgraph->nodes[j] == t) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// the unit whose CONCAT is node ci; false: not this pattern
+static bool ink_dyn_unit_at(const ggml_cgraph * cgraph, int ci, ink_dyn_unit & u) {
+    ggml_tensor * C = cgraph->nodes[ci];
+    if (C->op != GGML_OP_CONCAT || ggml_get_op_params_i32(C, 0) != 0 || C->type != GGML_TYPE_F32 || C->ne[0] != 4 ||
+            C->ne[2] != 1 || C->ne[3] != 1 || !ggml_is_contiguous(C)) {
+        return false;
+    }
+    const int64_t ch = C->ne[1];
+    const ggml_tensor * keep = C->src[0];
+    const ggml_tensor * xnew = C->src[1];
+    if (ch <= 0 || ch > INT_MAX/4 || keep->type != GGML_TYPE_F32 || keep->ne[0] != 3 || keep->ne[1] != ch ||
+            keep->nb[0] != sizeof(float) || keep->nb[1] % sizeof(float) != 0 || xnew->type != GGML_TYPE_F32 ||
+            xnew->ne[0] != 1 || xnew->ne[1] != ch || xnew->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    const int lim = std::min(cgraph->n_nodes, ci + 256);
+    u = ink_dyn_unit();
+    u.concat = C;
+    u.keep   = keep;
+    u.xnew   = xnew;
+    u.nodes.push_back(C);
+    // the state store CPY(VIEW(C, cols s..s+2), dst) and the SSM_CONV(C, w)
+    ggml_tensor * cpy = nullptr;
+    ggml_tensor * conv = nullptr;
+    int conv_idx = -1;
+    for (int j = ci + 1; j < lim && (!cpy || !conv); ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (!cpy && t->op == GGML_OP_CPY && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == C) {
+            cpy = t;
+        } else if (!conv && t->op == GGML_OP_SSM_CONV && t->src[0] == C) {
+            conv = t;
+            conv_idx = j;
+        }
+    }
+    if (!cpy || !conv) {
+        return false;
+    }
+    const ggml_tensor * wv = cpy->src[0];
+    const ggml_tensor * sd = cpy->src[1];
+    if (wv->ne[0] != 3 || wv->ne[1] != ch || wv->ne[2] != 1 || wv->nb[0] != sizeof(float) || wv->nb[1] != C->nb[1] ||
+            wv->view_offs % sizeof(float) != 0 || wv->view_offs/sizeof(float) > 1 || sd->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(sd) || ggml_nelements(sd) != 3*ch) {
+        return false;
+    }
+    const ggml_tensor * w = conv->src[1];
+    if (conv->type != GGML_TYPE_F32 || conv->ne[0] != ch || conv->ne[1] != 1 || conv->ne[2] != 1 || w->type != GGML_TYPE_F32 ||
+            w->ne[0] != 4 || w->ne[1] != ch || w->nb[0] != sizeof(float) || w->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    u.nodes.push_back(cpy);
+    u.nodes.push_back(conv);
+    u.store = sd;
+    u.w     = w;
+    u.a.store_col = (int) (wv->view_offs/sizeof(float));
+    // y = ADD(y, MUL(window, tap)) ..., then ADD(x, y), then SCALE
+    const ggml_tensor * xbase = ink_through_views(xnew);
+    const ggml_tensor * cur = conv;
+    int at = conv_idx;
+    ggml_tensor * addx = nullptr;
+    int n_terms = 0;
+    int hs = 0;
+    while (!addx) {
+        ggml_tensor * add = nullptr;
+        int add_idx = -1;
+        for (int j = at + 1; j < lim && !add; ++j) {
+            ggml_tensor * t = cgraph->nodes[j];
+            if (t->op == GGML_OP_ADD && (ink_through_views(t->src[0]) == cur || ink_through_views(t->src[1]) == cur)) {
+                add = t;
+                add_idx = j;
+            }
+        }
+        if (!add || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || ggml_nelements(add) != ch) {
+            return false;
+        }
+        const ggml_tensor * other = ink_through_views(add->src[0]) == cur ? add->src[1] : add->src[0];
+        const ggml_tensor * ob = ink_through_views(other);
+        if (ob == cur || !other) {
+            return false;
+        }
+        if (ob->op == GGML_OP_MUL) {
+            if (n_terms >= INK_DYN_MAX_TERMS) {
+                return false;
+            }
+            const ggml_tensor * mul = ob;
+            const ggml_tensor * cont = ink_through_views(mul->src[0]);
+            const ggml_tensor * tap = mul->src[1];
+            if (mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || ggml_nelements(mul) != ch || mul->ne[2] != 1 ||
+                    mul->ne[3] != 1 || !ggml_are_same_shape(mul, mul->src[0]) || !ggml_is_contiguous(mul->src[0]) ||
+                    cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_F32 || ggml_nelements(cont) != ch ||
+                    tap->type != GGML_TYPE_F32 || tap->ne[0] != 1 || tap->ne[1] != mul->ne[1] || tap->ne[2] != 1 ||
+                    tap->ne[3] != 1 || tap->nb[1] % sizeof(float) != 0 || mul->ne[0]*mul->ne[1] != ch) {
+                return false;
+            }
+            const ggml_tensor * tr = cont->src[0];
+            if (tr->op != GGML_OP_TRANSPOSE || tr->ne[0] != ch || tr->ne[1] != 1) {
+                return false;
+            }
+            const ggml_tensor * vw = tr->src[0];
+            if (vw->op != GGML_OP_VIEW || vw->view_src != C || vw->ne[0] != 1 || vw->ne[1] != ch || vw->nb[1] != C->nb[1] ||
+                    vw->view_offs % sizeof(float) != 0 || vw->view_offs/sizeof(float) > 3) {
+                return false;
+            }
+            if (hs != 0 && hs != mul->ne[0]) {
+                return false;
+            }
+            hs = (int) mul->ne[0];
+            u.a.col[n_terms] = (int) (vw->view_offs/sizeof(float));
+            u.tapv[n_terms]  = tap;
+            n_terms++;
+            u.nodes.push_back(const_cast<ggml_tensor *>(cont));
+            u.nodes.push_back(const_cast<ggml_tensor *>(mul));
+            u.nodes.push_back(add);
+            cur = add;
+            at  = add_idx;
+        } else if (ob == xbase && n_terms > 0) {
+            addx = add;
+            u.xop = other;
+            u.nodes.push_back(add);
+            at = add_idx;
+        } else {
+            return false;
+        }
+    }
+    ggml_tensor * sc = nullptr;
+    for (int j = at + 1; j < lim && !sc; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_SCALE && cgraph->nodes[j]->src[0] == addx) {
+            sc = cgraph->nodes[j];
+            u.sc_idx = j;
+        }
+    }
+    if (!sc || sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc) || ggml_nelements(sc) != ch) {
+        return false;
+    }
+    u.nodes.push_back(sc);
+    u.sc = sc;
+    u.a.n_terms = n_terms;
+    u.a.hs      = hs;
+    u.a.scale   = ggml_get_op_params_f32(sc, 0);
+    u.a.bias    = ggml_get_op_params_f32(sc, 1);
+    return true;
+}
+
+// ink_run_check without the 31-node limit: the run [i, last] holds the pattern nodes and view/no-op nodes only, and every
+// pattern node but the outputs is used only inside the run and is no graph output
+static bool ink_run_check_big(const ggml_cgraph * cgraph, int i, int last, const std::vector<ggml_tensor *> & set,
+        const std::vector<const ggml_tensor *> & outs) {
+    const int n = last - i + 1;
+    std::vector<uint8_t> in_set(n, 0), rel(n, 0);
+    for (ggml_tensor * t : set) {
+        const int j = ink_node_index(cgraph, t, i, last + 1);
+        if (j < 0) {
+            return false;
+        }
+        in_set[j - i] = 1;
+    }
+    if (!in_set[0] || !in_set[n - 1]) {
+        return false;
+    }
+    for (int j = i; j <= last; ++j) {
+        if (!in_set[j - i] && !ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            return false;
+        }
+    }
+    for (int j = i; j <= last; ++j) {
+        bool r = in_set[j - i];
+        for (int s = 0; s < GGML_MAX_SRC && !r; ++s) {
+            const ggml_tensor * src = cgraph->nodes[j]->src[s];
+            for (int k = i; k < j && src && !r; ++k) {
+                r = rel[k - i] && cgraph->nodes[k] == src;
+            }
+        }
+        rel[j - i] = r;
+    }
+    for (int j = i; j <= last; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (!rel[j - i] || std::find(outs.begin(), outs.end(), t) != outs.end()) {
+            continue;
+        }
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        int uses = 0;
+        for (int k = j; k <= last; ++k) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                uses += cgraph->nodes[k]->src[s] == t;
+            }
+        }
+        if (uses != ggml_node_get_use_count(cgraph, j)) {
+            return false;
+        }
+    }
+    return (cgraph->nodes[last]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+}
+
+static int g_ink_fire_dyn = 0;
+
+static int ggml_cuda_try_fuse_ink_dyn(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_DYN");
+    if (!on || cgraph->nodes[i]->op != GGML_OP_CONCAT) {
+        return 0;
+    }
+    ink_dyn_unit un[INK_DYN_MAX_UNITS];
+    if (!ink_dyn_unit_at(cgraph, i, un[0])) {
+        return 0;
+    }
+    int n_units = 1;
+    // a second unit (v) whose CONCAT comes before the first unit's conv chain ends
+    for (int j = i + 1; j < un[0].sc_idx && n_units < INK_DYN_MAX_UNITS; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_CONCAT) {
+            if (ink_dyn_unit_at(cgraph, j, un[1]) && un[1].concat->ne[1] == un[0].concat->ne[1]) {
+                n_units = 2;
+            }
+            break;
+        }
+    }
+    const int ch = (int) un[0].concat->ne[1];
+    int last = un[0].sc_idx;
+    if (n_units == 2) {
+        last = std::max(last, un[1].sc_idx);
+    }
+    std::vector<ggml_tensor *> set;
+    std::vector<const ggml_tensor *> outs;
+    for (int k = 0; k < n_units; ++k) {
+        set.insert(set.end(), un[k].nodes.begin(), un[k].nodes.end());
+        outs.push_back(un[k].sc);
+    }
+    if (cgraph->nodes[last] != un[n_units - 1].sc && (n_units == 1 || cgraph->nodes[last] != un[0].sc)) {
+        return 0;
+    }
+    if (!ink_run_check_big(cgraph, i, last, set, outs)) {
+        return 0;
+    }
+    if (!ctx) {
+        return last - i;
+    }
+    ink_dyn_args args = {};
+    args.n_units = n_units;
+    args.ch = ch;
+    for (int k = 0; k < n_units; ++k) {
+        ink_dyn_unit & u = un[k];
+        // the new row read for the concat and for ADD(x, y) must be the same values
+        if (!u.xop->data || u.xop->data != u.xnew->data || !ggml_is_contiguous(u.xop) || u.xnew->nb[1] != sizeof(float)) {
+            return 0;
+        }
+        ink_dyn_unit_args & a = u.a;
+        a.keep     = (const float *) u.keep->data;
+        a.keep_nb1 = (int64_t) (u.keep->nb[1]/sizeof(float));
+        a.x        = (const float *) u.xnew->data;
+        a.x_nb1    = (int64_t) (u.xnew->nb[1]/sizeof(float));
+        a.w        = (const float *) u.w->data;
+        a.w_nb1    = (int64_t) (u.w->nb[1]/sizeof(float));
+        a.store    = (float *) u.store->data;
+        a.out      = (float *) u.sc->data;
+        for (int t = 0; t < a.n_terms; ++t) {
+            a.tap[t]     = (const float *) u.tapv[t]->data;
+            a.tap_nb1[t] = (int64_t) (u.tapv[t]->nb[1]/sizeof(float));
+        }
+        // no written tensor (outputs, state windows) may overlap any read operand of any unit
+        for (int m = 0; m < n_units; ++m) {
+            const ink_dyn_unit & r = un[m];
+            for (const ggml_tensor * wr : { (const ggml_tensor *) u.sc, u.store }) {
+                if (ink_overlap(wr, r.keep) || ink_overlap(wr, r.xnew) || ink_overlap(wr, r.w)) {
+                    return 0;
+                }
+                for (int t = 0; t < r.a.n_terms; ++t) {
+                    if (ink_overlap(wr, r.tapv[t])) {
+                        return 0;
+                    }
+                }
+            }
+            if (m != k && (ink_overlap(u.sc, r.sc) || ink_overlap(u.store, r.store) || ink_overlap(u.sc, r.store))) {
+                return 0;
+            }
+        }
+    }
+    args.u[0] = un[0].a;
+    if (n_units == 2) {
+        args.u[1] = un[1].a;
+    }
+    ggml_cuda_ink_dyn_conv(*ctx, args);
+    g_ink_fire_dyn++;
+    return last - i;
+}
+
 static int g_ink_fire[12] = {};
 
 // ctx == nullptr: plan only (graph_optimize, tensors not allocated yet): match, launch nothing
@@ -11932,6 +12241,12 @@ static int ggml_cuda_try_fuse_inkglue(ggml_backend_cuda_context * ctx, ggml_cgra
         ggml_cuda_try_fuse_ink_wconv, ggml_cuda_try_fuse_ink_prep, ggml_cuda_try_fuse_ink_situ, ggml_cuda_try_fuse_ink_moe_wsum, ggml_cuda_try_fuse_ink_clip, ggml_cuda_try_fuse_ink_rel,
         ggml_cuda_try_fuse_ink_conv_epi, ggml_cuda_try_fuse_ink_mix_norm, ggml_cuda_try_fuse_ink_mmgroup,
         ggml_cuda_try_fuse_ink_lgmulti, ggml_cuda_try_fuse_ink_normq, ggml_cuda_try_fuse_ink_router };
+    {
+        const int n = ggml_cuda_try_fuse_ink_dyn(ctx, cgraph, i);
+        if (n > 0) {
+            return n;
+        }
+    }
     for (int k = 0; k < 12; ++k) {
         const int n = fns[k](ctx, cgraph, i);
         if (n > 0) {
@@ -13677,9 +13992,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         static int n_stat = 0;
         if (dump_path && cgraph->n_nodes >= 1500 && n_stat < 8) {
             n_stat++;
-            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d router %d; nodes %d\n",
+            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d router %d dyn %d; nodes %d\n",
                     g_ink_fire[2], g_ink_fire[3], g_ink_fire[4], g_ink_fire[5], g_ink_fire[6], g_ink_fire[7], g_ink_fire[8],
-                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], g_ink_fire[11], cgraph->n_nodes);
+                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], g_ink_fire[11], g_ink_fire_dyn, cgraph->n_nodes);
         }
         if (dump_path && !dumped && cgraph->n_nodes >= 1500) {
             ggml_tensor * n0 = cgraph->nodes[cgraph->n_nodes - 1];
