@@ -97,6 +97,9 @@ struct idmap {
     // fork AIPTAB lean: grouped slab-per-warp launches with exactly one route per expert decode AIT2_U2 with the
     // full-sum level rule (one IMAD + one DP4A per weight, no level packing, no IMMA); GGML_MOE_BANK_LEAN=1
     bool lean = false;
+    // fork INKPF3: GEMM-ID token tiles narrower than BN skip the MMA groups of 32 columns that hold no token (those
+    // columns are never stored, so the stored outputs are bit-identical). GGML_CUDA_AI4_TAIL_SKIP=0 = off.
+    bool tail_skip = false;
 };
 
 // fork AIPFIX D6: arrivals per (route column, 16-row slice) when both projections of a route are stored by the same
@@ -643,6 +646,11 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
 
 #pragma unroll
             for (int nb = 0; nb < NTI; nb += NTB) {
+                if constexpr (ID) {
+                    if (idm.tail_skip && (nw*NTI + nb)*8 >= N) {
+                        continue;   // warp-uniform (block-uniform at N_WARPS=1): this tile has no token in columns [(nw*NTI + nb)*8, +NTB*8)
+                    }
+                }
                 uint4 xf[NTB][2];
                 float dx[NTB][2];
 #pragma unroll

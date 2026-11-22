@@ -2103,7 +2103,26 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+// fork INKPF3: LLAMA_INKPF3_TIMING=1 logs the host time of every graph input setter over 2 ms (diagnostic only)
+static bool inkpf3_timing_on() {
+    static const bool on = [] { const char * e = getenv("LLAMA_INKPF3_TIMING"); return e && atoi(e) != 0; }();
+    return on;
+}
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    if (inkpf3_timing_on()) {
+        const int64_t t0 = ggml_time_us();
+        for (auto & input : inputs) {
+            const int64_t t = ggml_time_us();
+            input->set_input(ubatch);
+            const int64_t dt = ggml_time_us() - t;
+            if (dt > 2000) {
+                LLAMA_LOG_INFO("INKPF3 set_input %s: %.1f ms (n_tokens %u)\n", typeid(*input).name(), dt/1000.0, ubatch->n_tokens);
+            }
+        }
+        LLAMA_LOG_INFO("INKPF3 set_inputs total: %.1f ms (n_tokens %u)\n", (ggml_time_us() - t0)/1000.0, ubatch->n_tokens);
+        return;
+    }
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }
@@ -8876,7 +8895,8 @@ void llm_graph_context::build_conv_state_store(
         ggml_tensor * s,
         ggml_tensor * conv_x,
             int64_t   n_cols,
-             size_t   offs) const {
+             size_t   offs,
+               bool   slot_cpy) const {
     const auto * mctx_cur = inp->mctx;
 
     const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
@@ -8906,6 +8926,23 @@ void llm_graph_context::build_conv_state_store(
     // a rollback of k tokens reads slot k, and the memory allows k < n only (see rs_max), so slots from n on are left unwritten
     const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
     const int64_t Kw = std::min(n, K);
+
+    if (slot_cpy) {
+        // [INKGLUE SLOTCPY] the same stores as the SET_ROWS below, as one CPY per slot (window w -> slot Kw - 1 - w): the
+        // CUDA conv ring takes CPY windows, so the concat, the stores and the slot-order arange/scale/cast fold into its
+        // ssm_conv launch
+        for (int64_t w = 0; w < Kw; ++w) {
+            ggml_tensor * win = ggml_view_3d(ctx0, conv_x,
+                    n_cols, channels, n_seqs,
+                    conv_x->nb[1], conv_x->nb[2],
+                    ggml_row_size(conv_x->type, n - (Kw - 1) + w));
+            ggml_tensor * cell = ggml_view_2d(ctx0, s,
+                    n_cols*channels, n_seqs,
+                    row_size, cell_offs + (size_t) (Kw - 1 - w)*mctx_cur->get_size()*row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, win, cell));
+        }
+        return;
+    }
 
     // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
     // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all

@@ -20,6 +20,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <memory>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -5361,6 +5362,67 @@ void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch
     GGML_ASSERT(T >= (int64_t) ubatch->n_tokens);
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    // fork INKPF3: the same mask, built from one per-cell position table and filled by row on a few threads (the
+    // per-cell is_empty/seq_has/pos_get loop over n_kv x T was a host stall between prefill ubatches at long depth).
+    // LLAMA_INKPF3_FARMASK=0 = the original loop below.
+    static const bool fast = [] { const char * e = getenv("LLAMA_INKPF3_FARMASK"); return !e || atoi(e) != 0; }();
+    if (fast) {
+        std::unique_ptr<ggml_fp16_t[]> data(new ggml_fp16_t[n_kv*T]);
+        // cp[j]: the cell's position if it holds the row's sequence, else INT32_MAX (never <= pf); one table per seq
+        std::vector<std::pair<llama_seq_id, std::vector<llama_pos>>> tabs;
+        std::vector<const llama_pos *> row_cp(T, nullptr);
+        std::vector<int64_t> row_c1(T, 0);
+        std::vector<llama_pos> row_pf(T, -1);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const llama_seq_id seq = ubatch->seq_id[i][0];
+            const uint32_t strm = seq_to_stream.at(seq);
+            const auto & cells = v_cells.at(strm);
+            const llama_pos pf = ubatch->pos[i] - (llama_pos) extent;
+            if (pf < 0) {
+                continue;
+            }
+            auto it = std::find_if(tabs.begin(), tabs.end(), [&](const auto & t) { return t.first == seq; });
+            if (it == tabs.end()) {
+                const int64_t lim = std::min<int64_t>(n_kv, cells.used_max_p1());
+                std::vector<llama_pos> cp(lim);
+                for (int64_t j = 0; j < lim; ++j) {
+                    cp[j] = !cells.is_empty(j) && cells.seq_has(j, seq) ? cells.pos_get(j) : std::numeric_limits<llama_pos>::max();
+                }
+                tabs.emplace_back(seq, std::move(cp));
+                it = tabs.end() - 1;
+            }
+            row_cp[i] = it->second.data();
+            row_pf[i] = pf;
+            row_c1[i] = std::min<int64_t>((int64_t) it->second.size(), sj_kvarn_cell_of(strm, pf + 1));
+        }
+        auto fill = [&](int64_t r0, int64_t r1) {
+            for (int64_t i = r0; i < r1; ++i) {
+                ggml_fp16_t * row = data.get() + i*n_kv;
+                const int64_t c1 = row_cp[i] ? row_c1[i] : 0;
+                const llama_pos * cp = row_cp[i];
+                const llama_pos pf = row_pf[i];
+                for (int64_t j = 0; j < c1; ++j) {
+                    row[j] = cp[j] <= pf ? zero : ninf;
+                }
+                std::fill(row + c1, row + n_kv, ninf);
+            }
+        };
+        const int64_t n_thr = n_kv*T >= (int64_t) 1 << 22 ? std::min<int64_t>(8, T) : 1;
+        if (n_thr > 1) {
+            std::vector<std::thread> th;
+            for (int64_t k = 1; k < n_thr; ++k) {
+                th.emplace_back(fill, T*k/n_thr, T*(k + 1)/n_thr);
+            }
+            fill(0, T/n_thr);
+            for (auto & t : th) {
+                t.join();
+            }
+        } else {
+            fill(0, T);
+        }
+        ggml_backend_tensor_set(dst, data.get(), 0, ggml_nbytes(dst));
+        return;
+    }
     std::vector<ggml_fp16_t> data(n_kv*T, ninf);
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_seq_id seq = ubatch->seq_id[i][0];

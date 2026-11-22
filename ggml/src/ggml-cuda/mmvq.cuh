@@ -33,6 +33,10 @@ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
 
 // fork (INKGLUE): n single-column products sharing one src1 in one launch, bit-identical (mmvq.cu)
 bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);
+// fork (INKGLUE MMGV): the same for a 5..8-column src1 (verify batch), bit-identical (mmvq.cu)
+bool ggml_cuda_mul_mat_vec_q_group_nc(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);
+// fork (INKGLUE NORMQV): the same with each member's q8_1 activation given (vy == nullptr = support check only)
+bool ggml_cuda_mul_mat_vec_q_group_nc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, const void * const * vy);
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
