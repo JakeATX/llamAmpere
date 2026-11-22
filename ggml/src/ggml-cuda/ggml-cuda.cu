@@ -75,6 +75,7 @@
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/inkglue.cuh"
+#include "ggml-cuda/inkreltab.cuh"
 #include "ggml-cuda/inkprep.cuh"
 #include "ggml-cuda/inkcomb.cuh"
 #include "ggml-cuda/unary.cuh"
@@ -105,6 +106,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/inkmask.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -10926,7 +10928,22 @@ static int ggml_cuda_try_fuse_ink_rel(ggml_backend_cuda_context * ctx, ggml_cgra
         }
     }
     if (!gr) {
-        return 0;
+        // INKATTN visit: the table itself is the output (the INKREL FA node reads it): PAD + MUL_MAT + SUB + CONT in one
+        // launch, same fmaf chain as the dense fused mask. GGML_CUDA_INKGLUE_RELTAB=0 = off
+        static const bool tab_on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_RELTAB");
+        if (!tab_on || !pad || c1->type != GGML_TYPE_F32 || !ggml_is_contiguous(c1) || sub->ne[2] > 65535 ||
+                (sub->ne[1]*pad->src[0]->ne[0] + sub->ne[1])*sizeof(float) > 32768) {
+            return 0;
+        }
+        ggml_tensor * tset[4] = { pad, mm, sub, c1 };
+        const int tlast = ink_run_check(cgraph, i, tset, 4, c1);
+        if (tlast < 0 || ink_overlap(c1, sk) || ink_overlap(c1, pad->src[0]) || ink_overlap(c1, mm->src[1])) {
+            return 0;
+        }
+        if (ctx) {
+            ggml_cuda_ink_rel_table(*ctx, pad->src[0], mm->src[1], sk, c1);
+        }
+        return tlast - i;
     }
     const ggml_tensor * rp = gr->src[1];
     const int64_t H = sub->ne[1], T = sub->ne[2];
@@ -11841,6 +11858,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    // [INKPREFILL] Inkling rel-bias mask chain (GET_ROWS .. CPY F16) as one kernel (inkmask.cu, GGML_CUDA_INK_MASK=0 off)
+    if (node->op == GGML_OP_GET_ROWS && cuda_ctx->stream_context().concurrent_events.empty()) {
+        // the match checks the output against every tensor the kernel reads and stages it when they alias
+        const int n_rm = ggml_cuda_ink_relmask_match(cgraph, i);
+        if (n_rm > 0) {
+            ggml_cuda_ink_relmask_launch(*cuda_ctx, cgraph, i, n_rm);
+            return n_rm;
+        }
+    }
     if (node->op == GGML_OP_MUL_MAT) {
         const int n_grp = ggml_cuda_try_ai_mmv_group(*cuda_ctx, cgraph, i);
         if (n_grp > 0) {

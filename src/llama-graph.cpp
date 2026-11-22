@@ -9264,6 +9264,18 @@ static bool llama_inkattn_rel_on() {
     return on;
 }
 
+// INKATTN minimum cache depth. Default 0 = every depth: with INKGLUE RELTAB (the rel table in one launch) INKATTN is
+// at least as fast as the dense mask path at 3K and 16K (g3, 3090 Ti, AI4 fold, chat temp 1: 3K 111.67 vs 111.58,
+// 16K 104.09 vs 103.56 tok/s). GGML_CUDA_INKATTN_MIN_KV=N = dense below N cells (e.g. 16384 for builds without RELTAB).
+// The CUDA side (inkattn.cu) reads the same variable for plain FA nodes.
+static int64_t llama_inkattn_min_kv() {
+    static const int64_t v = [] {
+        const char * e = getenv("GGML_CUDA_INKATTN_MIN_KV");
+        return e && *e ? (int64_t) atoll(e) : (int64_t) 0;
+    }();
+    return v;
+}
+
 ggml_tensor * llm_graph_context::build_attn_rel_base(
         llm_graph_input_mem_hybrid_iswa_rel * inp,
         ggml_tensor * q_cur,
@@ -9320,6 +9332,7 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
                 kv->type == GGML_TYPE_F16 && vv->type == GGML_TYPE_F16 && kv->ne[3] == 1 && vv->nb[1] < vv->nb[2] &&
                 kv->ne[0] == 128 && vv->ne[0] == 128 && q_cur->ne[0] == 128 && n_head % n_head_kv == 0 &&
                 (n_head/n_head_kv)*n_tok <= 16 && rel_pos->ne[0] == kv->ne[2] && rel_pos->ne[1] == n_tok &&
+                kv->ne[2] >= llama_inkattn_min_kv() &&
                 !rot && !mctx_l->get_k_scale(il) && !mctx_l->get_v_scale(il) &&
                 hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
                 sinks && sinks->type == GGML_TYPE_F32 && (!gate || gate->type == GGML_TYPE_F32)) {

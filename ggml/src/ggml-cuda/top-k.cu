@@ -1076,6 +1076,109 @@ static void ggml_cuda_top_k_sort_fallback(ggml_cuda_pool & pool, const float * s
     }
 }
 
+// [HOSTGAP08] split top-k for wide rows with a small k (the 27B target verify rows: 248,320 columns, k 20-64, 4-32 rows).
+// Stage 1: one block per (tile of TOPK_SPLIT_TILE columns, row) sorts its tile's keys in shared memory and keeps the k
+// best. Stage 2: one block per row sorts the ntiles*k kept keys and writes the k best columns. A key is the ordered
+// float bits over (ncols-1-col), so a larger key is a larger value and, on equal values, the lower column: the result
+// is the first k of a stable descending sort, in that order (-0 counts as +0; the CPU heap top-k gives the same set up to
+// equal logits, and the sampler chain re-sorts). A global top-k entry has fewer than k
+// larger entries, so fewer than k inside its own tile, and the tiling cannot drop it.
+// GGML_CUDA_TOPK_SPLIT=0 off, 1 (default) rows the tiled path cannot take (they would go to the radix select or the
+// full-row sort), 2 also the wide rows the tiled path takes (comparison only).
+#define TOPK_SPLIT_TILE  4096
+#define TOPK_SPLIT_BLOCK 512
+#define TOPK_SPLIT_KMAX  64
+
+static __device__ __forceinline__ uint64_t topk_split_key(const float v, const int col, const int ncols) {
+    uint32_t b = __float_as_uint(v);
+    b = b == 0x80000000u ? 0u : b;  // -0 ranks as +0
+    b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    return ((uint64_t) b << 32) | (uint32_t) (ncols - 1 - col);
+}
+
+// descending bitonic sort of N keys in shared memory by the whole block
+template <int N, int BLOCK>
+static __device__ __forceinline__ void topk_split_sort_desc(uint64_t * s) {
+    for (int size = 2; size <= N; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            __syncthreads();
+#pragma unroll
+            for (int t = threadIdx.x; t < N/2; t += BLOCK) {
+                const int i = 2*t - (t & (stride - 1));
+                const int j = i + stride;
+                const uint64_t a = s[i];
+                const uint64_t b = s[j];
+                if ((a < b) == ((i & size) == 0)) {
+                    s[i] = b;
+                    s[j] = a;
+                }
+            }
+        }
+    }
+    __syncthreads();
+}
+
+template <int TILE, int BLOCK>
+static __global__ void __launch_bounds__(BLOCK) topk_split_tile(const float * __restrict__ src, uint64_t * __restrict__ cand,
+        const int ncols, const int ntiles, const int k) {
+    __shared__ uint64_t s[TILE];
+    const int     tile = blockIdx.x;
+    const int     row  = blockIdx.y;
+    const float * r    = src + (size_t) row * ncols;
+#pragma unroll
+    for (int i = threadIdx.x; i < TILE; i += BLOCK) {
+        const int col = tile * TILE + i;
+        s[i] = col < ncols ? topk_split_key(r[col], col, ncols) : 0;
+    }
+    topk_split_sort_desc<TILE, BLOCK>(s);
+    uint64_t * out = cand + ((size_t) row * ntiles + tile) * k;
+    for (int i = threadIdx.x; i < k; i += BLOCK) {
+        out[i] = s[i];
+    }
+}
+
+template <int N, int BLOCK>
+static __global__ void __launch_bounds__(BLOCK) topk_split_merge(const uint64_t * __restrict__ cand, int * __restrict__ dst,
+        const int ncand, const int ncols, const int k) {
+    __shared__ uint64_t s[N];
+    const int        row = blockIdx.x;
+    const uint64_t * c   = cand + (size_t) row * ncand;
+#pragma unroll
+    for (int i = threadIdx.x; i < N; i += BLOCK) {
+        s[i] = i < ncand ? c[i] : 0;
+    }
+    topk_split_sort_desc<N, BLOCK>(s);
+    for (int i = threadIdx.x; i < k; i += BLOCK) {
+        dst[(size_t) row * k + i] = ncols - 1 - (int) (uint32_t) s[i];
+    }
+}
+
+static int ggml_cuda_top_k_split_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_TOPK_SPLIT");
+        return e != nullptr ? atoi(e) : 1;
+    }();
+    return mode;
+}
+
+static bool ggml_cuda_top_k_split_fits(const int64_t ncols, const int64_t nrows, const int64_t k) {
+    const int64_t ntiles = (ncols + TOPK_SPLIT_TILE - 1) / TOPK_SPLIT_TILE;
+    return ncols > 2*TOPK_SPLIT_TILE && ncols <= INT_MAX && k >= 1 && k <= TOPK_SPLIT_KMAX &&
+        ntiles * k <= TOPK_SPLIT_TILE && nrows >= 1 && nrows <= 65535;
+}
+
+static void ggml_cuda_top_k_split(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int nrows,
+                                  const int k, cudaStream_t stream) {
+    const int ntiles = (ncols + TOPK_SPLIT_TILE - 1) / TOPK_SPLIT_TILE;
+    const int ncand  = ntiles * k;
+    ggml_cuda_pool_alloc<uint64_t> cand(pool, (size_t) nrows * ncand);
+    topk_split_tile<TOPK_SPLIT_TILE, TOPK_SPLIT_BLOCK><<<dim3(ntiles, nrows), TOPK_SPLIT_BLOCK, 0, stream>>>(
+            src, cand.get(), ncols, ntiles, k);
+    topk_split_merge<TOPK_SPLIT_TILE, TOPK_SPLIT_BLOCK><<<nrows, TOPK_SPLIT_BLOCK, 0, stream>>>(
+            cand.get(), dst, ncand, ncols, k);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -1101,6 +1204,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const char * value = getenv("GGML_CUDA_TOPK_SELECT");
         return value != nullptr ? atoi(value) : 0;
     }();
+    // [HOSTGAP08] wide rows, small k: the split path (see ggml_cuda_top_k_split) before the radix select / full sort
+    if (select_mode != 2 && select_mode != 3 && ggml_cuda_top_k_split_mode() > 0 && ggml_cuda_top_k_split_fits(ncols, nrows, k) &&
+            (ggml_cuda_top_k_split_mode() >= 2 || !ggml_cuda_top_k_tiled_fits(ncols, k))) {
+        ggml_cuda_top_k_split(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        return;
+    }
     if (select_mode > 0 && ncols > 1024 && k >= 64 && k <= ncols && nrows <= INT_MAX &&
             (select_mode == 3 || !ggml_cuda_top_k_tiled_fits(ncols, k))) {
         static const bool select_fast = [] {

@@ -7,6 +7,7 @@
 #include "speculative.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -161,10 +162,49 @@ void common_speculative_apply_mtp_sampling_default(common_params & params) {
     const auto & types = params.speculative.types;
     const bool mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
                      std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
-    if (mtp && !params.sampling.spec_lossy_explicit && !params.sampling.spec_lossy) {
+    // INKSPEC2: the DSpark drafter samples its draft (q), so the same mode-biased accept applies to it (as with MTP)
+    const bool dspark = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+    if ((mtp || dspark) && !params.sampling.spec_lossy_explicit && !params.sampling.spec_lossy) {
         params.sampling.spec_lossy = true;
-        LOG_INF("FYI: mode-biased MTP (--spec-mb-mtp) is on by default with MTP drafting. "
-                "To turn it off: --no-spec-mb-mtp\n");
+        LOG_INF("FYI: mode-biased MTP (--spec-mb-mtp) is on by default with %s drafting. "
+                "To turn it off: --no-spec-mb-mtp\n", mtp ? "MTP" : "DSpark");
+    }
+}
+
+void common_speculative_apply_dspark_default(common_params & params) {
+    auto & spec = params.speculative;
+    if (spec.draft.dspark_adaptive || spec.draft.dspark_n_max_prev > 0 ||
+            std::find(spec.types.begin(), spec.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) == spec.types.end()) {
+        return;
+    }
+    // INKSPEC2 (3090 screen 11-22): with mb on, the Inkling DSpark drafter is fastest at fixed depth 4 (adaptive 3..5
+    // and fixed 5/6 were slower). LLAMA_DSPARK_MB_DEPTH=N picks the depth (0 = keep n_max as before, the kill switch),
+    // LLAMA_DSPARK_ADAPT=1 drafts at the adaptive depth 3..5 instead. A draft GGUF without the Markov head (not the
+    // Inkling DSpark) keeps its depth.
+    const char * ed = getenv("LLAMA_DSPARK_MB_DEPTH");
+    const int    depth = ed ? atoi(ed) : 4;
+    const char * ea = getenv("LLAMA_DSPARK_ADAPT");
+    const bool   adapt = ea && atoi(ea) != 0;
+    if (!spec.draft.mparams.path.empty()) {
+        const struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+        gguf_context_ptr ctx(gguf_init_from_file(spec.draft.mparams.path.c_str(), gp));
+        if (ctx && gguf_find_key(ctx.get(), "dflash.dspark.markov_rank") < 0) {
+            return;
+        }
+    }
+    if (params.sampling.spec_lossy &&
+            !(spec.user_set & (COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX | COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE))) {
+        if (adapt) {
+            spec.draft.dspark_adaptive   = true;
+            spec.draft.dspark_n_max_prev = spec.draft.n_max;
+            spec.draft.n_max             = 5;
+            spec.draft.n_min_adaptive    = 3;
+        } else if (depth > 0) {
+            spec.draft.dspark_n_max_prev = spec.draft.n_max;
+            spec.draft.n_max             = depth;
+        }
+    } else if (spec.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE) {
+        spec.draft.dspark_adaptive = true; // an explicit adaptive floor asks for the adaptive depth
     }
 }
 

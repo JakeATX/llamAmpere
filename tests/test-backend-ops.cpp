@@ -21488,6 +21488,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_inf({4096, 2, 1, 1}, k));
         test_cases.emplace_back(new test_top_k_inf({248320, 1, 1, 1}, k));
     }
+    // [HOSTGAP08] the split top-k (ggml-cuda top-k.cu, wide rows, k 34-64 by default): several rows, a short last tile, ties
+    for (int k : {20, 34, 40, 64}) {
+        for (int nrows : {1, 5, 32}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, k));
+        }
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {61*4096 + 1, 3, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 4, 1, 1}, k, true));
+    }
     // a selection of the indexer of sparse attention, with more ties at the threshold than slots
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1088, 2048, 1, 1}, 512, true));
 
@@ -24992,6 +25000,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, 1, 1, 1}, k));
+    }
+    // [HOSTGAP08] target top-K verify rows of the 27B (vocab 248320): 1 user (4-8 rows) to 4 users (~32 rows)
+    for (auto k : {20, 64}) {
+        for (auto nrows : {1, 5, 8, 20, 32}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, k));
+        }
     }
 
     // short rows, many of them: MoE routing and group selection. The opposite corner from
