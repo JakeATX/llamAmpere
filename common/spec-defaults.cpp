@@ -161,10 +161,29 @@ void common_speculative_apply_mtp_sampling_default(common_params & params) {
     const auto & types = params.speculative.types;
     const bool mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() ||
                      std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != types.end();
-    if (mtp && !params.sampling.spec_lossy_explicit && !params.sampling.spec_lossy) {
+    // INKSPEC2: the DSpark drafter samples its draft (q), so the same mode-biased accept applies to it (as with MTP)
+    const bool dspark = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+    if ((mtp || dspark) && !params.sampling.spec_lossy_explicit && !params.sampling.spec_lossy) {
         params.sampling.spec_lossy = true;
-        LOG_INF("FYI: mode-biased MTP (--spec-mb-mtp) is on by default with MTP drafting. "
-                "To turn it off: --no-spec-mb-mtp\n");
+        LOG_INF("FYI: mode-biased MTP (--spec-mb-mtp) is on by default with %s drafting. "
+                "To turn it off: --no-spec-mb-mtp\n", mtp ? "MTP" : "DSpark");
+    }
+}
+
+void common_speculative_apply_dspark_default(common_params & params) {
+    auto & spec = params.speculative;
+    if (spec.draft.dspark_adaptive ||
+            std::find(spec.types.begin(), spec.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) == spec.types.end()) {
+        return;
+    }
+    if (params.sampling.spec_lossy &&
+            !(spec.user_set & (COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX | COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE))) {
+        spec.draft.dspark_adaptive   = true;
+        spec.draft.dspark_n_max_prev = spec.draft.n_max;
+        spec.draft.n_max             = 5;
+        spec.draft.n_min_adaptive    = 3;
+    } else if (spec.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE) {
+        spec.draft.dspark_adaptive = true; // an explicit adaptive floor asks for the adaptive depth
     }
 }
 

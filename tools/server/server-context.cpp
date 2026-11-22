@@ -1652,8 +1652,8 @@ struct server_slot {
                 const auto & pq = common_sampler_get_pq_stats(smpl.get());
                 if (pq.n_pos > 0) {
                     SLT_INF(*this,
-                            "spec pq: n=%zu match=%zu extra=%zu rej=%zu mean_p_d=%.4f mean_summin=%.4f\n",
-                            pq.n_pos, pq.n_match, pq.n_extra, pq.n_rej, pq.sum_p_d / pq.n_pos, pq.sum_min / pq.n_pos);
+                            "spec pq: n=%zu match=%zu extra=%zu rej=%zu mb_kept=%zu mean_p_d=%.4f mean_summin=%.4f\n",
+                            pq.n_pos, pq.n_match, pq.n_extra, pq.n_rej, pq.n_lossy, pq.sum_p_d / pq.n_pos, pq.sum_min / pq.n_pos);
                 }
             }
         }

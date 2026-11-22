@@ -673,6 +673,9 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         if (!types_gguf.empty()) {
             params.speculative.types = types_gguf;
         }
+        // INKSPEC2: an inferred DSpark drafter gets the same mb + adaptive default as an explicit --spec-type
+        common_speculative_apply_mtp_sampling_default(params);
+        common_speculative_apply_dspark_default(params);
     }
 
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
@@ -1583,6 +1586,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             params.speculative.draft.n_max          = 5;
             params.speculative.draft.n_min_adaptive = 3;
         }
+        // INKSPEC2: mb + adaptive depth 3..5 by default with a DSpark drafter (see spec-defaults.cpp)
+        common_speculative_apply_dspark_default(params);
         if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
             throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
         }
