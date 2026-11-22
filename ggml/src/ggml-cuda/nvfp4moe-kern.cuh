@@ -170,7 +170,19 @@ static __device__ __forceinline__ int nvfp4moe_gather(const nvfp4moe_params & P,
 // ---------------------------------------------------------------------------------------------------------------------
 // gate_up + scale + SITU -> q8_1. grid (F/32, T*n_used), 256 threads: 32 row groups of 8 lanes, group g = feature f0 + g
 // (gate row f, up row F + f), lane j owns half-blocks j + 8m. K = 2304 here: 72 half-blocks = 9 per lane.
-template <int MAXM, int NHB>  // NHB: half-blocks per lane (K/32/8)
+// x of T tokens -> q8_1 once per visit (T > 1, GGML_CUDA_NVFP4MOE_PREQ): warp w of CTA b quantizes block 8b + w with the
+// expressions of the in-CTA quantization below (bit-identical), instead of every gate_up CTA quantizing its tokens again
+static __global__ void __launch_bounds__(256) k_nvfp4moe_xq(const nvfp4moe_params P) {
+    const int nb_k = P.K / QK8_1;
+    const int b    = blockIdx.x*8 + (threadIdx.x >> 5);
+    if (b >= P.T*nb_k) {
+        return;  // warp-uniform
+    }
+    const int t = b / nb_k;
+    nvfp4moe_quant_block(P.x[t*P.x_s2 + (b - t*nb_k)*QK8_1 + (threadIdx.x & 31)], P.xq + b, threadIdx.x & 31);
+}
+
+template <int MAXM, int NHB, bool PREQ = false>  // NHB: half-blocks per lane (K/32/8); PREQ: x q8_1 from P.xq (k_nvfp4moe_xq)
 static __global__ void __launch_bounds__(256) k_nvfp4moe_gu(const nvfp4moe_params P) {
     constexpr int L = 8;
     extern __shared__ __align__(16) char smem_raw[];
@@ -213,10 +225,21 @@ static __global__ void __launch_bounds__(256) k_nvfp4moe_gu(const nvfp4moe_param
     if constexpr (MAXM == 1) {
         __syncthreads();
     }
-    for (int m = 0; m < n_tok; ++m) {
-        const float * xt = P.x + tok_t[m]*P.x_s2;
-        for (int b = warp; b < nb_k; b += 8) {
-            nvfp4moe_quant_block(xt[b*QK8_1 + lane], xq + m*nb_k + b, lane);
+    if constexpr (PREQ) {
+        static_assert(MAXM > 1, "PREQ: T > 1 only");
+        for (int m = 0; m < n_tok; ++m) {
+            const uint4 * src = (const uint4 *) (P.xq + tok_t[m]*nb_k);
+            uint4 * dst = (uint4 *) (xq + m*nb_k);
+            for (int q = tid; q < nb_k*(int) sizeof(block_q8_1)/16; q += 256) {
+                dst[q] = src[q];
+            }
+        }
+    } else {
+        for (int m = 0; m < n_tok; ++m) {
+            const float * xt = P.x + tok_t[m]*P.x_s2;
+            for (int b = warp; b < nb_k; b += 8) {
+                nvfp4moe_quant_block(xt[b*QK8_1 + lane], xq + m*nb_k + b, lane);
+            }
         }
     }
     __syncthreads();

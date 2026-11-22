@@ -24,10 +24,20 @@ int ggml_cuda_nvfp4moe_f32act() {
 int ggml_cuda_nvfp4moe_max_tok() {
     static const int n = [] {
         const char * e = getenv("GGML_CUDA_NVFP4MOE_MAXT");
-        const int v = e ? atoi(e) : 4;
+        const int v = e ? atoi(e) : 8;
         return v < 1 ? 1 : v > NVFP4MOE_MAX_TOK ? NVFP4MOE_MAX_TOK : v;
     }();
     return n;
+}
+
+bool ggml_cuda_nvfp4moe_preq() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_NVFP4MOE_PREQ"); return !e || atoi(e) != 0; }();
+    return on;
+}
+
+bool ggml_cuda_nvfp4moe_exact() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_NVFP4MOE_EXACT"); return !e || atoi(e) != 0; }();
+    return on;
 }
 
 bool ggml_cuda_nvfp4moe_supported(int cc, int64_t K, int64_t F, int64_t n_used) {
@@ -44,10 +54,15 @@ bool ggml_cuda_nvfp4moe_supported(int cc, int64_t K, int64_t F, int64_t n_used) 
 template <int MAXM>
 static void nvfp4moe_launch_m(const nvfp4moe_params & P, cudaStream_t stream) {
     const dim3 grid_gu(P.F/32, P.T*P.n_used);
+    const size_t smem_gu = MAXM*(P.K/QK8_1)*sizeof(block_q8_1);
     if constexpr (MAXM == 1) {
         k_nvfp4moe_gu1w<8><<<dim3(P.F/64, P.T*P.n_used), 256, 0, stream>>>(P);
+    } else if (P.xq) {
+        k_nvfp4moe_xq<<<(P.T*(P.K/QK8_1) + 7)/8, 256, 0, stream>>>(P);
+        CUDA_CHECK(cudaGetLastError());
+        k_nvfp4moe_gu<MAXM, 9, true><<<grid_gu, 256, smem_gu, stream>>>(P);
     } else {
-        k_nvfp4moe_gu<MAXM, 9><<<grid_gu, 256, MAXM*(P.K/QK8_1)*sizeof(block_q8_1), stream>>>(P);
+        k_nvfp4moe_gu<MAXM, 9><<<grid_gu, 256, smem_gu, stream>>>(P);
     }
     CUDA_CHECK(cudaGetLastError());
     if constexpr (MAXM == 1) {
@@ -79,6 +94,16 @@ void ggml_cuda_nvfp4moe_launch(const nvfp4moe_params & P, cudaStream_t stream) {
     }
     if (P.T == 1) {
         nvfp4moe_launch_m<1>(P, stream);
+    } else if (ggml_cuda_nvfp4moe_exact() && P.T <= 8) {
+        switch (P.T) {
+            case 2: nvfp4moe_launch_m<2>(P, stream); break;
+            case 3: nvfp4moe_launch_m<3>(P, stream); break;
+            case 4: nvfp4moe_launch_m<4>(P, stream); break;
+            case 5: nvfp4moe_launch_m<5>(P, stream); break;
+            case 6: nvfp4moe_launch_m<6>(P, stream); break;
+            case 7: nvfp4moe_launch_m<7>(P, stream); break;
+            default: nvfp4moe_launch_m<8>(P, stream); break;
+        }
     } else if (P.T <= 2) {
         nvfp4moe_launch_m<2>(P, stream);
     } else if (P.T <= 4) {

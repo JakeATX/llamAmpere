@@ -10867,6 +10867,17 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
 // = per-expert scale], the SITU run on its gate/up views, MUL_MAT_ID(down) [+ scale], the weighted expert sum
 // (MUL -> CONT(PERMUTE) -> SUM_ROWS). Bit-identical at one token while mmvq small_k keeps 4 warps (QC4_NWARPS_1).
 // GGML_CUDA_NVFP4MOE=0 off; GGML_CUDA_INKGLUE_WSUM=0 also turns it off on layers that own the sum (not WCONV layers) (the sum is matched by that matcher).
+// PREQ scratch: x as q8_1 right after the q8_1 SITU rows, in the rest of the f32 SITU output's memory (13 of its 36.9 KB per
+// token); nullptr (gate_up CTAs quantize x) at T == 1, with GGML_CUDA_NVFP4MOE_PREQ=0, or if it does not fit
+static block_q8_1 * ggml_cuda_nvfp4moe_xq_slot(const ggml_tensor * act, int64_t T, int64_t n_used, int64_t K, int64_t F) {
+    const size_t act_q8 = (size_t) (T*n_used*(F/QK8_1))*sizeof(block_q8_1);
+    const size_t x_q8   = (size_t) (T*(K/QK8_1))*sizeof(block_q8_1);
+    if (T < 2 || !ggml_cuda_nvfp4moe_preq() || act_q8 % 16 != 0 || act_q8 + x_q8 > ggml_nbytes(act)) {
+        return nullptr;
+    }
+    return (block_q8_1 *) ((char *) act->data + act_q8);
+}
+
 static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor * gu = cgraph->nodes[i];
     if (gu->op != GGML_OP_MUL_MAT_ID || gu->src[0]->type != GGML_TYPE_NVFP4 || !ggml_cuda_nvfp4moe_enabled()) {
@@ -11006,11 +11017,12 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
         P.x = (const float *) x->data; P.x_s2 = x->nb[2]/sizeof(float);
         P.ids = (const int32_t *) ids->data; P.ids_s1 = ids->nb[1]/sizeof(int32_t);
         P.act = (block_q8_1 *) act->data;
+        P.xq = ggml_cuda_nvfp4moe_xq_slot(act, T, n_used, K, F);
         P.e_out = (float *) dn_out->data;
         P.situ = sp;
         P.K = (int) K; P.F = (int) F; P.n_used = (int) n_used; P.T = (int) T; P.write_sum = 0;
         P.actf = (float *) act->data; P.acth = (half2 *) act->data; P.f32act = T == 1 ? ggml_cuda_nvfp4moe_f32act() : 0;
-    if (P.f32act == 1 && (uintptr_t) x->data % 16 != 0) { P.f32act = 0; }  // gu1f reads x as float4
+        if (P.f32act == 1 && (uintptr_t) x->data % 16 != 0) { P.f32act = 0; }  // gu1f reads x as float4
         ggml_cuda_nvfp4moe_launch(P, ctx->stream());
         return last - i;
     }
@@ -11065,6 +11077,7 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
     P.ids = (const int32_t *) ids->data; P.ids_s1 = ids->nb[1]/sizeof(int32_t);
     P.rw = (const float *) rw->data; P.rw_s1 = rw->nb[1]/sizeof(float); P.rw_s2 = rw->nb[2]/sizeof(float);
     P.act = (block_q8_1 *) act->data;
+    P.xq = ggml_cuda_nvfp4moe_xq_slot(act, T, n_used, K, F);
     P.e_out = (float *) dn_out->data;
     P.out = (float *) sum->data;
     P.situ = sp;
