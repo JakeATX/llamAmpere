@@ -219,6 +219,53 @@ static void test_sse(testing & t) {
     });
 }
 
+// Claude Code billing header: the per-request cch stamp and the per-session cc_version 4th part are blanked, so
+// two sessions with the same system prompt produce the same prompt text (same prefix-cache key).
+static void test_anthropic_billing_header(testing & t) {
+    // header shape recorded from Claude Code 2.1.327 (2026-11-19); session B differs only in the two stamps
+    const auto convert = [](const std::string & header, bool as_blocks) {
+        json body = {{"model", "m"}, {"max_tokens", 8},
+                     {"messages", json::array({json{{"role", "user"}, {"content", "say hi"}}})}};
+        if (as_blocks) {
+            body["system"] = json::array({
+                json{{"type", "text"}, {"text", header}},
+                json{{"type", "text"}, {"text", "You are a coding agent."}},
+            });
+        } else {
+            body["system"] = header + "You are Claude Code, Anthropic's official CLI for Claude.";
+        }
+        return server_chat_convert_anthropic_to_oai(body).at("messages").at(0).at("content").get<std::string>();
+    };
+    const std::string a = "x-anthropic-billing-header: cc_version=2.1.327.8c9; cc_entrypoint=sdk-cli; cch=a5145;";
+    const std::string b = "x-anthropic-billing-header: cc_version=2.1.327.e51; cc_entrypoint=sdk-cli; cch=0b7d2;";
+    const std::string want = "x-anthropic-billing-header: cc_version=2.1.327.fff; cc_entrypoint=sdk-cli; cch=fffff;";
+
+    for (bool blocks : {true, false}) {
+        const std::string ca = convert(a, blocks);
+        const std::string cb = convert(b, blocks);
+        t.assert_equal(blocks ? "blocks: same across sessions" : "string: same across sessions", ca, cb);
+        t.assert_equal(blocks ? "blocks: only stamps changed" : "string: only stamps changed",
+                       convert(want, blocks), ca);
+        t.assert_equal("length kept", convert(a, blocks).size(), convert(want, blocks).size());
+    }
+
+    // a version with no 4th part and a longer cch are handled; nothing else in the text moves
+    t.assert_equal("3-part version kept",
+        std::string("x-anthropic-billing-header: cc_version=2.1.327; cch=ffffffff;rest cc_version=1.2.3.4;"
+                    "You are Claude Code, Anthropic's official CLI for Claude."),
+        convert("x-anthropic-billing-header: cc_version=2.1.327; cch=12345678;rest cc_version=1.2.3.4;", false));
+    // no ';' on the header line: the stamp search stops at the newline, the body is untouched
+    const std::string nl = "x-anthropic-billing-header: cc_version=2.1.327.8c9\nBody a.b.c.d; more";
+    t.assert_equal("stops at newline", nl + "You are a coding agent.", convert(nl, true));
+    // not a header: untouched
+    const std::string plain = "Hello cc_version=2.1.327.8c9; cch=a5145;";
+    t.assert_equal("non-header untouched", plain + "You are Claude Code, Anthropic's official CLI for Claude.",
+                   convert(plain, false));
+    // stamps past the 160-char window are left alone
+    const std::string far = "x-anthropic-billing-header: " + std::string(200, 'x') + " cc_version=2.1.327.8c9; cch=a5145;";
+    t.assert_equal("far stamps untouched", far + "You are a coding agent.", convert(far, true));
+}
+
 static void test_json_helpers(testing & t) {
     t.test("json_is_array_of_numbers", [](testing & t) {
         t.assert_true("ints",         json_is_array_of_numbers(json::array({1, 2, 3})));
@@ -755,6 +802,7 @@ int main(int argc, char ** argv) {
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);
+    t.test("anthropic_billing_header", test_anthropic_billing_header);
     t.test("json_helpers",  test_json_helpers);
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_pipe",   test_server_pipe);

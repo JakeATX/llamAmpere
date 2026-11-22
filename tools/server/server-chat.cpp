@@ -352,19 +352,21 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     return chatcmpl_body;
 }
 
-// Edits the cch section of an "x-anthropic-billing-header" system prompt.
+// Edits the per-request and per-session stamps of an "x-anthropic-billing-header" system prompt.
 // Does nothing to any other prompt.
 //
-// This is a claude message with a "cch=ef01a" attribute that breaks prefix caching.
-// The cch stamp is a whitebox end-to-end integrity hint. It's not meaningful as a
-// system prompt data, particularly to llama.cpp, but its presence means the prefix
-// cache will not get past it: It changes on each request.
+// Claude Code starts its system prompt with a header line that breaks prefix caching:
+// - cch=a5145 is a whitebox end-to-end integrity hint. It changes on every request.
+// - the 4th part of cc_version (e51 below) changes on every session, so the first turn of each new
+//   session missed the whole system prompt + tool list after the header.
+// Neither stamp is meaningful as system prompt data, so both are overwritten with f's (same length).
+// Only a header at the very start of the text is touched, and only within its first 160 characters.
 //
 // Reference: https://github.com/ggml-org/llama.cpp/pull/21793
 // Example header:
 // ```
 // x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch=a5145;You are Claude Code, Anthropic's official CLI for Claude.
-//                                                                            ^^^^^
+//                                                ^^^                          ^^^^^
 // ```
 static void normalize_anthropic_billing_header(std::string & system_text) {
     if (system_text.rfind("x-anthropic-billing-header:", 0) != 0) {
@@ -372,19 +374,50 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
     }
 
     const size_t header_prefix_length = strlen("x-anthropic-billing-header:");
-    const size_t cch_length = 5;
+    const size_t header_window        = 160;   // stamps must start inside this many chars
+    const size_t max_stamp_length     = 64;
+
+    // overwrite [begin, end) with f's when end is a ';' inside the text and the span is a sane length
+    const auto blank = [&](size_t begin, size_t end) {
+        if (end == std::string::npos || end <= begin || end - begin > max_stamp_length) {
+            return false;
+        }
+        for (size_t i = begin; i < end; ++i) {
+            system_text[i] = 'f';
+        }
+        return true;
+    };
+
+    // per-request stamp: cch=<value>;  (5 chars today; accept up to 16)
     const size_t index_cch = system_text.find("cch=", header_prefix_length);
-    if (index_cch == std::string::npos) {
-        return;
+    if (index_cch != std::string::npos && index_cch <= header_window) {
+        const size_t v   = index_cch + strlen("cch=");
+        size_t end = system_text.find_first_of(";\n", v);   // stay on the header line
+        if (end != std::string::npos && system_text[end] != ';') {
+            end = std::string::npos;
+        }
+        if (end == std::string::npos || end - v > 16 || !blank(v, end)) {
+            LOG_WRN("%s: unexpected cch stamp in anthropic billing header\n", __func__);
+        }
     }
 
-    const size_t index_replace = index_cch + 4;
-    if (index_replace + cch_length < system_text.length() && system_text[index_replace + cch_length] == ';') {
-        for (size_t i = 0; i < cch_length; ++i) {
-            system_text[index_replace + i] = 'f';
+    // per-session stamp: cc_version=<a>.<b>.<c>.<stamp>;  -> blank <stamp>
+    const size_t index_ver = system_text.find("cc_version=", header_prefix_length);
+    if (index_ver != std::string::npos && index_ver <= header_window) {
+        const size_t v   = index_ver + strlen("cc_version=");
+        size_t end = system_text.find_first_of(";\n", v);   // stay on the header line
+        if (end != std::string::npos && system_text[end] != ';') {
+            end = std::string::npos;
         }
-    } else {
-        LOG_ERR("anthropic string not as expected: %s", system_text.c_str());
+        if (end != std::string::npos && end - v <= max_stamp_length) {
+            int dots = 0;
+            for (size_t i = v; i < end; ++i) {
+                if (system_text[i] == '.' && ++dots == 3) {
+                    blank(i + 1, end);
+                    break;
+                }
+            }
+        }
     }
 }
 
