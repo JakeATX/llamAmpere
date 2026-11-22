@@ -8876,7 +8876,8 @@ void llm_graph_context::build_conv_state_store(
         ggml_tensor * s,
         ggml_tensor * conv_x,
             int64_t   n_cols,
-             size_t   offs) const {
+             size_t   offs,
+               bool   slot_cpy) const {
     const auto * mctx_cur = inp->mctx;
 
     const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
@@ -8906,6 +8907,23 @@ void llm_graph_context::build_conv_state_store(
     // a rollback of k tokens reads slot k, and the memory allows k < n only (see rs_max), so slots from n on are left unwritten
     const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
     const int64_t Kw = std::min(n, K);
+
+    if (slot_cpy) {
+        // [INKGLUE SLOTCPY] the same stores as the SET_ROWS below, as one CPY per slot (window w -> slot Kw - 1 - w): the
+        // CUDA conv ring takes CPY windows, so the concat, the stores and the slot-order arange/scale/cast fold into its
+        // ssm_conv launch
+        for (int64_t w = 0; w < Kw; ++w) {
+            ggml_tensor * win = ggml_view_3d(ctx0, conv_x,
+                    n_cols, channels, n_seqs,
+                    conv_x->nb[1], conv_x->nb[2],
+                    ggml_row_size(conv_x->type, n - (Kw - 1) + w));
+            ggml_tensor * cell = ggml_view_2d(ctx0, s,
+                    n_cols*channels, n_seqs,
+                    row_size, cell_offs + (size_t) (Kw - 1 - w)*mctx_cur->get_size()*row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, win, cell));
+        }
+        return;
+    }
 
     // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
     // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all

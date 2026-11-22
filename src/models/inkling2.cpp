@@ -250,7 +250,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
 
-    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+    // [INKGLUE SLOTCPY] per-slot CPY stores at verify widths (the conv ring folds them); LLAMA_INKLING2_SLOT_CPY=0 = SET_ROWS
+    static const bool slot_cpy = [] { const char * e = getenv("LLAMA_INKLING2_SLOT_CPY"); return !e || atoi(e) != 0; }();
+    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state), slot_cpy && n_tokens <= 16);
 
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
@@ -363,7 +365,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // fork (INKGLUE): at decode the Q, K and V gates, then the three input norms, are put back to back so the CUDA backend
     // runs each set in one launch (same values). LLAMA_INKLING2_MM_ORDER=0 = old node order
     static const bool in_order = [] { const char * e = getenv("LLAMA_INKLING2_MM_ORDER"); return !e || atoi(e) != 0; }();
-    const bool group_inputs = in_order && n_tokens == 1;
+    // [INKGLUE VORDER] the same decode order at verify widths (2..8 tokens), so the per-visit fusions see the same runs
+    // there; LLAMA_INKLING2_VERIFY_ORDER=0 = decode only
+    static const bool verify_order = [] { const char * e = getenv("LLAMA_INKLING2_VERIFY_ORDER"); return !e || atoi(e) != 0; }();
+    const bool small_batch = n_tokens == 1 || (verify_order && n_tokens <= 8);
+    const bool group_inputs = in_order && small_batch;
 
     if (messages) {
         // the messages make the Q, K and V inputs of a SWA layer differ
@@ -408,7 +414,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * kp_mm = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
         ggml_tensor * v_mm  = build_lora_mm(layer.wv, inputs[2]);
         ggml_tensor * vp_mm = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
-        if (mm_order && n_tokens == 1) {
+        if (mm_order && small_batch) {
             for (ggml_tensor * t : { q_mm, r_mm, s_mm, g_mm, k_mm, kp_mm, v_mm, vp_mm }) {
                 if (t) {
                     ggml_build_forward_expand(gf, t);
