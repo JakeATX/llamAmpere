@@ -67,8 +67,7 @@ def check_overlay(rows, tag):
 
 
 def speed(o, tag):
-    rows = cells(o, tag)
-    check_overlay(rows, tag)
+    rows = cells(o, tag)  # overlay proof comes from the -lv 4 identity cells (same DS_ENV); loader INFO is hidden here
     A, B = rows.get('A', {}), rows.get('B', {})
     seeds = sorted(set(A) & set(B))
     print(f'\n## {tag}: prompt {A[seeds[0]]["prompt"] if seeds else "?"} tokens')

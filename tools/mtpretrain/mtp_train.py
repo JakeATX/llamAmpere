@@ -48,6 +48,28 @@ MATS = ['nextn.eh_proj.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight
 NORMS = ['nextn.enorm.weight', 'nextn.hnorm.weight', 'attn_norm.weight', 'attn_q_norm.weight', 'attn_k_norm.weight',
          'post_attention_norm.weight', 'nextn.shared_head_norm.weight']
 DEV = os.environ.get('MTP_DEV', 'cuda')
+LAM_TV = float(os.environ.get('MTP_TV', '0'))
+# MTP_QAT=1: every matrix is used through the exact Q5_0 / Q8_0 round trip of the export (straight-through gradient),
+# so training and eval see the weights the overlay will ship (round-to-nearest export ate ~2/3 of the fp32 gain)
+QAT = os.environ.get('MTP_QAT', '0') == '1'
+QTYPE = {'attn_k.weight': 'q8_0', 'attn_v.weight': 'q8_0'}  # every other matrix is Q5_0 (export asserts against meta)
+
+
+def fake_quant(w, kind):
+    """gguf-py reference quantize + dequantize, in torch (blocks of 32 along a row, fp16 scale)."""
+    b = w.float().reshape(-1, 32)
+    if kind == 'q8_0':
+        d = b.abs().amax(-1, keepdim=True) / 127
+        idv = torch.where(d == 0, torch.zeros_like(d), 1 / d)
+        q = torch.round(b * idv)  # np_roundf rounds half away from zero; ties are measure-zero for trained weights
+        out = q * d.half().float()
+    else:
+        imax = b.abs().argmax(-1, keepdim=True)
+        d = torch.gather(b, 1, imax) / -16
+        idv = torch.where(d == 0, torch.zeros_like(d), 1 / d)
+        q = torch.trunc(b * idv + 16.5).clamp(0, 31)
+        out = (q - 16) * d.half().float()
+    return out.reshape(w.shape)  # weight of the acceptance term in the training loss (0 = soft CE only)
 
 
 def rms(x, w):
@@ -74,8 +96,17 @@ class MTPHead(nn.Module):
         x1, x2 = r[..., :N_ROT // 2], r[..., N_ROT // 2:]
         return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, x[..., N_ROT:].float()], -1)
 
+    def refresh_q(self):
+        """QAT: weights for this forward = fake-quantized copies with a straight-through gradient."""
+        self.qw = {}
+        if QAT:
+            for n in MATS:
+                w = self.w(n)
+                self.qw[n] = (w + (fake_quant(w.detach(), QTYPE.get(n, 'q5_0')) - w.detach())).to(torch.bfloat16)
+
     def lin(self, x, n):
-        return F.linear(x.to(torch.bfloat16), self.w(n).to(torch.bfloat16)).float()
+        wq = getattr(self, 'qw', {}).get(n)
+        return F.linear(x.to(torch.bfloat16), wq if wq is not None else self.w(n).to(torch.bfloat16)).float()
 
     def proj(self, e, h):
         return self.lin(torch.cat([rms(e, self.w('nextn.enorm.weight')), rms(h, self.w('nextn.hnorm.weight'))], -1), 'nextn.eh_proj.weight')
@@ -117,6 +148,7 @@ def chain_forward(model, H, E_tok, a0, depth, ckpt):
     Returns [hn_1[a0:], hn_2, ..., hn_depth], each [R,5120] (R = N - a0); row r of step s = anchor a0+r."""
     L = H.shape[0]; N = L - 1; R = N - a0
     dev = H.device
+    model.refresh_q()
     pos1 = torch.arange(1, N + 1, device=dev)
     ar = torch.arange(R, device=dev)
 
@@ -262,7 +294,10 @@ def ce_chunk(h, W, tidx, tp, valid):
     z = h.float() @ W.T
     lse = torch.logsumexp(z, -1, keepdim=True)
     logq = torch.gather(z, 1, tidx.clamp(min=0)) - lse
-    return -((tp * logq).sum(-1) * valid).sum()
+    loss = -((tp * logq).sum(-1) * valid).sum()
+    if LAM_TV and torch.is_grad_enabled():  # training only; acceptance-aligned term: -sum_x min(p(x), q(x)) over the target support (= TV distance - 1)
+        loss = loss - LAM_TV * (torch.minimum(tp, logq.exp() * (tp > 0)).sum(-1) * valid).sum()
+    return loss
 
 
 def step_loss(hn, ctx, ti, tp, valid):
@@ -382,7 +417,7 @@ def read_overlay(path):
 
 def cmd_train(a):
     torch.manual_seed(a.seed); random.seed(a.seed)
-    ctx = Ctx(a)
+    ctx = Ctx(a, torch.load(a.head) if a.head else None)  # --head: start from a checkpoint (e.g. QAT polish)
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     D = ctx.D
     tr, ho = split_ids(D, 'train'), split_ids(D, 'heldout_sel')

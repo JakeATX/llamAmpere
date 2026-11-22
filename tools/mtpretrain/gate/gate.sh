@@ -7,7 +7,9 @@ W=/mnt/overflow/mtpretrain/gate
 sha256sum /mnt/overflow/mtpretrain/mtp-otp.gguf > $W/out-overlay.sha256
 bash $W/cell2.sh $W/cfg_gate.txt g100 100000 "A:7300,7301,7302 B:7300,7301,7302 B:7303,7304,7305 A:7303,7304,7305"
 bash $W/cell2.sh $W/cfg_gate.txt g8 8000 "A:7300,7301,7302 B:7300,7301,7302 B:7303,7304,7305 A:7303,7304,7305"
-NPRED=512 DS_EXTRA=--greedy bash $W/cell2.sh $W/cfg_gate.txt id8 8000 "AX:7300 BX:7300"
-NPRED=512 DS_EXTRA=--greedy SERVER_EXTRA="--spec-type none" bash $W/cell2.sh $W/cfg_gate.txt id8off 8000 "A:7300 B:7300"
+# identity cells log at -lv 4 so the loader's 'overlay patch ...: 15 tensors replaced' line proves B loaded the new head
+# (speed cells stay at default verbosity; they use the same DS_ENV as the proven B cells)
+NPRED=512 DS_EXTRA=--greedy SERVER_EXTRA="-lv 4" bash $W/cell2.sh $W/cfg_gate.txt id8 8000 "AX:7300 BX:7300"
+NPRED=512 DS_EXTRA=--greedy SERVER_EXTRA="-lv 4 --spec-type none" bash $W/cell2.sh $W/cfg_gate.txt id8off 8000 "A:7300 B:7300"
 python3 $W/summ.py $W/out > $W/summary.txt 2>&1
 echo GATE_DONE

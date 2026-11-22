@@ -15,7 +15,7 @@ ph_extract() { done_or extract && return; $PY $T/extract.py $M $R/w0 > $R/extrac
 
 ph_gen() {
   done_or gen && return
-  LLAMA_ARG_NO_CACHE_DISK=1 $R/bin/llama-server -m $M --preset 24dense --parallel $NP -c $((NP * 8192)) --no-spec-mb-mtp \
+  LLAMA_ARG_NO_CACHE_DISK=1 $R/bin/llama-server -m $M --preset 24dense --parallel $NP -c $((NP * 8192)) --no-spec-mb-mtp ${GEN_EXTRA:-} \
       --port $PORT --host 127.0.0.1 --no-webui > $R/gen_server.log 2>&1 &
   local sp=$!
   for i in $(seq 1 120); do curl -sf http://127.0.0.1:$PORT/health > /dev/null && break; sleep 5; done
@@ -57,7 +57,7 @@ ph_export() {
       || return 1
   log "rep base $(tail -1 $R/eval_base_rep.log)"; log "rep otp  $(tail -1 $R/eval_otp_rep.log)"
   # the overlay must load in the release server (15 tensors replaced) and draft
-  LLAMA_MODEL_OVERLAY_PATCH=$R/mtp-otp.gguf LLAMA_ARG_NO_CACHE_DISK=1 timeout 600 $R/bin/llama-server -m $M --preset 24dense -c 16384 \
+  LLAMA_MODEL_OVERLAY_PATCH=$R/mtp-otp.gguf LLAMA_ARG_NO_CACHE_DISK=1 timeout 600 $R/bin/llama-server -m $M --preset 24dense -c 16384 -lv 4 \
       --port $PORT --host 127.0.0.1 --no-webui > $R/ovl_server.log 2>&1 &
   local sp=$!
   for i in $(seq 1 60); do curl -sf http://127.0.0.1:$PORT/health > /dev/null && break; sleep 5; done
