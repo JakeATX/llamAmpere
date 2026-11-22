@@ -2050,7 +2050,17 @@ public:
         if (state != has_state || !params.ubatch.token || tokens->ne[0] != params.ubatch.n_tokens) {
             return false;
         }
-        return !has_state || llm_graph_input_embd_h::can_reuse(params);
+        if ((params.cparams.dspark_noise != nullptr) != (noise != nullptr)) {
+            return false;
+        }
+        if (has_state && !llm_graph_input_embd_h::can_reuse(params)) {
+            return false;
+        }
+        // [T5-IDLE] H4: refresh noise pointer on graph reuse (dspark_noise buffer may reallocate or update per round)
+        if (noise != nullptr) {
+            noise_src = params.cparams.dspark_noise;
+        }
+        return true;
     }
 
     const bool has_state;
@@ -2145,7 +2155,15 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     anchors = ggml_mul(ctx0, ggml_rms_norm(ctx0, anchors, target->hparams.f_norm_rms_eps), target->tok_norm);
     auto * cur = ggml_reshape_3d(ctx0, anchors, n_embd, 1, nb);
     if (block > 1) {
-        auto * masks = ggml_repeat_4d(ctx0, ggml_cast(ctx0, model.dspark_mask_embd, GGML_TYPE_F32), n_embd, block - 1, nb, 1);
+        // [T5-IDLE] H3: skip redundant F32->F32 cast on dspark_mask_embd (LLAMA_DSPARK_MASK_GPU=0 restores cast)
+        static const bool skip_noop_cast = [] {
+            const char * e = getenv("LLAMA_DSPARK_MASK_GPU");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        ggml_tensor * mask_f32 = (skip_noop_cast && model.dspark_mask_embd->type == GGML_TYPE_F32)
+            ? model.dspark_mask_embd
+            : ggml_cast(ctx0, model.dspark_mask_embd, GGML_TYPE_F32);
+        auto * masks = ggml_repeat_4d(ctx0, mask_f32, n_embd, block - 1, nb, 1);
         cur = ggml_concat(ctx0, cur, masks, 1);
     }
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);

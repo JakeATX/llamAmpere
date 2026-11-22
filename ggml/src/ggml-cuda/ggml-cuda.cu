@@ -5489,7 +5489,9 @@ struct ggml_cuda_upload_ring {
 };
 
 static bool ggml_cuda_upload_batch_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_SCHED_UPLOAD_BATCH"); return e && atoi(e) != 0; }();
+    // [T5-IDLE] H5: default ON (collapses ~38 k_cuda_upload_copy launches + events/round into 3 batched launches);
+    // Kill switch: GGML_SCHED_UPLOAD_BATCH=0
+    static const bool on = [] { const char * e = getenv("GGML_SCHED_UPLOAD_BATCH"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 
@@ -6155,28 +6157,62 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    const bool has_kv_stream = g_kv_stream_runtime_count.load(std::memory_order_acquire) != 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_cuda_graph::node_properties prop = {};
-        memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        const ggml_tensor * node = cgraph->nodes[i];
+        auto & dst_prop = graph->node_props[i];
 
-        if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i])) {
-            prop.kv_stream_generation = runtime->generation;
+        if (!res && !has_kv_stream) {
+            // [T5-IDLE] H6: in-place comparison avoids 1.1 KB stack memset+memcpy per node (~5 MB/round on verify)
+            bool same = dst_prop.kv_stream_generation == 0 &&
+                        memcmp(&dst_prop.node, node, sizeof(ggml_tensor)) == 0;
+            if (same) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    const ggml_tensor * s = node->src[j];
+                    if (s) {
+                        if (dst_prop.node_src_data_ptrs[j] != s->data ||
+                            memcmp(dst_prop.node_src_ne[j], s->ne, sizeof(dst_prop.node_src_ne[j])) != 0 ||
+                            memcmp(dst_prop.node_src_nb[j], s->nb, sizeof(dst_prop.node_src_nb[j])) != 0) {
+                            same = false;
+                            break;
+                        }
+                    } else if (dst_prop.node_src_data_ptrs[j] != nullptr) {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if (same) {
+                continue;
+            }
+            res = true;
         }
 
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (cgraph->nodes[i]->src[j]) {
-                if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(cgraph->nodes[i]->src[j])) {
-                    prop.kv_stream_generation = std::max(
-                        prop.kv_stream_generation, runtime->generation);
-                }
-                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
-                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
-                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+        ggml_cuda_graph::node_properties prop = {};
+        memcpy(&prop.node, node, sizeof(ggml_tensor));
+
+        if (has_kv_stream) {
+            if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(node)) {
+                prop.kv_stream_generation = runtime->generation;
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
-            graph->node_props[i] = prop;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j]) {
+                if (has_kv_stream) {
+                    if (auto * runtime = ggml_cuda_kv_stream_runtime_from_tensor(node->src[j])) {
+                        prop.kv_stream_generation = std::max(
+                            prop.kv_stream_generation, runtime->generation);
+                    }
+                }
+                prop.node_src_data_ptrs[j] = node->src[j]->data;
+                memcpy(prop.node_src_ne[j], node->src[j]->ne, sizeof(prop.node_src_ne[j]));
+                memcpy(prop.node_src_nb[j], node->src[j]->nb, sizeof(prop.node_src_nb[j]));
+            }
+        }
+
+        if (res || memcmp(&dst_prop, &prop, sizeof(prop)) != 0) {
+            dst_prop = prop;
             res = true;
         }
     }
@@ -14926,8 +14962,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 const int k = s ? atoi(s) : 2;
                 return k >= 2 ? k : 2;
             }();
-            const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-            if (graph_compatible) {
+            // [T5-IDLE] H6: O(1) uid fast-path skips the 4,500-node ggml_cuda_graph_check_compability walk
+            // when this exact cgraph uid was already verified and captured into graph->instance with unchanged generations.
+            // Kill switch: GGML_CUDA_GRAPH_UID_FAST=0
+            static const bool uid_fast_env = [] {
+                const char * e = getenv("GGML_CUDA_GRAPH_UID_FAST");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            if (uid_fast_env && graph->warmup_complete && graph->instance != nullptr &&
+                    cgraph->uid != 0 && cgraph->uid == graph->uid &&
+                    g_kv_stream_runtime_count.load(std::memory_order_acquire) == 0 &&
+                    graph->moe_cache_generation == ggml_cuda_moe_cache_device_capture_generation(cuda_ctx->device) &&
+                    (!ggml_cuda_lsa_j3_graphs() || graph->lsa_j3_generation == ggml_cuda_lsa_j3_generation())) {
+                graph->recaptured_last = false;
+                use_cuda_graph = true;
+                cuda_graph_update_required = false;
+            } else if (ggml_cuda_graph_check_compability(cgraph)) {
                 const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
                 if (!graph->warmup_complete) {

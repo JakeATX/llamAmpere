@@ -5437,8 +5437,16 @@ build_graph:
         const char * v = getenv("LLAMA_MTP_PLAN_SLOTS");
         return v == nullptr || strcmp(v, "0") != 0; // default on; =0 turns it off
     }();
+    // [T5-IDLE] H4: also enable 2-slot scheduler plans for DFlash/DSpark (slot 0 = process/inject p35, slot 1 = draft dr)
+    // Kill switch: LLAMA_DSPARK_PLAN_SLOTS=0
+    static const bool dspark_plan_slots_env = [] {
+        const char * v = getenv("LLAMA_DSPARK_PLAN_SLOTS");
+        return v == nullptr || strcmp(v, "0") != 0; // default on; =0 turns it off
+    }();
     int plan_slot = -1;
-    if (plan_slots_env && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !graph_reuse_disable && !b1_cur.active &&
+    const bool use_plan_slots = plan_slots_env &&
+        (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (dspark_plan_slots_env && model.arch == LLM_ARCH_DFLASH));
+    if (use_plan_slots && !graph_reuse_disable && !b1_cur.active &&
             !cparams.pipeline_parallel) {
         if (gf_res_prev_active == nullptr) {
             plan_res.fill(nullptr);
