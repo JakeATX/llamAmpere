@@ -65,7 +65,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 void common_speculative_free(common_speculative * spec);
 
 // INKSPEC_LOG (see speculative.cpp)
-extern std::vector<std::vector<float>> common_inkspec_dft_logits;
+// an accessor, not an extern variable: data exported from a Windows DLL needs dllimport at the use site (LNK2019)
+std::vector<std::vector<float>> & common_inkspec_dft_logits();
 bool common_inkspec_log_on();
 
 struct common_speculative_draft_params {

@@ -37,7 +37,7 @@
 static void inkspec_log_round(llama_context * ctx, const std::vector<int32_t> & idxs, const llama_tokens & draft,
                               size_t n_accepted) {
     static FILE * f = [] { const char * e = getenv("INKSPEC_LOG"); return e ? fopen(e, "a") : (FILE *) nullptr; }();
-    if (!f || draft.empty() || common_inkspec_dft_logits.size() < draft.size()) {
+    if (!f || draft.empty() || common_inkspec_dft_logits().size() < draft.size()) {
         return;
     }
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
@@ -45,7 +45,7 @@ static void inkspec_log_round(llama_context * ctx, const std::vector<int32_t> & 
     std::vector<int32_t> ord;
     for (size_t j = 0; j < draft.size(); ++j) {
         const float * lt = llama_get_logits_ith(ctx, idxs[j]);
-        const auto & ld = common_inkspec_dft_logits[j];
+        const auto & ld = common_inkspec_dft_logits()[j];
         // the captured row must be this draft's: same length and the same first-maximum token
         if (!lt || (int) ld.size() != n_vocab || (llama_token) (std::max_element(ld.begin(), ld.end()) - ld.begin()) != draft[j]) {
             break;
@@ -87,7 +87,7 @@ static void inkspec_log_round(llama_context * ctx, const std::vector<int32_t> & 
     }
     fprintf(f, "\n");
     fflush(f);
-    common_inkspec_dft_logits.clear();
+    common_inkspec_dft_logits().clear();
 }
 #include "../../src/llama-ext.h"
 
