@@ -2644,7 +2644,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
+        if (first_fit || head_cur > cells.get_used() + 2*n_tokens) {
             head_cur = 0;
         }
 
@@ -8094,6 +8094,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_cur];
+}
+
+uint32_t llama_kv_cache_context::get_n_stream_cache() const {
+    return kv->get_n_stream();
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
