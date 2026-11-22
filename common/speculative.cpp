@@ -1160,8 +1160,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         if (has_rnn_context) {
-            if (ds_adaptive && (this->params.n_min_adaptive < 1 || this->params.n_min_adaptive > this->params.n_max)) {
-                throw std::runtime_error("DSpark adaptive depth: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
+            if (ds_adaptive) {
+                // LLAMA_DSPARK_ADAPT=1 can force the adaptive depth without the parse-time defaults: keep the floor in range
+                this->params.n_min_adaptive = std::max(1, std::min(this->params.n_min_adaptive, this->params.n_max));
             }
             ds_ctrl.assign(n_seq, common_speculative_adaptive());
             for (auto & c : ds_ctrl) {
@@ -1447,12 +1448,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 i_block_beg[seq_id] = batch_rnn.size();
                 n_block    [seq_id] = block_size;
-                // INKSPEC2: this seq's draft cap: the adaptive depth (or n_max), then the server's per-call bound
+                // INKSPEC2: this seq's draft cap: the adaptive depth (or n_max)
+                // (the server's per-call bound dp.n_max is applied by the caller's truncation, as before, so the walk
+                // length, the noise stream and graph reuse do not follow it)
                 int32_t cap = ds_adaptive ? std::min(ds_ctrl[seq_id].n_cur, params.n_max) : params.n_max;
                 cap = std::max(cap, std::min(params.n_min, params.n_max)); // a draft below n_min would be cleared every round
-                if (dp.n_max > 0) {
-                    cap = std::min(cap, dp.n_max);
-                }
                 ds_cap [seq_id] = std::max(1, cap);
                 ds_last[seq_id] = 0;
                 for (int32_t i = 0; i < block_size; ++i) {
@@ -1776,6 +1776,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (dp.result_q) {
                     dp.result_q->clear();
                 }
+                if (seq_id < (llama_seq_id) ds_last.size()) {
+                    ds_last[seq_id] = 0;
+                }
             }
         }
     }
@@ -1798,6 +1801,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             n_acc = std::min(n_acc, (int) n_accepted_ctrl);
         }
         const int before = ds_ctrl[seq_id].n_cur;
+        if (own < before && n_acc == own) {
+            ds_last[seq_id] = 0; // a draft cut short (server bound, confidence stop) and fully accepted earns no climb
+            return;
+        }
         ds_ctrl[seq_id].update(own, n_acc, params.n_max, params.n_min_adaptive);
         if (ds_ctrl[seq_id].n_cur != before) {
             SPC_DBG("DSpark adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",

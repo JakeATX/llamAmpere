@@ -673,10 +673,11 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         if (!types_gguf.empty()) {
             params.speculative.types = types_gguf;
         }
-        // INKSPEC2: an inferred DSpark drafter gets the same mb + adaptive default as an explicit --spec-type
-        common_speculative_apply_mtp_sampling_default(params);
-        common_speculative_apply_dspark_default(params);
     }
+    // INKSPEC2: a DSpark drafter inferred from a sidecar or the draft GGUF gets the same mb + adaptive default as an
+    // explicit --spec-type (both calls are idempotent)
+    common_speculative_apply_mtp_sampling_default(params);
+    common_speculative_apply_dspark_default(params);
 
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
     const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
@@ -5447,8 +5448,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-mb-mtp"},
         {"--no-spec-mb-mtp"},
-        "mb-MTP (mode-biased MTP) on by default with MTP; --no-spec-mb-mtp for exact sampling. Keep a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens; "
-        "--no-spec-mb-mtp keeps exact (lossless) acceptance (default: on with --spec-type draft-mtp or draft-mtp-adaptive, otherwise off); with no depth flags it drafts at adaptive depth 3-5",
+        "mb-MTP (mode-biased MTP) on by default with MTP or DSpark drafting; --no-spec-mb-mtp for exact sampling. Keep a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens; "
+        "--no-spec-mb-mtp keeps exact (lossless) acceptance (default: on with --spec-type draft-mtp, draft-mtp-adaptive or draft-dspark, otherwise off); with no depth flags it drafts at adaptive depth 3-5 (DSpark: LLAMA_DSPARK_ADAPT=0 keeps the fixed depth)",
         [](common_params & params, bool value) {
             params.sampling.spec_lossy = value;
             params.sampling.spec_lossy_explicit = true;

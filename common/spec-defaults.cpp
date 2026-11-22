@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "spec-defaults.h"
 
 #include "common.h"
@@ -175,6 +176,19 @@ void common_speculative_apply_dspark_default(common_params & params) {
     if (spec.draft.dspark_adaptive ||
             std::find(spec.types.begin(), spec.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) == spec.types.end()) {
         return;
+    }
+    // LLAMA_DSPARK_ADAPT=0 (kill switch) keeps the fixed depth, so n_max (and the recurrent snapshot count derived
+    // from it) stays as before; a draft GGUF without the Markov head (not the Inkling DSpark) drafts at fixed depth too
+    const char * ea = getenv("LLAMA_DSPARK_ADAPT");
+    if (ea && atoi(ea) == 0) {
+        return;
+    }
+    if (!spec.draft.mparams.path.empty()) {
+        const struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+        gguf_context_ptr ctx(gguf_init_from_file(spec.draft.mparams.path.c_str(), gp));
+        if (ctx && gguf_find_key(ctx.get(), "dflash.dspark.markov_rank") < 0) {
+            return;
+        }
     }
     if (params.sampling.spec_lossy &&
             !(spec.user_set & (COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX | COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE))) {
