@@ -5105,6 +5105,22 @@ void llama_context::set_dspark_ids_out(bool on) {
     cparams.dspark_ids_out = on;
 }
 
+void llama_context::set_dspark_sample(int32_t k, float temp, const float * noise, size_t n) {
+    constexpr size_t cap = 64*16*64; // K <= 64, walk <= 16, blocks <= 64
+    if (dspark_noise.size() != cap) {
+        dspark_noise.assign(cap, 0.0f);
+    }
+    if (k <= 0 || noise == nullptr || n == 0 || n > cap || k > 64) {
+        cparams.dspark_sample_k = 0;
+        cparams.dspark_noise    = nullptr;
+        return;
+    }
+    std::copy(noise, noise + n, dspark_noise.begin());
+    cparams.dspark_sample_k = k;
+    cparams.dspark_sample_t = temp;
+    cparams.dspark_noise    = dspark_noise.data();
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -11140,6 +11156,10 @@ void llama_set_dspark_walk(llama_context * ctx, int32_t n) {
 
 void llama_set_dspark_ids_out(llama_context * ctx, bool on) {
     ctx->set_dspark_ids_out(on);
+}
+
+void llama_set_dspark_sample(llama_context * ctx, int32_t k, float temp, const float * noise, size_t n) {
+    ctx->set_dspark_sample(k, temp, noise, n);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

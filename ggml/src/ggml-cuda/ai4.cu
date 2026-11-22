@@ -480,7 +480,7 @@ static bool ai4_spw_enabled(int M, int K, const ai4k::idmap & idm, int max_tiles
 
 // fork AIPFIX D7 (defined after moe_mixed_group): cached AI+ experts, routes of one expert share a weight read
 template <int LAY, int XSH, int KT>
-static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
+static bool ai4_table_grouped_try(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
                                   const ai4k::idmap & idm, int max_tiles);
 
 // fork: each warp owns 16 rows and scans K without a cross-warp sum.
@@ -493,7 +493,7 @@ static bool ai4_spw_try(const uint8_t * W, const int8_t * q, const float * s, fl
         if (!ai4_spw_enabled(M, K, idm, max_tiles)) {
             return false;
         }
-        if (ai4_table_grouped_try<LAY, XSH, KT>(q, s, Y, M, K, stream, idm, max_tiles)) {
+        if (ai4_table_grouped_try<LAY, XSH, KT>(W, q, s, Y, M, K, stream, idm, max_tiles)) {
             return true;
         }
         ai4k::launch_mmvr<LAY, XSH, ID, KT, 2, 4, 6, true, false, 1, 1, false, true>(W, q, s, Y, M, M, 1, K, stream, idm, max_tiles);
@@ -1840,7 +1840,7 @@ static __device__ __forceinline__ void moe_mixed_group(const ai4k::idmap & idm, 
 // keeps the direct SPW K order, so the outputs are the ungrouped launch's bits. Filters, the paired second projection
 // (upper half of x) and the fused SwiGLU work as in mmvr. GGML_MOE_CACHE_AI_GROUP=0 opts out.
 template <int LAY, int XSH, int KT>
-static __global__ void __launch_bounds__(128, 6) ai4_table_grouped(const int8_t * __restrict__ Xq,
+static __global__ void __launch_bounds__(128, 6) ai4_table_grouped(const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq,
         const float * __restrict__ Xs, float * Y, int M, int K, const ai4k::idmap idm) {
     constexpr int WARPS = 4;
     const bool second = idm.table2 && (int) blockIdx.x >= (int) gridDim.x/2;
@@ -1877,7 +1877,8 @@ static __global__ void __launch_bounds__(128, 6) ai4_table_grouped(const int8_t 
     if (group.n == 0) {
         return;
     }
-    ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 6, true, false, 1, 1, false, true, true>(nullptr, Xq, Xs, y, M, M, 1,
+    // W: the resident expert stack (expert e at W + e*nb02) when there is no slot table (INKSPEC resident grouping)
+    ai4k::mmvr_body<LAY, XSH, true, KT, 2, WARPS, 6, true, false, 1, 1, false, true, true>(m.table ? nullptr : W, Xq, Xs, y, M, M, 1,
             K, m, &group, bx);
 }
 
@@ -1886,14 +1887,23 @@ static bool ai4_table_grouped_on() {
     return on;
 }
 
+// INKSPEC: the same grouped launch for resident expert stacks (no slot table): in a multi-token MUL_MAT_ID (speculative
+// verify) the routes that picked one expert share one weight read. Same per-column K order as the ungrouped SPW launch,
+// so the outputs are its bits (cost1, Taichi 3090, Inkling AI4 fold: 512 greedy DSpark tokens, ids + logprobs identical;
+// verify decode 4/6/8 rows 22.89/29.29/35.30 -> 20.81/24.79/28.05 ms). Default on; GGML_CUDA_AI_RES_GROUP=0 opts out.
+static bool ai4_res_grouped_on() {
+    static const bool on = ai4_env_int("GGML_CUDA_AI_RES_GROUP", nullptr, 1) != 0;
+    return on;
+}
+
 template <int LAY, int XSH, int KT>
-static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
+static bool ai4_table_grouped_try(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, cudaStream_t stream,
                                   const ai4k::idmap & idm, int max_tiles) {
     // one token has nothing to share; the native-id map (bank) and fused activations keep their own launches.
     // Paired launches (table2) stay ungrouped: the grouped second projection gives wrong output (f3q/f3r 11-02:
     // every bank route of that half off from element 0, unpaired grouped clean), and the paired ungrouped launch
     // was the faster one anyway (f3v2). This is what broke P1PLAIN-GU at >= 4 tokens (11-03 'incomplete output').
-    if (!ai4_table_grouped_on() || !idm.table || idm.table2 || idm.no_group || idm.direct_map || idm.direct_x ||
+    if (!ai4_table_grouped_on() || (!idm.table && (!ai4_res_grouped_on() || W == nullptr || idm.lean)) || idm.table2 || idm.no_group || idm.direct_map || idm.direct_x ||
             idm.direct_n_used <= 0 || max_tiles/idm.direct_n_used < 2 || M % 16 != 0) {
         return false;
     }
@@ -1907,7 +1917,7 @@ static bool ai4_table_grouped_try(const int8_t * q, const float * s, float * Y, 
         attr_set[dev & 63] = true;
     }
     const dim3 grid(((M/16 + WARPS - 1)/WARPS)*(idm.table2 ? 2 : 1), idm.direct_n_used, max_tiles/idm.direct_n_used);
-    ai4_table_grouped<LAY, XSH, KT><<<grid, WARPS*32, smem, stream>>>(q, s, Y, M, K, idm);
+    ai4_table_grouped<LAY, XSH, KT><<<grid, WARPS*32, smem, stream>>>(W, q, s, Y, M, K, idm);
     static bool logged = false;
     if (!logged) {
         logged = true;

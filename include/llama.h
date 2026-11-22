@@ -1393,6 +1393,10 @@ extern "C" {
     LLAMA_API void llama_set_dspark_walk(struct llama_context * ctx, int32_t n);
     // Inkling2 DSpark: the walked slots return their argmax token id in h_nextn (element markov_rank, as float) and no logits
     LLAMA_API void llama_set_dspark_ids_out(struct llama_context * ctx, bool on);
+    // INKSPEC: sampled DSpark walk (needs ids_out). k > 0: each walked slot draws from softmax(logit/temp) over its top k
+    // by Gumbel-max with the given noise (F32 [k, n_blocks, walk], copied); the slot row of h_nextn then carries
+    // [state(rank), id, k candidate ids, k candidate logits]. k = 0: argmax walk.
+    LLAMA_API void llama_set_dspark_sample(struct llama_context * ctx, int32_t k, float temp, const float * noise, size_t n);
 
     // Get all nextn embeddings, mirroring llama_get_embeddings()
     LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

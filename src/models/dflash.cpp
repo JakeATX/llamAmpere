@@ -2034,6 +2034,9 @@ public:
     llm_graph_input_inkling2_draft(int64_t n_embd, bool has_state) : llm_graph_input_embd_h(n_embd, n_embd), has_state(has_state) {}
 
     void set_input(const llama_ubatch * ubatch) override {
+        if (noise && noise_src) {
+            ggml_backend_tensor_set(noise, noise_src, 0, ggml_nbytes(noise));
+        }
         if (has_state) {
             llm_graph_input_embd_h::set_input(ubatch);
             return;
@@ -2051,6 +2054,9 @@ public:
     }
 
     const bool has_state;
+    // INKSPEC sampled walk: Gumbel noise F32 [K, n_blocks, walk], copied from the context at set_input
+    ggml_tensor * noise = nullptr;
+    const float * noise_src = nullptr;
 };
 
 // Inkling2 DSpark (#32218, greedy path):
@@ -2114,6 +2120,20 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     ggml_tensor * tokens = inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(tokens);
     ggml_tensor * f_rnn = has_state ? (inp->h = build_inp_embd_state(inp.get(), n_embd)) : nullptr;
+    // INKSPEC sampled walk (ids_out only; the slot row must hold state + id + K ids + K logits)
+    const int64_t nb_s    = std::max<int64_t>(1, ubatch.n_seqs_unq);
+    const int64_t block_s = n_tokens/nb_s;
+    const int64_t walk_s  = cparams.dspark_walk > 0 ? std::min<int64_t>(block_s - 1, cparams.dspark_walk) : block_s - 1;
+    const int64_t sk      = cparams.dspark_sample_k;
+    const bool sampled = has_state && cparams.dspark_ids_out && sk > 0 && cparams.dspark_noise != nullptr && walk_s > 0 &&
+            block_s <= (int64_t) hparams.dflash_block_size && hparams.dspark_markov_rank + 1 + 2*sk <= n_embd &&
+            sk*nb_s*walk_s <= 64*16*64;
+    ggml_tensor * noise = nullptr;
+    if (sampled) {
+        noise = inp->noise = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, sk, nb_s, walk_s);
+        ggml_set_input(noise);
+        inp->noise_src = cparams.dspark_noise;
+    }
     res->add_input(std::move(inp));
 
     // one block per sequence; the anchor is the target's normed token embedding, the other slots the mask embedding
@@ -2181,6 +2201,20 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             continue;
         }
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
+        if (noise) {
+            // sampled slot: Gumbel-max over the top K logits = one exact draw from softmax(logit/T) over those K
+            auto * lv   = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+            auto * cand = ggml_cont(ctx0, ggml_top_k(ctx0, lv, sk));                                                   // I32 [K, nb]
+            auto * vals = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, lv, 1, lv->ne[0], nb), cand), sk, nb);
+            auto * g    = ggml_view_2d(ctx0, noise, sk, nb, noise->nb[1], (i - 1)*noise->nb[2]);
+            auto * pick = ggml_argmax(ctx0, ggml_add(ctx0, ggml_scale(ctx0, vals, 1.0f/cparams.dspark_sample_t), g)); // [nb]
+            prev = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cand, 1, sk, nb), ggml_reshape_2d(ctx0, pick, 1, nb)), nb);
+            auto * row = ggml_concat(ctx0, state, ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, nb), 0);
+            row = ggml_concat(ctx0, row, ggml_cast(ctx0, cand, GGML_TYPE_F32), 0);
+            row = ggml_concat(ctx0, row, vals, 0);
+            states = ggml_concat(ctx0, states, ggml_pad(ctx0, row, n_embd - rank - 1 - 2*sk, 0, 0, 0), 1);
+            continue;
+        }
         // first maximum of the slot (the CUDA and CPU argmax both keep the lowest index on ties, like the host argmax)
         prev = ggml_argmax(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0)));
         if (ids_out) {

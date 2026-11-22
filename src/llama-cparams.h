@@ -23,6 +23,11 @@ struct llama_cparams {
     int32_t  nextn_layer_offset = 0;
     int32_t  dspark_walk        = 0; // Inkling2 DSpark: markov head steps per block (0 = the whole block)
     bool     dspark_ids_out     = false; // Inkling2 DSpark: walked slots output argmax ids in h_nextn, no logits
+    // INKSPEC sampled DSpark walk (ids_out only): each walked slot samples from softmax(logit/T) over its top K with
+    // host Gumbel noise (dspark_noise, F32 [K, n_blocks, walk]) instead of taking the argmax; K = 0: argmax
+    int32_t  dspark_sample_k    = 0;
+    float    dspark_sample_t    = 1.0f;
+    const float * dspark_noise  = nullptr;
 
     enum llama_moe_cache_mode moe_cache_mode;
     size_t moe_cache_budget_mib;
