@@ -35,7 +35,8 @@ static __device__ __forceinline__ float ink_situ_elem(const float gv, const floa
     const float u1 = p.ua_s*uv + p.ua_b;
     const float u2 = tanhf(u1);
     const float u3 = p.ub_s*u2 + p.ub_b;
-    return p.act_first ? a4*u3 : u3*a4;
+    // round-to-nearest product: never contracted into a following add (INKSITUQ quantizes this value in registers)
+    return p.act_first ? __fmul_rn(a4, u3) : __fmul_rn(u3, a4);
 }
 
 void ggml_cuda_ink_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,

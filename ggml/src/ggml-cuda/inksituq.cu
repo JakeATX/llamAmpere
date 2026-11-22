@@ -33,9 +33,7 @@ static __global__ void __launch_bounds__(128) k_ink_situq(const char * __restric
         const float * ur = (const float *) (u + i2*u_nb2 + i1*u_nb1) + cb*128 + l*8;
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            v[e] = ink_situ_elem(gr[e], ur[e], p);
-            // the value as k_ink_situ stores it: no FMA contraction of SITU's last product into the rotation's first add
-            asm volatile("" : "+f"(v[e]));
+            v[e] = ink_situ_elem(gr[e], ur[e], p); // __fmul_rn result: the value k_ink_situ stores, never contracted
         }
         float * yr = dst + (int64_t) tok*K + cb*128 + l*8;
         *(float4 *) yr       = make_float4(v[0], v[1], v[2], v[3]);
