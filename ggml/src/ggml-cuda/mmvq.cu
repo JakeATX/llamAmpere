@@ -1481,7 +1481,9 @@ static __global__ void mul_mat_vec_q_group(const mmvq_group_args g, const uint32
 // fork (INKGLUE MMGV): the same grouping at verify widths 5..8: each member runs the plain ncols_dst 5..8 kernel body
 // (mul_mat_vec_q<type, NC, false> with the default flags, as mul_mat_vec_q_switch_ncols_dst cases 5..8 launch it) on its
 // own row blocks, so every output is bit-identical to the separate launches. Kernel next to the body it must share.
-template <ggml_type type, int NC>
+// check_rows as the separate launch picks it (false when every member's rows fill whole row blocks): the guarded loop
+// keeps the compiler from sharing each row's weight loads across the NC columns (measured 2.5x slower at NC 5).
+template <ggml_type type, int NC, bool check_rows>
 __launch_bounds__(calc_nwarps(type, NC, get_device_table_id(), false, false, false)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_group_nc(const mmvq_group_args g, const uint32_t ncols_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint3 one_fd) {
@@ -1493,7 +1495,7 @@ static __global__ void mul_mat_vec_q_group_nc(const mmvq_group_args g, const uin
         ++k;
     }
     const ggml_cuda_mm_fusion_args_device fusion{};
-    mul_mat_vec_q_body<type, NC, false, false, false, false, false, false, true, 0>(
+    mul_mat_vec_q_body<type, NC, false, false, false, false, false, false, check_rows, 0>(
         g.vx[k], g.vy[k], nullptr, fusion, g.dst[k], ncols_x, make_uint3(0, 0, 0), stride_row_x, stride_col_y, g.nrows[k],
         one_fd, 0, 0, 0, one_fd, 0, 0, 0, g.nrows[k], b - b0);
 }
@@ -4150,9 +4152,19 @@ static bool mmvq_group_nc_launch(ggml_backend_cuda_context & ctx, ggml_tensor * 
             g.blk_end[k] = blk;
             g.nrows[k]   = (uint32_t) nrows;
         }
+        const int rpb = calc_rows_per_block(type, c_nc, table_id, false, block_dims.y, 0);
+        bool full = true;
+        for (int k = 0; k < n; ++k) {
+            full = full && g.nrows[k] % rpb == 0;
+        }
         const ggml_cuda_kernel_launch_params lp(dim3(blk, 1, 1), block_dims, 0, stream);
-        ggml_cuda_kernel_launch(mul_mat_vec_q_group_nc<type, c_nc>, lp, g, (uint32_t) ne10,
-            (uint32_t) (ne10 / ggml_blck_size(type)), (uint32_t) (ne10_padded / QK8_1), init_fastdiv_values(1));
+        if (full) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_group_nc<type, c_nc, false>, lp, g, (uint32_t) ne10,
+                (uint32_t) (ne10 / ggml_blck_size(type)), (uint32_t) (ne10_padded / QK8_1), init_fastdiv_values(1));
+        } else {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_group_nc<type, c_nc, true>, lp, g, (uint32_t) ne10,
+                (uint32_t) (ne10 / ggml_blck_size(type)), (uint32_t) (ne10_padded / QK8_1), init_fastdiv_values(1));
+        }
     };
     switch (NC) {
         case 5: launch(std::integral_constant<int, 5>{}); break;
