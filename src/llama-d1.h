@@ -208,25 +208,29 @@ struct llama_d1_ctx {
     bool async_pending = false;
     std::vector<int64_t> arows;  // rows of the current pool job
     void rescore_one(float * logits, int64_t n_vocab, int64_t r, std::vector<int32_t> & ids);
-    // cands == nullptr or pre < floor: scan the whole row; else check only cands (fused pick, floor = its scan floor)
-    void certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids,
-                 const std::vector<int32_t> * cands = nullptr, float floor = 0.0f);
+    void certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids);
+    struct cert_prep_t { float T = 0, pre = 0, hn = 0; std::vector<float> hg; std::vector<int32_t> sids; };
+    void cert_prepare(const float * row, const float * hr, const std::vector<int32_t> & ids, cert_prep_t & cp) const;
+    void cert_range(float * row, const float * hr, const cert_prep_t & cp, int64_t i0, int64_t i1,
+                    uint64_t & n_sigma, uint64_t & n_forced) const;
+    void cert_count(uint64_t n_sigma, uint64_t n_forced);
     float cert_slack(const float * hr) const; // D: pre = T - D (a hair below margin + sigma * gl2_max * hn)
 
-    // [EXACTHEAD] fused pick (default on, LLAMA_D1_FUSED=0 = the old per-row select + full certificate scan). Each
-    // row is split in n_chunk parts over the pool: (1) one scan per chunk keeps its top N and the certificate's
-    // candidates; the last chunk of a row merges them into the row's ids; (2) the row's dots are split the same way;
-    // the last dot part certifies from the kept ids (full scan if T is below the scan floor). Same rows as the old path.
-    bool fused = true;
+    // [EXACTHEAD] fused pick (LLAMA_D1_FUSED=1; default off until gated). Each row is split in n_chunk parts over the
+    // pool, in three phases: (1) one scan per chunk keeps its top N, the last chunk merges the row's ids; (2) the
+    // row's dots are split the same way, the last part prepares the certificate (T, pre); (3) the certificate scan
+    // runs per chunk, each part reading and writing only its range; the last part counts and marks the row done.
+    // Same rows as the separate path. Jobs run in row order, so the first read can return once its row is done.
+    bool fused = false;
     int64_t fused_min_chunk = 16384;           // ids per chunk at least (tests lower it)
-    std::atomic<uint64_t> n_fused_fallback{0}; // rows whose certificate needed the full scan
     struct fchunk_t { std::vector<llama_d1_cand> heap; std::vector<int32_t> buf; float floor = 0.0f; };
     struct frow_t {
-        float D = 0.0f, floor = 0.0f;
-        std::vector<int32_t> ids, cands;
+        std::vector<int32_t> ids;
+        cert_prep_t cp;
+        std::atomic<uint64_t> n_sigma{0}, n_forced{0};
         std::vector<float>   coarse;           // audit only
         bool audit = false;
-        std::atomic<int> left{0}, dleft{0}, ready{0}, done{0};
+        std::atomic<int> left{0}, dleft{0}, ready{0}, done{0}, cleft{0}, cready{0};
     };
     std::vector<fchunk_t> fch;                 // [rows x n_chunk]
     std::unique_ptr<frow_t[]> frow;            // [rows]
@@ -236,8 +240,8 @@ struct llama_d1_ctx {
     void fused_scan(int64_t k);   // phase 1 job
     void fused_merge(int64_t ri);
     void fused_dots(int64_t k);   // phase 2 job
-    void fused_cert(int64_t ri);
-    void fused_run(int64_t k);    // job k of the row-ordered list (scans, then dot parts, per row)
+    void fused_cert(int64_t k);   // phase 3 job
+    void fused_run(int64_t k);    // job k of the row-ordered list (scans, dot parts, certificate parts, per row)
 
     std::string summary() const;
 

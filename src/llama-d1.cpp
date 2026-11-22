@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -338,6 +339,29 @@ std::shared_ptr<llama_d1_head> llama_d1_head_open(const char * path, const llama
     close(fd);
     if (base == MAP_FAILED) { err = format("cannot mmap %s", path); return nullptr; }
     head->map_base = base;
+    {
+        // [EXACTHEAD] pre-fault the add-on at load (LLAMA_D1_PREFAULT=0 skips): a row the sampler waits on must not
+        // come from disk. LLAMA_D1_MLOCK=1 (opt-in) also pins it.
+        const char * pf = getenv("LLAMA_D1_PREFAULT");
+        if (!(pf && pf[0] == '0')) {
+            const auto t0 = std::chrono::steady_clock::now();
+            madvise(base, head->map_size, MADV_WILLNEED);
+            volatile uint8_t sink = 0;
+            const uint8_t * b = (const uint8_t *) base;
+            for (size_t o = 0; o < head->map_size; o += 4096) { sink ^= b[o]; }
+            (void) sink;
+            LLAMA_LOG_WARN("d1: pre-faulted %s (%.1f MiB) in %.0f ms\n", path, head->map_size / 1048576.0,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        const char * ml = getenv("LLAMA_D1_MLOCK");
+        if (ml && ml[0] == '1') {
+            if (mlock(base, head->map_size) != 0) {
+                LLAMA_LOG_WARN("d1: LLAMA_D1_MLOCK=1: mlock of %s failed (%s); continuing unlocked\n", path, strerror(errno));
+            } else {
+                LLAMA_LOG_WARN("d1: LLAMA_D1_MLOCK=1: %s locked in RAM\n", path);
+            }
+        }
+    }
 #endif
     if (offs + nbytes > head->map_size) {
         err = "sidecar tensor data is outside the file";
@@ -607,7 +631,7 @@ std::string llama_d1_ctx::summary() const {
                       n_cert_rows.load(), n_cert_sigma.load(), n_cert_forced.load(), n_cert_maxrow.load());
     }
     if (fused) {
-        out += format(" fused_fallback=%" PRIu64, n_fused_fallback.load());
+        out += " pick=fused";
     }
     return out;
 }
@@ -780,60 +804,52 @@ float llama_d1_ctx::cert_slack(const float * hr) const {
     return (cert.margin + cert.sigma * head->gl2_max * (float) std::sqrt(hn2)) * 1.0001f;
 }
 
-void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids,
-                           const std::vector<int32_t> * cands, float floor) {
+void llama_d1_ctx::cert_prepare(const float * row, const float * hr, const std::vector<int32_t> & ids, cert_prep_t & cp) const {
     const int64_t G = head->n_group;
-    thread_local std::vector<float>   top;
-    thread_local std::vector<float>   hg;    // ||h_g||^2 / 32
-    thread_local std::vector<uint8_t> cand;  // [n_vocab] 1 = exact already
+    thread_local std::vector<float> top;
     top.resize(ids.size());
     for (size_t j = 0; j < ids.size(); ++j) { top[j] = row[ids[j]]; }
     const size_t k = (size_t) std::max(1, std::min<int>(cert.k, (int) ids.size()));
     std::nth_element(top.begin(), top.begin() + (k - 1), top.end(), std::greater<float>());
-    const float T = top[k - 1];
-
-    hg.resize(G);
+    cp.T = top[k - 1];
+    cp.hg.resize(G);
     double hn2 = 0.0;
     for (int64_t gg = 0; gg < G; ++gg) {
         float s2 = 0.0f;
         for (int q = 0; q < 32; ++q) { s2 += hr[gg * 32 + q] * hr[gg * 32 + q]; }
-        hg[gg] = s2 / 32.0f;
-        hn2 += hg[gg];
+        cp.hg[gg] = s2 / 32.0f;
+        hn2 += cp.hg[gg];
     }
-    const float hn = (float) std::sqrt(hn2);  // s_i <= gl2_rowmax[i] * hn
+    cp.hn = (float) std::sqrt(hn2);  // s_i <= gl2_rowmax[i] * hn
     // a row below pre cannot pass even with the largest group error of the whole head
-    const float pre = T - cert_slack(hr);
+    cp.pre = cp.T - cert_slack(hr);
+    cp.sids.assign(ids.begin(), ids.end());
+    std::sort(cp.sids.begin(), cp.sids.end());
+}
 
-    if (cand.size() < (size_t) n_vocab) { cand.assign(n_vocab, 0); }
-    for (const int32_t id : ids) { cand[id] = 1; }
-
-    uint64_t n_sigma = 0, n_forced = 0;
+// rows in [i0, i1) whose bound reaches T are rescored; writes only row[i0, i1)
+void llama_d1_ctx::cert_range(float * row, const float * hr, const cert_prep_t & cp, int64_t i0, int64_t i1,
+                              uint64_t & n_sigma, uint64_t & n_forced) const {
+    const int64_t G = head->n_group;
+    const float T = cp.T, pre = cp.pre, hn = cp.hn;
     const auto check = [&](int64_t i) {
-        if (cand[i]) { return; }
+        if (std::binary_search(cp.sids.begin(), cp.sids.end(), (int32_t) i)) { return; } // exact already
         const float c = row[i] + cert.margin;
         if (c + cert.sigma * head->gl2_rowmax[i] * hn < T) { return; }
         const float * e = head->gl2 + i * G;
         float s2 = 0.0f;
-        for (int64_t gg = 0; gg < G; ++gg) { s2 += hg[gg] * e[gg] * e[gg]; }
+        for (int64_t gg = 0; gg < G; ++gg) { s2 += cp.hg[gg] * e[gg] * e[gg]; }
         ++n_sigma;
         if (c + cert.sigma * std::sqrt(s2) >= T) {
             row[i] = head->dot(hr, i);
             ++n_forced;
         }
     };
-    int64_t i = 0;
-    if (cands && pre >= floor) {
-        // fused pick: every id with row[i] >= floor (so >= pre) was kept by the chunk scans
-        for (const int32_t id : *cands) {
-            if (row[id] >= pre) { check(id); }
-        }
-        i = n_vocab;
-    } else if (cands) {
-        ++n_fused_fallback;
-    }
+    int64_t i = i0;
 #ifdef LLAMA_D1_AVX2
+    for (; i < i1 && (i & 7); ++i) { if (row[i] >= pre) { check(i); } }
     const __m256 pv = _mm256_set1_ps(pre);
-    for (; i + 8 <= n_vocab; i += 8) {
+    for (; i + 8 <= i1; i += 8) {
         // NaN coarse logits are never selected by the sampler's top-k either
         int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(row + i), pv, _CMP_GE_OQ));
         while (m) {
@@ -843,16 +859,26 @@ void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const
         }
     }
 #endif
-    for (; i < n_vocab; ++i) {
+    for (; i < i1; ++i) {
         if (row[i] >= pre) { check(i); }
     }
-    for (const int32_t id : ids) { cand[id] = 0; }
+}
 
+void llama_d1_ctx::cert_count(uint64_t n_sigma, uint64_t n_forced) {
     ++n_cert_rows;
     n_cert_sigma  += n_sigma;
     n_cert_forced += n_forced;
     uint64_t prev = n_cert_maxrow.load();
     while (n_forced > prev && !n_cert_maxrow.compare_exchange_weak(prev, n_forced)) {}
+}
+
+// [EXACTHEAD] ids are exact in row; rescore every other row whose bound reaches the k-th exact logit (see llama_d1_cert)
+void llama_d1_ctx::certify(float * row, int64_t n_vocab, const float * hr, const std::vector<int32_t> & ids) {
+    thread_local cert_prep_t cp;
+    cert_prepare(row, hr, ids, cp);
+    uint64_t n_sigma = 0, n_forced = 0;
+    cert_range(row, hr, cp, 0, n_vocab, n_sigma, n_forced);
+    cert_count(n_sigma, n_forced);
 }
 
 void llama_d1_ctx::fused_scan(int64_t k) {
@@ -863,7 +889,7 @@ void llama_d1_ctx::fused_scan(int64_t k) {
     const float * row = pool.logits + (*pool.rows)[ri] * nv;
     const auto t0 = std::chrono::steady_clock::now();
     fchunk_t & fc = fch[k];
-    fc.floor = llama_d1_scan_chunk(row, i0, i1, n_top, frow[ri].D, cert.on, fc.heap, fc.buf);
+    llama_d1_scan_chunk(row, i0, i1, n_top, 0.0f, false, fc.heap, fc.buf);
     ns_select += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     // the last chunk of the row merges (acq_rel: sees the other chunks' heaps and bufs)
     if (frow[ri].left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -876,13 +902,9 @@ void llama_d1_ctx::fused_merge(int64_t ri) {
     frow_t & fr = frow[ri];
     thread_local std::vector<d1_cand> all;
     all.clear();
-    fr.cands.clear();
-    fr.floor = -INFINITY;
     for (int c = 0; c < n_chunk; ++c) {
         const fchunk_t & fc = fch[ri * n_chunk + c];
         all.insert(all.end(), fc.heap.begin(), fc.heap.end());
-        fr.cands.insert(fr.cands.end(), fc.buf.begin(), fc.buf.end());
-        fr.floor = std::max(fr.floor, fc.floor);
     }
     // the same set as llama_d1_select_top: the global order (value desc, then id asc), first n_top
     if ((int64_t) all.size() > n_top) {
@@ -919,31 +941,64 @@ void llama_d1_ctx::fused_dots(int64_t k) {
     }
     ns_dot += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     if (fr.dleft.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        fused_cert(ri);
+        if (cert.on && !fr.ids.empty()) {
+            const auto t1 = std::chrono::steady_clock::now();
+            cert_prepare(row, hr, fr.ids, fr.cp);
+            fr.n_sigma = 0;
+            fr.n_forced = 0;
+            ns_dot += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count();
+            fr.cready.store(1, std::memory_order_release);
+        } else {
+            fr.cready.store(2, std::memory_order_release); // no certificate: cert parts only count down
+        }
     }
 }
 
-void llama_d1_ctx::fused_cert(int64_t ri) {
-    const auto t0 = std::chrono::steady_clock::now();
+void llama_d1_ctx::fused_cert(int64_t k) {
+    const int64_t ri = k / n_chunk, c = k % n_chunk;
     frow_t & fr = frow[ri];
-    float * row = pool.logits + (*pool.rows)[ri] * pool.n_vocab;
+    // the row's dot parts were all taken before any certificate part (job order), so this wait is short
+    int st;
+    while (!(st = fr.cready.load(std::memory_order_acquire))) {
+#ifdef LLAMA_D1_AVX2
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t nv = pool.n_vocab;
+    float * row = pool.logits + (*pool.rows)[ri] * nv;
     const float * hr = h_row((*pool.rows)[ri]);
-    if (cert.on && !fr.ids.empty()) {
-        certify(row, pool.n_vocab, hr, fr.ids, &fr.cands, fr.floor);
+    if (st == 1) {
+        // the same chunk bounds as the scans: each part reads and writes only its own range
+        const int64_t step = ((nv + n_chunk - 1) / n_chunk + 7) & ~(int64_t) 7;
+        const int64_t i0 = std::min(nv, c * step), i1 = std::min(nv, i0 + step);
+        uint64_t ns = 0, nf = 0;
+        cert_range(row, hr, fr.cp, i0, i1, ns, nf);
+        fr.n_sigma  += ns;
+        fr.n_forced += nf;
     }
     ns_dot += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-    if (fr.audit) {
-        audit_row(row, fr.coarse.data(), hr, pool.n_vocab);
+    if (fr.cleft.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (st == 1) {
+            cert_count(fr.n_sigma.load(), fr.n_forced.load());
+        }
+        if (fr.audit) {
+            audit_row(row, fr.coarse.data(), hr, nv);
+        }
+        fr.done.store(1, std::memory_order_release);
     }
-    fr.done.store(1, std::memory_order_release);
 }
 
 void llama_d1_ctx::fused_run(int64_t k) {
-    const int64_t ri = k / (2 * n_chunk), p = k % (2 * n_chunk);
+    const int64_t ri = k / (3 * n_chunk), p = k % (3 * n_chunk);
     if (p < n_chunk) {
         fused_scan(ri * n_chunk + p);
-    } else {
+    } else if (p < 2 * n_chunk) {
         fused_dots(ri * n_chunk + p - n_chunk);
+    } else {
+        fused_cert(ri * n_chunk + p - 2 * n_chunk);
     }
 }
 
@@ -965,7 +1020,7 @@ void llama_d1_ctx::run_job() {
     thread_local std::vector<int32_t> ids;
     if (fused) {
         // jobs in row order, each row's scans before its dot parts: a dot part only waits on scans already taken
-        const int64_t n_jobs = (int64_t) pool.rows->size() * 2 * n_chunk;
+        const int64_t n_jobs = (int64_t) pool.rows->size() * 3 * n_chunk;
         for (int64_t k; (k = pool.next.fetch_add(1)) < n_jobs; ) {
             fused_run(k);
         }
@@ -1020,9 +1075,10 @@ void llama_d1_ctx::rescore_rows(float * logits, int64_t n_vocab, const std::vect
         if (frow_n < (size_t) nr) { frow.reset(new frow_t[nr]); frow_n = nr; }
         for (int64_t ri = 0; ri < nr; ++ri) {
             frow_t & fr = frow[ri];
-            fr.D = cert.on ? cert_slack(h_row(rows[ri])) : 0.0f;
             fr.left.store(n_chunk);
             fr.dleft.store(n_chunk);
+            fr.cleft.store(n_chunk);
+            fr.cready.store(0);
             fr.ready.store(0);
             fr.done.store(0);
         }
@@ -1053,8 +1109,8 @@ void llama_d1_ctx::rescore_rows(float * logits, int64_t n_vocab, const std::vect
             // [EXACTHEAD] async rows: return once the row being read is exact; the pool finishes the later rows
             // while the caller samples this one. Every other entry (and llama_context::synchronize) drains first.
             async_pending = true;
-            const int64_t end = (need_ri + 1) * 2 * n_chunk;
-            for (int64_t k; pool.next.load() < end && (k = pool.next.fetch_add(1)) < (int64_t) rows.size() * 2 * n_chunk; ) {
+            const int64_t end = (need_ri + 1) * 3 * n_chunk;
+            for (int64_t k; pool.next.load() < end && (k = pool.next.fetch_add(1)) < (int64_t) rows.size() * 3 * n_chunk; ) {
                 fused_run(k);
             }
             while (!frow[need_ri].done.load(std::memory_order_acquire)) {

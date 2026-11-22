@@ -265,6 +265,7 @@ static void test_ctx(const std::string & dir) {
     {
         std::vector<float> Ls = L0, Lt = L0;
         llama_d1_ctx cs(head, NTOP, 64, 1), ct(head, NTOP, 64, 4);
+        ct.fused = true;
         for (auto * c : { &cs, &ct }) {
             c->reset(R);
             std::memcpy(c->h_row(0), H0.data(), sizeof(float) * R * E);
@@ -493,6 +494,7 @@ static void test_cert(const std::string & dir) {
                 std::vector<float> Lf = Ls, Lo = Ls;
                 llama_d1_ctx cf(head, NTOP, eager, thr, c0), co(head, NTOP, eager, thr, c0);
                 cf.fused_min_chunk = 37;
+                cf.fused = true;
                 co.fused = false;
                 for (auto * c : { &cf, &co }) {
                     c->reset(R);
@@ -511,9 +513,6 @@ static void test_cert(const std::string & dir) {
                 CHECK(cf.n_cert_forced == co.n_cert_forced, "fused forced %llu == separate %llu",
                       (unsigned long long) cf.n_cert_forced.load(), (unsigned long long) co.n_cert_forced.load());
                 if (on) {
-                    // shift 0: a few noisy rows may fall back too (N = 8 here); shift 10: every row must
-                    CHECK(shift == 0.0f ? cf.n_fused_fallback < (uint64_t) R / 2 : cf.n_fused_fallback == (uint64_t) R,
-                          "fused fallback %llu (shift %g)", (unsigned long long) cf.n_fused_fallback.load(), shift);
                     std::printf("fused shift %g threads %d chunks %d: %s\n", shift, thr, cf.n_chunk, cf.summary().c_str());
                 }
               }
