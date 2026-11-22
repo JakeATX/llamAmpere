@@ -11,7 +11,8 @@
 // GGML_CUDA_INK_MASK=0 turns it off.
 
 // Returns the offset n of the chain's last node (the F16 CPY) from node i, or 0 when the chain does not match.
-// The caller checks the memory ranges of nodes i..i+n and then calls ggml_cuda_ink_relmask_launch.
+// The match checks the output against the table, rel indices and mask; when they alias, the launch stages the result
+// in a dead chain intermediate or a pool buffer and copies it to the output.
 int ggml_cuda_ink_relmask_match(const ggml_cgraph * cgraph, int i);
 
 void ggml_cuda_ink_relmask_launch(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, int n);

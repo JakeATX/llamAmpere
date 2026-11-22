@@ -34,7 +34,7 @@ struct ink_relmask_chain {
     int mcast  = -1;  // CPY F16->F32 of the mask, or -1
     int add    = 0;   // ADD
     int out    = 0;   // CPY F32->F16 (last node)
-    int stage  = -1;  // -1: write the output directly; else a chain node (GET_ROWS, CONT or ADD) whose buffer holds the
+    int stage  = -1;  // -1: write the output directly; -2: stage in a CUDA pool buffer; else a chain node (GET_ROWS, CONT or ADD) whose buffer holds the
                       // result first, copied to the output after (the output reuses the table, rel or mask memory)
 };
 
@@ -77,7 +77,8 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
     }
     const ggml_tensor * P = cur;
     const ggml_tensor * C = cgraph->nodes[j];
-    if (C->op != GGML_OP_CONT || C->src[0] != P || C->type != GGML_TYPE_F32 || !ggml_is_contiguous(C)) {
+    if (C->op != GGML_OP_CONT || C->src[0] != P || C->type != GGML_TYPE_F32 || !ggml_is_contiguous(C) ||
+            !ggml_are_same_shape(C, P)) {
         INK_FAIL(5);
     }
     ch.cont = j - i;
@@ -161,7 +162,7 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
             }
         }
         if (ch.stage < 0) {
-            INK_FAIL(20);
+            ch.stage = -2; // no free intermediate: a pool buffer of the output's size stages it
         }
     }
 
@@ -281,13 +282,19 @@ void ggml_cuda_ink_relmask_launch(ggml_backend_cuda_context & ctx, const ggml_cg
 
     const int64_t H = G->ne[0], n_kv = G->ne[1], T = G->ne[2], Ts = P->ne[1];
     cudaStream_t stream = ctx.stream();
-    half * dst = (half *) (ch.stage >= 0 ? cgraph->nodes[i + ch.stage]->data : O->data);
+    ggml_cuda_pool_alloc<half> pool_stage(ctx.pool());
+    half * dst = (half *) O->data;
+    if (ch.stage >= 0) {
+        dst = (half *) cgraph->nodes[i + ch.stage]->data;
+    } else if (ch.stage == -2) {
+        dst = pool_stage.alloc(ggml_nelements(O));
+    }
     if (Mr->type == GGML_TYPE_F16) {
         ink_relmask_launch_t<half>(A, I, Mr, M, dst, H, n_kv, T, Ts, stream);
     } else {
         ink_relmask_launch_t<float>(A, I, Mr, M, dst, H, n_kv, T, Ts, stream);
     }
-    if (ch.stage >= 0) {
+    if (ch.stage != -1) {
         CUDA_CHECK(cudaMemcpyAsync(O->data, dst, ggml_nbytes(O), cudaMemcpyDeviceToDevice, stream));
     }
     // GGML_CUDA_INK_MASK_LOG=1: one line per new (n_kv, T) shape (diagnostic: shows the prompt ubatch size)
@@ -297,7 +304,7 @@ void ggml_cuda_ink_relmask_launch(ggml_backend_cuda_context & ctx, const ggml_cg
         static int n_logged = 0;
         if ((n_kv != last_kv || T != last_t) && n_logged < 256) {
             last_kv = n_kv; last_t = T; ++n_logged;
-            GGML_LOG_WARN("[INKMASK] shape n_kv %lld T %lld%s\n", (long long) n_kv, (long long) T, ch.stage >= 0 ? " staged" : "");
+            GGML_LOG_WARN("[INKMASK] shape n_kv %lld T %lld%s\n", (long long) n_kv, (long long) T, ch.stage >= 0 ? " staged" : ch.stage == -2 ? " pool-staged" : "");
         }
     }
     if (g_ink_relmask_count.n.fetch_add(1) == 0) {
