@@ -108,12 +108,17 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_case_impl(ggml_backend_cuda_conte
 #endif // !defined(GGML_USE_MUSA)
     }
 
+    // [ROUNDFIX] dead-tile skip: flash_attn_mask_to_live_tiles scans mask head 0 only, so a per-head mask
+    // (mask->ne[2] > 1, e.g. the Inkling rel bias) would drop tiles that are live for other heads; keep every tile then.
+    const ggml_tensor * mask = dst->src[3];
+    const bool skip_dead = !early_v && ggml_cuda_fattn_skip_dead_enabled() && (mask == nullptr || mask->ne[2] == 1);
+
     // need_f16_K = need_f16_V = false: launch_fattn does NOT convert turbo bytes to f16;
     // the kernel receives raw quantized KV + the true byte pitch. stream_k = true.
     launch_fattn<DV, ncols1, ncols2, compact_q5g6>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/true, /*use_sparse=*/false, warp_size_host,
-         nullptr, nullptr, 0, false, 0, /*skip_dead_tiles=*/!early_v && ggml_cuda_fattn_skip_dead_enabled());
+         nullptr, nullptr, 0, false, 0, /*skip_dead_tiles=*/skip_dead);
 }
 
 
