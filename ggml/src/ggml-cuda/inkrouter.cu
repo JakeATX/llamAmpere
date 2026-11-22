@@ -18,11 +18,14 @@ static __device__ unsigned int g_inkrouter_done[INKROUTER_MAX_SLOTS];
 // false, false>'s block `row` (mmvf.cu: one dst column, no ids, no fusion, CUDA nv_bfloat162 branch), line for line.
 template <int n_experts, bool has_bias>
 static __global__ void __launch_bounds__(INKROUTER_MMVF_BLOCK)
-k_inkrouter(const nv_bfloat16 * __restrict__ w, const float * __restrict__ y, float * logits, float * weights, int32_t * ids,
+k_inkrouter(const nv_bfloat16 * GGML_CUDA_RESTRICT w, const float * GGML_CUDA_RESTRICT y, float * logits, float * weights, int32_t * ids,
             const float * bias, const int ncols2, const int64_t stride_row, const int n_expert_used, const float clamp_val,
             const float scale_val, const topk_moe_config config, const int slot) {
     constexpr int block_size = INKROUTER_MMVF_BLOCK;
     constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    NO_DEVICE_CODE; // NVIDIA only (ggml_cuda_inkrouter_supported)
+#else
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
@@ -45,7 +48,7 @@ k_inkrouter(const nv_bfloat16 * __restrict__ w, const float * __restrict__ y, fl
         ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
     }
 
-    ggml_cuda_pdl_lc();
+    // no ggml_cuda_pdl_lc() here: the dependent kernel must wait for the top-k tail (topk_moe_row triggers it)
 
     sumf = warp_reduce_sum<warp_size>(sumf);
     buf_iw[tid/warp_size] = sumf;
@@ -89,6 +92,7 @@ k_inkrouter(const nv_bfloat16 * __restrict__ w, const float * __restrict__ y, fl
 
     // one warp: its shuffles order every lane's logit load before any ids / weights store, which may alias the logits
     topk_moe_row<n_experts, has_bias>(wt, weights, ids, bias, n_expert_used, clamp_val, scale_val, config);
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 // mmvf.cu launch_mul_mat_vec_f_cuda: the block size it picks for ncols
@@ -113,6 +117,10 @@ bool ggml_cuda_inkrouter_supported(const ggml_tensor * w, const ggml_tensor * y,
                                    const int warp_size) {
     const int64_t ncols    = w->ne[0];
     const int64_t n_expert = w->ne[1];
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(w, y, n_expert_used, cc, warp_size);
+    return false;
+#endif
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || warp_size != WARP_SIZE) {
         return false;
     }
@@ -172,6 +180,9 @@ bool ggml_cuda_op_inkrouter(ggml_backend_cuda_context &     ctx,
     GGML_ASSERT(logits->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(!args.delayed_softmax && args.n_groups == 0);
 
+    if (ctx.curr_stream_no != 0) {
+        return false; // one completion counter per context: main stream only
+    }
     const int slot = inkrouter_slot(&ctx);
     if (slot < 0) {
         return false;
