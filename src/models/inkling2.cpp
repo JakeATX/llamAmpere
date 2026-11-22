@@ -365,7 +365,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // fork (INKGLUE): at decode the Q, K and V gates, then the three input norms, are put back to back so the CUDA backend
     // runs each set in one launch (same values). LLAMA_INKLING2_MM_ORDER=0 = old node order
     static const bool in_order = [] { const char * e = getenv("LLAMA_INKLING2_MM_ORDER"); return !e || atoi(e) != 0; }();
-    const bool group_inputs = in_order && n_tokens == 1;
+    // [INKGLUE VORDER] the same decode order at verify widths (2..8 tokens), so the per-visit fusions see the same runs
+    // there; LLAMA_INKLING2_VERIFY_ORDER=0 = decode only
+    static const bool verify_order = [] { const char * e = getenv("LLAMA_INKLING2_VERIFY_ORDER"); return !e || atoi(e) != 0; }();
+    const bool small_batch = n_tokens == 1 || (verify_order && n_tokens <= 8);
+    const bool group_inputs = in_order && small_batch;
 
     if (messages) {
         // the messages make the Q, K and V inputs of a SWA layer differ
@@ -410,7 +414,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * kp_mm = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
         ggml_tensor * v_mm  = build_lora_mm(layer.wv, inputs[2]);
         ggml_tensor * vp_mm = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
-        if (mm_order && n_tokens == 1) {
+        if (mm_order && small_batch) {
             for (ggml_tensor * t : { q_mm, r_mm, s_mm, g_mm, k_mm, kp_mm, v_mm, vp_mm }) {
                 if (t) {
                     ggml_build_forward_expand(gf, t);
