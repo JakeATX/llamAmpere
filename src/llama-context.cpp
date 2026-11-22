@@ -5976,12 +5976,14 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     } else if (alone && n_tokens > 3072) {
         rows = n_tokens < 16384 ? std::min(2048u, n_tokens) : std::min(cparams.n_ubatch, n_tokens);
     } else if (alone && dynamic_ubatch && rows == 512 && n_tokens > 512 && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE &&
-            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && swa_full_rows_enabled()) {
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !b1_cache_device_active && swa_full_rows_enabled()) {
         // fork INKPREFILL: the SWA cache is sized n_swa + n_ubatch, so 512-row pieces of a server batch still attend
         // over all n_swa + n_ubatch cells (Inkling 2 Mini at ub 2048: 3,072 cells, not 1,536) and pay that mask and
         // attention work twice. Run the batch at its own size up to n_ubatch; the dynamic ceiling below still caps it.
         // 32K cold prefill, 3090, fused mask: 1,763 tok/s at 512 rows vs 2,226 at 2,048. LLAMA_LADDER_SWA_ROWS=0 off.
-        rows = std::min(n_tokens, cparams.n_ubatch);
+        // Rounded up to 512 and never below the current reserve, so a batch tail or a follow-up does not re-reserve;
+        // not while the expert cache is live (a bigger scratch would borrow from it: small cards with offload).
+        rows = std::min(cparams.n_ubatch, std::max(GGML_PAD(n_tokens, 512u), sched_reserve_tokens));
     }
     rows = std::min(rows, cparams.n_ubatch);
     // fork: packed prefill grows single-layer graphs, not a full-model MoE graph.
