@@ -39,7 +39,19 @@ struct inkattn_params {
     float scale;
     float  * Op;         // [S][Hkv][W][16][D]
     float2 * Mp;         // [S][Hkv][W][16]   (max, sum)
+    // live tiles (inkattn-live.cu, nullptr = every tile): ids live[(seq*Hkv + kvh)*NTmax + i], i < nlive[seq*Hkv + kvh];
+    // the runs of a (seq, KV head) are then min(W, ceil(nlive/tpw_live)) (inkattn_runs, also used by the combine)
+    const int * live; const int * nlive; int NTmax; int tpw_live;
 };
+
+// runs that hold tiles for one (seq, KV head): W, or with live tiles min(W, ceil(n_live / tpw)) (>= 1)
+static __device__ __forceinline__ int inkattn_runs(const int W, const int * nlive, const int i, const int tpw) {
+    if (nlive == nullptr) {
+        return W;
+    }
+    const int nl = nlive[i];
+    return max(1, min(W, (nl + tpw - 1)/tpw));
+}
 
 static __device__ __forceinline__ void inkattn_mma(float (&c)[4], const uint32_t a0, const uint32_t a1, const uint32_t a2,
         const uint32_t a3, const uint32_t b0, const uint32_t b1) {
@@ -89,11 +101,12 @@ static __device__ __forceinline__ void inkattn_decode_body(const inkattn_params 
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const int wi   = blockIdx.x*INKATTN_WARPS + warp; // run index within (seq, kv head)
-    if (wi >= p.W) {
-        return;
-    }
     const int kvh = blockIdx.y;
     const int seq = blockIdx.z;
+    const int Wd  = inkattn_runs(p.W, p.nlive, seq*p.Hkv + kvh, p.tpw_live);
+    if (wi >= Wd) {
+        return;
+    }
     const int c   = lane % 4;
     const int ln  = lane / 4;
     const int R   = p.g*p.T;
@@ -148,9 +161,10 @@ static __device__ __forceinline__ void inkattn_decode_body(const inkattn_params 
     const char * Kh = p.K + seq*p.nbk3 + kvh*p.nbk2;
     const char * Vh = p.V + seq*p.nbv3 + kvh*p.nbv2;
 
-    const int NT = (p.n_kv + 15) / 16;
-    const int t0 = (int) ((int64_t) wi*NT / p.W);
-    const int t1 = (int) ((int64_t) (wi + 1)*NT / p.W);
+    const int NT = p.live ? p.nlive[seq*p.Hkv + kvh] : (p.n_kv + 15) / 16;
+    const int * lt = p.live ? p.live + (int64_t) (seq*p.Hkv + kvh)*p.NTmax : nullptr;
+    const int t0 = (int) ((int64_t) wi*NT / Wd);
+    const int t1 = (int) ((int64_t) (wi + 1)*NT / Wd);
 
     float O[16][4];
 #pragma unroll
@@ -160,7 +174,8 @@ static __device__ __forceinline__ void inkattn_decode_body(const inkattn_params 
     float mx[2] = {-INFINITY, -INFINITY};
     float sm[2] = {0.0f, 0.0f};
 
-    for (int t = t0; t < t1; ++t) {
+    for (int it = t0; it < t1; ++it) {
+        const int t  = lt ? lt[it] : it;
         const int k0 = 16*t;
         const bool full = k0 + 16 <= p.n_kv;
 
@@ -458,7 +473,8 @@ inkattn_decode_comb(const inkattn_params p, const inkattn_comb_params cp) {
 // one block per (q head, token, sequence), D threads
 static __global__ void inkattn_combine(const float * __restrict__ Op, const float2 * __restrict__ Mp, const float * __restrict__ sinks,
         char * __restrict__ dst, const int64_t nbd1, const int64_t nbd2, const int64_t nbd3, float * __restrict__ lse,
-        const float * __restrict__ gate, const int64_t gate_t, const int W, const int g, const int Hkv) {
+        const float * __restrict__ gate, const int64_t gate_t, const int W, const int g, const int Hkv,
+        const int * __restrict__ nlive, const int tpw_live) {
     constexpr int D = INKATTN_D;
     const int h   = blockIdx.x;
     const int j   = blockIdx.y;
@@ -470,15 +486,16 @@ static __global__ void inkattn_combine(const float * __restrict__ Op, const floa
     const int r   = j*g + h % g;
 
     const int64_t base = (int64_t) (seq*Hkv + kvh)*W*16 + r;
+    const int     Wd   = inkattn_runs(W, nlive, seq*Hkv + kvh, tpw_live);
 
     float M = -INFINITY;
-    for (int w = 0; w < W; ++w) {
+    for (int w = 0; w < Wd; ++w) {
         M = fmaxf(M, Mp[base + (int64_t) w*16].x);
     }
     float L = 0.0f;
     float acc = 0.0f;
     if (M != -INFINITY) {
-        for (int w = 0; w < W; ++w) {
+        for (int w = 0; w < Wd; ++w) {
             const float2 ms = Mp[base + (int64_t) w*16];
             if (ms.x == -INFINITY) {
                 continue;
@@ -693,6 +710,15 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool_alloc<float>  Op(ctx.pool(), (size_t) S*Hkv*W*16*INKATTN_D);
     ggml_cuda_pool_alloc<float2> Mp(ctx.pool(), (size_t) S*Hkv*W*16);
 
+    // live tiles: walk only the 16-key tiles with a visible mask entry (exact skip, see inkattn-live.cu). On by default
+    // up to GGML_CUDA_INKATTN_LIVE_MAX_KV cells (16384: the SWA / near windows, whose cache is n_swa + n_ubatch cells of
+    // which ~n_swa + T are visible); GGML_CUDA_INKATTN_LIVE=0 = kill switch. GGML_CUDA_INKATTN_LIVE_TPW = tiles per run.
+    static const int live_on  = inkattn_env_int("GGML_CUDA_INKATTN_LIVE", 1);
+    static const int live_max = inkattn_env_int("GGML_CUDA_INKATTN_LIVE_MAX_KV", 16384);
+    static const int live_tpw = std::max(1, inkattn_env_int("GGML_CUDA_INKATTN_LIVE_TPW", 2));
+    const bool use_live = live_on != 0 && n_kv <= live_max && NT > 1;
+    ggml_cuda_pool_alloc<int> live(ctx.pool(), use_live ? (size_t) S*Hkv*NT + (size_t) S*Hkv : 1);
+
     inkattn_params p;
     p.Q = (const char *) Q->data; p.nbq1 = Q->nb[1]; p.nbq2 = Q->nb[2]; p.nbq3 = Q->nb[3];
     p.K = (const char *) K->data; p.nbk1 = K->nb[1]; p.nbk2 = K->nb[2]; p.nbk3 = K->nb[3];
@@ -702,6 +728,7 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     p.mask_al4 = inkattn_aligned(mask->data, mask->nb[1], mask->nb[2], mask->nb[3], 4);
     p.n_kv = n_kv; p.T = T; p.g = g; p.H = H; p.Hkv = Hkv; p.W = W; p.scale = scale;
     p.Op = Op.get(); p.Mp = Mp.get();
+    p.live = nullptr; p.nlive = nullptr; p.NTmax = NT; p.tpw_live = live_tpw;
     p.tab = nullptr; p.tab_h1 = 0; p.tab_t = 0; p.rp = nullptr; p.rp_t = 0;
     const ggml_tensor * gate = nullptr;
     if (inkrel) {
@@ -713,6 +740,13 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
     cudaStream_t stream = ctx.stream();
+    if (use_live) {
+        int * lv = live.get();
+        ggml_cuda_inkattn_live((const char *) mask->data, mask->nb[1], mask->nb[2], mask->nb[3], (int) mask->ne[2], (int) mask->ne[3],
+            n_kv, T, g, Hkv, S, inkattn_aligned(mask->data, mask->nb[1], mask->nb[2], mask->nb[3], 16), NT, lv, lv + (size_t) S*Hkv*NT,
+            stream);
+        p.live = lv; p.nlive = lv + (size_t) S*Hkv*NT;
+    }
     const dim3 grid((W + INKATTN_WARPS - 1)/INKATTN_WARPS, Hkv, S);
     const bool q8 = K->type == GGML_TYPE_Q8_0;
 
@@ -759,7 +793,7 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     inkattn_combine<<<dim3(H, T, S), INKATTN_D, 0, stream>>>(Op.get(), Mp.get(), snk ? (const float *) snk->data : nullptr,
         (char *) dst->data, dst->nb[1], dst->nb[2], dst->nb[3], lse ? (float *) lse->data : nullptr,
-        gate ? (const float *) gate->data : nullptr, gate ? (int64_t) (gate->nb[1]/sizeof(float)) : 0, W, g, Hkv);
+        gate ? (const float *) gate->data : nullptr, gate ? (int64_t) (gate->nb[1]/sizeof(float)) : 0, W, g, Hkv, p.nlive, p.tpw_live);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
