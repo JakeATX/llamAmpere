@@ -56,8 +56,11 @@ static __device__ __forceinline__ int32_t ink_rel_bias_row(const ink_rel_bias & 
         return __ldg(b.rel + c + t*b.r_t);
     }
     const int32_t kp = __ldg(b.kpos + c);
-    const int32_t d  = __ldg(b.qpos + t) - kp;
-    return kp >= 0 && d >= 0 && d < b.extent ? d : b.extent;
+    if (kp < 0) {
+        return b.extent; // empty cell
+    }
+    const int32_t d = __ldg(b.qpos + t) - kp;
+    return d >= 0 && d < b.extent ? d : b.extent;
 }
 
 static __device__ __forceinline__ float ink_rel_bias_at(const ink_rel_bias & b, const int32_t r, const int h, const int64_t t) {

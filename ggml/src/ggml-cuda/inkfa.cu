@@ -82,7 +82,7 @@ static __device__ __forceinline__ void fa_ldsm4_t(uint32_t & r0, uint32_t & r1, 
 static __device__ __forceinline__ void fa_cp16(half * dst, const void * src, const bool ok) {
 #ifdef AMPERE_MMA_AVAILABLE
     const unsigned a = (unsigned) __cvta_generic_to_shared(dst);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(a), "l"(src), "r"(ok ? 16 : 0));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(a), "l"(src), "r"(ok ? 16 : 0) : "memory");
 #else
     GGML_UNUSED_VARS(dst, src, ok);
     NO_DEVICE_CODE;
@@ -91,14 +91,14 @@ static __device__ __forceinline__ void fa_cp16(half * dst, const void * src, con
 
 static __device__ __forceinline__ void fa_commit() {
 #ifdef AMPERE_MMA_AVAILABLE
-    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.commit_group;" ::: "memory");
 #endif // AMPERE_MMA_AVAILABLE
 }
 
 template <int N>
 static __device__ __forceinline__ void fa_wait() {
 #ifdef AMPERE_MMA_AVAILABLE
-    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+    asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
 #endif // AMPERE_MMA_AVAILABLE
 }
 
@@ -395,11 +395,11 @@ static bool fa_aligned_t(const ggml_tensor * t, const int64_t n) {
 }
 
 // shape and type checks (no data pointers: also used while planning the graph)
-static bool inkfa_check(const int cc, const ggml_tensor * dst) {
+static bool inkfa_check(const int cc, const size_t smpbo, const ggml_tensor * dst) {
     if (!ggml_cuda_inkfa_enabled() || !ggml_flash_attn_ext_is_inkrel(dst)) {
         return false;
     }
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc) || smpbo < FA_SMEM) {
         return false;
     }
     const ggml_tensor * Q    = dst->src[0];
@@ -430,7 +430,7 @@ static bool inkfa_check(const int cc, const ggml_tensor * dst) {
     }
     const int64_t T = Q->ne[1], H = Q->ne[2], Hkv = K->ne[2], n_kv = K->ne[1];
     if (Q->ne[0] != FA_D || K->ne[0] != FA_D || V->ne[0] != FA_D || V->ne[1] != n_kv || V->ne[2] != Hkv || n_kv < 1 ||
-            Hkv < 1 || H % Hkv != 0 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || T > INT32_MAX/2 || n_kv > INT32_MAX/2) {
+            Hkv < 1 || H % Hkv != 0 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || (T + 63)/64 > 65535 || n_kv > INT32_MAX/2) {
         return false;
     }
     if ((H/Hkv)*T <= 16) {
@@ -445,7 +445,8 @@ static bool inkfa_check(const int cc, const ggml_tensor * dst) {
             dst->nb[0] != sizeof(float) || dst->ne[0] != FA_D || dst->ne[1] != H || dst->ne[2] != T || !fa_aligned_t(dst, 8)) {
         return false;
     }
-    if (tab->type != GGML_TYPE_F32 || !ggml_is_contiguous(tab) || tab->ne[0] != H || tab->ne[2] != T || tab->ne[3] != 1 ||
+    if (tab->type != GGML_TYPE_F32 || !ggml_is_contiguous(tab) || tab->ne[0] != H || tab->ne[1] < 1 || tab->ne[1] > INT32_MAX ||
+            tab->ne[2] != T || tab->ne[3] != 1 ||
             rp->type != GGML_TYPE_I32 || rp->nb[0] != sizeof(int32_t) || rp->nb[1] % sizeof(int32_t) != 0 ||
             rp->ne[0] != n_kv || rp->ne[1] != T || rp->ne[2] != 1 || rp->ne[3] != 1 || H > 256) {
         return false; // (the limits of ink_rel_bias_make, so that try() takes every node this accepts)
@@ -490,11 +491,11 @@ bool ggml_cuda_inkfa_enabled() {
 }
 
 bool ggml_cuda_inkfa_supported(int device, const ggml_tensor * dst) {
-    return inkfa_check(ggml_cuda_info().devices[device].cc, dst);
+    return inkfa_check(ggml_cuda_info().devices[device].cc, ggml_cuda_info().devices[device].smpbo, dst);
 }
 
 bool ggml_cuda_inkfa_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (!inkfa_check(ggml_cuda_info().devices[ctx.device].cc, dst)) {
+    if (!inkfa_check(ggml_cuda_info().devices[ctx.device].cc, ggml_cuda_info().devices[ctx.device].smpbo, dst)) {
         return false;
     }
     const ggml_tensor * Q    = dst->src[0];
