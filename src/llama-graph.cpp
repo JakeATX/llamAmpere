@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "ggml-inkrel.h"
 #include "llama-lsa.h"
 #include "../ggml/src/ggml-lsa-recall.h"
 #include "llama-lsa-gather.h"
@@ -9242,7 +9243,39 @@ ggml_tensor * llm_graph_context::build_attn_rel(
         ggml_tensor * table,
         ggml_tensor * sinks,
               float   kq_scale,
-                int   il) const {
+                int   il,
+        ggml_tensor * gate) const {
+    bool gated = false;
+    ggml_tensor * cur = build_attn_rel_base(inp, q_cur, k_cur, v_cur, table, sinks, kq_scale, il, gate, gated);
+    if (gate && !gated) {
+        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+    }
+    return cur;
+}
+
+// INKATTN (ggml-inkrel.h): the relative bias table, rel_pos and the output gate taken inside one FA node at decode-sized
+// ubatches. Off with LLAMA_INKATTN_REL=0 or GGML_CUDA_INKATTN=0 (the dense per-head mask path then).
+static bool llama_inkattn_rel_on() {
+    static const bool on = [] {
+        const char * a = getenv("LLAMA_INKATTN_REL");
+        const char * b = getenv("GGML_CUDA_INKATTN");
+        return !(a && *a && atoi(a) == 0) && !(b && *b && atoi(b) == 0);
+    }();
+    return on;
+}
+
+ggml_tensor * llm_graph_context::build_attn_rel_base(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * sinks,
+              float   kq_scale,
+                int   il,
+        ggml_tensor * gate,
+               bool & gated) const {
+    gated = false;
     const bool is_swa = hparams.is_swa(il);
     auto * inp_attn = inp->get_attn();
     const int64_t n_head = table->ne[0];
@@ -9265,6 +9298,49 @@ ggml_tensor * llm_graph_context::build_attn_rel(
         const ggml_tensor * kst = kv->view_src ? kv->view_src : kv;
         if (kst->buffer) {
             llama_inklsa_invalidate(&kst, 1);
+        }
+    }
+
+    // INKATTN: decode-sized ubatches (q heads per KV head x tokens <= 16) on a plain F16 cache: one FA node with the
+    // bias table + rel_pos (+ the output gate) inside, no [n_kv, T, n_head] mask; same f16 bias values as the dense path
+    // (not under -sm tensor: the meta backend splits heads and does not split the table / gate)
+    if (kc == nullptr && llama_inkattn_rel_on() && cparams.flash_attn && !cparams.training && cparams.kv_stream_arena_mib == 0 &&
+            model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+        const auto * mctx_l = is_swa ? inp_attn->mctx->get_swa() : inp_attn->mctx->get_base();
+        const auto & am     = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
+        ggml_tensor * raw     = am.raw;
+        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+        ggml_tensor * kv = mctx_l->get_k(ctx0, il);
+        ggml_tensor * vv = mctx_l->get_v(ctx0, il);
+        const int64_t n_head_kv = kv->ne[1];
+        const int64_t n_tok     = q_cur->ne[2];
+        const bool rot = is_swa ? (inp_attn->self_k_rot_swa[il] || inp_attn->self_v_rot_swa[il]) :
+                                  (inp_attn->self_k_rot[il] || inp_attn->self_v_rot[il]);
+        if (am.rows == nullptr && raw->type == GGML_TYPE_F16 && raw->ne[2] == 1 && raw->ne[3] == 1 &&
+                kv->type == GGML_TYPE_F16 && vv->type == GGML_TYPE_F16 && kv->ne[3] == 1 && vv->nb[1] < vv->nb[2] &&
+                kv->ne[0] == 128 && vv->ne[0] == 128 && q_cur->ne[0] == 128 && n_head % n_head_kv == 0 &&
+                (n_head/n_head_kv)*n_tok <= 16 && rel_pos->ne[0] == kv->ne[2] && rel_pos->ne[1] == n_tok &&
+                !rot && !mctx_l->get_k_scale(il) && !mctx_l->get_v_scale(il) &&
+                hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+                sinks && sinks->type == GGML_TYPE_F32 && (!gate || gate->type == GGML_TYPE_F32)) {
+            ggml_build_forward_expand(gf, q_cur);
+            ggml_build_forward_expand(gf, k_cur);
+            ggml_build_forward_expand(gf, v_cur);
+            ggml_build_forward_expand(gf, mctx_l->cpy_k(ctx0, k_cur, is_swa ? inp_attn->get_k_idxs_swa() : inp_attn->get_k_idxs(), il));
+            ggml_build_forward_expand(gf, mctx_l->cpy_v(ctx0, v_cur, is_swa ? inp_attn->get_v_idxs_swa() : inp_attn->get_v_idxs(), il));
+            ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+            ggml_tensor * k = ggml_permute(ctx0, mctx_l->get_k(ctx0, il), 0, 2, 1, 3);
+            ggml_tensor * v = ggml_permute(ctx0, mctx_l->get_v(ctx0, il), 0, 2, 1, 3);
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q, k, v, raw, kq_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(fa, sinks);
+            ggml_prec_set_acc(fa, GGML_PREC_F32);
+            ggml_tensor * g2 = gate && ggml_is_contiguous(gate) ? ggml_reshape_2d(ctx0, gate, q_cur->ne[0]*n_head, n_tok) : nullptr;
+            ggml_flash_attn_ext_set_inkrel(fa, table, rel_pos, g2);
+            gated = g2 != nullptr;
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il}); // the auto-FA probe checks this node's device
+            ggml_tensor * cur = ggml_reshape_2d(ctx0, fa, fa->ne[0]*fa->ne[1], fa->ne[2]*fa->ne[3]);
+            cb(cur, "kqv_out", il);
+            return cur;
         }
     }
 

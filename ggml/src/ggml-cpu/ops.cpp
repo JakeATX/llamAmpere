@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "ggml-inkrel.h"
 #include "../ggml-sjkvarn.h"
 
 #include "ggml-cpu.h"
@@ -9263,12 +9264,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
+        // INKREL (ggml-inkrel.h): bias table[h, rel_pos[ic, iq1], iq1] added to the mask, rounded to f16 like a per-head mask
+        const ggml_tensor * ir_tab = ggml_flash_attn_ext_inkrel_table(dst);
+        const ggml_tensor * ir_pos = ggml_flash_attn_ext_inkrel_pos(dst);
+        const float   * ir_trow = ir_tab ? (const float *) ((const char *) ir_tab->data + iq1*ir_tab->nb[2] + iq2*ir_tab->nb[0]) : nullptr;
+        const int32_t * ir_prow = ir_pos ? (const int32_t *) ((const char *) ir_pos->data + iq1*ir_pos->nb[1]) : nullptr;
+        const size_t    ir_tnb1 = ir_tab ? ir_tab->nb[1] : 0;
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
+            const float mv = ir_trow ? GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(mp[ic]) +
+                                 *(const float *) ((const char *) ir_trow + ir_prow[ic]*ir_tnb1))) :
+                             mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
                              mw ? slope*((mw[ic >> 5] >> (ic & 31)) & 1 ? 0.0f : -INFINITY) :
                              mask_imp ? slope*(ic < mlim ? 0.0f : -INFINITY) : 0.0f;
             if (mv == -INFINITY) {
@@ -9355,6 +9365,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             // V /= S
             const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
             ggml_vec_scale_f32(DV, VKQ32, S_inv);
+            if (const ggml_tensor * gate = ggml_flash_attn_ext_inkrel_gate(dst)) { // INKREL output gate: * sigmoid(gate)
+                const float * gr = (const float *) ((const char *) gate->data + iq1*gate->nb[1]) + iq2*DV;
+                for (int64_t d = 0; d < DV; ++d) {
+                    VKQ32[d] *= 1.0f/(1.0f + expf(-gr[d]));
+                }
+            }
 
             // dst indices
             const int i1 = iq1;
@@ -10074,7 +10090,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     // an LSE output (src[9], LSA compensation) is written by the plain one-chunk path only
-    const bool use_ref = params->use_ref || ggml_flash_attn_ext_get_lse(dst) != nullptr;
+    const bool use_ref = params->use_ref || ggml_flash_attn_ext_get_lse(dst) != nullptr || ggml_flash_attn_ext_is_inkrel(dst);
 
     // with kv_rows the loops run over the mask columns, the split KV path does not support it
     const ggml_tensor * kv_rows = ggml_flash_attn_ext_get_kv_rows(dst); // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN)

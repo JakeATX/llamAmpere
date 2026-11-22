@@ -417,9 +417,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
         // gathers the bias by distance (dense) or attends over the INKLSA compact set (full-attention visits)
-        cur = build_attn_rel(inp, Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il);
-
-        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+        // the output gate: out * sigmoid(gate), inside the attention when INKATTN takes the visit
+        cur = build_attn_rel(inp, Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il,
+                build_lora_mm(layer.wqkv_gate, inputs[0]));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
         cb(cur, "attn_out", il);
     }
