@@ -7,6 +7,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "q8a16.cuh"
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include "mmvq-iq4xs-k4.cuh"
 #include "mmvq-iq4xs-wide.cuh"
@@ -3831,6 +3832,12 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
+    // INKNVFP4K Q8A16: plain Q8_0 decode products on f32 activations, no q8_1 quantize (GGML_CUDA_Q8A16=0 = off)
+    if (src0->type == GGML_TYPE_Q8_0 && !fusion && !convrot &&
+            (ids ? ggml_cuda_q8a16_mul_mat_id(ctx, src0, src1, ids, dst) : ggml_cuda_q8a16_mul_mat(ctx, src0, src1, dst))) {
+        return;
+    }
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // Other types, fused/batched ops and unsupported layouts keep the existing MMVQ route.
     if (src0->type == GGML_TYPE_IQ4_XS && ggml_cuda_iq4xs_k4_variant() != IQ4XS_K4_OFF &&
@@ -3983,6 +3990,10 @@ static bool mmvq_group_launch(ggml_backend_cuda_context & ctx, ggml_tensor * con
     if (n < 1 || n > MMVQ_GROUP_MAX) {
         return false;
     }
+    // INKNVFP4K Q8A16: f32-activation group (reads each member's f32 src1; vy unused)
+    if (ggml_cuda_q8a16_group(ctx, dsts, n, vy == nullptr)) {
+        return true;
+    }
     const ggml_type type = GGML_TYPE_Q8_0;
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
@@ -4068,6 +4079,9 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
         }
     }
 
+    if (ggml_cuda_q8a16_group(ctx, dsts, n, false)) {
+        return true; // INKNVFP4K Q8A16: no q8_1 copy needed
+    }
     cudaStream_t stream = ctx.stream();
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_bytes    = ne10_padded * sizeof(block_q8_1)/QK8_1;
@@ -4104,6 +4118,10 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
 static bool mmvq_group_nc_launch(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, const void * const * vy) {
     if (n < 1 || n > MMVQ_GROUP_MAX) {
         return false;
+    }
+    // INKNVFP4K Q8A16: f32-activation group at the verify width (reads each member's f32 src1; vy unused)
+    if (ggml_cuda_q8a16_group(ctx, dsts, n, vy == nullptr)) {
+        return true;
     }
     constexpr ggml_type type = GGML_TYPE_Q8_0;
     const int NC = (int) dsts[0]->src[1]->ne[1];
@@ -4195,6 +4213,9 @@ bool ggml_cuda_mul_mat_vec_q_group_nc(ggml_backend_cuda_context & ctx, ggml_tens
     }
     if (!ggml_is_contiguous(src1) || !mmvq_group_nc_launch(ctx, dsts, n, nullptr)) {
         return false;
+    }
+    if (ggml_cuda_q8a16_group(ctx, dsts, n, false)) {
+        return true; // INKNVFP4K Q8A16: no q8_1 copy needed
     }
     const int NC = (int) src1->ne[1];
     const int64_t ne10 = src1->ne[0];

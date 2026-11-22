@@ -76,6 +76,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/inkglue.cuh"
 #include "ggml-cuda/inksituq.cuh"
+#include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
 #include "ggml-cuda/inkprep.cuh"
 #include "ggml-cuda/inkcomb.cuh"
@@ -111,6 +112,7 @@
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml-cuda/inkmask.cuh"
 #include "ggml-cuda/inkrouter.cuh"
+#include "ggml-cuda/q8a16.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -9399,6 +9401,9 @@ static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_cont
                 ggml_cuda_mul_mat_route(w, act, node, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
             return GGML_TYPE_COUNT;
         }
+        if (w->type == GGML_TYPE_Q8_0 && ggml_cuda_q8a16_enabled()) {
+            return GGML_TYPE_COUNT; // INKNVFP4K Q8A16 reads the f32 activation (a refused consumer quantizes on its own)
+        }
         return w->type;
     }
     return GGML_TYPE_COUNT;
@@ -10733,11 +10738,12 @@ static const ggml_tensor * ink_situq_consumer(const ggml_cgraph * cgraph, int la
     return down;
 }
 
-static int ggml_cuda_try_fuse_ink_situ(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
-    static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_SITU");
+// the SITU run that starts at node i: its g, u, output, scale params and last node index (-1: none)
+static int ink_situ_find(ggml_cgraph * cgraph, int i, const ggml_tensor ** g_out, const ggml_tensor ** u_out,
+        ggml_tensor ** out_out, ink_situ_params * p_out, ggml_tensor ** set9 = nullptr) {
     ggml_tensor * first = cgraph->nodes[i];
-    if (!on || (first->op != GGML_OP_SCALE && !ink_is_unary(first, GGML_UNARY_OP_SIGMOID))) {
-        return 0;
+    if (first->op != GGML_OP_SCALE && !ink_is_unary(first, GGML_UNARY_OP_SIGMOID)) {
+        return -1;
     }
     for (int j = i + 1; j < cgraph->n_nodes && j < i + 16; ++j) {
         ggml_tensor * out = cgraph->nodes[j];
@@ -10777,19 +10783,40 @@ static int ggml_cuda_try_fuse_ink_situ(ggml_backend_cuda_context * ctx, ggml_cgr
                 p.ub_s = ggml_get_op_params_f32(nu[2], 0); p.ub_b = ggml_get_op_params_f32(nu[2], 1);
                 p.sig_first = sig_first;
                 p.act_first = act_first;
-                const ggml_tensor * down = ink_situq_consumer(cgraph, last, out);
-                if (!ctx) {
-                    g_ink_situq_plan_down = down;
-                    return last - i;
+                *g_out = g; *u_out = u; *out_out = out; *p_out = p;
+                if (set9) {
+                    for (int k = 0; k < 9; ++k) {
+                        set9[k] = set[k];
+                    }
                 }
-                if (!down || !ggml_cuda_ink_situq_launch(*ctx, g, u, out, p, down)) {
-                    ggml_cuda_ink_situ(*ctx, g, u, out, p);
-                }
-                return last - i;
+                return last;
             }
         }
     }
-    return 0;
+    return -1;
+}
+
+static int ggml_cuda_try_fuse_ink_situ(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_SITU");
+    if (!on) {
+        return 0;
+    }
+    const ggml_tensor * g = nullptr, * u = nullptr;
+    ggml_tensor * out = nullptr;
+    ink_situ_params p;
+    const int last = ink_situ_find(cgraph, i, &g, &u, &out, &p);
+    if (last < 0) {
+        return 0;
+    }
+    const ggml_tensor * down = ink_situq_consumer(cgraph, last, out);
+    if (!ctx) {
+        g_ink_situq_plan_down = down;
+        return last - i;
+    }
+    if (!down || !ggml_cuda_ink_situq_launch(*ctx, g, u, out, p, down)) {
+        ggml_cuda_ink_situ(*ctx, g, u, out, p);
+    }
+    return last - i;
 }
 
 // MUL(e [n, k, T], w [1, k, T]) -> CONT(PERMUTE(1, 0, 2, 3)) -> SUM_ROWS [-> RESHAPE]
@@ -10832,6 +10859,223 @@ static int ggml_cuda_try_fuse_ink_moe_wsum(ggml_backend_cuda_context * ctx, ggml
         return last - i;
     }
     return 0;
+}
+
+static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i);
+
+// [INKNVFP4K] NVFP4 MoE decode visit in two launches (nvfp4moe.cu): MUL_MAT_ID(gate_up) [RESHAPE REPEAT GET_ROWS MUL
+// = per-expert scale], the SITU run on its gate/up views, MUL_MAT_ID(down) [+ scale], the weighted expert sum
+// (MUL -> CONT(PERMUTE) -> SUM_ROWS). Bit-identical at one token while mmvq small_k keeps 4 warps (QC4_NWARPS_1).
+// GGML_CUDA_NVFP4MOE=0 off; GGML_CUDA_INKGLUE_WSUM=0 also turns it off on layers that own the sum (not WCONV layers) (the sum is matched by that matcher).
+static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * gu = cgraph->nodes[i];
+    if (gu->op != GGML_OP_MUL_MAT_ID || gu->src[0]->type != GGML_TYPE_NVFP4 || !ggml_cuda_nvfp4moe_enabled()) {
+        return 0;
+    }
+    const int device = ctx ? ctx->device : ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const ggml_tensor * w_gu = gu->src[0];
+    const ggml_tensor * x    = gu->src[1];
+    const ggml_tensor * ids  = gu->src[2];
+    const int64_t K = w_gu->ne[0], F = w_gu->ne[1]/2, n_used = gu->ne[1], T = gu->ne[2];
+    if (!ggml_cuda_nvfp4moe_supported(cc, K, F, n_used) || w_gu->ne[1] != 2*F || T < 1 || T > ggml_cuda_nvfp4moe_max_tok() ||
+            gu->ne[0] != 2*F || gu->ne[3] != 1 || !ggml_is_contiguous(gu) || gu->type != GGML_TYPE_F32 ||
+            w_gu->nb[0] != ggml_type_size(GGML_TYPE_NVFP4) || w_gu->nb[1] != (size_t) (K/64)*36 || w_gu->ne[3] != 1 ||
+            x->type != GGML_TYPE_F32 || x->ne[0] != K || x->ne[1] != 1 || x->ne[2] != T || x->nb[0] != sizeof(float) ||
+            x->nb[2] % sizeof(float) != 0 ||
+            ids->type != GGML_TYPE_I32 || ids->ne[0] != n_used || ids->ne[1] != T || ids->nb[0] != sizeof(int32_t) ||
+            ids->nb[1] % sizeof(int32_t) != 0 || w_gu->nb[2] % 4 != 0) {
+        return 0;
+    }
+    // weights read by pointer: this device's plain CUDA buffer only (no moe-cache host arena, split or compute buffer)
+    auto plain_weight = [device](const ggml_tensor * op, const ggml_tensor * w) {
+        return w->buffer && w->buffer->buft == ggml_backend_cuda_buffer_type(device) &&
+            ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            !ggml_cuda_moe_cache_device_supports(op, device);
+    };
+    // per-expert scale chain RESHAPE -> REPEAT -> GET_ROWS -> MUL (checked before the shared helper, which assumes it)
+    auto scale_chain = [cgraph](int j0) {
+        return j0 + 3 < cgraph->n_nodes && cgraph->nodes[j0]->op == GGML_OP_RESHAPE && cgraph->nodes[j0]->src[0] &&
+            cgraph->nodes[j0 + 1]->op == GGML_OP_REPEAT && cgraph->nodes[j0 + 2]->op == GGML_OP_GET_ROWS &&
+            cgraph->nodes[j0 + 3]->op == GGML_OP_MUL;
+    };
+    if (!plain_weight(gu, w_gu)) {
+        return 0;
+    }
+    ggml_tensor * set[32];
+    int n_set = 0;
+    set[n_set++] = gu;
+    int j = i + 1;
+    // per-expert scale of gate_up
+    const ggml_tensor * s_gu = nullptr;
+    ggml_tensor * gu_out = gu;
+    if (scale_chain(j)) {
+        s_gu = ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[j], cgraph->nodes[j + 1], cgraph->nodes[j + 2], cgraph->nodes[j + 3], gu);
+        if (s_gu) {
+            for (int k = 0; k < 4; ++k) {
+                set[n_set++] = cgraph->nodes[j + k];
+            }
+            gu_out = cgraph->nodes[j + 3];
+            j += 4;
+        }
+    }
+    // SITU on the gate (offset 0) and up (offset F) views
+    const ggml_tensor * g = nullptr, * u = nullptr;
+    ggml_tensor * act = nullptr;
+    ink_situ_params sp;
+    int last_situ = -1;
+    for (int js = j; js < j + 3 && js < cgraph->n_nodes && last_situ < 0; ++js) {
+        if (cgraph->nodes[js]->op != GGML_OP_VIEW) {
+            last_situ = ink_situ_find(cgraph, js, &g, &u, &act, &sp, set + n_set);
+            if (last_situ < 0) {
+                break;
+            }
+        }
+    }
+    if (last_situ < 0 || !ggml_is_contiguous(gu_out) || g->view_src != gu_out || u->view_src != gu_out || g->view_offs != 0 ||
+            u->view_offs != (size_t) F*sizeof(float) || g->nb[1] != gu_out->nb[1] || u->nb[1] != gu_out->nb[1] ||
+            g->nb[2] != gu_out->nb[2] || u->nb[2] != gu_out->nb[2] || act->ne[0] != F || act->ne[1] != n_used ||
+            act->ne[2] != T || !ggml_is_contiguous(act)) {
+        return 0;
+    }
+    n_set += 9;
+    // down projection of the SITU output
+    j = last_situ + 1;
+    while (j < cgraph->n_nodes && j < last_situ + 3 && cgraph->nodes[j]->op != GGML_OP_MUL_MAT_ID) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * dn = cgraph->nodes[j];
+    const ggml_tensor * w_dn = dn->src[0];
+    if (dn->op != GGML_OP_MUL_MAT_ID || dn->src[1] != act || dn->src[2] != ids || w_dn->type != GGML_TYPE_NVFP4 ||
+            w_dn->ne[0] != F || w_dn->ne[1] != K || w_dn->ne[2] != w_gu->ne[2] || w_dn->ne[3] != 1 ||
+            w_dn->nb[0] != ggml_type_size(GGML_TYPE_NVFP4) || w_dn->nb[1] != (size_t) (F/64)*36 || w_dn->nb[2] % 4 != 0 ||
+            !plain_weight(dn, w_dn) || dn->ne[0] != K || dn->ne[1] != n_used || dn->ne[2] != T ||
+            !ggml_is_contiguous(dn) || dn->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    set[n_set++] = dn;
+    ++j;
+    const ggml_tensor * s_dn = nullptr;
+    ggml_tensor * dn_out = dn;
+    if (scale_chain(j)) {
+        s_dn = ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[j], cgraph->nodes[j + 1], cgraph->nodes[j + 2], cgraph->nodes[j + 3], dn);
+        if (s_dn) {
+            for (int k = 0; k < 4; ++k) {
+                set[n_set++] = cgraph->nodes[j + k];
+            }
+            dn_out = cgraph->nodes[j + 3];
+            j += 4;
+        }
+    }
+    // weighted expert sum: left to the graph when the WCONV combine (sum + conv ring in one kernel) takes it, else fused
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * wmul = cgraph->nodes[j];
+    const bool own_sum = ggml_cuda_try_fuse_ink_wconv(nullptr, cgraph, j) <= 0;
+    if (!own_sum) {
+        if (wmul->src[0] != dn_out || !ggml_is_contiguous(dn_out)) {
+            return 0;
+        }
+        const ggml_tensor * out_node = dn_out;
+        const int last = ink_run_check(cgraph, i, set, n_set, out_node);
+        if (last < 0) {
+            return 0;
+        }
+        if (!ctx) {
+            return last - i;
+        }
+        const ggml_tensor * reads[] = { x, ids, s_gu, s_dn };
+        for (const ggml_tensor * rd : reads) {
+            if (rd && (ink_overlap(act, rd) || ink_overlap(dn_out, rd))) {
+                return 0;
+            }
+        }
+        if (ink_overlap(act, dn_out) || (uintptr_t) act->data % 16 != 0 || (uintptr_t) w_gu->data % 4 != 0 ||
+                (uintptr_t) w_dn->data % 4 != 0) {
+            return 0;
+        }
+        nvfp4moe_params P = {};
+        P.w_gu = (const char *) w_gu->data; P.gu_nb1 = w_gu->nb[1]; P.gu_nb2 = w_gu->nb[2];
+        P.w_dn = (const char *) w_dn->data; P.dn_nb1 = w_dn->nb[1]; P.dn_nb2 = w_dn->nb[2];
+        P.s_gu = s_gu ? (const float *) s_gu->data : nullptr;
+        P.s_dn = s_dn ? (const float *) s_dn->data : nullptr;
+        P.x = (const float *) x->data; P.x_s2 = x->nb[2]/sizeof(float);
+        P.ids = (const int32_t *) ids->data; P.ids_s1 = ids->nb[1]/sizeof(int32_t);
+        P.act = (block_q8_1 *) act->data;
+        P.e_out = (float *) dn_out->data;
+        P.situ = sp;
+        P.K = (int) K; P.F = (int) F; P.n_used = (int) n_used; P.T = (int) T; P.write_sum = 0;
+        P.actf = (float *) act->data; P.acth = (half2 *) act->data; P.f32act = T == 1 ? ggml_cuda_nvfp4moe_f32act() : 0;
+    if (P.f32act == 1 && (uintptr_t) x->data % 16 != 0) { P.f32act = 0; }  // gu1f reads x as float4
+        ggml_cuda_nvfp4moe_launch(P, ctx->stream());
+        return last - i;
+    }
+    const int n_w = ggml_cuda_try_fuse_ink_moe_wsum(nullptr, cgraph, j);
+    if (n_w <= 0 || wmul->src[0] != dn_out || !ggml_is_contiguous(dn_out)) {
+        return 0;
+    }
+    ggml_tensor * sum = cgraph->nodes[j + n_w];
+    const ggml_tensor * rw = wmul->src[1];
+    if (sum->op != GGML_OP_SUM_ROWS || sum->src[0]->op != GGML_OP_CONT || rw->nb[0] != sizeof(float) ||
+            rw->nb[1] % sizeof(float) != 0 || rw->nb[2] % sizeof(float) != 0) {
+        return 0;
+    }
+    set[n_set++] = wmul;
+    set[n_set++] = sum->src[0];
+    set[n_set++] = sum;
+    const int last = ink_run_check(cgraph, i, set, n_set, sum);
+    if (last < 0) {
+        return 0;
+    }
+    if (!ctx) {
+        return last - i;
+    }
+    // the kernels read x, ids, weights, scales and rw while they write act (q8_1 in the SITU output's memory), e_out
+    // (the scaled down output, T > 1) and sum
+    const ggml_tensor * reads[] = { x, ids, rw, s_gu, s_dn };
+    const ggml_tensor * writes[] = { act, T > 1 ? dn_out : nullptr, sum };
+    for (const ggml_tensor * wt : writes) {
+        if (!wt) {
+            continue;
+        }
+        for (const ggml_tensor * rd : reads) {
+            if (rd && ink_overlap(wt, rd)) {
+                return 0;
+            }
+        }
+        for (const ggml_tensor * wt2 : writes) {
+            if (wt2 && wt2 != wt && ink_overlap(wt, wt2)) {
+                return 0;
+            }
+        }
+    }
+    if ((uintptr_t) act->data % 16 != 0 || (uintptr_t) w_gu->data % 4 != 0 || (uintptr_t) w_dn->data % 4 != 0) {
+        return 0;
+    }
+    nvfp4moe_params P = {};
+    P.w_gu = (const char *) w_gu->data; P.gu_nb1 = w_gu->nb[1]; P.gu_nb2 = w_gu->nb[2];
+    P.w_dn = (const char *) w_dn->data; P.dn_nb1 = w_dn->nb[1]; P.dn_nb2 = w_dn->nb[2];
+    P.s_gu = s_gu ? (const float *) s_gu->data : nullptr;
+    P.s_dn = s_dn ? (const float *) s_dn->data : nullptr;
+    P.x = (const float *) x->data; P.x_s2 = x->nb[2]/sizeof(float);
+    P.ids = (const int32_t *) ids->data; P.ids_s1 = ids->nb[1]/sizeof(int32_t);
+    P.rw = (const float *) rw->data; P.rw_s1 = rw->nb[1]/sizeof(float); P.rw_s2 = rw->nb[2]/sizeof(float);
+    P.act = (block_q8_1 *) act->data;
+    P.e_out = (float *) dn_out->data;
+    P.out = (float *) sum->data;
+    P.situ = sp;
+    P.K = (int) K; P.F = (int) F; P.n_used = (int) n_used; P.T = (int) T; P.write_sum = 1;
+    P.actf = (float *) act->data; P.acth = (half2 *) act->data; P.f32act = T == 1 ? ggml_cuda_nvfp4moe_f32act() : 0;
+    if (P.f32act == 1 && (uintptr_t) x->data % 16 != 0) { P.f32act = 0; }  // gu1f reads x as float4
+    ggml_cuda_nvfp4moe_launch(P, ctx->stream());
+    if (T > 1) {
+        ggml_cuda_ink_moe_wsum(*ctx, dn_out, rw, sum);
+    }
+    return last - i;
 }
 
 // [MUL(x, m) ->] L2_NORM -> SCALE: the Inkling q/k/r clips
@@ -11521,8 +11765,9 @@ static int ggml_cuda_try_fuse_ink_normq(ggml_backend_cuda_context * ctx, ggml_cg
     const size_t  q8_row       = ncols_padded*sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> q8(ctx->pool(), q8_row*G*nr);
     void * q8p[INK_MULTI_MAX];
+    const bool a16 = ggml_cuda_q8a16_group(*ctx, mms, n, true); // INKNVFP4K Q8A16 reads the f32 norm output: no q8_1 rows
     for (int k = 0; k < G; ++k) {
-        q8p[k] = used[k] ? q8.get() + k*nr*q8_row : nullptr;
+        q8p[k] = used[k] && !a16 ? q8.get() + k*nr*q8_row : nullptr;
     }
     const void * vy[8];
     for (int k = 0; k < n; ++k) {
@@ -12372,15 +12617,15 @@ static int ggml_cuda_try_fuse_ink_dyn(ggml_backend_cuda_context * ctx, ggml_cgra
     return last - i;
 }
 
-static int g_ink_fire[12] = {};
+static int g_ink_fire[13] = {};
 
 // ctx == nullptr: plan only (graph_optimize, tensors not allocated yet): match, launch nothing
 static int ggml_cuda_try_fuse_inkglue(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     if (ctx && !ctx->stream_context().concurrent_events.empty()) {
         return 0; // multi-stream graph (GGML_CUDA_GRAPH_OPT): the fused runs would skip cross-stream events
     }
-    int (* const fns[12])(ggml_backend_cuda_context *, ggml_cgraph *, int) = {
-        ggml_cuda_try_fuse_ink_wconv, ggml_cuda_try_fuse_ink_prep, ggml_cuda_try_fuse_ink_situ, ggml_cuda_try_fuse_ink_moe_wsum, ggml_cuda_try_fuse_ink_clip, ggml_cuda_try_fuse_ink_rel,
+    int (* const fns[13])(ggml_backend_cuda_context *, ggml_cgraph *, int) = {
+        ggml_cuda_try_fuse_ink_nvfp4moe, ggml_cuda_try_fuse_ink_wconv, ggml_cuda_try_fuse_ink_prep, ggml_cuda_try_fuse_ink_situ, ggml_cuda_try_fuse_ink_moe_wsum, ggml_cuda_try_fuse_ink_clip, ggml_cuda_try_fuse_ink_rel,
         ggml_cuda_try_fuse_ink_conv_epi, ggml_cuda_try_fuse_ink_mix_norm, ggml_cuda_try_fuse_ink_mmgroup,
         ggml_cuda_try_fuse_ink_lgmulti, ggml_cuda_try_fuse_ink_normq, ggml_cuda_try_fuse_ink_router };
     {
@@ -12389,7 +12634,7 @@ static int ggml_cuda_try_fuse_inkglue(ggml_backend_cuda_context * ctx, ggml_cgra
             return n;
         }
     }
-    for (int k = 0; k < 12; ++k) {
+    for (int k = 0; k < 13; ++k) {
         const int n = fns[k](ctx, cgraph, i);
         if (n > 0) {
             g_ink_fire[k] += ctx != nullptr;
@@ -14134,9 +14379,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         static int n_stat = 0;
         if (dump_path && cgraph->n_nodes >= 1500 && n_stat < 64) {
             n_stat++;
-            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d router %d situq %d/%d (taken/made) dyn %d mixq %d; nodes %d\n",
-                    g_ink_fire[2], g_ink_fire[3], g_ink_fire[4], g_ink_fire[5], g_ink_fire[6], g_ink_fire[7], g_ink_fire[8],
-                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], g_ink_fire[11], ggml_cuda_ink_situq_count(1),
+            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d router %d nvfp4moe %d situq %d/%d (taken/made) dyn %d mixq %d; nodes %d\n",
+                    g_ink_fire[3], g_ink_fire[4], g_ink_fire[5], g_ink_fire[6], g_ink_fire[7], g_ink_fire[8], g_ink_fire[9],
+                    g_ink_fire[10], g_ink_fire[11], g_ink_fire[2], g_ink_fire[1], g_ink_fire[12], g_ink_fire[0], ggml_cuda_ink_situq_count(1),
                     ggml_cuda_ink_situq_count(0), g_ink_fire_dyn, g_ink_fire_mixq, cgraph->n_nodes);
         }
         if (dump_path && !dumped && cgraph->n_nodes >= 1500) {
