@@ -2,6 +2,7 @@
 #include "ai4-mm.cuh"
 #include "inksituq.cuh"
 #include "ai4.cuh"
+#include "inkpreq.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
 #include "magic2-v2.cuh"
@@ -1721,7 +1722,11 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     // [INKSITUQ] the SITU producer already wrote this activation in quantize_act128's layout (one-shot, inksituq.cu)
     const int8_t * pre_q = nullptr;
     const float  * pre_s = nullptr;
-    const bool pre = !fused && xsh == 0 && ggml_cuda_ink_situq_take(ctx, dst, n_rows, K, &pre_q, &pre_s);
+    bool pre = !fused && xsh == 0 && ggml_cuda_ink_situq_take(ctx, dst, n_rows, K, &pre_q, &pre_s);
+    // [INKGLUE MIXQ] or by the depth-mix + norm producer (inkpreq.cu): same bytes, no launch
+    if (!fused && !pre && ctx.curr_stream_no == 0) {
+        pre = ggml_cuda_ink_ai4_preq_take(dst, src1->data, n_rows, K, xsh, &pre_q, &pre_s);
+    }
     ggml_cuda_pool_alloc<int8_t> q_buf(ctx.pool());
     ggml_cuda_pool_alloc<float>  s_buf(ctx.pool());
     if (!pre) {
