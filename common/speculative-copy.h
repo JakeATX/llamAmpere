@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct common_speculative_copy_params {
@@ -118,6 +119,9 @@ struct common_speculative_copy_params {
         }
         const char * env = std::getenv("LLAMA_SPEC_COPY_FIRST");
         if (env != nullptr && env[0] != '\0') {
+            if (std::strcmp(env, "off") == 0 || std::strcmp(env, "false") == 0 || std::strcmp(env, "no") == 0) {
+                return 0;
+            }
             char * end = nullptr;
             const long v = std::strtol(env, &end, 10);
             if (end != env && *end == '\0') {
@@ -229,17 +233,68 @@ inline void common_speculative_copy_append(
 // (history hist[0, n) followed by id_last), read from the virtual stream hist ++ id_last ++ span so that a match
 // overlapping its own suffix keeps repeating. The occurrence must end before hist[n_src] (n_src < 0: anywhere).
 // Empty when there is no such occurrence.
+// Token -> positions index of a fixed source hist[0, n_src) (the request prompt): the lookup visits only the positions
+// holding id_last, newest first, instead of scanning the whole prompt every round. Same result as the scan.
+struct common_speculative_copy_first_index {
+    std::unordered_map<llama_token, int32_t> head; // newest position of each token
+    std::vector<int32_t> prev;                       // previous position with the same token (-1 = none)
+    int32_t n = 0;                                   // indexed prefix length
+
+    void clear() { head.clear(); prev.clear(); n = 0; }
+
+    // extend to hist[0, n_src); a shorter source than indexed (context shift) rebuilds
+    void update(const llama_token * hist, int32_t n_src) {
+        if (n_src < n) {
+            clear();
+        }
+        prev.resize(n_src);
+        for (int32_t p = n; p < n_src; ++p) {
+            auto it = head.find(hist[p]);
+            prev[p] = it == head.end() ? -1 : it->second;
+            head[hist[p]] = p;
+        }
+        n = n_src;
+    }
+
+    // most recent p < n with hist[p] == id_last and hist[p - i] == hist[n_hist - i] for i < len_min; next = p + 1
+    common_speculative_copy_match find(const llama_token * hist, int32_t n_hist, llama_token id_last, int32_t len_min) const {
+        common_speculative_copy_match m;
+        auto it = head.find(id_last);
+        for (int32_t p = it == head.end() ? -1 : it->second; p >= 0; p = prev[p]) {
+            if (p >= n_hist) {
+                continue;
+            }
+            int32_t len = 1;
+            while (len < len_min && p - len >= 0 && hist[p - len] == hist[n_hist - len]) {
+                len++;
+            }
+            if (len >= len_min) {
+                m.next = p + 1;
+                m.len  = len;
+                return m;
+            }
+        }
+        return m;
+    }
+};
+
 inline std::vector<llama_token> common_speculative_copy_first_propose(
         const common_speculative_copy_params & cp, const llama_token * hist, int32_t n, llama_token id_last, int32_t n_span,
-        int32_t n_src = -1) {
+        int32_t n_src = -1, common_speculative_copy_first_index * index = nullptr) {
     std::vector<llama_token> span;
     if (n_span <= 0 || n <= 0 || cp.first <= 0) {
         return span;
     }
-    common_speculative_copy_params fp = cp;
-    fp.long_min  = cp.first_min;
-    fp.short_min = cp.first_min;
-    const auto m = common_speculative_copy_find(fp, hist, n, id_last, cp.first_src_all ? -1 : n_src);
+    common_speculative_copy_match m;
+    if (index != nullptr && !cp.first_src_all && n_src >= 0) {
+        index->update(hist, std::min(n, n_src));
+        m = index->find(hist, n, id_last, cp.first_min);
+    } else {
+        common_speculative_copy_params fp = cp;
+        fp.long_min  = cp.first_min;
+        fp.short_min = cp.first_min;
+        m = common_speculative_copy_find(fp, hist, n, id_last, cp.first_src_all ? -1 : n_src);
+    }
     if (m.next < 0 || m.len < cp.first_min) {
         return span;
     }
@@ -278,6 +333,7 @@ struct common_speculative_copy_state {
     int32_t first_cool  = 0; // rounds left without a span
     int32_t first_fail  = 0; // poor spans in a row
     int32_t first_n     = 0; // span verified this round (0 = the drafter drafted)
+    common_speculative_copy_first_index first_index; // per request (the prompt source is fixed per request)
 
     uint64_t n_first_rounds = 0; // rounds that verified a span
     uint64_t n_first_gen    = 0; // span tokens proposed
@@ -302,6 +358,7 @@ struct common_speculative_copy_state {
         first_cool = 0;
         first_fail = 0;
         first_n    = 0;
+        first_index.clear();
         n_first_rounds = 0;
         n_first_gen    = 0;
         n_first_acc    = 0;

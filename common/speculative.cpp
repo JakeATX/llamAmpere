@@ -5608,7 +5608,7 @@ void common_speculative_draft(common_speculative * spec) {
             const int32_t want = dp.n_first_max > 0 && dp.prompt != nullptr ? std::min(cs.first_want(), dp.n_first_max) : 0;
             if (want > 0) {
                 llama_tokens span = common_speculative_copy_first_propose(spec->copy, dp.prompt->data(),
-                        (int32_t) dp.prompt->size(), dp.id_last, want, dp.n_first_src);
+                        (int32_t) dp.prompt->size(), dp.id_last, want, dp.n_first_src, &cs.first_index);
                 if (!span.empty()) {
                     *dp.result = std::move(span);
                     if (dp.result_q) {

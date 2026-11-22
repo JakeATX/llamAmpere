@@ -2375,6 +2375,12 @@ private:
                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
             params.speculative.copy_first = common_speculative_copy_params::resolve_first(
                     params.speculative.copy_first, dspark && params.n_parallel == 1, 32);
+            // an explicit N needs a drafter a span can stand in for, else it would only raise n_rs_seq / outputs
+            const bool dflash = params.speculative.has_dft() &&
+                    std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
+            if (!dspark && !dflash) {
+                params.speculative.copy_first = 0;
+            }
             if (params.speculative.has_synth()) {
                 params.speculative.copy_first = 0;
             }
