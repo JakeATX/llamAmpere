@@ -186,13 +186,13 @@ static bool lsa_overflow_log() {
 // copied total, u64 at 4 stage full, 7 ahead_list entries for the next ahead copy, u64 at 8 ahead entries picked again,
 // u64 at 10 ahead entries offered
 constexpr int LSA_STAGE_CTL_WORDS = 12;
-// GGML_CUDA_LSA_STAGE_AHEAD (opt-in =1): see ggml_cuda_qsa_clock_map::ahead_list. Needs the whole-record stage
+// GGML_CUDA_LSA_STAGE_AHEAD (default on, =0 off): see ggml_cuda_qsa_clock_map::ahead_list. Needs the whole-record stage
 // (GGML_CUDA_LSA_RESIDENT_STAGE) and stays off with STAGE_ALL, stage strips and GGML_CUDA_LSA_PREFETCH; a J3 prefetch
 // (LLAMA_LSA_J3) turns it off for the process. Costs a second stage of the same size per buffer.
 static bool lsa_stage_ahead_env() {
     static const bool on = [] {
-        const char * v = getenv("GGML_CUDA_LSA_STAGE_AHEAD"); // opt-in (=1) until the HOSTKV08 gate passes
-        return v != nullptr && atoi(v) > 0;
+        const char * v = getenv("GGML_CUDA_LSA_STAGE_AHEAD"); // default on (HOSTKV08 gate, lossless); =0 turns it off
+        return v == nullptr || atoi(v) > 0;
     }();
     return on;
 }

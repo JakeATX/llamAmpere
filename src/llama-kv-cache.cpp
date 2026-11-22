@@ -1352,9 +1352,9 @@ llama_kv_cache::llama_kv_cache(
             in.stage_all       = stage_all;
             in.records         = (int64_t) sj_kvarn_n_groups;
             in.stage_rec_bytes = (int64_t) e0.stride;
-            // GGML_CUDA_LSA_STAGE_AHEAD=1 (ggml-cuda, opt-in): a second stage of the same size
+            // GGML_CUDA_LSA_STAGE_AHEAD (ggml-cuda, default on, =0 off): a second stage of the same size
             const char * ahead = getenv("GGML_CUDA_LSA_STAGE_AHEAD");
-            in.stage_copies = !stage_all && ahead && atoi(ahead) > 0 ? 2 : 1;
+            in.stage_copies = !stage_all && (ahead == nullptr || atoi(ahead) > 0) ? 2 : 1;
             const char * strips = getenv("GGML_CUDA_LSA_RESIDENT_STAGE_STRIPS");
             if (stage_all && strips && atoi(strips) > 0) {
                 in.stage_rec_bytes += int64_t(e0.heads)*4096;
