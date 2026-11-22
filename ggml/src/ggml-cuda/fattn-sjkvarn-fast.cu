@@ -876,10 +876,17 @@ static bool dispatch_shape(ggml_backend_cuda_context & ctx, ggml_tensor * dst, c
 } // namespace fattn_sj_kvarn_fast
 
 bool ggml_cuda_fattn_sj_kvarn_fast_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool rot) {
-#if defined(FLASH_ATTN_AVAILABLE) && defined(TURING_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
+    // INKATTN review: the old guard here used device-pass macros (__CUDA_ARCH__), so the host function always returned
+    // false; decide on the device's compute capability at run time instead (kernel bodies keep their device guards)
+    {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !cp_async_available(cc) || !turing_mma_available(cc)) {
+            return false;
+        }
+    }
     static const int mode = [] {
         const char * e = getenv("GGML_SJKVARN_FAST");
-        if (!e || !*e) return 1; // default ON (exact FP32 HMMA + raw_pairs K + branchless issue)
+        if (!e || !*e) return 0; // default OFF until gated on the card (INKATTN review: never launched before; raw K is rounding-level, not exact)
         const int m = atoi(e);
         return (m >= 0 && m <= 3) ? m : 1;
     }();
@@ -909,8 +916,4 @@ bool ggml_cuda_fattn_sj_kvarn_fast_try(ggml_backend_cuda_context & ctx, ggml_ten
     const int nstage = nstage_env != 0 ? nstage_env : (mode >= 2 ? 4 : 2);
     return rot ? fattn_sj_kvarn_fast::dispatch_shape<true>(ctx, dst, mode, nstage)
                : fattn_sj_kvarn_fast::dispatch_shape<false>(ctx, dst, mode, nstage);
-#else
-    GGML_UNUSED_VARS(ctx, dst, rot);
-    return false;
-#endif
 }

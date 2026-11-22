@@ -528,7 +528,7 @@ static bool inkattn_fast_aligned(const void * ptr, const int64_t a, const int64_
 bool ggml_cuda_inkattn_fast_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_INKATTN_FAST");
-        return !(e && *e && atoi(e) == 0);
+        return e && *e && atoi(e) != 0; // default OFF until gated on the card (INKATTN head to head)
     }();
     return on;
 }
