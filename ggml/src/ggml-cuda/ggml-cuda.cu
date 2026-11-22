@@ -79,6 +79,7 @@
 #include "ggml-cuda/inkprep.cuh"
 #include "ggml-cuda/inkcomb.cuh"
 #include "ggml-cuda/inkdyn.cuh"
+#include "ggml-cuda/inkpreq.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -11126,6 +11127,9 @@ static int ggml_cuda_try_fuse_ink_conv_epi(ggml_backend_cuda_context * ctx, ggml
 
 // DEPTH_MIX [-> RESHAPE] -> RMS_NORM -> MUL(weight): the norm of the mixed row in the mix kernel (1 row per block, the
 // rms_norm_f32<1024> scalar sum and expressions); the mix output stays an output
+static const ggml_tensor * ink_through_views(const ggml_tensor * t);
+static int g_ink_fire_mixq = 0;
+
 static int ggml_cuda_try_fuse_ink_mix_norm(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_MIXNORM") &&
         !(getenv("GGML_CUDA_RMS_NORM_VEC") && atoi(getenv("GGML_CUDA_RMS_NORM_VEC")) != 0);
@@ -11176,8 +11180,35 @@ static int ggml_cuda_try_fuse_ink_mix_norm(ggml_backend_cuda_context * ctx, ggml
     }
     float eps;
     memcpy(&eps, norm->op_params, sizeof(float));
-    if (!ggml_cuda_depth_mix_norm(*ctx, mix, w, mul, eps)) {
+    // [MIXQ] the AI+ MUL_MAT_ID (H256 activations, one token) that reads the normed row later in the layer gets its
+    // activation from this launch (depth-mix.cu, rq4::quantize_act_body); GGML_CUDA_INKGLUE_MIXQ=0 = off
+    static const bool mixq_on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_MIXQ");
+    ggml_tensor * mm = nullptr;
+    const int K = (int) mul->ne[0];
+    if (mixq_on && ggml_nrows(mul) == 1 && K % 256 == 0 && K <= 32*256) {
+        for (int j = last + 1; j < cgraph->n_nodes && j < last + 48 && !mm; ++j) {
+            ggml_tensor * t = cgraph->nodes[j];
+            if (t->op == GGML_OP_MUL_MAT_ID && ink_through_views(t->src[1]) == mul && (t->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    ggml_ai4_rate(t->src[0]->type) != 0 && t->src[1]->ne[0] == K && t->src[1]->ne[1] == 1 &&
+                    t->src[2]->ne[1] == 1 && t->src[1]->data == mul->data) {
+                mm = t;
+            }
+        }
+    }
+    int8_t * aq = nullptr;
+    float  * as = nullptr;
+    if (mm) {
+        ggml_cuda_ink_ai4_preq_alloc(*ctx, 1, K, 1, &aq, &as);
+    }
+    if (!ggml_cuda_depth_mix_norm(*ctx, mix, w, mul, eps, aq, as)) {
+        if (mm) {
+            ggml_cuda_ink_ai4_preq_release();
+        }
         return 0;
+    }
+    if (mm) {
+        ggml_cuda_ink_ai4_preq_set(mm, mul->data, 1, K, 1, aq, as);
+        g_ink_fire_mixq++;
     }
     return last - i;
 }
@@ -13992,9 +14023,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         static int n_stat = 0;
         if (dump_path && cgraph->n_nodes >= 1500 && n_stat < 8) {
             n_stat++;
-            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d router %d dyn %d; nodes %d\n",
+            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d router %d dyn %d mixq %d; nodes %d\n",
                     g_ink_fire[2], g_ink_fire[3], g_ink_fire[4], g_ink_fire[5], g_ink_fire[6], g_ink_fire[7], g_ink_fire[8],
-                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], g_ink_fire[11], g_ink_fire_dyn, cgraph->n_nodes);
+                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], g_ink_fire[11], g_ink_fire_dyn, g_ink_fire_mixq, cgraph->n_nodes);
         }
         if (dump_path && !dumped && cgraph->n_nodes >= 1500) {
             ggml_tensor * n0 = cgraph->nodes[cgraph->n_nodes - 1];
@@ -14394,6 +14425,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             host_block.begin();
             ggml_cuda_conv_ring_finish(cuda_ctx);
             g_ink_ring_skip = nullptr;
+            ggml_cuda_ink_ai4_preq_release();
             host_block.end("conv_ring_finish", nullptr);
             host_block.begin();
             ggml_cuda_moe_cache_hf_graph_end(*cuda_ctx);

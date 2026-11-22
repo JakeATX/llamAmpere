@@ -1,4 +1,5 @@
 #include "depth-mix.cuh"
+#include "rq4.cuh"
 
 #define DEPTH_MIX_THREADS 1024
 #define DEPTH_MIX_MAX_ROWS 64
@@ -24,7 +25,8 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         const char * __restrict__ stack, const int64_t s_nb1, const int64_t s_nb2, const int k,
         const char * __restrict__ cur, const int64_t c_nb1, const char * __restrict__ query, const int64_t q_nb1,
         float * dst, const int n, const int nq_all, const float eps, const float scale,
-        const float * __restrict__ nw = nullptr, float * __restrict__ ndst = nullptr, const float neps = 0.0f) {
+        const float * __restrict__ nw = nullptr, float * __restrict__ ndst = nullptr, const float neps = 0.0f,
+        int8_t * __restrict__ aq = nullptr, float * __restrict__ as = nullptr) {
     __shared__ float part[DEPTH_MIX_MAX_ROWS*(NQ + 1)];
     __shared__ float p[DEPTH_MIX_MAX_ROWS*NQ];
     __shared__ float s_r;
@@ -173,6 +175,12 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         for (int col = threadIdx.x; col < n; col += DEPTH_MIX_THREADS) {
             nd[col] = sc * out[col] * nw[col];
         }
+        // [INKGLUE MIXQ] then the AI+ H256 activation of the normed row, by rq4::quantize_act_body itself (one warp per 256
+        // block; the warps of this block cover n <= 32*256), from the row this block just wrote
+        if (aq != nullptr) {
+            __syncthreads();
+            rq4::quantize_act_body<false, false, false>(ndst, n, aq, as, n, (int) gridDim.x, 0, (int) t);
+        }
     }
 }
 
@@ -224,8 +232,12 @@ void ggml_cuda_depth_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 // [INKGLUE] depth mix (one query) + RMS_NORM(eps) + MUL(w) of the mixed rows into ndst; false: not this shape
-bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * w, ggml_tensor * ndst, float neps) {
+bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * w, ggml_tensor * ndst, float neps,
+        int8_t * aq, float * as) {
     if (!ggml_cuda_depth_mix_supported(dst) || dst->src[1]->ne[1] != 1) {
+        return false;
+    }
+    if (aq && (dst->src[0]->ne[0] % 256 != 0 || dst->src[0]->ne[0] > 32*256 || !ggml_is_contiguous(ndst))) {
         return false;
     }
     const ggml_tensor * cur   = dst->src[0];
@@ -248,10 +260,10 @@ bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid((unsigned) T, 1);
     if (vec) {
         k_depth_mix<1, 4, true><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
-            (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps);
+            (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
     } else {
         k_depth_mix<1, 1, true><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
-            (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps);
+            (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

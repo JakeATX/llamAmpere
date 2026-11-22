@@ -1,6 +1,7 @@
 // AI+ unit types (AITk_U) CUDA backend entry: reference and fast-path matmul dispatch.
 #include "ai4-mm.cuh"
 #include "ai4.cuh"
+#include "inkpreq.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
 #include "magic2-v2.cuh"
@@ -1719,7 +1720,12 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int xsh = K % 256 == 0 ? 1 : 0;
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool(), (size_t) n_rows*K);
     ggml_cuda_pool_alloc<float>  s(ctx.pool(), (size_t) n_rows*(K >> (7 + xsh)));
-    if (!fused) ai4_quantize_x((const float *) src1->data, n_rows, K, xsh, q.get(), s.get(), stream);
+    // [INKGLUE MIXQ] the activation may already be quantized by its producer (inkpreq.cu): same bytes, no launch
+    const int8_t * qp = q.get();
+    const float *  sp = s.get();
+    if (!fused && !ggml_cuda_ink_ai4_preq_take(dst, src1->data, n_rows, K, xsh, &qp, &sp)) {
+        ai4_quantize_x((const float *) src1->data, n_rows, K, xsh, q.get(), s.get(), stream);
+    }
 
     // mmv-ID (n_tok <= 8) takes tiles of MMV_ID_BN pairs, so an expert repeated within a token still fits
     int bn = ai4_mmvid_route(n_tok, n_used, n_expert, ggml_ai4_rate(src0->type)) ? ai4k::MMV_ID_BN : (n_tok >= ai4_bn128_min() ? 128 : 64);
@@ -1789,8 +1795,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     switch (ai4_lay_of(src0->type)) {
 #define AI4_MMID_U(L) \
         case L: \
-            if (xsh) { ai4_mm_id_kernels<L, 1>(W, q.get(), s.get(), Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
-            else     { ai4_mm_id_kernels<L, 0>(W, q.get(), s.get(), Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
+            if (xsh) { ai4_mm_id_kernels<L, 1>(W, qp, sp, Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
+            else     { ai4_mm_id_kernels<L, 0>(W, qp, sp, Y, M, K, n_tok, n_expert, n_pairs, idm, bn, max_tiles, stream, sms); } \
             break;
         AI4_MMID_U(ai4k::LAY_AIT2_U)
         AI4_MMID_U(ai4k::LAY_AIT2P_U)
