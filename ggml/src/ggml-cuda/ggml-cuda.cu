@@ -6153,7 +6153,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_instantiate(ggml_cuda_graph * graph) {
+static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
     // fork MOEGAP: GGML_CUDA_GRAPH_NODE_PRIORITY=1 (default off) keeps the priority each kernel was captured
     // with. Without it a replayed graph runs every node at one priority, so the hit-first expert copies (captured
@@ -6174,6 +6174,28 @@ static void ggml_cuda_graph_instantiate(ggml_cuda_graph * graph) {
     }
 #endif
     CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+}
+
+// [HOSTGAP08] GGML_CUDA_GRAPH_LOG=1 also logs the device memory each instantiate takes (cudaMemGetInfo before/after,
+// so other allocations at the same moment would show too): the small-card fit needs the graph cost per card class.
+static void ggml_cuda_graph_instantiate(ggml_cuda_graph * graph) {
+    if (!ggml_cuda_graph_log_on()) {
+        ggml_cuda_graph_instantiate_impl(graph);
+        return;
+    }
+    static std::atomic<int64_t> n_inst{0};
+    static std::atomic<int64_t> total_kib{0};
+    size_t free0 = 0, free1 = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free0, &total));
+    ggml_cuda_graph_instantiate_impl(graph);
+    CUDA_CHECK(cudaMemGetInfo(&free1, &total));
+    size_t n_nodes = 0;
+    CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &n_nodes));
+    const int64_t kib = ((int64_t) free0 - (int64_t) free1) / 1024;
+    const int64_t n   = ++n_inst;
+    const int64_t sum = total_kib += kib;
+    GGML_LOG_INFO("cuda_graph: instantiate %lld: %zu nodes, device memory %+lld KiB (sum over instantiates %lld KiB), free %zu MiB\n",
+        (long long) n, n_nodes, (long long) kib, (long long) sum, free1 >> 20);
 }
 
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
@@ -12724,12 +12746,40 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     // else: properties changed or first call - execute directly (use_cuda_graph stays false)
                 } else {
                     // Post-warmup: normal CUDA graph operation
-                    if (properties_changed) {
+                    // [HOSTGAP08] GGML_CUDA_GRAPH_FAST_RECAPTURE (default 1, 0 = off): a warm graph whose properties changed
+                    // (a decode shape after the KV view grew past a padding step) is re-captured at once and its instance
+                    // updated, instead of one eager call and a capture on the next. The captured kernels are the ones the
+                    // eager call would launch. A key that changes again on the very next call goes back to the warmup rule,
+                    // so a shape that changes every call still runs eagerly.
+                    static const bool fast_recapture = [] {
+                        const char * e = getenv("GGML_CUDA_GRAPH_FAST_RECAPTURE");
+                        return e == nullptr || atoi(e) != 0;
+                    }();
+                    // A new shape's first run may grow the pool; inside capture an out-of-memory retry (pool trim, sync,
+                    // free) is not legal, so the fast path needs headroom (GGML_CUDA_GRAPH_FAST_RECAPTURE_MIN_FREE_MIB,
+                    // default 256) and near-full cards keep the eager first run.
+                    static const size_t fast_recapture_min_free = [] {
+                        const char * e = getenv("GGML_CUDA_GRAPH_FAST_RECAPTURE_MIN_FREE_MIB");
+                        return (size_t) (e ? std::max(0, atoi(e)) : 256) << 20;
+                    }();
+                    bool headroom = false;
+                    if (properties_changed && fast_recapture && graph->instance != nullptr && !graph->recaptured_last) {
+                        size_t free_b = 0, total_b = 0;
+                        headroom = ggml_cuda_mem_get_info_capped(&free_b, &total_b) == cudaSuccess && free_b >= fast_recapture_min_free;
+                        (void) cudaGetLastError();
+                    }
+                    if (headroom) {
+                        graph->recaptured_last = true;
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    } else if (properties_changed) {
                         // Properties changed - reset warmup, execute directly until stable again
                         graph->warmup_complete = false;
                         graph->stable_calls    = 0;
+                        graph->recaptured_last = false;
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                     } else {
+                        graph->recaptured_last = false;
                         use_cuda_graph = true;
                         cuda_graph_update_required = graph->instance == nullptr;
                     }
