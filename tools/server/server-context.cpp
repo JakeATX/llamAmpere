@@ -187,6 +187,36 @@ static bool server_copy_inplace() {
     return v;
 }
 
+// NaN guard (LLAMA_SERVER_NAN_GUARD=0 turns it off). Idea from Strata v0.2.19 core/verify.cpp (MIT); clean
+// reimplementation. A NaN or +inf logit on the sampled row means the forward pass produced garbage; sampling from it
+// gives junk tokens and the slot's cached state would poison later turns. O(1) per token: only the sampled candidate
+// is read (a NaN hidden state makes every logit NaN). -inf is legal (masked tokens) and is not flagged.
+// LLAMA_SERVER_NAN_GUARD_INJECT=<n> (test only) trips the guard from the n-th generated token of every request.
+static bool server_nan_guard_on() {
+    static const bool v = common_speculative_copy_params::env_int("LLAMA_SERVER_NAN_GUARD", 1, 0, 1) != 0;
+    return v;
+}
+
+static int32_t server_nan_guard_inject() {
+    static const int32_t v = common_speculative_copy_params::env_int("LLAMA_SERVER_NAN_GUARD_INJECT", 0, 0, 1 << 30);
+    return v;
+}
+
+static bool server_sampled_logit_bad(common_sampler * smpl, int32_t n_gen_next) {
+    if (!server_nan_guard_on()) {
+        return false;
+    }
+    if (server_nan_guard_inject() > 0 && n_gen_next >= server_nan_guard_inject()) {
+        return true;
+    }
+    const llama_token_data_array * cur_p = common_sampler_get_candidates(smpl, false);
+    if (cur_p == nullptr || cur_p->data == nullptr || cur_p->selected < 0 || (size_t) cur_p->selected >= cur_p->size) {
+        return false; // compact backend greedy output: no candidates to check
+    }
+    const float logit = cur_p->data[cur_p->selected].logit;
+    return std::isnan(logit) || logit == INFINITY;
+}
+
 static int32_t server_copy_ckpt_stale() {
     static const int32_t v = common_speculative_copy_params::env_int("LLAMA_SPEC_COPY_CKPT_STALE", 128, 0, 1024);
     return v;
@@ -5530,6 +5560,20 @@ private:
         }
     }
 
+    // NaN guard: end the request with an error and drop the slot's cached state (target and draft), so the next
+    // request re-reads its prompt from token 0
+    void nan_guard_abort(server_slot & slot) {
+        SLT_ERR(slot, "non-finite logits at generated token %d: ending the request, dropping %d cached tokens\n",
+                (int) slot.stats.n_gen + 1, slot.prompt.n_tokens());
+        send_error(slot, "the model produced non-finite logits (NaN/inf); the request was stopped and its cache dropped",
+                ERROR_TYPE_SERVER);
+        slot.prompt_clear();
+        if (slot.ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, -1, -1);
+        }
+        slot.release();
+    }
+
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
             if (slot.is_processing()) {
@@ -7852,6 +7896,11 @@ private:
 
             slot.i_batch = -1;
 
+            if (server_sampled_logit_bad(slot.smpl.get(), slot.stats.n_gen + 1)) {
+                nan_guard_abort(slot);
+                return;
+            }
+
             common_sampler_accept(slot.smpl.get(), id, true);
             slot.sj_kvarn_accepted_end = slot.prompt.tokens.pos_next();
 
@@ -7972,6 +8021,10 @@ private:
                 slot.spec_sample_end_us = ggml_time_us();
                 slot.spec_sample_us += (uint64_t) (slot.spec_sample_end_us - t_sample0);
                 GGML_ASSERT(accepted.size() >= 1);
+                if (server_sampled_logit_bad(slot.smpl.get(), slot.stats.n_gen + 1)) {
+                    nan_guard_abort(slot);
+                    return;
+                }
                 if (common_inkspec_log_on() && !slot.spec_is_replay && !replayed_verify) {
                     inkspec_log_round(slot.ctx_tgt, spec_i_batch, slot.spec_draft, accepted.size());
                 }
