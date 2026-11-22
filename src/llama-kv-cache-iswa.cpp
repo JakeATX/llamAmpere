@@ -54,7 +54,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const  layer_share_cb & share,
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
-                     size_t kv_stream_maximum_pool_bytes) : unified(unified) {
+                     size_t kv_stream_maximum_pool_bytes,
+       llama_sj_kvarn_config sj_kvarn) : unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -109,17 +110,63 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     // the multi-cache streaming plan) - forwarding the same
     // kv_stream_phase_arena to both here is safe today only because no
     // caller reaches the swa_full branch with streaming enabled yet.
+    // fork (INKKV): SJ-KVaRN on the full-attention half. Its kernels take 256-wide heads; a 128-wide head cache with an
+    // even KV head count is stored as half as many 256-wide heads (two neighbouring KV heads per row, the same bytes
+    // per token), and the graph packs Q into the matching half of the 256 lanes (llm_graph_context::build_attn_rel).
+    // The SWA half (window-sized) keeps a plain cache: F16 unless LLAMA_INKKV_SWA_TYPE names f16 / q8_0.
+    const llama_hparams * hparams_base = &hparams;
+    ggml_type type_k_swa = type_k;
+    ggml_type type_v_swa = type_v;
+    if (sj_kvarn.enabled()) {
+        bool pack = false;
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if ((!filter || filter(il)) && !hparams.is_swa(il) && hparams.n_embd_head_k(il) == 128 && hparams.n_embd_head_v(il) == 128 &&
+                    hparams.n_head_kv(il) % 2 == 0) {
+                pack = true;
+            }
+        }
+        if (sj_kvarn.bits_k != 4 || sj_kvarn.bits_v != 4 || sj_kvarn.body_type == GGML_TYPE_I16 ||
+                sj_kvarn.body_type == GGML_TYPE_TURBO4_0 || sj_kvarn.edge_layers != 0 || !sj_kvarn.transform.empty()) {
+            throw std::runtime_error("SJ-KVaRN on an iSWA model (Inkling): only 4/4 with the scalar sjkvarn4 body is supported "
+                                     "(no trellis / turbo4 bodies, edge tiers or WUSH transforms)");
+        }
+        if (pack) {
+            hparams_base_sj = std::make_unique<llama_hparams>(hparams);
+            hparams_base_sj->n_embd_head_k_full = 256;
+            hparams_base_sj->n_embd_head_v_full = 256;
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                if ((!filter || filter(il)) && !hparams.is_swa(il)) {
+                    GGML_ASSERT(hparams.n_embd_head_k(il) == 128 && hparams.n_head_kv(il) % 2 == 0 && "INKKV: mixed head sizes");
+                    hparams_base_sj->n_head_kv_arr[il] = hparams.n_head_kv(il)/2;
+                }
+            }
+            hparams_base = hparams_base_sj.get();
+            LLAMA_LOG_INFO("%s: SJ-KVaRN full-attention cache: 128-wide heads packed in pairs as 256-wide heads\n", __func__);
+        }
+        type_k_swa = GGML_TYPE_F16;
+        type_v_swa = GGML_TYPE_F16;
+        if (const char * e = getenv("LLAMA_INKKV_SWA_TYPE"); e && *e) {
+            const std::string t = e;
+            if (t == "q8_0") {
+                type_k_swa = type_v_swa = GGML_TYPE_Q8_0;
+            } else if (t != "f16") {
+                throw std::runtime_error("LLAMA_INKKV_SWA_TYPE: expected f16 or q8_0");
+            }
+        }
+        LLAMA_LOG_INFO("%s: SJ-KVaRN on the non-SWA layers only; SWA cache K/V type %s\n", __func__, ggml_type_name(type_k_swa));
+    }
+
     kv_base = std::make_unique<llama_kv_cache>(
-            model, no_alloc, hparams, type_k, type_v,
+            model, no_alloc, *hparams_base, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share,
-            "", kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes);
+            "", kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes, sj_kvarn);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     const bool swa_is_full_length = size_swa == size_base;
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, no_alloc, hparams, type_k, type_v,
+            model, no_alloc, hparams, type_k_swa, type_v_swa,
             v_trans, offload, unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share,
             "", swa_is_full_length ? kv_stream_stage_bytes : 0,
@@ -134,6 +181,14 @@ void llama_kv_cache_iswa::clear(bool data) {
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     bool res = true;
+
+    if (kv_base->is_sj_kvarn()) {
+        // INKKV: an SJ-KVaRN cache refuses holes and cuts inside sealed records; leave the SWA cache untouched then
+        if (!kv_base->seq_rm(seq_id, p0, p1)) {
+            return false;
+        }
+        return kv_swa->seq_rm(seq_id, p0, p1);
+    }
 
     res = res & kv_base->seq_rm(seq_id, p0, p1);
     res = res & kv_swa ->seq_rm(seq_id, p0, p1);

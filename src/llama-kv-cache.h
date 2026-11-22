@@ -326,6 +326,8 @@ public:
     // largest position <= pos that seq_rm(pos, -1) can truncate to: pos itself unless pos lies inside the sealed body
     // below the intact ring rows, then the group boundary below it
     llama_pos sj_kvarn_rm_floor(llama_seq_id seq_id, llama_pos pos) const;
+    // INKKV: would seq_rm(seq_id, p0, p1) succeed? (no change; hybrid memories ask before touching the recurrent state)
+    bool      sj_kvarn_can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_st[0].N; }
     uint32_t get_sj_kvarn_capacity() const { return sj_kvarn_cap; }
     // [#197] position grid of the seal schedule (0 = off): the splitter must not let a ubatch cross a grid line
@@ -708,6 +710,8 @@ private:
     uint32_t sj_kvarn_seq_stream(llama_seq_id seq_id) const;
     uint32_t sj_kvarn_reopen_lo(uint32_t s) const;
     bool     sj_kvarn_truncate_target(uint32_t s, uint32_t p0, uint32_t & B_new) const;
+    bool     sj_kvarn_rm_plan(llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+                              std::vector<uint32_t> * s_reset, std::vector<uint32_t> * s_trunc) const;
     bool     sj_kvarn_truncate_body(uint32_t s, uint32_t p0);
     // SJ-KVaRN addresses cells, not positions (M-RoPE image tokens share a position): map the callers' positions to cells
     uint32_t  sj_kvarn_cell_of(uint32_t s, llama_pos p) const; // first cell with a position >= p

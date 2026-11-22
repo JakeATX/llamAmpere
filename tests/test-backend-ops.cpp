@@ -14452,6 +14452,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     bool packed_pair = false;
     bool lse_fix = false; // COMPFIX: SJ + LSE route cases, own op name (FLASH_ATTN_EXT_SJKVARN_LSE_ROUTES)
     bool lse_out = false; // LSA compensation: the node also writes its row log-sum-exp (ggml_flash_attn_ext_set_lse), appended to out
+    bool sinks_only = false; // INKKV: attention sinks without the logit softcap attn_options adds
     int lsa_blk = 128;    // mask_mode 9: LSA block size of the block list (ggml_flash_attn_ext_set_lsa_blocks)
     bool lsa_vk = false;  // mask_mode 9: virtual keys (ggml_flash_attn_ext_set_lsa_vk): "lsa_nd" [nbs, n_q] instead of
                           // "lsa_sel" (0 = picked, same blocks in every row; else 1 + a per-row dropped count, 0 for some),
@@ -14470,6 +14471,8 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                          // 9 = LSA block list (LLAMA_LSA_BLKLIST): visible body and ring cells hold GGML_LSA_MASK_SEL
                          //     (seen iff their lsa_blk block is picked in the F32 "lsa_sel" [nbs], ~half picked, blocks
                          //     past nbs hidden), with some plain 0 / -0.25k cells that pass through unchanged
+                         // 10 = INKKV (Inkling relative bias): mask [n_kv, n_q, nh], causal, every visible cell carries a
+                         //      bias that differs per q head (also within one KV group)
     const int data_case; // nonzero cases are CUDA differential checks over exceptional Q/K/V data
     const int compact_bound;
     unsigned init_epoch = 0; // changed device inputs at fixed captured pointers on replay
@@ -14500,6 +14503,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         }
         if (packed_pair) { result += ",packed=1"; }
         if (lse_out) { result += ",lse=1"; }
+        if (sinks_only) { result += ",sinks=1"; }
         if (mask_mode != 0) {
             result += ",mask_mode=" + std::to_string(mask_mode);
         }
@@ -14586,8 +14590,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
           cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
         GGML_ASSERT(n_ring <= cap && n_ring - 37*(n_streams() - 1) >= n_q);
         GGML_ASSERT(ns == 0 || rot != 2);
-        GGML_ASSERT(mask_mode >= 0 && mask_mode <= 9);
+        GGML_ASSERT(mask_mode >= 0 && mask_mode <= 10);
         GGML_ASSERT(mask_mode != 7 || (ns == 0 && compact_bound == 0));
+        GGML_ASSERT(mask_mode != 10 || (ns == 0 && compact_bound == 0 && !row_mask));
         GGML_ASSERT(mask_mode != 9 || (ns == 0 && compact_bound == 0 && rot != 2 && !row_mask));
         GGML_ASSERT(data_case >= 0 && data_case <= 15);
         GGML_ASSERT(data_case == 0 || (hkv == 2 && ns == 0 && rot == 0 && mask_mode == 2));
@@ -14625,7 +14630,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         ggml_set_name(v, "v");
         // Packed masks must also cover the physical ring passed to the generic FA constructor.
         const int64_t mask_kv = packed_pair ? std::max(n_kv_pad(), k->ne[1]) : n_kv_pad();
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, mask_mode == 7 ? nh : 1, n_streams());
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, mask_mode == 7 || mask_mode == 10 ? nh : 1, n_streams());
         ggml_set_name(m, "m");
         ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_rec_pool());
         body->op_params[7] = body_type;
@@ -14634,7 +14639,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         ggml_set_name(desc, "desc");
 
         ggml_tensor * sinks = nullptr;
-        if (attn_options) {
+        if (attn_options || sinks_only) {
             sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
             ggml_set_name(sinks, "sinks");
         }
@@ -14791,7 +14796,10 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                             if (row_mask && p >= S && p < B()) {
                                 value = (p / 16 + j + s) % 3 == 0 ? -INFINITY : -0.25f * (float) ((p + 3*j) % 11);
                             }
-                            if (mask_mode != 0 && p >= S && p < B()) {
+                            if (mask_mode == 10 && value == 0.0f) {
+                                value = -0.03f*float((7*p + 13*hm + j) % 29); // per-q-head relative bias
+                            }
+                            if (mask_mode != 0 && mask_mode != 10 && p >= S && p < B()) {
                                 const int64_t body_pos = p - S;
                                 const int64_t within = body_pos % 512;
                                 const bool live = (mask_mode == 2 && (body_pos < 4 ||
@@ -22391,6 +22399,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4));
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(3, 8, 4, 5, 1000)); // GQA 2, 5 records, ring nearly full
+    // INKKV: Inkling full-attention visits on SJ-KVaRN 4/4, 128-wide heads packed in pairs (24 q heads over 4 packed KV
+    // heads, GQA 6), per-q-head relative-bias mask, zero-logit sinks folded in as real sinks: decode, MTP verify and
+    // prefill widths, the f16 and the production staging (tq6_0 ring + f16 sink), unfused and fused rotation
+    for (int64_t n_q : {1, 2, 4, 8, 9, 64, 257, 512}) {
+        for (ggml_type st : {GGML_TYPE_F16, GGML_TYPE_TQ6_0}) {
+            for (bool sinks : {false, true}) {
+                if (!sinks && n_q <= 8) {
+                    continue; // per-q-head mask without sinks at n_q <= 8 is the LSA per-KV-head route (stream kernel)
+                }
+                auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, st, 128, st == GGML_TYPE_TQ6_0,
+                        GGML_TYPE_F32, 4, 4, 0, 0, 10);
+                t->sinks_only = sinks;
+                test_cases.emplace_back(t);
+            }
+        }
+    }
+    for (int64_t n_q : {1, 9, 257}) {
+        auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                GGML_TYPE_F32, 4, 4, 1, 0, 10);
+        t->sinks_only = true;
+        test_cases.emplace_back(t);
+    }
     // Flash-Next QSA shape (qwen4exp): 24 query heads over 2 KV heads (GQA 12) at the production staging (tq6_0 ring,
     // f16 sink, 4/4 scalar body): decode and MTP widths, prefill ubatches, and two sequences (--parallel 2)
     for (int64_t n_q : {1, 2, 4, 5, 8, 64, 257, 1024}) {
