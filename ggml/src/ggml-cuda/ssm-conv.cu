@@ -257,10 +257,13 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
 // conv arithmetic is ssm_conv_f32's, term for term (same products, same order, same bias add and SILU), so the
 // output bytes match; the windows are bit copies. Each thread owns one channel of one sequence: it reads every
 // value it needs before it writes anything, and it is the only writer of that channel's window columns.
-template <bool apply_silu, int d_conv, int n_t>
+// [INKGLUE] epi: the Inkling short-conv epilogue SCALE(ADD(x, conv)) on the same registers (x = the new row the conv
+// already read): v = (x + y), then scale*v + bias, the expressions of binbcast ADD and scale_f32
+template <bool apply_silu, int d_conv, int n_t, bool epi = false>
 static __global__ void ssm_conv_ring_f32(const ggml_cuda_conv_ring_args args, const float * __restrict__ w_ptr,
                                          const int w_nb1, const float * __restrict__ bias,
-                                         float * __restrict__ dst, const int dst_nb1, const int dst_nb2) {
+                                         float * __restrict__ dst, const int dst_nb1, const int dst_nb2,
+                                         const float epi_scale, const float epi_bias, const float * epi_res) {
     ggml_cuda_pdl_lc();
     constexpr int n_keep = d_conv - 1;
     constexpr int n_col  = n_keep + n_t;
@@ -319,14 +322,23 @@ static __global__ void ssm_conv_ring_f32(const ggml_cuda_conv_ring_args args, co
             sumf += x[i + j] * w[j];
         }
         sumf += b;
-        y[i * stride_y] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        float v = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        if constexpr (epi) {
+            v = x[n_keep + i] + v;
+            v = epi_scale * v + epi_bias;
+            if (epi_res != nullptr) {
+                v = epi_res[c + i * stride_y] + v; // the residual ADD(res, scaled) of the next graph node
+            }
+        }
+        y[i * stride_y] = v;
     }
 }
 
-template <bool apply_silu>
+template <bool apply_silu, bool epi = false>
 static void ssm_conv_ring_f32_cuda(const ggml_cuda_conv_ring_args & args, const float * w, const int w_nb1,
                                    const float * bias, float * dst, const int dst_nb1, const int dst_nb2,
-                                   const int64_t nr, const int64_t n_t, const int64_t n_s, cudaStream_t stream) {
+                                   const int64_t nr, const int64_t n_t, const int64_t n_s, cudaStream_t stream,
+                                   const float epi_scale = 1.0f, const float epi_bias = 0.0f, const float * epi_res = nullptr) {
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);
     const dim3 blocks(n_s, nr / threads, 1);
@@ -334,8 +346,8 @@ static void ssm_conv_ring_f32_cuda(const ggml_cuda_conv_ring_args & args, const 
 
     auto launch = [&](auto NT) {
         constexpr int kNT = decltype(NT)::value;
-        ggml_cuda_kernel_launch(ssm_conv_ring_f32<apply_silu, 4, kNT>, launch_params, args, w, w_nb1, bias,
-                                dst, dst_nb1, dst_nb2);
+        ggml_cuda_kernel_launch(ssm_conv_ring_f32<apply_silu, 4, kNT, epi>, launch_params, args, w, w_nb1, bias,
+                                dst, dst_nb1, dst_nb2, epi_scale, epi_bias, epi_res);
     };
     // the plan (ggml_cuda_conv_ring_match) only accepts d_conv 4 and 1 <= n_t <= GGML_CUDA_CONV_RING_MAX_T
     switch (n_t) {
@@ -515,4 +527,59 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
+}
+
+// [INKGLUE] the planned conv ring of `conv` with the Inkling epilogue SCALE(ADD(x, conv)) written to `out` (contiguous
+// [channels, n_t]); x must be the ring's new-row operand (the residual the ADD reads). false: not planned / not this shape
+bool ggml_cuda_op_ssm_conv_ring_epi(ggml_backend_cuda_context & ctx, ggml_tensor * conv, const ggml_tensor * x,
+        ggml_tensor * out, float scale, float bias, const ggml_tensor * res) {
+    const ggml_tensor * src0 = conv->src[0];
+    const ggml_tensor * src1 = conv->src[1];
+    const int64_t nc  = src1->ne[0];
+    const int64_t nr  = src0->ne[1];
+    const int64_t n_t = conv->ne[1];
+    const int64_t n_s = conv->ne[2];
+    if (nc != 4 || n_s != 1 || n_t < 1 || n_t > GGML_CUDA_CONV_RING_MAX_T || src1->type != GGML_TYPE_F32 ||
+            src1->nb[0] != sizeof(float) || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+            ggml_nelements(out) != nr*n_t || out->ne[0] != nr || nr % 128 != 0 ||
+            x->type != GGML_TYPE_F32 || x->ne[0] != nr || ggml_nrows(x) != n_t || x->nb[0] != sizeof(float) ||
+            (res && (res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) || !ggml_are_same_shape(res, out)))) {
+        return false;
+    }
+    // out must not share memory with what the ring reads (the old state: the CONCAT inputs, whole view sources) or with
+    // res other than exactly; other blocks may still be reading those while this one writes
+    auto overlaps = [&](const ggml_tensor * t) {
+        if (!t || !t->data) {
+            return false;
+        }
+        const ggml_tensor * b = t->view_src ? t->view_src : t;
+        const char * a0 = (const char *) out->data, * a1 = a0 + ggml_nbytes(out);
+        const char * b0 = (const char *) b->data,   * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    for (int k = 0; k < GGML_MAX_SRC && src0->src[k]; ++k) {
+        if (overlaps(src0->src[k])) {
+            return false;
+        }
+    }
+    if (overlaps(src0)) {
+        return false;
+    }
+    for (auto & e : ctx.conv_rings) {
+        if (e.conv != conv) {
+            continue;
+        }
+        // the ring's new rows must be x itself: channel stride 4 bytes, token stride x->nb[1]
+        if (e.args.x != (const float *) x->data || e.args.x_nb1 != (int64_t) sizeof(float) ||
+                (n_t > 1 && e.args.x_nb0 != (int64_t) x->nb[1])) {
+            return false;
+        }
+        ssm_conv_ring_f32_cuda<false, true>(e.args, (const float *) src1->data, src1->nb[1], nullptr, (float *) out->data,
+                out->nb[1], (int) (n_t*out->nb[1]), nr, n_t, n_s, ctx.stream(), scale, bias,
+                res ? (const float *) res->data : nullptr);
+        e.used = true;
+        ctx.fusion_stats.conv_ring++;
+        return true;
+    }
+    return false;
 }

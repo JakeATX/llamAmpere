@@ -2462,6 +2462,7 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+        ggml_tensor * zero_sinks  = nullptr; // fork (INKGLUE): the zero sink logits, one fill per graph
 
         // layer visits built so far: a looped model visits its core layers once per pass, in visit order
         // (cache slot ids are not), so layer-input features (DSpark drafter) are indexed by visit

@@ -1059,14 +1059,13 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
           bool reuse_weights = false, bool nw1 = false, bool smem_grid = false, bool check_rows = true, int rows_override = 0>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters, nw1)*ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mul_mat_vec_q(
-        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+static __device__ __forceinline__ void mul_mat_vec_q_body(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device & fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t nrows_x) {
+        const uint32_t nrows_x, const uint32_t blk_x) {
     // Indexed output columns span all routed experts. Their stride is not
     // the logical row count: tail blocks must not read or overwrite the next expert.
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
@@ -1088,7 +1087,7 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int row0 = rows_per_cuda_block*blk_x; // fork (INKGLUE): blockIdx.x, or the block within a grouped member
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -1431,6 +1430,52 @@ static __global__ void mul_mat_vec_q(
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
     }
+}
+
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+          bool reuse_weights = false, bool nw1 = false, bool smem_grid = false, bool check_rows = true, int rows_override = 0>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters, nw1)*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t nrows_x) {
+    mul_mat_vec_q_body<type, ncols_dst, has_fusion, small_k, halve_iters, reuse_weights, nw1, smem_grid, check_rows, rows_override>(
+        vx_ptr, vy_ptr, ids_ptr, fusion, dst_ptr, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio,
+        stride_sample_x, stride_sample_y, stride_sample_dst, nrows_x, blockIdx.x);
+}
+
+// fork (INKGLUE): several single-column products that share one activation in one launch. Block b runs member k's
+// row block b - blk_begin[k] through the same body (same nwarps and K split as each member's own launch), so every
+// output is bit-identical to the separate launches; only the launch count changes.
+#define MMVQ_GROUP_MAX 8
+struct mmvq_group_args {
+    const void * vx[MMVQ_GROUP_MAX];
+    const void * vy[MMVQ_GROUP_MAX];
+    float      * dst[MMVQ_GROUP_MAX];
+    uint32_t     blk_end[MMVQ_GROUP_MAX];
+    uint32_t     nrows[MMVQ_GROUP_MAX];
+    int          n;
+};
+
+template <ggml_type type, bool small_k>
+__launch_bounds__(calc_nwarps(type, 1, get_device_table_id(), small_k, false, false)*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_group(const mmvq_group_args g, const uint32_t ncols_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint3 one_fd) {
+    const uint32_t b = blockIdx.x;
+    int      k  = 0;
+    uint32_t b0 = 0;
+    while (k < g.n - 1 && b >= g.blk_end[k]) {
+        b0 = g.blk_end[k];
+        ++k;
+    }
+    const ggml_cuda_mm_fusion_args_device fusion{};
+    mul_mat_vec_q_body<type, 1, false, small_k, false, false, false, false, true, 0>(
+        g.vx[k], g.vy[k], nullptr, fusion, g.dst[k], ncols_x, make_uint3(0, 0, 0), stride_row_x, stride_col_y, g.nrows[k],
+        one_fd, 0, 0, 0, one_fd, 0, 0, 0, g.nrows[k], b - b0);
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -3904,6 +3949,131 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+// fork (INKGLUE): grouped single-column MMVQ (see mul_mat_vec_q_group). dsts[k] = MUL_MAT(src0_k, src1) with the same
+// src1 and src0 type for every k; the caller (ggml_cuda_ink_mmgroup in ggml-cuda.cu) checks the layout. Takes the plain
+// n = 1 route of ggml_cuda_mul_mat_vec_q (no ids, fusion or convrot), the same q8_1 activation (shared-quantize cache
+// included) and the same kernel parameters, so each output is bit-identical. Returns false to fall back.
+// one launch for n Q8_0 matvecs of width ne10 (member k reads the q8_1 activation vy[k]); the body, block shapes and
+// small_k choice are mul_mat_vec_q's at ncols_dst 1, so every output is bit-identical to its own launch
+static bool mmvq_group_launch(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, const void * const * vy) {
+    if (n < 1 || n > MMVQ_GROUP_MAX) {
+        return false;
+    }
+    const ggml_type type = GGML_TYPE_Q8_0;
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || table_id == MMVQ_PARAMETERS_GB10) {
+        return false; // should_halve_iters is GB10-only; keep the plain shapes
+    }
+    const int64_t ne10 = dsts[0]->src[1]->ne[0];
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * src0 = dsts[k]->src[0];
+        if (src0->type != type || src0->ne[0] != ne10 || dsts[k]->src[1]->ne[0] != ne10 ||
+                ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            return false;
+        }
+    }
+    if (vy == nullptr) {
+        return true; // support check only
+    }
+    cudaStream_t stream = ctx.stream();
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    auto launch = [&](auto small_k_tag) {
+        constexpr bool c_small_k = decltype(small_k_tag)::value;
+        constexpr ggml_type t = GGML_TYPE_Q8_0;
+        mmvq_group_args g{};
+        g.n = n;
+        uint32_t blk = 0;
+        dim3 block_dims;
+        for (int k = 0; k < n; ++k) {
+            const int nrows = (int) dsts[k]->src[0]->ne[1];
+            const std::pair<dim3, dim3> dims = calc_launch_params<t>(1, nrows, 1, 1, warp_size, table_id, c_small_k, false);
+            blk += dims.first.x;
+            block_dims  = dims.second;
+            g.vx[k]     = dsts[k]->src[0]->data;
+            g.vy[k]     = vy[k];
+            g.dst[k]    = (float *) dsts[k]->data;
+            g.blk_end[k] = blk;
+            g.nrows[k]  = (uint32_t) nrows;
+        }
+        const ggml_cuda_kernel_launch_params lp(dim3(blk, 1, 1), block_dims, 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_group<t, c_small_k>, lp, g, (uint32_t) ne10,
+            (uint32_t) (ne10 / ggml_blck_size(t)), (uint32_t) (ne10_padded / QK8_1), init_fastdiv_values(1));
+    };
+
+    // should_use_small_k of mul_mat_vec_q_switch_ncols_dst at ncols_dst 1 (Q8_0 is in none of its slow-type lists)
+    constexpr int qk = ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qk;
+    constexpr int qi = ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qi;
+    constexpr int vdr = get_vdr_mmvq(GGML_TYPE_Q8_0);
+    const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, table_id);
+    const bool small_k = !GGML_CUDA_CC_IS_RDNA(cc) && nwarps > 1 && ne10/qk < nwarps * (vdr * warp_size / qi);
+    if (small_k) {
+        launch(std::true_type{});
+    } else {
+        launch(std::false_type{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_mul_mat_vec_q_group_pre(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, const void * const * vy) {
+    return mmvq_group_launch(ctx, dsts, n, vy);
+}
+
+bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n) {
+    if (n < 2 || n > MMVQ_GROUP_MAX) {
+        return false;
+    }
+    const ggml_tensor * src1 = dsts[0]->src[1];
+    const ggml_type     type = dsts[0]->src[0]->type;
+    if (type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || get_device_table_id(cc) == MMVQ_PARAMETERS_GB10) {
+        return false;
+    }
+    const int64_t ne10 = src1->ne[0];
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * src0 = dsts[k]->src[0];
+        if (dsts[k]->src[1] != src1 || src0->type != type || src0->ne[0] != ne10 ||
+                ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            return false;
+        }
+    }
+
+    cudaStream_t stream = ctx.stream();
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t  q8_bytes    = ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // same as ggml_cuda_mul_mat_vec_q: reuse or fill the shared-quantize cache
+    auto & qc = ctx.q8_cache;
+    const bool q8_cacheable = ggml_cuda_q8_cacheable(ctx, q8_bytes);
+    ggml_backend_cuda_context::q8_cache_entry * qe =
+        q8_cacheable ? ggml_cuda_q8_cache_find(ctx, src1, type, q8_bytes, ne10_padded) : nullptr;
+    ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
+    char * src1_q8_1 = nullptr;
+    if (qe) {
+        qe->last_use = ++qc.tick;
+        ctx.fusion_stats.q8_cache_hits++;
+        src1_q8_1 = qe->ptr;
+    } else {
+        src1_q8_1 = q8_cacheable ? ggml_cuda_q8_cache_claim(ctx, src1, type, q8_bytes, ne10_padded) : src1_q8_1_local.alloc(q8_bytes);
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        const int64_t s12 = src1->nb[2] / sizeof(float);
+        const int64_t s13 = src1->nb[3] / sizeof(float);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1, type, ne10, s11, s12, s13,
+            ne10_padded, 1, 1, 1, stream);
+    }
+    const void * vy[MMVQ_GROUP_MAX];
+    for (int k = 0; k < n; ++k) {
+        vy[k] = src1_q8_1;
+    }
+    return mmvq_group_launch(ctx, dsts, n, vy);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
