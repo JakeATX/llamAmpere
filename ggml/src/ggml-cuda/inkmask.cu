@@ -13,9 +13,10 @@ static bool ink_relmask_enabled() {
 namespace {
 struct ink_relmask_counter {
     std::atomic<long long> n{0};
+    std::atomic<long long> matched{0};
     ~ink_relmask_counter() {
-        if (n.load() > 0) {
-            fprintf(stderr, "[INKMASK] fused rel-bias masks: %lld\n", n.load());
+        if (n.load() > 0 || matched.load() > 0) {
+            fprintf(stderr, "[INKMASK] fused rel-bias masks: %lld (matched %lld)\n", n.load(), matched.load());
         }
     }
 };
@@ -35,10 +36,19 @@ struct ink_relmask_chain {
     int out    = 0;   // CPY F32->F16 (last node)
 };
 
+static int ink_relmask_log_level() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_INK_MASK_LOG"); return e ? atoi(e) : 0; }();
+    return v;
+}
+// GGML_CUDA_INK_MASK_LOG=2: print why a GET_ROWS F32 node did not match (first 64), step = order of the checks
+static std::atomic<int> g_ink_fail_logs{0};
+#define INK_FAIL(step) do { if (ink_relmask_log_level() >= 2 && (step) > 2 && g_ink_fail_logs.fetch_add(1) < 64) { \
+        GGML_LOG_WARN("[INKMASK] no match at node %d (%s): step %d\n", i, cgraph->nodes[i]->name, (step)); } return false; } while (0)
+
 static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_chain & ch) {
     const ggml_tensor * G = cgraph->nodes[i];
     if (G->op != GGML_OP_GET_ROWS || G->type != GGML_TYPE_F32 || G->view_src != nullptr) {
-        return false;
+        INK_FAIL(1);
     }
     const ggml_tensor * A = G->src[0];
     const ggml_tensor * I = G->src[1];
@@ -46,11 +56,11 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
             A->nb[0] != sizeof(float) || I->nb[0] != sizeof(int32_t) || A->ne[3] != 1 || I->ne[2] != 1 || I->ne[3] != 1 ||
             A->ne[2] != I->ne[1] || A->ne[0] > 256 || !ggml_is_contiguous(G) ||
             A->nb[1] % sizeof(float) != 0 || A->nb[2] % sizeof(float) != 0 || I->nb[1] % sizeof(int32_t) != 0) {
-        return false;
+        INK_FAIL(2);
     }
     const int64_t H = G->ne[0], n_kv = G->ne[1], T = G->ne[2];
     if (T > 65535 || G->ne[3] != 1) {
-        return false;
+        INK_FAIL(3);
     }
 
     int j = i + 1;
@@ -61,12 +71,12 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
     }
     ch.n_view = j - (i + 1);
     if (ch.n_view == 0 || j >= cgraph->n_nodes) {
-        return false;
+        INK_FAIL(4);
     }
     const ggml_tensor * P = cur;
     const ggml_tensor * C = cgraph->nodes[j];
     if (C->op != GGML_OP_CONT || C->src[0] != P || C->type != GGML_TYPE_F32 || !ggml_is_contiguous(C)) {
-        return false;
+        INK_FAIL(5);
     }
     ch.cont = j - i;
 
@@ -75,54 +85,54 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
     if (P->view_src != G || P->view_offs != 0 || P->ne[0] != n_kv || P->ne[2] != H || Ts*ns != T ||
             P->nb[0] != (size_t) H*sizeof(float) || P->nb[1] != (size_t) H*n_kv*sizeof(float) ||
             P->nb[2] != sizeof(float) || P->nb[3] != (size_t) H*n_kv*Ts*sizeof(float)) {
-        return false;
+        INK_FAIL(6);
     }
 
     ++j;
     if (j >= cgraph->n_nodes) {
-        return false;
+        INK_FAIL(7);
     }
     if (cgraph->nodes[j]->op == GGML_OP_CPY) {
         const ggml_tensor * mc = cgraph->nodes[j];
         if (mc->type != GGML_TYPE_F32 || mc->src[0] == nullptr || mc->src[0]->type != GGML_TYPE_F16 ||
                 !ggml_are_same_shape(mc, mc->src[0])) {
-            return false;
+            INK_FAIL(8);
         }
         ch.mcast = j - i;
         ++j;
         if (j >= cgraph->n_nodes) {
-            return false;
+            INK_FAIL(9);
         }
     }
     const ggml_tensor * D = cgraph->nodes[j];
     if (D->op != GGML_OP_ADD || D->type != GGML_TYPE_F32 || !ggml_are_same_shape(D, C) || !ggml_is_contiguous(D)) {
-        return false;
+        INK_FAIL(10);
     }
     const ggml_tensor * M = D->src[0] == C ? D->src[1] : D->src[1] == C ? D->src[0] : nullptr;
     if (M == nullptr || M == C) {
-        return false;
+        INK_FAIL(11);
     }
     if (ch.mcast >= 0 && M != cgraph->nodes[i + ch.mcast]) {
-        return false;
+        INK_FAIL(12);
     }
     if (ch.mcast < 0 && M->type != GGML_TYPE_F32) {
-        return false;
+        INK_FAIL(13);
     }
     const ggml_tensor * Mr = ch.mcast >= 0 ? M->src[0] : M; // the tensor the kernel reads
     const size_t mts = ggml_type_size(Mr->type);
     if (!ggml_can_repeat(M, C) || Mr->nb[0] != mts || Mr->nb[1] % mts || Mr->nb[2] % mts || Mr->nb[3] % mts) {
-        return false;
+        INK_FAIL(14);
     }
     ch.add = j - i;
 
     ++j;
     if (j >= cgraph->n_nodes) {
-        return false;
+        INK_FAIL(15);
     }
     const ggml_tensor * O = cgraph->nodes[j];
     if (O->op != GGML_OP_CPY || O->src[0] != D || O->type != GGML_TYPE_F16 || !ggml_are_same_shape(O, D) ||
             !ggml_is_contiguous(O)) {
-        return false;
+        INK_FAIL(16);
     }
     ch.out = j - i;
 
@@ -133,7 +143,7 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
         return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
     };
     if (!O->data || overlaps(O, A) || overlaps(O, I) || overlaps(O, Mr)) {
-        return false;
+        INK_FAIL(17);
     }
 
     // the mask cast records itself as src[1] (ggml_cast), so its use count is 2 (itself + the ADD): checked here and
@@ -143,7 +153,7 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
         const ggml_tensor * mc = cgraph->nodes[mi];
         if (mc->src[1] != mc || (mc->flags & GGML_TENSOR_FLAG_OUTPUT) || !(mc->flags & GGML_TENSOR_FLAG_COMPUTE) ||
                 ggml_node_get_use_count(cgraph, mi) != 2) {
-            return false;
+            INK_FAIL(18);
         }
     }
 
@@ -151,7 +161,7 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
     int idxs[12];
     int count = 0;
     if (ch.out + 1 > 12) {
-        return false;
+        INK_FAIL(19);
     }
     for (int k = 0; k <= ch.out; ++k) {
         if (k == ch.mcast) {
@@ -162,7 +172,8 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
         ++count;
     }
     const int outs[1] = { i + ch.out };
-    return ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, outs, 1);
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, outs, 1)) { INK_FAIL(99); }
+    return true;
 }
 
 int ggml_cuda_ink_relmask_match(const ggml_cgraph * cgraph, int i) {
@@ -170,7 +181,11 @@ int ggml_cuda_ink_relmask_match(const ggml_cgraph * cgraph, int i) {
         return 0;
     }
     ink_relmask_chain ch;
-    return ink_relmask_parse(cgraph, i, ch) ? ch.out : 0;
+    if (!ink_relmask_parse(cgraph, i, ch)) {
+        return 0;
+    }
+    g_ink_relmask_count.matched.fetch_add(1, std::memory_order_relaxed);
+    return ch.out;
 }
 
 // one thread per key cell k of query row t (blockIdx.y = ts + Ts*s); loops over the heads
