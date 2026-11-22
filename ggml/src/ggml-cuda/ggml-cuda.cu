@@ -11886,7 +11886,8 @@ static int ggml_cuda_try_fuse_ink_router(ggml_backend_cuda_context * ctx, ggml_c
             !ggml_cuda_should_use_topk_moe(gating, mm, weights, ids)) {
         return 0;
     }
-    if (weights->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || ggml_nrows(weights) != 1 ||
+    if (weights->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            weights->ne[0] != 1 || weights->ne[2] != 1 || weights->ne[3] != 1 || ids->ne[0] != weights->ne[1] ||
             ids->nb[1] / ggml_type_size(ids->type) != (size_t) mm->ne[0] ||
             !ggml_cuda_inkrouter_supported(w, y, (int) weights->ne[1], cc, warp_size)) {
         return 0;
