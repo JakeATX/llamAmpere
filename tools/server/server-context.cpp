@@ -909,6 +909,10 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // when the current task was given to this slot (short-first prompt order, LLAMA_SERVER_SHORT_FIRST)
+    int64_t t_admit_us = 0;
+    int64_t t_fill_us  = 0; // last time this slot's prompt added rows to a call (short-first aging)
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_ctx_cap = 0; // --slot-ctx: n_ctx is a reserved cap (prompt-cache loads stay under it); 0 = unset
@@ -3882,6 +3886,8 @@ private:
         slot.sj_kvarn_accepted_end = -1;
         slot.sj_kvarn_idle_pending = false;
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.t_admit_us = ggml_time_us();
+        slot.t_fill_us  = slot.t_admit_us;
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -5548,6 +5554,89 @@ private:
         }
     }
 
+    // LLAMA_SERVER_SHORT_FIRST=<tokens> (default 4096; 0 = off, slots fill a call in id order as before): when the
+    // prompt part of a call is built, a prompt with at most that many tokens still to read goes before longer ones,
+    // in arrival order within each group, so a short chat beside a long agent read gets the next call instead of
+    // waiting for the whole read. A prompt that has waited LLAMA_SERVER_SHORT_FIRST_AGING_S (default 30) since it was
+    // given to its slot counts as short, so a long read is never held back for good. Only the order in which slots
+    // fill a call changes, never what is read. Children still come after all parents (as iterate() does).
+    static int64_t short_first_tokens() {
+        static const int64_t v = [] {
+            const char * e = getenv("LLAMA_SERVER_SHORT_FIRST");
+            return e ? std::max<int64_t>(0, atoll(e)) : (int64_t) 4096;
+        }();
+        return v;
+    }
+
+    static int64_t short_first_aging_us() {
+        static const int64_t v = [] {
+            const char * e = getenv("LLAMA_SERVER_SHORT_FIRST_AGING_S");
+            return (int64_t) ((e ? std::max(0.0, atof(e)) : 30.0) * 1e6);
+        }();
+        return v;
+    }
+
+    // prompt tokens this slot still has to read (STARTED: an estimate from the slot's own cached prefix)
+    static int64_t prompt_tokens_left(server_slot & slot) {
+        const int64_t n = slot.task->n_tokens();
+        if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+            return std::max<int64_t>(0, n - slot.prompt.n_tokens());
+        }
+        const int64_t keep = slot.task->params.cache_prompt && !slot.task->is_stateless()
+            ? (int64_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens) : 0;
+        return std::max<int64_t>(0, n - keep);
+    }
+
+    // order of the prompt-batching pass: (short or aged, arrival time); slots not reading a prompt keep id order after
+    // them. Returns false when short-first is off (the caller then uses iterate()).
+    bool prompt_order(std::vector<server_slot> & slots, int pass, std::vector<server_slot *> & out) {
+        out.clear();
+        const int64_t thr = short_first_tokens();
+        if (thr <= 0) {
+            return false;
+        }
+        const int64_t now = ggml_time_us();
+        struct item { int cls; int64_t t; int id; server_slot * s; };
+        std::vector<item> items;
+        for (auto & slot : slots) {
+            const bool is_child = slot.is_processing() && slot.task->is_child();
+            if (is_child != (pass == 1)) {
+                continue;
+            }
+            item it = { 2, 0, slot.id, &slot };
+            if (slot.task && (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT)) {
+                // aging counts time without progress, not read time: a long read that keeps filling the rest of
+                // each call is not starved and must not jump ahead of new short prompts
+                const bool aged = now - std::max(slot.t_admit_us, slot.t_fill_us) >= short_first_aging_us();
+                it.cls = (aged || prompt_tokens_left(slot) <= thr) ? 0 : 1;
+                it.t   = slot.t_admit_us;
+            }
+            items.push_back(it);
+        }
+        std::stable_sort(items.begin(), items.end(), [](const item & a, const item & b) {
+            return a.cls != b.cls ? a.cls < b.cls : (a.t != b.t ? a.t < b.t : a.id < b.id);
+        });
+        for (const auto & it : items) {
+            out.push_back(it.s);
+        }
+        return true;
+    }
+
+    // iterate() for the prompt-batching pass, in prompt_order()
+    void iterate_prompts(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
+        std::vector<server_slot *> order;
+        if (!prompt_order(slots, 0, order)) {
+            iterate(slots, callback);
+            return;
+        }
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass == 1) {
+                prompt_order(slots, 1, order);
+            }
+            iterate(order, callback);
+        }
+    }
+
     void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
@@ -6410,11 +6499,11 @@ private:
             return mix_prompt_cap >= 0 && batch.size() - mix_batch0 >= mix_prompt_cap;
         };
 
-        // next, batch any pending prompts without exceeding n_batch
+        // next, batch any pending prompts without exceeding n_batch (short prompts first, LLAMA_SERVER_SHORT_FIRST)
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            iterate_prompts(slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch || mix_capped()) {
                     return; // batch is full, skip remaining slots
                 }
@@ -7191,6 +7280,9 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    if (n_tokens_cur > 0) {
+                        slot.t_fill_us = ggml_time_us();
+                    }
 
                     if (!batch.ckpt_spots.empty()) {
                         batch.ckpt_slot = slot.id;
