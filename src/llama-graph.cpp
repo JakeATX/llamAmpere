@@ -9264,13 +9264,14 @@ static bool llama_inkattn_rel_on() {
     return on;
 }
 
-// INKATTN pays only on deep caches: below this many cache cells the dense mask path (with INKGLUE's REL fusion) is
-// faster (3K/8K chat on a 3090: INKATTN -2.4%/-2.8%). GGML_CUDA_INKATTN_MIN_KV=0 = INKATTN at every depth.
+// INKATTN minimum cache depth. Default 0 = every depth: with INKGLUE RELTAB (the rel table in one launch) INKATTN is
+// at least as fast as the dense mask path at 3K and 16K (g3, 3090 Ti, AI4 fold, chat temp 1: 3K 111.67 vs 111.58,
+// 16K 104.09 vs 103.56 tok/s). GGML_CUDA_INKATTN_MIN_KV=N = dense below N cells (e.g. 16384 for builds without RELTAB).
 // The CUDA side (inkattn.cu) reads the same variable for plain FA nodes.
 static int64_t llama_inkattn_min_kv() {
     static const int64_t v = [] {
         const char * e = getenv("GGML_CUDA_INKATTN_MIN_KV");
-        return e && *e ? (int64_t) atoll(e) : (int64_t) 16384;
+        return e && *e ? (int64_t) atoll(e) : (int64_t) 0;
     }();
     return v;
 }

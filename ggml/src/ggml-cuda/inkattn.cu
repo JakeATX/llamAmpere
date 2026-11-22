@@ -387,9 +387,9 @@ static bool inkattn_check(const int cc, const ggml_tensor * dst, const int mode)
     if (dst->src[9] != nullptr && lse == nullptr) {
         return false;
     }
-    // plain dense FA nodes over the whole cache: only on deep caches (the threshold the graph uses for INKREL nodes,
-    // see llama-graph.cpp). Nodes with an LSE output (INKREL near, INKLSA compact) keep INKATTN at any length.
-    static const int min_kv = inkattn_env_int("GGML_CUDA_INKATTN_MIN_KV", 16384);
+    // plain dense FA nodes over the whole cache: only at >= GGML_CUDA_INKATTN_MIN_KV cells (default 0 = always; the
+    // threshold the graph uses for INKREL nodes, see llama-graph.cpp). Nodes with an LSE output (INKREL near, INKLSA compact) keep INKATTN at any length.
+    static const int min_kv = inkattn_env_int("GGML_CUDA_INKATTN_MIN_KV", 0);
     if (!inkrel && lse == nullptr && K->ne[1] < min_kv) {
         return false;
     }
