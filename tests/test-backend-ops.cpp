@@ -18449,6 +18449,17 @@ static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, b
             }
         }
     }
+    // per-head mask (Inkling rel bias, mask ne[2] = 24) over turbo / TQ K/V: the fused turbo MMA decode route must not
+    // pack the GQA group onto one mask row (n_kv % 256 == 0 so the packing would otherwise apply)
+    for (ggml_type tk : {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TQ6_0}) {
+        for (int64_t nb : {1, 2, 4}) {
+            cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1024, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tk,
+                {0, 1, 2, 3}, true, false, 0, 0, 24));
+        }
+    }
+    cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1024, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_TQ6_0,
+        GGML_TYPE_TURBO3_0, {0, 1, 2, 3}, true, false, 0, 0, 24));
+
     // INKREL: bias table + rel_pos (+ gate) inside the node
     for (int64_t kv : {48, 113, 1000, 1536, 4096}) {
         for (int64_t T : {1, 2, 5}) {
