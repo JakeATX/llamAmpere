@@ -10872,7 +10872,8 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     }
     // (after the LSA check, so a refusal reports the LSA reason first)
     if (params.sj_kvarn_bits_k > 0 || params.sj_kvarn_bits_v > 0) {
-        const bool inkling = model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP;
+        const bool inkling = model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP ||
+                (model->arch == LLM_ARCH_DFLASH && model->hparams.dspark_markov_rank > 0 && model->hparams.swa_type != LLAMA_SWA_TYPE_NONE);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
                 continue;

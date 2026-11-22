@@ -31,7 +31,8 @@ public:
         const  layer_share_cb & share,
                           size_t kv_stream_stage_bytes = 0,
                           void * kv_stream_phase_arena = nullptr,
-                          size_t kv_stream_maximum_pool_bytes = 0);
+                          size_t kv_stream_maximum_pool_bytes = 0,
+                   llama_sj_kvarn_config sj_kvarn = llama_sj_kvarn_config()); // fork (INKKV): see below
 
     llama_kv_cache_iswa(
             const llama_model & model,

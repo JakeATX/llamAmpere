@@ -2093,6 +2093,11 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             k = build_norm(k, l.attn_k_ctx_norm, nullptr, LLM_NORM_RMS, il);
             k = build_rope(k, positions, il);
             const bool swa = hparams.is_swa(il);
+            if (!swa && attn->self_sj_kvarn_desc != nullptr) {
+                // INKKV: SJ-KVaRN full-attention half, 128-wide heads stored as 256-wide pairs
+                build_sj_pair_store(attn, k, v, il);
+                continue;
+            }
             const auto * kv = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
             auto * k_rot = swa ? attn->self_k_rot_swa[il] : attn->self_k_rot[il];
             auto * v_rot = swa ? attn->self_v_rot_swa[il] : attn->self_v_rot[il];

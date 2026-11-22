@@ -5355,7 +5355,7 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
 
 // INKKV v2: far mask of the SJ-KVaRN base: cells hold one sequence at their positions with no holes, so the cells at
 // distance >= extent from row i are the prefix [0, cell_of(pos_i - extent + 1)) of the occupied cells
-void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     GGML_ASSERT(dst->type == GGML_TYPE_F16 && dst->ne[2] == 1 && dst->ne[3] == 1 && sj_kvarn.enabled());
     const int64_t n_kv = dst->ne[0];
     const int64_t T    = dst->ne[1];
@@ -5424,6 +5424,7 @@ void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch
         return;
     }
     std::vector<ggml_fp16_t> data(n_kv*T, ninf);
+    int64_t end = 0;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_seq_id seq = ubatch->seq_id[i][0];
         const uint32_t strm = seq_to_stream.at(seq);
@@ -5436,10 +5437,12 @@ void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch
         for (int64_t j = 0; j < c1; ++j) {
             if (!cells.is_empty(j) && cells.seq_has(j, seq) && cells.pos_get(j) <= pf) {
                 data[i*n_kv + j] = zero;
+                end = std::max<int64_t>(end, j + 1);
             }
         }
     }
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+    return end;
 }
 
 // INKREL (llama-inklsa.h): far mask over every cell, near cells (within extent of some row) with their bias rows
@@ -7744,8 +7747,8 @@ void llama_kv_cache_context::set_input_lsa_pos(ggml_tensor * cell_pos, ggml_tens
     kv->set_input_lsa_pos(cell_pos, q_pos, ubatch);
 }
 
-void llama_kv_cache_context::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    kv->set_input_sj_far_mask(dst, ubatch, extent);
+int64_t llama_kv_cache_context::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    return kv->set_input_sj_far_mask(dst, ubatch, extent);
 }
 
 bool llama_kv_cache_context::has_layer(int32_t il) const {

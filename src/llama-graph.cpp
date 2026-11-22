@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 #include "ggml-inkrel.h"
+#include "ggml-inksj.h"
 #include "llama-lsa.h"
 #include "../ggml/src/ggml-lsa-recall.h"
 #include "llama-lsa-gather.h"
@@ -121,6 +122,16 @@ static ggml_tensor * build_attn_inp_kq_mask(
 // below pos - extent, so no far row is all -inf), and the SWA copy covers the whole near window of the lowest row (no
 // gap after a seq_rm). A reserve graph decides from shapes only (base n_kv > extent) so the split graph is the one
 // sized at load; the dense path then only runs below extent, where its mask is small.
+// INKKV far visible end (GGML_SJKVARN_DESC_FAR_END): the far decode node skips the fully masked ring strips past the
+// last far-visible position (exact: those strips add nothing). LLAMA_INKKV_FAR_END=0 turns it off.
+static bool llama_inkkv_far_end_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_INKKV_FAR_END");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    return on;
+}
+
 static bool inkkv_split_want(const llama_kv_cache_iswa_context * attn_ctx, const llama_ubatch & ubatch, const llama_cparams & cparams,
         uint32_t extent, uint32_t extent_swa, int32_t il_full, bool reserve) {
     if (il_full < 0 || !attn_ctx->get_base()->is_sj_kvarn() || !attn_ctx->get_swa()->has_layer(il_full) ||
@@ -1250,6 +1261,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     mctx->get_swa()->set_input_attn_mask(self_attn_mask_swa, ubatch, cparams.causal_attn);
+
+    if (self_sj_kvarn_desc && self_sj_kvarn_desc->buffer) {
+        mctx->get_base()->set_input_sj_kvarn_desc(self_sj_kvarn_desc, ubatch, 0);
+    }
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -1258,6 +1273,10 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
 
     bool res = true;
+
+    if (self_sj_kvarn_desc) {
+        res &= sj_kvarn_n_kv_streams == mctx->get_base()->get_sj_kvarn_n_kv_streams();
+    }
 
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
@@ -1873,7 +1892,15 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (self_sj_far_mask && self_sj_far_mask->buffer) {
-        attn_ctx->get_base()->set_input_sj_far_mask(self_sj_far_mask, ubatch, extent);
+        const int64_t far_end = attn_ctx->get_base()->set_input_sj_far_mask(self_sj_far_mask, ubatch, extent);
+        if (self_sj_far_desc && self_sj_far_desc->buffer) {
+            // the far node's desc: the ring strips past the far visible end are fully masked and skipped
+            attn_ctx->get_base()->set_input_sj_kvarn_desc(self_sj_far_desc, ubatch, 0);
+            if (self_sj_far_desc->ne[1] == 1 && llama_inkkv_far_end_on()) {
+                GGML_ASSERT(far_end < (int64_t(1) << (31 - GGML_INKSJ_FAR_END_SHIFT)));
+                ((int32_t *) self_sj_far_desc->data)[GGML_INKSJ_DESC_FLAGS] |= (int32_t) (std::max<int64_t>(far_end, 1) << GGML_INKSJ_FAR_END_SHIFT);
+            }
+        }
     }
 
     if (inkrel.on && inkrel.far_mask->buffer) {
@@ -4469,7 +4496,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             const int group = sj_kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;
             const bool fused_rot = sj_kvarn_pending.fused_rot;
             ggml_tensor * wush_ao = sj_kvarn_pending.wush_ao;
+            const bool inksj = sj_kvarn_pending.inksj;
             sj_kvarn_pending = {};
+            if (inksj) {
+                ggml_flash_attn_ext_set_inksj(cur); // INKKV: pair-packed Inkling heads (ggml-inksj.h)
+            }
             if (wush_ao) {
                 if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
                 cur = llm_graph_sj_wush_apply(ctx0, cur, wush_ao);
@@ -8315,6 +8346,20 @@ static ggml_tensor * build_attn_iswa_impl(
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
+    // INKKV: SJ-KVaRN full-attention half with pair-packed 128-wide heads (the Inkling DSpark drafter)
+    if (!is_swa && inp->self_sj_kvarn_desc != nullptr) {
+        GGML_ASSERT(k_cur && v_cur && kq_b == nullptr && kv_rows == nullptr && v_mla == nullptr && !k_rot && !v_rot);
+        ggml_tensor * cur = gctx.build_attn_sj_pair(inp, inp->self_sj_kvarn_desc, &inp->sj_kvarn_n_kv_streams,
+                q_cur, k_cur, v_cur, kq_mask, sinks, kq_scale, il);
+        if (wo) {
+            cur = gctx.build_lora_mm(wo, cur, wo_s);
+        }
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+        return cur;
+    }
+
     build_attn_scale_kv_inputs(ctx0, mctx_cur, q_cur, k_cur, v_cur, il);
 
     // these nodes are added to the graph together so that they are not reordered
@@ -8640,6 +8685,14 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->get_k_rot();
     inp->self_v_rot_swa = mctx_cur->get_swa()->get_v_rot();
+
+    // INKKV: SJ-KVaRN full-attention half (the Inkling DSpark drafter; llama_kv_cache_iswa packs the head pairs)
+    if (mctx_cur->get_base()->is_sj_kvarn()) {
+        GGML_ASSERT(cparams.flash_attn && "INKKV: SJ-KVaRN needs flash attention");
+        GGML_ASSERT(!mctx_cur->get_base()->has_sj_kvarn_edge_tier() && "INKKV: SJ-KVaRN edge tiers are not supported");
+        inp->self_sj_kvarn_desc = mctx_cur->get_base()->build_input_sj_kvarn_desc(ctx0, ubatch);
+        inp->sj_kvarn_n_kv_streams = mctx_cur->get_base()->get_sj_kvarn_n_kv_streams();
+    }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
 }
@@ -9126,6 +9179,8 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
             inp->self_sj_far_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens, 1, 1);
             ggml_set_input(inp->self_sj_far_mask);
             ggml_set_name(inp->self_sj_far_mask, "attn_inp_sj_far_mask");
+            inp->self_sj_far_desc = attn_ctx->get_base()->build_input_sj_kvarn_desc(ctx0, ubatch);
+            ggml_set_name(inp->self_sj_far_desc, "attn_inp_sj_far_desc");
         } else if (!is_reserve && attn_ctx->get_base()->get_n_kv() > extent + ubatch.n_tokens) {
             static bool warned = false;
             if (!warned) {
@@ -9360,9 +9415,57 @@ ggml_tensor * llm_graph_context::build_attn_rel_sj(
               float   kq_scale,
                 int   il,
         ggml_tensor ** lse_out) const {
-    auto * inp_attn = inp->get_attn();
+    // the far node (lse_out) reads its own desc, which carries the far visible end
+    ggml_tensor * desc = lse_out != nullptr && inp->self_sj_far_desc ? inp->self_sj_far_desc : inp->self_sj_kvarn_desc;
+    return build_attn_sj_pair(inp->get_attn(), desc, &inp->sj_kvarn_n_kv_streams, q_cur, k_cur, v_cur, kq_mask, sinks,
+            kq_scale, il, lse_out);
+}
+
+// INKKV: store this ubatch's 128-wide K/V heads into an SJ-KVaRN base cache as 256-wide head pairs (rotated as the
+// cache expects). Also used by the Inkling DSpark drafter's context injection (models/dflash.cpp).
+void llm_graph_context::build_sj_pair_store(
+        llm_graph_input_attn_kv_iswa * inp_attn,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+                int   il) const {
     const auto * mctx_cur = inp_attn->mctx->get_base();
     GGML_ASSERT(mctx_cur->is_sj_kvarn() && !cparams.training);
+    GGML_ASSERT(!inp_attn->self_k_rot[il] && !inp_attn->self_v_rot[il] && !mctx_cur->get_k_scale(il) && !mctx_cur->get_v_scale(il));
+    const int64_t dh  = k_cur->ne[0];
+    const int64_t Hkv = k_cur->ne[1];
+    const int64_t T   = k_cur->ne[2];
+    GGML_ASSERT(dh == 128 && v_cur->ne[0] == dh && v_cur->ne[1] == Hkv && Hkv % 2 == 0);
+    ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_is_contiguous(k_cur) ? k_cur : ggml_cont(ctx0, k_cur), 2*dh, Hkv/2, T);
+    ggml_tensor * v = ggml_reshape_3d(ctx0, ggml_is_contiguous(v_cur) ? v_cur : ggml_cont(ctx0, v_cur), 2*dh, Hkv/2, T);
+    const int group = mctx_cur->get_sj_kvarn().body_type == GGML_TYPE_TURBO4_0 ? 128 : 256;
+    k = ggml_turbo_wht(ctx0, k, 0, group, nullptr);
+    v = ggml_turbo_wht(ctx0, v, 0, group, nullptr);
+    cb(k, "k_sj_kvarn_rot", il);
+    cb(v, "v_sj_kvarn_rot", il);
+    if (mctx_cur->sj_kvarn_fused_rot()) {
+        k = llm_graph_sj_kvarn_unrotate(k); // #139: rotated inside the cache write
+        v = llm_graph_sj_kvarn_unrotate(v);
+    }
+    ggml_build_forward_expand(gf, v);
+    ggml_build_forward_expand(gf, k);
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k, inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v, inp_attn->get_v_idxs(), il));
+}
+
+ggml_tensor * llm_graph_context::build_attn_sj_pair(
+        llm_graph_input_attn_kv_iswa * inp_attn,
+        ggml_tensor * desc,
+        const std::vector<uint32_t> * n_kv_streams,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_mask,
+        ggml_tensor * sinks,
+              float   kq_scale,
+                int   il,
+        ggml_tensor ** lse_out) const {
+    const auto * mctx_cur = inp_attn->mctx->get_base();
+    GGML_ASSERT(mctx_cur->is_sj_kvarn() && !cparams.training && desc != nullptr);
     GGML_ASSERT(!inp_attn->self_k_rot[il] && !inp_attn->self_v_rot[il] && !mctx_cur->get_k_scale(il) && !mctx_cur->get_v_scale(il));
     GGML_ASSERT(mctx_cur->get_sj_wush(il) == nullptr && "INKKV: WUSH-KV transforms are not supported");
     // the per-q-head mask needs the sinks: CUDA serves SJ-KVaRN per-head masks without sinks on the stream decode
@@ -9382,7 +9485,20 @@ ggml_tensor * llm_graph_context::build_attn_rel_sj(
     // 2i+1); the zero half meets the other KV head, so every logit is the 128-wide one, and the mask, sinks and
     // output head order are unchanged (GQA ratio 2g over P heads)
     ggml_tensor * q;
-    {
+    static const bool qpack2 = [] {
+        const char * e = getenv("LLAMA_INKKV_QPACK");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    if (qpack2 && q_cur->type == GGML_TYPE_F32 && q_cur->nb[0] == sizeof(float)) {
+        // two kernels instead of fill + 3 concats: W = [0, q, 0] per head (pad), then packed head (c, side s) is the
+        // 256 lanes of W starting at lane 128*(1 - s), one strided view over W made contiguous (an exact copy).
+        // LLAMA_INKKV_QPACK=0: the concat form below
+        const size_t es = sizeof(float);
+        ggml_tensor * q4 = ggml_view_4d(ctx0, q_cur, dh, 1, H, T, q_cur->nb[1], q_cur->nb[1], q_cur->nb[2], 0);
+        ggml_tensor * w  = ggml_pad_ext(ctx0, q4, 0, 0, 1, 1, 0, 0, 0, 0);                        // [128, 3, H, T]
+        q = ggml_view_4d(ctx0, w, 2*dh, g, 2, P*T, 3*dh*es, (3*dh*g - dh)*es, 6*dh*g*es, dh*es);
+        q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), 2*dh, H, T);
+    } else {
         const size_t hs = q_cur->nb[1];
         ggml_tensor * qe = ggml_view_4d(ctx0, q_cur, dh, g, P, T, hs, 2*g*hs, q_cur->nb[2], 0);
         ggml_tensor * qo = ggml_view_4d(ctx0, q_cur, dh, g, P, T, hs, 2*g*hs, q_cur->nb[2], g*hs);
@@ -9390,8 +9506,6 @@ ggml_tensor * llm_graph_context::build_attn_rel_sj(
         q = ggml_concat(ctx0, ggml_concat(ctx0, qe, z, 0), ggml_concat(ctx0, z, qo, 0), 1); // [256, 2g, P, T]
         q = ggml_reshape_3d(ctx0, q, 2*dh, H, T);
     }
-    ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_is_contiguous(k_cur) ? k_cur : ggml_cont(ctx0, k_cur), 2*dh, P, T);
-    ggml_tensor * v = ggml_reshape_3d(ctx0, ggml_is_contiguous(v_cur) ? v_cur : ggml_cont(ctx0, v_cur), 2*dh, P, T);
     cb(q, "q_inkkv_pack", il);
 
     // the SJ-KVaRN rotation, step for step as build_attn (llm_graph_input_attn_kv) does it
@@ -9401,31 +9515,20 @@ ggml_tensor * llm_graph_context::build_attn_rel_sj(
         q = ggml_turbo_wht(ctx0, q, 0, group, nullptr);
         cb(q, "q_sj_kvarn_rot", il);
     }
-    k = ggml_turbo_wht(ctx0, k, 0, group, nullptr);
-    v = ggml_turbo_wht(ctx0, v, 0, group, nullptr);
-    cb(k, "k_sj_kvarn_rot", il);
-    cb(v, "v_sj_kvarn_rot", il);
-    if (mctx_cur->sj_kvarn_fused_rot()) {
-        k = llm_graph_sj_kvarn_unrotate(k); // #139: rotated inside the cache write
-        v = llm_graph_sj_kvarn_unrotate(v);
-    }
-
     ggml_build_forward_expand(gf, q);
-    ggml_build_forward_expand(gf, v);
-    ggml_build_forward_expand(gf, k);
-    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k, inp_attn->get_k_idxs(), il));
-    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v, inp_attn->get_v_idxs(), il));
+    build_sj_pair_store(inp_attn, k_cur, v_cur, il);
 
     uint32_t bits_k = 0, bits_v = 0;
     const int tier = mctx_cur->get_sj_kvarn_layer_tier(il, bits_k, bits_v);
     GGML_ASSERT(tier == 0);
     sj_kvarn_pending.body         = mctx_cur->get_sj_kvarn_body(il);
-    sj_kvarn_pending.desc         = inp->self_sj_kvarn_desc;
+    sj_kvarn_pending.desc         = desc;
     sj_kvarn_pending.bits_k       = (int32_t) bits_k;
     sj_kvarn_pending.bits_v       = (int32_t) bits_v;
     sj_kvarn_pending.fused_rot    = fused_rot;
-    sj_kvarn_pending.n_kv_streams = &inp->sj_kvarn_n_kv_streams;
+    sj_kvarn_pending.n_kv_streams = n_kv_streams;
     sj_kvarn_pending.wush_ao      = nullptr;
+    sj_kvarn_pending.inksj        = fused_rot; // the marker needs un-rotated Q (ggml-inksj.h)
 
     lsa_lse_req = lse_out != nullptr;
     ggml_tensor * cur = build_attn_mha(q, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il), nullptr, kq_mask, nullptr, sinks,

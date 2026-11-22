@@ -29,10 +29,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const  layer_share_cb & share,
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
-                     size_t kv_stream_maximum_pool_bytes) :
+                     size_t kv_stream_maximum_pool_bytes,
+       llama_sj_kvarn_config sj_kvarn) :
     llama_kv_cache_iswa(model, no_alloc, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_ubatch, mem_other, filter, reuse, share,
-            kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes) {
+            kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes, sj_kvarn) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(

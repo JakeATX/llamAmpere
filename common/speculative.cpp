@@ -4908,11 +4908,30 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_arena_mib = 0;
+    // INKKV: the Inkling DSpark drafter (-md DSpark file, draft-dspark) keeps the trunk's SJ-KVaRN 4/4 on its
+    // full-attention layer (the SWA layers stay F16, as on the trunk; llama_kv_cache_iswa packs the 128-wide head
+    // pairs). Kill switch: LLAMA_DSPARK_DRAFT_SJKVARN=0, --no-spec-draft-sjkvarn, or an explicit -ctkd/-ctvd. A non-Inkling draft-dspark
+    // model refuses the SJ-KVaRN cache at context creation (head size), so the switch is the way back there.
+    const bool spec_dspark = has_draft && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; });
+    const bool dspark_sj = spec_dspark && !spec_mtp && !(params_spec.sj_kvarn_explicit && !params_spec.sj_kvarn) && [] {
+            const char * e = std::getenv("LLAMA_DSPARK_DRAFT_SJKVARN");
+            return !(e && *e && std::atoi(e) == 0);
+        }() && params.sj_kvarn_bits_k == 4 && params.sj_kvarn_bits_v == 4 &&
+        params_spec.cache_type_k == GGML_TYPE_COUNT && params_spec.cache_type_v == GGML_TYPE_COUNT &&
+        params.sj_kvarn_edge_layers == 0 && params.sj_kvarn_transform.empty();
     // fork: the automatic default has the same parameter bounds as explicit DSJ.
     const char * sj_kvarn_error = common_speculative_draft_sj_kvarn_error(params);
-    result.speculative.draft.sj_kvarn = params_spec.sj_kvarn ||
-        (!params_spec.sj_kvarn_explicit && sj_kvarn_error == nullptr);
-    if (result.speculative.draft.sj_kvarn) {
+    result.speculative.draft.sj_kvarn = !dspark_sj && (params_spec.sj_kvarn ||
+        (!params_spec.sj_kvarn_explicit && sj_kvarn_error == nullptr));
+    if (dspark_sj) {
+        // the trunk's -ctk/-ctv sjkvarn4 plain type (F16) and its SJ-KVaRN settings are kept as they are in params;
+        // the server's SJ-KVaRN cut / checkpoint rules then cover the draft cache too (draft.sj_kvarn)
+        result.cache_type_k = params.cache_type_k;
+        result.cache_type_v = params.cache_type_v;
+        result.speculative.draft.cache_type_sj_kvarn_default = false;
+        result.speculative.draft.sj_kvarn = true;
+    } else if (result.speculative.draft.sj_kvarn) {
         if (sj_kvarn_error != nullptr) {
             throw std::invalid_argument(sj_kvarn_error);
         }

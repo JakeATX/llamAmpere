@@ -3,6 +3,8 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-i8qk.cuh"
 #include "fattn-prefill-policy.h"
+#include "fattn-sjkvarn-rot.cuh"
+#include "ggml-inksj.h"
 #include "qsa-resident-clock.cuh"
 #include "sjkvarn-lowbits.cuh"
 #include "sjkvarn-seal.cuh"
@@ -624,6 +626,260 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
                 ggml_cuda_kernel_launch(fattn_sj_kvarn_scatter_lse, lse_params,
                     (const float *) ((const char *) scratch_ptr + plan.lse_offset), (float *) lse->data, n_rows, heads*gqa,
                     head_first*gqa, int(Q->ne[2]));
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+    }
+    return true;
+}
+
+// INKKV (ggml-inksj.h): pair-packed Inkling prefill at the real head width. The packed path above runs the f16 MMA at
+// D 256 over 4 packed KV heads (GQA 6), half of every Q.K and P.V lane pair being the zero half or the unused other KV
+// head: twice the work of the F16-cache path (D 128, 8 KV heads, GQA 3). Here the expanded rows are un-rotated in
+// place (the plain H/16 is its own inverse), each packed head's two KV heads are read as D 128 heads (head stride 256
+// bytes inside the 512-byte row), the real half of each q head is gathered, and the D 128 MMA runs per packed head.
+// The output's real halves are written, the other halves zeroed; the LSE rows are the same rows.
+
+static __global__ void k_inksj_unrot_rows_f16(half * __restrict__ x, const int64_t nrows) {
+    const int64_t r = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
+    if (r >= nrows) {
+        return; // a row is a whole warp
+    }
+    const int lane = threadIdx.x;
+    half * row = x + r*256 + 8*lane;
+    const uint4 raw = *reinterpret_cast<const uint4 *>(row);
+    const half2 * h2 = reinterpret_cast<const half2 *>(&raw);
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 f = __half22float2(h2[j]);
+        v[2*j + 0] = f.x;
+        v[2*j + 1] = f.y;
+    }
+    sj_kvarn_rot256_row8(v, lane);
+    uint4 out;
+    half2 * o2 = reinterpret_cast<half2 *>(&out);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        o2[j] = __floats2half2_rn(v[2*j + 0], v[2*j + 1]);
+    }
+    *reinterpret_cast<uint4 *>(row) = out;
+}
+
+// Q [256, T, n_head] (any strides, f32, un-rotated) -> qg [128, T, n_head] contiguous: the real half of every head
+static __global__ void k_inksj_gather_q(const char * __restrict__ q, float * __restrict__ qg, const int T, const int n_head,
+        const int r, const size_t nb1, const size_t nb2) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= (int64_t) 128*T*n_head) {
+        return;
+    }
+    const int d = i % 128;
+    const int t = (i/128) % T;
+    const int h = i/((int64_t) 128*T);
+    const int half_ = h % r >= r/2 ? 1 : 0;
+    qg[i] = *(const float *) (q + t*nb1 + h*nb2 + (128*half_ + d)*sizeof(float));
+}
+
+// one packed head's D 128 output [128, r, T] -> dst rows (t, head_first + c) [256]: real half, zero other half
+static __global__ void k_inksj_scatter_out(const float * __restrict__ src, char * __restrict__ dst, const int T, const int r,
+        const int head_first, const size_t nb0, const size_t nb1, const size_t nb2) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= (int64_t) 256*r*T) {
+        return;
+    }
+    const int d = i % 256;
+    const int c = (i/256) % r;
+    const int t = i/(256*r);
+    const int half_ = c >= r/2 ? 1 : 0;
+    const float v = d/128 == half_ ? src[((int64_t) t*r + c)*128 + d % 128] : 0.0f;
+    *(float *) (dst + t*nb2 + (size_t) (head_first + c)*nb1 + d*nb0) = v;
+}
+
+static bool fattn_sj_kvarn_inksj_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_INKSJ_PREFILL");
+        return value == nullptr || atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_flash_attn_ext_sj_kvarn_inksj_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ggml_flash_attn_ext_is_inksj(dst) || !fattn_sj_kvarn_inksj_enabled() || !ggml_cuda_fattn_sj_kvarn_rot(dst)) {
+        return false; // an unflagged node holds rotated Q: the halves are mixed
+    }
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const fattn_sj_kvarn_prefill_plan plan = fattn_sj_kvarn_prefill_make_plan(cc, dst);
+    if (!plan.ok || plan.chunked || plan.master_bytes || fattn_sj_kvarn_prefill_trellis(dst) ||
+            ggml_get_op_params_i32(dst, 7) != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 || Q->nb[0] != sizeof(float) ||
+            mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[3] != 1 || (mask->ne[2] != 1 && mask->ne[2] != Q->ne[2]) ||
+            dst->type != GGML_TYPE_F32 || ggml_cuda_qsa_clock_strip_master_map(ctx, dst->src[5]) != nullptr ||
+            dst->src[7] != nullptr || dst->src[8] != nullptr || ggml_flash_attn_ext_get_lsa_block(dst) > 0 ||
+            ggml_flash_attn_ext_get_lsa_vk(dst) || mask->ne[1] < Q->ne[1] || mask->nb[1] % 16 != 0 ||
+            (uintptr_t) mask->data % 16 != 0 || ggml_get_op_params_f32(dst, 1) != 0.0f ||
+            (dst->src[4] != nullptr && (dst->src[4]->type != GGML_TYPE_F32 || dst->src[4]->nb[0] != sizeof(float)))) {
+        return false; // LSA block lists / virtual keys / QSA rows: the packed path owns their semantics
+    }
+    const int n_kv   = ggml_get_op_params_i32(dst, 6);
+    const int T      = Q->ne[1];
+    const int n_head = Q->ne[2];
+    const int r      = n_head/K->ne[2]; // packed GQA ratio (even): r/2 q heads per 128-wide KV head
+    ggml_tensor * lse = ggml_flash_attn_ext_get_lse(dst);
+    ggml_cuda_qsa_clock_prepare(ctx, dst);
+
+    const size_t offset = GGML_PAD(ggml_nbytes(dst), 128);
+    const bool reserved = dst->buffer != nullptr && dst->view_src == nullptr && (uintptr_t) dst->data % 128 == 0 &&
+        offset + plan.scratch_bytes <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
+    ggml_cuda_pool_alloc<half> scratch_pool(ctx.pool());
+    half * scratch_ptr = reserved ? (half *) ((char *) dst->data + offset) :
+        scratch_pool.alloc((plan.scratch_bytes + sizeof(half) - 1)/sizeof(half));
+    ggml_cuda_pool_alloc<float> qg(ctx.pool(), (size_t) 128*T*n_head);
+    ggml_cuda_pool_alloc<float> og(ctx.pool(), (size_t) 128*T*r);
+    ggml_cuda_pool_alloc<float> lg(ctx.pool(), lse ? (size_t) T*r : 1);
+    cudaStream_t stream = ctx.stream();
+    {
+        const int64_t n = (int64_t) 128*T*n_head;
+        k_inksj_gather_q<<<(n + 255)/256, 256, 0, stream>>>((const char *) Q->data, qg.ptr, T, n_head, r, Q->nb[1], Q->nb[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    for (int head_first = 0; head_first < K->ne[2]; head_first += plan.heads_per_group) {
+        const int heads = std::min(plan.heads_per_group, int(K->ne[2]) - head_first);
+        const size_t elements = plan.kv_elements_per_head*heads;
+        const ggml_cuda_kernel_launch_params launch_params(dim3(n_kv/16, heads, 1), dim3(32, 8, 1), 16*128*sizeof(half2), stream);
+        ggml_cuda_kernel_launch(fattn_sj_kvarn_expand_prefill, launch_params,
+            (const char *) K->data, (const char *) V->data,
+            ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
+            K->nb[1], K->nb[2], V->nb[1], V->nb[2],
+            (half2 *) scratch_ptr, (half2 *) (scratch_ptr + elements), n_kv, 0, head_first, false,
+            mask->ne[2] == 1 ? (const char *) mask->data : nullptr, mask->nb[1], T, false);
+        CUDA_CHECK(cudaGetLastError());
+        {
+            const int64_t nrows = 2*(int64_t) n_kv*heads; // K rows then V rows, contiguous
+            constexpr int warps = 4;
+            k_inksj_unrot_rows_f16<<<(nrows + warps - 1)/warps, dim3(WARP_SIZE, warps, 1), 0, stream>>>(scratch_ptr, nrows);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        for (int hl = 0; hl < heads; ++hl) {
+            const int ph = head_first + hl;
+            ggml_tensor q = *Q;
+            q.ne[0] = 128; q.ne[1] = T; q.ne[2] = r; q.ne[3] = 1;
+            q.nb[0] = sizeof(float);
+            for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                q.nb[d] = q.nb[d - 1]*q.ne[d - 1];
+            }
+            q.data = qg.ptr + (size_t) ph*r*T*128;
+            q.view_src = nullptr; q.view_offs = 0; q.buffer = nullptr;
+            ggml_tensor k = *K;
+            ggml_tensor v = *V;
+            for (ggml_tensor * t : {&k, &v}) {
+                t->type = GGML_TYPE_F16;
+                t->ne[0] = 128; t->ne[1] = n_kv; t->ne[2] = 2; t->ne[3] = 1;
+                t->nb[0] = sizeof(half);
+                t->nb[1] = 256*sizeof(half);
+                t->nb[2] = 128*sizeof(half);
+                t->nb[3] = t->nb[1]*n_kv;
+                t->view_src = nullptr; t->view_offs = 0; t->buffer = nullptr;
+            }
+            k.data = scratch_ptr + (size_t) hl*plan.kv_elements_per_head;
+            v.data = scratch_ptr + elements + (size_t) hl*plan.kv_elements_per_head;
+            ggml_tensor m = *mask;
+            if (mask->ne[2] != 1) {
+                m.ne[2] = r;
+                m.data = (char *) mask->data + (size_t) ph*r*mask->nb[2];
+                m.view_src = nullptr; m.view_offs = 0;
+            }
+            ggml_tensor sinks;
+            ggml_tensor lse_h;
+            ggml_tensor out = *dst;
+            out.ne[0] = 128; out.ne[1] = r; out.ne[2] = T; out.ne[3] = 1;
+            out.nb[0] = sizeof(float);
+            for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                out.nb[d] = out.nb[d - 1]*out.ne[d - 1];
+            }
+            out.data = og.ptr;
+            out.buffer = nullptr; out.view_src = nullptr; out.view_offs = 0;
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                out.src[i] = nullptr;
+            }
+            out.src[0] = &q;
+            out.src[1] = &k;
+            out.src[2] = &v;
+            out.src[3] = &m;
+            if (dst->src[4] != nullptr) {
+                sinks = *dst->src[4];
+                sinks.ne[0] = r;
+                sinks.data = (char *) sinks.data + (size_t) ph*r*sinks.nb[0];
+                sinks.view_src = nullptr; sinks.view_offs = 0;
+                out.src[4] = &sinks;
+            }
+            if (lse) {
+                lse_h = *lse;
+                lse_h.ne[0] = r; lse_h.ne[1] = T; lse_h.ne[2] = 1; lse_h.ne[3] = 1;
+                lse_h.nb[0] = sizeof(float);
+                for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                    lse_h.nb[d] = lse_h.nb[d - 1]*lse_h.ne[d - 1];
+                }
+                lse_h.data = lg.ptr;
+                lse_h.buffer = nullptr; lse_h.view_src = nullptr; lse_h.view_offs = 0;
+                out.src[9] = &lse_h;
+            }
+            for (int i = 4; i < GGML_MAX_OP_PARAMS/(int) sizeof(int32_t); ++i) {
+                ggml_set_op_params_i32(&out, i, 0); // n_kv_max, SJ-KVaRN, rotation and marker slots
+            }
+            // the f16 MMA tile rule of the F16-cache path (ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2, Ampere, T >= 128)
+            const int g = r/2;
+            // launch_fattn scans the mask rows of whole ncols1 tiles (flash_attn_mask_to_KV_max, T >= 1024) and the
+            // graph's mask has exactly T rows: past 1024 rows, run the 64-row multiple first, then the rest (< 64 rows)
+            const int T0 = T >= 1024 ? T - T % 64 : T;
+            for (int c0 = 0; c0 < T; c0 = c0 == 0 ? T0 : T) {
+                const int nr = (c0 == 0 ? T0 : T) - c0;
+                ggml_tensor qc = q, mc = m, oc = out, lc;
+                qc.ne[1] = nr;
+                qc.data  = (char *) q.data + (size_t) c0*q.nb[1];
+                mc.ne[1] = nr;
+                mc.data  = (char *) m.data + (size_t) c0*m.nb[1];
+                mc.view_src = nullptr; mc.view_offs = 0;
+                oc.ne[2] = nr;
+                oc.nb[3] = oc.nb[2]*nr;
+                oc.data  = og.ptr + (size_t) c0*r*128;
+                oc.src[0] = &qc;
+                oc.src[3] = &mc;
+                if (lse) {
+                    lc = lse_h;
+                    lc.ne[1] = nr;
+                    lc.nb[2] = lc.nb[1]*nr;
+                    lc.nb[3] = lc.nb[2];
+                    lc.data  = lg.ptr + (size_t) c0*r;
+                    oc.src[9] = &lc;
+                }
+                if (mc.ne[2] != 1 || oc.src[4] != nullptr) { // (a padded GQA tile reads sinks past the view)
+                    ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &oc);
+                } else if (g > 4) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 8, 8>(ctx, &oc);
+                } else if (g > 2) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 16, 4>(ctx, &oc);
+                } else if (g > 1) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 32, 2>(ctx, &oc);
+                } else {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &oc);
+                }
+            }
+            {
+                const int64_t n = (int64_t) 256*r*T;
+                k_inksj_scatter_out<<<(n + 255)/256, 256, 0, stream>>>(og.ptr, (char *) dst->data, T, r, ph*r,
+                        dst->nb[0], dst->nb[1], dst->nb[2]);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if (lse) {
+                const int n_rows = T*r;
+                ggml_cuda_kernel_launch(fattn_sj_kvarn_scatter_lse,
+                    ggml_cuda_kernel_launch_params(dim3((n_rows + 255)/256), dim3(256), 0, stream),
+                    (const float *) lg.ptr, (float *) lse->data, n_rows, r, ph*r, n_head);
                 CUDA_CHECK(cudaGetLastError());
             }
         }
