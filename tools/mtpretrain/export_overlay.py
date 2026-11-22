@@ -17,6 +17,7 @@ from gguf.quants import quantize  # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--w', required=True); ap.add_argument('--head', required=True); ap.add_argument('--out', required=True)
+    ap.add_argument('--retype', default='', help='screening only: e.g. q5_0=q8_0 retypes every Q5_0 matrix (size changes)')
     a = ap.parse_args()
     meta = json.loads((Path(a.w) / 'meta.json').read_text())
     head = torch.load(a.head)
@@ -31,6 +32,10 @@ def main():
         t = head[name].float().numpy()
         ne = info['ne']
         qt = gguf.GGMLQuantizationType(info['type'])
+        if a.retype:
+            src, dst = a.retype.upper().split('=')
+            if qt.name == src:
+                qt = gguf.GGMLQuantizationType[dst]
         shape = tuple(reversed(ne))  # numpy row-major [ne1, ne0]
         t = t.reshape(shape).astype(np.float32)
         assert np.isfinite(t).all(), name
@@ -38,7 +43,7 @@ def main():
             w.add_tensor(name, t)
         else:
             q = quantize(t, qt)
-            assert q.nbytes == info['n_bytes'], (name, q.nbytes, info['n_bytes'])
+            assert a.retype or q.nbytes == info['n_bytes'], (name, q.nbytes, info['n_bytes'])
             w.add_tensor(name, q, raw_shape=q.shape, raw_dtype=qt)
         n += 1
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()

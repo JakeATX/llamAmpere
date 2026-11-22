@@ -53,6 +53,7 @@ LAM_TV = float(os.environ.get('MTP_TV', '0'))
 # so training and eval see the weights the overlay will ship (round-to-nearest export ate ~2/3 of the fp32 gain)
 QAT = os.environ.get('MTP_QAT', '0') == '1'
 QTYPE = {'attn_k.weight': 'q8_0', 'attn_v.weight': 'q8_0'}  # every other matrix is Q5_0 (export asserts against meta)
+MAT_Q = os.environ.get('MTP_QAT_MATS', 'q5_0')  # q8_0: train for a sidecar whose Q5_0 matrices become Q8_0 (export --retype q5_0=q8_0)
 
 
 def fake_quant(w, kind):
@@ -61,7 +62,8 @@ def fake_quant(w, kind):
     if kind == 'q8_0':
         d = b.abs().amax(-1, keepdim=True) / 127
         idv = torch.where(d == 0, torch.zeros_like(d), 1 / d)
-        q = torch.round(b * idv)  # np_roundf rounds half away from zero; ties are measure-zero for trained weights
+        x = b * idv; ax = x.abs(); f = ax.floor()
+        q = x.sign() * (f + (2 * (ax - f)).floor())  # = gguf-py np_roundf: half away from zero (ties occur on Q5 grids)
         out = q * d.half().float()
     else:
         imax = b.abs().argmax(-1, keepdim=True)
@@ -102,10 +104,28 @@ class MTPHead(nn.Module):
         if QAT:
             for n in MATS:
                 w = self.w(n)
-                self.qw[n] = (w + (fake_quant(w.detach(), QTYPE.get(n, 'q5_0')) - w.detach())).to(torch.bfloat16)
+                fq = fake_quant(w.detach(), QTYPE.get(n, MAT_Q))
+                if torch.is_grad_enabled():
+                    self.qw[n] = (w + (fq - w.detach())).to(torch.bfloat16)
+                else:
+                    self.qw[n] = fq  # eval: exact fp32 dequantized values
+
+    @torch.no_grad()
+    def code_change(self):
+        """QAT: fraction of matrix weights whose quantized value differs from the start (is training moving codes?)."""
+        if not QAT:
+            return None
+        if not hasattr(self, 'q0'):
+            self.q0 = {n: fake_quant(self.w(n), QTYPE.get(n, MAT_Q)).to(torch.bfloat16) for n in MATS}
+        ch = tot = 0
+        for n in MATS:
+            ch += (fake_quant(self.w(n), QTYPE.get(n, MAT_Q)).to(torch.bfloat16) != self.q0[n]).sum().item(); tot += self.q0[n].numel()
+        return round(ch / tot, 5)
 
     def lin(self, x, n):
         wq = getattr(self, 'qw', {}).get(n)
+        if not torch.is_grad_enabled():  # eval: fp32 weights, like llama.cpp's exact dequantized values (no bf16 rounding)
+            return F.linear(x.float(), wq.float() if wq is not None else self.w(n).float())
         return F.linear(x.to(torch.bfloat16), wq if wq is not None else self.w(n).to(torch.bfloat16)).float()
 
     def proj(self, e, h):
@@ -434,6 +454,7 @@ def cmd_train(a):
         print(msg, flush=True); log.write(msg + '\n'); log.flush()
 
     P(f'train seqs {len(tr)} reply tokens {n_tok}; heldout_sel seqs {len(ho)}; steps {steps_total}; args {vars(a)}')
+    model.code_change()  # snapshot the starting codes
     best = evaluate(ctx, ho, a.eval_seqs)
     P('EVAL step 0 ' + json.dumps(best))
     best_e = best['E7_24']
@@ -469,8 +490,10 @@ def cmd_train(a):
             acc_tok = 0
             if step % a.eval_every == 0 or step == steps_total:
                 r = evaluate(ctx, ho, a.eval_seqs)
+                r['codes_changed'] = model.code_change()
                 P(f'EVAL step {step} ' + json.dumps(r))
-                torch.save({k: v.float().cpu() for k, v in model.state_gguf().items()}, out / f'head_step{step}.pt')
+                if os.environ.get('MTP_SAVE_STEPS') == '1':  # off by default: 1.7 GB per checkpoint
+                    torch.save({k: v.float().cpu() for k, v in model.state_gguf().items()}, out / f'head_step{step}.pt')
                 if r['E7_24'] > best_e:
                     best_e = r['E7_24']
                     torch.save({k: v.float().cpu() for k, v in model.state_gguf().items()}, out / 'head_best.pt')
