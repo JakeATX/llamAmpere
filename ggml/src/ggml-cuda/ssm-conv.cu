@@ -287,9 +287,21 @@ static __global__ void ssm_conv_ring_f32(const ggml_cuda_conv_ring_args args, co
         x[n_keep + i] = *(const float *) (xn + i * args.x_nb0);
     }
     const int stride_w = w_nb1 / sizeof(float);
+    if constexpr (d_conv == 4) {
+        if (stride_w == 4 && (((uintptr_t) w_ptr) & 15) == 0) {
+            const float4 wv = *reinterpret_cast<const float4 *>(w_ptr + c * 4);
+            w[0] = wv.x; w[1] = wv.y; w[2] = wv.z; w[3] = wv.w;
+        } else {
 #pragma unroll
-    for (int j = 0; j < d_conv; ++j) {
-        w[j] = w_ptr[c * stride_w + j];
+            for (int j = 0; j < d_conv; ++j) {
+                w[j] = w_ptr[c * stride_w + j];
+            }
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            w[j] = w_ptr[c * stride_w + j];
+        }
     }
     const float b = bias != nullptr ? bias[c] : 0.0f;
 
@@ -408,9 +420,21 @@ static __global__ void ssm_conv_ring_prefill_f32(const ggml_cuda_conv_ring_args 
 
     float w[d_conv];
     const int stride_w = w_nb1 / sizeof(float);
+    if constexpr (d_conv == 4) {
+        if (stride_w == 4 && (((uintptr_t) w_ptr) & 15) == 0) {
+            const float4 wv = *reinterpret_cast<const float4 *>(w_ptr + c * 4);
+            w[0] = wv.x; w[1] = wv.y; w[2] = wv.z; w[3] = wv.w;
+        } else {
 #pragma unroll
-    for (int j = 0; j < d_conv; ++j) {
-        w[j] = w_ptr[c * stride_w + j];
+            for (int j = 0; j < d_conv; ++j) {
+                w[j] = w_ptr[c * stride_w + j];
+            }
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            w[j] = w_ptr[c * stride_w + j];
+        }
     }
     const float b = bias != nullptr ? bias[c] : 0.0f;
 

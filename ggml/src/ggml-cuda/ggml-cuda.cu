@@ -80,6 +80,7 @@
 #include "ggml-cuda/inkreltab.cuh"
 #include "ggml-cuda/inkprep.cuh"
 #include "ggml-cuda/inkcomb.cuh"
+#include "ggml-cuda/inkcomb_mt.cuh"
 #include "ggml-cuda/inkdyn.cuh"
 #include "ggml-cuda/inkpreq.cuh"
 #include "ggml-cuda/ai4-exp-turbo.cuh"
@@ -12098,22 +12099,27 @@ static const ggml_tensor * ink_through_views(const ggml_tensor * t) {
 
 static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_WCONV");
+    const bool mt_on = ggml_cuda_ink_wsum_conv_mt_enabled();
     ggml_tensor * mul = cgraph->nodes[i];
-    if (!on || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || mul->ne[2] != 1 ||
+    if (!on || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
+            mul->ne[2] < 1 || mul->ne[2] > (mt_on ? GGML_CUDA_CONV_RING_MAX_T : 1) ||
             mul->ne[3] != 1 || mul->ne[1] > WARP_SIZE) {
         return 0;
     }
+    const int64_t n_t = mul->ne[2];
     const ggml_tensor * e = mul->src[0];
     const ggml_tensor * w = mul->src[1];
     if (!ggml_are_same_shape(e, mul) || e->type != GGML_TYPE_F32 || e->nb[0] != sizeof(float) || w->type != GGML_TYPE_F32 ||
-            w->ne[0] != 1 || w->ne[1] != mul->ne[1] || w->ne[2] != 1 || w->ne[3] != 1) {
+            w->ne[0] != 1 || w->ne[1] != mul->ne[1] || w->ne[2] != n_t || w->ne[3] != 1) {
         return 0;
     }
     ggml_tensor * cont = nullptr, * sum = nullptr, * cc = nullptr, * conv = nullptr, * add = nullptr, * sc = nullptr,
                 * add2 = nullptr;
-    ggml_tensor * wins[GGML_CUDA_CONV_RING_MAX_WIN];
+    // Multi-token ring snapshots may emit CPY or CONT+SET_ROWS per window (up to 2*GGML_CUDA_CONV_RING_MAX_WIN nodes)
+    constexpr int MAX_WIN_NODES = 2 * GGML_CUDA_CONV_RING_MAX_WIN;
+    ggml_tensor * wins[MAX_WIN_NODES];
     int n_wins = 0;
-    const int jmax = std::min(cgraph->n_nodes, i + 30);
+    const int jmax = std::min(cgraph->n_nodes, i + 50);
     for (int j = i + 1; j < jmax && !add2; ++j) {
         ggml_tensor * t = cgraph->nodes[j];
         if (ggml_cuda_is_view_or_noop(t)) {
@@ -12138,9 +12144,24 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
             return 0;
         }
         if (!conv) {
-            if (t->op == GGML_OP_CPY && ink_through_views(t->src[0]) == cc && n_wins < GGML_CUDA_CONV_RING_MAX_WIN) {
-                wins[n_wins++] = t;
-                continue;
+            if (n_wins < MAX_WIN_NODES) {
+                if ((t->op == GGML_OP_CPY || t->op == GGML_OP_CONT) && ink_through_views(t->src[0]) == cc) {
+                    wins[n_wins++] = t;
+                    continue;
+                }
+                if (t->op == GGML_OP_SET_ROWS) {
+                    const ggml_tensor * sr_src = ink_through_views(t->src[0]);
+                    bool from_win = (sr_src == cc);
+                    for (int k = 0; !from_win && k < n_wins; ++k) {
+                        if (sr_src == wins[k]) {
+                            from_win = true;
+                        }
+                    }
+                    if (from_win) {
+                        wins[n_wins++] = t;
+                        continue;
+                    }
+                }
             }
             if (t->op == GGML_OP_SSM_CONV && t->src[0] == cc) {
                 conv = t;
@@ -12172,18 +12193,20 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
         }
         return 0;
     }
-    if (!add2 || cont->ne[0] != mul->ne[1] || cont->ne[1] != mul->ne[0] || !ggml_is_contiguous(sum) ||
-            ggml_nelements(sum) != mul->ne[0] || conv->ne[0] != mul->ne[0] || conv->ne[1] != 1 || conv->ne[2] != 1 ||
+    const int64_t ne_tot = mul->ne[0] * n_t;
+    if (!add2 || cont->ne[0] != mul->ne[1] || cont->ne[1] != mul->ne[0] || cont->ne[2] != n_t ||
+            !ggml_is_contiguous(sum) || ggml_nelements(sum) != ne_tot ||
+            conv->ne[0] != mul->ne[0] || conv->ne[1] != n_t || conv->ne[2] != 1 ||
             add->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || add2->type != GGML_TYPE_F32 ||
-            !ggml_is_contiguous(add2) || ggml_nelements(add2) != mul->ne[0] || ggml_nelements(add) != mul->ne[0] ||
-            ggml_nelements(sc) != mul->ne[0]) {
+            !ggml_is_contiguous(add2) || ggml_nelements(add2) != ne_tot || ggml_nelements(add) != ne_tot ||
+            ggml_nelements(sc) != ne_tot) {
         return 0;
     }
     const ggml_tensor * res = add2->src[0] == sc ? add2->src[1] : add2->src[0];
-    if (res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) || ggml_nelements(res) != mul->ne[0]) {
+    if (res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) || ggml_nelements(res) != ne_tot) {
         return 0;
     }
-    ggml_tensor * set[8 + GGML_CUDA_CONV_RING_MAX_WIN] = { mul, cont, sum, cc, conv, add, sc, add2 };
+    ggml_tensor * set[8 + MAX_WIN_NODES] = { mul, cont, sum, cc, conv, add, sc, add2 };
     int n_set = 8;
     for (int k = 0; k < n_wins; ++k) {
         set[n_set++] = wins[k];
@@ -12195,15 +12218,23 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
     if (!ctx) {
         return last - i;
     }
-    // eval: the CONCAT and every window are skipped by the ring plan (the kernel does them), and the output overlaps
-    // nothing the kernel reads (res exactly is fine)
+    // eval: the CONCAT and every window node (CPY / CONT / SET_ROWS) must be skipped by the ring plan (the kernel does them),
+    // and the output overlaps nothing the kernel reads (res exactly is fine)
     if (!g_ink_ring_skip || (int) g_ink_ring_skip->size() <= last) {
         return 0;
     }
     for (int j = i; j <= last; ++j) {
         const ggml_tensor * t = cgraph->nodes[j];
-        if ((t == cc || t->op == GGML_OP_CPY) && !(*g_ink_ring_skip)[j]) {
-            return 0;
+        if (t == cc) {
+            if (!(*g_ink_ring_skip)[j]) {
+                return 0;
+            }
+            continue;
+        }
+        for (int k = 0; k < n_wins; ++k) {
+            if (t == wins[k] && !(*g_ink_ring_skip)[j]) {
+                return 0;
+            }
         }
     }
     const ggml_tensor * reads[5] = { e, w, cc->src[0], conv->src[1], sum };
@@ -12218,11 +12249,15 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
     if (ink_overlap(sum, e) || ink_overlap(sum, w) || ink_overlap(sum, cc->src[0]) || ink_overlap(sum, res)) {
         return 0;
     }
-    if (!ggml_cuda_ink_wsum_conv(*ctx, e, w, sum, conv, add2, ggml_get_op_params_f32(sc, 0), ggml_get_op_params_f32(sc, 1),
-            res)) {
-        return 0;
+    const float sc_s = ggml_get_op_params_f32(sc, 0);
+    const float sc_b = ggml_get_op_params_f32(sc, 1);
+    if (mt_on && ggml_cuda_ink_wsum_conv_mt(*ctx, e, w, sum, conv, add2, sc_s, sc_b, res)) {
+        return last - i;
     }
-    return last - i;
+    if (n_t == 1 && ggml_cuda_ink_wsum_conv(*ctx, e, w, sum, conv, add2, sc_s, sc_b, res)) {
+        return last - i;
+    }
+    return 0;
 }
 
 // [INKROUTER] decode MoE router: MUL_MAT(BF16 ffn_gate_inp, x) + the sigmoid topk-moe chain behind it (the nodes the

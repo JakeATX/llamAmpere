@@ -3,6 +3,8 @@
 // matchers live in ggml-cuda.cu (ggml_cuda_try_fuse_inkglue); GGML_CUDA_INKGLUE=0 turns all of them off.
 
 #include "inkglue.cuh"
+#include "inkcomb_mt.cuh"
+#include "inklg_vec.cuh"
 
 // ---------------------------------------------------------------------------------------------------------------------
 // SITU: out = (b*tanh(g/b) * sigmoid(g)) * (lb*tanh(u/lb)), 9 nodes (SCALE TANH SCALE SIGMOID MUL SCALE TANH SCALE MUL).
@@ -64,6 +66,9 @@ static __global__ void k_ink_moe_wsum(const char * __restrict__ e, const char * 
 }
 
 void ggml_cuda_ink_moe_wsum(ggml_backend_cuda_context & ctx, const ggml_tensor * e, const ggml_tensor * w, ggml_tensor * dst) {
+    if (ggml_cuda_ink_moe_wsum_coalesced(ctx, e, w, dst)) {
+        return;
+    }
     const int n_embd = (int) e->ne[0];
     const int n_used = (int) e->ne[1];
     const int n_tok  = (int) e->ne[2];
@@ -412,6 +417,9 @@ static void ink_lg_launch(ggml_backend_cuda_context & ctx, const ink_lg_args & a
 bool ggml_cuda_ink_loop_gate_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * gates, int G) {
     if (G < 2 || G > INK_MULTI_MAX) {
         return false;
+    }
+    if (ggml_cuda_ink_loop_gate_vec(ctx, gates, G)) {
+        return true;
     }
     const ggml_tensor * d0 = gates[0];
     const int n = (int) d0->src[0]->ne[0];

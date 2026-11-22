@@ -20,13 +20,14 @@ static __device__ __forceinline__ void depth_mix_load(float (&a)[W], const float
 // W = 4: float4 loads (rows 16-byte aligned, n % 4 == 0).
 // [INKGLUE] NORM (NQ == 1): then the rms norm of the mixed row times nw into ndst, with rms_norm_f32<1024>'s scalar sum
 // (col = tid, += 1024), block_reduce and expressions (bit-identical to the RMS_NORM + MUL nodes it replaces)
-template <int NQ, int W, bool NORM = false>
+template <int NQ, int W, bool NORM = false, bool SMEM_OUT = false>
 static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         const char * __restrict__ stack, const int64_t s_nb1, const int64_t s_nb2, const int k,
         const char * __restrict__ cur, const int64_t c_nb1, const char * __restrict__ query, const int64_t q_nb1,
         float * dst, const int n, const int nq_all, const float eps, const float scale,
         const float * __restrict__ nw = nullptr, float * __restrict__ ndst = nullptr, const float neps = 0.0f,
         int8_t * __restrict__ aq = nullptr, float * __restrict__ as = nullptr) {
+    extern __shared__ float s_out[];
     __shared__ float part[DEPTH_MIX_MAX_ROWS*(NQ + 1)];
     __shared__ float p[DEPTH_MIX_MAX_ROWS*NQ];
     __shared__ float s_r;
@@ -153,19 +154,34 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         depth_mix_load<W>(a, x + v*W);
 #pragma unroll
         for (int q = 0; q < NQ; ++q) {
-#pragma unroll
-            for (int w = 0; w < W; ++w) {
-                out[q*n + v*W + w] = acc[q][w] + p[k*NQ + q]*(a[w]*r);
+            if constexpr (W == 4) {
+                const float pk = p[k*NQ + q];
+                const float4 ov = make_float4(
+                    acc[q][0] + pk*(a[0]*r),
+                    acc[q][1] + pk*(a[1]*r),
+                    acc[q][2] + pk*(a[2]*r),
+                    acc[q][3] + pk*(a[3]*r));
+                *reinterpret_cast<float4 *>(out + q*n + v*4) = ov;
+                if constexpr (SMEM_OUT && NQ == 1) {
+                    *reinterpret_cast<float4 *>(s_out + v*4) = ov;
+                }
+            } else {
+                const float ov = acc[q][0] + p[k*NQ + q]*(a[0]*r);
+                out[q*n + v] = ov;
+                if constexpr (SMEM_OUT && NQ == 1) {
+                    s_out[v] = ov;
+                }
             }
         }
     }
     if constexpr (NORM) {
         static_assert(NQ == 1, "mix norm: one query");
         __shared__ float s_red[32];
-        __syncthreads(); // the block's global writes of out are visible to the block after this
+        __syncthreads();
+        const float * norm_src = SMEM_OUT ? s_out : out;
         float tmp = 0.0f;
         for (int col = threadIdx.x; col < n; col += DEPTH_MIX_THREADS) {
-            const float xi = out[col];
+            const float xi = norm_src[col];
             tmp += xi * xi;
         }
         tmp = block_reduce<block_reduce_method::SUM, DEPTH_MIX_THREADS>(tmp, s_red);
@@ -173,7 +189,7 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         const float sc   = rsqrtf(mean + neps);
         float * nd = ndst + (int64_t) t*n;
         for (int col = threadIdx.x; col < n; col += DEPTH_MIX_THREADS) {
-            nd[col] = sc * out[col] * nw[col];
+            nd[col] = sc * norm_src[col] * nw[col];
         }
         // [INKGLUE MIXQ] then the AI+ H256 activation of the normed row, by rq4::quantize_act_body itself (one warp per 256
         // block; the warps of this block cover n <= 32*256), from the row this block just wrote
@@ -261,12 +277,25 @@ bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     cudaStream_t stream = ctx.stream();
     const bool vec = n % 4 == 0 && (s1 | s2 | cur->nb[1] | query->nb[1]) % 16 == 0 &&
         ((uintptr_t) sd | (uintptr_t) cur->data | (uintptr_t) query->data | (uintptr_t) dst->data) % 16 == 0;
+    // [T5-GLUE] G4: cache mixed output in SMEM (9.2 KB for n=2304) so NORM reads SMEM instead of 2 global round-trips.
+    // Kill switch: GGML_CUDA_DEPTH_MIX_SMEM=0
+    static const bool use_smem_env = [] {
+        const char * e = getenv("GGML_CUDA_DEPTH_MIX_SMEM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool use_smem = use_smem_env && n <= 4096;
+    const size_t smem_bytes = use_smem ? (size_t) n * sizeof(float) : 0;
     const dim3 grid((unsigned) T, 1);
     if (vec) {
-        k_depth_mix<1, 4, true><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
-            (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
+        if (use_smem) {
+            k_depth_mix<1, 4, true, true><<<grid, DEPTH_MIX_THREADS, smem_bytes, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
+                (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
+        } else {
+            k_depth_mix<1, 4, true, false><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
+                (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
+        }
     } else {
-        k_depth_mix<1, 1, true><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
+        k_depth_mix<1, 1, true, false><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
             (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
     }
     CUDA_CHECK(cudaGetLastError());
