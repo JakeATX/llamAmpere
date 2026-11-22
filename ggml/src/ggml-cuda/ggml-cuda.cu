@@ -1252,6 +1252,7 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    ggml_cuda_ink_ai4_preq_free(this);
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -11185,7 +11186,8 @@ static int ggml_cuda_try_fuse_ink_mix_norm(ggml_backend_cuda_context * ctx, ggml
     static const bool mixq_on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_MIXQ");
     ggml_tensor * mm = nullptr;
     const int K = (int) mul->ne[0];
-    if (mixq_on && ggml_nrows(mul) == 1 && K % 256 == 0 && K <= 32*256) {
+    if (mixq_on && ggml_nrows(mul) == 1 && K % 256 == 0 && K <= 32*256 && ctx->curr_stream_no == 0 && !ctx->scratch_borrowed &&
+            ((uintptr_t) mul->data & 15) == 0) {
         for (int j = last + 1; j < cgraph->n_nodes && j < last + 48 && !mm; ++j) {
             ggml_tensor * t = cgraph->nodes[j];
             if (t->op == GGML_OP_MUL_MAT_ID && ink_through_views(t->src[1]) == mul && (t->flags & GGML_TENSOR_FLAG_COMPUTE) &&
@@ -11193,12 +11195,15 @@ static int ggml_cuda_try_fuse_ink_mix_norm(ggml_backend_cuda_context * ctx, ggml
                     t->src[2]->ne[1] == 1 && t->src[1]->data == mul->data) {
                 mm = t;
             }
+            if (!mm && !ggml_cuda_is_view_or_noop(t) && ink_overlap(t, mul)) {
+                break; // something rewrites the normed row before its consumer
+            }
         }
     }
     int8_t * aq = nullptr;
     float  * as = nullptr;
-    if (mm) {
-        ggml_cuda_ink_ai4_preq_alloc(*ctx, 1, K, 1, &aq, &as);
+    if (mm && !ggml_cuda_ink_ai4_preq_alloc(*ctx, 1, K, 1, &aq, &as)) {
+        mm = nullptr;
     }
     if (!ggml_cuda_depth_mix_norm(*ctx, mix, w, mul, eps, aq, as)) {
         if (mm) {
@@ -11978,6 +11983,20 @@ static int ink_node_index(const ggml_cgraph * cgraph, const ggml_tensor * t, int
 }
 
 // the unit whose CONCAT is node ci; false: not this pattern
+// op is a flat alias of base for a [ch] F32 elementwise read: base itself, or views/reshapes at offset 0 (no transpose or
+// permute), contiguous, ch elements
+static bool ink_dyn_flat(const ggml_tensor * op, const ggml_tensor * base, int64_t ch) {
+    if (!op || op->type != GGML_TYPE_F32 || ggml_nelements(op) != ch || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    for (const ggml_tensor * t = op; t != base; t = t->src[0]) {
+        if (!t || !(t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) || t->view_offs != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ink_dyn_unit_at(const ggml_cgraph * cgraph, int ci, ink_dyn_unit & u) {
     ggml_tensor * C = cgraph->nodes[ci];
     if (C->op != GGML_OP_CONCAT || ggml_get_op_params_i32(C, 0) != 0 || C->type != GGML_TYPE_F32 || C->ne[0] != 4 ||
@@ -12051,9 +12070,10 @@ static bool ink_dyn_unit_at(const ggml_cgraph * cgraph, int ci, ink_dyn_unit & u
         if (!add || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || ggml_nelements(add) != ch) {
             return false;
         }
-        const ggml_tensor * other = ink_through_views(add->src[0]) == cur ? add->src[1] : add->src[0];
+        const bool cur0 = ink_through_views(add->src[0]) == cur;
+        const ggml_tensor * other = cur0 ? add->src[1] : add->src[0];
         const ggml_tensor * ob = ink_through_views(other);
-        if (ob == cur || !other) {
+        if (!other || ob == cur || !ink_dyn_flat(cur0 ? add->src[0] : add->src[1], cur, ch) || !ink_dyn_flat(other, ob, ch)) {
             return false;
         }
         if (ob->op == GGML_OP_MUL) {
@@ -12136,7 +12156,7 @@ static bool ink_run_check_big(const ggml_cgraph * cgraph, int i, int last, const
         return false;
     }
     for (int j = i; j <= last; ++j) {
-        if (!in_set[j - i] && !ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        if (in_set[j - i] ? !(cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) : !ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
             return false;
         }
     }
@@ -12247,7 +12267,7 @@ static int ggml_cuda_try_fuse_ink_dyn(ggml_backend_cuda_context * ctx, ggml_cgra
                     }
                 }
             }
-            if (m != k && (ink_overlap(u.sc, r.sc) || ink_overlap(u.store, r.store) || ink_overlap(u.sc, r.store))) {
+            if (ink_overlap(u.sc, r.store) || (m != k && (ink_overlap(u.sc, r.sc) || ink_overlap(u.store, r.store)))) {
                 return 0;
             }
         }
@@ -14170,6 +14190,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             std::vector<uint8_t> conv_ring_skip;
             g_ink_ring_skip = nullptr;
             g_ink_prep_skip.clear(); // [INKGLUE PREP] SET_ROWS a prep launch of this eval wrote
+            ggml_cuda_ink_ai4_preq_release(); // [INKGLUE MIXQ] no handoff crosses graph evals
             // [ROUNDFIX] pooled-key GET_ROWS nodes the lightning indexer reads in place (ggml_cuda_lid_gather_plan)
             std::vector<uint8_t> lid_gather_skip;
             // [GDNDIRECT] final-state / checkpoint cpys the prefixed gated_delta_net launches replace

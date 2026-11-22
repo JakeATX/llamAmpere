@@ -1723,7 +1723,7 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     // [INKGLUE MIXQ] the activation may already be quantized by its producer (inkpreq.cu): same bytes, no launch
     const int8_t * qp = q.get();
     const float *  sp = s.get();
-    if (!fused && !ggml_cuda_ink_ai4_preq_take(dst, src1->data, n_rows, K, xsh, &qp, &sp)) {
+    if (!fused && !(ctx.curr_stream_no == 0 && ggml_cuda_ink_ai4_preq_take(dst, src1->data, n_rows, K, xsh, &qp, &sp))) {
         ai4_quantize_x((const float *) src1->data, n_rows, K, xsh, q.get(), s.get(), stream);
     }
 

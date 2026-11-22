@@ -237,7 +237,11 @@ bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (!ggml_cuda_depth_mix_supported(dst) || dst->src[1]->ne[1] != 1) {
         return false;
     }
-    if (aq && (dst->src[0]->ne[0] % 256 != 0 || dst->src[0]->ne[0] > 32*256 || !ggml_is_contiguous(ndst))) {
+    if ((aq == nullptr) != (as == nullptr)) {
+        return false;
+    }
+    if (aq && (dst->src[0]->ne[0] % 256 != 0 || dst->src[0]->ne[0] > 32*256 || !ggml_is_contiguous(ndst) ||
+            ((uintptr_t) ndst->data & 15) != 0)) {
         return false;
     }
     const ggml_tensor * cur   = dst->src[0];
