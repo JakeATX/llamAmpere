@@ -5,6 +5,7 @@
 #include "inkpreq.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
+#include "ai4-exp-turbo.cuh"
 #include "magic2-v2.cuh"
 #include "aif25-mmq.cuh"
 #include "../ggml-aif25.h"
@@ -1760,6 +1761,16 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     const int8_t * const xq = pre ? pre_q : q_buf.get();
     const float  * const xs = pre ? pre_s : s_buf.get();
+
+    // [INK200 T1] Ampere SM 8.0+ SpecDecode grouped expert turbo (M = 2..32; M = 1 stays untouched on mmvr).
+    // M = 2..8 (n_pairs <= 64): zero-ids_helper direct-grouped Split-K; M = 9..32: zero-static-SMEM grouped Split-K
+    // with per-visit ids_helper cache shared across gate_up & down. Kill switch: GGML_CUDA_AI4_EXP_TURBO=0.
+    if (!ampere_grouped && !fused && sms &&
+            ggml_cuda_ai4_exp_turbo_try(ctx, src0, ids, xq, xs, y_out, M, K, n_tok, n_used, ne11,
+                                        n_expert, xsh, y_into != nullptr, ai4_id_skip_on())) {
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     // mmv-ID (n_tok <= 8) takes tiles of MMV_ID_BN pairs, so an expert repeated within a token still fits
     int bn = ai4_mmvid_route(n_tok, n_used, n_expert, ggml_ai4_rate(src0->type)) ? ai4k::MMV_ID_BN : (n_tok >= ai4_bn128_min() ? 128 : 64);
