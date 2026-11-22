@@ -3295,12 +3295,71 @@ private:
         return allowed;
     }
 
+    // --slot-ctx cap swap: a conversation that outgrows its reserved cap takes the cap of an idle reserved slot that
+    // holds more; the unified pool addresses cells one by one, so a cap is accounting only and no cell moves. The
+    // other slot keeps its cached tokens, which must fit the smaller cap. LLAMA_SLOT_CTX_SWAP=0 turns it off.
+    static bool slot_ctx_swap_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SLOT_CTX_SWAP");
+            return !(e && *e && (std::string(e) == "0" || std::string(e) == "off" || std::string(e) == "false"));
+        }();
+        return on;
+    }
+
+    bool slot_ctx_cap_grow(server_slot & own, int64_t need) {
+        if (params_base.slot_ctx.empty() || own.ctx_shared || need <= own.n_ctx || !slot_ctx_swap_on()) {
+            return false;
+        }
+        server_slot * big = nullptr;
+        for (auto & s : slots) {
+            if (&s == &own || s.is_processing() || s.ctx_shared || s.n_ctx < need || s.prompt.n_tokens() > own.n_ctx) {
+                continue;
+            }
+            if (big == nullptr || s.n_ctx < big->n_ctx) {
+                big = &s;
+            }
+        }
+        if (big == nullptr) {
+            return false;
+        }
+        SLT_INF(own, "--slot-ctx: cap swap with idle slot %d: cap %d -> %d (%d tokens here, %d there; LLAMA_SLOT_CTX_SWAP=0 = off)\n",
+                big->id, own.n_ctx, big->n_ctx, own.prompt.n_tokens(), big->prompt.n_tokens());
+        std::swap(own.n_ctx, big->n_ctx);
+        std::swap(own.n_ctx_cap, big->n_ctx_cap);
+        return true;
+    }
+
+    // before routing: the idle reserved slot that holds this conversation (longest prefix, at least half its cache)
+    // grows its cap when the request no longer fits, so the next turn reuses its cells instead of a full re-read
+    void slot_ctx_cap_grow_for(const server_task & task) {
+        if (params_base.slot_ctx.empty() || task.id_slot != -1 || !slot_ctx_swap_on()) {
+            return;
+        }
+        server_slot * own = nullptr;
+        size_t best = 0;
+        for (auto & s : slots) {
+            if (s.is_processing() || s.ctx_shared || s.prompt.tokens.empty()) {
+                continue;
+            }
+            const size_t lcp = s.prompt.tokens.get_common_prefix(task.tokens);
+            if (lcp > best && 2*lcp >= s.prompt.tokens.size()) {
+                best = lcp;
+                own  = &s;
+            }
+        }
+        if (own != nullptr) {
+            slot_ctx_cap_grow(*own, (int64_t) task.tokens.size() + 64);
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
 
         slot_ctx_share_update();
+
+        slot_ctx_cap_grow_for(task);
 
         // --slot-ctx: one size filter for both the LCP and the LRU pick (a pinned id_slot is not filtered)
         const std::vector<char> allowed = task.id_slot == -1 ? slot_ctx_allowed(task) : std::vector<char>();
@@ -4011,7 +4070,8 @@ private:
 
         // if context shifting is disabled, make sure that we don't run out of context
         // Accepted groups are already in the prompt; deliver the whole group before checking its final capacity.
-        if (last_in_group && !params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        if (last_in_group && !params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx &&
+                !slot_ctx_cap_grow(slot, (int64_t) slot.n_ctx + 1)) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
