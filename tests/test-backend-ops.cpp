@@ -18364,11 +18364,12 @@ static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc);
 struct test_flash_attn_ext_inkrel : public test_case {
     const int64_t H, Hkv, kv, T, rows;
     const bool gate;
+    const ggml_type tkv; // K/V cache type (F16, or Q8_0: the Inkling SWA window at q8_0)
 
-    test_flash_attn_ext_inkrel(int64_t H, int64_t Hkv, int64_t kv, int64_t T, int64_t rows, bool gate)
-        : H(H), Hkv(Hkv), kv(kv), T(T), rows(rows), gate(gate) {}
+    test_flash_attn_ext_inkrel(int64_t H, int64_t Hkv, int64_t kv, int64_t T, int64_t rows, bool gate, ggml_type tkv = GGML_TYPE_F16)
+        : H(H), Hkv(Hkv), kv(kv), T(T), rows(rows), gate(gate), tkv(tkv) {}
 
-    std::string vars() override { return VARS_TO_STR6(H, Hkv, kv, T, rows, gate) + ",inkrel=1"; }
+    std::string vars() override { return VARS_TO_STR6(H, Hkv, kv, T, rows, gate) + ",inkrel=1" + (tkv == GGML_TYPE_F16 ? "" : std::string(",kv=") + ggml_type_name(tkv)); }
     std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -18377,8 +18378,8 @@ struct test_flash_attn_ext_inkrel : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t D = 128;
         ggml_tensor * q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, T);            ggml_set_name(q, "q");
-        ggml_tensor * kc = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, Hkv, kv);         ggml_set_name(kc, "k");
-        ggml_tensor * vc = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, Hkv, kv);         ggml_set_name(vc, "v");
+        ggml_tensor * kc = ggml_new_tensor_3d(ctx, tkv, D, Hkv, kv);                   ggml_set_name(kc, "k");
+        ggml_tensor * vc = ggml_new_tensor_3d(ctx, tkv, D, Hkv, kv);                   ggml_set_name(vc, "v");
         ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, T, 1, 1);        ggml_set_name(m, "m");
         ggml_tensor * tb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, rows, T);         ggml_set_name(tb, "tab");
         ggml_tensor * rp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, T);              ggml_set_name(rp, "rp");
@@ -18463,8 +18464,9 @@ struct test_flash_attn_ext_inkrel : public test_case {
 };
 
 static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
-    auto add = [&](int64_t kv, int64_t nb, int64_t mh, bool sinks, bool lse, int64_t nh = 8, std::array<int64_t, 2> nr23 = {3, 1}) {
-        auto * t = new test_flash_attn_ext(128, 128, nh, nr23, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+    auto add = [&](int64_t kv, int64_t nb, int64_t mh, bool sinks, bool lse, int64_t nh = 8, std::array<int64_t, 2> nr23 = {3, 1},
+            ggml_type tkv = GGML_TYPE_F16) {
+        auto * t = new test_flash_attn_ext(128, 128, nh, nr23, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, tkv, tkv,
             {0, 1, 2, 3}, true, false, 0, 0, mh);
         t->lse_out = lse;
         cases.emplace_back(t);
@@ -18512,6 +18514,17 @@ static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, b
             for (bool gt : {false, true}) {
                 cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, kv, T, 1025, gt));
             }
+        }
+    }
+    // Q8_0 K/V (the Inkling SWA window cache at q8_0): per-head and broadcast masks, sinks, LSE, and the INKREL node
+    for (int64_t kv : {113, 1536, 4096}) {
+        for (int64_t nb : {1, 3, 5}) {
+            add(kv, nb, 24, true, false, 8, {3, 1}, GGML_TYPE_Q8_0);
+            add(kv, nb, 24, false, kv >= 1000, 8, {3, 1}, GGML_TYPE_Q8_0);
+            add(kv, nb, 1, false, kv >= 1000, 8, {3, 1}, GGML_TYPE_Q8_0);
+        }
+        for (int64_t T : {1, 2, 5}) {
+            cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, kv, T, 1025, true, GGML_TYPE_Q8_0));
         }
     }
     cases.emplace_back(new test_flash_attn_ext_inkrel(16, 4, 1536, 4, 129, true));

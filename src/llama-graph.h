@@ -1512,6 +1512,9 @@ struct llm_graph_context {
     // LSA compensation (LLAMA_LSA_COMP=2): when set, the next plain flash attention node also writes its row
     // log-sum-exp to lsa_lse (F32 [n_head, n_tokens, n_seq]); the caller takes it and clears both
     mutable bool          lsa_lse_req = false;
+    // INKKV row-chunked rel-bias path: one view per (graph input, first row, rows), shared by every layer, so the
+    // scheduler uploads each input chunk once per split instead of once per layer (ctx x ub x layers otherwise)
+    mutable std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> inkkv_row_views;
     // Logging only: an earlier full-attention layer's residual projected through this layer's exact Q weights.
     mutable ggml_tensor * lsa_spec_q = nullptr;
     mutable ggml_tensor * lsa_spec_q2 = nullptr; // same target, residual from two attention layers earlier
@@ -2186,6 +2189,18 @@ struct llm_graph_context {
             ggml_tensor * gate = nullptr) const; // [n_embd_head_v*n_head_q, n_tokens]: returns out * sigmoid(gate)
 
     // the body of build_attn_rel; sets gated when the gate was applied inside the attention (INKATTN)
+    // INKKV: the dense / near per-head bias path in row chunks of tc rows per stream
+    ggml_tensor * build_attn_rel_chunked(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * table,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il,
+                  int64_t tc) const;
+
     ggml_tensor * build_attn_rel_base(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * q_cur,

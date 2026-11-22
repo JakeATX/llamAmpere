@@ -15,6 +15,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <type_traits>
 
 namespace {
 
@@ -58,7 +59,27 @@ static __device__ __forceinline__ uint4 inkattn_ld16(const char * p) {
     return __ldg(reinterpret_cast<const uint4 *>(p));
 }
 
-template <bool rows16, bool rel>
+// 8 consecutive K/V values [dim0, dim0 + 8) of one cache row as f16 (dim0 % 8 == 0). q8: Q8_0 rows (34-byte blocks
+// of 32: f16 scale + 32 int8), dequantized as d*q rounded to f16 (the value ggml's q8_0 -> f16 conversion gives)
+template <bool q8>
+static __device__ __forceinline__ uint4 inkattn_ld8(const char * row, const int dim0) {
+    if constexpr (!q8) {
+        return inkattn_ld16(row + dim0*sizeof(half));
+    } else {
+        const char * b = row + (dim0/32)*34;
+        const float d = __half2float(__ldg(reinterpret_cast<const half *>(b)));
+        const unsigned short * q = reinterpret_cast<const unsigned short *>(b + 2 + dim0 % 32); // 2-byte aligned
+        uint32_t w[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned short v = __ldg(q + i);
+            w[i] = inkattn_h2u(d*(float) (int8_t) (v & 0xFF), d*(float) (int8_t) (v >> 8));
+        }
+        return make_uint4(w[0], w[1], w[2], w[3]);
+    }
+}
+
+template <bool rows16, bool rel, bool q8>
 static __global__ void __launch_bounds__(INKATTN_WARPS*WARP_SIZE)
 inkattn_decode(const inkattn_params p) {
 #ifdef AMPERE_MMA_AVAILABLE
@@ -149,7 +170,7 @@ inkattn_decode(const inkattn_params p) {
             key = key < p.n_kv ? key : p.n_kv - 1;
 #pragma unroll
             for (int s = 0; s < 4; ++s) {
-                kr[nb][s] = inkattn_ld16(Kh + (int64_t) key*p.nbk1 + (32*s + 8*c)*sizeof(half));
+                kr[nb][s] = inkattn_ld8<q8>(Kh + (int64_t) key*p.nbk1, 32*s + 8*c);
             }
         }
         // V: keys k0 + {2c, 2c+1, 2c+8, 2c+9}, dv [16 ln, +16)
@@ -160,7 +181,7 @@ inkattn_decode(const inkattn_params p) {
             key = key < p.n_kv ? key : p.n_kv - 1;
 #pragma unroll
             for (int u = 0; u < 2; ++u) {
-                vr[i][u] = inkattn_ld16(Vh + (int64_t) key*p.nbv1 + (16*ln + 8*u)*sizeof(half));
+                vr[i][u] = inkattn_ld8<q8>(Vh + (int64_t) key*p.nbv1, 16*ln + 8*u);
             }
         }
         // mask: rows r0/r1, keys k0 + 8 nb + 2c + {0, 1}
@@ -368,7 +389,9 @@ static bool inkattn_check(const int cc, const ggml_tensor * dst, const int mode)
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) {
         return false;
     }
-    if (dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
+    // K/V: both F16, or both Q8_0 (the Inkling SWA window cache at q8_0, LLAMA_INKKV_SWA_TYPE)
+    const bool q8 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    if (dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 || !(q8 || (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16)) ||
             !mask || mask->type != GGML_TYPE_F16 || (snk && snk->type != GGML_TYPE_F32)) {
         return false;
     }
@@ -420,8 +443,8 @@ static bool inkattn_check(const int cc, const ggml_tensor * dst, const int mode)
         return false;
     }
     if (!inkattn_aligned(Q->data, Q->nb[1], Q->nb[2], Q->nb[3], 16) || Q->nb[0] != sizeof(float) ||
-            !inkattn_aligned(K->data, K->nb[1], K->nb[2], K->nb[3], 16) || K->nb[0] != sizeof(half) ||
-            !inkattn_aligned(V->data, V->nb[1], V->nb[2], V->nb[3], 16) || V->nb[0] != sizeof(half) ||
+            !inkattn_aligned(K->data, K->nb[1], K->nb[2], K->nb[3], q8 ? 2 : 16) || K->nb[0] != ggml_type_size(K->type) ||
+            !inkattn_aligned(V->data, V->nb[1], V->nb[2], V->nb[3], q8 ? 2 : 16) || V->nb[0] != ggml_type_size(V->type) ||
             mask->nb[0] != sizeof(half)) {
         return false;
     }
@@ -503,16 +526,18 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     cudaStream_t stream = ctx.stream();
     const dim3 grid((W + INKATTN_WARPS - 1)/INKATTN_WARPS, Hkv, S);
-    if (inkrel) {
-        if (rows16) {
-            inkattn_decode<true, true><<<grid, INKATTN_WARPS*WARP_SIZE, 0, stream>>>(p);
-        } else {
-            inkattn_decode<false, true><<<grid, INKATTN_WARPS*WARP_SIZE, 0, stream>>>(p);
-        }
-    } else if (rows16) {
-        inkattn_decode<true, false><<<grid, INKATTN_WARPS*WARP_SIZE, 0, stream>>>(p);
+    const bool q8 = K->type == GGML_TYPE_Q8_0;
+    auto launch = [&](auto r16, auto rel, auto kq8) {
+        inkattn_decode<decltype(r16)::value, decltype(rel)::value, decltype(kq8)::value><<<grid, INKATTN_WARPS*WARP_SIZE, 0, stream>>>(p);
+    };
+    using T_ = std::true_type;
+    using F_ = std::false_type;
+    if (q8) {
+        if (inkrel) { rows16 ? launch(T_{}, T_{}, T_{}) : launch(F_{}, T_{}, T_{}); }
+        else        { rows16 ? launch(T_{}, F_{}, T_{}) : launch(F_{}, F_{}, T_{}); }
     } else {
-        inkattn_decode<false, false><<<grid, INKATTN_WARPS*WARP_SIZE, 0, stream>>>(p);
+        if (inkrel) { rows16 ? launch(T_{}, T_{}, F_{}) : launch(F_{}, T_{}, F_{}); }
+        else        { rows16 ? launch(T_{}, F_{}, F_{}) : launch(F_{}, F_{}, F_{}); }
     }
     CUDA_CHECK(cudaGetLastError());
 

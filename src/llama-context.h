@@ -493,6 +493,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    bool inkkv_dual_reserve_busy = false; // graph_reserve: INKKV v2 one- + several-sequence reserve in progress
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
