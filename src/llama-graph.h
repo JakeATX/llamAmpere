@@ -2131,7 +2131,8 @@ struct llm_graph_context {
             ggml_tensor * s,
             ggml_tensor * conv_x,
                 int64_t   n_cols,
-                 size_t   offs) const;
+                 size_t   offs,
+                   bool   slot_cpy = false) const; // slot_cpy: one CPY per rollback slot instead of the SET_ROWS
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

@@ -250,7 +250,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
     x = ggml_concat(ctx0, past, x, 0);
 
-    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+    // [INKGLUE SLOTCPY] per-slot CPY stores at verify widths (the conv ring folds them); LLAMA_INKLING2_SLOT_CPY=0 = SET_ROWS
+    static const bool slot_cpy = [] { const char * e = getenv("LLAMA_INKLING2_SLOT_CPY"); return !e || atoi(e) != 0; }();
+    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state), slot_cpy && n_tokens <= 16);
 
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
