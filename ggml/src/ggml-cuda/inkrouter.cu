@@ -62,7 +62,9 @@ k_inkrouter(const nv_bfloat16 * __restrict__ w, const float * __restrict__ y, fl
         logits[row] = sumf;
         __threadfence();
         prev = atomicAdd(&g_inkrouter_done[slot], 1u);
+        __threadfence(); // acquire side for the observing lane (review note: shfl alone is not a sync op)
     }
+    __syncwarp();        // orders lane 0's observation before the other lanes' logit loads
     prev = __shfl_sync(0xFFFFFFFF, prev, 0, WARP_SIZE);
     if (prev != gridDim.x - 1) {
         return;
