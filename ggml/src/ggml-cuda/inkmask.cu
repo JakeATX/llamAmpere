@@ -44,7 +44,7 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
     const ggml_tensor * I = G->src[1];
     if (A == nullptr || I == nullptr || A->type != GGML_TYPE_F32 || I->type != GGML_TYPE_I32 ||
             A->nb[0] != sizeof(float) || I->nb[0] != sizeof(int32_t) || A->ne[3] != 1 || I->ne[2] != 1 || I->ne[3] != 1 ||
-            A->ne[2] != I->ne[1] || A->ne[2] < 2 || A->ne[0] > 256 || !ggml_is_contiguous(G) ||
+            A->ne[2] != I->ne[1] || A->ne[0] > 256 || !ggml_is_contiguous(G) ||
             A->nb[1] % sizeof(float) != 0 || A->nb[2] % sizeof(float) != 0 || I->nb[1] % sizeof(int32_t) != 0) {
         return false;
     }
@@ -126,15 +126,40 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
     }
     ch.out = j - i;
 
-    enum ggml_op ops[12];
-    int idxs[12];
-    const int count = ch.out + 1;
-    if (count > 12) {
+    // the output must not overlap anything the kernel reads: the table, and also the graph inputs (rel indices,
+    // mask), which ggml_cuda_check_fusion_memory_ranges skips (op NONE) but gallocr may free after their last use
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * ap = (const char *) a->data, * bp = (const char *) b->data;
+        return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
+    };
+    if (!O->data || overlaps(O, A) || overlaps(O, I) || overlaps(O, Mr)) {
         return false;
     }
-    for (int k = 0; k < count; ++k) {
-        idxs[k] = i + k;
-        ops[k]  = cgraph->nodes[i + k]->op;
+
+    // the mask cast records itself as src[1] (ggml_cast), so its use count is 2 (itself + the ADD): checked here and
+    // left out of the subgraph check, which counts only uses by later listed nodes
+    if (ch.mcast >= 0) {
+        const int mi = i + ch.mcast;
+        const ggml_tensor * mc = cgraph->nodes[mi];
+        if (mc->src[1] != mc || (mc->flags & GGML_TENSOR_FLAG_OUTPUT) || !(mc->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                ggml_node_get_use_count(cgraph, mi) != 2) {
+            return false;
+        }
+    }
+
+    enum ggml_op ops[12];
+    int idxs[12];
+    int count = 0;
+    if (ch.out + 1 > 12) {
+        return false;
+    }
+    for (int k = 0; k <= ch.out; ++k) {
+        if (k == ch.mcast) {
+            continue;
+        }
+        idxs[count] = i + k;
+        ops[count]  = cgraph->nodes[i + k]->op;
+        ++count;
     }
     const int outs[1] = { i + ch.out };
     return ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, outs, 1);
@@ -226,6 +251,16 @@ void ggml_cuda_ink_relmask_launch(ggml_backend_cuda_context & ctx, const ggml_cg
         ink_relmask_launch_t<half>(A, I, Mr, M, O, H, n_kv, T, Ts, stream);
     } else {
         ink_relmask_launch_t<float>(A, I, Mr, M, O, H, n_kv, T, Ts, stream);
+    }
+    // GGML_CUDA_INK_MASK_LOG=1: one line per new (n_kv, T) shape (diagnostic: shows the prompt ubatch size)
+    static const bool log_shapes = [] { const char * e = getenv("GGML_CUDA_INK_MASK_LOG"); return e && atoi(e) != 0; }();
+    if (log_shapes) {
+        static int64_t last_kv = -1, last_t = -1;
+        static int n_logged = 0;
+        if ((n_kv != last_kv || T != last_t) && n_logged < 256) {
+            last_kv = n_kv; last_t = T; ++n_logged;
+            GGML_LOG_WARN("[INKMASK] shape n_kv %lld T %lld\n", (long long) n_kv, (long long) T);
+        }
     }
     if (g_ink_relmask_count.n.fetch_add(1) == 0) {
         GGML_LOG_WARN("[INKMASK] fused rel-bias mask on: H %lld, n_kv %lld, T %lld (%lld x %lld), mask %s%s, %d nodes\n",
