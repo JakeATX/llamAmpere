@@ -377,13 +377,14 @@ static __global__ void k_ink_lg_apply(const ink_lg_args a, const float * __restr
 }
 
 // LGTUNE: rows r per down block (GGML_CUDA_LG_RB 1/2/4) and output rows per apply warp (GGML_CUDA_LG_ROWS 2/4/8);
-// launch shape only, every output is bit-identical for any setting
+// launch shape only, every output is bit-identical for any setting. Default RB=4 ROWS=4 (HOME 3090 Ti screen: fastest of 8
+// shapes); GGML_CUDA_LG_RB=1 GGML_CUDA_LG_ROWS=2 restores the old shape.
 int ggml_cuda_lg_tune_rb() {
-    static const int v = [] { const char * e = getenv("GGML_CUDA_LG_RB"); const int k = e && *e ? atoi(e) : 1; return k == 2 || k == 4 ? k : 1; }();
+    static const int v = [] { const char * e = getenv("GGML_CUDA_LG_RB"); const int k = e && *e ? atoi(e) : 4; return k == 1 || k == 2 ? k : 4; }();
     return v;
 }
 int ggml_cuda_lg_tune_rows() {
-    static const int v = [] { const char * e = getenv("GGML_CUDA_LG_ROWS"); const int k = e && *e ? atoi(e) : 2; return k == 4 || k == 8 ? k : 2; }();
+    static const int v = [] { const char * e = getenv("GGML_CUDA_LG_ROWS"); const int k = e && *e ? atoi(e) : 4; return k == 2 || k == 8 ? k : 4; }();
     return v;
 }
 
