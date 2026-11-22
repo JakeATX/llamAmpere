@@ -122,11 +122,50 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
                 mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q4>(ctx, args, stream);
                 break;
             }
+            if (prec_src1 == GGML_PREC_BF16) {
+                mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_BF16>(ctx, args, stream);
+                break;
+            }
+            if (prec_src1 == GGML_PREC_F16) {
+                mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_F16>(ctx, args, stream);
+                break;
+            }
             mul_mat_q_case<GGML_TYPE_NVFP4, GGML_PREC_Q8>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
     }
+}
+
+enum ggml_cuda_nvfp4_mmq_mode {
+    GGML_CUDA_NVFP4_MMQ_INT8   = 0, // BP-1B: Block-128 scale-folded INT8 IMMA (default on Ampere)
+    GGML_CUDA_NVFP4_MMQ_BF16   = 1, // BP-1A: Bit-exact pre-scaled BF16 HMMA
+    GGML_CUDA_NVFP4_MMQ_LEGACY = 2, // Original 16-elem Q8_1 + m16n8k16 path
+};
+
+static ggml_cuda_nvfp4_mmq_mode ggml_cuda_nvfp4_mmq_get_mode() {
+    static const ggml_cuda_nvfp4_mmq_mode mode = [] {
+        const char * env_c = getenv("GGML_CUDA_NVFP4_MMQ_MODE");
+        if (env_c == nullptr) {
+            return GGML_CUDA_NVFP4_MMQ_INT8;
+        }
+        std::string env_cpp = env_c;
+        for (char & c : env_cpp) {
+            c = std::tolower(c);
+        }
+        if (env_cpp == "bf16" || env_cpp == "bp1a") {
+            return GGML_CUDA_NVFP4_MMQ_BF16;
+        }
+        if (env_cpp == "legacy") {
+            return GGML_CUDA_NVFP4_MMQ_LEGACY;
+        }
+        if (env_cpp != "int8" && env_cpp != "bp1b" && env_cpp != "auto") {
+            GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_NVFP4_MMQ_MODE: '%s'. Available: 'int8', 'bf16', 'legacy'.\n",
+                          __func__, env_cpp.c_str());
+        }
+        return GGML_CUDA_NVFP4_MMQ_INT8;
+    }();
+    return mode;
 }
 
 // overrides the src1 precision requested by the graph, "auto" keeps the requested one
@@ -151,8 +190,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_env() {
     return GGML_PREC_UNDEFINED;
 }
 
-// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
-// default to the native W4A4 instructions on Blackwell.
+// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations (Blackwell)
+// or NVFP4 selects Ampere BP-1A BF16 / Legacy via GGML_CUDA_NVFP4_MMQ_MODE.
 static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_prec prec_requested, const int cc) {
     static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
 
@@ -162,12 +201,25 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_pr
     }
 
     // Q4 only for the FP4 types on Blackwell
-    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4 || prec == GGML_PREC_BF16);
     const bool can_use_q4 = (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
-    if (prec == GGML_PREC_Q8 || !can_use_q4) {
-        return GGML_PREC_Q8;
+    if (prec != GGML_PREC_Q8 && prec != GGML_PREC_BF16 && can_use_q4) {
+        return GGML_PREC_Q4;
     }
-    return GGML_PREC_Q4;
+    if (type == GGML_TYPE_NVFP4 && ampere_mma_available(cc)) {
+        if (prec == GGML_PREC_BF16) {
+            return GGML_PREC_BF16;
+        }
+        const ggml_cuda_nvfp4_mmq_mode nvfp4_mode = ggml_cuda_nvfp4_mmq_get_mode();
+        if (nvfp4_mode == GGML_CUDA_NVFP4_MMQ_BF16) {
+            return GGML_PREC_BF16;
+        }
+        if (nvfp4_mode == GGML_CUDA_NVFP4_MMQ_LEGACY) {
+            return GGML_PREC_F16;
+        }
+        return GGML_PREC_Q8; // BP-1B default
+    }
+    return GGML_PREC_Q8;
 }
 
 // fork AIPFIX (LLAMA_MOE_COLD_SKIP): routes whose skip value is >= 0 are computed by another call (the hot bank).
@@ -371,8 +423,10 @@ static void ggml_cuda_mul_mat_q_impl(
     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0->type, fusion ? fusion->prec_src1 : ggml_prec_get_src(dst, 1), cc);
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
-    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
-    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+    const bool use_bf16       = src0->type == GGML_TYPE_NVFP4 && prec_src1 == GGML_PREC_BF16;
+    const bool use_nvfp4_k128 = src0->type == GGML_TYPE_NVFP4 && prec_src1 == GGML_PREC_Q8 && ampere_mma_available(cc);
+    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : (use_bf16 ? sizeof(block_bf16_mmq) : sizeof(block_q8_1_mmq));
+    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : (use_bf16 ? QK_BF16_MMQ            : QK8_1_MMQ);
 
     int J_best        = 0;
     int nthreads_best = 0;
@@ -421,6 +475,8 @@ static void ggml_cuda_mul_mat_q_impl(
 
         const int64_t s12 = use_native_fp4 ?
                                 ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
+                            use_bf16 ?
+                                ne11 * ne10_padded * sizeof(block_bf16_mmq) / (QK_BF16_MMQ * sizeof(int)) :
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
         mmq_args args = {
@@ -432,7 +488,7 @@ static void ggml_cuda_mul_mat_q_impl(
         args.ncols_max = ne1;
         // fork: prefill can consume a swizzled producer buffer without quantizing it again.
         // fork: a paired product (paired_src0) reads the same q8_1 buffer in the default layout, so it keeps the default path.
-        const bool use_mmq_prefill = !convrot && !use_native_fp4 && !paired_src0 && !gate && ggml_cuda_should_use_mmq_prefill(args);
+        const bool use_mmq_prefill = !convrot && !use_native_fp4 && !use_bf16 && !use_nvfp4_k128 && !paired_src0 && !gate && ggml_cuda_should_use_mmq_prefill(args);
         const char * prequantized = use_mmq_prefill ? ggml_cuda_mmq_prefill_q8_lookup(ctx, src1, dst, ne10_padded) : nullptr;
         // [PREFILL-GLUE] an opt-in fused GLU / RMS_NORM producer wrote this exact q8_1 layout (same bytes as quantize_mmq_q8_1_cuda)
         if (prequantized == nullptr && !convrot && !use_native_fp4 && !paired_src0 && !gate && ne12 == 1 && ne13 == 1) {
@@ -467,7 +523,12 @@ static void ggml_cuda_mul_mat_q_impl(
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
-
+            } else if (use_bf16) {
+                quantize_mmq_bf16_cuda(src1_d, nullptr, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded,
+                                       ne11, ne12, ne13, stream);
+            } else if (use_nvfp4_k128) {
+                quantize_mmq_q8_1_d128_cuda(src1_d, nullptr, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded,
+                                            ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream, use_mmq_prefill);
@@ -572,6 +633,22 @@ static void ggml_cuda_mul_mat_q_impl(
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
+        } else if (use_bf16) {
+            if (dedup_bcast) {
+                quantize_scatter_mmq_bf16_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), ne10,
+                                        /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+            } else {
+                quantize_mmq_bf16_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), ne10, s11, s12, s13,
+                                       ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            }
+        } else if (use_nvfp4_k128) {
+            if (dedup_bcast) {
+                quantize_scatter_mmq_q8_1_d128_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), ne10,
+                                        /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+            } else {
+                quantize_mmq_q8_1_d128_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), ne10, s11, s12, s13,
+                                            ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            }
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
@@ -584,6 +661,7 @@ static void ggml_cuda_mul_mat_q_impl(
 
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
     const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
+                        use_bf16       ? ne11 * ne10_padded * sizeof(block_bf16_mmq) / (QK_BF16_MMQ * sizeof(int)) :
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 

@@ -2,6 +2,7 @@
 
 #include "vecdotq.cuh"
 #include "mma.cuh"
+#include "mmq-nvfp4-ampere.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -1234,4 +1235,131 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 }
+
+#if defined(AMPERE_MMA_AVAILABLE)
+// BP-1B (Fast Default on Ampere): Block-128 scale-folded INT8 IMMA vec_dot for NVFP4.
+// Accumulates 4 consecutive full-depth mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 (K=128) in int32
+// (max |acc| = 128 * 127 * 127 = 2,064,512 < 2^21 < 2^22), then converts ONCE per K=128 via magic_i2f
+// (IADD3 + FADD, 0 I2FP instructions!).
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_k128_q8_1_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    typedef tile<16, 8, int> tile_A;
+    typedef tile< 8, 8, int> tile_B;
+    typedef tile<16, 8, int> tile_C;
+
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback, prec_src1);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback, prec_src1);
+    constexpr int ntx           = rows_per_warp / tile_C::I;
+    constexpr int nfrags        = MMQ_TILE_NE_K / tile_A::J; // 32 / 8 = 4 k32 steps = K=128
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) (x_qs + 2 * MMQ_TILE_NE_K);
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    const int i0      = (threadIdx.y / ntx) * rows_per_warp;
+    const int k_chunk = k00 / MMQ_TILE_NE_K; // 0 for K=0..127, 1 for K=128..255
+
+    tile_A A[ntx][nfrags];
+    float dA[ntx][tile_C::ne / 2];
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = k00 + frag * tile_A::J;
+            load_ldmatrix(A[n][frag], x_qs + (i0 + n * tile_A::I) * sram_stride + k0, sram_stride);
+        }
+#pragma unroll
+        for (int l = 0; l < tile_C::ne / 2; ++l) {
+            const int i = i0 + n * tile_A::I + tile_C::get_i(2 * l);
+            dA[n][l] = x_df[i * sram_stride + k_chunk];
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+        tile_C C[ntx];
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            tile_B B;
+            load_generic(B, y_qs + j0 * MMQ_TILE_Y_K + frag * tile_B::J, MMQ_TILE_Y_K);
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                mma(C[n], A[n][frag], B);
+            }
+        }
+
+        float dB[tile_C::ne / 2];
+#pragma unroll
+        for (int l = 0; l < tile_C::ne / 2; ++l) {
+            const int j = j0 + tile_C::get_j(l);
+            dB[l] = y_df[j * MMQ_TILE_Y_K]; // 1 fp32 scale per 128 activations (MMQ_Q8_1_DS_LAYOUT_D1_128)
+        }
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const float scale = dA[n][l / 2] * dB[l % 2];
+                sum[(j0 / tile_C::J + n) * tile_C::ne + l] = fmaf(nvfp4_magic_i2f(C[n].x[l]), scale, sum[(j0 / tile_C::J + n) * tile_C::ne + l]);
+            }
+        }
+    }
+}
+
+// BP-1A (Bit-Exact Mode on Ampere): Pre-scaled BF16 HMMA vec_dot for NVFP4.
+// Executes 4 consecutive mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 (K=64 per call, K=128 per iter)
+// directly accumulating into float sum[] (0 I2FP, 0 scale ops, 0 activation quantization loss, 0.00% weight error).
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_bf16_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    typedef tile<16, 8, nv_bfloat162> tile_A;
+    typedef tile< 8, 8, nv_bfloat162> tile_B;
+    typedef tile<16, 8, float>        tile_C;
+
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback, prec_src1);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback, prec_src1);
+    constexpr int ntx           = rows_per_warp / tile_C::I;
+    constexpr int nfrags        = MMQ_TILE_NE_K / tile_A::J; // 32 / 8 = 4 k16 steps = K=64 BF16s
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const nv_bfloat162 * x_bf2 = reinterpret_cast<const nv_bfloat162 *>(x);
+    const nv_bfloat162 * y_bf2 = reinterpret_cast<const nv_bfloat162 *>(y + 4);
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    tile_A A[ntx][nfrags];
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = k00 + frag * tile_A::J;
+            load_ldmatrix(A[n][frag], x_bf2 + (i0 + n * tile_A::I) * sram_stride + k0, sram_stride);
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+        tile_B B[nfrags];
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            load_generic(B[frag], y_bf2 + j0 * MMQ_TILE_Y_K + frag * tile_B::J, MMQ_TILE_Y_K);
+        }
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            tile_C & C = *reinterpret_cast<tile_C *>(sum + (j0 / tile_C::J + n) * tile_C::ne);
+#pragma unroll
+            for (int frag = 0; frag < nfrags; ++frag) {
+                mma(C, A[n][frag], B[frag]);
+            }
+        }
+    }
+}
+#endif // defined(AMPERE_MMA_AVAILABLE)
 
