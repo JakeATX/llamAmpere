@@ -11,6 +11,7 @@
 #include "fattn-i8qk.cuh"
 #include "convert.cuh"
 #include "kv-stream-span-tuner.h"
+#include "inkattn.cuh"
 
 #include <algorithm>
 #include <cstdlib>
@@ -4379,6 +4380,9 @@ static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor 
 static bool ggml_cuda_fattn_mask_is_packed(const ggml_tensor * dst);            // [#175] below
 
 bool ggml_cuda_flash_attn_ext_bounded_prefill_applies(int device, const ggml_tensor * dst) {
+    if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        return false; // INKATTN only
+    }
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         return false; // kv_rows (src[9]): runs on the generic MMA route only
     }
@@ -4602,6 +4606,9 @@ size_t ggml_cuda_flash_attn_ext_sj_kvarn_prefill_alloc_size(int device, const gg
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        return ggml_nbytes(dst); // INKATTN only: scratch from the pool
+    }
     if (ggml_cuda_fattn_mask_is_packed(dst)) {
         // [#175] reserve as for the f16 mask: the routes plan the same scratch either way (the expansion is pool memory)
         ggml_tensor m2;
@@ -4943,6 +4950,11 @@ static bool ggml_cuda_fattn_prefix_supported(int device, const ggml_tensor * dst
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    // fork (INKATTN): relative bias table + gate inside the node (ggml-inkrel.h): no other route reads them
+    if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        GGML_ASSERT(ggml_cuda_inkattn_try(ctx, dst) && "INKREL flash attention node refused by INKATTN");
+        return;
+    }
     // kv_rows (src[9]; upstream src[5]): only upstream's generic MMA f16 kernel reads K/V through the row lists.
     // The fork routes (SJ-KVaRN, QSA rows, TurboQuant/TQ, fused/i8qk/bounded prefill, vec/tile) would silently ignore them.
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
@@ -5009,6 +5021,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // fork (INKATTN): GQA-grouped tensor-core decode for D 128 F16 K/V, g*T <= 16 (GGML_CUDA_INKATTN=0 = off)
+    if (ggml_cuda_inkattn_try(ctx, dst)) {
+        return;
+    }
+
     // fork (LSA compensation, opt-in): an LSE output (src[9]) is written only by the parallel-block combine of the
     // generic kernels or the MMA stream-k uniform fixup, so skip the fused / i8qk / bounded routes
     if (ggml_flash_attn_ext_get_lse(dst) != nullptr) {
@@ -5060,6 +5077,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        return ggml_cuda_inkattn_supported(device, dst);
+    }
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         // kv_rows (src[9]): generic MMA f16 route only (see ggml_cuda_flash_attn_ext)
         return ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;

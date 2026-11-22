@@ -2166,7 +2166,21 @@ struct llm_graph_context {
             ggml_tensor * table, // [n_head_q, extent + 1, n_tokens]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * gate = nullptr) const; // [n_embd_head_v*n_head_q, n_tokens]: returns out * sigmoid(gate)
+
+    // the body of build_attn_rel; sets gated when the gate was applied inside the attention (INKATTN)
+    ggml_tensor * build_attn_rel_base(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * table,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor * gate,
+                   bool & gated) const;
 
     // INKREL (llama-inklsa.h): full-attention visit as far + near flash attention merged by log-sum-exp; k and v are
     // the cache views with this ubatch already stored, the sink logit is zero (folded into table)
