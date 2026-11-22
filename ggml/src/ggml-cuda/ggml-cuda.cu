@@ -75,6 +75,7 @@
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/inkglue.cuh"
+#include "ggml-cuda/inksituq.cuh"
 #include "ggml-cuda/inkreltab.cuh"
 #include "ggml-cuda/inkprep.cuh"
 #include "ggml-cuda/inkcomb.cuh"
@@ -1199,6 +1200,10 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
     for (const auto & r : mmq_prefill_cache.retired) {
         free_buf(r.ptr, r.dev);
     }
+    free_buf(ink_situq.ptr, ink_situq.dev);
+    for (const auto & r : ink_situq.retired) {
+        free_buf(r.ptr, r.dev);
+    }
     free_buf(tq_rot_cache.ptr, tq_rot_cache.dev);
     for (const auto & r : tq_rot_cache.retired) {
         free_buf(r.ptr, r.dev);
@@ -1222,6 +1227,7 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
 
     q8_cache = {};
     mmq_prefill_cache = {};
+    ink_situq = {};
     tq_rot_cache = {};
     moe_tables.clear();
     moe_tables_retired.clear();
@@ -10680,6 +10686,38 @@ static bool ink_match_tanh_cap(ggml_tensor * t, const ggml_tensor ** x, ggml_ten
     return true;
 }
 
+// [INKSITUQ] the down MUL_MAT_ID that reads the SITU output `out` (node last) as src1: the next compute node after last (no-op
+// views between), the output's only use, AI+ experts with the H128 activation (K % 256 != 0: quantize_act128), decode-size
+// (<= 8 tokens). nullptr = none (the SITU kernel runs alone). GGML_CUDA_INKSITUQ=0 = off
+static const ggml_tensor * g_ink_situq_plan_down = nullptr;   // plan mode: the consumer the last SITU match would feed
+
+static const ggml_tensor * ink_situq_consumer(const ggml_cgraph * cgraph, int last, const ggml_tensor * out) {
+    static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKSITUQ");
+    if (!on || (out->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, last) != 1) {
+        return nullptr;
+    }
+    int j = last + 1;
+    while (j < cgraph->n_nodes && j < last + 8 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return nullptr;
+    }
+    const ggml_tensor * down = cgraph->nodes[j];
+    if (down->op != GGML_OP_MUL_MAT_ID || down->src[1] != out || down->src[0] == out || down->src[2] == out ||
+            !(down->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return nullptr;
+    }
+    const ggml_tensor * w   = down->src[0];
+    const ggml_tensor * ids = down->src[2];
+    const int64_t K = out->ne[0];
+    if (ggml_ai4_rate(w->type) == 0 || !ggml_cuda_ai4_supported(down) || w->ne[0] != K || K % 128 != 0 || K % 256 == 0 ||
+            K > INT_MAX || out->ne[2] != ids->ne[1] || ids->ne[1] > 8 || out->ne[1]*out->ne[2] > 65535 || out->ne[3] != 1) {
+        return nullptr;
+    }
+    return down;
+}
+
 static int ggml_cuda_try_fuse_ink_situ(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_SITU");
     ggml_tensor * first = cgraph->nodes[i];
@@ -10724,10 +10762,14 @@ static int ggml_cuda_try_fuse_ink_situ(ggml_backend_cuda_context * ctx, ggml_cgr
                 p.ub_s = ggml_get_op_params_f32(nu[2], 0); p.ub_b = ggml_get_op_params_f32(nu[2], 1);
                 p.sig_first = sig_first;
                 p.act_first = act_first;
+                const ggml_tensor * down = ink_situq_consumer(cgraph, last, out);
                 if (!ctx) {
+                    g_ink_situq_plan_down = down;
                     return last - i;
                 }
-                ggml_cuda_ink_situ(*ctx, g, u, out, p);
+                if (!down || !ggml_cuda_ink_situq_launch(*ctx, g, u, out, p, down)) {
+                    ggml_cuda_ink_situ(*ctx, g, u, out, p);
+                }
                 return last - i;
             }
         }
@@ -13569,9 +13611,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         static int n_stat = 0;
         if (dump_path && cgraph->n_nodes >= 1500 && n_stat < 8) {
             n_stat++;
-            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d; nodes %d\n",
+            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d situq %d/%d (taken/made); nodes %d\n",
                     g_ink_fire[2], g_ink_fire[3], g_ink_fire[4], g_ink_fire[5], g_ink_fire[6], g_ink_fire[7], g_ink_fire[8],
-                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], cgraph->n_nodes);
+                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], ggml_cuda_ink_situq_count(1),
+                    ggml_cuda_ink_situq_count(0), cgraph->n_nodes);
         }
         if (dump_path && !dumped && cgraph->n_nodes >= 1500) {
             ggml_tensor * n0 = cgraph->nodes[cgraph->n_nodes - 1];
@@ -13579,6 +13622,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 dumped = true;
                 FILE * f = fopen(dump_path, "w");
                 if (f) {
+                    const ggml_tensor * situq_down = nullptr;
                     for (int k = 0; k < cgraph->n_nodes; ++k) {
                         const ggml_tensor * t = cgraph->nodes[k];
                         fprintf(f, "%d\t%s\t%s\t%s\t[%lld,%lld,%lld,%lld]\t%s", k, ggml_op_desc(t), t->name, ggml_type_name(t->type),
@@ -13587,9 +13631,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j) {
                             fprintf(f, "\t%s", t->src[j]->name);
                         }
+                        if (t == situq_down) {
+                            fprintf(f, "\tINKSITUQ");   // takes the activation the SITU run before it quantized
+                        }
+                        g_ink_situq_plan_down = nullptr;
                         const int ink = ggml_cuda_try_fuse_inkglue(nullptr, cgraph, k);
                         if (ink > 0) {
                             fprintf(f, "\tINKFUSE+%d", ink);
+                            if (g_ink_situq_plan_down) {
+                                situq_down = g_ink_situq_plan_down;
+                                fprintf(f, "\tINKSITUQ");
+                            }
                         }
                         fprintf(f, "\n");
                     }

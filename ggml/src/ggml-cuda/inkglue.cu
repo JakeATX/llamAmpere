@@ -24,15 +24,7 @@ static __global__ void k_ink_situ(const char * __restrict__ g, const char * __re
     const float gv = *(const float *) (g + i2*g_nb2 + i1*g_nb1 + i0*sizeof(float));
     const float uv = *(const float *) (u + i2*u_nb2 + i1*u_nb1 + i0*sizeof(float));
 
-    const float a1 = p.ga_s*gv + p.ga_b;
-    const float a2 = tanhf(a1);
-    const float a3 = p.gb_s*a2 + p.gb_b;
-    const float sg = 1.0f / (1.0f + expf(-gv));
-    const float a4 = p.sig_first ? sg*a3 : a3*sg;
-    const float u1 = p.ua_s*uv + p.ua_b;
-    const float u2 = tanhf(u1);
-    const float u3 = p.ub_s*u2 + p.ub_b;
-    dst[i] = p.act_first ? a4*u3 : u3*a4;
+    dst[i] = ink_situ_elem(gv, uv, p);
 }
 
 void ggml_cuda_ink_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,
