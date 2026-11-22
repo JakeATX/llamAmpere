@@ -173,16 +173,18 @@ void common_speculative_apply_mtp_sampling_default(common_params & params) {
 
 void common_speculative_apply_dspark_default(common_params & params) {
     auto & spec = params.speculative;
-    if (spec.draft.dspark_adaptive ||
+    if (spec.draft.dspark_adaptive || spec.draft.dspark_n_max_prev > 0 ||
             std::find(spec.types.begin(), spec.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) == spec.types.end()) {
         return;
     }
-    // LLAMA_DSPARK_ADAPT=0 (kill switch) keeps the fixed depth, so n_max (and the recurrent snapshot count derived
-    // from it) stays as before; a draft GGUF without the Markov head (not the Inkling DSpark) drafts at fixed depth too
+    // INKSPEC2 (3090 screen 11-22): with mb on, the Inkling DSpark drafter is fastest at fixed depth 4 (adaptive 3..5
+    // and fixed 5/6 were slower). LLAMA_DSPARK_MB_DEPTH=N picks the depth (0 = keep n_max as before, the kill switch),
+    // LLAMA_DSPARK_ADAPT=1 drafts at the adaptive depth 3..5 instead. A draft GGUF without the Markov head (not the
+    // Inkling DSpark) keeps its depth.
+    const char * ed = getenv("LLAMA_DSPARK_MB_DEPTH");
+    const int    depth = ed ? atoi(ed) : 4;
     const char * ea = getenv("LLAMA_DSPARK_ADAPT");
-    if (ea && atoi(ea) == 0) {
-        return;
-    }
+    const bool   adapt = ea && atoi(ea) != 0;
     if (!spec.draft.mparams.path.empty()) {
         const struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
         gguf_context_ptr ctx(gguf_init_from_file(spec.draft.mparams.path.c_str(), gp));
@@ -192,10 +194,15 @@ void common_speculative_apply_dspark_default(common_params & params) {
     }
     if (params.sampling.spec_lossy &&
             !(spec.user_set & (COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MAX | COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE))) {
-        spec.draft.dspark_adaptive   = true;
-        spec.draft.dspark_n_max_prev = spec.draft.n_max;
-        spec.draft.n_max             = 5;
-        spec.draft.n_min_adaptive    = 3;
+        if (adapt) {
+            spec.draft.dspark_adaptive   = true;
+            spec.draft.dspark_n_max_prev = spec.draft.n_max;
+            spec.draft.n_max             = 5;
+            spec.draft.n_min_adaptive    = 3;
+        } else if (depth > 0) {
+            spec.draft.dspark_n_max_prev = spec.draft.n_max;
+            spec.draft.n_max             = depth;
+        }
     } else if (spec.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_N_MIN_ADAPTIVE) {
         spec.draft.dspark_adaptive = true; // an explicit adaptive floor asks for the adaptive depth
     }

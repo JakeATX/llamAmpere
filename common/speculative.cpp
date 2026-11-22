@@ -1124,12 +1124,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             lilicorr_embd.resize(slots * (size_t) n_embd_dec);
             lilicorr_pos.assign(slots, -1);
             batch_rnn = common_batch(ctx_dft);
-            const char * ea = getenv("LLAMA_DSPARK_ADAPT");
-            ds_adaptive = ea ? atoi(ea) != 0 : this->params.dspark_adaptive;
+            ds_adaptive = this->params.dspark_adaptive;
         }
-        // INKSPEC2: the mb default raised n_max for the adaptive range; a fixed-depth run (other DSpark drafters, or
-        // LLAMA_DSPARK_ADAPT=0) keeps the depth it had before (a lower n_max needs no more recurrent snapshots)
-        if (is_dspark && !ds_adaptive && this->params.dspark_n_max_prev > 0) {
+        // INKSPEC2: the mb default raised n_max for the Inkling DSpark drafter; another DSpark drafter (no recurrent
+        // context) keeps the depth it had before
+        if (is_dspark && !has_rnn_context && this->params.dspark_n_max_prev > 0) {
             this->params.n_max = this->params.dspark_n_max_prev;
         }
 
@@ -1170,7 +1169,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             ds_cap.assign(n_seq, 0);
             ds_last.assign(n_seq, 0);
-            LOG_INF("%s: DSpark draft depth %s %d..%d (LLAMA_DSPARK_ADAPT=0/1)\n", __func__, ds_adaptive ? "adaptive" : "fixed",
+            LOG_INF("%s: DSpark draft depth %s %d..%d (LLAMA_DSPARK_MB_DEPTH=N, LLAMA_DSPARK_ADAPT=1)\n", __func__, ds_adaptive ? "adaptive" : "fixed",
                     ds_adaptive ? this->params.n_min_adaptive : this->params.n_max, this->params.n_max);
         }
 

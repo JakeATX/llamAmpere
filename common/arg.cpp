@@ -1587,7 +1587,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             params.speculative.draft.n_max          = 5;
             params.speculative.draft.n_min_adaptive = 3;
         }
-        // INKSPEC2: mb + adaptive depth 3..5 by default with a DSpark drafter (see spec-defaults.cpp)
+        // INKSPEC2: mb + depth 4 by default with the Inkling DSpark drafter (see spec-defaults.cpp)
         common_speculative_apply_dspark_default(params);
         if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
             throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
@@ -5449,7 +5449,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-mb-mtp"},
         {"--no-spec-mb-mtp"},
         "mb-MTP (mode-biased MTP) on by default with MTP or DSpark drafting; --no-spec-mb-mtp for exact sampling. Keep a rejected draft if p(draft) >= p(residual replacement), excluding EOG and stop tokens; "
-        "--no-spec-mb-mtp keeps exact (lossless) acceptance (default: on with --spec-type draft-mtp, draft-mtp-adaptive or draft-dspark, otherwise off); with no depth flags it drafts at adaptive depth 3-5 (DSpark: LLAMA_DSPARK_ADAPT=0 keeps the fixed depth)",
+        "--no-spec-mb-mtp keeps exact (lossless) acceptance (default: on with --spec-type draft-mtp, draft-mtp-adaptive or draft-dspark, otherwise off); with no depth flags MTP drafts at adaptive depth 3-5 and the Inkling DSpark drafter at depth 4 (LLAMA_DSPARK_MB_DEPTH=0 keeps --spec-draft-n-max)",
         [](common_params & params, bool value) {
             params.sampling.spec_lossy = value;
             params.sampling.spec_lossy_explicit = true;
