@@ -9587,7 +9587,7 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
                 hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
                 sinks && sinks->type == GGML_TYPE_F32 && (!gate || gate->type == GGML_TYPE_F32) &&
                 (((n_head/n_head_kv)*n_tok <= 16 && kv->ne[2] >= llama_inkattn_min_kv()) ||
-                 (is_swa && llama_inkfa_prefill_on() && llama_inkfa_device_ok(ctx0, q_cur, kv, vv, raw, table, rel_pos, sinks, gate, kq_scale)))) {
+                 ((n_head/n_head_kv)*n_tok > 16 && is_swa && llama_inkfa_prefill_on() && llama_inkfa_device_ok(ctx0, q_cur, kv, vv, raw, table, rel_pos, sinks, gate, kq_scale)))) {
             ggml_build_forward_expand(gf, q_cur);
             ggml_build_forward_expand(gf, k_cur);
             ggml_build_forward_expand(gf, v_cur);
