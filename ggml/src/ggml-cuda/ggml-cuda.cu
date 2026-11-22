@@ -107,6 +107,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
 #include "ggml-cuda/inkmask.cuh"
+#include "ggml-cuda/inkrouter.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -11813,18 +11814,113 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
     return last - i;
 }
 
-static int g_ink_fire[11] = {};
+// [INKROUTER] decode MoE router: MUL_MAT(BF16 ffn_gate_inp, x) + the sigmoid topk-moe chain behind it (the nodes the
+// "//topk-moe" block of ggml_cuda_try_fuse takes at i + 1) in one launch (inkrouter.cu). The logits replay the MMVF
+// reduction ggml_cuda_mul_mat runs for this product and the selection is topk_moe_cuda's own device code, so logits, ids
+// and weights are bit-identical to the unfused MMVF + topk-moe pair. GGML_CUDA_INKROUTER=0 = off
+static int ggml_cuda_try_fuse_ink_router(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKROUTER");
+    ggml_tensor * mm = cgraph->nodes[i];
+    if (!on || mm->op != GGML_OP_MUL_MAT || i + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * y = mm->src[1];
+    if (w->type != GGML_TYPE_BF16 || y->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            y->ne[1] != 1 || y->ne[2] != 1 || y->ne[3] != 1 || w->ne[2] != 1 || w->ne[3] != 1 ||
+            !ggml_is_contiguous(w) || !ggml_is_contiguous(y) || !ggml_is_contiguous(mm) ||
+            mm->ne[0] != w->ne[1] || ggml_nrows(mm) != 1 || ggml_get_op_params_i32(mm, 1) != GGML_HINT_NONE) {
+        return 0;
+    }
+    const int device = ggml_cuda_get_device();
+    if (!w->buffer || w->buffer->buft != ggml_backend_cuda_buffer_type(device) ||
+            ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return 0; // a weight in this device's plain CUDA buffer only
+    }
+    const int cc        = ggml_cuda_info().devices[device].cc;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    if (ggml_cuda_mul_mat_route(w, y, mm, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVF) {
+        return 0; // the logits replay mul_mat_vec_f
+    }
+
+    ggml_tensor * gating = cgraph->nodes[i + 1];
+    if (gating->op != GGML_OP_UNARY || ggml_get_unary_op(gating) != GGML_UNARY_OP_SIGMOID || gating->src[0] != mm) {
+        return 0;
+    }
+    ggml_cuda_topk_moe_args args;
+    if (!ggml_cuda_topk_moe_fusion(cgraph, i + 1, args) || !args.sigmoid || args.delayed_softmax || args.n_groups != 0) {
+        return 0;
+    }
+
+    // the "//topk-moe" block's op list, with the MUL_MAT in front
+    std::vector<ggml_op> ops;
+    ops.reserve(16);
+    ops.insert(ops.end(), { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_RESHAPE });
+    const ggml_tensor * bias = nullptr;
+    if (args.prob_bias) {
+        ops.push_back(GGML_OP_ADD);
+        bias = cgraph->nodes[i + ops.size() - 1]->src[1];
+    }
+    ops.insert(ops.end(), { GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
+    int out_nodes[2];
+    out_nodes[0] = i + ops.size() - 2;
+    ggml_tensor * ids = cgraph->nodes[out_nodes[0]];
+    const ggml_tensor * clamp = nullptr;
+    const ggml_tensor * scale = nullptr;
+    if (args.norm) {
+        ops.insert(ops.end(),
+                   { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_eps ? GGML_OP_SCALE : GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
+        clamp = cgraph->nodes[i + ops.size() - 3];
+    }
+    if (args.scale) {
+        ops.push_back(GGML_OP_SCALE);
+        scale = cgraph->nodes[i + ops.size() - 1];
+    }
+    out_nodes[1] = i + ops.size() - 1;
+    if (out_nodes[1] >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * weights = cgraph->nodes[out_nodes[1]];
+
+    if (!ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) ||
+            !ggml_cuda_should_use_topk_moe(gating, mm, weights, ids)) {
+        return 0;
+    }
+    if (weights->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || ggml_nrows(weights) != 1 ||
+            ids->nb[1] / ggml_type_size(ids->type) != (size_t) mm->ne[0] ||
+            !ggml_cuda_inkrouter_supported(w, y, (int) weights->ne[1], cc, warp_size)) {
+        return 0;
+    }
+    if (bias && (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || ggml_nelements(bias) != mm->ne[0])) {
+        return 0;
+    }
+
+    if (ctx) {
+        // the logits are node i, an elided node of the run, so ids / weights may alias them: the one tail warp loads every
+        // logit before it stores (as topk_moe_cuda with one row per block)
+        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2) ||
+                ink_overlap(mm, y) || (bias && ink_overlap(mm, bias)) || ink_overlap(ids, weights)) {
+            return 0;
+        }
+        if (!ggml_cuda_op_inkrouter(*ctx, w, y, mm, weights, ids, clamp, scale, bias, args)) {
+            return 0;
+        }
+    }
+    return (int) ops.size() - 1;
+}
+
+static int g_ink_fire[12] = {};
 
 // ctx == nullptr: plan only (graph_optimize, tensors not allocated yet): match, launch nothing
 static int ggml_cuda_try_fuse_inkglue(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     if (ctx && !ctx->stream_context().concurrent_events.empty()) {
         return 0; // multi-stream graph (GGML_CUDA_GRAPH_OPT): the fused runs would skip cross-stream events
     }
-    int (* const fns[11])(ggml_backend_cuda_context *, ggml_cgraph *, int) = {
+    int (* const fns[12])(ggml_backend_cuda_context *, ggml_cgraph *, int) = {
         ggml_cuda_try_fuse_ink_wconv, ggml_cuda_try_fuse_ink_prep, ggml_cuda_try_fuse_ink_situ, ggml_cuda_try_fuse_ink_moe_wsum, ggml_cuda_try_fuse_ink_clip, ggml_cuda_try_fuse_ink_rel,
         ggml_cuda_try_fuse_ink_conv_epi, ggml_cuda_try_fuse_ink_mix_norm, ggml_cuda_try_fuse_ink_mmgroup,
-        ggml_cuda_try_fuse_ink_lgmulti, ggml_cuda_try_fuse_ink_normq };
-    for (int k = 0; k < 11; ++k) {
+        ggml_cuda_try_fuse_ink_lgmulti, ggml_cuda_try_fuse_ink_normq, ggml_cuda_try_fuse_ink_router };
+    for (int k = 0; k < 12; ++k) {
         const int n = fns[k](ctx, cgraph, i);
         if (n > 0) {
             g_ink_fire[k] += ctx != nullptr;
@@ -13569,9 +13665,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         static int n_stat = 0;
         if (dump_path && cgraph->n_nodes >= 1500 && n_stat < 8) {
             n_stat++;
-            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d; nodes %d\n",
+            GGML_LOG_INFO("INKGLUE fired (eval-time, cumulative): situ %d wsum %d clip %d rel %d conv %d mixnorm %d mmg %d lgm %d normq %d prep %d wconv %d router %d; nodes %d\n",
                     g_ink_fire[2], g_ink_fire[3], g_ink_fire[4], g_ink_fire[5], g_ink_fire[6], g_ink_fire[7], g_ink_fire[8],
-                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], cgraph->n_nodes);
+                    g_ink_fire[9], g_ink_fire[10], g_ink_fire[1], g_ink_fire[0], g_ink_fire[11], cgraph->n_nodes);
         }
         if (dump_path && !dumped && cgraph->n_nodes >= 1500) {
             ggml_tensor * n0 = cgraph->nodes[cgraph->n_nodes - 1];
