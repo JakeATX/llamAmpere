@@ -522,61 +522,44 @@ void llama_d1_select_top(const float * row, int64_t n_vocab, int n, std::vector<
     for (int k = 0; k < n; ++k) { ids[k] = heap[k].id; }
 }
 
-float llama_d1_scan_chunk(const float * row, int64_t i0, int64_t i1, int n, float D, bool collect,
-                          std::vector<llama_d1_cand> & heap, std::vector<int32_t> & buf) {
+void llama_d1_scan_chunk(const float * row, int64_t i0, int64_t i1, int n, std::vector<llama_d1_cand> & heap) {
     heap.clear();
-    buf.clear();
     const int64_t m = std::min<int64_t>(n, i1 - i0);
     for (int64_t i = i0; i < i0 + m; ++i) {
         heap.push_back({ row[i], (int32_t) i });
-        if (collect) { buf.push_back((int32_t) i); }
     }
     if (i1 - i0 <= n) {
-        return -INFINITY;
+        return;
     }
     std::make_heap(heap.begin(), heap.end(), d1_better());
     float thr = heap.front().v;
-    float lo  = collect ? thr - D : thr;
-    const size_t cap = 4096;
     const auto visit = [&](int64_t i) {
         const float x = row[i];
-        if (collect && x >= lo) { buf.push_back((int32_t) i); }
         if (x > thr) {
             std::pop_heap(heap.begin(), heap.end(), d1_better());
             heap.back() = { x, (int32_t) i };
             std::push_heap(heap.begin(), heap.end(), d1_better());
             thr = heap.front().v;
-            if (collect) {
-                lo = thr - D;
-                // ids below the risen floor can never be needed (the floor only rises); keeps buf small
-                if (buf.size() > cap) {
-                    size_t w = 0;
-                    for (const int32_t id : buf) { if (row[id] >= lo) { buf[w++] = id; } }
-                    buf.resize(w);
-                }
-            }
         }
     };
-    // collect: x >= lo (lo <= thr) is the superset test; else x > thr
     int64_t i = i0 + m;
 #ifdef LLAMA_D1_AVX2
     for (; i < i1 && (i & 7); ++i) { visit(i); }
-    __m256 tv = _mm256_set1_ps(collect ? lo : thr);
+    __m256 tv = _mm256_set1_ps(thr);
     for (; i + 8 <= i1; i += 8) {
         const __m256 x = _mm256_loadu_ps(row + i);
-        int mk = _mm256_movemask_ps(collect ? _mm256_cmp_ps(x, tv, _CMP_GE_OQ) : _mm256_cmp_ps(x, tv, _CMP_GT_OQ));
+        int mk = _mm256_movemask_ps(_mm256_cmp_ps(x, tv, _CMP_GT_OQ));
         if (mk) {
             while (mk) {
                 const int b = __builtin_ctz(mk);
                 mk &= mk - 1;
                 visit(i + b);
             }
-            tv = _mm256_set1_ps(collect ? lo : thr);
+            tv = _mm256_set1_ps(thr);
         }
     }
 #endif
     for (; i < i1; ++i) { visit(i); }
-    return collect ? lo : thr;
 }
 
 // ---- per-context state --------------------------------------------------------------------------------------------
@@ -889,9 +872,9 @@ void llama_d1_ctx::fused_scan(int64_t k) {
     const float * row = pool.logits + (*pool.rows)[ri] * nv;
     const auto t0 = std::chrono::steady_clock::now();
     fchunk_t & fc = fch[k];
-    llama_d1_scan_chunk(row, i0, i1, n_top, 0.0f, false, fc.heap, fc.buf);
+    llama_d1_scan_chunk(row, i0, i1, n_top, fc.heap);
     ns_select += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
-    // the last chunk of the row merges (acq_rel: sees the other chunks' heaps and bufs)
+    // the last chunk of the row merges (acq_rel: sees the other chunks' heaps)
     if (frow[ri].left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         fused_merge(ri);
     }

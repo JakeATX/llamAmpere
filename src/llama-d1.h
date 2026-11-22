@@ -109,12 +109,9 @@ void llama_d1_select_top(const float * row, int64_t n_vocab, int n, std::vector<
 
 struct llama_d1_cand { float v; int32_t id; };
 
-// [EXACTHEAD] fused pick, one scan of row[i0, i1): heap = the range's top n (llama_d1_cand, any order); if collect,
-// buf (appended, ascending ids) = every id ever kept plus every id with row[i] >= fl(thr_t - D), thr_t the running
-// n-th value when i was read. Returns the final fl(thr - D) (-inf if the range has <= n ids): every id of the range
-// with row[i] >= that value is in buf.
-float llama_d1_scan_chunk(const float * row, int64_t i0, int64_t i1, int n, float D, bool collect,
-                          std::vector<llama_d1_cand> & heap, std::vector<int32_t> & buf);
+// [EXACTHEAD] fused pick, one scan of row[i0, i1): heap = the range's top n (llama_d1_cand, any order; ties keep the
+// lower id, as llama_d1_select_top)
+void llama_d1_scan_chunk(const float * row, int64_t i0, int64_t i1, int n, std::vector<llama_d1_cand> & heap);
 
 // [EXACTHEAD] certificate: after the top N are exact, any other row whose coarse logit could still reach the k-th
 // exact logit (coarse + margin + sigma * s_i >= T_k, s_i = sqrt(sum_g ||h_g||^2 * gl2[i][g]^2 / 32)) is rescored too.
@@ -223,7 +220,7 @@ struct llama_d1_ctx {
     // Same rows as the separate path. Jobs run in row order, so the first read can return once its row is done.
     bool fused = false;
     int64_t fused_min_chunk = 16384;           // ids per chunk at least (tests lower it)
-    struct fchunk_t { std::vector<llama_d1_cand> heap; std::vector<int32_t> buf; float floor = 0.0f; };
+    struct fchunk_t { std::vector<llama_d1_cand> heap; };
     struct frow_t {
         std::vector<int32_t> ids;
         cert_prep_t cp;
@@ -236,7 +233,6 @@ struct llama_d1_ctx {
     std::unique_ptr<frow_t[]> frow;            // [rows]
     size_t                frow_n = 0;
     int                   n_chunk = 1;
-    std::atomic<int64_t>  next2{0};
     void fused_scan(int64_t k);   // phase 1 job
     void fused_merge(int64_t ri);
     void fused_dots(int64_t k);   // phase 2 job
