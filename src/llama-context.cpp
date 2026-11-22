@@ -5865,12 +5865,17 @@ static bool b1_pending_publish_enabled() {
     return enabled;
 }
 
-static bool swa_full_rows_enabled() {
-    static const bool enabled = [] {
+// LLAMA_LADDER_SWA_ROWS: unset = on for Inkling 2 only (gated there), 1 = on for every SWA model, 0 = off.
+// Other SWA families stay opt-in until each one is gated (COORD-taichi 11-22).
+static bool swa_full_rows_enabled(llm_arch arch) {
+    static const int mode = [] {
         const char * text = getenv("LLAMA_LADDER_SWA_ROWS");
-        return !(text && text[0] == '0');
+        return text && text[0] ? (text[0] == '0' ? 0 : 1) : -1;
     }();
-    return enabled;
+    if (mode >= 0) {
+        return mode == 1;
+    }
+    return arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP;
 }
 
 bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch,
@@ -5976,7 +5981,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     } else if (alone && n_tokens > 3072) {
         rows = n_tokens < 16384 ? std::min(2048u, n_tokens) : std::min(cparams.n_ubatch, n_tokens);
     } else if (alone && dynamic_ubatch && rows == 512 && n_tokens > 512 && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE &&
-            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !b1_cache_device_active && swa_full_rows_enabled()) {
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !b1_cache_device_active && swa_full_rows_enabled(model.arch)) {
         // fork INKPREFILL: the SWA cache is sized n_swa + n_ubatch, so 512-row pieces of a server batch still attend
         // over all n_swa + n_ubatch cells (Inkling 2 Mini at ub 2048: 3,072 cells, not 1,536) and pay that mask and
         // attention work twice. Run the batch at its own size up to n_ubatch; the dynamic ceiling below still caps it.
