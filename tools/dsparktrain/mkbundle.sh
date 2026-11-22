@@ -39,7 +39,7 @@ for f in target.pt lm_truth.bf16 lm_truth.gguf prep_check.json; do cp -u /mnt/da
     printf '%s\t%s\n' "$(stat -c %s $f)" "$f"
   done
   printf '%s\t%s\n' "$(du -sb /mnt/data/inkflags/venv | cut -f1)" /mnt/data/inkflags/venv/
-  printf '%s\t%s\n' "$(du -sb /home/jakek/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu | cut -f1)" /home/jakek/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/
+  UVP=$(readlink -f /home/jakek/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu); printf "%s\t%s (symlink target of the uv python; rsync both)\n" "$(du -sb $UVP | cut -f1)" "$UVP/"
 } > $B/STAGED_MODELS.txt
 echo "bundle $B: $(du -sh $B | cut -f1); + models/python:"; cat $B/STAGED_MODELS.txt
 sha256sum $B/w0/target.pt $B/w0/lm_truth.bf16 > $B/w0/SHA256SUMS

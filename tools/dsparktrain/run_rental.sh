@@ -12,7 +12,7 @@ M=$R/model/Inkling-2-Mini-A_all_ait4u-fold.gguf
 DQ=$R/model/Inkling-2-Mini-DSpark-Q8_0.gguf; DF=$R/model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf; DB=$R/model/Inkling-2-Mini-DSpark-BF16.gguf
 BUDGET=${BUDGET:-2000000}; NPRED=${NPRED:-4096}; MAXP=${MAXP:-2048}; NP=${NP:-10}; PORT=18480
 STEPS=${STEPS:-1000}; LR=${LR:-3e-5}; LOSS=${LOSS:-e4}; KL=${KL:-0.1}; SPS=${SPS:-4}; APS=${APS:-512}
-EVAL_EVERY=${EVAL_EVERY:-100}; EVAL_STRIDE=${EVAL_STRIDE:-4}; DTYPE=${DTYPE:-bf16}   # train dump dtype; sel/rep are f32
+EVAL_EVERY=${EVAL_EVERY:-100}; EVAL_STRIDE=${EVAL_STRIDE:-8}; DTYPE=${DTYPE:-bf16}   # train dump dtype; sel/rep are f32
 # KVF: target KV flags for gen, dumps and server checks (empty = default KV, the config of the 134.1 tok/s baseline;
 # set e.g. KVF="-ctk sjkvarn4 -ctv sjkvarn4" to train/evaluate at the Inkling gate KV)
 KVF=${KVF:-}
