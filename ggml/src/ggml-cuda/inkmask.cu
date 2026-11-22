@@ -34,6 +34,8 @@ struct ink_relmask_chain {
     int mcast  = -1;  // CPY F16->F32 of the mask, or -1
     int add    = 0;   // ADD
     int out    = 0;   // CPY F32->F16 (last node)
+    int stage  = -1;  // -1: write the output directly; else a chain node (GET_ROWS, CONT or ADD) whose buffer holds the
+                      // result first, copied to the output after (the output reuses the table, rel or mask memory)
 };
 
 static int ink_relmask_log_level() {
@@ -142,8 +144,25 @@ static bool ink_relmask_parse(const ggml_cgraph * cgraph, int i, ink_relmask_cha
         const char * ap = (const char *) a->data, * bp = (const char *) b->data;
         return ap < bp + ggml_nbytes(b) && bp < ap + ggml_nbytes(a);
     };
-    if (!O->data || overlaps(O, A) || overlaps(O, I) || overlaps(O, Mr)) {
+    if (!O->data) {
         INK_FAIL(17);
+    }
+    // gallocr frees the table after GET_ROWS, so in prefill the output often reuses its memory. The chain's own
+    // F32 intermediates (GET_ROWS, CONT, ADD: twice the output's size, dead once fused) then stage the result.
+    ch.stage = -1;
+    if (overlaps(O, A) || overlaps(O, I) || overlaps(O, Mr)) {
+        const int cands[3] = { 0, ch.cont, ch.add };
+        for (const int c : cands) {
+            const ggml_tensor * S = cgraph->nodes[i + c];
+            if (S->data && ggml_nbytes(S) >= ggml_nbytes(O) && !overlaps(S, A) && !overlaps(S, I) && !overlaps(S, Mr) &&
+                    !overlaps(S, O)) {
+                ch.stage = c;
+                break;
+            }
+        }
+        if (ch.stage < 0) {
+            INK_FAIL(20);
+        }
     }
 
     // the mask cast records itself as src[1] (ggml_cast), so its use count is 2 (itself + the ADD): checked here and
@@ -225,7 +244,7 @@ static __global__ void k_ink_relmask(
 
 template <typename mask_t>
 static void ink_relmask_launch_t(const ggml_tensor * A, const ggml_tensor * I, const ggml_tensor * Mr, const ggml_tensor * M,
-        ggml_tensor * O, int64_t H, int64_t n_kv, int64_t T, int64_t Ts, cudaStream_t stream) {
+        half * out, int64_t H, int64_t n_kv, int64_t T, int64_t Ts, cudaStream_t stream) {
     const size_t mts = ggml_type_size(Mr->type);
     const int block = 256;
     const dim3 grid((unsigned) ((n_kv + block - 1)/block), (unsigned) T, 1);
@@ -237,7 +256,7 @@ static void ink_relmask_launch_t(const ggml_tensor * A, const ggml_tensor * I, c
                 (const int32_t *) I->data, (int64_t) (I->nb[1]/sizeof(int32_t)),
                 (const mask_t *) Mr->data, M->ne[0], M->ne[1], M->ne[2], M->ne[3],
                 (int64_t) (Mr->nb[0]/mts), (int64_t) (Mr->nb[1]/mts), (int64_t) (Mr->nb[2]/mts), (int64_t) (Mr->nb[3]/mts),
-                (half *) O->data, (int) H, n_kv, Ts);
+                out, (int) H, n_kv, Ts);
     };
     if (per_head) {
         launch(k_ink_relmask<mask_t, true>);
@@ -262,10 +281,14 @@ void ggml_cuda_ink_relmask_launch(ggml_backend_cuda_context & ctx, const ggml_cg
 
     const int64_t H = G->ne[0], n_kv = G->ne[1], T = G->ne[2], Ts = P->ne[1];
     cudaStream_t stream = ctx.stream();
+    half * dst = (half *) (ch.stage >= 0 ? cgraph->nodes[i + ch.stage]->data : O->data);
     if (Mr->type == GGML_TYPE_F16) {
-        ink_relmask_launch_t<half>(A, I, Mr, M, O, H, n_kv, T, Ts, stream);
+        ink_relmask_launch_t<half>(A, I, Mr, M, dst, H, n_kv, T, Ts, stream);
     } else {
-        ink_relmask_launch_t<float>(A, I, Mr, M, O, H, n_kv, T, Ts, stream);
+        ink_relmask_launch_t<float>(A, I, Mr, M, dst, H, n_kv, T, Ts, stream);
+    }
+    if (ch.stage >= 0) {
+        CUDA_CHECK(cudaMemcpyAsync(O->data, dst, ggml_nbytes(O), cudaMemcpyDeviceToDevice, stream));
     }
     // GGML_CUDA_INK_MASK_LOG=1: one line per new (n_kv, T) shape (diagnostic: shows the prompt ubatch size)
     static const bool log_shapes = [] { const char * e = getenv("GGML_CUDA_INK_MASK_LOG"); return e && atoi(e) != 0; }();
@@ -274,7 +297,7 @@ void ggml_cuda_ink_relmask_launch(ggml_backend_cuda_context & ctx, const ggml_cg
         static int n_logged = 0;
         if ((n_kv != last_kv || T != last_t) && n_logged < 256) {
             last_kv = n_kv; last_t = T; ++n_logged;
-            GGML_LOG_WARN("[INKMASK] shape n_kv %lld T %lld\n", (long long) n_kv, (long long) T);
+            GGML_LOG_WARN("[INKMASK] shape n_kv %lld T %lld%s\n", (long long) n_kv, (long long) T, ch.stage >= 0 ? " staged" : "");
         }
     }
     if (g_ink_relmask_count.n.fetch_add(1) == 0) {
