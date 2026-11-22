@@ -2,6 +2,19 @@
 #include "qsa-resident.cuh"
 #include "ggml-cuda-kv-stream-testing.h"
 #include "moe-devsort.cuh"
+#include "q8p.cuh"
+
+// [INKDENSE Q8P] any copy into or out of a planar weight (or a view of one) first turns it back into Q8_0 blocks for good
+static void ggml_cuda_q8p_to_blocks(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return;
+    }
+    ggml_tensor * base = (ggml_tensor *) (t->view_src ? t->view_src : t);
+    if (ggml_cuda_q8p_is(base)) {
+        ggml_cuda_q8p_unpack_inplace(base, cudaStreamPerThread);
+        base->flags = (base->flags & ~GGML_CUDA_Q8P_FLAG) | GGML_CUDA_Q8P_FLAG_DENY;
+    }
+}
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc-impl.h"
@@ -1597,6 +1610,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1618,6 +1632,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     // TQ4_1S → q8_0 load-time conversion (default on, GGML_TQ_NATIVE=1 disables). Skipped for views
     // and for bases that already have a view (see ggml_backend_cuda_buffer_tq_view_follow_base).
     if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S && offset == 0 && size == ggml_nbytes(tensor) &&
@@ -1655,6 +1670,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1664,6 +1680,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     CUDA_CHECK(ggml_cuda_memcpy_h2d_2d_async(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1674,6 +1691,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q8p_to_blocks(tensor);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1685,6 +1703,7 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
     ggml_cuda_set_device(ctx->device);
 
     for (size_t i = 0; i < n_tensors; i++) {
+        ggml_cuda_q8p_to_blocks(tensors[i]);
         if (sizes[i] == 0) {
             continue;
         }
@@ -1710,6 +1729,7 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, 
     }
 
     for (size_t i = 0; i < n_tensors; i++) {
+        ggml_cuda_q8p_to_blocks(tensors[i]);
         if (sizes[i] == 0) {
             continue;
         }
@@ -1725,6 +1745,8 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, 
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_cuda_q8p_to_blocks(src);
+    ggml_cuda_q8p_to_blocks(dst);
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -4365,6 +4387,24 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
+    if (ggml_cuda_q8p_is(src0_)) {
+        // [INKDENSE Q8P] decode: planar matvec; larger batches: unpack to Q8_0 blocks in the pool and take the usual path
+        if (dst->src[0] == src0_ && dst->src[1] == src1_ && ggml_cuda_q8p_mmv(ctx, &dst, 1)) {
+            return;
+        }
+        const size_t nbytes = ggml_nbytes(src0_);
+        const size_t alloc  = std::max(nbytes, ggml_backend_buffer_get_alloc_size(src0_->buffer, src0_));
+        ggml_cuda_pool_alloc<char> blocks(ctx.pool(), alloc);
+        if (alloc > nbytes) {
+            CUDA_CHECK(cudaMemsetAsync(blocks.get() + nbytes, 0, alloc - nbytes, ctx.stream()));
+        }
+        ggml_cuda_q8p_unpack_to(src0_, blocks.get(), ctx.stream());
+        ggml_tensor w = *src0_;
+        w.data   = blocks.get();
+        w.flags &= ~GGML_CUDA_Q8P_FLAG;
+        ggml_cuda_mul_mat(ctx, &w, src1_, dst);
+        return;
+    }
     // Q8_CR weights are stored rotated: rotate the activations with the same
     // matrix and run the standard Q8_0 kernels (the rotations cancel)
     ggml_cuda_pool_alloc<float> src1_rot_buf;
@@ -5459,6 +5499,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
+    ggml_cuda_q8p_to_blocks(tensor);
 
     CUDA_CHECK(ggml_cuda_memcpy_h2d_async((char *) tensor->data + offset, data, size, cuda_ctx->stream()));
 }
@@ -5470,6 +5511,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
+    ggml_cuda_q8p_to_blocks(tensor);
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -5482,6 +5524,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
+    ggml_cuda_q8p_to_blocks(tensor);
 
     CUDA_CHECK(ggml_cuda_memcpy_h2d_2d_async(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cuda_ctx->stream()));
@@ -5495,12 +5538,16 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     GGML_ASSERT(ggml_backend_buffer_is_cuda(buf) &&
         static_cast<ggml_backend_cuda_buffer_context *>(buf->context)->device == cuda_ctx->device &&
         "unsupported buffer type");
+    ggml_cuda_q8p_to_blocks(tensor);
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_cuda_q8p_any(src) || ggml_cuda_q8p_any(dst)) {
+        return false;   // [INKDENSE Q8P] the scheduler falls back to the synchronous copy, which converts
+    }
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
@@ -6247,7 +6294,8 @@ static bool ggml_backend_cuda_set_scratch_buffers(ggml_backend_t backend, ggml_b
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
-           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+           (t->op == GGML_OP_NONE && (t->src[0] == nullptr || !ggml_cuda_q8p_enabled()));   // [INKDENSE Q8P] a NONE node with sources is a hidden MUL_MAT
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -6481,6 +6529,22 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->moe_cache_generation = moe_cache_generation;
         res = true;
     }
+    // [INKDENSE Q8P] a weight changed layout (pack / unpack in place): every graph re-captures, including one reused by uid
+    bool q8p_changed = false;
+    if (ggml_cuda_q8p_enabled()) {   // port: no map/mutex work with the flag off
+        static std::unordered_map<const void *, uint64_t> q8p_seen;
+        static std::mutex q8p_seen_mutex;
+        std::lock_guard<std::mutex> q8p_lock(q8p_seen_mutex);
+        const uint64_t gen = ggml_cuda_q8p_generation();
+        auto it = q8p_seen.find(graph);
+        if (it == q8p_seen.end()) {
+            q8p_seen.emplace(graph, gen);
+        } else if (it->second != gen) {
+            it->second = gen;
+            q8p_changed = true;
+            res = true;
+        }
+    }
     // J3 scratch moved (generation bump): every graph holding the old pointers re-captures, including one reused by uid
     bool lsa_j3_changed = false;
     if (ggml_cuda_lsa_j3_graphs()) {
@@ -6523,7 +6587,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
     }
 
-    if (!moe_cache_changed && !lsa_j3_changed && cgraph->uid != 0 &&
+    if (!moe_cache_changed && !lsa_j3_changed && !q8p_changed && cgraph->uid != 0 &&
         cgraph->uid == graph->uid &&
         kv_stream_generation == previous_kv_stream_generation) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -11199,6 +11263,96 @@ static int ggml_cuda_try_moe_onechain_fill(ggml_backend_cuda_context & ctx, ggml
     return 2;
 }
 
+// [INKDENSE Q8P] GGML_CUDA_Q8P=1 (default off): before a graph runs, every Q8_0 weight it uses only as src0 of MUL_MAT is
+// repacked in place to planes (q8p.cuh); a weight that any graph uses in another way goes back to blocks for good.
+static void ggml_cuda_q8p_prepare(ggml_backend_cuda_context & ctx, ggml_cgraph * g) {
+    const auto is_weight = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_Q8_0 && t->buffer != nullptr &&
+               ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    };
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            ggml_tensor * s = n->src[k];
+            if (s == nullptr) {
+                continue;
+            }
+            ggml_tensor * base = s->view_src ? s->view_src : s;
+            if ((n->op == GGML_OP_MUL_MAT && k == 0 && s == base) || (base->flags & GGML_CUDA_Q8P_FLAG_DENY) || !is_weight(base)) {
+                continue;
+            }
+            if (base->flags & GGML_CUDA_Q8P_FLAG) {
+                ggml_cuda_q8p_unpack_inplace(base, ctx.stream());
+                base->flags &= ~GGML_CUDA_Q8P_FLAG;
+            }
+            base->flags |= GGML_CUDA_Q8P_FLAG_DENY;
+        }
+    }
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        if (n->op != GGML_OP_MUL_MAT || n->src[0] == nullptr) {
+            continue;
+        }
+        ggml_tensor * w = n->src[0];
+        if ((w->flags & (GGML_CUDA_Q8P_FLAG | GGML_CUDA_Q8P_FLAG_DENY)) || !is_weight(w) || !ggml_cuda_q8p_shape_ok(w) ||
+                w->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) {
+            continue;
+        }
+        ggml_cuda_q8p_pack_inplace(w, ctx.stream());
+        w->flags |= GGML_CUDA_Q8P_FLAG;
+    }
+}
+
+// eval loop: node i is a planar MUL_MAT (op hidden as NONE). With can_group, later planar MUL_MATs with the same batch
+// whose activations do not come from an earlier member join one launch; view / no-op nodes between them are passed
+// over. Returns the nodes to skip.
+static int ggml_cuda_q8p_launch_run(ggml_backend_cuda_context & ctx, ggml_cgraph * g, const int i, const int n_limit,
+                                    const std::vector<uint8_t> & mark, const bool can_group) {
+    ggml_tensor * a = g->nodes[i];
+    ggml_tensor * dsts[GGML_CUDA_Q8P_GRP_MAX] = { a };
+    int n = 1, last = i;
+    const int64_t N = a->src[1]->ne[1];
+    if (can_group && N <= 8 && a->src[1]->ne[2] == 1 && a->src[1]->ne[3] == 1) {
+        for (int j = i + 1; j < n_limit && n < GGML_CUDA_Q8P_GRP_MAX; ++j) {
+            ggml_tensor * b = g->nodes[j];
+            if (!mark[j]) {
+                if (ggml_cuda_is_view_or_noop(b) || (b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+                break;
+            }
+            if ((b->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || b->src[1] != a->src[1]) {
+                break;   // same activations only: a freed src1 of one member may be reused for a later member's dst
+            }
+            const ggml_tensor * x = b->src[1]->view_src ? b->src[1]->view_src : b->src[1];
+            bool dep = false;
+            for (int k = 0; k < n; ++k) {
+                dep |= x == dsts[k] || x == (dsts[k]->view_src ? dsts[k]->view_src : dsts[k]);
+            }
+            if (dep) {
+                break;
+            }
+            dsts[n++] = b;
+            last = j;
+        }
+    }
+    if (n > 1 && ggml_cuda_q8p_mmv(ctx, dsts, n)) {
+        return last - i;
+    }
+    ggml_cuda_mul_mat(ctx, a->src[0], a->src[1], a);
+    return 0;
+}
+
+// graph_optimize test (the flag is set only at the first compute): a MUL_MAT that will run planar
+static bool ggml_cuda_q8p_member(const ggml_tensor * n) {
+    if (!ggml_cuda_q8p_enabled() || n->op != GGML_OP_MUL_MAT || n->src[0] == nullptr || n->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * w = n->src[0];
+    return (ggml_cuda_q8p_is(w) || ((w->flags & GGML_CUDA_Q8P_FLAG_DENY) == 0 && ggml_cuda_q8p_shape_ok(w))) &&
+           n->src[1]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32;
+}
+
 // [INKDENSE] GGML_CUDA_AI_MMV_GROUP (default on, =0 off): AI+ unit-type MUL_MATs that read the same activations (Inkling q / gate /
 // rel of a visit, and k / v where they share the input) are moved next to each other at graph_optimize and run as one grouped
 // decode mmv launch (ggml_cuda_mul_mat_ai4_group; bitwise equal to the separate launches).
@@ -11227,6 +11381,15 @@ static bool ggml_cuda_ai_mmv_group_pair(const ggml_tensor * a, const ggml_tensor
            b->src[0]->ne[0] == a->src[0]->ne[0];
 }
 
+static bool ggml_cuda_grp_member(const ggml_tensor * n) {
+    return (ggml_cuda_ai_mmv_group_on() && ggml_cuda_ai_mmv_group_member(n)) || ggml_cuda_q8p_member(n);
+}
+
+static bool ggml_cuda_grp_pair(const ggml_tensor * a, const ggml_tensor * b) {
+    return ggml_cuda_ai_mmv_group_member(a) ? ggml_cuda_ai_mmv_group_pair(a, b)
+                                            : ggml_cuda_q8p_member(b) && b->src[1] == a->src[1];
+}
+
 // graph_optimize: move every later member that shares the first member's activations (and layout, K) up behind it. A member
 // reads only its weight (a leaf) and the shared activations, which are computed before the first member, so the order stays
 // valid.
@@ -11242,7 +11405,7 @@ static void ggml_cuda_ai_mmv_group_optimize(ggml_cgraph * g) {
         }
         ggml_tensor * a = g->nodes[i];
         order.push_back(a);
-        if (!ggml_cuda_ai_mmv_group_member(a)) {
+        if (!ggml_cuda_grp_member(a)) {
             continue;
         }
         int cnt = 1;
@@ -11254,7 +11417,7 @@ static void ggml_cuda_ai_mmv_group_optimize(ggml_cgraph * g) {
             if (!taken[j] && k->view_src == base && !pure_view) {
                 break;   // writes the shared activations in place: no later member may move above it
             }
-            if (!taken[j] && ggml_cuda_ai_mmv_group_pair(a, g->nodes[j])) {
+            if (!taken[j] && ggml_cuda_grp_pair(a, g->nodes[j])) {
                 taken[j] = 1;
                 order.push_back(g->nodes[j]);
                 moved += j != i + cnt;
@@ -16718,6 +16881,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             const auto kv_stream_runtimes = ggml_cuda_kv_stream_prepare_graph(
                 cgraph, cuda_ctx->stream());
 
+            // [INKDENSE Q8P] planar MUL_MATs read as GGML_OP_NONE for every plan and fusion below (none of them knows the
+            // layout); the loop launches them itself and the ops are restored after it
+            std::vector<uint8_t> q8p_mark;
+            if (ggml_cuda_q8p_enabled()) {
+                for (int i = 0; i < cgraph->n_nodes; ++i) {
+                    ggml_tensor * n = cgraph->nodes[i];
+                    if (n->op == GGML_OP_MUL_MAT && ggml_cuda_q8p_is(n->src[0])) {
+                        if (q8p_mark.empty()) {
+                            q8p_mark.assign(cgraph->n_nodes, 0);
+                        }
+                        q8p_mark[i] = 1;
+                        n->op = GGML_OP_NONE;
+                    }
+                }
+            }
             // [#87] GET_ROWS state gathers the gated_delta_net launches replace (see ggml_cuda_gdn_state_read_plan)
             std::vector<uint8_t> gdn_state_read_skip;
             // [#110] CONCAT and snapshot-window nodes the conv ring ssm_conv launches replace (ggml_cuda_conv_ring_plan)
@@ -16860,6 +17038,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     fusion_graph.n_nodes = shexp_cur->join_at;
                 } else if (shexp_next < shexp_runs.size()) {
                     fusion_graph.n_nodes = shexp_runs[shexp_next].begin;
+                }
+
+                if (!q8p_mark.empty() && q8p_mark[i]) {
+                    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue;
+                    }
+                    i += ggml_cuda_q8p_launch_run(*cuda_ctx, cgraph, i, fusion_graph.n_nodes, q8p_mark,
+                            stream_ctx.concurrent_events.empty() && shexp_runs.empty() && !is_concurrent_event_active);
+                    continue;
                 }
 
                 if (ggml_cuda_is_view_or_noop(node)) {
@@ -17006,6 +17193,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            for (size_t k = 0; k < q8p_mark.size(); ++k) {
+                if (q8p_mark[k]) {
+                    cgraph->nodes[k]->op = GGML_OP_MUL_MAT;   // [INKDENSE Q8P] restore
+                }
             }
             // [VSHX] a chain or a join still open at the end of the graph
             if (shexp_state != 0) {
@@ -17161,6 +17353,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_backend_cuda_upload_flush(backend);  // no-op unless GGML_SCHED_UPLOAD_BATCH=1 staged copies are waiting
     ggml_cuda_lsa_ahead_graph_begin(*cuda_ctx, cgraph); // GGML_CUDA_LSA_STAGE_AHEAD: none applied across graphs; first layer queued here
+    if (ggml_cuda_q8p_enabled()) {
+        ggml_cuda_q8p_prepare(*cuda_ctx, cgraph);   // [INKDENSE Q8P] before any capture: repacks are synchronous
+    }
     if (cuda_ctx->scratch_borrowed && !ggml_cuda_borrowed_plan_fits(*cuda_ctx, cgraph)) {
         GGML_LOG_ERROR("%s: graph does not fit borrowed CUDA scratch\n", __func__);
         return GGML_STATUS_ALLOC_FAILED;
@@ -17345,7 +17540,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_cuda_nemotron_ssm_prepare(cgraph, params);
     }
 
-    if (!disable_fusion && ggml_cuda_ai_mmv_group_on()) {
+    if (!disable_fusion && (ggml_cuda_ai_mmv_group_on() || ggml_cuda_q8p_enabled())) {
         ggml_cuda_ai_mmv_group_optimize(cgraph);
     }
 
