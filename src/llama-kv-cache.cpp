@@ -1692,6 +1692,61 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+// INKKV: the SJ-KVaRN seq_rm rules without changing anything (see seq_rm); p0/p1 already clamped. Fills the streams to
+// reset / truncate when asked.
+bool llama_kv_cache::sj_kvarn_rm_plan(llama_seq_id seq_id, llama_pos p0, llama_pos p1,
+        std::vector<uint32_t> * s_reset, std::vector<uint32_t> * s_trunc) const {
+    const uint32_t s_beg = seq_id >= 0 ? seq_to_stream[seq_id] : 0;
+    const uint32_t s_end = seq_id >= 0 ? s_beg + 1 : n_stream;
+    for (uint32_t strm = s_beg; strm < s_end; ++strm) {
+        const auto & st = sj_kvarn_st[strm];
+        const uint32_t n_present = v_cells[strm].used_max_p1();
+        // the rules count cells: positions [p0, p1) are the cells [c0, c1)
+        const uint32_t c0 = sj_kvarn_cell_of(strm, p0);
+        const uint32_t c1 = sj_kvarn_cell_of(strm, p1);
+        if (c0 == 0 && c1 >= n_present) {
+            if (s_reset) { s_reset->push_back(strm); }
+        } else if (c0 < n_present && c1 < n_present) {
+            LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): cells [%u, %u) would remain behind a hole\n",
+                    __func__, p0, p1, c1, n_present);
+            return false;
+        } else if (st.B > sj_kvarn.sink && c0 < n_present &&
+                   (c0 < st.B || (sj_kvarn_split_grid && sj_kvarn_replay_B(c0) < st.B))) {
+            // [#197] full grid schedule (restore grid: llama_sj_kvarn_prefill_cut()): a cut at or above B also reopens the groups a prefill of [0, p0) would not
+            // have sealed yet (B ran ahead on the removed positions), so the re-prefill matches a cold one
+            // a suffix below B goes through sj_kvarn_truncate_body(): groups whose staging rows are still in the
+            // ring are reopened, below them only a cut on a group boundary works (whole records are dropped)
+            uint32_t B_new = 0;
+            const bool tgt = sj_kvarn_truncate_target(strm, c0, B_new);
+            if (!tgt && c0 >= st.B) {
+                continue; // [#197] grid reopen above B is best effort: the old suffix rule (B unchanged) applies
+            }
+            if (!tgt) {
+                LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): cells below %u are sealed, the ring no "
+                        "longer holds the rows below cell %u and it is not on a group boundary (truncate at llama_sj_kvarn_rm_floor())\n",
+                        __func__, p0, p1, st.B, c0);
+                return false;
+            }
+            if (s_trunc) { s_trunc->push_back(strm); }
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::sj_kvarn_can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (other || !sj_kvarn.enabled()) {
+        return true;
+    }
+    GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+    return p1 <= p0 || sj_kvarn_rm_plan(seq_id, p0, p1, nullptr, nullptr);
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Safe while block KV streaming is active: this only edits cell bookkeeping (which
     // positions and sequence ids a slot holds). No K/V bytes move, so the host cache stays
@@ -1726,41 +1781,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // dropped). A cut at or below the sink drops every record.
         // Every stream holds one sequence, so the rules apply per stream: the sequence's own stream, or every
         // stream for seq_id == -1 (checked for all of them before any is changed).
-        const uint32_t s_beg = seq_id >= 0 ? seq_to_stream[seq_id] : 0;
-        const uint32_t s_end = seq_id >= 0 ? s_beg + 1 : n_stream;
         std::vector<uint32_t> s_reset;
         std::vector<uint32_t> s_trunc;
-        for (uint32_t strm = s_beg; strm < s_end; ++strm) {
-            const auto & st = sj_kvarn_st[strm];
-            const uint32_t n_present = v_cells[strm].used_max_p1();
-            // the rules count cells: positions [p0, p1) are the cells [c0, c1)
-            const uint32_t c0 = sj_kvarn_cell_of(strm, p0);
-            const uint32_t c1 = sj_kvarn_cell_of(strm, p1);
-            if (c0 == 0 && c1 >= n_present) {
-                s_reset.push_back(strm);
-            } else if (c0 < n_present && c1 < n_present) {
-                LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): cells [%u, %u) would remain behind a hole\n",
-                        __func__, p0, p1, c1, n_present);
-                return false;
-            } else if (st.B > sj_kvarn.sink && c0 < n_present &&
-                       (c0 < st.B || (sj_kvarn_split_grid && sj_kvarn_replay_B(c0) < st.B))) {
-                // [#197] full grid schedule (restore grid: llama_sj_kvarn_prefill_cut()): a cut at or above B also reopens the groups a prefill of [0, p0) would not
-                // have sealed yet (B ran ahead on the removed positions), so the re-prefill matches a cold one
-                // a suffix below B goes through sj_kvarn_truncate_body(): groups whose staging rows are still in the
-                // ring are reopened, below them only a cut on a group boundary works (whole records are dropped)
-                uint32_t B_new = 0;
-                const bool tgt = sj_kvarn_truncate_target(strm, c0, B_new);
-                if (!tgt && c0 >= st.B) {
-                    continue; // [#197] grid reopen above B is best effort: the old suffix rule (B unchanged) applies
-                }
-                if (!tgt) {
-                    LLAMA_LOG_WARN("%s: SJ-KVaRN cache: cannot remove positions [%d, %d): cells below %u are sealed, the ring no "
-                            "longer holds the rows below cell %u and it is not on a group boundary (truncate at llama_sj_kvarn_rm_floor())\n",
-                            __func__, p0, p1, st.B, c0);
-                    return false;
-                }
-                s_trunc.push_back(strm);
-            }
+        if (!sj_kvarn_rm_plan(seq_id, p0, p1, &s_reset, &s_trunc)) {
+            return false;
         }
         for (uint32_t strm : s_trunc) {
             const bool ok = sj_kvarn_truncate_body(strm, sj_kvarn_cell_of(strm, p0));
@@ -5328,6 +5352,34 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+// INKKV v2: far mask of the SJ-KVaRN base: cells hold one sequence at their positions with no holes, so the cells at
+// distance >= extent from row i are the prefix [0, cell_of(pos_i - extent + 1)) of the occupied cells
+void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 && dst->ne[2] == 1 && dst->ne[3] == 1 && sj_kvarn.enabled());
+    const int64_t n_kv = dst->ne[0];
+    const int64_t T    = dst->ne[1];
+    GGML_ASSERT(T >= (int64_t) ubatch->n_tokens);
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    std::vector<ggml_fp16_t> data(n_kv*T, ninf);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq = ubatch->seq_id[i][0];
+        const uint32_t strm = seq_to_stream.at(seq);
+        const auto & cells = v_cells.at(strm);
+        const llama_pos pf = ubatch->pos[i] - (llama_pos) extent; // the last far position
+        if (pf < 0) {
+            continue;
+        }
+        const int64_t c1 = std::min<int64_t>(n_kv, std::min<int64_t>(cells.used_max_p1(), sj_kvarn_cell_of(strm, pf + 1)));
+        for (int64_t j = 0; j < c1; ++j) {
+            if (!cells.is_empty(j) && cells.seq_has(j, seq) && cells.pos_get(j) <= pf) {
+                data[i*n_kv + j] = zero;
+            }
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 // INKREL (llama-inklsa.h): far mask over every cell, near cells (within extent of some row) with their bias rows
 void llama_kv_cache::set_input_inkrel(const llama_inkrel_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const {
     const int64_t T    = ubatch->n_tokens;
@@ -7628,6 +7680,18 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_lsa_pos(ggml_tensor * cell_pos, ggml_tensor * q_pos, const llama_ubatch * ubatch) const {
     kv->set_input_lsa_pos(cell_pos, q_pos, ubatch);
+}
+
+void llama_kv_cache_context::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_sj_far_mask(dst, ubatch, extent);
+}
+
+bool llama_kv_cache_context::has_layer(int32_t il) const {
+    return kv->has_layer(il);
+}
+
+llama_pos llama_kv_cache_context::get_seq_pos_min(llama_seq_id seq_id) const {
+    return kv->seq_pos_min(seq_id);
 }
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {

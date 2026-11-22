@@ -976,7 +976,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 // INKSPEC_LOG=<path>: drafter slot logits of the last DSpark draft (host-argmax path, LLAMA_DSPARK_IDS=0), read by
 // the server's verify-side log. Pure logging: no RNG, no state change.
-std::vector<std::vector<float>> common_inkspec_dft_logits;
+std::vector<std::vector<float>> & common_inkspec_dft_logits() {
+    static std::vector<std::vector<float>> v;
+    return v;
+}
 bool common_inkspec_log_on() {
     static const bool on = getenv("INKSPEC_LOG") != nullptr;
     return on;
@@ -1650,7 +1653,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // token here (host argmax, first maximum), at most n_max of them
                 const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
                 if (common_inkspec_log_on()) {
-                    common_inkspec_dft_logits.clear();
+                    common_inkspec_dft_logits().clear();
                 }
                 if (dspark_ids && dspark_sk > 0) {
                     // INKSPEC sampled walk: row = [state(rank), drawn id, K candidate ids, K candidate logits]
@@ -1713,7 +1716,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     result.push_back((llama_token) (std::max_element(logits, logits + n_vocab) - logits));
                     // INKSPEC_LOG: keep the slot's drafter logits for the verify-side log (pure logging)
                     if (common_inkspec_log_on()) {
-                        common_inkspec_dft_logits.emplace_back(logits, logits + n_vocab);
+                        common_inkspec_dft_logits().emplace_back(logits, logits + n_vocab);
                     }
                 }
                 ds_last[seq_id] = (int32_t) result.size();

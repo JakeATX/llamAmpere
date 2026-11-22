@@ -3988,7 +3988,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr),
                             /* kv_stream_stage_bytes */ params.kv_stream_stage_bytes,
                             /* kv_stream_phase_arena */ params.kv_stream_phase_arena,
-                            /* kv_stream_maximum_pool_bytes */ params.kv_stream_maximum_pool_bytes);
+                            /* kv_stream_maximum_pool_bytes */ params.kv_stream_maximum_pool_bytes,
+                            /* sj_kvarn (INKKV)  */ (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) ?
+                                                    params.sj_kvarn : llama_sj_kvarn_config());
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(

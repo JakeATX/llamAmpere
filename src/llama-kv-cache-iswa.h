@@ -52,7 +52,9 @@ public:
         const  layer_share_cb & share,
                           size_t kv_stream_stage_bytes = 0,
                           void * kv_stream_phase_arena = nullptr,
-                          size_t kv_stream_maximum_pool_bytes = 0);
+                          size_t kv_stream_maximum_pool_bytes = 0,
+        // fork (INKKV): SJ-KVaRN on the non-SWA (full-attention) half only; the SWA half keeps a plain cache
+                   llama_sj_kvarn_config sj_kvarn = llama_sj_kvarn_config());
 
     ~llama_kv_cache_iswa() = default;
 
@@ -102,6 +104,9 @@ public:
 private:
 
     const bool unified;
+
+    // fork (INKKV): head-packed hparams of the SJ-KVaRN base half (see llama_kv_cache_iswa ctor), owned here
+    std::unique_ptr<llama_hparams> hparams_base_sj;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;

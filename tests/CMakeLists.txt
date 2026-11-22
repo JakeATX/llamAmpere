@@ -831,7 +831,7 @@ llama_build_and_test(test-ait-format.cpp)
 llama_build_and_test(test-ai4-u2.cpp)
 llama_build_and_test(test-gguf-deprecated-ai.cpp)
 
-if (GGML_CUDA)
+if (GGML_CUDA AND NOT GGML_BACKEND_DL) # test-magic2-v2 links ggml-cuda directly (a MODULE under GGML_BACKEND_DL)
     enable_language(CUDA)
     add_executable(test-magic2-v2 test-magic2-v2.cu)
     target_link_libraries(test-magic2-v2 PRIVATE ggml-base ggml-cuda)

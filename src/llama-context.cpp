@@ -3115,6 +3115,14 @@ static enum ggml_type llama_memory_get_kv_type(const llama_memory_i * mem, bool 
 static llama_kv_cache * llama_sj_kvarn_cache(llama_memory_i * memory) {
     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) { return kv; }
     if (auto * hy = dynamic_cast<llama_memory_hybrid *>(memory)) { return hy->get_mem_attn(); }
+    // fork (INKKV): SJ-KVaRN lives on the full-attention (base) half of an iSWA memory
+    if (auto * hy = dynamic_cast<llama_memory_hybrid_iswa *>(memory)) {
+        llama_kv_cache * base = hy->get_mem_attn() ? hy->get_mem_attn()->get_base() : nullptr;
+        return base && base->is_sj_kvarn() ? base : nullptr;
+    }
+    if (auto * kv = dynamic_cast<llama_kv_cache_iswa *>(memory)) {
+        return kv->get_base()->is_sj_kvarn() ? kv->get_base() : nullptr;
+    }
     return nullptr;
 }
 
@@ -5884,6 +5892,19 @@ static bool b1_pending_publish_enabled() {
     return enabled;
 }
 
+// LLAMA_LADDER_SWA_ROWS: unset = on for Inkling 2 only (gated there), 1 = on for every SWA model, 0 = off.
+// Other SWA families stay opt-in until each one is gated (COORD-taichi 11-22).
+static bool swa_full_rows_enabled(llm_arch arch) {
+    static const int mode = [] {
+        const char * text = getenv("LLAMA_LADDER_SWA_ROWS");
+        return text && text[0] ? (text[0] == '0' ? 0 : 1) : -1;
+    }();
+    if (mode >= 0) {
+        return mode == 1;
+    }
+    return arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP;
+}
+
 bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch,
         enum llama_decode_phase phase) {
     const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
@@ -5986,6 +6007,15 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         }
     } else if (alone && n_tokens > 3072) {
         rows = n_tokens < 16384 ? std::min(2048u, n_tokens) : std::min(cparams.n_ubatch, n_tokens);
+    } else if (alone && dynamic_ubatch && rows == 512 && n_tokens > 512 && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !b1_cache_device_active && swa_full_rows_enabled(model.arch)) {
+        // fork INKPREFILL: the SWA cache is sized n_swa + n_ubatch, so 512-row pieces of a server batch still attend
+        // over all n_swa + n_ubatch cells (Inkling 2 Mini at ub 2048: 3,072 cells, not 1,536) and pay that mask and
+        // attention work twice. Run the batch at its own size up to n_ubatch; the dynamic ceiling below still caps it.
+        // 32K cold prefill, 3090, fused mask: 1,763 tok/s at 512 rows vs 2,226 at 2,048. LLAMA_LADDER_SWA_ROWS=0 off.
+        // Rounded up to 512 and never below the current reserve, so a batch tail or a follow-up does not re-reserve;
+        // not while the expert cache is live (a bigger scratch would borrow from it: small cards with offload).
+        rows = std::min(cparams.n_ubatch, std::max(GGML_PAD(n_tokens, 512u), sched_reserve_tokens));
     }
     rows = std::min(rows, cparams.n_ubatch);
     // fork: packed prefill grows single-layer graphs, not a full-model MoE graph.
@@ -10820,9 +10850,21 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     }
     // (after the LSA check, so a refusal reports the LSA reason first)
     if (params.sj_kvarn_bits_k > 0 || params.sj_kvarn_bits_v > 0) {
+        const bool inkling = model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP;
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
                 continue;
+            }
+            if (inkling) {
+                // INKKV: Inkling's SWA layers keep an F16 cache; the full-attention layers pack two 128-channel KV heads
+                // into one 256-channel row (llama_kv_cache_iswa)
+                if (model->hparams.is_swa(il)) {
+                    continue;
+                }
+                if (model->hparams.n_embd_head_k(il) == 128 && model->hparams.n_embd_head_v(il) == 128 &&
+                        model->hparams.n_head_kv(il) % 2 == 0) {
+                    continue;
+                }
             }
             if (model->hparams.n_embd_head_k(il) != 256 || model->hparams.n_embd_head_v(il) != 256) {
                 LLAMA_LOG_ERROR("%s: SJ-KVaRN cache requires 256-channel K/V heads (layer %u has %u/%u)\n", __func__,

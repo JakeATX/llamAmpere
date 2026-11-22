@@ -1713,6 +1713,23 @@ struct ggml_backend_cuda_context {
         std::vector<retired_buf> retired;
     } mmq_prefill_cache;
 
+    // [INKSITUQ] one-shot handoff: the Inkling SITU kernel also writes the H128 int8 activation (q, then the fp32 scales)
+    // of its MUL_MAT_ID consumer, which then skips its own quantize launch. Persistent memory (a captured graph replays
+    // kernels that point at it), grow-only, retired buffers freed at teardown; main stream only (see inksituq.cu).
+    struct {
+        char *              ptr = nullptr;
+        size_t              cap = 0;
+        int                 dev = -1;
+        const ggml_tensor * src1 = nullptr;
+        const ggml_tensor * consumer = nullptr;
+        const void *        data = nullptr;
+        uint64_t            epoch = 0;
+        int64_t             rows = 0;
+        int                 K = 0;
+        cudaStream_t        stream = nullptr;
+        std::vector<retired_buf> retired;
+    } ink_situq;
+
     // Same idea for the TQ activation pre-rotation (forward block WHT + q8_1 quantize): the MoE
     // gate and up projections consume the same normed activation, so the rotation ran twice per
     // layer. Keyed by tensor identity, data pointer, size and graph-eval epoch; main-stream only.

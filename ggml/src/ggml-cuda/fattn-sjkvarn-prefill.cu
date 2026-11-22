@@ -108,6 +108,17 @@ static __global__ void fattn_sj_kvarn_scatter_prefill(
     *(float *) (dst + row*nb2 + (size_t) head*nb1 + (size_t) channel*nb0) = src[i];
 }
 
+// INKKV v2: one head group's LSE [group heads, T] (the stream-k fixup layout: row = token*heads + head) into the node's
+// LSE [n_head, T] at head offset head_first
+static __global__ void fattn_sj_kvarn_scatter_lse(
+        const float * src, float * dst, const int n_rows, const int query_heads, const int head_first, const int n_head) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_rows) {
+        return;
+    }
+    dst[(i/query_heads)*n_head + head_first + i%query_heads] = src[i];
+}
+
 static size_t fattn_sj_kvarn_prefill_budget() {
     static const size_t budget = [] {
         const char * value = getenv("GGML_SJKVARN_PREFILL_MIB");
@@ -194,6 +205,9 @@ struct fattn_sj_kvarn_prefill_plan {
     size_t i8qk_offset      = 0;     // bytes from the scratch start to the int8 K
     size_t master_offset    = 0;
     size_t master_bytes     = 0;
+    // INKKV v2: an LSE node (src[9], Inkling far part) runs the f16 MMA (stream-k: the uniform fixup writes the LSE), never
+    // the int8-QK kernel, the chunked fold or the strip master; grouped plans stage each group's LSE behind its output
+    size_t lse_offset       = 0;
 };
 
 static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc, const ggml_tensor * dst) {
@@ -205,11 +219,15 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const int bits_pair = ggml_get_op_params_i32(dst, 5);
     const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
     const size_t budget_cap = trellis ? fattn_sj_kvarn_prefill_trellis_budget() : fattn_sj_kvarn_prefill_budget();
+    const bool lse = ggml_flash_attn_ext_get_lse(dst) != nullptr;
     static const bool master_enabled = [] {
         const char * value = getenv("GGML_CUDA_LSA_RESIDENT_STRIP_MASTER");
         return value && value[0] == '1' && !value[1];
     }();
     const bool master = trellis && master_enabled;
+    if (lse && master) {
+        return p;
+    }
     // Canonical scratch is at most 41% of f16 K/V. Leave a third of the cap for it and alignment.
     const size_t budget = master ? budget_cap/3*2 : budget_cap;
     if (budget == 0 || Q->ne[1] < 128 || !ampere_mma_available(cc) || (ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 && !trellis) ||
@@ -240,8 +258,9 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     const size_t kv_elements_per_head = size_t(n_kv)*256;
     const size_t kv_bytes_per_head = 2*kv_elements_per_head*sizeof(half);
     const size_t output_elements_per_head = size_t(Q->ne[1])*gqa*256;
-    const size_t output_bytes_per_head = output_elements_per_head*sizeof(float);
-    const bool i8qk = ggml_cuda_fattn_i8qk_sj_kvarn_wanted(cc, dst);
+    const size_t lse_bytes_per_head = lse ? size_t(Q->ne[1])*gqa*sizeof(float) : 0;
+    const size_t output_bytes_per_head = output_elements_per_head*sizeof(float) + lse_bytes_per_head;
+    const bool i8qk = !lse && ggml_cuda_fattn_i8qk_sj_kvarn_wanted(cc, dst);
     const size_t i8qk_bytes_per_head = i8qk ? kv_elements_per_head : 0; // int8 K
     // the trellis chunk decision keeps the f16-only test; the int8 K bytes only regroup the expanded (unchunked) plan
     const bool grouped_f16 = size_t(K->ne[2]) > budget/kv_bytes_per_head;
@@ -258,7 +277,7 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
         const int v = value ? atoi(value) : 0;
         return v >= 256 && v % 256 == 0 ? v : 0;
     }();
-    if ((grouped_f16 || force_chunk_kv > 0) && trellis && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
+    if (!lse && (grouped_f16 || force_chunk_kv > 0) && trellis && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
             Q->ne[2] % K->ne[2] == 0 && gqa <= 8 && ggml_is_contiguous(dst)) {
         // [TRPF] KV chunks: K/V chunk (all heads) + one launch's partials + metas + the running (max, sum) per row
         const size_t n_head = Q->ne[2];
@@ -312,8 +331,12 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
     p.kv_elements_per_head = kv_elements_per_head;
     p.output_elements_per_head = output_elements_per_head;
     p.kv_elements = kv_elements_per_head*heads_per_group;
-    p.output_bytes = grouped ? output_bytes_per_head*heads_per_group : 0;
+    p.output_bytes = grouped ? (output_bytes_per_head - lse_bytes_per_head)*heads_per_group : 0;
     p.scratch_bytes = 2*p.kv_elements*sizeof(half) + p.output_bytes;
+    if (grouped && lse) {
+        p.lse_offset = GGML_PAD(p.scratch_bytes, 128);
+        p.scratch_bytes = p.lse_offset + lse_bytes_per_head*heads_per_group;
+    }
     if (i8qk) {
         p.i8qk = true;
         p.i8qk_offset = GGML_PAD(p.scratch_bytes, 128);
@@ -362,7 +385,8 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         ggml_cuda_lsa_page_prepare(ctx, dst);
     }
     const bool trellis = fattn_sj_kvarn_prefill_trellis(dst);
-    GGML_ASSERT(ggml_flash_attn_ext_get_lse(dst) == nullptr && "SJ-KVaRN expand prefill writes no LSE output (graph: no LSE at >= 128 rows)");
+    ggml_tensor * lse = ggml_flash_attn_ext_get_lse(dst);
+    GGML_ASSERT(!lse || (!plan.chunked && !plan.i8qk && !master));
     GGML_ASSERT(!ggml_cuda_fattn_sj_kvarn_rot(dst)); // [#139] no in-kernel rotation: fattn.cu runs it in separate passes
     const int gqa = Q->ne[2]/K->ne[2];
     const bool grouped = plan.grouped;
@@ -528,6 +552,16 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         ggml_set_op_params_i32(&out, 5, 0);
         ggml_set_op_params_i32(&out, 6, 0);
         ggml_tensor sinks;
+        ggml_tensor lse_group;
+        if (grouped && lse) {
+            lse_group = *lse;
+            lse_group.ne[0] = q.ne[2];
+            lse_group.data = (char *) scratch_ptr + plan.lse_offset;
+            lse_group.buffer = nullptr;
+            lse_group.view_src = nullptr;
+            lse_group.view_offs = 0;
+            out.src[9] = &lse_group;
+        }
         if (grouped) {
             out.ne[1] = q.ne[2];
             out.nb[0] = sizeof(float);
@@ -584,6 +618,14 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
                 output, (char *) dst->data, output_elements, heads*gqa, head_first*gqa,
                 dst->nb[0], dst->nb[1], dst->nb[2]);
             CUDA_CHECK(cudaGetLastError());
+            if (lse) {
+                const int n_rows = int(Q->ne[1])*heads*gqa;
+                const ggml_cuda_kernel_launch_params lse_params(dim3((n_rows + 255)/256), dim3(256), 0, ctx.stream());
+                ggml_cuda_kernel_launch(fattn_sj_kvarn_scatter_lse, lse_params,
+                    (const float *) ((const char *) scratch_ptr + plan.lse_offset), (float *) lse->data, n_rows, heads*gqa,
+                    head_first*gqa, int(Q->ne[2]));
+                CUDA_CHECK(cudaGetLastError());
+            }
         }
     }
     return true;

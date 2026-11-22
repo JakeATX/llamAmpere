@@ -25,6 +25,20 @@ struct ink_situ_params {
     int   act_first;    // MUL(act, u) instead of MUL(u, act)
 };
 
+// one SITU element (k_ink_situ; INKSITUQ's producer kernel runs the same expression)
+static __device__ __forceinline__ float ink_situ_elem(const float gv, const float uv, const ink_situ_params & p) {
+    const float a1 = p.ga_s*gv + p.ga_b;
+    const float a2 = tanhf(a1);
+    const float a3 = p.gb_s*a2 + p.gb_b;
+    const float sg = 1.0f / (1.0f + expf(-gv));
+    const float a4 = p.sig_first ? sg*a3 : a3*sg;
+    const float u1 = p.ua_s*uv + p.ua_b;
+    const float u2 = tanhf(u1);
+    const float u3 = p.ub_s*u2 + p.ub_b;
+    // round-to-nearest product: never contracted into a following add (INKSITUQ quantizes this value in registers)
+    return p.act_first ? __fmul_rn(a4, u3) : __fmul_rn(u3, a4);
+}
+
 void ggml_cuda_ink_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, ggml_tensor * dst,
         const ink_situ_params & p);
 void ggml_cuda_ink_moe_wsum(ggml_backend_cuda_context & ctx, const ggml_tensor * e, const ggml_tensor * w, ggml_tensor * dst);
