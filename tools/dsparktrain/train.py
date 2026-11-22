@@ -45,9 +45,13 @@ def ste_weights(P, fr, fold_fixed=None):
     H, b = P[D.H_NAME], P['dspark_hidden_out.bias']
     Hb = H + (H.detach().to(torch.bfloat16).float() - H.detach())
     lm = fr.lm[:D.V_UNPAD]
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False   # the fold is fp32 like ink_dspark_fold.py (then fp16)
     fold = lm.float() @ Hb
+    fold_b = lm.float() @ b
+    torch.backends.cuda.matmul.allow_tf32 = prev
     W['fold'] = fold + (fold.detach().half().float() - fold.detach())
-    W['fold_b'] = lm.float() @ b
+    W['fold_b'] = fold_b
     return W
 
 

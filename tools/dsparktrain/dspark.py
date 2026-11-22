@@ -208,14 +208,15 @@ _ROPE = {}
 
 
 def rope_cs(pos, device):
-    key = (device, int(pos.max()) + 1)
-    if key not in _ROPE or _ROPE[key][0].shape[0] < key[1]:
-        n = max(key[1], 8192)
+    """cos/sin tables, one per device, regrown (doubling) only when a longer position is needed."""
+    need = int(pos.max()) + 1
+    t = _ROPE.get(device)
+    if t is None or t[0].shape[0] < need:
+        n = max(need, 2 * (t[0].shape[0] if t is not None else 0), 8192)
         inv = ROPE_BASE ** (-(torch.arange(0, HD // 2, dtype=torch.float64) * 2) / HD)
         th = torch.arange(n, dtype=torch.float64)[:, None] * inv[None, :]
-        _ROPE[key] = (torch.cos(th).float().to(device), torch.sin(th).float().to(device))
-    c, s = _ROPE[key]
-    return c[pos], s[pos]
+        t = _ROPE[device] = (torch.cos(th).float().to(device), torch.sin(th).float().to(device))
+    return t[0][pos], t[1][pos]
 
 
 def rope_neox(x, pos):
@@ -324,7 +325,10 @@ def markov_step(W, prev, state, hidden, context):
 
 def slot_logits(W, frozen, cur_i, latent, bf16=False):
     """softcapped logits [R, V_UNPAD] of one walked slot."""
-    base = mm(cur_i, frozen.base_weight(bf16))
+    if bf16:   # bf16 GEMM for the [V, E] base (training speed option), fp32 result
+        base = (act_q8(cur_i).to(torch.bfloat16) @ frozen.base_weight(True).t()).float()
+    else:
+        base = mm(cur_i, frozen.out)
     bias = act_f16(latent) @ W['fold'][:V_UNPAD].t().to(latent.dtype) + W['fold_b'][:V_UNPAD].to(latent.dtype)
     l = (base + bias).float()
     return SOFTCAP * torch.tanh(l / SOFTCAP)
@@ -365,7 +369,7 @@ def accept_terms(p, pid, q, qid, t, eog=EOG_IDS, want_mb=True):
     pt = (p * (pid == t[:, None])).sum(-1)
     qt = (q * (qid == t[:, None])).sum(-1)
     ratio = qt / pt.clamp_min(1e-30)
-    c = torch.where(pt > 0, torch.clamp(ratio, max=1.0), (qt > 0).to(q.dtype))
+    c = torch.where(pt > 0, torch.clamp(ratio, max=1.0), torch.zeros_like(qt))   # p(t) = 0: dump/gen numeric mismatch, no credit
     out = dict(A=A, c=c, pt0=(pt <= 0))
     if not want_mb:
         return out
@@ -390,7 +394,7 @@ def accept_terms(p, pid, q, qid, t, eog=EOG_IDS, want_mb=True):
     resc = (p_at_q >= pt[:, None]) & ~q_eog & ~t_eog[:, None]
     rej = (q * (1 - m) * (~resc).to(q.dtype)).sum(-1)
     pprime = Jt + rest / Z.squeeze(-1).clamp_min(1e-30) * rej
-    out.update(Amb=Amb, cmb_is=torch.where(pt > 0, Jt / pt.clamp_min(1e-30), (Jt > 0).to(q.dtype)),
+    out.update(Amb=Amb, cmb_is=torch.where(pt > 0, Jt / pt.clamp_min(1e-30), torch.zeros_like(Jt)),
                cmb=torch.where(pprime > 0, torch.clamp(Jt / pprime.clamp_min(1e-30), max=1.0), torch.zeros_like(Jt)))
     return out
 

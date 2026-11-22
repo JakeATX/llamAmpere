@@ -6,7 +6,7 @@ Sources (none is a speed/quality gate prompt):
   re-templates them with the Inkling server's /apply-template), g2p = gr2plan-heal-r416 prompts (plain text).
 Leak guard: a prompt is dropped if any 64-character window (whitespace-normalised) of it occurs in the gate texts:
   inkbench TASK / GREEDY_PROMPTS / FOLLOWUPS, wikitext-2 test (speed-bench filler), the inkqual/inkqual2 panels.
-Splits by a hash of the prompt's document group (first 2,000 normalised characters), so prompts sharing a document
+Splits by a hash of the last user turn (first 2,000 normalised characters), so prompts sharing a document + question
 never straddle: train / sel (held-out, checkpoint selection) / rep (held-out, report only). 6% + 6%.
 usage: prep_prompts.py OUT.jsonl [--max-chars 14000]"""
 import hashlib, json, os, random, re, sys
@@ -117,7 +117,9 @@ def main():
         if leaks(full, sh):
             drop['gate_overlap'] += 1; continue
         seen.add(ch)
-        g = int(hashlib.sha256(norm(full)[:2000].encode()).hexdigest()[:8], 16) % 100
+        # group = the last user turn's first 2,000 characters (shared system / tool prompts do not decide the split;
+        # prompts reusing one document + question stay together)
+        g = int(hashlib.sha256(norm(d['messages'][-1]['content'])[:2000].encode()).hexdigest()[:8], 16) % 100
         d['split'] = 'sel' if g < SEL_PCT else 'rep' if g < SEL_PCT + REP_PCT else 'train'
         d['chash'] = ch
         kept.append(d)

@@ -10,15 +10,18 @@ R=${R:-/root/dst}; T=$R/wt/tools/dsparktrain; D=$R/data; O=$R/out
 PY=${PY:-/mnt/data/inkflags/venv/bin/python}
 M=$R/model/Inkling-2-Mini-A_all_ait4u-fold.gguf
 DQ=$R/model/Inkling-2-Mini-DSpark-Q8_0.gguf; DF=$R/model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf; DB=$R/model/Inkling-2-Mini-DSpark-BF16.gguf
-BUDGET=${BUDGET:-2000000}; NPRED=${NPRED:-4096}; MAXP=${MAXP:-2048}; NP=${NP:-16}; PORT=18480
+BUDGET=${BUDGET:-2000000}; NPRED=${NPRED:-4096}; MAXP=${MAXP:-2048}; NP=${NP:-10}; PORT=18480
 STEPS=${STEPS:-1000}; LR=${LR:-3e-5}; LOSS=${LOSS:-e4}; KL=${KL:-0.1}; SPS=${SPS:-4}; APS=${APS:-512}
-EVAL_EVERY=${EVAL_EVERY:-100}; EVAL_STRIDE=${EVAL_STRIDE:-4}; DTYPE=${DTYPE:-bf16}
+EVAL_EVERY=${EVAL_EVERY:-100}; EVAL_STRIDE=${EVAL_STRIDE:-4}; DTYPE=${DTYPE:-bf16}   # train dump dtype; sel/rep are f32
+# KVF: target KV flags for gen, dumps and server checks (empty = default KV, the config of the 134.1 tok/s baseline;
+# set e.g. KVF="-ctk sjkvarn4 -ctv sjkvarn4" to train/evaluate at the Inkling gate KV)
+KVF=${KVF:-}
 export PYTHONPATH=$R/wt/gguf-py LLAMA_ARG_NO_CACHE_DISK=1
 mkdir -p $D $O $R/run
 log() { echo "$(date -u +%FT%TZ) $*" | tee -a $R/run.log; }
 done_or() { [ -e $R/$1.done ] && { log "skip $1"; return 0; }; return 1; }
 TRAINARGS="--w0 $R/w0 --drafter $DF --bf16 $DB"
-DUMP="$R/bin/llama-dspark-dump -m $M -ngl 99 -fa on -t 8 -c 8192 -b 2048 -ub 512"
+DUMP="$R/bin/llama-dspark-dump -m $M -ngl 99 -fa on -t 8 -c 8192 -b 2048 -ub 512 $KVF"
 
 ph_check() {
   done_or check && return
@@ -33,7 +36,7 @@ ph_check() {
 
 ph_gen() {
   done_or gen && return
-  $R/bin/llama-server -m $M --host 127.0.0.1 --port $PORT -c $((NP * (MAXP + NPRED + 64))) -np $NP -ngl 99 -fa on -t 8 -tb 8 --jinja --no-webui \
+  $R/bin/llama-server -m $M --host 127.0.0.1 --port $PORT -c $((NP * (MAXP + NPRED + 64))) -np $NP -ngl 99 -fa on -t 8 -tb 8 --jinja --no-webui $KVF \
       > $R/gen_server.log 2>&1 &
   local sp=$!
   for i in $(seq 1 180); do curl -sf http://127.0.0.1:$PORT/health > /dev/null && break; sleep 2; done
@@ -53,12 +56,13 @@ ph_seq() { done_or seq && return; $PY $T/mkseq.py $D/gens.jsonl $D/seq > $R/seq.
 ph_dump() {
   done_or dump && return
   local ntok=$($PY -c "import json, glob; print(sum(m['len'] for f in glob.glob('$D/seq/*.seq.json') for m in json.load(open(f))))")
-  local need=$(( ntok * 4 * 2304 * 2 / 1000000000 + 5 ))   # bf16 features; top-64 rows add ~3%
+  local need=$(( ntok * 4 * 2304 * 2 / 1000000000 * 115 / 100 + 5 ))   # bf16 train features (+ f32 sel/rep, top-64 rows)
   local free=$(df -BG --output=avail $D | tail -1 | tr -dc 0-9)
   (( free > need )) || { log "dump needs ~${need} GB, ${free} GB free"; return 1; }
   for s in sel rep train; do
     [ -e $D/$s.dump.done ] && continue
-    $DUMP --ds-in $D/seq/$s.seq --ds-out $D/$s --ds-dtype $DTYPE > $R/dump_$s.log 2>&1 || { log "dump $s failed"; return 1; }
+    local dt=f32; [ $s = train ] && dt=$DTYPE
+    $DUMP --ds-in $D/seq/$s.seq --ds-out $D/$s --ds-dtype $dt > $R/dump_$s.log 2>&1 || { log "dump $s failed"; return 1; }
     touch $D/$s.dump.done; log "dump $s $(grep -E 'seqs,' $R/dump_$s.log | tail -1)"
   done
   touch $R/dump.done
@@ -93,7 +97,8 @@ ph_export() {
 }
 
 ph_server() {
-  # quick server tok/round: bench prompt (3K chat), 3,072-token replies, seeds 1,2; shipped vs new; exact and mb
+  # quick server check (not a gate: 2 seeds x 3,072 tokens; the gate is ABBA >= 6 seeds x 5,120): bench prompt (3K chat),
+  # shipped vs new, exact and mb, depth 4, each with the offline metric on the same sequences
   done_or server && return
   local arms="ship:$DF"; [ -e $O/dspark-new-Q8_0-fold.gguf ] && arms="$arms new:$O/dspark-new-Q8_0-fold.gguf"
   for a in $arms; do
@@ -101,8 +106,13 @@ ph_server() {
     for mode in exact mb; do
       local x=""; [ $mode = exact ] && x=--exact
       $PY $T/spec_check.py --bin $R/bin --model $M --drafter $f --out $O/srv_${n}_$mode $x --seeds 1,2 --npred 3072 --wiki $D/wiki.test.raw \
-          --port $((PORT + 1)) > $O/srv_${n}_$mode.log 2>&1
+          --port $((PORT + 1)) --extra="$KVF" > $O/srv_${n}_$mode.log 2>&1
       log "server $n $mode $(tail -1 $O/srv_${n}_$mode.log | cut -c1-400)"
+      # calibration: the offline metric on exactly the sequences this server run produced (f32 features)
+      $DUMP --ds-in $O/srv_${n}_$mode/calib.seq --ds-out $O/srv_${n}_$mode/d --ds-dtype f32 > $O/srv_${n}_$mode/dump.log 2>&1
+      local ev="--shipped-fold"; [ $n = new ] && ev="--init $R/run/best.pt"
+      $PY $T/train.py $TRAINARGS --out $O/cal_${n}_$mode --eval-only $ev --rep $O/srv_${n}_$mode/d:$O/srv_${n}_$mode/calib.seq > $O/cal_${n}_$mode.log 2>&1
+      log "calib $n $mode server mean_len $($PY -c "import json; print(json.load(open('$O/srv_${n}_$mode/result.json'))['mean_len'])") offline $(tail -1 $O/cal_${n}_$mode.log | $PY -c "import json,sys; d=json.loads(sys.stdin.read()); print('tok_round_sim', d['tok_round_sim'], 'mb', d['tok_round_sim_mb'], 'E', d['E'][-1], 'E_mb', d['E_mb'][-1])")"
     done
   done
   # parity of the exported drafter against torch, on the first server sequence
