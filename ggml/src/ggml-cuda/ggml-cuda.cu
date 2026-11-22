@@ -11507,6 +11507,10 @@ static int ggml_cuda_try_fuse_ink_normq(ggml_backend_cuda_context * ctx, ggml_cg
     if (!ctx) {
         return last - i;
     }
+    // borrowed scratch is preflighted for one activation per MUL_MAT (ggml_cuda_borrowed_plan): stay unfused there
+    if (ctx->scratch_borrowed && G*nr > 1) {
+        return 0;
+    }
     auto group = [&](const void * const * vy) {
         return nr == 1 ? ggml_cuda_mul_mat_vec_q_group_pre(*ctx, mms, n, vy) : ggml_cuda_mul_mat_vec_q_group_nc_pre(*ctx, mms, n, vy);
     };
