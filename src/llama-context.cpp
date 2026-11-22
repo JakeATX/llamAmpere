@@ -5322,9 +5322,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch &     ubatch
     auto pp_mark = [&](int i) {
         if (pp_phase) { const int64_t t = ggml_time_us(); pp_phase_us[i] += t - pp_t; pp_t = t; }
     };
+    // fork INKPF3: LLAMA_INKPF3_TIMING=1 logs host time of the SJ-KVaRN maintain step and of build+alloc (diagnostic)
+    static const bool ipt_on = [] { const char * e = getenv("LLAMA_INKPF3_TIMING"); return e && atoi(e) != 0; }();
+    const int64_t ipt0 = ipt_on ? ggml_time_us() : 0;
     if (b1_cur.active ? (b1_cur.ffn_phase <= 1 && !b1_seal_sj_kvarn(b1_cur.il0, b1_cur.il1)) : !maintain_sj_kvarn()) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    if (ipt_on) {
+        LLAMA_LOG_INFO("INKPF3 maintain_sj_kvarn: %.1f ms (n_tokens %u)\n", (ggml_time_us() - ipt0)/1000.0, ubatch.n_tokens);
     }
     pp_mark(0);
 
@@ -5496,6 +5502,9 @@ build_graph:
             }
         }
         const int64_t pp_inputs_t0 = b1_cur.active ? ggml_time_us() : 0;
+        if (ipt_on) {
+            LLAMA_LOG_INFO("INKPF3 pre-inputs (build/alloc incl.): %.1f ms (n_tokens %u)\n", (ggml_time_us() - ipt0)/1000.0, ubatch.n_tokens);
+        }
         res->set_inputs(&ubatch);
         if (b1_cur.active) {
             b1_pp_inputs_us += ggml_time_us() - pp_inputs_t0;
@@ -6007,6 +6016,19 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         }
     } else if (alone && n_tokens > 3072) {
         rows = n_tokens < 16384 ? std::min(2048u, n_tokens) : std::min(cparams.n_ubatch, n_tokens);
+        // fork INKPF3: an Inkling 2 server batch of 4096 (-b/-ub 4096) ran as 2048-row ubatches under the rule above
+        // (only batches of >= 16384 tokens reach n_ubatch). LLAMA_INK_PROMPT_ROWS=N lets an Inkling batch run at up to
+        // N rows (still capped by n_ubatch and the dynamic ceiling below); 0 or unset = the rule above.
+        static const uint32_t ink_rows = [] {
+            const char * text = getenv("LLAMA_INK_PROMPT_ROWS");
+            const long value = text && text[0] ? strtol(text, nullptr, 10) : 0;
+            return value > 0 && value <= 16384 ? (uint32_t) value : 0u;
+        }();
+        if (ink_rows && (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) &&
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !b1_cache_device_active) {
+            // only ever raises rows (never below the rule above); no expert-cache borrow on small cards
+            rows = std::max(rows, std::min({cparams.n_ubatch, ink_rows, std::max(GGML_PAD(n_tokens, 512u), sched_reserve_tokens)}));
+        }
     } else if (alone && dynamic_ubatch && rows == 512 && n_tokens > 512 && model.hparams.swa_type != LLAMA_SWA_TYPE_NONE &&
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !b1_cache_device_active && swa_full_rows_enabled(model.arch)) {
         // fork INKPREFILL: the SWA cache is sized n_swa + n_ubatch, so 512-row pieces of a server batch still attend

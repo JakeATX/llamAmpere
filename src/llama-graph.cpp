@@ -2103,7 +2103,26 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+// fork INKPF3: LLAMA_INKPF3_TIMING=1 logs the host time of every graph input setter over 2 ms (diagnostic only)
+static bool inkpf3_timing_on() {
+    static const bool on = [] { const char * e = getenv("LLAMA_INKPF3_TIMING"); return e && atoi(e) != 0; }();
+    return on;
+}
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    if (inkpf3_timing_on()) {
+        const int64_t t0 = ggml_time_us();
+        for (auto & input : inputs) {
+            const int64_t t = ggml_time_us();
+            input->set_input(ubatch);
+            const int64_t dt = ggml_time_us() - t;
+            if (dt > 2000) {
+                LLAMA_LOG_INFO("INKPF3 set_input %s: %.1f ms (n_tokens %u)\n", typeid(*input).name(), dt/1000.0, ubatch->n_tokens);
+            }
+        }
+        LLAMA_LOG_INFO("INKPF3 set_inputs total: %.1f ms (n_tokens %u)\n", (ggml_time_us() - t0)/1000.0, ubatch->n_tokens);
+        return;
+    }
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }
