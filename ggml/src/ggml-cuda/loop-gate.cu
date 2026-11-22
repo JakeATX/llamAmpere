@@ -145,8 +145,17 @@ bool ggml_cuda_loop_gate_supported(const ggml_tensor * op) {
         op->src[0]->ne[1] <= LOOP_GATE_MAX_T && op->src[2]->ne[1] <= LOOP_GATE_MAX_R;
 }
 
-int ggml_cuda_lg_tune_rb();   // inkglue.cu (GGML_CUDA_LG_RB, GGML_CUDA_LG_ROWS)
-int ggml_cuda_lg_tune_rows();
+// LGTUNE for the single loop gate (k_loop_gate_down/apply): its own shape knobs, GGML_CUDA_LG1_RB (1/2/4, default 1) and
+// GGML_CUDA_LG1_ROWS (2/4/8, default 2). nsys rc5 (3090, AI4 fold): RB=4 ROWS=4, the best shape for the multi-gate
+// k_ink_lg_*, made this one slower (apply 5.6 -> 7.9 us, down 3.9 -> 4.3 us). Launch shape only, bit-identical.
+static int loop_gate_tune_rb() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_LG1_RB"); const int k = e && *e ? atoi(e) : 1; return k == 2 || k == 4 ? k : 1; }();
+    return v;
+}
+static int loop_gate_tune_rows() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_LG1_ROWS"); const int k = e && *e ? atoi(e) : 2; return k == 4 || k == 8 ? k : 2; }();
+    return v;
+}
 
 template <typename TW, int RB, int ROWS>
 static void loop_gate_launch_t(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -170,7 +179,7 @@ static void loop_gate_launch_t(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
 template <typename TW, int RB>
 static void loop_gate_launch_r(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    switch (ggml_cuda_lg_tune_rows()) {
+    switch (loop_gate_tune_rows()) {
         case 4:  loop_gate_launch_t<TW, RB, 4>(ctx, dst); break;
         case 8:  loop_gate_launch_t<TW, RB, 8>(ctx, dst); break;
         default: loop_gate_launch_t<TW, RB, 2>(ctx, dst); break;
@@ -179,7 +188,7 @@ static void loop_gate_launch_r(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
 template <typename TW>
 static void loop_gate_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    switch (ggml_cuda_lg_tune_rb()) {
+    switch (loop_gate_tune_rb()) {
         case 2:  loop_gate_launch_r<TW, 2>(ctx, dst); break;
         case 4:  loop_gate_launch_r<TW, 4>(ctx, dst); break;
         default: loop_gate_launch_r<TW, 1>(ctx, dst); break;
