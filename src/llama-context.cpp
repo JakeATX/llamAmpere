@@ -5790,8 +5790,9 @@ build_graph:
     vg_slot = -1;
     const bool use_vgraph = vgraph_env && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.arch != LLM_ARCH_DFLASH &&
         (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER);   // target decode passes DEFAULT
-    // LLAMA_DSPINE_PIPE>0 (opt-in): a DFlash drafter keeps its feature-inject graph (slot 0) apart from the draft graph (slot 1)
-    const bool dflash_split_slots = llama_dspine_pipe_mode() > 0 && model.arch == LLM_ARCH_DFLASH;
+    // LLAMA_DSPINE_PIPE>0 (opt-in): a DSpine/DFlash2 drafter keeps its feature-inject graph (slot 0) apart from the draft graph (slot 1)
+    const bool is_dflash2_model   = model.arch == LLM_ARCH_DFLASH && (model.dflash_selector_hidden != nullptr || model.dspine_codebook != nullptr);
+    const bool dflash_split_slots = llama_dspine_pipe_mode() > 0 && is_dflash2_model;
     const int  want_slot          = dflash_split_slots ? ((ubatch.embd || ubatch.embd_row) ? 0 : 1) : (n_outputs > 0 ? 1 : 0);
     const bool use_plan_slots = (plan_slots_env &&
         (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (dspark_plan_slots_env && model.arch == LLM_ARCH_DFLASH))) || use_vgraph;
@@ -5842,10 +5843,6 @@ build_graph:
             vgraph_log_vram("first reuse", vg_slot);
         }
     } else {
-        if (pipe_inject_pending) {
-            ggml_backend_sched_synchronize(sched.get());
-            pipe_inject_pending = false;
-        }
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -5934,11 +5931,6 @@ build_graph:
         if (ipt_on) {
             LLAMA_LOG_INFO("INKPF3 pre-inputs (build/alloc incl.): %.1f ms (n_tokens %u)\n", (ggml_time_us() - ipt0)/1000.0, ubatch.n_tokens);
         }
-        // Finish any in-flight async DSpine inject on this context before writing the next graph's input tensors.
-        if (pipe_inject_pending) {
-            ggml_backend_sched_synchronize(sched.get());
-            pipe_inject_pending = false;
-        }
         res->set_inputs(&ubatch);
         if (b1_cur.active) {
             b1_pp_inputs_us += ggml_time_us() - pp_inputs_t0;
@@ -6001,6 +5993,9 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+    if (pipe_inject_pending) {
+        synchronize();
     }
 
     const auto & hparams = model.hparams;
@@ -7273,6 +7268,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!prompt_warm_join()) {
         return -2;
     }
+    // Wait for any in-flight async DSpine inject before memory updates, phase switches, or graph prep.
+    if (pipe_inject_pending) {
+        synchronize();
+    }
     // one-shot tag: read on entry, clear on every return, including the encode fallback and errors
     const enum llama_decode_phase tagged =
             (next_decode_phase == LLAMA_DECODE_PHASE_PROMPT || next_decode_phase == LLAMA_DECODE_PHASE_GENERATION)
@@ -7689,8 +7688,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (inject_src) {
         inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
         if (inject_backend) {
+            // Only use device-side stream wait on a single CUDA GPU matching layer_inp_dev (safe for 2-card -sm splits).
+            bool single_matching_cuda_gpu = false;
             if (llama_dspine_pipe_mode() > 0 && !compute_is_shared() &&
                     std::strncmp(ggml_backend_name(inject_backend), "CUDA", 4) == 0) {
+                int n_gpu = 0;
+                ggml_backend_dev_t only_gpu = nullptr;
+                for (const auto & b : backends) {
+                    ggml_backend_dev_t d = ggml_backend_get_device(b.get());
+                    if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        n_gpu++;
+                        only_gpu = d;
+                    }
+                }
+                single_matching_cuda_gpu = (n_gpu == 1 && only_gpu == inject_src->layer_inp_dev_dev);
+            }
+            if (single_matching_cuda_gpu) {
                 ggml_backend_event_wait(inject_backend, inject_src->ev_layer_inp_written.get());
                 async_dev_inject = true;
             } else {
@@ -8466,7 +8479,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
 
 bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
     bool extracted = false;
-    if (layer_inp_dev_call) {
+    if (llama_dspine_pipe_mode() == 0 ? cparams.embeddings_layer_inp_dev : layer_inp_dev_call) {
         return extracted;
     }
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
@@ -10109,7 +10122,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
-        /*.layer_inp_dev =*/ layer_inp_dev_call ? layer_inp_dev : nullptr,
+        /*.layer_inp_dev =*/ (llama_dspine_pipe_mode() == 0 || layer_inp_dev_call) ? layer_inp_dev : nullptr,
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,

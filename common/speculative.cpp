@@ -1356,8 +1356,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             use_dev_inject = llama_supports_embd_row(ctx_dft);
             if (use_dev_inject) {
                 batch_inject_dev = common_batch(ctx_dft);
-                LOG_INF("%s: device-side target feature injection enabled (LLAMA_DSPARK_DEV_INJECT=0 to disable, %d rows)\n",
-                        __func__, llama_layer_inp_dev_rows(ctx_tgt));
+                LOG_INF("%s: device-side target feature injection enabled (LLAMA_DSPARK_DEV_INJECT=0 to disable)\n", __func__);
             } else {
                 llama_set_embeddings_layer_inp_dev(ctx_tgt, false);
             }
