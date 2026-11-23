@@ -20,6 +20,28 @@ uint32_t llama_kv_cache_iswa::inkkv_mix_max() {
     return v;
 }
 
+// INKKV 0.7.4 (LLAMA_INKKV_DECODE_SOLO, default 1): a sequence deeper than LLAMA_INKKV_SOLO_MIN gets ubatches of its own,
+// decode included. A ubatch of several sequences cannot take the far/near split (inkkv_split_want) and falls back to the dense
+// per-head bias path over the whole n_kv: 2 users x 100K decoded 51 tok/s total vs 79 with one sequence per ubatch
+// (Taichi 3090 Ti, NQ + DSpark d4, 4/4). 0 = the INKKV v2 rule below (decode-sized sequences share a ubatch).
+static bool llama_inkkv_decode_solo() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_INKKV_DECODE_SOLO");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    return on;
+}
+
+// depth (a sequence's last position) from which its decode tokens get ubatches of their own: below it the dense bias is
+// cheap and one shared ubatch (one weight read) wins (4 users x 16K: 143 tok/s shared vs 101 solo; 2 users x 100K: 51 vs 79)
+static llama_pos llama_inkkv_solo_min() {
+    static const llama_pos v = [] {
+        const char * e = getenv("LLAMA_INKKV_SOLO_MIN");
+        return e && *e ? (llama_pos) std::max(0, atoi(e)) : (llama_pos) 32768;
+    }();
+    return v;
+}
+
 // INKKV v2 (several sequences): a sequence with more than inkkv_mix_max() tokens in this batch (a prompt) gets
 // ubatches of its own, which take the far/near split; only decode-sized sequences share a ubatch (the dense per-head
 // bias path, whose mask grows with n_kv x ubatch). nullptr when the split is off. seq_n: per-seq token counts, owned
@@ -42,6 +64,14 @@ llama_batch_allocr::seq_compat_fn llama_kv_cache_iswa::inkkv_mix_compat(const ll
         }
     }
     const uint32_t mx = inkkv_mix_max();
+    if (llama_inkkv_decode_solo()) {
+        const llama_pos dmin = llama_inkkv_solo_min();
+        const llama_kv_cache * base = kv_base.get();
+        return [&seq_n, mx, dmin, base](llama_seq_id a, llama_seq_id b) {
+            auto n = [&](llama_seq_id s) { return s >= 0 && (size_t) s < seq_n.size() ? seq_n[s] : 0u; };
+            return a == b || (n(a) <= mx && n(b) <= mx && base->seq_pos_max(a) < dmin && base->seq_pos_max(b) < dmin);
+        };
+    }
     return [&seq_n, mx](llama_seq_id a, llama_seq_id b) {
         auto n = [&](llama_seq_id s) { return s >= 0 && (size_t) s < seq_n.size() ? seq_n[s] : 0u; };
         return n(a) <= mx && n(b) <= mx;
