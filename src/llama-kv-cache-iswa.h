@@ -12,6 +12,9 @@
 // utilizes two instances of llama_kv_cache
 //   the first instance is for the non-SWA layers of the model and the second instance is for the SWA layers
 
+// INKKV multi-sequence far/near split switch (LLAMA_INKKV_MULTI_SPLIT, defined in llama-graph.cpp)
+bool llama_inkkv_multi_split_on();
+
 class llama_kv_cache_iswa : public llama_memory_i {
 public:
     llama_kv_cache_iswa(

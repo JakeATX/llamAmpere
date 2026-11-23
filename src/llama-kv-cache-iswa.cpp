@@ -24,10 +24,15 @@ uint32_t llama_kv_cache_iswa::inkkv_mix_max() {
 // decode included. A ubatch of several sequences cannot take the far/near split (inkkv_split_want) and falls back to the dense
 // per-head bias path over the whole n_kv: 2 users x 100K decoded 51 tok/s total vs 79 with one sequence per ubatch
 // (Taichi 3090 Ti, NQ + DSpark d4, 4/4). 0 = the INKKV v2 rule below (decode-sized sequences share a ubatch).
+// With the multi-sequence split (LLAMA_INKKV_MULTI_SPLIT, default on) several deep sequences take the split together,
+// so the default is then off (shared decode ubatches); LLAMA_INKKV_DECODE_SOLO=1 forces it on.
 static bool llama_inkkv_decode_solo() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_INKKV_DECODE_SOLO");
-        return !(e && *e && atoi(e) == 0);
+        if (!(e && *e)) {
+            return !llama_inkkv_multi_split_on();
+        }
+        return atoi(e) != 0;
     }();
     return on;
 }

@@ -35,6 +35,7 @@
 #include <array>
 #include <cstring>
 #include <numeric>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -143,30 +144,56 @@ static bool llama_inkkv_far_end_on() {
     return on;
 }
 
+// INKKV multi-sequence far/near split (LLAMA_INKKV_MULTI_SPLIT, default 1): a ubatch of several sequences (one SJ-KVaRN
+// stream each) takes the split when every sequence meets the one-sequence conditions; the far node runs once per stream
+// (build_attn_mha), the near window copy and its per-head mask carry the stream dim. 0 = several sequences take the
+// dense rel-bias path (the 0.7.3 behaviour). The reserve graph of a several-sequence ubatch stays the dense one.
+bool llama_inkkv_multi_split_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_INKKV_MULTI_SPLIT");
+        return !(e && *e && atoi(e) == 0);
+    }();
+    return on;
+}
+
 static bool inkkv_split_want(const llama_kv_cache_iswa_context * attn_ctx, const llama_ubatch & ubatch, const llama_cparams & cparams,
         uint32_t extent, uint32_t extent_swa, int32_t il_full, bool reserve) {
     if (il_full < 0 || !attn_ctx->get_base()->is_sj_kvarn() || !attn_ctx->get_swa()->has_layer(il_full) ||
-            extent == 0 || extent != extent_swa || ubatch.n_seqs_unq > 1 || ubatch.n_tokens == 0 ||
+            extent == 0 || extent != extent_swa || ubatch.n_tokens == 0 ||
             !cparams.causal_attn || cparams.training || !cparams.offload_kqv) {
+        return false;
+    }
+    if (ubatch.n_seqs_unq > 1 && (reserve || !llama_inkkv_multi_split_on() || cparams.kv_unified || ubatch.n_tokens % ubatch.n_seqs_unq != 0)) {
         return false;
     }
     if (reserve) {
         return attn_ctx->get_base()->get_n_kv() > extent;
     }
-    if (!ubatch.pos || !ubatch.seq_id) {
+    if (!ubatch.pos || !ubatch.seq_id || !ubatch.n_seq_id || !ubatch.seq_id_unq) {
         return false;
     }
-    llama_pos p_min = ubatch.pos[0];
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        p_min = std::min(p_min, ubatch.pos[i]);
+    // per sequence: every row has far cells, and the base and the SWA copy cover the near window of its lowest row
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq = ubatch.seq_id_unq[s];
+        llama_pos p_min = std::numeric_limits<llama_pos>::max();
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1) {
+                return false; // a token shared by several sequences: no single stream row
+            }
+            if (ubatch.seq_id[i][0] == seq) {
+                p_min = std::min(p_min, ubatch.pos[i]);
+            }
+        }
+        if (p_min == std::numeric_limits<llama_pos>::max() || p_min < (llama_pos) extent) {
+            return false;
+        }
+        const llama_pos base_min = attn_ctx->get_base()->get_seq_pos_min(seq);
+        const llama_pos swa_min  = attn_ctx->get_swa()->get_seq_pos_min(seq);
+        if (!(base_min >= 0 && base_min <= p_min - (llama_pos) extent && swa_min >= 0 && swa_min <= p_min - (llama_pos) extent + 1)) {
+            return false;
+        }
     }
-    if (p_min < (llama_pos) extent) {
-        return false;
-    }
-    const llama_seq_id seq = ubatch.seq_id[0][0];
-    const llama_pos base_min = attn_ctx->get_base()->get_seq_pos_min(seq);
-    const llama_pos swa_min  = attn_ctx->get_swa()->get_seq_pos_min(seq);
-    return base_min >= 0 && base_min <= p_min - (llama_pos) extent && swa_min >= 0 && swa_min <= p_min - (llama_pos) extent + 1;
+    return true;
 }
 
 static bool can_reuse_kq_mask(
@@ -1907,9 +1934,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         if (self_sj_far_desc && self_sj_far_desc->buffer) {
             // the far node's desc: the ring strips past the far visible end are fully masked and skipped
             attn_ctx->get_base()->set_input_sj_kvarn_desc(self_sj_far_desc, ubatch, 0);
-            if (self_sj_far_desc->ne[1] == 1 && llama_inkkv_far_end_on()) {
+            if (llama_inkkv_far_end_on()) {
+                // several streams (multi-sequence split): the end over all rows bounds every stream's rows (exact)
                 GGML_ASSERT(far_end < (int64_t(1) << (31 - GGML_INKSJ_FAR_END_SHIFT)));
-                ((int32_t *) self_sj_far_desc->data)[GGML_INKSJ_DESC_FLAGS] |= (int32_t) (std::max<int64_t>(far_end, 1) << GGML_INKSJ_FAR_END_SHIFT);
+                GGML_ASSERT(self_sj_far_desc->type == GGML_TYPE_I32 && self_sj_far_desc->nb[1] == self_sj_far_desc->ne[0]*sizeof(int32_t));
+                for (int64_t s = 0; s < self_sj_far_desc->ne[1]; ++s) {
+                    ((int32_t *) self_sj_far_desc->data)[s*self_sj_far_desc->ne[0] + GGML_INKSJ_DESC_FLAGS] |=
+                        (int32_t) (std::max<int64_t>(far_end, 1) << GGML_INKSJ_FAR_END_SHIFT);
+                }
             }
         }
     }
@@ -1986,8 +2018,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
         res &= split == (self_sj_far_mask != nullptr);
         if (self_sj_far_mask) {
             const int64_t n_kv_far = attn_ctx->get_base()->get_n_kv();
-            const bool    packed   = llama_inkkv_far_packed(params.ubatch.n_tokens, params.cparams);
-            res &= (self_sj_far_mask->type == GGML_TYPE_I32) == packed && self_sj_far_mask->ne[1] == params.ubatch.n_tokens &&
+            const int64_t ns_far   = std::max<int64_t>(1, params.ubatch.n_seqs_unq);
+            const bool    packed   = llama_inkkv_far_packed(params.ubatch.n_tokens/ns_far, params.cparams);
+            res &= (self_sj_far_mask->type == GGML_TYPE_I32) == packed && self_sj_far_mask->ne[3] == ns_far &&
+                self_sj_far_mask->ne[1]*ns_far == params.ubatch.n_tokens &&
                 self_sj_far_mask->ne[0] == (packed ? (n_kv_far + 31)/32 : n_kv_far) &&
                 (!packed || self_sj_far_mask->op_params[0] == (int32_t) n_kv_far);
         }
@@ -4406,6 +4440,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             const int group = sj_kvarn_pending.body->op_params[7] == GGML_TYPE_TURBO4_0 ? 128 : 256;
             const bool fused_rot = sj_kvarn_pending.fused_rot;
             ggml_tensor * wush_ao = sj_kvarn_pending.wush_ao; // EXPERIMENTAL WUSH-KV layer (fused_rot is off then)
+            const bool inksj = sj_kvarn_pending.inksj;
+            // the INKKV multi-sequence far node: one LSE leaf per stream node, joined [H, T/ns, ns] below (the in-order
+            // schedule runs every node before the merge that reads them, as the one-stream LSE)
+            const bool want_lse = lsa_lse_req;
+            lsa_lse_req = false;
+            ggml_tensor * lse_all = nullptr;
             ggml_tensor * out = nullptr;
             for (int64_t s = 0; s < ns; ++s) {
                 const int32_t n_kv_s = (int32_t) (*sj_kvarn_pending.n_kv_streams)[s];
@@ -4440,9 +4480,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                 if (fused_rot) {
                     ggml_flash_attn_ext_set_sj_kvarn_rot(c, 256);
                 }
+                if (inksj) {
+                    ggml_flash_attn_ext_set_inksj(c); // as the one-stream node (pair-packed Inkling heads)
+                }
+                if (want_lse) {
+                    ggml_tensor * lse_s = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, q_s->ne[2], q_s->ne[1], 1);
+                    ggml_format_name(lse_s, "lsa_lse-%d-s%d", il, (int) s);
+                    ggml_flash_attn_ext_set_lse(c, lse_s);
+                    lse_all = lse_all ? ggml_concat(ctx0, lse_all, lse_s, 2) : lse_s;
+                }
+                ggml_build_forward_expand(gf, c);
                 out = out ? ggml_concat(ctx0, out, c, 3) : c;
             }
             sj_kvarn_pending = {};
+            if (want_lse) {
+                lsa_lse = lse_all;
+            }
             cur = out;
             if (wush_ao) {
                 if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
@@ -9192,11 +9245,13 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
         }
         if (inkkv_split_want(attn_ctx, ubatch, cparams, extent, extent_swa, inp->sj_il_full, is_reserve)) {
             const int64_t n_kv_far = attn_ctx->get_base()->get_n_kv();
-            if (llama_inkkv_far_packed(ubatch.n_tokens, cparams)) {
-                inp->self_sj_far_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, (n_kv_far + 31)/32, ubatch.n_tokens, 1, 1);
+            // one stream per sequence (several only with LLAMA_INKKV_MULTI_SPLIT): rows i = s*T/ns + t, as the KQ mask
+            const int64_t ns_far = std::max<int64_t>(1, ubatch.n_seqs_unq);
+            if (llama_inkkv_far_packed(ubatch.n_tokens/ns_far, cparams)) { // per-stream rows: the one-stream rule
+                inp->self_sj_far_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, (n_kv_far + 31)/32, ubatch.n_tokens/ns_far, 1, ns_far);
                 inp->self_sj_far_mask->op_params[0] = (int32_t) n_kv_far;
             } else {
-                inp->self_sj_far_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv_far, ubatch.n_tokens, 1, 1);
+                inp->self_sj_far_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv_far, ubatch.n_tokens/ns_far, 1, ns_far);
             }
             ggml_set_input(inp->self_sj_far_mask);
             ggml_set_name(inp->self_sj_far_mask, "attn_inp_sj_far_mask");
@@ -9207,7 +9262,7 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
             if (!warned) {
                 warned = true;
                 LLAMA_LOG_WARN("%s: INKKV: dense SJ-KVaRN rel-bias path at n_kv = %u (no far/near split: a gap in the SWA "
-                        "window copy or several sequences); its per-head bias is [n_kv, T, n_head] and may need far more memory\n",
+                        "window copy, or several sequences with LLAMA_INKKV_MULTI_SPLIT=0 or one not deep enough); its per-head bias is [n_kv, T, n_head] and may need far more memory\n",
                         __func__, attn_ctx->get_base()->get_n_kv());
             }
         }
@@ -9682,7 +9737,7 @@ ggml_tensor * llm_graph_context::build_attn_rel_chunked(
     const int64_t Ts   = n_tokens/ns;
     const int64_t n_kv = mask->ne[0];
     GGML_ASSERT(rel_pos->ne[0] == n_kv && rel_pos->ne[1] == n_tokens && table->ne[2] == n_tokens && Ts*ns == n_tokens);
-    GGML_ASSERT(!split || ns == 1);
+    GGML_ASSERT(!split || inp->self_sj_far_mask->ne[3] == ns);
     const int64_t E = table->ne[1] - 1;
 
     // rows [t0, t0 + n) of every stream, stream-major: [.., n*ns] (contiguous)
@@ -9738,10 +9793,13 @@ ggml_tensor * llm_graph_context::build_attn_rel_chunked(
             GGML_ASSERT(l_n != nullptr);
             l_n = ggml_reshape_2d(ctx0, l_n, n_head, Tc);
             ggml_tensor * fm = shared_rows(inp->self_sj_far_mask, t0, n, [&](ggml_tensor * t) {
-                return ggml_view_4d(ctx0, t, t->ne[0], n, 1, 1, t->nb[1], t->nb[2], t->nb[3], t0*t->nb[1]); });
+                ggml_tensor * r = ggml_view_4d(ctx0, t, t->ne[0], n, 1, ns, t->nb[1], t->nb[2], t->nb[3], t0*t->nb[1]);
+                return ns > 1 ? ggml_cont(ctx0, r) : r; });
             ggml_tensor * l_f = nullptr;
             ggml_tensor * o_f = build_attn_rel_sj(inp, q, nullptr, nullptr, fm, nullptr, kq_scale, il, &l_f);
-            ggml_tensor * c_far = ggml_view_2d(ctx0, table, n_head, Tc, table->nb[2], E*table->nb[1] + t0*table->nb[2]);
+            // table[:, E, rows of the chunk] (every stream's rows when ns > 1)
+            ggml_tensor * tb_c = ns > 1 ? rows(table, t0, n) : table;
+            ggml_tensor * c_far = ggml_view_2d(ctx0, tb_c, n_head, Tc, tb_c->nb[2], E*tb_c->nb[1] + (ns > 1 ? 0 : t0*table->nb[2]));
             l_f = ggml_add(ctx0, l_f, c_far);
             cur = inkrel_merge(ctx0, o_f, l_f, o_n, l_n, n_head, Tc);
         } else if (sj) {
@@ -9895,7 +9953,10 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
             //   merge: softmax over (far, near, zero sink) log-sum-exps (inkrel_merge)
             const auto * mswa = inp_attn->mctx->get_swa();
             ggml_tensor * mask_swa = inp_attn->self_attn_mask_swa.raw;
-            GGML_ASSERT(inp_attn->self_attn_mask_swa.rows == nullptr && mask_swa->type != GGML_TYPE_I32 && mask_swa->ne[3] == 1);
+            // several sequences (LLAMA_INKKV_MULTI_SPLIT): one SWA / base stream each, rows stream-major
+            const int64_t ns = mask_swa->ne[3];
+            GGML_ASSERT(inp_attn->self_attn_mask_swa.rows == nullptr && mask_swa->type != GGML_TYPE_I32 &&
+                    ns == inp->self_sj_far_mask->ne[3] && mask_swa->ne[1]*ns == n_tokens);
             const int64_t E = table->ne[1] - 1;
             GGML_ASSERT(E == (int64_t) inp->extent && E == (int64_t) inp->extent_swa && mswa->has_layer(il));
             ggml_build_forward_expand(gf, q_cur);
@@ -9907,8 +9968,8 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
             const int64_t n_kv_n = mask_swa->ne[0];
             const int64_t T      = n_tokens;
             ggml_tensor * mn = ggml_get_rows(ctx0, table, inp->self_rel_pos_swa);                   // [n_head, n_kv_n*T]
-            mn = ggml_reshape_4d(ctx0, mn, n_head, n_kv_n, T, 1);
-            mn = ggml_cont(ctx0, ggml_permute(ctx0, mn, 2, 0, 1, 3));                                // [n_kv_n, T, n_head]
+            mn = ggml_reshape_4d(ctx0, mn, n_head, n_kv_n, T/ns, ns);
+            mn = ggml_cont(ctx0, ggml_permute(ctx0, mn, 2, 0, 1, 3));                                // [n_kv_n, T/ns, n_head, ns]
             ggml_tensor * ms = mask_swa->type == GGML_TYPE_F32 ? mask_swa : ggml_cast(ctx0, mask_swa, GGML_TYPE_F32);
             mn = ggml_cast(ctx0, ggml_add(ctx0, mn, ms), GGML_TYPE_F16);
             cb(mn, "inkkv_near_mask", il);

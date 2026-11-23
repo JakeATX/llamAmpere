@@ -5356,11 +5356,13 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
 // INKKV v2: far mask of the SJ-KVaRN base: cells hold one sequence at their positions with no holes, so the cells at
 // distance >= extent from row i are the prefix [0, cell_of(pos_i - extent + 1)) of the occupied cells
 int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    // F16 [n_kv, T] (0 / -inf) or packed I32 [(n_kv + 31)/32, T] with op_params[0] = n_kv (bit set = visible)
+    // F16 [n_kv, T] (0 / -inf) or packed I32 [(n_kv + 31)/32, T] with op_params[0] = n_kv (bit set = visible).
+    // Several streams (INKKV multi-sequence split): [.., T/ns, 1, ns], the same row order (row i = token i, the tokens
+    // of a stream contiguous, as the KQ mask), so the rows below are filled unchanged
     const bool packed = dst->type == GGML_TYPE_I32;
-    GGML_ASSERT((packed || dst->type == GGML_TYPE_F16) && dst->ne[2] == 1 && dst->ne[3] == 1 && sj_kvarn.enabled());
+    GGML_ASSERT((packed || dst->type == GGML_TYPE_F16) && dst->ne[2] == 1 && sj_kvarn.enabled());
     const int64_t n_kv = packed ? dst->op_params[0] : dst->ne[0];
-    const int64_t T    = dst->ne[1];
+    const int64_t T    = dst->ne[1]*dst->ne[3];
     GGML_ASSERT(T >= (int64_t) ubatch->n_tokens);
     GGML_ASSERT(!packed || (n_kv > 0 && (n_kv + 31)/32 == dst->ne[0]));
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
