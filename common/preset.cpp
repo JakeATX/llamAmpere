@@ -115,9 +115,12 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         tiny.fit_margin_mib = 500;
         // fork (INKSMALL2): Inkling 2 Mini small-card profiles (8/10/12 GB). Experts in host RAM with the VRAM expert
         // cache auto-sized (llama-context: free - reserve; --moe-cache-mib N overrides), SJ-KVaRN 4/4, op offload off,
-        // ub ceiling 512 with the deep-ctx ladder (a larger ub buys compute buffer out of the expert cache: 9,216 MiB cap,
-        // ub 512 70.9 tok/s vs 1024 56.1 vs 2048 31.2), moe cache batch 512 (llama-context default without op offload).
-        // ctx 131,072 = the 100K design depth. All three carry the DSpark drafter, but arg.cpp drops it by default
+        // ub 512 with the deep-ctx ladder, moe cache batch 512 (llama-context default without op offload). The ub 512 pick
+        // came from rows measured with the prompt experts on the CPU (--op-offload 0: prefill 41-190 tok/s, GPU idle);
+        // it does not hold once prefill streams the experts to the GPU, and the ub is set again when that lands.
+        // ctx: Jake's ctx floor: 8 GB >= 200K, 10/12 GB >= 250K; the expert cache is sized from what is left after
+        // KV + compute at this ctx (speed varies, ctx does not). 8ink 212,992, 10ink/12ink 262,144 (headless the same).
+        // All three carry the DSpark drafter, but arg.cpp drops it by default
         // (--card-drafter auto = off; on forces it): the drafter's ~1.4 GB of VRAM (weights + KV + compute) comes out of
         // the expert cache, and at 100K depth the lost cache hits cost more than drafting gains on every small card.
         // 100K (S34d, 4/4, b7, RTX 3090 capped): 10 GB 35.5 drafter vs 50.0 tok/s without (-29%); 12 GB 66.7 vs 75.7 tok/s (-12%, A D D A,
@@ -126,7 +129,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // Evidence: lanes/INKSMALL.md + INKSMALL2.md (S34d, RTX 3090 capped at 7,168/9,216/11,264 MiB).
         common_card_preset ink8 {
             "8ink", "2026-11-23.2", "best known/recheck before ship", "", {
-                {"--ctx-size", "131072"}, {"--parallel", "1"}, {"--batch-size", "4096"},
+                {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cpu-moe", "1"}, {"--op-offload", "0"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
@@ -135,18 +138,26 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
             }, {
                 {"LLAMA_DEEPCTX_LADDER", "1"},
                 // fork (INKSMALL2): fit headroom kept for the expert cache (sized after the fit). The auto-size reserve
-                // (900 + 256 + 2 KiB/cell) sits ~572 MiB above the fit's measured compute at ctx 131,072, so 1,152 keeps a
-                // >= ~580 MiB cache; with less free VRAM (a busy desktop) the fit lowers ctx first. Override by env.
+                // (900 + 256 + 2 KiB/cell) sits ~572 MiB above the fit's measured compute (measured at ctx 131,072), so
+                // 1,152 keeps a >= ~580 MiB cache; with less free VRAM (a busy desktop) the fit lowers ctx first. Override by env.
                 {"LLAMA_FIT_PRESET_MIN_FREE_MIB", "1152"},
                 // fork (INKKV 0.7.4): the 1-sequence INKKV bias-chunk default is 1024 MiB (32K prefill +2.8%); the small
                 // cards keep 512 so their fits (sized with 512) do not move
                 {"LLAMA_INKKV_BIAS_MIB", "512"}
             }
         };
+        // ink10/ink12 copy ink8, then take their own ctx (Jake's floor: 10/12 GB >= 250K)
+        auto set_ctx = [](common_card_preset & p, const char * ctx) {
+            for (auto & [opt, val] : p.options) {
+                if (opt == "--ctx-size") { val = ctx; }
+            }
+        };
         auto ink10 = ink8;
         ink10.name = "10ink";
+        set_ctx(ink10, "262144");
         auto ink12 = ink8;
         ink12.name = "12ink";
+        set_ctx(ink12, "262144");
         // fork (INKSTACK): Inkling 2 Mini on a 24 GB card, one slot, the whole model on the GPU, DSpark drafter on.
         // -b 2048 -ub 1024 (ladder on): at -c 262144 the NQ file runs out of VRAM at ub 2048 (rc8b boot check, RELREADY),
         // and --parallel 1 keeps the server from picking 4 slots + a unified KV (500 on the first 262K request).
