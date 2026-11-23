@@ -3449,6 +3449,23 @@ static inline uint32_t nk_pad_up(uint32_t x, uint32_t n) {
     return (uint32_t) ((((uint64_t) x + n - 1u) / n) * n);
 }
 
+uint32_t llama_kv_cache::reserve_cells(uint32_t n_new) const {
+    const uint32_t size = get_size();
+    if (swa_type != LLAMA_SWA_TYPE_NONE) {
+        return size;
+    }
+    // as get_n_kv(); with NEONKERN LLAMA_NK_KV_PAD a decode graph may pad n_kv to the coarser step, so the bound uses
+    // that step too (it can never be below what get_n_kv() returns for the same cells)
+    const uint32_t n_pad = std::max<uint32_t>(256u, llama_nk_kv_pad_step());
+    uint64_t result = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        // new cells go to the first free cells from the head, so none lands past max(used end, head) + n_new
+        const uint64_t end = (uint64_t) std::max(v_cells[s].used_max_p1(), v_heads[s]) + n_new;
+        result = std::max<uint64_t>(result, std::min<uint64_t>(size, std::max<uint64_t>(n_pad, ((end + n_pad - 1) / n_pad) * n_pad)));
+    }
+    return (uint32_t) result;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -7949,11 +7966,28 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 // llama_kv_cache_context
 //
 
+thread_local const llama_kv_cache * g_reserve_bound_kv = nullptr;
+thread_local uint32_t g_reserve_bound_cells = 0;
+
+llama_kv_reserve_bound::llama_kv_reserve_bound(const llama_kv_cache * kv, uint32_t cells) :
+        prev_kv(g_reserve_bound_kv), prev_cells(g_reserve_bound_cells) {
+    g_reserve_bound_kv = kv;
+    g_reserve_bound_cells = kv ? cells : 0;
+}
+
+llama_kv_reserve_bound::~llama_kv_reserve_bound() {
+    g_reserve_bound_kv = prev_kv;
+    g_reserve_bound_cells = prev_cells;
+}
+
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv, bool single_seq) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+    if (g_reserve_bound_kv == kv && g_reserve_bound_cells > 0) {
+        n_kv = std::min<int64_t>(n_kv, g_reserve_bound_cells);
+    }
 
     // worst case for graph reservation, only a unified cache splits into per-sequence lists
     // (never on the fork's KV paths: SJ-KVaRN, block KV streaming, TurboQuant/TQ K/V - see get_n_kv_rows)

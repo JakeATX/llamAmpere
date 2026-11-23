@@ -223,6 +223,10 @@ public:
     // Borrow unused cache bytes until the consumer is synchronized and releases them.
     std::vector<ggml_backend_buffer_ptr> scratch_borrow(ggml_backend_buffer_type_t buft, size_t chunk_bytes, size_t max_chunks, size_t min_free_bytes, uint32_t guard_tokens, void (*cancel)(void *), void * user);
     bool scratch_safe(uint32_t n_tokens) const;
+
+    // fork UBDEFAULT: cells a graph can address after n_new more tokens (padded like get_n_kv); the size for SWA
+    // caches (ring placement) and when the cache is full.
+    uint32_t reserve_cells(uint32_t n_new) const;
     void scratch_release();
     void scratch_cancel();
     void lsa_idx_invalidate(const char * why, int32_t strm = -1) const; // LSA index/mean caches of this cache's layers only
@@ -764,6 +768,15 @@ public:
     void state_write_sj_ckpt(llama_io_write_i & io, llama_seq_id seq_id) const;
     void state_read_sj_ckpt (llama_io_read_i  & io, llama_seq_id seq_id);
 private:
+};
+
+// fork UBDEFAULT: while one is alive on this thread, init_full() of `kv` sizes its graph over `cells` cells instead of
+// the whole cache (a prompt reserve sized against used cells; the caller re-reserves before the cache outgrows it).
+struct llama_kv_reserve_bound {
+    llama_kv_reserve_bound(const llama_kv_cache * kv, uint32_t cells);
+    ~llama_kv_reserve_bound();
+    const llama_kv_cache * prev_kv;
+    uint32_t prev_cells;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

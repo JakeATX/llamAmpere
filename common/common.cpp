@@ -1582,7 +1582,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         const std::string ub_arch = common_arch_of_model(params.model.path);
         bool ub_needs_ctx = false;
         int32_t ceiling = common_arch_ub_ceiling_24g(ub_arch, &ub_needs_ctx);
-        if (ub_needs_ctx && !(params.n_ctx > 0 && !params.card_preset_ctx_default)) {
+        // fork UBDEFAULT: with LLAMA_UB_KV_BOUND=1 (prompt reserves sized over used cells, llama-context) the wider rows
+        // fit at the fitted default ctx too, so the needs-ctx ceiling (inkling2 1024) then applies without -c as well.
+        // Opt-in only: the Inkling default-ctx speed gate has not run (KLD A file 4/4 c2048: ub 1024 0.007698 vs 512
+        // 0.007756, -0.7 SE). Without LLAMA_UB_KV_BOUND=1 the table rule above is unchanged.
+        const char * ub_kv_bound = getenv("LLAMA_UB_KV_BOUND");
+        const bool ub_ctx_waived = ub_kv_bound && ub_kv_bound[0] == '1';
+        if (ub_needs_ctx && !ub_ctx_waived && !(params.n_ctx > 0 && !params.card_preset_ctx_default)) {
             ceiling = params.n_ubatch;
         }
         // -b on a 24 GB card: the table's batch_24g (Inkling 2048: INKCOMP F262 -ub 1024 -b 2048), else the UBDEFAULT rule
