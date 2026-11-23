@@ -5,6 +5,7 @@
 #include "inkpreq.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
+#include "ai4-turbo.cuh"
 #include "ai4-exp-turbo.cuh"
 #include "magic2-v2.cuh"
 #include "aif25-mmq.cuh"
@@ -275,6 +276,13 @@ static void ai4_ampere_width(const uint8_t * W, const int8_t * q, const float * 
     }
 }
 
+// AI+ Turbo v3 gemm_s8_lowreg (ID=true: 128 regs, 2 CTAs/SM, bitwise = rc ai23 ID GEMM) for AIT4_U expert prefill,
+// n_tok >= GGML_CUDA_AI4_LOWREG_ID_MIN_N (64). Kill switch GGML_CUDA_AI4_LOWREG_ID=0. Needs 64-route tiles (forces bn 64).
+static bool ai4_lowreg_id(int n_tok) {
+    static const bool v = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID", nullptr, 1) != 0;
+    static const int mn = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID_MIN_N", nullptr, 64);
+    return v && n_tok >= mn;
+}
 static int ai4_bn128_min() {
     static const int v = ai4_env_int("GGML_CUDA_AI4_BN128_MIN", nullptr, 512);
     return v;
@@ -1660,6 +1668,12 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
     } else if (bn == 128) {
         ai23_launch_id_gemm<128, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     } else {
+        if constexpr (LAY == ai4k::LAY_AIT4_U) {
+            if (sms && ai4_lowreg_id(n_tok)) {
+                ai4_turbo::launch_gemm_s8_lowreg<LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles, sms);
+                return;
+            }
+        }
         ai23_launch_id_gemm<64, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     }
 }
@@ -1802,6 +1816,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ampere_grouped) {
         bn = ai4_ampere_bn(n_tok);
+    } else if (sms && src0->type == GGML_TYPE_AIT4_U && bn != ai4k::MMV_ID_BN && !direct && ai4_lowreg_id(n_tok)) {
+        bn = 64;   // gemm_s8_lowreg consumes 64-route tiles
     }
     static const bool tight_grid = ai4_env_int("GGML_CUDA_AI23_ID_TIGHT_GRID", nullptr, 0) != 0;
     const bool tight = tight_grid && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
