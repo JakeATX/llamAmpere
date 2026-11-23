@@ -142,7 +142,9 @@ TARGS() { echo "$TRAINARGS --train $D/strain:$D/short_train.seq --train2 $D/ltra
 
 ph_profile() {
   done_or profile && return
-  $PY $T/train.py $(TARGS) --out $R/prof --profile 4 --train2 $D/sel:$D/sel.seq --frac2 1.0 > $R/profile.log 2>&1 || { log "profile failed: $(tail -3 $R/profile.log | tr '\n' ' ')"; return 1; }
+  # only sel is dumped at this point: train on its real 100K/32K sequences (memory + speed check), then one sel eval
+  $PY $T/train.py $TRAINARGS --train $D/sel:$D/sel.seq --sel $D/sel:$D/sel.seq --lr $LR --loss $LOSS --kl $KL --seqs-per-step $SPS \
+      --anchors-per-seq $APS --chunk-long 32 --eval-stride $EVAL_STRIDE --out $R/prof --profile 4 > $R/profile.log 2>&1 || { log "profile failed: $(tail -3 $R/profile.log | tr '\n' ' ')"; return 1; }
   log "profile $(grep -E 'mem_gib|mean_step' $R/profile.log | tail -2 | tr '\n' ' ' | cut -c1-400)"
   touch $R/L.profile.done
 }

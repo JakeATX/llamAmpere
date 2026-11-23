@@ -269,6 +269,23 @@ def context_layers(W, feat, pos):
     return out, f_rnn
 
 
+def context_layers_sliced(W, feat, amax, dev, dtype=torch.float32, sl=8192):
+    """context_layers over positions 0..amax-1 without a graph, slice by slice into preallocated outputs (no torch.cat
+    copy); feat may live on the host (pinned) -- each slice is moved to dev on its own."""
+    out, f_rnn = None, None
+    for s0 in range(0, amax, sl):
+        s1 = min(s0 + sl, amax)
+        kv, fr_ = context_layers(W, feat[s0:s1].to(dev, non_blocking=True).to(dtype), torch.arange(s0, s1, device=dev))
+        if out is None:
+            out = [tuple(torch.empty((amax,) + t.shape[1:], dtype=t.dtype, device=dev) for t in pair) for pair in kv]
+            f_rnn = torch.empty((amax,) + fr_.shape[1:], dtype=fr_.dtype, device=dev)
+        for (K, V), (k, v) in zip(out, kv):
+            K[s0:s1] = k; V[s0:s1] = v
+        f_rnn[s0:s1] = fr_
+        del kv, fr_
+    return out, f_rnn
+
+
 def block_forward(W, frozen, ctx_kv, anchors, anchor_tok, k0, dtype):
     """Backbone over the blocks of anchors [nA] (positions a..a+7). ctx_kv: per layer (K, V) for context positions
     k0..k0+Lc-1. Returns cur [nA, BLOCK, N_EMBD] (after output_norm)."""
@@ -475,9 +492,8 @@ def seq_slots(W, frozen, S, anchors, walk, dtype=torch.float32, bf16_base=False,
     """Yield per anchor chunk: (anchor positions [n], list over slots s=1..walk of drafter logits [n, V_UNPAD], p [n, 20],
     pid [n, 20], data tokens [n, walk]). ctx = precomputed context_layers output (reuse across chunks)."""
     if ctx is None:
-        amax = int(anchors.max())
-        pos = torch.arange(amax, device=anchors.device)
-        ctx = context_layers(W, S['feat'][:amax].to(dtype), pos)
+        with torch.no_grad():
+            ctx = context_layers_sliced(W, S['feat'], int(anchors.max()), anchors.device, dtype)
     kv, f_rnn = ctx
     toks = S['toks']
     for i in range(0, anchors.shape[0], chunk):

@@ -81,6 +81,8 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
         idx = idx[:max_seq]
     for i in idx:
         S = ds.seq(i, fr.lm.device)
+        if S['len'] > LONG_LEN:
+            S['feat'] = S['feat'].cpu().pin_memory()   # ~100K-token features stay on host; context slices move on their own
         an = D.anchors_of(S, walk, stride)
         if an is None:
             continue
@@ -214,7 +216,7 @@ def main():
         batches = []
         cpu_seqs = fut.result(); fut = pool.submit(load_cpu, pick_step())   # next step's sequences load while this one trains
         for Sc in cpu_seqs:
-            S = {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in Sc.items()}
+            S = {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) and k != 'feat' else v) for k, v in Sc.items()}   # feat stays pinned on host; context slices move on their own
             an = D.anchors_of(S, a.walk)
             if an is None:
                 continue
@@ -231,11 +233,9 @@ def main():
             # the chunks, then recomputed slice by slice WITH a graph and backpropagated with the leaves' gradients (exact;
             # keeps ~100K-token sequences from holding the whole context graph at once)
             with torch.no_grad():
-                parts = [D.context_layers(Wl, S['feat'][s0:min(s0 + CTX_SLICE, amax)].float(), torch.arange(s0, min(s0 + CTX_SLICE, amax), device=dev))
-                         for s0 in range(0, amax, CTX_SLICE)]
-            ctx_l = [torch.cat([pp[0][j][h] for pp in parts]).requires_grad_(True) for j in range(D.N_LAYER) for h in (0, 1)] \
-                + [torch.cat([pp[1] for pp in parts]).requires_grad_(True)]
-            del parts
+                kv0, fr0 = D.context_layers_sliced(Wl, S['feat'], amax, dev, torch.float32, CTX_SLICE)
+            ctx_l = [x.requires_grad_(True) for pair in kv0 for x in pair] + [fr0.requires_grad_(True)]
+            del kv0, fr0
             ctx = ([(ctx_l[2 * j], ctx_l[2 * j + 1]) for j in range(D.N_LAYER)], ctx_l[-1])
             ch = a.chunk if S['len'] <= LONG_LEN else a.chunk_long
             for i in range(0, an.shape[0], ch):
@@ -256,7 +256,7 @@ def main():
                 n_tot += sub.shape[0]
             for s0 in range(0, amax, CTX_SLICE):
                 s1 = min(s0 + CTX_SLICE, amax)
-                kv, f_rnn = D.context_layers(Wl, S['feat'][s0:s1].float(), torch.arange(s0, s1, device=dev))
+                kv, f_rnn = D.context_layers(Wl, S['feat'][s0:s1].to(dev, non_blocking=True).float(), torch.arange(s0, s1, device=dev))
                 outs = [t for pair in kv for t in pair] + [f_rnn]
                 g = [(o, l.grad[s0:s1]) for o, l in zip(outs, ctx_l) if l.grad is not None]
                 torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
