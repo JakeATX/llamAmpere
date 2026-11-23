@@ -77,6 +77,7 @@ struct llama_cparams {
     bool kq_mask_packed = false; // fork: opt-in binary attention masks
     uint32_t kv_stream_arena_mib;
     size_t moe_cache_size;
+    bool   moe_cache_auto; // fork (INKSMALL2): moe_cache_size 0 was passed (not SIZE_MAX = off), the context may size the cache
     float  moe_cache_cpu_share;
 
     // expert keep policy (#215/#217): keep_default for layers past the table, -1 = keep every expert

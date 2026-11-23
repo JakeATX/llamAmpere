@@ -1142,11 +1142,24 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 (explicit_options.count(found->second.first) || found->second.first->has_value_from_env());
         };
         // fork (INKSMALL2): a card preset names its drafter "@model/<file>" (beside the model). Missing file: no drafter.
+        const bool spec_off = explicit_or_env("--spec-type") && params.speculative.types.size() == 1 &&
+            params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE;
         if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
-            const std::string file = (std::filesystem::path(params.model.path).parent_path() /
-                params.speculative.draft.mparams.path.substr(7)).string();
+            const std::string file = params.model.path.empty() ? std::string() :
+                (std::filesystem::path(params.model.path).parent_path() / params.speculative.draft.mparams.path.substr(7)).string();
             std::error_code ec;
-            if (std::filesystem::is_regular_file(file, ec)) {
+            if (spec_off) {
+                params.speculative.draft.mparams.path.clear(); // --spec-type none: no drafter, no drafter reserve
+                params.speculative.draft.mparams.hf_file.clear();
+            } else if (file.empty()) {
+                LOG_WRN("card preset %s: model given without a local path (-hf/-mu), drafter not resolved, speculative "
+                        "decoding off; pass --model-draft <file> to use it\n", params.card_preset.c_str());
+                params.speculative.draft.mparams.path.clear();
+                params.speculative.draft.mparams.hf_file.clear();
+                if (!explicit_or_env("--spec-type")) {
+                    params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+                }
+            } else if (std::filesystem::is_regular_file(file, ec)) {
                 params.speculative.draft.mparams.path    = file;
                 params.speculative.draft.mparams.hf_file = file;
                 LOG_INF("card preset %s: drafter %s\n", params.card_preset.c_str(), file.c_str());
@@ -1155,7 +1168,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                         "(download it with the release or pass --model-draft)\n", params.card_preset.c_str(), file.c_str());
                 params.speculative.draft.mparams.path.clear();
                 params.speculative.draft.mparams.hf_file.clear();
-                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+                if (!explicit_or_env("--spec-type")) {
+                    params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+                }
             }
         }
         const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
@@ -3653,12 +3668,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_SKIP_RANK_FLOOR"));
     add_opt(common_arg(
         {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: auto-size from free VRAM on one GPU, LLAMA_MOE_CACHE_AUTO=0 = off; 0 = off)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            params.moe_cache_size = value == 0 ? SIZE_MAX : (size_t) value*1024*1024; // fork (INKSMALL2): explicit 0 = off, not auto
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(

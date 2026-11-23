@@ -424,7 +424,7 @@ extern "C" {
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
         int32_t moe_skip_tail;                     // LOSSY: 0 off; 1..9 = leave out a non-resident expert that every token of a single-sequence decode window ranks at this position or later [EXPERIMENTAL]
         bool moe_skip_mass;                        // LOSSY: enable the configured weight-budget policy independently of route rank
-        size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = auto-size (one GPU, host experts; LLAMA_MOE_CACHE_AUTO=0 = off), SIZE_MAX = off [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
 
         // Expert keep policy for CPU-held MoE experts (#215/#217) [EXPERIMENTAL]

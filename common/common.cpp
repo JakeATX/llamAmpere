@@ -1571,7 +1571,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->model.reset(model);
 
-    if (!params.card_preset.empty()) {
+    if (!params.card_preset.empty() && !string_ends_with(params.card_preset, "ink")) {
         char arch[64] = {};
         llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
         if (std::string(arch) != "qwen35" || llama_model_n_layer(model) != 64 || llama_model_n_embd(model) != 5120) {
@@ -2221,6 +2221,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.moe_cache_size      = params.moe_cache_size;
     if (params.moe_cache_size == 0 && params.speculative.has_dft() && !getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB")) {
+        // (process-wide on purpose: the router/reload paths rebuild the same target + drafter pair)
         // fork (INKSMALL2): the drafter loads after the target context, so its weights + KV + compute (measured
         // 1,307-1,327 MiB for the Inkling DSpark Q8_0 fold drafter at ctx 16K-40K) stay out of the auto-sized cache
         common_set_env("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB", "1400");

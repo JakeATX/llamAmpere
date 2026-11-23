@@ -4945,8 +4945,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_ubatch = params_spec.n_ubatch;
     }
 
-    // the MoE cache is only used by the target context
-    result.moe_cache_size = 0;
+    // the MoE cache is only used by the target context (SIZE_MAX = off, no auto-size; fork INKSMALL2)
+    result.moe_cache_size = SIZE_MAX;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

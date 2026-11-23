@@ -848,7 +848,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
-    cparams.moe_cache_size      = params.moe_cache_size;
+    cparams.moe_cache_auto      = params.moe_cache_size == 0;
+    cparams.moe_cache_size      = params.moe_cache_size == SIZE_MAX ? 0 : params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
     // resolved after flash attention, see resolve_fused_ops()
@@ -1466,7 +1467,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         // LLAMA_MOE_CACHE_AUTO_RESERVE_MIB (common sets 1400 when a draft model is loaded). Calibrated on Inkling 2 Mini
         // S34d, SJ-KVaRN 4/4, --no-op-offload, ub 512, RTX 3090 capped at 7,168/9,216/11,264 MiB (INKSMALL2).
         // One GPU only; the main context only. Kill switch: LLAMA_MOE_CACHE_AUTO=0 (cache stays off, as before).
-        if (cparams.moe_cache_size == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc() &&
+        if (cparams.moe_cache_auto && cparams.moe_cache_size == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc() &&
                 model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
             const char * auto_env = getenv("LLAMA_MOE_CACHE_AUTO");
             const size_t host_bytes = (auto_env && strcmp(auto_env, "0") == 0) ? 0 : llama_moe_cache_host_expert_bytes(model);
