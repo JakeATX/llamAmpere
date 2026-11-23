@@ -13,6 +13,7 @@
 
 #include <clocale>
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <limits>
 #include <random>
@@ -362,22 +363,36 @@ int main(int argc, char ** argv) {
     // CPU float order differs between a 16-row and a short batch; this bound is far below any state mix-up
     const double tol = 1e-6;
     int fails = 0;
-    // [DSPINE4] verdict per plan:
-    //   FAIL  the shape-matched probe (every row inside a 16-row block) is above tol, or the 1-row probe is above tol vs
-    //         a rollback-free reference decoded in the same segment shapes (a state error);
-    //   PASS  the 1-row probe is within tol of the one-batch reference;
-    //   PASS(ROUNDING)  it is not, but it is within tol of the same-shape reference: the excess is the batch-shape
-    //         rounding between one batch and the segments (printed as the floor), not the rollback.
+    // [DSPINE4] verdict per plan. On CUDA the rollback-free references disagree with each other by batch shape alone
+    // (one batch vs segments: kernel choice per row count), so "floor" is measured, not assumed; it was 1.5e-5..5.8e-5 on
+    // P76 AI4 / 3090 (11-23) while a one-token state error was 1.5e-3..9.2e-2.
+    //   PASS            every probe within tol;
+    //   PASS(ROUNDING)  every probe within the rounding band = max(tol, 2 x the largest floor any plan measured) and the
+    //                   one-token control >= 20 x that probe's worst error (a state error would sit at the control's size);
+    //   FAIL            anything else, or a probe or control that did not run (non-finite).
+    std::vector<std::pair<run_result, matched_result>> res;
+    double floor_max = 0.0;
     for (const bool replay : { false, true }) {
         for (size_t i = 0; i < plans.size(); ++i) {
-            const run_result e = run(params, model, replay, plans[i], 100 + (uint32_t) i, n_vocab);
-            const matched_result m = run_matched(params, model, replay, plans[i], 500 + (uint32_t) i, n_vocab);
-            const char * verdict = !(m.worst <= tol) || !(e.seg_worst <= tol) ? "FAIL" : e.worst <= tol ? "PASS" : "PASS(ROUNDING)";
-            fprintf(stderr, "%s layout=%s plan %zu: worst nmse %.3e (1-row probe), %.3e (same-shape ref), floor %.3e, "
-                    "%.3e (shape-matched probe), one-token ctrl %.3e\n", verdict, replay ? "gdn_replay" : "ring", i,
-                    e.worst, e.seg_worst, e.floor_worst, m.worst, m.ctrl_min);
-            fails += verdict[0] == 'P' ? 0 : 1;
+            res.emplace_back(run(params, model, replay, plans[i], 100 + (uint32_t) i, n_vocab),
+                             run_matched(params, model, replay, plans[i], 500 + (uint32_t) i, n_vocab));
+            if (std::isfinite(res.back().first.floor_worst)) {
+                floor_max = std::max(floor_max, res.back().first.floor_worst);
+            }
         }
+    }
+    const double band = std::max(tol, 2.0 * floor_max);
+    fprintf(stderr, "rounding band %.3e (tol %.1e, largest rollback-free floor %.3e)\n", band, tol, floor_max);
+    for (size_t k = 0; k < res.size(); ++k) {
+        const run_result & e = res[k].first;
+        const matched_result & m = res[k].second;
+        const double w = std::max({ e.worst, e.seg_worst, m.worst });
+        const bool finite = std::isfinite(w) && std::isfinite(m.ctrl_min);
+        const char * verdict = !finite ? "FAIL" : w <= tol ? "PASS" : (w <= band && m.ctrl_min >= 20.0 * w) ? "PASS(ROUNDING)" : "FAIL";
+        fprintf(stderr, "%s layout=%s plan %zu: worst nmse %.3e (1-row probe), %.3e (same-shape ref), floor %.3e, "
+                "%.3e (shape-matched probe), one-token ctrl %.3e\n", verdict, k < plans.size() ? "ring" : "gdn_replay",
+                k % plans.size(), e.worst, e.seg_worst, e.floor_worst, m.worst, m.ctrl_min);
+        fails += verdict[0] == 'P' ? 0 : 1;
     }
     // 4 sequences, different accept counts per sequence and round (incl. 0 and the full block)
     const std::vector<std::vector<int32_t>> multi = {
