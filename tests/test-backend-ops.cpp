@@ -18155,6 +18155,15 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
             cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2560));
             cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 640));
         }
+        if (t == GGML_TYPE_AIT4_U) {
+            // INK200 T1: Inkling-2-Mini expert shapes (128 experts, top-8), gate_up 2304 <- 2304 (H256), down 2304 <- 1152 (H128)
+            for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 16}) {
+                cases.emplace_back(new test_mul_mat_id_ai4(t, 128, 8, true,  2304, n, 2304));
+                cases.emplace_back(new test_mul_mat_id_ai4(t, 128, 8, false, 2304, n, 1152));
+                cases.emplace_back(new test_mul_mat_id_ai4(t, 128, 8, false, 2304, n, 1152, false, false, 1));
+                cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 2304, n, 1152, true));
+            }
+        }
         for (int n : {1, 3, 8, 17, 129}) {
             cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 2, false, 32, n, 256));
             cases.emplace_back(new test_mul_mat_id_ai4(t, 8, 8, true,  48, n, 384));
@@ -23826,7 +23835,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // INKPF3: Inkling 2 Mini prefill expert GEMMs (AIT4_U, 128 experts, top-8): gate_up 2304 <- 2304, down 2304 <- 1152
     if (getenv("GGML_TEST_INKPF3") != nullptr) {
-        for (int64_t n : {512, 2048, 4096}) {
+        // GGML_TEST_INKPF3=dec: decode/verify widths instead (GGML_TEST_INKPF3_N, comma list, default 1,4,5,8,16)
+        std::vector<int64_t> ns = {512, 2048, 4096};
+        if (std::string(getenv("GGML_TEST_INKPF3")) == "dec") {
+            ns.clear();
+            std::string l = getenv("GGML_TEST_INKPF3_N") ? getenv("GGML_TEST_INKPF3_N") : "1,4,5,8,16";
+            for (size_t a = 0; a < l.size();) { size_t b = l.find(',', a); if (b == std::string::npos) b = l.size(); ns.push_back(std::stoll(l.substr(a, b - a))); a = b + 1; }
+        }
+        for (int64_t n : ns) {
             test_cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT4_U, 128, 8, true, 2304, n, 2304));
             test_cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT4_U, 128, 8, false, 2304, n, 1152));
         }
