@@ -1490,7 +1490,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 const double want_mib = std::min(free_mib - reserve, (double) host_bytes / (1024.0 * 1024.0) + 64.0);
                 if (want_mib >= 256.0) {
                     cparams.moe_cache_size = (size_t) want_mib * 1024 * 1024;
-                    LLAMA_LOG_INFO("%s: MoE cache auto-size %.0f MiB (free %.0f MiB - reserve %.0f MiB [ctx %u, ub %u, extra %.0f]; "
+                    LLAMA_LOG_WARN("%s: MoE cache auto-size %.0f MiB (free %.0f MiB - reserve %.0f MiB [ctx %u, ub %u, extra %.0f]; "
                                    "host experts %.0f MiB; --moe-cache-mib N sets it, LLAMA_MOE_CACHE_AUTO=0 turns it off)\n", __func__,
                                    want_mib, free_mib, reserve, cparams.n_ctx, cparams.n_ubatch, extra,
                                    (double) host_bytes / (1024.0 * 1024.0));
@@ -1499,7 +1499,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                                    __func__, want_mib, free_mib, reserve);
                 }
             } else if (host_bytes > 0) {
-                LLAMA_LOG_INFO("%s: MoE cache auto-size needs exactly one GPU (found %d); pass --moe-cache-mib N\n", __func__, n_gpu);
+                LLAMA_LOG_WARN("%s: MoE cache auto-size needs exactly one GPU (found %d); pass --moe-cache-mib N\n", __func__, n_gpu);
             }
         }
 

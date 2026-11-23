@@ -1475,7 +1475,9 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             params.model.get_paths(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
-            ncmoe_auto ? nullptr : &params.moe_cache,
+            // fork (INKSMALL2): *ink presets cache experts in llama_moe_cache (sized after the fit from what it leaves
+            // free); the provider pool allocates nothing there, so its 1 GiB minimum must not fail the 8 GB boot fit
+            ncmoe_auto || string_ends_with(params.card_preset, "ink") ? nullptr : &params.moe_cache,
             fit_targets.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
@@ -1539,9 +1541,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     common_fit_apply(params, mparams, cparams, &verify_compact_fit_safe);
     if (!params.card_preset.empty()) {
+        const uint32_t n_ctx_asked = params.n_ctx;
         params.n_ctx = cparams.n_ctx;
         LOG_INF("card preset %s: chosen context %u, ubatch %u; fit margin %zu MiB\n",
                 params.card_preset.c_str(), cparams.n_ctx, cparams.n_ubatch, params.fit_params_target.front() >> 20);
+        if (string_ends_with(params.card_preset, "ink") && n_ctx_asked > 0 && cparams.n_ctx < n_ctx_asked) {
+            LOG_WRN("card preset %s: not enough free VRAM for ctx %u plus an expert cache (other programs use part of the "
+                    "card); context reduced to %u to keep room for the cache. Close other GPU programs or pass -c N\n",
+                    params.card_preset.c_str(), n_ctx_asked, cparams.n_ctx);
+        }
     }
 
     if (!verify_compact_fit_safe) {
