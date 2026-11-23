@@ -2506,6 +2506,18 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
     const uint32_t n_tokens = std::min(cparams.n_ctx, reserve_tokens);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    // fork: LLAMA_UB_LADDER_HOLD sizes a return to the prompt ceiling from the last prompt-sized reserve
+    // (more than 64 rows; the writing scratch is 16), per backend.
+    const auto note_prompt_reserve = [&]() {
+        if (!dynamic_ubatch || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || n_tokens <= 64 || !sched) {
+            return;
+        }
+        dynamic_ubatch_pp_bytes.assign(backend_ptrs.size(), 0);
+        for (size_t bi = 0; bi < backend_ptrs.size(); ++bi) {
+            dynamic_ubatch_pp_bytes[bi] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[bi]);
+        }
+        dynamic_ubatch_pp_rows = n_tokens;
+    };
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -2816,6 +2828,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
         const int64_t t_end_us = ggml_time_us();
         LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n", __func__, (t_end_us - t_start_us) / 1000.0,
                        ggml_backend_sched_get_n_copies(sched.get()));
+        note_prompt_reserve();
         return;
     }
 
@@ -3016,6 +3029,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n", __func__, (t_end_us - t_start_us) / 1000.0,
                    ggml_backend_sched_get_n_copies(sched.get()));
+    note_prompt_reserve();
 }
 
 void llama_context::synchronize() {
@@ -6177,22 +6191,46 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             bool grow = true;
             bool gpu = false;
             const uint32_t next = std::min(std::min(cparams.n_ubatch, 4096u), dynamic_ubatch_rows * 2);
-            for (auto backend : backend_ptrs) {
+            // fork: LLAMA_UB_LADDER_HOLD (default on). The 2 GiB margin gates growth only: rows that the last prompt
+            // reserve already held fit again, so a big -c that leaves less than the margin free (262K: 1.3 GiB) no
+            // longer halves the prompt rows to 256 (-30% prompt at 100K fill). A cut needs free < floor (512 MiB, or
+            // the small-card margin), or a return to the ceiling that would not fit in free - floor, sized from the
+            // last prompt reserve (not the 16-row writing scratch). Writing-phase checks never cut. =0 restores the
+            // old cut at the full margin.
+            static const bool hold = [] { const char * e = getenv("LLAMA_UB_LADDER_HOLD"); return !e || !e[0] || atoi(e) != 0; }();
+            if (hold && dynamic_ubatch_pp_bytes.size() != backend_ptrs.size()) {
+                dynamic_ubatch_pp_bytes.assign(backend_ptrs.size(), 0);
+            }
+            for (size_t bi = 0; bi < backend_ptrs.size(); ++bi) {
+                auto backend = backend_ptrs[bi];
                 auto dev = ggml_backend_get_device(backend);
                 if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
                 gpu = true;
                 size_t free = 0, total = 0;
                 ggml_backend_dev_memory(dev, &free, &total);
                 const size_t margin = total >= (size_t(16) << 30) ? size_t(2) << 30 : size_t(64) << 20;
-                cut = cut || free < margin;
+                const size_t floor = std::min(margin, size_t(512) << 20);
                 // fork: budget from allocated rows, which may be writing-sized after a turn.
                 const size_t bytes = ggml_backend_sched_get_buffer_size(sched.get(), backend);
                 const uint32_t allocated = std::max(1u, sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch);
                 const double extra = double(bytes) * (next - std::min(next, allocated)) / allocated;
                 const double current_extra = double(bytes) *
                         (dynamic_ubatch_rows - std::min(dynamic_ubatch_rows, allocated)) / allocated;
-                cut = cut || (dynamic_ubatch_rows > allocated &&
-                        current_extra + margin + (size_t(64) << 20) >= double(free));
+                if (!hold) {
+                    cut = cut || free < margin;
+                    cut = cut || (dynamic_ubatch_rows > allocated &&
+                            current_extra + margin + (size_t(64) << 20) >= double(free));
+                } else if (prompt) {
+                    double need = current_extra;
+                    if (dynamic_ubatch_pp_rows > 0 && dynamic_ubatch_pp_bytes[bi] > 0) {
+                        // a shorter prompt reserve since (e.g. 512 rows) scales up linearly to the ceiling
+                        const double pp = double(dynamic_ubatch_pp_bytes[bi]) *
+                                std::max(1.0, double(dynamic_ubatch_rows) / dynamic_ubatch_pp_rows);
+                        need = std::max(0.0, pp - double(bytes));
+                    }
+                    cut = cut || free < floor;
+                    cut = cut || (dynamic_ubatch_rows > allocated && need + floor >= double(free));
+                }
                 grow = grow && free > margin && extra + (size_t(64) << 20) < double(free - margin);
             }
             const uint32_t previous = dynamic_ubatch_rows;
@@ -6202,7 +6240,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 dynamic_ubatch_rows = next;
             }
             if (previous != dynamic_ubatch_rows) {
-                LLAMA_LOG_INFO("%s: dynamic prompt ceiling %u -> %u rows\n", __func__, previous, dynamic_ubatch_rows);
+                if (dynamic_ubatch_rows < previous) {
+                    LLAMA_LOG_WARN("%s: dynamic prompt ceiling %u -> %u rows\n", __func__, previous, dynamic_ubatch_rows);
+                } else {
+                    LLAMA_LOG_INFO("%s: dynamic prompt ceiling %u -> %u rows\n", __func__, previous, dynamic_ubatch_rows);
+                }
             }
         }
         if (prompt) { rows = std::min(rows, dynamic_ubatch_rows); }

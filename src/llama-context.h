@@ -666,6 +666,9 @@ private:
     bool dynamic_ubatch = false;
     uint32_t dynamic_ubatch_rows = 0;
     int64_t dynamic_ubatch_pp_check_us = 0;
+    // per-backend compute buffer bytes and rows of the last prompt-sized reserve (LLAMA_UB_LADDER_HOLD)
+    std::vector<size_t> dynamic_ubatch_pp_bytes;
+    uint32_t dynamic_ubatch_pp_rows = 0;
     int64_t dynamic_ubatch_decode_check_us = 0;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
