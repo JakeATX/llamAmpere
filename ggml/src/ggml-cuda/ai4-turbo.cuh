@@ -938,6 +938,9 @@ static __global__ void __launch_bounds__(M_SLABS * 32, MINB) gemm_s8_lowreg(
             const int rem8   = o_base & 15;
 #pragma unroll
             for (int nt = 0; nt < NTI; ++nt) {
+                if constexpr (ID) {
+                    if (idm.tail_skip && nt * 8 >= N) continue;   // block-uniform: no routed column in [nt*8, nt*8+8) (rc INKPF3 tail_skip)
+                }
                 const int c = nt * 8 + g;
                 const int xo = ((p16 ^ (c & 7)) << 4) + rem8;
                 const uint2 xv = *(const uint2 *)(sx + c * 128 + xo);
@@ -948,6 +951,9 @@ static __global__ void __launch_bounds__(M_SLABS * 32, MINB) gemm_s8_lowreg(
         const float d1 = __half2float(sd[g + 8]);
 #pragma unroll
         for (int nt = 0; nt < NTI; ++nt) {
+            if constexpr (ID) {
+                if (idm.tail_skip && nt * 8 >= N) continue;
+            }
             const float dx0 = sxd[nt * 8 + 2 * t];
             const float dx1 = sxd[nt * 8 + 2 * t + 1];
             acc[nt][0] += magic_i2f(p[nt][0]) * (d0 * dx0);
