@@ -6337,7 +6337,34 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 grow = grow && free > margin && extra + (size_t(64) << 20) < double(free - margin);
             }
             const uint32_t previous = dynamic_ubatch_rows;
-            if (gpu && cut) {
+            if (gpu && ink_armed) {
+                // fork (INKSTREAM): pick the largest power-of-two ceiling that fits outright instead of one halving
+                // per check (one halving left a 2048 -> 1024 step that overran an 8 GB card by ~190 MiB). Besides the
+                // linear compute-buffer growth, mul_mat_id takes its gathered rows (expert inputs, gate_up and down
+                // outputs, f32, top-k per token) from the CUDA pool at compute time, outside the reserved buffer:
+                // charged for any ceiling above the current reserve, with 25% slack.
+                const auto & hp = model.hparams;
+                const double per_row = 1.25 * 4.0 * hp.n_expert_used() * (hp.n_embd + 3.0 * hp.n_ff_exp());
+                const uint32_t allocated = std::max(1u, sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch);
+                uint32_t pick = 512;
+                for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r /= 2) {
+                    bool fits = true;
+                    for (auto backend : backend_ptrs) {
+                        auto dev = ggml_backend_get_device(backend);
+                        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
+                        size_t free = 0, total = 0;
+                        ggml_backend_dev_memory(dev, &free, &total);
+                        const double margin = double(total >= (size_t(16) << 30) ? size_t(2) << 30 : size_t(64) << 20) +
+                                double(size_t(64) << 20);
+                        const double bytes = double(ggml_backend_sched_get_buffer_size(sched.get(), backend));
+                        const double need = r > allocated ? bytes * (r - allocated) / allocated + per_row * r : 0.0;
+                        // a ceiling already reserved only needs the floor (its pool is in use and counted in free)
+                        fits = fits && need + (r > allocated ? margin : double(size_t(64) << 20)) < double(free);
+                    }
+                    if (fits) { pick = r; break; }
+                }
+                dynamic_ubatch_rows = std::min(pick, std::max(512u, std::min(cparams.n_ubatch, 4096u)));
+            } else if (gpu && cut) {
                 dynamic_ubatch_rows = std::max(std::max(256u, cparams.n_seq_max), dynamic_ubatch_rows / 2);
             } else if (gpu && grow) {
                 dynamic_ubatch_rows = next;
