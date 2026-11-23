@@ -7,6 +7,7 @@
 #include "ai4-ampere.cuh"
 #include "ai4-turbo.cuh"
 #include "ai4-exp-turbo.cuh"
+#include "ai4-decode-fast.cuh"
 #include "magic2-v2.cuh"
 #include "aif25-mmq.cuh"
 #include "../ggml-aif25.h"
@@ -1048,6 +1049,9 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     float  * xs_p = nullptr;
     if (t == GGML_TYPE_AIT2P_U) {
         ai4_prep(ctx, key, X, N, K, xsh, AI4_PREP_PLAIN, qa, sa, xq_p, xs_p);
+        if (N <= 8 && ggml_cuda_ai4_decode_fast_unit_try(ctx, t, W, 0, nullptr, xq_p, xs_p, Y, M, N, K, 1, 1, 1, xsh, false)) {
+            return;
+        }
         if (xsh) { ai2p_mm_kernels<1>(W, xq_p, xs_p, Y, M, N, K, stream); }
         else     { ai2p_mm_kernels<0>(W, xq_p, xs_p, Y, M, N, K, stream); }
         return;
@@ -1182,6 +1186,10 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             }
             return;
         }
+    }
+    if (N <= 8 && !swap8 && !xperm &&
+            ggml_cuda_ai4_decode_fast_unit_try(ctx, t, W, 0, nullptr, xq_p, xs_p, Y, M, N, K, 1, 1, 1, xsh, false)) {
+        return;
     }
     switch (ai4_lay_of(t)) {
 #define AI4_MM_U(L) \
@@ -1787,6 +1795,12 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_cuda_ai4_exp_turbo_try(ctx, src0, ids, xq, xs, y_out, M, K, n_tok, n_used, ne11,
                                         n_expert, xsh, y_into != nullptr, ai4_id_skip_on())) {
         CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // AI+ decode-fast (6-rate, N <= 8) for what T1 declines (N == 1, n_pairs > 64, non-Ampere). Kill switch GGML_CUDA_AI4_DECODE_FAST=0.
+    if (!fused && n_tok <= 8 && ggml_cuda_ai4_decode_fast_unit_try(
+            ctx, src0->type, (const uint8_t *) src0->data, (int64_t) src0->nb[2], ids,
+            xq, xs, y_out, M, n_tok, K, n_used, ne11, n_expert, xsh, y_into != nullptr)) {
         return;
     }
 
@@ -3333,6 +3347,9 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         return;
     }
+    if (ggml_cuda_ai4_decode_fast_frac_try(ctx, w->type, xsh, wd, qp, sp, y, M, K, N)) {
+        return;
+    }
     aif25_mmv_type(w->type, xsh, wd, qp, sp, y, M, K, N, stream);
 }
 
@@ -3413,7 +3430,9 @@ void ggml_cuda_mul_mat_id_aif_rows(ggml_backend_cuda_context & ctx, ggml_tensor 
     const dim3 gs((n_sel + 255)/256, n_out);
     k_aif_rows_mark<<<gs, 256, 0, stream>>>((const int32_t *) ids->data, ids->nb[1], n_sel, n_out, n_rows, mask.get());
     CUDA_CHECK(cudaGetLastError());
-    aif25_mmv_type(w->type, xsh, (const uint8_t *) w->data, qp, sp, y.get(), n_rows, K, n_out, stream, mask.get());
+    if (!ggml_cuda_ai4_decode_fast_frac_try(ctx, w->type, xsh, (const uint8_t *) w->data, qp, sp, y.get(), n_rows, K, n_out, mask.get())) {
+        aif25_mmv_type(w->type, xsh, (const uint8_t *) w->data, qp, sp, y.get(), n_rows, K, n_out, stream, mask.get());
+    }
     k_aif_rows_gather<<<gs, 256, 0, stream>>>(y.get(), (const int32_t *) ids->data, ids->nb[1], n_sel, n_rows,
                                               (float *) dst->data, dst->nb[2]);
     CUDA_CHECK(cudaGetLastError());
