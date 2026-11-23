@@ -6354,6 +6354,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 const double per_row = 1.25 * 4.0 * hp.n_expert_used_max() * (hp.n_embd + 3.0 * ff_max);
                 const uint32_t allocated = std::max(1u, sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch);
                 uint32_t pick = 512;
+                double log_free = 0.0, log_need = 0.0; // the smallest ceiling above 512 that was tried
                 for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r /= 2) {
                     bool fits = true;
                     for (auto backend : backend_ptrs) {
@@ -6365,6 +6366,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                                 double(size_t(64) << 20);
                         const double bytes = double(ggml_backend_sched_get_buffer_size(sched.get(), backend));
                         if (r > allocated) {
+                            log_free = double(free); log_need = bytes * (r - allocated) / allocated + per_row * r + margin;
                             fits = fits && bytes * (r - allocated) / allocated + per_row * r + margin < double(free);
                         } else {
                             // at or below the reserve: its pool is in use and counted in free; a smaller ceiling
@@ -6375,6 +6377,10 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                     if (fits) { pick = r; break; }
                 }
                 dynamic_ubatch_rows = std::min(pick, std::max(512u, std::min(cparams.n_ubatch, 4096u)));
+                if (log_need > 0.0) {
+                    LLAMA_LOG_WARN("%s: [INKSTREAM] ceiling %u rows (reserved %u; next step needs %.0f MiB, free %.0f MiB)\n",
+                                   __func__, dynamic_ubatch_rows, allocated, log_need / 1048576.0, log_free / 1048576.0);
+                }
             } else if (gpu && cut) {
                 dynamic_ubatch_rows = std::max(std::max(256u, cparams.n_seq_max), dynamic_ubatch_rows / 2);
             } else if (gpu && grow) {
