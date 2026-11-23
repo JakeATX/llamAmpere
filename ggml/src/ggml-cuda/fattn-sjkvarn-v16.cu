@@ -6,6 +6,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-sjkvarn-rot.cuh"
+#include "qsa-resident-clock.cuh"
 #include "mma.cuh"
 #include "ggml-inksj.h"
 
@@ -668,12 +669,22 @@ static fattn_kernel_t v16_kernel() {
 
 template <int max_warps, int NSTAGE, bool rot>
 static int v16_ctas_per_sm(const int W) {
-    const size_t shared = v16_shared_bytes(NSTAGE);
-    if (shared > ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
-        return 0;
+    const int id = ggml_cuda_get_device();
+    static std::atomic<int> cached[GGML_CUDA_MAX_DEVICES][MAX_WARPS + 1];
+    if (id >= 0 && id < GGML_CUDA_MAX_DEVICES && W >= 1 && W <= MAX_WARPS) {
+        const int v = cached[id][W].load(std::memory_order_relaxed);
+        if (v != 0) {
+            return v - 1;
+        }
     }
+    const size_t shared = v16_shared_bytes(NSTAGE);
     int blocks = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, v16_kernel<max_warps, NSTAGE, rot>(), WARP_SIZE * W, shared));
+    if (shared <= ggml_cuda_info().devices[id].smpbo) {
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, v16_kernel<max_warps, NSTAGE, rot>(), WARP_SIZE * W, shared));
+    }
+    if (id >= 0 && id < GGML_CUDA_MAX_DEVICES && W >= 1 && W <= MAX_WARPS) {
+        cached[id][W].store(blocks + 1, std::memory_order_relaxed);
+    }
     return blocks;
 }
 
@@ -768,8 +779,9 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(const ggml_tensor * dst) {
             ggml_cuda_fattn_sj_live_records != nullptr) {
         return false;
     }
-    if (dst->src[5] && dst->src[5]->buffer &&
-            ggml_cuda_qsa_resident_is_buft(ggml_backend_buffer_get_type(dst->src[5]->buffer))) {
+    if (dst->src[5] && ((dst->src[5]->buffer &&
+            ggml_cuda_qsa_resident_is_buft(ggml_backend_buffer_get_type(dst->src[5]->buffer))) ||
+            ggml_cuda_qsa_strip_body(dst->src[5]))) {
         return false;
     }
     const ggml_tensor * Q    = dst->src[0];
@@ -798,7 +810,7 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(const ggml_tensor * dst) {
         return false;
     }
     const int32_t n_kv_pad = ggml_get_op_params_i32(dst, 6);
-    if (n_kv_pad <= 0 || n_kv_pad % FATTN_KQ_STRIDE != 0) {
+    if (n_kv_pad <= 0 || n_kv_pad % FATTN_KQ_STRIDE != 0 || mask->ne[0] < n_kv_pad) {
         return false;
     }
     if (((uintptr_t) mask->data) % 16 != 0 || mask->nb[1] % 16 != 0 ||
