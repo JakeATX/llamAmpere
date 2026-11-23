@@ -1,4 +1,5 @@
 #include "inkreltab.cuh"
+#include "inkreltab_vec.cuh"
 
 static __global__ void k_ink_rel_table(const float * __restrict__ bias, const float * __restrict__ r, const char * __restrict__ sinks,
         float * __restrict__ dst, const int n_rel, const int E, const int H, const int64_t r_s1, const int64_t r_s2,
@@ -33,6 +34,9 @@ static __global__ void k_ink_rel_table(const float * __restrict__ bias, const fl
 
 void ggml_cuda_ink_rel_table(ggml_backend_cuda_context & ctx, const ggml_tensor * bias, const ggml_tensor * r,
         const ggml_tensor * sinks, ggml_tensor * dst) {
+    if (ggml_cuda_ink_rel_table_vec(ctx, bias, r, sinks, dst)) {
+        return;
+    }
     const int n_rel = (int) bias->ne[0];
     const int E     = (int) bias->ne[1];
     const int H     = (int) r->ne[1];

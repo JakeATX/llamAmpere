@@ -628,6 +628,35 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
+    // [T5-IDLE] H1: account for target's layer_inp_dev buffer (n_extract * n_embd_tgt * n_batch_tgt * 4 B, ~144 MiB at -b 4096)
+    // when fitting a DFlash/DSpark drafter alongside its target model so 8/10/12 GB cards budget it before --fit finishes.
+    // Stored in mb.compute (not mb.context) because it scales with n_batch, not n_ctx (see common_fit_extra_memory_at).
+    if (ctx_parent != nullptr && nd > 0) {
+        const char * dev_inject_e = std::getenv("LLAMA_DSPARK_DEV_INJECT");
+        const bool   dev_inject   = dev_inject_e == nullptr || std::atoi(dev_inject_e) != 0;
+        const uint32_t n_extract  = llama_model_target_layer_ids_n(model.get());
+        if (dev_inject && n_extract > 0) {
+            const llama_model * model_parent = llama_get_model(ctx_parent);
+            const size_t layer_inp_bytes =
+                (size_t) n_extract * (size_t) llama_model_n_embd(model_parent) * (size_t) llama_n_batch(ctx_parent) * sizeof(float);
+            // Output device of the parent (where layer_inp_dev is allocated); fall back to draft's primary GPU device 0.
+            size_t target_idx = 0;
+            const uint32_t n_parent_devs = (uint32_t) llama_model_n_devices(model_parent);
+            if (n_parent_devs > 0) {
+                ggml_backend_dev_t parent_last = llama_model_get_device(model_parent, n_parent_devs - 1);
+                for (size_t i = 0; i < nd; ++i) {
+                    if (llama_model_get_device(model.get(), i) == parent_last) {
+                        target_idx = i;
+                        break;
+                    }
+                }
+            }
+            if (ggml_backend_dev_type(llama_model_get_device(model.get(), target_idx)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                ret[target_idx].mb.compute += layer_inp_bytes;
+            }
+        }
+    }
+
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {

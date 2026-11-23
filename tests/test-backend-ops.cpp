@@ -1742,7 +1742,7 @@ struct test_case {
                 }
             }
 
-            if ((t1->op == GGML_OP_FLASH_ATTN_EXT || t1->op == GGML_OP_CONCAT) && getenv("GGML_TEST_DUMP_HASH")) { // CONCAT: multi-stream SJ-KVaRN cases
+            if ((t1->op == GGML_OP_FLASH_ATTN_EXT || t1->op == GGML_OP_CONCAT || t1->op == GGML_OP_MUL_MAT_ID) && getenv("GGML_TEST_DUMP_HASH")) { // CONCAT: multi-stream SJ-KVaRN cases
                 // raw backend1 output bytes (FNV-1a 64) for bit-identity checks between two builds
                 std::vector<uint8_t> raw(ggml_nbytes(t1));
                 ggml_backend_tensor_get(t1, raw.data(), 0, raw.size());
@@ -18125,6 +18125,20 @@ static const ggml_type other_types[] = {
 // AI+ rates 2 and 3 parity matrix (correctness cases only) on the unit types AIT2_U / AIT3_U; with
 // GGML_CUDA_AI23_FAST=1 these run the IMMA kernels, unset the rate-k reference path: mmv (n 1-8), GEMM BN64 / BN128,
 // H256 and H128 tails, partial 128-row CTAs, mmv-ID / GEMM-ID with 512 experts top 10, small expert counts, repeated ids.
+// INK200 T1 + AI+ Turbo v3 lowreg: Inkling-2-Mini expert shapes (128 experts, top-8), gate_up 2304 <- 2304 (H256, ne11 1),
+// down 2304 <- 1152 (H128, ne11 8); decode/verify N 1-8, 16 (exp-turbo / ampere_mmv) and prefill N 64, 512 (gemm_s8_lowreg ID).
+static void add_ink200_cases(std::vector<std::unique_ptr<test_case>> & cases) {
+    const ggml_type t = GGML_TYPE_AIT4_U;
+    for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 16, 64, 512}) {
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 128, 8, true,  2304, n, 2304));
+        cases.emplace_back(new test_mul_mat_id_ai4(t, 128, 8, false, 2304, n, 1152));
+        if (n <= 16) {
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 128, 8, false, 2304, n, 1152, false, false, 1));
+            cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 3, false, 2304, n, 1152, true));
+        }
+    }
+}
+
 static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
     const ggml_type UT[] = { GGML_TYPE_AIT2_U, GGML_TYPE_AIT3_U };
     for (const ggml_type t : UT) {
@@ -18598,6 +18612,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     add_ai23_cases(test_cases);
+    add_ink200_cases(test_cases);
     add_ai_bank_cases(test_cases);
     add_ait2pu_cases(test_cases);
     add_ait2pu_cases(test_cases, GGML_TYPE_AIT2_U2);
@@ -23846,7 +23861,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // INKPF3: Inkling 2 Mini prefill expert GEMMs (AIT4_U, 128 experts, top-8): gate_up 2304 <- 2304, down 2304 <- 1152
     if (getenv("GGML_TEST_INKPF3") != nullptr) {
-        for (int64_t n : {512, 2048, 4096}) {
+        // GGML_TEST_INKPF3=dec: decode/verify widths instead (GGML_TEST_INKPF3_N, comma list, default 1,4,5,8,16)
+        std::vector<int64_t> ns = {512, 2048, 4096};
+        if (std::string(getenv("GGML_TEST_INKPF3")) == "dec") {
+            ns.clear();
+            std::string l = getenv("GGML_TEST_INKPF3_N") ? getenv("GGML_TEST_INKPF3_N") : "1,4,5,8,16";
+            for (size_t a = 0; a < l.size();) { size_t b = l.find(',', a); if (b == std::string::npos) b = l.size(); ns.push_back(std::stoll(l.substr(a, b - a))); a = b + 1; }
+        }
+        for (int64_t n : ns) {
             test_cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT4_U, 128, 8, true, 2304, n, 2304));
             test_cases.emplace_back(new test_mul_mat_id_ai4(GGML_TYPE_AIT4_U, 128, 8, false, 2304, n, 1152));
         }

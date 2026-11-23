@@ -3,6 +3,7 @@
 #include "llama-ext.h"
 #include "llama-impl.h"
 
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -1442,7 +1443,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DFLASH_FC,                              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
 
     {LLM_TENSOR_DSPARK_JOINT_PROJ,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_DSPARK_MASK_EMBD,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+    // [T5-IDLE] H3: place mask_embd (9 KB) on GPU (OUTPUT layer) like dspark_fuse/dspark_norm so graph_inkling2
+    // does not split into CPU->GPU(rms_norm)->83us sync->CPU(cast)->GPU(225 kernels) on every draft round.
+    {LLM_TENSOR_DSPARK_MASK_EMBD,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_DSPARK_FUSE,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DSPARK_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DSPARK_HIDDEN_OUT,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
@@ -1532,6 +1535,17 @@ llm_arch llm_arch_from_string(const std::string & name) {
 }
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor) {
+    if (tensor == LLM_TENSOR_DSPARK_MASK_EMBD) {
+        // [T5-IDLE] H3: respect LLAMA_DSPARK_MASK_GPU=0 so all-switches-off restores CPU placement identical to rc7.
+        static const bool mask_gpu = [] {
+            const char * e = std::getenv("LLAMA_DSPARK_MASK_GPU");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        static const llm_tensor_info info_cpu = { LLM_TENSOR_LAYER_INPUT, GGML_OP_GET_ROWS };
+        if (!mask_gpu) {
+            return info_cpu;
+        }
+    }
     return LLM_TENSOR_INFOS.at(tensor);
 }
 

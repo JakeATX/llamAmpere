@@ -1992,28 +1992,53 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
 }
 
 // Inkling2 DSpark markov head step: GRU-style recurrent cell over [state, w1[prev], hidden, context], its latent
-// is projected to n_embd and scored by the target's lm head as a bias on the backbone logits, then softcapped
+// is projected to n_embd and scored by the target's lm head as a bias on the backbone logits, then softcapped.
+// When shortlist_ids != nullptr, scores only the shortlisted rows of dspark_head_fold (via MUL_MAT_ID, fused by
+// ggml-cuda dspark-head.cu with zero duplicate weight copies) using pre-gathered fold_bias_sl and base_sl.
 static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
-        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context) {
+        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context,
+        ggml_tensor * shortlist_ids = nullptr, ggml_tensor * fold_bias_sl = nullptr, bool fast_graph = false) {
     auto * ctx0 = g.ctx0;
     const int64_t rank = model.hparams.dspark_markov_rank;
     auto * joint = ggml_concat(ctx0, state, ggml_get_rows(ctx0, model.dspark_markov_w1, prev), 0);
     joint = ggml_concat(ctx0, joint, ggml_concat(ctx0, hidden, context, 0), 0);
-    joint = ggml_add(ctx0, g.build_lora_mm(model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
+    auto * joint_raw = g.build_lora_mm(model.dspark_joint_proj, joint);
+    auto * joint_b   = ggml_add(ctx0, joint_raw, model.dspark_joint_proj_b);
     const auto chunk = [&](int64_t j) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, joint->ne[1], joint->nb[1], j*rank*joint->nb[0]));
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, joint_b, rank, joint_b->ne[1], joint_b->nb[1], j*rank*joint_b->nb[0]));
     };
     auto * gate      = ggml_sigmoid(ctx0, chunk(0));
     auto * candidate = ggml_tanh(ctx0, chunk(1));
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent     = ggml_tanh(ctx0, chunk(2));
+    if (fast_graph) {
+        // Keep the GRU update run contiguous in cgraph so ggml-cuda dspark-head.cu fuses it into 1 launch.
+        ggml_build_forward_expand(g.gf, state);
+        ggml_build_forward_expand(g.gf, latent);
+    }
     // folded head (lm_head . hidden_out, precomputed): reads [rank, n_vocab] instead of the whole lm head per step
     static const bool use_fold = [] { const char * e = getenv("LLAMA_DSPARK_HEAD_FOLD"); return !e || atoi(e) != 0; }();
     ggml_tensor * bias = nullptr;
     if (use_fold && model.dspark_head_fold) {
-        bias = g.build_lora_mm(model.dspark_head_fold, latent);
-        ggml_prec_set_acc(bias, GGML_PREC_F32);
-        bias = ggml_add(ctx0, bias, model.dspark_head_fold_b);
+        if (shortlist_ids != nullptr && fold_bias_sl != nullptr) {
+            const int64_t n_sel = shortlist_ids->ne[0];
+            const int64_t nb    = latent->ne[1];
+            ggml_tensor * fold_rows = ggml_reshape_3d(ctx0, model.dspark_head_fold,
+                    model.dspark_head_fold->ne[0], 1, model.dspark_head_fold->ne[1]);
+            ggml_tensor * ids_b = ggml_view_2d(ctx0, shortlist_ids, n_sel, 1, shortlist_ids->nb[1], 0);
+            if (nb > 1) {
+                ids_b->ne[1] = nb; // broadcast shortlist ids across sequences
+                ids_b->nb[1] = 0;
+            }
+            ggml_tensor * lat_3d = ggml_reshape_3d(ctx0, latent, latent->ne[0], 1, nb);
+            bias = ggml_reshape_2d(ctx0, ggml_mul_mat_id(ctx0, fold_rows, lat_3d, ids_b), n_sel, nb);
+            ggml_prec_set_acc(bias, GGML_PREC_F32);
+            bias = ggml_add(ctx0, bias, fold_bias_sl);
+        } else {
+            bias = g.build_lora_mm(model.dspark_head_fold, latent);
+            ggml_prec_set_acc(bias, GGML_PREC_F32);
+            bias = ggml_add(ctx0, bias, model.dspark_head_fold_b);
+        }
     } else {
         auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
         bias = g.build_lora_mm(target.output, correction, target.output_s);
@@ -2050,7 +2075,17 @@ public:
         if (state != has_state || !params.ubatch.token || tokens->ne[0] != params.ubatch.n_tokens) {
             return false;
         }
-        return !has_state || llm_graph_input_embd_h::can_reuse(params);
+        if ((params.cparams.dspark_noise != nullptr) != (noise != nullptr)) {
+            return false;
+        }
+        if (has_state && !llm_graph_input_embd_h::can_reuse(params)) {
+            return false;
+        }
+        // [T5-IDLE] H4: refresh noise pointer on graph reuse (dspark_noise buffer may reallocate or update per round)
+        if (noise != nullptr) {
+            noise_src = params.cparams.dspark_noise;
+        }
+        return true;
     }
 
     const bool has_state;
@@ -2077,6 +2112,10 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         return build_norm(ggml_reshape_2d(ctx0, x, n_embd, n_tokens), norm, nullptr, LLM_NORM_RMS, row == n_layer ? -1 : row);
     };
 
+    static const bool fast_graph = [] { const char * e = getenv("LLAMA_DSPARK_FAST_GRAPH"); return !e || atoi(e) != 0; }();
+    static const bool use_shortlist_env = [] { const char * e = getenv("LLAMA_DSPARK_SHORTLIST"); return !e || atoi(e) != 0; }();
+    static const bool use_fold_env = [] { const char * e = getenv("LLAMA_DSPARK_HEAD_FOLD"); return !e || atoi(e) != 0; }();
+
     ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd || ubatch.embd_row) {
         auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
@@ -2088,8 +2127,15 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             const int64_t nk = hparams.n_head_kv(il);
             auto * context = mix(features, il, l.dflare_norm);
             cb(context, "dspark_context", il);
-            auto * k = ggml_reshape_3d(ctx0, build_lora_mm(l.attn_k_ctx, context), hd, nk, n_tokens);
-            auto * v = ggml_reshape_3d(ctx0, build_lora_mm(l.attn_v_ctx, context), hd, nk, n_tokens);
+            auto * k_mm = build_lora_mm(l.attn_k_ctx, context);
+            auto * v_mm = build_lora_mm(l.attn_v_ctx, context);
+            if (fast_graph && (n_tokens == 1 || (n_tokens >= 5 && n_tokens <= 8))) {
+                // Keep k_ctx and v_ctx adjacent after dflare_norm so INKGLUE NORMQ/MMGV fuses both in one launch.
+                ggml_build_forward_expand(gf, k_mm);
+                ggml_build_forward_expand(gf, v_mm);
+            }
+            auto * k = ggml_reshape_3d(ctx0, k_mm, hd, nk, n_tokens);
+            auto * v = ggml_reshape_3d(ctx0, v_mm, hd, nk, n_tokens);
             k = build_norm(k, l.attn_k_ctx_norm, nullptr, LLM_NORM_RMS, il);
             k = build_rope(k, positions, il);
             const bool swa = hparams.is_swa(il);
@@ -2145,7 +2191,15 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     anchors = ggml_mul(ctx0, ggml_rms_norm(ctx0, anchors, target->hparams.f_norm_rms_eps), target->tok_norm);
     auto * cur = ggml_reshape_3d(ctx0, anchors, n_embd, 1, nb);
     if (block > 1) {
-        auto * masks = ggml_repeat_4d(ctx0, ggml_cast(ctx0, model.dspark_mask_embd, GGML_TYPE_F32), n_embd, block - 1, nb, 1);
+        // [T5-IDLE] H3: skip redundant F32->F32 cast on dspark_mask_embd (LLAMA_DSPARK_MASK_GPU=0 restores cast)
+        static const bool skip_noop_cast = [] {
+            const char * e = getenv("LLAMA_DSPARK_MASK_GPU");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        ggml_tensor * mask_f32 = (skip_noop_cast && model.dspark_mask_embd->type == GGML_TYPE_F32)
+            ? model.dspark_mask_embd
+            : ggml_cast(ctx0, model.dspark_mask_embd, GGML_TYPE_F32);
+        auto * masks = ggml_repeat_4d(ctx0, mask_f32, n_embd, block - 1, nb, 1);
         cur = ggml_concat(ctx0, cur, masks, 1);
     }
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
@@ -2155,9 +2209,18 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         const int64_t hd = hparams.n_embd_head_k(il);
         auto * residual = cur;
         cur = build_norm(cur, l.attn_norm, nullptr, LLM_NORM_RMS, il);
-        auto * q = ggml_reshape_3d(ctx0, build_lora_mm(l.wq, cur), hd, hparams.n_head(il),    n_tokens);
-        auto * k = ggml_reshape_3d(ctx0, build_lora_mm(l.wk, cur), hd, hparams.n_head_kv(il), n_tokens);
-        auto * v = ggml_reshape_3d(ctx0, build_lora_mm(l.wv, cur), hd, hparams.n_head_kv(il), n_tokens);
+        auto * q_mm = build_lora_mm(l.wq, cur);
+        auto * k_mm = build_lora_mm(l.wk, cur);
+        auto * v_mm = build_lora_mm(l.wv, cur);
+        if (fast_graph && (n_tokens == 1 || (n_tokens >= 5 && n_tokens <= 8))) {
+            // Keep wq, wk, wv adjacent after attn_norm so INKGLUE NORMQ/MMGV fuses all three with one Q8_1 quantize.
+            ggml_build_forward_expand(gf, q_mm);
+            ggml_build_forward_expand(gf, k_mm);
+            ggml_build_forward_expand(gf, v_mm);
+        }
+        auto * q = ggml_reshape_3d(ctx0, q_mm, hd, hparams.n_head(il),    n_tokens);
+        auto * k = ggml_reshape_3d(ctx0, k_mm, hd, hparams.n_head_kv(il), n_tokens);
+        auto * v = ggml_reshape_3d(ctx0, v_mm, hd, hparams.n_head_kv(il), n_tokens);
         q = build_rope(build_norm(q, l.attn_q_norm, nullptr, LLM_NORM_RMS, il), positions, il);
         k = build_rope(build_norm(k, l.attn_k_norm, nullptr, LLM_NORM_RMS, il), positions, il);
         cur = build_attn(attn, l.wo, nullptr, nullptr, q, k, v, nullptr, nullptr, nullptr, 1.0f/sqrtf(hd), il);
@@ -2170,45 +2233,159 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     res->t_embd = cur;
-    auto * base = build_lora_mm(target->output, cur, target->output_s);
-    ggml_prec_set_acc(base, GGML_PREC_F32);
-    if (!has_state || block > (int64_t) hparams.dflash_block_size) {
-        // backbone logits only (warmup, graph reserve)
-        res->t_h_nextn = cur;
-        res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
-        ggml_build_forward_expand(gf, res->t_logits);
-        return;
-    }
-    auto * state  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
-    auto * states = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
-    auto * logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, base->ne[0], nb, block*base->nb[1], 0));
-    const auto column = [&](ggml_tensor * t, int64_t i) {
-        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
-    };
-    auto * context  = column(f_rnn, 0);
-    auto * prev = ids;
+
     // the driver reads slots 1..n_max only (llama_set_dspark_walk); later slots carry the backbone logits, unused
     const int64_t walk = cparams.dspark_walk > 0 ? std::min<int64_t>(block - 1, cparams.dspark_walk) : block - 1;
     // ids_out: a walked slot carries its argmax id (as float, exact below 2^24) in state element `rank`, and the graph
     // returns no logits, so the driver skips the [n_vocab, block] copy and the host argmax
     const bool ids_out = cparams.dspark_ids_out && rank + 1 <= n_embd;
+
+    if (!has_state || block > (int64_t) hparams.dflash_block_size) {
+        // backbone logits only (warmup, graph reserve)
+        auto * base = build_lora_mm(target->output, cur, target->output_s);
+        ggml_prec_set_acc(base, GGML_PREC_F32);
+        res->t_h_nextn = cur;
+        res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
+        ggml_build_forward_expand(gf, res->t_logits);
+        return;
+    }
+
+    // Slice cur to ONLY the `walk` walked columns (cols 1..walk) when ids_out is on: skips scoring unused anchor
+    // (col 0) and tail (cols walk+1..block-1) through the 490 MB target LM head.
+    const bool slice_walk = fast_graph && ids_out && walk > 0 && walk < block;
+    ggml_tensor * cur_base = cur;
+    int64_t base_cols_per_seq = block;
+    if (slice_walk) {
+        if (nb == 1) {
+            cur_base = ggml_view_2d(ctx0, cur, n_embd, walk, cur->nb[1], cur->nb[1]);
+        } else {
+            ggml_tensor * cur3 = ggml_reshape_3d(ctx0, cur, n_embd, block, nb);
+            cur_base = ggml_reshape_2d(ctx0,
+                    ggml_cont(ctx0, ggml_view_3d(ctx0, cur3, n_embd, walk, nb, cur3->nb[1], cur3->nb[2], cur3->nb[1])),
+                    n_embd, walk * nb);
+        }
+        base_cols_per_seq = walk;
+    }
+
+    // DSpark Draft-Vocabulary Shortlist (when --spec-draft-vocab-map is active on ctx_dft):
+    // Scores ONLY the `n_sel` shortlisted rows of BOTH target->output (base) AND dspark_head_fold (markov bias),
+    // with zero duplicate weight copies for quantized target heads + full adaptive hot-slot support.
+    // Strictly gated to CUDA buffers (never CPU drafter -ngld 0, which would allocate a huge MUL_MAT_ID workspace)
+    // and bounded to nb <= 8 && cur_base->ne[1] <= 8 (avoids any 201K-expert host-sync path at --parallel > 8).
+    auto tensor_on_cuda = [](const ggml_tensor * t) -> bool {
+        if (!t || !t->buffer || !ggml_is_contiguous(t)) {
+            return false;
+        }
+        auto * buft = ggml_backend_buffer_get_type(t->buffer);
+        auto * dev  = ggml_backend_buft_get_device(buft);
+        if (!dev || buft != ggml_backend_dev_buffer_type(dev)) {
+            return false;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        return reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+    };
+    const bool has_compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == target->output &&
+            tensor_on_cuda(draft_vocab_compact);
+    const bool target_head_direct = !has_compact && tensor_on_cuda(target->output) &&
+            ggml_is_quantized(target->output->type) &&
+            ggml_ai4_rate(target->output->type) == 0 && ggml_ait_rate(target->output->type) == 0 &&
+            ggml_exl3_bits(target->output->type) == 0 &&
+            !(hadamard_rotations && hadamard_rotations->count(target->output));
+    const bool use_shortlist = use_shortlist_env && ids_out && use_fold_env &&
+            nb <= 8 && cur_base->ne[1] >= 1 && cur_base->ne[1] <= 8 && ggml_is_contiguous(cur_base) &&
+            tensor_on_cuda(model.dspark_head_fold) && model.dspark_head_fold_b != nullptr &&
+            draft_vocab_ids != nullptr && draft_vocab_ids->type == GGML_TYPE_I32 &&
+            draft_vocab_ids->ne[0] > 0 && draft_vocab_ids->ne[0] < (int64_t) hparams.n_vocab_unpadded &&
+            draft_vocab_ids->ne[1] == 1 && draft_vocab_ids->ne[2] == 1 && draft_vocab_ids->ne[3] == 1 &&
+            ggml_is_contiguous(draft_vocab_ids) &&
+            (!noise || draft_vocab_ids->ne[0] >= sk) &&
+            (!target->output_s || ggml_nelements(target->output_s) == 1) &&
+            (!loras || loras->empty()) &&
+            (has_compact || target_head_direct);
+
+    ggml_tensor * base = nullptr;
+    ggml_tensor * fold_bias_sl = nullptr;
+    ggml_tensor * ids_2d = nullptr;
+    if (use_shortlist) {
+        const int64_t n_sel   = draft_vocab_ids->ne[0];
+        const int64_t n_out_b = cur_base->ne[1];
+        if (has_compact) {
+            base = build_draft_vocab_compact(target->output, target->output_s, cur_base);
+        } else {
+            ggml_tensor * rows = ggml_reshape_3d(ctx0, target->output, target->output->ne[0], 1, target->output->ne[1]);
+            if (n_out_b >= 1 && n_out_b <= 8 && ggml_is_contiguous(cur_base)) {
+                ggml_tensor * ids_b = ggml_view_2d(ctx0, draft_vocab_ids, n_sel, 1, draft_vocab_ids->nb[1], 0);
+                if (n_out_b > 1) {
+                    ids_b->ne[1] = n_out_b; // broadcast id list across all walked columns
+                    ids_b->nb[1] = 0;
+                }
+                ggml_tensor * x3 = ggml_reshape_3d(ctx0, cur_base, cur_base->ne[0], 1, n_out_b);
+                base = ggml_reshape_2d(ctx0, ggml_mul_mat_id(ctx0, rows, x3, ids_b), n_sel, n_out_b);
+            } else {
+                for (int64_t c = 0; c < n_out_b; ++c) {
+                    ggml_tensor * h_c = ggml_view_2d(ctx0, cur_base, cur_base->ne[0], 1, cur_base->nb[1], c * cur_base->nb[1]);
+                    ggml_tensor * l_c = ggml_reshape_2d(ctx0, ggml_mul_mat_id(ctx0, rows, h_c, draft_vocab_ids), n_sel, 1);
+                    base = base ? ggml_concat(ctx0, base, l_c, 1) : l_c;
+                }
+            }
+            if (target->output_s) {
+                base = ggml_mul(ctx0, base, target->output_s);
+            }
+        }
+        ggml_prec_set_acc(base, GGML_PREC_F32);
+        // Gather fold_bias ONCE before the Markov walk loop (indexed by shortlist position 0..n_sel-1)
+        fold_bias_sl = ggml_reshape_1d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, model.dspark_head_fold_b, 1, model.dspark_head_fold_b->ne[0]), draft_vocab_ids),
+                n_sel);
+        ids_2d = ggml_reshape_2d(ctx0, draft_vocab_ids, 1, n_sel);
+    } else {
+        base = build_lora_mm(target->output, cur_base, target->output_s);
+        ggml_prec_set_acc(base, GGML_PREC_F32);
+    }
+
+    auto * state  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
+    auto * states = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
+    auto * logits = ids_out ? nullptr : ggml_cont(ctx0, ggml_view_2d(ctx0, base, base->ne[0], nb, block*base->nb[1], 0));
+    const auto column = [&](ggml_tensor * t, int64_t stride_cols, int64_t i) {
+        if (nb == 1 && fast_graph) {
+            // Single-sequence decode: column i is already contiguous -> skip redundant cpy_scalar!
+            return ggml_view_2d(ctx0, t, t->ne[0], 1, t->nb[1], i * t->nb[1]);
+        }
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, stride_cols * t->nb[1], i * t->nb[1]));
+    };
+    auto * context  = column(f_rnn, block, 0);
+    auto * prev = ids;
     for (int64_t i = 1; i < block; ++i) {
         if (i > walk) {
             states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
             if (!ids_out) {
-                logits = ggml_concat(ctx0, logits, column(base, i), 1);
+                logits = ggml_concat(ctx0, logits, column(base, block, i), 1);
             }
             continue;
         }
-        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
+        ggml_tensor * base_i = column(base, base_cols_per_seq, slice_walk ? (i - 1) : i);
+        ggml_tensor * hid_i  = column(cur, block, i);
+        auto * col = build_inkling2_head(*this, model, *target, prev, state, hid_i, base_i, context,
+                use_shortlist ? draft_vocab_ids : nullptr, fold_bias_sl, fast_graph);
         if (noise) {
             // sampled slot: Gumbel-max over the top K logits = one exact draw from softmax(logit/T) over those K
-            auto * lv   = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
-            auto * cand = ggml_cont(ctx0, ggml_top_k(ctx0, lv, sk));                                                   // I32 [K, nb]
-            auto * vals = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, lv, 1, lv->ne[0], nb), cand), sk, nb);
+            ggml_tensor * lv = use_shortlist
+                ? col
+                : ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
+            auto * cand_local = ggml_cont(ctx0, ggml_top_k(ctx0, lv, sk));                                              // I32 [K, nb]
+            auto * vals = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, lv, 1, lv->ne[0], nb), cand_local), sk, nb);
+            ggml_tensor * cand = use_shortlist
+                ? ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ids_2d, ggml_reshape_1d(ctx0, cand_local, sk * nb)), sk, nb)
+                : cand_local;
             auto * g    = ggml_view_2d(ctx0, noise, sk, nb, noise->nb[1], (i - 1)*noise->nb[2]);
             auto * pick = ggml_argmax(ctx0, ggml_add(ctx0, ggml_scale(ctx0, vals, 1.0f/cparams.dspark_sample_t), g)); // [nb]
             prev = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cand, 1, sk, nb), ggml_reshape_2d(ctx0, pick, 1, nb)), nb);
+            if (fast_graph) {
+                // Keep head -> softcap -> top_k -> remap -> gumbel-max contiguous for dspark-head.cu fusion.
+                ggml_build_forward_expand(gf, cand);
+                ggml_build_forward_expand(gf, vals);
+                ggml_build_forward_expand(gf, prev);
+            }
             auto * row = ggml_concat(ctx0, state, ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, nb), 0);
             row = ggml_concat(ctx0, row, ggml_cast(ctx0, cand, GGML_TYPE_F32), 0);
             row = ggml_concat(ctx0, row, vals, 0);
@@ -2216,7 +2393,15 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             continue;
         }
         // first maximum of the slot (the CUDA and CPU argmax both keep the lowest index on ties, like the host argmax)
-        prev = ggml_argmax(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0)));
+        if (use_shortlist) {
+            auto * argmax_sl = ggml_argmax(ctx0, col);
+            prev = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ids_2d, argmax_sl), nb);
+        } else {
+            prev = ggml_argmax(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0)));
+        }
+        if (fast_graph && ids_out) {
+            ggml_build_forward_expand(gf, prev);
+        }
         if (ids_out) {
             auto * id = ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, nb);
             states = ggml_concat(ctx0, states, ggml_pad(ctx0, ggml_concat(ctx0, state, id, 0), n_embd - rank - 1, 0, 0, 0), 1);

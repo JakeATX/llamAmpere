@@ -1,4 +1,5 @@
 #include "loop-gate.cuh"
+#include "inklg_vec.cuh"
 #include "convert.cuh"
 
 #define LOOP_GATE_CHUNKS 8   // chunks per input half (x, m); one warp each
@@ -198,6 +199,10 @@ static void loop_gate_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 void ggml_cuda_loop_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_loop_gate_supported(dst));
     if (dst->src[0]->ne[1] == 0) {
+        return;
+    }
+    ggml_tensor * g1[1] = { dst };
+    if (ggml_cuda_ink_loop_gate_vec(ctx, g1, 1)) {
         return;
     }
     switch (dst->src[2]->type) {

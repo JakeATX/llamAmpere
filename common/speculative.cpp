@@ -1006,8 +1006,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_lilicorr    = false;
     int32_t lilicorr_top_k = 0;
     size_t lilicorr_rows = 0;
-    std::vector<float> lilicorr_embd;
-    std::vector<llama_pos> lilicorr_pos;
+    mutable std::vector<float> lilicorr_embd;
+    mutable std::vector<llama_pos> lilicorr_pos;
+
+    // [T5-IDLE] H1: device-side target feature injection via layer_inp_dev + add_embd_row (LLAMA_DSPARK_DEV_INJECT=0 = host copy)
+    bool         use_dev_inject = false;
+    common_batch batch_inject_dev;
+
+    // [T5-IDLE] H2: async DSpark process() overlap with post_decode() (LLAMA_DSPARK_ASYNC_PROCESS=0 = sync inside process())
+    bool                           async_rnn_process = false;
+    mutable bool                   pending_rnn_valid = false;
+    mutable llama_seq_id           pending_rnn_seq   = 0;
+    mutable std::vector<llama_pos> pending_rnn_pos;
 
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
@@ -1219,12 +1229,45 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // turn on extraction of the target layers' input embeddings
         // (Inkling2 DSpark: id n_layer_tgt is the final normed state, layer input index n_layer of the target graph)
+        bool all_layer_inp_ascending = target_layer_ids_n > 0;
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            if (k > 0 && target_layer_ids[k] <= target_layer_ids[k - 1]) {
+                all_layer_inp_ascending = false;
+            }
             if (target_layer_ids[k] == n_layer_tgt && !has_rnn_context) {
                 llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+                all_layer_inp_ascending = false;
             } else {
                 llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
             }
+        }
+
+        // [T5-IDLE] H1: keep target layer features on device (eliminates 4x46KB D2H + 4 syncs + CPU memcpy + 4x184KB H2D per round)
+        // Kill switch: LLAMA_DSPARK_DEV_INJECT=0
+        static const bool dev_inject_env = [] {
+            const char * e = std::getenv("LLAMA_DSPARK_DEV_INJECT");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        if (dev_inject_env && all_layer_inp_ascending) {
+            llama_set_embeddings_layer_inp_dev(ctx_tgt, true);
+            use_dev_inject = llama_supports_embd_row(ctx_dft);
+            if (use_dev_inject) {
+                batch_inject_dev = common_batch(ctx_dft);
+                LOG_INF("%s: device-side target feature injection enabled (LLAMA_DSPARK_DEV_INJECT=0 to disable)\n", __func__);
+            } else {
+                llama_set_embeddings_layer_inp_dev(ctx_tgt, false);
+            }
+        }
+
+        // [T5-IDLE] H2: defer p35 context-feature readback/sync until draft()/get_state() so p35 overlaps CPU post_decode()
+        // Kill switch: LLAMA_DSPARK_ASYNC_PROCESS=0
+        static const bool async_process_env = [] {
+            const char * e = std::getenv("LLAMA_DSPARK_ASYNC_PROCESS");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        async_rnn_process = async_process_env && (is_lilicorr || has_rnn_context);
+        if (async_rnn_process) {
+            LOG_INF("%s: async DSpark process() overlap enabled (LLAMA_DSPARK_ASYNC_PROCESS=0 to disable)\n", __func__);
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
@@ -1246,6 +1289,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        flush_pending_rnn();
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1262,7 +1306,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_batch_free(batch_inject);
     }
 
+    void flush_pending_rnn() const {
+        if (!pending_rnn_valid) {
+            return;
+        }
+        pending_rnn_valid = false;
+        auto * ctx_dft = this->params.ctx_dft;
+        if (ctx_dft && !pending_rnn_pos.empty()) {
+            const float * projected = llama_get_embeddings_nextn(ctx_dft);
+            if (projected) {
+                const int32_t n_chunk = (int32_t) pending_rnn_pos.size();
+                const size_t seq_offset = (size_t) pending_rnn_seq * lilicorr_rows;
+                const llama_pos pos_min = std::max<llama_pos>(0, pending_rnn_pos[n_chunk - 1] - block_size);
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const llama_pos pos = pending_rnn_pos[i];
+                    if (pos < pos_min) {
+                        continue;
+                    }
+                    const size_t slot = seq_offset + (size_t) pos % lilicorr_rows;
+                    std::memcpy(lilicorr_embd.data() + slot * (size_t) n_embd_dec,
+                            projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                    lilicorr_pos[slot] = pos;
+                }
+            }
+        }
+        pending_rnn_pos.clear();
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        flush_pending_rnn();
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1289,6 +1361,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        flush_pending_rnn();
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1332,6 +1405,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        const bool dev_inject_ok = use_dev_inject && n_tokens <= (int32_t) llama_n_batch(ctx_tgt);
+
+        llama_seq_id last_active_seq = -1;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
+            if (has_embeddings && n_rows > 1 && pos_pinned) {
+                continue;
+            }
+            last_active_seq = seq_id;
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1349,36 +1436,49 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather target features per extract layer; the fused decode encodes and
-                // injects them into the K/V cache at the target positions
-                batch_inject.n_tokens = n_chunk;
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = target_layer_ids[k] == n_layer_tgt && !has_rnn_context
-                        ? llama_get_embeddings_nextn(ctx_tgt)
-                        : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
+                int32_t rc = 0;
+                if (dev_inject_ok) {
+                    // [T5-IDLE] H1: inject directly from ctx_tgt's layer_inp_dev buffer on device (zero D2H/H2D copy)
+                    batch_inject_dev.clear();
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        const int32_t row = i_batch_beg[seq_id] + offset + i;
+                        const llama_pos p = batch_in.pos[row];
+                        const llama_pos pos_arr[4] = { p, p, p, 0 };
+                        batch_inject_dev.add_embd_row(row, pos_arr, seq_id, false);
                     }
-                }
+                    rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject_dev.get());
+                } else {
+                    // gather target features per extract layer; the fused decode encodes and
+                    // injects them into the K/V cache at the target positions
+                    batch_inject.n_tokens = n_chunk;
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * layer = target_layer_ids[k] == n_layer_tgt && !has_rnn_context
+                            ? llama_get_embeddings_nextn(ctx_tgt)
+                            : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        }
+                    }
 
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                    batch_inject.pos[i] = p;
-                    if (is_mrope) {
-                        batch_inject.pos[1 * n_chunk + i] = p;
-                        batch_inject.pos[2 * n_chunk + i] = p;
-                        batch_inject.pos[3 * n_chunk + i] = 0;
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                        batch_inject.pos[i] = p;
+                        if (is_mrope) {
+                            batch_inject.pos[1 * n_chunk + i] = p;
+                            batch_inject.pos[2 * n_chunk + i] = p;
+                            batch_inject.pos[3 * n_chunk + i] = 0;
+                        }
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
                     }
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
+                    rc = llama_decode(ctx_dft, batch_inject);
                 }
-                const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1387,19 +1487,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (is_lilicorr || has_rnn_context) {
                     // Ordinary DFlash can write to the KV cache, but LiliCorr needs to store embeddings across sequences.
                     // Inkling2 DSpark keeps the committed boundary when the target rejects part of a verification batch.
-                    const float * projected = llama_get_embeddings_nextn(ctx_dft);
-                    if (projected) {
-                        const size_t seq_offset = (size_t) seq_id * lilicorr_rows;
-                        const llama_pos pos_min = std::max(0, batch_inject.pos[n_chunk - 1] - block_size);
+                    const bool is_last_chunk = (seq_id == last_active_seq) && (offset + n_chunk >= n_rows);
+                    if (async_rnn_process && is_last_chunk) {
+                        // [T5-IDLE] H2: let p35 run asynchronously while post_decode() runs on CPU;
+                        // flush_pending_rnn() completes the readback before draft()/get_state()/next process().
+                        pending_rnn_pos.resize(n_chunk);
                         for (int32_t i = 0; i < n_chunk; ++i) {
-                            const llama_pos pos = batch_inject.pos[i];
-                            if (pos < pos_min) {
-                                continue;
+                            pending_rnn_pos[i] = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                        }
+                        pending_rnn_seq   = seq_id;
+                        pending_rnn_valid = true;
+                    } else {
+                        const float * projected = llama_get_embeddings_nextn(ctx_dft);
+                        if (projected) {
+                            const size_t seq_offset = (size_t) seq_id * lilicorr_rows;
+                            const llama_pos pos_min = std::max<llama_pos>(0, batch_in.pos[i_batch_beg[seq_id] + offset + n_chunk - 1] - block_size);
+                            for (int32_t i = 0; i < n_chunk; ++i) {
+                                const llama_pos pos = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                                if (pos < pos_min) {
+                                    continue;
+                                }
+                                const size_t slot = seq_offset + (size_t) pos % lilicorr_rows;
+                                std::memcpy(lilicorr_embd.data() + slot * (size_t) n_embd_dec,
+                                        projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                                lilicorr_pos[slot] = pos;
                             }
-                            const size_t slot = seq_offset + (size_t) pos % lilicorr_rows;
-                            std::memcpy(lilicorr_embd.data() + slot * (size_t) n_embd_dec,
-                                    projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
-                            lilicorr_pos[slot] = pos;
                         }
                     }
                 }
@@ -1410,6 +1522,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        flush_pending_rnn();
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1825,6 +1938,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        flush_pending_rnn();
         const size_t bytes = get_state_size(seq_id);
         if (bytes == 0) {
             return false;
@@ -1838,6 +1952,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        flush_pending_rnn();
         const size_t bytes = get_state_size(seq_id);
         if (bytes == 0) {
             return;
@@ -5011,6 +5126,9 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    const bool spec_dspark = has_draft && std::find(params.speculative.types.begin(),
+                                                    params.speculative.types.end(),
+                                                    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         if (!has_draft) {
@@ -5020,10 +5138,25 @@ common_speculative_init_result::common_speculative_init_result(
                         __func__, cparams.draft_attn_window, cparams.draft_attn_sink);
             }
         }
+    }
+    if (spec_mtp) {
         if (!params.speculative.draft.vocab_map.empty() && params.speculative.draft.vocab_map != "none") {
             cparams.draft_vocab_map = params.speculative.draft.vocab_map.c_str();
             cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;
             LOG_INF("%s: MTP draft context uses the draft-only vocabulary shortlist '%s'\n", __func__, cparams.draft_vocab_map);
+            if (cparams.draft_vocab_hot > 0) {
+                LOG_INF("%s: the last %d entries of the shortlist are adaptive hot slots\n", __func__, cparams.draft_vocab_hot);
+            }
+        }
+    } else if (spec_dspark) {
+        // DSpark has no built-in shortlist for 'auto'; only forward an explicit shortlist file path so
+        // init_draft_vocab never logs a misleading 'auto' shortlist message when none exists.
+        const std::string & vmap = params.speculative.draft.vocab_map;
+        const bool is_auto = vmap == "auto" || vmap.rfind("auto:", 0) == 0;
+        if (!vmap.empty() && vmap != "none" && !is_auto) {
+            cparams.draft_vocab_map = vmap.c_str();
+            cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;
+            LOG_INF("%s: DSpark draft context uses the draft-only vocabulary shortlist '%s'\n", __func__, cparams.draft_vocab_map);
             if (cparams.draft_vocab_hot > 0) {
                 LOG_INF("%s: the last %d entries of the shortlist are adaptive hot slots\n", __func__, cparams.draft_vocab_hot);
             }

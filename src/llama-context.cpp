@@ -544,9 +544,16 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     // draft-only vocabulary shortlist: parsed once, kept as a persistent I32 map on the head's device
     {
         const char * path = params.draft_vocab_map;
-        // fork: the legacy environment override also replaces the resolved automatic shortlist.
-        if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0 || std::strcmp(path, "auto:rm24h") == 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        const bool is_dspark_ctx = model.arch == LLM_ARCH_DFLASH && model.hparams.dspark_markov_rank > 0;
+        // fork: legacy LLAMA_SPEC_DRAFT_VOCAB applies only to MTP contexts (never silently activates on DSpark);
+        // DSpark uses explicit --spec-draft-vocab-map <file> or dedicated LLAMA_DSPARK_VOCAB_MAP=<file>.
+        if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0 || std::strcmp(path, "auto:rm24h") == 0) &&
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
             if (const char * env = getenv("LLAMA_SPEC_DRAFT_VOCAB"); env != nullptr && env[0] != '\0') {
+                path = env;
+            }
+        } else if (is_dspark_ctx && (path == nullptr || path[0] == '\0')) {
+            if (const char * env = getenv("LLAMA_DSPARK_VOCAB_MAP"); env != nullptr && env[0] != '\0') {
                 path = env;
             }
         }
@@ -1870,12 +1877,20 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
                     path, (long long) map.n_vocab, (long long) n_vocab));
     }
 
-    // the map lives next to the head it indexes
+    // the map lives next to the head it indexes (DSpark borrows the target model's output head via ctx_other)
     const ggml_tensor * head = model.output;
+    const llama_model * head_model = &model;
     if (model.hparams.n_layer_nextn > 0 && model.hparams.n_layer() < model.layers.size()) {
         const auto & nextn = model.layers[model.hparams.n_layer()].nextn;
         if (nextn.shared_head_head) {
             head = nextn.shared_head_head;
+        }
+    }
+    if (head == nullptr && model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr) {
+        const llama_model * model_other = llama_get_model(cparams.ctx_other);
+        if (model_other != nullptr) {
+            head = model_other->output;
+            head_model = model_other;
         }
     }
     if (head == nullptr || head->buffer == nullptr) {
@@ -1900,7 +1915,7 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
         const bool is_exl3 = ggml_exl3_bits(head->type) != 0;
         const bool is_ai   = ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0; // AI+ tiles too
         const bool full_head = llama_draft_vocab_full_head(head);
-        const bool want = !model.no_alloc() && !model.hadamard_rotations.count(head) &&
+        const bool want = !head_model->no_alloc() && !head_model->hadamard_rotations.count(head) &&
                 !full_head && n_sel < head->ne[1] && (force == 1 || (force != 0 && (is_exl3 || is_ai)));
         if (full_head) {
             LLAMA_LOG_WARN("%s: draft shortlist uses existing %s head (%s), no compact weight copy\n",
@@ -4080,6 +4095,30 @@ void llama_context::layer_inp_dev_alloc() {
     layer_inp_dev_dev = model.dev_output();
     auto * buft = layer_inp_dev_dev ? ggml_backend_dev_buffer_type(layer_inp_dev_dev) : ggml_backend_cpu_buffer_type();
 
+    // [T5-IDLE] H1 small-card VRAM headroom guard: when not explicitly forced via LLAMA_DSPARK_DEV_INJECT=1,
+    // require at least LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB (default 512 MiB) free VRAM after allocation so
+    // tight 8/10/12 GB cards (including --fit off) keep CUDA Graph/pool headroom and fall back cleanly to host copies.
+    if (layer_inp_dev_dev && !ggml_backend_buft_is_host(buft)) {
+        const char * force_e = std::getenv("LLAMA_DSPARK_DEV_INJECT");
+        const bool   forced  = force_e != nullptr && std::atoi(force_e) > 0;
+        if (!forced) {
+            const char * min_e = std::getenv("LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB");
+            const size_t min_free_bytes = (size_t) (min_e ? std::max(0, std::atoi(min_e)) : 512) << 20;
+            const size_t need_bytes = ggml_nbytes(layer_inp_dev);
+            size_t free_mem = 0, total_mem = 0;
+            ggml_backend_dev_memory(layer_inp_dev_dev, &free_mem, &total_mem);
+            if (total_mem > 0 && free_mem < need_bytes + min_free_bytes) {
+                LLAMA_LOG_INFO("%s: skipping %.2f MiB layer_inp_dev (free %.2f MiB < need + %.2f MiB headroom; set LLAMA_DSPARK_DEV_INJECT=1 to force)\n",
+                        __func__, need_bytes / 1048576.0, free_mem / 1048576.0, min_free_bytes / 1048576.0);
+                cparams.embeddings_layer_inp_dev = false;
+                layer_inp_dev     = nullptr;
+                layer_inp_dev_dev = nullptr;
+                ctx_layer_inp_dev.reset();
+                return;
+            }
+        }
+    }
+
     buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(), buft));
     if (!buf_layer_inp_dev) {
         // e.g. a large n_batch that does not fit next to the model, keep the host copies
@@ -5437,8 +5476,16 @@ build_graph:
         const char * v = getenv("LLAMA_MTP_PLAN_SLOTS");
         return v == nullptr || strcmp(v, "0") != 0; // default on; =0 turns it off
     }();
+    // [T5-IDLE] H4: also enable 2-slot scheduler plans for DFlash/DSpark (slot 0 = process/inject p35, slot 1 = draft dr)
+    // Kill switch: LLAMA_DSPARK_PLAN_SLOTS=0
+    static const bool dspark_plan_slots_env = [] {
+        const char * v = getenv("LLAMA_DSPARK_PLAN_SLOTS");
+        return v == nullptr || strcmp(v, "0") != 0; // default on; =0 turns it off
+    }();
     int plan_slot = -1;
-    if (plan_slots_env && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !graph_reuse_disable && !b1_cur.active &&
+    const bool use_plan_slots = plan_slots_env &&
+        (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (dspark_plan_slots_env && model.arch == LLM_ARCH_DFLASH));
+    if (use_plan_slots && !graph_reuse_disable && !b1_cur.active &&
             !cparams.pipeline_parallel) {
         if (gf_res_prev_active == nullptr) {
             plan_res.fill(nullptr);
@@ -10412,6 +10459,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     }
     if (mtp_feedback.buf) {
         ret[ggml_backend_buffer_get_type(mtp_feedback.buf.get())].context += ggml_backend_buffer_get_size(mtp_feedback.buf.get());
+    }
+    if (buf_layer_inp_dev) {
+        ret[ggml_backend_buffer_get_type(buf_layer_inp_dev.get())].context += ggml_backend_buffer_get_size(buf_layer_inp_dev.get());
+    }
+    if (buf_h_nextn_dev) {
+        ret[ggml_backend_buffer_get_type(buf_h_nextn_dev.get())].context += ggml_backend_buffer_get_size(buf_h_nextn_dev.get());
     }
     if (model.no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {

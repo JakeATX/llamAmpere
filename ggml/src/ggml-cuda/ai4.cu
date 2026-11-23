@@ -5,6 +5,9 @@
 #include "inkpreq.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
+#include "ai4-turbo.cuh"
+#include "ai4-exp-turbo.cuh"
+#include "ai4-decode-fast.cuh"
 #include "magic2-v2.cuh"
 #include "aif25-mmq.cuh"
 #include "../ggml-aif25.h"
@@ -274,6 +277,17 @@ static void ai4_ampere_width(const uint8_t * W, const int8_t * q, const float * 
     }
 }
 
+// AI+ Turbo v3 gemm_s8_lowreg (ID=true: 128 regs, 2 CTAs/SM, bitwise = rc ai23 ID GEMM) for AIT4_U expert prefill,
+// GGML_CUDA_AI4_LOWREG_ID_MIN_N (64) <= n_tok <= GGML_CUDA_AI4_LOWREG_ID_MAX_N (1024). Kill switch GGML_CUDA_AI4_LOWREG_ID=0. Needs 64-route tiles (forces bn 64).
+static bool ai4_lowreg_id(int n_tok) {
+    static const bool v = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID", nullptr, 1) != 0;
+    static const int mn = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID_MIN_N", nullptr, 64);
+    // in-graph Taichi 3090 (tail_skip on), Inkling gate_up+down per visit: N=512 1481.8 -> 1057.6 us (-28.6%),
+    // N=2048 2874.0 -> 2845.2 (-1.0%), N=4096 5325.1 -> 5505.3 (+3.4%); end-to-end 3090 Ti ub 2048 = tie (+0.2% / -0.3%),
+    // ub 1024 +1.13%: cap 1024 (never slower by default; UBDEFAULT Inkling ceiling is 1024)
+    static const int mx = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID_MAX_N", nullptr, 1024);
+    return v && n_tok >= mn && n_tok <= mx;
+}
 static int ai4_bn128_min() {
     static const int v = ai4_env_int("GGML_CUDA_AI4_BN128_MIN", nullptr, 512);
     return v;
@@ -1035,6 +1049,9 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     float  * xs_p = nullptr;
     if (t == GGML_TYPE_AIT2P_U) {
         ai4_prep(ctx, key, X, N, K, xsh, AI4_PREP_PLAIN, qa, sa, xq_p, xs_p);
+        if (N <= 8 && ggml_cuda_ai4_decode_fast_unit_try(ctx, t, W, 0, nullptr, xq_p, xs_p, Y, M, N, K, 1, 1, 1, xsh, false)) {
+            return;
+        }
         if (xsh) { ai2p_mm_kernels<1>(W, xq_p, xs_p, Y, M, N, K, stream); }
         else     { ai2p_mm_kernels<0>(W, xq_p, xs_p, Y, M, N, K, stream); }
         return;
@@ -1169,6 +1186,10 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
             }
             return;
         }
+    }
+    if (N <= 8 && !swap8 && !xperm &&
+            ggml_cuda_ai4_decode_fast_unit_try(ctx, t, W, 0, nullptr, xq_p, xs_p, Y, M, N, K, 1, 1, 1, xsh, false)) {
+        return;
     }
     switch (ai4_lay_of(t)) {
 #define AI4_MM_U(L) \
@@ -1448,6 +1469,16 @@ bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (t != GGML_TYPE_AIT4_U && t != GGML_TYPE_AIT5_U && t != GGML_TYPE_AIT2_U && t != GGML_TYPE_AIT3_U) {
         return false;
     }
+    // decode-fast (default ON) takes every member of a group on Ampere (same N <= 8, M % 16, K % 128 guards):
+    // leave them to the single path so grouped layers get decode-fast too (GGML_CUDA_AI4_DECODE_FAST=0 restores grouping;
+    // GGML_CUDA_AI4_DF_GROUP_BAIL=0 keeps the rc7 grouped launch with decode-fast on elsewhere, for A/B)
+    static const bool df_bail = ai4_env_int("GGML_CUDA_AI4_DF_GROUP_BAIL", nullptr, 1) != 0;
+    if (df_bail && ggml_cuda_ai4_decode_fast_enabled()) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
+            return false;
+        }
+    }
     if (ai4_ref_only_type(t) || ai4_mmv_stages() != 2 || ai4_mmv_xsmem()) {
         return false;
     }
@@ -1659,6 +1690,12 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
     } else if (bn == 128) {
         ai23_launch_id_gemm<128, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     } else {
+        if constexpr (LAY == ai4k::LAY_AIT4_U) {
+            if (sms && ai4_lowreg_id(n_tok)) {
+                ai4_turbo::launch_gemm_s8_lowreg<LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles, sms);
+                return;
+            }
+        }
         ai23_launch_id_gemm<64, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     }
 }
@@ -1761,6 +1798,23 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int8_t * const xq = pre ? pre_q : q_buf.get();
     const float  * const xs = pre ? pre_s : s_buf.get();
 
+    // [INK200 T1] Ampere SM 8.0+ SpecDecode grouped expert turbo (M = 2..32; M = 1 stays untouched on mmvr).
+    // M = 2..8 (n_pairs <= 64): zero-ids_helper direct-grouped Split-K; M = 9..32: zero-static-SMEM grouped Split-K
+    // with per-visit ids_helper cache shared across gate_up & down. Kill switch: GGML_CUDA_AI4_EXP_TURBO=0.
+    if (!ampere_grouped && !fused && sms &&
+            ggml_cuda_ai4_exp_turbo_try(ctx, src0, ids, xq, xs, y_out, M, K, n_tok, n_used, ne11,
+                                        n_expert, xsh, y_into != nullptr, ai4_id_skip_on())) {
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // AI+ decode-fast (6-rate, N <= 8) for what T1 declines: N == 1, AIT5_U/AIT2P_U at N 2..8, everything when EXP_TURBO=0.
+    // It rejects n_pairs > 64 and non-Ampere itself. Kill switch GGML_CUDA_AI4_DECODE_FAST=0.
+    if (!fused && n_tok <= 8 && ggml_cuda_ai4_decode_fast_unit_try(
+            ctx, src0->type, (const uint8_t *) src0->data, (int64_t) src0->nb[2], ids,
+            xq, xs, y_out, M, n_tok, K, n_used, ne11, n_expert, xsh, y_into != nullptr)) {
+        return;
+    }
+
     // mmv-ID (n_tok <= 8) takes tiles of MMV_ID_BN pairs, so an expert repeated within a token still fits
     int bn = ai4_mmvid_route(n_tok, n_used, n_expert, ggml_ai4_rate(src0->type)) ? ai4k::MMV_ID_BN : (n_tok >= ai4_bn128_min() ? 128 : 64);
     // fork: keep decode and sparse MMV routing unchanged; size the helper and GEMM from the same tile width.
@@ -1791,6 +1845,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ampere_grouped) {
         bn = ai4_ampere_bn(n_tok);
+    } else if (sms && src0->type == GGML_TYPE_AIT4_U && bn != ai4k::MMV_ID_BN && !direct && ai4_lowreg_id(n_tok)) {
+        bn = 64;   // gemm_s8_lowreg consumes 64-route tiles
     }
     static const bool tight_grid = ai4_env_int("GGML_CUDA_AI23_ID_TIGHT_GRID", nullptr, 0) != 0;
     const bool tight = tight_grid && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
@@ -3302,6 +3358,9 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
         }
         return;
     }
+    if (ggml_cuda_ai4_decode_fast_frac_try(ctx, w->type, xsh, wd, qp, sp, y, M, K, N)) {
+        return;
+    }
     aif25_mmv_type(w->type, xsh, wd, qp, sp, y, M, K, N, stream);
 }
 
@@ -3382,7 +3441,9 @@ void ggml_cuda_mul_mat_id_aif_rows(ggml_backend_cuda_context & ctx, ggml_tensor 
     const dim3 gs((n_sel + 255)/256, n_out);
     k_aif_rows_mark<<<gs, 256, 0, stream>>>((const int32_t *) ids->data, ids->nb[1], n_sel, n_out, n_rows, mask.get());
     CUDA_CHECK(cudaGetLastError());
-    aif25_mmv_type(w->type, xsh, (const uint8_t *) w->data, qp, sp, y.get(), n_rows, K, n_out, stream, mask.get());
+    if (!ggml_cuda_ai4_decode_fast_frac_try(ctx, w->type, xsh, (const uint8_t *) w->data, qp, sp, y.get(), n_rows, K, n_out, mask.get())) {
+        aif25_mmv_type(w->type, xsh, (const uint8_t *) w->data, qp, sp, y.get(), n_rows, K, n_out, stream, mask.get());
+    }
     k_aif_rows_gather<<<gs, 256, 0, stream>>>(y.get(), (const int32_t *) ids->data, ids->nb[1], n_sel, n_rows,
                                               (float *) dst->data, dst->nb[2]);
     CUDA_CHECK(cudaGetLastError());

@@ -47,7 +47,9 @@ constexpr __host__ __device__ int ampere_mmv_stage_bytes() {
 
 template <int BN, int LAY, int WARPS>
 constexpr __host__ __device__ int ampere_mmv_smem_bytes() {
-    return WARPS*2*ampere_mmv_stage_bytes<BN, LAY>();
+    const int ring_b = WARPS*2*ampere_mmv_stage_bytes<BN, LAY>();
+    const int red_b  = (WARPS - 1)*(BN/8)*4*32*4;
+    return ring_b > red_b ? ring_b : red_b;
 }
 
 // One slab per block keeps narrow batches distributed across the SMs. Each decoded A fragment serves all token groups.
@@ -66,7 +68,6 @@ static __global__ void __launch_bounds__(WARPS*32, 1) ampere_mmv(
     constexpr int CHB = ch_bytes<LAY>();
     constexpr int ST = ampere_mmv_stage_bytes<BN, LAY>();
     extern __shared__ __align__(16) uint8_t smem[];
-    __shared__ float red[WARPS - 1][NTI][4][32];
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -206,12 +207,15 @@ static __global__ void __launch_bounds__(WARPS*32, 1) ampere_mmv(
         for (int i = 0; i < nmy; ++i) step(i, i & 1);
     }
     cp_async_wait<0>();
+    // Reuse dead cp.async ring smem for warp reduction (saves 3..28 KB static SMEM/CTA; bit-identical sum order).
+    __syncthreads();
+    float * red = (float *) smem;
     if (warp > 0) {
 #pragma unroll
         for (int nt = 0; nt < NTI; ++nt) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                red[warp - 1][nt][e][lane] = acc[nt][e];
+                red[(((warp - 1)*NTI + nt)*4 + e)*32 + lane] = acc[nt][e];
             }
         }
     }
@@ -223,7 +227,7 @@ static __global__ void __launch_bounds__(WARPS*32, 1) ampere_mmv(
             for (int w = 0; w < WARPS - 1; ++w) {
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    acc[nt][e] += red[w][nt][e][lane];
+                    acc[nt][e] += red[((w*NTI + nt)*4 + e)*32 + lane];
                 }
             }
             const int r = slab*16 + g;
@@ -245,8 +249,7 @@ template <int BN, int LAY = LAY_AIT4_U, int XSH = 1, bool ID = false, int WARPS 
 static void launch_ampere_mmv(const uint8_t * W, const int8_t * Xq, const float * Xs, float * Y, int64_t ldy,
                                int M, int N, int K, cudaStream_t stream, const idmap & idm = idmap{}, int max_tiles = 1) {
     constexpr int smem = ampere_mmv_smem_bytes<BN, LAY, WARPS>();
-    constexpr int red_bytes = (WARPS - 1)*(BN/8)*4*32*4;
-    if constexpr (smem + red_bytes > 48*1024) {
+    if constexpr (smem > 48*1024) {
         static bool attr_set[64] = {};
         int dev = 0;
         CUDA_CHECK_AI4K(cudaGetDevice(&dev));

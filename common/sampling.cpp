@@ -1452,14 +1452,24 @@ std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_a
     }
     if (total <= 0.0) { return law; }
     // Exact verification emits p. Rescue redirects each rejected-draft/replacement pair's
-    // joint mass, excess[d] * residual[y] / total, from y to d when p(d) >= p(y).
+    // joint mass, excess[d] * residual[y] / total, from y to d when kappa * p(d) >= p(y), scaled by alpha.
     // Drafts outside p have p(d)=0 and cannot beat a positive residual replacement.
+    static const double mb_kappa = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_KAPPA");
+        const double v = e && *e ? std::atof(e) : 1.0;
+        return (v >= 1.0 && std::isfinite(v)) ? v : 1.0;
+    }();
+    static const double mb_alpha = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_ALPHA");
+        const double v = e && *e ? std::atof(e) : 1.0;
+        return (v >= 0.0 && v <= 1.0 && std::isfinite(v)) ? v : 1.0;
+    }();
     for (size_t d = 0; d < p.size; ++d) {
-        if (excess[d] <= 0.0 || (is_stop && is_stop(p.data[d].id))) { continue; }
+        if (excess[d] <= 0.0 || p.data[d].p <= 0.0f || (is_stop && is_stop(p.data[d].id))) { continue; }
         for (size_t y = 0; y < p.size; ++y) {
-            if (residual[y] <= 0.0 || p.data[d].p < p.data[y].p ||
+            if (residual[y] <= 0.0 || mb_kappa * (double) p.data[d].p < (double) p.data[y].p ||
                     (is_stop && is_stop(p.data[y].id))) { continue; }
-            const double moved = excess[d] * residual[y] / total;
+            const double moved = mb_alpha * excess[d] * residual[y] / total;
             law[d] += moved;
             law[y] -= moved;
         }
@@ -1471,7 +1481,39 @@ template<bool cache_q, bool beat>
 static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
         llama_token d, llama_token x, std::mt19937 & rng, common_sampler_pq_stats & stats,
         const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
+    // [T5-IDLE] H6: stack-allocated open-addressed hash table for O(1) q lookup when p is wide (e.g. top_k=0)
+    // and |q| <= 32, avoiding O(|p|*|q|) linear scan with zero heap allocation and bit-identical results.
+    constexpr size_t Q_HASH_SIZE = 64;
+    constexpr size_t Q_HASH_MASK = Q_HASH_SIZE - 1;
+    const bool use_q_hash = p.size > 16 && q.size() >= 8 && q.size() <= 32;
+    llama_token q_hash_keys[Q_HASH_SIZE];
+    double      q_hash_vals[Q_HASH_SIZE];
+    if (use_q_hash) {
+        for (size_t s = 0; s < Q_HASH_SIZE; ++s) {
+            q_hash_keys[s] = LLAMA_TOKEN_NULL;
+        }
+        for (const auto & c : q) {
+            size_t slot = ((uint32_t) c.id * 2654435761u) & Q_HASH_MASK;
+            while (q_hash_keys[slot] != LLAMA_TOKEN_NULL && q_hash_keys[slot] != c.id) {
+                slot = (slot + 1) & Q_HASH_MASK;
+            }
+            if (q_hash_keys[slot] == LLAMA_TOKEN_NULL) {
+                q_hash_keys[slot] = c.id;
+                q_hash_vals[slot] = c.p;
+            }
+        }
+    }
     auto q_of = [&](llama_token id) -> double {
+        if (use_q_hash) {
+            size_t slot = ((uint32_t) id * 2654435761u) & Q_HASH_MASK;
+            while (q_hash_keys[slot] != LLAMA_TOKEN_NULL) {
+                if (q_hash_keys[slot] == id) {
+                    return q_hash_vals[slot];
+                }
+                slot = (slot + 1) & Q_HASH_MASK;
+            }
+            return 0.0;
+        }
         for (const auto & c : q) {
             if (c.id == id) {
                 return c.p;
@@ -1552,7 +1594,21 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
     const auto ends = [&](llama_token id) {
         return (vocab && llama_vocab_is_eog(vocab, id)) || (is_stop && is_stop(id));
     };
-    if (beat && !ends(d) && !ends(res.replacement) && p_d >= res.p_replacement) {
+    // Bounded-KL mode-biasing (OPT7): defaults (kappa=1.0, alpha=1.0) are bit-identical to stock p_d >= p_replacement.
+    // Opt-in knobs: LLAMA_SPEC_MB_KAPPA (e.g. 3.0) allows rescuing when kappa * p_d >= p_replacement (bounded ratio <= kappa),
+    // LLAMA_SPEC_MB_ALPHA (e.g. 0.5) throttles rescue probability to keep KL bounded.
+    static const double mb_kappa = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_KAPPA");
+        const double v = e && *e ? std::atof(e) : 1.0;
+        return (v >= 1.0 && std::isfinite(v)) ? v : 1.0;
+    }();
+    static const double mb_alpha = [] {
+        const char * e = std::getenv("LLAMA_SPEC_MB_ALPHA");
+        const double v = e && *e ? std::atof(e) : 1.0;
+        return (v >= 0.0 && v <= 1.0 && std::isfinite(v)) ? v : 1.0;
+    }();
+    if (beat && !ends(d) && !ends(res.replacement) && p_d > 0.0 && mb_kappa * p_d >= res.p_replacement &&
+            (mb_alpha >= 1.0 || uniform(rng) < mb_alpha)) {
         res.id = d;
         res.accepted = true;
         res.rescued = true;
