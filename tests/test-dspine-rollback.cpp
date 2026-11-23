@@ -58,9 +58,19 @@ static double nmse(const float * a, const float * b, int n) {
     return r > 0.0 ? e / r : e;
 }
 
-// rounds: kept[r] = accepted drafts of round r (0..15). Returns the worst nmse, or +inf on an error.
-static double run(const common_params & params, llama_model * model, bool gdn_replay, const std::vector<int32_t> & kept,
+// rounds: kept[r] = accepted drafts of round r (0..15). worst = the worst nmse, or +inf on an error.
+// [DSPINE4] seg_worst: the same probe vs a rollback-free reference decoded in the tested context's segment shapes
+// (prefix, then per round the 1 + a kept rows as one batch and the 1-row probe); floor_worst: one-batch reference vs that
+// segmented reference (the batch-shape rounding between two contexts that never roll back).
+struct run_result {
+    double worst = 0.0, seg_worst = 0.0, floor_worst = 0.0;
+};
+
+static run_result run(const common_params & params, llama_model * model, bool gdn_replay, const std::vector<int32_t> & kept,
         uint32_t seed, int n_vocab) {
+    run_result res;
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<std::vector<llama_token>> segs; // the tested context's kept segments, in decode order
     std::mt19937 g(seed);
     std::uniform_int_distribution<int32_t> tok(1, std::max(2, std::min(n_vocab - 1, 1000)));
     std::vector<llama_token> prefix(12);
@@ -71,17 +81,20 @@ static double run(const common_params & params, llama_model * model, bool gdn_re
     llama_context * ctx = make_ctx(params, model, gdn_replay);
     if (!ctx) {
         fprintf(stderr, "context init failed (gdn_replay=%d)\n", gdn_replay);
-        return std::numeric_limits<double>::infinity();
+        res.worst = inf;
+        return res;
     }
     if (llama_n_rs_seq(ctx) < N_RS) {
         fprintf(stderr, "n_rs_seq %u < %u\n", llama_n_rs_seq(ctx), N_RS);
         llama_free(ctx);
-        return std::numeric_limits<double>::infinity();
+        res.worst = inf;
+        return res;
     }
 
     std::vector<llama_token> history = prefix; // tokens the sequence really holds
     double worst = 0.0;
     bool ok = decode(ctx, prefix, 0, false);
+    segs.push_back(prefix);
     for (size_t r = 0; ok && r < kept.size(); ++r) {
         const int32_t a = kept[r];
         std::vector<llama_token> blk(BLOCK);
@@ -98,6 +111,7 @@ static double run(const common_params & params, llama_model * model, bool gdn_re
             break;
         }
         history.insert(history.end(), blk.begin(), blk.begin() + 1 + a);
+        segs.emplace_back(blk.begin(), blk.begin() + 1 + a);
 
         // next token on the rolled-back context vs a fresh context that decoded only the kept tokens
         const llama_token nxt = tok(g);
@@ -112,13 +126,35 @@ static double run(const common_params & params, llama_model * model, bool gdn_re
             break;
         }
         const double e = nmse(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ref, -1), n_vocab);
-        fprintf(stderr, "  gdn_replay=%d round %zu kept 1+%2d: nmse %.3e\n", gdn_replay, r, a, e);
+        // segmented, rollback-free reference: same segment shapes as ctx (kept rows, then the 1-row probe)
+        double es = inf, ef = inf;
+        llama_context * seg = make_ctx(params, model, gdn_replay);
+        if (seg) {
+            bool sok = true;
+            llama_pos pos = 0;
+            for (const auto & sg : segs) {
+                sok = sok && decode(seg, sg, pos, false);
+                pos += (llama_pos) sg.size();
+            }
+            sok = sok && decode(seg, { nxt }, pos, true);
+            if (sok) {
+                es = nmse(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(seg, -1), n_vocab);
+                ef = nmse(llama_get_logits_ith(ref, -1), llama_get_logits_ith(seg, -1), n_vocab);
+            }
+            llama_free(seg);
+        }
+        fprintf(stderr, "  gdn_replay=%d round %zu kept 1+%2d: nmse %.3e (same-shape ref %.3e, one-batch vs same-shape floor %.3e)\n",
+                gdn_replay, r, a, e, es, ef);
         worst = std::max(worst, e);
+        res.seg_worst   = std::max(res.seg_worst, es);
+        res.floor_worst = std::max(res.floor_worst, ef);
         history.push_back(nxt);
+        segs.push_back({ nxt });
         llama_free(ref);
     }
     llama_free(ctx);
-    return ok ? worst : std::numeric_limits<double>::infinity();
+    res.worst = ok ? worst : inf;
+    return res;
 }
 
 // [DSPINE4] shape-matched probe. run() probes each rollback with a 1-row decode, while its reference decodes that row inside
@@ -270,8 +306,9 @@ static double run_multi(const common_params & params, llama_model * model, bool 
         }
         ok = llama_decode(ctx, b) == 0;
         for (int32_t s = 0; ok && s < n_seq; ++s) {
-            // [DSPINE4] the reference never rolls back: no snapshot planes (the 4-seq ring case OOMed next to a 14 GB model)
-            llama_context * ref = make_ctx(params, model, gdn_replay, 1, 0);
+            // [DSPINE4] the reference never rolls back: one snapshot plane (the 4-seq ring case OOMed next to a 14 GB model
+            // with 15); n_rs_seq 0 would switch the GDN op and turn gdn_replay off, so it stays above 0
+            llama_context * ref = make_ctx(params, model, gdn_replay, 1, 1);
             ok = ref && decode(ref, hist[s], 0, false) && decode(ref, { nxt[s] }, (llama_pos) hist[s].size(), true);
             if (ok) {
                 const double e = nmse(llama_get_logits_ith(ctx, s), llama_get_logits_ith(ref, -1), n_vocab);
@@ -325,16 +362,20 @@ int main(int argc, char ** argv) {
     // CPU float order differs between a 16-row and a short batch; this bound is far below any state mix-up
     const double tol = 1e-6;
     int fails = 0;
-    // [DSPINE4] a plan passes when both probes are within tol, or as ROUNDING when only the 1-row probe is above tol, the
-    // shape-matched probe is within tol, and a one-token state error (ctrl) is >= 100x the 1-row probe's error.
+    // [DSPINE4] verdict per plan:
+    //   FAIL  the shape-matched probe (every row inside a 16-row block) is above tol, or the 1-row probe is above tol vs
+    //         a rollback-free reference decoded in the same segment shapes (a state error);
+    //   PASS  the 1-row probe is within tol of the one-batch reference;
+    //   PASS(ROUNDING)  it is not, but it is within tol of the same-shape reference: the excess is the batch-shape
+    //         rounding between one batch and the segments (printed as the floor), not the rollback.
     for (const bool replay : { false, true }) {
         for (size_t i = 0; i < plans.size(); ++i) {
-            const double e = run(params, model, replay, plans[i], 100 + (uint32_t) i, n_vocab);
+            const run_result e = run(params, model, replay, plans[i], 100 + (uint32_t) i, n_vocab);
             const matched_result m = run_matched(params, model, replay, plans[i], 500 + (uint32_t) i, n_vocab);
-            // ROUNDING: the shape-matched probe is exact while a one-token state error (ctrl) is >= 100x the 1-row excess
-            const char * verdict = m.worst > tol ? "FAIL" : e <= tol ? "PASS" : m.ctrl_min >= 100.0 * e ? "PASS(ROUNDING)" : "FAIL";
-            fprintf(stderr, "%s layout=%s plan %zu: worst nmse %.3e (1-row probe), %.3e (shape-matched), ctrl %.3e\n", verdict,
-                    replay ? "gdn_replay" : "ring", i, e, m.worst, m.ctrl_min);
+            const char * verdict = !(m.worst <= tol) || !(e.seg_worst <= tol) ? "FAIL" : e.worst <= tol ? "PASS" : "PASS(ROUNDING)";
+            fprintf(stderr, "%s layout=%s plan %zu: worst nmse %.3e (1-row probe), %.3e (same-shape ref), floor %.3e, "
+                    "%.3e (shape-matched probe), one-token ctrl %.3e\n", verdict, replay ? "gdn_replay" : "ring", i,
+                    e.worst, e.seg_worst, e.floor_worst, m.worst, m.ctrl_min);
             fails += verdict[0] == 'P' ? 0 : 1;
         }
     }
