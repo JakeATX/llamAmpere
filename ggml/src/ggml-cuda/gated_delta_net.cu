@@ -1851,27 +1851,45 @@ void ggml_cuda_gated_delta_net_ref_f32(
         float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
         int ingr_w, int64_t ingr_region,
         const ggml_cuda_gated_delta_net_state_src & state_src, cudaStream_t stream) {
-    constexpr int S_v = 128;
-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
-    const dim3 grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
-    const dim3 block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
-    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
-    const uint3 rq3_magic   = init_fastdiv_values(rq3);
-    const ggml_cuda_kernel_launch_params launch_params(grid_dims, block_dims, 0, stream);
-#define GDN_REF_LAUNCH(KRS_, EMIT_) \
-    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, KRS_, EMIT_, float>, launch_params, \
-        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, \
-        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, \
-        scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src)
+    constexpr int64_t S_v = 128;
     if (emit_ingr) {
-        GDN_REF_LAUNCH(true, true);
+        launch_gated_delta_net<false, true, true, float>(
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+            scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
     } else if (keep_rs) {
-        GDN_REF_LAUNCH(true, false);
+        if (launch_gated_delta_net_khshare<true, float>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                scale, state_slot_stride, K, slot_rows, state_src, stream)) {
+            return;
+        }
+        if (!launch_gated_delta_net_ilp<true, float>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                scale, state_slot_stride, K, slot_rows, state_src, stream)) {
+            launch_gated_delta_net<false, true, false, float>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
+        }
     } else {
-        GDN_REF_LAUNCH(false, false);
+        if (launch_gated_delta_net_khshare<false, float>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                scale, state_slot_stride, K, slot_rows, state_src, stream)) {
+            return;
+        }
+        if (!launch_gated_delta_net_ilp<false, float>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                scale, state_slot_stride, K, slot_rows, state_src, stream)) {
+            launch_gated_delta_net<false, false, false, float>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, S_v, H, n_tokens, n_seqs,
+                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
+        }
     }
-#undef GDN_REF_LAUNCH
 }
 
 template <typename state_t>

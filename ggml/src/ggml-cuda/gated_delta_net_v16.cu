@@ -800,6 +800,12 @@ bool ggml_cuda_gated_delta_net_v16_try(
             scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, *pool, stream);
         return true;
     }
+    if (mode == 3 && pool != nullptr && cap != cudaStreamCaptureStatusNone) {
+        static std::atomic<bool> cap_warned{false};
+        if (!cap_warned.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_WARN("GDN V16: GGML_CUDA_GDN_V16=3 skipped bit-check during CUDA graph capture (set GGML_CUDA_DISABLE_GRAPHS=1 to check in-server)\n");
+        }
+    }
 
     if (emit_ingr) {
         launch_shape<true, true>(nc, nw, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,

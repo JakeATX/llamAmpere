@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common.cuh"
+#include "gated_delta_net.cuh"
 
 #include <climits>
 
