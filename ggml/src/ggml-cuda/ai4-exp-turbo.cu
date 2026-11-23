@@ -19,6 +19,8 @@ bool ggml_cuda_ai4_exp_turbo_try(
     return false;
 }
 
+void ggml_cuda_ai4_exp_turbo_free(const ggml_backend_cuda_context *) {}
+
 #else
 
 namespace ai4_exp_turbo {
@@ -673,6 +675,8 @@ static ai4k::idmap get_or_build_idmap(
             m.hdr   = c.ptr;
             m.exps  = c.ptr + 2;
             m.off   = m.exps + n_expert;
+            // rows[] was built with the first consumer's ne11 (gate_up: 1) and ne11 is not in the key: on a hit only exps/off/cols/tiles
+            // are valid (the turbo kernels map cols -> src1 row themselves); never read rows[] from here.
             m.rows  = m.off + n_expert + 1;
             m.cols  = m.rows + n_pairs;
             m.tiles = m.cols + n_pairs;

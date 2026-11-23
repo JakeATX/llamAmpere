@@ -1261,10 +1261,11 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
-    ggml_cuda_ink_ai4_preq_free(this);
-    ggml_cuda_ai4_exp_turbo_free(this);
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+    // per-context device caches: cudaFree only after no other context is mid-capture (same rule as graph_reset / pool_trim)
+    ggml_cuda_ink_ai4_preq_free(this);
+    ggml_cuda_ai4_exp_turbo_free(this);
 
     // [#136] fold (default on): how often each fold matched (graph builds/captures, not replays)
     if (ggml_cuda_exl3_glue_fold_enabled() && fusion_stats.exl3_fold_norm + fusion_stats.exl3_fold_add + fusion_stats.exl3_fold_gu > 0) {
