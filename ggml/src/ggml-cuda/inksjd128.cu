@@ -9,7 +9,8 @@
 // to the head basis in shared memory (the cache stores the plain 256-point Hadamard H/16 of each row; H/16 is its own
 // inverse, applied with the same butterfly sequence as sj_kvarn_rot256_row8), and the two real heads run as D = 128
 // f16 MMA attention (GQA g) on the unrotated Q halves. The output is written in the unrotated basis, lanes of the other
-// half zero, which is what the fused-rotation contract (GGML_SJKVARN_ROT_PARAM) asks of the node.
+// half zero, which is what the fused-rotation contract (GGML_SJKVARN_ROT_PARAM) asks of the node. Without it (the build
+// default) Q arrives rotated and the graph un-rotates the output: Q is rotated back first and the output rotated again.
 // Rounding differs from the D = 256 route (f16 K/V in the head basis instead of the rotated one); math is the same.
 // GGML_CUDA_INK_SJ_D128=0 = off (the generic route).
 
@@ -158,6 +159,62 @@ static __global__ void k_ink_sj_d128_scatter(const float * __restrict__ src, cha
     }
 }
 
+// Unfused rotation (GGML_SJKVARN_FUSED_ROT off, the build default): Q arrives as H/16 of the padded [q, 0] / [0, q]
+// row. One warp per (token, head) row: rotate back (H/16 is its own inverse) and keep the real half, Qu [128, T, H].
+static __global__ void k_ink_sj_d128_q_unrot(const char * __restrict__ Q, float * __restrict__ Qu, const int T, const int n_head,
+        const int g, const size_t nb1, const size_t nb2) {
+    const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y; // h*T + t
+    if (row >= (int64_t) T*n_head) {
+        return;
+    }
+    const int lane = threadIdx.x;
+    const int t = row % T;
+    const int h = row / T;
+    const float * q = (const float *) (Q + (size_t) t*nb1 + (size_t) h*nb2);
+    float x[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        x[j] = q[8*lane + j];
+    }
+    sj_kvarn_rot256_row8(x, lane);
+    const int half = (h % (2*g)) >= g;
+    const int l0 = lane - 16*half;
+    if (l0 >= 0 && l0 < 16) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            Qu[row*128 + 8*l0 + j] = x[j];
+        }
+    }
+}
+
+// Unfused rotation: write H/16 of the padded output row (the graph's turbo_wht un-rotates it). One warp per (t, c) row.
+static __global__ void k_ink_sj_d128_scatter_rot(const float * __restrict__ src, char * __restrict__ dst, const int g, const int T,
+        const int head_first, const int half, const size_t nb1, const size_t nb2,
+        const float * __restrict__ lse_src, float * __restrict__ lse_dst, const int n_head) {
+    const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y; // t*g + c
+    if (row >= (int64_t) T*g) {
+        return;
+    }
+    const int lane = threadIdx.x;
+    const int c = row % g;
+    const int t = row / g;
+    const int l0 = lane - 16*half;
+    float x[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        x[j] = l0 >= 0 && l0 < 16 ? src[row*128 + 8*l0 + j] : 0.0f;
+    }
+    sj_kvarn_rot256_row8(x, lane);
+    float * o = (float *) (dst + (size_t) t*nb2 + (size_t) (head_first + c)*nb1);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        o[8*lane + j] = x[j];
+    }
+    if (lse_src && lane == 0) {
+        lse_dst[(size_t) t*n_head + head_first + c] = lse_src[row];
+    }
+}
+
 bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (!ink_sj_d128_enabled()) {
         return false;
@@ -180,7 +237,7 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_tensor * lse = ggml_flash_attn_ext_get_lse(dst);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const int n_kv = ggml_get_op_params_i32(dst, 6);
-    if (!ggml_cuda_fattn_sj_kvarn_rot(dst) || !ampere_mma_available(cc) || dst->src[5] == nullptr || dst->src[6] == nullptr ||
+    if (!ampere_mma_available(cc) || dst->src[5] == nullptr || dst->src[6] == nullptr ||
             ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4) || ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 ||
             ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0 || ggml_get_op_params_i32(dst, 4) != 0 ||
             Q->type != GGML_TYPE_F32 || Q->ne[0] != 256 || Q->nb[0] != sizeof(float) || Q->ne[1] < 128 || Q->ne[3] != 1 ||
@@ -219,7 +276,9 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const size_t kv_bytes = GGML_PAD(2*kv_elems*sizeof(half), 128);
     const size_t o_bytes  = GGML_PAD((size_t) g*T*128*sizeof(float), 128);
     const size_t l_bytes  = lse ? GGML_PAD((size_t) g*T*sizeof(float), 128) : 0;
-    const size_t need     = kv_bytes + o_bytes + l_bytes;
+    const bool   rot      = ggml_cuda_fattn_sj_kvarn_rot(dst); // fused contract: Q and the output in the head basis
+    const size_t qu_bytes = rot ? 0 : GGML_PAD((size_t) n_head*T*128*sizeof(float), 128);
+    const size_t need     = kv_bytes + o_bytes + l_bytes + qu_bytes;
     const size_t offset   = GGML_PAD(ggml_nbytes(dst), 128);
     const bool reserved = dst->buffer != nullptr && dst->view_src == nullptr && (uintptr_t) dst->data % 128 == 0 &&
         offset + need <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
@@ -232,6 +291,13 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     half  * Vs   = Ks + kv_elems;
     float * outs = (float *) (scratch + kv_bytes);
     float * lses = lse ? (float *) (scratch + kv_bytes + o_bytes) : nullptr;
+    float * Qu   = rot ? nullptr : (float *) (scratch + kv_bytes + o_bytes + l_bytes);
+    if (!rot) {
+        const int64_t rows_q = (int64_t) T*n_head;
+        k_ink_sj_d128_q_unrot<<<(unsigned) ((rows_q + 7)/8), dim3(32, 8, 1), 0, stream>>>((const char *) Q->data, Qu, T, n_head, g,
+            Q->nb[1], Q->nb[2]);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     for (int hp = 0; hp < P; ++hp) {
         const ggml_cuda_kernel_launch_params lp(dim3(n_kv/16, 1, 1), dim3(32, 8, 1), 2*16*128*sizeof(half2), stream);
@@ -245,7 +311,12 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             const int head_first = 2*g*hp + half_i*g;
             ggml_tensor q = *Q;
             q.ne[0] = 128; q.ne[2] = g;
-            q.data = (char *) Q->data + (size_t) head_first*Q->nb[2] + (size_t) half_i*128*sizeof(float);
+            if (rot) {
+                q.data = (char *) Q->data + (size_t) head_first*Q->nb[2] + (size_t) half_i*128*sizeof(float);
+            } else {
+                q.nb[0] = sizeof(float); q.nb[1] = 128*sizeof(float); q.nb[2] = q.nb[1]*T; q.nb[3] = q.nb[2]*g;
+                q.data = Qu + (size_t) head_first*T*128;
+            }
             q.view_src = nullptr; q.view_offs = 0; q.buffer = nullptr;
             ggml_tensor k = *K;
             ggml_tensor v = *V;
@@ -295,16 +366,22 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             out.data = outs; out.buffer = nullptr; out.view_src = nullptr; out.view_offs = 0;
             ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &out);
 
-            const int64_t n = (int64_t) T*g*256;
-            k_ink_sj_d128_scatter<<<(unsigned) ((n + 255)/256), 256, 0, stream>>>(outs, (char *) dst->data, g, T, head_first, half_i,
-                dst->nb[1], dst->nb[2], lses, lse ? (float *) lse->data : nullptr, n_head);
+            if (rot) {
+                const int64_t n = (int64_t) T*g*256;
+                k_ink_sj_d128_scatter<<<(unsigned) ((n + 255)/256), 256, 0, stream>>>(outs, (char *) dst->data, g, T, head_first, half_i,
+                    dst->nb[1], dst->nb[2], lses, lse ? (float *) lse->data : nullptr, n_head);
+            } else {
+                const int64_t rows_o = (int64_t) T*g;
+                k_ink_sj_d128_scatter_rot<<<(unsigned) ((rows_o + 7)/8), dim3(32, 8, 1), 0, stream>>>(outs, (char *) dst->data, g, T,
+                    head_first, half_i, dst->nb[1], dst->nb[2], lses, lse ? (float *) lse->data : nullptr, n_head);
+            }
             CUDA_CHECK(cudaGetLastError());
         }
     }
     static bool noted = false;
     if (!noted) {
         noted = true;
-        GGML_LOG_WARN("[INKSJD128] packed D128 SJ-KVaRN prefill: %d packed heads x 2 at D 128 (GQA %d), T %d, n_kv %d\n", P, g, T, n_kv);
+        GGML_LOG_WARN("[INKSJD128] packed D128 SJ-KVaRN prefill: %d packed heads x 2 at D 128 (GQA %d), T %d, n_kv %d, %s rotation\n", P, g, T, n_kv, rot ? "fused" : "graph");
     }
     return true;
 }
