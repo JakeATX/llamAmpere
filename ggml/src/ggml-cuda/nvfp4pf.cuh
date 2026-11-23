@@ -2,7 +2,7 @@
 // INKNVFP4K NVFP4PF: NVFP4 MoE prefill (MUL_MAT_ID with >= 512 tokens) on int8 tensor cores, ported from Gemini's S8-K64
 // engine (exp/ampere-nextgen 82183ff0b); kernels and numerics in nvfp4pf-kern.cuh. Runs from the fused MUL_MAT_ID +
 // per-expert scale site (the scale is applied in the epilogue). Not bit-exact with MMQ: KLD-gated.
-// GGML_CUDA_NVFP4PF = 0 (default: MMQ) | k64 (int8 per 64) | k32 (int8 per 32, lower loss).
+// GGML_CUDA_NVFP4PF = k64 (default: int8 per 64) | 0 (MMQ) | k32 (int8 per 32, lower loss).
 // GGML_CUDA_NVFP4PF_LOG=1 logs every call (shape, mode); the first call always logs once.
 
 #include "common.cuh"

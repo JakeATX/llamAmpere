@@ -9,8 +9,8 @@
 int ggml_cuda_nvfp4pf_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_CUDA_NVFP4PF");
-        if (!e) {
-            return 0;
+        if (!e || !*e) {
+            return 64; // default ON (INKPREFILL nq1: NQ prefill +11-13%, KLD within noise of MMQ); GGML_CUDA_NVFP4PF=0 = MMQ
         }
         if (!strcmp(e, "k64") || !strcmp(e, "1")) {
             return 64;
