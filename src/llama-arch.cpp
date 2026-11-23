@@ -3,6 +3,7 @@
 #include "llama-ext.h"
 #include "llama-impl.h"
 
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -1534,6 +1535,17 @@ llm_arch llm_arch_from_string(const std::string & name) {
 }
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor) {
+    if (tensor == LLM_TENSOR_DSPARK_MASK_EMBD) {
+        // [T5-IDLE] H3: respect LLAMA_DSPARK_MASK_GPU=0 so all-switches-off restores CPU placement identical to rc7.
+        static const bool mask_gpu = [] {
+            const char * e = std::getenv("LLAMA_DSPARK_MASK_GPU");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        static const llm_tensor_info info_cpu = { LLM_TENSOR_LAYER_INPUT, GGML_OP_GET_ROWS };
+        if (!mask_gpu) {
+            return info_cpu;
+        }
+    }
     return LLM_TENSOR_INFOS.at(tensor);
 }
 

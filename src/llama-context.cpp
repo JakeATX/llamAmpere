@@ -4080,6 +4080,30 @@ void llama_context::layer_inp_dev_alloc() {
     layer_inp_dev_dev = model.dev_output();
     auto * buft = layer_inp_dev_dev ? ggml_backend_dev_buffer_type(layer_inp_dev_dev) : ggml_backend_cpu_buffer_type();
 
+    // [T5-IDLE] H1 small-card VRAM headroom guard: when not explicitly forced via LLAMA_DSPARK_DEV_INJECT=1,
+    // require at least LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB (default 512 MiB) free VRAM after allocation so
+    // tight 8/10/12 GB cards (including --fit off) keep CUDA Graph/pool headroom and fall back cleanly to host copies.
+    if (layer_inp_dev_dev && !ggml_backend_buft_is_host(buft)) {
+        const char * force_e = std::getenv("LLAMA_DSPARK_DEV_INJECT");
+        const bool   forced  = force_e != nullptr && std::atoi(force_e) > 0;
+        if (!forced) {
+            const char * min_e = std::getenv("LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB");
+            const size_t min_free_bytes = (size_t) (min_e ? std::max(0, std::atoi(min_e)) : 512) << 20;
+            const size_t need_bytes = ggml_nbytes(layer_inp_dev);
+            size_t free_mem = 0, total_mem = 0;
+            ggml_backend_dev_memory(layer_inp_dev_dev, &free_mem, &total_mem);
+            if (total_mem > 0 && free_mem < need_bytes + min_free_bytes) {
+                LLAMA_LOG_INFO("%s: skipping %.2f MiB layer_inp_dev (free %.2f MiB < need + %.2f MiB headroom; set LLAMA_DSPARK_DEV_INJECT=1 to force)\n",
+                        __func__, need_bytes / 1048576.0, free_mem / 1048576.0, min_free_bytes / 1048576.0);
+                cparams.embeddings_layer_inp_dev = false;
+                layer_inp_dev     = nullptr;
+                layer_inp_dev_dev = nullptr;
+                ctx_layer_inp_dev.reset();
+                return;
+            }
+        }
+    }
+
     buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(), buft));
     if (!buf_layer_inp_dev) {
         // e.g. a large n_batch that does not fit next to the model, keep the host copies
@@ -10420,6 +10444,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     }
     if (mtp_feedback.buf) {
         ret[ggml_backend_buffer_get_type(mtp_feedback.buf.get())].context += ggml_backend_buffer_get_size(mtp_feedback.buf.get());
+    }
+    if (buf_layer_inp_dev) {
+        ret[ggml_backend_buffer_get_type(buf_layer_inp_dev.get())].context += ggml_backend_buffer_get_size(buf_layer_inp_dev.get());
+    }
+    if (buf_h_nextn_dev) {
+        ret[ggml_backend_buffer_get_type(buf_h_nextn_dev.get())].context += ggml_backend_buffer_get_size(buf_h_nextn_dev.get());
     }
     if (model.no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {

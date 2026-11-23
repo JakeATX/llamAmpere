@@ -27,7 +27,7 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         float * dst, const int n, const int nq_all, const float eps, const float scale,
         const float * __restrict__ nw = nullptr, float * __restrict__ ndst = nullptr, const float neps = 0.0f,
         int8_t * __restrict__ aq = nullptr, float * __restrict__ as = nullptr) {
-    extern __shared__ float s_out[];
+    extern __shared__ __align__(16) float s_out[];
     __shared__ float part[DEPTH_MIX_MAX_ROWS*(NQ + 1)];
     __shared__ float p[DEPTH_MIX_MAX_ROWS*NQ];
     __shared__ float s_r;

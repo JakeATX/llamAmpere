@@ -1,6 +1,6 @@
 // [T5-GLUE] G1: Vectorized SM 8.6 loop-gate kernels (down + apply) for G=1..4 gates.
 // Targets Inkling-2-Mini looped layers: n=2304, R=64, T=1..8 (SpecDecode T=5), BF16 weights.
-// Kill switch: GGML_CUDA_INK_LG_VEC=0 (default 1 = on).
+// Opt-in switch: GGML_CUDA_INK_LG_VEC=1 (default 0 = off until KLD gate clears).
 
 #include "inklg_vec.cuh"
 #include "convert.cuh"
@@ -26,9 +26,11 @@ struct ink_lgv_args {
 };
 
 bool ggml_cuda_ink_lg_vec_enabled() {
+    // Default OFF (opt-in via GGML_CUDA_INK_LG_VEC=1) until KLD gate clears:
+    // ~1e-7/gate FP32 reduction-order diff can flip razor-thin greedy ties across 48 looped visits.
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_INK_LG_VEC");
-        return e == nullptr || atoi(e) != 0;
+        return e != nullptr && atoi(e) != 0;
     }();
     return on;
 }
@@ -182,7 +184,7 @@ static __global__ void __launch_bounds__(LGV_APPLY_WARPS * WARP_SIZE) k_ink_lg_a
     float * __restrict__ dst = a.dst[g];
     const float eps = a.eps[g];
 
-    __shared__ float gs[LGV_MAX_T * LGV_MAX_R];
+    __shared__ __align__(16) float gs[LGV_MAX_T * LGV_MAX_R];
     __shared__ float rs[2 * LGV_MAX_T];
     // SMEM staging for 32 consecutive rows x T_CAP tokens (+1 padding to avoid bank conflicts)
     __shared__ float s_ag[T_CAP][33];
