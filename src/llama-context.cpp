@@ -6344,7 +6344,9 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 // outputs, f32, top-k per token) from the CUDA pool at compute time, outside the reserved buffer:
                 // charged for any ceiling above the current reserve, with 25% slack.
                 const auto & hp = model.hparams;
-                const double per_row = 1.25 * 4.0 * hp.n_expert_used() * (hp.n_embd + 3.0 * hp.n_ff_exp());
+                uint32_t ff_max = 0;
+                for (uint32_t il = 0; il < hp.n_layer(); ++il) { ff_max = std::max(ff_max, hp.n_ff_exp(il)); }
+                const double per_row = 1.25 * 4.0 * hp.n_expert_used_max() * (hp.n_embd + 3.0 * ff_max);
                 const uint32_t allocated = std::max(1u, sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch);
                 uint32_t pick = 512;
                 for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r /= 2) {
@@ -6357,9 +6359,13 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                         const double margin = double(total >= (size_t(16) << 30) ? size_t(2) << 30 : size_t(64) << 20) +
                                 double(size_t(64) << 20);
                         const double bytes = double(ggml_backend_sched_get_buffer_size(sched.get(), backend));
-                        const double need = r > allocated ? bytes * (r - allocated) / allocated + per_row * r : 0.0;
-                        // a ceiling already reserved only needs the floor (its pool is in use and counted in free)
-                        fits = fits && need + (r > allocated ? margin : double(size_t(64) << 20)) < double(free);
+                        if (r > allocated) {
+                            fits = fits && bytes * (r - allocated) / allocated + per_row * r + margin < double(free);
+                        } else {
+                            // at or below the reserve: its pool is in use and counted in free; a smaller ceiling
+                            // gets back its share of the compute buffer
+                            fits = fits && double(size_t(64) << 20) < double(free) + bytes * (allocated - r) / allocated;
+                        }
                     }
                     if (fits) { pick = r; break; }
                 }
@@ -8017,6 +8023,8 @@ ggml_cgraph * llama_context::graph_reserve(
     // debug (INKSTREAM): LLAMA_GRAPH_MEM_TOP=N lists the N largest GPU-assigned graph tensors after a reserve, and the
     // GPU bytes by op, to see what scales the compute buffer with rows. Off by default.
     if (static const int top = getenv("LLAMA_GRAPH_MEM_TOP") ? atoi(getenv("LLAMA_GRAPH_MEM_TOP")) : 0; top > 0 && !split_only) {
+        // the reserve ends with a sched reset (no backend ids left): split again to read them, then reset
+        ggml_backend_sched_split_graph(sched.get(), gf);
         std::vector<std::pair<size_t, ggml_tensor *>> v;
         std::map<std::string, size_t> by_op;
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
@@ -8038,6 +8046,7 @@ ggml_cgraph * llama_context::graph_reserve(
         for (const auto & [op, bytes] : by_op) {
             LLAMA_LOG_WARN("%s: [MEMTOP] op %-14s %10.2f MiB (sum of node sizes, not live)\n", __func__, op.c_str(), bytes / 1048576.0);
         }
+        ggml_backend_sched_reset(sched.get());
     }
 
     return gf;
