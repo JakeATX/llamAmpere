@@ -1569,6 +1569,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         int32_t ceiling = 4096;
         if (!params.model.path.empty()) {
             const std::string arch = common_get_gguf_info(params.model.path).arch;
+            // Qwen3.5/3.8 27B (P76, 24dense): 4096 vs 2048, 3090, ABBA x6: cold prefill 3K +1.7%, 32K -1.5%, 100K -0.4%
+            // (no gain), decode at 100K fill +0.3%, but 16-token replies after a 3K/32K prompt -26%/-29% -> 2048.
+            if (arch == "qwen35") {
+                ceiling = 2048;
+            }
             if (arch == "inkling2" || arch == "inkling2_loop") {
                 // The SWA cache grows by the ub (n_swa + n_ubatch cells). At the fitted default ctx the 512-row boot
                 // reserve leaves no room for wider prompt rows (the full-ctx reserve sizes the masks at every cell),
@@ -1594,7 +1599,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
         }
         LOG_INF("%s: dynamic ub ceiling %d (-b %d) for the smallest GPU total %zu MiB (auto: no -ub/-b given; "
-                "24 GB-class >= 23552 MiB -> 4096, Inkling 1024, LLAMA_UB_CEILING)\n", __func__, params.n_ubatch, params.n_batch, min_total >> 20);
+                "24 GB-class >= 23552 MiB -> 4096, qwen35 2048, Inkling 1024 with -c, LLAMA_UB_CEILING)\n", __func__, params.n_ubatch, params.n_batch, min_total >> 20);
     }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
