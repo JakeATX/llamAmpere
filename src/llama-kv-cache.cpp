@@ -5485,7 +5485,11 @@ int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_uba
                 }
                 if (b != 0u) {
                     row[w] = b;
-                    end = std::max<int64_t>(end, w*32 + 32 - __builtin_clz(b));
+                    int hb = 31; // highest set bit of b (b != 0); portable, MSVC has no __builtin_clz
+                    while (((b >> hb) & 1u) == 0u) {
+                        --hb;
+                    }
+                    end = std::max<int64_t>(end, w*32 + hb + 1);
                 }
             }
             continue;
