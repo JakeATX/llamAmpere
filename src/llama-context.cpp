@@ -6434,6 +6434,15 @@ bool llama_context::ink_stream_take() {
         return false;
     }
     ink_stream_fails = 0;
+    // the ladder was cut while the cache held the card: start the prompt ceiling high again and check it now; the cut
+    // test below gives rows back if the lent VRAM does not fund them
+    if (dynamic_ubatch) {
+        dynamic_ubatch_rows = 256;
+        while (dynamic_ubatch_rows < 4096 && dynamic_ubatch_rows * 2 <= cparams.n_ubatch) {
+            dynamic_ubatch_rows *= 2;
+        }
+        dynamic_ubatch_pp_check_us = 0;
+    }
     sched_need_reserve = true; // the graph reads the slots now
     ink_stream_tokens   = 0;
     ink_stream_rows_max = 0;
