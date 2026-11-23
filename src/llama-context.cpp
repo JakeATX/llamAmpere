@@ -6112,7 +6112,9 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             ink_refill = ink_stream_release(n_tokens == 0 ? "scratch return" : "writing call");
         }
         // a refill that failed earlier is retried on every call until the cache is back
-        ink_refill = ink_refill || (!ink_stream->armed() && moe_cache && moe_cache->suspended());
+        // (rate-limited: a failing multi-GB alloc and a graph reset per decode token would cost more than it saves)
+        static uint32_t ink_retry = 0;
+        ink_refill = ink_refill || (!ink_stream->armed() && moe_cache && moe_cache->suspended() && (n_tokens == 0 || ++ink_retry % 64 == 0));
     }
     const bool ink_armed = ink_stream && ink_stream->armed();
     // refill the hot experts once the prompt scratch is back to its boot size
