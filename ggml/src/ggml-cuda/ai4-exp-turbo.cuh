@@ -24,6 +24,9 @@
 //   GGML_CUDA_AI4_EXP_TURBO_CFG=auto|3x2|3x3|4x2  direct kernel (warps x stages), default auto
 //   GGML_CUDA_AI4_EXP_TURBO_MAX_N=32      max verify token width routed here (default 32, min 2)
 //   GGML_CUDA_AI4_EXP_TURBO_IDCACHE=0|1   cache ids_helper across gate_up & down for M=9..32 (default 1)
+// frees the per-context ids_helper cache (call from the CUDA context destructor)
+void ggml_cuda_ai4_exp_turbo_free(const ggml_backend_cuda_context * ctx);
+
 bool ggml_cuda_ai4_exp_turbo_try(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,

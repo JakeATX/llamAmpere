@@ -277,13 +277,14 @@ static void ai4_ampere_width(const uint8_t * W, const int8_t * q, const float * 
 }
 
 // AI+ Turbo v3 gemm_s8_lowreg (ID=true: 128 regs, 2 CTAs/SM, bitwise = rc ai23 ID GEMM) for AIT4_U expert prefill,
-// GGML_CUDA_AI4_LOWREG_ID_MIN_N (64) <= n_tok <= GGML_CUDA_AI4_LOWREG_ID_MAX_N (2048). Kill switch GGML_CUDA_AI4_LOWREG_ID=0. Needs 64-route tiles (forces bn 64).
+// GGML_CUDA_AI4_LOWREG_ID_MIN_N (64) <= n_tok <= GGML_CUDA_AI4_LOWREG_ID_MAX_N (1024). Kill switch GGML_CUDA_AI4_LOWREG_ID=0. Needs 64-route tiles (forces bn 64).
 static bool ai4_lowreg_id(int n_tok) {
     static const bool v = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID", nullptr, 1) != 0;
     static const int mn = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID_MIN_N", nullptr, 64);
     // in-graph Taichi 3090 (tail_skip on), Inkling gate_up+down per visit: N=512 1481.8 -> 1057.6 us (-28.6%),
-    // N=2048 2874.0 -> 2845.2 (-1.0%), N=4096 5325.1 -> 5505.3 (+3.4%): stay on the rc 128-route tile above 2048
-    static const int mx = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID_MAX_N", nullptr, 2048);
+    // N=2048 2874.0 -> 2845.2 (-1.0%), N=4096 5325.1 -> 5505.3 (+3.4%); end-to-end 3090 Ti ub 2048 = tie (+0.2% / -0.3%),
+    // ub 1024 +1.13%: cap 1024 (never slower by default; UBDEFAULT Inkling ceiling is 1024)
+    static const int mx = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID_MAX_N", nullptr, 1024);
     return v && n_tok >= mn && n_tok <= mx;
 }
 static int ai4_bn128_min() {

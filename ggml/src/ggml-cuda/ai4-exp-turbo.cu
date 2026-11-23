@@ -192,7 +192,7 @@ static __global__ void __launch_bounds__(WARPS * 32, MINB) exp_turbo_direct_s8(
     auto route_to_xrow = [&](int r) -> int {
         if (ne11 == n_used) return r; // down projection: 1:1 with route index (0 div/mod!)
         if (ne11 == 1) return pow2_used ? (r >> used_sh) : (r / n_used); // gate_up: token index
-        return (r / n_used) * ne11 + (r % n_used);
+        return (r / n_used) * ne11 + (r % n_used) % ne11;   // 1 < ne11 < n_used: slot j reads src1 row j % ne11 (ggml MUL_MAT_ID)
     };
 
     const bool has_n  = (g < N);
@@ -461,7 +461,7 @@ static __global__ void __launch_bounds__(WARPS * 32, MINB) exp_turbo_grouped_s8(
     auto col_to_xrow = [&](int r) -> int {
         if (ne11 == n_used) return r;
         if (ne11 == 1) return pow2_used ? (r >> used_sh) : (r / n_used);
-        return (r / n_used) * ne11 + (r % n_used);
+        return (r / n_used) * ne11 + (r % n_used) % ne11;   // 1 < ne11 < n_used: slot j reads src1 row j % ne11 (ggml MUL_MAT_ID)
     };
 
     int xr_idx[NTI];
@@ -634,6 +634,21 @@ struct idcache_entry {
 
 static std::mutex g_idcache_mu;
 static std::unordered_map<const ggml_backend_cuda_context *, idcache_entry> g_idcache;
+
+// Called from ~ggml_backend_cuda_context: frees the 64 KiB buffer and drops the entry, so a context re-created at the same
+// address (graph_epoch restarts at 1) can never match stale routing.
+void ggml_cuda_ai4_exp_turbo_free(const ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(g_idcache_mu);
+    auto it = g_idcache.find(ctx);
+    if (it == g_idcache.end()) {
+        return;
+    }
+    if (it->second.ptr != nullptr) {
+        ggml_cuda_set_device(it->second.dev);
+        cudaFree(it->second.ptr);
+    }
+    g_idcache.erase(it);
+}
 
 static ai4k::idmap get_or_build_idmap(
         ggml_backend_cuda_context & ctx,

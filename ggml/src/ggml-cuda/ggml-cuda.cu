@@ -82,6 +82,7 @@
 #include "ggml-cuda/inkcomb.cuh"
 #include "ggml-cuda/inkdyn.cuh"
 #include "ggml-cuda/inkpreq.cuh"
+#include "ggml-cuda/ai4-exp-turbo.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -1261,6 +1262,7 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_ink_ai4_preq_free(this);
+    ggml_cuda_ai4_exp_turbo_free(this);
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
