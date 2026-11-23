@@ -48,32 +48,6 @@ static __device__ __forceinline__ void gdn_store_state(void * state, const int64
 // type (f32/bf16/f16/q8_0, --cache-type-s) when the snapshot copy is fused (ggml_cuda_try_gdn_cache_fusion).
 // The recurrence itself always runs in F32 registers; only the stored state is rounded. `state` is
 // addressed in elements (gdn_store_state), so a q8_0 block is 32 consecutive elements of one column.
-// [MULTI08 B] guard_in_place: true when a sequence's input row (base + rows[t] * row_stride, D floats) shares bytes
-// with a final / checkpoint output block of another sequence, or with its own without being the same row (a row
-// read and stored by the same thread, element by element, is safe: [#87]). Every block computes the same answer.
-static __device__ __forceinline__ bool gdn_direct_rows_conflict(const float * base, const ggml_cuda_gated_delta_net_state_src & ss,
-                                                               const int64_t n_seqs, const int64_t D) {
-    if (ss.guard_in_place == 2) {
-        return true; // GGML_CUDA_GDN_DIRECT_FORCE_FALLBACK=1 (test only): take the fallback path every time
-    }
-    for (int64_t t = 0; t < n_seqs; ++t) {
-        const float * r0 = base + (int64_t) ss.rows[t] * ss.row_stride;
-        for (int64_t s = 0; s < n_seqs; ++s) {
-            for (int j = 0; j < 2; ++j) {
-                const float * w = j == 0 ? ss.final_dst : ss.ckpt_dst;
-                if (w == nullptr) {
-                    continue;
-                }
-                const float * w0 = w + s * D;
-                if (r0 < w0 + D && w0 < r0 + D && !(t == s && r0 == w0)) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
 // [MULTI08 B] after a guard_in_place launch: if the kernels found a conflict they stored the final / checkpoint
 // blocks in the op output (fin_src / ckpt_src); copy them to the cache rows. Otherwise nothing to do.
 static __global__ void gdn_direct_fallback(const float * base, const ggml_cuda_gated_delta_net_state_src ss, const int64_t n_seqs,
@@ -972,17 +946,6 @@ gated_delta_net_cuda_r16(const float * q,
     }
 }
 
-static __global__ void gdn_r16_diff(const uint32_t * __restrict__ a, const uint32_t * __restrict__ b, const int64_t n,
-                                    unsigned long long * __restrict__ ndiff) {
-    unsigned long long c = 0;
-    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
-        c += a[i] != b[i];
-    }
-    if (c) {
-        atomicAdd(ndiff, c);
-    }
-}
-
 // Four columns per physical warp, with 16 state floats per lane in either layout.
 template <int SW, bool keep_rs_t, bool emit_ingredients_t>
 __global__ void __launch_bounds__(128, 2)
@@ -1875,6 +1838,42 @@ static bool launch_gated_delta_net_khshare(
 }
 
 
+void ggml_cuda_gated_delta_net_ref_f32(
+        bool keep_rs, bool emit_ingr,
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, void * state_d,
+        int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3,
+        float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
+        int ingr_w, int64_t ingr_region,
+        const ggml_cuda_gated_delta_net_state_src & state_src, cudaStream_t stream) {
+    constexpr int S_v = 128;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int num_warps = 4;
+    const dim3 grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+    const dim3 block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
+    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const uint3 rq3_magic   = init_fastdiv_values(rq3);
+    const ggml_cuda_kernel_launch_params launch_params(grid_dims, block_dims, 0, stream);
+#define GDN_REF_LAUNCH(KRS_, EMIT_) \
+    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, KRS_, EMIT_, float>, launch_params, \
+        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, \
+        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, \
+        scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src)
+    if (emit_ingr) {
+        GDN_REF_LAUNCH(true, true);
+    } else if (keep_rs) {
+        GDN_REF_LAUNCH(true, false);
+    } else {
+        GDN_REF_LAUNCH(false, false);
+    }
+#undef GDN_REF_LAUNCH
+}
+
 template <typename state_t>
 static void gated_delta_net_dispatch(
         bool kda, bool keep_rs, bool emit_ingr,
@@ -1912,7 +1911,7 @@ static void gated_delta_net_dispatch(
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
         sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows
     if constexpr (std::is_same_v<state_t, float>) {
-        if (!kda && ggml_cuda_gated_delta_net_v16_try(keep_rs, emit_ingr, GDN_ARGS, ingr_w, ingr_region, state_src, stream)) {
+        if (!kda && ggml_cuda_gated_delta_net_v16_try(keep_rs, emit_ingr, GDN_ARGS, ingr_w, ingr_region, state_src, pool, stream)) {
             return;
         }
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2156,7 +2155,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
         } else if (!ggml_cuda_gated_delta_net_v16_try(true, true, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
-                state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream)) {
+                state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, &ctx.pool(), stream)) {
             launch_gated_delta_net<false, true, true, float>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
                 state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);

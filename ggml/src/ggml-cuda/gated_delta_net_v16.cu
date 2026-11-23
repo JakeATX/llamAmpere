@@ -4,35 +4,15 @@
 #include "gated_delta_net.cuh"
 #include "gated_delta_net_v16.cuh"
 
+#include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 namespace gdn_v16 {
-
-static __device__ __forceinline__ bool direct_rows_conflict(
-        const float * base, const ggml_cuda_gated_delta_net_state_src & ss,
-        const int64_t n_seqs, const int64_t D) {
-    if (ss.guard_in_place == 2) {
-        return true;
-    }
-    for (int64_t t = 0; t < n_seqs; ++t) {
-        const float * r0 = base + (int64_t) ss.rows[t] * ss.row_stride;
-        for (int64_t s = 0; s < n_seqs; ++s) {
-            for (int j = 0; j < 2; ++j) {
-                const float * w = j == 0 ? ss.final_dst : ss.ckpt_dst;
-                if (w == nullptr) {
-                    continue;
-                }
-                const float * w0 = w + s * D;
-                if (r0 < w0 + D && w0 < r0 + D && !(t == s && r0 == w0)) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
 
 template <int NW>
 static __device__ __forceinline__ void block_sync() {
@@ -103,7 +83,7 @@ gated_delta_net_cuda_v16(const float * q,
     float * fin_dst = state_src.final_dst;
     float * ckp_dst = state_src.ckpt_dst;
     if constexpr (emit_ingredients_t) {
-        if (state_src.guard_in_place && direct_rows_conflict(curr_state, state_src, n_seqs, H * S_v * S_v)) {
+        if (state_src.guard_in_place && gdn_direct_rows_conflict(curr_state, state_src, n_seqs, H * S_v * S_v)) {
             fin_dst = nullptr;
             ckp_dst = nullptr;
         }
@@ -555,6 +535,210 @@ static void launch_shape(
 #undef GDN_V16_LAUNCH
 }
 
+static bool host_direct_rows_conflict(
+        const float * base, const ggml_cuda_gated_delta_net_state_src & ss,
+        const std::vector<int32_t> & h_rows, const int64_t n_seqs, const int64_t D) {
+    if (ss.guard_in_place == 2) {
+        return true;
+    }
+    for (int64_t t = 0; t < n_seqs; ++t) {
+        const float * r0 = base + (int64_t) h_rows[t] * ss.row_stride;
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            for (int j = 0; j < 2; ++j) {
+                const float * w = j == 0 ? ss.final_dst : ss.ckpt_dst;
+                if (w == nullptr) {
+                    continue;
+                }
+                const float * w0 = w + s * D;
+                if (r0 < w0 + D && w0 < r0 + D && !(t == s && r0 == w0)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool env_nonzero(const char * name) {
+    const char * s = getenv(name);
+    return s != nullptr && atoi(s) != 0;
+}
+
+static void v16_log_mode_warnings(const int mode) {
+    static std::atomic<bool> warned{false};
+    if (warned.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    if (mode == 2) {
+        GGML_LOG_WARN("GDN V16: GGML_CUDA_GDN_V16=2 is diagnostic-only (includes n_tokens=1 and long prefills)\n");
+    } else if (mode == 3) {
+        GGML_LOG_WARN("GDN V16: GGML_CUDA_GDN_V16=3 is diagnostic-only (runs reference kernel and bit-compares every output; synchronizes)\n");
+    }
+    if (env_nonzero("GGML_CUDA_GDN_R16") || env_nonzero("GGML_CUDA_GDN_SUBWARP") || env_nonzero("GGML_CUDA_GDN_REPLAY_COLS")) {
+        GGML_LOG_WARN("GDN V16: GGML_CUDA_GDN_V16=%d overrides GGML_CUDA_GDN_R16 / GGML_CUDA_GDN_SUBWARP / GGML_CUDA_GDN_REPLAY_COLS\n", mode);
+    }
+}
+
+struct diff_region {
+    const char *     name;
+    const uint32_t * a;
+    const uint32_t * b;
+    int64_t          n;
+};
+
+static void v16_check_bit_exact(
+        const int nc, const int nw, const bool keep_rs, const bool emit_ingr,
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        float * dst_d, void * state_d,
+        const int64_t H, const int64_t n_tokens, const int64_t n_seqs,
+        const int64_t sq1, const int64_t sq2, const int64_t sq3,
+        const int64_t sv1, const int64_t sv2, const int64_t sv3,
+        const int64_t sb1, const int64_t sb2, const int64_t sb3,
+        const int64_t neqk1, const int64_t rq3,
+        const float scale, const int64_t state_slot_stride, const int K, const int32_t * slot_rows,
+        const int ingr_w, const int64_t ingr_region,
+        const ggml_cuda_gated_delta_net_state_src & state_src, ggml_cuda_pool & pool, cudaStream_t stream) {
+    constexpr int64_t S_v = 128;
+    const int64_t n_attn  = n_seqs * n_tokens * H * S_v;
+    const int64_t n_blk   = H * S_v * S_v;
+    const int64_t n_state = n_seqs * n_blk;
+
+    // Reference runs first into pool scratch because s_d may alias live output cache rows.
+    ggml_cuda_pool_alloc<float> r_dst(pool, (size_t) n_attn);
+    const bool has_ckpt = emit_ingr && ((state_src.prefix_n > 0 && n_tokens <= K) || n_tokens > K);
+    const int64_t n_slots = !emit_ingr ? (keep_rs ? std::min<int64_t>(K, n_tokens) : 1) : 0;
+    const int64_t r_state_elems = emit_ingr
+        ? ingr_region + (has_ckpt ? 2 : 1) * n_state
+        : n_slots * n_state;
+    ggml_cuda_pool_alloc<float> r_state(pool, (size_t) r_state_elems);
+    CUDA_CHECK(cudaMemsetAsync(r_state.get(), 0, (size_t) r_state_elems * sizeof(float), stream));
+
+    ggml_cuda_gated_delta_net_state_src ref_ss = state_src;
+    ref_ss.final_dst      = nullptr;
+    ref_ss.ckpt_dst       = nullptr;
+    ref_ss.ingr_dst       = nullptr;
+    ref_ss.guard_in_place = 0;
+    const int64_t ref_slot_stride = emit_ingr ? (int64_t) ingr_w * H * n_seqs : n_state;
+
+    ggml_cuda_gated_delta_net_ref_f32(
+        keep_rs, emit_ingr, q_d, k_d, v_d, g_d, b_d, s_d, r_dst.get(), r_state.get(),
+        H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+        scale, ref_slot_stride, K, nullptr, ingr_w, ingr_region, ref_ss, stream);
+
+    if (emit_ingr) {
+        launch_shape<true, true>(nc, nw, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+            scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
+    } else if (keep_rs) {
+        launch_shape<true, false>(nc, nw, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+            scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
+    } else {
+        launch_shape<false, false>(nc, nw, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+            scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
+    }
+
+    std::vector<diff_region> regs;
+    regs.push_back({ "attn", (const uint32_t *) dst_d, (const uint32_t *) r_dst.get(), n_attn });
+
+    const float * state_f = (const float *) state_d;
+    if (emit_ingr) {
+        bool conflict = false;
+        if (state_src.guard_in_place) {
+            std::vector<int32_t> h_rows((size_t) n_seqs);
+            CUDA_CHECK(cudaMemcpyAsync(h_rows.data(), state_src.rows, h_rows.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            conflict = host_direct_rows_conflict(s_d, state_src, h_rows, n_seqs, n_blk);
+        }
+        // Only slots written by t = 0..n_tokens-1 (target_slot in [max(0, K - n_tokens), K)) are valid.
+        const int64_t sl_beg = std::max<int64_t>(0, (int64_t) K - n_tokens);
+        for (int64_t sl = sl_beg; sl < K; sl++) {
+            for (int64_t sq = 0; sq < n_seqs; sq++) {
+                const float * real_ingr = state_src.ingr_dst
+                    ? state_src.ingr_dst + (sq * K + sl) * ingr_w * H
+                    : state_f + sq * H * ingr_w + sl * state_slot_stride;
+                const float * ref_ingr = r_state.get() + sq * H * ingr_w + sl * ref_slot_stride;
+                regs.push_back({ "ingr", (const uint32_t *) real_ingr, (const uint32_t *) ref_ingr, H * ingr_w });
+            }
+        }
+        const float * fin_real = (!conflict && state_src.final_dst) ? state_src.final_dst : (state_f + ingr_region);
+        regs.push_back({ "final", (const uint32_t *) fin_real, (const uint32_t *) (r_state.get() + ingr_region), n_state });
+        if (has_ckpt) {
+            const float * ckp_real = (!conflict && state_src.ckpt_dst) ? state_src.ckpt_dst : (state_f + ingr_region + n_state);
+            regs.push_back({ "ckpt", (const uint32_t *) ckp_real, (const uint32_t *) (r_state.get() + ingr_region + n_state), n_state });
+        }
+    } else {
+        std::vector<int32_t> h_rows;
+        if (keep_rs && slot_rows != nullptr) {
+            h_rows.resize((size_t) (n_slots * n_seqs));
+            CUDA_CHECK(cudaMemcpyAsync(h_rows.data(), slot_rows, h_rows.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        for (int64_t sl = 0; sl < n_slots; sl++) {
+            for (int64_t sq = 0; sq < n_seqs; sq++) {
+                const int64_t e_real = !keep_rs ? sq * n_blk
+                    : (slot_rows == nullptr ? sq * n_blk + sl * state_slot_stride : (int64_t) h_rows[(size_t) (sl * n_seqs + sq)] * n_blk);
+                const int64_t e_ref = sl * n_state + sq * n_blk;
+                regs.push_back({ "snap", (const uint32_t *) (state_f + e_real), (const uint32_t *) (r_state.get() + e_ref), n_blk });
+            }
+        }
+    }
+
+    const size_t n_reg = regs.size();
+    ggml_cuda_pool_alloc<unsigned long long> stats(pool, 2 * n_reg);
+    std::vector<unsigned long long> init(2 * n_reg, 0);
+    for (size_t i = 0; i < n_reg; ++i) {
+        init[n_reg + i] = ULLONG_MAX;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(stats.get(), init.data(), init.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice, stream));
+    for (size_t i = 0; i < n_reg; ++i) {
+        const int blocks = (int) std::min<int64_t>((regs[i].n + 255) / 256, 2048);
+        if (blocks > 0) {
+            gdn_r16_diff<<<blocks, 256, 0, stream>>>(regs[i].a, regs[i].b, regs[i].n, stats.get() + i, stats.get() + n_reg + i);
+        }
+    }
+    std::vector<unsigned long long> h(2 * n_reg);
+    CUDA_CHECK(cudaMemcpyAsync(h.data(), stats.get(), h.size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    unsigned long long total_diff = 0;
+    size_t first_bad = n_reg;
+    for (size_t i = 0; i < n_reg; ++i) {
+        total_diff += h[i];
+        if (h[i] != 0 && first_bad == n_reg) {
+            first_bad = i;
+        }
+    }
+
+    static std::atomic<unsigned long long> ncalls{0};
+    static std::atomic<unsigned long long> nbad{0};
+    const unsigned long long call_id = ++ncalls;
+    if (total_diff != 0) {
+        const unsigned long long bad_id = ++nbad;
+        const unsigned long long idx = h[n_reg + first_bad];
+        uint32_t w_v16 = 0, w_ref = 0;
+        if (idx < (unsigned long long) regs[first_bad].n) {
+            CUDA_CHECK(cudaMemcpyAsync(&w_v16, regs[first_bad].a + idx, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(&w_ref, regs[first_bad].b + idx, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        float f_v16 = 0.0f, f_ref = 0.0f;
+        memcpy(&f_v16, &w_v16, sizeof(float));
+        memcpy(&f_ref, &w_ref, sizeof(float));
+        GGML_LOG_WARN("GDN V16 bit-check call %llu (C=%d NW=%d emit=%d keep_rs=%d n_tokens=%lld prefix=%d H=%lld n_seqs=%lld): "
+            "MISMATCH total=%llu first=%s[%llu] v16=0x%08x (%.9g) ref=0x%08x (%.9g) bad_calls=%llu\n",
+            call_id, nc, nw, (int) emit_ingr, (int) keep_rs, (long long) n_tokens, state_src.prefix_n,
+            (long long) H, (long long) n_seqs, total_diff, regs[first_bad].name, idx, w_v16, f_v16, w_ref, f_ref, bad_id);
+    } else if ((call_id & (call_id - 1)) == 0) {
+        GGML_LOG_INFO("GDN V16 bit-check call %llu (C=%d NW=%d emit=%d keep_rs=%d n_tokens=%lld prefix=%d H=%lld n_seqs=%lld): "
+            "0 differing words (bad_calls=%llu)\n",
+            call_id, nc, nw, (int) emit_ingr, (int) keep_rs, (long long) n_tokens, state_src.prefix_n,
+            (long long) H, (long long) n_seqs, nbad.load(std::memory_order_relaxed));
+    }
+}
+
 } // namespace gdn_v16
 
 bool ggml_cuda_gated_delta_net_v16_try(
@@ -569,7 +753,7 @@ bool ggml_cuda_gated_delta_net_v16_try(
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, const int32_t * slot_rows,
         int ingr_w, int64_t ingr_region,
-        const ggml_cuda_gated_delta_net_state_src & state_src, cudaStream_t stream) {
+        const ggml_cuda_gated_delta_net_state_src & state_src, ggml_cuda_pool * pool, cudaStream_t stream) {
     using namespace gdn_v16;
     const int mode = v16_mode();
     if (mode <= 0 || S_v != 128 || n_tokens < 1 || (emit_ingr && !keep_rs)) {
@@ -578,6 +762,7 @@ bool ggml_cuda_gated_delta_net_v16_try(
     if (state_src.prefix_n > 0 && !emit_ingr) {
         return false;
     }
+    v16_log_mode_warnings(mode);
     if (mode == 1) {
         if (n_tokens + state_src.prefix_n < 2) {
             return false;
@@ -604,6 +789,18 @@ bool ggml_cuda_gated_delta_net_v16_try(
 
     const int nc = v16_cols();
     const int nw = v16_warps();
+
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (mode == 3 && pool != nullptr) {
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+    }
+    if (mode == 3 && pool != nullptr && cap == cudaStreamCaptureStatusNone) {
+        v16_check_bit_exact(nc, nw, keep_rs, emit_ingr, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+            scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, *pool, stream);
+        return true;
+    }
+
     if (emit_ingr) {
         launch_shape<true, true>(nc, nw, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
             H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
