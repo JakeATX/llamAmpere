@@ -1797,7 +1797,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    // AI+ decode-fast (6-rate, N <= 8) for what T1 declines (N == 1, n_pairs > 64, non-Ampere). Kill switch GGML_CUDA_AI4_DECODE_FAST=0.
+    // AI+ decode-fast (6-rate, N <= 8) for what T1 declines: N == 1, AIT5_U/AIT2P_U at N 2..8, everything when EXP_TURBO=0.
+    // It rejects n_pairs > 64 and non-Ampere itself. Kill switch GGML_CUDA_AI4_DECODE_FAST=0.
     if (!fused && n_tok <= 8 && ggml_cuda_ai4_decode_fast_unit_try(
             ctx, src0->type, (const uint8_t *) src0->data, (int64_t) src0->nb[2], ids,
             xq, xs, y_out, M, n_tok, K, n_used, ne11, n_expert, xsh, y_into != nullptr)) {
