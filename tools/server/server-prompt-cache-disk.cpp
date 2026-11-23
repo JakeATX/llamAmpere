@@ -566,13 +566,32 @@ int64_t server_prompt_disk_tier::clock_us() const {
     return clock_us_fn ? clock_us_fn() : ggml_time_us();
 }
 
+uint64_t server_prompt_disk_tier::guard_floor(uint64_t capacity) const {
+    uint64_t floor = (uint64_t) (guard_frac * (double) capacity);
+    if (guard_cap > 0) {
+        floor = std::min(floor, guard_cap);
+    }
+    return std::max(floor, guard_abs);
+}
+
+std::string server_prompt_disk_tier::guard_rule() const {
+    constexpr double GiB = 1024.0*1024.0*1024.0;
+    char buf[128];
+    if (guard_cap > 0) {
+        snprintf(buf, sizeof(buf), "%.3g%% of the filesystem in [%.1f GiB, %.1f GiB]", guard_frac * 100.0, guard_abs / GiB, guard_cap / GiB);
+    } else {
+        snprintf(buf, sizeof(buf), "max(%.3g%%, %.2f GiB)", guard_frac * 100.0, guard_abs / GiB);
+    }
+    return buf;
+}
+
 server_prompt_disk_tier::space_info server_prompt_disk_tier::space_check() const {
     space_info si;
     if (!space_fn || !space_fn(dir, si.capacity, si.available)) {
         return si;
     }
 
-    si.reserve = std::max<uint64_t>((uint64_t) (guard_frac * (double) si.capacity), guard_abs);
+    si.reserve = guard_floor(si.capacity);
     si.want    = limit > 0 ? limit - std::min<uint64_t>(size(), limit) : guard_abs;
 
     if (si.available <= si.reserve) {
@@ -592,7 +611,7 @@ bool server_prompt_disk_tier::guard_allows(uint64_t need) {
         return true; // cannot query: the write itself will fail cleanly if the disk is full
     }
 
-    const uint64_t reserve = std::max<uint64_t>((uint64_t) (guard_frac * (double) capacity), guard_abs);
+    const uint64_t reserve = guard_floor(capacity);
 
     constexpr double GiB = 1024.0*1024.0*1024.0;
 
@@ -602,9 +621,9 @@ bool server_prompt_disk_tier::guard_allows(uint64_t need) {
 
         const int64_t t_now = clock_us();
         if (!guard_active) {
-            SRV_WRN("prompt cache disk tier: skipping writes, %.1f GiB free of %.1f GiB (keeping at least %.1f GiB free: max(%.0f%%, %.0f GiB)); "
+            SRV_WRN("prompt cache disk tier: skipping writes, %.1f GiB free of %.1f GiB (keeping at least %.1f GiB free: %s); "
                     "entries evicted from RAM are lost until space is freed\n",
-                    available / GiB, capacity / GiB, reserve / GiB, guard_frac * 100.0, guard_abs / GiB);
+                    available / GiB, capacity / GiB, reserve / GiB, guard_rule().c_str());
             SRV_WRN("%s", "prompt cache disk tier: --cache-disk-min-free N (MiB, NG for GiB, N% of the filesystem) sets the free space to keep\n");
             guard_active     = true;
             guard_t_warn     = t_now;

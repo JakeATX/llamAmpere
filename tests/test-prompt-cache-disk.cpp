@@ -463,6 +463,8 @@ static void test_guard(const std::string & root) {
 
     uint64_t cap = 100*GiB, avail = 9*GiB;
     t.space_fn = [&](const std::string &, uint64_t & c, uint64_t & a) { c = cap; a = avail; return true; };
+    // the max(frac, abs) arithmetic without an upper bound (the old default, still what guard_cap = 0 gives)
+    t.guard_frac = 0.10; t.guard_abs = 8*GiB; t.guard_cap = 0;
 
     // 100 GiB disk: reserve = max(10 GiB, 8 GiB) = 10 GiB
     CHECK(!write_entry(t, make_entry(1, 10, 1000)));
@@ -498,6 +500,50 @@ static void test_guard(const std::string & root) {
     CHECK(write_entry(t, make_entry(9, 10, 1000)));
 }
 
+// the default floor: 5% of the filesystem, at least 8 GiB, at most 32 GiB. A big, mostly full volume still gets a
+// disk cache (the old max(10%, 8 GiB) kept 183 GiB free on a 1.8 TB drive and wrote nothing); explicit settings
+// (guard_cap = 0, as --cache-disk-min-free sets) keep their exact meaning.
+static void test_guard_default(const std::string & root) {
+    const std::string dir = root + "/guard-default";
+    server_prompt_disk_tier t = make_tier(dir, "k", 0);
+    CHECK(t.guard_frac == 0.05 && t.guard_abs == 8*GiB && t.guard_cap == 32*GiB);
+
+    uint64_t cap = 1863*GiB, avail = 100*GiB; // 2 TB drive (1.82 TiB) at 95% full
+    t.space_fn = [&](const std::string &, uint64_t & c, uint64_t & a) { c = cap; a = avail; return true; };
+    CHECK(t.guard_floor(cap) == 32*GiB);
+    CHECK(t.space_check().state == server_prompt_disk_tier::SPACE_OK);
+    CHECK(write_entry(t, make_entry(1, 10, 1000)));
+    CHECK(t.n_guard_skips == 0 && count_files(dir, ".bin") == 1);
+    avail = 33*GiB;  // 1 GiB above the cap floor: still writes
+    CHECK(write_entry(t, make_entry(2, 10, 1000)));
+    avail = 31*GiB;  // below it: skipped, counted
+    CHECK(!write_entry(t, make_entry(3, 10, 1000)));
+    CHECK(t.n_guard_skips == 1);
+
+    cap = 916*GiB; avail = 27*GiB;   // 97% full 1 TB volume: floor 32 GiB (5% = 45.8 capped) -> skip
+    CHECK(t.guard_floor(cap) == 32*GiB);
+    CHECK(!write_entry(t, make_entry(4, 10, 1000)));
+    avail = 40*GiB;
+    CHECK(write_entry(t, make_entry(5, 10, 1000)));
+
+    cap = 400*GiB;                   // mid-size: 5% = 20 GiB inside the bounds
+    CHECK(t.guard_floor(cap) == 20*GiB);
+    cap = 64*GiB;                    // small: the 8 GiB minimum
+    CHECK(t.guard_floor(cap) == 8*GiB);
+    avail = 9*GiB;
+    CHECK(write_entry(t, make_entry(6, 10, 1000)));
+    avail = 7*GiB;
+    CHECK(!write_entry(t, make_entry(7, 10, 1000)));
+
+    // explicit overrides as server-context applies them: N% = frac only, N MiB = abs only, both uncapped
+    t.guard_frac = 0.10; t.guard_abs = 0; t.guard_cap = 0;
+    CHECK(t.guard_floor(1863*GiB) == (uint64_t) (0.10 * (double) (1863*GiB)));
+    t.guard_frac = 0.0; t.guard_abs = 100*GiB; t.guard_cap = 0;
+    CHECK(t.guard_floor(1863*GiB) == 100*GiB);
+    t.guard_frac = 0.0; t.guard_abs = 0; t.guard_cap = 0; // --cache-disk-min-free 0
+    CHECK(t.guard_floor(1863*GiB) == 0);
+}
+
 // the guard must be visible: a startup state that says writes are (about to be) skipped, a rate-limited
 // repeated warning while skipping, and counters for /metrics
 static void test_guard_visibility(const std::string & root) {
@@ -512,6 +558,7 @@ static void test_guard_visibility(const std::string & root) {
     int64_t now = 1000000;
     t.clock_us_fn = [&]() { return now; };
     t.guard_warn_interval_s = 60.0;
+    t.guard_frac = 0.10; t.guard_abs = 8*GiB; t.guard_cap = 0; // uncapped max(10%, 8 GiB) rule for these numbers
 
     // startup states: floor = max(10% of 1000 GiB, 8 GiB) = 100 GiB, the tier wants its 16 GiB limit above it
     auto st = t.space_check();
@@ -531,6 +578,7 @@ static void test_guard_visibility(const std::string & root) {
     {
         server_prompt_disk_tier u = make_tier(dir + "-nolimit", "k", 0);
         u.space_fn = t.space_fn;
+        u.guard_frac = 0.10; u.guard_abs = 8*GiB; u.guard_cap = 0;
         avail = 105*GiB;
         CHECK(u.space_check().state == server_prompt_disk_tier::SPACE_NEAR);
         avail = 109*GiB;
@@ -598,6 +646,7 @@ static void test_guard_visibility(const std::string & root) {
         std::string err;
         pc.disk.space_fn    = t.space_fn;
         pc.disk.clock_us_fn = t.clock_us_fn;
+        pc.disk.guard_frac  = 0.10; pc.disk.guard_abs = 8*GiB; pc.disk.guard_cap = 0;
         CHECK(pc.disk_open(dir + "-flush", "k", 0, err)); // logs the BELOW state
         server_prompt p;
         p.tokens = server_tokens(llama_tokens{1, 2, 3, 4}, false);
@@ -1191,6 +1240,7 @@ int main() {
     test_fifo(root);
     test_guard(root);
     test_guard_visibility(root);
+    test_guard_default(root);
     test_corrupt_cleanup(root);
     test_supersede_dedupe(root);
     test_spare_pool();

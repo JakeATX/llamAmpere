@@ -847,7 +847,7 @@ struct common_params {
     bool        cache_disk      = true;  // prompt-cache disk tier (--no-cache-disk turns it off)
     std::string cache_disk_path;         // disk tier directory (empty = common_prompt_cache_default_dir())
     int32_t cache_disk_mib      = 16384; // disk tier size limit in MiB, -1 = no limit (free-space guard only), 0 = disable
-    int32_t cache_disk_min_free_mib = -1; // [#187] free space the disk tier leaves on its filesystem in MiB (-1 = max(10%, 8 GiB))
+    int32_t cache_disk_min_free_mib = -1; // [#187] free space the disk tier leaves on its filesystem in MiB (-1 = 5% of the filesystem in [8 GiB, 32 GiB])
     float   cache_disk_min_free_pct = -1.0f; // ... or as a percentage of the filesystem (-1 = unset; set by --cache-disk-min-free N%)
     int32_t cache_ram_ckpt      = 4;     // RAM tier: newest context checkpoints kept per entry (+ log-spaced older), 0 = all
     std::string eval_cache_path;          // --eval-cache DIR: read-mostly folder of pre-built prompt states (empty = off)

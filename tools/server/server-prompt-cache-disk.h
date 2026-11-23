@@ -69,9 +69,12 @@ struct server_prompt_disk_tier {
     uint64_t    key_hash = 0;
     size_t      limit    = 0; // bytes, 0 = no limit
 
-    // writes are skipped while the filesystem would have less than max(guard_frac * capacity, guard_abs) free
-    double      guard_frac = 0.10;
+    // writes are skipped while the filesystem would have less than guard_floor(capacity) free:
+    // guard_frac * capacity, at least guard_abs and (guard_cap > 0) at most guard_cap. Default 5% in [8 GiB, 32 GiB]:
+    // a flat 10% kept 183 GiB free on a 1.8 TB drive, so most disks never got a disk cache.
+    double      guard_frac = 0.05;
     uint64_t    guard_abs  = 8ull*1024*1024*1024;
+    uint64_t    guard_cap  = 32ull*1024*1024*1024; // 0 = no upper bound
     space_fn_t  space_fn;
 
     // while writes are being skipped, the warning is repeated at most once per this many seconds (0 = every skip)
@@ -98,11 +101,15 @@ struct server_prompt_disk_tier {
         space_state state     = SPACE_UNKNOWN;
         uint64_t    capacity  = 0;
         uint64_t    available = 0;
-        uint64_t    reserve   = 0; // the floor: max(guard_frac * capacity, guard_abs)
+        uint64_t    reserve   = 0; // the floor: guard_floor(capacity)
         uint64_t    want      = 0; // headroom above the floor the tier wants (room left to its limit, else guard_abs)
     };
     // SPACE_BELOW: writes are skipped now; SPACE_NEAR: the floor will stop writes before the tier reaches its limit
     space_info space_check() const;
+
+    // the free space writes leave on a filesystem of this capacity, and the rule as text for logs
+    uint64_t    guard_floor(uint64_t capacity) const;
+    std::string guard_rule() const;
 
     // create the directory (mkdir -p), check that it is writable and index it; on failure `err` says why
     bool open(const std::string & dir, const std::string & key, size_t limit_bytes, std::string & err);
