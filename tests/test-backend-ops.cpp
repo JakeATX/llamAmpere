@@ -25128,7 +25128,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // GDNREPLAY2 GGML_TEST_GDN_VERIFY_PERF=1: only one GDN verify round at n_rs_seq K = 4. Width 5 (4 drafts)
     // folds the replay into the main call; width 4 keeps the separate replay, a K=1 call over the 4 ring slots.
-    if (getenv("GGML_TEST_GDN_VERIFY_PERF") != nullptr) {
+    if (const char * e = getenv("GGML_TEST_GDN_VERIFY_PERF"); e != nullptr) {
+        if (strcmp(e, "16") == 0) {
+            for (int64_t n : {8, 16}) {
+                test_cases.emplace_back(new test_gated_delta_net_verify(n, 15, 0, -1));
+                test_cases.emplace_back(new test_gated_delta_net_verify(n, 15, 2, -1));
+                for (int64_t acc : {0, 5, 10, 15}) {
+                    test_cases.emplace_back(new test_gated_delta_net_verify(n, 15, 2, acc));
+                }
+            }
+            return test_cases;
+        }
         for (int64_t n : {4, 5}) {
             test_cases.emplace_back(new test_gated_delta_net_verify(n, 4, 0, -1));
             test_cases.emplace_back(new test_gated_delta_net_verify(n, 4, 2, -1));

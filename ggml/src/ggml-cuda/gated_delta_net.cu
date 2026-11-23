@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_v16.cuh"
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 #include "convert.cuh"
@@ -1911,6 +1912,9 @@ static void gated_delta_net_dispatch(
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
         sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, slot_rows
     if constexpr (std::is_same_v<state_t, float>) {
+        if (!kda && ggml_cuda_gated_delta_net_v16_try(keep_rs, emit_ingr, GDN_ARGS, ingr_w, ingr_region, state_src, stream)) {
+            return;
+        }
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         // Every V row must permit float2 accesses, including strided/permuted views.
         const bool aligned_v = (reinterpret_cast<uintptr_t>(v_d) % alignof(float2)) == 0 &&
@@ -2150,7 +2154,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
             launch_gated_delta_net<true, true, true, float>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
                 state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
-        } else {
+        } else if (!ggml_cuda_gated_delta_net_v16_try(true, true, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
+                state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream)) {
             launch_gated_delta_net<false, true, true, float>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale,
                 state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, stream);
