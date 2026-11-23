@@ -1546,8 +1546,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         LOG_INF("card preset %s: chosen context %u, ubatch %u; fit margin %zu MiB\n",
                 params.card_preset.c_str(), cparams.n_ctx, cparams.n_ubatch, params.fit_params_target.front() >> 20);
         if (string_ends_with(params.card_preset, "ink") && n_ctx_asked > 0 && cparams.n_ctx < n_ctx_asked) {
-            LOG_WRN("card preset %s: not enough free VRAM for ctx %u plus an expert cache (other programs use part of the "
-                    "card); context reduced to %u to keep room for the cache. Close other GPU programs or pass -c N\n",
+            LOG_WRN("card preset %s: not enough free VRAM for ctx %u with the preset margin and the expert-cache floor "
+                    "(other programs use part of the card); context reduced to %u. Close other GPU programs to get it back\n",
                     params.card_preset.c_str(), n_ctx_asked, cparams.n_ctx);
         }
     }

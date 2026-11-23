@@ -1070,6 +1070,7 @@ static void common_params_fit_impl(
             preset_free.push_back(memory.free);
             preset_lines.push_back(size_t(memory.total) - std::min(size_t(memory.total), margin));
             preset_targets.push_back(common_fit_preset_target(memory.total, memory.free, margin));
+            const bool margin_used_up = preset_targets.back() == 0 && margin > 0;
             // fork (INKSMALL2): a preset whose expert cache is sized from what the fit leaves free (*ink) keeps at
             // least this much above weights + KV + compute, so a busy desktop lowers ctx before it starves the cache
             if (const char * mf = std::getenv("LLAMA_FIT_PRESET_MIN_FREE_MIB")) {
@@ -1078,7 +1079,7 @@ static void common_params_fit_impl(
             LOG_INF("preset line %zu MiB = total %zu - margin %zu on %s; free target %zu MiB\n",
                 preset_lines.back()/MiB, size_t(memory.total)/MiB, margin/MiB,
                 ggml_backend_dev_name(devs[id]), preset_targets.back()/MiB);
-            if (preset_targets.back() == 0 && margin > 0) {
+            if (margin_used_up) {
                 LOG_WRN("%s: other programs already use %zu MiB of %s, at or over the preset margin of %zu MiB: "
                     "the fit keeps no spare memory and the server may run out of memory while writing; "
                     "close them or pass a smaller --ctx-size\n", __func__,
@@ -1305,8 +1306,9 @@ static void common_params_fit_impl(
                                 {int64_t(dmds_min_ctx[id].mb.total()), margins[id]});
                             if (overage > 0) {
                                 throw common_params_fit_exception("preset line " + std::to_string(preset_lines[id]/MiB) +
-                                    " MiB exceeded by " + std::to_string((overage + MiB - 1)/MiB) +
-                                    " MiB even at minimum context; lower -ub or change model/placement");
+                                    " MiB (or the LLAMA_FIT_PRESET_MIN_FREE_MIB expert-cache floor) exceeded by " +
+                                    std::to_string((overage + MiB - 1)/MiB) +
+                                    " MiB even at minimum context; close other GPU programs, lower -ub or change model/placement");
                             }
                         }
                     }
