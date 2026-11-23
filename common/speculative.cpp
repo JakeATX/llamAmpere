@@ -1149,21 +1149,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             LOG_INF("%s: lattice verify-length planner on (LLAMA_SPEC_LATTICE_PLAN): verify ms by rows %s, draft %.2f ms\n",
                     __func__, pts.c_str(), lattice_cost.draft_ms);
         }
-        if (const char * env = getenv("LLAMA_DSPINE_ADAPT"); is_dflash2 && env && *env && strcmp(env, "0") != 0) {
-            float a = 0.125f;
-            int lo = 0;
-            float up = 0.0f, down = 0.0f;
-            const int n = sscanf(env, "%d:%f:%f:%f", &lo, &up, &down, &a);
-            if (n < 3 || lo < 1 || lo >= this->params.n_max || !(down <= up) || !(a > 0.0f && a <= 1.0f)) {
-                throw std::runtime_error("LLAMA_DSPINE_ADAPT must be \"lo:up:down[:alpha]\" with 1 <= lo < --spec-draft-n-max, down <= up, 0 < alpha <= 1");
-            }
-            aw_on = true; aw_lo = lo; aw_up = up; aw_down = down; aw_alpha = a;
-            aw_width.assign(n_seq, lo);
-            aw_drafted.assign(n_seq, 0);
-            aw_ema.assign(n_seq, 0.0f);
-            LOG_INF("%s: DSpine adaptive width on (LLAMA_DSPINE_ADAPT): %d or %d tokens, widen at EMA >= %.2f tok/round, "
-                    "narrow below %.2f, alpha %.3f\n", __func__, lo, this->params.n_max, up, down, a);
-        }
         char lilicorr_meta[32] = {};
         lilicorr_top_k = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0
                 ? std::atoi(lilicorr_meta) : 0;
@@ -1238,6 +1223,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // [DSPINE-V07] the lattice graph needs a block of 2..block_size rows; refuse here rather than abort mid-request
             throw std::runtime_error(string_format("lattice drafter: draft n_max %d must be in 1..%d (block size %d)",
                     this->params.n_max, block_size - 1, block_size));
+        }
+        if (const char * env = getenv("LLAMA_DSPINE_ADAPT"); is_dflash2 && env && *env && strcmp(env, "0") != 0) {
+            float a = 0.125f;
+            int lo = 0;
+            float up = 0.0f, down = 0.0f;
+            int used3 = -1, used4 = -1;
+            const int n = sscanf(env, "%d:%f:%f%n:%f%n", &lo, &up, &down, &used3, &a, &used4);
+            const size_t len = strlen(env);
+            const bool whole = (n == 3 && used3 == (int) len) || (n == 4 && used4 == (int) len);
+            if (!whole || lo < std::max(1, this->params.n_min) || lo >= this->params.n_max || !(down < up) ||
+                    !(a > 0.0f && a <= 1.0f)) {
+                throw std::runtime_error("LLAMA_DSPINE_ADAPT must be \"lo:up:down[:alpha]\" with max(1, --spec-draft-n-min) <= lo < "
+                        "--spec-draft-n-max (after the block-size clamp), down < up, 0 < alpha <= 1");
+            }
+            aw_on = true; aw_lo = lo; aw_up = up; aw_down = down; aw_alpha = a;
+            aw_width.assign(n_seq, lo);
+            aw_drafted.assign(n_seq, 0);
+            aw_ema.assign(n_seq, 0.0f);
+            LOG_INF("%s: DSpine adaptive width on (LLAMA_DSPINE_ADAPT): %d or %d tokens, widen at EMA >= %.2f tok/round, "
+                    "narrow below %.2f, alpha %.3f\n", __func__, lo, this->params.n_max, up, down, a);
         }
 
         if (has_rnn_context) {
@@ -1811,7 +1816,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // the width comes from past rounds only; the walk stops there, so no slot past it is drawn
                     n_pos = std::min(n_pos, aw_width[seq_id]);
                     aw_drafted[seq_id] = aw_width[seq_id];
-                    aw_rounds[aw_width[seq_id] > aw_lo ? 1 : 0]++;
                 }
 
                 // [DSPINE-V07] opt-in verify-length planner (LLAMA_SPEC_LATTICE_PLAN=1); off = the plain walk above
@@ -1983,9 +1987,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (aw_on && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq && aw_drafted[seq_id] > 0) {
             // kept tokens this round (kept drafts + the target's own); a draft the server cut short still counts
-            const float kept = (float) n_accepted + 1.0f;
+            // the controller's count: the forced probe's real-rule count, the mb exact-rule / copy-tail cap, never past the draft
+            int32_t acc = n_accepted_real >= 0 ? n_accepted_real : n_accepted;
+            if (n_accepted_ctrl >= 0) {
+                acc = std::min(acc, n_accepted_ctrl);
+            }
+            acc = std::min(acc, aw_drafted[seq_id]);
+            const float kept = (float) acc + 1.0f;
             float & ema = aw_ema[seq_id];
             ema = ema == 0.0f ? kept : ema + aw_alpha * (kept - ema);
+            aw_rounds[aw_drafted[seq_id] > aw_lo ? 1 : 0]++; // verified rounds only
             const int32_t before = aw_width[seq_id];
             if (before == aw_lo && ema >= aw_up) {
                 aw_width[seq_id] = params.n_max;
