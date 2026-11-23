@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  BUILD_SHA: ${{ inputs.sha || '3063401db06f8fdcf33b82ba6f686973224e052b' }}
+  BUILD_SHA: ${{ inputs.sha || '841a210b88bd09e8981cf53ac09ea19afa1a6f3f' }}
   ZIP_NAME: ${{ inputs.name || 'llamampere-v0.7.3-rc-windows-x86_64-cuda12-server' }}
 
 jobs:
