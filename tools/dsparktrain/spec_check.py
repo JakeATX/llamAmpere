@@ -46,6 +46,7 @@ def main():
     ap.add_argument('--wiki', default='/mnt/data/inkflags/data/wiki.test.raw'); ap.add_argument('--port', type=int, default=18631)
     ap.add_argument('--ctx', type=int, default=16384); ap.add_argument('--timeout', type=int, default=7200); ap.add_argument('--depth', type=int, default=4); ap.add_argument('--extra', default='')
     ap.add_argument('--env', default='', help='VAR=val ... added to the server env (after the GGML_/LLAMA_ strip)')
+    ap.add_argument('--reuse', action='store_true', help='keep the prompt cached across seeds (one prefill; replies unchanged)')
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('GGML_', 'LLAMA_', 'TURBO_'))}
@@ -74,10 +75,10 @@ def main():
         res['load_s'] = round(time.time() - t0, 1)
         ids = build_prompt(base, a.plen, a.wiki)
         res['prompt_tokens'] = len(ids)
-        post(base, '/completion', dict(prompt=ids, n_predict=1, temperature=0.0, cache_prompt=False), a.timeout)  # warm-up
+        post(base, '/completion', dict(prompt=ids, n_predict=1, temperature=0.0, cache_prompt=a.reuse), a.timeout)  # warm-up
         for seed in [int(s) for s in a.seeds.split(',')]:
             body = dict(prompt=ids, n_predict=a.npred, temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, repeat_penalty=1.0, seed=seed,
-                        return_tokens=True, cache_prompt=False, stream=False)
+                        return_tokens=True, cache_prompt=a.reuse, stream=False)
             r = post(base, '/completion', body, a.timeout); tm = r.get('timings', {})
             res['rows'].append(dict(seed=seed, n=len(r['tokens']), stop_type=r.get('stop_type'), tok_s=tm.get('predicted_per_second'),
                                     draft_n=tm.get('draft_n'), draft_n_accepted=tm.get('draft_n_accepted')))

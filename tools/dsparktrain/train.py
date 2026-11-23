@@ -62,6 +62,7 @@ def slot_terms(l, S, rows, t, mb):
     return D.accept_terms(p, pid, q, qid, t, eog=S['eog'], want_mb=mb), p, pid
 
 
+LONG_LEN = 16384   # sequences longer than this use the small chunk (train --chunk-long, eval 32)
 EVAL_CHUNK = int(os.environ.get('DSPARK_EVAL_CHUNK', '128'))   # anchors per eval chunk (32 for ~100K-token sequences)
 
 
@@ -82,7 +83,8 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
         if an is None:
             continue
         cs, cms, valid_all = [], [], []
-        for a, logits, rows, tdat in D.seq_slots(W, fr, S, an, walk, chunk=EVAL_CHUNK):
+        ch = EVAL_CHUNK if S['len'] <= LONG_LEN else min(EVAL_CHUNK, 32)   # ~100K-token sequences: small chunks (full-attn layer 1)
+        for a, logits, rows, tdat in D.seq_slots(W, fr, S, an, walk, chunk=ch):
             A, C, Am, Cm, Cmc = [], [], [], [], []
             for s, l in enumerate(logits):
                 r, _, _ = slot_terms(l, S, rows[:, s], tdat[:, s], True)
@@ -129,6 +131,9 @@ def main():
     ap.add_argument('--loss', default='e4', choices=['e4', 'mb']); ap.add_argument('--kl', type=float, default=0.1)
     ap.add_argument('--seqs-per-step', type=int, default=4); ap.add_argument('--anchors-per-seq', type=int, default=512)
     ap.add_argument('--chunk', type=int, default=128); ap.add_argument('--bf16-base', action='store_true')
+    ap.add_argument('--chunk-long', type=int, default=32, help='anchor chunk for sequences longer than LONG_LEN')
+    ap.add_argument('--train2', help='second train set P:SEQ (e.g. the long-context dumps), drawn with probability --frac2')
+    ap.add_argument('--frac2', type=float, default=0.5)
     ap.add_argument('--eval-every', type=int, default=100); ap.add_argument('--eval-stride', type=int, default=4)
     ap.add_argument('--select', default='E_mb'); ap.add_argument('--max-eval-seq', type=int, default=0)
     ap.add_argument('--profile', type=int, default=0, help='run N train steps, print per-step timings, exit')
@@ -162,7 +167,7 @@ def main():
                 emit(dict(eval=name, **evaluate(P, fr, ds, a.walk, 1, a.max_eval_seq, fold_fixed, tag=name)))
         return 0
 
-    tr = dset(a.train); sel = dset(a.sel)
+    tr = dset(a.train); tr2 = dset(a.train2); sel = dset(a.sel)
     params = [torch.nn.Parameter(v) for v in P.values()]
     names = list(P.keys())
     for n, p in zip(names, params):
@@ -177,6 +182,8 @@ def main():
         torch.save({k: v.detach().cpu() for k, v in P.items()}, os.path.join(a.out, 'best.pt'))
     order = list(range(len(tr)))
     random.shuffle(order); oi = 0
+    order2 = list(range(len(tr2))) if tr2 is not None else []
+    random.shuffle(order2); oi2 = 0
     tstep = []
     for step in range(1, (a.profile or a.steps) + 1):
         sync(dev); t0 = time.time()
@@ -185,9 +192,14 @@ def main():
         n_tot, lsum, esum, ksum = 0, 0.0, 0.0, 0.0
         batches = []
         for _ in range(a.seqs_per_step):
-            S = tr.seq(order[oi % len(order)], dev); oi += 1
-            if oi % len(order) == 0:
-                random.shuffle(order)
+            if tr2 is not None and random.random() < a.frac2:
+                S = tr2.seq(order2[oi2 % len(order2)], dev); oi2 += 1
+                if oi2 % len(order2) == 0:
+                    random.shuffle(order2)
+            else:
+                S = tr.seq(order[oi % len(order)], dev); oi += 1
+                if oi % len(order) == 0:
+                    random.shuffle(order)
             an = D.anchors_of(S, a.walk)
             if an is None:
                 continue
@@ -204,9 +216,10 @@ def main():
             ctx_out = [t for pair in kv for t in pair] + [f_rnn]
             ctx_l = [t.detach().requires_grad_(True) for t in ctx_out]
             ctx = ([(ctx_l[2 * j], ctx_l[2 * j + 1]) for j in range(D.N_LAYER)], ctx_l[-1])
-            for i in range(0, an.shape[0], a.chunk):
-                sub = an[i:i + a.chunk]
-                (aa, logits, rows, tdat), = list(D.seq_slots(Wl, fr, S, sub, a.walk, bf16_base=a.bf16_base, chunk=a.chunk, ctx=ctx))
+            ch = a.chunk if S['len'] <= LONG_LEN else a.chunk_long
+            for i in range(0, an.shape[0], ch):
+                sub = an[i:i + ch]
+                (aa, logits, rows, tdat), = list(D.seq_slots(Wl, fr, S, sub, a.walk, bf16_base=a.bf16_base, chunk=ch, ctx=ctx))
                 A, C, KL = [], [], 0.0
                 for s, l in enumerate(logits):
                     r, p, pid = slot_terms(l, S, rows[:, s], tdat[:, s], a.loss == 'mb')
