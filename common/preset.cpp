@@ -137,7 +137,10 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 // fork (INKSMALL2): fit headroom kept for the expert cache (sized after the fit). The auto-size reserve
                 // (900 + 256 + 2 KiB/cell) sits ~572 MiB above the fit's measured compute at ctx 131,072, so 1,152 keeps a
                 // >= ~580 MiB cache; with less free VRAM (a busy desktop) the fit lowers ctx first. Override by env.
-                {"LLAMA_FIT_PRESET_MIN_FREE_MIB", "1152"}
+                {"LLAMA_FIT_PRESET_MIN_FREE_MIB", "1152"},
+                // fork (INKKV 0.7.4): the 1-sequence INKKV bias-chunk default is 1024 MiB (32K prefill +2.8%); the small
+                // cards keep 512 so their fits (sized with 512) do not move
+                {"LLAMA_INKKV_BIAS_MIB", "512"}
             }
         };
         auto ink10 = ink8;
