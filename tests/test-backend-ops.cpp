@@ -24857,6 +24857,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
             return test_cases;
         }
+        // [DSPINE4] GGML_TEST_AIV2_PERF=dsw16: DSpine verify widths 1..16 (where is the 8 -> 9 row cliff?): decode attention
+        // at 775 records + 300 ring rows (99,628 positions) and 60 records (~8K), plus the P76 dense shapes (AIT4 / AIT3 /
+        // AIT5_U) and the Q6_K / Q8_0 curve (head / shortlist) at 4..16 rows
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "dsw16") {
+            for (int64_t ng : { 775, 60 }) {
+                for (int64_t n_q : { 1, 4, 6, 7, 8, 9, 10, 12, 16 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, ng, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
+                }
+            }
+            for (int64_t n : { 4, 8, 9, 12, 16 }) {
+                for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 5120, 5120 }, { 17408, 5120 }, { 5120, 17408 }, { 12288, 5120 } }) {
+                    for (ggml_type t : { GGML_TYPE_AIT4, GGML_TYPE_AIT3 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                    test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, GGML_TYPE_AIT5_U));
+                }
+                for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 26624, 5120 }, { 248320, 5120 } }) {
+                    for (ggml_type t : { GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+                        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                    }
+                }
+            }
+            return test_cases;
+        }
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "fakeep") {
             for (int64_t ng : { 160, 256, 448 }) {
                 for (int64_t n_q : { 1, 3, 6 }) {
