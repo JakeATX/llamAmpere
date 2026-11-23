@@ -8014,6 +8014,31 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
     }
+    // debug (INKSTREAM): LLAMA_GRAPH_MEM_TOP=N lists the N largest GPU-assigned graph tensors after a reserve, and the
+    // GPU bytes by op, to see what scales the compute buffer with rows. Off by default.
+    if (static const int top = getenv("LLAMA_GRAPH_MEM_TOP") ? atoi(getenv("LLAMA_GRAPH_MEM_TOP")) : 0; top > 0 && !split_only) {
+        std::vector<std::pair<size_t, ggml_tensor *>> v;
+        std::map<std::string, size_t> by_op;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+            auto * dev = b ? ggml_backend_get_device(b) : nullptr;
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || t->view_src) { continue; }
+            v.emplace_back(ggml_nbytes(t), t);
+            by_op[ggml_op_desc(t)] += ggml_nbytes(t);
+        }
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        LLAMA_LOG_WARN("%s: [MEMTOP] tokens %u outputs %u: %zu GPU nodes\n", __func__, n_tokens, n_outputs, v.size());
+        for (int i = 0; i < std::min<int>(top, (int) v.size()); ++i) {
+            const ggml_tensor * t = v[i].second;
+            LLAMA_LOG_WARN("%s: [MEMTOP] %8.2f MiB %-12s %-36s [%lld %lld %lld %lld] %s\n", __func__, v[i].first / 1048576.0,
+                           ggml_op_desc(t), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                           (long long) t->ne[3], ggml_type_name(t->type));
+        }
+        for (const auto & [op, bytes] : by_op) {
+            LLAMA_LOG_WARN("%s: [MEMTOP] op %-14s %10.2f MiB (sum of node sizes, not live)\n", __func__, op.c_str(), bytes / 1048576.0);
+        }
+    }
 
     return gf;
 }
