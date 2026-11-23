@@ -117,11 +117,12 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // cache auto-sized (llama-context: free - reserve; --moe-cache-mib N overrides), SJ-KVaRN 4/4, op offload off,
         // ub ceiling 512 with the deep-ctx ladder (a larger ub buys compute buffer out of the expert cache: 9,216 MiB cap,
         // ub 512 70.9 tok/s vs 1024 56.1 vs 2048 31.2), moe cache batch 512 (llama-context default without op offload).
-        // ctx 131,072 = the 100K design depth. All three carry the DSpark drafter; arg.cpp keeps it only where it measured
-        // faster (--card-drafter auto: 12ink on, 8ink/10ink off; on/off force it). The reason: the drafter's ~1.4 GB of
-        // VRAM (weights + KV + compute) comes out of the expert cache, and on 8/10 GB the lost cache hits cost more than
-        // drafting gains (3K: 8 GB -43%, 10 GB -17%; 100K 10 GB: 35.9 drafter vs 48.8-56.0 tok/s without). 12 GB: +12% 3K,
-        // +10% 32K. Resolved beside the model in arg.cpp, off with a warning if the file is missing.
+        // ctx 131,072 = the 100K design depth. All three carry the DSpark drafter, but arg.cpp drops it by default
+        // (--card-drafter auto = off; on forces it): the drafter's ~1.4 GB of VRAM (weights + KV + compute) comes out of
+        // the expert cache, and at 100K depth the lost cache hits cost more than drafting gains on every small card.
+        // 100K (S34d, 4/4, b7, RTX 3090 capped): 10 GB 35.5 drafter vs 50.0 tok/s without (-29%); 12 GB 66.7 vs 75.7 tok/s (-12%, A D D A,
+        // 6+6 seeds). Short ctx differs: 3K 8 GB -43%, 10 GB -17%, 12 GB +12% (32K +10%). Resolved beside the model in
+        // arg.cpp when on, off with a warning if the file is missing.
         // Evidence: lanes/INKSMALL.md + INKSMALL2.md (S34d, RTX 3090 capped at 7,168/9,216/11,264 MiB).
         common_card_preset ink8 {
             "8ink", "2026-11-23.1", "best known/recheck before ship", "", {

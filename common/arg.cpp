@@ -1147,10 +1147,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // fork (INKSMALL2): the *ink presets keep the drafter only where it measured faster: its ~1.4 GB of VRAM comes out
         // of the expert cache, which costs more than drafting gains on 8/10 GB (see common/preset.cpp)
         const bool ink_card = string_ends_with(params.card_preset, "ink");
-        if (ink_card && params.card_drafter != "on" && (params.card_drafter == "off" || params.card_preset != "12ink")) {
+        if (ink_card && params.card_drafter != "on") {
             if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
                 LOG_INF("card preset %s: drafter off (%s; --card-drafter on forces it)\n", params.card_preset.c_str(),
-                        params.card_drafter == "off" ? "--card-drafter off" : "it measured slower on this card size: its VRAM comes out of the expert cache");
+                        params.card_drafter == "off" ? "--card-drafter off" : "it measured slower at 100K depth on 8/10/12 GB: its VRAM comes out of the expert cache");
                 params.speculative.draft.mparams.path.clear();
                 params.speculative.draft.mparams.hf_file.clear();
                 if (!explicit_or_env("--spec-type")) {
@@ -5955,8 +5955,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--card-drafter"}, "auto|on|off",
-        "*ink card presets: speculative drafter use (default: auto = on for 12ink, off for 8ink/10ink, where its VRAM "
-        "costs more expert cache than drafting gains)",
+        "*ink card presets: speculative DSpark drafter (default: auto = off: at 100K depth its ~1.4 GB of VRAM costs more "
+        "expert cache than drafting gains on 8/10/12 GB; on = use it, e.g. for short-context 12 GB use, where it is +10-12%)",
         [](common_params & params, const std::string & value) {
             if (value != "auto" && value != "on" && value != "off") {
                 throw std::invalid_argument("expected auto, on or off");
