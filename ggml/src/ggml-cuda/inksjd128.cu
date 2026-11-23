@@ -7,8 +7,8 @@
 //
 // Here: each packed head's K/V rows are expanded to f16 as in fattn_sj_kvarn_expand_prefill (same loaders), rotated back
 // to the head basis in shared memory (the cache stores the plain 256-point Hadamard H/16 of each row; H/16 is its own
-// inverse, applied with the same butterfly sequence as sj_kvarn_rot256_row8), and the two real heads run as D = 128
-// f16 MMA attention (GQA g) on the unrotated Q halves. The output is written in the unrotated basis, lanes of the other
+// inverse, applied with the same butterfly sequence as sj_kvarn_rot256_row8) and split into its two 128-wide KV heads;
+// then one D = 128 f16 MMA attention runs over all q heads (GQA g) on the real Q halves. The output is written in the unrotated basis, lanes of the other
 // half zero, which is what the fused-rotation contract (GGML_SJKVARN_ROT_PARAM) asks of the node. Without it (the build
 // default) Q arrives rotated and the graph un-rotates the output: Q is rotated back first and the output rotated again.
 // Rounding differs from the D = 256 route (f16 K/V in the head basis instead of the rotated one); math is the same.
@@ -29,13 +29,13 @@ static bool ink_sj_d128_enabled() {
     return on;
 }
 
-// One packed KV head, positions [0, n_kv): 16 rows per block, 256 threads. Loads exactly as fattn_sj_kvarn_expand_prefill
+// Packed KV head blockIdx.y, positions [0, n_kv): 16 rows per block, 256 threads. Loads exactly as fattn_sj_kvarn_expand_prefill
 // (4/4 body records, sink / ring rows), then each row is rotated back in shared memory and written as f16.
 static __global__ void k_ink_sj_d128_expand(
         const char * K, const char * V, const char * body, const int32_t * desc,
         const size_t k_row_stride, const size_t k_head_stride,
         const size_t v_row_stride, const size_t v_head_stride,
-        half2 * K_out, half2 * V_out, const int head,
+        half2 * K_out, half2 * V_out, const int n_kv,
         const char * mask, const size_t mask_pitch, const int mask_queries) {
     constexpr int D2 = 128;
     constexpr int rows = 16;
@@ -43,8 +43,11 @@ static __global__ void k_ink_sj_d128_expand(
     const int tid = threadIdx.y*32 + threadIdx.x;
     const int lane = threadIdx.x;
     const int p0 = blockIdx.x*rows;
+    const int head = blockIdx.y;
+    // out: [2*P planes][n_kv][128] f16, plane 2*head + half = the 128-wide KV head (lanes 0-15 / 16-31 of a row8 row)
+    const int    half_l = lane >= 16;
+    const size_t lane_offset = ((size_t) (2*head + half_l)*n_kv + p0)*64 + 4*(lane & 15); // half2 units
     const fattn_sj_kvarn_ctx kv = fattn_sj_kvarn_make_ctx(body, desc, head, 2*D2, 4, 4, k_head_stride, v_head_stride);
-    const size_t out_offset = (size_t) p0*D2;
 
     // rotate rows 2w, 2w + 1 of the tile back (warp w) and store them to out
     auto unrotate_store = [&](half2 * out) {
@@ -60,7 +63,7 @@ static __global__ void k_ink_sj_d128_expand(
             sj_kvarn_rot256_row8(x, lane);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                out[out_offset + r*D2 + 4*lane + j] = __floats2half2_rn(x[2*j], x[2*j + 1]);
+                out[lane_offset + (size_t) r*64 + j] = __floats2half2_rn(x[2*j], x[2*j + 1]);
             }
         }
     };
@@ -79,8 +82,10 @@ static __global__ void k_ink_sj_d128_expand(
             }
             if (!visible) {
                 for (int i = tid; i < rows*D2; i += 256) {
-                    K_out[out_offset + i] = make_half2(0.0f, 0.0f);
-                    V_out[out_offset + i] = make_half2(0.0f, 0.0f);
+                    const int r = i / D2, c2 = i % D2;
+                    const size_t o = ((size_t) (2*head + c2/64)*n_kv + p0 + r)*64 + c2 % 64;
+                    K_out[o] = make_half2(0.0f, 0.0f);
+                    V_out[o] = make_half2(0.0f, 0.0f);
                 }
                 return;
             }
@@ -132,36 +137,17 @@ static __global__ void k_ink_sj_d128_expand(
             sj_kvarn_rot256_row8(x, lane);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                V_out[out_offset + r*D2 + 4*lane + j] = __floats2half2_rn(x[2*j], x[2*j + 1]);
+                V_out[lane_offset + (size_t) r*64 + j] = __floats2half2_rn(x[2*j], x[2*j + 1]);
             }
         }
     }
 }
 
-// FA output [128, g, T] (and LSE [g, T]) of the q heads [head_first, head_first + g) into dst [256, H, T] at lanes
-// [half*128, half*128 + 128), the other half zero
-static __global__ void k_ink_sj_d128_scatter(const float * __restrict__ src, char * __restrict__ dst, const int g, const int T,
-        const int head_first, const int half, const size_t nb1, const size_t nb2,
-        const float * __restrict__ lse_src, float * __restrict__ lse_dst, const int n_head) {
-    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; // over T*g*256
-    if (i >= (int64_t) T*g*256) {
-        return;
-    }
-    const int lane = i % 256;
-    const int64_t row = i / 256; // t*g + c
-    const int c = row % g;
-    const int t = row / g;
-    const int d = lane - half*128;
-    const float v = d >= 0 && d < 128 ? src[row*128 + d] : 0.0f;
-    *(float *) (dst + (size_t) t*nb2 + (size_t) (head_first + c)*nb1 + (size_t) lane*sizeof(float)) = v;
-    if (lse_src && lane == 0) {
-        lse_dst[(size_t) t*n_head + head_first + c] = lse_src[row];
-    }
-}
-
-// Unfused rotation (GGML_SJKVARN_FUSED_ROT off, the build default): Q arrives as H/16 of the padded [q, 0] / [0, q]
-// row. One warp per (token, head) row: rotate back (H/16 is its own inverse) and keep the real half, Qu [128, T, H].
-static __global__ void k_ink_sj_d128_q_unrot(const char * __restrict__ Q, float * __restrict__ Qu, const int T, const int n_head,
+// Q prep: one warp per (head, token) row of the padded 256-wide Q ([q, 0] for c < g, [0, q] for c >= g). Unfused
+// rotation (GGML_SJKVARN_FUSED_ROT off, the build default): Q arrives as H/16 of that row; rotate it back first (H/16 is
+// its own inverse). Keep the real half: Qu [128, T, H].
+template <bool rot>
+static __global__ void k_ink_sj_d128_q_prep(const char * __restrict__ Q, float * __restrict__ Qu, const int T, const int n_head,
         const int g, const size_t nb1, const size_t nb2) {
     const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y; // h*T + t
     if (row >= (int64_t) T*n_head) {
@@ -176,7 +162,9 @@ static __global__ void k_ink_sj_d128_q_unrot(const char * __restrict__ Q, float 
     for (int j = 0; j < 8; ++j) {
         x[j] = q[8*lane + j];
     }
-    sj_kvarn_rot256_row8(x, lane);
+    if (rot) {
+        sj_kvarn_rot256_row8(x, lane);
+    }
     const int half = (h % (2*g)) >= g;
     const int l0 = lane - 16*half;
     if (l0 >= 0 && l0 < 16) {
@@ -187,31 +175,32 @@ static __global__ void k_ink_sj_d128_q_unrot(const char * __restrict__ Q, float 
     }
 }
 
-// Unfused rotation: write H/16 of the padded output row (the graph's turbo_wht un-rotates it). One warp per (t, c) row.
-static __global__ void k_ink_sj_d128_scatter_rot(const float * __restrict__ src, char * __restrict__ dst, const int g, const int T,
-        const int head_first, const int half, const size_t nb1, const size_t nb2,
-        const float * __restrict__ lse_src, float * __restrict__ lse_dst, const int n_head) {
-    const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y; // t*g + c
-    if (row >= (int64_t) T*g) {
+// Output: FA [128, H, T] into dst [256, H, T], the head's real half, the other half zero; unfused rotation: write H/16
+// of that padded row (the graph's turbo_wht un-rotates it). One warp per (token, head) row.
+template <bool rot>
+static __global__ void k_ink_sj_d128_out(const float * __restrict__ src, char * __restrict__ dst, const int T, const int n_head,
+        const int g, const size_t nb1, const size_t nb2) {
+    const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y; // t*H + h
+    if (row >= (int64_t) T*n_head) {
         return;
     }
     const int lane = threadIdx.x;
-    const int c = row % g;
-    const int t = row / g;
+    const int h = row % n_head;
+    const int t = row / n_head;
+    const int half = (h % (2*g)) >= g;
     const int l0 = lane - 16*half;
     float x[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         x[j] = l0 >= 0 && l0 < 16 ? src[row*128 + 8*l0 + j] : 0.0f;
     }
-    sj_kvarn_rot256_row8(x, lane);
-    float * o = (float *) (dst + (size_t) t*nb2 + (size_t) (head_first + c)*nb1);
+    if (rot) {
+        sj_kvarn_rot256_row8(x, lane);
+    }
+    float * o = (float *) (dst + (size_t) t*nb2 + (size_t) h*nb1);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         o[8*lane + j] = x[j];
-    }
-    if (lse_src && lane == 0) {
-        lse_dst[(size_t) t*n_head + head_first + c] = lse_src[row];
     }
 }
 
@@ -270,118 +259,99 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int n_head = (int) Q->ne[2];
     const int P      = (int) K->ne[2];
     const int g      = n_head/(2*P); // q heads per 128-wide KV head
+    const bool rot   = !ggml_cuda_fattn_sj_kvarn_rot(dst); // unfused: Q rotated, output rotated (the graph un-rotates it)
     cudaStream_t stream = ctx.stream();
 
-    const size_t kv_elems = (size_t) n_kv*256;                   // one packed head, halves
+    // K/V of all 2P 128-wide heads: the size of the generic route's expand-once scratch, which the plan reserves behind dst
+    const size_t kv_elems = (size_t) 2*P*n_kv*128;
     const size_t kv_bytes = GGML_PAD(2*kv_elems*sizeof(half), 128);
-    const size_t o_bytes  = GGML_PAD((size_t) g*T*128*sizeof(float), 128);
-    const size_t l_bytes  = lse ? GGML_PAD((size_t) g*T*sizeof(float), 128) : 0;
-    const bool   rot      = ggml_cuda_fattn_sj_kvarn_rot(dst); // fused contract: Q and the output in the head basis
-    const size_t qu_bytes = rot ? 0 : GGML_PAD((size_t) n_head*T*128*sizeof(float), 128);
-    const size_t need     = kv_bytes + o_bytes + l_bytes + qu_bytes;
     const size_t offset   = GGML_PAD(ggml_nbytes(dst), 128);
     const bool reserved = dst->buffer != nullptr && dst->view_src == nullptr && (uintptr_t) dst->data % 128 == 0 &&
-        offset + need <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
-    if (!reserved && need > (size_t(256) << 20)) {
-        return false; // no reservation behind dst (the generic plan did not fit): keep the VMM pool bounded
+        offset + kv_bytes <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
+    const size_t qo_bytes = GGML_PAD((size_t) n_head*T*128*sizeof(float), 128);
+    const size_t pool_need = 2*qo_bytes + (reserved ? 0 : kv_bytes);
+    if (pool_need > (size_t(256) << 20)) {
+        return false; // keep the VMM pool bounded: the generic route
     }
-    ggml_cuda_pool_alloc<char> pool(ctx.pool());
-    char * scratch = reserved ? (char *) dst->data + offset : pool.alloc(need);
-    half  * Ks   = (half *) scratch;
-    half  * Vs   = Ks + kv_elems;
-    float * outs = (float *) (scratch + kv_bytes);
-    float * lses = lse ? (float *) (scratch + kv_bytes + o_bytes) : nullptr;
-    float * Qu   = rot ? nullptr : (float *) (scratch + kv_bytes + o_bytes + l_bytes);
-    if (!rot) {
+    ggml_cuda_pool_alloc<char> pool(ctx.pool(), pool_need);
+    char * kvp  = reserved ? (char *) dst->data + offset : pool.get() + 2*qo_bytes;
+    half  * Ks  = (half *) kvp;
+    half  * Vs  = Ks + kv_elems;
+    float * Qu  = (float *) pool.get();
+    float * Ou  = (float *) (pool.get() + qo_bytes);
+
+    {
         const int64_t rows_q = (int64_t) T*n_head;
-        k_ink_sj_d128_q_unrot<<<(unsigned) ((rows_q + 7)/8), dim3(32, 8, 1), 0, stream>>>((const char *) Q->data, Qu, T, n_head, g,
-            Q->nb[1], Q->nb[2]);
+        const dim3 grid((unsigned) ((rows_q + 7)/8));
+        if (rot) {
+            k_ink_sj_d128_q_prep<true><<<grid, dim3(32, 8, 1), 0, stream>>>((const char *) Q->data, Qu, T, n_head, g, Q->nb[1], Q->nb[2]);
+        } else {
+            k_ink_sj_d128_q_prep<false><<<grid, dim3(32, 8, 1), 0, stream>>>((const char *) Q->data, Qu, T, n_head, g, Q->nb[1], Q->nb[2]);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
-
-    for (int hp = 0; hp < P; ++hp) {
-        const ggml_cuda_kernel_launch_params lp(dim3(n_kv/16, 1, 1), dim3(32, 8, 1), 2*16*128*sizeof(half2), stream);
+    {
+        const ggml_cuda_kernel_launch_params lp(dim3(n_kv/16, P, 1), dim3(32, 8, 1), 2*16*128*sizeof(half2), stream);
         ggml_cuda_kernel_launch(k_ink_sj_d128_expand, lp,
             (const char *) K->data, (const char *) V->data, body, (const int32_t *) dst->src[6]->data,
-            K->nb[1], K->nb[2], V->nb[1], V->nb[2], (half2 *) Ks, (half2 *) Vs, hp,
+            K->nb[1], K->nb[2], V->nb[1], V->nb[2], (half2 *) Ks, (half2 *) Vs, n_kv,
             (const char *) mask->data, mask->nb[1], T);
         CUDA_CHECK(cudaGetLastError());
+    }
 
-        for (int half_i = 0; half_i < 2; ++half_i) {
-            const int head_first = 2*g*hp + half_i*g;
-            ggml_tensor q = *Q;
-            q.ne[0] = 128; q.ne[2] = g;
-            if (rot) {
-                q.data = (char *) Q->data + (size_t) head_first*Q->nb[2] + (size_t) half_i*128*sizeof(float);
-            } else {
-                q.nb[0] = sizeof(float); q.nb[1] = 128*sizeof(float); q.nb[2] = q.nb[1]*T; q.nb[3] = q.nb[2]*g;
-                q.data = Qu + (size_t) head_first*T*128;
-            }
-            q.view_src = nullptr; q.view_offs = 0; q.buffer = nullptr;
-            ggml_tensor k = *K;
-            ggml_tensor v = *V;
-            for (ggml_tensor * t : {&k, &v}) {
-                t->type = GGML_TYPE_F16;
-                t->ne[0] = 128; t->ne[1] = n_kv; t->ne[2] = 1; t->ne[3] = 1;
-                t->nb[0] = sizeof(half);
-                t->nb[1] = 256*sizeof(half);
-                t->nb[2] = kv_elems*sizeof(half);
-                t->nb[3] = t->nb[2];
-                t->view_src = nullptr; t->view_offs = 0; t->buffer = nullptr;
-            }
-            k.data = Ks + half_i*128;
-            v.data = Vs + half_i*128;
-            ggml_tensor s;
-            if (snk) {
-                s = *snk;
-                s.ne[0] = g;
-                s.data = (char *) snk->data + (size_t) head_first*snk->nb[0];
-                s.view_src = nullptr; s.view_offs = 0;
-            }
-            ggml_tensor l;
-            if (lse) {
-                l = *lse;
-                l.ne[0] = g; l.ne[1] = T;
-                l.nb[1] = g*sizeof(float); l.nb[2] = l.nb[1]*T; l.nb[3] = l.nb[2];
-                l.data = lses; l.buffer = nullptr; l.view_src = nullptr; l.view_offs = 0;
-            }
-            ggml_tensor out = *dst;
-            for (int i = 4; i < GGML_MAX_OP_PARAMS/(int) sizeof(int32_t); ++i) {
-                ggml_set_op_params_i32(&out, i, 0);
-            }
-            for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                out.src[i] = nullptr;
-            }
-            out.src[0] = &q;
-            out.src[1] = &k;
-            out.src[2] = &v;
-            out.src[3] = const_cast<ggml_tensor *>(mask);
-            out.src[4] = snk ? &s : nullptr;
-            out.src[9] = lse ? &l : nullptr;
-            out.ne[0] = 128; out.ne[1] = g; out.ne[2] = T; out.ne[3] = 1;
-            out.nb[0] = sizeof(float);
-            for (int d = 1; d < GGML_MAX_DIMS; ++d) {
-                out.nb[d] = out.nb[d - 1]*out.ne[d - 1];
-            }
-            out.data = outs; out.buffer = nullptr; out.view_src = nullptr; out.view_offs = 0;
-            ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &out);
+    // one D = 128 attention over all heads: q head h = 2g*hp + half*g + c reads KV plane 2*hp + half = h/g (GQA g)
+    ggml_tensor q = *Q;
+    q.ne[0] = 128; q.ne[1] = T; q.ne[2] = n_head; q.ne[3] = 1;
+    q.nb[0] = sizeof(float); q.nb[1] = 128*sizeof(float); q.nb[2] = q.nb[1]*T; q.nb[3] = q.nb[2]*n_head;
+    q.data = Qu; q.view_src = nullptr; q.view_offs = 0; q.buffer = nullptr;
+    ggml_tensor k = *K;
+    ggml_tensor v = *V;
+    for (ggml_tensor * t : {&k, &v}) {
+        t->type = GGML_TYPE_F16;
+        t->ne[0] = 128; t->ne[1] = n_kv; t->ne[2] = 2*P; t->ne[3] = 1;
+        t->nb[0] = sizeof(half);
+        t->nb[1] = 128*sizeof(half);
+        t->nb[2] = t->nb[1]*n_kv;
+        t->nb[3] = t->nb[2]*2*P;
+        t->view_src = nullptr; t->view_offs = 0; t->buffer = nullptr;
+    }
+    k.data = Ks;
+    v.data = Vs;
+    ggml_tensor out = *dst;
+    for (int i = 4; i < GGML_MAX_OP_PARAMS/(int) sizeof(int32_t); ++i) {
+        ggml_set_op_params_i32(&out, i, 0);
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        out.src[i] = nullptr;
+    }
+    out.src[0] = &q;
+    out.src[1] = &k;
+    out.src[2] = &v;
+    out.src[3] = const_cast<ggml_tensor *>(mask);
+    out.src[4] = const_cast<ggml_tensor *>(snk);
+    out.src[9] = lse; // [H, T] F32, the q head order is unchanged
+    out.ne[0] = 128; out.ne[1] = n_head; out.ne[2] = T; out.ne[3] = 1;
+    out.nb[0] = sizeof(float);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        out.nb[d] = out.nb[d - 1]*out.ne[d - 1];
+    }
+    out.data = Ou; out.buffer = nullptr; out.view_src = nullptr; out.view_offs = 0;
+    ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &out);
 
-            if (rot) {
-                const int64_t n = (int64_t) T*g*256;
-                k_ink_sj_d128_scatter<<<(unsigned) ((n + 255)/256), 256, 0, stream>>>(outs, (char *) dst->data, g, T, head_first, half_i,
-                    dst->nb[1], dst->nb[2], lses, lse ? (float *) lse->data : nullptr, n_head);
-            } else {
-                const int64_t rows_o = (int64_t) T*g;
-                k_ink_sj_d128_scatter_rot<<<(unsigned) ((rows_o + 7)/8), dim3(32, 8, 1), 0, stream>>>(outs, (char *) dst->data, g, T,
-                    head_first, half_i, dst->nb[1], dst->nb[2], lses, lse ? (float *) lse->data : nullptr, n_head);
-            }
-            CUDA_CHECK(cudaGetLastError());
+    {
+        const int64_t rows_o = (int64_t) T*n_head;
+        const dim3 grid((unsigned) ((rows_o + 7)/8));
+        if (rot) {
+            k_ink_sj_d128_out<true><<<grid, dim3(32, 8, 1), 0, stream>>>(Ou, (char *) dst->data, T, n_head, g, dst->nb[1], dst->nb[2]);
+        } else {
+            k_ink_sj_d128_out<false><<<grid, dim3(32, 8, 1), 0, stream>>>(Ou, (char *) dst->data, T, n_head, g, dst->nb[1], dst->nb[2]);
         }
+        CUDA_CHECK(cudaGetLastError());
     }
     static bool noted = false;
     if (!noted) {
         noted = true;
-        GGML_LOG_WARN("[INKSJD128] packed D128 SJ-KVaRN prefill: %d packed heads x 2 at D 128 (GQA %d), T %d, n_kv %d, %s rotation\n", P, g, T, n_kv, rot ? "fused" : "graph");
+        GGML_LOG_WARN("[INKSJD128] packed D128 SJ-KVaRN prefill: %d packed heads x 2 at D 128 (GQA %d), T %d, n_kv %d, %s rotation, KV %s\n", P, g, T, n_kv, rot ? "graph" : "fused", reserved ? "reserved" : "pool");
     }
     return true;
 }
