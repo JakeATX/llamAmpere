@@ -80,6 +80,7 @@
 #include "ggml-cuda/nvfp4pf.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
+#include "ggml-cuda/inkreltab2.cuh"
 #include "ggml-cuda/inkprep.cuh"
 #include "ggml-cuda/inkcomb.cuh"
 #include "ggml-cuda/inkdyn.cuh"
@@ -11256,7 +11257,12 @@ static int ggml_cuda_try_fuse_ink_rel(ggml_backend_cuda_context * ctx, ggml_cgra
             return 0;
         }
         if (ctx) {
-            ggml_cuda_ink_rel_table(*ctx, pad->src[0], mm->src[1], sk, c1);
+            // [INKPREFILL] inkreltab2.cu: same table, bit-identical, several tokens per block (GGML_CUDA_INK_RELTAB2=0 off)
+            if (ggml_cuda_ink_rel_table2_enabled() && 8*(sub->ne[1]*(pad->src[0]->ne[0] + 1) + sub->ne[1])*sizeof(float) <= 48*1024) {
+                ggml_cuda_ink_rel_table2(*ctx, pad->src[0], mm->src[1], sk, c1);
+            } else {
+                ggml_cuda_ink_rel_table(*ctx, pad->src[0], mm->src[1], sk, c1);
+            }
         }
         return tlast - i;
     }
