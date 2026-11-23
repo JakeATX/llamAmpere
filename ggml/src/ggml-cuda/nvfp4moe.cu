@@ -5,6 +5,8 @@
 #include "nvfp4moe.cuh"
 #endif
 
+#include "nvfp4mt.cuh"
+
 #include <cstdlib>
 #include <cstring>
 
@@ -108,6 +110,8 @@ void ggml_cuda_nvfp4moe_launch(const nvfp4moe_params & P, cudaStream_t stream) {
     }
     if (P.T == 1) {
         nvfp4moe_launch_m<1>(P, stream);
+    } else if (ggml_cuda_nvfp4mt_launch(P, stream)) {
+        return;  // NVFP4MT: 2..8 tokens, weights streamed once per visit
     } else if (ggml_cuda_nvfp4moe_exact() && P.T <= 8) {
         switch (P.T) {
             case 2: nvfp4moe_launch_m<2>(P, stream); break;
