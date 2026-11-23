@@ -125,7 +125,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // arg.cpp when on, off with a warning if the file is missing.
         // Evidence: lanes/INKSMALL.md + INKSMALL2.md (S34d, RTX 3090 capped at 7,168/9,216/11,264 MiB).
         common_card_preset ink8 {
-            "8ink", "2026-11-23.1", "best known/recheck before ship", "", {
+            "8ink", "2026-11-23.2", "best known/recheck before ship", "", {
                 {"--ctx-size", "131072"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cpu-moe", "1"}, {"--op-offload", "0"},
@@ -133,7 +133,11 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
                 {"--spec-draft-ngl", "99"}
             }, {
-                {"LLAMA_DEEPCTX_LADDER", "1"}
+                {"LLAMA_DEEPCTX_LADDER", "1"},
+                // fork (INKSMALL2): fit headroom kept for the expert cache (sized after the fit). The auto-size reserve
+                // (900 + 256 + 2 KiB/cell) sits ~572 MiB above the fit's measured compute at ctx 131,072, so 1,152 keeps a
+                // >= ~580 MiB cache; with less free VRAM (a busy desktop) the fit lowers ctx first. Override by env.
+                {"LLAMA_FIT_PRESET_MIN_FREE_MIB", "1152"}
             }
         };
         auto ink10 = ink8;

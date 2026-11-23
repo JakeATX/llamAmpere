@@ -1070,6 +1070,11 @@ static void common_params_fit_impl(
             preset_free.push_back(memory.free);
             preset_lines.push_back(size_t(memory.total) - std::min(size_t(memory.total), margin));
             preset_targets.push_back(common_fit_preset_target(memory.total, memory.free, margin));
+            // fork (INKSMALL2): a preset whose expert cache is sized from what the fit leaves free (*ink) keeps at
+            // least this much above weights + KV + compute, so a busy desktop lowers ctx before it starves the cache
+            if (const char * mf = std::getenv("LLAMA_FIT_PRESET_MIN_FREE_MIB")) {
+                preset_targets.back() = std::max(preset_targets.back(), size_t(std::max(0, atoi(mf))) * MiB);
+            }
             LOG_INF("preset line %zu MiB = total %zu - margin %zu on %s; free target %zu MiB\n",
                 preset_lines.back()/MiB, size_t(memory.total)/MiB, margin/MiB,
                 ggml_backend_dev_name(devs[id]), preset_targets.back()/MiB);
