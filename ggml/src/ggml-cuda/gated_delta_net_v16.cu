@@ -790,20 +790,27 @@ bool ggml_cuda_gated_delta_net_v16_try(
     const int nc = v16_cols();
     const int nw = v16_warps();
 
+    // Note: ggml_cuda_gated_delta_net_v16_try runs after gdn_argon::launch_gated_delta_net_chunked_tc
+    // in gated_delta_net.cu, so long-prompt chunked TC calls return earlier and are not covered here.
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-    if (mode == 3 && pool != nullptr) {
-        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
-    }
-    if (mode == 3 && pool != nullptr && cap == cudaStreamCaptureStatusNone) {
-        v16_check_bit_exact(nc, nw, keep_rs, emit_ingr, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-            H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
-            scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, *pool, stream);
-        return true;
-    }
-    if (mode == 3 && pool != nullptr && cap != cudaStreamCaptureStatusNone) {
-        static std::atomic<bool> cap_warned{false};
-        if (!cap_warned.exchange(true, std::memory_order_relaxed)) {
-            GGML_LOG_WARN("GDN V16: GGML_CUDA_GDN_V16=3 skipped bit-check during CUDA graph capture (set GGML_CUDA_DISABLE_GRAPHS=1 to check in-server)\n");
+    if (mode == 3) {
+        if (pool == nullptr) {
+            static std::atomic<bool> pool_warned{false};
+            if (!pool_warned.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_WARN("GDN V16: GGML_CUDA_GDN_V16=3 skipped bit-check (no scratch pool)\n");
+            }
+        } else {
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+            if (cap == cudaStreamCaptureStatusNone) {
+                v16_check_bit_exact(nc, nw, keep_rs, emit_ingr, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                    H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                    scale, state_slot_stride, K, slot_rows, ingr_w, ingr_region, state_src, *pool, stream);
+                return true;
+            }
+            static std::atomic<bool> cap_warned{false};
+            if (!cap_warned.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_WARN("GDN V16: GGML_CUDA_GDN_V16=3 skipped bit-check during CUDA graph capture (set GGML_CUDA_DISABLE_GRAPHS=1 to check in-server)\n");
+            }
         }
     }
 
