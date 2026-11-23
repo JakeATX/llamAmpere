@@ -637,21 +637,6 @@ struct idcache_entry {
 static std::mutex g_idcache_mu;
 static std::unordered_map<const ggml_backend_cuda_context *, idcache_entry> g_idcache;
 
-// Called from ~ggml_backend_cuda_context: frees the 64 KiB buffer and drops the entry, so a context re-created at the same
-// address (graph_epoch restarts at 1) can never match stale routing.
-void ggml_cuda_ai4_exp_turbo_free(const ggml_backend_cuda_context * ctx) {
-    std::lock_guard<std::mutex> lock(g_idcache_mu);
-    auto it = g_idcache.find(ctx);
-    if (it == g_idcache.end()) {
-        return;
-    }
-    if (it->second.ptr != nullptr) {
-        ggml_cuda_set_device(it->second.dev);
-        cudaFree(it->second.ptr);
-    }
-    g_idcache.erase(it);
-}
-
 static ai4k::idmap get_or_build_idmap(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * ids,
@@ -726,6 +711,21 @@ static void dispatch_grouped_lay(
 }
 
 } // namespace ai4_exp_turbo
+
+// Called from ~ggml_backend_cuda_context: frees the 64 KiB buffer and drops the entry, so a context re-created at the same
+// address (graph_epoch restarts at 1) can never match stale routing.
+void ggml_cuda_ai4_exp_turbo_free(const ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(ai4_exp_turbo::g_idcache_mu);
+    auto it = ai4_exp_turbo::g_idcache.find(ctx);
+    if (it == ai4_exp_turbo::g_idcache.end()) {
+        return;
+    }
+    if (it->second.ptr != nullptr) {
+        ggml_cuda_set_device(it->second.dev);
+        cudaFree(it->second.ptr);
+    }
+    ai4_exp_turbo::g_idcache.erase(it);
+}
 
 bool ggml_cuda_ai4_exp_turbo_try(
         ggml_backend_cuda_context & ctx,
