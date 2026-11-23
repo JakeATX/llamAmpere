@@ -6834,7 +6834,20 @@ private:
                             const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
 
                             // a state or a checkpoint is useful when its pos_min is below this threshold
-                            const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+                            // (upstream n_swa_reuse) a recurrent state holds one position only: with one (Inkling is
+                            // hybrid iSWA + recurrent) the live state is usable only at its own end, so the SWA slack
+                            // must not apply. With it, a warm turn that extends the cache by a token looked for a
+                            // checkpoint ending > n_swa before its end and fell back to an old grid one (MAYAMU 11-22:
+                            // 1,684 / 8-48K tokens re-read). LLAMA_SERVER_REUSE_SWA_HYBRID=1 = the old rule.
+                            static const bool reuse_swa_hybrid = [] {
+                                const char * e = getenv("LLAMA_SERVER_REUSE_SWA_HYBRID");
+                                return e && atoi(e) != 0;
+                            }();
+                            const int32_t n_swa_reuse = !reuse_swa_hybrid && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) ? 0 : n_swa;
+                            const auto pos_min_thold = std::max(0, n_swa_reuse > 0 ? pos_eval - n_swa_reuse + 2 : pos_eval);
+                            // the SWA threshold of the old rule: the [EVALFLAG] branch keys on it (an eval-cache entry restored
+                            // at its end is continued as a restored state, which keeps its own batch, on hybrids too)
+                            const auto pos_min_thold_swa = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -6893,11 +6906,19 @@ private:
                                 // checkpoint (or a full re-prefill) on SWA and hybrid models.
                                 const bool eval_cache_exact = slot.eval_cache_restored && has_new_tokens &&
                                                               n_past == (int) slot.prompt.n_tokens();
-                                if (eval_cache_exact && pos_min >= pos_min_thold) {
+                                // the live state of a hybrid is reused only when the target memory ends right before
+                                // pos_next (the invariant the n_swa_reuse rule relies on); otherwise search a checkpoint
+                                const bool live_ok = n_swa_reuse == n_swa ||
+                                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1 == pos_next;
+                                if (!live_ok) {
+                                    SLT_WRN(slot, "live state ends at %d, not before pos_next = %d: searching a checkpoint\n",
+                                            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id), pos_next);
+                                }
+                                if (eval_cache_exact && pos_min >= pos_min_thold_swa) {
                                     slot.prompt_checkpoint_restored = true;
                                     slot.loop_guard = {};
                                     SLT_INF(slot, "eval cache: continuing from the restored entry at n_past = %d (pos_min = %d)\n", n_past, pos_min);
-                                } else if (pos_min >= pos_min_thold) {
+                                } else if (pos_min >= pos_min_thold || !live_ok) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
