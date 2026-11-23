@@ -2270,14 +2270,30 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     // DSpark Draft-Vocabulary Shortlist (when --spec-draft-vocab-map is active on ctx_dft):
     // Scores ONLY the `n_sel` shortlisted rows of BOTH target->output (base) AND dspark_head_fold (markov bias),
     // with zero duplicate weight copies for quantized target heads + full adaptive hot-slot support.
-    const bool has_compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == target->output;
-    const bool target_head_direct = !has_compact && target->output->buffer != nullptr &&
-            ggml_is_contiguous(target->output) && ggml_is_quantized(target->output->type) &&
+    // Strictly gated to CUDA buffers (never CPU drafter -ngld 0, which would allocate a huge MUL_MAT_ID workspace)
+    // and bounded to nb <= 8 && cur_base->ne[1] <= 8 (avoids any 201K-expert host-sync path at --parallel > 8).
+    auto tensor_on_cuda = [](const ggml_tensor * t) -> bool {
+        if (!t || !t->buffer || !ggml_is_contiguous(t)) {
+            return false;
+        }
+        auto * buft = ggml_backend_buffer_get_type(t->buffer);
+        auto * dev  = ggml_backend_buft_get_device(buft);
+        if (!dev || buft != ggml_backend_dev_buffer_type(dev)) {
+            return false;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        return reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+    };
+    const bool has_compact = draft_vocab_compact != nullptr && draft_vocab_compact_src == target->output &&
+            tensor_on_cuda(draft_vocab_compact);
+    const bool target_head_direct = !has_compact && tensor_on_cuda(target->output) &&
+            ggml_is_quantized(target->output->type) &&
             ggml_ai4_rate(target->output->type) == 0 && ggml_ait_rate(target->output->type) == 0 &&
             ggml_exl3_bits(target->output->type) == 0 &&
             !(hadamard_rotations && hadamard_rotations->count(target->output));
     const bool use_shortlist = use_shortlist_env && ids_out && use_fold_env &&
-            model.dspark_head_fold != nullptr && model.dspark_head_fold_b != nullptr &&
+            nb <= 8 && cur_base->ne[1] >= 1 && cur_base->ne[1] <= 8 && ggml_is_contiguous(cur_base) &&
+            tensor_on_cuda(model.dspark_head_fold) && model.dspark_head_fold_b != nullptr &&
             draft_vocab_ids != nullptr && draft_vocab_ids->type == GGML_TYPE_I32 &&
             draft_vocab_ids->ne[0] > 0 && draft_vocab_ids->ne[0] < (int64_t) hparams.n_vocab_unpadded &&
             draft_vocab_ids->ne[1] == 1 && draft_vocab_ids->ne[2] == 1 && draft_vocab_ids->ne[3] == 1 &&

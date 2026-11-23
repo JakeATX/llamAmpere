@@ -5,6 +5,10 @@
 
 // Inkling-2 DSpark CUDA fused kernels (new .cu file: dspark-head.cu).
 //
+// Numerics note: F16 GEMV uses exact FP32 accumulation in a 32-lane warp butterfly reduction and exact tanhf()
+// (matching unfused op_tanh); because FP32 addition order differs from unfused mul_mat_vec_f, logits are
+// near-exact (max abs diff < 3e-6 on real weights) and draft-only (verifier exactness is unaffected).
+//
 // 1. Fused folded Markov head + fold_bias + base + softcap + top-K (or argmax) + Gumbel-max sampling:
 //    Replaces 18+ kernels per Markov walk step (mul_mat_vec_f / mul_mat_id + add + add + scale + tanh + scale
 //    + unpad cpy + topk_tile_select + argsort + topk_unmap + get_rows + scale + add_noise + argmax + get_rows)

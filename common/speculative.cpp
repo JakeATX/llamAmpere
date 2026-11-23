@@ -5139,12 +5139,24 @@ common_speculative_init_result::common_speculative_init_result(
             }
         }
     }
-    if (spec_mtp || spec_dspark) {
+    if (spec_mtp) {
         if (!params.speculative.draft.vocab_map.empty() && params.speculative.draft.vocab_map != "none") {
             cparams.draft_vocab_map = params.speculative.draft.vocab_map.c_str();
             cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;
-            LOG_INF("%s: %s draft context uses the draft-only vocabulary shortlist '%s'\n",
-                    __func__, spec_mtp ? "MTP" : "DSpark", cparams.draft_vocab_map);
+            LOG_INF("%s: MTP draft context uses the draft-only vocabulary shortlist '%s'\n", __func__, cparams.draft_vocab_map);
+            if (cparams.draft_vocab_hot > 0) {
+                LOG_INF("%s: the last %d entries of the shortlist are adaptive hot slots\n", __func__, cparams.draft_vocab_hot);
+            }
+        }
+    } else if (spec_dspark) {
+        // DSpark has no built-in shortlist for 'auto'; only forward an explicit shortlist file path so
+        // init_draft_vocab never logs a misleading 'auto' shortlist message when none exists.
+        const std::string & vmap = params.speculative.draft.vocab_map;
+        const bool is_auto = vmap == "auto" || vmap.rfind("auto:", 0) == 0;
+        if (!vmap.empty() && vmap != "none" && !is_auto) {
+            cparams.draft_vocab_map = vmap.c_str();
+            cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;
+            LOG_INF("%s: DSpark draft context uses the draft-only vocabulary shortlist '%s'\n", __func__, cparams.draft_vocab_map);
             if (cparams.draft_vocab_hot > 0) {
                 LOG_INF("%s: the last %d entries of the shortlist are adaptive hot slots\n", __func__, cparams.draft_vocab_hot);
             }

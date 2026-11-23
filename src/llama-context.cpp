@@ -545,10 +545,15 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     {
         const char * path = params.draft_vocab_map;
         const bool is_dspark_ctx = model.arch == LLM_ARCH_DFLASH && model.hparams.dspark_markov_rank > 0;
-        // fork: the legacy environment override also replaces the resolved automatic shortlist.
+        // fork: legacy LLAMA_SPEC_DRAFT_VOCAB applies only to MTP contexts (never silently activates on DSpark);
+        // DSpark uses explicit --spec-draft-vocab-map <file> or dedicated LLAMA_DSPARK_VOCAB_MAP=<file>.
         if ((path == nullptr || path[0] == '\0' || std::strcmp(path, "auto") == 0 || std::strcmp(path, "auto:rm24h") == 0) &&
-                (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || is_dspark_ctx)) {
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
             if (const char * env = getenv("LLAMA_SPEC_DRAFT_VOCAB"); env != nullptr && env[0] != '\0') {
+                path = env;
+            }
+        } else if (is_dspark_ctx && (path == nullptr || path[0] == '\0')) {
+            if (const char * env = getenv("LLAMA_DSPARK_VOCAB_MAP"); env != nullptr && env[0] != '\0') {
                 path = env;
             }
         }

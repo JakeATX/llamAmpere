@@ -20,16 +20,6 @@ bool ggml_cuda_dspark_gru_enabled() {
     return on;
 }
 
-static __device__ __forceinline__ float dspark_fast_tanh(const float x) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
-    float y;
-    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-#else
-    return tanhf(x);
-#endif
-}
-
 // Ordered 64-bit descending sort key matching top-k.cu (topk_split_key):
 // upper 32 bits = order-preserving float encoding (-0.0f folded to +0.0f),
 // lower 32 bits = (ncols - 1 - col) so ties break to the lowest column index.
@@ -144,7 +134,7 @@ bool ggml_cuda_dspark_f16_rows_supported(const ggml_tensor * dst) {
         return false;
     }
     if ((src0->ne[0] % 8) != 0 || src0->ne[0] <= 0 || src0->ne[0] > INT_MAX ||
-            dst->ne[1] <= 0 || dst->ne[1] > INT_MAX || dst->ne[2] <= 0 || dst->ne[2] > 8) {
+            dst->ne[1] <= 0 || dst->ne[1] > INT_MAX || dst->ne[2] <= 0 || dst->ne[2] > 64) {
         return false;
     }
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
@@ -209,10 +199,10 @@ static __global__ void __launch_bounds__(256) k_dspark_gru_update(
         const float l_in = jr[i + 2 * rank] + joint_b[i + 2 * rank];
 
         const float gate = 1.0f / (1.0f + expf(-g_in));
-        const float cand = dspark_fast_tanh(c_in);
+        const float cand = tanhf(c_in);
         const float st   = si[i];
         so[i] = cand + gate * (st - cand);
-        lo[i] = dspark_fast_tanh(l_in);
+        lo[i] = tanhf(l_in);
     }
 }
 
@@ -264,6 +254,7 @@ static __global__ void __launch_bounds__(256) k_dspark_fold_head_tile_topk(
         const size_t base_stride) {
     __shared__ float    s_x[256];
     __shared__ uint64_t s_keys[TILE];
+    __shared__ uint64_t s_warp_best[8];
 
     const int tile    = blockIdx.x;
     const int b       = blockIdx.y;
@@ -308,7 +299,7 @@ static __global__ void __launch_bounds__(256) k_dspark_fold_head_tile_topk(
             acc += __shfl_xor_sync(0xffffffffu, acc, 1);
 
             if (lane == 0) {
-                const float v = cap * dspark_fast_tanh((acc + fold_bias[local_idx] + base_b[local_idx]) * inv_cap);
+                const float v = cap * tanhf((acc + fold_bias[local_idx] + base_b[local_idx]) * inv_cap);
                 s_keys[r] = dspark_topk_key(v, local_idx, n_eval);
             }
         } else if (lane == 0) {
@@ -317,7 +308,7 @@ static __global__ void __launch_bounds__(256) k_dspark_fold_head_tile_topk(
     }
 
     if (k == 1) {
-        // Greedy fast path: block-wide max reduction of TILE keys (no bitonic sort needed!)
+        // Greedy fast path: block-wide max reduction of TILE keys into separate s_warp_best[8] (no SMEM race!)
         __syncthreads();
         uint64_t best = 0ull;
 #pragma unroll
@@ -335,15 +326,15 @@ static __global__ void __launch_bounds__(256) k_dspark_fold_head_tile_topk(
             }
         }
         if (lane == 0) {
-            s_keys[warp_id] = best;
+            s_warp_best[warp_id] = best;
         }
         __syncthreads();
         if (tid == 0) {
-            uint64_t gbest = s_keys[0];
+            uint64_t gbest = s_warp_best[0];
 #pragma unroll
             for (int w = 1; w < 8; ++w) {
-                if (s_keys[w] > gbest) {
-                    gbest = s_keys[w];
+                if (s_warp_best[w] > gbest) {
+                    gbest = s_warp_best[w];
                 }
             }
             cand_out[(size_t) b * ntiles + tile] = gbest;
@@ -501,10 +492,18 @@ bool ggml_cuda_dspark_head_launch(
         return false;
     }
     const bool sampled = noise != nullptr;
-    if (sampled && (sk < 1 || sk > 64 || !cand_out || !vals_out ||
-            cand_out->type != GGML_TYPE_I32 || vals_out->type != GGML_TYPE_F32 ||
-            noise->type != GGML_TYPE_F32 || n_eval < sk)) {
-        return false;
+    if (sampled) {
+        if (sk < 1 || sk > 64 || !cand_out || !vals_out ||
+                cand_out->type != GGML_TYPE_I32 || vals_out->type != GGML_TYPE_F32 ||
+                noise->type != GGML_TYPE_F32 || n_eval < sk ||
+                cand_out->ne[0] != sk || cand_out->ne[1] != nb || cand_out->ne[2] != 1 ||
+                vals_out->ne[0] != sk || vals_out->ne[1] != nb || vals_out->ne[2] != 1 ||
+                cand_out->nb[0] != sizeof(int32_t) || (cand_out->nb[1] % sizeof(int32_t)) != 0 ||
+                (nb > 1 && cand_out->nb[1] < (size_t) sk * sizeof(int32_t)) ||
+                vals_out->nb[0] != sizeof(float) || (vals_out->nb[1] % sizeof(float)) != 0 ||
+                (nb > 1 && vals_out->nb[1] < (size_t) sk * sizeof(float))) {
+            return false;
+        }
     }
     if (!sampled) {
         sk = 1;

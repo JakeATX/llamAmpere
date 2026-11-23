@@ -12931,6 +12931,7 @@ static int ggml_cuda_try_fuse_dspark_head(ggml_backend_cuda_context * ctx, ggml_
         }
         // Unwrap latent reshape [256, 1, nb] -> [256, nb] so nb[1] is sequence stride
         if (latent->view_src && latent->view_src->ne[0] == 256 && latent->view_src->ne[1] == nb &&
+                latent->view_src->ne[2] == 1 && latent->view_src->ne[3] == 1 &&
                 ggml_is_contiguous(latent->view_src)) {
             latent = latent->view_src;
         } else if (nb != 1) {
@@ -12944,7 +12945,8 @@ static int ggml_cuda_try_fuse_dspark_head(ggml_backend_cuda_context * ctx, ggml_
         n_mm_rows = bias_mm->ne[0];
         nb        = bias_mm->ne[1];
     }
-    if (nb <= 0 || nb > 64 || n_mm_rows <= 0 || n_mm_rows > INT_MAX) {
+    if (nb <= 0 || nb > 64 || n_mm_rows <= 0 || n_mm_rows > INT_MAX ||
+            (nb > 1 && (latent->ne[1] != nb || latent->ne[2] != 1 || latent->nb[1] < (size_t) 256 * sizeof(float)))) {
         return 0;
     }
 
@@ -13083,8 +13085,27 @@ static int ggml_cuda_try_fuse_dspark_head(ggml_backend_cuda_context * ctx, ggml_
         set[n_set++] = pick;
         set[n_set++] = prev_gr;
 
-        ggml_tensor * cand_out = cand_view ? cand_view : (cand_gr ? cand_gr : cand_local);
-        ggml_tensor * vals_out = vals_view ? vals_view : vals_gr;
+        // Require explicit [sk, nb] RESHAPE views for vals (and cand in shortlist mode) so sequence stride nb[1]
+        // is guaranteed to equal sk elements rather than GET_ROWS's inner dim-0 stride of 1 element.
+        if (!vals_view || vals_view->ne[0] != sk || vals_view->ne[1] != nb || vals_view->ne[2] != 1 ||
+                vals_view->ne[3] != 1 || !ggml_is_contiguous(vals_view)) {
+            return 0;
+        }
+        ggml_tensor * cand_out = nullptr;
+        if (is_shortlist) {
+            if (!cand_view || cand_view->ne[0] != sk || cand_view->ne[1] != nb || cand_view->ne[2] != 1 ||
+                    cand_view->ne[3] != 1 || !ggml_is_contiguous(cand_view)) {
+                return 0;
+            }
+            cand_out = cand_view;
+        } else {
+            if (cand_local->ne[0] != sk || cand_local->ne[1] != nb || cand_local->ne[2] != 1 ||
+                    cand_local->ne[3] != 1 || !ggml_is_contiguous(cand_local)) {
+                return 0;
+            }
+            cand_out = cand_local;
+        }
+        ggml_tensor * vals_out = vals_view;
         const ggml_tensor * outs[6] = {
             cand_gr ? cand_gr : cand_local,
             cand_out,
