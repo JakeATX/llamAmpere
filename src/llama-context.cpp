@@ -1971,8 +1971,9 @@ uint64_t llama_model_tokenizer_fingerprint(const llama_model * model) {
 void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    // Inkling2 DSpark (Markov rank > 0) keeps its own shortlist path through the target head below
-    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dspark_markov_rank == 0 && (model.dspine_codebook == nullptr || model.no_alloc())) {
+    // DSpark drafters (Inkling2 Markov rank > 0, or a markov_w1 head) keep their own shortlist path below
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dspark_markov_rank == 0 && model.dspark_markov_w1 == nullptr &&
+            (model.dspine_codebook == nullptr || model.no_alloc())) {
         LLAMA_LOG_INFO("%s: draft vocabulary '%s' not used: only an allocated DSpine lattice drafter reads a shortlist\n", __func__, path);
         return;
     }
