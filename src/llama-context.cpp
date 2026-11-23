@@ -7568,6 +7568,33 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    // INKKV v2 with several sequences: a one-sequence prompt ubatch takes the far/near split (its [n_kv, T] far mask)
+    // and a several-sequence one the row-chunked dense path; size the buffers for both (the larger per backend)
+    if (n_seqs > 1 && n_tokens > n_seqs && !inkkv_dual_reserve_busy) {
+        const llama_kv_cache_iswa * iswa = dynamic_cast<const llama_kv_cache_iswa *>(memory.get());
+        if (!iswa) {
+            if (const auto * hyb = dynamic_cast<const llama_memory_hybrid_iswa *>(memory.get())) {
+                iswa = hyb->get_mem_attn();
+            }
+        }
+        if (iswa && iswa->inkkv_near_copy() && iswa->get_base()->is_sj_kvarn()) {
+            struct busy_guard { bool & b; ~busy_guard() { b = false; } } guard{inkkv_dual_reserve_busy};
+            inkkv_dual_reserve_busy = true;
+            std::vector<size_t> s1(sizes ? backend_ptrs.size() : 0, 0);
+            // the one-sequence graph on a one-stream view (a full-cache context covers every stream)
+            const auto mctx1 = memory->init_full_single_seq();
+            ggml_cgraph * g1 = graph_reserve(n_tokens, 1, std::min(n_outputs, n_tokens), mctx1.get(), split_only, sizes ? s1.data() : nullptr);
+            // several-sequence ubatches carry at most inkkv_mix_max() tokens per sequence (llama_kv_cache_iswa::init_batch)
+            const uint32_t n_mix = std::min(n_tokens, n_seqs*llama_kv_cache_iswa::inkkv_mix_max());
+            ggml_cgraph * gn = g1 ? graph_reserve(n_mix, n_seqs, std::min(n_outputs, n_mix), mctx, split_only, sizes) : nullptr;
+            if (gn && sizes) {
+                for (size_t i = 0; i < s1.size(); ++i) {
+                    sizes[i] = std::max(sizes[i], s1[i]);
+                }
+            }
+            return gn;
+        }
+    }
     const bool qwen_chain = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.arch == LLM_ARCH_QWEN4EXP && cparams.mtp_chain;
     if (qwen_chain) {
         GGML_ASSERT(n_seqs == 1);
@@ -10872,7 +10899,8 @@ llama_context * llama_init_from_model(llama_model * model, llama_context_params 
     }
     // (after the LSA check, so a refusal reports the LSA reason first)
     if (params.sj_kvarn_bits_k > 0 || params.sj_kvarn_bits_v > 0) {
-        const bool inkling = model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP;
+        const bool inkling = model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP ||
+                (model->arch == LLM_ARCH_DFLASH && model->hparams.dspark_markov_rank > 0 && model->hparams.swa_type != LLAMA_SWA_TYPE_NONE);
         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             if (!model->hparams.has_kv(il) || model->hparams.is_recr(il)) {
                 continue;

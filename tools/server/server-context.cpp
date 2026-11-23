@@ -266,6 +266,8 @@ static common_speculative_output_limits server_output_limits(const common_params
     }
     // copy mode: a wide round verifies the drafter's block plus the lookup tail
     n_max += common_speculative_copy_tail(&params.speculative);
+    // copy-first: a span round verifies up to copy_first tokens instead of the block
+    n_max = std::max(n_max, params.speculative.copy_first);
 
     auto result = common_speculative_get_output_limits(common_context_n_batch(params), params.n_parallel, n_max);
 
@@ -2365,6 +2367,28 @@ private:
                 params.speculative.copy_tail, mtp && !params.speculative.has_dft() && params.n_parallel == 1,
                 std::getenv("LLAMA_SPEC_COPY"));
         SRV_INF("copy mode: %s (tail = %d)\n", params.speculative.copy_tail > 0 ? "on" : "off", params.speculative.copy_tail);
+        {
+            // copy-first: auto-on only for a DSpark drafter (Inkling2: its recurrent snapshot is a short-conv state of
+            // a few KiB per layer, so the n_rs_seq raise to the span cap is cheap) with one slot; an explicit
+            // --spec-copy-first N also serves DFlash. Never with synthetic acceptance (it would judge the spans).
+            const bool dspark = params.speculative.has_dft() &&
+                    std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+            params.speculative.copy_first = common_speculative_copy_params::resolve_first(
+                    params.speculative.copy_first, dspark && params.n_parallel == 1, 0);
+            // INKCOPY gate (HOME 3090 Ti, 4/4, DSpark d4): edit/quote tasks +33% but normal chat not faster (3K +0.2%,
+            // 100K -2.4% over 6 seeds), so auto stays off; opt in with --spec-copy-first 32 or LLAMA_SPEC_COPY_FIRST=32
+            // an explicit N needs a drafter a span can stand in for, else it would only raise n_rs_seq / outputs
+            const bool dflash = params.speculative.has_dft() &&
+                    std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
+            if (!dspark && !dflash) {
+                params.speculative.copy_first = 0;
+            }
+            if (params.speculative.has_synth()) {
+                params.speculative.copy_first = 0;
+            }
+            SRV_INF("copy-first: %s (max span = %d)\n", params.speculative.copy_first > 0 ? "on" : "off",
+                    params.speculative.copy_first);
+        }
 
 #if !defined(_WIN32)
         // copy mode: a wide verify batch keeps its pre-round recurrent plane, so a block miss needs no checkpoint
@@ -2991,9 +3015,11 @@ private:
                 if (params_base.cache_disk_min_free_pct >= 0.0f) {
                     prompt_cache->disk.guard_frac = params_base.cache_disk_min_free_pct / 100.0;
                     prompt_cache->disk.guard_abs  = 0;
+                    prompt_cache->disk.guard_cap  = 0;
                 } else if (params_base.cache_disk_min_free_mib >= 0) {
                     prompt_cache->disk.guard_frac = 0.0;
                     prompt_cache->disk.guard_abs  = 1024ull*1024ull*(uint64_t) params_base.cache_disk_min_free_mib;
+                    prompt_cache->disk.guard_cap  = 0;
                 }
 
                 std::string err;
@@ -3295,12 +3321,72 @@ private:
         return allowed;
     }
 
+    // --slot-ctx cap swap: a conversation that outgrows its reserved cap takes the cap of an idle reserved slot that
+    // holds more; the unified pool addresses cells one by one, so a cap is accounting only and no cell moves. The
+    // other slot keeps its cached tokens, which must fit the smaller cap with 64 tokens to spare. Not for tasks pinned with
+    // id_slot; /props keeps the boot caps, /slots shows the live ones. LLAMA_SLOT_CTX_SWAP=0 turns it off.
+    static bool slot_ctx_swap_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SLOT_CTX_SWAP");
+            return !(e && *e && (std::string(e) == "0" || std::string(e) == "off" || std::string(e) == "false"));
+        }();
+        return on;
+    }
+
+    bool slot_ctx_cap_grow(server_slot & own, int64_t need) {
+        if (params_base.slot_ctx.empty() || own.ctx_shared || need <= own.n_ctx || !slot_ctx_swap_on()) {
+            return false;
+        }
+        server_slot * big = nullptr;
+        for (auto & s : slots) {
+            if (&s == &own || s.is_processing() || s.ctx_shared || s.n_ctx < need || s.prompt.n_tokens() + 64 > own.n_ctx) {
+                continue;
+            }
+            if (big == nullptr || s.n_ctx < big->n_ctx) {
+                big = &s;
+            }
+        }
+        if (big == nullptr) {
+            return false;
+        }
+        SLT_INF(own, "--slot-ctx: cap swap with idle slot %d: cap %d -> %d (%d tokens here, %d there; LLAMA_SLOT_CTX_SWAP=0 = off)\n",
+                big->id, own.n_ctx, big->n_ctx, own.prompt.n_tokens(), big->prompt.n_tokens());
+        std::swap(own.n_ctx, big->n_ctx);
+        std::swap(own.n_ctx_cap, big->n_ctx_cap);
+        return true;
+    }
+
+    // before routing: the idle reserved slot that holds this conversation (longest prefix, at least half its cache)
+    // grows its cap when the request no longer fits, so the next turn reuses its cells instead of a full re-read
+    void slot_ctx_cap_grow_for(const server_task & task) {
+        if (params_base.slot_ctx.empty() || task.id_slot != -1 || !slot_ctx_swap_on()) {
+            return;
+        }
+        server_slot * own = nullptr;
+        size_t best = 0;
+        for (auto & s : slots) {
+            if (s.is_processing() || s.ctx_shared || s.prompt.tokens.empty()) {
+                continue;
+            }
+            const size_t lcp = s.prompt.tokens.get_common_prefix(task.tokens);
+            if (lcp > best && 2*lcp >= s.prompt.tokens.size()) {
+                best = lcp;
+                own  = &s;
+            }
+        }
+        if (own != nullptr) {
+            slot_ctx_cap_grow(*own, (int64_t) task.tokens.size() + 64);
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
 
         slot_ctx_share_update();
+
+        slot_ctx_cap_grow_for(task);
 
         // --slot-ctx: one size filter for both the LCP and the LRU pick (a pinned id_slot is not filtered)
         const std::vector<char> allowed = task.id_slot == -1 ? slot_ctx_allowed(task) : std::vector<char>();
@@ -4011,7 +4097,8 @@ private:
 
         // if context shifting is disabled, make sure that we don't run out of context
         // Accepted groups are already in the prompt; deliver the whole group before checking its final capacity.
-        if (last_in_group && !params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        if (last_in_group && !params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx &&
+                !slot_ctx_cap_grow(slot, (int64_t) slot.n_ctx + 1)) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -4032,7 +4119,15 @@ private:
                 if (slot.answer_reserve < 0) {
                     slot.answer_reserve = common_answer_reserve(left + slot.stats.n_gen, tp.sampling.reasoning_answer_reserve);
                 }
-                if (left <= slot.answer_reserve + (int32_t) tp.sampling.reasoning_budget_forced.size()) {
+                const int32_t n_forced = (int32_t) tp.sampling.reasoning_budget_forced.size();
+                // --slot-ctx cap swap: when the slot cap (not max_tokens) runs out, grow the cap before closing the think block
+                if (!params_base.ctx_shift && left <= slot.answer_reserve + n_forced &&
+                        (slot.n_remaining() < 0 || slot.n_remaining() > left) && slot_ctx_cap_grow(slot, (int64_t) slot.n_ctx + 1)) {
+                    const int32_t ctx_left = slot.n_ctx - slot.prompt.n_tokens() - 1;
+                    left = slot.n_remaining() < 0 ? ctx_left : std::min(slot.n_remaining(), ctx_left);
+                    slot.answer_reserve = common_answer_reserve(left + slot.stats.n_gen, tp.sampling.reasoning_answer_reserve);
+                }
+                if (left <= slot.answer_reserve + n_forced) {
                     llama_sampler * tracker = slot.think_tracker.release();
                     if (tracker && common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING) {
                         // the tracker moves into the chain: sampling continues on the CPU from here
@@ -6359,6 +6454,18 @@ private:
                                 tail_cap = -1;
                             }
                             common_speculative_get_draft_params(spec.get(), slot.id).n_tail_max = tail_cap;
+                            // copy-first: a span up to what the context and the request allow (none under a shared budget)
+                            // and, on a recurrent/hybrid target, at its snapshots: every span miss rolls back in place
+                            int32_t first_cap = std::min(n_draft_max, params_base.speculative.copy_first);
+                            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                                first_cap = std::min(first_cap, (int32_t) llama_n_rs_seq(ctx_tgt));
+                            } else if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                                first_cap = 0; // a target that restores a checkpoint per miss: no spans
+                            }
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_first_max = first_cap;
+                            // copy-first source: the request prompt (the reply so far only with LLAMA_SPEC_COPY_FIRST_SRC=all)
+                            common_speculative_get_draft_params(spec.get(), slot.id).n_first_src =
+                                    (int32_t) std::min<size_t>(spec_prompt->size(), (size_t) std::max(0, (int) slot.task->n_tokens()));
                         }
 
                         drafting.push_back(&slot);

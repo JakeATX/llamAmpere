@@ -571,6 +571,142 @@ cudaError_t ggml_cuda_mem_get_info_capped(size_t * free, size_t * total) {
     return err;
 }
 
+// P2P sanity probe (GGML_CUDA_P2P_PROBE=0 turns it off). Idea from Strata v0.2.19 ep_dual_gpu.cu (MIT); clean
+// reimplementation. Some IOMMU/ACS root complexes report cudaDeviceCanAccessPeer = 1 but drop or zero peer
+// transfers, which gives silent garbage under layer/tensor split. After peer access is enabled, a 4 KiB pattern is
+// copied peer-to-peer in both directions and read back; on a mismatch (or any CUDA error) peer access is disabled for
+// that pair, so copies go through the driver's host-staged path. Runs once at init, never inside graph capture.
+// GGML_CUDA_P2P_PROBE_FAIL=1 (test only) makes every probe report a mismatch.
+static bool ggml_cuda_peer_broken_tab[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {{}};
+
+static bool ggml_cuda_p2p_probe_pair(int a, int b) {
+    constexpr size_t n = 1024; // 4 KiB of uint32
+    std::vector<uint32_t> pat_a(n), pat_b(n), got(n);
+    for (size_t i = 0; i < n; ++i) {
+        pat_a[i] = 0x9E3779B9u * (uint32_t) (i + 1) ^ (0xA5000000u | (uint32_t) (a << 8 | b));
+        pat_b[i] = ~pat_a[i] * 0x85EBCA6Bu + (uint32_t) i;
+    }
+    void * buf_a = nullptr;
+    void * buf_b = nullptr;
+    bool ok = true;
+    const auto chk = [&](cudaError_t e) {
+        if (e != cudaSuccess) {
+            GGML_LOG_WARN("ggml_cuda_p2p_probe: CUDA error %s while probing peer copy %d <-> %d\n", cudaGetErrorString(e), a, b);
+            (void) cudaGetLastError();
+            ok = false;
+        }
+        return ok;
+    };
+    // a -> b and b -> a, each landing in a buffer that was pre-filled with something else
+    ok = chk(cudaSetDevice(a)) && chk(cudaMalloc(&buf_a, n * sizeof(uint32_t))) &&
+         chk(cudaSetDevice(b)) && chk(cudaMalloc(&buf_b, n * sizeof(uint32_t)));
+    if (ok) {
+        ok = chk(cudaSetDevice(a)) && chk(cudaMemcpy(buf_a, pat_a.data(), n * sizeof(uint32_t), cudaMemcpyHostToDevice)) &&
+             chk(cudaSetDevice(b)) && chk(cudaMemcpy(buf_b, pat_b.data(), n * sizeof(uint32_t), cudaMemcpyHostToDevice)) &&
+             chk(cudaSetDevice(a)) && chk(cudaMemcpyPeer(buf_b, b, buf_a, a, n * sizeof(uint32_t))) &&
+             chk(cudaDeviceSynchronize()) &&
+             chk(cudaSetDevice(b)) && chk(cudaMemcpy(got.data(), buf_b, n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        ok = ok && got == pat_a;
+        if (ok) {
+            ok = chk(cudaMemcpy(buf_b, pat_b.data(), n * sizeof(uint32_t), cudaMemcpyHostToDevice)) &&
+                 chk(cudaMemcpyPeer(buf_a, a, buf_b, b, n * sizeof(uint32_t))) &&
+                 chk(cudaDeviceSynchronize()) &&
+                 chk(cudaSetDevice(a)) && chk(cudaMemcpy(got.data(), buf_a, n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            ok = ok && got == pat_b;
+        }
+    }
+    if (buf_a) { (void) cudaSetDevice(a); (void) cudaFree(buf_a); }
+    if (buf_b) { (void) cudaSetDevice(b); (void) cudaFree(buf_b); }
+    (void) cudaGetLastError();
+    // a sticky error (e.g. an IOMMU fault) cannot be cleared: stop here with a hint instead of a puzzling abort later
+    for (int d : { a, b }) {
+        const cudaError_t e = cudaSetDevice(d) == cudaSuccess ? cudaDeviceSynchronize() : cudaErrorInvalidDevice;
+        if (e != cudaSuccess) {
+            GGML_LOG_ERROR("ggml_cuda_p2p_probe: CUDA%d is unusable after probing peer copies %d <-> %d (%s); "
+                           "run without GGML_CUDA_P2P or with GGML_CUDA_P2P_PROBE=0\n", d, a, b, cudaGetErrorString(e));
+            GGML_ABORT("peer copy probe left a sticky CUDA error");
+        }
+    }
+    if (ggml_cuda_env_flag("GGML_CUDA_P2P_PROBE_FAIL")) {
+        ok = false;
+    }
+    return ok;
+}
+
+// true when the probe found the peer path between two physical devices broken (peer access was disabled for them)
+static bool ggml_cuda_peer_broken(int a, int b) {
+    return a >= 0 && b >= 0 && a < GGML_CUDA_MAX_DEVICES && b < GGML_CUDA_MAX_DEVICES && ggml_cuda_peer_broken_tab[a][b];
+}
+
+static bool ggml_cuda_p2p_probe_off() {
+    return ggml_cuda_env_set("GGML_CUDA_P2P_PROBE") && !ggml_cuda_env_flag("GGML_CUDA_P2P_PROBE");
+}
+
+#if defined(GGML_USE_NCCL)
+// NCCL builds without GGML_CUDA_P2P: NCCL enables peer access itself and picks its own P2P transport, so probe each
+// pair with peer access enabled just for the probe (then restored). On a broken pair, NCCL_P2P_DISABLE=1 is set
+// (unless the user set it) before any communicator exists, and the VMM pool skips that peer.
+static void ggml_cuda_p2p_probe_nccl(const ggml_cuda_device_info & info) {
+    if (ggml_cuda_p2p_probe_off()) {
+        return;
+    }
+    for (int a = 0; a < info.physical_device_count; ++a) {
+        for (int b = a + 1; b < info.physical_device_count; ++b) {
+            int ab = 0, ba = 0;
+            if (cudaDeviceCanAccessPeer(&ab, a, b) != cudaSuccess || cudaDeviceCanAccessPeer(&ba, b, a) != cudaSuccess || !ab || !ba) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            bool enabled_ab = false, enabled_ba = false;
+            if (cudaSetDevice(a) == cudaSuccess) { enabled_ab = cudaDeviceEnablePeerAccess(b, 0) == cudaSuccess; }
+            if (cudaSetDevice(b) == cudaSuccess) { enabled_ba = cudaDeviceEnablePeerAccess(a, 0) == cudaSuccess; }
+            (void) cudaGetLastError();
+            const bool ok = ggml_cuda_p2p_probe_pair(a, b);
+            if (enabled_ab) { (void) cudaSetDevice(a); (void) cudaDeviceDisablePeerAccess(b); }
+            if (enabled_ba) { (void) cudaSetDevice(b); (void) cudaDeviceDisablePeerAccess(a); }
+            (void) cudaGetLastError();
+            if (!ok) {
+                GGML_LOG_WARN("%s: peer copies between CUDA%d and CUDA%d return wrong data (IOMMU/ACS?): "
+                              "NCCL_P2P_DISABLE=1, the VMM pool skips this peer\n", __func__, a, b);
+                ggml_cuda_peer_broken_tab[a][b] = ggml_cuda_peer_broken_tab[b][a] = true;
+#if defined(_WIN32)
+                if (getenv("NCCL_P2P_DISABLE") == nullptr) { _putenv_s("NCCL_P2P_DISABLE", "1"); }
+#else
+                setenv("NCCL_P2P_DISABLE", "1", 0);
+#endif
+            }
+        }
+    }
+}
+#endif // defined(GGML_USE_NCCL)
+
+static void ggml_cuda_p2p_probe(ggml_cuda_device_info & info) {
+    if (ggml_cuda_p2p_probe_off()) {
+        return;
+    }
+    for (int a = 0; a < info.physical_device_count; ++a) {
+        for (int b = a + 1; b < info.physical_device_count; ++b) {
+            if (!info.peer_access[a][b] && !info.peer_access[b][a]) {
+                continue;
+            }
+            if (ggml_cuda_p2p_probe_pair(a, b)) {
+                continue;
+            }
+            GGML_LOG_WARN("%s: peer copies between CUDA%d and CUDA%d return wrong data (IOMMU/ACS?): "
+                          "peer access disabled for this pair, copies go through host memory\n", __func__, a, b);
+            for (const auto & [from, to] : { std::pair<int, int>{a, b}, std::pair<int, int>{b, a} }) {
+                if (info.peer_access[from][to]) {
+                    (void) cudaSetDevice(from);
+                    (void) cudaDeviceDisablePeerAccess(to);
+                    (void) cudaGetLastError();
+                    info.peer_access[from][to] = false;
+                }
+                ggml_cuda_peer_broken_tab[from][to] = true;
+            }
+        }
+    }
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -751,7 +887,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 }
             }
         }
+        ggml_cuda_p2p_probe(info);
     }
+#if defined(GGML_USE_NCCL)
+    else {
+        ggml_cuda_p2p_probe_nccl(info);
+    }
+#endif // defined(GGML_USE_NCCL)
 
     ggml_cuda_vram_cap_apply(info);
 
@@ -1030,7 +1172,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                     if (id_physical != physical_device) {
                         int can_access_peer = 0;
                         CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
-                        if (!can_access_peer) {
+                        if (!can_access_peer || ggml_cuda_peer_broken(id_physical, physical_device)) {
                             continue;
                         }
                     }

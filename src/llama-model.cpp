@@ -4118,7 +4118,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     share,
                                     params.kv_stream_stage_bytes,
                                     params.kv_stream_phase_arena,
-                                    params.kv_stream_maximum_pool_bytes);
+                                    params.kv_stream_maximum_pool_bytes,
+                                    // fork (INKKV): the Inkling DSpark drafter keeps its full-attention layer on the
+                                    // trunk's SJ-KVaRN 4/4 (pair-packed heads, common_base_params_to_speculative)
+                                    (arch == LLM_ARCH_DFLASH && hparams.dspark_markov_rank > 0) ?
+                                            params.sj_kvarn : llama_sj_kvarn_config());
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());

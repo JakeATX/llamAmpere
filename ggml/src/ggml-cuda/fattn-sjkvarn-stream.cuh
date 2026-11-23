@@ -46,6 +46,7 @@
 #include "fattn-mma-f16.cuh" // fattn_sj_kvarn_u32_as_half2
 #include "mma.cuh"
 #include "fattn-sjkvarn-rot.cuh"
+#include "ggml-inksj.h" // GGML_INKSJ_DESC_FLAGS, GGML_INKSJ_FAR_END_SHIFT (INKKV far visible end)
 
 #include <atomic>
 #include <cfloat>
@@ -423,7 +424,11 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const int s_lo   = sb0 + (int) (((int64_t) nbody *  split     ) / nsplit);
     const int s_hi   = sb0 + (int) (((int64_t) nbody * (split + 1)) / nsplit);
     const int n_ex_sink = kv.S/16;
-    const int n_ex      = n_ex_sink + (n_kv_pad - kv.B)/16; // padded positions are masked
+    // padded positions are masked; so is every ring position at or past the far visible end (INKKV far nodes)
+    const int far_end   = sj_kvarn_desc[GGML_INKSJ_DESC_FLAGS] >> GGML_INKSJ_FAR_END_SHIFT; // ggml-inksj.h
+    const int ex_end    = far_end > 0 ? min(n_kv_pad, max(kv.B, 16*((far_end + 15)/16))) : n_kv_pad;
+    const int n_ex      = n_ex_sink + (ex_end - kv.B)/16;
+    const int n_ex_all  = n_ex_sink + (n_kv_pad - kv.B)/16; // the LSA virtual-key round-robin start (unchanged by far_end)
 
     const float * Qf = (const float *) (Q + (size_t) col_query(hcol)*nb01 + (size_t) (head0 + (hvalid ? col_head(hcol) : 0))*nb02);
     // [#139] rot build: Q arrives rotated (ggml_cuda_sj_kvarn_rot256_q_pass in the launcher); only the output is rotated here
@@ -1087,7 +1092,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         const int vk_n = vkp ? vkp->n : 0;
         if (vk_n > 0) {
             const int nvs = (vk_n + 15)/16;
-            int v = (split - n_ex) % nsplit;
+            int v = (split - n_ex_all) % nsplit;
             v += v < 0 ? nsplit : 0;
             if (v < nvs && split >= n_ex) {
                 setup_exact();

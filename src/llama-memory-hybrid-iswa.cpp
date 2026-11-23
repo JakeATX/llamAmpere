@@ -84,6 +84,16 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         // [TAG_GDN_REPLAY_SPLIT]
         auto rsplit = mem_recr->make_replay_split(balloc);
 
+        // INKKV v2 (several sequences): prompts get ubatches of their own (llama_kv_cache_iswa::inkkv_mix_compat)
+        std::vector<uint32_t> inkkv_seq_n;
+        const auto inkkv_compat = embd_all ? llama_batch_allocr::seq_compat_fn() : mem_attn->inkkv_mix_compat(balloc, inkkv_seq_n);
+        const auto rcompat = rsplit.fn();
+        llama_batch_allocr::seq_compat_fn compat = rcompat;
+        if (inkkv_compat) {
+            compat = rcompat ? llama_batch_allocr::seq_compat_fn([&](llama_seq_id a, llama_seq_id b) { return inkkv_compat(a, b) && rcompat(a, b); })
+                             : inkkv_compat;
+        }
+
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
 
@@ -102,7 +112,7 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, rsplit.fn(),
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, compat,
                         rsplit.strict_fn(), rsplit.n_mixed_min(), rsplit.set_fn());
             }
 
@@ -149,6 +159,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_full() {
     return std::make_unique<llama_memory_hybrid_iswa_context>(this);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_iswa::init_full_single_seq() {
+    return std::make_unique<llama_memory_hybrid_iswa_context>(this, true);
 }
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * lctx, bool optimize) {
@@ -285,8 +299,8 @@ llama_memory_recurrent * llama_memory_hybrid_iswa::get_mem_recr() const {
 
 llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_status status) : status(status) {}
 
-llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_hybrid_iswa * mem) :
-    ctx_attn(mem->get_mem_attn()->init_full()),
+llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_hybrid_iswa * mem, bool single_seq) :
+    ctx_attn(single_seq ? mem->get_mem_attn()->init_full_single_seq() : mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }

@@ -826,6 +826,13 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     // if n_keep_tail > 0, keep only the seqs that either finish in this ubatch or have at least
     //   n_keep_tail tokens remaining for a future ubatch, so that the trailing n_keep_tail tokens
     //   of each seq are never split across ubatches
+    if (n_keep_tail > 0 && n_ubatch <= n_keep_tail) {
+        // a small (writing-scratch) ubatch below the recurrent rollback depth, e.g. 16 rows with n_rs_seq raised to a
+        // copy-first span cap of 32: fine while what is left of the batch fits one ubatch (nothing is split, so every
+        // tail is whole); a longer batch could not keep its tail whole at this size
+        GGML_ASSERT((int32_t) n_used == batch.n_tokens && "n_ubatch <= n_keep_tail with a batch that needs splitting");
+        n_keep_tail = 0;
+    }
     if (n_keep_tail > 0) {
         GGML_ASSERT(n_ubatch > n_keep_tail);
 

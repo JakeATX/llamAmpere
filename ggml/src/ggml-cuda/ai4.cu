@@ -41,7 +41,10 @@
 //   GGML_CUDA_AI4_MMV_MINB=2|4|6|8  launch_bounds min blocks of that kernel (default 6).
 //                             8 warps with min blocks 8 does not fit sm_86 and uses 4 and 6.
 //                             Stages 3/4 and XSMEM ignore both and keep 4 warps.
-//   GGML_CUDA_AI4_AMPERE_MMV=1   rate-4 width 9-32 family on sm_80/sm_86 (default off)
+//   GGML_CUDA_AI4_AMPERE_MMV=1   rate-4 width 9-32 family on sm_80/sm_86 for dense AIT4_U (default off; =0 also turns
+//                             off the MUL_MAT_ID default below)
+//   GGML_CUDA_AI4_AMPERE_MMV_ID=0  kill switch: AIT4_U MUL_MAT_ID (experts) at 9-32 tokens back to the grouped table path
+//                             (default on, sm_80/sm_86; AIPLUSBENCH e2e gate, 4-user DSpark verify)
 //   GGML_CUDA_AI4_AMPERE_MMV_MIN_N/MAX_N   inclusive per-card tuning range within 1-64 (defaults 9/32)
 //   GGML_CUDA_AI4_AMPERE_GEMM    retired; keeps baseline prefill after measured regressions
 //   GGML_CUDA_AI4_PREFILL_V2=1  experimental rate-4 decode-once dense prefill, N >= 512 (default off)
@@ -123,6 +126,15 @@ static bool ai4_ampere_mmv(int n) {
         }
         return r;
     }();
+    return v && range.contains(n);
+}
+// MUL_MAT_ID (experts): default on in the same 9..32 range; GGML_CUDA_AI4_AMPERE_MMV_ID=0, or an explicit
+// GGML_CUDA_AI4_AMPERE_MMV=0, restores the grouped table path
+static bool ai4_ampere_mmv_id(int n) {
+    static const bool v = ai4_env_int("GGML_CUDA_AI4_AMPERE_MMV_ID", nullptr, 1) != 0 &&
+                          ai4_env_int("GGML_CUDA_AI4_AMPERE_MMV", nullptr, 1) != 0;
+    static const rpb_ai4_ampere_range range =
+        rpb_ai4_ampere_resolve(getenv("GGML_CUDA_AI4_AMPERE_MMV_MIN_N"), getenv("GGML_CUDA_AI4_AMPERE_MMV_MAX_N"));
     return v && range.contains(n);
 }
 static bool ai4_prefill_v2() {
@@ -1618,7 +1630,7 @@ template <int LAY, int XSH>
 static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float * s, float * Y, int M, int K, int n_tok,
                               int n_expert, int64_t n_pairs, const ai4k::idmap & idm, int bn, int max_tiles, cudaStream_t stream, int sms) {
     if constexpr (LAY == ai4k::LAY_AIT4_U) {
-        if (sms && ai4_ampere_mmv(n_tok)) {
+        if (sms && ai4_ampere_mmv_id(n_tok)) {
             ai4_ampere_width<LAY, XSH, true>(W, q, s, Y, M, 0, K, bn, sms, stream, idm, max_tiles);
             return;
         }
@@ -1720,7 +1732,7 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int rate = ggml_ai4_rate(src0->type);
     const int sms = ai4_ampere_sms(ctx);
     // The Ampere kernel consumes grouped routing, including when sparse IDs qualify for direct routing.
-    const bool ampere_grouped = sms && src0->type == GGML_TYPE_AIT4_U && ai4_ampere_mmv(n_tok);
+    const bool ampere_grouped = sms && src0->type == GGML_TYPE_AIT4_U && ai4_ampere_mmv_id(n_tok);
     static const int aikern_direct_max = ai4_env_int("GGML_CUDA_AIKERN_DIRECT", nullptr, 64);
     const bool aikern_direct = !ampere_grouped && ai4_aikern() && rate >= 2 && rate <= 4 && (rate == 4 || ai4_mmvr_on_id());
     const bool direct = aikern_direct ?

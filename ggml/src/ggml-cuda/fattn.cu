@@ -4948,6 +4948,8 @@ static bool ggml_cuda_fattn_prefix_supported(int device, const ggml_tensor * dst
         ggml_cuda_get_best_fattn_kernel(device, &d) == BEST_FATTN_KERNEL_MMA_F16;
 }
 
+bool ggml_cuda_flash_attn_ext_sj_kvarn_inksj_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst); // fattn-sjkvarn-prefill.cu
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     // fork (INKATTN): relative bias table + gate inside the node (ggml-inkrel.h): no other route reads them
@@ -4993,6 +4995,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     // SJ-KVaRN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
     if (dst->src[6] != nullptr) {
+        // INKKV (ggml-inksj.h): pair-packed Inkling prefill at D 128 (un-rotated Q in, un-rotated output out)
+        if (ggml_cuda_flash_attn_ext_sj_kvarn_inksj_prefill(ctx, dst)) {
+            return;
+        }
         if (ggml_cuda_fattn_sj_kvarn_rot(dst) && !ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ctx, dst)) {
             // separate passes around this same dispatch, on a copy of the node without the flag
             ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused(ctx, dst, ggml_cuda_flash_attn_ext);
