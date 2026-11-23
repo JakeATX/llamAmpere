@@ -182,7 +182,9 @@ static __global__ void __launch_bounds__(256) k_nvfp4moe_xq(const nvfp4moe_param
     nvfp4moe_quant_block(P.x[t*P.x_s2 + (b - t*nb_k)*QK8_1 + (threadIdx.x & 31)], P.xq + b, threadIdx.x & 31);
 }
 
-template <int MAXM, int NHB, bool PREQ = false>  // NHB: half-blocks per lane (K/32/8); PREQ: x q8_1 from P.xq (k_nvfp4moe_xq)
+// GO (GGML_CUDA_NVFP4MOE_GORD, T > 1): every token's sums in the generic order (mul_mat_vec_q_moe: lane l holds
+// 0 + p[l] + p[l+32] + p[l+64], xor 16..1 butterfly), so each token is bit-identical to the generic path; else sequential
+template <int MAXM, int NHB, bool PREQ = false, bool GO = false>  // NHB: half-blocks per lane (K/32/8); PREQ: x q8_1 from P.xq (k_nvfp4moe_xq)
 static __global__ void __launch_bounds__(256) k_nvfp4moe_gu(const nvfp4moe_params P) {
     constexpr int L = 8;
     extern __shared__ __align__(16) char smem_raw[];
@@ -287,6 +289,40 @@ static __global__ void __launch_bounds__(256) k_nvfp4moe_gu(const nvfp4moe_param
                 uv *= scale;
             }
             act_s[m][g] = nvfp4moe_situ(gv, uv, P.situ);
+        }
+    } else if constexpr (GO) {
+        static_assert(NHB == 9, "GO: K = 2304");
+        // 2..MAXM tokens, generic order per token: generic lane j + 8a (a < 4) holds half-blocks j + 8a, + 32, (a == 0) + 64
+        // = m, m + 4, m + 8 here; acc a gets 0 + p[a] + p[a+4] (+ p[8]), then the xor 16 / 8 butterfly is (a0 + a2) + (a1 + a3)
+        float ag[MAXM][4], au[MAXM][4];
+#pragma unroll
+        for (int i = 0; i < NHB; ++i) {
+            const nvfp4moe_hbd wg = nvfp4moe_decode(cg[i], sg[i], ue4m3, t0, t1, t2, t3);
+            const nvfp4moe_hbd wu = nvfp4moe_decode(cu[i], su[i], ue4m3, t0, t1, t2, t3);
+#pragma unroll
+            for (int m = 0; m < MAXM; ++m) {
+                if (m < n_tok) {
+                    const block_q8_1 * yb = xq + m*nb_k + j + L*i;
+                    const float pg = nvfp4moe_hbd_dot(wg, yb), pu = nvfp4moe_hbd_dot(wu, yb);
+                    if (i < 4) { ag[m][i] = 0.0f + pg; au[m][i] = 0.0f + pu; }
+                    else       { ag[m][i & 3] += pg;   au[m][i & 3] += pu; }
+                }
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) {
+            if (m < n_tok) {
+                float rg_ = (ag[m][0] + ag[m][2]) + (ag[m][1] + ag[m][3]);
+                float ru_ = (au[m][0] + au[m][2]) + (au[m][1] + au[m][3]);
+#pragma unroll
+                for (int o = 4; o > 0; o >>= 1) {
+                    rg_ += __shfl_xor_sync(0xffffffff, rg_, o, 32);
+                    ru_ += __shfl_xor_sync(0xffffffff, ru_, o, 32);
+                }
+                if (j == 0) {
+                    act_s[m][g] = nvfp4moe_situ(P.s_gu ? rg_*scale : rg_, P.s_gu ? ru_*scale : ru_, P.situ);
+                }
+            }
         }
     } else {
         // 2..MAXM tokens: decode each half-block once, dot it with every token (sequential sums, not the 1-token order)
@@ -839,7 +875,8 @@ static __global__ void __launch_bounds__(256) k_nvfp4moe_dn1(const nvfp4moe_para
 // ---------------------------------------------------------------------------------------------------------------------
 // down for 2..MAXM tokens: grid (K/64, T*n_used), 256 threads: lane = 4*row + j, warp w rows 8w..8w+7 of the chunk.
 // Each CTA reads the rows of its expert once and dots every token routed to it; writes e_out[t][k][r] (scaled).
-template <int MAXM>
+// GO: generic order per token (lane l of mul_mat_vec_q_moe: 0 + p[l] + p[l+32], l < 4), as k_nvfp4moe_dn1 rebuilds it
+template <int MAXM, bool GO = false>
 static __global__ void __launch_bounds__(256) k_nvfp4moe_dnm(const nvfp4moe_params P) {
     constexpr int NHB = 9;
     extern __shared__ __align__(16) char smem_raw[];
@@ -878,6 +915,28 @@ static __global__ void __launch_bounds__(256) k_nvfp4moe_dnm(const nvfp4moe_para
 
     const uint32_t t0 = 0x03020100, t1 = 0x0C080604, t2 = 0xFDFEFF00, t3 = 0xF4F8FAFC;
     float acc[MAXM];
+    if constexpr (GO) {
+        // lane j holds generic lanes j + 4a (a < 8) = half-blocks j + 4i, i < 8, and j + 32 (i == 8, added to a = 0 first):
+        // acc4[a] = 0 + p[a] (+ p[8]); xor 16 / 8 / 4 = ((q0 + q4) + (q2 + q6)) + ((q1 + q5) + (q3 + q7))
+        constexpr int ord[NHB] = {0, 8, 1, 2, 3, 4, 5, 6, 7};
+        float q[MAXM][8];
+#pragma unroll
+        for (int ii = 0; ii < NHB; ++ii) {
+            const int i = ord[ii];
+            const nvfp4moe_hbd wd = nvfp4moe_decode(c[i], sc[i], ue4m3, t0, t1, t2, t3);
+#pragma unroll
+            for (int m = 0; m < MAXM; ++m) {
+                if (m < n_tok) {
+                    const float p = nvfp4moe_hbd_dot(wd, aq + m*nb_f + j + 4*i);
+                    if (i == 8) { q[m][0] += p; } else { q[m][i] = 0.0f + p; }
+                }
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) {
+            acc[m] = m >= n_tok ? 0.0f : ((q[m][0] + q[m][4]) + (q[m][2] + q[m][6])) + ((q[m][1] + q[m][5]) + (q[m][3] + q[m][7]));
+        }
+    } else {
 #pragma unroll
     for (int m = 0; m < MAXM; ++m) { acc[m] = 0.0f; }
 #pragma unroll
@@ -889,6 +948,7 @@ static __global__ void __launch_bounds__(256) k_nvfp4moe_dnm(const nvfp4moe_para
                 acc[m] += nvfp4moe_hbd_dot(wd, aq + m*nb_f + j + 4*i);
             }
         }
+    }
     }
 #pragma unroll
     for (int m = 0; m < MAXM; ++m) {

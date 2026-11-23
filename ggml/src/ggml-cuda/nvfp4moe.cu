@@ -35,6 +35,11 @@ bool ggml_cuda_nvfp4moe_preq() {
     return on;
 }
 
+bool ggml_cuda_nvfp4moe_gord() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_NVFP4MOE_GORD"); return !e || atoi(e) != 0; }();
+    return on;
+}
+
 bool ggml_cuda_nvfp4moe_exact() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_NVFP4MOE_EXACT"); return !e || atoi(e) != 0; }();
     return on;
@@ -51,8 +56,8 @@ bool ggml_cuda_nvfp4moe_supported(int cc, int64_t K, int64_t F, int64_t n_used) 
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-template <int MAXM>
-static void nvfp4moe_launch_m(const nvfp4moe_params & P, cudaStream_t stream) {
+template <int MAXM, bool GO>
+static void nvfp4moe_launch_mg(const nvfp4moe_params & P, cudaStream_t stream) {
     const dim3 grid_gu(P.F/32, P.T*P.n_used);
     const size_t smem_gu = MAXM*(P.K/QK8_1)*sizeof(block_q8_1);
     if constexpr (MAXM == 1) {
@@ -60,18 +65,27 @@ static void nvfp4moe_launch_m(const nvfp4moe_params & P, cudaStream_t stream) {
     } else if (P.xq) {
         k_nvfp4moe_xq<<<(P.T*(P.K/QK8_1) + 7)/8, 256, 0, stream>>>(P);
         CUDA_CHECK(cudaGetLastError());
-        k_nvfp4moe_gu<MAXM, 9, true><<<grid_gu, 256, smem_gu, stream>>>(P);
+        k_nvfp4moe_gu<MAXM, 9, true, GO><<<grid_gu, 256, smem_gu, stream>>>(P);
     } else {
-        k_nvfp4moe_gu<MAXM, 9><<<grid_gu, 256, smem_gu, stream>>>(P);
+        k_nvfp4moe_gu<MAXM, 9, false, GO><<<grid_gu, 256, smem_gu, stream>>>(P);
     }
     CUDA_CHECK(cudaGetLastError());
     if constexpr (MAXM == 1) {
         k_nvfp4moe_dn1<<<P.K/8, 256, 0, stream>>>(P);
     } else {
         const dim3 grid_dn(P.K/64, P.T*P.n_used);
-        k_nvfp4moe_dnm<MAXM><<<grid_dn, 256, MAXM*(P.F/QK8_1)*sizeof(block_q8_1), stream>>>(P);
+        k_nvfp4moe_dnm<MAXM, GO><<<grid_dn, 256, MAXM*(P.F/QK8_1)*sizeof(block_q8_1), stream>>>(P);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <int MAXM>
+static void nvfp4moe_launch_m(const nvfp4moe_params & P, cudaStream_t stream) {
+    if (MAXM > 1 && ggml_cuda_nvfp4moe_gord()) {
+        nvfp4moe_launch_mg<MAXM, true>(P, stream);
+    } else {
+        nvfp4moe_launch_mg<MAXM, false>(P, stream);
+    }
 }
 
 void ggml_cuda_nvfp4moe_launch(const nvfp4moe_params & P, cudaStream_t stream) {

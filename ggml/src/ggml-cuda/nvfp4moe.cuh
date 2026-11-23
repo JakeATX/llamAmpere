@@ -34,6 +34,8 @@ int ggml_cuda_nvfp4moe_f32act();
 int  ggml_cuda_nvfp4moe_max_tok();
 // GGML_CUDA_NVFP4MOE_PREQ=0: T > 1 gate_up CTAs quantize x themselves (default: one k_nvfp4moe_xq launch per visit)
 bool ggml_cuda_nvfp4moe_preq();
+// GGML_CUDA_NVFP4MOE_GORD=0: T > 1 sums each token sequentially (default: the generic MMVQ order, bit-identical per token)
+bool ggml_cuda_nvfp4moe_gord();
 // GGML_CUDA_NVFP4MOE_EXACT=0: T > 1 runs the 2 / 4 / 8 / 16-token kernels (default: the kernel of exactly T tokens, T <= 8)
 bool ggml_cuda_nvfp4moe_exact();
 // shapes the kernels take (K = 2304, F = 1152, n_used = 8, NVIDIA Ampere/Ada)
