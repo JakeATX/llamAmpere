@@ -138,13 +138,13 @@ PY
 }
 
 TARGS() { echo "$TRAINARGS --train $D/strain:$D/short_train.seq --train2 $D/ltrain:$D/lseq/train.seq --frac2 $FRAC2 --sel $D/sel:$D/sel.seq \
-  --lr $LR --loss $LOSS --kl $KL --seqs-per-step $SPS --anchors-per-seq $APS --chunk-long 32"; }
+  --lr $LR --loss $LOSS --kl $KL --seqs-per-step $SPS --anchors-per-seq $APS --chunk-long $CL"; }
 
 ph_profile() {
   done_or profile && return
   # only sel is dumped at this point: train on its real 100K/32K sequences (memory + speed check), then one sel eval
   $PY $T/train.py $TRAINARGS --train $D/sel:$D/sel.seq --sel $D/sel:$D/sel.seq --lr $LR --loss $LOSS --kl $KL --seqs-per-step $SPS \
-      --anchors-per-seq $APS --chunk-long 32 --eval-stride $EVAL_STRIDE --out $R/prof --profile 4 > $R/profile.log 2>&1 || { log "profile failed: $(tail -3 $R/profile.log | tr '\n' ' ')"; return 1; }
+      --anchors-per-seq $APS --chunk-long $CL --eval-stride $EVAL_STRIDE --out $R/prof --profile 4 > $R/profile.log 2>&1 || { log "profile failed: $(tail -3 $R/profile.log | tr '\n' ' ')"; return 1; }
   log "profile $(grep -E 'mem_gib|mean_step' $R/profile.log | tail -2 | tr '\n' ' ' | cut -c1-400)"
   touch $R/L.profile.done
 }
@@ -174,6 +174,7 @@ ph_export() {
       && touch $R/L.export.done && log "export $(tail -1 $R/export.log | cut -c1-400)"
 }
 
+CL=${CL:-8}   # anchors per chunk on ~100K seqs (full-attn layer scores scale with chunk x context)
 PHASES=${*:-check selrep dumpsel profile lgen lseq dump base train rep export}
 for p in $PHASES; do
   log "PHASE $p"

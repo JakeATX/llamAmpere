@@ -64,7 +64,7 @@ def slot_terms(l, S, rows, t, mb):
 
 
 CTX_SLICE = 8192   # context positions per slice (train)
-LONG_LEN = 16384   # sequences longer than this use the small chunk (train --chunk-long, eval 32)
+LONG_LEN = 16384   # sequences longer than this use the small chunk (train --chunk-long, eval 16)
 EVAL_CHUNK = int(os.environ.get('DSPARK_EVAL_CHUNK', '128'))   # anchors per eval chunk (32 for ~100K-token sequences)
 
 
@@ -87,7 +87,7 @@ def evaluate(P, fr, ds, walk, stride=1, max_seq=0, fold_fixed=None, roundsim=Tru
         if an is None:
             continue
         cs, cms, valid_all = [], [], []
-        ch = EVAL_CHUNK if S['len'] <= LONG_LEN else min(EVAL_CHUNK, 32)   # ~100K-token sequences: small chunks (full-attn layer 1)
+        ch = EVAL_CHUNK if S['len'] <= LONG_LEN else min(EVAL_CHUNK, 16)   # ~100K-token sequences: small chunks (full-attn layer 1)
         for a, logits, rows, tdat in D.seq_slots(W, fr, S, an, walk, chunk=ch):
             A, C, Am, Cm, Cmc = [], [], [], [], []
             for s, l in enumerate(logits):

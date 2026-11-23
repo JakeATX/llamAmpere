@@ -296,13 +296,19 @@ def block_forward(W, frozen, ctx_kv, anchors, anchor_tok, k0, dtype):
     x[:, 1:] = W['mask_embd.weight'].to(dtype)
     pos = anchors[:, None] + torch.arange(BLOCK, device=dev)[None, :]          # [nA, 8]
     Lc = ctx_kv[0][0].shape[0]
-    cpos = k0 + torch.arange(Lc, device=dev)
-    # mask [nA*8, Lc + nA*8]: context cells p < a (and p >= a - N_SWA for SWA layers) + own block
-    vis_full = cpos[None, :] < anchors[:, None]                                  # [nA, Lc]
-    vis_swa = vis_full & (cpos[None, :] >= anchors[:, None] - N_SWA)
+    # each layer only gets the context columns this chunk can see (full: p < max anchor; SWA: also p >= min anchor -
+    # N_SWA); dropped columns are masked for every query, so this is the same math with far less memory at ~100K
+    amin, amaxc = int(anchors.min()), int(anchors.max())
     blk = torch.eye(nA, dtype=torch.bool, device=dev).repeat_interleave(BLOCK, 0).repeat_interleave(BLOCK, 1)
-    masks = {}
-    for kind, vis in (('full', vis_full), ('swa', vis_swa)):
+    cols, masks = {}, {}
+    for kind in ('full', 'swa'):
+        lo = 0 if kind == 'full' else max(0, amin - N_SWA - k0)
+        hi = max(lo, min(Lc, amaxc - k0))
+        cpos = k0 + torch.arange(lo, hi, device=dev)
+        vis = cpos[None, :] < anchors[:, None]                                    # [nA, hi-lo]
+        if kind == 'swa':
+            vis = vis & (cpos[None, :] >= anchors[:, None] - N_SWA)
+        cols[kind] = (lo, hi)
         masks[kind] = torch.cat([vis.repeat_interleave(BLOCK, 0), blk], 1)[None, None]   # [1,1,Lq,Lk]
     for il in range(N_LAYER):
         p = f'blk.{il}.'
@@ -312,7 +318,8 @@ def block_forward(W, frozen, ctx_kv, anchors, anchor_tok, k0, dtype):
         v = mm(h, W[p + 'attn_v.weight']).reshape(nA, BLOCK, N_HEAD_KV, HD)
         q = rope_neox(rms(q, W[p + 'attn_q_norm.weight'].to(dtype)), pos)
         k = rope_neox(rms(k, W[p + 'attn_k_norm.weight'].to(dtype)), pos)
-        Kc, Vc = ctx_kv[il]
+        lo, hi = cols['swa' if il in SWA_LAYERS else 'full']
+        Kc, Vc = ctx_kv[il][0][lo:hi], ctx_kv[il][1][lo:hi]
         Kall = torch.cat([Kc.to(dtype), k.reshape(nA * BLOCK, N_HEAD_KV, HD)], 0)
         Vall = torch.cat([Vc.to(dtype), v.reshape(nA * BLOCK, N_HEAD_KV, HD)], 0)
         # GQA without expanding K/V (q head h uses kv head h // G): the G query heads of a kv head are stacked along the
