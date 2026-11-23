@@ -44,7 +44,9 @@ public:
     static bool wanted(const llama_model & model);
 
     bool armed() const { return is_armed; }
-    // allocate the two slots, staging and copy stream; false (nothing allocated) when VRAM or pinned RAM is short
+    // copy stream, events, staging and workers (made once); false: the streamer cannot run (it stays off)
+    bool prepare();
+    // allocate the two slots (prepare() first); false (nothing allocated) when VRAM is short
     bool arm();
     // wait for the copies in flight, then free all of it
     void disarm();
@@ -67,6 +69,7 @@ private:
         std::vector<const ggml_tensor *> host;   // host expert tensors
         std::vector<ggml_tensor *>       views;  // device views in the slot of this visit (same order)
         std::vector<size_t>              offs;   // offset of each view in the slot
+        std::vector<size_t>              tails;  // bytes after each tensor that the kernels may read: uploaded as zeros
         int slot = -1;                           // 0 or 1
         int pos  = -1;                           // index in order
         ggml_tensor * map = nullptr;
@@ -80,6 +83,7 @@ private:
 
     bool init_ok  = false;
     bool is_armed = false;
+    bool pipeline_ok = false;
 
     ggml_backend_t             backend_gpu = nullptr;
     ggml_backend_dev_t         dev         = nullptr;
@@ -132,5 +136,6 @@ private:
     void issue(int il, ggml_backend_t backend);
     void wait_issued();
     void worker(int w);
-    void free_all();
+    void free_slots();
+    void free_pipeline();
 };

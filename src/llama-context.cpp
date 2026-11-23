@@ -6100,12 +6100,19 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     // a writing-sized call (<= 32 rows) or the generation phase returns the scratch and refills the cache below.
     bool ink_refill = false;
     if (ink_stream && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
-        const bool stream_call = alone && n_tokens > 512 && phase != LLAMA_DECODE_PHASE_GENERATION;
-        if (stream_call && !ink_stream->armed()) {
+        static const uint32_t ink_min = [] {
+            const char * e = getenv("LLAMA_INK_STREAM_MIN_ROWS");
+            const long v = e && e[0] ? strtol(e, nullptr, 10) : 512;
+            return v >= 32 && v <= 65536 ? (uint32_t) v : 512u;
+        }();
+        const bool stream_call = alone && n_tokens > ink_min && phase != LLAMA_DECODE_PHASE_GENERATION;
+        if (stream_call && !ink_stream->armed() && ink_stream->ok() && ink_stream_fails < 2) {
             ink_stream_take();
         } else if (ink_stream->armed() && !stream_call && (n_tokens <= 32 || phase == LLAMA_DECODE_PHASE_GENERATION)) {
             ink_refill = ink_stream_release(n_tokens == 0 ? "scratch return" : "writing call");
         }
+        // a refill that failed earlier is retried on every call until the cache is back
+        ink_refill = ink_refill || (!ink_stream->armed() && moe_cache && moe_cache->suspended());
     }
     const bool ink_armed = ink_stream && ink_stream->armed();
     // refill the hot experts once the prompt scratch is back to its boot size
@@ -6134,9 +6141,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         }
         gf_res_prev_active = nullptr;
         if (!moe_cache->resume()) {
-            LLAMA_LOG_ERROR("%s: [INKSTREAM] no VRAM to refill the MoE cache; decode runs its experts on the host\n", __func__);
+            LLAMA_LOG_ERROR("%s: [INKSTREAM] no VRAM to refill the MoE cache; decode runs its experts on the host until it fits\n", __func__);
             return true;
         }
+        // the 512-row reserve above ran without the cache (its expert ops on the host): reserve again with it
+        sched_need_reserve = true;
         LLAMA_LOG_WARN("%s: [INKSTREAM] MoE cache refilled in %.1f ms\n", __func__, (ggml_time_us() - t0)/1000.0);
         return true;
     };
@@ -6382,7 +6391,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             if (!dynamic_ubatch || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) { throw; }
             const uint32_t floor = std::min(cparams.n_ubatch, std::max(256u, cparams.n_seq_max));
             LLAMA_LOG_WARN("%s: dynamic scratch %u rows failed: %s\n", __func__, rows, error.what());
-            if (rows <= floor) { sched_need_reserve = true; return false; }
+            if (rows <= floor) { sched_need_reserve = true; ink_cache_refill(); return false; }
             rows = std::max(floor, rows / 2);
             dynamic_ubatch_rows = rows;
         }
@@ -6408,14 +6417,21 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
 
 bool llama_context::ink_stream_take() {
     synchronize();
-    const size_t lent = moe_cache ? moe_cache->suspend() : 0;
-    if (!ink_stream->arm()) {
-        if (moe_cache && !moe_cache->resume()) {
-            LLAMA_LOG_ERROR("%s: [INKSTREAM] cannot refill the MoE cache\n", __func__);
-        }
-        LLAMA_LOG_WARN("%s: [INKSTREAM] streamer not armed, this prompt keeps the normal path\n", __func__);
+    if (!ink_stream->prepare()) {
+        ink_stream_fails = 2;
         return false;
     }
+    const size_t lent = moe_cache ? moe_cache->suspend() : 0;
+    sched_need_reserve = true; // any graph built so far reads the banks: rebuild (the resize path drops the old graphs)
+    if (!ink_stream->arm()) {
+        if (moe_cache && !moe_cache->resume()) {
+            LLAMA_LOG_ERROR("%s: [INKSTREAM] cannot refill the MoE cache (retried on the next calls)\n", __func__);
+        }
+        ink_stream_fails++;
+        LLAMA_LOG_WARN("%s: [INKSTREAM] streamer not armed (%d), this prompt keeps the normal path\n", __func__, ink_stream_fails);
+        return false;
+    }
+    ink_stream_fails = 0;
     sched_need_reserve = true; // the graph reads the slots now
     ink_stream_tokens   = 0;
     ink_stream_rows_max = 0;
@@ -6427,8 +6443,8 @@ bool llama_context::ink_stream_take() {
 
 bool llama_context::ink_stream_release(const char * why) {
     synchronize();
-    const llama_ink_stream_stats st = ink_stream->take_stats();
     ink_stream->disarm();
+    const llama_ink_stream_stats st = ink_stream->take_stats();
     sched_need_reserve = true; // the graph reads the MoE cache again
     const double t = (ggml_time_us() - ink_stream_t0_us)/1e6;
     LLAMA_LOG_WARN("%s: [INKSTREAM] prompt done (%s): %llu tokens in %.2f s (%.1f tok/s), ubatch up to %u rows, "

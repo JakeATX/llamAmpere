@@ -3604,12 +3604,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // fork: the hot/cold bank split, the onechain bank fill and the fork Hadamard table keep the cached path only
         (!hadamard_rotations || hadamard_rotations->empty()) && moe_onechain_bank == nullptr && moe_route_skip == nullptr;
     // fork (INKSTREAM): a streamed prompt reads every expert of this visit from its VRAM slot
-    ggml_tensor * stream_slots = build_moe_stream_slots(selected_experts, il);
+    // (not with LoRAs or the paths that keep the cached graph only: the onechain bank fill and the route skip)
+    bool stream_ok = moe_stream && moe_stream->get_map(il) && loras->empty() && moe_onechain_bank == nullptr && moe_route_skip == nullptr;
     for (ggml_tensor * w : exps) {
-        if (stream_slots && w && (moe_stream->get_experts(w, il) == nullptr || !loras->empty())) {
-            stream_slots = nullptr; // not one of its experts: the normal path
-        }
+        stream_ok = stream_ok && (w == nullptr || moe_stream->get_experts(w, il) != nullptr);
     }
+    ggml_tensor * stream_slots = stream_ok ? build_moe_stream_slots(selected_experts, il) : nullptr;
     moe_stream_il = stream_slots ? il : -1;
     const llm_graph_moe_cache_slots cache = stream_slots ? llm_graph_moe_cache_slots{ stream_slots, nullptr } :
         build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, can_cpu_share, il);

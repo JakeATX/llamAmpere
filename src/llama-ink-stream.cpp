@@ -80,13 +80,46 @@ llama_ink_stream::llama_ink_stream(const llama_model & model, ggml_backend_t bac
             off = GGML_PAD(off, align);
             v.host.push_back(t);
             v.offs.push_back(off);
-            // the device alloc size (MMQ row padding) plus a zeroed tail, as the cache banks and the op offload copies keep
-            off += ggml_backend_buft_get_alloc_size(buft_dev, t) + 512;
+            // the device alloc size (MMQ row padding) plus a zeroed tail, as the cache banks and the op offload copies keep;
+            // other visits of the slot lay out their tensors differently, so this tail is zeroed again on every upload
+            const size_t alloc = ggml_backend_buft_get_alloc_size(buft_dev, t) + 512;
+            v.tails.push_back(alloc - ggml_nbytes(t));
+            off += alloc;
         }
         slot_size = std::max(slot_size, GGML_PAD(off, align));
-        v.pos = (int) order.size();
         order.push_back(il);
         n_views += experts.size();
+    }
+    // graph order of the visits. A looped model (Inkling 2 loop) repeats its core layers [start, end) after the physical
+    // layers [0, n_phys): the graph runs [0, end), then the repeats (il >= n_phys), then the coda [end, n_phys). Repeats
+    // share the expert tensors of their physical layer, which is how they are found here.
+    {
+        int n_phys = n_layer, start = n_layer, end = -1;
+        for (int il = 0; il < n_layer && n_phys == n_layer; ++il) {
+            for (int j = 0; j < il; ++j) {
+                if (model.layers[il].ffn_down_exps && model.layers[il].ffn_down_exps == model.layers[j].ffn_down_exps) {
+                    n_phys = il;
+                    break;
+                }
+            }
+        }
+        for (int il = n_phys; il < n_layer; ++il) {
+            for (int j = 0; j < n_phys; ++j) {
+                if (model.layers[il].ffn_down_exps && model.layers[il].ffn_down_exps == model.layers[j].ffn_down_exps) {
+                    start = std::min(start, j);
+                    end   = std::max(end, j + 1);
+                }
+            }
+        }
+        if (n_phys < n_layer && end > start) {
+            auto rank = [&](int il) {
+                return il < end ? il : il >= n_phys ? end + (il - n_phys) : end + (n_layer - n_phys) + (il - end);
+            };
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return rank(a) < rank(b); });
+        }
+        for (size_t i = 0; i < order.size(); ++i) {
+            visits[order[i]].pos = (int) i;
+        }
     }
     if (order.size() < 2) {
         if (!order.empty()) {
@@ -151,6 +184,7 @@ llama_ink_stream::llama_ink_stream(const llama_model & model, ggml_backend_t bac
 
 llama_ink_stream::~llama_ink_stream() {
     disarm();
+    free_pipeline();
     if (buf_map) {
         ggml_backend_buffer_free(buf_map);
     }
@@ -162,7 +196,21 @@ llama_ink_stream::~llama_ink_stream() {
     }
 }
 
-void llama_ink_stream::free_all() {
+void llama_ink_stream::free_pipeline() {
+    if (!threads.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+        threads.clear();
+    }
+    if (backend_copy) {
+        ggml_backend_synchronize(backend_copy);
+    }
     for (auto & w : wst) {
         for (int b = 0; b < 2; ++b) {
             if (w.ev[b]) { ggml_backend_event_free(w.ev[b]); }
@@ -173,12 +221,15 @@ void llama_ink_stream::free_all() {
     for (int s = 0; s < 2; ++s) {
         if (ev_free[s])  { ggml_backend_event_free(ev_free[s]);  ev_free[s]  = nullptr; }
         if (ev_ready[s]) { ggml_backend_event_free(ev_ready[s]); ev_ready[s] = nullptr; }
-        issued[s] = -1;
     }
     if (backend_copy) {
         ggml_backend_free(backend_copy);
         backend_copy = nullptr;
     }
+    pipeline_ok = false;
+}
+
+void llama_ink_stream::free_slots() {
     if (buf_slot) {
         ggml_backend_buffer_free(buf_slot);
         buf_slot = nullptr;
@@ -188,22 +239,70 @@ void llama_ink_stream::free_all() {
         t->data   = nullptr;
         t->buffer = nullptr;
     }
+    issued[0] = issued[1] = -1;
 }
 
-bool llama_ink_stream::arm() {
+// copy stream, events, pinned staging and the workers: made once, kept between prompts (no VRAM of note)
+bool llama_ink_stream::prepare() {
     if (!init_ok) {
         return false;
     }
+    if (pipeline_ok) {
+        return true;
+    }
+    backend_copy = ggml_backend_dev_init(dev, nullptr);
+    bool ok = backend_copy != nullptr;
+    for (int s = 0; s < 2 && ok; ++s) {
+        ev_free[s]  = ggml_backend_event_new(dev);
+        ev_ready[s] = ggml_backend_event_new(dev);
+        ok = ev_free[s] && ev_ready[s];
+    }
+    // pinned staging: two pieces per worker
+    ggml_backend_buffer_type_t buft_host = ok ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    ok = ok && buft_host != nullptr;
+    wst.resize(ok ? n_workers : 0);
+    for (auto & w : wst) {
+        for (int b = 0; b < 2 && ok; ++b) {
+            w.buf[b] = ggml_backend_buft_alloc_buffer(buft_host, piece_max);
+            w.ev[b]  = w.buf[b] ? ggml_backend_event_new(dev) : nullptr;
+            ok = w.buf[b] && w.ev[b];
+            if (ok) {
+                w.data[b] = (char *) ggml_backend_buffer_get_base(w.buf[b]);
+            }
+        }
+    }
+    if (!ok) {
+        LLAMA_LOG_WARN("%s: [INKSTREAM] cannot set up the copy pipeline, the streamer is off\n", __func__);
+        free_pipeline();
+        init_ok = false; // do not retry on every prompt
+        return false;
+    }
+    stop = false;
+    n_busy = 0;
+    req_gen = done_gen = 0;
+    req_slot = -1;
+    pieces.clear();
+    for (int w = 0; w < n_workers; ++w) {
+        threads.emplace_back(&llama_ink_stream::worker, this, w);
+    }
+    pipeline_ok = true;
+    return true;
+}
+
+bool llama_ink_stream::arm() {
     if (is_armed) {
         return true;
+    }
+    if (!prepare()) {
+        return false;
     }
     buf_slot = ggml_backend_buft_alloc_buffer(buft_dev, 2*slot_size);
     if (!buf_slot) {
         LLAMA_LOG_WARN("%s: [INKSTREAM] cannot allocate 2 x %.1f MiB of expert slots\n", __func__, slot_size/1048576.0);
-        free_all();
+        free_slots();
         return false;
     }
-    ggml_backend_buffer_clear(buf_slot, 0); // the padding after each expert tensor stays zero
+    ggml_backend_buffer_clear(buf_slot, 0); // the padding after each expert tensor starts zero
     ggml_backend_buffer_set_usage(buf_slot, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     char * base = (char *) ggml_backend_buffer_get_base(buf_slot);
     bool ok = true;
@@ -216,42 +315,13 @@ bool llama_ink_stream::arm() {
             ok = ggml_backend_tensor_alloc(buf_slot, v.views[i], base + v.slot*slot_size + v.offs[i]) == GGML_STATUS_SUCCESS;
         }
     }
-    backend_copy = ok ? ggml_backend_dev_init(dev, nullptr) : nullptr;
-    ok = ok && backend_copy != nullptr;
-    for (int s = 0; s < 2 && ok; ++s) {
-        ev_free[s]  = ggml_backend_event_new(dev);
-        ev_ready[s] = ggml_backend_event_new(dev);
-        ok = ev_free[s] && ev_ready[s];
-    }
-    // pinned staging: two pieces per worker
-    ggml_backend_buffer_type_t buft_host = ggml_backend_dev_host_buffer_type(dev);
-    ok = ok && buft_host != nullptr;
-    wst.resize(ok ? n_workers : 0);
-    for (auto & w : wst) {
-        for (int b = 0; b < 2 && ok; ++b) {
-            w.buf[b] = ggml_backend_buft_alloc_buffer(buft_host, piece_max);
-            w.ev[b]  = ggml_backend_event_new(dev);
-            ok = w.buf[b] && w.ev[b];
-            if (ok) {
-                w.data[b] = (char *) ggml_backend_buffer_get_base(w.buf[b]);
-            }
-        }
-    }
     if (!ok) {
-        LLAMA_LOG_WARN("%s: [INKSTREAM] cannot set up the copy pipeline\n", __func__);
-        free_all();
+        LLAMA_LOG_WARN("%s: [INKSTREAM] cannot place the expert views\n", __func__);
+        free_slots();
         return false;
     }
     ggml_backend_synchronize(backend_gpu); // the cleared slots are visible to both streams
-
-    stop = false;
-    n_busy = 0;
-    req_gen = done_gen = 0;
-    req_slot = -1;
-    pieces.clear();
-    for (int w = 0; w < n_workers; ++w) {
-        threads.emplace_back(&llama_ink_stream::worker, this, w);
-    }
+    issued[0] = issued[1] = -1;
     is_armed = true;
     return true;
 }
@@ -260,19 +330,10 @@ void llama_ink_stream::disarm() {
     if (!is_armed) {
         return;
     }
-    wait_issued();
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        stop = true;
-    }
-    cv.notify_all();
-    for (auto & t : threads) {
-        t.join();
-    }
-    threads.clear();
+    wait_issued(); // the speculative upload of the next ubatch is queued
     ggml_backend_synchronize(backend_copy);
     ggml_backend_synchronize(backend_gpu);
-    free_all();
+    free_slots();
     is_armed = false;
 }
 
@@ -310,11 +371,15 @@ void llama_ink_stream::issue(int il, ggml_backend_t backend) {
         ggml_backend_event_wait(backend_copy, ev_free[s]);
     }
     pieces.clear();
+    static const std::vector<char> zeros(64u << 10, 0);
     for (size_t i = 0; i < v.host.size(); ++i) {
         const ggml_tensor * t = v.host[i];
         const size_t nb = ggml_nbytes(t);
         for (size_t o = 0; o < nb; o += piece_max) {
             pieces.push_back({ (const char *) t->data + o, v.offs[i] + o, std::min(piece_max, nb - o) });
+        }
+        for (size_t o = 0; o < v.tails[i]; o += zeros.size()) {
+            pieces.push_back({ zeros.data(), v.offs[i] + nb + o, std::min(zeros.size(), v.tails[i] - o) });
         }
     }
     req_slot = s;
@@ -345,6 +410,9 @@ void llama_ink_stream::worker(int w) {
             }
             // issue() changes the request only when no worker is busy, so this snapshot stays valid
             seen = req_gen;
+            if (done_gen == req_gen) {
+                continue; // woke after the others finished it: never join a done request (issue() may be rewriting it)
+            }
             n    = pieces.size();
             s    = req_slot;
             n_busy++;
