@@ -1476,8 +1476,9 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             // fork (INKSMALL2): *ink presets cache experts in llama_moe_cache (sized after the fit from what it leaves
-            // free); the provider pool allocates nothing there, so its 1 GiB minimum must not fail the 8 GB boot fit
-            ncmoe_auto || string_ends_with(params.card_preset, "ink") ? nullptr : &params.moe_cache,
+            // free); the provider pool allocates nothing there, so its 1 GiB minimum must not fail the 8 GB boot fit.
+            // 24ink keeps every expert on the GPU and takes the default path.
+            ncmoe_auto || (string_ends_with(params.card_preset, "ink") && params.card_preset != "24ink") ? nullptr : &params.moe_cache,
             fit_targets.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
