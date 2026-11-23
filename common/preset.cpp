@@ -140,7 +140,21 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         ink10.name = "10ink";
         auto ink12 = ink8;
         ink12.name = "12ink";
-        std::vector<common_card_preset> cards {large, medium, small, tiny, ink8, ink10, ink12};
+        // fork (INKSTACK): Inkling 2 Mini on a 24 GB card, one slot, the whole model on the GPU, DSpark drafter on.
+        // -b 2048 -ub 1024 (ladder on): at -c 262144 the NQ file runs out of VRAM at ub 2048 (rc8b boot check, RELREADY),
+        // and --parallel 1 keeps the server from picking 4 slots + a unified KV (500 on the first 262K request).
+        common_card_preset ink24 {
+            "24ink", "2026-11-23.1", "best known/recheck before ship", "", {
+                {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "2048"},
+                {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
+                {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
+                {"--spec-draft-ngl", "99"}, {"--spec-draft-ubatch", "64"}
+            }, {
+                {"LLAMA_DEEPCTX_LADDER", "1"}
+            }
+        };
+        std::vector<common_card_preset> cards {large, medium, small, tiny, ink8, ink10, ink12, ink24};
         for (auto & card : cards) {
             if (string_ends_with(card.name, "ink")) {
                 continue; // fork (INKSMALL2): Inkling profiles keep their own version and the model's sampling defaults
@@ -173,7 +187,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
             return profile;
         }
     }
-    throw std::invalid_argument("unknown card preset: expected 24dense, 12dense, 10dense, 8dense, 12ink, 10ink, or 8ink");
+    throw std::invalid_argument("unknown card preset: expected 24dense, 12dense, 10dense, 8dense, 24ink, 12ink, 10ink, or 8ink");
 }
 
 std::string common_card_preset_apply_env(const common_params & params) {

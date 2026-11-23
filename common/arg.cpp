@@ -960,7 +960,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         const std::string card_key = string_ends_with(key, "-headless") ? key.substr(0, key.size() - 9) : key;
         if (key == "--preset" || card_key == "24dense" || card_key == "12dense" ||
             card_key == "10dense" || card_key == "8dense" ||
-            card_key == "12ink" || card_key == "10ink" || card_key == "8ink") {
+            card_key == "24ink" || card_key == "12ink" || card_key == "10ink" || card_key == "8ink") {
             if (++card_selectors > 1) {
                 throw std::invalid_argument("select only one card preset");
             }
@@ -1146,7 +1146,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE;
         // fork (INKSMALL2): the *ink presets keep the drafter only where it measured faster: its ~1.4 GB of VRAM comes out
         // of the expert cache, which costs more than drafting gains on 8/10 GB (see common/preset.cpp)
-        const bool ink_card = string_ends_with(params.card_preset, "ink");
+        const bool ink_card = string_ends_with(params.card_preset, "ink") && params.card_preset != "24ink"; // 24ink: full GPU, drafter kept
         if (ink_card && params.card_drafter != "on") {
             if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
                 LOG_INF("card preset %s: drafter off (%s; --card-drafter on forces it)\n", params.card_preset.c_str(),
@@ -5933,9 +5933,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
-        {"--preset"}, "24dense|12dense|10dense|8dense|12ink|10ink|8ink",
-        "card profile: *dense = 27B dense, *ink = Inkling 2 Mini (experts in RAM, auto-sized VRAM expert cache, 4/4 KV; "
-        "12ink adds the DSpark drafter if Inkling-2-Mini-DSpark-Q8_0-fold.gguf is beside the model); append headless or "
+        {"--preset"}, "24dense|12dense|10dense|8dense|24ink|12ink|10ink|8ink",
+        "card profile: *dense = 27B dense, *ink = Inkling 2 Mini (8/10/12ink: experts in RAM, auto-sized VRAM expert cache, "
+        "4/4 KV, drafter off unless --card-drafter on; 24ink: whole model on the GPU, 262K, DSpark drafter if "
+        "Inkling-2-Mini-DSpark-Q8_0-fold.gguf is beside the model); append headless or "
         "-headless for a 500 MiB margin (default: 1024; 8dense: always 500); explicit flags override",
         [](common_params & params, const std::string & value) {
             params.card_preset = common_card_preset_get(value).name;
@@ -5955,7 +5956,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--card-drafter"}, "auto|on|off",
-        "*ink card presets: speculative DSpark drafter (default: auto = off: at 100K depth its ~1.4 GB of VRAM costs more "
+        "8/10/12ink card presets: speculative DSpark drafter (default: auto = off: at 100K depth its ~1.4 GB of VRAM costs more "
         "expert cache than drafting gains on 8/10/12 GB; on = use it, e.g. for short-context 12 GB use, where it is +10-12%)",
         [](common_params & params, const std::string & value) {
             if (value != "auto" && value != "on" && value != "off") {
@@ -5964,6 +5965,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.card_drafter = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_CARD_DRAFTER"));
+    add_opt(common_arg({"24ink", "24ink-headless"}, "alias for --preset 24ink (Inkling 2 Mini, 24 GB card, one slot, DSpark drafter)",
+        [](common_params & params) { params.card_preset = "24ink"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg({"12ink", "12ink-headless"}, "alias for --preset 12ink (Inkling 2 Mini, 12 GB card, one slot)",
         [](common_params & params) { params.card_preset = "12ink"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
