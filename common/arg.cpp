@@ -1144,6 +1144,23 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // fork (INKSMALL2): a card preset names its drafter "@model/<file>" (beside the model). Missing file: no drafter.
         const bool spec_off = explicit_or_env("--spec-type") && params.speculative.types.size() == 1 &&
             params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE;
+        // fork (INKSMALL2): the *ink presets keep the drafter only where it measured faster: its ~1.4 GB of VRAM comes out
+        // of the expert cache, which costs more than drafting gains on 8/10 GB (see common/preset.cpp)
+        const bool ink_card = string_ends_with(params.card_preset, "ink");
+        if (ink_card && params.card_drafter != "on" && (params.card_drafter == "off" || params.card_preset != "12ink")) {
+            if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
+                LOG_INF("card preset %s: drafter off (%s; --card-drafter on forces it)\n", params.card_preset.c_str(),
+                        params.card_drafter == "off" ? "--card-drafter off" : "it measured slower on this card size: its VRAM comes out of the expert cache");
+                params.speculative.draft.mparams.path.clear();
+                params.speculative.draft.mparams.hf_file.clear();
+                if (!explicit_or_env("--spec-type")) {
+                    params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+                }
+            } else if (params.speculative.has_dft()) {
+                LOG_WRN("card preset %s: --model-draft given; on this card size the drafter measured slower (its VRAM comes "
+                        "out of the expert cache), kept because you asked for it\n", params.card_preset.c_str());
+            }
+        }
         if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
             const std::string file = params.model.path.empty() ? std::string() :
                 (std::filesystem::path(params.model.path).parent_path() / params.speculative.draft.mparams.path.substr(7)).string();
@@ -5936,6 +5953,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg({"8dense", "8dense-headless"}, "alias for --preset 8dense (one slot)",
         [](common_params & params) { params.card_preset = "8dense"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--card-drafter"}, "auto|on|off",
+        "*ink card presets: speculative drafter use (default: auto = on for 12ink, off for 8ink/10ink, where its VRAM "
+        "costs more expert cache than drafting gains)",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto" && value != "on" && value != "off") {
+                throw std::invalid_argument("expected auto, on or off");
+            }
+            params.card_drafter = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_CARD_DRAFTER"));
     add_opt(common_arg({"12ink", "12ink-headless"}, "alias for --preset 12ink (Inkling 2 Mini, 12 GB card, one slot)",
         [](common_params & params) { params.card_preset = "12ink"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));

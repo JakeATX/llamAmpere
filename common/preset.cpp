@@ -117,15 +117,20 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // cache auto-sized (llama-context: free - reserve; --moe-cache-mib N overrides), SJ-KVaRN 4/4, op offload off,
         // ub ceiling 512 with the deep-ctx ladder (a larger ub buys compute buffer out of the expert cache: 9,216 MiB cap,
         // ub 512 70.9 tok/s vs 1024 56.1 vs 2048 31.2), moe cache batch 512 (llama-context default without op offload).
-        // ctx 131,072 = the 100K design depth. DSpark drafter on 12 GB only (+12% at 3K, +10% at 32K; costs ~1.4 GB of
-        // cache, which loses at 8/10 GB: -43% / -17%), resolved beside the model in arg.cpp, off if the file is missing.
+        // ctx 131,072 = the 100K design depth. All three carry the DSpark drafter; arg.cpp keeps it only where it measured
+        // faster (--card-drafter auto: 12ink on, 8ink/10ink off; on/off force it). The reason: the drafter's ~1.4 GB of
+        // VRAM (weights + KV + compute) comes out of the expert cache, and on 8/10 GB the lost cache hits cost more than
+        // drafting gains (3K: 8 GB -43%, 10 GB -17%; 100K 10 GB: 35.9 drafter vs 48.8-56.0 tok/s without). 12 GB: +12% 3K,
+        // +10% 32K. Resolved beside the model in arg.cpp, off with a warning if the file is missing.
         // Evidence: lanes/INKSMALL.md + INKSMALL2.md (S34d, RTX 3090 capped at 7,168/9,216/11,264 MiB).
         common_card_preset ink8 {
             "8ink", "2026-11-23.1", "best known/recheck before ship", "", {
                 {"--ctx-size", "131072"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "512"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cpu-moe", "1"}, {"--op-offload", "0"},
-                {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"}
+                {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
+                {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
+                {"--spec-draft-ngl", "99"}
             }, {
                 {"LLAMA_DEEPCTX_LADDER", "1"}
             }
@@ -134,10 +139,6 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         ink10.name = "10ink";
         auto ink12 = ink8;
         ink12.name = "12ink";
-        ink12.options.insert(ink12.options.end(), {
-            {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
-            {"--spec-draft-ngl", "99"}
-        });
         std::vector<common_card_preset> cards {large, medium, small, tiny, ink8, ink10, ink12};
         for (auto & card : cards) {
             if (string_ends_with(card.name, "ink")) {
