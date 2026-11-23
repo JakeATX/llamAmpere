@@ -369,9 +369,9 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const int nwarps = blockDim.y;
     const int n_q    = int(ne01.z);
     constexpr bool compact = tile == sj_kvarn_tile::compact;
-    // [DSPINE4 VERIFY16] 8, 10 and 12 warps: widths 9..16 (GGML_SJKVARN_COMPACT16, fattn-sjkvarn-compact16-instance.cu)
+    // [DSPINE4 VERIFY16] 8, 10 and 12 warps: widths 9..16 (GGML_SJKVARN_COMPACT16) and 7/8 (GGML_SJKVARN_COMPACT8W, fattn-sjkvarn-compact16-instance.cu)
     static_assert(!compact || (max_warps >= 3 && max_warps <= 6) || max_warps == 8 || max_warps == 10 || max_warps == 12,
-                  "the compact tile runs 3..6 warps, or 8/10/12 for widths 9..16");
+                  "the compact tile runs 3..6 warps, or 8/10/12 for widths 9..16 (and 7/8 under COMPACT8W)");
     constexpr bool fixed_nt = max_warps == 5 || max_warps == 6 || compact; // MTP-4 verification (5), 6 rows (NT6_OCC), compact
     // compact: max_warps == ceil(6*n_q/8) == nwarps (ggml_cuda_fattn_sj_kvarn_stream_compact launches it so), compile-time
     const int NT     = compact || max_warps == 5 || max_warps == 6 ? max_warps : n_q;
@@ -1336,9 +1336,9 @@ static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_co
         }
     }
     if constexpr (tile == sj_kvarn_tile::compact && max_warps > 6) {
-        // [DSPINE4 VERIFY16] widths 9..16: one query tile of 16 rows (ntiles_x 1); the kernel never reads blockIdx.x, so an
+        // [DSPINE4 VERIFY16] widths 9..16 (and 7/8, COMPACT8W): one query tile of 16 rows (ntiles_x 1); the kernel never reads blockIdx.x, so an
         // 8-row tile would launch the whole node twice
-        GGML_ASSERT(dst->src[0]->ne[1] > 8 && dst->src[0]->ne[1] <= 16 && KW == 1);
+        GGML_ASSERT(dst->src[0]->ne[1] >= 4 && dst->src[0]->ne[1] <= 16 && KW == 1); // 4..8: GGML_SJKVARN_COMPACT8W
         launch_fattn<D, 16, NCOLS2>
             (ctx, dst, kernel, NT*KW,
              ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body), UNIT,
@@ -1695,7 +1695,24 @@ static inline bool ggml_cuda_fattn_sj_kvarn_compact16_env() {
     return on;
 }
 
-// warps of the compact16 launch at n_q 9..16 (>= ceil(6*n_q/8); pad warps hold only pad pairs)
+// [DSPINE4 VERIFY8W] GGML_SJKVARN_COMPACT8W=<lo> (4..8, default unset = off): widths lo..8 on a compact node (the
+// compact tile already serves it in mode 2, i.e. widths 7/8 under GGML_SJKVARN_COMPACT_W78; mode 1 at widths 4/6 keeps its
+// bit-identical copied split; width 5 has its own Q5/G6 path) run the compact16 launch at 8 warps, 1 CTA/SM (240 regs, no local memory) instead of
+// the 3..6-warp instances held to 2 CTAs/SM (168 regs, 64 B local at 5/6 warps). Own KV split (mode 2): rounding-only.
+static inline int ggml_cuda_fattn_sj_kvarn_compact8w_lo() {
+    static const int lo = [] {
+        const char * e = getenv("GGML_SJKVARN_COMPACT8W");
+        const int v = e != nullptr ? atoi(e) : 0;
+        const int lo = v >= 4 && v <= 8 ? v : 0;
+        if (e != nullptr) {
+            GGML_LOG_INFO("SJ-KVaRN GGML_SJKVARN_COMPACT8W=%s: %s\n", e, lo != 0 ? "8-warp compact launch from width lo (mode-2 widths)" : "off (needs 4..8)");
+        }
+        return lo;
+    }();
+    return lo;
+}
+
+// warps of the compact16 launch at n_q 9..16 (and 4..8 under GGML_SJKVARN_COMPACT8W) (>= ceil(6*n_q/8); pad warps hold only pad pairs)
 static constexpr int ggml_cuda_fattn_sj_kvarn_compact16_warps(const int n_q) {
     return n_q <= 10 ? 8 : n_q <= 13 ? 10 : 12;
 }
@@ -1716,12 +1733,13 @@ static void ggml_cuda_fattn_sj_kvarn_stream_compact16_w(ggml_backend_cuda_contex
 template <bool turbo4_body, bool rot>
 static void ggml_cuda_fattn_sj_kvarn_stream_compact16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int nstage_env) {
     const int n_q = (int) dst->src[0]->ne[1];
-    GGML_ASSERT(n_q > 8 && n_q <= 16 && dst->src[0]->ne[2] == 6*dst->src[1]->ne[2]);
+    GGML_ASSERT(n_q >= 4 && n_q <= 16 && dst->src[0]->ne[2] == 6*dst->src[1]->ne[2]);
     const int W = ggml_cuda_fattn_sj_kvarn_compact16_warps(n_q);
     static std::atomic<uint32_t> logged{0};
     const uint32_t bit = 1u << n_q;
     if (!(logged.fetch_or(bit) & bit)) {
-        GGML_LOG_INFO("%s: SJ-KVaRN compact16 verify tile on at width %d (%d warps, one pass, own KV split)\n", __func__, n_q, W);
+        GGML_LOG_INFO("%s: SJ-KVaRN compact16 verify tile on at width %d (%d warps, one pass, own KV split%s)\n", __func__, n_q, W,
+            n_q <= 8 ? ", COMPACT8W" : "");
     }
     switch (W) {
         case 8:  ggml_cuda_fattn_sj_kvarn_stream_compact16_w< 8, turbo4_body, rot>(ctx, dst, nstage_env); break;
@@ -1732,6 +1750,7 @@ static void ggml_cuda_fattn_sj_kvarn_stream_compact16(ggml_backend_cuda_context 
 
 // exported from template-instances/fattn-sjkvarn-compact16-instance.cu
 bool ggml_cuda_flash_attn_ext_sj_kvarn_compact16_ok(const ggml_tensor * dst);
+bool ggml_cuda_flash_attn_ext_sj_kvarn_compact8w_ok(const ggml_tensor * dst);
 void ggml_cuda_flash_attn_ext_sj_kvarn_compact16_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool turbo4_body, bool rot, int nstage_env);
 
 template <bool turbo4_body = false, bool rot = false>
@@ -1902,6 +1921,10 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
         }
         if (NT >= 7 && ggml_cuda_fattn_sj_kvarn_compact_w78() == 0) {
             cmode = 0; // the kill switch wins over an explicit GGML_SJKVARN_COMPACT_OCC=1 too
+        }
+        if (cmode == 2 && ggml_cuda_flash_attn_ext_sj_kvarn_compact8w_ok(dst)) { // mode 1 (widths 4/6, bit-identical split) keeps its path
+            ggml_cuda_flash_attn_ext_sj_kvarn_compact16_run(ctx, dst, turbo4_body, rot, nstage_env); // [DSPINE4 VERIFY8W]
+            return;
         }
         if (cmode != 0) {
             ggml_cuda_fattn_sj_kvarn_stream_compact<turbo4_body, rot>(ctx, dst, nstage_env, cmode, NT == 4 ? 4 : NT == 6 && nt6_occ ? 6 : 8);
