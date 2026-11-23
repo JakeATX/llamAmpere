@@ -159,7 +159,17 @@ static __global__ void k_ink_sj_d128_scatter(const float * __restrict__ src, cha
 }
 
 bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (!ink_sj_d128_enabled() || ggml_get_op_params_i32(dst, GGML_INK_SJ_D128_PARAM) != GGML_INK_SJ_D128_MAGIC) {
+    if (!ink_sj_d128_enabled()) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(dst, GGML_INK_SJ_D128_PARAM) != GGML_INK_SJ_D128_MAGIC) {
+        if (dst->src[0] && dst->src[0]->ne[0] == 256 && dst->src[0]->ne[1] >= 128) {
+            static bool told_flag = false;
+            if (!told_flag) {
+                told_flag = true;
+                GGML_LOG_WARN("[INKSJD128] SJ node without the packed flag: %s, T %d\n", dst->name, (int) dst->src[0]->ne[1]);
+            }
+        }
         return false;
     }
     const ggml_tensor * Q    = dst->src[0];
@@ -187,7 +197,7 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             static bool told = false;
             if (!told) {
                 told = true;
-                GGML_LOG_INFO("[INKSJD128] packed node not taken (generic route): T %d, mask %s ne2 %d, op5 %x op7 %d op4 %d, rot %d, lse %d, src7 %d src8 %d src9 %d\n",
+                GGML_LOG_WARN("[INKSJD128] packed node not taken (generic route): T %d, mask %s ne2 %d, op5 %x op7 %d op4 %d, rot %d, lse %d, src7 %d src8 %d src9 %d\n",
                     (int) Q->ne[1], mask ? ggml_type_name(mask->type) : "none", mask ? (int) mask->ne[2] : -1,
                     ggml_get_op_params_i32(dst, 5), ggml_get_op_params_i32(dst, 7), ggml_get_op_params_i32(dst, 4),
                     (int) ggml_cuda_fattn_sj_kvarn_rot(dst), lse != nullptr, dst->src[7] != nullptr, dst->src[8] != nullptr, dst->src[9] != nullptr);
@@ -294,7 +304,7 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     static bool noted = false;
     if (!noted) {
         noted = true;
-        GGML_LOG_INFO("[INKSJD128] packed D128 SJ-KVaRN prefill: %d packed heads x 2 at D 128 (GQA %d), T %d, n_kv %d\n", P, g, T, n_kv);
+        GGML_LOG_WARN("[INKSJD128] packed D128 SJ-KVaRN prefill: %d packed heads x 2 at D 128 (GQA %d), T %d, n_kv %d\n", P, g, T, n_kv);
     }
     return true;
 }
