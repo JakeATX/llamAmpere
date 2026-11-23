@@ -2137,7 +2137,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-disk-limit"}, "N",
         string_format("size limit of the prompt-cache disk tier in MiB; the oldest-written entries are deleted first, "
-            "and writes are skipped while the filesystem has less than max(10%%, 8 GiB) free "
+            "and writes are skipped while the filesystem has less than 5%% of it (8-32 GiB) free "
             "(default: %d, -1 = no limit, the free-space guard still applies, 0 = disable the disk tier)", params.cache_disk_mib),
         [](common_params & params, int value) {
             if (value < -1) {
@@ -2150,7 +2150,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--cache-disk-min-free"}, "N",
         "free space the prompt-cache disk tier leaves on its filesystem; writes are skipped (with a warning, and "
         "counted in /metrics) below it. N = MiB, NG = GiB, N% = percent of the filesystem "
-        "(default: -1 = max(10% of the filesystem, 8 GiB))",
+        "(default: -1 = 5% of the filesystem, at least 8 GiB and at most 32 GiB)",
         [](common_params & params, const std::string & value) {
             const auto bad = []() {
                 return std::invalid_argument("cache-disk-min-free must be -1, a size in MiB, NG (GiB) or N% (0-100)");

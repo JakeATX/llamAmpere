@@ -3015,9 +3015,11 @@ private:
                 if (params_base.cache_disk_min_free_pct >= 0.0f) {
                     prompt_cache->disk.guard_frac = params_base.cache_disk_min_free_pct / 100.0;
                     prompt_cache->disk.guard_abs  = 0;
+                    prompt_cache->disk.guard_cap  = 0;
                 } else if (params_base.cache_disk_min_free_mib >= 0) {
                     prompt_cache->disk.guard_frac = 0.0;
                     prompt_cache->disk.guard_abs  = 1024ull*1024ull*(uint64_t) params_base.cache_disk_min_free_mib;
+                    prompt_cache->disk.guard_cap  = 0;
                 }
 
                 std::string err;
