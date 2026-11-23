@@ -21,13 +21,14 @@
 static constexpr uint32_t N_RS  = 15;
 static constexpr int32_t  BLOCK = 16;
 
-static llama_context * make_ctx(const common_params & params, llama_model * model, bool gdn_replay, uint32_t n_seq = 1) {
+static llama_context * make_ctx(const common_params & params, llama_model * model, bool gdn_replay, uint32_t n_seq = 1,
+        uint32_t n_rs = N_RS) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max  = n_seq;
     cparams.n_ctx      = 512 * n_seq;
     cparams.n_batch    = 64;
     cparams.n_ubatch   = 64;
-    cparams.n_rs_seq   = N_RS;
+    cparams.n_rs_seq   = n_rs;
     cparams.gdn_replay = gdn_replay;
     return llama_init_from_model(model, cparams);
 }
@@ -120,6 +121,87 @@ static double run(const common_params & params, llama_model * model, bool gdn_re
     return ok ? worst : std::numeric_limits<double>::infinity();
 }
 
+// [DSPINE4] shape-matched probe. run() probes each rollback with a 1-row decode, while its reference decodes that row inside
+// a long batch; on CUDA the 1-row and the many-row matmul paths round differently, so later rounds differ at ~1e-5 even
+// when the state is right. Here every row of the rolled-back context is decoded inside a 16-row verify block (as the
+// server does: the next round's row 0 is the target's own token), and the probe is that block's row-0 logits. The
+// reference decodes history + row 0 in one batch. A state mix-up would show here as it does in run(); rounding from
+// batch shape should not. ctrl = the same reference with the last kept token dropped (must be far above tol, so the
+// probe can see a one-token state error).
+struct matched_result {
+    double worst = 0.0;
+    double ctrl_min = std::numeric_limits<double>::infinity();
+};
+
+static matched_result run_matched(const common_params & params, llama_model * model, bool gdn_replay,
+        const std::vector<int32_t> & kept, uint32_t seed, int n_vocab) {
+    matched_result res;
+    std::mt19937 g(seed);
+    std::uniform_int_distribution<int32_t> tok(1, std::max(2, std::min(n_vocab - 1, 1000)));
+    std::vector<llama_token> history(12);
+    for (auto & t : history) {
+        t = tok(g);
+    }
+    llama_context * ctx = make_ctx(params, model, gdn_replay);
+    if (!ctx || llama_n_rs_seq(ctx) < N_RS) {
+        if (ctx) {
+            llama_free(ctx);
+        }
+        res.worst = std::numeric_limits<double>::infinity();
+        return res;
+    }
+    const size_t n_prefix = history.size();
+    bool ok = decode(ctx, history, 0, false);
+    for (size_t r = 0; ok && r <= kept.size(); ++r) {
+        std::vector<llama_token> blk(BLOCK);
+        for (auto & t : blk) {
+            t = tok(g);
+        }
+        const llama_pos p0 = (llama_pos) history.size();
+        ok = decode(ctx, blk, p0, true);
+        if (!ok) {
+            break;
+        }
+        // probe: row 0 of this block vs a fresh context that decoded history + row 0 in one batch
+        std::vector<llama_token> seq = history;
+        seq.push_back(blk[0]);
+        llama_context * ref = make_ctx(params, model, gdn_replay);
+        ok = ref && decode(ref, seq, 0, true);
+        if (ok) {
+            const double e = nmse(llama_get_logits_ith(ctx, 0), llama_get_logits_ith(ref, -1), n_vocab);
+            fprintf(stderr, "  matched gdn_replay=%d round %zu: nmse %.3e\n", gdn_replay, r, e);
+            res.worst = std::max(res.worst, e);
+        }
+        if (ref) {
+            llama_free(ref);
+        }
+        if (ok && history.size() > n_prefix) {
+            std::vector<llama_token> bad(history.begin(), history.end() - 1);
+            bad.push_back(blk[0]);
+            llama_context * rc = make_ctx(params, model, gdn_replay);
+            if (rc && decode(rc, bad, 0, true)) {
+                const double c = nmse(llama_get_logits_ith(ctx, 0), llama_get_logits_ith(rc, -1), n_vocab);
+                res.ctrl_min = std::min(res.ctrl_min, c);
+            }
+            if (rc) {
+                llama_free(rc);
+            }
+        }
+        if (!ok || r == kept.size()) {
+            break;
+        }
+        const int32_t a = kept[r];
+        ok = llama_memory_seq_rm(llama_get_memory(ctx), 0, p0 + 1 + a, -1) &&
+             llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == p0 + a;
+        history.insert(history.end(), blk.begin(), blk.begin() + 1 + a);
+    }
+    llama_free(ctx);
+    if (!ok) {
+        res.worst = std::numeric_limits<double>::infinity();
+    }
+    return res;
+}
+
 // [review F8] 4 sequences in one context: every round verifies a 16-row block per sequence in ONE batch, then rolls each
 // sequence back to its own depth, then decodes one next token per sequence in one batch. Each sequence's logits must
 // match a fresh single-sequence context that decoded only that sequence's kept tokens.
@@ -188,7 +270,8 @@ static double run_multi(const common_params & params, llama_model * model, bool 
         }
         ok = llama_decode(ctx, b) == 0;
         for (int32_t s = 0; ok && s < n_seq; ++s) {
-            llama_context * ref = make_ctx(params, model, gdn_replay);
+            // [DSPINE4] the reference never rolls back: no snapshot planes (the 4-seq ring case OOMed next to a 14 GB model)
+            llama_context * ref = make_ctx(params, model, gdn_replay, 1, 0);
             ok = ref && decode(ref, hist[s], 0, false) && decode(ref, { nxt[s] }, (llama_pos) hist[s].size(), true);
             if (ok) {
                 const double e = nmse(llama_get_logits_ith(ctx, s), llama_get_logits_ith(ref, -1), n_vocab);
@@ -242,12 +325,17 @@ int main(int argc, char ** argv) {
     // CPU float order differs between a 16-row and a short batch; this bound is far below any state mix-up
     const double tol = 1e-6;
     int fails = 0;
+    // [DSPINE4] a plan passes when both probes are within tol, or as ROUNDING when only the 1-row probe is above tol, the
+    // shape-matched probe is within tol, and a one-token state error (ctrl) is >= 100x the 1-row probe's error.
     for (const bool replay : { false, true }) {
         for (size_t i = 0; i < plans.size(); ++i) {
             const double e = run(params, model, replay, plans[i], 100 + (uint32_t) i, n_vocab);
-            const bool pass = e <= tol;
-            fprintf(stderr, "%s layout=%s plan %zu: worst nmse %.3e\n", pass ? "PASS" : "FAIL", replay ? "gdn_replay" : "ring", i, e);
-            fails += pass ? 0 : 1;
+            const matched_result m = run_matched(params, model, replay, plans[i], 500 + (uint32_t) i, n_vocab);
+            // ROUNDING: the shape-matched probe is exact while a one-token state error (ctrl) is >= 100x the 1-row excess
+            const char * verdict = m.worst > tol ? "FAIL" : e <= tol ? "PASS" : m.ctrl_min >= 100.0 * e ? "PASS(ROUNDING)" : "FAIL";
+            fprintf(stderr, "%s layout=%s plan %zu: worst nmse %.3e (1-row probe), %.3e (shape-matched), ctrl %.3e\n", verdict,
+                    replay ? "gdn_replay" : "ring", i, e, m.worst, m.ctrl_min);
+            fails += verdict[0] == 'P' ? 0 : 1;
         }
     }
     // 4 sequences, different accept counts per sequence and round (incl. 0 and the full block)
