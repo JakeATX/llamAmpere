@@ -1038,6 +1038,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<std::vector<float>>   lattice_conf;
     std::vector<uint64_t>             lattice_n_plan;
 
+    // [DSPINE4] acceptance-adaptive draft width (LLAMA_DSPINE_ADAPT="lo:up:down[:alpha]", default off): each seq drafts lo
+    // tokens or the full --spec-draft-n-max, from an EMA of its past kept tokens per round (kept drafts + 1): widen when
+    // the EMA reaches up, narrow when it falls below down. Only past rounds decide the width, so the accept law is unchanged.
+    bool                 aw_on    = false;
+    int32_t              aw_lo    = 7;
+    float                aw_up    = 7.0f;
+    float                aw_down  = 6.0f;
+    float                aw_alpha = 0.125f;
+    std::vector<int32_t> aw_width;   // per seq: the width the next draft uses
+    std::vector<int32_t> aw_drafted; // per seq: the width of the last draft (0 = none pending)
+    std::vector<float>   aw_ema;
+    uint64_t             aw_rounds[2] = { 0, 0 }; // rounds drafted at lo / hi
+    uint64_t             aw_switch    = 0;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1134,6 +1148,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             LOG_INF("%s: lattice verify-length planner on (LLAMA_SPEC_LATTICE_PLAN): verify ms by rows %s, draft %.2f ms\n",
                     __func__, pts.c_str(), lattice_cost.draft_ms);
+        }
+        if (const char * env = getenv("LLAMA_DSPINE_ADAPT"); is_dflash2 && env && *env && strcmp(env, "0") != 0) {
+            float a = 0.125f;
+            int lo = 0;
+            float up = 0.0f, down = 0.0f;
+            const int n = sscanf(env, "%d:%f:%f:%f", &lo, &up, &down, &a);
+            if (n < 3 || lo < 1 || lo >= this->params.n_max || !(down <= up) || !(a > 0.0f && a <= 1.0f)) {
+                throw std::runtime_error("LLAMA_DSPINE_ADAPT must be \"lo:up:down[:alpha]\" with 1 <= lo < --spec-draft-n-max, down <= up, 0 < alpha <= 1");
+            }
+            aw_on = true; aw_lo = lo; aw_up = up; aw_down = down; aw_alpha = a;
+            aw_width.assign(n_seq, lo);
+            aw_drafted.assign(n_seq, 0);
+            aw_ema.assign(n_seq, 0.0f);
+            LOG_INF("%s: DSpine adaptive width on (LLAMA_DSPINE_ADAPT): %d or %d tokens, widen at EMA >= %.2f tok/round, "
+                    "narrow below %.2f, alpha %.3f\n", __func__, lo, this->params.n_max, up, down, a);
         }
         char lilicorr_meta[32] = {};
         lilicorr_top_k = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0
@@ -1332,6 +1361,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     ~common_speculative_impl_draft_dflash() override {
         flush_pending_rnn();
+        if (aw_on) {
+            LOG_INF("DSpine adaptive width: rounds at %d / %d tokens: %llu / %llu, %llu switches\n", aw_lo, params.n_max,
+                    (unsigned long long) aw_rounds[0], (unsigned long long) aw_rounds[1], (unsigned long long) aw_switch);
+        }
         if (lattice_plan) {
             std::string hist;
             for (size_t n = 0; n < lattice_n_plan.size(); ++n) {
@@ -1396,6 +1429,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (ds_adaptive && seq_id < (llama_seq_id) ds_ctrl.size()) {
             ds_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
             ds_last[seq_id] = 0;
+        }
+        if (aw_on) {
+            // per request, like the seed: a request starts narrow
+            aw_width[seq_id]   = aw_lo;
+            aw_drafted[seq_id] = 0;
+            aw_ema[seq_id]     = 0.0f;
         }
         if (lattice_plan) {
             // per request, like the seed, so two identical requests plan identically
@@ -1768,6 +1807,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 wp.sample = sample;
 
                 int32_t n_pos = (is_dflash2 ? n_block_tokens : params.n_max + 1) - 1;
+                if (aw_on) {
+                    // the width comes from past rounds only; the walk stops there, so no slot past it is drawn
+                    n_pos = std::min(n_pos, aw_width[seq_id]);
+                    aw_drafted[seq_id] = aw_width[seq_id];
+                    aw_rounds[aw_width[seq_id] > aw_lo ? 1 : 0]++;
+                }
 
                 // [DSPINE-V07] opt-in verify-length planner (LLAMA_SPEC_LATTICE_PLAN=1); off = the plain walk above
                 const bool plan = is_dflash2 && lattice_plan;
@@ -1936,6 +1981,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (aw_on && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq && aw_drafted[seq_id] > 0) {
+            // kept tokens this round (kept drafts + the target's own); a draft the server cut short still counts
+            const float kept = (float) n_accepted + 1.0f;
+            float & ema = aw_ema[seq_id];
+            ema = ema == 0.0f ? kept : ema + aw_alpha * (kept - ema);
+            const int32_t before = aw_width[seq_id];
+            if (before == aw_lo && ema >= aw_up) {
+                aw_width[seq_id] = params.n_max;
+            } else if (before != aw_lo && ema < aw_down) {
+                aw_width[seq_id] = aw_lo;
+            }
+            if (aw_width[seq_id] != before) {
+                aw_switch++;
+                SPC_DBG("DSpine adaptive width seq %d: %d -> %d (EMA %.2f tok/round)\n", (int) seq_id, before, aw_width[seq_id], ema);
+            }
+            aw_drafted[seq_id] = 0;
+        }
         if (lattice_plan && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
             auto & conf = lattice_conf[seq_id];
             // n_drafted_ctrl: the width the server verified (it can be shorter than the draft); -1 = the whole draft
