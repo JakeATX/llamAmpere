@@ -2220,6 +2220,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_prefetch = params.moe_prefetch;
 
     cparams.moe_cache_size      = params.moe_cache_size;
+    if (params.moe_cache_size == 0 && params.speculative.has_dft() && !getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB")) {
+        // fork (INKSMALL2): the drafter loads after the target context, so its weights + KV + compute (measured
+        // 1,307-1,327 MiB for the Inkling DSpark Q8_0 fold drafter at ctx 16K-40K) stay out of the auto-sized cache
+        common_set_env("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB", "1400");
+    }
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
     cparams.moe_draft_keep = params.moe_draft_keep;
     cparams.moe_keep_map   = params.moe_keep_map.empty() ? nullptr : params.moe_keep_map.c_str();

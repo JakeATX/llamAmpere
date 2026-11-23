@@ -46,3 +46,6 @@ private:
 };
 
 using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
+
+// fork (INKSMALL2): host expert bytes the MoE cache could hold (looped layers once); 0 = nothing to cache
+size_t llama_moe_cache_host_expert_bytes(const llama_model & model);

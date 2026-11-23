@@ -1459,6 +1459,49 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        // fork (INKSMALL2): auto-size the MoE expert cache when the experts live in host memory (-cmoe / -ot ...=CPU) and
+        // --moe-cache-mib was not given. Without a cache, Inkling 2 Mini on an 8-12 GB card decodes ~10 tok/s instead of
+        // 48-99. Size = free device memory after the weights and KV minus a reserve for the compute buffer and its
+        // fill-time growth: 900 + 256 margin + 2 KiB per ctx cell + 1.9 MiB per ubatch row above 512, plus
+        // LLAMA_MOE_CACHE_AUTO_RESERVE_MIB (common sets 1400 when a draft model is loaded). Calibrated on Inkling 2 Mini
+        // S34d, SJ-KVaRN 4/4, --no-op-offload, ub 512, RTX 3090 capped at 7,168/9,216/11,264 MiB (INKSMALL2).
+        // One GPU only; the main context only. Kill switch: LLAMA_MOE_CACHE_AUTO=0 (cache stays off, as before).
+        if (cparams.moe_cache_size == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc() &&
+                model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+            const char * auto_env = getenv("LLAMA_MOE_CACHE_AUTO");
+            const size_t host_bytes = (auto_env && strcmp(auto_env, "0") == 0) ? 0 : llama_moe_cache_host_expert_bytes(model);
+            int n_gpu = 0;
+            ggml_backend_dev_t gpu = nullptr;
+            for (const auto & d : model.devices) {
+                if (ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    n_gpu++;
+                    gpu = d.dev;
+                }
+            }
+            if (host_bytes > 0 && n_gpu == 1) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(gpu, &free, &total);
+                const char * extra_env = getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB");
+                const double extra   = extra_env ? std::max(0.0, atof(extra_env)) : 0.0;
+                const double reserve = 900.0 + 256.0 + (double) cparams.n_ctx * 2.0 / 1024.0 +
+                    std::max(0.0, (double) cparams.n_ubatch - 512.0) * 1.9 + extra;
+                const double free_mib = (double) free / (1024.0 * 1024.0);
+                const double want_mib = std::min(free_mib - reserve, (double) host_bytes / (1024.0 * 1024.0) + 64.0);
+                if (want_mib >= 256.0) {
+                    cparams.moe_cache_size = (size_t) want_mib * 1024 * 1024;
+                    LLAMA_LOG_INFO("%s: MoE cache auto-size %.0f MiB (free %.0f MiB - reserve %.0f MiB [ctx %u, ub %u, extra %.0f]; "
+                                   "host experts %.0f MiB; --moe-cache-mib N sets it, LLAMA_MOE_CACHE_AUTO=0 turns it off)\n", __func__,
+                                   want_mib, free_mib, reserve, cparams.n_ctx, cparams.n_ubatch, extra,
+                                   (double) host_bytes / (1024.0 * 1024.0));
+                } else {
+                    LLAMA_LOG_WARN("%s: MoE cache auto-size: only %.0f MiB would be left (free %.0f - reserve %.0f), cache stays off\n",
+                                   __func__, want_mib, free_mib, reserve);
+                }
+            } else if (host_bytes > 0) {
+                LLAMA_LOG_INFO("%s: MoE cache auto-size needs exactly one GPU (found %d); pass --moe-cache-mib N\n", __func__, n_gpu);
+            }
+        }
+
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel = model.n_devices() > 1 && model.n_gpu_layers() > model.hparams.n_layer_all &&
@@ -1548,6 +1591,17 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         const char * shared_experts = getenv("GGML_MOE_CACHE_MTP_SHARED");
         if (shared_experts && strcmp(shared_experts, "1") == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !compute_peer) {
             throw std::runtime_error("shared MTP experts require serialized compute on the target device");
+        }
+        if (cparams.moe_cache_size > 0 && !cparams.op_offload && !getenv("LLAMA_MOE_CACHE_MAX_BATCH")) {
+            // fork (INKSMALL2): without op offload, prompt ubatches above the cache's batch cap run their experts on the
+            // CPU; 512 (= the small-card ub ceiling) keeps them on the GPU through the cache. Every Inkling 8/10/12 GB row
+            // used 512. With op offload the old default 32 stays. LLAMA_MOE_CACHE_MAX_BATCH=32 restores the old value.
+#ifdef _WIN32
+            _putenv_s("LLAMA_MOE_CACHE_MAX_BATCH", "512");
+#else
+            setenv("LLAMA_MOE_CACHE_MAX_BATCH", "512", 0);
+#endif
+            LLAMA_LOG_INFO("%s: MoE cache batch cap 512 (no op offload; LLAMA_MOE_CACHE_MAX_BATCH=32 = old default)\n", __func__);
         }
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);

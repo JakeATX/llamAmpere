@@ -959,7 +959,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
         const std::string card_key = string_ends_with(key, "-headless") ? key.substr(0, key.size() - 9) : key;
         if (key == "--preset" || card_key == "24dense" || card_key == "12dense" ||
-            card_key == "10dense" || card_key == "8dense") {
+            card_key == "10dense" || card_key == "8dense" ||
+            card_key == "12ink" || card_key == "10ink" || card_key == "8ink") {
             if (++card_selectors > 1) {
                 throw std::invalid_argument("select only one card preset");
             }
@@ -1140,6 +1141,23 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             return found != arg_to_options.end() &&
                 (explicit_options.count(found->second.first) || found->second.first->has_value_from_env());
         };
+        // fork (INKSMALL2): a card preset names its drafter "@model/<file>" (beside the model). Missing file: no drafter.
+        if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
+            const std::string file = (std::filesystem::path(params.model.path).parent_path() /
+                params.speculative.draft.mparams.path.substr(7)).string();
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(file, ec)) {
+                params.speculative.draft.mparams.path    = file;
+                params.speculative.draft.mparams.hf_file = file;
+                LOG_INF("card preset %s: drafter %s\n", params.card_preset.c_str(), file.c_str());
+            } else {
+                LOG_WRN("card preset %s: drafter %s not found beside the model, speculative decoding off "
+                        "(download it with the release or pass --model-draft)\n", params.card_preset.c_str(), file.c_str());
+                params.speculative.draft.mparams.path.clear();
+                params.speculative.draft.mparams.hf_file.clear();
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            }
+        }
         const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
         if (adaptive_mtp && explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive")) {
@@ -5883,8 +5901,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
-        {"--preset"}, "24dense|12dense|10dense|8dense",
-        "dense 27B card profile; append headless or -headless for a 500 MiB margin (default: 1024; 8dense: always 500); explicit flags override",
+        {"--preset"}, "24dense|12dense|10dense|8dense|12ink|10ink|8ink",
+        "card profile: *dense = 27B dense, *ink = Inkling 2 Mini (experts in RAM, auto-sized VRAM expert cache, 4/4 KV; "
+        "12ink adds the DSpark drafter if Inkling-2-Mini-DSpark-Q8_0-fold.gguf is beside the model); append headless or "
+        "-headless for a 500 MiB margin (default: 1024; 8dense: always 500); explicit flags override",
         [](common_params & params, const std::string & value) {
             params.card_preset = common_card_preset_get(value).name;
         }
@@ -5900,6 +5920,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg({"8dense", "8dense-headless"}, "alias for --preset 8dense (one slot)",
         [](common_params & params) { params.card_preset = "8dense"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"12ink", "12ink-headless"}, "alias for --preset 12ink (Inkling 2 Mini, 12 GB card, one slot)",
+        [](common_params & params) { params.card_preset = "12ink"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"10ink", "10ink-headless"}, "alias for --preset 10ink (Inkling 2 Mini, 10 GB card, one slot)",
+        [](common_params & params) { params.card_preset = "10ink"; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg({"8ink", "8ink-headless"}, "alias for --preset 8ink (Inkling 2 Mini, 8 GB card, one slot)",
+        [](common_params & params) { params.card_preset = "8ink"; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(

@@ -319,6 +319,28 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
 
 }
 
+// fork (INKSMALL2): bytes of host-resident experts the cache could hold, each looped (shared) layer counted once.
+// Used by the context to size the cache when --moe-cache-mib is not given. 0 = no layer keeps all experts on the host.
+size_t llama_moe_cache_host_expert_bytes(const llama_model & model) {
+    if (model.hparams.n_expert == 0) {
+        return 0;
+    }
+    size_t total = 0;
+    std::vector<std::vector<ggml_tensor *>> seen;
+    for (const auto & layer : model.layers) {
+        auto experts = llama_moe_cache_layer_experts(layer);
+        if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight) ||
+            std::find(seen.begin(), seen.end(), experts) != seen.end()) {
+            continue;
+        }
+        seen.push_back(experts);
+        for (const ggml_tensor * t : experts) {
+            total += t->nb[1] * t->ne[1] * t->ne[2];
+        }
+    }
+    return total;
+}
+
 struct llama_moe_cache::impl {
     // a GPU with its own budget and banks, it caches the layers assigned to it
     struct device {
