@@ -1470,8 +1470,10 @@ bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return false;
     }
     // decode-fast (default ON) takes every member of a group on Ampere (same N <= 8, M % 16, K % 128 guards):
-    // leave them to the single path so grouped layers get decode-fast too (GGML_CUDA_AI4_DECODE_FAST=0 restores grouping)
-    if (ggml_cuda_ai4_decode_fast_enabled()) {
+    // leave them to the single path so grouped layers get decode-fast too (GGML_CUDA_AI4_DECODE_FAST=0 restores grouping;
+    // GGML_CUDA_AI4_DF_GROUP_BAIL=0 keeps the rc7 grouped launch with decode-fast on elsewhere, for A/B)
+    static const bool df_bail = ai4_env_int("GGML_CUDA_AI4_DF_GROUP_BAIL", nullptr, 1) != 0;
+    if (df_bail && ggml_cuda_ai4_decode_fast_enabled()) {
         const int cc = ggml_cuda_info().devices[ctx.device].cc;
         if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
             return false;
