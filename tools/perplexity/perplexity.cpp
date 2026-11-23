@@ -1895,6 +1895,14 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 
+    // GEMINIGATE (test-only): LLAMA_KLD_DUMP=<file> writes the per-token KLD values in token order (float32), for paired A/B deltas.
+    if (const char * kd = getenv("LLAMA_KLD_DUMP")) {
+        if (FILE * fk = fopen(kd, "wb")) {
+            fwrite(kld_values.data(), sizeof(float), kld_values.size(), fk);
+            fclose(fk);
+        }
+    }
+
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
 
