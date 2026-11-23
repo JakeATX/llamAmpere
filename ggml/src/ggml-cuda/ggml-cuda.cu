@@ -77,6 +77,7 @@
 #include "ggml-cuda/inkglue.cuh"
 #include "ggml-cuda/inksituq.cuh"
 #include "ggml-cuda/nvfp4mt.cuh"
+#include "ggml-cuda/nvfp4pf.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
 #include "ggml-cuda/inkprep.cuh"
@@ -13657,6 +13658,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                                src0->view_src;
                 if (!use_mmvq && !bad_padding_clear &&
                         ggml_cuda_should_use_mmq(src0->type, cc, ncols, /*n_experts =*/ is_id ? src0->ne[2] : 0)) {
+                    // NVFP4PF: int8 tensor-core MoE prefill with the per-expert scale in its epilogue (opt-in, >= 512 tokens; quantizes
+                    // src1 to int8 whatever prec_src1 asks, so only with the switch set)
+                    if (is_id && ggml_cuda_nvfp4pf_try(*cuda_ctx, src0, src1, ids, out_node, scale)) {
+                        return n_ops - 1;
+                    }
                     fusion_data.prec_src1 = ggml_prec_get_src(mm_node, 1);
                     ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                     return n_ops - 1;
