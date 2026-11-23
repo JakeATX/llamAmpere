@@ -1,4 +1,4 @@
-// INKNVFP4K NVFP4MT: multi-token NVFP4 MoE decode launches (kernels in nvfp4mt-kern.cuh), called by ggml_cuda_nvfp4moe_launch
+// INKNVFP4K NVFP4MT: 1..8 token NVFP4 MoE decode launches (kernels in nvfp4mt-kern.cuh), called by ggml_cuda_nvfp4moe_launch
 #include "nvfp4mt.cuh"
 
 #include <cstdlib>
@@ -6,6 +6,11 @@
 bool ggml_cuda_nvfp4mt_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_NVFP4MT"); return !e || atoi(e) != 0; }();
     return on;
+}
+
+bool ggml_cuda_nvfp4mt_t1() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_NVFP4MT_T1"); return !e || atoi(e) != 0; }();
+    return ggml_cuda_nvfp4mt_enabled() && on;
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -31,15 +36,21 @@ static void nvfp4mt_launch_t(const nvfp4moe_params & P, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-bool ggml_cuda_nvfp4mt_launch(const nvfp4moe_params & P, cudaStream_t stream) {
+bool ggml_cuda_nvfp4mt_accepts(const nvfp4moe_params & P) {
     // GGML_CUDA_NVFP4MOE_GORD=0 / _EXACT=0 ask for the older T > 1 kernels: leave those to nvfp4moe_launch
-    if (!ggml_cuda_nvfp4mt_enabled() || !ggml_cuda_nvfp4moe_gord() || !ggml_cuda_nvfp4moe_exact() || P.T < 2 || P.T > 8 || !P.xq || P.f32act || P.n_used != 8 || P.K != 2304 ||
-            P.F != 1152 || P.gu_nb1 != NVFP4MT_ROW_GU || P.dn_nb1 != NVFP4MT_ROW_DN || P.gu_nb2 % 16 != 0 ||
-            P.dn_nb2 % 16 != 0 || (uintptr_t) P.w_gu % 16 != 0 || (uintptr_t) P.w_dn % 16 != 0 ||
-            (uintptr_t) P.act % 4 != 0 || (uintptr_t) P.xq % 4 != 0) {
+    return ggml_cuda_nvfp4mt_enabled() && ggml_cuda_nvfp4moe_gord() && ggml_cuda_nvfp4moe_exact() &&
+        (P.T >= 2 || (P.T == 1 && !P.write_sum && ggml_cuda_nvfp4mt_t1())) && P.T <= 8 && P.xq && !P.f32act && P.n_used == 8 &&
+        P.K == 2304 && P.F == 1152 && P.gu_nb1 == NVFP4MT_ROW_GU && P.dn_nb1 == NVFP4MT_ROW_DN && P.gu_nb2 % 16 == 0 &&
+        P.dn_nb2 % 16 == 0 && (uintptr_t) P.w_gu % 16 == 0 && (uintptr_t) P.w_dn % 16 == 0 && (uintptr_t) P.act % 4 == 0 &&
+        (uintptr_t) P.xq % 4 == 0;
+}
+
+bool ggml_cuda_nvfp4mt_launch(const nvfp4moe_params & P, cudaStream_t stream) {
+    if (!ggml_cuda_nvfp4mt_accepts(P)) {
         return false;
     }
     switch (P.T) {
+        case 1:  nvfp4mt_launch_t<1, 4, 8, 2, 4, 8, 2>(P, stream); break;
         case 2:  nvfp4mt_launch_t<2, 4, 8, 3, 4, 8, 3>(P, stream); break;
         case 3:  nvfp4mt_launch_t<3, 4, 8, 3, 4, 8, 3>(P, stream); break;
         case 4:  nvfp4mt_launch_t<4, 4, 8, 3, 4, 8, 3>(P, stream); break;
@@ -51,6 +62,9 @@ bool ggml_cuda_nvfp4mt_launch(const nvfp4moe_params & P, cudaStream_t stream) {
     return true;
 }
 #else
+bool ggml_cuda_nvfp4mt_accepts(const nvfp4moe_params &) {
+    return false;
+}
 bool ggml_cuda_nvfp4mt_launch(const nvfp4moe_params &, cudaStream_t) {
     return false;
 }

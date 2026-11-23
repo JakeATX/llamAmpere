@@ -76,6 +76,7 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/inkglue.cuh"
 #include "ggml-cuda/inksituq.cuh"
+#include "ggml-cuda/nvfp4mt.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
 #include "ggml-cuda/inkprep.cuh"
@@ -10868,11 +10869,11 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
 // (MUL -> CONT(PERMUTE) -> SUM_ROWS). Bit-identical at one token while mmvq small_k keeps 4 warps (QC4_NWARPS_1).
 // GGML_CUDA_NVFP4MOE=0 off; GGML_CUDA_INKGLUE_WSUM=0 also turns it off on layers that own the sum (not WCONV layers) (the sum is matched by that matcher).
 // PREQ scratch: x as q8_1 right after the q8_1 SITU rows, in the rest of the f32 SITU output's memory (13 of its 36.9 KB per
-// token); nullptr (gate_up CTAs quantize x) at T == 1, with GGML_CUDA_NVFP4MOE_PREQ=0, or if it does not fit
+// token; at T == 1 only for NVFP4MT, see ggml_cuda_nvfp4mt_t1); nullptr (gate_up CTAs quantize x) at T == 1 without NVFP4MT, with GGML_CUDA_NVFP4MOE_PREQ=0, or if it does not fit
 static block_q8_1 * ggml_cuda_nvfp4moe_xq_slot(const ggml_tensor * act, int64_t T, int64_t n_used, int64_t K, int64_t F) {
     const size_t act_q8 = (size_t) (T*n_used*(F/QK8_1))*sizeof(block_q8_1);
     const size_t x_q8   = (size_t) (T*(K/QK8_1))*sizeof(block_q8_1);
-    if (T < 2 || !ggml_cuda_nvfp4moe_preq() || act_q8 % 16 != 0 || act_q8 + x_q8 > ggml_nbytes(act)) {
+    if ((T < 2 && !ggml_cuda_nvfp4mt_t1()) || !ggml_cuda_nvfp4moe_preq() || act_q8 % 16 != 0 || act_q8 + x_q8 > ggml_nbytes(act)) {
         return nullptr;
     }
     return (block_q8_1 *) ((char *) act->data + act_q8);
@@ -11047,7 +11048,7 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
         return last - i;
     }
     // the kernels read x, ids, weights, scales and rw while they write act (q8_1 in the SITU output's memory), e_out
-    // (the scaled down output, T > 1) and sum
+    // (the scaled down output, T > 1 or NVFP4MT at T == 1) and sum
     const ggml_tensor * reads[] = { x, ids, rw, s_gu, s_dn };
     const ggml_tensor * writes[] = { act, T > 1 ? dn_out : nullptr, sum };
     for (const ggml_tensor * wt : writes) {
@@ -11084,8 +11085,18 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
     P.K = (int) K; P.F = (int) F; P.n_used = (int) n_used; P.T = (int) T; P.write_sum = 1;
     P.actf = (float *) act->data; P.acth = (half2 *) act->data; P.f32act = T == 1 ? ggml_cuda_nvfp4moe_f32act() : 0;
     if (P.f32act == 1 && (uintptr_t) x->data % 16 != 0) { P.f32act = 0; }  // gu1f reads x as float4
+    // NVFP4MT at one token writes e_out (dn_out) like T > 1 and the weighted sum runs below; else dn1 writes the sum
+    bool e_out_sum = T > 1;
+    if (T == 1) {
+        P.write_sum = 0;
+        e_out_sum = ggml_cuda_nvfp4mt_accepts(P) && !ink_overlap(dn_out, act) && !ink_overlap(dn_out, sum);
+        for (const ggml_tensor * rd : reads) {
+            e_out_sum = e_out_sum && !(rd && ink_overlap(dn_out, rd));
+        }
+        P.write_sum = e_out_sum ? 0 : 1;
+    }
     ggml_cuda_nvfp4moe_launch(P, ctx->stream());
-    if (T > 1) {
+    if (e_out_sum) {
         ggml_cuda_ink_moe_wsum(*ctx, dn_out, rw, sum);
     }
     return last - i;

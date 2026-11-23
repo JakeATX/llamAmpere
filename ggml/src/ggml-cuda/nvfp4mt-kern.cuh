@@ -1,5 +1,5 @@
 #pragma once
-// INKNVFP4K NVFP4MT: NVFP4 MoE decode for 2..8 tokens (DSpark verify, 2-user decode) on sm_86, K = 2304, F = 1152, 8 used.
+// INKNVFP4K NVFP4MT: NVFP4 MoE decode for 1..8 tokens (decode, DSpark verify, 2-user decode) on sm_86, K = 2304, F = 1152, 8 used.
 // One CTA per (routed expert, tile): the first slot of an expert serves every token routed to it, so each expert's weights
 // are read once per visit. The weights stream through a per-warp cp.async ring in shared memory (16-byte copies of whole
 // rows, no register staging), so 2 CTAs per SM keep loads in flight while the other computes. The body is compiled per

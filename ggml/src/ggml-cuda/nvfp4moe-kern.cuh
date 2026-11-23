@@ -170,7 +170,7 @@ static __device__ __forceinline__ int nvfp4moe_gather(const nvfp4moe_params & P,
 // ---------------------------------------------------------------------------------------------------------------------
 // gate_up + scale + SITU -> q8_1. grid (F/32, T*n_used), 256 threads: 32 row groups of 8 lanes, group g = feature f0 + g
 // (gate row f, up row F + f), lane j owns half-blocks j + 8m. K = 2304 here: 72 half-blocks = 9 per lane.
-// x of T tokens -> q8_1 once per visit (T > 1, GGML_CUDA_NVFP4MOE_PREQ): warp w of CTA b quantizes block 8b + w with the
+// x of T tokens -> q8_1 once per visit (T > 1 or NVFP4MT at T == 1, GGML_CUDA_NVFP4MOE_PREQ): warp w of CTA b quantizes block 8b + w with the
 // expressions of the in-CTA quantization below (bit-identical), instead of every gate_up CTA quantizing its tokens again
 static __global__ void __launch_bounds__(256) k_nvfp4moe_xq(const nvfp4moe_params P) {
     const int nb_k = P.K / QK8_1;
