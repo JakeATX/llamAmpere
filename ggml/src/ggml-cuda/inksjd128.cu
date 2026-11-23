@@ -276,17 +276,25 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         ggml_backend_buffer_get_alloc_size(dst->buffer, dst) : 0;
     const size_t avail_r  = alloc > offset ? alloc - offset : 0;
     const size_t pool_cap = size_t(256) << 20;
-    const bool reserved = avail_r >= kv_head_bytes + 128;
-    const int G = (int) std::min<size_t>(P, (reserved ? avail_r - 128 : pool_cap) / kv_head_bytes);
+    const bool reserved = avail_r >= kv_head_bytes;
+    const size_t qu_bytes = GGML_PAD((size_t) n_head*T*128*sizeof(float), 128);
+    // the pool part (Q, the group's output and LSE, and K/V unless reserved) stays within pool_cap: shrink the group
+    auto pool_bytes = [&](int G_) {
+        const size_t Hg_ = (size_t) 2*g*G_;
+        return qu_bytes + GGML_PAD(Hg_*T*128*sizeof(float), 128) + (lse ? GGML_PAD(Hg_*T*sizeof(float), 128) : 0) +
+            (reserved ? 0 : GGML_PAD((size_t) G_*kv_head_bytes, 128));
+    };
+    int G = (int) std::min<size_t>(P, reserved ? avail_r/kv_head_bytes : pool_cap/kv_head_bytes);
+    while (G >= 1 && pool_bytes(G) > pool_cap) {
+        --G;
+    }
     if (G < 1) {
         return false; // keep the VMM pool bounded: the generic route
     }
     const int Hg_max = 2*g*G;
-    const size_t qu_bytes = GGML_PAD((size_t) n_head*T*128*sizeof(float), 128);
     const size_t ou_bytes = GGML_PAD((size_t) Hg_max*T*128*sizeof(float), 128);
     const size_t lg_bytes = lse ? GGML_PAD((size_t) Hg_max*T*sizeof(float), 128) : 0;
-    const size_t kv_bytes = GGML_PAD((size_t) G*kv_head_bytes, 128);
-    const size_t pool_need = qu_bytes + ou_bytes + lg_bytes + (reserved ? 0 : kv_bytes);
+    const size_t pool_need = pool_bytes(G);
     ggml_cuda_pool_alloc<char> pool(ctx.pool(), pool_need);
     float * Qu  = (float *) pool.get();
     float * Ou  = (float *) (pool.get() + qu_bytes);
