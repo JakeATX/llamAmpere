@@ -18169,7 +18169,6 @@ static void add_ai23_cases(std::vector<std::unique_ptr<test_case>> & cases) {
             cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, true,  640,  n, 2560));
             cases.emplace_back(new test_mul_mat_id_ai4(t, 512, 10, false, 2560, n, 640));
         }
-        }
         for (int n : {1, 3, 8, 17, 129}) {
             cases.emplace_back(new test_mul_mat_id_ai4(t, 4, 2, false, 32, n, 256));
             cases.emplace_back(new test_mul_mat_id_ai4(t, 8, 8, true,  48, n, 384));
