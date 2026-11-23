@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 #include "ggml-inkrel.h"
+#include "ggml-inksjd128.h"
 #include "llama-lsa.h"
 #include "../ggml/src/ggml-lsa-recall.h"
 #include "llama-lsa-gather.h"
@@ -9431,6 +9432,28 @@ ggml_tensor * llm_graph_context::build_attn_rel_sj(
     ggml_tensor * cur = build_attn_mha(q, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il), nullptr, kq_mask, nullptr, sinks,
             nullptr, 0, kq_scale, il); // [256*H, T], un-rotated
     GGML_ASSERT(sj_kvarn_pending.body == nullptr);
+    {
+        // INKPREFILL (ggml-inksjd128.h): tell the backend the heads are packed D128 pairs (CUDA runs them at D 128)
+        // (one FA node per KV stream: multi-stream builds join them with CONCAT)
+        std::vector<ggml_tensor *> todo = { cur };
+        for (int n = 0; !todo.empty() && n < 64; ++n) {
+            ggml_tensor * t = todo.back();
+            todo.pop_back();
+            if (!t) {
+                continue;
+            }
+            if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+                if (t->src[6] != nullptr && t->op_params[GGML_INK_SJ_D128_PARAM] == 0) {
+                    ggml_flash_attn_ext_set_ink_sj_d128(t);
+                }
+            } else if (t->op == GGML_OP_CONCAT) {
+                todo.push_back(t->src[0]);
+                todo.push_back(t->src[1]);
+            } else if (n < 16) {
+                todo.push_back(t->src[0]); // reshape / permute / cont between the node and cur
+            }
+        }
+    }
     if (lse_out != nullptr) {
         // packed q head index == q head index, so the LSE rows are the 128-wide heads' (the rotation keeps the logits)
         GGML_ASSERT(lsa_lse != nullptr && lsa_lse->ne[0] == H);

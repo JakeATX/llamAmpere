@@ -13,6 +13,7 @@
 #include "kv-stream-span-tuner.h"
 #include "inkattn.cuh"
 #include "inkfa.cuh"
+#include "inksjd128.cuh"
 
 #include <algorithm>
 #include <cstdlib>
@@ -4997,6 +4998,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     // SJ-KVaRN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
     if (dst->src[6] != nullptr) {
+        if (ggml_cuda_ink_sj_d128_try(ctx, dst)) { // [INKPREFILL] packed D128 heads at D 128 (inksjd128.cu, GGML_CUDA_INK_SJ_D128=0 off)
+            return;
+        }
         if (ggml_cuda_fattn_sj_kvarn_rot(dst) && !ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ctx, dst)) {
             // separate passes around this same dispatch, on a copy of the node without the flag
             ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused(ctx, dst, ggml_cuda_flash_attn_ext);
