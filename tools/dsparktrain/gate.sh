@@ -10,7 +10,7 @@ set -u
 O=$1; S=$2; N=$3; ROWS=${4:-100k 32k 3k}
 R=${R:-/root/dst}; BIN=${BIN:-$R/bin}; M=${M:-$R/model/Inkling-2-Mini-A_all_ait4u-fold.gguf}
 PY=${PY:-/mnt/data/inkflags/venv/bin/python}; IB=${IB:-$R/wt/inkbench.py}; SEEDS=${SEEDS:-1 2 3 4 5 6}
-KVF=${KVF:--ctk sjkvarn4 -ctv sjkvarn4}; G=${GPU:-0}
+KVF=${KVF:--ctk sjkvarn4 -ctv sjkvarn4}; G=${GPU:-${CUDA_VISIBLE_DEVICES:-0}}   # keep the card cardq assigned
 export CUDA_VISIBLE_DEVICES=$G INK_GPU=$G
 mkdir -p $O
 for f in $S $N; do sz=$(stat -c %s $f); [ "$sz" = 453522464 ] || { echo "GATE_ABORT $f is $sz B, not the shipped 453,522,464 B Q8_0 fold"; exit 3; }; done
