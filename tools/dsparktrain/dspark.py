@@ -269,7 +269,23 @@ def context_layers(W, feat, pos):
     return out, f_rnn
 
 
-def context_layers_sliced(W, feat, amax, dev, dtype=torch.float32, sl=8192):
+def frnn_rows(W, feat_rows):
+    """f_rnn (position-wise) for feature rows [n, 4, N_EMBD] only -- same math as context_layers' f_rnn."""
+    fuse = torch.softmax(W['dspark_fuse.weight'].float(), -1)
+    mix = torch.einsum('nke,k->ne', feat_rows, fuse[N_LAYER].to(feat_rows.dtype))
+    return rms(mix, W['dspark_norm.weight'].to(feat_rows.dtype))
+
+
+class RowLookup:
+    """f_rnn stand-in holding only rows `rows` (sorted): RowLookup[idx] -> those rows (idx must be in rows)."""
+    def __init__(self, rows, vals):
+        self.rows, self.vals = rows, vals
+
+    def __getitem__(self, idx):
+        return self.vals[torch.searchsorted(self.rows, idx)]
+
+
+def context_layers_sliced(W, feat, amax, dev, dtype=torch.float32, sl=8192, want_frnn=True):
     """context_layers over positions 0..amax-1 without a graph, slice by slice into preallocated outputs (no torch.cat
     copy); feat may live on the host (pinned) -- each slice is moved to dev on its own."""
     out, f_rnn = None, None
@@ -278,10 +294,11 @@ def context_layers_sliced(W, feat, amax, dev, dtype=torch.float32, sl=8192):
         kv, fr_ = context_layers(W, feat[s0:s1].to(dev, non_blocking=True).to(dtype), torch.arange(s0, s1, device=dev))
         if out is None:
             out = [tuple(torch.empty((amax,) + t.shape[1:], dtype=t.dtype, device=dev) for t in pair) for pair in kv]
-            f_rnn = torch.empty((amax,) + fr_.shape[1:], dtype=fr_.dtype, device=dev)
+            f_rnn = torch.empty((amax,) + fr_.shape[1:], dtype=fr_.dtype, device=dev) if want_frnn else None
         for (K, V), (k, v) in zip(out, kv):
             K[s0:s1] = k; V[s0:s1] = v
-        f_rnn[s0:s1] = fr_
+        if want_frnn:
+            f_rnn[s0:s1] = fr_
         del kv, fr_
     return out, f_rnn
 

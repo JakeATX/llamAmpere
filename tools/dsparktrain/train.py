@@ -135,6 +135,8 @@ def main():
     ap.add_argument('--loss', default='e4', choices=['e4', 'mb']); ap.add_argument('--kl', type=float, default=0.1)
     ap.add_argument('--seqs-per-step', type=int, default=4); ap.add_argument('--anchors-per-seq', type=int, default=512)
     ap.add_argument('--chunk', type=int, default=128); ap.add_argument('--bf16-base', action='store_true')
+    ap.add_argument('--ckpt-every', type=int, default=0, help='also save ckpt_<step>.pt every N steps')
+    ap.add_argument('--stop-no-gain', type=int, default=0, help='stop at this step if sel never beat step 0')
     ap.add_argument('--chunk-long', type=int, default=32, help='anchor chunk for sequences longer than LONG_LEN')
     ap.add_argument('--train2', help='second train set P:SEQ (e.g. the long-context dumps), drawn with probability --frac2')
     ap.add_argument('--frac2', type=float, default=0.5)
@@ -181,7 +183,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True
     best = None
     if sel is not None and not a.profile:
-        r = evaluate(P, fr, sel, a.walk, a.eval_stride, a.max_eval_seq, tag='sel'); best = r[a.select][-1]
+        r = evaluate(P, fr, sel, a.walk, a.eval_stride, a.max_eval_seq, tag='sel'); best = r[a.select][-1]; best0 = best
         emit(dict(step=0, eval='sel', **r))
         torch.save({k: v.detach().cpu() for k, v in P.items()}, os.path.join(a.out, 'best.pt'))
     order = list(range(len(tr)))
@@ -232,11 +234,14 @@ def main():
             # context K/V + f_rnn: computed without a graph (position-wise, in CTX_SLICE slices), used as gradient leaves by
             # the chunks, then recomputed slice by slice WITH a graph and backpropagated with the leaves' gradients (exact;
             # keeps ~100K-token sequences from holding the whole context graph at once)
+            # f_rnn is only read at anchor-1: keep just those rows (saves a full [len, N_EMBD] leaf + its grad at ~100K)
+            frow = an - 1
             with torch.no_grad():
-                kv0, fr0 = D.context_layers_sliced(Wl, S['feat'], amax, dev, torch.float32, CTX_SLICE)
+                kv0, _ = D.context_layers_sliced(Wl, S['feat'], amax, dev, torch.float32, CTX_SLICE, want_frnn=False)
+                fr0 = D.frnn_rows(Wl, S['feat'][frow.cpu() if S['feat'].device.type == 'cpu' else frow].to(dev).float())
             ctx_l = [x.requires_grad_(True) for pair in kv0 for x in pair] + [fr0.requires_grad_(True)]
             del kv0, fr0
-            ctx = ([(ctx_l[2 * j], ctx_l[2 * j + 1]) for j in range(D.N_LAYER)], ctx_l[-1])
+            ctx = ([(ctx_l[2 * j], ctx_l[2 * j + 1]) for j in range(D.N_LAYER)], D.RowLookup(frow, ctx_l[-1]))
             ch = a.chunk if S['len'] <= LONG_LEN else a.chunk_long
             for i in range(0, an.shape[0], ch):
                 sub = an[i:i + ch]
@@ -256,11 +261,16 @@ def main():
                 n_tot += sub.shape[0]
             for s0 in range(0, amax, CTX_SLICE):
                 s1 = min(s0 + CTX_SLICE, amax)
-                kv, f_rnn = D.context_layers(Wl, S['feat'][s0:s1].to(dev, non_blocking=True).float(), torch.arange(s0, s1, device=dev))
-                outs = [t for pair in kv for t in pair] + [f_rnn]
-                g = [(o, l.grad[s0:s1]) for o, l in zip(outs, ctx_l) if l.grad is not None]
+                kv, _ = D.context_layers(Wl, S['feat'][s0:s1].to(dev, non_blocking=True).float(), torch.arange(s0, s1, device=dev))
+                outs = [t for pair in kv for t in pair]
+                g = [(o, l.grad[s0:s1]) for o, l in zip(outs, ctx_l[:-1]) if l.grad is not None]
                 torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
-            del ctx_l, ctx
+                del kv, outs, g
+            if ctx_l[-1].grad is not None:
+                fo = D.frnn_rows(Wl, S['feat'][frow.cpu() if S['feat'].device.type == 'cpu' else frow].to(dev).float())
+                torch.autograd.backward([fo], [ctx_l[-1].grad])
+            del ctx_l, ctx, S
+            torch.cuda.empty_cache()
         g = [(W[k], Wl[k].grad) for k in W if Wl[k].grad is not None and W[k].requires_grad]
         torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
         if step == 1:
@@ -280,6 +290,12 @@ def main():
                 torch.save({k: v.detach().cpu() for k, v in P.items()}, os.path.join(a.out, 'best.pt.tmp'))
                 os.replace(os.path.join(a.out, 'best.pt.tmp'), os.path.join(a.out, 'best.pt'))
                 emit(dict(step=step, saved='best.pt', best=best))
+            if a.stop_no_gain and step >= a.stop_no_gain and best <= best0:
+                emit(dict(step=step, stop='no_gain', best=best, base=best0)); break
+        if a.ckpt_every and not a.profile and step % a.ckpt_every == 0:
+            torch.save({k: v.detach().cpu() for k, v in P.items()}, os.path.join(a.out, 'ckpt.tmp'))
+            os.replace(os.path.join(a.out, 'ckpt.tmp'), os.path.join(a.out, 'ckpt_%04d.pt' % step))
+            emit(dict(step=step, saved='ckpt_%04d.pt' % step))
     if a.profile:
         torch.save({k: v.detach().cpu() for k, v in P.items()}, os.path.join(a.out, 'last.pt'))
         emit(dict(profile_steps=len(tstep), mean_step_s=float(np.mean(tstep[1:] if len(tstep) > 1 else tstep))))

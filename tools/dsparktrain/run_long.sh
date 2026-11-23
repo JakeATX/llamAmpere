@@ -19,7 +19,7 @@ PY=${PY:-/mnt/data/inkflags/venv/bin/python}
 M=$R/model/Inkling-2-Mini-NVFP4-native-q8d.gguf
 DQ=$R/model/Inkling-2-Mini-DSpark-Q8_0.gguf; DF=$R/model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf; DB=$R/model/Inkling-2-Mini-DSpark-BF16.gguf
 KVF="-ctk sjkvarn4 -ctv sjkvarn4"; UBF="-b 2048 -ub 1024"; PORT=18480
-STEPS=${STEPS:-600}; LR=${LR:-3e-5}; LOSS=${LOSS:-e4}; KL=${KL:-0.1}; SPS=${SPS:-2}; APS=${APS:-1024}; FRAC2=${FRAC2:-0.6}
+STEPS=${STEPS:-400}; LR=${LR:-3e-5}; LOSS=${LOSS:-e4}; KL=${KL:-0.1}; SPS=${SPS:-2}; APS=${APS:-1024}; FRAC2=${FRAC2:-0.6}
 EVAL_EVERY=${EVAL_EVERY:-50}; EVAL_STRIDE=${EVAL_STRIDE:-8}; NPRED=${NPRED:-3072}; CALTOL=${CALTOL:-3.0}
 export PYTHONPATH=$R/wt/gguf-py LLAMA_ARG_NO_CACHE_DISK=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mkdir -p $D $O $R/run
@@ -152,8 +152,10 @@ ph_profile() {
 ph_train() {
   done_or train && return
   rm -f $R/run/log.jsonl $R/run/best.pt
-  $PY $T/train.py $(TARGS) --out $R/run --steps $STEPS --eval-every $EVAL_EVERY --eval-stride $EVAL_STRIDE > $R/train.log 2>&1 \
-      && touch $R/L.train.done && log "train ok $(grep saved $R/run/log.jsonl | tail -1)"
+  $PY $T/train.py $(TARGS) --out $R/run --steps $STEPS --eval-every $EVAL_EVERY --ckpt-every 50 --stop-no-gain ${STOPNG:-200} --eval-stride $EVAL_STRIDE > $R/train.log 2>&1 \
+      || { log "train failed: $(tail -3 $R/train.log | tr '\n' ' ')"; return 1; }
+  grep -q '"stop": "no_gain"' $R/run/log.jsonl && { log "NO_GAIN: sel never beat step 0 by step ${STOPNG:-200}; stopping (no rep/export)"; return 1; }
+  touch $R/L.train.done && log "train ok $(grep saved $R/run/log.jsonl | tail -1)"
 }
 
 ph_rep() {
