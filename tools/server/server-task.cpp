@@ -2380,8 +2380,8 @@ bool server_prompt_cache::disk_open(const std::string & dir, const std::string &
     switch (si.state) {
         case server_prompt_disk_tier::SPACE_BELOW:
             SRV_WRN("prompt cache disk tier: WRITES DISABLED: %.1f GiB free of %.1f GiB is at or below the free-space floor of %.1f GiB "
-                    "(max(%.0f%%, %.0f GiB)); nothing will be written until space is freed or --cache-disk-min-free is lowered\n",
-                    si.available / GiB, si.capacity / GiB, si.reserve / GiB, disk.guard_frac * 100.0, disk.guard_abs / GiB);
+                    "(%s); nothing will be written until space is freed or --cache-disk-min-free is lowered\n",
+                    si.available / GiB, si.capacity / GiB, si.reserve / GiB, disk.guard_rule().c_str());
             break;
         case server_prompt_disk_tier::SPACE_NEAR:
             SRV_WRN("prompt cache disk tier: low free space: %.1f GiB free of %.1f GiB, floor %.1f GiB; only %.1f GiB can be written "
