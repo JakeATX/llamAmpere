@@ -1361,9 +1361,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 llama_set_embeddings_layer_inp_dev(ctx_tgt, false);
             }
         }
-        if (const char * e = std::getenv("LLAMA_DSPINE_PIPE"); is_dflash2 && !has_rnn_context && e && std::atoi(e) != 0) {
+        if (const int32_t pipe_mode = llama_dspine_pipe_mode(); is_dflash2 && !has_rnn_context && pipe_mode > 0) {
             LOG_INF("%s: DSpine pipeline enabled (LLAMA_DSPINE_PIPE=%d): dev_inject=%d (%d rows)\n",
-                    __func__, std::atoi(e), (int) use_dev_inject, llama_layer_inp_dev_rows(ctx_tgt));
+                    __func__, pipe_mode, (int) use_dev_inject, llama_layer_inp_dev_rows(ctx_tgt));
         }
 
         // [T5-IDLE] H2: defer p35 context-feature readback/sync until draft()/get_state() so p35 overlaps CPU post_decode()

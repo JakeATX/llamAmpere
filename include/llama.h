@@ -1431,6 +1431,10 @@ extern "C" {
     // Row capacity of the layer input device buffer (0 when disabled or not allocated).
     LLAMA_API int32_t llama_layer_inp_dev_rows(const struct llama_context * ctx);
 
+    // Resolved LLAMA_DSPINE_PIPE mode: 0 = off, 1 = full pipeline (compact layer_inp_dev + DFlash2 2-slot
+    // reuse + async CUDA event wait + early process() overlap), 2 = compact layer_inp_dev + 2-slot reuse only.
+    LLAMA_API int32_t llama_dspine_pipe_mode(void);
+
     // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
     // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,
     // row n_batch + s is free for the caller, e.g. for seq s (see llama_set_embeddings_nextn_rows()).

@@ -4344,10 +4344,19 @@ ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
     return nullptr;
 }
 
-static int32_t llama_dspine_pipe_mode() {
+int32_t llama_dspine_pipe_mode() {
     static const int32_t mode = [] {
         const char * e = std::getenv("LLAMA_DSPINE_PIPE");
-        return e ? std::atoi(e) : 0;
+        if (e == nullptr || *e == '\0') {
+            return 0;
+        }
+        char * end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end != e && *end == '\0' && (v == 0 || v == 1 || v == 2)) {
+            return (int32_t) v;
+        }
+        LLAMA_LOG_WARN("%s: invalid LLAMA_DSPINE_PIPE='%s' (expected 0, 1, or 2); disabling\n", __func__, e);
+        return 0;
     }();
     return mode;
 }
@@ -5790,8 +5799,9 @@ build_graph:
     vg_slot = -1;
     const bool use_vgraph = vgraph_env && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.arch != LLM_ARCH_DFLASH &&
         (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER);   // target decode passes DEFAULT
-    // LLAMA_DSPINE_PIPE>0 (opt-in): a DSpine/DFlash2 drafter keeps its feature-inject graph (slot 0) apart from the draft graph (slot 1)
-    const bool is_dflash2_model   = model.arch == LLM_ARCH_DFLASH && (model.dflash_selector_hidden != nullptr || model.dspine_codebook != nullptr);
+    // LLAMA_DSPINE_PIPE>0 (opt-in): a DSpine/DFlash2 drafter keeps its feature-inject graph (slot 0) apart from the draft graph (slot 1).
+    // Matches common/speculative.cpp (is_dflash2 = dflash_selector_top_k > 0, which sets logits=false on draft too).
+    const bool is_dflash2_model   = model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_top_k > 0;
     const bool dflash_split_slots = llama_dspine_pipe_mode() > 0 && is_dflash2_model;
     const int  want_slot          = dflash_split_slots ? ((ubatch.embd || ubatch.embd_row) ? 0 : 1) : (n_outputs > 0 ? 1 : 0);
     const bool use_plan_slots = (plan_slots_env &&
@@ -7265,12 +7275,12 @@ void llama_context::ub_loan_end() {
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
-    if (!prompt_warm_join()) {
-        return -2;
-    }
-    // Wait for any in-flight async DSpine inject before memory updates, phase switches, or graph prep.
+    // Wait for any in-flight async DSpine inject before warm join, memory updates, phase switches, or graph prep.
     if (pipe_inject_pending) {
         synchronize();
+    }
+    if (!prompt_warm_join()) {
+        return -2;
     }
     // one-shot tag: read on entry, clear on every return, including the encode fallback and errors
     const enum llama_decode_phase tagged =
@@ -7688,9 +7698,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (inject_src) {
         inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
         if (inject_backend) {
-            // Only use device-side stream wait on a single CUDA GPU matching layer_inp_dev (safe for 2-card -sm splits).
+            // Only use device-side stream wait in PIPE=1 on a single CUDA GPU matching layer_inp_dev (safe for 2-card -sm splits).
             bool single_matching_cuda_gpu = false;
-            if (llama_dspine_pipe_mode() > 0 && !compute_is_shared() &&
+            if (llama_dspine_pipe_mode() == 1 && !compute_is_shared() &&
                     std::strncmp(ggml_backend_name(inject_backend), "CUDA", 4) == 0) {
                 int n_gpu = 0;
                 ggml_backend_dev_t only_gpu = nullptr;
@@ -8844,6 +8854,17 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     auto * res = gf_res_reserve.get();
+
+    // Match decode()'s per-call layer_inp_dev routing under LLAMA_DSPINE_PIPE>0 so pp and tg reserves match runtime topology.
+    const bool prev_layer_inp_dev_call = layer_inp_dev_call;
+    struct layer_inp_dev_reserve_guard {
+        bool & active;
+        bool   prev;
+        ~layer_inp_dev_reserve_guard() { active = prev; }
+    } layer_inp_dev_reserve_guard_ { layer_inp_dev_call, prev_layer_inp_dev_call };
+    if (llama_dspine_pipe_mode() > 0) {
+        layer_inp_dev_call = cparams.embeddings_layer_inp_dev && layer_inp_dev != nullptr && (int64_t) ubatch.n_tokens <= layer_inp_dev->ne[1];
+    }
 
     auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
     gparams.is_reserve = true;
