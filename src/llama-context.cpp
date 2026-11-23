@@ -1496,8 +1496,13 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 ggml_backend_dev_memory(gpu, &free, &total);
                 const char * extra_env = getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB");
                 const double extra   = extra_env ? std::max(0.0, atof(extra_env)) : 0.0;
+                // fork (INKSTREAM): with ink_rows_cap the boot scratch stays at 512 rows, but the SWA cache (and the
+                // f32 attention scores of a 512-row prompt ubatch) is sized n_swa + n_ubatch: one score copy per extra
+                // cell (512 rows x n_head x 4 B). Without it 10ink/12ink at -ub 4096 peaked 12-14 MiB over the line.
+                const double swa_extra = ink_rows_cap && model.hparams.n_swa > 0 ?
+                    (double) (cparams.n_ubatch - 512) * 512.0 * model.hparams.n_head() * 4.0 / (1024.0 * 1024.0) : 0.0;
                 const double reserve = 900.0 + 256.0 + (double) cparams.n_ctx * 2.0 / 1024.0 +
-                    std::max(0.0, (double) (ink_rows_cap ? 512u : cparams.n_ubatch) - 512.0) * 1.9 + extra;
+                    std::max(0.0, (double) (ink_rows_cap ? 512u : cparams.n_ubatch) - 512.0) * 1.9 + swa_extra + extra;
                 const double free_mib = (double) free / (1024.0 * 1024.0);
                 const double want_mib = std::min(free_mib - reserve, (double) host_bytes / (1024.0 * 1024.0) + 64.0);
                 if (want_mib >= 256.0) {
