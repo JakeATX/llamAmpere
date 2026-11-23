@@ -11,7 +11,7 @@ Eval (fp32, no TF32): alpha_s = sum reach_s A_s / sum reach_s, E_1..E_d exact an
 Checkpoints: best by --select (default E_d mb on the sel split) -> OUT/best.pt; OUT/log.jsonl.
 usage: train.py --w0 W0 --drafter Q8_0-fold.gguf --bf16 BF16.gguf --out OUT [--train P:SEQ] [--sel P:SEQ] [--rep P:SEQ]
                 [--steps N] [--eval-only] [--init ckpt.pt] [--profile N]"""
-import argparse, json, math, os, random, sys, time
+import argparse, gc, json, math, os, random, sys, time
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
@@ -61,6 +61,14 @@ def slot_terms(l, S, rows, t, mb):
     pid = S['top_ids'][rows][:, :p.shape[1]]
     q, qid, _ = D.draft_q(l)
     return D.accept_terms(p, pid, q, qid, t, eog=S['eog'], want_mb=mb), p, pid
+
+
+MEMDBG = os.environ.get('DSQ_MEMDBG') == '1'
+
+
+def memlog(tag):
+    if MEMDBG:
+        print('MEM', tag, round(torch.cuda.memory_allocated() / 2**30, 2), round(torch.cuda.max_memory_allocated() / 2**30, 2), flush=True)
 
 
 CTX_SLICE = 8192   # context positions per slice (train)
@@ -213,7 +221,13 @@ def main():
     for step in range(1, (a.profile or a.steps) + 1):
         sync(dev); t0 = time.time()
         opt.zero_grad(set_to_none=True)
+        memlog('step%d start' % step)
+        if MEMDBG and step > 1:
+            import collections
+            cnt = collections.Counter((tuple(o.shape), str(o.dtype)) for o in gc.get_objects() if torch.is_tensor(o) and o.is_cuda)
+            print('LIVE', sorted(((s, d, n) for (s, d), n in cnt.items()), key=lambda x: -int(np.prod(x[0])) * x[2])[:8], flush=True)
         W = ste_weights(P, fr)
+        memlog('W')
         n_tot, lsum, esum, ksum = 0, 0.0, 0.0, 0.0
         batches = []
         cpu_seqs = fut.result(); fut = pool.submit(load_cpu, pick_step())   # next step's sequences load while this one trains
@@ -236,12 +250,22 @@ def main():
             # keeps ~100K-token sequences from holding the whole context graph at once)
             # f_rnn is only read at anchor-1: keep just those rows (saves a full [len, N_EMBD] leaf + its grad at ~100K)
             frow = an - 1
+            # only the full-attention layer gets full-length leaves; SWA layers compute their window per chunk (LazyCtx)
+            FL = [il for il in range(D.N_LAYER) if il not in D.SWA_LAYERS]
             with torch.no_grad():
-                kv0, _ = D.context_layers_sliced(Wl, S['feat'], amax, dev, torch.float32, CTX_SLICE, want_frnn=False)
+                full = {}
+                for il in FL:
+                    K0 = torch.empty(amax, D.N_HEAD_KV, D.HD, device=dev); V0 = torch.empty_like(K0)
+                    for s0 in range(0, amax, CTX_SLICE):
+                        s1 = min(s0 + CTX_SLICE, amax)
+                        K0[s0:s1], V0[s0:s1] = D.ctx_layer(Wl, S['feat'][s0:s1].to(dev, non_blocking=True).float(), torch.arange(s0, s1, device=dev), il)
+                    full[il] = (K0.requires_grad_(True), V0.requires_grad_(True))
                 fr0 = D.frnn_rows(Wl, S['feat'][frow.cpu() if S['feat'].device.type == 'cpu' else frow].to(dev).float())
-            ctx_l = [x.requires_grad_(True) for pair in kv0 for x in pair] + [fr0.requires_grad_(True)]
-            del kv0, fr0
-            ctx = ([(ctx_l[2 * j], ctx_l[2 * j + 1]) for j in range(D.N_LAYER)], D.RowLookup(frow, ctx_l[-1]))
+            ctx_l = [x for il in FL for x in full[il]] + [fr0.requires_grad_(True)]
+            del fr0
+            ctx = ([full[il] if il in full else D.LazyCtx(Wl, S['feat'], il, amax, dev) for il in range(D.N_LAYER)], D.RowLookup(frow, ctx_l[-1]))
+            del full, K0, V0
+            memlog('ctx')
             ch = a.chunk if S['len'] <= LONG_LEN else a.chunk_long
             for i in range(0, an.shape[0], ch):
                 sub = an[i:i + ch]
@@ -259,24 +283,36 @@ def main():
                 loss.backward()
                 lsum += float(loss.detach()) * n_all; esum += float(Ed.sum()); ksum += float(KL.sum()) if a.kl else 0.0
                 n_tot += sub.shape[0]
-            for s0 in range(0, amax, CTX_SLICE):
-                s1 = min(s0 + CTX_SLICE, amax)
-                kv, _ = D.context_layers(Wl, S['feat'][s0:s1].to(dev, non_blocking=True).float(), torch.arange(s0, s1, device=dev))
-                outs = [t for pair in kv for t in pair]
-                g = [(o, l.grad[s0:s1]) for o, l in zip(outs, ctx_l[:-1]) if l.grad is not None]
-                torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
-                del kv, outs, g
+                loss = E = Ed = A = C = KL = logits = l = r = p = pid = ls = None   # drop graph refs (they pin Wl/W + grads)
+            memlog('chunks')
+            for il_i, il in enumerate(FL):
+                gK, gV = ctx_l[2 * il_i].grad, ctx_l[2 * il_i + 1].grad
+                if gK is None and gV is None:
+                    continue
+                for s0 in range(0, amax, CTX_SLICE):
+                    s1 = min(s0 + CTX_SLICE, amax)
+                    k, v = D.ctx_layer(Wl, S['feat'][s0:s1].to(dev, non_blocking=True).float(), torch.arange(s0, s1, device=dev), il)
+                    g = [(o, gg[s0:s1]) for o, gg in ((k, gK), (v, gV)) if gg is not None]
+                    torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
+                    del k, v, g
             if ctx_l[-1].grad is not None:
                 fo = D.frnn_rows(Wl, S['feat'][frow.cpu() if S['feat'].device.type == 'cpu' else frow].to(dev).float())
                 torch.autograd.backward([fo], [ctx_l[-1].grad])
+                fo = None
+            gK = gV = None
             del ctx_l, ctx, S
-            torch.cuda.empty_cache()
+            gc.collect(); torch.cuda.empty_cache()
+            memlog('seq done')
         g = [(W[k], Wl[k].grad) for k in W if Wl[k].grad is not None and W[k].requires_grad]
         torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
         if step == 1:
             emit(dict(step=1, params_without_grad=[n for n, p in zip(names, params) if p.grad is None or not bool(p.grad.abs().sum() > 0)]))
+        del g, Wl, W, batches, cpu_seqs   # free this step's STE weights / leaf copies (+ their grads) before the next step builds new ones
         gn = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
+        memlog('pre-opt')
         opt.step(); sched.step()
+        torch.cuda.empty_cache()
+        memlog('post-opt')
         sync(dev); dt = time.time() - t0; tstep.append(dt)
         if step % 10 == 0 or a.profile:
             emit(dict(step=step, loss=lsum / max(n_tot, 1), E_train=esum / max(n_tot, 1), kl=ksum / max(n_tot, 1), anchors=n_tot,

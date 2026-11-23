@@ -269,6 +269,49 @@ def context_layers(W, feat, pos):
     return out, f_rnn
 
 
+def ctx_layer(W, feat, pos, il):
+    """context K (roped), V [N, 8, HD] of one layer il -- same math as context_layers."""
+    fuse = torch.softmax(W['dspark_fuse.weight'].float(), -1)
+    mix = torch.einsum('nke,k->ne', feat, fuse[il].to(feat.dtype))
+    c = rms(mix, W[f'blk.{il}.dflare_norm.weight'].to(feat.dtype))
+    k = mm(c, W[f'blk.{il}.attn_k_ctx.weight']).reshape(-1, N_HEAD_KV, HD)
+    v = mm(c, W[f'blk.{il}.attn_v_ctx.weight']).reshape(-1, N_HEAD_KV, HD)
+    return rope_neox(rms(k, W[f'blk.{il}.attn_k_ctx_norm.weight'].to(k.dtype)), pos), v
+
+
+class LazyCtx:
+    """context K/V of one layer computed on demand (with the caller's grad mode) for the slice block_forward asks
+    for -- used for SWA layers, whose chunks only see ~N_SWA + span positions, so no full-length leaf is needed."""
+    def __init__(self, W, feat, il, n, dev):
+        self.W, self.feat, self.il, self.dev, self.key, self.val = W, feat, il, dev, None, None
+        self.shape = (n,)
+
+    def get(self, lo, hi):
+        if self.key != (lo, hi):
+            self.val = ctx_layer(self.W, self.feat[lo:hi].to(self.dev, non_blocking=True).float(),
+                                 torch.arange(lo, hi, device=self.dev), self.il)
+            self.key = (lo, hi)
+        return self.val
+
+    def __getitem__(self, j):
+        return _LazyHalf(self, j)   # made per access: no LazyCtx <-> half reference cycle (it would pin W until gc)
+
+
+class _LazyHalf:
+    def __init__(self, p, j):
+        self.p, self.j = p, j
+
+    @property
+    def shape(self):
+        return self.p.shape
+
+    def __getitem__(self, s):
+        r = self.p.get(s.start or 0, s.stop)[self.j]
+        if self.j == 1:
+            self.p.key = None   # V is read after K in each block_forward: never reuse a slice (its graph) across chunks
+        return r
+
+
 def frnn_rows(W, feat_rows):
     """f_rnn (position-wise) for feature rows [n, 4, N_EMBD] only -- same math as context_layers' f_rnn."""
     fuse = torch.softmax(W['dspark_fuse.weight'].float(), -1)
