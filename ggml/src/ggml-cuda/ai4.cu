@@ -1469,6 +1469,14 @@ bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (t != GGML_TYPE_AIT4_U && t != GGML_TYPE_AIT5_U && t != GGML_TYPE_AIT2_U && t != GGML_TYPE_AIT3_U) {
         return false;
     }
+    // decode-fast (default ON) takes every member of a group on Ampere (same N <= 8, M % 16, K % 128 guards):
+    // leave them to the single path so grouped layers get decode-fast too (GGML_CUDA_AI4_DECODE_FAST=0 restores grouping)
+    if (ggml_cuda_ai4_decode_fast_enabled()) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
+            return false;
+        }
+    }
     if (ai4_ref_only_type(t) || ai4_mmv_stages() != 2 || ai4_mmv_xsmem()) {
         return false;
     }
