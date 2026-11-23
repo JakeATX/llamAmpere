@@ -6742,11 +6742,25 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         // fork UBDEFAULT: without an expert cache each prompt reserve is sized exactly (ub_fit_rows below: free
         // memory, then the KV-tail loan, then the next rung down), so the ceiling stays put and this free-memory
         // heuristic only runs where the expert cache shares the card (small cards, unchanged).
-        if ((!ubdefault || sched_cache_mode != 0) && now >= deadline) {
+        // fork: LLAMA_UB_LADDER_TARGET (default off; =1 turns it on; measured neutral at the gate). A prompt check sizes the return from
+        // the rows this call asks for (capped by the ceiling), not the ceiling itself: a short call (the 505-token
+        // server warmup asks 512 rows) no longer halves the ceiling before the first long prompt. A call that would
+        // grow the scratch past its reserve is checked at once, not at the next 2 s deadline.
+        static const bool target_on = [] { const char * e = getenv("LLAMA_UB_LADDER_TARGET"); return e && e[0] && atoi(e) != 0; }();
+        static const bool hold = [] { const char * e = getenv("LLAMA_UB_LADDER_HOLD"); return !e || !e[0] || atoi(e) != 0; }();
+        const uint32_t want = rows;
+        const bool target = target_on && hold && prompt;
+        // the rows a prompt check sizes the return for: the ceiling, or (TARGET) this call's rows under it
+        const uint32_t sized = target ? std::min(dynamic_ubatch_rows, std::max(want, 1u)) : dynamic_ubatch_rows;
+        uint32_t call_cap = UINT32_MAX; // TARGET only: this call's rows cap (the ceiling itself is applied below)
+        if ((!ubdefault || sched_cache_mode != 0) && (now >= deadline || (target && sched_reserve_tokens && sized > sched_reserve_tokens))) {
             deadline = now + (prompt ? 2000000 : 10000000);
             bool cut = false;
             bool grow = true;
             bool gpu = false;
+            bool low_any = false;
+            double cut_free = 0.0, cut_need = 0.0;
+            uint32_t cut_alloc = 0;
             const uint32_t next = std::min(std::min(cparams.n_ubatch, 4096u), dynamic_ubatch_rows * 2);
             // fork: LLAMA_UB_LADDER_HOLD (default on). The 2 GiB margin gates growth only: rows that the last prompt
             // reserve already held fit again, so a big -c that leaves less than the margin free (262K: 1.3 GiB) no
@@ -6754,7 +6768,6 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             // the small-card margin), or a return to the ceiling that would not fit in free - floor, sized from the
             // last prompt reserve (not the 16-row writing scratch). Writing-phase checks never cut. =0 restores the
             // old cut at the full margin.
-            static const bool hold = [] { const char * e = getenv("LLAMA_UB_LADDER_HOLD"); return !e || !e[0] || atoi(e) != 0; }();
             if (hold && dynamic_ubatch_pp_bytes.size() != backend_ptrs.size()) {
                 dynamic_ubatch_pp_bytes.assign(backend_ptrs.size(), 0);
             }
@@ -6778,15 +6791,25 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                     cut = cut || (dynamic_ubatch_rows > allocated &&
                             current_extra + margin + (size_t(64) << 20) >= double(free));
                 } else if (prompt) {
-                    double need = current_extra;
+                    double need = double(bytes) * (sized - std::min(sized, allocated)) / allocated;
                     if (dynamic_ubatch_pp_rows > 0 && dynamic_ubatch_pp_bytes[bi] > 0) {
-                        // a shorter prompt reserve since (e.g. 512 rows) scales up linearly to the ceiling
+                        // a shorter prompt reserve since (e.g. 512 rows) scales up linearly to the sized rows
                         const double pp = double(dynamic_ubatch_pp_bytes[bi]) *
-                                std::max(1.0, double(dynamic_ubatch_rows) / dynamic_ubatch_pp_rows);
+                                std::max(1.0, double(sized) / dynamic_ubatch_pp_rows);
                         need = std::max(0.0, pp - double(bytes));
+                        if (target && sized < dynamic_ubatch_pp_rows && allocated < sized && pp > double(bytes)) {
+                            // TARGET: rows between the current reserve and the prompt reserve: interpolate between the
+                            // two measured buffers (keeps the fixed part; a plain scale-down would drop it)
+                            need = (pp - double(bytes)) * (sized - allocated) / (dynamic_ubatch_pp_rows - allocated);
+                        }
                     }
-                    cut = cut || free < floor;
-                    cut = cut || (dynamic_ubatch_rows > allocated && need + floor >= double(free));
+                    const bool low = free < floor;
+                    const bool over = sized > allocated && need + floor >= double(free);
+                    if ((low || over) && !cut) {
+                        cut_free = double(free); cut_need = need; cut_alloc = allocated;
+                    }
+                    low_any = low_any || low;
+                    cut = cut || low || over;
                 }
                 grow = grow && free > margin && extra + (size_t(64) << 20) < double(free - margin);
             }
@@ -6860,6 +6883,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                     LLAMA_LOG_WARN("%s: [INKSTREAM] ceiling %u rows (reserved %u; next step needs %.0f MiB, free %.0f MiB)\n",
                                    __func__, dynamic_ubatch_rows, allocated, log_need / 1048576.0, log_free / 1048576.0);
                 }
+            } else if (gpu && cut && target && !low_any && sized < dynamic_ubatch_rows) {
+                // TARGET: this call's rows under the ceiling do not fit: halve the call, keep the ceiling for later prompts
+                call_cap = std::max(std::max(256u, cparams.n_seq_max), sized / 2);
+                LLAMA_LOG_WARN("%s: dynamic prompt call %u -> %u rows (ceiling %u kept; reserve %u, free %.0f MiB, need %.0f MiB)\n",
+                        __func__, sized, call_cap, dynamic_ubatch_rows, cut_alloc, cut_free / 1048576.0, cut_need / 1048576.0);
             } else if (gpu && cut) {
                 dynamic_ubatch_rows = std::max(std::max(256u, cparams.n_seq_max), dynamic_ubatch_rows / 2);
             } else if (gpu && grow) {
@@ -6867,13 +6895,15 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             }
             if (previous != dynamic_ubatch_rows) {
                 if (dynamic_ubatch_rows < previous) {
-                    LLAMA_LOG_WARN("%s: dynamic prompt ceiling %u -> %u rows\n", __func__, previous, dynamic_ubatch_rows);
+                    LLAMA_LOG_WARN("%s: dynamic prompt ceiling %u -> %u rows (call %u rows, reserve %u, free %.0f MiB, need %.0f MiB, prompt reserve %u rows)\n",
+                            __func__, previous, dynamic_ubatch_rows, want, cut_alloc, cut_free / 1048576.0, cut_need / 1048576.0,
+                            dynamic_ubatch_pp_rows);
                 } else {
                     LLAMA_LOG_INFO("%s: dynamic prompt ceiling %u -> %u rows\n", __func__, previous, dynamic_ubatch_rows);
                 }
             }
         }
-        if (prompt) { rows = std::min(rows, dynamic_ubatch_rows); }
+        if (prompt) { rows = std::min({rows, dynamic_ubatch_rows, call_cap}); }
     }
     const bool trim_packed = n_tokens == 0 && (b1_ffn_scratch_active || b1_layer_scratch_active);
     // fork UBDEFAULT: a reserve sized over the used cells covers this call only while the cells it can address stay
