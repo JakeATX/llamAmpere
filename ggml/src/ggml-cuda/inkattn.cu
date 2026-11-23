@@ -710,10 +710,10 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool_alloc<float>  Op(ctx.pool(), (size_t) S*Hkv*W*16*INKATTN_D);
     ggml_cuda_pool_alloc<float2> Mp(ctx.pool(), (size_t) S*Hkv*W*16);
 
-    // live tiles: walk only the 16-key tiles with a visible mask entry (exact skip, see inkattn-live.cu). On by default
+    // live tiles: walk only the 16-key tiles with a visible mask entry (exact skip, see inkattn-live.cu). Opt-in
     // up to GGML_CUDA_INKATTN_LIVE_MAX_KV cells (16384: the SWA / near windows, whose cache is n_swa + n_ubatch cells of
-    // which ~n_swa + T are visible); GGML_CUDA_INKATTN_LIVE=0 = kill switch. GGML_CUDA_INKATTN_LIVE_TPW = tiles per run.
-    static const int live_on  = inkattn_env_int("GGML_CUDA_INKATTN_LIVE", 1);
+    // which ~n_swa + T are visible), GGML_CUDA_INKATTN_LIVE=1 (off by default: kernel-level mixed; the FAST path skips dead tiles itself). GGML_CUDA_INKATTN_LIVE_TPW = tiles per run.
+    static const int live_on  = inkattn_env_int("GGML_CUDA_INKATTN_LIVE", 0);
     static const int live_max = inkattn_env_int("GGML_CUDA_INKATTN_LIVE_MAX_KV", 16384);
     static const int live_tpw = std::max(1, inkattn_env_int("GGML_CUDA_INKATTN_LIVE_TPW", 2));
     const bool use_live = live_on != 0 && n_kv <= live_max && NT > 1;
