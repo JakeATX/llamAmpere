@@ -1571,17 +1571,20 @@ static int ggml_cuda_fattn_sj_kvarn_compact_nstage(const int W) {
 }
 
 // [DSPINE2 B0] GGML_SJKVARN_COMPACT_W78: widths 7/8 on the mode-2 compact tile when the compact mode is 1 (the default).
-// unset/1 = on (default), 0 (off/false/no) = the rows kernel at 7/8 in every compact mode. Logged once when the switch is set.
-static bool ggml_cuda_fattn_sj_kvarn_compact_w78() {
-    static const bool on = [] {
-        const int v = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT_W78");
-        if (v >= 0) {
-            GGML_LOG_INFO("ggml_cuda_fattn_sj_kvarn_compact: GGML_SJKVARN_COMPACT_W78=%d: widths 7/8 on %s\n", v,
-                v ? "the mode-2 compact tile" : "the rows kernel");
+// [DSPINE4] 1 = on; unset = the release rule (rows kernel at 7/8 unless GGML_SJKVARN_COMPACT_OCC picks mode 2);
+// 0 (off/false/no) = the rows kernel at 7/8 in every compact mode.
+// common/arg.cpp sets it to 1 for --spec-type draft-dflash (DSpine 8-row verify) unless it is already set, so MTP
+// verify at widths 7/8 stays bit-identical to the release. Logged once when the switch is set.
+static int ggml_cuda_fattn_sj_kvarn_compact_w78() { // -1 unset (release behaviour), 0 off, 1 on
+    static const int v = [] {
+        const int e = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT_W78");
+        if (e >= 0) {
+            GGML_LOG_INFO("ggml_cuda_fattn_sj_kvarn_compact: GGML_SJKVARN_COMPACT_W78=%d: widths 7/8 on %s\n", e,
+                e ? "the mode-2 compact tile" : "the rows kernel");
         }
-        return v != 0;
+        return e;
     }();
-    return on;
+    return v;
 }
 
 // mode for a width-4/6/7/8 node: 0 when the shape is not covered (one warning per process when a switch is set)
@@ -1824,9 +1827,10 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
             // 103K prompt (Taichi 3090, 6 seeds) -6.4% ms/round; not bit-identical (combine order), KLD vs a q8_0-KV reference
             // not worse than the rows kernel (DSPINE2 OCCREF/OCCX4). GGML_SJKVARN_COMPACT_W78=0 = rows kernel at 7/8 (kill
             // switch); COMPACT_ALL=0 still turns every compact tile off. Widths 4/6 keep mode 1 (bit-identical).
-            cmode = 2;
+            // [DSPINE4] only with GGML_SJKVARN_COMPACT_W78=1 (set for DSpine by arg.cpp); unset = the release rows kernel.
+            cmode = ggml_cuda_fattn_sj_kvarn_compact_w78() > 0 ? 2 : 0;
         }
-        if (NT >= 7 && !ggml_cuda_fattn_sj_kvarn_compact_w78()) {
+        if (NT >= 7 && ggml_cuda_fattn_sj_kvarn_compact_w78() == 0) {
             cmode = 0; // the kill switch wins over an explicit GGML_SJKVARN_COMPACT_OCC=1 too
         }
         if (cmode != 0) {

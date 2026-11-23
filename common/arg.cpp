@@ -1255,6 +1255,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 (params.card_preset.empty() || (params.card_preset == "24dense" && params.n_parallel == 1));
     }
 
+    // [DSPINE4] DSpine verifies 8 rows: widths 7/8 take the mode-2 compact tile (DSPINE2 B0, -6.4% ms/round at 103K).
+    // MTP keeps the release kernels. An explicit GGML_SJKVARN_COMPACT_W78 wins.
+    if ((params.speculative.draft.dflash || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) &&
+            common_get_env("GGML_SJKVARN_COMPACT_W78").empty()) {
+        common_set_env("GGML_SJKVARN_COMPACT_W78", "1");
+        LOG_INF("draft-dflash: GGML_SJKVARN_COMPACT_W78=1 (verify widths 7/8 on the compact tile)\n");
+    }
+
     if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {
         throw std::invalid_argument(params.card_preset == "24ink" ? "24ink is one slot (--parallel 1); for several users drop the preset and pass -np N --kv-unified -b 1024 -ub 1024"
                                                                    : "small-card presets require --parallel 1; multi-user support is planned");
