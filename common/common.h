@@ -489,6 +489,11 @@ struct common_params_speculative {
     int32_t copy_tail = -1;
     bool    copy_rs   = false;
 
+    // copy-first (--spec-copy-first N): a lookup span of up to N tokens verified INSTEAD of the drafter's block when
+    // the last tokens repeat earlier text (DFlash/DSpark drafters, see speculative-copy.h). -1 = auto (default): off
+    // (opt-in: edit/quote work); LLAMA_SPEC_COPY_FIRST=N turns it on for a DSpark drafter with one slot, 0 = off.
+    int32_t copy_first = -1;
+
     // per-token recurrent-state snapshots the target context must keep so that a partial draft
     // acceptance can roll the GDN/SSM state back in place (COMMON_CONTEXT_SEQ_RM_TYPE_RS).
     // Without them a hybrid/recurrent target falls back to a full checkpoint restore + replay
@@ -536,6 +541,12 @@ struct common_params_speculative {
 
         if (copy_rs && copy_tail > 0 && n > 0) {
             n += (uint32_t) std::min(copy_tail, 16); // common_speculative_copy_params::TAIL_MAX
+        }
+
+        // copy-first: one snapshot per span token, so every partial span accept rolls back in place (the server caps
+        // the span at n_rs_seq); a recurrent snapshot of the targets it serves (Inkling2 short conv) is small
+        if (copy_first > 0 && n > 0) {
+            n = std::max(n, (uint32_t) std::min(copy_first, 128)); // common_speculative_copy_params::FIRST_MAX
         }
 
         return n;

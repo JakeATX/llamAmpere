@@ -5346,6 +5346,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_COPY_TAIL"));
 
     add_opt(common_arg(
+        {"--spec-copy-first"}, "N",
+        string_format("copy-first: when the last tokens repeat earlier text of the request, verify up to N tokens read "
+            "from there instead of the drafter's block (DFlash/DSpark drafters; the span starts small and doubles per "
+            "full accept). 0 = off, max %d, default: auto = 32 with a DSpark drafter and one slot; "
+            "LLAMA_SPEC_COPY_FIRST=N overrides auto (0 = kill switch)",
+            (int) common_speculative_copy_params::FIRST_MAX),
+        [](common_params & params, int value) {
+            if (value < 0 || value > common_speculative_copy_params::FIRST_MAX) {
+                throw std::invalid_argument(string_format("error: --spec-copy-first must be in [0, %d]",
+                    (int) common_speculative_copy_params::FIRST_MAX));
+            }
+            params.speculative.copy_first = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
         {"--spec-copy-rs"},
         "copy mode: keep one recurrent-state snapshot per tail token, so a wide round rolls back in place "
         "instead of restoring a checkpoint (more VRAM on hybrid models; default: off)",

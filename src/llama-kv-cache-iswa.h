@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-kv-cache.h"
+#include "llama-batch.h"
 
 #include <vector>
 
@@ -10,6 +11,9 @@
 
 // utilizes two instances of llama_kv_cache
 //   the first instance is for the non-SWA layers of the model and the second instance is for the SWA layers
+
+// INKKV multi-sequence far/near split switch (LLAMA_INKKV_MULTI_SPLIT, defined in llama-graph.cpp)
+bool llama_inkkv_multi_split_on();
 
 class llama_kv_cache_iswa : public llama_memory_i {
 public:
@@ -31,7 +35,8 @@ public:
         const  layer_share_cb & share,
                           size_t kv_stream_stage_bytes = 0,
                           void * kv_stream_phase_arena = nullptr,
-                          size_t kv_stream_maximum_pool_bytes = 0);
+                          size_t kv_stream_maximum_pool_bytes = 0,
+                   llama_sj_kvarn_config sj_kvarn = llama_sj_kvarn_config()); // fork (INKKV): see below
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -68,6 +73,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_single_seq() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -101,7 +107,16 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
 
+    // INKKV v2: the SWA cache holds the full-attention window copy (the far/near split can run)
+    bool inkkv_near_copy() const { return near_copy; }
+
+    // INKKV v2: most tokens per sequence in a ubatch shared by several sequences (init_batch)
+    static uint32_t inkkv_mix_max();
+    llama_batch_allocr::seq_compat_fn inkkv_mix_compat(const llama_batch_allocr & balloc, std::vector<uint32_t> & seq_n) const;
+
 private:
+
+    bool near_copy = false;
 
     const bool unified;
 
@@ -121,7 +136,7 @@ public:
 
     // used to create a full-cache context
     llama_kv_cache_iswa_context(
-            llama_kv_cache_iswa * kv);
+            llama_kv_cache_iswa * kv, bool single_seq = false);
 
     // used to create an update context
     llama_kv_cache_iswa_context(

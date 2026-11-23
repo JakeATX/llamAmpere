@@ -730,6 +730,11 @@ public:
     std::vector<ggml_tensor *> self_k_rot_swa;
     std::vector<ggml_tensor *> self_v_rot_swa;
 
+    // INKKV: SJ-KVaRN base (the Inkling DSpark drafter, build_attn_inp_kv_iswa): region descriptor and per-stream
+    // attended lengths; nullptr / empty otherwise (the Inkling trunk keeps its own in llm_graph_input_mem_hybrid_iswa_rel)
+    ggml_tensor * self_sj_kvarn_desc = nullptr;
+    std::vector<uint32_t> sj_kvarn_n_kv_streams;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -988,6 +993,7 @@ public:
     std::vector<uint32_t> sj_kvarn_n_kv_streams;
     // INKKV v2 far/near split: [n_kv, T] F16 mask of the cells at distance >= extent (null = the dense v1 path)
     ggml_tensor * self_sj_far_mask = nullptr;
+    ggml_tensor * self_sj_far_desc = nullptr; // INKKV: the SJ desc of the far nodes, with the far visible end (GGML_SJKVARN_DESC_FAR_END)
     int32_t       sj_il_full       = -1; // a full-attention layer (the SWA cache window copy check)
 
     // distance from the token to the cell, extent for the empty, future and more distant cells
@@ -1498,6 +1504,7 @@ struct llm_graph_context {
         bool fused_rot = false; // Q/output rotation inside the FA node (ggml_sj_kvarn_fused_rot_enabled)
         const std::vector<uint32_t> * n_kv_streams = nullptr; // multi-stream: per-stream n_kv (see llm_graph_input_attn_kv)
         ggml_tensor * wush_ao = nullptr; // EXPERIMENTAL WUSH-KV: output transform replacing the inverse Hadamard
+        bool inksj = false; // INKKV: Inkling pair-packed heads (ggml-inksj.h marker on the node)
     } sj_kvarn_pending;
     // QSA prompt (LLAMA_QSA_DIRECT_LISTS): final selected-cell rows [n_sel, n_tokens] for the next flash attention node's
     // src[8], so the CUDA sparse path builds its per-tile cell lists from them instead of scanning the n_kv-wide mask
@@ -1505,6 +1512,9 @@ struct llm_graph_context {
     // LSA compensation (LLAMA_LSA_COMP=2): when set, the next plain flash attention node also writes its row
     // log-sum-exp to lsa_lse (F32 [n_head, n_tokens, n_seq]); the caller takes it and clears both
     mutable bool          lsa_lse_req = false;
+    // INKKV row-chunked rel-bias path: one view per (graph input, first row, rows), shared by every layer, so the
+    // scheduler uploads each input chunk once per split instead of once per layer (ctx x ub x layers otherwise)
+    mutable std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> inkkv_row_views;
     // Logging only: an earlier full-attention layer's residual projected through this layer's exact Q weights.
     mutable ggml_tensor * lsa_spec_q = nullptr;
     mutable ggml_tensor * lsa_spec_q2 = nullptr; // same target, residual from two attention layers earlier
@@ -2179,6 +2189,18 @@ struct llm_graph_context {
             ggml_tensor * gate = nullptr) const; // [n_embd_head_v*n_head_q, n_tokens]: returns out * sigmoid(gate)
 
     // the body of build_attn_rel; sets gated when the gate was applied inside the attention (INKATTN)
+    // INKKV: the dense / near per-head bias path in row chunks of tc rows per stream
+    ggml_tensor * build_attn_rel_chunked(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * table,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il,
+                  int64_t tc) const;
+
     ggml_tensor * build_attn_rel_base(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * q_cur,
@@ -2203,6 +2225,26 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor ** lse_out = nullptr) const; // INKKV v2: also the row log-sum-exp [n_head, T]
+
+    // INKKV: the pair-packed SJ-KVaRN visit on any iSWA input (desc = the SJ region descriptor of this node), and the
+    // K/V store alone (the Inkling DSpark drafter writes its context K/V without attending)
+    ggml_tensor * build_attn_sj_pair(
+            llm_graph_input_attn_kv_iswa * inp_attn,
+            ggml_tensor * desc,
+            const std::vector<uint32_t> * n_kv_streams,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_mask,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor ** lse_out = nullptr) const;
+    void build_sj_pair_store(
+            llm_graph_input_attn_kv_iswa * inp_attn,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+                    int   il) const;
 
     // INKREL (llama-inklsa.h): full-attention visit as far + near flash attention merged by log-sum-exp; k and v are
     // the cache views with this ubatch already stored, the sink logit is zero (folded into table)

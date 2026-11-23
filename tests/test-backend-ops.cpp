@@ -20,6 +20,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "ggml-inkrel.h"
+#include "ggml-inksj.h"
 #include "nmse-masked-inf.h"
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-ai4.h"
@@ -14453,6 +14454,8 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     bool lse_fix = false; // COMPFIX: SJ + LSE route cases, own op name (FLASH_ATTN_EXT_SJKVARN_LSE_ROUTES)
     bool lse_out = false; // LSA compensation: the node also writes its row log-sum-exp (ggml_flash_attn_ext_set_lse), appended to out
     bool sinks_only = false; // INKKV: attention sinks without the logit softcap attn_options adds
+    bool inksj = false;      // INKKV (ggml-inksj.h): pair-packed Q (zero half per head), only the real output halves compared
+    int64_t far_gap = 0;     // INKKV far node: query at pos sees positions <= pos - far_gap, desc carries the far visible end
     int lsa_blk = 128;    // mask_mode 9: LSA block size of the block list (ggml_flash_attn_ext_set_lsa_blocks)
     bool lsa_vk = false;  // mask_mode 9: virtual keys (ggml_flash_attn_ext_set_lsa_vk): "lsa_nd" [nbs, n_q] instead of
                           // "lsa_sel" (0 = picked, same blocks in every row; else 1 + a per-row dropped count, 0 for some),
@@ -14504,6 +14507,8 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         if (packed_pair) { result += ",packed=1"; }
         if (lse_out) { result += ",lse=1"; }
         if (sinks_only) { result += ",sinks=1"; }
+        if (inksj) { result += ",inksj=1"; }
+        if (far_gap) { result += ",far_gap=" + std::to_string(far_gap); }
         if (mask_mode != 0) {
             result += ",mask_mode=" + std::to_string(mask_mode);
         }
@@ -14524,7 +14529,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         return result;
     }
 
-    bool run_whole_graph() override { return rot == 2 || data_case != 0 || ns > 1 || packed_pair || lse_out; } // lse: output is CONCAT(out, lse), time the FA too
+    bool run_whole_graph() override { return rot == 2 || data_case != 0 || ns > 1 || packed_pair || lse_out || inksj; } // lse: output is CONCAT(out, lse), time the FA too
     // Repeat the producer attention nodes each time, as well as the final CONCAT.
     bool perf_whole_graph() override { return ns > 1; }
     const char * required_fusion() override {
@@ -14540,6 +14545,22 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     }
 
     double err(const float * a, const float * b, size_t n) override {
+        if (inksj) {
+            // output rows [D] per (q head, query), then the LSE (lse_out); keep the real half of each row
+            GGML_ASSERT(ns == 0 && rot != 2 && data_case == 0 && !packed_pair);
+            const size_t rows = (size_t) nh*n_q;
+            const size_t nl = lse_out ? rows : 0;
+            GGML_ASSERT(n == rows*D + nl);
+            const int r = (int) (nh/hkv);
+            std::vector<float> fa, fb;
+            for (size_t rr = 0; rr < rows; ++rr) {
+                const size_t off = rr*D + 128*(size_t) ggml_inksj_half((int) (rr % nh), r);
+                fa.insert(fa.end(), a + off, a + off + 128);
+                fb.insert(fb.end(), b + off, b + off + 128);
+            }
+            const double e = nmse(fa.data(), fb.data(), fa.size());
+            return nl ? std::max(e, nmse(a + rows*D, b + rows*D, nl)) : e;
+        }
         if (packed_pair && !kq_mask_packed_pair_equal(a, b, n, 2*(size_t) D)) { return INFINITY; }
         if (rot != 2) {
             // A5 trellis + LSE: output and LSE checked separately, so the LSE values (about 8-10 each) do not dilute
@@ -14669,6 +14690,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 ggml_flash_attn_ext_set_sj_kvarn(o, body, desc, bits_k, bits_v, (int32_t) n_kv_pad());
                 ggml_flash_attn_ext_set_n_kv_max(o, compact_bound);
                 ggml_prec_set_acc(o, GGML_PREC_F32);
+                if (inksj) {
+                    ggml_flash_attn_ext_set_inksj(o);
+                }
                 if (mask_mode == 9) {
                     GGML_ASSERT(!packed_pair && lsa_blk >= (lsa_vk ? 16 : 1) && (lsa_blk & (lsa_blk - 1)) == 0);
                     const int64_t nbs = std::max<int64_t>(1, n_kv_pad()/lsa_blk - 1);
@@ -14760,7 +14784,17 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             if (t->view_src != nullptr) {
                 continue; // per-stream q/k/v/mask/desc views (ns > 0), the ring views, the permuted q: their storage is set below
             }
-            if (strcmp(t->name, "q") == 0 && (data_case == 1 || data_case == 2)) {
+            if (strcmp(t->name, "q") == 0 && inksj) {
+                // zero the other half of every q head: [D, nh, n_q] (rot) or [D, n_q, nh]
+                std::vector<float> values(ggml_nelements(t));
+                const int r = (int) (nh/hkv);
+                for (size_t i = 0; i < values.size(); ++i) {
+                    const size_t row = i/D;
+                    const int h = (int) (rot != 0 ? row % nh : row / n_q % nh);
+                    values[i] = (int) ((i % D)/128) == ggml_inksj_half(h, r) ? uni(-1.0f, 1.0f) : 0.0f;
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(float));
+            } else if (strcmp(t->name, "q") == 0 && (data_case == 1 || data_case == 2)) {
                 std::vector<float> values(ggml_nelements(t));
                 for (auto & value : values) { value = uni(-1.0f, 1.0f); }
                 values[0] = data_case == 1 ? std::numeric_limits<float>::quiet_NaN() : 70000.0f;
@@ -14792,7 +14826,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                     for (int64_t j = 0; j < n_q; ++j) {
                         const int64_t pos = Ns - n_q + j;
                         for (int64_t p = 0; p < n_kv_pad(); ++p) {
-                            float value = p <= pos && p < Ns ? 0.0f : -INFINITY;
+                            float value = p <= pos - far_gap && p < Ns ? 0.0f : -INFINITY;
                             if (row_mask && p >= S && p < B()) {
                                 value = (p / 16 + j + s) % 3 == 0 ? -INFINITY : -0.25f * (float) ((p + 3*j) % 11);
                             }
@@ -14855,6 +14889,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                     // fork: entry 15 = kernel flags, as llama-kv-cache.cpp writes it (bit 0: GGML_SJKVARN_TILE_SKIP=1)
                     static const bool tile_skip = getenv("GGML_SJKVARN_TILE_SKIP") && atoi(getenv("GGML_SJKVARN_TILE_SKIP")) != 0;
                     d[15] = tile_skip ? 1 : 0;
+                    if (far_gap > 0) {
+                        d[GGML_INKSJ_DESC_FLAGS] |= (int32_t) (std::max<int64_t>(Ns - far_gap, 1) << GGML_INKSJ_FAR_END_SHIFT);
+                    }
                     if (ns > 0) {
                         d[GGML_SJKVARN_DESC_TABLE] = 1;
                         for (int64_t g = 0; g < n_groups; ++g) d[GGML_SJKVARN_DESC_N_ENTRIES + g] = perm[s*n_groups + g];
@@ -18342,11 +18379,16 @@ struct test_flash_attn_ext_inkrel : public test_case {
     const int64_t H, Hkv, kv, T, rows;
     const bool gate;
     const int64_t win; // > 0: sliding-window band mask, row r sees keys [kv - T + r - win, kv - T + r] (whole tiles masked)
+    const ggml_type tkv; // K/V cache type (F16, or Q8_0: the Inkling SWA window at q8_0)
 
-    test_flash_attn_ext_inkrel(int64_t H, int64_t Hkv, int64_t kv, int64_t T, int64_t rows, bool gate, int64_t win = 0)
-        : H(H), Hkv(Hkv), kv(kv), T(T), rows(rows), gate(gate), win(win) {}
+    test_flash_attn_ext_inkrel(int64_t H, int64_t Hkv, int64_t kv, int64_t T, int64_t rows, bool gate, int64_t win = 0,
+            ggml_type tkv = GGML_TYPE_F16)
+        : H(H), Hkv(Hkv), kv(kv), T(T), rows(rows), gate(gate), win(win), tkv(tkv) {}
 
-    std::string vars() override { return VARS_TO_STR6(H, Hkv, kv, T, rows, gate) + (win ? ",win=" + std::to_string(win) : "") + ",inkrel=1"; }
+    std::string vars() override {
+        return VARS_TO_STR6(H, Hkv, kv, T, rows, gate) + (win ? ",win=" + std::to_string(win) : "") + ",inkrel=1" +
+            (tkv == GGML_TYPE_F16 ? "" : std::string(",kv=") + ggml_type_name(tkv));
+    }
     std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -18355,8 +18397,8 @@ struct test_flash_attn_ext_inkrel : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t D = 128;
         ggml_tensor * q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H, T);            ggml_set_name(q, "q");
-        ggml_tensor * kc = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, Hkv, kv);         ggml_set_name(kc, "k");
-        ggml_tensor * vc = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, Hkv, kv);         ggml_set_name(vc, "v");
+        ggml_tensor * kc = ggml_new_tensor_3d(ctx, tkv, D, Hkv, kv);                   ggml_set_name(kc, "k");
+        ggml_tensor * vc = ggml_new_tensor_3d(ctx, tkv, D, Hkv, kv);                   ggml_set_name(vc, "v");
         ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, T, 1, 1);        ggml_set_name(m, "m");
         ggml_tensor * tb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, rows, T);         ggml_set_name(tb, "tab");
         ggml_tensor * rp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, T);              ggml_set_name(rp, "rp");
@@ -18442,8 +18484,9 @@ struct test_flash_attn_ext_inkrel : public test_case {
 };
 
 static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
-    auto add = [&](int64_t kv, int64_t nb, int64_t mh, bool sinks, bool lse, int64_t nh = 8, std::array<int64_t, 2> nr23 = {3, 1}) {
-        auto * t = new test_flash_attn_ext(128, 128, nh, nr23, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+    auto add = [&](int64_t kv, int64_t nb, int64_t mh, bool sinks, bool lse, int64_t nh = 8, std::array<int64_t, 2> nr23 = {3, 1},
+            ggml_type tkv = GGML_TYPE_F16) {
+        auto * t = new test_flash_attn_ext(128, 128, nh, nr23, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, tkv, tkv,
             {0, 1, 2, 3}, true, false, 0, 0, mh);
         t->lse_out = lse;
         cases.emplace_back(t);
@@ -18491,6 +18534,17 @@ static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, b
             for (bool gt : {false, true}) {
                 cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, kv, T, 1025, gt));
             }
+        }
+    }
+    // Q8_0 K/V (the Inkling SWA window cache at q8_0): per-head and broadcast masks, sinks, LSE, and the INKREL node
+    for (int64_t kv : {113, 1536, 4096}) {
+        for (int64_t nb : {1, 3, 5}) {
+            add(kv, nb, 24, true, false, 8, {3, 1}, GGML_TYPE_Q8_0);
+            add(kv, nb, 24, false, kv >= 1000, 8, {3, 1}, GGML_TYPE_Q8_0);
+            add(kv, nb, 1, false, kv >= 1000, 8, {3, 1}, GGML_TYPE_Q8_0);
+        }
+        for (int64_t T : {1, 2, 5}) {
+            cases.emplace_back(new test_flash_attn_ext_inkrel(24, 8, kv, T, 1025, true, 0, GGML_TYPE_Q8_0));
         }
     }
     cases.emplace_back(new test_flash_attn_ext_inkrel(16, 4, 1536, 4, 129, true));
@@ -22455,6 +22509,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 GGML_TYPE_F32, 4, 4, 1, 0, 10);
         t->sinks_only = true;
         test_cases.emplace_back(t);
+    }
+    // INKKV (ggml-inksj.h): the marked nodes, far part (LSE) and dense part (per-q-head mask + sinks), decode to prefill;
+    // rot 0 keeps the packed path (the marker needs un-rotated Q)
+    for (int64_t n_q : {1, 8, 9, 128, 257, 512, 1024, 1100}) {
+        for (int mode : {0, 10}) {
+            for (int rot : {0, 1}) {
+                if (rot == 0 && n_q != 257) {
+                    continue;
+                }
+                auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                        GGML_TYPE_F32, 4, 4, rot, 0, mode);
+                t->inksj = true;
+                t->lse_out = mode == 0;
+                t->sinks_only = mode == 10;
+                test_cases.emplace_back(t);
+            }
+        }
+    }
+    // INKKV far visible end (ggml-inksj.h): the far mask hides the last far_gap positions of every row, the desc says so
+    for (int64_t n_q : {1, 2, 4, 8}) {
+        for (int64_t gap : {11, 16, 300, 1024, 1500}) { // 11: far_end % 16 == 1 (an off-by-one drops a visible column)
+            auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                    GGML_TYPE_F32, 4, 4, 1, 0, 0);
+            t->lse_out = true;
+            t->far_gap = gap;
+            test_cases.emplace_back(t);
+        }
     }
     // INKKV v2 far part: broadcast causal mask, no sinks, row log-sum-exp out (merged with the F16 near part)
     for (int64_t n_q : {1, 2, 4, 8, 9, 64, 257, 512}) {

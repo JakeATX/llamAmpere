@@ -11,6 +11,78 @@
 // llama_kv_cache_iswa
 //
 
+// INKKV v2: most tokens a sequence may bring to a ubatch shared with other sequences (LLAMA_INKKV_MIX_MAX, default 32)
+uint32_t llama_kv_cache_iswa::inkkv_mix_max() {
+    static const uint32_t v = [] {
+        const char * e = getenv("LLAMA_INKKV_MIX_MAX");
+        return e && *e ? (uint32_t) std::max(1, atoi(e)) : 32u;
+    }();
+    return v;
+}
+
+// INKKV 0.7.4 (LLAMA_INKKV_DECODE_SOLO, default 1): a sequence deeper than LLAMA_INKKV_SOLO_MIN gets ubatches of its own,
+// decode included. A ubatch of several sequences cannot take the far/near split (inkkv_split_want) and falls back to the dense
+// per-head bias path over the whole n_kv: 2 users x 100K decoded 51 tok/s total vs 79 with one sequence per ubatch
+// (Taichi 3090 Ti, NQ + DSpark d4, 4/4). 0 = the INKKV v2 rule below (decode-sized sequences share a ubatch).
+// With the multi-sequence split (LLAMA_INKKV_MULTI_SPLIT, default on) several deep sequences take the split together,
+// so the default is then off (shared decode ubatches); LLAMA_INKKV_DECODE_SOLO=1 forces it on.
+static bool llama_inkkv_decode_solo() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_INKKV_DECODE_SOLO");
+        if (!(e && *e)) {
+            return !llama_inkkv_multi_split_on();
+        }
+        return atoi(e) != 0;
+    }();
+    return on;
+}
+
+// depth (a sequence's last position) from which its decode tokens get ubatches of their own: below it the dense bias is
+// cheap and one shared ubatch (one weight read) wins (4 users x 16K: 143 tok/s shared vs 101 solo; 2 users x 100K: 51 vs 79)
+static llama_pos llama_inkkv_solo_min() {
+    static const llama_pos v = [] {
+        const char * e = getenv("LLAMA_INKKV_SOLO_MIN");
+        return e && *e ? (llama_pos) std::max(0, atoi(e)) : (llama_pos) 32768;
+    }();
+    return v;
+}
+
+// INKKV v2 (several sequences): a sequence with more than inkkv_mix_max() tokens in this batch (a prompt) gets
+// ubatches of its own, which take the far/near split; only decode-sized sequences share a ubatch (the dense per-head
+// bias path, whose mask grows with n_kv x ubatch). nullptr when the split is off. seq_n: per-seq token counts, owned
+// by the caller for as long as the returned filter is used
+llama_batch_allocr::seq_compat_fn llama_kv_cache_iswa::inkkv_mix_compat(const llama_batch_allocr & balloc, std::vector<uint32_t> & seq_n) const {
+    if (!near_copy || !kv_base->is_sj_kvarn() || kv_base->get_n_stream() <= 1) {
+        return nullptr;
+    }
+    seq_n.clear();
+    const llama_batch & b = balloc.get_batch();
+    for (int32_t i = 0; i < b.n_tokens; ++i) {
+        for (int32_t k = 0; k < b.n_seq_id[i]; ++k) {
+            const llama_seq_id s = b.seq_id[i][k];
+            if (s >= 0) {
+                if ((size_t) s >= seq_n.size()) {
+                    seq_n.resize(s + 1, 0);
+                }
+                seq_n[s]++;
+            }
+        }
+    }
+    const uint32_t mx = inkkv_mix_max();
+    if (llama_inkkv_decode_solo()) {
+        const llama_pos dmin = llama_inkkv_solo_min();
+        const llama_kv_cache * base = kv_base.get();
+        return [&seq_n, mx, dmin, base](llama_seq_id a, llama_seq_id b) {
+            auto n = [&](llama_seq_id s) { return s >= 0 && (size_t) s < seq_n.size() ? seq_n[s] : 0u; };
+            return a == b || (n(a) <= mx && n(b) <= mx && base->seq_pos_max(a) < dmin && base->seq_pos_max(b) < dmin);
+        };
+    }
+    return [&seq_n, mx](llama_seq_id a, llama_seq_id b) {
+        auto n = [&](llama_seq_id s) { return s >= 0 && (size_t) s < seq_n.size() ? seq_n[s] : 0u; };
+        return n(a) <= mx && n(b) <= mx;
+    };
+}
+
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
                      bool   no_alloc,
@@ -29,10 +101,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     const  layer_share_cb & share,
                      size_t kv_stream_stage_bytes,
                      void * kv_stream_phase_arena,
-                     size_t kv_stream_maximum_pool_bytes) :
+                     size_t kv_stream_maximum_pool_bytes,
+       llama_sj_kvarn_config sj_kvarn) :
     llama_kv_cache_iswa(model, no_alloc, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
             kv_size, n_seq_max, n_ubatch, mem_other, filter, reuse, share,
-            kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes) {
+            kv_stream_stage_bytes, kv_stream_phase_arena, kv_stream_maximum_pool_bytes, sj_kvarn) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -117,7 +190,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     // fork (INKKV): SJ-KVaRN on the full-attention half. Its kernels take 256-wide heads; a 128-wide head cache with an
     // even KV head count is stored as half as many 256-wide heads (two neighbouring KV heads per row, the same bytes
     // per token), and the graph packs Q into the matching half of the 256 lanes (llm_graph_context::build_attn_rel).
-    // The SWA half (window-sized) keeps a plain cache: F16 unless LLAMA_INKKV_SWA_TYPE names f16 / q8_0.
+    // The SWA half (window-sized) keeps a plain cache: F16 unless LLAMA_INKKV_SWA_TYPE names another type (see below).
     const llama_hparams * hparams_base = &hparams;
     ggml_type type_k_swa = type_k;
     ggml_type type_v_swa = type_v;
@@ -148,7 +221,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             LLAMA_LOG_INFO("%s: SJ-KVaRN full-attention cache: 128-wide heads packed in pairs as 256-wide heads\n", __func__);
             const char * e = getenv("LLAMA_INKKV_SPLIT");
             swa_near_copy = !(e && *e && atoi(e) == 0) && hparams.n_swa > 0 && hparams.n_relative_extent == hparams.n_swa && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD &&
-                    !swa_full && n_seq_max == 1; // the split runs on one sequence only; never a full-context F16 copy
+                    !swa_full; // never a full-context F16 copy; one window copy per sequence stream
+            near_copy = swa_near_copy;
             if (swa_near_copy) {
                 LLAMA_LOG_INFO("%s: INKKV far/near split: the SWA cache keeps a window copy of the full-attention layers "
                         "(LLAMA_INKKV_SPLIT=0 = off)\n", __func__);
@@ -157,11 +231,17 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         type_k_swa = GGML_TYPE_F16;
         type_v_swa = GGML_TYPE_F16;
         if (const char * e = getenv("LLAMA_INKKV_SWA_TYPE"); e && *e) {
+            // f16 and q8_0 keep the fused rel-bias decode kernel (inkattn); the others run the generic flash attention
             const std::string t = e;
-            if (t == "q8_0") {
-                type_k_swa = type_v_swa = GGML_TYPE_Q8_0;
-            } else if (t != "f16") {
-                throw std::runtime_error("LLAMA_INKKV_SWA_TYPE: expected f16 or q8_0");
+            bool found = false;
+            for (ggml_type c : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_TQ6_0, GGML_TYPE_TQ5_0, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0}) {
+                if (t == ggml_type_name(c)) {
+                    type_k_swa = type_v_swa = c;
+                    found = true;
+                }
+            }
+            if (!found) {
+                throw std::runtime_error("LLAMA_INKKV_SWA_TYPE: expected f16, q8_0, tq6_0, tq5_0, q4_0 or turbo4");
             }
         }
         LLAMA_LOG_INFO("%s: SJ-KVaRN on the non-SWA layers only; SWA cache K/V type %s\n", __func__, ggml_type_name(type_k_swa));
@@ -298,13 +378,17 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
                 this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
     } while (false);
 
+    // INKKV v2 (several sequences): prompts get ubatches of their own (inkkv_mix_compat)
+    std::vector<uint32_t> seq_n;
+    const llama_batch_allocr::seq_compat_fn compat = embd_all ? nullptr : inkkv_mix_compat(balloc, seq_n);
+
     // if it fails, try equal split
     do {
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0);
+            auto ubatch = embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, !unified, 0, compat);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -344,6 +428,10 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_full() {
     return std::make_unique<llama_kv_cache_iswa_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache_iswa::init_full_single_seq() {
+    return std::make_unique<llama_kv_cache_iswa_context>(this, true);
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
 }
@@ -379,9 +467,9 @@ llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
-        llama_kv_cache_iswa * kv) :
-    ctx_base(kv->get_base()->init_full()),
-    ctx_swa (kv->get_swa ()->init_full()),
+        llama_kv_cache_iswa * kv, bool single_seq) :
+    ctx_base(single_seq ? kv->get_base()->init_full_single_seq() : kv->get_base()->init_full()),
+    ctx_swa (single_seq ? kv->get_swa ()->init_full_single_seq() : kv->get_swa ()->init_full()),
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
 }
 

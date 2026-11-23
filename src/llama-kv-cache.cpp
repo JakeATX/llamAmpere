@@ -5355,24 +5355,30 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
 
 // INKKV v2: far mask of the SJ-KVaRN base: cells hold one sequence at their positions with no holes, so the cells at
 // distance >= extent from row i are the prefix [0, cell_of(pos_i - extent + 1)) of the occupied cells
-void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    GGML_ASSERT(dst->type == GGML_TYPE_F16 && dst->ne[2] == 1 && dst->ne[3] == 1 && sj_kvarn.enabled());
-    const int64_t n_kv = dst->ne[0];
-    const int64_t T    = dst->ne[1];
+int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    // F16 [n_kv, T] (0 / -inf) or packed I32 [(n_kv + 31)/32, T] with op_params[0] = n_kv (bit set = visible).
+    // Several streams (INKKV multi-sequence split): [.., T/ns, 1, ns], the same row order (row i = token i, the tokens
+    // of a stream contiguous, as the KQ mask), so the rows below are filled unchanged
+    const bool packed = dst->type == GGML_TYPE_I32;
+    GGML_ASSERT((packed || dst->type == GGML_TYPE_F16) && dst->ne[2] == 1 && sj_kvarn.enabled());
+    const int64_t n_kv = packed ? dst->op_params[0] : dst->ne[0];
+    const int64_t T    = dst->ne[1]*dst->ne[3];
     GGML_ASSERT(T >= (int64_t) ubatch->n_tokens);
+    GGML_ASSERT(!packed || (n_kv > 0 && (n_kv + 31)/32 == dst->ne[0]));
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     // fork INKPF3: the same mask, built from one per-cell position table and filled by row on a few threads (the
     // per-cell is_empty/seq_has/pos_get loop over n_kv x T was a host stall between prefill ubatches at long depth).
     // LLAMA_INKPF3_FARMASK=0 = the original loop below.
     static const bool fast = [] { const char * e = getenv("LLAMA_INKPF3_FARMASK"); return !e || atoi(e) != 0; }();
-    if (fast) {
+    if (fast && !packed) {
         std::unique_ptr<ggml_fp16_t[]> data(new ggml_fp16_t[n_kv*T]);
         // cp[j]: the cell's position if it holds the row's sequence, else INT32_MAX (never <= pf); one table per seq
         std::vector<std::pair<llama_seq_id, std::vector<llama_pos>>> tabs;
         std::vector<const llama_pos *> row_cp(T, nullptr);
         std::vector<int64_t> row_c1(T, 0);
         std::vector<llama_pos> row_pf(T, -1);
+        std::vector<int64_t> row_end(T, 0); // last visible cell + 1 per row (same as the loop below)
         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
             const llama_seq_id seq = ubatch->seq_id[i][0];
             const uint32_t strm = seq_to_stream.at(seq);
@@ -5401,9 +5407,13 @@ void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch
                 const int64_t c1 = row_cp[i] ? row_c1[i] : 0;
                 const llama_pos * cp = row_cp[i];
                 const llama_pos pf = row_pf[i];
+                int64_t e = 0;
                 for (int64_t j = 0; j < c1; ++j) {
-                    row[j] = cp[j] <= pf ? zero : ninf;
+                    const bool vis = cp[j] <= pf;
+                    row[j] = vis ? zero : ninf;
+                    e = vis ? j + 1 : e;
                 }
+                row_end[i] = e;
                 std::fill(row + c1, row + n_kv, ninf);
             }
         };
@@ -5421,9 +5431,17 @@ void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch
             fill(0, T);
         }
         ggml_backend_tensor_set(dst, data.get(), 0, ggml_nbytes(dst));
-        return;
+        return T > 0 ? *std::max_element(row_end.begin(), row_end.end()) : 0;
     }
-    std::vector<ggml_fp16_t> data(n_kv*T, ninf);
+    std::vector<ggml_fp16_t> data(packed ? 0 : n_kv*T, ninf);
+    std::vector<uint32_t>    bits(packed ? dst->ne[0]*T : 0, 0u);
+    int64_t end = 0;
+    // packed: per 32-cell word of the sequence's cells, the visible-candidate bits and their position range, so a row
+    // costs O(n_kv/32) (whole words in or out) instead of O(n_kv); the same bits as the per-cell rule below
+    const int64_t W = packed ? dst->ne[0] : 0;
+    llama_seq_id w_seq = -1;
+    std::vector<uint32_t>  w_valid;
+    std::vector<llama_pos> w_pmin, w_pmax;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_seq_id seq = ubatch->seq_id[i][0];
         const uint32_t strm = seq_to_stream.at(seq);
@@ -5433,13 +5451,62 @@ void llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch
             continue;
         }
         const int64_t c1 = std::min<int64_t>(n_kv, std::min<int64_t>(cells.used_max_p1(), sj_kvarn_cell_of(strm, pf + 1)));
+        if (packed) {
+            if (seq != w_seq) {
+                w_seq = seq;
+                const int64_t nl = std::min<int64_t>(n_kv, cells.used_max_p1());
+                w_valid.assign(W, 0u);
+                w_pmin.assign(W, std::numeric_limits<llama_pos>::max());
+                w_pmax.assign(W, std::numeric_limits<llama_pos>::min());
+                for (int64_t j = 0; j < nl; ++j) {
+                    if (!cells.is_empty(j) && cells.seq_has(j, seq)) {
+                        const llama_pos p = cells.pos_get(j);
+                        w_valid[j/32] |= 1u << (j % 32);
+                        w_pmin[j/32] = std::min(w_pmin[j/32], p);
+                        w_pmax[j/32] = std::max(w_pmax[j/32], p);
+                    }
+                }
+            }
+            uint32_t * row = bits.data() + i*W;
+            for (int64_t w = 0; w*32 < c1; ++w) {
+                uint32_t b = w_valid[w];
+                if (b == 0u || w_pmin[w] > pf) {
+                    continue;
+                }
+                if (w_pmax[w] > pf) {
+                    for (int k = 0; k < 32; ++k) {
+                        if (((b >> k) & 1u) && cells.pos_get(w*32 + k) > pf) {
+                            b &= ~(1u << k);
+                        }
+                    }
+                }
+                if (c1 - w*32 < 32) {
+                    b &= (1u << (c1 - w*32)) - 1u;
+                }
+                if (b != 0u) {
+                    row[w] = b;
+                    end = std::max<int64_t>(end, w*32 + 32 - __builtin_clz(b));
+                }
+            }
+            continue;
+        }
         for (int64_t j = 0; j < c1; ++j) {
             if (!cells.is_empty(j) && cells.seq_has(j, seq) && cells.pos_get(j) <= pf) {
-                data[i*n_kv + j] = zero;
+                if (packed) {
+                    bits[i*dst->ne[0] + j/32] |= 1u << (j % 32);
+                } else {
+                    data[i*n_kv + j] = zero;
+                }
+                end = std::max<int64_t>(end, j + 1);
             }
         }
     }
-    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+    if (packed) {
+        ggml_backend_tensor_set(dst, bits.data(), 0, ggml_nbytes(dst));
+    } else {
+        ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+    }
+    return end;
 }
 
 // INKREL (llama-inklsa.h): far mask over every cell, near cells (within extent of some row) with their bias rows
@@ -7744,8 +7811,8 @@ void llama_kv_cache_context::set_input_lsa_pos(ggml_tensor * cell_pos, ggml_tens
     kv->set_input_lsa_pos(cell_pos, q_pos, ubatch);
 }
 
-void llama_kv_cache_context::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
-    kv->set_input_sj_far_mask(dst, ubatch, extent);
+int64_t llama_kv_cache_context::set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    return kv->set_input_sj_far_mask(dst, ubatch, extent);
 }
 
 bool llama_kv_cache_context::has_layer(int32_t il) const {

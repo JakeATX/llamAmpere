@@ -4625,7 +4625,16 @@ struct common_speculative {
     // copy mode (--spec-copy-tail, default off), see speculative-copy.h
     common_speculative_copy_params             copy;
     std::vector<common_speculative_copy_state> copy_state; // [n_seq]
+
+    // copy-first (--spec-copy-first): the drafter a span stands in for (its accept() is a no-op), nullptr = off
+    common_speculative_impl * first_impl = nullptr;
 };
+
+// drafters a copy-first span may replace for a round: their state follows the target batches (process()) and their
+// accept() keeps nothing per draft, so a round they did not draft leaves them consistent
+static bool common_speculative_copy_first_ok(common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
 
 // drafters whose block the copy tail may follow; the n-gram drafters keep their own (narrow) width
 static bool common_speculative_copy_fuses(common_speculative_type type) {
@@ -5023,11 +5032,32 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // The first block-streaming implementation owns only the target cache.
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_arena_mib = 0;
+    // INKKV: the Inkling DSpark drafter (-md DSpark file, draft-dspark) keeps the trunk's SJ-KVaRN 4/4 on its
+    // full-attention layer (the SWA layers stay F16, as on the trunk; llama_kv_cache_iswa packs the 128-wide head
+    // pairs). On with LLAMA_DSPARK_DRAFT_SJKVARN=1 or --spec-draft-sjkvarn; an explicit -ctkd/-ctvd keeps it off. A non-Inkling draft-dspark
+    // model refuses the SJ-KVaRN cache at context creation (head size), so the switch is the way back there.
+    const bool spec_dspark = has_draft && std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; });
+    // Opt-in (2026-11-22 speed gate, ABBA 6v6 vs the F16 drafter: 3K -0.2%, 32K -1.8%, 100K -3.0%; saves the
+    // drafter's 4,096 B/token F16 KV): LLAMA_DSPARK_DRAFT_SJKVARN=1 or --spec-draft-sjkvarn turns it on.
+    const bool dspark_sj = spec_dspark && !spec_mtp && (params_spec.sj_kvarn_explicit ? params_spec.sj_kvarn : [] {
+            const char * e = std::getenv("LLAMA_DSPARK_DRAFT_SJKVARN");
+            return e && *e && std::atoi(e) != 0;
+        }()) && params.sj_kvarn_bits_k == 4 && params.sj_kvarn_bits_v == 4 &&
+        params_spec.cache_type_k == GGML_TYPE_COUNT && params_spec.cache_type_v == GGML_TYPE_COUNT &&
+        params.sj_kvarn_edge_layers == 0 && params.sj_kvarn_transform.empty();
     // fork: the automatic default has the same parameter bounds as explicit DSJ.
     const char * sj_kvarn_error = common_speculative_draft_sj_kvarn_error(params);
-    result.speculative.draft.sj_kvarn = params_spec.sj_kvarn ||
-        (!params_spec.sj_kvarn_explicit && sj_kvarn_error == nullptr);
-    if (result.speculative.draft.sj_kvarn) {
+    result.speculative.draft.sj_kvarn = !dspark_sj && (params_spec.sj_kvarn ||
+        (!params_spec.sj_kvarn_explicit && sj_kvarn_error == nullptr));
+    if (dspark_sj) {
+        // the trunk's -ctk/-ctv sjkvarn4 plain type (F16) and its SJ-KVaRN settings are kept as they are in params;
+        // the server's SJ-KVaRN cut / checkpoint rules then cover the draft cache too (draft.sj_kvarn)
+        result.cache_type_k = params.cache_type_k;
+        result.cache_type_v = params.cache_type_v;
+        result.speculative.draft.cache_type_sj_kvarn_default = false;
+        result.speculative.draft.sj_kvarn = true;
+    } else if (result.speculative.draft.sj_kvarn) {
         if (sj_kvarn_error != nullptr) {
             throw std::invalid_argument(sj_kvarn_error);
         }
@@ -5456,18 +5486,37 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .synth_probs = */ {},
         /* .copy        = */ {},
         /* .copy_state  = */ {},
+        /* .first_impl  = */ nullptr,
     });
 
-    if (params.copy_tail > 0) {
-        result->copy = common_speculative_copy_params::from_env(params.copy_tail);
+    if (params.copy_tail > 0 || params.copy_first > 0) {
+        result->copy = common_speculative_copy_params::from_env(std::max(0, params.copy_tail));
+        if (params.copy_first > 0) {
+            for (auto & impl : result->impls) {
+                if (common_speculative_copy_first_ok(impl->type)) {
+                    result->first_impl = impl.get();
+                    break;
+                }
+            }
+            result->copy.set_first(result->first_impl != nullptr ? params.copy_first : 0);
+        }
         result->copy_state.assign(n_seq, common_speculative_copy_state());
         for (auto & cs : result->copy_state) {
             cs.reset();
-            cs.cool_base = result->copy.cool;
+            cs.cool_base       = result->copy.cool;
+            cs.first_max       = result->copy.first;
+            cs.first_start     = std::min(result->copy.first_start, std::max(1, result->copy.first));
+            cs.first_cool_base = result->copy.first_cool;
         }
-        LOG_INF("%s: copy mode: tail = %d, long = %d, short = %d, agree = %d, cool = %d, n_rs_seq = %u\n", __func__,
-                result->copy.tail, result->copy.long_min, result->copy.short_min, result->copy.agree, result->copy.cool,
-                params.need_n_rs_seq());
+        if (result->copy.tail > 0) {
+            LOG_INF("%s: copy mode: tail = %d, long = %d, short = %d, agree = %d, cool = %d, n_rs_seq = %u\n", __func__,
+                    result->copy.tail, result->copy.long_min, result->copy.short_min, result->copy.agree, result->copy.cool,
+                    params.need_n_rs_seq());
+        }
+        LOG_INF("%s: copy-first: max span = %d, min match = %d, start = %d, cool = %d, source = %s (drafter %s)\n", __func__,
+                result->copy.first, result->copy.first_min, result->copy.first_start, result->copy.first_cool,
+                result->copy.first_src_all ? "all" : "prompt",
+                result->first_impl ? common_speculative_type_to_str(result->first_impl->type).c_str() : "none: off");
     }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
@@ -5678,6 +5727,40 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // copy-first: a sequence whose last tokens repeat earlier text verifies a lookup span this round, and the model
+    // drafter does not run for it (see speculative-copy.h)
+    if (spec->first_impl != nullptr) {
+        int n_drafting = 0;
+        for (size_t i = 0; i < dparams.size() && i < spec->copy_state.size(); ++i) {
+            auto & dp = dparams[i];
+            if (!dp.drafting) {
+                continue;
+            }
+            auto & cs = spec->copy_state[i];
+            cs.first_n = 0;
+            const int32_t want = dp.n_first_max > 0 && dp.prompt != nullptr ? std::min(cs.first_want(), dp.n_first_max) : 0;
+            if (want > 0) {
+                llama_tokens span = common_speculative_copy_first_propose(spec->copy, dp.prompt->data(),
+                        (int32_t) dp.prompt->size(), dp.id_last, want, dp.n_first_src, &cs.first_index);
+                if (!span.empty()) {
+                    *dp.result = std::move(span);
+                    if (dp.result_q) {
+                        dp.result_q->clear(); // id match (point mass) at every span position
+                    }
+                    dp.drafting = false;
+                    spec->impl_last[i] = spec->first_impl;
+                    cs.on_first_draft((int32_t) dp.result->size());
+                    continue;
+                }
+                cs.first_span = 0; // no match: the next run starts small
+            }
+            n_drafting++;
+        }
+        if (n_drafting == 0) {
+            return;
+        }
+    }
+
     std::vector<char> copy_seq; // sequences drafting in this call (copy mode only)
     if (spec->copy.tail > 0) {
         copy_seq.resize(dparams.size(), 0);
@@ -5797,6 +5880,20 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
 
+        // copy-first: a span round is not the drafter's; it feeds the span controller only. The stand-in drafter gets
+        // is_other = true like the rest: DSpark's adaptive depth controller must not score a span it did not draft
+        if (seq_id >= 0 && seq_id < (llama_seq_id) spec->copy_state.size() && spec->copy_state[seq_id].first_n > 0) {
+            spec->copy_state[seq_id].on_first_accept(n_accepted);
+            impl->accept(seq_id, n_accepted, true);
+            impl->n_call_accept++;
+            for (auto & impl_other : spec->impls) {
+                if (impl_other.get() != impl) {
+                    impl_other->accept(seq_id, n_accepted, true);
+                }
+            }
+            return;
+        }
+
         // (per-position counts keep the tail positions: they are the acceptance of the fused draft)
         if (impl->n_acc_tokens_per_pos.size() < n_accepted) {
             impl->n_acc_tokens_per_pos.resize(n_accepted, 0);
@@ -5911,6 +6008,11 @@ void common_speculative_print_stats(const common_speculative * spec) {
             LOG_INF("statistics copy tail: seq = %zu, #rounds = %" PRIu64 ", #gen tokens = %" PRIu64 ", #acc tokens = %" PRIu64
                     ", #block miss = %" PRIu64 ", #poor tails = %" PRIu64 ", #cooled rounds = %" PRIu64 "\n",
                     i, cs.n_rounds, cs.n_gen, cs.n_acc, cs.n_miss_blk, cs.n_poor, cs.n_cooled);
+        }
+        if (cs.n_first_rounds > 0) {
+            LOG_INF("statistics copy-first: seq = %zu, #rounds = %" PRIu64 ", #gen tokens = %" PRIu64 ", #acc tokens = %" PRIu64
+                    ", #full spans = %" PRIu64 ", #poor spans = %" PRIu64 "\n",
+                    i, cs.n_first_rounds, cs.n_first_gen, cs.n_first_acc, cs.n_first_full, cs.n_first_poor);
         }
     }
 
