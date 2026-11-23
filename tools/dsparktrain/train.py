@@ -12,6 +12,7 @@ Checkpoints: best by --select (default E_d mb on the sel split) -> OUT/best.pt; 
 usage: train.py --w0 W0 --drafter Q8_0-fold.gguf --bf16 BF16.gguf --out OUT [--train P:SEQ] [--sel P:SEQ] [--rep P:SEQ]
                 [--steps N] [--eval-only] [--init ckpt.pt] [--profile N]"""
 import argparse, json, math, os, random, sys, time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +63,7 @@ def slot_terms(l, S, rows, t, mb):
     return D.accept_terms(p, pid, q, qid, t, eog=S['eog'], want_mb=mb), p, pid
 
 
+CTX_SLICE = 8192   # context positions per slice (train)
 LONG_LEN = 16384   # sequences longer than this use the small chunk (train --chunk-long, eval 32)
 EVAL_CHUNK = int(os.environ.get('DSPARK_EVAL_CHUNK', '128'))   # anchors per eval chunk (32 for ~100K-token sequences)
 
@@ -185,21 +187,34 @@ def main():
     order2 = list(range(len(tr2))) if tr2 is not None else []
     random.shuffle(order2); oi2 = 0
     tstep = []
+
+    def pick_step():
+        nonlocal oi, oi2
+        picks = []
+        for _ in range(a.seqs_per_step):
+            if tr2 is not None and random.random() < a.frac2:
+                picks.append((tr2, order2[oi2 % len(order2)])); oi2 += 1
+                if oi2 % len(order2) == 0:
+                    random.shuffle(order2)
+            else:
+                picks.append((tr, order[oi % len(order)])); oi += 1
+                if oi % len(order) == 0:
+                    random.shuffle(order)
+        return picks
+
+    def load_cpu(picks):   # disk -> pinned host memory (features of ~100K-token sequences are ~1.8 GB each)
+        return [{k: (v.pin_memory() if torch.is_tensor(v) else v) for k, v in ds.seq(i, 'cpu').items()} for ds, i in picks]
+
+    pool = ThreadPoolExecutor(1); fut = pool.submit(load_cpu, pick_step())
     for step in range(1, (a.profile or a.steps) + 1):
         sync(dev); t0 = time.time()
         opt.zero_grad(set_to_none=True)
         W = ste_weights(P, fr)
         n_tot, lsum, esum, ksum = 0, 0.0, 0.0, 0.0
         batches = []
-        for _ in range(a.seqs_per_step):
-            if tr2 is not None and random.random() < a.frac2:
-                S = tr2.seq(order2[oi2 % len(order2)], dev); oi2 += 1
-                if oi2 % len(order2) == 0:
-                    random.shuffle(order2)
-            else:
-                S = tr.seq(order[oi % len(order)], dev); oi += 1
-                if oi % len(order) == 0:
-                    random.shuffle(order)
+        cpu_seqs = fut.result(); fut = pool.submit(load_cpu, pick_step())   # next step's sequences load while this one trains
+        for Sc in cpu_seqs:
+            S = {k: (v.to(dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in Sc.items()}
             an = D.anchors_of(S, a.walk)
             if an is None:
                 continue
@@ -212,9 +227,15 @@ def main():
         Wl = {k: v.detach().requires_grad_(v.requires_grad) for k, v in W.items()}
         for S, an in batches:
             amax = int(an.max())
-            kv, f_rnn = D.context_layers(Wl, S['feat'][:amax].float(), torch.arange(amax, device=dev))
-            ctx_out = [t for pair in kv for t in pair] + [f_rnn]
-            ctx_l = [t.detach().requires_grad_(True) for t in ctx_out]
+            # context K/V + f_rnn: computed without a graph (position-wise, in CTX_SLICE slices), used as gradient leaves by
+            # the chunks, then recomputed slice by slice WITH a graph and backpropagated with the leaves' gradients (exact;
+            # keeps ~100K-token sequences from holding the whole context graph at once)
+            with torch.no_grad():
+                parts = [D.context_layers(Wl, S['feat'][s0:min(s0 + CTX_SLICE, amax)].float(), torch.arange(s0, min(s0 + CTX_SLICE, amax), device=dev))
+                         for s0 in range(0, amax, CTX_SLICE)]
+            ctx_l = [torch.cat([pp[0][j][h] for pp in parts]).requires_grad_(True) for j in range(D.N_LAYER) for h in (0, 1)] \
+                + [torch.cat([pp[1] for pp in parts]).requires_grad_(True)]
+            del parts
             ctx = ([(ctx_l[2 * j], ctx_l[2 * j + 1]) for j in range(D.N_LAYER)], ctx_l[-1])
             ch = a.chunk if S['len'] <= LONG_LEN else a.chunk_long
             for i in range(0, an.shape[0], ch):
@@ -233,8 +254,13 @@ def main():
                 loss.backward()
                 lsum += float(loss.detach()) * n_all; esum += float(Ed.sum()); ksum += float(KL.sum()) if a.kl else 0.0
                 n_tot += sub.shape[0]
-            g = [(o, l.grad) for o, l in zip(ctx_out, ctx_l) if l.grad is not None]
-            torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
+            for s0 in range(0, amax, CTX_SLICE):
+                s1 = min(s0 + CTX_SLICE, amax)
+                kv, f_rnn = D.context_layers(Wl, S['feat'][s0:s1].float(), torch.arange(s0, s1, device=dev))
+                outs = [t for pair in kv for t in pair] + [f_rnn]
+                g = [(o, l.grad[s0:s1]) for o, l in zip(outs, ctx_l) if l.grad is not None]
+                torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
+            del ctx_l, ctx
         g = [(W[k], Wl[k].grad) for k in W if Wl[k].grad is not None and W[k].requires_grad]
         torch.autograd.backward([o for o, _ in g], [gg for _, gg in g])
         if step == 1:
@@ -257,6 +283,9 @@ def main():
     if a.profile:
         torch.save({k: v.detach().cpu() for k, v in P.items()}, os.path.join(a.out, 'last.pt'))
         emit(dict(profile_steps=len(tstep), mean_step_s=float(np.mean(tstep[1:] if len(tstep) > 1 else tstep))))
+        if sel is not None:   # one sel eval with the optimizer state allocated (memory check for the in-train evals)
+            r = evaluate(P, fr, sel, a.walk, a.eval_stride, a.max_eval_seq, tag='sel')
+            emit(dict(profile_eval='sel', **r, mem_gib=round(torch.cuda.max_memory_allocated() / 2**30, 2) if dev == 'cuda' else None))
     return 0
 
 

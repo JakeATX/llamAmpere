@@ -298,12 +298,14 @@ def block_forward(W, frozen, ctx_kv, anchors, anchor_tok, k0, dtype):
         Kc, Vc = ctx_kv[il]
         Kall = torch.cat([Kc.to(dtype), k.reshape(nA * BLOCK, N_HEAD_KV, HD)], 0)
         Vall = torch.cat([Vc.to(dtype), v.reshape(nA * BLOCK, N_HEAD_KV, HD)], 0)
-        qq = q.reshape(nA * BLOCK, N_HEAD, HD).transpose(0, 1)[None]          # [1, 24, Lq, HD]
-        kk = Kall.repeat_interleave(N_HEAD // N_HEAD_KV, 1).transpose(0, 1)[None]   # GQA: q head h uses kv head h // 3
-        vv = Vall.repeat_interleave(N_HEAD // N_HEAD_KV, 1).transpose(0, 1)[None]
-        o = F.scaled_dot_product_attention(qq, kk, vv, attn_mask=masks['swa' if il in SWA_LAYERS else 'full'],
-                                           scale=1.0 / math.sqrt(HD))
-        o = o[0].transpose(0, 1).reshape(nA, BLOCK, N_HEAD * HD)
+        # GQA without expanding K/V (q head h uses kv head h // G): the G query heads of a kv head are stacked along the
+        # query axis, so SDPA sees 8 heads over [G*Lq] queries and the unexpanded [Lk] keys (same math, no [24, Lk] copies)
+        G = N_HEAD // N_HEAD_KV; Lq = nA * BLOCK
+        qq = q.reshape(Lq, N_HEAD_KV, G, HD).permute(1, 2, 0, 3).reshape(1, N_HEAD_KV, G * Lq, HD)
+        kk = Kall.transpose(0, 1)[None]; vv = Vall.transpose(0, 1)[None]                     # [1, 8, Lk, HD]
+        m = masks['swa' if il in SWA_LAYERS else 'full'].repeat(1, 1, G, 1)                  # [1, 1, G*Lq, Lk]
+        o = F.scaled_dot_product_attention(qq, kk, vv, attn_mask=m, scale=1.0 / math.sqrt(HD))
+        o = o[0].reshape(N_HEAD_KV, G, Lq, HD).permute(2, 0, 1, 3).reshape(nA, BLOCK, N_HEAD * HD)
         x = x + mm(o, W[p + 'attn_output.weight'])
         h = rms(x, W[p + 'ffn_norm.weight'].to(dtype))
         g = mm(h, W[p + 'ffn_gate.weight'])

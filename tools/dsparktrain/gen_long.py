@@ -28,7 +28,11 @@ def main():
     base = f'http://127.0.0.1:{a.port}'
     done = set()
     try:
-        done = {json.loads(l)['id'] for l in open(a.out)}
+        for l in open(a.out):
+            try:
+                done.add(json.loads(l)['id'])
+            except json.JSONDecodeError:   # a cut-off last line (killed mid-write): that row is redone
+                pass
     except FileNotFoundError:
         pass
     fout = open(a.out, 'a')

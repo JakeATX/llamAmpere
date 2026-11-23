@@ -12,7 +12,7 @@
 #   profile : 3 train steps (memory / speed on 100K sequences)
 #   train   : mixed sampler (long with p=FRAC2, else short), select E_d mb on sel (32K + 100K bench samples)
 #   rep     : best vs shipped on rep100 / rep32 / rep3 ; export : Q8_0 fold gguf (453,522,464 B)
-# usage: run_long.sh [phase ...]   (default: check selrep lgen lseq dump base profile train rep export)
+# usage: run_long.sh [phase ...]   (default: check selrep dumpsel profile lgen lseq dump base train rep export)
 set -uo pipefail
 R=${R:-/root/dst}; T=$R/wt/tools/dsparktrain; D=$R/data; O=$R/out
 PY=${PY:-/mnt/data/inkflags/venv/bin/python}
@@ -28,7 +28,7 @@ done_or() { [ -e $R/L.$1.done ] && { log "skip $1"; return 0; }; return 1; }
 TRAINARGS="--w0 $R/w0 --drafter $DF --bf16 $DB"
 DUMPS="$R/bin/llama-dspark-dump -m $M -ngl 99 -fa on -t 8 -c 12288 -b 2048 -ub 512 $KVF"
 DUMPL="$R/bin/llama-dspark-dump -m $M -ngl 99 -fa on -t 8 -c 110592 $UBF $KVF"
-SPEC="--env LLAMA_DEEPCTX_LADDER=1 --reuse --timeout 3600"
+SPEC="--env LLAMA_DEEPCTX_LADDER=1 --timeout 3600"
 
 ph_check() {
   done_or check && return
@@ -39,6 +39,7 @@ ph_check() {
   ( cd $R/w0 && sha256sum -c SHA256SUMS ) >> $R/run.log 2>&1 || { log 'w0 checksum mismatch'; return 1; }
   for f in $M $DQ $DF $DB $D/long_docs.jsonl $D/short_train.seq $D/wiki.test.raw; do [ -s $f ] || { log "missing $f"; return 1; }; done
   df -h $R | tail -1 | tee -a $R/run.log
+  local free=$(df -BG --output=avail $R | tail -1 | tr -dc 0-9); (( free >= 110 )) || { log "only ${free} GB free, need >= 110"; return 1; }
   touch $R/L.check.done; log 'check ok'
 }
 
@@ -48,8 +49,9 @@ ph_selrep() {
   for row in "sel100 100000 110592 101,102" "sel32 32000 40960 101,102" "rep100 100000 110592 103" "rep32 32000 40960 103" "rep3 3000 16384 101,102"; do
     set -- $row; local c=$O/sr_$1
     [ -e $c/result.json ] && continue
+    local ru=""; [[ $1 == sel* ]] && ru=--reuse   # sel: one prefill per row; rep rows: fresh prefill per seed (honest server cal)
     $PY $T/spec_check.py --bin $R/bin --model $M --drafter $DF --out $c --seeds $4 --plen $2 --ctx $3 --npred 5120 --wiki $D/wiki.test.raw \
-        --port $((PORT + 2)) $SPEC --extra="$KVF $UBF" > $c.log 2>&1 || { log "selrep $1 failed: $(tail -2 $c.log | tr '\n' ' ')"; return 1; }
+        --port $((PORT + 2)) $SPEC $ru --extra="$KVF $UBF" > $c.log 2>&1 || { log "selrep $1 failed: $(tail -2 $c.log | tr '\n' ' ')"; return 1; }
     log "selrep $1 $(grep DONE $c.log | cut -c1-300)"
   done
   $PY - $O $D <<'PY' || { log 'selrep concat failed'; return 1; }
@@ -91,9 +93,18 @@ ph_lgen() {
 
 ph_lseq() { done_or lseq && return; $PY $T/mkseq.py $D/lgens.jsonl $D/lseq --max-len 110592 > $R/lseq.log 2>&1 && touch $R/L.lseq.done && log "lseq $(tr '\n' ' ' < $R/lseq.log)"; }
 
+ph_dumpsel() {   # sel first: the profile phase trains on it (2 x 100K + 2 x 32K real sequences) before lgen spends hours
+  done_or dumpsel && return
+  [ -e $D/sel.dump.done ] || { $DUMPL --ds-in $D/sel.seq --ds-out $D/sel --ds-dtype f32 > $R/dump_sel.log 2>&1 && touch $D/sel.dump.done; } \
+      || { log "dump sel failed: $(tail -2 $R/dump_sel.log | tr '\n' ' ')"; return 1; }
+  log "dump sel $(grep -E 'seqs,' $R/dump_sel.log | tail -1)"
+  dd if=$D/sel.feat of=/dev/null bs=16M count=64 iflag=direct 2>&1 | tail -1 | sed 's/^/COLD_READ /' | tee -a $R/run.log
+  touch $R/L.dumpsel.done
+}
+
 ph_dump() {
   done_or dump && return
-  for s in "ltrain $D/lseq/train.seq bf16 L" "strain $D/short_train.seq bf16 S" "sel $D/sel.seq f32 L" "rep100 $D/rep100.seq f32 L" "rep32 $D/rep32.seq f32 L" "rep3 $D/rep3.seq f32 S"; do
+  for s in "ltrain $D/lseq/train.seq bf16 L" "strain $D/short_train.seq bf16 S" "rep100 $D/rep100.seq f32 L" "rep32 $D/rep32.seq f32 L" "rep3 $D/rep3.seq f32 S"; do
     set -- $s; [ -e $D/$1.dump.done ] && continue
     local cmd=$DUMPL; [ $4 = S ] && cmd=$DUMPS
     $cmd --ds-in $2 --ds-out $D/$1 --ds-dtype $3 > $R/dump_$1.log 2>&1 || { log "dump $1 failed: $(tail -2 $R/dump_$1.log | tr '\n' ' ')"; return 1; }
@@ -109,7 +120,7 @@ ph_base() {
     $PY $T/train.py $TRAINARGS --out $O/base --eval-only --shipped-fold --rep $D/$r:$D/$r.seq > $R/base_$r.log 2>&1 || { log "base $r failed"; return 1; }
   done
   # cal: offline round-sim (shipped) vs the server's own tok/round on the same sequences (sel100 / sel32 / rep rows)
-  $PY - $O $R $CALTOL <<'PY' | tee -a $R/run.log
+  $PY - $O $R $CALTOL <<'PY' > $R/cal.txt || { log 'cal compare failed'; return 1; }
 import json, sys
 O, R, tol = sys.argv[1], sys.argv[2], float(sys.argv[3])
 def ev(f):
@@ -121,6 +132,8 @@ for r, f in (('rep100', 'base_rep100.log'), ('rep32', 'base_rep32.log'), ('rep3'
           f"srv_acc_pos {s['acc_per_pos']} BAD {int(abs(100 * (off / srv - 1)) > tol)}")
 e = ev(f'{R}/base_sel.log'); print('BASE sel E_mb', e['E_mb'], 'round_sim_mb', e['tok_round_sim_mb'], 'alpha_mb', e['alpha_mb'])
 PY
+  cat $R/cal.txt | tee -a $R/run.log
+  grep -q 'rep100 .*BAD 1' $R/cal.txt && { log "CAL_STOP: offline vs server differ > ${CALTOL}% at 100K on NQ"; return 1; }
   touch $R/L.base.done
 }
 
@@ -129,13 +142,14 @@ TARGS() { echo "$TRAINARGS --train $D/strain:$D/short_train.seq --train2 $D/ltra
 
 ph_profile() {
   done_or profile && return
-  $PY $T/train.py $(TARGS) --out $R/prof --profile 3 --frac2 1.0 > $R/profile.log 2>&1 || { log "profile failed: $(tail -3 $R/profile.log | tr '\n' ' ')"; return 1; }
+  $PY $T/train.py $(TARGS) --out $R/prof --profile 4 --train2 $D/sel:$D/sel.seq --frac2 1.0 > $R/profile.log 2>&1 || { log "profile failed: $(tail -3 $R/profile.log | tr '\n' ' ')"; return 1; }
   log "profile $(grep -E 'mem_gib|mean_step' $R/profile.log | tail -2 | tr '\n' ' ' | cut -c1-400)"
   touch $R/L.profile.done
 }
 
 ph_train() {
   done_or train && return
+  rm -f $R/run/log.jsonl $R/run/best.pt
   $PY $T/train.py $(TARGS) --out $R/run --steps $STEPS --eval-every $EVAL_EVERY --eval-stride $EVAL_STRIDE > $R/train.log 2>&1 \
       && touch $R/L.train.done && log "train ok $(grep saved $R/run/log.jsonl | tail -1)"
 }
@@ -158,7 +172,7 @@ ph_export() {
       && touch $R/L.export.done && log "export $(tail -1 $R/export.log | cut -c1-400)"
 }
 
-PHASES=${*:-check selrep lgen lseq dump base profile train rep export}
+PHASES=${*:-check selrep dumpsel profile lgen lseq dump base train rep export}
 for p in $PHASES; do
   log "PHASE $p"
   ph_$p || { log "PHASE $p FAILED"; exit 1; }
