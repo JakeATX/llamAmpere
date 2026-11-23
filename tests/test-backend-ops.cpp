@@ -23361,6 +23361,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 300, true));
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 16, 2));
     }
+    // [DSPINE4 VERIFY16] every width 9..16 in the production staging (tq6_0 ring + f16 sink), plain and fused rotation,
+    // and a turbo4 body: GGML_SJKVARN_COMPACT16=1 runs them on the compact16 tile, unset on the row split
+    for (int64_t n_q = 9; n_q <= 16; ++n_q) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                                                                 GGML_TYPE_F32, 4, 4, 1));
+    }
+    for (int64_t n_q : {9, 13, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+        // per-row body mask (row_mask) on the 4/4 body, and rot 2 (in-kernel rotation vs WHT -> FA -> WHT, bit-identical)
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, true, false, GGML_TYPE_TQ6_0, 128, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                                                                 GGML_TYPE_F32, 4, 4, 2));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12, 16, 4, 2, 200)); // GQA 4, 12 rows
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12,  4, 4, 2, 200)); // GQA 1, 12 rows
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 16, 4,  2,  200)); // GQA 4
@@ -24862,7 +24876,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         // AIT5_U) and the Q6_K / Q8_0 curve (head / shortlist) at 4..16 rows
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "dsw16") {
             for (int64_t ng : { 775, 60 }) {
-                for (int64_t n_q : { 1, 4, 6, 7, 8, 9, 10, 12, 16 }) {
+                for (int64_t n_q : { 1, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }) {
                     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, ng, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
                 }
             }

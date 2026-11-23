@@ -990,7 +990,7 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl(ggml_backend_cuda_cont
     static const int stream_max = getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") != nullptr
                                 ? atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8;
     const int n_q = dst->src[0]->ne[1];
-    if (n_q <= stream_max) {
+    if (n_q <= stream_max || n_q > 8) { // [DSPINE4 VERIFY16] 9..16 rows: only via ggml_cuda_flash_attn_ext_sj_kvarn_compact16_ok
         ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ctx, dst);
         return;
     }
