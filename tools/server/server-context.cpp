@@ -6837,7 +6837,7 @@ private:
                             // (upstream n_swa_reuse) a recurrent state holds one position only: with one (Inkling is
                             // hybrid iSWA + recurrent) the live state is usable only at its own end, so the SWA slack
                             // must not apply. With it, a warm turn that extends the cache by a token looked for a
-                            // checkpoint ending > n_swa before its end and fell back to an old grid one (MAYAMU 11-22:
+                            // checkpoint ending > n_swa before its end and fell back to an old grid one (11-22 gate:
                             // 1,684 / 8-48K tokens re-read). LLAMA_SERVER_REUSE_SWA_HYBRID=1 = the old rule.
                             static const bool reuse_swa_hybrid = [] {
                                 const char * e = getenv("LLAMA_SERVER_REUSE_SWA_HYBRID");
