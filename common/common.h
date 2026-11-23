@@ -612,7 +612,7 @@ struct common_moe_cache_params {
 
 struct common_params {
     std::string card_preset;
-    std::string card_drafter = "auto"; // fork (INKSMALL2): *ink presets: auto (12ink on, 8ink/10ink off), on, off
+    std::string card_drafter = "auto"; // fork (INKSMALL2): *ink presets: auto (8/10/12ink off, 24ink on), on, off
     std::string card_preset_flags;
     bool card_preset_kv_default = true;
     bool card_preset_ctx_default = false;

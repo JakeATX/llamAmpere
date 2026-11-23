@@ -1146,8 +1146,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE;
         // fork (INKSMALL2): the *ink presets keep the drafter only where it measured faster: its ~1.4 GB of VRAM comes out
         // of the expert cache, which costs more than drafting gains on 8/10 GB (see common/preset.cpp)
-        const bool ink_card = string_ends_with(params.card_preset, "ink") && params.card_preset != "24ink"; // 24ink: full GPU, drafter kept
-        if (ink_card && params.card_drafter != "on") {
+        // 24ink keeps the model on the GPU, so its drafter stays on unless --card-drafter off
+        const bool ink24 = params.card_preset == "24ink";
+        const bool ink_card = string_ends_with(params.card_preset, "ink");
+        if (ink_card && (ink24 ? params.card_drafter == "off" : params.card_drafter != "on")) {
             if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
                 LOG_INF("card preset %s: drafter off (%s; --card-drafter on forces it)\n", params.card_preset.c_str(),
                         params.card_drafter == "off" ? "--card-drafter off" : "it measured slower at 100K depth on 8/10/12 GB: its VRAM comes out of the expert cache");
@@ -1156,7 +1158,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 if (!explicit_or_env("--spec-type")) {
                     params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
                 }
-            } else if (params.speculative.has_dft()) {
+            } else if (params.speculative.has_dft() && !ink24) {
                 LOG_WRN("card preset %s: --model-draft given; on this card size the drafter measured slower (its VRAM comes "
                         "out of the expert cache), kept because you asked for it\n", params.card_preset.c_str());
             }
@@ -1241,7 +1243,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
 
     if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {
-        throw std::invalid_argument("small-card presets require --parallel 1; multi-user support is planned");
+        throw std::invalid_argument(params.card_preset == "24ink" ? "24ink is one slot (--parallel 1); for several users drop the preset and pass -np N --kv-unified -b 1024 -ub 1024"
+                                                                   : "small-card presets require --parallel 1; multi-user support is planned");
     }
 
     if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON && !params.no_extra_bufts) {
@@ -5956,8 +5959,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--card-drafter"}, "auto|on|off",
-        "8/10/12ink card presets: speculative DSpark drafter (default: auto = off: at 100K depth its ~1.4 GB of VRAM costs more "
-        "expert cache than drafting gains on 8/10/12 GB; on = use it, e.g. for short-context 12 GB use, where it is +10-12%)",
+        "*ink card presets: speculative DSpark drafter (default: auto = off: at 100K depth its ~1.4 GB of VRAM costs more "
+        "expert cache than drafting gains on 8/10/12 GB; on = use it, e.g. for short-context 12 GB use, where it is +10-12%; "
+        "24ink: auto = on, off drops it)",
         [](common_params & params, const std::string & value) {
             if (value != "auto" && value != "on" && value != "off") {
                 throw std::invalid_argument("expected auto, on or off");
