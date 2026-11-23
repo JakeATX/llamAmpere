@@ -9622,13 +9622,16 @@ static int64_t llama_inkattn_min_kv() {
 }
 
 // INKKV row chunks (build_attn_rel_base): rows per stream per chunk so that one chunk's F32 per-head bias
-// [n_kv, rows, n_head, n_stream] stays within LLAMA_INKKV_BIAS_MIB (default 512; 0 = no chunks); a multiple of 64 rows
+// [n_kv, rows, n_head, n_stream] stays within LLAMA_INKKV_BIAS_MIB (0 = no chunks); a multiple of 64 rows
+// (default 1024 with one sequence: rc9 32K prefill at 512 was -3.5% vs rc8, 1024 +2.8%; 512 with several sequences,
+// whose prompt compute buffer sets the multi-user fit)
 // when >= 64 (the FA tiles), never below 16
-static int64_t llama_inkkv_bias_rows(int64_t n_kv, int64_t n_head, int64_t n_stream, int64_t T_stream) {
-    static const int64_t mib = [] {
+static int64_t llama_inkkv_bias_rows(int64_t n_kv, int64_t n_head, int64_t n_stream, int64_t T_stream, uint32_t n_seq_max) {
+    static const int64_t mib_env = [] {
         const char * e = getenv("LLAMA_INKKV_BIAS_MIB");
-        return e && *e ? (int64_t) atoll(e) : (int64_t) 512;
+        return e && *e ? (int64_t) atoll(e) : (int64_t) -1;
     }();
+    const int64_t mib = mib_env >= 0 ? mib_env : (n_seq_max > 1 ? 512 : 1024);
     if (mib <= 0) {
         return T_stream;
     }
@@ -9869,7 +9872,7 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
         const auto & am  = (is_swa || split) ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
         const int64_t ns = am.raw->ne[3];
         const int64_t Ts = n_tokens/ns;
-        const int64_t tc = llama_inkkv_bias_rows(am.raw->ne[0], n_head, ns, Ts);
+        const int64_t tc = llama_inkkv_bias_rows(am.raw->ne[0], n_head, ns, Ts, cparams.n_seq_max);
         if (tc < Ts && am.rows == nullptr && am.raw->type != GGML_TYPE_I32 && q_cur->ne[3] == 1) {
             return build_attn_rel_chunked(inp, q_cur, k_cur, v_cur, table, sinks, kq_scale, il, tc);
         }
