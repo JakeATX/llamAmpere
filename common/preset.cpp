@@ -117,9 +117,12 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // cache auto-sized (llama-context: free - reserve; --moe-cache-mib N overrides), SJ-KVaRN 4/4, op offload off,
         // ub 512 with the deep-ctx ladder, moe cache batch 512 (llama-context default without op offload). The ub 512 pick
         // came from rows measured with the prompt experts on the CPU (--op-offload 0: prefill 41-190 tok/s, GPU idle).
-        // INKSTREAM: -ub 4096 is now the prompt ceiling. Boot, the fit and the cache auto-size still use 512 rows; a
-        // prompt call lends the cache, streams each visit's experts through two VRAM slots and runs up to 4096-row
-        // ubatches (the ladder halves them when VRAM is short), then the cache is refilled before decode.
+        // INKSTREAM: -ub 1024 is the prompt ceiling. Boot, the fit and the cache auto-size still use 512 rows; a
+        // prompt call lends the cache, streams each visit's experts through two VRAM slots and runs up to 1024-row
+        // ubatches (the ladder halves them when VRAM is short), then the cache is refilled before decode. 1024, not
+        // 4096: the SWA KV and attention scratch grow with n_swa + n_ubatch, so 4096 took VRAM from the cache and the
+        // ladder could not reach it on 8/10 GB (INKSTREAM 11-23, S34d x16: 8ink 7,223 prefill 620-719, decode 30.8/30.0
+        // 3K/100K, cache 2,024 vs 1,746 MiB at 4096; 10ink 9,271 prefill 608, decode 48.8, cache 3,561 vs 2,872).
         // LLAMA_INK_STREAM=0 restores 512-row prompt ubatches through the cache.
         // ctx: Jake's ctx floor: 8 GB >= 200K, 10/12 GB >= 250K; the expert cache is sized from what is left after
         // KV + compute at this ctx (speed varies, ctx does not). 8ink 212,992, 10ink/12ink 262,144 (headless the same).
@@ -131,9 +134,9 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // arg.cpp when on, off with a warning if the file is missing.
         // Evidence: lanes/INKSMALL.md + INKSMALL2.md (S34d, RTX 3090 capped at 7,168/9,216/11,264 MiB).
         common_card_preset ink8 {
-            "8ink", "2026-11-23.3", "best known/recheck before ship", "", {
+            "8ink", "2026-11-23.4", "best known/recheck before ship", "", {
                 {"--ctx-size", "212992"}, {"--parallel", "1"}, {"--batch-size", "4096"},
-                {"--ubatch-size", "4096"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
+                {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cpu-moe", "1"}, {"--op-offload", "0"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
                 {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
