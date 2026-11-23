@@ -13,6 +13,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-ink-stream.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2335,6 +2336,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses (params.hadamard_inverses),
     moe_cache        (params.moe_cache),
+    moe_stream       (params.moe_stream),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2642,7 +2644,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+        ggml_mul_mat_id(ctx0, !cached ? w : moe_stream_il >= 0 ? moe_stream->get_experts(w, moe_stream_il) : moe_cache->get_experts(w), cur_mm, slots);
     if (moe_route_skip && !ggml_exl3_bits(w->type) && ggml_nelements(moe_route_skip) == res->ne[1]*res->ne[2]) {
         res->src[3] = moe_route_skip; // a backend that ignores it computes those routes (their weight is zero)
     }
@@ -3601,7 +3603,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         std::none_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w != nullptr && hdmd != nullptr && hdmd->rot.count(w) > 0; }) &&
         // fork: the hot/cold bank split, the onechain bank fill and the fork Hadamard table keep the cached path only
         (!hadamard_rotations || hadamard_rotations->empty()) && moe_onechain_bank == nullptr && moe_route_skip == nullptr;
-    const llm_graph_moe_cache_slots cache = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, can_cpu_share, il);
+    // fork (INKSTREAM): a streamed prompt reads every expert of this visit from its VRAM slot
+    ggml_tensor * stream_slots = build_moe_stream_slots(selected_experts, il);
+    for (ggml_tensor * w : exps) {
+        if (stream_slots && w && (moe_stream->get_experts(w, il) == nullptr || !loras->empty())) {
+            stream_slots = nullptr; // not one of its experts: the normal path
+        }
+    }
+    moe_stream_il = stream_slots ? il : -1;
+    const llm_graph_moe_cache_slots cache = stream_slots ? llm_graph_moe_cache_slots{ stream_slots, nullptr } :
+        build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, can_cpu_share, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     ggml_tensor * const moe_in = cur;
@@ -3800,6 +3811,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots, true);
+    moe_stream_il = -1;
     if (cache.cpu_ids != nullptr) {
         // the cached experts and the misses computed from the host experts, each reads the others as zero
         // the cached experts come first in the graph, so that they are computed while the misses are
@@ -3891,6 +3903,27 @@ ggml_tensor * llm_graph_context::build_hadamard_inverse(ggml_tensor * table, ggm
         }
     }
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_moe_stream_slots(ggml_tensor * selected_experts, int il) const {
+    ggml_tensor * map = moe_stream ? moe_stream->get_map(il) : nullptr;
+    if (map == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * ids = selected_experts;
+    if (!ggml_is_contiguous(ids)) {
+        ids = ggml_cont(ctx0, ids);
+    }
+    ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+    // the map is a host weight: the scheduler splits here and its copy callback makes the compute stream wait for the slot
+    ggml_tensor * slots = ggml_get_rows(ctx0, map, ids); // [1, n_expert_used*n_tokens], equal to ids
+    if (!ggml_backend_supports_op(moe_stream->backend(), slots)) {
+        return nullptr;
+    }
+    ggml_backend_sched_set_tensor_backend(sched, slots, moe_stream->backend());
+    cb(slots, "ffn_moe_stream_slots", il);
+    ggml_build_forward_expand(gf, slots);
+    return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]);
 }
 
 llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(

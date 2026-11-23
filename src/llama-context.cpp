@@ -32,6 +32,7 @@
 #include "llama-draft-vocab-compact.h"
 #include "llama-mtp-chain-sample.h"
 #include "llama-moe-cache.h"
+#include "llama-ink-stream.h"
 #include "llama-b1.h"
 #include "llama-ple-prefetch.h"
 #include "llama-ext.h"
@@ -1474,6 +1475,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         // LLAMA_MOE_CACHE_AUTO_RESERVE_MIB (common sets 1400 when a draft model is loaded). Calibrated on Inkling 2 Mini
         // S34d, SJ-KVaRN 4/4, --no-op-offload, ub 512, RTX 3090 capped at 7,168/9,216/11,264 MiB (INKSMALL2).
         // One GPU only; the main context only. Kill switch: LLAMA_MOE_CACHE_AUTO=0 (cache stays off, as before).
+        // fork (INKSTREAM): Inkling with host experts boots at 512 rows whatever -ub is (see the streamer below)
+        ink_rows_cap = (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) && !cparams.op_offload &&
+                dynamic_ubatch && cparams.n_ubatch > 512 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+                cparams.causal_attn && !cparams.embeddings && !cparams.training;
         if (cparams.moe_cache_auto && cparams.moe_cache_size == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc() &&
                 model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
             const char * auto_env = getenv("LLAMA_MOE_CACHE_AUTO");
@@ -1492,7 +1497,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 const char * extra_env = getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB");
                 const double extra   = extra_env ? std::max(0.0, atof(extra_env)) : 0.0;
                 const double reserve = 900.0 + 256.0 + (double) cparams.n_ctx * 2.0 / 1024.0 +
-                    std::max(0.0, (double) cparams.n_ubatch - 512.0) * 1.9 + extra;
+                    std::max(0.0, (double) (ink_rows_cap ? 512u : cparams.n_ubatch) - 512.0) * 1.9 + extra;
                 const double free_mib = (double) free / (1024.0 * 1024.0);
                 const double want_mib = std::min(free_mib - reserve, (double) host_bytes / (1024.0 * 1024.0) + 64.0);
                 if (want_mib >= 256.0) {
@@ -1613,6 +1618,30 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+        }
+        // fork (INKSTREAM): prompt ubatches above 512 rows stream the host experts through two VRAM slots, funded by
+        // lending the MoE cache. Boot (and the fit's dry run) still reserve 512 rows, so the fit and the cache size
+        // are those of -ub 512; the prompt ladder grows the scratch while the cache is lent. LLAMA_INK_STREAM=0 = off.
+        ink_rows_cap = ink_rows_cap && !kv_stream_phase_arena.configured;
+        if (ink_rows_cap) {
+            if (sched_reserve_tokens == 0) {
+                sched_reserve_tokens = 512;
+            }
+            // without the streamer, prompt ubatches stay at 512 rows (the MoE cache batch cap), as with -ub 512
+            if (llama_ink_stream::wanted(model) && !model.no_alloc()) {
+                for (ggml_backend_t backend : backend_ptrs) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        ink_stream = std::make_unique<llama_ink_stream>(model, backend);
+                        break;
+                    }
+                }
+                if (ink_stream && !ink_stream->ok()) {
+                    ink_stream.reset();
+                }
+                LLAMA_LOG_WARN("%s: [INKSTREAM] prompt expert streamer %s (boot scratch %u rows, prompt ceiling %u)\n", __func__,
+                        ink_stream ? "on" : "unavailable", sched_reserve_tokens, cparams.n_ubatch);
+            }
         }
 
         sched_reserve();
@@ -1746,6 +1775,10 @@ void llama_context::ple_hint_add(const llama_token * window, int32_t n_window) {
 }
 
 llama_context::~llama_context() {
+    if (ink_stream) {
+        ink_stream->disarm(); // its copy stream and events go before the backends
+        ink_stream.reset();
+    }
     if (d1) {
         LLAMA_LOG_INFO("%s\n", d1->summary().c_str()); // [D1] exit counters (gate 8.0(d))
     }
@@ -3782,6 +3815,12 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
 void llama_context::set_decode_phase(enum llama_decode_phase phase) {
     if (!pp_warm_async && !prompt_warm_join()) {
         throw std::runtime_error("expert cache refill failed");
+    }
+    if (phase == LLAMA_DECODE_PHASE_GENERATION && ink_stream && ink_stream->armed()) {
+        // fork (INKSTREAM): back to the 512-row scratch and the refilled cache before the first decode step
+        if (!prompt_buffers_resize(1, nullptr, LLAMA_DECODE_PHASE_GENERATION)) {
+            throw std::runtime_error("failed to return the streamed prompt scratch");
+        }
     }
     if (phase == LLAMA_DECODE_PHASE_GENERATION) {
         const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
@@ -6057,6 +6096,50 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     for (llama_seq_id s = 0; s < (llama_seq_id) n_seq_max() && alone; ++s) {
         alone = s == seq || memory->seq_pos_max(s) < 0;
     }
+    // fork (INKSTREAM): a prompt call of one sequence above 512 rows lends the MoE cache and streams the experts;
+    // a writing-sized call (<= 32 rows) or the generation phase returns the scratch and refills the cache below.
+    bool ink_refill = false;
+    if (ink_stream && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        const bool stream_call = alone && n_tokens > 512 && phase != LLAMA_DECODE_PHASE_GENERATION;
+        if (stream_call && !ink_stream->armed()) {
+            ink_stream_take();
+        } else if (ink_stream->armed() && !stream_call && (n_tokens <= 32 || phase == LLAMA_DECODE_PHASE_GENERATION)) {
+            ink_refill = ink_stream_release(n_tokens == 0 ? "scratch return" : "writing call");
+        }
+    }
+    const bool ink_armed = ink_stream && ink_stream->armed();
+    // refill the hot experts once the prompt scratch is back to its boot size
+    auto ink_cache_refill = [&]() {
+        if (!ink_refill || !moe_cache) {
+            return true;
+        }
+        const int64_t t0 = ggml_time_us();
+        for (ggml_backend_t backend : backend_ptrs) {
+            auto dev = ggml_backend_get_device(backend);
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            using trim_fn  = size_t (*)(ggml_backend_t);
+            using reset_fn = bool (*)(ggml_backend_t);
+            auto reg   = ggml_backend_dev_backend_reg(dev);
+            auto trim  = (trim_fn)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pool_trim");
+            auto reset = (reset_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_reset");
+            // the temporary pool grew with the prompt ubatches: give it back before the banks are allocated
+            if (trim && reset && reset(backend)) {
+                trim(backend);
+            }
+        }
+        for (auto & res : gf_res_prev) {
+            res.reset();
+        }
+        gf_res_prev_active = nullptr;
+        if (!moe_cache->resume()) {
+            LLAMA_LOG_ERROR("%s: [INKSTREAM] no VRAM to refill the MoE cache; decode runs its experts on the host\n", __func__);
+            return true;
+        }
+        LLAMA_LOG_WARN("%s: [INKSTREAM] MoE cache refilled in %.1f ms\n", __func__, (ggml_time_us() - t0)/1000.0);
+        return true;
+    };
     // fork: n_tokens contains only the incoming rows after prompt-cache reuse.
     uint32_t rows = 512;
     // fork VRAMFIT: writing-phase scratch is 16 rows instead of 512 (LLAMA_DECODE_SCRATCH_ROWS=N, 1..512;
@@ -6156,6 +6239,15 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         rows = std::min(cparams.n_ubatch, std::max(GGML_PAD(n_tokens, 512u), sched_reserve_tokens));
     }
     rows = std::min(rows, cparams.n_ubatch);
+    if (ink_rows_cap && !ink_armed) {
+        rows = std::min(rows, 512u);
+    }
+    if (ink_armed && n_tokens > 32) {
+        // fork (INKSTREAM): each ubatch streams every visit's experts once, so the larger the ubatch the fewer bytes
+        // per token. Rounded up to 512 and never below the current reserve (a batch tail keeps the scratch); the
+        // dynamic ceiling below still gives rows back when the card runs short.
+        rows = std::min(cparams.n_ubatch, std::max(GGML_PAD(n_tokens, 512u), sched_reserve_tokens));
+    }
     // fork: packed prefill grows single-layer graphs, not a full-model MoE graph.
     const char * packed = getenv("LLAMA_B1_FFN");
     if (alone && n_tokens >= 16384 && packed && packed[0] == '1' &&
@@ -6251,7 +6343,10 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     }
     const bool trim_packed = n_tokens == 0 && (b1_ffn_scratch_active || b1_layer_scratch_active);
     if (rows == sched_reserve_tokens && !trim_packed && !sched_need_reserve) {
-        return true;
+        if (ink_armed) {
+            ink_stream_tokens += n_tokens;
+        }
+        return ink_cache_refill();
     }
     synchronize();
     for (ggml_backend_t backend : backend_ptrs) {
@@ -6301,6 +6396,45 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     }
     LLAMA_LOG_INFO("%s: turn scratch %u -> %u rows, %u uncached tokens, %s, %s\n", __func__, previous, rows,
             n_tokens, cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? "target" : "draft", alone ? "alone" : "shared slots");
+    if (ink_armed) {
+        ink_stream_tokens += n_tokens;
+        if (rows != previous) {
+            LLAMA_LOG_WARN("%s: [INKSTREAM] prompt ubatch %u rows (was %u)\n", __func__, rows, previous);
+        }
+        ink_stream_rows_max = std::max(ink_stream_rows_max, rows);
+    }
+    return ink_cache_refill();
+}
+
+bool llama_context::ink_stream_take() {
+    synchronize();
+    const size_t lent = moe_cache ? moe_cache->suspend() : 0;
+    if (!ink_stream->arm()) {
+        if (moe_cache && !moe_cache->resume()) {
+            LLAMA_LOG_ERROR("%s: [INKSTREAM] cannot refill the MoE cache\n", __func__);
+        }
+        LLAMA_LOG_WARN("%s: [INKSTREAM] streamer not armed, this prompt keeps the normal path\n", __func__);
+        return false;
+    }
+    sched_need_reserve = true; // the graph reads the slots now
+    ink_stream_tokens   = 0;
+    ink_stream_rows_max = 0;
+    ink_stream_t0_us    = ggml_time_us();
+    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt: MoE cache lent (%.0f MiB), 2 expert slots of %.1f MiB armed\n", __func__,
+            lent/1048576.0, ink_stream->slot_bytes()/1048576.0);
+    return true;
+}
+
+bool llama_context::ink_stream_release(const char * why) {
+    synchronize();
+    const llama_ink_stream_stats st = ink_stream->take_stats();
+    ink_stream->disarm();
+    sched_need_reserve = true; // the graph reads the MoE cache again
+    const double t = (ggml_time_us() - ink_stream_t0_us)/1e6;
+    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt done (%s): %llu tokens in %.2f s (%.1f tok/s), ubatch up to %u rows, "
+            "%llu visit uploads, %.2f GiB streamed, %.1f ms host wait\n", __func__, why,
+            (unsigned long long) ink_stream_tokens, t, t > 0 ? ink_stream_tokens/t : 0.0, ink_stream_rows_max,
+            (unsigned long long) st.uploads, st.bytes_h2d/1073741824.0, st.t_wait_us/1000.0);
     return true;
 }
 
@@ -9049,6 +9183,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.res         =*/ res,
     };
     p.ple_pf = ple_pf.get();
+    p.moe_stream = ink_stream && ink_stream->armed() ? ink_stream.get() : nullptr;
     p.mtp_tok_row = mtp_pipe.active;
     p.moe_onepath_live = ggml_moe_bank_onepath_live();
     if (b1_cur.active) {
@@ -9159,6 +9294,11 @@ bool llama_context::sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_ten
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // fork (INKSTREAM): the visit maps of the prompt expert streamer
+    if (lctx->ink_stream && lctx->ink_stream->copy(backend, src, dst)) {
+        return true;
+    }
 
     // fork: pack arena expert planes without copying the intervening roles.
     const size_t expert_bytes = src->nb[1] * src->ne[1];

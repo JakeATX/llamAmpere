@@ -40,6 +40,13 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // fork (INKSTREAM): free the device banks for a prompt that streams its experts (returns the bytes freed); the slot
+    // maps and the LRU stay, and no graph may use the cache until resume(). resume() allocates the banks again and
+    // uploads the experts the slots held (same experts in the same slots). false: no VRAM, still suspended.
+    size_t suspend();
+    bool   resume();
+    bool   suspended() const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

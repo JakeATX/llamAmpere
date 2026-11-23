@@ -23,6 +23,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_ink_stream;
 class llama_b1;
 class llama_ple_prefetch;
 struct llama_ple_hinter;
@@ -663,6 +664,16 @@ private:
     bool sched_op_offload = false;
     bool prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch,
             enum llama_decode_phase phase = LLAMA_DECODE_PHASE_UNKNOWN);
+
+    // fork (INKSTREAM): prompt expert streamer (see llama-ink-stream.h). take: suspend the MoE cache and arm the
+    // streamer for a prompt call; release: disarm, shrink the prompt scratch and refill the cache (before decode).
+    std::unique_ptr<llama_ink_stream> ink_stream;
+    bool     ink_stream_take();
+    bool     ink_stream_release(const char * why);
+    uint64_t ink_stream_tokens = 0;  // prompt tokens streamed since the last take
+    int64_t  ink_stream_t0_us  = 0;
+    uint32_t ink_stream_rows_max = 0; // largest ubatch run while armed
+    bool     ink_rows_cap = false;    // Inkling with host experts: prompt rows stay at 512 unless the streamer is armed
     bool dynamic_ubatch = false;
     uint32_t dynamic_ubatch_rows = 0;
     int64_t dynamic_ubatch_pp_check_us = 0;

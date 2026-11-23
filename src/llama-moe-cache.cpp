@@ -433,6 +433,8 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
+    bool is_suspended = false; // fork (INKSTREAM): banks freed for a streamed prompt
+
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
@@ -764,7 +766,7 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const {
-        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (is_suspended || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
         const layer & l = layers[il];
@@ -798,11 +800,17 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * get_experts(const ggml_tensor * w) const {
+        if (is_suspended) {
+            return nullptr;
+        }
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+        if (is_suspended) {
+            return 0;
+        }
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -935,6 +943,87 @@ struct llama_moe_cache::impl {
         return true;
     }
 
+    size_t suspend() {
+        if (is_suspended) {
+            return 0;
+        }
+        size_t freed = 0;
+        for (device & d : devices) {
+            if (!d.buf || !d.ctx) {
+                continue;
+            }
+            freed += ggml_backend_buffer_get_size(d.buf.get());
+            d.buf.reset();
+            for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t; t = ggml_get_next_tensor(d.ctx.get(), t)) {
+                t->data   = nullptr;
+                t->buffer = nullptr;
+            }
+        }
+        is_suspended = true;
+        return freed;
+    }
+
+    bool resume() {
+        if (!is_suspended) {
+            return true;
+        }
+        for (device & d : devices) {
+            if (d.buf || !d.ctx) {
+                continue;
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), d.buft);
+            if (!buf) {
+                // free what was allocated so far, the context stays suspended
+                for (device & o : devices) {
+                    if (o.buf && o.ctx) {
+                        o.buf.reset();
+                        for (ggml_tensor * t = ggml_get_first_tensor(o.ctx.get()); t; t = ggml_get_next_tensor(o.ctx.get(), t)) {
+                            t->data   = nullptr;
+                            t->buffer = nullptr;
+                        }
+                    }
+                }
+                return false;
+            }
+            d.buf.reset(buf);
+            ggml_backend_buffer_clear(buf, 0);
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        // the experts the slots held, consecutive slots of consecutive experts of one layer in one upload
+        for (group & g : groups) {
+            const moe_cache_lru & lru = g.lru;
+            for (int32_t s = 0; s < g.n_slots; ) {
+                const int32_t key = lru.key_of[s];
+                if (key < 0) {
+                    s++;
+                    continue;
+                }
+                const int32_t il = lru.key_layer(key);
+                const int32_t e  = lru.key_expert(key);
+                int32_t n = 1;
+                while (s + n < g.n_slots && lru.key_of[s + n] == key + n && lru.key_layer(key + n) == il) {
+                    n++;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w    = l.experts[ip];
+                    ggml_tensor       * bank = g.banks[ip];
+                    const size_t expert_size = bank->nb[2];
+                    if (w->nb[2] == expert_size) {
+                        ggml_backend_tensor_set(bank, (const uint8_t *) w->data + e*w->nb[2], s*expert_size, n*expert_size);
+                    } else {
+                        for (int32_t k = 0; k < n; ++k) {
+                            ggml_backend_tensor_set(bank, (const uint8_t *) w->data + (e + k)*w->nb[2], (s + k)*expert_size, expert_size);
+                        }
+                    }
+                }
+                s += n;
+            }
+        }
+        is_suspended = false;
+        return true;
+    }
+
     void log_stats() const {
         auto log = [](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
@@ -980,6 +1069,18 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+size_t llama_moe_cache::suspend() {
+    return pimpl->suspend();
+}
+
+bool llama_moe_cache::resume() {
+    return pimpl->resume();
+}
+
+bool llama_moe_cache::suspended() const {
+    return pimpl->is_suspended;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

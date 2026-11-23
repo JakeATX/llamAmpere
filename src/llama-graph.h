@@ -45,6 +45,7 @@ struct llama_hadamard;
 struct llama_lsa_idx_slot;
 
 class llama_moe_cache;
+class llama_ink_stream;
 class llama_ple_prefetch;
 
 struct llama_memory_context_i;
@@ -1160,6 +1161,7 @@ struct llm_graph_params {
 
     // [PLEPF] the context's PLE page prefetch (null when off); set after construction
     llama_ple_prefetch * ple_pf = nullptr;
+    const llama_ink_stream * moe_stream = nullptr; // fork (INKSTREAM): armed prompt expert streamer, or nullptr
 
     // [RTPORT] 1-row MTP step whose token embedding row is a device input (LLAMA_MTP_PIPELINE); set after construction
     bool mtp_tok_row = false;
@@ -1250,6 +1252,10 @@ struct llm_graph_params {
         }
 
         if (moe_onepath_live != other.moe_onepath_live) {
+            return false;
+        }
+
+        if (moe_stream != other.moe_stream) {
             return false;
         }
 
@@ -1451,6 +1457,8 @@ struct llm_graph_context {
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
     const llama_moe_cache        * moe_cache;
+    const llama_ink_stream       * moe_stream = nullptr;
+    mutable int                    moe_stream_il = -1; // visit whose experts build_lora_mm_id reads from the streamer
 
     const llama_prec_policy * prec_policy;
 
@@ -1717,6 +1725,9 @@ struct llm_graph_context {
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     // with cpu_part, also the misses computed from the host experts, if the cache leaves any to the CPU
+    // fork (INKSTREAM): slots of the streamed experts of visit il (an identity lookup that hooks the copy), or nullptr
+    ggml_tensor * build_moe_stream_slots(ggml_tensor * selected_experts, int il) const;
+
     llm_graph_moe_cache_slots build_moe_cache_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
