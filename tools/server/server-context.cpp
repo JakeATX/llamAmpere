@@ -8458,7 +8458,13 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        bool spec_processed_early = false;
+        bool spec_early_ok        = true;
         {
+            static const int dspine_pipe_mode = [] {
+                const char * e = getenv("LLAMA_DSPINE_PIPE");
+                return e ? atoi(e) : 0;
+            }();
             const int64_t t_decode_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 // #217 trunk keep is lossy, so it may run only when every row is a sampled
@@ -8487,6 +8493,12 @@ private:
                 if (ovl_win) {
                     llama_split_overlap_set_window(ctx_tgt, 0);
                     n_split_ovl_rounds++;
+                }
+                if (ret == 0 && dspine_pipe_mode == 1 && spec && has_output && !ovl_win &&
+                        batch_phase == LLAMA_DECODE_PHASE_GENERATION && !ckpt_armed && !handoff_on &&
+                        common_speculative_can_pipe_process(spec.get(), batch.view)) {
+                    spec_early_ok        = common_speculative_process(spec.get(), batch.view);
+                    spec_processed_early = true;
                 }
                 if (ret == 0 && has_output && !ovl_win) {
                     // a windowed verify is waited per window by the row reads (llama_get_logits_ith)
@@ -8688,13 +8700,15 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                const int32_t from = std::max(spec_processed, handoff.done);
-                ok = (spec_ranges || handoff_on)
-                    ? common_speculative_process_range(spec.get(), batch.view, from, batch.view.size() - from)
-                    : common_speculative_process(spec.get(), batch.view);
-            });
+            bool ok = spec_early_ok;
+            if (!spec_processed_early) {
+                queue_tasks.yield_to_queue([&]() {
+                    const int32_t from = std::max(spec_processed, handoff.done);
+                    ok = (spec_ranges || handoff_on)
+                        ? common_speculative_process_range(spec.get(), batch.view, from, batch.view.size() - from)
+                        : common_speculative_process(spec.get(), batch.view);
+                });
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");

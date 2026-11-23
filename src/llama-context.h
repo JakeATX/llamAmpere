@@ -135,6 +135,7 @@ struct llama_context {
     float * get_embeddings_layer_inp(uint32_t lid);
 
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
+    int32_t       get_layer_inp_dev_rows() const { return layer_inp_dev ? (int32_t) layer_inp_dev->ne[1] : 0; }
     ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
 
     llama_token * get_sampled_tokens() const;
@@ -414,7 +415,7 @@ public:
     void moe_cache_request_end();
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(int slot = -1);
     llm_graph_result * get_gf_res_vg(int slot);
     void vgraph_log_vram(const char * what, int slot);
 
@@ -1001,6 +1002,8 @@ private:
     ggml_backend_event_ptr ev_layer_inp_written;
     ggml_backend_event_ptr ev_layer_inp_read;
     bool ev_layer_inp_read_recorded = false;
+    bool layer_inp_dev_call         = false;
+    bool pipe_inject_pending        = false;
 
     // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
     // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s

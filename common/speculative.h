@@ -132,6 +132,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// Whether process() reads target features strictly on device and can run before llama_synchronize(ctx_tgt).
+bool common_speculative_can_pipe_process(const common_speculative * spec, const common_batch & batch);
+
 // Process MTP prompt ranges while target hidden rows still cover the full batch.
 bool common_speculative_supports_process_range(const common_speculative * spec);
 bool common_speculative_process_range(common_speculative * spec, const common_batch & batch, int32_t first, int32_t count);

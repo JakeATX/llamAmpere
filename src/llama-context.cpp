@@ -3307,6 +3307,7 @@ void llama_context::synchronize() {
     if (moe_peer) {
         moe_peer->check(); // [PEERX] a timed-out mailbox wait turns the copy hook off
     }
+    pipe_inject_pending = false;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -4343,6 +4344,14 @@ ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
     return nullptr;
 }
 
+static int32_t llama_dspine_pipe_mode() {
+    static const int32_t mode = [] {
+        const char * e = std::getenv("LLAMA_DSPINE_PIPE");
+        return e ? std::atoi(e) : 0;
+    }();
+    return mode;
+}
+
 void llama_context::layer_inp_dev_alloc() {
     synchronize();
 
@@ -4371,7 +4380,10 @@ void llama_context::layer_inp_dev_alloc() {
     };
     ctx_layer_inp_dev.reset(ggml_init(params));
 
-    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
+    // LLAMA_DSPINE_PIPE>0 caps layer_inp_dev to decode/verify widths (64 rows ~ 6.25 MiB vs 400 MiB at -b 4096)
+    // so device-side feature injection fits on 24 GB cards at deep context; prompt prefills keep host copies.
+    const int64_t dev_rows = llama_dspine_pipe_mode() > 0 ? std::min<int64_t>(cparams.n_batch, 64) : (int64_t) cparams.n_batch;
+    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, dev_rows);
     ggml_set_name(layer_inp_dev, "layer_inp_dev");
 
     layer_inp_dev_dev = model.dev_output();
@@ -4385,8 +4397,9 @@ void llama_context::layer_inp_dev_alloc() {
         const bool   forced  = force_e != nullptr && std::atoi(force_e) > 0;
         if (!forced) {
             const char * min_e = std::getenv("LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB");
-            const size_t min_free_bytes = (size_t) (min_e ? std::max(0, std::atoi(min_e)) : 512) << 20;
             const size_t need_bytes = ggml_nbytes(layer_inp_dev);
+            const int    default_mib = (llama_dspine_pipe_mode() > 0 && need_bytes <= (16u << 20)) ? 64 : 512;
+            const size_t min_free_bytes = (size_t) (min_e ? std::max(0, std::atoi(min_e)) : default_mib) << 20;
             size_t free_mem = 0, total_mem = 0;
             ggml_backend_dev_memory(layer_inp_dev_dev, &free_mem, &total_mem);
             if (total_mem > 0 && free_mem < need_bytes + min_free_bytes) {
@@ -5777,6 +5790,9 @@ build_graph:
     vg_slot = -1;
     const bool use_vgraph = vgraph_env && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.arch != LLM_ARCH_DFLASH &&
         (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER);   // target decode passes DEFAULT
+    // LLAMA_DSPINE_PIPE>0 (opt-in): a DFlash drafter keeps its feature-inject graph (slot 0) apart from the draft graph (slot 1)
+    const bool dflash_split_slots = llama_dspine_pipe_mode() > 0 && model.arch == LLM_ARCH_DFLASH;
+    const int  want_slot          = dflash_split_slots ? ((ubatch.embd || ubatch.embd_row) ? 0 : 1) : (n_outputs > 0 ? 1 : 0);
     const bool use_plan_slots = (plan_slots_env &&
         (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (dspark_plan_slots_env && model.arch == LLM_ARCH_DFLASH))) || use_vgraph;
     if (use_plan_slots && !graph_reuse_disable && !b1_cur.active &&
@@ -5784,7 +5800,7 @@ build_graph:
         if (gf_res_prev_active == nullptr) {
             plan_res.fill(nullptr);
         }
-        int want = n_outputs > 0 ? 1 : 0;
+        int want = want_slot;
         if (use_vgraph) {
             const bool verify = ubatch.n_tokens >= 2 && ubatch.n_tokens <= LLAMA_PLAN_SLOTS_MAX && n_outputs == (int32_t) ubatch.n_tokens;
             want = verify ? (int) ubatch.n_tokens - 1 : 0;
@@ -5800,7 +5816,7 @@ build_graph:
             plan_res.fill(nullptr);
         }
     }
-    auto * res = vg_slot > 0 ? get_gf_res_vg(vg_slot) : get_gf_res_prev();
+    auto * res = vg_slot > 0 ? get_gf_res_vg(vg_slot) : get_gf_res_prev(dflash_split_slots ? want_slot : -1);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -5826,6 +5842,10 @@ build_graph:
             vgraph_log_vram("first reuse", vg_slot);
         }
     } else {
+        if (pipe_inject_pending) {
+            ggml_backend_sched_synchronize(sched.get());
+            pipe_inject_pending = false;
+        }
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -5913,6 +5933,11 @@ build_graph:
         const int64_t pp_inputs_t0 = b1_cur.active ? ggml_time_us() : 0;
         if (ipt_on) {
             LLAMA_LOG_INFO("INKPF3 pre-inputs (build/alloc incl.): %.1f ms (n_tokens %u)\n", (ggml_time_us() - ipt0)/1000.0, ubatch.n_tokens);
+        }
+        // Finish any in-flight async DSpine inject on this context before writing the next graph's input tensors.
+        if (pipe_inject_pending) {
+            ggml_backend_sched_synchronize(sched.get());
+            pipe_inject_pending = false;
         }
         res->set_inputs(&ubatch);
         if (b1_cur.active) {
@@ -7652,19 +7677,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     // ordering for the layer input device buffer
+    layer_inp_dev_call = cparams.embeddings_layer_inp_dev && layer_inp_dev != nullptr && (int64_t) n_tokens_all <= layer_inp_dev->ne[1];
+    struct layer_inp_dev_guard {
+        bool & active;
+        ~layer_inp_dev_guard() { active = false; }
+    } layer_inp_dev_guard_ { layer_inp_dev_call };
+
     llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
     ggml_backend_t  inject_backend = nullptr;
+    bool            async_dev_inject = false;
     if (inject_src) {
         inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
         if (inject_backend) {
-            // wait on the host: a device-side wait would stall our queue for the whole target batch,
-            // which trips the Metal command buffer timeout on long prompts
-            ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
+            if (llama_dspine_pipe_mode() > 0 && !compute_is_shared() &&
+                    std::strncmp(ggml_backend_name(inject_backend), "CUDA", 4) == 0) {
+                ggml_backend_event_wait(inject_backend, inject_src->ev_layer_inp_written.get());
+                async_dev_inject = true;
+            } else {
+                // wait on the host: a device-side wait would stall our queue for the whole target batch,
+                // which trips the Metal command buffer timeout on long prompts
+                ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
+            }
         } else {
             inject_src->synchronize();
         }
     }
-    if (layer_inp_dev && ev_layer_inp_read && ev_layer_inp_read_recorded) {
+    if (layer_inp_dev_call && ev_layer_inp_read && ev_layer_inp_read_recorded) {
         // do not overwrite rows the reader has not consumed yet
         ggml_backend_event_wait(layer_inp_backend, ev_layer_inp_read.get());
     }
@@ -8091,7 +8129,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         moe_cache->window_end();
     }
 
-    if (layer_inp_dev && ev_layer_inp_written) {
+    if (layer_inp_dev_call && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
     }
     if (write_h_nextn) {
@@ -8110,6 +8148,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (inject_backend) {
             ggml_backend_event_record(inject_src->ev_layer_inp_read.get(), inject_backend);
             inject_src->ev_layer_inp_read_recorded = true;
+            if (async_dev_inject) {
+                pipe_inject_pending = true;
+            }
         } else {
             synchronize();
         }
@@ -8228,8 +8269,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
         embd_nextn.size = (size_t) n_embd_out * nextn_rows;
     }
 
+    const bool need_host_layer_inp = !cparams.embeddings_layer_inp_dev ||
+            (layer_inp_dev != nullptr && layer_inp_dev->ne[1] < (int64_t) n_batch);
     for (bool enabled : cparams.embeddings_layer_inp) {
-        if (enabled && !cparams.embeddings_layer_inp_dev) {
+        if (enabled && need_host_layer_inp) {
             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
         }
     }
@@ -8355,7 +8398,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
     offset += embd_nextn.size * sizeof(float);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
-        if (cparams.embeddings_layer_inp[il] && !cparams.embeddings_layer_inp_dev) {
+        if (cparams.embeddings_layer_inp[il] && need_host_layer_inp) {
             embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_batch};
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
@@ -8423,7 +8466,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_tokens) {
 
 bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
     bool extracted = false;
-    if (cparams.embeddings_layer_inp_dev) {
+    if (layer_inp_dev_call) {
         return extracted;
     }
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
@@ -8648,8 +8691,9 @@ void llama_context::vgraph_log_vram(const char * what, int slot) {
         __func__, slot + 1, slot, what, buf / 1048576.0, free_b / 1048576.0, ((double) vg_free0 - (double) free_b) / 1048576.0);
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+llm_graph_result * llama_context::get_gf_res_prev(int slot) {
+    const int idx = slot >= 0 ? slot : (n_outputs > 0 ? 1 : 0);
+    auto & res = gf_res_prev[idx];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
@@ -10065,7 +10109,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
-        /*.layer_inp_dev =*/ layer_inp_dev,
+        /*.layer_inp_dev =*/ layer_inp_dev_call ? layer_inp_dev : nullptr,
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
@@ -11160,6 +11204,9 @@ size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * ds
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (pipe_inject_pending) {
+        synchronize();
+    }
     if (ckpt_sel >= 0 && seq_id == ckpt_seq && flags == LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
         const auto & capture = ckpt_caps[ckpt_sel];
         if (size < capture.blob_size()) {
@@ -11435,6 +11482,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id          seq_id,
                                          const uint8_t *       src,
                                          size_t                size,
                                          llama_state_seq_flags flags) {
+    if (pipe_inject_pending) {
+        synchronize();
+    }
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -12659,6 +12709,10 @@ void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {
 
 bool llama_supports_embd_row(const llama_context * ctx) {
     return ctx->supports_embd_row();
+}
+
+int32_t llama_layer_inp_dev_rows(const llama_context * ctx) {
+    return ctx ? ctx->get_layer_inp_dev_rows() : 0;
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
