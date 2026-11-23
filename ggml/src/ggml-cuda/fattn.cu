@@ -4,6 +4,7 @@
 #include "fattn-mma-turbo.cuh"
 #include "fattn-mma-sjkvarn.cuh"
 #include "fattn-sjkvarn-rot.cuh"
+#include "fattn-sjkvarn-v16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -4670,6 +4671,10 @@ static bool ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ggml_backend_cuda_context & c
         return true; // fattn-sjkvarn-lowbits.cu rotates in-kernel or takes the separate passes itself
     }
     GGML_UNUSED(ctx);
+    // 4/4: the single-pass V16 compact kernel (GGML_SJKVARN_V16=1) rotates in-kernel too
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(dst)) {
+        return true;
+    }
     // 4/4: the stream decode kernel (fattn-sjkvarn-stream.cuh) through ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl
     static const int stream_max = getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") != nullptr
                                 ? atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8; // same default as fattn-sjkvarn-direct.cuh
@@ -4862,8 +4867,13 @@ static bool ggml_cuda_fattn_mask_packed_native(const ggml_tensor * dst) {
         if (ggml_cuda_fattn_sj_kvarn_is_lowbits(dst)) {
             return ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(dst);
         }
-        // the 4/4 direct decode reader (also each GGML_SJKVARN_ROWSPLIT chunk) still needs F16
-        return dst->src[0]->ne[1] > 8 && !ggml_cuda_fattn_sj_kvarn_rowsplit(dst);
+        ggml_tensor m16;
+        ggml_cuda_fattn_mask_f16_desc(mask, m16);
+        ggml_tensor d16 = *dst;
+        d16.src[3] = &m16;
+        // the 4/4 direct decode reader (also each GGML_SJKVARN_ROWSPLIT chunk and V16) still needs F16
+        return dst->src[0]->ne[1] > 8 && !ggml_cuda_fattn_sj_kvarn_rowsplit(dst) &&
+            !ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(&d16);
     }
     ggml_tensor m2;
     ggml_cuda_fattn_mask_f16_desc(mask, m2);
@@ -5063,6 +5073,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         if (ggml_cuda_fattn_sj_kvarn_compact16(dst)) {
             ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, dst); // [DSPINE4 VERIFY16] one pass at 9..16 rows
+            return;
+        }
+        if (ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(dst)) {
+            ggml_cuda_flash_attn_ext_sj_kvarn_v16(ctx, dst);
             return;
         }
         if (ggml_cuda_fattn_sj_kvarn_rowsplit(dst)) {
