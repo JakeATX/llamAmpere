@@ -23,6 +23,7 @@
 #include <memory>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include <mutex>
 
 // [PFDIAG] host timing of init_batch pieces (LLAMA_DECODE_HOST_US=1, batches >= 256 tokens)
@@ -3075,9 +3076,10 @@ std::vector<ggml_backend_buffer_ptr> llama_kv_cache::b1_scratch_views(
     // cache can place a cold sequence beyond cell zero; token count alone does not
     // bound those physical writes. Attention can read masked padding too: protect
     // the same padded frontier as get_n_kv(), not only the occupied cells.
-    const uint32_t cell_pad = 256u; // n_pad removed upstream (7a2e5aba9): fixed 256, as get_n_kv()
+    const uint32_t used_end = v_cells[0].used_max_p1();
+    const uint32_t cell_pad = nk_kv_pad_for(used_end, /*n_tps=*/ 1u);
     const uint32_t occupied_end = std::min(v_cells[0].size(),
-            std::max(cell_pad, GGML_PAD(v_cells[0].used_max_p1(), cell_pad)));
+            std::max(cell_pad, GGML_PAD(used_end, cell_pad)));
     const uint32_t protected_cells = std::max(prompt_cells, occupied_end);
     struct span { ggml_backend_buffer_t parent; size_t offset; size_t size; };
     std::vector<span> spans;
@@ -3337,17 +3339,74 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
+// NEONKERN: LLAMA_NK_KV_PAD=1|N (default 0 = off -> base 256): coarser n_kv padding step during deep-context
+// full-attention decode (swa_type == NONE, n_tps <= 32, used >= 4096) to reduce 256-token graph rebuild and
+// CUDA graph recapture spikes. =1 selects 2048 (8x fewer recaptures; stays <= 1 MiB upload ring even solo at 100K);
+// explicit N >= 256 selects a multiple-of-256 step up to 16384 (e.g. 4096). Unset = exact base 256.
+static uint32_t llama_nk_kv_pad_step() {
+    static const uint32_t pad = []() -> uint32_t {
+        const char * e = getenv("LLAMA_NK_KV_PAD");
+        if (!e) {
+            return 0u;
+        }
+        const int v = atoi(e);
+        if (v <= 0) {
+            return 0u;
+        }
+        if (v < 256) {
+            return 2048u;
+        }
+        const uint32_t clamped = (uint32_t) std::min(v, 16384);
+        return (clamped / 256u) * 256u;
+    }();
+    return pad;
+}
+
+uint32_t llama_kv_cache::nk_kv_pad_for(uint32_t used_max_p1, uint32_t n_tps) const {
+    const uint32_t step = llama_nk_kv_pad_step();
+    if (step <= 256u || swa_type != LLAMA_SWA_TYPE_NONE || used_max_p1 < 4096u || n_tps == 0u || n_tps > 32u) {
+        return 256u;
+    }
+    static std::once_flag once_log;
+    std::call_once(once_log, [step] {
+        LLAMA_LOG_INFO("[NK_KV_PAD] active: decode n_kv pad=%u (LLAMA_NK_KV_PAD)\n", step);
+    });
+    return step;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad = 256;
+    const uint32_t n_tps = sinfo.empty() ? 0u : (uint32_t) sinfo.size();
+    uint32_t max_pad = 256u;
+    uint32_t max_used = 0u;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
+        const uint32_t used_end = cells.used_max_p1();
+        const uint32_t n_pad = nk_kv_pad_for(used_end, n_tps);
+        max_pad = std::max(max_pad, n_pad);
+        max_used = std::max(max_used, used_end);
 
-        result = std::max(std::min(cells.size(), std::max(n_pad, GGML_PAD(cells.used_max_p1(), n_pad))), result);
+        result = std::max(std::min(cells.size(), std::max(n_pad, GGML_PAD(used_end, n_pad))), result);
+    }
+
+    if (max_pad > 256u) {
+        static const bool trace = [] {
+            const char * e = getenv("GGML_CUDA_NK_TRACE");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (trace) {
+            static std::atomic<uint32_t> last_n_kv{0};
+            static std::atomic<int> trace_n{0};
+            const uint32_t prev = last_n_kv.exchange(result, std::memory_order_relaxed);
+            if (prev != result && trace_n.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LLAMA_LOG_INFO("[NK_KV_PAD] n_kv=%u (used=%u pad=%u n_tps=%u sj=%d)\n",
+                        result, max_used, max_pad, n_tps, sj_kvarn.enabled() ? 1 : 0);
+            }
+        }
     }
 
     return result;
@@ -3954,10 +4013,11 @@ uint32_t llama_kv_cache::get_sj_kvarn_sealed_end(llama_seq_id seq_id) const {
     return B;
 }
 
-uint32_t llama_kv_cache::get_sj_kvarn_n_kv_stream(uint32_t strm) const {
-    const uint32_t n_pad_cur = 256u; // n_pad removed upstream (7a2e5aba9): fixed 256, as get_n_kv()
+uint32_t llama_kv_cache::get_sj_kvarn_n_kv_stream(uint32_t strm, uint32_t n_tps) const {
     const auto & cells = v_cells[strm];
-    return std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur)));
+    const uint32_t used_end = cells.used_max_p1();
+    const uint32_t n_pad_cur = nk_kv_pad_for(used_end, n_tps);
+    return std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(used_end, n_pad_cur)));
 }
 
 void llama_kv_cache::sj_kvarn_release_groups(uint32_t strm, uint32_t g0) {
@@ -7879,9 +7939,10 @@ std::vector<uint32_t> llama_kv_cache_context::get_sj_kvarn_n_kv_streams() const 
         return res;
     }
     const auto & sinfo = sinfos[i_cur];
+    const uint32_t n_tps = ubatches.empty() || sinfo.empty() ? 0u : (uint32_t) sinfo.size();
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         // the graph-reserve context (n_kv = kv size) attends the whole stream
-        res.push_back(ubatches.empty() ? n_kv : std::min<uint32_t>(n_kv, kv->get_sj_kvarn_n_kv_stream(sinfo.strm[s])));
+        res.push_back(ubatches.empty() ? n_kv : std::min<uint32_t>(n_kv, kv->get_sj_kvarn_n_kv_stream(sinfo.strm[s], n_tps)));
     }
     return res;
 }

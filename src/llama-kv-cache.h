@@ -358,7 +358,7 @@ public:
     // records free in the paged pool (0 when not paged)
     uint32_t get_sj_kvarn_free_records() const { return (uint32_t) sj_kvarn_free.size(); }
     // padded attended position count of one stream (the per-stream FA n_kv of a multi-stream ubatch)
-    uint32_t get_sj_kvarn_n_kv_stream(uint32_t strm) const;
+    uint32_t get_sj_kvarn_n_kv_stream(uint32_t strm, uint32_t n_tps = 0) const;
 
     // I32[GGML_SJKVARN_DESC_N_ENTRIES] graph input consumed by the seal op and the attention op
     // multi-stream (paged) caches: I32[GGML_SJKVARN_DESC_N_ENTRIES + n_groups_seq, n_stream of the ubatch], one row per stream
@@ -470,6 +470,9 @@ private:
     // LLAMA_KQ_MASK_DEVICE defers the f16 mask fill to the scheduler's input copy. With any KV layer in a host buffer the
     // attention can read the host mask with no copy, so the fill would never run (stale mask, NaN on CPU / -ngl 0).
     bool kq_mask_defer_ok = true;
+
+    // NEONKERN: LLAMA_NK_KV_PAD decode padding step helper (returns 256 when unset or ineligible)
+    uint32_t nk_kv_pad_for(uint32_t used_max_p1, uint32_t n_tps) const;
 
     // SJ-KVaRN state (see is_sj_kvarn()). Positions: [0, sink) exact rows 0..sink-1; [sink, B) sealed records
     // (sink..B in groups of `group`); [B, N) exact ring rows sink + (p - sink) % cap. Cells stay one per
