@@ -438,18 +438,22 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }
 
-ggml_tensor * llama_model_inkling2::graph::build_inputs() {
+ggml_tensor * llama_model_inkling2::graph::build_inputs(bool embd, bool out_ids) {
     inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa, hparams.n_relative_extent_mid);
     attn = inp->get_attn();
     recr = inp->get_recr();
 
     ggml_tensor * inp_pos = build_inp_pos();
-    inp_out_ids = build_inp_out_ids();
+    inp_out_ids = out_ids ? build_inp_out_ids() : nullptr;
 
     // log-scaled positions: 1 + alpha*log(max(1, (pos + 1)/floor)), multiplies q and r of the full-attention layers
     tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, inp_pos, GGML_TYPE_F32), 1.0f, 1.0f);
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
+
+    if (!embd) {
+        return nullptr;
+    }
 
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
 

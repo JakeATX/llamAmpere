@@ -1958,10 +1958,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
-        attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+        llm_attn_mask m = inp_attn->self_attn_mask;
+        if (ink_b1_bound & INK_B1_MASK) {
+            m.raw = nullptr; // [INKB1] bound: only the kv rows
+        }
+        attn_ctx->get_base()->set_input_attn_mask(m, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos->buffer) {
+    if (self_rel_pos->buffer && !(ink_b1_bound & INK_B1_REL_POS)) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
@@ -1972,10 +1976,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
-        attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
+        llm_attn_mask m = inp_attn->self_attn_mask_swa;
+        if (ink_b1_bound & INK_B1_MASK_SWA) {
+            m.raw = nullptr;
+        }
+        attn_ctx->get_swa()->set_input_attn_mask(m, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos_swa->buffer) {
+    if (self_rel_pos_swa->buffer && !(ink_b1_bound & INK_B1_REL_POS_SWA)) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
@@ -1998,7 +2006,9 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     int64_t far_end = -1;
     if (self_sj_far_mask && self_sj_far_mask->buffer) {
-        far_end = attn_ctx->get_base()->set_input_sj_far_mask(self_sj_far_mask, ubatch, extent);
+        far_end = (ink_b1_bound & INK_B1_FAR_MASK) ? ink_b1_far_end :
+                attn_ctx->get_base()->set_input_sj_far_mask(self_sj_far_mask, ubatch, extent);
+        ink_b1_far_end = far_end;
     }
 
     if (inkrel.on && inkrel.far_mask->buffer) {

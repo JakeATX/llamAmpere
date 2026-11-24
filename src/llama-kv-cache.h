@@ -327,6 +327,11 @@ public:
     bool b1_sj_seek(size_t i);
     bool b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1);
     void b1_sj_rewind(); // undo the bookkeeping of a call whose ubatches were applied but never computed
+    // [INKB1] layer-major prompt on an iSWA memory: the SWA half reuses its cells within a call, so the cell metadata of
+    // every ubatch is kept (llama_kv_cache_context::b1_save_cells) and swapped in before its graphs. All streams.
+    bool b1_cells_supported() const { return other == nullptr && v_cells_impl.use_count() == 1; } // no cell sharing
+    llama_kv_cells_vec b1_cells_copy() const { return v_cells; }
+    void b1_cells_swap(llama_kv_cells_vec & cells) { std::swap(v_cells, cells); }
     int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
     // sealed end: of the sequence's stream (seq_id >= 0), or the largest over all streams (seq_id < 0)
     uint32_t get_sj_kvarn_sealed_end(llama_seq_id seq_id = -1) const;
@@ -814,6 +819,11 @@ public:
     bool b1_supported() const override;
     void b1_save() override;
     bool b1_seek(size_t i) override;
+    // [INKB1] the same, plus the cell metadata and n_kv_rows of each ubatch (llama_kv_cache::b1_cells_*): for a cache
+    // whose later ubatches reuse the cells of earlier ones (the SWA half of an iSWA memory)
+    bool b1_cells_supported() const { return kv->b1_cells_supported(); }
+    void b1_save_cells();
+    bool b1_seek_cells(size_t i);
 
     //
     // llama_kv_cache_context specific API
@@ -934,6 +944,10 @@ private:
 
     // [B1] n_kv of each ubatch, recorded right after its apply()
     std::vector<int32_t> b1_n_kv;
+    // [INKB1] b1_save_cells: the cells after each ubatch's apply; the entry of the ubatch the cache holds is vacant
+    std::vector<llama_kv_cells_vec> b1_cells;
+    std::vector<uint32_t> b1_n_kv_rows;
+    size_t b1_cells_live = 0;
     // see llama_kv_cache::get_n_kv_rows
     uint32_t n_kv_rows = 0;
 };

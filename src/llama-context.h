@@ -888,7 +888,46 @@ private:
         ggml_tensor * carry  = nullptr;
         const llm_b1_ffn * ffn = nullptr;
         int ffn_phase = 0;
+        int32_t       seal_il = -1;     // [INKB1] the cache slot this one-visit graph seals (-1: [il0, il1))
     } b1_cur;
+
+    // fork (INKB1): layer-major prompt of a looped model (LLAMA_INK_B1=1, Inkling 2 Mini on the INKSTREAM streamer).
+    // Every ubatch of the call is applied and saved up front; a group of G ubatches then runs one visit at a time for
+    // all of them (graph position p, carry rows from model.ink_b1_carry_rows()), so each visit's experts cross PCIe
+    // once per group instead of once per ubatch. The per-ubatch masks and relative positions are made by the first
+    // graph of each ubatch that reads them and kept on the card for its later graphs.
+    struct ink_b1_input {
+        ggml_backend_buffer_ptr buf;
+        bool    filled  = false;
+        ggml_type type  = GGML_TYPE_COUNT;
+        int64_t ne[GGML_MAX_DIMS] = {};
+        int64_t far_end = 0;
+    };
+    struct {
+        bool    active  = false;        // this decode call runs layer-major
+        size_t  n_ub    = 0;
+        size_t  G       = 0;            // ubatches per group
+        size_t  slot    = 0;            // the group slot of the graph being built
+        llama_seq_id seq = -1;
+        ggml_backend_t backend = nullptr; // the GPU backend of the carries and the input copies
+        ggml_context_ptr        ctx;    // the carry tensors, one per ubatch (slot u % G)
+        ggml_backend_buffer_ptr carry_buf;
+        std::vector<ggml_tensor *> carry;
+        std::vector<std::array<ink_b1_input, 5>> inputs; // per slot, by llm_graph_input_mem_hybrid_iswa_rel role
+        // per prompt (take to release of the streamer)
+        uint64_t calls = 0, groups = 0, ubatches = 0, graphs = 0, bound = 0, normal_calls = 0, reallocs = 0;
+        size_t   g_max = 0;
+        size_t   carry_bytes_max = 0, input_bytes_max = 0;
+        size_t   input_budget = 0; // card bytes of kept inputs per group slot that the group size was planned for
+        const char * normal_why = nullptr;
+    } ink_b1;
+    int  ink_b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp);
+    bool ink_b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
+    bool ink_b1_next(llama_memory_context_i * mctx, size_t i);
+    void ink_b1_bind(llm_graph_result * res);
+    void ink_b1_capture(llm_graph_result * res);
+    void ink_b1_end();
+    void ink_b1_log_prompt();
 
     // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
     // 2 to retry smaller ubatches before state apply, 3 for opt-in short-tail retries down to 512 rows,

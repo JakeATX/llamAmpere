@@ -390,3 +390,22 @@ const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn()
 const llama_memory_recurrent_context * llama_memory_hybrid_iswa_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
 }
+
+bool llama_memory_hybrid_iswa_context::ink_b1_supported() const {
+    return status == LLAMA_MEMORY_STATUS_SUCCESS && ubatches.size() >= 2 && ctx_attn && ctx_recr &&
+           get_attn()->ink_b1_supported() && ctx_recr->b1_supported();
+}
+
+void llama_memory_hybrid_iswa_context::ink_b1_save() {
+    static_cast<llama_kv_cache_iswa_context *>(ctx_attn.get())->ink_b1_save();
+    ctx_recr->b1_save();
+}
+
+bool llama_memory_hybrid_iswa_context::ink_b1_seek(size_t i) {
+    if (i >= ubatches.size() || !static_cast<llama_kv_cache_iswa_context *>(ctx_attn.get())->ink_b1_seek(i) ||
+            !ctx_recr->b1_seek(i)) {
+        return false;
+    }
+    i_next = i;
+    return true;
+}

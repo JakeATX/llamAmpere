@@ -8121,6 +8121,31 @@ bool llama_kv_cache_context::b1_seek(size_t i) {
     return kv->b1_sj_seek(i);
 }
 
+void llama_kv_cache_context::b1_save_cells() {
+    b1_save();
+    if (b1_cells.size() <= i_cur) {
+        b1_cells.resize(i_cur + 1);
+        b1_n_kv_rows.resize(i_cur + 1, 0);
+    }
+    b1_cells[i_cur]     = kv->b1_cells_copy();
+    b1_n_kv_rows[i_cur] = n_kv_rows;
+    b1_cells_live       = i_cur; // the cache holds the cells after this apply
+}
+
+bool llama_kv_cache_context::b1_seek_cells(size_t i) {
+    if (i >= b1_cells.size() || b1_cells_live >= b1_cells.size() || !b1_seek(i)) {
+        return false;
+    }
+    if (i != b1_cells_live) {
+        // every other entry holds its ubatch's cells: park the live ones, take ubatch i's (two O(1) swaps)
+        kv->b1_cells_swap(b1_cells[b1_cells_live]);
+        kv->b1_cells_swap(b1_cells[i]);
+        b1_cells_live = i;
+    }
+    n_kv_rows = b1_n_kv_rows[i];
+    return true;
+}
+
 llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
 }

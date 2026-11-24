@@ -735,3 +735,26 @@ const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa_mid() const 
 
     return static_cast<const llama_kv_cache_context *>(ctx_swa_mid.get());
 }
+
+bool llama_kv_cache_iswa_context::ink_b1_supported() const {
+    // port: a mid-window SWA cache (ctx_swa_mid) has no per-ubatch cell swap here, so INKB1 takes the normal order
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || ubatches.empty() || ctx_swa_mid) {
+        return false;
+    }
+    const auto * swa = get_swa();
+    return get_base()->b1_supported() && swa->b1_supported() && !swa->is_sj_kvarn() && swa->b1_cells_supported();
+}
+
+void llama_kv_cache_iswa_context::ink_b1_save() {
+    static_cast<llama_kv_cache_context *>(ctx_base.get())->b1_save();
+    static_cast<llama_kv_cache_context *>(ctx_swa.get())->b1_save_cells();
+}
+
+bool llama_kv_cache_iswa_context::ink_b1_seek(size_t i) {
+    if (i >= ubatches.size() || !static_cast<llama_kv_cache_context *>(ctx_base.get())->b1_seek(i) ||
+            !static_cast<llama_kv_cache_context *>(ctx_swa.get())->b1_seek_cells(i)) {
+        return false;
+    }
+    i_next = i;
+    return true;
+}

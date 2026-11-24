@@ -1022,6 +1022,30 @@ public:
     ggml_tensor * self_rel_pos_swa     = nullptr; // I32 [n_kv_swa,     n_batch]
     ggml_tensor * self_rel_pos_swa_mid = nullptr; // I32 [n_kv_swa_mid, n_batch]
 
+    // [INKB1] layer-major prompt: the large per-ubatch inputs a one-visit graph reads from a device copy made by an
+    // earlier graph of the same ubatch (bit set = bound to that copy, set_input leaves it alone); the far mask's
+    // visible end comes with it (set_input stores the one it computes in ink_b1_far_end)
+    enum {
+        INK_B1_MASK         = 1 << 0,
+        INK_B1_REL_POS      = 1 << 1,
+        INK_B1_MASK_SWA     = 1 << 2,
+        INK_B1_REL_POS_SWA  = 1 << 3,
+        INK_B1_FAR_MASK     = 1 << 4,
+        INK_B1_N_ROLES      = 5,
+    };
+    uint32_t ink_b1_bound   = 0;
+    int64_t  ink_b1_far_end = 0;
+    ggml_tensor * ink_b1_role(int r) const {
+        switch (r) {
+            case 0:  return inp_attn->self_attn_mask.raw;
+            case 1:  return self_rel_pos;
+            case 2:  return inp_attn->self_attn_mask_swa.raw;
+            case 3:  return self_rel_pos_swa;
+            case 4:  return self_sj_far_mask;
+            default: return nullptr;
+        }
+    }
+
     const uint32_t extent;
     const uint32_t extent_swa;
     const uint32_t extent_swa_mid;

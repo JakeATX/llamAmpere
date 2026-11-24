@@ -2449,8 +2449,9 @@ struct llama_model_inkling2 : public llama_model_base {
         struct no_build {};
         graph(const llm_graph_params & params, no_build) : llm_graph_context(params) {}
 
-        // the inputs and the token embeddings
-        ggml_tensor * build_inputs();
+        // the inputs and the token embeddings (embd = false: no token input, returns null; out_ids = false: no output
+        // rows; both for the one-visit graphs of a layer-major prompt, which read neither)
+        ggml_tensor * build_inputs(bool embd = true, bool out_ids = true);
         // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
@@ -2496,8 +2497,15 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     // messages in one op (LLAMA_INKLING2_MSG_BATCH); null if the queries are not F32 in one buffer type
     ggml_tensor * msg_query_all = nullptr;
 
+    // fork (INKB1): layer-major prompt (LLAMA_INK_B1), see ink_b1_layout in inkling2-loop.cpp
+    int32_t ink_b1_carry_rows() const override;
+    int32_t ink_b1_visit_slot(int32_t p) const override;
+
     struct graph : public llama_model_inkling2::graph {
         graph(const llm_graph_params & params);
+    private:
+        // one visit of a layer-major prompt (b1_carry set): graph position b1_il0 of the ubatch whose carry it is
+        void build_visit(const llama_model_inkling2_loop & m);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
