@@ -7943,6 +7943,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (elastic_kv && !elastic_kv_prepare(batch_inp)) {
         return -2;
     }
+    if (ink_stream) {
+        ink_stream->drop_residents(); // CORERES: the ladder and B1 size this call without the regions of the last one
+    }
     if (!prompt_buffers_resize(n_tokens_all, &batch_inp, tagged)) {
         return -2;
     }
@@ -8086,6 +8089,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             b1_mode = 0;
         }
+    }
+    // fork (CORERES, LLAMA_INK_CORERES=N): resident core layers from the VRAM left once this call's buffers are sized,
+    // keeping LLAMA_INK_CORERES_KEEP_MIB (default 768) plus the CUDA pool rows of mul_mat_id at this ubatch free
+    if (ink_stream && ink_stream->armed()) {
+        static const size_t keep_base = (size_t) std::max(0, [] { const char * e = getenv("LLAMA_INK_CORERES_KEEP_MIB"); return e ? atoi(e) : 768; }()) << 20;
+        const auto & hp = model.hparams;
+        uint32_t ff_max = 0;
+        for (uint32_t il = 0; il < hp.n_layer(); ++il) { ff_max = std::max(ff_max, hp.n_ff_exp(il)); }
+        const double per_row = 1.25 * 4.0 * hp.n_expert_used_max() * (hp.n_embd + 3.0 * ff_max);
+        ink_stream->place_residents(keep_base + (size_t) (per_row * std::min<uint32_t>(turn_ubatch, std::max<uint32_t>(1, n_tokens_all))));
     }
     // [INKB1] an exception out of a layer-major call: abandon it (binds, carries, kept inputs, swapped SWA cells)
     struct ink_b1_unwind {

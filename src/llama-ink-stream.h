@@ -50,6 +50,14 @@ public:
     bool arm();
     // wait for the copies in flight, then free all of it
     void disarm();
+    // fork (CORERES): place up to LLAMA_INK_CORERES resident core layers in the VRAM that is still free once the prompt
+    // call has sized its buffers (ubatch ceiling, B1 groups), leaving keep bytes free. The ubatch size and grouping never
+    // depend on them, so the values are those of the two-slot stream. Returns the number placed. Call once per decode
+    // call of an armed prompt, before its first graph; drop_residents() before the next call measures VRAM.
+    int place_residents(size_t keep);
+    // wait for the copies in flight and give the resident regions back (their visits stream again)
+    void drop_residents();
+    int residents() const { return n_res; }
 
     size_t slot_bytes() const { return slot_size; }
     ggml_backend_t backend() const { return backend_gpu; }
@@ -115,6 +123,7 @@ private:
     ggml_context * ctx_map  = nullptr;     // maps
     ggml_backend_buffer_t buf_map  = nullptr;
     ggml_backend_buffer_t buf_slot = nullptr;
+    ggml_backend_buffer_t buf_res  = nullptr; // CORERES regions of this decode call
     std::vector<ggml_tensor *> raw;        // [2 + n_core]: the two streamed slots, then one region per resident core layer
 
     // copy pipeline
@@ -122,12 +131,13 @@ private:
     std::vector<ggml_backend_event_t> ev_free;  // [2 + n_core]
     std::vector<ggml_backend_event_t> ev_ready; // [2 + n_core]
     ggml_backend_event_t ev_list = nullptr; // upload_wait(): the last piece is on the card
-    std::vector<int> issued;   // [2 + n_core] visit last queued into each slot (a resident region: any visit, once per arm)
+    std::vector<int> issued;   // [2 + n_core] visit last queued into each slot (a resident region: any visit, once per call)
     // fork (CORERES): LLAMA_INK_CORERES=N keeps the experts of N core layers (the layers a looped model visits on every
     // pass) in VRAM for the whole armed prompt, uploaded once instead of on every pass; 0 (default) = two slots only
     int n_core   = 0;          // physical layers visited more than once
     int res_want = 0;
-    int n_res    = 0;          // resident regions of this arm
+    int n_res    = 0;          // resident regions of this decode call (placed after its buffers, see place_residents)
+    std::vector<int> res_region; // [n_core] region of each core layer for this call, -1 = streamed
 
     int    n_workers = 4;
     size_t piece_max = 8u << 20;
@@ -166,4 +176,8 @@ private:
     void worker(int w);
     void free_slots();
     void free_pipeline();
+    // streamed visits alternate between the two slots in graph order, keeping the slot of an upload already queued for
+    // the first one (the prefetch from the previous call); views follow their visit's slot
+    void assign_slots();
+    bool place_views(int il);
 };
