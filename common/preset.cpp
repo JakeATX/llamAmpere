@@ -140,7 +140,11 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--cpu-moe", "1"}, {"--op-offload", "0"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
                 {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
-                {"--spec-draft-ngl", "99"}
+                {"--spec-draft-ngl", "99"},
+                // fork (INKVIS): the vision projector runs on the CPU. On the GPU its ~710 MiB came out of the expert
+                // cache: 8ink S34d 100K turn decode 30.2 vs 37.4 tok/s, image turn 29.7 s; on the CPU 37.3 tok/s and
+                // 10.1 s (1,371-token image turn, RTX 3090 at the 7,168 line). --mmproj-offload puts it back on the GPU.
+                {"--mmproj-offload", "0"}
             }, {
                 {"LLAMA_DEEPCTX_LADDER", "1"},
                 // fork (INKSMALL2): fit headroom kept for the expert cache (sized after the fit). The auto-size reserve
