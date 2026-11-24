@@ -1164,6 +1164,20 @@ llama_kv_cache::llama_kv_cache(
                     }
                 }
             }
+            // fork (SURGE-cache, elastic KV): LLAMA_ELASTIC_KV=1 puts the pools of a single-sequence cache in a VMM buffer
+            if (body_ctx == ctx && offload && n_stream == 1 && n_seq_max == 1 && !sj_kvarn_paged && !other &&
+                    ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                static const bool elastic = [] { const char * e = getenv("LLAMA_ELASTIC_KV"); return e && atoi(e) != 0; }();
+                if (elastic) {
+                    auto * dev = model.dev_layer(il);
+                    using elastic_type_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+                    auto * get_type = reinterpret_cast<elastic_type_fn>(ggml_backend_reg_get_proc_address(
+                        ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_elastic_buffer_type"));
+                    if (auto * ebuft = get_type ? get_type(dev) : nullptr) {
+                        body_ctx = ctx_for_buft(ebuft);
+                    }
+                }
+            }
             body = ggml_new_tensor_1d(body_ctx, GGML_TYPE_I8, (int64_t) rb * hparams.n_head_kv(il) * sj_kvarn_n_groups);
             if (!lsa_auto.empty() && lsa_auto.back().il == il && lsa_auto.back().body == nullptr) {
                 lsa_auto.back().body = body;
@@ -1449,6 +1463,8 @@ llama_kv_cache::llama_kv_cache(
     // EXPERIMENTAL WUSH-KV: the transforms share the cache buffers, so they are uploaded here and again after every
     // clear(data = true), which zeroes those buffers (the host copy is kept for that)
     sj_wush_upload();
+
+    elastic_init(); // fork (SURGE-cache): no-op unless LLAMA_ELASTIC_KV=1 placed the record pools in a VMM buffer
 
     {
         const size_t memory_size_k = size_k_bytes();
@@ -2681,6 +2697,15 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
+    }
+
+    if (elastic_buf != nullptr && ubatch.n_tokens > 0) {
+        // fork (SURGE-cache): the context maps ahead of each decode call; this catches calls it did not see
+        llama_pos p_max = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            p_max = std::max(p_max, ubatch.pos[i]);
+        }
+        elastic_require((uint32_t) p_max + 1);
     }
 
     // keep track of the max sequence position that we would overwrite with this ubatch
@@ -6618,6 +6643,9 @@ uint32_t llama_kv_cache::state_read_sj_kvarn(llama_io_read_i & io, llama_seq_id 
             }
             const size_t rec_stride = (size_t) hparams.n_head_kv(layer.il)*layer.sj_kvarn_rec_bytes;
             if (!sj_kvarn_paged) {
+                if (n_rec > 0 && elastic_buf != nullptr && layer.body->buffer == elastic_buf) {
+                    elastic_require(sj_kvarn.sink + n_rec*sj_kvarn.group); // fork (SURGE-cache): pages for the records read
+                }
                 if (n_rec > 0) {
                     io.read_tensor(layer.body, 0, (size_t) n_rec*rec_stride);
                 }

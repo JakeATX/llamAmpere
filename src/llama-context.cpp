@@ -1659,6 +1659,37 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                         ink_stream ? "on" : "unavailable", sched_reserve_tokens, cparams.n_ubatch);
             }
         }
+        // fork (SURGE-cache, elastic KV): the KV cache maps its record pages per call; it asks here for VRAM it lacks.
+        // LLAMA_ELASTIC_KV_BOOT_UB=N (with LLAMA_ELASTIC_KV=1): boot (and the fit's dry run) reserve N prompt rows, below
+        // -ub; the prompt ladder grows to -ub on the KV pages lent while the context is short, and gives them back.
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && sched_reserve_tokens == 0) {
+            const char * on = getenv("LLAMA_ELASTIC_KV");
+            const char * bu = getenv("LLAMA_ELASTIC_KV_BOOT_UB");
+            const long   n  = on && atoi(on) != 0 && bu && bu[0] ? strtol(bu, nullptr, 10) : 0;
+            if (n >= 256 && (uint32_t) n < cparams.n_ubatch) {
+                sched_reserve_tokens = (uint32_t) n;
+                LLAMA_LOG_WARN("%s: [ELASTICKV] boot prompt reserve %ld rows (ceiling -ub %u on lent KV pages)\n", __func__, n, cparams.n_ubatch);
+            }
+        }
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            llama_kv_cache * kv = llama_sj_kvarn_cache(memory.get());
+            if (kv && kv->elastic_on()) {
+                elastic_kv = kv;
+                elastic_boot_rows = sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch;
+                kv->elastic_make_room = [this](size_t bytes) { return elastic_kv_make_room(bytes); };
+            }
+        }
+        // fork (SURGE-cache, MCDET): LLAMA_MOE_CACHE_DET=1 (off by default)
+        if (const char * det = getenv("LLAMA_MOE_CACHE_DET"); det && atoi(det) != 0 && moe_cache) {
+            moe_cache_det = true;
+#ifdef _WIN32
+            _putenv_s("GGML_CUDA_MMQ_ID_TILED", "1");
+#else
+            setenv("GGML_CUDA_MMQ_ID_TILED", "1", 0);
+#endif
+            LLAMA_LOG_WARN("%s: [MCDET] MoE cache output independent of history: every expert on the GPU, fixed prompt crossover, "
+                    "tiled MMQ for expert matmuls\n", __func__);
+        }
 
         sched_reserve();
 
@@ -6656,7 +6687,8 @@ uint32_t llama_context::ink_loan_cross(uint32_t ink_min) const {
     if (fixed >= 0) {
         return (uint32_t) std::max<long>(ink_loan_rows, std::min<long>(fixed, ink_min));
     }
-    if (ink_loan_chunk_ms <= 0 || ink_loan_pass_ms <= 0) {
+    // fork (SURGE-cache, MCDET): a crossover from measured times makes the ubatch split of a prompt depend on history
+    if (moe_cache_det || ink_loan_chunk_ms <= 0 || ink_loan_pass_ms <= 0) {
         return ink_min;
     }
     const uint32_t rows_s = std::max(512u, std::min(cparams.n_ubatch, 4096u));
@@ -6866,6 +6898,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ~b1_cache_guard() { ctx.b1_cache_resume(); }
     } b1_cache_guard_ { *this };
     pp_setup_clock pp_dec;
+    if (elastic_kv && !elastic_kv_prepare(batch_inp)) {
+        return -2;
+    }
     if (!prompt_buffers_resize(n_tokens_all, &batch_inp, tagged)) {
         return -2;
     }

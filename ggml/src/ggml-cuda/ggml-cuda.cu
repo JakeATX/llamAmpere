@@ -119,6 +119,7 @@
 #include "ggml-cuda/inkmask.cuh"
 #include "ggml-cuda/inkrouter.cuh"
 #include "ggml-cuda/q8a16.cuh"
+#include "ggml-cuda/elastic-buf.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1452,6 +1453,7 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     ggml_backend_cuda_phase_arena_t arena = nullptr;
+    ggml_cuda_elastic * elastic = nullptr; // fork (SURGE-cache): VMM pages that can be unmapped, see elastic-buf.cuh
     std::string name;
 
     // TQ4_1S load-time q8_0 conversion bookkeeping (see ggml_tq_convert_q8). Pointers are only
@@ -1770,6 +1772,10 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ctx->elastic != nullptr) {
+        ggml_cuda_elastic_clear(ctx->elastic, value); // unmapped pages take the value when they are mapped
+        return;
+    }
     CUDA_CHECK(cudaMemset(ctx->dev_ptr, value, buffer->size));
 }
 
@@ -1802,9 +1808,12 @@ static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_t
     return ctx->name.c_str();
 }
 
+static const char * ggml_backend_cuda_elastic_buffer_type_get_name(ggml_backend_buffer_type_t buft);
+
 static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name ||
-        buft->iface.get_name == ggml_backend_cuda_phase_arena_buffer_type_get_name;
+        buft->iface.get_name == ggml_backend_cuda_phase_arena_buffer_type_get_name ||
+        buft->iface.get_name == ggml_backend_cuda_elastic_buffer_type_get_name;
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -1980,6 +1989,10 @@ static void ggml_backend_cuda_phase_arena_release(ggml_backend_cuda_phase_arena_
 }
 
 ggml_backend_cuda_buffer_context::~ggml_backend_cuda_buffer_context() {
+    if (elastic != nullptr) {
+        ggml_cuda_elastic_destroy(elastic);
+        return;
+    }
     if (arena == nullptr) {
         CUDA_CHECK(cudaFree(dev_ptr));
         return;
@@ -2071,6 +2084,86 @@ void ggml_backend_cuda_phase_arena_free(ggml_backend_cuda_phase_arena_t arena) {
 
 size_t ggml_backend_cuda_phase_arena_size(ggml_backend_cuda_phase_arena_t arena) {
     return arena == nullptr ? 0 : arena->size;
+}
+
+// fork (SURGE-cache, elastic KV): a CUDA buffer type whose buffers are VMM ranges with unmappable pages
+// (elastic-buf.cuh). Same buffer interface and kernels as the plain CUDA buffer; only the backing differs.
+struct ggml_backend_cuda_elastic_buft_context {
+    int device;
+    std::string name;
+};
+
+static const char * ggml_backend_cuda_elastic_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    return static_cast<ggml_backend_cuda_elastic_buft_context *>(buft->context)->name.c_str();
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_elastic_buffer_type_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * bctx = static_cast<ggml_backend_cuda_elastic_buft_context *>(buft->context);
+    ggml_cuda_set_device(bctx->device);
+    void * base = nullptr;
+    ggml_cuda_elastic * e = ggml_cuda_elastic_create(bctx->device, ggml_cuda_get_physical_device(bctx->device), size, &base);
+    if (e == nullptr) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: mapping %.2f MiB of elastic VMM memory on device %d failed\n", __func__, size/1024.0/1024.0, bctx->device);
+        return nullptr;
+    }
+    auto * ctx = new ggml_backend_cuda_buffer_context(bctx->device, base);
+    ctx->elastic = e;
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
+static size_t ggml_backend_cuda_elastic_buffer_type_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return 128;
+}
+
+static size_t ggml_backend_cuda_elastic_buffer_type_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    return ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
+        static_cast<ggml_backend_cuda_elastic_buft_context *>(buft->context)->device, tensor);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_elastic_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_cuda_elastic_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cuda_elastic_buffer_type_alloc,
+    /* .alloc_buffer_n   = */ nullptr,
+    /* .get_alignment    = */ ggml_backend_cuda_elastic_buffer_type_alignment,
+    /* .get_max_size     = */ nullptr,
+    /* .get_alloc_size   = */ ggml_backend_cuda_elastic_buffer_type_alloc_size,
+    /* .get_alloc_size_n = */ nullptr,
+    /* .is_host          = */ nullptr,
+};
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_elastic_buffer_type(int device) {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static std::mutex mutex;
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static ggml_backend_cuda_elastic_buft_context ctxs[GGML_CUDA_MAX_DEVICES];
+    static bool init[GGML_CUDA_MAX_DEVICES] = {};
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!init[device]) {
+        ctxs[device]  = { device, GGML_CUDA_NAME + std::to_string(device) + "_Elastic" };
+        types[device] = {
+            /* .iface   = */ ggml_backend_cuda_elastic_buffer_type_interface,
+            /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+            /* .context = */ &ctxs[device],
+        };
+        init[device] = true;
+    }
+    return &types[device];
+#else
+    GGML_UNUSED(device);
+    return nullptr;
+#endif
+}
+
+static ggml_cuda_elastic * ggml_backend_cuda_buffer_elastic(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->iface.free_buffer != ggml_backend_cuda_buffer_free_buffer) {
+        return nullptr;
+    }
+    return static_cast<ggml_backend_cuda_buffer_context *>(buffer->context)->elastic;
 }
 
 bool ggml_backend_cuda_phase_arena_set_compute(
@@ -17888,6 +17981,33 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_host_unpin") == 0) {
         return (void *)ggml_cuda_host_unpin;
+    }
+    // fork (SURGE-cache, elastic KV): buffer type of a device, then map/unmap pages of one of its buffers
+    if (strcmp(name, "ggml_backend_cuda_elastic_buffer_type") == 0) {
+        return (void *) +[](ggml_backend_dev_t dev) -> ggml_backend_buffer_type_t {
+            if (dev == nullptr || dev->iface.get_name != ggml_backend_cuda_device_get_name) {
+                return nullptr;
+            }
+            return ggml_backend_cuda_elastic_buffer_type(static_cast<ggml_backend_cuda_device_context *>(dev->context)->device);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_elastic_set_ranges") == 0) {
+        return (void *) +[](ggml_backend_buffer_t buf, const size_t * off, const size_t * len, int n) -> bool {
+            ggml_cuda_elastic * e = ggml_backend_cuda_buffer_elastic(buf);
+            return e != nullptr && ggml_cuda_elastic_set_ranges(e, off, len, n);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_elastic_mapped") == 0) {
+        return (void *) +[](ggml_backend_buffer_t buf) -> size_t {
+            ggml_cuda_elastic * e = ggml_backend_cuda_buffer_elastic(buf);
+            return e != nullptr ? ggml_cuda_elastic_mapped(e) : 0;
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_elastic_page") == 0) {
+        return (void *) +[](ggml_backend_buffer_t buf) -> size_t {
+            ggml_cuda_elastic * e = ggml_backend_cuda_buffer_elastic(buf);
+            return e != nullptr ? ggml_cuda_elastic_page(e) : 0;
+        };
     }
     if (strcmp(name, "ggml_backend_cuda_phase_arena_new_for_device") == 0) {
         return (void *) +[](ggml_backend_dev_t dev, size_t size) -> void * {
