@@ -1460,9 +1460,23 @@ struct server_slot {
         if (llama_draft_vocab_n_hot(ctx_dft) <= 0) {
             return;
         }
-        const auto & toks = prompt.tokens.get_tokens();
-        const size_t n    = std::min((size_t) stats.n_gen, toks.size());
-        llama_draft_vocab_observe(ctx_dft, toks.data() + (toks.size() - n), n);
+        if (!prompt.tokens.has_mtmd) {
+            const auto & toks = prompt.tokens.get_tokens();
+            const size_t n    = std::min((size_t) stats.n_gen, toks.size());
+            llama_draft_vocab_observe(ctx_dft, toks.data() + (toks.size() - n), n);
+        } else {
+            // get_tokens() asserts with an mmproj loaded; the generated tail is text, copy it by index
+            const size_t nt = prompt.tokens.size();
+            const size_t n  = std::min((size_t) stats.n_gen, nt);
+            llama_tokens tail;
+            tail.reserve(n);
+            for (size_t i = nt - n; i < nt; ++i) {
+                if (prompt.tokens[i] != LLAMA_TOKEN_NULL) {
+                    tail.push_back(prompt.tokens[i]);
+                }
+            }
+            llama_draft_vocab_observe(ctx_dft, tail.data(), tail.size());
+        }
     }
 
     void release() {
@@ -7078,7 +7092,20 @@ private:
                             if (!hot_carry && !others_busy) {
                                 n_reset = common_speculative_vocab_reset(spec_init.get());
                             }
-                            common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
+                            if (!input_tokens.has_mtmd) {
+                                common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
+                            } else {
+                                // with an mmproj loaded get_tokens() asserts; observe the text tokens only
+                                // (media positions hold LLAMA_TOKEN_NULL)
+                                llama_tokens text;
+                                text.reserve(input_tokens.size());
+                                for (size_t i = 0; i < input_tokens.size(); ++i) {
+                                    if (input_tokens[i] != LLAMA_TOKEN_NULL) {
+                                        text.push_back(input_tokens[i]);
+                                    }
+                                }
+                                common_speculative_observe(spec_init.get(), text);
+                            }
 
                             const int32_t n_replaced = common_speculative_refresh(spec_init.get());
 
