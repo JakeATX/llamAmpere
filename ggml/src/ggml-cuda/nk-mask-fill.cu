@@ -5,7 +5,7 @@
 //
 // - Vectorized 16-byte (uint4 = 8 halfs) multi-CTA stores when the row pointer is 16-byte aligned,
 //   saturating device memory bandwidth (~2 us for 1.6 MB on RTX 3090 vs ~500-750 us host build + PCIe).
-// - Inline kernel-arg counts for n_rows <= 32 (zero mapped host ring, zero event sync, zero mutex).
+// - By-value kernel-argument counts for n_rows <= 32 (zero mapped host ring, zero event sync, zero mutex).
 // - Mapped pinned ring fallback for n_rows > 32 (up to 65,535 rows).
 
 #include "nk-mask-fill.cuh"

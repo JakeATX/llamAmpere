@@ -51,8 +51,11 @@ static constexpr uint32_t LLAMA_SJ_KVARN_CKPT_END_MAGIC = 0x45434a53u; // "SJCE"
 // [PPIMPL] LLAMA_KQ_MASK_DEVICE: deferred sequence-prefix masks (llama-kv-cache.cpp)
 bool llama_kq_mask_device_enabled();
 bool llama_nk_dev_mask_enabled();
-bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector<int32_t> && n_visible);
-bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_visible, int64_t * n_kv);
+bool llama_nk_dev_mask_check_enabled();
+bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector<int32_t> && n_visible,
+                                const char * tag = "kq", bool has_host_ref = false);
+bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_visible, int64_t * n_kv,
+                                const char ** tag = nullptr, bool * has_host_ref = nullptr);
 void llama_kq_mask_deferred_fill_host(const ggml_tensor * t);
 
 class llama_kv_cache : public llama_memory_i {
