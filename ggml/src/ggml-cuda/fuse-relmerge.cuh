@@ -4,15 +4,15 @@
 
 #include <cstdlib>
 
-// [FUSE RELMERGE] (GGML_CUDA_FUSE_RELMERGE=1, default off): the Inkling far / near attention merge of a full-attention
-// visit at decode widths in one launch. The graph (llama-graph.cpp inkrel_merge, INKKV far/near split) runs it as
-// unpack CONCAT, ADD (far LSE + table constant), CONCAT, FILL, CONCAT, SOFT_MAX over (far, near, 0), 2x CONT, 2x MUL,
-// ADD and the output gate (SIGMOID, MUL): 12 kernels. One block per (q head, token), one thread per dv, the same
-// expressions in the same order (soft_max_f32's max / exp / sum / reciprocal, then the products and the sum).
+// [FUSE RELMERGE] (default on; GGML_CUDA_FUSE_RELMERGE=0 = off): the Inkling far / near attention merge of a
+// full-attention visit at decode widths in one launch. The graph (llama-graph.cpp inkrel_merge, INKKV far/near split)
+// runs it as unpack CONCAT, ADD (far LSE + table constant), CONCAT, FILL, CONCAT, SOFT_MAX over (far, near, 0), 2x
+// CONT, 2x MUL, ADD and the output gate (SIGMOID, MUL): 12 kernels. One block per (q head, token), one thread per dv,
+// the same expressions in the same order (soft_max_f32's max / exp / sum / reciprocal, then the products and the sum).
 static inline bool ggml_cuda_fuse_relmerge_on() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_FUSE_RELMERGE");
-        return e && *e && atoi(e) != 0;
+        return !e || !*e || atoi(e) != 0;
     }();
     return on;
 }

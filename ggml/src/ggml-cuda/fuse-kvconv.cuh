@@ -4,7 +4,7 @@
 
 #include <cstdlib>
 
-// [FUSE KVCONV] (GGML_CUDA_FUSE_KVCONV=1, default off): the K and V short convs of an Inkling sliding-window visit
+// [FUSE KVCONV] (default on; GGML_CUDA_FUSE_KVCONV=0 = off): the K and V short convs of an Inkling sliding-window visit
 // (two planned conv rings with the SCALE(ADD(x, conv)) epilogue, back to back in the graph) in one launch. The blocks
 // of the first unit run the first ring's arithmetic, the rest the second's: the expressions, order and window copies
 // of ssm_conv_ring_f32<false, 4, n_t, epi> for each, so both outputs and all windows are the same bytes. The caller
@@ -12,7 +12,7 @@
 static inline bool ggml_cuda_fuse_kvconv_on() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_FUSE_KVCONV");
-        return e && *e && atoi(e) != 0;
+        return !e || !*e || atoi(e) != 0;
     }();
     return on;
 }
