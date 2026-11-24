@@ -13,6 +13,7 @@
 #include "kv-stream-span-tuner.h"
 #include "inkattn.cuh"
 #include "inkfa.cuh"
+#include "inkgqa.cuh"
 #include "inksjd128.cuh"
 
 #include <algorithm>
@@ -4956,6 +4957,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
     // fork (INKATTN): relative bias table + gate inside the node (ggml-inkrel.h): no other route reads them
     if (ggml_flash_attn_ext_is_inkrel(dst)) {
+        // [INKGQA] GQA-group prefill (inkgqa.cu): the INKREL factor form, and table nodes under GGML_CUDA_INKGQA_SWA=1
+        if (ggml_cuda_inkgqa_inkrel_try(ctx, dst)) {
+            return;
+        }
+        GGML_ASSERT(!ggml_flash_attn_ext_is_inkrel_factor(dst) && "INKREL factor node refused by INKGQA");
         if (ggml_cuda_inkfa_try(ctx, dst)) { // [INKPREFILL] prefill widths (inkfa.cu, GGML_CUDA_INKFA=0 off)
             return;
         }
@@ -4997,6 +5003,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     ggml_cuda_qsa_resident_prepare(ctx, dst);
+
+    // [INKGQA] GGML_CUDA_INKGQA_FAR=1: plain F16 GQA-3 D128 prefill nodes (inkgqa.cu; declines anything else)
+    if (dst->src[6] == nullptr && ggml_cuda_inkgqa_fa_try(ctx, dst)) {
+        return;
+    }
 
     // SJ-KVaRN region-aware attention (sink/ring f16 rows + sealed 4-bit body records): dedicated MMA path.
     if (dst->src[6] != nullptr) {
@@ -5094,7 +5105,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     if (ggml_flash_attn_ext_is_inkrel(dst)) {
-        return ggml_cuda_inkfa_supported(device, dst) || ggml_cuda_inkattn_supported(device, dst); // [INKPREFILL] inkfa.cu
+        if (ggml_cuda_inkgqa_inkrel_supported(device, dst)) { // [INKGQA] inkgqa.cu
+            return true;
+        }
+        return !ggml_flash_attn_ext_is_inkrel_factor(dst) &&
+            (ggml_cuda_inkfa_supported(device, dst) || ggml_cuda_inkattn_supported(device, dst)); // [INKPREFILL] inkfa.cu
     }
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         // kv_rows (src[9]): generic MMA f16 route only (see ggml_cuda_flash_attn_ext)

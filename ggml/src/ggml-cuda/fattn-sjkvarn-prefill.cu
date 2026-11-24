@@ -5,6 +5,7 @@
 #include "fattn-prefill-policy.h"
 #include "fattn-sjkvarn-rot.cuh"
 #include "ggml-inksj.h"
+#include "inkgqa.cuh"
 #include "qsa-resident-clock.cuh"
 #include "sjkvarn-lowbits.cuh"
 #include "sjkvarn-seal.cuh"
@@ -856,6 +857,9 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_inksj_prefill(ggml_backend_cuda_context &
                     lc.nb[3] = lc.nb[2];
                     lc.data  = lg.ptr + (size_t) c0*r;
                     oc.src[9] = &lc;
+                }
+                if (ggml_cuda_inkgqa_fa_try(ctx, &oc)) { // [INKGQA] GGML_CUDA_INKGQA_FAR=1: exact GQA-3 tile, no padded head
+                    continue;
                 }
                 if (mc.ne[2] != 1 || oc.src[4] != nullptr) { // (a padded GQA tile reads sinks past the view)
                     ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &oc);
