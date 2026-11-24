@@ -401,6 +401,19 @@ void llama_memory_hybrid_iswa_context::ink_b1_save() {
     ctx_recr->b1_save();
 }
 
+bool llama_memory_hybrid_iswa_context::ink_b1_undo_mark() {
+    if (!static_cast<llama_kv_cache_iswa_context *>(ctx_attn.get())->ink_b1_undo_mark()) {
+        return false;
+    }
+    static_cast<llama_memory_recurrent_context *>(ctx_recr.get())->b1_undo_mark();
+    return true;
+}
+
+void llama_memory_hybrid_iswa_context::ink_b1_undo() {
+    static_cast<llama_kv_cache_iswa_context *>(ctx_attn.get())->ink_b1_undo();
+    static_cast<llama_memory_recurrent_context *>(ctx_recr.get())->b1_undo();
+}
+
 bool llama_memory_hybrid_iswa_context::ink_b1_seek(size_t i) {
     if (i >= ubatches.size() || !static_cast<llama_kv_cache_iswa_context *>(ctx_attn.get())->ink_b1_seek(i) ||
             !ctx_recr->b1_seek(i)) {

@@ -7123,9 +7123,10 @@ bool llama_context::ink_stream_release(const char * why) {
 }
 
 // fork (INKB1): layer-major prompt of a looped model, see llama-context.h. Returns 4 when this call runs layer-major
-// (every ubatch applied and saved, the carries made), 0 for the normal order (nothing applied), < 0 for a decode error
-// after the memory was touched (the sequence is cleared). LLAMA_INK_B1=1 turns it on; LLAMA_INK_B1_GROUP=N caps the
-// ubatches per group; LLAMA_INK_B1_MARGIN_MIB (default 768) is the VRAM kept free beside the carries and input copies.
+// (every ubatch applied and saved, the carries made), 0 for the normal order (nothing applied), 5 for the normal order
+// after the applies were given back (the memory context must be made again). LLAMA_INK_B1=1 turns it on;
+// LLAMA_INK_B1_GROUP=N caps the ubatches per group; LLAMA_INK_B1_MARGIN_MIB (default 768) is the VRAM kept free beside
+// the carries and input copies.
 int llama_context::ink_b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp) {
     static const bool on = [] { const char * e = getenv("LLAMA_INK_B1"); return e && atoi(e) != 0; }();
     if (!on || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !ink_stream || !ink_stream->armed()) {
@@ -7208,6 +7209,12 @@ int llama_context::ink_b1_prepare(llama_memory_context_i * mctx, const llama_bat
             llm_graph_input_mem_hybrid_iswa_rel::INK_B1_N_ROLES*align;
     static const int64_t margin_mib = [] { const char * e = getenv("LLAMA_INK_B1_MARGIN_MIB"); return e ? atoll(e) : 768ll; }();
     static const int64_t cap = [] { const char * e = getenv("LLAMA_INK_B1_GROUP"); return e ? atoll(e) : 0ll; }();
+    // nothing of an earlier call may hold card memory while this one measures it
+    ink_b1_end();
+    ink_b1.carry.clear();
+    ink_b1.inputs.clear();
+    ink_b1.carry_buf.reset();
+    ink_b1.ctx.reset();
     size_t free_vram = 0, total_vram = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(gpu), &free_vram, &total_vram);
     const int64_t room = (int64_t) free_vram - (margin_mib << 20);
@@ -7246,23 +7253,42 @@ int llama_context::ink_b1_prepare(llama_memory_context_i * mctx, const llama_bat
         }
     }
 
-    // apply every ubatch now, saving each memory view (the normal order applies them in the same order)
+    std::vector<std::array<ink_b1_input, 5>> inputs(G);
+
+    // apply every ubatch now, saving each memory view (the normal order applies them in the same order). Until a
+    // graph starts, the applies can be given back exactly (cells, heads, recurrent slots, SJ-KVaRN bookkeeping and
+    // records), so a call that cannot run layer-major takes the normal order instead of losing the sequence.
+    if (!hctx->ink_b1_undo_mark()) {
+        return normal("the full-attention cells of the call are not fresh (no exact undo)");
+    }
     sj->b1_sj_begin(seq);
-    size_t n_applied = 0;
-    do {
-        if (!hctx->apply()) {
-            LLAMA_LOG_ERROR("%s: [INKB1] failed to apply memory context of ubatch %zu\n", __func__, n_applied);
-            break;
-        }
-        hctx->ink_b1_save();
-        ++n_applied;
-    } while (hctx->next());
-    if (n_applied != n_ub || !hctx->ink_b1_seek(0)) {
-        // the SWA half may have reused cells of earlier positions while applying: only a full clear is exact
+    auto give_back = [&]() {
+        hctx->ink_b1_undo();
         sj->b1_sj_rewind();
-        LLAMA_LOG_WARN("%s: [INKB1] removing memory module entries for seq_id = %d, pos = [0, +inf)\n", __func__, seq);
-        memory->seq_rm(seq, -1, -1);
-        return -3;
+    };
+    bool applied = true;
+    try {
+        size_t n_applied = 0;
+        do {
+            if (!hctx->apply()) {
+                LLAMA_LOG_ERROR("%s: [INKB1] failed to apply memory context of ubatch %zu\n", __func__, n_applied);
+                break;
+            }
+            hctx->ink_b1_save();
+            ++n_applied;
+        } while (hctx->next());
+        // a short SJ-KVaRN record pool shows here (b1_sj_save could not take the records, the seek fails)
+        applied = n_applied == n_ub && hctx->ink_b1_seek(0);
+    } catch (...) {
+        give_back();
+        throw;
+    }
+    if (!applied) {
+        give_back();
+        ink_b1.normal_calls++;
+        ink_b1.normal_why = "the per-ubatch views could not be made (SJ-KVaRN record pool?); applies given back";
+        LLAMA_LOG_WARN("%s: [INKB1] the per-ubatch memory views could not be made: applies given back, normal order\n", __func__);
+        return 5;
     }
 
     ink_b1.active    = true;
@@ -7274,9 +7300,9 @@ int llama_context::ink_b1_prepare(llama_memory_context_i * mctx, const llama_bat
     ink_b1.ctx       = std::move(ctx);
     ink_b1.carry_buf = std::move(buf);
     ink_b1.carry     = std::move(carry);
-    ink_b1.inputs.clear();
-    ink_b1.inputs.resize(G);
+    ink_b1.inputs    = std::move(inputs);
     ink_b1.input_budget = input_slot;
+    ink_b1.n_started = 0;
     ink_b1.calls++;
     ink_b1.groups   += n_groups;
     ink_b1.ubatches += n_ub;
@@ -7315,10 +7341,10 @@ bool llama_context::ink_b1_run_prefix(llama_memory_context_i * mctx, size_t ub0,
             b1_cur = { true, p, p + 1, ink_b1.carry[u], nullptr, 0, il };
             const auto * res = process_ubatch(hctx->get_ubatch(), gtype, hctx, status);
             b1_cur = {};
-            ink_b1.graphs++;
             if (!res) {
                 return false;
             }
+            ink_b1.graphs++;
         }
     }
     if (!hctx->ink_b1_seek(ub0)) {
@@ -7374,6 +7400,7 @@ void llama_context::ink_b1_bind(llm_graph_result * res) {
 // [INKB1] after set_inputs: copy the large inputs this graph filled on the host to the card for its ubatch's later
 // graphs. A copy that cannot be made leaves that input to be filled again by each graph (slower, same values).
 void llama_context::ink_b1_capture(llm_graph_result * res) {
+    ink_b1.n_started++; // the inputs are set: from here on the graph may run, the applies can no longer be given back
     auto * inp = ink_b1_mem_input(res);
     if (!inp || ink_b1.slot >= ink_b1.inputs.size()) {
         return;
@@ -7434,6 +7461,35 @@ void llama_context::ink_b1_end() {
     ink_b1.carry_buf.reset();
     ink_b1.ctx.reset();
     ink_b1.slot = 0;
+}
+
+// [INKB1] a layer-major call that cannot finish (failure or exception): no binds, carries or kept inputs outlive it,
+// and the memory is left as the normal order expects. true: no graph had started, the applies were given back (the
+// memory is as before the call); false: the sequence was cleared. Either way nothing of the call is kept.
+bool llama_context::ink_b1_abandon(llama_memory_context_i * mctx) noexcept {
+    b1_cur = {};
+    const bool   give_back = ink_b1.n_started == 0;
+    const size_t n_ub      = ink_b1.n_ub;
+    const llama_seq_id seq = ink_b1.seq;
+    ink_b1_end();
+    try {
+        auto * hctx = static_cast<llama_memory_hybrid_iswa_context *>(mctx);
+        auto * sj   = llama_sj_kvarn_cache(memory.get());
+        if (give_back) {
+            hctx->ink_b1_undo();
+            if (sj) {
+                sj->b1_sj_rewind();
+            }
+            return true;
+        }
+        // the cells of the last apply (what the memory holds after the call) before the clear
+        hctx->ink_b1_seek(n_ub - 1);
+        LLAMA_LOG_WARN("%s: [INKB1] removing memory module entries for seq_id = %d, pos = [0, +inf)\n", __func__, seq);
+        memory->seq_rm(seq, -1, -1);
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: [INKB1] exception while giving the memory back\n", __func__);
+    }
+    return false;
 }
 
 // [INKB1] once per streamed prompt (at the streamer's release): calls, groups and visit graphs; with the INKSTREAM
@@ -7989,7 +8045,27 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // applied and saved, the carries made
     if (b1_mode == 0) {
         b1_mode = ink_b1_prepare(mctx.get(), batch_inp);
+        if (b1_mode == 5) {
+            // the applies were given back: the normal order with a fresh memory context
+            mctx.reset();
+            mctx = memory->init_batch(*balloc, turn_ubatch, embd_all);
+            if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: [INKB1] cannot prepare the normal-order ubatches\n", __func__);
+                return -2;
+            }
+            b1_mode = 0;
+        }
     }
+    // [INKB1] an exception out of a layer-major call: abandon it (binds, carries, kept inputs, swapped SWA cells)
+    struct ink_b1_unwind {
+        llama_context * lctx;
+        llama_memory_context_i * mctx;
+        ~ink_b1_unwind() {
+            if (mctx && lctx->ink_b1.active) {
+                lctx->ink_b1_abandon(mctx);
+            }
+        }
+    } ink_b1_unwind_ { this, b1_mode == 4 ? mctx.get() : nullptr };
     pp_dec.mark("b1_prepare");
     if (ple_pf && ple_pf_late && b1_mode >= 0 && ple_pf->start(batch_inp, balloc->get_batch().pos[0])) {
         ple_pf_g.p = ple_pf.get();
@@ -8089,20 +8165,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     };
 
-    // [INKB1] on a failure the layers stopped at different ubatches: only a full clear of the sequence is exact
+    // [INKB1] on a failure the layers stopped at different ubatches: the applies are given back if no graph had
+    // started, else the sequence is cleared. Nothing of the call is kept either way, so never 2 (an abort), which
+    // tells the caller that the ubatches before the failing one are in the memory.
     auto ink_b1_fail = [&](ggml_status st) -> int {
-        b1_cur = {};
-        const llama_seq_id seq = ink_b1.seq;
-        ink_b1_end();
-        // the cells of the last apply (what the memory holds after the call) before the clear
-        static_cast<llama_memory_hybrid_iswa_context *>(mctx.get())->ink_b1_seek(ink_b1.n_ub - 1);
-        LLAMA_LOG_WARN("%s: [INKB1] removing memory module entries for seq_id = %d, pos = [0, +inf)\n", __func__, seq);
-        memory->seq_rm(seq, -1, -1);
-        switch (st) {
-            case GGML_STATUS_ABORTED:      return 2;
-            case GGML_STATUS_ALLOC_FAILED: return -2;
-            default:                       return -3;
-        }
+        ink_b1_abandon(mctx.get());
+        return st == GGML_STATUS_ALLOC_FAILED ? -2 : -3;
     };
 
     // start a new sampling transaction for this logical batch
@@ -8178,12 +8246,34 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (b1_i % ink_b1.G == 0) {
                 ggml_status st_pre = GGML_STATUS_SUCCESS;
                 if (!ink_b1_run_prefix(mctx.get(), b1_i, st_pre)) {
-                    return ink_b1_fail(st_pre);
+                    if (st_pre != GGML_STATUS_ALLOC_FAILED || ink_b1.n_started > 0) {
+                        return ink_b1_fail(st_pre);
+                    }
+                    // the first one-visit graph did not fit and nothing ran: give the applies back and run this call
+                    // in the normal order with a fresh memory context
+                    const size_t n_groups = (ink_b1.n_ub + ink_b1.G - 1)/ink_b1.G;
+                    ink_b1.calls--;
+                    ink_b1.groups   -= n_groups;
+                    ink_b1.ubatches -= ink_b1.n_ub;
+                    ink_b1.normal_calls++;
+                    ink_b1.normal_why = "the first one-visit graph did not fit; applies given back";
+                    ink_b1_abandon(mctx.get());
+                    ink_b1_unwind_.mctx = nullptr;
+                    LLAMA_LOG_WARN("%s: [INKB1] the first one-visit graph did not fit: applies given back, normal order\n", __func__);
+                    mctx.reset();
+                    mctx = memory->init_batch(*balloc, turn_ubatch, embd_all);
+                    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("%s: [INKB1] cannot prepare the normal-order ubatches\n", __func__);
+                        return -2;
+                    }
+                    b1_mode = 0;
                 }
             }
-            const int32_t p_last = (int32_t) model.hparams.n_layer() - 1;
-            ink_b1.slot = b1_i % ink_b1.G;
-            b1_cur = { true, p_last, p_last + 1, ink_b1.carry[b1_i], nullptr, 0, model.ink_b1_visit_slot(p_last) };
+            if (b1_mode == 4) {
+                const int32_t p_last = (int32_t) model.hparams.n_layer() - 1;
+                ink_b1.slot = b1_i % ink_b1.G;
+                b1_cur = { true, p_last, p_last + 1, ink_b1.carry[b1_i], nullptr, 0, model.ink_b1_visit_slot(p_last) };
+            }
         }
 
         const auto & ubatch = mctx->get_ubatch();
@@ -8249,10 +8339,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
         if (b1_mode == 4) {
             b1_cur = {};
-            ++ink_b1.graphs;
             if (!res) {
                 return ink_b1_fail(status);
             }
+            ++ink_b1.graphs;
         }
 
         if (!res) {

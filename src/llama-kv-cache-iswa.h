@@ -189,6 +189,8 @@ public:
     bool ink_b1_supported() const;
     void ink_b1_save();
     bool ink_b1_seek(size_t i);
+    bool ink_b1_undo_mark(); // before the first apply: the base keeps the cells it fills, the SWA half all its cells
+    void ink_b1_undo();
 
 private:
     //llama_kv_cache_iswa * kv;

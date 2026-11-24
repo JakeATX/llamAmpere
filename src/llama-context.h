@@ -919,6 +919,7 @@ private:
         size_t   g_max = 0;
         size_t   carry_bytes_max = 0, input_bytes_max = 0;
         size_t   input_budget = 0; // card bytes of kept inputs per group slot that the group size was planned for
+        size_t   n_started = 0;    // one-visit graphs of this call that set their inputs (the KV / state data may change)
         const char * normal_why = nullptr;
     } ink_b1;
     int  ink_b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp);
@@ -927,6 +928,7 @@ private:
     void ink_b1_bind(llm_graph_result * res);
     void ink_b1_capture(llm_graph_result * res);
     void ink_b1_end();
+    bool ink_b1_abandon(llama_memory_context_i * mctx) noexcept;
     void ink_b1_log_prompt();
 
     // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),

@@ -146,6 +146,10 @@ public:
     bool   ink_b1_supported() const;
     void   ink_b1_save();
     bool   ink_b1_seek(size_t i);
+    // before the first apply: what an undo needs; ink_b1_undo() puts the memory back as before the call (only while
+    // none of its graphs has started: the KV and state data are untouched then)
+    bool   ink_b1_undo_mark();
+    void   ink_b1_undo();
     size_t ink_b1_n_ubatch() const { return ubatches.size(); }
     uint32_t ink_b1_ubatch_tokens(size_t i) const { return ubatches[i].n_tokens; }
 

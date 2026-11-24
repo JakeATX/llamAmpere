@@ -750,6 +750,16 @@ void llama_kv_cache_iswa_context::ink_b1_save() {
     static_cast<llama_kv_cache_context *>(ctx_swa.get())->b1_save_cells();
 }
 
+bool llama_kv_cache_iswa_context::ink_b1_undo_mark() {
+    return static_cast<llama_kv_cache_context *>(ctx_base.get())->b1_undo_mark(false) &&
+           static_cast<llama_kv_cache_context *>(ctx_swa.get())->b1_undo_mark(true);
+}
+
+void llama_kv_cache_iswa_context::ink_b1_undo() {
+    static_cast<llama_kv_cache_context *>(ctx_base.get())->b1_undo();
+    static_cast<llama_kv_cache_context *>(ctx_swa.get())->b1_undo();
+}
+
 bool llama_kv_cache_iswa_context::ink_b1_seek(size_t i) {
     if (i >= ubatches.size() || !static_cast<llama_kv_cache_context *>(ctx_base.get())->b1_seek(i) ||
             !static_cast<llama_kv_cache_context *>(ctx_swa.get())->b1_seek_cells(i)) {

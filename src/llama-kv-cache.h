@@ -332,6 +332,11 @@ public:
     bool b1_cells_supported() const { return other == nullptr && v_cells_impl.use_count() == 1; } // no cell sharing
     llama_kv_cells_vec b1_cells_copy() const { return v_cells; }
     void b1_cells_swap(llama_kv_cells_vec & cells) { std::swap(v_cells, cells); }
+    // [INKB1] undo of a call's applies while none of its graphs has started: the heads, and either all the cell
+    // metadata (whole: a cache that reuses cells within the call) or the cells the call fills, which must all be empty
+    // and distinct before it (then apply_ubatch touches no other cell). false: no exact undo, nothing kept.
+    bool b1_undo_mark(const slot_info_vec_t & sinfos, bool whole);
+    void b1_undo();
     int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
     // sealed end: of the sequence's stream (seq_id >= 0), or the largest over all streams (seq_id < 0)
     uint32_t get_sj_kvarn_sealed_end(llama_seq_id seq_id = -1) const;
@@ -686,6 +691,15 @@ private:
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
+    // [INKB1] b1_undo_mark / b1_undo
+    struct {
+        bool on    = false;
+        bool whole = false;
+        std::vector<uint32_t> heads;
+        llama_kv_cells_vec    cells;
+        std::vector<std::pair<uint32_t, uint32_t>> filled; // (stream, cell)
+    } b1_undo_st;
+
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
@@ -824,6 +838,9 @@ public:
     bool b1_cells_supported() const { return kv->b1_cells_supported(); }
     void b1_save_cells();
     bool b1_seek_cells(size_t i);
+    // before the call's first apply / when none of its graphs has started (llama_kv_cache::b1_undo_*)
+    bool b1_undo_mark(bool whole) { return kv->b1_undo_mark(sinfos, whole); }
+    void b1_undo() { kv->b1_undo(); }
 
     //
     // llama_kv_cache_context specific API

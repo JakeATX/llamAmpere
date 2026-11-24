@@ -8132,6 +8132,56 @@ void llama_kv_cache_context::b1_save_cells() {
     b1_cells_live       = i_cur; // the cache holds the cells after this apply
 }
 
+bool llama_kv_cache::b1_undo_mark(const slot_info_vec_t & sinfos, bool whole) {
+    b1_undo_st = {};
+    if (other) {
+        return false;
+    }
+    if (!whole) {
+        for (const auto & sinfo : sinfos) {
+            for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+                const uint32_t strm = sinfo.strm[s];
+                for (const uint32_t idx : sinfo.idxs[s]) {
+                    if (!v_cells[strm].is_empty(idx)) {
+                        b1_undo_st = {};
+                        return false;
+                    }
+                    b1_undo_st.filled.emplace_back(strm, idx);
+                }
+            }
+        }
+        auto sorted = b1_undo_st.filled;
+        std::sort(sorted.begin(), sorted.end());
+        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+            b1_undo_st = {};
+            return false;
+        }
+    } else {
+        b1_undo_st.cells = v_cells;
+    }
+    b1_undo_st.heads = v_heads;
+    b1_undo_st.whole = whole;
+    b1_undo_st.on    = true;
+    return true;
+}
+
+void llama_kv_cache::b1_undo() {
+    if (!b1_undo_st.on) {
+        return;
+    }
+    if (b1_undo_st.whole) {
+        std::swap(v_cells, b1_undo_st.cells);
+    } else {
+        for (const auto & [strm, idx] : b1_undo_st.filled) {
+            if (!v_cells[strm].is_empty(idx)) {
+                v_cells[strm].rm(idx);
+            }
+        }
+    }
+    std::swap(v_heads, b1_undo_st.heads);
+    b1_undo_st = {};
+}
+
 bool llama_kv_cache_context::b1_seek_cells(size_t i) {
     if (i >= b1_cells.size() || b1_cells_live >= b1_cells.size() || !b1_seek(i)) {
         return false;
