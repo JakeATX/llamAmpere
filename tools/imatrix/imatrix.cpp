@@ -76,7 +76,21 @@ public:
     const std::unordered_map<std::string, Stats> & get_mstats() const { return m_stats; }
     void set_n_layer_nextn(int32_t n_layer_nextn) { m_n_layer_nextn = n_layer_nextn; }
     int32_t get_n_layer_nextn() const { return m_n_layer_nextn; }
+    // LAMQ-CALIB (LLAMA_IMATRIX_TOKEN_WEIGHTS): per-token weights of the batch being decoded; empty = unweighted (default)
+    void set_token_weights(const float * w, size_t n) { if (w) { m_tok_w.assign(w, w + n); } else { m_tok_w.clear(); } }
 private:
+    std::vector<float>                      m_tok_w;
+    int64_t                                 m_tok_w_miss = 0;
+    // weights for an activation with n_tok token rows; nullptr (= unweighted) when the rows are not the batch tokens
+    const float * tok_w_for(int64_t n_tok) {
+        if (m_tok_w.empty()) { return nullptr; }
+        if ((size_t) n_tok == m_tok_w.size()) { return m_tok_w.data(); }
+        if (m_tok_w_miss++ == 0) {
+            LOG_WRN("%s: LLAMA_IMATRIX_TOKEN_WEIGHTS: activation with %lld rows vs %zu batch tokens, collected unweighted\n",
+                    __func__, (long long) n_tok, m_tok_w.size());
+        }
+        return nullptr;
+    }
     std::unordered_map<std::string, Stats>  m_stats;
     common_params                           m_params;
     std::mutex                              m_mutex;
@@ -642,6 +656,7 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         const int64_t ne0 = src1->ne[0];
         const int64_t n_tokens = src1->ne[2];
         const bool has_act = !e.activations.empty();
+        const float * tw = tok_w_for(n_tokens);
 
         // single pass over the routing ids
         std::vector<uint8_t> touched(n_as, 0);
@@ -656,9 +671,17 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
                 e.counts[ex]++;
                 touched[ex] = 1;
-                for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
-                if (act) {
-                    for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+                if (!tw) {
+                    for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
+                    if (act) {
+                        for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+                    }
+                } else {
+                    const float w = tw[row];
+                    for (int64_t j = 0; j < ne0; ++j) { acc[j] += w * x[j] * x[j]; }
+                    if (act) {
+                        for (int64_t j = 0; j < ne0; ++j) { act[j] += w * x[j]; }
+                    }
                 }
             }
         }
@@ -717,6 +740,8 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
         const int64_t ne0 = src1->ne[0];
         const bool has_act = !e.activations.empty();
+        // rows of a dense matmul are the batch tokens in order (n_ubatch == n_batch, one sequence)
+        const float * tw = m_tok_w.empty() ? nullptr : tok_w_for(src1->ne[2] * src1->ne[3] == 1 ? src1->ne[1] : -1);
         for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
             for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
                 // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
@@ -725,9 +750,17 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 float * act = has_act ? e.activations.data() + mat_id * ne0 : nullptr;
                 for (int64_t row = 0; row < src1->ne[1]; ++row) {
                     const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
-                    for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
-                    if (act) {
-                        for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+                    if (!tw) {
+                        for (int64_t j = 0; j < ne0; ++j) { acc[j] += x[j] * x[j]; }
+                        if (act) {
+                            for (int64_t j = 0; j < ne0; ++j) { act[j] += x[j]; }
+                        }
+                    } else {
+                        const float w = tw[row];
+                        for (int64_t j = 0; j < ne0; ++j) { acc[j] += w * x[j] * x[j]; }
+                        if (act) {
+                            for (int64_t j = 0; j < ne0; ++j) { act[j] += w * x[j]; }
+                        }
                     }
                 }
             }
@@ -1432,7 +1465,57 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     auto tim1 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
+    std::vector<llama_token> tokens;
+    // LAMQ-CALIB: LLAMA_IMATRIX_INPUT_IDS = raw int32 token ids (e.g. the model's own sampled answers) used instead of the
+    // tokenized text; LLAMA_IMATRIX_TOKEN_WEIGHTS = float32 per token of that stream (digits/entities high, rest low).
+    // Both unset = default behaviour.
+    const char * ids_path = getenv("LLAMA_IMATRIX_INPUT_IDS");
+    const char * tw_path  = getenv("LLAMA_IMATRIX_TOKEN_WEIGHTS");
+    std::vector<float> tok_w;
+    auto read_bin = [](const char * path, size_t elt, std::vector<char> & out) {
+        FILE * f = fopen(path, "rb");
+        if (!f) { return false; }
+        fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
+        out.resize(n > 0 ? (size_t) n : 0);
+        const bool ok = n > 0 && n % (long) elt == 0 && fread(out.data(), 1, out.size(), f) == out.size();
+        fclose(f);
+        return ok;
+    };
+    if (ids_path && *ids_path) {
+        std::vector<char> raw;
+        if (!read_bin(ids_path, sizeof(int32_t), raw)) { LOG_ERR("%s: cannot read LLAMA_IMATRIX_INPUT_IDS %s\n", __func__, ids_path); return false; }
+        tokens.resize(raw.size() / sizeof(int32_t));
+        memcpy(tokens.data(), raw.data(), raw.size());
+        const int32_t n_vocab_ids = llama_vocab_n_tokens(vocab);
+        for (const auto t : tokens) { if (t < 0 || t >= n_vocab_ids) { LOG_ERR("%s: token id %d out of range\n", __func__, t); return false; } }
+        LOG_INF("%s: LLAMA_IMATRIX_INPUT_IDS: %zu raw token ids from %s\n", __func__, tokens.size(), ids_path);
+    } else {
+        tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
+    }
+    if (tw_path && *tw_path) {
+        std::vector<char> raw;
+        if (!read_bin(tw_path, sizeof(float), raw)) { LOG_ERR("%s: cannot read LLAMA_IMATRIX_TOKEN_WEIGHTS %s\n", __func__, tw_path); return false; }
+        tok_w.resize(raw.size() / sizeof(float));
+        memcpy(tok_w.data(), raw.data(), raw.size());
+        if (tok_w.size() != tokens.size()) {
+            LOG_ERR("%s: LLAMA_IMATRIX_TOKEN_WEIGHTS has %zu weights for %zu tokens\n", __func__, tok_w.size(), tokens.size());
+            return false;
+        }
+        if (params.n_ubatch < params.n_batch || params.n_batch > n_ctx || nextn != nullptr) {
+            LOG_ERR("%s: LLAMA_IMATRIX_TOKEN_WEIGHTS needs -ub >= -b, -b <= -c (one sequence per batch) and no --nextn\n", __func__);
+            return false;
+        }
+        double sw = 0.0;
+        for (const float w : tok_w) {
+            if (!std::isfinite(w) || w < 0.0f) { LOG_ERR("%s: bad token weight %g\n", __func__, w); return false; }
+            sw += w;
+        }
+        if (sw <= 0.0) { LOG_ERR("%s: token weights sum to 0\n", __func__); return false; }
+        // normalise to mean 1 so the stored sums keep the unweighted scale (counts stay token counts)
+        const float inv = (float) (tok_w.size() / sw);
+        for (auto & w : tok_w) { w *= inv; }
+        LOG_INF("%s: LLAMA_IMATRIX_TOKEN_WEIGHTS: %zu weights from %s (normalised to mean 1)\n", __func__, tok_w.size(), tw_path);
+    }
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -1444,6 +1527,7 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
         }
         LOG_INF("%s: removing initial %d chunks (%d tokens)\n", __func__, params.i_chunk, params.i_chunk*n_ctx);
         tokens.erase(tokens.begin(), tokens.begin() + params.i_chunk*n_ctx);
+        if (!tok_w.empty()) { tok_w.erase(tok_w.begin(), tok_w.begin() + params.i_chunk*n_ctx); }
     }
 
     if (int(tokens.size()) < 2*n_ctx) {
@@ -1526,6 +1610,11 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
 
                 // restore the original token in case it was set to BOS
                 tokens[seq_start] = token_org;
+            }
+
+            if (!tok_w.empty()) {
+                // one sequence per batch (checked above); the BOS swap keeps the original token's weight
+                g_collector.set_token_weights(tok_w.data() + batch_start, batch_size);
             }
 
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
@@ -1879,6 +1968,12 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s : failed to load %s\n", __func__, in_file.c_str());
             return 1;
         }
+    }
+
+    // LAMQ-CALIB: a raw id stream stands in for the prompt text
+    const char * lamq_ids = getenv("LLAMA_IMATRIX_INPUT_IDS");
+    if (params.prompt.empty() && lamq_ids && *lamq_ids) {
+        params.prompt = " ";
     }
 
     if (params.prompt.empty()) {
