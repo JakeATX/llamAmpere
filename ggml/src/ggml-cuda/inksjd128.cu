@@ -17,6 +17,7 @@
 #include "inksjd128.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "inkgqa.cuh"
 #include "qsa-resident.cuh"
 
 #include <algorithm>
@@ -376,7 +377,9 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             out.nb[d] = out.nb[d - 1]*out.ne[d - 1];
         }
         out.data = Ou; out.buffer = nullptr; out.view_src = nullptr; out.view_offs = 0;
-        ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &out);
+        if (!ggml_cuda_inkgqa_fa_try(ctx, &out)) { // [INKGQA] GGML_CUDA_INKGQA_FAR=1: one K/V tile per 3 q heads
+            ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &out);
+        }
 
         const int64_t rows_o = (int64_t) T*Hg;
         const dim3 grid((unsigned) ((rows_o + 7)/8));
