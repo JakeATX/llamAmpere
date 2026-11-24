@@ -187,6 +187,9 @@ using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_in
 // statistics, and re-rank/upload the hot slots. Both are no-ops without a hot tail and must be
 // called from the decoding thread at a request boundary.
 void    common_speculative_observe(common_speculative_init_result * spec, const llama_tokens & toks);
+
+// stop (or resume) mirroring seq_id's target rows into the draft in common_speculative_process()
+void common_speculative_set_seq_muted(common_speculative * spec, llama_seq_id seq_id, bool muted);
 int32_t common_speculative_refresh(common_speculative_init_result * spec);
 int32_t common_speculative_vocab_reset(common_speculative_init_result * spec);
 

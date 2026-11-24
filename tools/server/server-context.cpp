@@ -219,8 +219,8 @@ static bool server_copy_inplace() {
     return v;
 }
 
-// NaN guard (LLAMA_SERVER_NAN_GUARD=0 turns it off). Idea from Strata v0.2.19 core/verify.cpp (MIT); clean
-// reimplementation. A NaN or +inf logit on the sampled row means the forward pass produced garbage; sampling from it
+// NaN guard (LLAMA_SERVER_NAN_GUARD=0 turns it off).
+// A NaN or +inf logit on the sampled row means the forward pass produced garbage; sampling from it
 // gives junk tokens and the slot's cached state would poison later turns. O(1) per token: only the sampled candidate
 // is read (a NaN hidden state makes every logit NaN). -inf is legal (masked tokens) and is not flagged.
 // LLAMA_SERVER_NAN_GUARD_INJECT=<n> (test only) trips the guard from the n-th generated token of every request.
@@ -1008,7 +1008,7 @@ struct server_slot {
     // hand_over_ckpts [#187]: the cache entry takes this slot's checkpoints by move (no multi-GiB copy on the
     // request's critical path); the caller then runs prompt_reclaim_checkpoints once prompt_load has decided
     server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool hand_over_ckpts = false) {
-        if (prompt.tokens.size() == 0 || state_save_unsupported) {
+        if (prompt.tokens.size() == 0 || state_save_unsupported || spec_media) { // [VISSPEC] no valid draft state
             return nullptr;
         }
 
@@ -1381,8 +1381,11 @@ struct server_slot {
         return state != SLOT_STATE_IDLE;
     }
 
+    // [VISSPEC] this request's prompt has media and the drafter cannot hold it (M-RoPE target): no speculation
+    bool spec_media = false;
+
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && !spec_media;
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -1498,9 +1501,23 @@ struct server_slot {
         if (llama_draft_vocab_n_hot(ctx_dft) <= 0) {
             return;
         }
-        const auto & toks = prompt.tokens.get_tokens();
-        const size_t n    = std::min((size_t) stats.n_gen, toks.size());
-        llama_draft_vocab_observe(ctx_dft, toks.data() + (toks.size() - n), n);
+        if (!prompt.tokens.has_mtmd) {
+            const auto & toks = prompt.tokens.get_tokens();
+            const size_t n    = std::min((size_t) stats.n_gen, toks.size());
+            llama_draft_vocab_observe(ctx_dft, toks.data() + (toks.size() - n), n);
+        } else {
+            // get_tokens() asserts with an mmproj loaded; the generated tail is text, copy it by index
+            const size_t nt = prompt.tokens.size();
+            const size_t n  = std::min((size_t) stats.n_gen, nt);
+            llama_tokens tail;
+            tail.reserve(n);
+            for (size_t i = nt - n; i < nt; ++i) {
+                if (prompt.tokens[i] != LLAMA_TOKEN_NULL) {
+                    tail.push_back(prompt.tokens[i]);
+                }
+            }
+            llama_draft_vocab_observe(ctx_dft, tail.data(), tail.size());
+        }
     }
 
     void release() {
@@ -1854,7 +1871,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 struct cb_data_t {
                     common_speculative * spec;
                     llama_context * ctx;
-                } cb_data = { slot.spec, slot.ctx_tgt };
+                } cb_data = { slot.spec_media ? nullptr : slot.spec, slot.ctx_tgt };
 
                 static auto cb = [](const mtmd_helper_embd_batch * b, void * user_data) {
                     const auto * data = static_cast<cb_data_t *>(user_data);
@@ -2643,6 +2660,20 @@ private:
             int64_t t_start = ggml_time_us();
             mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             mmproj_usage_t_us = ggml_time_us() - t_start;
+        }
+
+        // fork (INKVIS): an auto-sized MoE expert cache (small-card presets) takes the free VRAM left after the target
+        // context, and the mmproj loads after it: keep the mmproj's device memory (weights + warmup compute) out of it
+        if (has_mmproj && mparams.use_gpu && params_base.moe_cache_size == 0) {
+            size_t mm_dev = 0;
+            for (const auto & [dev, size] : mmproj_usage.backend_mem_usage) {
+                if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    mm_dev += size;
+                }
+            }
+            if (mm_dev > 0) {
+                common_set_env("LLAMA_MOE_CACHE_AUTO_MMPROJ_MIB", std::to_string((mm_dev >> 20) + 1));
+            }
         }
 
         // optionally fit mmproj memory usage
@@ -6839,6 +6870,29 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        // [VISSPEC] an M-RoPE target's image leaves a gap the draft cache cannot hold (find_slot fails on
+                        // the text after it): run a prompt with media without the drafter and drop the slot's draft
+                        // sequence. Leaving that mode, the next prompt is processed from scratch so both caches match.
+                        if (slot.spec && ctx_dft) {
+                            const auto rt = llama_model_rope_type(llama_get_model(ctx_tgt));
+                            bool media = false;
+                            if (input_tokens.has_mtmd && (rt == LLAMA_ROPE_TYPE_MROPE || rt == LLAMA_ROPE_TYPE_IMROPE)) {
+                                for (size_t i = 0; i < input_tokens.size() && !media; ++i) {
+                                    media = input_tokens[i] == LLAMA_TOKEN_NULL;
+                                }
+                            }
+                            if (media || slot.spec_media) {
+                                if (!media) {
+                                    slot.prompt_clear();
+                                }
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                SLT_INF(slot, "prompt %s media: drafter %s for this request\n", media ? "has" : "has no",
+                                        media ? "off" : "back on, caches rebuilt");
+                            }
+                            slot.spec_media = media;
+                            common_speculative_set_seq_muted(slot.spec, slot.id, media);
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -7249,7 +7303,20 @@ private:
                             if (!hot_carry && !others_busy) {
                                 n_reset = common_speculative_vocab_reset(spec_init.get());
                             }
-                            common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
+                            if (!input_tokens.has_mtmd) {
+                                common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
+                            } else {
+                                // with an mmproj loaded get_tokens() asserts; observe the text tokens only
+                                // (media positions hold LLAMA_TOKEN_NULL)
+                                llama_tokens text;
+                                text.reserve(input_tokens.size());
+                                for (size_t i = 0; i < input_tokens.size(); ++i) {
+                                    if (input_tokens[i] != LLAMA_TOKEN_NULL) {
+                                        text.push_back(input_tokens[i]);
+                                    }
+                                }
+                                common_speculative_observe(spec_init.get(), text);
+                            }
 
                             const int32_t n_replaced = common_speculative_refresh(spec_init.get());
 
@@ -7906,7 +7973,8 @@ private:
         } handoff;
         // PP-1: defer only the final device handoff until the refill starts.
         const bool pp_overlap = spec && ctx_dft && llama_prompt_overlap_enabled();
-        const bool handoff_on = spec && ctx_dft && common_speculative_handoff_enabled(spec.get()) && batch.view.size() > 3072 &&
+        const bool media_slot = std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.spec_media; });
+        const bool handoff_on = spec && ctx_dft && !media_slot && common_speculative_handoff_enabled(spec.get()) && batch.view.size() > 3072 &&
                 std::all_of(batch.view.tokens.begin(), batch.view.tokens.end(), [&](const auto & token) {
                     return token.seq_ids_extra.empty() && token.seq_id == batch.view.tokens.front().seq_id;
                 }) && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
@@ -8123,7 +8191,7 @@ private:
 
         // in-call checkpoints: catch the hybrid draft up to each captured target boundary before saving it.
         int32_t spec_processed = 0;
-        const bool spec_ranges = ckpt_armed && common_speculative_supports_process_range(spec.get());
+        const bool spec_ranges = ckpt_armed && !media_slot && common_speculative_supports_process_range(spec.get());
         if (ckpt_armed) {
             server_slot * cslot = nullptr;
             for (auto & s : slots) {

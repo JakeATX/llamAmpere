@@ -1521,7 +1521,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 size_t free = 0, total = 0;
                 ggml_backend_dev_memory(gpu, &free, &total);
                 const char * extra_env = getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB");
-                const double extra   = extra_env ? std::max(0.0, atof(extra_env)) : 0.0;
+                // fork (INKVIS): the server loads an mmproj after this context; its GPU weights + compute stay out of
+                // the cache as well (the server sets LLAMA_MOE_CACHE_AUTO_MMPROJ_MIB from mtmd_get_memory_usage)
+                const char * mmproj_env = getenv("LLAMA_MOE_CACHE_AUTO_MMPROJ_MIB");
+                const double extra   = (extra_env ? std::max(0.0, atof(extra_env)) : 0.0) +
+                                       (mmproj_env ? std::max(0.0, atof(mmproj_env)) : 0.0);
                 // fork (INKSTREAM): with ink_rows_cap the boot scratch stays at 512 rows, but the SWA cache (and the
                 // f32 attention scores of a 512-row prompt ubatch) is sized n_swa + n_ubatch: one score copy per extra
                 // cell (512 rows x n_head x 4 B). Without it 10ink/12ink at -ub 4096 peaked 12-14 MiB over the line.
@@ -2785,7 +2789,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
     sync_moe_keep();
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this); // upstream: counts/traces graph reallocations
-    if (mtp_prefill_async || mtp_scratch_enabled || llama_kq_mask_device_enabled()) {
+    if (mtp_prefill_async || mtp_scratch_enabled || llama_kq_mask_device_enabled() || llama_nk_dev_mask_enabled()) {
         ggml_backend_sched_set_input_copy_callback(sched.get(), sched_copy_mtp_inputs, this);
     }
 
@@ -9909,17 +9913,76 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
 bool llama_context::sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // [PPIMPL] LLAMA_KQ_MASK_DEVICE: a deferred sequence-prefix mask is filled on the card from its row counts, in
-    // stream order (no host wait, no mask copy). Otherwise its host buffer is filled now and the normal copy follows.
-    if (llama_kq_mask_device_enabled() && src->type == GGML_TYPE_F16) {
+    // [PPIMPL] LLAMA_KQ_MASK_DEVICE (and LLAMA_NK_DEV_MASK): a deferred sequence-prefix mask is filled on the card from
+    // its row counts, in stream order (no host wait, no mask copy). Otherwise its host buffer is filled now and the normal copy follows.
+    const bool nk_dev_mask = llama_nk_dev_mask_enabled();
+    if ((llama_kq_mask_device_enabled() || nk_dev_mask) && src->type == GGML_TYPE_F16) {
         thread_local std::vector<int32_t> n_visible;
         int64_t n_kv = 0;
-        if (llama_kq_mask_deferred_get(src, n_visible, &n_kv)) {
+        const char * tag = nullptr;
+        bool has_host_ref = false;
+        if (llama_kq_mask_deferred_get(src, n_visible, &n_kv, &tag, &has_host_ref)) {
             using fill_fn = bool (*)(ggml_backend_t, ggml_tensor *, const int32_t *, int64_t, int64_t);
             auto * dev  = ggml_backend_get_device(backend);
-            auto   fill = dev ? (fill_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
-                    "ggml_backend_cuda_fill_prefix_mask") : nullptr;
+            auto * reg  = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            fill_fn fill = nullptr;
+            if (reg && nk_dev_mask) {
+                fill = (fill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_fill_prefix_mask");
+            }
+            if (!fill && reg) {
+                fill = (fill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fill_prefix_mask");
+            }
             if (fill && ggml_nbytes(dst) == ggml_nbytes(src) && fill(backend, dst, n_visible.data(), (int64_t) n_visible.size(), n_kv)) {
+                if (nk_dev_mask && has_host_ref && llama_nk_dev_mask_check_enabled()) {
+                    ggml_backend_synchronize(backend);
+                    const size_t nbytes = ggml_nbytes(dst);
+                    const int64_t n_rows = (int64_t) n_visible.size();
+                    thread_local std::vector<uint16_t> dev_buf;
+                    dev_buf.resize(nbytes / sizeof(uint16_t));
+                    ggml_backend_tensor_get(dst, dev_buf.data(), 0, nbytes);
+                    const uint16_t * cpu_buf = (const uint16_t *) src->data;
+                    static std::atomic<int64_t> g_ok{0}, g_fail{0}, g_ok_nc{0}, g_ok_sj{0}, g_ok_c{0};
+                    const char * tname = tag ? tag : "?";
+                    if (std::memcmp(dev_buf.data(), cpu_buf, nbytes) == 0) {
+                        const int64_t ok_n = g_ok.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (std::strcmp(tname, "kq_noncausal") == 0) {
+                            g_ok_nc.fetch_add(1, std::memory_order_relaxed);
+                        } else if (std::strcmp(tname, "sj_far") == 0) {
+                            g_ok_sj.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            g_ok_c.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (ok_n == 1 || (ok_n % 256) == 0) {
+                            LLAMA_LOG_WARN("[NK_DEV_MASK_CHECK] OK #%lld tag=%s n_rows=%lld n_kv=%lld nv0=%d nv_last=%d (nc=%lld sj=%lld c=%lld fail=%lld)\n",
+                                    (long long) ok_n, tname, (long long) n_rows, (long long) n_kv,
+                                    n_rows > 0 ? n_visible[0] : 0, n_rows > 0 ? n_visible[(size_t) (n_rows - 1)] : 0,
+                                    (long long) g_ok_nc.load(std::memory_order_relaxed),
+                                    (long long) g_ok_sj.load(std::memory_order_relaxed),
+                                    (long long) g_ok_c.load(std::memory_order_relaxed),
+                                    (long long) g_fail.load(std::memory_order_relaxed));
+                        }
+                    } else {
+                        const int64_t fail_n = g_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+                        int64_t bad_r = -1, bad_c = -1;
+                        uint16_t dev_v = 0, cpu_v = 0;
+                        for (int64_t r = 0; r < n_rows && bad_r < 0; ++r) {
+                            for (int64_t c = 0; c < n_kv; ++c) {
+                                const size_t idx = (size_t) (r * n_kv + c);
+                                if (dev_buf[idx] != cpu_buf[idx]) {
+                                    bad_r = r;
+                                    bad_c = c;
+                                    dev_v = dev_buf[idx];
+                                    cpu_v = cpu_buf[idx];
+                                    break;
+                                }
+                            }
+                        }
+                        LLAMA_LOG_ERROR("[NK_DEV_MASK_CHECK] MISMATCH #%lld tag=%s n_rows=%lld n_kv=%lld row=%lld col=%lld dev=0x%04x cpu=0x%04x (ok=%lld)\n",
+                                (long long) fail_n, tname, (long long) n_rows, (long long) n_kv,
+                                (long long) bad_r, (long long) bad_c, (unsigned) dev_v, (unsigned) cpu_v,
+                                (long long) g_ok.load(std::memory_order_relaxed));
+                    }
+                }
                 return true;
             }
             llama_kq_mask_deferred_fill_host(src);

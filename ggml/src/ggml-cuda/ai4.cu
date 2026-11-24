@@ -3,6 +3,7 @@
 #include "inksituq.cuh"
 #include "ai4.cuh"
 #include "inkpreq.cuh"
+#include "prefill-glue.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
 #include "ai4-turbo.cuh"
@@ -977,6 +978,16 @@ static void ai4_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * key, c
                      int variant, ggml_cuda_pool_alloc<int8_t> & qa, ggml_cuda_pool_alloc<float> & sa,
                      int8_t * & q, float * & s) {
     cudaStream_t stream = ctx.stream();
+    // [PREFILL-GLUE] a fused producer (GLU / RMS_NORM, opt-in) already wrote this exact activation in this layout
+    const int8_t * pre_q = nullptr;
+    const float  * pre_s = nullptr;
+    if (key != nullptr && key->data == (const void *) X &&
+            ggml_cuda_prefill_ai4_take(ctx, key, N, K, xsh, variant, pre_q, pre_s)) {
+        q = const_cast<int8_t *>(pre_q);
+        s = const_cast<float *>(pre_s);
+        ctx.fusion_stats.ai_prep_hits++;
+        return;
+    }
     const size_t ns     = (size_t) N*(K >> (7 + xsh));
     const size_t q_off  = GGML_PAD(ns*sizeof(float), 256);
     const size_t bytes  = q_off + (size_t) N*K;
@@ -1036,6 +1047,24 @@ static void ai4_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * key, c
     ctx.fusion_stats.ai_prep_runs++;
     q = qa.get();
     s = sa.get();
+}
+
+// [PREFILL-GLUE] the prep variant ai4_mul_mat_fast picks (same policy); a wrong guess only means the cache is not taken
+int ggml_cuda_ai4_prefill_variant(const ggml_backend_cuda_context & ctx, ggml_type w_type, int M, int N, int K, bool is_id) {
+    if (is_id || w_type == GGML_TYPE_AIT2P_U) {
+        return AI4_PREP_PLAIN;
+    }
+    const ai23_dense_policy policy = ai23_dense_config(M, N, K, ai4_ampere_sms(const_cast<ggml_backend_cuda_context &>(ctx)), ggml_ai4_rate(w_type));
+    const int  tile         = policy.tile;
+    const bool swap8        = (ggml_ai4_rate(w_type) == 2 || ggml_ai4_rate(w_type) == 3) && N > 8 && N <= 64 &&
+                              (tile == 22 || tile == 23 || tile == 25 || tile == 27);
+    const int  splits       = policy.splits;
+    const bool split_active = splits == 2 || splits == 4 || splits == 8 || splits == 16;
+    const bool whole        = split_active ? (tile != 16 && tile != 17 && !(tile >= 22 && tile <= 27)) :
+                              (tile == 18 || tile == 19 || tile == 21 || (!tile && policy.narrow >= 3 && (K == 5120 || K == 17408) && ai4_ampere_sms(const_cast<ggml_backend_cuda_context &>(ctx))));
+    const bool xperm        = ggml_ai4_rate(w_type) == 2 && N > 8 && N <= 64 && whole &&
+                              ai4_env_int("GGML_CUDA_AI23_XPERM", nullptr, 0);
+    return swap8 ? AI4_PREP_SWAP8 : xperm ? AI4_PREP_XPERM : AI4_PREP_PLAIN;
 }
 
 // W4A8 fast path: rotate+quantize the activations, then the AI+ decode-to-IMMA kernels
@@ -1787,6 +1816,10 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     // [INKGLUE MIXQ] or by the depth-mix + norm producer (inkpreq.cu): same bytes, no launch
     if (!fused && !pre && ctx.curr_stream_no == 0) {
         pre = ggml_cuda_ink_ai4_preq_take(dst, src1->data, n_rows, K, xsh, &pre_q, &pre_s);
+    }
+    // [PREFILL-GLUE] or by an opt-in fused GLU / RMS_NORM producer (same bytes as ai4_quantize_x, no launch)
+    if (!fused && !pre && ctx.curr_stream_no == 0) {
+        pre = ggml_cuda_prefill_ai4_take(ctx, src1, n_rows, K, xsh, 0, pre_q, pre_s);
     }
     ggml_cuda_pool_alloc<int8_t> q_buf(ctx.pool());
     ggml_cuda_pool_alloc<float>  s_buf(ctx.pool());

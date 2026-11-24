@@ -82,21 +82,11 @@ static __device__ __forceinline__ float magic_i2f(int x) {
 
 // Optional scratch layout swaps the two 8-byte halves of each vector for token bit 1.
 // The default fragment layout remains unchanged.
-// quantize_act_body is one CTA's work for grid block (bx, tok); other kernels may run it on part of their grid.
+// quantize_act_regs quantizes one warp's 8 values per lane of H256 block hb (already loaded into registers).
 template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
-static __device__ __forceinline__ void quantize_act_body(
-        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
-        int bx, int tok) {
+static __device__ __forceinline__ void quantize_act_regs(
+        float (&v)[8], const int hb, int8_t * __restrict__ q, float * __restrict__ s, int K, int tok) {
     const int lane = threadIdx.x & 31;
-    const int hb   = bx*4 + (threadIdx.x >> 5);
-    if (hb*RQ4_HB >= K || tok >= N) {
-        return;
-    }
-    const float * xr = x + (int64_t) tok*sx + hb*RQ4_HB + lane*8;
-    const float4 u0 = *(const float4 *) xr;
-    const float4 u1 = *(const float4 *) (xr + 4);
-    float v[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
-
     const uint32_t sw = d_sign_bits[lane >> 2] >> ((lane & 3)*8);
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
@@ -162,6 +152,23 @@ static __device__ __forceinline__ void quantize_act_body(
     if (lane == 0) {
         s[(int64_t) tok*(K/RQ4_HB) + hb] = d;
     }
+}
+
+// quantize_act_body is one CTA's work for grid block (bx, tok); other kernels may run it on part of their grid.
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
+static __device__ __forceinline__ void quantize_act_body(
+        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
+        int bx, int tok) {
+    const int lane = threadIdx.x & 31;
+    const int hb   = bx*4 + (threadIdx.x >> 5);
+    if (hb*RQ4_HB >= K || tok >= N) {
+        return;
+    }
+    const float * xr = x + (int64_t) tok*sx + hb*RQ4_HB + lane*8;
+    const float4 u0 = *(const float4 *) xr;
+    const float4 u1 = *(const float4 *) (xr + 4);
+    float v[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+    quantize_act_regs<SWAP8, XPERM, LINEAR>(v, hb, q, s, K, tok);
 }
 
 template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>

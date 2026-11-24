@@ -27,9 +27,10 @@
 #include <stdexcept>
 #include <vector>
 
+#include <cstdlib>
+
 #if defined(__GLIBC__)
 #include <malloc.h>
-#include <cstdlib>
 #include <unistd.h>
 #endif
 
@@ -356,6 +357,28 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
+        }
+        // Inkling defaults: speedups gated (speed + greedy identity or E21 KLD) on the Inkling family only (the ship files
+        // NQ / H1 / S34d load as inkling2_loop). Each one is set only when the user has not set it, so <name>=0 is its
+        // kill switch. Process-wide: the readers cache the value at their first call, after the model load.
+        if (model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP) {
+            static const char * const ink_defaults[][2] = {
+                { "LLAMA_NK_DEV_MASK", "1"    },  // device-side DSpark / SJ-KVaRN far masks
+                { "LLAMA_NK_KV_PAD",   "4096" },  // coarser deep-context n_kv padding step
+                { "GGML_CUDA_Q8TC",    "2"    },  // tensor-core dense Q8_0 matvec for T = 4..8 (draft verify), hi/lo split activations (mode 1 = plain f16: faster, small KLD cost)
+                { "GGML_CUDA_INKGQA_FAR", "1" },  // grouped-query far-attention prefill kernel
+                { "GGML_CUDA_INKGQA_SWA", "1" },  // same kernel family for the sliding-window layers
+                { "LLAMA_INKFA_RELF",     "1" },  // relative-bias factor form (no [n_head, extent, T] table in the graph)
+            };
+            for (const auto & d : ink_defaults) {
+                if (!getenv(d[0])) {
+#ifdef _WIN32
+                    _putenv_s(d[0], d[1]);
+#else
+                    setenv(d[0], d[1], 0);
+#endif
+                }
+            }
         }
         try {
             model->load_vocab(ml);

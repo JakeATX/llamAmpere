@@ -12,6 +12,8 @@ bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 // AI+ unit types: shapes and layouts the CUDA backend runs (MUL_MAT and MUL_MAT_ID)
 bool ggml_cuda_ai4_supported(const ggml_tensor * op);
+// [PREFILL-GLUE] activation layout (AI4_PREP_*) ggml_cuda_mul_mat_ai4 quantizes src1 into for this shape
+int  ggml_cuda_ai4_prefill_variant(const ggml_backend_cuda_context & ctx, ggml_type w_type, int M, int N, int K, bool is_id);
 
 // MUL_MAT_ID over an AI+ unit expert stack (device-side routing, only the selected experts are read)
 // y_into != nullptr: write the routed pairs into y_into (same layout as dst) and leave skipped pairs untouched

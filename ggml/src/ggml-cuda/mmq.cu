@@ -5,6 +5,7 @@
 #include "quantize.cuh"
 #include "dense-tc.cuh"
 #include "mmid.cuh"
+#include "prefill-glue.cuh"
 
 #include <cstdint>
 #include <cstdlib>
@@ -428,6 +429,11 @@ static void ggml_cuda_mul_mat_q_impl(
         // fork: a paired product (paired_src0) reads the same q8_1 buffer in the default layout, so it keeps the default path.
         const bool use_mmq_prefill = !convrot && !use_native_fp4 && !paired_src0 && !gate && ggml_cuda_should_use_mmq_prefill(args);
         const char * prequantized = use_mmq_prefill ? ggml_cuda_mmq_prefill_q8_lookup(ctx, src1, dst, ne10_padded) : nullptr;
+        // [PREFILL-GLUE] an opt-in fused GLU / RMS_NORM producer wrote this exact q8_1 layout (same bytes as quantize_mmq_q8_1_cuda)
+        if (prequantized == nullptr && !convrot && !use_native_fp4 && !paired_src0 && !gate && ne12 == 1 && ne13 == 1) {
+            ggml_cuda_prefill_mmq_take(ctx, src1, ne11, ne10, ne10_padded, (int) mmq_get_q8_1_ds_layout(src0->type),
+                                       use_mmq_prefill, prequantized);
+        }
         if (prequantized == nullptr) {
             src1_q8_1.alloc(nbytes_src1_q8_1);
         }

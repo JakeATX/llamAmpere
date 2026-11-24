@@ -14610,6 +14610,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     bool lse_fix = false; // COMPFIX: SJ + LSE route cases, own op name (FLASH_ATTN_EXT_SJKVARN_LSE_ROUTES)
     bool lse_out = false; // LSA compensation: the node also writes its row log-sum-exp (ggml_flash_attn_ext_set_lse), appended to out
     bool sinks_only = false; // INKKV: attention sinks without the logit softcap attn_options adds
+    bool mask_bits = false;  // mask "m" as the one-bit packed I32 mask (mask_mode 0, no row_mask / streams / packed_pair)
     bool d128 = false;       // INKPREFILL (ggml-inksjd128.h): also mark the node as packed D 128 pairs (same Q layout as inksj)
     bool inksj = false;      // INKKV (ggml-inksj.h): pair-packed Q (zero half per head), only the real output halves compared
     int64_t far_gap = 0;     // INKKV far node: query at pos sees positions <= pos - far_gap, desc carries the far visible end
@@ -14666,6 +14667,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         if (sinks_only) { result += ",sinks=1"; }
         if (inksj) { result += ",inksj=1"; }
         if (d128) { result += ",d128=1"; }
+        if (mask_bits) { result += ",mbits=1"; }
         if (far_gap) { result += ",far_gap=" + std::to_string(far_gap); }
         if (mask_mode != 0) {
             result += ",mask_mode=" + std::to_string(mask_mode);
@@ -14809,7 +14811,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         ggml_set_name(v, "v");
         // Packed masks must also cover the physical ring passed to the generic FA constructor.
         const int64_t mask_kv = packed_pair ? std::max(n_kv_pad(), k->ne[1]) : n_kv_pad();
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, mask_mode == 7 || mask_mode == 10 ? nh : 1, n_streams());
+        GGML_ASSERT(!mask_bits || (mask_mode == 0 && !row_mask && ns == 0 && !packed_pair && data_case == 0));
+        ggml_tensor * m = mask_bits ? new_tensor_kq_mask_packed(ctx, mask_kv, n_q, 1, n_streams()) :
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, mask_mode == 7 || mask_mode == 10 ? nh : 1, n_streams());
         ggml_set_name(m, "m");
         ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_rec_pool());
         body->op_params[7] = body_type;
@@ -14977,6 +14981,17 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                     }
                 }
                 set_tensor_kq_mask_binary(t, vis, mask_kv);
+            } else if (strcmp(t->name, "m") == 0 && mask_bits) {
+                // the mask_mode 0 visibility below, as bits
+                const int64_t mkv = t->op_params[0];
+                std::vector<uint8_t> vis((size_t) mkv*n_q);
+                for (int64_t j = 0; j < n_q; ++j) {
+                    const int64_t pos = N() - n_q + j;
+                    for (int64_t p = 0; p < mkv; ++p) {
+                        vis[j*mkv + p] = p <= pos - far_gap && p < N();
+                    }
+                }
+                set_tensor_kq_mask_binary(t, vis, mkv);
             } else if (strcmp(t->name, "m") == 0) {
                 const int64_t nhm = t->ne[2]; // nh for the per-head mode 7, else 1
                 std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q * nhm * n_streams());
@@ -19080,8 +19095,218 @@ static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, b
     }
 }
 
+// NEONKERN: fused Inkling 2 Mini NVFP4 / Q8_0 MoE graph (gate_up [+ scale] + SITU + down [+ scale] + wsum)
+// Exercises ggml_cuda_try_fuse_ink_nvfp4moe -> nvfp4mt / nk-nvfp4-tc / nk-q8-moe-tc across T = 1..8 and routing patterns.
+struct test_ink_nvfp4_moe : public test_case {
+    const ggml_type w_type;
+    const int n_expert;
+    const int n_used;
+    const int64_t K;
+    const int64_t F;
+    const int64_t T;
+    const bool scaled;
+    const bool strided_ids;
+    const int route_mode; // 0 = distinct random, 1 = correlated (~24 unique at T=5), 2 = all tokens same 8 experts (N=T)
+
+    test_ink_nvfp4_moe(int n_expert, int n_used, int64_t K, int64_t F, int64_t T,
+                       bool scaled = true, bool strided_ids = false, int route_mode = 0,
+                       ggml_type w_type = GGML_TYPE_NVFP4)
+        : w_type(w_type), n_expert(n_expert), n_used(n_used), K(K), F(F), T(T),
+          scaled(scaled), strided_ids(strided_ids), route_mode(route_mode) {}
+
+    static bool switch_on(const char * name) {
+        const char * e = getenv(name);
+        if (strcmp(name, "GGML_CUDA_NK_Q8_0_TC") == 0) { // default ON, =0 disables
+            return !(e != nullptr && *e && atoi(e) == 0);
+        }
+        return e != nullptr && atoi(e) != 0;
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return w_type == GGML_TYPE_Q8_0 ? "INK_Q8_0_MOE" : "INK_NVFP4_MOE";
+    }
+    std::string vars() override {
+        return VARS_TO_STR8(n_expert, n_used, K, F, T, scaled, strided_ids, route_mode);
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-3; }
+    const char * required_fusion() override {
+        if (w_type == GGML_TYPE_Q8_0) {
+            return switch_on("GGML_CUDA_NK_Q8_0_TC") ? "nk_q8_0_tc" : nullptr;
+        }
+        return switch_on("GGML_CUDA_NK_NVFP4_TC") ? "nk_nvfp4_tc" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        if (w_type == GGML_TYPE_Q8_0) {
+            return switch_on("GGML_CUDA_NK_Q8_0_TC") ? nullptr : "nk_q8_0_tc";
+        }
+        return switch_on("GGML_CUDA_NK_NVFP4_TC") ? nullptr : "nk_nvfp4_tc";
+    }
+    uint64_t op_flops(ggml_tensor *) override {
+        // gate_up (2*F x K) + down (K x F) = 3 * 2 * K * F * n_used * T
+        return 6ull * (uint64_t) K * (uint64_t) F * (uint64_t) n_used * (uint64_t) T;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w_gu = ggml_new_tensor_3d(ctx, w_type, K, 2 * F, n_expert);
+        ggml_tensor * w_dn = ggml_new_tensor_3d(ctx, w_type, F, K, n_expert);
+        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, T);
+        ggml_tensor * rw   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, T);
+        ggml_set_name(w_gu, "w_gu");
+        ggml_set_name(w_dn, "w_dn");
+        ggml_set_name(x,    "x");
+        ggml_set_name(rw,   "rw");
+
+        ggml_tensor * ids_base = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, strided_ids ? n_expert : n_used, T);
+        ggml_set_name(ids_base, "ids");
+        ggml_tensor * ids = strided_ids
+            ? ggml_view_2d(ctx, ids_base, n_used, T, ids_base->nb[1], 0)
+            : ids_base;
+
+        ggml_tensor * gu = ggml_mul_mat_id(ctx, w_gu, x, ids);
+        if (scaled) {
+            ggml_tensor * s_gu = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+            ggml_set_name(s_gu, "s_gu");
+            ggml_tensor * s = ggml_reshape_3d(ctx, s_gu, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx, s, 1, n_expert, T, 1);
+            s = ggml_get_rows(ctx, s, ids);
+            gu = ggml_mul(ctx, gu, s);
+        }
+
+        ggml_tensor * g = ggml_view_3d(ctx, gu, F, n_used, T, gu->nb[1], gu->nb[2], 0);
+        ggml_tensor * u = ggml_view_3d(ctx, gu, F, n_used, T, gu->nb[1], gu->nb[2], (size_t) F * gu->nb[0]);
+
+        const float beta = 10.0f;
+        const float lb   = 10.0f;
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, g, 1.0f / beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, g));
+        ggml_tensor * u_act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, u, 1.0f / lb)), lb);
+        act = ggml_mul(ctx, act, u_act);
+
+        ggml_tensor * dn = ggml_mul_mat_id(ctx, w_dn, act, ids);
+        if (scaled) {
+            ggml_tensor * s_dn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+            ggml_set_name(s_dn, "s_dn");
+            ggml_tensor * s = ggml_reshape_3d(ctx, s_dn, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx, s, 1, n_expert, T, 1);
+            s = ggml_get_rows(ctx, s, ids);
+            dn = ggml_mul(ctx, dn, s);
+        }
+
+        ggml_tensor * wmul = ggml_mul(ctx, dn, rw);
+        ggml_tensor * pe   = ggml_cont(ctx, ggml_permute(ctx, wmul, 1, 0, 2, 3));
+        ggml_tensor * sum  = ggml_sum_rows(ctx, pe);
+        return ggml_reshape_2d(ctx, sum, K, T);
+    }
+
+    void fill_ids(ggml_tensor * t, uint32_t seed) const {
+        std::mt19937 rng(seed);
+        const int64_t ne0 = t->ne[0];
+        std::vector<int32_t> row(ne0, 0);
+        for (int64_t tok = 0; tok < T; ++tok) {
+            std::vector<int32_t> perm;
+            if (route_mode == 2) {
+                for (int i = 0; i < n_used; ++i) {
+                    row[i] = i;
+                }
+            } else if (route_mode == 1) {
+                // Correlated routing matching DSpark verify (~24 unique experts at T=5):
+                // 3 shared hot experts + 5 drawn from a hot pool of 32 experts (all 8 distinct per token).
+                const int pool = std::min(n_expert, 32);
+                perm.resize(pool);
+                std::iota(perm.begin(), perm.end(), 0);
+                // Keep first 3 shared across tokens, shuffle remaining pool[3..pool-1]
+                std::shuffle(perm.begin() + std::min(3, pool), perm.end(), rng);
+                for (int i = 0; i < n_used; ++i) {
+                    row[i] = perm[i];
+                }
+            } else {
+                perm.resize(n_expert);
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                for (int i = 0; i < n_used; ++i) {
+                    row[i] = perm[i];
+                }
+            }
+            ggml_backend_tensor_set(t, row.data(), (size_t) tok * t->nb[1], (size_t) ne0 * sizeof(int32_t));
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                fill_ids(t, 12345u + (uint32_t) T * 17u + (uint32_t) route_mode * 3u);
+            } else if (strcmp(t->name, "s_gu") == 0 || strcmp(t->name, "s_dn") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (strcmp(t->name, "rw") == 0) {
+                init_tensor_uniform(t, 0.05f, 0.25f);
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        static uint32_t iter = 0;
+        ++iter;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32 && t->op == GGML_OP_NONE && !ggml_is_view_op(t->op)) {
+                fill_ids(t, 99991u + iter * 1009u + (uint32_t) T * 17u);
+            }
+        }
+    }
+};
+
+static void add_ink_nvfp4_moe_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        // Full 128-expert Inkling 2 Mini MoE visit: correlated (~24 unique at T=5) and uniform random across T=1..8.
+        for (int64_t T : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            cases.emplace_back(new test_ink_nvfp4_moe(128, 8, 2304, 1152, T, true, false, 1));
+        }
+        for (int64_t T : {1, 5, 8}) {
+            cases.emplace_back(new test_ink_nvfp4_moe(128, 8, 2304, 1152, T, true, false, 0));
+        }
+        return;
+    }
+    // Correctness: T=1..8, scales on/off, strided & contiguous ids, distinct/correlated/all-shared (N=T) routing.
+    for (int64_t T : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        cases.emplace_back(new test_ink_nvfp4_moe(16, 8, 2304, 1152, T, true,  false, 0));
+        cases.emplace_back(new test_ink_nvfp4_moe(16, 8, 2304, 1152, T, false, true,  2));
+    }
+    cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 5, true, false, 1));
+    cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 8, true, true,  1));
+}
+
+static void add_ink_q8_0_moe_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        // Full 128-expert Inkling 2 Mini L20-23 Q8_0 MoE visit: correlated (~24 unique at T=5), uniform random, and all-shared.
+        for (int64_t T : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            cases.emplace_back(new test_ink_nvfp4_moe(128, 8, 2304, 1152, T, false, false, 1, GGML_TYPE_Q8_0));
+        }
+        for (int64_t T : {1, 5, 8}) {
+            cases.emplace_back(new test_ink_nvfp4_moe(128, 8, 2304, 1152, T, false, false, 0, GGML_TYPE_Q8_0));
+        }
+        cases.emplace_back(new test_ink_nvfp4_moe(128, 8, 2304, 1152, 5, false, false, 2, GGML_TYPE_Q8_0));
+        return;
+    }
+    // Correctness: T=1..8, contiguous & strided ids, distinct/correlated/all-shared (N=T) routing.
+    for (int64_t T : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        cases.emplace_back(new test_ink_nvfp4_moe(16, 8, 2304, 1152, T, false, false, 0, GGML_TYPE_Q8_0));
+        cases.emplace_back(new test_ink_nvfp4_moe(16, 8, 2304, 1152, T, false, true,  2, GGML_TYPE_Q8_0));
+    }
+    cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 5, false, false, 1, GGML_TYPE_Q8_0));
+    cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 8, false, true,  1, GGML_TYPE_Q8_0));
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GGML_TEST_INK_Q8_0_MOE") != nullptr) {
+        add_ink_q8_0_moe_cases(test_cases, false);
+        return test_cases;
+    }
     if (getenv("GGML_TEST_INKGROUP") != nullptr) {
         add_inkgroup_cases(test_cases);
         return test_cases;
@@ -22554,6 +22779,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lsa_comp_merge(784, 5, 24, 4, 256, 1));
 
     add_inkattn_cases(test_cases, false);
+    add_ink_nvfp4_moe_cases(test_cases, false);
+    add_ink_q8_0_moe_cases(test_cases, false);
     for (bool packed : {false, true}) {
         for (bool gated : {false, true}) {
             for (int64_t T : {1, 2, 5, 8}) {
@@ -23067,6 +23294,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             t->sinks_only = mode == 10;
             test_cases.emplace_back(t);
         }
+        // the one-bit packed far mask of prompt ubatches (LSE far node, as the INKKV split builds it)
+        auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                GGML_TYPE_F32, 4, 4, 1, 0, 0);
+        t->inksj = true;
+        t->d128 = true;
+        t->mask_bits = true;
+        t->lse_out = true;
+        test_cases.emplace_back(t);
     }
     // INKKV far visible end (ggml-inksj.h): the far mask hides the last far_gap positions of every row, the desc says so
     for (int64_t n_q : {1, 2, 4, 8}) {
@@ -24449,6 +24684,16 @@ struct test_inkgroup : public test_case {
 };
 
 static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc) {
+    if (getenv("GGML_TEST_INKGROUP") != nullptr && std::string(getenv("GGML_TEST_INKGROUP")) == "q8") {
+        // INKNVFP4K: NQ Q8_0 grouped QKV (q, gate, k, v, rel, sink) and attn_output at the decode / verify widths
+        for (int64_t n : { 1, 2, 3, 4, 5, 6, 7, 8 }) {
+            tc.emplace_back(new test_inkgroup(GGML_TYPE_Q8_0, { 3072, 3072, 1024, 1024, 384, 24 }, 2304, n));
+            tc.emplace_back(new test_inkgroup(GGML_TYPE_Q8_0, { 2304 }, 3072, n));
+            tc.emplace_back(new test_inkgroup(GGML_TYPE_Q8_0, { 40, 7 }, 256, n));      // 1 chunk: warps without work; < 16-row members
+            tc.emplace_back(new test_inkgroup(GGML_TYPE_Q8_0, { 333, 64 }, 1280, n));   // 5 chunks over 3 warps; ragged last tile
+        }
+        return;
+    }
     for (ggml_type t : { GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U }) {
         for (int64_t n : { 1, 2, 8 }) {
             tc.emplace_back(new test_inkgroup(t, { 3072, 3072, 384 }, 2304, n));            // q, gate, rel
@@ -24489,6 +24734,11 @@ static void add_inkdense_cases(std::vector<std::unique_ptr<test_case>> & tc) {
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // INK_Q8_0_MOE: GGML_TEST_INK_Q8_0_MOE=1 with -o INK_Q8_0_MOE (perf mode = 12 timing cases, test mode = 18 correctness cases)
+    if (getenv("GGML_TEST_INK_Q8_0_MOE") != nullptr) {
+        add_ink_q8_0_moe_cases(test_cases, true);
+        return test_cases;
+    }
     if (getenv("GGML_TEST_INKDENSE") != nullptr) {
         add_inkdense_cases(test_cases);
         return test_cases;
@@ -24510,6 +24760,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     if (getenv("GGML_TEST_INKATTN") != nullptr) {
         add_inkattn_cases(test_cases, true);
+        return test_cases;
+    }
+    const bool test_nvfp4_moe = getenv("GGML_TEST_INK_NVFP4_MOE") != nullptr;
+    const bool test_q8_0_moe  = getenv("GGML_TEST_INK_Q8_0_MOE")  != nullptr;
+    if (test_nvfp4_moe || test_q8_0_moe) {
+        if (test_nvfp4_moe) {
+            add_ink_nvfp4_moe_cases(test_cases, true);
+        }
+        if (test_q8_0_moe) {
+            add_ink_q8_0_moe_cases(test_cases, true);
+        }
         return test_cases;
     }
     // [SEAL08] one layer of the 24dense adaptive-tail flush (32 groups x 4 KV heads, tq6_0 ring): GGML_TEST_SEAL_PERF=1
@@ -24989,6 +25250,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_PTQ1_0}) {
         for (int n = 1; n <= 8; ++n) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
+    // [NK_DENSE_TC] Inkling 2 Mini NQ dense Q8_0 attention projections at decode/verify widths T=1..8:
+    // grouped QKV equivalent (8576 x 2304), attn_output (2304 x 3072), single attn_q/gate (3072 x 2304)
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{8576, 2304}, {2304, 3072}, {3072, 2304}}) {
+        for (int n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
     }
 
@@ -26747,6 +27016,1246 @@ static int run_ait_midt_check(const char * dir) {
     return fails ? 1 : 0;
 }
 
+// NEONKERN: GGML_TEST_NK_PREFIX_MASK=1 verifies ggml_backend_cuda_nk_fill_prefix_mask bit-for-bit against
+// CPU reference and stock ggml_backend_cuda_fill_prefix_mask across aligned/unaligned n_kv, inline (<=32 rows)
+// and ring (>32 rows) paths, 4D multi-stream layouts, clamping, and fusion counter increments, plus 100K timing.
+static int run_nk_prefix_mask_check() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        fprintf(stderr, "nk_prefix_mask: no GPU backend\n");
+        return 1;
+    }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using fill_fn = bool (*)(ggml_backend_t, ggml_tensor *, const int32_t *, int64_t, int64_t);
+    using cnt_fn  = int64_t (*)(ggml_backend_t, const char *);
+    auto nk_fill  = (fill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_fill_prefix_mask");
+    auto ref_fill = (fill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fill_prefix_mask");
+    auto cnt      = (cnt_fn)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+    if (!nk_fill || !ref_fill || !cnt) {
+        fprintf(stderr, "nk_prefix_mask: missing proc address (nk=%p ref=%p cnt=%p)\n",
+                (void *) nk_fill, (void *) ref_fill, (void *) cnt);
+        ggml_backend_free(be);
+        return 1;
+    }
+
+    struct mask_case { int64_t n_kv; int64_t ne1; int64_t ne3; };
+    const std::vector<mask_case> cases = {
+        { 1, 1, 1 }, { 1, 5, 1 }, { 7, 1, 1 }, { 7, 5, 1 }, { 7, 8, 1 },
+        { 8, 1, 1 }, { 8, 8, 1 }, { 9, 5, 1 }, { 9, 8, 1 }, { 15, 3, 1 },
+        { 16, 4, 1 }, { 17, 7, 1 }, { 255, 5, 1 }, { 256, 8, 1 }, { 257, 5, 1 },
+        { 1024, 32, 1 }, { 1024, 33, 1 }, { 1024, 64, 1 }, { 1025, 35, 1 },
+        { 4096, 128, 1 }, { 100096, 5, 1 }, { 100352, 5, 1 }, { 100352, 8, 1 },
+        { 100352, 5, 2 }, { 100352, 4, 2 },
+    };
+
+    const uint16_t keep_u16 = 0x0000u;
+    const uint16_t drop_u16 = 0xFC00u;
+    const uint16_t poison_u16 = 0x3C00u; // 1.0h
+
+    int fails = 0;
+    for (const auto & c : cases) {
+        const int64_t n_rows = c.ne1 * c.ne3;
+        const int64_t n_el = c.n_kv * n_rows;
+        ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t_nk  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.n_kv, c.ne1, 1, c.ne3);
+        ggml_tensor * t_ref = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.n_kv, c.ne1, 1, c.ne3);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::vector<int32_t> n_vis((size_t) n_rows);
+        for (int64_t r = 0; r < n_rows; ++r) {
+            switch (r % 12) {
+                case 0:  n_vis[r] = 0; break;
+                case 1:  n_vis[r] = (int32_t) c.n_kv; break;
+                case 2:  n_vis[r] = -5; break;
+                case 3:  n_vis[r] = (int32_t) c.n_kv + 17; break;
+                case 4:  n_vis[r] = 1; break;
+                case 5:  n_vis[r] = 7; break;
+                case 6:  n_vis[r] = 8; break;
+                case 7:  n_vis[r] = 9; break;
+                case 8:  n_vis[r] = (int32_t) (c.n_kv / 2); break;
+                case 9:  n_vis[r] = (int32_t) std::max<int64_t>(0, c.n_kv / 2 - 3); break;
+                case 10: n_vis[r] = (int32_t) std::max<int64_t>(0, c.n_kv - 7); break;
+                default: n_vis[r] = (int32_t) std::max<int64_t>(0, c.n_kv - 1); break;
+            }
+        }
+
+        std::vector<uint16_t> poison((size_t) n_el, poison_u16);
+        ggml_backend_tensor_set(t_nk,  poison.data(), 0, poison.size() * sizeof(uint16_t));
+        ggml_backend_tensor_set(t_ref, poison.data(), 0, poison.size() * sizeof(uint16_t));
+
+        const int64_t c0 = cnt(be, "nk_dev_mask");
+        const bool ok_nk  = nk_fill(be, t_nk, n_vis.data(), n_rows, c.n_kv);
+        const bool ok_ref = ref_fill(be, t_ref, n_vis.data(), n_rows, c.n_kv);
+        const int64_t c1 = cnt(be, "nk_dev_mask");
+        ggml_backend_synchronize(be);
+
+        std::vector<uint16_t> out_nk((size_t) n_el), out_ref((size_t) n_el);
+        ggml_backend_tensor_get(t_nk,  out_nk.data(),  0, out_nk.size()  * sizeof(uint16_t));
+        ggml_backend_tensor_get(t_ref, out_ref.data(), 0, out_ref.size() * sizeof(uint16_t));
+
+        bool match_cpu = true;
+        int64_t bad_r = -1, bad_j = -1;
+        for (int64_t r = 0; r < n_rows && match_cpu; ++r) {
+            const int64_t nv = std::max<int64_t>(0, std::min<int64_t>(c.n_kv, n_vis[r]));
+            for (int64_t j = 0; j < c.n_kv; ++j) {
+                const uint16_t want = j < nv ? keep_u16 : drop_u16;
+                if (out_nk[(size_t) (r * c.n_kv + j)] != want) {
+                    match_cpu = false;
+                    bad_r = r;
+                    bad_j = j;
+                    break;
+                }
+            }
+        }
+        const bool match_ref = std::memcmp(out_nk.data(), out_ref.data(), out_nk.size() * sizeof(uint16_t)) == 0;
+        const bool ok_cnt = (c1 - c0) == 1;
+        const bool pass = ok_nk && ok_ref && match_cpu && match_ref && ok_cnt;
+        if (!pass) {
+            ++fails;
+            printf("NK_PREFIX_MASK(n_kv=%lld,ne1=%lld,ne3=%lld): FAIL ok_nk=%d ok_ref=%d cpu=%d(r=%lld,j=%lld) ref=%d cnt=%lld\n",
+                   (long long) c.n_kv, (long long) c.ne1, (long long) c.ne3,
+                   ok_nk, ok_ref, match_cpu, (long long) bad_r, (long long) bad_j, match_ref, (long long) (c1 - c0));
+        } else {
+            printf("NK_PREFIX_MASK(n_kv=%lld,ne1=%lld,ne3=%lld): OK\n",
+                   (long long) c.n_kv, (long long) c.ne1, (long long) c.ne3);
+        }
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // Microbench at exact Inkling 2 Mini 100K decode shapes: [100352, 8] (DSpark) and [100352, 5] (SJ far mask)
+    for (int64_t n_rows : { 8, 5 }) {
+        const int64_t n_kv = 100352;
+        ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_rows);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        std::vector<int32_t> n_vis((size_t) n_rows, 100100);
+        const int iters = 200;
+        for (int w = 0; w < 20; ++w) {
+            nk_fill(be, t, n_vis.data(), n_rows, n_kv);
+        }
+        ggml_backend_synchronize(be);
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < iters; ++i) {
+            nk_fill(be, t, n_vis.data(), n_rows, n_kv);
+        }
+        ggml_backend_synchronize(be);
+        const double nk_us = (double) (ggml_time_us() - t0) / iters;
+
+        for (int w = 0; w < 20; ++w) {
+            ref_fill(be, t, n_vis.data(), n_rows, n_kv);
+        }
+        ggml_backend_synchronize(be);
+        const int64_t t1 = ggml_time_us();
+        for (int i = 0; i < iters; ++i) {
+            ref_fill(be, t, n_vis.data(), n_rows, n_kv);
+        }
+        ggml_backend_synchronize(be);
+        const double ref_us = (double) (ggml_time_us() - t1) / iters;
+
+        const double bytes = (double) n_kv * n_rows * 2.0;
+        printf("NK_PREFIX_MASK perf [%lld x %lld] (%.2f MB): nk=%.2f us (%.1f GB/s), stock=%.2f us (%.1f GB/s)\n",
+               (long long) n_kv, (long long) n_rows, bytes / 1e6,
+               nk_us, bytes / (nk_us * 1e3), ref_us, bytes / (ref_us * 1e3));
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(be);
+    printf("nk_prefix_mask: %s (%d fails)\n", fails ? "FAIL" : "PASS", fails);
+    return fails ? 1 : 0;
+}
+
+// NEONKERN: GGML_TEST_NK_DSPARK_HEAD=1 verifies ggml_cuda_nk_dspark_head_launch bit-for-bit against
+// base ggml_cuda_dspark_head_launch_base across Inkling 2 Mini full/shortlist/multi-seq/edge/all-tied cases,
+// enforces the nk_dspark_head fusion counter, and runs a same-job ABBA microbench.
+static int run_nk_dspark_head_check() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        fprintf(stderr, "nk_dspark_head: no GPU backend\n");
+        return 1;
+    }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using run_fn = bool (*)(ggml_backend_t, bool,
+            const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+            const ggml_tensor *, const ggml_tensor *,
+            ggml_tensor *, ggml_tensor *, ggml_tensor *,
+            int64_t, int, float, float, int);
+    using cnt_fn = int64_t (*)(ggml_backend_t, const char *);
+    auto run_head = (run_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dspark_head_run");
+    auto cnt      = (cnt_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+    if (!run_head || !cnt) {
+        fprintf(stderr, "nk_dspark_head: missing proc address (run=%p cnt=%p)\n", (void *) run_head, (void *) cnt);
+        ggml_backend_free(be);
+        return 1;
+    }
+
+    struct head_case {
+        const char * name;
+        int64_t n_full;
+        int64_t n_eval;
+        int     nb;
+        int     sk;
+        bool    sampled;
+        bool    shortlist;
+        bool    all_tied;
+        int     ntiles_override;
+    };
+    const std::vector<head_case> cases = {
+        { "full_sampled_k20",         200058, 200058, 1, 20, true,  false, false,   0 },
+        { "full_sampled_k64",         200058, 200058, 1, 64, true,  false, false,   0 },
+        { "full_greedy",              200058, 200058, 1,  1, false, false, false,   0 },
+        { "shortlist_k20",            200058,  32768, 1, 20, true,  true,  false,   0 },
+        { "shortlist_greedy",         200058,  32768, 1,  1, false, true,  false,   0 },
+        { "full_nb4_k20",             200058, 200058, 4, 20, true,  false, false,   0 },
+        { "full_nb4_greedy",          200058, 200058, 4,  1, false, false, false,   0 },
+        { "edge_neval_eq_k",            1024,     20, 1, 20, true,  false, false,   0 },
+        { "edge_odd_63",                1024,     63, 1, 20, true,  false, false,   0 },
+        { "edge_odd_65",                1024,     65, 1, 20, true,  false, false,   0 },
+        { "edge_non4_1001_nb2",         1024,   1001, 2, 32, true,  false, false,   0 },
+        { "adversarial_tied",          10000,  10000, 1, 20, true,  false, true,    0 },
+        { "ntiles_328_sampled_k20",   200058, 200058, 1, 20, true,  false, false, 328 },
+        { "ntiles_336_sampled_k20",   200058, 200058, 1, 20, true,  false, false, 336 },
+        { "ntiles_196_sampled_k20",   200058, 200058, 1, 20, true,  false, false, 196 },
+        { "ntiles_328_greedy",        200058, 200058, 1,  1, false, false, false, 328 },
+        { "ntiles_336_greedy",        200058, 200058, 1,  1, false, false, false, 336 },
+        { "ntiles_196_greedy",        200058, 200058, 1,  1, false, false, false, 196 },
+    };
+
+    auto fill_case = [](const head_case & c,
+            std::vector<ggml_fp16_t> & h_w,
+            std::vector<float> & h_lat,
+            std::vector<float> & h_fb,
+            std::vector<float> & h_base,
+            std::vector<int32_t> & h_ids,
+            std::vector<float> & h_noise) {
+        std::mt19937 rng(20261124u + (uint32_t) c.n_eval * 17u + (uint32_t) c.sk * 31u + (uint32_t) c.nb);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        h_w.resize((size_t) c.n_full * 256);
+        h_lat.resize((size_t) c.nb * 256);
+        h_fb.resize((size_t) c.n_eval);
+        h_base.resize((size_t) c.nb * c.n_eval);
+        if (c.all_tied) {
+            std::fill(h_w.begin(), h_w.end(), ggml_fp32_to_fp16(0.0f));
+            std::fill(h_lat.begin(), h_lat.end(), 0.0f);
+            std::fill(h_fb.begin(), h_fb.end(), 500.0f);
+            std::fill(h_base.begin(), h_base.end(), 500.0f);
+        } else {
+            for (size_t i = 0; i < h_w.size(); ++i) {
+                h_w[i] = ggml_fp32_to_fp16(nd(rng) * 0.2f);
+            }
+            for (float & x : h_lat)  x = nd(rng) * 0.25f;
+            for (float & x : h_fb)   x = nd(rng) * 0.5f;
+            for (float & x : h_base) x = nd(rng) * 3.0f;
+        }
+        if (c.shortlist) {
+            h_ids.resize((size_t) c.n_eval);
+            for (int64_t i = 0; i < c.n_eval; ++i) {
+                h_ids[(size_t) i] = (int32_t) (((i * 2654435761ull) >> 1) % (uint64_t) c.n_full);
+            }
+        } else {
+            h_ids.clear();
+        }
+        if (c.sampled) {
+            h_noise.resize((size_t) c.nb * c.sk);
+            for (float & x : h_noise) x = nd(rng) * 0.5f;
+        } else {
+            h_noise.clear();
+        }
+    };
+
+    int fails = 0;
+    const float softcap  = 30.0f;
+    const float inv_temp = 1.0f;
+
+    for (const auto & c : cases) {
+        ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t_w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, c.n_full);
+        ggml_tensor * t_lat   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, c.nb);
+        ggml_tensor * t_fb    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.n_eval);
+        ggml_tensor * t_base  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.n_eval, c.nb);
+        ggml_tensor * t_ids   = c.shortlist ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.n_eval) : nullptr;
+        ggml_tensor * t_noise = c.sampled   ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+
+        ggml_tensor * t_cand_nk  = c.sampled ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_vals_nk  = c.sampled ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_prev_nk  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.nb);
+        ggml_tensor * t_cand_ref = c.sampled ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_vals_ref = c.sampled ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_prev_ref = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.nb);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::vector<ggml_fp16_t> h_w;
+        std::vector<float> h_lat, h_fb, h_base, h_noise;
+        std::vector<int32_t> h_ids;
+        fill_case(c, h_w, h_lat, h_fb, h_base, h_ids, h_noise);
+
+        ggml_backend_tensor_set(t_w,    h_w.data(),    0, h_w.size()    * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_lat,  h_lat.data(),  0, h_lat.size()  * sizeof(float));
+        ggml_backend_tensor_set(t_fb,   h_fb.data(),   0, h_fb.size()   * sizeof(float));
+        ggml_backend_tensor_set(t_base, h_base.data(), 0, h_base.size() * sizeof(float));
+        if (t_ids)   ggml_backend_tensor_set(t_ids,   h_ids.data(),   0, h_ids.size()   * sizeof(int32_t));
+        if (t_noise) ggml_backend_tensor_set(t_noise, h_noise.data(), 0, h_noise.size() * sizeof(float));
+
+        const int64_t c0 = cnt(be, "nk_dspark_head");
+        const bool ok_ref = run_head(be, false, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
+                t_cand_ref, t_vals_ref, t_prev_ref, c.n_eval, c.sk, softcap, inv_temp, 0);
+        const int64_t c1 = cnt(be, "nk_dspark_head");
+        const bool ok_nk = run_head(be, true, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
+                t_cand_nk, t_vals_nk, t_prev_nk, c.n_eval, c.sk, softcap, inv_temp, c.ntiles_override);
+        const int64_t c2 = cnt(be, "nk_dspark_head");
+        ggml_backend_synchronize(be);
+
+        std::vector<int32_t> prev_nk((size_t) c.nb), prev_ref((size_t) c.nb);
+        ggml_backend_tensor_get(t_prev_nk,  prev_nk.data(),  0, prev_nk.size()  * sizeof(int32_t));
+        ggml_backend_tensor_get(t_prev_ref, prev_ref.data(), 0, prev_ref.size() * sizeof(int32_t));
+
+        bool eq_prev = std::memcmp(prev_nk.data(), prev_ref.data(), prev_nk.size() * sizeof(int32_t)) == 0;
+        bool eq_cand = true;
+        bool eq_vals = true;
+        int bad_b = -1, bad_j = -1;
+        int32_t bad_c_nk = 0, bad_c_ref = 0;
+        float   bad_v_nk = 0.0f, bad_v_ref = 0.0f;
+        if (c.sampled) {
+            std::vector<int32_t> cand_nk((size_t) c.nb * c.sk), cand_ref((size_t) c.nb * c.sk);
+            std::vector<float>   vals_nk((size_t) c.nb * c.sk), vals_ref((size_t) c.nb * c.sk);
+            ggml_backend_tensor_get(t_cand_nk,  cand_nk.data(),  0, cand_nk.size()  * sizeof(int32_t));
+            ggml_backend_tensor_get(t_cand_ref, cand_ref.data(), 0, cand_ref.size() * sizeof(int32_t));
+            ggml_backend_tensor_get(t_vals_nk,  vals_nk.data(),  0, vals_nk.size()  * sizeof(float));
+            ggml_backend_tensor_get(t_vals_ref, vals_ref.data(), 0, vals_ref.size() * sizeof(float));
+            eq_cand = std::memcmp(cand_nk.data(), cand_ref.data(), cand_nk.size() * sizeof(int32_t)) == 0;
+            eq_vals = std::memcmp(vals_nk.data(), vals_ref.data(), vals_nk.size() * sizeof(float)) == 0;
+            if (!eq_cand || !eq_vals) {
+                for (int b = 0; b < c.nb && bad_b < 0; ++b) {
+                    for (int j = 0; j < c.sk; ++j) {
+                        const size_t idx = (size_t) b * c.sk + j;
+                        if (cand_nk[idx] != cand_ref[idx] ||
+                                std::memcmp(&vals_nk[idx], &vals_ref[idx], sizeof(float)) != 0) {
+                            bad_b = b;
+                            bad_j = j;
+                            bad_c_nk  = cand_nk[idx];
+                            bad_c_ref = cand_ref[idx];
+                            bad_v_nk  = vals_nk[idx];
+                            bad_v_ref = vals_ref[idx];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        const bool ok_cnt = (c1 == c0) && (c2 == c1 + 1);
+        const bool pass = ok_ref && ok_nk && eq_prev && eq_cand && eq_vals && ok_cnt;
+        if (!pass) {
+            ++fails;
+            printf("NK_DSPARK_HEAD(%s): FAIL ok_ref=%d ok_nk=%d prev=%d cand=%d vals=%d cnt=(%lld,%lld) first=(b=%d,j=%d nk=%d/%.6g ref=%d/%.6g)\n",
+                   c.name, ok_ref, ok_nk, eq_prev, eq_cand, eq_vals, (long long) (c1 - c0), (long long) (c2 - c1),
+                   bad_b, bad_j, bad_c_nk, bad_v_nk, bad_c_ref, bad_v_ref);
+        } else {
+            printf("NK_DSPARK_HEAD(%s): OK (bit-exact, cnt=+1)\n", c.name);
+        }
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // Same-job ABBA microbench on the exact Inkling 2 Mini DSpark head shapes
+    const std::vector<head_case> perf_cases = {
+        { "full_sampled_k20",    200058, 200058, 1, 20, true,  false, false, 0 },
+        { "full_greedy",         200058, 200058, 1,  1, false, false, false, 0 },
+        { "shortlist_k20",       200058,  32768, 1, 20, true,  true,  false, 0 },
+        { "full_nb4_k20",        200058, 200058, 4, 20, true,  false, false, 0 },
+    };
+    const int warmup = 20;
+    const int iters  = 200;
+    for (const auto & c : perf_cases) {
+        ggml_init_params ip = { 12 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t_w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, c.n_full);
+        ggml_tensor * t_lat   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, c.nb);
+        ggml_tensor * t_fb    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.n_eval);
+        ggml_tensor * t_base  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.n_eval, c.nb);
+        ggml_tensor * t_ids   = c.shortlist ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.n_eval) : nullptr;
+        ggml_tensor * t_noise = c.sampled   ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_cand  = c.sampled   ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_vals  = c.sampled   ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_prev  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.nb);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::vector<ggml_fp16_t> h_w;
+        std::vector<float> h_lat, h_fb, h_base, h_noise;
+        std::vector<int32_t> h_ids;
+        fill_case(c, h_w, h_lat, h_fb, h_base, h_ids, h_noise);
+
+        ggml_backend_tensor_set(t_w,    h_w.data(),    0, h_w.size()    * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_lat,  h_lat.data(),  0, h_lat.size()  * sizeof(float));
+        ggml_backend_tensor_set(t_fb,   h_fb.data(),   0, h_fb.size()   * sizeof(float));
+        ggml_backend_tensor_set(t_base, h_base.data(), 0, h_base.size() * sizeof(float));
+        if (t_ids)   ggml_backend_tensor_set(t_ids,   h_ids.data(),   0, h_ids.size()   * sizeof(int32_t));
+        if (t_noise) ggml_backend_tensor_set(t_noise, h_noise.data(), 0, h_noise.size() * sizeof(float));
+
+        auto time_leg = [&](bool use_nk) -> double {
+            for (int w = 0; w < warmup; ++w) {
+                run_head(be, use_nk, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
+                        t_cand, t_vals, t_prev, c.n_eval, c.sk, softcap, inv_temp, c.ntiles_override);
+            }
+            ggml_backend_synchronize(be);
+            const int64_t t0 = ggml_time_us();
+            for (int i = 0; i < iters; ++i) {
+                run_head(be, use_nk, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
+                        t_cand, t_vals, t_prev, c.n_eval, c.sk, softcap, inv_temp, c.ntiles_override);
+            }
+            ggml_backend_synchronize(be);
+            return (double) (ggml_time_us() - t0) / iters;
+        };
+
+        const double a1 = time_leg(false);
+        const double b1 = time_leg(true);
+        const double b2 = time_leg(true);
+        const double a2 = time_leg(false);
+        const double base_us = 0.5 * (a1 + a2);
+        const double nk_us   = 0.5 * (b1 + b2);
+        const double bytes   = (double) c.nb * (double) c.n_eval * (512.0 + 4.0 + 4.0 + (c.shortlist ? 4.0 : 0.0));
+        printf("NK_DSPARK_HEAD perf %-18s (%.1f MB): base=%.2f us (%.0f GB/s) -> nk=%.2f us (%.0f GB/s) | delta=%+.2f us (%+.1f%%) | 4x=%+.1f us/r\n",
+               c.name, bytes / 1e6, base_us, bytes / (base_us * 1e3), nk_us, bytes / (nk_us * 1e3),
+               nk_us - base_us, (nk_us / base_us - 1.0) * 100.0, 4.0 * (nk_us - base_us));
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(be);
+    printf("nk_dspark_head: %s (%d fails)\n", fails ? "FAIL" : "PASS", fails);
+    return fails ? 1 : 0;
+}
+
+static int run_nk_dense_tc_check() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        fprintf(stderr, "nk_dense_tc: no GPU backend\n");
+        return 1;
+    }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using run_fn   = bool (*)(ggml_backend_t, bool, const ggml_tensor *, const ggml_tensor *, ggml_tensor *);
+    using grp_fn   = bool (*)(ggml_backend_t, bool, ggml_tensor * const *, int);
+    using cnt_fn   = int64_t (*)(ggml_backend_t, const char *);
+    auto run_mm    = (run_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_dense_tc_run");
+    auto run_grp   = (grp_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_dense_tc_group_run");
+    auto cnt       = (cnt_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+    if (!run_mm || !run_grp || !cnt) {
+        fprintf(stderr, "nk_dense_tc: missing proc address (mm=%p grp=%p cnt=%p)\n",
+                (void *) run_mm, (void *) run_grp, (void *) cnt);
+        ggml_backend_free(be);
+        return 1;
+    }
+
+    auto make_q8_weights = [](int64_t M, int64_t K, uint32_t seed,
+                              std::vector<uint8_t> & wq_bytes, std::vector<float> & w_deq) {
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> nd(0.0f, 0.25f);
+        std::vector<float> wf((size_t) M * K);
+        for (float & v : wf) {
+            v = nd(rng);
+        }
+        const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, K);
+        wq_bytes.resize((size_t) M * row_bytes);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, wf.data(), wq_bytes.data(), 0, M, K, nullptr);
+        w_deq.resize((size_t) M * K);
+        const auto to_float = ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float;
+        for (int64_t r = 0; r < M; ++r) {
+            to_float(wq_bytes.data() + (size_t) r * row_bytes, w_deq.data() + (size_t) r * K, K);
+        }
+    };
+
+    auto cpu_ref_mm = [](const std::vector<float> & w_deq, const std::vector<float> & x,
+                         int64_t M, int64_t K, int64_t T, int64_t sx, std::vector<float> & ref) {
+        ref.resize((size_t) T * M);
+        for (int64_t t = 0; t < T; ++t) {
+            const float * xt = x.data() + (size_t) t * sx;
+            for (int64_t r = 0; r < M; ++r) {
+                const float * wr = w_deq.data() + (size_t) r * K;
+                double s = 0.0;
+                for (int64_t j = 0; j < K; ++j) {
+                    s += (double) wr[j] * (double) xt[j];
+                }
+                ref[(size_t) t * M + r] = (float) s;
+            }
+        }
+    };
+
+    auto calc_nmse = [](const float * a, const float * ref, int64_t M, int64_t T, int64_t sd,
+                        double & out_max_abs, bool & out_bad_fp) -> double {
+        double num = 0.0, den = 0.0;
+        out_max_abs = 0.0;
+        out_bad_fp  = false;
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t r = 0; r < M; ++r) {
+                const float va = a[(size_t) t * sd + r];
+                const float vr = ref[(size_t) t * M + r];
+                if (!std::isfinite(va) || !std::isfinite(vr)) {
+                    out_bad_fp = true;
+                    return 1e9;
+                }
+                const double d = (double) va - (double) vr;
+                num += d * d;
+                den += (double) vr * (double) vr;
+                if (std::fabs(d) > out_max_abs) {
+                    out_max_abs = std::fabs(d);
+                }
+            }
+        }
+        return den > 0.0 ? (num / den) : num;
+    };
+
+    const double max_nmse = 5e-4;
+    int fails = 0;
+
+    // 1. Single MUL_MAT correctness: attn_output (2304x3072) at T=1..8 + odd M / small K / strided / adversarial
+    struct single_case {
+        const char * name;
+        int64_t M, K, T;
+        int64_t pad_sx, pad_sd;
+        int     mode; // 0=normal, 1=zero_cols, 2=wide_range_outlier
+        bool    expect_nk;
+    };
+    std::vector<single_case> scases;
+    for (int t = 1; t <= 8; ++t) {
+        static const char * tnames[8] = {
+            "attn_out_T1", "attn_out_T2", "attn_out_T3", "attn_out_T4",
+            "attn_out_T5", "attn_out_T6", "attn_out_T7", "attn_out_T8"
+        };
+        scases.push_back({ tnames[t - 1], 2304, 3072, t, 0, 0, 0, true });
+    }
+    scases.push_back({ "edge_M1_K2304_T5",     1, 2304, 5,  0,  0, 0, true  });
+    scases.push_back({ "edge_M15_K2304_T5",   15, 2304, 5,  0,  0, 0, true  });
+    scases.push_back({ "edge_M17_K2304_T5",   17, 2304, 5,  0,  0, 0, true  });
+    scases.push_back({ "edge_M24_K2304_T5",   24, 2304, 5,  0,  0, 0, true  });
+    scases.push_back({ "edge_M31_K2304_T1",   31, 2304, 1,  0,  0, 0, true  });
+    scases.push_back({ "edge_M33_K2304_T8",   33, 2304, 8,  0,  0, 0, true  });
+    scases.push_back({ "edge_M127_K2304_T2", 127, 2304, 2,  0,  0, 0, true  });
+    scases.push_back({ "edge_K256_nch1_T5",   33,  256, 5,  0,  0, 0, true  });
+    scases.push_back({ "edge_K512_nch2_T5",   33,  512, 5,  0,  0, 0, true  });
+    scases.push_back({ "edge_K768_nch3_T5",   33,  768, 5,  0,  0, 0, true  });
+    scases.push_back({ "edge_K1024_nch4_T5",  33, 1024, 5,  0,  0, 0, true  });
+    scases.push_back({ "edge_strided_sx_sd",  35,  512, 5, 64, 19, 0, true  });
+    scases.push_back({ "edge_zero_x_cols",    64,  512, 5,  0,  0, 1, true  });
+    scases.push_back({ "edge_wide_outlier",   64,  512, 5,  0,  0, 2, true  });
+    scases.push_back({ "fallback_odd_K96",    64,   96, 5,  0,  0, 0, false });
+    scases.push_back({ "fallback_odd_K320",   64,  320, 5,  0,  0, 0, false });
+
+    for (size_t ci = 0; ci < scases.size(); ++ci) {
+        const auto & c = scases[ci];
+        const int64_t sx = c.K + c.pad_sx;
+        const int64_t sd = c.M + c.pad_sd;
+        ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t_w      = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, c.K, c.M);
+        ggml_tensor * t_x_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sx, c.T);
+        ggml_tensor * t_x      = c.pad_sx ? ggml_view_2d(ctx, t_x_full, c.K, c.T, (size_t) sx * sizeof(float), 0) : t_x_full;
+        ggml_tensor * t_d_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sd, c.T);
+        ggml_tensor * t_d      = c.pad_sd ? ggml_view_2d(ctx, t_d_full, c.M, c.T, (size_t) sd * sizeof(float), 0) : t_d_full;
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::vector<uint8_t> h_wq;
+        std::vector<float> h_wdeq, h_x((size_t) c.T * sx, 0.0f), h_ref;
+        make_q8_weights(c.M, c.K, 20261124u + (uint32_t) ci * 97u, h_wq, h_wdeq);
+
+        std::mt19937 rng(9911u + (uint32_t) ci * 53u);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (int64_t t = 0; t < c.T; ++t) {
+            for (int64_t j = 0; j < c.K; ++j) {
+                float v = nd(rng);
+                if (c.mode == 1) {
+                    v = (t == 0 || t == 2) ? 0.0f : v;
+                } else if (c.mode == 2) {
+                    const float scale = (t == 0) ? 1e-4f : (t == 1) ? 1e3f : 1.0f;
+                    v *= scale;
+                    if (t == 2 && (j % 32) == 7) {
+                        v = 50.0f;
+                    }
+                }
+                h_x[(size_t) t * sx + j] = v;
+            }
+        }
+        std::vector<float> h_dst_init((size_t) c.T * sd, -12345.0f);
+        ggml_backend_tensor_set(t_w, h_wq.data(), 0, h_wq.size());
+        ggml_backend_tensor_set(t_x_full, h_x.data(), 0, h_x.size() * sizeof(float));
+        ggml_backend_tensor_set(t_d_full, h_dst_init.data(), 0, h_dst_init.size() * sizeof(float));
+
+        const int64_t c0 = cnt(be, "nk_dense_tc");
+        const bool ok_nk = run_mm(be, true, t_w, t_x, t_d);
+        const int64_t c1 = cnt(be, "nk_dense_tc");
+        ggml_backend_synchronize(be);
+
+        if (!c.expect_nk) {
+            const bool ok_base = run_mm(be, false, t_w, t_x, t_d);
+            const int64_t c2 = cnt(be, "nk_dense_tc");
+            ggml_backend_synchronize(be);
+            const bool pass = !ok_nk && ok_base && c1 == c0 && c2 == c0;
+            if (!pass) {
+                ++fails;
+                printf("NK_DENSE_TC(%-20s): FAIL expect_fallback ok_nk=%d ok_base=%d dc=%lld\n",
+                       c.name, ok_nk, ok_base, (long long) (c2 - c0));
+            } else {
+                printf("NK_DENSE_TC(%-20s): OK (clean fallback, cnt=+0)\n", c.name);
+            }
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            continue;
+        }
+
+        std::vector<float> h_out((size_t) c.T * sd);
+        ggml_backend_tensor_get(t_d_full, h_out.data(), 0, h_out.size() * sizeof(float));
+        cpu_ref_mm(h_wdeq, h_x, c.M, c.K, c.T, sx, h_ref);
+
+        double max_abs = 0.0;
+        bool bad_fp = false;
+        const double nmse = calc_nmse(h_out.data(), h_ref.data(), c.M, c.T, sd, max_abs, bad_fp);
+
+        bool pad_ok = true;
+        if (c.pad_sd > 0) {
+            for (int64_t t = 0; t < c.T && pad_ok; ++t) {
+                for (int64_t r = c.M; r < sd; ++r) {
+                    if (h_out[(size_t) t * sd + r] != -12345.0f) {
+                        pad_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        const bool pass = ok_nk && (c1 == c0 + 1) && !bad_fp && nmse <= max_nmse && pad_ok;
+        if (!pass) {
+            ++fails;
+            printf("NK_DENSE_TC(%-20s): FAIL ok=%d dc=%lld nmse=%.3e max_abs=%.3e pad_ok=%d\n",
+                   c.name, ok_nk, (long long) (c1 - c0), nmse, max_abs, pad_ok);
+        } else {
+            printf("NK_DENSE_TC(%-20s): OK (nmse=%.2e max_abs=%.3e cnt=+1)\n", c.name, nmse, max_abs);
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // 2. Grouped QKV correctness: 6-member SWA ({3072,3072,1024,1024,384,24} x 2304, 3 distinct xs) at T=1..8
+    //    and 8-member full-attn (+32,+32) at T=5
+    struct grp_case {
+        const char * name;
+        std::vector<int64_t> ms;
+        int64_t K, T;
+    };
+    std::vector<grp_case> gcases;
+    const std::vector<int64_t> qkv6 = { 3072, 3072, 1024, 1024, 384, 24 };
+    const std::vector<int64_t> qkv8 = { 3072, 3072, 1024, 1024, 384, 24, 32, 32 };
+    for (int t = 1; t <= 8; ++t) {
+        static const char * gnames[8] = {
+            "qkv6_T1", "qkv6_T2", "qkv6_T3", "qkv6_T4",
+            "qkv6_T5", "qkv6_T6", "qkv6_T7", "qkv6_T8"
+        };
+        gcases.push_back({ gnames[t - 1], qkv6, 2304, t });
+    }
+    gcases.push_back({ "qkv8_full_T5", qkv8, 2304, 5 });
+
+    for (size_t gi = 0; gi < gcases.size(); ++gi) {
+        const auto & g = gcases[gi];
+        const int nm = (int) g.ms.size();
+        ggml_init_params ip = { 64 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * xs[3];
+        for (int s = 0; s < 3; ++s) {
+            xs[s] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, g.K, g.T);
+        }
+        std::vector<ggml_tensor *> ws(nm), ds(nm);
+        for (int m = 0; m < nm; ++m) {
+            ws[m] = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, g.K, g.ms[m]);
+            // Mirror looped Inkling layers: q/gate/rel/sink -> xs[0], k/kp -> xs[1], v/vp -> xs[2]
+            const int xidx = (m == 2 || m == 6) ? 1 : (m == 3 || m == 7) ? 2 : 0;
+            ds[m] = ggml_mul_mat(ctx, ws[m], xs[xidx]);
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::mt19937 rng(55501u + (uint32_t) gi * 131u);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> h_xs[3];
+        for (int s = 0; s < 3; ++s) {
+            h_xs[s].resize((size_t) g.T * g.K);
+            for (float & v : h_xs[s]) { v = nd(rng); }
+            ggml_backend_tensor_set(xs[s], h_xs[s].data(), 0, h_xs[s].size() * sizeof(float));
+        }
+        std::vector<std::vector<float>> h_wdeqs(nm);
+        for (int m = 0; m < nm; ++m) {
+            std::vector<uint8_t> h_wq;
+            make_q8_weights(g.ms[m], g.K, 77701u + (uint32_t) gi * 37u + (uint32_t) m * 17u, h_wq, h_wdeqs[m]);
+            ggml_backend_tensor_set(ws[m], h_wq.data(), 0, h_wq.size());
+        }
+
+        const int64_t c0 = cnt(be, "nk_dense_tc");
+        const bool ok_nk = run_grp(be, true, ds.data(), nm);
+        const int64_t c1 = cnt(be, "nk_dense_tc");
+        ggml_backend_synchronize(be);
+
+        double worst_nmse = 0.0;
+        double worst_abs  = 0.0;
+        bool bad_fp = false;
+        for (int m = 0; m < nm; ++m) {
+            std::vector<float> h_out((size_t) g.T * g.ms[m]), h_ref;
+            ggml_backend_tensor_get(ds[m], h_out.data(), 0, h_out.size() * sizeof(float));
+            const int xidx = (m == 2 || m == 6) ? 1 : (m == 3 || m == 7) ? 2 : 0;
+            cpu_ref_mm(h_wdeqs[m], h_xs[xidx], g.ms[m], g.K, g.T, g.K, h_ref);
+            double ma = 0.0;
+            bool bfp = false;
+            const double e = calc_nmse(h_out.data(), h_ref.data(), g.ms[m], g.T, g.ms[m], ma, bfp);
+            worst_nmse = std::max(worst_nmse, e);
+            worst_abs  = std::max(worst_abs, ma);
+            bad_fp     = bad_fp || bfp;
+        }
+        const bool pass = ok_nk && (c1 == c0 + 1) && !bad_fp && worst_nmse <= max_nmse;
+        if (!pass) {
+            ++fails;
+            printf("NK_DENSE_TC(%-20s): FAIL ok=%d dc=%lld max_nmse=%.3e max_abs=%.3e\n",
+                   g.name, ok_nk, (long long) (c1 - c0), worst_nmse, worst_abs);
+        } else {
+            printf("NK_DENSE_TC(%-20s): OK (max_nmse=%.2e max_abs=%.3e cnt=+1)\n", g.name, worst_nmse, worst_abs);
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // 3. Same-job ABBA microbench (base q8a16 vs NK_DENSE_TC) at exact Inkling 2 Mini NQ shapes
+    printf("\n--- NK_DENSE_TC same-job ABBA microbench (base=q8a16 -> nk=NK_DENSE_TC) ---\n");
+    const int warmup = 20;
+    const int iters  = 200;
+
+    double qkv_base_t5 = 0.0, qkv_nk_t5 = 0.0;
+    double out_base_t5 = 0.0, out_nk_t5 = 0.0;
+    double qkv_base_t8 = 0.0, qkv_nk_t8 = 0.0;
+    double out_base_t8 = 0.0, out_nk_t8 = 0.0;
+
+    // 3a. Grouped QKV 6-member SWA (8576 x 2304, 20.99 MB) across T=1..8
+    {
+        const int nm = (int) qkv6.size();
+        const int64_t K = 2304;
+        const int64_t M_tot = 8576;
+        const double w_bytes = (double) M_tot * (double) ggml_row_size(GGML_TYPE_Q8_0, K);
+
+        ggml_init_params ip = { 64 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * xs[3];
+        for (int s = 0; s < 3; ++s) {
+            xs[s] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 8);
+        }
+        std::vector<ggml_tensor *> ws(nm);
+        for (int m = 0; m < nm; ++m) {
+            ws[m] = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, qkv6[m]);
+        }
+        ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx, be);
+        for (int s = 0; s < 3; ++s) {
+            std::vector<float> hx((size_t) 8 * K, 0.25f);
+            ggml_backend_tensor_set(xs[s], hx.data(), 0, hx.size() * sizeof(float));
+        }
+        for (int m = 0; m < nm; ++m) {
+            std::vector<uint8_t> h_wq;
+            std::vector<float> h_deq;
+            make_q8_weights(qkv6[m], K, 12300u + (uint32_t) m, h_wq, h_deq);
+            ggml_backend_tensor_set(ws[m], h_wq.data(), 0, h_wq.size());
+        }
+
+        for (int T = 1; T <= 8; ++T) {
+            ggml_init_params ip_t = { 32 * ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx_t = ggml_init(ip_t);
+            std::vector<ggml_tensor *> ds(nm);
+            for (int m = 0; m < nm; ++m) {
+                const int xidx = (m == 2) ? 1 : (m == 3) ? 2 : 0;
+                ggml_tensor * xv = ggml_view_2d(ctx_t, xs[xidx], K, T, xs[xidx]->nb[1], 0);
+                ds[m] = ggml_mul_mat(ctx_t, ws[m], xv);
+            }
+            ggml_backend_buffer_t buf_t = ggml_backend_alloc_ctx_tensors(ctx_t, be);
+
+            auto time_leg = [&](bool use_nk) -> double {
+                const int64_t cb = cnt(be, "nk_dense_tc");
+                for (int w = 0; w < warmup; ++w) {
+                    if (!run_grp(be, use_nk, ds.data(), nm)) { ++fails; }
+                }
+                ggml_backend_synchronize(be);
+                const int64_t t0 = ggml_time_us();
+                for (int i = 0; i < iters; ++i) {
+                    if (!run_grp(be, use_nk, ds.data(), nm)) { ++fails; }
+                }
+                ggml_backend_synchronize(be);
+                const int64_t dt = ggml_time_us() - t0;
+                const int64_t ca = cnt(be, "nk_dense_tc");
+                const int64_t exp_dc = use_nk ? (int64_t) (warmup + iters) : 0;
+                if (ca - cb != exp_dc) {
+                    ++fails;
+                    fprintf(stderr, "nk_dense_tc: counter mismatch on qkv6 T=%d use_nk=%d got=%lld exp=%lld\n",
+                            T, use_nk, (long long) (ca - cb), (long long) exp_dc);
+                }
+                return (double) dt / iters;
+            };
+            const double a1 = time_leg(false);
+            const double b1 = time_leg(true);
+            const double b2 = time_leg(true);
+            const double a2 = time_leg(false);
+            const double base_us = 0.5 * (a1 + a2);
+            const double nk_us   = 0.5 * (b1 + b2);
+            if (T == 5) { qkv_base_t5 = base_us; qkv_nk_t5 = nk_us; }
+            if (T == 8) { qkv_base_t8 = base_us; qkv_nk_t8 = nk_us; }
+            printf("NK_DENSE_TC perf %-18s T=%d (%.2f MB): base=%6.2f us (%4.0f GB/s) -> nk=%6.2f us (%4.0f GB/s) | delta=%+6.2f us (%+5.1f%%)\n",
+                   "qkv6_8576x2304", T, w_bytes / 1e6, base_us, w_bytes / (base_us * 1e3),
+                   nk_us, w_bytes / (nk_us * 1e3), nk_us - base_us, (nk_us / base_us - 1.0) * 100.0);
+            ggml_backend_buffer_free(buf_t);
+            ggml_free(ctx_t);
+        }
+        ggml_backend_buffer_free(buf_w);
+        ggml_free(ctx);
+    }
+
+    // 3b. Single MUL_MAT shapes: attn_output (2304x3072, T=1..8), attn_q (3072x2304, T=1,2,5,8), output_head (201024x2304, T=5)
+    struct perf_single {
+        const char * name;
+        int64_t M, K;
+        std::vector<int> ts;
+        int w_iters, t_iters;
+    };
+    const std::vector<perf_single> pshapes = {
+        { "attn_out_2304x3072", 2304,   3072, { 1, 2, 3, 4, 5, 6, 7, 8 }, warmup, iters },
+        { "attn_q_3072x2304",   3072,   2304, { 1, 2, 5, 8 },             warmup, iters },
+        { "head_201024x2304",   201024, 2304, { 5 },                      5,      20    },
+    };
+    for (const auto & ps : pshapes) {
+        const double w_bytes = (double) ps.M * (double) ggml_row_size(GGML_TYPE_Q8_0, ps.K);
+        ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t_w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ps.K, ps.M);
+        ggml_tensor * t_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ps.K, 8);
+        ggml_tensor * t_d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ps.M, 8);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        // Fast synthetic valid Q8_0 fill (34 B/block = 2 B fp16 scale + 32 int8 qs)
+        {
+            const size_t nbytes = ggml_nbytes(t_w);
+            const size_t tsz    = ggml_type_size(GGML_TYPE_Q8_0);
+            const int    bsz    = (int) ggml_blck_size(GGML_TYPE_Q8_0);
+            std::vector<uint8_t> raw(nbytes);
+            const size_t nblk = nbytes / tsz;
+            const ggml_fp16_t d_val = ggml_fp32_to_fp16(0.02f);
+            for (size_t b = 0; b < nblk; ++b) {
+                uint8_t * bp = raw.data() + b * tsz;
+                std::memcpy(bp, &d_val, sizeof(d_val));
+                int8_t * qs = (int8_t *) (bp + sizeof(d_val));
+                for (int i = 0; i < bsz; ++i) {
+                    qs[i] = (int8_t) (((b + (size_t) i) & 31u) - 16u);
+                }
+            }
+            ggml_backend_tensor_set(t_w, raw.data(), 0, nbytes);
+            std::vector<float> hx((size_t) 8 * ps.K, 0.25f);
+            ggml_backend_tensor_set(t_x, hx.data(), 0, hx.size() * sizeof(float));
+        }
+
+        for (int T : ps.ts) {
+            ggml_init_params ip_v = { 8 * ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx_v = ggml_init(ip_v);
+            ggml_tensor * xv = ggml_view_2d(ctx_v, t_x, ps.K, T, t_x->nb[1], 0);
+            ggml_tensor * dv = ggml_view_2d(ctx_v, t_d, ps.M, T, t_d->nb[1], 0);
+
+            auto time_leg = [&](bool use_nk) -> double {
+                const int64_t cb = cnt(be, "nk_dense_tc");
+                for (int w = 0; w < ps.w_iters; ++w) {
+                    if (!run_mm(be, use_nk, t_w, xv, dv)) { ++fails; }
+                }
+                ggml_backend_synchronize(be);
+                const int64_t t0 = ggml_time_us();
+                for (int i = 0; i < ps.t_iters; ++i) {
+                    if (!run_mm(be, use_nk, t_w, xv, dv)) { ++fails; }
+                }
+                ggml_backend_synchronize(be);
+                const int64_t dt = ggml_time_us() - t0;
+                const int64_t ca = cnt(be, "nk_dense_tc");
+                const int64_t exp_dc = use_nk ? (int64_t) (ps.w_iters + ps.t_iters) : 0;
+                if (ca - cb != exp_dc) {
+                    ++fails;
+                    fprintf(stderr, "nk_dense_tc: counter mismatch on %s T=%d use_nk=%d got=%lld exp=%lld\n",
+                            ps.name, T, use_nk, (long long) (ca - cb), (long long) exp_dc);
+                }
+                return (double) dt / ps.t_iters;
+            };
+            const double a1 = time_leg(false);
+            const double b1 = time_leg(true);
+            const double b2 = time_leg(true);
+            const double a2 = time_leg(false);
+            const double base_us = 0.5 * (a1 + a2);
+            const double nk_us   = 0.5 * (b1 + b2);
+            if (ps.M == 2304 && ps.K == 3072 && T == 5) { out_base_t5 = base_us; out_nk_t5 = nk_us; }
+            if (ps.M == 2304 && ps.K == 3072 && T == 8) { out_base_t8 = base_us; out_nk_t8 = nk_us; }
+            printf("NK_DENSE_TC perf %-18s T=%d (%.2f MB): base=%6.2f us (%4.0f GB/s) -> nk=%6.2f us (%4.0f GB/s) | delta=%+6.2f us (%+5.1f%%)\n",
+                   ps.name, T, w_bytes / 1e6, base_us, w_bytes / (base_us * 1e3),
+                   nk_us, w_bytes / (nk_us * 1e3), nk_us - base_us, (nk_us / base_us - 1.0) * 100.0);
+            ggml_free(ctx_v);
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    printf("NK_DENSE_TC 48-visit QKV+attn_out T=5: base=%.2f ms -> nk=%.2f ms (delta=%+.2f ms, %+.1f%%)\n",
+           48.0 * (qkv_base_t5 + out_base_t5) / 1e3,
+           48.0 * (qkv_nk_t5 + out_nk_t5) / 1e3,
+           48.0 * ((qkv_nk_t5 + out_nk_t5) - (qkv_base_t5 + out_base_t5)) / 1e3,
+           ((qkv_nk_t5 + out_nk_t5) / (qkv_base_t5 + out_base_t5) - 1.0) * 100.0);
+    printf("NK_DENSE_TC 48-visit QKV+attn_out T=8: base=%.2f ms -> nk=%.2f ms (delta=%+.2f ms, %+.1f%%)\n",
+           48.0 * (qkv_base_t8 + out_base_t8) / 1e3,
+           48.0 * (qkv_nk_t8 + out_nk_t8) / 1e3,
+           48.0 * ((qkv_nk_t8 + out_nk_t8) - (qkv_base_t8 + out_base_t8)) / 1e3,
+           ((qkv_nk_t8 + out_nk_t8) / (qkv_base_t8 + out_base_t8) - 1.0) * 100.0);
+
+    ggml_backend_free(be);
+    printf("nk_dense_tc: %s (%d fails)\n", fails ? "FAIL" : "PASS", fails);
+    return fails ? 1 : 0;
+}
+
+// GGML_TEST_NK_PF_MM=1: bit-exact correctness + same-job ABBA perf for NK_PF_MM vs base k_nvfp4pf_mm.
+// Runs both base and NK in one process on identical NVFP4 weights, F32 activations, routing ids, and scales.
+static int run_nk_pf_mm_check() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        fprintf(stderr, "nk_pf_mm: no GPU backend\n");
+        return 1;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    typedef bool (*nk_pf_mm_run_t)(ggml_backend_t, const ggml_tensor *, const ggml_tensor *,
+            const ggml_tensor *, ggml_tensor *, const ggml_tensor *, int);
+    typedef double (*nk_pf_mm_bench_kern_t)(ggml_backend_t, const ggml_tensor *, const ggml_tensor *,
+            const ggml_tensor *, ggml_tensor *, const ggml_tensor *, int, int, int);
+    typedef int64_t (*fusion_count_t)(ggml_backend_t, const char *);
+    auto run_fn = (nk_pf_mm_run_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_pf_mm_run");
+    auto bench_kern_fn = (nk_pf_mm_bench_kern_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_pf_mm_bench_kern");
+    auto count_fn = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+    if (!run_fn || !bench_kern_fn || !count_fn) {
+        fprintf(stderr, "nk_pf_mm: CUDA test proc addresses not available\n");
+        return 1;
+    }
+
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    if (!be) {
+        fprintf(stderr, "nk_pf_mm: failed to init GPU backend\n");
+        return 1;
+    }
+
+    const char * pf_env = getenv("GGML_CUDA_NVFP4PF");
+    const char * nk_env = getenv("GGML_CUDA_NK_PF_MM");
+    const char * perf_env = getenv("GGML_TEST_NK_PF_MM_NO_PERF");
+    const bool do_perf = !(perf_env && atoi(perf_env) != 0);
+    printf("nk_pf_mm: GGML_CUDA_NVFP4PF=%s GGML_CUDA_NK_PF_MM=%s\n",
+        (pf_env && *pf_env) ? pf_env : "k64(default)",
+        (nk_env && *nk_env) ? nk_env : "1(default)");
+
+    enum route_kind { ROUTE_UNIFORM = 0, ROUTE_SKEWED = 1, ROUTE_INVALID = 2, ROUTE_SPARSE = 3 };
+    struct pf_case {
+        const char * name;
+        int64_t K;
+        int64_t M;
+        int64_t E;
+        int64_t ne11;
+        int64_t n_used;
+        int64_t n_tok;
+        route_kind route;
+        bool with_scale;
+        bool bench;
+    };
+
+    const std::vector<pf_case> cases = {
+        { "gu_t512_unif",     2304, 2304, 128, 1, 8,  512, ROUTE_UNIFORM, true,  true  },
+        { "gu_t512_skew",     2304, 2304, 128, 1, 8,  512, ROUTE_SKEWED,  true,  true  },
+        { "dn_t512_unif",     1152, 2304, 128, 8, 8,  512, ROUTE_UNIFORM, true,  true  },
+        { "dn_t512_skew",     1152, 2304, 128, 8, 8,  512, ROUTE_SKEWED,  true,  true  },
+        { "gu_t1024_unif",    2304, 2304, 128, 1, 8, 1024, ROUTE_UNIFORM, true,  true  },
+        { "gu_t1024_skew",    2304, 2304, 128, 1, 8, 1024, ROUTE_SKEWED,  true,  true  },
+        { "dn_t1024_unif",    1152, 2304, 128, 8, 8, 1024, ROUTE_UNIFORM, true,  true  },
+        { "dn_t1024_skew",    1152, 2304, 128, 8, 8, 1024, ROUTE_SKEWED,  true,  true  },
+        { "gu_t2048_unif",    2304, 2304, 128, 1, 8, 2048, ROUTE_UNIFORM, true,  true  },
+        { "gu_t2048_skew",    2304, 2304, 128, 1, 8, 2048, ROUTE_SKEWED,  true,  true  },
+        { "dn_t2048_unif",    1152, 2304, 128, 8, 8, 2048, ROUTE_UNIFORM, true,  true  },
+        { "dn_t2048_skew",    1152, 2304, 128, 8, 8, 2048, ROUTE_SKEWED,  true,  true  },
+        { "edge_odd_slab",    1280, 2320,  64, 1, 8,  512, ROUTE_UNIFORM, true,  false },
+        { "edge_small_m_k128", 128,   80,  32, 1, 4,  512, ROUTE_UNIFORM, true,  false },
+        { "edge_unscaled",    1152, 2304, 128, 8, 8,  512, ROUTE_UNIFORM, false, false },
+        { "edge_invalid_id",  1152, 2304, 128, 8, 8,  512, ROUTE_INVALID, true,  false },
+        { "edge_sparse_3pair",1152, 2304, 128, 8, 8,  512, ROUTE_SPARSE,  true,  false },
+    };
+
+    int fails = 0;
+    int passed = 0;
+
+    for (size_t ci = 0; ci < cases.size(); ++ci) {
+        const pf_case & tc = cases[ci];
+        ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * src0  = ggml_new_tensor_3d(ctx, GGML_TYPE_NVFP4, tc.K, tc.M, tc.E);
+        ggml_tensor * src1  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,   tc.K, tc.ne11, tc.n_tok);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,   tc.n_used, tc.n_tok);
+        ggml_tensor * dst   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,   tc.M, tc.n_used, tc.n_tok);
+        ggml_tensor * s_exp = tc.with_scale ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, tc.E) : nullptr;
+        ggml_backend_buffer_t bb = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::mt19937 rng(20261124u + (uint32_t) ci * 997u);
+
+        // Fill NVFP4 blocks (36 bytes = 4 UE4M3 sub-scales + 32 nibble bytes) including edge scales
+        const size_t n_wbytes = ggml_nbytes(src0);
+        const size_t n_blocks = n_wbytes / 36;
+        std::vector<uint8_t> wb(n_wbytes);
+        for (size_t b = 0; b < n_blocks; ++b) {
+            uint8_t * p = wb.data() + b * 36;
+            const uint32_t r = rng();
+            for (int s = 0; s < 4; ++s) {
+                const uint32_t rb = (r >> (8 * s)) & 0xFFu;
+                uint8_t u = (uint8_t) (0x20u + (rb & 0x3Fu)); // normal UE4M3 range
+                if ((rb & 0xC0u) == 0xC0u) {
+                    u |= 0x80u; // bit-7 set normal scales (25% of random entries)
+                }
+                const size_t tag = (b + (size_t) s) & 63u;
+                if (tag == 0u) {
+                    u = 0x00u; // zero scale
+                } else if (tag == 1u) {
+                    u = 0x03u; // subnormal scale
+                } else if (tag == 2u) {
+                    u = 0x7Fu; // NaN -> 0 edge case
+                } else if (tag == 3u) {
+                    u = 0x80u; // bit-7 zero
+                } else if (tag == 4u) {
+                    u = 0x83u; // bit-7 subnormal
+                } else if (tag == 5u) {
+                    u = 0xFEu; // bit-7 max-1 normal
+                } else if (tag == 6u) {
+                    u = 0xFFu; // bit-7 0xFF -> 240.0 (NOT NaN)
+                }
+                p[s] = u;
+            }
+            for (int j = 0; j < 8; ++j) {
+                ((uint32_t *) (p + 4))[j] = rng();
+            }
+        }
+
+        // Fill F32 activations, keeping row 0 all-zero to test MIN_SCALE
+        const size_t n_x = (size_t) tc.K * (size_t) tc.ne11 * (size_t) tc.n_tok;
+        std::vector<float> xb(n_x);
+        std::uniform_real_distribution<float> ux(-2.0f, 2.0f);
+        for (size_t i = 0; i < n_x; ++i) {
+            xb[i] = (i < (size_t) tc.K) ? 0.0f : ux(rng);
+        }
+
+        // Fill routing ids [n_used, n_tok]
+        std::vector<int32_t> idb((size_t) tc.n_used * (size_t) tc.n_tok);
+        if (tc.route == ROUTE_UNIFORM) {
+            std::vector<int32_t> perm((size_t) tc.E);
+            std::iota(perm.begin(), perm.end(), 0);
+            for (int64_t t = 0; t < tc.n_tok; ++t) {
+                for (int64_t u = 0; u < tc.n_used; ++u) {
+                    const size_t j = (size_t) u + (rng() % (size_t) (tc.E - u));
+                    std::swap(perm[(size_t) u], perm[j]);
+                    idb[(size_t) t * (size_t) tc.n_used + (size_t) u] = perm[(size_t) u];
+                }
+            }
+        } else if (tc.route == ROUTE_SKEWED) {
+            // Zipf-like skew: top experts get ~3-5x average traffic, tail experts get <16 pairs
+            std::vector<double> cdf((size_t) tc.E);
+            double tot = 0.0;
+            for (int64_t e = 0; e < tc.E; ++e) {
+                tot += 1.0 / std::pow((double) (e + 1), 0.75);
+                cdf[(size_t) e] = tot;
+            }
+            std::uniform_real_distribution<double> u01(0.0, tot);
+            for (int64_t t = 0; t < tc.n_tok; ++t) {
+                std::vector<int32_t> used;
+                used.reserve((size_t) tc.n_used);
+                for (int64_t u = 0; u < tc.n_used; ++u) {
+                    int32_t pick = 0;
+                    for (int tries = 0; tries < 64; ++tries) {
+                        const double v = u01(rng);
+                        pick = (int32_t) (std::lower_bound(cdf.begin(), cdf.end(), v) - cdf.begin());
+                        if (pick >= (int32_t) tc.E) { pick = (int32_t) tc.E - 1; }
+                        if (std::find(used.begin(), used.end(), pick) == used.end()) { break; }
+                    }
+                    while (std::find(used.begin(), used.end(), pick) != used.end()) {
+                        pick = (pick + 1) % (int32_t) tc.E;
+                    }
+                    used.push_back(pick);
+                    idb[(size_t) t * (size_t) tc.n_used + (size_t) u] = pick;
+                }
+            }
+        } else if (tc.route == ROUTE_INVALID) {
+            for (size_t i = 0; i < idb.size(); ++i) {
+                if ((i % 19u) == 0u) {
+                    idb[i] = -1;
+                } else if ((i % 37u) == 0u) {
+                    idb[i] = (int32_t) tc.E;
+                } else {
+                    idb[i] = (int32_t) (rng() % (uint32_t) tc.E);
+                }
+            }
+        } else {
+            // ROUTE_SPARSE: 2 hot experts + 1 expert with 3 pairs + 1 expert with 17 pairs
+            for (size_t i = 0; i < idb.size(); ++i) {
+                idb[i] = (int32_t) (i & 1u);
+            }
+            idb[0] = 5; idb[1] = 5; idb[2] = 5;
+            for (size_t i = 10; i < 27 && i < idb.size(); ++i) {
+                idb[i] = 7;
+            }
+        }
+
+        std::vector<float> sb((size_t) tc.E);
+        std::uniform_real_distribution<float> us(0.5f, 2.0f);
+        for (float & v : sb) { v = us(rng); }
+
+        ggml_backend_tensor_set(src0, wb.data(), 0, wb.size());
+        ggml_backend_tensor_set(src1, xb.data(), 0, xb.size() * sizeof(float));
+        ggml_backend_tensor_set(ids,  idb.data(), 0, idb.size() * sizeof(int32_t));
+        if (s_exp) {
+            ggml_backend_tensor_set(s_exp, sb.data(), 0, sb.size() * sizeof(float));
+        }
+
+        const size_t n_y = (size_t) tc.M * (size_t) tc.n_used * (size_t) tc.n_tok;
+        std::vector<float> nan_fill(n_y, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> y_base(n_y), y_nk(n_y);
+
+        // 1. Run base (use_nk = 0)
+        ggml_backend_tensor_set(dst, nan_fill.data(), 0, n_y * sizeof(float));
+        const int64_t cnt_b0 = count_fn(be, "nk_pf_mm");
+        const bool ok_base = run_fn(be, src0, src1, ids, dst, s_exp, 0);
+        ggml_backend_synchronize(be);
+        const int64_t cnt_b1 = count_fn(be, "nk_pf_mm");
+        ggml_backend_tensor_get(dst, y_base.data(), 0, n_y * sizeof(float));
+
+        // 2. Run NK_PF_MM (use_nk = 1)
+        ggml_backend_tensor_set(dst, nan_fill.data(), 0, n_y * sizeof(float));
+        const int64_t cnt_n0 = count_fn(be, "nk_pf_mm");
+        const bool ok_nk = run_fn(be, src0, src1, ids, dst, s_exp, 1);
+        ggml_backend_synchronize(be);
+        const int64_t cnt_n1 = count_fn(be, "nk_pf_mm");
+        ggml_backend_tensor_get(dst, y_nk.data(), 0, n_y * sizeof(float));
+
+        // 3. On first case, verify env-mode dispatch (-1) matches GGML_CUDA_NK_PF_MM
+        bool ok_env = true;
+        if (ci == 0) {
+            const bool expect_nk = !(nk_env && *nk_env && atoi(nk_env) == 0);
+            const int64_t ce0 = count_fn(be, "nk_pf_mm");
+            const bool ran_env = run_fn(be, src0, src1, ids, dst, s_exp, -1);
+            ggml_backend_synchronize(be);
+            const int64_t ce1 = count_fn(be, "nk_pf_mm");
+            ok_env = ran_env && ((ce1 - ce0) == (expect_nk ? 1 : 0));
+        }
+
+        bool finite_ok = true;
+        for (size_t i = 0; i < n_y; ++i) {
+            if (!std::isfinite(y_base[i]) || !std::isfinite(y_nk[i])) {
+                finite_ok = false;
+                break;
+            }
+        }
+        const bool exact = memcmp(y_base.data(), y_nk.data(), n_y * sizeof(float)) == 0;
+        const bool cnt_ok = (cnt_b1 == cnt_b0) && (cnt_n1 == cnt_n0 + 1);
+        const bool pass = ok_base && ok_nk && ok_env && finite_ok && exact && cnt_ok;
+
+        if (!pass) {
+            ++fails;
+            printf("nk_pf_mm %-18s FAIL (base=%d nk=%d env=%d finite=%d exact=%d cnt_b=%lld cnt_n=%lld)\n",
+                tc.name, ok_base, ok_nk, ok_env, finite_ok, exact,
+                (long long) (cnt_b1 - cnt_b0), (long long) (cnt_n1 - cnt_n0));
+            if (!exact) {
+                for (size_t i = 0; i < n_y; ++i) {
+                    uint32_t ub = 0, un = 0;
+                    memcpy(&ub, &y_base[i], 4);
+                    memcpy(&un, &y_nk[i], 4);
+                    if (ub != un) {
+                        const int64_t r = (int64_t) (i % (size_t) tc.M);
+                        const int64_t col = (int64_t) (i / (size_t) tc.M);
+                        const int64_t u = col % tc.n_used;
+                        const int64_t t = col / tc.n_used;
+                        printf("  first mismatch t=%lld u=%lld r=%lld id=%d: nk=%.9g (0x%08x) ref=%.9g (0x%08x) diff=%.3g\n",
+                            (long long) t, (long long) u, (long long) r, idb[(size_t) col],
+                            y_nk[i], un, y_base[i], ub, (double) y_nk[i] - (double) y_base[i]);
+                        break;
+                    }
+                }
+            }
+        } else {
+            ++passed;
+            if (do_perf && tc.bench) {
+                auto bench_whole = [&](int use_nk, int warmup, int iters) -> double {
+                    for (int i = 0; i < warmup; ++i) {
+                        run_fn(be, src0, src1, ids, dst, s_exp, use_nk);
+                    }
+                    ggml_backend_synchronize(be);
+                    const int64_t t0 = ggml_time_us();
+                    for (int i = 0; i < iters; ++i) {
+                        run_fn(be, src0, src1, ids, dst, s_exp, use_nk);
+                    }
+                    ggml_backend_synchronize(be);
+                    const int64_t t1 = ggml_time_us();
+                    return (double) (t1 - t0) / (double) iters;
+                };
+                // Settle clocks under load before ABBA legs to reduce 300 W boost-to-steady drift
+                for (int i = 0; i < 6; ++i) {
+                    run_fn(be, src0, src1, ids, dst, s_exp, i & 1);
+                }
+                ggml_backend_synchronize(be);
+
+                const int iters = tc.n_tok >= 2048 ? 8 : 12;
+                const double a0 = bench_whole(0, 3, iters);
+                const double b0 = bench_whole(1, 3, iters);
+                const double b1 = bench_whole(1, 2, iters);
+                const double a1 = bench_whole(0, 2, iters);
+                const double base_us = 0.5 * (a0 + a1);
+                const double nk_us   = 0.5 * (b0 + b1);
+                const double pct     = 100.0 * (nk_us - base_us) / base_us;
+                const double ops     = 2.0 * (double) tc.n_tok * (double) tc.n_used * (double) tc.M * (double) tc.K;
+                const double base_tops = ops / (base_us * 1e6);
+                const double nk_tops   = ops / (nk_us * 1e6);
+                printf("nk_pf_mm %-18s PASS exact | whole: base %7.1f us (%5.1f TOPS) -> nk %7.1f us (%5.1f TOPS) | %+6.1f%% (ABBA: %.1f/%.1f vs %.1f/%.1f)\n",
+                    tc.name, base_us, base_tops, nk_us, nk_tops, pct, a0, a1, b0, b1);
+
+                const double ka0 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 0, 3, iters);
+                const double kb0 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 1, 3, iters);
+                const double kb1 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 1, 2, iters);
+                const double ka1 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 0, 2, iters);
+                if (ka0 < 0.0 || kb0 < 0.0 || kb1 < 0.0 || ka1 < 0.0) {
+                    --passed;
+                    ++fails;
+                    printf("nk_pf_mm %-18s FAIL (bench_kern returned < 0: %.1f/%.1f/%.1f/%.1f)\n",
+                        tc.name, ka0, kb0, kb1, ka1);
+                } else {
+                    const double kbase_us = 0.5 * (ka0 + ka1);
+                    const double knk_us   = 0.5 * (kb0 + kb1);
+                    const double kpct     = 100.0 * (knk_us - kbase_us) / kbase_us;
+                    const double kbase_tops = ops / (kbase_us * 1e6);
+                    const double knk_tops   = ops / (knk_us * 1e6);
+                    printf("nk_pf_mm %-18s            | kern:  base %7.1f us (%5.1f TOPS) -> nk %7.1f us (%5.1f TOPS) | %+6.1f%% (ABBA: %.1f/%.1f vs %.1f/%.1f)\n",
+                        tc.name, kbase_us, kbase_tops, knk_us, knk_tops, kpct, ka0, ka1, kb0, kb1);
+                }
+            } else {
+                printf("nk_pf_mm %-18s PASS exact\n", tc.name);
+            }
+        }
+
+        ggml_backend_buffer_free(bb);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(be);
+    printf("nk_pf_mm summary: %d/%zu PASS (%d fails)\n", passed, cases.size(), fails);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     // the expert-bank MUL_MAT_ID cases pass skipped (-1 / out-of-stack) ids without loading a bank model; the CUDA
     // backend zeroes their outputs only when told to (or when a hot-bank model is loaded)
@@ -26755,6 +28264,15 @@ int main(int argc, char ** argv) {
 #else
     setenv("GGML_CUDA_AI_ID_SKIP_ZERO", "1", 0);
 #endif
+    if (getenv("GGML_TEST_NK_PREFIX_MASK") != nullptr) {
+        return run_nk_prefix_mask_check();
+    }
+    if (getenv("GGML_TEST_NK_DSPARK_HEAD") != nullptr) {
+        return run_nk_dspark_head_check();
+    }
+    if (getenv("GGML_TEST_NK_DENSE_TC") != nullptr) {
+        return run_nk_dense_tc_check();
+    }
     if (const char * ad = getenv("GGML_TEST_AIT_DIR")) {
         return run_ait_check(ad);
     }
@@ -26766,6 +28284,11 @@ int main(int argc, char ** argv) {
     }
     if (const char * od = getenv("GGML_TEST_AIT_MIDT_OUT")) {
         return run_ait_midt_check(od);
+    }
+    if (const char * nk = getenv("GGML_TEST_NK_PF_MM")) {
+        if (atoi(nk) != 0) {
+            return run_nk_pf_mm_check();
+        }
     }
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;

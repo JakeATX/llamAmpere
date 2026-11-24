@@ -8,6 +8,8 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #include "q8a16.cuh"
+#include "nk-dense-tc.cuh"
+#include "q8a16moe.cuh"
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include "mmvq-iq4xs-k4.cuh"
 #include "mmvq-iq4xs-wide.cuh"
@@ -3832,9 +3834,17 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
+    // NEONKERN NK_DENSE_TC: opt-in Ampere int8 TC dense Q8_0 decode/verify matmul (GGML_CUDA_NK_DENSE_TC=1, default OFF)
+    if (src0->type == GGML_TYPE_Q8_0 && !ids && !fusion && !convrot &&
+            ggml_cuda_nk_dense_tc_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
     // INKNVFP4K Q8A16: plain Q8_0 decode products on f32 activations, no q8_1 quantize (GGML_CUDA_Q8A16=0 = off)
     if (src0->type == GGML_TYPE_Q8_0 && !fusion && !convrot &&
-            (ids ? ggml_cuda_q8a16_mul_mat_id(ctx, src0, src1, ids, dst) : ggml_cuda_q8a16_mul_mat(ctx, src0, src1, dst))) {
+            (ids ? (ids->ne[1] == 1 ? ggml_cuda_q8a16_mul_mat_id(ctx, src0, src1, ids, dst)
+                                    : ggml_cuda_q8a16_moe_mul_mat_id(ctx, src0, src1, ids, dst)) // INKNVFP4K T = 2..8, deduped
+                 : ggml_cuda_q8a16_mul_mat(ctx, src0, src1, dst))) {
         return;
     }
 
@@ -3990,6 +4000,10 @@ static bool mmvq_group_launch(ggml_backend_cuda_context & ctx, ggml_tensor * con
     if (n < 1 || n > MMVQ_GROUP_MAX) {
         return false;
     }
+    // NEONKERN NK_DENSE_TC: opt-in int8 TC group (reads each member's f32 src1; vy unused)
+    if (ggml_cuda_nk_dense_tc_group(ctx, dsts, n, vy == nullptr)) {
+        return true;
+    }
     // INKNVFP4K Q8A16: f32-activation group (reads each member's f32 src1; vy unused)
     if (ggml_cuda_q8a16_group(ctx, dsts, n, vy == nullptr)) {
         return true;
@@ -4079,6 +4093,9 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
         }
     }
 
+    if (ggml_cuda_nk_dense_tc_group(ctx, dsts, n, false)) {
+        return true; // NEONKERN NK_DENSE_TC: no q8_1 copy needed
+    }
     if (ggml_cuda_q8a16_group(ctx, dsts, n, false)) {
         return true; // INKNVFP4K Q8A16: no q8_1 copy needed
     }
@@ -4118,6 +4135,10 @@ bool ggml_cuda_mul_mat_vec_q_group(ggml_backend_cuda_context & ctx, ggml_tensor 
 static bool mmvq_group_nc_launch(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, const void * const * vy) {
     if (n < 1 || n > MMVQ_GROUP_MAX) {
         return false;
+    }
+    // NEONKERN NK_DENSE_TC: opt-in int8 TC group at verify widths (reads each member's f32 src1; vy unused)
+    if (ggml_cuda_nk_dense_tc_group(ctx, dsts, n, vy == nullptr)) {
+        return true;
     }
     // INKNVFP4K Q8A16: f32-activation group at the verify width (reads each member's f32 src1; vy unused)
     if (ggml_cuda_q8a16_group(ctx, dsts, n, vy == nullptr)) {
@@ -4213,6 +4234,9 @@ bool ggml_cuda_mul_mat_vec_q_group_nc(ggml_backend_cuda_context & ctx, ggml_tens
     }
     if (!ggml_is_contiguous(src1) || !mmvq_group_nc_launch(ctx, dsts, n, nullptr)) {
         return false;
+    }
+    if (ggml_cuda_nk_dense_tc_group(ctx, dsts, n, false)) {
+        return true; // NEONKERN NK_DENSE_TC: no q8_1 copy needed
     }
     if (ggml_cuda_q8a16_group(ctx, dsts, n, false)) {
         return true; // INKNVFP4K Q8A16: no q8_1 copy needed

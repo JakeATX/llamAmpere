@@ -60,6 +60,22 @@ void ggml_cuda_dspark_gru_update(
 //   sk:         top-K size (1..64 for sampled, 1 for greedy)
 //   softcap:    final logit softcap (> 0, e.g. 30.0f)
 //   inv_temp:   1.0f / dspark_sample_t (unused when greedy)
+bool ggml_cuda_dspark_head_launch_base(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * fold_w,
+        const ggml_tensor * latent,
+        const ggml_tensor * fold_bias,
+        const ggml_tensor * base,
+        const ggml_tensor * ids,
+        const ggml_tensor * noise,
+        ggml_tensor       * cand_out,
+        ggml_tensor       * vals_out,
+        ggml_tensor       * prev_out,
+        int64_t             n_eval,
+        int                 sk,
+        float               softcap,
+        float               inv_temp);
+
 bool ggml_cuda_dspark_head_launch(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * fold_w,

@@ -14,3 +14,11 @@ int ggml_cuda_nvfp4pf_mode();
 // (T >= 512, sm_80 / sm_86, K % 128 == 0, M % 16 == 0, contiguous src1 / dst); false = nothing done
 bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp);
+
+// nk_override: -1 = env GGML_CUDA_NK_PF_MM (default OFF), 0 = force base, 1 = force NK_PF_MM
+bool ggml_cuda_nvfp4pf_try_mode(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp, int nk_override);
+
+// Benchmark GEMM kernel launch only (route + xq run once, cudaEvent around iters GEMM launches); returns us/run or -1.
+double ggml_cuda_nvfp4pf_bench_kern(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp, int use_nk, int warmup, int iters);

@@ -1,5 +1,6 @@
 #include "depth-mix.cuh"
 #include "rq4.cuh"
+#include "prefill-glue-dev.cuh"
 
 #define DEPTH_MIX_THREADS 1024
 #define DEPTH_MIX_MAX_ROWS 64
@@ -20,7 +21,8 @@ static __device__ __forceinline__ void depth_mix_load(float (&a)[W], const float
 // W = 4: float4 loads (rows 16-byte aligned, n % 4 == 0).
 // [INKGLUE] NORM (NQ == 1): then the rms norm of the mixed row times nw into ndst, with rms_norm_f32<1024>'s scalar sum
 // (col = tid, += 1024), block_reduce and expressions (bit-identical to the RMS_NORM + MUL nodes it replaces)
-template <int NQ, int W, bool NORM = false, bool SMEM_OUT = false>
+// [PREFILL-GLUE] KF = 32 / 64: aq / as take the NVFP4PF activation (k_nvfp4pf_xq layout) instead of the AI+ H256 one
+template <int NQ, int W, bool NORM = false, bool SMEM_OUT = false, int KF = 0>
 static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         const char * __restrict__ stack, const int64_t s_nb1, const int64_t s_nb2, const int k,
         const char * __restrict__ cur, const int64_t c_nb1, const char * __restrict__ query, const int64_t q_nb1,
@@ -195,7 +197,11 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         // block; the warps of this block cover n <= 32*256), from the row this block just wrote
         if (aq != nullptr) {
             __syncthreads();
-            rq4::quantize_act_body<false, false, false>(ndst, n, aq, as, n, (int) gridDim.x, 0, (int) t);
+            if constexpr (KF == 0) {
+                rq4::quantize_act_body<false, false, false>(ndst, n, aq, as, n, (int) gridDim.x, 0, (int) t);
+            } else {
+                pf_quantize_row_nvfp4pf_from_ptr<KF>(nd, aq, as, n, (int) t, DEPTH_MIX_THREADS/32);
+            }
         }
     }
 }
@@ -249,14 +255,14 @@ void ggml_cuda_depth_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // [INKGLUE] depth mix (one query) + RMS_NORM(eps) + MUL(w) of the mixed rows into ndst; false: not this shape
 bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * w, ggml_tensor * ndst, float neps,
-        int8_t * aq, float * as) {
+        int8_t * aq, float * as, int nvfp4_kf) {
     if (!ggml_cuda_depth_mix_supported(dst) || dst->src[1]->ne[1] != 1) {
         return false;
     }
-    if ((aq == nullptr) != (as == nullptr)) {
+    if ((aq == nullptr) != (as == nullptr) || (nvfp4_kf != 0 && (aq == nullptr || (nvfp4_kf != 32 && nvfp4_kf != 64)))) {
         return false;
     }
-    if (aq && (dst->src[0]->ne[0] % 256 != 0 || dst->src[0]->ne[0] > 32*256 || !ggml_is_contiguous(ndst) ||
+    if (aq && (dst->src[0]->ne[0] % (nvfp4_kf ? nvfp4_kf : 256) != 0 || dst->src[0]->ne[0] > 32*256 || !ggml_is_contiguous(ndst) ||
             ((uintptr_t) ndst->data & 15) != 0)) {
         return false;
     }
@@ -286,6 +292,24 @@ bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool use_smem = use_smem_env && n <= 4096;
     const size_t smem_bytes = use_smem ? (size_t) n * sizeof(float) : 0;
     const dim3 grid((unsigned) T, 1);
+    if (nvfp4_kf != 0) {
+        // [PREFILL-GLUE] default on (GGML_CUDA_PREFILL_FUSE_NORM_ACTQ=0 disables): same mix + norm, ndst always written, then the
+        // NVFP4PF activation quantized from the row this block just wrote
+#define DEPTH_MIX_NORM_KF(W_, SMEM_, KF_) \
+        k_depth_mix<1, W_, true, SMEM_, KF_><<<grid, DEPTH_MIX_THREADS, SMEM_ ? smem_bytes : 0, stream>>>(sd, s1, s2, k, \
+            (const char *) cur->data, cur->nb[1], (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, \
+            (const float *) w->data, (float *) ndst->data, neps, aq, as)
+        if (vec && use_smem) {
+            if (nvfp4_kf == 32) { DEPTH_MIX_NORM_KF(4, true, 32); } else { DEPTH_MIX_NORM_KF(4, true, 64); }
+        } else if (vec) {
+            if (nvfp4_kf == 32) { DEPTH_MIX_NORM_KF(4, false, 32); } else { DEPTH_MIX_NORM_KF(4, false, 64); }
+        } else {
+            if (nvfp4_kf == 32) { DEPTH_MIX_NORM_KF(1, false, 32); } else { DEPTH_MIX_NORM_KF(1, false, 64); }
+        }
+#undef DEPTH_MIX_NORM_KF
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     if (vec) {
         if (use_smem) {
             k_depth_mix<1, 4, true, true><<<grid, DEPTH_MIX_THREADS, smem_bytes, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
