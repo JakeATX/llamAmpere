@@ -1431,8 +1431,8 @@ extern "C" {
     // Row capacity of the layer input device buffer (0 when disabled or not allocated).
     LLAMA_API int32_t llama_layer_inp_dev_rows(const struct llama_context * ctx);
 
-    // Resolved LLAMA_DSPINE_PIPE mode: 0 = off, 1 = full pipeline (compact layer_inp_dev + DFlash2 2-slot
-    // reuse + async CUDA event wait + early process() overlap), 2 = compact layer_inp_dev + 2-slot reuse only.
+    // Resolved LLAMA_DSPINE_PIPE mode: 0 = off, 1 = full pipeline (DFlash2 2-slot reuse + async CUDA
+    // event wait + early process() overlap + 64-row layer_inp_dev fallback when tight), 2 = 2-slot reuse + fallback only.
     LLAMA_API int32_t llama_dspine_pipe_mode(void);
 
     // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer

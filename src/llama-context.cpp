@@ -4382,56 +4382,72 @@ void llama_context::layer_inp_dev_alloc() {
         return;
     }
 
-    ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead(),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    ctx_layer_inp_dev.reset(ggml_init(params));
-
-    // LLAMA_DSPINE_PIPE>0 caps layer_inp_dev to decode/verify widths (64 rows ~ 6.25 MiB vs 400 MiB at -b 4096)
-    // so device-side feature injection fits on 24 GB cards at deep context; prompt prefills keep host copies.
-    const int64_t dev_rows = llama_dspine_pipe_mode() > 0 ? std::min<int64_t>(cparams.n_batch, 64) : (int64_t) cparams.n_batch;
-    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, dev_rows);
-    ggml_set_name(layer_inp_dev, "layer_inp_dev");
-
     layer_inp_dev_dev = model.dev_output();
     auto * buft = layer_inp_dev_dev ? ggml_backend_dev_buffer_type(layer_inp_dev_dev) : ggml_backend_cpu_buffer_type();
 
-    // [T5-IDLE] H1 small-card VRAM headroom guard: when not explicitly forced via LLAMA_DSPARK_DEV_INJECT=1,
-    // require at least LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB (default 512 MiB) free VRAM after allocation so
-    // tight 8/10/12 GB cards (including --fit off) keep CUDA Graph/pool headroom and fall back cleanly to host copies.
-    if (layer_inp_dev_dev && !ggml_backend_buft_is_host(buft)) {
-        const char * force_e = std::getenv("LLAMA_DSPARK_DEV_INJECT");
-        const bool   forced  = force_e != nullptr && std::atoi(force_e) > 0;
-        if (!forced) {
-            const char * min_e = std::getenv("LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB");
-            const size_t need_bytes = ggml_nbytes(layer_inp_dev);
-            const int    default_mib = (llama_dspine_pipe_mode() > 0 && need_bytes <= (16u << 20)) ? 64 : 512;
-            const size_t min_free_bytes = (size_t) (min_e ? std::max(0, std::atoi(min_e)) : default_mib) << 20;
+    const char * force_e = std::getenv("LLAMA_DSPARK_DEV_INJECT");
+    const bool   forced  = force_e != nullptr && std::atoi(force_e) > 0;
+    const char * min_e   = std::getenv("LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB");
+
+    // Try full n_batch rows first so prompt prefills stay on device; under LLAMA_DSPINE_PIPE>0,
+    // fall back to a 64-row decode-only buffer only if the full buffer does not fit VRAM headroom.
+    const int64_t full_rows    = (int64_t) cparams.n_batch;
+    const int64_t compact_rows = (llama_dspine_pipe_mode() > 0 && full_rows > 64) ? 64 : 0;
+
+    auto try_alloc_rows = [&](int64_t rows, int default_headroom_mib, bool log_skip) -> bool {
+        ctx_layer_inp_dev.reset();
+        buf_layer_inp_dev.reset();
+        layer_inp_dev = nullptr;
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_layer_inp_dev.reset(ggml_init(params));
+        layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, rows);
+        ggml_set_name(layer_inp_dev, "layer_inp_dev");
+
+        // [T5-IDLE] H1 small-card VRAM headroom guard: when not explicitly forced via LLAMA_DSPARK_DEV_INJECT=1,
+        // require at least LLAMA_DSPARK_DEV_INJECT_MIN_FREE_MIB (default 512 MiB) free VRAM after allocation so
+        // tight 8/10/12 GB cards (including --fit off) keep CUDA Graph/pool headroom and fall back cleanly to host copies.
+        if (layer_inp_dev_dev && !ggml_backend_buft_is_host(buft) && !forced) {
+            const size_t need_bytes     = ggml_nbytes(layer_inp_dev);
+            const size_t min_free_bytes = (size_t) (min_e ? std::max(0, std::atoi(min_e)) : default_headroom_mib) << 20;
             size_t free_mem = 0, total_mem = 0;
             ggml_backend_dev_memory(layer_inp_dev_dev, &free_mem, &total_mem);
             if (total_mem > 0 && free_mem < need_bytes + min_free_bytes) {
-                LLAMA_LOG_INFO("%s: skipping %.2f MiB layer_inp_dev (free %.2f MiB < need + %.2f MiB headroom; set LLAMA_DSPARK_DEV_INJECT=1 to force)\n",
-                        __func__, need_bytes / 1048576.0, free_mem / 1048576.0, min_free_bytes / 1048576.0);
-                cparams.embeddings_layer_inp_dev = false;
-                layer_inp_dev     = nullptr;
-                layer_inp_dev_dev = nullptr;
+                if (log_skip) {
+                    LLAMA_LOG_INFO("%s: skipping %.2f MiB layer_inp_dev (free %.2f MiB < need + %.2f MiB headroom; set LLAMA_DSPARK_DEV_INJECT=1 to force)\n",
+                            __func__, need_bytes / 1048576.0, free_mem / 1048576.0, min_free_bytes / 1048576.0);
+                }
+                layer_inp_dev = nullptr;
                 ctx_layer_inp_dev.reset();
-                return;
+                return false;
             }
         }
-    }
 
-    buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(), buft));
-    if (!buf_layer_inp_dev) {
-        // e.g. a large n_batch that does not fit next to the model, keep the host copies
-        LLAMA_LOG_WARN("%s: failed to allocate the layer input device buffer, using host copies\n", __func__);
-        cparams.embeddings_layer_inp_dev = false;
-        layer_inp_dev     = nullptr;
-        layer_inp_dev_dev = nullptr;
-        ctx_layer_inp_dev.reset();
-        return;
+        buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(), buft));
+        if (!buf_layer_inp_dev) {
+            if (log_skip) {
+                LLAMA_LOG_WARN("%s: failed to allocate the layer input device buffer, using host copies\n", __func__);
+            }
+            layer_inp_dev = nullptr;
+            ctx_layer_inp_dev.reset();
+            return false;
+        }
+        return true;
+    };
+
+    if (!try_alloc_rows(full_rows, 512, compact_rows == 0)) {
+        if (compact_rows == 0 || !try_alloc_rows(compact_rows, 64, true)) {
+            cparams.embeddings_layer_inp_dev = false;
+            layer_inp_dev     = nullptr;
+            layer_inp_dev_dev = nullptr;
+            ctx_layer_inp_dev.reset();
+            return;
+        }
+        LLAMA_LOG_INFO("%s: fell back to compact %" PRId64 "-row layer_inp_dev for decode\n", __func__, compact_rows);
     }
 
     LLAMA_LOG_INFO("%s: %10s layer input buffer size = %8.2f MiB (%d layers)\n", __func__,
@@ -7698,9 +7714,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (inject_src) {
         inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
         if (inject_backend) {
-            // Only use device-side stream wait in PIPE=1 on a single CUDA GPU matching layer_inp_dev (safe for 2-card -sm splits).
+            // Only use device-side stream wait in PIPE=1 on decode-sized injects (<= 64 rows) and a single CUDA GPU
+            // matching layer_inp_dev; prompt prefill chunks keep the exact PIPE=0 path without inter-chunk syncs.
             bool single_matching_cuda_gpu = false;
-            if (llama_dspine_pipe_mode() == 1 && !compute_is_shared() &&
+            if (llama_dspine_pipe_mode() == 1 && n_tokens_all <= 64 && !compute_is_shared() &&
                     std::strncmp(ggml_backend_name(inject_backend), "CUDA", 4) == 0) {
                 int n_gpu = 0;
                 ggml_backend_dev_t only_gpu = nullptr;

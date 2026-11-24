@@ -1660,7 +1660,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool can_pipe_process(int32_t n_tokens) const override {
         return is_dflash2 && !is_lilicorr && !has_rnn_context && use_dev_inject &&
-               n_tokens > 0 &&
+               n_tokens > 0 && n_tokens <= 64 &&
                n_tokens <= llama_layer_inp_dev_rows(this->params.ctx_tgt) &&
                n_tokens <= (int32_t) llama_n_ubatch(this->params.ctx_dft);
     }
