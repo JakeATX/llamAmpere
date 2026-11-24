@@ -1970,6 +1970,12 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // LAMQ-CALIB: a raw id stream stands in for the prompt text
+    const char * lamq_ids = getenv("LLAMA_IMATRIX_INPUT_IDS");
+    if (params.prompt.empty() && lamq_ids && *lamq_ids) {
+        params.prompt = " ";
+    }
+
     if (params.prompt.empty()) {
         LOG_INF("No prompt provided; combining precomputed matrices only.\n");
 
