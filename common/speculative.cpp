@@ -4632,7 +4632,21 @@ struct common_speculative {
 
     // copy-first (--spec-copy-first): the drafter a span stands in for (its accept() is a no-op), nullptr = off
     common_speculative_impl * first_impl = nullptr;
+
+    // seqs whose target rows process() must not mirror into the draft (server: a prompt with media on a drafter
+    // that cannot hold it); their rows stay in the batch, so row indices into the target outputs do not shift
+    std::vector<char> muted;
 };
+
+void common_speculative_set_seq_muted(common_speculative * spec, llama_seq_id seq_id, bool muted) {
+    if (spec == nullptr || seq_id < 0) {
+        return;
+    }
+    if ((size_t) seq_id >= spec->muted.size()) {
+        spec->muted.resize(seq_id + 1, 0);
+    }
+    spec->muted[seq_id] = muted;
+}
 
 // drafters a copy-first span may replace for a round: their state follows the target batches (process()) and their
 // accept() keeps nothing per draft, so a round they did not draft leaves them consistent
@@ -5661,6 +5675,12 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 
     static thread_local spec_batch_view view;
     const llama_batch b = view.render(batch);
+    for (int32_t i = 0; i < b.n_tokens && !spec->muted.empty(); ++i) {
+        const llama_seq_id s = b.seq_id[i][0];
+        if (s >= 0 && (size_t) s < spec->muted.size() && spec->muted[s]) {
+            b.seq_id[i][0] = -1; // process() skips rows of seq < 0
+        }
+    }
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(b);

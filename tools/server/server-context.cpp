@@ -972,7 +972,7 @@ struct server_slot {
     // hand_over_ckpts [#187]: the cache entry takes this slot's checkpoints by move (no multi-GiB copy on the
     // request's critical path); the caller then runs prompt_reclaim_checkpoints once prompt_load has decided
     server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool hand_over_ckpts = false) {
-        if (prompt.tokens.size() == 0 || state_save_unsupported) {
+        if (prompt.tokens.size() == 0 || state_save_unsupported || spec_media) { // [VISSPEC] no valid draft state
             return nullptr;
         }
 
@@ -1343,8 +1343,11 @@ struct server_slot {
         return state != SLOT_STATE_IDLE;
     }
 
+    // [VISSPEC] this request's prompt has media and the drafter cannot hold it (M-RoPE target): no speculation
+    bool spec_media = false;
+
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && !spec_media;
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
@@ -1828,7 +1831,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                 struct cb_data_t {
                     common_speculative * spec;
                     llama_context * ctx;
-                } cb_data = { slot.spec, slot.ctx_tgt };
+                } cb_data = { slot.spec_media ? nullptr : slot.spec, slot.ctx_tgt };
 
                 static auto cb = [](const mtmd_helper_embd_batch * b, void * user_data) {
                     const auto * data = static_cast<cb_data_t *>(user_data);
@@ -6682,6 +6685,29 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        // [VISSPEC] an M-RoPE target's image leaves a gap the draft cache cannot hold (find_slot fails on
+                        // the text after it): run a prompt with media without the drafter and drop the slot's draft
+                        // sequence. Leaving that mode, the next prompt is processed from scratch so both caches match.
+                        if (slot.spec && ctx_dft) {
+                            const auto rt = llama_model_rope_type(llama_get_model(ctx_tgt));
+                            bool media = false;
+                            if (input_tokens.has_mtmd && (rt == LLAMA_ROPE_TYPE_MROPE || rt == LLAMA_ROPE_TYPE_IMROPE)) {
+                                for (size_t i = 0; i < input_tokens.size() && !media; ++i) {
+                                    media = input_tokens[i] == LLAMA_TOKEN_NULL;
+                                }
+                            }
+                            if (media || slot.spec_media) {
+                                if (!media) {
+                                    slot.prompt_clear();
+                                }
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                SLT_INF(slot, "prompt %s media: drafter %s for this request\n", media ? "has" : "has no",
+                                        media ? "off" : "back on, caches rebuilt");
+                            }
+                            slot.spec_media = media;
+                            common_speculative_set_seq_muted(slot.spec, slot.id, media);
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -7762,7 +7788,8 @@ private:
         } handoff;
         // PP-1: defer only the final device handoff until the refill starts.
         const bool pp_overlap = spec && ctx_dft && llama_prompt_overlap_enabled();
-        const bool handoff_on = spec && ctx_dft && common_speculative_handoff_enabled(spec.get()) && batch.view.size() > 3072 &&
+        const bool media_slot = std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.spec_media; });
+        const bool handoff_on = spec && ctx_dft && !media_slot && common_speculative_handoff_enabled(spec.get()) && batch.view.size() > 3072 &&
                 std::all_of(batch.view.tokens.begin(), batch.view.tokens.end(), [&](const auto & token) {
                     return token.seq_ids_extra.empty() && token.seq_id == batch.view.tokens.front().seq_id;
                 }) && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
@@ -7927,7 +7954,7 @@ private:
 
         // in-call checkpoints: catch the hybrid draft up to each captured target boundary before saving it.
         int32_t spec_processed = 0;
-        const bool spec_ranges = ckpt_armed && common_speculative_supports_process_range(spec.get());
+        const bool spec_ranges = ckpt_armed && !media_slot && common_speculative_supports_process_range(spec.get());
         if (ckpt_armed) {
             server_slot * cslot = nullptr;
             for (auto & s : slots) {
