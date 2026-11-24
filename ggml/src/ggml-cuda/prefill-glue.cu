@@ -1,5 +1,5 @@
 // [PREFILL-GLUE] Prefill glue fusion: GLU / SITU -> AI+ / NVFP4PF / MMQ q8_1 activation, RMS_NORM(+ADD)*w -> the same.
-// Opt-in (GGML_CUDA_PREFILL_FUSE_GLU_ACTQ / GGML_CUDA_PREFILL_FUSE_NORM_ACTQ, default 0). A fused producer always writes
+// Default on; GGML_CUDA_PREFILL_FUSE_GLU_ACTQ=0 / GGML_CUDA_PREFILL_FUSE_NORM_ACTQ=0 turn each fusion off. A fused producer always writes
 // its normal f32 output as well; the quantized copy is only a cache a consumer matmul may take when its src1, shape and
 // layout match exactly, so any consumer that does not take it reads the f32 tensor as before.
 
@@ -24,7 +24,7 @@ namespace {
 
 static bool pf_env_on(const char * name) {
     const char * e = std::getenv(name);
-    return e && std::atoi(e) != 0;
+    return !e || std::atoi(e) != 0;  // unset = on; set to 0 = off (kill switch)
 }
 
 static __device__ __forceinline__ float pf_eval_glu_dev(
