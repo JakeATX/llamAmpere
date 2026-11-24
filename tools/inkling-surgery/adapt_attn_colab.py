@@ -447,7 +447,7 @@ class InklingAttentionBlock(nn.Module):
             denom = exp_s.sum(dim=-1, keepdim=True) + torch.exp(-m)
             probs = exp_s / denom  # [H, Bq, Bk]
 
-            if stats_out is not None and not torch.is_grad_enabled() and mode in (MODE_SWA_MID, MODE_LSA):
+            if stats_out is not None and mode in (MODE_SWA_MID, MODE_LSA):
                 with torch.no_grad():
                     eligible_q = q_pos >= 1024
                     n_eq = int(eligible_q.sum().item())
@@ -464,7 +464,7 @@ class InklingAttentionBlock(nn.Module):
             out_q = torch.bmm(probs.to(vt.dtype), vt)  # [H, Bq, D]
             out_chunks.append(out_q.permute(1, 0, 2).reshape(q1 - q0, self.n_head * self.head_dim))
 
-        if stats_out is not None and not torch.is_grad_enabled() and far_q_count > 0 and mode in (MODE_SWA_MID, MODE_LSA):
+        if stats_out is not None and far_q_count > 0 and mode in (MODE_SWA_MID, MODE_LSA):
             key_prefix = "swa_mid" if mode == MODE_SWA_MID else "lsa"
             stats_out[f"{key_prefix}_far_sum"] = stats_out.get(f"{key_prefix}_far_sum", 0.0) + far_mass_sum
             stats_out[f"{key_prefix}_mid_sum"] = stats_out.get(f"{key_prefix}_mid_sum", 0.0) + mid_mass_sum
@@ -658,9 +658,13 @@ class Inkling2MiniSurgeryModel(nn.Module):
         # Freeze everything by default
         for param in self.parameters():
             param.requires_grad_(False)
+        vram_str = (
+            f"{torch.cuda.memory_allocated(device) / (1024**3):.2f} GiB"
+            if device.type == "cuda"
+            else "cpu"
+        )
         print(
-            f"[load] Inkling 2 Mini loaded in {time.time() - t0:.1f}s | VRAM allocated: "
-            f"{torch.cuda.memory_allocated(device) / (1024**3):.2f} GiB",
+            f"[load] Inkling 2 Mini loaded in {time.time() - t0:.1f}s | VRAM allocated: {vram_str}",
             flush=True,
         )
 
@@ -686,8 +690,9 @@ class Inkling2MiniSurgeryModel(nn.Module):
 
         def run_visit(ip: int, c_in: torch.Tensor, blks: List[torch.Tensor], msgs: Optional[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
             nonlocal visit_idx
-            if visit_idx in tap_visits:
-                taps[visit_idx] = c_in
+            vid = visit_idx
+            if vid in tap_visits:
+                taps[vid] = c_in
             visit_idx += 1
             layer = self.layers[ip]
             mode = layer_modes[ip]
@@ -699,7 +704,13 @@ class Inkling2MiniSurgeryModel(nn.Module):
                 def _fn(c_arg, *rest):
                     b_list = list(rest[:n_b])
                     m_arg = rest[n_b] if has_m else None
-                    c_out, pushed = layer.forward_visit(c_arg, b_list, mode, tau, self.e2m1_lut, m_arg, q_blk, stats_out)
+                    s_arg = None
+                    if stats_out is not None:
+                        seen = stats_out.setdefault("_seen", set())
+                        if vid not in seen:
+                            seen.add(vid)
+                            s_arg = stats_out
+                    c_out, pushed = layer.forward_visit(c_arg, b_list, mode, tau, self.e2m1_lut, m_arg, q_blk, s_arg)
                     return (c_out, pushed) if pushed is not None else (c_out,)
 
                 args = [c_in] + list(blks) + ([msgs] if has_m else [])
@@ -810,7 +821,7 @@ def run_verify_logits(model: Inkling2MiniSurgeryModel, token_ids: List[int], out
 
 def train_surgery(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
-    device = torch.device("cuda")
+    device = torch.device(args.device)
     model_dir = resolve_model_dir(args.model_dir, args.hf_repo)
     model = Inkling2MiniSurgeryModel(model_dir, device=device, chunk_experts=args.chunk_experts)
 
@@ -1087,6 +1098,7 @@ def save_overlay(
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", type=str, default=None, help="Local dir with config.json + model-00001-of-00001.safetensors")
+    ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--hf-repo", type=str, default="thinkingmachines/Inkling-2-Mini")
     ap.add_argument("--verify-logits", action="store_true")
     ap.add_argument("--verify-tokens", type=str, default="9906,11,1268,527,499,30")
