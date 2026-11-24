@@ -33,6 +33,7 @@
 #include "llama-mtp-chain-sample.h"
 #include "llama-moe-cache.h"
 #include "llama-ink-stream.h"
+#include "llama-ink-host.h"
 #include "llama-b1.h"
 #include "llama-ple-prefetch.h"
 #include "llama-ext.h"
@@ -1644,6 +1645,16 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             setenv("LLAMA_MOE_CACHE_MAX_BATCH", "512", 0);
 #endif
             LLAMA_LOG_INFO("%s: MoE cache batch cap 512 (no op offload; LLAMA_MOE_CACHE_MAX_BATCH=32 = old default)\n", __func__);
+        }
+        if (cparams.moe_cache_size > 0 && !model.no_alloc()) {
+            // fork (INKMISS): LLAMA_INK_HOST_ARENA / LLAMA_INK_HOST_PIN move or page-lock the host experts (no-op unset)
+            for (ggml_backend_t backend : backend_ptrs) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    llama_ink_host_prepare(model, ggml_backend_dev_buffer_type(dev));
+                    break;
+                }
+            }
         }
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);

@@ -4457,9 +4457,60 @@ ggml_vec_dot_iq23_grouped(enum ggml_type type, int n, const void * vx, const voi
     }
 }
 
+// fork (INKMISS, #133; GGML_CPU_NVFP4_GROUPED=1): one NVFP4 weight row against up to 8 q8_0 rows (the tokens routed to one
+// expert). Each block is unpacked once (nibbles through the FP4 table, four UE4M3 scales) and serves every row; per row
+// the arithmetic is the same as ggml_vec_dot_nvfp4_q8_0 (AVX2 branch), in the same order, so the result is identical.
+static void ggml_vec_dot_nvfp4_grouped(int n, const block_nvfp4 * GGML_RESTRICT x, const void * const * vy, float * s, int nr) {
+    const int nb = n / QK_NVFP4;
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_fp4);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+    __m256 accum[8];
+    for (int t = 0; t < nr; ++t) {
+        accum[t] = _mm256_setzero_ps();
+    }
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m128i q4bits_01 = _mm_loadu_si128((const __m128i *)(x[ib].qs + 0));
+        const __m128i q4bits_23 = _mm_loadu_si128((const __m128i *)(x[ib].qs + 16));
+        const __m128i q4_01_lo = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_01, m4b));
+        const __m128i q4_01_hi = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_01, 4), m4b));
+        const __m128i q4_23_lo = _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_23, m4b));
+        const __m128i q4_23_hi = _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_23, 4), m4b));
+        const __m256i q4_01 = MM256_SET_M128I(_mm_unpackhi_epi64(q4_01_lo,q4_01_hi), _mm_unpacklo_epi64(q4_01_lo,q4_01_hi));
+        const __m256i q4_23 = MM256_SET_M128I(_mm_unpackhi_epi64(q4_23_lo,q4_23_hi),_mm_unpacklo_epi64(q4_23_lo,q4_23_hi));
+        const float d0 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[0]);
+        const float d1 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[1]);
+        const float d2 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[2]);
+        const float d3 = GGML_CPU_UE4M3_TO_FP32(x[ib].d[3]);
+        for (int t = 0; t < nr; ++t) {
+            const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) vy[t];
+            const __m256i q8_01 = _mm256_loadu_si256((const __m256i *)y[2*ib + 0].qs);
+            const __m256i q8_23 = _mm256_loadu_si256((const __m256i *)y[2*ib + 1].qs);
+            const __m256i p_1 = _mm256_madd_epi16(mul_add_epi8(q4_01, q8_01), mone);
+            const __m256i p_2 = _mm256_madd_epi16(mul_add_epi8(q4_23, q8_23), mone);
+            const float dy0 = GGML_CPU_FP16_TO_FP32(y[2*ib].d);
+            const float dy1 = GGML_CPU_FP16_TO_FP32(y[2*ib+1].d);
+            const __m256 scales01 = _mm256_set_m128(_mm_set1_ps(d1 * dy0), _mm_set1_ps(d0 * dy0));
+            const __m256 scales23 = _mm256_set_m128(_mm_set1_ps(d3 * dy1), _mm_set1_ps(d2 * dy1));
+            accum[t] = _mm256_fmadd_ps(scales01, _mm256_cvtepi32_ps(p_1), accum[t]);
+            accum[t] = _mm256_fmadd_ps(scales23, _mm256_cvtepi32_ps(p_2), accum[t]);
+        }
+    }
+    for (int t = 0; t < nr; ++t) {
+        s[t] = hsum_float_8(accum[t]);
+    }
+}
+
 bool ggml_vec_dot_iq_grouped_avx2(enum ggml_type type, int n, const void * vx, const void * const * vy, float * s, int nr) {
     if (nr < 1 || nr > 8 || n <= 0) {
         return false;
+    }
+    if (type == GGML_TYPE_NVFP4) {
+        if (n % QK_NVFP4 != 0) {
+            return false;
+        }
+        ggml_vec_dot_nvfp4_grouped(n, (const block_nvfp4 *) vx, vy, s, nr);
+        return true;
     }
     if (type == GGML_TYPE_IQ4_NL) {
         if (n % QK4_NL != 0) {

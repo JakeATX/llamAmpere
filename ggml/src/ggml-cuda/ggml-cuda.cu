@@ -18011,6 +18011,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_host_pin") == 0) {
         return (void *)ggml_cuda_host_pin;
     }
+    // fork (INKMISS, LLAMA_INK_HOST_PIN): page-lock read-only file pages in place (unpin with ggml_backend_cuda_host_unpin)
+    if (strcmp(name, "ggml_backend_cuda_host_pin_ro") == 0) {
+        return (void *) +[](void * ptr, size_t size) -> bool {
+            const cudaError_t err = ggml_cuda_host_register(ptr, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("%s: failed to page-lock %.1f MiB read only: %s\n", __func__, size / 1048576.0, cudaGetErrorString(err));
+                return false;
+            }
+            return true;
+        };
+    }
     if (strcmp(name, "ggml_backend_cuda_host_is_unpinned") == 0) {
         return (void *) ggml_cuda_host_is_unpinned;
     }

@@ -174,6 +174,7 @@ llama_build(test-gdn-replay-lanes.cpp) # [TAG_GDN_REPLAY_LANES] joint vs split r
 llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
 llama_build(test-peer-experts.cpp LINK ggml) # GGML_PEER_EXPERTS transport; needs a CUDA device (same device twice is fine)
+llama_build(test-inkmiss-cpu.cpp LINK ggml) # [INKMISS] CPU MUL_MAT_ID hashes: run flags off vs GGML_CPU_NVFP4_GROUPED=1 GGML_CPU_AI4_SCHEDULE=1, must match
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
 llama_build_and_test(test-kq-mask-pack.cpp)

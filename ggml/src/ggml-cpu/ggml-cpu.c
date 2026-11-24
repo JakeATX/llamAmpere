@@ -85,6 +85,10 @@
 
 static bool ggml_cpu_expert_reuse = false;
 static bool ggml_cpu_expert_schedule = false;
+// fork (INKMISS, #133): GGML_CPU_NVFP4_GROUPED=1 unpacks each NVFP4 expert row once for all the tokens routed to it
+static bool ggml_cpu_nvfp4_grouped = false;
+// fork (INKMISS, FNV7-2): GGML_CPU_AI4_SCHEDULE=1, expert-local chunk queue for AI+ unit MUL_MAT_ID (see below)
+static bool ggml_cpu_ai4_schedule = false;
 static bool ggml_cpu_expert_q8_reuse = false;
 static bool ggml_cpu_expert_cpumask[GGML_MAX_N_THREADS];
 static int ggml_cpu_expert_n_threads = 0;
@@ -1730,6 +1734,58 @@ static void ggml_compute_forward_mul_mat_id_ai4(
         }
     }
 
+    // fork (INKMISS, FNV7-2; GGML_CPU_AI4_SCHEDULE=1, off by default): expert-local chunk queue. The used experts are
+    // listed once; tasks are runs of 4 slabs of one expert, expert-major, taken from one atomic counter, so a thread moves
+    // on to the next expert's slabs as soon as it is done instead of every thread striding through every expert and the
+    // op ending on the slowest thread's last expert. Each slab is computed as below: identical results.
+    if (ggml_cpu_ai4_schedule && !params->use_ref && ne02 <= 4096) {
+        uint64_t mark[64] = { 0 };
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t s = 0; s < n_ids; ++s) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]);
+                if (e >= 0 && e < ne02) {
+                    mark[e >> 6] |= UINT64_C(1) << (e & 63);
+                }
+            }
+        }
+        int32_t used[4096];
+        int64_t n_used = 0;
+        for (int64_t e = 0; e < ne02; ++e) {
+            if (mark[e >> 6] >> (e & 63) & 1) {
+                used[n_used++] = (int32_t) e;
+            }
+        }
+        const int64_t slabs_per_task = 4;
+        const int64_t tasks_per_expert = (ng + slabs_per_task - 1) / slabs_per_task;
+        const int64_t n_tasks = n_used*tasks_per_expert;
+        if (ith == 0) {
+            ggml_threadpool_chunk_set(params->threadpool, nth);
+        }
+        ggml_barrier(params->threadpool);
+        for (int64_t task = ith; task < n_tasks; task = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+            const int64_t e  = used[task / tasks_per_expert];
+            const int64_t g0 = (task % tasks_per_expert)*slabs_per_task;
+            const int64_t g1 = MIN(g0 + slabs_per_task, ng);
+            const uint8_t * w = (const uint8_t *) src0->data + e*nb02;
+            for (int64_t g = g0; g < g1; ++g) {
+                ggml_ai4_dequantize_slab(src0->type, w, K, g, wbuf);
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    for (int64_t s = 0; s < n_ids; ++s) {
+                        if (*(const int32_t *) ((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]) != e) {
+                            continue;
+                        }
+                        const float * x = (const float *) ((const char *) src1->data + (s % ne11)*nb11 + t*nb12);
+                        float * d = (float *) ((char *) dst->data + s*nb1 + t*nb2) + g*16;
+                        for (int r = 0; r < 16; ++r) {
+                            ggml_vec_dot_f32((int) K, &d[r], 0, wbuf + (size_t) r * K, 0, x, 0, 1);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for (int64_t e = 0; e < ne02; ++e) {
         bool used = false;
         for (int64_t t = 0; t < n_tok && !used; ++t) {
@@ -2036,8 +2092,9 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
     if (reuse && ir1_end - ir1_start >= 2 &&
-        (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS ||
-         type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL)) {
+        ((ggml_cpu_expert_reuse && (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS ||
+          type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL)) ||
+         (ggml_cpu_nvfp4_grouped && type == GGML_TYPE_NVFP4))) {
         for (int64_t first = ir1_start; first < ir1_end; first += 8) {
             const int nr = MIN(8, ir1_end - first);
             const void * inputs[8];
@@ -2434,7 +2491,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, expert, row, MIN(row + rows_per_chunk, ne01),
                 0, matrix_row_counts[expert], (const char *) src0->data + expert*nb02,
-                matrix_rows, row_size, src1_cont, wdata, ggml_cpu_expert_reuse);
+                matrix_rows, row_size, src1_cont, wdata, ggml_cpu_expert_reuse || ggml_cpu_nvfp4_grouped);
             task = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
         goto collect_cache;
@@ -2494,7 +2551,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata, ggml_cpu_expert_reuse && !params->use_ref
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, (ggml_cpu_expert_reuse || ggml_cpu_nvfp4_grouped) && !params->use_ref
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -5602,6 +5659,10 @@ void ggml_cpu_init(void) {
             ggml_cpu_expert_reuse = env && strcmp(env, "1") == 0;
             env = getenv("GGML_CPU_EXPERT_SCHEDULE");
             ggml_cpu_expert_schedule = env && strcmp(env, "1") == 0;
+            env = getenv("GGML_CPU_NVFP4_GROUPED");
+            ggml_cpu_nvfp4_grouped = env && strcmp(env, "1") == 0;
+            env = getenv("GGML_CPU_AI4_SCHEDULE");
+            ggml_cpu_ai4_schedule = env && strcmp(env, "1") == 0;
             env = getenv("GGML_CPU_EXPERT_Q8_REUSE");
             ggml_cpu_expert_q8_reuse = env && strcmp(env, "1") == 0;
             ggml_cpu_init_expert_affinity();

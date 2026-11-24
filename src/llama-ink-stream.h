@@ -73,6 +73,8 @@ private:
         int slot = -1;                           // 0 or 1
         int pos  = -1;                           // index in order
         ggml_tensor * map = nullptr;
+        bool   direct      = false;              // fork (GS11): host experts page-locked, queued without staging
+        size_t direct_span = 0;                  // fork (GS11): > 0: the whole visit is one copy of this many bytes
     };
 
     struct piece {
@@ -132,6 +134,11 @@ private:
     int      n_busy = 0;       // workers on a request
 
     llama_ink_stream_stats st;
+
+    // fork (INKMISS, GS11; LLAMA_INK_STREAM_DIRECT=1): direct uploads from page-locked host experts
+    bool direct_on = false;
+    ggml_backend_buffer_t buf_zeros = nullptr; // pinned zeros for the tails
+    size_t n_direct = 0, n_direct_span = 0;
 
     void issue(int il, ggml_backend_t backend);
     void wait_issued();
