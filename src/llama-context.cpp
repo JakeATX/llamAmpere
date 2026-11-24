@@ -1700,7 +1700,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             }
         }
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            // fork (PLOAN): the banks go in a VMM buffer only when the prompt streamer below will lend them
+            const bool ploan = llama_ink_ploan_on() && ink_rows_cap && !kv_stream_phase_arena.configured &&
+                    llama_ink_stream::wanted(model);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size,
+                    cparams.moe_cache_cpu_share, ploan);
             moe_cache->set_op_offload(cparams.op_offload); // read only by LLAMA_MOE_CACHE_FEWROW_CPU
         }
         // [PEERX] GGML_PEER_EXPERTS=1 (default off): the target context's host expert layers on a second card
@@ -3129,9 +3133,6 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             }
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
-            if (llama_ink_ploan_on() && moe_cache && moe_cache->partial()) {
-                free += moe_cache->kept_bytes(); // fork (PLOAN): as with the whole cache lent; a failed reserve lends them
-            }
             const size_t card_limit = (size_t) 23552 << 20;
             // fork: kernel temporaries are outside graph sizing. Leave 128 MiB beyond the card cap by default.
             // LLAMA_PROMPT_TEMP_HEADROOM=0 restores 64 MiB; nonzero retains the larger 512 MiB cushion.
@@ -3148,6 +3149,12 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             }
             const size_t need = required[i] + handoff_growth + headroom;
             trim += need > free ? need - free : 0;
+        }
+        if (trim > 0 && llama_ink_ploan_on() && moe_cache && moe_cache->partial()) {
+            // fork (PLOAN): the kept banks go first (one device): the trim is then the one of the whole cache lent
+            const size_t kept = moe_cache->kept_bytes();
+            ink_ploan_give_back("the turn scratch needs them");
+            trim = trim > kept ? trim - kept : 0;
         }
         if (trim > 0) {
             b1_cache_needs_refresh = true;
@@ -6640,9 +6647,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         if (llama_ink_ploan_on()) {
             int32_t n_up = 0, n_filled = 0;
             size_t bytes = 0;
-            moe_cache->last_resume(&n_up, &n_filled, &bytes);
-            LLAMA_LOG_WARN("%s: [PLOAN] refill %d of %d slots (%.0f MiB) in %.1f ms (%s)\n", __func__, n_up, n_filled,
-                    bytes/1048576.0, copy_ms, ploan_part ? "partial: the kept slots stayed" : "full");
+            double map_ms = 0.0;
+            moe_cache->last_resume(&n_up, &n_filled, &bytes, &map_ms);
+            LLAMA_LOG_WARN("%s: [PLOAN] refill %d of %d slots (%.0f MiB) in %.1f ms, %.1f ms of it %s (%s)\n", __func__, n_up,
+                    n_filled, bytes/1048576.0, copy_ms, map_ms, ploan_part ? "page remap" : "bank alloc",
+                    ploan_part ? "partial: the kept slots stayed" : "full");
         }
         return true;
     };
@@ -7101,10 +7110,12 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 const double per_row = 1.25 * 4.0 * hp.n_expert_used_max() * (hp.n_embd + 3.0 * ff_max);
                 size_t free = 0, total = 0;
                 ggml_backend_dev_memory(dev, &free, &total);
-                const double need = per_row*std::min(rows, std::max(1u, n_tokens)) + double(size_t(128) << 20);
+                // + the INKB1 scratch, allocated after this check (ink_b1_prepare)
+                const double need = per_row*std::min(rows, std::max(1u, n_tokens)) + double(size_t(128) << 20) +
+                        double(ink_ploan_b1_bytes(rows, n_tokens, seq));
                 if (double(free) < need) {
                     char why[160];
-                    snprintf(why, sizeof(why), "%.0f MiB free after the %u-row reserve, the pool rows need %.0f MiB",
+                    snprintf(why, sizeof(why), "%.0f MiB free after the %u-row reserve, the pool rows and INKB1 need %.0f MiB",
                             free/1048576.0, rows, need/1048576.0);
                     ink_ploan_give_back(why);
                 }
@@ -7240,11 +7251,20 @@ bool llama_context::ink_stream_take(uint32_t n_tokens, llama_seq_id seq) {
             est = (size_t) ((double) cur*rung/sched_reserve_tokens);
             src = "scaled";
         }
+        // LLAMA_ELASTIC_KV: this call's KV records are mapped before the take (elastic_kv_prepare); the next call of
+        // this size maps up to depth + n_tokens more positions (+ page rounding and the 128 MiB default margin)
+        size_t kv_more = 0;
+        if (elastic_kv && elastic_kv->elastic_on()) {
+            const uint64_t depth = seq >= 0 ? (uint64_t) std::max<llama_pos>(0, memory->seq_pos_max(seq) + 1) : 0;
+            const uint32_t want  = elastic_kv->elastic_groups_for((uint32_t) std::min<uint64_t>(UINT32_MAX, depth + 3ull*n_tokens));
+            const uint32_t have  = elastic_kv->elastic_groups();
+            kv_more = want > have ? elastic_kv->elastic_bytes(want - have) + (size_t(192) << 20) : 0;
+        }
         const size_t bank = moe_cache->size();
         size_t need = SIZE_MAX, keep = 0;
         if (gpu && est != SIZE_MAX) {
             need = 2*ink_stream->slot_bytes() + (est > cur ? est - cur : 0) + ink_ploan_b1_bytes(rung, n_tokens, seq) +
-                    llama_ink_ploan_margin();
+                    kv_more + llama_ink_ploan_margin();
             keep = free + bank > need ? std::min(bank, free + bank - need) : 0;
         }
         if (force >= 0) {
@@ -7252,9 +7272,9 @@ bool llama_context::ink_stream_take(uint32_t n_tokens, llama_seq_id seq) {
         }
         lent = moe_cache->suspend_keep(keep);
         LLAMA_LOG_WARN("%s: [PLOAN] take: keep %.0f of %.0f MiB, lent %.0f MiB (need est %.0f MiB for %u tokens; rung %u rows, "
-                "reserve %.0f MiB %s, free %.0f MiB%s)\n", __func__, moe_cache->kept_bytes()/1048576.0, bank/1048576.0,
+                "reserve %.0f MiB %s, KV %.0f MiB, free %.0f MiB%s)\n", __func__, moe_cache->kept_bytes()/1048576.0, bank/1048576.0,
                 lent/1048576.0, need == SIZE_MAX ? -1.0 : need/1048576.0, n_tokens, rung, est == SIZE_MAX ? -1.0 : est/1048576.0,
-                src, free/1048576.0, force >= 0 ? ", LLAMA_INK_PLOAN_KEEP_MIB" : "");
+                src, kv_more/1048576.0, free/1048576.0, force >= 0 ? ", LLAMA_INK_PLOAN_KEEP_MIB" : "");
     } else {
         lent = moe_cache ? moe_cache->suspend() : 0;
     }
@@ -7818,7 +7838,7 @@ uint32_t llama_context::ub_fit_rows(uint32_t rows, uint32_t floor, uint32_t n_to
     gf_res_reserve.reset(new llm_graph_result(graph_max_nodes(rows)));
     std::vector<size_t> sizes(backend_ptrs.size());
     // fork (PLOAN): the kept bank pages count as free; a rung that fits only with them gets them lent too
-    const size_t ploan_kept = llama_ink_ploan_on() && moe_cache && moe_cache->partial() ? moe_cache->kept_bytes() : 0;
+    size_t ploan_kept = llama_ink_ploan_on() && moe_cache && moe_cache->partial() ? moe_cache->kept_bytes() : 0;
     for (;;) {
         std::fill(sizes.begin(), sizes.end(), 0);
         const uint32_t outputs = tight ? 0 : std::min(rows, cparams.n_outputs_max);
@@ -7863,6 +7883,11 @@ uint32_t llama_context::ub_fit_rows(uint32_t rows, uint32_t floor, uint32_t n_to
         // The floor is the boot reserve size: it always fits in owned memory, never lend for it.
         if (rows <= floor) {
             return floor;
+        }
+        if (gf && loan_ok && head_ok && n_gpu == 1 && ploan_kept > 0) {
+            // fork (PLOAN): the KV-tail loan's pool temporaries need the kept pages free, as with the whole cache lent
+            ink_ploan_give_back("the KV-tail loan needs them");
+            ploan_kept = 0;
         }
         if (gf && loan_ok && head_ok && n_gpu == 1 && ub_loan_begin(rows, n_tokens, gpu, sizes[gpu], gf)) {
             return rows;

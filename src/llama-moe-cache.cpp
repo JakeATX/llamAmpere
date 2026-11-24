@@ -555,6 +555,7 @@ struct llama_moe_cache::impl {
     bool elastic_warned = false;
     int32_t res_n_up = 0, res_n_all = 0; // the last resume(): slots uploaded, of the filled slots
     size_t  res_bytes = 0;
+    int64_t res_map_us = 0;              // the last resume(): page map (partial) or bank alloc (full) time
 
     // fork (SURGE-cache, round admission; LLAMA_MOE_CACHE_ROUND=1, off by default). Once the cache is full, a decode
     // miss is computed on the CPU from the host experts instead of being uploaded on the spot (the graph's CPU part,
@@ -649,7 +650,7 @@ struct llama_moe_cache::impl {
     std::unique_ptr<llama_moe_og> og;
 
 
-    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
+    impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool ploan) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -933,8 +934,8 @@ struct llama_moe_cache::impl {
             stage_first_il = layers[il].ig >= 0 ? (int32_t) il : -1; // fork (INKMISS, R3): window start
         }
 
-        if (ploan_on && !no_alloc) {
-            ploan_init();
+        if (ploan_on && ploan && !no_alloc) {
+            ploan_init(); // fork (PLOAN): only with a prompt streamer (the context says so)
         }
         // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
         for (device & d : devices) {
@@ -2260,6 +2261,7 @@ struct llama_moe_cache::impl {
         // fork (PLOAN): a partial loan maps its dropped pages again (they read the clear value, zero) and uploads only
         // the slots from keep_n on; a failed map leaves it as it was (still suspended)
         std::vector<int32_t> first(groups.size(), 0);
+        const int64_t t_map = ploan_on ? ggml_time_us() : 0;
         if (is_partial) {
             for (device & d : devices) {
                 if (!d.buf || !d.ctx || !d.elastic) {
@@ -2267,7 +2269,9 @@ struct llama_moe_cache::impl {
                 }
                 const size_t off = 0, len = ggml_backend_buffer_get_size(d.buf.get());
                 if (!el_set(d.buf.get(), &off, &len, 1)) {
-                    LLAMA_LOG_WARN("%s: [PLOAN] mapping the lent bank pages again failed (retried later)\n", __func__);
+                    // a full loan from here: the kept pages go too and the retry allocates the banks whole
+                    LLAMA_LOG_WARN("%s: [PLOAN] mapping the lent bank pages again failed: the kept banks are lent too (retried later)\n", __func__);
+                    suspend();
                     return false;
                 }
             }
@@ -2323,7 +2327,8 @@ struct llama_moe_cache::impl {
         };
         if (ploan_on) {
             res_n_up = res_n_all = 0;
-            res_bytes = 0;
+            res_bytes  = 0;
+            res_map_us = ggml_time_us() - t_map;
         }
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             group & g = groups[ig];
@@ -2579,8 +2584,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
-    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool ploan) :
+    pimpl(new impl(model, no_alloc, backends, bufts, size, cpu_share, ploan)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -2645,10 +2650,11 @@ size_t llama_moe_cache::kept_bytes() const {
     return pimpl->kept_bytes();
 }
 
-void llama_moe_cache::last_resume(int32_t * n_up, int32_t * n_filled, size_t * bytes) const {
+void llama_moe_cache::last_resume(int32_t * n_up, int32_t * n_filled, size_t * bytes, double * map_ms) const {
     *n_up     = pimpl->res_n_up;
     *n_filled = pimpl->res_n_all;
     *bytes    = pimpl->res_bytes;
+    *map_ms   = pimpl->res_map_us/1000.0;
 }
 
 void llama_moe_cache::set_op_offload(bool on) {
