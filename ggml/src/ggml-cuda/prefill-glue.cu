@@ -912,28 +912,44 @@ void ggml_cuda_prefill_launch_glu_mmq(
     CUDA_CHECK(cudaGetLastError());
 }
 
+typedef void (*pf_norm_q_fn)(
+        const float * __restrict__, const float * __restrict__, float * __restrict__,
+        const float * __restrict__, float * __restrict__, int8_t * __restrict__, float * __restrict__,
+        int64_t, int, int64_t, int64_t, float);
+typedef void (*pf_norm_mmq_fn)(
+        const float * __restrict__, const float * __restrict__, float * __restrict__,
+        const float * __restrict__, float * __restrict__, void * __restrict__,
+        int64_t, int, int, int64_t, int64_t, float);
+
+// BS / HAS_ADD are template parameters of a plain function rather than constexpr locals of an
+// enclosing generic lambda: MSVC cannot resolve the kernel template-id in the nested-lambda form.
+template <int BS, bool HAS_ADD>
+static void pf_launch_norm_ai4_bs(
+        const float * x, const float * r, float * add_dst, const float * w, float * mul_dst,
+        int8_t * q, float * s, int64_t n_rows, int K, float eps, int xsh, int variant,
+        const dim3 grid, const size_t smem, cudaStream_t stream) {
+    pf_dispatch_ai4_variants(variant, xsh, [&](auto xsh_tag, auto sw_tag, auto xp_tag, auto ln_tag) {
+        const pf_norm_q_fn kfn = k_prefill_norm_ai4<BS, decltype(xsh_tag)::value, decltype(sw_tag)::value,
+                                                    decltype(xp_tag)::value, decltype(ln_tag)::value, HAS_ADD>;
+        if (smem > 48u * 1024u) {
+            CUDA_CHECK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        }
+        kfn<<<grid, BS, smem, stream>>>(x, r, add_dst, w, mul_dst, q, s, n_rows, K, K, K, eps);
+    });
+}
+
 void ggml_cuda_prefill_launch_norm_ai4(
         const float * x, const float * r, float * add_dst, const float * w, float * mul_dst,
         int8_t * q, float * s, int64_t n_rows, int K, float eps, int xsh, int variant, cudaStream_t stream) {
     const size_t smem = (size_t) K * sizeof(float);
     const dim3 grid((unsigned) std::min<int64_t>(n_rows, 65535));
-    auto launch = [&](auto bs_tag, auto add_tag) {
-        constexpr int  BS  = decltype(bs_tag)::value;
-        constexpr bool ADD = decltype(add_tag)::value;
-        pf_dispatch_ai4_variants(variant, xsh, [&](auto xsh_tag, auto sw_tag, auto xp_tag, auto ln_tag) {
-            auto * kfn = k_prefill_norm_ai4<BS, decltype(xsh_tag)::value, decltype(sw_tag)::value, decltype(xp_tag)::value, decltype(ln_tag)::value, ADD>;
-            if (smem > 48u * 1024u) {
-                CUDA_CHECK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
-            }
-            kfn<<<grid, BS, smem, stream>>>(x, r, add_dst, w, mul_dst, q, s, n_rows, K, K, K, eps);
-        });
-    };
-    auto pick_add = [&](auto bs_tag) {
-        if (r != nullptr) launch(bs_tag, std::true_type{});
-        else              launch(bs_tag, std::false_type{});
-    };
-    if (K < 1024) pick_add(std::integral_constant<int, 256>{});
-    else          pick_add(std::integral_constant<int, 1024>{});
+    if (K < 1024) {
+        if (r != nullptr) pf_launch_norm_ai4_bs< 256, true >(x, r, add_dst, w, mul_dst, q, s, n_rows, K, eps, xsh, variant, grid, smem, stream);
+        else              pf_launch_norm_ai4_bs< 256, false>(x, r, add_dst, w, mul_dst, q, s, n_rows, K, eps, xsh, variant, grid, smem, stream);
+    } else {
+        if (r != nullptr) pf_launch_norm_ai4_bs<1024, true >(x, r, add_dst, w, mul_dst, q, s, n_rows, K, eps, xsh, variant, grid, smem, stream);
+        else              pf_launch_norm_ai4_bs<1024, false>(x, r, add_dst, w, mul_dst, q, s, n_rows, K, eps, xsh, variant, grid, smem, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -944,7 +960,7 @@ void ggml_cuda_prefill_launch_norm_nvfp4pf(
     const dim3 grid((unsigned) std::min<int64_t>(n_rows, 65535));
     auto launch = [&](auto bs_tag, auto kf_tag, auto add_tag) {
         constexpr int BS = decltype(bs_tag)::value;
-        auto * kfn = k_prefill_norm_nvfp4pf<BS, decltype(kf_tag)::value, decltype(add_tag)::value>;
+        const pf_norm_q_fn kfn = k_prefill_norm_nvfp4pf<BS, decltype(kf_tag)::value, decltype(add_tag)::value>;
         if (smem > 48u * 1024u) {
             CUDA_CHECK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         }
@@ -970,7 +986,7 @@ void ggml_cuda_prefill_launch_norm_mmq(
     const dim3 grid((unsigned) std::min<int64_t>(n_rows, 65535));
     auto launch = [&](auto bs_tag, auto ds_tag, auto sw_tag, auto add_tag) {
         constexpr int BS = decltype(bs_tag)::value;
-        auto * kfn = k_prefill_norm_mmq<BS, decltype(ds_tag)::value, decltype(sw_tag)::value, decltype(add_tag)::value>;
+        const pf_norm_mmq_fn kfn = k_prefill_norm_mmq<BS, decltype(ds_tag)::value, decltype(sw_tag)::value, decltype(add_tag)::value>;
         if (smem > 48u * 1024u) {
             CUDA_CHECK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         }
