@@ -152,18 +152,22 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"LLAMA_INKKV_BIAS_MIB", "512"}
             }
         };
-        // ink10/ink12 copy ink8, then take their own ctx (Jake's floor: 10/12 GB >= 250K)
-        auto set_ctx = [](common_card_preset & p, const char * ctx) {
+        // ink10/ink12 copy ink8, then take their own ctx (Jake's floor: 10/12 GB >= 250K) and prompt ceiling
+        auto set_opt = [](common_card_preset & p, const char * name, const char * v) {
             for (auto & [opt, val] : p.options) {
-                if (opt == "--ctx-size") { val = ctx; }
+                if (opt == name) { val = v; }
             }
         };
+        auto set_ctx = [&](common_card_preset & p, const char * ctx) { set_opt(p, "--ctx-size", ctx); };
         auto ink10 = ink8;
         ink10.name = "10ink";
         set_ctx(ink10, "262144");
         auto ink12 = ink8;
         ink12.name = "12ink";
         set_ctx(ink12, "262144");
+        // 12 GB has room for the 2,048-row prompt step (INKSTREAM 11-23, X2 at 11,264, ladder reaches 2,048 rows: 100K
+        // prefill 968 tok/s); 8/10 GB stay at 1024 (the 2,048 step does not fit: 10ink needs 3,028 vs 1,408 MiB free)
+        set_opt(ink12, "--ubatch-size", "2048");
         // fork (INKSTACK): Inkling 2 Mini on a 24 GB card, one slot, the whole model on the GPU, DSpark drafter on.
         // -b 2048 -ub 1024 (ladder on): at -c 262144 the NQ file runs out of VRAM at ub 2048 (rc8b boot check, RELREADY),
         // and --parallel 1 keeps the server from picking 4 slots + a unified KV (500 on the first 262K request).
