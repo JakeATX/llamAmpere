@@ -232,7 +232,7 @@ static bool i8qk_applies_impl(int cc, const ggml_tensor * dst, const bool f16_kv
         }
     }
     if (lse != nullptr) {
-        if (lse->type != GGML_TYPE_F32 || lse->nb[0] != sizeof(float) || lse->nb[1] % sizeof(float) != 0 ||
+        if (lse->type != GGML_TYPE_F32 || lse->nb[0] != sizeof(float) || lse->nb[1] != (size_t) lse->ne[0]*sizeof(float) ||
                 (lse->ne[2] > 1 && lse->nb[2] % sizeof(float) != 0) ||
                 lse->ne[0] != Q->ne[2] || lse->ne[1] != Q->ne[1] || lse->ne[2] != Q->ne[3] || lse->ne[3] != 1) {
             return false;

@@ -570,6 +570,14 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
         if (grouped && lse) {
             lse_group = *lse;
             lse_group.ne[0] = q.ne[2];
+            // the group scratch is packed [heads*gqa, T, S]; fattn_sj_kvarn_scatter_lse reads it packed, and i8qk takes its row stride from nb[1]
+            // (only the i8qk route, GGML_CUDA_FA_I8QK_EXT=1, reads these strides; the MMA routes keep the cand base strides)
+            if (plan.i8qk) {
+                lse_group.nb[0] = sizeof(float);
+                for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                    lse_group.nb[d] = lse_group.nb[d - 1]*lse_group.ne[d - 1];
+                }
+            }
             lse_group.data = (char *) scratch_ptr + plan.lse_offset;
             lse_group.buffer = nullptr;
             lse_group.view_src = nullptr;
