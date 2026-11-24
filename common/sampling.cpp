@@ -1436,8 +1436,82 @@ const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_
     return gsmpl->pq_stats;
 }
 
+double common_sampler_mb_effective_kappa(const common_sampler_mb_params & mb, size_t pos, size_t n_draft) {
+    if (!(mb.kappa > 1.0) || !mb.pos_weight || n_draft <= 1) {
+        return mb.kappa;
+    }
+    // continuation value V_j = (1 - a^(n_draft - pos)) / (1 - a) with retention a = 0.8, normalized by its mean over
+    // the positions so that the mean of log(kappa_j) is log(kappa): more room early in the block, less at the end
+    constexpr double a = 0.80;
+    const size_t j = std::min(pos, n_draft - 1);
+    const double v_j = (1.0 - std::pow(a, (double) (n_draft - j))) / (1.0 - a);
+    double v_sum = 0.0;
+    for (size_t k = 0; k < n_draft; ++k) {
+        v_sum += (1.0 - std::pow(a, (double) (n_draft - k))) / (1.0 - a);
+    }
+    return std::exp(std::log(mb.kappa) * (v_j / (v_sum / (double) n_draft)));
+}
+
+// rescue probability of the weighted rule for draft d (target p_d, draft q_d) over replacement y (target p_y,
+// residual mass mass_y = max(0, p_y - q_y)); kappa <= 1 gives the hard threshold p_d >= alpha * p_y
+static inline double common_sampler_mb_rescue_weight(double p_d, double q_d, double p_y, double mass_y,
+        const common_sampler_mb_params & mb) {
+    if (!(p_d > 0.0) || p_d < mb.alpha * p_y) {
+        return 0.0;
+    }
+    if (!(mb.kappa > 1.0)) {
+        return 1.0;
+    }
+    if (!(p_y > 0.0)) {
+        return 0.0;
+    }
+    // w = min(1, (kappa - 1) / (a + kappa * b)), a = max(0, q(d)/p(d) - 1), b = clamp(mass_y / p(y), 0, 1):
+    // keeps p(x) / kappa <= p_mb(x) <= kappa * p(x) for every token x
+    const double a = std::max(0.0, q_d / p_d - 1.0);
+    const double b = std::clamp(mass_y / p_y, 0.0, 1.0);
+    const double denom = a + mb.kappa * b;
+    return denom > 0.0 ? std::min(1.0, (mb.kappa - 1.0) / denom) : 1.0;
+}
+
+static std::vector<double> common_sampler_pq_mode_distribution_weighted(const llama_token_data_array & p,
+        const std::vector<llama_token_data> & q, const std::function<bool(llama_token)> & is_stop,
+        const common_sampler_mb_params & mb) {
+    std::vector<double> law(p.size), residual(p.size), excess(p.size), qv(p.size);
+    double total = 0.0;
+    for (size_t k = 0; k < p.size; ++k) {
+        double qk = 0.0;
+        for (const auto & c : q) {
+            if (c.id == p.data[k].id) { qk = c.p; break; }
+        }
+        qv[k] = qk;
+        law[k] = p.data[k].p;
+        residual[k] = std::max(0.0, law[k] - qk);
+        excess[k] = std::max(0.0, qk - law[k]);
+        total += residual[k];
+    }
+    if (total <= 0.0) { return law; }
+    // each rejected-draft/replacement pair's joint mass excess[d] * residual[y] / total moves from y to d with
+    // probability w(d, y); drafts outside p (p(d) = 0) never rescue
+    for (size_t d = 0; d < p.size; ++d) {
+        if (excess[d] <= 0.0 || p.data[d].p <= 0.0f || (is_stop && is_stop(p.data[d].id))) { continue; }
+        for (size_t y = 0; y < p.size; ++y) {
+            if (residual[y] <= 0.0 || (is_stop && is_stop(p.data[y].id))) { continue; }
+            const double w = common_sampler_mb_rescue_weight(p.data[d].p, qv[d], p.data[y].p, residual[y], mb);
+            if (w <= 0.0) { continue; }
+            const double moved = excess[d] * residual[y] / total * w;
+            law[d] += moved;
+            law[y] -= moved;
+        }
+    }
+    return law;
+}
+
 std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_array & p,
-        const std::vector<llama_token_data> & q, const std::function<bool(llama_token)> & is_stop) {
+        const std::vector<llama_token_data> & q, const std::function<bool(llama_token)> & is_stop,
+        const common_sampler_mb_params & mb) {
+    if (mb.weighted()) {
+        return common_sampler_pq_mode_distribution_weighted(p, q, is_stop, mb);
+    }
     std::vector<double> law(p.size), residual(p.size), excess(p.size);
     double total = 0.0;
     for (size_t k = 0; k < p.size; ++k) {
@@ -1477,10 +1551,13 @@ std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_a
     return law;
 }
 
-template<bool cache_q, bool beat>
+// weighted = true only for beat with mb.weighted(); weighted = false is the classic rule, unchanged
+template<bool cache_q, bool beat, bool weighted>
 static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
         llama_token d, llama_token x, std::mt19937 & rng, common_sampler_pq_stats & stats,
-        const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
+        const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop, const common_sampler_mb_params & mb) {
+    static_assert(!weighted || beat, "the weighted rule is a beat rule");
+    GGML_UNUSED(mb);
     // [T5-IDLE] H6: stack-allocated open-addressed hash table for O(1) q lookup when p is wide (e.g. top_k=0)
     // and |q| <= 32, avoiding O(|p|*|q|) linear scan with zero heap allocation and bit-identical results.
     constexpr size_t Q_HASH_SIZE = 64;
@@ -1566,6 +1643,7 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
         total += mass;
     }
     res.id = x;
+    [[maybe_unused]] double mass_replacement = 0.0; // residual mass of the replacement (weighted rule only)
     if (total > 0.0) {
         const double target = uniform(rng) * total;
         double run = 0.0;
@@ -1579,11 +1657,13 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
             if (beat) {
                 res.id = c.id;
                 res.p_replacement = c.p;
+                if constexpr (weighted) { mass_replacement = mass; }
             }
             run += mass;
             if (beat ? run > target : run >= target) {
                 res.id = c.id;
                 res.p_replacement = c.p;
+                if constexpr (weighted) { mass_replacement = mass; }
                 break;
             }
         }
@@ -1594,6 +1674,20 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
     const auto ends = [&](llama_token id) {
         return (vocab && llama_vocab_is_eog(vocab, id)) || (is_stop && is_stop(id));
     };
+    if constexpr (weighted) {
+        // --spec-mb-kappa / --spec-mb-alpha: keep d with probability w(d, y); the LLAMA_SPEC_MB_KAPPA / _ALPHA
+        // environment knobs below belong to the classic path and are not read here
+        const double w = common_sampler_mb_rescue_weight(p_d, q_d, res.p_replacement, mass_replacement, mb);
+        if (w > 0.0 && !ends(d) && !ends(res.replacement) && (w >= 1.0 || uniform(rng) < w)) {
+            res.id = d;
+            res.accepted = true;
+            res.rescued = true;
+            stats.n_lossy++;
+        } else {
+            stats.n_rej++;
+        }
+        return res;
+    }
     // Bounded-KL mode-biasing (OPT7): defaults (kappa=1.0, alpha=1.0) are bit-identical to stock p_d >= p_replacement.
     // Opt-in knobs: LLAMA_SPEC_MB_KAPPA (e.g. 3.0) allows rescuing when kappa * p_d >= p_replacement (bounded ratio <= kappa),
     // LLAMA_SPEC_MB_ALPHA (e.g. 0.5) throttles rescue probability to keep KL bounded.
@@ -1621,18 +1715,32 @@ static common_sampler_pq_result common_sampler_verify_pq_impl(const llama_token_
 
 common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
         llama_token d, llama_token x, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
-        const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop) {
+        const llama_vocab * vocab, const std::function<bool(llama_token)> & is_stop, const common_sampler_mb_params & mb) {
     static const bool cache_q = [] {
         const char * e = std::getenv("LLAMA_SPEC_PQ_CACHE");
         return !e || std::atoi(e) != 0;
     }();
     // Tiny supports cost less to scan again than to materialize a probability cache.
-    if (p.size <= 4 || !cache_q) {
-        return beat ? common_sampler_verify_pq_impl<false, true>(p, q, d, x, rng, stats, vocab, is_stop) :
-                      common_sampler_verify_pq_impl<false, false>(p, q, d, x, rng, stats, vocab, is_stop);
+    if (beat && mb.weighted()) {
+        return p.size <= 4 || !cache_q ?
+            common_sampler_verify_pq_impl<false, true, true>(p, q, d, x, rng, stats, vocab, is_stop, mb) :
+            common_sampler_verify_pq_impl<true,  true, true>(p, q, d, x, rng, stats, vocab, is_stop, mb);
     }
-    return beat ? common_sampler_verify_pq_impl<true, true>(p, q, d, x, rng, stats, vocab, is_stop) :
-                  common_sampler_verify_pq_impl<true, false>(p, q, d, x, rng, stats, vocab, is_stop);
+    if (p.size <= 4 || !cache_q) {
+        return beat ? common_sampler_verify_pq_impl<false, true, false>(p, q, d, x, rng, stats, vocab, is_stop, mb) :
+                      common_sampler_verify_pq_impl<false, false, false>(p, q, d, x, rng, stats, vocab, is_stop, mb);
+    }
+    return beat ? common_sampler_verify_pq_impl<true, true, false>(p, q, d, x, rng, stats, vocab, is_stop, mb) :
+                  common_sampler_verify_pq_impl<true, false, false>(p, q, d, x, rng, stats, vocab, is_stop, mb);
+}
+
+static common_sampler_mb_params common_sampler_mb_params_from(const common_params_sampling & params) {
+    common_sampler_mb_params mb;
+    mb.kappa      = params.spec_mb_kappa;
+    mb.alpha      = params.spec_mb_alpha;
+    mb.pos_weight = params.spec_mb_pos_weight;
+    mb.no_consec  = params.spec_mb_no_consec;
+    return mb;
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sampler * gsmpl, struct llama_context * ctx,
@@ -1647,6 +1755,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
     std::vector<llama_token> result;
     result.reserve(idxs.size());
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const common_sampler_mb_params mb_base = common_sampler_mb_params_from(gsmpl->params);
 
     // top-1 probability of the distribution just sampled from (cur_p holds p over the surviving candidates)
     gsmpl->top1_trace.clear();
@@ -1662,6 +1771,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
     };
     GGML_UNUSED_VARS(seq, generated);
     size_t i = 0;
+    bool prev_rescued = false;
     for (; i < draft.size(); ++i) {
         // x ~ p, the target chain's own draw; it also leaves cur_p holding p over the surviving candidates
         const llama_token x = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
@@ -1678,15 +1788,21 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
         const auto ends = [&](llama_token id) { return is_stop && is_stop(id, result); };
         common_sampler_pq_result res{x};
         if (have_q && cpu_p) {
+            // --spec-mb-no-consec: exact verification right after a rescue (unset: beat_i == spec_lossy)
+            const bool beat_i = gsmpl->params.spec_lossy && !(mb_base.no_consec && prev_rescued);
+            common_sampler_mb_params mb_i = mb_base;
+            if (beat_i && mb_i.kappa > 1.0 && mb_i.pos_weight) {
+                mb_i.kappa = common_sampler_mb_effective_kappa(mb_base, i, draft.size());
+            }
             // Explicit quality-only opt-in. Never draw RNG values or alter sampler state.
             // Compare local sampled-token laws, not unchanged model logits; mb-MTP acts after logits.
             static const int audit_limit = []() {
                 const char * e = std::getenv("LLAMA_SPEC_MB_KL");
                 return e ? std::max(0, std::min(512, std::atoi(e))) : 0;
             }();
-            if (gsmpl->params.spec_lossy && gsmpl->pq_stats.n_pos < audit_limit) {
+            if (beat_i && gsmpl->pq_stats.n_pos < audit_limit) {
                 const auto stop = [&](llama_token id) { return llama_vocab_is_eog(vocab, id) || ends(id); };
-                const auto law = common_sampler_pq_mode_distribution(p, draft_q[i], stop);
+                const auto law = common_sampler_pq_mode_distribution(p, draft_q[i], stop, mb_i);
                 double forward = 0.0, reverse = 0.0, mass = 0.0;
                 for (size_t k = 0; k < p.size; ++k) {
                     const double pk = p.data[k].p, sk = std::max(0.0, law[k]);
@@ -1694,16 +1810,23 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
                     if (pk > 0.0) { forward += sk > 0.0 ? pk * std::log(pk/sk) : INFINITY; }
                     if (sk > 0.0) { reverse += pk > 0.0 ? sk * std::log(sk/pk) : INFINITY; }
                 }
-                LOG_INF("mb-mtp local-law: seq=%d generated=%lld draft_pos=%zu p_to_mb=%.12g mb_to_p=%.12g mass=%.12g\n",
-                        seq, (long long) generated, i, forward, reverse, mass);
+                if (mb_i.weighted()) {
+                    LOG_INF("mb-mtp local-law: seq=%d generated=%lld draft_pos=%zu kappa=%.4g alpha=%.4g p_to_mb=%.12g mb_to_p=%.12g mass=%.12g\n",
+                            seq, (long long) generated, i, mb_i.kappa, mb_i.alpha, forward, reverse, mass);
+                } else {
+                    LOG_INF("mb-mtp local-law: seq=%d generated=%lld draft_pos=%zu p_to_mb=%.12g mb_to_p=%.12g mass=%.12g\n",
+                            seq, (long long) generated, i, forward, reverse, mass);
+                }
             }
-            res = common_sampler_verify_pq(p, draft_q[i], draft[i], x, gsmpl->pq_rng, gsmpl->params.spec_lossy, gsmpl->pq_stats, vocab, ends);
+            res = common_sampler_verify_pq(p, draft_q[i], draft[i], x, gsmpl->pq_rng, beat_i, gsmpl->pq_stats, vocab, ends, mb_i);
+            prev_rescued = res.rescued;
             if (res.rescued && gsmpl->first_rescue < 0) {
                 gsmpl->first_rescue = (int32_t) i;
             }
         } else {
             // id-match for this and the remaining positions
             res.accepted = x == draft[i];
+            prev_rescued = false;
         }
         const bool stopped = llama_vocab_is_eog(vocab, res.id) || ends(res.id);
         common_sampler_accept(gsmpl, res.id, true);

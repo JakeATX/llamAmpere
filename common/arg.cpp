@@ -5569,6 +5569,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MB_MTP"));
     add_opt(common_arg(
+        {"--spec-mb-kappa"}, "N",
+        "mb-MTP likelihood-ratio cap: a rejected draft is kept with a probability that bounds the output law to "
+        "p(x)/N <= p_mb(x) <= N*p(x) for every token (no support wipeout; with --spec-mb-pos-weight N is the geometric "
+        "mean of the per-position caps, so early positions get a larger cap); <= 1 = classic rule (default: 0 = off)",
+        [](common_params & params, const std::string & value) {
+            const float k = std::stof(value);
+            if (!std::isfinite(k) || k < 0.0f) {
+                throw std::invalid_argument("error: --spec-mb-kappa must be a finite number >= 0");
+            }
+            params.sampling.spec_mb_kappa = k;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MB_KAPPA"));
+    add_opt(common_arg(
+        {"--spec-mb-alpha"}, "N",
+        "mb-MTP rescue threshold: keep a rejected draft only if p(draft) >= N * p(replacement) (default: 1.0 = classic rule)",
+        [](common_params & params, const std::string & value) {
+            const float a = std::stof(value);
+            if (!std::isfinite(a) || a < 0.0f) {
+                throw std::invalid_argument("error: --spec-mb-alpha must be a finite number >= 0");
+            }
+            params.sampling.spec_mb_alpha = a;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MB_ALPHA"));
+    add_opt(common_arg(
+        {"--spec-mb-pos-weight"},
+        {"--no-spec-mb-pos-weight"},
+        "with --spec-mb-kappa > 1: scale log(kappa) by the draft position's continuation value (looser early in the block, tighter at the end; default: off)",
+        [](common_params & params, bool value) {
+            params.sampling.spec_mb_pos_weight = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MB_POS_WEIGHT"));
+    add_opt(common_arg(
+        {"--spec-mb-no-consec"},
+        {"--no-spec-mb-no-consec"},
+        "mb-MTP: verify exactly at the position right after a rescue within one draft round (default: off)",
+        [](common_params & params, bool value) {
+            params.sampling.spec_mb_no_consec = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MB_NO_CONSEC"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",

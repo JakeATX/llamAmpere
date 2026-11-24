@@ -31,6 +31,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu.cpp
         ggml-cpu/exl3.cpp
         ggml-cpu/exl3.h
+        ggml-cpu/ai4-avx2.cpp
+        ggml-cpu/ai4-avx2.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
