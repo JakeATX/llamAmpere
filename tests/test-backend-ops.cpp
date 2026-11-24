@@ -26410,6 +26410,162 @@ static int run_ait_midt_check(const char * dir) {
     return fails ? 1 : 0;
 }
 
+// NEONKERN: GGML_TEST_NK_PREFIX_MASK=1 verifies ggml_backend_cuda_nk_fill_prefix_mask bit-for-bit against
+// CPU reference and stock ggml_backend_cuda_fill_prefix_mask across aligned/unaligned n_kv, inline (<=32 rows)
+// and ring (>32 rows) paths, 4D multi-stream layouts, clamping, and fusion counter increments, plus 100K timing.
+static int run_nk_prefix_mask_check() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        fprintf(stderr, "nk_prefix_mask: no GPU backend\n");
+        return 1;
+    }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using fill_fn = bool (*)(ggml_backend_t, ggml_tensor *, const int32_t *, int64_t, int64_t);
+    using cnt_fn  = int64_t (*)(ggml_backend_t, const char *);
+    auto nk_fill  = (fill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_fill_prefix_mask");
+    auto ref_fill = (fill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fill_prefix_mask");
+    auto cnt      = (cnt_fn)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+    if (!nk_fill || !ref_fill || !cnt) {
+        fprintf(stderr, "nk_prefix_mask: missing proc address (nk=%p ref=%p cnt=%p)\n",
+                (void *) nk_fill, (void *) ref_fill, (void *) cnt);
+        ggml_backend_free(be);
+        return 1;
+    }
+
+    struct mask_case { int64_t n_kv; int64_t ne1; int64_t ne3; };
+    const std::vector<mask_case> cases = {
+        { 1, 1, 1 }, { 1, 5, 1 }, { 7, 1, 1 }, { 7, 5, 1 }, { 7, 8, 1 },
+        { 8, 1, 1 }, { 8, 8, 1 }, { 9, 5, 1 }, { 9, 8, 1 }, { 15, 3, 1 },
+        { 16, 4, 1 }, { 17, 7, 1 }, { 255, 5, 1 }, { 256, 8, 1 }, { 257, 5, 1 },
+        { 1024, 32, 1 }, { 1024, 33, 1 }, { 1024, 64, 1 }, { 1025, 35, 1 },
+        { 4096, 128, 1 }, { 100096, 5, 1 }, { 100352, 5, 1 }, { 100352, 8, 1 },
+        { 100352, 5, 2 }, { 100352, 4, 2 },
+    };
+
+    const uint16_t keep_u16 = 0x0000u;
+    const uint16_t drop_u16 = 0xFC00u;
+    const uint16_t poison_u16 = 0x3C00u; // 1.0h
+
+    int fails = 0;
+    for (const auto & c : cases) {
+        const int64_t n_rows = c.ne1 * c.ne3;
+        const int64_t n_el = c.n_kv * n_rows;
+        ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t_nk  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.n_kv, c.ne1, 1, c.ne3);
+        ggml_tensor * t_ref = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, c.n_kv, c.ne1, 1, c.ne3);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::vector<int32_t> n_vis((size_t) n_rows);
+        for (int64_t r = 0; r < n_rows; ++r) {
+            switch (r % 12) {
+                case 0:  n_vis[r] = 0; break;
+                case 1:  n_vis[r] = (int32_t) c.n_kv; break;
+                case 2:  n_vis[r] = -5; break;
+                case 3:  n_vis[r] = (int32_t) c.n_kv + 17; break;
+                case 4:  n_vis[r] = 1; break;
+                case 5:  n_vis[r] = 7; break;
+                case 6:  n_vis[r] = 8; break;
+                case 7:  n_vis[r] = 9; break;
+                case 8:  n_vis[r] = (int32_t) (c.n_kv / 2); break;
+                case 9:  n_vis[r] = (int32_t) std::max<int64_t>(0, c.n_kv / 2 - 3); break;
+                case 10: n_vis[r] = (int32_t) std::max<int64_t>(0, c.n_kv - 7); break;
+                default: n_vis[r] = (int32_t) std::max<int64_t>(0, c.n_kv - 1); break;
+            }
+        }
+
+        std::vector<uint16_t> poison((size_t) n_el, poison_u16);
+        ggml_backend_tensor_set(t_nk,  poison.data(), 0, poison.size() * sizeof(uint16_t));
+        ggml_backend_tensor_set(t_ref, poison.data(), 0, poison.size() * sizeof(uint16_t));
+
+        const int64_t c0 = cnt(be, "nk_dev_mask");
+        const bool ok_nk  = nk_fill(be, t_nk, n_vis.data(), n_rows, c.n_kv);
+        const bool ok_ref = ref_fill(be, t_ref, n_vis.data(), n_rows, c.n_kv);
+        const int64_t c1 = cnt(be, "nk_dev_mask");
+        ggml_backend_synchronize(be);
+
+        std::vector<uint16_t> out_nk((size_t) n_el), out_ref((size_t) n_el);
+        ggml_backend_tensor_get(t_nk,  out_nk.data(),  0, out_nk.size()  * sizeof(uint16_t));
+        ggml_backend_tensor_get(t_ref, out_ref.data(), 0, out_ref.size() * sizeof(uint16_t));
+
+        bool match_cpu = true;
+        int64_t bad_r = -1, bad_j = -1;
+        for (int64_t r = 0; r < n_rows && match_cpu; ++r) {
+            const int64_t nv = std::max<int64_t>(0, std::min<int64_t>(c.n_kv, n_vis[r]));
+            for (int64_t j = 0; j < c.n_kv; ++j) {
+                const uint16_t want = j < nv ? keep_u16 : drop_u16;
+                if (out_nk[(size_t) (r * c.n_kv + j)] != want) {
+                    match_cpu = false;
+                    bad_r = r;
+                    bad_j = j;
+                    break;
+                }
+            }
+        }
+        const bool match_ref = std::memcmp(out_nk.data(), out_ref.data(), out_nk.size() * sizeof(uint16_t)) == 0;
+        const bool ok_cnt = (c1 - c0) == 1;
+        const bool pass = ok_nk && ok_ref && match_cpu && match_ref && ok_cnt;
+        if (!pass) {
+            ++fails;
+            printf("NK_PREFIX_MASK(n_kv=%lld,ne1=%lld,ne3=%lld): FAIL ok_nk=%d ok_ref=%d cpu=%d(r=%lld,j=%lld) ref=%d cnt=%lld\n",
+                   (long long) c.n_kv, (long long) c.ne1, (long long) c.ne3,
+                   ok_nk, ok_ref, match_cpu, (long long) bad_r, (long long) bad_j, match_ref, (long long) (c1 - c0));
+        } else {
+            printf("NK_PREFIX_MASK(n_kv=%lld,ne1=%lld,ne3=%lld): OK\n",
+                   (long long) c.n_kv, (long long) c.ne1, (long long) c.ne3);
+        }
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // Microbench at exact Inkling 2 Mini 100K decode shapes: [100352, 8] (DSpark) and [100352, 5] (SJ far mask)
+    for (int64_t n_rows : { 8, 5 }) {
+        const int64_t n_kv = 100352;
+        ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_rows);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        std::vector<int32_t> n_vis((size_t) n_rows, 100100);
+        const int iters = 200;
+        for (int w = 0; w < 20; ++w) {
+            nk_fill(be, t, n_vis.data(), n_rows, n_kv);
+        }
+        ggml_backend_synchronize(be);
+        const int64_t t0 = ggml_time_us();
+        for (int i = 0; i < iters; ++i) {
+            nk_fill(be, t, n_vis.data(), n_rows, n_kv);
+        }
+        ggml_backend_synchronize(be);
+        const double nk_us = (double) (ggml_time_us() - t0) / iters;
+
+        for (int w = 0; w < 20; ++w) {
+            ref_fill(be, t, n_vis.data(), n_rows, n_kv);
+        }
+        ggml_backend_synchronize(be);
+        const int64_t t1 = ggml_time_us();
+        for (int i = 0; i < iters; ++i) {
+            ref_fill(be, t, n_vis.data(), n_rows, n_kv);
+        }
+        ggml_backend_synchronize(be);
+        const double ref_us = (double) (ggml_time_us() - t1) / iters;
+
+        const double bytes = (double) n_kv * n_rows * 2.0;
+        printf("NK_PREFIX_MASK perf [%lld x %lld] (%.2f MB): nk=%.2f us (%.1f GB/s), stock=%.2f us (%.1f GB/s)\n",
+               (long long) n_kv, (long long) n_rows, bytes / 1e6,
+               nk_us, bytes / (nk_us * 1e3), ref_us, bytes / (ref_us * 1e3));
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(be);
+    printf("nk_prefix_mask: %s (%d fails)\n", fails ? "FAIL" : "PASS", fails);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     // the expert-bank MUL_MAT_ID cases pass skipped (-1 / out-of-stack) ids without loading a bank model; the CUDA
     // backend zeroes their outputs only when told to (or when a hot-bank model is loaded)
@@ -26418,6 +26574,9 @@ int main(int argc, char ** argv) {
 #else
     setenv("GGML_CUDA_AI_ID_SKIP_ZERO", "1", 0);
 #endif
+    if (getenv("GGML_TEST_NK_PREFIX_MASK") != nullptr) {
+        return run_nk_prefix_mask_check();
+    }
     if (const char * ad = getenv("GGML_TEST_AIT_DIR")) {
         return run_ait_check(ad);
     }
