@@ -23122,9 +23122,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_flash_attn_ext_causal(128, 128, 8, {4, 1}, 1024, nb, true, true, 0, 10, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
     }
+    for (int64_t nb : {8, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext_causal(128, 128, 8, {4, 1}, 4096, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 2}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 2}, 1024, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 8, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 1024, 8, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 1024, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
 
     // [I8QK] prefill shapes (>= 64 queries) for the default-on int8-QK route (fattn-i8qk.cu); GGML_CUDA_FA_I8QK=0 covers the f16 MMA prefill route.
     // Production head dims 256 (Qwen3.8, GQA 6) and 128, the production
@@ -23572,6 +23579,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12, 16, 4, 2, 200)); // GQA 4, 12 rows
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12,  4, 4, 2, 200)); // GQA 1, 12 rows
+    // V16 single-pass 4/4 verify coverage: partial-warp widths (9/10/12/15/16), multi-group bodies, Q8_0/TQ6_0 staging,
+    // f16_sink off/on, rot=0/1/2, even GQA 2/4/8, and a 1-group body (small split count).
+    for (int64_t n_q : {9, 10, 12, 15, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,  GGML_TYPE_F32, 4, 4, 0));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,  GGML_TYPE_F32, 4, 4, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, true,  false, GGML_TYPE_Q8_0,  256, false, GGML_TYPE_F32, 4, 4, 1));
+    }
+    for (int64_t n_q : {9, 12, 15}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,  GGML_TYPE_F32, 4, 4, 2));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12,  8, 4, 48,  300, false, false, GGML_TYPE_TQ6_0, 128, true,  GGML_TYPE_F32, 4, 4, 1)); // GQA 2
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(16, 16, 4, 48,  300, false, false, GGML_TYPE_TQ6_0, 128, false, GGML_TYPE_F32, 4, 4, 1)); // GQA 4, tq6 sink
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12, 16, 2, 48,  300, false, false, GGML_TYPE_TQ6_0, 128, true,  GGML_TYPE_F32, 4, 4, 1)); // GQA 8, W=12
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn( 9, 24, 4,  1,  128, false, false, GGML_TYPE_TQ6_0, 128, true,  GGML_TYPE_F32, 4, 4, 1)); // 1 group
+    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(16, 24, 4,  1,  128, false, false, GGML_TYPE_TQ6_0, 128, true,  GGML_TYPE_F32, 4, 4, 1)); // 1 group
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 16, 4,  2,  200)); // GQA 4
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(2,  4, 4,  2,  200)); // GQA 1
     // prefill ubatches: query rows tiled in ncols1 blocks (stream-k fixup across jt), all GQA classes
@@ -23979,6 +24001,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nb : {1, 4, 8, 64, 512}) {
             test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 128, 128, 8, {4, 1}, 4096, nb, false, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16));
             test_cases.emplace_back(new test_flash_attn_ext_packed(mode,  64,  64, 4, {1, 1},  512, nb, false, 0.0f, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+        for (int64_t nb : {1, 4, 8, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 128, 128, 8, {4, 1}, 1024, nb, false, 0.0f, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
         }
         test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 256, 256, 4, {6, 1}, 4096, 1024, false, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext_packed(mode, 256, 256, 4, {6, 2}, 4096, 100, false, 0.0f, GGML_TYPE_F16, GGML_TYPE_F16));

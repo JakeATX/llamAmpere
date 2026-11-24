@@ -65,9 +65,9 @@ static __device__ __forceinline__ uint32_t lop3_and_or(const uint32_t x, const u
 static __device__ __forceinline__ void raw_pairs(const uint32_t x, const uint32_t magic, half2 * const __restrict__ r) {
     const uint32_t y = x >> 8;
     r[0] = fattn_sj_kvarn_u32_as_half2(lop3_and_or(x, 0x000F000FU, magic));
-    r[1] = fattn_sj_kvarn_u32_as_half2(lop3_and_or(x, 0x000F00F0U, magic));
+    r[1] = fattn_sj_kvarn_u32_as_half2(lop3_and_or(x, 0x00F000F0U, magic));
     r[2] = fattn_sj_kvarn_u32_as_half2(lop3_and_or(y, 0x000F000FU, magic));
-    r[3] = fattn_sj_kvarn_u32_as_half2(lop3_and_or(y, 0x000F00F0U, magic));
+    r[3] = fattn_sj_kvarn_u32_as_half2(lop3_and_or(y, 0x00F000F0U, magic));
 }
 
 static __device__ __forceinline__ void decode_pairs(const uint32_t x, const uint32_t magic, half2 * const __restrict__ q) {
