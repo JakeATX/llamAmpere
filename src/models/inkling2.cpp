@@ -418,7 +418,12 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     // fork (INKFLAGS): the whole gate in one op (2 kernels instead of 12) at decode/verify widths, with the weights read in
     // their stored type. LLAMA_INKLING2_GATE_FUSED=0 = the graph below.
     static const bool gate_fused = [] { const char * e = getenv("LLAMA_INKLING2_GATE_FUSED"); return !e || atoi(e) != 0; }();
-    if (gate_fused && n_tokens <= 8 && loop.ctrl_gain[ctrl]->type == loop.ctrl_forget[ctrl]->type &&
+    // fork: the same op at prompt widths (2 kernels per gate instead of ~16, F32 math instead of BF16 GEMMs), for rank
+    // <= 64 (LGP_RMAX in ggml-cuda/inklg_pp.cu), without LoRA adapters (the graph below applies them). Opt-in (port, default
+    // off): LLAMA_INKLING2_GATE_PP=1; unset or 0 = the graph below at prompt widths
+    static const bool gate_pp = [] { const char * e = getenv("LLAMA_INKLING2_GATE_PP"); return e && atoi(e) != 0; }();
+    if (gate_fused && (n_tokens <= 8 || (gate_pp && (loras == nullptr || loras->empty()) && loop.ctrl_down[ctrl]->ne[1] <= 64)) &&
+            loop.ctrl_gain[ctrl]->type == loop.ctrl_forget[ctrl]->type &&
             loop.ctrl_down[ctrl]->type == loop.ctrl_gain[ctrl]->type && ggml_is_contiguous(loop.ctrl_down[ctrl]) &&
             (loop.ctrl_down[ctrl]->type == GGML_TYPE_F32 || loop.ctrl_down[ctrl]->type == GGML_TYPE_F16 ||
              loop.ctrl_down[ctrl]->type == GGML_TYPE_BF16)) {

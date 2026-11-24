@@ -1,5 +1,6 @@
 #include "loop-gate.cuh"
 #include "inklg_vec.cuh"
+#include "inklg_pp.cuh"
 #include "convert.cuh"
 
 #define LOOP_GATE_CHUNKS 8   // chunks per input half (x, m); one warp each
@@ -146,6 +147,10 @@ bool ggml_cuda_loop_gate_supported(const ggml_tensor * op) {
         op->src[0]->ne[1] <= LOOP_GATE_MAX_T && op->src[2]->ne[1] <= LOOP_GATE_MAX_R;
 }
 
+bool ggml_cuda_loop_gate_op_supported(const ggml_tensor * op) {
+    return op->src[0]->ne[1] > LOOP_GATE_MAX_T ? ggml_cuda_ink_loop_gate_pp_supported(op) : ggml_cuda_loop_gate_supported(op);
+}
+
 // LGTUNE for the single loop gate (k_loop_gate_down/apply): its own shape knobs, GGML_CUDA_LG1_RB (1/2/4, default 1) and
 // GGML_CUDA_LG1_ROWS (2/4/8, default 2). nsys rc5 (3090, AI4 fold): RB=4 ROWS=4, the best shape for the multi-gate
 // k_ink_lg_*, made this one slower (apply 5.6 -> 7.9 us, down 3.9 -> 4.3 us). Launch shape only, bit-identical.
@@ -197,6 +202,10 @@ static void loop_gate_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 }
 
 void ggml_cuda_loop_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->src[0]->ne[1] > LOOP_GATE_MAX_T) {
+        ggml_cuda_ink_loop_gate_pp(ctx, dst);
+        return;
+    }
     GGML_ASSERT(ggml_cuda_loop_gate_supported(dst));
     if (dst->src[0]->ne[1] == 0) {
         return;

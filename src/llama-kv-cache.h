@@ -269,6 +269,9 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    // fork PPLAN: the largest n_kv (padded as get_n_kv) the slot infos sinfos[i0..] reach once applied, plus `extra`
+    // cells for later calls of the same prompt; capped at the cache size
+    uint32_t get_n_kv_bound(const slot_info_vec_t & sinfos, size_t i0, uint32_t extra) const;
 
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
@@ -819,6 +822,10 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
     uint32_t get_kv_size() const; // cells of the cache (LSA index cache rows on SJ-KVaRN)
+    // fork PPLAN: the n_kv the rest of this batch reaches plus `extra` cells (0 for a reserve / update context), and a
+    // temporary n_kv for a graph that only sizes the compute buffers (llama_context::prompt_plan); returns the old one
+    uint32_t n_kv_ahead(uint32_t extra) const;
+    uint32_t set_n_kv_plan(uint32_t v);
 
     ggml_type type_k() const;
     ggml_type type_v() const;

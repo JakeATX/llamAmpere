@@ -303,6 +303,12 @@ LLAMA_API bool llama_sampler_backend_rows_ready(const struct llama_sampler * sam
 // The #217 trunk keep map is applied only when the tag is GENERATION.
 LLAMA_API void llama_set_next_decode_phase(struct llama_context * ctx, enum llama_decode_phase phase);
 
+// One-shot hint for the next llama_decode() on ctx: the prompt rows (all sequences) that later calls of the same
+// prompt will add after it. The context then plans its compute buffers once for the depth the prompt reaches,
+// instead of re-planning them on every ubatch while the KV grows (opt-in: LLAMA_PROMPT_PLAN=1). 0 = no hint.
+// Read on entry of the next llama_decode() and cleared when it returns.
+LLAMA_API void llama_set_next_prompt_rows(struct llama_context * ctx, int32_t n_rows_after);
+
 // PP-1 (LLAMA_PP_OVERLAP=1, off by default): like llama_set_decode_phase(GENERATION), but the expert
 // cache refill that follows a long prompt runs on a helper thread. It returns once every cache pool has
 // its final size, so the caller can run the MTP helper's catch-up while the expert copies stream in.

@@ -5,3 +5,6 @@
 void ggml_cuda_loop_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 bool ggml_cuda_loop_gate_supported(const ggml_tensor * op);
+
+// fork: any width; rows past LOOP_GATE_MAX_T take the prompt-width kernels (inklg_pp.cu)
+bool ggml_cuda_loop_gate_op_supported(const ggml_tensor * op);

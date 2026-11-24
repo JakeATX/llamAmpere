@@ -2716,9 +2716,11 @@ void llama_context::sched_new(const sched_params & params) {
 }
 
 void llama_context::sched_reserve(bool suspend_prompt_cache) {
+    sampler_reserve_check();
     if (!sched_need_reserve) {
         return;
     }
+    sampler_sig_reserved = sampler_signature(); // fork SAMPKEEP: the sampler set this reserve measures
 
     mtp_scratch_end();
     detach_compute_borrower();
@@ -4091,7 +4093,7 @@ void llama_context::set_decode_phase(enum llama_decode_phase phase) {
             }();
             if (reserve_early && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && compute_peer &&
                     compute_peer->cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer->sched &&
-                    compute_peer->sched_need_reserve) {
+                    (compute_peer->sampler_reserve_check(), compute_peer->sched_need_reserve)) {
                 compute_peer->sched_reserve();
                 LLAMA_LOG_INFO("%s: helper scratch reserved before the expert cache build (%u rows)\n", __func__,
                         compute_peer->sched_reserve_tokens);
@@ -4217,12 +4219,18 @@ bool llama_context::prompt_warm_join() {
                         trim(backend) / 1048576.0);
             }
         }
+        compute_peer->sampler_reserve_check();
         if (compute_peer->sched_need_reserve) {
             compute_peer->sched_reserve();
         }
     }
     g_pp_overlap_prompt = false;
     return ok;
+}
+
+void llama_context::set_next_prompt_rows(int32_t n_rows_after) {
+    next_prompt_rows = n_rows_after > 0 ? n_rows_after : 0;
+    pp_hinted = true; // a caller that knows the prompt length (the server); other callers keep per-ubatch planning
 }
 
 void llama_context::set_next_decode_phase(enum llama_decode_phase phase) {
@@ -5549,6 +5557,51 @@ bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
 
+// fork SAMPKEEP: a backend sampler adds nodes to the graph, so a change used to force a full scheduler reserve
+// (~62 ms on Inkling 2 Mini at 24 GB). The server sets a new sampler on every request (reset to none, then the new
+// chain), with the same composition as before, so every follow-up turn paid that reserve. A change now only marks
+// the set; the reserve runs when the composition differs from the one the last reserve measured. Any shape
+// difference the signature misses (a larger top-k) is caught by the allocator's own re-plan, as for any graph.
+// Opt-in (port, default off): LLAMA_SAMPLER_RESERVE_KEEP=1; unset or 0 = a reserve on every change (the base behaviour).
+void llama_context::sampler_changed() {
+    static const bool keep = [] { const char * e = getenv("LLAMA_SAMPLER_RESERVE_KEEP"); return e && e[0] && atoi(e) != 0; }();
+    if (keep) {
+        sampler_set_dirty = true;
+        // the allocated graph holds the old chain's nodes and inputs; a new chain can reuse the old one's address, so the
+        // pointer compare in can_reuse alone is not enough. Dropping the graph costs no reserve (the next build re-plans).
+        gf_res_prev_active = nullptr;
+    } else {
+        sched_need_reserve = true;
+    }
+}
+
+std::string llama_context::sampler_signature() const {
+    std::string sig = std::to_string(cparams.n_outputs_max_per_seq);
+    for (const auto & [seq_id, smpl] : sampling.samplers) {
+        sig += '|';
+        sig += std::to_string(seq_id);
+        sig += ':';
+        sig += smpl ? llama_sampler_name(smpl) : "-";
+        const int32_t n = smpl ? llama_sampler_chain_n(smpl) : 0;
+        for (int32_t i = 0; i < n; ++i) {
+            sig += ',';
+            sig += llama_sampler_name(llama_sampler_chain_get(smpl, i));
+        }
+    }
+    return sig;
+}
+
+void llama_context::sampler_reserve_check() {
+    if (!sampler_set_dirty) {
+        return;
+    }
+    sampler_set_dirty = false;
+    // a fixed phase arena cannot grow, so a same-name chain with larger nodes (top-k, penalties) must be measured
+    if (kv_stream_phase_arena.configured || sampler_signature() != sampler_sig_reserved) {
+        sched_need_reserve = true;
+    }
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -5564,7 +5617,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sampler_changed();
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -5577,7 +5630,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sampler_changed();
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -5593,7 +5646,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        sampler_changed();
 
         return true;
     }
@@ -5603,7 +5656,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
                        llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sampler_changed();
         }
 
         sampling.samplers.erase(seq_id);
@@ -5613,7 +5666,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    sampler_changed();
 
     return true;
 }
@@ -5844,6 +5897,10 @@ build_graph:
 
         //const auto t_start_us = ggml_time_us();
 
+        // fork PPLAN: size the buffers once for the depth this prompt reaches (no-op unless the caller hints)
+        const bool pp_planned = prompt_plan(ubatch, mctx, res, gparams);
+        const uint64_t pp_gen_planned = pp_plan_gen;
+
         gf = model.build_graph(gparams);
         pp_mark(3);
 
@@ -5872,6 +5929,18 @@ build_graph:
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+        if (pp_planned) {
+            if (pp_plan_gen != pp_gen_planned) {
+                // the real graph re-planned: its topology differs from the sizing graph (an n_kv-dependent path)
+                pp_plan_at = UINT64_MAX;
+                if (++pp_plan_fails >= 2) {
+                    pp_plan_off = true;
+                    LLAMA_LOG_WARN("%s: [PPLAN] the sized plan did not fit the prompt graph twice; per-ubatch planning from here\n", __func__);
+                }
+            } else {
+                pp_plan_fails = 0;
+            }
         }
 
         pp_mark(4);
@@ -7253,9 +7322,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             (next_decode_phase == LLAMA_DECODE_PHASE_PROMPT || next_decode_phase == LLAMA_DECODE_PHASE_GENERATION)
                     ? next_decode_phase
                     : LLAMA_DECODE_PHASE_UNKNOWN;
+    sampler_reserve_check(); // fork SAMPKEEP: a sampler change of the same composition keeps the reserve
+    // fork PPLAN: the prompt-rows hint is one-shot like the phase tag
+    call_prompt_rows = next_prompt_rows;
     struct decode_phase_reset {
         llama_context * ctx;
-        ~decode_phase_reset() { ctx->next_decode_phase = LLAMA_DECODE_PHASE_UNKNOWN; }
+        ~decode_phase_reset() {
+            ctx->next_decode_phase = LLAMA_DECODE_PHASE_UNKNOWN;
+            ctx->next_prompt_rows  = 0;
+            ctx->call_prompt_rows  = 0;
+        }
     } phase_reset{this};
 
     if (!mtp_feedback.active) {
@@ -8715,6 +8791,7 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    pp_plan_gen++; // fork PPLAN: a reserve replaces the scheduler's plan
     // INKKV v2 with several sequences: a one-sequence prompt ubatch takes the far/near split (its [n_kv, T] far mask)
     // and a several-sequence one the row-chunked dense path; size the buffers for both (the larger per backend)
     if (n_seqs > 1 && n_tokens > n_seqs && !inkkv_dual_reserve_busy) {
@@ -9382,7 +9459,7 @@ int llama_context::b1_prepare(llama_memory_context_i * mctx, const llama_batch_e
             (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
              compute_peer->cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
              !compute_peer->mtp_prefill_async && !compute_peer->mtp_scratch_active &&
-             compute_peer->sched_need_reserve);
+             (compute_peer->sampler_reserve_check(), compute_peer->sched_need_reserve));
         b1_kv_scratch_enabled = kv_cold && peer_detached && mtp_scratch_clients.empty() && n_tokens_all <= UINT32_MAX - 512 && b1->n_groups() == 1 && b1_ctx_env("LLAMA_B1_KV_SCRATCH", 0) != 0;
         b1_lend_scratch = peer_detached && mtp_scratch_clients.empty() && n_tokens_all <= UINT32_MAX - 512 && b1->n_groups() == 1 && b1_ctx_env("LLAMA_B1_LEND_SCRATCH", 0) != 0;
         b1_kv_prompt_cells = n_tokens_all + 512;
@@ -10095,12 +10172,13 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    lctx->pp_plan_gen++; // fork PPLAN: any re-plan replaces a prompt plan
+
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {
         return;
     }
-
-    auto * lctx = static_cast<llama_context *>(user_data);
 
     if (graph_size_changed) {
         lctx->n_reallocs_diff++;
@@ -10111,6 +10189,84 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
+}
+
+bool llama_context::prompt_plan(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_result * res,
+        const llm_graph_params & gparams) {
+    // Opt-in (LLAMA_PROMPT_PLAN=1): the first gate (3090 Ti, NQ 24ink) failed. The deeper plan made the compute buffer
+    // look larger to the dynamic ubatch ladder, which cut the prompt rows 1024 -> 512 (-23% prefill at 32K/100K), and the
+    // real graph's topology differs from the sizing graph at some n_kv (two misses). Kept for a ladder-aware redo.
+    // Only for contexts whose caller sends llama_set_next_prompt_rows() (the server), prompt-sized ubatches, and cards
+    // without the expert cache / streamer (their prompt scratch is sized by the lend).
+    static const bool on = [] { const char * e = getenv("LLAMA_PROMPT_PLAN"); return e && e[0] && atoi(e) != 0; }();
+    if (!on || pp_plan_off || !pp_hinted || mctx == nullptr || ubatch.n_tokens < 256 ||
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.pipeline_parallel || b1_cur.active || moe_cache ||
+            (ink_stream && ink_stream->armed()) || kv_stream_phase_arena.configured || cparams.kv_stream_arena_mib != 0) {
+        return false;
+    }
+    // the attention KV contexts of this ubatch
+    llama_kv_cache_context * kb = nullptr;
+    llama_kv_cache_context * ks = nullptr;
+    const llama_kv_cache_iswa_context * iswa = nullptr;
+    if (const auto * hi = dynamic_cast<const llama_memory_hybrid_iswa_context *>(mctx)) {
+        iswa = hi->get_attn();
+    } else if (const auto * hy = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        kb = const_cast<llama_kv_cache_context *>(hy->get_attn());
+    } else if (const auto * is = dynamic_cast<const llama_kv_cache_iswa_context *>(mctx)) {
+        iswa = is;
+    } else if (const auto * kc = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        kb = const_cast<llama_kv_cache_context *>(kc);
+    }
+    if (iswa) {
+        kb = const_cast<llama_kv_cache_context *>(iswa->get_base());
+        ks = const_cast<llama_kv_cache_context *>(iswa->get_swa());
+    }
+    if (!kb) {
+        return false;
+    }
+    const uint32_t extra = call_prompt_rows > 0 ? (uint32_t) call_prompt_rows : 0u;
+    const uint32_t cb = kb->get_n_kv();
+    const uint32_t cs = ks ? ks->get_n_kv() : 0;
+    const uint32_t tb = std::max(cb, kb->n_kv_ahead(extra));
+    const uint32_t ts = ks ? std::max(cs, ks->n_kv_ahead(extra)) : 0;
+    if (tb == cb && ts == cs) {
+        return false; // the deepest graph of this prompt: the usual plan is exact
+    }
+    if (pp_plan_at == pp_plan_gen && cb <= pp_plan_base && cs <= pp_plan_swa && ubatch.n_tokens <= pp_plan_rows) {
+        return false; // the plan made earlier in this prompt still covers this graph
+    }
+    const int64_t t0 = ggml_time_us();
+    // the same ubatch, built at the depth the prompt reaches; only its tensor sizes are used
+    const uint32_t ob = kb->set_n_kv_plan(tb);
+    const uint32_t os = ks ? ks->set_n_kv_plan(ts) : 0;
+    ggml_cgraph * gs = model.build_graph(gparams);
+    if (gs && (mtp_hidden_source || mtp_feedback.active)) {
+        mtp_prefill_place(*res); // the same backend placement as the real graph, so the split matches
+    }
+    bool ok = gs != nullptr && ggml_backend_sched_reserve(sched.get(), gs);
+    kb->set_n_kv_plan(ob);
+    if (ks) {
+        ks->set_n_kv_plan(os);
+    }
+    res->reset();
+    ggml_backend_sched_reset(sched.get());
+    pp_plan_gen++;
+    if (!ok) {
+        pp_plan_off = true;
+        pp_plan_at  = UINT64_MAX;
+        LLAMA_LOG_WARN("%s: [PPLAN] sizing the prompt buffers for n_kv %u (swa %u) failed; per-ubatch planning from here\n",
+                __func__, tb, ts);
+        return false;
+    }
+    pp_plan_at   = pp_plan_gen;
+    pp_plan_base = tb;
+    pp_plan_swa  = ts;
+    pp_plan_rows = ubatch.n_tokens;
+    if (++pp_plan_count <= 4) {
+        LLAMA_LOG_INFO("%s: [PPLAN] prompt buffers planned for n_kv %u (swa %u, now %u / %u) at %u rows in %.1f ms\n",
+                __func__, tb, ts, cb, cs, ubatch.n_tokens, (ggml_time_us() - t0)/1000.0);
+    }
+    return true;
 }
 
 ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
@@ -12507,6 +12663,12 @@ void llama_set_decode_phase(llama_context * ctx, enum llama_decode_phase phase) 
 
 void llama_set_next_decode_phase(llama_context * ctx, enum llama_decode_phase phase) {
     ctx->set_next_decode_phase(phase);
+}
+
+void llama_set_next_prompt_rows(llama_context * ctx, int32_t n_rows_after) {
+    if (ctx) {
+        ctx->set_next_prompt_rows(n_rows_after);
+    }
 }
 
 void llama_set_decode_phase_async(llama_context * ctx, enum llama_decode_phase phase) {

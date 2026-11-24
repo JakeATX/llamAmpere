@@ -166,6 +166,8 @@ struct llama_context {
     bool prompt_warm_join();
     bool prompt_warm_running() const { return pp_warm_thread.joinable(); }
     void set_next_decode_phase(enum llama_decode_phase phase);
+    // fork PPLAN: one-shot count of the prompt rows that follow the next decode() in later calls (llama_set_next_prompt_rows)
+    void set_next_prompt_rows(int32_t n_rows_after);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
@@ -394,6 +396,12 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    // fork SAMPKEEP: see sampler_changed() in llama-context.cpp
+    void        sampler_changed();
+    std::string sampler_signature() const;
+    void        sampler_reserve_check();
+    bool        sampler_set_dirty = false;
+    std::string sampler_sig_reserved;
 
     // parse a `llama-mtp-vocab-v1` map and upload it to the head's device (throws on error)
     // the last `n_hot` entries become adaptive slots, see llama_draft_vocab_observe/refresh
@@ -449,6 +457,13 @@ private:
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+
+    // fork PPLAN: before a prompt ubatch whose KV keeps growing, size the compute buffers once for the depth the prompt
+    // reaches (this batch + the rows the caller says follow), so the later ubatches allocate without a re-plan
+    // (each re-plan waits for the device and re-runs the allocator: ~10-17 ms of idle card per ubatch). Returns true
+    // when it sized; the caller checks that the real graph then allocated without a re-plan.
+    bool prompt_plan(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_result * res,
+            const llm_graph_params & gparams);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -779,6 +794,20 @@ private:
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
+
+    // fork PPLAN state: every reserve and re-plan of the scheduler bumps pp_plan_gen; the plan made by prompt_plan()
+    // holds while pp_plan_gen == pp_plan_at and covers n_kv up to pp_plan_base / pp_plan_swa at pp_plan_rows rows
+    uint64_t pp_plan_gen   = 0;
+    uint64_t pp_plan_at    = UINT64_MAX;
+    uint32_t pp_plan_base  = 0;
+    uint32_t pp_plan_swa   = 0;
+    uint32_t pp_plan_rows  = 0;
+    int32_t  pp_plan_fails = 0;     // plans in a row that the real graph did not fit (topology differs): 2 turn it off
+    bool     pp_plan_off   = false;
+    bool     pp_hinted     = false; // the caller sent a prompt-rows hint at least once (only such contexts plan)
+    int32_t  next_prompt_rows = 0;  // one-shot hint for the next decode()
+    int32_t  call_prompt_rows = 0;  // the hint of the decode() in progress
+    uint32_t pp_plan_count = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

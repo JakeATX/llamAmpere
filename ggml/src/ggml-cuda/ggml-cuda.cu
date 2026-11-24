@@ -18574,7 +18574,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DEPTH_MIX:
             return ggml_cuda_depth_mix_supported(op);
         case GGML_OP_LOOP_GATE:
-            return ggml_cuda_loop_gate_supported(op);
+            return ggml_cuda_loop_gate_op_supported(op);
         case GGML_OP_LSA_PREFETCH:
             return true;
         case GGML_OP_MOE_OG_SLOTS:

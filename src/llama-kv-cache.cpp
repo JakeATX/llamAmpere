@@ -3486,6 +3486,25 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_bound(const slot_info_vec_t & sinfos, size_t i0, uint32_t extra) const {
+    const uint32_t n_pad = 256; // as get_n_kv()
+    uint32_t result = 0;
+    for (size_t i = i0; i < sinfos.size(); ++i) {
+        const auto & sinfo = sinfos[i];
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const auto & cells = v_cells[sinfo.strm[s]];
+            uint64_t top = cells.used_max_p1();
+            for (const uint32_t idx : sinfo.idxs[s]) {
+                top = std::max<uint64_t>(top, uint64_t(idx) + 1);
+            }
+            top += extra;
+            const uint64_t padded = std::max<uint64_t>(n_pad, (top + n_pad - 1) / n_pad * n_pad);
+            result = std::max<uint32_t>(result, (uint32_t) std::min<uint64_t>(cells.size(), padded));
+        }
+    }
+    return result;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_seqs_unq == 1) {
         return 1;
@@ -8064,6 +8083,19 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::n_kv_ahead(uint32_t extra) const {
+    if (ubatches.empty() || sinfos.empty() || i_cur >= sinfos.size()) {
+        return 0;
+    }
+    return kv->get_n_kv_bound(sinfos, i_cur, extra);
+}
+
+uint32_t llama_kv_cache_context::set_n_kv_plan(uint32_t v) {
+    const uint32_t old = (uint32_t) n_kv;
+    n_kv = (int32_t) v;
+    return old;
 }
 
 uint32_t llama_kv_cache_context::get_kv_size() const {
