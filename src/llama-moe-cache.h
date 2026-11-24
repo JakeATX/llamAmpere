@@ -55,6 +55,13 @@ public:
     // few-row CPU tier (LLAMA_MOE_CACHE_FEWROW_CPU): with it off, the CPU part of a prompt chunk stays on the CPU.
     void   set_op_offload(bool on);
 
+    // fork (INKCACHEUX): see llama-moe-cache-policy.h. window_end(): a decode step was submitted (GS8,
+    // LLAMA_MOE_CACHE_BOUNDARY=1; boundary() says whether it is on). request_end(): a request finished
+    // (LLAMA_MOE_CACHE_REQ_STATS line, LLAMA_MOE_CACHE_HEAT periodic save). Both are no-ops with the flags unset.
+    void   window_end();
+    bool   boundary() const;
+    void   request_end();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
