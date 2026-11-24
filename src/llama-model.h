@@ -1039,6 +1039,9 @@ struct llama_model {
     // Shared by all contexts: optional later read-ahead cannot reuse spent RAM.
     mutable std::atomic<size_t> prefetch_remaining{SIZE_MAX};
 
+    // fork (INKMISS): host expert arena / page-locking state (llama-ink-host.cpp), set only by LLAMA_INK_HOST_ARENA/_PIN
+    mutable std::shared_ptr<void> ink_host;
+
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 

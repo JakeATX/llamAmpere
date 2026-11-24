@@ -1,4 +1,5 @@
 #include "llama-ink-stream.h"
+#include "llama-ink-host.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -175,6 +176,7 @@ llama_ink_stream::llama_ink_stream(const llama_model & model, ggml_backend_t bac
         }
     }
 
+    direct_on = ink_stream_env("LLAMA_INK_STREAM_DIRECT", 0) != 0;
     n_workers = std::clamp(ink_stream_env("LLAMA_INK_STREAM_THREADS", 4), 1, 32);
     piece_max = (size_t) std::clamp(ink_stream_env("LLAMA_INK_STREAM_PIECE_MIB", 8), 1, 256) << 20;
     init_ok = true;
@@ -197,6 +199,10 @@ llama_ink_stream::~llama_ink_stream() {
 }
 
 void llama_ink_stream::free_pipeline() {
+    if (buf_zeros) {
+        ggml_backend_buffer_free(buf_zeros);
+        buf_zeros = nullptr;
+    }
     if (!threads.empty()) {
         {
             std::lock_guard<std::mutex> lk(mtx);
@@ -276,6 +282,44 @@ bool llama_ink_stream::prepare() {
         free_pipeline();
         init_ok = false; // do not retry on every prompt
         return false;
+    }
+    // fork (INKMISS, GS11): visits whose host experts are page-locked (LLAMA_INK_HOST_PIN) skip the staging memcpy and the
+    // workers; in the arena (LLAMA_INK_HOST_ARENA) a visit's tensors sit at its slot offsets with zeroed tails: one copy
+    if (direct_on) {
+        size_t max_tail = 0;
+        for (int il : order) {
+            visit & v = visits[il];
+            bool pinned = true;
+            for (size_t i = 0; i < v.host.size(); ++i) {
+                pinned = pinned && llama_ink_host_pinned(v.host[i]->data, ggml_nbytes(v.host[i]));
+                max_tail = std::max(max_tail, v.tails[i]);
+            }
+            v.direct = pinned;
+            v.direct_span = 0;
+            const size_t span = pinned ? llama_ink_host_layer_span(v.host[0]->data, buft_dev) : 0;
+            bool same = span > 0 && v.offs[0] == 0 && span == v.offs.back() + ggml_nbytes(v.host.back()) + v.tails.back() &&
+                    span <= slot_size && llama_ink_host_pinned(v.host[0]->data, span);
+            for (size_t i = 0; i < v.host.size() && same; ++i) {
+                same = (size_t) ((const char *) v.host[i]->data - (const char *) v.host[0]->data) == v.offs[i];
+            }
+            v.direct_span = same ? span : 0;
+            n_direct      += v.direct ? 1 : 0;
+            n_direct_span += v.direct_span ? 1 : 0;
+        }
+        if (n_direct > 0) {
+            buf_zeros = ggml_backend_buft_alloc_buffer(buft_host, std::max<size_t>(max_tail, 4096));
+            if (buf_zeros) {
+                memset(ggml_backend_buffer_get_base(buf_zeros), 0, ggml_backend_buffer_get_size(buf_zeros));
+            } else {
+                for (int il : order) {
+                    visits[il].direct = false;
+                    visits[il].direct_span = 0;
+                }
+                n_direct = n_direct_span = 0;
+            }
+        }
+        LLAMA_LOG_WARN("%s: [INKSTREAM] direct uploads (LLAMA_INK_STREAM_DIRECT): %zu of %zu visits from page-locked experts, "
+                "%zu of them as one copy\n", __func__, n_direct, order.size(), n_direct_span);
     }
     stop = false;
     n_busy = 0;
@@ -371,6 +415,37 @@ void llama_ink_stream::issue(int il, ggml_backend_t backend) {
         ggml_backend_event_wait(backend_copy, ev_free[s]);
     }
     pieces.clear();
+    if (v.direct) {
+        // fork (INKMISS, GS11): page-locked source, so these copies are DMA and return at once: no workers, no staging
+        size_t bytes = 0;
+        {
+            std::lock_guard<std::mutex> ls(mtx_stream);
+            if (v.direct_span > 0) {
+                ggml_backend_tensor_set_async(backend_copy, raw[s], v.host[0]->data, 0, v.direct_span);
+                bytes = v.direct_span;
+            } else {
+                const char * zeros = (const char *) ggml_backend_buffer_get_base(buf_zeros);
+                for (size_t i = 0; i < v.host.size(); ++i) {
+                    const size_t nb = ggml_nbytes(v.host[i]);
+                    ggml_backend_tensor_set_async(backend_copy, raw[s], v.host[i]->data, v.offs[i], nb);
+                    if (v.tails[i] > 0) {
+                        ggml_backend_tensor_set_async(backend_copy, raw[s], zeros, v.offs[i] + nb, v.tails[i]);
+                    }
+                    bytes += nb + v.tails[i];
+                }
+            }
+            ggml_backend_event_record(ev_ready[s], backend_copy);
+        }
+        req_slot = s;
+        pieces_done = 0;
+        next_piece.store(0);
+        ++req_gen;
+        done_gen = req_gen; // nothing for the workers: a worker that wakes sees the request done
+        issued[s] = il;
+        st.uploads++;
+        st.bytes_h2d += bytes;
+        return;
+    }
     static const std::vector<char> zeros(64u << 10, 0);
     for (size_t i = 0; i < v.host.size(); ++i) {
         const ggml_tensor * t = v.host[i];

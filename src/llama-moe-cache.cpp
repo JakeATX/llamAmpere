@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -52,6 +53,20 @@ struct moe_cache_lru {
     std::vector<int32_t> uniq;  // the distinct selected experts
     std::vector<int32_t> misses;
     std::vector<uint64_t> token_zero; // [n_tokens] zero slots used by each token
+
+    // fork (INKMISS, R3 staged admission; LLAMA_MOE_CACHE_ROUND=1, off by default). Once the cache is full, a miss of a
+    // decode ubatch is uploaded into one of n_stage staging slots (after the zero slots) and computed from there, unless
+    // it is admitted: its CRF beats the decayed CRF of its victim by admit_margin, and the window's admission budget is
+    // not spent. A staged expert does not enter the LRU and evicts nothing. admit_budget < 0: no admission control.
+    int32_t n_stage      = 0;
+    int32_t stage_base   = 0;     // first staging slot (n_slots + n_zero)
+    float   admit_margin = 0.0f;  // S2-SWAP-POLICY pair swaps (LLAMA_MOE_CACHE_PAIR): hysteresis between candidate and victim
+    int32_t admit_budget = -1;
+    bool    declined_budget = false; // a miss beat its victim but was staged because the budget was spent
+    std::vector<int32_t> declined;   // their keys (S2-NOWAIT promotes them in the background)
+    // fork (INKMISS, S2-NOWAIT): busy[s] == busy_gen: slot s is being written on the copy stream, it is never a victim
+    std::vector<uint32_t> busy;
+    uint32_t busy_gen = 0;
 
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         GGML_ASSERT(n_class == (int) std::log2(1.0f/(1.0f - std::exp2(-1.0f/crf_half_life))) + 1);
@@ -139,10 +154,14 @@ struct moe_cache_lru {
         return seen[key_expert(key)] == seen_gen;
     }
 
+    bool is_busy(int32_t s) const {
+        return busy_gen != 0 && busy[s] == busy_gen;
+    }
+
     // the least recently used slot of list c that this plan() does not select, -1 if none
     int32_t candidate(int c, int32_t il) const {
         for (int32_t s = head[c]; s >= 0; s = next[s]) {
-            if (!is_selected(il, key_of[s])) {
+            if (!is_selected(il, key_of[s]) && !is_busy(s)) {
                 return s;
             }
         }
@@ -289,8 +308,29 @@ struct moe_cache_lru {
         // fill the misses in expert order: victim() takes unused slots, and slots filled by one plan(), in list order,
         // so consecutive experts often get consecutive slots and one upload
         std::sort(misses.begin(), misses.end());
+        int32_t n_staged = 0;
         for (int32_t e : misses) {
             const int32_t s = victim(il);
+            if (admit_budget >= 0 && n_filled == n_slots) {
+                // fork (INKMISS, R3): admit, or stage while staging slots last
+                const int32_t key = make_key(il, e);
+                const int32_t old = key_of[s];
+                const bool better = old < 0 || crf[key] > decayed_crf(key_layer(old), old) + admit_margin;
+                const bool admit  = better && admit_budget > 0;
+                if (!admit && n_staged < n_stage) {
+                    if (better) {
+                        declined_budget = true;
+                        declined.push_back(key);
+                    }
+                    slots[e] = stage_base + n_staged;
+                    fills.push_back({ e, stage_base + n_staged });
+                    n_staged++;
+                    continue;
+                }
+                if (admit) {
+                    admit_budget--;
+                }
+            }
             if (key_of[s] >= 0) {
                 slot_map[key_layer(key_of[s])][key_expert(key_of[s])] = empty;
             } else {
@@ -473,6 +513,32 @@ struct llama_moe_cache::impl {
     std::vector<uint8_t> round_backlog;        // [group]
     size_t   round_n = 0, round_n_swaps = 0, round_n_backlog = 0;
 
+    // fork (INKMISS, R3): LLAMA_MOE_CACHE_ROUND=1 is staged admission (see moe_cache_lru::n_stage): decode misses are
+    // uploaded as before, on the spot, but only the ones that beat their victim enter the cache, at most
+    // LLAMA_MOE_CACHE_ROUND_SWAPS per window (x LLAMA_MOE_CACHE_ROUND_BOOST after a window that ran out); the others go
+    // to LLAMA_MOE_CACHE_ROUND_STAGE (default 2 x n_expert_used) staging slots. No CPU part, so no extra graph splits
+    // and no CPU expert compute (the old design, 4.8 vs ~29 tok/s, is LLAMA_MOE_CACHE_ROUND=2: round_on below).
+    bool     stage_on = false;
+    int32_t  n_stage  = 0;
+    float    pair_margin = 0.0f;                // S2-SWAP-POLICY: LLAMA_MOE_CACHE_PAIR=<CRF margin>
+    int32_t  stage_first_il = -1;               // a window starts at the lookup of this layer
+
+    // fork (INKMISS, S2-NOWAIT; LLAMA_MOE_CACHE_NOWAIT=1 with ROUND=1, off by default): the misses a window staged only
+    // because its budget was spent are uploaded into the cache at the next window start on a copy stream; the slots
+    // being written are never victims, and a lookup that selects one makes the compute stream wait for the copy event
+    // (a device-side wait, the host never blocks; one batch in flight, synchronized at the following window start).
+    // Fast with page-locked host experts (LLAMA_INK_HOST_PIN): from file pages each copy is staged by the driver.
+    bool     nowait_on = false;
+    ggml_backend_t       nw_backend = nullptr;  // copy stream on the cache's device
+    ggml_backend_event_t nw_event   = nullptr;
+    bool     nw_pending = false;
+    size_t   nw_n_batches = 0, nw_n_swaps = 0, nw_n_waits = 0;
+    size_t   stage_n_staged = 0, stage_n_admitted = 0;
+
+    // fork (INKMISS, S2-SWAP-POLICY seeding): LLAMA_MOE_CACHE_SEED=<file> fills the empty cache at boot with the hottest
+    // experts of a saved profile; LLAMA_MOE_CACHE_SEED_SAVE=<file> writes the decayed use counts at exit.
+    std::string seed_save;
+
     // fork (SURGE-cache, MCDET; LLAMA_MOE_CACHE_DET=1, off by default): no miss is computed on the CPU (its last bits
     // differ from the GPU's), so a request's output does not depend on what earlier requests left in the cache.
     bool     det_on = false;
@@ -588,11 +654,25 @@ struct llama_moe_cache::impl {
         // one extra slot at the end, CUDA MMQ can read past the last expert
         {
             const char * e = getenv("LLAMA_MOE_CACHE_ROUND");
-            round_on = e && atoi(e) != 0;
+            const int round_mode = e ? atoi(e) : 0;
+            round_on = round_mode == 2;                 // fork (INKMISS): the old CPU-computed design
+            stage_on = round_mode != 0 && round_mode != 2; // 1 (any other non-zero value too)
             const char * d = getenv("LLAMA_MOE_CACHE_DET");
             det_on = d && atoi(d) != 0;
             if (det_on) {
                 round_on = false;
+            }
+            if (stage_on) {
+                const char * st = getenv("LLAMA_MOE_CACHE_ROUND_STAGE");
+                n_stage = std::clamp(st && st[0] ? atoi(st) : 2*n_expert_used, n_expert_used, 64*n_expert_used);
+                if (const char * pm = getenv("LLAMA_MOE_CACHE_PAIR"); pm && pm[0]) {
+                    pair_margin = std::max(0.0f, (float) atof(pm));
+                }
+                const char * nw = getenv("LLAMA_MOE_CACHE_NOWAIT");
+                nowait_on = nw && atoi(nw) != 0;
+            }
+            if (const char * ss = getenv("LLAMA_MOE_CACHE_SEED_SAVE"); ss && ss[0]) {
+                seed_save = ss;
             }
             if (const char * w = getenv("LLAMA_MOE_CACHE_ROUND_SWAPS"); w && w[0]) {
                 round_swaps = std::max(1, atoi(w));
@@ -602,6 +682,11 @@ struct llama_moe_cache::impl {
             }
         }
         n_zero = (cpu_share > 0.0f && !det_on) || round_on || fewrow_r > 0 ? std::min<int32_t>(n_expert_used, 64) : 0; // merge: cache + prompt zero-slot users
+        if (stage_on) {
+            LLAMA_LOG_WARN("%s: [MCROUND] staged admission on: %d staging slots per group, %d admissions per window (x%d after "
+                    "a window that ran out), pair margin %.2f%s\n", __func__, n_stage, round_swaps, round_boost, pair_margin,
+                    nowait_on ? ", background promotion on a copy stream (NOWAIT)" : "");
+        }
         if (round_on) {
             round_cand.assign(groups.size(), {});
             round_backlog.assign(groups.size(), 0);
@@ -613,7 +698,7 @@ struct llama_moe_cache::impl {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
             for (const ggml_tensor * t : g.ref) {
-                res += GGML_PAD((t->nb[1]*t->ne[1])*(n_slots + n_zero + 1), alignment);
+                res += GGML_PAD((t->nb[1]*t->ne[1])*(n_slots + n_zero + n_stage + 1), alignment);
             }
             return res;
         };
@@ -673,6 +758,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
+            init_stage(g);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(n_zero > 0 ? 3 : 1); // slot maps and CPU map
         }
@@ -710,7 +796,7 @@ struct llama_moe_cache::impl {
             }
             ggml_context * ctx = devices[g.id].ctx.get();
             for (const ggml_tensor * t : g.ref) {
-                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + n_zero + 1);
+                ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + n_zero + n_stage + 1);
                 GGML_ASSERT(bank->nb[2] == t->nb[1] * t->ne[1]);
                 ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                 g.banks.push_back(bank);
@@ -721,7 +807,7 @@ struct llama_moe_cache::impl {
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size() && canon[il] == il; ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
-                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
+                    ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero + n_stage, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
                 }
@@ -740,6 +826,10 @@ struct llama_moe_cache::impl {
                 }
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
+        }
+
+        for (size_t il = 0; stage_on && il < layers.size() && stage_first_il < 0; ++il) {
+            stage_first_il = layers[il].ig >= 0 ? (int32_t) il : -1; // fork (INKMISS, R3): window start
         }
 
         // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
@@ -768,6 +858,9 @@ struct llama_moe_cache::impl {
                         }
                     }
                 }
+            }
+            if (const char * sp = getenv("LLAMA_MOE_CACHE_SEED"); sp && sp[0]) {
+                seed_load(sp);
             }
         }
 
@@ -806,6 +899,259 @@ struct llama_moe_cache::impl {
 
     ggml_backend_t backend(int32_t il) const {
         return devices[groups[layers[il].ig].id].backend;
+    }
+
+    // fork (INKMISS): staging and admission state of a group's LRU (after every lru.init)
+    void init_stage(group & g) {
+        if (!stage_on) {
+            return;
+        }
+        g.lru.n_stage      = n_stage;
+        g.lru.stage_base   = g.n_slots + n_zero;
+        g.lru.admit_margin = pair_margin;
+        g.lru.admit_budget = round_swaps;
+        g.lru.declined_budget = false;
+        g.lru.declined.clear();
+        if (nowait_on) {
+            g.lru.busy.assign(g.n_slots, 0);
+            g.lru.busy_gen = 0;
+        }
+    }
+
+    // fork (INKMISS, S2-NOWAIT): the background batch in flight is done (host wait; it was queued a window ago)
+    void nowait_drain() {
+        if (!nw_pending) {
+            return;
+        }
+        ggml_backend_event_synchronize(nw_event);
+        nw_pending = false;
+        for (group & g : groups) {
+            if (!g.lru.busy.empty() && ++g.lru.busy_gen == 0) {
+                std::fill(g.lru.busy.begin(), g.lru.busy.end(), 0);
+                g.lru.busy_gen = 1;
+            }
+        }
+    }
+
+    bool nowait_init() {
+        if (nw_backend) {
+            return true;
+        }
+        int32_t n_dev = 0;
+        for (const device & d : devices) {
+            n_dev += d.ctx ? 1 : 0;
+        }
+        ggml_backend_dev_t dev = n_dev == 1 ? ggml_backend_get_device(devices[groups[0].id].backend) : nullptr;
+        ggml_backend_dev_props props;
+        if (dev) {
+            ggml_backend_dev_get_props(dev, &props);
+        }
+        if (!dev || !props.caps.events || !props.caps.async) {
+            LLAMA_LOG_WARN("%s: [MCROUND] NOWAIT needs one device with events and async copies: off\n", __func__);
+            nowait_on = false;
+            return false;
+        }
+        nw_backend = ggml_backend_dev_init(dev, nullptr);
+        nw_event   = nw_backend ? ggml_backend_event_new(dev) : nullptr;
+        if (!nw_event) {
+            LLAMA_LOG_WARN("%s: [MCROUND] NOWAIT: no copy stream or event: off\n", __func__);
+            if (nw_backend) {
+                ggml_backend_free(nw_backend);
+                nw_backend = nullptr;
+            }
+            nowait_on = false;
+            return false;
+        }
+        return true;
+    }
+
+    // fork (INKMISS, R3 + S2-NOWAIT): a new window: reset each group's budget (boosted after a window that ran out) and
+    // promote in the background what the last window had to stage for lack of budget. Called right after copy() has
+    // synchronized the compute stream, so no queued kernel still reads a victim slot.
+    void stage_window() {
+        nowait_drain();
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            moe_cache_lru & lru = g.lru;
+            const bool backlog = lru.declined_budget;
+            lru.admit_budget    = backlog ? round_swaps*round_boost : round_swaps;
+            lru.declined_budget = false;
+            if (!nowait_on || g.n_slots == 0 || lru.declined.empty() || is_suspended || !nowait_init()) {
+                lru.declined.clear();
+                continue;
+            }
+            auto crf_now = [&](int32_t key) { return lru.decayed_crf(lru.key_layer(key), key); };
+            std::vector<std::pair<float, int32_t>> rank;
+            std::sort(lru.declined.begin(), lru.declined.end());
+            lru.declined.erase(std::unique(lru.declined.begin(), lru.declined.end()), lru.declined.end());
+            for (int32_t key : lru.declined) {
+                if (lru.slot_map[lru.key_layer(key)][lru.key_expert(key)] >= lru.n_slots) {
+                    rank.push_back({ crf_now(key), key });
+                }
+            }
+            lru.declined.clear();
+            std::sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            if (++lru.seen_gen == 0) { // nothing is selected now
+                std::fill(lru.seen.begin(), lru.seen.end(), 0);
+                lru.seen_gen = 1;
+            }
+            if (++lru.busy_gen == 0) {
+                std::fill(lru.busy.begin(), lru.busy.end(), 0);
+                lru.busy_gen = 1;
+            }
+            int32_t n_swap = 0;
+            for (size_t i = 0; i < rank.size() && n_swap < round_swaps; ++i) {
+                const int32_t key = rank[i].second;
+                const int32_t s   = lru.victim(lru.key_layer(key));
+                const int32_t old = lru.key_of[s];
+                if (old >= 0 && crf_now(old) + pair_margin >= rank[i].first) {
+                    break; // the coldest slot is as hot: so is every later candidate's victim
+                }
+                if (old >= 0) {
+                    lru.slot_map[lru.key_layer(old)][lru.key_expert(old)] = lru.empty;
+                } else {
+                    lru.n_filled++;
+                }
+                const int32_t il = lru.key_layer(key);
+                const int32_t e  = lru.key_expert(key);
+                lru.key_of[s]       = key;
+                lru.slot_map[il][e] = s;
+                lru.move(s, lru.class_of(key));
+                lru.busy[s] = lru.busy_gen;
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w    = l.experts[ip];
+                    ggml_tensor       * bank = g.banks[ip];
+                    ggml_backend_tensor_set_async(nw_backend, bank, (const uint8_t *) w->data + e*w->nb[2], s*bank->nb[2], bank->nb[2]);
+                    stats_small.bytes += bank->nb[2];
+                }
+                n_swap++;
+            }
+            if (n_swap > 0) {
+                ggml_backend_event_record(nw_event, nw_backend);
+                nw_pending = true;
+                nw_n_batches++;
+                nw_n_swaps += n_swap;
+            }
+        }
+    }
+
+    // fork (INKMISS, S2-SWAP-POLICY seeding): profile = "MCS1", u32 n_layer, u32 n_records, then (i32 layer, i32 expert,
+    // f32 decayed use count) per record
+    void seed_write(const std::string & path) const {
+        FILE * f = fopen(path.c_str(), "wb");
+        if (!f) {
+            LLAMA_LOG_WARN("%s: [MCSEED] cannot write %s\n", __func__, path.c_str());
+            return;
+        }
+        struct rec { int32_t il, e; float v; };
+        std::vector<rec> recs;
+        for (const group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            for (int32_t il : g.layers) {
+                if (canon[il] != il) {
+                    continue;
+                }
+                for (int32_t e = 0; e < g.lru.n_expert; ++e) {
+                    const int32_t key = g.lru.make_key(il, e);
+                    if (g.lru.last_use[key] >= 0) {
+                        const float v = g.lru.decayed_crf(il, key);
+                        if (v > 0.0f) {
+                            recs.push_back({ il, e, v });
+                        }
+                    }
+                }
+            }
+        }
+        const uint32_t hdr[2] = { (uint32_t) layers.size(), (uint32_t) recs.size() };
+        fwrite("MCS1", 1, 4, f);
+        fwrite(hdr, sizeof(uint32_t), 2, f);
+        for (const rec & r : recs) {
+            fwrite(&r.il, sizeof(int32_t), 1, f);
+            fwrite(&r.e,  sizeof(int32_t), 1, f);
+            fwrite(&r.v,  sizeof(float),   1, f);
+        }
+        fclose(f);
+        LLAMA_LOG_INFO("%s: [MCSEED] %zu expert use counts written to %s\n", __func__, recs.size(), path.c_str());
+    }
+
+    void seed_load(const char * path) {
+        FILE * f = fopen(path, "rb");
+        if (!f) {
+            LLAMA_LOG_WARN("%s: [MCSEED] no profile at %s, the cache starts empty\n", __func__, path);
+            return;
+        }
+        char magic[4] = {};
+        uint32_t hdr[2] = {};
+        bool ok = fread(magic, 1, 4, f) == 4 && memcmp(magic, "MCS1", 4) == 0 && fread(hdr, sizeof(uint32_t), 2, f) == 2 &&
+                hdr[0] == (uint32_t) layers.size();
+        size_t n_seeded = 0;
+        for (uint32_t i = 0; ok && i < hdr[1]; ++i) {
+            int32_t il = -1, e = -1;
+            float v = 0.0f;
+            ok = fread(&il, sizeof(il), 1, f) == 1 && fread(&e, sizeof(e), 1, f) == 1 && fread(&v, sizeof(v), 1, f) == 1;
+            if (!ok || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || canon[il] != il || !(v > 0.0f)) {
+                continue;
+            }
+            group & g = groups[layers[il].ig];
+            if (g.n_slots == 0 || e < 0 || e >= g.lru.n_expert) {
+                continue;
+            }
+            const int32_t key = g.lru.make_key(il, e);
+            g.lru.crf[key]      = v;
+            g.lru.last_use[key] = 0;
+        }
+        fclose(f);
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: [MCSEED] %s is not a profile of this model, ignored\n", __func__, path);
+            for (group & g : groups) {
+                std::fill(g.lru.crf.begin(), g.lru.crf.end(), 0.0f);
+                std::fill(g.lru.last_use.begin(), g.lru.last_use.end(), -1);
+            }
+            return;
+        }
+        // the hottest keys of each group fill its slots, in key order (consecutive experts in consecutive slots)
+        for (group & g : groups) {
+            moe_cache_lru & lru = g.lru;
+            if (g.n_slots == 0 || lru.n_filled > 0) {
+                continue;
+            }
+            std::vector<std::pair<float, int32_t>> rank;
+            for (int32_t il : g.layers) {
+                for (int32_t e = 0; canon[il] == il && e < lru.n_expert; ++e) {
+                    const int32_t key = lru.make_key(il, e);
+                    if (lru.last_use[key] == 0) {
+                        rank.push_back({ lru.crf[key], key });
+                    }
+                }
+            }
+            std::sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            rank.resize(std::min(rank.size(), (size_t) g.n_slots));
+            std::sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
+            for (size_t k = 0; k < rank.size(); ++k) {
+                const int32_t key = rank[k].second;
+                const int32_t s   = (int32_t) k;
+                lru.crf[key]  = std::max(1.0f, lru.crf[key]); // a cached key has class >= 0
+                lru.key_of[s] = key;
+                lru.slot_map[lru.key_layer(key)][lru.key_expert(key)] = s;
+                lru.move(s, lru.class_of(key));
+                lru.n_filled++;
+                const layer & l = layers[lru.key_layer(key)];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w    = l.experts[ip];
+                    ggml_tensor       * bank = g.banks[ip];
+                    ggml_backend_tensor_set(bank, (const uint8_t *) w->data + lru.key_expert(key)*w->nb[2], s*bank->nb[2], bank->nb[2]);
+                }
+            }
+            n_seeded += rank.size();
+        }
+        LLAMA_LOG_WARN("%s: [MCSEED] %zu experts seeded from %s (LLAMA_MOE_CACHE_SEED)\n", __func__, n_seeded, path);
     }
 
     // trace format, little endian: "MCT1", then u32 n_layer, n_expert_used, n_group
@@ -847,6 +1193,15 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        if (!seed_save.empty()) {
+            seed_write(seed_save);
+        }
+        if (nw_backend) {
+            nowait_drain();
+            ggml_backend_synchronize(nw_backend);
+            ggml_backend_event_free(nw_event);
+            ggml_backend_free(nw_backend);
+        }
         log_stats();
         if (trace != nullptr) {
             fclose(trace);
@@ -909,6 +1264,7 @@ struct llama_moe_cache::impl {
         if (is_suspended) {
             return 0;
         }
+        nowait_drain(); // fork (INKMISS): a large batch reads the banks without the lookup's event wait
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -996,6 +1352,15 @@ struct llama_moe_cache::impl {
             }
             round_prev_il = il;
         }
+        // fork (INKMISS, R3): same windows for staged admission; only decode ubatches (<= 8 rows) are admission-controlled
+        const bool staged = stage_on && sel->src[0]->ne[1] <= 8;
+        if (stage_on && il == stage_first_il) {
+            stage_window(); // the first cached layer in graph order (looped models revisit lower layers mid-token)
+        }
+        const int32_t budget_keep = g.lru.admit_budget;
+        if (stage_on && !staged) {
+            g.lru.admit_budget = -1;
+        }
 
         // part of the misses is computed on the CPU once the cache is full, the carry keeps the share right on average
         // (round admission: all of them, as far as zero slots allow; MCDET: none)
@@ -1012,6 +1377,30 @@ struct llama_moe_cache::impl {
                 g.lru.n_filled == g.lru.n_slots ? fewrow_r : 0;
         if (!g.lru.plan(ci, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit, ci == il, few_rows)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+        if (stage_on) {
+            if (staged) {
+                for (const auto & f : fills) {
+                    const bool st = f.slot >= g.lru.stage_base;
+                    stage_n_staged   += st ? 1 : 0;
+                    stage_n_admitted += st ? 0 : 1;
+                }
+            } else {
+                g.lru.admit_budget = budget_keep;
+            }
+            // fork (INKMISS, S2-NOWAIT): a selected expert whose slot the copy stream is still writing: the compute stream
+            // waits for the batch (on the device)
+            if (nw_pending) {
+                const int32_t * slots = g.lru.slot_map[ci];
+                for (int32_t e : g.lru.uniq) {
+                    const int32_t sl = slots[e];
+                    if (sl < g.lru.n_slots && g.lru.is_busy(sl)) {
+                        ggml_backend_event_wait(backend, nw_event);
+                        nw_n_waits++;
+                        break;
+                    }
+                }
+            }
         }
         if (has_cpu) {
             int32_t * cpu_map = (int32_t *) l.cpu_map->data;
@@ -1099,7 +1488,7 @@ struct llama_moe_cache::impl {
                 const int32_t key = rank[i].second;
                 const int32_t s   = lru.victim(lru.key_layer(key));
                 const int32_t old = lru.key_of[s];
-                if (old >= 0 && crf_now(old) >= rank[i].first) {
+                if (old >= 0 && crf_now(old) + pair_margin >= rank[i].first) {
                     break; // the coldest cached expert is at least as hot: so is every later candidate's victim
                 }
                 if (old >= 0) {
@@ -1143,6 +1532,7 @@ struct llama_moe_cache::impl {
         if (is_suspended) {
             return 0;
         }
+        nowait_drain(); // fork (INKMISS): no background copy into banks about to be freed
         size_t freed = 0;
         for (device & d : devices) {
             if (!d.buf || !d.ctx) {
@@ -1164,7 +1554,7 @@ struct llama_moe_cache::impl {
         const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
         size_t res = 0;
         for (const ggml_tensor * t : g.ref) {
-            res += GGML_PAD((t->nb[1]*t->ne[1])*(n + n_zero + 1), alignment);
+            res += GGML_PAD((t->nb[1]*t->ne[1])*(n + n_zero + n_stage + 1), alignment);
         }
         return res;
     }
@@ -1186,6 +1576,7 @@ struct llama_moe_cache::impl {
         if (!is_suspended || (n_zero > 0 && !round_on && !(fewrow_r > 0 && cpu_share == 0.0f)) || trace != nullptr || groups.empty()) {
             return false;
         }
+        nowait_drain();
         int32_t n_dev = 0;
         for (const device & d : devices) {
             n_dev += d.ctx ? 1 : 0;
@@ -1266,6 +1657,7 @@ struct llama_moe_cache::impl {
                 }
             }
             g.n_slots = want[ig];
+            init_stage(g); // fork (INKMISS): the staging slots follow the new slot count
             if (round_on) {
                 round_cand[ig].clear(); // the candidates' slot state was rebuilt
                 round_backlog[ig] = 0;
@@ -1296,7 +1688,7 @@ struct llama_moe_cache::impl {
                 }
                 g.banks.clear();
                 for (const ggml_tensor * t : g.ref) {
-                    ggml_tensor * bank = ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], g.n_slots + n_zero + 1);
+                    ggml_tensor * bank = ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], g.n_slots + n_zero + n_stage + 1);
                     GGML_ASSERT(bank->nb[2] == t->nb[1] * t->ne[1]);
                     ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
                     g.banks.push_back(bank);
@@ -1305,7 +1697,7 @@ struct llama_moe_cache::impl {
                     const layer & l = layers[il];
                     for (size_t ip = 0; ip < l.experts.size() && canon[il] == il; ++ip) {
                         ggml_tensor * bank   = g.banks[ip];
-                        ggml_tensor * cached = ggml_view_3d(ctx.get(), bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
+                        ggml_tensor * cached = ggml_view_3d(ctx.get(), bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero + n_stage, bank->nb[1], bank->nb[2], 0);
                         ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
                         bindings[l.experts[ip]].cached = cached;
                     }
@@ -1390,6 +1782,10 @@ struct llama_moe_cache::impl {
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
+        if (stage_on) {
+            LLAMA_LOG_INFO("llama_moe_cache: [MCROUND] staged admission: %zu decode misses admitted, %zu staged; NOWAIT %zu batches, "
+                "%zu background swaps, %zu device waits\n", stage_n_admitted, stage_n_staged, nw_n_batches, nw_n_swaps, nw_n_waits);
+        }
         if (round_n > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: [MCROUND] %zu rounds, %zu swaps (%.2f per round), %zu rounds under a backlog\n",
                 round_n, round_n_swaps, (double) round_n_swaps/round_n, round_n_backlog);
