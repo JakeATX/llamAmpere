@@ -211,6 +211,9 @@ llama_sampler * common_reasoning_tracker_init(const struct llama_model * model, 
 // chain and force it. Before a move the caller must drop any backend sampler of the sequence (llama_set_sampler
 // nullptr): the chain is replaced by a CPU copy. true when forcing started
 bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler ** tracker);
+
+// after common_sampler_reasoning_close: keep the think block closed (its one-token start tag is banned from then on)
+bool common_sampler_reasoning_block_reopen(struct common_sampler * gsmpl);
 // an end-of-generation token sampled inside an open think block would end the reply with no answer: close the think
 // block instead (same rules as common_sampler_reasoning_close) and return the token to emit in its place, which the
 // chain has accepted; LLAMA_TOKEN_NULL when the think block is not open

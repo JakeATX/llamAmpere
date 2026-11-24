@@ -50,3 +50,7 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);
+
+// Once the sampler is DONE, ban one-token start sequences so the think block cannot be re-opened.
+// Returns true if the sampler exists.
+bool common_reasoning_budget_block_reopen(struct llama_sampler * smpl);

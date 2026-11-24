@@ -1792,6 +1792,10 @@ bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler
     return true;
 }
 
+bool common_sampler_reasoning_block_reopen(struct common_sampler * gsmpl) {
+    return gsmpl && common_reasoning_budget_block_reopen(gsmpl->rbudget);
+}
+
 llama_token common_sampler_reasoning_rescue_eog(struct common_sampler * gsmpl, llama_sampler ** tracker) {
     if (!gsmpl || gsmpl->params.reasoning_budget_forced.empty()) {
         return LLAMA_TOKEN_NULL;

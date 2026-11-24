@@ -187,6 +187,15 @@ static bool server_copy_inplace() {
     return v;
 }
 
+// LLAMA_SERVER_RESERVE_NO_REOPEN=1 (default off): after the answer reserve closes the think block it stays closed.
+static bool server_reserve_no_reopen() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SERVER_RESERVE_NO_REOPEN");
+        return e != nullptr && atoi(e) > 0;
+    }();
+    return v;
+}
+
 // NaN guard (LLAMA_SERVER_NAN_GUARD=0 turns it off).
 // A NaN or +inf logit on the sampled row means the forward pass produced garbage; sampling from it
 // gives junk tokens and the slot's cached state would poison later turns. O(1) per token: only the sampled candidate
@@ -4167,6 +4176,12 @@ private:
                     if (common_sampler_reasoning_close(slot.smpl.get(), &tracker)) {
                         SLT_INF(slot, "answer reserve: closing the think block, n_gen = %d, left = %d, reserve = %d\n",
                                 (int) slot.stats.n_gen, left, slot.answer_reserve);
+                        // opt-in (LLAMA_SERVER_RESERVE_NO_REOPEN=1): a model that re-opens the think block right
+                        // after this close gets closed again and again (open/close loop, then the repeat stop ends
+                        // the reply with no answer). Ban the start tag from here so the answer gets written
+                        if (server_reserve_no_reopen() && common_sampler_reasoning_block_reopen(slot.smpl.get())) {
+                            SLT_INF(slot, "%s", "answer reserve: think block stays closed (no re-open)\n");
+                        }
                     }
                     slot.think_tracker.reset(tracker);
                 }
