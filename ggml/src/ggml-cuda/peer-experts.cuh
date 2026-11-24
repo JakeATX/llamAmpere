@@ -44,3 +44,17 @@ bool     ggml_backend_cuda_peer_wait(ggml_backend_t backend, ggml_cuda_peer_mbox
         ggml_tensor * dst, uint32_t seq, uint64_t timeout_ns);
 uint32_t ggml_backend_cuda_peer_status(const ggml_cuda_peer_mbox * mb, int slot, int dir);
 void     ggml_backend_cuda_peer_abort(ggml_cuda_peer_mbox * mb, uint32_t value);
+
+// Copy hook (GGML_PEER_EXPERTS llama tier, off until a caller enables it): a cross-card copy of a small contiguous
+// F32/I32 tensor between two cards without peer access goes through a per-pair mailbox ring instead of a driver-staged
+// cudaMemcpyPeerAsync: post on the src stream, bounded wait on the dst stream, so neither side waits on the host. A
+// slot is reused only after the dst stream's wait on it is done (one event per slot). Called from
+// ggml_backend_cuda_cpy_tensor_async; false = not taken (the caller copies as before).
+// "ggml_backend_cuda_peer_copy_enable": turn the hook on/off (process-wide)
+typedef void (*ggml_cuda_peer_copy_enable_t)(bool on);
+// "ggml_backend_cuda_peer_copy_failures": waits of the hook that timed out or were aborted so far (read after a sync)
+typedef uint64_t (*ggml_cuda_peer_copy_failures_t)(void);
+void     ggml_backend_cuda_peer_copy_enable(bool on);
+uint64_t ggml_backend_cuda_peer_copy_failures(void);
+bool     ggml_cuda_peer_copy_on(void);
+bool     ggml_cuda_peer_copy(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst);

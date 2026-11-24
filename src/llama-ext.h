@@ -79,6 +79,10 @@ LLAMA_API bool    llama_split_overlap_init(struct llama_context * ctx);
 LLAMA_API int32_t llama_split_overlap_decode(struct llama_context * ctx, struct llama_batch batch, int32_t slot);
 LLAMA_API bool    llama_split_overlap_wait(struct llama_context * ctx, int32_t slot);
 LLAMA_API float * llama_split_overlap_logits_ith(struct llama_context * ctx, int32_t slot, int32_t i);
+// verify windows inside one llama_decode (after a successful init): a single-sequence batch longer than n_rows runs
+// as ubatches of at most n_rows rows, pipelined over the cards, and llama_get_logits_ith(i) waits only for the
+// window holding row i (the last window's read synchronizes fully). 0 = off. false if split overlap is not on.
+LLAMA_API bool    llama_split_overlap_set_window(struct llama_context * ctx, int32_t n_rows);
 
 //
 // llama architecture queries

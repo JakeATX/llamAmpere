@@ -5413,6 +5413,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else if (ggml_cuda_info().peer_access[cuda_ctx_src->device][cuda_ctx_dst->device]) {
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+        } else if (ggml_cuda_peer_copy_on() && ggml_cuda_peer_copy(backend_src, backend_dst, src, dst)) {
+            // GGML_PEER_EXPERTS copy hook (off unless enabled): mailbox post/wait, stream-ordered on both sides
+            return true;
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
@@ -18140,6 +18143,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_peer_abort") == 0) {
         return (void *) ggml_backend_cuda_peer_abort;
+    }
+    if (strcmp(name, "ggml_backend_cuda_peer_copy_enable") == 0) {
+        return (void *) ggml_backend_cuda_peer_copy_enable;
+    }
+    if (strcmp(name, "ggml_backend_cuda_peer_copy_failures") == 0) {
+        return (void *) ggml_backend_cuda_peer_copy_failures;
     }
     if (strcmp(name, "ggml_backend_cuda_scratch_preflight") == 0) {
         return (void *) ggml_backend_cuda_scratch_preflight;

@@ -16,6 +16,7 @@ set(LLAMA_CORE_SOURCES
     llama-chat.cpp
     llama-context.cpp
     llama-split-overlap.cpp
+    llama-peer-experts.cpp
     llama-d1.cpp
     llama-cparams.cpp
     llama-grammar.cpp

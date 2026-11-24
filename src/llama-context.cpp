@@ -1660,6 +1660,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
             moe_cache->set_op_offload(cparams.op_offload); // read only by LLAMA_MOE_CACHE_FEWROW_CPU
         }
+        // [PEERX] GGML_PEER_EXPERTS=1 (default off): the target context's host expert layers on a second card
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            moe_peer = llama_peer_experts::create(model, backend_ptrs);
+        }
         // fork (INKSTREAM): prompt ubatches above 512 rows stream the host experts through two VRAM slots, funded by
         // lending the MoE cache. Boot (and the fit's dry run) still reserve 512 rows, so the fit and the cache size
         // are those of -ub 512; the prompt ladder grows the scratch while the cache is lent. LLAMA_INK_STREAM=0 = off.
@@ -3178,6 +3182,10 @@ void llama_context::synchronize() {
         }
     } else {
         ggml_backend_sched_synchronize(sched.get());
+    }
+    split_ovl.win_pending = false;
+    if (moe_peer) {
+        moe_peer->check(); // [PEERX] a timed-out mailbox wait turns the copy hook off
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -7216,6 +7224,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // Its causal attention/shared-expert chunks still use the requested turn size.
     uint32_t turn_ubatch = (b1_ffn_scratch_active || b1_layer_scratch_active) ? cparams.n_ubatch :
             (sched_reserve_tokens ? std::min(cparams.n_ubatch, sched_reserve_tokens) : cparams.n_ubatch);
+    // [SPLITOVL] verify windows: smaller ubatches pipelined over the cards, one event set per window
+    split_ovl.win_end.clear();
+    split_ovl.win_waited  = 0;
+    split_ovl.win_pending = false;
+    split_ovl.win_ok      = split_ovl.enabled && split_ovl.window > 0 && n_outputs_all > 0 &&
+        sampling.samplers.empty() && !b1_ffn_scratch_active && !b1_layer_scratch_active &&
+        (uint32_t) n_tokens_all > split_ovl.window &&
+        // a recurrent rollback ring keeps each sequence's last n_rs_seq rows in one ubatch: no window can be smaller
+        split_ovl.window > cparams.n_rs_seq;
+    if (split_ovl.win_ok) {
+        turn_ubatch = std::min(turn_ubatch, split_ovl.window);
+    }
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
@@ -7836,6 +7856,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev += ubatch.n_tokens;
+        if (split_ovl.win_ok) {
+            split_overlap_record_window(ubatch.n_seqs_unq == 1 && b1_mode != 1, n_outputs_prev);
+        }
         if (b1_mode == 1 && b1->is_group_last(b1_i)) {
             b1->pass_end(b1_i);
         }
@@ -7881,6 +7904,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+    split_ovl.win_pending = split_ovl.win_ok && !split_ovl.win_end.empty() && output_swaps.empty();
+    split_ovl.win_ok      = false;
 
     // set output mappings
     if (n_outputs > 0) {
@@ -9813,6 +9838,7 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
     };
     p.ple_pf = ple_pf.get();
     p.moe_stream = ink_stream && ink_stream->armed() ? ink_stream.get() : nullptr;
+    p.moe_peer = moe_peer.get();
     p.mtp_tok_row = mtp_pipe.active;
     p.moe_onepath_live = ggml_moe_bank_onepath_live();
     if (b1_cur.active) {
@@ -11292,6 +11318,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (moe_peer) {
+        for (const auto & [buft, size] : moe_peer->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
     if (mtp_hidden.buf) {
         ret[ggml_backend_buffer_get_type(mtp_hidden.buf.get())].context += ggml_backend_buffer_get_size(mtp_hidden.buf.get());
     }
@@ -12106,7 +12137,10 @@ float * llama_get_logits(llama_context * ctx) {
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    // [SPLITOVL] after a windowed verify decode, wait only for the window that holds row i
+    if (!ctx->split_overlap_wait_row(i)) {
+        ctx->synchronize();
+    }
 
     float * res = nullptr;
 

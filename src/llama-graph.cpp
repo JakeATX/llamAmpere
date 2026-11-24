@@ -14,6 +14,7 @@
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-ink-stream.h"
+#include "llama-peer-experts.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2337,6 +2338,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hadamard_inverses (params.hadamard_inverses),
     moe_cache        (params.moe_cache),
     moe_stream       (params.moe_stream),
+    moe_peer         (params.moe_peer),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2642,9 +2644,16 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         cur_mm = build_hadamard_input(w, cur);
     }
     // the experts in the MoE cache are selected by their slots
+    // [PEERX] an expert chain built for the peer card reads the peer copies (same type and shape)
+    ggml_tensor * w_mm = w;
+    if (moe_peer_on && !cached) {
+        ggml_tensor * wp = moe_peer->get(w);
+        GGML_ASSERT(wp != nullptr);
+        w_mm = wp;
+    }
     ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, !cached ? w : moe_stream_il >= 0 ? moe_stream->get_experts(w, moe_stream_il) : moe_cache->get_experts(w), cur_mm, slots);
+        ggml_mul_mat_id(ctx0, w_mm, cur_mm, ids) :
+        ggml_mul_mat_id(ctx0, !cached ? w_mm : moe_stream_il >= 0 ? moe_stream->get_experts(w, moe_stream_il) : moe_cache->get_experts(w), cur_mm, slots);
     if (moe_route_skip && !ggml_exl3_bits(w->type) && ggml_nelements(moe_route_skip) == res->ne[1]*res->ne[2]) {
         res->src[3] = moe_route_skip; // a backend that ignores it computes those routes (their weight is zero)
     }
@@ -3810,9 +3819,51 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    ggml_tensor * experts = build_experts(cur, selected_experts, cache.slots, true);
+    // [PEERX] GGML_PEER_EXPERTS: a layer whose experts the peer card holds computes there (a) the misses the CPU
+    // share would compute or (b) every routed expert when the layer is not read through the cache. The peer chain
+    // goes first in the graph, so its input copy is queued before the main card's cached experts and both cards
+    // compute at the same time; the main card then adds the peer rows (each part reads the other's experts as zero).
+    const bool peer_ok = moe_peer != nullptr && moe_peer->has_layer(il) && can_cpu_share && stream_slots == nullptr &&
+        selected_experts_in == nullptr && !moe_defer_reduce && n_tokens <= moe_peer->max_tokens() &&
+        std::all_of(exps.begin(), exps.end(), [&](ggml_tensor * w) { return w == nullptr || moe_peer->get(w) != nullptr; });
+    const bool peer_misses = peer_ok && cache.cpu_ids != nullptr;
+    const bool peer_all    = peer_ok && cache.slots == nullptr;
+    ggml_tensor * peer_rows = nullptr;
+    if (peer_misses || peer_all) {
+        ggml_tensor * peer_ids = peer_misses ? cache.cpu_ids : nullptr;
+        ggml_build_forward_expand(gf, cur);
+        ggml_build_forward_expand(gf, selected_experts);
+        if (peer_ids) {
+            ggml_build_forward_expand(gf, peer_ids);
+        }
+        static int n_logged = 0;
+        if (n_logged < 2 && il == moe_peer->first_layer()) {
+            n_logged++;
+            LLAMA_LOG_WARN("%s: [PEERX] layer %d (%lld tokens): the peer computes %s\n", __func__, il, (long long) n_tokens,
+                    peer_misses ? "the cache misses of the CPU share" : "all routed experts");
+        }
+        moe_peer_on = true;
+        peer_rows = build_experts(cur, selected_experts, peer_ids, false);
+        moe_peer_on = false;
+        build_moe_peer_pin(peer_rows, { cur, selected_experts, peer_ids }, il);
+        cb(peer_rows, "ffn_moe_down_peer", il);
+        ggml_build_forward_expand(gf, peer_rows);
+    }
+
+    ggml_tensor * experts = nullptr;
+    if (peer_all) {
+        // the whole routed part ran on the peer: the rows come back next to the rest of the layer
+        experts = ggml_cont(ctx0, peer_rows);
+        ggml_backend_sched_set_tensor_backend(sched, experts, moe_peer->main_backend(il));
+    } else {
+        experts = build_experts(cur, selected_experts, cache.slots, true);
+    }
     moe_stream_il = -1;
-    if (cache.cpu_ids != nullptr) {
+    if (peer_misses) {
+        experts = ggml_add(ctx0, experts, peer_rows);
+        ggml_backend_sched_set_tensor_backend(sched, experts, moe_cache->backend(il));
+        cb(experts, "ffn_moe_down_merged", il);
+    } else if (cache.cpu_ids != nullptr) {
         // the cached experts and the misses computed from the host experts, each reads the others as zero
         // the cached experts come first in the graph, so that they are computed while the misses are
         ggml_build_forward_expand(gf, experts);
@@ -3924,6 +3975,43 @@ ggml_tensor * llm_graph_context::build_moe_stream_slots(ggml_tensor * selected_e
     cb(slots, "ffn_moe_stream_slots", il);
     ggml_build_forward_expand(gf, slots);
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]);
+}
+
+void llm_graph_context::build_moe_peer_pin(ggml_tensor * out, const std::vector<const ggml_tensor *> & stops, int il) const {
+    ggml_backend_t peer = moe_peer->backend();
+    std::unordered_set<const ggml_tensor *> seen(stops.begin(), stops.end());
+    std::vector<ggml_tensor *> stack = { out };
+    std::vector<ggml_tensor *> nodes;
+    while (!stack.empty()) {
+        ggml_tensor * t = stack.back();
+        stack.pop_back();
+        if (t == nullptr || t->op == GGML_OP_NONE || !seen.insert(t).second) {
+            continue;
+        }
+        nodes.push_back(t);
+        for (ggml_tensor * src : t->src) {
+            if (src) {
+                stack.push_back(src);
+            }
+        }
+    }
+    // views follow their source; all or nothing: if the peer cannot run a node the scheduler places the chain itself
+    for (ggml_tensor * t : nodes) {
+        if (t->view_src == nullptr && !ggml_backend_supports_op(peer, t)) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: [PEERX] layer %d: %s (%s) not supported on the peer; chain left to the scheduler\n",
+                        __func__, il, t->name, ggml_op_desc(t));
+            }
+            return;
+        }
+    }
+    for (ggml_tensor * t : nodes) {
+        if (t->view_src == nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, t, peer);
+        }
+    }
 }
 
 llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
