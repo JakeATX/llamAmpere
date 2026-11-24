@@ -1,5 +1,44 @@
 # Docker
 
+## llamAmpere server image (NVIDIA Ampere, CUDA 12)
+
+`.devops/llamampere-cuda.Dockerfile` builds `llama-server` (plus `llama-cli` and `llama-mtmd-cli`) the same way as the
+Linux release package: CUDA 12.4, g++-13, sm_86, AVX2 CPU paths. Your NVIDIA driver must support CUDA 12.4, and the
+host needs the NVIDIA Container Toolkit for `--gpus`.
+
+Build it from the repository root (`.git` must be present so the version line is right):
+
+```bash
+git checkout v0.7.5   # or any release tag
+docker build -f .devops/llamampere-cuda.Dockerfile -t llamampere:server-cuda12 .
+# A100 too:              --build-arg CUDA_ARCH="80;86"
+# less RAM while building: --build-arg BUILD_JOBS=4
+```
+
+Run it with the model folder mounted. Arguments after the image name go to `llama-server`, so the README launch
+lines work unchanged once the paths point into the container:
+
+```bash
+docker run --gpus all --ulimit memlock=-1 --ipc=host -p 8080:8080 \
+  -v /path/to/models:/models -v llamampere-cache:/cache \
+  llamampere:server-cuda12 --preset 24dense -m /models/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf
+```
+
+- `--ulimit memlock=-1` lets the server pin and lock host memory (MoE experts, host KV, `-lm mlock`). Without it the
+  pinned paths fall back or fail.
+- `--ipc=host` (or a large `--shm-size`) avoids the small default `/dev/shm`.
+- The prompt-cache disk tier is written under `/cache` (`XDG_CACHE_HOME=/cache`); keep the volume to reuse it across
+  restarts.
+- The server listens on `0.0.0.0:8080` inside the container (`LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`). Set `--api-key`
+  if the port is reachable from other machines.
+- Files that a preset expects beside the model (for example `lsa-qwen38-27b-d2048.gguf` for the small-card presets)
+  must be in the same mounted folder.
+
+`.github/workflows/docker-llamampere.yml` builds the same image on GitHub Actions on demand
+(Actions > llamAmpere Docker image > Run workflow). It only publishes to `ghcr.io` when the `push` input is set.
+
+## Upstream llama.cpp images
+
 ## Prerequisites
 * Docker must be installed and running on your system.
 * Create a folder to store big models & intermediate files (ex. /llama/models)
