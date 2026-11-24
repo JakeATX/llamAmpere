@@ -28,6 +28,8 @@
 #include "reasoning-budget.h"
 #include "speculative.h"
 #include "speculative-copy.h"
+#include "speculative-copy-ctl.h"
+#include "speculative-cost-depth.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "mtmd-internal.h"
@@ -857,6 +859,28 @@ struct spec_adapt_ctrl {
     }
 };
 
+// LLAMA_RTB_COSTDEPTH=1: cost-model draft depth (speculative-cost-depth.h); default off
+static bool server_rtb_costdepth() {
+    static const bool v = rtb::env_on("LLAMA_RTB_COSTDEPTH") && !spec_adapt_ctrl::enabled();
+    return v;
+}
+
+// LLAMA_RTB_CKPTGAP=1 (default off): prompt checkpoints spread over the whole checkpoint budget. Along a long prompt
+// the spacing is n_prompt / (budget - 3) (3 kept for the end spots), floored at LLAMA_RTB_CKPTGAP_MIN (1024) and capped
+// at --checkpoint-min-step, so an edit in the middle of a long prompt resumes near it. A full list drops the
+// checkpoint whose removal leaves the shortest uncovered gap (never the newest-position one), not the oldest.
+// Prefill batching is unchanged (checkpoints go at batch starts), so a cold prompt computes as before.
+static bool server_rtb_ckptgap() {
+    static const bool v = rtb::env_on("LLAMA_RTB_CKPTGAP");
+    return v;
+}
+
+static int64_t server_rtb_ckptgap_step(int64_t n_prompt, int32_t n_ckpt, int32_t min_step) {
+    static const int64_t lo = rtb::env_num("LLAMA_RTB_CKPTGAP_MIN", 1024, 1, 1 << 30);
+    const int64_t step = n_prompt / std::max<int32_t>(1, n_ckpt - 3);
+    return std::max<int64_t>(lo, std::min<int64_t>(min_step, step));
+}
+
 static bool server_bookkeep_enabled() {
     static const bool on = [] {
         const char * e = getenv("LLAMA_BOOKKEEP_SERVER");
@@ -1199,6 +1223,7 @@ struct server_slot {
 
     std::vector<double> verify_budget_accept;
     spec_adapt_ctrl       spec_adapt; // BL6a controller (inactive unless LLAMA_SPEC_ADAPT_COST=1)
+    rtb::cost_depth       rtb_depth;  // cost-model depth (inactive unless LLAMA_RTB_COSTDEPTH=1)
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -1740,6 +1765,9 @@ struct server_slot {
             }
             if (spec_adapt.active()) {
                 SLT_INF(*this, " adaptive depth (BL6a) = %s\n", spec_adapt.summary().c_str());
+            }
+            if (rtb_depth.active()) {
+                SLT_INF(*this, " cost-model depth = %s\n", rtb_depth.summary().c_str());
             }
             if (smpl) {
                 const auto & pq = common_sampler_get_pq_stats(smpl.get());
@@ -2515,18 +2543,35 @@ private:
             // --spec-copy-first N also serves DFlash. Never with synthetic acceptance (it would judge the spans).
             const bool dspark = params.speculative.has_dft() &&
                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end();
+            // LLAMA_RTB_COPYCTL=1: the cost-model copy controller only copies when copying is measured to pay, so it
+            // turns copy-first on by default (span cap LLAMA_RTB_COPYCTL_SPAN, 32) where auto would leave it off
+            const int32_t first_def = rtb::env_on("LLAMA_RTB_COPYCTL")
+                    ? (int32_t) rtb::env_num("LLAMA_RTB_COPYCTL_SPAN", 32, 1, common_speculative_copy_params::FIRST_MAX) : 0;
+            // LLAMA_RTB_GDNCOPY=1: copy-first also stands in for an MTP drafter (Qwen 27B, 24dense), see below for the
+            // recurrent state rollback
+            const bool rtb_gdncopy = rtb::env_on("LLAMA_RTB_GDNCOPY");
             params.speculative.copy_first = common_speculative_copy_params::resolve_first(
-                    params.speculative.copy_first, dspark && params.n_parallel == 1, 0);
+                    params.speculative.copy_first, (dspark || (rtb_gdncopy && mtp && !params.speculative.has_dft())) &&
+                    params.n_parallel == 1, first_def);
             // INKCOPY gate (HOME 3090 Ti, 4/4, DSpark d4): edit/quote tasks +33% but normal chat not faster (3K +0.2%,
             // 100K -2.4% over 6 seeds), so auto stays off; opt in with --spec-copy-first 32 or LLAMA_SPEC_COPY_FIRST=32
             // an explicit N needs a drafter a span can stand in for, else it would only raise n_rs_seq / outputs
             const bool dflash = params.speculative.has_dft() &&
                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
-            if (!dspark && !dflash) {
+            if (!dspark && !dflash && !(rtb_gdncopy && mtp)) {
                 params.speculative.copy_first = 0;
             }
             if (params.speculative.has_synth()) {
                 params.speculative.copy_first = 0;
+            }
+            // LLAMA_RTB_GDNCOPY=1: on a Gated DeltaNet target (Qwen 27B) the copy-first span cap raises n_rs_seq, and a
+            // full-state snapshot per span token does not fit; GDN ingredient replay keeps a small per-token ring
+            // instead (the memory only turns it on for GDN layers, so other targets are unaffected).
+            // LLAMA_RTB_GDNCOPY_REPLAY=0 keeps the configured --gdn-replay.
+            if (rtb_gdncopy && params.speculative.copy_first > 0 && !params.gdn_replay &&
+                    rtb::env_num("LLAMA_RTB_GDNCOPY_REPLAY", 1, 0, 1) != 0) {
+                params.gdn_replay = true;
+                SRV_INF("%s", "copy-first on a recurrent target: GDN ingredient replay on (LLAMA_RTB_GDNCOPY)\n");
             }
             SRV_INF("copy-first: %s (max span = %d)\n", params.speculative.copy_first > 0 ? "on" : "off",
                     params.speculative.copy_first);
@@ -4097,6 +4142,13 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            // LLAMA_RTB_HASHSAMPLE=1 (test mode): every target token comes from the CPU chain's keyed draw, verified by
+            // id match, so spec on and off emit the same ids
+            if (common_sampler_rtb_hash_enabled()) {
+                speculative_sampler  = nullptr;
+                use_backend_sampling = false;
+            }
+
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
@@ -5181,11 +5233,14 @@ private:
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
+        const int64_t min_step = server_rtb_ckptgap() && slot.task
+                ? server_rtb_ckptgap_step(slot.task->n_tokens(), params_base.n_ctx_checkpoints, params_base.checkpoint_min_step)
+                : params_base.checkpoint_min_step;
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = *it;
-            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
+            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
@@ -5196,6 +5251,49 @@ private:
 
             last = cur.n_tokens;
             ++it;
+        }
+
+        while (server_rtb_ckptgap() && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints &&
+                slot.prompt.checkpoints.size() >= 2) {
+            // LLAMA_RTB_CKPTGAP: drop the checkpoint whose removal leaves the shortest gap between its neighbours
+            // (positions sorted; the new checkpoint counts as a neighbour), never the one at the highest position
+            auto & cps = slot.prompt.checkpoints;
+            using cp_it = std::remove_reference_t<decltype(cps)>::iterator;
+            std::vector<cp_it> ord;
+            for (auto it = cps.begin(); it != cps.end(); ++it) {
+                ord.push_back(it);
+            }
+            std::stable_sort(ord.begin(), ord.end(), [](const cp_it & a, const cp_it & b) { return a->n_tokens < b->n_tokens; });
+            // checkpoints of the current task (its end spots) only when no older one can go
+            size_t  victim = ord.size();
+            int64_t best_gap = INT64_MAX;
+            for (int pass = 0; pass < 2 && victim >= ord.size(); ++pass)
+            for (size_t k = 0; k + 1 < ord.size(); ++k) {
+                if (pass == 0 && ord[k]->id_task == id_task) {
+                    continue;
+                }
+                int64_t prev = k > 0 ? ord[k - 1]->n_tokens : 0;
+                int64_t next = ord[k + 1]->n_tokens;
+                const int64_t self = ord[k]->n_tokens;
+                if (n_tokens_new > prev && n_tokens_new < self) {
+                    prev = n_tokens_new;
+                }
+                if (n_tokens_new > self && n_tokens_new < next) {
+                    next = n_tokens_new;
+                }
+                const int64_t gap = next - prev;
+                if (gap < best_gap) {
+                    best_gap = gap;
+                    victim   = k;
+                }
+            }
+            if (victim >= ord.size()) {
+                break;
+            }
+            SLT_INF(slot, "erasing context checkpoint at n_tokens = %" PRId64 " (shortest gap left: %" PRId64 ", LLAMA_RTB_CKPTGAP)\n",
+                    ord[victim]->n_tokens, best_gap);
+            slot.ckpt_recycle(*ord[victim]);
+            cps.erase(ord[victim]);
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -6635,6 +6733,17 @@ private:
                                 n_draft_req = std::min(n_draft_req, d);
                             }
                         }
+                        else if (draft_budget[slot.id] < 0 && server_rtb_costdepth()) {
+                            if (!slot.rtb_depth.active()) {
+                                slot.rtb_depth.reset(common_speculative_n_max(spec.get()));
+                                slot.rtb_depth.decay = rtb::env_num("LLAMA_RTB_COSTDEPTH_DECAY", 0.97, 0.5, 1.0);
+                                slot.rtb_depth.floor_d = (int) rtb::env_num("LLAMA_RTB_COSTDEPTH_FLOOR", 1, 1, 64);
+                            }
+                            const int d = slot.rtb_depth.pick((double) slot.prompt.tokens.pos_next());
+                            if (d > 0) {
+                                n_draft_req = std::min(n_draft_req, d);
+                            }
+                        }
                         if (const int dm = draft_budget[slot.id] < 0 ? spec_depth_mix::get().pick() : 0; dm > 0) {
                             n_draft_req = std::min(n_draft_req, dm);
                         }
@@ -7713,6 +7822,9 @@ private:
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
                     bool ckpt_exact = true;
+                    const int64_t ckpt_step = server_rtb_ckptgap()
+                            ? server_rtb_ckptgap_step(slot.task->n_tokens(), params_base.n_ctx_checkpoints, params_base.checkpoint_min_step)
+                            : params_base.checkpoint_min_step;
                     if (sj_align && sj_exact_spot(n_tokens_start)) {
                         // [#240] exact spot (seal state + open rows in the checkpoint)
                     } else if (sj_align) {
@@ -7721,14 +7833,14 @@ private:
                             sj_kvarn_ckpt_floor((llama_pos) n_tokens_start) == n_tokens_start && (
                                 sj_ckpt_target(n_tokens_start) ||
                                 slot.prompt.checkpoints.empty() ||
-                                n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                                n_tokens_start > slot.prompt.checkpoints.back().n_tokens + ckpt_step);
                         ckpt_exact = false;
                     } else {
                         // no need to create checkpoints that are too close together, unless it's the last user message
                         do_checkpoint = do_checkpoint && (
                                 slot.prompt.checkpoints.empty() ||
                                 is_last_user_message || near_prompt_end ||
-                                n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                                n_tokens_start > slot.prompt.checkpoints.back().n_tokens + ckpt_step);
                     }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -8537,7 +8649,7 @@ private:
                         ? server_sample_and_accept_synth(
                                 slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
                                 synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
-                        : (slot.spec_draft_q.empty()
+                        : ((slot.spec_draft_q.empty() || common_sampler_rtb_hash_enabled())
                             ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, false, is_stop)
                             : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, spec_i_batch,
                                     slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay, slot.id, slot.stats.n_gen, is_stop));
@@ -8708,6 +8820,11 @@ private:
                 }
                 if (slot.spec_adapt.active()) {
                     slot.spec_adapt.observe((int) verify_width, (int) n_accepted, slot.t_spec_round_last > 0 ? t_now - slot.t_spec_round_last : 0);
+                }
+                // (a copy-first span is not the drafter's depth: it does not feed the depth model)
+                if (slot.rtb_depth.active() && !common_speculative_last_round_copy(spec.get(), slot.id)) {
+                    slot.rtb_depth.observe((int) verify_width, (int) n_accepted,
+                            slot.t_spec_round_last > 0 ? t_now - slot.t_spec_round_last : 0, (double) slot.prompt.tokens.pos_next());
                 }
                 slot.t_spec_round_last = t_now;
                 slot.spec_draft_us_pending = 0;

@@ -12,6 +12,7 @@
 #include "speculative-adaptive.h"
 #include "speculative-cdepth.h"
 #include "speculative-copy.h"
+#include "speculative-copy-ctl.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "../src/llama-mtp-chain-sample.h" // [#69] sampled chain: host re-derivation
@@ -4636,6 +4637,14 @@ struct common_speculative {
     // seqs whose target rows process() must not mirror into the draft (server: a prompt with media on a drafter
     // that cannot hold it); their rows stay in the batch, so row indices into the target outputs do not shift
     std::vector<char> muted;
+
+    // copy-first controller pieces (LLAMA_RTB_COPYCTL / _COPYCURSOR / _EDITCOPY, all default off; empty = off),
+    // see speculative-copy-ctl.h
+    rtb::copy_flags            rtb_fl;
+    std::vector<rtb::copy_seq> rtb_seq; // [n_seq]
+
+    // [n_seq] the last accepted round verified a copy-first span (filled only while copy-first is on)
+    std::vector<char> last_copy;
 };
 
 void common_speculative_set_seq_muted(common_speculative * spec, llama_seq_id seq_id, bool muted) {
@@ -4648,10 +4657,43 @@ void common_speculative_set_seq_muted(common_speculative * spec, llama_seq_id se
     spec->muted[seq_id] = muted;
 }
 
+bool common_speculative_last_round_copy(const common_speculative * spec, llama_seq_id seq_id) {
+    return spec != nullptr && seq_id >= 0 && seq_id < (llama_seq_id) spec->last_copy.size() && spec->last_copy[seq_id] != 0;
+}
+
+// copy-first controller: the round that just ended was verified with n_accepted accepted of n_drafted
+static void common_speculative_rtb_accept(common_speculative * spec, llama_seq_id seq_id, int32_t n_accepted, int32_t n_drafted) {
+    if (seq_id < 0 || seq_id >= (llama_seq_id) spec->rtb_seq.size()) {
+        return;
+    }
+    auto & rs = spec->rtb_seq[seq_id];
+    const int64_t now = ggml_time_us();
+    if (rs.t_last_us > 0) {
+        // the interval since the last verify covers this round's draft, verify and sampling
+        const double ms = (double) (now - rs.t_last_us) / 1000.0;
+        if (rs.kind == rtb::copy_seq::ROUND_COPY || rs.kind == rtb::copy_seq::ROUND_EDIT) {
+            rs.ctl.time_copy(rs.rows, ms);
+        } else if (rs.kind == rtb::copy_seq::ROUND_DRAFTER) {
+            rs.ctl.time_alt(ms, n_accepted + 1, (n_drafted >= 0 ? n_drafted : n_accepted) + 1);
+        }
+    }
+    rs.on_verified(n_accepted);
+    rs.kind      = rtb::copy_seq::ROUND_NONE;
+    rs.t_last_us = now;
+    rs.acc_seen  = true;
+}
+
 // drafters a copy-first span may replace for a round: their state follows the target batches (process()) and their
 // accept() keeps nothing per draft, so a round they did not draft leaves them consistent
 static bool common_speculative_copy_first_ok(common_speculative_type type) {
-    return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+        return true;
+    }
+    // LLAMA_RTB_GDNCOPY=1 (default off): MTP too. Its catch-up decode follows every target batch (process_range)
+    // and accept(is_other) takes the hidden row of the accepted span position, so a round it did not draft leaves
+    // it consistent; its adaptive depth controller is not fed span rounds (is_other)
+    return rtb::env_on("LLAMA_RTB_GDNCOPY") &&
+           (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
 }
 
 // drafters whose block the copy tail may follow; the n-gram drafters keep their own (narrow) width
@@ -5529,6 +5571,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             result->copy.set_first(result->first_impl != nullptr ? params.copy_first : 0);
         }
         result->copy_state.assign(n_seq, common_speculative_copy_state());
+        result->last_copy.assign(n_seq, 0);
         for (auto & cs : result->copy_state) {
             cs.reset();
             cs.cool_base       = result->copy.cool;
@@ -5540,6 +5583,23 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             LOG_INF("%s: copy mode: tail = %d, long = %d, short = %d, agree = %d, cool = %d, n_rs_seq = %u\n", __func__,
                     result->copy.tail, result->copy.long_min, result->copy.short_min, result->copy.agree, result->copy.cool,
                     params.need_n_rs_seq());
+        }
+        if (result->first_impl != nullptr) {
+            result->rtb_fl = rtb::copy_flags::from_env();
+            if (!result->rtb_fl.cursor) {
+                result->rtb_fl.cursor_src_all = result->copy.first_src_all;
+            }
+            if (result->rtb_fl.any()) {
+                result->rtb_seq.assign(n_seq, rtb::copy_seq());
+                for (auto & rs : result->rtb_seq) {
+                    rs.reset_request();
+                    rs.ctl.margin = rtb::env_num("LLAMA_RTB_COPYCTL_MARGIN", rs.ctl.margin, 0.5, 4.0);
+                    rs.ctl.row_k  = rtb::env_num("LLAMA_RTB_COPYCTL_ROWK", rs.ctl.row_k, 0.0, 1.0);
+                }
+                LOG_INF("%s: copy-first controller: ctl = %d, cursor = %d, edit = %d, source = %s, margin = %.2f, row_k = %.3f\n",
+                        __func__, result->rtb_fl.ctl, result->rtb_fl.cursor, result->rtb_fl.edit,
+                        result->rtb_fl.cursor_src_all ? "all" : "prompt", result->rtb_seq[0].ctl.margin, result->rtb_seq[0].ctl.row_k);
+            }
         }
         LOG_INF("%s: copy-first: max span = %d, min match = %d, start = %d, cool = %d, source = %s (drafter %s)\n", __func__,
                 result->copy.first, result->copy.first_min, result->copy.first_start, result->copy.first_cool,
@@ -5605,6 +5665,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
     if (seq_id >= 0 && seq_id < (llama_seq_id) spec->copy_state.size()) {
         spec->copy_state[seq_id].reset();
+    }
+    if (seq_id >= 0 && seq_id < (llama_seq_id) spec->rtb_seq.size()) {
+        spec->rtb_seq[seq_id].reset_request(); // the learned rates and costs stay
     }
 }
 
@@ -5772,6 +5835,40 @@ void common_speculative_draft(common_speculative * spec) {
             }
             auto & cs = spec->copy_state[i];
             cs.first_n = 0;
+            if (i < spec->rtb_seq.size()) {
+                // controller path (LLAMA_RTB_COPYCTL / _COPYCURSOR / _EDITCOPY)
+                auto & rs = spec->rtb_seq[i];
+                if (!rs.acc_seen) {
+                    rs.t_last_us = 0; // the last round was not verified: no round interval to measure
+                }
+                rs.acc_seen = false;
+                const int32_t cap = dp.n_first_max > 0 && dp.prompt != nullptr ? dp.n_first_max : 0;
+                llama_tokens span;
+                if (dp.prompt != nullptr) {
+                    const int32_t legacy_want = !spec->rtb_fl.ctl && cap > 0 ? std::min(cs.first_want(), cap) : 0;
+                    rtb::stream_view sv;
+                    sv.h    = dp.prompt->data();
+                    sv.n    = (int32_t) dp.prompt->size();
+                    sv.last = dp.id_last;
+                    span = rtb::copy_round(spec->rtb_fl, rs, sv, cap, dp.n_first_src, dp.temp <= 0.0f,
+                            spec->copy.first_min, legacy_want);
+                    if (span.empty() && legacy_want > 0) {
+                        cs.first_span = 0; // no match: the next run starts small (old rule)
+                    }
+                }
+                if (!span.empty()) {
+                    *dp.result = std::move(span);
+                    if (dp.result_q) {
+                        dp.result_q->clear(); // id match (point mass) at every span position
+                    }
+                    dp.drafting = false;
+                    spec->impl_last[i] = spec->first_impl;
+                    cs.on_first_draft((int32_t) dp.result->size());
+                    continue;
+                }
+                n_drafting++;
+                continue;
+            }
             const int32_t want = dp.n_first_max > 0 && dp.prompt != nullptr ? std::min(cs.first_want(), dp.n_first_max) : 0;
             if (want > 0) {
                 llama_tokens span = common_speculative_copy_first_propose(spec->copy, dp.prompt->data(),
@@ -5916,6 +6013,10 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
         // copy-first: a span round is not the drafter's; it feeds the span controller only. The stand-in drafter gets
         // is_other = true like the rest: DSpark's adaptive depth controller must not score a span it did not draft
+        common_speculative_rtb_accept(spec, seq_id, n_accepted, n_drafted);
+        if (seq_id >= 0 && seq_id < (llama_seq_id) spec->last_copy.size()) {
+            spec->last_copy[seq_id] = seq_id < (llama_seq_id) spec->copy_state.size() && spec->copy_state[seq_id].first_n > 0;
+        }
         if (seq_id >= 0 && seq_id < (llama_seq_id) spec->copy_state.size() && spec->copy_state[seq_id].first_n > 0) {
             spec->copy_state[seq_id].on_first_accept(n_accepted);
             impl->accept(seq_id, n_accepted, true);
@@ -6047,6 +6148,15 @@ void common_speculative_print_stats(const common_speculative * spec) {
             LOG_INF("statistics copy-first: seq = %zu, #rounds = %" PRIu64 ", #gen tokens = %" PRIu64 ", #acc tokens = %" PRIu64
                     ", #full spans = %" PRIu64 ", #poor spans = %" PRIu64 "\n",
                     i, cs.n_first_rounds, cs.n_first_gen, cs.n_first_acc, cs.n_first_full, cs.n_first_poor);
+        }
+        if (i < spec->rtb_seq.size()) {
+            const auto & rs = spec->rtb_seq[i];
+            const auto & q  = rs.ctl.r[rs.greedy ? 0 : 1];
+            LOG_INF("statistics copy-first controller: seq = %zu, #copy rounds = %" PRIu64 ", #copy tokens = %" PRIu64
+                    ", #acc tokens = %" PRIu64 ", #edit rounds = %" PRIu64 " (%" PRIu64 " took the edit), #cursor hits = %" PRIu64
+                    ", #shadow scores = %" PRIu64 ", q1 = %.2f/%.2f/%.2f/%.2f, qn = %.3f, qe = %.2f, drafter ms/tok = %.2f\n",
+                    i, rs.n_copy, rs.n_copy_tok, rs.n_copy_acc, rs.n_edit, rs.n_edit_hit, rs.n_cursor, rs.n_shadow,
+                    q.first[0], q.first[1], q.first[2], q.first[3], q.next, q.edit, rs.ctl.alt_tok_ms);
         }
     }
 

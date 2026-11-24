@@ -75,6 +75,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // The returned chain is [greedy], or [logit-bias, greedy] when the request carries logit biases (this is
 // how the server expresses ignore_eos) or the model declares suppress tokens. The bias is applied to the
 // logit rows on the backend, in front of the argmax, exactly as the CPU chain does. Owned by gsmpl.
+// LLAMA_RTB_HASHSAMPLE=1 test mode: the final draw is keyed by (seed, output index, token id) (sampling-hash.h)
+bool common_sampler_rtb_hash_enabled();
+
 bool common_sampler_supports_greedy_backend(const common_params_sampling & params);
 
 // the bias set that chain applies in front of its argmax: the request's logit_bias followed by the model's
