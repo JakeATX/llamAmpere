@@ -261,7 +261,10 @@ static void compact_state_case(llama_model * model, const sj_cfg & cfg, const ch
     compare(13, "rollback-continuation");
     for (const auto & probe : from) {
         require(probe->dispatches > 0 && probe->graph_replays > 0 && probe->input_updates >= 12 && probe->descriptor_updates >= 12,
-                "compact state observed dispatch, graph replay, changed inputs and changed descriptors at every width");
+                "compact state observed dispatch, graph replay, changed inputs and changed descriptors at every width (T=" +
+                std::to_string(probe->width) + ": dispatches=" + std::to_string(probe->dispatches) + " graph_replays=" +
+                std::to_string(probe->graph_replays) + " input_updates=" + std::to_string(probe->input_updates) +
+                " descriptor_updates=" + std::to_string(probe->descriptor_updates) + ")");
     }
     require(std::remove(path.c_str()) == 0, "remove compact state file");
     printf("OK: compact state T1/T4/T5, changed-input/descriptor replay, file restore, sealing continuation and 2/5 rollback\n");

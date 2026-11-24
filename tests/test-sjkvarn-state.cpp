@@ -166,8 +166,11 @@ static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t 
                 const ggml_tensor * body = cache->get_sj_kvarn_body(il);
                 require(body && body->buffer, "resident body allocated");
                 const auto buft = ggml_backend_buffer_get_type(body->buffer);
-                const bool split = strstr(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_") != nullptr;
-                require(split == (model->hparams.dsv4_compress_ratios[il] > 0), "only eligible QSA layers use split bodies");
+                // the CLOCK pool (GGML_CUDA_QSA_RESIDENT_CLOCK, default on) is the split body under another buffer name
+                const char * name = ggml_backend_buft_name(buft);
+                const bool split = strstr(name, "CUDA_QSA_Resident_") != nullptr || strstr(name, "CUDA_QSA_Clock_") != nullptr;
+                require(split == (model->hparams.dsv4_compress_ratios[il] > 0), "only eligible QSA layers use split bodies (layer " +
+                        std::to_string(il) + ": " + name + ")");
                 require(ggml_backend_buft_get_device(buft) == model->dev_layer(il), "body stays on the model layer device");
                 require(ggml_backend_dev_type(model->dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_GPU, "resident state test runs on GPU");
                 if (split) {
@@ -230,7 +233,9 @@ static std::vector<int32_t> descriptor(llama_kv_cache * cache, llama_pos next_po
     llama_kv_cache::slot_info sinfo;
     sinfo.s0 = sinfo.s1 = 0;
     sinfo.strm  = { 0 };
-    sinfo.idxs  = { { 0 } };
+    // QPOS0 is the cell of the first query row (#39). These probes ask about a position, not a placed ubatch: pass the
+    // position, as QPOS0 was before #39 (only the CLOCK resident path reads it)
+    sinfo.idxs  = { { (uint32_t) next_pos } };
     cache->set_input_sj_kvarn_desc(desc, &ubatch, sinfo);
     std::vector<int32_t> result(GGML_SJKVARN_DESC_N_ENTRIES);
     ggml_backend_tensor_get(desc, result.data(), 0, result.size()*sizeof(int32_t));
