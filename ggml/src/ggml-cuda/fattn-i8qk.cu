@@ -60,6 +60,22 @@ bool ggml_cuda_fattn_i8qk_enabled() {
     return v;
 }
 
+bool ggml_cuda_fattn_i8qk_f16_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CUDA_FA_I8QK_F16");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return v;
+}
+
+bool ggml_cuda_fattn_i8qk_ext_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CUDA_FA_I8QK_EXT");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return v;
+}
+
 // [SPQ] a sparse-attention (QSA) prompt at long context: op param 4 carries the per-query selected-cell count, and once
 // the f16 MMA route would gather only the selected cells (fattn.cu shall_use_sparse, the (256, 256, 8, 8) case the SJ-KVaRN
 // prefill launches for GQA > 4) the int8-QK kernel, which skips only fully masked 128x64 tiles, does several times more
@@ -88,7 +104,7 @@ static bool ggml_cuda_fattn_i8qk_yields_to_sparse(int cc, const ggml_tensor * ds
     return ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8);
 }
 
-static int ggml_cuda_fattn_i8qk_min_q() {
+int ggml_cuda_fattn_i8qk_min_q() {
     static const int v = [] {
         const char * e = getenv("GGML_CUDA_FA_I8QK_MIN_Q");
         const int n = e ? atoi(e) : 64;
@@ -156,16 +172,15 @@ static const i8qk_modes & ggml_cuda_fattn_i8qk_modes() {
     return m;
 }
 
-// Quantized caches only: the int8 K and the f16 K staging / f16 V live in the f16 K/V reservation the allocator makes for
-// the f16 route of a quantized pair. An f16 K or V has no such reservation (the f16 route reads it in place), so the int8
-// route would need new VRAM for it: f16 caches keep the f16 route.
+// When GGML_CUDA_FA_I8QK_F16=0 (default): quantized caches only: the int8 K and the f16 K staging / f16 V live in the f16
+// K/V reservation the allocator makes for the f16 route of a quantized pair. An f16 K or V has no such reservation, so
+// without GGML_CUDA_FA_I8QK_F16=1 it keeps the f16 route rather than taking pool VRAM for int8 K tiles.
 static bool i8qk_kv_type_ok(const ggml_tensor * t, const bool f16_ok = false) {
     switch (t->type) {
         case GGML_TYPE_F16:
-            // [I8SJ] only for callers that pass their own int8 K workspace (the SJ-KVaRN prefill expand scratch):
-            // read in place, 16-byte rows for the cp.async V loads
+            // F16 KV read in place (for V, 16-byte rows/slices for cp.async loads; for K, direct read by i8qk_k_quant)
             return f16_ok && t->nb[0] == sizeof(half) && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 &&
-                   (uintptr_t) t->data % 16 == 0;
+                   (t->ne[3] == 1 || t->nb[3] % 16 == 0) && (uintptr_t) t->data % 16 == 0;
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
@@ -187,21 +202,39 @@ static bool i8qk_applies_impl(int cc, const ggml_tensor * dst, const bool f16_kv
         return false;
     }
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED(cc); GGML_UNUSED(dst);
+    GGML_UNUSED(cc); GGML_UNUSED(dst); GGML_UNUSED(f16_kv);
     return false;
 #else
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) {
         return false;
     }
+    const bool f16_ok = f16_kv || ggml_cuda_fattn_i8qk_f16_enabled();
+    const bool ext    = ggml_cuda_fattn_i8qk_ext_enabled();
+
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
-    if (Q == nullptr || K == nullptr || V == nullptr || dst->src[4] != nullptr) {
-        return false; // sinks are not implemented
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * lse   = ggml_flash_attn_ext_get_lse(dst);
+    if (Q == nullptr || K == nullptr || V == nullptr) {
+        return false;
+    }
+    if (sinks != nullptr) {
+        if (!ext || sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
+                sinks->ne[0] != Q->ne[2] || sinks->ne[1] != 1 || sinks->ne[2] != 1 || sinks->ne[3] != 1) {
+            return false;
+        }
     }
     for (int i = 5; i < GGML_MAX_SRC; ++i) {
-        if (dst->src[i] != nullptr) {
+        if (dst->src[i] != nullptr && (i != 9 || lse == nullptr || !ext)) {
+            return false;
+        }
+    }
+    if (lse != nullptr) {
+        if (lse->type != GGML_TYPE_F32 || lse->nb[0] != sizeof(float) || lse->nb[1] % sizeof(float) != 0 ||
+                (lse->ne[2] > 1 && lse->nb[2] % sizeof(float) != 0) ||
+                lse->ne[0] != Q->ne[2] || lse->ne[1] != Q->ne[1] || lse->ne[2] != Q->ne[3] || lse->ne[3] != 1) {
             return false;
         }
     }
@@ -210,18 +243,33 @@ static bool i8qk_applies_impl(int cc, const ggml_tensor * dst, const bool f16_kv
         return false;
     }
     if (Q->type != GGML_TYPE_F32 || Q->nb[0] != sizeof(float) || Q->nb[1] % 16 != 0 || Q->nb[2] % 16 != 0 ||
-            (uintptr_t) Q->data % 16 != 0) {
+            (Q->ne[3] > 1 && Q->nb[3] % 16 != 0) || (uintptr_t) Q->data % 16 != 0) {
         return false;
     }
     // grid limits: query tiles and query heads go to gridDim.y of the tile-flag / attention launches
-    if (Q->ne[1] < ggml_cuda_fattn_i8qk_min_q() || Q->ne[1] > int64_t(65535)*I8QK_BM || Q->ne[2] > 65535 ||
-            Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
+    if (Q->ne[1] < ggml_cuda_fattn_i8qk_min_q() || Q->ne[1] > int64_t(65535)*I8QK_BM || Q->ne[2] > 65535) {
         return false;
+    }
+    if (!ext || f16_kv) {
+        if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
+            return false;
+        }
+    } else {
+        if (Q->ne[3] < 1 || Q->ne[3] > 65535 ||
+                (K->ne[3] != 1 && K->ne[3] != Q->ne[3]) ||
+                (V->ne[3] != 1 && V->ne[3] != Q->ne[3])) {
+            return false;
+        }
     }
     if (K->ne[2] < 1 || K->ne[2] != V->ne[2] || Q->ne[2] % K->ne[2] != 0) {
         return false;
     }
-    if (K->ne[1] < I8QK_BN || K->ne[1] % I8QK_BN != 0 || K->ne[1] != V->ne[1] || K->ne[1] > (int64_t(1) << 26)) {
+    // partial last KV tile only under the opt-in switches (GGML_CUDA_FA_I8QK_F16 / _EXT); the default-on I8SJ caller
+    // (f16_kv) keeps the whole-tile rule of the cand base
+    if ((ggml_cuda_fattn_i8qk_f16_enabled() || ext) ? (K->ne[1] < 1) : (K->ne[1] < I8QK_BN || K->ne[1] % I8QK_BN != 0)) {
+        return false;
+    }
+    if (K->ne[1] != V->ne[1] || K->ne[1] > (int64_t(1) << 26)) {
         return false;
     }
     if (K == V || V->view_src == K || K->view_src == V ||
@@ -229,14 +277,28 @@ static bool i8qk_applies_impl(int cc, const ggml_tensor * dst, const bool f16_kv
         return false;
     }
     if (f16_kv ? (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || !i8qk_kv_type_ok(K, true) || !i8qk_kv_type_ok(V, true))
-               : (!i8qk_kv_type_ok(K) || !i8qk_kv_type_ok(V))) {
+               : (!i8qk_kv_type_ok(K, f16_ok) || !i8qk_kv_type_ok(V, f16_ok))) {
         return false;
     }
-    if (mask != nullptr && ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_I32) ||
-            mask->nb[0] != (mask->type == GGML_TYPE_I32 ? sizeof(uint32_t) : sizeof(half)) ||
-            mask->ne[0]*(mask->type == GGML_TYPE_I32 ? 32 : 1) < K->ne[1] || mask->ne[1] < Q->ne[1] ||
-            mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[1] % 4 != 0 || (uintptr_t) mask->data % 4 != 0)) {
-        return false;
+    if (mask != nullptr) {
+        if ((mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_I32) ||
+                mask->nb[0] != (mask->type == GGML_TYPE_I32 ? sizeof(uint32_t) : sizeof(half)) ||
+                mask->ne[0]*(mask->type == GGML_TYPE_I32 ? 32 : 1) < K->ne[1] || mask->ne[1] < Q->ne[1] ||
+                mask->nb[1] % 4 != 0 || (uintptr_t) mask->data % 4 != 0) {
+            return false;
+        }
+        if (!ext) {
+            if (mask->ne[2] != 1 || mask->ne[3] != 1) {
+                return false;
+            }
+        } else {
+            if (mask->ne[2] < 1 || mask->ne[2] > 65535 ||
+                    (mask->ne[2] > 1 && mask->nb[2] % 4 != 0) ||
+                    (mask->ne[3] != 1 && mask->ne[3] != Q->ne[3]) ||
+                    (mask->ne[3] > 1 && mask->nb[3] % 4 != 0)) {
+                return false;
+            }
+        }
     }
     float max_bias = 0.0f;
     float softcap  = 0.0f;
@@ -246,7 +308,7 @@ static bool i8qk_applies_impl(int cc, const ggml_tensor * dst, const bool f16_kv
         return false;
     }
     if (dst->type != GGML_TYPE_F32 || dst->ne[0] != D || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] ||
-            dst->ne[3] != 1 || !ggml_is_contiguous(dst)) {
+            dst->ne[3] != Q->ne[3] || !ggml_is_contiguous(dst)) {
         return false;
     }
     return true;
@@ -270,15 +332,24 @@ bool ggml_cuda_fattn_i8qk_sj_kvarn_wanted(int cc, const ggml_tensor * dst) {
     GGML_UNUSED(dst);
     return false;
 #else
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * mask = dst->src[3];
+    const bool ext = ggml_cuda_fattn_i8qk_ext_enabled();
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
     float max_bias = 0.0f;
     float softcap  = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
+    const bool sinks_ok = sinks == nullptr ||
+        (ext && sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks) &&
+         sinks->ne[0] == Q->ne[2] && sinks->ne[1] == 1 && sinks->ne[2] == 1 && sinks->ne[3] == 1);
+    const bool mask_ok = mask == nullptr ||
+        ((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32) &&
+         mask->ne[3] == 1 &&
+         (ext ? (mask->ne[2] >= 1 && mask->ne[2] <= 65535 && (mask->ne[2] == 1 || mask->nb[2] % 4 == 0))
+              : mask->ne[2] == 1));
     return Q->type == GGML_TYPE_F32 && Q->ne[0] == 256 && Q->ne[1] >= ggml_cuda_fattn_i8qk_min_q() &&
-           dst->src[4] == nullptr && max_bias == 0.0f && softcap == 0.0f &&
-           (mask == nullptr || ((mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32) && mask->ne[2] == 1 && mask->ne[3] == 1));
+           sinks_ok && max_bias == 0.0f && softcap == 0.0f && mask_ok;
 #endif
 }
 
@@ -294,6 +365,15 @@ static __device__ __forceinline__ void i8qk_cp_async_16(void * smem, const void 
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(i8qk_smem_u32(smem)), "l"(gmem));
 #else
     GGML_UNUSED(smem); GGML_UNUSED(gmem);
+#endif
+}
+
+static __device__ __forceinline__ void i8qk_cp_async_16_pred(void * smem, const void * gmem, const bool pred) {
+#if defined(AMPERE_MMA_AVAILABLE) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE)
+    const int src_size = pred ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(i8qk_smem_u32(smem)), "l"(gmem), "r"(src_size));
+#else
+    GGML_UNUSED(smem); GGML_UNUSED(gmem); GGML_UNUSED(pred);
 #endif
 }
 
@@ -413,19 +493,23 @@ static __global__ void i8qk_k_mean_block(const half * __restrict__ K, const int6
     m[2*c2 + 1] = isfinite(my) ? my : 0.0f;
 }
 
-// One warp per (token, head): K - mean -> int8 with one f32 scale per token. grid (n_kv/8, heads), block 256.
+// One warp per (token, head): K - mean -> int8 with one f32 scale per token. grid (n_kv_pad/8, heads), block 256.
 // NS = scales stored per token (1, or D/128 copies of the token scale for the per-half kernels).
+// Ks is strided by n_kv_pad (tail padding tokens [n_kv, n_kv_pad) receive zero scales); Kq stays strided by n_kv.
 // blk > 0: mean holds nblk per-block means per head ([head][block][D]), token tok uses block tok/blk; blk 0: one mean
 // per head.
 template <int D, int NS>
 static __global__ void i8qk_k_quant(const half * __restrict__ K, const int64_t s_tok, const int64_t s_head,
-                                    const float * __restrict__ mean, const int n_kv, const int blk, const int nblk,
-                                    int8_t * __restrict__ Kq, float * __restrict__ Ks) {
+                                    const float * __restrict__ mean, const int n_kv, const int n_kv_pad,
+                                    const int blk, const int nblk, int8_t * __restrict__ Kq, float * __restrict__ Ks) {
     constexpr int E = D/WARP_SIZE; // 8 (D 256) or 4 (D 128) channels per lane
     const int lane = threadIdx.x % WARP_SIZE;
     const int tok  = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
     const int head = blockIdx.y;
     if (tok >= n_kv) {
+        if (tok < n_kv_pad && lane < NS) {
+            Ks[((size_t) head*n_kv_pad + tok)*NS + lane] = 0.0f;
+        }
         return;
     }
     const half * src = K + head*s_head + tok*s_tok + lane*E;
@@ -476,7 +560,7 @@ static __global__ void i8qk_k_quant(const half * __restrict__ K, const int64_t s
         *(uint32_t *) dstq = packed[0];
     }
     if (lane < NS) {
-        Ks[((size_t) head*n_kv + tok)*NS + lane] = fin ? amax/127.0f : 0.0f;
+        Ks[((size_t) head*n_kv_pad + tok)*NS + lane] = fin ? amax/127.0f : 0.0f;
     }
 }
 
@@ -518,7 +602,8 @@ static __global__ void i8qk_k_cb_mean_partial(const char * __restrict__ K, const
 // lanes per block. grid (n_kv/8, heads), block 256. A non-finite row (padding) gives zero codes and scale 0.
 template <int D, ggml_type type>
 static __global__ void i8qk_k_codebook(const char * __restrict__ K, const int64_t nb1, const int64_t nb2, const int n_kv,
-                                       const float * __restrict__ mean, int8_t * __restrict__ Kq, float * __restrict__ Ks) {
+                                       const int n_kv_pad, const float * __restrict__ mean, int8_t * __restrict__ Kq,
+                                       float * __restrict__ Ks) {
     static_assert(type == GGML_TYPE_TQ5_0 || type == GGML_TYPE_TQ6_0, "i8qk codebook: tq5_0 / tq6_0 only");
     constexpr int E  = D/WARP_SIZE;
     constexpr int NB = D/128;
@@ -533,11 +618,14 @@ static __global__ void i8qk_k_codebook(const char * __restrict__ K, const int64_
     const int lane = threadIdx.x % WARP_SIZE;
     const int tok  = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
     const int head = blockIdx.y;
-    if (tok >= n_kv) {
-        return;
-    }
     const int b = (lane*E)/128; // block within the row
     const int j = (lane*E)%128; // first value within the block (multiple of E)
+    if (tok >= n_kv) {
+        if (tok < n_kv_pad && j == 0) {
+            Ks[((size_t) head*n_kv_pad + tok)*NB + b] = 0.0f;
+        }
+        return;
+    }
     const char * row = K + head*nb2 + tok*nb1;
 
     float x[E];
@@ -587,7 +675,7 @@ static __global__ void i8qk_k_codebook(const char * __restrict__ K, const int64_
         *(uint32_t *) dstq = packed[0];
     }
     if (j == 0) {
-        Ks[((size_t) head*n_kv + tok)*NB + b] = fin ? amax/127.0f : 0.0f;
+        Ks[((size_t) head*n_kv_pad + tok)*NB + b] = fin ? amax/127.0f : 0.0f;
     }
 }
 
@@ -601,28 +689,45 @@ static __device__ __forceinline__ float2 i8qk_mask_pair(const half * mask, const
     return __half22float2(*(const half2 *) (mask + int64_t(q)*stride + k));
 }
 
-// Per (query tile, KV tile) mask class: 0 = every visible element -inf (skip), 1 = all 0 (no mask), 2 = mixed.
-// grid (n_ktiles, n_qtiles), block 256.
-static __global__ void i8qk_tile_flags(const half * __restrict__ mask, const int64_t s1, const int n_q,
-                                       uint8_t * __restrict__ flags) {
+static __device__ __forceinline__ float2 i8qk_mask_pair_safe(const half * mask, const int64_t stride, const int q, const int k,
+                                                             const int n_kv) {
+    if (k + 1 < n_kv) {
+        return i8qk_mask_pair(mask, stride, q, k);
+    }
+    if (stride < 0) {
+        const uint32_t * row = (const uint32_t *) mask + int64_t(q)*(-stride);
+        const uint32_t bits = row[k >> 5] >> (k & 31);
+        return make_float2((bits & 1u) ? 0.0f : -INFINITY, -INFINITY);
+    }
+    return make_float2(__half2float(mask[int64_t(q)*stride + k]), -INFINITY);
+}
+
+// Per (mask plane, query tile, KV tile) mask class: 0 = every visible element -inf (skip), 1 = all 0 (no mask), 2 = mixed.
+// grid (n_ktiles, n_qtiles, mask_ne2), block 256.
+static __global__ void i8qk_tile_flags(const half * __restrict__ mask, const int64_t mask_nb2, const int64_t s1,
+                                       const int n_q, const int n_kv, uint8_t * __restrict__ flags) {
     const int kt = blockIdx.x;
     const int qt = blockIdx.y;
+    const int mh = blockIdx.z;
+    const half * mask_h = (const half *) ((const char *) mask + (int64_t) mh*mask_nb2);
     int all_ninf = 1;
     int all_zero = 1;
     for (int i = threadIdx.x; i < I8QK_BM*I8QK_BN/2; i += blockDim.x) {
         const int row = i / (I8QK_BN/2);
         const int c2  = i % (I8QK_BN/2);
         const int q   = qt*I8QK_BM + row;
-        if (q < n_q) {
-            const float2 m = i8qk_mask_pair(mask, s1, q, kt*I8QK_BN + 2*c2);
-            all_ninf &= (isinf(m.x) && m.x < 0.0f) && (isinf(m.y) && m.y < 0.0f);
-            all_zero &= m.x == 0.0f && m.y == 0.0f;
+        const int k   = kt*I8QK_BN + 2*c2;
+        if (q < n_q && k < n_kv) {
+            const float2 m = i8qk_mask_pair_safe(mask_h, s1, q, k, n_kv);
+            const bool k1_valid = k + 1 < n_kv;
+            all_ninf &= (isinf(m.x) && m.x < 0.0f) && (!k1_valid || (isinf(m.y) && m.y < 0.0f));
+            all_zero &= m.x == 0.0f && (!k1_valid || m.y == 0.0f);
         }
     }
     all_ninf = __syncthreads_and(all_ninf);
     all_zero = __syncthreads_and(all_zero);
     if (threadIdx.x == 0) {
-        flags[(size_t) qt*gridDim.x + kt] = all_ninf ? 0 : (all_zero ? 1 : 2);
+        flags[((size_t) mh*gridDim.y + qt)*gridDim.x + kt] = all_ninf ? 0 : (all_zero ? 1 : 2);
     }
 }
 
@@ -636,11 +741,12 @@ struct i8qk_smem {
     static constexpr int k_stride = D + 16;   // bytes per int8 K row
     static constexpr int v_stride = 2*D + 16; // bytes per f16 V row
     static constexpr int q_off   = 0;
-    static constexpr int k_off   = q_off  + I8QK_BM*q_stride;
-    static constexpr int v_off   = k_off  + I8QK_BN*k_stride;
-    static constexpr int ks_off  = v_off  + I8QK_BN*v_stride;
-    static constexpr int qs_off  = ks_off + I8QK_BN*NS*int(sizeof(float));
-    static constexpr int bytes   = qs_off + I8QK_BM*NS*int(sizeof(float));
+    static constexpr int k_off   = q_off   + I8QK_BM*q_stride;
+    static constexpr int v_off   = k_off   + I8QK_BN*k_stride;
+    static constexpr int ks_off  = v_off   + I8QK_BN*v_stride;
+    static constexpr int qs_off  = ks_off  + I8QK_BN*NS*int(sizeof(float));
+    static constexpr int kcs_off = qs_off  + I8QK_BM*NS*int(sizeof(float)); // unshifted q.kmean*scale_log2 per row
+    static constexpr int bytes   = kcs_off + I8QK_BM*int(sizeof(float));
 };
 
 // PV16: f16 P.V accumulator (#151). NS: see i8qk_smem. Q2L: two-limb Q (#154 arm); limb 1 lives in registers, limb 2
@@ -653,10 +759,11 @@ static __global__ void i8qk_flash_attn(
         const char * __restrict__ Q, const int64_t q_nb1, const int64_t q_nb2,
         const int8_t * __restrict__ Kq, const float * __restrict__ Ksc,
         const char * __restrict__ V, const int64_t v_nb1, const int64_t v_nb2,
-        const half * __restrict__ mask, const int64_t mask_s1,
-        const uint8_t * __restrict__ flags, const int n_ktiles,
+        const half * __restrict__ mask, const int64_t mask_s1, const int64_t mask_nb2, const int mask_ne2,
+        const uint8_t * __restrict__ flags, const int n_qtiles, const int n_ktiles,
         float * __restrict__ dst, const int64_t dst_s_head, const int64_t dst_s_q,
-        const int n_q, const int n_kv, const int gqa, const float scale_log2,
+        const float * __restrict__ sinks, float * __restrict__ lse, const int64_t lse_s_q,
+        const int head0, const int n_q, const int n_kv, const int n_kv_pad, const int gqa, const float scale_log2,
         const float * __restrict__ kmean, const int blk_tiles, const int nblk) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     static_assert(NS == 1 || NS == D/128, "i8qk: NS must be 1 or D/128");
@@ -668,6 +775,7 @@ static __global__ void i8qk_flash_attn(
     char   * Vs  =            (smem + L::v_off);
     float  * Kss = (float  *) (smem + L::ks_off);
     float  * Qss = (float  *) (smem + L::qs_off);
+    float  * Kcs = (float  *) (smem + L::kcs_off);
 
     const int tid  = threadIdx.x;
     const int lane = tid % WARP_SIZE;
@@ -678,19 +786,32 @@ static __global__ void i8qk_flash_attn(
     const int h    = blockIdx.y;      // query head within the launched group
     const int kvh  = h / gqa;
     const int q0   = qt*I8QK_BM;
+    const int mh   = mask_ne2 > 1 ? (head0 + h)%mask_ne2 : 0;
 
-    const uint8_t * fl = flags + (size_t) qt*n_ktiles;
+    const half    * mask_h = mask ? (const half *) ((const char *) mask + (int64_t) mh*mask_nb2) : nullptr;
+    const uint8_t * fl     = flags + ((size_t) mh*n_qtiles + qt)*n_ktiles;
 
     const int8_t * Kq_h  = Kq  + (size_t) kvh*n_kv*D;
-    const float  * Ksc_h = Ksc + (size_t) kvh*n_kv*NS;
+    const float  * Ksc_h = Ksc + (size_t) kvh*n_kv_pad*NS;
     const char   * V_h   = V   + kvh*v_nb2;
 
     auto load_K = [&](const int j) {
         constexpr int chunks_row = D/16;
-        for (int i = tid; i < I8QK_BN*chunks_row; i += i8qk_nthreads) {
-            const int row = i / chunks_row;
-            const int c   = i % chunks_row;
-            i8qk_cp_async_16(Ks + row*L::k_stride + c*16, Kq_h + ((size_t) j*I8QK_BN + row)*D + c*16);
+        const int k_base = j*I8QK_BN;
+        if (k_base + I8QK_BN <= n_kv) {
+            for (int i = tid; i < I8QK_BN*chunks_row; i += i8qk_nthreads) {
+                const int row = i / chunks_row;
+                const int c   = i % chunks_row;
+                i8qk_cp_async_16(Ks + row*L::k_stride + c*16, Kq_h + ((size_t) k_base + row)*D + c*16);
+            }
+        } else {
+            for (int i = tid; i < I8QK_BN*chunks_row; i += i8qk_nthreads) {
+                const int row = i / chunks_row;
+                const int c   = i % chunks_row;
+                const bool ok = k_base + row < n_kv;
+                const int  kr = ok ? k_base + row : 0;
+                i8qk_cp_async_16_pred(Ks + row*L::k_stride + c*16, Kq_h + (size_t) kr*D + c*16, ok);
+            }
         }
         if (tid < I8QK_BN*NS/4) {
             i8qk_cp_async_16(Kss + tid*4, Ksc_h + (size_t) j*I8QK_BN*NS + tid*4);
@@ -698,10 +819,21 @@ static __global__ void i8qk_flash_attn(
     };
     auto load_V = [&](const int j) {
         constexpr int chunks_row = 2*D/16;
-        for (int i = tid; i < I8QK_BN*chunks_row; i += i8qk_nthreads) {
-            const int row = i / chunks_row;
-            const int c   = i % chunks_row;
-            i8qk_cp_async_16(Vs + row*L::v_stride + c*16, V_h + ((int64_t) j*I8QK_BN + row)*v_nb1 + c*16);
+        const int k_base = j*I8QK_BN;
+        if (k_base + I8QK_BN <= n_kv) {
+            for (int i = tid; i < I8QK_BN*chunks_row; i += i8qk_nthreads) {
+                const int row = i / chunks_row;
+                const int c   = i % chunks_row;
+                i8qk_cp_async_16(Vs + row*L::v_stride + c*16, V_h + ((int64_t) k_base + row)*v_nb1 + c*16);
+            }
+        } else {
+            for (int i = tid; i < I8QK_BN*chunks_row; i += i8qk_nthreads) {
+                const int row = i / chunks_row;
+                const int c   = i % chunks_row;
+                const bool ok = k_base + row < n_kv;
+                const int  kr = ok ? k_base + row : 0;
+                i8qk_cp_async_16_pred(Vs + row*L::v_stride + c*16, V_h + (int64_t) kr*v_nb1 + c*16, ok);
+            }
         }
     };
     auto next_tile = [&](int j) {
@@ -722,6 +854,10 @@ static __global__ void i8qk_flash_attn(
     const int8_t * Qw = Qs + (warp*16)*L::q_stride;
     const int lrow = lane % 8;
     const int lmat = lane / 8;
+
+    // With global K-mean smoothing (!KBF), scores are shifted by -scale_log2 * dot(Q, mu); sinks and LSE compare
+    // against unshifted logits, so capture that per-row correction during pass-0 Q load and restore it at the end.
+    const bool kmean_corr = !KBF && kmean != nullptr && (sinks != nullptr || lse != nullptr);
 
     // Q tile -> int8 rows in shared memory, NS f32 scales per row (softmax scale and log2(e) folded in). Lane value
     // group i (4 values at i*128 + lane*4) lies in 128-dim half i. Two-limb Q: pass 0 writes limb 1 and moves it to
@@ -751,6 +887,26 @@ static __global__ void i8qk_flash_attn(
 #pragma unroll
                 for (int i = 0; i < D/128; ++i) {
                     x[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+            if constexpr (!KBF) {
+                if (kmean_corr && (!Q2L || pass == 0)) {
+                    float qmu = 0.0f;
+                    if (q < n_q) {
+                        const float * mb = kmean + (size_t) kvh*D;
+#pragma unroll
+                        for (int i = 0; i < D/128; ++i) {
+                            const float4 mv = *(const float4 *) (mb + i*128 + lane*4);
+                            qmu += x[i].x*mv.x + x[i].y*mv.y + x[i].z*mv.z + x[i].w*mv.w;
+                        }
+                    }
+#pragma unroll
+                    for (int o = WARP_SIZE/2; o > 0; o >>= 1) {
+                        qmu += __shfl_xor_sync(0xFFFFFFFF, qmu, o);
+                    }
+                    if (lane == 0) {
+                        Kcs[row] = qmu*scale_log2;
+                    }
                 }
             }
 #pragma unroll
@@ -938,19 +1094,32 @@ static __global__ void i8qk_flash_attn(
         float mx0 = -INFINITY, mx1 = -INFINITY;
         const int qa = q0 + warp*16 + g;
         const int qb = qa + 8;
+        const int  k_base    = j*I8QK_BN;
+        const bool partial_k = k_base + I8QK_BN > n_kv;
 #pragma unroll
         for (int nt = 0; nt < I8QK_BN/8; ++nt) {
-            const int col = nt*8 + 2*t;
-            if (flag == 2) {
-                if (qa < n_q) {
-                    const float2 mk = i8qk_mask_pair(mask, mask_s1, qa, j*I8QK_BN + col);
-                    Sf[nt][0] += mk.x*1.4426950408889634f;
-                    Sf[nt][1] += mk.y*1.4426950408889634f;
+            const int k = k_base + nt*8 + 2*t;
+            if (partial_k && k >= n_kv) {
+                Sf[nt][0] = -INFINITY;
+                Sf[nt][1] = -INFINITY;
+                Sf[nt][2] = -INFINITY;
+                Sf[nt][3] = -INFINITY;
+            } else {
+                if (flag == 2) {
+                    if (qa < n_q) {
+                        const float2 mk = i8qk_mask_pair_safe(mask_h, mask_s1, qa, k, n_kv);
+                        Sf[nt][0] += mk.x*1.4426950408889634f;
+                        Sf[nt][1] += mk.y*1.4426950408889634f;
+                    }
+                    if (qb < n_q) {
+                        const float2 mk = i8qk_mask_pair_safe(mask_h, mask_s1, qb, k, n_kv);
+                        Sf[nt][2] += mk.x*1.4426950408889634f;
+                        Sf[nt][3] += mk.y*1.4426950408889634f;
+                    }
                 }
-                if (qb < n_q) {
-                    const float2 mk = i8qk_mask_pair(mask, mask_s1, qb, j*I8QK_BN + col);
-                    Sf[nt][2] += mk.x*1.4426950408889634f;
-                    Sf[nt][3] += mk.y*1.4426950408889634f;
+                if (partial_k && k + 1 >= n_kv) {
+                    Sf[nt][1] = -INFINITY;
+                    Sf[nt][3] = -INFINITY;
                 }
             }
             mx0 = fmaxf(mx0, fmaxf(Sf[nt][0], Sf[nt][1]));
@@ -1034,11 +1203,46 @@ static __global__ void i8qk_flash_attn(
     l0 += __shfl_xor_sync(0xFFFFFFFF, l0, 2);
     l1 += __shfl_xor_sync(0xFFFFFFFF, l1, 1);
     l1 += __shfl_xor_sync(0xFFFFFFFF, l1, 2);
-    const float il0 = l0 > 0.0f ? 1.0f/l0 : 0.0f;
-    const float il1 = l1 > 0.0f ? 1.0f/l1 : 0.0f;
+    float il0 = l0 > 0.0f ? 1.0f/l0 : 0.0f;
+    float il1 = l1 > 0.0f ? 1.0f/l1 : 0.0f;
+    if constexpr (!KBF) {
+        if (kmean_corr) {
+            const int rb = warp*16 + g;
+            if (m0 != -INFINITY) {
+                m0 += Kcs[rb];
+            }
+            if (m1 != -INFINITY) {
+                m1 += Kcs[rb + 8];
+            }
+        }
+    }
+    if (sinks != nullptr) {
+        const float s2    = sinks[h]*1.4426950408889634f;
+        const float mn0   = fmaxf(m0, s2);
+        const float mn1   = fmaxf(m1, s2);
+        const float sa0   = (m0 == -INFINITY || mn0 == -INFINITY) ? 0.0f : exp2f(m0 - mn0);
+        const float sa1   = (m1 == -INFINITY || mn1 == -INFINITY) ? 0.0f : exp2f(m1 - mn1);
+        const float sadd0 = (s2 == -INFINITY || mn0 == -INFINITY) ? 0.0f : exp2f(s2 - mn0);
+        const float sadd1 = (s2 == -INFINITY || mn1 == -INFINITY) ? 0.0f : exp2f(s2 - mn1);
+        l0  = l0*sa0 + sadd0;
+        l1  = l1*sa1 + sadd1;
+        m0  = mn0;
+        m1  = mn1;
+        il0 = l0 > 0.0f ? sa0/l0 : 0.0f;
+        il1 = l1 > 0.0f ? sa1/l1 : 0.0f;
+    }
 
     const int qa = q0 + warp*16 + g;
     const int qb = qa + 8;
+    constexpr float I8QK_LN2 = 0.6931471805599453f;
+    if (lse != nullptr && t == 0) {
+        if (qa < n_q) {
+            lse[(int64_t) qa*lse_s_q + h] = l0 > 0.0f ? (m0*I8QK_LN2 + logf(l0)) : -INFINITY;
+        }
+        if (qb < n_q) {
+            lse[(int64_t) qb*lse_s_q + h] = l1 > 0.0f ? (m1*I8QK_LN2 + logf(l1)) : -INFINITY;
+        }
+    }
     if (qa < n_q) {
         float * o = dst + qa*dst_s_q + h*dst_s_head;
 #pragma unroll
@@ -1064,8 +1268,9 @@ static __global__ void i8qk_flash_attn(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, q_nb1, q_nb2, Kq, Ksc, V, v_nb1, v_nb2, mask, mask_s1, flags, n_ktiles, dst, dst_s_head, dst_s_q,
-                     n_q, n_kv, gqa, scale_log2, kmean, blk_tiles, nblk);
+    GGML_UNUSED_VARS(Q, q_nb1, q_nb2, Kq, Ksc, V, v_nb1, v_nb2, mask, mask_s1, mask_nb2, mask_ne2, flags, n_qtiles,
+                     n_ktiles, dst, dst_s_head, dst_s_q, sinks, lse, lse_s_q, head0, n_q, n_kv, n_kv_pad, gqa,
+                     scale_log2, kmean, blk_tiles, nblk);
     NO_DEVICE_CODE;
 #endif
 }
@@ -1076,9 +1281,10 @@ static __global__ void i8qk_flash_attn(
 template <int D, bool PV16, int NS, bool Q2L, bool KBF>
 static void i8qk_launch_attn(const ggml_tensor * dst, const char * Qp, const int8_t * Kq, const float * ksc,
                              const char * Vp, const int64_t v_nb1, const int64_t v_nb2, const uint8_t * flags,
-                             const int n_qtiles, const int n_ktiles, float * dstp, const int heads, const int gqa,
-                             const int n_q, const int n_kv, const float scale_log2, const float * kmean,
-                             const int blk_tiles, const int nblk, cudaStream_t stream) {
+                             const int n_qtiles, const int n_ktiles, float * dstp, const float * sinksp,
+                             float * lsep, const int64_t lse_s_q, const int head0, const int heads, const int gqa,
+                             const int n_q, const int n_kv, const int n_kv_pad, const float scale_log2,
+                             const float * kmean, const int blk_tiles, const int nblk, cudaStream_t stream) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * mask = dst->src[3];
     const int    id     = ggml_cuda_get_device();
@@ -1088,22 +1294,26 @@ static void i8qk_launch_attn(const ggml_tensor * dst, const char * Qp, const int
         CUDA_CHECK(cudaFuncSetAttribute(i8qk_flash_attn<D, PV16, NS, Q2L, KBF>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) nbytes));
         smem_raised[id] = true;
     }
+    const int mask_ne2 = mask ? (int) mask->ne[2] : 1;
+    const int64_t mask_nb2 = mask ? mask->nb[2] : 0;
+    const int64_t mask_s1  = mask ? (mask->type == GGML_TYPE_I32 ? -int64_t(mask->nb[1]/sizeof(uint32_t)) : int64_t(mask->nb[1]/sizeof(half))) : 0;
     i8qk_flash_attn<D, PV16, NS, Q2L, KBF><<<dim3(n_qtiles, heads*gqa), i8qk_nthreads, nbytes, stream>>>(
         Qp, Q->nb[1], Q->nb[2], Kq, ksc, Vp, v_nb1, v_nb2,
-        mask ? (const half *) mask->data : nullptr,
-        mask ? (mask->type == GGML_TYPE_I32 ? -int64_t(mask->nb[1]/sizeof(uint32_t)) : int64_t(mask->nb[1]/sizeof(half))) : 0,
-        flags, n_ktiles, dstp, (int64_t) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)),
-        n_q, n_kv, gqa, scale_log2, kmean, blk_tiles, nblk);
+        mask ? (const half *) mask->data : nullptr, mask_s1, mask_nb2, mask_ne2,
+        flags, n_qtiles, n_ktiles, dstp, (int64_t) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)),
+        sinksp, lsep, lse_s_q, head0, n_q, n_kv, n_kv_pad, gqa, scale_log2, kmean, blk_tiles, nblk);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <int D>
 static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int first,
                                                const int heads, void * ws_k, half * ws_v) {
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * V    = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * lse   = ggml_flash_attn_ext_get_lse(dst);
 
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool & pool = ctx.pool();
@@ -1125,15 +1335,18 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
     const int nchunks  = std::min(64, std::max(1, n_kv/256));
     const int chunk    = (n_kv + nchunks - 1)/nchunks;
     const int n_qtiles = (n_q + I8QK_BM - 1)/I8QK_BM;
-    const int n_ktiles = n_kv/I8QK_BN;
+    const int n_ktiles = (n_kv + I8QK_BN - 1)/I8QK_BN;
+    const int n_kv_pad = n_ktiles*I8QK_BN;
     const int nblk     = kbf ? (n_kv + kblk - 1)/kblk : 1;
+    const int mask_ne2 = mask ? (int) mask->ne[2] : 1;
 
-    // the big buffers live in the caller's f16 K/V reservation (no new VRAM); only scales, means and flags are pooled
-    GGML_ASSERT(ws_k != nullptr && ws_v != nullptr);
+    // quantized caches live in the caller's f16 K/V reservation; f16 caches pass pool ws_k with ws_v == nullptr
+    GGML_ASSERT(ws_k != nullptr);
+    GGML_ASSERT(ws_v != nullptr || !((k_conv && !kcb) || v_conv));
     half   * f16_buf = ws_v;
     int8_t * Kq      = (int8_t *) ws_k;
     // pool allocations in construction order (the VMM pool frees LIFO, i.e. in reverse destruction order)
-    ggml_cuda_pool_alloc<float>   ksc(pool, (size_t) n_kv*heads*ns);
+    ggml_cuda_pool_alloc<float>   ksc(pool, (size_t) n_kv_pad*heads*ns);
     ggml_cuda_pool_alloc<float>   kmean_part(pool);
     ggml_cuda_pool_alloc<float>   kmean(pool);
     if (kblk < 0) {
@@ -1145,13 +1358,13 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
     // flag unset: allocate at the same point as before the cache existed (same pool order and footprint)
     ggml_cuda_pool_alloc<uint8_t> flags(pool);
     if (!ggml_cuda_fattn_i8qk_flagcache()) {
-        flags.alloc((size_t) n_qtiles*n_ktiles);
+        flags.alloc((size_t) mask_ne2*n_qtiles*n_ktiles);
     }
 
     if (kcb) {
         // codebook-direct int8 K straight from the cache codes (#152): mean pass + one quant pass, no f16 staging
         const char * Kp = (const char *) K->data + (size_t) first*K->nb[2];
-        const dim3 grid(n_kv/8, heads);
+        const dim3 grid(n_kv_pad/8, heads);
         const float * mu = nullptr;
         if (kblk < 0) {
             if (K->type == GGML_TYPE_TQ5_0) {
@@ -1163,9 +1376,9 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
             mu = kmean.ptr;
         }
         if (K->type == GGML_TYPE_TQ5_0) {
-            i8qk_k_codebook<D, GGML_TYPE_TQ5_0><<<grid, 256, 0, stream>>>(Kp, K->nb[1], K->nb[2], n_kv, mu, Kq, ksc.ptr);
+            i8qk_k_codebook<D, GGML_TYPE_TQ5_0><<<grid, 256, 0, stream>>>(Kp, K->nb[1], K->nb[2], n_kv, n_kv_pad, mu, Kq, ksc.ptr);
         } else {
-            i8qk_k_codebook<D, GGML_TYPE_TQ6_0><<<grid, 256, 0, stream>>>(Kp, K->nb[1], K->nb[2], n_kv, mu, Kq, ksc.ptr);
+            i8qk_k_codebook<D, GGML_TYPE_TQ6_0><<<grid, 256, 0, stream>>>(Kp, K->nb[1], K->nb[2], n_kv, n_kv_pad, mu, Kq, ksc.ptr);
         }
         CUDA_CHECK(cudaGetLastError());
     } else {
@@ -1200,9 +1413,9 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
         }
         const int qblk = kbf ? kblk : 0;
         if (ns == 1) {
-            i8qk_k_quant<D, 1><<<dim3(n_kv/8, heads), 256, 0, stream>>>(Kh, k_s_tok, k_s_head, kmean.ptr, n_kv, qblk, nblk, Kq, ksc.ptr);
+            i8qk_k_quant<D, 1><<<dim3(n_kv_pad/8, heads), 256, 0, stream>>>(Kh, k_s_tok, k_s_head, kmean.ptr, n_kv, n_kv_pad, qblk, nblk, Kq, ksc.ptr);
         } else {
-            i8qk_k_quant<D, D/128><<<dim3(n_kv/8, heads), 256, 0, stream>>>(Kh, k_s_tok, k_s_head, kmean.ptr, n_kv, qblk, nblk, Kq, ksc.ptr);
+            i8qk_k_quant<D, D/128><<<dim3(n_kv_pad/8, heads), 256, 0, stream>>>(Kh, k_s_tok, k_s_head, kmean.ptr, n_kv, n_kv_pad, qblk, nblk, Kq, ksc.ptr);
         }
         CUDA_CHECK(cudaGetLastError());
     }
@@ -1226,13 +1439,15 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
         v_nb2 = V->nb[2];
     }
 
-    // 5. mask classes per (query tile, KV tile)
-    const size_t n_flags = (size_t) n_qtiles*n_ktiles;
+    // 5. mask classes per (mask plane, query tile, KV tile); more than one mask plane (GGML_CUDA_FA_I8QK_EXT=1) or a
+    // partial last KV tile bypasses the FLAGCACHE (its key holds neither)
+    const size_t n_flags = (size_t) mask_ne2*n_qtiles*n_ktiles;
     uint8_t * flags_ptr = nullptr;
     if (mask != nullptr) {
         const int64_t mask_stride = mask->type == GGML_TYPE_I32 ? -int64_t(mask->nb[1]/sizeof(uint32_t)) : int64_t(mask->nb[1]/sizeof(half));
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-        const bool enabled = ggml_cuda_fattn_i8qk_flagcache() && ctx.curr_stream_no == 0;
+        const bool enabled = ggml_cuda_fattn_i8qk_flagcache() && ctx.curr_stream_no == 0 && mask_ne2 == 1 &&
+                n_kv % I8QK_BN == 0;
         if (enabled) {
             CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
         }
@@ -1262,7 +1477,8 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
             } else {
                 flags_ptr = flags.ptr ? flags.ptr : flags.alloc(n_flags);
             }
-            i8qk_tile_flags<<<dim3(n_ktiles, n_qtiles), 256, 0, stream>>>((const half *) mask->data, mask_stride, n_q, flags_ptr);
+            i8qk_tile_flags<<<dim3(n_ktiles, n_qtiles, mask_ne2), 256, 0, stream>>>(
+                (const half *) mask->data, mask->nb[2], mask_stride, n_q, n_kv, flags_ptr);
             CUDA_CHECK(cudaGetLastError());
         }
     } else {
@@ -1275,10 +1491,16 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
     const float scale_log2 = scale*1.4426950408889634f;
 
-    const char * Qp = (const char *) Q->data + (size_t) first*gqa*Q->nb[2];
-    float * dstp = (float *) dst->data + (size_t) first*gqa*D;
+    const int head0 = first*gqa;
+    const char * Qp = (const char *) Q->data + (size_t) head0*Q->nb[2];
+    float * dstp    = (float *) dst->data + (size_t) head0*(dst->nb[1]/sizeof(float));
+    const float * sinksp = sinks ? (const float *) sinks->data + head0 : nullptr;
+    float * lsep    = lse ? (float *) lse->data + head0 : nullptr;
+    const int64_t lse_s_q = lse ? (int64_t) (lse->nb[1]/sizeof(float)) : 0;
+    const float * kmean_attn = kblk == 0 ? nullptr : kmean.ptr;
 #define I8QK_LAUNCH(PV16, NS, Q2L, KBF) i8qk_launch_attn<D, PV16, NS, Q2L, KBF>(dst, Qp, Kq, ksc.ptr, Vp, v_nb1, v_nb2, \
-        flags_ptr, n_qtiles, n_ktiles, dstp, heads, gqa, n_q, n_kv, scale_log2, kmean.ptr, kblk/I8QK_BN, nblk, stream)
+        flags_ptr, n_qtiles, n_ktiles, dstp, sinksp, lsep, lse_s_q, head0, heads, gqa, n_q, n_kv, n_kv_pad, \
+        scale_log2, kmean_attn, kblk/I8QK_BN, nblk, stream)
 #define I8QK_LAUNCH_PV16(NS) \
         if (md.q2l) { if (kbf) { I8QK_LAUNCH(true, NS, true,  true); } else { I8QK_LAUNCH(true, NS, true,  false); } } \
         else        { if (kbf) { I8QK_LAUNCH(true, NS, false, true); } else { I8QK_LAUNCH(true, NS, false, false); } }

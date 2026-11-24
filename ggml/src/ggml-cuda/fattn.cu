@@ -4525,8 +4525,8 @@ static void ggml_cuda_flash_attn_ext_bounded_prefill(
 }
 
 // [I8QK] default-on int8-QK prefill route (GGML_CUDA_FA_I8QK=0 opts out, fattn-i8qk.cu). Takes only ops that would run the f16 MMA
-// kernel (generic or bounded prefill route) and reuses the reservation the allocator made for that route: the f16 K
-// region holds the int8 K, the f16 V region first stages the f16 K, then holds the f16 V. No new reservation.
+// kernel (generic or bounded prefill route). Quantized caches reuse the f16 K/V reservation behind dst; F16 KV caches
+// (GGML_CUDA_FA_I8QK_F16=1) pool transient int8 K tiles in bounded head groups while reading F16 V in place.
 static bool ggml_cuda_flash_attn_ext_i8qk_route(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
@@ -4537,40 +4537,104 @@ static bool ggml_cuda_flash_attn_ext_i8qk_route(ggml_backend_cuda_context & ctx,
             ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_MMA_F16) {
         return false;
     }
-    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * lse  = ggml_flash_attn_ext_get_lse(dst);
 
-    const ggml_cuda_fattn_bounded_plan p = ggml_cuda_fattn_bounded_prefill_plan(device, dst);
+    const bool k_conv = K->type != GGML_TYPE_F16;
+    const bool v_conv = V->type != GGML_TYPE_F16;
+
+    const ggml_cuda_fattn_bounded_plan p = (k_conv && v_conv) ?
+        ggml_cuda_fattn_bounded_prefill_plan(device, dst) : ggml_cuda_fattn_bounded_plan();
+    ggml_cuda_flash_attn_ext_f16_extra_data want = {};
+    if (p.heads == 0 && (k_conv || v_conv)) {
+        // quantized K and/or V need the f16 reservation behind dst rather than pulling full f16 copies from the pool
+        if (dst->buffer == nullptr || dst->view_src != nullptr) {
+            return false;
+        }
+        want = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
+        if ((k_conv && want.K == 0) || (v_conv && want.V == 0) ||
+                want.end - (uintptr_t) dst->data > ggml_backend_buffer_get_alloc_size(dst->buffer, dst)) {
+            return false;
+        }
+    }
+
+    ggml_cuda_pool_alloc<char>   ws_pool(ctx.pool());
+    ggml_cuda_pool_alloc<int8_t> kq_pool(ctx.pool());
+    ggml_cuda_pool_alloc<half>   f16_pool(ctx.pool());
+
+    char * bounded_ws = nullptr;
     if (p.heads > 0) {
         // same workspace and capture rule as ggml_cuda_flash_attn_ext_bounded_prefill
         cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
         GGML_ASSERT(capture_status == cudaStreamCaptureStatusNone && "bounded prefill must not run inside CUDA graph capture");
-
-        ggml_cuda_pool_alloc<char> ws_pool(ctx.pool());
-        char * ws = nullptr;
         const bool reserved = dst->buffer != nullptr && dst->view_src == nullptr && (uintptr_t) dst->data % 128 == 0 &&
             p.offset + p.workspace <= ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
-        ws = reserved ? (char *) dst->data + p.offset : ws_pool.alloc(p.workspace);
+        bounded_ws = reserved ? (char *) dst->data + p.offset : ws_pool.alloc(p.workspace);
+    }
 
-        for (int first = 0; first < p.n_head_kv; first += p.heads) {
-            const int heads = std::min(p.heads, p.n_head_kv - first);
-            ggml_cuda_flash_attn_ext_i8qk(ctx, dst, first, heads, ws, (half *) (ws + p.kv_bytes));
+    int grp_heads = (int) K->ne[2];
+    if (p.heads == 0 && !k_conv) {
+        static const size_t f16_cap = [] {
+            const char * e = getenv("GGML_CUDA_FA_I8QK_F16_MIB");
+            const int mib = (e && *e) ? atoi(e) : 256;
+            return mib > 0 ? size_t(mib) << 20 : size_t(-1);
+        }();
+        const size_t head_bytes = (size_t) K->ne[1]*K->ne[0];
+        if (f16_cap != size_t(-1)) {
+            grp_heads = std::max(1, (int) std::min<size_t>(K->ne[2], f16_cap/head_bytes));
         }
-        return true;
+        kq_pool.alloc((size_t) grp_heads*head_bytes);
+    }
+    if (p.heads == 0 && k_conv && !v_conv) {
+        f16_pool.alloc((size_t) K->ne[2]*K->ne[1]*K->ne[0]);
     }
 
-    // generic route: the f16 K/V copies reserved behind dst (both caches are quantized, see the gate); without that
-    // reservation the op keeps the f16 route rather than taking new VRAM from the pool
-    if (dst->buffer == nullptr || dst->view_src != nullptr) {
-        return false;
+    for (int64_t seq = 0; seq < Q->ne[3]; ++seq) {
+        ggml_tensor qs = *Q, ks = *K, vs = *V, ds = *dst;
+        ggml_tensor ms, ls;
+        ggml_tensor * d_seq = dst;
+        if (Q->ne[3] > 1) {
+            qs.ne[3] = 1; qs.data = (char *) Q->data + (size_t) seq*Q->nb[3];
+            ks.ne[3] = 1; ks.data = (char *) K->data + (K->ne[3] > 1 ? (size_t) seq*K->nb[3] : 0);
+            vs.ne[3] = 1; vs.data = (char *) V->data + (V->ne[3] > 1 ? (size_t) seq*V->nb[3] : 0);
+            ds.ne[3] = 1; ds.data = (char *) dst->data + (size_t) seq*dst->nb[3];
+            ds.src[0] = &qs;
+            ds.src[1] = &ks;
+            ds.src[2] = &vs;
+            if (mask != nullptr) {
+                ms = *mask;
+                ms.ne[3] = 1;
+                ms.data = (char *) mask->data + (mask->ne[3] > 1 ? (size_t) seq*mask->nb[3] : 0);
+                ds.src[3] = &ms;
+            }
+            if (lse != nullptr) {
+                ls = *lse;
+                ls.ne[2] = 1;
+                ls.data = (char *) lse->data + (size_t) seq*lse->nb[2];
+                ds.src[9] = &ls;
+            }
+            d_seq = &ds;
+        }
+        if (p.heads > 0) {
+            for (int first = 0; first < p.n_head_kv; first += p.heads) {
+                const int heads = std::min(p.heads, p.n_head_kv - first);
+                ggml_cuda_flash_attn_ext_i8qk(ctx, d_seq, first, heads, bounded_ws, (half *) (bounded_ws + p.kv_bytes));
+            }
+        } else if (!k_conv) {
+            half * ws_v = v_conv ? (half *) want.V : nullptr;
+            for (int first = 0; first < (int) K->ne[2]; first += grp_heads) {
+                const int heads = std::min(grp_heads, (int) K->ne[2] - first);
+                ggml_cuda_flash_attn_ext_i8qk(ctx, d_seq, first, heads, kq_pool.ptr, ws_v);
+            }
+        } else {
+            half * ws_v = v_conv ? (half *) want.V : f16_pool.ptr;
+            ggml_cuda_flash_attn_ext_i8qk(ctx, d_seq, 0, (int) K->ne[2], (void *) want.K, ws_v);
+        }
     }
-    const ggml_cuda_flash_attn_ext_f16_extra_data want = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
-    if (want.K == 0 || want.V == 0 || want.end - (uintptr_t) dst->data > ggml_backend_buffer_get_alloc_size(dst->buffer, dst)) {
-        return false;
-    }
-    void * ws_k = (void *) want.K;
-    half * ws_v = (half *) want.V;
-    ggml_cuda_flash_attn_ext_i8qk(ctx, dst, 0, (int) K->ne[2], ws_k, ws_v);
     return true;
 }
 
@@ -5079,8 +5143,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     // fork (LSA compensation, opt-in): an LSE output (src[9]) is written only by the parallel-block combine of the
-    // generic kernels or the MMA stream-k uniform fixup, so skip the fused / i8qk / bounded routes
+    // generic kernels, the MMA stream-k uniform fixup, or i8qk when GGML_CUDA_FA_I8QK_EXT=1
     if (ggml_flash_attn_ext_get_lse(dst) != nullptr) {
+        if (ggml_cuda_fattn_i8qk_ext_enabled() && ggml_cuda_flash_attn_ext_i8qk_route(ctx, dst)) {
+            return;
+        }
         const best_fattn_kernel k = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
         GGML_ASSERT(k != BEST_FATTN_KERNEL_NONE);
         // MMA f16 with the stream-k uniform fixup writing the LSE (INKREL 32K gate: within the batch-split rounding

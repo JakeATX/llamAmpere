@@ -21,6 +21,9 @@
 #include "common.cuh"
 
 bool ggml_cuda_fattn_i8qk_enabled();
+bool ggml_cuda_fattn_i8qk_f16_enabled();
+bool ggml_cuda_fattn_i8qk_ext_enabled();
+int  ggml_cuda_fattn_i8qk_min_q();
 
 // Shape/type gate of the int8-QK route (the caller also checks that the op would take the f16 MMA route).
 bool ggml_cuda_fattn_i8qk_applies(int cc, const ggml_tensor * dst);
@@ -29,11 +32,11 @@ bool ggml_cuda_fattn_i8qk_applies(int cc, const ggml_tensor * dst);
 // their own int8 K workspace, i.e. the SJ-KVaRN prefill (fattn-sjkvarn-prefill.cu) on its expanded f16 K/V scratch.
 bool ggml_cuda_fattn_i8qk_applies_f16kv(int cc, const ggml_tensor * dst);
 
-// [I8SJ] planning predicate on the original SJ-KVaRN node (switch on, SM80+, D 256, wide query, no sinks / bias /
-// softcap, one mask plane): the SJ-KVaRN prefill plan then reserves n_kv*256 bytes of int8 K per KV head of a group.
+// [I8SJ] planning predicate on the original SJ-KVaRN node (switch on, SM80+, D 256, wide query, optional ext features
+// when GGML_CUDA_FA_I8QK_EXT=1): the SJ-KVaRN prefill plan then reserves n_kv*256 bytes of int8 K per KV head of a group.
 bool ggml_cuda_fattn_i8qk_sj_kvarn_wanted(int cc, const ggml_tensor * dst);
 
 // Run KV heads [first, first + heads) of dst. ws_k: >= n_kv*D*heads bytes for the int8 K; ws_v: >= n_kv*D*heads halves
-// for the f16 K staging and then the f16 V (both required).
+// for the f16 K staging and/or f16 V when either K or V is quantized (may be nullptr when both K and V are F16).
 void ggml_cuda_flash_attn_ext_i8qk(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int first, int heads,
                                    void * ws_k, half * ws_v);

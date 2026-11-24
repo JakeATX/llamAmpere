@@ -23235,6 +23235,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_large_logits(hs, hs, 4, {6, 1}, 1024, 200, true, false, 0, 0, GGML_PREC_F32, types.first, types.second));
         }
     }
+    // [I8QK-EXT] Sinks, per-head masks (mask_heads > 1), LSE output, and non-64-multiple KV tails (GGML_CUDA_FA_I8QK_F16=1 / GGML_CUDA_FA_I8QK_EXT=1).
+    for (const auto & types : {std::pair{GGML_TYPE_F16, GGML_TYPE_F16}, std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
+        for (int64_t kv : {512, 531}) {
+            auto * t = new test_flash_attn_ext(128, 128, 4, {6, 1}, kv, 128, true, true, 0, 0, GGML_PREC_F32, types.first, types.second, {0, 1, 2, 3}, true, false, 0, 0, 24);
+            t->lse_out = true;
+            test_cases.emplace_back(t);
+        }
+    }
 
     // SLOWKV (GGML_SLOWKV): the same verify-width coverage for the other fused D256 pairs. Width 5 takes the compact
     // tile when the switch is on, turbo4/tq6_0 widths 5-8 otherwise the fused (8,8) tile, q8_0/q5_1 the fused tiles at
