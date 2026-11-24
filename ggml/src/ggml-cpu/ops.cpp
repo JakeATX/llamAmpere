@@ -9267,16 +9267,32 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // INKREL (ggml-inkrel.h): bias table[h, rel_pos[ic, iq1], iq1] added to the mask, rounded to f16 like a per-head mask
         const ggml_tensor * ir_tab = ggml_flash_attn_ext_inkrel_table(dst);
         const ggml_tensor * ir_pos = ggml_flash_attn_ext_inkrel_pos(dst);
-        const float   * ir_trow = ir_tab ? (const float *) ((const char *) ir_tab->data + iq1*ir_tab->nb[2] + iq2*ir_tab->nb[0]) : nullptr;
+        // INKREL factor form: bias = d < extent ? r[iq1, iq2] . E[d] : 0 (src[7] = [E; r], src[4] = per-row sinks)
+        const bool      ir_fac  = ggml_flash_attn_ext_is_inkrel_factor(dst);
+        const int64_t   ir_ext  = ir_fac ? ggml_flash_attn_ext_inkrel_factor_extent(dst) : 0;
+        const float   * ir_r    = ir_fac ? (const float *) ir_tab->data + (ir_ext + iq1*neq2 + iq2)*16 : nullptr;
+        const float   * ir_trow = ir_tab && !ir_fac ? (const float *) ((const char *) ir_tab->data + iq1*ir_tab->nb[2] + iq2*ir_tab->nb[0]) : nullptr;
         const int32_t * ir_prow = ir_pos ? (const int32_t *) ((const char *) ir_pos->data + iq1*ir_pos->nb[1]) : nullptr;
         const size_t    ir_tnb1 = ir_tab ? ir_tab->nb[1] : 0;
+        auto ir_fbias = [&](const int32_t d) -> float {
+            if (d >= ir_ext) {
+                return 0.0f;
+            }
+            const float * e = (const float *) ir_tab->data + (int64_t) d*16;
+            float acc = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                acc += ir_r[i]*e[i];
+            }
+            return acc;
+        };
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = ir_trow ? GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(mp[ic]) +
+            const float mv = ir_fac ? GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(mp[ic]) + ir_fbias(ir_prow[ic]))) :
+                             ir_trow ? GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(mp[ic]) +
                                  *(const float *) ((const char *) ir_trow + ir_prow[ic]*ir_tnb1))) :
                              mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
                              mw ? slope*((mw[ic >> 5] >> (ic & 31)) & 1 ? 0.0f : -INFINITY) :
@@ -9338,7 +9354,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         // sinks - apply only on the first kv-chunk
         if (sinks && ic_start == 0) {
-            const float s = ((float *)((char *) sinks->data))[h];
+            const float s = ir_fac ? ((const float *) sinks->data)[iq1*neq2 + h] : ((float *)((char *) sinks->data))[h];
 
             float ms = 1.0f;
             float vs = 1.0f;
