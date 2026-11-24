@@ -9592,7 +9592,7 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
             in.n_blk       = n_kv / rcfg.block;
             in.sinks       = rcfg.sinks;
             in.window      = (int64_t) extent;
-            in.idx_cap     = llama_inklsa_idx_rows(attn_ctx->get_base()->get_size(), in.B) + 1;
+            in.idx_cap     = llama_inklsa_idx_rows(attn_ctx->get_base()->get_kv_size(), in.B) + 1;
             in.n_u         = std::max<int64_t>(1, (T + in.B - 1) / in.B);
             in.n_keep      = llama_inklsa_n_keep_for(n_kv, rcfg.keep, rcfg.keep_frac, rcfg.keep_max);
             const int64_t n_fix_sj   = in.sinks + in.window;

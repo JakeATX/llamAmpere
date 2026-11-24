@@ -213,7 +213,7 @@ void llama_inklsa_reset_valid(const ggml_tensor * const * kcaches, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         auto it = s.e.find(kcaches[i]);
         if (it != s.e.end()) {
-            it.second.built = it.second.gen;
+            it->second.built = it->second.gen;
         }
     }
 }
