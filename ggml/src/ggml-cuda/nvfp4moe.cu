@@ -6,6 +6,7 @@
 #endif
 
 #include "nvfp4mt.cuh"
+#include "nk-nvfp4-tc.cuh"
 
 #include <cstdlib>
 #include <cstring>
@@ -107,6 +108,9 @@ void ggml_cuda_nvfp4moe_launch(const nvfp4moe_params & P, cudaStream_t stream) {
         k_nvfp4moe_dn1f<<<P.K/8, 256, 0, stream>>>(P);
         CUDA_CHECK(cudaGetLastError());
         return;
+    }
+    if (ggml_cuda_nk_nvfp4_tc_launch(P, stream)) {
+        return;  // NEONKERN: sm_86 int8 tensor-core NVFP4 MoE for T = 1..8 (GGML_CUDA_NK_NVFP4_TC=1)
     }
     if (P.T == 1) {
         if (!ggml_cuda_nvfp4mt_launch(P, stream)) {  // NVFP4MT at one token: only without write_sum (e_out, caller sums)
