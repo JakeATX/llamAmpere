@@ -317,6 +317,16 @@ struct common_params_sampling {
     bool spec_lossy = false;
     bool spec_lossy_explicit = false; // --spec-mb-mtp / --no-spec-mb-mtp (or LLAMA_ARG_SPEC_MB_MTP) was given; otherwise MTP drafting turns it on
 
+    // Opt-in bounded-KL mb-MTP (--spec-mb-kappa / --spec-mb-alpha / --spec-mb-pos-weight / --spec-mb-no-consec).
+    // All unset (kappa <= 1, alpha == 1, both bools false) keeps the classic verifier code path unchanged.
+    // kappa > 1 keeps a rejected draft d over the replacement y with probability
+    //   w(d, y) = I[p(d) >= alpha * p(y)] * min(1, (kappa - 1) / (max(0, q(d)/p(d) - 1) + kappa * (1 - q(y)/p(y))))
+    // which bounds the emitted law pointwise: p(x) / kappa <= p_mb(x) <= kappa * p(x).
+    float spec_mb_kappa      = 0.0f;  // <= 1: off; > 1: likelihood-ratio cap
+    float spec_mb_alpha      = 1.0f;  // rescue only when p(draft) >= alpha * p(replacement) (1 = off)
+    bool  spec_mb_pos_weight = false; // scale log(kappa) by the draft position's continuation value
+    bool  spec_mb_no_consec  = false; // no rescue right after a rescue within one draft round
+
     // print the parameters into a string
     std::string print() const;
 };
