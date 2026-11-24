@@ -1,24 +1,40 @@
-// NEONKERN NK_DENSE_TC: Ampere int8 tensor-core kernel (mma.m16n8k32.s32.s8)
-// for dense Q8_0 decode/verify projections (T=1..8), single and grouped.
-// Weights stay in stock 34-byte block_q8_0 layout; 4 warps cooperate on a
-// 3-stage cp.async.cg.L2::128B shared ring (272 B = 8 blocks per chunk) with
-// overlapped in-register per-32 f32 -> int8 + fp32-scale activation quantization.
+// NEONKERN NK_DENSE_TC: Ampere int8 tensor-core kernels (mma.m16n8k32.s32.s8)
+// for dense Q8_0 decode/verify projections (T=1..8).
+//
+// Primary target (GGML_CUDA_NK_DENSE_TC=1, default MIN_ROWS=16385):
+//   k_nk_head_tc: persistent 1-CTA/SM head streamer (NW=8 independent warps/CTA,
+//   2-stage cross-tile cp.async.cg.L2::128B.L2::cache_hint evict_first, activation
+//   quantized ONCE per SM into SMEM in exact MMA lane layout, 0 barriers in the
+//   streaming loop, 0 epilogue SMEM reduction, even SM tile partitioning).
+//
+// Fallback / MIN_ROWS=0 (attention-sized or grouped or K > 3072):
+//   k_nk_dense_tc: 4-warp 3-stage cooperative ring kernel (r11 behavior).
+//
 // Opt-in via GGML_CUDA_NK_DENSE_TC=1 (default OFF).
 
 #include "nk-dense-tc.cuh"
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <atomic>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
 
-#define NK_DTC_MAX_GROUP   8
-#define NK_DTC_STAGES      3
-#define NK_DTC_ROW_WORDS   68
-#define NK_DTC_STAGE_WORDS (16 * NK_DTC_ROW_WORDS)
-#define NK_DTC_STAGE_BYTES (NK_DTC_STAGE_WORDS * 4)
-#define NK_DTC_RED_FLOATS  (3 * 32 * 4)
+#define NK_DTC_MAX_GROUP      8
+#define NK_DTC_STAGES         3
+#define NK_DTC_ROW_WORDS      68
+#define NK_DTC_STAGE_WORDS    (16 * NK_DTC_ROW_WORDS)
+#define NK_DTC_STAGE_BYTES    (NK_DTC_STAGE_WORDS * 4)
+#define NK_DTC_RED_FLOATS     (3 * 32 * 4)
+
+#define NK_HEAD_MIN_ROWS_DEF  16385
+#define NK_HEAD_NW            8
+#define NK_HEAD_MAX_NCH       12
+#define NK_HEAD_W_WORDS       (NK_HEAD_NW * 2 * NK_DTC_STAGE_WORDS)
+#define NK_HEAD_W_BYTES       (NK_HEAD_W_WORDS * 4)
+#define NK_HEAD_X_BLK_BYTES   (32 * 8 + 4 * 8)
+#define NK_HEAD_MAX_SMEM      (NK_HEAD_W_BYTES + (NK_HEAD_MAX_NCH * 8) * NK_HEAD_X_BLK_BYTES)
 
 static std::atomic<int64_t> g_nk_dense_tc_fires{0};
 
@@ -28,6 +44,18 @@ bool ggml_cuda_nk_dense_tc_enabled() {
         return e != nullptr && strcmp(e, "1") == 0;
     }();
     return on;
+}
+
+int ggml_cuda_nk_dense_tc_min_rows() {
+    static const int v = [] {
+        const char * e = getenv("GGML_CUDA_NK_DENSE_TC_MIN_ROWS");
+        if (e == nullptr) {
+            return NK_HEAD_MIN_ROWS_DEF;
+        }
+        const int x = atoi(e);
+        return x > 0 ? x : 0;
+    }();
+    return v;
 }
 
 int64_t ggml_cuda_nk_dense_tc_count() {
@@ -52,6 +80,14 @@ static int nk_dense_tc_max_rows() {
         return x > 0 ? x : 0;
     }();
     return v;
+}
+
+static bool nk_dense_tc_l2_evict_first_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_NK_DENSE_TC_L2");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
 }
 
 static bool nk_dense_tc_trace() {
@@ -79,6 +115,32 @@ static __device__ __forceinline__ void nk_dtc_cp16(uint32_t smem_addr, const voi
     asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(smem_addr), "l"(gmem));
 #else
     GGML_UNUSED_VARS(smem_addr, gmem);
+    NO_DEVICE_CODE;
+#endif
+}
+
+static __device__ __forceinline__ uint64_t nk_head_l2_evict_first() {
+#if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    uint64_t p = 0;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(p));
+    return p;
+#else
+    return 0;
+#endif
+}
+
+template <bool L2_EF>
+static __device__ __forceinline__ void nk_head_cp16(uint32_t smem_addr, const void * gmem, uint64_t l2_pol) {
+#if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    if constexpr (L2_EF) {
+        asm volatile("cp.async.cg.shared.global.L2::128B.L2::cache_hint [%0], [%1], 16, %2;\n"
+            :: "r"(smem_addr), "l"(gmem), "l"(l2_pol));
+    } else {
+        asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+            :: "r"(smem_addr), "l"(gmem));
+    }
+#else
+    GGML_UNUSED_VARS(smem_addr, gmem, l2_pol);
     NO_DEVICE_CODE;
 #endif
 }
@@ -138,6 +200,223 @@ static __device__ __forceinline__ void nk_dtc_quant_x_pair(
     nk_dtc_quant_x_blk(v10, v11, tig, b0_1, b1_1, dx0_1, dx1_1);
 }
 
+// Persistent 1-CTA/SM head kernel: NW=8 independent warps, 2-stage cross-tile cp.async ring,
+// activation quantized once per CTA into SMEM (exact MMA lane layout), zero loop/epilogue barriers.
+template <bool L2_EF>
+static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
+        const char  * __restrict__ vx,
+        const float * __restrict__ x,
+        float       * __restrict__ dst,
+        const int64_t srow,
+        const int64_t sx,
+        const int64_t sd,
+        const int     nr,
+        const int     nch,
+        const int     T) {
+#if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    extern __shared__ __align__(16) uint32_t smem[];
+
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int w    = tid >> 5;
+    const int gid  = lane >> 2;
+    const int tig  = lane & 3;
+    const int nb   = nch * 8;
+
+    uint32_t * sw    = smem;
+    uint2    * s_xb  = (uint2 *)  (sw + NK_HEAD_W_WORDS);
+    float2   * s_xdx = (float2 *) (s_xb + nb * 32);
+
+    // 1. Quantize all nb activation blocks ONCE per CTA into SMEM (exact MMA lane order).
+    const bool colok = gid < T;
+    const float * x_col = x + (int64_t) (colok ? gid : 0) * sx + 4 * tig;
+    for (int b = w; b < nb; b += NK_HEAD_NW) {
+        const float * xp = x_col + (int64_t) b * QK8_0;
+        const float4 z   = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4 v0  = colok ? __ldg((const float4 *) (xp +  0)) : z;
+        const float4 v1  = colok ? __ldg((const float4 *) (xp + 16)) : z;
+        uint32_t b0, b1;
+        float dx0, dx1;
+        nk_dtc_quant_x_blk(v0, v1, tig, b0, b1, dx0, dx1);
+        s_xb[b * 32 + lane] = make_uint2(b0, b1);
+        if (gid == 0) {
+            s_xdx[b * 4 + tig] = make_float2(dx0, dx1);
+        }
+    }
+    __syncthreads();
+
+    // 2. Evenly partition 16-row tiles across SMs (contiguous DRAM slice per SM, ~99.5% load balance).
+    const int ntiles     = (nr + 15) / 16;
+    const int nfull      = nr / 16;
+    const int base_tiles = ntiles / (int) gridDim.x;
+    const int rem_tiles  = ntiles % (int) gridDim.x;
+    const int sm_start   = (int) blockIdx.x * base_tiles + min((int) blockIdx.x, rem_tiles);
+    const int sm_end     = sm_start + base_tiles + ((int) blockIdx.x < rem_tiles ? 1 : 0);
+
+    int tile = sm_start + w;
+    if (tile >= sm_end) {
+        return;
+    }
+
+    // 3. Precompute all 9 coalesced 16-B copy descriptors once for this warp (zero i/17 in loop).
+    uint32_t * S_warp = sw + w * (2 * NK_DTC_STAGE_WORDS);
+    int32_t  g_off[9];
+    uint32_t sa_base[9];
+#pragma unroll
+    for (int i0 = 0; i0 < 8; ++i0) {
+        const int i = i0 * 32 + lane;
+        const int r = i / 17;
+        const int c = i - r * 17;
+        g_off[i0]   = (int32_t) ((int64_t) r * srow + c * 16);
+        sa_base[i0] = (uint32_t) __cvta_generic_to_shared(&S_warp[r * NK_DTC_ROW_WORDS + c * 4]);
+    }
+    g_off[8]   = (lane < 16) ? (int32_t) ((int64_t) 15 * srow + (lane + 1) * 16) : 0;
+    sa_base[8] = (lane < 16) ? (uint32_t) __cvta_generic_to_shared(&S_warp[15 * NK_DTC_ROW_WORDS + (lane + 1) * 4]) : 0u;
+
+    const uint64_t l2_pol = L2_EF ? nk_head_l2_evict_first() : 0ull;
+
+    auto issue_tile_chunk = [&](const int t_idx, const int c_idx, const uint32_t stage_bytes) {
+        const char * cb = vx + (int64_t) t_idx * 16 * srow + (int64_t) c_idx * 272;
+        if (t_idx < nfull) {
+#pragma unroll
+            for (int i0 = 0; i0 < 8; ++i0) {
+                nk_head_cp16<L2_EF>(sa_base[i0] + stage_bytes, cb + g_off[i0], l2_pol);
+            }
+            if (lane < 16) {
+                nk_head_cp16<L2_EF>(sa_base[8] + stage_bytes, cb + g_off[8], l2_pol);
+            }
+        } else {
+            const int rmax = nr - 1 - t_idx * 16;
+#pragma unroll
+            for (int i0 = 0; i0 < 8; ++i0) {
+                const int i = i0 * 32 + lane;
+                const int r = i / 17;
+                const int c = i - r * 17;
+                nk_head_cp16<L2_EF>(sa_base[i0] + stage_bytes, cb + (int64_t) min(r, rmax) * srow + c * 16, l2_pol);
+            }
+            if (lane < 16) {
+                nk_head_cp16<L2_EF>(sa_base[8] + stage_bytes, cb + (int64_t) min(15, rmax) * srow + (lane + 1) * 16, l2_pol);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
+
+    // 4. Cross-tile 2-stage double-buffered streaming loop (zero CTA barriers, zero tile-boundary bubbles).
+    int ch = 0;
+    uint32_t stage_b = 0u;
+    uint32_t stage_w = 0u;
+    issue_tile_chunk(tile, 0, 0u);
+
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const uint32_t * S_base0 = S_warp + gid * NK_DTC_ROW_WORDS;
+    const int c0_out = 2 * tig;
+    const int c1_out = c0_out + 1;
+
+    for (;;) {
+        const bool last_ch = (ch + 1 == nch);
+        const int nxt_tile = last_ch ? (tile + NK_HEAD_NW) : tile;
+        const int nxt_ch   = last_ch ? 0 : (ch + 1);
+        const bool has_nxt = (nxt_tile < sm_end);
+
+        if (has_nxt) {
+            issue_tile_chunk(nxt_tile, nxt_ch, stage_b ^ NK_DTC_STAGE_BYTES);
+            asm volatile("cp.async.wait_group 1;\n");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n");
+        }
+        __syncwarp();
+
+        const uint32_t * S0 = S_base0 + stage_w;
+        const uint32_t * S1 = S0 + 8 * NK_DTC_ROW_WORDS;
+        const int blk0 = ch * 8;
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t * W0 = S0 + 17 * j;
+            const uint32_t * W1 = S1 + 17 * j;
+
+            const uint32_t u0_a = W0[tig],     u0_b = W0[tig + 1];
+            const uint32_t u0_c = W0[tig + 4], u0_d = W0[tig + 5];
+            const uint32_t u1_a = W1[tig],     u1_b = W1[tig + 1];
+            const uint32_t u1_c = W1[tig + 4], u1_d = W1[tig + 5];
+
+            const uint32_t a0_e0 = __byte_perm(u0_a, u0_b, 0x5432);
+            const uint32_t a2_e0 = __byte_perm(u0_c, u0_d, 0x5432);
+            const uint32_t a1_e0 = __byte_perm(u1_a, u1_b, 0x5432);
+            const uint32_t a3_e0 = __byte_perm(u1_c, u1_d, 0x5432);
+
+            const uint32_t a0_e1 = W0[9 + tig],  a2_e1 = W0[13 + tig];
+            const uint32_t a1_e1 = W1[9 + tig],  a3_e1 = W1[13 + tig];
+
+            const uint32_t h0_e0 = __shfl_sync(0xffffffffu, u0_a, lane & ~3);
+            const uint32_t h0_e1 = __shfl_sync(0xffffffffu, u0_d, (lane & ~3) + 3);
+            const uint32_t h1_e0 = __shfl_sync(0xffffffffu, u1_a, lane & ~3);
+            const uint32_t h1_e1 = __shfl_sync(0xffffffffu, u1_d, (lane & ~3) + 3);
+
+            const float dw0_0 = __half2float(__ushort_as_half((uint16_t) (h0_e0 & 0xFFFFu)));
+            const float dw1_0 = __half2float(__ushort_as_half((uint16_t) (h1_e0 & 0xFFFFu)));
+            const float dw0_1 = __half2float(__ushort_as_half((uint16_t) (h0_e1 >> 16)));
+            const float dw1_1 = __half2float(__ushort_as_half((uint16_t) (h1_e1 >> 16)));
+
+            const int b_even = blk0 + 2 * j;
+            const int b_odd  = b_even + 1;
+            const uint2  xb0  = s_xb[b_even * 32 + lane];
+            const uint2  xb1  = s_xb[b_odd  * 32 + lane];
+            const float2 xdx0 = s_xdx[b_even * 4 + tig];
+            const float2 xdx1 = s_xdx[b_odd  * 4 + tig];
+
+            int d0[4] = { 0, 0, 0, 0 };
+            nk_dtc_mma_i8(d0, a0_e0, a1_e0, a2_e0, a3_e0, xb0.x, xb0.y);
+
+            int d1[4] = { 0, 0, 0, 0 };
+            nk_dtc_mma_i8(d1, a0_e1, a1_e1, a2_e1, a3_e1, xb1.x, xb1.y);
+
+            acc[0] = fmaf(__int2float_rn(d0[0]), dw0_0 * xdx0.x, acc[0]);
+            acc[1] = fmaf(__int2float_rn(d0[1]), dw0_0 * xdx0.y, acc[1]);
+            acc[2] = fmaf(__int2float_rn(d0[2]), dw1_0 * xdx0.x, acc[2]);
+            acc[3] = fmaf(__int2float_rn(d0[3]), dw1_0 * xdx0.y, acc[3]);
+
+            acc[0] = fmaf(__int2float_rn(d1[0]), dw0_1 * xdx1.x, acc[0]);
+            acc[1] = fmaf(__int2float_rn(d1[1]), dw0_1 * xdx1.y, acc[1]);
+            acc[2] = fmaf(__int2float_rn(d1[2]), dw1_1 * xdx1.x, acc[2]);
+            acc[3] = fmaf(__int2float_rn(d1[3]), dw1_1 * xdx1.y, acc[3]);
+        }
+
+        // All lanes must finish reading S_warp[stage_w] before next iteration overwrites it.
+        __syncwarp();
+
+        if (last_ch) {
+            const int r0_out = tile * 16 + gid;
+            const int r1_out = r0_out + 8;
+            if (r0_out < nr) {
+                if (c0_out < T) { dst[(int64_t) c0_out * sd + r0_out] = acc[0]; }
+                if (c1_out < T) { dst[(int64_t) c1_out * sd + r0_out] = acc[1]; }
+            }
+            if (r1_out < nr) {
+                if (c0_out < T) { dst[(int64_t) c0_out * sd + r1_out] = acc[2]; }
+                if (c1_out < T) { dst[(int64_t) c1_out * sd + r1_out] = acc[3]; }
+            }
+            acc[0] = 0.0f;
+            acc[1] = 0.0f;
+            acc[2] = 0.0f;
+            acc[3] = 0.0f;
+        }
+
+        if (!has_nxt) {
+            break;
+        }
+        tile = nxt_tile;
+        ch   = nxt_ch;
+        stage_b ^= NK_DTC_STAGE_BYTES;
+        stage_w ^= NK_DTC_STAGE_WORDS;
+    }
+#else
+    GGML_UNUSED_VARS(vx, x, dst, srow, sx, sd, nr, nch, T);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Fallback / MIN_ROWS=0 kernel (r11 4-warp cooperative 3-stage ring for grouped or K > 3072).
 static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
         const nk_dense_tc_args a, const int nch, const int T) {
 #if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -159,8 +438,6 @@ static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
     const char * vx = a.vx[k] + (int64_t) tile * 16 * srow;
     const int rmax  = nr - 1 - tile * 16;
 
-    // Precompute the 3 coalesced 16-B copy descriptors per thread (272 = 128 + 128 + 16).
-    // Pass 2 covers indices 256..271 = row 15, col 1..16 (15 * 17 = 255).
     const int r0 = tid / 17;
     const int c0 = tid - r0 * 17;
     const int i1 = tid + 128;
@@ -186,7 +463,6 @@ static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
         asm volatile("cp.async.commit_group;\n");
     };
 
-    // Prologue: prefetch up to 2 chunks into slots 0 and 1.
     issue_chunk(0u);
     if (nch > 1) {
         issue_chunk(NK_DTC_STAGE_BYTES);
@@ -195,7 +471,6 @@ static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
     const bool colok = gid < T;
     const float * x_ptr = a.x[k] + (int64_t) (colok ? gid : 0) * a.sx[k] + (2 * w) * QK8_0 + 4 * tig;
 
-    // Quantize activation block-pair for ch = 0 while prologue cp.async is in flight.
     uint32_t xb0_0, xb1_0, xb0_1, xb1_1;
     float    dx0_0, dx1_0, dx0_1, dx1_1;
     nk_dtc_quant_x_pair(x_ptr, colok, tig, xb0_0, xb1_0, dx0_0, dx1_0, xb0_1, xb1_1, dx0_1, dx1_1);
@@ -213,7 +488,6 @@ static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
         }
         __syncthreads();
 
-        // All warps finished reading slot (ch - 1) % 3 == slot (ch + 2) % 3 before __syncthreads.
         if (ch + 2 < nch) {
             issue_chunk(nxt_b);
         }
@@ -221,7 +495,6 @@ static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
         const uint32_t * W0 = sw + cur_w + gid * NK_DTC_ROW_WORDS + 17 * w;
         const uint32_t * W1 = W0 + 8 * NK_DTC_ROW_WORDS;
 
-        // Even block (2-byte offset inside 17-word block pair) + scales from u*_a (tig=0) and u*_d (tig=3).
         const uint32_t u0_a = W0[tig],     u0_b = W0[tig + 1];
         const uint32_t u0_c = W0[tig + 4], u0_d = W0[tig + 5];
         const uint32_t u1_a = W1[tig],     u1_b = W1[tig + 1];
@@ -232,7 +505,6 @@ static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
         const uint32_t a1_e0 = __byte_perm(u1_a, u1_b, 0x5432);
         const uint32_t a3_e0 = __byte_perm(u1_c, u1_d, 0x5432);
 
-        // Odd block (4-byte aligned in words 9..16).
         const uint32_t a0_e1 = W0[9 + tig],  a2_e1 = W0[13 + tig];
         const uint32_t a1_e1 = W1[9 + tig],  a3_e1 = W1[13 + tig];
 
@@ -271,7 +543,6 @@ static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
         nxt_b = (nxt_b == 2u * NK_DTC_STAGE_BYTES) ? 0u : (nxt_b + NK_DTC_STAGE_BYTES);
     }
 
-    // Deterministic 4-warp epilogue reduction into separate SMEM buffer (1 barrier total).
     float4 * red = (float4 *) &sw[NK_DTC_STAGES * NK_DTC_STAGE_WORDS];
     if (w > 0) {
         red[(w - 1) * 32 + lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
@@ -317,13 +588,14 @@ static bool nk_dense_tc_device_ok(const ggml_backend_cuda_context & ctx) {
 
 static bool nk_dense_tc_member_ok(
         const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * d,
-        const int64_t ne10, const int64_t T, const int max_rows) {
+        const int64_t ne10, const int64_t T, const int min_rows, const int max_rows) {
     if (!w || !x || !d || w->type != GGML_TYPE_Q8_0 || !w->buffer ||
             ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         return false;
     }
     if (w->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) || w->ne[0] != ne10 ||
-            w->ne[1] <= 0 || w->ne[1] > INT_MAX || (max_rows > 0 && w->ne[1] > max_rows) ||
+            w->ne[1] <= 0 || w->ne[1] > INT_MAX || w->ne[1] < min_rows ||
+            (max_rows > 0 && w->ne[1] > max_rows) ||
             w->ne[2] != 1 || w->ne[3] != 1 ||
             w->nb[1] != (size_t) (ne10 / QK8_0) * sizeof(block_q8_0) ||
             (uintptr_t) w->data % 16 != 0) {
@@ -339,6 +611,34 @@ static bool nk_dense_tc_member_ok(
             d->nb[0] != sizeof(float) || d->nb[1] % sizeof(float) != 0) {
         return false;
     }
+    return true;
+}
+
+template <bool L2_EF>
+static bool nk_head_tc_ensure_smem(const int dev, const size_t smem_bytes, cudaStream_t stream) {
+    static std::atomic<uint32_t> done_mask{0};
+    if (dev < 0 || dev >= 32) {
+        return false;
+    }
+    const size_t smpbo = ggml_cuda_info().devices[dev].smpbo;
+    if (smem_bytes > smpbo) {
+        return false;
+    }
+    const uint32_t bit = 1u << (unsigned) dev;
+    if ((done_mask.load(std::memory_order_acquire) & bit) != 0u) {
+        return true;
+    }
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    const int req = (int) std::min<size_t>(smpbo, NK_HEAD_MAX_SMEM);
+    if (cudaFuncSetAttribute(k_nk_head_tc<L2_EF>, cudaFuncAttributeMaxDynamicSharedMemorySize, req) != cudaSuccess) {
+        return false;
+    }
+    (void) cudaFuncSetAttribute(k_nk_head_tc<L2_EF>, cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared);
+    done_mask.fetch_or(bit, std::memory_order_release);
     return true;
 }
 
@@ -361,6 +661,66 @@ static void nk_dense_tc_maybe_set_carveout(const int dev, cudaStream_t stream) {
     }
 }
 
+static void nk_dense_tc_log_active() {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_WARN("[NK_DENSE_TC] active (head persistent NW=%d 2-stage int8 mma.m16n8k32, l2_ef=%d, min_rows=%d, min_t=%d, max_rows=%d)\n",
+            NK_HEAD_NW, (int) nk_dense_tc_l2_evict_first_enabled(),
+            ggml_cuda_nk_dense_tc_min_rows(), nk_dense_tc_min_t(), nk_dense_tc_max_rows());
+    }
+}
+
+static bool nk_head_tc_try_launch(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor       * dst,
+        const int           nch,
+        const int           T) {
+    if (nch < 1 || nch > NK_HEAD_MAX_NCH || src0->ne[1] < NK_HEAD_MIN_ROWS_DEF) {
+        return false;
+    }
+    const size_t smem_bytes = (size_t) NK_HEAD_W_BYTES + (size_t) (nch * 8) * NK_HEAD_X_BLK_BYTES;
+    cudaStream_t stream = ctx.stream();
+    const bool l2_ef = nk_dense_tc_l2_evict_first_enabled();
+    const bool ready = l2_ef
+        ? nk_head_tc_ensure_smem<true>(ctx.device, smem_bytes, stream)
+        : nk_head_tc_ensure_smem<false>(ctx.device, smem_bytes, stream);
+    if (!ready) {
+        return false;
+    }
+
+    const int nr     = (int) src0->ne[1];
+    const int ntiles = (nr + 15) / 16;
+    const int nsm    = ggml_cuda_info().devices[ctx.device].nsm;
+    const int grid   = std::max(1, std::min(nsm, (ntiles + NK_HEAD_NW - 1) / NK_HEAD_NW));
+
+    nk_dense_tc_log_active();
+
+    const char  * vx   = (const char *)  src0->data;
+    const float * x    = (const float *) src1->data;
+    float       * out  = (float *)       dst->data;
+    const int64_t srow = (int64_t) src0->nb[1];
+    const int64_t sx   = (int64_t) (src1->nb[1] / sizeof(float));
+    const int64_t sd   = (int64_t) (dst->nb[1] / sizeof(float));
+
+    if (l2_ef) {
+        k_nk_head_tc<true><<<(uint32_t) grid, 32 * NK_HEAD_NW, smem_bytes, stream>>>(
+            vx, x, out, srow, sx, sd, nr, nch, T);
+    } else {
+        k_nk_head_tc<false><<<(uint32_t) grid, 32 * NK_HEAD_NW, smem_bytes, stream>>>(
+            vx, x, out, srow, sx, sd, nr, nch, T);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    const int64_t fire = g_nk_dense_tc_fires.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (nk_dense_tc_trace() && fire <= 8) {
+        GGML_LOG_WARN("[NK_DENSE_TC] trace #%lld (head_tc l2_ef=%d): rows=%d K=%d T=%d grid=%d smem=%zu\n",
+            (long long) fire, (int) l2_ef, nr, nch * 8 * QK8_0, T, grid, smem_bytes);
+    }
+    return true;
+}
+
 static bool nk_dense_tc_launch(
         ggml_backend_cuda_context & ctx, nk_dense_tc_args & a, const int nch, const int T) {
     uint64_t blk64 = 0;
@@ -375,11 +735,7 @@ static bool nk_dense_tc_launch(
         return false;
     }
 
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
-        GGML_LOG_WARN("[NK_DENSE_TC] active (int8 mma.m16n8k32, 3-stage cp.async.cg.L2::128B, min_t=%d, max_rows=%d)\n",
-            nk_dense_tc_min_t(), nk_dense_tc_max_rows());
-    }
+    nk_dense_tc_log_active();
 
     cudaStream_t stream = ctx.stream();
     nk_dense_tc_maybe_set_carveout(ctx.device, stream);
@@ -392,7 +748,7 @@ static bool nk_dense_tc_launch(
         for (int k = 0; k < a.n; ++k) {
             total_rows += a.nrows[k];
         }
-        GGML_LOG_WARN("[NK_DENSE_TC] trace #%lld: n=%d rows=%d K=%d T=%d grid=%u\n",
+        GGML_LOG_WARN("[NK_DENSE_TC] trace #%lld (dense_tc): n=%d rows=%d K=%d T=%d grid=%u\n",
             (long long) fire, a.n, total_rows, nch * 8 * QK8_0, T, (unsigned) blk64);
     }
     return true;
@@ -413,12 +769,17 @@ bool ggml_cuda_nk_dense_tc_mul_mat(
     const int64_t ne10 = src0->ne[0];
     const int64_t T    = src1->ne[1];
     const int min_t    = force_enable ? 1 : nk_dense_tc_min_t();
+    const int min_rows = force_enable ? 1 : ggml_cuda_nk_dense_tc_min_rows();
     const int max_rows = force_enable ? 0 : nk_dense_tc_max_rows();
     if (T < min_t || T > 8 || ne10 < 8 * QK8_0 || ne10 % (8 * QK8_0) != 0) {
         return false;
     }
-    if (!nk_dense_tc_member_ok(src0, src1, dst, ne10, T, max_rows)) {
+    if (!nk_dense_tc_member_ok(src0, src1, dst, ne10, T, min_rows, max_rows)) {
         return false;
+    }
+    const int nch = (int) (ne10 / (8 * QK8_0));
+    if (nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T)) {
+        return true;
     }
     nk_dense_tc_args a{};
     a.n        = 1;
@@ -429,7 +790,7 @@ bool ggml_cuda_nk_dense_tc_mul_mat(
     a.sx[0]    = (int64_t) (src1->nb[1] / sizeof(float));
     a.sd[0]    = (int64_t) (dst->nb[1] / sizeof(float));
     a.nrows[0] = (int) src0->ne[1];
-    return nk_dense_tc_launch(ctx, a, (int) (ne10 / (8 * QK8_0)), (int) T);
+    return nk_dense_tc_launch(ctx, a, nch, (int) T);
 }
 
 bool ggml_cuda_nk_dense_tc_group(
@@ -446,12 +807,13 @@ bool ggml_cuda_nk_dense_tc_group(
     const int64_t ne10 = dsts[0]->src[0]->ne[0];
     const int64_t T    = dsts[0]->src[1]->ne[1];
     const int min_t    = force_enable ? 1 : nk_dense_tc_min_t();
+    const int min_rows = force_enable ? 1 : ggml_cuda_nk_dense_tc_min_rows();
     const int max_rows = force_enable ? 0 : nk_dense_tc_max_rows();
     if (T < min_t || T > 8 || ne10 < 8 * QK8_0 || ne10 % (8 * QK8_0) != 0) {
         return false;
     }
     for (int k = 0; k < n; ++k) {
-        if (!dsts[k] || !nk_dense_tc_member_ok(dsts[k]->src[0], dsts[k]->src[1], dsts[k], ne10, T, max_rows)) {
+        if (!dsts[k] || !nk_dense_tc_member_ok(dsts[k]->src[0], dsts[k]->src[1], dsts[k], ne10, T, min_rows, max_rows)) {
             return false;
         }
     }

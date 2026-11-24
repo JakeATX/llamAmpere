@@ -9944,7 +9944,9 @@ static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_cont
                 ggml_cuda_mul_mat_route(w, act, node, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
             return GGML_TYPE_COUNT;
         }
-        if (w->type == GGML_TYPE_Q8_0 && (ggml_cuda_nk_dense_tc_enabled() || ggml_cuda_q8a16_enabled())) {
+        if (w->type == GGML_TYPE_Q8_0 &&
+                ((ggml_cuda_nk_dense_tc_enabled() && w->ne[1] >= ggml_cuda_nk_dense_tc_min_rows()) ||
+                 ggml_cuda_q8a16_enabled())) {
             return GGML_TYPE_COUNT; // NK_DENSE_TC / Q8A16 reads the f32 activation directly
         }
         return w->type;

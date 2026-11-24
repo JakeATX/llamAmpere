@@ -4,7 +4,10 @@
 
 // GGML_CUDA_NK_DENSE_TC=1: opt-in Ampere int8 tensor-core kernel for dense Q8_0
 // decode/verify projections (T=1..8). Default OFF (unset or 0 = base path).
+// GGML_CUDA_NK_DENSE_TC_MIN_ROWS: minimum weight rows (default 16385 = head-only;
+// set 0 to include attention-sized and grouped projections).
 bool    ggml_cuda_nk_dense_tc_enabled();
+int     ggml_cuda_nk_dense_tc_min_rows();
 int64_t ggml_cuda_nk_dense_tc_count();
 
 bool ggml_cuda_nk_dense_tc_mul_mat(

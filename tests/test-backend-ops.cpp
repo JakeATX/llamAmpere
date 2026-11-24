@@ -25459,9 +25459,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // [NK_DENSE_TC] Inkling 2 Mini NQ dense Q8_0 attention projections at decode/verify widths T=1..8:
-    // grouped QKV equivalent (8576 x 2304), attn_output (2304 x 3072), single attn_q/gate (3072 x 2304)
-    for (auto mk : std::vector<std::array<int64_t, 2>>{{8576, 2304}, {2304, 3072}, {3072, 2304}}) {
+    // [NK_DENSE_TC] Inkling 2 Mini NQ dense Q8_0 projections at decode/verify widths T=1..8:
+    // target output head (201024 x 2304), grouped QKV equiv (8576 x 2304), attn_output (2304 x 3072), attn_q/gate (3072 x 2304)
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{201024, 2304}, {8576, 2304}, {2304, 3072}, {3072, 2304}}) {
         for (int n = 1; n <= 8; ++n) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
         }
@@ -27937,6 +27937,132 @@ static int run_nk_dense_tc_check() {
         ggml_free(ctx);
     }
 
+    // 2b. Head kernel correctness (k_nk_head_tc, M >= 16385): M=201024 K=2304 at T=1,2,5,8
+    //     (exact CPU double ref on 384 rows spanning start/mid/end SM slices + full NaN/Inf scan)
+    //     plus non-16 head tail edge M=16399 K=2304 T=5 and max-SMEM K=3072 edge M=16400 T=5.
+    {
+        struct head_corr_case {
+            const char * name;
+            int64_t M, K, T;
+        };
+        const std::vector<head_corr_case> hcases = {
+            { "head_201024_T1",       201024, 2304, 1 },
+            { "head_201024_T2",       201024, 2304, 2 },
+            { "head_201024_T5",       201024, 2304, 5 },
+            { "head_201024_T8",       201024, 2304, 8 },
+            { "head_edge_M16399_T5",   16399, 2304, 5 },
+            { "head_edge_K3072_T5",    16400, 3072, 5 },
+        };
+        const size_t tsz = ggml_type_size(GGML_TYPE_Q8_0);
+        const int    bsz = (int) ggml_blck_size(GGML_TYPE_Q8_0);
+        const auto to_float = ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float;
+
+        for (size_t hi = 0; hi < hcases.size(); ++hi) {
+            const auto & h = hcases[hi];
+            const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, h.K);
+            const size_t nblk_row  = (size_t) h.K / (size_t) bsz;
+
+            ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            ggml_tensor * t_w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, h.K, h.M);
+            ggml_tensor * t_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  h.K, h.T);
+            ggml_tensor * t_d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  h.M, h.T);
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+            // Fast deterministic pseudo-random valid Q8_0 weights across all M rows
+            std::vector<uint8_t> h_wq((size_t) h.M * row_bytes);
+            uint32_t st = 0x12345678u ^ ((uint32_t) hi * 0x9e3779b9u);
+            auto xorsh = [&]() -> uint32_t {
+                st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+                return st;
+            };
+            const ggml_fp16_t d_lut[8] = {
+                ggml_fp32_to_fp16(0.006f), ggml_fp32_to_fp16(0.011f),
+                ggml_fp32_to_fp16(0.017f), ggml_fp32_to_fp16(0.023f),
+                ggml_fp32_to_fp16(0.031f), ggml_fp32_to_fp16(0.041f),
+                ggml_fp32_to_fp16(0.013f), ggml_fp32_to_fp16(0.029f),
+            };
+            for (int64_t r = 0; r < h.M; ++r) {
+                uint8_t * rp = h_wq.data() + (size_t) r * row_bytes;
+                for (size_t b = 0; b < nblk_row; ++b) {
+                    uint8_t * bp = rp + b * tsz;
+                    const uint32_t v = xorsh();
+                    const ggml_fp16_t dv = d_lut[v & 7u];
+                    std::memcpy(bp, &dv, sizeof(dv));
+                    int8_t * qs = (int8_t *) (bp + sizeof(dv));
+                    uint32_t wv = v ^ 0xa5a55a5au;
+                    for (int q4 = 0; q4 < 8; ++q4) {
+                        wv = wv * 1664525u + 1013904223u;
+                        qs[q4 * 4 + 0] = (int8_t) ((int) ((wv >>  0) & 255u) - 128);
+                        qs[q4 * 4 + 1] = (int8_t) ((int) ((wv >>  8) & 255u) - 128);
+                        qs[q4 * 4 + 2] = (int8_t) ((int) ((wv >> 16) & 255u) - 128);
+                        qs[q4 * 4 + 3] = (int8_t) ((int) ((wv >> 24) & 255u) - 128);
+                    }
+                }
+            }
+
+            std::mt19937 rng(88401u + (uint32_t) hi * 73u);
+            std::normal_distribution<float> nd(0.0f, 1.0f);
+            std::vector<float> h_x((size_t) h.T * h.K);
+            for (float & v : h_x) { v = nd(rng); }
+
+            ggml_backend_tensor_set(t_w, h_wq.data(), 0, h_wq.size());
+            ggml_backend_tensor_set(t_x, h_x.data(),  0, h_x.size() * sizeof(float));
+
+            const int64_t c0 = cnt(be, "nk_dense_tc");
+            const bool ok_nk = run_mm(be, true, t_w, t_x, t_d);
+            const int64_t c1 = cnt(be, "nk_dense_tc");
+            ggml_backend_synchronize(be);
+
+            std::vector<float> h_out((size_t) h.T * h.M);
+            ggml_backend_tensor_get(t_d, h_out.data(), 0, h_out.size() * sizeof(float));
+
+            bool bad_fp = false;
+            for (float v : h_out) {
+                if (!std::isfinite(v)) { bad_fp = true; break; }
+            }
+
+            // Sampled rows spanning start, middle, and tail SM slices (incl. last row M-1)
+            std::vector<int64_t> check_rows;
+            const int64_t starts[3] = { 0, (h.M / 2) & ~15ll, std::max<int64_t>(0, h.M - 128) };
+            for (int s = 0; s < 3; ++s) {
+                for (int64_t off = 0; off < 128 && starts[s] + off < h.M; ++off) {
+                    check_rows.push_back(starts[s] + off);
+                }
+            }
+
+            double num = 0.0, den = 0.0, max_abs = 0.0;
+            std::vector<float> w_row((size_t) h.K);
+            for (int64_t r : check_rows) {
+                to_float(h_wq.data() + (size_t) r * row_bytes, w_row.data(), h.K);
+                for (int64_t t = 0; t < h.T; ++t) {
+                    const float * xt = h_x.data() + (size_t) t * h.K;
+                    double ref = 0.0;
+                    for (int64_t j = 0; j < h.K; ++j) {
+                        ref += (double) w_row[(size_t) j] * (double) xt[(size_t) j];
+                    }
+                    const double got = (double) h_out[(size_t) t * h.M + r];
+                    const double d = got - ref;
+                    num += d * d;
+                    den += ref * ref;
+                    if (std::fabs(d) > max_abs) { max_abs = std::fabs(d); }
+                }
+            }
+            const double nmse = den > 0.0 ? (num / den) : num;
+            const bool pass = ok_nk && (c1 == c0 + 1) && !bad_fp && nmse <= max_nmse;
+            if (!pass) {
+                ++fails;
+                printf("NK_DENSE_TC(%-20s): FAIL ok=%d dc=%lld nmse=%.3e max_abs=%.3e bad_fp=%d\n",
+                       h.name, ok_nk, (long long) (c1 - c0), nmse, max_abs, bad_fp);
+            } else {
+                printf("NK_DENSE_TC(%-20s): OK (rows=%zu nmse=%.2e max_abs=%.3e cnt=+1)\n",
+                       h.name, check_rows.size(), nmse, max_abs);
+            }
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+        }
+    }
+
     // 3. Same-job ABBA microbench (base q8a16 vs NK_DENSE_TC) at exact Inkling 2 Mini NQ shapes
     printf("\n--- NK_DENSE_TC same-job ABBA microbench (base=q8a16 -> nk=NK_DENSE_TC) ---\n");
     const int warmup = 20;
@@ -28034,9 +28160,9 @@ static int run_nk_dense_tc_check() {
         int w_iters, t_iters;
     };
     const std::vector<perf_single> pshapes = {
+        { "head_201024x2304",   201024, 2304, { 1, 2, 3, 4, 5, 6, 7, 8 }, 10, 40 },
         { "attn_out_2304x3072", 2304,   3072, { 1, 2, 3, 4, 5, 6, 7, 8 }, warmup, iters },
         { "attn_q_3072x2304",   3072,   2304, { 1, 2, 5, 8 },             warmup, iters },
-        { "head_201024x2304",   201024, 2304, { 5 },                      5,      20    },
     };
     for (const auto & ps : pshapes) {
         const double w_bytes = (double) ps.M * (double) ggml_row_size(GGML_TYPE_Q8_0, ps.K);
