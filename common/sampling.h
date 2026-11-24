@@ -168,10 +168,25 @@ struct common_sampler_pq_result {
     bool rescued = false;
 };
 
+// Bounded-KL mode-biased rescue policy. Defaults (kappa <= 1, alpha == 1) select the classic rule p(d) >= p(y) and its
+// existing code path. kappa > 1 or alpha != 1 selects the weighted rule (see common_params_sampling::spec_mb_kappa).
+struct common_sampler_mb_params {
+    double kappa      = 0.0;   // <= 1: classic rule; > 1: likelihood-ratio cap
+    double alpha      = 1.0;   // rescue only if p(d) >= alpha * p(y)
+    bool   pos_weight = false; // scale log(kappa) by the position's continuation value
+    bool   no_consec  = false; // no rescue right after a rescue within one draft round
+
+    bool weighted() const { return kappa > 1.0 || alpha != 1.0; }
+};
+
+// position-weighted kappa_j for draft position pos of n_draft (geometric mean over positions == kappa)
+double common_sampler_mb_effective_kappa(const common_sampler_mb_params & mb, size_t pos, size_t n_draft);
+
 // Verify one position from the already filtered target distribution. Does not apply samplers or copy data.
 common_sampler_pq_result common_sampler_verify_pq(const llama_token_data_array & p, const std::vector<llama_token_data> & q,
         llama_token draft, llama_token target, std::mt19937 & rng, bool beat, common_sampler_pq_stats & stats,
-        const llama_vocab * vocab = nullptr, const std::function<bool(llama_token)> & is_stop = {});
+        const llama_vocab * vocab = nullptr, const std::function<bool(llama_token)> & is_stop = {},
+        const common_sampler_mb_params & mb = {});
 
 // true when the chain samples on the CPU at temperature > 0 without grammar, reasoning budget or mirostat
 bool common_sampler_pq_supported(const struct common_sampler * gsmpl);
@@ -184,8 +199,10 @@ const common_sampler_pq_stats & common_sampler_get_pq_stats(const struct common_
 
 // Marginal token law of mode-biased p/q verification at one fixed prefix. Output follows p's
 // order; p and q must be normalized. This is a local sampler diagnostic, not sequence KL.
+// mb.weighted() gives the law of the weighted rule; otherwise the classic one.
 std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_array & p,
-        const std::vector<llama_token_data> & q, const std::function<bool(llama_token)> & is_stop = {});
+        const std::vector<llama_token_data> & q, const std::function<bool(llama_token)> & is_stop = {},
+        const common_sampler_mb_params & mb = {});
 
 // top-1 probability of the target distribution at each position the last common_sampler_sample_and_accept_n_pq
 // call sampled from (request-matched, after the sampler chain; -1 where the chain sampled on the backend).
