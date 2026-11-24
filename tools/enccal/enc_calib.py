@@ -121,7 +121,7 @@ def pieces_from_vocab(toks, types, model):
 
 _DIGIT = re.compile(rb'[0-9]')
 _WORD = re.compile(rb"[A-Z][A-Za-z0-9'\-]*[A-Za-z0-9]|[A-Z]")
-_SENT = re.compile(rb'(^|[.!?:]["\')\]]?\s+|\n\s*|^\s*[-*#>]+\s*|["(\[]\s*)$')
+_SENT = re.compile(rb'(^|[.!?]["\')\]]?\s+|\n\s*|\n\s*([-*#>]+|\d+[.)])\s*)$')   # after ':' or '(' a capital is not a sentence start
 _COMMON = {b'I', b'A', b'The', b'This', b'That', b'It', b'In', b'If', b'For', b'And', b'But', b'So', b'We', b'You',
            b'Yes', b'No', b'Here', b'There', b'What', b'When', b'Why', b'How', b'Let', b'Note', b'Step', b'Also', b'Then',
            b'Now', b'First', b'Second', b'Finally', b'However', b'OK', b'Okay'}
@@ -180,6 +180,10 @@ def cmd_selftest(_):
     got = {t[x.start():x.end()] for x in re.finditer(rb'\S+', t) if m[x.start():x.end()].any()}
     for want in (b'1969,', b'Neil', b'Armstrong', b'Moon.', b'NASA', b'$25'):
         assert want in got, (want, got)
+    t2 = b'Crew: Young, Duke (Jul 1972). Note: done.'
+    m2 = key_spans(t2); got2 = {t2[x.start():x.end()] for x in re.finditer(rb'\S+', t2) if m2[x.start():x.end()].any()}
+    for want in (b'Young,', b'Duke', b'(Jul', b'1972).'):
+        assert want in got2, (want, got2)
     for bad in (b'In', b'The', b'walked', b'it', b'big.\nParis'):
         assert bad not in got, (bad, got)
     # Paris starts a sentence alone: not weighted (heuristic), documented limitation
