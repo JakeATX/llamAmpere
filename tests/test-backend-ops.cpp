@@ -26585,7 +26585,7 @@ static int run_nk_dspark_head_check() {
             const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
             const ggml_tensor *, const ggml_tensor *,
             ggml_tensor *, ggml_tensor *, ggml_tensor *,
-            int64_t, int, float, float);
+            int64_t, int, float, float, int);
     using cnt_fn = int64_t (*)(ggml_backend_t, const char *);
     auto run_head = (run_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dspark_head_run");
     auto cnt      = (cnt_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
@@ -26604,20 +26604,27 @@ static int run_nk_dspark_head_check() {
         bool    sampled;
         bool    shortlist;
         bool    all_tied;
+        int     ntiles_override;
     };
     const std::vector<head_case> cases = {
-        { "full_sampled_k20",    200058, 200058, 1, 20, true,  false, false },
-        { "full_sampled_k64",    200058, 200058, 1, 64, true,  false, false },
-        { "full_greedy",         200058, 200058, 1,  1, false, false, false },
-        { "shortlist_k20",       200058,  32768, 1, 20, true,  true,  false },
-        { "shortlist_greedy",    200058,  32768, 1,  1, false, true,  false },
-        { "full_nb4_k20",        200058, 200058, 4, 20, true,  false, false },
-        { "full_nb4_greedy",     200058, 200058, 4,  1, false, false, false },
-        { "edge_neval_eq_k",       1024,     20, 1, 20, true,  false, false },
-        { "edge_odd_63",           1024,     63, 1, 20, true,  false, false },
-        { "edge_odd_65",           1024,     65, 1, 20, true,  false, false },
-        { "edge_non4_1001_nb2",    1024,   1001, 2, 32, true,  false, false },
-        { "adversarial_tied",     10000,  10000, 1, 20, true,  false, true  },
+        { "full_sampled_k20",         200058, 200058, 1, 20, true,  false, false,   0 },
+        { "full_sampled_k64",         200058, 200058, 1, 64, true,  false, false,   0 },
+        { "full_greedy",              200058, 200058, 1,  1, false, false, false,   0 },
+        { "shortlist_k20",            200058,  32768, 1, 20, true,  true,  false,   0 },
+        { "shortlist_greedy",         200058,  32768, 1,  1, false, true,  false,   0 },
+        { "full_nb4_k20",             200058, 200058, 4, 20, true,  false, false,   0 },
+        { "full_nb4_greedy",          200058, 200058, 4,  1, false, false, false,   0 },
+        { "edge_neval_eq_k",            1024,     20, 1, 20, true,  false, false,   0 },
+        { "edge_odd_63",                1024,     63, 1, 20, true,  false, false,   0 },
+        { "edge_odd_65",                1024,     65, 1, 20, true,  false, false,   0 },
+        { "edge_non4_1001_nb2",         1024,   1001, 2, 32, true,  false, false,   0 },
+        { "adversarial_tied",          10000,  10000, 1, 20, true,  false, true,    0 },
+        { "ntiles_328_sampled_k20",   200058, 200058, 1, 20, true,  false, false, 328 },
+        { "ntiles_336_sampled_k20",   200058, 200058, 1, 20, true,  false, false, 336 },
+        { "ntiles_196_sampled_k20",   200058, 200058, 1, 20, true,  false, false, 196 },
+        { "ntiles_328_greedy",        200058, 200058, 1,  1, false, false, false, 328 },
+        { "ntiles_336_greedy",        200058, 200058, 1,  1, false, false, false, 336 },
+        { "ntiles_196_greedy",        200058, 200058, 1,  1, false, false, false, 196 },
     };
 
     auto fill_case = [](const head_case & c,
@@ -26699,10 +26706,10 @@ static int run_nk_dspark_head_check() {
 
         const int64_t c0 = cnt(be, "nk_dspark_head");
         const bool ok_ref = run_head(be, false, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
-                t_cand_ref, t_vals_ref, t_prev_ref, c.n_eval, c.sk, softcap, inv_temp);
+                t_cand_ref, t_vals_ref, t_prev_ref, c.n_eval, c.sk, softcap, inv_temp, 0);
         const int64_t c1 = cnt(be, "nk_dspark_head");
         const bool ok_nk = run_head(be, true, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
-                t_cand_nk, t_vals_nk, t_prev_nk, c.n_eval, c.sk, softcap, inv_temp);
+                t_cand_nk, t_vals_nk, t_prev_nk, c.n_eval, c.sk, softcap, inv_temp, c.ntiles_override);
         const int64_t c2 = cnt(be, "nk_dspark_head");
         ggml_backend_synchronize(be);
 
@@ -26713,6 +26720,9 @@ static int run_nk_dspark_head_check() {
         bool eq_prev = std::memcmp(prev_nk.data(), prev_ref.data(), prev_nk.size() * sizeof(int32_t)) == 0;
         bool eq_cand = true;
         bool eq_vals = true;
+        int bad_b = -1, bad_j = -1;
+        int32_t bad_c_nk = 0, bad_c_ref = 0;
+        float   bad_v_nk = 0.0f, bad_v_ref = 0.0f;
         if (c.sampled) {
             std::vector<int32_t> cand_nk((size_t) c.nb * c.sk), cand_ref((size_t) c.nb * c.sk);
             std::vector<float>   vals_nk((size_t) c.nb * c.sk), vals_ref((size_t) c.nb * c.sk);
@@ -26722,13 +26732,31 @@ static int run_nk_dspark_head_check() {
             ggml_backend_tensor_get(t_vals_ref, vals_ref.data(), 0, vals_ref.size() * sizeof(float));
             eq_cand = std::memcmp(cand_nk.data(), cand_ref.data(), cand_nk.size() * sizeof(int32_t)) == 0;
             eq_vals = std::memcmp(vals_nk.data(), vals_ref.data(), vals_nk.size() * sizeof(float)) == 0;
+            if (!eq_cand || !eq_vals) {
+                for (int b = 0; b < c.nb && bad_b < 0; ++b) {
+                    for (int j = 0; j < c.sk; ++j) {
+                        const size_t idx = (size_t) b * c.sk + j;
+                        if (cand_nk[idx] != cand_ref[idx] ||
+                                std::memcmp(&vals_nk[idx], &vals_ref[idx], sizeof(float)) != 0) {
+                            bad_b = b;
+                            bad_j = j;
+                            bad_c_nk  = cand_nk[idx];
+                            bad_c_ref = cand_ref[idx];
+                            bad_v_nk  = vals_nk[idx];
+                            bad_v_ref = vals_ref[idx];
+                            break;
+                        }
+                    }
+                }
+            }
         }
         const bool ok_cnt = (c1 == c0) && (c2 == c1 + 1);
         const bool pass = ok_ref && ok_nk && eq_prev && eq_cand && eq_vals && ok_cnt;
         if (!pass) {
             ++fails;
-            printf("NK_DSPARK_HEAD(%s): FAIL ok_ref=%d ok_nk=%d prev=%d cand=%d vals=%d cnt=(%lld,%lld)\n",
-                   c.name, ok_ref, ok_nk, eq_prev, eq_cand, eq_vals, (long long) (c1 - c0), (long long) (c2 - c1));
+            printf("NK_DSPARK_HEAD(%s): FAIL ok_ref=%d ok_nk=%d prev=%d cand=%d vals=%d cnt=(%lld,%lld) first=(b=%d,j=%d nk=%d/%.6g ref=%d/%.6g)\n",
+                   c.name, ok_ref, ok_nk, eq_prev, eq_cand, eq_vals, (long long) (c1 - c0), (long long) (c2 - c1),
+                   bad_b, bad_j, bad_c_nk, bad_v_nk, bad_c_ref, bad_v_ref);
         } else {
             printf("NK_DSPARK_HEAD(%s): OK (bit-exact, cnt=+1)\n", c.name);
         }
@@ -26739,10 +26767,10 @@ static int run_nk_dspark_head_check() {
 
     // Same-job ABBA microbench on the exact Inkling 2 Mini DSpark head shapes
     const std::vector<head_case> perf_cases = {
-        { "full_sampled_k20",    200058, 200058, 1, 20, true,  false, false },
-        { "full_greedy",         200058, 200058, 1,  1, false, false, false },
-        { "shortlist_k20",       200058,  32768, 1, 20, true,  true,  false },
-        { "full_nb4_k20",        200058, 200058, 4, 20, true,  false, false },
+        { "full_sampled_k20",    200058, 200058, 1, 20, true,  false, false, 0 },
+        { "full_greedy",         200058, 200058, 1,  1, false, false, false, 0 },
+        { "shortlist_k20",       200058,  32768, 1, 20, true,  true,  false, 0 },
+        { "full_nb4_k20",        200058, 200058, 4, 20, true,  false, false, 0 },
     };
     const int warmup = 20;
     const int iters  = 200;
@@ -26775,13 +26803,13 @@ static int run_nk_dspark_head_check() {
         auto time_leg = [&](bool use_nk) -> double {
             for (int w = 0; w < warmup; ++w) {
                 run_head(be, use_nk, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
-                        t_cand, t_vals, t_prev, c.n_eval, c.sk, softcap, inv_temp);
+                        t_cand, t_vals, t_prev, c.n_eval, c.sk, softcap, inv_temp, c.ntiles_override);
             }
             ggml_backend_synchronize(be);
             const int64_t t0 = ggml_time_us();
             for (int i = 0; i < iters; ++i) {
                 run_head(be, use_nk, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
-                        t_cand, t_vals, t_prev, c.n_eval, c.sk, softcap, inv_temp);
+                        t_cand, t_vals, t_prev, c.n_eval, c.sk, softcap, inv_temp, c.ntiles_override);
             }
             ggml_backend_synchronize(be);
             return (double) (ggml_time_us() - t0) / iters;

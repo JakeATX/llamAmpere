@@ -17951,7 +17951,8 @@ static bool ggml_backend_cuda_dspark_head_run(
         int64_t             n_eval,
         int                 sk,
         float               softcap,
-        float               inv_temp) {
+        float               inv_temp,
+        int                 ntiles_override) {
     if (!backend || !ggml_backend_is_cuda(backend)) {
         return false;
     }
@@ -17959,7 +17960,7 @@ static bool ggml_backend_cuda_dspark_head_run(
     ggml_cuda_set_device(ctx->device);
     if (use_nk) {
         return ggml_cuda_nk_dspark_head_launch(*ctx, fold_w, latent, fold_bias, base, ids, noise,
-            cand_out, vals_out, prev_out, n_eval, sk, softcap, inv_temp);
+            cand_out, vals_out, prev_out, n_eval, sk, softcap, inv_temp, ntiles_override);
     }
     return ggml_cuda_dspark_head_launch_base(*ctx, fold_w, latent, fold_bias, base, ids, noise,
         cand_out, vals_out, prev_out, n_eval, sk, softcap, inv_temp);
