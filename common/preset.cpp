@@ -45,7 +45,11 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--spec-draft-type-k", "q8_0"}, {"--spec-draft-type-v", "q8_0"},
                 {"--sjkvarn-sink", "128"}, {"--sjkvarn-sink-type", "f16"},
                 {"--sjkvarn-staging-type", "tq6_0"}, {"--sjkvarn-tail", "4096"},
-                {"--sjkvarn-tail-max", "8192"}
+                {"--sjkvarn-tail-max", "8192"},
+                // GHFIX-40: projector weights in pinned host RAM, projector still on the GPU (the F16 projector on
+                // the GPU fails the 12dense fit at 196,608; CPU loads but its image turns are 5.4x slower).
+                // Off: --no-mmproj-host-weights or LLAMA_ARG_MMPROJ_HOST_WEIGHTS=0; CPU: --no-mmproj-offload.
+                {"--mmproj-host-weights", "1"}
             }, {
                 {"LLAMA_DEEPCTX_LADDER", "1"},
                 {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "1"}, {"LLAMA_KQ_MASK_PACKED", "1"},
@@ -89,7 +93,8 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--spec-n-rs-seq", "3"}, {"--spec-draft-p-min", "0"},
                 {"--spec-draft-vocab-map", "auto:65536"},
                 {"--spec-draft-window", "20480"}, {"--spec-draft-n-ubatch", "8"},
-                {"--spec-draft-type-k", "q8_0"}, {"--spec-draft-type-v", "q8_0"}
+                {"--spec-draft-type-k", "q8_0"}, {"--spec-draft-type-v", "q8_0"},
+                {"--mmproj-host-weights", "1"} // GHFIX-40, as 10dense
             }, {
                 {"LLAMA_DEEPCTX_LADDER", "1"},
                 {"LLAMA_LSA_MODE", "key"}, {"LLAMA_LSA_MAP", "@model/lsa-qwen38-27b-d2048.gguf"},
@@ -140,7 +145,8 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"--cpu-moe", "1"}, {"--op-offload", "0"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
                 {"--spec-draft-model", "@model/Inkling-2-Mini-DSpark-Q8_0-fold.gguf"}, {"--spec-type", "draft-dspark"},
-                {"--spec-draft-ngl", "99"}
+                {"--spec-draft-ngl", "99"},
+                {"--mmproj-host-weights", "1"} // GHFIX-40, as 10dense (ink10/ink12 copy ink8)
             }, {
                 {"LLAMA_DEEPCTX_LADDER", "1"},
                 // fork (INKSMALL2): fit headroom kept for the expert cache (sized after the fit). The auto-size reserve

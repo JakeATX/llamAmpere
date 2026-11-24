@@ -3428,6 +3428,8 @@ static size_t ggml_backend_cuda_host_weights_buffer_type_get_alloc_size(ggml_bac
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_weights_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // pin from the projector's device context (-mmdev), so the mapping belongs to that card
+    ggml_cuda_set_device((int) (intptr_t) buft->context);
     void * ptr = ggml_cuda_host_malloc(size);
 
     if (ptr == nullptr) {
@@ -3446,28 +3448,44 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_weights_buffer_type_alloc_bu
     return buffer;
 }
 
-static ggml_backend_buffer_type_t ggml_backend_cuda_host_weights_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host_weights = {
-        /* .iface    = */ {
-            /* .get_name            = */ ggml_backend_cuda_host_weights_buffer_type_name,
-            /* .alloc_buffer        = */ ggml_backend_cuda_host_weights_buffer_type_alloc_buffer,
-            /* .alloc_buffer_n      = */ NULL,
-            /* .get_alignment       = */ ggml_backend_cuda_host_weights_buffer_type_get_alignment,
-            /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size      = */ ggml_backend_cuda_host_weights_buffer_type_get_alloc_size,
-            /* .get_alloc_size_n    = */ NULL,
-            /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
-        },
-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
-        /* .context  = */ nullptr,
-    };
+// one CUDA_Host_W buffer type per device: the buffer follows the projector's device (-mmdev), not device 0
+static ggml_backend_buffer_type_t ggml_backend_cuda_host_weights_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
 
-    return &ggml_backend_cuda_buffer_type_host_weights;
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_buffer_types_host_weights[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_cuda_buffer_types_host_weights[i] = {
+                /* .iface    = */ {
+                    /* .get_name            = */ ggml_backend_cuda_host_weights_buffer_type_name,
+                    /* .alloc_buffer        = */ ggml_backend_cuda_host_weights_buffer_type_alloc_buffer,
+                    /* .alloc_buffer_n      = */ NULL,
+                    /* .get_alignment       = */ ggml_backend_cuda_host_weights_buffer_type_get_alignment,
+                    /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+                    /* .get_alloc_size      = */ ggml_backend_cuda_host_weights_buffer_type_get_alloc_size,
+                    /* .get_alloc_size_n    = */ NULL,
+                    /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                },
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ (void *) (intptr_t) i,
+            };
+        }
+        initialized = true;
+    }
+
+    return &ggml_backend_cuda_buffer_types_host_weights[device];
 }
 
 // only reachable through get_proc_address (tools/mtmd, --mmproj-host-weights), so no other tensor can land in CUDA_Host_W
-static ggml_backend_buffer_type_t ggml_backend_cuda_get_host_weights_buffer_type(void) {
-    return ggml_backend_cuda_host_weights_buffer_type();
+static ggml_backend_buffer_type_t ggml_backend_cuda_get_host_weights_buffer_type_dev(int device) {
+    return ggml_backend_cuda_host_weights_buffer_type(device);
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
@@ -18053,8 +18071,8 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }
-    if (strcmp(name, "ggml_backend_cuda_get_host_weights_buffer_type") == 0) {
-        return (void *)ggml_backend_cuda_get_host_weights_buffer_type;
+    if (strcmp(name, "ggml_backend_cuda_get_host_weights_buffer_type_dev") == 0) {
+        return (void *)ggml_backend_cuda_get_host_weights_buffer_type_dev;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
