@@ -4620,6 +4620,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 GGML_LOG_INFO("MMQ FEW: draft-only mode active (type=%s, m=%lld, n=%lld, k=%lld)\n",
                         ggml_type_name(src0->type), (long long) src0->ne[1], (long long) src1->ne[1], (long long) src0->ne[0]);
             }
+            // harness audit: one line per distinct weight (type, m, k) that takes MMQ_FEW in draft mode, so a gate can
+            // prove no target-only weight type/shape is routed here (scope-leak check).
+            {
+                static std::mutex audit_mu;
+                static std::vector<std::array<int64_t, 3>> audit_seen;
+                const std::array<int64_t, 3> key = { (int64_t) src0->type, src0->ne[1], src0->ne[0] };
+                std::lock_guard<std::mutex> lk(audit_mu);
+                if (audit_seen.size() < 256 && std::find(audit_seen.begin(), audit_seen.end(), key) == audit_seen.end()) {
+                    audit_seen.push_back(key);
+                    GGML_LOG_INFO("MMQ FEW: draft weight (type=%s, m=%lld, k=%lld, name=%s)\n", ggml_type_name(src0->type),
+                            (long long) src0->ne[1], (long long) src0->ne[0], src0->name);
+                }
+            }
         }
         ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;
