@@ -11826,9 +11826,12 @@ static int ggml_cuda_try_fuse_ink_mix_norm(ggml_backend_cuda_context * ctx, ggml
             mix->ne[0] < 1024) {
         return 0;
     }
-    // [FUSE MIXNORMV] (GGML_CUDA_FUSE_MIXNORMV=1, default off): also through a whole-tensor VIEW of the mixed rows (the
-    // one-query mix of a sliding-window visit reaches its input norm through the row view of input 0)
-    static const bool view_on = [] { const char * e = getenv("GGML_CUDA_FUSE_MIXNORMV"); return e && *e && atoi(e) != 0; }();
+    // [FUSE MIXNORMV] (default on; GGML_CUDA_FUSE_MIXNORMV=0 = off): also through a whole-tensor VIEW of the mixed rows
+    // (the one-query mix of a sliding-window visit reaches its input norm through the row view of input 0)
+    static const bool view_on = [] {
+        const char * e = getenv("GGML_CUDA_FUSE_MIXNORMV");
+        return !e || !*e || atoi(e) != 0;
+    }();
     auto whole_view = [&](const ggml_tensor * v) {
         return view_on && v->op == GGML_OP_VIEW && v->view_offs == 0 && v->src[0] && ggml_is_contiguous(v) &&
             ggml_is_contiguous(v->src[0]) && ggml_nelements(v) == ggml_nelements(v->src[0]) && v->type == v->src[0]->type;
@@ -13563,9 +13566,9 @@ static int ggml_cuda_try_fuse_dspark_head(ggml_backend_cuda_context * ctx, ggml_
     return 0;
 }
 
-// [FUSE KVCONV] (fuse-kvconv.cuh, GGML_CUDA_FUSE_KVCONV=1, default off): two conv-epilogue runs (SSM_CONV, ADD, SCALE)
-// whose only nodes in between are the second ring's planned (skipped) CONCAT / window nodes and views, as one launch.
-// Neither unit may read or write what the other writes (the unfused order ran the first entirely before the second).
+// [FUSE KVCONV] (fuse-kvconv.cuh, default on; GGML_CUDA_FUSE_KVCONV=0 = off): two conv-epilogue runs (SSM_CONV, ADD,
+// SCALE) whose only nodes in between are the second ring's planned (skipped) CONCAT / window nodes and views, as one
+// launch. Neither unit may read or write what the other writes (unfused, the first ran entirely before the second).
 static int ggml_cuda_try_fuse_kvconv(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     if (!ggml_cuda_fuse_kvconv_on()) {
         return 0;
@@ -13685,7 +13688,7 @@ static int ggml_cuda_try_fuse_kvconv(ggml_backend_cuda_context * ctx, ggml_cgrap
     return last2 - i;
 }
 
-// [FUSE RELMERGE] (fuse-relmerge.cuh, GGML_CUDA_FUSE_RELMERGE=1, default off): the far / near merge of an Inkling
+// [FUSE RELMERGE] (fuse-relmerge.cuh, default on; GGML_CUDA_FUSE_RELMERGE=0 = off): the far / near merge of an Inkling
 // full-attention visit (llama-graph.cpp inkrel_merge: [unpack CONCAT,] ADD(far LSE, table constant), CONCAT, FILL 0,
 // CONCAT, SOFT_MAX, CONT, MUL, CONT, MUL, ADD [, SIGMOID(gate), MUL]) as one launch; same values
 static bool fuse_rm_f32c(const ggml_tensor * t) {

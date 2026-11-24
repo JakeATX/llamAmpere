@@ -514,10 +514,10 @@ static __global__ void k_ink_rms_norm_mul_multi(const ink_rn_args a, const int n
     }
 }
 
-// [FUSE QKVNORM] (GGML_CUDA_FUSE_QKVNORM=1, default off): also take a contiguous x whose row stride is not ncols: the
-// one-row view of the three-row depth mix that the Q, K and V input norms of a full-attention decode visit read
+// [FUSE QKVNORM] (default on; GGML_CUDA_FUSE_QKVNORM=0 = off): also take a contiguous x whose row stride is not ncols:
+// the one-row view of the three-row depth mix that the Q, K and V input norms of a full-attention decode visit read
 static bool ink_rn_x_ok(const ggml_tensor * x, const int64_t ncols) {
-    static const bool strided = getenv("GGML_CUDA_FUSE_QKVNORM") && atoi(getenv("GGML_CUDA_FUSE_QKVNORM")) != 0;
+    static const bool strided = !getenv("GGML_CUDA_FUSE_QKVNORM") || atoi(getenv("GGML_CUDA_FUSE_QKVNORM")) != 0;
     return x->nb[1] == ncols*sizeof(float) || (strided && ggml_is_contiguous(x));
 }
 
