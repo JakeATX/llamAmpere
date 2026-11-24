@@ -41,7 +41,7 @@ static const char * k_arch_defaults_json = R"ARCHJSON(
       "ub": {"ladder": true, "ceiling_24g": 1024, "needs_ctx": true, "batch_24g": 2048,
              "why": "UBDEFAULT sweep 3090 4/4 c131072: 1024 best at 32K/100K (SWA rel-bias work grows with ub); INKCOMP F262: -ub 1024 -b 2048 +3% decode, +131K max ctx"},
       "lean_prompt": {"24g": "off", "small": "auto",
-             "why": "free-MiB rule was tuned on Flash-Next; NQ 24 GB has 7,667 MiB free and took it silently; DEFPATH A/B 11-24 (see commit)"},
+             "why": "free-MiB rule was tuned on Flash-Next; NQ 24 GB (7,667 MiB free) took it silently. DEFPATH smoke 11-24 3090 300 W, NQ defaults, 16K fill, 5,120-tok chat temp 1, ABBA 2+2: LEAN=0 prefill 1993 vs 1949 (+2.3%), decode 97.9 vs 97.7"},
       "kv": {"type_k": "sjkvarn4", "type_v": "sjkvarn4", "why": "Jake 11-22: Inkling ships SJ-KVaRN 4/4 (LLAMA_INK_KV44 engine default)"},
       "spec": {"type": "draft-dspark", "model": "Inkling-2-Mini-DSpark-Q8_0-fold.gguf", "ngl": 99, "ubatch": 64,
                "type_k": "f16", "type_v": "f16", "min_gpu_mib": 23552,
@@ -411,6 +411,7 @@ void common_arch_defaults_report(const common_params & params, const llama_model
         const int best = (*row).value("parallel", 0);
         const bool same = params.n_parallel == best;
         add(same ? "ON" : "OVERRIDE", "parallel", std::to_string(params.n_parallel), string_format("best -np %d (one user)", best));
+        if (!same) differ.push_back("parallel");
     }
     // engine switches and gated flags
     if (row) {

@@ -247,7 +247,9 @@ static void common_speculative_apply_file_default(common_params & params, const 
     const char * why_not = nullptr;
     if (!std::filesystem::is_regular_file(file, ec)) {
         why_not = "the drafter file is not beside the model";
-    } else if (params.n_gpu_layers == 0 || !params.tensor_buft_overrides.empty()) {
+    } else if (params.n_gpu_layers == 0 || params.n_cpu_moe_auto ||
+            (!params.tensor_buft_overrides.empty() && params.tensor_buft_overrides[0].pattern != nullptr)) {
+        // (arg.cpp pads tensor_buft_overrides with null entries for the fit: only a real pattern counts)
         why_not = "the model is not fully on the GPU (-ngl 0, --cpu-moe or -ot)";
     } else if (min_mib < row.min_gpu_mib) {
         why_not = "the card is below the drafter's card line";
