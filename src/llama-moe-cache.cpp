@@ -1,5 +1,7 @@
 #include "llama-moe-cache.h"
 #include "llama-moe-cache-policy.h"
+#include "llama-moe-ramlock.h"
+#include "llama-moe-prefetch.h"
 
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -190,6 +192,31 @@ struct moe_cache_lru {
         }
         if (res < 0) {
             GGML_ABORT("no MoE cache victim");
+        }
+        return res;
+    }
+
+    // fork (R4, NEXTPF): victim() that also skips the slots for which keep(s) is true; -1 if every slot is kept
+    template <typename K>
+    int32_t victim_keep(int32_t il, K && keep) const {
+        int32_t res = -1;
+        double res_score = -1.0;
+        for (int c = 0; c < n_class; ++c) {
+            for (int32_t s = head[c]; s >= 0; s = next[s]) {
+                if (is_selected(il, key_of[s]) || keep(s)) {
+                    continue;
+                }
+                const int32_t key = key_of[s];
+                if (key < 0) {
+                    return s;
+                }
+                const double score = std::ldexp((double) (clock[key_layer(key)] - last_use[key]), -c);
+                if (score > res_score) {
+                    res       = s;
+                    res_score = score;
+                }
+                break; // the least recently used candidate of the list, as candidate()
+            }
         }
         return res;
     }
@@ -486,6 +513,16 @@ struct llama_moe_cache::impl {
 
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
     FILE * trace = nullptr;
+
+    // fork (#130, RAMLOCK): LLAMA_MOE_RAM_LOCK_GIB, nullptr when unset (see llama-moe-ramlock.h)
+    std::unique_ptr<llama_moe_ramlock> ramlock;
+
+    // fork (R4, NEXTPF): LLAMA_MOE_CACHE_NEXT_PREFETCH, nullptr when unset (see llama-moe-prefetch.h); stopped in ~impl()
+    std::unique_ptr<llama_moe_prefetch> prefetch;
+    std::vector<uint32_t> pf_pred;    // [n_expert] == pf_gen: predicted for the next layer
+    uint32_t pf_gen = 0;
+    std::vector<int32_t> pf_experts;
+    std::vector<moe_cache_lru::fill> pf_fills;
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -887,6 +924,30 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (!no_alloc) {
+            ramlock = llama_moe_ramlock::from_env((int32_t) layers.size(), (int32_t) model.hparams.n_expert);
+            if (ramlock) {
+                for (const group & g : groups) {
+                    for (int32_t il : g.layers) {
+                        if (canon[il] == il) {
+                            ramlock->add_layer(il, layers[il].experts);
+                        }
+                    }
+                }
+                ramlock->start();
+            }
+            prefetch = llama_moe_prefetch::from_env((int32_t) layers.size());
+            if (prefetch && (round_on || det_on)) {
+                LLAMA_LOG_WARN("%s: [NEXTPF] off: not with LLAMA_MOE_CACHE_ROUND / LLAMA_MOE_CACHE_DET\n", __func__);
+                prefetch.reset();
+            }
+            if (prefetch) {
+                pf_pred.assign(model.hparams.n_expert, 0);
+                LLAMA_LOG_WARN("%s: [NEXTPF] decode lookups upload up to %d experts of the next layer ahead (LLAMA_MOE_CACHE_NEXT_PREFETCH)\n",
+                        __func__, prefetch->budget());
+            }
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -1218,6 +1279,13 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        if (prefetch) {
+            prefetch->wait();
+            LLAMA_LOG_WARN("llama_moe_cache: [NEXTPF] %zu experts uploaded ahead in %zu rounds (%.2f MiB), %zu of them used (%.1f%%)\n",
+                    prefetch->n_prefetched, prefetch->n_rounds, prefetch->n_bytes/1024.0/1024.0, prefetch->n_used,
+                    prefetch->n_prefetched ? 100.0*prefetch->n_used/prefetch->n_prefetched : 0.0);
+            prefetch.reset();
+        }
         if (!seed_save.empty()) {
             seed_write(seed_save);
         }
@@ -1294,6 +1362,9 @@ struct llama_moe_cache::impl {
             return 0;
         }
         nowait_drain(); // fork (INKMISS): a large batch reads the banks without the lookup's event wait
+        if (prefetch) {
+            prefetch->wait(); // the banks it reads may be in flight
+        }
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -1336,6 +1407,9 @@ struct llama_moe_cache::impl {
         const int32_t il      = it->second.first;
         const int32_t ci      = canon[il];
         const bool    has_cpu = it->second.second;
+        if (prefetch) {
+            prefetch->wait(); // uploads ahead write the banks this lookup plans over
+        }
         layer & l = layers[il];
         group & g = groups[l.ig];
 
@@ -1375,6 +1449,14 @@ struct llama_moe_cache::impl {
 
         if (trace != nullptr) {
             write_trace(il, n_used);
+        }
+        if (ramlock) {
+            ramlock->observe(ci, ids.data(), ids.size());
+        }
+        const bool pf_decode = prefetch && sel->src[0]->ne[1] <= 8;
+        if (pf_decode) {
+            prefetch->account(ci, ids.data(), ids.size());
+            prefetch->record(ci, ids.data(), ids.size());
         }
 
         // fork (SURGE-cache): a window starts at a lookup of a layer at or below the previous one; rank the last one first
@@ -1490,7 +1572,85 @@ struct llama_moe_cache::impl {
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, g.lru.slot_map[ci], 0, ggml_nbytes(l.slot_map));
 
+        if (pf_decode) {
+            prefetch_next(il, ci, g);
+        }
+
         return true;
+    }
+
+    // fork (R4, NEXTPF): see llama-moe-prefetch.h. Runs after the plan of layer il (seen = its selection), so victims
+    // skip its selected experts; the uploads go to slots that nothing on the device reads before the next lookup.
+    void prefetch_next(int32_t il, int32_t ci, group & g) {
+        const int32_t nl = il + 1;
+        if (nl >= (int32_t) layers.size() || layers[nl].ig != layers[il].ig) {
+            return;
+        }
+        const int32_t cn = canon[nl];
+        int32_t * slots = g.lru.slot_map[cn];
+        const std::vector<int32_t> & pred = prefetch->predicted(cn);
+        if (cn == ci || slots == nullptr || pred.empty()) {
+            return;
+        }
+        if (++pf_gen == 0) {
+            std::fill(pf_pred.begin(), pf_pred.end(), 0);
+            pf_gen = 1;
+        }
+        for (int32_t e : pred) {
+            pf_pred[e] = pf_gen;
+        }
+        moe_cache_lru & lru = g.lru;
+        auto keep = [&](int32_t s) {
+            const int32_t key = lru.key_of[s];
+            return key >= 0 && lru.key_layer(key) == cn && pf_pred[lru.key_expert(key)] == pf_gen;
+        };
+        pf_fills.clear();
+        pf_experts.clear();
+        for (int32_t e : pred) {
+            if (slots[e] < g.n_slots) {
+                continue; // cached (a slot >= n_slots is empty or a zero slot of a CPU miss)
+            }
+            if ((int32_t) pf_fills.size() >= prefetch->budget()) {
+                break;
+            }
+            const int32_t s = lru.victim_keep(ci, keep);
+            if (s < 0) {
+                break;
+            }
+            if (lru.key_of[s] >= 0) {
+                lru.slot_map[lru.key_layer(lru.key_of[s])][lru.key_expert(lru.key_of[s])] = lru.empty;
+            } else {
+                lru.n_filled++;
+            }
+            const int32_t key = lru.make_key(cn, e);
+            lru.key_of[s] = key;
+            slots[e]      = s;
+            lru.move(s, lru.crf[key] >= 1.0f ? lru.class_of(key) : 0);
+            pf_fills.push_back({ e, s });
+            pf_experts.push_back(e);
+        }
+        if (pf_fills.empty()) {
+            return;
+        }
+        std::vector<llama_moe_prefetch::job> jobs;
+        const layer & ln = layers[nl];
+        for (size_t ip = 0; ip < ln.experts.size(); ++ip) {
+            const ggml_tensor * w    = ln.experts[ip];
+            ggml_tensor       * bank = g.banks[ip];
+            const size_t expert_size = bank->nb[2];
+            for (size_t i = 0; i < pf_fills.size();) {
+                size_t n = 1;
+                while (w->nb[2] == expert_size && i + n < pf_fills.size() && pf_fills[i + n].expert == pf_fills[i].expert + (int32_t) n &&
+                        pf_fills[i + n].slot == pf_fills[i].slot + (int32_t) n) {
+                    n++;
+                }
+                jobs.push_back({ bank, (const uint8_t *) w->data + pf_fills[i].expert*w->nb[2], pf_fills[i].slot*expert_size, n*expert_size });
+                i += n;
+            }
+        }
+        prefetch->n_prefetched += pf_fills.size();
+        prefetch->mark(cn, pf_experts);
+        prefetch->submit(std::move(jobs));
     }
 
     // fork (SURGE-cache, round admission): see round_on. Runs at the first lookup of a window, when the device has
@@ -1576,6 +1736,9 @@ struct llama_moe_cache::impl {
             return 0;
         }
         nowait_drain(); // fork (INKMISS): no background copy into banks about to be freed
+        if (prefetch) {
+            prefetch->wait();
+        }
         size_t freed = 0;
         for (device & d : devices) {
             if (!d.buf || !d.ctx) {

@@ -614,6 +614,7 @@ endif()
 
 llama_build_and_test(test-backend-ops.cpp LINK ggml Threads::Threads)
 llama_build_and_test(test-fattn-prefill-policy.cpp)
+llama_build(test-i8qk-flagcache.cpp)
 llama_build_and_test(test-fa-skip-dead.cpp) # [ROUNDFIX] dead-tile skip bit-identity; skips without a GPU backend
 llama_build_and_test(test-topk-select-fast.cpp) # [ROUNDFIX] fast radix select bit-identity; skips without a GPU backend
 llama_build_and_test(test-lid-gather.cpp) # [ROUNDFIX] pooled-key gather read in place, bit-identity; skips without a GPU backend
@@ -818,6 +819,11 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT LLAMA_USE_SYSTEM_GGML)
     target_include_directories(test-mmap-prefetch PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_test(test-mmap-prefetch LABEL "main;cpu")
 endif()
+
+# fork (R4, NEXTPF): next-layer expert prefetch worker and bookkeeping, CPU only
+add_executable(test-moe-prefetch test-moe-prefetch.cpp ../src/llama-moe-prefetch.cpp)
+target_link_libraries(test-moe-prefetch PRIVATE ggml-base Threads::Threads)
+llama_test(test-moe-prefetch LABEL "main;cpu")
 
 if (UNIX AND NOT LLAMA_USE_SYSTEM_GGML)
     # safety: --load-mode dio reads through a plain bounce buffer and gives the same bytes as mmap

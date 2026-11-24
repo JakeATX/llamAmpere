@@ -166,8 +166,11 @@ static llama_context * make_ctx(llama_model * model, const sj_cfg & c, uint32_t 
                 const ggml_tensor * body = cache->get_sj_kvarn_body(il);
                 require(body && body->buffer, "resident body allocated");
                 const auto buft = ggml_backend_buffer_get_type(body->buffer);
-                const bool split = strstr(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_") != nullptr;
-                require(split == (model->hparams.dsv4_compress_ratios[il] > 0), "only eligible QSA layers use split bodies");
+                // the CLOCK pool (GGML_CUDA_QSA_RESIDENT_CLOCK, default on) is the split body under another buffer name
+                const char * name = ggml_backend_buft_name(buft);
+                const bool split = strstr(name, "CUDA_QSA_Resident_") != nullptr || strstr(name, "CUDA_QSA_Clock_") != nullptr;
+                require(split == (model->hparams.dsv4_compress_ratios[il] > 0), "only eligible QSA layers use split bodies (layer " +
+                        std::to_string(il) + ": " + name + ")");
                 require(ggml_backend_buft_get_device(buft) == model->dev_layer(il), "body stays on the model layer device");
                 require(ggml_backend_dev_type(model->dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_GPU, "resident state test runs on GPU");
                 if (split) {
@@ -230,7 +233,9 @@ static std::vector<int32_t> descriptor(llama_kv_cache * cache, llama_pos next_po
     llama_kv_cache::slot_info sinfo;
     sinfo.s0 = sinfo.s1 = 0;
     sinfo.strm  = { 0 };
-    sinfo.idxs  = { { 0 } };
+    // QPOS0 is the cell of the first query row (#39). These probes ask about a position, not a placed ubatch: pass the
+    // position, as QPOS0 was before #39 (only the CLOCK resident path reads it)
+    sinfo.idxs  = { { (uint32_t) next_pos } };
     cache->set_input_sj_kvarn_desc(desc, &ubatch, sinfo);
     std::vector<int32_t> result(GGML_SJKVARN_DESC_N_ENTRIES);
     ggml_backend_tensor_get(desc, result.data(), 0, result.size()*sizeof(int32_t));
@@ -399,6 +404,25 @@ static void failed_restore_clear_case(llama_model * model) {
     require(same_logits(decode(dst.get(), 0, 1537, 128, 3), decode(ref.get(), 0, 1537, 128, 3)), "cleared cache decodes like a fresh one");
 }
 
+// --resident report: KV breakdown by host/card and the card bytes an on-device snapshot takes (split bodies are a host
+// master plus card slots, so their snapshot copy belongs in RAM)
+static size_t card_free(llama_model * model) {
+    size_t free = 0, total = 0;
+    ggml_backend_dev_memory(model->dev_layer(0), &free, &total);
+    return free;
+}
+
+static void resident_breakdown(llama_context * ctx, const char * name) {
+    double host = 0.0, card = 0.0;
+    std::string per;
+    for (const auto & [buft, size] : cache_of(ctx)->memory_breakdown()) {
+        const bool is_host = ggml_backend_buft_is_host(buft);
+        (is_host ? host : card) += size/1048576.0;
+        per += std::string(" ") + ggml_backend_buft_name(buft) + "=" + std::to_string(size/1048576.0).substr(0, 6) + "MiB";
+    }
+    printf("resident %s: KV breakdown host %.2f MiB, card %.2f MiB:%s\n", name, host, card, per.c_str());
+}
+
 static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_cfg> & mismatches, const char * tmp_dir) {
     llama_context * src = make_ctx(model, c);
     require(src != nullptr, "source context");
@@ -423,7 +447,11 @@ static int run_case(llama_model * model, const sj_cfg & c, const std::vector<sj_
         const live_cache before = snapshot(src);
         const auto rec_before = records(src, n_groups_pool);
         if (c.resident) {
+            resident_breakdown(src, c.name);
+            const size_t free_before = card_free(model);
             const auto device_blob = seq_state(src, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            printf("resident %s: on-device snapshot took %.2f MiB of card memory\n", c.name,
+                    ((double) free_before - (double) card_free(model))/1048576.0);
             decode(src, N0, N0 + 256, 128, 9);
             require(llama_state_seq_set_data_ext(src, device_blob.data(), device_blob.size(), 0,
                     LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == device_blob.size(), "on-device snapshot restores after further seals");

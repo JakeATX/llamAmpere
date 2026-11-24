@@ -639,6 +639,16 @@ static bool backend_has_feature(ggml_backend_t backend, const char * feature_nam
     return false;
 }
 
+// UZU-4: TBO_PERF_COLD_MIB=N times perf cases with the device cache evicted before every run (0/unset = off)
+static size_t perf_cold_mib() {
+    static const size_t v = [] {
+        const char * e = getenv("TBO_PERF_COLD_MIB");
+        const long long n = e ? atoll(e) : 0;
+        return (size_t) std::max(0LL, std::min(n, 4096LL));
+    }();
+    return v;
+}
+
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -1985,8 +1995,44 @@ struct test_case {
             n_runs = 1;
         }
 
+        // UZU-4 cold-cache timing (TBO_PERF_COLD_MIB=N, off by default): before every timed run of the op, a scale over
+        // an N MiB scratch buffer evicts the device cache (pick N well above the L2/LLC size, e.g. 64), and the same
+        // eviction-only graph is timed on its own and subtracted, so the op is timed with its inputs read cold.
+        // The subtraction carries the eviction's run-to-run jitter: keep N near 2-4x the cache (3090: 6 MiB L2 -> 16-24)
+        // and trust it for ops that take at least ~10% of one eviction (CPU runs the scale on one thread: slow and noisy).
+        const size_t cold_mib = perf_cold_mib();
+        const bool cold = cold_mib > 0 && !perf_whole_graph() && perf_repeats_output() && !run_whole_graph();
+        ggml_context_ptr ctx_cold;
+        ggml_backend_buffer_ptr buf_cold(nullptr);
+        ggml_tensor * evict = nullptr;
+        ggml_cgraph * gf_evict = nullptr;
+        if (cold) {
+            ggml_init_params cp = { ggml_tensor_overhead()*4 + ggml_graph_overhead_custom(graph_nodes, false), NULL, true };
+            ctx_cold.reset(ggml_init(cp));
+            ggml_tensor * scratch = ggml_new_tensor_1d(ctx_cold.get(), GGML_TYPE_F32, (int64_t) (cold_mib << 20)/sizeof(float));
+            // not in place and s != 1: no backend may skip it (an in-place scale by 1 can be a no-op)
+            evict = ggml_scale(ctx_cold.get(), scratch, 0.5f);
+            evict->flags |= GGML_TENSOR_FLAG_COMPUTE; // added by hand below, not through ggml_build_forward_expand
+            buf_cold.reset(ggml_backend_alloc_ctx_tensors(ctx_cold.get(), backend));
+            if (buf_cold == NULL) {
+                printf("failed to allocate the cold-cache scratch\n");
+                return false;
+            }
+            ggml_backend_buffer_clear(buf_cold.get(), 0);
+            // each run pays a full eviction, so keep the graph short (the 1 s loop still repeats it)
+            n_runs = std::max(1, std::min({n_runs, 32, (int) (ggml_graph_size(gf) - ggml_graph_n_nodes(gf))/2}));
+            gf_evict = ggml_new_graph_custom(ctx_cold.get(), graph_nodes, false);
+            // the op's own output stays last in gf: [build nodes..., out] -> [build nodes..., evict, out, evict, out, ...]
+            gf->n_nodes--;
+            for (int i = 0; i < n_runs; i++) {
+                ggml_graph_add_node(gf, evict);
+                ggml_graph_add_node(gf, out);
+                ggml_graph_add_node(gf_evict, evict);
+            }
+        }
+
         // duplicate the op
-        for (int i = 1; i < n_runs; i++) {
+        for (int i = 1; i < n_runs && !cold; i++) {
             ggml_graph_add_node(gf, out);
         }
 
@@ -2004,6 +2050,9 @@ struct test_case {
         };
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             if (ggml_is_view_op(ggml_graph_node(gf, i)->op) || ggml_graph_node(gf, i) == out) {
+                continue;
+            }
+            if (ggml_graph_node(gf, i) == evict) {
                 continue;
             }
             mem += tensor_op_size(ggml_graph_node(gf, i));
@@ -2029,6 +2078,25 @@ struct test_case {
             // re-draw any data-dependent inputs (expert ids) outside the timed region
             reinit_perf_iter(ctx.get());
         } while (total_time_us < 1000*1000); // run for at least 1 second
+
+        if (cold) {
+            // time the eviction-only graph for as many evictions and subtract it
+            const int iters = total_runs / n_runs;
+            int64_t evict_us = 0;
+            if (ggml_backend_graph_compute(backend, gf_evict) != GGML_STATUS_SUCCESS) { // warmup
+                return false;
+            }
+            for (int it = 0; it < iters; ++it) {
+                const int64_t t0 = ggml_time_us();
+                if (ggml_backend_graph_compute(backend, gf_evict) != GGML_STATUS_SUCCESS) {
+                    return false;
+                }
+                evict_us += ggml_time_us() - t0;
+            }
+            fprintf(stderr, "  [cold %zu MiB] op+evict %.2f us/run, evict only %.2f us/run\n", cold_mib,
+                    (double) total_time_us/total_runs, (double) evict_us/total_runs);
+            total_time_us = std::max<int64_t>(1, total_time_us - evict_us);
+        }
 
         // Create test result
         double avg_time_us      = (double) total_time_us / total_runs;

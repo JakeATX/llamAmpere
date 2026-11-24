@@ -38,6 +38,8 @@ set(LLAMA_CORE_SOURCES
     llama-memory.cpp
     llama-moe-cache.cpp
     llama-moe-cache-policy.cpp
+    llama-moe-ramlock.cpp
+    llama-moe-prefetch.cpp
     llama-ink-stream.cpp
     llama-ink-host.cpp
     llama-moe-arena.cpp

@@ -4,6 +4,7 @@
 #include "base64.hpp"
 #include "server-chat.h"
 #include "server-eval-cache.h"
+#include "server-numerics-probe.h"
 #include "server-loop-guard.h"
 #include "server-common.h"
 #include "server-decision.h"
@@ -3111,6 +3112,20 @@ private:
         if (prompt_cache && disk_cache_enabled) {
             try {
                 disk_cache_key = prompt_cache_key();
+                if (server_numerics_probe_enabled()) {
+                    // [TF233] LLAMA_PROMPT_CACHE_NUMERICS_PROBE=1: key the disk tier on the numbers this build makes
+                    std::string part, perr;
+                    if (server_numerics_probe(ctx_tgt, part, perr)) {
+                        SRV_INF("prompt cache numerics probe: %s\n", part.c_str());
+                    } else {
+                        SRV_WRN("prompt cache numerics probe skipped: %s\n", perr.c_str());
+                        part = "skipped:" + perr;
+                    }
+                    disk_cache_key += "numerics=" + part + ";";
+                    if (ctx_dft && llama_get_memory(ctx_dft)) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, -1, -1); // a target decode may also feed the drafter
+                    }
+                }
             } catch (const std::exception & e) {
                 SRV_WRN("prompt cache disk tier disabled, running RAM-only: %s\n", e.what());
                 disk_cache_enabled = false;
