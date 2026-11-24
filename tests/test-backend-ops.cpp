@@ -14773,7 +14773,6 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         : n_q(n_q), nh(nh), hkv(hkv), n_groups(n_groups), n_ring(n_ring), row_mask(row_mask), attn_options(attn_options), staging_type(staging_type), body_type(body_type), bits_k(bits_k), bits_v(bits_v), S(S), f16_sink(f16_sink), rot(rot), ns(ns), mask_mode(mask_mode), data_case(data_case), compact_bound(compact_bound), G(group_size),
           cap(std::max<int64_t>(1280, ((n_ring + G - 1)/G)*G)) {
         GGML_ASSERT(n_ring <= cap && n_ring - 37*(n_streams() - 1) >= n_q);
-        GGML_ASSERT(ns == 0 || rot != 2);
         GGML_ASSERT(mask_mode >= 0 && mask_mode <= 10);
         GGML_ASSERT(mask_mode != 7 || (ns == 0 && compact_bound == 0));
         GGML_ASSERT(mask_mode != 10 || (ns == 0 && compact_bound == 0 && !row_mask));
@@ -14829,7 +14828,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
             sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
             ggml_set_name(sinks, "sinks");
         }
-        auto fa = [&](ggml_tensor * qq) {
+        auto fa = [&](ggml_tensor * qq, bool fused_rot) {
             ggml_tensor * out = nullptr;
             if (ns > 0) {
                 // per-stream nodes over views, exactly as llm_graph_context::build_attn_mha splits a multi-stream cache
@@ -14844,7 +14843,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                     ggml_flash_attn_ext_set_sj_kvarn(o, body, ds, bits_k, bits_v, (int32_t) n_kv_pad());
                     ggml_flash_attn_ext_set_n_kv_max(o, compact_bound);
                     ggml_prec_set_acc(o, GGML_PREC_F32);
-                    if (rot == 1) {
+                    if (fused_rot) {
                         ggml_flash_attn_ext_set_sj_kvarn_rot(o, 256);
                     }
                     out = out ? ggml_concat(ctx, out, o, 3) : o;
@@ -14892,34 +14891,33 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                 if (lse_out) {
                     // A5: the rotation flag belongs on the FA node, not on the CONCAT below (rot = 2 has no LSE form)
                     GGML_ASSERT(rot != 2);
-                    if (rot == 1) {
+                    if (fused_rot) {
                         ggml_flash_attn_ext_set_sj_kvarn_rot(o, 256);
                     }
                     ggml_tensor * lse = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nh, n_q, 1);
                     ggml_set_name(lse, "lse");
                     ggml_flash_attn_ext_set_lse(o, lse);
                     out = ggml_concat(ctx, ggml_reshape_1d(ctx, o, ggml_nelements(o)), ggml_reshape_1d(ctx, lse, nh*n_q), 0);
+                } else if (fused_rot) {
+                    ggml_flash_attn_ext_set_sj_kvarn_rot(o, 256);
                 }
             }
             return out;
         };
-        ggml_tensor * out = fa(q);
+        ggml_tensor * out = fa(q, rot != 0);
         if (packed_pair) {
             GGML_ASSERT(rot == 0);
             ggml_tensor * m_f16 = m;
             m = new_tensor_kq_mask_packed(ctx, mask_kv, n_q, 1, n_streams());
             ggml_set_name(m, "mp");
-            ggml_tensor * out_p = fa(q);
+            ggml_tensor * out_p = fa(q, false);
             m = m_f16;
             out = ggml_concat(ctx, out, out_p, 0);
-        }
-        if (rot != 0 && ns == 0 && !lse_out) {
-            ggml_flash_attn_ext_set_sj_kvarn_rot(out, 256);
         }
         if (rot == 2) {
             ggml_set_name(out, "out_fused");
             ggml_tensor * q_rot = ggml_permute(ctx, ggml_turbo_wht(ctx, q_rows, 0, 256, nullptr), 0, 2, 1, 3);
-            ggml_tensor * ref = ggml_turbo_wht(ctx, fa(q_rot), 1, 256, nullptr);
+            ggml_tensor * ref = ggml_turbo_wht(ctx, fa(q_rot, false), 1, 256, nullptr);
             out = ggml_sub(ctx, out, ref);
         }
         if (data_case != 0) {
@@ -23926,21 +23924,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 775, 300, true, false, GGML_TYPE_TQ6_0, 128, true));
     // [W8] widths 7/8 at GQA 6 with Q8_0 / TQ6_0 staging, n_groups 0 (4K) and 111 (32K, G=256 like sj_fill),
-    // n_seqs 1 and 4, f16_sink 0/1, and bit-exact fused rotation (rot=2, ns=0; FLASH_ATTN_EXT_SJKVARN_ROT_EXACT).
+    // unpaged (ns=0) and paged (ns=1, 4) layouts, f16_sink 0/1, Q8_0 rot=0/1, TQ6_0 rot=1, and bit-exact rot=2.
     for (int64_t n_q : {7, 8}) {
         for (auto [n_groups, n_ring] : std::vector<std::pair<int64_t, int64_t>>{{0, 3968}, {111, 4224}}) {
             for (bool f16_sink : {false, true}) {
-                for (int ns : {0, 4}) {
-                    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(
-                        n_q, 24, 4, n_groups, n_ring, false, false, GGML_TYPE_Q8_0, 128, f16_sink, GGML_TYPE_F32, 4, 4, 1, ns, 0, 0, 0, 256));
-                    if (!f16_sink || (n_groups == 0 && n_q == 7)) {
+                for (int ns : {0, 1, 4}) {
+                    for (int rot : {0, 1, 2}) {
                         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(
-                            n_q, 24, 4, n_groups, n_ring, false, false, GGML_TYPE_TQ6_0, 128, f16_sink, GGML_TYPE_F32, 4, 4, 1, ns, 0, 0, 0, 256));
+                            n_q, 24, 4, n_groups, n_ring, false, false, GGML_TYPE_Q8_0, 128, f16_sink, GGML_TYPE_F32, 4, 4, rot, ns, 0, 0, 0, 256));
                     }
-                }
-                for (ggml_type st : {GGML_TYPE_Q8_0, GGML_TYPE_TQ6_0}) {
-                    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(
-                        n_q, 24, 4, n_groups, n_ring, false, false, st, 128, f16_sink, GGML_TYPE_F32, 4, 4, 2, 0, 0, 0, 0, 256));
+                    for (int rot : {1, 2}) {
+                        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(
+                            n_q, 24, 4, n_groups, n_ring, false, false, GGML_TYPE_TQ6_0, 128, f16_sink, GGML_TYPE_F32, 4, 4, rot, ns, 0, 0, 0, 256));
+                    }
                 }
             }
         }

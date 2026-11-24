@@ -41,6 +41,8 @@ static int w8_parse_env(const char * name, const long lo, const long hi, const b
 static int w8_mode()       { static const int v = w8_parse_env("GGML_SJKVARN_W8",        0, 2,       false, "0, 1 or 2");    return v; }
 static int w8_nstage_env() { static const int v = w8_parse_env("GGML_SJKVARN_W8_NSTAGE", 2, 4,       true,  "0, 2, 3 or 4"); return v; }
 static int w8_splits_env() { static const int v = w8_parse_env("GGML_SJKVARN_W8_SPLITS", 0, INT_MAX, true,  ">= 0");         return v; }
+// Test-only switch: force the rot occupancy-mismatch fallback (unfused W8) so tests can verify it directly.
+static bool w8_force_unfused_env() { static const bool v = w8_parse_env("GGML_SJKVARN_W8_FORCE_UNFUSED", 0, 1, false, "0 or 1") != 0; return v; }
 
 template <int NSTAGE, bool rot, bool raw_k>
 static fattn_kernel_t w8_kernel() {
@@ -126,7 +128,15 @@ static void w8_launch_rot_checked(ggml_backend_cuda_context & ctx, ggml_tensor *
     }
     // Fused rot=true is bit-exact against unfused rot=false + WHT only when launch_fattn sees the same CTA/SM
     // occupancy (hence identical parallel_blocks / KV splits). Fall back to unfused W8 if they ever differ.
-    if (w8_ctas_per_sm<NSTAGE, true, raw_k>() != w8_ctas_per_sm<NSTAGE, false, raw_k>()) {
+    const int  ctas_rot   = w8_ctas_per_sm<NSTAGE, true,  raw_k>();
+    const int  ctas_plain = w8_ctas_per_sm<NSTAGE, false, raw_k>();
+    const bool forced     = w8_force_unfused_env();
+    if (forced || ctas_rot != ctas_plain) {
+        static std::atomic_flag logged_fb = ATOMIC_FLAG_INIT;
+        if (!logged_fb.test_and_set()) {
+            GGML_LOG_INFO("SJKVARN W8: rot unfused fallback taken (nstage %d, raw_k %d, ctas_rot %d, ctas_plain %d, forced %d)\n",
+                NSTAGE, (int) raw_k, ctas_rot, ctas_plain, (int) forced);
+        }
         ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused(ctx, dst, ::ggml_cuda_flash_attn_ext_sj_kvarn_w8);
         return;
     }
