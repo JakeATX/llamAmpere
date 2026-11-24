@@ -965,7 +965,7 @@ struct llama_moe_cache::impl {
             for (const auto & f : cpu) {
                 cpu_map[f.expert] = f.expert;
                 l.cpu_experts.push_back(f.expert);
-                if (round_on) {
+                if (round_on && sel->src[0]->ne[1] <= 8) { // decode misses only (a prompt tier may share the CPU part)
                     const int32_t key = g.lru.make_key(ci, f.expert);
                     if (round_mark[key] != round_gen) {
                         round_mark[key] = round_gen;
