@@ -14455,6 +14455,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
     bool lse_fix = false; // COMPFIX: SJ + LSE route cases, own op name (FLASH_ATTN_EXT_SJKVARN_LSE_ROUTES)
     bool lse_out = false; // LSA compensation: the node also writes its row log-sum-exp (ggml_flash_attn_ext_set_lse), appended to out
     bool sinks_only = false; // INKKV: attention sinks without the logit softcap attn_options adds
+    bool mask_bits = false;  // mask "m" as the one-bit packed I32 mask (mask_mode 0, no row_mask / streams / packed_pair)
     bool d128 = false;       // INKPREFILL (ggml-inksjd128.h): also mark the node as packed D 128 pairs (same Q layout as inksj)
     bool inksj = false;      // INKKV (ggml-inksj.h): pair-packed Q (zero half per head), only the real output halves compared
     int64_t far_gap = 0;     // INKKV far node: query at pos sees positions <= pos - far_gap, desc carries the far visible end
@@ -14511,6 +14512,7 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         if (sinks_only) { result += ",sinks=1"; }
         if (inksj) { result += ",inksj=1"; }
         if (d128) { result += ",d128=1"; }
+        if (mask_bits) { result += ",mbits=1"; }
         if (far_gap) { result += ",far_gap=" + std::to_string(far_gap); }
         if (mask_mode != 0) {
             result += ",mask_mode=" + std::to_string(mask_mode);
@@ -14654,7 +14656,9 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
         ggml_set_name(v, "v");
         // Packed masks must also cover the physical ring passed to the generic FA constructor.
         const int64_t mask_kv = packed_pair ? std::max(n_kv_pad(), k->ne[1]) : n_kv_pad();
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, mask_mode == 7 || mask_mode == 10 ? nh : 1, n_streams());
+        GGML_ASSERT(!mask_bits || (mask_mode == 0 && !row_mask && ns == 0 && !packed_pair && data_case == 0));
+        ggml_tensor * m = mask_bits ? new_tensor_kq_mask_packed(ctx, mask_kv, n_q, 1, n_streams()) :
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F16, mask_kv, n_q, mask_mode == 7 || mask_mode == 10 ? nh : 1, n_streams());
         ggml_set_name(m, "m");
         ggml_tensor * body = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, rec_bytes()*hkv*n_rec_pool());
         body->op_params[7] = body_type;
@@ -14822,6 +14826,17 @@ struct test_flash_attn_ext_sj_kvarn : public test_case {
                     }
                 }
                 set_tensor_kq_mask_binary(t, vis, mask_kv);
+            } else if (strcmp(t->name, "m") == 0 && mask_bits) {
+                // the mask_mode 0 visibility below, as bits
+                const int64_t mkv = t->op_params[0];
+                std::vector<uint8_t> vis((size_t) mkv*n_q);
+                for (int64_t j = 0; j < n_q; ++j) {
+                    const int64_t pos = N() - n_q + j;
+                    for (int64_t p = 0; p < mkv; ++p) {
+                        vis[j*mkv + p] = p <= pos - far_gap && p < N();
+                    }
+                }
+                set_tensor_kq_mask_binary(t, vis, mkv);
             } else if (strcmp(t->name, "m") == 0) {
                 const int64_t nhm = t->ne[2]; // nh for the per-head mode 7, else 1
                 std::vector<ggml_fp16_t> mask((size_t) n_kv_pad() * n_q * nhm * n_streams());
@@ -22852,6 +22867,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             t->sinks_only = mode == 10;
             test_cases.emplace_back(t);
         }
+        // the one-bit packed far mask of prompt ubatches (LSE far node, as the INKKV split builds it)
+        auto * t = new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                GGML_TYPE_F32, 4, 4, 1, 0, 0);
+        t->inksj = true;
+        t->d128 = true;
+        t->mask_bits = true;
+        t->lse_out = true;
+        test_cases.emplace_back(t);
     }
     // INKKV far visible end (ggml-inksj.h): the far mask hides the last far_gap positions of every row, the desc says so
     for (int64_t n_q : {1, 2, 4, 8}) {
