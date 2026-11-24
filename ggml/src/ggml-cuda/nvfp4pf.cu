@@ -135,6 +135,86 @@ bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp) {
     return ggml_cuda_nvfp4pf_try_mode(ctx, src0, src1, ids, dst, s_exp, -1);
 }
+
+double ggml_cuda_nvfp4pf_bench_kern(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp, int use_nk, int warmup, int iters) {
+    const int KF = ggml_cuda_nvfp4pf_mode();
+    if (KF == 0 || !src0 || !src1 || !ids || !dst || !src0->data || !src1->data || !ids->data || !dst->data || iters <= 0) {
+        return -1.0;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || (cc != GGML_CUDA_CC_AMPERE && cc != 860)) {
+        return -1.0;
+    }
+    const int64_t K = src0->ne[0], M = src0->ne[1], n_expert = src0->ne[2];
+    const int64_t ne11 = src1->ne[1], n_used = ids->ne[0], n_tok = ids->ne[1];
+    if (K <= 0 || M <= 0 || K % 128 != 0 || M % 16 != 0 || n_expert <= 0 || n_expert > NVFP4PF_MAX_EXPERTS || n_tok < 512) {
+        return -1.0;
+    }
+    const int64_t n_rows = ne11 * n_tok, n_pairs = n_used * n_tok;
+    const int bn = n_pairs < 64 * n_expert ? 64 : 128;
+    const int max_tiles = nvfp4pf_max_tiles((int) n_expert, n_pairs, bn);
+    if (n_rows > 65535 || n_pairs > INT_MAX || max_tiles > 65535) {
+        return -1.0;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<int8_t> xq(ctx.pool(), (size_t) n_rows * K);
+    ggml_cuda_pool_alloc<float>  xs(ctx.pool(), (size_t) n_rows * (K / KF));
+    ggml_cuda_pool_alloc<int>    work(ctx.pool(), nvfp4pf_work_ints((int) n_expert, n_pairs, max_tiles));
+    float * y = (float *) dst->data;
+    const int64_t stride_blk = src0->nb[1] / 36;
+    const char * w = (const char *) src0->data;
+    const float * se = s_exp ? (const float *) s_exp->data : nullptr;
+
+    k_nvfp4pf_route<<<1, 256, 0, stream>>>((const char *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, (int) ne11,
+        (int) n_expert, bn, max_tiles, work.get(), y, (int) M);
+    const nvfp4pf_map map = nvfp4pf_map_of(work.get(), (int) n_expert, n_pairs, src0->nb[2]);
+    const nk_pf_map nk_map = { map.hdr, map.exps, map.off, map.rows, map.cols, map.tiles, map.nb02 };
+    const dim3 gq((unsigned) ((K / KF + 3) / 4), (unsigned) n_rows);
+    if (KF == 64) {
+        k_nvfp4pf_xq<64><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
+    } else {
+        k_nvfp4pf_xq<32><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
+    }
+
+    auto launch_mm = [&]() {
+        if (use_nk > 0) {
+            ggml_cuda_nk_pf_mm_launch(KF, bn, w, stride_blk, xq.get(), xs.get(), y, (int) M, (int) K,
+                nk_map, max_tiles, se, ctx.device, stream);
+        } else if (KF == 64) {
+            if (bn == 64) {
+                nvfp4pf_launch_mm<64, 64>(w, stride_blk, xq.get(), xs.get(), y, (int) M, (int) K, map, max_tiles, se, stream);
+            } else {
+                nvfp4pf_launch_mm<64, 128>(w, stride_blk, xq.get(), xs.get(), y, (int) M, (int) K, map, max_tiles, se, stream);
+            }
+        } else {
+            if (bn == 64) {
+                nvfp4pf_launch_mm<32, 64>(w, stride_blk, xq.get(), xs.get(), y, (int) M, (int) K, map, max_tiles, se, stream);
+            } else {
+                nvfp4pf_launch_mm<32, 128>(w, stride_blk, xq.get(), xs.get(), y, (int) M, (int) K, map, max_tiles, se, stream);
+            }
+        }
+    };
+
+    for (int i = 0; i < warmup; ++i) {
+        launch_mm();
+    }
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+    CUDA_CHECK(cudaEventCreate(&ev0));
+    CUDA_CHECK(cudaEventCreate(&ev1));
+    CUDA_CHECK(cudaEventRecord(ev0, stream));
+    for (int i = 0; i < iters; ++i) {
+        launch_mm();
+    }
+    CUDA_CHECK(cudaEventRecord(ev1, stream));
+    CUDA_CHECK(cudaEventSynchronize(ev1));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+    CUDA_CHECK(cudaEventDestroy(ev0));
+    CUDA_CHECK(cudaEventDestroy(ev1));
+    return (double) ms * 1000.0 / (double) iters;
+}
 #else
 bool ggml_cuda_nvfp4pf_try_mode(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *,
         const ggml_tensor *, int) {
@@ -143,5 +223,9 @@ bool ggml_cuda_nvfp4pf_try_mode(ggml_backend_cuda_context &, const ggml_tensor *
 bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *,
         const ggml_tensor *) {
     return false;
+}
+double ggml_cuda_nvfp4pf_bench_kern(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+        ggml_tensor *, const ggml_tensor *, int, int, int) {
+    return -1.0;
 }
 #endif

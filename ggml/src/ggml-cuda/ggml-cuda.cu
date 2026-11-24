@@ -18329,6 +18329,19 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
             return ggml_cuda_nvfp4pf_try_mode(*cuda_ctx, src0, src1, ids, dst, s_exp, use_nk);
         };
     }
+    if (strcmp(name, "ggml_backend_cuda_nk_pf_mm_bench_kern") == 0) {
+        return (void *) +[](ggml_backend_t backend,
+                const ggml_tensor * src0, const ggml_tensor * src1,
+                const ggml_tensor * ids, ggml_tensor * dst,
+                const ggml_tensor * s_exp, int use_nk, int warmup, int iters) -> double {
+            if (!ggml_backend_is_cuda(backend)) {
+                return -1.0;
+            }
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            return ggml_cuda_nvfp4pf_bench_kern(*cuda_ctx, src0, src1, ids, dst, s_exp, use_nk, warmup, iters);
+        };
+    }
     return nullptr;
 }
 

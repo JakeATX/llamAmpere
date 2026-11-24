@@ -1,8 +1,8 @@
-// NEONKERN NK_PF_MM: Ampere (sm_80 / sm_86) NVFP4 MoE prefill int8 tensor-core GEMM.
+// NEONKERN NK_PF_MM v2: Ampere (sm_80 / sm_86) NVFP4 MoE prefill int8 tensor-core GEMM.
 // BM=128, BK=64, BN=64|128, 8 warps (4x2, 2 M-slabs/pair, interleaved nw columns),
-// 3-stage cp.async x ring with bank-conflict-free ldmatrix.x4 swizzle,
-// 4x leaner cooperative warp-pair dequant with 4-shuffle 4x4 transpose,
-// overlapped raw-W prefetch, biased pacc (0x4B400000), 100 KB SMEM carveout (2 CTAs/SM).
+// 3-stage cp.async x ring + 2-stage double-buffered adec/wsc (zero bar64 in mainloop),
+// interleaved MMA(kb) / dequant(kb+1) / raw-W prefetch(kb+2), SWAR UE4M3 max (no scale shuffles),
+// bank-conflict-free ldmatrix.x4 with hoisted offsets, biased pacc (0x4B400000), 100 KB SMEM carveout.
 
 #include "nk-pf-mm.cuh"
 
@@ -71,15 +71,6 @@ static __device__ __forceinline__ void nk_pf_wait() {
 #endif
 }
 
-static __device__ __forceinline__ void nk_pf_bar64(const int id) {
-#ifdef NK_PF_NO_SM80
-    (void) id;
-    __syncthreads();
-#else
-    asm volatile("bar.sync %0, 64;\n" :: "r"(id) : "memory");
-#endif
-}
-
 static __device__ __forceinline__ void nk_pf_ldmatrix_x4(
         uint32_t & r0, uint32_t & r1, uint32_t & r2, uint32_t & r3, const void * s) {
 #ifdef NK_PF_NO_SM80
@@ -118,11 +109,10 @@ static __device__ __forceinline__ void nk_pf_mma(
 #endif
 }
 
-static __device__ __forceinline__ float nk_pf_ue4m3(const uint32_t u) {
-    const uint32_t x  = u & 0x7Fu;
-    const bool     sn = x < 8u;
-    const float    v  = __fsub_rn(__uint_as_float((sn ? 0x3C000000u : 0x3B800000u) + (x << 20)), sn ? 0.0078125f : 0.0f);
-    return u == 0x7Fu ? 0.0f : v;
+// Convert pre-cleaned 7-bit UE4M3 value (0x7F already zeroed via SWAR mask; 0xFF -> 127) to f32.
+static __device__ __forceinline__ float nk_pf_ue4m3_clean(const uint32_t x) {
+    const bool sn = x < 8u;
+    return __fsub_rn(__uint_as_float((sn ? 0x3C000000u : 0x3B800000u) + (x << 20)), sn ? 0.0078125f : 0.0f);
 }
 
 static __device__ __forceinline__ float nk_pf_i2f_biased(const int x_biased) {
@@ -168,31 +158,39 @@ static __device__ __forceinline__ int2 nk_pf_dec8(
 }
 
 // Cooperative warp-pair decode for one 16-row slab of one 64-weight NVFP4 block.
-// nw=0 decodes j=0 (sub-blocks 0, 1); nw=1 decodes j=1 (sub-blocks 2, 3).
-// Each lane (g, t) owns row (t & 1 ? r1 : r0) and sub-block 2*nw + (t >> 1), builds 1 LUT,
-// decodes both 32-bit nibble words without dropping halves, then runs a 4-shuffle 4x4 transpose.
+// Uses branchless SWAR 0x7F zeroing + integer max over all 4 UE4M3 bytes (zero scale shuffles),
+// 1 LUT + 2 dec8 per lane keeping both .x/.y halves, and a 4-shuffle 4x4 transpose.
 template <int KF>
 static __device__ __forceinline__ void nk_pf_decode_slab(
         const uint32_t d_mine, const uint32_t q0_mine, const uint32_t q1_mine,
-        const int nw, const int g, const int t, const int lane,
+        const int nw, const int g, const int t, const int lane, const int s_mine_shift,
         uint4 * __restrict__ adec_slab, float * __restrict__ wsc_slab) {
     constexpr float QW = 4096.0f * (127.0f / 12.0f);
-    const int s_mine_idx = 2 * nw + (t >> 1);
-    const float s_mine = nk_pf_ue4m3((d_mine >> (8 * s_mine_idx)) & 0xFFu);
 
-    float m_span;
+    // Zero any byte == 0x7F (NaN->0) without cross-byte borrow, and strip bit 7 on all 4 bytes
+    const uint32_t x7f  = d_mine ^ 0x7F7F7F7Fu;
+    const uint32_t is7f = (~(((x7f & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | x7f)) & 0x80808080u;
+    const uint32_t m4   = (d_mine & 0x7F7F7F7Fu) & ~(is7f - (is7f >> 7));
+    const float s_mine  = nk_pf_ue4m3_clean((m4 >> s_mine_shift) & 0xFFu);
+
+    uint32_t m_u;
     if constexpr (KF == 64) {
-        const int s_oth_idx = 2 * (nw ^ 1) + (t >> 1);
-        const float s_oth = nk_pf_ue4m3((d_mine >> (8 * s_oth_idx)) & 0xFFu);
-        const float s_mine_p = __shfl_xor_sync(0xffffffffu, s_mine, 2);
-        const float s_oth_p  = __shfl_xor_sync(0xffffffffu, s_oth, 2);
-        m_span = fmaxf(fmaxf(s_mine, s_mine_p), fmaxf(s_oth, s_oth_p));
+        const uint32_t b0 = m4 & 0xFFu;
+        const uint32_t b1 = (m4 >> 8) & 0xFFu;
+        const uint32_t b2 = (m4 >> 16) & 0xFFu;
+        const uint32_t b3 = m4 >> 24;
+        m_u = max(max(b0, b1), max(b2, b3));
+    } else {
+        const uint32_t mh = nw ? (m4 >> 16) : m4;
+        m_u = max(mh & 0xFFu, (mh >> 8) & 0xFFu);
+    }
+    const float m_span = nk_pf_ue4m3_clean(m_u);
+
+    if constexpr (KF == 64) {
         if (nw == 0 && t < 2) {
             wsc_slab[g + t * 8] = m_span >= NK_PF_MIN_SCALE ? m_span * (12.0f / 127.0f) : 0.0f;
         }
     } else {
-        const float s_mine_p = __shfl_xor_sync(0xffffffffu, s_mine, 2);
-        m_span = fmaxf(s_mine, s_mine_p);
         if (t < 2) {
             wsc_slab[nw * 16 + g + t * 8] = m_span >= NK_PF_MIN_SCALE ? m_span * (12.0f / 127.0f) : 0.0f;
         }
@@ -235,9 +233,9 @@ static constexpr __host__ __device__ int nk_pf_stage_bytes() {
 
 template <int KF, int BN>
 static constexpr __host__ __device__ int nk_pf_smem_bytes() {
-    // 3 stages of (xq + xs) + adec (4 warp-pairs * 2 M-slabs * 2 j * 32 lanes * 16 B)
-    // + wsc (4 warp-pairs * 2 M-slabs * (64/KF) * 16 rows * 4 B)
-    return 3 * nk_pf_stage_bytes<KF, BN>() + 4 * 2 * 2 * 32 * 16 + 4 * 2 * (64 / KF) * 16 * 4;
+    // 3 stages of (xq + xs) + 2 stages of adec (4 pairs * 2 M-slabs * 2 j * 32 lanes * 16 B)
+    // + 2 stages of wsc (4 pairs * 2 M-slabs * (64/KF) * 16 rows * 4 B)
+    return 3 * nk_pf_stage_bytes<KF, BN>() + 2 * (4 * 2 * 2 * 32 * 16) + 2 * (4 * 2 * (64 / KF) * 16 * 4);
 }
 
 template <int KF, int BN>
@@ -255,6 +253,8 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
     constexpr int SUBS = 64 / KF;        // 1 (KF=64) or 2 (KF=32)
     constexpr int JPS = KF / 32;         // 2 (KF=64) or 1 (KF=32)
     constexpr int STAGE = nk_pf_stage_bytes<KF, BN>();
+    constexpr int ADEC_SLOT_U4 = 4 * 128;              // 512 uint4s = 8192 B per wslot
+    constexpr int WSC_SLOT_F32 = 4 * 2 * SUBS * 16;    // 128 (KF=64) or 256 (KF=32) floats per wslot
 
     extern __shared__ __align__(16) uint8_t smem_nk[];
     __shared__ int srow[BN];
@@ -288,30 +288,38 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
     }
     __syncthreads();
 
-    uint4 * adec0 = (uint4 *) (smem_nk + 3 * STAGE) + mw * 128;
-    uint4 * adec1 = adec0 + 64;
-    float * wsc0  = (float *) (smem_nk + 3 * STAGE + 4 * 2 * 2 * 32 * 16) + mw * (2 * SUBS * 16);
-    float * wsc1  = wsc0 + SUBS * 16;
+    uint4 * adec_base = (uint4 *) (smem_nk + 3 * STAGE) + mw * 128;
+    float * wsc_base  = (float *) (smem_nk + 3 * STAGE + 2 * ADEC_SLOT_U4 * 16) + mw * (2 * SUBS * 16);
+
+    // Precompute loop-invariant load_x swizzle offset and row bases (eliminates srow LDS in mainloop)
+    const int c0_x   = tid >> 2;
+    const int p0_x   = tid & 3;
+    const int xq_off = c0_x * 64 + (p0_x ^ ((c0_x >> 1) & 3)) * 16;
+    const bool ok_x0 = c0_x < nt;
+    const int8_t * xq_src0 = ok_x0 ? (xq + (int64_t) srow[c0_x] * K + p0_x * 16) : xq;
+    const bool ok_x1 = (BN == 128) && ((c0_x + 64) < nt);
+    const int8_t * xq_src1 = xq;
+    if constexpr (BN == 128) {
+        if (ok_x1) {
+            xq_src1 = xq + (int64_t) srow[c0_x + 64] * K + p0_x * 16;
+        }
+    }
+
+    const bool has_xs = tid < BN * SUBS;
+    const int c_xs    = SUBS == 1 ? tid : (tid >> 1);
+    const int sb_xs   = SUBS == 1 ? 0   : (tid & 1);
+    const bool ok_xs  = has_xs && (c_xs < nt);
+    const float * xs_src = ok_xs ? (xs + (int64_t) srow[c_xs] * nbx + sb_xs) : xs;
 
     auto load_x = [&](const int kb, const int slot) {
         uint8_t * st = smem_nk + slot * STAGE;
-#pragma unroll
-        for (int it = 0; it < BN * 4 / 256; ++it) {
-            const int i = tid + it * 256;
-            const int c = i >> 2;
-            const int p = i & 3;
-            const bool ok = c < nt;
-            nk_pf_cp16(
-                st + c * 64 + (p ^ ((c >> 1) & 3)) * 16,
-                xq + (ok ? (int64_t) srow[c] * K + kb * 64 + p * 16 : 0),
-                ok);
+        nk_pf_cp16(st + xq_off, xq_src0 + kb * 64, ok_x0);
+        if constexpr (BN == 128) {
+            nk_pf_cp16(st + xq_off + 4096, xq_src1 + kb * 64, ok_x1);
         }
-        float * sx = (float *) (st + BN * 64);
-        if (tid < BN * SUBS) {
-            const int c  = SUBS == 1 ? tid : (tid >> 1);
-            const int sb = SUBS == 1 ? 0   : (tid & 1);
-            const bool ok = c < nt;
-            nk_pf_cp4(sx + tid, xs + (ok ? (int64_t) srow[c] * nbx + kb * SUBS + sb : 0), ok);
+        if (has_xs) {
+            float * sx = (float *) (st + BN * 64);
+            nk_pf_cp4(sx + tid, xs_src + kb * SUBS, ok_xs);
         }
     };
 
@@ -327,7 +335,7 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
         }
     }
 
-    // Prologue: enqueue kb = 0 (slot 0) and kb = 1 (slot 1)
+    // Prologue: enqueue x for kb = 0 (slot 0) and kb = 1 (slot 1)
     load_x(0, 0);
     nk_pf_commit();
     load_x(1, 1);
@@ -344,35 +352,66 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
     const int r0_1 = slab1 * 16 + g;
     const int r1_1 = r0_1 + 8;
 
-    const int r_mine0 = (t & 1) ? r1_0 : r0_0;
-    const int r_mine1 = (t & 1) ? r1_1 : r0_1;
-    const int q_off   = 4 + 8 * (2 * nw + (t >> 1));
+    const int r_mine0      = (t & 1) ? r1_0 : r0_0;
+    const int r_mine1      = (t & 1) ? r1_1 : r0_1;
+    int s_mine_shift       = 8 * (2 * nw + (t >> 1));
+#ifndef NK_PF_NO_SM80
+    if constexpr (KF == 64 || BN == 64) {
+        asm("" : "+r"(s_mine_shift));
+    }
+#endif
+    const int q_off        = 4 + s_mine_shift;
 
     const char * b0 = slab_ok0 ? (W + (int64_t) r_mine0 * stride_blk * 36) : nullptr;
     const char * b1 = slab_ok1 ? (W + (int64_t) r_mine1 * stride_blk * 36) : nullptr;
 
+    // Prologue weight decode for kb = 0 -> wslot 0 (overlaps cp.async of x[0], x[1])
     uint32_t d0_cur = 0, q00_cur = 0, q01_cur = 0;
     uint32_t d1_cur = 0, q10_cur = 0, q11_cur = 0;
     if (slab_ok0) {
+        const uint32_t d0 = __ldg((const uint32_t *) b0);
+        const uint32_t q0 = __ldg((const uint32_t *) (b0 + q_off));
+        const uint32_t q1 = __ldg((const uint32_t *) (b0 + q_off + 4));
+        nk_pf_decode_slab<KF>(d0, q0, q1, nw, g, t, lane, s_mine_shift, adec_base, wsc_base);
+        // Prefetch raw W for kb = 1 (nk >= 2 guaranteed)
+        b0 += 36;
         d0_cur  = __ldg((const uint32_t *) b0);
         q00_cur = __ldg((const uint32_t *) (b0 + q_off));
         q01_cur = __ldg((const uint32_t *) (b0 + q_off + 4));
     }
     if (slab_ok1) {
+        const uint32_t d1 = __ldg((const uint32_t *) b1);
+        const uint32_t q0 = __ldg((const uint32_t *) (b1 + q_off));
+        const uint32_t q1 = __ldg((const uint32_t *) (b1 + q_off + 4));
+        nk_pf_decode_slab<KF>(d1, q0, q1, nw, g, t, lane, s_mine_shift, adec_base + 64, wsc_base + SUBS * 16);
+        b1 += 36;
         d1_cur  = __ldg((const uint32_t *) b1);
         q10_cur = __ldg((const uint32_t *) (b1 + q_off));
         q11_cur = __ldg((const uint32_t *) (b1 + q_off + 4));
     } else if (slab_ok0) {
-        adec1[nw * 32 + lane] = make_uint4(0, 0, 0, 0);
+        // Keep slab-1 decoded buffers initialized for both double-buffer slots
+        (adec_base + 64)[nw * 32 + lane] = make_uint4(0, 0, 0, 0);
+        (adec_base + ADEC_SLOT_U4 + 64)[nw * 32 + lane] = make_uint4(0, 0, 0, 0);
     }
 
-    const int u_ld  = lane >> 4;
-    const int l7    = lane & 7;
-    const int p_bit = (lane >> 3) & 1;
-    const int bias[4] = { 0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000 };
+    // Hoisted ldmatrix.x4 and sx base offsets (pair_idx steps by +32 cols = +2048 B, swizzle invariant)
+    const int u_ld     = lane >> 4;
+    const int l7       = lane & 7;
+    const int p_bit    = (lane >> 3) & 1;
+    const int c_ld0    = nw * 16 + u_ld * 8 + l7;
+    const int c_sw0    = (c_ld0 >> 1) & 3;
+    int ldm_off0       = c_ld0 * 64 + (p_bit ^ c_sw0) * 16;
+    int ldm_off1       = c_ld0 * 64 + ((2 + p_bit) ^ c_sw0) * 16;
+    const int sx_off0  = (nw * 16 + 2 * t) * SUBS;
+#ifndef NK_PF_NO_SM80
+    // Keep ldmatrix base offsets in registers across pair_idx branches instead of rematerializing 4x/kb
+    asm("" : "+r"(ldm_off0), "+r"(ldm_off1));
+#endif
+    const int bias[4]  = { 0x4B400000, 0x4B400000, 0x4B400000, 0x4B400000 };
 
     int cur_slot = 0;
     int nxt_slot = 2;
+    int wcur     = 0;
 
     for (int kb = 0; kb < nk; ++kb) {
         if (kb + 1 < nk) {
@@ -380,6 +419,7 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
         } else {
             nk_pf_wait<0>();
         }
+        // Single CTA barrier synchronizes both x[kb] and adec/wsc[wcur] (zero bar64 needed)
         __syncthreads();
 
         if (kb + 2 < nk) {
@@ -387,94 +427,95 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
             nk_pf_commit();
         }
 
-        const uint8_t * st = smem_nk + cur_slot * STAGE;
-
+        const int wnxt = wcur ^ 1;
         if (slab_ok0) {
-            nk_pf_decode_slab<KF>(d0_cur, q00_cur, q01_cur, nw, g, t, lane, adec0, wsc0);
-        }
-        if (slab_ok1) {
-            nk_pf_decode_slab<KF>(d1_cur, q10_cur, q11_cur, nw, g, t, lane, adec1, wsc1);
-        }
-        nk_pf_bar64(mw + 1);
+            const uint8_t * st = smem_nk + cur_slot * STAGE;
+            const float * sx   = (const float *) (st + BN * 64);
+            const uint4 * adec0_cur = adec_base + wcur * ADEC_SLOT_U4;
+            const uint4 * adec1_cur = adec0_cur + 64;
+            const float * wsc0_cur  = wsc_base  + wcur * WSC_SLOT_F32;
+            const float * wsc1_cur  = wsc0_cur  + SUBS * 16;
+            uint4 * adec0_nxt       = adec_base + wnxt * ADEC_SLOT_U4;
+            uint4 * adec1_nxt       = adec0_nxt + 64;
+            float * wsc0_nxt        = wsc_base  + wnxt * WSC_SLOT_F32;
+            float * wsc1_nxt        = wsc0_nxt  + SUBS * 16;
 
-        // Prefetch raw W for kb + 1 so global/L2 load latency overlaps the MMA loop
-        if (kb + 1 < nk) {
-            if (slab_ok0) {
-                b0 += 36;
-                d0_cur  = __ldg((const uint32_t *) b0);
-                q00_cur = __ldg((const uint32_t *) (b0 + q_off));
-                q01_cur = __ldg((const uint32_t *) (b0 + q_off + 4));
-            }
-            if (slab_ok1) {
-                b1 += 36;
-                d1_cur  = __ldg((const uint32_t *) b1);
-                q10_cur = __ldg((const uint32_t *) (b1 + q_off));
-                q11_cur = __ldg((const uint32_t *) (b1 + q_off + 4));
-            }
-        }
-
-        if (slab_ok0 && nw * 16 < nt) {
-            const float * sx = (const float *) (st + BN * 64);
 #pragma unroll
             for (int sb = 0; sb < SUBS; ++sb) {
-                const float dw00 = wsc0[sb * 16 + g];
-                const float dw01 = wsc0[sb * 16 + g + 8];
-                const float dw10 = slab_ok1 ? wsc1[sb * 16 + g] : 0.0f;
-                const float dw11 = slab_ok1 ? wsc1[sb * 16 + g + 8] : 0.0f;
+                const float dw00 = wsc0_cur[sb * 16 + g];
+                const float dw01 = wsc0_cur[sb * 16 + g + 8];
+                const float dw10 = slab_ok1 ? wsc1_cur[sb * 16 + g] : 0.0f;
+                const float dw11 = slab_ok1 ? wsc1_cur[sb * 16 + g + 8] : 0.0f;
 
 #pragma unroll
                 for (int pair_idx = 0; pair_idx < NPAIRS; ++pair_idx) {
                     const int c_base = (pair_idx * 2 + nw) * 16;
-                    if (c_base >= nt) {
-                        continue;
-                    }
-                    int pacc0[2][4];
-                    int pacc1[2][4];
-                    const int c_ld = c_base + u_ld * 8 + l7;
-                    const int c_sw = (c_ld >> 1) & 3;
-                    const uint8_t * st_row = st + c_ld * 64;
+                    if (c_base < nt) {
+                        int pacc0[2][4];
+                        int pacc1[2][4];
+                        const uint8_t * st_pair = st + pair_idx * 2048;
 
 #pragma unroll
-                    for (int jj = 0; jj < JPS; ++jj) {
-                        const int j = sb * JPS + jj;
-                        const int p_ld = 2 * j + p_bit;
-                        uint32_t b00, b01, b10, b11;
-                        nk_pf_ldmatrix_x4(b00, b01, b10, b11, st_row + (p_ld ^ c_sw) * 16);
+                        for (int jj = 0; jj < JPS; ++jj) {
+                            const int j = sb * JPS + jj;
+                            uint32_t b00, b01, b10, b11;
+                            nk_pf_ldmatrix_x4(b00, b01, b10, b11, st_pair + (j == 0 ? ldm_off0 : ldm_off1));
 
-                        const uint4 av0 = adec0[j * 32 + lane];
-                        const uint32_t a0[4] = { av0.x, av0.y, av0.z, av0.w };
-                        if (jj == 0) {
-                            nk_pf_mma_init(pacc0[0], a0, b00, b01, bias);
-                            nk_pf_mma_init(pacc0[1], a0, b10, b11, bias);
-                        } else {
-                            nk_pf_mma(pacc0[0], a0, b00, b01);
-                            nk_pf_mma(pacc0[1], a0, b10, b11);
+                            const uint4 av0 = adec0_cur[j * 32 + lane];
+                            const uint32_t a0[4] = { av0.x, av0.y, av0.z, av0.w };
+                            if (jj == 0) {
+                                nk_pf_mma_init(pacc0[0], a0, b00, b01, bias);
+                                nk_pf_mma_init(pacc0[1], a0, b10, b11, bias);
+                            } else {
+                                nk_pf_mma(pacc0[0], a0, b00, b01);
+                                nk_pf_mma(pacc0[1], a0, b10, b11);
+                            }
+                            const uint4 av1 = adec1_cur[j * 32 + lane];
+                            const uint32_t a1[4] = { av1.x, av1.y, av1.z, av1.w };
+                            if (jj == 0) {
+                                nk_pf_mma_init(pacc1[0], a1, b00, b01, bias);
+                                nk_pf_mma_init(pacc1[1], a1, b10, b11, bias);
+                            } else {
+                                nk_pf_mma(pacc1[0], a1, b00, b01);
+                                nk_pf_mma(pacc1[1], a1, b10, b11);
+                            }
                         }
-                        const uint4 av1 = adec1[j * 32 + lane];
-                        const uint32_t a1[4] = { av1.x, av1.y, av1.z, av1.w };
-                        if (jj == 0) {
-                            nk_pf_mma_init(pacc1[0], a1, b00, b01, bias);
-                            nk_pf_mma_init(pacc1[1], a1, b10, b11, bias);
-                        } else {
-                            nk_pf_mma(pacc1[0], a1, b00, b01);
-                            nk_pf_mma(pacc1[1], a1, b10, b11);
+
+#pragma unroll
+                        for (int u = 0; u < 2; ++u) {
+                            const int sx_i  = sx_off0 + (pair_idx * 32 + u * 8) * SUBS + sb;
+                            const float dx0 = sx[sx_i];
+                            const float dx1 = sx[sx_i + SUBS];
+                            const int ni    = pair_idx * 2 + u;
+                            acc[0][ni][0] = fmaf(nk_pf_i2f_biased(pacc0[u][0]), dw00 * dx0, acc[0][ni][0]);
+                            acc[0][ni][1] = fmaf(nk_pf_i2f_biased(pacc0[u][1]), dw00 * dx1, acc[0][ni][1]);
+                            acc[0][ni][2] = fmaf(nk_pf_i2f_biased(pacc0[u][2]), dw01 * dx0, acc[0][ni][2]);
+                            acc[0][ni][3] = fmaf(nk_pf_i2f_biased(pacc0[u][3]), dw01 * dx1, acc[0][ni][3]);
+                            acc[1][ni][0] = fmaf(nk_pf_i2f_biased(pacc1[u][0]), dw10 * dx0, acc[1][ni][0]);
+                            acc[1][ni][1] = fmaf(nk_pf_i2f_biased(pacc1[u][1]), dw10 * dx1, acc[1][ni][1]);
+                            acc[1][ni][2] = fmaf(nk_pf_i2f_biased(pacc1[u][2]), dw11 * dx0, acc[1][ni][2]);
+                            acc[1][ni][3] = fmaf(nk_pf_i2f_biased(pacc1[u][3]), dw11 * dx1, acc[1][ni][3]);
                         }
                     }
 
-#pragma unroll
-                    for (int u = 0; u < 2; ++u) {
-                        const int c0 = c_base + u * 8 + 2 * t;
-                        const float dx0 = sx[c0 * SUBS + sb];
-                        const float dx1 = sx[(c0 + 1) * SUBS + sb];
-                        const int ni = pair_idx * 2 + u;
-                        acc[0][ni][0] = fmaf(nk_pf_i2f_biased(pacc0[u][0]), dw00 * dx0, acc[0][ni][0]);
-                        acc[0][ni][1] = fmaf(nk_pf_i2f_biased(pacc0[u][1]), dw00 * dx1, acc[0][ni][1]);
-                        acc[0][ni][2] = fmaf(nk_pf_i2f_biased(pacc0[u][2]), dw01 * dx0, acc[0][ni][2]);
-                        acc[0][ni][3] = fmaf(nk_pf_i2f_biased(pacc0[u][3]), dw01 * dx1, acc[0][ni][3]);
-                        acc[1][ni][0] = fmaf(nk_pf_i2f_biased(pacc1[u][0]), dw10 * dx0, acc[1][ni][0]);
-                        acc[1][ni][1] = fmaf(nk_pf_i2f_biased(pacc1[u][1]), dw10 * dx1, acc[1][ni][1]);
-                        acc[1][ni][2] = fmaf(nk_pf_i2f_biased(pacc1[u][2]), dw11 * dx0, acc[1][ni][2]);
-                        acc[1][ni][3] = fmaf(nk_pf_i2f_biased(pacc1[u][3]), dw11 * dx1, acc[1][ni][3]);
+                    // Interleave next-block decode + kb+2 raw-W prefetch with MMA pairs across warps
+                    if (sb == 0 && pair_idx == 0 && kb + 1 < nk) {
+                        nk_pf_decode_slab<KF>(d0_cur, q00_cur, q01_cur, nw, g, t, lane, s_mine_shift, adec0_nxt, wsc0_nxt);
+                        if (kb + 2 < nk) {
+                            b0 += 36;
+                            d0_cur  = __ldg((const uint32_t *) b0);
+                            q00_cur = __ldg((const uint32_t *) (b0 + q_off));
+                            q01_cur = __ldg((const uint32_t *) (b0 + q_off + 4));
+                        }
+                    }
+                    if (sb == 0 && pair_idx == 1 && kb + 1 < nk && slab_ok1) {
+                        nk_pf_decode_slab<KF>(d1_cur, q10_cur, q11_cur, nw, g, t, lane, s_mine_shift, adec1_nxt, wsc1_nxt);
+                        if (kb + 2 < nk) {
+                            b1 += 36;
+                            d1_cur  = __ldg((const uint32_t *) b1);
+                            q10_cur = __ldg((const uint32_t *) (b1 + q_off));
+                            q11_cur = __ldg((const uint32_t *) (b1 + q_off + 4));
+                        }
                     }
                 }
             }
@@ -482,6 +523,7 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
 
         cur_slot = cur_slot == 2 ? 0 : cur_slot + 1;
         nxt_slot = nxt_slot == 2 ? 0 : nxt_slot + 1;
+        wcur     = wnxt;
     }
 
     if (!slab_ok0 || nw * 16 >= nt) {
@@ -497,7 +539,7 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
         }
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
-            const int c = c_base + u * 8 + 2 * t;
+            const int c  = c_base + u * 8 + 2 * t;
             const int ni = pair_idx * 2 + u;
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
@@ -555,7 +597,7 @@ void ggml_cuda_nk_pf_mm_launch(
     const int64_t cnt = g_nk_pf_mm_launches.fetch_add(1, std::memory_order_relaxed) + 1;
     static std::atomic<int> logged{0};
     if (logged.exchange(1) == 0) {
-        GGML_LOG_WARN("[NK_PF_MM] active: KF=%d BN=%d BM=128 BK=64 M=%d K=%d max_tiles=%d\n",
+        GGML_LOG_WARN("[NK_PF_MM] active: KF=%d BN=%d BM=128 BK=64 DB=2 M=%d K=%d max_tiles=%d\n",
             KF, bn, M, K, max_tiles);
     } else if (nk_pf_mm_trace() && (cnt <= 4 || (cnt & 255) == 0)) {
         GGML_LOG_WARN("[NK_PF_MM] trace #%lld: KF=%d BN=%d M=%d K=%d max_tiles=%d\n",

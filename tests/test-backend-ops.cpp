@@ -27483,10 +27483,13 @@ static int run_nk_pf_mm_check() {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     typedef bool (*nk_pf_mm_run_t)(ggml_backend_t, const ggml_tensor *, const ggml_tensor *,
             const ggml_tensor *, ggml_tensor *, const ggml_tensor *, int);
+    typedef double (*nk_pf_mm_bench_kern_t)(ggml_backend_t, const ggml_tensor *, const ggml_tensor *,
+            const ggml_tensor *, ggml_tensor *, const ggml_tensor *, int, int, int);
     typedef int64_t (*fusion_count_t)(ggml_backend_t, const char *);
     auto run_fn = (nk_pf_mm_run_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_pf_mm_run");
+    auto bench_kern_fn = (nk_pf_mm_bench_kern_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_pf_mm_bench_kern");
     auto count_fn = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
-    if (!run_fn || !count_fn) {
+    if (!run_fn || !bench_kern_fn || !count_fn) {
         fprintf(stderr, "nk_pf_mm: CUDA test proc addresses not available\n");
         return 1;
     }
@@ -27724,7 +27727,7 @@ static int run_nk_pf_mm_check() {
         } else {
             ++passed;
             if (do_perf && tc.bench) {
-                auto bench_arm = [&](int use_nk, int warmup, int iters) -> double {
+                auto bench_whole = [&](int use_nk, int warmup, int iters) -> double {
                     for (int i = 0; i < warmup; ++i) {
                         run_fn(be, src0, src1, ids, dst, s_exp, use_nk);
                     }
@@ -27737,19 +27740,37 @@ static int run_nk_pf_mm_check() {
                     const int64_t t1 = ggml_time_us();
                     return (double) (t1 - t0) / (double) iters;
                 };
+                // Settle clocks under load before ABBA legs to reduce 300 W boost-to-steady drift
+                for (int i = 0; i < 6; ++i) {
+                    run_fn(be, src0, src1, ids, dst, s_exp, i & 1);
+                }
+                ggml_backend_synchronize(be);
+
                 const int iters = tc.n_tok >= 2048 ? 8 : 12;
-                const double a0 = bench_arm(0, 3, iters);
-                const double b0 = bench_arm(1, 3, iters);
-                const double b1 = bench_arm(1, 1, iters);
-                const double a1 = bench_arm(0, 1, iters);
+                const double a0 = bench_whole(0, 3, iters);
+                const double b0 = bench_whole(1, 3, iters);
+                const double b1 = bench_whole(1, 2, iters);
+                const double a1 = bench_whole(0, 2, iters);
                 const double base_us = 0.5 * (a0 + a1);
                 const double nk_us   = 0.5 * (b0 + b1);
                 const double pct     = 100.0 * (nk_us - base_us) / base_us;
                 const double ops     = 2.0 * (double) tc.n_tok * (double) tc.n_used * (double) tc.M * (double) tc.K;
                 const double base_tops = ops / (base_us * 1e6);
                 const double nk_tops   = ops / (nk_us * 1e6);
-                printf("nk_pf_mm %-18s PASS exact | base %8.1f us (%5.1f TOPS) -> nk %8.1f us (%5.1f TOPS) | %+6.1f%% (ABBA: %.1f/%.1f vs %.1f/%.1f)\n",
+                printf("nk_pf_mm %-18s PASS exact | whole: base %7.1f us (%5.1f TOPS) -> nk %7.1f us (%5.1f TOPS) | %+6.1f%% (ABBA: %.1f/%.1f vs %.1f/%.1f)\n",
                     tc.name, base_us, base_tops, nk_us, nk_tops, pct, a0, a1, b0, b1);
+
+                const double ka0 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 0, 3, iters);
+                const double kb0 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 1, 3, iters);
+                const double kb1 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 1, 2, iters);
+                const double ka1 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 0, 2, iters);
+                const double kbase_us = 0.5 * (ka0 + ka1);
+                const double knk_us   = 0.5 * (kb0 + kb1);
+                const double kpct     = 100.0 * (knk_us - kbase_us) / kbase_us;
+                const double kbase_tops = ops / (kbase_us * 1e6);
+                const double knk_tops   = ops / (knk_us * 1e6);
+                printf("nk_pf_mm %-18s            | kern:  base %7.1f us (%5.1f TOPS) -> nk %7.1f us (%5.1f TOPS) | %+6.1f%% (ABBA: %.1f/%.1f vs %.1f/%.1f)\n",
+                    tc.name, kbase_us, kbase_tops, knk_us, knk_tops, kpct, ka0, ka1, kb0, kb1);
             } else {
                 printf("nk_pf_mm %-18s PASS exact\n", tc.name);
             }
