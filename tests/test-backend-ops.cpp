@@ -18724,6 +18724,9 @@ struct test_ink_nvfp4_moe : public test_case {
 
     static bool switch_on(const char * name) {
         const char * e = getenv(name);
+        if (strcmp(name, "GGML_CUDA_NK_Q8_0_TC") == 0) { // default ON, =0 disables
+            return !(e != nullptr && *e && atoi(e) == 0);
+        }
         return e != nullptr && atoi(e) != 0;
     }
 

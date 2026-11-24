@@ -20,8 +20,9 @@
 
 bool ggml_cuda_nk_q8_0_tc_enabled() {
     static const bool on = [] {
+        // default ON (HOME 100K ABBA -2.77% ms/round 6/6; E21 KLD |delta| <= 1e-6); =0 disables
         const char * e = getenv("GGML_CUDA_NK_Q8_0_TC");
-        return e != nullptr && atoi(e) != 0;
+        return !(e != nullptr && *e && atoi(e) == 0);
     }();
     return on;
 }
