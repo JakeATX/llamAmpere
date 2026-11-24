@@ -11983,8 +11983,8 @@ struct test_topk_moe : public test_case {
     }
 };
 
-// INKROUTER: the BF16 router MUL_MAT in front of the sigmoid top-k chain (T = 1, and 2..8 rows under
-// GGML_CUDA_FUSE_ROUTERT=1). Values are chosen so every dot product is exact in fp32 in any order (weights and inputs
+// INKROUTER: the BF16 router MUL_MAT in front of the sigmoid top-k chain (T = 1, and 2..8 rows with
+// ROUTERT, default on). Values are chosen so every dot product is exact in fp32 in any order (weights and inputs
 // with few mantissa bits): CPU and CUDA logits are equal bits, and selector columns give row r the expert order
 // perm_r with logit gaps of 1/16, so no selection is a near tie
 struct test_inkrouter_mm : public test_case {
