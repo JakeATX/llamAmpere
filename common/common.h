@@ -407,6 +407,7 @@ struct common_params_speculative_draft {
     bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
     int32_t n_ctx                 = 0;     // draft context size
     int32_t n_ubatch              = -1;    // MTP draft physical microbatch: -1 = auto (2048 for an MTP draft file loaded with -md), 0 = main's -ub, N > 0 = at most N
+    int32_t n_ubatch_auto_cap     = 0;     // fork UBDEFAULT: main ub before the 24 GB auto ceiling; an auto (-1) draft ub stays at most this
 
     // MTP drafter attention window (default off)
     int32_t attn_window = 0;     // > 0: the MTP drafter attends only to its last attn_window positions (+ sinks)
@@ -633,6 +634,7 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    bool    n_ubatch_auto         = false; // fork UBDEFAULT: -ub/-b not given: common_init raises the ceiling on 24 GB cards
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -1230,6 +1232,7 @@ struct common_gguf_info {
     common_decision_type decision_type = COMMON_DECISION_TYPE_UNKNOWN; // UNKNOWN if the file is missing, unreadable, or invalid
     uint32_t             n_ctx_train   = 0;                            // 0 if unknown
     bool                 has_chat_tmpl = false;                        // has the default tokenizer.chat_template
+    std::string          arch;                                         // general.architecture, empty if unknown
 };
 
 common_gguf_info common_get_gguf_info(const std::string & fname);

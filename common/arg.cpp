@@ -1242,6 +1242,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     }
 
+    // fork UBDEFAULT (Jake 11-22): with no -ub/-b (flag or env), common_init picks the ub ceiling from the card
+    // (4096 on a 24 GB-class card); small-card presets keep their measured ceilings, and so does multi-user 24dense.
+    {
+        auto given = [&](const std::string & key) {
+            auto found = arg_to_options.find(key);
+            return found != arg_to_options.end() &&
+                (explicit_options.count(found->second.first) || found->second.first->has_value_from_env());
+        };
+        params.n_ubatch_auto = !given("--ubatch-size") && !given("--batch-size") && !params.embedding &&
+                ctx_arg.ex != LLAMA_EXAMPLE_PERPLEXITY && ctx_arg.ex != LLAMA_EXAMPLE_IMATRIX &&
+                (params.card_preset.empty() || (params.card_preset == "24dense" && params.n_parallel == 1));
+    }
+
     if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {
         throw std::invalid_argument(params.card_preset == "24ink" ? "24ink is one slot (--parallel 1); for several users drop the preset and pass -np N --kv-unified -b 1024 -ub 1024"
                                                                    : "small-card presets require --parallel 1; multi-user support is planned");

@@ -1,0 +1,54 @@
+#pragma once
+
+#include "common.h"
+
+#include <string>
+
+// fork DEFPATH: per-arch best-config reference (common/arch-defaults.cpp, one JSON row per model family).
+//
+// A new model or a new release must not inherit slow defaults without anyone seeing it. The table lists, per
+// general.architecture, the measured best settings: drafter and its KV, ub ladder ceiling, lean prompt, KV type,
+// the engine's default-ON switches and the flags still under gate. At boot:
+//   - common_arch_defaults_apply() sets the table's env values the user did not set (LLAMA_LEAN_PROMPT, ...);
+//   - common_arch_defaults_report() prints one WARN block: every lever, on/off/overridden, and why;
+//   - an arch with no row gets a WARN that every lever is at the engine default.
+// The gate script scripts/defpath/defpath_gate.py reads the same JSON from this file (between the ARCHJSON markers)
+// and compares the default run with the best config row.
+//
+// Kill switches: LLAMA_ARCH_DEFAULTS=0 (table applies nothing: no env, no auto drafter, no table ub ceiling),
+// LLAMA_ENGAGED_REPORT=0 (no report block). LLAMA_UBDEFAULT=0 is UBDEFAULT's own switch (see llama-context.cpp).
+
+// false with LLAMA_ARCH_DEFAULTS=0
+bool common_arch_defaults_enabled();
+
+// general.architecture of the GGUF header (cached per path); empty if unreadable
+std::string common_arch_of_model(const std::string & path);
+
+// smallest total memory (MiB) of the GPUs this run uses (params.devices, else all GPU devices); 0 = no GPU
+size_t common_arch_min_gpu_total_mib(const common_params & params);
+
+// the 24 GB-class auto ub ceiling for this arch (UBDEFAULT; 4096 for an arch without a row), and whether it only
+// applies when -c is given. LLAMA_UB_CEILING still wins (caller).
+int32_t common_arch_ub_ceiling_24g(const std::string & arch, bool * needs_ctx);
+
+// the table's -b for a 24 GB-class card (0 = UBDEFAULT rule)
+int32_t common_arch_batch_24g(const std::string & arch);
+
+// set the env values of the arch row that are not set yet (before the model load); remembers which were the user's
+void common_arch_defaults_apply(const common_params & params);
+
+// the speculative row of the arch (drafter file beside the model): fields for spec-defaults.cpp
+struct common_arch_spec_default {
+    std::string type;       // --spec-type, e.g. "draft-dspark"
+    std::string model;      // draft GGUF file name beside the target model
+    int32_t     ngl = -1;   // --spec-draft-ngl
+    int32_t     ubatch = 0; // --spec-draft-ubatch (0 = keep)
+    std::string type_k;     // explicit draft KV types ("" = engine resolver)
+    std::string type_v;
+    size_t      min_gpu_mib = 0; // only on cards at least this large (small cards: the drafter costs expert cache)
+    std::string why;
+};
+bool common_arch_spec_default_get(const std::string & arch, common_arch_spec_default & out);
+
+// one WARN block after the main context is created
+void common_arch_defaults_report(const common_params & params, const llama_model * model, const llama_context * ctx);

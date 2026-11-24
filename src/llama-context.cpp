@@ -78,6 +78,16 @@ static std::atomic<uint64_t> g_pp_cache_copies{0};
 
 static llama_kv_cache * llama_sj_kvarn_cache(llama_memory_i * memory);
 
+// fork UBDEFAULT: rows of the boot reserve (and so of the memory fit) while the dynamic ub ladder is on.
+static uint32_t llama_ub_fit_rows_cfg() {
+    static const uint32_t rows = [] {
+        const char * e = getenv("LLAMA_UB_FIT_ROWS");
+        const long v = e && e[0] ? strtol(e, nullptr, 10) : 512;
+        return v >= 64 && v <= 65536 ? (uint32_t) v : 512u;
+    }();
+    return rows;
+}
+
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
 // (fork tables: model.hadamard_rotations/inverses; upstream prism.hadamard: model.hdmd.rot/inv)
@@ -667,8 +677,13 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    // fork UBDEFAULT (Jake 11-22): the dynamic ub ladder is on by default for every context it supports (causal,
+    // default context type, no training/embeddings); LLAMA_DEEPCTX_LADDER=0 turns it off, "1" still forces it on.
+    // fork DEFPATH: LLAMA_UBDEFAULT=0 is the kill switch for all of UBDEFAULT (the old opt-in ladder comes back).
     const char * ladder = getenv("LLAMA_DEEPCTX_LADDER");
-    dynamic_ubatch = ladder && strcmp(ladder, "1") == 0;
+    const char * ubdef = getenv("LLAMA_UBDEFAULT");
+    ubdefault = !(ubdef && ubdef[0] == '0');
+    dynamic_ubatch = ubdefault ? (!ladder || !ladder[0] || strcmp(ladder, "0") != 0) : (ladder && strcmp(ladder, "1") == 0);
 
     // fork: small-card prompt ubatch. An MoE model asked for -ub > 6144 on a card with less than
     // LLAMA_UB_SMALL_CARD_FREE_MIB (default 14336) free here (after the weights, before KV and the expert cache;
@@ -977,6 +992,15 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
+    if (ubdefault && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc()) {
+        const char * loan = getenv("LLAMA_UB_KV_LOAN");
+        LLAMA_LOG_INFO("%s: dynamic ub ladder %s: ceiling %u rows, fit/boot reserve %u rows, KV-tail loan %s "
+                "(LLAMA_DEEPCTX_LADDER=0 off, LLAMA_UB_FIT_ROWS, LLAMA_UB_KV_LOAN=0)\n", __func__,
+                dynamic_ubatch ? "on" : "off", dynamic_ubatch ? std::min(cparams.n_ubatch, 4096u) : cparams.n_ubatch,
+                dynamic_ubatch && cparams.causal_attn && !cparams.training && !cparams.embeddings ?
+                        std::min(cparams.n_ubatch, llama_ub_fit_rows_cfg()) : cparams.n_ubatch,
+                loan && loan[0] == '0' ? "off" : "on");
+    }
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -1843,6 +1867,7 @@ llama_context::~llama_context() {
                 (unsigned long long) mtp_pipe.n_steps, (unsigned long long) mtp_pipe.n_deferred,
                 (unsigned long long) mtp_pipe.n_cancel, mtp_pipe.failed ? ", stopped after a timeout" : "");
     }
+    ub_loan_end();
     if (auto * kv = llama_sj_kvarn_cache(memory.get())) {
         kv->scratch_cancel();
     }
@@ -2578,9 +2603,15 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
     const int64_t t_start_us = ggml_time_us();
 
     const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
-    if (!sched && sched_reserve_tokens == 0 && rotate && rotate[0] == '1' &&
+    // fork UBDEFAULT: with the ladder on, the first reserve (and so the memory fit, which measures it) is sized at
+    // LLAMA_UB_FIT_ROWS rows (default 512, 64..n_ubatch), not at the ceiling. Prompt rows above it are borrowed at
+    // prompt time (free memory or the unused KV tail) and given back before writing, so the ceiling never takes
+    // KV, expert cache or context from the fit.
+    const uint32_t ub_fit_rows_env = llama_ub_fit_rows_cfg();
+    if (!sched && sched_reserve_tokens == 0 && ((rotate && rotate[0] == '1') ||
+                (ubdefault && dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) &&
             cparams.causal_attn && !cparams.training && !cparams.embeddings && !compute_peer && !kv_stream_phase_arena.configured) {
-        sched_reserve_tokens = std::min(cparams.n_ubatch, 512u);
+        sched_reserve_tokens = std::min(cparams.n_ubatch, (rotate && rotate[0] == '1') ? 512u : ub_fit_rows_env);
     }
     const uint32_t n_seqs   = cparams.n_seq_max;
     const uint32_t reserve_tokens = sched_reserve_tokens ? std::min(cparams.n_ubatch, sched_reserve_tokens) : cparams.n_ubatch;
@@ -2686,6 +2717,17 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
         sched_cache_budget_mib = cparams.moe_cache_budget_mib;
         sched_pipeline_parallel = cparams.pipeline_parallel;
         sched_op_offload = cparams.op_offload;
+    }
+    if (ub_loan_active && ub_loan_backend) {
+        // fork UBDEFAULT: this reserve places the GPU compute buffer in the borrowed KV-tail views.
+        std::vector<ggml_backend_buffer_t> buffers;
+        for (const auto & view : ub_loan_views) {
+            buffers.push_back(view.get());
+        }
+        ggml_backend_sched_reset(sched.get());
+        if (!ggml_backend_sched_set_buffers(sched.get(), ub_loan_backend, buffers.data(), (int) buffers.size())) {
+            throw std::runtime_error("cannot place prompt compute in the KV loan");
+        }
     }
     if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer != nullptr && compute_peer->sched) {
         if (!ggml_backend_sched_set_donor(sched.get(), compute_peer->sched.get())) {
@@ -6382,6 +6424,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         if (g_pp_overlap_prompt.load()) {
             rows = std::min(rows, pp_overlap_rows()); // PP-1: the refill owns the rest of the card
         }
+    } else if (ubdefault && alone && dynamic_ubatch && sched_cache_mode == 0 && n_tokens > 512 &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !b1_cache_device_active) {
+        // fork UBDEFAULT: without an expert cache any prompt above 512 rows runs at its own size (rounded up to 512)
+        // up to the ceiling; the exact fit below steps it down when memory is short.
+        rows = std::min(cparams.n_ubatch, std::max(GGML_PAD(n_tokens, 512u), sched_reserve_tokens));
     } else if (alone && n_tokens > 3072) {
         rows = n_tokens < 16384 ? std::min(2048u, n_tokens) : std::min(cparams.n_ubatch, n_tokens);
         // fork INKPF3: an Inkling 2 server batch of 4096 (-b/-ub 4096) ran as 2048-row ubatches under the rule above
@@ -6471,7 +6518,10 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 dynamic_ubatch_rows *= 2;
             }
         }
-        if (now >= deadline) {
+        // fork UBDEFAULT: without an expert cache each prompt reserve is sized exactly (ub_fit_rows below: free
+        // memory, then the KV-tail loan, then the next rung down), so the ceiling stays put and this free-memory
+        // heuristic only runs where the expert cache shares the card (small cards, unchanged).
+        if ((!ubdefault || sched_cache_mode != 0) && now >= deadline) {
             deadline = now + (prompt ? 2000000 : 10000000);
             bool cut = false;
             bool grow = true;
@@ -6575,6 +6625,12 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         if (prompt) { rows = std::min(rows, dynamic_ubatch_rows); }
     }
     const bool trim_packed = n_tokens == 0 && (b1_ffn_scratch_active || b1_layer_scratch_active);
+    // fork UBDEFAULT: a KV-tail loan lives only while the same prompt rows keep running and the cells this call
+    // writes (plus the loan's guard) stay clear of the lent tail; anything else gives it back first.
+    if (ub_loan_active && (rows != sched_reserve_tokens || trim_packed || sched_need_reserve ||
+                !ub_loan_cache->scratch_safe(n_tokens))) {
+        ub_loan_end();
+    }
     if (rows == sched_reserve_tokens && !trim_packed && !sched_need_reserve) {
         if (ink_armed) {
             ink_stream_tokens += n_tokens;
@@ -6605,6 +6661,30 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     const bool suspend_prompt_cache = b1 && alone && n_tokens >= 16384 &&
         (b1_ffn_scratch_active || b1_layer_scratch_active) && suspend_early && suspend_early[0] == '1' &&
         suspend_cache && suspend_cache[0] == '1';
+    // fork UBDEFAULT: size prompt rows above the boot/fit reserve exactly before allocating (free memory under the
+    // 23,552 MiB card line, else the unused KV tail, else the next rung down) instead of letting the allocator
+    // run into the margin or fail. Only without an expert cache (that path keeps its cache-trim borrow).
+    const uint32_t fit_floor = std::min(cparams.n_ubatch, std::max(llama_ub_fit_rows_cfg(), cparams.n_seq_max));
+    const bool exact_fit = ubdefault && dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && sched_cache_mode == 0 &&
+            !b1_ffn_scratch_active && !b1_layer_scratch_active && n_tokens > 0;
+    if (ubdefault && dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens > 512 && !ub_path_logged) {
+        ub_path_logged = true;
+        LLAMA_LOG_INFO("%s: dynamic ub ceiling %u: %s (expert cache mode %d)\n", __func__, cparams.n_ubatch,
+                exact_fit ? "exact fit per rung (free memory, then KV-tail loan, then next rung)" : "expert-cache trim heuristic",
+                sched_cache_mode);
+    }
+    const uint32_t want = rows;
+    // A rung that did not fit (or failed in the loan) is not measured again for 60 s: free memory only moves when
+    // other processes allocate, and a failed attempt costs a full reserve on every ubatch.
+    const bool memo_hit = exact_fit && want == ub_memo_want && ggml_time_us() - ub_memo_us < 60ll * 1000 * 1000;
+    if (memo_hit) {
+        rows = ub_memo_rows;
+    } else if (exact_fit && rows > fit_floor) {
+        rows = ub_fit_rows(rows, fit_floor, n_tokens);
+    }
+    if (ubdefault && rows == sched_reserve_tokens && !trim_packed && !sched_need_reserve) {
+        return true;
+    }
     for (;;) {
         sched_reserve_tokens = rows;
         sched_need_reserve = true;
@@ -6612,12 +6692,30 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             sched_reserve(suspend_prompt_cache);
             break;
         } catch (const std::exception & error) {
-            if (!dynamic_ubatch || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) { throw; }
+            if (!dynamic_ubatch || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+                if (ub_loan_active) { ub_loan_end(); }
+                throw;
+            }
             const uint32_t floor = std::min(cparams.n_ubatch, std::max(256u, cparams.n_seq_max));
-            LLAMA_LOG_WARN("%s: dynamic scratch %u rows failed: %s\n", __func__, rows, error.what());
+            LLAMA_LOG_WARN("%s: dynamic scratch %u rows failed%s: %s\n", __func__, rows,
+                    ub_loan_active ? " in the KV loan" : "", error.what());
+            if (ub_loan_active) { ub_loan_end(); }
             if (rows <= floor) { sched_need_reserve = true; ink_cache_refill(); return false; }
             rows = std::max(floor, rows / 2);
-            dynamic_ubatch_rows = rows;
+            if (!ubdefault || sched_cache_mode != 0) { dynamic_ubatch_rows = rows; }
+            if (exact_fit && rows > fit_floor) {
+                rows = ub_fit_rows(rows, fit_floor, n_tokens);
+            }
+        }
+    }
+    // Only owned-memory rungs are remembered: a lent rung is re-lent (or stepped down) on the next call.
+    if (exact_fit && !memo_hit && !ub_loan_active) {
+        if (rows < want) {
+            ub_memo_want = want;
+            ub_memo_rows = rows;
+            ub_memo_us = ggml_time_us();
+        } else if (want == ub_memo_want) {
+            ub_memo_want = 0;
         }
     }
     if (rows < previous || trim_packed) {
@@ -6750,6 +6848,173 @@ void llama_context::ink_loan_shrink(const char * why) {
     sched_need_reserve = true;
     LLAMA_LOG_WARN("%s: [CACHELOAN] resize %.0f -> %.0f MiB (%s) in %.1f ms%s\n", __func__, size0/1048576.0,
             moe_cache->size()/1048576.0, why, (ggml_time_us() - t0)/1000.0, ok ? "" : ", refill failed (retried)");
+}
+
+// fork UBDEFAULT: pick the prompt rows for this reserve. Each rung from `rows` down to `floor` is sized with the
+// real graph (no allocation). It is taken when the compute fits in free memory under the 23,552 MiB card line
+// (plus 128 MiB for kernel temporaries, the same headroom the turn-scratch borrow uses), or when the whole GPU
+// compute buffer fits in the unused tail of the KV cache (ub_loan_begin). Otherwise the next rung down is tried.
+uint32_t llama_context::ub_fit_rows(uint32_t rows, uint32_t floor, uint32_t n_tokens) {
+    if (!memory || model.no_alloc()) {
+        return rows;
+    }
+    auto mctx = memory->init_full();
+    if (!mctx) {
+        return rows;
+    }
+    const char * loan_env = getenv("LLAMA_UB_KV_LOAN");
+    // A helper sharing this compute (MTP) or another KV-scratch user keeps the plain path.
+    const bool loan_ok = !(loan_env && loan_env[0] == '0') && compute_peer == nullptr && mtp_scratch_clients.empty() &&
+            !mtp_scratch_active && b1_kv_backend == nullptr && !b1;
+    const bool tight = (mtp_prefill_async || mtp_reserve_tight) && !cparams.embeddings &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    const uint32_t first = rows;
+    // gf_res_reserve was sized for the last reserve (512 rows at boot); several arches budget nodes per row.
+    gf_res_reserve.reset(new llm_graph_result(graph_max_nodes(rows)));
+    std::vector<size_t> sizes(backend_ptrs.size());
+    for (;;) {
+        std::fill(sizes.begin(), sizes.end(), 0);
+        const uint32_t outputs = tight ? 0 : std::min(rows, cparams.n_outputs_max);
+        auto * gf = graph_reserve(rows, cparams.n_seq_max, outputs, mctx.get(), true, sizes.data());
+        bool fits = gf != nullptr;
+        size_t gpu = SIZE_MAX;
+        int n_gpu = 0;
+        size_t need_mib = 0, free_mib = 0;
+        bool head_ok = true;
+        for (size_t i = 0; gf && i < backend_ptrs.size(); ++i) {
+            auto dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ++n_gpu;
+            gpu = i;
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            const size_t card_limit = (size_t) 23552 << 20;
+            const size_t headroom = std::max<size_t>(256u << 20, total > card_limit ? total - card_limit + (128u << 20) : 0);
+            // The current compute buffer is released before the new one is allocated.
+            const size_t held = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            const size_t avail = free + held;
+            need_mib = std::max(need_mib, (sizes[i] + headroom) >> 20);
+            free_mib = avail >> 20;
+            fits = fits && sizes[i] + headroom <= avail;
+            // A loan moves only the graph buffer; pool temporaries still need the headroom in free memory.
+            head_ok = head_ok && headroom <= avail;
+        }
+        if (fits) {
+            if (rows != first) {
+                LLAMA_LOG_INFO("%s: dynamic ub %u -> %u rows (fits in free memory: need %zu MiB, free %zu MiB)\n",
+                        __func__, first, rows, need_mib, free_mib);
+            }
+            return rows;
+        }
+        // The floor is the boot reserve size: it always fits in owned memory, never lend for it.
+        if (rows <= floor) {
+            return floor;
+        }
+        if (gf && loan_ok && head_ok && n_gpu == 1 && ub_loan_begin(rows, n_tokens, gpu, sizes[gpu], gf)) {
+            return rows;
+        }
+        const uint32_t next = std::max(floor, rows / 2);
+        LLAMA_LOG_INFO("%s: dynamic ub step down %u -> %u rows (need %zu MiB incl. headroom, free %zu MiB, no KV loan)\n",
+                __func__, rows, next, need_mib, free_mib);
+        rows = next;
+    }
+}
+
+// fork UBDEFAULT: lend the unused KV tail to the target's prompt compute (Jake 11-20 design: the ub starts high
+// and the context takes the space back as it fills). Same mechanism as the MTP prefill scratch (scratch_borrow +
+// ggml_backend_sched_set_buffers). Only the graph compute buffer moves; the backend pool stays owned.
+bool llama_context::ub_loan_begin(uint32_t rows, uint32_t n_tokens, size_t gpu, size_t bytes, ggml_cgraph * gf) {
+    auto * cache = llama_sj_kvarn_cache(memory.get());
+    if (!cache || !bytes || !gf) {
+        return false;
+    }
+    auto * backend = backend_ptrs[gpu];
+    auto * buft = backend_buft[gpu];
+    size_t chunk_bytes = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        auto * node = ggml_graph_node(gf, i);
+        if (!node->view_src && !node->data && ggml_backend_sched_get_tensor_backend(sched.get(), node) == backend) {
+            chunk_bytes = std::max(chunk_bytes, ggml_backend_buft_get_alloc_size(buft, node));
+        }
+    }
+    if (!chunk_bytes) {
+        return false;
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    const size_t largest = chunk_bytes;
+    // The lent tail starts past every cell this call writes plus later calls of the same prompt (8 batches).
+    const uint64_t guard64 = (uint64_t) n_tokens + 8ull * std::max(rows, cparams.n_batch);
+    const uint32_t guard = (uint32_t) std::min<uint64_t>(guard64, UINT32_MAX - 1024);
+    // Fewest, largest chunks first (inputs and leaves are not in the node scan; big chunks leave room to pack),
+    // then smaller ones while the per-layer KV tails cannot hold a chunk; at most 16 views.
+    std::vector<ggml_backend_buffer_ptr> views;
+    size_t chunks = 0;
+    for (size_t parts : {2u, 4u, 8u, 12u}) {
+        chunk_bytes = GGML_PAD(std::max(largest + (largest >> 2), bytes / parts), alignment);
+        chunks = (bytes + chunk_bytes - 1) / chunk_bytes + 2;
+        if (chunks > 16) {
+            break;
+        }
+        views = cache->scratch_borrow(buft, chunk_bytes, chunks, 0, guard,
+                [](void * user) { static_cast<llama_context *>(user)->ub_loan_end(); }, this);
+        if (views.size() >= chunks) {
+            break;
+        }
+        if (!views.empty()) {
+            cache->scratch_release();
+            views.clear();
+        }
+    }
+    if (views.empty() || views.size() < chunks) {
+        return false;
+    }
+    ub_loan_cache = cache;
+    ub_loan_backend = backend;
+    ub_loan_views = std::move(views);
+    ub_loan_active = true;
+    // The lent buffers are placed by the next sched_reserve, also when the rows did not change.
+    sched_need_reserve = true;
+    LLAMA_LOG_INFO("%s: dynamic ub %u rows: compute %.2f MiB lent from the unused KV tail (%zu x %.2f MiB, guard %u "
+            "tokens; LLAMA_UB_KV_LOAN=0 off)\n", __func__, rows, bytes / 1048576.0, chunks, chunk_bytes / 1048576.0, guard);
+    return true;
+}
+
+void llama_context::ub_loan_end() {
+    if (!ub_loan_active) {
+        return;
+    }
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+        for (auto & res : gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
+        }
+        gf_res_prev_active = nullptr;
+        if (gf_res_reserve) {
+            gf_res_reserve->reset();
+        }
+        auto * dev = ggml_backend_get_device(ub_loan_backend);
+        using reset_fn = bool (*)(ggml_backend_t);
+        auto reset = (reset_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_reset");
+        GGML_ASSERT(!reset || reset(ub_loan_backend));
+        ggml_backend_sched_reset(sched.get());
+        GGML_ASSERT(ggml_backend_sched_set_buffer(sched.get(), ub_loan_backend, nullptr));
+    }
+    // Attention can read masked padding before it applies the mask. Remove scratch NaNs from unused KV.
+    for (auto & view : ub_loan_views) {
+        ggml_backend_buffer_clear(view.get(), 0);
+    }
+    ub_loan_views.clear();
+    ub_loan_active = false;
+    ub_loan_backend = nullptr;
+    auto * cache = ub_loan_cache;
+    ub_loan_cache = nullptr;
+    cache->scratch_release();
+    sched_need_reserve = true;
+    LLAMA_LOG_INFO("%s: dynamic ub KV loan returned\n", __func__);
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
