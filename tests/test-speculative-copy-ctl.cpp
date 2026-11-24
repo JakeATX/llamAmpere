@@ -315,6 +315,32 @@ static void test_cost_depth() {
         assert(std::abs(med - want) <= 1);
         (void) last;
     }
+    // one run with the context growing from 3K to 100K (a long reply): the fit must split b (per row) from c (per row
+    // per 1K context), so the pick at the end follows the deep optimum and the coefficients come back near the truth
+    {
+        rtb::cost_depth cd;
+        cd.reset(8);
+        std::vector<int> picks;
+        const int R = 6000;
+        for (int r = 0; r < R; ++r) {
+            const double ctx = 3000.0 + (100000.0 - 3000.0) * r / (R - 1);
+            const int d = cd.pick(ctx);
+            int acc = 0;
+            while (acc < d && (rng() % 1000) < p * 1000) {
+                ++acc;
+            }
+            const double t = a + b * (d + 1) + c * (d + 1) * ctx / 1024.0;
+            const double noise = 1.0 + 0.05 * ((double) (rng() % 1000) / 1000.0 - 0.5);
+            cd.observe(d, acc, (int64_t) (t * noise), ctx);
+            if (r >= R - 500) picks.push_back(d);
+        }
+        std::sort(picks.begin(), picks.end());
+        const int med = picks[picks.size() / 2];
+        const int want = true_best(p, a, b, c, 100000.0, 8);
+        printf("  cost depth ctx 3K->100K: median pick %d, true best at 100K %d (%s)\n", med, want, cd.summary().c_str());
+        assert(std::abs(med - want) <= 1);
+        assert(std::fabs(cd.theta[2] - c) < 0.5 * c);
+    }
 }
 
 
