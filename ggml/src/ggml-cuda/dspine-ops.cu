@@ -1,4 +1,8 @@
-// Fused DSpine draft and lattice CUDA kernels (GGML_CUDA_DSPINE_FUSE=1, default 0).
+// Fused DSpine draft and lattice CUDA kernels (GGML_CUDA_DSPINE_FUSE={0,1,2}, default 0).
+// Modes:
+//   0 (default): off
+//   1: all 3 kernels (includes lattice_q6k_pack; not bit-identical to cuBLAS SGEMM K-tiling)
+//   2: bit-exact kernels only (write_epilogue + refine_norm; matches unfused CUDA bit-for-bit)
 // Covers three capture-safe, zero-sync, deterministic sm_86 subgraphs:
 //   1. k_dspine_write_epilogue:   SQR -> SUM_ROWS -> SCALE -> SQRT -> MUL -> RESHAPE -> PAD -> RESHAPE -> ADD
 //   2. k_dspine_refine_norm:      MUL(delta, rms) -> ADD(., raw) -> RMS_NORM -> MUL(., gamma)
@@ -20,22 +24,22 @@ int64_t ggml_cuda_dspine_fuse_count = 0;
 
 namespace dspine_ops {
 
-static bool dspine_fuse_enabled() {
-    static const bool on = []() {
+static int dspine_fuse_mode() {
+    static const int mode = []() {
         const char * e = getenv("GGML_CUDA_DSPINE_FUSE");
-        if (e == nullptr || *e == '\0') {
-            return false;
+        if (e == nullptr || *e == '\0' || strcmp(e, "0") == 0) {
+            return 0;
         }
         if (strcmp(e, "1") == 0) {
-            return true;
+            return 1;
         }
-        if (strcmp(e, "0") == 0) {
-            return false;
+        if (strcmp(e, "2") == 0) {
+            return 2;
         }
-        GGML_LOG_WARN("DSPINE FUSE: invalid GGML_CUDA_DSPINE_FUSE=\"%s\" (expected 0 or 1); using 0\n", e);
-        return false;
+        GGML_LOG_WARN("DSPINE FUSE: invalid GGML_CUDA_DSPINE_FUSE=\"%s\" (expected 0, 1 or 2); using 0\n", e);
+        return 0;
     }();
-    return on;
+    return mode;
 }
 
 static ggml_backend_buffer_t dspine_tensor_buf(const ggml_tensor * t) {
@@ -117,9 +121,11 @@ static bool dspine_check_internal_uses(const ggml_cgraph * cgraph, int first, in
 
 // ------------------------------------------------------------------------------------------------
 // Kernel 1: DSpine bridge write epilogue (9 nodes -> 1 launch)
+// Matches unfused SQR + reduce_row_f32 (sum_rows_f32_cuda block size & num_unroll=8) + SCALE + SQRT
+// + binbcast MUL + PAD + binbcast ADD bit-for-bit.
 // ------------------------------------------------------------------------------------------------
 template <int BLOCK_SIZE>
-static __global__ void k_dspine_write_epilogue(
+static __global__ __launch_bounds__(BLOCK_SIZE, 1) void k_dspine_write_epilogue(
         const float * __restrict__ cur,
         const float * __restrict__ cur_pos,
         const float * __restrict__ delta,
@@ -133,65 +139,65 @@ static __global__ void k_dspine_write_epilogue(
     const int b     = (int) blockIdx.y;
     const int tid   = (int) threadIdx.x;
     const int n_pos = block - 1;
-    const int E4    = E >> 2;
 
     const int64_t row_full = (int64_t) b * block + r;
-    const float4 * cur4 = (const float4 *) (cur + row_full * E);
-    float4       * out4 = (float4 *)       (out + row_full * E);
+    const float * cur_row  = cur + row_full * E;
+    float       * out_row  = out + row_full * E;
 
     if (r == 0) {
-        for (int i = tid; i < E4; i += BLOCK_SIZE) {
-            out4[i] = cur4[i];
+        for (int i = tid; i < E; i += BLOCK_SIZE) {
+            out_row[i] = __fadd_rn(cur_row[i], 0.0f);
         }
         return;
     }
 
-    const int64_t row_pos = (int64_t) b * n_pos + (r - 1);
-    const float4 * cur_pos4 = (const float4 *) (cur_pos + row_pos * E);
-    const float4 * delta4   = (const float4 *) (delta   + row_pos * E);
+    const int64_t row_pos     = (int64_t) b * n_pos + (r - 1);
+    const float * cur_pos_row = cur_pos + row_pos * E;
+    const float * delta_row   = delta   + row_pos * E;
 
-    constexpr int MAX_REG = 8; // 8 * 256 * 4 = 8192 floats per row cached in registers
-    float4 reg[MAX_REG];
-    float sum_sq = 0.0f;
+    constexpr int MAX_REG    = 16; // 16 * 512 = 8192 floats per row cached in registers
+    constexpr int num_unroll = 8;
+    float reg[MAX_REG];
+    float temp[num_unroll];
+    float sum_temp[num_unroll] = { 0.0f };
 
     int k = 0;
-    for (int i = tid; i < E4; i += BLOCK_SIZE, ++k) {
-        const float4 x = cur_pos4[i];
-        if (same_cur_pos && k < MAX_REG) {
-            reg[k] = x;
+    for (int i = tid; i < E;) {
+        for (int j = 0; j < num_unroll; ++j) {
+            if (i < E) {
+                const float x = cur_pos_row[i];
+                if (same_cur_pos && k < MAX_REG) {
+                    reg[k] = x;
+                }
+                temp[j] = __fmul_rn(x, x);
+            } else {
+                temp[j] = 0.0f;
+            }
+            i += BLOCK_SIZE;
+            ++k;
         }
-        sum_sq += x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
-    }
-
-    sum_sq = warp_reduce_sum(sum_sq);
-    constexpr int NWARPS = BLOCK_SIZE / WARP_SIZE;
-    __shared__ float s_warp[NWARPS];
-    const int lane = tid & (WARP_SIZE - 1);
-    const int warp = tid / WARP_SIZE;
-    if (lane == 0) {
-        s_warp[warp] = sum_sq;
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        float total = 0.0f;
-        for (int w = 0; w < NWARPS; ++w) {
-            total += s_warp[w];
-        }
-        const float rms = sqrtf(total * scale);
-        s_warp[0] = rms;
-        if (rms_out != nullptr) {
-            rms_out[row_pos] = rms;
+        for (int j = 0; j < num_unroll; ++j) {
+            sum_temp[j] += temp[j];
         }
     }
-    __syncthreads();
+    float sum = 0.0f;
+    for (int j = 0; j < num_unroll; ++j) {
+        sum += sum_temp[j];
+    }
 
-    const float rms = s_warp[0];
+    __shared__ float shared_vals[32];
+    sum = block_reduce<block_reduce_method::SUM, BLOCK_SIZE>(sum, shared_vals);
+
+    const float rms = sqrtf(__fmul_rn(sum, scale));
+    if (tid == 0 && rms_out != nullptr) {
+        rms_out[row_pos] = rms;
+    }
+
     k = 0;
-    for (int i = tid; i < E4; i += BLOCK_SIZE, ++k) {
-        const float4 c = (same_cur_pos && k < MAX_REG) ? reg[k] : cur4[i];
-        const float4 d = delta4[i];
-        out4[i] = make_float4(c.x + d.x * rms, c.y + d.y * rms, c.z + d.z * rms, c.w + d.w * rms);
+    for (int i = tid; i < E; i += BLOCK_SIZE, ++k) {
+        const float c = (same_cur_pos && k < MAX_REG) ? reg[k] : cur_row[i];
+        const float d = delta_row[i];
+        out_row[i] = __fadd_rn(c, __fmul_rn(d, rms));
     }
 }
 
@@ -230,7 +236,7 @@ static int try_fuse_write_epilogue(ggml_backend_cuda_context * ctx, ggml_cgraph 
     const int64_t n_pos = n5->ne[1];
     const int64_t B     = n5->ne[2];
     const int64_t block = n_pos + 1;
-    if (E <= 0 || (E & 3) != 0 || n_pos <= 0 || B <= 0 || n5->ne[3] != 1 ||
+    if (E <= 0 || n_pos <= 0 || B <= 0 || n5->ne[3] != 1 ||
         block > 65535 || B > 65535) {
         return 0;
     }
@@ -282,10 +288,6 @@ static int try_fuse_write_epilogue(ggml_backend_cuda_context * ctx, ggml_cgraph 
         (write_rms && !dspine_on_device(n3, dev))) {
         return 0;
     }
-    if (!dspine_aligned16(cur) || !dspine_aligned16(cur_pos) ||
-        !dspine_aligned16(delta) || !dspine_aligned16(n8)) {
-        return 0;
-    }
     if (dspine_overlap(n8, cur) || dspine_overlap(n8, cur_pos) || dspine_overlap(n8, delta)) {
         return 0;
     }
@@ -297,20 +299,32 @@ static int try_fuse_write_epilogue(ggml_backend_cuda_context * ctx, ggml_cgraph 
     const bool same_cur_pos = (B == 1) &&
             ((const char *) cur_pos->data == (const char *) cur->data + (size_t) E * sizeof(float));
 
+    const int     nsm   = ggml_cuda_info().devices[dev].nsm;
+    const int     nrows = (int) (n_pos * B);
+    const int     bs    = ((nrows / nsm) < 2) ? 512 : (E < 1024 ? 32 : 128);
+
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
     if (!logged.test_and_set()) {
-        GGML_LOG_INFO("DSPINE FUSE: write_epilogue active (E=%lld, block=%lld, B=%lld, write_rms=%d, same_cur_pos=%d)\n",
-                (long long) E, (long long) block, (long long) B, (int) write_rms, (int) same_cur_pos);
+        GGML_LOG_INFO("DSPINE FUSE: write_epilogue active (E=%lld, block=%lld, B=%lld, bs=%d, write_rms=%d, same_cur_pos=%d)\n",
+                (long long) E, (long long) block, (long long) B, bs, (int) write_rms, (int) same_cur_pos);
     }
 
     const dim3 grid((unsigned int) block, (unsigned int) B, 1);
-    k_dspine_write_epilogue<256><<<grid, 256, 0, ctx->stream()>>>(
-            (const float *) cur->data,
-            (const float *) cur_pos->data,
-            (const float *) delta->data,
-            (float *) n8->data,
-            write_rms ? (float *) n3->data : nullptr,
-            (int) E, (int) block, scale, same_cur_pos);
+    const float * cur_p     = (const float *) cur->data;
+    const float * cur_pos_p = (const float *) cur_pos->data;
+    const float * delta_p   = (const float *) delta->data;
+    float       * out_p     = (float *) n8->data;
+    float       * rms_p     = write_rms ? (float *) n3->data : nullptr;
+    if (bs == 512) {
+        k_dspine_write_epilogue<512><<<grid, 512, 0, ctx->stream()>>>(
+                cur_p, cur_pos_p, delta_p, out_p, rms_p, (int) E, (int) block, scale, same_cur_pos);
+    } else if (bs == 128) {
+        k_dspine_write_epilogue<128><<<grid, 128, 0, ctx->stream()>>>(
+                cur_p, cur_pos_p, delta_p, out_p, rms_p, (int) E, (int) block, scale, same_cur_pos);
+    } else {
+        k_dspine_write_epilogue<32><<<grid, 32, 0, ctx->stream()>>>(
+                cur_p, cur_pos_p, delta_p, out_p, rms_p, (int) E, (int) block, scale, same_cur_pos);
+    }
 
     ggml_cuda_dspine_fuse_count++;
     return 8;
@@ -318,9 +332,10 @@ static int try_fuse_write_epilogue(ggml_backend_cuda_context * ctx, ggml_cgraph 
 
 // ------------------------------------------------------------------------------------------------
 // Kernel 2: DSpine lattice refine + RMS norm (4 nodes -> 1 launch)
+// Matches unfused binbcast MUL + ADD + default scalar rms_norm_mul_f32 (256/1024 threads) bit-for-bit.
 // ------------------------------------------------------------------------------------------------
 template <int BLOCK_SIZE>
-static __global__ void k_dspine_refine_norm(
+static __global__ __launch_bounds__(BLOCK_SIZE, 1) void k_dspine_refine_norm(
         const float * __restrict__ delta,
         const float * __restrict__ rms,
         const float * __restrict__ raw,
@@ -334,64 +349,38 @@ static __global__ void k_dspine_refine_norm(
     const int p   = (int) blockIdx.y;
     const int b   = (int) blockIdx.z;
     const int tid = (int) threadIdx.x;
-    const int E4  = E >> 2;
 
     const int64_t pb  = (int64_t) b * P + p;
     const int64_t row = pb * C + c;
     const float   r   = rms[pb];
 
-    const float4 * delta4 = (const float4 *) (delta + row * E);
-    const float4 * raw4   = (const float4 *) (raw   + pb  * E);
-    const float4 * gamma4 = (const float4 *) gamma;
-    float4       * out4   = (float4 *)       (out   + row * E);
+    const float * delta_row = delta + row * E;
+    const float * raw_row   = raw   + pb  * E;
+    float       * out_row   = out   + row * E;
 
-    constexpr int MAX_REG = 8; // 8 * 256 * 4 = 8192 floats per row cached in registers
-    float4 reg[MAX_REG];
-    float sum_sq = 0.0f;
+    constexpr int MAX_REG = 8; // 8 * 1024 = 8192 (or 8 * 256 = 2048 >= 1024) floats per row cached in registers
+    float reg[MAX_REG];
+    float tmp = 0.0f;
 
     int k = 0;
-    for (int i = tid; i < E4; i += BLOCK_SIZE, ++k) {
-        const float4 d = delta4[i];
-        const float4 w = raw4[i];
-        const float4 v = make_float4(d.x * r + w.x, d.y * r + w.y, d.z * r + w.z, d.w * r + w.w);
+    for (int col = tid; col < E; col += BLOCK_SIZE, ++k) {
+        const float xi = __fadd_rn(__fmul_rn(delta_row[col], r), raw_row[col]);
         if (k < MAX_REG) {
-            reg[k] = v;
+            reg[k] = xi;
         }
-        sum_sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        tmp += xi * xi;
     }
 
-    sum_sq = warp_reduce_sum(sum_sq);
-    constexpr int NWARPS = BLOCK_SIZE / WARP_SIZE;
-    __shared__ float s_warp[NWARPS];
-    const int lane = tid & (WARP_SIZE - 1);
-    const int warp = tid / WARP_SIZE;
-    if (lane == 0) {
-        s_warp[warp] = sum_sq;
-    }
-    __syncthreads();
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM, BLOCK_SIZE>(tmp, s_sum);
 
-    if (tid == 0) {
-        float total = 0.0f;
-        for (int w = 0; w < NWARPS; ++w) {
-            total += s_warp[w];
-        }
-        s_warp[0] = rsqrtf(total / (float) E + eps);
-    }
-    __syncthreads();
+    const float mean  = tmp / E;
+    const float scale = rsqrtf(mean + eps);
 
-    const float inv_rms = s_warp[0];
     k = 0;
-    for (int i = tid; i < E4; i += BLOCK_SIZE, ++k) {
-        float4 v;
-        if (k < MAX_REG) {
-            v = reg[k];
-        } else {
-            const float4 d = delta4[i];
-            const float4 w = raw4[i];
-            v = make_float4(d.x * r + w.x, d.y * r + w.y, d.z * r + w.z, d.w * r + w.w);
-        }
-        const float4 g = gamma4[i];
-        out4[i] = make_float4(v.x * inv_rms * g.x, v.y * inv_rms * g.y, v.z * inv_rms * g.z, v.w * inv_rms * g.w);
+    for (int col = tid; col < E; col += BLOCK_SIZE, ++k) {
+        const float xi = (k < MAX_REG) ? reg[k] : __fadd_rn(__fmul_rn(delta_row[col], r), raw_row[col]);
+        out_row[col] = scale * xi * gamma[col];
     }
 }
 
@@ -416,7 +405,7 @@ static int try_fuse_refine_norm(ggml_backend_cuda_context * ctx, ggml_cgraph * c
     const int64_t C = n3->ne[1];
     const int64_t P = n3->ne[2];
     const int64_t B = n3->ne[3];
-    if (E <= 4 || (E & 3) != 0 || C <= 0 || P <= 0 || B <= 0 || P > 65535 || B > 65535) {
+    if (E <= 0 || C <= 0 || P <= 0 || B <= 0 || P > 65535 || B > 65535) {
         return 0;
     }
 
@@ -467,41 +456,50 @@ static int try_fuse_refine_norm(ggml_backend_cuda_context * ctx, ggml_cgraph * c
         !dspine_on_device(raw, dev) || !dspine_on_device(gamma, dev) || !dspine_on_device(n3, dev)) {
         return 0;
     }
-    if (!dspine_aligned16(delta) || !dspine_aligned16(raw) ||
-        !dspine_aligned16(gamma) || !dspine_aligned16(n3)) {
-        return 0;
-    }
     if (dspine_overlap(n3, delta) || dspine_overlap(n3, rms) ||
         dspine_overlap(n3, raw) || dspine_overlap(n3, gamma)) {
         return 0;
     }
 
     const float eps = ggml_get_op_params_f32(n2, 0);
+    const int   bs  = (E < 1024) ? 256 : 1024;
 
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
     if (!logged.test_and_set()) {
-        GGML_LOG_INFO("DSPINE FUSE: refine_norm active (E=%lld, C=%lld, P=%lld, B=%lld)\n",
-                (long long) E, (long long) C, (long long) P, (long long) B);
+        GGML_LOG_INFO("DSPINE FUSE: refine_norm active (E=%lld, C=%lld, P=%lld, B=%lld, bs=%d)\n",
+                (long long) E, (long long) C, (long long) P, (long long) B, bs);
     }
 
     const dim3 grid((unsigned int) C, (unsigned int) P, (unsigned int) B);
-    k_dspine_refine_norm<256><<<grid, 256, 0, ctx->stream()>>>(
-            (const float *) delta->data,
-            (const float *) rms->data,
-            (const float *) raw->data,
-            (const float *) gamma->data,
-            (float *) n3->data,
-            (int) E, (int) C, (int) P, eps);
+    if (bs == 256) {
+        k_dspine_refine_norm<256><<<grid, 256, 0, ctx->stream()>>>(
+                (const float *) delta->data,
+                (const float *) rms->data,
+                (const float *) raw->data,
+                (const float *) gamma->data,
+                (float *) n3->data,
+                (int) E, (int) C, (int) P, eps);
+    } else {
+        k_dspine_refine_norm<1024><<<grid, 1024, 0, ctx->stream()>>>(
+                (const float *) delta->data,
+                (const float *) rms->data,
+                (const float *) raw->data,
+                (const float *) gamma->data,
+                (float *) n3->data,
+                (int) E, (int) C, (int) P, eps);
+    }
 
     ggml_cuda_dspine_fuse_count++;
     return 3;
 }
 
 // ------------------------------------------------------------------------------------------------
-// Kernel 3: DSpine Q6_K lattice scoring + packing (10-22 nodes -> 1 launch)
+// Kernel 3: DSpine Q6_K lattice scoring + packing (10-22 nodes -> 1 launch, opt-in mode 1 only)
 // Streams each candidate's Q6_K output row once directly into registers (no F32 dequant buffer),
 // dots against the 1 (dedup pos-0) or K refined vectors, and writes [cand_id, scores, zero-pad]
 // plus row 0 zeros directly into the packed [E, block, B] lattice tensor.
+// Not bit-identical to unfused GET_ROWS(Q6_K) + cublasGemmStridedBatchedEx (proprietary K-tiling
+// order), so GGML_CUDA_DSPINE_FUSE=2 skips this kernel for strict draft-exact runs.
 // ------------------------------------------------------------------------------------------------
 template <int MAX_K>
 static __global__ void k_dspine_lattice_q6k_pack(
@@ -923,7 +921,8 @@ static int try_fuse_lattice_q6k_pack(ggml_backend_cuda_context * ctx, ggml_cgrap
 
 int ggml_cuda_try_fuse_dspine(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     using namespace dspine_ops;
-    if (!dspine_fuse_enabled() || i < 0 || i >= cgraph->n_nodes) {
+    const int mode = dspine_fuse_mode();
+    if (mode == 0 || i < 0 || i >= cgraph->n_nodes) {
         return 0;
     }
     if (ctx != nullptr && !ctx->stream_context().concurrent_events.empty()) {
@@ -936,7 +935,7 @@ int ggml_cuda_try_fuse_dspine(ggml_backend_cuda_context * ctx, ggml_cgraph * cgr
     if (op == GGML_OP_MUL) {
         return try_fuse_refine_norm(ctx, cgraph, i);
     }
-    if (op == GGML_OP_FILL) {
+    if (op == GGML_OP_FILL && mode == 1) {
         return try_fuse_lattice_q6k_pack(ctx, cgraph, i);
     }
     return 0;

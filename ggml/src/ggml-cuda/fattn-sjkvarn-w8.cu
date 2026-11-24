@@ -33,8 +33,8 @@ static int w8_parse_env(const char * name, const long lo, const long hi, const b
     char * end = nullptr;
     const long v = strtol(e, &end, 10);
     if (end == e || *end != '\0' || ((v < lo || v > hi) && !(allow_zero && v == 0))) {
-        GGML_LOG_WARN("SJKVARN W8: invalid %s=\"%s\" (expected %s); using default %d\n", name, e, desc, default_val);
-        return default_val;
+        GGML_LOG_WARN("SJKVARN W8: invalid %s=\"%s\" (expected %s); falling back to 0\n", name, e, desc);
+        return 0;
     }
     return (int) v;
 }

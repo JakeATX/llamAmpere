@@ -2405,10 +2405,36 @@ struct test_case {
     }
 };
 
-// DSpine fused CUDA op tests (GGML_CUDA_DSPINE_FUSE=1): write epilogue, refine+norm, and Q6_K lattice pack
-static const char * dspine_fuse_required_for_test() {
+// DSpine fused CUDA op tests (GGML_CUDA_DSPINE_FUSE=1 all 3 kernels, =2 bit-exact write_epilogue + refine_norm only)
+static int dspine_fuse_mode_env() {
     const char * e = getenv("GGML_CUDA_DSPINE_FUSE");
-    return (e != nullptr && strcmp(e, "1") == 0) ? "dspine_fuse" : nullptr;
+    if (e == nullptr || *e == '\0' || strcmp(e, "0") == 0) {
+        return 0;
+    }
+    if (strcmp(e, "1") == 0) {
+        return 1;
+    }
+    if (strcmp(e, "2") == 0) {
+        return 2;
+    }
+    return 0;
+}
+
+static int mmq_few_mode_env() {
+    const char * e = getenv("GGML_CUDA_MMQ_FEW");
+    if (e == nullptr || *e == '\0' || strcmp(e, "0") == 0) {
+        return 0;
+    }
+    if (strcmp(e, "1") == 0) {
+        return 1;
+    }
+    if (strcmp(e, "2") == 0) {
+        return 2;
+    }
+    if (strcmp(e, "draft") == 0) {
+        return 3;
+    }
+    return 0;
 }
 
 struct test_dspine_write_epilogue : public test_case {
@@ -2416,6 +2442,8 @@ struct test_dspine_write_epilogue : public test_case {
     const int64_t block;
     const int64_t B;
     const bool    write_rms;
+    ggml_tensor * fused_out = nullptr;
+    ggml_tensor * ref_out   = nullptr;
 
     test_dspine_write_epilogue(int64_t E, int64_t block, int64_t B, bool write_rms)
         : E(E), block(block), B(B), write_rms(write_rms) {}
@@ -2425,7 +2453,14 @@ struct test_dspine_write_epilogue : public test_case {
     double max_nmse_err() override { return 1e-5; }
     bool run_whole_graph() override { return true; }
     bool perf_whole_graph() override { return true; }
-    const char * required_fusion() override { return dspine_fuse_required_for_test(); }
+    size_t max_tensors() override { return 128; }
+    const char * required_fusion() override {
+        const int m = dspine_fuse_mode_env();
+        return (m == 1 || m == 2) ? "dspine_fuse" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        return dspine_fuse_mode_env() == 0 ? "dspine_fuse" : nullptr;
+    }
 
     size_t op_size(ggml_tensor *) override {
         const int64_t n_pos = block - 1;
@@ -2437,30 +2472,70 @@ struct test_dspine_write_epilogue : public test_case {
         ggml_tensor * cur   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, block * B);
         ggml_tensor * delta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_pos * B);
 
-        ggml_tensor * cur3 = ggml_reshape_3d(ctx, cur, E, block, B);
-        ggml_tensor * cur_pos3 = nullptr;
-        if (B == 1) {
-            ggml_tensor * cur2 = ggml_reshape_2d(ctx, cur3, E, block);
-            ggml_tensor * v2   = ggml_view_2d(ctx, cur2, E, n_pos, cur2->nb[1], cur2->nb[1]);
-            cur_pos3 = ggml_reshape_3d(ctx, v2, E, n_pos, 1);
-        } else {
-            cur_pos3 = ggml_cont(ctx, ggml_view_3d(ctx, cur3, E, n_pos, B, cur3->nb[1], cur3->nb[2], cur3->nb[1]));
-        }
-        ggml_tensor * cur_pos = ggml_reshape_2d(ctx, cur_pos3, E, n_pos * B);
+        auto build_chain = [&](bool block_fuse) -> ggml_tensor * {
+            ggml_tensor * cur3 = ggml_reshape_3d(ctx, cur, E, block, B);
+            ggml_tensor * cur_pos3 = nullptr;
+            if (B == 1) {
+                ggml_tensor * cur2 = ggml_reshape_2d(ctx, cur3, E, block);
+                ggml_tensor * v2   = ggml_view_2d(ctx, cur2, E, n_pos, cur2->nb[1], cur2->nb[1]);
+                cur_pos3 = ggml_reshape_3d(ctx, v2, E, n_pos, 1);
+            } else {
+                cur_pos3 = ggml_cont(ctx, ggml_view_3d(ctx, cur3, E, n_pos, B, cur3->nb[1], cur3->nb[2], cur3->nb[1]));
+            }
+            ggml_tensor * cur_pos = ggml_reshape_2d(ctx, cur_pos3, E, n_pos * B);
 
-        ggml_tensor * rms_pos = ggml_sqrt(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur_pos)), 1.0f / (float) E));
-        ggml_tensor * d = ggml_mul(ctx, delta, rms_pos);
-        d = ggml_pad_ext(ctx, ggml_reshape_3d(ctx, d, E, n_pos, B), 0, 0, 1, 0, 0, 0, 0, 0);
-        d = ggml_reshape_2d(ctx, d, E, block * B);
-        ggml_tensor * out = ggml_add(ctx, cur, d);
+            ggml_tensor * sq = ggml_sqr(ctx, cur_pos);
+            if (block_fuse) {
+                // Marking an internal node as output blocks dspine_fuse on the reference chain only.
+                ggml_set_output(sq);
+            }
+            ggml_tensor * rms_pos = ggml_sqrt(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, sq), 1.0f / (float) E));
+            ggml_tensor * d = ggml_mul(ctx, delta, rms_pos);
+            d = ggml_pad_ext(ctx, ggml_reshape_3d(ctx, d, E, n_pos, B), 0, 0, 1, 0, 0, 0, 0, 0);
+            d = ggml_reshape_2d(ctx, d, E, block * B);
+            ggml_tensor * res = ggml_add(ctx, cur, d);
 
-        if (write_rms) {
-            ggml_tensor * rms_pad = ggml_reshape_2d(ctx,
-                    ggml_pad_ext(ctx, ggml_reshape_3d(ctx, rms_pos, 1, n_pos, B), 0, 0, 1, 0, 0, 0, 0, 0),
-                    1, block * B);
-            out = ggml_add(ctx, out, rms_pad);
+            if (write_rms) {
+                ggml_tensor * rms_pad = ggml_reshape_2d(ctx,
+                        ggml_pad_ext(ctx, ggml_reshape_3d(ctx, rms_pos, 1, n_pos, B), 0, 0, 1, 0, 0, 0, 0, 0),
+                        1, block * B);
+                res = ggml_add(ctx, res, rms_pad);
+            }
+            return res;
+        };
+
+        fused_out = build_chain(false);
+        ref_out   = nullptr;
+        if (mode == MODE_TEST) {
+            ref_out = build_chain(true);
+            ggml_set_output(fused_out);
+            ggml_set_output(ref_out);
+            ggml_build_forward_expand(gf, ref_out);
         }
-        return out;
+        return fused_out;
+    }
+
+    bool verify_backend_result(ggml_backend_t backend) override {
+        const int fm = dspine_fuse_mode_env();
+        if (ref_out == nullptr || fused_out == nullptr || (fm != 1 && fm != 2)) {
+            return true;
+        }
+        const char * dis = getenv("GGML_CUDA_DISABLE_FUSION");
+        if (dis != nullptr && atoi(dis) != 0) {
+            return true;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count")) {
+            return true;
+        }
+        std::vector<uint32_t> a((size_t) ggml_nelements(fused_out)), b((size_t) ggml_nelements(ref_out));
+        ggml_backend_tensor_get(fused_out, a.data(), 0, a.size() * sizeof(uint32_t));
+        ggml_backend_tensor_get(ref_out,   b.data(), 0, b.size() * sizeof(uint32_t));
+        if (a != b) {
+            fprintf(stderr, "DSPINE_WRITE_EPILOGUE fused vs unfused GPU output bytes differ\n");
+            return false;
+        }
+        return true;
     }
 };
 
@@ -2469,6 +2544,8 @@ struct test_dspine_refine_norm : public test_case {
     const int64_t C;
     const int64_t P;
     const int64_t B;
+    ggml_tensor * fused_out = nullptr;
+    ggml_tensor * ref_out   = nullptr;
 
     test_dspine_refine_norm(int64_t E, int64_t C, int64_t P, int64_t B)
         : E(E), C(C), P(P), B(B) {}
@@ -2478,7 +2555,14 @@ struct test_dspine_refine_norm : public test_case {
     double max_nmse_err() override { return 1e-5; }
     bool run_whole_graph() override { return true; }
     bool perf_whole_graph() override { return true; }
-    const char * required_fusion() override { return dspine_fuse_required_for_test(); }
+    size_t max_tensors() override { return 128; }
+    const char * required_fusion() override {
+        const int m = dspine_fuse_mode_env();
+        return (m == 1 || m == 2) ? "dspine_fuse" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        return dspine_fuse_mode_env() == 0 ? "dspine_fuse" : nullptr;
+    }
 
     size_t op_size(ggml_tensor *) override {
         return (size_t) (2 * C * P * B + P * B + 1) * (size_t) E * sizeof(float);
@@ -2490,8 +2574,51 @@ struct test_dspine_refine_norm : public test_case {
         ggml_tensor * raw   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, 1, P, B);
         ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, E);
 
-        ggml_tensor * x = ggml_add(ctx, ggml_mul(ctx, delta, rms), raw);
-        return ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma);
+        auto build_chain = [&](bool block_fuse) -> ggml_tensor * {
+            ggml_tensor * m = ggml_mul(ctx, delta, rms);
+            if (block_fuse) {
+                ggml_set_output(m);
+            }
+            ggml_tensor * x = ggml_add(ctx, m, raw);
+            return ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma);
+        };
+
+        fused_out = build_chain(false);
+        ref_out   = nullptr;
+        if (mode == MODE_TEST) {
+            ref_out = build_chain(true);
+            ggml_set_output(fused_out);
+            ggml_set_output(ref_out);
+            ggml_build_forward_expand(gf, ref_out);
+        }
+        return fused_out;
+    }
+
+    bool verify_backend_result(ggml_backend_t backend) override {
+        const int fm = dspine_fuse_mode_env();
+        if (ref_out == nullptr || fused_out == nullptr || (fm != 1 && fm != 2)) {
+            return true;
+        }
+        const char * dis = getenv("GGML_CUDA_DISABLE_FUSION");
+        if (dis != nullptr && atoi(dis) != 0) {
+            return true;
+        }
+        const char * rnv = getenv("GGML_CUDA_RMS_NORM_VEC");
+        if (rnv != nullptr && atoi(rnv) != 0) {
+            return true;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count")) {
+            return true;
+        }
+        std::vector<uint32_t> a((size_t) ggml_nelements(fused_out)), b((size_t) ggml_nelements(ref_out));
+        ggml_backend_tensor_get(fused_out, a.data(), 0, a.size() * sizeof(uint32_t));
+        ggml_backend_tensor_get(ref_out,   b.data(), 0, b.size() * sizeof(uint32_t));
+        if (a != b) {
+            fprintf(stderr, "DSPINE_REFINE_NORM fused vs unfused GPU output bytes differ\n");
+            return false;
+        }
+        return true;
     }
 };
 
@@ -2511,7 +2638,8 @@ struct test_dspine_lattice_q6k_pack : public test_case {
     double max_nmse_err() override { return 1e-5; }
     bool run_whole_graph() override { return true; }
     bool perf_whole_graph() override { return true; }
-    const char * required_fusion() override { return dspine_fuse_required_for_test(); }
+    const char * required_fusion() override { return dspine_fuse_mode_env() == 1 ? "dspine_fuse" : nullptr; }
+    const char * forbidden_fusion() override { return dspine_fuse_mode_env() != 1 ? "dspine_fuse" : nullptr; }
 
     size_t op_size(ggml_tensor *) override {
         const int64_t n_ref = dedup ? (1 + K * (n_pos - 1)) * B : K * n_pos * B;
@@ -2584,6 +2712,65 @@ struct test_dspine_lattice_q6k_pack : public test_case {
     }
 };
 
+// Draft-only few-row MMQ test (GGML_CUDA_MMQ_FEW=draft): verifies that DFlash/DSpine tagged graphs
+// fire mmq_few while untagged target control graphs forbid it.
+struct test_dspine_draft_mmq_few : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int draft_tag; // 0 = untagged target control, 1 = inp_noise_embd (draft), 2 = inp_g_embeddings (inject)
+
+    test_dspine_draft_mmq_few(ggml_type type_a, int64_t m, int64_t n, int64_t k, int draft_tag)
+        : type_a(type_a), m(m), n(n), k(k), draft_tag(draft_tag) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DSPINE_DRAFT_MMQ_FEW"; }
+    std::string vars() override { return VARS_TO_STR5(type_a, m, n, k, draft_tag); }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        return (uint64_t) (2 * m * n * k);
+    }
+
+    size_t op_size(ggml_tensor *) override {
+        return ggml_row_size(type_a, k) * (size_t) m + (size_t) (k + m) * (size_t) n * sizeof(float);
+    }
+
+    bool expect_mmq_few() const {
+        const int mode = mmq_few_mode_env();
+        if (mode == 1 || mode == 2) {
+            return true;
+        }
+        return mode == 3 && draft_tag > 0;
+    }
+
+    const char * required_fusion() override {
+        return expect_mmq_few() ? "mmq_few" : nullptr;
+    }
+
+    const char * forbidden_fusion() override {
+        return expect_mmq_few() ? nullptr : "mmq_few";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        if (draft_tag == 1) {
+            ggml_set_name(b, "inp_noise_embd");
+        } else if (draft_tag == 2) {
+            ggml_set_name(b, "inp_g_embeddings");
+        } else {
+            ggml_set_name(b, "b");
+        }
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static void add_dspine_fuse_cases(std::vector<std::unique_ptr<test_case>> & test_cases, bool perf) {
     if (perf) {
         test_cases.emplace_back(new test_dspine_write_epilogue(5120, 8, 1, false));
@@ -2592,6 +2779,10 @@ static void add_dspine_fuse_cases(std::vector<std::unique_ptr<test_case>> & test
         test_cases.emplace_back(new test_dspine_refine_norm(5120, 16, 7, 1));
         test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 4096, 16, 7, 1, true));
         test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 4096, 16, 7, 1, false));
+        test_cases.emplace_back(new test_dspine_draft_mmq_few(GGML_TYPE_Q4_K, 17408, 8, 5120, 0));
+        test_cases.emplace_back(new test_dspine_draft_mmq_few(GGML_TYPE_Q4_K, 17408, 8, 5120, 1));
+        test_cases.emplace_back(new test_dspine_draft_mmq_few(GGML_TYPE_Q6_K, 24576, 7, 5120, 0));
+        test_cases.emplace_back(new test_dspine_draft_mmq_few(GGML_TYPE_Q6_K, 24576, 7, 5120, 2));
         return;
     }
     test_cases.emplace_back(new test_dspine_write_epilogue(5120, 8, 1, false));
@@ -2612,6 +2803,11 @@ static void add_dspine_fuse_cases(std::vector<std::unique_ptr<test_case>> & test
     test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 512, 16, 7, 1, false));
     test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 512, 16, 7, 2, false));
     test_cases.emplace_back(new test_dspine_lattice_q6k_pack(512,  128, 20, 3, 1, true));
+
+    test_cases.emplace_back(new test_dspine_draft_mmq_few(GGML_TYPE_Q4_K, 512, 8, 2048, 0));
+    test_cases.emplace_back(new test_dspine_draft_mmq_few(GGML_TYPE_Q4_K, 512, 8, 2048, 1));
+    test_cases.emplace_back(new test_dspine_draft_mmq_few(GGML_TYPE_Q6_K, 512, 7, 2048, 0));
+    test_cases.emplace_back(new test_dspine_draft_mmq_few(GGML_TYPE_Q6_K, 512, 7, 2048, 2));
 }
 
 

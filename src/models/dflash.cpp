@@ -4,6 +4,7 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -1770,6 +1771,17 @@ llama_model_dflash::graph<false>::graph(const llm_graph_params & params) : llm_g
             !model.dflash_selector_hidden && !model.dspark_markov_w1 && !model.lilicorr_pass_hidden_proj &&
             dspine.raw != nullptr && ubatch.n_seqs_unq > 0 && n_tokens % ubatch.n_seqs_unq == 0 &&
             (n_tokens / ubatch.n_seqs_unq) <= (int64_t) hparams.dflash_block_size;
+
+    if (dspine_fast && dspine.raw != nullptr) {
+        static std::atomic<int> logged_mode{0};
+        const int mode_bit = dspine_lattice_only ? 2 : 1;
+        if ((logged_mode.fetch_or(mode_bit, std::memory_order_relaxed) & mode_bit) == 0) {
+            const int64_t n_blocks = ubatch.n_seqs_unq;
+            const int64_t block    = n_blocks > 0 ? (n_tokens / n_blocks) : 0;
+            LLAMA_LOG_INFO("DSPINE FAST: active (block=%lld, n_blocks=%lld, lattice_only=%d)\n",
+                    (long long) block, (long long) n_blocks, (int) dspine_lattice_only);
+        }
+    }
 
     ggml_tensor * norm_in = inpL;
     if (dspine_lattice_only) {
