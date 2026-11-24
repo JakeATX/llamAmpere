@@ -17,6 +17,61 @@ int32_t common_spec_tree_paths() {
     return v;
 }
 
+bool common_spec_tree_posrng() {
+    static const bool v = [] {
+        const char * e = std::getenv("LLAMA_SPEC_TREE_POSRNG");
+        return e && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
+static uint64_t spec_tree_mix(uint64_t z) {
+    z += 0x9e3779b97f4a7c15ull;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+double common_spec_tree_uniform(uint32_t seed, llama_pos pos, int32_t node) {
+    uint64_t h = spec_tree_mix((uint64_t) seed);
+    h = spec_tree_mix(h ^ (uint64_t) (uint32_t) pos);
+    h = spec_tree_mix(h ^ ((uint64_t) (uint32_t) node << 32));
+    return (double) (h >> 11) * (1.0 / 9007199254740992.0);
+}
+
+// inverse-CDF draw from the sampler's final candidates (their p after the chain); NULL if they are not a distribution
+static llama_token spec_tree_draw(struct common_sampler * gsmpl, double u) {
+    const llama_token_data_array * cur_p = common_sampler_get_candidates(gsmpl, false);
+    if (!cur_p || cur_p->size == 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+    double sum = 0.0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const float p = cur_p->data[i].p;
+        if (!(p >= 0.0f) || !std::isfinite(p)) {
+            return LLAMA_TOKEN_NULL;
+        }
+        sum += p;
+    }
+    if (!(sum > 0.99 && sum < 1.01)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    const double t = u * sum;
+    double acc = 0.0;
+    size_t last = 0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (cur_p->data[i].p <= 0.0f) {
+            continue;
+        }
+        last = i;
+        acc += cur_p->data[i].p;
+        if (t < acc) {
+            return cur_p->data[i].id;
+        }
+    }
+    return cur_p->data[last].id;
+}
+
 int32_t common_spec_tree_branch() {
     static const int32_t v = [] {
         const char * e = std::getenv("LLAMA_SPEC_TREE_BRANCH");
@@ -110,7 +165,7 @@ std::vector<std::vector<llama_token>> common_spec_tree_build(const common_spec_t
 
 std::vector<llama_token> common_spec_tree_extend(struct common_sampler * gsmpl, struct llama_context * ctx,
         const std::vector<llama_token> & chain, const std::vector<common_spec_tree_path> & paths, size_t n0, llama_token x,
-        const std::vector<llama_token> & committed, llama_pos pos_row0,
+        const std::vector<llama_token> & committed, llama_pos pos_row0, float temp,
         const std::function<bool(llama_token, const std::vector<llama_token> &)> & is_stop, int32_t & path_out) {
     std::vector<llama_token> ext;
     path_out = -1;
@@ -136,12 +191,20 @@ std::vector<llama_token> common_spec_tree_extend(struct common_sampler * gsmpl, 
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     std::vector<llama_token> prefix = committed;
+    const bool     posrng = common_spec_tree_posrng() && temp > 0.0f;
+    const uint32_t seed   = posrng ? common_sampler_get_seed(gsmpl) : 0;
 
     // row r of a live path holds tokens[r - 1]; its output is the target's token at depth r
     for (size_t r = n0 + 1; r <= L; ++r) {
         const int32_t k = live.front();
-        const llama_token y = common_sampler_sample(gsmpl, ctx, paths[k].rows[r]);
-        GGML_UNUSED(pos_row0);
+        llama_token y = common_sampler_sample(gsmpl, ctx, paths[k].rows[r]);
+        if (posrng) {
+            // UZU-3: this node's own uniform; the node index is the path's, the depth is in the position
+            const llama_token yp = spec_tree_draw(gsmpl, common_spec_tree_uniform(seed, pos_row0 + (llama_pos) r, k));
+            if (yp != LLAMA_TOKEN_NULL) {
+                y = yp;
+            }
+        }
         common_sampler_accept(gsmpl, y, true);
         const bool stopped = llama_vocab_is_eog(vocab, y) || (is_stop && is_stop(y, prefix));
         ext.push_back(y);

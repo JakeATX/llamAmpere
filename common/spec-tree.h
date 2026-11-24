@@ -23,6 +23,14 @@ int32_t common_spec_tree_paths();
 // max children per tree node, chain child included (LLAMA_SPEC_TREE_BRANCH, default 2, 2..8)
 int32_t common_spec_tree_branch();
 
+// UZU-3 (LLAMA_SPEC_TREE_POSRNG=1, only with LLAMA_SPEC_TREE and temp > 0): a token the tree walk draws on an extra
+// path's row uses its own uniform, a hash of (request seed, absolute position, path index), by inverse CDF over the
+// sampler's final distribution. The draw is then the same whichever round or batch layout reaches that node.
+bool common_spec_tree_posrng();
+
+// the uniform in [0, 1) of tree node (seed, pos, node)
+double common_spec_tree_uniform(uint32_t seed, llama_pos pos, int32_t node);
+
 // per-depth candidate marginals of the last block draft of one sequence
 struct common_spec_tree_marg {
     std::vector<std::vector<llama_token_data>> cand; // [depth] candidates (id, p), any order
@@ -49,8 +57,9 @@ struct common_sampler;
 // row of that path and accepted into gsmpl; the walk follows a path while its next token is the sampled one.
 // Returns the tokens committed after x (the last one is the new bonus token; empty: no path matched), path_out = the
 // index of the path whose rows hold them. committed = the tokens this round committed before (for is_stop).
-// pos_row0 = absolute position of row 0 (for LLAMA_SPEC_TREE_POSRNG).
+// pos_row0 = absolute position of row 0, temp = the request's temperature (both for LLAMA_SPEC_TREE_POSRNG; pass
+// temp <= 0 when the draw must stay the sampler's own, e.g. with a grammar).
 std::vector<llama_token> common_spec_tree_extend(struct common_sampler * gsmpl, struct llama_context * ctx,
         const std::vector<llama_token> & chain, const std::vector<common_spec_tree_path> & paths, size_t n0, llama_token x,
-        const std::vector<llama_token> & committed, llama_pos pos_row0,
+        const std::vector<llama_token> & committed, llama_pos pos_row0, float temp,
         const std::function<bool(llama_token, const std::vector<llama_token> &)> & is_stop, int32_t & path_out);

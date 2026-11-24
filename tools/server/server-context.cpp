@@ -8901,7 +8901,9 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt) &&
                             llama_get_sampled_token_ith(slot.ctx_tgt, spec_i_batch[0]) == LLAMA_TOKEN_NULL) {
                         tree_ext = common_spec_tree_extend(slot.smpl.get(), slot.ctx_tgt, slot.spec_draft, slot.spec_tree,
-                                n0, x, accepted, slot.spec_tree_pos0, is_stop, tree_k);
+                                n0, x, accepted, slot.spec_tree_pos0,
+                                slot.task->params.sampling.grammar.empty() ? slot.task->params.sampling.temp : 0.0f,
+                                is_stop, tree_k);
                     }
                     if (tree_ext.empty()) {
                         tree_k = -1;
