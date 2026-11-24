@@ -10131,6 +10131,9 @@ ggml_status llama_context::graph_compute(ggml_cgraph * gf, bool batched) {
     }
 
     copy_experts.reset();
+    if (moe_cache) {
+        moe_cache->og_prepare(); // fork (ONEGRAPH): no-op unless LLAMA_MOE_ONEGRAPH=1
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

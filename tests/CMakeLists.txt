@@ -791,6 +791,11 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU AND TARGET ggml-cuda AND CMAKE_SYSTEM_NAME 
     target_link_libraries(test-moe-iq-rows PRIVATE ggml-cuda ggml-cpu)
 endif()
 
+# fork ONEGRAPH (#101): doorbell handshake of ggml_moe_og_slots vs a host worker (not a ctest: needs a GPU)
+if (TARGET ggml-cuda)
+    llama_build(test-moe-onegraph.cpp)
+endif()
+
 # libmtmd
 llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 

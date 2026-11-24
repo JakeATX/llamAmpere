@@ -61,6 +61,10 @@ public:
     void   window_end();
     bool   boundary() const;
     void   request_end();
+    // fork (ONEGRAPH, LLAMA_MOE_ONEGRAPH=1, llama-moe-onegraph.h): the GPU-side lookup of layer il for a decode ubatch
+    // (<= 8 rows), nullptr when it is off or does not apply; og_prepare() runs before every graph of the context.
+    ggml_tensor * og_slots(ggml_context * ctx, ggml_tensor * ids, int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+    void          og_prepare();
 
 private:
     struct impl;

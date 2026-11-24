@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-model.h"
 #include "llama-moe-nvme.h"
+#include "llama-moe-onegraph.h"
 
 #include "ggml-cpp.h"
 
@@ -15,6 +16,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <set>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -620,6 +624,12 @@ struct llama_moe_cache::impl {
         }
         return p;
     }
+    // fork (ONEGRAPH, LLAMA_MOE_ONEGRAPH=1, off by default): decode lookups on the GPU, misses served by a host worker
+    // (llama-moe-onegraph.h). Declared last: it stops its worker before the rest of the cache goes away.
+    int32_t og_n_expert = 0;
+    std::vector<int32_t> og_ids;
+    std::vector<moe_cache_lru::fill> og_fills, og_cpu;
+    std::unique_ptr<llama_moe_og> og;
 
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
@@ -995,6 +1005,142 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        og_init(model, no_alloc);
+    }
+
+    // fork (ONEGRAPH): one device, every group sized, no zero slots (CPU share, round admission, few-row tier) and no trace
+    void og_init(const llama_model & model, bool no_alloc) {
+        if (!llama_moe_og::requested() || no_alloc || n_zero > 0 || round_on || fewrow_r > 0 || trace != nullptr) {
+            if (llama_moe_og::requested() && !no_alloc) {
+                LLAMA_LOG_WARN("%s: [ONEGRAPH] off: needs no CPU share, round admission, few-row tier or trace\n", __func__);
+            }
+            return;
+        }
+        int32_t n_dev = 0, id = -1;
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (devices[i].ctx) {
+                n_dev++;
+                id = (int32_t) i;
+            }
+        }
+        og_n_expert = (int32_t) model.hparams.n_expert;
+        bool ok = n_dev == 1;
+        for (const group & g : groups) {
+            ok = ok && g.ref[0]->ne[2] == og_n_expert;
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: [ONEGRAPH] off: one device and one expert count only\n", __func__);
+            return;
+        }
+        // the host experts the GPU copies misses from (looped visits share their canonical layer's tensors)
+        std::vector<std::pair<void *, size_t>> pins;
+        std::set<const void *> seen;
+        for (const layer & l : layers) {
+            if (l.ig < 0) {
+                continue;
+            }
+            for (const ggml_tensor * w : l.experts) {
+                if (seen.insert(w->data).second) {
+                    pins.emplace_back(w->data, ggml_nbytes(w));
+                }
+            }
+        }
+        // CUDA pins whole pages: ranges that share a page (adjacent tensors) are registered as one
+        std::sort(pins.begin(), pins.end());
+        std::vector<std::pair<void *, size_t>> merged;
+        for (const auto & p : pins) {
+            const uintptr_t b = (uintptr_t) p.first;
+            if (!merged.empty()) {
+                const uintptr_t mb = (uintptr_t) merged.back().first;
+                const uintptr_t me = mb + merged.back().second;
+                if (b < me + 65536) {
+                    merged.back().second = std::max(me, b + p.second) - mb;
+                    continue;
+                }
+            }
+            merged.push_back(p);
+        }
+        og.reset(llama_moe_og::create(devices[id].backend, devices[id].buft, og_n_expert, (int32_t) layers.size(), merged,
+            [this](const ggml_moe_og_rec & rec, std::vector<ggml_moe_og_copy> & copies) { return og_serve(rec, copies); },
+            [this](int32_t * table) { og_snapshot(table); }));
+    }
+
+    // fork (ONEGRAPH): the worker's half of copy(): same plan, the GPU does the copies (no CPU part)
+    int og_serve(const ggml_moe_og_rec & rec, std::vector<ggml_moe_og_copy> & copies) {
+        const int32_t il = rec.layer;
+        if (is_suspended || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || rec.n_used <= 0 ||
+                rec.n_ids <= 0 || rec.n_ids % rec.n_used != 0) {
+            return 0;
+        }
+        const int32_t ci = canon[il];
+        layer & l = layers[il];
+        group & g = groups[l.ig];
+        if (g.n_slots == 0) {
+            return 0;
+        }
+        og_ids.assign(rec.ids, rec.ids + rec.n_ids);
+        size_t n_hit = 0;
+        auto no_cpu = [](size_t) { return (size_t) 0; };
+        if (!g.lru.plan(ci, og_ids.data(), og_ids.size(), rec.n_ids / rec.n_used, rec.n_used, n_zero, no_cpu, og_fills, og_cpu, n_hit, ci == il, 0)) {
+            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+        size_t bytes = 0;
+        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+            const ggml_tensor * w    = l.experts[ip];
+            ggml_tensor       * bank = g.banks[ip];
+            const size_t expert_size = bank->nb[2];
+            for (size_t i = 0; i < og_fills.size();) {
+                size_t n = 1;
+                while (w->nb[2] == expert_size && i + n < og_fills.size() && og_fills[i + n].expert == og_fills[i].expert + (int32_t) n &&
+                        og_fills[i + n].slot == og_fills[i].slot + (int32_t) n) {
+                    n++;
+                }
+                copies.push_back({ (uint64_t) (uintptr_t) ((const uint8_t *) w->data + og_fills[i].expert*w->nb[2]),
+                                   (uint64_t) (uintptr_t) ((uint8_t *) bank->data + og_fills[i].slot*expert_size), (uint64_t) (n*expert_size) });
+                bytes += n*expert_size;
+                i += n;
+            }
+        }
+        stats & st = og_ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        st.hits   += n_hit;
+        st.misses += og_fills.size();
+        st.bytes  += bytes;
+        return og_fills.empty() ? 0 : 1;
+    }
+
+    // fork (ONEGRAPH): the slot maps of the canonical layers, row il = layer il (looped visits read their canonical row)
+    void og_snapshot(int32_t * table) const {
+        for (const group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            for (int32_t il : g.layers) {
+                if (canon[il] == il && g.lru.slot_map[il] != nullptr) {
+                    memcpy(table + (size_t) il*og_n_expert, g.lru.slot_map[il], (size_t) og_n_expert*sizeof(int32_t));
+                }
+            }
+        }
+    }
+
+    ggml_tensor * og_slots(ggml_context * ctx, ggml_tensor * ids, int32_t il, int64_t n_tokens, int64_t n_used) const {
+        if (!og || llama_moe_og::mode() != 1 || is_suspended || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0 || n_tokens < 1 || n_tokens > 8 ||
+                n_tokens*n_used > GGML_MOE_OG_MAX_IDS || ggml_nelements(ids) != n_tokens*n_used) {
+            return nullptr;
+        }
+        const group & g = groups[layers[il].ig];
+        return g.n_slots > 0 ? og->slots(ctx, ids, canon[il], il, g.n_slots, (int32_t) n_used) : nullptr;
+    }
+
+    // fork (ONEGRAPH): the regular paths change the maps or the banks only with the worker idle and its uploads done
+    std::unique_lock<std::mutex> og_hold(bool changes) {
+        if (!og) {
+            return {};
+        }
+        og->quiesce();
+        if (changes) {
+            og->mark_dirty();
+        }
+        return std::unique_lock<std::mutex>(og->mu);
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -1388,6 +1534,10 @@ struct llama_moe_cache::impl {
         if (backend != devices[g.id].backend) {
             return 0;
         }
+        std::unique_lock<std::mutex> og_lock;
+        if (og) {
+            og_lock = std::unique_lock<std::mutex>(og->mu); // fork (ONEGRAPH): reads the slot maps the worker writes
+        }
 
         // large batches only read the cache, so the experts used in generation stay in it
         const int32_t * slots = g.lru.slot_map[b.il];
@@ -1463,6 +1613,7 @@ struct llama_moe_cache::impl {
         if (split.active()) {
             split.on_ids(il, sel->src[0]->ne[1]); // fork (INKCACHEUX) #249: layer interval, ids to ids
         }
+        const std::unique_lock<std::mutex> og_lock = og_hold(true); // fork (ONEGRAPH): no-op unless on
 
         if (trace != nullptr) {
             write_trace(il, n_used);
@@ -1768,6 +1919,7 @@ struct llama_moe_cache::impl {
         if (prefetch) {
             prefetch->wait();
         }
+        const std::unique_lock<std::mutex> og_lock = og_hold(true); // fork (ONEGRAPH): no-op unless on
         size_t freed = 0;
         for (device & d : devices) {
             if (!d.buf || !d.ctx) {
@@ -1812,6 +1964,7 @@ struct llama_moe_cache::impl {
             return false;
         }
         nowait_drain();
+        const std::unique_lock<std::mutex> og_lock = og_hold(true); // fork (ONEGRAPH): no-op unless on
         int32_t n_dev = 0;
         for (const device & d : devices) {
             n_dev += d.ctx ? 1 : 0;
@@ -1948,6 +2101,7 @@ struct llama_moe_cache::impl {
         if (!is_suspended) {
             return true;
         }
+        const std::unique_lock<std::mutex> og_lock = og_hold(true); // fork (ONEGRAPH): no-op unless on
         for (device & d : devices) {
             if (d.buf || !d.ctx) {
                 continue;
@@ -2272,6 +2426,16 @@ bool llama_moe_cache::boundary() const {
 
 void llama_moe_cache::request_end() {
     pimpl->request_end();
+}
+
+ggml_tensor * llama_moe_cache::og_slots(ggml_context * ctx, ggml_tensor * ids, int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    return pimpl->og_slots(ctx, ids, il, n_tokens, n_expert_used);
+}
+
+void llama_moe_cache::og_prepare() {
+    if (pimpl->og) {
+        pimpl->og->prepare();
+    }
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

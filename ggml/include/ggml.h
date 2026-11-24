@@ -510,6 +510,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_OG_SLOTS, // fork (ONEGRAPH): GPU-anchored MoE cache lookup, ggml-moe-onegraph.h
+
         GGML_OP_COUNT,
     };
 
@@ -2512,6 +2514,22 @@ extern "C" {
             int                   unit,
             int                   flags,
             int                   src);
+
+    // fork (ONEGRAPH, ggml-moe-onegraph.h): slots of the experts ids [n_ids] (I32) in the device slot map row `row`
+    // of map (I32 [n_expert, n_rows]); misses are slots >= n_slots. Publishes the ids to the host ring (pinned, mapped
+    // memory the GPU can address) and waits on ctrl (device, GGML_MOE_OG_CTRL_BYTES) for the host to fill the misses.
+    // Result: I32 [n_ids]. CUDA only.
+    GGML_API struct ggml_tensor * ggml_moe_og_slots(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * map,
+            struct ggml_tensor  * ctrl,
+            void                * ring,
+            int                   row,
+            int                   layer,
+            int                   n_slots,
+            int                   n_used,
+            int                   timeout_ms);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

@@ -132,6 +132,7 @@
 #include "ggml-cuda/q8a16.cuh"
 #include "ggml-cuda/q8tc.cuh"
 #include "ggml-cuda/head2.cuh"
+#include "ggml-cuda/moe-onegraph.cuh"
 #include "ggml-cuda/elastic-buf.cuh"
 #include "ggml-cuda/prefill-glue.cuh"
 #include "ggml.h"
@@ -5065,6 +5066,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LSA_PREFETCH:
             ggml_cuda_lsa_prefetch(ctx, dst); // no-op unless the body has record-page slots
+            break;
+        case GGML_OP_MOE_OG_SLOTS:
+            ggml_cuda_moe_og_slots(ctx, dst); // fork (ONEGRAPH)
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -18512,6 +18516,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_loop_gate_supported(op);
         case GGML_OP_LSA_PREFETCH:
             return true;
+        case GGML_OP_MOE_OG_SLOTS:
+            return ggml_cuda_moe_og_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
             // kv_rows: src[9] here (upstream uses src[5], taken by SJ-KVaRN). Only the generic MMA f16 route reads it:
             // refuse it with TurboQuant/TQ K/V, SJ-KVaRN (src[6]), QSA selected rows (src[8]) and kv-stream K/V buffers.
@@ -19139,6 +19145,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_get_host_weights_buffer_type_dev") == 0) {
         return (void *)ggml_backend_cuda_get_host_weights_buffer_type_dev;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_og_pin") == 0) {   // fork ONEGRAPH (LLAMA_MOE_ONEGRAPH=1 only)
+        return (void *) ggml_backend_cuda_moe_og_pin;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_og_unpin") == 0) {
+        return (void *) ggml_backend_cuda_moe_og_unpin;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;

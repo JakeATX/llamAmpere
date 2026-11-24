@@ -4066,6 +4066,17 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     }
     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
+    // fork (ONEGRAPH, LLAMA_MOE_ONEGRAPH=1): decode lookups read a device copy of the slot maps; a host worker serves
+    // the misses, so no split starts here (nullptr when off or not applicable: the regular lookup below)
+    if (cpu_map == nullptr) {
+        if (ggml_tensor * og = moe_cache->og_slots(ctx0, ids, il, selected_experts->ne[1], selected_experts->ne[0])) {
+            ggml_backend_sched_set_tensor_backend(sched, og, moe_cache->backend(il));
+            cb(og, "ffn_moe_og_slots", il);
+            ggml_build_forward_expand(gf, og);
+            return { ggml_reshape_2d(ctx0, og, selected_experts->ne[0], selected_experts->ne[1]), nullptr };
+        }
+    }
+
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, uploads the missing ones and updates the slot map
     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]

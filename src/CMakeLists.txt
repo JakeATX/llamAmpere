@@ -40,6 +40,7 @@ set(LLAMA_CORE_SOURCES
     llama-moe-cache-policy.cpp
     llama-moe-ramlock.cpp
     llama-moe-prefetch.cpp
+    llama-moe-onegraph.cpp
     llama-ink-stream.cpp
     llama-ink-headloan.cpp
     llama-ink-host.cpp

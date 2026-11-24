@@ -1427,9 +1427,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_OG_SLOTS",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1550,9 +1552,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_og_slots(ids, map, ctrl)",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6105,6 +6109,38 @@ struct ggml_tensor * ggml_lsa_unit_lse(
     result->src[0] = k;
     result->src[1] = q;
     result->src[2] = mask;
+
+    return result;
+}
+
+// ggml_moe_og_slots (fork ONEGRAPH)
+
+struct ggml_tensor * ggml_moe_og_slots(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * map,
+        struct ggml_tensor  * ctrl,
+        void                * ring,
+        int                   row,
+        int                   layer,
+        int                   n_slots,
+        int                   n_used,
+        int                   timeout_ms) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids) && ggml_nelements(ids) <= 64);
+    GGML_ASSERT(map->type == GGML_TYPE_I32 && ggml_is_contiguous(map) && row >= 0 && row < map->ne[1]);
+    GGML_ASSERT(ggml_nbytes(ctrl) >= 64 && ring != NULL && n_slots > 0 && n_used > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ggml_nelements(ids));
+
+    int32_t params[8] = { row, layer, n_slots, n_used, timeout_ms, 0, 0, 0 };
+    const int64_t ring_i = (int64_t) (intptr_t) ring;
+    memcpy(params + 6, &ring_i, sizeof(ring_i));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_MOE_OG_SLOTS;
+    result->src[0] = ids;
+    result->src[1] = map;
+    result->src[2] = ctrl;
 
     return result;
 }
