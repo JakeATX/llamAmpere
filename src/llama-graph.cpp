@@ -10575,7 +10575,7 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
                 const auto & in = inp->inklsa;
                 {
                     static std::atomic<int> n_logged_sj{0};
-                    if (n_logged_sj.fetch_add(1) == 0) {
+                    if (!is_reserve && n_logged_sj.fetch_add(1) == 0) {
                         LLAMA_LOG_WARN("%s: INKLSA-SJ sparse attention active (layer %d: n_kv %lld, T %lld, keep_total %lld, nk_far %lld x B %lld, sinks %lld, window %lld)\n",
                                 __func__, il, (long long) (in.n_blk*in.B), (long long) T, (long long) in.n_keep,
                                 (long long) in.nk_far, (long long) in.B, (long long) in.sinks, (long long) in.window);

@@ -236,11 +236,14 @@ struct llama_hparams {
     // optional per-layer attention mode (llama_attn_mode) and LSA metadata overrides
     bool     has_attn_modes = false;
     std::array<uint8_t, LLAMA_MAX_LAYERS> attn_mode_impl{};
+    std::array<float, LLAMA_MAX_LAYERS>   lsa_far_bias_impl{};
     int32_t  lsa_keep_min  = -1;
     float    lsa_keep_frac = -1.0f;
     int32_t  lsa_keep_max  = -1;
     int32_t  lsa_block     = -1;
     int32_t  lsa_sinks     = -1;
+
+    float lsa_far_bias(uint32_t il) const { return il < LLAMA_MAX_LAYERS ? lsa_far_bias_impl[il] : 0.0f; }
 
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;

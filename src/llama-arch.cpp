@@ -381,6 +381,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_LSA_KEEP_MAX,                 "%s.attention.lsa_keep_max"                 },
     { LLM_KV_ATTENTION_LSA_BLOCK,                    "%s.attention.lsa_block"                    },
     { LLM_KV_ATTENTION_LSA_SINKS,                    "%s.attention.lsa_sinks"                    },
+    { LLM_KV_ATTENTION_LSA_FAR_BIAS,                 "%s.attention.lsa_far_bias"                 },
 
     { LLM_KV_HYPER_CONNECTION_COUNT,                 "%s.hyper_connection.count"                 },
     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,   "%s.hyper_connection.sinkhorn_iterations"   },

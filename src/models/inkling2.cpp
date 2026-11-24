@@ -84,6 +84,20 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
             }
         }
     }
+    {
+        uint32_t n_fb = 0;
+        if (ml.get_arr_n(LLM_KV_ATTENTION_LSA_FAR_BIAS, n_fb, false)) {
+            if (n_fb != hparams.n_layer()) {
+                throw std::runtime_error("inkling2: attention.lsa_far_bias length must equal layer count");
+            }
+            ml.get_arr(LLM_KV_ATTENTION_LSA_FAR_BIAS, hparams.lsa_far_bias_impl);
+            for (uint32_t il = 0; il < n_fb; ++il) {
+                if (!std::isfinite(hparams.lsa_far_bias_impl[il])) {
+                    throw std::runtime_error("inkling2: non-finite attention.lsa_far_bias entry");
+                }
+            }
+        }
+    }
     // runtime diagnostic override for zero-shot probes on unmodified GGUFs (default OFF)
     if (const char * pat = getenv("LLAMA_INK_MIXED_PATTERN"); pat && *pat) {
         const uint32_t block = hparams.attn_res_block_size;
@@ -598,11 +612,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         table = ggml_sub(ctx0, table, sinks_3d);
         table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3)); // [n_head, extent + 1, n_tokens]
 
-        // diagnostic far-distance scalar offset on modified SWA_MID / LSA layers (LLAMA_INK_FAR_BIAS, default 0.0f)
-        static const float far_bias = [] {
+        // per-layer far-distance scalar offset on modified SWA_MID / LSA layers (LLAMA_INK_FAR_BIAS overrides GGUF metadata)
+        static const bool far_bias_env_set = [] { const char * e = getenv("LLAMA_INK_FAR_BIAS"); return e && *e; }();
+        static const float far_bias_env = [] {
             const char * e = getenv("LLAMA_INK_FAR_BIAS");
             return e && *e ? (float) atof(e) : 0.0f;
         }();
+        const float far_bias = far_bias_env_set ? far_bias_env : hparams.lsa_far_bias(il);
         if (far_bias != 0.0f && (hparams.is_swa_mid(il) || hparams.is_lsa_layer(il))) {
             const int64_t E = table->ne[1] - 1;
             ggml_tensor * near_rows = ggml_cont(ctx0, ggml_view_3d(ctx0, table, n_head, E, n_tokens, table->nb[1], table->nb[2], 0));
