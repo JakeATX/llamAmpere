@@ -11,6 +11,8 @@ add_library(${TARGET} STATIC
     server-task.h
     server-prompt-cache-disk.cpp
     server-prompt-cache-disk.h
+    server-numerics-probe.cpp
+    server-numerics-probe.h
     server-eval-cache.cpp
     server-eval-cache.h
     server-queue.cpp
