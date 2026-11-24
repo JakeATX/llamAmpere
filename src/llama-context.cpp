@@ -11355,6 +11355,16 @@ const llama_memory_recurrent * llama_context::capture_mem() const {
     return mem_recr;
 }
 
+bool llama_context::is_gdn_replay() const {
+    const llama_memory_recurrent * mem_recr = capture_mem();
+    if (mem_recr == nullptr) {
+        if (const auto * hyb_iswa = dynamic_cast<const llama_memory_hybrid_iswa *>(memory.get())) {
+            mem_recr = hyb_iswa->get_mem_recr();
+        }
+    }
+    return mem_recr != nullptr && mem_recr->gdn_replay;
+}
+
 int32_t llama_context::capture_arm(llama_seq_id seq_id, const llama_pos * n_tokens, int32_t n) {
     ckpt_caps.clear();
     ckpt_sel   = -1;
@@ -12580,6 +12590,10 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+bool llama_gdn_replay_enabled(const llama_context * ctx) {
+    return ctx != nullptr && ctx->is_gdn_replay();
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {

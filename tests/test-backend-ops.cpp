@@ -16665,6 +16665,36 @@ struct test_flash_attn_ext_causal : public test_flash_attn_ext {
     }
 };
 
+struct test_flash_attn_ext_swa : public test_flash_attn_ext {
+    const int64_t window;
+
+    test_flash_attn_ext_swa(int64_t window, int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                            bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
+                            ggml_type type_K, ggml_type type_V, std::array<int32_t, 4> permute = {0, 1, 2, 3}, bool kv_view = true)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view),
+          window(window) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",swa=" + std::to_string(window);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                continue;
+            }
+            std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+            for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                const int64_t end   = std::min<int64_t>(t->ne[0], std::max<int64_t>(0, t->ne[0] - t->ne[1] + row % t->ne[1] + 1));
+                const int64_t start = std::max<int64_t>(0, end - window);
+                std::fill(data.data() + row*t->ne[0] + start, data.data() + row*t->ne[0] + end, ggml_fp32_to_fp16(0.0f));
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+        }
+    }
+};
+
 struct test_flash_attn_ext_packed : public test_flash_attn_ext {
     test_flash_attn_ext_packed(int mode, int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
                                bool sinks, float logit_softcap, ggml_type type_K, ggml_type type_V,
@@ -23116,7 +23146,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // D128 TQ5_0/TURBO4_0 decode/draft shapes (DSpine ctx_dft: 8 KV heads x GQA 4, widths 1..16, interleaved KV).
-    for (int64_t nb : {1, 2, 4, 8, 16}) {
+    for (int64_t nb : {1, 2, 4, 8, 9, 12, 15, 16}) {
         for (int64_t kv : {1024, 1057}) {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
         }
@@ -23125,12 +23155,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nb : {8, 16}) {
         test_cases.emplace_back(new test_flash_attn_ext_causal(128, 128, 8, {4, 1}, 4096, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
     }
+    test_cases.emplace_back(new test_flash_attn_ext_swa(8192, 128, 128, 8, {4, 1}, 10240, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 2}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 2}, 1024, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 8, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 1024, 8, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 1024, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 1024, 12, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
 
     // [I8QK] prefill shapes (>= 64 queries) for the default-on int8-QK route (fattn-i8qk.cu); GGML_CUDA_FA_I8QK=0 covers the f16 MMA prefill route.

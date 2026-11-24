@@ -1272,6 +1272,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             aw_ema.assign(n_seq, 0.0f);
             LOG_INF("%s: DSpine adaptive width on (LLAMA_DSPINE_ADAPT): %d or %d tokens, widen at EMA >= %.2f tok/round, "
                     "narrow below %.2f, alpha %.3f\n", __func__, lo, this->params.n_max, up, down, a);
+            if (llama_gdn_replay_enabled(ctx_tgt)) {
+                const char * rshort = getenv("LLAMA_GDN_REPLAY_SHORT");
+                if (rshort == nullptr || std::strcmp(rshort, "1") != 0) {
+                    LOG_WRN("%s: LLAMA_DSPINE_ADAPT with lo=%d < n_max=%d and --gdn-replay: set LLAMA_GDN_REPLAY_SHORT=1 to keep static GDN verify graphs on short-tier rounds\n",
+                            __func__, lo, this->params.n_max);
+                }
+            }
         }
 
         if (has_rnn_context) {

@@ -337,3 +337,5 @@ LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * m
 // Returning true stops the decode before that ubatch: its positions are removed from memory, earlier ubatches stay,
 // and llama_decode returns 2. nullptr clears it. Used by the server to stop a long prompt read of a cancelled request.
 LLAMA_API void llama_set_ubatch_abort_callback(struct llama_context * ctx, bool (*cb)(void * user), void * user);
+// true when the context's recurrent or hybrid memory uses GDN ingredient replay (--gdn-replay)
+LLAMA_API bool llama_gdn_replay_enabled(const struct llama_context * ctx);

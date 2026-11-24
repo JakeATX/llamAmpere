@@ -98,6 +98,7 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
+    bool is_gdn_replay() const;
 
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
