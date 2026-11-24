@@ -9,6 +9,7 @@
 #include "vecdotq.cuh"
 #include "q8a16.cuh"
 #include "nk-dense-tc.cuh"
+#include "q8a16moe.cuh"
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include "mmvq-iq4xs-k4.cuh"
 #include "mmvq-iq4xs-wide.cuh"
@@ -3841,7 +3842,9 @@ void ggml_cuda_mul_mat_vec_q(
 
     // INKNVFP4K Q8A16: plain Q8_0 decode products on f32 activations, no q8_1 quantize (GGML_CUDA_Q8A16=0 = off)
     if (src0->type == GGML_TYPE_Q8_0 && !fusion && !convrot &&
-            (ids ? ggml_cuda_q8a16_mul_mat_id(ctx, src0, src1, ids, dst) : ggml_cuda_q8a16_mul_mat(ctx, src0, src1, dst))) {
+            (ids ? (ids->ne[1] == 1 ? ggml_cuda_q8a16_mul_mat_id(ctx, src0, src1, ids, dst)
+                                    : ggml_cuda_q8a16_moe_mul_mat_id(ctx, src0, src1, ids, dst)) // INKNVFP4K T = 2..8, deduped
+                 : ggml_cuda_q8a16_mul_mat(ctx, src0, src1, dst))) {
         return;
     }
 
