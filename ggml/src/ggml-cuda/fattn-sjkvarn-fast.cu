@@ -8,6 +8,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-sjkvarn-rot.cuh"
 #include "mma.cuh"
+#include "ggml-inksj.h" // GGML_INKSJ_DESC_FLAGS, GGML_INKSJ_FAR_END_SHIFT
 
 #include <algorithm>
 #include <atomic>
@@ -176,7 +177,11 @@ static __global__ void flash_attn_ext_sj_kvarn_fast(
     const int s_lo    = sb0 + (int) (((int64_t) nbody *  split     ) / nsplit);
     const int s_hi    = sb0 + (int) (((int64_t) nbody * (split + 1)) / nsplit);
     const int n_ex_sink = kv.S/16;
-    const int n_ex    = n_ex_sink + (n_kv_pad - kv.B)/16; // padded positions are masked (as the stream kernel)
+    // padded positions are masked; so is every ring position at or past the far visible end (INKKV far nodes, as the
+    // stream kernel)
+    const int far_end = sj_kvarn_desc[GGML_INKSJ_DESC_FLAGS] >> GGML_INKSJ_FAR_END_SHIFT; // ggml-inksj.h
+    const int ex_end  = far_end > 0 ? min(n_kv_pad, max(kv.B, 16*((far_end + 15)/16))) : n_kv_pad;
+    const int n_ex    = n_ex_sink + (ex_end - kv.B)/16;
 
     const float * Qf = (const float *) (Q + (size_t) col_query(hcol)*nb01 + (size_t) (head0 + (hvalid ? col_head(hcol) : 0))*nb02);
     const half  * mrow_h = (const half *) (mask + (size_t) col_query(2*(lane & 3))*nb31);
