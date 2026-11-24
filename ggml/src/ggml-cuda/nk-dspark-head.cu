@@ -27,8 +27,9 @@
 
 bool ggml_cuda_nk_dspark_head_enabled() {
     static const bool on = [] {
+        // default ON since the HOME 100K ABBA (-1.36% ms/round, identical output); =0 disables
         const char * e = std::getenv("GGML_CUDA_NK_DSPARK_HEAD");
-        return e != nullptr && std::atoi(e) != 0;
+        return !(e != nullptr && *e && std::atoi(e) == 0);
     }();
     return on;
 }
