@@ -6124,12 +6124,15 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         }();
         // fork (CACHELOAN): while the cache holds the loan, a prompt above the crossover streams (a smaller one runs in
         // chunks of the small reserve through the cache, see below)
-        loan_cross = ink_loan_cross(ink_min);
+        loan_cross = ink_loan && ink_loan_grown ? ink_loan_cross(ink_min) : ink_min;
         const uint32_t stream_min = ink_loan && ink_loan_grown ? loan_cross : ink_min;
         if (ink_loan_chunk_n > 0) {
             // the previous call was a chunked short prompt: its time up to this call is its cost
+            // (an idle gap or other work before this call inflates it: a sample above 3x the mean or 30 s is dropped)
             const double ms = (ggml_time_us() - ink_loan_chunk_t0)/1000.0/ink_loan_chunk_n;
-            ink_loan_chunk_ms = ink_loan_chunk_ms > 0 ? 0.5*(ink_loan_chunk_ms + ms) : ms;
+            if (ms*ink_loan_chunk_n < 30000.0 && (ink_loan_chunk_ms <= 0 || ms < 3.0*ink_loan_chunk_ms)) {
+                ink_loan_chunk_ms = ink_loan_chunk_ms > 0 ? 0.5*(ink_loan_chunk_ms + ms) : ms;
+            }
             ink_loan_chunk_n = 0;
         }
         const bool stream_call = alone && n_tokens > stream_min && phase != LLAMA_DECODE_PHASE_GENERATION;
@@ -6293,7 +6296,8 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
               (b1_cache_device_pending ? b1_pending_publish_enabled() && n_tokens <= pending_rows : b1_cache_device_active)) || // pending: decode() publishes
              (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer && compute_peer->b1_cache_device_active &&
-              !compute_peer->b1_cache_device_pending && compute_peer->sched_reserve_tokens <= decode_rows));
+              !compute_peer->b1_cache_device_pending && compute_peer->sched_reserve_tokens <=
+                    std::max(decode_rows, compute_peer->ink_loan_grown ? compute_peer->ink_loan_rows : 0u)));
     static bool small_logged = false;
     if (!small_logged && decode_rows && small_rows && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
         small_logged = true;
@@ -6361,7 +6365,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         if (alone && (n_tokens <= ink_loan_rows || phase == LLAMA_DECODE_PHASE_GENERATION ||
                     (ink_loan_grown && n_tokens <= loan_cross && phase != LLAMA_DECODE_PHASE_GENERATION))) {
             rows = ink_loan_rows;
-            if (n_tokens > ink_loan_rows) {
+            if (n_tokens > ink_loan_rows && phase != LLAMA_DECODE_PHASE_GENERATION) {
                 ink_loan_chunk_t0 = ggml_time_us();
                 ink_loan_chunk_n  = (n_tokens + ink_loan_rows - 1) / ink_loan_rows;
                 LLAMA_LOG_INFO("%s: [CACHELOAN] %u-token prompt in %u chunks of %u rows through the cache\n", __func__,
@@ -6641,7 +6645,7 @@ uint32_t llama_context::ink_loan_cross(uint32_t ink_min) const {
         return e && e[0] ? strtol(e, nullptr, 10) : -1l;
     }();
     if (fixed >= 0) {
-        return (uint32_t) std::min<long>(fixed, ink_min);
+        return (uint32_t) std::max<long>(ink_loan_rows, std::min<long>(fixed, ink_min));
     }
     if (ink_loan_chunk_ms <= 0 || ink_loan_pass_ms <= 0) {
         return ink_min;
