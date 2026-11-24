@@ -514,6 +514,13 @@ static __global__ void k_ink_rms_norm_mul_multi(const ink_rn_args a, const int n
     }
 }
 
+// [FUSE QKVNORM] (GGML_CUDA_FUSE_QKVNORM=1, default off): also take a contiguous x whose row stride is not ncols: the
+// one-row view of the three-row depth mix that the Q, K and V input norms of a full-attention decode visit read
+static bool ink_rn_x_ok(const ggml_tensor * x, const int64_t ncols) {
+    static const bool strided = getenv("GGML_CUDA_FUSE_QKVNORM") && atoi(getenv("GGML_CUDA_FUSE_QKVNORM")) != 0;
+    return x->nb[1] == ncols*sizeof(float) || (strided && ggml_is_contiguous(x));
+}
+
 bool ggml_cuda_ink_rms_norm_mul_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * x,
         const ggml_tensor * const * gamma, ggml_tensor * const * dst, void * const * q8, const float * eps, int G) {
     if (G < 1 || G > INK_MULTI_MAX) {
@@ -529,7 +536,7 @@ bool ggml_cuda_ink_rms_norm_mul_multi(ggml_backend_cuda_context & ctx, const ggm
     const size_t q8_row = (size_t) ncols_padded/QK8_1;
     ink_rn_args a{};
     for (int k = 0; k < G; ++k) {
-        if (ggml_nrows(x[k]) != nrows || ggml_nrows(dst[k]) != nrows || x[k]->nb[1] != ncols*sizeof(float) ||
+        if (ggml_nrows(x[k]) != nrows || ggml_nrows(dst[k]) != nrows || !ink_rn_x_ok(x[k], ncols) ||
                 dst[k]->nb[1] != ncols*sizeof(float)) {
             return false;
         }
