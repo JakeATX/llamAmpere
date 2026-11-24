@@ -2090,6 +2090,15 @@ private:
         if (split_ovl_window <= 0) {
             return;
         }
+        if (llama_n_rs_seq(ctx_tgt) >= (uint32_t) split_ovl_window) {
+            // recurrent/hybrid memory: the rollback ring needs the verify tail (n_rs_seq rows) in one ubatch, so the
+            // verify cannot be cut into windows inside one decode
+            SRV_WRN("split overlap chain-ahead off: recurrent rollback depth %u >= window %d; draft depth back to %d\n",
+                    llama_n_rs_seq(ctx_tgt), split_ovl_window, split_ovl_depth_off);
+            p.speculative.draft.n_max = split_ovl_depth_off;
+            split_ovl_window = 0;
+            return;
+        }
         if (!llama_split_overlap_init(ctx_tgt)) {
             SRV_WRN("split overlap chain-ahead off: the context refused it; draft depth back to %d\n", split_ovl_depth_off);
             p.speculative.draft.n_max = split_ovl_depth_off;

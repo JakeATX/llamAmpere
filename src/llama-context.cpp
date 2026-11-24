@@ -6954,7 +6954,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     split_ovl.win_pending = false;
     split_ovl.win_ok      = split_ovl.enabled && split_ovl.window > 0 && n_outputs_all > 0 &&
         sampling.samplers.empty() && !b1_ffn_scratch_active && !b1_layer_scratch_active &&
-        (uint32_t) n_tokens_all > split_ovl.window;
+        (uint32_t) n_tokens_all > split_ovl.window &&
+        // a recurrent rollback ring keeps each sequence's last n_rs_seq rows in one ubatch: no window can be smaller
+        split_ovl.window > cparams.n_rs_seq;
     if (split_ovl.win_ok) {
         turn_ubatch = std::min(turn_ubatch, split_ovl.window);
     }

@@ -3836,6 +3836,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (peer_ids) {
             ggml_build_forward_expand(gf, peer_ids);
         }
+        static int n_logged = 0;
+        if (n_logged < 2 && il == moe_peer->first_layer()) {
+            n_logged++;
+            LLAMA_LOG_WARN("%s: [PEERX] layer %d (%lld tokens): the peer computes %s\n", __func__, il, (long long) n_tokens,
+                    peer_misses ? "the cache misses of the CPU share" : "all routed experts");
+        }
         moe_peer_on = true;
         peer_rows = build_experts(cur, selected_experts, peer_ids, false);
         moe_peer_on = false;

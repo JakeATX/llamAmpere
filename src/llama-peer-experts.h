@@ -36,6 +36,9 @@ public:
     // every expert tensor of layer il is on the peer
     bool has_layer(int il) const;
 
+    // the first layer on the peer (for one-time logs)
+    int first_layer() const { return il_first; }
+
     // ubatches with more tokens keep the default path (LLAMA_PEER_EXPERTS_MAX_TOKENS, 0 = no limit)
     int64_t max_tokens() const { return n_tokens_max; }
 
@@ -54,6 +57,7 @@ private:
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     int64_t n_tokens_max = INT64_MAX;
+    int il_first = -1;
 
     void     (*copy_enable)(bool)  = nullptr;
     uint64_t (*copy_failures)()    = nullptr;

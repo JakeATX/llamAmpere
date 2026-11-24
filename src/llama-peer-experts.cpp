@@ -169,6 +169,9 @@ std::unique_ptr<llama_peer_experts> llama_peer_experts::create(const llama_model
             }
         }
         res->main_of_layer[il] = main_of[il];
+        if (res->il_first < 0) {
+            res->il_first = (int) il;
+        }
         n_picked++;
     }
     if (picked.empty()) {
@@ -210,7 +213,8 @@ std::unique_ptr<llama_peer_experts> llama_peer_experts::create(const llama_model
         copy_enable(true);
         res->n_fail_seen = copy_failures();
     }
-    LLAMA_LOG_INFO("%s: [PEERX] %d host expert layers (%zu tensors, %.0f MiB) on %s%s; cross-card copies: %s\n", __func__,
+    // WARN, not INFO: the fit wraps the context creation in a quiet logger, and this opt-in tier must be visible
+    LLAMA_LOG_WARN("%s: [PEERX] %d host expert layers (%zu tensors, %.0f MiB) on %s%s; cross-card copies: %s\n", __func__,
             n_picked, picked.size(), total / 1048576.0, ggml_backend_dev_name(peer_dev),
             mode == 2 ? " (test mode)" : "", hook ? "mailbox" : "driver");
     return res;
