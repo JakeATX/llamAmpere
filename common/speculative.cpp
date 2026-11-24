@@ -5675,15 +5675,47 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 
     static thread_local spec_batch_view view;
     const llama_batch b = view.render(batch);
-    for (int32_t i = 0; i < b.n_tokens && !spec->muted.empty(); ++i) {
+
+    // Rows of a muted sequence (a request with images on an M-RoPE target) never reach the drafter.
+    const auto is_muted = [&](int32_t i) {
         const llama_seq_id s = b.seq_id[i][0];
-        if (s >= 0 && (size_t) s < spec->muted.size() && spec->muted[s]) {
-            b.seq_id[i][0] = -1; // process() skips rows of seq < 0
-        }
+        return s >= 0 && (size_t) s < spec->muted.size() && spec->muted[s] != 0;
+    };
+    int32_t n_muted = 0;
+    for (int32_t i = 0; i < b.n_tokens && !spec->muted.empty(); ++i) {
+        n_muted += is_muted(i) ? 1 : 0;
     }
 
-    for (auto & impl : spec->impls) {
-        result = result && impl->process(b);
+    if (n_muted == 0) {
+        for (auto & impl : spec->impls) {
+            result = result && impl->process(b);
+        }
+        return result;
+    }
+    if (n_muted == b.n_tokens || b.token == nullptr || !common_speculative_supports_process_range(spec)) {
+        return true;
+    }
+
+    // Mixed batch: hand the drafter each run of unmuted rows at its own output offset.
+    for (int32_t i = 0; i < b.n_tokens && result;) {
+        const bool m = is_muted(i);
+        int32_t    j = i;
+        while (j < b.n_tokens && is_muted(j) == m) {
+            ++j;
+        }
+        if (!m) {
+            llama_batch r = b;
+            r.n_tokens = j - i;
+            r.token += i;
+            r.pos += i;
+            r.n_seq_id += i;
+            r.seq_id += i;
+            r.logits += i;
+            for (auto & impl : spec->impls) {
+                result = result && impl->process_range(r, i);
+            }
+        }
+        i = j;
     }
 
     return result;
