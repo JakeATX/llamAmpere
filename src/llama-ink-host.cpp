@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -123,6 +124,52 @@ struct ink_host_state {
     }
 };
 
+// fork (PINHOST): LLAMA_PINHOST = 0 (off), 1 (on), auto (on when free RAM covers the page-locked copy + headroom).
+// Unset = off (a card preset may set it). LLAMA_INK_HOST_ARENA / LLAMA_INK_HOST_PIN, when set, win over it.
+int pinhost_mode() {
+    const char * v = getenv("LLAMA_PINHOST");
+    if (v == nullptr || *v == '\0') {
+        return 0;
+    }
+    if (strcmp(v, "auto") == 0) {
+        return 2;
+    }
+    return atoi(v) != 0 ? 1 : 0;
+}
+
+#ifdef __linux__
+// kB value of a /proc/meminfo field, -1 if absent
+long long pinhost_meminfo_kb(const char * key) {
+    std::ifstream f("/proc/meminfo");
+    std::string k;
+    long long v = -1;
+    std::string unit;
+    while (f >> k >> v) {
+        std::getline(f, unit);
+        if (k == key) {
+            return v;
+        }
+    }
+    return -1;
+}
+
+// whether ptr sits in a file mapping (an mmap'd model) rather than anonymous memory (--load-mode none), /proc/self/maps
+bool pinhost_file_backed(const void * ptr) {
+    std::ifstream f("/proc/self/maps");
+    std::string line;
+    const uintptr_t a = (uintptr_t) ptr;
+    while (std::getline(f, line)) {
+        unsigned long lo = 0, hi = 0, inode = 0;
+        char perms[8] = {}, dev[16] = {};
+        unsigned long long off = 0;
+        if (sscanf(line.c_str(), "%lx-%lx %7s %llx %15s %lu", &lo, &hi, perms, &off, dev, &inode) == 6 && a >= lo && a < hi) {
+            return inode != 0;
+        }
+    }
+    return false;
+}
+#endif
+
 void ink_host_add_pinned(uintptr_t lo, uintptr_t hi) {
     auto & r = registry();
     std::lock_guard<std::mutex> lk(r.mtx);
@@ -151,9 +198,11 @@ size_t llama_ink_host_layer_span(const void * ptr, ggml_backend_buffer_type_t bu
 }
 
 void llama_ink_host_prepare(const llama_model & model, ggml_backend_buffer_type_t buft_dev) {
-    const bool want_arena = ink_host_env("LLAMA_INK_HOST_ARENA", 0) != 0;
-    const bool want_pin   = ink_host_env("LLAMA_INK_HOST_PIN", 0) != 0;
-    if ((!want_arena && !want_pin) || model.ink_host || model.hparams.n_expert == 0) {
+    bool want_arena = ink_host_env("LLAMA_INK_HOST_ARENA", 0) != 0;
+    bool want_pin   = ink_host_env("LLAMA_INK_HOST_PIN", 0) != 0;
+    const bool explicit_flags = getenv("LLAMA_INK_HOST_ARENA") || getenv("LLAMA_INK_HOST_PIN");
+    const int pinhost = explicit_flags ? 0 : pinhost_mode();
+    if ((!want_arena && !want_pin && pinhost == 0) || model.ink_host || model.hparams.n_expert == 0) {
         return;
     }
 
@@ -169,6 +218,49 @@ void llama_ink_host_prepare(const llama_model & model, ggml_backend_buffer_type_
     }
     if (layers.empty()) {
         return;
+    }
+    if (pinhost != 0) {
+        // fork (PINHOST): page-lock the host experts so MoE cache misses and prompt streaming upload them by DMA instead
+        // of the driver's staged pageable copies. An mmap'd model (file pages, which the driver will not register read
+        // only) is first copied into an anonymous arena (LLAMA_INK_HOST_ARENA path), so mmap loading stays; anonymous
+        // experts (--load-mode none) are pinned in place. auto: only when MemAvailable covers the pinned bytes plus a
+        // headroom of max(4 GiB, 10% of RAM) (LLAMA_PINHOST_HEADROOM_MIB); LLAMA_PINHOST=0 is the kill switch.
+        size_t bytes = 0;
+        for (const auto & experts : layers) {
+            for (const ggml_tensor * t : experts) {
+                bytes += ggml_nbytes(t);
+            }
+        }
+        const char * why = nullptr;
+        bool file_backed = false;
+#ifdef __linux__
+        file_backed = pinhost_file_backed(layers.front().front()->data);
+        const long long avail_kb = pinhost_meminfo_kb("MemAvailable:");
+        const long long total_kb = pinhost_meminfo_kb("MemTotal:");
+        const char * hr = getenv("LLAMA_PINHOST_HEADROOM_MIB");
+        const double headroom = hr && *hr ? std::max(0.0, atof(hr)) * 1048576.0 :
+                std::max(4.0 * 1073741824.0, total_kb > 0 ? total_kb * 1024.0 * 0.10 : 0.0);
+        const double avail = avail_kb > 0 ? avail_kb * 1024.0 : 0.0;
+        if (pinhost == 2 && avail < (double) bytes + headroom) {
+            why = "not enough free RAM";
+        }
+        LLAMA_LOG_WARN("%s: [PINHOST] %s: %.2f GiB of host experts (%s), MemAvailable %.1f GiB, need %.1f GiB "
+                "(+%.1f GiB headroom); LLAMA_PINHOST=0 turns it off\n", __func__, why ? "off" : "on", bytes/1073741824.0,
+                file_backed ? "file pages -> anonymous arena" : "anonymous, pinned in place", avail/1073741824.0,
+                ((double) bytes + headroom)/1073741824.0, headroom/1073741824.0);
+#else
+        // no RAM probe and no arena off Linux: auto stays off, LLAMA_PINHOST=1 pins the experts in place (read only)
+        if (pinhost == 2) {
+            why = "auto needs Linux";
+        }
+        LLAMA_LOG_WARN("%s: [PINHOST] %s: %.2f GiB of host experts%s; LLAMA_PINHOST=0 turns it off\n", __func__,
+                why ? "off" : "on (in place)", bytes/1073741824.0, why ? " (auto needs Linux; LLAMA_PINHOST=1 forces)" : "");
+#endif
+        if (why != nullptr) {
+            return;
+        }
+        want_pin   = true;
+        want_arena = file_backed;
     }
     auto state = std::make_shared<ink_host_state>();
     model.ink_host = state;
