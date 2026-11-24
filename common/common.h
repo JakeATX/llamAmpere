@@ -412,6 +412,8 @@ struct common_params_speculative_draft {
     // MTP drafter attention window (default off)
     int32_t attn_window = 0;     // > 0: the MTP drafter attends only to its last attn_window positions (+ sinks)
     int32_t attn_sink   = -1;    // sink positions kept with attn_window (-1 = default 128)
+    int32_t dspark_window      = 0;  // fork (DSPARKWIN): > 0: the DSpark drafter's full-attention layers keep a ring of the last N positions (+ sinks)
+    int32_t dspark_window_sink = -1; // sink positions kept with dspark_window (-1 = default 128)
 
 };
 
@@ -1296,6 +1298,10 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
 // apply the MTP drafter attention-window options (--spec-draft-window, --spec-draft-window-sink)
 // to the llama_context_params of an MTP draft context; no-op when they are off
 void common_speculative_mtp_cparams(const common_params & params, llama_context_params & cparams);
+
+// fork (DSPARKWIN): apply --spec-dspark-window / --spec-dspark-window-sink to the llama_context_params of a DSpark
+// draft context (the ring replaces the drafter's full-context full-attention KV); no-op when off
+void common_speculative_dspark_cparams(const common_params & params, llama_context_params & cparams);
 
 struct common_threadpools {
     common_threadpools() = default;

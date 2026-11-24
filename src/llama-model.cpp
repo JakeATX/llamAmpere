@@ -4175,7 +4175,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     // fork (INKKV): the Inkling DSpark drafter keeps its full-attention layer on the
                                     // trunk's SJ-KVaRN 4/4 (pair-packed heads, common_base_params_to_speculative)
                                     (arch == LLM_ARCH_DFLASH && hparams.dspark_markov_rank > 0) ?
-                                            params.sj_kvarn : llama_sj_kvarn_config());
+                                            params.sj_kvarn : llama_sj_kvarn_config(),
+                                    // fork (DSPARKWIN): --spec-dspark-window makes the Inkling DSpark drafter's
+                                    // full-attention layer a ring (common_speculative_dspark_cparams); 0 = full context
+                                    (arch == LLM_ARCH_DFLASH && hparams.dspark_markov_rank > 0) ? cparams.draft_attn_window : 0,
+                                    (arch == LLM_ARCH_DFLASH && hparams.dspark_markov_rank > 0) ? cparams.draft_attn_sink : 0);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());

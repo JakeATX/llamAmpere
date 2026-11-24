@@ -36,7 +36,9 @@ public:
                           size_t kv_stream_stage_bytes = 0,
                           void * kv_stream_phase_arena = nullptr,
                           size_t kv_stream_maximum_pool_bytes = 0,
-                   llama_sj_kvarn_config sj_kvarn = llama_sj_kvarn_config()); // fork (INKKV): see below
+                   llama_sj_kvarn_config sj_kvarn = llama_sj_kvarn_config(), // fork (INKKV): see below
+                          uint32_t base_window = 0,  // fork (DSPARKWIN): see below
+                          uint32_t base_sink   = 0);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -59,7 +61,11 @@ public:
                           void * kv_stream_phase_arena = nullptr,
                           size_t kv_stream_maximum_pool_bytes = 0,
         // fork (INKKV): SJ-KVaRN on the non-SWA (full-attention) half only; the SWA half keeps a plain cache
-                   llama_sj_kvarn_config sj_kvarn = llama_sj_kvarn_config());
+                   llama_sj_kvarn_config sj_kvarn = llama_sj_kvarn_config(),
+        // fork (DSPARKWIN): base_window > 0 makes the non-SWA half a sliding-window ring of the last base_window
+        // positions plus base_sink sink positions (the DSpark drafter's --spec-dspark-window); needs a plain cache
+                          uint32_t base_window = 0,
+                          uint32_t base_sink   = 0);
 
     ~llama_kv_cache_iswa() = default;
 

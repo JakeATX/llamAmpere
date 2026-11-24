@@ -5591,6 +5591,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-dspark-window"}, "N",
+        "[EXPERIMENTAL] DSpark drafter attention window: its full-attention layers attend only to the last N positions "
+        "plus --spec-dspark-window-sink sink positions, and their KV cache becomes a ring of that size instead of the "
+        "full context (default: 0 = full attention). Needs the plain draft cache (not --spec-draft-sjkvarn)",
+        [](common_params & params, int value) {
+            params.speculative.draft.dspark_window = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DSPARK_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-dspark-window-sink"}, "N",
+        "[EXPERIMENTAL] sink positions (the first N) kept with --spec-dspark-window (default: 128)",
+        [](common_params & params, int value) {
+            params.speculative.draft.dspark_window_sink = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DSPARK_WINDOW_SINK"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",

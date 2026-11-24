@@ -1030,6 +1030,33 @@ static void test(void) {
         common_speculative_mtp_cparams(spec_defaults, cp);
         assert(cp.draft_attn_window == 0 && cp.draft_attn_sink == 0);
     }
+    // DSPARKWIN: the DSpark drafter window is off by default, separate from the MTP window, and its helper only
+    // writes the draft context params when it is set
+    assert(spec_defaults.speculative.draft.dspark_window == 0);
+    assert(spec_defaults.speculative.draft.dspark_window_sink == -1);
+    {
+        llama_context_params cp = llama_context_default_params();
+        common_speculative_dspark_cparams(spec_defaults, cp);
+        assert(cp.draft_attn_window == 0 && cp.draft_attn_sink == 0);
+    }
+    for (const auto & ex : {LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}) {
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-dspark-window", "8192"};
+        common_params dw;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dw, ex));
+        assert(dw.speculative.draft.dspark_window == 8192 && dw.speculative.draft.attn_window == 0);
+        llama_context_params cp = llama_context_default_params();
+        common_speculative_mtp_cparams(dw, cp);
+        assert(cp.draft_attn_window == 0); // the MTP helper ignores the DSpark window
+        common_speculative_dspark_cparams(dw, cp);
+        assert(cp.draft_attn_window == 8192 && cp.draft_attn_sink == 128);
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--spec-dspark-window", "4096", "--spec-dspark-window-sink", "0"};
+        common_params dws;
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dws, ex));
+        cp = llama_context_default_params();
+        common_speculative_dspark_cparams(dws, cp);
+        assert(cp.draft_attn_window == 4096 && cp.draft_attn_sink == 0);
+    }
     for (const auto & ex : {LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}) {
         argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-window", "8192"};
         common_params window_params;
