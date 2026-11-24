@@ -3078,8 +3078,8 @@ std::vector<ggml_backend_buffer_ptr> llama_kv_cache::b1_scratch_views(
     // the same padded frontier as get_n_kv(), not only the occupied cells.
     const uint32_t used_end = v_cells[0].used_max_p1();
     const uint32_t cell_pad = nk_kv_pad_for(used_end, /*n_tps=*/ 1u);
-    const uint32_t occupied_end = std::min(v_cells[0].size(),
-            std::max(cell_pad, GGML_PAD(used_end, cell_pad)));
+    const uint32_t padded_end = (uint32_t) ((((uint64_t) used_end + cell_pad - 1u) / cell_pad) * cell_pad);
+    const uint32_t occupied_end = std::min(v_cells[0].size(), std::max(cell_pad, padded_end));
     const uint32_t protected_cells = std::max(prompt_cells, occupied_end);
     struct span { ggml_backend_buffer_t parent; size_t offset; size_t size; };
     std::vector<span> spans;
@@ -3374,6 +3374,10 @@ uint32_t llama_kv_cache::nk_kv_pad_for(uint32_t used_max_p1, uint32_t n_tps) con
     return step;
 }
 
+static inline uint32_t nk_pad_up(uint32_t x, uint32_t n) {
+    return (uint32_t) ((((uint64_t) x + n - 1u) / n) * n);
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -3390,7 +3394,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         max_pad = std::max(max_pad, n_pad);
         max_used = std::max(max_used, used_end);
 
-        result = std::max(std::min(cells.size(), std::max(n_pad, GGML_PAD(used_end, n_pad))), result);
+        result = std::max(std::min(cells.size(), std::max(n_pad, nk_pad_up(used_end, n_pad))), result);
     }
 
     if (max_pad > 256u) {
@@ -3398,13 +3402,12 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
             const char * e = getenv("GGML_CUDA_NK_TRACE");
             return e != nullptr && atoi(e) != 0;
         }();
-        if (trace) {
-            static std::atomic<uint32_t> last_n_kv{0};
-            static std::atomic<int> trace_n{0};
-            const uint32_t prev = last_n_kv.exchange(result, std::memory_order_relaxed);
-            if (prev != result && trace_n.fetch_add(1, std::memory_order_relaxed) < 32) {
-                LLAMA_LOG_INFO("[NK_KV_PAD] n_kv=%u (used=%u pad=%u n_tps=%u sj=%d)\n",
-                        result, max_used, max_pad, n_tps, sj_kvarn.enabled() ? 1 : 0);
+        if (trace && nk_kv_pad_last_n_kv != result) {
+            nk_kv_pad_last_n_kv = result;
+            if (nk_kv_pad_trace_n < 32) {
+                ++nk_kv_pad_trace_n;
+                LLAMA_LOG_INFO("[NK_KV_PAD] cache=%p n_kv=%u (used=%u pad=%u n_tps=%u sj=%d)\n",
+                        (const void *) this, result, max_used, max_pad, n_tps, sj_kvarn.enabled() ? 1 : 0);
             }
         }
     }
@@ -4017,7 +4020,7 @@ uint32_t llama_kv_cache::get_sj_kvarn_n_kv_stream(uint32_t strm, uint32_t n_tps)
     const auto & cells = v_cells[strm];
     const uint32_t used_end = cells.used_max_p1();
     const uint32_t n_pad_cur = nk_kv_pad_for(used_end, n_tps);
-    return std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(used_end, n_pad_cur)));
+    return std::min(cells.size(), std::max(n_pad_cur, nk_pad_up(used_end, n_pad_cur)));
 }
 
 void llama_kv_cache::sj_kvarn_release_groups(uint32_t strm, uint32_t g0) {

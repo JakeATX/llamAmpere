@@ -24167,12 +24167,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         add_inkattn_cases(test_cases, true);
         return test_cases;
     }
-    if (getenv("GGML_TEST_INK_NVFP4_MOE") != nullptr) {
-        add_ink_nvfp4_moe_cases(test_cases, true);
-        return test_cases;
-    }
-    if (getenv("GGML_TEST_INK_Q8_0_MOE") != nullptr) {
-        add_ink_q8_0_moe_cases(test_cases, true);
+    const bool test_nvfp4_moe = getenv("GGML_TEST_INK_NVFP4_MOE") != nullptr;
+    const bool test_q8_0_moe  = getenv("GGML_TEST_INK_Q8_0_MOE")  != nullptr;
+    if (test_nvfp4_moe || test_q8_0_moe) {
+        if (test_nvfp4_moe) {
+            add_ink_nvfp4_moe_cases(test_cases, true);
+        }
+        if (test_q8_0_moe) {
+            add_ink_q8_0_moe_cases(test_cases, true);
+        }
         return test_cases;
     }
     // [SEAL08] one layer of the 24dense adaptive-tail flush (32 groups x 4 KV heads, tq6_0 ring): GGML_TEST_SEAL_PERF=1

@@ -473,6 +473,8 @@ private:
 
     // NEONKERN: LLAMA_NK_KV_PAD decode padding step helper (returns 256 when unset or ineligible)
     uint32_t nk_kv_pad_for(uint32_t used_max_p1, uint32_t n_tps) const;
+    mutable uint32_t nk_kv_pad_last_n_kv = 0;
+    mutable int      nk_kv_pad_trace_n   = 0;
 
     // SJ-KVaRN state (see is_sj_kvarn()). Positions: [0, sink) exact rows 0..sink-1; [sink, B) sealed records
     // (sink..B in groups of `group`); [B, N) exact ring rows sink + (p - sink) % cap. Cells stay one per
