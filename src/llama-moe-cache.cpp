@@ -2125,6 +2125,18 @@ struct llama_moe_cache::impl {
             ggml_backend_buffer_clear(buf, 0);
             ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
+        if (up) {
+            // the clear above is a memset on the legacy default stream, which the uploader's non-blocking copy stream
+            // does not wait for: finish it first (a read on the per-thread stream orders after it), or it can zero
+            // experts already uploaded. The synchronous copies below are ordered after it anyway.
+            for (device & d : devices) {
+                ggml_tensor * t = d.buf && d.ctx ? ggml_get_first_tensor(d.ctx.get()) : nullptr;
+                if (t && ggml_nbytes(t) > 0) {
+                    uint8_t b;
+                    ggml_backend_tensor_get(t, &b, 0, 1);
+                }
+            }
+        }
         // the experts the slots held, consecutive slots of consecutive experts of one layer in one upload; with an
         // uploader (REFILLPIPE) the runs go to it as one list, else (or when it declines) one synchronous copy each
         std::vector<llama_moe_cache::copy_op> ops;

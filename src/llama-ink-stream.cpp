@@ -425,6 +425,14 @@ bool llama_ink_stream::arm() {
         free_slots();
         return false;
     }
+    // the clear is a memset on the legacy default stream, which the non-blocking copy and compute streams do not wait
+    // for: a read on the per-thread stream orders after it and returns once it is done. Port: LLAMA_INK_STREAM_CLEAR_SYNC=1
+    // on, 0 off; unset follows LLAMA_INK_B1 (part of the gated layer-major config), so with INKB1 off arm() is the cand base's
+    static const bool clear_sync = ink_stream_env("LLAMA_INK_STREAM_CLEAR_SYNC", ink_stream_env("LLAMA_INK_B1", 0) != 0 ? 1 : 0) != 0;
+    if (clear_sync) {
+        uint8_t b;
+        ggml_backend_tensor_get(raw[0], &b, 0, 1);
+    }
     ggml_backend_synchronize(backend_gpu); // the cleared slots are visible to both streams
     std::fill(issued.begin(), issued.end(), -1);
     is_armed = true;
@@ -651,6 +659,39 @@ bool llama_ink_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggm
         }
         st.t_wait_us += ggml_time_us() - t0;
         ggml_backend_event_wait(backend, ev_ready[v.slot]); // the compute stream waits for the slot
+        // debug (LLAMA_INK_STREAM_VERIFY=1, slow): the slot holds this visit's host experts and zero tails
+        static const bool verify = ink_stream_env("LLAMA_INK_STREAM_VERIFY", 0) != 0;
+        if (verify) {
+            static int n_bad = 0;
+            static size_t n_ok = 0;
+            ggml_backend_event_synchronize(ev_ready[v.slot]);
+            std::vector<uint8_t> tmp;
+            for (size_t i = 0; i < v.host.size(); ++i) {
+                const size_t nb = ggml_nbytes(v.host[i]);
+                tmp.resize(nb + v.tails[i]);
+                ggml_backend_tensor_get(raw[v.slot], tmp.data(), v.offs[i], nb + v.tails[i]);
+                const uint8_t * h = (const uint8_t *) v.host[i]->data;
+                size_t bad = SIZE_MAX;
+                for (size_t o = 0; o < nb && bad == SIZE_MAX; o += 4096) {
+                    if (memcmp(tmp.data() + o, h + o, std::min<size_t>(4096, nb - o)) != 0) {
+                        bad = o;
+                    }
+                }
+                for (size_t o = nb; o < nb + v.tails[i] && bad == SIZE_MAX; ++o) {
+                    if (tmp[o] != 0) {
+                        bad = o;
+                    }
+                }
+                if (bad != SIZE_MAX) {
+                    if (n_bad++ < 40) {
+                        LLAMA_LOG_WARN("%s: [INKSTREAM] VERIFY mismatch: visit %d (pos %d, slot %d, issued %d, req %d) tensor %zu (%s) at %zu of %zu+%zu\n",
+                                __func__, il, v.pos, v.slot, issued[v.slot], req_slot, i, v.host[i]->name, bad, nb, v.tails[i]);
+                    }
+                } else if (++n_ok % 500 == 0) {
+                    LLAMA_LOG_WARN("%s: [INKSTREAM] VERIFY ok %zu checks, %d mismatches\n", __func__, n_ok, n_bad);
+                }
+            }
+        }
         // the next visit that needs an upload goes in while this one computes (wrapping into the next ubatch): a streamed
         // one into the other slot, or a resident layer not on the card yet; resident layers already there are skipped
         for (size_t k = 1; k < order.size(); ++k) {
