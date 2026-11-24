@@ -409,6 +409,16 @@ static bool parse_bool_value(const std::string & value) {
     throw std::invalid_argument("the argument has been removed. " + msg);
 }
 
+// fork: a card preset that cannot find its drafter runs at roughly 60% of its decode speed; say so loudly
+static void common_card_drafter_missing_warning(const std::string & preset, const std::string & looked, const std::string & name) {
+    LOG_WRN("\n");
+    LOG_WRN("card preset %s: NO DRAFTER FOUND - speculative decoding is OFF, decode will be much slower\n", preset.c_str());
+    LOG_WRN("  looked for: %s\n", looked.c_str());
+    LOG_WRN("  fix: put %s beside the model (it is in the model's Hugging Face repo),\n", name.c_str());
+    LOG_WRN("       or pass -md /path/to/%s\n", name.c_str());
+    LOG_WRN("\n");
+}
+
 //
 // common_models_handler
 //
@@ -849,6 +859,15 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     }
 
+    // fork: a card preset's -hf drafter that the repo does not have (or could not be fetched): no drafter, loudly
+    if (!params.card_preset.empty() && !params.speculative.draft.mparams.hf_repo.empty() &&
+            params.speculative.draft.mparams.path.empty() && !params.speculative.draft.mparams.hf_file.empty()) {
+        common_card_drafter_missing_warning(params.card_preset, params.speculative.draft.mparams.hf_repo + "/" +
+            params.speculative.draft.mparams.hf_file, params.speculative.draft.mparams.hf_file);
+        params.speculative.draft.mparams = {};
+        params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+    }
+
     common_ink_kv44_default(params);
 }
 
@@ -1164,27 +1183,37 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             }
         }
         if (params.speculative.draft.mparams.path.compare(0, 7, "@model/") == 0) {
-            const std::string file = params.model.path.empty() ? std::string() :
-                (std::filesystem::path(params.model.path).parent_path() / params.speculative.draft.mparams.path.substr(7)).string();
+            // fork: the published drafter name first, then the older local name of the same file
+            const std::string name = params.speculative.draft.mparams.path.substr(7);
+            std::vector<std::string> names = { name };
+            if (name == "Inkling-2-Mini-ATX-Drafter-Q8_0.gguf") {
+                names.push_back("Inkling-2-Mini-DSpark-Q8_0-fold.gguf");
+            }
+            std::string file;
             std::error_code ec;
+            for (const auto & n : names) {
+                const auto f = params.model.path.empty() ? std::string() : (std::filesystem::path(params.model.path).parent_path() / n).string();
+                if (!f.empty() && std::filesystem::is_regular_file(f, ec)) {
+                    file = f;
+                    break;
+                }
+            }
             if (spec_off) {
                 params.speculative.draft.mparams.path.clear(); // --spec-type none: no drafter, no drafter reserve
                 params.speculative.draft.mparams.hf_file.clear();
-            } else if (file.empty()) {
-                LOG_WRN("card preset %s: model given without a local path (-hf/-mu), drafter not resolved, speculative "
-                        "decoding off; pass --model-draft <file> to use it\n", params.card_preset.c_str());
+            } else if (params.model.path.empty() && !params.model.hf_repo.empty()) {
+                // -hf: fetch the drafter from the model's repo; a repo without it ends in the warning after the download
                 params.speculative.draft.mparams.path.clear();
-                params.speculative.draft.mparams.hf_file.clear();
-                if (!explicit_or_env("--spec-type")) {
-                    params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
-                }
-            } else if (std::filesystem::is_regular_file(file, ec)) {
+                params.speculative.draft.mparams.hf_repo = params.model.hf_repo;
+                params.speculative.draft.mparams.hf_file = name;
+                LOG_INF("card preset %s: drafter %s from %s\n", params.card_preset.c_str(), name.c_str(), params.model.hf_repo.c_str());
+            } else if (!file.empty()) {
                 params.speculative.draft.mparams.path    = file;
                 params.speculative.draft.mparams.hf_file = file;
                 LOG_INF("card preset %s: drafter %s\n", params.card_preset.c_str(), file.c_str());
             } else {
-                LOG_WRN("card preset %s: drafter %s not found beside the model, speculative decoding off "
-                        "(download it with the release or pass --model-draft)\n", params.card_preset.c_str(), file.c_str());
+                common_card_drafter_missing_warning(params.card_preset, params.model.path.empty() ? std::string("(no local model path)") :
+                    (std::filesystem::path(params.model.path).parent_path() / name).string(), name);
                 params.speculative.draft.mparams.path.clear();
                 params.speculative.draft.mparams.hf_file.clear();
                 if (!explicit_or_env("--spec-type")) {
@@ -5954,8 +5983,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--preset"}, "24dense|12dense|10dense|8dense|24ink|12ink|10ink|8ink",
         "card profile: *dense = 27B dense, *ink = Inkling 2 Mini (8/10/12ink: experts in RAM, auto-sized VRAM expert cache, "
-        "4/4 KV, drafter off unless --card-drafter on; 24ink: whole model on the GPU, 262K, DSpark drafter if "
-        "Inkling-2-Mini-DSpark-Q8_0-fold.gguf is beside the model); append headless or "
+        "4/4 KV, drafter off unless --card-drafter on; 24ink: whole model on the GPU, 262K, DSpark drafter "
+        "Inkling-2-Mini-ATX-Drafter-Q8_0.gguf from beside the model, or from the -hf repo); append headless or "
         "-headless for a 500 MiB margin (default: 1024; 8dense: always 500); explicit flags override",
         [](common_params & params, const std::string & value) {
             params.card_preset = common_card_preset_get(value).name;
