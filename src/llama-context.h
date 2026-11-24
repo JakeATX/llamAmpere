@@ -687,8 +687,10 @@ private:
     // fork (INKSTREAM): prompt expert streamer (see llama-ink-stream.h). take: suspend the MoE cache and arm the
     // streamer for a prompt call; release: disarm, shrink the prompt scratch and refill the cache (before decode).
     std::unique_ptr<llama_ink_stream> ink_stream;
-    std::unique_ptr<llama_ink_headloan> ink_headloan;
-    uint32_t ink_head_retry = 0; // [HEADLOAN] rate limit of the upload retry after a failed restore // [HEADLOAN] (#247) LLAMA_INK_HEAD_LOAN=1
+    std::unique_ptr<llama_ink_headloan> ink_headloan; // [HEADLOAN] (#247) LLAMA_INK_HEAD_LOAN=1
+    uint32_t ink_head_retry = 0; // [HEADLOAN] rate limit of the upload retry after a failed restore
+    uint32_t ink_rung_changes = 0, ink_rung_hold = 0; // [RUNG] ceiling changes this prompt; checks a lowered ceiling holds
+    double   ink_rung_hold_free = 0.0;                // [RUNG] free VRAM when the ceiling was lowered
     bool     ink_stream_take();
     bool     ink_stream_release(const char * why);
     uint64_t ink_stream_tokens = 0;  // prompt tokens streamed since the last take

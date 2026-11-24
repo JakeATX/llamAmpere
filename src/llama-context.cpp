@@ -6206,6 +6206,21 @@ static bool swa_full_rows_enabled(llm_arch arch) {
     return arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP;
 }
 
+// [RUNG] LLAMA_INK_STREAM_RUNG=N or HI:LO (multiples of 128, 128..2048; anything else = off) and LLAMA_INK_STREAM_HOLD
+// (checks, default 8, 0 = off). which: 0 = HI (0: rung off), 1 = LO (HI when no valid LO), 2 = hold
+static uint32_t ink_rung_env(int which) {
+    static const std::array<uint32_t, 3> v = [] {
+        auto ok = [](long x) { return x >= 128 && x <= 2048 && x % 128 == 0; };
+        const char * e = getenv("LLAMA_INK_STREAM_RUNG"); const char * c = e ? strchr(e, ':') : nullptr;
+        const long hi = e && e[0] ? strtol(e, nullptr, 10) : 0, lo = c ? strtol(c + 1, nullptr, 10) : 0;
+        const char * h = getenv("LLAMA_INK_STREAM_HOLD"); char * end = nullptr;
+        const long hold = h && h[0] ? strtol(h, &end, 10) : -1;
+        const uint32_t H = ok(hi) ? (uint32_t) hi : 0u;
+        return std::array<uint32_t, 3>{ H, H && ok(lo) ? (uint32_t) lo : H, hold >= 0 && end && *end == 0 ? (uint32_t) hold : 8u };
+    }();
+    return v[which];
+}
+
 bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch,
         enum llama_decode_phase phase) {
     const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
@@ -6636,16 +6651,19 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 const uint32_t allocated = std::max(1u, sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch);
                 uint32_t pick = 512;
                 double log_free = 0.0, log_need = 0.0; // the smallest ceiling above 512 that was tried
-                // [HEADLOAN] LLAMA_INK_STREAM_RUNG=N (a multiple of 256, 256..2048; unset/0 = halving): the ceilings
-                // step down by N rows instead of halving, so a card whose free VRAM sits between two powers of two
-                // (8 GB with the head lent: 1,536) streams fewer bytes per prompt token
-                static const uint32_t rung = [] {
-                    const char * e = getenv("LLAMA_INK_STREAM_RUNG");
-                    const long v = e && e[0] ? strtol(e, nullptr, 10) : 0;
-                    return v >= 256 && v <= 2048 && v % 256 == 0 ? (uint32_t) v : 0u;
-                }();
-                for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r = rung ? (r > 512 + rung ? r - rung : 512) : r / 2) {
-                    bool fits = true;
+                // [RUNG] LLAMA_INK_STREAM_RUNG=N or HI:LO (multiples of 128, 128..2048; unset/0 = halving): the ceilings
+                // step down by N rows (HI above 1024 rows, LO at or below), so a card whose free VRAM sits between two
+                // powers of two (8 GB with the head lent: 1,536) streams fewer bytes per prompt token. Hysteresis
+                // (LLAMA_INK_STREAM_HOLD=N checks, default 8, 0 = off): a rise needs one more step of bytes spare; a
+                // lowered ceiling holds N checks or until free VRAM rises by more than one step.
+                const uint32_t rung_hi = ink_rung_env(0), rung_lo = ink_rung_env(1), rung_hold = ink_rung_env(2);
+                auto step_of = [&](uint32_t r) { return r > 1024 ? rung_hi : rung_lo; };
+                auto next_of = [&](uint32_t r) { return r > 1024 ? (r > 1024 + rung_hi ? r - rung_hi : 1024u) : (r > 512 + rung_lo ? r - rung_lo : 512u); };
+                const uint32_t prev_rows = dynamic_ubatch_rows;
+                const bool first_pick = ink_rung_changes == 0; // the take resets the ceiling to the top: its first cut arms no hold
+                double free_min = 1e30, step_bytes = 0.0;
+                for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r = rung_hi ? next_of(r) : r / 2) {
+                    bool fits = true, fits_bare = true;
                     for (auto backend : backend_ptrs) {
                         auto dev = ggml_backend_get_device(backend);
                         if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
@@ -6654,9 +6672,14 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                         const double margin = double(total >= (size_t(16) << 30) ? size_t(2) << 30 : size_t(64) << 20) +
                                 double(size_t(64) << 20);
                         const double bytes = double(ggml_backend_sched_get_buffer_size(sched.get(), backend));
+                        const double sb = rung_hi ? (bytes / allocated + per_row) * step_of(r) : 0.0; // one step's bytes
+                        free_min = std::min(free_min, double(free));
+                        if (r > prev_rows) { step_bytes = sb; } // ends as the step just above the current ceiling
                         if (r > allocated) {
+                            const double spare = rung_hi && rung_hold && r > prev_rows && !first_pick ? sb : 0.0;
                             log_free = double(free); log_need = bytes * (r - allocated) / allocated + per_row * r + margin;
-                            fits = fits && bytes * (r - allocated) / allocated + per_row * r + margin < double(free);
+                            fits = fits && log_need + spare < double(free);
+                            fits_bare = fits_bare && log_need < double(free);
                         } else {
                             // at or below the reserve: its pool is in use and counted in free; a smaller ceiling
                             // gets back its share of the compute buffer
@@ -6664,8 +6687,22 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                         }
                     }
                     if (fits) { pick = r; break; }
+                    if (fits_bare && r > prev_rows) { pick = prev_rows; break; } // a rise short of its spare keeps the ceiling
+                }
+                if (rung_hi && rung_hold && !first_pick) {
+                    if (pick < prev_rows) {
+                        ink_rung_hold = rung_hold; ink_rung_hold_free = free_min;
+                    } else if (pick > prev_rows && ink_rung_hold > 0 && free_min <= ink_rung_hold_free + step_bytes) {
+                        pick = prev_rows; --ink_rung_hold; // a lowered ceiling holds
+                    } else if (ink_rung_hold > 0) {
+                        ink_rung_hold = pick > prev_rows ? 0 : ink_rung_hold - 1; // free VRAM rose by a step: hold ends
+                    }
                 }
                 dynamic_ubatch_rows = std::min(pick, std::max(512u, std::min(cparams.n_ubatch, 4096u)));
+                if (rung_hi && dynamic_ubatch_rows != prev_rows) {
+                    LLAMA_LOG_WARN("%s: [RUNG] t=%.3f s ceiling %u -> %u rows (change %u this prompt, free %.0f MiB, hold %u)\n", __func__,
+                            (ggml_time_us() - ink_stream_t0_us)/1e6, prev_rows, dynamic_ubatch_rows, ++ink_rung_changes, free_min/1048576.0, ink_rung_hold);
+                }
                 if (log_need > 0.0) {
                     LLAMA_LOG_WARN("%s: [INKSTREAM] ceiling %u rows (reserved %u; next step needs %.0f MiB, free %.0f MiB)\n",
                                    __func__, dynamic_ubatch_rows, allocated, log_need / 1048576.0, log_free / 1048576.0);
@@ -6816,6 +6853,7 @@ bool llama_context::ink_stream_take() {
         return false;
     }
     ink_stream_fails = 0;
+    ink_rung_changes = 0; ink_rung_hold = 0; // [RUNG] counts per prompt
     // [HEADLOAN] the prompt needs the head for its last row only: it runs from host memory while the streamer is armed
     // (not when a draft model shares the head tensor)
     const bool head_lent = ink_headloan && !model.output_borrowed && ink_headloan->lend();
@@ -6854,9 +6892,10 @@ bool llama_context::ink_stream_release(const char * why) {
     const llama_ink_stream_stats st = ink_stream->take_stats();
     sched_need_reserve = true; // the graph reads the MoE cache again
     const double t = (ggml_time_us() - ink_stream_t0_us)/1e6;
-    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt done (%s): %llu tokens in %.2f s (%.1f tok/s), ubatch up to %u rows, "
+    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt done (%s): %llu tokens in %.2f s (%.1f tok/s), ubatch up to %u rows%s, "
             "%llu visit uploads, %.2f GiB streamed, %.1f ms host wait\n", __func__, why,
             (unsigned long long) ink_stream_tokens, t, t > 0 ? ink_stream_tokens/t : 0.0, ink_stream_rows_max,
+            ink_rung_env(0) ? (" (" + std::to_string(ink_rung_changes) + " ceiling changes [RUNG])").c_str() : "",
             (unsigned long long) st.uploads, st.bytes_h2d/1073741824.0, st.t_wait_us/1000.0);
     if (ink_stream_tokens > 0 && ink_stream_rows_max > 0) {
         const double n_ub = (double) ((ink_stream_tokens + ink_stream_rows_max - 1) / ink_stream_rows_max);
