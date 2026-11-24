@@ -136,8 +136,6 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 
 // thinking-loop guard: LLAMA_SERVER_THINK_LOOP_CLOSE=N closes an open think block after N repeats of one token
 // (256 is the intended value). Unset or 0 = off (default)
-// thinking-loop guard: LLAMA_SERVER_THINK_LOOP_CLOSE=N closes an open think block after N repeats of one token
-// (256 is the intended value). Unset or 0 = off (default)
 // non-streaming keep-alive: LLAMA_SERVER_JSON_KEEPALIVE=S sends a space every S seconds while a non-streaming reply
 // is not ready yet (after the first S seconds). Unset or 0 = off (default)
 static int32_t server_json_keepalive_s() {
@@ -9100,23 +9098,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     bool stream = json_value(data, "stream", false);
 
     if (!stream) {
-        // non-stream, wait for the results
-        auto all_results = rd.wait_for_all(req.should_stop);
-        if (all_results.is_terminated) {
-            return res; // connection is closed
-        } else if (all_results.error) {
-            res->error(all_results.error->to_json());
-            return res;
-        } else {
+        // one JSON body from the final results (a single object, or the OAI multi-choice merge, or an array)
+        auto build_final = [res_type](std::vector<server_task_result_ptr> & results) -> json {
             json arr = json::array();
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
-                arr.push_back(res->to_json());
+            for (auto & r : results) {
+                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(r.get()) != nullptr);
+                arr.push_back(r->to_json());
             }
             GGML_ASSERT(!arr.empty() && "empty results");
             if (arr.size() == 1) {
                 // if single request, return single object instead of array
-                res->ok(arr[0]);
+                return arr[0];
             } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
                 // if multiple results in OAI format, we need to re-format them
                 json & usage   = arr[0]["usage"];
@@ -9124,7 +9116,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 for (size_t i = 1; i < arr.size(); i++) {
                     choices.push_back(std::move(arr[i]["choices"][0]));
                 }
-
+    
                 // OAI counts generated tokens across all choices
                 int64_t n_completion_tokens = 0;
                 for (auto & item : arr) {
@@ -9132,13 +9124,126 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
                 usage["completion_tokens"] = n_completion_tokens;
                 usage["total_tokens"]      = usage["prompt_tokens"].get<int64_t>() + n_completion_tokens;
-
-                res->ok(arr[0]);
+    
+                return arr[0];
             } else {
                 // multi-results, non-OAI compat
-                res->ok(arr);
+                return arr;
             }
+        };
+
+        // opt-in keep-alive for non-streaming requests (LLAMA_SERVER_JSON_KEEPALIVE=S, unset or 0 = off): a long
+        // prompt read (100K prefill, or a wait for a free slot) sends nothing until the reply is ready, and clients
+        // with a read timeout give up. When no reply is ready after S seconds, the 200 headers go out and a space
+        // (whitespace before a JSON value is valid JSON) is sent every S seconds until the body follows. An error
+        // after that point is sent as the JSON error body with status 200. A reply ready within S seconds is sent
+        // exactly as without the flag.
+        const int32_t keepalive_s = server_json_keepalive_s();
+        if (keepalive_s <= 0) {
+            // non-stream, wait for the results
+            auto all_results = rd.wait_for_all(req.should_stop);
+            if (all_results.is_terminated) {
+                return res; // connection is closed
+            } else if (all_results.error) {
+                res->error(all_results.error->to_json());
+                return res;
+            }
+            res->ok(build_final(all_results.results));
+            return res;
         }
+
+        auto collected = std::make_shared<std::vector<server_task_result_ptr>>(rd.id_tasks.size());
+        // 1 = all results in, 0 = should_stop, -1 = error (stored in *err)
+        auto collect = [collected](server_response_reader & r, const std::function<bool()> & should_stop,
+                                   server_task_result_ptr & err) -> int {
+            while (r.has_next()) {
+                auto one = r.next(should_stop);
+                if (one == nullptr) {
+                    return 0;
+                }
+                if (one->is_error()) {
+                    err = std::move(one);
+                    return -1;
+                }
+                const size_t idx = one->index;
+                GGML_ASSERT(idx < collected->size() && "index out of range");
+                GGML_ASSERT((*collected)[idx] == nullptr && "duplicate result received");
+                (*collected)[idx] = std::move(one);
+            }
+            return 1;
+        };
+
+        bool first_timeout = false;
+        const int64_t t_first = ggml_time_ms();
+        server_task_result_ptr first_err;
+        const int first_rc = collect(rd, [&req, &first_timeout, t_first, keepalive_s]() {
+            if (req.should_stop()) {
+                return true;
+            }
+            if (ggml_time_ms() - t_first > (int64_t) keepalive_s * 1000) {
+                first_timeout = true;
+                return true;
+            }
+            return false;
+        }, first_err);
+
+        if (!first_timeout) {
+            if (first_rc == 0) {
+                return res; // connection is closed
+            }
+            if (first_rc < 0) {
+                res->error(first_err->to_json());
+                return res;
+            }
+            res->ok(build_final(*collected));
+            return res;
+        }
+
+        SRV_DBG("%s", "no reply within the JSON keep-alive interval, sending the headers and keep-alive spaces\n");
+        res->status       = 200;
+        res->content_type = "application/json; charset=utf-8";
+        res->data         = " ";
+        res->set_next([res_this = res.get(), collected, collect, build_final, keepalive_s](std::string & output) -> bool {
+            try {
+                if (res_this->should_stop()) {
+                    return false;
+                }
+                if (!res_this->data.empty()) {
+                    output = std::move(res_this->data);
+                    res_this->data.clear();
+                    return true;
+                }
+                bool timeout = false;
+                const int64_t t_start = ggml_time_ms();
+                server_task_result_ptr err;
+                const int rc = collect(res_this->rd, [res_this, &timeout, t_start, keepalive_s]() {
+                    if (res_this->should_stop()) {
+                        return true;
+                    }
+                    if (ggml_time_ms() - t_start > (int64_t) keepalive_s * 1000) {
+                        timeout = true;
+                        return true;
+                    }
+                    return false;
+                }, err);
+                if (rc == 0) {
+                    if (timeout) {
+                        output = " ";
+                        return true;
+                    }
+                    return false; // connection is closed
+                }
+                if (rc < 0) {
+                    output = safe_json_to_str({{ "error", err->to_json() }});
+                    return false;
+                }
+                output = safe_json_to_str(build_final(*collected));
+                return false;
+            } catch (const std::exception & e) {
+                output = safe_json_to_str({{ "error", format_error_response(e.what(), ERROR_TYPE_SERVER) }});
+                return false;
+            }
+        });
     } else {
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
