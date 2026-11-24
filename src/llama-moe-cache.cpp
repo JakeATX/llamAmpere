@@ -675,6 +675,11 @@ struct llama_moe_cache::impl {
             const int32_t max_slots = g.n_canon*n_expert;
             if (ux.slots > 0) {
                 g.n_slots = std::min(ux.slots, max_slots); // fork (INKCACHEUX) GS1: slot-count form
+                if (alloc_size(g, g.n_slots) > budget) {
+                    LLAMA_LOG_WARN("%s: [CACHEUX] %d slots for %zu layers take %.1f MiB, over the %.1f MiB the fit gave this group "
+                            "(the slot count bypasses the fit; the context may not fit)\n", __func__, g.n_slots, g.layers.size(),
+                            alloc_size(g, g.n_slots)/1048576.0, budget/1048576.0);
+                }
             } else if (const double mib = ux.dev_budget_mib(g.id); mib >= 0.0) {
                 const size_t b = (size_t) (mib*1024.0*1024.0*g.host_bytes/d.host_bytes); // GS1: MiB per GPU
                 while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= b) {
