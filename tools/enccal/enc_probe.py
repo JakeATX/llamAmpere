@@ -16,6 +16,11 @@ Subcommands
          Noise: per (row, --block columns) the block RMS r, delta = sqrt(rel_mse) * r * z, z ~ N(0,1), deterministic
          from --seed and the tensor name. --col-tilt a > 0 scales column j by (h_j / mean h)^(-a/2) (imatrix h,
          renormalised to the same mean square), i.e. less error on high-activation columns as a weighted encoder does.
+  patch  WORK.gguf TENSOR [--rel-mse ...] [--restore ORIG.gguf]
+         Same noise, written IN PLACE into a working copy of the reference, in the tensor's own type (NVFP4, Q8_0,
+         BF16, F16, F32), so one copy on disk serves every arm (patch, score, --restore from the original, next).
+         Re-rounding to the tensor's own grid adds that grid's error on top (uniform over tensors of one type; the
+         per-role calibration ratio absorbs it). --restore copies the tensor's original bytes back from ORIG.
   relmse REF.gguf CAND.gguf TENSOR [--experts 3]
          Weight relMSE of CAND vs REF for one tensor (both must be types gguf-py can dequantize) to set --rel-mse.
   rank   --scores DIR [DIR ...] --b0 ARM --probe P{t} [--anchor FORMAT=TEMPLATE ...] [--out probe_rank.csv]
@@ -128,6 +133,69 @@ def cmd_noise(a):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
     print(f'NOISE {a.tensor} slices={n_sl} realised_relmse={num / max(den, 1e-30):.5f} target={a.rel_mse} '
           f'folded_scale={sc is not None} -> {a.out}')
+
+
+_E2M1x2 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], np.float32)
+
+
+def nvfp4_quantize(w):
+    """float32 [rows, cols] (cols % 64 == 0) -> NVFP4 block bytes [rows, cols/64*36] (4 x ue4m3 scale + 32 nibble bytes)."""
+    gguf = _gguf(); Q = gguf.quants.NVFP4
+    rows, cols = w.shape
+    x = w.reshape(-1, 4, 16)
+    amax = np.abs(x).max(-1)
+    db = Q.fp32_to_ue4m3(2.0 * amax / 12.0)          # stored byte decodes to (value * 0.5)
+    d = Q.ue4m3_to_fp32(db)
+    # bump a scale that rounded down so amax still fits the +-12 grid
+    low = (d * 12.0 < amax * (1 - 1e-6)) & (db < 0x7E)
+    db = np.where(low, db + 1, db).astype(np.uint8); d = Q.ue4m3_to_fp32(db)
+    r = np.where(d[..., None] > 0, x / np.where(d > 0, d, 1)[..., None], 0.0)
+    pos = _E2M1x2[:8]
+    idx = np.abs(np.abs(r)[..., None] - pos).argmin(-1).astype(np.uint8)
+    idx = np.where((r < 0) & (idx > 0), idx + 8, idx).astype(np.uint8)
+    qs = (idx[..., :8] | (idx[..., 8:] << 4)).astype(np.uint8)          # byte j: element j low, element j+8 high
+    blk = np.concatenate([db.reshape(-1, 4), qs.reshape(-1, 32)], axis=1)
+    return blk.reshape(rows, cols // 64 * 36)
+
+
+def _requant(w, ttype):
+    gguf = _gguf(); T = gguf.GGMLQuantizationType
+    if ttype == T.NVFP4:
+        return nvfp4_quantize(w)
+    if ttype in (T.Q8_0, T.BF16, T.F16):
+        return gguf.quants.quantize(w, ttype) if ttype != T.F16 else w.astype(np.float16)
+    if ttype == T.F32:
+        return w.astype(np.float32)
+    raise SystemExit(f'patch: no requantizer for {ttype.name}')
+
+
+def cmd_patch(a):
+    gguf = _gguf()
+    r = gguf.GGUFReader(a.work)                      # read-only view for offsets + current bytes
+    t = _tensor(r, a.tensor)
+    nbytes = int(t.n_bytes)
+    if a.restore:
+        o = _tensor(gguf.GGUFReader(a.restore), a.tensor)
+        assert int(o.n_bytes) == nbytes and o.tensor_type == t.tensor_type, 'restore: layout differs'
+        src = np.asarray(o.data).view(np.uint8).reshape(-1)
+        with open(a.work, 'r+b') as f:
+            f.seek(int(t.data_offset)); f.write(src.tobytes())
+        print(f'RESTORED {a.tensor} {nbytes} bytes'); return
+    seed = int.from_bytes(hashlib.sha256(f'{a.seed}:{a.tensor}'.encode()).digest()[:8], 'little')
+    rng = np.random.default_rng(seed)
+    n_sl = t.data.shape[0] if t.data.ndim == 3 else 1
+    num = den = 0.0
+    with open(a.work, 'r+b') as f:
+        off = int(t.data_offset)
+        for e, w in _deq_slices(gguf, t):
+            wn = add_noise(w, a.rel_mse, a.block, rng)
+            q = np.ascontiguousarray(_requant(wn, t.tensor_type)).view(np.uint8).reshape(-1)
+            back = np.asarray(gguf.quants.dequantize(q.reshape(w.shape[0], -1), t.tensor_type), np.float32).reshape(w.shape) \
+                if t.tensor_type not in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16) else wn
+            num += float(((back - w).astype(np.float64) ** 2).sum()); den += float((w.astype(np.float64) ** 2).sum())
+            f.seek(off); f.write(q.tobytes()); off += q.size
+        assert off - int(t.data_offset) == nbytes, (off - int(t.data_offset), nbytes)
+    print(f'PATCH {a.tensor} {t.tensor_type.name} slices={n_sl} stored_relmse={num / max(den, 1e-30):.5f} (noise {a.rel_mse})')
 
 
 def cmd_relmse(a):
@@ -296,6 +364,9 @@ def main():
     p.add_argument('--rel-mse', type=float, default=0.019); p.add_argument('--block', type=int, default=256)
     p.add_argument('--col-tilt', type=float, default=0.0); p.add_argument('--imatrix')
     p.add_argument('--seed', type=int, default=0); p.add_argument('--no-fold', action='store_true')
+    p = sp.add_parser('patch'); p.add_argument('work'); p.add_argument('tensor')
+    p.add_argument('--rel-mse', type=float, default=0.019); p.add_argument('--block', type=int, default=256)
+    p.add_argument('--seed', type=int, default=0); p.add_argument('--restore')
     p = sp.add_parser('relmse'); p.add_argument('ref'); p.add_argument('cand'); p.add_argument('tensor')
     p.add_argument('--experts', type=int, default=3)
     p = sp.add_parser('rank'); p.add_argument('--scores', nargs='+', required=True); p.add_argument('--b0', default='B0')
@@ -308,7 +379,7 @@ def main():
     a = ap.parse_args()
     if a.cmd == 'noise' and a.col_tilt and not a.imatrix:
         ap.error('--col-tilt needs --imatrix')
-    dict(noise=cmd_noise, relmse=cmd_relmse, rank=cmd_rank, alloc=cmd_alloc)[a.cmd](a)
+    dict(noise=cmd_noise, patch=cmd_patch, relmse=cmd_relmse, rank=cmd_rank, alloc=cmd_alloc)[a.cmd](a)
 
 
 if __name__ == '__main__':
