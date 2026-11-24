@@ -65,7 +65,7 @@ def engaged(log):
             on, lines = True, [l]
             continue
         if on:
-            if l.lstrip().startswith('[') or 'lever(s) differ' in l or 'all levers match' in l or 'no arch-defaults row' in l:
+            if re.search(r'\s\[(ON|OFF|OVERRIDE|N/A) *\]', l) or 'lever(s) differ' in l or 'all levers match' in l or 'no arch-defaults row' in l:
                 lines.append(l)
                 m = re.search(r'lever\(s\) differ from the \S+ best config: (.*)$', l)
                 if m: differ = [x.strip() for x in m.group(1).split(',')]

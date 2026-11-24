@@ -379,8 +379,16 @@ void common_arch_defaults_report(const common_params & params, const llama_model
         }
         if (!types.empty()) {
             const auto & d = params.speculative.draft;
-            const std::string dk = (d.cache_type_k == GGML_TYPE_COUNT ? std::string("resolver") : ggml_type_name(d.cache_type_k)) + "/" +
-                                   (d.cache_type_v == GGML_TYPE_COUNT ? std::string("resolver") : ggml_type_name(d.cache_type_v));
+            // an unset draft type of a file drafter (not MTP) inherits the trunk's plain type (F16 under -ctk sjkvarnN)
+            bool mtp = false;
+            for (auto t : params.speculative.types) {
+                mtp = mtp || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
+            }
+            auto dname = [&](ggml_type t, ggml_type trunk) -> std::string {
+                if (t != GGML_TYPE_COUNT) return ggml_type_name(t);
+                return params.speculative.has_dft() && !mtp ? ggml_type_name(trunk) : "resolver";
+            };
+            const std::string dk = dname(d.cache_type_k, params.cache_type_k) + "/" + dname(d.cache_type_v, params.cache_type_v);
             std::string best_dk;
             if (row && row->contains("spec") && !(*row)["spec"].is_null() && !(*row)["spec"].value("type_k", "").empty()) {
                 best_dk = (*row)["spec"].value("type_k", "") + "/" + (*row)["spec"].value("type_v", "");
