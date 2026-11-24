@@ -1,4 +1,5 @@
 #include "llama-moe-cache.h"
+#include "llama-moe-ramlock.h"
 
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -446,6 +447,9 @@ struct llama_moe_cache::impl {
     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
     FILE * trace = nullptr;
 
+    // fork (#130, RAMLOCK): LLAMA_MOE_RAM_LOCK_GIB, nullptr when unset (see llama-moe-ramlock.h)
+    std::unique_ptr<llama_moe_ramlock> ramlock;
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -771,6 +775,20 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (!no_alloc) {
+            ramlock = llama_moe_ramlock::from_env((int32_t) layers.size(), (int32_t) model.hparams.n_expert);
+            if (ramlock) {
+                for (const group & g : groups) {
+                    for (int32_t il : g.layers) {
+                        if (canon[il] == il) {
+                            ramlock->add_layer(il, layers[il].experts);
+                        }
+                    }
+                }
+                ramlock->start();
+            }
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -987,6 +1005,9 @@ struct llama_moe_cache::impl {
 
         if (trace != nullptr) {
             write_trace(il, n_used);
+        }
+        if (ramlock) {
+            ramlock->observe(ci, ids.data(), ids.size());
         }
 
         // fork (SURGE-cache): a window starts at a lookup of a layer at or below the previous one; rank the last one first
