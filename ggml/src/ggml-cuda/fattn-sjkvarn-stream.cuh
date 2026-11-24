@@ -105,11 +105,19 @@ typedef tile< 8, 8, half2> T_B;  // Q'^T (heads x channels) / P (heads x tokens)
 typedef tile<16, 8, float> T_C;  // KQ (tokens x heads) / O (channels x heads), fp32
 typedef tile<16, 4, half2> T_CH; // [DSPINE4 KQX] the same C fragment, fp16 (x[0] = C x[0..1], x[1] = C x[2..3])
 
-static __host__ __device__ __forceinline__ size_t split_bytes(const int nstage, const bool turbo4_body = false) {
+constexpr int QP_WARP_BYTES = NTC*WARP_SIZE*(int) sizeof(uint2); // 4096: per-warp qp[16] in shared memory
+
+static constexpr __host__ __device__ __forceinline__ size_t split_bytes(const int nstage, const bool turbo4_body = false) {
     return turbo4_body ? (size_t) nstage*TURBO4_STAGE_BYTES : (size_t) nstage*STAGE_BYTES + 2*RMETA_BYTES;
 }
 static __host__ __device__ __forceinline__ size_t ring_bytes(const int nsplit, const int nstage, const bool turbo4_body = false) {
     return (size_t) nsplit * split_bytes(nstage, turbo4_body);
+}
+
+static __device__ __forceinline__ uint32_t half2_as_u32(const half2 h) {
+    uint32_t u;
+    memcpy(&u, &h, sizeof(u));
+    return u;
 }
 
 // barrier among the NT row-warps of one KV split (named barriers 1..KW; 0 is __syncthreads)
@@ -240,6 +248,7 @@ struct sj_lsa_vk {
 constexpr int SJ_LIST_HDR = 16; // ints before the lists: sj_lsa_vk, then list[-4 .. -1]
 static_assert(sizeof(sj_lsa_vk) <= (SJ_LIST_HDR - 4)*sizeof(int32_t), "list header");
 
+#ifndef FATTN_SJKVARN_STREAM_KERNEL_ONLY
 // sel F32 [nbs] -> bit words (vk: row 0 of the virtual-key plane, picked = entry < 0.5)
 static __global__ void sj_lsa_sel_bits(const float * sel, const int nbs, uint32_t * bits, const int vk = 0) {
     const int w = blockIdx.x*blockDim.x + threadIdx.x;
@@ -332,6 +341,7 @@ static __global__ void sj_live_record_list(const int32_t * desc, const int32_t *
         list[0] = base;
     }
 }
+#endif // FATTN_SJKVARN_STREAM_KERNEL_ONLY
 
 #ifdef SJKVARN_STREAM_DBG_TIME
 static __device__ unsigned int fattn_sj_kvarn_stream_dbg_run = 0;
@@ -345,7 +355,10 @@ static __device__ unsigned int fattn_sj_kvarn_stream_dbg_run = 0;
 // 5 -> 4, 6 -> 5, 7 and 8 -> 6. Every column keeps its own Q, mask row, online softmax and output; the KV split partition
 // is the host's choice (mode 1: forced to the rows kernel's), so the result is bit-identical to the rows kernel while the
 // block issues fewer MMA rows per strip. Instances: max_warps 3 (width 4), 4 (width 5), 5 (width 6), 6 (widths 7, 8).
-template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
+// W8 (GGML_SJKVARN_W8, fattn-sjkvarn-w8.cu, opt-in): qp_smem keeps Q' in shared memory, raw_k folds the code bias into c_r,
+// force_raw_pipe keeps the pipelined exact ring at 6 warps; all three default off, so every other instance is unchanged.
+template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows,
+          bool qp_smem = false, bool raw_k = false, bool force_raw_pipe = false>
 __launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 || max_warps == 6 || (max_warps == 3 && tile != sj_kvarn_tile::rows) ? 2 : 1)
 static __global__ void flash_attn_ext_sj_kvarn_stream(
         const char * __restrict__ Q,
@@ -396,6 +409,9 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     // [DSPINE4 VERIFY16] 8, 10 and 12 warps: widths 9..16 (GGML_SJKVARN_COMPACT16) and 7/8 (GGML_SJKVARN_COMPACT8W, fattn-sjkvarn-compact16-instance.cu)
     static_assert(!compact || (max_warps >= 3 && max_warps <= 6) || max_warps == 8 || max_warps == 10 || max_warps == 12,
                   "the compact tile runs 3..6 warps, or 8/10/12 for widths 9..16 (and 7/8 under COMPACT8W)");
+    static_assert(!qp_smem || (compact && !turbo4_body && !lsa), "qp_smem requires compact non-LSA 4/4");
+    static_assert(!raw_k || !turbo4_body, "raw_k requires scalar 4/4 body");
+    static_assert(kqx == 0 || (!qp_smem && !raw_k), "W8 (qp_smem / raw_k) runs on the plain compact tile, not the KQX variants");
     constexpr bool fixed_nt = max_warps == 5 || max_warps == 6 || compact; // MTP-4 verification (5), 6 rows (NT6_OCC), compact
     // compact: max_warps == ceil(6*n_q/8) == nwarps (ggml_cuda_fattn_sj_kvarn_stream_compact launches it so), compile-time
     const int NT     = compact || max_warps == 5 || max_warps == 6 ? max_warps : n_q;
@@ -475,6 +491,10 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     static_assert(NSTAGE <= 6, "a record (G >= 96 tokens) must span more strips than the issue lead, see rmeta");
     char * ring = smem + (size_t) kw*split_bytes(NSTAGE, turbo4_body); // shared by the NT row-warps of this split
     char * rmeta = ring + NSTAGE*STAGE_BYTES;              // [2][RMETA_BYTES]: record g's vectors in buffer g&1
+    uint2 * qp_s = qp_smem ? (uint2 *) (smem + split_bytes(NSTAGE, false)) + nt*(NTC*WARP_SIZE) : nullptr;
+    if constexpr (!qp_smem) {
+        GGML_UNUSED(qp_s);
+    }
     const uint32_t ring_s = ggml_cuda_cvta_generic_to_shared(ring);
     const uint32_t rmeta_s = ring_s + NSTAGE*STAGE_BYTES;
     auto sync_split = [&]() {
@@ -487,8 +507,15 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const uint32_t magic = 0x64006400U;
     const float centroid = turbo4_body ? TURBO_CENTROIDS_4BIT[lane & 15] : 0.0f;
 
-    T_B   qp[NTC];   // Q' B fragments for the current record
-    float c_r[2] = {0.0f, 0.0f};
+    T_B   qp[qp_smem ? 1 : NTC];   // Q' B fragments for the current record (in smem when qp_smem)
+    if constexpr (qp_smem) {
+        GGML_UNUSED(qp);
+    }
+    float c_r[2]  = {0.0f, 0.0f};
+    float c_r1[2] = {0.0f, 0.0f};  // raw_k bias for rows 8..15 (c_r - 64*sq)
+    if constexpr (!raw_k) {
+        GGML_UNUSED(c_r1);
+    }
     T_C   acc[NTC];  // O, fp32, unnormalized, in units of the current record's Vch*s (zero-initialized by the tile ctor)
     float kq_max[2] = {-FLT_MAX/2, -FLT_MAX/2};
     float kq_sum[2] = {0.0f, 0.0f};
@@ -498,12 +525,36 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     // Q for the lane's column, scaled: channel pairs 16c + 2(lane%4) (+8) as fp32
     auto load_q = [&](const int c, float2 & q0, float2 & q1) {
         if (hvalid) {
-            q0 = *(const float2 *) (Qf + 16*c + 2*(lane & 3));
-            q1 = *(const float2 *) (Qf + 16*c + 2*(lane & 3) + 8);
+            if constexpr (qp_smem) {
+                q0 = __ldg((const float2 *) (Qf + 16*c + 2*(lane & 3)));
+                q1 = __ldg((const float2 *) (Qf + 16*c + 2*(lane & 3) + 8));
+            } else {
+                q0 = *(const float2 *) (Qf + 16*c + 2*(lane & 3));
+                q1 = *(const float2 *) (Qf + 16*c + 2*(lane & 3) + 8);
+            }
             q0.x *= scale; q0.y *= scale; q1.x *= scale; q1.y *= scale;
         } else {
             q0 = make_float2(0.0f, 0.0f);
             q1 = make_float2(0.0f, 0.0f);
+        }
+    };
+    auto store_qp = [&](const int c, const half2 p0, const half2 p1) {
+        if constexpr (qp_smem) {
+            qp_s[c*WARP_SIZE + lane] = make_uint2(half2_as_u32(p0), half2_as_u32(p1));
+        } else {
+            qp[c].x[0] = p0;
+            qp[c].x[1] = p1;
+        }
+    };
+    auto load_qp = [&](const int c) -> T_B {
+        if constexpr (qp_smem) {
+            const uint2 v = qp_s[c*WARP_SIZE + lane];
+            T_B b;
+            b.x[0] = fattn_sj_kvarn_u32_as_half2(v.x);
+            b.x[1] = fattn_sj_kvarn_u32_as_half2(v.y);
+            return b;
+        } else {
+            return qp[c];
         }
     };
 
@@ -512,6 +563,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         const uint2 * ks2 = (const uint2 *) (rm            + 2*(lane & 3)*(D/4));
         const uint2 * kz2 = (const uint2 *) (rm + RMETA_KZ + 2*(lane & 3)*(D/4));
         float cr = 0.0f;
+        float sq = 0.0f;
 #pragma unroll
         for (int c = 0; c < NTC; ++c) {
             const uint2 ks = ks2[c];
@@ -521,19 +573,39 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
             const half2 ks0 = fattn_sj_kvarn_u32_as_half2(ks.x), ks1 = fattn_sj_kvarn_u32_as_half2(ks.y);
             const float2 kz0 = __half22float2(fattn_sj_kvarn_u32_as_half2(kz.x));
             const float2 kz1 = __half22float2(fattn_sj_kvarn_u32_as_half2(kz.y));
-            qp[c].x[0] = __hmul2(__floats2half2_rn(q0.x, q0.y), ks0);
-            qp[c].x[1] = __hmul2(__floats2half2_rn(q1.x, q1.y), ks1);
+            const half2 p0 = __hmul2(__floats2half2_rn(q0.x, q0.y), ks0);
+            const half2 p1 = __hmul2(__floats2half2_rn(q1.x, q1.y), ks1);
+            store_qp(c, p0, p1);
             cr += q0.x*kz0.x + q0.y*kz0.y + q1.x*kz1.x + q1.y*kz1.y;
             if constexpr (kqx == 3) { // [DSPINE4 KQX] codes centred on 8: q . Q' = (q - 8) . Q' + 8 sum Q' (the fp16 Q' the MMA uses)
                 const float2 a0 = __half22float2(qp[c].x[0]), a1 = __half22float2(qp[c].x[1]);
                 cr += 8.0f*((a0.x + a0.y) + (a1.x + a1.y));
             }
+            if constexpr (raw_k) {
+                const float2 pf0 = __half22float2(p0);
+                const float2 pf1 = __half22float2(p1);
+                sq += pf0.x + pf0.y + pf1.x + pf1.y;
+            }
         }
         cr += __shfl_xor_sync(0xFFFFFFFF, cr, 1, WARP_SIZE);
         cr += __shfl_xor_sync(0xFFFFFFFF, cr, 2, WARP_SIZE);
         // C-fragment columns 2(lane%4) and +1 live in lanes 8(lane%4) and 8(lane%4)+4
-        c_r[0] = __shfl_sync(0xFFFFFFFF, cr, 8*(lane & 3),     WARP_SIZE);
-        c_r[1] = __shfl_sync(0xFFFFFFFF, cr, 8*(lane & 3) + 4, WARP_SIZE);
+        const float cr0 = __shfl_sync(0xFFFFFFFF, cr, 8*(lane & 3),     WARP_SIZE);
+        const float cr1 = __shfl_sync(0xFFFFFFFF, cr, 8*(lane & 3) + 4, WARP_SIZE);
+        if constexpr (raw_k) {
+            sq += __shfl_xor_sync(0xFFFFFFFF, sq, 1, WARP_SIZE);
+            sq += __shfl_xor_sync(0xFFFFFFFF, sq, 2, WARP_SIZE);
+            const float sq0 = __shfl_sync(0xFFFFFFFF, sq, 8*(lane & 3),     WARP_SIZE);
+            const float sq1 = __shfl_sync(0xFFFFFFFF, sq, 8*(lane & 3) + 4, WARP_SIZE);
+            c_r[0]  = cr0 - 1024.0f*sq0;
+            c_r[1]  = cr1 - 1024.0f*sq1;
+            c_r1[0] = cr0 -   64.0f*sq0;
+            c_r1[1] = cr1 -   64.0f*sq1;
+        } else {
+            GGML_UNUSED(sq);
+            c_r[0] = cr0;
+            c_r[1] = cr1;
+        }
     };
 
     // exact rows: Q' = Qs, c_r = 0
@@ -542,8 +614,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         for (int c = 0; c < NTC; ++c) {
             float2 q0, q1;
             load_q(c, q0, q1);
-            qp[c].x[0] = __floats2half2_rn(q0.x, q0.y);
-            qp[c].x[1] = __floats2half2_rn(q1.x, q1.y);
+            store_qp(c, __floats2half2_rn(q0.x, q0.y), __floats2half2_rn(q1.x, q1.y));
         }
         c_r[0] = 0.0f;
         c_r[1] = 0.0f;
@@ -719,12 +790,13 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 slot_card = smap.card + ((size_t) slot*smap.heads + kv.resident_head)*GGML_LSA_STRIP_HEAD_BYTES;
             }
         }
+        constexpr int cp_prefetch = qp_smem ? 128 : 0;
         if (with_meta) {
             const uint32_t dst_m = rmeta_s + ((lsa ? cu.o : cu.g) & 1)*RMETA_BYTES;
             for (int q = nt*WARP_SIZE + lane; q < RMETA_CHUNKS; q += NT*WARP_SIZE) {
                 const char * src = meta_card ? meta_card + 16*q :
                     q < RMETA_VCH/16 ? rec + kv.k_scale + 16*q : rec + kv.v_ch + 16*(q - RMETA_VCH/16);
-                cp_async_cg_16<0>(dst_m + 16*q, src);
+                cp_async_cg_16<cp_prefetch>(dst_m + 16*q, src);
             }
         }
         if (lsa && cu.sl < 8 && !((cu.sm >> cu.sl) & 1)) { // dead strip (strip skip): record vectors only, empty group keeps the count
@@ -746,7 +818,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                     : m < 4 ? rec + kv.v_scale + cu.sl*32 + half_off
                     :         rec + kv.v_zero  + cu.sl*32 + half_off;
             }
-            cp_async_cg_16<0>(dst_s + 16*q, src);
+            cp_async_cg_16<cp_prefetch>(dst_s + 16*q, src);
         }
         cp_async_commit();
     };
@@ -766,7 +838,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                     out[i] = fattn_sj_kvarn_ring_pair_warp(rows + (size_t) r*nb, 4*j+i, type, tq6_mag); // warp-uniform: q steps by whole warps
                 }
             } else {
-                cp_async_cg_16<0>(ring_s + r*EXACT_ROW_BYTES + 16*(j ^ (r & 7)), rows + (size_t) r*nb + 16*j);
+                cp_async_cg_16<qp_smem ? 128 : 0>(ring_s + r*EXACT_ROW_BYTES + 16*(j ^ (r & 7)), rows + (size_t) r*nb + 16*j);
             }
         }
         cp_async_commit();
@@ -843,7 +915,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                     const int cp = 8*c + 4*(l >> 1) + (lane & 3);
                     a.x[l] = turbo4_pair(st, row, cp, centroid);
                 }
-                mma(kq, a, qp[c]);
+                mma(kq, a, load_qp(c));
             }
             const float mk0 = mask_at((const half *) mrow, cc.p0 + (lane >> 2));
             const float mk1 = mask_at((const half *) mrow, cc.p0 + (lane >> 2) + 8);
@@ -862,6 +934,13 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 mma(acc[c], a, P);
             }
         } else if (!lsa || cc.sl >= 8 || ((cc.sm >> cc.sl) & 1)) { // dead strips (strip skip) add nothing: skipped; G > 128: strips 8+ always walked
+            half mk0_h = __ushort_as_half(0), mk1_h = __ushort_as_half(0);
+            if constexpr (qp_smem) {
+                mk0_h = __ldg((const half *) mrow + cc.p0 + (lane >> 2));
+                mk1_h = __ldg((const half *) mrow + cc.p0 + (lane >> 2) + 8);
+            } else {
+                GGML_UNUSED_VARS(mk0_h, mk1_h);
+            }
             T_C kq;
             const char * st = ring + stage_c*STAGE_BYTES;
             const uint32_t * kwp = (const uint32_t *) st + lane;
@@ -898,8 +977,12 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 #pragma unroll
             for (int c = 0; c < NTC; ++c) {
                 T_A a;
-                decode_pairs(kwp[c*WARP_SIZE], magic, a.x);
-                mma(kq, a, qp[c]);
+                if constexpr (raw_k) {
+                    raw_pairs(kwp[c*WARP_SIZE], magic, a.x);
+                } else {
+                    decode_pairs(kwp[c*WARP_SIZE], magic, a.x);
+                }
+                mma(kq, a, load_qp(c));
             }
             }
             const half * ktok = (const half *) (st + META_KTOK);
@@ -907,12 +990,25 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
             const half * vzh  = (const half *) (st + META_VZ);
             const float tok0 = __half2float(ktok[lane >> 2]);
             const float tok1 = __half2float(ktok[(lane >> 2) + 8]);
-            const float mk0  = mask_at((const half *) mrow, cc.p0 + (lane >> 2));
-            const float mk1  = mask_at((const half *) mrow, cc.p0 + (lane >> 2) + 8);
-            kq.x[0] = tok0*(kq.x[0] + c_r[0]) + mk0;
-            kq.x[1] = tok0*(kq.x[1] + c_r[1]) + mk0;
-            kq.x[2] = tok1*(kq.x[2] + c_r[0]) + mk1;
-            kq.x[3] = tok1*(kq.x[3] + c_r[1]) + mk1;
+            const float mk0  = [&]() {
+                if constexpr (qp_smem) { return __half2float(mk0_h); }
+                else                   { return mask_at((const half *) mrow, cc.p0 + (lane >> 2)); }
+            }();
+            const float mk1  = [&]() {
+                if constexpr (qp_smem) { return __half2float(mk1_h); }
+                else                   { return mask_at((const half *) mrow, cc.p0 + (lane >> 2) + 8); }
+            }();
+            if constexpr (raw_k) {
+                kq.x[0] = fmaf(tok0, kq.x[0] + c_r[0], mk0);
+                kq.x[1] = fmaf(tok0, kq.x[1] + c_r[1], mk0);
+                kq.x[2] = fmaf(tok1, fmaf(0.0625f, kq.x[2], c_r1[0]), mk1);
+                kq.x[3] = fmaf(tok1, fmaf(0.0625f, kq.x[3], c_r1[1]), mk1);
+            } else {
+                kq.x[0] = tok0*(kq.x[0] + c_r[0]) + mk0;
+                kq.x[1] = tok0*(kq.x[1] + c_r[1]) + mk0;
+                kq.x[2] = tok1*(kq.x[2] + c_r[0]) + mk1;
+                kq.x[3] = tok1*(kq.x[3] + c_r[1]) + mk1;
+            }
 
             T_B P = softmax(kq);
 
@@ -992,7 +1088,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
                 const int cp  = 8*c + 4*(l >> 1) + (lane & 3);
                 a.x[l] = fattn_sj_kvarn_u32_as_half2(exact_word(row, cp));
             }
-            mma(kq, a, qp[c]);
+            mma(kq, a, load_qp(c));
         }
         kq.x[0] += mk0;
         kq.x[1] += mk0;
@@ -1039,7 +1135,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
         (((uintptr_t) Kh | (uintptr_t) Vh | (uintptr_t) nb11 | (uintptr_t) nb21 | (uintptr_t) rb_k | (uintptr_t) rb_v) & 3) == 0;
     // the MTP-4 verification kernel (max_warps 5) sits at its register cap; the queue's state costs its body loop
     // more than the pipeline saves (measured +30-35 us/call at 102K), so it keeps the direct path
-    constexpr bool raw_pipe = max_warps != 5 && max_warps != 6; // compact at max_warps 3 and 4 keeps the pipeline, as before
+    constexpr bool raw_pipe = force_raw_pipe || (max_warps != 5 && max_warps != 6); // compact at max_warps 3 and 4 keeps the pipeline, as before
     const int nraw = raw_pipe && raw_ok ? min(RAW_MAX, raw_avail/raw_slot) : 0;
     int e_pipe = n_ex; // first strip of the pipelined range (n_ex: none)
     if (nraw > 0) {
@@ -1339,6 +1435,7 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
 
 } // namespace fattn_sj_kvarn_stream
 
+#ifndef FATTN_SJKVARN_STREAM_KERNEL_ONLY
 // Each query warp shares a packed-data ring with the other query warps in its KV split.
 template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
 static fattn_kernel_t ggml_cuda_fattn_sj_kvarn_stream_kernel() {
@@ -2037,3 +2134,4 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
         ggml_cuda_fattn_sj_kvarn_stream_select<8, turbo4_body, rot>(ctx, dst, NT, KW, nstage_env, 0);
     }
 }
+#endif // FATTN_SJKVARN_STREAM_KERNEL_ONLY

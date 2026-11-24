@@ -5,6 +5,7 @@
 #include "fattn-mma-sjkvarn.cuh"
 #include "fattn-sjkvarn-rot.cuh"
 #include "fattn-sjkvarn-v16.cuh"
+#include "fattn-sjkvarn-w8.cuh"
 #include "fattn-mma-turbo-d128-tq5t4.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -4676,8 +4677,8 @@ static bool ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ggml_backend_cuda_context & c
         return true; // fattn-sjkvarn-lowbits.cu rotates in-kernel or takes the separate passes itself
     }
     GGML_UNUSED(ctx);
-    // 4/4: the single-pass V16 compact kernel (GGML_SJKVARN_V16=1) rotates in-kernel too
-    if (ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(dst)) {
+    // 4/4: the single-pass W8 / V16 compact kernels (GGML_SJKVARN_W8 / GGML_SJKVARN_V16) rotate in-kernel too
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_w8_supported(dst) || ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(dst)) {
         return true;
     }
     // 4/4: the stream decode kernel (fattn-sjkvarn-stream.cuh) through ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl
@@ -5078,6 +5079,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         if (ggml_cuda_fattn_sj_kvarn_compact16(dst)) {
             ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, dst); // [DSPINE4 VERIFY16] one pass at 9..16 rows
+            return;
+        }
+        if (ggml_cuda_flash_attn_ext_sj_kvarn_w8_supported(dst)) {
+            ggml_cuda_flash_attn_ext_sj_kvarn_w8(ctx, dst);
             return;
         }
         if (ggml_cuda_flash_attn_ext_sj_kvarn_v16_supported(dst)) {
