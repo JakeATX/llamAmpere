@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mtp-vocab.h"
 #include "llama-moe-cache.h"
+#include "llama-peer-experts.h"
 #include "llama-d1.h"
 
 #include "ggml-cpp.h"
@@ -259,6 +260,9 @@ struct llama_context {
     bool    split_overlap_wait(int32_t slot);
     float * split_overlap_logits_ith(int32_t slot, int32_t i);
     void    split_overlap_swap_outputs();
+    bool    split_overlap_set_window(int32_t n_rows);
+    bool    split_overlap_wait_row(int32_t i); // true = row i is ready and synchronize() was not needed
+    void    split_overlap_record_window(bool ok, int64_t n_rows_end);
 
     //
     // state save/load
@@ -507,6 +511,7 @@ private:
 
     bool inkkv_dual_reserve_busy = false; // graph_reserve: INKKV v2 one- + several-sequence reserve in progress
     llama_moe_cache_ptr moe_cache;
+    std::unique_ptr<llama_peer_experts> moe_peer; // [PEERX] GGML_PEER_EXPERTS second-card expert tier, or nullptr
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -927,6 +932,15 @@ private:
         std::vector<ggml_backend_t>         ev_backend;
         bool    recorded[2] = {false, false};
         uint64_t n_decodes = 0;
+        // verify windows inside one decode (llama_split_overlap_set_window): the batch runs as ubatches of at most
+        // `window` rows, pipelined over the cards; reading a row waits only for the window that holds it
+        uint32_t window      = 0;
+        bool     win_pending = false;                       // windows of the last decode not all waited yet
+        bool     win_ok      = false;                       // the decode in progress records windows
+        std::vector<int64_t> win_end;                       // per window: output rows [.., end)
+        std::vector<std::vector<ggml_backend_event_ptr>> win_ev; // per window, per GPU backend (grown on demand)
+        size_t   win_waited  = 0;                           // windows [0, win_waited) are done
+        uint64_t n_win_reads = 0;                           // row reads served without a full synchronize
     } split_ovl;
 
     // largest number of output rows reserved so far; output_reserve() never sizes below it, so the pinned

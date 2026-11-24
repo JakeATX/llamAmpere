@@ -2036,6 +2036,67 @@ private:
 
     common_speculative_init_result_ptr spec_init;
 
+    // [SPLITOVL] chain-ahead verify (LLAMA_SPLIT_OVERLAP=1, default off): with one slot under -sm layer on two cards
+    // the drafter drafts 2n+1 tokens instead of n (LLAMA_SPLIT_OVERLAP_DEPTH=N picks the depth; the DSpark block
+    // caps it), and the verify runs as two windows: the first n+1 rows (what the plain round would verify) and the
+    // chained rest. The pipeline-parallel scheduler starts the second window on card A while card B finishes the
+    // first, and the row reads wait per window. Acceptance, rollback and the drafter see one ordinary wide round.
+    int32_t  split_ovl_window    = 0;  // rows of the first window, 0 = off
+    int32_t  split_ovl_depth_off = -1; // the draft depth before the raise
+    uint64_t n_split_ovl_rounds  = 0;
+
+    static bool server_view_one_seq(const common_batch & view) {
+        return view.size() > 0 && std::all_of(view.tokens.begin(), view.tokens.end(), [&](const auto & t) {
+            return t.seq_ids_extra.empty() && t.seq_id == view.tokens.front().seq_id;
+        });
+    }
+
+    // before the contexts are made: the deeper draft has to size the outputs and the recurrent rollback ring
+    void server_split_overlap_plan(common_params & p) {
+        split_ovl_window    = 0;
+        split_ovl_depth_off = -1;
+        const char * e = getenv("LLAMA_SPLIT_OVERLAP");
+        const int flag = e ? atoi(e) : 0;
+        if (flag != 1 && flag != 2) {
+            return;
+        }
+        const char * why = nullptr;
+        if (p.n_parallel != 1) {
+            why = "needs one slot (-np 1)";
+        } else if (p.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            why = "not with -sm tensor";
+        } else if (common_speculative_n_max(&p.speculative) <= 0 || p.speculative.draft.n_max <= 0) {
+            why = "needs a drafter (draft model, MTP or DSpark)";
+        } else if (p.speculative.has_synth()) {
+            why = "not with synthetic acceptance";
+        }
+        if (why) {
+            SRV_WRN("split overlap chain-ahead off: %s\n", why);
+            return;
+        }
+        const int32_t n = p.speculative.draft.n_max;
+        int32_t depth = 2 * n + 1;
+        if (const char * d = getenv("LLAMA_SPLIT_OVERLAP_DEPTH"); d && atoi(d) > n) {
+            depth = atoi(d);
+        }
+        split_ovl_depth_off           = n;
+        split_ovl_window              = n + 1;
+        p.speculative.draft.n_max     = depth;
+        SRV_INF("split overlap chain-ahead: draft depth %d -> %d, verify windows of %d + rest rows\n", n, depth, n + 1);
+    }
+
+    // after the target context is made: the context decides (two cards, layer split, pipeline parallel)
+    void server_split_overlap_attach(common_params & p) {
+        if (split_ovl_window <= 0) {
+            return;
+        }
+        if (!llama_split_overlap_init(ctx_tgt)) {
+            SRV_WRN("split overlap chain-ahead off: the context refused it; draft depth back to %d\n", split_ovl_depth_off);
+            p.speculative.draft.n_max = split_ovl_depth_off;
+            split_ovl_window = 0;
+        }
+    }
+
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
@@ -2456,6 +2517,7 @@ private:
         }
 
         params_base = params_load;
+        server_split_overlap_plan(params_base);
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -2625,6 +2687,7 @@ private:
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
         }
+        server_split_overlap_attach(params_base);
 
         vocab = llama_model_get_vocab(model_tgt);
 
@@ -7883,8 +7946,18 @@ private:
                     }
                 }
                 llama_set_next_decode_phase(ctx_tgt, batch_phase);
+                // [SPLITOVL] a single-slot verify longer than the first window runs as pipelined windows
+                // (verify rows only: a prompt chunk keeps its ubatch size)
+                const bool ovl_win = split_ovl_window > 0 && batch_phase == LLAMA_DECODE_PHASE_GENERATION &&
+                    n_view > split_ovl_window && server_view_one_seq(batch.view) &&
+                    llama_split_overlap_set_window(ctx_tgt, split_ovl_window);
                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-                if (ret == 0 && has_output) {
+                if (ovl_win) {
+                    llama_split_overlap_set_window(ctx_tgt, 0);
+                    n_split_ovl_rounds++;
+                }
+                if (ret == 0 && has_output && !ovl_win) {
+                    // a windowed verify is waited per window by the row reads (llama_get_logits_ith)
                     llama_synchronize(ctx_tgt);
                 }
             });

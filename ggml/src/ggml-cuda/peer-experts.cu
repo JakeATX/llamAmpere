@@ -6,7 +6,10 @@
 #include "peer-experts.cuh"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 // host layout: [abort line][per slot, per dir: doorbell line, status line][data areas, 256-byte aligned]
 static constexpr size_t PEER_LINE = 128;
@@ -187,5 +190,116 @@ bool ggml_backend_cuda_peer_wait(ggml_backend_t backend, ggml_cuda_peer_mbox * m
     k_peer_wait<<<1, 1024, 0, ctx->stream()>>>(d_bell, d_abort, seq, d_data, (float *) dst->data,
             (int) ggml_nelements(dst), d_status, timeout_ns);
     CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ---- copy hook (see peer-experts.cuh) ----
+
+static constexpr int PEER_LINK_SLOTS = 32;
+
+struct ggml_cuda_peer_link {
+    ggml_cuda_peer_mbox *    mb  = nullptr;
+    uint32_t                 seq = 0;
+    std::vector<cudaEvent_t> done;      // per slot, on the dst device: recorded after the dst stream's wait
+    std::vector<uint32_t>    posted;    // per slot: last seq posted (0 = never)
+    std::vector<uint32_t>    seen_fail; // per slot: last failed seq already counted
+};
+
+static std::atomic<bool>     g_peer_copy_on{false};
+static std::atomic<uint64_t> g_peer_copy_fail{0};
+static std::mutex            g_peer_copy_mtx;
+static size_t                g_peer_copy_max = 1u << 20; // GGML_PEER_EXPERTS_COPY_MAX_KIB (default 1024)
+static uint64_t              g_peer_copy_wait_ns = 10ull * 1000 * 1000 * 1000; // GGML_PEER_EXPERTS_WAIT_MS (default 10000)
+static ggml_cuda_peer_link   g_peer_links[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES];
+
+void ggml_backend_cuda_peer_copy_enable(bool on) {
+    std::lock_guard<std::mutex> lock(g_peer_copy_mtx);
+    if (on) {
+        if (const char * e = getenv("GGML_PEER_EXPERTS_COPY_MAX_KIB"); e && atoi(e) > 0) {
+            g_peer_copy_max = (size_t) atoi(e) * 1024;
+        }
+        if (const char * e = getenv("GGML_PEER_EXPERTS_WAIT_MS"); e && atoi(e) > 0) {
+            g_peer_copy_wait_ns = (uint64_t) atoi(e) * 1000 * 1000;
+        }
+    }
+    g_peer_copy_on.store(on, std::memory_order_release);
+}
+
+bool ggml_cuda_peer_copy_on(void) {
+    return g_peer_copy_on.load(std::memory_order_relaxed);
+}
+
+uint64_t ggml_backend_cuda_peer_copy_failures(void) {
+    std::lock_guard<std::mutex> lock(g_peer_copy_mtx);
+    for (auto & row : g_peer_links) {
+        for (auto & l : row) {
+            if (!l.mb) {
+                continue;
+            }
+            for (int s = 0; s < PEER_LINK_SLOTS; ++s) {
+                const uint32_t st = ggml_backend_cuda_peer_status(l.mb, s, 0);
+                if (st != 0 && st != l.seen_fail[s]) {
+                    l.seen_fail[s] = st;
+                    g_peer_copy_fail++;
+                }
+            }
+        }
+    }
+    return g_peer_copy_fail.load();
+}
+
+bool ggml_cuda_peer_copy(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (src->type != dst->type || (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_I32) ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst) ||
+            ggml_nbytes(src) == 0 || src->data == nullptr || dst->data == nullptr) {
+        return false;
+    }
+    auto * ctx_src = static_cast<ggml_backend_cuda_context *>(backend_src->context);
+    auto * ctx_dst = static_cast<ggml_backend_cuda_context *>(backend_dst->context);
+    const int ds = ctx_src->device, dd = ctx_dst->device;
+    if (ds < 0 || dd < 0 || ds >= GGML_CUDA_MAX_DEVICES || dd >= GGML_CUDA_MAX_DEVICES || ds == dd) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_peer_copy_mtx);
+    if (!g_peer_copy_on.load(std::memory_order_relaxed) || ggml_nbytes(src) > g_peer_copy_max) {
+        return false;
+    }
+    ggml_cuda_peer_link & l = g_peer_links[ds][dd];
+    if (!l.mb) {
+        l.mb = ggml_backend_cuda_peer_mbox_new(PEER_LINK_SLOTS, g_peer_copy_max, 0);
+        if (!l.mb) {
+            return false;
+        }
+        ggml_cuda_set_device(dd);
+        l.done.assign(PEER_LINK_SLOTS, nullptr);
+        for (auto & ev : l.done) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        }
+        l.posted.assign(PEER_LINK_SLOTS, 0);
+        l.seen_fail.assign(PEER_LINK_SLOTS, 0);
+    }
+    if (ggml_nbytes(src) > l.mb->bytes[0]) {
+        return false; // the limit grew after this ring was made
+    }
+    // doorbells start at 0 and are compared as (bell - seq) >= 0: seq 0 is never used
+    if (++l.seq == 0) {
+        ++l.seq;
+    }
+    const uint32_t seq  = l.seq;
+    const int      slot = (int) (seq % PEER_LINK_SLOTS);
+    if (l.posted[slot] != 0) {
+        // the dst stream must have read the slot's previous rows before the src stream overwrites them
+        ggml_cuda_set_device(ds);
+        CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), l.done[slot], 0));
+    }
+    if (!ggml_backend_cuda_peer_post(backend_src, l.mb, slot, 0, src, seq) ||
+            !ggml_backend_cuda_peer_wait(backend_dst, l.mb, slot, 0, dst, seq, g_peer_copy_wait_ns)) {
+        // cannot happen after the checks above; the copy state is then unknown, so stop using the hook
+        g_peer_copy_on.store(false);
+        GGML_ABORT("peer copy: mailbox post/wait refused after the argument checks");
+    }
+    ggml_cuda_set_device(dd);
+    CUDA_CHECK(cudaEventRecord(l.done[slot], ctx_dst->stream()));
+    l.posted[slot] = seq;
     return true;
 }

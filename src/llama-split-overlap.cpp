@@ -171,9 +171,81 @@ float * llama_context::split_overlap_logits_ith(int32_t slot, int32_t i) {
     return lg.data + (size_t) j * model.vocab.n_tokens();
 }
 
+// ---- verify windows inside one decode ----
+//
+// A caller that verifies a long draft (the server's chain-ahead: depth 2n+1 where n would do) sets a window of the
+// first n+1 rows. decode() then cuts that batch into ubatches of at most `window` rows, which the pipeline-parallel
+// scheduler runs back to back: card A starts window 1 while card B finishes window 0. One output set holds all
+// rows (embeddings, layer inputs and nextn rows stay where the readers expect them). llama_get_logits_ith(i) waits
+// for the events of the window holding row i only, so the sampler accepts window 0 while window 1 is in flight; the
+// last window's read, and every other accessor, synchronizes as before.
+
+bool llama_context::split_overlap_set_window(int32_t n_rows) {
+    if (!split_ovl.enabled || n_rows < 0) {
+        return false;
+    }
+    split_ovl.window = (uint32_t) n_rows;
+    return true;
+}
+
+void llama_context::split_overlap_record_window(bool ok, int64_t n_rows_end) {
+    auto & so = split_ovl;
+    if (!ok) {
+        so.win_ok = false; // multi-sequence or B1 ubatch: the reads synchronize as usual
+        so.win_end.clear();
+        return;
+    }
+    const size_t w = so.win_end.size();
+    if (so.win_ev.size() <= w) {
+        so.win_ev.emplace_back();
+        for (ggml_backend_t b : so.ev_backend) {
+            so.win_ev.back().emplace_back(ggml_backend_event_new(ggml_backend_get_device(b)));
+            if (!so.win_ev.back().back()) {
+                so.win_ev.pop_back();
+                so.win_ok = false;
+                so.win_end.clear();
+                return;
+            }
+        }
+    }
+    for (size_t i = 0; i < so.ev_backend.size(); ++i) {
+        ggml_backend_event_record(so.win_ev[w][i].get(), so.ev_backend[i]);
+    }
+    so.win_end.push_back(n_rows_end);
+}
+
+bool llama_context::split_overlap_wait_row(int32_t i) {
+    auto & so = split_ovl;
+    if (!so.win_pending || i < 0 || (size_t) i >= output_ids.size()) {
+        return false;
+    }
+    const int64_t j = output_ids[i];
+    if (j < 0) {
+        return false;
+    }
+    size_t w = 0;
+    while (w < so.win_end.size() && j >= so.win_end[w]) {
+        ++w;
+    }
+    if (w + 1 >= so.win_end.size()) {
+        return false; // the last window (or out of range): full synchronize, stats and checks as before
+    }
+    for (; so.win_waited <= w; ++so.win_waited) {
+        for (auto & ev : so.win_ev[so.win_waited]) {
+            ggml_backend_event_synchronize(ev.get());
+        }
+    }
+    so.n_win_reads++;
+    return true;
+}
+
 //
 // C API
 //
+
+bool llama_split_overlap_set_window(llama_context * ctx, int32_t n_rows) {
+    return ctx && ctx->split_overlap_set_window(n_rows);
+}
 
 bool llama_split_overlap_init(llama_context * ctx) {
     return ctx && ctx->split_overlap_init();
