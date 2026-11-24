@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-split-buft.h"
 #include "llama-inklsa.h"
 #include "llama-kq-mask-pack.h"
 #include "llama-kv-stream-plan.h"
@@ -2156,9 +2157,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
         // LLAMA_LSA_RESIDENT strip buffers split the same way (pinned master on the host, slots + meta on the card)
-        if (strncmp(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_", 18) == 0 ||
-                strncmp(ggml_backend_buft_name(buft), "CUDA_LSA_Strip_", 15) == 0 ||
-                strncmp(ggml_backend_buft_name(buft), "CUDA_LSA_Page_", 14) == 0) {
+        if (llama_buft_is_split_body(buft)) {
             auto * dev = ggml_backend_buft_get_device(buft);
             using bytes_fn = size_t (*)(ggml_backend_buffer_type_t, const ggml_tensor *);
             auto * device_bytes = reinterpret_cast<bytes_fn>(ggml_backend_reg_get_proc_address(
