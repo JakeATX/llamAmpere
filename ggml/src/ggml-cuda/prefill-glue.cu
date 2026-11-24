@@ -1079,7 +1079,8 @@ bool ggml_cuda_try_fuse_prefill_glu(ggml_backend_cuda_context * ctx, ggml_cgraph
         return false;
     }
     const int32_t swapped = ((const int32_t *) glu->op_params)[1];
-    const float limit     = ggml_get_op_params_f32(glu, 2);
+    // same op_params slots the stock CUDA GLU ops read: SWIGLU_CLAMP limit = [3], SWIGLU_OAI alpha / limit = [2] / [3]
+    const float limit     = ggml_get_op_params_f32(glu, 3);
     float oai_alpha = 1.702f, oai_limit = 7.0f;
     if (kind == PF_GLU_SWIGLU_OAI) {
         oai_alpha = ggml_get_op_params_f32(glu, 2);

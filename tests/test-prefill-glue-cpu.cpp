@@ -334,10 +334,10 @@ int main() {
     std::mt19937 rng(42);
     bool ok = true;
 
-    // 1. Default-OFF safety checks when env switches are unset/0
+    // 1. report the switches (the kernels are opt-in; this binary has no CUDA)
     const char * e1 = std::getenv("GGML_CUDA_PREFILL_FUSE_GLU_ACTQ");
     const char * e2 = std::getenv("GGML_CUDA_PREFILL_FUSE_NORM_ACTQ");
-    std::printf("[MEASURED CPU] Env kill-switch default check: GLU=%s NORM=%s\n",
+    std::printf("[INFO] env: GGML_CUDA_PREFILL_FUSE_GLU_ACTQ=%s GGML_CUDA_PREFILL_FUSE_NORM_ACTQ=%s\n",
                 e1 ? e1 : "(unset->0)", e2 ? e2 : "(unset->0)");
 
     // 2. GLU exactness across Inkling2 (1152, 2304, 18432) and dense (8192, 28672) shapes + Outl100x
