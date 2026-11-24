@@ -579,8 +579,8 @@ cudaError_t ggml_cuda_mem_get_info_capped(size_t * free, size_t * total) {
     return err;
 }
 
-// P2P sanity probe (GGML_CUDA_P2P_PROBE=0 turns it off). Idea from Strata v0.2.19 ep_dual_gpu.cu (MIT); clean
-// reimplementation. Some IOMMU/ACS root complexes report cudaDeviceCanAccessPeer = 1 but drop or zero peer
+// P2P sanity probe (GGML_CUDA_P2P_PROBE=0 turns it off).
+// Some IOMMU/ACS root complexes report cudaDeviceCanAccessPeer = 1 but drop or zero peer
 // transfers, which gives silent garbage under layer/tensor split. After peer access is enabled, a 4 KiB pattern is
 // copied peer-to-peer in both directions and read back; on a mismatch (or any CUDA error) peer access is disabled for
 // that pair, so copies go through the driver's host-staged path. Runs once at init, never inside graph capture.

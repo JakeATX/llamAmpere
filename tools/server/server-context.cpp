@@ -187,8 +187,8 @@ static bool server_copy_inplace() {
     return v;
 }
 
-// NaN guard (LLAMA_SERVER_NAN_GUARD=0 turns it off). Idea from Strata v0.2.19 core/verify.cpp (MIT); clean
-// reimplementation. A NaN or +inf logit on the sampled row means the forward pass produced garbage; sampling from it
+// NaN guard (LLAMA_SERVER_NAN_GUARD=0 turns it off).
+// A NaN or +inf logit on the sampled row means the forward pass produced garbage; sampling from it
 // gives junk tokens and the slot's cached state would poison later turns. O(1) per token: only the sampled candidate
 // is read (a NaN hidden state makes every logit NaN). -inf is legal (masked tokens) and is not flagged.
 // LLAMA_SERVER_NAN_GUARD_INJECT=<n> (test only) trips the guard from the n-th generated token of every request.
