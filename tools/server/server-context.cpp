@@ -134,6 +134,28 @@ extern "C" {
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// thinking-loop guard: LLAMA_SERVER_THINK_LOOP_CLOSE=N closes an open think block after N repeats of one token
+// (256 is the intended value). Unset or 0 = off (default)
+// thinking-loop guard: LLAMA_SERVER_THINK_LOOP_CLOSE=N closes an open think block after N repeats of one token
+// (256 is the intended value). Unset or 0 = off (default)
+// non-streaming keep-alive: LLAMA_SERVER_JSON_KEEPALIVE=S sends a space every S seconds while a non-streaming reply
+// is not ready yet (after the first S seconds). Unset or 0 = off (default)
+static int32_t server_json_keepalive_s() {
+    static const int32_t v = [] {
+        const char * e = getenv("LLAMA_SERVER_JSON_KEEPALIVE");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    return v;
+}
+
+static int32_t server_think_loop_close() {
+    static const int32_t v = [] {
+        const char * e = getenv("LLAMA_SERVER_THINK_LOOP_CLOSE");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    return v;
+}
+
 // GPU verification of MTP/draft tokens (argmax or the full sampler chain on the backend, only token ids
 // downloaded) is opt-in, via LLAMA_MTP_GPU_VERIFY:
 //
@@ -958,6 +980,10 @@ struct server_slot {
     stop_type stop;
     server_loop_guard loop_guard;
 
+    // thinking-loop guard (LLAMA_SERVER_THINK_LOOP_CLOSE): run of one repeated token inside the think block
+    llama_token think_run_tok = LLAMA_TOKEN_NULL;
+    int32_t     think_run_n   = 0;
+
     std::string stopping_word;
 
     // state
@@ -1189,6 +1215,8 @@ struct server_slot {
         prompt_checkpoint_restored = false;
         stop           = STOP_TYPE_NONE;
         loop_guard     = {};
+        think_run_tok  = LLAMA_TOKEN_NULL;
+        think_run_n    = 0;
         stopping_word  = "";
         n_sent_text    = 0;
 
@@ -3965,6 +3993,8 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.loop_guard = {};
+        slot.think_run_tok = LLAMA_TOKEN_NULL;
+        slot.think_run_n   = 0;
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
         slot.answer_reserve = -1;
         slot.think_tracker.reset(slot.smpl ? common_reasoning_tracker_init(model_tgt, task.params.sampling) : nullptr);
@@ -4049,7 +4079,41 @@ private:
 
         // check if there is incomplete UTF-8 character at the end
         const auto & tp = slot.task->params;
-        const bool looped = tp.loop_guard && slot.loop_guard.accept(result.tok, tp.loop_guard_reps, params_base.loop_guard_span);
+        bool looped = tp.loop_guard && slot.loop_guard.accept(result.tok, tp.loop_guard_reps, params_base.loop_guard_span);
+
+        // thinking-loop guard, opt-in (LLAMA_SERVER_THINK_LOOP_CLOSE=N, unset or 0 = off): N repeats of one token
+        // inside an open think block close the block (the end tag is forced) so the answer still gets written,
+        // instead of the loop burning the budget or the repeat stop ending the reply with no answer. While it is
+        // on, the repeat stop above ignores a one-token run inside the think block and leaves it to this guard.
+        if (const int32_t think_loop_n = server_think_loop_close(); think_loop_n > 0 && slot.smpl) {
+            const bool in_think = common_sampler_reasoning_in_think(slot.smpl.get(), slot.think_tracker.get());
+            if (!in_think) {
+                slot.think_run_tok = LLAMA_TOKEN_NULL;
+                slot.think_run_n   = 0;
+            } else {
+                slot.think_run_n   = result.tok == slot.think_run_tok ? slot.think_run_n + 1 : 1;
+                slot.think_run_tok = result.tok;
+                if (looped && slot.loop_guard.period == 1) {
+                    looped = false;
+                }
+                // only the last token of a group is not yet decoded, so the block is closed only there
+                if (last_in_group && slot.think_run_n >= think_loop_n) {
+                    llama_sampler * tracker = slot.think_tracker.release();
+                    if (tracker && common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING) {
+                        // the tracker moves into the chain: sampling continues on the CPU from here
+                        llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
+                    }
+                    if (common_sampler_reasoning_close(slot.smpl.get(), &tracker)) {
+                        SLT_INF(slot, "think loop guard: token %d repeated %d times in the think block, closing it, n_gen = %d\n",
+                                result.tok, slot.think_run_n, (int) slot.stats.n_gen);
+                        slot.stats.think_loop_closed = true;
+                    }
+                    slot.think_tracker.reset(tracker);
+                    slot.think_run_tok = LLAMA_TOKEN_NULL;
+                    slot.think_run_n   = 0;
+                }
+            }
+        }
         if (looped) {
             // Flush pending text on a loop stop without an incomplete UTF-8 suffix.
             slot.generated.truncate(validate_utf8(slot.generated.text));
