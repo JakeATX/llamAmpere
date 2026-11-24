@@ -9945,8 +9945,7 @@ static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_cont
             return GGML_TYPE_COUNT;
         }
         if (w->type == GGML_TYPE_Q8_0 &&
-                ((ggml_cuda_nk_dense_tc_enabled() && w->ne[1] >= ggml_cuda_nk_dense_tc_min_rows()) ||
-                 ggml_cuda_q8a16_enabled())) {
+                (ggml_cuda_nk_dense_tc_takes_rows(w->ne[1]) || ggml_cuda_q8a16_enabled())) {
             return GGML_TYPE_COUNT; // NK_DENSE_TC / Q8A16 reads the f32 activation directly
         }
         return w->type;
@@ -18779,6 +18778,15 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "nk_dense_tc") == 0) {
         return ggml_cuda_nk_dense_tc_count();
     }
+    if (strcmp(name, "nk_dense_tc_head_grid") == 0) {
+        return ggml_cuda_nk_dense_tc_head_grid_count();
+    }
+    if (strcmp(name, "nk_dense_tc_head_tc") == 0) {
+        return ggml_cuda_nk_dense_tc_head_tc_count();
+    }
+    if (strcmp(name, "nk_dense_tc_dense") == 0) {
+        return ggml_cuda_nk_dense_tc_dense_count();
+    }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
     }
@@ -19025,7 +19033,34 @@ static bool ggml_backend_cuda_nk_dense_tc_run(
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(ctx->device);
     if (use_nk) {
-        return ggml_cuda_nk_dense_tc_mul_mat(*ctx, src0, src1, dst, true);
+        return ggml_cuda_nk_dense_tc_mul_mat(*ctx, src0, src1, dst, true, -1, false);
+    }
+    return ggml_cuda_q8a16_mul_mat(*ctx, src0, src1, dst);
+}
+
+// test-backend-ops helper with explicit path_override (-1=env, 0=auto, 1=tc, 2=grid) and respect_mint
+// (falls back cleanly to base q8a16 when NK declines, e.g. T<MINT on head).
+static bool ggml_backend_cuda_nk_dense_tc_run_ex(
+        ggml_backend_t      backend,
+        bool                use_nk,
+        int                 path_override,
+        bool                respect_mint,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor       * dst) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    if (use_nk) {
+        if (ggml_cuda_nk_dense_tc_mul_mat(*ctx, src0, src1, dst, true, path_override, respect_mint)) {
+            return true;
+        }
+        if (respect_mint) {
+            return ggml_cuda_q8a16_mul_mat(*ctx, src0, src1, dst);
+        }
+        return false;
     }
     return ggml_cuda_q8a16_mul_mat(*ctx, src0, src1, dst);
 }
@@ -19435,6 +19470,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_nk_dense_tc_run") == 0) {
         return (void *)ggml_backend_cuda_nk_dense_tc_run;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nk_dense_tc_run_ex") == 0) {
+        return (void *)ggml_backend_cuda_nk_dense_tc_run_ex;
     }
     if (strcmp(name, "ggml_backend_cuda_nk_dense_tc_group_run") == 0) {
         return (void *)ggml_backend_cuda_nk_dense_tc_group_run;

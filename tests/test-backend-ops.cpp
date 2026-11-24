@@ -27653,15 +27653,17 @@ static int run_nk_dense_tc_check() {
     }
     ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    using run_fn   = bool (*)(ggml_backend_t, bool, const ggml_tensor *, const ggml_tensor *, ggml_tensor *);
-    using grp_fn   = bool (*)(ggml_backend_t, bool, ggml_tensor * const *, int);
-    using cnt_fn   = int64_t (*)(ggml_backend_t, const char *);
-    auto run_mm    = (run_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_dense_tc_run");
-    auto run_grp   = (grp_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_dense_tc_group_run");
-    auto cnt       = (cnt_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
-    if (!run_mm || !run_grp || !cnt) {
-        fprintf(stderr, "nk_dense_tc: missing proc address (mm=%p grp=%p cnt=%p)\n",
-                (void *) run_mm, (void *) run_grp, (void *) cnt);
+    using run_fn    = bool (*)(ggml_backend_t, bool, const ggml_tensor *, const ggml_tensor *, ggml_tensor *);
+    using run_ex_fn = bool (*)(ggml_backend_t, bool, int, bool, const ggml_tensor *, const ggml_tensor *, ggml_tensor *);
+    using grp_fn    = bool (*)(ggml_backend_t, bool, ggml_tensor * const *, int);
+    using cnt_fn    = int64_t (*)(ggml_backend_t, const char *);
+    auto run_mm     = (run_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_dense_tc_run");
+    auto run_mm_ex  = (run_ex_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_dense_tc_run_ex");
+    auto run_grp    = (grp_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_dense_tc_group_run");
+    auto cnt        = (cnt_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+    if (!run_mm || !run_mm_ex || !run_grp || !cnt) {
+        fprintf(stderr, "nk_dense_tc: missing proc address (mm=%p ex=%p grp=%p cnt=%p)\n",
+                (void *) run_mm, (void *) run_mm_ex, (void *) run_grp, (void *) cnt);
         ggml_backend_free(be);
         return 1;
     }
@@ -27937,25 +27939,34 @@ static int run_nk_dense_tc_check() {
         ggml_free(ctx);
     }
 
-    // 2b. Head kernel correctness (k_nk_head_tc, M >= 16385): M=201024 K=2304 at T=1,2,5,8
-    //     (exact CPU double ref on 384 rows spanning start/mid/end SM slices + full NaN/Inf scan)
-    //     plus non-16 head tail edge M=16399 K=2304 T=5 and max-SMEM K=3072 edge M=16400 T=5.
+    // 2b. Head kernel correctness (M >= 16385): both head_grid (0-SMEM DP4A) and head_tc (persistent IMMA).
+    //     Pre-fills the ENTIRE output tensor with NaN before every run and verifies every single (row, col)
+    //     element is finite (catches any skipped tile). Checks BOTH:
+    //       - exact per-32 int8-activation CPU double ref: nmse_q8 <= 1e-6 AND max_abs_q8 <= 1e-3 * rms;
+    //       - unquantized f32 CPU double ref:              nmse_f32 <= 1e-4 AND max_abs_f32 <= 0.05 * rms;
+    //     plus path-specific counter increment (+1 on nk_dense_tc_head_grid or nk_dense_tc_head_tc).
     {
         struct head_corr_case {
             const char * name;
             int64_t M, K, T;
+            int     path; // 2=grid, 1=tc
         };
         const std::vector<head_corr_case> hcases = {
-            { "head_201024_T1",       201024, 2304, 1 },
-            { "head_201024_T2",       201024, 2304, 2 },
-            { "head_201024_T5",       201024, 2304, 5 },
-            { "head_201024_T8",       201024, 2304, 8 },
-            { "head_edge_M16399_T5",   16399, 2304, 5 },
-            { "head_edge_K3072_T5",    16400, 3072, 5 },
+            { "head_grid_201024_T1",  201024, 2304, 1, 2 },
+            { "head_grid_201024_T2",  201024, 2304, 2, 2 },
+            { "head_grid_201024_T5",  201024, 2304, 5, 2 },
+            { "head_grid_201024_T8",  201024, 2304, 8, 2 },
+            { "head_grid_M16399_T5",   16399, 2304, 5, 2 },
+            { "head_grid_K3072_T5",    16400, 3072, 5, 2 },
+            { "head_tc_201024_T5",    201024, 2304, 5, 1 },
+            { "head_tc_201024_T8",    201024, 2304, 8, 1 },
+            { "head_tc_M16399_T5",     16399, 2304, 5, 1 },
+            { "head_tc_K3072_T5",      16400, 3072, 5, 1 },
         };
         const size_t tsz = ggml_type_size(GGML_TYPE_Q8_0);
         const int    bsz = (int) ggml_blck_size(GGML_TYPE_Q8_0);
         const auto to_float = ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float;
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
 
         for (size_t hi = 0; hi < hcases.size(); ++hi) {
             const auto & h = hcases[hi];
@@ -27969,7 +27980,6 @@ static int run_nk_dense_tc_check() {
             ggml_tensor * t_d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  h.M, h.T);
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
 
-            // Fast deterministic pseudo-random valid Q8_0 weights across all M rows
             std::vector<uint8_t> h_wq((size_t) h.M * row_bytes);
             uint32_t st = 0x12345678u ^ ((uint32_t) hi * 0x9e3779b9u);
             auto xorsh = [&]() -> uint32_t {
@@ -28006,174 +28016,127 @@ static int run_nk_dense_tc_check() {
             std::vector<float> h_x((size_t) h.T * h.K);
             for (float & v : h_x) { v = nd(rng); }
 
-            ggml_backend_tensor_set(t_w, h_wq.data(), 0, h_wq.size());
-            ggml_backend_tensor_set(t_x, h_x.data(),  0, h_x.size() * sizeof(float));
+            // Pre-fill entire output tensor with NaN so any skipped tile fails immediately
+            std::vector<float> h_nan((size_t) h.T * h.M, qnan);
+            ggml_backend_tensor_set(t_w, h_wq.data(),  0, h_wq.size());
+            ggml_backend_tensor_set(t_x, h_x.data(),   0, h_x.size() * sizeof(float));
+            ggml_backend_tensor_set(t_d, h_nan.data(), 0, h_nan.size() * sizeof(float));
 
+            const char * path_cnt_name = (h.path == 2) ? "nk_dense_tc_head_grid" : "nk_dense_tc_head_tc";
             const int64_t c0 = cnt(be, "nk_dense_tc");
-            const bool ok_nk = run_mm(be, true, t_w, t_x, t_d);
+            const int64_t p0 = cnt(be, path_cnt_name);
+            const bool ok_nk = run_mm_ex(be, true, h.path, false, t_w, t_x, t_d);
             const int64_t c1 = cnt(be, "nk_dense_tc");
+            const int64_t p1 = cnt(be, path_cnt_name);
             ggml_backend_synchronize(be);
 
             std::vector<float> h_out((size_t) h.T * h.M);
             ggml_backend_tensor_get(t_d, h_out.data(), 0, h_out.size() * sizeof(float));
 
-            bool bad_fp = false;
+            int64_t bad_fp_cnt = 0;
             for (float v : h_out) {
-                if (!std::isfinite(v)) { bad_fp = true; break; }
+                if (!std::isfinite(v)) { ++bad_fp_cnt; }
             }
 
-            // Sampled rows spanning start, middle, and tail SM slices (incl. last row M-1)
+            // Build exact per-32 int8-quantized x on CPU (matches GPU 12582912.0f bias + fp32 scale)
+            std::vector<float> h_xq((size_t) h.T * h.K);
+            for (int64_t t = 0; t < h.T; ++t) {
+                for (int64_t b = 0; b < h.K / bsz; ++b) {
+                    const float * src = h_x.data() + (size_t) t * h.K + (size_t) b * bsz;
+                    float * dst_q = h_xq.data() + (size_t) t * h.K + (size_t) b * bsz;
+                    float m = 0.0f;
+                    for (int i = 0; i < bsz; ++i) { m = std::max(m, std::fabs(src[i])); }
+                    const float dx = m * (1.0f / 127.0f);
+                    const float inv_dx = (m > 1e-30f) ? (127.0f / m) : 0.0f;
+                    for (int i = 0; i < bsz; ++i) {
+                        const float z = std::fma(src[i], inv_dx, 12582912.0f);
+                        uint32_t zi = 0;
+                        std::memcpy(&zi, &z, sizeof(zi));
+                        const int8_t q = (int8_t) (zi & 0xffu);
+                        dst_q[i] = (float) q * dx;
+                    }
+                }
+            }
+
+            // Sample 512 rows spanning start, quarter, middle, and final SM slices (incl. last row M-1)
             std::vector<int64_t> check_rows;
-            const int64_t starts[3] = { 0, (h.M / 2) & ~15ll, std::max<int64_t>(0, h.M - 128) };
-            for (int s = 0; s < 3; ++s) {
+            const int64_t starts[4] = {
+                0,
+                (h.M / 4) & ~15ll,
+                (h.M / 2) & ~15ll,
+                std::max<int64_t>(0, h.M - 128),
+            };
+            for (int s = 0; s < 4; ++s) {
                 for (int64_t off = 0; off < 128 && starts[s] + off < h.M; ++off) {
                     check_rows.push_back(starts[s] + off);
                 }
             }
 
-            double num = 0.0, den = 0.0, max_abs = 0.0;
+            double num_f32 = 0.0, den_f32 = 0.0, max_abs_f32 = 0.0;
+            double num_q8  = 0.0, den_q8  = 0.0, max_abs_q8  = 0.0;
             std::vector<float> w_row((size_t) h.K);
             for (int64_t r : check_rows) {
                 to_float(h_wq.data() + (size_t) r * row_bytes, w_row.data(), h.K);
                 for (int64_t t = 0; t < h.T; ++t) {
-                    const float * xt = h_x.data() + (size_t) t * h.K;
-                    double ref = 0.0;
+                    const float * xt  = h_x.data()  + (size_t) t * h.K;
+                    const float * xqt = h_xq.data() + (size_t) t * h.K;
+                    double rf = 0.0, rq = 0.0;
                     for (int64_t j = 0; j < h.K; ++j) {
-                        ref += (double) w_row[(size_t) j] * (double) xt[(size_t) j];
+                        const double wv = (double) w_row[(size_t) j];
+                        rf += wv * (double) xt[(size_t) j];
+                        rq += wv * (double) xqt[(size_t) j];
                     }
                     const double got = (double) h_out[(size_t) t * h.M + r];
-                    const double d = got - ref;
-                    num += d * d;
-                    den += ref * ref;
-                    if (std::fabs(d) > max_abs) { max_abs = std::fabs(d); }
+                    const double df = got - rf;
+                    const double dq = got - rq;
+                    num_f32 += df * df; den_f32 += rf * rf;
+                    num_q8  += dq * dq; den_q8  += rq * rq;
+                    if (std::fabs(df) > max_abs_f32) { max_abs_f32 = std::fabs(df); }
+                    if (std::fabs(dq) > max_abs_q8)  { max_abs_q8  = std::fabs(dq); }
                 }
             }
-            const double nmse = den > 0.0 ? (num / den) : num;
-            const bool pass = ok_nk && (c1 == c0 + 1) && !bad_fp && nmse <= max_nmse;
+            const double n_elems  = (double) check_rows.size() * (double) h.T;
+            const double rms      = std::sqrt(den_q8 / std::max(1.0, n_elems));
+            const double nmse_q8  = den_q8  > 0.0 ? (num_q8  / den_q8)  : num_q8;
+            const double nmse_f32 = den_f32 > 0.0 ? (num_f32 / den_f32) : num_f32;
+            const double lim_abs_q8  = std::max(1e-4, 1e-3 * rms);
+            const double lim_abs_f32 = std::max(1e-2, 0.05 * rms);
+            const bool pass = ok_nk && (c1 == c0 + 1) && (p1 == p0 + 1) && (bad_fp_cnt == 0) &&
+                nmse_q8 <= 1e-6 && max_abs_q8 <= lim_abs_q8 &&
+                nmse_f32 <= 1e-4 && max_abs_f32 <= lim_abs_f32;
             if (!pass) {
                 ++fails;
-                printf("NK_DENSE_TC(%-20s): FAIL ok=%d dc=%lld nmse=%.3e max_abs=%.3e bad_fp=%d\n",
-                       h.name, ok_nk, (long long) (c1 - c0), nmse, max_abs, bad_fp);
+                printf("NK_DENSE_TC(%-20s): FAIL ok=%d dc=%lld dp=%lld nan_inf=%lld nmse_q8=%.2e max_q8=%.2e (lim=%.2e) nmse_f32=%.2e max_f32=%.2e\n",
+                       h.name, ok_nk, (long long) (c1 - c0), (long long) (p1 - p0), (long long) bad_fp_cnt,
+                       nmse_q8, max_abs_q8, lim_abs_q8, nmse_f32, max_abs_f32);
             } else {
-                printf("NK_DENSE_TC(%-20s): OK (rows=%zu nmse=%.2e max_abs=%.3e cnt=+1)\n",
-                       h.name, check_rows.size(), nmse, max_abs);
+                printf("NK_DENSE_TC(%-20s): OK (all %lld finite, nmse_q8=%.2e max_q8=%.2e | nmse_f32=%.2e max_f32=%.2e | %s=+1)\n",
+                       h.name, (long long) (h.M * h.T), nmse_q8, max_abs_q8, nmse_f32, max_abs_f32, path_cnt_name);
             }
             ggml_backend_buffer_free(buf);
             ggml_free(ctx);
         }
     }
 
-    // 3. Same-job ABBA microbench (base q8a16 vs NK_DENSE_TC) at exact Inkling 2 Mini NQ shapes
-    printf("\n--- NK_DENSE_TC same-job ABBA microbench (base=q8a16 -> nk=NK_DENSE_TC) ---\n");
-    const int warmup = 20;
-    const int iters  = 200;
-
-    double qkv_base_t5 = 0.0, qkv_nk_t5 = 0.0;
-    double out_base_t5 = 0.0, out_nk_t5 = 0.0;
-    double qkv_base_t8 = 0.0, qkv_nk_t8 = 0.0;
-    double out_base_t8 = 0.0, out_nk_t8 = 0.0;
-
-    // 3a. Grouped QKV 6-member SWA (8576 x 2304, 20.99 MB) across T=1..8
+    // 3. Same-job ABBA microbench on target head output.weight (201024x2304, 492.1 MB) for T=1..8
+    //    Runs the active production policy (respect_mint=true, path_override=-1 -> obeys env overrides)
+    //    and reports per T which exact path ran (base(q8a16) / head_grid / head_tc / dense_tc),
+    //    plus a direct same-job 3-arm comparison (base vs head_grid vs head_tc) at T=4,5,6,7,8.
+    printf("\n--- NK_DENSE_TC target head ABBA microbench (201024x2304, 492.1 MB, base=q8a16 vs NK) ---\n");
     {
-        const int nm = (int) qkv6.size();
+        const int64_t M = 201024;
         const int64_t K = 2304;
-        const int64_t M_tot = 8576;
-        const double w_bytes = (double) M_tot * (double) ggml_row_size(GGML_TYPE_Q8_0, K);
+        const int w_iters = 10;
+        const int t_iters = 40;
+        const double w_bytes = (double) M * (double) ggml_row_size(GGML_TYPE_Q8_0, K);
 
-        ggml_init_params ip = { 64 * ggml_tensor_overhead(), nullptr, true };
-        ggml_context * ctx = ggml_init(ip);
-        ggml_tensor * xs[3];
-        for (int s = 0; s < 3; ++s) {
-            xs[s] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 8);
-        }
-        std::vector<ggml_tensor *> ws(nm);
-        for (int m = 0; m < nm; ++m) {
-            ws[m] = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, qkv6[m]);
-        }
-        ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx, be);
-        for (int s = 0; s < 3; ++s) {
-            std::vector<float> hx((size_t) 8 * K, 0.25f);
-            ggml_backend_tensor_set(xs[s], hx.data(), 0, hx.size() * sizeof(float));
-        }
-        for (int m = 0; m < nm; ++m) {
-            std::vector<uint8_t> h_wq;
-            std::vector<float> h_deq;
-            make_q8_weights(qkv6[m], K, 12300u + (uint32_t) m, h_wq, h_deq);
-            ggml_backend_tensor_set(ws[m], h_wq.data(), 0, h_wq.size());
-        }
-
-        for (int T = 1; T <= 8; ++T) {
-            ggml_init_params ip_t = { 32 * ggml_tensor_overhead(), nullptr, true };
-            ggml_context * ctx_t = ggml_init(ip_t);
-            std::vector<ggml_tensor *> ds(nm);
-            for (int m = 0; m < nm; ++m) {
-                const int xidx = (m == 2) ? 1 : (m == 3) ? 2 : 0;
-                ggml_tensor * xv = ggml_view_2d(ctx_t, xs[xidx], K, T, xs[xidx]->nb[1], 0);
-                ds[m] = ggml_mul_mat(ctx_t, ws[m], xv);
-            }
-            ggml_backend_buffer_t buf_t = ggml_backend_alloc_ctx_tensors(ctx_t, be);
-
-            auto time_leg = [&](bool use_nk) -> double {
-                const int64_t cb = cnt(be, "nk_dense_tc");
-                for (int w = 0; w < warmup; ++w) {
-                    if (!run_grp(be, use_nk, ds.data(), nm)) { ++fails; }
-                }
-                ggml_backend_synchronize(be);
-                const int64_t t0 = ggml_time_us();
-                for (int i = 0; i < iters; ++i) {
-                    if (!run_grp(be, use_nk, ds.data(), nm)) { ++fails; }
-                }
-                ggml_backend_synchronize(be);
-                const int64_t dt = ggml_time_us() - t0;
-                const int64_t ca = cnt(be, "nk_dense_tc");
-                const int64_t exp_dc = use_nk ? (int64_t) (warmup + iters) : 0;
-                if (ca - cb != exp_dc) {
-                    ++fails;
-                    fprintf(stderr, "nk_dense_tc: counter mismatch on qkv6 T=%d use_nk=%d got=%lld exp=%lld\n",
-                            T, use_nk, (long long) (ca - cb), (long long) exp_dc);
-                }
-                return (double) dt / iters;
-            };
-            const double a1 = time_leg(false);
-            const double b1 = time_leg(true);
-            const double b2 = time_leg(true);
-            const double a2 = time_leg(false);
-            const double base_us = 0.5 * (a1 + a2);
-            const double nk_us   = 0.5 * (b1 + b2);
-            if (T == 5) { qkv_base_t5 = base_us; qkv_nk_t5 = nk_us; }
-            if (T == 8) { qkv_base_t8 = base_us; qkv_nk_t8 = nk_us; }
-            printf("NK_DENSE_TC perf %-18s T=%d (%.2f MB): base=%6.2f us (%4.0f GB/s) -> nk=%6.2f us (%4.0f GB/s) | delta=%+6.2f us (%+5.1f%%)\n",
-                   "qkv6_8576x2304", T, w_bytes / 1e6, base_us, w_bytes / (base_us * 1e3),
-                   nk_us, w_bytes / (nk_us * 1e3), nk_us - base_us, (nk_us / base_us - 1.0) * 100.0);
-            ggml_backend_buffer_free(buf_t);
-            ggml_free(ctx_t);
-        }
-        ggml_backend_buffer_free(buf_w);
-        ggml_free(ctx);
-    }
-
-    // 3b. Single MUL_MAT shapes: attn_output (2304x3072, T=1..8), attn_q (3072x2304, T=1,2,5,8), output_head (201024x2304, T=5)
-    struct perf_single {
-        const char * name;
-        int64_t M, K;
-        std::vector<int> ts;
-        int w_iters, t_iters;
-    };
-    const std::vector<perf_single> pshapes = {
-        { "head_201024x2304",   201024, 2304, { 1, 2, 3, 4, 5, 6, 7, 8 }, 10, 40 },
-        { "attn_out_2304x3072", 2304,   3072, { 1, 2, 3, 4, 5, 6, 7, 8 }, warmup, iters },
-        { "attn_q_3072x2304",   3072,   2304, { 1, 2, 5, 8 },             warmup, iters },
-    };
-    for (const auto & ps : pshapes) {
-        const double w_bytes = (double) ps.M * (double) ggml_row_size(GGML_TYPE_Q8_0, ps.K);
         ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(ip);
-        ggml_tensor * t_w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ps.K, ps.M);
-        ggml_tensor * t_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ps.K, 8);
-        ggml_tensor * t_d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ps.M, 8);
+        ggml_tensor * t_w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, M);
+        ggml_tensor * t_x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  K, 8);
+        ggml_tensor * t_d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  M, 8);
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
 
-        // Fast synthetic valid Q8_0 fill (34 B/block = 2 B fp16 scale + 32 int8 qs)
         {
             const size_t nbytes = ggml_nbytes(t_w);
             const size_t tsz    = ggml_type_size(GGML_TYPE_Q8_0);
@@ -28190,64 +28153,96 @@ static int run_nk_dense_tc_check() {
                 }
             }
             ggml_backend_tensor_set(t_w, raw.data(), 0, nbytes);
-            std::vector<float> hx((size_t) 8 * ps.K, 0.25f);
+            std::vector<float> hx((size_t) 8 * K, 0.25f);
             ggml_backend_tensor_set(t_x, hx.data(), 0, hx.size() * sizeof(float));
         }
 
-        for (int T : ps.ts) {
+        auto run_head_leg = [&](ggml_tensor * xv, ggml_tensor * dv, bool use_nk, int path_ov, bool resp_mint,
+                                int64_t & out_dc_grid, int64_t & out_dc_tc, int64_t & out_dc_dense) -> double {
+            const int64_t g0 = cnt(be, "nk_dense_tc_head_grid");
+            const int64_t t0c = cnt(be, "nk_dense_tc_head_tc");
+            const int64_t d0 = cnt(be, "nk_dense_tc_dense");
+            for (int w = 0; w < w_iters; ++w) {
+                if (!run_mm_ex(be, use_nk, path_ov, resp_mint, t_w, xv, dv)) { ++fails; }
+            }
+            ggml_backend_synchronize(be);
+            const int64_t ts0 = ggml_time_us();
+            for (int i = 0; i < t_iters; ++i) {
+                if (!run_mm_ex(be, use_nk, path_ov, resp_mint, t_w, xv, dv)) { ++fails; }
+            }
+            ggml_backend_synchronize(be);
+            const int64_t dt = ggml_time_us() - ts0;
+            out_dc_grid  = cnt(be, "nk_dense_tc_head_grid") - g0;
+            out_dc_tc    = cnt(be, "nk_dense_tc_head_tc")   - t0c;
+            out_dc_dense = cnt(be, "nk_dense_tc_dense")     - d0;
+            return (double) dt / t_iters;
+        };
+
+        auto path_label = [&](int64_t dg, int64_t dtc, int64_t dd) -> const char * {
+            if (dg > 0 && dtc == 0 && dd == 0)  { return "head_grid"; }
+            if (dtc > 0 && dg == 0 && dd == 0)  { return "head_tc"; }
+            if (dd > 0 && dg == 0 && dtc == 0)  { return "dense_tc"; }
+            if (dg == 0 && dtc == 0 && dd == 0) { return "base(q8a16)"; }
+            return "mixed";
+        };
+
+        for (int T = 1; T <= 8; ++T) {
             ggml_init_params ip_v = { 8 * ggml_tensor_overhead(), nullptr, true };
             ggml_context * ctx_v = ggml_init(ip_v);
-            ggml_tensor * xv = ggml_view_2d(ctx_v, t_x, ps.K, T, t_x->nb[1], 0);
-            ggml_tensor * dv = ggml_view_2d(ctx_v, t_d, ps.M, T, t_d->nb[1], 0);
+            ggml_tensor * xv = ggml_view_2d(ctx_v, t_x, K, T, t_x->nb[1], 0);
+            ggml_tensor * dv = ggml_view_2d(ctx_v, t_d, M, T, t_d->nb[1], 0);
 
-            auto time_leg = [&](bool use_nk) -> double {
-                const int64_t cb = cnt(be, "nk_dense_tc");
-                for (int w = 0; w < ps.w_iters; ++w) {
-                    if (!run_mm(be, use_nk, t_w, xv, dv)) { ++fails; }
-                }
-                ggml_backend_synchronize(be);
-                const int64_t t0 = ggml_time_us();
-                for (int i = 0; i < ps.t_iters; ++i) {
-                    if (!run_mm(be, use_nk, t_w, xv, dv)) { ++fails; }
-                }
-                ggml_backend_synchronize(be);
-                const int64_t dt = ggml_time_us() - t0;
-                const int64_t ca = cnt(be, "nk_dense_tc");
-                const int64_t exp_dc = use_nk ? (int64_t) (ps.w_iters + ps.t_iters) : 0;
-                if (ca - cb != exp_dc) {
-                    ++fails;
-                    fprintf(stderr, "nk_dense_tc: counter mismatch on %s T=%d use_nk=%d got=%lld exp=%lld\n",
-                            ps.name, T, use_nk, (long long) (ca - cb), (long long) exp_dc);
-                }
-                return (double) dt / ps.t_iters;
-            };
-            const double a1 = time_leg(false);
-            const double b1 = time_leg(true);
-            const double b2 = time_leg(true);
-            const double a2 = time_leg(false);
+            int64_t dg0 = 0, dtc0 = 0, dd0 = 0, dg1 = 0, dtc1 = 0, dd1 = 0;
+            int64_t dg2 = 0, dtc2 = 0, dd2 = 0, dg3 = 0, dtc3 = 0, dd3 = 0;
+            const double a1 = run_head_leg(xv, dv, false, -1, true, dg0, dtc0, dd0);
+            const double b1 = run_head_leg(xv, dv, true,  -1, true, dg1, dtc1, dd1);
+            const double b2 = run_head_leg(xv, dv, true,  -1, true, dg2, dtc2, dd2);
+            const double a2 = run_head_leg(xv, dv, false, -1, true, dg3, dtc3, dd3);
+
             const double base_us = 0.5 * (a1 + a2);
             const double nk_us   = 0.5 * (b1 + b2);
-            if (ps.M == 2304 && ps.K == 3072 && T == 5) { out_base_t5 = base_us; out_nk_t5 = nk_us; }
-            if (ps.M == 2304 && ps.K == 3072 && T == 8) { out_base_t8 = base_us; out_nk_t8 = nk_us; }
-            printf("NK_DENSE_TC perf %-18s T=%d (%.2f MB): base=%6.2f us (%4.0f GB/s) -> nk=%6.2f us (%4.0f GB/s) | delta=%+6.2f us (%+5.1f%%)\n",
-                   ps.name, T, w_bytes / 1e6, base_us, w_bytes / (base_us * 1e3),
-                   nk_us, w_bytes / (nk_us * 1e3), nk_us - base_us, (nk_us / base_us - 1.0) * 100.0);
+            const char * plab    = path_label(dg1 + dg2, dtc1 + dtc2, dd1 + dd2);
+            if (dg0 + dtc0 + dd0 + dg3 + dtc3 + dd3 != 0) {
+                ++fails;
+                fprintf(stderr, "nk_dense_tc: unexpected NK fire on base arm T=%d\n", T);
+            }
+            printf("NK_DENSE_TC perf %-18s T=%d (%.2f MB): base=%6.2f us (%4.0f GB/s) -> nk=%6.2f us (%4.0f GB/s) | delta=%+6.2f us (%+5.1f%%) | path=%s\n",
+                   "head_201024x2304", T, w_bytes / 1e6, base_us, w_bytes / (base_us * 1e3),
+                   nk_us, w_bytes / (nk_us * 1e3), nk_us - base_us, (nk_us / base_us - 1.0) * 100.0, plab);
+            printf("NK_DENSE_TC head_path T=%d: %s (grid=%lld tc=%lld dense=%lld)\n",
+                   T, plab, (long long) (dg1 + dg2), (long long) (dtc1 + dtc2), (long long) (dd1 + dd2));
             ggml_free(ctx_v);
         }
+
+        // Direct same-job comparison of base vs head_grid vs head_tc at T=4..8
+        printf("\n--- NK_DENSE_TC head_grid vs head_tc same-job ABBA (T=4..8) ---\n");
+        for (int T = 4; T <= 8; ++T) {
+            ggml_init_params ip_v = { 8 * ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx_v = ggml_init(ip_v);
+            ggml_tensor * xv = ggml_view_2d(ctx_v, t_x, K, T, t_x->nb[1], 0);
+            ggml_tensor * dv = ggml_view_2d(ctx_v, t_d, M, T, t_d->nb[1], 0);
+
+            int64_t g = 0, tc = 0, d = 0;
+            const double b1 = run_head_leg(xv, dv, false, 0, false, g, tc, d);
+            const double r1 = run_head_leg(xv, dv, true,  2, false, g, tc, d);
+            const double c1 = run_head_leg(xv, dv, true,  1, false, g, tc, d);
+            const double c2 = run_head_leg(xv, dv, true,  1, false, g, tc, d);
+            const double r2 = run_head_leg(xv, dv, true,  2, false, g, tc, d);
+            const double b2 = run_head_leg(xv, dv, false, 0, false, g, tc, d);
+            const double base_us = 0.5 * (b1 + b2);
+            const double grid_us = 0.5 * (r1 + r2);
+            const double tc_us   = 0.5 * (c1 + c2);
+            printf("NK_DENSE_TC head_cmp T=%d: base=%6.2f us (%4.0f GB/s) | grid=%6.2f us (%4.0f GB/s, %+5.1f%%) | tc=%6.2f us (%4.0f GB/s, %+5.1f%%) | winner=%s\n",
+                   T, base_us, w_bytes / (base_us * 1e3),
+                   grid_us, w_bytes / (grid_us * 1e3), (grid_us / base_us - 1.0) * 100.0,
+                   tc_us,   w_bytes / (tc_us   * 1e3), (tc_us   / base_us - 1.0) * 100.0,
+                   grid_us <= tc_us ? "head_grid" : "head_tc");
+            ggml_free(ctx_v);
+        }
+
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
     }
-
-    printf("NK_DENSE_TC 48-visit QKV+attn_out T=5: base=%.2f ms -> nk=%.2f ms (delta=%+.2f ms, %+.1f%%)\n",
-           48.0 * (qkv_base_t5 + out_base_t5) / 1e3,
-           48.0 * (qkv_nk_t5 + out_nk_t5) / 1e3,
-           48.0 * ((qkv_nk_t5 + out_nk_t5) - (qkv_base_t5 + out_base_t5)) / 1e3,
-           ((qkv_nk_t5 + out_nk_t5) / (qkv_base_t5 + out_base_t5) - 1.0) * 100.0);
-    printf("NK_DENSE_TC 48-visit QKV+attn_out T=8: base=%.2f ms -> nk=%.2f ms (delta=%+.2f ms, %+.1f%%)\n",
-           48.0 * (qkv_base_t8 + out_base_t8) / 1e3,
-           48.0 * (qkv_nk_t8 + out_nk_t8) / 1e3,
-           48.0 * ((qkv_nk_t8 + out_nk_t8) - (qkv_base_t8 + out_base_t8)) / 1e3,
-           ((qkv_nk_t8 + out_nk_t8) / (qkv_base_t8 + out_base_t8) - 1.0) * 100.0);
 
     ggml_backend_free(be);
     printf("nk_dense_tc: %s (%d fails)\n", fails ? "FAIL" : "PASS", fails);

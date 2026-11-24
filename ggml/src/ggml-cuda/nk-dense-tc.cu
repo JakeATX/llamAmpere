@@ -1,16 +1,15 @@
-// NEONKERN NK_DENSE_TC: Ampere int8 tensor-core kernels (mma.m16n8k32.s32.s8)
-// for dense Q8_0 decode/verify projections (T=1..8).
+// NEONKERN NK_DENSE_TC: Ampere int8 dense Q8_0 decode/verify head kernels (T=1..8).
 //
-// Primary target (GGML_CUDA_NK_DENSE_TC=1, default MIN_ROWS=16385):
-//   k_nk_head_tc: persistent 1-CTA/SM head streamer (NW=8 independent warps/CTA,
-//   2-stage cross-tile cp.async.cg.L2::128B.L2::cache_hint evict_first, activation
-//   quantized ONCE per SM into SMEM in exact MMA lane layout, 0 barriers in the
-//   streaming loop, 0 epilogue SMEM reduction, even SM tile partitioning).
-//
-// Fallback / MIN_ROWS=0 (attention-sized or grouped or K > 3072):
-//   k_nk_dense_tc: 4-warp 3-stage cooperative ring kernel (r11 behavior).
-//
-// Opt-in via GGML_CUDA_NK_DENSE_TC=1 (default OFF).
+// Default policy when GGML_CUDA_NK_DENSE_TC=1 (default OFF):
+//   - MIN_ROWS = 16385 (head-only: output.weight 201024x2304; =0 restores r11 attention/grouped)
+//   - MINT     = 4     (T=1..3 stay on base q8a16, which streams 201024x2304 at ~876 GB/s at T=1)
+//   - HEAD_PATH = auto | tc | grid (default auto, selects per T from k_head_auto_table):
+//       * grid (default for T=4..8): k_nk_quant_x_dp4a (~2-3 us pre-quant into 12-21 KB L1-resident
+//         qx_buf via ctx.pool()) + k_nk_head_grid_dp4a (0 B SMEM -> full 128 KB L1, 0 barriers,
+//         4 warps/CTA up to 32 warps/SM, coalesced LDG.E.NA.64 + L2::evict_first, native dp4a + fp32 acc).
+//       * tc (r12 persistent): k_nk_head_tc (NW=8 independent warps/CTA, 2-stage cross-tile cp.async,
+//         x quantized once per SM in SMEM, mma.m16n8k32.s32.s8).
+//   - Fallback / MIN_ROWS=0 (attention or grouped): k_nk_dense_tc (r11 4-warp 3-stage ring).
 
 #include "nk-dense-tc.cuh"
 #include "ggml-impl.h"
@@ -29,6 +28,7 @@
 #define NK_DTC_RED_FLOATS     (3 * 32 * 4)
 
 #define NK_HEAD_MIN_ROWS_DEF  16385
+#define NK_HEAD_MINT_DEF      4
 #define NK_HEAD_NW            8
 #define NK_HEAD_MAX_NCH       12
 #define NK_HEAD_W_WORDS       (NK_HEAD_NW * 2 * NK_DTC_STAGE_WORDS)
@@ -37,6 +37,25 @@
 #define NK_HEAD_MAX_SMEM      (NK_HEAD_W_BYTES + (NK_HEAD_MAX_NCH * 8) * NK_HEAD_X_BLK_BYTES)
 
 static std::atomic<int64_t> g_nk_dense_tc_fires{0};
+static std::atomic<int64_t> g_nk_dense_tc_head_grid_fires{0};
+static std::atomic<int64_t> g_nk_dense_tc_head_tc_fires{0};
+static std::atomic<int64_t> g_nk_dense_tc_dense_fires{0};
+
+static int nk_parse_nonneg_env(const char * name, const int def_val) {
+    const char * e = getenv(name);
+    if (e == nullptr || e[0] == '\0') {
+        return def_val;
+    }
+    char * end = nullptr;
+    const long v = strtol(e, &end, 10);
+    if (end == e || *end != '\0') {
+        return def_val;
+    }
+    if (v < 0) {
+        return 0;
+    }
+    return v > INT_MAX ? INT_MAX : (int) v;
+}
 
 bool ggml_cuda_nk_dense_tc_enabled() {
     static const bool on = [] {
@@ -47,40 +66,93 @@ bool ggml_cuda_nk_dense_tc_enabled() {
 }
 
 int ggml_cuda_nk_dense_tc_min_rows() {
-    static const int v = [] {
-        const char * e = getenv("GGML_CUDA_NK_DENSE_TC_MIN_ROWS");
-        if (e == nullptr) {
-            return NK_HEAD_MIN_ROWS_DEF;
-        }
-        const int x = atoi(e);
-        return x > 0 ? x : 0;
-    }();
+    static const int v = nk_parse_nonneg_env("GGML_CUDA_NK_DENSE_TC_MIN_ROWS", NK_HEAD_MIN_ROWS_DEF);
     return v;
+}
+
+static int nk_dense_tc_max_rows() {
+    static const int v = nk_parse_nonneg_env("GGML_CUDA_NK_DENSE_TC_MAX_ROWS", 0);
+    return v;
+}
+
+bool ggml_cuda_nk_dense_tc_takes_rows(int64_t nrows) {
+    if (!ggml_cuda_nk_dense_tc_enabled()) {
+        return false;
+    }
+    if (nrows < ggml_cuda_nk_dense_tc_min_rows()) {
+        return false;
+    }
+    const int max_r = nk_dense_tc_max_rows();
+    if (max_r > 0 && nrows > max_r) {
+        return false;
+    }
+    return true;
 }
 
 int64_t ggml_cuda_nk_dense_tc_count() {
     return g_nk_dense_tc_fires.load(std::memory_order_relaxed);
 }
 
+int64_t ggml_cuda_nk_dense_tc_head_grid_count() {
+    return g_nk_dense_tc_head_grid_fires.load(std::memory_order_relaxed);
+}
+
+int64_t ggml_cuda_nk_dense_tc_head_tc_count() {
+    return g_nk_dense_tc_head_tc_fires.load(std::memory_order_relaxed);
+}
+
+int64_t ggml_cuda_nk_dense_tc_dense_count() {
+    return g_nk_dense_tc_dense_fires.load(std::memory_order_relaxed);
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static int nk_dense_tc_min_t() {
     static const int v = [] {
-        const char * e = getenv("GGML_CUDA_NK_DENSE_TC_MINT");
-        const int x = e ? atoi(e) : 1;
+        const int x = nk_parse_nonneg_env("GGML_CUDA_NK_DENSE_TC_MINT", NK_HEAD_MINT_DEF);
         return x < 1 ? 1 : x > 8 ? 8 : x;
     }();
     return v;
 }
 
-static int nk_dense_tc_max_rows() {
-    static const int v = [] {
-        const char * e = getenv("GGML_CUDA_NK_DENSE_TC_MAX_ROWS");
-        const int x = e ? atoi(e) : 0;
-        return x > 0 ? x : 0;
+static nk_dense_tc_head_path nk_dense_tc_head_path_env() {
+    static const nk_dense_tc_head_path p = [] {
+        const char * e = getenv("GGML_CUDA_NK_DENSE_TC_HEAD_PATH");
+        if (e == nullptr) {
+            return NK_HEAD_PATH_AUTO;
+        }
+        if (strcmp(e, "tc") == 0) {
+            return NK_HEAD_PATH_TC;
+        }
+        if (strcmp(e, "grid") == 0) {
+            return NK_HEAD_PATH_GRID;
+        }
+        return NK_HEAD_PATH_AUTO;
     }();
-    return v;
+    return p;
 }
+
+static const char * nk_head_path_name(const nk_dense_tc_head_path p) {
+    switch (p) {
+        case NK_HEAD_PATH_TC:   return "tc";
+        case NK_HEAD_PATH_GRID: return "grid";
+        default:                return "auto";
+    }
+}
+
+// Per-T auto selection table for head-sized tensors (M >= 16385).
+// T=1..3 stay on base q8a16 via default MINT=4; T=4..8 pick grid (0-SMEM DP4A).
+static constexpr nk_dense_tc_head_path k_head_auto_table[9] = {
+    NK_HEAD_PATH_GRID, // T=0 (unused)
+    NK_HEAD_PATH_GRID, // T=1 (base by default MINT=4)
+    NK_HEAD_PATH_GRID, // T=2 (base by default MINT=4)
+    NK_HEAD_PATH_GRID, // T=3 (base by default MINT=4)
+    NK_HEAD_PATH_GRID, // T=4
+    NK_HEAD_PATH_GRID, // T=5 (headline)
+    NK_HEAD_PATH_GRID, // T=6
+    NK_HEAD_PATH_GRID, // T=7
+    NK_HEAD_PATH_GRID, // T=8
+};
 
 static bool nk_dense_tc_l2_evict_first_enabled() {
     static const bool on = [] {
@@ -122,7 +194,7 @@ static __device__ __forceinline__ void nk_dtc_cp16(uint32_t smem_addr, const voi
 static __device__ __forceinline__ uint64_t nk_head_l2_evict_first() {
 #if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     uint64_t p = 0;
-    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(p));
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(p));
     return p;
 #else
     return 0;
@@ -142,6 +214,27 @@ static __device__ __forceinline__ void nk_head_cp16(uint32_t smem_addr, const vo
 #else
     GGML_UNUSED_VARS(smem_addr, gmem, l2_pol);
     NO_DEVICE_CODE;
+#endif
+}
+
+// Non-volatile read-only streaming 64-bit load so ptxas can hoist and overlap across rows.
+// Contiguous 32-lane uint2 loads read 256 B (8 sectors) + 2-lane tail 16 B (1 sector) = 272 B
+// with zero duplicate L2->SM sector fetches and zero L1 pollution.
+template <bool L2_EF>
+static __device__ __forceinline__ uint2 nk_ldg_na_u64(const uint2 * p, uint64_t l2_pol) {
+#if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    uint2 v;
+    if constexpr (L2_EF) {
+        asm("ld.global.L1::no_allocate.L2::cache_hint.v2.u32 {%0, %1}, [%2], %3;\n"
+            : "=r"(v.x), "=r"(v.y) : "l"(p), "l"(l2_pol));
+    } else {
+        asm("ld.global.L1::no_allocate.v2.u32 {%0, %1}, [%2];\n"
+            : "=r"(v.x), "=r"(v.y) : "l"(p));
+    }
+    return v;
+#else
+    GGML_UNUSED_VARS(l2_pol);
+    return *p;
 #endif
 }
 
@@ -200,7 +293,179 @@ static __device__ __forceinline__ void nk_dtc_quant_x_pair(
     nk_dtc_quant_x_blk(v10, v11, tig, b0_1, b1_1, dx0_1, dx1_1);
 }
 
-// Persistent 1-CTA/SM head kernel: NW=8 independent warps, 2-stage cross-tile cp.async ring,
+// Step 1 of improved head grid path: quantize [K, T] f32 activation ONCE into L1-resident
+// per-32 int8 + fp32-scale layout: qx_q[nb*T*4] (int2 per 8 elems) and qx_d[nb*T] (float).
+// 4 lanes per (ib, t) block -> 32 blocks per 128-thread CTA (~2-3 us for K=2304, T=5).
+static __global__ void __launch_bounds__(128) k_nk_quant_x_dp4a(
+        const float * __restrict__ x,
+        int2        * __restrict__ qx_q,
+        float       * __restrict__ qx_d,
+        const int64_t sx,
+        const int     nb,
+        const int     T) {
+    const int idx   = (int) blockIdx.x * 32 + ((int) threadIdx.x >> 2);
+    const int iq    = (int) threadIdx.x & 3;
+    const int total = nb * T;
+    const bool valid = idx < total;
+
+    const float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 v0 = z;
+    float4 v1 = z;
+    if (valid) {
+        const int ib = idx / T;
+        const int t  = idx - ib * T;
+        const float * xp = x + (int64_t) t * sx + (int64_t) ib * QK8_0 + iq * 8;
+        v0 = __ldg((const float4 *) (xp + 0));
+        v1 = __ldg((const float4 *) (xp + 4));
+    }
+
+    // All 32 lanes in the warp stay converged through the 4-lane amax butterfly.
+    float m = fmaxf(fmaxf(fabsf(v0.x), fabsf(v0.y)), fmaxf(fabsf(v0.z), fabsf(v0.w)));
+    m = fmaxf(m, fmaxf(fmaxf(fabsf(v1.x), fabsf(v1.y)), fmaxf(fabsf(v1.z), fabsf(v1.w))));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+
+    const float dx     = __fmul_rn(m, 1.0f / 127.0f);
+    const float inv_dx = (m > 1e-30f) ? __fdiv_rn(127.0f, m) : 0.0f;
+    const uint32_t q0  = nk_dtc_pack4_i8(v0, inv_dx);
+    const uint32_t q1  = nk_dtc_pack4_i8(v1, inv_dx);
+
+    if (valid) {
+        qx_q[idx * 4 + iq] = make_int2((int) q0, (int) q1);
+        if (iq == 0) {
+            qx_d[idx] = dx;
+        }
+    }
+}
+
+// Step 2 of improved head grid path: 0-SMEM, 0-barrier, high-occupancy streaming DP4A kernel.
+// Each warp owns RW rows; 32 lanes read 8 consecutive block_q8_0 (272 contiguous bytes = 34 uint2)
+// once per iteration via coalesced LDG.E.NA.64 (256 B + 16 B tail) + L2::evict_first, leaving the
+// full 128 KB L1 dedicated to the 12-21 KB pre-quantized activation buffer (qx_q, qx_d).
+template <int T, int RW, int NW, int MINB, bool L2_EF>
+static __global__ void __launch_bounds__(32 * NW, MINB) k_nk_head_grid_dp4a(
+        const char  * __restrict__ vx,
+        const int2  * __restrict__ qx_q,
+        const float * __restrict__ qx_d,
+        float       * __restrict__ dst,
+        const int64_t srow,
+        const int64_t sd,
+        const int     nr,
+        const int     nb) {
+#if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    static_assert(T >= 1 && T <= 8 && RW * T <= 32, "head_grid_dp4a shape");
+    const int warp = (int) threadIdx.x >> 5;
+    const int lane = (int) threadIdx.x & 31;
+    const int row0 = ((int) blockIdx.x * NW + warp) * RW;
+    if (row0 >= nr) {
+        return;
+    }
+
+    const int pair_in_iter = lane >> 3;
+    const int g            = lane & 7;
+    const int is_odd       = g >> 2;
+    const int ib_lane      = lane >> 2;
+    const int iq           = lane & 3;
+    const int pair_base_w  = pair_in_iter * 17 + (is_odd ? (9 + 2 * iq) : (2 * iq));
+    const int s_lo         = (lane < 30) ? (pair_base_w >> 1) : 0;
+    const int s_hi         = (s_lo + 1) & 31;
+    const int parity       = pair_base_w & 1;
+    const int d_src_lane   = (lane & ~7) + (is_odd ? 3 : 0);
+
+    const char * wp0 = vx + (int64_t) row0 * srow;
+    int64_t row_off[RW];
+#pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        row_off[r] = (row0 + r < nr) ? (int64_t) r * srow : 0;
+    }
+
+    const int2  * pq = qx_q + (ib_lane * T) * 4 + iq;
+    const float * pd = qx_d + (ib_lane * T);
+
+    const uint64_t l2_pol = L2_EF ? nk_head_l2_evict_first() : 0ull;
+
+    float acc[RW][T];
+#pragma unroll
+    for (int r = 0; r < RW; ++r) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            acc[r][t] = 0.0f;
+        }
+    }
+
+    for (int ib0 = 0; ib0 < nb; ib0 += 8) {
+        int2  xq[T];
+        float xd[T];
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            xq[t] = __ldg(pq + t * 4);
+            xd[t] = __ldg(pd + t);
+        }
+        pq += 8 * T * 4;
+        pd += 8 * T;
+
+        uint2 v0[RW], v1[RW];
+#pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            const uint2 * rp = (const uint2 *) (wp0 + row_off[r]);
+            v0[r] = nk_ldg_na_u64<L2_EF>(rp + lane, l2_pol);
+            v1[r] = (lane >= 30) ? nk_ldg_na_u64<L2_EF>(rp + 2 + lane, l2_pol) : make_uint2(0u, 0u);
+        }
+        wp0 += 272;
+
+#pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            const uint32_t a      = __shfl_sync(0xffffffffu, v0[r].x, s_lo);
+            const uint32_t b      = __shfl_sync(0xffffffffu, v0[r].y, s_lo);
+            const uint32_t c      = __shfl_sync(0xffffffffu, v0[r].x, s_hi);
+            const uint32_t d      = __shfl_sync(0xffffffffu, v0[r].y, s_hi);
+            const uint32_t u0     = (lane >= 30) ? v1[r].x : (parity ? b : a);
+            const uint32_t u1     = (lane >= 30) ? v1[r].y : (parity ? c : b);
+            const uint32_t next_w = parity ? d : c;
+            const uint32_t q0     = is_odd ? u0 : __byte_perm(u0, u1, 0x5432);
+            const uint32_t q1     = is_odd ? u1 : __byte_perm(u1, next_w, 0x5432);
+            const uint32_t d_carry = (g == 3) ? next_w : u0;
+            const uint32_t d_word  = __shfl_sync(0xffffffffu, d_carry, d_src_lane);
+            const float dw = __half2float(__ushort_as_half(
+                (uint16_t) (is_odd ? (d_word >> 16) : (d_word & 0xFFFFu))));
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                int dot = __dp4a((int) q0, xq[t].x, 0);
+                dot     = __dp4a((int) q1, xq[t].y, dot);
+                acc[r][t] = fmaf(__int2float_rn(dot), dw * xd[t], acc[r][t]);
+            }
+        }
+    }
+
+    float out = 0.0f;
+#pragma unroll
+    for (int r = 0; r < RW; ++r) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            float s = acc[r][t];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                s += __shfl_xor_sync(0xffffffffu, s, off);
+            }
+            if (lane == r * T + t) {
+                out = s;
+            }
+        }
+    }
+    if (lane < RW * T) {
+        const int r = lane / T;
+        const int t = lane - r * T;
+        if (row0 + r < nr) {
+            dst[(int64_t) t * sd + row0 + r] = out;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(vx, qx_q, qx_d, dst, srow, sd, nr, nb);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// Persistent 1-CTA/SM head kernel (r12 tc path): NW=8 independent warps, 2-stage cross-tile cp.async ring,
 // activation quantized once per CTA into SMEM (exact MMA lane layout), zero loop/epilogue barriers.
 template <bool L2_EF>
 static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
@@ -227,7 +492,6 @@ static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
     uint2    * s_xb  = (uint2 *)  (sw + NK_HEAD_W_WORDS);
     float2   * s_xdx = (float2 *) (s_xb + nb * 32);
 
-    // 1. Quantize all nb activation blocks ONCE per CTA into SMEM (exact MMA lane order).
     const bool colok = gid < T;
     const float * x_col = x + (int64_t) (colok ? gid : 0) * sx + 4 * tig;
     for (int b = w; b < nb; b += NK_HEAD_NW) {
@@ -237,7 +501,18 @@ static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
         const float4 v1  = colok ? __ldg((const float4 *) (xp + 16)) : z;
         uint32_t b0, b1;
         float dx0, dx1;
-        nk_dtc_quant_x_blk(v0, v1, tig, b0, b1, dx0, dx1);
+        {
+            float m = fmaxf(fmaxf(fabsf(v0.x), fabsf(v0.y)), fmaxf(fabsf(v0.z), fabsf(v0.w)));
+            m = fmaxf(m, fmaxf(fmaxf(fabsf(v1.x), fabsf(v1.y)), fmaxf(fabsf(v1.z), fabsf(v1.w))));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+            const float dx     = __fmul_rn(m, 1.0f / 127.0f);
+            const float inv_dx = (m > 1e-30f) ? __fdiv_rn(127.0f, m) : 0.0f;
+            b0  = nk_dtc_pack4_i8(v0, inv_dx);
+            b1  = nk_dtc_pack4_i8(v1, inv_dx);
+            dx0 = __shfl_sync(0xffffffffu, dx, 8 * tig);
+            dx1 = __shfl_sync(0xffffffffu, dx, 8 * tig + 4);
+        }
         s_xb[b * 32 + lane] = make_uint2(b0, b1);
         if (gid == 0) {
             s_xdx[b * 4 + tig] = make_float2(dx0, dx1);
@@ -245,7 +520,6 @@ static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
     }
     __syncthreads();
 
-    // 2. Evenly partition 16-row tiles across SMs (contiguous DRAM slice per SM, ~99.5% load balance).
     const int ntiles     = (nr + 15) / 16;
     const int nfull      = nr / 16;
     const int base_tiles = ntiles / (int) gridDim.x;
@@ -258,7 +532,6 @@ static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
         return;
     }
 
-    // 3. Precompute all 9 coalesced 16-B copy descriptors once for this warp (zero i/17 in loop).
     uint32_t * S_warp = sw + w * (2 * NK_DTC_STAGE_WORDS);
     int32_t  g_off[9];
     uint32_t sa_base[9];
@@ -301,7 +574,6 @@ static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
         asm volatile("cp.async.commit_group;\n");
     };
 
-    // 4. Cross-tile 2-stage double-buffered streaming loop (zero CTA barriers, zero tile-boundary bubbles).
     int ch = 0;
     uint32_t stage_b = 0u;
     uint32_t stage_w = 0u;
@@ -382,7 +654,6 @@ static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
             acc[3] = fmaf(__int2float_rn(d1[3]), dw1_1 * xdx1.y, acc[3]);
         }
 
-        // All lanes must finish reading S_warp[stage_w] before next iteration overwrites it.
         __syncwarp();
 
         if (last_ch) {
@@ -416,7 +687,7 @@ static __global__ void __launch_bounds__(32 * NK_HEAD_NW, 1) k_nk_head_tc(
 #endif
 }
 
-// Fallback / MIN_ROWS=0 kernel (r11 4-warp cooperative 3-stage ring for grouped or K > 3072).
+// Fallback / MIN_ROWS=0 kernel (r11 4-warp cooperative 3-stage ring for grouped or attention).
 static __global__ void __launch_bounds__(128, 6) k_nk_dense_tc(
         const nk_dense_tc_args a, const int nch, const int T) {
 #if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -634,10 +905,13 @@ static bool nk_head_tc_ensure_smem(const int dev, const size_t smem_bytes, cudaS
     }
     const int req = (int) std::min<size_t>(smpbo, NK_HEAD_MAX_SMEM);
     if (cudaFuncSetAttribute(k_nk_head_tc<L2_EF>, cudaFuncAttributeMaxDynamicSharedMemorySize, req) != cudaSuccess) {
+        (void) cudaGetLastError();
         return false;
     }
-    (void) cudaFuncSetAttribute(k_nk_head_tc<L2_EF>, cudaFuncAttributePreferredSharedMemoryCarveout,
-        cudaSharedmemCarveoutMaxShared);
+    if (cudaFuncSetAttribute(k_nk_head_tc<L2_EF>, cudaFuncAttributePreferredSharedMemoryCarveout,
+            cudaSharedmemCarveoutMaxShared) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
     done_mask.fetch_or(bit, std::memory_order_release);
     return true;
 }
@@ -658,16 +932,95 @@ static void nk_dense_tc_maybe_set_carveout(const int dev, cudaStream_t stream) {
     if (cudaFuncSetAttribute(k_nk_dense_tc, cudaFuncAttributePreferredSharedMemoryCarveout,
             cudaSharedmemCarveoutMaxShared) == cudaSuccess) {
         done_mask.fetch_or(bit, std::memory_order_release);
+    } else {
+        (void) cudaGetLastError();
     }
 }
 
 static void nk_dense_tc_log_active() {
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
-        GGML_LOG_WARN("[NK_DENSE_TC] active (head persistent NW=%d 2-stage int8 mma.m16n8k32, l2_ef=%d, min_rows=%d, min_t=%d, max_rows=%d)\n",
-            NK_HEAD_NW, (int) nk_dense_tc_l2_evict_first_enabled(),
+        GGML_LOG_WARN("[NK_DENSE_TC] active (head_path=%s, l2_ef=%d, min_rows=%d, min_t=%d, max_rows=%d)\n",
+            nk_head_path_name(nk_dense_tc_head_path_env()),
+            (int) nk_dense_tc_l2_evict_first_enabled(),
             ggml_cuda_nk_dense_tc_min_rows(), nk_dense_tc_min_t(), nk_dense_tc_max_rows());
     }
+}
+
+template <int T, int RW, int NW, int MINB, bool L2_EF>
+static void nk_head_grid_launch_t(
+        const char * vx, const int2 * qx_q, const float * qx_d, float * dst,
+        const int64_t srow, const int64_t sd, const int nr, const int nb, cudaStream_t stream) {
+    const uint32_t grid = (uint32_t) ((nr + RW * NW - 1) / (RW * NW));
+    k_nk_head_grid_dp4a<T, RW, NW, MINB, L2_EF><<<grid, 32 * NW, 0, stream>>>(
+        vx, qx_q, qx_d, dst, srow, sd, nr, nb);
+}
+
+template <bool L2_EF>
+static void nk_head_grid_dispatch(
+        const char * vx, const int2 * qx_q, const float * qx_d, float * dst,
+        const int64_t srow, const int64_t sd, const int nr, const int nb, const int T, cudaStream_t stream) {
+    switch (T) {
+        case 1: nk_head_grid_launch_t<1, 4, 4, 8, L2_EF>(vx, qx_q, qx_d, dst, srow, sd, nr, nb, stream); break;
+        case 2: nk_head_grid_launch_t<2, 4, 4, 8, L2_EF>(vx, qx_q, qx_d, dst, srow, sd, nr, nb, stream); break;
+        case 3: nk_head_grid_launch_t<3, 4, 4, 8, L2_EF>(vx, qx_q, qx_d, dst, srow, sd, nr, nb, stream); break;
+        case 4: nk_head_grid_launch_t<4, 4, 4, 8, L2_EF>(vx, qx_q, qx_d, dst, srow, sd, nr, nb, stream); break;
+        case 5: nk_head_grid_launch_t<5, 4, 4, 8, L2_EF>(vx, qx_q, qx_d, dst, srow, sd, nr, nb, stream); break;
+        case 6: nk_head_grid_launch_t<6, 3, 4, 8, L2_EF>(vx, qx_q, qx_d, dst, srow, sd, nr, nb, stream); break;
+        case 7: nk_head_grid_launch_t<7, 2, 4, 8, L2_EF>(vx, qx_q, qx_d, dst, srow, sd, nr, nb, stream); break;
+        case 8: nk_head_grid_launch_t<8, 2, 4, 8, L2_EF>(vx, qx_q, qx_d, dst, srow, sd, nr, nb, stream); break;
+        default: GGML_ABORT("nk_head_grid_dp4a: invalid T");
+    }
+}
+
+static bool nk_head_grid_try_launch(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor       * dst,
+        const int           nb,
+        const int           T) {
+    const int nr = (int) src0->ne[1];
+    if (nr < NK_HEAD_MIN_ROWS_DEF || nb < 8 || nb % 8 != 0 || T < 1 || T > 8) {
+        return false;
+    }
+
+    const size_t q_bytes  = (size_t) nb * (size_t) T * 4u * sizeof(int2);
+    const size_t d_bytes  = (size_t) nb * (size_t) T * sizeof(float);
+    const size_t tot_bytes = (q_bytes + d_bytes + 15u) & ~size_t(15u);
+    ggml_cuda_pool_alloc<char> qx_buf(ctx.pool(), tot_bytes);
+
+    int2  * qx_q = (int2 *)  qx_buf.get();
+    float * qx_d = (float *) (qx_buf.get() + q_bytes);
+
+    nk_dense_tc_log_active();
+
+    cudaStream_t stream = ctx.stream();
+    const char  * vx   = (const char *)  src0->data;
+    const float * x    = (const float *) src1->data;
+    float       * out  = (float *)       dst->data;
+    const int64_t srow = (int64_t) src0->nb[1];
+    const int64_t sx   = (int64_t) (src1->nb[1] / sizeof(float));
+    const int64_t sd   = (int64_t) (dst->nb[1] / sizeof(float));
+
+    const uint32_t q_grid = (uint32_t) ((nb * T + 31) / 32);
+    k_nk_quant_x_dp4a<<<q_grid, 128, 0, stream>>>(x, qx_q, qx_d, sx, nb, T);
+
+    const bool l2_ef = nk_dense_tc_l2_evict_first_enabled();
+    if (l2_ef) {
+        nk_head_grid_dispatch<true>(vx, qx_q, qx_d, out, srow, sd, nr, nb, T, stream);
+    } else {
+        nk_head_grid_dispatch<false>(vx, qx_q, qx_d, out, srow, sd, nr, nb, T, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    g_nk_dense_tc_head_grid_fires.fetch_add(1, std::memory_order_relaxed);
+    const int64_t fire = g_nk_dense_tc_fires.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (nk_dense_tc_trace() && fire <= 16) {
+        GGML_LOG_WARN("[NK_DENSE_TC] trace #%lld (head_grid l2_ef=%d): rows=%d K=%d T=%d qx=%zu B\n",
+            (long long) fire, (int) l2_ef, nr, nb * QK8_0, T, tot_bytes);
+    }
+    return true;
 }
 
 static bool nk_head_tc_try_launch(
@@ -713,8 +1066,9 @@ static bool nk_head_tc_try_launch(
     }
     CUDA_CHECK(cudaGetLastError());
 
+    g_nk_dense_tc_head_tc_fires.fetch_add(1, std::memory_order_relaxed);
     const int64_t fire = g_nk_dense_tc_fires.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (nk_dense_tc_trace() && fire <= 8) {
+    if (nk_dense_tc_trace() && fire <= 16) {
         GGML_LOG_WARN("[NK_DENSE_TC] trace #%lld (head_tc l2_ef=%d): rows=%d K=%d T=%d grid=%d smem=%zu\n",
             (long long) fire, (int) l2_ef, nr, nch * 8 * QK8_0, T, grid, smem_bytes);
     }
@@ -742,8 +1096,9 @@ static bool nk_dense_tc_launch(
     k_nk_dense_tc<<<(uint32_t) blk64, 128, 0, stream>>>(a, nch, T);
     CUDA_CHECK(cudaGetLastError());
 
+    g_nk_dense_tc_dense_fires.fetch_add(1, std::memory_order_relaxed);
     const int64_t fire = g_nk_dense_tc_fires.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (nk_dense_tc_trace() && fire <= 8) {
+    if (nk_dense_tc_trace() && fire <= 16) {
         int total_rows = 0;
         for (int k = 0; k < a.n; ++k) {
             total_rows += a.nrows[k];
@@ -759,7 +1114,9 @@ bool ggml_cuda_nk_dense_tc_mul_mat(
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         ggml_tensor       * dst,
-        bool                force_enable) {
+        bool                force_enable,
+        int                 path_override,
+        bool                respect_mint) {
     if ((!force_enable && !ggml_cuda_nk_dense_tc_enabled()) || !nk_dense_tc_device_ok(ctx)) {
         return false;
     }
@@ -768,7 +1125,7 @@ bool ggml_cuda_nk_dense_tc_mul_mat(
     }
     const int64_t ne10 = src0->ne[0];
     const int64_t T    = src1->ne[1];
-    const int min_t    = force_enable ? 1 : nk_dense_tc_min_t();
+    const int min_t    = respect_mint ? nk_dense_tc_min_t() : 1;
     const int min_rows = force_enable ? 1 : ggml_cuda_nk_dense_tc_min_rows();
     const int max_rows = force_enable ? 0 : nk_dense_tc_max_rows();
     if (T < min_t || T > 8 || ne10 < 8 * QK8_0 || ne10 % (8 * QK8_0) != 0) {
@@ -777,10 +1134,34 @@ bool ggml_cuda_nk_dense_tc_mul_mat(
     if (!nk_dense_tc_member_ok(src0, src1, dst, ne10, T, min_rows, max_rows)) {
         return false;
     }
-    const int nch = (int) (ne10 / (8 * QK8_0));
-    if (nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T)) {
-        return true;
+
+    const int nb  = (int) (ne10 / QK8_0);
+    const int nch = nb / 8;
+
+    if (src0->ne[1] >= NK_HEAD_MIN_ROWS_DEF) {
+        const nk_dense_tc_head_path mode = (path_override >= 0)
+            ? (nk_dense_tc_head_path) path_override
+            : nk_dense_tc_head_path_env();
+        const nk_dense_tc_head_path chosen = (mode == NK_HEAD_PATH_AUTO)
+            ? k_head_auto_table[T]
+            : mode;
+        if (chosen == NK_HEAD_PATH_GRID) {
+            if (nk_head_grid_try_launch(ctx, src0, src1, dst, nb, (int) T)) {
+                return true;
+            }
+            if (nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T)) {
+                return true;
+            }
+        } else {
+            if (nk_head_tc_try_launch(ctx, src0, src1, dst, nch, (int) T)) {
+                return true;
+            }
+            if (nk_head_grid_try_launch(ctx, src0, src1, dst, nb, (int) T)) {
+                return true;
+            }
+        }
     }
+
     nk_dense_tc_args a{};
     a.n        = 1;
     a.vx[0]    = (const char *) src0->data;
@@ -837,7 +1218,7 @@ bool ggml_cuda_nk_dense_tc_group(
 #else
 
 bool ggml_cuda_nk_dense_tc_mul_mat(
-        ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, bool) {
+        ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, bool, int, bool) {
     return false;
 }
 
