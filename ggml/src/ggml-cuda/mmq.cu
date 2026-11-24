@@ -2,6 +2,8 @@
 #include "convrot.cuh"
 #include "mmq.cuh"
 #include "mmq-prefill.cuh"
+#include "mmq-q8pf.cuh"
+#include "mmq-sklast.cuh"
 #include "quantize.cuh"
 #include "dense-tc.cuh"
 #include "mmid.cuh"
@@ -60,7 +62,10 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_Q5_1, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8>(ctx, args, stream);
+            // fork #51 (GGML_CUDA_MMQ_SK_LASTCTA=1, default off): in-kernel stream-K fixup (mmq-sklast.cu)
+            if (!ggml_cuda_mmq_sklast(ctx, args, stream)) {
+                mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8>(ctx, args, stream);
+            }
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_Q2_K:
@@ -434,6 +439,9 @@ static void ggml_cuda_mul_mat_q_impl(
             ggml_cuda_prefill_mmq_take(ctx, src1, ne11, ne10, ne10_padded, (int) mmq_get_q8_1_ds_layout(src0->type),
                                        use_mmq_prefill, prequantized);
         }
+        // fork PFG-4 (GGML_CUDA_MMQ_Q8PF=1, default off): dense Q8_0 prompt GEMM (mmq-q8pf.cu) on the default q8_1 activation
+        const bool use_q8pf = !use_mmq_prefill && !convrot && !use_native_fp4 && !paired_src0 && !gate &&
+                              ggml_cuda_should_use_mmq_q8pf(args);
         if (prequantized == nullptr) {
             src1_q8_1.alloc(nbytes_src1_q8_1);
         }
@@ -470,6 +478,8 @@ static void ggml_cuda_mul_mat_q_impl(
         if (use_mmq_prefill) {
             ggml_cuda_mul_mat_q_prefill(args, stream);
             ctx.fusion_stats.mmq_prefill++;
+        } else if (use_q8pf) {
+            ggml_cuda_mul_mat_q8pf(args, stream);
         } else {
             launch_products(args);
         }

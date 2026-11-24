@@ -19345,10 +19345,47 @@ static void add_ink_q8_0_moe_cases(std::vector<std::unique_ptr<test_case>> & cas
     cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 8, false, true,  1, GGML_TYPE_Q8_0));
 }
 
+// PFG-4 (GGML_CUDA_MMQ_Q8PF): dense Q8_0 prompt GEMMs at the Inkling 2 Mini shapes plus tile-edge cases.
+// GGML_TEST_INKQ8PF=1 selects only these (eval and perf); GGML_TEST_INKQ8PF_N = comma list of widths for perf (default 1024).
+static void add_inkq8pf_cases(std::vector<std::unique_ptr<test_case>> & tc, bool perf) {
+    struct shp { int64_t m, k; };
+    // q / gate, k / v, rel, o, q+gate+rel stacked
+    const shp ink[] = { {3072, 2304}, {1024, 2304}, {384, 2304}, {2304, 3072}, {6528, 2304} };
+    std::vector<int64_t> ns = { 1024 };
+    if (perf) {
+        const char * e = getenv("GGML_TEST_INKQ8PF_N");
+        if (e) {
+            ns.clear();
+            std::string l = e;
+            for (size_t a = 0; a < l.size();) { size_t b = l.find(',', a); if (b == std::string::npos) b = l.size(); ns.push_back(std::stoll(l.substr(a, b - a))); a = b + 1; }
+        }
+    } else {
+        ns = { 64, 257, 1024 };
+    }
+    for (const auto & s : ink) {
+        for (int64_t n : ns) {
+            tc.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s.m, n, s.k, {1, 1}, {1, 1}));
+        }
+    }
+    if (perf) {
+        return;
+    }
+    // edges: one K stage, odd column tails, every tile width, and shapes that must stay on the default MMQ
+    const int64_t edge[][3] = { {128, 64, 128}, {128, 65, 128}, {256, 100, 384}, {128, 1000, 256}, {384, 95, 2304},
+                                {1152, 333, 640}, {3072, 17, 2304}, {24, 1024, 2304}, {200, 512, 256}, {128, 512, 96} };
+    for (const auto & e : edge) {
+        tc.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, e[0], e[1], e[2], {1, 1}, {1, 1}));
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     if (getenv("GGML_TEST_INK_Q8_0_MOE") != nullptr) {
         add_ink_q8_0_moe_cases(test_cases, false);
+        return test_cases;
+    }
+    if (getenv("GGML_TEST_INKQ8PF") != nullptr) {
+        add_inkq8pf_cases(test_cases, false);
         return test_cases;
     }
     if (getenv("GGML_TEST_INKGROUP") != nullptr) {
@@ -24897,6 +24934,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // INK_Q8_0_MOE: GGML_TEST_INK_Q8_0_MOE=1 with -o INK_Q8_0_MOE (perf mode = 12 timing cases, test mode = 18 correctness cases)
     if (getenv("GGML_TEST_INK_Q8_0_MOE") != nullptr) {
         add_ink_q8_0_moe_cases(test_cases, true);
+        return test_cases;
+    }
+    if (getenv("GGML_TEST_INKQ8PF") != nullptr) {
+        add_inkq8pf_cases(test_cases, true);
         return test_cases;
     }
     if (getenv("GGML_TEST_INKDENSE") != nullptr) {
