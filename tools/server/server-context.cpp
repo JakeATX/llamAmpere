@@ -2550,31 +2550,18 @@ private:
             // turns copy-first on by default (span cap LLAMA_RTB_COPYCTL_SPAN, 32) where auto would leave it off
             const int32_t first_def = rtb::env_on("LLAMA_RTB_COPYCTL")
                     ? (int32_t) rtb::env_num("LLAMA_RTB_COPYCTL_SPAN", 32, 1, common_speculative_copy_params::FIRST_MAX) : 0;
-            // LLAMA_RTB_GDNCOPY=1: copy-first also stands in for an MTP drafter (Qwen 27B, 24dense), see below for the
-            // recurrent state rollback
-            const bool rtb_gdncopy = rtb::env_on("LLAMA_RTB_GDNCOPY");
             params.speculative.copy_first = common_speculative_copy_params::resolve_first(
-                    params.speculative.copy_first, (dspark || (rtb_gdncopy && mtp && !params.speculative.has_dft())) &&
-                    params.n_parallel == 1, first_def);
+                    params.speculative.copy_first, dspark && params.n_parallel == 1, first_def);
             // INKCOPY gate (HOME 3090 Ti, 4/4, DSpark d4): edit/quote tasks +33% but normal chat not faster (3K +0.2%,
             // 100K -2.4% over 6 seeds), so auto stays off; opt in with --spec-copy-first 32 or LLAMA_SPEC_COPY_FIRST=32
             // an explicit N needs a drafter a span can stand in for, else it would only raise n_rs_seq / outputs
             const bool dflash = params.speculative.has_dft() &&
                     std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
-            if (!dspark && !dflash && !(rtb_gdncopy && mtp)) {
+            if (!dspark && !dflash) {
                 params.speculative.copy_first = 0;
             }
             if (params.speculative.has_synth()) {
                 params.speculative.copy_first = 0;
-            }
-            // LLAMA_RTB_GDNCOPY=1: on a Gated DeltaNet target (Qwen 27B) the copy-first span cap raises n_rs_seq, and a
-            // full-state snapshot per span token does not fit; GDN ingredient replay keeps a small per-token ring
-            // instead (the memory only turns it on for GDN layers, so other targets are unaffected).
-            // LLAMA_RTB_GDNCOPY_REPLAY=0 keeps the configured --gdn-replay.
-            if (rtb_gdncopy && params.speculative.copy_first > 0 && !params.gdn_replay &&
-                    rtb::env_num("LLAMA_RTB_GDNCOPY_REPLAY", 1, 0, 1) != 0) {
-                params.gdn_replay = true;
-                SRV_INF("%s", "copy-first on a recurrent target: GDN ingredient replay on (LLAMA_RTB_GDNCOPY)\n");
             }
             SRV_INF("copy-first: %s (max span = %d)\n", params.speculative.copy_first > 0 ? "on" : "off",
                     params.speculative.copy_first);

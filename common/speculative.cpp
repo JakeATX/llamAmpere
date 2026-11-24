@@ -4686,14 +4686,7 @@ static void common_speculative_rtb_accept(common_speculative * spec, llama_seq_i
 // drafters a copy-first span may replace for a round: their state follows the target batches (process()) and their
 // accept() keeps nothing per draft, so a round they did not draft leaves them consistent
 static bool common_speculative_copy_first_ok(common_speculative_type type) {
-    if (type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
-        return true;
-    }
-    // LLAMA_RTB_GDNCOPY=1 (default off): MTP too. Its catch-up decode follows every target batch (process_range)
-    // and accept(is_other) takes the hidden row of the accepted span position, so a round it did not draft leaves
-    // it consistent; its adaptive depth controller is not fed span rounds (is_other)
-    return rtb::env_on("LLAMA_RTB_GDNCOPY") &&
-           (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
 }
 
 // drafters whose block the copy tail may follow; the n-gram drafters keep their own (narrow) width
@@ -6157,6 +6150,17 @@ void common_speculative_print_stats(const common_speculative * spec) {
                     ", #shadow scores = %" PRIu64 ", q1 = %.2f/%.2f/%.2f/%.2f, qn = %.3f, qe = %.2f, drafter ms/tok = %.2f\n",
                     i, rs.n_copy, rs.n_copy_tok, rs.n_copy_acc, rs.n_edit, rs.n_edit_hit, rs.n_cursor, rs.n_shadow,
                     q.first[0], q.first[1], q.first[2], q.first[3], q.next, q.edit, rs.ctl.alt_tok_ms);
+            // measured verify pass by row count (EWMA ms, rounds): the cost of a span width on this card and context
+            std::string by_rows;
+            for (int r = 1; r <= rtb::copy_ctl::ROWS_MAX; ++r) {
+                if (rs.ctl.t_n[r] > 1) {
+                    char buf[48];
+                    snprintf(buf, sizeof(buf), " w%d=%.1f(%d)", r, rs.ctl.t_ms[r], rs.ctl.t_n[r] - 1);
+                    by_rows += buf;
+                }
+            }
+            LOG_INF("statistics copy-first controller: seq = %zu, pass ms by verify rows:%s; drafter round ms = %.2f over %.1f rows\n",
+                    i, by_rows.empty() ? " none" : by_rows.c_str(), rs.ctl.alt_round_ms, rs.ctl.alt_rows);
         }
     }
 
