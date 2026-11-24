@@ -111,6 +111,25 @@ static __device__ __forceinline__ void fattn_sj_kvarn_trellis_cb_stage() {
     __syncthreads();
 }
 
+// [RTBT4] GGML_SJKVARN_TRELLIS4_SMEM=1 (opt-in, with GGML_SJKVARN_TRELLIS_TOKENS=1): the 4/4 token-axis trellis4 build
+// (template bits_k = 4 | 32) copies the two 1024-entry trellis4 tables (4 KB) into shared memory once per CTA and the
+// tile loader reads them through kv.cb4 (a generic pointer to that copy) instead of the lane-divergent global table.
+// Only the bits_k | 32 kernel references this array, so no other build gains static shared memory. Values are the same
+// table entries: output identical to the global-table build.
+static __shared__ uint16_t fattn_sj_kvarn_cb4_smem[2*FATTN_SJKVARN_TR4_NWIN];
+
+// Block-wide: every thread of the CTA must call it (it ends in __syncthreads()).
+static __device__ __forceinline__ const uint16_t * fattn_sj_kvarn_trellis_cb4_stage() {
+    const int tid  = threadIdx.y*blockDim.x + threadIdx.x;
+    const int nthr = blockDim.x*blockDim.y;
+    for (int i = tid; i < FATTN_SJKVARN_TR4_NWIN; i += nthr) {
+        fattn_sj_kvarn_cb4_smem[i]                          = fattn_sj_kvarn_cb4_k[i];
+        fattn_sj_kvarn_cb4_smem[FATTN_SJKVARN_TR4_NWIN + i] = fattn_sj_kvarn_cb4_v[i];
+    }
+    __syncthreads();
+    return fattn_sj_kvarn_cb4_smem;
+}
+
 // Staged codebook entry for a 2/3-bit trellis window (fattn_sj_kvarn_trellis_cb_stage must have run in this CTA).
 template<bool is_V>
 static __device__ __forceinline__ uint16_t fattn_sj_kvarn_trellis_cb_at(const uint32_t win) {
@@ -121,7 +140,8 @@ static __device__ __forceinline__ uint16_t fattn_sj_kvarn_trellis_cb_at(const ui
 // decoded through the BITS-bit trellis codebook, packed as q[l] = (value l, value l+4) like fattn_sj_kvarn_lowbits_decode_word.
 // BITS 2/3 read the shared codebook copy: only call from a kernel that ran fattn_sj_kvarn_trellis_cb_stage first.
 template<int BITS, bool is_V>
-static __device__ __forceinline__ void fattn_sj_kvarn_trellis_lb_word(const uint8_t * __restrict__ payload, const int word, half2 * const __restrict__ q /* [4] */) {
+static __device__ __forceinline__ void fattn_sj_kvarn_trellis_lb_word(const uint8_t * __restrict__ payload, const int word, half2 * const __restrict__ q /* [4] */,
+        const uint16_t * cb4 = nullptr /* [RTBT4] staged trellis4 tables (K then V), nullptr = global */) {
     static_assert(BITS >= 2 && BITS <= 4, "low-bit trellis decode (4 = token-axis trellis4)");
     const int lane  = word & 31;
     const int tile  = (word >> 5) & 15;
@@ -137,7 +157,8 @@ static __device__ __forceinline__ void fattn_sj_kvarn_trellis_lb_word(const uint
         const int channel = tile*16  + (is_V ? row : col);
         const uint32_t win = ggml_sj_kvarn::trellis_lb_window_any<BITS>(payload, token, channel, 256, 128, tok);
         if constexpr (BITS == 4) {
-            vals[nib] = __ushort_as_half((is_V ? fattn_sj_kvarn_cb4_v : fattn_sj_kvarn_cb4_k)[win]); // trellis4 table is not staged
+            vals[nib] = __ushort_as_half(cb4 ? cb4[(is_V ? FATTN_SJKVARN_TR4_NWIN : 0) + win]
+                                             : (is_V ? fattn_sj_kvarn_cb4_v : fattn_sj_kvarn_cb4_k)[win]); // global unless [RTBT4]
         } else {
             vals[nib] = __ushort_as_half(fattn_sj_kvarn_trellis_cb_at<is_V>(win));
         }
@@ -295,6 +316,8 @@ struct fattn_sj_kvarn_lowbits_ctx {
     // GGML_SJKVARN_LIVE_TILES (opt-in, nullptr otherwise): [0] = count, then the physical KV tile ids that some query
     // row can see, ascending; the tile kernel's kb0 then counts list entries (flash_attn_ext_f16_iter maps it)
     const int * live_tiles = nullptr;
+    // [RTBT4] staged trellis4 codebooks (bits_k | 32 build only), nullptr = the global tables
+    const uint16_t * cb4 = nullptr;
 };
 
 // fork: descriptor entry 15 (zero in every writer, below GGML_SJKVARN_DESC_N_ENTRIES) carries per-call flags without a
@@ -339,6 +362,7 @@ static __device__ __forceinline__ fattn_sj_kvarn_lowbits_ctx fattn_sj_kvarn_lowb
     const int G         = desc[GGML_SJKVARN_DESC_G];
     const int rec_bytes = desc[GGML_SJKVARN_DESC_RECBYTES];
     c.trellis       = (bits_k & 24) != 0; // compile-time in every caller: bits_k | 8 word-load, | 16 byte-load trellis build
+    // (bits_k | 32 = [RTBT4] trellis4 with staged tables: not a 2/3-bit trellis build, the kernel sets c.cb4)
     c.trellis_words = (bits_k & 8) != 0;
     c.bits_k = bits_k & 7;
     c.bits_v = bits_v;

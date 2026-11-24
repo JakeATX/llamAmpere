@@ -673,7 +673,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
                 } else if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 2) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_sj_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_sj_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
                 } else if (kv.body_type == GGML_TYPE_I16 && bits == 4 && (fattn_sj_kvarn_trtok & 2)) {
-                    fattn_sj_kvarn_trellis_lb_word<4,is_V>(packed, word, q); // token-axis trellis4 (opt-in, explicit GGML_SJKVARN_TRELLIS_TOKENS=1)
+                    fattn_sj_kvarn_trellis_lb_word<4,is_V>(packed, word, q, kv.cb4); // token-axis trellis4 (opt-in, explicit GGML_SJKVARN_TRELLIS_TOKENS=1)
                 } else {
                     const uint32_t w = bits == 4 ? __ldg(payload + word)
                         : bits == 3 ? sj_kvarn_lowbits::fragment_word<3,is_V>(packed,word)
@@ -735,7 +735,7 @@ static __device__ __forceinline__ void flash_attn_ext_sj_kvarn_load_tile_raw(
                 } else if (kv.trellis && kv.body_type == GGML_TYPE_I16 && bits == 2) { // staged codebooks (#126)
                     if (kv.trellis_words) { fattn_sj_kvarn_trellis_lb_word_w<2,is_V>(packed, word, q); } else { fattn_sj_kvarn_trellis_lb_word<2,is_V>(packed, word, q); }
                 } else if (kv.body_type == GGML_TYPE_I16 && bits == 4 && (fattn_sj_kvarn_trtok & 2)) {
-                    fattn_sj_kvarn_trellis_lb_word<4,is_V>(packed, word, q); // token-axis trellis4 (opt-in, explicit GGML_SJKVARN_TRELLIS_TOKENS=1)
+                    fattn_sj_kvarn_trellis_lb_word<4,is_V>(packed, word, q, kv.cb4); // token-axis trellis4 (opt-in, explicit GGML_SJKVARN_TRELLIS_TOKENS=1)
                 } else {
                     const uint32_t w = bits == 4 ? __ldg(payload + word)
                         : bits == 3 ? sj_kvarn_lowbits::fragment_word<3,is_V>(packed,word)
@@ -3379,6 +3379,13 @@ static __global__ void flash_attn_ext_f16(
     if constexpr (type_K == GGML_TYPE_I8 && (bits_k & 24) != 0) {
         fattn_sj_kvarn_trellis_cb_stage<bits_k & 7, bits_v>();
     }
+    // [RTBT4] trellis4 build with staged tables (bits_k = 4 | 32): same point, every thread present
+    const uint16_t * cb4_staged = nullptr;
+    if constexpr (type_K == GGML_TYPE_I8 && (bits_k & 32) != 0) {
+        static_assert((bits_k & 7) == 4 && bits_v == 4, "[RTBT4] staged trellis4 tables: 4/4 only");
+        cb4_staged = fattn_sj_kvarn_trellis_cb4_stage();
+    }
+    (void) cb4_staged;
 
     // For turbo4 KV the kernel receives RAW quantized bytes (need_f16_K/V = false in the
     // launcher), so stride_K/stride_V must be the true byte pitch nb11/nb21 — the turbo
@@ -3438,6 +3445,7 @@ static __global__ void flash_attn_ext_f16(
         if constexpr (is_sj_kvarn) {
             kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, bits_k, bits_v, nb12, nb22, ne01.z);
             kv.live_tiles = live_tiles;
+            kv.cb4 = cb4_staged;
         }
 
         if (KV_max) {
@@ -3491,6 +3499,7 @@ static __global__ void flash_attn_ext_f16(
     if constexpr (is_sj_kvarn) {
         kv = fattn_sj_kvarn_lowbits_make_ctx(sj_kvarn_body, sj_kvarn_desc, z_KV, DKQ, bits_k, bits_v, nb12, nb22, ne01.z);
         kv.live_tiles = live_tiles;
+        kv.cb4 = cb4_staged;
     }
 
     if (KV_max) {

@@ -448,7 +448,18 @@ static void ggml_cuda_lowbits_case(ggml_backend_cuda_context & ctx, ggml_tensor 
         // 4/4 reaches this path only as the token-axis trellis4 body (explicit nonzero GGML_SJKVARN_TRELLIS_TOKENS, fattn.cu)
         GGML_ASSERT(ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16 && ggml_sj_kvarn::trellis3::tokens4());
         ggml_cuda_sj_kvarn_trellis_cb_init();
-        ggml_cuda_lowbits_prefill_case<256,256,8,8,4,4>(ctx,dst);
+        // [RTBT4] GGML_SJKVARN_TRELLIS4_SMEM=1: the build that stages the trellis4 tables in shared memory
+        static const bool cb4_smem = [] {
+            const char * e = getenv("GGML_SJKVARN_TRELLIS4_SMEM");
+            const bool on = e != nullptr && e[0] == '1';
+            if (on) { GGML_LOG_INFO("%s: SJ-KVaRN trellis4 codebooks staged in shared memory (GGML_SJKVARN_TRELLIS4_SMEM)\n", __func__); }
+            return on;
+        }();
+        if (cb4_smem) {
+            ggml_cuda_lowbits_prefill_case<256,256,8,8,4 | 32,4>(ctx,dst);
+        } else {
+            ggml_cuda_lowbits_prefill_case<256,256,8,8,4,4>(ctx,dst);
+        }
     } else if (ggml_get_op_params_i32(dst,7) == GGML_TYPE_I16) {
         // trellis-coded body: the stream kernel has no codebook path, the tile loader decodes every width from the
         // codebooks staged in shared memory (#126). Only 3/3, 3/2 and 2/2 seal a 2/3-bit trellis body (llama-context.cpp).
