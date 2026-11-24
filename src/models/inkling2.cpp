@@ -51,6 +51,11 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
         hparams.attn_mode_impl[il] = hparams.is_swa_impl[il] ? LLAMA_ATTN_MODE_SWA : LLAMA_ATTN_MODE_GLOBAL;
     }
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_MID, hparams.n_swa_mid, false);
+    hparams.n_relative_extent_mid = hparams.n_relative_extent;
+    ml.get_key(LLM_KV_ATTENTION_RELATIVE_EXTENT_MID, hparams.n_relative_extent_mid, false);
+    if (!hparams.n_relative_extent_mid || hparams.n_relative_extent_mid > INT32_MAX) {
+        throw std::runtime_error("inkling2: invalid relative_extent_mid");
+    }
     {
         uint32_t v = 0;
         if (ml.get_key(LLM_KV_ATTENTION_LSA_KEEP_MIN, v, false)) { hparams.lsa_keep_min = (int32_t) v; }
@@ -139,8 +144,8 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
         if (hparams.n_swa != hparams.n_relative_extent) {
             throw std::runtime_error("inkling2: mixed attention modes require sliding_window == relative_extent");
         }
-        if (hparams.n_swa_mid > INT32_MAX || (hparams.is_swa_mid_any() && hparams.n_swa_mid == 0)) {
-            throw std::runtime_error("inkling2: invalid sliding_window_mid");
+        if (hparams.n_swa_mid > INT32_MAX || (hparams.is_swa_mid_any() && (hparams.n_swa_mid == 0 || hparams.n_relative_extent_mid > hparams.n_swa_mid))) {
+            throw std::runtime_error("inkling2: invalid sliding_window_mid or relative_extent_mid");
         }
         uint32_t c_glob = 0, c_swa = 0, c_mid = 0, c_lsa = 0;
         for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
@@ -224,7 +229,8 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         // probe attn_norm first so widened SWA layers (SWA_MID / LSA) work without adding split Q/K/V norm or conv_proj tensors
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
         const bool has_shared_norm = layer.attn_norm != nullptr;
-        const int64_t n_extent     = has_shared_norm ? hparams.n_swa : hparams.n_relative_extent;
+        const int64_t n_extent     = hparams.is_swa_mid(i) ? hparams.n_relative_extent_mid :
+                                     (has_shared_norm ? hparams.n_swa : hparams.n_relative_extent);
 
         // attention
         layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), {n_embd, n_embd_head*n_head}, 0);
@@ -414,7 +420,7 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
-    inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
+    inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa, hparams.n_relative_extent_mid);
     attn = inp->get_attn();
     recr = inp->get_recr();
 

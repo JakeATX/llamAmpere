@@ -976,11 +976,13 @@ public:
             std::unique_ptr<llm_graph_input_rs>          inp_rs,
             const llama_memory_hybrid_iswa_context *     mctx,
             uint32_t extent,
-            uint32_t extent_swa) :
+            uint32_t extent_swa,
+            uint32_t extent_swa_mid = 0) :
         inp_attn(std::move(inp_attn)),
         inp_rs(std::move(inp_rs)),
         extent(extent),
         extent_swa(extent_swa),
+        extent_swa_mid(extent_swa_mid > 0 ? extent_swa_mid : extent_swa),
         cparams(cparams),
         mctx(mctx) { }
     virtual ~llm_graph_input_mem_hybrid_iswa_rel() = default;
@@ -1022,6 +1024,7 @@ public:
 
     const uint32_t extent;
     const uint32_t extent_swa;
+    const uint32_t extent_swa_mid;
 
     const llama_cparams cparams;
 
@@ -2219,7 +2222,8 @@ struct llm_graph_context {
     // extent, extent_swa: the distance that the bias tables of the full and the SWA layers stop at
     llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(
             uint32_t extent,
-            uint32_t extent_swa) const;
+            uint32_t extent_swa,
+            uint32_t extent_swa_mid = 0) const;
 
     // Inkling 2 attention: kq_b is gathered here from the per-query bias table [n_head_q, extent + 1, n_tokens]
     // (row extent = the zero pad row minus the sink, used for every cell at distance >= extent); the full-attention

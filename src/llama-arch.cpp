@@ -375,6 +375,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_LOG_SCALE_ALPHA,              "%s.attention.log_scale_alpha"              },
     { LLM_KV_ATTENTION_LAYER_MODES,                  "%s.attention.layer_modes"                  },
     { LLM_KV_ATTENTION_SLIDING_WINDOW_MID,           "%s.attention.sliding_window_mid"           },
+    { LLM_KV_ATTENTION_RELATIVE_EXTENT_MID,          "%s.attention.relative_extent_mid"          },
     { LLM_KV_ATTENTION_LSA_KEEP_MIN,                 "%s.attention.lsa_keep_min"                 },
     { LLM_KV_ATTENTION_LSA_KEEP_FRAC,                "%s.attention.lsa_keep_frac"                },
     { LLM_KV_ATTENTION_LSA_KEEP_MAX,                 "%s.attention.lsa_keep_max"                 },

@@ -1988,7 +1988,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
             mswa_mid->set_input_attn_mask(inp_attn->self_attn_mask_swa_mid, ubatch, cparams.causal_attn);
         }
         if (self_rel_pos_swa_mid && self_rel_pos_swa_mid->buffer) {
-            mswa_mid->set_input_relative_pos(self_rel_pos_swa_mid, ubatch, extent_swa);
+            mswa_mid->set_input_relative_pos(self_rel_pos_swa_mid, ubatch, extent_swa_mid);
         }
     }
 
@@ -9471,7 +9471,8 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
 
 llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_iswa_rel(
         uint32_t extent,
-        uint32_t extent_swa) const {
+        uint32_t extent_swa,
+        uint32_t extent_swa_mid) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
 
     auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
@@ -9511,7 +9512,7 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     inp_attn->self_k_rot_swa = attn_ctx->get_swa()->get_k_rot();
     inp_attn->self_v_rot_swa = attn_ctx->get_swa()->get_v_rot();
 
-    auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa, extent_swa_mid);
 
     inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
     ggml_set_input(inp->self_rel_pos);
@@ -10235,6 +10236,7 @@ ggml_tensor * llm_graph_context::build_attn_rel_chunked(
     const auto & am = is_swa_mid ? inp_attn->self_attn_mask_swa_mid : ((is_swa || split) ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask);
     ggml_tensor * mask    = am.raw;
     ggml_tensor * rel_pos = is_swa_mid ? inp->self_rel_pos_swa_mid : ((is_swa || split) ? inp->self_rel_pos_swa : inp->self_rel_pos);
+    GGML_ASSERT(!is_swa_mid || table->ne[1] == (int64_t) inp->extent_swa_mid + 1);
     const int64_t ns   = mask->ne[3];
     const int64_t Ts   = n_tokens/ns;
     const int64_t n_kv = mask->ne[0];
@@ -10335,6 +10337,7 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
     gated = false;
     const bool is_swa       = hparams.is_swa(il);
     const bool is_swa_mid   = hparams.is_swa_mid(il);
+    GGML_ASSERT(!is_swa_mid || table->ne[1] == (int64_t) inp->extent_swa_mid + 1);
     const bool layer_is_lsa = hparams.is_lsa_any() ? hparams.is_lsa_layer(il) : (!is_swa && llama_inklsa_cfg().on);
     auto * inp_attn = inp->get_attn();
     const int64_t n_head = table->ne[0];

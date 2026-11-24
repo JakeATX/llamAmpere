@@ -288,9 +288,10 @@ struct llama_hparams {
     std::array<int32_t, LLAMA_MAX_LAYERS> mudd_tap_idx; // [n_layer][n_mudd_taps], -1 = no mixing
 
     // inkling2
-    uint32_t n_relative        = 0;
-    uint32_t n_relative_extent = 0;
-    uint32_t n_vocab_unpadded  = 0;
+    uint32_t n_relative            = 0;
+    uint32_t n_relative_extent     = 0;
+    uint32_t n_relative_extent_mid = 0; // optional extended relative bias extent for SWA_MID layers (default = n_relative_extent)
+    uint32_t n_vocab_unpadded      = 0;
     uint32_t n_vocab_padded    = 0;
     uint32_t n_log_scale_floor = 0;
     float    f_log_scale_alpha = 0.0f;
