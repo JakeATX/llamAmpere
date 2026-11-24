@@ -173,7 +173,36 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // warm-up: load every kernel on both streams before the timed protocol, so a first-launch stall cannot
+    // eat a wait's timeout (a real caller sees that as one fallback step, the test would count it as a fail)
+    {
+        const uint32_t seq = 0x7fff0000u;
+        bool ok = p_post(m.backend, mb_x, 0, 0, m.x[1], seq) && p_post(m.backend, mb_ids, 0, 0, m.ids[1], seq) &&
+                  p_wait(p.backend, mb_x, 0, 0, p.x[1], seq, WAIT_NS) && p_wait(p.backend, mb_ids, 0, 0, p.ids[1], seq, WAIT_NS) &&
+                  p_post(p.backend, mb_x, 0, 1, p.yback[1], seq) && p_wait(m.backend, mb_x, 0, 1, m.yback[1], seq, WAIT_NS);
+        for (int t = 1; t <= T_MAX; ++t) {
+            ok = ok && ggml_backend_graph_compute(m.backend, m.gf[t]) == GGML_STATUS_SUCCESS &&
+                       ggml_backend_graph_compute(p.backend, p.gf[t]) == GGML_STATUS_SUCCESS;
+        }
+        ggml_backend_synchronize(m.backend);
+        ggml_backend_synchronize(p.backend);
+        if (!ok || p_status(mb_x, 0, 1) == seq) {
+            printf("FAIL: warm-up round trip\n");
+            return 1;
+        }
+        // doorbells are compared as (bell - seq) >= 0: start the rounds from a clean mailbox
+        p_free(mb_x);
+        p_free(mb_ids);
+        mb_x   = p_new(2, bytes_in, bytes_out);
+        mb_ids = p_new(2, sizeof(int32_t) * N_USED * T_MAX, 64);
+        if (!mb_x || !mb_ids) {
+            printf("FAIL: mailbox alloc\n");
+            return 1;
+        }
+    }
+
     std::atomic<bool> peer_ok{true};
+    std::atomic<int> peer_in_fail{0};
     auto peer_round = [&](int r) {
         const int t = n_tok[r], slot = r & 1;
         const uint32_t seq = (uint32_t) r + 1;
@@ -193,6 +222,10 @@ int main(int argc, char ** argv) {
                 peer_round(r);
                 // keep the peer at most one round ahead of its own stream (the data areas alternate by slot)
                 ggml_backend_synchronize(p.backend);
+                const uint32_t seq = (uint32_t) r + 1;
+                if (p_status(mb_x, r & 1, 0) == seq || p_status(mb_ids, r & 1, 0) == seq) {
+                    peer_in_fail++;
+                }
             }
         });
     }
@@ -215,7 +248,7 @@ int main(int argc, char ** argv) {
         ggml_backend_synchronize(m.backend);
         us_sum += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         if (!ok || p_status(mb_x, slot, 1) == seq) {
-            printf("FAIL: round %d: transport (ok=%d status=%u)\n", r, ok, p_status(mb_x, slot, 1));
+            printf("FAIL: round %d: transport fallback (ok=%d status=%u)\n", r, ok, p_status(mb_x, slot, 1));
             n_fail++;
             continue;
         }
@@ -231,6 +264,10 @@ int main(int argc, char ** argv) {
     }
     if (peer_thr.joinable()) {
         peer_thr.join();
+    }
+    if (peer_in_fail > 0) {
+        printf("FAIL: %d peer input waits timed out\n", peer_in_fail.load());
+        n_fail++;
     }
     if (!peer_ok) {
         printf("FAIL: peer side launch\n");

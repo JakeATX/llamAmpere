@@ -22,6 +22,8 @@ typedef ggml_cuda_peer_mbox * (*ggml_cuda_peer_mbox_new_t)(int n_slots, size_t b
 typedef void (*ggml_cuda_peer_mbox_free_t)(ggml_cuda_peer_mbox * mb);
 // "ggml_backend_cuda_peer_post": on the stream of backend, copy the contiguous F32 or I32 device tensor src (32-bit words, bit-exact) into the
 // data area of (slot, dir), then ring the doorbell with seq. false: bad arguments or src larger than the area.
+// A dir-1 post whose slot's dir-0 wait failed for seq also stores seq in the dir-1 status word (the rows are not
+// valid), so the main card sees the failure through peer_status(slot, 1) after its wait.
 typedef bool (*ggml_cuda_peer_post_t)(ggml_backend_t backend, ggml_cuda_peer_mbox * mb, int slot, int dir,
         const ggml_tensor * src, uint32_t seq);
 // "ggml_backend_cuda_peer_wait": on the stream of backend, wait until the doorbell of (slot, dir) reaches seq

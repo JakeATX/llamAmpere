@@ -88,14 +88,20 @@ static __device__ __forceinline__ uint64_t peer_globaltimer_ns() {
 }
 
 // one block: every data store must be visible before the doorbell, and one block makes that a __syncthreads
+// in_status (dir 1 posts only): the status word of the slot's dir-0 wait. If that wait failed for this seq, the
+// rows are not valid: the failure goes into the dir-1 status word, so the main card falls back instead of
+// accumulating rows computed from zeros.
 static __global__ void k_peer_post(const float * __restrict__ src, volatile float * dst, int n,
-        volatile uint32_t * bell, uint32_t seq) {
+        volatile uint32_t * bell, uint32_t seq, const volatile uint32_t * in_status, volatile uint32_t * out_status) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         dst[i] = src[i];
     }
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
+        if (in_status && *in_status == seq) {
+            *out_status = seq;
+        }
         __threadfence_system();
         *bell = seq;
     }
@@ -151,11 +157,16 @@ bool ggml_backend_cuda_peer_post(ggml_backend_t backend, ggml_cuda_peer_mbox * m
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     ggml_cuda_set_device(ctx->device);
     float * d_data = nullptr;
-    uint32_t * d_bell = nullptr;
+    uint32_t * d_bell = nullptr, * d_in_status = nullptr, * d_out_status = nullptr;
     if (!peer_dev_ptr(peer_data(mb, slot, dir), &d_data) || !peer_dev_ptr(peer_bell(mb, slot, dir), &d_bell)) {
         return false;
     }
-    k_peer_post<<<1, 1024, 0, ctx->stream()>>>((const float *) src->data, d_data, (int) ggml_nelements(src), d_bell, seq);
+    if (dir == 1 && (!peer_dev_ptr(peer_status_word(mb, slot, 0), &d_in_status) ||
+            !peer_dev_ptr(peer_status_word(mb, slot, 1), &d_out_status))) {
+        return false;
+    }
+    k_peer_post<<<1, 1024, 0, ctx->stream()>>>((const float *) src->data, d_data, (int) ggml_nelements(src), d_bell, seq,
+            d_in_status, d_out_status);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
