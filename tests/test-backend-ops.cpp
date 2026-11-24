@@ -18579,9 +18579,10 @@ static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, b
     }
 }
 
-// NEONKERN: fused Inkling 2 Mini NVFP4 MoE graph (gate_up + scale + SITU + down + scale + wsum)
-// Exercises ggml_cuda_try_fuse_ink_nvfp4moe -> nvfp4mt / nk-nvfp4-tc across T = 1..8 and routing patterns.
+// NEONKERN: fused Inkling 2 Mini NVFP4 / Q8_0 MoE graph (gate_up [+ scale] + SITU + down [+ scale] + wsum)
+// Exercises ggml_cuda_try_fuse_ink_nvfp4moe -> nvfp4mt / nk-nvfp4-tc / nk-q8-moe-tc across T = 1..8 and routing patterns.
 struct test_ink_nvfp4_moe : public test_case {
+    const ggml_type w_type;
     const int n_expert;
     const int n_used;
     const int64_t K;
@@ -18592,24 +18593,44 @@ struct test_ink_nvfp4_moe : public test_case {
     const int route_mode; // 0 = distinct random, 1 = correlated (~24 unique at T=5), 2 = all tokens same 8 experts (N=T)
 
     test_ink_nvfp4_moe(int n_expert, int n_used, int64_t K, int64_t F, int64_t T,
-                       bool scaled = true, bool strided_ids = false, int route_mode = 0)
-        : n_expert(n_expert), n_used(n_used), K(K), F(F), T(T),
+                       bool scaled = true, bool strided_ids = false, int route_mode = 0,
+                       ggml_type w_type = GGML_TYPE_NVFP4)
+        : w_type(w_type), n_expert(n_expert), n_used(n_used), K(K), F(F), T(T),
           scaled(scaled), strided_ids(strided_ids), route_mode(route_mode) {}
 
-    std::string op_desc(ggml_tensor *) override { return "INK_NVFP4_MOE"; }
+    static bool switch_on(const char * name) {
+        const char * e = getenv(name);
+        return e != nullptr && atoi(e) != 0;
+    }
+
+    std::string op_desc(ggml_tensor *) override {
+        return w_type == GGML_TYPE_Q8_0 ? "INK_Q8_0_MOE" : "INK_NVFP4_MOE";
+    }
     std::string vars() override {
         return VARS_TO_STR8(n_expert, n_used, K, F, T, scaled, strided_ids, route_mode);
     }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 1e-3; }
+    const char * required_fusion() override {
+        if (w_type == GGML_TYPE_Q8_0) {
+            return switch_on("GGML_CUDA_NK_Q8_0_TC") ? "nk_q8_0_tc" : nullptr;
+        }
+        return switch_on("GGML_CUDA_NK_NVFP4_TC") ? "nk_nvfp4_tc" : nullptr;
+    }
+    const char * forbidden_fusion() override {
+        if (w_type == GGML_TYPE_Q8_0) {
+            return switch_on("GGML_CUDA_NK_Q8_0_TC") ? nullptr : "nk_q8_0_tc";
+        }
+        return switch_on("GGML_CUDA_NK_NVFP4_TC") ? nullptr : "nk_nvfp4_tc";
+    }
     uint64_t op_flops(ggml_tensor *) override {
         // gate_up (2*F x K) + down (K x F) = 3 * 2 * K * F * n_used * T
         return 6ull * (uint64_t) K * (uint64_t) F * (uint64_t) n_used * (uint64_t) T;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * w_gu = ggml_new_tensor_3d(ctx, GGML_TYPE_NVFP4, K, 2 * F, n_expert);
-        ggml_tensor * w_dn = ggml_new_tensor_3d(ctx, GGML_TYPE_NVFP4, F, K, n_expert);
+        ggml_tensor * w_gu = ggml_new_tensor_3d(ctx, w_type, K, 2 * F, n_expert);
+        ggml_tensor * w_dn = ggml_new_tensor_3d(ctx, w_type, F, K, n_expert);
         ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, T);
         ggml_tensor * rw   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, T);
         ggml_set_name(w_gu, "w_gu");
@@ -18738,6 +18759,27 @@ static void add_ink_nvfp4_moe_cases(std::vector<std::unique_ptr<test_case>> & ca
     }
     cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 5, true, false, 1));
     cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 8, true, true,  1));
+}
+
+static void add_ink_q8_0_moe_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (perf) {
+        // Full 128-expert Inkling 2 Mini L20-23 Q8_0 MoE visit: correlated (~24 unique at T=5), uniform random, and all-shared.
+        for (int64_t T : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            cases.emplace_back(new test_ink_nvfp4_moe(128, 8, 2304, 1152, T, false, false, 1, GGML_TYPE_Q8_0));
+        }
+        for (int64_t T : {1, 5, 8}) {
+            cases.emplace_back(new test_ink_nvfp4_moe(128, 8, 2304, 1152, T, false, false, 0, GGML_TYPE_Q8_0));
+        }
+        cases.emplace_back(new test_ink_nvfp4_moe(128, 8, 2304, 1152, 5, false, false, 2, GGML_TYPE_Q8_0));
+        return;
+    }
+    // Correctness: T=1..8, contiguous & strided ids, distinct/correlated/all-shared (N=T) routing.
+    for (int64_t T : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        cases.emplace_back(new test_ink_nvfp4_moe(16, 8, 2304, 1152, T, false, false, 0, GGML_TYPE_Q8_0));
+        cases.emplace_back(new test_ink_nvfp4_moe(16, 8, 2304, 1152, T, false, true,  2, GGML_TYPE_Q8_0));
+    }
+    cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 5, false, false, 1, GGML_TYPE_Q8_0));
+    cases.emplace_back(new test_ink_nvfp4_moe(32, 8, 2304, 1152, 8, false, true,  1, GGML_TYPE_Q8_0));
 }
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
@@ -22208,6 +22250,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     add_inkattn_cases(test_cases, false);
     add_ink_nvfp4_moe_cases(test_cases, false);
+    add_ink_q8_0_moe_cases(test_cases, false);
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
@@ -24126,6 +24169,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     if (getenv("GGML_TEST_INK_NVFP4_MOE") != nullptr) {
         add_ink_nvfp4_moe_cases(test_cases, true);
+        return test_cases;
+    }
+    if (getenv("GGML_TEST_INK_Q8_0_MOE") != nullptr) {
+        add_ink_q8_0_moe_cases(test_cases, true);
         return test_cases;
     }
     // [SEAL08] one layer of the 24dense adaptive-tail flush (32 groups x 4 KV heads, tq6_0 ring): GGML_TEST_SEAL_PERF=1
