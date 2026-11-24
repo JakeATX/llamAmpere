@@ -26,9 +26,11 @@
 #include <vector>
 
 struct llama_model;
+class  llama_moe_cache;
 
 struct llama_ink_stream_stats {
     uint64_t bytes_h2d   = 0; // expert bytes uploaded
+    uint64_t bytes_d2d   = 0; // fork (PLOAN): expert bytes copied from the kept MoE cache banks
     uint64_t uploads     = 0; // visits uploaded
     int64_t  t_wait_us   = 0; // graph thread waiting for an upload to be queued
 };
@@ -71,6 +73,10 @@ public:
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst);
 
     llama_ink_stream_stats take_stats();
+
+    // fork (PLOAN, LLAMA_INK_PLOAN=1): while the MoE cache keeps a mapped prefix of its banks (suspend_keep), a visit
+    // copies the experts it holds device to device and uploads only the others; the refill may write VMM banks
+    void set_cache(const llama_moe_cache * cache);
 
     // fork (REFILLPIPE): one host -> device copy for upload_wait()
     struct upload {
@@ -171,7 +177,13 @@ private:
     ggml_backend_buffer_t buf_zeros = nullptr; // pinned zeros for the tails
     size_t n_direct = 0, n_direct_span = 0;
 
+    // fork (PLOAN)
+    const llama_moe_cache * cache = nullptr;
+    ggml_context * ctx_d2d = nullptr;               // views of the kept-expert copies of one visit
+    ggml_backend_buffer_type_t buft_elastic = nullptr; // the VMM bank buffer type (upload_wait destinations)
+
     void issue(int il, ggml_backend_t backend);
+    bool issue_kept(int il); // fork (PLOAN): false = no kept experts in this visit (nothing queued)
     void wait_issued();
     void worker(int w);
     void free_slots();

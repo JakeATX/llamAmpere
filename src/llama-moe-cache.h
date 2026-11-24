@@ -55,6 +55,16 @@ public:
     using uploader = std::function<bool(const std::vector<copy_op> &)>;
     bool   resume(const uploader & up = nullptr);
     bool   suspended() const;
+    // fork (PLOAN, LLAMA_INK_PLOAN=1): like suspend(), but the first slots of each bank (about keep_bytes in all) stay
+    // mapped with their experts (VMM banks, one device; else a full suspend). Returns the bytes freed. resume() then
+    // maps the rest again and uploads only the slots that were dropped; suspend() frees the kept slots too.
+    size_t suspend_keep(size_t keep_bytes);
+    bool   partial() const;
+    // while partial: the slot map of host experts w (expert e is kept iff slots[e] < *n_keep) and its bank; else nullptr
+    const int32_t * kept_slots(const ggml_tensor * w, ggml_tensor ** bank, int32_t * n_keep) const;
+    size_t kept_bytes() const; // mapped bank bytes while partial, else 0
+    // with LLAMA_INK_PLOAN=1: the slots the last resume() uploaded, of the filled slots, and their bytes
+    void   last_resume(int32_t * n_up, int32_t * n_filled, size_t * bytes) const;
     // fork (CACHELOAN): while suspended, rebuild the banks for `size` bytes (keeps the hottest experts; resume()
     // uploads them). false: not possible here (several devices, CPU share, trace), nothing changed. size(): bank bytes.
     bool   resize(size_t size);

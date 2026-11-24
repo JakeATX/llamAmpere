@@ -717,8 +717,14 @@ private:
     uint32_t ink_head_retry = 0; // [HEADLOAN] rate limit of the upload retry after a failed restore
     uint32_t ink_rung_changes = 0, ink_rung_hold = 0; // [RUNG] ceiling changes this prompt; checks a lowered ceiling holds
     double   ink_rung_hold_free = 0.0;                // [RUNG] free VRAM when the ceiling was lowered
-    bool     ink_stream_take();
+    bool     ink_stream_take(uint32_t n_tokens = 0, llama_seq_id seq = -1);
     bool     ink_stream_release(const char * why);
+    // fork (PLOAN, LLAMA_INK_PLOAN=1): the take keeps the MoE cache bank bytes the prompt does not need (need: the two
+    // slots, the compute reserve at the prompt's ladder rung, the INKB1 scratch, LLAMA_INK_PLOAN_MARGIN_MIB); anything
+    // the kept banks would cut (a reserve that fails, the pool rows, the B1 group size) first gets them back in full
+    std::map<uint32_t, size_t> ink_ploan_reserve; // measured GPU compute buffer of an armed prompt reserve, by rows
+    size_t   ink_ploan_b1_bytes(uint32_t rows, uint32_t n_tokens, llama_seq_id seq) const;
+    void     ink_ploan_give_back(const char * why);
     uint64_t ink_stream_tokens = 0;  // prompt tokens streamed since the last take
     int64_t  ink_stream_t0_us  = 0;
     uint32_t ink_stream_rows_max = 0; // largest ubatch run while armed

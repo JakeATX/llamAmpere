@@ -447,6 +447,7 @@ struct llama_moe_cache::impl {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
+        bool elastic = false; // fork (PLOAN): buf is a VMM buffer whose pages can be unmapped
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -538,6 +539,22 @@ struct llama_moe_cache::impl {
     ggml_context_ptr ctx_views;
 
     bool is_suspended = false; // fork (INKSTREAM): banks freed for a streamed prompt
+
+    // fork (PLOAN, LLAMA_INK_PLOAN=1, off by default): the banks sit in one VMM buffer (one device). A streamed prompt
+    // then keeps the first keep_n[g] slots of each bank of group g mapped (suspend_keep) and the streamer copies those
+    // experts device to device; resume() maps the rest again and uploads only the dropped slots.
+    using elastic_buft_fn   = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+    using elastic_set_fn    = bool   (*)(ggml_backend_buffer_t, const size_t *, const size_t *, int);
+    using elastic_mapped_fn = size_t (*)(ggml_backend_buffer_t);
+    const bool ploan_on = [] { const char * e = getenv("LLAMA_INK_PLOAN"); return e && atoi(e) == 1; }();
+    ggml_backend_buffer_type_t buft_elastic = nullptr; // set only with ploan_on, one device
+    elastic_set_fn    el_set    = nullptr;
+    elastic_mapped_fn el_mapped = nullptr;
+    bool is_partial = false;
+    std::vector<int32_t> keep_n; // [group] kept slots while partial
+    bool elastic_warned = false;
+    int32_t res_n_up = 0, res_n_all = 0; // the last resume(): slots uploaded, of the filled slots
+    size_t  res_bytes = 0;
 
     // fork (SURGE-cache, round admission; LLAMA_MOE_CACHE_ROUND=1, off by default). Once the cache is full, a decode
     // miss is computed on the CPU from the host experts instead of being uploaded on the spot (the graph's CPU part,
@@ -916,9 +933,17 @@ struct llama_moe_cache::impl {
             stage_first_il = layers[il].ig >= 0 ? (int32_t) il : -1; // fork (INKMISS, R3): window start
         }
 
+        if (ploan_on && !no_alloc) {
+            ploan_init();
+        }
         // with no_alloc, dummy buffers are attached so the memory use can still be measured, see llama_context::memory_breakdown
         for (device & d : devices) {
             if (!d.ctx) {
+                continue;
+            }
+            if (buft_elastic && alloc_elastic(d)) {
+                ggml_backend_buffer_clear(d.buf.get(), 0);
+                d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
                 continue;
             }
             d.buf = llama_memory_bufs::alloc_buf(d.ctx.get(), d.buft, no_alloc, "MoE cache");
@@ -1911,8 +1936,133 @@ struct llama_moe_cache::impl {
         }
     }
 
-    size_t suspend() {
+    // fork (PLOAN): the VMM buffer type of the one device that holds banks and its page calls; else PLOAN stays off
+    void ploan_init() {
+        const device * one = nullptr;
+        int n_dev = 0;
+        for (const device & d : devices) {
+            if (d.ctx) {
+                one = &d;
+                n_dev++;
+            }
+        }
+        ggml_backend_dev_t dev = one ? ggml_backend_get_device(one->backend) : nullptr;
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto get_buft = reg ? (elastic_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_elastic_buffer_type") : nullptr;
+        el_set    = reg ? (elastic_set_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_elastic_set_ranges") : nullptr;
+        el_mapped = reg ? (elastic_mapped_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_elastic_mapped") : nullptr;
+        buft_elastic = n_dev == 1 && get_buft && el_set && el_mapped ? get_buft(dev) : nullptr;
+        if (buft_elastic) {
+            LLAMA_LOG_WARN("%s: [PLOAN] on: MoE cache banks in a VMM buffer; a streamed prompt keeps a mapped prefix of each bank\n", __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: [PLOAN] off: needs one CUDA device with VMM for the banks (%d devices hold banks)\n", __func__, n_dev);
+        }
+    }
+
+    // fork (PLOAN): the banks of d in a VMM buffer; false (logged once): the caller takes the plain buffer type
+    bool alloc_elastic(device & d) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), buft_elastic);
+        d.elastic = buf != nullptr;
+        if (!buf) {
+            if (!elastic_warned) {
+                elastic_warned = true;
+                LLAMA_LOG_WARN("%s: [PLOAN] the VMM banks did not allocate: plain banks (prompts lend the whole cache)\n", __func__);
+            }
+            return false;
+        }
+        d.buf.reset(buf);
+        return true;
+    }
+
+    // fork (PLOAN): bytes of one slot of a group (all its banks)
+    static size_t slot_bytes(const group & g) {
+        size_t res = 0;
+        for (const ggml_tensor * t : g.ref) {
+            res += t->nb[1]*t->ne[1];
+        }
+        return res;
+    }
+
+    size_t suspend_keep(size_t keep_bytes) {
         if (is_suspended) {
+            return 0;
+        }
+        device * one = nullptr;
+        int n_dev = 0;
+        for (device & d : devices) {
+            if (d.ctx) {
+                one = &d;
+                n_dev++;
+            }
+        }
+        if (keep_bytes == 0 || n_dev != 1 || !one->buf || !one->elastic || !el_set || !el_mapped) {
+            return suspend();
+        }
+        nowait_drain(); // no background copy into the banks while the streamer reads them
+        if (prefetch) {
+            prefetch->wait();
+        }
+        // each group keeps the same share of its slots, about keep_bytes in all
+        size_t all = 0;
+        for (const group & g : groups) {
+            all += (size_t) g.n_slots*slot_bytes(g);
+        }
+        const double f = all > 0 ? std::min(1.0, (double) keep_bytes/all) : 0.0;
+        keep_n.assign(groups.size(), 0);
+        std::vector<size_t> off, len;
+        const char * base = (const char *) ggml_backend_buffer_get_base(one->buf.get());
+        int32_t n_kept = 0;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            if (g.n_slots == 0) {
+                continue;
+            }
+            keep_n[ig] = std::min(g.n_slots, (int32_t) (f*g.n_slots));
+            n_kept += keep_n[ig];
+            for (const ggml_tensor * bank : g.banks) {
+                off.push_back((size_t) ((const char *) bank->data - base));
+                len.push_back((size_t) keep_n[ig]*bank->nb[2]);
+            }
+        }
+        const size_t before = el_mapped(one->buf.get());
+        if (n_kept == 0 || !el_set(one->buf.get(), off.data(), len.data(), (int) off.size())) {
+            keep_n.clear();
+            return suspend();
+        }
+        // the banks keep their pointers and the kept slots their experts; readers see the cache suspended
+        is_suspended = true;
+        is_partial   = true;
+        return before - el_mapped(one->buf.get());
+    }
+
+    size_t kept_bytes() const {
+        size_t res = 0;
+        for (const device & d : devices) {
+            res += is_partial && d.buf && d.elastic ? el_mapped(d.buf.get()) : 0;
+        }
+        return res;
+    }
+
+    const int32_t * kept_slots(const ggml_tensor * w, ggml_tensor ** bank, int32_t * n_keep) const {
+        if (!is_partial) {
+            return nullptr;
+        }
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return nullptr;
+        }
+        const binding & b = it->second;
+        const int32_t ig = layers[b.il].ig;
+        if (ig < 0 || ig >= (int32_t) keep_n.size() || keep_n[ig] <= 0 || groups[ig].lru.slot_map[b.il] == nullptr) {
+            return nullptr;
+        }
+        *bank   = groups[ig].banks[b.ip];
+        *n_keep = keep_n[ig];
+        return groups[ig].lru.slot_map[b.il];
+    }
+
+    size_t suspend() {
+        if (ploan_on && is_suspended && !is_partial) { // port: PLOAN only, off = the cand base's path
             return 0;
         }
         nowait_drain(); // fork (INKMISS): no background copy into banks about to be freed
@@ -1925,7 +2075,8 @@ struct llama_moe_cache::impl {
             if (!d.buf || !d.ctx) {
                 continue;
             }
-            freed += ggml_backend_buffer_get_size(d.buf.get());
+            // fork (PLOAN): a partial loan frees the pages it kept mapped
+            freed += is_partial && d.elastic ? el_mapped(d.buf.get()) : ggml_backend_buffer_get_size(d.buf.get());
             d.buf.reset();
             for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t; t = ggml_get_next_tensor(d.ctx.get(), t)) {
                 t->data   = nullptr;
@@ -1933,6 +2084,7 @@ struct llama_moe_cache::impl {
             }
         }
         is_suspended = true;
+        is_partial   = false;
         return freed;
     }
 
@@ -1993,7 +2145,10 @@ struct llama_moe_cache::impl {
             change = change || n != g.n_slots;
         }
         if (!change) {
-            return true;
+            return true; // fork (PLOAN): a partial loan stays, resume() refills only its dropped slots
+        }
+        if (is_partial) {
+            suspend(); // fork (PLOAN): the slots move, so the kept pages go too
         }
 
         for (size_t ig = 0; ig < groups.size(); ++ig) {
@@ -2102,11 +2257,28 @@ struct llama_moe_cache::impl {
             return true;
         }
         const std::unique_lock<std::mutex> og_lock = og_hold(true); // fork (ONEGRAPH): no-op unless on
+        // fork (PLOAN): a partial loan maps its dropped pages again (they read the clear value, zero) and uploads only
+        // the slots from keep_n on; a failed map leaves it as it was (still suspended)
+        std::vector<int32_t> first(groups.size(), 0);
+        if (is_partial) {
+            for (device & d : devices) {
+                if (!d.buf || !d.ctx || !d.elastic) {
+                    continue;
+                }
+                const size_t off = 0, len = ggml_backend_buffer_get_size(d.buf.get());
+                if (!el_set(d.buf.get(), &off, &len, 1)) {
+                    LLAMA_LOG_WARN("%s: [PLOAN] mapping the lent bank pages again failed (retried later)\n", __func__);
+                    return false;
+                }
+            }
+            first = keep_n;
+        }
         for (device & d : devices) {
             if (d.buf || !d.ctx) {
                 continue;
             }
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), d.buft);
+            ggml_backend_buffer_t buf = buft_elastic && alloc_elastic(d) ? d.buf.release() :
+                ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), d.buft);
             if (!buf) {
                 // free what was allocated so far, the context stays suspended
                 for (device & o : devices) {
@@ -2149,9 +2321,14 @@ struct llama_moe_cache::impl {
                 ggml_backend_tensor_set(bank, src, offs, len);
             }
         };
-        for (group & g : groups) {
+        if (ploan_on) {
+            res_n_up = res_n_all = 0;
+            res_bytes = 0;
+        }
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
             const moe_cache_lru & lru = g.lru;
-            for (int32_t s = 0; s < g.n_slots; ) {
+            for (int32_t s = first[ig]; s < g.n_slots; ) {
                 const int32_t key = lru.key_of[s];
                 if (key < 0) {
                     s++;
@@ -2162,6 +2339,10 @@ struct llama_moe_cache::impl {
                 int32_t n = 1;
                 while (s + n < g.n_slots && lru.key_of[s + n] == key + n && lru.key_layer(key + n) == il) {
                     n++;
+                }
+                if (ploan_on) {
+                    res_n_up  += n;
+                    res_bytes += (size_t) n*slot_bytes(g);
                 }
                 const layer & l = layers[il];
                 if (nvme != nullptr) {
@@ -2201,7 +2382,15 @@ struct llama_moe_cache::impl {
                 ggml_backend_tensor_set(op.dst, op.src, op.offs, op.len);
             }
         }
+        if (ploan_on) {
+            for (const group & g : groups) {
+                for (int32_t s = 0; s < g.n_slots; ++s) {
+                    res_n_all += g.lru.key_of[s] >= 0 ? 1 : 0;
+                }
+            }
+        }
         is_suspended = false;
+        is_partial   = false;
         return true;
     }
 
@@ -2438,6 +2627,28 @@ size_t llama_moe_cache::size() const {
 
 bool llama_moe_cache::suspended() const {
     return pimpl->is_suspended;
+}
+
+size_t llama_moe_cache::suspend_keep(size_t keep_bytes) {
+    return pimpl->suspend_keep(keep_bytes);
+}
+
+bool llama_moe_cache::partial() const {
+    return pimpl->is_partial;
+}
+
+const int32_t * llama_moe_cache::kept_slots(const ggml_tensor * w, ggml_tensor ** bank, int32_t * n_keep) const {
+    return pimpl->kept_slots(w, bank, n_keep);
+}
+
+size_t llama_moe_cache::kept_bytes() const {
+    return pimpl->kept_bytes();
+}
+
+void llama_moe_cache::last_resume(int32_t * n_up, int32_t * n_filled, size_t * bytes) const {
+    *n_up     = pimpl->res_n_up;
+    *n_filled = pimpl->res_n_all;
+    *bytes    = pimpl->res_bytes;
 }
 
 void llama_moe_cache::set_op_offload(bool on) {
