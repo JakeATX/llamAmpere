@@ -9015,7 +9015,7 @@ static void add_dspine_mmq_few_exact_cases(std::vector<std::unique_ptr<test_case
         cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K,  5120, 7, 17408, 1));
         cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K, 24576, 7,  5120, 1));
         cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K, 24576, 8,  5120, 1));
-        // Fallback tail (m % 128 != 0), odd-row Q6_K tail, unsplit eff>=90% (m=10496 -> nti=82), untagged controls, n=4 MMVQ guard
+        // Fallback tail (m % 128 != 0), even-row Q6_K tail (m=1002, 16 B aligned rows), unsplit eff>=90% (m=10496 -> nti=82), untagged controls, n=4 MMVQ guard
         cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  1000, 7,  5120, 1));
         cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K,  1002, 7,  5120, 1));
         cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K, 10496, 8,  5120, 0));
