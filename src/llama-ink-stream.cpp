@@ -278,6 +278,10 @@ bool llama_ink_stream::prepare() {
             }
         }
     }
+    // fork (INKB1): a visit computed again (the next ubatch of a layer-major group) does not wait for the other slot's
+    // upload (same values, the host only waits less). Port: LLAMA_INK_STREAM_REUSE_NOWAIT=1 on, 0 off; unset follows
+    // LLAMA_INK_B1 (part of the gated layer-major config), so with INKB1 off the wait is the cand base's.
+    layer_major_reuse = ink_stream_env("LLAMA_INK_STREAM_REUSE_NOWAIT", ink_stream_env("LLAMA_INK_B1", 0) != 0 ? 1 : 0) != 0;
     if (!ok) {
         LLAMA_LOG_WARN("%s: [INKSTREAM] cannot set up the copy pipeline, the streamer is off\n", __func__);
         free_pipeline();
@@ -546,12 +550,18 @@ bool llama_ink_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggm
             wait_issued();
             issue(il, backend);
         }
-        wait_issued();                                    // its ready event is recorded
+        // its ready event is recorded. Requests run one at a time, so only the latest one (req_slot) can still be
+        // queuing: when that is the other slot (a visit computed again for the next ubatch of a layer-major group
+        // while the next visit uploads), this slot's event is already recorded and the graph goes on at once.
+        if (req_slot == v.slot || !layer_major_reuse) {
+            wait_issued();
+        }
         st.t_wait_us += ggml_time_us() - t0;
         ggml_backend_event_wait(backend, ev_ready[v.slot]); // the compute stream waits for the slot
         // the next streamed visit goes into the other slot while this one computes (wrapping into the next ubatch)
         const int nx = order[(v.pos + 1) % order.size()];
         if (visits[nx].slot != v.slot && issued[visits[nx].slot] != nx) {
+            wait_issued();
             issue(nx, backend);
         }
     }

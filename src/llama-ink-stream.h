@@ -111,6 +111,7 @@ private:
 
     int    n_workers = 4;
     size_t piece_max = 8u << 20;
+    bool   layer_major_reuse = false; // see copy(): no wait for the other slot when a visit repeats (INKB1)
     struct worker_state {
         ggml_backend_buffer_t buf[2] = { nullptr, nullptr };
         char *                data[2] = { nullptr, nullptr };
