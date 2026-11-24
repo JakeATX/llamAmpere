@@ -610,6 +610,12 @@ if (GGML_CUDA)
     add_test(NAME test-aif25-mmq-async-nb1 COMMAND $<TARGET_FILE:test-aif25-mmq>)
     set_tests_properties(test-aif25-mmq-async-nb1 PROPERTIES
         ENVIRONMENT "GGML_CUDA_AIF25_MMQ_MIN=64;GGML_CUDA_AIF_NARROW=0;GGML_CUDA_AIF_ASYNC=1" SKIP_RETURN_CODE 77 LABELS cuda)
+    # [K126-4] prompt widths on the cp.async-staged GEMM (GGML_CUDA_AIF_STAGED_GEMM=1), every CTA shape
+    foreach(v 0 1 2)
+        add_test(NAME test-aif25-mmq-staged-${v} COMMAND $<TARGET_FILE:test-aif25-mmq>)
+        set_tests_properties(test-aif25-mmq-staged-${v} PROPERTIES
+            ENVIRONMENT "GGML_CUDA_AIF_STAGED_GEMM=1;GGML_CUDA_AIF_STAGED_CFG=${v}" SKIP_RETURN_CODE 77 LABELS cuda)
+    endforeach()
     # [KAIFUSE] shared AI+ prep (R1) and the AIF draft shortlist rows (R2), bit for bit (exits 77 without a CUDA device)
     llama_build_and_test(test-kaifuse.cpp LABEL cuda)
     set_tests_properties(test-kaifuse PROPERTIES SKIP_RETURN_CODE 77)

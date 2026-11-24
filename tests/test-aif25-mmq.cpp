@@ -9,6 +9,9 @@
 // kernel (GGML_CUDA_AIF_NARROW, default on, range GGML_CUDA_AIF_NARROW_MIN/_MAX); it is checked against mmv the same way.
 // [OPT10] With GGML_CUDA_AIF_ASYNC=1 (ctest variants "async", "async-nb1"), widths 9..32 / 33..63 take the cp.async
 // kernel (aif-async-mmv.cu), checked against mmv the same way.
+// [K126-4] With GGML_CUDA_AIF_STAGED_GEMM=1 (ctest variant "staged") the prompt widths take the cp.async-staged GEMM
+// (aif-staged-gemm.cu) where it applies (K % 512 == 0), checked against mmv the same way; the real 27B shapes at N = 256,
+// 512 and 2048 are added for every type (CPU reference on the first 128 tokens of those).
 // Exit 0 = pass, 1 = fail, 77 = no CUDA device.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -27,9 +30,14 @@
 
 static int g_checked = 0;
 static int g_bad = 0;
+static int g_staged = 0;
 
 static void log_cb(ggml_log_level level, const char * text, void * user) {
     (void) level; (void) user;
+    if (std::strstr(text, "[AIF_STAGED]") != nullptr) {
+        ++g_staged;
+        std::fputs(text, stderr);
+    }
     if (std::strstr(text, "[AIF25_MMQ] check") != nullptr) {
         ++g_checked;
         if (std::strstr(text, ": 0 of ") == nullptr) {
@@ -62,7 +70,7 @@ int main() {
         std::fprintf(stderr, "CUDA0 init failed\n");
         return 1;
     }
-    struct shape { int64_t m, k, n; ggml_type type = GGML_TYPE_AIF25_U; };
+    struct shape { int64_t m, k, n; ggml_type type = GGML_TYPE_AIF25_U; int64_t ref_n = 0; };
     // K = 5120 / 17408: activation scale per 256 columns; K = 640 / 384: per 128 (the XSH = 0 kernels).
     // M = 48 leaves a partial two-strip block; widths cover partial, exact and multi-tile token tiles.
     const std::vector<shape> shapes = {
@@ -88,11 +96,28 @@ int main() {
         {5120, 6144, 23, GGML_TYPE_AIF25_U2_512}, {48, 512, 10, GGML_TYPE_AIF25_U2_512},
         {2560, 640, 10}, {640, 2560, 31}, {48, 384, 23}, {17408, 5120, 28}, {2560, 640, 33},
     };
+    const bool staged = env_or("GGML_CUDA_AIF_STAGED_GEMM", 0) != 0;
+    std::vector<shape> all = shapes;
+    if (staged) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 }, { 5120, 6144 } }) {
+            for (int64_t n : { 256, 512, 2048 }) {
+                for (ggml_type t : { GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2, GGML_TYPE_AIF25_U2_512, GGML_TYPE_AIF25_U }) {
+                    if (t == GGML_TYPE_AIF25_U2 && mk.second % 640 != 0) { continue; }
+                    all.push_back({ mk.first, mk.second, n, t, 128 });
+                }
+            }
+        }
+        // partial CTA tiles: M not a multiple of 64 rows, N not a multiple of 64 tokens
+        all.push_back({ 48, 512, 77, GGML_TYPE_AIF175_U2 });
+        all.push_back({ 1040, 5120, 130, GGML_TYPE_AIF25_U2 });
+        all.push_back({ 1040, 1024, 1000, GGML_TYPE_AIF25_U2_512 });
+        all.push_back({ 2064, 1024, 65, GGML_TYPE_AIF25_U });
+    }
     std::mt19937 rng(20261111);
     std::uniform_real_distribution<float> scale(0.002f, 0.02f), act(-1.0f, 1.0f);
     int expected = 0;
     bool ok = true;
-    for (const shape & s : shapes) {
+    for (const shape & s : all) {
         ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
         ggml_context * ctx = ggml_init(ip);
         ggml_tensor * w = ggml_new_tensor_2d(ctx, s.type, s.k, s.m);
@@ -164,7 +189,7 @@ int main() {
             } else {
                 aif25_dequantize_slab(slab, wr.data(), s.k);
             }
-            for (int64_t t = 0; t < s.n; ++t) {
+            for (int64_t t = 0; t < (s.ref_n > 0 ? std::min(s.n, s.ref_n) : s.n); ++t) {
                 for (int r = 0; r < 16; ++r) {
                     double acc = 0.0;
                     for (int64_t k = 0; k < s.k; ++k) {
@@ -185,9 +210,9 @@ int main() {
         ggml_free(ctx);
     }
     ggml_backend_free(backend);
-    ok = ok && g_bad == 0 && g_checked == expected;
-    std::fprintf(stderr, "test-aif25-mmq: tile=%s strips=%s min=%d: %d of %d expected calls checked bit-identical, %d differ: %s\n",
+    ok = ok && g_bad == 0 && g_checked == expected && (!staged || g_staged == 1);
+    std::fprintf(stderr, "test-aif25-mmq: tile=%s strips=%s min=%d staged=%d: %d of %d expected calls checked bit-identical, %d differ: %s\n",
             std::getenv("GGML_CUDA_AIF25_MMQ"), std::getenv("GGML_CUDA_AIF25_MMQ_STRIPS") ? std::getenv("GGML_CUDA_AIF25_MMQ_STRIPS") : "1",
-            min_n, g_checked, expected, g_bad, ok ? "PASS" : "FAIL");
+            min_n, staged ? 1 : 0, g_checked, expected, g_bad, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

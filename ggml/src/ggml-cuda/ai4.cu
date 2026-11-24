@@ -16,6 +16,7 @@
 #include "magic2-v2.cuh"
 #include "aif25-mmq.cuh"
 #include "aif-async-mmv.cuh"
+#include "aif-staged-gemm.cuh"
 #include "../ggml-aif25.h"
 #include "../ggml-aif175.h"
 #include "rpb-knobs.h"
@@ -3913,8 +3914,10 @@ void ggml_cuda_mul_mat_aif25(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // [OPT10] GGML_CUDA_AIF_ASYNC=1 (default off): the verify-width tile and the mmv tiling of the widths between 8 and
     // the prompt threshold take the cp.async kernel of aif-async-mmv.cu (bit-identical to mmv; also covered by
     // GGML_CUDA_AIF25_MMQ_CHECK). The mmq kill switches (GGML_CUDA_AIF25_MMQ=0, GGML_CUDA_AIF_RS_MMQ=0) still give mmv.
+    // [K126-4] GGML_CUDA_AIF_STAGED_GEMM=1 (default off): prompt widths try the cp.async-staged GEMM first (bit-identical)
     const bool aif_async = ggml_cuda_aif_async_enabled();
-    if ((wide && ggml_cuda_aif25_mmq(w->type, xsh, tile, aif25_mmq_strips(), wd, qp, sp, y, M, K, N, stream)) ||
+    if ((wide && ((ggml_cuda_aif_staged_gemm_enabled() && ggml_cuda_aif_staged_gemm(w->type, xsh, wd, qp, sp, y, M, K, N, stream)) ||
+                  ggml_cuda_aif25_mmq(w->type, xsh, tile, aif25_mmq_strips(), wd, qp, sp, y, M, K, N, stream))) ||
             (mmq_ok && aif_narrow(N) && (aif_async
                 ? ggml_cuda_aif_async_mm(w->type, xsh, (int) ((N + 7)/8), wd, qp, sp, y, M, K, N, stream)
                 : ggml_cuda_aif25_mmq_narrow(w->type, xsh, wd, qp, sp, y, M, K, N, stream))) ||
