@@ -18653,6 +18653,15 @@ static void add_inkattn_cases(std::vector<std::unique_ptr<test_case>> & cases, b
             add(kv, nb, 1, false, true);
         }
     }
+    // one-bit packed mask (the INKKV far mask of prompt ubatches): f16-mask and packed halves must match bitwise
+    for (int64_t kv : {1024, 4096}) {
+        for (int64_t nb : {64, 200}) {
+            for (int mode : {0, 1}) {
+                cases.emplace_back(new test_flash_attn_ext_packed(mode, 128, 128, 8, {3, 1}, kv, nb, mode == 1, 0.0f,
+                    GGML_TYPE_F16, GGML_TYPE_F16));
+            }
+        }
+    }
     for (int64_t kv : {113, 1536, 3072}) {
         for (int64_t T : {64, 200, 512}) {
             if (T > kv) {
