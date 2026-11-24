@@ -8843,6 +8843,204 @@ static void add_frows_cases(std::vector<std::unique_ptr<test_case>> & cases, boo
     }
 }
 
+// Bit-exact verification of GGML_CUDA_MMQ_FEW=draftx and GGML_CUDA_MMQ_EXACT=1|2 against regular MMQ
+// on DSpine drafter Q4_K/Q6_K shapes and target LM-head shapes (0-ULP uint32_t GPU comparison).
+struct test_dspine_mmq_few_exact : public test_case {
+    ggml_type type_a;
+    int64_t m, n, k;
+    int draft_tag; // 0 = untagged (target), 1 = inp_noise_embd (draft), 2 = inp_g_embeddings (inject)
+    ggml_tensor * a = nullptr;
+    ggml_tensor * b = nullptr;
+    ggml_tensor * out = nullptr;
+
+    test_dspine_mmq_few_exact(ggml_type type_a, int64_t m, int64_t n, int64_t k, int draft_tag)
+        : type_a(type_a), m(m), n(n), k(k), draft_tag(draft_tag) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DSPINE_MMQ_FEW_EXACT"; }
+    double max_nmse_err() override { return 1e-3; }
+
+    std::string vars() override {
+        return "type_a=" + std::string(ggml_type_name(type_a)) +
+               ",m=" + std::to_string(m) + ",n=" + std::to_string(n) + ",k=" + std::to_string(k) +
+               ",draft_tag=" + std::to_string(draft_tag);
+    }
+
+    static bool mmq_few_is(const char * val) {
+        const char * e = getenv("GGML_CUDA_MMQ_FEW");
+        return e != nullptr && strcmp(e, val) == 0;
+    }
+
+    static bool mmq_exact_is_on() {
+        const char * e = getenv("GGML_CUDA_MMQ_EXACT");
+        return e != nullptr && (strcmp(e, "1") == 0 || strcmp(e, "2") == 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        out = ggml_mul_mat(ctx, a, b);
+        ggml_set_output(out);
+        if (draft_tag != 0) {
+            ggml_tensor * tag = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(tag, draft_tag == 1 ? "inp_noise_embd" : "inp_g_embeddings");
+            ggml_tensor * tag_out = ggml_scale(ctx, tag, 1.0f);
+            ggml_build_forward_expand(gf, tag_out);
+        }
+        return out;
+    }
+
+    bool run_whole_graph() override { return true; }
+    int graph_replays() override { return 2; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    const char * required_fusion() override {
+        if (mmq_few_is("draftx")) {
+            return (draft_tag != 0 && n >= 5) ? "mmq_few" : nullptr;
+        }
+        if (mmq_exact_is_on()) {
+            return n >= 5 ? "mmq_exact" : nullptr;
+        }
+        return nullptr;
+    }
+
+    const char * forbidden_fusion() override {
+        if (mmq_few_is("draftx")) {
+            return (draft_tag == 0 || n <= 4) ? "mmq_few" : nullptr;
+        }
+        if (mmq_exact_is_on()) {
+            return n <= 4 ? "mmq_exact" : nullptr;
+        }
+        return "mmq_exact";
+    }
+
+    bool verify_backend_result(ggml_backend_t backend) override {
+        if (!mmq_few_is("draftx") || draft_tag == 0 || mmq_exact_is_on()) {
+            return true;
+        }
+        auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count")) {
+            return true;
+        }
+
+        const size_t ne = (size_t) ggml_nelements(out);
+        std::vector<uint32_t> got(ne), exp(ne);
+        ggml_backend_tensor_get(out, got.data(), 0, ne * sizeof(uint32_t));
+
+        ggml_init_params params = {
+            /* .mem_size   = */ ggml_tensor_overhead() * 8 + ggml_graph_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ggml_context * ctx_ref = ggml_init(params);
+        if (!ctx_ref) {
+            return false;
+        }
+        ggml_tensor * ref = ggml_mul_mat(ctx_ref, a, b);
+        ggml_cgraph * gf_ref = ggml_new_graph(ctx_ref);
+        ggml_build_forward_expand(gf_ref, ref);
+        ggml_backend_buffer_t buf_ref = ggml_backend_alloc_ctx_tensors(ctx_ref, backend);
+        if (!buf_ref) {
+            ggml_free(ctx_ref);
+            return false;
+        }
+        const ggml_status st = ggml_backend_graph_compute(backend, gf_ref);
+        if (st == GGML_STATUS_SUCCESS) {
+            ggml_backend_tensor_get(ref, exp.data(), 0, ne * sizeof(uint32_t));
+        }
+        ggml_backend_buffer_free(buf_ref);
+        ggml_free(ctx_ref);
+        if (st != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "DSPINE_MMQ_FEW_EXACT reference compute failed\n");
+            return false;
+        }
+
+        size_t n_diff = 0;
+        size_t first = 0;
+        for (size_t i = 0; i < ne; ++i) {
+            if (got[i] != exp[i]) {
+                if (n_diff == 0) {
+                    first = i;
+                }
+                ++n_diff;
+            }
+        }
+        if (n_diff > 0) {
+            float fg = 0.0f, fe = 0.0f;
+            memcpy(&fg, &got[first], sizeof(float));
+            memcpy(&fe, &exp[first], sizeof(float));
+            fprintf(stderr, "DSPINE_MMQ_FEW_EXACT bit mismatch vs regular MMQ: %zu/%zu diffs, first[%zu] got=0x%08x (%g) exp=0x%08x (%g)\n",
+                n_diff, ne, first, got[first], fg, exp[first], fe);
+            return false;
+        }
+        return true;
+    }
+};
+
+// Perf-only target LM-head and drafter shapes for GGML_CUDA_MMQ_EXACT=0|1|2 (no slow CPU reference).
+struct test_dspine_mmq_exact_lmhead : public test_case {
+    ggml_type type_a;
+    int64_t m, n, k;
+
+    test_dspine_mmq_exact_lmhead(ggml_type type_a, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DSPINE_MMQ_EXACT_LMHEAD"; }
+
+    std::string vars() override {
+        return "type_a=" + std::string(ggml_type_name(type_a)) +
+               ",m=" + std::to_string(m) + ",n=" + std::to_string(n) + ",k=" + std::to_string(k);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        return ggml_mul_mat(ctx, a, b);
+    }
+};
+
+static void add_dspine_mmq_few_exact_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
+    if (!perf) {
+        // Drafter Q4_K shapes (stream-k split, nwarps=1 and nwarps=2)
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  4096, 7,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  4096, 8,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  1024, 8,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  5120, 8,  4096, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K, 17408, 7,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K, 17408, 8,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  5120, 8, 17408, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  5120, 7, 25600, 2));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K, 24576, 8,  5120, 1));
+        // Drafter Q6_K shapes (unaligned 210B blocks, 128-half scaling)
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K,  1024, 8,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K,  5120, 7, 17408, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K, 24576, 7,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K, 24576, 8,  5120, 1));
+        // Fallback tail (m % 128 != 0), odd-row Q6_K tail, unsplit eff>=90% (m=10496 -> nti=82), untagged controls, n=4 MMVQ guard
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  1000, 7,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K,  1001, 7,  5120, 1));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K, 10496, 8,  5120, 0));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  4096, 8,  5120, 0));
+        cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  4096, 4,  5120, 1));
+        return;
+    }
+
+    // Perf: tagged drafter shapes (compare MMQ_FEW=0 vs draft vs draftx)
+    cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K, 17408, 8,  5120, 1));
+    cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  5120, 8, 17408, 1));
+    cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  4096, 8,  5120, 1));
+    cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q4_K,  5120, 7, 25600, 2));
+    cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K, 24576, 7,  5120, 1));
+    cases.emplace_back(new test_dspine_mmq_few_exact(GGML_TYPE_Q6_K, 24576, 8,  5120, 1));
+
+    // Perf: target output.weight LM head and drafter shapes for GGML_CUDA_MMQ_EXACT=0|1|2
+    cases.emplace_back(new test_dspine_mmq_exact_lmhead(GGML_TYPE_Q6_K, 248320, 8,  5120));
+    cases.emplace_back(new test_dspine_mmq_exact_lmhead(GGML_TYPE_Q6_K, 248320, 5,  5120));
+    cases.emplace_back(new test_dspine_mmq_exact_lmhead(GGML_TYPE_Q6_K,  24576, 7,  5120));
+    cases.emplace_back(new test_dspine_mmq_exact_lmhead(GGML_TYPE_Q4_K,  17408, 8,  5120));
+    cases.emplace_back(new test_dspine_mmq_exact_lmhead(GGML_TYPE_Q4_K,   5120, 8, 17408));
+    cases.emplace_back(new test_dspine_mmq_exact_lmhead(GGML_TYPE_Q4_K,   5120, 7, 25600));
+}
+
 // fork: opt-in cases also verify dispatch counters so a fallback cannot hide missing coverage.
 struct test_mul_mat_mmq_prefill : public test_mul_mat {
     const bool q8_exact;
@@ -25278,6 +25476,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     add_dspine_fuse_cases(test_cases, false);
+    add_dspine_mmq_few_exact_cases(test_cases, false);
 
     return test_cases;
 }
@@ -25961,6 +26160,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_kqrows_cases(test_cases, true);
     add_frows_cases(test_cases, true);
     add_dspine_fuse_cases(test_cases, true);
+    add_dspine_mmq_few_exact_cases(test_cases, true);
 
     // [HCGP] Flash-Next hyper-connection mixer at a 4,096- and 12,288-token ubatch (GGML_CUDA_HC_GATE_PRE A/B)
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 4096));

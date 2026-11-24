@@ -137,6 +137,7 @@
 #include "ggml-cuda/elastic-buf.cuh"
 #include "ggml-cuda/prefill-glue.cuh"
 #include "ggml-cuda/dspine-ops.cuh"
+#include "ggml-cuda/mmq-few-exact.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -4213,7 +4214,8 @@ static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggm
     return turing_mma_available(ggml_cuda_info().devices[device].cc);
 }
 
-static bool ggml_cuda_mmq_few_takes(const ggml_tensor * src0, const ggml_tensor * src1, int cc);
+static bool ggml_cuda_mmq_few_takes(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
+static int  ggml_cuda_mmq_exact_mode();
 
 static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu,
         const ggml_tensor * up_scale = nullptr, const ggml_tensor * gate_scale = nullptr) {
@@ -4243,10 +4245,13 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
     const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
     // [MMQFEW] do not fuse the matmuls that few-row MMQ takes in ggml_cuda_mul_mat
-    if (!is_id && ggml_cuda_mmq_few_takes(x_up, y, cc)) {
+    if (!is_id && ggml_cuda_mmq_few_takes(x_up, y, up, cc)) {
         return false;
     }
     if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
+        return false;
+    }
+    if (!is_id && ggml_cuda_mmq_exact_mode() != 0 && ggml_cuda_should_use_mmq_few_exact(x_up, y, up, cc)) {
         return false;
     }
 
@@ -4258,9 +4263,14 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 // (spec-decoding verify widths). AI4 / AI+ (AIT) / CR / TQ weights never reach it: ggml_cuda_mul_mat dispatches them
 // before the route. GGML_CUDA_MMQ_FEW: 1 (set explicitly) = on, except the IQ4_XS widths [PARW] already takes (9..its max);
 // 2 = on for every width it supports, PARW included; draft = mode 1 restricted to DFlash/DSpine draft and KV-inject
-// graphs (target model weights stay untouched so target logits remain bit-identical); 0 (default) = off (the pre-merge routes).
+// graphs (target model weights stay untouched so target logits remain bit-identical); draftx = bit-exact row-parallel
+// Q4_K/Q6_K MMQ restricted to DFlash/DSpine draft/inject graphs on widths baseline routes to MMQ (matches regular MMQ
+// to 0 ULP, leaving n<=4 on MMVQ); 0 (default) = off (the pre-merge routes).
+// GGML_CUDA_MMQ_EXACT: 0 (default) = off; 1 = bit-exact row-parallel Q4_K/Q6_K MMQ on ROUTE_MMQ (e.g. target output.weight
+// at n=5..8); 2 = same plus on-GPU bit-exact self-check against regular MMQ (traps on any 1-bit mismatch).
 static thread_local bool g_cuda_graph_is_draft = false;
 static std::atomic<int64_t> ggml_cuda_mmq_few_count{0};
+static std::atomic<int64_t> ggml_cuda_mmq_exact_count{0};
 
 static bool ggml_cuda_tensor_is_draft_tag(const ggml_tensor * t) {
     if (t == nullptr) {
@@ -4320,15 +4330,50 @@ static int ggml_cuda_mmq_few_mode() {
         if (strcmp(e, "draft") == 0) {
             return 3;
         }
-        GGML_LOG_WARN("%s: GGML_CUDA_MMQ_FEW=\"%s\" is not 0, 1, 2 or draft: few-row MMQ falls back to 0 (the default)\n", __func__, e);
+        if (strcmp(e, "draftx") == 0) {
+            return 4;
+        }
+        GGML_LOG_WARN("%s: GGML_CUDA_MMQ_FEW=\"%s\" is not 0, 1, 2, draft or draftx: few-row MMQ falls back to 0 (the default)\n", __func__, e);
         return 0;
     }();
     return mode;
 }
 
-static bool ggml_cuda_mmq_few_takes(const ggml_tensor * src0, const ggml_tensor * src1, const int cc) {
+static bool ggml_cuda_mmq_few_draft_scoped() {
     const int mode = ggml_cuda_mmq_few_mode();
-    if (mode == 0 || (mode == 3 && !g_cuda_graph_is_draft) || !ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
+    return mode == 3 || mode == 4;
+}
+
+static int ggml_cuda_mmq_exact_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_MMQ_EXACT");
+        if (e == nullptr || *e == '\0' || strcmp(e, "0") == 0) {
+            return 0;
+        }
+        if (strcmp(e, "1") == 0) {
+            return 1;
+        }
+        if (strcmp(e, "2") == 0) {
+            return 2;
+        }
+        GGML_LOG_WARN("%s: GGML_CUDA_MMQ_EXACT=\"%s\" is not 0, 1 or 2: bit-exact MMQ falls back to 0 (the default)\n", __func__, e);
+        return 0;
+    }();
+    return mode;
+}
+
+static bool ggml_cuda_mmq_few_takes(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc) {
+    const int mode = ggml_cuda_mmq_few_mode();
+    if (mode == 0) {
+        return false;
+    }
+    if (mode == 4) {
+        return g_cuda_graph_is_draft &&
+            !ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]) &&
+            ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts =*/ 0) &&
+            ggml_cuda_should_use_mmq_few_exact(src0, src1, dst, cc);
+    }
+    if ((mode == 3 && !g_cuda_graph_is_draft) || !ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
         return false;
     }
     if ((mode == 1 || mode == 3) && src0->type == GGML_TYPE_IQ4_XS && src1->ne[1] > MMVQ_MAX_BATCH_SIZE &&
@@ -4403,7 +4448,7 @@ static ggml_cuda_mm_route ggml_cuda_mul_mat_route(const ggml_tensor * src0, cons
         return GGML_CUDA_MM_ROUTE_MMVQ;
     }
     // [MMQFEW] upstream order: MMVQ below the per-type minimum width, few-row MMQ from it up to 24, MMQ above
-    if (!is_tq_weight && ggml_cuda_mmq_few_takes(src0, src1, cc)) {
+    if (!is_tq_weight && ggml_cuda_mmq_few_takes(src0, src1, dst, cc)) {
         return GGML_CUDA_MM_ROUTE_MMQ_FEW;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
@@ -4614,13 +4659,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (route == GGML_CUDA_MM_ROUTE_MMQ_FEW) {
         ggml_cuda_mmq_few_count.fetch_add(1, std::memory_order_relaxed);
-        if (ggml_cuda_mmq_few_mode() == 3) {
+        const int few_mode = ggml_cuda_mmq_few_mode();
+        if (few_mode == 3 || few_mode == 4) {
             static std::atomic_flag logged_draft = ATOMIC_FLAG_INIT;
             if (!logged_draft.test_and_set(std::memory_order_relaxed)) {
-                GGML_LOG_INFO("MMQ FEW: draft-only mode active (type=%s, m=%lld, n=%lld, k=%lld)\n",
+                GGML_LOG_INFO("MMQ FEW: %s mode active (type=%s, m=%lld, n=%lld, k=%lld)\n",
+                        few_mode == 4 ? "draftx (bit-exact)" : "draft-only",
                         ggml_type_name(src0->type), (long long) src0->ne[1], (long long) src1->ne[1], (long long) src0->ne[0]);
             }
-            // harness audit: one line per distinct weight (type, m, k) that takes MMQ_FEW in draft mode, so a gate can
+            // harness audit: one line per distinct weight (type, m, k) that takes MMQ_FEW in draft/draftx mode, so a gate can
             // prove no target-only weight type/shape is routed here (scope-leak check).
             {
                 static std::mutex audit_mu;
@@ -4634,7 +4681,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 }
             }
         }
-        ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
+        if (few_mode == 4) {
+            ggml_cuda_mul_mat_q_few_exact(ctx, src0, src1, dst, /*self_check =*/ false);
+        } else {
+            ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
+        }
         return;
     }
     if (route == GGML_CUDA_MM_ROUTE_MMVQ) {
@@ -4644,6 +4695,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (route == GGML_CUDA_MM_ROUTE_MMQ) {
         // [PARW] multi-slot verify widths (9..32) of IQ4_XS: int8 tensor-core matvec instead of an MMQ tile
         if (ggml_cuda_mul_mat_iq4xs_wide_try(ctx, src0, src1, dst)) {
+            return;
+        }
+        const int exact_mode = ggml_cuda_mmq_exact_mode();
+        if (exact_mode != 0 && ggml_cuda_should_use_mmq_few_exact(src0, src1, dst, cc)) {
+            ggml_cuda_mmq_exact_count.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic_flag logged_exact = ATOMIC_FLAG_INIT;
+            if (!logged_exact.test_and_set(std::memory_order_relaxed)) {
+                GGML_LOG_INFO("MMQ EXACT: active (mode=%d, type=%s, m=%lld, n=%lld, k=%lld)\n",
+                        exact_mode, ggml_type_name(src0->type),
+                        (long long) src0->ne[1], (long long) src1->ne[1], (long long) src0->ne[0]);
+            }
+            ggml_cuda_mul_mat_q_few_exact(ctx, src0, src1, dst, /*self_check =*/ exact_mode == 2);
             return;
         }
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
@@ -5768,7 +5831,7 @@ static bool ggml_cuda_borrowed_plan(ggml_backend_cuda_context & ctx, const ggml_
     if (cc < GGML_CUDA_CC_AMPERE || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
         return false;
     }
-    const ggml_cuda_draft_graph_scope draft_scope(ggml_cuda_mmq_few_mode() == 3 && ggml_cuda_cgraph_is_draft(graph));
+    const ggml_cuda_draft_graph_scope draft_scope(ggml_cuda_mmq_few_draft_scoped() && ggml_cuda_cgraph_is_draft(graph));
     total = largest = GGML_CUDA_BORROWED_BLAS_BYTES;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
     for (int i = 0; i < graph->n_nodes; ++i) {
@@ -5843,11 +5906,21 @@ static bool ggml_cuda_borrowed_plan(ggml_backend_cuda_context & ctx, const ggml_
                 if (route == GGML_CUDA_MM_ROUTE_MMVQ) {
                     allocs.push_back(size_t(x->ne[1]) * GGML_PAD(x->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1) / QK8_1);
                 } else if (route == GGML_CUDA_MM_ROUTE_MMQ_FEW) {
-                    allocs.push_back(ggml_cuda_mmq_few_pool_bytes(w, x));
+                    allocs.push_back(ggml_cuda_mmq_few_mode() == 4
+                        ? ggml_cuda_mmq_few_exact_pool_bytes(w, x)
+                        : ggml_cuda_mmq_few_pool_bytes(w, x));
                 } else if (route == GGML_CUDA_MM_ROUTE_MMQ) {
-                    const bool fallback = w->ne[1] % 128 != 0;
-                    allocs.push_back(size_t(x->ne[1]) * GGML_PAD(x->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1_mmq) / QK8_1_MMQ +
-                            ggml_cuda_mmq_get_J_max(w->type, fallback, cc, x->ne[1]) * sizeof(block_q8_1_mmq));
+                    const int exact_mode = ggml_cuda_mmq_exact_mode();
+                    if (exact_mode != 0 && ggml_cuda_should_use_mmq_few_exact(w, x, node, cc)) {
+                        if (exact_mode == 2) {
+                            return false;
+                        }
+                        allocs.push_back(ggml_cuda_mmq_few_exact_pool_bytes(w, x));
+                    } else {
+                        const bool fallback = w->ne[1] % 128 != 0;
+                        allocs.push_back(size_t(x->ne[1]) * GGML_PAD(x->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1_mmq) / QK8_1_MMQ +
+                                ggml_cuda_mmq_get_J_max(w->type, fallback, cc, x->ne[1]) * sizeof(block_q8_1_mmq));
+                    }
                 } else if (route == GGML_CUDA_MM_ROUTE_OTHER || route == GGML_CUDA_MM_ROUTE_CUBLAS_FORCED) {
                     if (!ctx.cublas_handles[ctx.device][0] || !ctx.cublas_workspaces[ctx.device][0] ||
                             ctx.cublas_workspace_sizes[ctx.device] != GGML_CUDA_BORROWED_BLAS_BYTES) {
@@ -16996,7 +17069,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    const ggml_cuda_draft_graph_scope draft_scope(ggml_cuda_mmq_few_mode() == 3 && ggml_cuda_cgraph_is_draft(cgraph));
+    const ggml_cuda_draft_graph_scope draft_scope(ggml_cuda_mmq_few_draft_scoped() && ggml_cuda_cgraph_is_draft(cgraph));
     if (ggml_cuda_launch_stats_enabled()) {
         g_cuda_graph_compute_t_entry = ggml_time_us();
     }
@@ -17173,7 +17246,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    const ggml_cuda_draft_graph_scope draft_scope(ggml_cuda_mmq_few_mode() == 3 && ggml_cuda_cgraph_is_draft(cgraph));
+    const ggml_cuda_draft_graph_scope draft_scope(ggml_cuda_mmq_few_draft_scoped() && ggml_cuda_cgraph_is_draft(cgraph));
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
 
@@ -18965,6 +19038,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "mmq_few") == 0) {
         return ggml_cuda_mmq_few_count.load(std::memory_order_relaxed);
+    }
+    if (strcmp(name, "mmq_exact") == 0) {
+        return ggml_cuda_mmq_exact_count.load(std::memory_order_relaxed);
     }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
