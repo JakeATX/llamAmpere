@@ -6,6 +6,9 @@
 
 bool ggml_cuda_q8a16_enabled();
 
+// widest batch the Q8A16 paths take (GGML_CUDA_Q8A16_MAXT, default 8, 0 = Q8A16 off for every width)
+int ggml_cuda_q8a16_max_t();
+
 // plain MUL_MAT: dst = src0 (Q8_0) x src1 (f32, 1..MAXT columns). Returns false (nothing launched) when not taken.
 bool ggml_cuda_q8a16_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 

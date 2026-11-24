@@ -18911,6 +18911,10 @@ static void add_ink_q8_0_moe_cases(std::vector<std::unique_ptr<test_case>> & cas
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (getenv("GGML_TEST_INK_Q8_0_MOE") != nullptr) {
+        add_ink_q8_0_moe_cases(test_cases, false);
+        return test_cases;
+    }
     if (getenv("GGML_TEST_INKGROUP") != nullptr) {
         add_inkgroup_cases(test_cases);
         return test_cases;
@@ -24251,6 +24255,16 @@ struct test_inkgroup : public test_case {
 };
 
 static void add_inkgroup_cases(std::vector<std::unique_ptr<test_case>> & tc) {
+    if (getenv("GGML_TEST_INKGROUP") != nullptr && std::string(getenv("GGML_TEST_INKGROUP")) == "q8") {
+        // INKNVFP4K: NQ Q8_0 grouped QKV (q, gate, k, v, rel, sink) and attn_output at the decode / verify widths
+        for (int64_t n : { 1, 2, 3, 4, 5, 6, 7, 8 }) {
+            tc.emplace_back(new test_inkgroup(GGML_TYPE_Q8_0, { 3072, 3072, 1024, 1024, 384, 24 }, 2304, n));
+            tc.emplace_back(new test_inkgroup(GGML_TYPE_Q8_0, { 2304 }, 3072, n));
+            tc.emplace_back(new test_inkgroup(GGML_TYPE_Q8_0, { 40, 7 }, 256, n));      // 1 chunk: warps without work; < 16-row members
+            tc.emplace_back(new test_inkgroup(GGML_TYPE_Q8_0, { 333, 64 }, 1280, n));   // 5 chunks over 3 warps; ragged last tile
+        }
+        return;
+    }
     for (ggml_type t : { GGML_TYPE_AIT4_U, GGML_TYPE_AIT5_U, GGML_TYPE_AIT3_U, GGML_TYPE_AIT2_U }) {
         for (int64_t n : { 1, 2, 8 }) {
             tc.emplace_back(new test_inkgroup(t, { 3072, 3072, 384 }, 2304, n));            // q, gate, rel
@@ -24291,6 +24305,11 @@ static void add_inkdense_cases(std::vector<std::unique_ptr<test_case>> & tc) {
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // INK_Q8_0_MOE: GGML_TEST_INK_Q8_0_MOE=1 with -o INK_Q8_0_MOE (perf mode = 12 timing cases, test mode = 18 correctness cases)
+    if (getenv("GGML_TEST_INK_Q8_0_MOE") != nullptr) {
+        add_ink_q8_0_moe_cases(test_cases, true);
+        return test_cases;
+    }
     if (getenv("GGML_TEST_INKDENSE") != nullptr) {
         add_inkdense_cases(test_cases);
         return test_cases;
