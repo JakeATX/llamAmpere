@@ -396,7 +396,7 @@ constexpr __host__ __device__ int gemm_stage_bytes() {
 template <int BN, int STAGES, int NTB, int LAY, int XSH, bool ID, int N_WARPS = 1, int M_SLABS = GEMM_SLABS, bool PREDECODED = false, int MINB = 1, bool STREAM_A = false, bool J_MAJOR = false, bool X8 = false, bool WHOLE = false, bool SPLIT = false, bool SWAP8 = false, bool FIXED_LOAD = false, bool XPERM = false, bool XOR_X = false>
 static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
-        float * __restrict__ Y, int64_t ldy, int M, int N, int K, const idmap idm, const int8_t * __restrict__ decoded_weights, int split_k) {
+        float * __restrict__ Y, int64_t ldy, int M, int N, int K, const idmap idm, const int8_t * __restrict__ decoded_weights, int split_k, bool dst_bf16 = false) {
     constexpr int GEMM_SLABS = M_SLABS;
     constexpr int GEMM_THREADS = M_SLABS*N_WARPS*32;
     constexpr int NTI = BN/(8*N_WARPS);
@@ -703,15 +703,29 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
 #pragma unroll
     for (int nt = 0; nt < NTI; ++nt) {
         const int c = (nw*NTI + nt)*8 + 2*t;
-        if (n0 + c < N) {
-            const int64_t y = ycol(c);
-            Y[y*ldy + r]           = acc[nt][0];
-            Y[y*ldy + r + 8]       = acc[nt][2];
-        }
-        if (n0 + c + 1 < N) {
-            const int64_t y = ycol(c + 1);
-            Y[y*ldy + r]     = acc[nt][1];
-            Y[y*ldy + r + 8] = acc[nt][3];
+        if (!SPLIT && dst_bf16) {
+            nv_bfloat16 * Y16 = (nv_bfloat16 *) Y;
+            if (n0 + c < N) {
+                const int64_t y = ycol(c);
+                Y16[y*ldy + r]           = __float2bfloat16(acc[nt][0]);
+                Y16[y*ldy + r + 8]       = __float2bfloat16(acc[nt][2]);
+            }
+            if (n0 + c + 1 < N) {
+                const int64_t y = ycol(c + 1);
+                Y16[y*ldy + r]     = __float2bfloat16(acc[nt][1]);
+                Y16[y*ldy + r + 8] = __float2bfloat16(acc[nt][3]);
+            }
+        } else {
+            if (n0 + c < N) {
+                const int64_t y = ycol(c);
+                Y[y*ldy + r]           = acc[nt][0];
+                Y[y*ldy + r + 8]       = acc[nt][2];
+            }
+            if (n0 + c + 1 < N) {
+                const int64_t y = ycol(c + 1);
+                Y[y*ldy + r]     = acc[nt][1];
+                Y[y*ldy + r + 8] = acc[nt][3];
+            }
         }
     }
 }
@@ -719,7 +733,7 @@ static __global__ void __launch_bounds__(M_SLABS*N_WARPS*32, MINB) gemm(
 // ID = true: grid.y = max_tiles (an upper bound of the idmap's token tiles; blocks past hdr[1] exit), N unused
 template <int BN, int STAGES = 3, int NTB = 4, int LAY = LAY_AIT4_U, int XSH = 1, bool ID = false, int N_WARPS = 1, int M_SLABS = GEMM_SLABS, bool PREDECODED = false, int MINB = 1, bool STREAM_A = false, bool J_MAJOR = false, bool X8 = false, bool WHOLE = false, bool SPLIT = false, bool SWAP8 = false, bool FIXED_LOAD = false, bool XPERM = false, bool XOR_X = false>
 static void launch_gemm(const uint8_t * W, const int8_t * Xq, const float * Xs, float * Y, int64_t ldy,
-                        int M, int N, int K, cudaStream_t stream, const idmap & idm = idmap{}, int max_tiles = 0, const int8_t * decoded_weights = nullptr, int split_k = 1) {
+                        int M, int N, int K, cudaStream_t stream, const idmap & idm = idmap{}, int max_tiles = 0, const int8_t * decoded_weights = nullptr, int split_k = 1, bool dst_bf16 = false) {
     constexpr int decoded = N_WARPS > 1 ? M_SLABS*4*4*32*4 : 0;
     constexpr int smem = STAGES*gemm_stage_bytes<BN, LAY, M_SLABS, PREDECODED, X8, XOR_X>() + decoded;
     static bool attr_set[64] = {};
@@ -743,7 +757,7 @@ static void launch_gemm(const uint8_t * W, const int8_t * Xq, const float * Xs, 
                 BN, STAGES, LAY, N_WARPS, M_SLABS, MINB, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XPERM, XOR_X, attr.numRegs, attr.sharedSizeBytes, smem, reserved, sm_shared, attr.localSizeBytes, blocks, grid.x, grid.y, grid.z);
         reported[dev & 63] = true;
     }
-    gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XPERM, XOR_X><<<grid, M_SLABS*N_WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm, decoded_weights, split_k);
+    gemm<BN, STAGES, NTB, LAY, XSH, ID, N_WARPS, M_SLABS, PREDECODED, MINB, STREAM_A, J_MAJOR, X8, WHOLE, SPLIT, SWAP8, FIXED_LOAD, XPERM, XOR_X><<<grid, M_SLABS*N_WARPS*32, smem, stream>>>(W, Xq, Xs, Y, ldy, M, N, K, idm, decoded_weights, split_k, dst_bf16);
 }
 
 // Split-K partials keep float accumulation; only the final sum order changes.

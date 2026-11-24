@@ -119,6 +119,7 @@
 #include "ggml-cuda/inkmask.cuh"
 #include "ggml-cuda/inkrouter.cuh"
 #include "ggml-cuda/q8a16.cuh"
+#include "ggml-cuda/prefill-glue.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1389,6 +1390,7 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
     moe_tables.clear();
     moe_tables_retired.clear();
     moe_slabs.clear();
+    ggml_cuda_prefill_glue_free(this);
 
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -1413,6 +1415,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     // per-context device caches: cudaFree only after no other context is mid-capture (same rule as graph_reset / pool_trim)
     ggml_cuda_ink_ai4_preq_free(this);
     ggml_cuda_ai4_exp_turbo_free(this);
+    ggml_cuda_prefill_glue_free(this);
 
     // [#136] fold (default on): how often each fold matched (graph builds/captures, not replays)
     if (ggml_cuda_exl3_glue_fold_enabled() && fusion_stats.exl3_fold_norm + fusion_stats.exl3_fold_add + fusion_stats.exl3_fold_gu > 0) {
@@ -3389,7 +3392,11 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 };
 
 template<ggml_type compute_type>
-static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                                          bool dst_bf16 = false, bool * out_wrote_bf16 = nullptr) {
+    if (out_wrote_bf16) *out_wrote_bf16 = false;
+    const bool src1_is_bf16 = ggml_cuda_prefill_bf16_is_active(ctx, src1);
+    const ggml_type src1_eff_type = src1_is_bf16 ? GGML_TYPE_BF16 : src1->type;
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
@@ -3452,21 +3459,26 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
-    if (src1->type == compute_type) {
+    if (src1_eff_type == compute_type && (!src1_is_bf16 || ggml_is_contiguous(src1))) {
         src1_ptr = (const cuda_t *) src1->data;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
         if (ggml_is_contiguously_allocated(src1)) {
-            const auto convert_func = traits::convert(src1->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
-            const size_t src1_bs = ggml_blck_size(src1->type);
-            s11 *= src1_bs;
-            s12 *= src1_bs;
-            s13 *= src1_bs;
+            if constexpr (compute_type == GGML_TYPE_F32) {
+                GGML_ASSERT(src1_is_bf16);
+                ggml_cuda_prefill_bf16_to_f32((const nv_bfloat16 *) src1->data, (float *) src1_alloc.get(), ggml_nelements(src1), main_stream);
+            } else {
+                const auto convert_func = traits::convert(src1_eff_type);
+                GGML_ASSERT(convert_func != nullptr);
+                convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
+                const size_t src1_bs = ggml_blck_size(src1_eff_type);
+                s11 *= src1_bs;
+                s12 *= src1_bs;
+                s13 *= src1_bs;
+            }
         } else {
-            const auto convert_func = traits::convert_nc(src1->type);
+            const auto convert_func = traits::convert_nc(src1_eff_type);
             GGML_ASSERT(convert_func != nullptr);
             convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
             s11 = ne10;
@@ -3490,10 +3502,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const void * beta = traits::get_beta();
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const bool direct_bf16_out = (compute_type == GGML_TYPE_BF16) && dst_bf16;
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
         prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
-    } else if (compute_type == GGML_TYPE_BF16) {
+    } else if (compute_type == GGML_TYPE_BF16 && !direct_bf16_out) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_RDNA4_M(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
 
@@ -3506,6 +3519,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     } else {
         if constexpr (compute_type == GGML_TYPE_F32) {
             dst_ptr = (char *) dst_ddf;  // Direct F32 output
+        } else if (direct_bf16_out) {
+            dst_ptr = (char *) dst_ddf;  // [PREFILL-GLUE] Direct BF16 output inside existing F32 buffer
+            nbd2 /= sizeof(float) / sizeof(cuda_t);
+            nbd3 /= sizeof(float) / sizeof(cuda_t);
+            if (out_wrote_bf16) *out_wrote_bf16 = true;
         } else {
             dst_ptr = (char *) dst_temp.alloc(ne_dst);
             nbd2 /= sizeof(float) / sizeof(cuda_t);
@@ -3596,7 +3614,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 
     // Convert output back to F32 if needed
-    if (cu_data_type != CUDA_R_32F) {
+    if (cu_data_type != CUDA_R_32F && !direct_bf16_out) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
     }
@@ -3677,12 +3695,18 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         }
     }
 
+    const bool want_bf16 = (ctx.prefill_bf16_target == dst);
+    bool wrote_bf16 = false;
     switch (compute_type) {
         case GGML_TYPE_F32:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
             break;
         case GGML_TYPE_BF16:
-            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst);
+            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst, want_bf16, &wrote_bf16);
+            if (wrote_bf16) {
+                ggml_cuda_prefill_bf16_mark(ctx, dst);
+                ctx.fusion_stats.prefill_bf16_mlp++;
+            }
             break;
         case GGML_TYPE_F16:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
@@ -4291,7 +4315,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 
     if (ggml_ai4_rate(src0->type) != 0) {
-        ggml_cuda_mul_mat_ai4(ctx, src0, src1, dst);
+        bool wrote_bf16 = false;
+        ggml_cuda_mul_mat_ai4(ctx, src0, src1, dst, ctx.prefill_bf16_target == dst, &wrote_bf16);
+        if (wrote_bf16) {
+            ggml_cuda_prefill_bf16_mark(ctx, dst);
+            ctx.fusion_stats.prefill_bf16_mlp++;
+        }
         return;
     }
 
@@ -4359,7 +4388,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         if (ggml_cuda_mul_mat_iq4xs_wide_try(ctx, src0, src1, dst)) {
             return;
         }
-        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        bool wrote_bf16 = false;
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst, nullptr, ctx.prefill_bf16_target == dst, &wrote_bf16);
+        if (wrote_bf16) {
+            ggml_cuda_prefill_bf16_mark(ctx, dst);
+            ctx.fusion_stats.prefill_bf16_mlp++;
+        }
         return;
     }
     // TQ weight types: fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill).
@@ -4511,7 +4545,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // large batch falls through to the dequant-to-f16 cuBLAS path, which synchronizes the stream.
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     if (ggml_ai4_rate(src0->type) != 0) {
-        ggml_cuda_mul_mat_id_ai4(ctx, dst);
+        bool wrote_bf16 = false;
+        ggml_cuda_mul_mat_id_ai4(ctx, dst, nullptr, ctx.prefill_bf16_target == dst, &wrote_bf16);
+        if (wrote_bf16) {
+            ggml_cuda_prefill_bf16_mark(ctx, dst);
+            ctx.fusion_stats.prefill_bf16_mlp++;
+        }
         return;
     }
     if (ggml_cuda_aif_rows_supported(dst)) {
@@ -4567,7 +4606,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            bool wrote_bf16 = false;
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, nullptr, ctx.prefill_bf16_target == dst, &wrote_bf16);
+            if (wrote_bf16) {
+                ggml_cuda_prefill_bf16_mark(ctx, dst);
+                ctx.fusion_stats.prefill_bf16_mlp++;
+            }
             return;
         }
 
@@ -11116,6 +11160,27 @@ static int ink_situ_find(ggml_cgraph * cgraph, int i, const ggml_tensor ** g_out
     return -1;
 }
 
+int ggml_cuda_ink_situ_spans(ggml_cgraph * cgraph, int start_idx, const ggml_tensor * src_tensor) {
+    static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_SITU");
+    if (!on || !cgraph || start_idx < 0 || start_idx >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * g = nullptr, * u = nullptr;
+    ggml_tensor * out = nullptr;
+    ink_situ_params p;
+    const int last = ink_situ_find(cgraph, start_idx, &g, &u, &out, &p);
+    if (last < 0) {
+        return -1;
+    }
+    auto unwrap = [](const ggml_tensor * t) {
+        while (t && ((t->op == GGML_OP_VIEW && t->view_src) || (t->op == GGML_OP_RESHAPE && !t->view_src && t->src[0]))) {
+            t = t->op == GGML_OP_VIEW ? t->view_src : t->src[0];
+        }
+        return t;
+    };
+    return (unwrap(g) == src_tensor || unwrap(u) == src_tensor) ? last : -1;
+}
+
 static int ggml_cuda_try_fuse_ink_situ(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     static const bool on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_SITU");
     if (!on) {
@@ -11134,7 +11199,9 @@ static int ggml_cuda_try_fuse_ink_situ(ggml_backend_cuda_context * ctx, ggml_cgr
         return last - i;
     }
     if (!down || !ggml_cuda_ink_situq_launch(*ctx, g, u, out, p, down)) {
-        ggml_cuda_ink_situ(*ctx, g, u, out, p);
+        if (!ggml_cuda_prefill_situ_launch(*ctx, cgraph, last, g, u, out, p)) {
+            ggml_cuda_ink_situ(*ctx, g, u, out, p);
+        }
     }
     return last - i;
 }
@@ -11840,6 +11907,23 @@ static int ggml_cuda_try_fuse_ink_mix_norm(ggml_backend_cuda_context * ctx, ggml
     float  * as = nullptr;
     if (mm && !ggml_cuda_ink_ai4_preq_alloc(*ctx, 1, K, 1, &aq, &as)) {
         mm = nullptr;
+    }
+    int pf_kind = 0;
+    void * pf0 = nullptr, * pf1 = nullptr;
+    bool pf_write_f32 = true;
+    const ggml_tensor * pf_mm = nullptr;
+    bool pf_active = false;
+    if (!mm && ggml_cuda_prefill_fuse_norm_actq_on()) {
+        pf_active = ggml_cuda_prefill_try_mix_norm_actq(*ctx, cgraph, last, mix, w, mul, eps, pf_kind, &pf0, &pf1, pf_write_f32, &pf_mm);
+    }
+    if (pf_active) {
+        const int pm = (pf_kind == ggml_backend_cuda_context::PREFILL_ACT_AI4) ? 1 : pf_kind;
+        if (!ggml_cuda_depth_mix_norm(*ctx, mix, w, mul, eps, (int8_t *) pf0, (float *) pf1, pm, pf_write_f32)) {
+            ggml_cuda_prefill_invalidate_ptr(*ctx, mul->data, ggml_nbytes(mul));
+            return 0;
+        }
+        ggml_cuda_prefill_mix_norm_commit(*ctx, mul, ggml_nrows(mul), K, pf_kind, 0, pf0, pf1);
+        return last - i;
     }
     if (!ggml_cuda_depth_mix_norm(*ctx, mix, w, mul, eps, aq, as)) {
         if (mm) {
@@ -13777,6 +13861,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_ADD) {
+        const int n_prefill = ggml_cuda_try_fuse_prefill_norm(cuda_ctx, cgraph, i);
+        if (n_prefill > 0) {
+            return n_prefill;
+        }
         const int n_skip = ggml_cuda_try_add_rms_norm_mul(*cuda_ctx, cgraph, i);
         if (n_skip > 0) {
             return n_skip;
@@ -14499,11 +14587,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         ggml_cuda_should_use_mmq(src0->type, cc, ncols, /*n_experts =*/ is_id ? src0->ne[2] : 0)) {
                     // NVFP4PF: int8 tensor-core MoE prefill with the per-expert scale in its epilogue (opt-in, >= 512 tokens; quantizes
                     // src1 to int8 whatever prec_src1 asks, so only with the switch set)
-                    if (is_id && ggml_cuda_nvfp4pf_try(*cuda_ctx, src0, src1, ids, out_node, scale)) {
+                    const bool want_bf16 = (cuda_ctx->prefill_bf16_target == out_node && out_node == mm_node);
+                    bool wrote_bf16 = false;
+                    if (is_id && ggml_cuda_nvfp4pf_try(*cuda_ctx, src0, src1, ids, out_node, scale, want_bf16, &wrote_bf16)) {
+                        if (wrote_bf16) {
+                            ggml_cuda_prefill_bf16_mark(*cuda_ctx, out_node);
+                            cuda_ctx->fusion_stats.prefill_bf16_mlp++;
+                        }
                         return n_ops - 1;
                     }
                     fusion_data.prec_src1 = ggml_prec_get_src(mm_node, 1);
-                    ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+                    ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data, want_bf16, &wrote_bf16);
+                    if (wrote_bf16) {
+                        ggml_cuda_prefill_bf16_mark(*cuda_ctx, out_node);
+                        cuda_ctx->fusion_stats.prefill_bf16_mlp++;
+                    }
                     return n_ops - 1;
                 }
             }
@@ -14624,6 +14722,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        const int n_prefill = ggml_cuda_try_fuse_prefill_norm(cuda_ctx, cgraph, i);
+        if (n_prefill > 0) {
+            return n_prefill;
+        }
         if (!ggml_cuda_try_rms_norm_mmq(*cuda_ctx, cgraph, i)) {
             ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         }
@@ -15407,6 +15509,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             g_ink_ring_skip = nullptr;
             g_ink_prep_skip.clear(); // [INKGLUE PREP] SET_ROWS a prep launch of this eval wrote
             ggml_cuda_ink_ai4_preq_release(); // [INKGLUE MIXQ] no handoff crosses graph evals
+            ggml_cuda_prefill_glue_reset(cuda_ctx);
             // [ROUNDFIX] pooled-key GET_ROWS nodes the lightning indexer reads in place (ggml_cuda_lid_gather_plan)
             std::vector<uint8_t> lid_gather_skip;
             // [GDNDIRECT] final-state / checkpoint cpys the prefixed gated_delta_net launches replace
@@ -15553,12 +15656,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // [PREFILL-GLUE] Fused prefill GLU -> ActQ / BF16 narrowing
+                if (node->op == GGML_OP_GLU && ggml_cuda_try_fuse_prefill_glu(cuda_ctx, &fusion_graph, i) > 0) {
+                    continue;
+                }
+
+                cuda_ctx->prefill_bf16_target = ggml_cuda_prefill_bf16_want_out(*cuda_ctx, &fusion_graph, i) ? node : nullptr;
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, &fusion_graph, i);
                 if (nodes_to_skip == 0 && autofuse) {
                     nodes_to_skip = ggml_cuda_autofuse_launch(*cuda_ctx, &fusion_graph, i, *autofuse);
                 }
 
                 if (nodes_to_skip != 0) {
+                    cuda_ctx->prefill_bf16_target = nullptr;
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -15612,7 +15723,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 host_block.begin();
+                ggml_cuda_prefill_invalidate_ptr(*cuda_ctx, node->data, ggml_nbytes(node));
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                cuda_ctx->prefill_bf16_target = nullptr;
                 host_block.end("node", node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -15663,6 +15776,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_conv_ring_finish(cuda_ctx);
             g_ink_ring_skip = nullptr;
             ggml_cuda_ink_ai4_preq_release();
+            ggml_cuda_prefill_glue_reset(cuda_ctx);
             host_block.end("conv_ring_finish", nullptr);
             host_block.begin();
             ggml_cuda_moe_cache_hf_graph_end(*cuda_ctx);
@@ -17706,6 +17820,30 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "hc_gate_pre_xn") == 0) {
         return g_hc_gate_pre_xn_count.load();
+    }
+    if (strcmp(name, "prefill_glu_actq") == 0) {
+        return ctx->fusion_stats.prefill_glu_actq;
+    }
+    if (strcmp(name, "prefill_glu_actq_elided") == 0) {
+        return ctx->fusion_stats.prefill_glu_actq_elided;
+    }
+    if (strcmp(name, "prefill_norm_actq") == 0) {
+        return ctx->fusion_stats.prefill_norm_actq;
+    }
+    if (strcmp(name, "prefill_norm_actq_hits") == 0) {
+        return ctx->fusion_stats.prefill_norm_actq_hits;
+    }
+    if (strcmp(name, "prefill_norm_actq_elided") == 0) {
+        return ctx->fusion_stats.prefill_norm_actq_elided;
+    }
+    if (strcmp(name, "prefill_mix_actq") == 0) {
+        return ctx->fusion_stats.prefill_mix_actq;
+    }
+    if (strcmp(name, "prefill_bf16_mlp") == 0) {
+        return ctx->fusion_stats.prefill_bf16_mlp;
+    }
+    if (strcmp(name, "prefill_bf16_glu") == 0) {
+        return ctx->fusion_stats.prefill_bf16_glu;
     }
     return -1;
 }

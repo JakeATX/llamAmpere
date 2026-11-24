@@ -842,4 +842,15 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL) # test-magic2-v2 links ggml-cuda directly
     set_target_properties(test-magic2-v2 PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 86)
     llama_test(test-magic2-v2 LABEL "cuda")
     set_tests_properties(test-magic2-v2 PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(bench-prefill-glue bench-prefill-glue.cu)
+    target_link_libraries(bench-prefill-glue PRIVATE ggml-base ggml-cuda)
+    target_include_directories(bench-prefill-glue PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${PROJECT_SOURCE_DIR}/ggml/src)
+    set_target_properties(bench-prefill-glue PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 86)
 endif()
+
+# Pure-CPU verification harness for prefill-glue numerics (zero CUDA runtime / GPU device usage)
+add_executable(test-prefill-glue-cpu test-prefill-glue-cpu.cpp)
+target_link_libraries(test-prefill-glue-cpu PRIVATE ggml-base)
+target_include_directories(test-prefill-glue-cpu PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_test(test-prefill-glue-cpu LABEL "main;cpu")
