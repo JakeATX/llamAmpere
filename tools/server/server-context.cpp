@@ -190,6 +190,21 @@ static FILE * server_spec_round_log() {
     return f;
 }
 
+// MTPPUNCT LLAMA_SPEC_TOKLOG=<file>: one line per first verify of a speculative round (not the replay pass), for
+// acceptance-by-token-class analysis. Pure logging, default off (unset = no file, no work):
+//   "R <slot> <task> <n_gen> <n_past> <t_us> <prev> <n_draft> <n_acc> <first_rescue> <path> |"
+//   then per draft position j: " <d_j>,<q(d_j)>,<q top-1>,<q entropy nats>,<|q|>,<p top-1>,<p(d_j)>,<sum min(p,q)>"
+//   then " | <committed ids>". prev = the token the draft follows, n_acc = drafts kept (mode bias included),
+//   first_rescue = first mode-biased rescue (-1 none), path p = p/q rows, s = synth probs, i = id match.
+//   q fields are -1 when the row has no draft distribution; p fields are -1 where the verifier did not expose them.
+static FILE * server_spec_toklog() {
+    static FILE * f = [] {
+        const char * p = getenv("LLAMA_SPEC_TOKLOG");
+        return p && *p ? fopen(p, "a") : nullptr;
+    }();
+    return f;
+}
+
 // DSPINE-FU S4 forced probe: LLAMA_SPEC_FORCE_TOKENS=<file of whitespace-separated token ids> makes the committed
 // tokens follow the file (one cursor across requests; LLAMA_SPEC_FORCE_SKIP_TASKS=<n> leaves the first n tasks
 // unforced, e.g. a warm request). Drafts are still verified by the real rule: that count feeds the depth controllers
@@ -229,6 +244,36 @@ struct server_spec_force {
         return true;
     }
 };
+
+static void server_spec_toklog_round(FILE * f, int slot_id, int task_id, int n_gen, int n_past, llama_token prev,
+        const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, char path,
+        const llama_tokens & committed, int first_rescue, const std::vector<float> & top1, const std::vector<float> & pq) {
+    fprintf(f, "R %d %d %d %d %lld %d %zu %zu %d %c |", slot_id, task_id, n_gen, n_past, (long long) ggml_time_us(), prev,
+            draft.size(), committed.empty() ? (size_t) 0 : committed.size() - 1, first_rescue, path);
+    for (size_t j = 0; j < draft.size(); ++j) {
+        double qd = -1, q1 = -1, qh = -1;
+        int qn = -1;
+        if (j < draft_q.size() && !draft_q[j].empty()) {
+            double z = 0;
+            for (const auto & c : draft_q[j]) z += c.p;
+            qd = 0; q1 = 0; qh = 0; qn = (int) draft_q[j].size();
+            for (const auto & c : draft_q[j]) {
+                const double pc = z > 0 ? c.p / z : 0.0;
+                if (c.id == draft[j]) qd = pc;
+                q1 = std::max(q1, pc);
+                if (pc > 0) qh -= pc * std::log(pc);
+            }
+        }
+        const float p1 = j < top1.size() ? top1[j] : -1.0f;
+        const float pd = 2 * j + 1 < pq.size() ? pq[2 * j] : -1.0f;
+        const float sm = 2 * j + 1 < pq.size() ? pq[2 * j + 1] : -1.0f;
+        fprintf(f, " %d,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f", draft[j], qd, q1, qh, qn, p1, pd, sm);
+    }
+    fprintf(f, " |");
+    for (const auto id : committed) fprintf(f, " %d", id);
+    fprintf(f, "\n");
+    fflush(f);
+}
 
 static bool server_mtp_gpu_verify_enabled() {
     const char * gpu_verify = std::getenv("LLAMA_MTP_GPU_VERIFY");
@@ -8911,6 +8956,13 @@ private:
                     for (const auto & p : slot.spec_tree) {
                         llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), p.seq, -1, -1);
                     }
+                }
+                if (FILE * tl = server_spec_toklog(); tl && !slot.spec_is_replay && !replayed_verify) {
+                    const char path = !synth_probs.empty() ? 's' : (slot.spec_draft_q.empty() ? 'i' : 'p');
+                    server_spec_toklog_round(tl, slot.id, slot.task->id, (int) slot.stats.n_gen, (int) slot.prompt.n_tokens(),
+                            slot.sampled, slot.spec_draft, slot.spec_draft_q, path, accepted,
+                            common_sampler_get_first_rescue(slot.smpl.get()), common_sampler_get_top1_trace(slot.smpl.get()),
+                            path == 'p' ? common_sampler_get_pq_trace(slot.smpl.get()) : std::vector<float>());
                 }
                 if (!slot.spec_is_replay && params_base.speculative.draft.depth_policy == "cdepth") {
                     // CDEPTH history: target top-1 of the committed rows (the re-decode after a restore is not counted twice)

@@ -211,6 +211,8 @@ std::vector<double> common_sampler_pq_mode_distribution(const llama_token_data_a
 // call sampled from (request-matched, after the sampler chain; -1 where the chain sampled on the backend).
 // Entries 0..accepted belong to the committed tokens; later entries do not exist (the call stops at a rejection).
 const std::vector<float> & common_sampler_get_top1_trace(const struct common_sampler * gsmpl);
+// MTPPUNCT: per position of the last sample_and_accept_n_pq call, [p(d), sum_x min(p(x), q(x))]; -1 = id-match row
+const std::vector<float> & common_sampler_get_pq_trace(const struct common_sampler * gsmpl);
 
 // [MBFIX] draft position where the last common_sampler_sample_and_accept_n_pq call first kept a draft token that the
 // exact rule had rejected (mode-biased MTP rescue); -1 when it made none. The exact rule would have accepted this many.

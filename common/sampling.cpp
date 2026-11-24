@@ -489,6 +489,7 @@ struct common_sampler {
     // target top-1 probability (request-matched distribution, after the sampler chain) of every position the last
     // sample_and_accept_n_pq call looked at; a free by-product used by the CDEPTH draft-depth policy. -1 = unknown
     std::vector<float> top1_trace;
+    std::vector<float> pq_trace; // MTPPUNCT LLAMA_SPEC_TOKLOG: per verified draft position p(d), sum_x min(p, q) (-1 = id match)
     int32_t first_rescue = -1; // [MBFIX] position of the last pq verify call's first mode-biased rescue (-1 = none)
 };
 
@@ -1348,6 +1349,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     gsmpl->first_rescue = -1;
     gsmpl->top1_trace.clear();
+    gsmpl->pq_trace.clear();
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -1843,7 +1845,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
 
     // top-1 probability of the distribution just sampled from (cur_p holds p over the surviving candidates)
     gsmpl->top1_trace.clear();
+    gsmpl->pq_trace.clear();
     gsmpl->first_rescue = -1;
+    static const bool pq_trace_on = [] { const char * e = std::getenv("LLAMA_SPEC_TOKLOG"); return e && *e; }();
     auto trace_top1 = [&]() {
         float top = -1.0f;
         if (llama_get_sampled_token_ith(ctx, idxs[std::min(gsmpl->top1_trace.size(), idxs.size() - 1)]) == LLAMA_TOKEN_NULL) {
@@ -1902,8 +1906,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
                             seq, (long long) generated, i, forward, reverse, mass);
                 }
             }
+            const double pd0 = gsmpl->pq_stats.sum_p_d, sm0 = gsmpl->pq_stats.sum_min;
             res = common_sampler_verify_pq(p, draft_q[i], draft[i], x, gsmpl->pq_rng, beat_i, gsmpl->pq_stats, vocab, ends, mb_i);
             prev_rescued = res.rescued;
+            if (pq_trace_on) {
+                gsmpl->pq_trace.push_back((float) (gsmpl->pq_stats.sum_p_d - pd0));
+                gsmpl->pq_trace.push_back((float) (gsmpl->pq_stats.sum_min - sm0));
+            }
             if (res.rescued && gsmpl->first_rescue < 0) {
                 gsmpl->first_rescue = (int32_t) i;
             }
@@ -1911,6 +1920,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
             // id-match for this and the remaining positions
             res.accepted = x == draft[i];
             prev_rescued = false;
+            if (pq_trace_on) {
+                gsmpl->pq_trace.push_back(-1.0f);
+                gsmpl->pq_trace.push_back(-1.0f);
+            }
         }
         const bool stopped = llama_vocab_is_eog(vocab, res.id) || ends(res.id);
         common_sampler_accept(gsmpl, res.id, true);
@@ -1930,6 +1943,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
 
 const std::vector<float> & common_sampler_get_top1_trace(const struct common_sampler * gsmpl) {
     return gsmpl->top1_trace;
+}
+
+const std::vector<float> & common_sampler_get_pq_trace(const struct common_sampler * gsmpl) {
+    return gsmpl->pq_trace;
 }
 
 int32_t common_sampler_get_first_rescue(const struct common_sampler * gsmpl) {
