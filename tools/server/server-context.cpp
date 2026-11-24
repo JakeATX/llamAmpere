@@ -187,11 +187,11 @@ static bool server_copy_inplace() {
     return v;
 }
 
-// LLAMA_SERVER_RESERVE_NO_REOPEN=1 (default off): after the answer reserve closes the think block it stays closed.
+// LLAMA_SERVER_RESERVE_NO_REOPEN (default on, =0 turns it off): after the answer reserve closes the think block it stays closed.
 static bool server_reserve_no_reopen() {
     static const bool v = [] {
         const char * e = getenv("LLAMA_SERVER_RESERVE_NO_REOPEN");
-        return e != nullptr && atoi(e) > 0;
+        return e == nullptr || atoi(e) > 0;
     }();
     return v;
 }
@@ -4176,7 +4176,7 @@ private:
                     if (common_sampler_reasoning_close(slot.smpl.get(), &tracker)) {
                         SLT_INF(slot, "answer reserve: closing the think block, n_gen = %d, left = %d, reserve = %d\n",
                                 (int) slot.stats.n_gen, left, slot.answer_reserve);
-                        // opt-in (LLAMA_SERVER_RESERVE_NO_REOPEN=1): a model that re-opens the think block right
+                        // LLAMA_SERVER_RESERVE_NO_REOPEN (default on): a model that re-opens the think block right
                         // after this close gets closed again and again (open/close loop, then the repeat stop ends
                         // the reply with no answer). Ban the start tag from here so the answer gets written
                         if (server_reserve_no_reopen() && common_sampler_reasoning_block_reopen(slot.smpl.get())) {
