@@ -159,6 +159,7 @@ template <int N>
 static __device__ __forceinline__ void nk_wait() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
+    __syncwarp();
 #endif
 }
 
@@ -672,7 +673,7 @@ bool ggml_cuda_nk_nvfp4_tc_launch(const nvfp4moe_params & P, cudaStream_t stream
     const bool l2_ef = nk_nvfp4_tc_l2_ef();
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
     if (!logged.test_and_set()) {
-        GGML_LOG_INFO("[NK_NVFP4_TC] active (m16n8k16 v2 per-warp D=4/3, T=1..8, l2_evict_first=%d, smem gu=%zu dn=%zu)\n",
+        GGML_LOG_WARN("[NK_NVFP4_TC] active (m16n8k16 v2 per-warp D=4/3, T=1..8, l2_evict_first=%d, smem gu=%zu dn=%zu)\n",
             l2_ef ? 1 : 0, nk_nvfp4_tc::NK_SMEM_GU, nk_nvfp4_tc::NK_SMEM_DN);
     }
     const int64_t n = g_nk_nvfp4_tc_launches.fetch_add(1, std::memory_order_relaxed) + 1;

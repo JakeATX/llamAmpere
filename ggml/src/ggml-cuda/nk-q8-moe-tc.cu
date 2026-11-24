@@ -646,7 +646,7 @@ bool ggml_cuda_nk_q8_0_tc_launch(const nvfp4moe_params & P, cudaStream_t stream)
     const bool l2_ef = nk_q8_0_tc_l2_ef();
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
     if (!logged.test_and_set()) {
-        GGML_LOG_INFO("[NK_Q8_0_TC] active (m16n8k32 s8 TC, T=1..8, l2_evict_first=%d, smem gu=%zu dn=%zu)\n",
+        GGML_LOG_WARN("[NK_Q8_0_TC] active (m16n8k32 s8 TC, T=1..8, l2_evict_first=%d, smem gu=%zu dn=%zu)\n",
             l2_ef ? 1 : 0, nk_q8_0_tc::NK_SMEM_GU, nk_q8_0_tc::NK_SMEM_DN);
     }
     const int64_t n = g_nk_q8_0_tc_launches.fetch_add(1, std::memory_order_relaxed) + 1;

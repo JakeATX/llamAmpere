@@ -3369,7 +3369,7 @@ uint32_t llama_kv_cache::nk_kv_pad_for(uint32_t used_max_p1, uint32_t n_tps) con
     }
     static std::once_flag once_log;
     std::call_once(once_log, [step] {
-        LLAMA_LOG_INFO("[NK_KV_PAD] active: decode n_kv pad=%u (LLAMA_NK_KV_PAD)\n", step);
+        LLAMA_LOG_WARN("[NK_KV_PAD] active: decode n_kv pad=%u (LLAMA_NK_KV_PAD)\n", step);
     });
     return step;
 }
