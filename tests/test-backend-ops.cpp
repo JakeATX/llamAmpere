@@ -23925,6 +23925,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 775, 300, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_F32, 4, 4, 1));
     }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(5, 24, 4, 775, 300, true, false, GGML_TYPE_TQ6_0, 128, true));
+    // [W8] widths 7/8 at GQA 6 with Q8_0 / TQ6_0 staging, n_groups 0 (4K) and 111 (32K, G=256 like sj_fill),
+    // n_seqs 1 and 4, f16_sink 0/1, and bit-exact fused rotation (rot=2, ns=0; FLASH_ATTN_EXT_SJKVARN_ROT_EXACT).
+    for (int64_t n_q : {7, 8}) {
+        for (auto [n_groups, n_ring] : std::vector<std::pair<int64_t, int64_t>>{{0, 3968}, {111, 4224}}) {
+            for (bool f16_sink : {false, true}) {
+                for (int ns : {0, 4}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(
+                        n_q, 24, 4, n_groups, n_ring, false, false, GGML_TYPE_Q8_0, 128, f16_sink, GGML_TYPE_F32, 4, 4, 1, ns, 0, 0, 0, 256));
+                    if (!f16_sink || (n_groups == 0 && n_q == 7)) {
+                        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(
+                            n_q, 24, 4, n_groups, n_ring, false, false, GGML_TYPE_TQ6_0, 128, f16_sink, GGML_TYPE_F32, 4, 4, 1, ns, 0, 0, 0, 256));
+                    }
+                }
+                for (ggml_type st : {GGML_TYPE_Q8_0, GGML_TYPE_TQ6_0}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(
+                        n_q, 24, 4, n_groups, n_ring, false, false, st, 128, f16_sink, GGML_TYPE_F32, 4, 4, 2, 0, 0, 0, 0, 256));
+                }
+            }
+        }
+    }
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 0*128, 128 + 2*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_sj_kvarn_seal_dyn(256, 128, 4, 128, 384, 128 + 5*128, 128 + 7*128, 9, 3, 4, 4, 16, GGML_TYPE_TQ6_0, GGML_TYPE_TURBO4_0, true));

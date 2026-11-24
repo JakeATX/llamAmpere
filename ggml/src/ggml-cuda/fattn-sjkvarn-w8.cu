@@ -99,24 +99,51 @@ static void w8_launch_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         nullptr, nullptr, pb, /*async_kv_preload=*/false, /*sj_fill_kv_splits=*/1);
 }
 
-template <bool rot, bool raw_k>
-static void w8_select_nstage(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <bool raw_k>
+static int w8_pick_nstage() {
     const int nst = w8_nstage_env();
-    if (nst == 4 && w8_ctas_per_sm<4, rot, raw_k>() > 0) {
-        w8_launch_impl<4, rot, raw_k>(ctx, dst);
-    } else if (nst == 2) {
-        w8_launch_impl<2, rot, raw_k>(ctx, dst);
-    } else if (nst == 3 && w8_ctas_per_sm<3, rot, raw_k>() > 0) {
-        w8_launch_impl<3, rot, raw_k>(ctx, dst);
-    } else {
-        // Default: NSTAGE=3 (2 body strips + 2 tq6_0 raw slots in flight) whenever it keeps max CTA/SM occupancy.
-        const int c3 = w8_ctas_per_sm<3, rot, raw_k>();
-        const int c2 = w8_ctas_per_sm<2, rot, raw_k>();
-        if (c3 > 0 && c3 >= c2) {
-            w8_launch_impl<3, rot, raw_k>(ctx, dst);
-        } else {
-            w8_launch_impl<2, rot, raw_k>(ctx, dst);
-        }
+    if (nst == 4 && w8_ctas_per_sm<4, false, raw_k>() > 0) {
+        return 4;
+    }
+    if (nst == 2) {
+        return 2;
+    }
+    if (nst == 3 && w8_ctas_per_sm<3, false, raw_k>() > 0) {
+        return 3;
+    }
+    // Default: NSTAGE=3 (2 body strips + 2 tq6_0 or 1 q8_0 raw slot in flight) whenever it keeps max CTA/SM occupancy.
+    // Query the plain (rot=false) build so fused and unfused rotation always pick the same stage count.
+    const int c3 = w8_ctas_per_sm<3, false, raw_k>();
+    const int c2 = w8_ctas_per_sm<2, false, raw_k>();
+    return (c3 > 0 && c3 >= c2) ? 3 : 2;
+}
+
+template <int NSTAGE, bool raw_k>
+static void w8_launch_rot_checked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool rot) {
+    if (!rot) {
+        w8_launch_impl<NSTAGE, false, raw_k>(ctx, dst);
+        return;
+    }
+    // Fused rot=true is bit-exact against unfused rot=false + WHT only when launch_fattn sees the same CTA/SM
+    // occupancy (hence identical parallel_blocks / KV splits). Fall back to unfused W8 if they ever differ.
+    if (w8_ctas_per_sm<NSTAGE, true, raw_k>() != w8_ctas_per_sm<NSTAGE, false, raw_k>()) {
+        ggml_cuda_flash_attn_ext_sj_kvarn_rot_unfused(ctx, dst, ::ggml_cuda_flash_attn_ext_sj_kvarn_w8);
+        return;
+    }
+    ggml_cuda_pool_alloc<float> q_rot(ctx.pool(), ggml_nelements(dst->src[0]));
+    ggml_tensor q2;
+    ggml_cuda_sj_kvarn_rot256_q_pass(ctx, dst->src[0], q_rot.ptr, &q2);
+    ggml_tensor d2 = *dst;
+    d2.src[0] = &q2;
+    w8_launch_impl<NSTAGE, true, raw_k>(ctx, &d2);
+}
+
+template <bool raw_k>
+static void w8_select_nstage(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const bool rot) {
+    switch (w8_pick_nstage<raw_k>()) {
+        case 4:  w8_launch_rot_checked<4, raw_k>(ctx, dst, rot); break;
+        case 3:  w8_launch_rot_checked<3, raw_k>(ctx, dst, rot); break;
+        default: w8_launch_rot_checked<2, raw_k>(ctx, dst, rot); break;
     }
 }
 
@@ -151,8 +178,9 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_w8_supported(const ggml_tensor * dst) {
     if (n_q < 7 || n_q > 8 || dst->ne[2] != n_q) {
         return false;
     }
-    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-            Q->ne[0] != D || K->ne[0] != D || V->ne[0] != D ||
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            Q->ne[0] != D || K->ne[0] != D || V->ne[0] != D || Q->nb[0] != sizeof(float) ||
+            dst->ne[0] != D || dst->ne[1] != Q->ne[2] ||
             Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || dst->ne[3] != 1) {
         return false;
     }
@@ -192,22 +220,10 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_w8_supported(const ggml_tensor * dst) {
 void ggml_cuda_flash_attn_ext_sj_kvarn_w8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     using namespace fattn_sj_kvarn_w8;
     const bool rawk = w8_mode() == 1;
-    if (ggml_cuda_fattn_sj_kvarn_rot(dst)) {
-        ggml_cuda_pool_alloc<float> q_rot(ctx.pool(), ggml_nelements(dst->src[0]));
-        ggml_tensor q2;
-        ggml_cuda_sj_kvarn_rot256_q_pass(ctx, dst->src[0], q_rot.ptr, &q2);
-        ggml_tensor d2 = *dst;
-        d2.src[0] = &q2;
-        if (rawk) {
-            w8_select_nstage<true, true>(ctx, &d2);
-        } else {
-            w8_select_nstage<true, false>(ctx, &d2);
-        }
-        return;
-    }
+    const bool rot  = ggml_cuda_fattn_sj_kvarn_rot(dst);
     if (rawk) {
-        w8_select_nstage<false, true>(ctx, dst);
+        w8_select_nstage<true>(ctx, dst, rot);
     } else {
-        w8_select_nstage<false, false>(ctx, dst);
+        w8_select_nstage<false>(ctx, dst, rot);
     }
 }
