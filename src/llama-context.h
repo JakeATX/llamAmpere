@@ -691,6 +691,17 @@ private:
     uint32_t ink_loan_chunk_n   = 0;
     uint32_t ink_loan_cross(uint32_t ink_min) const;
     void     ink_loan_shrink(const char * why);
+    // fork (SURGE-cache, elastic KV, LLAMA_ELASTIC_KV=1; llama-kv-elastic.cpp): before a decode call, map the KV record
+    // pages it may reach (shrinking the grown MoE cache if VRAM is short) and unmap the pages past it (lent to the cache
+    // at its next refill). make_room frees `bytes` of VRAM by shrinking the cache, never below its boot size.
+    llama_kv_cache * elastic_kv = nullptr;
+    bool     elastic_kv_prepare(const llama_batch_ext & batch);
+    bool     elastic_kv_make_room(size_t bytes);
+    bool     elastic_kv_shrink_compute(size_t bytes);
+    uint32_t elastic_boot_rows = 0; // compute reserve rows at boot (fitted with every KV page mapped)
+    // fork (SURGE-cache, MCDET): LLAMA_MOE_CACHE_DET=1, the output of a request does not depend on what earlier
+    // requests left in the MoE cache (fixed prompt crossover; see llama-moe-cache.cpp for the cache side)
+    bool     moe_cache_det = false;
     bool dynamic_ubatch = false;
     uint32_t dynamic_ubatch_rows = 0;
     int64_t dynamic_ubatch_pp_check_us = 0;

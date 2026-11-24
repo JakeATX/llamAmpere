@@ -435,6 +435,27 @@ struct llama_moe_cache::impl {
 
     bool is_suspended = false; // fork (INKSTREAM): banks freed for a streamed prompt
 
+    // fork (SURGE-cache, round admission; LLAMA_MOE_CACHE_ROUND=1, off by default). Once the cache is full, a decode
+    // miss is computed on the CPU from the host experts instead of being uploaded on the spot (the graph's CPU part,
+    // as with --moe-cache-cpu-share 1). After the last layer of the window (one decode ubatch) has been served, the
+    // experts the CPU computed are ranked by their decayed use count and the hottest are uploaded in place of the
+    // coldest cached ones: at most LLAMA_MOE_CACHE_ROUND_SWAPS (16) per window, LLAMA_MOE_CACHE_ROUND_BOOST (4) times
+    // that while a backlog lasts (the previous round left candidates that would still beat the coldest slot).
+    // An expert routed once qualifies when its count beats the coldest cached expert's decayed count.
+    bool     round_on    = false;
+    int32_t  round_swaps = 16;
+    int32_t  round_boost = 4;
+    int32_t  round_prev_il = -1;               // layer of the previous lookup: a lower or equal one starts a window
+    std::vector<std::vector<int32_t>> round_cand; // [group] keys the CPU computed in this window
+    std::vector<uint32_t> round_mark;          // [n_layer*n_expert] == round_gen when the key is in round_cand
+    uint32_t round_gen = 1;
+    std::vector<uint8_t> round_backlog;        // [group]
+    size_t   round_n = 0, round_n_swaps = 0, round_n_backlog = 0;
+
+    // fork (SURGE-cache, MCDET; LLAMA_MOE_CACHE_DET=1, off by default): no miss is computed on the CPU (its last bits
+    // differ from the GPU's), so a request's output does not depend on what earlier requests left in the cache.
+    bool     det_on = false;
+
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
@@ -524,7 +545,29 @@ struct llama_moe_cache::impl {
 
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
         // one extra slot at the end, CUDA MMQ can read past the last expert
-        n_zero = cpu_share > 0.0f ? std::min<int32_t>(n_expert_used, 64) : 0;
+        {
+            const char * e = getenv("LLAMA_MOE_CACHE_ROUND");
+            round_on = e && atoi(e) != 0;
+            const char * d = getenv("LLAMA_MOE_CACHE_DET");
+            det_on = d && atoi(d) != 0;
+            if (det_on) {
+                round_on = false;
+            }
+            if (const char * w = getenv("LLAMA_MOE_CACHE_ROUND_SWAPS"); w && w[0]) {
+                round_swaps = std::max(1, atoi(w));
+            }
+            if (const char * b = getenv("LLAMA_MOE_CACHE_ROUND_BOOST"); b && b[0]) {
+                round_boost = std::max(1, atoi(b));
+            }
+        }
+        n_zero = (cpu_share > 0.0f && !det_on) || round_on ? std::min<int32_t>(n_expert_used, 64) : 0;
+        if (round_on) {
+            round_cand.assign(groups.size(), {});
+            round_backlog.assign(groups.size(), 0);
+            round_mark.assign(model.layers.size()*(size_t) model.hparams.n_expert, 0);
+            LLAMA_LOG_WARN("%s: [MCROUND] round admission on: decode misses on the CPU, %d swaps per window (x%d under a backlog)\n",
+                    __func__, round_swaps, round_boost);
+        }
         auto alloc_size = [&](const group & g, int32_t n_slots) {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
@@ -891,8 +934,19 @@ struct llama_moe_cache::impl {
             write_trace(il, n_used);
         }
 
+        // fork (SURGE-cache): a window starts at a lookup of a layer at or below the previous one; rank the last one first
+        if (round_on) {
+            if (il <= round_prev_il) {
+                run_rounds();
+            }
+            round_prev_il = il;
+        }
+
         // part of the misses is computed on the CPU once the cache is full, the carry keeps the share right on average
-        const uint32_t share_q = has_cpu && g.lru.n_filled == g.lru.n_slots ? cpu_share_q : 0;
+        // (round admission: all of them, as far as zero slots allow; MCDET: none)
+        // (round admission: all decode misses, ubatches of <= 8 rows; larger ones upload as before)
+        const uint32_t share_full = round_on ? (sel->src[0]->ne[1] <= 8 ? 65536u : 0u) : det_on ? 0u : cpu_share_q;
+        const uint32_t share_q = has_cpu && g.lru.n_filled == g.lru.n_slots ? share_full : 0;
         auto n_cpu = [&](size_t n_miss) {
             const uint64_t acc = (uint64_t) n_miss*share_q + l.cpu_acc;
             l.cpu_acc = acc & 0xffff;
@@ -911,6 +965,13 @@ struct llama_moe_cache::impl {
             for (const auto & f : cpu) {
                 cpu_map[f.expert] = f.expert;
                 l.cpu_experts.push_back(f.expert);
+                if (round_on) {
+                    const int32_t key = g.lru.make_key(ci, f.expert);
+                    if (round_mark[key] != round_gen) {
+                        round_mark[key] = round_gen;
+                        round_cand[l.ig].push_back(key);
+                    }
+                }
             }
         }
 
@@ -941,6 +1002,84 @@ struct llama_moe_cache::impl {
         ggml_backend_tensor_set_async(backend, dst, g.lru.slot_map[ci], 0, ggml_nbytes(l.slot_map));
 
         return true;
+    }
+
+    // fork (SURGE-cache, round admission): see round_on. Runs at the first lookup of a window, when the device has
+    // finished the previous window (copy() synchronizes before it reads the ids), so the banks can be written.
+    void run_rounds() {
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            std::vector<int32_t> & cand = round_cand[ig];
+            if (g.n_slots == 0 || cand.empty()) {
+                round_backlog[ig] = 0;
+                cand.clear();
+                continue;
+            }
+            moe_cache_lru & lru = g.lru;
+            auto crf_now = [&](int32_t key) { return lru.decayed_crf(lru.key_layer(key), key); };
+            std::vector<std::pair<float, int32_t>> rank;
+            rank.reserve(cand.size());
+            for (int32_t key : cand) {
+                if (lru.slot_map[lru.key_layer(key)][lru.key_expert(key)] >= lru.n_slots) {
+                    rank.push_back({ crf_now(key), key });
+                }
+            }
+            cand.clear();
+            // hottest first; ties by key, so the order does not depend on the order of the lookups
+            std::sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            const int32_t budget = round_backlog[ig] ? round_swaps*round_boost : round_swaps;
+            // nothing is selected during a round: a fresh generation clears is_selected() for every slot
+            if (++lru.seen_gen == 0) {
+                std::fill(lru.seen.begin(), lru.seen.end(), 0);
+                lru.seen_gen = 1;
+            }
+            ggml_backend_t backend = devices[g.id].backend;
+            int32_t n_swap = 0;
+            size_t  i = 0;
+            for (; i < rank.size() && n_swap < budget; ++i) {
+                const int32_t key = rank[i].second;
+                const int32_t s   = lru.victim(lru.key_layer(key));
+                const int32_t old = lru.key_of[s];
+                if (old >= 0 && crf_now(old) >= rank[i].first) {
+                    break; // the coldest cached expert is at least as hot: so is every later candidate's victim
+                }
+                if (old >= 0) {
+                    lru.slot_map[lru.key_layer(old)][lru.key_expert(old)] = lru.empty;
+                } else {
+                    lru.n_filled++;
+                }
+                const int32_t il = lru.key_layer(key);
+                const int32_t e  = lru.key_expert(key);
+                lru.key_of[s]       = key;
+                lru.slot_map[il][e] = s;
+                lru.move(s, lru.class_of(key));
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w    = l.experts[ip];
+                    ggml_tensor       * bank = g.banks[ip];
+                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + e*w->nb[2], s*bank->nb[2], bank->nb[2]);
+                    stats_small.bytes += bank->nb[2];
+                }
+                n_swap++;
+            }
+            // a backlog: the budget ran out while the next candidate would still have beaten the coldest slot
+            bool backlog = false;
+            if (n_swap == budget && i < rank.size()) {
+                const int32_t s   = lru.victim(lru.key_layer(rank[i].second));
+                const int32_t old = lru.key_of[s];
+                backlog = old < 0 || crf_now(old) < rank[i].first;
+            }
+            round_backlog[ig] = backlog ? 1 : 0;
+            round_n++;
+            round_n_swaps   += n_swap;
+            round_n_backlog += backlog ? 1 : 0;
+        }
+        if (++round_gen == 0) {
+            std::fill(round_mark.begin(), round_mark.end(), 0);
+            round_gen = 1;
+        }
     }
 
     size_t suspend() {
@@ -985,7 +1124,8 @@ struct llama_moe_cache::impl {
     // lowest eviction score (the ones victim() would take last). The banks are rebuilt, so the views change: the graphs
     // that read them must be rebuilt. One device, no CPU share (zero slots), no trace: otherwise false and nothing changes.
     bool resize(size_t size) {
-        if (!is_suspended || n_zero > 0 || trace != nullptr || groups.empty()) {
+        // fork (SURGE-cache): zero slots (CPU misses) are fine under round admission: the banks are cleared on resume
+        if (!is_suspended || (n_zero > 0 && !round_on) || trace != nullptr || groups.empty()) {
             return false;
         }
         int32_t n_dev = 0;
@@ -1068,6 +1208,11 @@ struct llama_moe_cache::impl {
                 }
             }
             g.n_slots = want[ig];
+            if (round_on) {
+                round_cand[ig].clear(); // the candidates' slot state was rebuilt
+                round_backlog[ig] = 0;
+                // cpu_experts stay: the next lookup of each layer resets their cpu_map entries before it sets new ones
+            }
         }
 
         // new banks and views on the device
@@ -1187,6 +1332,10 @@ struct llama_moe_cache::impl {
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
+        if (round_n > 0) {
+            LLAMA_LOG_INFO("llama_moe_cache: [MCROUND] %zu rounds, %zu swaps (%.2f per round), %zu rounds under a backlog\n",
+                round_n, round_n_swaps, (double) round_n_swaps/round_n, round_n_backlog);
+        }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }

@@ -1544,6 +1544,15 @@ static inline __host__ bool ggml_cuda_mmq_id_sk_upstream() {
     return v;
 }
 
+// fork (SURGE-cache, MCDET): GGML_CUDA_MMQ_ID_TILED=1 runs expert (ids) matmuls with one CUDA block per output tile, so
+// no tile's K range is split across blocks. The stream-k split points depend on the tile's place in the grid, which for
+// a MoE cache bank is the slot the expert happens to occupy: tiled, an expert's result no longer depends on its slot.
+// Off by default (set by LLAMA_MOE_CACHE_DET=1).
+static inline __host__ bool ggml_cuda_mmq_id_tiled() {
+    static const bool v = [] { const char * e = getenv("GGML_CUDA_MMQ_ID_TILED"); return e && atoi(e) != 0; }();
+    return v;
+}
+
 static inline __host__ bool ggml_cuda_mmq_sk_upstream() {
     static const bool v = [] { const char * e = getenv("GGML_CUDA_MMQ_SK_UPSTREAM"); return e && atoi(e) != 0; }();
     return v;
@@ -1608,7 +1617,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // order are v0.6.3's exactly. MoE: with args.tiles_v063 ntiles_dst also equals v0.6.3's per-expert grid
     // (GGML_CUDA_MMQ_ID_SK_UPSTREAM=1 = upstream). Dense: GGML_CUDA_MMQ_SK_UPSTREAM=1 = upstream's min(nsm, nwork).
     const bool grid_v063 = args.ids_dst ? args.tiles_v063 : !ggml_cuda_mmq_sk_upstream();
-    int nblocks_stream_k = GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst :
+    int nblocks_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90) || (args.ids_dst && ggml_cuda_mmq_id_tiled()) ? ntiles_dst :
         (grid_v063 ? nsm : std::min(nsm, nwork));
     // [PARW] a few output tiles over a long K (the 48-row GDN gate projections at verify widths 9..32 are ONE tile):
     // nsm CTAs leave most of them without a K iteration and the fixup's last CTA walks every earlier CTA serially

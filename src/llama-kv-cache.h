@@ -430,7 +430,31 @@ public:
     // attention sinks for a sliding-window cache: positions [0, n) are never SWA-masked or evicted
     void set_swa_sink(uint32_t n) { n_swa_sink = n; }
 
+    // fork (SURGE-cache, elastic KV; LLAMA_ELASTIC_KV=1, off by default): a single-sequence SJ-KVaRN cache keeps its
+    // sealed-record pools in a CUDA VMM buffer (all pages mapped at boot, so the fit and the boot sizes are unchanged).
+    // elastic_fit() unmaps the record pages past the live context so the MoE expert cache can take that VRAM, and maps
+    // them again (filled with zeros) before the context reaches them. Implemented in llama-kv-elastic.cpp.
+    bool   elastic_on() const { return elastic_buf != nullptr; }
+    // record groups that hold positions [0, n_pos), rounded up to the mapping step
+    uint32_t elastic_groups_for(uint32_t n_pos) const;
+    uint32_t elastic_groups() const { return elastic_n_groups; }
+    // bytes the record pools take with g groups mapped (before page rounding)
+    size_t elastic_bytes(uint32_t g) const;
+    size_t elastic_mapped() const;
+    // map exactly the groups for positions [0, n_pos) (shrink only if `shrink`); false: no VRAM for it, nothing changed
+    bool   elastic_fit(uint32_t n_pos, bool shrink);
+    // set by the context: make `bytes` of VRAM free (by shrinking the MoE cache); called when a fit inside the cache
+    // (a ubatch past the mapping, a state read) is short of VRAM
+    std::function<bool(size_t)> elastic_make_room;
+
 private:
+    void elastic_init(); // after the buffers are allocated
+    // the body pages needed for positions up to n_pos are mapped (asks elastic_make_room if short); throws if impossible
+    void elastic_require(uint32_t n_pos);
+    ggml_backend_buffer_t elastic_buf = nullptr;
+    uint32_t elastic_n_groups = 0; // groups of every pool mapped now
+    uint32_t elastic_step     = 0; // mapping step in groups
+
     const llama_model & model;
     const llama_hparams & hparams;
 
