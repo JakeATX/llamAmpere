@@ -27471,6 +27471,299 @@ static int run_nk_dense_tc_check() {
     return fails ? 1 : 0;
 }
 
+// GGML_TEST_NK_PF_MM=1: bit-exact correctness + same-job ABBA perf for NK_PF_MM vs base k_nvfp4pf_mm.
+// Runs both base and NK in one process on identical NVFP4 weights, F32 activations, routing ids, and scales.
+static int run_nk_pf_mm_check() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        fprintf(stderr, "nk_pf_mm: no GPU backend\n");
+        return 1;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    typedef bool (*nk_pf_mm_run_t)(ggml_backend_t, const ggml_tensor *, const ggml_tensor *,
+            const ggml_tensor *, ggml_tensor *, const ggml_tensor *, int);
+    typedef int64_t (*fusion_count_t)(ggml_backend_t, const char *);
+    auto run_fn = (nk_pf_mm_run_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_nk_pf_mm_run");
+    auto count_fn = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+    if (!run_fn || !count_fn) {
+        fprintf(stderr, "nk_pf_mm: CUDA test proc addresses not available\n");
+        return 1;
+    }
+
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    if (!be) {
+        fprintf(stderr, "nk_pf_mm: failed to init GPU backend\n");
+        return 1;
+    }
+
+    const char * pf_env = getenv("GGML_CUDA_NVFP4PF");
+    const char * nk_env = getenv("GGML_CUDA_NK_PF_MM");
+    const char * perf_env = getenv("GGML_TEST_NK_PF_MM_NO_PERF");
+    const bool do_perf = !(perf_env && atoi(perf_env) != 0);
+    printf("nk_pf_mm: GGML_CUDA_NVFP4PF=%s GGML_CUDA_NK_PF_MM=%s\n",
+        (pf_env && *pf_env) ? pf_env : "k64(default)",
+        (nk_env && *nk_env) ? nk_env : "0(default)");
+
+    enum route_kind { ROUTE_UNIFORM = 0, ROUTE_SKEWED = 1, ROUTE_INVALID = 2, ROUTE_SPARSE = 3 };
+    struct pf_case {
+        const char * name;
+        int64_t K;
+        int64_t M;
+        int64_t E;
+        int64_t ne11;
+        int64_t n_used;
+        int64_t n_tok;
+        route_kind route;
+        bool with_scale;
+        bool bench;
+    };
+
+    const std::vector<pf_case> cases = {
+        { "gu_t512_unif",     2304, 2304, 128, 1, 8,  512, ROUTE_UNIFORM, true,  true  },
+        { "gu_t512_skew",     2304, 2304, 128, 1, 8,  512, ROUTE_SKEWED,  true,  true  },
+        { "dn_t512_unif",     1152, 2304, 128, 8, 8,  512, ROUTE_UNIFORM, true,  true  },
+        { "dn_t512_skew",     1152, 2304, 128, 8, 8,  512, ROUTE_SKEWED,  true,  true  },
+        { "gu_t1024_unif",    2304, 2304, 128, 1, 8, 1024, ROUTE_UNIFORM, true,  true  },
+        { "gu_t1024_skew",    2304, 2304, 128, 1, 8, 1024, ROUTE_SKEWED,  true,  true  },
+        { "dn_t1024_unif",    1152, 2304, 128, 8, 8, 1024, ROUTE_UNIFORM, true,  true  },
+        { "dn_t1024_skew",    1152, 2304, 128, 8, 8, 1024, ROUTE_SKEWED,  true,  true  },
+        { "gu_t2048_unif",    2304, 2304, 128, 1, 8, 2048, ROUTE_UNIFORM, true,  true  },
+        { "gu_t2048_skew",    2304, 2304, 128, 1, 8, 2048, ROUTE_SKEWED,  true,  true  },
+        { "dn_t2048_unif",    1152, 2304, 128, 8, 8, 2048, ROUTE_UNIFORM, true,  true  },
+        { "dn_t2048_skew",    1152, 2304, 128, 8, 8, 2048, ROUTE_SKEWED,  true,  true  },
+        { "edge_odd_slab",    1280, 2320,  64, 1, 8,  512, ROUTE_UNIFORM, true,  false },
+        { "edge_small_m_k128", 128,   80,  32, 1, 4,  512, ROUTE_UNIFORM, true,  false },
+        { "edge_unscaled",    1152, 2304, 128, 8, 8,  512, ROUTE_UNIFORM, false, false },
+        { "edge_invalid_id",  1152, 2304, 128, 8, 8,  512, ROUTE_INVALID, true,  false },
+        { "edge_sparse_3pair",1152, 2304, 128, 8, 8,  512, ROUTE_SPARSE,  true,  false },
+    };
+
+    int fails = 0;
+    int passed = 0;
+
+    for (size_t ci = 0; ci < cases.size(); ++ci) {
+        const pf_case & tc = cases[ci];
+        ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * src0  = ggml_new_tensor_3d(ctx, GGML_TYPE_NVFP4, tc.K, tc.M, tc.E);
+        ggml_tensor * src1  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,   tc.K, tc.ne11, tc.n_tok);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,   tc.n_used, tc.n_tok);
+        ggml_tensor * dst   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,   tc.M, tc.n_used, tc.n_tok);
+        ggml_tensor * s_exp = tc.with_scale ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, tc.E) : nullptr;
+        ggml_backend_buffer_t bb = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::mt19937 rng(20261124u + (uint32_t) ci * 997u);
+
+        // Fill NVFP4 blocks (36 bytes = 4 UE4M3 sub-scales + 32 nibble bytes) including edge scales
+        const size_t n_wbytes = ggml_nbytes(src0);
+        const size_t n_blocks = n_wbytes / 36;
+        std::vector<uint8_t> wb(n_wbytes);
+        for (size_t b = 0; b < n_blocks; ++b) {
+            uint8_t * p = wb.data() + b * 36;
+            const uint32_t r = rng();
+            for (int s = 0; s < 4; ++s) {
+                uint8_t u = (uint8_t) (0x20u + (((r >> (8 * s)) & 0x3Fu))); // normal UE4M3 range
+                if (((b + (size_t) s) & 63u) == 0u) {
+                    u = 0x00u; // zero scale
+                } else if (((b + (size_t) s) & 63u) == 1u) {
+                    u = 0x03u; // subnormal scale
+                } else if (((b + (size_t) s) & 63u) == 2u) {
+                    u = 0x7Fu; // NaN -> 0 edge case
+                }
+                p[s] = u;
+            }
+            for (int j = 0; j < 8; ++j) {
+                ((uint32_t *) (p + 4))[j] = rng();
+            }
+        }
+
+        // Fill F32 activations, keeping row 0 all-zero to test MIN_SCALE
+        const size_t n_x = (size_t) tc.K * (size_t) tc.ne11 * (size_t) tc.n_tok;
+        std::vector<float> xb(n_x);
+        std::uniform_real_distribution<float> ux(-2.0f, 2.0f);
+        for (size_t i = 0; i < n_x; ++i) {
+            xb[i] = (i < (size_t) tc.K) ? 0.0f : ux(rng);
+        }
+
+        // Fill routing ids [n_used, n_tok]
+        std::vector<int32_t> idb((size_t) tc.n_used * (size_t) tc.n_tok);
+        if (tc.route == ROUTE_UNIFORM) {
+            std::vector<int32_t> perm((size_t) tc.E);
+            std::iota(perm.begin(), perm.end(), 0);
+            for (int64_t t = 0; t < tc.n_tok; ++t) {
+                for (int64_t u = 0; u < tc.n_used; ++u) {
+                    const size_t j = (size_t) u + (rng() % (size_t) (tc.E - u));
+                    std::swap(perm[(size_t) u], perm[j]);
+                    idb[(size_t) t * (size_t) tc.n_used + (size_t) u] = perm[(size_t) u];
+                }
+            }
+        } else if (tc.route == ROUTE_SKEWED) {
+            // Zipf-like skew: top experts get ~3-5x average traffic, tail experts get <16 pairs
+            std::vector<double> cdf((size_t) tc.E);
+            double tot = 0.0;
+            for (int64_t e = 0; e < tc.E; ++e) {
+                tot += 1.0 / std::pow((double) (e + 1), 0.75);
+                cdf[(size_t) e] = tot;
+            }
+            std::uniform_real_distribution<double> u01(0.0, tot);
+            for (int64_t t = 0; t < tc.n_tok; ++t) {
+                std::vector<int32_t> used;
+                used.reserve((size_t) tc.n_used);
+                for (int64_t u = 0; u < tc.n_used; ++u) {
+                    int32_t pick = 0;
+                    for (int tries = 0; tries < 64; ++tries) {
+                        const double v = u01(rng);
+                        pick = (int32_t) (std::lower_bound(cdf.begin(), cdf.end(), v) - cdf.begin());
+                        if (pick >= (int32_t) tc.E) { pick = (int32_t) tc.E - 1; }
+                        if (std::find(used.begin(), used.end(), pick) == used.end()) { break; }
+                    }
+                    while (std::find(used.begin(), used.end(), pick) != used.end()) {
+                        pick = (pick + 1) % (int32_t) tc.E;
+                    }
+                    used.push_back(pick);
+                    idb[(size_t) t * (size_t) tc.n_used + (size_t) u] = pick;
+                }
+            }
+        } else if (tc.route == ROUTE_INVALID) {
+            for (size_t i = 0; i < idb.size(); ++i) {
+                if ((i % 19u) == 0u) {
+                    idb[i] = -1;
+                } else if ((i % 37u) == 0u) {
+                    idb[i] = (int32_t) tc.E;
+                } else {
+                    idb[i] = (int32_t) (rng() % (uint32_t) tc.E);
+                }
+            }
+        } else {
+            // ROUTE_SPARSE: 2 hot experts + 1 expert with 3 pairs + 1 expert with 17 pairs
+            for (size_t i = 0; i < idb.size(); ++i) {
+                idb[i] = (int32_t) (i & 1u);
+            }
+            idb[0] = 5; idb[1] = 5; idb[2] = 5;
+            for (size_t i = 10; i < 27 && i < idb.size(); ++i) {
+                idb[i] = 7;
+            }
+        }
+
+        std::vector<float> sb((size_t) tc.E);
+        std::uniform_real_distribution<float> us(0.5f, 2.0f);
+        for (float & v : sb) { v = us(rng); }
+
+        ggml_backend_tensor_set(src0, wb.data(), 0, wb.size());
+        ggml_backend_tensor_set(src1, xb.data(), 0, xb.size() * sizeof(float));
+        ggml_backend_tensor_set(ids,  idb.data(), 0, idb.size() * sizeof(int32_t));
+        if (s_exp) {
+            ggml_backend_tensor_set(s_exp, sb.data(), 0, sb.size() * sizeof(float));
+        }
+
+        const size_t n_y = (size_t) tc.M * (size_t) tc.n_used * (size_t) tc.n_tok;
+        std::vector<float> nan_fill(n_y, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> y_base(n_y), y_nk(n_y);
+
+        // 1. Run base (use_nk = 0)
+        ggml_backend_tensor_set(dst, nan_fill.data(), 0, n_y * sizeof(float));
+        const int64_t cnt_b0 = count_fn(be, "nk_pf_mm");
+        const bool ok_base = run_fn(be, src0, src1, ids, dst, s_exp, 0);
+        ggml_backend_synchronize(be);
+        const int64_t cnt_b1 = count_fn(be, "nk_pf_mm");
+        ggml_backend_tensor_get(dst, y_base.data(), 0, n_y * sizeof(float));
+
+        // 2. Run NK_PF_MM (use_nk = 1)
+        ggml_backend_tensor_set(dst, nan_fill.data(), 0, n_y * sizeof(float));
+        const int64_t cnt_n0 = count_fn(be, "nk_pf_mm");
+        const bool ok_nk = run_fn(be, src0, src1, ids, dst, s_exp, 1);
+        ggml_backend_synchronize(be);
+        const int64_t cnt_n1 = count_fn(be, "nk_pf_mm");
+        ggml_backend_tensor_get(dst, y_nk.data(), 0, n_y * sizeof(float));
+
+        // 3. On first case, verify env-mode dispatch (-1) matches GGML_CUDA_NK_PF_MM
+        bool ok_env = true;
+        if (ci == 0) {
+            const bool expect_nk = nk_env && atoi(nk_env) != 0;
+            const int64_t ce0 = count_fn(be, "nk_pf_mm");
+            const bool ran_env = run_fn(be, src0, src1, ids, dst, s_exp, -1);
+            ggml_backend_synchronize(be);
+            const int64_t ce1 = count_fn(be, "nk_pf_mm");
+            ok_env = ran_env && ((ce1 - ce0) == (expect_nk ? 1 : 0));
+        }
+
+        bool finite_ok = true;
+        for (size_t i = 0; i < n_y; ++i) {
+            if (!std::isfinite(y_base[i]) || !std::isfinite(y_nk[i])) {
+                finite_ok = false;
+                break;
+            }
+        }
+        const bool exact = memcmp(y_base.data(), y_nk.data(), n_y * sizeof(float)) == 0;
+        const bool cnt_ok = (cnt_b1 == cnt_b0) && (cnt_n1 == cnt_n0 + 1);
+        const bool pass = ok_base && ok_nk && ok_env && finite_ok && exact && cnt_ok;
+
+        if (!pass) {
+            ++fails;
+            printf("nk_pf_mm %-18s FAIL (base=%d nk=%d env=%d finite=%d exact=%d cnt_b=%lld cnt_n=%lld)\n",
+                tc.name, ok_base, ok_nk, ok_env, finite_ok, exact,
+                (long long) (cnt_b1 - cnt_b0), (long long) (cnt_n1 - cnt_n0));
+            if (!exact) {
+                for (size_t i = 0; i < n_y; ++i) {
+                    uint32_t ub = 0, un = 0;
+                    memcpy(&ub, &y_base[i], 4);
+                    memcpy(&un, &y_nk[i], 4);
+                    if (ub != un) {
+                        const int64_t r = (int64_t) (i % (size_t) tc.M);
+                        const int64_t col = (int64_t) (i / (size_t) tc.M);
+                        const int64_t u = col % tc.n_used;
+                        const int64_t t = col / tc.n_used;
+                        printf("  first mismatch t=%lld u=%lld r=%lld id=%d: nk=%.9g (0x%08x) ref=%.9g (0x%08x) diff=%.3g\n",
+                            (long long) t, (long long) u, (long long) r, idb[(size_t) col],
+                            y_nk[i], un, y_base[i], ub, (double) y_nk[i] - (double) y_base[i]);
+                        break;
+                    }
+                }
+            }
+        } else {
+            ++passed;
+            if (do_perf && tc.bench) {
+                auto bench_arm = [&](int use_nk, int warmup, int iters) -> double {
+                    for (int i = 0; i < warmup; ++i) {
+                        run_fn(be, src0, src1, ids, dst, s_exp, use_nk);
+                    }
+                    ggml_backend_synchronize(be);
+                    const int64_t t0 = ggml_time_us();
+                    for (int i = 0; i < iters; ++i) {
+                        run_fn(be, src0, src1, ids, dst, s_exp, use_nk);
+                    }
+                    ggml_backend_synchronize(be);
+                    const int64_t t1 = ggml_time_us();
+                    return (double) (t1 - t0) / (double) iters;
+                };
+                const int iters = tc.n_tok >= 2048 ? 8 : 12;
+                const double a0 = bench_arm(0, 3, iters);
+                const double b0 = bench_arm(1, 3, iters);
+                const double b1 = bench_arm(1, 1, iters);
+                const double a1 = bench_arm(0, 1, iters);
+                const double base_us = 0.5 * (a0 + a1);
+                const double nk_us   = 0.5 * (b0 + b1);
+                const double pct     = 100.0 * (nk_us - base_us) / base_us;
+                const double ops     = 2.0 * (double) tc.n_tok * (double) tc.n_used * (double) tc.M * (double) tc.K;
+                const double base_tops = ops / (base_us * 1e6);
+                const double nk_tops   = ops / (nk_us * 1e6);
+                printf("nk_pf_mm %-18s PASS exact | base %8.1f us (%5.1f TOPS) -> nk %8.1f us (%5.1f TOPS) | %+6.1f%% (ABBA: %.1f/%.1f vs %.1f/%.1f)\n",
+                    tc.name, base_us, base_tops, nk_us, nk_tops, pct, a0, a1, b0, b1);
+            } else {
+                printf("nk_pf_mm %-18s PASS exact\n", tc.name);
+            }
+        }
+
+        ggml_backend_buffer_free(bb);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(be);
+    printf("nk_pf_mm summary: %d/%zu PASS (%d fails)\n", passed, cases.size(), fails);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     // the expert-bank MUL_MAT_ID cases pass skipped (-1 / out-of-stack) ids without loading a bank model; the CUDA
     // backend zeroes their outputs only when told to (or when a hot-bank model is loaded)
@@ -27499,6 +27792,11 @@ int main(int argc, char ** argv) {
     }
     if (const char * od = getenv("GGML_TEST_AIT_MIDT_OUT")) {
         return run_ait_midt_check(od);
+    }
+    if (const char * nk = getenv("GGML_TEST_NK_PF_MM")) {
+        if (atoi(nk) != 0) {
+            return run_nk_pf_mm_check();
+        }
     }
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;

@@ -83,6 +83,7 @@
 #include "ggml-cuda/nk-dspark-head.cuh"
 #include "ggml-cuda/nk-dense-tc.cuh"
 #include "ggml-cuda/nvfp4pf.cuh"
+#include "ggml-cuda/nk-pf-mm.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
 #include "ggml-cuda/inkreltab2.cuh"
@@ -17813,6 +17814,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "prefill_actq_hits") == 0) {
         return ctx->fusion_stats.prefill_actq_hits;
     }
+    if (strcmp(name, "nk_pf_mm") == 0) {
+        return ggml_cuda_nk_pf_mm_count();
+    }
     return -1;
 }
 
@@ -18311,6 +18315,19 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_nk_dense_tc_group_run") == 0) {
         return (void *)ggml_backend_cuda_nk_dense_tc_group_run;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nk_pf_mm_run") == 0) {
+        return (void *) +[](ggml_backend_t backend,
+                const ggml_tensor * src0, const ggml_tensor * src1,
+                const ggml_tensor * ids, ggml_tensor * dst,
+                const ggml_tensor * s_exp, int use_nk) -> bool {
+            if (!ggml_backend_is_cuda(backend)) {
+                return false;
+            }
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            return ggml_cuda_nvfp4pf_try_mode(*cuda_ctx, src0, src1, ids, dst, s_exp, use_nk);
+        };
     }
     return nullptr;
 }
