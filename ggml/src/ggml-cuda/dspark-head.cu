@@ -1,4 +1,5 @@
 #include "dspark-head.cuh"
+#include "nk-dspark-head.cuh"
 
 #include <cmath>
 #include <cstdint>
@@ -458,7 +459,7 @@ static __global__ void __launch_bounds__(512) k_dspark_head_merge_sample(
     }
 }
 
-bool ggml_cuda_dspark_head_launch(
+bool ggml_cuda_dspark_head_launch_base(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * fold_w,
         const ggml_tensor * latent,
@@ -611,4 +612,28 @@ bool ggml_cuda_dspark_head_launch(
 
     CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+bool ggml_cuda_dspark_head_launch(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * fold_w,
+        const ggml_tensor * latent,
+        const ggml_tensor * fold_bias,
+        const ggml_tensor * base,
+        const ggml_tensor * ids,
+        const ggml_tensor * noise,
+        ggml_tensor       * cand_out,
+        ggml_tensor       * vals_out,
+        ggml_tensor       * prev_out,
+        int64_t             n_eval,
+        int                 sk,
+        float               softcap,
+        float               inv_temp) {
+    if (ggml_cuda_nk_dspark_head_enabled() &&
+            ggml_cuda_nk_dspark_head_launch(ctx, fold_w, latent, fold_bias, base, ids, noise,
+                cand_out, vals_out, prev_out, n_eval, sk, softcap, inv_temp)) {
+        return true;
+    }
+    return ggml_cuda_dspark_head_launch_base(ctx, fold_w, latent, fold_bias, base, ids, noise,
+        cand_out, vals_out, prev_out, n_eval, sk, softcap, inv_temp);
 }
