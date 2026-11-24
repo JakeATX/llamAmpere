@@ -130,6 +130,19 @@ static void fill_realistic(std::vector<float> & buf, std::mt19937 & rng, bool ou
     }
 }
 
+static void diag(const char * tag, const int8_t * q0, const int8_t * q1, size_t nq, const float * s0, const float * s1, size_t ns,
+                 const float * d_a, const float * d_b, size_t n) {
+    std::vector<float> a(n), b(n);
+    CUDA_CK(cudaMemcpy(a.data(), d_a, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CK(cudaMemcpy(b.data(), d_b, n * sizeof(float), cudaMemcpyDeviceToHost));
+    size_t dq = 0, ds = 0, df = 0, fq = SIZE_MAX, ff = SIZE_MAX; int mq = 0; double mf = 0, ms = 0;
+    for (size_t i = 0; i < nq; ++i) if (q0[i] != q1[i]) { ++dq; if (fq == SIZE_MAX) fq = i; mq = std::max(mq, std::abs(int(q0[i]) - int(q1[i]))); }
+    for (size_t i = 0; i < ns; ++i) if (std::memcmp(&s0[i], &s1[i], 4)) { ++ds; ms = std::max(ms, (double) std::fabs(s0[i] - s1[i]) / (std::fabs(s0[i]) + 1e-30)); }
+    for (size_t i = 0; i < n; ++i) if (std::memcmp(&a[i], &b[i], 4)) { ++df; if (ff == SIZE_MAX) ff = i; mf = std::max(mf, (double) std::fabs(a[i] - b[i]) / (std::fabs(a[i]) + 1e-30)); }
+    std::printf("  DIAG %-22s q diff %zu/%zu (first %zd, max |dq| %d)  s diff %zu/%zu (max rel %.3g)  f32 diff %zu/%zu (first %zd, max rel %.3g)\n",
+                tag, dq, nq, (ssize_t) (fq == SIZE_MAX ? -1 : fq), mq, ds, ns, ms, df, n, (ssize_t) (ff == SIZE_MAX ? -1 : ff), mf);
+}
+
 static bool same_f32(const float * d_a, const float * d_b, size_t n) {
     std::vector<float> a(n), b(n);
     CUDA_CK(cudaMemcpy(a.data(), d_a, n * sizeof(float), cudaMemcpyDeviceToHost));
@@ -184,6 +197,7 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         const bool eq = (std::memcmp(hq0.data(), hq1.data(), hq0.size()) == 0) &&
                         (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0) &&
                         same_f32(df32, dfus, hg.size());
+        if (!eq) diag("site", hq0.data(), hq1.data(), hq0.size(), hs0.data(), hs1.data(), hs0.size(), df32, dfus, hg.size());
         std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> f32 + AI4 %s (0-ULP)\n", tag, rows, K, eq ? "PASS" : "FAIL");
         ok &= eq;
 
@@ -231,6 +245,7 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         const bool eq = (std::memcmp(hq0.data(), hq1.data(), hq0.size()) == 0) &&
                         (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0) &&
                         same_f32(df32, dfus, hx.size());
+        if (!eq) diag("site", hq0.data(), hq1.data(), hq0.size(), hs0.data(), hs1.data(), hs0.size(), df32, dfus, hx.size());
         std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> f32 + AI4 %s (0-ULP)\n", tag, rows, K, eq ? "PASS" : "FAIL");
         ok &= eq;
 
@@ -288,6 +303,7 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         const bool eq = (std::memcmp(hq0.data(), hq1.data(), hq0.size()) == 0) &&
                         (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0) &&
                         same_f32(df32, dfus, hg.size());
+        if (!eq) diag("site", hq0.data(), hq1.data(), hq0.size(), hs0.data(), hs1.data(), hs0.size(), df32, dfus, hg.size());
         std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> f32 + NVFP4PF %s (0-ULP)\n", "SITU Inkling NVFP4PF", rows, K, eq ? "PASS" : "FAIL");
         ok &= eq;
         CUDA_CK(cudaFree(dg)); CUDA_CK(cudaFree(du)); CUDA_CK(cudaFree(df32)); CUDA_CK(cudaFree(dfus));
