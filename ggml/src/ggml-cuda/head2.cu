@@ -402,7 +402,9 @@ static __global__ void k_h2_compact(const float * __restrict__ hib, const float 
 
 // exact rows, in the lane order of k_q8a16 (q8a16-kern.cuh): lane l takes blocks l/4 + 8i and weights 8*(l%4)..+7,
 // p = f0*x0 then 7 fmas, acc = fma(d, p, acc), then warp_reduce_sum. Keep the two in step.
-template <int T, int NW>
+// STAGE (mode 2, low planes in mapped host memory): each warp first copies its row's low planes into shared memory
+// with 16-byte loads (one PCIe read per 16 B instead of per 2 B); the arithmetic is unchanged.
+template <int T, int NW, bool STAGE>
 __launch_bounds__(32*NW)
 static __global__ void k_h2_rescore(const uint8_t * __restrict__ hi, const int64_t hs, const uint8_t * __restrict__ lo, const int64_t ls,
         const int nb, const float * __restrict__ x, const int64_t sx, const int * __restrict__ list, const unsigned * __restrict__ cnt,
@@ -415,6 +417,17 @@ static __global__ void k_h2_rescore(const uint8_t * __restrict__ hi, const int64
         const int r = list[i];
         const uint8_t * wh = hi + (int64_t) r*hs;
         const uint8_t * wl = lo + (int64_t) r*ls;
+        if constexpr (STAGE) {
+            extern __shared__ uint4 h2_slo[];
+            uint4 * sl = h2_slo + warp*(ls/16);
+            const uint4 * gl = (const uint4 *) wl;
+            __syncwarp();
+            for (int j = lane; j < ls/16; j += 32) {
+                sl[j] = gl[j];
+            }
+            __syncwarp();
+            wl = (const uint8_t *) sl;
+        }
         float acc[T];
 #pragma unroll
         for (int t = 0; t < T; ++t) {
@@ -546,7 +559,11 @@ static void h2_run(ggml_backend_cuda_context & ctx, const h2_entry & e, const gg
             g_h2_shadow ? flag.get() : nullptr);
     constexpr int NWR = 4;
     const int grid = 8*ggml_cuda_info().devices[ctx.device].nsm;
-    k_h2_rescore<T, NWR><<<grid, 32*NWR, 0, stream>>>(hi, hs, lo, ls, nb, x, sx, list.get(), cnt.get(), dst, sd);
+    if (e.mode == 2) {
+        k_h2_rescore<T, NWR, true><<<grid, 32*NWR, NWR*ls, stream>>>(hi, hs, lo, ls, nb, x, sx, list.get(), cnt.get(), dst, sd);
+    } else {
+        k_h2_rescore<T, NWR, false><<<grid, 32*NWR, 0, stream>>>(hi, hs, lo, ls, nb, x, sx, list.get(), cnt.get(), dst, sd);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     if (g_h2_cnt) {
