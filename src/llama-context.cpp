@@ -6908,6 +6908,25 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         }
         if (prompt) { rows = std::min(rows, dynamic_ubatch_rows); }
     }
+    // fork SCRATCHHOLD: the first writing call after a prompt gave the prompt scratch back (1,024 -> 512 rows at 24 GB)
+    // and the next prompt over 512 rows grew it again. That is two scheduler reserves per request: ~85 ms before the
+    // first prompt ubatch and ~50 ms before the first token (3090 Ti, Inkling 2 Mini 24ink), each freeing and
+    // re-pinning the host compute buffer and re-planning the graph. With no expert cache, streamer, layer-major
+    // lending or shared helper scratch, nothing takes the returned memory, so a call that fits one ubatch at either
+    // size keeps the larger reserve. The ubatch split is unchanged (one ubatch either way), and a ladder cut below
+    // the reserve still shrinks it. Opt-in (port, default off): LLAMA_SCRATCH_HOLD=1; unset or 0 = the give-back. Off with
+    // elastic KV (LLAMA_ELASTIC_KV=1): its KV pages compete for the returned memory.
+    static const bool scratch_hold = [] {
+        const char * e  = getenv("LLAMA_SCRATCH_HOLD");
+        const char * kv = getenv("LLAMA_ELASTIC_KV");
+        return (e && e[0] && atoi(e) != 0) && !(kv && kv[0] && atoi(kv) != 0);
+    }();
+    if (scratch_hold && n_tokens > 0 && rows < sched_reserve_tokens && n_tokens <= rows &&
+            !(dynamic_ubatch && dynamic_ubatch_rows > 0 && dynamic_ubatch_rows < sched_reserve_tokens) &&
+            !moe_cache && !ink_stream && !b1 && !compute_peer && !b1_cache_device_active &&
+            !b1_ffn_scratch_active && !b1_layer_scratch_active) {
+        rows = sched_reserve_tokens;
+    }
     const bool trim_packed = n_tokens == 0 && (b1_ffn_scratch_active || b1_layer_scratch_active);
     // fork UBDEFAULT: a KV-tail loan lives only while the same prompt rows keep running and the cells this call
     // writes (plus the loan's guard) stay clear of the lent tail; anything else gives it back first.
