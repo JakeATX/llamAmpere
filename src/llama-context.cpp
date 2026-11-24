@@ -7753,8 +7753,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
         if (inject_backend) {
             // wait on the host: a device-side wait would stall our queue for the whole target batch,
-            // which trips the Metal command buffer timeout on long prompts
-            ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
+            // which trips the Metal command buffer timeout on long prompts. CUDA has no such timeout: there the
+            // wait goes on our stream, so the host can queue the target's next batch while this one finishes
+            // (a host wait lets the GPU run dry each batch). The target's ev_layer_inp_read wait orders the
+            // rewrite. Opt-in (port, default off): LLAMA_INJECT_DEVICE_WAIT=1; unset or 0 waits on the host everywhere.
+            static const bool dev_wait_env = [] { const char * e = getenv("LLAMA_INJECT_DEVICE_WAIT"); return e && atoi(e) != 0; }();
+            ggml_backend_dev_t idev = ggml_backend_get_device(inject_backend);
+            ggml_backend_reg_t ireg = idev ? ggml_backend_dev_backend_reg(idev) : nullptr;
+            if (dev_wait_env && compute_peer == nullptr && ireg && strcmp(ggml_backend_reg_name(ireg), "CUDA") == 0) {
+                ggml_backend_event_wait(inject_backend, inject_src->ev_layer_inp_written.get());
+            } else {
+                ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
+            }
         } else {
             inject_src->synchronize();
         }
