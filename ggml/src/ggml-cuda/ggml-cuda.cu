@@ -80,6 +80,7 @@
 #include "ggml-cuda/nk-nvfp4-tc.cuh"
 #include "ggml-cuda/nk-q8-moe-tc.cuh"
 #include "ggml-cuda/nk-mask-fill.cuh"
+#include "ggml-cuda/nk-dspark-head.cuh"
 #include "ggml-cuda/nvfp4pf.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
@@ -17732,6 +17733,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "nk_dev_mask") == 0) {
         return ggml_cuda_nk_dev_mask_count();
     }
+    if (strcmp(name, "nk_dspark_head") == 0) {
+        return ggml_cuda_nk_dspark_head_count();
+    }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
     }
@@ -17932,6 +17936,35 @@ static void * ggml_backend_cuda_kv_stream_runtime_new_for_device_impl(
 
 static bool ggml_backend_cuda_share_pool(ggml_backend_t dst, ggml_backend_t src);
 
+static bool ggml_backend_cuda_dspark_head_run(
+        ggml_backend_t backend,
+        bool use_nk,
+        const ggml_tensor * fold_w,
+        const ggml_tensor * latent,
+        const ggml_tensor * fold_bias,
+        const ggml_tensor * base,
+        const ggml_tensor * ids,
+        const ggml_tensor * noise,
+        ggml_tensor       * cand_out,
+        ggml_tensor       * vals_out,
+        ggml_tensor       * prev_out,
+        int64_t             n_eval,
+        int                 sk,
+        float               softcap,
+        float               inv_temp) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    if (use_nk) {
+        return ggml_cuda_nk_dspark_head_launch(*ctx, fold_w, latent, fold_bias, base, ids, noise,
+            cand_out, vals_out, prev_out, n_eval, sk, softcap, inv_temp);
+    }
+    return ggml_cuda_dspark_head_launch_base(*ctx, fold_w, latent, fold_bias, base, ids, noise,
+        cand_out, vals_out, prev_out, n_eval, sk, softcap, inv_temp);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -18052,6 +18085,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_nk_fill_prefix_mask") == 0) {
         return (void *) ggml_backend_cuda_nk_fill_prefix_mask;
+    }
+    if (strcmp(name, "ggml_backend_cuda_dspark_head_run") == 0) {
+        return (void *) ggml_backend_cuda_dspark_head_run;
     }
     if (strcmp(name, "ggml_backend_cuda_mtp_row_wait") == 0) {
         return (void *) ggml_backend_cuda_mtp_row_wait;

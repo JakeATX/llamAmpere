@@ -26569,6 +26569,244 @@ static int run_nk_prefix_mask_check() {
     return fails ? 1 : 0;
 }
 
+// NEONKERN: GGML_TEST_NK_DSPARK_HEAD=1 verifies ggml_cuda_nk_dspark_head_launch bit-for-bit against
+// base ggml_cuda_dspark_head_launch_base across Inkling 2 Mini full/shortlist/multi-seq/edge/all-tied cases,
+// enforces the nk_dspark_head fusion counter, and runs a same-job ABBA microbench.
+static int run_nk_dspark_head_check() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        fprintf(stderr, "nk_dspark_head: no GPU backend\n");
+        return 1;
+    }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using run_fn = bool (*)(ggml_backend_t, bool,
+            const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+            const ggml_tensor *, const ggml_tensor *,
+            ggml_tensor *, ggml_tensor *, ggml_tensor *,
+            int64_t, int, float, float);
+    using cnt_fn = int64_t (*)(ggml_backend_t, const char *);
+    auto run_head = (run_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dspark_head_run");
+    auto cnt      = (cnt_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fusion_count");
+    if (!run_head || !cnt) {
+        fprintf(stderr, "nk_dspark_head: missing proc address (run=%p cnt=%p)\n", (void *) run_head, (void *) cnt);
+        ggml_backend_free(be);
+        return 1;
+    }
+
+    struct head_case {
+        const char * name;
+        int64_t n_full;
+        int64_t n_eval;
+        int     nb;
+        int     sk;
+        bool    sampled;
+        bool    shortlist;
+        bool    all_tied;
+    };
+    const std::vector<head_case> cases = {
+        { "full_sampled_k20",    200058, 200058, 1, 20, true,  false, false },
+        { "full_sampled_k64",    200058, 200058, 1, 64, true,  false, false },
+        { "full_greedy",         200058, 200058, 1,  1, false, false, false },
+        { "shortlist_k20",       200058,  32768, 1, 20, true,  true,  false },
+        { "shortlist_greedy",    200058,  32768, 1,  1, false, true,  false },
+        { "full_nb4_k20",        200058, 200058, 4, 20, true,  false, false },
+        { "full_nb4_greedy",     200058, 200058, 4,  1, false, false, false },
+        { "edge_neval_eq_k",       1024,     20, 1, 20, true,  false, false },
+        { "edge_odd_63",           1024,     63, 1, 20, true,  false, false },
+        { "edge_odd_65",           1024,     65, 1, 20, true,  false, false },
+        { "edge_non4_1001_nb2",    1024,   1001, 2, 32, true,  false, false },
+        { "adversarial_tied",     10000,  10000, 1, 20, true,  false, true  },
+    };
+
+    auto fill_case = [](const head_case & c,
+            std::vector<ggml_fp16_t> & h_w,
+            std::vector<float> & h_lat,
+            std::vector<float> & h_fb,
+            std::vector<float> & h_base,
+            std::vector<int32_t> & h_ids,
+            std::vector<float> & h_noise) {
+        std::mt19937 rng(20261124u + (uint32_t) c.n_eval * 17u + (uint32_t) c.sk * 31u + (uint32_t) c.nb);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        h_w.resize((size_t) c.n_full * 256);
+        h_lat.resize((size_t) c.nb * 256);
+        h_fb.resize((size_t) c.n_eval);
+        h_base.resize((size_t) c.nb * c.n_eval);
+        if (c.all_tied) {
+            std::fill(h_w.begin(), h_w.end(), ggml_fp32_to_fp16(0.0f));
+            std::fill(h_lat.begin(), h_lat.end(), 0.0f);
+            std::fill(h_fb.begin(), h_fb.end(), 500.0f);
+            std::fill(h_base.begin(), h_base.end(), 500.0f);
+        } else {
+            for (size_t i = 0; i < h_w.size(); ++i) {
+                h_w[i] = ggml_fp32_to_fp16(nd(rng) * 0.2f);
+            }
+            for (float & x : h_lat)  x = nd(rng) * 0.25f;
+            for (float & x : h_fb)   x = nd(rng) * 0.5f;
+            for (float & x : h_base) x = nd(rng) * 3.0f;
+        }
+        if (c.shortlist) {
+            h_ids.resize((size_t) c.n_eval);
+            for (int64_t i = 0; i < c.n_eval; ++i) {
+                h_ids[(size_t) i] = (int32_t) (((i * 2654435761ull) >> 1) % (uint64_t) c.n_full);
+            }
+        } else {
+            h_ids.clear();
+        }
+        if (c.sampled) {
+            h_noise.resize((size_t) c.nb * c.sk);
+            for (float & x : h_noise) x = nd(rng) * 0.5f;
+        } else {
+            h_noise.clear();
+        }
+    };
+
+    int fails = 0;
+    const float softcap  = 30.0f;
+    const float inv_temp = 1.0f;
+
+    for (const auto & c : cases) {
+        ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t_w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, c.n_full);
+        ggml_tensor * t_lat   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, c.nb);
+        ggml_tensor * t_fb    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.n_eval);
+        ggml_tensor * t_base  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.n_eval, c.nb);
+        ggml_tensor * t_ids   = c.shortlist ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.n_eval) : nullptr;
+        ggml_tensor * t_noise = c.sampled   ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+
+        ggml_tensor * t_cand_nk  = c.sampled ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_vals_nk  = c.sampled ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_prev_nk  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.nb);
+        ggml_tensor * t_cand_ref = c.sampled ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_vals_ref = c.sampled ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_prev_ref = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.nb);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::vector<ggml_fp16_t> h_w;
+        std::vector<float> h_lat, h_fb, h_base, h_noise;
+        std::vector<int32_t> h_ids;
+        fill_case(c, h_w, h_lat, h_fb, h_base, h_ids, h_noise);
+
+        ggml_backend_tensor_set(t_w,    h_w.data(),    0, h_w.size()    * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_lat,  h_lat.data(),  0, h_lat.size()  * sizeof(float));
+        ggml_backend_tensor_set(t_fb,   h_fb.data(),   0, h_fb.size()   * sizeof(float));
+        ggml_backend_tensor_set(t_base, h_base.data(), 0, h_base.size() * sizeof(float));
+        if (t_ids)   ggml_backend_tensor_set(t_ids,   h_ids.data(),   0, h_ids.size()   * sizeof(int32_t));
+        if (t_noise) ggml_backend_tensor_set(t_noise, h_noise.data(), 0, h_noise.size() * sizeof(float));
+
+        const int64_t c0 = cnt(be, "nk_dspark_head");
+        const bool ok_ref = run_head(be, false, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
+                t_cand_ref, t_vals_ref, t_prev_ref, c.n_eval, c.sk, softcap, inv_temp);
+        const int64_t c1 = cnt(be, "nk_dspark_head");
+        const bool ok_nk = run_head(be, true, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
+                t_cand_nk, t_vals_nk, t_prev_nk, c.n_eval, c.sk, softcap, inv_temp);
+        const int64_t c2 = cnt(be, "nk_dspark_head");
+        ggml_backend_synchronize(be);
+
+        std::vector<int32_t> prev_nk((size_t) c.nb), prev_ref((size_t) c.nb);
+        ggml_backend_tensor_get(t_prev_nk,  prev_nk.data(),  0, prev_nk.size()  * sizeof(int32_t));
+        ggml_backend_tensor_get(t_prev_ref, prev_ref.data(), 0, prev_ref.size() * sizeof(int32_t));
+
+        bool eq_prev = std::memcmp(prev_nk.data(), prev_ref.data(), prev_nk.size() * sizeof(int32_t)) == 0;
+        bool eq_cand = true;
+        bool eq_vals = true;
+        if (c.sampled) {
+            std::vector<int32_t> cand_nk((size_t) c.nb * c.sk), cand_ref((size_t) c.nb * c.sk);
+            std::vector<float>   vals_nk((size_t) c.nb * c.sk), vals_ref((size_t) c.nb * c.sk);
+            ggml_backend_tensor_get(t_cand_nk,  cand_nk.data(),  0, cand_nk.size()  * sizeof(int32_t));
+            ggml_backend_tensor_get(t_cand_ref, cand_ref.data(), 0, cand_ref.size() * sizeof(int32_t));
+            ggml_backend_tensor_get(t_vals_nk,  vals_nk.data(),  0, vals_nk.size()  * sizeof(float));
+            ggml_backend_tensor_get(t_vals_ref, vals_ref.data(), 0, vals_ref.size() * sizeof(float));
+            eq_cand = std::memcmp(cand_nk.data(), cand_ref.data(), cand_nk.size() * sizeof(int32_t)) == 0;
+            eq_vals = std::memcmp(vals_nk.data(), vals_ref.data(), vals_nk.size() * sizeof(float)) == 0;
+        }
+        const bool ok_cnt = (c1 == c0) && (c2 == c1 + 1);
+        const bool pass = ok_ref && ok_nk && eq_prev && eq_cand && eq_vals && ok_cnt;
+        if (!pass) {
+            ++fails;
+            printf("NK_DSPARK_HEAD(%s): FAIL ok_ref=%d ok_nk=%d prev=%d cand=%d vals=%d cnt=(%lld,%lld)\n",
+                   c.name, ok_ref, ok_nk, eq_prev, eq_cand, eq_vals, (long long) (c1 - c0), (long long) (c2 - c1));
+        } else {
+            printf("NK_DSPARK_HEAD(%s): OK (bit-exact, cnt=+1)\n", c.name);
+        }
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    // Same-job ABBA microbench on the exact Inkling 2 Mini DSpark head shapes
+    const std::vector<head_case> perf_cases = {
+        { "full_sampled_k20",    200058, 200058, 1, 20, true,  false, false },
+        { "full_greedy",         200058, 200058, 1,  1, false, false, false },
+        { "shortlist_k20",       200058,  32768, 1, 20, true,  true,  false },
+        { "full_nb4_k20",        200058, 200058, 4, 20, true,  false, false },
+    };
+    const int warmup = 20;
+    const int iters  = 200;
+    for (const auto & c : perf_cases) {
+        ggml_init_params ip = { 12 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * t_w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, c.n_full);
+        ggml_tensor * t_lat   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, c.nb);
+        ggml_tensor * t_fb    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.n_eval);
+        ggml_tensor * t_base  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.n_eval, c.nb);
+        ggml_tensor * t_ids   = c.shortlist ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.n_eval) : nullptr;
+        ggml_tensor * t_noise = c.sampled   ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_cand  = c.sampled   ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_vals  = c.sampled   ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.sk, c.nb) : nullptr;
+        ggml_tensor * t_prev  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.nb);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+
+        std::vector<ggml_fp16_t> h_w;
+        std::vector<float> h_lat, h_fb, h_base, h_noise;
+        std::vector<int32_t> h_ids;
+        fill_case(c, h_w, h_lat, h_fb, h_base, h_ids, h_noise);
+
+        ggml_backend_tensor_set(t_w,    h_w.data(),    0, h_w.size()    * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(t_lat,  h_lat.data(),  0, h_lat.size()  * sizeof(float));
+        ggml_backend_tensor_set(t_fb,   h_fb.data(),   0, h_fb.size()   * sizeof(float));
+        ggml_backend_tensor_set(t_base, h_base.data(), 0, h_base.size() * sizeof(float));
+        if (t_ids)   ggml_backend_tensor_set(t_ids,   h_ids.data(),   0, h_ids.size()   * sizeof(int32_t));
+        if (t_noise) ggml_backend_tensor_set(t_noise, h_noise.data(), 0, h_noise.size() * sizeof(float));
+
+        auto time_leg = [&](bool use_nk) -> double {
+            for (int w = 0; w < warmup; ++w) {
+                run_head(be, use_nk, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
+                        t_cand, t_vals, t_prev, c.n_eval, c.sk, softcap, inv_temp);
+            }
+            ggml_backend_synchronize(be);
+            const int64_t t0 = ggml_time_us();
+            for (int i = 0; i < iters; ++i) {
+                run_head(be, use_nk, t_w, t_lat, t_fb, t_base, t_ids, t_noise,
+                        t_cand, t_vals, t_prev, c.n_eval, c.sk, softcap, inv_temp);
+            }
+            ggml_backend_synchronize(be);
+            return (double) (ggml_time_us() - t0) / iters;
+        };
+
+        const double a1 = time_leg(false);
+        const double b1 = time_leg(true);
+        const double b2 = time_leg(true);
+        const double a2 = time_leg(false);
+        const double base_us = 0.5 * (a1 + a2);
+        const double nk_us   = 0.5 * (b1 + b2);
+        const double bytes   = (double) c.nb * (double) c.n_eval * (512.0 + 4.0 + 4.0 + (c.shortlist ? 4.0 : 0.0));
+        printf("NK_DSPARK_HEAD perf %-18s (%.1f MB): base=%.2f us (%.0f GB/s) -> nk=%.2f us (%.0f GB/s) | delta=%+.2f us (%+.1f%%) | 4x=%+.1f us/r\n",
+               c.name, bytes / 1e6, base_us, bytes / (base_us * 1e3), nk_us, bytes / (nk_us * 1e3),
+               nk_us - base_us, (nk_us / base_us - 1.0) * 100.0, 4.0 * (nk_us - base_us));
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(be);
+    printf("nk_dspark_head: %s (%d fails)\n", fails ? "FAIL" : "PASS", fails);
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     // the expert-bank MUL_MAT_ID cases pass skipped (-1 / out-of-stack) ids without loading a bank model; the CUDA
     // backend zeroes their outputs only when told to (or when a hot-bank model is loaded)
@@ -26579,6 +26817,9 @@ int main(int argc, char ** argv) {
 #endif
     if (getenv("GGML_TEST_NK_PREFIX_MASK") != nullptr) {
         return run_nk_prefix_mask_check();
+    }
+    if (getenv("GGML_TEST_NK_DSPARK_HEAD") != nullptr) {
+        return run_nk_dspark_head_check();
     }
     if (const char * ad = getenv("GGML_TEST_AIT_DIR")) {
         return run_ait_check(ad);
