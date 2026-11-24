@@ -1310,6 +1310,8 @@ struct mtmd_model_params {
     int32_t image_min_tokens = -1;
     int32_t image_max_tokens = -1;
     bool no_alloc = false; // only create the tensors, do not read their data
+    ggml_backend_buffer_type_t host_weights_buft = nullptr; // pinned host buffer type for the weights, nullptr = off
+    bool host_weights_strict = false; // fail the load if pinning fails
     mtmd_progress_callback progress_callback = nullptr;
     void * progress_callback_user_data = nullptr;
 };

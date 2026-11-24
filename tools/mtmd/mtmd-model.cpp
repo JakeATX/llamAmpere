@@ -1327,8 +1327,13 @@ struct mtmd_model_loader {
         }
     }
 
-    void load_tensors(mtmd_model & model, ggml_backend_buffer_type_t buft, bool no_alloc) {
+    void load_tensors(mtmd_model & model, ggml_backend_buffer_type_t buft, const mtmd_model_params & model_params) {
         auto & hparams = model.hparams;
+        const bool no_alloc = model_params.no_alloc;
+        // host weights count as host memory; the largest weight stays on the device as extra headroom (scheduler copies are in mem_compute; this is not a bound for cuBLAS F16 conversion of quantized weights)
+        ggml_backend_buffer_type_t host_weights_buft = model_params.host_weights_buft;
+        ggml_backend_dev_t weights_dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
@@ -1377,7 +1382,12 @@ struct mtmd_model_loader {
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
                 // add to weight memory counter
-                model.mem_weights[ggml_backend_buft_get_device(buft)] += ggml_nbytes(cur);
+                if (host_weights_buft) {
+                    model.mem_weights[cpu_dev] += ggml_nbytes(cur);
+                    model.mem_weights[weights_dev] = std::max(model.mem_weights[weights_dev], ggml_nbytes(cur));
+                } else {
+                    model.mem_weights[weights_dev] += ggml_nbytes(cur);
+                }
             }
             return cur;
         };
@@ -3548,7 +3558,26 @@ struct mtmd_model_loader {
             }
 
             // alloc memory and offload data
-            model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), buft));
+            // weights in pinned host memory, compute stays on the GPU; uses CUDA_Host_W, not the shared host buft that holds model inputs
+            if (host_weights_buft) {
+                model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), host_weights_buft));
+                if (model.buf) {
+                    buft = host_weights_buft;
+                    LOG_INF("%s: --mmproj-host-weights: projector weights in host memory, buffer \"%s\"\n",
+                            __func__, ggml_backend_buft_name(host_weights_buft));
+                } else if (model_params.host_weights_strict && !no_alloc) {
+                    // the memory fit counted these weights as host memory, so device memory may not have room for them
+                    throw std::runtime_error(mtmd_format("%s: --mmproj-host-weights: failed to pin host memory after the memory fit; free host RAM, or use --fit off or --no-mmproj-host-weights\n", __func__));
+                } else {
+                    LOG_WRN("%s: --mmproj-host-weights: failed to pin host memory, weights stay in device memory\n", __func__);
+                    // the weights are in device memory after all, move them back in the estimate
+                    model.mem_weights[weights_dev] = model.mem_weights[cpu_dev];
+                    model.mem_weights.erase(cpu_dev);
+                }
+            }
+            if (!model.buf) {
+                model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), buft));
+            }
             ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!no_alloc) {
@@ -3755,7 +3784,7 @@ mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params
         model->hparams.custom_image_min_tokens = params.image_min_tokens;
         model->hparams.custom_image_max_tokens = params.image_max_tokens;
         loader.load_hparams(*model, modality);
-        loader.load_tensors(*model, buft, params.no_alloc);
+        loader.load_tensors(*model, buft, params);
         return model;
     };
 
