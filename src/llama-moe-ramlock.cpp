@@ -173,9 +173,9 @@ void llama_moe_ramlock::rerank() {
     for (double & h : heat) {
         h *= 0.5;
     }
-    // the first re-ranks at INFO (so a smoke run shows the lock working), later ones at DEBUG
+    // the first re-ranks at WARN (the server log hides library INFO; so a smoke run shows the lock working), later ones at DEBUG
     if (++n_rerank <= 4) {
-        LLAMA_LOG_INFO("%s: [RAMLOCK] re-rank %zu: %.3f GiB locked, %zu experts ranked\n", __func__, n_rerank,
+        LLAMA_LOG_WARN("%s: [RAMLOCK] re-rank %zu: %.3f GiB locked, %zu experts ranked\n", __func__, n_rerank,
                 locked_bytes/1024.0/1024.0/1024.0, order.size());
     } else {
         LLAMA_LOG_DEBUG("%s: [RAMLOCK] %.3f GiB locked\n", __func__, locked_bytes/1024.0/1024.0/1024.0);
@@ -198,6 +198,6 @@ llama_moe_ramlock::~llama_moe_ramlock() {
             lock_one((int32_t) k, false);
         }
     }
-    LLAMA_LOG_INFO("%s: [RAMLOCK] %.2f GiB were locked at exit, %zu lock calls\n", __func__,
+    LLAMA_LOG_WARN("%s: [RAMLOCK] %.2f GiB were locked at exit, %zu lock calls\n", __func__,
             locked_bytes/1024.0/1024.0/1024.0, n_lock_calls);
 }

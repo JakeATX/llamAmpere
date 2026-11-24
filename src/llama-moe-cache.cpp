@@ -827,7 +827,7 @@ struct llama_moe_cache::impl {
             }
             if (prefetch) {
                 pf_pred.assign(model.hparams.n_expert, 0);
-                LLAMA_LOG_INFO("%s: [NEXTPF] decode lookups upload up to %d experts of the next layer ahead (LLAMA_MOE_CACHE_NEXT_PREFETCH)\n",
+                LLAMA_LOG_WARN("%s: [NEXTPF] decode lookups upload up to %d experts of the next layer ahead (LLAMA_MOE_CACHE_NEXT_PREFETCH)\n",
                         __func__, prefetch->budget());
             }
         }
@@ -910,7 +910,7 @@ struct llama_moe_cache::impl {
     ~impl() {
         if (prefetch) {
             prefetch->wait();
-            LLAMA_LOG_INFO("llama_moe_cache: [NEXTPF] %zu experts uploaded ahead in %zu rounds (%.2f MiB), %zu of them used (%.1f%%)\n",
+            LLAMA_LOG_WARN("llama_moe_cache: [NEXTPF] %zu experts uploaded ahead in %zu rounds (%.2f MiB), %zu of them used (%.1f%%)\n",
                     prefetch->n_prefetched, prefetch->n_rounds, prefetch->n_bytes/1024.0/1024.0, prefetch->n_used,
                     prefetch->n_prefetched ? 100.0*prefetch->n_used/prefetch->n_prefetched : 0.0);
             prefetch.reset();
