@@ -82,7 +82,8 @@ private:
         std::vector<ggml_tensor *>       views;  // device views in the slot of this visit (same order)
         std::vector<size_t>              offs;   // offset of each view in the slot
         std::vector<size_t>              tails;  // bytes after each tensor that the kernels may read: uploaded as zeros
-        int slot = -1;                           // 0 or 1
+        int slot = -1;                           // 0 or 1 (streamed), 2 + grp (CORERES: resident for the prompt)
+        int grp  = -1;                           // CORERES: index of its physical core layer (visited more than once)
         int pos  = -1;                           // index in order
         ggml_tensor * map = nullptr;
         bool   direct      = false;              // fork (GS11): host experts page-locked, queued without staging
@@ -114,14 +115,19 @@ private:
     ggml_context * ctx_map  = nullptr;     // maps
     ggml_backend_buffer_t buf_map  = nullptr;
     ggml_backend_buffer_t buf_slot = nullptr;
-    ggml_tensor * raw[2] = { nullptr, nullptr };
+    std::vector<ggml_tensor *> raw;        // [2 + n_core]: the two streamed slots, then one region per resident core layer
 
     // copy pipeline
     ggml_backend_t backend_copy = nullptr;
-    ggml_backend_event_t ev_free[2]  = { nullptr, nullptr };
-    ggml_backend_event_t ev_ready[2] = { nullptr, nullptr };
+    std::vector<ggml_backend_event_t> ev_free;  // [2 + n_core]
+    std::vector<ggml_backend_event_t> ev_ready; // [2 + n_core]
     ggml_backend_event_t ev_list = nullptr; // upload_wait(): the last piece is on the card
-    int issued[2] = { -1, -1 }; // visit last queued into each slot
+    std::vector<int> issued;   // [2 + n_core] visit last queued into each slot (a resident region: any visit, once per arm)
+    // fork (CORERES): LLAMA_INK_CORERES=N keeps the experts of N core layers (the layers a looped model visits on every
+    // pass) in VRAM for the whole armed prompt, uploaded once instead of on every pass; 0 (default) = two slots only
+    int n_core   = 0;          // physical layers visited more than once
+    int res_want = 0;
+    int n_res    = 0;          // resident regions of this arm
 
     int    n_workers = 4;
     size_t piece_max = 8u << 20;
