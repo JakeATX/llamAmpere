@@ -3363,7 +3363,7 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
-// NEONKERN: LLAMA_NK_KV_PAD=1|N (unset/0 -> base 256; llama sets 4096 for the Inkling family, see llama_model_load): coarser n_kv padding step during deep-context
+// NEONKERN: LLAMA_NK_KV_PAD=1|N (unset/0 -> base 256; the arch-defaults table sets 4096 for the Inkling family, common/arch-defaults.cpp): coarser n_kv padding step during deep-context
 // full-attention decode (swa_type == NONE, n_tps <= 32, used >= 4096) to reduce 256-token graph rebuild and
 // CUDA graph recapture spikes. =1 selects 2048 (8x fewer recaptures; stays <= 1 MiB upload ring even solo at 100K);
 // explicit N >= 256 selects a multiple-of-256 step up to 16384 (e.g. 4096). Unset or =0 = exact base 256.
@@ -4985,7 +4985,7 @@ bool llama_kq_mask_device_enabled() {
     return v;
 }
 
-// NEONKERN: LLAMA_NK_DEV_MASK=1 (unset = off; llama sets it to 1 for the Inkling family, see llama_model_load; =0 disables):
+// NEONKERN: LLAMA_NK_DEV_MASK=1 (unset = off; the arch-defaults table sets it to 1 for the Inkling family, common/arch-defaults.cpp; =0 disables):
 // defer non-causal dense F16 prefix masks (DSpark draft blocks)
 // and SJ-KVaRN F16 far masks to a vectorized GPU prefix-fill kernel, eliminating ~2.6 MB/round of host mask
 // builds and PCIe uploads at 100K decode. Unset or =0 = exact base behavior.

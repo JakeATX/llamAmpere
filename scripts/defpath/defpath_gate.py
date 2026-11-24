@@ -65,7 +65,7 @@ def engaged(log):
             on, lines = True, [l]
             continue
         if on:
-            if re.search(r'\s\[(ON|OFF|OVERRIDE|N/A) *\]', l) or 'lever(s) differ' in l or 'all levers match' in l or 'no arch-defaults row' in l:
+            if re.search(r'\s\[(ON|OFF|OVERRIDE|N/A|MISMATCH) *\]', l) or 'lever(s) differ' in l or 'all levers match' in l or 'no arch-defaults row' in l:
                 lines.append(l)
                 m = re.search(r'lever\(s\) differ from the \S+ best config: (.*)$', l)
                 if m: differ = [x.strip() for x in m.group(1).split(',')]
@@ -89,6 +89,11 @@ def main():
     ap.add_argument('--strict-engage', action='store_true'); ap.add_argument('--dry-run', action='store_true')
     a = ap.parse_args()
     tab = table(a.src); proto = tab['protocol']
+    # fork DEFSYNC: the table must agree with the code before a gate means anything (status vs runtime default, hidden setters)
+    chk = subprocess.run([sys.executable, str(HERE / 'check_table.py'), '--root', str(Path(a.src).resolve().parents[1])], capture_output=True, text=True)
+    print(chk.stdout.strip().splitlines()[-1] if chk.stdout.strip() else 'CHECK_TABLE no output')
+    if chk.returncode != 0:
+        print('\n'.join(l for l in chk.stdout.splitlines() if l.startswith('FAIL'))); print('FAIL arch-defaults table disagrees with the code'); return 4
     plen = a.plen or proto['fill']; npred = a.npred or proto['npred']; tol = proto['fail_if_default_slower_pct'] if a.tol is None else a.tol
     arch = gguf_arch(a.model); row = row_for(tab, arch)
     print(f'DEFPATH gate: table {tab["version"]}, model {a.model}, arch {arch or "?"}, card {a.card}, fill {plen}, npred {npred}, seeds {a.seeds}, tol {tol}%')
