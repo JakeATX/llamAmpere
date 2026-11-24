@@ -280,9 +280,10 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
         const int v = value ? atoi(value) : 0;
         return v >= 256 && v % 256 == 0 ? v : 0;
     }();
-    if (!lse && (grouped_f16 || force_chunk_kv > 0) && trellis && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
-            Q->ne[2] % K->ne[2] == 0 && gqa <= 8 && ggml_is_contiguous(dst)) {
-        // [TRPF] KV chunks: K/V chunk (all heads) + one launch's partials + metas + the running (max, sum) per row
+    const bool chunk_ok = !lse && kv_chunks && dst->src[3] != nullptr && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 &&
+            Q->ne[2] % K->ne[2] == 0 && gqa <= 8 && ggml_is_contiguous(dst);
+    // [TRPF] KV chunks: K/V chunk (all heads) + one launch's partials + metas + the running (max, sum) per row
+    auto make_chunked = [&]() {
         const size_t n_head = Q->ne[2];
         const size_t acc_meta_bytes = size_t(Q->ne[1])*n_head*sizeof(float2);
         const size_t per_query = n_head*(256*sizeof(float) + sizeof(float2));
@@ -309,8 +310,11 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
             p.output_elements_per_head = output_elements_per_head;
             p.scratch_bytes = GGML_PAD(2*p.kv_elements*sizeof(half), 128) + GGML_PAD(p.parts_bytes, 128) +
                 GGML_PAD(p.meta_bytes, 128) + acc_meta_bytes;
-            return finish();
         }
+        return p.ok;
+    };
+    if ((grouped_f16 || force_chunk_kv > 0) && trellis && chunk_ok && make_chunked()) {
+        return finish();
     }
     if (grouped) {
         static const bool head_groups = [] {
@@ -323,6 +327,11 @@ static fattn_sj_kvarn_prefill_plan fattn_sj_kvarn_prefill_make_plan(const int cc
         }
         heads_per_group = std::min(size_t(K->ne[2]), budget/(kv_bytes_per_head + output_bytes_per_head + i8qk_bytes_per_head));
         if (heads_per_group == 0) {
+            // 4/4: one KV head's f16 K/V (+ int8 K + output) no longer fits the budget (Qwen3.8 27B at -ub 512: n_kv
+            // above ~207K). Without a plan the node fell back to the per-tile kernel, ~30x slower; run KV chunks instead.
+            if (!trellis && chunk_ok && make_chunked()) {
+                return finish();
+            }
             return p;
         }
     }
@@ -442,11 +451,13 @@ bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, 
                 (const char *) K->data, (const char *) V->data,
                 ggml_cuda_qsa_resident_body(dst->src[5]), (const int32_t *) dst->src[6]->data,
                 K->nb[1], K->nb[2], V->nb[1], V->nb[2],
-                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, 0, true,
+                (half2 *) K_chunk, (half2 *) (K_chunk + elements), cn, c0, 0, trellis,
                 dst->src[3] && dst->src[3]->ne[2] == 1 && dst->src[3]->ne[3] == 1 ? (const char *) dst->src[3]->data : nullptr,
                 dst->src[3] ? dst->src[3]->nb[1] : 0, Q->ne[1], dst->src[3] && dst->src[3]->type == GGML_TYPE_I32);
             CUDA_CHECK(cudaGetLastError());
-            expand_body((half2 *) K_chunk, (half2 *) (K_chunk + elements), elements, cn, c0, heads, 0);
+            if (trellis) {
+                expand_body((half2 *) K_chunk, (half2 *) (K_chunk + elements), elements, cn, c0, heads, 0);
+            }
 
             ggml_tensor k = *K;
             ggml_tensor v = *V;
