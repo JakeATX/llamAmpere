@@ -13,6 +13,7 @@
 // GGML_CUDA_FA_I8QK_PV16 and GGML_CUDA_FA_I8QK_KCB default to 1; =0 disables each (PV16=0 uses f32 P.V accumulation).
 // Opt-in variants (fattn-i8qk.cu, i8qk_modes): GGML_CUDA_FA_I8QK_QH=1 (Q scale per 128-dim half),
 // GGML_CUDA_FA_I8QK_Q2L=1 (two-limb Q), GGML_CUDA_FA_I8QK_KBLK=0|n (no K smoothing / block-frozen K offsets).
+// GGML_CUDA_FA_I8QK_FLAGCACHE=1 reuses read-only mask classes within one graph evaluation (main stream, outside capture).
 // Quantized K and V caches only (q8_0, turbo2/3/4, tq5_0, tq6_0). No new
 // VRAM: the int8 K and the f16 V reuse the f16 K/V reservation the allocator already made for the f16 route behind dst
 // (bounded prefill workspace or the generic f16 copies); without that reservation the op keeps the f16 route.

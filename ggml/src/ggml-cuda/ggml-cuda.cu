@@ -1352,6 +1352,7 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
     for (const auto & r : q8_cache.retired) {
         free_buf(r.ptr, r.dev);
     }
+    free_buf(i8qk_flags.ptr, i8qk_flags.dev);
     free_buf(mmq_prefill_cache.ptr, mmq_prefill_cache.dev);
     for (const auto & r : mmq_prefill_cache.retired) {
         free_buf(r.ptr, r.dev);
@@ -1385,6 +1386,8 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
     }
 
     q8_cache = {};
+    i8qk_flags = {};
+    i8qk_mask_graph = nullptr;
     mmq_prefill_cache = {};
     ink_situq = {};
     tq_rot_cache = {};
@@ -15996,7 +15999,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif
     }
 
+    cuda_ctx->i8qk_mask_graph = cgraph;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    cuda_ctx->i8qk_mask_graph = nullptr;
 
     return GGML_STATUS_SUCCESS;
 }

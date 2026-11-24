@@ -1675,6 +1675,22 @@ struct ggml_backend_cuda_context {
     // collide into one decorated name and the linker rejects the object (LNK1179).
     struct retired_buf { char * ptr; size_t cap; int dev; };
 
+    // fork: mask classes shared by attention layers on the main stream of one graph evaluation.
+    struct {
+        char * ptr = nullptr;
+        size_t cap = 0;
+        int dev = -1;
+        const ggml_tensor * mask = nullptr;
+        const void * data = nullptr;
+        uint64_t epoch = 0;
+        ggml_type type = GGML_TYPE_F16;
+        int64_t stride = 0;
+        int n_q = 0;
+        int n_qtiles = 0;
+        int n_ktiles = 0;
+    } i8qk_flags;
+    const ggml_cgraph * i8qk_mask_graph = nullptr;
+
     // Two entries: a layer can quantize one activation in both layouts (IQ4_XS swizzled and plain)
     // and read the first layout again after the second one.
     struct q8_cache_entry {

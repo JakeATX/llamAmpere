@@ -612,6 +612,7 @@ endif()
 
 llama_build_and_test(test-backend-ops.cpp LINK ggml Threads::Threads)
 llama_build_and_test(test-fattn-prefill-policy.cpp)
+llama_build(test-i8qk-flagcache.cpp)
 llama_build_and_test(test-fa-skip-dead.cpp) # [ROUNDFIX] dead-tile skip bit-identity; skips without a GPU backend
 llama_build_and_test(test-topk-select-fast.cpp) # [ROUNDFIX] fast radix select bit-identity; skips without a GPU backend
 llama_build_and_test(test-lid-gather.cpp) # [ROUNDFIX] pooled-key gather read in place, bit-identity; skips without a GPU backend

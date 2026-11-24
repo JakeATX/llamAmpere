@@ -14,6 +14,44 @@
 
 static constexpr int i8qk_nthreads = I8QK_NW*WARP_SIZE;
 
+static bool ggml_cuda_fattn_i8qk_flagcache() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_FA_I8QK_FLAGCACHE");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return enabled;
+}
+
+static bool i8qk_mask_is_read_only(const ggml_cgraph * graph, const ggml_tensor * mask) {
+    if (graph == nullptr || mask->data == nullptr) {
+        return false;
+    }
+    // Internal expanded/view descriptors can live on the stack and reuse pool
+    // storage for different masks. Only cache the graph's actual mask tensor.
+    bool graph_mask = false;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        graph_mask |= node->op == GGML_OP_FLASH_ATTN_EXT && node->src[3] == mask;
+    }
+    if (!graph_mask) {
+        return false;
+    }
+    const uintptr_t begin = (uintptr_t) mask->data;
+    const size_t bytes = ggml_nbytes(mask);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE || node->data == nullptr) {
+            continue;
+        }
+        const uintptr_t out = (uintptr_t) node->data;
+        if (out >= begin ? out - begin < bytes : begin - out < ggml_nbytes(node)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_cuda_fattn_i8qk_enabled() {
     static const bool v = [] {
         const char * e = getenv("GGML_CUDA_FA_I8QK");
@@ -1104,7 +1142,11 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
     if (kblk < 0 || !kcb) {
         kmean.alloc((size_t) heads*nblk*D);
     }
-    ggml_cuda_pool_alloc<uint8_t> flags(pool, (size_t) n_qtiles*n_ktiles);
+    // flag unset: allocate at the same point as before the cache existed (same pool order and footprint)
+    ggml_cuda_pool_alloc<uint8_t> flags(pool);
+    if (!ggml_cuda_fattn_i8qk_flagcache()) {
+        flags.alloc((size_t) n_qtiles*n_ktiles);
+    }
 
     if (kcb) {
         // codebook-direct int8 K straight from the cache codes (#152): mean pass + one quant pass, no f16 staging
@@ -1185,13 +1227,47 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
     }
 
     // 5. mask classes per (query tile, KV tile)
+    const size_t n_flags = (size_t) n_qtiles*n_ktiles;
+    uint8_t * flags_ptr = nullptr;
     if (mask != nullptr) {
         const int64_t mask_stride = mask->type == GGML_TYPE_I32 ? -int64_t(mask->nb[1]/sizeof(uint32_t)) : int64_t(mask->nb[1]/sizeof(half));
-        i8qk_tile_flags<<<dim3(n_ktiles, n_qtiles), 256, 0, stream>>>((const half *) mask->data, mask_stride,
-                                                                     n_q, flags.ptr);
-        CUDA_CHECK(cudaGetLastError());
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        const bool enabled = ggml_cuda_fattn_i8qk_flagcache() && ctx.curr_stream_no == 0;
+        if (enabled) {
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        }
+        auto & fc = ctx.i8qk_flags;
+        const bool use_cache = enabled && capture == cudaStreamCaptureStatusNone && n_flags <= 32*1024*1024 &&
+                i8qk_mask_is_read_only(ctx.i8qk_mask_graph, mask);
+        const bool hit = use_cache && fc.ptr && fc.epoch == ctx.graph_epoch && fc.mask == mask && fc.data == mask->data &&
+                fc.type == mask->type && fc.stride == mask_stride && fc.n_q == n_q &&
+                fc.n_qtiles == n_qtiles && fc.n_ktiles == n_ktiles;
+        if (hit) {
+            flags_ptr = (uint8_t *) fc.ptr;
+        } else {
+            if (use_cache) {
+                if (fc.cap < n_flags) {
+                    if (fc.ptr) {
+                        CUDA_CHECK(cudaFree(fc.ptr));
+                    }
+                    fc = {};
+                    fc.cap = GGML_PAD(n_flags, 4096);
+                    CUDA_CHECK(cudaMalloc(&fc.ptr, fc.cap));
+                    fc.dev = ctx.device;
+                }
+                fc.epoch = ctx.graph_epoch;
+                fc.mask = mask; fc.data = mask->data; fc.type = mask->type; fc.stride = mask_stride;
+                fc.n_q = n_q; fc.n_qtiles = n_qtiles; fc.n_ktiles = n_ktiles;
+                flags_ptr = (uint8_t *) fc.ptr;
+            } else {
+                flags_ptr = flags.ptr ? flags.ptr : flags.alloc(n_flags);
+            }
+            i8qk_tile_flags<<<dim3(n_ktiles, n_qtiles), 256, 0, stream>>>((const half *) mask->data, mask_stride, n_q, flags_ptr);
+            CUDA_CHECK(cudaGetLastError());
+        }
     } else {
-        CUDA_CHECK(cudaMemsetAsync(flags.ptr, 1, (size_t) n_qtiles*n_ktiles, stream));
+        flags_ptr = flags.ptr ? flags.ptr : flags.alloc(n_flags);
+        CUDA_CHECK(cudaMemsetAsync(flags_ptr, 1, n_flags, stream));
     }
 
     // 6. attention
@@ -1202,7 +1278,7 @@ static void ggml_cuda_flash_attn_ext_i8qk_impl(ggml_backend_cuda_context & ctx, 
     const char * Qp = (const char *) Q->data + (size_t) first*gqa*Q->nb[2];
     float * dstp = (float *) dst->data + (size_t) first*gqa*D;
 #define I8QK_LAUNCH(PV16, NS, Q2L, KBF) i8qk_launch_attn<D, PV16, NS, Q2L, KBF>(dst, Qp, Kq, ksc.ptr, Vp, v_nb1, v_nb2, \
-        flags.ptr, n_qtiles, n_ktiles, dstp, heads, gqa, n_q, n_kv, scale_log2, kmean.ptr, kblk/I8QK_BN, nblk, stream)
+        flags_ptr, n_qtiles, n_ktiles, dstp, heads, gqa, n_q, n_kv, scale_log2, kmean.ptr, kblk/I8QK_BN, nblk, stream)
 #define I8QK_LAUNCH_PV16(NS) \
         if (md.q2l) { if (kbf) { I8QK_LAUNCH(true, NS, true,  true); } else { I8QK_LAUNCH(true, NS, true,  false); } } \
         else        { if (kbf) { I8QK_LAUNCH(true, NS, false, true); } else { I8QK_LAUNCH(true, NS, false, false); } }
