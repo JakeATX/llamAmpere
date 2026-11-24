@@ -7,6 +7,6 @@ bool ggml_cuda_depth_mix_supported(const ggml_tensor * op);
 
 // [INKGLUE] depth mix (one query) + RMS_NORM(neps) + MUL(w) into ndst; false: not this shape
 // aq / as (optional): also the AI+ H256 activation of the normed rows (rq4::quantize_act layout), n % 256 == 0
-// prefill_mode (0 = legacy AI4 MIXQ, 1 = prefill AI4 H256 from SMEM, 232/264 = NVFP4PF KF=32/64 from SMEM; write_f32=false elides ndst store when SMEM active)
+// nvfp4_kf = 32 / 64 (needs aq / as): the NVFP4PF activation (k_nvfp4pf_xq layout) instead, n % nvfp4_kf == 0
 bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * w, ggml_tensor * ndst, float neps,
-        int8_t * aq = nullptr, float * as = nullptr, int prefill_mode = 0, bool write_f32 = true);
+        int8_t * aq = nullptr, float * as = nullptr, int nvfp4_kf = 0);

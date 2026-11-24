@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstring>
 
-// Pure C++ / CUDA shared helpers for prefill activation fusion and BF16 narrowing.
+// Pure C++ / CUDA shared helpers for the prefill activation fusion.
 // Must remain includable from pure-CPU test harnesses without any CUDA headers or runtime calls.
 
 #if defined(__CUDACC__)
@@ -12,25 +12,6 @@
 #else
 #define PF_HD inline
 #endif
-
-// Exact IEEE-754 Round-to-Nearest-Ties-to-Even f32 <-> bf16 bit conversions matching Ampere PTX cvt.rn.bf16.f32.
-PF_HD uint16_t pf_f32_to_bf16_bits(float x) {
-    uint32_t u = 0;
-    std::memcpy(&u, &x, sizeof(u));
-    if ((u & 0x7fffffffu) > 0x7f800000u) {
-        return (uint16_t) ((u >> 16) | 0x0040u);
-    }
-    const uint32_t lsb = (u >> 16) & 1u;
-    u += 0x7fffu + lsb;
-    return (uint16_t) (u >> 16);
-}
-
-PF_HD float pf_bf16_bits_to_f32(uint16_t b) {
-    const uint32_t u = (uint32_t) b << 16;
-    float f = 0.0f;
-    std::memcpy(&f, &u, sizeof(f));
-    return f;
-}
 
 enum pf_glu_kind {
     PF_GLU_SITU         = -1,

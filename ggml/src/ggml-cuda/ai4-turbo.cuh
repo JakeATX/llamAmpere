@@ -807,7 +807,7 @@ constexpr __host__ __device__ int gemm_lowreg_stage_bytes() {
 template <int BN = 64, int STAGES = 2, int LAY = ai4k::LAY_AIT4_U, int XSH = 1, bool ID = false, int M_SLABS = 8, int MINB = 2>
 static __global__ void __launch_bounds__(M_SLABS * 32, MINB) gemm_s8_lowreg(
         const uint8_t * __restrict__ W, const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
-        float * __restrict__ Y, int64_t ldy, int M, int N, int K, const ai4k::idmap idm, bool dst_bf16 = false) {
+        float * __restrict__ Y, int64_t ldy, int M, int N, int K, const ai4k::idmap idm) {
     static_assert(BN == 64 && M_SLABS == 8, "medium-batch lowreg tile");
     constexpr int THREADS = M_SLABS * 32;
     constexpr int NTI     = BN / 8;
@@ -968,25 +968,13 @@ static __global__ void __launch_bounds__(M_SLABS * 32, MINB) gemm_s8_lowreg(
 #pragma unroll
     for (int nt = 0; nt < NTI; ++nt) {
         const int c = nt * 8 + 2 * t;
-        if (dst_bf16) {
-            nv_bfloat16 * Y16 = (nv_bfloat16 *) Y;
-            if (n0 + c < N) {
-                Y16[ycol(c) * ldy + r]     = __float2bfloat16(acc[nt][0]);
-                Y16[ycol(c) * ldy + r + 8] = __float2bfloat16(acc[nt][2]);
-            }
-            if (n0 + c + 1 < N) {
-                Y16[ycol(c + 1) * ldy + r]     = __float2bfloat16(acc[nt][1]);
-                Y16[ycol(c + 1) * ldy + r + 8] = __float2bfloat16(acc[nt][3]);
-            }
-        } else {
-            if (n0 + c < N) {
-                Y[ycol(c) * ldy + r]     = acc[nt][0];
-                Y[ycol(c) * ldy + r + 8] = acc[nt][2];
-            }
-            if (n0 + c + 1 < N) {
-                Y[ycol(c + 1) * ldy + r]     = acc[nt][1];
-                Y[ycol(c + 1) * ldy + r + 8] = acc[nt][3];
-            }
+        if (n0 + c < N) {
+            Y[ycol(c) * ldy + r]     = acc[nt][0];
+            Y[ycol(c) * ldy + r + 8] = acc[nt][2];
+        }
+        if (n0 + c + 1 < N) {
+            Y[ycol(c + 1) * ldy + r]     = acc[nt][1];
+            Y[ycol(c + 1) * ldy + r + 8] = acc[nt][3];
         }
     }
 }
@@ -1008,7 +996,7 @@ template <int BN = 64, int STAGES = 2, int LAY = ai4k::LAY_AIT4_U, int XSH = 1, 
 static void launch_gemm_s8_lowreg_cfg(
         const uint8_t * W, const int8_t * Xq, const float * Xs,
         float * Y, int64_t ldy, int M, int N, int K, cudaStream_t stream,
-        const ai4k::idmap & idm = ai4k::idmap{}, int max_tiles = 1, bool dst_bf16 = false) {
+        const ai4k::idmap & idm = ai4k::idmap{}, int max_tiles = 1) {
     constexpr int smem = STAGES * gemm_lowreg_stage_bytes<BN, LAY, M_SLABS>();
     if constexpr (smem > 48 * 1024) {
         static bool attr_set[64] = {};
@@ -1023,7 +1011,7 @@ static void launch_gemm_s8_lowreg_cfg(
     }
     const dim3 grid((M / 16 + M_SLABS - 1) / M_SLABS, ID ? max_tiles : (N + BN - 1) / BN);
     gemm_s8_lowreg<BN, STAGES, LAY, XSH, ID, M_SLABS, MINB><<<grid, M_SLABS * 32, smem, stream>>>(
-        W, Xq, Xs, Y, ldy, M, N, K, idm, dst_bf16);
+        W, Xq, Xs, Y, ldy, M, N, K, idm);
 }
 
 // Auto-selecting launcher for gemm_s8_lowreg:
@@ -1033,11 +1021,11 @@ template <int LAY = ai4k::LAY_AIT4_U, int XSH = 1, bool ID = false>
 static void launch_gemm_s8_lowreg(
         const uint8_t * W, const int8_t * Xq, const float * Xs,
         float * Y, int64_t ldy, int M, int N, int K, cudaStream_t stream,
-        const ai4k::idmap & idm = ai4k::idmap{}, int max_tiles = 1, int sms = 82, bool dst_bf16 = false) {
+        const ai4k::idmap & idm = ai4k::idmap{}, int max_tiles = 1, int sms = 82) {
     if (should_use_gemm_s8_lowreg_2stage(ID, M, N, sms)) {
-        launch_gemm_s8_lowreg_cfg<64, 2, LAY, XSH, ID, 8, 2>(W, Xq, Xs, Y, ldy, M, N, K, stream, idm, max_tiles, dst_bf16);
+        launch_gemm_s8_lowreg_cfg<64, 2, LAY, XSH, ID, 8, 2>(W, Xq, Xs, Y, ldy, M, N, K, stream, idm, max_tiles);
     } else {
-        launch_gemm_s8_lowreg_cfg<64, 3, LAY, XSH, ID, 8, 1>(W, Xq, Xs, Y, ldy, M, N, K, stream, idm, max_tiles, dst_bf16);
+        launch_gemm_s8_lowreg_cfg<64, 3, LAY, XSH, ID, 8, 1>(W, Xq, Xs, Y, ldy, M, N, K, stream, idm, max_tiles);
     }
 }
 

@@ -26,18 +26,14 @@ int ggml_cuda_nvfp4pf_mode() {
 
 template <int KF, int BN>
 static void nvfp4pf_launch_mm(const char * w, int64_t stride_blk, const int8_t * xq, const float * xs, float * y, int M, int K,
-        const nvfp4pf_map & map, int max_tiles, const float * s_exp, cudaStream_t stream, bool dst_bf16 = false) {
+        const nvfp4pf_map & map, int max_tiles, const float * s_exp, cudaStream_t stream) {
     constexpr int smem = nvfp4pf_smem_bytes<KF, BN>();
     static_assert(smem + 2*BN*sizeof(int) <= 48*1024, "NVFP4PF: shared memory (+ static srow / scol) above the default limit");
-    k_nvfp4pf_mm<KF, BN><<<dim3((M + 63)/64, max_tiles), 256, smem, stream>>>(w, stride_blk, xq, xs, y, M, M, K, map, s_exp, 1.0f, dst_bf16);
+    k_nvfp4pf_mm<KF, BN><<<dim3((M + 63)/64, max_tiles), 256, smem, stream>>>(w, stride_blk, xq, xs, y, M, M, K, map, s_exp, 1.0f);
 }
 
 bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp,
-        bool dst_bf16, bool * out_wrote_bf16) {
-    if (out_wrote_bf16) {
-        *out_wrote_bf16 = false;
-    }
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp) {
     const int KF = ggml_cuda_nvfp4pf_mode();
     if (KF == 0 || !ids) {
         return false;
@@ -82,16 +78,18 @@ bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
 
     cudaStream_t stream = ctx.stream();
+    // [PREFILL-GLUE] an opt-in fused GLU / RMS_NORM producer already wrote k_nvfp4pf_xq's bytes for this exact src1
     const int8_t * pre_xq = nullptr;
     const float  * pre_xs = nullptr;
     const bool pre = ggml_cuda_prefill_nvfp4_take(ctx, src1, n_rows, (int) K, KF, pre_xq, pre_xs);
-    const bool src_bf16 = !pre && ggml_cuda_prefill_bf16_is_active(ctx, src1);
     ggml_cuda_pool_alloc<int8_t> xq(ctx.pool());
     ggml_cuda_pool_alloc<float>  xs(ctx.pool());
     if (!pre) {
         xq.alloc((size_t) n_rows*K);
         xs.alloc((size_t) n_rows*(K/KF));
     }
+    const int8_t * xq_use = pre ? pre_xq : xq.get();
+    const float  * xs_use = pre ? pre_xs : xs.get();
     ggml_cuda_pool_alloc<int>    work(ctx.pool(), nvfp4pf_work_ints((int) n_expert, n_pairs, max_tiles));
     float * y = (float *) dst->data;
     const int64_t stride_blk = src0->nb[1]/36;
@@ -99,43 +97,35 @@ bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const float * se = s_exp ? (const float *) s_exp->data : nullptr;
 
     k_nvfp4pf_route<<<1, 256, 0, stream>>>((const char *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, (int) ne11,
-        (int) n_expert, bn, max_tiles, work.get(), y, (int) M, dst_bf16);
+        (int) n_expert, bn, max_tiles, work.get(), y, (int) M);
     CUDA_CHECK(cudaGetLastError());
     const nvfp4pf_map map = nvfp4pf_map_of(work.get(), (int) n_expert, n_pairs, src0->nb[2]);
     const dim3 gq((unsigned) ((K/KF + 3)/4), (unsigned) n_rows);
-    const int8_t * xq_use = pre ? pre_xq : xq.get();
-    const float  * xs_use = pre ? pre_xs : xs.get();
-    if (!pre) {
-        if (src_bf16) {
-            ggml_cuda_prefill_bf16_to_nvfp4pf((const nv_bfloat16 *) src1->data, n_rows, (int) K, KF, xq.get(), xs.get(), stream);
-        } else if (KF == 64) {
-            k_nvfp4pf_xq<64><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
-        } else {
-            k_nvfp4pf_xq<32><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
-        }
-    }
     if (KF == 64) {
+        if (!pre) {
+            k_nvfp4pf_xq<64><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
+        }
         if (bn == 64) {
-            nvfp4pf_launch_mm<64, 64>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream, dst_bf16);
+            nvfp4pf_launch_mm<64, 64>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream);
         } else {
-            nvfp4pf_launch_mm<64, 128>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream, dst_bf16);
+            nvfp4pf_launch_mm<64, 128>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream);
         }
     } else {
-        if (bn == 64) {
-            nvfp4pf_launch_mm<32, 64>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream, dst_bf16);
-        } else {
-            nvfp4pf_launch_mm<32, 128>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream, dst_bf16);
+        if (!pre) {
+            k_nvfp4pf_xq<32><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
         }
-    }
-    if (out_wrote_bf16) {
-        *out_wrote_bf16 = dst_bf16;
+        if (bn == 64) {
+            nvfp4pf_launch_mm<32, 64>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream);
+        } else {
+            nvfp4pf_launch_mm<32, 128>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
 #else
 bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *,
-        const ggml_tensor *, bool, bool *) {
+        const ggml_tensor *) {
     return false;
 }
 #endif

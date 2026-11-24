@@ -13,5 +13,4 @@ int ggml_cuda_nvfp4pf_mode();
 // dst = MUL_MAT_ID(src0 NVFP4 [K, M, E], src1 f32 [K, ne11, T], ids [n_used, T]) [* s_exp[e]] when the shape fits
 // (T >= 512, sm_80 / sm_86, K % 128 == 0, M % 16 == 0, contiguous src1 / dst); false = nothing done
 bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp,
-        bool dst_bf16 = false, bool * out_wrote_bf16 = nullptr);
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp);
