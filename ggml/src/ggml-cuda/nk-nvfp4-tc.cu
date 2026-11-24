@@ -1,17 +1,23 @@
-// NEONKERN: sm_86 cliff-free int8 tensor-core NVFP4 MoE decode/verify kernels (T = 1..8).
+// NEONKERN: sm_86 cliff-free int8 tensor-core NVFP4 MoE decode/verify kernels (T = 1..8), v2.
 //
-// Design:
+// Design (v2 per-warp multi-stage cp.async ring):
 // - Weights stay in native ggml block_nvfp4 layout (36 bytes per 64 weights: 4 UE4M3 scales + 32 code bytes).
-// - Each 16-row slab is a contiguous, 128-byte-aligned DRAM stream (gate/up: 20,736 B = 162 lines; down: 10,368 B = 81 lines),
-//   double-buffered via 16-byte cp.async.cg with optional L2::evict_first cache policy so expert weights do not evict hot
-//   activations or KV metadata from L2.
+// - Each warp owns 16 complete output rows across the full K dimension and streams K-chunks through its own private
+//   cp.async.cg ring buffer with optional L2::evict_first cache policy, accumulating in 4 FP32 registers.
+//   This eliminates split-K shared-memory reductions, loop-internal __syncthreads(), and wait_group 0 stalls:
+//   - gu: 2 warps/CTA (32 features, grid (36, T*8)), 9 chunks x 4 blocks (144 B/row), D=4 stages/warp (wait_group 2,
+//         3 stages = 6,912 B/warp always in flight), 18 continuous gate->up steps, 19,456 B SMEM (5 CTAs/SM = 69.1 KB/SM
+//         in flight), 1 single __syncthreads() in the entire kernel before P.act quantization.
+//   - dn: 2 warps/CTA (64 rows = 2 slabs of 16 rows/warp, grid (36, T*8)), 3 chunks x 6 blocks (216 B/row) via
+//         16B-aligned 224 B over-fetch into 240 B bank-conflict-free SMEM stride (0 bytes OOB), D=3 stages/warp
+//         (wait_group 1, 2 stages = 7,168 B payload/warp always in flight), 6 continuous steps across both slabs,
+//         23,040 B SMEM (4 CTAs/SM = 57.3 KB/SM in flight), 0 __syncthreads() in the entire kernel.
 // - Each 16-element NVFP4 sub-block maps directly to one mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 with weights as A
-//   (16 rows x 16 cols) and up to 8 member tokens/slots as B (16 cols x 8 cols), so T = 1..8 execute the exact same MMA work.
+//   (16 rows x 16 cols) and up to 8 member tokens/slots as B (16 cols x 8 cols), so T = 1..8 execute identical MMA work.
 // - Activations (P.xq, P.act) use a private split-SOA layout inside the existing act scratch (zero extra VRAM) pre-permuted
 //   to match the raw NVFP4 nibble layout so decoding 4 weights takes 3 PRMT + 2 ALU ops with zero de-interleave, and loading
 //   all 4 sub-blocks of B takes one LDG.128 per 64 weights from L1 cache.
-// - Every 16-element sub-block integer dot product and UE4M3/q8_1 scale is exact (identical terms to vec_dot_nvfp4_q8_1);
-//   only the outer FP32 K-summation order across warps differs.
+// - Every 16-element sub-block integer dot product and UE4M3/q8_1 scale is exact (identical terms to vec_dot_nvfp4_q8_1).
 
 #include "nk-nvfp4-tc.cuh"
 
@@ -74,20 +80,36 @@ constexpr int NK_NB64_K  = NK_K / 64;  // 36
 constexpr int NK_NB64_F  = NK_F / 64;  // 18
 constexpr int NK_ROW_GU  = NK_NB64_K * 36;  // 1296 bytes
 constexpr int NK_ROW_DN  = NK_NB64_F * 36;  // 648 bytes
-constexpr int NK_SLAB_GU = 16 * NK_ROW_GU;  // 20736 bytes (162 x 128B lines)
-constexpr int NK_SLAB_DN = 16 * NK_ROW_DN;  // 10368 bytes (81 x 128B lines)
+constexpr int NK_SLAB_DN = 16 * NK_ROW_DN;  // 10368 bytes
 
-constexpr int NK_NW_GU   = 12; // 36 blocks / 12 warps = 3 blocks/warp; 2 CTAs/SM = 24 warps/SM
-constexpr int NK_NW_DN   = 6;  // 18 blocks / 6 warps  = 3 blocks/warp; 4 CTAs/SM = 24 warps/SM
+// gu per-warp ring: 9 chunks x 4 blocks = 144 B/row (9 x 16B, bank-conflict-free), D = 4 stages/warp, 2 warps/CTA.
+constexpr int NK_NW_GU     = 2;
+constexpr int NK_GU_CHUNKS = 9;
+constexpr int NK_GU_CBLK   = 4;
+constexpr int NK_GU_CBYTES = NK_GU_CBLK * 36;         // 144 B
+constexpr int NK_GU_STAGE  = 16 * NK_GU_CBYTES;       // 2304 B
+constexpr int NK_GU_D      = 4;
+constexpr int NK_GU_WRING  = NK_GU_D * NK_GU_STAGE;   // 9216 B
+
+// dn per-warp ring: 3 chunks x 6 blocks = 216 B/row via 16B-aligned 224 B over-fetch into 240 B SMEM row stride,
+// D = 3 stages/warp, 2 warps/CTA (2 slabs of 16 rows/warp = 64 rows/CTA).
+constexpr int NK_NW_DN     = 2;
+constexpr int NK_DN_CHUNKS = 3;
+constexpr int NK_DN_CBLK   = 6;
+constexpr int NK_DN_CBYTES = NK_DN_CBLK * 36;         // 216 B
+constexpr int NK_DN_SROW   = 240;                     // >= 224 B, 60 words == 28 mod 32 -> 0 bank conflicts for even/odd skew
+constexpr int NK_DN_STAGE  = 16 * NK_DN_SROW;         // 3840 B
+constexpr int NK_DN_D      = 3;
+constexpr int NK_DN_WRING  = NK_DN_D * NK_DN_STAGE;   // 11520 B
 
 // Dynamic shared memory sizes (multiples of 128 bytes):
-// gu: 2 * 20736 (ring) + 12 * 128 * 4 (red) + 256 * 4 (act_s) + 32 (s_slots) = 48672 -> pad 48768 (2 CTAs/SM = 97536 <= 101376)
-// dn: 2 * 10368 (ring) +  6 * 128 * 4 (red) + 32 (s_slots)                   = 23840 -> pad 23936 (4 CTAs/SM = 95744 <= 101376)
-constexpr size_t NK_SMEM_GU = ((2 * NK_SLAB_GU + NK_NW_GU * 128 * sizeof(float) + 256 * sizeof(float) + 32 + 127) & ~size_t(127));
-constexpr size_t NK_SMEM_DN = ((2 * NK_SLAB_DN + NK_NW_DN * 128 * sizeof(float) + 32 + 127) & ~size_t(127));
+// gu: 2 * 9216 (per-warp ring) + 256 * 4 (act_s) = 19456 B -> 5 CTAs/SM = 97280 <= 101376
+// dn: 2 * 11520 (per-warp ring)                  = 23040 B -> 4 CTAs/SM = 92160 <= 101376
+constexpr size_t NK_SMEM_GU = (size_t) (NK_NW_GU * NK_GU_WRING + 256 * (int) sizeof(float));
+constexpr size_t NK_SMEM_DN = (size_t) (NK_NW_DN * NK_DN_WRING);
 
-static_assert(NK_SMEM_GU * 2 <= 101376, "NK_NVFP4_TC gu must fit 2 CTAs/SM on sm_86");
-static_assert(NK_SMEM_DN * 4 <= 101376, "NK_NVFP4_TC dn must fit 4 CTAs/SM on sm_86");
+static_assert(NK_SMEM_GU % 128 == 0 && NK_SMEM_GU * 5 <= 101376, "NK_NVFP4_TC gu must fit 5 CTAs/SM on sm_86");
+static_assert(NK_SMEM_DN % 128 == 0 && NK_SMEM_DN * 4 <= 101376, "NK_NVFP4_TC dn must fit 4 CTAs/SM on sm_86");
 
 // Exact signed-int-to-float via 1.5 * 2^23 binade bias (exact for |x| < 2^22; sub-block max |sumi| = 16*12*127 = 24384).
 constexpr int   NK_I2F_BIAS_I = 0x4B400000;
@@ -226,7 +248,7 @@ static __global__ void __launch_bounds__(256) k_nk_nvfp4_xq(const nvfp4moe_param
 // Returns N (1..8) slots handled by this CTA (0 if not the chunk leader or invalid expert id).
 // Handles duplicate ids with > 8 routes via 8-slot chunking ((before & 7) == 0).
 static __device__ __forceinline__ int nk_route_ballot(
-        const nvfp4moe_params & P, const int lane, int & e_out, uint32_t & f0_out, uint32_t & f1_out, int & n0_out) {
+        const nvfp4moe_params & P, const int lane, int & e_out, uint32_t & f0_out, uint32_t & f1_out) {
     const int ns  = P.T * NK_NUSED;
     const int own = (int) blockIdx.y;
     const int e   = P.ids[(own >> 3) * P.ids_s1 + (own & 7)];
@@ -234,7 +256,7 @@ static __device__ __forceinline__ int nk_route_ballot(
     if (e < 0) {
         return 0;
     }
-    const int id0 = (lane < ns)      ? P.ids[(lane >> 3) * P.ids_s1 + (lane & 7)]             : -1;
+    const int id0 = (lane < ns)      ? P.ids[(lane >> 3) * P.ids_s1 + (lane & 7)]               : -1;
     const int id1 = (lane + 32 < ns) ? P.ids[((lane + 32) >> 3) * P.ids_s1 + ((lane + 32) & 7)] : -1;
 
     const uint32_t m0 = __ballot_sync(0xffffffffu, (lane < ns) && (id0 == e));
@@ -248,61 +270,56 @@ static __device__ __forceinline__ int nk_route_ballot(
     }
     const uint32_t f0 = m0 & ~prior0;
     const uint32_t f1 = m1 & ~prior1;
-    const int n0 = __popc(f0);
     f0_out = f0;
     f1_out = f1;
-    n0_out = n0;
-    return min(8, n0 + __popc(f1));
+    return min(8, __popc(f0) + __popc(f1));
 }
 
-// Scatter up to 8 active slot indices into s_slots[0..N-1] using warp 0.
-static __device__ __forceinline__ void nk_scatter_slots(
-        int * s_slots, const uint32_t f0, const uint32_t f1, const int n0, const int lane) {
-    const uint32_t lower = (1u << lane) - 1u;
-    if (f0 & (1u << lane)) {
-        const int idx = __popc(f0 & lower);
-        if (idx < 8) {
-            s_slots[idx] = lane;
+// Warp-uniform unpack of up to 8 active slots from (f0, f1) into lane k (0..7) using 1-cycle __ffsll;
+// replaces slow sm_86 __fns software emulation and needs zero SMEM or CTA barriers.
+static __device__ __forceinline__ int nk_unpack_slots_lane(const uint32_t f0, const uint32_t f1, const int lane) {
+    uint64_t m = ((uint64_t) f1 << 32) | (uint64_t) f0;
+    int my_slot = -1;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int bit = __ffsll((long long) m) - 1;
+        if (lane == k) {
+            my_slot = bit;
         }
+        m &= m - 1ull;
     }
-    if (f1 & (1u << lane)) {
-        const int idx = n0 + __popc(f1 & lower);
-        if (idx < 8) {
-            s_slots[idx] = 32 + lane;
-        }
-    }
+    return my_slot;
 }
 
-// Compute 16 rows x up to 8 columns for one staged 16-row slab using N_BLK = 3 block_nvfp4 blocks per warp.
-template <int ROW_BYTES, int N_BLK>
-static __device__ __forceinline__ void nk_slab_dot(
-        const char * __restrict__ slab_s,
-        const int8_t * __restrict__ xq_qs_g,
+// Accumulate 16 rows x up to 8 columns for one staged K-chunk (N_BLK block_nvfp4 blocks) into acc[0..3].
+// xq_qs_gt is pre-offset by + t * 16 in the prologue.
+template <int SMEM_ROW_BYTES, int N_BLK>
+static __device__ __forceinline__ void nk_chunk_dot(
+        const char * __restrict__ stage_s,
+        const int skew,
+        const int kb_base,
+        const int8_t * __restrict__ xq_qs_gt,
         const float  * __restrict__ xq_d_c0,
         const float  * __restrict__ xq_d_c1,
-        const int warp, const int lane, float (&acc)[4]) {
-    const int g   = lane >> 2;
-    const int t   = lane & 3;
-    const int kb0 = warp * N_BLK;
+        const bool has_g, const bool has_c0, const bool has_c1,
+        const int lane,
+        float (&acc)[4]) {
+    const int g = lane >> 2;
+    const int t = lane & 3;
 
-    const char * row0 = slab_s + g * ROW_BYTES;
-    const char * row8 = slab_s + (g + 8) * ROW_BYTES;
-
-    acc[0] = 0.0f;
-    acc[1] = 0.0f;
-    acc[2] = 0.0f;
-    acc[3] = 0.0f;
+    const char * row0 = stage_s + g * SMEM_ROW_BYTES + skew;
+    const char * row8 = stage_s + (g + 8) * SMEM_ROW_BYTES + skew;
 
 #pragma unroll 1
     for (int bi = 0; bi < N_BLK; ++bi) {
-        const int kb = kb0 + bi;
+        const int kb = kb_base + bi;
 
-        const uint4  bv  = xq_qs_g ? __ldg((const uint4 *)  (xq_qs_g + kb * 64 + t * 16)) : make_uint4(0u, 0u, 0u, 0u);
-        const float2 dx0 = xq_d_c0 ? __ldg((const float2 *) (xq_d_c0 + 2 * kb))           : make_float2(0.0f, 0.0f);
-        const float2 dx1 = xq_d_c1 ? __ldg((const float2 *) (xq_d_c1 + 2 * kb))           : make_float2(0.0f, 0.0f);
+        const uint4  bv  = has_g  ? __ldg((const uint4 *)  (xq_qs_gt + kb * 64)) : make_uint4(0u, 0u, 0u, 0u);
+        const float2 dx0 = has_c0 ? __ldg((const float2 *) (xq_d_c0 + 2 * kb))   : make_float2(0.0f, 0.0f);
+        const float2 dx1 = has_c1 ? __ldg((const float2 *) (xq_d_c1 + 2 * kb))   : make_float2(0.0f, 0.0f);
 
-        const char * b0 = row0 + kb * 36;
-        const char * b8 = row8 + kb * 36;
+        const char * b0 = row0 + bi * 36;
+        const char * b8 = row8 + bi * 36;
         const uint32_t d0_raw = *(const uint32_t *) b0;
         const uint32_t d8_raw = *(const uint32_t *) b8;
 
@@ -337,121 +354,151 @@ static __device__ __forceinline__ void nk_slab_dot(
 }
 
 // gate_up + scale + SITU -> split-SOA P.act.
-// Grid: (F/32 = 36, T*8), 384 threads (12 warps), 2 CTAs/SM = 24 warps/SM on sm_86.
+// Grid: (F/32 = 36, T*8), 64 threads (2 warps), 5 CTAs/SM = 10 warps/SM on sm_86.
 template <bool L2_EF>
-static __global__ void __launch_bounds__(NK_NW_GU * 32, 2) k_nk_nvfp4_gu(const nvfp4moe_params P) {
+static __global__ void __launch_bounds__(NK_NW_GU * 32, 5) k_nk_nvfp4_gu(const nvfp4moe_params P) {
     const int tid  = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
 
-    int e, n0;
+    int e;
     uint32_t f0_m, f1_m;
-    const int N = nk_route_ballot(P, lane, e, f0_m, f1_m, n0);
+    const int N = nk_route_ballot(P, lane, e, f0_m, f1_m);
     if (N == 0) {
         return; // CTA-uniform, before any barrier
     }
 
     extern __shared__ __align__(16) char smem[];
-    char  * ring    = smem;                                       // [2][20736]
-    float * red     = (float *) (ring + 2 * NK_SLAB_GU);          // [12][8][16]
-    float * act_s   = red + NK_NW_GU * 128;                       // [8][32]
-    int   * s_slots = (int *) (act_s + 256);                      // [8]
+    char  * warp_ring = smem + warp * NK_GU_WRING;
+    float * act_s     = (float *) (smem + NK_NW_GU * NK_GU_WRING); // [8][32]
 
-    const uint32_t ring_s = (uint32_t) __cvta_generic_to_shared(ring);
-    const uint64_t policy = L2_EF ? nk_l2_evict_first() : 0ull;
+    const uint32_t warp_ring_s = (uint32_t) __cvta_generic_to_shared(warp_ring);
+    const uint64_t policy      = L2_EF ? nk_l2_evict_first() : 0ull;
 
-    const int feat0 = (int) blockIdx.x * 32;
-    const char * wg = P.w_gu + (int64_t) e * P.gu_nb2 + (int64_t) feat0 * NK_ROW_GU;
+    const int feat_warp = (int) blockIdx.x * 32 + warp * 16;
+    const char * wg = P.w_gu + (int64_t) e * P.gu_nb2 + (int64_t) feat_warp * NK_ROW_GU;
     const char * wu = wg + (int64_t) NK_F * NK_ROW_GU;
 
-    auto slab_src = [&](const int s) -> const char * {
-        const char * base = (s & 1) ? wu : wg;
-        return base + (s >= 2 ? NK_SLAB_GU : 0);
-    };
-    auto issue_slab = [&](const int s, const int buf) {
-        const char * src = slab_src(s);
-        const uint32_t dst = ring_s + (uint32_t) (buf * NK_SLAB_GU);
+    // Precompute per-lane source byte offsets for the 144 x 16B copy of one 16-row x 144 B stage.
+    int src_off[5];
 #pragma unroll
-        for (int c = tid; c < NK_SLAB_GU / 16; c += NK_NW_GU * 32) {
-            nk_cp16<L2_EF>(dst + (uint32_t) (c * 16), src + c * 16, policy);
+    for (int it = 0; it < 5; ++it) {
+        const int c = it * 32 + lane;
+        if (c < 144) {
+            const int r   = c / 9;
+            const int k16 = c - r * 9;
+            src_off[it] = r * NK_ROW_GU + k16 * 16;
+        } else {
+            src_off[it] = 0;
+        }
+    }
+
+    auto issue_stage = [&](const char * base, const int buf) {
+        const uint32_t dst_stage = warp_ring_s + (uint32_t) (buf * NK_GU_STAGE);
+#pragma unroll
+        for (int it = 0; it < 4; ++it) {
+            nk_cp16<L2_EF>(dst_stage + (uint32_t) ((it * 32 + lane) * 16), base + src_off[it], policy);
+        }
+        if (lane < 16) {
+            nk_cp16<L2_EF>(dst_stage + (uint32_t) ((128 + lane) * 16), base + src_off[4], policy);
         }
         nk_commit();
     };
 
-    // Prologue: start DRAM stream of slab 0 immediately, scatter slot table under its latency.
-    issue_slab(0, 0);
-    if (warp == 0) {
-        nk_scatter_slots(s_slots, f0_m, f1_m, n0, lane);
-    }
-    const float scale = P.s_gu ? P.s_gu[e] : 1.0f;
-    nk_wait<0>();
-    __syncthreads();
+    // Prologue: immediately prime 3 stages in flight (6,912 B/warp) and resolve routing pointers under DRAM latency.
+    issue_stage(wg + 0 * NK_GU_CBYTES, 0);
+    issue_stage(wg + 1 * NK_GU_CBYTES, 1);
+    issue_stage(wg + 2 * NK_GU_CBYTES, 2);
 
     const int g = lane >> 2;
     const int t = lane & 3;
-    const int tok_g  = (g < N)         ? (s_slots[g]         >> 3) : -1;
-    const int tok_c0 = (2 * t < N)     ? (s_slots[2 * t]     >> 3) : -1;
-    const int tok_c1 = (2 * t + 1 < N) ? (s_slots[2 * t + 1] >> 3) : -1;
+    const int my_slot = nk_unpack_slots_lane(f0_m, f1_m, lane);
+    const int slot_g  = __shfl_sync(0xffffffffu, my_slot, g);
+    const int slot_c0 = __shfl_sync(0xffffffffu, my_slot, 2 * t);
+    const int slot_c1 = __shfl_sync(0xffffffffu, my_slot, 2 * t + 1);
+    const bool has_g  = slot_g  >= 0;
+    const bool has_c0 = slot_c0 >= 0;
+    const bool has_c1 = slot_c1 >= 0;
 
     const int8_t * xq_qs = (const int8_t *) P.xq;
     const float  * xq_d  = (const float *) (xq_qs + (int64_t) P.T * NK_K);
 
-    const int8_t * xq_qs_g = tok_g  >= 0 ? xq_qs + (int64_t) tok_g  * NK_K     : nullptr;
-    const float  * xq_d_c0 = tok_c0 >= 0 ? xq_d  + (int64_t) tok_c0 * NK_NB32_K : nullptr;
-    const float  * xq_d_c1 = tok_c1 >= 0 ? xq_d  + (int64_t) tok_c1 * NK_NB32_K : nullptr;
+    const int8_t * xq_qs_gt = has_g  ? xq_qs + (int64_t) (slot_g  >> 3) * NK_K + t * 16 : nullptr;
+    const float  * xq_d_c0  = has_c0 ? xq_d  + (int64_t) (slot_c0 >> 3) * NK_NB32_K     : nullptr;
+    const float  * xq_d_c1  = has_c1 ? xq_d  + (int64_t) (slot_c1 >> 3) * NK_NB32_K     : nullptr;
 
+    const float scale = P.s_gu ? P.s_gu[e] : 1.0f;
+
+    float acc_g[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float acc_u[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    // Gate pass (s = 0..8); steps 6..8 seamlessly prefetch up chunks 0..2 so gate->up has zero pipeline bubble.
 #pragma unroll 1
-    for (int s = 0; s < 4; ++s) {
-        if (s + 1 < 4) {
-            issue_slab(s + 1, (s + 1) & 1);
-        }
-
-        float acc[4];
-        nk_slab_dot<NK_ROW_GU, 3>(ring + (s & 1) * NK_SLAB_GU, xq_qs_g, xq_d_c0, xq_d_c1, warp, lane, acc);
-
-        float * rw = red + warp * 128;
-        if (2 * t < N) {
-            rw[(2 * t) * 16 + g]     = acc[0];
-            rw[(2 * t) * 16 + g + 8] = acc[2];
-        }
-        if (2 * t + 1 < N) {
-            rw[(2 * t + 1) * 16 + g]     = acc[1];
-            rw[(2 * t + 1) * 16 + g + 8] = acc[3];
-        }
-        __syncthreads();
-
-        if (tid < N * 16) {
-            const int c = tid >> 4;
-            const int r = tid & 15;
-            float sum = 0.0f;
-#pragma unroll
-            for (int w = 0; w < NK_NW_GU; ++w) {
-                sum += red[w * 128 + c * 16 + r];
-            }
-            if (P.s_gu) {
-                sum *= scale;
-            }
-            const int foff = (s >= 2 ? 16 : 0) + r;
-            if ((s & 1) == 0) {
-                act_s[c * 32 + foff] = sum;
-            } else {
-                const float gv = act_s[c * 32 + foff];
-                act_s[c * 32 + foff] = nk_situ(gv, sum, P.situ);
-            }
-        }
-        if (s + 1 < 4) {
-            nk_wait<0>();
-            __syncthreads();
-        }
+    for (int s = 0; s < NK_GU_CHUNKS; ++s) {
+        nk_wait<2>();
+        const int ns = s + 3;
+        const char * next_base = (ns < NK_GU_CHUNKS)
+            ? (wg + ns * NK_GU_CBYTES)
+            : (wu + (ns - NK_GU_CHUNKS) * NK_GU_CBYTES);
+        issue_stage(next_base, ns & 3);
+        nk_chunk_dot<NK_GU_CBYTES, NK_GU_CBLK>(
+            warp_ring + (s & 3) * NK_GU_STAGE, 0, s * NK_GU_CBLK,
+            xq_qs_gt, xq_d_c0, xq_d_c1, has_g, has_c0, has_c1, lane, acc_g);
     }
 
+    // Up pass (s = 9..17); explicit wait drain on the final 2 steps with zero empty commit groups.
+#pragma unroll 1
+    for (int k = 0; k < NK_GU_CHUNKS; ++k) {
+        const int s = NK_GU_CHUNKS + k;
+        if (k < NK_GU_CHUNKS - 2) {
+            nk_wait<2>();
+        } else if (k == NK_GU_CHUNKS - 2) {
+            nk_wait<1>();
+        } else {
+            nk_wait<0>();
+        }
+        if (k + 3 < NK_GU_CHUNKS) {
+            issue_stage(wu + (k + 3) * NK_GU_CBYTES, (s + 3) & 3);
+        }
+        nk_chunk_dot<NK_GU_CBYTES, NK_GU_CBLK>(
+            warp_ring + (s & 3) * NK_GU_STAGE, 0, k * NK_GU_CBLK,
+            xq_qs_gt, xq_d_c0, xq_d_c1, has_g, has_c0, has_c1, lane, acc_u);
+    }
+
+    // Epilogue: apply scale + SITU directly in registers, stage [N][32] into SMEM, single CTA barrier, quantize P.act.
+    const int foff = warp * 16;
+    if (has_c0) {
+        float g0 = acc_g[0], u0 = acc_u[0];
+        float g2 = acc_g[2], u2 = acc_u[2];
+        if (P.s_gu) {
+            g0 *= scale;
+            u0 *= scale;
+            g2 *= scale;
+            u2 *= scale;
+        }
+        act_s[(2 * t) * 32 + foff + g]     = nk_situ(g0, u0, P.situ);
+        act_s[(2 * t) * 32 + foff + g + 8] = nk_situ(g2, u2, P.situ);
+    }
+    if (has_c1) {
+        float g1 = acc_g[1], u1 = acc_u[1];
+        float g3 = acc_g[3], u3 = acc_u[3];
+        if (P.s_gu) {
+            g1 *= scale;
+            u1 *= scale;
+            g3 *= scale;
+            u3 *= scale;
+        }
+        act_s[(2 * t + 1) * 32 + foff + g]     = nk_situ(g1, u1, P.situ);
+        act_s[(2 * t + 1) * 32 + foff + g + 8] = nk_situ(g3, u3, P.situ);
+    }
     __syncthreads();
-    if (warp < N) {
-        const int slot = s_slots[warp];
-        int8_t * act_qs = (int8_t *) P.act;
-        float  * act_d  = (float *) (act_qs + (int64_t) P.T * NK_NUSED * NK_F);
+
+    int8_t * act_qs = (int8_t *) P.act;
+    float  * act_d  = (float *) (act_qs + (int64_t) P.T * NK_NUSED * NK_F);
+    for (int c = warp; c < N; c += NK_NW_GU) {
+        const int slot = __shfl_sync(0xffffffffu, my_slot, c);
         nk_quant_store_32(
-            act_s[warp * 32 + lane],
+            act_s[c * 32 + lane],
             act_qs + (int64_t) slot * NK_F,
             act_d  + (int64_t) slot * NK_NB32_F,
             (int) blockIdx.x, lane);
@@ -459,99 +506,122 @@ static __global__ void __launch_bounds__(NK_NW_GU * 32, 2) k_nk_nvfp4_gu(const n
 }
 
 // down + scale -> P.e_out.
-// Grid: (K/32 = 72, T*8), 192 threads (6 warps), 4 CTAs/SM = 24 warps/SM on sm_86.
+// Grid: (K/64 = 36, T*8), 64 threads (2 warps), 4 CTAs/SM = 8 warps/SM on sm_86.
+// Zero __syncthreads(): each warp independently streams 2 slabs x 3 K-chunks through its private D=3 ring.
 template <bool L2_EF>
 static __global__ void __launch_bounds__(NK_NW_DN * 32, 4) k_nk_nvfp4_dn(const nvfp4moe_params P) {
     const int tid  = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
 
-    int e, n0;
+    int e;
     uint32_t f0_m, f1_m;
-    const int N = nk_route_ballot(P, lane, e, f0_m, f1_m, n0);
+    const int N = nk_route_ballot(P, lane, e, f0_m, f1_m);
     if (N == 0) {
-        return; // CTA-uniform, before any barrier
+        return; // CTA-uniform
     }
 
     extern __shared__ __align__(16) char smem[];
-    char  * ring    = smem;                                       // [2][10368]
-    float * red     = (float *) (ring + 2 * NK_SLAB_DN);          // [6][8][16]
-    int   * s_slots = (int *) (red + NK_NW_DN * 128);             // [8]
+    char * warp_ring = smem + warp * NK_DN_WRING;
 
-    const uint32_t ring_s = (uint32_t) __cvta_generic_to_shared(ring);
-    const uint64_t policy = L2_EF ? nk_l2_evict_first() : 0ull;
+    const uint32_t warp_ring_s = (uint32_t) __cvta_generic_to_shared(warp_ring);
+    const uint64_t policy      = L2_EF ? nk_l2_evict_first() : 0ull;
 
-    const int row_base = (int) blockIdx.x * 32;
-    const char * wd = P.w_dn + (int64_t) e * P.dn_nb2 + (int64_t) row_base * NK_ROW_DN;
+    const int row_warp = (int) blockIdx.x * 64 + warp * 32;
+    const char * wd = P.w_dn + (int64_t) e * P.dn_nb2 + (int64_t) row_warp * NK_ROW_DN;
 
-    auto issue_slab = [&](const int s, const int buf) {
-        const char * src = wd + s * NK_SLAB_DN;
-        const uint32_t dst = ring_s + (uint32_t) (buf * NK_SLAB_DN);
+    // Precompute per-lane offsets for the 224 x 16B = 7 unpredicated cp.async.cg transfers per 16-row stage.
+    // Row r, chunk k starts at r*648 + k*216; subtracting skew = ((r+k)&1)*8 aligns down to 16B with 0 B OOB.
+    int      src_even[7];
+    uint32_t dst_off[7];
+    uint32_t r_odd_mask = 0u;
 #pragma unroll
-        for (int c = tid; c < NK_SLAB_DN / 16; c += NK_NW_DN * 32) {
-            nk_cp16<L2_EF>(dst + (uint32_t) (c * 16), src + c * 16, policy);
+    for (int it = 0; it < 7; ++it) {
+        const int c   = it * 32 + lane;
+        const int r   = c / 14;
+        const int j16 = c - r * 14;
+        src_even[it]  = r * NK_ROW_DN - (r & 1) * 8 + j16 * 16;
+        dst_off[it]   = (uint32_t) (r * NK_DN_SROW + j16 * 16);
+        r_odd_mask   |= ((uint32_t) (r & 1)) << it;
+    }
+
+    auto issue_stage = [&](const int sl, const int k) {
+        const char * slab_base = wd + sl * NK_SLAB_DN;
+        const uint32_t dst_stage = warp_ring_s + (uint32_t) (k * NK_DN_STAGE);
+        const int k_add_even = k * NK_DN_CBYTES - (k & 1) * 8;
+        const int k_add_odd  = k * NK_DN_CBYTES + (k & 1) * 8;
+#pragma unroll
+        for (int it = 0; it < 7; ++it) {
+            const int k_add = (r_odd_mask & (1u << it)) ? k_add_odd : k_add_even;
+            nk_cp16<L2_EF>(dst_stage + dst_off[it], slab_base + src_even[it] + k_add, policy);
         }
         nk_commit();
     };
 
-    // Prologue: start DRAM stream of slab 0 immediately, scatter slot table under its latency.
-    issue_slab(0, 0);
-    if (warp == 0) {
-        nk_scatter_slots(s_slots, f0_m, f1_m, n0, lane);
-    }
-    const float scale = P.s_dn ? P.s_dn[e] : 1.0f;
-    nk_wait<0>();
-    __syncthreads();
+    // Prologue: immediately prime 2 stages in flight (7,168 B payload / 7,680 B SMEM per warp).
+    issue_stage(0, 0);
+    issue_stage(0, 1);
 
     const int g = lane >> 2;
     const int t = lane & 3;
-    const int slot_g  = (g < N)         ? s_slots[g]         : -1;
-    const int slot_c0 = (2 * t < N)     ? s_slots[2 * t]     : -1;
-    const int slot_c1 = (2 * t + 1 < N) ? s_slots[2 * t + 1] : -1;
+    const int my_slot = nk_unpack_slots_lane(f0_m, f1_m, lane);
+    const int slot_g  = __shfl_sync(0xffffffffu, my_slot, g);
+    const int slot_c0 = __shfl_sync(0xffffffffu, my_slot, 2 * t);
+    const int slot_c1 = __shfl_sync(0xffffffffu, my_slot, 2 * t + 1);
+    const bool has_g  = slot_g  >= 0;
+    const bool has_c0 = slot_c0 >= 0;
+    const bool has_c1 = slot_c1 >= 0;
 
     const int8_t * act_qs = (const int8_t *) P.act;
     const float  * act_d  = (const float *) (act_qs + (int64_t) P.T * NK_NUSED * NK_F);
 
-    const int8_t * act_qs_g = slot_g  >= 0 ? act_qs + (int64_t) slot_g  * NK_F      : nullptr;
-    const float  * act_d_c0 = slot_c0 >= 0 ? act_d  + (int64_t) slot_c0 * NK_NB32_F : nullptr;
-    const float  * act_d_c1 = slot_c1 >= 0 ? act_d  + (int64_t) slot_c1 * NK_NB32_F : nullptr;
+    const int8_t * act_qs_gt = has_g  ? act_qs + (int64_t) slot_g  * NK_F + t * 16 : nullptr;
+    const float  * act_d_c0  = has_c0 ? act_d  + (int64_t) slot_c0 * NK_NB32_F     : nullptr;
+    const float  * act_d_c1  = has_c1 ? act_d  + (int64_t) slot_c1 * NK_NB32_F     : nullptr;
+
+    const float scale = P.s_dn ? P.s_dn[e] : 1.0f;
 
 #pragma unroll 1
-    for (int s = 0; s < 2; ++s) {
-        if (s == 0) {
-            issue_slab(1, 1);
-        }
-
-        float acc[4];
-        nk_slab_dot<NK_ROW_DN, 3>(ring + s * NK_SLAB_DN, act_qs_g, act_d_c0, act_d_c1, warp, lane, acc);
-
-        float * rw = red + warp * 128;
-        if (2 * t < N) {
-            rw[(2 * t) * 16 + g]     = acc[0];
-            rw[(2 * t) * 16 + g + 8] = acc[2];
-        }
-        if (2 * t + 1 < N) {
-            rw[(2 * t + 1) * 16 + g]     = acc[1];
-            rw[(2 * t + 1) * 16 + g + 8] = acc[3];
-        }
-        __syncthreads();
-
-        if (tid < N * 16) {
-            const int c = tid >> 4;
-            const int r = tid & 15;
-            float sum = 0.0f;
-#pragma unroll
-            for (int w = 0; w < NK_NW_DN; ++w) {
-                sum += red[w * 128 + c * 16 + r];
+    for (int sl = 0; sl < 2; ++sl) {
+        float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll 1
+        for (int k = 0; k < NK_DN_CHUNKS; ++k) {
+            const int s = sl * NK_DN_CHUNKS + k;
+            if (s < 5) {
+                nk_wait<1>();
+            } else {
+                nk_wait<0>();
             }
+            if (s + 2 < 6) {
+                const int ns = s + 2;
+                issue_stage(ns / NK_DN_CHUNKS, ns % NK_DN_CHUNKS);
+            }
+            const int skew = ((g + k) & 1) * 8;
+            nk_chunk_dot<NK_DN_SROW, NK_DN_CBLK>(
+                warp_ring + k * NK_DN_STAGE, skew, k * NK_DN_CBLK,
+                act_qs_gt, act_d_c0, act_d_c1, has_g, has_c0, has_c1, lane, acc);
+        }
+
+        const int row_slab = row_warp + sl * 16;
+        if (has_c0) {
+            float v0 = acc[0];
+            float v2 = acc[2];
             if (P.s_dn) {
-                sum *= scale;
+                v0 *= scale;
+                v2 *= scale;
             }
-            P.e_out[(int64_t) s_slots[c] * NK_K + row_base + s * 16 + r] = sum;
+            P.e_out[(int64_t) slot_c0 * NK_K + row_slab + g]     = v0;
+            P.e_out[(int64_t) slot_c0 * NK_K + row_slab + g + 8] = v2;
         }
-        if (s == 0) {
-            nk_wait<0>();
-            __syncthreads();
+        if (has_c1) {
+            float v1 = acc[1];
+            float v3 = acc[3];
+            if (P.s_dn) {
+                v1 *= scale;
+                v3 *= scale;
+            }
+            P.e_out[(int64_t) slot_c1 * NK_K + row_slab + g]     = v1;
+            P.e_out[(int64_t) slot_c1 * NK_K + row_slab + g + 8] = v3;
         }
     }
 }
@@ -574,7 +644,7 @@ static void launch_pair(const nvfp4moe_params & P, cudaStream_t stream) {
     k_nk_nvfp4_gu<L2_EF><<<dim3(NK_F / 32, P.T * NK_NUSED), NK_NW_GU * 32, NK_SMEM_GU, stream>>>(P);
     CUDA_CHECK(cudaGetLastError());
 
-    k_nk_nvfp4_dn<L2_EF><<<dim3(NK_K / 32, P.T * NK_NUSED), NK_NW_DN * 32, NK_SMEM_DN, stream>>>(P);
+    k_nk_nvfp4_dn<L2_EF><<<dim3(NK_K / 64, P.T * NK_NUSED), NK_NW_DN * 32, NK_SMEM_DN, stream>>>(P);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -602,7 +672,7 @@ bool ggml_cuda_nk_nvfp4_tc_launch(const nvfp4moe_params & P, cudaStream_t stream
     const bool l2_ef = nk_nvfp4_tc_l2_ef();
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
     if (!logged.test_and_set()) {
-        GGML_LOG_INFO("[NK_NVFP4_TC] active (m16n8k16 s8 TC, T=1..8, l2_evict_first=%d, smem gu=%zu dn=%zu)\n",
+        GGML_LOG_INFO("[NK_NVFP4_TC] active (m16n8k16 v2 per-warp D=4/3, T=1..8, l2_evict_first=%d, smem gu=%zu dn=%zu)\n",
             l2_ef ? 1 : 0, nk_nvfp4_tc::NK_SMEM_GU, nk_nvfp4_tc::NK_SMEM_DN);
     }
     const int64_t n = g_nk_nvfp4_tc_launches.fetch_add(1, std::memory_order_relaxed) + 1;
