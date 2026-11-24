@@ -169,6 +169,7 @@ double ggml_cuda_nvfp4pf_bench_kern(ggml_backend_cuda_context & ctx, const ggml_
 
     k_nvfp4pf_route<<<1, 256, 0, stream>>>((const char *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, (int) ne11,
         (int) n_expert, bn, max_tiles, work.get(), y, (int) M);
+    CUDA_CHECK(cudaGetLastError());
     const nvfp4pf_map map = nvfp4pf_map_of(work.get(), (int) n_expert, n_pairs, src0->nb[2]);
     const nk_pf_map nk_map = { map.hdr, map.exps, map.off, map.rows, map.cols, map.tiles, map.nb02 };
     const dim3 gq((unsigned) ((K / KF + 3) / 4), (unsigned) n_rows);
@@ -177,6 +178,7 @@ double ggml_cuda_nvfp4pf_bench_kern(ggml_backend_cuda_context & ctx, const ggml_
     } else {
         k_nvfp4pf_xq<32><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
     }
+    CUDA_CHECK(cudaGetLastError());
 
     auto launch_mm = [&]() {
         if (use_nk > 0) {
@@ -200,6 +202,7 @@ double ggml_cuda_nvfp4pf_bench_kern(ggml_backend_cuda_context & ctx, const ggml_
     for (int i = 0; i < warmup; ++i) {
         launch_mm();
     }
+    CUDA_CHECK(cudaGetLastError());
     cudaEvent_t ev0 = nullptr, ev1 = nullptr;
     CUDA_CHECK(cudaEventCreate(&ev0));
     CUDA_CHECK(cudaEventCreate(&ev1));
@@ -207,6 +210,7 @@ double ggml_cuda_nvfp4pf_bench_kern(ggml_backend_cuda_context & ctx, const ggml_
     for (int i = 0; i < iters; ++i) {
         launch_mm();
     }
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(ev1, stream));
     CUDA_CHECK(cudaEventSynchronize(ev1));
     float ms = 0.0f;

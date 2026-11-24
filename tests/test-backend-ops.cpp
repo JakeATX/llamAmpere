@@ -27566,13 +27566,26 @@ static int run_nk_pf_mm_check() {
             uint8_t * p = wb.data() + b * 36;
             const uint32_t r = rng();
             for (int s = 0; s < 4; ++s) {
-                uint8_t u = (uint8_t) (0x20u + (((r >> (8 * s)) & 0x3Fu))); // normal UE4M3 range
-                if (((b + (size_t) s) & 63u) == 0u) {
+                const uint32_t rb = (r >> (8 * s)) & 0xFFu;
+                uint8_t u = (uint8_t) (0x20u + (rb & 0x3Fu)); // normal UE4M3 range
+                if ((rb & 0xC0u) == 0xC0u) {
+                    u |= 0x80u; // bit-7 set normal scales (25% of random entries)
+                }
+                const size_t tag = (b + (size_t) s) & 63u;
+                if (tag == 0u) {
                     u = 0x00u; // zero scale
-                } else if (((b + (size_t) s) & 63u) == 1u) {
+                } else if (tag == 1u) {
                     u = 0x03u; // subnormal scale
-                } else if (((b + (size_t) s) & 63u) == 2u) {
+                } else if (tag == 2u) {
                     u = 0x7Fu; // NaN -> 0 edge case
+                } else if (tag == 3u) {
+                    u = 0x80u; // bit-7 zero
+                } else if (tag == 4u) {
+                    u = 0x83u; // bit-7 subnormal
+                } else if (tag == 5u) {
+                    u = 0xFEu; // bit-7 max-1 normal
+                } else if (tag == 6u) {
+                    u = 0xFFu; // bit-7 0xFF -> 240.0 (NOT NaN)
                 }
                 p[s] = u;
             }
@@ -27764,13 +27777,20 @@ static int run_nk_pf_mm_check() {
                 const double kb0 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 1, 3, iters);
                 const double kb1 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 1, 2, iters);
                 const double ka1 = bench_kern_fn(be, src0, src1, ids, dst, s_exp, 0, 2, iters);
-                const double kbase_us = 0.5 * (ka0 + ka1);
-                const double knk_us   = 0.5 * (kb0 + kb1);
-                const double kpct     = 100.0 * (knk_us - kbase_us) / kbase_us;
-                const double kbase_tops = ops / (kbase_us * 1e6);
-                const double knk_tops   = ops / (knk_us * 1e6);
-                printf("nk_pf_mm %-18s            | kern:  base %7.1f us (%5.1f TOPS) -> nk %7.1f us (%5.1f TOPS) | %+6.1f%% (ABBA: %.1f/%.1f vs %.1f/%.1f)\n",
-                    tc.name, kbase_us, kbase_tops, knk_us, knk_tops, kpct, ka0, ka1, kb0, kb1);
+                if (ka0 < 0.0 || kb0 < 0.0 || kb1 < 0.0 || ka1 < 0.0) {
+                    --passed;
+                    ++fails;
+                    printf("nk_pf_mm %-18s FAIL (bench_kern returned < 0: %.1f/%.1f/%.1f/%.1f)\n",
+                        tc.name, ka0, kb0, kb1, ka1);
+                } else {
+                    const double kbase_us = 0.5 * (ka0 + ka1);
+                    const double knk_us   = 0.5 * (kb0 + kb1);
+                    const double kpct     = 100.0 * (knk_us - kbase_us) / kbase_us;
+                    const double kbase_tops = ops / (kbase_us * 1e6);
+                    const double knk_tops   = ops / (knk_us * 1e6);
+                    printf("nk_pf_mm %-18s            | kern:  base %7.1f us (%5.1f TOPS) -> nk %7.1f us (%5.1f TOPS) | %+6.1f%% (ABBA: %.1f/%.1f vs %.1f/%.1f)\n",
+                        tc.name, kbase_us, kbase_tops, knk_us, knk_tops, kpct, ka0, ka1, kb0, kb1);
+                }
             } else {
                 printf("nk_pf_mm %-18s PASS exact\n", tc.name);
             }
