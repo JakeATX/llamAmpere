@@ -78,6 +78,7 @@
 #include "ggml-cuda/inksituq.cuh"
 #include "ggml-cuda/nvfp4mt.cuh"
 #include "ggml-cuda/nk-nvfp4-tc.cuh"
+#include "ggml-cuda/nk-q8-moe-tc.cuh"
 #include "ggml-cuda/nvfp4pf.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
@@ -11196,10 +11197,13 @@ static int ggml_cuda_try_fuse_ink_wconv(ggml_backend_cuda_context * ctx, ggml_cg
 // GGML_CUDA_NVFP4MOE=0 off; GGML_CUDA_INKGLUE_WSUM=0 also turns it off on layers that own the sum (not WCONV layers) (the sum is matched by that matcher).
 // PREQ scratch: x as q8_1 right after the q8_1 SITU rows, in the rest of the f32 SITU output's memory (13 of its 36.9 KB per
 // token; at T == 1 only for NVFP4MT, see ggml_cuda_nvfp4mt_t1); nullptr (gate_up CTAs quantize x) at T == 1 without NVFP4MT, with GGML_CUDA_NVFP4MOE_PREQ=0, or if it does not fit
-static block_q8_1 * ggml_cuda_nvfp4moe_xq_slot(const ggml_tensor * act, int64_t T, int64_t n_used, int64_t K, int64_t F) {
+static block_q8_1 * ggml_cuda_nvfp4moe_xq_slot(const ggml_tensor * act, int64_t T, int64_t n_used, int64_t K, int64_t F, bool is_q8_0) {
     const size_t act_q8 = (size_t) (T*n_used*(F/QK8_1))*sizeof(block_q8_1);
     const size_t x_q8   = (size_t) (T*(K/QK8_1))*sizeof(block_q8_1);
-    if ((T < 2 && !ggml_cuda_nvfp4mt_t1() && !ggml_cuda_nk_nvfp4_tc_enabled()) || !ggml_cuda_nvfp4moe_preq() || act_q8 % 16 != 0 || act_q8 + x_q8 > ggml_nbytes(act)) {
+    if (!is_q8_0 && ((T < 2 && !ggml_cuda_nvfp4mt_t1() && !ggml_cuda_nk_nvfp4_tc_enabled()) || !ggml_cuda_nvfp4moe_preq())) {
+        return nullptr;
+    }
+    if (act_q8 % 16 != 0 || act_q8 + x_q8 > ggml_nbytes(act)) {
         return nullptr;
     }
     return (block_q8_1 *) ((char *) act->data + act_q8);
@@ -11207,7 +11211,12 @@ static block_q8_1 * ggml_cuda_nvfp4moe_xq_slot(const ggml_tensor * act, int64_t 
 
 static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor * gu = cgraph->nodes[i];
-    if (gu->op != GGML_OP_MUL_MAT_ID || gu->src[0]->type != GGML_TYPE_NVFP4 || !ggml_cuda_nvfp4moe_enabled()) {
+    if (gu->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    const ggml_type w_type = gu->src[0]->type;
+    const bool is_q8_0 = w_type == GGML_TYPE_Q8_0 && ggml_cuda_nk_q8_0_tc_enabled();
+    if (!is_q8_0 && (w_type != GGML_TYPE_NVFP4 || !ggml_cuda_nvfp4moe_enabled())) {
         return 0;
     }
     const int device = ctx ? ctx->device : ggml_cuda_get_device();
@@ -11216,9 +11225,13 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
     const ggml_tensor * x    = gu->src[1];
     const ggml_tensor * ids  = gu->src[2];
     const int64_t K = w_gu->ne[0], F = w_gu->ne[1]/2, n_used = gu->ne[1], T = gu->ne[2];
-    if (!ggml_cuda_nvfp4moe_supported(cc, K, F, n_used) || w_gu->ne[1] != 2*F || T < 1 || T > ggml_cuda_nvfp4moe_max_tok() ||
+    const bool shape_ok = is_q8_0
+        ? (ggml_cuda_nk_q8_0_tc_supported(cc, K, F, n_used) && T >= 1 && T <= 8)
+        : (ggml_cuda_nvfp4moe_supported(cc, K, F, n_used) && T >= 1 && T <= ggml_cuda_nvfp4moe_max_tok());
+    const size_t gu_row_bytes = is_q8_0 ? (size_t) (K/QK8_0)*sizeof(block_q8_0) : (size_t) (K/64)*36;
+    if (!shape_ok || w_gu->ne[1] != 2*F ||
             gu->ne[0] != 2*F || gu->ne[3] != 1 || !ggml_is_contiguous(gu) || gu->type != GGML_TYPE_F32 ||
-            w_gu->nb[0] != ggml_type_size(GGML_TYPE_NVFP4) || w_gu->nb[1] != (size_t) (K/64)*36 || w_gu->ne[3] != 1 ||
+            w_gu->nb[0] != ggml_type_size(w_type) || w_gu->nb[1] != gu_row_bytes || w_gu->ne[3] != 1 ||
             x->type != GGML_TYPE_F32 || x->ne[0] != K || x->ne[1] != 1 || x->ne[2] != T || x->nb[0] != sizeof(float) ||
             x->nb[2] % sizeof(float) != 0 ||
             ids->type != GGML_TYPE_I32 || ids->ne[0] != n_used || ids->ne[1] != T || ids->nb[0] != sizeof(int32_t) ||
@@ -11287,9 +11300,10 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
     }
     ggml_tensor * dn = cgraph->nodes[j];
     const ggml_tensor * w_dn = dn->src[0];
-    if (dn->op != GGML_OP_MUL_MAT_ID || dn->src[1] != act || dn->src[2] != ids || w_dn->type != GGML_TYPE_NVFP4 ||
+    const size_t dn_row_bytes = is_q8_0 ? (size_t) (F/QK8_0)*sizeof(block_q8_0) : (size_t) (F/64)*36;
+    if (dn->op != GGML_OP_MUL_MAT_ID || dn->src[1] != act || dn->src[2] != ids || w_dn->type != w_type ||
             w_dn->ne[0] != F || w_dn->ne[1] != K || w_dn->ne[2] != w_gu->ne[2] || w_dn->ne[3] != 1 ||
-            w_dn->nb[0] != ggml_type_size(GGML_TYPE_NVFP4) || w_dn->nb[1] != (size_t) (F/64)*36 || w_dn->nb[2] % 4 != 0 ||
+            w_dn->nb[0] != ggml_type_size(w_type) || w_dn->nb[1] != dn_row_bytes || w_dn->nb[2] % 4 != 0 ||
             !plain_weight(dn, w_dn) || dn->ne[0] != K || dn->ne[1] != n_used || dn->ne[2] != T ||
             !ggml_is_contiguous(dn) || dn->type != GGML_TYPE_F32) {
         return 0;
@@ -11344,13 +11358,19 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
         P.x = (const float *) x->data; P.x_s2 = x->nb[2]/sizeof(float);
         P.ids = (const int32_t *) ids->data; P.ids_s1 = ids->nb[1]/sizeof(int32_t);
         P.act = (block_q8_1 *) act->data;
-        P.xq = ggml_cuda_nvfp4moe_xq_slot(act, T, n_used, K, F);
+        P.xq = ggml_cuda_nvfp4moe_xq_slot(act, T, n_used, K, F, is_q8_0);
         P.e_out = (float *) dn_out->data;
         P.situ = sp;
         P.K = (int) K; P.F = (int) F; P.n_used = (int) n_used; P.T = (int) T; P.write_sum = 0;
-        P.actf = (float *) act->data; P.acth = (half2 *) act->data; P.f32act = T == 1 ? ggml_cuda_nvfp4moe_f32act() : 0;
+        P.actf = (float *) act->data; P.acth = (half2 *) act->data; P.f32act = (!is_q8_0 && T == 1) ? ggml_cuda_nvfp4moe_f32act() : 0;
         if (P.f32act == 1 && (uintptr_t) x->data % 16 != 0) { P.f32act = 0; }  // gu1f reads x as float4
-        ggml_cuda_nvfp4moe_launch(P, ctx->stream());
+        if (is_q8_0) {
+            if (!ggml_cuda_nk_q8_0_tc_launch(P, ctx->stream())) {
+                return 0;
+            }
+        } else {
+            ggml_cuda_nvfp4moe_launch(P, ctx->stream());
+        }
         return last - i;
     }
     const int n_w = ggml_cuda_try_fuse_ink_moe_wsum(nullptr, cgraph, j);
@@ -11404,24 +11424,31 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
     P.ids = (const int32_t *) ids->data; P.ids_s1 = ids->nb[1]/sizeof(int32_t);
     P.rw = (const float *) rw->data; P.rw_s1 = rw->nb[1]/sizeof(float); P.rw_s2 = rw->nb[2]/sizeof(float);
     P.act = (block_q8_1 *) act->data;
-    P.xq = ggml_cuda_nvfp4moe_xq_slot(act, T, n_used, K, F);
+    P.xq = ggml_cuda_nvfp4moe_xq_slot(act, T, n_used, K, F, is_q8_0);
     P.e_out = (float *) dn_out->data;
     P.out = (float *) sum->data;
     P.situ = sp;
-    P.K = (int) K; P.F = (int) F; P.n_used = (int) n_used; P.T = (int) T; P.write_sum = 1;
-    P.actf = (float *) act->data; P.acth = (half2 *) act->data; P.f32act = T == 1 ? ggml_cuda_nvfp4moe_f32act() : 0;
+    P.K = (int) K; P.F = (int) F; P.n_used = (int) n_used; P.T = (int) T; P.write_sum = is_q8_0 ? 0 : 1;
+    P.actf = (float *) act->data; P.acth = (half2 *) act->data; P.f32act = (!is_q8_0 && T == 1) ? ggml_cuda_nvfp4moe_f32act() : 0;
     if (P.f32act == 1 && (uintptr_t) x->data % 16 != 0) { P.f32act = 0; }  // gu1f reads x as float4
     // NVFP4MT at one token writes e_out (dn_out) like T > 1 and the weighted sum runs below; else dn1 writes the sum
     bool e_out_sum = T > 1;
     if (T == 1) {
         P.write_sum = 0;
-        e_out_sum = (ggml_cuda_nk_nvfp4_tc_accepts(P) || ggml_cuda_nvfp4mt_accepts(P)) && !ink_overlap(dn_out, act) && !ink_overlap(dn_out, sum);
+        e_out_sum = (is_q8_0 ? ggml_cuda_nk_q8_0_tc_accepts(P) : (ggml_cuda_nk_nvfp4_tc_accepts(P) || ggml_cuda_nvfp4mt_accepts(P))) &&
+            !ink_overlap(dn_out, act) && !ink_overlap(dn_out, sum);
         for (const ggml_tensor * rd : reads) {
             e_out_sum = e_out_sum && !(rd && ink_overlap(dn_out, rd));
         }
-        P.write_sum = e_out_sum ? 0 : 1;
+        P.write_sum = (is_q8_0 || e_out_sum) ? 0 : 1;
     }
-    ggml_cuda_nvfp4moe_launch(P, ctx->stream());
+    if (is_q8_0) {
+        if (!e_out_sum || !ggml_cuda_nk_q8_0_tc_launch(P, ctx->stream())) {
+            return 0;
+        }
+    } else {
+        ggml_cuda_nvfp4moe_launch(P, ctx->stream());
+    }
     if (e_out_sum) {
         ggml_cuda_ink_moe_wsum(*ctx, dn_out, rw, sum);
     }
@@ -17694,6 +17721,12 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "gdn_khshare") == 0) {
         extern int64_t ggml_cuda_gdn_khshare_count; // gated_delta_net.cu (#199)
         return ggml_cuda_gdn_khshare_count;
+    }
+    if (strcmp(name, "nk_nvfp4_tc") == 0) {
+        return ggml_cuda_nk_nvfp4_tc_count();
+    }
+    if (strcmp(name, "nk_q8_0_tc") == 0) {
+        return ggml_cuda_nk_q8_0_tc_count();
     }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
