@@ -3563,8 +3563,9 @@ struct mtmd_model_loader {
                 model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), host_weights_buft));
                 if (model.buf) {
                     buft = host_weights_buft;
-                    LOG_INF("%s: --mmproj-host-weights: projector weights in host memory, buffer \"%s\"\n",
-                            __func__, ggml_backend_buft_name(host_weights_buft));
+                    LOG_INF("%s: --mmproj-host-weights: projector weights in host memory, buffer \"%s\", device %s\n",
+                            __func__, ggml_backend_buft_name(host_weights_buft),
+                            ggml_backend_dev_name(ggml_backend_buft_get_device(host_weights_buft)));
                 } else if (model_params.host_weights_strict && !no_alloc) {
                     // the memory fit counted these weights as host memory, so device memory may not have room for them
                     throw std::runtime_error(mtmd_format("%s: --mmproj-host-weights: failed to pin host memory after the memory fit; free host RAM, or use --fit off or --no-mmproj-host-weights\n", __func__));

@@ -607,14 +607,22 @@ static bool cbx_is_mtl(const mtmd_model & model) {
     return model.cbx_read_tensor("a.cenc.perceiver.pre_attention_query", nullptr, 0) > 0;
 }
 
-// CUDA_Host_W buffer type of the device, nullptr when the backend has none
+// CUDA_Host_W buffer type of the device (the projector's -mmdev device), nullptr when the backend has none
 static ggml_backend_buffer_type_t mtmd_host_weights_buft(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    typedef ggml_backend_buffer_type_t (*host_weights_buft_fn)(void);
+    typedef ggml_backend_buffer_type_t (*host_weights_buft_fn)(int);
     auto get_host_weights_buft = reg
-        ? (host_weights_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_weights_buffer_type")
+        ? (host_weights_buft_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_host_weights_buffer_type_dev")
         : nullptr;
-    return get_host_weights_buft ? get_host_weights_buft() : nullptr;
+    if (!get_host_weights_buft) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return get_host_weights_buft((int) i);
+        }
+    }
+    return nullptr;
 }
 
 struct mtmd_context {
