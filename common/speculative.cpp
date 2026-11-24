@@ -1378,9 +1378,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // positions, which is all find_slot requires (the crash was the image batch itself,
         // whose tokens all carry one temporal position). No server-side change is involved.
         // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
+        // fork (INKVIS): a target without M-RoPE (Inkling 2) gives the image rows ordinary consecutive positions, and
+        // its draft cache (full-attention layer, SJ-KVaRN) only accepts Y = X + 1: skipping them made the first text
+        // batch after an image fail find_slot and every image request return 500. Mirror the image rows there, with
+        // their target features, so the draft cache stays contiguous.
         const bool has_tokens     = batch_in.token != nullptr;
         const bool has_embeddings = batch_in.embd  != nullptr;
-        if (!has_tokens || has_embeddings) {
+        if ((!has_tokens && !has_embeddings) || (has_embeddings && is_mrope)) {
             return true;
         }
 
