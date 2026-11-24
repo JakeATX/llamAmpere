@@ -394,9 +394,17 @@ public:
     ggml_tensor * s_copy_pair_main = nullptr; // I32 [n_seqs] view
     ggml_tensor * replay_w         = nullptr; // F32 [n_rs_seq], or [n_rs_seq, n_seqs] per lane ([TAG_GDN_REPLAY_LANES])
 
+    // [CONVGATHER] one-graph conv history gather (LLAMA_INKLING2_CONV_GATHER=1): s_copy once per layer plane of the
+    // memory's r_all, and the gathered rows {n_embd_r, n_rs, n_layer} built by the first layer that asks (build_rs_all).
+    // Only when no state is zeroed, moved or copied as an extra (n_rs == n_seqs, rs_z < 0, n_older == 0): those keep
+    // the per-layer build_rs. nullptr otherwise.
+    ggml_tensor * s_copy_all = nullptr; // I32 [n_rs, n_layer]
+    ggml_tensor * r_rows_all = nullptr;
+
     // fill every rs input (s_copy and the shift or ring tensors) from the memory context; exactly
     // once per ubatch -- both fills consume the pending rollback
     void fill_s_copy(const llama_memory_recurrent_context * m);
+    void fill_s_copy_all(const int32_t * data); // [CONVGATHER] s_copy once per layer plane
 
     // [TAG_GDN_REPLAY_LANES] 2-D replay_w: w, s_copy_conv and s_copy_pair per lane, from the filled s_copy data
     void fill_replay_lanes(const llama_memory_recurrent_context * m, const int32_t * data, int64_t n_rs);
@@ -2154,6 +2162,14 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = nullptr) const;
+
+    // [CONVGATHER] the conv history of the layer whose state is s (a plane of the memory's r_all), from one gather of
+    // every layer's rows per graph; nullptr when the graph cannot take it (then build_rs)
+    ggml_tensor * build_rs_all(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     // the conv history gather: build_rs, except that under --gdn-replay's static verify graph the rows
     // come from the pending rollback's group (inp->s_copy_conv)

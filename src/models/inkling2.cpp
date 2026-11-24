@@ -346,7 +346,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
-    ggml_tensor * history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+    // [CONVGATHER] LLAMA_INKLING2_CONV_GATHER=1: one gather of every layer's conv history per graph (a view of it here)
+    ggml_tensor * history = build_rs_all(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+    if (!history) {
+        history = build_rs(recr, state, hparams.n_embd_r(), ubatch.n_seqs);
+    }
     history = ggml_reshape_3d(ctx0, history, hparams.n_shortconv_l_cache - 1, hparams.n_sconv_channels, ubatch.n_seqs);
 
     res->t_layer_inp[n_visit++] = cur;

@@ -25,6 +25,7 @@ struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
 class llama_ink_stream;
+class llama_ink_headloan;
 class llama_b1;
 class llama_ple_prefetch;
 struct llama_ple_hinter;
@@ -686,6 +687,8 @@ private:
     // fork (INKSTREAM): prompt expert streamer (see llama-ink-stream.h). take: suspend the MoE cache and arm the
     // streamer for a prompt call; release: disarm, shrink the prompt scratch and refill the cache (before decode).
     std::unique_ptr<llama_ink_stream> ink_stream;
+    std::unique_ptr<llama_ink_headloan> ink_headloan;
+    uint32_t ink_head_retry = 0; // [HEADLOAN] rate limit of the upload retry after a failed restore // [HEADLOAN] (#247) LLAMA_INK_HEAD_LOAN=1
     bool     ink_stream_take();
     bool     ink_stream_release(const char * why);
     uint64_t ink_stream_tokens = 0;  // prompt tokens streamed since the last take

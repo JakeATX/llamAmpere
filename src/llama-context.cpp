@@ -34,6 +34,7 @@
 #include "llama-mtp-chain-sample.h"
 #include "llama-moe-cache.h"
 #include "llama-ink-stream.h"
+#include "llama-ink-headloan.h"
 #include "llama-ink-host.h"
 #include "llama-b1.h"
 #include "llama-ple-prefetch.h"
@@ -548,6 +549,12 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             // used to read the target's layer input device buffer
             cparams.ctx_other = params.ctx_other;
         }
+    }
+
+    // [HEADLOAN] a context that reads another context's model (draft heads, MTP peers) may run that model's head: it is
+    // never lent then
+    if (cparams.ctx_other != nullptr && llama_get_model(cparams.ctx_other) != nullptr) {
+        llama_get_model(cparams.ctx_other)->output_borrowed = true;
     }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -1494,6 +1501,18 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        // [HEADLOAN] (#247): the head the loader kept in host memory goes into a VRAM buffer of its own before the MoE cache
+        // is sized, so the boot layout matches the head in the weight buffer; streamed prompts lend that buffer
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc() && llama_ink_headloan_wanted(model.arch) &&
+                !model.output_loaned && model.output && model.output->buffer && ggml_backend_buffer_is_host(model.output->buffer) &&
+                model.dev_output() && ggml_backend_dev_type(model.dev_output()) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ink_headloan = std::make_unique<llama_ink_headloan>(model.output, ggml_backend_dev_buffer_type(model.dev_output()));
+            if (!ink_headloan->ok()) {
+                ink_headloan.reset();
+            } else {
+                model.output_loaned = true; // one owner per model: a second context keeps the head where it is
+            }
+        }
         // fork (INKSMALL2): auto-size the MoE expert cache when the experts live in host memory (-cmoe / -ot ...=CPU) and
         // --moe-cache-mib was not given. Without a cache, Inkling 2 Mini on an 8-12 GB card decodes ~10 tok/s instead of
         // 48-99. Size = free device memory after the weights and KV minus a reserve for the compute buffer and its
@@ -1867,6 +1886,10 @@ void llama_context::ple_hint_add(const llama_token * window, int32_t n_window) {
 }
 
 llama_context::~llama_context() {
+    if (ink_headloan) { // [HEADLOAN] the head points at its host copy again; the VRAM copy goes
+        ink_headloan.reset();
+        model.output_loaned = false;
+    }
     if (ink_stream) {
         ink_stream->disarm(); // its copy stream and events go before the backends
         ink_stream.reset();
@@ -6245,6 +6268,12 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         ink_refill = ink_refill || (!ink_stream->armed() && moe_cache && moe_cache->suspended() && (n_tokens == 0 || ++ink_retry % 64 == 0));
     }
     const bool ink_armed = ink_stream && ink_stream->armed();
+    // [HEADLOAN] an upload that failed at the release is retried (rate-limited like the cache refill above)
+    if (!ink_armed && ink_headloan && ink_headloan->is_lent() && (n_tokens == 0 || ++ink_head_retry % 64 == 0) &&
+            ink_headloan->restore()) {
+        LLAMA_LOG_WARN("%s: [HEADLOAN] head uploaded again (retry)\n", __func__);
+        sched_need_reserve = true;
+    }
     // refill the hot experts once the prompt scratch is back to its boot size
     auto ink_cache_refill = [&]() {
         if (!ink_refill || !moe_cache) {
@@ -6607,7 +6636,15 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 const uint32_t allocated = std::max(1u, sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch);
                 uint32_t pick = 512;
                 double log_free = 0.0, log_need = 0.0; // the smallest ceiling above 512 that was tried
-                for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r /= 2) {
+                // [HEADLOAN] LLAMA_INK_STREAM_RUNG=N (a multiple of 256, 256..2048; unset/0 = halving): the ceilings
+                // step down by N rows instead of halving, so a card whose free VRAM sits between two powers of two
+                // (8 GB with the head lent: 1,536) streams fewer bytes per prompt token
+                static const uint32_t rung = [] {
+                    const char * e = getenv("LLAMA_INK_STREAM_RUNG");
+                    const long v = e && e[0] ? strtol(e, nullptr, 10) : 0;
+                    return v >= 256 && v <= 2048 && v % 256 == 0 ? (uint32_t) v : 0u;
+                }();
+                for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r = rung ? (r > 512 + rung ? r - rung : 512) : r / 2) {
                     bool fits = true;
                     for (auto backend : backend_ptrs) {
                         auto dev = ggml_backend_get_device(backend);
@@ -6779,6 +6816,9 @@ bool llama_context::ink_stream_take() {
         return false;
     }
     ink_stream_fails = 0;
+    // [HEADLOAN] the prompt needs the head for its last row only: it runs from host memory while the streamer is armed
+    // (not when a draft model shares the head tensor)
+    const bool head_lent = ink_headloan && !model.output_borrowed && ink_headloan->lend();
     // the ladder was cut while the cache held the card: start the prompt ceiling high again and check it now; the cut
     // test below gives rows back if the lent VRAM does not fund them
     if (dynamic_ubatch) {
@@ -6796,14 +6836,21 @@ bool llama_context::ink_stream_take() {
         const double ms = (ink_stream_t0_us - t_take0)/1000.0;
         ink_loan_take_ms = ink_loan_take_ms > 0 ? 0.5*(ink_loan_take_ms + ms) : ms;
     }
-    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt: MoE cache lent (%.0f MiB), 2 expert slots of %.1f MiB armed\n", __func__,
-            lent/1048576.0, ink_stream->slot_bytes()/1048576.0);
+    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt: MoE cache lent (%.0f MiB), 2 expert slots of %.1f MiB armed%s\n", __func__,
+            lent/1048576.0, ink_stream->slot_bytes()/1048576.0, head_lent ? ", head lent [HEADLOAN]" : "");
     return true;
 }
 
 bool llama_context::ink_stream_release(const char * why) {
     synchronize();
     ink_stream->disarm();
+    // [HEADLOAN] the head back in VRAM before the cache refill sizes itself from free memory
+    if (ink_headloan && ink_headloan->is_lent()) {
+        const int64_t t_head0 = ggml_time_us();
+        if (ink_headloan->restore()) {
+            LLAMA_LOG_WARN("%s: [HEADLOAN] head uploaded again in %.1f ms\n", __func__, (ggml_time_us() - t_head0)/1000.0);
+        }
+    }
     const llama_ink_stream_stats st = ink_stream->take_stats();
     sched_need_reserve = true; // the graph reads the MoE cache again
     const double t = (ggml_time_us() - ink_stream_t0_us)/1e6;

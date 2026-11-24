@@ -843,6 +843,8 @@ struct llama_model {
     struct ggml_tensor * output_res_query = nullptr; // inkling2: query of the final attention-residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
+    mutable bool output_borrowed = false; // [HEADLOAN] a draft model shares this head tensor (set through its const donor pointer)
+    mutable bool output_loaned   = false; // [HEADLOAN] a context owns the head's VRAM loan
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
