@@ -1527,7 +1527,7 @@ struct llama_moe_cache::impl {
             }
             n_warm += keep.size();
         }
-        LLAMA_LOG_INFO("%s: [HEAT] warm start: %zu experts placed from the profile, %.2f MiB uploaded\n", __func__,
+        LLAMA_LOG_WARN("%s: [HEAT] warm start: %zu experts placed from the profile, %.2f MiB uploaded\n", __func__,
                 n_warm, bytes/1024.0/1024.0);
     }
 
@@ -1557,7 +1557,7 @@ struct llama_moe_cache::impl {
                 if (hits + misses == 0) {
                     return;
                 }
-                LLAMA_LOG_INFO("llama_moe_cache: request %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
+                LLAMA_LOG_WARN("llama_moe_cache: request %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
                         name, hits, misses, cpu, 100.0*hits/(hits + misses), bytes/1024.0/1024.0);
             };
             line("decode", stats_small, req_small);

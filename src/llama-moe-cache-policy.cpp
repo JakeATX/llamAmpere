@@ -158,7 +158,7 @@ void llama_moe_cache_heat::init(int32_t n_layer, int32_t n_expert, uint64_t fing
 bool llama_moe_cache_heat::load() {
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) {
-        LLAMA_LOG_INFO("%s: [HEAT] no profile at %s yet, starting cold\n", __func__, path.c_str());
+        LLAMA_LOG_WARN("%s: [HEAT] no profile at %s yet, starting cold\n", __func__, path.c_str());
         return false;
     }
     char magic[4];
@@ -185,7 +185,7 @@ bool llama_moe_cache_heat::load() {
         return false;
     }
     rate_old = std::move(r);
-    LLAMA_LOG_INFO("%s: [HEAT] loaded %s (%llu decode rows)\n", __func__, path.c_str(), (unsigned long long) nrows);
+    LLAMA_LOG_WARN("%s: [HEAT] loaded %s (%llu decode rows)\n", __func__, path.c_str(), (unsigned long long) nrows);
     return true;
 }
 
@@ -250,7 +250,7 @@ bool llama_moe_cache_heat::save() {
     }
     rows_saved = total;
     t_save = std::chrono::steady_clock::now();
-    LLAMA_LOG_INFO("%s: [HEAT] saved %s (%llu decode rows this session)\n", __func__, path.c_str(), (unsigned long long) total);
+    LLAMA_LOG_WARN("%s: [HEAT] saved %s (%llu decode rows this session)\n", __func__, path.c_str(), (unsigned long long) total);
     return true;
 }
 
@@ -470,7 +470,7 @@ void llama_moe_split_policy::window_end() {
     f = std::round(f/0.05)*0.05;
     frac = std::clamp(f, 0.10, 0.60);
     frac_hist.push_back(frac);
-    LLAMA_LOG_INFO("llama_moe_cache: [SPLIT] update %d after %lld windows: c %.4f ms, g %.4f ms per expert -> PCIe fraction %.2f\n",
+    LLAMA_LOG_WARN("llama_moe_cache: [SPLIT] update %d after %lld windows: c %.4f ms, g %.4f ms per expert -> PCIe fraction %.2f\n",
             n_updates, (long long) n_windows, c, g, frac);
 }
 
@@ -482,7 +482,7 @@ void llama_moe_split_policy::log_summary() const {
     for (double f : frac_hist) {
         hist += (hist.empty() ? "" : " -> ") + std::to_string(f).substr(0, 5);
     }
-    LLAMA_LOG_INFO("llama_moe_cache: [SPLIT] %lld lookups, %lld windows, %lld samples (%lld dropped), %lld explore; "
+    LLAMA_LOG_WARN("llama_moe_cache: [SPLIT] %lld lookups, %lld windows, %lld samples (%lld dropped), %lld explore; "
             "CPU %.4f + %.4f*cpu + %.4f*pcie ms (n %lld), GPU %.4f + %.4f*pcie ms (n %lld, %lld with PCIe)%s%s\n",
             (long long) n_lookups, (long long) n_windows, (long long) n_obs, (long long) n_drop, (long long) n_explore,
             cpu.theta[0], cpu.theta[1], cpu.theta[2], (long long) cpu.n, gpu.theta[0], gpu.theta[1], (long long) gpu.n,

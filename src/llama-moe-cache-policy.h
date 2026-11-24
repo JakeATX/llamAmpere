@@ -8,7 +8,7 @@
 //     LLAMA_MOE_CACHE_SLOTS=N         fixed slot count (experts) per layer group instead of a byte budget;
 //                                     wins over LLAMA_MOE_CACHE_DEV_MIB
 //     LLAMA_MOE_CACHE_LAYERS=0,4-20   only these layers are cached (a looped layer's visits follow its first visit)
-//     LLAMA_MOE_CACHE_REQ_STATS=1     one hit/miss/upload line per request at INFO (llama_moe_cache_request_end)
+//     LLAMA_MOE_CACHE_REQ_STATS=1     one hit/miss/upload line per request (WARN level, so the default server log shows it) (llama_moe_cache_request_end)
 //     LLAMA_MOE_CACHE_DRAFT_MIB=N     (common/speculative.cpp) a draft model context gets its own N MiB cache
 //   GS4 heat profile:
 //     LLAMA_MOE_CACHE_HEAT=path       decode use rate per expert; loaded at start (warm slots), saved at exit and at
