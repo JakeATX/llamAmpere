@@ -6,8 +6,10 @@
 // token = argmax_i (logit_i + G(seed, n, id_i)), G = -log(-log(u)), u uniform in (0, 1) from the hash. This samples
 // exactly softmax(logits), like the dist sampler, but the noise of output index n does not depend on how many random
 // numbers were drawn before. With speculation verified by id match (the server forces that in this mode), spec on
-// and spec off then emit the same tokens at any temperature, so a T = 1 speed gate can prove "no output change" by
-// comparing ids. Not a production verify: p/q accepts more than id match.
+// and spec off then emit the same tokens at any temperature, so a T = 1 identity check can prove "no output change"
+// by comparing ids. Identity only, never speed: id match accepts fewer drafts than the p/q verify and backend
+// sampling is off in this mode, so its tok/s is not the product's. With the default seed the noise is fixed (pass
+// an explicit seed per request).
 
 #include <cmath>
 #include <cstdint>

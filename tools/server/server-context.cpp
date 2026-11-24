@@ -877,8 +877,11 @@ static bool server_rtb_ckptgap() {
 
 static int64_t server_rtb_ckptgap_step(int64_t n_prompt, int32_t n_ckpt, int32_t min_step) {
     static const int64_t lo = rtb::env_num("LLAMA_RTB_CKPTGAP_MIN", 1024, 1, 1 << 30);
+    if (min_step <= 0) {
+        return min_step; // no minimum spacing configured: as before
+    }
     const int64_t step = n_prompt / std::max<int32_t>(1, n_ckpt - 3);
-    return std::max<int64_t>(lo, std::min<int64_t>(min_step, step));
+    return std::min<int64_t>(min_step, std::max<int64_t>(lo, step));
 }
 
 static bool server_bookkeep_enabled() {
