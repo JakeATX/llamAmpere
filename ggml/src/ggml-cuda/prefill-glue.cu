@@ -675,6 +675,10 @@ static bool pf_pick_target(const ggml_backend_cuda_context & ctx, const ggml_cgr
         if (!src1 || (src1 != prod_out && pf_unwrap_views(src1) != prod_out)) {
             continue;
         }
+        // the layout (xsh, K) is chosen from the consumer: it must read rows of exactly the producer's width
+        if (src1->ne[0] != prod_out->ne[0] || ggml_nrows(src1) != ggml_nrows(prod_out)) {
+            continue;
+        }
         const pf_consumer_route r = pf_inspect_consumer(ctx, node);
         if (!r.valid) {
             continue;
