@@ -1792,6 +1792,14 @@ bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler
     return true;
 }
 
+bool common_sampler_reasoning_in_think(const struct common_sampler * gsmpl, const llama_sampler * tracker) {
+    if (!gsmpl) {
+        return false;
+    }
+    const llama_sampler * think = gsmpl->rbudget ? gsmpl->rbudget : tracker;
+    return think && common_reasoning_budget_get_state(think) == REASONING_BUDGET_COUNTING;
+}
+
 llama_token common_sampler_reasoning_rescue_eog(struct common_sampler * gsmpl, llama_sampler ** tracker) {
     if (!gsmpl || gsmpl->params.reasoning_budget_forced.empty()) {
         return LLAMA_TOKEN_NULL;

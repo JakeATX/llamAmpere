@@ -164,6 +164,10 @@ json server_slot_stats::to_json() const {
         base["loop_repeats"] = loop_repeats;
     }
 
+    if (think_loop_closed) {
+        base["think_loop_closed"] = true;
+    }
+
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
