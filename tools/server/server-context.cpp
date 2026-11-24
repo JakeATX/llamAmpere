@@ -31,6 +31,7 @@
 #include "speculative-copy-ctl.h"
 #include "speculative-cost-depth.h"
 #include "preset.h"
+#include "spec-tree.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "mtmd-internal.h"
@@ -649,6 +650,7 @@ struct server_batch {
         bool is_prompt; // for stats tracking
         int32_t decision_order = 0;
         int32_t i_embd = -1; // row in embd, -1 if this is a token
+        llama_seq_id seq = -1; // UZU-1T: sequence of a tree verify row (-1 = the slot's own)
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -680,6 +682,15 @@ struct server_batch {
             return false;
         }
         tokens.push_back({ id_slot, token, { pos, 0, 0, 0 }, output, is_prompt });
+        return true;
+    }
+
+    // UZU-1T: a tree verify row of slot id_slot on its own sequence
+    bool add_tree(int32_t id_slot, llama_seq_id seq, llama_token token, llama_pos pos, bool output) {
+        if (!add(id_slot, token, pos, output, false)) {
+            return false;
+        }
+        tokens.back().seq = seq;
         return true;
     }
 
@@ -746,7 +757,7 @@ struct server_batch {
             if (t.i_embd >= 0) {
                 view.add_embd({ embd.data() + (size_t) t.i_embd * n_embd, 1, (size_t) n_embd }, t.pos.data(), t.id_slot, t.output);
             } else {
-                view.add(t.token, t.pos[0], t.id_slot, t.output);
+                view.add(t.token, t.pos[0], t.seq >= 0 ? t.seq : t.id_slot, t.output);
             }
             view.tokens.back().decision_order = t.decision_order;
         }
@@ -1018,6 +1029,12 @@ struct server_slot {
     int64_t   spec_ckpt_tgt_n_tokens = -1; // -1 = no valid target checkpoint
     llama_pos spec_ckpt_tgt_pos_max  = -1;
     llama_tokens spec_replay_prefix;       // committed tokens to re-decode ahead of the replayed draft (no output)
+    // UZU-1T (LLAMA_SPEC_TREE): the extra verify paths of this round (own sequences, removed after the verify)
+    std::vector<common_spec_tree_path> spec_tree;
+    llama_pos spec_tree_pos0   = -1; // position of the anchor row
+    uint64_t  spec_tree_rounds = 0;  // rounds verified with extra paths
+    uint64_t  spec_tree_won    = 0;  // rounds an extra path extended
+    uint64_t  spec_tree_tokens = 0;  // tokens those extensions committed
     bool spec_is_replay = false;
     bool spec_round_kb  = false; // copy mode: this wide round keeps its pre-round state plane on the card (no checkpoint)
     common_sampler_ptr spec_smpl_after_verify;
@@ -1336,6 +1353,16 @@ struct server_slot {
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
+        if (!spec_tree.empty()) {
+            for (const auto & p : spec_tree) {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), p.seq, -1, -1);
+            }
+            spec_tree.clear();
+        }
+        if (common_spec_tree_paths() > 0) {
+            spec_replay_prefix.clear();
+        }
+        spec_tree_rounds = spec_tree_won = spec_tree_tokens = 0;
         generated_tokens.clear();
         generated_token_probs.clear();
         draft_vocab_observed = false;
@@ -1516,6 +1543,9 @@ struct server_slot {
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
+        if (common_spec_tree_paths() > 0) {
+            n_draft_max -= (int) spec_replay_prefix.size(); // UZU-1T: tree tokens still to re-decode
+        }
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
@@ -1533,6 +1563,17 @@ struct server_slot {
         const llama_token tok_track = sampled == LLAMA_TOKEN_NULL ? 0 : sampled;
         if (spec_draft.empty() && !spec_smpl_after_verify) {
             // no speculative decoding
+            // UZU-1T: tokens a tree path committed last round and that no draft round re-decoded yet (the drafter
+            // holds their rows from the commit; the decode below injects them again)
+            if (!spec_replay_prefix.empty() && ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), id, prompt.tokens.pos_next(), -1);
+            }
+            for (auto token : spec_replay_prefix) {
+                add_ok &= batch.add(this->id, token, prompt.tokens.pos_next(), false, false);
+                prompt.tokens.push_back(token);
+            }
+            spec_replay_prefix.clear();
+
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
@@ -1565,6 +1606,8 @@ struct server_slot {
 
             // copy mode: a restore from a reused (older) checkpoint first re-decodes the committed tokens between
             // the checkpoint and this round, in the same pass as the replayed draft and without output rows
+            const llama_tokens tree_prefix = spec_tree.empty() ? llama_tokens() : spec_replay_prefix;
+            const llama_pos    tree_pos_pre = prompt.tokens.pos_next();
             for (auto token : spec_replay_prefix) {
                 add_ok &= batch.add(this->id, token, prompt.tokens.pos_next(), false, false);
                 prompt.tokens.push_back(token);
@@ -1579,9 +1622,26 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
+            spec_tree_pos0 = pos0;
             add_ok &= batch.add(id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
+            }
+
+            // UZU-1T: every extra path repeats the pending prefix and the anchor on its own sequence (equal length,
+            // so the verify stays one ubatch), then its own tokens
+            for (auto & p : spec_tree) {
+                llama_pos pos = tree_pos_pre;
+                for (auto token : tree_prefix) {
+                    add_ok &= batch.add_tree(id, p.seq, token, pos++, false);
+                }
+                p.rows.clear();
+                p.rows.push_back(batch.size());
+                add_ok &= batch.add_tree(id, p.seq, sampled, pos++, true);
+                for (auto token : p.tokens) {
+                    p.rows.push_back(batch.size());
+                    add_ok &= batch.add_tree(id, p.seq, token, pos++, true);
+                }
             }
         }
 
@@ -1777,6 +1837,10 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            if (spec_tree_rounds > 0) {
+                SLT_INF(*this, "tree verify: %" PRIu64 " / %d rounds with extra paths, %" PRIu64 " extended, %" PRIu64 " tokens from extra paths\n",
+                        spec_tree_rounds, n_draft_verif_steps, spec_tree_won, spec_tree_tokens);
+            }
             // [D56] LLAMA_SPEC_ACCPOS=1 prints the per-position acceptance at info level (no -lv 4 needed)
             static const bool accpos_inf = getenv("LLAMA_SPEC_ACCPOS") != nullptr && strcmp(getenv("LLAMA_SPEC_ACCPOS"), "0") != 0;
             if (accpos_inf) {
@@ -2234,6 +2298,7 @@ private:
     }
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    int32_t spec_tree_n = 0; // UZU-1T: extra verify paths per round (LLAMA_SPEC_TREE, after the config checks)
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
@@ -2659,6 +2724,35 @@ private:
             SRV_INF("copy-first: %s (max span = %d)\n", params.speculative.copy_first > 0 ? "on" : "off",
                     params.speculative.copy_first);
         }
+        // UZU-1T (LLAMA_SPEC_TREE=P): P extra verify paths per round from the drafter's per-depth candidates. v1: one
+        // slot with a block drafter (-md, the Inkling DSpark markov head; other drafters keep the chain every round),
+        // text only, no tensor split, no synthetic acceptance. Copy mode and copy-first are off with it.
+        spec_tree_n = 0;
+        params.n_seq_tree = 0;
+        if (common_spec_tree_paths() > 0) {
+            const char * why = nullptr;
+            if (params.n_parallel != 1) {
+                why = "needs --parallel 1";
+            } else if (!params.speculative.has_dft() || mtp) {
+                why = "needs a block drafter (-md DSpark), not MTP";
+            } else if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                why = "not with -sm tensor";
+            } else if (!params.mmproj.path.empty()) {
+                why = "not with a multimodal projector";
+            } else if (params.speculative.has_synth()) {
+                why = "not with synthetic acceptance";
+            }
+            if (why) {
+                SRV_WRN("tree verify (LLAMA_SPEC_TREE=%d) refused: %s; drafts stay chains\n", common_spec_tree_paths(), why);
+            } else {
+                spec_tree_n = common_spec_tree_paths();
+                params.n_seq_tree = spec_tree_n;
+                params.speculative.copy_tail  = 0;
+                params.speculative.copy_first = 0;
+                SRV_INF("tree verify: on, %d extra paths per round, max %d children per node (copy mode and copy-first off)\n",
+                        spec_tree_n, common_spec_tree_branch());
+            }
+        }
 
 #if !defined(_WIN32)
         // copy mode: a wide verify batch keeps its pre-round recurrent plane, so a block miss needs no checkpoint
@@ -2679,6 +2773,11 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        if (params_base.n_seq_tree > 0) {
+            // UZU-1T: every extra path has the chain's output rows
+            params_base.n_outputs_max = std::min<int32_t>(common_context_n_batch(params_base),
+                    output_limits.per_seq * (1 + params_base.n_seq_tree));
+        }
 
         const bool has_mmproj = !params_base.mmproj.path.empty();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
@@ -6856,7 +6955,7 @@ private:
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_req,
-                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
+                            /* .pos0     = */ slot.prompt.tokens.pos_next() + (llama_pos) (spec_tree_n > 0 ? slot.spec_replay_prefix.size() : 0),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ spec_prompt,
                             /* .result   = */ &slot.spec_draft,
@@ -6998,6 +7097,10 @@ private:
                 if (use_ckpt_dft) {
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
+            }
+
+            if (spec_tree_n > 0) {
+                spec_tree_prepare(slot);
             }
         });
 
@@ -8711,6 +8814,10 @@ private:
             // batch indices of the draft tokens, used to get the token probabilities below
             auto spec_i_batch = std::move(slot.spec_i_batch);
 
+            // UZU-1T: tokens an extra path commits after the chain's miss, and that path
+            std::vector<llama_token> tree_ext;
+            int32_t tree_k = -1;
+
             // verify and try to accept the draft
             {
                 // fork: a sampler snapshot is used only when this round can require checkpoint replay.
@@ -8781,6 +8888,27 @@ private:
                 }
                 if (common_inkspec_log_on() && !slot.spec_is_replay && !replayed_verify) {
                     inkspec_log_round(slot.ctx_tgt, spec_i_batch, slot.spec_draft, accepted.size());
+                }
+                if (!slot.spec_tree.empty()) {
+                    // UZU-1T: the chain missed at depth n0 and the target committed x there: continue on an extra
+                    // path that holds x (only with the in-place rollback the paths were built for)
+                    const size_t n0 = accepted.size() - 1;
+                    const llama_token x = accepted.back();
+                    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(slot.ctx_tgt));
+                    const llama_tokens before(accepted.begin(), accepted.end() - 1);
+                    if (!replayed_verify && synth_probs.empty() && !slot.spec_is_replay && n0 < n_draft &&
+                            x != slot.spec_draft[n0] && !llama_vocab_is_eog(vocab, x) && !is_stop(x, before) &&
+                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt) &&
+                            llama_get_sampled_token_ith(slot.ctx_tgt, spec_i_batch[0]) == LLAMA_TOKEN_NULL) {
+                        tree_ext = common_spec_tree_extend(slot.smpl.get(), slot.ctx_tgt, slot.spec_draft, slot.spec_tree,
+                                n0, x, accepted, slot.spec_tree_pos0, is_stop, tree_k);
+                    }
+                    if (tree_ext.empty()) {
+                        tree_k = -1;
+                    }
+                    for (const auto & p : slot.spec_tree) {
+                        llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), p.seq, -1, -1);
+                    }
                 }
                 if (!slot.spec_is_replay && params_base.speculative.draft.depth_policy == "cdepth") {
                     // CDEPTH history: target top-1 of the committed rows (the re-decode after a restore is not counted twice)
@@ -8902,7 +9030,7 @@ private:
                 slot.spec_draft_q.clear();
             }
 
-            const auto ids = std::move(slot.spec_draft);
+            auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
             const size_t n_acc_ctl = slot.spec_forced ? slot.spec_n_nat - 1 : n_accepted;  // DSPINE-FU S4
@@ -8985,6 +9113,32 @@ private:
                 slot.sj_kvarn_accepted_end = slot.prompt.tokens.pos_next();
             }
 
+            if (tree_k >= 0) {
+                // UZU-1T: the path's rows of x and the extension go to the drafter now; the target re-decodes those
+                // tokens ahead of the next anchor (no output rows), the last extension token is the new anchor
+                const auto & tp = slot.spec_tree[tree_k];
+                if (!spec_tree_commit_dft(slot, tp, n_accepted + 1, tree_ext.size())) {
+                    SLT_WRN(slot, "%s", "tree verify: drafter feature commit failed\n");
+                }
+                GGML_ASSERT(slot.spec_replay_prefix.empty());
+                slot.spec_replay_prefix.push_back(ids.back());
+                slot.spec_replay_prefix.insert(slot.spec_replay_prefix.end(), tree_ext.begin(), tree_ext.end() - 1);
+                slot.sampled = tree_ext.back();
+                ids.insert(ids.end(), tree_ext.begin(), tree_ext.end());
+                slot.stats.n_draft_accepted += (int32_t) tree_ext.size();
+                slot.spec_tree_won    += 1;
+                slot.spec_tree_tokens += tree_ext.size();
+                if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {
+                    for (size_t j = 0; j < tree_ext.size(); ++j) {
+                        completion_token_output r;
+                        r.tok = tree_ext[j];
+                        populate_token_probs(slot, r, false, params_base.special, tp.rows[n_accepted + 1 + j]);
+                        pre_sample_probs.push_back(std::move(r));
+                    }
+                }
+            }
+            slot.spec_tree.clear();
+
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -9013,6 +9167,57 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+    }
+
+    // UZU-1T: build this round's extra paths from the drafter's per-depth candidates and give each a copy of the
+    // slot's sequence (the paths are decoded after the chain in the same batch, see handle_last_sampled_token)
+    void spec_tree_prepare(server_slot & slot) {
+        for (const auto & p : slot.spec_tree) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), p.seq, -1, -1); // a round that never reached its verify
+        }
+        slot.spec_tree.clear();
+        const auto & draft = slot.spec_draft;
+        if (draft.empty() || slot.spec_smpl_after_verify || slot.spec_is_replay || slot.prompt.tokens.has_mtmd ||
+                ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || draft.size() > llama_n_rs_seq(ctx_tgt)) {
+            return; // the in-place rollback of the chain is what lets a path extend it
+        }
+        const common_spec_tree_marg * marg = common_speculative_get_tree_marg(spec.get(), slot.id);
+        if (!marg || marg->chain.size() < draft.size() || !std::equal(draft.begin(), draft.end(), marg->chain.begin())) {
+            return; // not a block draft with candidates (copy span, other drafter, failed walk)
+        }
+        const size_t n_rows = (draft.size() + 1 + slot.spec_replay_prefix.size()) * (size_t) (1 + spec_tree_n);
+        if (n_rows > (size_t) llama_n_ubatch(ctx_tgt) || n_rows > (size_t) llama_n_batch(ctx_tgt)) {
+            return;
+        }
+        const auto paths = common_spec_tree_build(*marg, draft.size(), spec_tree_n, common_spec_tree_branch());
+        auto * mem = llama_get_memory(ctx_tgt);
+        for (size_t k = 0; k < paths.size(); ++k) {
+            common_spec_tree_path p;
+            p.tokens = paths[k];
+            p.seq    = (llama_seq_id) (params_base.n_parallel + (int32_t) k);
+            llama_memory_seq_rm(mem, p.seq, -1, -1);
+            llama_memory_seq_cp(mem, slot.id, p.seq, -1, -1);
+            slot.spec_tree.push_back(std::move(p));
+        }
+        if (!slot.spec_tree.empty()) {
+            slot.spec_tree_rounds += 1;
+        }
+    }
+
+    // UZU-1T: the drafter takes the target features of the winning path's rows [r0, r0 + n) as the slot's committed
+    // rows (positions pos_row0 + r), in place of the chain's rows it got during the verify decode
+    bool spec_tree_commit_dft(const server_slot & slot, const common_spec_tree_path & p, size_t r0, size_t n) {
+        const int32_t beg = p.rows[r0];
+        const int32_t end = p.rows[r0 + n - 1];
+        GGML_ASSERT(end - beg + 1 == (int32_t) n);
+        common_batch b(ctx_tgt);
+        for (int32_t i = 0; i <= end; ++i) {
+            // rows before the path's are not this slot's: a sequence id past the drafter's skips them
+            const bool mine = i >= beg;
+            b.add(0, mine ? slot.spec_tree_pos0 + (llama_pos) (r0 + (size_t) (i - beg)) : 0,
+                  mine ? (llama_seq_id) slot.id : (llama_seq_id) (params_base.n_parallel + spec_tree_n), false);
+        }
+        return common_speculative_process(spec.get(), b);
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot

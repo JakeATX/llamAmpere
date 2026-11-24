@@ -35,6 +35,10 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 // return the conditional synthetic acceptance probabilities
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
+// UZU-1T (LLAMA_SPEC_TREE): per-depth candidates of the last draft of seq_id, nullptr when the drafter has none
+struct common_spec_tree_marg;
+const common_spec_tree_marg * common_speculative_get_tree_marg(const common_speculative * spec, llama_seq_id seq_id);
+
 // MTP drafter KV cache types over a SJ-KVaRN trunk when DSJ is off and --spec-draft-type-k/-v are not given ({K, V}).
 // Provisional: one line to change (tq6_0/tq6_0 once its fused verify-width kernel lands).
 inline constexpr ggml_type COMMON_SJKVARN_MTP_DRAFT_KV[2] = { GGML_TYPE_TQ5_0, GGML_TYPE_TURBO4_0 };

@@ -2245,6 +2245,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    if (params.n_seq_tree > 0) {
+        // UZU-1T: the tree paths are sequences of their own next to the slot's, over the slot's whole context
+        cparams.n_seq_max  = params.n_parallel + params.n_seq_tree;
+        cparams.kv_unified = true;
+    }
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

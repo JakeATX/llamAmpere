@@ -10,6 +10,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "spec-tree.h"
 #include "speculative-adaptive.h"
 #include "speculative-cdepth.h"
 #include "speculative-copy.h"
@@ -256,6 +257,9 @@ struct common_speculative_impl {
     // change whether the server can capture an in-call prompt checkpoint.
     virtual bool get_resume_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const { return get_state(seq_id, data); }
     virtual bool set_resume_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) { set_state(seq_id, data); return !data.empty(); }
+
+    // (optional) UZU-1T: per-depth candidate marginals of the last draft of seq_id (LLAMA_SPEC_TREE), nullptr = none
+    virtual const common_spec_tree_marg * tree_marg(llama_seq_id /*seq_id*/) const { return nullptr; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1086,6 +1090,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t      dspark_sk       = 0;     // INKSPEC: K of the sampled walk of the last draft decode (0 = argmax)
     float        dspark_st       = 1.0f;  // INKSPEC: its draw temperature
     std::vector<float> dspark_noise;      // INKSPEC: Gumbel noise [K, n_blocks, walk]
+    bool         tree_greedy     = false; // UZU-1T: the sampled layout of the last draft decode is a greedy argmax walk
     // INKSPEC2: adaptive draft depth (the MTP streak controller) per seq, in [n_min_adaptive, n_max]; the markov walk
     // runs only to the deepest cap of the round. Drafter-side history only (verified counts), so p/q stays exact.
     bool         ds_adaptive = false;
@@ -1093,6 +1098,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<int32_t> ds_cap;   // [n_seq] cap of the last draft call
     std::vector<int32_t> ds_last;  // [n_seq] tokens drafted by the last draft call
     common_batch batch_rnn;
+    // UZU-1T (LLAMA_SPEC_TREE): candidates of every walked slot of the last draft, per seq; greedy requests then take
+    // the sampled layout with zero noise (the same argmax walk) so the K candidates reach the host
+    std::vector<common_spec_tree_marg> tree_margs;
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
@@ -1203,6 +1211,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             lilicorr_pos.assign(slots, -1);
             batch_rnn = common_batch(ctx_dft);
             ds_adaptive = this->params.dspark_adaptive;
+            if (common_spec_tree_paths() > 0) {
+                tree_margs.resize(n_seq);
+            }
         }
         // INKSPEC2: the mb default raised n_max for the Inkling DSpark drafter; another DSpark drafter (no recurrent
         // context) keeps the depth it had before
@@ -1669,7 +1680,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // token count sits hundreds of positions past the draft's own cache. Take the next
             // position from the target's memory instead; without images the two are equal.
             const llama_pos pos_max_tgt = llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), seq_id);
-            const int32_t n = pos_max_tgt >= 0 ? (int32_t) pos_max_tgt + 1 : (int32_t) dp.pos0;
+            int32_t n = pos_max_tgt >= 0 ? (int32_t) pos_max_tgt + 1 : (int32_t) dp.pos0;
+            // UZU-1T: after a tree path won, its tokens are committed but re-decoded by the target only in the next
+            // verify batch (ahead of the anchor); the drafter already holds their features, the anchor sits at pos0
+            if (common_spec_tree_paths() > 0 && has_rnn_context && (int32_t) dp.pos0 > n) {
+                n = (int32_t) dp.pos0;
+            }
+            if (common_spec_tree_paths() > 0 && seq_id < (llama_seq_id) tree_margs.size()) {
+                tree_margs[seq_id].cand.clear();
+                tree_margs[seq_id].chain.clear();
+            }
 
             const int32_t n_draft = params.n_max;
 
@@ -1731,6 +1751,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // (exact p/q: the output keeps the target's distribution for any q). Needs ids_out, the same temp > 0 on
             // every drafting seq, and no mirostat; otherwise the walk stays argmax.
             dspark_sk = 0;
+            tree_greedy = false;
             static const int  s_on = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE"); return e ? atoi(e) : 1; }();
             static const int  s_k  = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE_K"); return e ? std::max(1, std::min(64, atoi(e))) : 20; }();
             static const float s_ts = [] { const char * e = getenv("LLAMA_DSPARK_SAMPLE_TSCALE"); const float v = e ? (float) atof(e) : 1.0f; return v > 0.0f ? v : 1.0f; }();
@@ -1746,14 +1767,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         continue;
                     }
                     const auto & dp = dparams[s];
-                    ok = dp.result_q && dp.sampling && dp.sampling->temp > 0.0f && dp.sampling->mirostat == 0 &&
-                         (temp < 0.0f || dp.sampling->temp == temp);
-                    temp = ok ? dp.sampling->temp : temp;
+                    // UZU-1T: a greedy request takes the sampled layout with zero noise (argmax walk) for its candidates
+                    const bool  t_tree = common_spec_tree_paths() > 0 && dp.sampling && dp.sampling->temp <= 0.0f;
+                    const float t_req  = t_tree ? 0.0f : dp.sampling ? dp.sampling->temp : -1.0f;
+                    ok = dp.result_q && dp.sampling && (dp.sampling->temp > 0.0f || t_tree) && dp.sampling->mirostat == 0 &&
+                         (temp < 0.0f || t_req == temp);
+                    temp = ok ? t_req : temp;
                     nb++;
                 }
                 if (ok && nb > 0 && (size_t) s_k*nb*walk <= 64*16*64) {
+                    tree_greedy = temp == 0.0f;
                     dspark_sk = s_k;
-                    dspark_st = temp*s_ts;
+                    dspark_st = tree_greedy ? 1.0f : temp*s_ts;
                     dspark_noise.assign((size_t) s_k*nb*walk, 0.0f);
                     std::uniform_real_distribution<double> uni(0.0, 1.0);
                     int b = 0;
@@ -1768,7 +1793,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         // INKSPEC2: draw only the slots this seq reads (its own cap), so its stream does not depend on
                         // the other seqs' caps; the walked slots past the cap keep zero noise and are never read
-                        for (int w = 0; w < std::min<int32_t>(walk, ds_cap[s]); ++w) {
+                        for (int w = 0; w < (tree_greedy ? 0 : std::min<int32_t>(walk, ds_cap[s])); ++w) {
                             for (int k = 0; k < s_k; ++k) {
                                 double u = uni(dflash2_rng[s]);
                                 u = std::min(std::max(u, 1e-12), 1.0 - 1e-12);
@@ -1887,7 +1912,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         for (int k = 1; k < dspark_sk; ++k) {
                             lmax = std::max(lmax, row[1 + dspark_sk + k]);
                         }
-                        auto & q = dp.result_q->emplace_back();
+                        std::vector<llama_token_data> q_local;
+                        auto & q = tree_greedy ? q_local : dp.result_q->emplace_back();
                         q.reserve(dspark_sk);
                         double z = 0.0;
                         bool found = false;
@@ -1905,7 +1931,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         conf *= qmax;
                         if (i >= 2 && stop_th > 0.0f && conf < stop_th) {
-                            dp.result_q->pop_back();
+                            if (!tree_greedy) {
+                                dp.result_q->pop_back();
+                            }
                             break;
                         }
                         if (i >= 2 && conf_stop > 0.0f && conf_kept * qmax < conf_stop) {
@@ -1917,6 +1945,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             LOG_WRN("%s: sampled DSpark slot %d: drawn id not among the candidates, dropping the draft\n", __func__, i);
                             result.clear();
                             dp.result_q->clear();
+                            if (seq_id < (llama_seq_id) tree_margs.size()) {
+                                tree_margs[seq_id].cand.clear();
+                            }
                             break;
                         }
                         if (conf_stop > 0.0f) {
@@ -1928,6 +1959,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             }
                         }
                         result.push_back(id);
+                        if (seq_id < (llama_seq_id) tree_margs.size()) {
+                            tree_margs[seq_id].cand.push_back(q);
+                        }
+                    }
+                    if (seq_id < (llama_seq_id) tree_margs.size()) {
+                        auto & tm = tree_margs[seq_id];
+                        tm.chain = tm.cand.size() == result.size() ? result : llama_tokens();
                     }
                 } else if (dspark_ids) {
                     // the graph's own argmax ids (same first maximum), read from the chain-state rows
@@ -2077,6 +2115,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     (int) seq_id, before, ds_ctrl[seq_id].n_cur, own, n_acc);
         }
         ds_last[seq_id] = 0;
+    }
+
+    const common_spec_tree_marg * tree_marg(llama_seq_id seq_id) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) tree_margs.size() || tree_margs[seq_id].chain.empty()) {
+            return nullptr;
+        }
+        return &tree_margs[seq_id];
     }
 
     // Inkling2 DSpark: the per-sequence context rows travel with the slot state (prompt cache save/restore)
@@ -5134,6 +5179,13 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
     return rates;
 }
 
+const common_spec_tree_marg * common_speculative_get_tree_marg(const common_speculative * spec, llama_seq_id seq_id) {
+    if (!spec || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size() || !spec->impl_last[seq_id]) {
+        return nullptr;
+    }
+    return spec->impl_last[seq_id]->tree_marg(seq_id);
+}
+
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec) {
     GGML_ASSERT(spec);
     return spec->synth_probs;
@@ -5169,6 +5221,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
+
+    result.n_seq_tree   = 0; // the drafter keeps one sequence per slot
 
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;

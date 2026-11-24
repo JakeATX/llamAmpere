@@ -771,6 +771,7 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    int32_t n_seq_tree     = 0;     // UZU-1T (LLAMA_SPEC_TREE): extra target sequences for tree verify paths (server sets it, 0 = none)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
