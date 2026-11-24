@@ -1367,6 +1367,9 @@ void ggml_backend_cuda_context::release_scratch(bool preserve_blas) {
     for (const auto & e : ai_prep_cache.entries) {
         free_buf(e.ptr, e.dev);
     }
+    for (const auto & r : ai_prep_cache.retired) {
+        free_buf(r.ptr, r.dev);
+    }
     for (const auto & t : moe_tables) {
         free_buf((char *) t.ptr, t.dev);
     }
@@ -1417,6 +1420,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_ink_ai4_preq_free(this);
     ggml_cuda_ai4_exp_turbo_free(this);
 
+    // [OPT9] which AI+ drop-in fusions ran (graph builds/captures, not replays); only with one of the switches on
+    if (ggml_cuda_ai_fuse_act_enabled() || ggml_cuda_ai_fuse_glu_enabled() || ggml_cuda_ai_mmv_group_spec_enabled()) {
+        GGML_LOG_INFO("AI+ fuse: device %d: norm_q %lld, glu_q %lld, dense_glu %lld, dense_glu_q8 %lld, group_spec %lld, prep_hits %lld\n",
+                      device, (long long) fusion_stats.ai_fuse_norm_q, (long long) fusion_stats.ai_fuse_glu_q,
+                      (long long) fusion_stats.ai_fuse_dense_glu, (long long) fusion_stats.ai_fuse_dense_glu_q8,
+                      (long long) fusion_stats.ai_mmv_group_spec, (long long) fusion_stats.ai_prep_hits);
+    }
     // [#136] fold (default on): how often each fold matched (graph builds/captures, not replays)
     if (ggml_cuda_exl3_glue_fold_enabled() && fusion_stats.exl3_fold_norm + fusion_stats.exl3_fold_add + fusion_stats.exl3_fold_gu > 0) {
         GGML_LOG_INFO("EXL3 glue fold: device %d: norm %lld, residual add %lld, fused gate|up %lld, #74 bridge %lld\n", device,
@@ -10916,7 +10926,10 @@ static bool ggml_cuda_ai_mmv_group_member(const ggml_tensor * n) {
     }
     const ggml_tensor * w = n->src[0];
     const ggml_type t = w->type;
-    return (t == GGML_TYPE_AIT4_U || t == GGML_TYPE_AIT5_U || t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U) &&
+    // [OPT9] GGML_CUDA_AI_MMV_GROUP_SPEC=1 groups all 11 AI+ unit layouts (the 9..32-token launch takes every layout;
+    // at <= 8 tokens ggml_cuda_mul_mat_ai4_group still takes only these four)
+    return (t == GGML_TYPE_AIT4_U || t == GGML_TYPE_AIT5_U || t == GGML_TYPE_AIT2_U || t == GGML_TYPE_AIT3_U ||
+            (ggml_cuda_ai_mmv_group_spec_enabled() && ggml_ai4_rate(t) != 0)) &&
            w->op == GGML_OP_NONE && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[1] > 128 && w->ne[1] % 16 == 0 &&
            n->src[1]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32 && ggml_get_op_params_i32(n, 1) == 0;
 }
@@ -10992,6 +11005,138 @@ static int ggml_cuda_try_ai_mmv_group(ggml_backend_cuda_context & ctx, ggml_cgra
         }
     }
     return ggml_cuda_mul_mat_ai4_group(ctx, dsts, n) ? n - 1 : 0;
+}
+
+// [OPT9] the prep variant of the first AI+ / AIF matmul (weights on this device) that reads act, directly or through a
+// contiguous zero-offset RESHAPE / VIEW of it, in the window of nodes after node `after`; -1 = none. The fused producers
+// below always write act in f32 too, so a consumer this misses (or one that reads another layout) still reads correct
+// data and only quantizes as before.
+static constexpr int GGML_CUDA_AI_FUSE_SCAN = 64;
+static int ggml_cuda_ai_act_consumer_variant(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int after,
+                                             const ggml_tensor * act) {
+    const ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), ctx.device);
+    const auto reads_act = [act](const ggml_tensor * t) {
+        return t == act || (t != nullptr && t->src[0] == act && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) &&
+                            t->data == act->data && ggml_is_contiguous(t));
+    };
+    const int end = std::min(cgraph->n_nodes, after + 1 + GGML_CUDA_AI_FUSE_SCAN);
+    for (int j = after + 1; j < end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if ((n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) || !reads_act(n->src[1])) {
+            continue;
+        }
+        const ggml_tensor * w = n->src[0];
+        if (w == nullptr || w->buffer == nullptr || !ggml_backend_buft_is_cuda(w->buffer->buft) ||
+                w->buffer->buft->device != dev) {
+            continue;
+        }
+        const int v = ggml_cuda_ai_prep_variant_for(ctx, n);
+        if (v >= 0) {
+            return v;
+        }
+    }
+    return -1;
+}
+
+static bool ggml_cuda_ai_fuse_ctx_ok(ggml_backend_cuda_context & ctx) {
+    return ctx.curr_stream_no == 0 && !ctx.scratch_borrowed && ctx.stream_context().concurrent_events.empty();
+}
+
+static bool ggml_cuda_ai_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const uintptr_t a0 = (uintptr_t) a->data;
+    const uintptr_t b0 = (uintptr_t) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// [OPT9] GGML_CUDA_AI_FUSE_ACT: RMS_NORM + MUL that also writes its AI+ consumer's int8 activation (false: not taken)
+static bool ggml_cuda_try_rms_norm_ai4(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_ai_fuse_act_enabled() || !ggml_cuda_ai_fuse_ctx_ok(ctx) || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * norm = cgraph->nodes[i];
+    const ggml_tensor * mul  = cgraph->nodes[i + 1];
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || (mul->src[0] != norm && mul->src[1] != norm)) {
+        return false;
+    }
+    const ggml_tensor * x     = norm->src[0];
+    const ggml_tensor * gamma = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if (x == nullptr || gamma == nullptr || mul->ne[0] <= 0 || (mul->ne[0] & 127) != 0) {
+        return false;
+    }
+    // the kernel reads x and gamma while it writes mul: no overlap at all (an in-place norm stays unfused)
+    if (ggml_cuda_ai_ranges_overlap(mul, x) || ggml_cuda_ai_ranges_overlap(mul, gamma)) {
+        return false;
+    }
+    const int variant = ggml_cuda_ai_act_consumer_variant(ctx, cgraph, i + 1, mul);
+    if (variant < 0) {
+        return false;
+    }
+    return ggml_cuda_ai_rms_norm_mul_prep(ctx, norm, mul, variant);
+}
+
+// [OPT9] GGML_CUDA_AI_FUSE_ACT: an unfused GLU that also writes its AI+ consumer's int8 activation (false: not taken)
+static bool ggml_cuda_try_glu_ai4(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_ai_fuse_act_enabled() || !ggml_cuda_ai_fuse_ctx_ok(ctx)) {
+        return false;
+    }
+    const ggml_tensor * glu = cgraph->nodes[i];
+    if (glu->op != GGML_OP_GLU || glu->type != GGML_TYPE_F32 || glu->ne[0] <= 0 || (glu->ne[0] & 127) != 0) {
+        return false;
+    }
+    for (const ggml_tensor * src : { glu->src[0], glu->src[1] }) {
+        if (src != nullptr && ggml_cuda_ai_ranges_overlap(glu, src)) {
+            return false;
+        }
+    }
+    const int variant = ggml_cuda_ai_act_consumer_variant(ctx, cgraph, i, glu);
+    if (variant < 0) {
+        return false;
+    }
+    return ggml_cuda_ai_glu_prep(ctx, glu, variant);
+}
+
+// [OPT9] GGML_CUDA_AI_FUSE_GLU: dense AI+ MUL_MAT(gate), MUL_MAT(up), GLU as one launch; returns the nodes to skip
+static int ggml_cuda_try_ai_dense_glu(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_cuda_ai_fuse_glu_enabled() || !ggml_cuda_ai_fuse_ctx_ok(ctx) || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    if (!ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
+        return 0;
+    }
+    ggml_tensor * glu  = cgraph->nodes[i + 2];
+    ggml_tensor * gate = glu->src[0];
+    ggml_tensor * up   = glu->src[1];
+    if (!((gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]))) {
+        return 0;
+    }
+    if (gate->src[0] == nullptr || up->src[0] == nullptr || gate->src[1] == nullptr ||
+            ggml_ai4_rate(gate->src[0]->type) == 0 || gate->src[0]->type != up->src[0]->type) {
+        return 0;
+    }
+    for (const ggml_tensor * w : { gate->src[0], up->src[0] }) {
+        if (!w->buffer || w->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) {
+            return 0;   // split / host / foreign weights keep their own path
+        }
+    }
+    // the kernel reads the activations while it writes the GLU output (graph_optimize keeps them apart; checked anyway)
+    if (ggml_cuda_ai_ranges_overlap(glu, gate->src[1])) {
+        return 0;
+    }
+    // the GLU's first AI+ MUL_MAT consumer: with FUSE_ACT the launch also writes its PLAIN prep
+    const ggml_tensor * down_next = nullptr;
+    if (ggml_cuda_ai_fuse_act_enabled()) {
+        const ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), ctx.device);
+        const int end = std::min(cgraph->n_nodes, i + 3 + GGML_CUDA_AI_FUSE_SCAN);
+        for (int j = i + 3; j < end && down_next == nullptr; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_MUL_MAT && n->src[1] == glu && n->src[0] != nullptr && n->src[0]->buffer != nullptr &&
+                    ggml_backend_buft_is_cuda(n->src[0]->buffer->buft) && n->src[0]->buffer->buft->device == dev &&
+                    ggml_ai4_rate(n->src[0]->type) != 0) {
+                down_next = n;
+            }
+        }
+    }
+    return ggml_cuda_mul_mat_ai4_dense_glu(ctx, gate, up, glu, down_next) ? 2 : 0;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -13633,6 +13778,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
     if (node->op == GGML_OP_MUL_MAT) {
+        const int n_dglu = ggml_cuda_try_ai_dense_glu(*cuda_ctx, cgraph, i);   // [OPT9] 0 at once while off
+        if (n_dglu > 0) {
+            return n_dglu;
+        }
         const int n_grp = ggml_cuda_try_ai_mmv_group(*cuda_ctx, cgraph, i);
         if (n_grp > 0) {
             return n_grp;
@@ -14726,7 +14875,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        if (!ggml_cuda_try_rms_norm_mmq(*cuda_ctx, cgraph, i)) {
+        if (!ggml_cuda_try_rms_norm_mmq(*cuda_ctx, cgraph, i) &&
+                !ggml_cuda_try_rms_norm_ai4(*cuda_ctx, cgraph, i)) {   // [OPT9] false at once while off
             ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         }
         return 1;
@@ -15722,7 +15872,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 host_block.begin();
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                // [OPT9] GGML_CUDA_AI_FUSE_ACT: an unfused GLU that also writes its AI+ consumer's int8 activation
+                bool ok = node->op == GGML_OP_GLU && !head2_nofuse && !ggml_cuda_fusion_disabled() &&
+                          ggml_cuda_try_glu_ai4(*cuda_ctx, &fusion_graph, i);
+                if (!ok) {
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                }
                 host_block.end("node", node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -16156,7 +16311,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 ggml_tensor * gate = glu->src[0];
                 ggml_tensor * up   = glu->src[1];
                 const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
-                if (ok && ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device)) {
+                // [OPT9] GGML_CUDA_AI_FUSE_GLU: the dense AI+ gate + up + GLU launch reads them while it writes the GLU too
+                const bool ai4_glu = ok && ggml_cuda_ai_fuse_glu_enabled() && gate->op == GGML_OP_MUL_MAT &&
+                                     up->op == GGML_OP_MUL_MAT && gate->src[0] != nullptr && up->src[0] != nullptr &&
+                                     ggml_ai4_rate(gate->src[0]->type) != 0 && gate->src[0]->type == up->src[0]->type;
+                if (ok && (ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device) || ai4_glu)) {
                     add_alloc_deps(i, i + 2);
                     i += 2;
                     continue;
@@ -17693,6 +17852,21 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "ai_prep_hits") == 0) {
         return ctx->fusion_stats.ai_prep_hits;
+    }
+    if (strcmp(name, "ai_fuse_norm_q") == 0) {
+        return ctx->fusion_stats.ai_fuse_norm_q;
+    }
+    if (strcmp(name, "ai_fuse_glu_q") == 0) {
+        return ctx->fusion_stats.ai_fuse_glu_q;
+    }
+    if (strcmp(name, "ai_fuse_dense_glu") == 0) {
+        return ctx->fusion_stats.ai_fuse_dense_glu;
+    }
+    if (strcmp(name, "ai_fuse_dense_glu_q8") == 0) {
+        return ctx->fusion_stats.ai_fuse_dense_glu_q8;
+    }
+    if (strcmp(name, "ai_mmv_group_spec") == 0) {
+        return ctx->fusion_stats.ai_mmv_group_spec;
     }
     if (strcmp(name, "cuda_graph_replays") == 0) {
         return ctx->fusion_stats.cuda_graph_replays;

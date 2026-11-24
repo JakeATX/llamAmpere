@@ -5,6 +5,7 @@
 #include "inkpreq.cuh"
 #include "ai4-kern.cuh"
 #include "ai4-ampere.cuh"
+#include "ai4-fuse.cuh"
 #include "ai4-turbo.cuh"
 #include "ai4-exp-turbo.cuh"
 #include "ai4-decode-fast.cuh"
@@ -114,13 +115,63 @@ static int ai4_env_int(const char * name, const char * /*unused*/, int def) {
     const char * e = getenv(name);
     return e ? atoi(e) : def;
 }
+
+// [OPT9] AI+ drop-in fusions and an Ampere auto policy. Every switch is off by default; unset, each knob below returns
+// the value it had before (legacy default), so dispatch, numerics and allocations are unchanged.
+//   GGML_CUDA_AI_AUTO=1            measured Ampere defaults: GGML_CUDA_AI4_AMPERE_MMV (dense 9..32), GGML_CUDA_AI4_PREFILL_V2
+//                                  (M*K <= 512 Mi), GGML_CUDA_AI23_TUNED=1, GGML_CUDA_AI23_ID_REF=0, GGML_CUDA_AI23_FAST=1
+//                                  (also over GGML_CUDA_AIKERN=0) and the three switches below; an explicit env var of any
+//                                  of these still wins. Taken only when every CUDA device is Ampere (sm_80..sm_87); on any
+//                                  other device it logs and stays off
+//   GGML_CUDA_AI_FUSE_ACT=1        RMS_NORM+MUL and GLU also write their AI+ consumer's int8 activation (ai_prep_cache) at
+//                                  N <= 32 rows; the f32 output is always written too, so a consumer that misses still reads it
+//   GGML_CUDA_AI_FUSE_GLU=1        dense AI+ gate + up + GLU in one launch at N <= 32 (with FUSE_ACT: also the down's activation)
+//   GGML_CUDA_AI_MMV_GROUP_SPEC=1  the INKDENSE grouped mmv also at 9..32 tokens, all 11 AI+ unit layouts
+bool ggml_cuda_ai_auto_enabled() {
+    static const bool v = [] {
+        if (ai4_env_int("GGML_CUDA_AI_AUTO", nullptr, 0) == 0) {
+            return false;
+        }
+        const auto & info = ggml_cuda_info();
+        for (int d = 0; d < info.device_count; ++d) {
+            const int cc = info.devices[d].cc;
+            if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+                GGML_LOG_INFO("[ai4-auto] GGML_CUDA_AI_AUTO=1 ignored: device %d (cc %d) is not Ampere\n", d, cc);
+                return false;
+            }
+        }
+        GGML_LOG_INFO("[ai4-auto] GGML_CUDA_AI_AUTO=1: Ampere AI+ auto defaults on (explicit per-flag env vars win)\n");
+        return true;
+    }();
+    return v;
+}
+static bool ai4_env_auto_bool(const char * name, bool auto_val, bool legacy_def) {
+    const char * e = getenv(name);
+    if (e != nullptr) {
+        return atoi(e) != 0;
+    }
+    return ggml_cuda_ai_auto_enabled() ? auto_val : legacy_def;
+}
+bool ggml_cuda_ai_fuse_act_enabled() {
+    static const bool v = ai4_env_auto_bool("GGML_CUDA_AI_FUSE_ACT", true, false);
+    return v;
+}
+bool ggml_cuda_ai_fuse_glu_enabled() {
+    static const bool v = ai4_env_auto_bool("GGML_CUDA_AI_FUSE_GLU", true, false);
+    return v;
+}
+bool ggml_cuda_ai_mmv_group_spec_enabled() {
+    static const bool v = ai4_env_auto_bool("GGML_CUDA_AI_MMV_GROUP_SPEC", true, false);
+    return v;
+}
+
 // fork: routed AI+ unit kernels; set GGML_CUDA_AIKERN=0 for the prior path.
 static bool ai4_aikern() {
     static const bool v = ai4_env_int("GGML_CUDA_AIKERN", nullptr, 1) != 0;
     return v;
 }
 static bool ai4_ai23_tuned() {
-    static const bool v = ai4_env_int("GGML_CUDA_AI23_TUNED", nullptr, 0) != 0;
+    static const bool v = ai4_env_auto_bool("GGML_CUDA_AI23_TUNED", true, false);
     return v;
 }
 static bool ai4_ref() {
@@ -132,7 +183,7 @@ static bool ai4_parw(int n) {
     return v && n > 8 && n <= 32;
 }
 static bool ai4_ampere_mmv(int n) {
-    static const bool v = ai4_env_int("GGML_CUDA_AI4_AMPERE_MMV", nullptr, 0) != 0;
+    static const bool v = ai4_env_auto_bool("GGML_CUDA_AI4_AMPERE_MMV", true, false);
     static const rpb_ai4_ampere_range range = [] {
         const auto r = rpb_ai4_ampere_resolve(getenv("GGML_CUDA_AI4_AMPERE_MMV_MIN_N"), getenv("GGML_CUDA_AI4_AMPERE_MMV_MAX_N"));
         if (r.rejected) {
@@ -151,9 +202,14 @@ static bool ai4_ampere_mmv_id(int n) {
         rpb_ai4_ampere_resolve(getenv("GGML_CUDA_AI4_AMPERE_MMV_MIN_N"), getenv("GGML_CUDA_AI4_AMPERE_MMV_MAX_N"));
     return v && range.contains(n);
 }
-static bool ai4_prefill_v2() {
-    static const bool v = ai4_env_int("GGML_CUDA_AI4_PREFILL_V2", nullptr, 0) != 0;
-    return v;
+// [OPT9] under GGML_CUDA_AI_AUTO=1 (no explicit env) only where the decoded weight buffer stays <= 512 MiB
+static bool ai4_prefill_v2(int64_t M, int64_t K) {
+    static const char * e = getenv("GGML_CUDA_AI4_PREFILL_V2");
+    if (e != nullptr) {
+        static const bool v = atoi(e) != 0;
+        return v;
+    }
+    return ggml_cuda_ai_auto_enabled() && M*K <= ((int64_t) 512 << 20);
 }
 static int ai4_ampere_sms(const ggml_backend_cuda_context & ctx) {
     const auto & dev = ggml_cuda_info().devices[ctx.device];
@@ -913,7 +969,7 @@ static int ai4_lay_of(ggml_type t) {
 
 // Rate-2 / rate-3 IMMA kernels; GGML_CUDA_AI23_FAST overrides the routed AI+ default.
 static bool ai4_ai23_fast() {
-    static const bool v = ai4_env_int("GGML_CUDA_AI23_FAST", nullptr, ai4_aikern() ? 1 : 0) != 0;
+    static const bool v = ai4_env_auto_bool("GGML_CUDA_AI23_FAST", true, ai4_aikern());
     return v;
 }
 
@@ -998,6 +1054,99 @@ static void ai4_quantize_variant(int variant, const float * X, int64_t N, int K,
 // larger preps (prefill ubatches) keep their own pool buffers. 3 entries = 768 KiB per device, allocated on first use.
 static constexpr size_t AI4_PREP_CACHE_BYTES = 256u << 10;
 
+// [OPT9] GGML_CUDA_AI_FUSE_ACT / _GLU: a fused producer writes its consumer's prep straight into an ai_prep_cache entry,
+// keyed by the producer's output tensor. Only at decode / verify widths (<= 32 rows, <= 1 MiB: 32 x 17,408 + scales);
+// prefill widths keep the unfused path. An entry that has to grow past its buffer retires the old one (a captured CUDA
+// graph may still replay kernels that use it; freed at teardown). Unused while both switches are off.
+static constexpr size_t  AI4_PREP_FUSED_MAX_BYTES = 1u << 20;
+static constexpr int64_t AI4_PREP_FUSED_MAX_ROWS  = 32;
+
+static bool ai4_prep_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * key, int64_t N, int K, int xsh,
+                             int variant, int8_t * & q, float * & s) {
+    if (key == nullptr || !ai4_prep_cache_on() || ctx.scratch_borrowed || ctx.curr_stream_no != 0 ||
+            N <= 0 || N > AI4_PREP_FUSED_MAX_ROWS || K <= 0 || (K & 127) != 0) {
+        return false;
+    }
+    const size_t ns    = (size_t) N*(K >> (7 + xsh));
+    const size_t q_off = GGML_PAD(ns*sizeof(float), 256);
+    const size_t bytes = q_off + (size_t) N*K;
+    if (bytes > AI4_PREP_FUSED_MAX_BYTES) {
+        return false;
+    }
+    const int layout = xsh | variant << 1;
+    auto & pc = ctx.ai_prep_cache;
+    ggml_backend_cuda_context::ai_prep_entry * e = nullptr;
+    for (auto & c : pc.entries) {
+        if (c.epoch == ctx.graph_epoch && c.src1 == key && c.data == key->data && c.n_rows == N && c.k == K &&
+                c.layout == layout && c.dev == ctx.device) {
+            e = &c;
+            break;
+        }
+    }
+    if (e == nullptr) {
+        // an entry from an older graph eval first, else the least recently used one (as ai4_prep)
+        e = &pc.entries[0];
+        for (auto & c : pc.entries) {
+            if (c.epoch != ctx.graph_epoch) {
+                e = &c;
+                break;
+            }
+            if (c.last_use < e->last_use) {
+                e = &c;
+            }
+        }
+    }
+    if (e->ptr == nullptr || e->dev != ctx.device || e->cap < bytes) {
+        if (e->ptr != nullptr) {
+            pc.retired.push_back({ e->ptr, e->cap, e->dev });
+        }
+        const size_t alloc_sz = std::max(AI4_PREP_CACHE_BYTES, bytes);
+        CUDA_CHECK(ggml_cuda_device_malloc((void **) &e->ptr, alloc_sz, ctx.device));
+        e->cap = alloc_sz;
+        e->dev = ctx.device;
+    }
+    e->src1     = key;
+    e->data     = key->data;
+    e->epoch    = ctx.graph_epoch;
+    e->n_rows   = N;
+    e->k        = K;
+    e->layout   = layout;
+    e->last_use = ++pc.tick;
+    s = (float *) e->ptr;
+    q = (int8_t *) (e->ptr + q_off);
+    return true;
+}
+
+// [OPT9] a hit on an entry a fused producer wrote: key itself, or a contiguous zero-offset RESHAPE / VIEW whose direct
+// parent is the entry's tensor (the [K, n_tok] -> [K, 1, n_tok] view a MUL_MAT_ID reads). The parent test (not view_src)
+// keeps a view of a later in-place rewrite of that tensor from matching. Only with GGML_CUDA_AI_FUSE_ACT on.
+static bool ai4_prep_lookup_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * key, const void * X, int64_t N,
+                                  int K, int xsh, int variant, int8_t * & q, float * & s) {
+    if (key == nullptr || !ggml_cuda_ai_fuse_act_enabled() || !ai4_prep_cache_on() || ctx.scratch_borrowed ||
+            ctx.curr_stream_no != 0 || key->data != X || N <= 0 || N > AI4_PREP_FUSED_MAX_ROWS) {
+        return false;
+    }
+    const size_t ns     = (size_t) N*(K >> (7 + xsh));
+    const size_t q_off  = GGML_PAD(ns*sizeof(float), 256);
+    const size_t bytes  = q_off + (size_t) N*K;
+    const int    layout = xsh | variant << 1;
+    const bool   alias  = (key->op == GGML_OP_RESHAPE || key->op == GGML_OP_VIEW) && key->src[0] != nullptr &&
+                          key->src[0]->data == key->data && ggml_is_contiguous(key) && ggml_is_contiguous(key->src[0]);
+    auto & pc = ctx.ai_prep_cache;
+    for (auto & c : pc.entries) {
+        const bool key_match = c.src1 == key || (alias && c.src1 == key->src[0]);
+        if (c.epoch == ctx.graph_epoch && key_match && c.data == key->data && c.n_rows == N && c.k == K &&
+                c.layout == layout && c.dev == ctx.device && c.ptr != nullptr && c.cap >= bytes) {
+            c.last_use = ++pc.tick;
+            ctx.fusion_stats.ai_prep_hits++;
+            s = (float *) c.ptr;
+            q = (int8_t *) (c.ptr + q_off);
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ai4_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * key, const float * X, int64_t N, int K, int xsh,
                      int variant, ggml_cuda_pool_alloc<int8_t> & qa, ggml_cuda_pool_alloc<float> & sa,
                      int8_t * & q, float * & s) {
@@ -1007,6 +1156,9 @@ static void ai4_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * key, c
     const size_t bytes  = q_off + (size_t) N*K;
     const int    layout = xsh | variant << 1;
     auto & pc = ctx.ai_prep_cache;
+    if (ai4_prep_lookup_fused(ctx, key, X, N, K, xsh, variant, q, s)) {
+        return;   // [OPT9] written by a fused producer (GGML_CUDA_AI_FUSE_ACT; false at once while it is off)
+    }
     // main stream only (a sibling stream could read the buffer with no ordering), never inside a borrowed scratch plan
     const bool cacheable = key != nullptr && ai4_prep_cache_on() && !ctx.scratch_borrowed && ctx.curr_stream_no == 0 &&
                            bytes <= AI4_PREP_CACHE_BYTES && key->data == (const void *) X;
@@ -1063,6 +1215,26 @@ static void ai4_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * key, c
     s = sa.get();
 }
 
+// The activation layout ai4_mul_mat_fast picks for a dense non-AIT2P_U product (one resolver: [OPT9] fused producers use
+// it to write the layout their consumer reads)
+struct ai4_dense_prep_sel {
+    bool swap8;
+    bool xperm;
+};
+static ai4_dense_prep_sel ai4_dense_prep_select(ggml_type t, int M, int N, int K, int sms) {
+    const ai23_dense_policy policy = ai23_dense_config(M, N, K, sms, ggml_ai4_rate(t));
+    const int tile = policy.tile;
+    const bool swap8 = (ggml_ai4_rate(t) == 2 || ggml_ai4_rate(t) == 3) && N > 8 && N <= 64 && (tile == 22 || tile == 23 || tile == 25 || tile == 27);
+    const int splits = policy.splits;
+    const int narrow = policy.narrow;
+    const bool split_active = splits == 2 || splits == 4 || splits == 8 || splits == 16;
+    const bool whole = split_active ? (tile != 16 && tile != 17 && !(tile >= 22 && tile <= 27)) :
+                       (tile == 18 || tile == 19 || tile == 21 || (!tile && narrow >= 3 && (K == 5120 || K == 17408) && sms));
+    const bool xperm = ggml_ai4_rate(t) == 2 && N > 8 && N <= 64 && whole &&
+                       ai4_env_int("GGML_CUDA_AI23_XPERM", nullptr, 0);
+    return { swap8, xperm };
+}
+
 // W4A8 fast path: rotate+quantize the activations, then the AI+ decode-to-IMMA kernels
 static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const uint8_t * W, const float * X, float * Y,
                             int M, int N, int K, const ggml_tensor * key = nullptr) {
@@ -1083,14 +1255,12 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
     }
     const ai23_dense_policy policy = ai23_dense_config(M, N, K, ai4_ampere_sms(ctx), ggml_ai4_rate(t));
     const int tile = policy.tile;
-    const bool swap8 = (ggml_ai4_rate(t) == 2 || ggml_ai4_rate(t) == 3) && N > 8 && N <= 64 && (tile == 22 || tile == 23 || tile == 25 || tile == 27);
     const int splits = policy.splits;
     const int narrow = policy.narrow;
     const bool split_active = splits == 2 || splits == 4 || splits == 8 || splits == 16;
-    const bool whole = split_active ? (tile != 16 && tile != 17 && !(tile >= 22 && tile <= 27)) :
-                       (tile == 18 || tile == 19 || tile == 21 || (!tile && narrow >= 3 && (K == 5120 || K == 17408) && ai4_ampere_sms(ctx)));
-    const bool xperm = ggml_ai4_rate(t) == 2 && N > 8 && N <= 64 && whole &&
-                       ai4_env_int("GGML_CUDA_AI23_XPERM", nullptr, 0);
+    const ai4_dense_prep_sel sel = ai4_dense_prep_select(t, M, N, K, ai4_ampere_sms(ctx));
+    const bool swap8 = sel.swap8;
+    const bool xperm = sel.xperm;
     ai4_prep(ctx, key, X, N, K, xsh, swap8 ? AI4_PREP_SWAP8 : xperm ? AI4_PREP_XPERM : AI4_PREP_PLAIN, qa, sa, xq_p, xs_p);
     const int rate = ggml_ai4_rate(t);
     static const int small_splits = ai4_env_int("GGML_CUDA_AI23_SMALL_SPLIT", nullptr, 0);
@@ -1135,7 +1305,7 @@ static void ai4_mul_mat_fast(ggml_backend_cuda_context & ctx, ggml_type t, const
         ai4k::split_k_reduce<<<((int64_t) M*N + 255)/256, 256, 0, stream>>>(partial.get(), Y, (int64_t) M*N, splits);
         return;
     }
-    if (N >= 512 && ai4_ampere_sms(ctx) && ai4_prefill_v2() && t == GGML_TYPE_AIT4_U) {
+    if (N >= 512 && ai4_ampere_sms(ctx) && ai4_prefill_v2(M, K) && t == GGML_TYPE_AIT4_U) {
         GGML_ASSERT(M > 0 && K > 0 && (size_t) M <= SIZE_MAX / (size_t) K);
         ggml_cuda_pool_alloc<int8_t> decoded(ctx.pool(), (size_t) M*K);
         if (xsh) {
@@ -1262,7 +1432,7 @@ static bool ai4_ref_only_type(ggml_type t) {
 // which made a prompt batch over an AI+ expert bank several times slower than the IQ expert stack it replaces.
 // Default (unset or 1) keeps the reference path for MUL_MAT_ID; dense MUL_MAT keeps ai4_ref_only_type.
 static bool ai4_id_ref_only_type(ggml_type t) {
-    static const bool id_ref = ai4_env_int("GGML_CUDA_AI23_ID_REF", nullptr, 1) != 0;
+    static const bool id_ref = ai4_env_auto_bool("GGML_CUDA_AI23_ID_REF", false, true);
     if (ggml_ai4v2_rate(t) != 0) {
         return false;
     }
@@ -1487,9 +1657,69 @@ void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 // default mmv kernel (stages 2, register activations, 4 warps x 6 blocks): the outputs are then bitwise equal to the
 // ungrouped launches. Returns false (nothing launched) when any member would take another path.
 static_assert(GGML_CUDA_AI4_GRP_MAX == ai4k::MMV_GRP_MAX, "group size");
+
+// [OPT9] GGML_CUDA_AI_MMV_GROUP_SPEC=1: the same groups at 9..32 tokens (MTP / DSpark verify widths), any of the 11 AI+
+// unit layouts: one shared PLAIN prep (ai_prep_cache, so a fused RMS_NORM+MUL prep is reused) and one
+// ai4fuse::launch_mmv_grp_spec_ai4 launch. fp32 sums in another order than the single-product kernels (gemm / MIDT /
+// Ampere width), so not bitwise equal to them. Returns -1 when the width is not 9..32 (the INKDENSE path decides),
+// else whether it launched.
+static int ai4_mmv_group_spec(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n) {
+    const ggml_tensor * src1 = dsts[0]->src[1];
+    const int64_t N = src1->ne[1]*src1->ne[2]*src1->ne[3];
+    if (N < 9 || N > 32) {
+        return -1;
+    }
+    const ggml_type t = dsts[0]->src[0]->type;
+    const int64_t K = dsts[0]->src[0]->ne[0];
+    if (!ai4_is_type(t) || ai4_ref_only_type(t)) {
+        return 0;
+    }
+    if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[0] != K || K % 128 != 0 || K > INT32_MAX ||
+            (ggml_ai4v2_rate(t) != 0 && K % (128*ggml_ai4v2_chunks(t)) != 0) || ((uintptr_t) src1->data & 15) != 0) {
+        return 0;
+    }
+    ai4k::mmv_group grp = {};
+    grp.n = n;
+    int blocks = 0;
+    for (int j = 0; j < n; ++j) {
+        const ggml_tensor * d = dsts[j];
+        const ggml_tensor * w = d->src[0];
+        if (d->src[1] != src1 || w->type != t || w->ne[0] != K || w->ne[2] != 1 || w->ne[3] != 1 ||
+                !ggml_is_contiguous(w) || !ggml_is_contiguous(d) || d->type != GGML_TYPE_F32 ||
+                w->ne[1] % 16 != 0 || w->ne[1] <= 128 || d->ne[0] != w->ne[1] || ggml_nelements(d) != w->ne[1]*N) {
+            return 0;
+        }
+        grp.W[j]  = (const uint8_t *) w->data;
+        grp.Y[j]  = (float *) d->data;
+        grp.M[j]  = (int) w->ne[1];
+        grp.s0[j] = blocks;
+        blocks += (int) (w->ne[1]/16);
+    }
+    grp.s0[n] = blocks;
+    for (int j = n + 1; j <= ai4k::MMV_GRP_MAX; ++j) {
+        grp.s0[j] = blocks;
+    }
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    ggml_cuda_pool_alloc<int8_t> qa(ctx.pool());
+    ggml_cuda_pool_alloc<float>  sa(ctx.pool());
+    int8_t * qp = nullptr;
+    float  * sp = nullptr;
+    ai4_prep(ctx, src1, (const float *) src1->data, N, (int) K, xsh, AI4_PREP_PLAIN, qa, sa, qp, sp);
+    ai4fuse::launch_mmv_grp_spec_ai4(ai4_lay_of(t), xsh, grp, qp, sp, (int) N, (int) K, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+    ctx.fusion_stats.ai_mmv_group_spec++;
+    return 1;
+}
+
 bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n) {
     if (n < 2 || n > ai4k::MMV_GRP_MAX || !ai4_fast_ok(ctx)) {
         return false;
+    }
+    if (ggml_cuda_ai_mmv_group_spec_enabled()) {
+        const int r = ai4_mmv_group_spec(ctx, dsts, n);
+        if (r >= 0) {
+            return r != 0;
+        }
     }
     const ggml_tensor * src1 = dsts[0]->src[1];
     const ggml_type t = dsts[0]->src[0]->type;
@@ -1570,6 +1800,244 @@ bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * 
         default: GGML_ABORT("ai4 mmv group layout");
     }
     CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// -------------------------------------------------------------------------------------------------
+// [OPT9] fused activation preps and the dense gate + up + GLU (kernels in ai4-fuse.cu)
+// -------------------------------------------------------------------------------------------------
+
+static int ai4_glu_op_tag(ggml_glu_op op) {
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:       return ai4fuse::GLU_SWIGLU;
+        case GGML_GLU_OP_GEGLU:        return ai4fuse::GLU_GEGLU;
+        case GGML_GLU_OP_SWIGLU_OAI:   return ai4fuse::GLU_SWIGLU_OAI;
+        case GGML_GLU_OP_SWIGLU_CLAMP: return ai4fuse::GLU_SWIGLU_CLAMP;
+        default:                       return -1;
+    }
+}
+static_assert(ai4fuse::PREP_PLAIN == AI4_PREP_PLAIN && ai4fuse::PREP_SWAP8 == AI4_PREP_SWAP8 &&
+              ai4fuse::PREP_XPERM == AI4_PREP_XPERM && ai4fuse::PREP_LINEAR == AI4_PREP_LINEAR, "prep variants");
+
+int ggml_cuda_ai_prep_variant_for(const ggml_backend_cuda_context & ctx, const ggml_tensor * op) {
+    if (op == nullptr || (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) ||
+            op->src[0] == nullptr || op->src[1] == nullptr) {
+        return -1;
+    }
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) {
+        return -1;
+    }
+    if (op->op == GGML_OP_MUL_MAT && ggml_cuda_aif25_supported(op)) {
+        return AI4_PREP_LINEAR;
+    }
+    if (!ai4_is_type(w->type) || !ggml_cuda_ai4_supported(op) || !ai4_fast_ok(ctx)) {
+        return -1;
+    }
+    if (op->op == GGML_OP_MUL_MAT_ID) {
+        if (ai4_id_ref_only_type(w->type)) {
+            return -1;
+        }
+        static const bool fused_x = ai4_env_int("GGML_CUDA_AI23_FUSED_X", nullptr, 0) != 0;
+        if (fused_x && op->src[2] != nullptr && op->src[2]->ne[1] == 1) {
+            return -1;   // FUSED_X reads the f32 activation directly at n_tok == 1
+        }
+        return AI4_PREP_PLAIN;
+    }
+    if (ai4_ref_only_type(w->type)) {
+        return -1;
+    }
+    const int64_t K = w->ne[0];
+    const int64_t M = w->ne[1];
+    const int64_t N = x->ne[1]*x->ne[2]*x->ne[3];
+    if (N <= 0 || N > AI4_PREP_FUSED_MAX_ROWS || M <= 0 || K <= 0) {
+        return -1;
+    }
+    const int rate = ggml_ai4_rate(w->type);
+    if ((rate == 2 || rate == 3) && M <= 128 && N <= 128/M) {
+        return -1;   // the small-M f32 reference product
+    }
+    if (w->type == GGML_TYPE_AIT2P_U) {
+        return AI4_PREP_PLAIN;
+    }
+    const ai4_dense_prep_sel sel = ai4_dense_prep_select(w->type, (int) M, (int) N, (int) K, ai4_ampere_sms(ctx));
+    return sel.swap8 ? AI4_PREP_SWAP8 : sel.xperm ? AI4_PREP_XPERM : AI4_PREP_PLAIN;
+}
+
+bool ggml_cuda_ai_rms_norm_mul_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * mul,
+                                    int variant) {
+    if (norm == nullptr || mul == nullptr || norm->src[0] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * x     = norm->src[0];
+    const ggml_tensor * gamma = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if (gamma == nullptr || x->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            norm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t K = mul->ne[0];
+    const int64_t N = ggml_nrows(mul);
+    if (K <= 0 || K > INT32_MAX || (K & 127) != 0 || N <= 0 || N > AI4_PREP_FUSED_MAX_ROWS ||
+            x->ne[0] != K || ggml_nrows(x) != N || gamma->ne[0] != K || ggml_nrows(gamma) != 1 ||
+            !ggml_is_contiguous(x) || !ggml_is_contiguous(gamma) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    if (((uintptr_t) x->data & 15) != 0 || ((uintptr_t) gamma->data & 15) != 0 || ((uintptr_t) mul->data & 15) != 0) {
+        return false;
+    }
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    int8_t * qp = nullptr;
+    float  * sp = nullptr;
+    if (!ai4_prep_reserve(ctx, mul, N, (int) K, xsh, variant, qp, sp)) {
+        return false;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    ai4fuse::launch_rms_norm_mul_quantize_act_ai4((const float *) x->data, K, (const float *) gamma->data,
+        (float *) mul->data, qp, sp, (int) K, (int) N, eps, xsh, variant, true, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+    ctx.fusion_stats.ai_prep_runs++;
+    ctx.fusion_stats.ai_fuse_norm_q++;
+    return true;
+}
+
+bool ggml_cuda_ai_glu_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, int variant) {
+    if (glu == nullptr || glu->op != GGML_OP_GLU || glu->src[0] == nullptr || glu->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int glu_tag = ai4_glu_op_tag(ggml_get_glu_op(glu));
+    if (glu_tag < 0) {
+        return false;
+    }
+    const ggml_tensor * src0 = glu->src[0];
+    const ggml_tensor * src1 = glu->src[1];
+    if (src0->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src0) || src0->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(glu)) {
+        return false;
+    }
+    const int64_t K = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int64_t N = ggml_nrows(glu);
+    if (K <= 0 || K > INT32_MAX || (K & 127) != 0 || N <= 0 || N > AI4_PREP_FUSED_MAX_ROWS ||
+            glu->ne[0] != K || ggml_nrows(src0) != N) {
+        return false;
+    }
+    if (src1 != nullptr && (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src1) || src1->nb[0] != sizeof(float) ||
+            src1->ne[0] != K || ggml_nrows(src1) != N)) {
+        return false;
+    }
+    // the kernel walks rows by one stride: dims 1..3 of each source must be one run of rows
+    for (const ggml_tensor * t : { src0, src1 }) {
+        if (t != nullptr && (t->nb[2] != t->nb[1]*t->ne[1] || t->nb[3] != t->nb[2]*t->ne[2])) {
+            return false;
+        }
+    }
+    const int xsh = K % 256 == 0 ? 1 : 0;
+    const int32_t swapped = ggml_get_op_params_i32(glu, 1);
+    const float alpha = ggml_get_op_params_f32(glu, 2);
+    const float limit = ggml_get_op_params_f32(glu, 3);
+    const float * gate_p = (const float *) src0->data;
+    const float * up_p   = (const float *) (src1 ? src1->data : src0->data);
+    const int64_t s_gate = (int64_t) (src0->nb[1] / sizeof(float));
+    const int64_t s_up   = (int64_t) ((src1 ? src1->nb[1] : src0->nb[1]) / sizeof(float));
+    if (src1 == nullptr) {
+        gate_p += swapped ? K : 0;
+        up_p   += swapped ? 0 : K;
+    } else if (swapped) {
+        return false;   // the split form with swapped operands: leave it to the unfused GLU
+    }
+    if (((uintptr_t) gate_p & 15) != 0 || ((uintptr_t) up_p & 15) != 0 || (s_gate & 3) != 0 || (s_up & 3) != 0 ||
+            ((uintptr_t) glu->data & 15) != 0) {
+        return false;
+    }
+    int8_t * qp = nullptr;
+    float  * sp = nullptr;
+    if (!ai4_prep_reserve(ctx, glu, N, (int) K, xsh, variant, qp, sp)) {
+        return false;
+    }
+    ai4fuse::launch_swiglu_quantize_act_ai4(gate_p, s_gate, up_p, s_up, (float *) glu->data, qp, sp, (int) K, (int) N,
+        xsh, variant, true, glu_tag, alpha, limit, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+    ctx.fusion_stats.ai_prep_runs++;
+    ctx.fusion_stats.ai_fuse_glu_q++;
+    return true;
+}
+
+bool ggml_cuda_mul_mat_ai4_dense_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
+                                     ggml_tensor * glu, const ggml_tensor * down_next) {
+    if (gate == nullptr || up == nullptr || glu == nullptr || !ai4_fast_ok(ctx)) {
+        return false;
+    }
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    if (glu->src[0] != gate || glu->src[1] != up || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    const int glu_tag = ai4_glu_op_tag(ggml_get_glu_op(glu));
+    if (glu_tag < 0) {
+        return false;
+    }
+    const ggml_tensor * wg   = gate->src[0];
+    const ggml_tensor * wu   = up->src[0];
+    const ggml_tensor * src1 = gate->src[1];
+    if (wg == nullptr || wu == nullptr || src1 == nullptr || up->src[1] != src1) {
+        return false;
+    }
+    const ggml_type t = wg->type;
+    if (wu->type != t || !ai4_is_type(t) || ai4_ref_only_type(t)) {
+        return false;
+    }
+    const int64_t K = wg->ne[0];
+    const int64_t M = wg->ne[1];
+    const int64_t N = src1->ne[1]*src1->ne[2]*src1->ne[3];
+    if (N < 1 || N > AI4_PREP_FUSED_MAX_ROWS || K <= 0 || K > INT32_MAX || (K & 127) != 0 || M <= 128 || M > INT32_MAX ||
+            (M & 15) != 0 || (ggml_ai4v2_rate(t) != 0 && K % (128*ggml_ai4v2_chunks(t)) != 0) ||
+            wu->ne[0] != K || wu->ne[1] != M || wg->ne[2] != 1 || wg->ne[3] != 1 ||
+            wu->ne[2] != 1 || wu->ne[3] != 1 || src1->ne[0] != K ||
+            gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+            glu->ne[0] != M || ggml_nelements(glu) != M*N ||
+            src1->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(wg) || !ggml_is_contiguous(wu) ||
+            !ggml_is_contiguous(src1) || !ggml_is_contiguous(glu) ||
+            ((uintptr_t) src1->data & 15) != 0) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    const int xsh_in = K % 256 == 0 ? 1 : 0;
+    const int lay    = ai4_lay_of(t);
+    const float alpha = ggml_get_op_params_f32(glu, 2);
+    const float limit = ggml_get_op_params_f32(glu, 3);
+
+    ggml_cuda_pool_alloc<int8_t> qa(ctx.pool());
+    ggml_cuda_pool_alloc<float>  sa(ctx.pool());
+    int8_t * xq_in = nullptr;
+    float  * xs_in = nullptr;
+    ai4_prep(ctx, src1, (const float *) src1->data, N, (int) K, xsh_in, AI4_PREP_PLAIN, qa, sa, xq_in, xs_in);
+
+    // with GGML_CUDA_AI_FUSE_ACT: the same launch also writes the down product's PLAIN activation (H256 / H128 + int8)
+    // into ai_prep_cache. The f32 GLU output is always written as well.
+    if (down_next != nullptr && (M & 127) == 0 && ggml_cuda_ai_fuse_act_enabled()) {
+        const int xsh_out = M % 256 == 0 ? 1 : 0;
+        const int min_m   = xsh_out ? 4096 : 2048;   // >= 16 CTAs along M
+        int8_t * xq_out = nullptr;
+        float  * xs_out = nullptr;
+        if (M >= min_m && ggml_cuda_ai_prep_variant_for(ctx, down_next) == AI4_PREP_PLAIN &&
+                ai4_prep_reserve(ctx, glu, N, (int) M, xsh_out, AI4_PREP_PLAIN, xq_out, xs_out)) {
+            ai4fuse::launch_dense_gate_up_glu_q8_ai4(lay, xsh_in, xsh_out, glu_tag, true,
+                (const uint8_t *) wg->data, (const uint8_t *) wu->data, xq_in, xs_in, (float *) glu->data, xq_out, xs_out,
+                (int) M, (int) N, (int) K, alpha, limit, stream);
+            CUDA_CHECK(cudaGetLastError());
+            ctx.fusion_stats.ai_prep_runs++;
+            ctx.fusion_stats.ai_fuse_dense_glu_q8++;
+            return true;
+        }
+    }
+    ai4fuse::launch_dense_gate_up_glu_ai4(lay, xsh_in, glu_tag, (const uint8_t *) wg->data, (const uint8_t *) wu->data,
+        xq_in, xs_in, (float *) glu->data, (int) M, (int) N, (int) K, alpha, limit, stream);
+    CUDA_CHECK(cudaGetLastError());
+    ctx.fusion_stats.ai_fuse_dense_glu++;
     return true;
 }
 
@@ -1840,6 +2308,16 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
     // [INKGLUE MIXQ] or by the depth-mix + norm producer (inkpreq.cu): same bytes, no launch
     if (!fused && !pre && ctx.curr_stream_no == 0) {
         pre = ggml_cuda_ink_ai4_preq_take(dst, src1->data, n_rows, K, xsh, &pre_q, &pre_s);
+    }
+    // [OPT9] or by a fused RMS_NORM+MUL / GLU producer (GGML_CUDA_AI_FUSE_ACT; false at once while it is off)
+    if (!fused && !pre) {
+        int8_t * fq = nullptr;
+        float  * fs = nullptr;
+        if (ai4_prep_lookup_fused(ctx, src1, src1->data, n_rows, K, xsh, AI4_PREP_PLAIN, fq, fs)) {
+            pre   = true;
+            pre_q = fq;
+            pre_s = fs;
+        }
     }
     ggml_cuda_pool_alloc<int8_t> q_buf(ctx.pool());
     ggml_cuda_pool_alloc<float>  s_buf(ctx.pool());
