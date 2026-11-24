@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-split-buft.h"
 #include "llama-lsa.h"
 #include "llama-moe-arena.h"
 #include "llama-sampler.h"
@@ -10114,7 +10115,7 @@ class llama_io_write_device : public llama_io_write_i {
                     mbuf_cur = std::move(mbuf);
 
                     // fork: a split QSA checkpoint needs authoritative RAM bytes, not a second card window.
-                    auto * copy_buft = strncmp(ggml_backend_buft_name(buft), "CUDA_QSA_Resident_", 18) == 0 ? ggml_backend_cpu_buffer_type() : buft;
+                    auto * copy_buft = llama_buft_is_qsa_split(buft) ? ggml_backend_cpu_buffer_type() : buft;
                     mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), copy_buft));
 
                     LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft),
