@@ -1764,8 +1764,9 @@ struct ggml_backend_cuda_context {
         uint64_t            last_use = 0;
     };
     struct {
-        ai_prep_entry entries[3];    // fixed-size buffers (AI4_PREP_CACHE_BYTES in ai4.cu): never outgrown, so no retired list
-        uint64_t      tick = 0;
+        ai_prep_entry            entries[3];  // AI4_PREP_CACHE_BYTES each (ai4.cu); only an [OPT9] fused entry grows one
+        std::vector<retired_buf> retired;     // [OPT9] buffers a grown entry replaced: a captured graph may still read them
+        uint64_t                 tick = 0;
     } ai_prep_cache;
 
     // Per-expert address tables for the MoE weight indirection (see tq_build_expert_table). One
@@ -1814,6 +1815,11 @@ struct ggml_backend_cuda_context {
         int64_t add_rms_q8    = 0;   // ... of which also prefilled the q8_1 cache for the next MMVQ consumer
         int64_t ai_prep_runs  = 0;   // AI+ activation preps launched (cached or not) [KAIFUSE R1]
         int64_t ai_prep_hits  = 0;   // ... AI+ matmuls that reused a cached prep instead
+        int64_t ai_fuse_norm_q       = 0;   // [OPT9] RMS_NORM+MUL that also wrote the AI+ consumer's int8 activation
+        int64_t ai_fuse_glu_q        = 0;   // [OPT9] GLU that also wrote the AI+ consumer's int8 activation
+        int64_t ai_fuse_dense_glu    = 0;   // [OPT9] dense AI+ gate + up + GLU launches
+        int64_t ai_fuse_dense_glu_q8 = 0;   // [OPT9] ... that also wrote the down product's int8 activation
+        int64_t ai_mmv_group_spec    = 0;   // [OPT9] grouped AI+ mmv launches at 9..32 tokens
         int64_t cuda_graph_replays = 0;   // CUDA graph launches that replayed without a re-capture [KAIFUSE test]
         int64_t exl3_ffn_bridge = 0; // EXL3 gate/up -> SwiGLU -> down runs through ggml_cuda_exl3_ffn_bridge [#74]
         int64_t exl3_fold_norm = 0;  // RMS_NORM+MUL that also wrote the EXL3 consumer's glued input [#136]

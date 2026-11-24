@@ -10,6 +10,23 @@ void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 // [INKDENSE] grouped decode mmv over n MUL_MATs that share src1 (false = not taken, nothing launched)
 bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n);
 
+// [OPT9] AI+ drop-in fusions, all default off (ai4.cu has the full switch list):
+//   GGML_CUDA_AI_AUTO=1  GGML_CUDA_AI_FUSE_ACT=1  GGML_CUDA_AI_FUSE_GLU=1  GGML_CUDA_AI_MMV_GROUP_SPEC=1
+bool ggml_cuda_ai_auto_enabled();
+bool ggml_cuda_ai_fuse_act_enabled();
+bool ggml_cuda_ai_fuse_glu_enabled();
+bool ggml_cuda_ai_mmv_group_spec_enabled();
+// the ai4 prep variant (0 PLAIN, 1 SWAP8, 2 XPERM, 3 LINEAR) an AI+ / AIF consumer at decode / verify width (<= 32 rows)
+// reads, or -1 when it takes no int8 prep (reference paths, small-M f32 product, FUSED_X, wider batches)
+int  ggml_cuda_ai_prep_variant_for(const ggml_backend_cuda_context & ctx, const ggml_tensor * op);
+// fused producers: write the f32 output and the consumer's prep (variant) into ai_prep_cache; false = nothing launched
+bool ggml_cuda_ai_rms_norm_mul_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * mul,
+                                    int variant);
+bool ggml_cuda_ai_glu_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, int variant);
+// dense AI+ gate + up + GLU (N <= 32) in one launch; with down_next (the GLU's AI+ consumer) and FUSE_ACT also its prep
+bool ggml_cuda_mul_mat_ai4_dense_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
+                                     ggml_tensor * glu, const ggml_tensor * down_next);
+
 // AI+ unit types: shapes and layouts the CUDA backend runs (MUL_MAT and MUL_MAT_ID)
 bool ggml_cuda_ai4_supported(const ggml_tensor * op);
 
