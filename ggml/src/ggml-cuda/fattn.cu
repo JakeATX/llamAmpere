@@ -5,6 +5,7 @@
 #include "fattn-mma-sjkvarn.cuh"
 #include "fattn-sjkvarn-rot.cuh"
 #include "fattn-sjkvarn-v16.cuh"
+#include "fattn-mma-turbo-d128-tq5t4.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -4043,6 +4044,10 @@ static bool ggml_cuda_flash_attn_ext_fused(ggml_backend_cuda_context * ctx, ggml
     // kv_rows (src[9]): the fused turbo / in-place q8 MMA readers walk K/V in cell order; never route such a node here
     if (ggml_flash_attn_ext_get_kv_rows(dst) != nullptr) {
         return false;
+    }
+
+    if (ggml_cuda_flash_attn_ext_d128_tq5t4_try(ctx, dst, device)) {
+        return true;
     }
 
     // Qwen3.8 verification fast path: Q8 K and Turbo3 V are decoded directly
