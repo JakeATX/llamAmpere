@@ -46,6 +46,7 @@ struct gq_params {
     const char * V; int64_t nbv1, nbv2;
     const half * M; int64_t m_t;            // f16 broadcast mask, halves per query row
     int m_al4;                              // half2 mask loads
+    const uint32_t * mp; int64_t mp_t;      // or the one-bit packed mask (ggml.h): 1 = visible; words per query row
     ink_rel_bias b;                         // table form: table + rel; factor form: rel only
     const float * rf; int extent;           // factor form: E rows [0, extent), r rows extent + t*H + h
     const float * sinks;                    // [H] per head, or [H, T] per row (factor form), or nullptr
@@ -146,8 +147,8 @@ static __device__ __forceinline__ void gq_load_tile(half * Ks, half * Vs, const 
 // flags[rb][tile]: 0 = no row of the BM-row block rb sees a key of the tile, 2 = every cell (rows < T, keys < n_kv,
 // the tile inside n_kv) is exactly 0, 1 = otherwise
 template <int BM>
-static __global__ void inkgqa_tile_flags(const half * __restrict__ M, const int64_t m_t, const int T, const int n_kv, const int NT,
-        uint8_t * __restrict__ flags) {
+static __global__ void inkgqa_tile_flags(const half * __restrict__ M, const int64_t m_t, const uint32_t * __restrict__ MP,
+        const int64_t mp_t, const int T, const int n_kv, const int NT, uint8_t * __restrict__ flags) {
     const int tile = blockIdx.x;
     const int rb   = blockIdx.y;
     bool any = false;
@@ -156,7 +157,8 @@ static __global__ void inkgqa_tile_flags(const half * __restrict__ M, const int6
         const int row = rb*BM + e / GQ_BN;
         const int key = tile*GQ_BN + e % GQ_BN;
         if (row < T && key < n_kv) {
-            const float v = __half2float(M[(int64_t) row*m_t + key]);
+            const float v = MP ? ((MP[(int64_t) row*mp_t + key/32] >> (key % 32)) & 1u ? 0.0f : -INFINITY) :
+                                 __half2float(M[(int64_t) row*m_t + key]);
             any  |= v != -INFINITY;
             all0 &= v == 0.0f;
         }
@@ -270,8 +272,8 @@ static __global__ void __launch_bounds__(GQ_G*RW*WARP_SIZE, 1) inkgqa_fa(const g
     }
     float ma = -INFINITY, mb = -INFINITY, la = 0.0f, lb = 0.0f;
 
-    const half * mra = p.M + (int64_t) ta*p.m_t;
-    const half * mrb = p.M + (int64_t) tb*p.m_t;
+    const half * mra = p.M ? p.M + (int64_t) ta*p.m_t : nullptr;
+    const half * mrb = p.M ? p.M + (int64_t) tb*p.m_t : nullptr;
     const char * Kh  = p.K + (int64_t) kvh*p.nbk2;
     const char * Vh  = p.V + (int64_t) kvh*p.nbv2;
     const uint32_t * tl = p.tiles + (int64_t) rb*p.NT;
@@ -306,7 +308,13 @@ static __global__ void __launch_bounds__(GQ_G*RW*WARP_SIZE, 1) inkgqa_fa(const g
             if (!whole) {
                 xa = make_float2(-INFINITY, -INFINITY);
                 xb = xa;
-                if (p.m_al4 && c + 1 < p.n_kv) {
+                if (p.mp) {
+                    // c is even and the pair shares a word; keys >= n_kv stay masked
+                    const uint32_t wa = p.mp[(int64_t) ta*p.mp_t + c/32] >> (c % 32);
+                    const uint32_t wb = p.mp[(int64_t) tb*p.mp_t + c/32] >> (c % 32);
+                    if (c < p.n_kv)     { xa.x = wa & 1u ? 0.0f : -INFINITY; xb.x = wb & 1u ? 0.0f : -INFINITY; }
+                    if (c + 1 < p.n_kv) { xa.y = wa & 2u ? 0.0f : -INFINITY; xb.y = wb & 2u ? 0.0f : -INFINITY; }
+                } else if (p.m_al4 && c + 1 < p.n_kv) {
                     xa = __half22float2(*reinterpret_cast<const half2 *>(mra + c));
                     xb = __half22float2(*reinterpret_cast<const half2 *>(mrb + c));
                 } else {
@@ -636,9 +644,9 @@ static void gq_run(ggml_backend_cuda_context & ctx, gq_params & p) {
     p.tiles   = tiles.get();
     p.n_tiles = (const int32_t *) (tiles.get() + (size_t) n_rb*p.NT);
     if (RW == 4) {
-        inkgqa_tile_flags<64><<<dim3(p.NT, n_rb), 256, 0, stream>>>(p.M, p.m_t, p.T, p.n_kv, p.NT, flags.get());
+        inkgqa_tile_flags<64><<<dim3(p.NT, n_rb), 256, 0, stream>>>(p.M, p.m_t, p.mp, p.mp_t, p.T, p.n_kv, p.NT, flags.get());
     } else {
-        inkgqa_tile_flags<32><<<dim3(p.NT, n_rb), 256, 0, stream>>>(p.M, p.m_t, p.T, p.n_kv, p.NT, flags.get());
+        inkgqa_tile_flags<32><<<dim3(p.NT, n_rb), 256, 0, stream>>>(p.M, p.m_t, p.mp, p.mp_t, p.T, p.n_kv, p.NT, flags.get());
     }
     CUDA_CHECK(cudaGetLastError());
     inkgqa_tile_lists<<<n_rb, WARP_SIZE, 0, stream>>>(flags.get(), p.NT, (uint32_t *) p.tiles, (int32_t *) p.n_tiles);
@@ -682,8 +690,9 @@ static bool gq_check_qkv(const ggml_tensor * dst) {
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const bool packed = mask && ggml_flash_attn_ext_mask_packed(mask);
     if (dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
-            !mask || mask->type != GGML_TYPE_F16) {
+            !mask || (mask->type != GGML_TYPE_F16 && !packed)) {
         return false;
     }
     float max_bias, softcap;
@@ -698,8 +707,9 @@ static bool gq_check_qkv(const ggml_tensor * dst) {
             Hkv > 65535 || n_kv > INT32_MAX/2) {
         return false;
     }
-    if (mask->ne[0] < n_kv || mask->ne[1] < T || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[0] != sizeof(half) ||
-            mask->nb[1] % sizeof(half) != 0) {
+    if ((packed ? mask->ne[0]*32 < n_kv || mask->nb[0] != sizeof(uint32_t) || mask->nb[1] % sizeof(uint32_t) != 0 :
+                  mask->ne[0] < n_kv || mask->nb[0] != sizeof(half) || mask->nb[1] % sizeof(half) != 0) ||
+            mask->ne[1] < T || mask->ne[2] != 1 || mask->ne[3] != 1) {
         return false;
     }
     if (Q->nb[0] != sizeof(float) || !gq_aligned_t(Q, 8) || K->nb[0] != sizeof(half) || !gq_aligned_t(K, 16) ||
@@ -720,15 +730,20 @@ static void gq_fill_qkv(gq_params & p, const ggml_tensor * dst) {
     p.Q = (const char *) Q->data; p.nbq1 = Q->nb[1]; p.nbq2 = Q->nb[2];
     p.K = (const char *) K->data; p.nbk1 = K->nb[1]; p.nbk2 = K->nb[2];
     p.V = (const char *) V->data; p.nbv1 = V->nb[1]; p.nbv2 = V->nb[2];
-    p.M = (const half *) mask->data; p.m_t = mask->nb[1]/sizeof(half);
-    p.m_al4 = (reinterpret_cast<uintptr_t>(mask->data) % 4) == 0 && mask->nb[1] % 4 == 0;
+    if (ggml_flash_attn_ext_mask_packed(mask)) {
+        p.mp = (const uint32_t *) mask->data; p.mp_t = mask->nb[1]/sizeof(uint32_t);
+    } else {
+        p.M = (const half *) mask->data; p.m_t = mask->nb[1]/sizeof(half);
+        p.m_al4 = (reinterpret_cast<uintptr_t>(mask->data) % 4) == 0 && mask->nb[1] % 4 == 0;
+    }
     p.O = (char *) dst->data; p.nbo1 = dst->nb[1]; p.nbo2 = dst->nb[2];
     p.T = (int) Q->ne[1]; p.H = (int) Q->ne[2]; p.Hkv = (int) K->ne[2]; p.n_kv = (int) K->ne[1];
     memcpy(&p.scale, (const float *) dst->op_params + 0, sizeof(float));
 }
 
 static bool gq_inkrel_check(const int device, const ggml_tensor * dst) {
-    if (!ggml_flash_attn_ext_is_inkrel(dst) || !gq_device_ok(device) || !gq_check_qkv(dst)) {
+    if (!ggml_flash_attn_ext_is_inkrel(dst) || !gq_device_ok(device) || !gq_check_qkv(dst) ||
+            dst->src[3]->type != GGML_TYPE_F16) {
         return false;
     }
     const bool factor = ggml_flash_attn_ext_is_inkrel_factor(dst);
