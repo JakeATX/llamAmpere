@@ -4909,12 +4909,25 @@ bool llama_nk_dev_mask_enabled() {
     return v;
 }
 
+// NEONKERN: LLAMA_NK_DEV_MASK_CHECK=1 (default off, debug only): also build the base CPU mask for each
+// deferred call, sync + D2H the GPU result in sched_copy_mtp_inputs, and memcmp byte-for-byte.
+bool llama_nk_dev_mask_check_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_NK_DEV_MASK_CHECK");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
 namespace {
 struct kq_mask_deferred {
     const ggml_tensor *  t;
     void *               data;
     int64_t              n_kv;
     std::vector<int32_t> n_visible;
+    const char *         tag          = "kq";
+    bool                 has_host_ref = false;
+    bool                 copied       = false;
 };
 std::mutex                    g_kq_deferred_mu;
 std::vector<kq_mask_deferred> g_kq_deferred;
@@ -4944,7 +4957,8 @@ kq_mask_deferred * kq_mask_deferred_find(const ggml_tensor * t) {
 }
 } // namespace
 
-bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector<int32_t> && n_visible) {
+bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector<int32_t> && n_visible,
+                                const char * tag, bool has_host_ref) {
     if (!t || !t->data || t->type != GGML_TYPE_F16 || n_kv <= 0 || t->ne[0] != n_kv ||
             !ggml_is_contiguous(t) || ggml_nrows(t) != (int64_t) n_visible.size()) {
         return false;
@@ -4955,8 +4969,9 @@ bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector
         }
     }
     std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
-    // Keep pending masks until their copies run. Under LLAMA_NK_DEV_MASK=1, evict stale entries from prior
-    // reallocated graphs so long multi-request runs never hit the 64-slot cap and fall back to host fills.
+    // Keep pending masks until their copies run. Under LLAMA_NK_DEV_MASK=1, evict only the oldest entry
+    // whose copy has already run (copied == true); never drop a pending uncopied entry. If all 64 slots
+    // hold pending entries, return false so the caller falls back to the host fill safely.
     if (llama_nk_dev_mask_enabled()) {
         for (size_t i = 0; i < g_kq_deferred.size(); ++i) {
             if (g_kq_deferred[i].t == t || g_kq_deferred[i].data == t->data) {
@@ -4965,23 +4980,36 @@ bool llama_kq_mask_deferred_set(const ggml_tensor * t, int64_t n_kv, std::vector
             }
         }
         if (g_kq_deferred.size() >= 64) {
-            g_kq_deferred.erase(g_kq_deferred.begin());
+            auto it = std::find_if(g_kq_deferred.begin(), g_kq_deferred.end(),
+                    [](const kq_mask_deferred & d) { return d.copied; });
+            if (it == g_kq_deferred.end()) {
+                return false;
+            }
+            g_kq_deferred.erase(it);
         }
     } else if (g_kq_deferred.size() >= 64) {
         return false;
     }
-    g_kq_deferred.push_back({ t, t->data, n_kv, std::move(n_visible) });
+    g_kq_deferred.push_back({ t, t->data, n_kv, std::move(n_visible), tag ? tag : "kq", has_host_ref, false });
     return true;
 }
 
-bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_visible, int64_t * n_kv) {
+bool llama_kq_mask_deferred_get(const ggml_tensor * t, std::vector<int32_t> & n_visible, int64_t * n_kv,
+                                const char ** tag, bool * has_host_ref) {
     std::lock_guard<std::mutex> lock(g_kq_deferred_mu);
-    const auto * d = kq_mask_deferred_find(t);
+    auto * d = kq_mask_deferred_find(t);
     if (!d) {
         return false;
     }
+    d->copied = true;
     n_visible = d->n_visible;  // a copy: another context may replace the record after the lock is released
     *n_kv     = d->n_kv;
+    if (tag) {
+        *tag = d->tag;
+    }
+    if (has_host_ref) {
+        *has_host_ref = d->has_host_ref;
+    }
     return true;
 }
 
@@ -5246,6 +5274,21 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
+    const args_set_input_attn_mask args = {
+        /*.hparams          =*/ hparams,
+        /*.ubatch           =*/ ubatch,
+        /*.v_cells          =*/ v_cells,
+        /*.seq_to_stream    =*/ seq_to_stream,
+        /*.n_swa            =*/ n_swa,
+        /*.swa_type         =*/ swa_type,
+        /*.n_swa_sink       =*/ n_swa_sink,
+        /*.n_kv             =*/ n_kv,
+        /*.n_stream         =*/ n_stream,
+        /*.n_tps            =*/ n_tps,
+        /*.rows             =*/ rows,
+        /*.block_uniform    =*/ block_uniform,
+    };
+
     if (n_stream == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && n_tokens > 0 &&
             rows == nullptr && !block_uniform && kq_mask_fast_enabled()) {
         const llama_seq_id seq_id = ubatch->seq_id[0][0];
@@ -5259,8 +5302,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
             if (allow_defer && dst->type == GGML_TYPE_F16 && kq_mask_defer_ok && llama_kq_mask_device_enabled() && dst->ne[1] == (int64_t) n_tokens &&
                     ggml_is_contiguous(dst)) {
                 std::vector<int32_t> counts;
+                const bool check = llama_nk_dev_mask_enabled() && llama_nk_dev_mask_check_enabled();
                 if (kq_mask_seq_prefix_counts(cells, ubatch, n_kv, counts) &&
-                        llama_kq_mask_deferred_set(dst, n_kv, std::move(counts))) {
+                        llama_kq_mask_deferred_set(dst, n_kv, std::move(counts), "kq_causal", check)) {
+                    if (check) {
+                        set_input_attn_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+                    }
                     return;
                 }
             }
@@ -5293,25 +5340,14 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
             }
             counts[i] = (int32_t) std::min<int64_t>(n_kv, cells.used_max_p1());
         }
-        if (ok && llama_kq_mask_deferred_set(dst, n_kv, std::move(counts))) {
+        const bool check = llama_nk_dev_mask_check_enabled();
+        if (ok && llama_kq_mask_deferred_set(dst, n_kv, std::move(counts), "kq_noncausal", check)) {
+            if (check) {
+                set_input_attn_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+            }
             return;
         }
     }
-
-    const args_set_input_attn_mask args = {
-        /*.hparams          =*/ hparams,
-        /*.ubatch           =*/ ubatch,
-        /*.v_cells          =*/ v_cells,
-        /*.seq_to_stream    =*/ seq_to_stream,
-        /*.n_swa            =*/ n_swa,
-        /*.swa_type         =*/ swa_type,
-        /*.n_swa_sink       =*/ n_swa_sink,
-        /*.n_kv             =*/ n_kv,
-        /*.n_stream         =*/ n_stream,
-        /*.n_tps            =*/ n_tps,
-        /*.rows             =*/ rows,
-        /*.block_uniform    =*/ block_uniform,
-    };
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_attn_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
@@ -5407,7 +5443,7 @@ int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_uba
     // of a stream contiguous, as the KQ mask), so the rows below are filled unchanged
     const bool packed = dst->type == GGML_TYPE_I32;
     GGML_ASSERT((packed || dst->type == GGML_TYPE_F16) && dst->ne[2] == 1 && sj_kvarn.enabled());
-    if (llama_kq_mask_device_enabled() || llama_nk_dev_mask_enabled()) {
+    if (llama_nk_dev_mask_enabled()) {
         kq_mask_deferred_drop(dst);
     }
     const int64_t n_kv = packed ? dst->op_params[0] : dst->ne[0];
@@ -5418,6 +5454,10 @@ int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_uba
     // NEONKERN (LLAMA_NK_DEV_MASK=1): SJ-KVaRN F16 far mask is a pure per-row prefix [0, c1) when the stream holds
     // contiguous used cells for one sequence in non-decreasing position order (the SJ-KVaRN invariant). Compute c1 via
     // O(log n_kv) sj_kvarn_cell_of and defer the 1 MB fill to the GPU prefix-fill kernel.
+    // Under LLAMA_NK_DEV_MASK_CHECK=1 (debug), fall through to the exact base CPU fill and verify far_end + memcmp.
+    bool nk_check_pending = false;
+    std::vector<int32_t> nk_check_counts;
+    int64_t nk_check_far_end = 0;
     if (llama_nk_dev_mask_enabled() && !packed && kq_mask_defer_ok && dst->buffer != nullptr &&
             ggml_backend_buffer_is_host(dst->buffer) && ggml_is_contiguous(dst) && T > 0 && n_kv > 0) {
         std::vector<int32_t> counts((size_t) T, 0);
@@ -5448,10 +5488,26 @@ int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_uba
             counts[i] = (int32_t) c1;
             far_end = std::max(far_end, c1);
         }
-        if (ok && llama_kq_mask_deferred_set(dst, n_kv, std::move(counts))) {
-            return far_end;
+        if (ok) {
+            if (llama_nk_dev_mask_check_enabled()) {
+                nk_check_pending = true;
+                nk_check_counts  = std::move(counts);
+                nk_check_far_end = far_end;
+            } else if (llama_kq_mask_deferred_set(dst, n_kv, std::move(counts), "sj_far", false)) {
+                return far_end;
+            }
         }
     }
+    auto finish_nk_check = [&](int64_t cpu_far_end) -> int64_t {
+        if (nk_check_pending) {
+            if (nk_check_far_end != cpu_far_end) {
+                LLAMA_LOG_ERROR("[NK_DEV_MASK_CHECK] MISMATCH tag=sj_far far_end dev=%lld cpu=%lld (n_kv=%lld T=%lld)\n",
+                        (long long) nk_check_far_end, (long long) cpu_far_end, (long long) n_kv, (long long) T);
+            }
+            llama_kq_mask_deferred_set(dst, n_kv, std::move(nk_check_counts), "sj_far", /*has_host_ref=*/ true);
+        }
+        return cpu_far_end;
+    };
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     // fork INKPF3: the same mask, built from one per-cell position table and filled by row on a few threads (the
@@ -5518,7 +5574,7 @@ int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_uba
             fill(0, T);
         }
         ggml_backend_tensor_set(dst, data.get(), 0, ggml_nbytes(dst));
-        return T > 0 ? *std::max_element(row_end.begin(), row_end.end()) : 0;
+        return finish_nk_check(T > 0 ? *std::max_element(row_end.begin(), row_end.end()) : 0);
     }
     std::vector<ggml_fp16_t> data(packed ? 0 : n_kv*T, ninf);
     std::vector<uint32_t>    bits(packed ? dst->ne[0]*T : 0, 0u);
@@ -5597,7 +5653,7 @@ int64_t llama_kv_cache::set_input_sj_far_mask(ggml_tensor * dst, const llama_uba
     } else {
         ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
     }
-    return end;
+    return finish_nk_check(end);
 }
 
 // INKREL (llama-inklsa.h): far mask over every cell, near cells (within extent of some row) with their bias rows
