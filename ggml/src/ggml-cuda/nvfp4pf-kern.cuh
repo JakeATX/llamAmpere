@@ -147,7 +147,7 @@ static __device__ __forceinline__ int2 nvfp4pf_dec8(const uint32_t q4, const uin
 // every output column is computed alone, so that order does not change any value). Pairs with an invalid id get 0.
 static __global__ void __launch_bounds__(256) k_nvfp4pf_route(const char * __restrict__ ids, const int64_t ids_nb0,
         const int64_t ids_nb1, const int n_used, const int n_tok, const int ne11, const int n_expert, const int bn,
-        const int max_tiles, int * __restrict__ work, float * __restrict__ y, const int m) {
+        const int max_tiles, int * __restrict__ work, float * __restrict__ y, const int m, const bool dst_bf16 = false) {
     __shared__ int cnt[NVFP4PF_MAX_EXPERTS];
     __shared__ int pos[NVFP4PF_MAX_EXPERTS];
     const int tid = threadIdx.x;
@@ -204,8 +204,15 @@ static __global__ void __launch_bounds__(256) k_nvfp4pf_route(const char * __res
             rows[i] = (int) (p / n_used)*ne11 + (int) (p % n_used) % ne11;
             cols[i] = (int) p;
         } else {
-            for (int r = 0; r < m; ++r) {
-                y[p*m + r] = 0.0f;
+            if (dst_bf16) {
+                nv_bfloat16 * y16 = (nv_bfloat16 *) y;
+                for (int r = 0; r < m; ++r) {
+                    y16[p*m + r] = __float2bfloat16(0.0f);
+                }
+            } else {
+                for (int r = 0; r < m; ++r) {
+                    y[p*m + r] = 0.0f;
+                }
             }
         }
     }
@@ -268,7 +275,7 @@ constexpr __host__ __device__ int nvfp4pf_smem_bytes() {
 template <int KF, int BN>
 static __global__ void __launch_bounds__(256, 2) k_nvfp4pf_mm(const char * __restrict__ w_all, const int64_t stride_blk,
         const int8_t * __restrict__ xq, const float * __restrict__ xs, float * __restrict__ y, const int64_t ldy,
-        const int M, const int K, const nvfp4pf_map map, const float * __restrict__ s_exp, const float s_all) {
+        const int M, const int K, const nvfp4pf_map map, const float * __restrict__ s_exp, const float s_all, const bool dst_bf16 = false) {
     static_assert(KF == 32 || KF == 64, "NVFP4PF: KF 32 or 64");
     static_assert(BN == 64 || BN == 128, "NVFP4PF: BN 64 or 128");
     constexpr int WN = BN/2, NTI = WN/8, SUBS = 128/KF, JPS = KF/32, STAGE = nvfp4pf_stage_bytes<KF, BN>();
@@ -437,9 +444,15 @@ static __global__ void __launch_bounds__(256, 2) k_nvfp4pf_mm(const char * __res
 #pragma unroll
         for (int q = 0; q < 2; ++q) {
             if (c + q < nt) {
-                float * yc = y + (int64_t) scol[c + q]*ldy;
-                yc[r0] = scaled ? acc[i][q]*oscale     : acc[i][q];
-                yc[r1] = scaled ? acc[i][q + 2]*oscale : acc[i][q + 2];
+                if (dst_bf16) {
+                    nv_bfloat16 * yc16 = (nv_bfloat16 *) y + (int64_t) scol[c + q]*ldy;
+                    yc16[r0] = __float2bfloat16(scaled ? acc[i][q]*oscale     : acc[i][q]);
+                    yc16[r1] = __float2bfloat16(scaled ? acc[i][q + 2]*oscale : acc[i][q + 2]);
+                } else {
+                    float * yc = y + (int64_t) scol[c + q]*ldy;
+                    yc[r0] = scaled ? acc[i][q]*oscale     : acc[i][q];
+                    yc[r1] = scaled ? acc[i][q + 2]*oscale : acc[i][q + 2];
+                }
             }
         }
     }

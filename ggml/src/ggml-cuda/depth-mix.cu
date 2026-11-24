@@ -1,5 +1,6 @@
 #include "depth-mix.cuh"
 #include "rq4.cuh"
+#include "prefill-glue-dev.cuh"
 
 #define DEPTH_MIX_THREADS 1024
 #define DEPTH_MIX_MAX_ROWS 64
@@ -26,7 +27,7 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         const char * __restrict__ cur, const int64_t c_nb1, const char * __restrict__ query, const int64_t q_nb1,
         float * dst, const int n, const int nq_all, const float eps, const float scale,
         const float * __restrict__ nw = nullptr, float * __restrict__ ndst = nullptr, const float neps = 0.0f,
-        int8_t * __restrict__ aq = nullptr, float * __restrict__ as = nullptr) {
+        int8_t * __restrict__ aq = nullptr, float * __restrict__ as = nullptr, int prefill_mode = 0) {
     extern __shared__ __align__(16) float s_out[];
     __shared__ float part[DEPTH_MIX_MAX_ROWS*(NQ + 1)];
     __shared__ float p[DEPTH_MIX_MAX_ROWS*NQ];
@@ -187,15 +188,31 @@ static __global__ void __launch_bounds__(DEPTH_MIX_THREADS) k_depth_mix(
         tmp = block_reduce<block_reduce_method::SUM, DEPTH_MIX_THREADS>(tmp, s_red);
         const float mean = tmp / n;
         const float sc   = rsqrtf(mean + neps);
-        float * nd = ndst + (int64_t) t*n;
+        float * nd = ndst ? (ndst + (int64_t) t*n) : nullptr;
         for (int col = threadIdx.x; col < n; col += DEPTH_MIX_THREADS) {
-            nd[col] = sc * norm_src[col] * nw[col];
+            const float val = __fmul_rn(__fmul_rn(sc, norm_src[col]), nw[col]);
+            if (nd) {
+                nd[col] = val;
+            }
+            if constexpr (SMEM_OUT) {
+                if (prefill_mode != 0) {
+                    s_out[col] = val;
+                }
+            }
         }
-        // [INKGLUE MIXQ] then the AI+ H256 activation of the normed row, by rq4::quantize_act_body itself (one warp per 256
-        // block; the warps of this block cover n <= 32*256), from the row this block just wrote
+        // [INKGLUE MIXQ] / [PREFILL-GLUE] quantize the normed row directly from SMEM (or global if !SMEM_OUT)
         if (aq != nullptr) {
             __syncthreads();
-            rq4::quantize_act_body<false, false, false>(ndst, n, aq, as, n, (int) gridDim.x, 0, (int) t);
+            const float * qsrc = (SMEM_OUT && prefill_mode != 0) ? s_out : nd;
+            if (prefill_mode == 1) {
+                pf_quantize_row_ai4_from_ptr<1>(qsrc, aq, as, n, (int) t, DEPTH_MIX_THREADS / 32);
+            } else if (prefill_mode == 264) {
+                pf_quantize_row_nvfp4pf_from_ptr<64>(qsrc, aq, as, n, (int) t, DEPTH_MIX_THREADS / 32);
+            } else if (prefill_mode == 232) {
+                pf_quantize_row_nvfp4pf_from_ptr<32>(qsrc, aq, as, n, (int) t, DEPTH_MIX_THREADS / 32);
+            } else {
+                rq4::quantize_act_body<false, false, false>(ndst, n, aq, as, n, (int) gridDim.x, 0, (int) t);
+            }
         }
     }
 }
@@ -249,14 +266,15 @@ void ggml_cuda_depth_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 // [INKGLUE] depth mix (one query) + RMS_NORM(eps) + MUL(w) of the mixed rows into ndst; false: not this shape
 bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * w, ggml_tensor * ndst, float neps,
-        int8_t * aq, float * as) {
+        int8_t * aq, float * as, int prefill_mode, bool write_f32) {
     if (!ggml_cuda_depth_mix_supported(dst) || dst->src[1]->ne[1] != 1) {
         return false;
     }
     if ((aq == nullptr) != (as == nullptr)) {
         return false;
     }
-    if (aq && (dst->src[0]->ne[0] % 256 != 0 || dst->src[0]->ne[0] > 32*256 || !ggml_is_contiguous(ndst) ||
+    if (aq && (dst->src[0]->ne[0] % (prefill_mode == 232 ? 32 : prefill_mode == 264 ? 64 : 256) != 0 ||
+            dst->src[0]->ne[0] > 32*256 || !ggml_is_contiguous(ndst) ||
             ((uintptr_t) ndst->data & 15) != 0)) {
         return false;
     }
@@ -283,20 +301,26 @@ bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const char * e = getenv("GGML_CUDA_DEPTH_MIX_SMEM");
         return e == nullptr || atoi(e) != 0;
     }();
-    const bool use_smem = use_smem_env && n <= 4096;
+    const bool use_smem = (use_smem_env || prefill_mode != 0) && n <= 4096;
     const size_t smem_bytes = use_smem ? (size_t) n * sizeof(float) : 0;
+    float * ndst_ptr = (!write_f32 && use_smem && prefill_mode != 0) ? nullptr : (float *) ndst->data;
     const dim3 grid((unsigned) T, 1);
     if (vec) {
         if (use_smem) {
             k_depth_mix<1, 4, true, true><<<grid, DEPTH_MIX_THREADS, smem_bytes, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
-                (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
+                (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, ndst_ptr, neps, aq, as, prefill_mode);
         } else {
             k_depth_mix<1, 4, true, false><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
-                (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
+                (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, ndst_ptr, neps, aq, as, prefill_mode);
         }
     } else {
-        k_depth_mix<1, 1, true, false><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
-            (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, (float *) ndst->data, neps, aq, as);
+        if (use_smem) {
+            k_depth_mix<1, 1, true, true><<<grid, DEPTH_MIX_THREADS, smem_bytes, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
+                (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, ndst_ptr, neps, aq, as, prefill_mode);
+        } else {
+            k_depth_mix<1, 1, true, false><<<grid, DEPTH_MIX_THREADS, 0, stream>>>(sd, s1, s2, k, (const char *) cur->data, cur->nb[1],
+                (const char *) query->data, query->nb[1], (float *) dst->data, n, 1, eps, scale, (const float *) w->data, ndst_ptr, neps, aq, as, prefill_mode);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

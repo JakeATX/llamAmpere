@@ -82,21 +82,10 @@ static __device__ __forceinline__ float magic_i2f(int x) {
 
 // Optional scratch layout swaps the two 8-byte halves of each vector for token bit 1.
 // The default fragment layout remains unchanged.
-// quantize_act_body is one CTA's work for grid block (bx, tok); other kernels may run it on part of their grid.
 template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
-static __device__ __forceinline__ void quantize_act_body(
-        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
-        int bx, int tok) {
+static __device__ __forceinline__ void quantize_act_regs(
+        float (&v)[8], const int hb, int8_t * __restrict__ q, float * __restrict__ s, int K, int tok) {
     const int lane = threadIdx.x & 31;
-    const int hb   = bx*4 + (threadIdx.x >> 5);
-    if (hb*RQ4_HB >= K || tok >= N) {
-        return;
-    }
-    const float * xr = x + (int64_t) tok*sx + hb*RQ4_HB + lane*8;
-    const float4 u0 = *(const float4 *) xr;
-    const float4 u1 = *(const float4 *) (xr + 4);
-    float v[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
-
     const uint32_t sw = d_sign_bits[lane >> 2] >> ((lane & 3)*8);
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
@@ -155,13 +144,30 @@ static __device__ __forceinline__ void quantize_act_body(
         int8_t * qr = q + (int64_t) tok*K + hb*RQ4_HB + c*RQ4_CHUNK + h*64 + (t0 >> 1)*32 + j*8;
         *(uint2 *) qr = make_uint2(w[0], w[1]);
     } else {
-    int8_t * qr = q + (int64_t) tok*K + hb*RQ4_HB + c*RQ4_CHUNK + (j ^ (SWAP8 ? ((tok >> 1) & 1) : 0))*8 + h*4;
-    *(uint32_t *) (qr + (t0 + 0)*32) = w[0];
-    *(uint32_t *) (qr + (t0 + 1)*32) = w[1];
+        int8_t * qr = q + (int64_t) tok*K + hb*RQ4_HB + c*RQ4_CHUNK + (j ^ (SWAP8 ? ((tok >> 1) & 1) : 0))*8 + h*4;
+        *(uint32_t *) (qr + (t0 + 0)*32) = w[0];
+        *(uint32_t *) (qr + (t0 + 1)*32) = w[1];
     }
     if (lane == 0) {
         s[(int64_t) tok*(K/RQ4_HB) + hb] = d;
     }
+}
+
+// quantize_act_body is one CTA's work for grid block (bx, tok); other kernels may run it on part of their grid.
+template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
+static __device__ __forceinline__ void quantize_act_body(
+        const float * __restrict__ x, int64_t sx, int8_t * __restrict__ q, float * __restrict__ s, int K, int N,
+        int bx, int tok) {
+    const int lane = threadIdx.x & 31;
+    const int hb   = bx*4 + (threadIdx.x >> 5);
+    if (hb*RQ4_HB >= K || tok >= N) {
+        return;
+    }
+    const float * xr = x + (int64_t) tok*sx + hb*RQ4_HB + lane*8;
+    const float4 u0 = *(const float4 *) xr;
+    const float4 u1 = *(const float4 *) (xr + 4);
+    float v[8] = { u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w };
+    quantize_act_regs<SWAP8, XPERM, LINEAR>(v, hb, q, s, K, tok);
 }
 
 template <bool SWAP8 = false, bool XPERM = false, bool LINEAR = false>
@@ -345,7 +351,7 @@ template <class Codec, int BN, int GEMM_STAGES, int WMW = 2>
 static __global__ void __launch_bounds__(GEMM_THREADS, (BN <= 64 && GEMM_STAGES <= 2) ? 2 : 1) gemm(
         const uint8_t * __restrict__ W, int64_t row_bytes,
         const int8_t * __restrict__ Xq, const float * __restrict__ Xs,
-        float * __restrict__ Y, int64_t ldy, int M, int N, int K) {
+        float * __restrict__ Y, int64_t ldy, int M, int N, int K, bool dst_bf16 = false) {
     constexpr int BM  = GEMM_BM;
     constexpr int WNW = 8/WMW;    // warps along N
     constexpr int WMR = BM/WMW;   // rows per warp (64 or 32)
@@ -482,13 +488,25 @@ static __global__ void __launch_bounds__(GEMM_THREADS, (BN <= 64 && GEMM_STAGES 
 #pragma unroll
         for (int nt = 0; nt < NTI; ++nt) {
             const int c = n0 + wn*WN + nt*8 + 2*t;
-            if (c < N) {
-                Y[(int64_t) c*ldy + r]           = acc[mt][nt][0]*Codec::out_mul;
-                Y[(int64_t) c*ldy + r + 8]       = acc[mt][nt][2]*Codec::out_mul;
-            }
-            if (c + 1 < N) {
-                Y[(int64_t) (c + 1)*ldy + r]     = acc[mt][nt][1]*Codec::out_mul;
-                Y[(int64_t) (c + 1)*ldy + r + 8] = acc[mt][nt][3]*Codec::out_mul;
+            if (dst_bf16) {
+                nv_bfloat16 * Y16 = (nv_bfloat16 *) Y;
+                if (c < N) {
+                    Y16[(int64_t) c*ldy + r]           = __float2bfloat16(acc[mt][nt][0]*Codec::out_mul);
+                    Y16[(int64_t) c*ldy + r + 8]       = __float2bfloat16(acc[mt][nt][2]*Codec::out_mul);
+                }
+                if (c + 1 < N) {
+                    Y16[(int64_t) (c + 1)*ldy + r]     = __float2bfloat16(acc[mt][nt][1]*Codec::out_mul);
+                    Y16[(int64_t) (c + 1)*ldy + r + 8] = __float2bfloat16(acc[mt][nt][3]*Codec::out_mul);
+                }
+            } else {
+                if (c < N) {
+                    Y[(int64_t) c*ldy + r]           = acc[mt][nt][0]*Codec::out_mul;
+                    Y[(int64_t) c*ldy + r + 8]       = acc[mt][nt][2]*Codec::out_mul;
+                }
+                if (c + 1 < N) {
+                    Y[(int64_t) (c + 1)*ldy + r]     = acc[mt][nt][1]*Codec::out_mul;
+                    Y[(int64_t) (c + 1)*ldy + r + 8] = acc[mt][nt][3]*Codec::out_mul;
+                }
             }
         }
     }
@@ -497,7 +515,7 @@ static __global__ void __launch_bounds__(GEMM_THREADS, (BN <= 64 && GEMM_STAGES 
 
 template <class Codec, int BN, int STAGES = GEMM_STAGES_DEFAULT, int WMW = 2>
 static void launch_gemm(const uint8_t * W, int64_t row_bytes, const int8_t * Xq, const float * Xs,
-                        float * Y, int64_t ldy, int M, int N, int K, cudaStream_t stream) {
+                        float * Y, int64_t ldy, int M, int N, int K, cudaStream_t stream, bool dst_bf16 = false) {
     constexpr int smem = gemm_smem_bytes<Codec, BN, STAGES>();
     static bool attr_set[64] = {};   // per template instance and device
     int dev = 0;
@@ -507,7 +525,7 @@ static void launch_gemm(const uint8_t * W, int64_t row_bytes, const int8_t * Xq,
         attr_set[dev & 63] = true;
     }
     const dim3 grid(M/GEMM_BM, (N + BN - 1)/BN);
-    gemm<Codec, BN, STAGES, WMW><<<grid, GEMM_THREADS, smem, stream>>>(W, row_bytes, Xq, Xs, Y, ldy, M, N, K);
+    gemm<Codec, BN, STAGES, WMW><<<grid, GEMM_THREADS, smem, stream>>>(W, row_bytes, Xq, Xs, Y, ldy, M, N, K, dst_bf16);
 }
 
 // ---------------------------------------------------------------------------------------------
