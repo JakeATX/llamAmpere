@@ -1993,6 +1993,22 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);
             warmup_ok = check_warmup(llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()), "decode");
+
+            // fork PROMPTWARM: also run one prompt-width ubatch, so the first prompt after boot does not pay the lazy
+            // loading of the prompt kernels. LLAMA_WARMUP_PROMPT: unset/0 = off, 1 = one n_ubatch, N > 1 = N rows.
+            const char * pw_env = getenv("LLAMA_WARMUP_PROMPT");
+            const int    pw_req = pw_env && pw_env[0] ? atoi(pw_env) : 0;
+            int n_pw = pw_req == 1 ? (int) llama_n_ubatch(lctx) : pw_req;
+            n_pw = std::min({ n_pw, (int) llama_n_ubatch(lctx), (int) llama_n_batch(lctx), (int) llama_n_ctx_seq(lctx) - 1 });
+            if (warmup_ok && n_pw > (int) tmp.size()) {
+                llama_memory_clear(llama_get_memory(lctx), true);
+                std::vector<llama_token> pw((size_t) n_pw, tmp[0]);
+                common_batch pbatch = common_batch_get_one(lctx, pw);
+                std::vector<float> pzeros;
+                common_batch_set_zero_state(pbatch, model, pzeros);
+                warmup_ok = check_warmup(llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, pbatch.get()), "prompt decode");
+                COM_INF("warmup: prompt-width ubatch of %d rows\n", n_pw);
+            }
         }
         if (!warmup_ok) {
             res->free_context();
