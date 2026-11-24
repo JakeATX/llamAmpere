@@ -25,4 +25,5 @@ bool ggml_cuda_nk_dspark_head_launch(
         int64_t             n_eval,
         int                 sk,
         float               softcap,
-        float               inv_temp);
+        float               inv_temp,
+        int                 ntiles_override = 0);

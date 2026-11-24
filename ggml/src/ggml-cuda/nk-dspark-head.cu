@@ -33,12 +33,16 @@ bool ggml_cuda_nk_dspark_head_enabled() {
     return on;
 }
 
-static bool nk_dspark_head_l2_ef() {
-    static const bool on = [] {
+// Returns: -1 = auto (L2::evict_first on nb==1, off on nb>1 for cross-seq L2 reuse), 0 = force off, 1 = force on.
+static int nk_dspark_head_l2_mode() {
+    static const int mode = [] {
         const char * e = std::getenv("GGML_CUDA_NK_DSPARK_HEAD_L2");
-        return e == nullptr || std::atoi(e) != 0;
+        if (e == nullptr) {
+            return -1;
+        }
+        return std::atoi(e) != 0 ? 1 : 0;
     }();
-    return on;
+    return mode;
 }
 
 static bool nk_dspark_head_trace() {
@@ -115,24 +119,54 @@ static __device__ __forceinline__ float nk_dot8(const uint4 w4, const float4 x0,
          + f3.x * x1.z + f3.y * x1.w;
 }
 
-// Warp-0 descending bitonic sort of 64 uint64_t keys in shared memory (32 pairs = 1 warp, 0 __syncthreads).
+// Pure-register 64-bit warp butterfly shuffle.
+static __device__ __forceinline__ uint64_t nk_shfl_xor_u64(const uint64_t v, const int mask) {
+    const uint32_t lo = __shfl_xor_sync(0xffffffffu, (uint32_t) v, mask);
+    const uint32_t hi = __shfl_xor_sync(0xffffffffu, (uint32_t) (v >> 32), mask);
+    return ((uint64_t) hi << 32) | (uint64_t) lo;
+}
+
+// Pure-register bitonic sort of 32 uint64_t across lanes 0..31 (desc=true -> descending, false -> ascending).
+static __device__ __forceinline__ uint64_t nk_warp_bitonic_sort32(uint64_t v, const int lane, const bool desc) {
+    for (int size = 2; size <= 32; size <<= 1) {
+        const bool dir = ((lane & size) == 0) ? desc : !desc;
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const uint64_t o = nk_shfl_xor_u64(v, stride);
+            const bool is_lo = (lane & stride) == 0;
+            const bool keep_max = (is_lo == dir);
+            v = keep_max ? (v > o ? v : o) : (v < o ? v : o);
+        }
+    }
+    return v;
+}
+
+// Pure-register bitonic merge of a 32-element bitonic sequence into descending order across lanes 0..31.
+static __device__ __forceinline__ uint64_t nk_warp_bitonic_merge32_desc(uint64_t v, const int lane) {
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        const uint64_t o = nk_shfl_xor_u64(v, stride);
+        const bool is_lo = (lane & stride) == 0;
+        v = is_lo ? (v > o ? v : o) : (v < o ? v : o);
+    }
+    return v;
+}
+
+// Warp-0 descending bitonic sort of 64 uint64_t keys using pure-register warp shuffles (0 intermediate SMEM
+// traffic, 0 __syncthreads, immune to non-volatile SMEM load hoisting across __syncwarp).
 static __device__ __forceinline__ void nk_sort64_desc_warp0(uint64_t * __restrict__ s, const int tid) {
     if (tid < 32) {
-#pragma unroll
-        for (int size = 2; size <= 64; size <<= 1) {
-#pragma unroll
-            for (int stride = size >> 1; stride > 0; stride >>= 1) {
-                const int i = 2 * tid - (tid & (stride - 1));
-                const int j = i + stride;
-                const uint64_t a = s[i];
-                const uint64_t b = s[j];
-                if ((a < b) == ((i & size) == 0)) {
-                    s[i] = b;
-                    s[j] = a;
-                }
-                __syncwarp();
-            }
+        uint64_t a = s[tid];
+        uint64_t b = s[tid + 32];
+        a = nk_warp_bitonic_sort32(a, tid, false);
+        b = nk_warp_bitonic_sort32(b, tid, true);
+        if (a < b) {
+            const uint64_t tmp = a;
+            a = b;
+            b = tmp;
         }
+        a = nk_warp_bitonic_merge32_desc(a, tid);
+        b = nk_warp_bitonic_merge32_desc(b, tid);
+        s[tid]      = a;
+        s[tid + 32] = b;
     }
 }
 
@@ -339,7 +373,7 @@ static __device__ __forceinline__ int nk_tile_cut(const int tile, const int ntil
 }
 
 // Stage 1: 4-row unrolled F16 folded-head GEMV + bias + base + softcap + exact radix top-K (or greedy max).
-// Grid: (ntiles, nb), Block: 256 (8 warps), target 4 CTAs/SM = 32 warps/SM on sm_86.
+// Grid: (nb, ntiles) so multi-seq CTAs for the same tile co-execute and reuse fold_w in L2; Block: 256 (8 warps).
 template <bool HAS_IDS, bool GREEDY, bool L2_EF>
 static __global__ void __launch_bounds__(256, 4) k_nk_dspark_head_scan(
         const half  * __restrict__ fold_w,
@@ -360,8 +394,8 @@ static __global__ void __launch_bounds__(256, 4) k_nk_dspark_head_scan(
     __shared__ nk_radix_smem sm_radix;
     extern __shared__ uint64_t s_keys[]; // dynamic: max_tile_rows uint64_t (0 B when GREEDY)
 
-    const int tile    = blockIdx.x;
-    const int b       = blockIdx.y;
+    const int b       = blockIdx.x;
+    const int tile    = blockIdx.y;
     const int tid     = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane    = tid & 31;
@@ -607,7 +641,8 @@ bool ggml_cuda_nk_dspark_head_launch(
         int64_t             n_eval,
         int                 sk,
         float               softcap,
-        float               inv_temp) {
+        float               inv_temp,
+        int                 ntiles_override) {
     using namespace nk_dspark_head;
 
     const int dev = ctx.device;
@@ -652,8 +687,8 @@ bool ggml_cuda_nk_dspark_head_launch(
 
     const int sm_count = std::max(1, ggml_cuda_info().devices[dev].nsm);
     const int min_tiles = (int) ((n_eval + 1023) / 1024);
-    int target_tiles = (sm_count * 4 + nb - 1) / nb;
-    if (n_eval < (int64_t) target_tiles * 64) {
+    int target_tiles = ntiles_override > 0 ? ntiles_override : (sm_count * 4 + nb - 1) / nb;
+    if (ntiles_override <= 0 && n_eval < (int64_t) target_tiles * 64) {
         target_tiles = (int) ((n_eval + 63) / 64);
     }
     const int ntiles = std::max(1, std::max(min_tiles, target_tiles));
@@ -668,23 +703,24 @@ bool ggml_cuda_nk_dspark_head_launch(
     const size_t base_stride = base->nb[1]   / sizeof(float);
     const bool has_ids       = ids != nullptr;
     const int * ids_d        = has_ids ? (const int *) ids->data : nullptr;
-    const bool l2_ef         = nk_dspark_head_l2_ef();
+    const int l2_mode        = nk_dspark_head_l2_mode();
+    const bool l2_ef         = (l2_mode < 0) ? (nb == 1) : (l2_mode != 0);
 
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
     if (!logged.test_and_set()) {
-        GGML_LOG_WARN("[NK_DSPARK_HEAD] active (4-row unroll + 8-bit radix top-K, sm=%d, l2_evict_first=%d)\n",
-            sm_count, l2_ef ? 1 : 0);
+        GGML_LOG_WARN("[NK_DSPARK_HEAD] active (4-row unroll + 8-bit radix top-K + reg sort64, sm=%d, l2_mode=%d)\n",
+            sm_count, l2_mode);
     }
     const int64_t n = g_nk_dspark_head_launches.fetch_add(1, std::memory_order_relaxed) + 1;
     if (nk_dspark_head_trace() && n <= 64) {
-        GGML_LOG_INFO("[NK_DSPARK_HEAD] launch #%lld n_eval=%lld nb=%d sk=%d sampled=%d ids=%d ntiles=%d smem=%zu\n",
-            (long long) n, (long long) n_eval, nb, sk, sampled ? 1 : 0, has_ids ? 1 : 0, ntiles, scan_smem);
+        GGML_LOG_INFO("[NK_DSPARK_HEAD] launch #%lld n_eval=%lld nb=%d sk=%d sampled=%d ids=%d ntiles=%d l2_ef=%d smem=%zu\n",
+            (long long) n, (long long) n_eval, nb, sk, sampled ? 1 : 0, has_ids ? 1 : 0, ntiles, l2_ef ? 1 : 0, scan_smem);
     }
 
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool_alloc<uint64_t> cand_buf(ctx.pool(), (size_t) nb * ncand);
 
-    const dim3 grid1(ntiles, nb, 1);
+    const dim3 grid1(nb, ntiles, 1);
     auto launch_scan = [&](auto ids_tag, auto greedy_tag, auto l2_tag) {
         constexpr bool I = decltype(ids_tag)::value;
         constexpr bool G = decltype(greedy_tag)::value;
@@ -755,7 +791,7 @@ bool ggml_cuda_nk_dspark_head_launch(
         ggml_backend_cuda_context &,
         const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
         const ggml_tensor *, const ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
-        int64_t, int, float, float) {
+        int64_t, int, float, float, int) {
     return false;
 }
 
