@@ -79,6 +79,10 @@ LLAMA_API bool    llama_split_overlap_init(struct llama_context * ctx);
 LLAMA_API int32_t llama_split_overlap_decode(struct llama_context * ctx, struct llama_batch batch, int32_t slot);
 LLAMA_API bool    llama_split_overlap_wait(struct llama_context * ctx, int32_t slot);
 LLAMA_API float * llama_split_overlap_logits_ith(struct llama_context * ctx, int32_t slot, int32_t i);
+// [INKCACHEUX] a request finished on ctx: with LLAMA_MOE_CACHE_REQ_STATS=1 logs that request's MoE cache hits,
+// misses and uploads at INFO; with LLAMA_MOE_CACHE_HEAT set, saves the expert heat profile (at most every
+// LLAMA_MOE_CACHE_HEAT_SAVE_S seconds). No-op without a MoE cache or with both unset.
+LLAMA_API void    llama_moe_cache_request_end(struct llama_context * ctx);
 
 //
 // llama architecture queries

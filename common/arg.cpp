@@ -3707,6 +3707,80 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_cache_cpu_share = share;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
+    // fork (INKCACHEUX) GS1/GS4/#249: expert-cache controls, each sets the env var the cache reads (src/llama-moe-cache-policy.h)
+    {
+        add_opt(common_arg(
+            {"--moe-cache-dev-mib"}, "A,B,..",
+            "MoE cache MiB per GPU (one value applies to every GPU); replaces the --moe-cache-mib total and its split",
+            [](common_params & params, const std::string & value) {
+                double total = 0;
+                for (const char * p = value.c_str(); *p; ) {
+                    char * end = nullptr;
+                    const double v = strtod(p, &end);
+                    if (end == p || v < 0.0 || (*end != ',' && *end != '\0')) {
+                        throw std::invalid_argument("invalid MiB list");
+                    }
+                    total += v;
+                    p = *end == ',' ? end + 1 : end;
+                }
+                if (params.moe_cache_size == 0 || params.moe_cache_size == SIZE_MAX) {
+                    params.moe_cache_size = (size_t) std::max(1.0, total)*1024*1024; // build the cache; the list sets the sizes
+                }
+                common_set_env("LLAMA_MOE_CACHE_DEV_MIB", value);
+            }
+        ));
+        add_opt(common_arg(
+            {"--moe-cache-slots"}, "N",
+            "MoE cache: a fixed number of expert slots per layer group instead of a byte budget (wins over --moe-cache-dev-mib)",
+            [](common_params &, int value) {
+                if (value <= 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                common_set_env("LLAMA_MOE_CACHE_SLOTS", std::to_string(value));
+            }
+        ));
+        add_opt(common_arg(
+            {"--moe-cache-layers"}, "LIST",
+            "MoE cache: only cache these layers, e.g. 0,4-20 (default: every layer with host experts)",
+            [](common_params &, const std::string & value) {
+                common_set_env("LLAMA_MOE_CACHE_LAYERS", value);
+            }
+        ));
+        add_opt(common_arg(
+            {"--moe-cache-stats"},
+            "MoE cache: log hits, misses and uploads for each request",
+            [](common_params &) {
+                common_set_env("LLAMA_MOE_CACHE_REQ_STATS", "1");
+            }
+        ));
+        add_opt(common_arg(
+            {"--moe-cache-draft-mib"}, "N",
+            "MoE cache for a separate draft model, in MiB (default: off)",
+            [](common_params &, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                common_set_env("LLAMA_MOE_CACHE_DRAFT_MIB", std::to_string(value));
+            }
+        ));
+        add_opt(common_arg(
+            {"--moe-cache-heat"}, "FNAME",
+            "MoE cache: expert heat profile, loaded at start to warm the cache and saved at exit and when idle",
+            [](common_params &, const std::string & value) {
+                common_set_env("LLAMA_MOE_CACHE_HEAT", value);
+            }
+        ));
+        add_opt(common_arg(
+            {"--moe-cache-split"}, "minimax|sched",
+            "MoE cache: choose the CPU/PCIe split of the misses from measured costs (needs --moe-cache-cpu-share > 0)",
+            [](common_params &, const std::string & value) {
+                if (value != "minimax" && value != "sched") {
+                    throw std::invalid_argument("invalid value, must be minimax or sched");
+                }
+                common_set_env("LLAMA_MOE_CACHE_SPLIT", value);
+            }
+        ));
+    }
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

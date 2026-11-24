@@ -5092,6 +5092,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     // the MoE cache is only used by the target context (SIZE_MAX = off, no auto-size; fork INKSMALL2)
     result.moe_cache_size = SIZE_MAX;
+    // fork (INKCACHEUX) GS1: LLAMA_MOE_CACHE_DRAFT_MIB=N (--moe-cache-draft-mib) gives a separate draft model its own N MiB
+    // cache (off by default; an MTP head that shares the target's weights uses the target's cache and controls)
+    if (const char * v = getenv("LLAMA_MOE_CACHE_DRAFT_MIB"); v && atoll(v) > 0) {
+        result.moe_cache_size = (size_t) atoll(v)*1024*1024;
+    }
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

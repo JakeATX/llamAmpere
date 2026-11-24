@@ -399,6 +399,9 @@ public:
     // [D0] d1 rescore counters since the previous call; empty without d1
     std::string d1_counters_delta() { return d1 ? d1->summary_delta() : std::string(); }
 
+    // fork (INKCACHEUX): a request finished; per-request cache line and heat save (no-op with the flags unset)
+    void moe_cache_request_end();
+
 private:
     llm_graph_result * get_gf_res_prev();
 

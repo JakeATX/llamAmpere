@@ -7579,6 +7579,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 __func__, b1_compute_submit_us / 1000.0);
     }
 
+    // fork (INKCACHEUX) GS8, LLAMA_MOE_CACHE_BOUNDARY=1: the step is submitted, run the cache's window work now
+    if (moe_cache && b1_mode != 1 && n_tokens_all <= 8 && moe_cache->boundary()) {
+        moe_cache->window_end();
+    }
+
     if (layer_inp_dev && ev_layer_inp_written) {
         ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
     }
@@ -11817,6 +11822,19 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
+}
+
+// fork (INKCACHEUX): see llama-ext.h
+void llama_context::moe_cache_request_end() {
+    if (moe_cache) {
+        moe_cache->request_end();
+    }
+}
+
+void llama_moe_cache_request_end(llama_context * ctx) {
+    if (ctx) {
+        ctx->moe_cache_request_end();
+    }
 }
 
 void llama_synchronize(llama_context * ctx) {

@@ -1,4 +1,5 @@
 #include "llama-moe-cache.h"
+#include "llama-moe-cache-policy.h"
 
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -497,6 +498,12 @@ struct llama_moe_cache::impl {
     }();
     bool fewrow_op_offload = true; // the scheduler offloads large host-weight ops (see set_op_offload)
 
+    // fork (INKCACHEUX): GS1 controls, GS4 heat profile, #249/GS9 miss split, GS8 boundary (llama-moe-cache-policy.h)
+    llama_moe_cache_controls ux;
+    llama_moe_cache_heat     heat;
+    llama_moe_split_policy   split;
+    stats req_small, req_large; // stats at the previous request end
+
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
@@ -518,6 +525,7 @@ struct llama_moe_cache::impl {
             throw std::runtime_error("MoE cache requires a MoE model");
         }
 
+        ux.from_env((int32_t) model.layers.size()); // fork (INKCACHEUX) GS1
         const char * loop_share_env = getenv("LLAMA_MOE_CACHE_LOOP_SHARE");
         const bool loop_share = loop_share_env == nullptr || strcmp(loop_share_env, "0") != 0;
         canon.resize(model.layers.size());
@@ -542,7 +550,8 @@ struct llama_moe_cache::impl {
             auto experts = llama_moe_cache_layer_experts(model.layers[il]);
             if (experts.empty() ||
                 (native_cpu_exl3 && std::any_of(experts.begin(), experts.end(), [](const ggml_tensor * t) { return ggml_exl3_bits(t->type) != 0; })) ||
-                !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+                !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight) ||
+                !ux.layer_selected(canon[il])) { // fork (INKCACHEUX) GS1: a looped layer's visits follow its first visit
                 continue;
             }
             const auto it_dev = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return ggml_backend_get_device(d.backend) == model.dev_layer(il); });
@@ -664,8 +673,17 @@ struct llama_moe_cache::impl {
             const int32_t n_expert  = g.ref[0]->ne[2];
             const size_t  budget    = (size_t) ((double) size*d.split/split_sum*g.host_bytes/d.host_bytes);
             const int32_t max_slots = g.n_canon*n_expert;
-            while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
-                g.n_slots++;
+            if (ux.slots > 0) {
+                g.n_slots = std::min(ux.slots, max_slots); // fork (INKCACHEUX) GS1: slot-count form
+            } else if (const double mib = ux.dev_budget_mib(g.id); mib >= 0.0) {
+                const size_t b = (size_t) (mib*1024.0*1024.0*g.host_bytes/d.host_bytes); // GS1: MiB per GPU
+                while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= b) {
+                    g.n_slots++;
+                }
+            } else {
+                while (g.n_slots < max_slots && alloc_size(g, g.n_slots + 1) <= budget) {
+                    g.n_slots++;
+                }
             }
             if (g.n_slots < n_expert_used) {
                 LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
@@ -779,6 +797,8 @@ struct llama_moe_cache::impl {
         }
         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+        ux_init(model, no_alloc); // fork (INKCACHEUX)
+
         for (size_t id = 0; id < devices.size(); ++id) {
             const device & d = devices[id];
             if (d.host_bytes == 0) {
@@ -848,6 +868,10 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         log_stats();
+        split.log_summary();
+        if (heat.on()) {
+            heat.save();
+        }
         if (trace != nullptr) {
             fclose(trace);
         }
@@ -984,6 +1008,9 @@ struct llama_moe_cache::impl {
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        if (split.active()) {
+            split.on_ids(il, sel->src[0]->ne[1]); // fork (INKCACHEUX) #249: layer interval, ids to ids
+        }
 
         if (trace != nullptr) {
             write_trace(il, n_used);
@@ -1002,7 +1029,11 @@ struct llama_moe_cache::impl {
         // (round admission: all decode misses, ubatches of <= 8 rows; larger ones upload as before)
         const uint32_t share_full = round_on ? (sel->src[0]->ne[1] <= 8 ? 65536u : 0u) : det_on ? 0u : cpu_share_q;
         const uint32_t share_q = has_cpu && g.lru.n_filled == g.lru.n_slots ? share_full : 0;
+        const bool split_on = split.active() && share_q > 0 && !round_on; // fork (INKCACHEUX) #249/GS9
         auto n_cpu = [&](size_t n_miss) {
+            if (split_on) {
+                return split.n_cpu(n_miss, l.cpu_acc);
+            }
             const uint64_t acc = (uint64_t) n_miss*share_q + l.cpu_acc;
             l.cpu_acc = acc & 0xffff;
             return (size_t) (acc >> 16);
@@ -1012,6 +1043,13 @@ struct llama_moe_cache::impl {
                 g.lru.n_filled == g.lru.n_slots ? fewrow_r : 0;
         if (!g.lru.plan(ci, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit, ci == il, few_rows)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+        if (split_on) {
+            split.record(cpu.size(), fills.size());
+        }
+        if (heat.on() && sel->src[0]->ne[1] <= 8) {
+            heat.observe(ci, ids.data(), ids.size()); // fork (INKCACHEUX) GS4: decode rows only
+            heat.add_rows(ci, sel->src[0]->ne[1]);
         }
         if (has_cpu) {
             int32_t * cpu_map = (int32_t *) l.cpu_map->data;
@@ -1398,6 +1436,137 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
     }
+
+    // fork (INKCACHEUX): end of the constructor. GS1 log, #249/GS9 policy, GS4 profile load and warm slots.
+    void ux_init(const llama_model & model, bool no_alloc) {
+        if (ux.any() || ux.req_stats || ux.boundary) {
+            std::string sel;
+            for (size_t il = 0; il < ux.layers.size(); ++il) {
+                sel += ux.layers[il] ? '1' : '0';
+            }
+            LLAMA_LOG_WARN("%s: [CACHEUX] controls: slots %d, per-GPU MiB %s, layers %s, request stats %d, boundary %d\n", __func__,
+                    ux.slots, ux.dev_mib.empty() ? "off" : "list", sel.empty() ? "all" : sel.c_str(), ux.req_stats, ux.boundary);
+        }
+        split.init(cpu_share);
+        if (!getenv("LLAMA_MOE_CACHE_HEAT") || groups.empty()) {
+            return;
+        }
+        llama_moe_cache_fp fp;
+        for (const group & g : groups) {
+            for (int32_t il : g.layers) {
+                if (g.n_slots > 0 && canon[il] == il) {
+                    for (const ggml_tensor * t : layers[il].experts) {
+                        fp.add_tensor(il, t);
+                    }
+                }
+            }
+        }
+        heat.init((int32_t) layers.size(), (int32_t) model.hparams.n_expert, fp.h);
+        if (no_alloc || !heat.load()) {
+            return;
+        }
+        const std::vector<float> rate = heat.rates();
+        // a key used with probability p per decode row settles at a CRF of about p/(1 - 2^(-1/half-life))
+        const float crf_per_rate = 1.0f/(1.0f - std::exp2(-1.0f/moe_cache_lru::crf_half_life));
+        size_t n_warm = 0, bytes = 0;
+        for (group & g : groups) {
+            moe_cache_lru & lru = g.lru;
+            if (g.n_slots == 0 || lru.n_expert != (int32_t) model.hparams.n_expert) {
+                continue;
+            }
+            std::vector<std::pair<float, int32_t>> rank;
+            for (int32_t il : g.layers) {
+                if (canon[il] != il || lru.slot_map[il] == nullptr) {
+                    continue;
+                }
+                for (int32_t e = 0; e < lru.n_expert; ++e) {
+                    const int32_t key = lru.make_key(il, e);
+                    if (rate[key] > 0.0f) {
+                        lru.crf[key]      = std::max(1.0f, rate[key]*crf_per_rate);
+                        lru.last_use[key] = 0;
+                        rank.push_back({ rate[key], key });
+                    }
+                }
+            }
+            std::sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            std::vector<int32_t> keep;
+            for (size_t i = 0; i < rank.size() && keep.size() < (size_t) g.n_slots; ++i) {
+                keep.push_back(rank[i].second);
+            }
+            std::sort(keep.begin(), keep.end()); // consecutive experts of a layer in consecutive slots: one upload
+            for (size_t s = 0; s < keep.size(); ++s) {
+                const int32_t key = keep[s];
+                lru.key_of[s] = key;
+                lru.slot_map[lru.key_layer(key)][lru.key_expert(key)] = (int32_t) s;
+                lru.move((int32_t) s, lru.class_of(key));
+            }
+            lru.n_filled = (int32_t) keep.size();
+            for (size_t s = 0; s < keep.size(); ) {
+                const int32_t key = keep[s];
+                const int32_t il  = lru.key_layer(key);
+                const int32_t e   = lru.key_expert(key);
+                size_t n = 1;
+                while (s + n < keep.size() && keep[s + n] == key + (int32_t) n && lru.key_layer(key + (int32_t) n) == il) {
+                    n++;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w    = l.experts[ip];
+                    ggml_tensor       * bank = g.banks[ip];
+                    const size_t expert_size = bank->nb[2];
+                    for (size_t k = 0; k < n; ) {
+                        size_t run = w->nb[2] == expert_size ? n - k : 1;
+                        ggml_backend_tensor_set(bank, (const uint8_t *) w->data + (e + k)*w->nb[2], (s + k)*expert_size, run*expert_size);
+                        bytes += run*expert_size;
+                        k += run;
+                    }
+                }
+                s += n;
+            }
+            n_warm += keep.size();
+        }
+        LLAMA_LOG_INFO("%s: [HEAT] warm start: %zu experts placed from the profile, %.2f MiB uploaded\n", __func__,
+                n_warm, bytes/1024.0/1024.0);
+    }
+
+    // fork (INKCACHEUX) GS8: a decode step has been submitted; run the window work now, while the device computes the
+    // tail of the step, instead of at the first lookup of the next step. Same decisions: nothing plans in between.
+    // The bank writes queue on the device stream behind the step that is still running.
+    void window_end() {
+        if (!ux.boundary || is_suspended) {
+            return;
+        }
+        if (round_on && round_prev_il >= 0) {
+            run_rounds();
+            round_prev_il = -1; // the next lookup starts a window without running the rounds again
+        }
+        if (split.active()) {
+            split.window_end();
+        }
+    }
+
+    // fork (INKCACHEUX): a request ended (server). GS1 per-request line, GS4 periodic save.
+    void request_end() {
+        if (ux.req_stats) {
+            auto line = [](const char * name, const stats & now, stats & prev) {
+                const size_t hits = now.hits - prev.hits, misses = now.misses - prev.misses;
+                const size_t cpu  = now.cpu - prev.cpu, bytes = now.bytes - prev.bytes;
+                prev = now;
+                if (hits + misses == 0) {
+                    return;
+                }
+                LLAMA_LOG_INFO("llama_moe_cache: request %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
+                        name, hits, misses, cpu, 100.0*hits/(hits + misses), bytes/1024.0/1024.0);
+            };
+            line("decode", stats_small, req_small);
+            line("prompt", stats_large, req_large);
+        }
+        if (heat.on()) {
+            heat.maybe_save();
+        }
+    }
 };
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
@@ -1452,6 +1621,18 @@ bool llama_moe_cache::suspended() const {
 
 void llama_moe_cache::set_op_offload(bool on) {
     pimpl->fewrow_op_offload = on;
+}
+
+void llama_moe_cache::window_end() {
+    pimpl->window_end();
+}
+
+bool llama_moe_cache::boundary() const {
+    return pimpl->ux.boundary;
+}
+
+void llama_moe_cache::request_end() {
+    pimpl->request_end();
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

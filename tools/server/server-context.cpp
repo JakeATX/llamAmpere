@@ -1632,6 +1632,8 @@ struct server_slot {
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
 
+        llama_moe_cache_request_end(ctx_tgt); // fork (INKCACHEUX): no-op unless LLAMA_MOE_CACHE_REQ_STATS / _HEAT
+
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;
