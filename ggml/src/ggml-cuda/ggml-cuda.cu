@@ -119,6 +119,7 @@
 #include "ggml-cuda/inkmask.cuh"
 #include "ggml-cuda/inkrouter.cuh"
 #include "ggml-cuda/q8a16.cuh"
+#include "ggml-cuda/head2.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -4759,6 +4760,10 @@ static bool ggml_cuda_kv_stream_staged_set_rows_range(
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     if (ggml_cuda_moe_skipmass_supports(dst)) { return ggml_cuda_moe_skipmass_compute(ctx, dst); }
+    // [HEAD2] LLAMA_HEAD2 (default off): the relaid-out output head
+    if (ggml_cuda_head2_active() && ggml_cuda_head2_forward(ctx, dst)) {
+        return true;
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -5480,6 +5485,9 @@ static bool ggml_cuda_borrowed_plan(ggml_backend_cuda_context & ctx, const ggml_
             if (node->src[s] && node->src[s]->buffer && ggml_backend_buft_is_cuda_kv_stream(node->src[s]->buffer->buft)) {
                 return false;
             }
+        }
+        if (ggml_cuda_head2_active() && ggml_cuda_head2_touches(node)) {
+            return false; // [HEAD2] its scratch is not in this plan
         }
         switch (node->op) {
             case GGML_OP_NONE:
@@ -15553,8 +15561,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, &fusion_graph, i);
-                if (nodes_to_skip == 0 && autofuse) {
+                // [HEAD2] no fused launch may read the relaid-out head: the head product and the few nodes before it
+                // run unfused (only with LLAMA_HEAD2 set)
+                bool head2_nofuse = false;
+                if (ggml_cuda_head2_active()) {
+                    for (int j = i; j < cgraph->n_nodes && j <= i + 8 && !head2_nofuse; ++j) {
+                        head2_nofuse = ggml_cuda_head2_touches(cgraph->nodes[j]);
+                    }
+                }
+                int nodes_to_skip = head2_nofuse ? 0 : ggml_cuda_try_fuse(cuda_ctx, &fusion_graph, i);
+                if (nodes_to_skip == 0 && autofuse && !head2_nofuse) {
                     nodes_to_skip = ggml_cuda_autofuse_launch(*cuda_ctx, &fusion_graph, i, *autofuse);
                 }
 
@@ -17880,6 +17896,24 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     // [FNPORT] page-lock an existing writable host range (anonymous memory: the read-only registration of a mapped
     // file is unsupported on some drivers) for direct copies; no env switch here: the caller's own opt-in decides (the
     // expert streamer uses it for GGML_SCHED_XSTREAM_PIN_MIB)
+    // [HEAD2] LLAMA_HEAD2 (default off): relayout the output head into bit planes (the caller's opt-in decides)
+    if (strcmp(name, "ggml_backend_cuda_head2_prepare") == 0) {
+        return (void *) +[](ggml_tensor * t, int mode, int host_device, int top_k, float delta, float softcap) -> bool {
+            if (t == nullptr || t->buffer == nullptr) {
+                return false;
+            }
+            int device = host_device;
+            if (ggml_backend_buft_is_cuda(t->buffer->buft)) {
+                device = ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device;
+            } else if (!ggml_backend_buffer_is_host(t->buffer)) {
+                return false; // split or other non-plain buffers
+            }
+            if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+                return false;
+            }
+            return ggml_cuda_head2_prepare(t, mode, device, top_k, delta, softcap);
+        };
+    }
     if (strcmp(name, "ggml_backend_cuda_host_pin") == 0) {
         return (void *)ggml_cuda_host_pin;
     }

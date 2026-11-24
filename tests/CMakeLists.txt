@@ -193,6 +193,7 @@ llama_build_and_test(test-lsa-resident-fit.cpp LABEL "turbo")
 llama_build_and_test(test-lsa-src9.cpp LABEL "turbo")
 # [D1] exact head rescore: select, sidecar checks, scope, row states, threaded == serial (pure, no model)
 llama_build_and_test(test-d1-rescore.cpp LABEL "turbo")
+llama_build_and_test(test-head2.cpp) # [HEAD2] CPU reference of the exact two-stage head (optional args: model.gguf rows)
 # prompt-cache state round trip over every KV / drafter / recurrent-state type (needs an MTP model: -m)
 llama_build(test-prompt-cache-types.cpp)
 

@@ -1847,6 +1847,8 @@ ggml_tensor * llama_model::create_derived_tensor(ggml_backend_buffer_type_t buft
     return t;
 }
 
+static void llama_head2_prepare(ggml_tensor * output, const ggml_tensor * tok_embd, float softcap, int64_t n_vocab);
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -2456,7 +2458,58 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     register_moe_bank();
 
+    llama_head2_prepare(output, tok_embd, hparams.f_final_logit_softcapping, (int64_t) vocab.n_tokens());
+
     return true;
+}
+
+// [HEAD2] LLAMA_HEAD2=1|2 (default off): relayout a Q8_0 output head into bit planes for the exact two-stage head of
+// the CUDA backend (ggml-cuda/head2.cu). 1 = planes in VRAM; 2 = low planes in pinned host memory (load the head with
+// -ot output.weight=CPU to free their VRAM). LLAMA_HEAD2_TOPK (default 64): the logits that can reach each column's
+// top K are exact and the rest are -inf, which is exact for samplers that keep at most K tokens after logit-lowering
+// steps (top_k <= K - penalty_last_n with penalties on). LLAMA_HEAD2_TOPK=0: mass mode, rows whose softmax share after
+// the softcap can reach V e^-LLAMA_HEAD2_DELTA are exact, the rest get their upper bound (exact for any sampler at
+// temperature <= 1). Grammar and positive logit biases are not covered: leave the flag unset for them.
+static void llama_head2_prepare(ggml_tensor * output, const ggml_tensor * tok_embd, float softcap, int64_t n_vocab) {
+    const char * env = getenv("LLAMA_HEAD2");
+    const int mode = env ? atoi(env) : 0;
+    if (mode == 0) {
+        return;
+    }
+    const char * why = nullptr;
+    if (mode != 1 && mode != 2) {
+        why = "LLAMA_HEAD2 is not 0, 1 or 2";
+    } else if (output == nullptr || output == tok_embd) {
+        why = "no separate output head";
+    } else if (output->type != GGML_TYPE_Q8_0) {
+        why = "the head is not Q8_0 (the Q6_K variant is not built yet)";
+    } else if (getenv("LLAMA_D1_HEAD") && *getenv("LLAMA_D1_HEAD")) {
+        why = "LLAMA_D1_HEAD reads the head";
+    }
+    using prepare_fn = bool (*)(ggml_tensor *, int, int, int, float, float);
+    prepare_fn fn = nullptr;
+    if (why == nullptr) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        fn = reg ? (prepare_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_head2_prepare") : nullptr;
+        if (fn == nullptr) {
+            why = "no CUDA backend";
+        }
+    }
+    if (why != nullptr) {
+        LLAMA_LOG_WARN("%s: LLAMA_HEAD2=%s ignored: %s\n", __func__, env, why);
+        return;
+    }
+    const auto env_f = [](const char * name, double def) {
+        const char * v = getenv(name);
+        return v && *v ? atof(v) : def;
+    };
+    const int   top_k  = (int) env_f("LLAMA_HEAD2_TOPK", 64);
+    const float delta  = (float) env_f("LLAMA_HEAD2_DELTA", std::log((double) std::max<int64_t>(n_vocab, 2)) + 53.0*std::log(2.0) + 1.0);
+    const float cap    = (float) env_f("LLAMA_HEAD2_SOFTCAP", softcap > 0.0f ? softcap : 0.0f);
+    const int   device = (int) env_f("LLAMA_HEAD2_DEVICE", 0);
+    if (!fn(output, mode, device, top_k < 0 ? 0 : top_k, delta, cap)) {
+        LLAMA_LOG_WARN("%s: LLAMA_HEAD2=%d: the CUDA backend refused %s; head2 off\n", __func__, mode, output->name);
+    }
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
