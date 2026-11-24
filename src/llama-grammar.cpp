@@ -1401,10 +1401,36 @@ void llama_grammar_free_impl(struct llama_grammar * grammar) {
     delete grammar;
 }
 
+// LLAMA_GRAMMAR_SHARED_RULES=1: a clone shares the (never modified) rules of its source instead of copying them, so
+// its stacks keep pointing into the same rules and need no remap. Same rules, same stacks: same decisions.
+// Unset or 0 = off (default): each clone owns a copy of the rules
+static bool llama_grammar_shared_rules() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_GRAMMAR_SHARED_RULES");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
 struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & grammar) {
+    if (llama_grammar_shared_rules()) {
+        return new llama_grammar {
+            grammar.vocab,
+            grammar.rules_ptr,
+            grammar.stacks,
+            grammar.partial_utf8,
+            grammar.lazy,
+            grammar.awaiting_trigger,
+            grammar.trigger_buffer,
+            grammar.trigger_buffer_positions,
+            grammar.trigger_tokens,
+            grammar.trigger_patterns,
+        };
+    }
+
     auto * result = new llama_grammar {
         grammar.vocab,
-        grammar.rules,
+        llama_grammar_rules(grammar.rules),
         grammar.stacks,
         grammar.partial_utf8,
         grammar.lazy,

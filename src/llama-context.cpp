@@ -7173,7 +7173,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         const int64_t t_compute0 = b1_mode == 1 ? ggml_time_us() : 0;
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        // between ubatches of the ordinary path, a set abort check can stop the decode before this ubatch runs; it
+        // is then handled like an aborted ubatch (its positions are removed, the earlier ubatches stay, returns 2)
+        const bool ubatch_abort = b1_mode == 0 && ubatch_abort_cb && n_tokens_prev > 0 &&
+                ubatch_abort_cb(ubatch_abort_cb_user);
+        if (ubatch_abort) {
+            status = GGML_STATUS_ABORTED;
+        }
+        const auto * res = ubatch_abort ? nullptr :
+                process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
         if (b1_mode == 1) {
             const int64_t compute_us = ggml_time_us() - t_compute0;
             b1_compute_submit_us += compute_us;
@@ -11732,6 +11740,11 @@ int32_t llama_n_threads(llama_context * ctx) {
 
 int32_t llama_n_threads_batch(llama_context * ctx) {
     return ctx->n_threads_batch();
+}
+
+void llama_set_ubatch_abort_callback(llama_context * ctx, bool (*cb)(void * user), void * user) {
+    ctx->ubatch_abort_cb      = cb;
+    ctx->ubatch_abort_cb_user = cb ? user : nullptr;
 }
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {

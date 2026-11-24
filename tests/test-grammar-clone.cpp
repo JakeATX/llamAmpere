@@ -230,6 +230,37 @@ int main() {
         llama_grammar_free_impl(g);
     }
 
+    // 3b. same decisions after the clone: a clone whose source is freed first (LLAMA_GRAMMAR_SHARED_RULES keeps the
+    // shared rules alive) and the reference clone accept the same text and keep the same (rule, offset) stacks
+    for (int n_tools : { 0, 20, 107 }) {
+        const int last = n_tools > 0 ? n_tools - 1 : 0;
+        const std::string id = std::to_string(last);
+        const std::string call = n_tools > 0 ?
+            "{\"name\": \"tool_" + id + "\", \"arguments\": {\"path_" + id + "\": \"a b\", \"count_" + id + "\": 12}}" :
+            "{\"text\": \"hello\"}";
+        for (size_t cut = 0; cut <= call.size(); cut += 7) {
+            llama_grammar * src = build(tool_grammar(n_tools));
+            feed(src, call.substr(0, cut));
+            llama_grammar * a = llama_grammar_clone_impl(*src);
+            llama_grammar * b = clone_ref(*src);
+            llama_grammar_free_impl(src);
+            for (size_t i = cut; i < call.size(); i++) {
+                llama_grammar_accept(a, (unsigned char) call[i]);
+                llama_grammar_accept(b, (unsigned char) call[i]);
+                assert(a->stacks.size() == b->stacks.size());
+                for (size_t is = 0; is < a->stacks.size(); is++) {
+                    assert(a->stacks[is].size() == b->stacks[is].size());
+                    for (size_t ie = 0; ie < a->stacks[is].size(); ie++) {
+                        assert(locate(a->rules, a->stacks[is][ie]) == locate(b->rules, b->stacks[is][ie]));
+                        n_checked++;
+                    }
+                }
+            }
+            llama_grammar_free_impl(a);
+            llama_grammar_free_impl(b);
+        }
+    }
+
     printf("clone equivalence: %zu stack pointers checked, all equal\n", n_checked);
 
     // 4. timing: old search vs lookup table (whole clone, rules copy included)

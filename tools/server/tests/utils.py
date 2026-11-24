@@ -145,6 +145,9 @@ class ServerProcess:
     slot_stall_timeout: int | None = None
     slot_stall_cancel: bool = False
     llama_cache: str | None = None
+    # XDG cache folder of this server (the prompt cache disk tier lives under it). None = a fresh empty folder per
+    # ServerProcess, kept across its restarts, so one test never reads prompts another test's server stored
+    cache_home: str | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -165,6 +168,11 @@ class ServerProcess:
         }
         if self.debug_proxy_allow_private:
             env["LLAMA_SERVER_DEBUG_PROXY_ALLOW_PRIVATE"] = "1"
+        if self.cache_home is None:
+            import atexit, shutil, tempfile
+            self.cache_home = tempfile.mkdtemp(prefix="llama-test-xdg-")
+            atexit.register(shutil.rmtree, self.cache_home, True)
+        env["XDG_CACHE_HOME"] = self.cache_home
         if self.llama_cache is not None:
             env["LLAMA_CACHE"] = self.llama_cache
         elif "LLAMA_CACHE" not in os.environ:

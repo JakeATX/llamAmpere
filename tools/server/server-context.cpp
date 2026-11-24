@@ -134,6 +134,16 @@ extern "C" {
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// LLAMA_SERVER_PREFILL_CANCEL=1: a prompt-only decode whose requests were all cancelled (client gone) stops before
+// its next ubatch instead of running to the end of the batch. Unset or 0 = off (default)
+static bool server_prefill_cancel() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SERVER_PREFILL_CANCEL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
 // thinking-loop guard: LLAMA_SERVER_THINK_LOOP_CLOSE=N closes an open think block after N repeats of one token
 // (256 is the intended value). Unset or 0 = off (default)
 // non-streaming keep-alive: LLAMA_SERVER_JSON_KEEPALIVE=S sends a space every S seconds while a non-streaming reply
@@ -1936,6 +1946,21 @@ struct server_context_impl {
     friend struct server_context;
 
 public:
+    // LLAMA_SERVER_PREFILL_CANCEL: task ids of the prompt-only view being decoded, and whether the decode stopped
+    std::vector<int> prefill_cancel_ids;
+    bool prefill_cancel_stopped = false;
+
+    // called by the target context before each ubatch after the first: stop once every request in the view is cancelled
+    static bool prefill_cancel_cb(void * user) {
+        auto * self = static_cast<server_context_impl *>(user);
+        for (const int id_task : self->prefill_cancel_ids) {
+            if (!self->queue_tasks.cancel_posted(id_task)) {
+                return false;
+            }
+        }
+        return !self->prefill_cancel_ids.empty();
+    }
+
     // only use these pointers outside of this class:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
@@ -5291,6 +5316,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    queue_tasks.cancel_handled(task.id_target);
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
@@ -6137,6 +6163,11 @@ private:
 
                 batch.render(off, n_tokens);
                 bool ok = decode(n_batch, off);
+                if (prefill_cancel_stopped) {
+                    // every request in this batch was cancelled and its slot released: nothing left to process
+                    prefill_cancel_stopped = false;
+                    break;
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -7809,6 +7840,26 @@ private:
             llama_set_ubatch_rows_callback(ctx_tgt, &ubatch_handoff::cb, &handoff);
         }
 
+        // LLAMA_SERVER_PREFILL_CANCEL: a prompt-only view (no handoff) may stop between ubatches once every request
+        // in it was cancelled
+        prefill_cancel_ids.clear();
+        if (server_prefill_cancel() && !handoff_on && batch.view.size() > 0) {
+            for (int32_t i = off; i < off + batch.view.size(); ++i) {
+                const auto & t = batch.tokens[i];
+                if (!t.is_prompt || t.id_slot < 0 || t.id_slot >= (int32_t) slots.size() || !slots[t.id_slot].task) {
+                    prefill_cancel_ids.clear();
+                    break;
+                }
+                const int id_task = slots[t.id_slot].task->id;
+                if (std::find(prefill_cancel_ids.begin(), prefill_cancel_ids.end(), id_task) == prefill_cancel_ids.end()) {
+                    prefill_cancel_ids.push_back(id_task);
+                }
+            }
+            if (!prefill_cancel_ids.empty()) {
+                llama_set_ubatch_abort_callback(ctx_tgt, &server_context_impl::prefill_cancel_cb, this);
+            }
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -7838,6 +7889,28 @@ private:
                 }
             });
             t_decode_pass += ggml_time_us() - t_decode_start;
+        }
+        if (!prefill_cancel_ids.empty()) {
+            llama_set_ubatch_abort_callback(ctx_tgt, nullptr, nullptr);
+            if (ret == 2) {
+                // stopped between ubatches: the memory holds part of the view, so the slots drop their prompt
+                for (auto & slot : slots) {
+                    if (slot.task && std::find(prefill_cancel_ids.begin(), prefill_cancel_ids.end(), slot.task->id) != prefill_cancel_ids.end()) {
+                        SLT_INF(slot, "prompt read stopped between ubatches: the request was cancelled, n_tokens = %d\n", slot.prompt.n_tokens());
+                        slot.release();
+                        slot.prompt_clear();
+                    }
+                }
+                prefill_cancel_ids.clear();
+                if (ckpt_armed) {
+                    llama_state_seq_capture_arm(ctx_tgt, -1, nullptr, 0);
+                    batch.ckpt_slot = -1;
+                    batch.ckpt_spots.clear();
+                }
+                prefill_cancel_stopped = true;
+                return true;
+            }
+            prefill_cancel_ids.clear();
         }
         if (handoff_on) {
             if (!handoff.deferred_count || ret != 0) {
