@@ -542,13 +542,6 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
             return;
         }
-        if (round_on) {
-            round_cand.assign(groups.size(), {});
-            round_backlog.assign(groups.size(), 0);
-            round_mark.assign(model.layers.size()*(size_t) model.hparams.n_expert, 0);
-            LLAMA_LOG_WARN("%s: [MCROUND] round admission on: decode misses on the CPU, %d swaps per window (x%d under a backlog)\n",
-                    __func__, round_swaps, round_boost);
-        }
 
         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
         // one extra slot at the end, CUDA MMQ can read past the last expert
@@ -568,6 +561,13 @@ struct llama_moe_cache::impl {
             }
         }
         n_zero = (cpu_share > 0.0f && !det_on) || round_on ? std::min<int32_t>(n_expert_used, 64) : 0;
+        if (round_on) {
+            round_cand.assign(groups.size(), {});
+            round_backlog.assign(groups.size(), 0);
+            round_mark.assign(model.layers.size()*(size_t) model.hparams.n_expert, 0);
+            LLAMA_LOG_WARN("%s: [MCROUND] round admission on: decode misses on the CPU, %d swaps per window (x%d under a backlog)\n",
+                    __func__, round_swaps, round_boost);
+        }
         auto alloc_size = [&](const group & g, int32_t n_slots) {
             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
             size_t res = 0;
