@@ -370,9 +370,21 @@ bool llama_ink_stream::arm() {
     if (!prepare()) {
         return false;
     }
-    // CORERES: as many resident core layers as fit, down to none
+    // CORERES: as many resident core layers as fit and still leave LLAMA_INK_CORERES_KEEP_MIB (default 1536, about a
+    // 1024-row prompt ubatch) free for the prompt buffers, down to none
+    static const size_t res_keep = (size_t) std::max(0, ink_stream_env("LLAMA_INK_CORERES_KEEP_MIB", 1536)) << 20;
+    size_t free_after = 0;
     for (n_res = res_want; ; --n_res) {
         buf_slot = ggml_backend_buft_alloc_buffer(buft_dev, (2 + n_res)*slot_size);
+        if (buf_slot && n_res > 0 && res_keep > 0) {
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free_after, &total);
+            if (free_after < res_keep) {
+                ggml_backend_buffer_free(buf_slot);
+                buf_slot = nullptr;
+                continue;
+            }
+        }
         if (buf_slot || n_res == 0) {
             break;
         }
@@ -383,8 +395,9 @@ bool llama_ink_stream::arm() {
         return false;
     }
     if (res_want > 0) {
-        LLAMA_LOG_WARN("%s: [INKSTREAM] CORERES: %d of %d core layers resident for the prompt (%d asked, %.1f MiB)\n", __func__,
-                n_res, n_core, res_want, n_res*slot_size/1048576.0);
+        LLAMA_LOG_WARN("%s: [INKSTREAM] CORERES: %d of %d core layers resident for the prompt (%d asked, %.1f MiB, %.0f MiB free "
+                "after, keep %.0f)\n", __func__, n_res, n_core, res_want, n_res*slot_size/1048576.0, free_after/1048576.0,
+                res_keep/1048576.0);
     }
     // resident visits take their region; the others alternate between the two slots in graph order among themselves
     {
