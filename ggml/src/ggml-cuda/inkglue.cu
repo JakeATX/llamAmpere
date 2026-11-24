@@ -5,6 +5,7 @@
 #include "inkglue.cuh"
 #include "inkcomb_mt.cuh"
 #include "inklg_vec.cuh"
+#include "loop-gate.cuh"
 
 // ---------------------------------------------------------------------------------------------------------------------
 // SITU: out = (b*tanh(g/b) * sigmoid(g)) * (lb*tanh(u/lb)), 9 nodes (SCALE TANH SCALE SIGMOID MUL SCALE TANH SCALE MUL).
@@ -426,6 +427,10 @@ bool ggml_cuda_ink_loop_gate_multi(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int T = (int) d0->src[0]->ne[1];
     const int R = (int) d0->src[2]->ne[1];
     const ggml_type wt = d0->src[2]->type;
+    if (T > INK_LG_MAX_T && R <= INK_LG_MAX_R) {
+        // LGSPLIT: a verify batch of several users, as <= 8-token chunks of this grouped kernel (loop-gate.cuh)
+        return ggml_cuda_loop_gate_split(ctx, gates, G, ggml_cuda_ink_loop_gate_multi);
+    }
     if (T < 1 || T > INK_LG_MAX_T || R > INK_LG_MAX_R) {
         return false;
     }
