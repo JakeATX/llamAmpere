@@ -3092,6 +3092,10 @@ llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
 
+bool llama_model::sj_kvarn() const {
+    return params.sj_kvarn;
+}
+
 bool llama_model::no_alloc() const {
     return params.no_alloc;
 }

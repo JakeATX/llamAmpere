@@ -1470,6 +1470,7 @@ struct cmd_params_instance {
         mparams.tensor_split  = tensor_split.data();
         mparams.use_extra_bufts = repack;
         mparams.no_host       = no_host;
+        mparams.sj_kvarn      = !sj_kvarn.empty();
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
