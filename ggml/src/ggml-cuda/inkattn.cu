@@ -15,7 +15,9 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <mutex>
 #include <type_traits>
+#include <unordered_map>
 
 namespace {
 
@@ -80,8 +82,7 @@ static __device__ __forceinline__ uint4 inkattn_ld8(const char * row, const int 
 }
 
 template <bool rows16, bool rel, bool q8>
-static __global__ void __launch_bounds__(INKATTN_WARPS*WARP_SIZE)
-inkattn_decode(const inkattn_params p) {
+static __device__ __forceinline__ void inkattn_decode_body(const inkattn_params & p) {
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int D = INKATTN_D;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -303,6 +304,156 @@ inkattn_decode(const inkattn_params p) {
 #endif // AMPERE_MMA_AVAILABLE
 }
 
+template <bool rows16, bool rel, bool q8>
+static __global__ void __launch_bounds__(INKATTN_WARPS*WARP_SIZE)
+inkattn_decode(const inkattn_params p) {
+    inkattn_decode_body<rows16, rel, q8>(p);
+}
+
+// [FUSE ATTNCOMB] (GGML_CUDA_FUSE_ATTNCOMB=1, default off): the combine below folded into the decode launch. Every block
+// writes its runs' partials as before, then counts itself done on its (sequence, KV head) counter; the block that comes
+// last combines the g*T rows of that KV head (a warp per row, the same terms in the same order as inkattn_combine, so the
+// output is the same) and resets the counter for the next launch (CUDA graph replays need no host work). Used when
+// g*T <= INKATTN_WARPS (decode); wider rows keep the separate combine launch.
+#define INKATTN_COMB_SLOTS 16
+#define INKATTN_COMB_CNT   256 // (sequence, KV head) pairs per launch
+static __device__ unsigned int g_inkattn_comb_done[INKATTN_COMB_SLOTS][INKATTN_COMB_CNT];
+
+struct inkattn_comb_params {
+    const float * sinks;
+    char * dst; int64_t nbd1, nbd2, nbd3;
+    float * lse;
+    const float * gate; int64_t gate_t;
+    int slot;
+};
+
+template <bool rows16, bool rel, bool q8>
+static __global__ void __launch_bounds__(INKATTN_WARPS*WARP_SIZE)
+inkattn_decode_comb(const inkattn_params p, const inkattn_comb_params cp) {
+    inkattn_decode_body<rows16, rel, q8>(p);
+
+    constexpr int D = INKATTN_D;
+    const int kvh = blockIdx.y;
+    const int seq = blockIdx.z;
+    __shared__ unsigned int s_last;
+    // the block's partial stores, then thread 0's fence (cumulative over what the barrier made it observe) and count
+    __syncthreads();
+    unsigned int * cnt = &g_inkattn_comb_done[cp.slot][seq*p.Hkv + kvh];
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const unsigned int prev = atomicAdd(cnt, 1u);
+        s_last = prev == gridDim.x - 1;
+        if (s_last) {
+            *cnt = 0; // every block of this KV head has counted: ready for the next launch
+            __threadfence(); // the other blocks' partials, before this block reads them
+        }
+    }
+    __syncthreads();
+    if (!s_last) {
+        return;
+    }
+
+    // warp r combines row r (the launcher keeps R = g*T <= the block's warps), lane = 4 consecutive dv. Per dv the terms
+    // and their order are inkattn_combine's: the max over the runs (order free), then the runs in order, skipping the
+    // empty ones. The run (max, sum) pairs come by shuffle; the partial rows are loaded 32 runs at a time (the decode
+    // visits have W <= 32: one round trip), the first 32 before the max is known, and the gate with them.
+    static_assert(D == 4*WARP_SIZE, "one float4 of dv per lane");
+    constexpr int NB = WARP_SIZE;
+    const int lane  = threadIdx.x % WARP_SIZE;
+    const int warp  = threadIdx.x / WARP_SIZE;
+    const int nwarp = blockDim.x / WARP_SIZE;
+    const int R     = p.g*p.T;
+    for (int r = warp; r < R; r += nwarp) {
+        const int h = kvh*p.g + r % p.g;
+        const int j = r / p.g;
+        const int64_t base = (int64_t) (seq*p.Hkv + kvh)*p.W*16 + r;
+
+        auto load_runs = [&](float4 (&o)[NB], const int w, const int nw) {
+#pragma unroll
+            for (int u = 0; u < NB; ++u) {
+                o[u] = u < nw ? __ldcg((const float4 *) (p.Op + (base + (int64_t) (w + u)*16)*D) + lane)
+                              : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        };
+        const float2 ms0 = lane < p.W ? __ldcg(&p.Mp[base + (int64_t) lane*16]) : make_float2(-INFINITY, 0.0f);
+        float4 o[NB];
+        load_runs(o, 0, min(NB, p.W));
+        float gv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        if (cp.gate) {
+            const float * gp = cp.gate + (int64_t) j*cp.gate_t + h*D + 4*lane;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                gv[c] = gp[c];
+            }
+        }
+
+        float M = fmaxf(-INFINITY, ms0.x);
+        for (int w = lane + WARP_SIZE; w < p.W; w += WARP_SIZE) {
+            M = fmaxf(M, __ldcg(&p.Mp[base + (int64_t) w*16].x));
+        }
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            M = fmaxf(M, __shfl_xor_sync(0xffffffff, M, off));
+        }
+        float  L   = 0.0f;
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (M != -INFINITY) {
+            for (int w0 = 0; w0 < p.W; w0 += WARP_SIZE) {
+                const int    nw  = min(WARP_SIZE, p.W - w0);
+                const float2 msl = w0 == 0 ? ms0 :
+                    lane < nw ? __ldcg(&p.Mp[base + (int64_t) (w0 + lane)*16]) : make_float2(-INFINITY, 0.0f);
+                for (int k0 = 0; k0 < nw; k0 += NB) {
+                    if (w0 + k0 > 0) {
+                        load_runs(o, w0 + k0, min(NB, nw - k0));
+                    }
+#pragma unroll
+                    for (int u = 0; u < NB; ++u) {
+                        if (k0 + u < nw) { // warp-uniform
+                            const float msx = __shfl_sync(0xffffffff, msl.x, k0 + u);
+                            const float msy = __shfl_sync(0xffffffff, msl.y, k0 + u);
+                            if (msx != -INFINITY) {
+                                const float f = __expf(msx - M);
+                                L     += f*msy;
+                                acc.x += f*o[u].x;
+                                acc.y += f*o[u].y;
+                                acc.z += f*o[u].z;
+                                acc.w += f*o[u].w;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (cp.sinks) {
+            const float s  = cp.sinks[h];
+            const float M2 = fmaxf(M, s);
+            const float f  = M == -INFINITY ? 0.0f : __expf(M - M2);
+            L     = L*f + __expf(s - M2);
+            acc.x = acc.x*f;
+            acc.y = acc.y*f;
+            acc.z = acc.z*f;
+            acc.w = acc.w*f;
+            M     = M2;
+        }
+        float * d = (float *) (cp.dst + seq*cp.nbd3 + j*cp.nbd2 + h*cp.nbd1) + 4*lane;
+        float res[4] = { L > 0.0f ? acc.x / L : 0.0f, L > 0.0f ? acc.y / L : 0.0f,
+                         L > 0.0f ? acc.z / L : 0.0f, L > 0.0f ? acc.w / L : 0.0f };
+        if (cp.gate) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                res[c] = res[c] * (1.0f / (1.0f + expf(-gv[c])));
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            d[c] = res[c];
+        }
+        if (cp.lse && lane == 0) {
+            cp.lse[((int64_t) seq*p.T + j)*p.H + h] = L > 0.0f ? M + logf(L) : -INFINITY;
+        }
+    }
+}
+
 // one block per (q head, token, sequence), D threads
 static __global__ void inkattn_combine(const float * __restrict__ Op, const float2 * __restrict__ Mp, const float * __restrict__ sinks,
         char * __restrict__ dst, const int64_t nbd1, const int64_t nbd2, const int64_t nbd3, float * __restrict__ lse,
@@ -366,6 +517,32 @@ static int inkattn_mode() {
 static int inkattn_env_int(const char * name, const int def) {
     const char * e = getenv(name);
     return e && *e ? atoi(e) : def;
+}
+
+// [FUSE ATTNCOMB] default off; GGML_CUDA_FUSE_ATTNCOMB=1 folds the combine into the decode launch
+static bool inkattn_comb_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_FUSE_ATTNCOMB");
+        return e && *e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// one counter row per stream, so launches on different streams never share a counter; -1 when the slots run out
+static int inkattn_comb_slot(const cudaStream_t stream) {
+    static std::mutex mtx;
+    static std::unordered_map<const void *, int> slots;
+    std::lock_guard<std::mutex> lock(mtx);
+    const auto it = slots.find((const void *) stream);
+    if (it != slots.end()) {
+        return it->second;
+    }
+    if (slots.size() >= INKATTN_COMB_SLOTS) {
+        return -1;
+    }
+    const int slot = (int) slots.size();
+    slots.emplace((const void *) stream, slot);
+    return slot;
 }
 
 static bool inkattn_aligned(const void * ptr, const int64_t a, const int64_t b, const int64_t c, const int64_t n) {
@@ -527,6 +704,34 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
     const dim3 grid((W + INKATTN_WARPS - 1)/INKATTN_WARPS, Hkv, S);
     const bool q8 = K->type == GGML_TYPE_Q8_0;
+
+    // [FUSE ATTNCOMB] one launch: the last block of each (sequence, KV head) combines (see inkattn_decode_comb)
+    // one combined row per warp: wider R (verify widths) runs the separate combine, whose H*T blocks spread the work
+    const int comb_slot = inkattn_comb_on() && S*Hkv <= INKATTN_COMB_CNT && g*T <= INKATTN_WARPS ? inkattn_comb_slot(stream) : -1;
+    if (comb_slot >= 0) {
+        inkattn_comb_params cp;
+        cp.sinks = snk ? (const float *) snk->data : nullptr;
+        cp.dst = (char *) dst->data; cp.nbd1 = dst->nb[1]; cp.nbd2 = dst->nb[2]; cp.nbd3 = dst->nb[3];
+        cp.lse = lse ? (float *) lse->data : nullptr;
+        cp.gate = gate ? (const float *) gate->data : nullptr;
+        cp.gate_t = gate ? (int64_t) (gate->nb[1]/sizeof(float)) : 0;
+        cp.slot = comb_slot;
+        auto launch_c = [&](auto r16, auto rel, auto kq8) {
+            inkattn_decode_comb<decltype(r16)::value, decltype(rel)::value, decltype(kq8)::value><<<grid, INKATTN_WARPS*WARP_SIZE, 0, stream>>>(p, cp);
+        };
+        using T_ = std::true_type;
+        using F_ = std::false_type;
+        if (q8) {
+            if (inkrel) { rows16 ? launch_c(T_{}, T_{}, T_{}) : launch_c(F_{}, T_{}, T_{}); }
+            else        { rows16 ? launch_c(T_{}, F_{}, T_{}) : launch_c(F_{}, F_{}, T_{}); }
+        } else {
+            if (inkrel) { rows16 ? launch_c(T_{}, T_{}, F_{}) : launch_c(F_{}, T_{}, F_{}); }
+            else        { rows16 ? launch_c(T_{}, F_{}, F_{}) : launch_c(F_{}, F_{}, F_{}); }
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+
     auto launch = [&](auto r16, auto rel, auto kq8) {
         inkattn_decode<decltype(r16)::value, decltype(rel)::value, decltype(kq8)::value><<<grid, INKATTN_WARPS*WARP_SIZE, 0, stream>>>(p);
     };
