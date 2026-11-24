@@ -9743,6 +9743,59 @@ static bool llama_inkfa_prefill_on() {
     return on;
 }
 
+// [INKGQA-3] (LLAMA_INKFA_RELF=1, default off): SWA prefill INKREL nodes in the factor form
+// (ggml_flash_attn_ext_set_inkrel_factor): the CUDA kernel (inkgqa.cu) computes r . E[d] itself, so the graph does not
+// build the [n_head, extent + 1, T] table (mul_mat + sub + permute + cont) for these visits.
+static bool llama_inkfa_relf_on() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_INKFA_RELF");
+        return e && *e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// the factor inputs from the table the model built: table = cont(permute(sub(mul_mat(pad(E), R), sinks_3d))) (inkling2.cpp)
+// -> rf = [E; R] F32 [16, extent + n_head*T] and the per-row sink logits [n_head, T]; false when the pattern differs
+static bool llama_inkfa_relf_inputs(ggml_context * ctx0, ggml_tensor * table, const int64_t n_head, const int64_t n_tok,
+        ggml_tensor * & rf, ggml_tensor * & rs) {
+    ggml_tensor * perm = table && table->op == GGML_OP_CONT ? table->src[0] : nullptr;
+    ggml_tensor * sub  = perm && perm->op == GGML_OP_PERMUTE ? perm->src[0] : nullptr;
+    ggml_tensor * mm   = sub && sub->op == GGML_OP_SUB ? sub->src[0] : nullptr;
+    ggml_tensor * snk  = sub ? sub->src[1] : nullptr;
+    ggml_tensor * pad  = mm && mm->op == GGML_OP_MUL_MAT ? mm->src[0] : nullptr;
+    ggml_tensor * R    = mm ? mm->src[1] : nullptr;
+    ggml_tensor * E    = pad && pad->op == GGML_OP_PAD ? pad->src[0] : nullptr;
+    if (!E || !R || !snk || E->ne[0] != 16 || E->ne[2] != 1 || E->ne[3] != 1 || E->ne[1] + 1 != table->ne[1] ||
+            R->type != GGML_TYPE_F32 || R->ne[0] != 16 || R->ne[1] != n_head || R->ne[2] != n_tok || R->ne[3] != 1 ||
+            snk->type != GGML_TYPE_F32 || ggml_nelements(snk) != n_head*n_tok || snk->ne[0] != 1 || snk->ne[1] != n_head) {
+        return false;
+    }
+    ggml_tensor * e2 = E->type == GGML_TYPE_F32 ? E : ggml_cast(ctx0, E, GGML_TYPE_F32);
+    ggml_tensor * r2 = ggml_is_contiguous(R) ? R : ggml_cont(ctx0, R);
+    rf = ggml_concat(ctx0, ggml_cont(ctx0, e2), ggml_reshape_2d(ctx0, r2, 16, n_head*n_tok), 1);
+    ggml_tensor * s2 = ggml_is_contiguous(snk) ? snk : ggml_cont(ctx0, snk);
+    rs = ggml_reshape_2d(ctx0, s2, n_head, n_tok);
+    return true;
+}
+
+// can the K/V device run the factor node (CUDA, inkgqa)? a probe node with the same shapes
+static bool llama_inkfa_relf_device_ok(ggml_context * ctx0, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * raw,
+        ggml_tensor * rf, ggml_tensor * rel_pos, ggml_tensor * rs, ggml_tensor * g2, float kq_scale, ggml_tensor * kv) {
+    const ggml_tensor * ks = kv->view_src ? kv->view_src : kv;
+    if (!ks->buffer) {
+        return true; // memory-fit dry run: planned as the device run
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(ks->buffer));
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return false;
+    }
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q, k, v, raw, kq_scale, 0.0f, 0.0f);
+    ggml_prec_set_acc(fa, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_inkrel_factor(fa, rf, rel_pos, g2, rs);
+    return ggml_backend_dev_supports_op(dev, fa);
+}
+
 // can the K/V device run the prefill-width INKREL node (CUDA, inkfa)? Anything else (a CPU / host K/V buffer, another
 // backend, a pre-Ampere card) keeps the dense prefill path: the CPU reference of INKREL nodes is far slower than it.
 static bool llama_inkfa_device_ok(ggml_context * ctx0, ggml_tensor * q_cur, ggml_tensor * kv, ggml_tensor * vv, ggml_tensor * raw,
@@ -9983,10 +10036,18 @@ ggml_tensor * llm_graph_context::build_attn_rel_base(
             ggml_tensor * k = ggml_permute(ctx0, mctx_l->get_k(ctx0, il), 0, 2, 1, 3);
             ggml_tensor * v = ggml_permute(ctx0, mctx_l->get_v(ctx0, il), 0, 2, 1, 3);
             ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q, k, v, raw, kq_scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_add_sinks(fa, sinks);
             ggml_prec_set_acc(fa, GGML_PREC_F32);
             ggml_tensor * g2 = gate && ggml_is_contiguous(gate) ? ggml_reshape_2d(ctx0, gate, q_cur->ne[0]*n_head, n_tok) : nullptr;
-            ggml_flash_attn_ext_set_inkrel(fa, table, rel_pos, g2);
+            ggml_tensor * rf = nullptr;
+            ggml_tensor * rs = nullptr;
+            if ((n_head/n_head_kv)*n_tok > 16 && llama_inkfa_relf_on() &&
+                    llama_inkfa_relf_inputs(ctx0, table, n_head, n_tok, rf, rs) &&
+                    llama_inkfa_relf_device_ok(ctx0, q, k, v, raw, rf, rel_pos, rs, g2, kq_scale, kv)) {
+                ggml_flash_attn_ext_set_inkrel_factor(fa, rf, rel_pos, g2, rs); // [INKGQA-3] factor form: no bias table
+            } else {
+                ggml_flash_attn_ext_add_sinks(fa, sinks);
+                ggml_flash_attn_ext_set_inkrel(fa, table, rel_pos, g2);
+            }
             gated = g2 != nullptr;
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il}); // the auto-FA probe checks this node's device
             ggml_tensor * cur = ggml_reshape_2d(ctx0, fa, fa->ne[0]*fa->ne[1], fa->ne[2]*fa->ne[3]);
