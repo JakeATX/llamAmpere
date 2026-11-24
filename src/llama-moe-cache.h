@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -44,7 +45,15 @@ public:
     // maps and the LRU stay, and no graph may use the cache until resume(). resume() allocates the banks again and
     // uploads the experts the slots held (same experts in the same slots). false: no VRAM, still suspended.
     size_t suspend();
-    bool   resume();
+    // fork (REFILLPIPE): one bank upload of resume(); an uploader that returns true has copied the whole list
+    struct copy_op {
+        ggml_tensor * dst;
+        size_t        offs;
+        const void  * src;
+        size_t        len;
+    };
+    using uploader = std::function<bool(const std::vector<copy_op> &)>;
+    bool   resume(const uploader & up = nullptr);
     bool   suspended() const;
     // fork (CACHELOAN): while suspended, rebuild the banks for `size` bytes (keeps the hottest experts; resume()
     // uploads them). false: not possible here (several devices, CPU share, trace), nothing changed. size(): bank bytes.

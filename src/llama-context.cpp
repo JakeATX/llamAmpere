@@ -6547,13 +6547,41 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             LLAMA_LOG_WARN("%s: [CACHELOAN] resize %.0f -> %.0f MiB (boot size, reserve %u rows)\n", __func__,
                     size0/1048576.0, moe_cache->size()/1048576.0, sched_reserve_tokens);
         }
-        bool ok = moe_cache->resume();
+        // fork (REFILLPIPE): the refill goes through the streamer's pinned staging workers and copy stream (one synchronous
+        // pageable copy per run of experts reached about half of PCIe). Same bytes. Opt-in (port, default off):
+        // LLAMA_INK_REFILL_PIPE=1; unset or 0 = the plain copies (cand base).
+        static const bool refill_pipe = [] {
+            const char * e = getenv("LLAMA_INK_REFILL_PIPE");
+            return e && e[0] && atoi(e) != 0;
+        }();
+        llama_moe_cache::uploader up;
+        bool piped = false;
+        if (refill_pipe && ink_stream && !ink_stream->armed()) {
+            up = [this, &piped](const std::vector<llama_moe_cache::copy_op> & ops) {
+                std::vector<llama_ink_stream::upload> list;
+                list.reserve(ops.size());
+                for (const auto & op : ops) {
+                    list.push_back({ op.dst, op.offs, op.src, op.len });
+                }
+                const bool done = ink_stream->upload_wait(list);
+                piped = piped || done;
+                return done;
+            };
+        }
+        double copy_ms = 0.0;
+        auto resume = [&]() {
+            const int64_t t = ggml_time_us();
+            const bool r = moe_cache->resume(up);
+            copy_ms += (ggml_time_us() - t)/1000.0;
+            return r;
+        };
+        bool ok = resume();
         if (!ok && grown) {
             // fallback (WDDM can refuse a large allocation right after the frees): the boot size
             moe_cache->resize(ink_loan_boot);
             grown = false;
             LLAMA_LOG_WARN("%s: [CACHELOAN] resize back to %.0f MiB: the grown banks did not allocate\n", __func__, moe_cache->size()/1048576.0);
-            ok = moe_cache->resume();
+            ok = resume();
         }
         if (!ok) {
             ink_loan_grown = false;
@@ -6578,7 +6606,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 grown = false;
                 LLAMA_LOG_WARN("%s: [CACHELOAN] resize back to %.0f MiB (free after the reserve %.0f MiB)\n", __func__,
                         moe_cache->size()/1048576.0, free/1048576.0);
-                if (!moe_cache->resume()) {
+                if (!resume()) {
                     ink_loan_grown = false;
                     LLAMA_LOG_ERROR("%s: [INKSTREAM] no VRAM to refill the MoE cache; decode runs its experts on the host until it fits\n", __func__);
                     return true;
@@ -6592,7 +6620,8 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         ink_loan_grown = grown;
         const double ms = (ggml_time_us() - t0)/1000.0;
         ink_loan_refill_ms = ink_loan_refill_ms > 0 ? 0.5*(ink_loan_refill_ms + ms) : ms;
-        LLAMA_LOG_WARN("%s: [INKSTREAM] MoE cache refilled in %.1f ms\n", __func__, ms);
+        LLAMA_LOG_WARN("%s: [INKSTREAM] MoE cache refilled in %.1f ms (bank alloc + copies %.1f ms%s)\n", __func__, ms, copy_ms,
+                piped ? ", staged pipe" : "");
         return true;
     };
     // fork: n_tokens contains only the incoming rows after prompt-cache reuse.

@@ -64,6 +64,18 @@ public:
 
     llama_ink_stream_stats take_stats();
 
+    // fork (REFILLPIPE): one host -> device copy for upload_wait()
+    struct upload {
+        ggml_tensor * dst;
+        size_t        dst_offs;
+        const void  * src;
+        size_t        len;
+    };
+    // copy the list through the pinned staging workers and the copy stream and wait until it has landed (the MoE cache
+    // refill after a streamed prompt, whose plain path is one synchronous pageable copy per run of experts). Only while
+    // not armed. false: the pipeline cannot run or a destination is not on this device (nothing copied).
+    bool upload_wait(const std::vector<upload> & list);
+
 private:
     struct visit {
         std::vector<const ggml_tensor *> host;   // host expert tensors
@@ -81,6 +93,7 @@ private:
         const char * src;
         size_t dst_offs;
         size_t len;
+        ggml_tensor * dst = nullptr; // nullptr: the slot of the request (req_slot); else upload_wait()
     };
 
     bool init_ok  = false;
@@ -107,6 +120,7 @@ private:
     ggml_backend_t backend_copy = nullptr;
     ggml_backend_event_t ev_free[2]  = { nullptr, nullptr };
     ggml_backend_event_t ev_ready[2] = { nullptr, nullptr };
+    ggml_backend_event_t ev_list = nullptr; // upload_wait(): the last piece is on the card
     int issued[2] = { -1, -1 }; // visit last queued into each slot
 
     int    n_workers = 4;

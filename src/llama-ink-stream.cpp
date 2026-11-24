@@ -229,6 +229,7 @@ void llama_ink_stream::free_pipeline() {
         if (ev_free[s])  { ggml_backend_event_free(ev_free[s]);  ev_free[s]  = nullptr; }
         if (ev_ready[s]) { ggml_backend_event_free(ev_ready[s]); ev_ready[s] = nullptr; }
     }
+    if (ev_list) { ggml_backend_event_free(ev_list); ev_list = nullptr; }
     if (backend_copy) {
         ggml_backend_free(backend_copy);
         backend_copy = nullptr;
@@ -264,6 +265,8 @@ bool llama_ink_stream::prepare() {
         ev_ready[s] = ggml_backend_event_new(dev);
         ok = ev_free[s] && ev_ready[s];
     }
+    ev_list = ok ? ggml_backend_event_new(dev) : nullptr;
+    ok = ok && ev_list != nullptr;
     // pinned staging: two pieces per worker
     ggml_backend_buffer_type_t buft_host = ok ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
     ok = ok && buft_host != nullptr;
@@ -512,7 +515,7 @@ void llama_ink_stream::worker(int w) {
             }
             {
                 std::lock_guard<std::mutex> ls(mtx_stream);
-                ggml_backend_tensor_set_async(backend_copy, raw[s], ws.data[b], p.dst_offs, p.len);
+                ggml_backend_tensor_set_async(backend_copy, p.dst ? p.dst : raw[s], ws.data[b], p.dst_offs, p.len);
                 ggml_backend_event_record(ws.ev[b], backend_copy);
             }
             ws.used[b] = true;
@@ -524,16 +527,52 @@ void llama_ink_stream::worker(int w) {
             // every piece is on the copy stream: the slot is ready when the stream reaches this event
             {
                 std::lock_guard<std::mutex> ls(mtx_stream);
-                ggml_backend_event_record(ev_ready[s], backend_copy);
+                ggml_backend_event_record(s >= 0 ? ev_ready[s] : ev_list, backend_copy);
             }
             for (const piece & p : pieces) {
-                st.bytes_h2d += p.len;
+                st.bytes_h2d += s >= 0 ? p.len : 0; // upload_wait() lists are not prompt streaming
             }
             done_gen = seen;
         }
         n_busy--;
         cv.notify_all();
     }
+}
+
+bool llama_ink_stream::upload_wait(const std::vector<upload> & list) {
+    if (is_armed || !prepare() || wst.empty()) {
+        return false;
+    }
+    for (const upload & u : list) {
+        // the copy stream's async set takes the device's own buffer type only (like the slots)
+        if (!u.dst || !u.dst->buffer || ggml_backend_buffer_get_type(u.dst->buffer) != buft_dev ||
+                u.dst_offs + u.len > ggml_nbytes(u.dst)) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        GGML_ASSERT(done_gen == req_gen && n_busy == 0);
+        pieces.clear();
+        for (const upload & u : list) {
+            for (size_t o = 0; o < u.len; o += piece_max) {
+                pieces.push_back({ (const char *) u.src + o, u.dst_offs + o, std::min(piece_max, u.len - o), u.dst });
+            }
+        }
+        if (pieces.empty()) {
+            return true;
+        }
+        req_slot = -1;
+        pieces_done = 0;
+        next_piece.store(0);
+        ++req_gen;
+    }
+    cv.notify_all();
+    wait_issued();
+    ggml_backend_event_synchronize(ev_list);
+    std::lock_guard<std::mutex> lk(mtx);
+    pieces.clear();
+    return true;
 }
 
 bool llama_ink_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {

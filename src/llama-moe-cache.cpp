@@ -2097,7 +2097,7 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    bool resume() {
+    bool resume(const llama_moe_cache::uploader & up) {
         if (!is_suspended) {
             return true;
         }
@@ -2125,7 +2125,18 @@ struct llama_moe_cache::impl {
             ggml_backend_buffer_clear(buf, 0);
             ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
-        // the experts the slots held, consecutive slots of consecutive experts of one layer in one upload
+        // the experts the slots held, consecutive slots of consecutive experts of one layer in one upload; with an
+        // uploader (REFILLPIPE) the runs go to it as one list, else (or when it declines) one synchronous copy each
+        std::vector<llama_moe_cache::copy_op> ops;
+        bool use_up = (bool) up;
+        auto put = [&](ggml_tensor * bank, const ggml_tensor * w, const void * src, size_t offs, size_t len) {
+            if (use_up && w->buffer && ggml_backend_buffer_is_host(w->buffer)) {
+                ops.push_back({ bank, offs, src, len });
+            } else {
+                use_up = false;
+                ggml_backend_tensor_set(bank, src, offs, len);
+            }
+        };
         for (group & g : groups) {
             const moe_cache_lru & lru = g.lru;
             for (int32_t s = 0; s < g.n_slots; ) {
@@ -2160,10 +2171,10 @@ struct llama_moe_cache::impl {
                     ggml_tensor       * bank = g.banks[ip];
                     const size_t expert_size = bank->nb[2];
                     if (w->nb[2] == expert_size) {
-                        ggml_backend_tensor_set(bank, (const uint8_t *) w->data + e*w->nb[2], s*expert_size, n*expert_size);
+                        put(bank, w, (const uint8_t *) w->data + e*w->nb[2], s*expert_size, n*expert_size);
                     } else {
                         for (int32_t k = 0; k < n; ++k) {
-                            ggml_backend_tensor_set(bank, (const uint8_t *) w->data + (e + k)*w->nb[2], (s + k)*expert_size, expert_size);
+                            put(bank, w, (const uint8_t *) w->data + (e + k)*w->nb[2], (s + k)*expert_size, expert_size);
                         }
                     }
                 }
@@ -2172,6 +2183,11 @@ struct llama_moe_cache::impl {
         }
         if (nvme != nullptr) {
             nvme_refill_flush();
+        }
+        if (!ops.empty() && !(use_up && up(ops))) {
+            for (const auto & op : ops) {
+                ggml_backend_tensor_set(op.dst, op.src, op.offs, op.len);
+            }
         }
         is_suspended = false;
         return true;
@@ -2396,8 +2412,8 @@ size_t llama_moe_cache::suspend() {
     return pimpl->suspend();
 }
 
-bool llama_moe_cache::resume() {
-    return pimpl->resume();
+bool llama_moe_cache::resume(const uploader & up) {
+    return pimpl->resume(up);
 }
 
 bool llama_moe_cache::resize(size_t size) {
