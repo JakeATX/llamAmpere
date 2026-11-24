@@ -963,6 +963,157 @@ struct llama_moe_cache::impl {
         return freed;
     }
 
+    // fork (CACHELOAN): bytes of the banks of a group with n slots
+    size_t group_bytes(const group & g, int32_t n) const {
+        const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
+        size_t res = 0;
+        for (const ggml_tensor * t : g.ref) {
+            res += GGML_PAD((t->nb[1]*t->ne[1])*(n + n_zero + 1), alignment);
+        }
+        return res;
+    }
+
+    size_t bank_bytes() const {
+        size_t res = 0;
+        for (const group & g : groups) {
+            res += g.n_slots > 0 ? group_bytes(g, g.n_slots) : 0;
+        }
+        return res;
+    }
+
+    // fork (CACHELOAN): while suspended, give each group the share of `size` it has now and keep its experts with the
+    // lowest eviction score (the ones victim() would take last). The banks are rebuilt, so the views change: the graphs
+    // that read them must be rebuilt. One device, no CPU share (zero slots), no trace: otherwise false and nothing changes.
+    bool resize(size_t size) {
+        if (!is_suspended || n_zero > 0 || trace != nullptr || groups.empty()) {
+            return false;
+        }
+        int32_t n_dev = 0;
+        for (const device & d : devices) {
+            n_dev += d.ctx ? 1 : 0;
+        }
+        if (n_dev != 1) {
+            return false;
+        }
+        const size_t cur = bank_bytes();
+        std::vector<int32_t> want(groups.size());
+        bool change = false;
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            if (g.n_slots == 0) {
+                return false;
+            }
+            const size_t  budget    = (size_t) ((double) size*group_bytes(g, g.n_slots)/cur);
+            const int32_t max_slots = g.n_canon*(int32_t) g.ref[0]->ne[2];
+            int32_t n = n_expert_used;
+            if (group_bytes(g, n) > budget) {
+                return false;
+            }
+            while (n < max_slots && group_bytes(g, n + 1) <= budget) {
+                n++;
+            }
+            want[ig] = n;
+            change = change || n != g.n_slots;
+        }
+        if (!change) {
+            return true;
+        }
+
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            group & g = groups[ig];
+            moe_cache_lru & lru = g.lru;
+            // the filled slots in list order (classes low to high, each least recently used first) and their scores
+            std::vector<int32_t> order;
+            std::vector<std::pair<double, int32_t>> score;
+            for (int c = 0; c < moe_cache_lru::n_class; ++c) {
+                for (int32_t s = lru.head[c]; s >= 0; s = lru.next[s]) {
+                    const int32_t key = lru.key_of[s];
+                    if (key >= 0) {
+                        order.push_back(key);
+                        const int64_t age = lru.clock[lru.key_layer(key)] - lru.last_use[key];
+                        score.push_back({ std::ldexp((double) age, -c), key });
+                    }
+                }
+            }
+            const size_t n_keep = std::min(order.size(), (size_t) want[ig]);
+            std::sort(score.begin(), score.end());
+            std::vector<int32_t> keep(n_keep);
+            for (size_t k = 0; k < n_keep; ++k) {
+                keep[k] = score[k].second;
+            }
+            std::sort(keep.begin(), keep.end()); // consecutive experts of a layer in consecutive slots: one upload
+
+            std::vector<int32_t *> maps     = lru.slot_map;
+            std::vector<float>     crf      = std::move(lru.crf);
+            std::vector<int64_t>   last_use = std::move(lru.last_use);
+            std::vector<int64_t>   clock    = std::move(lru.clock);
+            lru.init((int32_t) maps.size(), lru.n_expert, want[ig]);
+            lru.slot_map = maps;
+            lru.crf      = std::move(crf);
+            lru.last_use = std::move(last_use);
+            lru.clock    = std::move(clock);
+            for (int32_t il : g.layers) {
+                int32_t * slots = (int32_t *) layers[il].slot_map->data;
+                std::fill(slots, slots + layers[il].slot_map->ne[1], lru.empty);
+            }
+            for (size_t k = 0; k < n_keep; ++k) {
+                lru.key_of[k] = keep[k];
+                lru.slot_map[lru.key_layer(keep[k])][lru.key_expert(keep[k])] = (int32_t) k;
+            }
+            lru.n_filled = (int32_t) n_keep;
+            for (int32_t key : order) {
+                const int32_t s = lru.slot_map[lru.key_layer(key)][lru.key_expert(key)];
+                if (s < lru.n_slots) {
+                    lru.move(s, lru.class_of(key)); // same order within each class as before
+                }
+            }
+            g.n_slots = want[ig];
+        }
+
+        // new banks and views on the device
+        for (size_t id = 0; id < devices.size(); ++id) {
+            device & d = devices[id];
+            if (!d.ctx) {
+                continue;
+            }
+            size_t n_tensors = 0;
+            for (const group & g : groups) {
+                n_tensors += g.id == (int32_t) id ? g.ref.size()*(1 + g.layers.size()) : 0;
+            }
+            ggml_init_params params = { n_tensors*ggml_tensor_overhead(), nullptr, true };
+            ggml_context_ptr ctx(ggml_init(params));
+            if (!ctx) {
+                throw std::runtime_error("failed to create the MoE cache context");
+            }
+            d.buf_size = 0;
+            for (size_t ig = 0; ig < groups.size(); ++ig) {
+                group & g = groups[ig];
+                if (g.id != (int32_t) id) {
+                    continue;
+                }
+                g.banks.clear();
+                for (const ggml_tensor * t : g.ref) {
+                    ggml_tensor * bank = ggml_new_tensor_3d(ctx.get(), t->type, t->ne[0], t->ne[1], g.n_slots + n_zero + 1);
+                    GGML_ASSERT(bank->nb[2] == t->nb[1] * t->ne[1]);
+                    ggml_format_name(bank, "moe_cache.%zu.%s", ig, t->name);
+                    g.banks.push_back(bank);
+                }
+                for (int32_t il : g.layers) {
+                    const layer & l = layers[il];
+                    for (size_t ip = 0; ip < l.experts.size() && canon[il] == il; ++ip) {
+                        ggml_tensor * bank   = g.banks[ip];
+                        ggml_tensor * cached = ggml_view_3d(ctx.get(), bank, bank->ne[0], bank->ne[1], g.n_slots + n_zero, bank->nb[1], bank->nb[2], 0);
+                        ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
+                        bindings[l.experts[ip]].cached = cached;
+                    }
+                }
+                d.buf_size += group_bytes(g, g.n_slots);
+            }
+            d.ctx = std::move(ctx);
+        }
+        return true;
+    }
+
     bool resume() {
         if (!is_suspended) {
             return true;
@@ -986,6 +1137,7 @@ struct llama_moe_cache::impl {
                 return false;
             }
             d.buf.reset(buf);
+            d.buf_size = ggml_backend_buffer_get_size(buf);
             ggml_backend_buffer_clear(buf, 0);
             ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
@@ -1077,6 +1229,14 @@ size_t llama_moe_cache::suspend() {
 
 bool llama_moe_cache::resume() {
     return pimpl->resume();
+}
+
+bool llama_moe_cache::resize(size_t size) {
+    return pimpl->resize(size);
+}
+
+size_t llama_moe_cache::size() const {
+    return pimpl->bank_bytes();
 }
 
 bool llama_moe_cache::suspended() const {

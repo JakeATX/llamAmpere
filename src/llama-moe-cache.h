@@ -46,6 +46,10 @@ public:
     size_t suspend();
     bool   resume();
     bool   suspended() const;
+    // fork (CACHELOAN): while suspended, rebuild the banks for `size` bytes (keeps the hottest experts; resume()
+    // uploads them). false: not possible here (several devices, CPU share, trace), nothing changed. size(): bank bytes.
+    bool   resize(size_t size);
+    size_t size() const;
 
 private:
     struct impl;

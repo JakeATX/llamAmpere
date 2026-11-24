@@ -675,6 +675,19 @@ private:
     uint32_t ink_stream_rows_max = 0; // largest ubatch run while armed
     int      ink_stream_fails = 0;    // arm failures in a row; at 2 the streamer stops trying
     bool     ink_rows_cap = false;    // Inkling with host experts: prompt rows stay at 512 unless the streamer is armed
+    // fork (CACHELOAN): after a streamed prompt, decode keeps a small reserve and the MoE cache takes the rest of the card
+    bool     ink_loan       = false;  // LLAMA_INK_CACHE_LOAN=0 = off
+    bool     ink_loan_grown = false;  // the cache holds the loan (sized from free VRAM at the small reserve)
+    uint32_t ink_loan_rows  = 32;     // reserve while grown (LLAMA_INK_DECODE_ROWS); short prompts run in chunks of it
+    size_t   ink_loan_boot  = 0;      // cache bytes at boot
+    double   ink_loan_chunk_ms  = 0;  // measured: one chunk of a short prompt at the small reserve
+    double   ink_loan_pass_ms   = 0;  // measured: one streamed prompt ubatch
+    double   ink_loan_take_ms   = 0;  // measured: lend the cache and arm the streamer
+    double   ink_loan_refill_ms = 0;  // measured: refill (resize, upload, reserve)
+    int64_t  ink_loan_chunk_t0  = 0;
+    uint32_t ink_loan_chunk_n   = 0;
+    uint32_t ink_loan_cross(uint32_t ink_min) const;
+    void     ink_loan_shrink(const char * why);
     bool dynamic_ubatch = false;
     uint32_t dynamic_ubatch_rows = 0;
     int64_t dynamic_ubatch_pp_check_us = 0;

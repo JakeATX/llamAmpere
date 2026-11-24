@@ -1644,6 +1644,17 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 if (ink_stream && !ink_stream->ok()) {
                     ink_stream.reset();
                 }
+                // fork (CACHELOAN): one GPU cache that can be resized; LLAMA_INK_CACHE_LOAN=0 keeps the boot size
+                const char * loan_env = getenv("LLAMA_INK_CACHE_LOAN");
+                ink_loan = ink_stream && moe_cache && !(loan_env && strcmp(loan_env, "0") == 0);
+                if (ink_loan) {
+                    const char * rows_env = getenv("LLAMA_INK_DECODE_ROWS");
+                    const long v = rows_env && rows_env[0] ? strtol(rows_env, nullptr, 10) : 32;
+                    ink_loan_rows = v >= 1 && v <= 512 ? (uint32_t) v : 32u;
+                    ink_loan_boot = moe_cache->size();
+                    LLAMA_LOG_WARN("%s: [CACHELOAN] on: after a streamed prompt decode reserves %u rows and the MoE cache grows "
+                            "from %.0f MiB into the rest (LLAMA_INK_CACHE_LOAN=0 = off)\n", __func__, ink_loan_rows, ink_loan_boot/1048576.0);
+                }
                 LLAMA_LOG_WARN("%s: [INKSTREAM] prompt expert streamer %s (boot scratch %u rows, prompt ceiling %u)\n", __func__,
                         ink_stream ? "on" : "unavailable", sched_reserve_tokens, cparams.n_ubatch);
             }
@@ -6104,13 +6115,24 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     // fork (INKSTREAM): a prompt call of one sequence above 512 rows lends the MoE cache and streams the experts;
     // a writing-sized call (<= 32 rows) or the generation phase returns the scratch and refills the cache below.
     bool ink_refill = false;
+    uint32_t loan_cross = 512;
     if (ink_stream && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
         static const uint32_t ink_min = [] {
             const char * e = getenv("LLAMA_INK_STREAM_MIN_ROWS");
             const long v = e && e[0] ? strtol(e, nullptr, 10) : 512;
             return v >= 32 && v <= 65536 ? (uint32_t) v : 512u;
         }();
-        const bool stream_call = alone && n_tokens > ink_min && phase != LLAMA_DECODE_PHASE_GENERATION;
+        // fork (CACHELOAN): while the cache holds the loan, a prompt above the crossover streams (a smaller one runs in
+        // chunks of the small reserve through the cache, see below)
+        loan_cross = ink_loan_cross(ink_min);
+        const uint32_t stream_min = ink_loan && ink_loan_grown ? loan_cross : ink_min;
+        if (ink_loan_chunk_n > 0) {
+            // the previous call was a chunked short prompt: its time up to this call is its cost
+            const double ms = (ggml_time_us() - ink_loan_chunk_t0)/1000.0/ink_loan_chunk_n;
+            ink_loan_chunk_ms = ink_loan_chunk_ms > 0 ? 0.5*(ink_loan_chunk_ms + ms) : ms;
+            ink_loan_chunk_n = 0;
+        }
+        const bool stream_call = alone && n_tokens > stream_min && phase != LLAMA_DECODE_PHASE_GENERATION;
         if (stream_call && !ink_stream->armed() && ink_stream->ok() && ink_stream_fails < 2) {
             ink_stream_take();
         } else if (ink_stream->armed() && !stream_call && (n_tokens <= 32 || phase == LLAMA_DECODE_PHASE_GENERATION)) {
@@ -6147,13 +6169,88 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             res.reset();
         }
         gf_res_prev_active = nullptr;
-        if (!moe_cache->resume()) {
+        // fork (CACHELOAN): at the small reserve the cache takes the free VRAM less a decode margin
+        // (LLAMA_INK_LOAN_MARGIN_MIB, default 256: the CUDA pool of decode and short-prompt chunks)
+        static const size_t loan_margin = [] {
+            const char * e = getenv("LLAMA_INK_LOAN_MARGIN_MIB");
+            const long v = e && e[0] ? strtol(e, nullptr, 10) : 256;
+            return (size_t) std::max(64l, v) << 20;
+        }();
+        auto gpu_free = [&]() {
+            size_t free = 0, total = 0;
+            for (ggml_backend_t backend : backend_ptrs) {
+                auto dev = ggml_backend_get_device(backend);
+                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    break;
+                }
+            }
+            return free;
+        };
+        const size_t size0 = moe_cache->size();
+        bool grown = false;
+        if (ink_loan && sched_reserve_tokens == ink_loan_rows) {
+            const size_t free = gpu_free();
+            const size_t cap  = llama_moe_cache_host_expert_bytes(model) + (size_t(64) << 20);
+            const size_t want = std::min(cap, free > loan_margin ? free - loan_margin : 0);
+            if (want > ink_loan_boot && moe_cache->resize(want)) {
+                grown = moe_cache->size() > ink_loan_boot;
+            } else {
+                moe_cache->resize(ink_loan_boot);
+            }
+            LLAMA_LOG_WARN("%s: [CACHELOAN] resize %.0f -> %.0f MiB (free %.0f MiB at the %u-row reserve, margin %.0f MiB)\n", __func__,
+                    size0/1048576.0, moe_cache->size()/1048576.0, free/1048576.0, ink_loan_rows, loan_margin/1048576.0);
+        } else if (ink_loan && moe_cache->size() != ink_loan_boot) {
+            moe_cache->resize(ink_loan_boot);
+            LLAMA_LOG_WARN("%s: [CACHELOAN] resize %.0f -> %.0f MiB (boot size, reserve %u rows)\n", __func__,
+                    size0/1048576.0, moe_cache->size()/1048576.0, sched_reserve_tokens);
+        }
+        bool ok = moe_cache->resume();
+        if (!ok && grown) {
+            // fallback (WDDM can refuse a large allocation right after the frees): the boot size
+            moe_cache->resize(ink_loan_boot);
+            grown = false;
+            LLAMA_LOG_WARN("%s: [CACHELOAN] resize back to %.0f MiB: the grown banks did not allocate\n", __func__, moe_cache->size()/1048576.0);
+            ok = moe_cache->resume();
+        }
+        if (!ok) {
+            ink_loan_grown = false;
             LLAMA_LOG_ERROR("%s: [INKSTREAM] no VRAM to refill the MoE cache; decode runs its experts on the host until it fits\n", __func__);
             return true;
         }
-        // the 512-row reserve above ran without the cache (its expert ops on the host): reserve again with it
+        // the reserve above ran without the cache (its expert ops on the host): reserve again with it
         sched_need_reserve = true;
-        LLAMA_LOG_WARN("%s: [INKSTREAM] MoE cache refilled in %.1f ms\n", __func__, (ggml_time_us() - t0)/1000.0);
+        if (grown) {
+            // invariant: the reserve with the cache fits and leaves half the margin, else back to the boot size
+            bool fits = true;
+            try {
+                sched_reserve();
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("%s: [CACHELOAN] reserve with the grown cache failed: %s\n", __func__, e.what());
+                fits = false;
+            }
+            const size_t free = gpu_free();
+            if (!fits || free < loan_margin/2) {
+                moe_cache->suspend();
+                moe_cache->resize(ink_loan_boot);
+                grown = false;
+                LLAMA_LOG_WARN("%s: [CACHELOAN] resize back to %.0f MiB (free after the reserve %.0f MiB)\n", __func__,
+                        moe_cache->size()/1048576.0, free/1048576.0);
+                if (!moe_cache->resume()) {
+                    ink_loan_grown = false;
+                    LLAMA_LOG_ERROR("%s: [INKSTREAM] no VRAM to refill the MoE cache; decode runs its experts on the host until it fits\n", __func__);
+                    return true;
+                }
+                sched_need_reserve = true;
+            } else {
+                LLAMA_LOG_WARN("%s: [CACHELOAN] grown cache %.0f MiB, %.0f MiB free after the %u-row reserve\n", __func__,
+                        moe_cache->size()/1048576.0, free/1048576.0, sched_reserve_tokens);
+            }
+        }
+        ink_loan_grown = grown;
+        const double ms = (ggml_time_us() - t0)/1000.0;
+        ink_loan_refill_ms = ink_loan_refill_ms > 0 ? 0.5*(ink_loan_refill_ms + ms) : ms;
+        LLAMA_LOG_WARN("%s: [INKSTREAM] MoE cache refilled in %.1f ms\n", __func__, ms);
         return true;
     };
     // fork: n_tokens contains only the incoming rows after prompt-cache reuse.
@@ -6257,6 +6354,22 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     rows = std::min(rows, cparams.n_ubatch);
     if (ink_rows_cap && !ink_armed) {
         rows = std::min(rows, 512u);
+    }
+    if (ink_loan && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !ink_armed && (ink_refill || ink_loan_grown)) {
+        // fork (CACHELOAN): the refill call and, while the cache holds the loan, decode and short single-sequence prompts
+        // (up to the crossover) run at the small reserve; anything else first gives the loan back (boot size)
+        if (alone && (n_tokens <= ink_loan_rows || phase == LLAMA_DECODE_PHASE_GENERATION ||
+                    (ink_loan_grown && n_tokens <= loan_cross && phase != LLAMA_DECODE_PHASE_GENERATION))) {
+            rows = ink_loan_rows;
+            if (n_tokens > ink_loan_rows) {
+                ink_loan_chunk_t0 = ggml_time_us();
+                ink_loan_chunk_n  = (n_tokens + ink_loan_rows - 1) / ink_loan_rows;
+                LLAMA_LOG_INFO("%s: [CACHELOAN] %u-token prompt in %u chunks of %u rows through the cache\n", __func__,
+                        n_tokens, ink_loan_chunk_n, ink_loan_rows);
+            }
+        } else if (ink_loan_grown) {
+            ink_loan_shrink(alone ? "prompt above the crossover, streamer off" : "shared slots");
+        }
     }
     if (ink_armed && n_tokens > 32) {
         // fork (INKSTREAM): each ubatch streams every visit's experts once, so the larger the ubatch the fewer bytes
@@ -6463,6 +6576,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
 
 bool llama_context::ink_stream_take() {
     synchronize();
+    const int64_t t_take0 = ggml_time_us();
     if (!ink_stream->prepare()) {
         ink_stream_fails = 2;
         return false;
@@ -6491,6 +6605,10 @@ bool llama_context::ink_stream_take() {
     ink_stream_tokens   = 0;
     ink_stream_rows_max = 0;
     ink_stream_t0_us    = ggml_time_us();
+    {
+        const double ms = (ink_stream_t0_us - t_take0)/1000.0;
+        ink_loan_take_ms = ink_loan_take_ms > 0 ? 0.5*(ink_loan_take_ms + ms) : ms;
+    }
     LLAMA_LOG_WARN("%s: [INKSTREAM] prompt: MoE cache lent (%.0f MiB), 2 expert slots of %.1f MiB armed\n", __func__,
             lent/1048576.0, ink_stream->slot_bytes()/1048576.0);
     return true;
@@ -6506,7 +6624,66 @@ bool llama_context::ink_stream_release(const char * why) {
             "%llu visit uploads, %.2f GiB streamed, %.1f ms host wait\n", __func__, why,
             (unsigned long long) ink_stream_tokens, t, t > 0 ? ink_stream_tokens/t : 0.0, ink_stream_rows_max,
             (unsigned long long) st.uploads, st.bytes_h2d/1073741824.0, st.t_wait_us/1000.0);
+    if (ink_stream_tokens > 0 && ink_stream_rows_max > 0) {
+        const double n_ub = (double) ((ink_stream_tokens + ink_stream_rows_max - 1) / ink_stream_rows_max);
+        const double ms   = t*1000.0/n_ub;
+        ink_loan_pass_ms = ink_loan_pass_ms > 0 ? 0.5*(ink_loan_pass_ms + ms) : ms;
+    }
     return true;
+}
+
+// fork (CACHELOAN): the largest prompt that runs in chunks of the small reserve through the grown cache. From the measured
+// costs: n/rows chunks against lending the cache, streamed ubatches and the refill; ink_min until both were measured.
+// LLAMA_INK_LOAN_MIN_ROWS=N fixes it.
+uint32_t llama_context::ink_loan_cross(uint32_t ink_min) const {
+    static const long fixed = [] {
+        const char * e = getenv("LLAMA_INK_LOAN_MIN_ROWS");
+        return e && e[0] ? strtol(e, nullptr, 10) : -1l;
+    }();
+    if (fixed >= 0) {
+        return (uint32_t) std::min<long>(fixed, ink_min);
+    }
+    if (ink_loan_chunk_ms <= 0 || ink_loan_pass_ms <= 0) {
+        return ink_min;
+    }
+    const uint32_t rows_s = std::max(512u, std::min(cparams.n_ubatch, 4096u));
+    for (uint32_t n = ink_loan_rows + 1; n <= ink_min; ++n) {
+        const double chunk  = ((n + ink_loan_rows - 1) / ink_loan_rows)*ink_loan_chunk_ms;
+        const double stream = ink_loan_take_ms + ink_loan_refill_ms + ((n + rows_s - 1) / rows_s)*ink_loan_pass_ms;
+        if (chunk > stream) {
+            return n - 1;
+        }
+    }
+    return ink_min;
+}
+
+// fork (CACHELOAN): give the loan back before a call that needs the normal reserve (boot cache size)
+void llama_context::ink_loan_shrink(const char * why) {
+    synchronize();
+    const int64_t t0 = ggml_time_us();
+    for (ggml_backend_t backend : backend_ptrs) {
+        auto dev = ggml_backend_get_device(backend);
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        using reset_fn = bool (*)(ggml_backend_t);
+        auto reset = (reset_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_reset");
+        if (reset) {
+            reset(backend);
+        }
+    }
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+    const size_t size0 = moe_cache->size();
+    moe_cache->suspend();
+    moe_cache->resize(ink_loan_boot);
+    const bool ok = moe_cache->resume();
+    ink_loan_grown = false;
+    sched_need_reserve = true;
+    LLAMA_LOG_WARN("%s: [CACHELOAN] resize %.0f -> %.0f MiB (%s) in %.1f ms%s\n", __func__, size0/1048576.0,
+            moe_cache->size()/1048576.0, why, (ggml_time_us() - t0)/1000.0, ok ? "" : ", refill failed (retried)");
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
