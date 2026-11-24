@@ -164,6 +164,12 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         auto ink12 = ink8;
         ink12.name = "12ink";
         set_ctx(ink12, "262144");
+        // 12ink takes -ub 2048: at 11,264 MiB the ladder reaches 2,048 with the cache intact (100K prefill 968 vs
+        // 644 tok/s at 1024, S34d/X2, RTX 3090 capped). 8ink and 10ink stay at 1024 (2048 shrinks their cache).
+        for (auto & [opt, val] : ink12.options) {
+            if (opt == "--ubatch-size") { val = "2048"; }
+        }
+        ink12.version = "2026-11-23.5";
         // fork (INKSTACK): Inkling 2 Mini on a 24 GB card, one slot, the whole model on the GPU, DSpark drafter on.
         // -b 2048 -ub 1024 (ladder on): at -c 262144 the NQ file runs out of VRAM at ub 2048 (rc8b boot check, RELREADY),
         // and --parallel 1 keeps the server from picking 4 slots + a unified KV (500 on the first 262K request).
