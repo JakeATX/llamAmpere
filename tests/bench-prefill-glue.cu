@@ -53,6 +53,29 @@ static __global__ void k_ref_swiglu(const float * g, const float * u, float * ou
     }
 }
 
+// stock GLU element functions (unary.cuh / unary.cu), one per kind
+static __global__ void k_ref_glu(int glu_kind, const float * g, const float * u, float * out, int K, int64_t rows,
+        ink_situ_params p, float limit, float oai_alpha, float oai_limit) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= K) return;
+    for (int64_t r = blockIdx.y; r < rows; r += gridDim.y) {
+        const float x = g[r * K + c], y = u[r * K + c];
+        float v;
+        switch (glu_kind) {
+            case PF_GLU_SITU:         v = ink_situ_elem(x, y, p); break;
+            case PF_GLU_REGLU:        v = fmaxf(x, 0) * y; break;
+            case PF_GLU_GEGLU:        v = ggml_cuda_op_gelu_single(x) * y; break;
+            case PF_GLU_SWIGLU:       v = ggml_cuda_op_silu_single(x) * y; break;
+            case PF_GLU_SWIGLU_OAI:   v = ggml_cuda_op_swiglu_oai_single(x, y, oai_alpha, oai_limit); break;
+            case PF_GLU_SWIGLU_CLAMP: v = ggml_cuda_op_swiglu_clamp_single(x, y, limit); break;
+            case PF_GLU_GEGLU_ERF:    v = (0.5f*x*(1.0f + erff(x*0.70710678118654752440084436210484f))) * y; break;
+            case PF_GLU_GEGLU_QUICK:  v = (x * (1.0f / (1.0f + expf(-1.702f * x)))) * y; break;
+            default:                  v = y; break;
+        }
+        out[r * K + c] = v;
+    }
+}
+
 template <int BS>
 static __global__ void k_ref_rmsnorm_mul(const float * x, const float * w, float * dst, int K, int64_t rows, float eps) {
     __shared__ float s_red[32];
@@ -139,8 +162,7 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         CUDA_CK(cudaMemcpy(du, hu.data(), hu.size() * sizeof(float), cudaMemcpyHostToDevice));
 
         const dim3 grid_e((unsigned) ((K + 255) / 256), (unsigned) rows);
-        if (glu_kind == PF_GLU_SITU) k_ref_situ<<<grid_e, 256>>>(dg, du, df32, K, rows, situ);
-        else                         k_ref_swiglu<<<grid_e, 256>>>(dg, du, df32, K, rows);
+        k_ref_glu<<<grid_e, 256>>>(glu_kind, dg, du, df32, K, rows, situ, 7.0f, 1.702f, 7.0f);
 
         if (xsh) rq4::launch_quantize_act<false, false, false>(df32, K, d_ref_q, d_ref_s, K, rows, 0);
         else     ai4k::launch_quantize_act128<false, false, false>(df32, K, d_ref_q, d_ref_s, K, rows, 0);
@@ -220,6 +242,12 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
     verify_glu(64, 1152,  PF_GLU_SITU,   "SITU Inkling H128");
     verify_glu(64, 2304,  PF_GLU_SITU,   "SITU Inkling H256");
     verify_glu(32, 28672, PF_GLU_SWIGLU, "SwiGLU Dense H256");
+    verify_glu(64, 2304,  PF_GLU_REGLU,        "ReGLU H256");
+    verify_glu(64, 1152,  PF_GLU_GEGLU,        "GeGLU H128");
+    verify_glu(64, 2304,  PF_GLU_GEGLU_ERF,    "GeGLU-erf H256");
+    verify_glu(64, 2304,  PF_GLU_GEGLU_QUICK,  "GeGLU-quick H256");
+    verify_glu(64, 2304,  PF_GLU_SWIGLU_OAI,   "SwiGLU-OAI H256");
+    verify_glu(64, 2304,  PF_GLU_SWIGLU_CLAMP, "SwiGLU-clamp H256");
 
     // NVFP4PF KF=64 0-ULP GPU verification
     {

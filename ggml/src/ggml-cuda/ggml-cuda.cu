@@ -11851,12 +11851,14 @@ static int ggml_cuda_try_fuse_ink_mix_norm(ggml_backend_cuda_context * ctx, ggml
     // always written; the copy is only taken by a consumer whose src1 / shape / layout match exactly)
     int pf_kf = 0;
     if (!mm && ggml_cuda_prefill_try_mix_norm_actq(*ctx, cgraph, last, mul, pf_kf, &aq, &as)) {
-        if (!ggml_cuda_depth_mix_norm(*ctx, mix, w, mul, eps, aq, as, pf_kf)) {
-            ggml_cuda_prefill_invalidate_ptr(*ctx, mul->data, ggml_nbytes(mul));
-            return 0;
+        if (ggml_cuda_depth_mix_norm(*ctx, mix, w, mul, eps, aq, as, pf_kf)) {
+            ctx->fusion_stats.prefill_mix_actq++;
+            return last - i;
         }
-        ctx->fusion_stats.prefill_mix_actq++;
-        return last - i;
+        // nothing was launched: drop the entry and run the plain fused mix-norm below
+        ggml_cuda_prefill_invalidate_ptr(*ctx, mul->data, ggml_nbytes(mul));
+        aq = nullptr;
+        as = nullptr;
     }
     if (!ggml_cuda_depth_mix_norm(*ctx, mix, w, mul, eps, aq, as)) {
         if (mm) {
