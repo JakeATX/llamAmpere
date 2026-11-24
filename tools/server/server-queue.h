@@ -149,7 +149,26 @@ public:
         callback_sleeping_state.push_back(std::move(callback));
     }
 
+    // ids of tasks a cancel was posted for and not yet handled by the main loop (own mutex: read from inside a
+    // decode, see LLAMA_SERVER_PREFILL_CANCEL)
+    bool cancel_posted(int id_task) {
+        std::lock_guard<std::mutex> lock(mutex_cancel);
+        return cancel_ids.count(id_task) != 0;
+    }
+    void cancel_handled(int id_task) {
+        std::lock_guard<std::mutex> lock(mutex_cancel);
+        cancel_ids.erase(id_task);
+    }
+
 private:
+    std::mutex              mutex_cancel;
+    std::unordered_set<int> cancel_ids;
+
+    void note_cancel(int id_target) {
+        std::lock_guard<std::mutex> lock(mutex_cancel);
+        cancel_ids.insert(id_target);
+    }
+
     void cleanup_pending_task(int id_target);
 
     // process all pending tasks in the queue

@@ -234,6 +234,9 @@ struct llama_context {
     void set_ubatch_rows_callback(void (*cb)(void * user, int32_t first, int32_t count), void * user);
     int mtp_handoff_decode(llama_context & target, llama_batch batch, int32_t first, const float * carry);
     void (*ubatch_rows_cb)(void * user, int32_t first, int32_t count) = nullptr;
+    // checked before every ubatch of a decode but the first (ordinary path only); true = stop the decode as aborted
+    bool (*ubatch_abort_cb)(void * user) = nullptr;
+    void * ubatch_abort_cb_user = nullptr;
     void * ubatch_rows_cb_user = nullptr;
     bool mtp_device_feedback_init();
     int mtp_device_feedback_decode(llama_batch batch, bool use_previous);
