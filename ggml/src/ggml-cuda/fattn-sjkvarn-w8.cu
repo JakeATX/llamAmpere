@@ -23,26 +23,27 @@ static constexpr size_t w8_shared_bytes(const int nstage) {
     return split_bytes(nstage, false) + (size_t) W8_WARPS * QP_WARP_BYTES;
 }
 
-// GGML_SJKVARN_W8: 0/unset = off (default), 1 = qp-smem + raw-K fold + raw_pipe, 2 = qp-smem + decode_pairs + raw_pipe.
-static int w8_parse_env(const char * name, const long lo, const long hi, const bool allow_zero, const char * desc) {
+// GGML_SJKVARN_W8: unset/0 = off (ggml default: every run keeps the cand verify kernels), 2 = qp-smem + decode_pairs + raw_pipe,
+// 1 = qp-smem + raw-K fold + raw_pipe. common/arg.cpp sets 2 for draft-dflash (DSpine) runs only, next to the W78 rule.
+static int w8_parse_env(const char * name, const long lo, const long hi, const bool allow_zero, const int default_val, const char * desc) {
     const char * e = getenv(name);
     if (e == nullptr || *e == '\0') {
-        return 0;
+        return default_val;
     }
     char * end = nullptr;
     const long v = strtol(e, &end, 10);
     if (end == e || *end != '\0' || ((v < lo || v > hi) && !(allow_zero && v == 0))) {
-        GGML_LOG_WARN("SJKVARN W8: invalid %s=\"%s\" (expected %s); %s\n", name, e, desc, allow_zero ? "auto" : "OFF");
-        return 0;
+        GGML_LOG_WARN("SJKVARN W8: invalid %s=\"%s\" (expected %s); using default %d\n", name, e, desc, default_val);
+        return default_val;
     }
     return (int) v;
 }
 
-static int w8_mode()       { static const int v = w8_parse_env("GGML_SJKVARN_W8",        0, 2,       false, "0, 1 or 2");    return v; }
-static int w8_nstage_env() { static const int v = w8_parse_env("GGML_SJKVARN_W8_NSTAGE", 2, 4,       true,  "0, 2, 3 or 4"); return v; }
-static int w8_splits_env() { static const int v = w8_parse_env("GGML_SJKVARN_W8_SPLITS", 0, INT_MAX, true,  ">= 0");         return v; }
+static int w8_mode()       { static const int v = w8_parse_env("GGML_SJKVARN_W8",        0, 2,       false, 0, "0, 1 or 2");    return v; }
+static int w8_nstage_env() { static const int v = w8_parse_env("GGML_SJKVARN_W8_NSTAGE", 2, 4,       true,  0, "0, 2, 3 or 4"); return v; }
+static int w8_splits_env() { static const int v = w8_parse_env("GGML_SJKVARN_W8_SPLITS", 0, INT_MAX, true,  0, ">= 0");         return v; }
 // Test-only switch: force the rot occupancy-mismatch fallback (unfused W8) so tests can verify it directly.
-static bool w8_force_unfused_env() { static const bool v = w8_parse_env("GGML_SJKVARN_W8_FORCE_UNFUSED", 0, 1, false, "0 or 1") != 0; return v; }
+static bool w8_force_unfused_env() { static const bool v = w8_parse_env("GGML_SJKVARN_W8_FORCE_UNFUSED", 0, 1, false, 0, "0 or 1") != 0; return v; }
 
 template <int NSTAGE, bool rot, bool raw_k>
 static fattn_kernel_t w8_kernel() {

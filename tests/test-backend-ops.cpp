@@ -2405,6 +2405,215 @@ struct test_case {
     }
 };
 
+// DSpine fused CUDA op tests (GGML_CUDA_DSPINE_FUSE=1): write epilogue, refine+norm, and Q6_K lattice pack
+static const char * dspine_fuse_required_for_test() {
+    const char * e = getenv("GGML_CUDA_DSPINE_FUSE");
+    return (e != nullptr && strcmp(e, "1") == 0) ? "dspine_fuse" : nullptr;
+}
+
+struct test_dspine_write_epilogue : public test_case {
+    const int64_t E;
+    const int64_t block;
+    const int64_t B;
+    const bool    write_rms;
+
+    test_dspine_write_epilogue(int64_t E, int64_t block, int64_t B, bool write_rms)
+        : E(E), block(block), B(B), write_rms(write_rms) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DSPINE_WRITE_EPILOGUE"; }
+    std::string vars() override { return VARS_TO_STR4(E, block, B, write_rms); }
+    double max_nmse_err() override { return 1e-5; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    const char * required_fusion() override { return dspine_fuse_required_for_test(); }
+
+    size_t op_size(ggml_tensor *) override {
+        const int64_t n_pos = block - 1;
+        return (size_t) (2 * block * B + n_pos * B) * (size_t) E * sizeof(float);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_pos = block - 1;
+        ggml_tensor * cur   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, block * B);
+        ggml_tensor * delta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_pos * B);
+
+        ggml_tensor * cur3 = ggml_reshape_3d(ctx, cur, E, block, B);
+        ggml_tensor * cur_pos3 = nullptr;
+        if (B == 1) {
+            ggml_tensor * cur2 = ggml_reshape_2d(ctx, cur3, E, block);
+            ggml_tensor * v2   = ggml_view_2d(ctx, cur2, E, n_pos, cur2->nb[1], cur2->nb[1]);
+            cur_pos3 = ggml_reshape_3d(ctx, v2, E, n_pos, 1);
+        } else {
+            cur_pos3 = ggml_cont(ctx, ggml_view_3d(ctx, cur3, E, n_pos, B, cur3->nb[1], cur3->nb[2], cur3->nb[1]));
+        }
+        ggml_tensor * cur_pos = ggml_reshape_2d(ctx, cur_pos3, E, n_pos * B);
+
+        ggml_tensor * rms_pos = ggml_sqrt(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur_pos)), 1.0f / (float) E));
+        ggml_tensor * d = ggml_mul(ctx, delta, rms_pos);
+        d = ggml_pad_ext(ctx, ggml_reshape_3d(ctx, d, E, n_pos, B), 0, 0, 1, 0, 0, 0, 0, 0);
+        d = ggml_reshape_2d(ctx, d, E, block * B);
+        ggml_tensor * out = ggml_add(ctx, cur, d);
+
+        if (write_rms) {
+            ggml_tensor * rms_pad = ggml_reshape_2d(ctx,
+                    ggml_pad_ext(ctx, ggml_reshape_3d(ctx, rms_pos, 1, n_pos, B), 0, 0, 1, 0, 0, 0, 0, 0),
+                    1, block * B);
+            out = ggml_add(ctx, out, rms_pad);
+        }
+        return out;
+    }
+};
+
+struct test_dspine_refine_norm : public test_case {
+    const int64_t E;
+    const int64_t C;
+    const int64_t P;
+    const int64_t B;
+
+    test_dspine_refine_norm(int64_t E, int64_t C, int64_t P, int64_t B)
+        : E(E), C(C), P(P), B(B) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DSPINE_REFINE_NORM"; }
+    std::string vars() override { return VARS_TO_STR4(E, C, P, B); }
+    double max_nmse_err() override { return 1e-5; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    const char * required_fusion() override { return dspine_fuse_required_for_test(); }
+
+    size_t op_size(ggml_tensor *) override {
+        return (size_t) (2 * C * P * B + P * B + 1) * (size_t) E * sizeof(float);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * delta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, C, P, B);
+        ggml_tensor * rms   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, P, B);
+        ggml_tensor * raw   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, 1, P, B);
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, E);
+
+        ggml_tensor * x = ggml_add(ctx, ggml_mul(ctx, delta, rms), raw);
+        return ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma);
+    }
+};
+
+struct test_dspine_lattice_q6k_pack : public test_case {
+    const int64_t E;
+    const int64_t V;
+    const int64_t K;
+    const int64_t n_pos;
+    const int64_t B;
+    const bool    dedup;
+
+    test_dspine_lattice_q6k_pack(int64_t E, int64_t V, int64_t K, int64_t n_pos, int64_t B, bool dedup)
+        : E(E), V(V), K(K), n_pos(n_pos), B(B), dedup(dedup) {}
+
+    std::string op_desc(ggml_tensor *) override { return "DSPINE_LATTICE_Q6K_PACK"; }
+    std::string vars() override { return VARS_TO_STR6(E, V, K, n_pos, B, dedup); }
+    double max_nmse_err() override { return 1e-5; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    const char * required_fusion() override { return dspine_fuse_required_for_test(); }
+
+    size_t op_size(ggml_tensor *) override {
+        const int64_t n_ref = dedup ? (1 + K * (n_pos - 1)) * B : K * n_pos * B;
+        return (size_t) (K * n_pos * B) * ggml_row_size(GGML_TYPE_Q6_K, E) +
+               (size_t) (n_ref + (n_pos + 1) * B) * (size_t) E * sizeof(float);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * output   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q6_K, E, V);
+        ggml_tensor * cand_run = ggml_new_tensor_3d(ctx, GGML_TYPE_I32,  K, n_pos, B);
+        ggml_set_name(cand_run, "cand_ids");
+
+        ggml_tensor * head = ggml_get_rows(ctx, output, ggml_reshape_1d(ctx, cand_run, K * n_pos * B));
+        head = ggml_reshape_4d(ctx, head, E, K, n_pos, B);
+
+        ggml_tensor * table = nullptr;
+        if (!dedup) {
+            ggml_tensor * refined = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, K, n_pos, B);
+            table = ggml_mul_mat(ctx, head, refined);
+        } else if (n_pos == 1) {
+            ggml_tensor * ref0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, 1, 1, B);
+            table = ggml_repeat_4d(ctx, ggml_mul_mat(ctx, head, ref0), K, K, 1, B);
+        } else {
+            ggml_tensor * ref0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, 1, 1, B);
+            ggml_tensor * refr = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, E, K, n_pos - 1, B);
+            ggml_tensor * head3 = ggml_reshape_3d(ctx, head, E * K, n_pos, B);
+            auto slice_rows = [&](int64_t beg, int64_t len) {
+                if (B == 1) {
+                    ggml_tensor * t2 = ggml_reshape_2d(ctx, head3, E * K, n_pos);
+                    ggml_tensor * v2 = ggml_view_2d(ctx, t2, E * K, len, t2->nb[1], (size_t) beg * t2->nb[1]);
+                    return ggml_reshape_4d(ctx, ggml_reshape_3d(ctx, v2, E * K, len, 1), E, K, len, 1);
+                }
+                ggml_tensor * c3 = ggml_cont(ctx, ggml_view_3d(ctx, head3, E * K, len, B, head3->nb[1], head3->nb[2], (size_t) beg * head3->nb[1]));
+                return ggml_reshape_4d(ctx, c3, E, K, len, B);
+            };
+            ggml_tensor * head0 = slice_rows(0, 1);
+            ggml_tensor * headr = slice_rows(1, n_pos - 1);
+            ggml_tensor * t0 = ggml_repeat_4d(ctx, ggml_mul_mat(ctx, head0, ref0), K, K, 1, B);
+            ggml_tensor * tr = ggml_mul_mat(ctx, headr, refr);
+            table = ggml_concat(ctx, t0, tr, 2);
+        }
+
+        ggml_tensor * row = ggml_concat(ctx,
+                ggml_cast(ctx, cand_run, GGML_TYPE_F32),
+                ggml_reshape_3d(ctx, table, K * K, n_pos, B), 0);
+        row = ggml_pad(ctx, row, E - K - K * K, 0, 0, 0);
+
+        ggml_tensor * packed = ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, 1, B), 0.0f);
+        packed = ggml_reshape_2d(ctx, ggml_concat(ctx, packed, row, 1), E, (n_pos + 1) * B);
+        return packed;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0xD591E001u ^ (uint32_t) (E + 31 * K + 131 * n_pos + 977 * B + (dedup ? 7 : 0)));
+        std::uniform_int_distribution<int32_t> id_dist(0, (int32_t) V - 1);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> ids((size_t) ggml_nelements(t));
+                for (auto & v : ids) {
+                    v = id_dist(rng);
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+static void add_dspine_fuse_cases(std::vector<std::unique_ptr<test_case>> & test_cases, bool perf) {
+    if (perf) {
+        test_cases.emplace_back(new test_dspine_write_epilogue(5120, 8, 1, false));
+        test_cases.emplace_back(new test_dspine_write_epilogue(5120, 8, 1, true));
+        test_cases.emplace_back(new test_dspine_refine_norm(5120, 16, 6, 1));
+        test_cases.emplace_back(new test_dspine_refine_norm(5120, 16, 7, 1));
+        test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 4096, 16, 7, 1, true));
+        test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 4096, 16, 7, 1, false));
+        return;
+    }
+    test_cases.emplace_back(new test_dspine_write_epilogue(5120, 8, 1, false));
+    test_cases.emplace_back(new test_dspine_write_epilogue(5120, 8, 1, true));
+    test_cases.emplace_back(new test_dspine_write_epilogue(5120, 8, 2, true));
+    test_cases.emplace_back(new test_dspine_write_epilogue(5120, 2, 1, false));
+    test_cases.emplace_back(new test_dspine_write_epilogue(512,  4, 2, false));
+
+    test_cases.emplace_back(new test_dspine_refine_norm(5120, 1,  1, 1));
+    test_cases.emplace_back(new test_dspine_refine_norm(5120, 16, 6, 1));
+    test_cases.emplace_back(new test_dspine_refine_norm(5120, 16, 7, 1));
+    test_cases.emplace_back(new test_dspine_refine_norm(5120, 16, 6, 2));
+    test_cases.emplace_back(new test_dspine_refine_norm(512,  4,  3, 2));
+
+    test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 512, 16, 7, 1, true));
+    test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 512, 16, 7, 2, true));
+    test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 512, 16, 1, 1, true));
+    test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 512, 16, 7, 1, false));
+    test_cases.emplace_back(new test_dspine_lattice_q6k_pack(5120, 512, 16, 7, 2, false));
+    test_cases.emplace_back(new test_dspine_lattice_q6k_pack(512,  128, 20, 3, 1, true));
+}
+
 
 // ####################################
 // ## Section 2: GGML Op Definitions ##
@@ -24872,6 +25081,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    add_dspine_fuse_cases(test_cases, false);
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -25553,6 +25764,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     add_mmf_split_k_cases(test_cases, true);
     add_kqrows_cases(test_cases, true);
     add_frows_cases(test_cases, true);
+    add_dspine_fuse_cases(test_cases, true);
 
     // [HCGP] Flash-Next hyper-connection mixer at a 4,096- and 12,288-token ubatch (GGML_CUDA_HC_GATE_PRE A/B)
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 4, 320, 4096));

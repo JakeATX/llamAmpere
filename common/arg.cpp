@@ -595,6 +595,15 @@ static void common_dflash_w78_default(const common_params & params) {
         common_set_env("GGML_SJKVARN_COMPACT_W78", "1");
         LOG_INF("draft-dflash: GGML_SJKVARN_COMPACT_W78=1 (verify widths 7/8 on the compact tile)\n");
     }
+    // DSpine W8: the spill-free 6-warp compact kernel (fattn-sjkvarn-w8.cu, qp in shared memory) takes verify widths 7/8
+    // at GQA 6 ahead of the W78 tile. Same scope as the W78 rule above (draft-dflash only); every other run keeps the cand kernels.
+    // An explicit GGML_SJKVARN_W8 wins (0 = off).
+    if ((params.speculative.draft.dflash || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) &&
+            common_get_env("GGML_SJKVARN_W8").empty()) {
+        common_set_env("GGML_SJKVARN_W8", "2");
+        LOG_INF("draft-dflash: GGML_SJKVARN_W8=2 (verify widths 7/8 on the W8 kernel)\n");
+    }
 }
 
 

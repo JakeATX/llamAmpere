@@ -136,6 +136,7 @@
 #include "ggml-cuda/moe-onegraph.cuh"
 #include "ggml-cuda/elastic-buf.cuh"
 #include "ggml-cuda/prefill-glue.cuh"
+#include "ggml-cuda/dspine-ops.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -14622,6 +14623,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return n_ink;
         }
     }
+    {
+        const int n_ds = ggml_cuda_try_fuse_dspine(cuda_ctx, cgraph, i);
+        if (n_ds > 0) {
+            return n_ds;
+        }
+    }
 
     ggml_tensor * node = cgraph->nodes[i];
     // [INKPREFILL] Inkling rel-bias mask chain (GET_ROWS .. CPY F16) as one kernel (inkmask.cu, GGML_CUDA_INK_MASK=0 off)
@@ -17139,6 +17146,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
     if (!disable_fusion) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const int n = ggml_cuda_try_fuse_dspine(nullptr, cgraph, i);
+            if (n > 0) {
+                add_alloc_deps(i, i + n);
+                i += n;
+            }
+        }
+    }
+
+    if (!disable_fusion) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
@@ -18868,6 +18885,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "nk_dense_tc_dense") == 0) {
         return ggml_cuda_nk_dense_tc_dense_count();
+    }
+    if (strcmp(name, "dspine_fuse") == 0) {
+        return ggml_cuda_dspine_fuse_count;
     }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
