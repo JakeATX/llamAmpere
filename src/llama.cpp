@@ -365,7 +365,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             static const char * const ink_defaults[][2] = {
                 { "LLAMA_NK_DEV_MASK", "1"    },  // device-side DSpark / SJ-KVaRN far masks
                 { "LLAMA_NK_KV_PAD",   "4096" },  // coarser deep-context n_kv padding step
-                { "GGML_CUDA_Q8TC",    "1"    },  // f16 tensor-core dense Q8_0 matvec for T = 4..8 (draft verify)
+                { "GGML_CUDA_Q8TC",    "2"    },  // tensor-core dense Q8_0 matvec for T = 4..8 (draft verify), hi/lo split activations (mode 1 = plain f16: faster, small KLD cost)
                 { "GGML_CUDA_INKGQA_FAR", "1" },  // grouped-query far-attention prefill kernel
                 { "GGML_CUDA_INKGQA_SWA", "1" },  // same kernel family for the sliding-window layers
                 { "LLAMA_INKFA_RELF",     "1" },  // relative-bias factor form (no [n_head, extent, T] table in the graph)
