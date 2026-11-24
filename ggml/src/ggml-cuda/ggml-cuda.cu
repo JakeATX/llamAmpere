@@ -79,6 +79,7 @@
 #include "ggml-cuda/nvfp4mt.cuh"
 #include "ggml-cuda/nk-nvfp4-tc.cuh"
 #include "ggml-cuda/nk-q8-moe-tc.cuh"
+#include "ggml-cuda/nk-mask-fill.cuh"
 #include "ggml-cuda/nvfp4pf.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
@@ -17728,6 +17729,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "nk_q8_0_tc") == 0) {
         return ggml_cuda_nk_q8_0_tc_count();
     }
+    if (strcmp(name, "nk_dev_mask") == 0) {
+        return ggml_cuda_nk_dev_mask_count();
+    }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
     }
@@ -18045,6 +18049,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_fill_prefix_mask") == 0) {
         return (void *) ggml_backend_cuda_fill_prefix_mask;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nk_fill_prefix_mask") == 0) {
+        return (void *) ggml_backend_cuda_nk_fill_prefix_mask;
     }
     if (strcmp(name, "ggml_backend_cuda_mtp_row_wait") == 0) {
         return (void *) ggml_backend_cuda_mtp_row_wait;
