@@ -164,6 +164,18 @@ static int32_t server_think_loop_close() {
     return v;
 }
 
+// thinking-loop guard for short periods: LLAMA_SERVER_THINK_LOOP_PERIOD=R closes an open think block once a span of
+// 2..16 tokens repeats back to back R times (and the repeated stretch is at least 128 tokens). Unset or 0 = off (default)
+constexpr int THINK_LOOP_PERIOD_MAX     = 16;
+constexpr int THINK_LOOP_PERIOD_MIN_RUN = 128;
+static int32_t server_think_loop_period() {
+    static const int32_t v = [] {
+        const char * e = getenv("LLAMA_SERVER_THINK_LOOP_PERIOD");
+        return e ? std::max(0, atoi(e)) : 0;
+    }();
+    return v;
+}
+
 // GPU verification of MTP/draft tokens (argmax or the full sampler chain on the backend, only token ids
 // downloaded) is opt-in, via LLAMA_MTP_GPU_VERIFY:
 //
@@ -991,6 +1003,17 @@ struct server_slot {
     // thinking-loop guard (LLAMA_SERVER_THINK_LOOP_CLOSE): run of one repeated token inside the think block
     llama_token think_run_tok = LLAMA_TOKEN_NULL;
     int32_t     think_run_n   = 0;
+    // period guard (LLAMA_SERVER_THINK_LOOP_PERIOD): last think tokens and, per period p, the run of tok[i] == tok[i-p]
+    std::array<llama_token, THINK_LOOP_PERIOD_MAX> think_hist = {};
+    std::array<int32_t, THINK_LOOP_PERIOD_MAX + 1> think_match = {};
+    int32_t think_hist_n = 0;
+
+    void think_loop_reset() {
+        think_run_tok = LLAMA_TOKEN_NULL;
+        think_run_n   = 0;
+        think_match.fill(0);
+        think_hist_n  = 0;
+    }
 
     std::string stopping_word;
 
@@ -1223,8 +1246,7 @@ struct server_slot {
         prompt_checkpoint_restored = false;
         stop           = STOP_TYPE_NONE;
         loop_guard     = {};
-        think_run_tok  = LLAMA_TOKEN_NULL;
-        think_run_n    = 0;
+        think_loop_reset();
         stopping_word  = "";
         n_sent_text    = 0;
 
@@ -4016,8 +4038,7 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.loop_guard = {};
-        slot.think_run_tok = LLAMA_TOKEN_NULL;
-        slot.think_run_n   = 0;
+        slot.think_loop_reset();
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
         slot.answer_reserve = -1;
         slot.think_tracker.reset(slot.smpl ? common_reasoning_tracker_init(model_tgt, task.params.sampling) : nullptr);
@@ -4108,32 +4129,58 @@ private:
         // inside an open think block close the block (the end tag is forced) so the answer still gets written,
         // instead of the loop burning the budget or the repeat stop ending the reply with no answer. While it is
         // on, the repeat stop above ignores a one-token run inside the think block and leaves it to this guard.
-        if (const int32_t think_loop_n = server_think_loop_close(); think_loop_n > 0 && slot.smpl) {
+        // LLAMA_SERVER_THINK_LOOP_PERIOD=R (unset or 0 = off) does the same for a span of 2..16 tokens repeated R times
+        // back to back (stretch >= max(R * period, 128) tokens); while it is on, the repeat stop leaves runs of those
+        // periods inside the think block to it.
+        const int32_t think_loop_n = server_think_loop_close();
+        const int32_t think_loop_r = server_think_loop_period();
+        if ((think_loop_n > 0 || think_loop_r > 0) && slot.smpl) {
             const bool in_think = common_sampler_reasoning_in_think(slot.smpl.get(), slot.think_tracker.get());
             if (!in_think) {
-                slot.think_run_tok = LLAMA_TOKEN_NULL;
-                slot.think_run_n   = 0;
+                slot.think_loop_reset();
             } else {
-                slot.think_run_n   = result.tok == slot.think_run_tok ? slot.think_run_n + 1 : 1;
-                slot.think_run_tok = result.tok;
-                if (looped && slot.loop_guard.period == 1) {
-                    looped = false;
+                bool    fire   = false;
+                int32_t period = 0;
+                if (think_loop_n > 0) {
+                    slot.think_run_n   = result.tok == slot.think_run_tok ? slot.think_run_n + 1 : 1;
+                    slot.think_run_tok = result.tok;
+                    if (looped && slot.loop_guard.period == 1) {
+                        looped = false;
+                    }
+                    if (slot.think_run_n >= think_loop_n) {
+                        fire = true; period = 1;
+                    }
+                }
+                if (think_loop_r > 0) {
+                    const int32_t n = slot.think_hist_n;
+                    for (int p = 2; p <= THINK_LOOP_PERIOD_MAX; ++p) {
+                        auto & m = slot.think_match[p];
+                        m = n >= p && result.tok == slot.think_hist[(n - p) % THINK_LOOP_PERIOD_MAX] ? m + 1 : 0;
+                        if (!fire && m + p >= std::max(think_loop_r * p, THINK_LOOP_PERIOD_MIN_RUN)) {
+                            fire = true; period = p;
+                        }
+                    }
+                    slot.think_hist[n % THINK_LOOP_PERIOD_MAX] = result.tok;
+                    slot.think_hist_n = n + 1 == 2 * THINK_LOOP_PERIOD_MAX * 1024 ? THINK_LOOP_PERIOD_MAX : n + 1;
+                    if (looped && slot.loop_guard.period >= 2 && slot.loop_guard.period <= THINK_LOOP_PERIOD_MAX) {
+                        looped = false;
+                    }
                 }
                 // only the last token of a group is not yet decoded, so the block is closed only there
-                if (last_in_group && slot.think_run_n >= think_loop_n) {
+                if (last_in_group && fire) {
                     llama_sampler * tracker = slot.think_tracker.release();
                     if (tracker && common_reasoning_budget_get_state(tracker) == REASONING_BUDGET_COUNTING) {
                         // the tracker moves into the chain: sampling continues on the CPU from here
                         llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
                     }
                     if (common_sampler_reasoning_close(slot.smpl.get(), &tracker)) {
-                        SLT_INF(slot, "think loop guard: token %d repeated %d times in the think block, closing it, n_gen = %d\n",
-                                result.tok, slot.think_run_n, (int) slot.stats.n_gen);
+                        SLT_INF(slot, "think loop guard: period %d loop (token %d) in the think block, closing it, n_gen = %d\n",
+                                period, result.tok, (int) slot.stats.n_gen);
                         slot.stats.think_loop_closed = true;
+                        slot.stats.think_loop_period = period;
                     }
                     slot.think_tracker.reset(tracker);
-                    slot.think_run_tok = LLAMA_TOKEN_NULL;
-                    slot.think_run_n   = 0;
+                    slot.think_loop_reset();
                 }
             }
         }
