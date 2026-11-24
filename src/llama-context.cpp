@@ -6362,7 +6362,16 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     if (ink_loan && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !ink_armed && (ink_refill || ink_loan_grown)) {
         // fork (CACHELOAN): the refill call and, while the cache holds the loan, decode and short single-sequence prompts
         // (up to the crossover) run at the small reserve; anything else first gives the loan back (boot size)
-        if (alone && (n_tokens <= ink_loan_rows || phase == LLAMA_DECODE_PHASE_GENERATION ||
+        // the switch to generation (set_decode_phase) comes without a batch: alone when at most one sequence has cells
+        bool loan_alone = alone;
+        if (!batch && phase == LLAMA_DECODE_PHASE_GENERATION && memory) {
+            int n_seq = 0;
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq_max(); ++s) {
+                n_seq += memory->seq_pos_max(s) >= 0 ? 1 : 0;
+            }
+            loan_alone = n_seq <= 1;
+        }
+        if (loan_alone && (n_tokens <= ink_loan_rows || phase == LLAMA_DECODE_PHASE_GENERATION ||
                     (ink_loan_grown && n_tokens <= loan_cross && phase != LLAMA_DECODE_PHASE_GENERATION))) {
             rows = ink_loan_rows;
             if (n_tokens > ink_loan_rows && phase != LLAMA_DECODE_PHASE_GENERATION) {
@@ -6372,7 +6381,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                         n_tokens, ink_loan_chunk_n, ink_loan_rows);
             }
         } else if (ink_loan_grown) {
-            ink_loan_shrink(alone ? "prompt above the crossover, streamer off" : "shared slots");
+            ink_loan_shrink(loan_alone ? "prompt above the crossover, streamer off" : "shared slots");
         }
     }
     if (ink_armed && n_tokens > 32) {
