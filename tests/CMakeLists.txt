@@ -173,6 +173,7 @@ llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-gdn-replay-lanes.cpp) # [TAG_GDN_REPLAY_LANES] joint vs split replay; needs a GDN model (-m)
 llama_build(test-fit-recurrent-noalloc.cpp)
 llama_build(test-output-buffer-reuse.cpp)
+llama_build(test-peer-experts.cpp LINK ggml) # GGML_PEER_EXPERTS transport; needs a CUDA device (same device twice is fine)
 
 llama_build_and_test(test-gdn-ingredient-replay.cpp LABEL "turbo")
 llama_build_and_test(test-kq-mask-pack.cpp)

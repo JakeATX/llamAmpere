@@ -57,6 +57,7 @@
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
+#include "ggml-cuda/peer-experts.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/pool1d.cuh"
 #include "ggml-cuda/quantize.cuh"
@@ -18108,6 +18109,25 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_mtp_row_wait") == 0) {
         return (void *) ggml_backend_cuda_mtp_row_wait;
+    }
+    // GGML_PEER_EXPERTS transport (peer-experts.cuh); inert unless a caller asks for it
+    if (strcmp(name, "ggml_backend_cuda_peer_mbox_new") == 0) {
+        return (void *) ggml_backend_cuda_peer_mbox_new;
+    }
+    if (strcmp(name, "ggml_backend_cuda_peer_mbox_free") == 0) {
+        return (void *) ggml_backend_cuda_peer_mbox_free;
+    }
+    if (strcmp(name, "ggml_backend_cuda_peer_post") == 0) {
+        return (void *) ggml_backend_cuda_peer_post;
+    }
+    if (strcmp(name, "ggml_backend_cuda_peer_wait") == 0) {
+        return (void *) ggml_backend_cuda_peer_wait;
+    }
+    if (strcmp(name, "ggml_backend_cuda_peer_status") == 0) {
+        return (void *) ggml_backend_cuda_peer_status;
+    }
+    if (strcmp(name, "ggml_backend_cuda_peer_abort") == 0) {
+        return (void *) ggml_backend_cuda_peer_abort;
     }
     if (strcmp(name, "ggml_backend_cuda_scratch_preflight") == 0) {
         return (void *) ggml_backend_cuda_scratch_preflight;
