@@ -233,6 +233,10 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_tensor * lse = ggml_flash_attn_ext_get_lse(dst);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const int n_kv = ggml_get_op_params_i32(dst, 6);
+    // [INKGQA] GGML_CUDA_INKGQA_FAR=1: the one-bit packed far mask of prompt ubatches is read natively by inkgqa.cu
+    // (GQA 3, T >= 64); without the flag such nodes keep the generic route as before
+    const bool mpk = mask && ggml_flash_attn_ext_mask_packed(mask) && ggml_cuda_inkgqa_far_enabled() && K->ne[2] >= 1 &&
+        Q->ne[2] == 6*K->ne[2] && Q->ne[1] >= 64 && mask->ne[0]*32 >= n_kv && mask->nb[1] % 4 == 0;
     if (!ampere_mma_available(cc) || dst->src[5] == nullptr || dst->src[6] == nullptr ||
             ggml_get_op_params_i32(dst, 5) != ((4 << 8) | 4) || ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16 ||
             ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0 || ggml_get_op_params_i32(dst, 4) != 0 ||
@@ -241,7 +245,8 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_TQ6_0) ||
             (V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_TQ6_0) ||
             Q->ne[2] % (2*K->ne[2]) != 0 || n_kv <= 0 || n_kv % 256 != 0 ||
-            !mask || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->ne[0] < n_kv || mask->ne[1] < Q->ne[1] ||
+            !mask || (mask->type != GGML_TYPE_F16 && !mpk) || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+            (!mpk && mask->ne[0] < n_kv) || mask->ne[1] < Q->ne[1] ||
             (snk && (snk->type != GGML_TYPE_F32 || snk->ne[0] != Q->ne[2])) ||
             dst->type != GGML_TYPE_F32 || dst->ne[0] != 256 || dst->ne[1] != Q->ne[2] || dst->ne[2] != Q->ne[1] || dst->nb[0] != sizeof(float) ||
             (lse && (lse->type != GGML_TYPE_F32 || !ggml_is_contiguous(lse) || lse->ne[0] != Q->ne[2] || lse->ne[1] != Q->ne[1])) ||
@@ -378,6 +383,7 @@ bool ggml_cuda_ink_sj_d128_try(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         }
         out.data = Ou; out.buffer = nullptr; out.view_src = nullptr; out.view_offs = 0;
         if (!ggml_cuda_inkgqa_fa_try(ctx, &out)) { // [INKGQA] GGML_CUDA_INKGQA_FAR=1: one K/V tile per 3 q heads
+            GGML_ASSERT(!mpk && "INKGQA declined a packed-mask D128 group");
             ggml_cuda_flash_attn_ext_mma_f16_case<128, 128, 64, 1>(ctx, &out);
         }
 
