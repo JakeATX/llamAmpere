@@ -14,8 +14,9 @@ static std::atomic<int64_t> g_nk_pf_mm_launches{0};
 
 bool ggml_cuda_nk_pf_mm_enabled() {
     static const bool en = []() {
+        // default ON (HOME ABBA 100K: prefill +10.2%, byte-exact); GGML_CUDA_NK_PF_MM=0 disables
         const char * e = getenv("GGML_CUDA_NK_PF_MM");
-        return e && atoi(e) != 0;
+        return !(e && *e && atoi(e) == 0);
     }();
     return en;
 }
