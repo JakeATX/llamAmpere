@@ -27506,7 +27506,7 @@ static int run_nk_pf_mm_check() {
     const bool do_perf = !(perf_env && atoi(perf_env) != 0);
     printf("nk_pf_mm: GGML_CUDA_NVFP4PF=%s GGML_CUDA_NK_PF_MM=%s\n",
         (pf_env && *pf_env) ? pf_env : "k64(default)",
-        (nk_env && *nk_env) ? nk_env : "0(default)");
+        (nk_env && *nk_env) ? nk_env : "1(default)");
 
     enum route_kind { ROUTE_UNIFORM = 0, ROUTE_SKEWED = 1, ROUTE_INVALID = 2, ROUTE_SPARSE = 3 };
     struct pf_case {
@@ -27696,7 +27696,7 @@ static int run_nk_pf_mm_check() {
         // 3. On first case, verify env-mode dispatch (-1) matches GGML_CUDA_NK_PF_MM
         bool ok_env = true;
         if (ci == 0) {
-            const bool expect_nk = nk_env && atoi(nk_env) != 0;
+            const bool expect_nk = !(nk_env && *nk_env && atoi(nk_env) == 0);
             const int64_t ce0 = count_fn(be, "nk_pf_mm");
             const bool ran_env = run_fn(be, src0, src1, ids, dst, s_exp, -1);
             ggml_backend_synchronize(be);
