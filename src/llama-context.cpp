@@ -1623,6 +1623,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
         }
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache->set_op_offload(cparams.op_offload); // read only by LLAMA_MOE_CACHE_FEWROW_CPU
         }
         // fork (INKSTREAM): prompt ubatches above 512 rows stream the host experts through two VRAM slots, funded by
         // lending the MoE cache. Boot (and the fit's dry run) still reserve 512 rows, so the fit and the cache size
@@ -6291,13 +6292,33 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     }();
     // The helper (MTP) shares the target compute buffer: its catch-up for the same call keeps writing-sized ubatches
     // too while the target is at writing size, so it fits the existing buffer instead of growing it outside the cache.
-    const bool small_prompt = decode_rows && small_rows && alone &&
+    // fork (SURGE-PROMPT, F1 for Inkling with resident experts, 24ink): LLAMA_INK_SMALL_PROMPT_ROWS=N (17..3072, unset or
+    // 0 = off). A single-sequence follow-up of decode_rows+1..N rows on an Inkling 2 context with no host experts (no MoE
+    // cache, no streamer) keeps the writing scratch and runs as decode_rows-row ubatches, instead of growing the scratch
+    // to 512+ rows (a full re-reserve of the prompt graph and compute buffer) and shrinking it again when the reply
+    // starts. Same kernels as a verify round of that width; batch-split rounding only.
+    static const uint32_t ink_small_rows = [] {
+        const char * text = getenv("LLAMA_INK_SMALL_PROMPT_ROWS");
+        const long value = text && text[0] ? strtol(text, nullptr, 10) : 0;
+        return value >= 17 && value <= 3072 ? (uint32_t) value : 0u;
+    }();
+    const bool ink_small_prompt = ink_small_rows && decode_rows && alone && !moe_cache && !ink_stream &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && phase != LLAMA_DECODE_PHASE_GENERATION &&
+            (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) &&
+            sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= ink_small_rows;
+    static bool ink_small_logged = false;
+    if (ink_small_prompt && !ink_small_logged) {
+        ink_small_logged = true;
+        LLAMA_LOG_WARN("%s: [INKSMALLPROMPT] follow-ups of %u..%u rows keep the %u-row writing scratch (LLAMA_INK_SMALL_PROMPT_ROWS)\n",
+                __func__, decode_rows + 1, ink_small_rows, decode_rows);
+    }
+    const bool small_prompt = ink_small_prompt || (decode_rows && small_rows && alone &&
             sched_reserve_tokens <= decode_rows && n_tokens > decode_rows && n_tokens <= small_rows &&
             ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
               (b1_cache_device_pending ? b1_pending_publish_enabled() && n_tokens <= pending_rows : b1_cache_device_active)) || // pending: decode() publishes
              (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && compute_peer && compute_peer->b1_cache_device_active &&
               !compute_peer->b1_cache_device_pending && compute_peer->sched_reserve_tokens <=
-                    std::max(decode_rows, compute_peer->ink_loan_grown ? compute_peer->ink_loan_rows : 0u)));
+                    std::max(decode_rows, compute_peer->ink_loan_grown ? compute_peer->ink_loan_rows : 0u))));
     static bool small_logged = false;
     if (!small_logged && decode_rows && small_rows && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
         small_logged = true;
