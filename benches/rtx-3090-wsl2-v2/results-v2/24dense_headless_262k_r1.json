@@ -1,0 +1,93 @@
+{
+  "preset": "24dense-headless",
+  "variant": "24dense_headless_262k",
+  "rep": 1,
+  "extra_args": "",
+  "ctx_actual": 262144,
+  "batch_params": "batch=4096 ubatch=2048",
+  "max_ctx_tokens": 256901,
+  "load_seconds": 70,
+  "probe_seconds": 1620,
+  "peak_vram_mib": 21673,
+  "ceiling_mib": 24076,
+  "headroom_mib": 2403,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "coding_16k",
+      "prompt_tokens": 16473,
+      "prompt_ms": 13057.5,
+      "pp_tok_s": 1261.58,
+      "gen_tokens": 512,
+      "gen_ms": 3347.4,
+      "tg_tok_s": 152.65,
+      "wall_s": 16.55
+    },
+    {
+      "task": "coding_64k",
+      "prompt_tokens": 65468,
+      "prompt_ms": 47124.1,
+      "pp_tok_s": 1389.27,
+      "gen_tokens": 512,
+      "gen_ms": 3704.3,
+      "tg_tok_s": 137.95,
+      "wall_s": 51.41
+    },
+    {
+      "task": "coding_128k",
+      "prompt_tokens": 130947,
+      "prompt_ms": 121017.5,
+      "pp_tok_s": 1082.05,
+      "gen_tokens": 512,
+      "gen_ms": 5276.1,
+      "tg_tok_s": 96.85,
+      "wall_s": 128.01
+    },
+    {
+      "task": "coding_160k",
+      "prompt_tokens": 163710,
+      "prompt_ms": 168274.1,
+      "pp_tok_s": 972.88,
+      "gen_tokens": 512,
+      "gen_ms": 5160.4,
+      "tg_tok_s": 99.02,
+      "wall_s": 175.88
+    },
+    {
+      "task": "coding_200k",
+      "prompt_tokens": 204596,
+      "prompt_ms": 240910.9,
+      "pp_tok_s": 849.26,
+      "gen_tokens": 512,
+      "gen_ms": 5660.1,
+      "tg_tok_s": 90.28,
+      "wall_s": 250.25
+    },
+    {
+      "task": "coding_250k",
+      "prompt_tokens": 255769,
+      "prompt_ms": 485565.3,
+      "pp_tok_s": 526.74,
+      "gen_tokens": 512,
+      "gen_ms": 6070.8,
+      "tg_tok_s": 84.17,
+      "wall_s": 499.46
+    },
+    {
+      "task": "max_ctx",
+      "prompt_tokens": 256469,
+      "prompt_ms": 486861.6,
+      "pp_tok_s": 526.78,
+      "gen_tokens": 64,
+      "gen_ms": 884.2,
+      "tg_tok_s": 71.25,
+      "wall_s": 494.3,
+      "max_ctx_request": 256901
+    }
+  ],
+  "max_ctx_pp": 526.78,
+  "max_ctx_tg": 71.25,
+  "max_ctx_prompt_tokens": 256469,
+  "pass": true
+}

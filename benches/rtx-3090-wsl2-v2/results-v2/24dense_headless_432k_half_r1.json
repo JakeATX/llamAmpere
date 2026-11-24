@@ -1,0 +1,88 @@
+{
+  "preset": "24dense-headless",
+  "variant": "24dense_headless_432k_half",
+  "rep": 1,
+  "extra_args": "-c 432538 --rope-scaling yarn --rope-scale 1.65 -b 2048 -ub 1024",
+  "ctx_actual": 432640,
+  "batch_params": "batch=2048 ubatch=1024",
+  "max_ctx_tokens": 423144,
+  "load_seconds": 73,
+  "probe_seconds": 7200,
+  "peak_vram_mib": 23953,
+  "ceiling_mib": 24076,
+  "headroom_mib": 123,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "coding_16k",
+      "pp_tok_s": 1349.94,
+      "tg_tok_s": 117.83,
+      "prompt_tokens": 16466
+    },
+    {
+      "task": "coding_64k",
+      "pp_tok_s": 1095.76,
+      "tg_tok_s": 107.06,
+      "prompt_tokens": 65484
+    },
+    {
+      "task": "coding_128k",
+      "pp_tok_s": 657.79,
+      "tg_tok_s": 98.18,
+      "prompt_tokens": 130963
+    },
+    {
+      "task": "coding_160k",
+      "pp_tok_s": 521.02,
+      "tg_tok_s": 94.59,
+      "prompt_tokens": 163725
+    },
+    {
+      "task": "coding_200k",
+      "pp_tok_s": 421.44,
+      "tg_tok_s": 92.27,
+      "prompt_tokens": 204637
+    },
+    {
+      "task": "coding_250k",
+      "pp_tok_s": 343.36,
+      "tg_tok_s": 77.68,
+      "prompt_tokens": 255752
+    },
+    {
+      "task": "coding_300k",
+      "pp_tok_s": 291.37,
+      "tg_tok_s": 69.01,
+      "prompt_tokens": 306770
+    },
+    {
+      "task": "coding_350k",
+      "pp_tok_s": 253.3,
+      "tg_tok_s": 81.73,
+      "prompt_tokens": 358146
+    },
+    {
+      "task": "coding_400k",
+      "pp_tok_s": 224.6,
+      "tg_tok_s": 64.53,
+      "prompt_tokens": 408996
+    },
+    {
+      "task": "max_ctx",
+      "prompt_tokens": 423144,
+      "prompt_ms": 1908973.9,
+      "pp_tok_s": 221.66,
+      "gen_tokens": 64,
+      "gen_ms": 1491.5,
+      "tg_tok_s": 42.24,
+      "wall_s": 1943.12,
+      "max_ctx_request": 423987
+    }
+  ],
+  "error": "Expecting value: line 1 column 1 (char 0)",
+  "note": "max_ctx row merged from a separate max-only run after the 7200 s probe cap; both phases pass at the 24076 MiB headless line.",
+  "pass": true,
+  "max_ctx_pp": 221.66,
+  "max_ctx_tg": 42.24
+}

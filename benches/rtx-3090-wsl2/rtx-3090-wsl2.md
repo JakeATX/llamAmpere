@@ -1,3 +1,5 @@
+> v0.7.2.1 re-check: `../rtx-3090-wsl2-v2/rtx-3090-wsl-v2.md` re-measures the same card and model with the current card preset (default microbatch, lowered where the default does not fit). Raw records are in `../rtx-3090-wsl2-v2/results-v2/`.
+
 ## System info
 
 ```bash

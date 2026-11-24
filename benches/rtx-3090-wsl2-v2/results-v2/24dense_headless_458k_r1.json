@@ -1,0 +1,12 @@
+{
+  "preset": "24dense-headless",
+  "variant": "24dense_headless_458k",
+  "rep": 1,
+  "extra_args": "-c 458752 --rope-scaling yarn --rope-scale 1.75 -b 4096 -ub 2048",
+  "load_seconds": 3,
+  "peak_vram_mib": 688,
+  "status": "failed_to_start",
+  "pass": false,
+  "error_tail": "0.01.048.911 W common_params_fit_impl: other programs already use 1151 MiB of CUDA0, at or over the preset margin of 500 MiB: the fit keeps no spare memory and the server may run out of memory while writing; close them or pass a smaller --ctx-size|0.02.702.101 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort|0.02.702.183 E srv    load_model: failed to load model, '/home/user/Strata-data/jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI4.gguf': card preset fit could not prove the memory margin; adjust -c/-ub or use -fit off|0.02.702.938 E srv  server_run_i: exiting due to model loading error|",
+  "results": []
+}

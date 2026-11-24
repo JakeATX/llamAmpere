@@ -1,0 +1,34 @@
+{
+  "preset": "24dense",
+  "variant": "24dense_458k_ub256",
+  "rep": 1,
+  "extra_args": "-c 458752 --rope-scaling yarn --rope-scale 1.75 -ub 256",
+  "ctx_actual": 458752,
+  "batch_params": "batch=4096 ubatch=256",
+  "max_ctx_tokens": 449576,
+  "load_seconds": 68,
+  "probe_seconds": 2142,
+  "peak_vram_mib": 24137,
+  "ceiling_mib": 23552,
+  "headroom_mib": -585,
+  "oom_lines": 0,
+  "status": "ok",
+  "results": [
+    {
+      "task": "max_ctx",
+      "prompt_tokens": 448336,
+      "prompt_ms": 2137453.4,
+      "pp_tok_s": 209.75,
+      "gen_tokens": 64,
+      "gen_ms": 1172.2,
+      "tg_tok_s": 53.75,
+      "wall_s": 2139.29,
+      "max_ctx_request": 449576
+    }
+  ],
+  "max_ctx_pp": 209.75,
+  "max_ctx_tg": 53.75,
+  "max_ctx_prompt_tokens": 448336,
+  "pass": false,
+  "fail_reasons": "peak=24137>23552"
+}
