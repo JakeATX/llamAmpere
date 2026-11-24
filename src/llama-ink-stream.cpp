@@ -663,6 +663,14 @@ bool llama_ink_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggm
             } else if ((!resident && x.slot == v.slot) || issued[x.slot] == nx) {
                 break;
             }
+            if (n_res > 0) {
+                // an upload still queuing (a resident layer issued from an earlier call of this visit) is not waited for
+                // here, which would hold this visit's graph; a later call issues the next one
+                std::lock_guard<std::mutex> lk(mtx);
+                if (done_gen != req_gen || n_busy != 0) {
+                    break;
+                }
+            }
             wait_issued();
             issue(nx, backend);
             break;
