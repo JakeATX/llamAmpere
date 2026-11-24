@@ -1437,12 +1437,20 @@ struct ggml_cuda_graph {
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
+        for (cudaGraphExec_t exec : chunk_tail) {
+            CUDA_CHECK(cudaGraphExecDestroy(exec));
+        }
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // [GLCHUNK] GGML_CUDA_GRAPH_CHUNK: with cuts, graph / instance hold the first chunk and chunk_tail the executables of the
+    // chunks after it, launched in order
+    std::vector<cudaGraphExec_t> chunk_tail;
+    int  chunk_state = 0;     // 0 not checked, 1 the last whole capture was one chain of nodes (cuts are safe), -1 it was not
+    bool chunk_tried = false; // a capture ran after the chain check passed (the one-time re-capture in chunks is done)
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;

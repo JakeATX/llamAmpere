@@ -6602,7 +6602,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
+static void ggml_cuda_graph_instantiate_exec(cudaGraphExec_t * instance, cudaGraph_t cuda_graph) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
     // fork MOEGAP: GGML_CUDA_GRAPH_NODE_PRIORITY=1 (default off) keeps the priority each kernel was captured
     // with. Without it a replayed graph runs every node at one priority, so the hit-first expert copies (captured
@@ -6613,8 +6613,7 @@ static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
         return v && std::strcmp(v, "1") == 0;
     }();
     if (node_prio || ggml_cuda_moe_table_prefetch_enabled()) {
-        CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph->instance, graph->graph,
-                                                 cudaGraphInstantiateFlagUseNodePriority));
+        CUDA_CHECK(cudaGraphInstantiateWithFlags(instance, cuda_graph, cudaGraphInstantiateFlagUseNodePriority));
         return;
     }
 #else
@@ -6622,7 +6621,11 @@ static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
         GGML_ABORT("GGML_MOE_TABLE_PREFETCH requires CUDA >= 11.7 for captured node priorities");
     }
 #endif
-    CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+    CUDA_CHECK(cudaGraphInstantiate(instance, cuda_graph, NULL, NULL, 0));
+}
+
+static void ggml_cuda_graph_instantiate_impl(ggml_cuda_graph * graph) {
+    ggml_cuda_graph_instantiate_exec(&graph->instance, graph->graph);
 }
 
 // [HOSTGAP08] GGML_CUDA_GRAPH_LOG=1 also logs the device memory each instantiate takes (cudaMemGetInfo before/after,
@@ -6672,6 +6675,174 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         ggml_cuda_graph_instantiate(graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
+    }
+}
+
+// [GLCHUNK] GGML_CUDA_GRAPH_CHUNK=N (default 0 = off): capture a graph as a series of executables of about N ggml nodes each,
+// launching each one as soon as its capture ends, and on replay launching them in order on the same stream. A graph launch
+// call costs host time per node (~0.8 us) and the GPU starts its first kernel only when the call returns, so a 5,000-node
+// multi-user decode graph leaves the GPU idle ~4 ms per step. With chunks the GPU starts after the first chunk and the rest
+// is enqueued while it runs. The kernels, their order and their stream are unchanged. GGML_CUDA_GRAPH_CHUNK_FIRST (default
+// N/4, at least 16) sizes the first chunk. Cuts are made only in a graph whose last whole capture was one chain of nodes (no
+// side-stream fork anywhere in it), only on the main stream, and never inside a concurrent or shared-expert side region.
+static int ggml_cuda_graph_chunk_nodes() {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return 0;
+#else
+    static const int n = [] { const char * e = getenv("GGML_CUDA_GRAPH_CHUNK"); return e ? std::max(0, atoi(e)) : 0; }();
+    return n;
+#endif
+}
+
+static int ggml_cuda_graph_chunk_first() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_CHUNK_FIRST");
+        return std::max(16, e ? atoi(e) : ggml_cuda_graph_chunk_nodes() / 4);
+    }();
+    return n;
+}
+
+// true when every node has at most one dependency and one dependent and the edges connect all nodes (a single chain)
+static bool ggml_cuda_graph_is_chain(cudaGraph_t cuda_graph) {
+    size_t n_nodes = 0, n_edges = 0;
+    if (cudaGraphGetNodes(cuda_graph, nullptr, &n_nodes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 13000
+    cudaError_t err = cudaGraphGetEdges(cuda_graph, nullptr, nullptr, nullptr, &n_edges);
+#else
+    cudaError_t err = cudaGraphGetEdges(cuda_graph, nullptr, nullptr, &n_edges);
+#endif
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (n_nodes <= 1) {
+        return n_edges == 0;
+    }
+    if (n_edges != n_nodes - 1) {
+        return false;
+    }
+    std::vector<cudaGraphNode_t> from(n_edges), to(n_edges);
+#if CUDART_VERSION >= 13000
+    err = cudaGraphGetEdges(cuda_graph, from.data(), to.data(), nullptr, &n_edges);
+#else
+    err = cudaGraphGetEdges(cuda_graph, from.data(), to.data(), &n_edges);
+#endif
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    std::unordered_map<cudaGraphNode_t, uint8_t> n_out, n_in;
+    n_out.reserve(n_edges);
+    n_in.reserve(n_edges);
+    for (size_t i = 0; i < n_edges; ++i) {
+        if (++n_out[from[i]] > 1 || ++n_in[to[i]] > 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A cut is safe when the capture so far is one chain of nodes whose last node is the capturing stream's only dependency:
+// no side stream holds work that is not joined back yet (ending the capture then would fail). 1 = safe, 0 = nothing captured
+// yet (try a later node), -1 = not a chain (stop cutting this graph).
+static int ggml_cuda_graph_capture_cut_ok(cudaStream_t stream) {
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaGraph_t cuda_graph = nullptr;
+    const cudaGraphNode_t * deps = nullptr;
+    size_t n_deps = 0;
+#if CUDART_VERSION >= 13000
+    cudaError_t err = cudaStreamGetCaptureInfo(stream, &st, nullptr, &cuda_graph, &deps, nullptr, &n_deps);
+#else
+    cudaError_t err = cudaStreamGetCaptureInfo(stream, &st, nullptr, &cuda_graph, &deps, &n_deps);
+#endif
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    if (st != cudaStreamCaptureStatusActive || cuda_graph == nullptr) {
+        return -1;
+    }
+    if (n_deps == 0) {
+        return 0;
+    }
+    if (n_deps != 1 || !ggml_cuda_graph_is_chain(cuda_graph)) {
+        return -1;
+    }
+    size_t n_out = 0;
+#if CUDART_VERSION >= 13000
+    err = cudaGraphNodeGetDependentNodes(deps[0], nullptr, nullptr, &n_out);
+#else
+    err = cudaGraphNodeGetDependentNodes(deps[0], nullptr, &n_out);
+#endif
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    return n_out == 0 ? 1 : -1;
+}
+
+// end the capture of chunk idx, create or update its executable and launch it; chunk 0 lives in graph->graph / instance
+static void ggml_cuda_graph_chunk_launch(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph, uint64_t graph_key, size_t idx) {
+    cudaGraph_t cuda_graph = nullptr;
+    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
+    if (!ggml_cuda_graph_is_chain(cuda_graph)) {
+        graph->chunk_state = -1;  // the next capture of this graph is whole again
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: a graph chunk is not a single chain of nodes; this graph is captured whole from now on\n", __func__);
+        }
+    }
+    if (idx == 0) {
+        if (graph->graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+        }
+        graph->graph = cuda_graph;
+        if (graph->instance == nullptr) {
+            ggml_cuda_graph_instantiate(graph);
+        } else {
+            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        return;
+    }
+    const size_t k = idx - 1;
+    GGML_ASSERT(k <= graph->chunk_tail.size());
+    if (k == graph->chunk_tail.size()) {
+        graph->chunk_tail.push_back(nullptr);
+        ggml_cuda_graph_instantiate_exec(&graph->chunk_tail[k], cuda_graph);
+    } else {
+#if CUDART_VERSION >= 12000
+        cudaGraphExecUpdateResultInfo result_info;
+        cudaError_t stat = cudaGraphExecUpdate(graph->chunk_tail[k], cuda_graph, &result_info);
+#else
+        cudaGraphNode_t errorNode;
+        cudaGraphExecUpdateResult result_info;
+        cudaError_t stat = cudaGraphExecUpdate(graph->chunk_tail[k], cuda_graph, &errorNode, &result_info);
+#endif // CUDART_VERSION >= 12000
+        if (stat == cudaErrorGraphExecUpdateFailure) {
+            (void) cudaGetLastError();
+            CUDA_CHECK(cudaGraphExecDestroy(graph->chunk_tail[k]));
+            graph->chunk_tail[k] = nullptr;
+            ggml_cuda_graph_instantiate_exec(&graph->chunk_tail[k], cuda_graph);
+        } else {
+            GGML_ASSERT(stat == cudaSuccess);
+        }
+    }
+    CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+    CUDA_CHECK(cudaGraphLaunch(graph->chunk_tail[k], cuda_ctx->stream()));
+}
+
+// keep the first n tail executables (a shorter or whole capture drops the rest)
+static void ggml_cuda_graph_chunk_trim(ggml_cuda_graph * graph, size_t n) {
+    for (size_t i = n; i < graph->chunk_tail.size(); ++i) {
+        CUDA_CHECK(cudaGraphExecDestroy(graph->chunk_tail[i]));
+    }
+    if (graph->chunk_tail.size() > n) {
+        graph->chunk_tail.resize(n);
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -16372,6 +16543,12 @@ static void ggml_cuda_launch_stats_add(int n_nodes, int64_t pre_us, int64_t laun
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
+#ifdef USE_CUDA_GRAPH
+    // [GLCHUNK] chunked capture state: chunk_next = node index of the next cut (INT_MAX = no cuts this capture)
+    ggml_cuda_graph * chunk_graph = use_cuda_graph && ggml_cuda_graph_chunk_nodes() > 0 ? cuda_ctx->cuda_graph(graph_key) : nullptr;
+    int    chunk_next  = INT_MAX;
+    size_t n_chunk_cut = 0;
+#endif
 
     // GGML_CUDA_INKGLUE_DUMP=<file> (diagnostic, off by default): write the node list (op, name, shape, sources) of the
     // first graph with >= 1,500 nodes and a 1-row ubatch (decode) to <file>, to map kernels to graph nodes.
@@ -16586,8 +16763,36 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_host_block_timer host_block;
 
             const bool pf_on = ggml_cuda_prefill_any_on();
+#ifdef USE_CUDA_GRAPH
+            // [GLCHUNK] cut this capture into chunks (see ggml_cuda_graph_chunk_launch)
+            if (use_cuda_graph && cuda_graph_update_required && chunk_graph != nullptr && chunk_graph->chunk_state == 1 &&
+                    shexp_runs.empty() && stream_ctx.concurrent_events.empty() && !should_launch_concurrent_events &&
+                    kv_stream_runtimes.empty() && cuda_ctx->curr_stream_no == 0) {
+                chunk_next = ggml_cuda_graph_chunk_first();
+            }
+#endif
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                if (i >= chunk_next && i + 32 <= cgraph->n_nodes && !is_concurrent_event_active && shexp_state == 0 &&
+                        cuda_ctx->curr_stream_no == 0) {
+                    const int cut = ggml_cuda_graph_capture_cut_ok(cuda_ctx->stream());
+                    if (cut < 0) {
+                        chunk_graph->chunk_state = -1;  // a side stream is open here: this graph stays whole from now on
+                        chunk_next = INT_MAX;
+                        static std::atomic<int> n_logged{0};
+                        if (n_logged.fetch_add(1) < 4) {
+                            GGML_LOG_INFO("%s: [GLCHUNK] graph %016llx: no safe cut at node %d (side-stream work open), "
+                                          "captured whole from the next capture on\n", __func__, (unsigned long long) graph_key, i);
+                        }
+                    } else if (cut > 0) {
+                        ggml_cuda_graph_chunk_launch(cuda_ctx, chunk_graph, graph_key, n_chunk_cut++);
+                        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                        chunk_next = chunk_graph->chunk_state == 1 ? i + ggml_cuda_graph_chunk_nodes() : INT_MAX;
+                    }
+                }
+#endif
                 if (op_times) {
                     op_times->mark(cuda_ctx->device, op_times_stream, i);
                 }
@@ -16856,12 +17061,39 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            if (graph->graph != nullptr) {
-                CUDA_CHECK(cudaGraphDestroy(graph->graph));
-                graph->graph = nullptr;
-            }
+            if (n_chunk_cut > 0) {
+                // [GLCHUNK] the last chunk: earlier chunks were launched at their cuts
+                ggml_cuda_graph_chunk_launch(cuda_ctx, graph, graph_key, n_chunk_cut);
+                ggml_cuda_graph_chunk_trim(graph, n_chunk_cut);
+                static std::atomic<int> n_logged{0};
+                if (n_logged.fetch_add(1) < 4) {
+                    GGML_LOG_INFO("%s: [GLCHUNK] graph %016llx (%d nodes) captured as %zu chunks\n", __func__,
+                                  (unsigned long long) graph_key, cgraph->n_nodes, n_chunk_cut + 1);
+                }
+            } else {
+                if (graph->graph != nullptr) {
+                    CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                    graph->graph = nullptr;
+                }
 
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+                CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+                if (chunk_graph != nullptr) {
+                    ggml_cuda_graph_chunk_trim(graph, 0);  // captured whole: no tail chunks
+                    if (graph->chunk_state == 0) {
+                        graph->chunk_state = ggml_cuda_graph_is_chain(graph->graph) ? 1 : -1;
+                        static std::atomic<int> n_logged{0};
+                        if (graph->chunk_state < 0 && n_logged.fetch_add(1) < 4) {
+                            GGML_LOG_INFO("%s: [GLCHUNK] graph %016llx (%d nodes) is not one chain of nodes (a side-stream fork): "
+                                          "captured whole\n", __func__, (unsigned long long) graph_key, cgraph->n_nodes);
+                        }
+                    } else if (graph->chunk_state == 1) {
+                        graph->chunk_tried = true;  // a capture after the check made no cut (no forced re-capture again)
+                    }
+                }
+            }
+            if (n_chunk_cut > 0) {
+                graph->chunk_tried = true;
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -16875,19 +17107,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            ggml_cuda_graph_instantiate(graph);
-        }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
-        }
-        // Launch graph
-        if (ggml_cuda_launch_stats_enabled()) {
-            const int64_t t_launch = ggml_time_us();
+        if (n_chunk_cut == 0) {  // [GLCHUNK] a chunked capture launched its chunks as they were captured
+            if (graph->instance == nullptr) { // Create executable graph from captured graph.
+                ggml_cuda_graph_instantiate(graph);
+            }
+            if (cuda_graph_update_required) { // Update graph executable
+                ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            }
+            // Launch graph (and, for a graph captured in chunks, the chunks after the first, in order)
+            const int64_t t_launch = ggml_cuda_launch_stats_enabled() ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
-            ggml_cuda_launch_stats_add(cgraph->n_nodes, t_launch - g_cuda_graph_compute_t_entry, ggml_time_us() - t_launch);
-        } else {
-            CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+            for (cudaGraphExec_t exec : graph->chunk_tail) {
+                CUDA_CHECK(cudaGraphLaunch(exec, cuda_ctx->stream()));
+            }
+            if (ggml_cuda_launch_stats_enabled()) {
+                ggml_cuda_launch_stats_add(cgraph->n_nodes, t_launch - g_cuda_graph_compute_t_entry, ggml_time_us() - t_launch);
+            }
         }
         if (!cuda_graph_update_required) {
             cuda_ctx->fusion_stats.cuda_graph_replays++;   // a launch with no host-side op code run this eval
@@ -17037,6 +17272,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     }
                 }
             }
+        }
+    }
+    // [GLCHUNK] a replayed graph that passed the chain check is captured once more, in chunks
+    if (use_cuda_graph && !cuda_graph_update_required && ggml_cuda_graph_chunk_nodes() > 0) {
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (graph->chunk_state == 1 && !graph->chunk_tried && graph->instance != nullptr &&
+                cgraph->n_nodes > ggml_cuda_graph_chunk_first() + 32) {
+            cuda_graph_update_required = true;
         }
     }
 #endif // USE_CUDA_GRAPH
