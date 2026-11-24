@@ -818,6 +818,11 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT LLAMA_USE_SYSTEM_GGML)
     llama_test(test-mmap-prefetch LABEL "main;cpu")
 endif()
 
+# fork (R4, NEXTPF): next-layer expert prefetch worker and bookkeeping, CPU only
+add_executable(test-moe-prefetch test-moe-prefetch.cpp ../src/llama-moe-prefetch.cpp)
+target_link_libraries(test-moe-prefetch PRIVATE ggml-base Threads::Threads)
+llama_test(test-moe-prefetch LABEL "main;cpu")
+
 if (UNIX AND NOT LLAMA_USE_SYSTEM_GGML)
     # safety: --load-mode dio reads through a plain bounce buffer and gives the same bytes as mmap
     add_executable(test-dio-bounce test-dio-bounce.cpp)
