@@ -1768,7 +1768,8 @@ struct ggml_backend_cuda_context {
         uint64_t      tick = 0;
     } ai_prep_cache;
 
-    // [PREFILL-GLUE] Opt-in (default OFF) persistent prefill quantized activation caches & BF16 narrowing tracker.
+    // [PREFILL-GLUE] opt-in (default off) quantized activations written by a fused GLU / RMS_NORM producer next to its
+    // f32 output (prefill-glue.cu). A consumer matmul takes one only on an exact match (tensor, data, shape, layout, epoch).
     enum prefill_act_kind {
         PREFILL_ACT_NONE    = 0,
         PREFILL_ACT_AI4     = 1,
@@ -1789,6 +1790,7 @@ struct ggml_backend_cuda_context {
         int                 param        = 0;
         size_t              aux_off      = 0;
         int                 rem_uses     = 0;
+        uint64_t            born         = 0;
         uint64_t            last_use     = 0;
         std::vector<retired_buf> retired;
     };
@@ -1796,37 +1798,6 @@ struct ggml_backend_cuda_context {
         prefill_act_entry entries[8];
         uint64_t          tick = 0;
     } prefill_act_cache;
-
-    struct {
-        bool                active       = false;
-        uint64_t            epoch        = 0;
-        const ggml_tensor * dst          = nullptr;
-        const ggml_tensor * g            = nullptr;
-        const ggml_tensor * u            = nullptr;
-        const void *        g_ptr        = nullptr;
-        const void *        u_ptr        = nullptr;
-        int                 glu_op       = 0;
-        float               glu_limit    = 0.0f;
-        float               oai_alpha    = 1.702f;
-        float               oai_limit    = 7.0f;
-        float               situ_params[10] = {};
-        int64_t             ne1          = 0;
-        int64_t             ne2          = 0;
-        int64_t             g_nb1        = 0;
-        int64_t             g_nb2        = 0;
-        int64_t             u_nb1        = 0;
-        int64_t             u_nb2        = 0;
-        bool                src_bf16     = false;
-    } prefill_glu_mmq_id;
-
-    struct prefill_bf16_entry {
-        const ggml_tensor * tensor       = nullptr;
-        const void *        data         = nullptr;
-        size_t              nbytes_f32   = 0;
-        uint64_t            epoch        = 0;
-    };
-    std::vector<prefill_bf16_entry> prefill_bf16_acts;
-    const ggml_tensor *             prefill_bf16_target = nullptr;
 
     // Per-expert address tables for the MoE weight indirection (see tq_build_expert_table). One
     // entry per expert tensor, built on first use and kept for the life of the context: a captured
@@ -1890,14 +1861,10 @@ struct ggml_backend_cuda_context {
         int64_t moe_bank_down_reduce = 0;   // routed sums written by the banked down launch
         int64_t mmq_route_skip = 0;         // prompt MUL_MAT_IDs that left out the hot-bank routes
         int64_t moe_onechain_fill = 0;      // AI+ bank products written into the regular prompt expert output
-        int64_t prefill_glu_actq = 0;       // [PREFILL-GLUE] fused SITU/GLU -> quantized INT8/Q8_1 runs
-        int64_t prefill_glu_actq_elided = 0;// ... of which omitted writing intermediate F32/BF16 buffer
-        int64_t prefill_norm_actq = 0;      // [PREFILL-GLUE] fused RMS_NORM(+ADD) -> cached INT8/Q8_1 runs
-        int64_t prefill_norm_actq_hits = 0; // ... downstream prefill matmuls hitting norm/glu cache
-        int64_t prefill_norm_actq_elided = 0;// ... norm runs that omitted writing F32 norm output
-        int64_t prefill_mix_actq = 0;       // [PREFILL-GLUE] depth_mix + norm -> prefill quantized acts
-        int64_t prefill_bf16_mlp = 0;       // [PREFILL-GLUE] gate_up/gate/up GEMMs emitting BF16
-        int64_t prefill_bf16_glu = 0;       // [PREFILL-GLUE] SITU/GLU reading or writing BF16 acts
+        int64_t prefill_glu_actq = 0;       // [PREFILL-GLUE] fused SITU / GLU runs that also wrote a quantized activation
+        int64_t prefill_norm_actq = 0;      // [PREFILL-GLUE] fused RMS_NORM(+ADD) runs that also wrote one
+        int64_t prefill_mix_actq = 0;       // [PREFILL-GLUE] depth mix + norm runs that also wrote one
+        int64_t prefill_actq_hits = 0;      // [PREFILL-GLUE] consumer matmuls that took a cached activation
     } fusion_stats;
     // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
     // address table is pointed at a slot instead of at the expert's home address once it is copied.

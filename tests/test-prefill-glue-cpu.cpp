@@ -1,4 +1,4 @@
-// Pure-CPU numerical correctness & error-bound verification for Prefill Glue Fusion & BF16 Narrowing.
+// Pure-CPU bit-exactness checks for the prefill glue fusion math (GLU / RMS_NORM -> quantized activation).
 // Strictly CPU-only: NO CUDA runtime, NO device allocation, NO GPU interaction.
 
 #include "prefill-glue-math.h"
@@ -328,59 +328,6 @@ static bool test_norm_bit_exact(std::mt19937 & rng, int rows, int K, bool with_a
     return diffs == 0;
 }
 
-static bool test_bf16_narrowing_outliers(std::mt19937 & rng, int rows, int K) {
-    std::normal_distribution<float> dist(0.0f, 1.0f);
-    std::vector<float> g((size_t) rows * K), u((size_t) rows * K);
-    for (size_t i = 0; i < g.size(); ++i) {
-        float m = 1.0f;
-        if (i % 100 == 0)  m = 100.0f;   // Outl100x
-        if (i % 2000 == 1) m = 5000.0f;  // Extreme stress beyond FP16 65504 after product -> safe in BF16 (max 3.39e38)!
-        g[i] = dist(rng) * m;
-        u[i] = dist(rng) * m;
-    }
-
-    double err_sq_bf16_only = 0.0, err_sq_fused_p1p3 = 0.0, norm_sq = 0.0;
-    double max_rel = 0.0;
-    size_t bad_vals = 0;
-
-    std::vector<float> ref_row(K), p3_row(K), p1p3_row(K);
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < K; ++c) {
-            const float gf = g[(size_t) r * K + c];
-            const float uf = u[(size_t) r * K + c];
-            const float ref = pf_silu_f32(gf) * uf;
-            // BF16 gate_up inputs (Pillar #3)
-            const float gb = pf_bf16_bits_to_f32(pf_f32_to_bf16_bits(gf));
-            const float ub = pf_bf16_bits_to_f32(pf_f32_to_bf16_bits(uf));
-            const float glu_fp32_out = pf_silu_f32(gb) * ub;                 // Pillar #1 + #3 (in-reg SwiGLU from BF16 -> INT8)
-            const float glu_bf16_out = pf_bf16_bits_to_f32(pf_f32_to_bf16_bits(glu_fp32_out)); // Pillar #3 alone (also BF16 output)
-            if (!std::isfinite(glu_bf16_out) || !std::isfinite(glu_fp32_out)) bad_vals++;
-
-            ref_row[c]  = ref;
-            p1p3_row[c] = glu_fp32_out;
-            p3_row[c]   = glu_bf16_out;
-
-            const double d3   = (double) glu_bf16_out - (double) ref;
-            const double d13  = (double) glu_fp32_out - (double) ref;
-            err_sq_bf16_only  += d3 * d3;
-            err_sq_fused_p1p3 += d13 * d13;
-            norm_sq           += (double) ref * (double) ref;
-            if (std::fabs(ref) > 1e-3f) {
-                max_rel = std::max(max_rel, std::fabs(d3) / std::fabs((double) ref));
-            }
-        }
-    }
-    const double rel_l2_p3   = std::sqrt(err_sq_bf16_only / std::max(norm_sq, 1e-30));
-    const double rel_l2_p1p3 = std::sqrt(err_sq_fused_p1p3 / std::max(norm_sq, 1e-30));
-
-    // Verify BF16 representation theoretical bound: < 0.005 (7-bit BF16 mantissa worst-case ULP = 2^-7 = 0.0078125; combined inputs ~ 0.004 rel L2)
-    // Plus 0 NaN/Inf even on Outl100x / 5000x stress!
-    const bool pass = (bad_vals == 0 && rel_l2_p3 < 0.005 && rel_l2_p1p3 < 0.004 && max_rel < 0.025);
-    std::printf("[MEASURED CPU] BF16 Outl100x+5000x Stress rows=%-3d K=%-5d: nan_inf=%zu relL2(#3)=%.6f relL2(#1+#3)=%.6f maxRel=%.6f -> %s\n",
-                rows, K, bad_vals, rel_l2_p3, rel_l2_p1p3, max_rel, pass ? "PASS" : "FAIL");
-    return pass;
-}
-
 } // namespace
 
 int main() {
@@ -390,11 +337,10 @@ int main() {
     // 1. Default-OFF safety checks when env switches are unset/0
     const char * e1 = std::getenv("GGML_CUDA_PREFILL_FUSE_GLU_ACTQ");
     const char * e2 = std::getenv("GGML_CUDA_PREFILL_FUSE_NORM_ACTQ");
-    const char * e3 = std::getenv("GGML_CUDA_PREFILL_BF16_ACT");
-    std::printf("[MEASURED CPU] Env kill-switch default check: GLU=%s NORM=%s BF16=%s\n",
-                e1 ? e1 : "(unset->0)", e2 ? e2 : "(unset->0)", e3 ? e3 : "(unset->0)");
+    std::printf("[MEASURED CPU] Env kill-switch default check: GLU=%s NORM=%s\n",
+                e1 ? e1 : "(unset->0)", e2 ? e2 : "(unset->0)");
 
-    // 2. Pillar #1 exactness across Inkling2 (1152, 2304, 18432) and dense (8192, 28672) shapes + Outl100x
+    // 2. GLU exactness across Inkling2 (1152, 2304, 18432) and dense (8192, 28672) shapes + Outl100x
     ok &= test_glu_bit_exact(rng, 16, 1152,  PF_GLU_SITU,   "SITU   Inkling down",  false);
     ok &= test_glu_bit_exact(rng, 16, 1152,  PF_GLU_SITU,   "SITU   Inkling Outl",  true);
     ok &= test_glu_bit_exact(rng, 8,  2304,  PF_GLU_SITU,   "SITU   Inkling 2304",  true);
@@ -403,15 +349,11 @@ int main() {
     ok &= test_glu_bit_exact(rng, 4,  28672, PF_GLU_SWIGLU, "SwiGLU Dense 28672",   true);
     ok &= test_glu_bit_exact(rng, 4,  8192,  PF_GLU_GEGLU,  "GeGLU  Dense 8192",    true);
 
-    // 3. Pillar #2 exactness across RMSNorm (+ ADD)
+    // 3. Norm exactness across RMSNorm (+ ADD)
     ok &= test_norm_bit_exact(rng, 16, 2304, false, true);
     ok &= test_norm_bit_exact(rng, 16, 2304, true,  true);
     ok &= test_norm_bit_exact(rng, 8,  8192, false, true);
     ok &= test_norm_bit_exact(rng, 8,  8192, true,  true);
-
-    // 4. Pillar #3 BF16 narrowing Outl100x + 5000x stress (zero overflow, tight L2 bound)
-    ok &= test_bf16_narrowing_outliers(rng, 16, 1152);
-    ok &= test_bf16_narrowing_outliers(rng, 4,  28672);
 
     std::printf("\nALL CPU CHECKS: %s\n", ok ? "PASSED" : "FAILED");
     return ok ? 0 : 1;

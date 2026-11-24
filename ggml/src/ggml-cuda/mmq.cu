@@ -277,10 +277,7 @@ static int64_t ggml_cuda_mmq_ncols_opt(const ggml_tensor * src0, const ggml_tens
 static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst, bool convrot, ggml_tensor * paired_dst,
-        const ggml_cuda_mm_fusion_args_host * fusion, bool dst_bf16 = false, bool * out_wrote_bf16 = nullptr) {
-    if (out_wrote_bf16) {
-        *out_wrote_bf16 = false;
-    }
+        const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -428,16 +425,14 @@ static void ggml_cuda_mul_mat_q_impl(
             ne03, ne13, s03, s13, s3,
             ntj, J_best, fusion_device};
         args.ncols_max = ne1;
-        const bool can_bf16 = dst_bf16 && !paired_src0 && !gate;
-        args.dst_bf16 = can_bf16;
-        args.out_wrote_bf16 = can_bf16 ? out_wrote_bf16 : nullptr;
         // fork: prefill can consume a swizzled producer buffer without quantizing it again.
         // fork: a paired product (paired_src0) reads the same q8_1 buffer in the default layout, so it keeps the default path.
         const bool use_mmq_prefill = !convrot && !use_native_fp4 && !paired_src0 && !gate && ggml_cuda_should_use_mmq_prefill(args);
         const char * prequantized = use_mmq_prefill ? ggml_cuda_mmq_prefill_q8_lookup(ctx, src1, dst, ne10_padded) : nullptr;
+        // [PREFILL-GLUE] an opt-in fused GLU / RMS_NORM producer wrote this exact q8_1 layout (same bytes as quantize_mmq_q8_1_cuda)
         if (prequantized == nullptr && !convrot && !use_native_fp4 && !paired_src0 && !gate && ne12 == 1 && ne13 == 1) {
-            const int dsl = (int) mmq_get_q8_1_ds_layout(src0->type);
-            ggml_cuda_prefill_mmq_take(ctx, src1, ne11, ne10, ne10_padded, dsl, use_mmq_prefill, prequantized);
+            ggml_cuda_prefill_mmq_take(ctx, src1, ne11, ne10, ne10_padded, (int) mmq_get_q8_1_ds_layout(src0->type),
+                                       use_mmq_prefill, prequantized);
         }
         if (prequantized == nullptr) {
             src1_q8_1.alloc(nbytes_src1_q8_1);
@@ -454,7 +449,6 @@ static void ggml_cuda_mul_mat_q_impl(
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
-            const bool src_bf16 = !convrot && !use_native_fp4 && ggml_cuda_prefill_bf16_is_active(ctx, src1);
             if (convrot) {
                 ggml_cuda_convrot_quantize_mmq_q8_1(
                     src1_d, src1_q8_1.get(), ne10, s11, s12, s13,
@@ -466,10 +460,6 @@ static void ggml_cuda_mul_mat_q_impl(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
-            } else if (src_bf16) {
-                ggml_cuda_prefill_bf16_to_mmq(
-                    (const nv_bfloat16 *) src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
-                    ne10_padded, ne11, ne12, ne13, false, 0, use_mmq_prefill, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream, use_mmq_prefill);
@@ -478,9 +468,6 @@ static void ggml_cuda_mul_mat_q_impl(
         }
 
         if (use_mmq_prefill) {
-            if (args.out_wrote_bf16) {
-                *args.out_wrote_bf16 = args.dst_bf16;
-            }
             ggml_cuda_mul_mat_q_prefill(args, stream);
             ctx.fusion_stats.mmq_prefill++;
         } else {
@@ -575,12 +562,6 @@ static void ggml_cuda_mul_mat_q_impl(
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
-        } else if (!dedup_bcast && ggml_cuda_prefill_glu_mmq_id_take(ctx, src1, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream)) {
-            // [PREFILL-GLUE] GLU/SITU quantized directly in compact MoE sorted order using ids_src1
-        } else if (ggml_cuda_prefill_bf16_is_active(ctx, src1)) {
-            ggml_cuda_prefill_bf16_to_mmq((const nv_bfloat16 *) src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
-                dedup_bcast ? s12 : s11, s12, s13, ne10_padded, dedup_bcast ? ne12 : ne11_flat, ne12_flat, ne13_flat,
-                dedup_bcast, n_expert_used, false, stream);
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
@@ -610,24 +591,21 @@ static void ggml_cuda_mul_mat_q_impl(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     // With tiles_v063 nchannels_y stays 1: the expert index is part of the linear tile index (e*ntx + jt).
-    mmq_args args = {
+    const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), tiles_v063 ? tile_spec_v063.get() : tile_spec.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02,    1, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         tiles_v063 ? ne02*ntx_v063 : ntj, J_best, fusion_device, /*ncols_max =*/ ne12, /*tiles_v063 =*/ tiles_v063};
-    const bool can_bf16 = dst_bf16 && !paired_src0 && !gate;
-    args.dst_bf16 = can_bf16;
-    args.out_wrote_bf16 = can_bf16 ? out_wrote_bf16 : nullptr;
 
     launch_products(args);
 }
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion, bool dst_bf16, bool * out_wrote_bf16) {
-    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, false, nullptr, fusion, dst_bf16, out_wrote_bf16);
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, false, nullptr, fusion);
 }
 
 void ggml_cuda_mul_mat_q(

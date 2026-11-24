@@ -1,5 +1,5 @@
-// Real-data, L2-flushed SM 8.6 CUDA benchmark + GPU numerical correctness gate for Prefill Glue & BF16 Narrowing.
-// Strictly compiled on CPU host and executed by Opus on RTX 3090 (NEVER run on busy dev host).
+// L2-flushed SM 8.6 benchmark + GPU bit-exactness gate for the prefill glue kernels (fused GLU / RMS_NORM -> f32 output
+// + quantized activation). Needs a free GPU; not part of ctest.
 
 #include "ggml.h"
 #include "ggml-cuda.h"
@@ -73,23 +73,6 @@ static __global__ void k_ref_rmsnorm_mul(const float * x, const float * w, float
     }
 }
 
-static __global__ void k_ref_to_bf16(const float * src, nv_bfloat16 * dst, size_t n) {
-    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2bfloat16(src[i]);
-}
-
-static __global__ void k_ref_glu_bf16(int glu_kind, const nv_bfloat16 * g, const nv_bfloat16 * u,
-        nv_bfloat16 * out, int K, int64_t rows, ink_situ_params p) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= K) return;
-    for (int64_t r = blockIdx.y; r < rows; r += gridDim.y) {
-        const float gf = __bfloat162float(g[r * K + c]);
-        const float uf = __bfloat162float(u[r * K + c]);
-        const float v  = (glu_kind == PF_GLU_SITU) ? ink_situ_elem(gf, uf, p) : (ggml_cuda_op_silu_single(gf) * uf);
-        out[r * K + c] = __float2bfloat16(v);
-    }
-}
-
 template <typename FN>
 static float measure_median_us(FN && fn, uint4 * d_flush, size_t flush_vecs, int warmup = 5, int iters = 25) {
     for (int i = 0; i < warmup; ++i) fn();
@@ -124,6 +107,13 @@ static void fill_realistic(std::vector<float> & buf, std::mt19937 & rng, bool ou
     }
 }
 
+static bool same_f32(const float * d_a, const float * d_b, size_t n) {
+    std::vector<float> a(n), b(n);
+    CUDA_CK(cudaMemcpy(a.data(), d_a, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CK(cudaMemcpy(b.data(), d_b, n * sizeof(float), cudaMemcpyDeviceToHost));
+    return std::memcmp(a.data(), b.data(), n * sizeof(float)) == 0;
+}
+
 static bool run_gpu_correctness_checks(std::mt19937 & rng) {
     bool ok = true;
     const ink_situ_params situ = { 0.85f, 0.05f, 1.1f, -0.02f, 0.75f, 0.01f, 0.9f, 0.1f, 1, 1 };
@@ -133,13 +123,14 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         fill_realistic(hg, rng, true);
         fill_realistic(hu, rng, true);
 
-        float * dg = nullptr, * du = nullptr, * df32 = nullptr, * d_ref_s = nullptr, * d_fus_s = nullptr;
+        float * dg = nullptr, * du = nullptr, * df32 = nullptr, * dfus = nullptr, * d_ref_s = nullptr, * d_fus_s = nullptr;
         int8_t * d_ref_q = nullptr, * d_fus_q = nullptr;
         const int xsh = (K % 256 == 0) ? 1 : 0;
         const int ns  = K >> (7 + xsh);
         CUDA_CK(cudaMalloc(&dg, hg.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&du, hu.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&df32, hg.size() * sizeof(float)));
+        CUDA_CK(cudaMalloc(&dfus, hg.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&d_ref_q, hg.size()));
         CUDA_CK(cudaMalloc(&d_fus_q, hg.size()));
         CUDA_CK(cudaMalloc(&d_ref_s, (size_t) rows * ns * sizeof(float)));
@@ -155,10 +146,10 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         else     ai4k::launch_quantize_act128<false, false, false>(df32, K, d_ref_q, d_ref_s, K, rows, 0);
 
         ggml_cuda_prefill_launch_glu_ai4(
-            glu_kind, dg, du, nullptr, d_fus_q, d_fus_s, K, rows, rows,
+            glu_kind, dg, du, dfus, d_fus_q, d_fus_s, K, rows, rows,
             (int64_t) K * sizeof(float), (int64_t) rows * K * sizeof(float),
             (int64_t) K * sizeof(float), (int64_t) rows * K * sizeof(float),
-            false, 0, xsh, 0, situ, 7.0f, 1.702f, 7.0f, 0);
+            xsh, 0, situ, 7.0f, 1.702f, 7.0f, 0);
         CUDA_CK(cudaDeviceSynchronize());
 
         std::vector<int8_t> hq0(hg.size()), hq1(hg.size());
@@ -169,11 +160,12 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         CUDA_CK(cudaMemcpy(hs1.data(), d_fus_s, hs1.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
         const bool eq = (std::memcmp(hq0.data(), hq1.data(), hq0.size()) == 0) &&
-                        (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0);
-        std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> AI4 %s (0-ULP)\n", tag, rows, K, eq ? "PASS" : "FAIL");
+                        (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0) &&
+                        same_f32(df32, dfus, hg.size());
+        std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> f32 + AI4 %s (0-ULP)\n", tag, rows, K, eq ? "PASS" : "FAIL");
         ok &= eq;
 
-        CUDA_CK(cudaFree(dg)); CUDA_CK(cudaFree(du)); CUDA_CK(cudaFree(df32));
+        CUDA_CK(cudaFree(dg)); CUDA_CK(cudaFree(du)); CUDA_CK(cudaFree(df32)); CUDA_CK(cudaFree(dfus));
         CUDA_CK(cudaFree(d_ref_q)); CUDA_CK(cudaFree(d_fus_q));
         CUDA_CK(cudaFree(d_ref_s)); CUDA_CK(cudaFree(d_fus_s));
     };
@@ -183,13 +175,14 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         fill_realistic(hx, rng, true);
         fill_realistic(hw, rng, false);
 
-        float * dx = nullptr, * dw = nullptr, * df32 = nullptr, * d_ref_s = nullptr, * d_fus_s = nullptr;
+        float * dx = nullptr, * dw = nullptr, * df32 = nullptr, * dfus = nullptr, * d_ref_s = nullptr, * d_fus_s = nullptr;
         int8_t * d_ref_q = nullptr, * d_fus_q = nullptr;
         const int xsh = (K % 256 == 0) ? 1 : 0;
         const int ns  = K >> (7 + xsh);
         CUDA_CK(cudaMalloc(&dx, hx.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&dw, hw.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&df32, hx.size() * sizeof(float)));
+        CUDA_CK(cudaMalloc(&dfus, hx.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&d_ref_q, hx.size()));
         CUDA_CK(cudaMalloc(&d_fus_q, hx.size()));
         CUDA_CK(cudaMalloc(&d_ref_s, (size_t) rows * ns * sizeof(float)));
@@ -203,9 +196,7 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         if (xsh) rq4::launch_quantize_act<false, false, false>(df32, K, d_ref_q, d_ref_s, K, rows, 0);
         else     ai4k::launch_quantize_act128<false, false, false>(df32, K, d_ref_q, d_ref_s, K, rows, 0);
 
-        ggml_cuda_prefill_launch_norm_ai4(
-            dx, nullptr, nullptr, dw, 1, nullptr, d_fus_q, d_fus_s,
-            rows, K, K, 0, 1e-6f, false, xsh, 0, 0);
+        ggml_cuda_prefill_launch_norm_ai4(dx, nullptr, nullptr, dw, dfus, d_fus_q, d_fus_s, rows, K, 1e-6f, xsh, 0, 0);
         CUDA_CK(cudaDeviceSynchronize());
 
         std::vector<int8_t> hq0(hx.size()), hq1(hx.size());
@@ -216,11 +207,12 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         CUDA_CK(cudaMemcpy(hs1.data(), d_fus_s, hs1.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
         const bool eq = (std::memcmp(hq0.data(), hq1.data(), hq0.size()) == 0) &&
-                        (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0);
-        std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> AI4 %s (0-ULP)\n", tag, rows, K, eq ? "PASS" : "FAIL");
+                        (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0) &&
+                        same_f32(df32, dfus, hx.size());
+        std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> f32 + AI4 %s (0-ULP)\n", tag, rows, K, eq ? "PASS" : "FAIL");
         ok &= eq;
 
-        CUDA_CK(cudaFree(dx)); CUDA_CK(cudaFree(dw)); CUDA_CK(cudaFree(df32));
+        CUDA_CK(cudaFree(dx)); CUDA_CK(cudaFree(dw)); CUDA_CK(cudaFree(df32)); CUDA_CK(cudaFree(dfus));
         CUDA_CK(cudaFree(d_ref_q)); CUDA_CK(cudaFree(d_fus_q));
         CUDA_CK(cudaFree(d_ref_s)); CUDA_CK(cudaFree(d_fus_s));
     };
@@ -235,11 +227,12 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         std::vector<float> hg((size_t) rows * K), hu((size_t) rows * K);
         fill_realistic(hg, rng, true);
         fill_realistic(hu, rng, true);
-        float * dg = nullptr, * du = nullptr, * df32 = nullptr, * d_ref_s = nullptr, * d_fus_s = nullptr;
+        float * dg = nullptr, * du = nullptr, * df32 = nullptr, * dfus = nullptr, * d_ref_s = nullptr, * d_fus_s = nullptr;
         int8_t * d_ref_q = nullptr, * d_fus_q = nullptr;
         CUDA_CK(cudaMalloc(&dg, hg.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&du, hu.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&df32, hg.size() * sizeof(float)));
+        CUDA_CK(cudaMalloc(&dfus, hg.size() * sizeof(float)));
         CUDA_CK(cudaMalloc(&d_ref_q, hg.size()));
         CUDA_CK(cudaMalloc(&d_fus_q, hg.size()));
         CUDA_CK(cudaMalloc(&d_ref_s, (size_t) rows * (K / kf) * sizeof(float)));
@@ -252,10 +245,10 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         const dim3 gq((unsigned) ((K / kf + 3) / 4), (unsigned) rows);
         k_nvfp4pf_xq<64><<<gq, 128>>>(df32, K, d_ref_q, d_ref_s, K, rows);
         ggml_cuda_prefill_launch_glu_nvfp4pf(
-            PF_GLU_SITU, dg, du, nullptr, d_fus_q, d_fus_s, K, rows, rows,
+            PF_GLU_SITU, dg, du, dfus, d_fus_q, d_fus_s, K, rows, rows,
             (int64_t) K * sizeof(float), (int64_t) rows * K * sizeof(float),
             (int64_t) K * sizeof(float), (int64_t) rows * K * sizeof(float),
-            false, 0, kf, situ, 7.0f, 1.702f, 7.0f, 0);
+            kf, situ, 7.0f, 1.702f, 7.0f, 0);
         CUDA_CK(cudaDeviceSynchronize());
 
         std::vector<int8_t> hq0(hg.size()), hq1(hg.size());
@@ -265,10 +258,11 @@ static bool run_gpu_correctness_checks(std::mt19937 & rng) {
         CUDA_CK(cudaMemcpy(hs0.data(), d_ref_s, hs0.size() * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CK(cudaMemcpy(hs1.data(), d_fus_s, hs1.size() * sizeof(float), cudaMemcpyDeviceToHost));
         const bool eq = (std::memcmp(hq0.data(), hq1.data(), hq0.size()) == 0) &&
-                        (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0);
-        std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> NVFP4PF %s (0-ULP)\n", "SITU Inkling NVFP4PF", rows, K, eq ? "PASS" : "FAIL");
+                        (std::memcmp(hs0.data(), hs1.data(), hs0.size() * sizeof(float)) == 0) &&
+                        same_f32(df32, dfus, hg.size());
+        std::printf("[GPU GATE] %-24s rows=%-4d K=%-5d -> f32 + NVFP4PF %s (0-ULP)\n", "SITU Inkling NVFP4PF", rows, K, eq ? "PASS" : "FAIL");
         ok &= eq;
-        CUDA_CK(cudaFree(dg)); CUDA_CK(cudaFree(du)); CUDA_CK(cudaFree(df32));
+        CUDA_CK(cudaFree(dg)); CUDA_CK(cudaFree(du)); CUDA_CK(cudaFree(df32)); CUDA_CK(cudaFree(dfus));
         CUDA_CK(cudaFree(d_ref_q)); CUDA_CK(cudaFree(d_fus_q));
         CUDA_CK(cudaFree(d_ref_s)); CUDA_CK(cudaFree(d_fus_s));
     }
@@ -286,7 +280,6 @@ static void bench_mlp_glue(std::mt19937 & rng, uint4 * d_flush, size_t flush_vec
     fill_realistic(hu, rng, true);
 
     float * dg = nullptr, * du = nullptr, * df32 = nullptr, * d_s = nullptr;
-    nv_bfloat16 * dg16 = nullptr, * du16 = nullptr, * df16 = nullptr;
     int8_t * d_q = nullptr;
     const int xsh = (K % 256 == 0) ? 1 : 0;
     const int ns  = K >> (7 + xsh);
@@ -295,17 +288,10 @@ static void bench_mlp_glue(std::mt19937 & rng, uint4 * d_flush, size_t flush_vec
     CUDA_CK(cudaMalloc(&dg, hg.size() * sizeof(float)));
     CUDA_CK(cudaMalloc(&du, hu.size() * sizeof(float)));
     CUDA_CK(cudaMalloc(&df32, hg.size() * sizeof(float)));
-    CUDA_CK(cudaMalloc(&dg16, hg.size() * sizeof(nv_bfloat16)));
-    CUDA_CK(cudaMalloc(&du16, hu.size() * sizeof(nv_bfloat16)));
-    CUDA_CK(cudaMalloc(&df16, hg.size() * sizeof(nv_bfloat16)));
     CUDA_CK(cudaMalloc(&d_q, hg.size()));
     CUDA_CK(cudaMalloc(&d_s, (size_t) rows * ns * sizeof(float)));
-
     CUDA_CK(cudaMemcpy(dg, hg.data(), hg.size() * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CK(cudaMemcpy(du, hu.data(), hu.size() * sizeof(float), cudaMemcpyHostToDevice));
-    k_ref_to_bf16<<<(unsigned) ((hg.size() + 255) / 256), 256>>>(dg, dg16, hg.size());
-    k_ref_to_bf16<<<(unsigned) ((hu.size() + 255) / 256), 256>>>(du, du16, hu.size());
-    CUDA_CK(cudaDeviceSynchronize());
 
     const dim3 grid_e((unsigned) ((K + 255) / 256), (unsigned) std::min<int>(rows, 65535));
     const float base_us = measure_median_us([&]() {
@@ -315,35 +301,19 @@ static void bench_mlp_glue(std::mt19937 & rng, uint4 * d_flush, size_t flush_vec
         else     ai4k::launch_quantize_act128<false, false, false>(df32, K, d_q, d_s, K, std::min(rows, 65535), 0);
     }, d_flush, flush_vecs);
 
-    // Pillar #1 only (F32 inputs -> fused GLU+ActQ, 0 intermediate write)
-    const float p1_us = measure_median_us([&]() {
+    // fused: one kernel writes the f32 GLU output and the quantized activation
+    const float fused_us = measure_median_us([&]() {
         ggml_cuda_prefill_launch_glu_ai4(
-            glu_kind, dg, du, nullptr, d_q, d_s, K, rows, rows,
+            glu_kind, dg, du, df32, d_q, d_s, K, rows, rows,
             (int64_t) K * sizeof(float), (int64_t) rows * K * sizeof(float),
             (int64_t) K * sizeof(float), (int64_t) rows * K * sizeof(float),
-            false, 0, xsh, 0, situ, 7.0f, 1.702f, 7.0f, 0);
+            xsh, 0, situ, 7.0f, 1.702f, 7.0f, 0);
     }, d_flush, flush_vecs);
 
-    // Pillar #3 only (BF16 inputs -> BF16 GLU intermediate -> bf16_to_ai4)
-    const float p3_us = measure_median_us([&]() {
-        k_ref_glu_bf16<<<grid_e, 256>>>(glu_kind, dg16, du16, df16, K, rows, situ);
-        ggml_cuda_prefill_bf16_to_ai4(df16, rows, K, xsh, 0, d_q, d_s, 0);
-    }, d_flush, flush_vecs);
-
-    // Pillar #1 + #3 combined (BF16 gate_up inputs -> fused GLU+ActQ, 0 intermediate write)
-    const float p1p3_us = measure_median_us([&]() {
-        ggml_cuda_prefill_launch_glu_ai4(
-            glu_kind, dg16, du16, nullptr, d_q, d_s, K, rows, rows,
-            (int64_t) K * sizeof(float), (int64_t) rows * K * sizeof(float),
-            (int64_t) K * sizeof(float), (int64_t) rows * K * sizeof(float),
-            true, 0, xsh, 0, situ, 7.0f, 1.702f, 7.0f, 0);
-    }, d_flush, flush_vecs);
-
-    std::printf("[BENCH L2-FLUSH] %-22s rows=%-5d K=%-5d | Base=%7.1f us | #1=%7.1f us (%.2fx) | #3(BF16out)=%7.1f us (%.2fx) | #1+#3=%7.1f us (%.2fx)\n",
-                label, rows, K, base_us, p1_us, base_us / p1_us, p3_us, base_us / p3_us, p1p3_us, base_us / p1p3_us);
+    std::printf("[BENCH L2-FLUSH] %-22s rows=%-5d K=%-5d | Base=%7.1f us | fused=%7.1f us (%.2fx)\n",
+                label, rows, K, base_us, fused_us, base_us / fused_us);
 
     CUDA_CK(cudaFree(dg)); CUDA_CK(cudaFree(du)); CUDA_CK(cudaFree(df32));
-    CUDA_CK(cudaFree(dg16)); CUDA_CK(cudaFree(du16)); CUDA_CK(cudaFree(df16));
     CUDA_CK(cudaFree(d_q)); CUDA_CK(cudaFree(d_s));
 }
 
@@ -375,14 +345,12 @@ static void bench_norm_glue(std::mt19937 & rng, uint4 * d_flush, size_t flush_ve
         }
     }, d_flush, flush_vecs);
 
-    // Fused Pillar #2: 1 kernel from SMEM -> cached INT8, 0 HBM write of norm output!
+    // fused: one kernel writes the f32 norm*w output and the quantized activation (consumers then take the cache)
     const float p2_us = measure_median_us([&]() {
-        ggml_cuda_prefill_launch_norm_ai4(
-            dx, nullptr, nullptr, dw, 1, nullptr, d_q, d_s,
-            rows, K, K, 0, 1e-6f, false, xsh, 0, 0);
+        ggml_cuda_prefill_launch_norm_ai4(dx, nullptr, nullptr, dw, df32, d_q, d_s, rows, K, 1e-6f, xsh, 0, 0);
     }, d_flush, flush_vecs);
 
-    std::printf("[BENCH L2-FLUSH] %-22s rows=%-5d K=%-5d (consumers=%d) | Base=%7.1f us | #2(SMEM+Elide)=%7.1f us (%.2fx)\n",
+    std::printf("[BENCH L2-FLUSH] %-22s rows=%-5d K=%-5d (consumers=%d) | Base=%7.1f us | fused=%7.1f us (%.2fx)\n",
                 label, rows, K, n_consumers, base_us, p2_us, base_us / p2_us);
 
     CUDA_CK(cudaFree(dx)); CUDA_CK(cudaFree(dw)); CUDA_CK(cudaFree(df32));

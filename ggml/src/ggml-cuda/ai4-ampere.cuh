@@ -30,13 +30,13 @@ static __global__ void __launch_bounds__(256) prefill_decode(
 // Decode each weight once across all N tiles. The caller owns M*K scratch bytes until this stream completes.
 template <int LAY = LAY_AIT4_U, int XSH = 1>
 static void launch_prefill_v2(const uint8_t * W, const int8_t * Xq, const float * Xs, int8_t * decoded,
-                              float * Y, int64_t ldy, int M, int N, int K, cudaStream_t stream, bool dst_bf16 = false) {
+                              float * Y, int64_t ldy, int M, int N, int K, cudaStream_t stream) {
     const int64_t chunks = (int64_t) (M/16)*(K/128);
     prefill_decode<LAY><<<(chunks + 7)/8, 256, 0, stream>>>(W, decoded, M, K);
     if (M <= 1024 && N < 2048) {
-        launch_gemm<128, 2, 2, LAY, XSH, false, 1, 4, true>(W, Xq, Xs, Y, ldy, M, N, K, stream, idmap{}, 0, decoded, 1, dst_bf16);
+        launch_gemm<128, 2, 2, LAY, XSH, false, 1, 4, true>(W, Xq, Xs, Y, ldy, M, N, K, stream, idmap{}, 0, decoded);
     } else {
-        launch_gemm<256, 2, 2, LAY, XSH, false, 1, 8, true>(W, Xq, Xs, Y, ldy, M, N, K, stream, idmap{}, 0, decoded, 1, dst_bf16);
+        launch_gemm<256, 2, 2, LAY, XSH, false, 1, 8, true>(W, Xq, Xs, Y, ldy, M, N, K, stream, idmap{}, 0, decoded);
     }
 }
 

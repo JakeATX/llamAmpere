@@ -135,7 +135,7 @@ template <ggml_type type, int tile_n, int nstages>
 __launch_bounds__(nthreads, tile_n == 128 ? 1 : 2)
 static __global__ void mul_mat_q_prefill(
         const char * x, const block_q8_1_mmq * y, float * dst,
-        const int m, const int n, const int k_steps, const int stride_x, const int stride_dst, const bool dst_bf16 = false) {
+        const int m, const int n, const int k_steps, const int stride_x, const int stride_dst) {
 #if __CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 900
     using namespace ggml_cuda_mma;
     constexpr int x_stride = weight_stride<type>();
@@ -214,16 +214,12 @@ static __global__ void mul_mat_q_prefill(
             const int row = m0 + row0 + (l/2)*8;
             const int col = n0 + j*8 + 2*(lane%4) + l%2;
             if (row < m && col < n) {
-                if (dst_bf16) {
-                    ((nv_bfloat16 *) dst)[size_t(col)*stride_dst + row] = __float2bfloat16(sum[j][l]);
-                } else {
-                    dst[size_t(col)*stride_dst + row] = sum[j][l];
-                }
+                dst[size_t(col)*stride_dst + row] = sum[j][l];
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(x, y, dst, m, n, k_steps, stride_x, stride_dst, dst_bf16);
+    GGML_UNUSED_VARS(x, y, dst, m, n, k_steps, stride_x, stride_dst);
 #endif
 }
 
@@ -234,7 +230,7 @@ static void launch_prefill(const mmq_args & args, cudaStream_t stream) {
     const dim3 grid((args.nrows_x + tile_m - 1)/tile_m, (args.ncols_dst + tile_n - 1)/tile_n);
     mul_mat_q_prefill<type, tile_n, nstages><<<grid, nthreads, shared, stream>>>(
         args.x, (const block_q8_1_mmq *) args.y, args.dst,
-        args.nrows_x, args.ncols_dst, args.ncols_x/128, args.stride_row_x, args.nrows_dst, args.dst_bf16);
+        args.nrows_x, args.ncols_dst, args.ncols_x/128, args.stride_row_x, args.nrows_dst);
 }
 
 template <ggml_type type, int tile_n>
