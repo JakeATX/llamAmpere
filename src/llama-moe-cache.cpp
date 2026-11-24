@@ -183,9 +183,12 @@ struct moe_cache_lru {
     // n_cpu(n) of the n misses are left to the CPU and read a zero slot on the device, they are not cached
     // a zero slot is used at most once per token, a miss that does not get one is cached instead
     // returns false if the ids select more distinct experts than there are slots
+    // few_rows > 0 (fork SURGE-PROMPT, LLAMA_MOE_CACHE_FEWROW_CPU): instead of n_cpu, the misses that this ubatch routes to
+    // at most few_rows tokens are left to the CPU (lowest CRF first if the zero slots run out); the others are uploaded
+    std::vector<int32_t> miss_rows; // [n_expert] tokens routed to each expert, only with few_rows > 0
     template <typename F>
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, F && n_cpu,
-            std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, bool advance = true) {
+            std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, bool advance = true, int32_t few_rows = 0) {
         fills.clear();
         cpu.clear();
         n_hit = 0;
@@ -223,9 +226,27 @@ struct moe_cache_lru {
 
         // the misses with the lowest CRF are left to the CPU, a miss that keeps being used gains CRF and enters the cache
         // all misses are used at the same clock, so their CRF compare without decay
-        const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
+        size_t n_c = 0;
+        if (few_rows > 0) {
+            miss_rows.assign(n_expert, 0);
+            for (size_t i = 0; i < n_ids; ++i) {
+                miss_rows[ids[i]]++;
+            }
+            for (int32_t e : misses) {
+                n_c += miss_rows[e] <= few_rows ? 1 : 0;
+            }
+        } else {
+            n_c = std::min(n_cpu(misses.size()), misses.size());
+        }
         if (n_c > 0) {
             std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
+                if (few_rows > 0) {
+                    const bool few_a = miss_rows[a] <= few_rows;
+                    const bool few_b = miss_rows[b] <= few_rows;
+                    if (few_a != few_b) {
+                        return few_a; // the few-row misses first: only they go to the CPU
+                    }
+                }
                 const float crf_a = crf[make_key(il, a)];
                 const float crf_b = crf[make_key(il, b)];
                 return crf_a != crf_b ? crf_a < crf_b : a < b;
@@ -456,6 +477,26 @@ struct llama_moe_cache::impl {
     // differ from the GPU's), so a request's output does not depend on what earlier requests left in the cache.
     bool     det_on = false;
 
+    // fork (SURGE-PROMPT, PROMPTPOL mid-size prompt policy): LLAMA_MOE_CACHE_FEWROW_CPU=R (1..64, unset or 0 = off).
+    // In a ubatch of at least LLAMA_MOE_CACHE_FEWROW_MIN_TOKENS rows (default 17: prompt chunks, not decode or verify),
+    // a missed expert that only R or fewer of its tokens route to is computed on the CPU from the host experts (where
+    // it lives) instead of being uploaded over PCIe into the cache, which also keeps it from evicting the experts that
+    // decode uses. Misses with more rows are uploaded as before. It needs the zero slots of the CPU-share path, so it
+    // adds n_expert_used zero slots per group (the cache holds that many fewer experts). Smaller ubatches keep the graph
+    // without a CPU part, so decode runs the same kernels as with the flag off. Rounding-level: a CPU-computed expert
+    // sums in another order than the GPU one.
+    const int32_t fewrow_r = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_FEWROW_CPU");
+        const long v = e && e[0] ? strtol(e, nullptr, 10) : 0;
+        return (int32_t) std::clamp(v, 0l, 64l);
+    }();
+    const int64_t fewrow_min = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_FEWROW_MIN_TOKENS");
+        const long v = e && e[0] ? strtol(e, nullptr, 10) : 17;
+        return (int64_t) std::clamp(v, 2l, 65536l);
+    }();
+    bool fewrow_op_offload = true; // the scheduler offloads large host-weight ops (see set_op_offload)
+
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
@@ -560,7 +601,7 @@ struct llama_moe_cache::impl {
                 round_boost = std::max(1, atoi(b));
             }
         }
-        n_zero = (cpu_share > 0.0f && !det_on) || round_on ? std::min<int32_t>(n_expert_used, 64) : 0;
+        n_zero = (cpu_share > 0.0f && !det_on) || round_on || fewrow_r > 0 ? std::min<int32_t>(n_expert_used, 64) : 0; // merge: cache + prompt zero-slot users
         if (round_on) {
             round_cand.assign(groups.size(), {});
             round_backlog.assign(groups.size(), 0);
@@ -745,6 +786,10 @@ struct llama_moe_cache::impl {
             }
             LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %.0f%% of the misses on the CPU\n", __func__,
                 ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, 100.0*cpu_share);
+            if (fewrow_r > 0) {
+                LLAMA_LOG_WARN("%s: [FEWROW] misses routed to <= %d rows of a ubatch of >= %lld rows are computed on the CPU "
+                        "(LLAMA_MOE_CACHE_FEWROW_CPU), %d zero slots per group\n", __func__, fewrow_r, (long long) fewrow_min, n_zero);
+            }
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%, %.1f tokens worth)\n", __func__,
@@ -825,6 +870,16 @@ struct llama_moe_cache::impl {
     ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].cpu_map == nullptr) {
             return nullptr;
+        }
+        if (fewrow_r > 0 && cpu_share == 0.0f) {
+            // few-row tier only: no CPU part below the prompt-chunk size, and with op offload off the scheduler keeps
+            // the CPU part on the CPU whatever the batch size
+            if (n_tokens < fewrow_min) {
+                return nullptr;
+            }
+            if (!fewrow_op_offload) {
+                return layers[il].cpu_map;
+            }
         }
         // the scheduler would run the CPU part on a device that offloads such batches from host weights
         ggml_tensor probe = {};
@@ -953,7 +1008,9 @@ struct llama_moe_cache::impl {
             return (size_t) (acc >> 16);
         };
         size_t n_hit = 0;
-        if (!g.lru.plan(ci, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit, ci == il)) {
+        const int32_t few_rows = has_cpu && fewrow_r > 0 && sel->src[0]->ne[1] >= fewrow_min &&
+                g.lru.n_filled == g.lru.n_slots ? fewrow_r : 0;
+        if (!g.lru.plan(ci, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit, ci == il, few_rows)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
         if (has_cpu) {
@@ -1125,7 +1182,8 @@ struct llama_moe_cache::impl {
     // that read them must be rebuilt. One device, no CPU share (zero slots), no trace: otherwise false and nothing changes.
     bool resize(size_t size) {
         // fork (SURGE-cache): zero slots (CPU misses) are fine under round admission: the banks are cleared on resume
-        if (!is_suspended || (n_zero > 0 && !round_on) || trace != nullptr || groups.empty()) {
+        // the few-row tier keeps its zero slots through a resize: resume() clears the new banks, so they read zero again
+        if (!is_suspended || (n_zero > 0 && !round_on && !(fewrow_r > 0 && cpu_share == 0.0f)) || trace != nullptr || groups.empty()) {
             return false;
         }
         int32_t n_dev = 0;
@@ -1390,6 +1448,10 @@ size_t llama_moe_cache::size() const {
 
 bool llama_moe_cache::suspended() const {
     return pimpl->is_suspended;
+}
+
+void llama_moe_cache::set_op_offload(bool on) {
+    pimpl->fewrow_op_offload = on;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

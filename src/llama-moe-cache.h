@@ -51,6 +51,10 @@ public:
     bool   resize(size_t size);
     size_t size() const;
 
+    // fork (SURGE-PROMPT): whether the scheduler offloads large ops on host weights (cparams.op_offload). Only read by the
+    // few-row CPU tier (LLAMA_MOE_CACHE_FEWROW_CPU): with it off, the CPU part of a prompt chunk stays on the CPU.
+    void   set_op_offload(bool on);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
