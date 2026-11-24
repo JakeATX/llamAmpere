@@ -9580,8 +9580,8 @@ bool llama_context::sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_ten
                         } else {
                             g_ok_c.fetch_add(1, std::memory_order_relaxed);
                         }
-                        if (ok_n <= 8 || ok_n == 20 || ok_n == 50 || (ok_n % 100) == 0) {
-                            LLAMA_LOG_INFO("[NK_DEV_MASK_CHECK] OK #%lld tag=%s n_rows=%lld n_kv=%lld nv0=%d nv_last=%d (nc=%lld sj=%lld c=%lld fail=%lld)\n",
+                        if (ok_n == 1 || (ok_n % 256) == 0) {
+                            LLAMA_LOG_WARN("[NK_DEV_MASK_CHECK] OK #%lld tag=%s n_rows=%lld n_kv=%lld nv0=%d nv_last=%d (nc=%lld sj=%lld c=%lld fail=%lld)\n",
                                     (long long) ok_n, tname, (long long) n_rows, (long long) n_kv,
                                     n_rows > 0 ? n_visible[0] : 0, n_rows > 0 ? n_visible[(size_t) (n_rows - 1)] : 0,
                                     (long long) g_ok_nc.load(std::memory_order_relaxed),

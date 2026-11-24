@@ -133,7 +133,7 @@ bool ggml_backend_cuda_nk_fill_prefix_mask(
 
     static std::once_flag once_log;
     std::call_once(once_log, [] {
-        GGML_LOG_INFO("[NK_DEV_MASK] active: vectorized device prefix-mask fill (LLAMA_NK_DEV_MASK=1)\n");
+        GGML_LOG_WARN("[NK_DEV_MASK] active: vectorized device prefix-mask fill (LLAMA_NK_DEV_MASK=1)\n");
     });
 
     ggml_cuda_set_device(ctx->device);
