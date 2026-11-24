@@ -67,6 +67,14 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         medium.name = "12dense";
         medium.options.front().second = "262144";
         medium.env.emplace_back("GGML_CUDA_GRAPH_MAX_ROWS", "16");
+        // 16 GB (GitHub #77, RTX 3080 Ti Laptop 16 GB): 12dense with the spare VRAM spent on LSA record slots. 4,500 MiB
+        // holds every record of a 262,144 context on the card (the reporter's 10dense run: 2015/2015 records), so decode
+        // reads no host KV (180K: 31.9 -> 45.0 tok/s on a PCIe 4.0 x8 host). Headed and headless both run 262,144.
+        auto large16 = medium;
+        large16.name = "16dense";
+        for (auto & [k, v] : large16.env) {
+            if (k == "LLAMA_LSA_RESIDENT_MIB") { v = "4500.0"; }
+        }
         // 8 GB loop check: V07/PRESETS/SOL_HANDOFF.md, owner order 2026-11-17T04:03Z.
         // 0.7.1: the drafter is the mtp-dm.gguf overlay (127 MB sidecar beside the model, owner option B 2026-11-19)
         // instead of the file's own MTP layer; mb-MTP stays on as in the other profiles (owner small-card design:
@@ -182,13 +190,14 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"LLAMA_DEEPCTX_LADDER", "1"}
             }
         };
-        std::vector<common_card_preset> cards {large, medium, small, tiny, ink8, ink10, ink12, ink24};
+        std::vector<common_card_preset> cards {large, large16, medium, small, tiny, ink8, ink10, ink12, ink24};
         for (auto & card : cards) {
             if (string_ends_with(card.name, "ink")) {
                 continue; // fork (INKSMALL2): Inkling profiles keep their own version and the model's sampling defaults
             }
             // 8dense and 12dense: CUDA graphs back on (HOSTGAP08 gates, V07/HOSTGAP08/RESULT.md)
-            card.version = card.name == "8dense" || card.name == "12dense" ? "2026-11-21.1" : "2026-11-17.6";
+            card.version = card.name == "16dense" ? "2026-11-24.1" :
+                card.name == "8dense" || card.name == "12dense" ? "2026-11-21.1" : "2026-11-17.6";
             card.options.insert(card.options.end(), {
                 {"--temp", "1.0"}, {"--top-k", "20"}, {"--top-p", "0.95"}, {"--min-p", "0"}
             });
@@ -215,7 +224,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
             return profile;
         }
     }
-    throw std::invalid_argument("unknown card preset: expected 24dense, 12dense, 10dense, 8dense, 24ink, 12ink, 10ink, or 8ink");
+    throw std::invalid_argument("unknown card preset: expected 24dense, 16dense, 12dense, 10dense, 8dense, 24ink, 12ink, 10ink, or 8ink");
 }
 
 std::string common_card_preset_apply_env(const common_params & params) {
