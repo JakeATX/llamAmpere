@@ -81,6 +81,7 @@
 #include "ggml-cuda/nk-q8-moe-tc.cuh"
 #include "ggml-cuda/nk-mask-fill.cuh"
 #include "ggml-cuda/nk-dspark-head.cuh"
+#include "ggml-cuda/nk-dense-tc.cuh"
 #include "ggml-cuda/nvfp4pf.cuh"
 #include "ggml-cuda/nvfp4moe.cuh"
 #include "ggml-cuda/inkreltab.cuh"
@@ -9728,8 +9729,8 @@ static ggml_type ggml_cuda_add_rms_q8_consumer_type(const ggml_backend_cuda_cont
                 ggml_cuda_mul_mat_route(w, act, node, cc, warp_size) != GGML_CUDA_MM_ROUTE_MMVQ) {
             return GGML_TYPE_COUNT;
         }
-        if (w->type == GGML_TYPE_Q8_0 && ggml_cuda_q8a16_enabled()) {
-            return GGML_TYPE_COUNT; // INKNVFP4K Q8A16 reads the f32 activation (a refused consumer quantizes on its own)
+        if (w->type == GGML_TYPE_Q8_0 && (ggml_cuda_nk_dense_tc_enabled() || ggml_cuda_q8a16_enabled())) {
+            return GGML_TYPE_COUNT; // NK_DENSE_TC / Q8A16 reads the f32 activation directly
         }
         return w->type;
     }
@@ -12164,7 +12165,7 @@ static int ggml_cuda_try_fuse_ink_normq(ggml_backend_cuda_context * ctx, ggml_cg
     const size_t  q8_row       = ncols_padded*sizeof(block_q8_1)/QK8_1;
     ggml_cuda_pool_alloc<char> q8(ctx->pool(), q8_row*G*nr);
     void * q8p[INK_MULTI_MAX];
-    const bool a16 = ggml_cuda_q8a16_group(*ctx, mms, n, true); // INKNVFP4K Q8A16 reads the f32 norm output: no q8_1 rows
+    const bool a16 = ggml_cuda_nk_dense_tc_group(*ctx, mms, n, true) || ggml_cuda_q8a16_group(*ctx, mms, n, true); // f32 norm output: no q8_1 rows
     for (int k = 0; k < G; ++k) {
         q8p[k] = used[k] && !a16 ? q8.get() + k*nr*q8_row : nullptr;
     }
@@ -17736,6 +17737,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     if (strcmp(name, "nk_dspark_head") == 0) {
         return ggml_cuda_nk_dspark_head_count();
     }
+    if (strcmp(name, "nk_dense_tc") == 0) {
+        return ggml_cuda_nk_dense_tc_count();
+    }
     if (strcmp(name, "conv_ring") == 0) {
         return ctx->fusion_stats.conv_ring;
     }
@@ -17964,6 +17968,41 @@ static bool ggml_backend_cuda_dspark_head_run(
     }
     return ggml_cuda_dspark_head_launch_base(*ctx, fold_w, latent, fold_bias, base, ids, noise,
         cand_out, vals_out, prev_out, n_eval, sk, softcap, inv_temp);
+}
+
+// test-backend-ops helper for GGML_TEST_NK_DENSE_TC=1 (single MUL_MAT: NK_DENSE_TC vs base q8a16)
+static bool ggml_backend_cuda_nk_dense_tc_run(
+        ggml_backend_t      backend,
+        bool                use_nk,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor       * dst) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    if (use_nk) {
+        return ggml_cuda_nk_dense_tc_mul_mat(*ctx, src0, src1, dst, true);
+    }
+    return ggml_cuda_q8a16_mul_mat(*ctx, src0, src1, dst);
+}
+
+// test-backend-ops helper for GGML_TEST_NK_DENSE_TC=1 (grouped QKV: NK_DENSE_TC vs base q8a16)
+static bool ggml_backend_cuda_nk_dense_tc_group_run(
+        ggml_backend_t        backend,
+        bool                  use_nk,
+        ggml_tensor * const * dsts,
+        int                   n) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    if (use_nk) {
+        return ggml_cuda_nk_dense_tc_group(*ctx, dsts, n, false, true);
+    }
+    return ggml_cuda_q8a16_group(*ctx, dsts, n, false);
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
@@ -18266,6 +18305,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_fusion_count") == 0) {
         return (void *)ggml_backend_cuda_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nk_dense_tc_run") == 0) {
+        return (void *)ggml_backend_cuda_nk_dense_tc_run;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nk_dense_tc_group_run") == 0) {
+        return (void *)ggml_backend_cuda_nk_dense_tc_group_run;
     }
     return nullptr;
 }
