@@ -22,6 +22,7 @@ int ggml_cuda_nvfp4pf_mode() {
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "nk-pf-mm.cuh"
 #include "nvfp4pf-kern.cuh"
 
 template <int KF, int BN>
@@ -32,8 +33,8 @@ static void nvfp4pf_launch_mm(const char * w, int64_t stride_blk, const int8_t *
     k_nvfp4pf_mm<KF, BN><<<dim3((M + 63)/64, max_tiles), 256, smem, stream>>>(w, stride_blk, xq, xs, y, M, M, K, map, s_exp, 1.0f);
 }
 
-bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp) {
+bool ggml_cuda_nvfp4pf_try_mode(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp, int nk_override) {
     const int KF = ggml_cuda_nvfp4pf_mode();
     if (KF == 0 || !ids) {
         return false;
@@ -100,20 +101,26 @@ bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         (int) n_expert, bn, max_tiles, work.get(), y, (int) M);
     CUDA_CHECK(cudaGetLastError());
     const nvfp4pf_map map = nvfp4pf_map_of(work.get(), (int) n_expert, n_pairs, src0->nb[2]);
+    const bool use_nk = nk_override > 0 || (nk_override < 0 && ggml_cuda_nk_pf_mm_enabled());
     const dim3 gq((unsigned) ((K/KF + 3)/4), (unsigned) n_rows);
-    if (KF == 64) {
-        if (!pre) {
+    if (!pre) {
+        if (KF == 64) {
             k_nvfp4pf_xq<64><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
+        } else {
+            k_nvfp4pf_xq<32><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
         }
+    }
+    if (use_nk) {
+        const nk_pf_map nk_map = { map.hdr, map.exps, map.off, map.rows, map.cols, map.tiles, map.nb02 };
+        ggml_cuda_nk_pf_mm_launch(KF, bn, w, stride_blk, xq_use, xs_use, y, (int) M, (int) K,
+            nk_map, max_tiles, se, ctx.device, stream);
+    } else if (KF == 64) {
         if (bn == 64) {
             nvfp4pf_launch_mm<64, 64>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream);
         } else {
             nvfp4pf_launch_mm<64, 128>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream);
         }
     } else {
-        if (!pre) {
-            k_nvfp4pf_xq<32><<<gq, 128, 0, stream>>>((const float *) src1->data, K, xq.get(), xs.get(), (int) K, (int) n_rows);
-        }
         if (bn == 64) {
             nvfp4pf_launch_mm<32, 64>(w, stride_blk, xq_use, xs_use, y, (int) M, (int) K, map, max_tiles, se, stream);
         } else {
@@ -123,7 +130,16 @@ bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * s_exp) {
+    return ggml_cuda_nvfp4pf_try_mode(ctx, src0, src1, ids, dst, s_exp, -1);
+}
 #else
+bool ggml_cuda_nvfp4pf_try_mode(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *,
+        const ggml_tensor *, int) {
+    return false;
+}
 bool ggml_cuda_nvfp4pf_try(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *,
         const ggml_tensor *) {
     return false;
