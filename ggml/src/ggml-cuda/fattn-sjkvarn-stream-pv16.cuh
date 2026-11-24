@@ -177,7 +177,9 @@ static __global__ void flash_attn_ext_sj_kvarn_stream_pv16(
     const float * Qf = (const float *) (Q + (size_t) col_query(hcol)*nb01 + (size_t) (head0 + (hvalid ? col_head(hcol) : 0))*nb02);
 
     const int c0 = 2 * (lane & 3);
-    const half * mrow0 = (const half *) (mask + (size_t) col_query(c0)*nb31 + (ne32 > 1 ? (size_t) (head0 + col_head(c0))*nb32 : 0));
+    // padding columns (c0 past the last head / query) read the first valid row instead of past the mask's end
+    const bool c0_valid = col_valid(c0);
+    const half * mrow0 = (const half *) (mask + (size_t) (c0_valid ? col_query(c0) : 0)*nb31 + (ne32 > 1 ? (size_t) (head0 + (c0_valid ? col_head(c0) : 0))*nb32 : 0));
     const half * mrow1 = (ne32 > 1 && col_valid(c0 + 1)) ? (const half *) ((const char *) mrow0 + nb32) : mrow0;
 
     static_assert(NSTAGE * STAGE_BYTES >= EXACT_BYTES, "ring must hold one exact K or V strip");
