@@ -1495,7 +1495,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 size_t free = 0, total = 0;
                 ggml_backend_dev_memory(gpu, &free, &total);
                 const char * extra_env = getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB");
-                const double extra   = extra_env ? std::max(0.0, atof(extra_env)) : 0.0;
+                // fork (INKVIS): the server loads an mmproj after this context; its GPU weights + compute stay out of
+                // the cache as well (the server sets LLAMA_MOE_CACHE_AUTO_MMPROJ_MIB from mtmd_get_memory_usage)
+                const char * mmproj_env = getenv("LLAMA_MOE_CACHE_AUTO_MMPROJ_MIB");
+                const double extra   = (extra_env ? std::max(0.0, atof(extra_env)) : 0.0) +
+                                       (mmproj_env ? std::max(0.0, atof(mmproj_env)) : 0.0);
                 // fork (INKSTREAM): with ink_rows_cap the boot scratch stays at 512 rows, but the SWA cache (and the
                 // f32 attention scores of a 512-row prompt ubatch) is sized n_swa + n_ubatch: one score copy per extra
                 // cell (512 rows x n_head x 4 B). Without it 10ink/12ink at -ub 4096 peaked 12-14 MiB over the line.

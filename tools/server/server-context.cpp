@@ -2518,6 +2518,20 @@ private:
             mmproj_usage_t_us = ggml_time_us() - t_start;
         }
 
+        // fork (INKVIS): an auto-sized MoE expert cache (small-card presets) takes the free VRAM left after the target
+        // context, and the mmproj loads after it: keep the mmproj's device memory (weights + warmup compute) out of it
+        if (has_mmproj && mparams.use_gpu && params_base.moe_cache_size == 0) {
+            size_t mm_dev = 0;
+            for (const auto & [dev, size] : mmproj_usage.backend_mem_usage) {
+                if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    mm_dev += size;
+                }
+            }
+            if (mm_dev > 0) {
+                common_set_env("LLAMA_MOE_CACHE_AUTO_MMPROJ_MIB", std::to_string((mm_dev >> 20) + 1));
+            }
+        }
+
         // optionally fit mmproj memory usage
         // on resume params_base already holds the margin from the first load
         if (has_mmproj && params_base.fit_params && !is_resume) {
