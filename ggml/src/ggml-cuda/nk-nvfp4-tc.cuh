@@ -5,6 +5,7 @@
 
 #include "nvfp4moe.cuh"
 
-bool ggml_cuda_nk_nvfp4_tc_enabled();
-bool ggml_cuda_nk_nvfp4_tc_accepts(const nvfp4moe_params & P);
-bool ggml_cuda_nk_nvfp4_tc_launch(const nvfp4moe_params & P, cudaStream_t stream);
+bool    ggml_cuda_nk_nvfp4_tc_enabled();
+bool    ggml_cuda_nk_nvfp4_tc_accepts(const nvfp4moe_params & P);
+bool    ggml_cuda_nk_nvfp4_tc_launch(const nvfp4moe_params & P, cudaStream_t stream);
+int64_t ggml_cuda_nk_nvfp4_tc_count();

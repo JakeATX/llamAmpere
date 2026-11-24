@@ -34,6 +34,20 @@ static bool nk_nvfp4_tc_l2_ef() {
     return on;
 }
 
+static bool nk_nvfp4_tc_trace() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_NK_TRACE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static std::atomic<int64_t> g_nk_nvfp4_tc_launches{0};
+
+int64_t ggml_cuda_nk_nvfp4_tc_count() {
+    return g_nk_nvfp4_tc_launches.load(std::memory_order_relaxed);
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 namespace nk_nvfp4_tc {
@@ -568,8 +582,13 @@ static void launch_pair(const nvfp4moe_params & P, cudaStream_t stream) {
 
 bool ggml_cuda_nk_nvfp4_tc_accepts(const nvfp4moe_params & P) {
     using namespace nk_nvfp4_tc;
-    return ggml_cuda_nk_nvfp4_tc_enabled() &&
-        P.T >= 1 && P.T <= 8 && !P.write_sum && P.xq != nullptr && !P.f32act && P.n_used == NK_NUSED &&
+    if (!ggml_cuda_nk_nvfp4_tc_enabled()) {
+        return false;
+    }
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_HOPPER &&
+        (P.T >= 2 || (P.T == 1 && !P.write_sum)) && P.T <= 8 && P.xq != nullptr && !P.f32act && P.n_used == NK_NUSED &&
         P.K == NK_K && P.F == NK_F && P.gu_nb1 == NK_ROW_GU && P.dn_nb1 == NK_ROW_DN &&
         P.gu_nb2 % 16 == 0 && P.dn_nb2 % 16 == 0 &&
         (uintptr_t) P.w_gu % 16 == 0 && (uintptr_t) P.w_dn % 16 == 0 &&
@@ -585,6 +604,10 @@ bool ggml_cuda_nk_nvfp4_tc_launch(const nvfp4moe_params & P, cudaStream_t stream
     if (!logged.test_and_set()) {
         GGML_LOG_INFO("[NK_NVFP4_TC] active (m16n8k16 s8 TC, T=1..8, l2_evict_first=%d, smem gu=%zu dn=%zu)\n",
             l2_ef ? 1 : 0, nk_nvfp4_tc::NK_SMEM_GU, nk_nvfp4_tc::NK_SMEM_DN);
+    }
+    const int64_t n = g_nk_nvfp4_tc_launches.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (nk_nvfp4_tc_trace()) {
+        GGML_LOG_INFO("[NK_NVFP4_TC] launch #%lld T=%d write_sum=%d\n", (long long) n, P.T, P.write_sum);
     }
     if (l2_ef) {
         nk_nvfp4_tc::launch_pair<true>(P, stream);
