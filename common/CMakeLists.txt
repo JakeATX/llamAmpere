@@ -59,6 +59,8 @@ add_library(${TARGET}
     ${LLAMA_CHAT_PARSERS_SOURCES}
     arg.cpp
     arg.h
+    arch-defaults.cpp
+    arch-defaults.h
     base64.hpp
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp

@@ -679,8 +679,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
     // fork UBDEFAULT (Jake 11-22): the dynamic ub ladder is on by default for every context it supports (causal,
     // default context type, no training/embeddings); LLAMA_DEEPCTX_LADDER=0 turns it off, "1" still forces it on.
+    // fork DEFPATH: LLAMA_UBDEFAULT=0 is the kill switch for all of UBDEFAULT (the old opt-in ladder comes back).
     const char * ladder = getenv("LLAMA_DEEPCTX_LADDER");
-    dynamic_ubatch = !ladder || !ladder[0] || strcmp(ladder, "0") != 0;
+    const char * ubdef = getenv("LLAMA_UBDEFAULT");
+    ubdefault = !(ubdef && ubdef[0] == '0');
+    dynamic_ubatch = ubdefault ? (!ladder || !ladder[0] || strcmp(ladder, "0") != 0) : (ladder && strcmp(ladder, "1") == 0);
 
     // fork: small-card prompt ubatch. An MoE model asked for -ub > 6144 on a card with less than
     // LLAMA_UB_SMALL_CARD_FREE_MIB (default 14336) free here (after the weights, before KV and the expert cache;
@@ -989,7 +992,7 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
-    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc()) {
+    if (ubdefault && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc()) {
         const char * loan = getenv("LLAMA_UB_KV_LOAN");
         LLAMA_LOG_INFO("%s: dynamic ub ladder %s: ceiling %u rows, fit/boot reserve %u rows, KV-tail loan %s "
                 "(LLAMA_DEEPCTX_LADDER=0 off, LLAMA_UB_FIT_ROWS, LLAMA_UB_KV_LOAN=0)\n", __func__,
@@ -2606,7 +2609,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
     // KV, expert cache or context from the fit.
     const uint32_t ub_fit_rows_env = llama_ub_fit_rows_cfg();
     if (!sched && sched_reserve_tokens == 0 && ((rotate && rotate[0] == '1') ||
-                (dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) &&
+                (ubdefault && dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) &&
             cparams.causal_attn && !cparams.training && !cparams.embeddings && !compute_peer && !kv_stream_phase_arena.configured) {
         sched_reserve_tokens = std::min(cparams.n_ubatch, (rotate && rotate[0] == '1') ? 512u : ub_fit_rows_env);
     }
@@ -6421,7 +6424,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         if (g_pp_overlap_prompt.load()) {
             rows = std::min(rows, pp_overlap_rows()); // PP-1: the refill owns the rest of the card
         }
-    } else if (alone && dynamic_ubatch && sched_cache_mode == 0 && n_tokens > 512 &&
+    } else if (ubdefault && alone && dynamic_ubatch && sched_cache_mode == 0 && n_tokens > 512 &&
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !b1_cache_device_active) {
         // fork UBDEFAULT: without an expert cache any prompt above 512 rows runs at its own size (rounded up to 512)
         // up to the ceiling; the exact fit below steps it down when memory is short.
@@ -6518,7 +6521,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         // fork UBDEFAULT: without an expert cache each prompt reserve is sized exactly (ub_fit_rows below: free
         // memory, then the KV-tail loan, then the next rung down), so the ceiling stays put and this free-memory
         // heuristic only runs where the expert cache shares the card (small cards, unchanged).
-        if (sched_cache_mode != 0 && now >= deadline) {
+        if ((!ubdefault || sched_cache_mode != 0) && now >= deadline) {
             deadline = now + (prompt ? 2000000 : 10000000);
             bool cut = false;
             bool grow = true;
@@ -6662,9 +6665,9 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     // 23,552 MiB card line, else the unused KV tail, else the next rung down) instead of letting the allocator
     // run into the margin or fail. Only without an expert cache (that path keeps its cache-trim borrow).
     const uint32_t fit_floor = std::min(cparams.n_ubatch, std::max(llama_ub_fit_rows_cfg(), cparams.n_seq_max));
-    const bool exact_fit = dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && sched_cache_mode == 0 &&
+    const bool exact_fit = ubdefault && dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && sched_cache_mode == 0 &&
             !b1_ffn_scratch_active && !b1_layer_scratch_active && n_tokens > 0;
-    if (dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens > 512 && !ub_path_logged) {
+    if (ubdefault && dynamic_ubatch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens > 512 && !ub_path_logged) {
         ub_path_logged = true;
         LLAMA_LOG_INFO("%s: dynamic ub ceiling %u: %s (expert cache mode %d)\n", __func__, cparams.n_ubatch,
                 exact_fit ? "exact fit per rung (free memory, then KV-tail loan, then next rung)" : "expert-cache trim heuristic",
@@ -6679,7 +6682,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     } else if (exact_fit && rows > fit_floor) {
         rows = ub_fit_rows(rows, fit_floor, n_tokens);
     }
-    if (rows == sched_reserve_tokens && !trim_packed && !sched_need_reserve) {
+    if (ubdefault && rows == sched_reserve_tokens && !trim_packed && !sched_need_reserve) {
         return true;
     }
     for (;;) {
@@ -6699,7 +6702,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             if (ub_loan_active) { ub_loan_end(); }
             if (rows <= floor) { sched_need_reserve = true; ink_cache_refill(); return false; }
             rows = std::max(floor, rows / 2);
-            if (sched_cache_mode != 0) { dynamic_ubatch_rows = rows; }
+            if (!ubdefault || sched_cache_mode != 0) { dynamic_ubatch_rows = rows; }
             if (exact_fit && rows > fit_floor) {
                 rows = ub_fit_rows(rows, fit_floor, n_tokens);
             }

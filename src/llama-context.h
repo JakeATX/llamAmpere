@@ -710,6 +710,9 @@ private:
     // requests left in the MoE cache (fixed prompt crossover; see llama-moe-cache.cpp for the cache side)
     bool     moe_cache_det = false;
     bool dynamic_ubatch = false;
+    // fork DEFPATH: LLAMA_UBDEFAULT=0 restores the pre-UBDEFAULT ladder (on only with LLAMA_DEEPCTX_LADDER=1, boot
+    // reserve at the ceiling, free-memory heuristic for every prompt rung, no exact fit, no KV-tail loan)
+    bool ubdefault = true;
     // fork UBDEFAULT: prompt compute lent from the unused KV tail (Jake 11-20: start high, give the space back when
     // the context needs it). Active only between a prompt reserve and the next reserve; LLAMA_UB_KV_LOAN=0 off.
     std::vector<ggml_backend_buffer_ptr> ub_loan_views;

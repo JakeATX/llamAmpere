@@ -1,5 +1,7 @@
 #include "spec-defaults.h"
 
+#include "arch-defaults.h"
+
 #include "common.h"
 #include "ggml-cpp.h"
 #include "llama.h"
@@ -8,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -15,7 +18,12 @@
 static const common_speculative_family_default common_speculative_family_defaults[] = {
     // Qwen3.8 (qwen35) with the built-in MTP head: the production settings
     // (--spec-type draft-mtp-adaptive --spec-draft-n-max 4 --spec-draft-n-min-adaptive 3 --spec-draft-p-min 0,
-    //  vocab map auto); the draft KV cache types are left unset and inherit the trunk -ctk/-ctv (tq5_0/turbo4 over SJ-KVaRN)
+    //  vocab map auto). The draft KV types stay unset on purpose: the resolver in common_base_params_to_speculative
+    //  picks DSJ (draft on the trunk's SJ-KVaRN regions + the RM24H shortlist) or tq5_0/turbo4 over a SJ-KVaRN trunk;
+    //  DSJ needs -ctkd/-ctvd unset (an explicit draft type or vocab map turned it off in the 11-19 loss). The report
+    //  (common/arch-defaults.cpp) prints the resolved draft KV.
+    // Drafters that ship as a separate file beside the model (Inkling 2 DSpark) are rows of the arch table
+    // (common/arch-defaults.cpp, "spec"), applied by common_speculative_apply_file_default below.
     { "qwen35", true, "MTP drafter", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, 4, 3, 0.0f, "auto" },
 };
 
@@ -208,6 +216,74 @@ void common_speculative_apply_dspark_default(common_params & params) {
     }
 }
 
+// fork DEFPATH (SPECROW): an arch whose drafter ships as a file beside the model (the arch table's "spec" row, e.g.
+// inkling2: DSpark, -ngld 99 -ubd 64, draft KV F16 explicit). Only when no drafting was chosen, the file is there, the
+// whole model is on the GPU and the smallest used GPU is at least min_gpu_mib (on small cards the drafter's VRAM
+// comes out of the expert cache and measured slower). LLAMA_ARCH_DEFAULTS=0 or --spec-type none: no drafter.
+static ggml_type spec_kv_type_from_name(const std::string & name) {
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const char * n = ggml_type_name((ggml_type) t);
+        if (n && name == n) {
+            return (ggml_type) t;
+        }
+    }
+    return GGML_TYPE_COUNT;
+}
+
+static void common_speculative_apply_file_default(common_params & params, const std::string & arch) {
+    auto & spec = params.speculative;
+    common_arch_spec_default row;
+    if (!common_arch_spec_default_get(arch, row)) {
+        return;
+    }
+    const auto type = common_speculative_type_from_name(row.type);
+    if (type == COMMON_SPECULATIVE_TYPE_COUNT) {
+        LOG_WRN("speculative: arch table drafter type '%s' for %s is unknown, no drafter\n", row.type.c_str(), arch.c_str());
+        return;
+    }
+    const std::string file = (std::filesystem::path(params.model.path).parent_path() / row.model).string();
+    std::error_code ec;
+    const size_t min_mib = common_arch_min_gpu_total_mib(params);
+    const char * why_not = nullptr;
+    if (!std::filesystem::is_regular_file(file, ec)) {
+        why_not = "the drafter file is not beside the model";
+    } else if (params.n_gpu_layers == 0 || !params.tensor_buft_overrides.empty()) {
+        why_not = "the model is not fully on the GPU (-ngl 0, --cpu-moe or -ot)";
+    } else if (min_mib < row.min_gpu_mib) {
+        why_not = "the card is below the drafter's card line";
+    }
+    if (why_not) {
+        LOG_INF("speculative: %s drafter %s not applied: %s (%s)\n", arch.c_str(), row.model.c_str(), why_not, row.why.c_str());
+        return;
+    }
+    spec.draft.mparams.path    = file;
+    spec.draft.mparams.hf_file = file;
+    spec.types.push_back(type);
+    if (row.ngl != -1 && spec.draft.n_gpu_layers == -1) {
+        spec.draft.n_gpu_layers = row.ngl;
+    }
+    if (row.ubatch > 0 && spec.draft.n_ubatch < 0) {
+        spec.draft.n_ubatch = row.ubatch;
+    }
+    // explicit draft KV (not inherited from the trunk); LLAMA_DSPARK_DRAFT_SJKVARN=1 keeps its opt-in path
+    const char * dsj = getenv("LLAMA_DSPARK_DRAFT_SJKVARN");
+    if (!(dsj && *dsj && atoi(dsj) != 0) && !spec.draft.sj_kvarn_explicit) {
+        if (!row.type_k.empty() && spec.draft.cache_type_k == GGML_TYPE_COUNT) {
+            spec.draft.cache_type_k = spec_kv_type_from_name(row.type_k);
+        }
+        if (!row.type_v.empty() && spec.draft.cache_type_v == GGML_TYPE_COUNT) {
+            spec.draft.cache_type_v = spec_kv_type_from_name(row.type_v);
+        }
+    }
+    common_speculative_apply_mtp_sampling_default(params);
+    common_speculative_apply_dspark_default(params);
+    LOG_INF("speculative: %s on by default for %s (arch table): %s, -ngld %d -ubd %d, draft KV %s/%s, n-max %d; "
+            "--spec-type none or LLAMA_ARCH_DEFAULTS=0 disables\n", row.model.c_str(), arch.c_str(), row.type.c_str(),
+            spec.draft.n_gpu_layers, spec.draft.n_ubatch,
+            spec.draft.cache_type_k == GGML_TYPE_COUNT ? "trunk" : ggml_type_name(spec.draft.cache_type_k),
+            spec.draft.cache_type_v == GGML_TYPE_COUNT ? "trunk" : ggml_type_name(spec.draft.cache_type_v), spec.draft.n_max);
+}
+
 bool common_speculative_apply_model_default(common_params & params) {
     auto & spec = params.speculative;
 
@@ -224,6 +300,7 @@ bool common_speculative_apply_model_default(common_params & params) {
 
     const common_speculative_family_default * row = common_speculative_apply_family_default(spec, arch, n_nextn);
     if (row == nullptr) {
+        common_speculative_apply_file_default(params, arch);
         return true;
     }
 

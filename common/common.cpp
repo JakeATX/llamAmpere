@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "arch-defaults.h"
 
 #include "../src/llama-ext.h"
 
@@ -1537,11 +1538,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 card.name.c_str(), card.version.c_str(), card.status.c_str(), params.card_preset_flags.c_str(),
                 params.n_ctx, params.n_parallel, params.n_batch, params.n_ubatch, preset_env.c_str());
     }
+    // fork DEFPATH: the arch table's env values (LLAMA_LEAN_PROMPT per card class, ...) before anything reads them
+    common_arch_defaults_apply(params);
     // fork UBDEFAULT (Jake 11-22): no -ub/-b given -> the dynamic ub ladder's ceiling follows the card. A 24 GB-class
     // card (smallest used GPU total >= 23,552 MiB) gets -ub 4096 -b >= 4096; smaller cards keep the default (512) and
     // their presets' values. The boot reserve and the memory fit stay at LLAMA_UB_FIT_ROWS (512) rows, so the ceiling
     // costs no context, KV or expert cache: prompt rows above it come from free memory or the unused KV tail.
-    if (params.n_ubatch_auto) {
+    // fork DEFPATH: LLAMA_UBDEFAULT=0 skips this block (pre-UBDEFAULT -ub/-b); the per-arch values come from the table.
+    const char * ubdefault_env = getenv("LLAMA_UBDEFAULT");
+    if (params.n_ubatch_auto && !(ubdefault_env && ubdefault_env[0] == '0')) {
         size_t min_total = 0;
         auto consider = [&](ggml_backend_dev_t dev) {
             if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -1566,21 +1571,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // cells is materialised per head, so the work per row grows with the ub. UBDEFAULT sweep (3090, 4/4,
         // c 131,072, cold prefill tok/s 3K/32K/100K): 512 1883/1835/1399, 1024 1772/2073/1514, 2048 1369/2082/1456,
         // 4096 1851/1620/1191 -> 1024. LLAMA_UB_CEILING=<rows> overrides the auto ceiling for any model.
-        int32_t ceiling = 4096;
-        if (!params.model.path.empty()) {
-            const std::string arch = common_get_gguf_info(params.model.path).arch;
-            // Qwen3.5/3.8 27B (P76, 24dense): 4096 vs 2048, 3090, ABBA x6: cold prefill 3K +1.7%, 32K -1.5%, 100K -0.4%
-            // (no gain), decode at 100K fill +0.3%, but 16-token replies after a 3K/32K prompt -26%/-29% -> 2048.
-            if (arch == "qwen35") {
-                ceiling = 2048;
-            }
-            if (arch == "inkling2" || arch == "inkling2_loop") {
-                // The SWA cache grows by the ub (n_swa + n_ubatch cells). At the fitted default ctx the 512-row boot
-                // reserve leaves no room for wider prompt rows (the full-ctx reserve sizes the masks at every cell),
-                // so a wider ceiling would only cost context: raise it only when -c is given.
-                ceiling = params.n_ctx > 0 && !params.card_preset_ctx_default ? 1024 : params.n_ubatch;
-            }
+        // fork DEFPATH: per-arch ceilings live in common/arch-defaults.cpp (same values: 4096, qwen35 2048,
+        // inkling2 1024 only with -c). Qwen3.5/3.8 27B (P76): 4096 vs 2048 no prefill gain, 16-token replies -26%/-29%.
+        // Inkling: the SWA cache grows by the ub (n_swa + n_ubatch cells); at the fitted default ctx the 512-row boot
+        // reserve leaves no room for wider prompt rows, so a wider ceiling would only cost context.
+        const std::string ub_arch = common_arch_of_model(params.model.path);
+        bool ub_needs_ctx = false;
+        int32_t ceiling = common_arch_ub_ceiling_24g(ub_arch, &ub_needs_ctx);
+        if (ub_needs_ctx && !(params.n_ctx > 0 && !params.card_preset_ctx_default)) {
+            ceiling = params.n_ubatch;
         }
+        // -b on a 24 GB card: the table's batch_24g (Inkling 2048: INKCOMP F262 -ub 1024 -b 2048), else the UBDEFAULT rule
+        const int32_t batch_24g = common_arch_defaults_enabled() ? common_arch_batch_24g(ub_arch) : 0;
         if (const char * e = getenv("LLAMA_UB_CEILING"); e && e[0]) {
             ceiling = std::max(64, std::min(65536, atoi(e)));
         }
@@ -1588,7 +1590,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             // The draft contexts have no ladder of their own: an auto draft ub keeps the old ceiling (speculative.cpp).
             params.speculative.draft.n_ubatch_auto_cap = params.n_ubatch;
             params.n_ubatch = ceiling;
-            params.n_batch = std::max(params.n_batch, std::max(ceiling, 4096));
+            params.n_batch = batch_24g > 0 ? std::max(ceiling, batch_24g) : std::max(params.n_batch, std::max(ceiling, 4096));
             if (!params.card_preset.empty()) {
                 for (const char * from : {" --ubatch-size 2048", " --ubatch-size 1024"}) {
                     const size_t pos = params.card_preset_flags.find(from);
@@ -1599,7 +1601,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
         }
         LOG_INF("%s: dynamic ub ceiling %d (-b %d) for the smallest GPU total %zu MiB (auto: no -ub/-b given; "
-                "24 GB-class >= 23552 MiB -> 4096, qwen35 2048, Inkling 1024 with -c, LLAMA_UB_CEILING)\n", __func__, params.n_ubatch, params.n_batch, min_total >> 20);
+                "24 GB-class >= 23552 MiB -> per-arch table (common/arch-defaults.cpp), LLAMA_UB_CEILING, LLAMA_UBDEFAULT=0 off)\n", __func__, params.n_ubatch, params.n_batch, min_total >> 20);
     }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -1813,6 +1815,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    // fork DEFPATH: one WARN block, every speed lever on/off/overridden and why (LLAMA_ENGAGED_REPORT=0 hides it)
+    common_arch_defaults_report(params, model, lctx);
 
     set_process_priority(params.cpuparams.priority);
 
