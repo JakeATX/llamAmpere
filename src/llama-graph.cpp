@@ -4801,6 +4801,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             if (inksj) {
                 ggml_flash_attn_ext_set_inksj(cur); // INKKV: pair-packed Inkling heads (ggml-inksj.h)
             }
+            if (q->ne[1] == (int64_t) ubatch.n_tokens && q->ne[3] == 1) {
+                // [POSTREV4] GGML_SJKVARN_MU_SPLIT (0 = no hint unless the flag is on)
+                const uint32_t groups = llm_graph_ubatch_row_groups(ubatch);
+                if (groups != 0) {
+                    ggml_flash_attn_ext_set_row_groups(cur, groups);
+                }
+            }
             if (wush_ao) {
                 if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
                 cur = llm_graph_sj_wush_apply(ctx0, cur, wush_ao);

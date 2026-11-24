@@ -6,6 +6,7 @@
 #include "server-eval-cache.h"
 #include "server-numerics-probe.h"
 #include "server-loop-guard.h"
+#include "server-par-sample.h"
 #include "server-common.h"
 #include "server-decision.h"
 #include "server-http.h"
@@ -1096,6 +1097,14 @@ struct server_slot {
     bool spec_round_kb  = false; // copy mode: this wide round keeps its pre-round state plane on the card (no checkpoint)
     common_sampler_ptr spec_smpl_after_verify;
     llama_token spec_replay_token = LLAMA_TOKEN_NULL;
+    // [#250] PARSAMPLE (LLAMA_SERVER_PAR_SAMPLE): this pass's sampler result, made by the pool before the slot loops
+    int                par_kind = 0; // 0 = none, 1 = one plain token (par_id), 2 = draft verify (par_accepted)
+    llama_token        par_id   = LLAMA_TOKEN_NULL;
+    llama_tokens       par_accepted;
+    common_sampler_ptr par_smpl_save; // kind 2: the sampler before the verify (the loop's smpl_save)
+    int64_t            par_t0_us = 0;
+    int64_t            par_t1_us = 0;
+    std::exception_ptr par_err;
     size_t spec_verify_width = 0;
     bool spec_forced = false;          // DSPINE-FU S4: this round's committed tokens came from LLAMA_SPEC_FORCE_TOKENS
     bool spec_round_restored = false;  // DSPINE-FU S4: this round needed a checkpoint restore + replay pass
@@ -5520,6 +5529,100 @@ private:
         return f;
     }
 
+    // [CKPTDYN] LLAMA_SERVER_CKPT_BRANCH=1 (default off): prompt checkpoints also go where agent conversations branch,
+    // i.e. at message boundaries (the start of each message = the end of the one before), and a full checkpoint list
+    // gives up the interior grid checkpoint whose loss leaves the smallest gap for its distance from the tail instead
+    // of the oldest one; message-boundary checkpoints go last. Which boundaries: the end of the system prompt (where
+    // sub-agents fork), the last two message starts (an edit or a regenerated reply), and any other message start at
+    // least LLAMA_SERVER_CKPT_BRANCH_MIN tokens (default 512) past the previous one taken. SJ-KVaRN targets the seal
+    // grid boundary at or below each spot, as for the other prompt checkpoints.
+    static bool ckpt_branch_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SERVER_CKPT_BRANCH");
+            return e != nullptr && *e != '\0' && strcmp(e, "0") != 0;
+        }();
+        return on;
+    }
+
+    static int64_t ckpt_branch_min() {
+        static const int64_t v = [] {
+            const char * e = getenv("LLAMA_SERVER_CKPT_BRANCH_MIN");
+            const long long n = e && *e ? atoll(e) : 512;
+            return (int64_t) std::max(1LL, n);
+        }();
+        return v;
+    }
+
+    // the message-boundary spots of a prompt of n_task tokens (ascending, inside (0, n_task))
+    static std::vector<int64_t> ckpt_branch_spots(const common_chat_msg_spans & spans, int64_t n_task) {
+        std::vector<int64_t> starts;
+        int64_t sys_end = -1;
+        for (size_t i = 0; i < spans.spans.size(); ++i) {
+            const auto & sp = spans.spans[i];
+            const int64_t p = (int64_t) sp.pos;
+            if (p > 0 && p < n_task) {
+                starts.push_back(p);
+                if (sys_end < 0 && i > 0 && spans.spans[i - 1].role == COMMON_CHAT_ROLE_SYSTEM && sp.role != COMMON_CHAT_ROLE_SYSTEM) {
+                    sys_end = p;
+                }
+            }
+        }
+        std::sort(starts.begin(), starts.end());
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+        std::vector<int64_t> out;
+        int64_t last = -ckpt_branch_min();
+        for (size_t i = 0; i < starts.size(); ++i) {
+            const int64_t p = starts[i];
+            if (p == sys_end || i + 2 >= starts.size() || p >= last + ckpt_branch_min()) {
+                out.push_back(p);
+                last = p;
+            }
+        }
+        return out;
+    }
+
+    // [CKPTDYN] full list: index of the checkpoint to give up. Grid (non-branch) checkpoints first; among a class, the
+    // one whose removal leaves the smallest gap (next - previous) relative to its distance from the tail n_tail; the
+    // newest checkpoint is never picked while another one exists
+    static size_t ckpt_branch_victim(const std::list<common_prompt_checkpoint> & ckpts, int64_t n_tail) {
+        std::vector<const common_prompt_checkpoint *> v;
+        for (const auto & c : ckpts) {
+            v.push_back(&c);
+        }
+        int64_t newest = -1;
+        for (const auto * c : v) {
+            newest = std::max(newest, c->n_tokens);
+        }
+        size_t best = 0;
+        double best_score = 0.0;
+        int best_cls = 2;
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (v.size() > 1 && v[i]->n_tokens == newest) {
+                continue;
+            }
+            int64_t prev = 0, next = n_tail;
+            for (size_t j = 0; j < v.size(); ++j) {
+                if (j == i) {
+                    continue;
+                }
+                if (v[j]->n_tokens <= v[i]->n_tokens) {
+                    prev = std::max(prev, v[j]->n_tokens);
+                } else {
+                    next = std::min(next, v[j]->n_tokens);
+                }
+            }
+            const int cls = v[i]->branch ? 1 : 0;
+            const double dist  = (double) std::max<int64_t>(1, n_tail - v[i]->n_tokens);
+            const double score = (double) (next - prev) / dist;
+            if (cls < best_cls || (cls == best_cls && score < best_score)) {
+                best = i;
+                best_cls = cls;
+                best_score = score;
+            }
+        }
+        return best;
+    }
+
     // [#240] exact = false: a plain grid checkpoint even when LLAMA_SJKVARN_EXACT_CKPT=1 (the long-prompt grid that keeps
     // rollbacks into the middle of a prompt reachable)
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool exact = true) {
@@ -5546,7 +5649,8 @@ private:
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = *it;
-            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + min_step) {
+            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + min_step &&
+                    !(ckpt_branch_on() && cur.branch)) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
@@ -5559,7 +5663,16 @@ private:
             ++it;
         }
 
-        while (server_rtb_ckptgap() && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints &&
+        // LLAMA_RTB_CKPTGAP and LLAMA_SERVER_CKPT_BRANCH both set: the CKPTDYN eviction below wins (it keeps the
+        // message-boundary checkpoints); the CKPTGAP spacing (min_step above, ckpt_step at prefill) still applies
+        if (server_rtb_ckptgap() && ckpt_branch_on()) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                SRV_INF("%s", "LLAMA_RTB_CKPTGAP + LLAMA_SERVER_CKPT_BRANCH: checkpoint eviction by LLAMA_SERVER_CKPT_BRANCH (message-boundary thinning); CKPTGAP spacing kept\n");
+            }
+        }
+
+        while (server_rtb_ckptgap() && !ckpt_branch_on() && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints &&
                 slot.prompt.checkpoints.size() >= 2) {
             // LLAMA_RTB_CKPTGAP: drop the checkpoint whose removal leaves the shortest gap between its neighbours
             // (positions sorted; the new checkpoint counts as a neighbour), never the one at the highest position
@@ -5600,6 +5713,16 @@ private:
                     ord[victim]->n_tokens, best_gap);
             slot.ckpt_recycle(*ord[victim]);
             cps.erase(ord[victim]);
+        }
+
+        while (ckpt_branch_on() && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+            // [CKPTDYN] the grid checkpoint whose loss costs least for its distance from the tail
+            auto it = slot.prompt.checkpoints.begin();
+            std::advance(it, ckpt_branch_victim(slot.prompt.checkpoints, std::max<int64_t>(n_tokens_new, slot.prompt.n_tokens())));
+            SLT_INF(slot, "erasing context checkpoint at n_tokens = %" PRId64 "%s (thinning, %.3f MiB)\n",
+                    it->n_tokens, it->branch ? " (message boundary)" : "", (float) it->size() / 1024 / 1024);
+            slot.ckpt_recycle(*it);
+            slot.prompt.checkpoints.erase(it);
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -6475,6 +6598,54 @@ private:
         return false;
     }
 
+    // [#257] PFXDEDUP (LLAMA_SLOT_CTX_SHARE_DEDUP=1, default off): when D-share must clear an idle shared slot, clear
+    // first the one whose content another idle slot already holds. covered(A) = the most tokens of A's content that
+    // some other idle slot B could hand a request for A's content without a re-read (the common prefix when B can cut
+    // there, else B's newest checkpoint inside it: the same rule as eval_cache_slot_reuse). Victim = the idle shared
+    // slot with the fewest unique tokens (n_tokens - covered); ties go to the least recently used, so with no overlap
+    // between slots the pick is the plain LRU one. Reserved slots are never cleared (they may cover a shared one).
+    static bool slot_ctx_share_dedup_on() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SLOT_CTX_SHARE_DEDUP");
+            return e != nullptr && *e != '\0' && strcmp(e, "0") != 0;
+        }();
+        return on;
+    }
+
+    int64_t slot_ctx_share_dedup_unique = -1; // unique tokens of the last pick (0 = fully held elsewhere)
+
+    template <typename BusyOf>
+    server_slot * slot_ctx_share_dedup_pick(const BusyOf & busy_of) {
+        server_slot * best = nullptr;
+        int64_t best_unique = 0;
+        int64_t best_cov    = 0;
+        for (auto & a : slots) {
+            if (!a.ctx_shared || busy_of(a) || a.prompt.n_tokens() <= 0) {
+                continue;
+            }
+            int64_t cov = 0;
+            for (const auto & b : slots) {
+                if (b.id == a.id || busy_of(b) || b.prompt.n_tokens() <= 0) {
+                    continue;
+                }
+                cov = std::max<int64_t>(cov, (int64_t) eval_cache_slot_reuse(b, a.prompt.tokens));
+            }
+            cov = std::min<int64_t>(cov, a.prompt.n_tokens());
+            const int64_t unique = a.prompt.n_tokens() - cov;
+            if (!best || unique < best_unique || (unique == best_unique && a.t_last_used < best->t_last_used)) {
+                best        = &a;
+                best_unique = unique;
+                best_cov    = cov;
+            }
+        }
+        slot_ctx_share_dedup_unique = best ? best_unique : -1;
+        if (best && best_cov > 0) {
+            SRV_INF("--slot-ctx: idle shared slot %d is a redundant prefix holder (%" PRId64 " of %d tokens held by another idle slot), cleared first (LLAMA_SLOT_CTX_SHARE_DEDUP)\n",
+                    best->id, best_cov, best->prompt.n_tokens());
+        }
+        return best;
+    }
+
     // D-share (--slot-ctx with 0 entries): the shared slots' caps follow what the other shared users hold.
     // A busy shared slot claims its task's prompt while it starts (the old cache tail past the common prefix is trimmed
     // before any new cell is written; admission checks the same number + 64) and the cells it holds once generating.
@@ -6505,6 +6676,9 @@ private:
         }
         while (busy + idle > slot_ctx_share_budget) {
             server_slot * lru = nullptr;
+            if (slot_ctx_share_dedup_on()) {
+                lru = slot_ctx_share_dedup_pick(busy_of);
+            } else
             for (auto & s : slots) {
                 if (s.ctx_shared && !busy_of(s) && s.prompt.n_tokens() > 0 && (!lru || s.t_last_used < lru->t_last_used)) {
                     lru = &s;
@@ -6515,7 +6689,10 @@ private:
             }
             SRV_WRN("--slot-ctx: clearing idle shared slot %d (%d tokens) for the busy shared users\n", lru->id, lru->prompt.n_tokens());
             idle -= lru->prompt.n_tokens();
-            if (prompt_cache) {
+            if (prompt_cache && slot_ctx_share_dedup_on() && slot_ctx_share_dedup_unique == 0) {
+                // [#257] every token is held by another idle slot (its checkpoints included): no prompt-cache copy
+                SRV_INF("--slot-ctx: slot %d not saved to the prompt cache (content held by another idle slot)\n", lru->id);
+            } else if (prompt_cache) {
                 lru->prompt_save(*prompt_cache);
                 prompt_cache->update();
             }
@@ -7908,6 +8085,12 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+                    // [CKPTDYN] message-boundary spots (empty unless LLAMA_SERVER_CKPT_BRANCH)
+                    const std::vector<int64_t> branch_spots = do_checkpoint && ckpt_branch_on() ?
+                        ckpt_branch_spots(spans, slot.task->n_tokens()) : std::vector<int64_t>();
+                    auto is_branch = [&](int64_t n) {
+                        return !branch_spots.empty() && std::binary_search(branch_spots.begin(), branch_spots.end(), n);
+                    };
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
@@ -7951,6 +8134,19 @@ private:
                         };
                         for (int64_t q : spots) {
                             if (q > 0 && ckpt_target_floor(q) == n) {
+                                return true;
+                            }
+                        }
+                        for (int64_t q : branch_spots) { // [CKPTDYN]
+                            if (ckpt_target_floor(q) == n) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+                    auto sj_branch_target = [&](int64_t n) { // [CKPTDYN] n is the grid spot of a message boundary
+                        for (int64_t q : branch_spots) {
+                            if (ckpt_target_floor(q) == n) {
                                 return true;
                             }
                         }
@@ -8056,11 +8252,11 @@ private:
                             }
                         } else
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        if (do_checkpoint && (spans.is_user_start(slot.prompt.n_tokens()) || is_branch(slot.prompt.n_tokens()))) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || is_branch(pos) || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -8127,7 +8323,7 @@ private:
                     } else if (!sj_align) {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_branch(n_tokens_start)) {
                             do_checkpoint = false;
                         }
                     }
@@ -8162,7 +8358,7 @@ private:
                         // no need to create checkpoints that are too close together, unless it's the last user message
                         do_checkpoint = do_checkpoint && (
                                 slot.prompt.checkpoints.empty() ||
-                                is_last_user_message || near_prompt_end ||
+                                is_last_user_message || near_prompt_end || is_branch(n_tokens_start) ||
                                 n_tokens_start > slot.prompt.checkpoints.back().n_tokens + ckpt_step);
                     }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
@@ -8188,6 +8384,13 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, ckpt_exact);
+                        if (!branch_spots.empty() && !slot.prompt.checkpoints.empty() &&
+                                slot.prompt.checkpoints.back().n_tokens == n_tokens_start &&
+                                (sj_align ? sj_branch_target(n_tokens_start) : is_branch(n_tokens_start))) {
+                            slot.prompt.checkpoints.back().branch = true; // [CKPTDYN]
+                            SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " marked as a message boundary (LLAMA_SERVER_CKPT_BRANCH)\n",
+                                    slot.prompt.checkpoints.back().n_tokens);
+                        }
                     }
                 }
 
@@ -8764,6 +8967,99 @@ private:
         return true;
     }
 
+    // [#250] PARSAMPLE (LLAMA_SERVER_PAR_SAMPLE=N >= 2, default off): before the slot loops of post_decode, run the
+    // sampler calls of every slot that samples in this pass on N threads. A plain step stores its token (par_id), a
+    // draft verify its accepted tokens and the sampler copy the loop would have taken first (par_smpl_save). The loops
+    // then use these results in the usual order, so every side effect stays on this thread and in slot order; each
+    // slot's sampler sees the same calls in the same order as in the sequential loop, so the tokens are the same.
+    // Not used for synthetic-draft rounds or with LLAMA_D1_HEAD (lazy logit rows are rescored on first read).
+    std::unique_ptr<server_par_sample_pool> par_pool;
+
+    template <typename InView, typename StopOf>
+    void par_sample_prepass(const InView & is_inside_view, int32_t off, const StopOf & spec_is_stop) {
+        const int n_thr = server_par_sample_pool::env_threads();
+        if (n_thr < 2) {
+            return;
+        }
+        static const bool d1 = getenv("LLAMA_D1_HEAD") != nullptr && *getenv("LLAMA_D1_HEAD") != '\0';
+        if (d1) {
+            return;
+        }
+        struct job {
+            server_slot * slot;
+            int kind;
+            int tok_idx;
+            std::function<bool(llama_token, const llama_tokens &)> stop;
+            bool save;
+        };
+        std::vector<job> jobs;
+        const bool synth = spec && !common_speculative_get_synth_probs(spec.get()).empty();
+        for (auto & slot : slots) {
+            if (slot.par_kind != 0) {
+                SLT_WRN(slot, "%s", "PARSAMPLE: a sampled result of the previous pass was not used, dropped\n");
+            }
+            slot.par_kind = 0;
+            slot.par_err  = nullptr;
+            slot.par_smpl_save.reset();
+            if (!slot.is_processing() || !slot.task) {
+                continue;
+            }
+            const auto type = slot.task->type;
+            const bool to_gen = slot.state == SLOT_STATE_GENERATING ||
+                (slot.state == SLOT_STATE_DONE_PROMPT && !slot.task->params.warm && slot.task->need_sampling() &&
+                 type != SERVER_TASK_TYPE_EMBEDDING && type != SERVER_TASK_TYPE_RERANK && type != SERVER_TASK_TYPE_DECISION);
+            const bool spec_round = slot.can_speculate() && (!slot.spec_draft.empty() || slot.spec_smpl_after_verify);
+            if (to_gen && is_inside_view(slot.i_batch) && !spec_round) {
+                // the first loop: one token from row i_batch
+                jobs.push_back({&slot, 1, slot.i_batch - off, {}, false});
+            } else if (!synth && slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && !slot.spec_draft.empty() &&
+                    !slot.spec_smpl_after_verify && slot.spec_i_batch.size() == slot.spec_draft.size() + 1 &&
+                    (slot.spec_draft_q.empty() || slot.spec_draft_q.size() == slot.spec_draft.size())) {
+                // the second loop: verify the draft (same sampler-copy rule as there)
+                const size_t n_draft = slot.spec_draft.size();
+                const bool may_replay = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                jobs.push_back({&slot, 2, -1, spec_is_stop(slot), !server_bookkeep_enabled() || may_replay});
+            }
+        }
+        if (jobs.size() < 2) {
+            return;
+        }
+        if (!par_pool) {
+            par_pool = std::make_unique<server_par_sample_pool>(n_thr);
+            SRV_INF("PARSAMPLE: sampling runs on %d threads (LLAMA_SERVER_PAR_SAMPLE)\n", par_pool->n_threads());
+        }
+        // logits are final after this; the first read also applies the output row order, once, on this thread
+        llama_synchronize(ctx_tgt);
+        {
+            const job & j0 = jobs.front();
+            (void) llama_get_logits_ith(ctx_tgt, j0.kind == 1 ? j0.tok_idx : j0.slot->spec_i_batch.front());
+        }
+        par_pool->run((int) jobs.size(), [&](int i) {
+            job & j = jobs[i];
+            server_slot & slot = *j.slot;
+            slot.par_t0_us = ggml_time_us();
+            try {
+                if (j.kind == 1) {
+                    slot.par_id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, j.tok_idx);
+                } else {
+                    if (j.save) {
+                        slot.par_smpl_save.reset(common_sampler_clone(slot.smpl.get()));
+                    }
+                    // same pick as the second loop (incl. the RTB hash sampler taking the plain verify)
+                    slot.par_accepted = (slot.spec_draft_q.empty() || common_sampler_rtb_hash_enabled())
+                        ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, j.stop)
+                        : common_sampler_sample_and_accept_n_pq(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch,
+                                slot.spec_draft, slot.spec_draft_q, false, slot.spec_is_replay, slot.id, slot.stats.n_gen, j.stop);
+                }
+            } catch (...) {
+                slot.par_err = std::current_exception();
+            }
+            slot.par_t1_us = ggml_time_us();
+            slot.par_kind  = j.kind;
+        });
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -8784,6 +9080,42 @@ private:
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
+
+        // stop-word check of a draft verify: the antiprompt tail of the slot's text plus the tokens accepted so far
+        auto spec_is_stop = [&](server_slot & slot) -> std::function<bool(llama_token, const llama_tokens &)> {
+            return [&accept_special_token, &slot = slot](llama_token token, const llama_tokens & prefix) {
+                if (slot.task->params.antiprompt.empty()) {
+                    return false;
+                }
+                size_t tail = 0;
+                for (const auto & word : slot.task->params.antiprompt) {
+                    tail = std::max(tail, word.size());
+                }
+                size_t from = slot.generated.text.size() - std::min(tail + 4, slot.generated.text.size());
+                while (from < slot.generated.text.size() && (static_cast<unsigned char>(slot.generated.text[from]) & 0xc0) == 0x80) {
+                    ++from;
+                }
+                std::string text = slot.generated.text.substr(from);
+                for (const auto id : prefix) {
+                    text += common_token_to_piece(slot.ctx_tgt, id, accept_special_token(slot, id));
+                }
+                const std::string piece = common_token_to_piece(slot.ctx_tgt, token, accept_special_token(slot, token));
+                text += piece;
+                if (validate_utf8(text) < text.size()) {
+                    return false;
+                }
+                for (const auto & word : slot.task->params.antiprompt) {
+                    const size_t span = word.size() + piece.size();
+                    if (text.find(word, text.size() > span ? text.size() - span : 0) != std::string::npos) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+        };
+
+        // [#250] PARSAMPLE: the sampler calls of this pass, side by side (off unless LLAMA_SERVER_PAR_SAMPLE >= 2)
+        par_sample_prepass(is_inside_view, off, spec_is_stop);
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -8849,7 +9181,13 @@ private:
             const int tok_idx = slot.i_batch - off;
 
             llama_token id;
-            {
+            if (slot.par_kind == 1) {
+                slot.par_kind = 0;
+                if (slot.par_err) {
+                    std::rethrow_exception(std::exchange(slot.par_err, nullptr));
+                }
+                id = slot.par_id;
+            } else {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
@@ -8937,40 +9275,14 @@ private:
                 // fork: a sampler snapshot is used only when this round can require checkpoint replay.
                 const bool may_replay = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
-                common_sampler_ptr smpl_save(!server_bookkeep_enabled() || may_replay ? common_sampler_clone(slot.smpl.get()) : nullptr);
+                const bool par_done = slot.par_kind == 2;
+                common_sampler_ptr smpl_save(par_done ? slot.par_smpl_save.release() :
+                        !server_bookkeep_enabled() || may_replay ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                const auto is_stop = [&](llama_token token, const llama_tokens & prefix) {
-                    if (slot.task->params.antiprompt.empty()) {
-                        return false;
-                    }
-                    size_t tail = 0;
-                    for (const auto & word : slot.task->params.antiprompt) {
-                        tail = std::max(tail, word.size());
-                    }
-                    size_t from = slot.generated.text.size() - std::min(tail + 4, slot.generated.text.size());
-                    while (from < slot.generated.text.size() && (static_cast<unsigned char>(slot.generated.text[from]) & 0xc0) == 0x80) {
-                        ++from;
-                    }
-                    std::string text = slot.generated.text.substr(from);
-                    for (const auto id : prefix) {
-                        text += common_token_to_piece(slot.ctx_tgt, id, accept_special_token(slot, id));
-                    }
-                    const std::string piece = common_token_to_piece(slot.ctx_tgt, token, accept_special_token(slot, token));
-                    text += piece;
-                    if (validate_utf8(text) < text.size()) {
-                        return false;
-                    }
-                    for (const auto & word : slot.task->params.antiprompt) {
-                        const size_t span = word.size() + piece.size();
-                        if (text.find(word, text.size() > span ? text.size() - span : 0) != std::string::npos) {
-                            return true;
-                        }
-                    }
-                    return false;
-                };
+                const auto is_stop = spec_is_stop(slot);
                 llama_tokens accepted;
                 const int64_t t_sample0 = ggml_time_us();
                 const bool replayed_verify = bool(slot.spec_smpl_after_verify);
@@ -8979,6 +9291,15 @@ private:
                     accepted.push_back(slot.spec_replay_token);
                     common_sampler_copy(slot.spec_smpl_after_verify.get(), slot.smpl.get());
                     slot.spec_smpl_after_verify.reset();
+                } else if (par_done) {
+                    slot.par_kind = 0;
+                    if (slot.par_err) {
+                        std::rethrow_exception(std::exchange(slot.par_err, nullptr));
+                    }
+                    accepted = std::move(slot.par_accepted);
+                    // as the sequential branch below: natural accept count, then the forced-token override (DSPINE-FU S4)
+                    slot.spec_n_nat = accepted.size();
+                    slot.spec_forced = server_spec_force::get().apply(slot.task->id, slot.stats.n_gen, slot.spec_draft, accepted);
                 } else {
                     accepted = !synth_probs.empty()
                         ? server_sample_and_accept_synth(
@@ -8994,7 +9315,8 @@ private:
                 slot.spec_round_restored = replayed_verify;
 
                 slot.spec_sample_end_us = ggml_time_us();
-                slot.spec_sample_us += (uint64_t) (slot.spec_sample_end_us - t_sample0);
+                slot.spec_sample_us += par_done ? (uint64_t) (slot.par_t1_us - slot.par_t0_us)
+                                                : (uint64_t) (slot.spec_sample_end_us - t_sample0);
                 GGML_ASSERT(accepted.size() >= 1);
                 if (server_sampled_logit_bad(slot.smpl.get(), slot.stats.n_gen + 1)) {
                     nan_guard_abort(slot);

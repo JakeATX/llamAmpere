@@ -1105,6 +1105,32 @@ struct llm_b1_ffn {
     std::vector<llm_b1_ffn_bucket> buckets;
 };
 
+// [POSTREV4] GGML_SJKVARN_MU_SPLIT=1 (default off): SJ-KVaRN FA nodes of a unified-KV multi-user ubatch carry the
+// rows where a new sequence starts (ggml_flash_attn_ext_set_row_groups), so a 9..32-row verify can run one decode
+// launch per user that reads only that user's records instead of the tile kernel over the whole unified cache
+static inline bool llm_graph_mu_split_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_SJKVARN_MU_SPLIT");
+        return e != nullptr && *e != '\0' && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// bit r = token r starts a new sequence (bit 0 always); 0 when the ubatch is not a 9..32-token multi-sequence one
+static inline uint32_t llm_graph_ubatch_row_groups(const llama_ubatch & ub) {
+    if (!llm_graph_mu_split_enabled() || ub.n_tokens <= 8 || ub.n_tokens > 32 || ub.n_seqs_unq < 2 ||
+            ub.seq_id == nullptr || ub.n_seq_id == nullptr) {
+        return 0;
+    }
+    uint32_t g = 1u;
+    for (uint32_t r = 1; r < ub.n_tokens; ++r) {
+        if (ub.n_seq_id[r] < 1 || ub.n_seq_id[r - 1] < 1 || ub.seq_id[r][0] != ub.seq_id[r - 1][0]) {
+            g |= 1u << r;
+        }
+    }
+    return g;
+}
+
 struct llm_graph_params {
     const llama_model * model = nullptr;
 
@@ -1231,6 +1257,11 @@ struct llm_graph_params {
                     can_reuse_ubatch &= ubatch.seq_id_unq[s] == other.ubatch.seq_id_unq[s];
                 }
             }
+        }
+
+        // [POSTREV4] the FA row-group hint is baked into the graph; a different sequence layout rebuilds it
+        if (can_reuse_ubatch && llm_graph_mu_split_enabled() && !ubatch.equal_seqs()) {
+            can_reuse_ubatch = ubatch.data && llm_graph_ubatch_row_groups(ubatch) == llm_graph_ubatch_row_groups(other.ubatch);
         }
 
         if (!can_reuse_ubatch) {
