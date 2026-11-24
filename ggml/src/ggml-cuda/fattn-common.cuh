@@ -1772,7 +1772,9 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D, bool rot = false> // D == head size; rot: [#139] SJ-KVaRN fused output rotation of the final row
+// bounded: [FA-BMERGE] GGML_CUDA_FA_BOUNDED_MERGE=1 (default off): skip parallel blocks with no visible key (l == 0, their
+// parts are never read) and write 0 for a row with no visible key at all (instead of 0/0).
+template<int D, bool rot = false, bool bounded = false> // D == head size; rot: [#139] SJ-KVaRN fused output rotation of the final row
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * __restrict__ VKQ_parts,
@@ -1813,10 +1815,21 @@ static __global__ void flash_attn_combine_results(
     for (int l = 1; l < parallel_blocks; ++l) {
         kqmax = max(kqmax, meta[l].x);
     }
+    if constexpr (bounded) { // [FA-BMERGE] the max over the blocks that saw a key (an empty block's max is a sentinel)
+        kqmax = -INFINITY;
+        for (int l = 0; l < parallel_blocks; ++l) {
+            kqmax = meta[l].y == 0.0f ? kqmax : max(kqmax, meta[l].x);
+        }
+    }
 
     float VKQ_numerator   = 0.0f;
     float VKQ_denominator = 0.0f;
     for (int l = 0; l < parallel_blocks; ++l) {
+        if constexpr (bounded) {
+            if (meta[l].y == 0.0f) {
+                continue; // [FA-BMERGE] empty block: adds exactly 0, its parts are not read
+            }
+        }
         const float KQ_max_scale = expf(meta[l].x - kqmax);
 
         VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
@@ -1824,6 +1837,13 @@ static __global__ void flash_attn_combine_results(
     }
     if (lse != nullptr && tid == 0) { // fork: [H, T, S] row log-sum-exp, same row order as dst
         lse[j_dst_unrolled] = VKQ_denominator > 0.0f ? kqmax + logf(VKQ_denominator) : -INFINITY;
+    }
+
+    if constexpr (bounded) {
+        if (!(VKQ_denominator > 0.0f)) {
+            VKQ_numerator   = 0.0f; // [FA-BMERGE] no visible key: output 0 (after the LSE, which stays -inf)
+            VKQ_denominator = 1.0f;
+        }
     }
 
     if constexpr (rot) {
@@ -1841,6 +1861,15 @@ inline thread_local const int * ggml_cuda_fattn_kv_max_override = nullptr;
 // fork: SJ-KVaRN live-record list ([0] = count, then the live body record ids in order) for the stream decode kernel,
 // passed in its KV_max slot; set around the launch by the opt-in record skip (GGML_SJKVARN_LIVE_RECORDS=1).
 inline thread_local const int * ggml_cuda_fattn_sj_live_records = nullptr;
+
+#ifndef GGML_CUDA_FA_BMERGE_HELPER
+#define GGML_CUDA_FA_BMERGE_HELPER
+// [FA-BMERGE] GGML_CUDA_FA_BOUNDED_MERGE=1 (default off): the parallel-block combine takes its bounded build
+static inline bool ggml_cuda_fa_bounded_merge() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_FA_BOUNDED_MERGE"); return e && atoi(e) != 0; }();
+    return on;
+}
+#endif
 
 template <int DV, int ncols1, int ncols2, bool compact_q5g6 = false>
 void launch_fattn(
@@ -2298,9 +2327,11 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
+        const bool bmerge = ggml_cuda_fa_bounded_merge();
         if (ggml_cuda_fattn_sj_kvarn_rot(KQV)) { // [#139] the SJ-KVaRN stream kernel rotated Q; the combine rotates the output
             if constexpr (DV == 256) {
-                flash_attn_combine_results<DV, true>
+                auto combine = bmerge ? flash_attn_combine_results<DV, true, true> : flash_attn_combine_results<DV, true>;
+                combine
                     <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
                     (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks,
                      ggml_flash_attn_ext_get_lse(KQV) ? (float *) ggml_flash_attn_ext_get_lse(KQV)->data : nullptr);
@@ -2308,7 +2339,8 @@ void launch_fattn(
                 GGML_ABORT("SJ-KVaRN fused rotation needs DV == 256");
             }
         } else {
-        flash_attn_combine_results<DV>
+        auto combine = bmerge ? flash_attn_combine_results<DV, false, true> : flash_attn_combine_results<DV>;
+        combine
             <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
             (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks,
                      ggml_flash_attn_ext_get_lse(KQV) ? (float *) ggml_flash_attn_ext_get_lse(KQV)->data : nullptr);
