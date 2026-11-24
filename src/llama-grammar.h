@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <map>
+#include <memory>
 #include <regex>
 #include <string>
 #include <vector>
@@ -129,11 +130,35 @@ struct llama_grammar {
     // maintain a list of llama_tokens and their positions in the trigger_buffer
     using token_pos = std::pair<llama_token, std::pair<size_t, size_t>>;
 
+    llama_grammar(const llama_vocab * vocab, std::shared_ptr<const llama_grammar_rules> rules_ptr, llama_grammar_stacks stacks,
+            llama_partial_utf8 partial_utf8, bool lazy, bool awaiting_trigger, std::string trigger_buffer,
+            std::vector<token_pos> trigger_buffer_positions, std::vector<llama_token> trigger_tokens,
+            std::vector<llama_grammar_trigger_pattern> trigger_patterns)
+        : vocab(vocab), rules_ptr(std::move(rules_ptr)), rules(*this->rules_ptr), stacks(std::move(stacks)),
+          partial_utf8(partial_utf8), lazy(lazy), awaiting_trigger(awaiting_trigger),
+          trigger_buffer(std::move(trigger_buffer)), trigger_buffer_positions(std::move(trigger_buffer_positions)),
+          trigger_tokens(std::move(trigger_tokens)), trigger_patterns(std::move(trigger_patterns)) {}
+
+    // owns a copy of the rules
+    llama_grammar(const llama_vocab * vocab, llama_grammar_rules rules, llama_grammar_stacks stacks,
+            llama_partial_utf8 partial_utf8, bool lazy, bool awaiting_trigger, std::string trigger_buffer,
+            std::vector<token_pos> trigger_buffer_positions, std::vector<llama_token> trigger_tokens,
+            std::vector<llama_grammar_trigger_pattern> trigger_patterns)
+        : llama_grammar(vocab, std::make_shared<const llama_grammar_rules>(std::move(rules)), std::move(stacks),
+                        partial_utf8, lazy, awaiting_trigger, std::move(trigger_buffer),
+                        std::move(trigger_buffer_positions), std::move(trigger_tokens), std::move(trigger_patterns)) {}
+
+    // stacks point into the rules: a copy would have to remap them, use llama_grammar_clone_impl
+    llama_grammar(const llama_grammar &) = delete;
+    llama_grammar & operator=(const llama_grammar &) = delete;
+
     // note: allow null vocab for testing (not great)
     const llama_vocab * vocab;
 
-    const llama_grammar_rules  rules;  // TODO: shared ptr
-          llama_grammar_stacks stacks;
+    // the rules never change after init, so clones may share them (LLAMA_GRAMMAR_SHARED_RULES)
+    std::shared_ptr<const llama_grammar_rules> rules_ptr;
+    const llama_grammar_rules &  rules;
+          llama_grammar_stacks   stacks;
 
     // buffer for partially generated UTF-8 sequence from accepted tokens
     llama_partial_utf8 partial_utf8;
