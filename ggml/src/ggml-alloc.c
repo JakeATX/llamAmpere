@@ -1082,8 +1082,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     galloc_peak_report(galloc, graph);
 }
 
-static bool ggml_gallocr_reserve_n_impl(
-        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+// plan the graph: tensor offsets per buffer and the size each buffer chunk needs; no buffer is touched
+static void ggml_gallocr_plan_impl(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -1161,11 +1162,10 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
-    // A size query must leave existing backing buffers intact, including when
-    // the measured graph is larger and a later real reserve will grow them.
-    if (no_alloc) {
-        return true;
-    }
+}
+
+// back the planned graph: grow or replace each buffer its plan does not fit
+static bool ggml_gallocr_reserve_buffers_impl(ggml_gallocr_t galloc) {
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (!ggml_gallocr_external_fits(galloc, i)) {
             return false;
@@ -1387,6 +1387,17 @@ static bool ggml_gallocr_reserve_n_impl(
     return true;
 }
 
+static bool ggml_gallocr_reserve_n_impl(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+    ggml_gallocr_plan_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    // A size query must leave existing backing buffers intact, including when
+    // the measured graph is larger and a later real reserve will grow them.
+    if (no_alloc) {
+        return true;
+    }
+    return ggml_gallocr_reserve_buffers_impl(galloc);
+}
+
 void ggml_gallocr_reserve_n_size(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
     GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
@@ -1405,6 +1416,31 @@ void ggml_gallocr_reserve_n_size(
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+}
+
+bool ggml_gallocr_plan_fits(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    ggml_gallocr_plan_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    if (galloc->donor != NULL) {
+        return false;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        struct vbuffer * b = galloc->buffers[i];
+        if (b == NULL || b->refs > 1) {
+            return false;
+        }
+        const struct ggml_dyn_tallocr * t = galloc->buf_tallocs[i];
+        for (int c = 0; c < t->n_chunks; c++) {
+            const size_t need = ggml_dyn_tallocr_max_size(t, c);
+            if (need > ggml_vbuffer_chunk_size(b, c) || (need > 0 && b->chunks[c] == NULL)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool ggml_gallocr_reserve_planned(ggml_gallocr_t galloc) {
+    return ggml_gallocr_reserve_buffers_impl(galloc);
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {

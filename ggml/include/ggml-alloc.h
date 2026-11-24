@@ -73,6 +73,12 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// Plan the graph without touching any buffer: true when the plan fits the current private buffers, so backing it
+// frees and grows nothing. ggml_gallocr_reserve_planned then backs the plan (same result as ggml_gallocr_reserve_n,
+// without planning the graph a second time).
+GGML_API bool ggml_gallocr_plan_fits(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids);
+GGML_API bool ggml_gallocr_reserve_planned(ggml_gallocr_t galloc);
+
 // Let galloc adopt the donor's compute buffers when they are large enough instead of allocating its own.
 // Only valid when the two allocators' graphs never execute concurrently (the caller must synchronize).
 GGML_API void ggml_gallocr_set_donor(ggml_gallocr_t galloc, ggml_gallocr_t donor);

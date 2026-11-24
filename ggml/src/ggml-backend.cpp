@@ -3302,11 +3302,32 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
+        // fork: plan first. When the new plan fits the current buffers (nothing freed or grown), work still in
+        // flight keeps valid memory and the new graph runs after it on the same stream, so the wait is skipped:
+        // it drained the GPU for the host work that follows (~10 ms per prompt ubatch whose graph changed).
+        // Only with one graph copy and backends unchanged. Opt-in (port, default off): GGML_SCHED_PLAN_FIRST=1; unset or 0
+        // always waits and plans once with ggml_gallocr_reserve_n (the base path).
+        static const bool plan_first = [] { const char * e = getenv("GGML_SCHED_PLAN_FIRST"); return e && atoi(e) != 0; }();
+        int n_gpu = 0, n_other = 0;  // one CUDA device plus CPU: copies between devices are not ordered on one stream
+        for (int i = 0; plan_first && i < sched->n_backends; i++) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[i]);
+            const char * reg = dev ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
+            if (strcmp(reg, "CUDA") == 0) {
+                n_gpu++;
+            } else if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                n_other++;
+            }
+        }
+        const bool planned = plan_first && n_gpu == 1 && n_other == 0 && !backend_ids_changed && sched->n_copies == 1;
+        const bool keep_running = planned &&
+            ggml_gallocr_plan_fits(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        for (int i = 0; i < sched->n_backends && !keep_running; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+        // plan_fits has planned the graph already: back that plan instead of planning it again
+        if (!(planned ? ggml_gallocr_reserve_planned(sched->galloc) :
+                        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids))) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
