@@ -488,6 +488,21 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
 
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
 
+// shards of a live registration always derive from the tensor's type and dims (the split axis shrinks)
+static bool ggml_backend_meta_shards_match(const ggml_tensor * tensor, const std::vector<ggml_tensor *> & shards) {
+    for (const ggml_tensor * s : shards) {
+        if (s->type != tensor->type) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            if (s->ne[i] > tensor->ne[i]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -495,13 +510,24 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
+    if (it != stc.simple_tensors.end() && !ggml_backend_meta_shards_match(tensor, it->second)) {
+        // a reset container can still hold an entry for a recycled tensor address: treat it as missing
+        it = stc.simple_tensors.end();
+    }
     if (it == stc.simple_tensors.end()) {
         // a reused graph (MTP target + draft) can outlive the container rotation and lose its registration:
         // re-register the still-live tensor on demand instead of returning null
+        static uint64_t reregistrations = 0;
         ggml_backend_meta_simple_tensor_container & cur = buf_ctx->stc_compute[buf_ctx->stc_compute_index];
-        ggml_backend_meta_buffer_init_tensor_impl(cur, const_cast<ggml_tensor *>(tensor));
+        if (ggml_backend_meta_buffer_init_tensor_impl(cur, const_cast<ggml_tensor *>(tensor)) != GGML_STATUS_SUCCESS) {
+            GGML_ABORT("meta backend: on-demand re-registration failed for tensor '%s'", tensor->name);
+        }
         it = cur.simple_tensors.find(tensor);
         GGML_ASSERT(it != cur.simple_tensors.end());
+        if (++reregistrations == 1) {
+            GGML_LOG_WARN("meta backend: re-registered a graph tensor lost to container rotation ('%s'; further occurrences silent)\n",
+                    tensor->name);
+        }
     }
     return it->second[index];
 }
