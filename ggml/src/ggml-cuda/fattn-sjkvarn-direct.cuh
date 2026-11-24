@@ -41,6 +41,7 @@
 #include "fattn-mma-f16.cuh" // fattn_sj_kvarn_u32_as_half2
 #include "mma.cuh"
 #include "fattn-sjkvarn-stream.cuh"
+#include "fattn-sjkvarn-verify.cuh"
 
 #include <cfloat>
 #include <climits>
@@ -982,6 +983,14 @@ static bool ggml_cuda_flash_attn_ext_sj_kvarn_direct_launch(ggml_backend_cuda_co
 
 // Use the same half-MMA arithmetic across supported decode widths. The existing override retains the integer path for comparison.
 inline void ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst)) {
+        ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_run(ctx, dst);
+        return;
+    }
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_applies(dst)) {
+        ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_run(ctx, dst);
+        return;
+    }
     if (ggml_get_op_params_i32(dst, 7) == GGML_TYPE_TURBO4_0) {
         ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl<true>(ctx, dst);
         return;

@@ -4,6 +4,7 @@
 #include "fattn-mma-turbo.cuh"
 #include "fattn-mma-sjkvarn.cuh"
 #include "fattn-sjkvarn-rot.cuh"
+#include "fattn-sjkvarn-verify.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -4670,6 +4671,10 @@ static bool ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ggml_backend_cuda_context & c
         return true; // fattn-sjkvarn-lowbits.cu rotates in-kernel or takes the separate passes itself
     }
     GGML_UNUSED(ctx);
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst) ||
+        ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_applies(dst)) {
+        return true;
+    }
     // 4/4: the stream decode kernel (fattn-sjkvarn-stream.cuh) through ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl
     static const int stream_max = getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") != nullptr
                                 ? atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8; // same default as fattn-sjkvarn-direct.cuh
@@ -4779,6 +4784,9 @@ static void ggml_cuda_fattn_sj_kvarn_rowsplit_view(const ggml_tensor * dst, cons
 // true when every chunk of this node is served by the n_q <= 8 decode kernel (a packed mask is judged by its f16
 // expansion, which ggml_cuda_fattn_mask_packed_native then selects for this node)
 static bool ggml_cuda_fattn_sj_kvarn_rowsplit(const ggml_tensor * dst) {
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst)) {
+        return false; // verify-tuned IMMA path handles T = 4..64 directly in a single launch
+    }
     if (!ggml_cuda_fattn_sj_kvarn_rowsplit_enabled() || dst->src[6] == nullptr || ggml_cuda_fattn_sj_kvarn_is_lowbits(dst) ||
             ggml_flash_attn_ext_get_lsa_block(dst) > 0 || dst->src[7] != nullptr || dst->src[8] != nullptr || dst->src[9] != nullptr) {
         // LSA guard: block-list / value-key / selected-row / LSE nodes keep their per-node inputs whole. With LSA on, the
@@ -4861,6 +4869,10 @@ static bool ggml_cuda_fattn_mask_packed_native(const ggml_tensor * dst) {
     if (dst->src[6] != nullptr) {
         if (ggml_cuda_fattn_sj_kvarn_is_lowbits(dst)) {
             return ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(dst);
+        }
+        if (ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst) ||
+            ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_applies(dst)) {
+            return false; // expand I32 packed mask to F16 cleanly
         }
         // the 4/4 direct decode reader (also each GGML_SJKVARN_ROWSPLIT chunk) still needs F16
         return dst->src[0]->ne[1] > 8 && !ggml_cuda_fattn_sj_kvarn_rowsplit(dst);

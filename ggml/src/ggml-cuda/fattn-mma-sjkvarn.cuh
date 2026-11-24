@@ -162,6 +162,7 @@ extern DECL_FATTN_MMA_SJKVARN_CASE(256, 256, 8, 1);
 bool ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(const ggml_tensor * dst);
 void ggml_cuda_flash_attn_ext_sj_kvarn_direct(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_flash_attn_ext_sj_kvarn_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#include "fattn-sjkvarn-verify.cuh"
 
 // Per-query-head mask (mask ne[2] == n_head; LSA per-KV-head pick, the q heads of a KV group share one mask): only the
 // 4/4 stream decode kernel (fattn-sjkvarn-stream.cuh) reads the head slice, so it is served at decode / verify widths
@@ -240,6 +241,14 @@ static void ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2(ggml_backend_cud
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     if (ggml_get_op_params_i32(dst, 7) == GGML_TYPE_I16) {
         ggml_cuda_sj_kvarn_trellis_cb_init();
+    }
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst)) {
+        ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_run(ctx, dst);
+        return;
+    }
+    if (ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_applies(dst)) {
+        ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_run(ctx, dst);
+        return;
     }
     if (mask->ne[2] != 1) {
         if (ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst)) {
@@ -329,7 +338,8 @@ static inline bool ggml_cuda_flash_attn_ext_sj_kvarn_supported(const int cc, con
     if (ggml_flash_attn_ext_get_lsa_block(dst) > 0 && !ggml_cuda_flash_attn_ext_sj_kvarn_lsa_blocks_ok(dst)) {
         return false;
     }
-    if (mask->ne[2] != 1 && !ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst) && !ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_tile_ok(dst)) {
+    if (mask->ne[2] != 1 && !ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_ok(dst) && !ggml_cuda_flash_attn_ext_sj_kvarn_head_mask_tile_ok(dst) &&
+            !ggml_cuda_flash_attn_ext_sj_kvarn_direct_verify_applies(dst) && !ggml_cuda_flash_attn_ext_sj_kvarn_stream_pv16_applies(dst)) {
         return false;
     }
     for (const ggml_tensor * kv : {K, V}) {
