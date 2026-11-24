@@ -18,6 +18,15 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+// ai4-coop128.cu (own TU): opt-in BN=128 cooperative AIT4_U expert prefill GEMM, GGML_CUDA_AI4_COOP128=1
+namespace ai4_coop {
+bool env_coop128_enabled();
+void dispatch_coop128_ait4(
+        const uint8_t * W, const int8_t * Xq, const float * Xs,
+        float * Y, int64_t ldy, int M, int N, int K, int xsh, bool is_id,
+        const ai4k::idmap & idm, int max_tiles, cudaStream_t stream);
+} // namespace ai4_coop
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -1688,6 +1697,14 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
             GGML_ABORT("unsupported 32-column expert layout");
         }
     } else if (bn == 128) {
+        if constexpr (LAY == ai4k::LAY_AIT4_U) {
+            // opt-in (default off): only where gemm<128> would run, and not under the INKPF3 shape sweep override
+            static const int s4_override = ai4_env_int("GGML_CUDA_AI4_ID_SHAPE", nullptr, 0);
+            if (sms && s4_override == 0 && ai4_coop::env_coop128_enabled()) {
+                ai4_coop::dispatch_coop128_ait4(W, q, s, Y, M, M, 0, K, XSH, true, idm, max_tiles, stream);
+                return;
+            }
+        }
         ai23_launch_id_gemm<128, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     } else {
         if constexpr (LAY == ai4k::LAY_AIT4_U) {
