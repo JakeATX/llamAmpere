@@ -1748,7 +1748,7 @@ int32_t common_answer_reserve(int32_t limit, int32_t reserve) {
         return 0;
     }
     if (reserve < 0) {
-        reserve = std::max(limit / 4, std::min(512, limit / 2));
+        reserve = std::min(std::max(limit / 4, std::min(512, limit / 2)), 2048); // auto: 1/4 of the limit, capped at 2048
     }
     return std::min(reserve, limit);
 }

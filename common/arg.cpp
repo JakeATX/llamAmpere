@@ -4820,7 +4820,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--reasoning-answer-reserve"}, "N",
         "close the think block early so N tokens stay for the answer when max_tokens or the context is near; "
-        "-1 = auto (1/4 of the limit, at least min(512, limit/2)), 0 = off (default: -1)",
+        "-1 = auto (1/4 of the limit, at least min(512, limit/2), at most 2048), 0 = off (default: -1)",
         [](common_params & params, int value) {
             if (value < -1) { throw std::invalid_argument("invalid value"); }
             params.sampling.reasoning_answer_reserve = value;

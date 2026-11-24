@@ -383,7 +383,8 @@ static void test_answer_reserve() {
     GGML_ASSERT(common_answer_reserve(4096, -1) == 1024);   // auto: 1/4 of the limit
     GGML_ASSERT(common_answer_reserve(1024, -1) == 512);    // auto: at least 512
     GGML_ASSERT(common_answer_reserve(600, -1) == 300);     // auto: at most half of a small limit
-    GGML_ASSERT(common_answer_reserve(131072, -1) == 32768);
+    GGML_ASSERT(common_answer_reserve(32768, -1) == 2048);   // auto: capped at 2048
+    GGML_ASSERT(common_answer_reserve(131072, -1) == 2048);
     GGML_ASSERT(common_answer_reserve(4096, 200) == 200);   // fixed
     GGML_ASSERT(common_answer_reserve(100, 200) == 100);    // fixed, clamped to the limit
 
