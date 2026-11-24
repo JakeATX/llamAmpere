@@ -68,6 +68,17 @@ LLAMA_API bool llama_mtp_pipe_step_ok(struct llama_context * draft);
 LLAMA_API void llama_ple_hint(struct llama_context * target, const llama_token * window, int32_t n_window);
 // steps run, steps queued ahead of their token, queued steps released unused; false if off or stopped by a timeout
 LLAMA_API bool llama_mtp_pipe_stats(struct llama_context * draft, uint64_t * n_steps, uint64_t * n_deferred, uint64_t * n_cancel);
+// [SPLITOVL] LLAMA_SPLIT_OVERLAP=1 (default off): overlapped verify windows under -sm layer on 2+ cards.
+// init returns false (and changes nothing) unless the flag is set, the model is layer split over 2+ devices, the
+// scheduler is pipeline parallel and no backend sampler is attached. split_overlap_decode decodes into output slot
+// 0 or 1 without waiting for the other slot's window; split_overlap_logits_ith waits for that slot's window only and
+// returns the logits of batch index i of that window. A slot's rows stay valid until the next decode into the same
+// slot. Rollback after a miss: llama_synchronize(), then llama_memory_seq_rm (the rollback ring must hold both
+// windows, i.e. n_rs_seq >= the two windows' rows minus one).
+LLAMA_API bool    llama_split_overlap_init(struct llama_context * ctx);
+LLAMA_API int32_t llama_split_overlap_decode(struct llama_context * ctx, struct llama_batch batch, int32_t slot);
+LLAMA_API bool    llama_split_overlap_wait(struct llama_context * ctx, int32_t slot);
+LLAMA_API float * llama_split_overlap_logits_ith(struct llama_context * ctx, int32_t slot, int32_t i);
 
 //
 // llama architecture queries

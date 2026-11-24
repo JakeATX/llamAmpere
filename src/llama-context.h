@@ -253,6 +253,13 @@ struct llama_context {
     void mtp_pipe_input(llm_graph_input_embd_h & input);
     void mtp_pipe_publish(uint32_t seq, llama_token token);
 
+    // [SPLITOVL] LLAMA_SPLIT_OVERLAP=1: overlapped verify windows under -sm layer on 2+ cards (see llama-split-overlap.cpp)
+    bool    split_overlap_init();
+    int32_t split_overlap_decode(const llama_batch & batch, int32_t slot);
+    bool    split_overlap_wait(int32_t slot);
+    float * split_overlap_logits_ith(int32_t slot, int32_t i);
+    void    split_overlap_swap_outputs();
+
     //
     // state save/load
     //
@@ -899,6 +906,28 @@ private:
     // kept separate from buf_output so that installing/removing a backend sampler never reallocates the
     // (much larger) logits/embeddings block
     ggml_backend_buffer_ptr buf_sampling;
+
+    // [SPLITOVL] two output sets so a queued verify window does not overwrite the window still being read: the
+    // live members above always describe the set the last decode wrote, `stash` the other one. Off (enabled false)
+    // unless llama_split_overlap_init() succeeded, and then nothing else in the context changes.
+    struct {
+        bool    enabled = false;
+        int32_t active  = 0;    // slot whose outputs the live members hold
+        struct {
+            ggml_backend_buffer_ptr          buf_output;
+            std::unique_ptr<llama_moe_output> output_file;
+            buffer_view<float>               logits     = {nullptr, 0};
+            buffer_view<float>               embd       = {nullptr, 0};
+            buffer_view<float>               embd_nextn = {nullptr, 0};
+            std::vector<buffer_view<float>>  embd_layer_inp;
+            std::vector<int32_t>             output_ids;
+            uint32_t                         n_outputs = 0;
+        } stash;
+        std::vector<ggml_backend_event_ptr> ev[2];     // one per GPU backend, recorded after the slot's decode
+        std::vector<ggml_backend_t>         ev_backend;
+        bool    recorded[2] = {false, false};
+        uint64_t n_decodes = 0;
+    } split_ovl;
 
     // largest number of output rows reserved so far; output_reserve() never sizes below it, so the pinned
     // buffers only ever grow (each growth is a cudaFreeHost/cudaMallocHost pair)
