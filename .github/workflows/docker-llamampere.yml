@@ -84,5 +84,7 @@ jobs:
       - name: Smoke test (no GPU on the runner)
         if: ${{ !inputs.push }}
         run: |
-          docker run --rm --entrypoint /bin/sh ${{ steps.meta.outputs.tags }} -c \
-            'ldd /app/llama-server | grep -v libcuda | grep "not found" && exit 1; /app/llama-server --help >/dev/null 2>&1; echo ok'
+          # libcuda.so.1 comes from the host driver at run time (NVIDIA Container Toolkit); every other library must resolve
+          missing=$(docker run --rm --entrypoint /bin/sh ${{ steps.meta.outputs.tags }} -c 'ldd /app/llama-server | grep "not found" | grep -v libcuda.so' || true)
+          if [ -n "$missing" ]; then echo "$missing"; exit 1; fi
+          echo "libraries ok"
