@@ -6,6 +6,7 @@
 #include "gguf.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
 #include "llama-hparams.h"
+#include "llama-moe-nvme.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -2424,8 +2425,19 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const bool direct_overlay = (int) idx == overlay_idx && file->has_direct_io();
             const size_t prefetch_size = prefetch && use_mmap && !use_moe_arena && !direct_overlay ? -1 : 0;
 
+            // fork (NVMETIER): with the NVMe tier on, the expert ranges are not prefetched (the tier reads them)
+            llama_mmap::ranges nvme_lazy;
+            const bool nvme_tier = llama_moe_nvme_enabled();
+            if (nvme_tier) {
+                nvme_lazy = lazy.for_file(idx);
+                for (const auto & [name, weight] : weights_map) {
+                    if (weight.idx == idx && llama_moe_nvme_is_expert_name(name.c_str())) {
+                        nvme_lazy.emplace_back(weight.offs, weight.offs + ggml_nbytes(weight.tensor));
+                    }
+                }
+            }
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx), fit_ram ? +fit_prefetch : nullptr, &prefetch_remaining);
+                    nvme_tier ? nvme_lazy : lazy.for_file(idx), fit_ram ? +fit_prefetch : nullptr, &prefetch_remaining);
             if (private_dense) {
                 for (const char * name : { "token_embd.weight", "output.weight" }) {
                     auto found = weights_map.find(name);

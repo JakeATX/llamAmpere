@@ -650,6 +650,11 @@ llama_build_and_test(test-topk-select-fast.cpp) # [ROUNDFIX] fast radix select b
 llama_build_and_test(test-lid-gather.cpp) # [ROUNDFIX] pooled-key gather read in place, bit-identity; skips without a GPU backend
 llama_build_and_test(test-mtp-vocab.cpp)
 llama_build_and_test(test-mtp-vocab-builtin.cpp ../src/llama-mtp-vocab-builtin.cpp)
+if (NOT WIN32)
+    # fork (NVMETIER): CPU-only NVMe expert tier test (O_DIRECT reads, eviction, bytes equal to the file)
+    llama_build_and_test(test-moe-nvme-tier.cpp ../src/llama-moe-nvme.cpp)
+    target_include_directories(test-moe-nvme-tier PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 llama_build_and_test(test-gdn-replay-split.cpp)
 # [TAG_GDN_REPLAY_LANES] short static rounds: joined (SHORT=1) and split (SHORT=1 SHORT_JOIN=0)
 llama_test(test-gdn-replay-split NAME test-gdn-replay-split-short)

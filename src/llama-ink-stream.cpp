@@ -3,6 +3,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-nvme.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -474,6 +475,8 @@ void llama_ink_stream::wait_issued() {
 void llama_ink_stream::worker(int w) {
     worker_state & ws = wst[w];
     uint64_t seen = 0;
+    // fork (NVMETIER, LLAMA_MOE_NVME_TIER=1): pieces are read through the RAM tier / the model file; nullptr = memcpy
+    llama_moe_nvme_tier * nvme = llama_moe_nvme_global();
     for (;;) {
         size_t n;
         int s;
@@ -500,7 +503,9 @@ void llama_ink_stream::worker(int w) {
             if (ws.used[b]) {
                 ggml_backend_event_synchronize(ws.ev[b]); // the previous upload from this staging buffer is done
             }
-            memcpy(ws.data[b], p.src, p.len);
+            if (nvme == nullptr || !nvme->read(p.src, p.len, ws.data[b])) {
+                memcpy(ws.data[b], p.src, p.len);
+            }
             {
                 std::lock_guard<std::mutex> ls(mtx_stream);
                 ggml_backend_tensor_set_async(backend_copy, raw[s], ws.data[b], p.dst_offs, p.len);

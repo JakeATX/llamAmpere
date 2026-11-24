@@ -44,6 +44,8 @@ set(LLAMA_CORE_SOURCES
     llama-ink-headloan.cpp
     llama-ink-host.cpp
     llama-moe-arena.cpp
+    llama-moe-nvme.cpp
+    llama-moe-nvme-setup.cpp
     llama-b1.cpp
     llama-ple-cache.cpp
     llama-ple-prefetch.cpp

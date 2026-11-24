@@ -9,6 +9,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-moe-nvme.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1676,6 +1677,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    llama_moe_nvme_global_release(this); // fork (NVMETIER): no-op unless LLAMA_MOE_NVME_TIER=1
     for (const void * data : moe_bank_registered) {
         ggml_moe_bank_unregister(data);
     }
@@ -2508,6 +2510,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
     load_arch_data_post();
+    if (llama_moe_nvme_enabled()) {
+        llama_moe_nvme_setup(*this, ml); // fork (NVMETIER)
+    }
 
     if (const char * profile = getenv("LLAMA_PLE_PROFILE"); profile && *profile && per_layer_tok_embd) {
         if (arch != LLM_ARCH_QWEN4EXP || !can_prefetch.count(per_layer_tok_embd)) {

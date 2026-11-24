@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-model.h"
+#include "llama-moe-nvme.h"
 
 #include "ggml-cpp.h"
 
@@ -606,6 +607,19 @@ struct llama_moe_cache::impl {
     llama_moe_cache_heat     heat;
     llama_moe_split_policy   split;
     stats req_small, req_large; // stats at the previous request end
+    // fork (NVMETIER, LLAMA_MOE_NVME_TIER=1): the uploads read the host experts from the RAM tier, which reads the
+    // missing ones from the model file; nullptr (the default) reads them from the mapping as before
+    llama_moe_nvme_tier * nvme = llama_moe_nvme_global();
+    // host bytes of an upload: the RAM tier copy when the tier is on
+    const uint8_t * host_src(const ggml_tensor * w, size_t offs, size_t size) const {
+        const uint8_t * p = (const uint8_t *) w->data + offs;
+        if (nvme != nullptr) {
+            if (const void * q = nvme->ensure(p, size)) {
+                return (const uint8_t *) q;
+            }
+        }
+        return p;
+    }
 
 
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
@@ -1410,6 +1424,9 @@ struct llama_moe_cache::impl {
         if (prefetch) {
             prefetch->wait(); // uploads ahead write the banks this lookup plans over
         }
+        if (nvme != nullptr) {
+            nvme->epoch(); // the uploads of earlier lookups have left the host buffers (pageable copies)
+        }
         layer & l = layers[il];
         group & g = groups[l.ig];
 
@@ -1548,6 +1565,16 @@ struct llama_moe_cache::impl {
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
+        if (nvme != nullptr && !fills.empty()) {
+            // fork (NVMETIER): read every missing expert of the layer into the RAM tier at once (parallel reads)
+            std::vector<std::pair<const void *, size_t>> want;
+            for (const ggml_tensor * w : l.experts) {
+                for (const auto & f : fills) {
+                    want.emplace_back((const uint8_t *) w->data + f.expert*w->nb[2], (size_t) w->nb[2]);
+                }
+            }
+            nvme->ensure_many(want);
+        }
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
@@ -1557,7 +1584,8 @@ struct llama_moe_cache::impl {
                 while (w->nb[2] == expert_size && i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*w->nb[2], fills[i].slot*expert_size, n*expert_size);
+                const uint8_t * src = nvme ? host_src(w, fills[i].expert*w->nb[2], n*expert_size) : (const uint8_t *) w->data + fills[i].expert*w->nb[2];
+                ggml_backend_tensor_set_async(backend, bank, src, fills[i].slot*expert_size, n*expert_size);
                 bytes += n*expert_size;
                 i += n;
             }
@@ -1708,7 +1736,8 @@ struct llama_moe_cache::impl {
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const ggml_tensor * w    = l.experts[ip];
                     ggml_tensor       * bank = g.banks[ip];
-                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + e*w->nb[2], s*bank->nb[2], bank->nb[2]);
+                    const uint8_t * src = nvme ? host_src(w, e*w->nb[2], bank->nb[2]) : (const uint8_t *) w->data + e*w->nb[2];
+                    ggml_backend_tensor_set_async(backend, bank, src, s*bank->nb[2], bank->nb[2]);
                     stats_small.bytes += bank->nb[2];
                 }
                 n_swap++;
@@ -1958,6 +1987,20 @@ struct llama_moe_cache::impl {
                     n++;
                 }
                 const layer & l = layers[il];
+                if (nvme != nullptr) {
+                    // fork (NVMETIER): queued, read into the RAM tier in parallel batches below
+                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                        for (int32_t k = 0; k < n; ++k) {
+                            nvme_refill.push_back({ l.experts[ip], g.banks[ip], e + k, s + k });
+                            nvme_refill_bytes += g.banks[ip]->nb[2];
+                        }
+                    }
+                    if (nvme_refill_bytes >= nvme_refill_batch) {
+                        nvme_refill_flush();
+                    }
+                    s += n;
+                    continue;
+                }
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     const ggml_tensor * w    = l.experts[ip];
                     ggml_tensor       * bank = g.banks[ip];
@@ -1973,8 +2016,37 @@ struct llama_moe_cache::impl {
                 s += n;
             }
         }
+        if (nvme != nullptr) {
+            nvme_refill_flush();
+        }
         is_suspended = false;
         return true;
+    }
+
+    // fork (NVMETIER): resume() uploads from the RAM tier, in batches of up to 256 MiB read in parallel (synchronous
+    // uploads, so a batch may leave the tier once it is on the device)
+    struct nvme_upload { const ggml_tensor * w; ggml_tensor * bank; int32_t e; int32_t s; };
+    std::vector<nvme_upload> nvme_refill;
+    size_t nvme_refill_bytes = 0;
+    static constexpr size_t nvme_refill_batch = 256u << 20;
+    void nvme_refill_flush() {
+        if (nvme_refill.empty()) {
+            return;
+        }
+        nvme->epoch();
+        std::vector<std::pair<const void *, size_t>> want;
+        want.reserve(nvme_refill.size());
+        for (const auto & u : nvme_refill) {
+            want.emplace_back((const uint8_t *) u.w->data + u.e*u.w->nb[2], (size_t) u.bank->nb[2]);
+        }
+        nvme->ensure_many(want);
+        for (const auto & u : nvme_refill) {
+            const size_t expert_size = u.bank->nb[2];
+            ggml_backend_tensor_set(u.bank, host_src(u.w, u.e*u.w->nb[2], expert_size), u.s*expert_size, expert_size);
+        }
+        nvme_refill.clear();
+        nvme_refill_bytes = 0;
+        nvme->epoch();
     }
 
     void log_stats() const {
@@ -1998,6 +2070,9 @@ struct llama_moe_cache::impl {
         }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+        }
+        if (nvme != nullptr) {
+            nvme->print_stats("MoE cache");
         }
     }
 
