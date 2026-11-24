@@ -16050,7 +16050,7 @@ struct test_depth_mix_norm_view : public test_case {
 };
 
 // [FUSE QKVNORM] the RMS_NORM -> MUL -> Q8_0 MUL_MAT run (INKGLUE NORMQ) reading a one-row view of a three-row mix (row
-// stride three rows, as the Q, K and V input norms of a full-attention decode visit); GGML_CUDA_FUSE_QKVNORM=1 fuses it
+// stride three rows, as the Q, K and V input norms of a full-attention decode visit); QKVNORM (default on) fuses it
 struct test_ink_qkvnorm : public test_case {
     const int64_t n, m;
     const int row;
@@ -18695,7 +18695,7 @@ struct test_flash_attn_ext_inkrel_factor : public test_case {
 };
 
 // Inkling full-attention far / near merge (llama-graph.cpp inkrel_merge with the far LSE + table constant, the packed
-// pair unpack of the far output and the output gate), built in the graph's node order; GGML_CUDA_FUSE_RELMERGE=1 runs it
+// pair unpack of the far output and the output gate), built in the graph's node order; RELMERGE (default on) runs it
 // as one launch on CUDA
 struct test_inkrel_merge : public test_case {
     const int64_t dv, g, P, T; const bool packed, gated;
