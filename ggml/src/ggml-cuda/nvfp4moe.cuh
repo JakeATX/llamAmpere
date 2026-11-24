@@ -6,6 +6,10 @@
 #include "inkglue.cuh"
 
 #define NVFP4MOE_MAX_TOK 16
+// fork MTSPLIT: largest token count taken as <= 8-token NVFP4MT chunks (4 users x 5 verify tokens = 20)
+#define NVFP4MT_SPLIT_MAX_TOK 32
+// fork MTSPLIT: GGML_CUDA_NVFP4MT_SPLIT=1 (port: opt-in, default off)
+bool ggml_cuda_nvfp4mt_split_enabled();
 
 struct nvfp4moe_params {
     const char    * w_gu;  int64_t gu_nb1, gu_nb2;   // gate_up [K, 2F, E]: row and expert strides in bytes
