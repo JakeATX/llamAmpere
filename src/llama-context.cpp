@@ -7153,8 +7153,8 @@ int llama_context::ink_b1_prepare(llama_memory_context_i * mctx, const llama_bat
     if (cparams.embeddings || cparams.embeddings_nextn || cparams.embeddings_nextn_dev || cparams.embeddings_layer_inp_dev ||
             layer_inp || layer_inp_dev || cparams.pipeline_parallel || !cparams.causal_attn || mtp_hidden.enabled ||
             mtp_hidden_source || mtp_feedback.active || mtp_pipe.active || d1 || ple_pf || ubatch_rows_cb ||
-            !ckpt_caps.empty() || mctx->has_kv_stream_targets() || (loras && !loras->empty())) {
-        return normal("a feature that reads every layer of a ubatch (embeddings, drafter features, MTP, checkpoints, LoRA)");
+            mctx->has_kv_stream_targets() || (loras && !loras->empty())) {
+        return normal("a feature that reads every layer of a ubatch (embeddings, drafter features, MTP, LoRA)");
     }
     llama_seq_id seq = -1;
     for (const auto & tok : batch_inp.tokens) {
@@ -7345,6 +7345,8 @@ bool llama_context::ink_b1_run_prefix(llama_memory_context_i * mctx, size_t ub0,
                 return false;
             }
             ink_b1.graphs++;
+            // in-call checkpoints: this graph wrote visit slot il of ubatch u (a later ubatch overwrites those rows)
+            capture_ubatch(hctx->get_ubatch(), il, il + 1);
         }
     }
     if (!hctx->ink_b1_seek(ub0)) {
@@ -8381,8 +8383,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
-        // in-call checkpoints: the normal path ran every layer, B1's last range the layers from b1_final_l0 on
-        capture_ubatch(ubatch, b1_mode == 1 ? b1_final_l0 : 0, -1);
+        // in-call checkpoints: the normal path ran every layer, B1's last range the layers from b1_final_l0 on, INKB1's
+        // last graph the slot of the last visit (ink_b1_run_prefix took the others)
+        if (b1_mode == 4) {
+            const int32_t il_last = model.ink_b1_visit_slot((int32_t) model.hparams.n_layer() - 1);
+            capture_ubatch(ubatch, il_last, il_last + 1);
+        } else {
+            capture_ubatch(ubatch, b1_mode == 1 ? b1_final_l0 : 0, -1);
+        }
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -11919,6 +11927,22 @@ class llama_io_write_layout : public llama_io_write_i {
     bool   same = true;
 };
 
+// [INKB1] the SWA cache of a hybrid iSWA memory whose full-attention cache is SJ-KVaRN (its PARTIAL_ONLY state holds no
+// full-attention rows), else nullptr
+const llama_kv_cache * llama_context::capture_swa() const {
+    // port: only with INKB1 (LLAMA_INK_B1=1); otherwise capture_mem() answers as the cand base
+    static const bool ink_b1_on = [] { const char * e = getenv("LLAMA_INK_B1"); return e && atoi(e) != 0; }();
+    if (!ink_b1_on) {
+        return nullptr;
+    }
+    const auto * hi = dynamic_cast<const llama_memory_hybrid_iswa *>(memory.get());
+    if (hi == nullptr || hi->get_mem_attn() == nullptr || hi->get_mem_recr() == nullptr) {
+        return nullptr;
+    }
+    const auto * base = hi->get_mem_attn()->get_base();
+    return base != nullptr && base->is_sj_kvarn() ? hi->get_mem_attn()->get_swa() : nullptr;
+}
+
 const llama_memory_recurrent * llama_context::capture_mem() const {
     // PARTIAL_ONLY is exactly the recurrent state for these memories (the hybrid ones skip their attention cache and
     // indexer); under gdn_replay the checkpoint state and the ingredient ring rows travel in the replay section, and
@@ -11926,6 +11950,10 @@ const llama_memory_recurrent * llama_context::capture_mem() const {
     const llama_memory_recurrent * mem_recr = nullptr;
     if (const auto * hyb = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
         mem_recr = hyb->get_mem_recr();
+    } else if (const llama_kv_cache * swa = capture_swa()) {
+        // [INKB1] hybrid iSWA on SJ-KVaRN: PARTIAL_ONLY is the SWA window and the recurrent state, both per layer
+        (void) swa;
+        mem_recr = static_cast<const llama_memory_hybrid_iswa *>(memory.get())->get_mem_recr();
     } else {
         mem_recr = dynamic_cast<const llama_memory_recurrent *>(memory.get());
     }
@@ -12006,7 +12034,9 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
     }
 
     const auto * mem_recr = capture_mem();
-    const int32_t n_layer = (int32_t) mem_recr->r_l.size();
+    const llama_kv_cache * swa = capture_swa();
+    const int32_t n_recr  = (int32_t) mem_recr->r_l.size();
+    const int32_t n_layer = swa ? std::max<int32_t>(n_recr, (int32_t) model.hparams.n_layer()) : n_recr;
     if (il1 < 0 || il1 > n_layer) {
         il1 = n_layer;
     }
@@ -12070,16 +12100,19 @@ void llama_context::capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int
             c.layer_done.assign(n_layer, 1);
             // gdn_replay: the checkpoint state and the ingredient ring of a layer are that layer's rows too
             auto layer_tensor = [&](const ggml_tensor * t, int32_t il) {
-                return t != nullptr && (t == mem_recr->r_l[il] || t == mem_recr->s_l[il] || t == mem_recr->p_l[il] ||
+                return t != nullptr && il < n_recr && (t == mem_recr->r_l[il] || t == mem_recr->s_l[il] || t == mem_recr->p_l[il] ||
                     (il < (int32_t) mem_recr->s_ckpt_l.size() && t == mem_recr->s_ckpt_l[il]) ||
                     (il < (int32_t) mem_recr->ingr_l.size()   && t == mem_recr->ingr_l[il]));
             };
             for (int32_t il = 0; il < n_layer; ++il) {
-                if (mem_recr->r_l[il] || mem_recr->s_l[il] || mem_recr->p_l[il]) {
+                if ((il < n_recr && (mem_recr->r_l[il] || mem_recr->s_l[il] || mem_recr->p_l[il])) || (swa && swa->has_layer(il))) {
                     c.layer_done[il] = 0;
                 }
             }
             for (auto & w : c.writes) {
+                if (swa) {
+                    w.il = swa->layer_of_tensor(w.t); // [INKB1] a SWA window row
+                }
                 for (int32_t il = 0; il < n_layer && w.il < 0; ++il) {
                     if (layer_tensor(w.t, il)) {
                         w.il = il;

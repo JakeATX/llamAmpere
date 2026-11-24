@@ -1010,6 +1010,7 @@ private:
 
     // the recurrent memory whose PARTIAL_ONLY state the captures copy, nullptr when unsupported
     const llama_memory_recurrent * capture_mem() const;
+    const llama_kv_cache *         capture_swa() const;
     // after a ubatch graph over layers [il0, il1) (il1 < 0: to the last layer) ran: copy the rows of a capture
     // whose spot this ubatch ends
     void capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int32_t il1);

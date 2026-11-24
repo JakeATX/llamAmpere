@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -347,6 +348,16 @@ public:
     // returns the far visible end: 1 + the last far-visible mask column over all rows (0: none)
     int64_t   set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     bool      has_layer(int32_t il) const { return map_layer_ids.count(il) != 0; }
+    // [INKB1] the layer whose K or V cache (or one of its stream views) is t, -1 for none (in-call checkpoint rows)
+    int32_t   layer_of_tensor(const ggml_tensor * t) const {
+        for (const auto & layer : layers) {
+            if (t == layer.k || t == layer.v || std::find(layer.k_stream.begin(), layer.k_stream.end(), t) != layer.k_stream.end() ||
+                    std::find(layer.v_stream.begin(), layer.v_stream.end(), t) != layer.v_stream.end()) {
+                return (int32_t) layer.il;
+            }
+        }
+        return -1;
+    }
     // INKKV: would seq_rm(seq_id, p0, p1) succeed? (no change; hybrid memories ask before touching the recurrent state)
     bool      sj_kvarn_can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_st[0].N; }

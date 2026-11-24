@@ -5566,15 +5566,16 @@ private:
         return dft_windowed() ? (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     }
 
-    // In-call checkpoints: on with B1 (LLAMA_B1=1, layer-major prefill), unless LLAMA_B1_CKPT=0. A prompt checkpoint
+    // In-call checkpoints: on with B1 (LLAMA_B1=1, layer-major prefill) or INKB1 (LLAMA_INK_B1=1), unless LLAMA_B1_CKPT=0. A prompt checkpoint
     // spot on the SJ-KVaRN grid then no longer ends the batch: the decode copies the recurrent state when the ubatch
     // that ends there has run (llama_state_seq_capture_arm), and the checkpoint is made from the copy after the call.
     // A B1 call that ended at the spot would pay another pass over the streamed experts for the tokens after it.
     bool ckpt_in_call_enabled() const {
         static const bool on = [] {
             const char * b1 = getenv("LLAMA_B1");
+            const char * ib = getenv("LLAMA_INK_B1"); // [INKB1] layer-major prompt groups on the expert streamer
             const char * ck = getenv("LLAMA_B1_CKPT");
-            return b1 && atoi(b1) != 0 && !(ck && atoi(ck) == 0);
+            return ((b1 && atoi(b1) != 0) || (ib && atoi(ib) != 0)) && !(ck && atoi(ck) == 0);
         }();
         return on;
     }
