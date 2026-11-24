@@ -4,11 +4,11 @@
 #include "inkglue.cuh"
 #include "prefill-glue-math.h"
 
-// [PREFILL-GLUE] Default-off switches. With both unset (or 0) no hook below changes anything: dispatch and numerics are
+// [PREFILL-GLUE] Default-on switches. With both set to 0 no hook below changes anything: dispatch and numerics are
 // those of rc/v0.7.4-small @ a0360f2e3. A fused producer always writes its normal f32 output; the quantized copy it
 // adds is a cache a consumer matmul takes only on an exact match.
-bool ggml_cuda_prefill_fuse_glu_actq_on();   // GGML_CUDA_PREFILL_FUSE_GLU_ACTQ=1 (default 0)
-bool ggml_cuda_prefill_fuse_norm_actq_on();  // GGML_CUDA_PREFILL_FUSE_NORM_ACTQ=1 (default 0)
+bool ggml_cuda_prefill_fuse_glu_actq_on();   // GGML_CUDA_PREFILL_FUSE_GLU_ACTQ=0 turns it off (default 1)
+bool ggml_cuda_prefill_fuse_norm_actq_on();  // GGML_CUDA_PREFILL_FUSE_NORM_ACTQ=0 turns it off (default 1)
 bool ggml_cuda_prefill_any_on();
 
 // Context lifecycle / invalidation. invalidate drops every entry whose source memory overlaps [ptr, ptr + nbytes), except

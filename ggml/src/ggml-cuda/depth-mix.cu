@@ -293,7 +293,7 @@ bool ggml_cuda_depth_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const size_t smem_bytes = use_smem ? (size_t) n * sizeof(float) : 0;
     const dim3 grid((unsigned) T, 1);
     if (nvfp4_kf != 0) {
-        // [PREFILL-GLUE] opt-in only (GGML_CUDA_PREFILL_FUSE_NORM_ACTQ): same mix + norm, ndst always written, then the
+        // [PREFILL-GLUE] default on (GGML_CUDA_PREFILL_FUSE_NORM_ACTQ=0 disables): same mix + norm, ndst always written, then the
         // NVFP4PF activation quantized from the row this block just wrote
 #define DEPTH_MIX_NORM_KF(W_, SMEM_, KF_) \
         k_depth_mix<1, W_, true, SMEM_, KF_><<<grid, DEPTH_MIX_THREADS, SMEM_ ? smem_bytes : 0, stream>>>(sd, s1, s2, k, \
