@@ -8,6 +8,8 @@
 #include "ai4-turbo.cuh"
 #include "ai4-exp-turbo.cuh"
 #include "ai4-decode-fast.cuh"
+#include "ait5a16.cuh"
+#include "ai5-coop128.cuh"
 #include "magic2-v2.cuh"
 #include "aif25-mmq.cuh"
 #include "../ggml-aif25.h"
@@ -17,6 +19,15 @@
 #include "moe-weighted-reduction.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+
+// ai4-coop128.cu (own TU): opt-in BN=128 cooperative AIT4_U expert prefill GEMM, GGML_CUDA_AI4_COOP128=1
+namespace ai4_coop {
+bool env_coop128_enabled();
+void dispatch_coop128_ait4(
+        const uint8_t * W, const int8_t * Xq, const float * Xs,
+        float * Y, int64_t ldy, int M, int N, int K, int xsh, bool is_id,
+        const ai4k::idmap & idm, int max_tiles, cudaStream_t stream);
+} // namespace ai4_coop
 
 #include <algorithm>
 #include <cmath>
@@ -287,6 +298,20 @@ static bool ai4_lowreg_id(int n_tok) {
     // ub 1024 +1.13%: cap 1024 (never slower by default; UBDEFAULT Inkling ceiling is 1024)
     static const int mx = ai4_env_int("GGML_CUDA_AI4_LOWREG_ID_MAX_N", nullptr, 1024);
     return v && n_tok >= mn && n_tok <= mx;
+}
+// Opt-in AIT5_U expert prefill lowreg, GGML_CUDA_AI5_LOWREG_ID=1 (default 0); same int sums and order as the AIT5_U gemm<64> ID
+static std::atomic<uint64_t> g_ai5_lowreg_id_fires{0};
+static bool ai5_lowreg_id(int n_tok) {
+    static const bool v = ai4_env_int("GGML_CUDA_AI5_LOWREG_ID", nullptr, 0) != 0;
+    static const int mn = ai4_env_int("GGML_CUDA_AI5_LOWREG_ID_MIN_N", nullptr, 64);
+    static const int mx = ai4_env_int("GGML_CUDA_AI5_LOWREG_ID_MAX_N", nullptr, 1024);
+    return v && n_tok >= mn && n_tok <= mx;
+}
+extern "C" GGML_BACKEND_API uint64_t ggml_cuda_ai5_lowreg_id_fire_count(void) {
+    return g_ai5_lowreg_id_fires.load(std::memory_order_relaxed);
+}
+extern "C" GGML_BACKEND_API void ggml_cuda_ai5_lowreg_id_reset_fire_count(void) {
+    g_ai5_lowreg_id_fires.store(0, std::memory_order_relaxed);
 }
 static int ai4_bn128_min() {
     static const int v = ai4_env_int("GGML_CUDA_AI4_BN128_MIN", nullptr, 512);
@@ -1431,6 +1456,9 @@ void ggml_cuda_mul_mat_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
 
     if (ai4_fast_ok(ctx)) {
+        if (src0->type == GGML_TYPE_AIT5_U && ggml_cuda_ait5a16_mul_mat(ctx, src0, src1, dst)) {
+            return;
+        }
         const int rate = ggml_ai4_rate(src0->type);
         // With very few outputs, activation quantization can dominate the output norm.
         // Keep these small products in f32 without changing the normal matrix kernels.
@@ -1473,7 +1501,7 @@ bool ggml_cuda_mul_mat_ai4_group(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // leave them to the single path so grouped layers get decode-fast too (GGML_CUDA_AI4_DECODE_FAST=0 restores grouping;
     // GGML_CUDA_AI4_DF_GROUP_BAIL=0 keeps the rc7 grouped launch with decode-fast on elsewhere, for A/B)
     static const bool df_bail = ai4_env_int("GGML_CUDA_AI4_DF_GROUP_BAIL", nullptr, 1) != 0;
-    if (df_bail && ggml_cuda_ai4_decode_fast_enabled()) {
+    if ((df_bail && ggml_cuda_ai4_decode_fast_enabled()) || (t == GGML_TYPE_AIT5_U && ggml_cuda_ait5a16_enabled())) {
         const int cc = ggml_cuda_info().devices[ctx.device].cc;
         if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
             return false;
@@ -1688,10 +1716,31 @@ static void ai4_mm_id_kernels(const uint8_t * W, const int8_t * q, const float *
             GGML_ABORT("unsupported 32-column expert layout");
         }
     } else if (bn == 128) {
+        if constexpr (LAY == ai4k::LAY_AIT4_U) {
+            // opt-in (default off): only where gemm<128> would run, and not under the INKPF3 shape sweep override
+            static const int s4_override = ai4_env_int("GGML_CUDA_AI4_ID_SHAPE", nullptr, 0);
+            if (sms && s4_override == 0 && ai4_coop::env_coop128_enabled()) {
+                ai4_coop::dispatch_coop128_ait4(W, q, s, Y, M, M, 0, K, XSH, true, idm, max_tiles, stream);
+                return;
+            }
+        } else if constexpr (LAY == ai4k::LAY_AIT5_U) {
+            // opt-in GGML_CUDA_AI5_COOP128=1 (default off), same placement rule as the AIT4_U coop128 above
+            static const int s4_override = ai4_env_int("GGML_CUDA_AI4_ID_SHAPE", nullptr, 0);
+            if (sms && s4_override == 0 && ai5_coop::env_coop128_enabled()) {
+                ai5_coop::dispatch_coop128_ait5_id(W, q, s, Y, M, M, 0, K, XSH, idm, max_tiles, stream);
+                return;
+            }
+        }
         ai23_launch_id_gemm<128, LAY, XSH>(W, q, s, Y, M, K, stream, idm, max_tiles);
     } else {
         if constexpr (LAY == ai4k::LAY_AIT4_U) {
             if (sms && ai4_lowreg_id(n_tok)) {
+                ai4_turbo::launch_gemm_s8_lowreg<LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles, sms);
+                return;
+            }
+        } else if constexpr (LAY == ai4k::LAY_AIT5_U) {
+            if (sms && ai5_lowreg_id(n_tok)) {
+                g_ai5_lowreg_id_fires.fetch_add(1, std::memory_order_relaxed);
                 ai4_turbo::launch_gemm_s8_lowreg<LAY, XSH, true>(W, q, s, Y, M, M, 0, K, stream, idm, max_tiles, sms);
                 return;
             }
@@ -1759,6 +1808,10 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
         }
         CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_AIT5_U && ggml_cuda_ait5a16_mul_mat_id(ctx, dst, y_into)) {
         return;
     }
 
@@ -1847,6 +1900,8 @@ void ggml_cuda_mul_mat_id_ai4(ggml_backend_cuda_context & ctx, const ggml_tensor
         bn = ai4_ampere_bn(n_tok);
     } else if (sms && src0->type == GGML_TYPE_AIT4_U && bn != ai4k::MMV_ID_BN && !direct && ai4_lowreg_id(n_tok)) {
         bn = 64;   // gemm_s8_lowreg consumes 64-route tiles
+    } else if (sms && src0->type == GGML_TYPE_AIT5_U && bn != ai4k::MMV_ID_BN && !direct && ai5_lowreg_id(n_tok)) {
+        bn = 64;   // opt-in GGML_CUDA_AI5_LOWREG_ID=1: gemm_s8_lowreg for AIT5_U, same 64-route tiles
     }
     static const bool tight_grid = ai4_env_int("GGML_CUDA_AI23_ID_TIGHT_GRID", nullptr, 0) != 0;
     const bool tight = tight_grid && (rate == 2 || rate == 3) && bn != ai4k::MMV_ID_BN;
