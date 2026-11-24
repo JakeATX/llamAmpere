@@ -9,7 +9,7 @@
 //     MMQ vec dot's: sum = fma(float(dot)*dA, dB, sum), blocks in K order, no K split.
 //   - streams X (raw 34-byte Q8_0 blocks, 4 per stage row) and the q8_1 activation tile with cp.async, 2-4 stages.
 //   - tile 128 rows x BN columns (BN 128/64/32 picked for wave efficiency), 8 warps of 32 x BN/2.
-// Gate: Q8_0 weights, rows % 128 == 0, K % 128 == 0, ncols >= GGML_CUDA_MMQ_Q8PF_MIN (default 64, never below 16),
+// Gate: Q8_0 weights, rows % 128 == 0 and <= GGML_CUDA_MMQ_Q8PF_MAXROWS (2304), K % 128 == 0, ncols >= GGML_CUDA_MMQ_Q8PF_MIN (default 64, never below 16),
 // no ids / fusion / channels. Everything else keeps the default MMQ.
 
 #include "mmq-q8pf.cuh"
@@ -48,6 +48,14 @@ static bool q8pf_enabled() {
 
 static int q8pf_min_cols() {
     static const int v = std::max(16, q8pf_env_int("GGML_CUDA_MMQ_Q8PF_MIN", 64));
+    return v;
+}
+
+// Weights with more rows stay on stock MMQ: its stream-K partition beats this kernel there (RTX 3090, n=1024, kernel
+// only: 3072 x 2304 198 us vs 155 + 20 us fixup; 1024 x 2304 60 vs 56 + 19; 384 x 2304 40 vs 27 + 17).
+// GGML_CUDA_MMQ_Q8PF_MAXROWS=N (default 2304, 0 = no cap).
+static int64_t q8pf_max_rows() {
+    static const int64_t v = std::max(0, q8pf_env_int("GGML_CUDA_MMQ_Q8PF_MAXROWS", 2304));
     return v;
 }
 
@@ -321,7 +329,7 @@ bool ggml_cuda_should_use_mmq_q8pf(const mmq_args & args) {
             args.nchannels_x != 1 || args.nchannels_y != 1 || args.nsamples_x != 1 || args.nsamples_y != 1 ||
             args.ncols_dst < q8pf_min_cols() || args.ncols_dst != args.ncols_y || args.ncols_max != args.ncols_dst ||
             args.ncols_x <= 0 || args.ncols_x % 128 != 0 || args.ncols_x/128 > INT_MAX ||
-            args.nrows_x <= 0 || args.nrows_x % q8pf_bm != 0 || args.nrows_x/q8pf_bm > 65535 ||
+            args.nrows_x <= 0 || args.nrows_x % q8pf_bm != 0 || (q8pf_max_rows() > 0 && args.nrows_x > q8pf_max_rows()) || args.nrows_x/q8pf_bm > 65535 ||
             args.ncols_dst > INT_MAX - 128 ||
             args.stride_row_x < args.ncols_x/QK8_0 || args.stride_row_x % 4 != 0 ||
             args.nrows_dst < args.nrows_x || uintptr_t(args.x) % 8 != 0 || uintptr_t(args.y) % 16 != 0) {
