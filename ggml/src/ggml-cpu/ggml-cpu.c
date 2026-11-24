@@ -18,6 +18,7 @@
 #include "common.h"
 #include "ggml-ai4.h"
 #include "ggml-ai4-decode.h"
+#include "ai4-avx2.h"
 #include "tiled/tiled.h"
 #include "exl3.h"
 
@@ -1664,6 +1665,10 @@ static void ggml_compute_forward_mul_mat_ai4(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    if (ggml_cpu_ai4_avx2_mul_mat(params, dst)) {   // opt-in GGML_CPU_AI4_AVX2=1
+        return;
+    }
+
     const uint32_t aimul = ggml_ai4_trellis_mul(src0->type);
     GGML_ASSERT(ne02 == 1 && ne03 == 1);
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
@@ -1706,6 +1711,10 @@ static void ggml_compute_forward_mul_mat_id_ai4(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    if (ggml_cpu_ai4_avx2_mul_mat_id(params, dst)) {   // opt-in GGML_CPU_AI4_AVX2=1
+        return;
+    }
 
     const uint32_t aimul = ggml_ai4_trellis_mul(src0->type);
     GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
@@ -3816,6 +3825,9 @@ struct ggml_cplan ggml_graph_plan(
 
                         if (ggml_ai4_rate(node->src[0]->type) != 0) {
                             cur = (size_t) n_tasks * 16 * node->src[0]->ne[0] * sizeof(float);
+                            if (ggml_cpu_ai4_avx2_use(node)) {   // opt-in GGML_CPU_AI4_AVX2=1: + rotated activations
+                                cur = ggml_cpu_ai4_avx2_work_size(node, n_tasks);
+                            }
                         } else if (ggml_exl3_bits(node->src[0]->type)) {
                             // per-thread [16][K] f32 row-group scratch (ggml_compute_forward_mul_mat_exl3),
                             // plus a shared [T][K] x' when the node carries the suh/svh glue (src[2])
@@ -3842,6 +3854,9 @@ struct ggml_cplan ggml_graph_plan(
                         cur = 0;
                         if (ggml_ai4_rate(node->src[0]->type) != 0) {
                             cur = (size_t) n_tasks * 16 * node->src[0]->ne[0] * sizeof(float);
+                            if (ggml_cpu_ai4_avx2_use(node)) {   // opt-in GGML_CPU_AI4_AVX2=1: + rotated activations
+                                cur = ggml_cpu_ai4_avx2_work_size(node, n_tasks);
+                            }
                             break;
                         }
                         const struct ggml_tensor * src0 = node->src[0];
