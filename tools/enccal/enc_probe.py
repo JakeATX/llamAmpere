@@ -182,25 +182,29 @@ def tensor_ids(n_layer):
 
 
 def cmd_rank(a):
+    # each directory is one scoring platform with its own base score; a delta is arm - base of the SAME directory
+    bases = {d: kld_mean(os.path.join(d, a.pattern.format(arm=a.b0))) for d in a.scores}
     def f(arm):
         for d in a.scores:
             v = kld_mean(os.path.join(d, a.pattern.format(arm=arm)))
             if v is not None:
-                return v
+                if bases[d] is None:
+                    raise SystemExit(f'{d}: has {arm} but no base arm {a.b0}')
+                return v - bases[d]
         return None
-    b0 = f(a.b0)
+    b0 = next((v for v in bases.values() if v is not None), None)
     if b0 is None:
         raise SystemExit(f'no score for base arm {a.b0}')
     anchors = [(x.split('=', 1)[0], x.split('=', 1)[1]) for x in a.anchor]   # FORMAT=TEMPLATE, arm = TEMPLATE % tid
     rows = []
     for tid in tensor_ids(a.n_layer):
         p = f(a.probe.format(t=tid))
-        row = dict(tensor=tid, role=role_of(tid), probe=None if p is None else p - b0)
+        row = dict(tensor=tid, role=role_of(tid), probe=p)
         for fmt, pre in anchors:
             m = f(pre.format(t=tid))
-            row[f'meas_{fmt}'] = None if m is None else m - b0
+            row[f'meas_{fmt}'] = m
         rows.append(row)
-    print(f'base {a.b0} KLD {b0:.6f}; probe arms scored: {sum(r["probe"] is not None for r in rows)}/{len(rows)}')
+    print('base ' + ' '.join(f'{d}:{v:.6f}' for d, v in bases.items() if v is not None) + f'; probe arms scored: {sum(r["probe"] is not None for r in rows)}/{len(rows)}')
     # calibration: per (role, format) median of measured / probe over tensors with both (role pooled when < min_pairs)
     ratio = {}
     for fmt, _ in anchors:
