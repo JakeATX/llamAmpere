@@ -110,8 +110,9 @@ public:
     // llama_kv_cache_iswa specific API
     //
 
-    llama_kv_cache * get_base() const;
-    llama_kv_cache * get_swa () const;
+    llama_kv_cache * get_base()    const;
+    llama_kv_cache * get_swa ()    const;
+    llama_kv_cache * get_swa_mid() const;
 
     // INKKV v2: the SWA cache holds the full-attention window copy (the far/near split can run)
     bool inkkv_near_copy() const { return near_copy; }
@@ -131,6 +132,7 @@ private:
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;
+    std::unique_ptr<llama_kv_cache> kv_swa_mid;
 };
 
 class llama_kv_cache_iswa_context : public llama_memory_context_i {
@@ -155,7 +157,8 @@ public:
             llama_kv_cache_iswa * kv,
             slot_info_vec_t sinfos_base,
             slot_info_vec_t sinfos_swa,
-            std::vector<llama_ubatch> ubatches);
+            std::vector<llama_ubatch> ubatches,
+            slot_info_vec_t sinfos_swa_mid = {});
 
     virtual ~llama_kv_cache_iswa_context();
 
@@ -176,8 +179,9 @@ public:
     // llama_kv_cache_iswa_context specific API
     //
 
-    const llama_kv_cache_context * get_base() const;
-    const llama_kv_cache_context * get_swa()  const;
+    const llama_kv_cache_context * get_base()    const;
+    const llama_kv_cache_context * get_swa()     const;
+    const llama_kv_cache_context * get_swa_mid() const;
 
 private:
     //llama_kv_cache_iswa * kv;
@@ -189,6 +193,7 @@ private:
 
     const llama_memory_context_ptr ctx_base;
     const llama_memory_context_ptr ctx_swa;
+    const llama_memory_context_ptr ctx_swa_mid;
 
     const llama_memory_status status;
 };

@@ -721,24 +721,32 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
-    ggml_tensor * get_v_idxs()     const { return self_v_idxs; }
-    ggml_tensor * get_k_idxs_swa() const { return self_k_idxs_swa; }
-    ggml_tensor * get_v_idxs_swa() const { return self_v_idxs_swa; }
+    ggml_tensor * get_k_idxs()         const { return self_k_idxs; }
+    ggml_tensor * get_v_idxs()         const { return self_v_idxs; }
+    ggml_tensor * get_k_idxs_swa()     const { return self_k_idxs_swa; }
+    ggml_tensor * get_v_idxs_swa()     const { return self_v_idxs_swa; }
+    ggml_tensor * get_k_idxs_swa_mid() const { return self_k_idxs_swa_mid; }
+    ggml_tensor * get_v_idxs_swa_mid() const { return self_v_idxs_swa_mid; }
 
-    ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
-    ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
-    ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
-    ggml_tensor * self_v_idxs_swa = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+    ggml_tensor * self_k_idxs         = nullptr; // I64 [n_batch]
+    ggml_tensor * self_v_idxs         = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+    ggml_tensor * self_k_idxs_swa     = nullptr; // I64 [n_batch]
+    ggml_tensor * self_v_idxs_swa     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+    ggml_tensor * self_k_idxs_swa_mid = nullptr; // I64 [n_batch]
+    ggml_tensor * self_v_idxs_swa_mid = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     llm_attn_mask self_attn_mask;
     llm_attn_mask self_attn_mask_swa;
+    llm_attn_mask self_attn_mask_swa_mid;
 
     std::vector<ggml_tensor *> self_k_rot;
     std::vector<ggml_tensor *> self_v_rot;
 
     std::vector<ggml_tensor *> self_k_rot_swa;
     std::vector<ggml_tensor *> self_v_rot_swa;
+
+    std::vector<ggml_tensor *> self_k_rot_swa_mid;
+    std::vector<ggml_tensor *> self_v_rot_swa_mid;
 
     // INKKV: SJ-KVaRN base (the Inkling DSpark drafter, build_attn_inp_kv_iswa): region descriptor and per-stream
     // attended lengths; nullptr / empty otherwise (the Inkling trunk keeps its own in llm_graph_input_mem_hybrid_iswa_rel)
@@ -987,12 +995,13 @@ public:
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
-    // INKLSA (llama-inklsa.h, LLAMA_INKLSA=1): sparse full-attention inputs, the visits' index caches and the epochs a
-    // rebuild graph commits when it runs
+    // INKLSA (llama-inklsa.h, LLAMA_INKLSA=1 or per-layer LSA): sparse full-attention inputs, the visits' index caches
+    // (with expected validity at build time) and the epochs a rebuild graph commits when it runs
     bool inklsa_on      = false;
     bool inklsa_rebuild = false;
+    int64_t inklsa_sj_d = 0;
     llama_inklsa_inputs inklsa;
-    std::vector<const ggml_tensor *> inklsa_kcaches;
+    std::vector<std::pair<const ggml_tensor *, bool>> inklsa_kcaches;
     mutable std::vector<std::pair<const ggml_tensor *, uint64_t>> inklsa_commit;
 
     // INKREL (llama-inklsa.h, default on): split full-attention inputs for wide ubatches
@@ -1007,8 +1016,9 @@ public:
     int32_t       sj_il_full       = -1; // a full-attention layer (the SWA cache window copy check)
 
     // distance from the token to the cell, extent for the empty, future and more distant cells
-    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
-    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+    ggml_tensor * self_rel_pos         = nullptr; // I32 [n_kv,         n_batch]
+    ggml_tensor * self_rel_pos_swa     = nullptr; // I32 [n_kv_swa,     n_batch]
+    ggml_tensor * self_rel_pos_swa_mid = nullptr; // I32 [n_kv_swa_mid, n_batch]
 
     const uint32_t extent;
     const uint32_t extent_swa;

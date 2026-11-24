@@ -418,6 +418,7 @@ public:
     void set_input_lsa_pos   (ggml_tensor * cell_pos, ggml_tensor * q_pos, const llama_ubatch * ubatch) const; // LSA probe
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_inklsa(const struct llama_inklsa_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const;
+    int64_t set_input_inklsa_sj(const struct llama_inklsa_inputs & in, const llama_kv_cache * kv_swa, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_inkrel(const struct llama_inkrel_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
@@ -885,6 +886,7 @@ public:
     llama_pos get_seq_pos_min(llama_seq_id seq_id) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_inklsa(const struct llama_inklsa_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const;
+    int64_t set_input_inklsa_sj(const struct llama_inklsa_inputs & in, const llama_kv_cache_context * mswa, const llama_ubatch * ubatch, uint32_t extent) const;
     void set_input_inkrel(const struct llama_inkrel_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // see llama_kv_cache::get_prev_tokens()

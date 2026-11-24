@@ -1,12 +1,19 @@
 #include "llama-inklsa.h"
 
+#include "llama-hparams.h"
 #include "llama-impl.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <mutex>
 #include <string>
+
+static bool inklsa_env_set(const char * name) {
+    const char * s = getenv(name);
+    return s && *s;
+}
 
 static int64_t inklsa_env(const char * name, int64_t def) {
     const char * s = getenv(name);
@@ -16,16 +23,24 @@ static int64_t inklsa_env(const char * name, int64_t def) {
 const llama_inklsa_config & llama_inklsa_cfg() {
     static const llama_inklsa_config cfg = [] {
         llama_inklsa_config c;
-        c.on         = inklsa_env("LLAMA_INKLSA", 0) != 0;
-        c.keep       = inklsa_env("LLAMA_INKLSA_KEEP", c.keep);
-        c.block      = inklsa_env("LLAMA_INKLSA_BLOCK", c.block);
-        c.window     = inklsa_env("LLAMA_INKLSA_WINDOW", c.window);
-        c.sinks      = inklsa_env("LLAMA_INKLSA_SINKS", c.sinks);
-        c.min_kv     = inklsa_env("LLAMA_INKLSA_MIN_KV", c.min_kv);
-        c.max_t      = inklsa_env("LLAMA_INKLSA_MAX_T", c.max_t);
-        c.stats      = inklsa_env("LLAMA_INKLSA_STATS", 0) != 0;
-        c.pick       = (int) inklsa_env("LLAMA_INKLSA_PICK", 0);
-        c.comp       = inklsa_env("LLAMA_INKLSA_COMP", 0) != 0;
+        c.on            = inklsa_env("LLAMA_INKLSA", 0) != 0;
+        c.keep_env      = inklsa_env_set("LLAMA_INKLSA_KEEP");
+        c.keep_max_env  = inklsa_env_set("LLAMA_INKLSA_KEEP_MAX");
+        c.block_env     = inklsa_env_set("LLAMA_INKLSA_BLOCK");
+        c.window_env    = inklsa_env_set("LLAMA_INKLSA_WINDOW");
+        c.sinks_env     = inklsa_env_set("LLAMA_INKLSA_SINKS");
+        c.min_kv_env    = inklsa_env_set("LLAMA_INKLSA_MIN_KV");
+        c.keep_frac_env = inklsa_env_set("LLAMA_INKLSA_KEEP_FRAC");
+        c.keep          = inklsa_env("LLAMA_INKLSA_KEEP", c.keep);
+        c.keep_max      = inklsa_env("LLAMA_INKLSA_KEEP_MAX", c.keep_max);
+        c.block         = inklsa_env("LLAMA_INKLSA_BLOCK", c.block);
+        c.window        = inklsa_env("LLAMA_INKLSA_WINDOW", c.window);
+        c.sinks         = inklsa_env("LLAMA_INKLSA_SINKS", c.sinks);
+        c.min_kv        = inklsa_env("LLAMA_INKLSA_MIN_KV", c.min_kv);
+        c.max_t         = inklsa_env("LLAMA_INKLSA_MAX_T", c.max_t);
+        c.stats         = inklsa_env("LLAMA_INKLSA_STATS", 0) != 0;
+        c.pick          = (int) inklsa_env("LLAMA_INKLSA_PICK", 0);
+        c.comp          = inklsa_env("LLAMA_INKLSA_COMP", 0) != 0;
         if (const char * f = getenv("LLAMA_INKLSA_KEEP_FRAC"); f && *f) {
             c.keep_frac = std::clamp(atof(f), 0.0, 1.0);
         }
@@ -38,8 +53,9 @@ const llama_inklsa_config & llama_inklsa_cfg() {
                         " - INKLSA off\n", __func__, (long long) c.block, (long long) c.sinks);
                 c.on = false;
             } else {
-                LLAMA_LOG_WARN("%s: INKLSA on: keep %lld (%lld) keep_frac %.3f pick %d comp %d block %lld window %lld sinks %lld"
-                        " min_kv %lld max_t %lld\n", __func__, (long long) c.keep, (long long) ((c.keep + 255)/256*256), c.keep_frac, c.pick, (int) c.comp,
+                LLAMA_LOG_WARN("%s: INKLSA on: keep %lld (%lld) keep_frac %.3f keep_max %lld pick %d comp %d block %lld window %lld sinks %lld"
+                        " min_kv %lld max_t %lld\n", __func__, (long long) c.keep, (long long) ((c.keep + 255)/256*256),
+                        c.keep_frac, (long long) c.keep_max, c.pick, (int) c.comp,
                         (long long) c.block, (long long) c.window, (long long) c.sinks, (long long) c.min_kv,
                         (long long) c.max_t);
             }
@@ -47,6 +63,37 @@ const llama_inklsa_config & llama_inklsa_cfg() {
         return c;
     }();
     return cfg;
+}
+
+llama_inklsa_resolved llama_inklsa_resolve(const llama_hparams & hparams, bool sj_mode) {
+    const auto & c = llama_inklsa_cfg();
+    const bool arch_lsa = hparams.is_lsa_any();
+    llama_inklsa_resolved r;
+    // priority: explicit env var > GGUF metadata > arch-LSA defaults (2048, 4%, 16384) > legacy env defaults
+    r.keep      = c.keep_env      ? c.keep      : (hparams.lsa_keep_min  >  0 ? hparams.lsa_keep_min  : (arch_lsa ? 2048 : c.keep));
+    r.keep_frac = c.keep_frac_env ? c.keep_frac : (hparams.lsa_keep_frac >= 0.0f ? (double) hparams.lsa_keep_frac : (arch_lsa ? 0.04 : c.keep_frac));
+    r.keep_max  = c.keep_max_env  ? c.keep_max  : (hparams.lsa_keep_max  >= 0 ? hparams.lsa_keep_max  : c.keep_max);
+    r.block     = c.block_env     ? c.block     : (hparams.lsa_block     >  0 ? hparams.lsa_block     : c.block);
+    r.sinks     = c.sinks_env     ? c.sinks     : (hparams.lsa_sinks     >= 0 ? hparams.lsa_sinks     : c.sinks);
+    r.window    = c.window_env    ? c.window    : (hparams.n_swa         >  0 ? (int64_t) hparams.n_swa : c.window);
+    r.min_kv    = c.min_kv_env    ? c.min_kv    : (arch_lsa ? 0 : c.min_kv);
+    r.max_t     = sj_mode         ? std::min<int64_t>(c.max_t, 8) : c.max_t;
+
+    // sanitize to safe invariants
+    if (r.block <= 0 || 256 % r.block != 0 || (r.block & (r.block - 1)) != 0) {
+        r.block = 64;
+    }
+    if (r.sinks < 0 || r.sinks % r.block != 0) {
+        r.sinks = (std::max<int64_t>(0, r.sinks) / r.block) * r.block;
+    }
+    if (r.keep <= 0) {
+        r.keep = 2048;
+    }
+    r.keep_frac = std::clamp(r.keep_frac, 0.0, 1.0);
+    if (r.keep_max > 0 && r.keep_max < r.keep) {
+        r.keep_max = r.keep;
+    }
+    return r;
 }
 
 bool llama_inkrel_want(int64_t n_kv, int64_t T, int64_t extent) {
@@ -60,14 +107,23 @@ int64_t llama_inklsa_n_fix() {
     return (c.sinks + c.window + c.block + c.max_t + 255)/256*256;
 }
 
+int64_t llama_inklsa_n_fix_for(const llama_inklsa_resolved & rcfg) {
+    return (rcfg.sinks + rcfg.window + rcfg.block + rcfg.max_t + 255)/256*256;
+}
+
 int64_t llama_inklsa_idx_rows(int64_t kv_size, int64_t B) {
     return (kv_size/B + 255)/256*256*(llama_inklsa_cfg().comp ? 2 : 1);
 }
 
+int64_t llama_inklsa_n_keep_for(int64_t n_kv, int64_t keep, double keep_frac, int64_t keep_max) {
+    const int64_t raw    = std::max<int64_t>(keep, (int64_t) std::floor(keep_frac*(double) n_kv));
+    const int64_t capped = keep_max > 0 ? std::min<int64_t>(raw, keep_max) : raw;
+    return (capped + 255)/256*256;
+}
+
 int64_t llama_inklsa_n_keep(int64_t n_kv) {
     const auto & c = llama_inklsa_cfg();
-    const int64_t k = std::max<int64_t>(c.keep, (int64_t) (c.keep_frac*(double) n_kv));
-    return (k + 255)/256*256;
+    return llama_inklsa_n_keep_for(n_kv, c.keep, c.keep_frac, c.keep_max);
 }
 
 namespace {
@@ -141,6 +197,23 @@ void llama_inklsa_invalidate(const ggml_tensor * const * kcaches, size_t n) {
         auto it = s.e.find(kcaches[i]);
         if (it != s.e.end()) {
             it->second.gen++;
+        }
+    }
+}
+
+void llama_inklsa_reset_valid(const ggml_tensor * const * kcaches, size_t n) {
+    auto & s = inklsa_st();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    if (kcaches == nullptr || n == 0) {
+        for (auto & it : s.e) {
+            it.second.built = it.second.gen;
+        }
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        auto it = s.e.find(kcaches[i]);
+        if (it != s.e.end()) {
+            it.second.built = it.second.gen;
         }
     }
 }

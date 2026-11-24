@@ -23,20 +23,31 @@
 
 #include <cstdint>
 
+struct llama_hparams;
+
 struct llama_inklsa_config {
-    bool    on      = false; // LLAMA_INKLSA
-    int64_t keep    = 4096;  // LLAMA_INKLSA_KEEP: middle cells kept (rounded up to a multiple of 256)
-    int64_t block   = 64;    // LLAMA_INKLSA_BLOCK: cells per block (divides 256)
-    int64_t window  = 1024;  // LLAMA_INKLSA_WINDOW: >= relative extent
-    int64_t sinks   = 128;   // LLAMA_INKLSA_SINKS: multiple of BLOCK
-    int64_t min_kv  = 16384; // LLAMA_INKLSA_MIN_KV: below this n_kv the visit stays dense
-    int64_t max_t   = 16;    // LLAMA_INKLSA_MAX_T: wider ubatches stay dense
-    bool    stats   = false; // LLAMA_INKLSA_STATS: log the configuration once
-    double  keep_frac = 0.0; // LLAMA_INKLSA_KEEP_FRAC: keep max(KEEP, frac x n_kv) cells
-    int     pick    = 0;     // LLAMA_INKLSA_PICK: 0 block-mean index; 1 oracle (exact attention mass per block from
-                             // every key, same shared pick: diagnostic, reads all of K)
-    bool    comp    = false; // LLAMA_INKLSA_COMP=1 (lossy, opt-in): every eligible block that is not picked joins the
-                             // sparse attention as one virtual cell (mean K, mean V, logit + log B), a third LSE term
+    bool    on        = false; // LLAMA_INKLSA
+    int64_t keep      = 4096;  // LLAMA_INKLSA_KEEP: middle cells kept (or total budget in SJ-LSA mode)
+    int64_t keep_max  = 16384; // LLAMA_INKLSA_KEEP_MAX: upper cap on dynamic keep (0 = uncapped)
+    int64_t block     = 64;    // LLAMA_INKLSA_BLOCK: cells per block (divides 256)
+    int64_t window    = 1024;  // LLAMA_INKLSA_WINDOW: >= relative extent
+    int64_t sinks     = 128;   // LLAMA_INKLSA_SINKS: multiple of BLOCK
+    int64_t min_kv    = 16384; // LLAMA_INKLSA_MIN_KV: below this n_kv the visit stays dense
+    int64_t max_t     = 16;    // LLAMA_INKLSA_MAX_T: wider ubatches stay dense
+    bool    stats     = false; // LLAMA_INKLSA_STATS: log the configuration once
+    double  keep_frac = 0.0;   // LLAMA_INKLSA_KEEP_FRAC: keep clamp(max(KEEP, frac x n_kv), KEEP, KEEP_MAX)
+    int     pick      = 0;     // LLAMA_INKLSA_PICK: 0 block-mean index; 1 oracle (exact attention mass per block from
+                               // every key, same shared pick: diagnostic, reads all of K)
+    bool    comp      = false; // LLAMA_INKLSA_COMP=1 (lossy, opt-in): every eligible block that is not picked joins the
+                               // sparse attention as one virtual cell (mean K, mean V, logit + log B), a third LSE term
+    // env-override flags so model GGUF metadata applies only when the user did not set an env override
+    bool    keep_env      = false;
+    bool    keep_frac_env = false;
+    bool    keep_max_env  = false;
+    bool    block_env     = false;
+    bool    sinks_env     = false;
+    bool    min_kv_env    = false;
+    bool    window_env    = false;
     // INKREL (REL-SPLIT, lossless, default on; independent of LLAMA_INKLSA; F16 K/V, no kv-stream; positions of a ubatch
     // contiguous per sequence, else set_input asserts): ubatches of >= rel_min_t rows attend
     // to the full-attention visits in two flash-attention calls instead of one call with a per-head F32 bias mask
@@ -48,7 +59,20 @@ struct llama_inklsa_config {
                               // its dense mask is small; verify widths split too, so the reserve covers them)
 };
 
+// effective LSA parameters after merging env overrides > GGUF metadata > architecture defaults
+struct llama_inklsa_resolved {
+    int64_t keep      = 2048;
+    double  keep_frac = 0.04;
+    int64_t keep_max  = 16384;
+    int64_t block     = 64;
+    int64_t sinks     = 128;
+    int64_t window    = 1024;
+    int64_t min_kv    = 0;
+    int64_t max_t     = 8;
+};
+
 const llama_inklsa_config & llama_inklsa_cfg();
+llama_inklsa_resolved llama_inklsa_resolve(const llama_hparams & hparams, bool sj_mode);
 
 // index rows per K cache of kv_size cells: blocks rounded up to 256 (the COMP attention pads to it), twice with COMP
 // (mean V in rows [cap/2, cap))
@@ -56,8 +80,10 @@ int64_t llama_inklsa_idx_rows(int64_t kv_size, int64_t B);
 
 // fixed-cell capacity of a sparse graph with up to max_t rows: sinks + window + one partial block + rows, to 256
 int64_t llama_inklsa_n_fix();
-// kept middle cells per sparse graph over n_kv cells (multiple of 256 and of the block)
+int64_t llama_inklsa_n_fix_for(const llama_inklsa_resolved & rcfg);
+// kept cells per sparse graph over n_kv cells: clamp(max(keep, floor(keep_frac * n_kv)), keep, keep_max) padded to 256
 int64_t llama_inklsa_n_keep(int64_t n_kv);
+int64_t llama_inklsa_n_keep_for(int64_t n_kv, int64_t keep, double keep_frac, int64_t keep_max);
 
 struct llama_inklsa_idx {
     ggml_tensor * t     = nullptr; // F16 [d, kv_size/B]
@@ -70,6 +96,8 @@ bool llama_inklsa_idx_get(const ggml_tensor * kcache, int64_t d, int64_t n_blk_c
 void llama_inklsa_idx_commit(const ggml_tensor * kcache, uint64_t epoch);
 // nullptr / n == 0: every index
 void llama_inklsa_invalidate(const ggml_tensor * const * kcaches, size_t n);
+// cache cleared (empty): mark indices valid again so new blocks populate cleanly from pos 0
+void llama_inklsa_reset_valid(const ggml_tensor * const * kcaches, size_t n);
 // cache tensors destroyed
 void llama_inklsa_forget(const ggml_tensor * const * kcaches, size_t n);
 
@@ -91,16 +119,23 @@ bool llama_inkrel_want(int64_t n_kv, int64_t T, int64_t extent);
 
 struct llama_inklsa_inputs {
     bool          sparse   = false;   // this graph attends over the compact set (else: dense, index refresh only)
+    bool          sj_mode  = false;   // SJ-KVaRN 4/4 far-leg LSA (index refreshed from kv_swa, block-list far mask)
     int64_t       B        = 0;
     int64_t       n_blk    = 0;       // n_kv / B
     int64_t       n_fix    = 0;
-    int64_t       n_u      = 0;       // blocks the ubatch may write
-    int64_t       n_keep   = 0;       // kept middle cells of this graph: max(KEEP, KEEP_FRAC x n_kv), to 256
+    int64_t       n_u      = 0;       // blocks the ubatch may write/complete
+    int64_t       n_keep   = 0;       // kept cells of this graph: clamp(max(KEEP, KEEP_FRAC x n_kv), KEEP, KEEP_MAX), to 256
+    int64_t       nk_far   = 0;       // SJ-LSA: picked far blocks per sparse graph (<= n_blk)
+    int64_t       sinks    = 0;       // SJ-LSA: sink cells (multiple of B)
+    int64_t       window   = 0;       // SJ-LSA: near window size (= extent)
+    int64_t       idx_cap  = 0;       // SJ-LSA: allocated rows of idx.t (dummy scratch row is idx_cap - 1)
     ggml_tensor * fix_ids  = nullptr; // I32 [n_fix]           fixed cells (sinks + window), padding = cell 0
     ggml_tensor * fix_rel  = nullptr; // I32 [n_fix, T]        bias-table row of each fixed cell per query row
     ggml_tensor * fix_mask = nullptr; // F32 [n_fix, T]        0 visible, -inf padding / future / other sequence
     ggml_tensor * elig     = nullptr; // F32 [n_blk]           0 eligible block, -inf otherwise
     ggml_tensor * u_blk    = nullptr; // I32 [n_u]             blocks this ubatch writes (refresh), padded with the last
-    ggml_tensor * u_blk64  = nullptr; // I64 [n_u]             same, for set_rows
+    ggml_tensor * u_blk64  = nullptr; // I64 [n_u]             same, for set_rows (SJ-LSA: padded with idx_cap - 1)
+    ggml_tensor * u_cells  = nullptr; // I32 [B * n_u]         SJ-LSA: kv_swa cell indices for the B cells of each completed block
+    ggml_tensor * sj_m3    = nullptr; // F16 [n_kv, T, 1, 1]   SJ-LSA: far mask (0 kept, -inf hidden, GGML_LSA_MASK_SEL eligible)
     ggml_tensor * onehot   = nullptr; // F32 [1, n_head_kv, n_head, 1]  KV group of each q head
 };

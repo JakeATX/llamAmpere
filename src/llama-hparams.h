@@ -28,6 +28,14 @@ enum llama_swa_type {
     LLAMA_SWA_TYPE_SYMMETRIC = 3,
 };
 
+// per-layer attention mode (optional, for mixed multi-window SWA + LSA models)
+enum llama_attn_mode : uint8_t {
+    LLAMA_ATTN_MODE_GLOBAL  = 0,
+    LLAMA_ATTN_MODE_SWA     = 1,
+    LLAMA_ATTN_MODE_SWA_MID = 2,
+    LLAMA_ATTN_MODE_LSA     = 3,
+};
+
 // how the non-causal mask should be constructed with llama_set_causal_attn(ctx, false)
 // (e.g. mtmd decoding image tokens)
 enum llama_non_causal_type {
@@ -212,16 +220,27 @@ struct llama_hparams {
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
     // the size of the sliding window (0 - no SWA)
     uint32_t n_swa = 0;
+    // optional secondary sliding window size (0 - no SWA_MID cache)
+    uint32_t n_swa_mid = 0;
 
     // see llama_non_causal_type
     // note: for SWA_FULL, older tokens (outside the current ubatch) are still window-clipped
     llama_non_causal_type non_causal_type = LLAMA_NON_CAUSAL_TYPE_ALL;
 
-    // if is_swa_impl[il] == 1, then layer il is SWA
-    // if is_swa_impl[il] == 0, then layer il is dense (i.e. non-SWA)
+    // if is_swa_impl[il] == 1, then layer il is SWA (includes SWA_MID when attn_mode_impl is active)
+    // if is_swa_impl[il] == 0, then layer il is dense (GLOBAL or LSA)
     // by default, all layers are dense
     // note: using uint32_t type for compatibility reason
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_swa_impl;
+
+    // optional per-layer attention mode (llama_attn_mode) and LSA metadata overrides
+    bool     has_attn_modes = false;
+    std::array<uint8_t, LLAMA_MAX_LAYERS> attn_mode_impl{};
+    int32_t  lsa_keep_min  = -1;
+    float    lsa_keep_frac = -1.0f;
+    int32_t  lsa_keep_max  = -1;
+    int32_t  lsa_block     = -1;
+    int32_t  lsa_sinks     = -1;
 
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;
@@ -487,6 +506,12 @@ struct llama_hparams {
     bool is_swa_any() const;
 
     bool is_swa(uint32_t il) const;
+
+    llama_attn_mode attn_mode(uint32_t il) const;
+    bool is_swa_mid(uint32_t il) const;
+    bool is_swa_mid_any() const;
+    bool is_lsa_layer(uint32_t il) const;
+    bool is_lsa_any() const;
 
     bool is_indexer_full(uint32_t il) const;
 

@@ -150,8 +150,17 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
             return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
+        llama_kv_cache::slot_info_vec_t sinfos_swa_mid;
+        if (auto * swa_mid = mem_attn->get_swa_mid()) {
+            sinfos_swa_mid = swa_mid->prepare(ubatches);
+            if (sinfos_swa_mid.empty()) {
+                LLAMA_LOG_ERROR("%s: failed to prepare attention swa_mid ubatches\n", __func__);
+                return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            }
+        }
+
         return std::make_unique<llama_memory_hybrid_iswa_context>(
-                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches), std::move(sinfos_swa_mid));
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -249,6 +258,9 @@ void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id s
             base->state_write(io, seq_id, f);
         }
         mem_attn->get_swa()->state_write(io, seq_id, f);
+        if (auto * swa_mid = mem_attn->get_swa_mid()) {
+            swa_mid->state_write(io, seq_id, f);
+        }
         mem_recr->state_write(io, seq_id, flags);
         if (partial && (flags & LLAMA_STATE_SEQ_FLAGS_SJ_EXACT)) {
             base->state_write_sj_ckpt(io, seq_id);
@@ -269,6 +281,9 @@ void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq
         }
         try {
             mem_attn->get_swa()->state_read(io, seq_id, f);
+            if (auto * swa_mid = mem_attn->get_swa_mid()) {
+                swa_mid->state_read(io, seq_id, f);
+            }
             mem_recr->state_read(io, seq_id, flags);
             if (partial && io.n_left() > 0) {
                 base->state_read_sj_ckpt(io, seq_id); // checkpoints without the suffix end with the recurrent state
@@ -318,10 +333,11 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
            llama_memory_hybrid_iswa * mem,
                     slot_info_vec_t   sinfos_base,
                     slot_info_vec_t   sinfos_swa,
-          std::vector<llama_ubatch>   ubatches) :
+          std::vector<llama_ubatch>   ubatches,
+                    slot_info_vec_t   sinfos_swa_mid) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_attn(new llama_kv_cache_iswa_context(mem->get_mem_attn(), std::move(sinfos_base), std::move(sinfos_swa), this->ubatches)),
+    ctx_attn(new llama_kv_cache_iswa_context(mem->get_mem_attn(), std::move(sinfos_base), std::move(sinfos_swa), this->ubatches, std::move(sinfos_swa_mid))),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }

@@ -1839,8 +1839,8 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     // GGML_SJKVARN_TILE_SKIP=1 (the low-bit tile kernel's skip of fully masked body tiles, the switch LSA uses on 3/2t
     // and 3/3t) takes the same exact skip here: the live-strip walk (dead records and dead 16-cell strips not read)
     static const bool tile_skip_env = getenv("GGML_SJKVARN_TILE_SKIP") != nullptr && atoi(getenv("GGML_SJKVARN_TILE_SKIP")) != 0;
-    static const bool strip_env = tile_skip_env ||
-        (getenv("GGML_SJKVARN_LIVE_STRIPS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_STRIPS")) != 0);
+    static const int  strip_env_val = getenv("GGML_SJKVARN_LIVE_STRIPS") != nullptr ? atoi(getenv("GGML_SJKVARN_LIVE_STRIPS")) : -1;
+    static const bool strip_env = tile_skip_env || strip_env_val > 0;
     static const bool live_env  = strip_env ||
         (getenv("GGML_SJKVARN_LIVE_RECORDS") != nullptr && atoi(getenv("GGML_SJKVARN_LIVE_RECORDS")) != 0);
     // LSA block list (ggml_flash_attn_ext_set_lsa_blocks): the mask's GGML_LSA_MASK_SEL entries resolve through the
@@ -1908,9 +1908,10 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
                     sel_nbs, (uint32_t *) selb, vk && sel_off == 0 ? 1 : 0);
                 CUDA_CHECK(cudaGetLastError());
             }
+            const int use_strips = (strip_env || strip_res || (lsa_blk > 0 && strip_env_val != 0)) ? 1 : 0;
             sj_live_record_flags<<<dim3((nrec_max + 7)/8, n_lists), 8*WARP_SIZE, 0, ctx.stream()>>>((const half *) mask->data,
                 int(mask->nb[1]/sizeof(half)), int(dst->src[0]->ne[1]), desc, flags.ptr, nrec_max,
-                head_mask ? int64_t(gqa)*int64_t(mask->nb[2]/sizeof(half)) : 0, strip_env || strip_res ? 1 : 0, selb, sel_sh, sel_nbs);
+                head_mask ? int64_t(gqa)*int64_t(mask->nb[2]/sizeof(half)) : 0, use_strips, selb, sel_sh, sel_nbs);
             CUDA_CHECK(cudaGetLastError());
             sj_live_record_list<<<n_lists, 1024, 0, ctx.stream()>>>(desc, flags.ptr, list.ptr + hdr, nrec_max,
                 head_mask ? nrec_max + 1 : 0, lsa_blk > 0 ? int(lists) : 0, sel_sh, sel_nbs, vka);

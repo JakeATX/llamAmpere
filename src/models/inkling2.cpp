@@ -1,6 +1,10 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -40,6 +44,115 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
         hparams.n_shortconv_l_cache > 64 || hparams.n_relative_extent > INT32_MAX || hparams.n_swa > INT32_MAX ||
         !hparams.n_vocab_unpadded || hparams.n_vocab_unpadded > hparams.n_vocab_padded) {
         throw std::runtime_error("inkling2: invalid dimensions, vocabulary, or layer pattern");
+    }
+
+    // optional multi-window SWA + per-layer LSA metadata (absent in stock 5:1 GGUFs)
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        hparams.attn_mode_impl[il] = hparams.is_swa_impl[il] ? LLAMA_ATTN_MODE_SWA : LLAMA_ATTN_MODE_GLOBAL;
+    }
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_MID, hparams.n_swa_mid, false);
+    {
+        uint32_t v = 0;
+        if (ml.get_key(LLM_KV_ATTENTION_LSA_KEEP_MIN, v, false)) { hparams.lsa_keep_min = (int32_t) v; }
+        ml.get_key(LLM_KV_ATTENTION_LSA_KEEP_FRAC, hparams.lsa_keep_frac, false);
+        if (ml.get_key(LLM_KV_ATTENTION_LSA_KEEP_MAX, v, false)) { hparams.lsa_keep_max = (int32_t) v; }
+        if (ml.get_key(LLM_KV_ATTENTION_LSA_BLOCK,    v, false)) { hparams.lsa_block    = (int32_t) v; }
+        if (ml.get_key(LLM_KV_ATTENTION_LSA_SINKS,    v, false)) { hparams.lsa_sinks    = (int32_t) v; }
+    }
+    {
+        uint32_t n_modes = 0;
+        if (ml.get_arr_n(LLM_KV_ATTENTION_LAYER_MODES, n_modes, false)) {
+            if (n_modes != hparams.n_layer()) {
+                throw std::runtime_error("inkling2: attention.layer_modes length must equal layer count");
+            }
+            std::vector<uint32_t> modes(n_modes);
+            ml.get_arr(LLM_KV_ATTENTION_LAYER_MODES, modes);
+            for (uint32_t il = 0; il < n_modes; ++il) {
+                if (modes[il] > LLAMA_ATTN_MODE_LSA) {
+                    throw std::runtime_error("inkling2: invalid attention.layer_modes entry");
+                }
+                hparams.attn_mode_impl[il] = (uint8_t) modes[il];
+            }
+            hparams.has_attn_modes = true;
+            if (hparams.n_swa_mid == 0 && hparams.is_swa_mid_any()) {
+                hparams.n_swa_mid = 4096;
+            }
+        }
+    }
+    // runtime diagnostic override for zero-shot probes on unmodified GGUFs (default OFF)
+    if (const char * pat = getenv("LLAMA_INK_MIXED_PATTERN"); pat && *pat) {
+        const uint32_t block = hparams.attn_res_block_size;
+        uint32_t s_mid = 1;
+        uint32_t s_lsa = 3;
+        if (const char * sl = getenv("LLAMA_INK_MIXED_SLOTS"); sl && *sl) {
+            unsigned a = 0, b = 0;
+            const int n_parsed = std::sscanf(sl, "%u,%u", &a, &b);
+            if (n_parsed >= 1) {
+                s_mid = a;
+            }
+            if (n_parsed >= 2) {
+                s_lsa = b;
+            }
+        }
+        uint32_t swa_mid_sz = hparams.n_swa_mid > 0 ? hparams.n_swa_mid : 4096u;
+        if (const char * sm = getenv("LLAMA_INK_SWA_MID"); sm && *sm) {
+            const long long v = atoll(sm);
+            if (v > 0 && v <= INT32_MAX) {
+                swa_mid_sz = (uint32_t) v;
+            }
+        }
+        const bool pat_a = (pat[0] == 'A' || pat[0] == 'a') && pat[1] == '\0';
+        const bool pat_b = (pat[0] == 'B' || pat[0] == 'b') && pat[1] == '\0';
+        if (!pat_a && !pat_b) {
+            throw std::runtime_error("inkling2: LLAMA_INK_MIXED_PATTERN must be A or B");
+        }
+        if (s_mid >= block || (pat_a && (s_lsa >= block || s_mid == s_lsa))) {
+            throw std::runtime_error("inkling2: invalid LLAMA_INK_MIXED_SLOTS for block size");
+        }
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            const uint32_t r = il % block;
+            const bool orig_swa = hparams.is_swa_impl[il] != 0;
+            if (pat_a) {
+                if (!orig_swa) {
+                    hparams.attn_mode_impl[il] = LLAMA_ATTN_MODE_GLOBAL;
+                } else if (r == s_mid) {
+                    hparams.attn_mode_impl[il] = LLAMA_ATTN_MODE_SWA_MID;
+                } else if (r == s_lsa) {
+                    hparams.attn_mode_impl[il] = LLAMA_ATTN_MODE_LSA;
+                } else {
+                    hparams.attn_mode_impl[il] = LLAMA_ATTN_MODE_SWA;
+                }
+            } else {
+                if (!orig_swa) {
+                    hparams.attn_mode_impl[il] = LLAMA_ATTN_MODE_LSA;
+                } else if (r == s_mid) {
+                    hparams.attn_mode_impl[il] = LLAMA_ATTN_MODE_SWA_MID;
+                } else {
+                    hparams.attn_mode_impl[il] = LLAMA_ATTN_MODE_SWA;
+                }
+            }
+        }
+        hparams.n_swa_mid = swa_mid_sz;
+        hparams.has_attn_modes = true;
+    }
+    if (hparams.has_attn_modes) {
+        if (hparams.n_swa != hparams.n_relative_extent) {
+            throw std::runtime_error("inkling2: mixed attention modes require sliding_window == relative_extent");
+        }
+        if (hparams.n_swa_mid > INT32_MAX || (hparams.is_swa_mid_any() && hparams.n_swa_mid == 0)) {
+            throw std::runtime_error("inkling2: invalid sliding_window_mid");
+        }
+        uint32_t c_glob = 0, c_swa = 0, c_mid = 0, c_lsa = 0;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            const auto m = (llama_attn_mode) hparams.attn_mode_impl[il];
+            hparams.is_swa_impl[il] = (m == LLAMA_ATTN_MODE_SWA || m == LLAMA_ATTN_MODE_SWA_MID) ? 1u : 0u;
+            c_glob += (m == LLAMA_ATTN_MODE_GLOBAL);
+            c_swa  += (m == LLAMA_ATTN_MODE_SWA);
+            c_mid  += (m == LLAMA_ATTN_MODE_SWA_MID);
+            c_lsa  += (m == LLAMA_ATTN_MODE_LSA);
+        }
+        LLAMA_LOG_WARN("%s: inkling2 mixed attention modes active (phys layers: %u SWA(%u), %u SWA_MID(%u), %u LSA, %u Global)\n",
+                __func__, c_swa, hparams.n_swa, c_mid, hparams.n_swa_mid, c_lsa, c_glob);
     }
 
     for (float value : {hparams.f_norm_rms_eps, hparams.f_qk_clip, hparams.f_relative_clip, hparams.situ_beta, hparams.situ_linear_beta}) {
@@ -107,7 +220,11 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         const int64_t n_head_kv   = hparams.n_head_kv(i);
         const int64_t n_embd_head = hparams.n_embd_head_k(i);
         const int64_t n_ff_exp    = hparams.n_ff_exp(i);
-        const int64_t n_extent    = hparams.is_swa(i) ? hparams.n_swa : hparams.n_relative_extent;
+
+        // probe attn_norm first so widened SWA layers (SWA_MID / LSA) work without adding split Q/K/V norm or conv_proj tensors
+        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        const bool has_shared_norm = layer.attn_norm != nullptr;
+        const int64_t n_extent     = has_shared_norm ? hparams.n_swa : hparams.n_relative_extent;
 
         // attention
         layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), {n_embd, n_embd_head*n_head}, 0);
@@ -130,9 +247,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         layer.attn_post_conv = create_tensor(tn(LLM_TENSOR_ATTN_POST_CONV, "weight", i), {n_conv, n_embd}, 0);
         layer.ffn_post_conv  = create_tensor(tn(LLM_TENSOR_FFN_POST_CONV,  "weight", i), {n_conv, n_embd}, 0);
 
-        if (hparams.is_swa(i)) {
-            layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-        } else {
+        if (!has_shared_norm) {
             // full-attention layers: separate Q, K and V input norms, and input-dependent taps for the K and V convolutions
             layer.attn_q_inp_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_INP_NORM,  "weight", i), {n_embd}, 0);
             layer.attn_k_inp_norm  = create_tensor(tn(LLM_TENSOR_ATTN_K_INP_NORM,  "weight", i), {n_embd}, 0);
@@ -143,7 +258,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
 
         // block attention residuals
         if (i > 0) {
-            layer.attn_res_query = create_tensor(tn(LLM_TENSOR_ATTN_RES_QUERY, "weight", i), {n_embd, hparams.is_swa(i) ? 1 : 3}, 0);
+            layer.attn_res_query = create_tensor(tn(LLM_TENSOR_ATTN_RES_QUERY, "weight", i), {n_embd, has_shared_norm ? 1 : 3}, 0);
         }
         layer.ffn_res_query = create_tensor(tn(LLM_TENSOR_FFN_RES_QUERY, "weight", i), {n_embd}, 0);
 
@@ -357,12 +472,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     ggml_tensor * inpSA = cur;
 
-    // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
+    // attention inputs: shared-norm layers mix one, split-norm layers one each for Q, K and V
+    const bool has_shared_norm = layer.attn_norm != nullptr;
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
         for (int j = 0; j < 3; ++j) {
-            inputs[j] = row_view(mixed, is_swa ? 0 : j);
+            inputs[j] = row_view(mixed, layer.attn_res_query->ne[1] == 1 ? 0 : j);
         }
     }
 
@@ -387,11 +503,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         }
     }
 
-    if (is_swa && messages) {
+    if (has_shared_norm && messages) {
         for (int j = 0; j < 3; ++j) {
             inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         }
-    } else if (is_swa) {
+    } else if (has_shared_norm) {
         inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         inputs[1] = inputs[2] = inputs[0];
     } else {
@@ -415,9 +531,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * s_mm  = build_lora_mm(layer.attn_sink_proj, inputs[0]);
         ggml_tensor * g_mm  = build_lora_mm(layer.wqkv_gate, inputs[0]);
         ggml_tensor * k_mm  = build_lora_mm(layer.wk, inputs[1]);
-        ggml_tensor * kp_mm = is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]);
+        ggml_tensor * kp_mm = layer.attn_k_conv_proj ? build_lora_mm(layer.attn_k_conv_proj, inputs[1]) : nullptr;
         ggml_tensor * v_mm  = build_lora_mm(layer.wv, inputs[2]);
-        ggml_tensor * vp_mm = is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]);
+        ggml_tensor * vp_mm = layer.attn_v_conv_proj ? build_lora_mm(layer.attn_v_conv_proj, inputs[2]) : nullptr;
         if (mm_order && small_batch) {
             for (ggml_tensor * t : { q_mm, r_mm, s_mm, g_mm, k_mm, kp_mm, v_mm, vp_mm }) {
                 if (t) {
@@ -475,6 +591,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, sinks_3d);
         table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3)); // [n_head, extent + 1, n_tokens]
+
+        // diagnostic far-distance scalar offset on modified SWA_MID / LSA layers (LLAMA_INK_FAR_BIAS, default 0.0f)
+        static const float far_bias = [] {
+            const char * e = getenv("LLAMA_INK_FAR_BIAS");
+            return e && *e ? (float) atof(e) : 0.0f;
+        }();
+        if (far_bias != 0.0f && (hparams.is_swa_mid(il) || hparams.is_lsa_layer(il))) {
+            const int64_t E = table->ne[1] - 1;
+            ggml_tensor * near_rows = ggml_cont(ctx0, ggml_view_3d(ctx0, table, n_head, E, n_tokens, table->nb[1], table->nb[2], 0));
+            ggml_tensor * far_row   = ggml_cont(ctx0, ggml_view_3d(ctx0, table, n_head, 1, n_tokens, table->nb[1], table->nb[2], E*table->nb[1]));
+            far_row = ggml_scale_bias(ctx0, far_row, 1.0f, far_bias);
+            table = ggml_concat(ctx0, near_rows, far_row, 1);
+        }
 
         // fork (INKGLUE): one zero-sink fill per graph instead of one per visit (same values). LLAMA_INKLING2_SINK_ONCE=0 = old
         static const bool sink_once = [] { const char * e = getenv("LLAMA_INKLING2_SINK_ONCE"); return !e || atoi(e) != 0; }();
@@ -567,7 +696,15 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     if (!head_full && hparams.n_vocab_unpadded > 0 && hparams.n_vocab_unpadded < head->ne[1] &&
             (loras == nullptr || loras->empty()) &&
             (hadamard_rotations == nullptr || hadamard_rotations->find(head) == hadamard_rotations->end())) {
-        head = ggml_view_2d(ctx0, head, head->ne[0], hparams.n_vocab_unpadded, head->nb[1], 0);
+        int64_t n_rows = hparams.n_vocab_unpadded;
+        // 16-row slab formats (AIT*_U, AIF25_U, AIT*_U2, AIF*_U2, and upcoming AI6.5NL/AI8H) require row counts aligned to 16
+        if (ggml_ai4_is_unit(head->type) || head->type == GGML_TYPE_AIF25_U || ggml_ai4v2_rate(head->type) > 0 ||
+                head->type == GGML_TYPE_AIF25_U2 || head->type == GGML_TYPE_AIF175_U2 || head->type == GGML_TYPE_AIF25_U2_512) {
+            n_rows = std::min<int64_t>(head->ne[1], GGML_PAD(n_rows, 16));
+        }
+        if (n_rows < head->ne[1]) {
+            head = ggml_view_2d(ctx0, head, head->ne[0], n_rows, head->nb[1], 0);
+        }
     }
     cur = build_lora_mm(head, cur);
     ggml_prec_set_acc(cur, GGML_PREC_F32);

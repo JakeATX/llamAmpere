@@ -382,6 +382,57 @@ bool llama_hparams::is_swa(uint32_t il) const {
     GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
 }
 
+llama_attn_mode llama_hparams::attn_mode(uint32_t il) const {
+    if (il < n_layer_all) {
+        if (has_attn_modes) {
+            return (llama_attn_mode) attn_mode_impl[il];
+        }
+        return is_swa_impl[il] ? LLAMA_ATTN_MODE_SWA : LLAMA_ATTN_MODE_GLOBAL;
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
+}
+
+bool llama_hparams::is_swa_mid(uint32_t il) const {
+    if (il < n_layer_all) {
+        return has_attn_modes && attn_mode_impl[il] == LLAMA_ATTN_MODE_SWA_MID;
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
+}
+
+bool llama_hparams::is_swa_mid_any() const {
+    if (!has_attn_modes) {
+        return false;
+    }
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        if (attn_mode_impl[il] == LLAMA_ATTN_MODE_SWA_MID) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_hparams::is_lsa_layer(uint32_t il) const {
+    if (il < n_layer_all) {
+        return has_attn_modes && attn_mode_impl[il] == LLAMA_ATTN_MODE_LSA;
+    }
+
+    GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
+}
+
+bool llama_hparams::is_lsa_any() const {
+    if (!has_attn_modes) {
+        return false;
+    }
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        if (attn_mode_impl[il] == LLAMA_ATTN_MODE_LSA) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool llama_hparams::is_mla() const {
     assert((n_embd_head_k_mla_impl == 0 && n_embd_head_v_mla_impl == 0) ||
            (n_embd_head_k_mla_impl != 0 && n_embd_head_v_mla_impl != 0));

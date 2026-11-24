@@ -36,6 +36,7 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
         hparams.n_ff_exp_arr[il]      = hparams.n_ff_exp_arr[p];
         hparams.n_expert_used_arr[il] = hparams.n_expert_used_arr[p];
         hparams.is_swa_impl[il]       = hparams.is_swa_impl[p];
+        hparams.attn_mode_impl[il]    = hparams.attn_mode_impl[p];
         hparams.is_recr_impl[il]      = hparams.is_recr_impl[p];
     }
 }

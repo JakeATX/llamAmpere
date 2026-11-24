@@ -1688,6 +1688,23 @@ void llama_kv_cache::clear(bool data) {
         sj_kvarn_reset_stream(s);
     }
 
+    // cache is now empty: any previously invalidated INKLSA index will be populated fresh from pos 0
+    {
+        std::vector<const ggml_tensor *> ks;
+        ks.reserve(layers.size());
+        for (const auto & l : layers) {
+            if (l.k) {
+                ks.push_back(l.k);
+            }
+            for (const auto * t : l.k_stream) {
+                ks.push_back(t);
+            }
+        }
+        if (!ks.empty()) {
+            llama_inklsa_reset_valid(ks.data(), ks.size());
+        }
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -1806,8 +1823,14 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             return false;
         }
         for (uint32_t strm : s_trunc) {
-            const bool ok = sj_kvarn_truncate_body(strm, sj_kvarn_cell_of(strm, p0));
+            const uint32_t c0 = sj_kvarn_cell_of(strm, p0);
+            const bool ok = sj_kvarn_truncate_body(strm, c0);
             GGML_ASSERT(ok);
+            // a deep truncation below the sealed end that splits a 256-aligned block invalidates any INKLSA-SJ index
+            // immediately (before can_reuse) so the next decode falls back to dense instead of scoring a partial block
+            if (c0 % 256 != 0) {
+                lsa_idx_invalidate("seq_rm_trunc", (int32_t) strm);
+            }
         }
         for (uint32_t strm : s_reset) {
             sj_kvarn_reset_stream(strm);
@@ -1881,6 +1904,30 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
             }
+        }
+    }
+
+    // if the entire cache is now empty (e.g. llama-server slot reset via seq_rm(0, 0, -1)), re-validate INKLSA indices
+    bool all_empty = true;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (v_cells[s].get_used() > 0) {
+            all_empty = false;
+            break;
+        }
+    }
+    if (all_empty) {
+        std::vector<const ggml_tensor *> ks;
+        ks.reserve(layers.size());
+        for (const auto & l : layers) {
+            if (l.k) {
+                ks.push_back(l.k);
+            }
+            for (const auto * t : l.k_stream) {
+                ks.push_back(t);
+            }
+        }
+        if (!ks.empty()) {
+            llama_inklsa_reset_valid(ks.data(), ks.size());
         }
     }
 
@@ -5858,8 +5905,10 @@ void llama_kv_cache::set_input_inklsa(const llama_inklsa_inputs & in, const llam
         return;
     }
     // eligible blocks [b_lo, b_hi): past the sinks, every cell at distance >= window from every row
-    const int64_t b_lo = cfg.sinks/B;
-    const int64_t b_hi = std::max<int64_t>(b_lo, ((int64_t) p0 - cfg.window + 1)/B);
+    const int64_t sinks  = in.sinks >= 0 ? in.sinks : cfg.sinks;
+    const int64_t window = in.window > 0 ? in.window : cfg.window;
+    const int64_t b_lo = sinks/B;
+    const int64_t b_hi = std::max<int64_t>(b_lo, ((int64_t) p0 - window + 1)/B);
     std::vector<float> elig(in.n_blk, -INFINITY);
     // every cell of the block is checked: a sequence removal or another sequence can leave holes inside a block
     for (int64_t b = b_lo; b < std::min(b_hi, in.n_blk); ++b) {
@@ -5875,7 +5924,7 @@ void llama_kv_cache::set_input_inklsa(const llama_inklsa_inputs & in, const llam
     // fixed cells: [0, min(sinks, b_hi*B)) and [b_hi*B, p1]
     std::vector<int32_t> ids;
     ids.reserve(in.n_fix);
-    for (int64_t c = 0; c < std::min<int64_t>(cfg.sinks, b_hi*B); ++c) {
+    for (int64_t c = 0; c < std::min<int64_t>(sinks, b_hi*B); ++c) {
         ids.push_back((int32_t) c);
     }
     for (int64_t c = b_hi*B; c <= p1; ++c) {
@@ -5903,6 +5952,151 @@ void llama_kv_cache::set_input_inklsa(const llama_inklsa_inputs & in, const llam
     ggml_backend_tensor_set(in.fix_ids,  ids.data(), 0, ggml_nbytes(in.fix_ids));
     ggml_backend_tensor_set(in.fix_rel,  rel.data(), 0, ggml_nbytes(in.fix_rel));
     ggml_backend_tensor_set(in.fix_mask, msk.data(), 0, ggml_nbytes(in.fix_mask));
+}
+
+// SJ-KVaRN 4/4 INKLSA: populate completed-block gather indices from kv_swa (un-rotated F16/Q8_0 window copy),
+// per-block eligibility, and the per-graph F16 far mask M3 (0 kept, -inf hidden, GGML_LSA_MASK_SEL droppable).
+// Returns the highest visible far cell + 1 (far_end) when sj_m3 is populated, or -1 otherwise.
+int64_t llama_kv_cache::set_input_inklsa_sj(
+        const llama_inklsa_inputs & in,
+        const llama_kv_cache * kv_swa,
+        const llama_ubatch * ubatch,
+        uint32_t extent) const {
+    const int64_t T = ubatch->n_tokens;
+    const int64_t B = in.B;
+    if (T <= 0) {
+        return -1;
+    }
+    GGML_ASSERT(in.sj_mode && kv_swa != nullptr && sj_kvarn.enabled());
+    const llama_seq_id seq = ubatch->seq_id[0][0];
+    const uint32_t strm = seq_to_stream.at(seq);
+    const auto & cells = v_cells.at(strm);
+    llama_pos p0 = ubatch->pos[0], p1 = ubatch->pos[0];
+    for (int64_t i = 0; i < T; ++i) {
+        GGML_ASSERT(ubatch->seq_id[i][0] == seq && "INKLSA-SJ: one sequence per ubatch");
+        p0 = std::min(p0, ubatch->pos[i]);
+        p1 = std::max(p1, ubatch->pos[i]);
+        GGML_ASSERT((uint32_t) ubatch->pos[i] < cells.size() && !cells.is_empty(ubatch->pos[i]) &&
+                cells.pos_get(ubatch->pos[i]) == ubatch->pos[i] && "INKLSA-SJ: needs cells == positions");
+    }
+
+    if (in.u_blk64 && in.u_blk64->buffer && in.u_cells && in.u_cells->buffer) {
+        const auto & cells_swa = kv_swa->v_cells.at(kv_swa->seq_to_stream.at(seq));
+        const int64_t b0 = (int64_t) p0 / B;
+        const int64_t b1 = (int64_t) p1 / B;
+        const int64_t p_need_lo = b0 * B;
+        const int64_t span = (int64_t) p1 - p_need_lo + 1;
+        std::vector<int32_t> pos_to_swa(span, -1);
+        const uint32_t swa_lim = cells_swa.used_max_p1();
+        for (uint32_t j = 0; j < swa_lim; ++j) {
+            if (!cells_swa.is_empty(j) && cells_swa.seq_has(j, seq)) {
+                const llama_pos ps = cells_swa.pos_get(j);
+                if (ps >= p_need_lo && ps <= p1) {
+                    pos_to_swa[ps - p_need_lo] = (int32_t) j;
+                }
+            }
+        }
+        std::vector<int64_t> u64;
+        std::vector<int32_t> ucells;
+        u64.reserve((size_t) in.n_u);
+        ucells.reserve((size_t) (in.n_u * B));
+        bool missing_prefix = false;
+        for (int64_t b = b0; b <= b1; ++b) {
+            if (b * B + B - 1 > p1) {
+                continue; // incomplete block: will be indexed when its last token arrives
+            }
+            bool complete = true;
+            for (int64_t k = 0; k < B; ++k) {
+                if (pos_to_swa[b * B + k - p_need_lo] < 0) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (complete) {
+                u64.push_back(b);
+                for (int64_t k = 0; k < B; ++k) {
+                    ucells.push_back(pos_to_swa[b * B + k - p_need_lo]);
+                }
+            } else {
+                missing_prefix = true;
+            }
+        }
+        if (missing_prefix) {
+            // deep mid-block seq_rm left kv_swa without this block's prefix: invalidate index so sparse falls back to dense
+            lsa_idx_invalidate("inklsa_sj_partial_block", (int32_t) strm);
+        }
+        GGML_ASSERT((int64_t) u64.size() <= in.n_u && "INKLSA-SJ: completed blocks exceed planned n_u");
+        const int64_t dummy_row = in.idx_cap - 1;
+        while ((int64_t) u64.size() < in.n_u) {
+            u64.push_back(dummy_row);
+            for (int64_t k = 0; k < B; ++k) {
+                ucells.push_back(0);
+            }
+        }
+        ggml_backend_tensor_set(in.u_blk64, u64.data(),    0, ggml_nbytes(in.u_blk64));
+        ggml_backend_tensor_set(in.u_cells, ucells.data(), 0, ggml_nbytes(in.u_cells));
+    }
+
+    if (in.onehot && in.onehot->buffer) {
+        const int64_t nkv = in.onehot->ne[1], nh = in.onehot->ne[2];
+        std::vector<float> oh(nkv * nh, 0.0f);
+        for (int64_t h = 0; h < nh; ++h) {
+            oh[h * nkv + h / (nh / nkv)] = 1.0f;
+        }
+        ggml_backend_tensor_set(in.onehot, oh.data(), 0, ggml_nbytes(in.onehot));
+    }
+
+    if (!in.sparse || !in.elig || !in.elig->buffer || !in.sj_m3 || !in.sj_m3->buffer) {
+        return -1;
+    }
+
+    const int64_t n_kv = in.sj_m3->ne[0];
+    GGML_ASSERT(in.sj_m3->type == GGML_TYPE_F16 && in.sj_m3->ne[1] == T && in.sj_m3->ne[2] == 1 && in.sj_m3->ne[3] == 1);
+    const int64_t b_lo = in.sinks / B;
+    const int64_t b_hi = std::max<int64_t>(b_lo, ((int64_t) p0 - in.window + 1) / B);
+    std::vector<float> elig(in.n_blk, -INFINITY);
+    int64_t n_elig = 0;
+    for (int64_t b = b_lo; b < std::min(b_hi, in.n_blk); ++b) {
+        bool ok = true;
+        for (uint32_t c = (uint32_t) (b * B); ok && c < (uint32_t) (b * B + B); ++c) {
+            ok = c < cells.size() && !cells.is_empty(c) && cells.pos_get(c) == (llama_pos) c && cells.seq_has(c, seq);
+        }
+        if (ok) {
+            elig[b] = 0.0f;
+            n_elig++;
+        }
+    }
+
+    const ggml_fp16_t f16_zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
+    const ggml_fp16_t f16_sel  = ggml_fp32_to_fp16(GGML_LSA_MASK_SEL);
+    std::vector<ggml_fp16_t> m3(n_kv * T, f16_ninf);
+    int64_t far_end = 0;
+    for (int64_t t = 0; t < T; ++t) {
+        const llama_pos pf = ubatch->pos[t] - (llama_pos) extent;
+        if (pf < 0) {
+            continue;
+        }
+        const int64_t c1 = std::min<int64_t>(n_kv, std::min<int64_t>(cells.used_max_p1(), sj_kvarn_cell_of(strm, pf + 1)));
+        ggml_fp16_t * row = m3.data() + t * n_kv;
+        for (int64_t j = 0; j < c1; ++j) {
+            if (!cells.is_empty(j) && cells.seq_has(j, seq) && cells.pos_get(j) <= pf) {
+                if (j >= in.sinks && j < b_hi * B && elig[j / B] == 0.0f) {
+                    row[j] = f16_sel;
+                } else {
+                    row[j] = f16_zero;
+                }
+                far_end = std::max<int64_t>(far_end, j + 1);
+            }
+        }
+    }
+    if (n_elig == 0 && !elig.empty()) {
+        // no droppable blocks exist (m3 has zero f16_sel entries): keep softmax finite (avoid 0/0 NaN in votes)
+        elig[0] = 0.0f;
+    }
+    ggml_backend_tensor_set(in.elig,  elig.data(), 0, ggml_nbytes(in.elig));
+    ggml_backend_tensor_set(in.sj_m3, m3.data(),   0, ggml_nbytes(in.sj_m3));
+    return far_end;
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
@@ -6992,6 +7186,7 @@ void llama_kv_cache::state_read_sj_ckpt(llama_io_read_i & io, llama_seq_id seq_i
     if (sj_kvarn_paged) {
         sj_kvarn_release_groups(strm, (B - S)/G); // groups at or above B re-seal later from the restored rows
     }
+    lsa_idx_invalidate("state_read_sj_ckpt", (int32_t) strm);
     // ring rows still valid: [B, n) were just rewritten; below B the live rows of [ring_lo, B) survive unless one of
     // the rewritten rows held them (positions below n - cap)
     st.ring_lo  = std::min(lo, std::max(st.ring_lo, n > sj_kvarn_cap ? n - sj_kvarn_cap : 0u));
@@ -8068,6 +8263,10 @@ void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const lla
 
 void llama_kv_cache_context::set_input_inklsa(const llama_inklsa_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_inklsa(in, ubatch, extent);
+}
+
+int64_t llama_kv_cache_context::set_input_inklsa_sj(const llama_inklsa_inputs & in, const llama_kv_cache_context * mswa, const llama_ubatch * ubatch, uint32_t extent) const {
+    return kv->set_input_inklsa_sj(in, mswa ? mswa->kv : nullptr, ubatch, extent);
 }
 
 void llama_kv_cache_context::set_input_inkrel(const llama_inkrel_inputs & in, const llama_ubatch * ubatch, uint32_t extent) const {

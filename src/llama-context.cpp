@@ -1559,7 +1559,8 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                 // fork (INKSTREAM): with ink_rows_cap the boot scratch stays at 512 rows, but the SWA cache (and the
                 // f32 attention scores of a 512-row prompt ubatch) is sized n_swa + n_ubatch: one score copy per extra
                 // cell (512 rows x n_head x 4 B). Without it 10ink/12ink at -ub 4096 peaked 12-14 MiB over the line.
-                const double swa_extra = ink_rows_cap && model.hparams.n_swa > 0 ?
+                const uint32_t n_swa_max = std::max(model.hparams.n_swa, model.hparams.n_swa_mid);
+                const double swa_extra = ink_rows_cap && n_swa_max > 0 ?
                     (double) (cparams.n_ubatch - 512) * 512.0 * model.hparams.n_head() * 4.0 / (1024.0 * 1024.0) : 0.0;
                 const double reserve = 900.0 + 256.0 + (double) cparams.n_ctx * 2.0 / 1024.0 +
                     std::max(0.0, (double) (ink_rows_cap ? 512u : cparams.n_ubatch) - 512.0) * 1.9 + swa_extra + extra;

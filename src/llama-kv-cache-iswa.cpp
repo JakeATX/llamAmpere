@@ -147,12 +147,24 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return !model.hparams.is_swa(il);
     };
 
+    const layer_filter_cb filter_swa_mid = [&](int32_t il) {
+        if (filter && !filter(il)) {
+            return false;
+        }
+
+        return model.hparams.is_swa_mid(il);
+    };
+
     const layer_filter_cb filter_swa  = [&](int32_t il) {
         if (filter && !filter(il)) {
             return false;
         }
 
-        return  model.hparams.is_swa(il) || swa_near_copy;
+        if (model.hparams.is_swa_mid(il)) {
+            return false;
+        }
+
+        return model.hparams.is_swa(il) || swa_near_copy;
     };
 
     uint32_t size_base = kv_size;
@@ -180,9 +192,23 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         }
     }
 
+    bool has_swa_mid = false;
+    if (hparams.n_swa_mid > 0) {
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if (filter_swa_mid(il)) {
+                has_swa_mid = true;
+                break;
+            }
+        }
+    }
+
+
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
     uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    uint32_t size_swa_mid = has_swa_mid
+        ? GGML_PAD(std::min(size_base, hparams.n_swa_mid*(unified ? n_seq_max : 1) + n_ubatch), 256)
+        : 0;
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
@@ -190,6 +216,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 __func__, "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
 
         size_swa = size_base;
+        if (has_swa_mid) {
+            size_swa_mid = size_base;
+        }
     }
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
@@ -202,6 +231,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     llama_memory_t mem_other_swa = nullptr;
     if (mem_other) {
         mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
+    }
+
+    llama_memory_t mem_other_swa_mid = nullptr;
+    if (mem_other) {
+        mem_other_swa_mid = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa_mid();
     }
 
     // Block KV streaming: the base cache scales with context length and is
@@ -294,11 +328,27 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             "", swa_is_full_length ? kv_stream_stage_bytes : 0,
             swa_is_full_length ? kv_stream_phase_arena : nullptr,
             swa_is_full_length ? kv_stream_maximum_pool_bytes : 0);
+
+    if (has_swa_mid) {
+        LLAMA_LOG_INFO("%s: creating SWA-mid KV cache (n_swa_mid = %u), size = %u cells, type %s/%s\n",
+                __func__, hparams.n_swa_mid, size_swa_mid, ggml_type_name(type_k_swa), ggml_type_name(type_v_swa));
+        const bool swa_mid_is_full_length = size_swa_mid == size_base;
+        kv_swa_mid = std::make_unique<llama_kv_cache>(
+                model, no_alloc, hparams, type_k_swa, type_v_swa,
+                v_trans, offload, unified, size_swa_mid, n_seq_max,
+                hparams.n_swa_mid, hparams.swa_type, mem_other_swa_mid, filter_swa_mid, reuse, share,
+                "", swa_mid_is_full_length ? kv_stream_stage_bytes : 0,
+                swa_mid_is_full_length ? kv_stream_phase_arena : nullptr,
+                swa_mid_is_full_length ? kv_stream_maximum_pool_bytes : 0);
+    }
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
     kv_base->clear(data);
     kv_swa ->clear(data);
+    if (kv_swa_mid) {
+        kv_swa_mid->clear(data);
+    }
 }
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -309,11 +359,18 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         if (!kv_base->seq_rm(seq_id, p0, p1)) {
             return false;
         }
-        return kv_swa->seq_rm(seq_id, p0, p1);
+        res = kv_swa->seq_rm(seq_id, p0, p1);
+        if (kv_swa_mid) {
+            res = res & kv_swa_mid->seq_rm(seq_id, p0, p1);
+        }
+        return res;
     }
 
     res = res & kv_base->seq_rm(seq_id, p0, p1);
     res = res & kv_swa ->seq_rm(seq_id, p0, p1);
+    if (kv_swa_mid) {
+        res = res & kv_swa_mid->seq_rm(seq_id, p0, p1);
+    }
 
     return res;
 }
@@ -321,30 +378,51 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    if (kv_swa_mid) {
+        kv_swa_mid->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
 }
 
 void llama_kv_cache_iswa::seq_keep(llama_seq_id seq_id) {
     kv_base->seq_keep(seq_id);
     kv_swa ->seq_keep(seq_id);
+    if (kv_swa_mid) {
+        kv_swa_mid->seq_keep(seq_id);
+    }
 }
 
 void llama_kv_cache_iswa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     kv_base->seq_add(seq_id, p0, p1, shift);
     kv_swa ->seq_add(seq_id, p0, p1, shift);
+    if (kv_swa_mid) {
+        kv_swa_mid->seq_add(seq_id, p0, p1, shift);
+    }
 }
 
 void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     kv_base->seq_div(seq_id, p0, p1, d);
     kv_swa ->seq_div(seq_id, p0, p1, d);
+    if (kv_swa_mid) {
+        kv_swa_mid->seq_div(seq_id, p0, p1, d);
+    }
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
-    // the base cache is a superset of the SWA cache, so we can just check the SWA cache
-    return kv_swa->seq_pos_min(seq_id);
+    const llama_pos p_swa = kv_swa->seq_pos_min(seq_id);
+    if (!kv_swa_mid) {
+        return p_swa;
+    }
+    const llama_pos p_mid = kv_swa_mid->seq_pos_min(seq_id);
+    return (p_swa < 0 || p_mid < 0) ? -1 : std::max(p_swa, p_mid);
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
-    return kv_swa->seq_pos_max(seq_id);
+    const llama_pos p_swa = kv_swa->seq_pos_max(seq_id);
+    if (!kv_swa_mid) {
+        return p_swa;
+    }
+    const llama_pos p_mid = kv_swa_mid->seq_pos_max(seq_id);
+    return (p_swa < 0 || p_mid < 0) ? -1 : std::min(p_swa, p_mid);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown() const {
@@ -352,17 +430,28 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     for (const auto & buft_size : kv_swa->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }
+    if (kv_swa_mid) {
+        for (const auto & buft_size : kv_swa_mid->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
     return mb;
 }
 
 bool llama_kv_cache_iswa::has_kv_stream_targets() const {
-    return kv_base->has_kv_stream_targets() || kv_swa->has_kv_stream_targets();
+    return kv_base->has_kv_stream_targets() || kv_swa->has_kv_stream_targets() ||
+           (kv_swa_mid && kv_swa_mid->has_kv_stream_targets());
 }
 
 std::vector<llama_kv_stream_target> llama_kv_cache_iswa::get_kv_stream_targets() const {
     std::vector<llama_kv_stream_target> targets = kv_base->get_kv_stream_targets();
     for (auto & target : kv_swa->get_kv_stream_targets()) {
         targets.push_back(target);
+    }
+    if (kv_swa_mid) {
+        for (auto & target : kv_swa_mid->get_kv_stream_targets()) {
+            targets.push_back(target);
+        }
     }
     return targets;
 }
@@ -403,10 +492,19 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
             break;
         }
 
+        llama_kv_cache::slot_info_vec_t sinfos_swa_mid;
+        if (kv_swa_mid) {
+            sinfos_swa_mid = kv_swa_mid->prepare(ubatches);
+            if (sinfos_swa_mid.empty()) {
+                break;
+            }
+            assert(sinfos_base.size() == sinfos_swa_mid.size());
+        }
+
         assert(sinfos_base.size() == sinfos_swa.size());
 
         return std::make_unique<llama_kv_cache_iswa_context>(
-                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches), std::move(sinfos_swa_mid));
     } while (false);
 
     // INKKV v2 (several sequences): prompts get ubatches of their own (inkkv_mix_compat)
@@ -443,10 +541,19 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
             break;
         }
 
+        llama_kv_cache::slot_info_vec_t sinfos_swa_mid;
+        if (kv_swa_mid) {
+            sinfos_swa_mid = kv_swa_mid->prepare(ubatches);
+            if (sinfos_swa_mid.empty()) {
+                break;
+            }
+            assert(sinfos_base.size() == sinfos_swa_mid.size());
+        }
+
         assert(sinfos_base.size() == sinfos_swa.size());
 
         return std::make_unique<llama_kv_cache_iswa_context>(
-                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches), std::move(sinfos_swa_mid));
     } while (false);
 
     // TODO: if we fail again, we should attempt different splitting strategies
@@ -470,17 +577,24 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, 
 bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&
-           kv_base->get_size() == kv_swa->get_size();
+           kv_base->get_size() == kv_swa->get_size() &&
+           (!kv_swa_mid || (kv_swa_mid->get_can_shift() && kv_base->get_size() == kv_swa_mid->get_size()));
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     kv_base->state_write(io, seq_id, flags);
     kv_swa ->state_write(io, seq_id, flags);
+    if (kv_swa_mid) {
+        kv_swa_mid->state_write(io, seq_id, flags);
+    }
 }
 
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     kv_base->state_read(io, seq_id, flags);
     kv_swa ->state_read(io, seq_id, flags);
+    if (kv_swa_mid) {
+        kv_swa_mid->state_read(io, seq_id, flags);
+    }
 }
 
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {
@@ -491,38 +605,54 @@ llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
     return kv_swa.get();
 }
 
+llama_kv_cache * llama_kv_cache_iswa::get_swa_mid() const {
+    return kv_swa_mid.get();
+}
+
 //
 // llama_kv_cache_iswa_context
 //
+
+static llama_memory_status iswa_combine_status(
+        const llama_memory_context_ptr & a,
+        const llama_memory_context_ptr & b,
+        const llama_memory_context_ptr & c) {
+    llama_memory_status s = llama_memory_status_combine(a->get_status(), b->get_status());
+    return c ? llama_memory_status_combine(s, c->get_status()) : s;
+}
 
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         llama_kv_cache_iswa * kv, bool single_seq) :
-    ctx_base(single_seq ? kv->get_base()->init_full_single_seq() : kv->get_base()->init_full()),
-    ctx_swa (single_seq ? kv->get_swa ()->init_full_single_seq() : kv->get_swa ()->init_full()),
-    status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
+    ctx_base   (single_seq ? kv->get_base()->init_full_single_seq() : kv->get_base()->init_full()),
+    ctx_swa    (single_seq ? kv->get_swa ()->init_full_single_seq() : kv->get_swa ()->init_full()),
+    ctx_swa_mid(kv->get_swa_mid() ? (single_seq ? kv->get_swa_mid()->init_full_single_seq() : kv->get_swa_mid()->init_full()) : nullptr),
+    status     (iswa_combine_status(ctx_base, ctx_swa, ctx_swa_mid)) {
 }
 
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         llama_kv_cache_iswa * kv,
         llama_context * lctx,
         bool optimize) :
-    ctx_base(kv->get_base()->init_update(lctx, optimize)),
-    ctx_swa (kv->get_swa ()->init_update(lctx, optimize)),
-    status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
+    ctx_base   (kv->get_base()->init_update(lctx, optimize)),
+    ctx_swa    (kv->get_swa ()->init_update(lctx, optimize)),
+    ctx_swa_mid(kv->get_swa_mid() ? kv->get_swa_mid()->init_update(lctx, optimize) : nullptr),
+    status     (iswa_combine_status(ctx_base, ctx_swa, ctx_swa_mid)) {
 }
 
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         llama_kv_cache_iswa * kv,
         slot_info_vec_t sinfos_base,
         slot_info_vec_t sinfos_swa,
-        std::vector<llama_ubatch> ubatches) :
+        std::vector<llama_ubatch> ubatches,
+        slot_info_vec_t sinfos_swa_mid) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_base(new llama_kv_cache_context(kv->get_base(), std::move(sinfos_base), this->ubatches)),
-    ctx_swa (new llama_kv_cache_context(kv->get_swa (), std::move(sinfos_swa),  this->ubatches)),
-    status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
+    ctx_base   (new llama_kv_cache_context(kv->get_base(), std::move(sinfos_base), this->ubatches)),
+    ctx_swa    (new llama_kv_cache_context(kv->get_swa (), std::move(sinfos_swa),  this->ubatches)),
+    ctx_swa_mid(kv->get_swa_mid() ? new llama_kv_cache_context(kv->get_swa_mid(), std::move(sinfos_swa_mid), this->ubatches) : nullptr),
+    status     (iswa_combine_status(ctx_base, ctx_swa, ctx_swa_mid)) {
 }
 
 llama_kv_cache_iswa_context:: ~llama_kv_cache_iswa_context() = default;
@@ -532,6 +662,9 @@ bool llama_kv_cache_iswa_context::next() {
 
     ctx_base->next();
     ctx_swa ->next();
+    if (ctx_swa_mid) {
+        ctx_swa_mid->next();
+    }
 
     if (++i_next >= ubatches.size()) {
         return false;
@@ -547,6 +680,9 @@ bool llama_kv_cache_iswa_context::apply() {
 
     res = res & ctx_base->apply();
     res = res & ctx_swa ->apply();
+    if (ctx_swa_mid) {
+        res = res & ctx_swa_mid->apply();
+    }
 
     return res;
 }
@@ -562,7 +698,8 @@ const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
 }
 
 bool llama_kv_cache_iswa_context::has_kv_stream_targets() const {
-    return ctx_base->has_kv_stream_targets() || ctx_swa->has_kv_stream_targets();
+    return ctx_base->has_kv_stream_targets() || ctx_swa->has_kv_stream_targets() ||
+           (ctx_swa_mid && ctx_swa_mid->has_kv_stream_targets());
 }
 
 std::vector<llama_kv_stream_active_target> llama_kv_cache_iswa_context::get_kv_stream_active_targets() const {
@@ -572,6 +709,11 @@ std::vector<llama_kv_stream_active_target> llama_kv_cache_iswa_context::get_kv_s
     std::vector<llama_kv_stream_active_target> targets = ctx_base->get_kv_stream_active_targets();
     for (auto & target : ctx_swa->get_kv_stream_active_targets()) {
         targets.push_back(target);
+    }
+    if (ctx_swa_mid) {
+        for (auto & target : ctx_swa_mid->get_kv_stream_active_targets()) {
+            targets.push_back(target);
+        }
     }
     return targets;
 }
@@ -586,4 +728,10 @@ const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa()  const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return static_cast<const llama_kv_cache_context *>(ctx_swa.get());
+}
+
+const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa_mid() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    return static_cast<const llama_kv_cache_context *>(ctx_swa_mid.get());
 }

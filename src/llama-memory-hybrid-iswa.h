@@ -120,7 +120,8 @@ public:
            llama_memory_hybrid_iswa * mem,
                     slot_info_vec_t   sinfos_base,
                     slot_info_vec_t   sinfos_swa,
-          std::vector<llama_ubatch>   ubatches);
+          std::vector<llama_ubatch>   ubatches,
+                    slot_info_vec_t   sinfos_swa_mid = {});
 
     ~llama_memory_hybrid_iswa_context() = default;
 
