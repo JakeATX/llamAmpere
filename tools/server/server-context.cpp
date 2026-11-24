@@ -1102,7 +1102,7 @@ struct server_slot {
         }
         const size_t size = need + need / 64;
         try {
-            ckpt_pf_next = std::async(std::launch::async, [size] { return std::vector<uint8_t>(size); });
+            ckpt_pf_next = std::async(std::launch::async, [size] { std::vector<uint8_t> buf; common_buf_resize(buf, size); return buf; });
         } catch (const std::system_error &) {
             // no helper thread: update_tgt allocates as before
         }
@@ -8407,7 +8407,11 @@ private:
                         }
                         // 1/64 headroom for a later spot laid out a little larger; update_tgt accepts up to 1/8 waste
                         sz += sz / 64;
-                        return std::vector<std::vector<uint8_t>>(n_pf, std::vector<uint8_t>(sz));
+                        std::vector<std::vector<uint8_t>> bufs(n_pf);
+                        for (auto & buf : bufs) {
+                            common_buf_resize(buf, sz);
+                        }
+                        return bufs;
                     });
                 }
             } else {
