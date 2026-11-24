@@ -752,7 +752,7 @@ bool ggml_cuda_inkattn_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     // [FUSE ATTNCOMB] one launch: the last block of each (sequence, KV head) combines (see inkattn_decode_comb)
     // one combined row per warp: wider R (verify widths) runs the separate combine, whose H*T blocks spread the work
-    const int comb_slot = inkattn_comb_on() && S*Hkv <= INKATTN_COMB_CNT && g*T <= INKATTN_WARPS ? inkattn_comb_slot(stream) : -1;
+    const int comb_slot = !use_live && inkattn_comb_on() && S*Hkv <= INKATTN_COMB_CNT && g*T <= INKATTN_WARPS ? inkattn_comb_slot(stream) : -1;
     if (comb_slot >= 0) {
         inkattn_comb_params cp;
         cp.sinks = snk ? (const float *) snk->data : nullptr;
