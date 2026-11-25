@@ -19273,17 +19273,24 @@ struct test_gffn_p9 : public test_ink_nvfp4_moe {
     std::string op_desc(ggml_tensor *) override { return "INKGFFNP9"; }
     bool dump_hash() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
-    const char * required_fusion() override {
-        return scaled && switch_on("GGML_CUDA_GFFN_P9") ? "gffn_p9" : nullptr;
+    // the matcher's switches: GGML_CUDA_GFFN_P9=1, NVFP4PF not off (default k64), INKGLUE / INKGLUE_SITU not off
+    // (default on); the card (sm_80 / sm_86) is the job's to pick
+    static bool not_off(const char * name) {
+        const char * e = getenv(name);
+        return !(e != nullptr && *e && atoi(e) == 0 && strcmp(e, "k32") != 0 && strcmp(e, "k64") != 0);
     }
-    const char * forbidden_fusion() override {
-        return scaled && switch_on("GGML_CUDA_GFFN_P9") ? nullptr : "gffn_p9";
+    bool p9_expected() {
+        return scaled && switch_on("GGML_CUDA_GFFN_P9") && not_off("GGML_CUDA_NVFP4PF") &&
+            not_off("GGML_CUDA_INKGLUE") && not_off("GGML_CUDA_INKGLUE_SITU");
     }
+    const char * required_fusion() override { return p9_expected() ? "gffn_p9" : nullptr; }
+    const char * forbidden_fusion() override { return p9_expected() ? nullptr : "gffn_p9"; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         checked.clear();
         ggml_tensor * out = test_ink_nvfp4_moe::build_graph(ctx);
         // the SITU output: src[1] of the down MUL_MAT_ID that feeds the expert sum
-        ggml_tensor * dn = out->src[0]->src[0]->src[0]->src[0];   // RESHAPE <- SUM_ROWS <- CONT <- PERMUTE <- MUL(dn, rw)
+        // RESHAPE <- SUM_ROWS <- CONT <- PERMUTE <- MUL(dn, rw)
+        ggml_tensor * dn = out->src[0]->src[0]->src[0]->src[0];
         dn = dn->src[0];
         if (dn->op == GGML_OP_MUL) {
             dn = dn->src[0];
@@ -22815,7 +22822,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     add_inkattn_cases(test_cases, false);
     add_ink_nvfp4_moe_cases(test_cases, false);
-    // GFFN-P9: both NVFP4PF tile widths (bn 64: 128 experts, bn 128: 16 experts), strided ids, all-shared routing, unscaled
+    // GFFN-P9: both NVFP4PF tile widths (bn 64: 128 experts, bn 128: 16 experts), strided ids, all-shared routing,
+    // unscaled (no -1 id case: the scale's GET_ROWS takes the same ids, so the graph has none)
     test_cases.emplace_back(new test_gffn_p9(128, 512,  true,  false, 0));
     test_cases.emplace_back(new test_gffn_p9(16,  512,  true,  false, 0));
     test_cases.emplace_back(new test_gffn_p9(16,  1024, true,  true,  1));

@@ -36,6 +36,7 @@ static bool nk_pf_mm_trace() {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #include "nk-pf-lut.cuh"
+#include "inkglue.cuh"
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 #define NK_PF_NO_SM80 1
@@ -199,13 +200,16 @@ static constexpr __host__ __device__ int nk_pf_smem_bytes() {
         + (nk_pf_use_smem_lut<KF, BN>() ? (int) sizeof(nk_pf_lut_blob) : 0);
 }
 
-template <int KF, int BN>
+// SITU = true ([GFFN-P9]): M = 2F gate_up rows; slab s computes gate rows 8s..8s+7 as its rows 0..7 and up rows
+// F+8s..F+8s+7 as its rows 8..15, so each lane holds the gate and up of one (row, column) and stores SITU(gate, up)
+// into the [F] output row (ldy = F). Per element the arithmetic is the SITU = false kernel's.
+template <int KF, int BN, bool SITU = false>
 static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
         const char * __restrict__ w_all, const int64_t stride_blk,
         const int8_t * __restrict__ xq, const float * __restrict__ xs,
         float * __restrict__ y, const int64_t ldy,
         const int M, const int K, const nk_pf_map map,
-        const float * __restrict__ s_exp, const float s_all) {
+        const float * __restrict__ s_exp, const float s_all, const ink_situ_params situ = {}) {
     static_assert(KF == 32 || KF == 64, "NK_PF_MM: KF must be 32 or 64");
     static_assert(BN == 64 || BN == 128, "NK_PF_MM: BN must be 64 or 128");
     constexpr int WN = BN / 2;
@@ -324,10 +328,10 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
     const bool slab_ok0 = slab0 < n_slabs;
     const bool slab_ok1 = slab1 < n_slabs;
 
-    const int r0_0 = slab0 * 16 + g;
-    const int r1_0 = r0_0 + 8;
-    const int r0_1 = slab1 * 16 + g;
-    const int r1_1 = r0_1 + 8;
+    const int r0_0 = SITU ? slab0 * 8 + g : slab0 * 16 + g;
+    const int r1_0 = SITU ? r0_0 + (M >> 1) : r0_0 + 8;
+    const int r0_1 = SITU ? slab1 * 8 + g : slab1 * 16 + g;
+    const int r1_1 = SITU ? r0_1 + (M >> 1) : r0_1 + 8;
 
     const int r_mine0     = (t & 1) ? r1_0 : r0_0;
     const int r_mine1     = (t & 1) ? r1_1 : r0_1;
@@ -523,7 +527,18 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
             const int ni = pair_idx * 2 + u;
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
-                if (c + q < nt) {
+                if constexpr (SITU) {
+                    if (c + q < nt) {
+                        // __fmul_rn: the rounded product SITU = false stores, never contracted into the SITU expression
+                        float * yc = y + (int64_t) scol[c + q] * ldy;
+                        yc[r0_0] = ink_situ_elem(scaled ? __fmul_rn(acc[0][ni][q], oscale) : acc[0][ni][q],
+                            scaled ? __fmul_rn(acc[0][ni][q + 2], oscale) : acc[0][ni][q + 2], situ);
+                        if (slab_ok1) {
+                            yc[r0_1] = ink_situ_elem(scaled ? __fmul_rn(acc[1][ni][q], oscale) : acc[1][ni][q],
+                                scaled ? __fmul_rn(acc[1][ni][q + 2], oscale) : acc[1][ni][q + 2], situ);
+                        }
+                    }
+                } else if (c + q < nt) {
                     float * yc = y + (int64_t) scol[c + q] * ldy;
                     yc[r0_0] = scaled ? acc[0][ni][q] * oscale     : acc[0][ni][q];
                     yc[r1_0] = scaled ? acc[0][ni][q + 2] * oscale : acc[0][ni][q + 2];
@@ -537,13 +552,13 @@ static __global__ void __launch_bounds__(256, 2) k_nk_pf_mm(
     }
 }
 
-template <int KF, int BN>
+template <int KF, int BN, bool SITU = false>
 static void nk_pf_launch_impl(
         const char * w, const int64_t stride_blk,
         const int8_t * xq, const float * xs,
         float * y, const int M, const int K,
         const nk_pf_map & map, const int max_tiles,
-        const float * s_exp, const int device, cudaStream_t stream) {
+        const float * s_exp, const int device, cudaStream_t stream, const ink_situ_params & situ = {}) {
     constexpr int smem = nk_pf_smem_bytes<KF, BN>();
     static_assert(smem + BN * (int) sizeof(int) <= 50 * 1024,
         "NK_PF_MM: per-CTA shared memory exceeds 2 CTAs/SM budget on 100 KB Ampere SMEM");
@@ -552,11 +567,11 @@ static void nk_pf_launch_impl(
     const uint64_t dev_bit = (device >= 0 && device < 64) ? (uint64_t(1) << device) : 0;
     if (dev_bit && (smem_cfg_set.load(std::memory_order_relaxed) & dev_bit) == 0) {
         const cudaError_t err1 = cudaFuncSetAttribute(
-            k_nk_pf_mm<KF, BN>,
+            k_nk_pf_mm<KF, BN, SITU>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem);
         const cudaError_t err2 = cudaFuncSetAttribute(
-            k_nk_pf_mm<KF, BN>,
+            k_nk_pf_mm<KF, BN, SITU>,
             cudaFuncAttributePreferredSharedMemoryCarveout,
             cudaSharedmemCarveoutMaxShared);
         if (err1 == cudaSuccess && err2 == cudaSuccess) {
@@ -567,8 +582,9 @@ static void nk_pf_launch_impl(
     }
 
     const dim3 grid((unsigned) ((M + 127) / 128), (unsigned) max_tiles);
-    k_nk_pf_mm<KF, BN><<<grid, 256, smem, stream>>>(
-        w, stride_blk, xq, xs, y, M, M, K, map, s_exp, 1.0f);
+    // SITU: the output row is [F] (ldy = M/2)
+    k_nk_pf_mm<KF, BN, SITU><<<grid, 256, smem, stream>>>(
+        w, stride_blk, xq, xs, y, SITU ? M / 2 : M, M, K, map, s_exp, 1.0f, situ);
 }
 
 void ggml_cuda_nk_pf_mm_launch(
@@ -603,11 +619,42 @@ void ggml_cuda_nk_pf_mm_launch(
     }
 }
 
+void ggml_cuda_nk_pf_mm_launch_situ(
+        const int KF, const int bn,
+        const char * w, const int64_t stride_blk,
+        const int8_t * xq, const float * xs,
+        float * y, const int M, const int K,
+        const nk_pf_map & map, const int max_tiles,
+        const float * s_exp, const ink_situ_params & situ, const int device, cudaStream_t stream) {
+    if (KF == 64) {
+        if (bn == 64) {
+            nk_pf_launch_impl<64, 64, true>(w, stride_blk, xq, xs, y, M, K, map, max_tiles, s_exp, device, stream,
+                situ);
+        } else {
+            nk_pf_launch_impl<64, 128, true>(w, stride_blk, xq, xs, y, M, K, map, max_tiles, s_exp, device, stream,
+                situ);
+        }
+    } else {
+        if (bn == 64) {
+            nk_pf_launch_impl<32, 64, true>(w, stride_blk, xq, xs, y, M, K, map, max_tiles, s_exp, device, stream,
+                situ);
+        } else {
+            nk_pf_launch_impl<32, 128, true>(w, stride_blk, xq, xs, y, M, K, map, max_tiles, s_exp, device, stream,
+                situ);
+        }
+    }
+}
+
 #else
 
 void ggml_cuda_nk_pf_mm_launch(
         int, int, const char *, int64_t, const int8_t *, const float *,
         float *, int, int, const nk_pf_map &, int, const float *, int, cudaStream_t) {
+}
+
+void ggml_cuda_nk_pf_mm_launch_situ(
+        int, int, const char *, int64_t, const int8_t *, const float *,
+        float *, int, int, const nk_pf_map &, int, const float *, const ink_situ_params &, int, cudaStream_t) {
 }
 
 #endif

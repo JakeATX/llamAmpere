@@ -27,3 +27,14 @@ void ggml_cuda_nk_pf_mm_launch(
         float * y, int M, int K,
         const nk_pf_map & map, int max_tiles,
         const float * s_exp, int device, cudaStream_t stream);
+
+// [GFFN-P9] M = 2F gate_up rows; stores SITU(gate*s, up*s) into y [F] per column (the bytes of the plain launch above
+// followed by the SITU kernel)
+struct ink_situ_params;
+void ggml_cuda_nk_pf_mm_launch_situ(
+        int KF, int bn,
+        const char * w, int64_t stride_blk,
+        const int8_t * xq, const float * xs,
+        float * y, int M, int K,
+        const nk_pf_map & map, int max_tiles,
+        const float * s_exp, const ink_situ_params & situ, int device, cudaStream_t stream);
