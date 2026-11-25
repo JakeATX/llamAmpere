@@ -1356,6 +1356,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 
 // fork: the full fit (n-cpu-moe auto, MoE-cache aware placement, VRAM floors, rollback on failure), shared by
 // common_init_result and common_measure_memory; *verify_compact_fit_safe reports whether AI+ compact verify may stay on
+
+// fork (DFIT): LLAMA_MOE_CACHE_AUTO_RESERVE_MIB is written by common (1400 default, then the fit's drafter
+// measurement); a value the user set (anything common did not write) is kept
+static std::string g_moe_cache_auto_reserve_mib;
+
+static bool common_moe_cache_auto_reserve_is_default() {
+    const char * v = getenv("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB");
+    return v == nullptr || g_moe_cache_auto_reserve_mib == v;
+}
+
+static void common_moe_cache_auto_reserve_set(const std::string & mib) {
+    g_moe_cache_auto_reserve_mib = mib;
+    common_set_env("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB", mib);
+}
+
 void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams, bool * verify_compact_fit_safe) {
     bool verify_compact_fit_safe_local = false;
     if (verify_compact_fit_safe == nullptr) {
@@ -1477,6 +1492,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 
         bool fit_margins_verified = false;
         size_t verified_free_min = 0;
+        size_t extra_device_bytes = 0;
         const common_params_fit_status fit_status = common_fit_params(
             params.model.get_paths(), &mparams, &cparams,
             params.tensor_split,
@@ -1490,7 +1506,17 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
             &fit_margins_verified, params.card_preset_ctx_default ? cparams.n_ctx : 0, params.card_preset_fit_target,
-            params.card_preset_fit_target ? &verified_free_min : nullptr);
+            params.card_preset_fit_target ? &verified_free_min : nullptr, has_draft ? &extra_device_bytes : nullptr);
+        if (fit_status == COMMON_PARAMS_FIT_STATUS_SUCCESS && has_draft && extra_device_bytes > 0 &&
+                params.moe_cache_size == 0 && common_moe_cache_auto_reserve_is_default()) {
+            // fork (DFIT): the drafter loads after the target context; leave the fit's measurement of its weights + KV +
+            // compute at the fitted ctx (+64 MiB) out of the auto-sized expert cache instead of the fixed 1,400 MiB
+            // (measured at ctx 16K-40K; at 240K and -ub 2048 the drafter took 5,551 MiB and its compute buffer OOMed)
+            const size_t mib = (extra_device_bytes + (1u << 20) - 1) / (1u << 20) + 64;
+            common_moe_cache_auto_reserve_set(std::to_string(mib));
+            COM_INF("drafter at ctx %u: %zu MiB of VRAM (fit measurement) stay out of the auto-sized expert cache\n",
+                    cparams.n_ctx, mib - 64);
+        }
         *verify_compact_fit_safe = common_fit_verify_compact_margins(fit_margins_verified, fit_targets,
             vram_floor, params.card_preset_fit_target, verified_free_min);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
@@ -2313,7 +2339,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         // (process-wide on purpose: the router/reload paths rebuild the same target + drafter pair)
         // fork (INKSMALL2): the drafter loads after the target context, so its weights + KV + compute (measured
         // 1,307-1,327 MiB for the Inkling DSpark Q8_0 fold drafter at ctx 16K-40K) stay out of the auto-sized cache
-        common_set_env("LLAMA_MOE_CACHE_AUTO_RESERVE_MIB", "1400");
+        // (fork DFIT: a fit replaces this with its measurement of the drafter at the fitted ctx, common_fit_apply)
+        common_moe_cache_auto_reserve_set("1400");
     }
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
     cparams.moe_draft_keep = params.moe_draft_keep;

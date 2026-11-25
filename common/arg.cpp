@@ -1246,6 +1246,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
             }
         }
+        // fork (DFIT): 8/10/12ink with the drafter on: the DSpark drafter has no ub ladder (non-causal) and reserved its
+        // compute at the target's -ub (12ink 2048: 4,164 MiB at ctx 240,640 -> boot OOM, ctx under the floor). Its prompt
+        // pass is split into -ubd pieces, so take 24ink's 64 rows unless -ubd is given. Drafter off: nothing changes.
+        if (ink_card && !ink24 && params.speculative.has_dft() && !explicit_or_env("--spec-draft-ubatch") &&
+                !explicit_or_env("--spec-draft-n-ubatch")) {
+            params.speculative.draft.n_ubatch = 64;
+            params.card_preset_flags += " --spec-draft-ubatch 64";
+            LOG_INF("card preset %s: drafter on, draft ubatch 64 (as 24ink; -ubd N sets it)\n", params.card_preset.c_str());
+        }
         const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                 COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
         if (adaptive_mtp && explicit_or_env("--spec-draft-n-max") && !explicit_or_env("--spec-draft-n-min-adaptive")) {

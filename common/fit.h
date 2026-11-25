@@ -172,7 +172,9 @@ common_params_fit_status common_fit_params(
                                bool * margins_verified = nullptr,
                            uint32_t   n_ctx_preset_max = 0,
                                bool   preset_total_margin = false,
-                             size_t * verified_free_min = nullptr);
+                             size_t * verified_free_min = nullptr,
+                             size_t * extra_device_bytes = nullptr); // out: the extra model's GPU weights + KV + compute at
+                                                                     // the fitted context (0 if not measured or shared)
 
 // print estimated memory to stdout
 void common_fit_print(

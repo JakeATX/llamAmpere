@@ -351,6 +351,18 @@ static void test(void) {
         assert(cli_headless.fit_params_target.front() == size_t(500) * 1024 * 1024);
         common_params full_context;
         assert(parse_card({"--preset", "8dense", "-c", "0"}, full_context));
+        // fork (DFIT): 8/10/12ink with the drafter on default the draft ubatch to 64; drafter off and -ubd keep theirs
+        for (const std::string name : {"8ink", "10ink", "12ink"}) {
+            common_params ink_off;
+            assert(parse_card({"--preset", name, "-m", "model.gguf"}, ink_off));
+            assert(!ink_off.speculative.has_dft() && ink_off.speculative.draft.n_ubatch == -1);
+            common_params ink_on;
+            assert(parse_card({"--preset", name, "-m", "model.gguf", "--spec-draft-model", "draft.gguf"}, ink_on));
+            assert(ink_on.speculative.has_dft() && ink_on.speculative.draft.n_ubatch == 64);
+            common_params ink_ubd;
+            assert(parse_card({"--preset", name, "-m", "model.gguf", "--spec-draft-model", "draft.gguf", "-ubd", "256"}, ink_ubd));
+            assert(ink_ubd.speculative.draft.n_ubatch == 256);
+        }
         assert(full_context.n_ctx == 0 && !full_context.card_preset_ctx_default);
         for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
             common_params selected;

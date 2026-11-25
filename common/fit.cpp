@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -900,7 +901,7 @@ static void common_params_fit_impl(
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         common_moe_cache_params * moe_cache, const size_t * margins_s, uint32_t n_ctx_min,
         const common_fit_extra_model * extra, enum ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max,
-        bool preset_total_margin, size_t * verified_free_min) {
+        bool preset_total_margin, size_t * verified_free_min, size_t * extra_device_bytes) {
     // tensor split: every device holds a slice of every layer, so the only free variable is the context. The model is one
     // meta device whose buffers report their largest per-device slice and whose memory is that of the smallest card
     // (common_get_device_memory_data_impl), so the single-device context fit applies. LLAMA_FIT_SM_TENSOR=0: old refusal.
@@ -940,6 +941,25 @@ static void common_params_fit_impl(
     std::vector<int64_t> preset_free;
     std::vector<size_t> preset_lines;
     std::vector<size_t> preset_targets;
+
+    // fork (DFIT): report what the extra model (a separate drafter) takes on the GPUs at the fitted context, so the
+    // MoE cache auto-size (sized after the fit, before the drafter loads) can leave exactly that much free
+    struct extra_report_t {
+        std::function<void()> fn;
+        ~extra_report_t() { fn(); }
+    } extra_report { [&] {
+        if (!extra_device_bytes || !extra || extra->shares_compute || !extra_complete || dmds_extra.empty()) {
+            return;
+        }
+        size_t sum = 0;
+        for (size_t id = 0; id < devs.size() && id < dmds_extra.size(); id++) {
+            const llama_memory_breakdown_data & mb = dmds_extra[id].mb;
+            const common_fit_extra_memory mem = common_fit_extra_memory_at(
+                {mb.model, mb.context, mb.compute}, n_ctx_extra, cparams->n_ctx, 0, false);
+            sum += mem.model + mem.context + mem.compute;
+        }
+        *extra_device_bytes = sum;
+    } };
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes: both its KV cache and its compute graph
@@ -2198,17 +2218,20 @@ enum common_params_fit_status common_fit_params(
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
         ggml_log_level log_level, bool * margins_verified, uint32_t n_ctx_preset_max, bool preset_total_margin,
-        size_t * verified_free_min) {
+        size_t * verified_free_min, size_t * extra_device_bytes) {
     const int64_t t0_us = llama_time_us();
     if (margins_verified) {
         *margins_verified = false;
+    }
+    if (extra_device_bytes) {
+        *extra_device_bytes = 0;
     }
     if (verified_free_min) {
         *verified_free_min = 0;
     }
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level, margins_verified, n_ctx_preset_max, preset_total_margin, verified_free_min);
+        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, extra, log_level, margins_verified, n_ctx_preset_max, preset_total_margin, verified_free_min, extra_device_bytes);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_no_room & e) {
         LOG_ERR("%s: no placement fits in device memory: %s\n", __func__, e.what());
@@ -2219,6 +2242,9 @@ enum common_params_fit_status common_fit_params(
     } catch (const std::runtime_error & e) {
         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+    if (extra_device_bytes && status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        *extra_device_bytes = 0;
     }
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
