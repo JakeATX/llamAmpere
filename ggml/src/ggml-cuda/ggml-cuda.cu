@@ -11824,10 +11824,13 @@ static int ggml_cuda_try_fuse_ink_rel(ggml_backend_cuda_context * ctx, ggml_cgra
     if (!gr) {
         return table_only();
     }
-    // [FUSE RELTABFULL] (GGML_CUDA_FUSE_RELTABFULL=1, default off): when the whole mask chain does not fuse at decode
-    // widths (a full-attention visit with the far / near split: the table has a second reader, the far LSE constant),
-    // the table part still runs as the one-launch table above instead of PAD, MUL_MAT, SUB and CONT
-    static const bool tab_full = [] { const char * e = getenv("GGML_CUDA_FUSE_RELTABFULL"); return e && *e && atoi(e) != 0; }();
+    // [FUSE RELTABFULL] (default on, GGML_CUDA_FUSE_RELTABFULL=0 = off): when the whole mask chain does not fuse at
+    // decode widths (a full-attention visit with the far / near split: the table has a second reader, the far LSE
+    // constant), the table part still runs as the one-launch table above instead of PAD, MUL_MAT, SUB and CONT
+    static const bool tab_full = [] {
+        const char * e = getenv("GGML_CUDA_FUSE_RELTABFULL");
+        return !e || !*e || atoi(e) != 0;
+    }();
     auto gr_refuse = [&]() -> int {
         return tab_full && sub->ne[2] <= 8 ? table_only() : 0;
     };
@@ -12853,7 +12856,7 @@ static int ggml_cuda_try_fuse_ink_router(ggml_backend_cuda_context * ctx, ggml_c
     }
     const ggml_tensor * w = mm->src[0];
     const ggml_tensor * y = mm->src[1];
-    // [FUSE ROUTERT] (fuse-routert.cuh, GGML_CUDA_FUSE_ROUTERT=1): also 2..8 rows
+    // [FUSE ROUTERT] (fuse-routert.cuh, default on): also 2..8 rows
     const int64_t n_rows = y->ne[1];
     const bool    multi  = n_rows > 1;
     if (multi && (!ggml_cuda_fuse_routert_on() || n_rows > GGML_CUDA_ROUTERT_MAX_ROWS)) {

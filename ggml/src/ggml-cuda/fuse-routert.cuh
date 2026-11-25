@@ -5,8 +5,8 @@
 
 #include <cstdlib>
 
-// [FUSE ROUTERT] (GGML_CUDA_FUSE_ROUTERT=1, default off; needs INKROUTER on): the INKROUTER router (BF16 gate matvec +
-// the topk-moe chain in one launch) at 2..8 rows (drafter verify widths). Each row's logits are the sums
+// [FUSE ROUTERT] (default on, GGML_CUDA_FUSE_ROUTERT=0 = off; needs INKROUTER on): the INKROUTER router (BF16 gate
+// matvec + the topk-moe chain in one launch) at 2..8 rows (drafter verify widths). Each row's logits are the sums
 // mul_mat_vec_f computes for one column (block of 256, the same per-thread accumulation and reductions for every
 // column), i.e. the bits a one-row decode step gets for that row; the unfused verify path runs mul_mat_f there, so
 // the logits differ from it by rounding. The last block runs topk_moe_cuda's per-row device code, one warp per row.
@@ -15,7 +15,7 @@
 static inline bool ggml_cuda_fuse_routert_on() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_FUSE_ROUTERT");
-        return e && *e && atoi(e) != 0;
+        return !e || !*e || atoi(e) != 0;
     }();
     return on;
 }
