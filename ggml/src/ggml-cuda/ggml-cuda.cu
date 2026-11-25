@@ -11568,14 +11568,15 @@ static block_q8_1 * ggml_cuda_nvfp4moe_xq_slot(const ggml_tensor * act, int64_t 
     return (block_q8_1 *) ((char *) act->data + act_q8);
 }
 
-// [GFFN-P9] (gffn-p9.cuh, GGML_CUDA_GFFN_P9=1, default off): NVFP4 MoE prefill gate_up MUL_MAT_ID, RESHAPE REPEAT GET_ROWS
-// MUL (per-expert scale), then the SITU run on its gate (offset 0) and up (offset F) views, as one NVFP4PF GEMM that stores
-// SITU(gate, up) into the SITU output. Taken only where the unfused run takes NVFP4PF at the fused scale-MMQ site (MMQ
-// size, plain weights), so the output is that run's bytes.
+// [GFFN-P9] (gffn-p9.cuh, GGML_CUDA_GFFN_P9=1, default off): NVFP4 MoE prefill gate_up MUL_MAT_ID, RESHAPE REPEAT
+// GET_ROWS MUL (per-expert scale), then the SITU run on its gate (offset 0) and up (offset F) views, as one NVFP4PF GEMM
+// that stores SITU(gate, up) into the SITU output. Taken only where the unfused run takes NVFP4PF at the fused scale-MMQ
+// site (MMQ size, plain weights) and the fused SITU kernel (INKGLUE SITU on), so the output is that run's bytes.
 static int ggml_cuda_try_fuse_gffn_p9(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    static const bool situ_on = ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_SITU");   // also off with GGML_CUDA_INKGLUE=0
     ggml_tensor * gu = cgraph->nodes[i];
-    if (!ggml_cuda_gffn_p9_on() || gu->op != GGML_OP_MUL_MAT_ID || gu->src[0]->type != GGML_TYPE_NVFP4 || gu->ne[2] < 512 ||
-            gu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gu) || i + 5 >= cgraph->n_nodes) {
+    if (!ggml_cuda_gffn_p9_on() || !situ_on || gu->op != GGML_OP_MUL_MAT_ID || gu->src[0]->type != GGML_TYPE_NVFP4 ||
+            gu->ne[2] < 512 || gu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gu) || i + 5 >= cgraph->n_nodes) {
         return 0;
     }
     const int device = ctx ? ctx->device : ggml_cuda_get_device();
@@ -11629,9 +11630,10 @@ static int ggml_cuda_try_fuse_gffn_p9(ggml_backend_cuda_context * ctx, ggml_cgra
             }
         }
     }
-    if (last_situ < 0 || !ggml_is_contiguous(gu_out) || g->view_src != gu_out || u->view_src != gu_out || g->view_offs != 0 ||
-            u->view_offs != (size_t) F*sizeof(float) || g->nb[1] != gu_out->nb[1] || u->nb[1] != gu_out->nb[1] ||
-            g->nb[2] != gu_out->nb[2] || u->nb[2] != gu_out->nb[2] || !ggml_cuda_gffn_p9_supported(cc, gu, s_gu, act, sp)) {
+    if (last_situ < 0 || !ggml_is_contiguous(gu_out) || g->view_src != gu_out || u->view_src != gu_out ||
+            g->view_offs != 0 || u->view_offs != (size_t) F*sizeof(float) || g->nb[1] != gu_out->nb[1] ||
+            u->nb[1] != gu_out->nb[1] || g->nb[2] != gu_out->nb[2] || u->nb[2] != gu_out->nb[2] ||
+            !ggml_cuda_gffn_p9_supported(cc, gu, s_gu, act, sp)) {
         return 0;
     }
     n_set += 9;
@@ -17130,6 +17132,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // memory the fused kernel still reads (the eval-time matchers also refuse any overlap)
     if (!disable_fusion && ggml_cuda_inkglue_on("GGML_CUDA_INKGLUE_DEPS")) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            // [GFFN-P9] the fused GEMM reads only x, ids and the expert scale and writes only the SITU output: keep just
+            // those alive (the whole-run deps would also hold the gate_up product, never written here, until the
+            // output: 2F x n_used x T x 4 B more compute buffer)
+            const int np9 = ggml_cuda_try_fuse_gffn_p9(nullptr, cgraph, i);
+            if (np9 > 0) {
+                ggml_tensor * gu = cgraph->nodes[i];
+                ggml_tensor * out = cgraph->nodes[i + np9];
+                params->add_alloc_dep(params->user_data, gu->src[1], out);
+                params->add_alloc_dep(params->user_data, gu->src[2], out);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 1]->src[0], out);   // RESHAPE of the scale
+                i += np9;
+                continue;
+            }
             const int n = ggml_cuda_try_fuse_inkglue(nullptr, cgraph, i);
             if (n > 0) {
                 add_alloc_deps(i, i + n);

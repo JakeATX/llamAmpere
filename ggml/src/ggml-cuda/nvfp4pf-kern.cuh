@@ -457,17 +457,17 @@ static __global__ void __launch_bounds__(256, 2) k_nvfp4pf_mm(const char * __res
                 }
             }
         }
-        return;
-    }
+    } else {
 #pragma unroll
-    for (int i = 0; i < NTI; ++i) {
-        const int c = nw*WN + i*8 + 2*t;
+        for (int i = 0; i < NTI; ++i) {
+            const int c = nw*WN + i*8 + 2*t;
 #pragma unroll
-        for (int q = 0; q < 2; ++q) {
-            if (c + q < nt) {
-                float * yc = y + (int64_t) scol[c + q]*ldy;
-                yc[r0] = scaled ? acc[i][q]*oscale     : acc[i][q];
-                yc[r1] = scaled ? acc[i][q + 2]*oscale : acc[i][q + 2];
+            for (int q = 0; q < 2; ++q) {
+                if (c + q < nt) {
+                    float * yc = y + (int64_t) scol[c + q]*ldy;
+                    yc[r0] = scaled ? acc[i][q]*oscale     : acc[i][q];
+                    yc[r1] = scaled ? acc[i][q + 2]*oscale : acc[i][q + 2];
+                }
             }
         }
     }
