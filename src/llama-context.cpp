@@ -5661,7 +5661,7 @@ build_graph:
     int plan_slot = -1;
     vg_slot = -1;
     const bool use_vgraph = vgraph_env && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && model.arch != LLM_ARCH_DFLASH &&
-        gtype == LLM_GRAPH_TYPE_DECODER;
+        (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER);   // target decode passes DEFAULT
     const bool use_plan_slots = (plan_slots_env &&
         (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (dspark_plan_slots_env && model.arch == LLM_ARCH_DFLASH))) || use_vgraph;
     if (use_plan_slots && !graph_reuse_disable && !b1_cur.active &&
@@ -8442,7 +8442,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 
 llm_graph_result * llama_context::get_gf_res_vg(int slot) {
     auto & res = gf_res_vg[slot];
-    if (!res) {
+    // a re-reserve can raise max_nodes; a width result made before it must not be rebuilt into (its reuse is already
+    // blocked: gf_res_prev_active == nullptr clears plan_res)
+    if (!res || res->get_max_nodes() < gf_res_reserve->get_max_nodes()) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
     return res.get();
