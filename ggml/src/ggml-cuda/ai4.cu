@@ -45,6 +45,7 @@ void dispatch_coop128_ait4(
 #include <mutex>
 #include <cstring>
 #include <vector>
+#include "split-waves.cuh"
 
 // Kernel selection (read once per process), for A/B runs:
 //   GGML_CUDA_AI4_REF=1        reference path: reconstruct to f32 + cuBLAS SGEMM
@@ -867,7 +868,7 @@ static int ai5_midt_splits(int M, int N, int K, int sms) {
         return 0;
     }
     const int ctas = (M/16 + ai4k::GEMM_SLABS - 1)/ai4k::GEMM_SLABS;
-    const int want = v < 0 ? 1 : v > 1 ? v : sms/ctas;
+    const int want = v < 0 ? 1 : v > 1 ? v : ggml_cuda_midt_splits(ctas, sms, std::min(8, K/512));
     // at most one split per four 128-column chunks; ceil-sized slices can leave a tail split empty (K = 4224, 8 splits):
     // the kernel then writes a zero plane
     return std::max(1, std::min(want, std::min(8, K/512)));
@@ -961,7 +962,7 @@ static void ai4_midt_u_launch(const uint8_t * W, const int8_t * q, const float *
 // splits as ai5_midt_splits with its default (1 = from the SM count), clamped to [1, min(8, K/512)]
 static int ai4_midt_u_splits(int M, int K, int sms) {
     const int ctas = (M/16 + ai4k::GEMM_SLABS - 1)/ai4k::GEMM_SLABS;
-    return std::max(1, std::min(sms/ctas, std::min(8, K/512)));
+    return std::max(1, std::min(ggml_cuda_midt_splits(ctas, sms, std::min(8, K/512)), std::min(8, K/512)));
 }
 
 // ai4-kern LAY of an AI+ unit type; xsh = 1 unless K % 256 != 0.
