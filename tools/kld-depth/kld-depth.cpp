@@ -374,6 +374,9 @@ int main(int argc, char ** argv) {
         } else {
             int32_t saved[4];
             base_in.read((char *) saved, sizeof(saved));
+            // INKE21: KLD_STUDENT_UB_ANY=1 lets the student run a different -ub than the teacher (batch/context/contract still checked)
+            static const bool ub_any = getenv("KLD_STUDENT_UB_ANY") && atoi(getenv("KLD_STUDENT_UB_ANY")) != 0;
+            if (ub_any) { saved[1] = config[1]; }
             if (!base_in || memcmp(config, saved, sizeof(config))) {
                 LOG_ERR("base batch/ubatch/context/contract length mismatch\n"); return 1;
             }
