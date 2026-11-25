@@ -380,8 +380,8 @@ struct common_sampler {
 
     // LLAMA_SAMPLER_TOPK_FUSED=1: exact leading top-k (0 = off). LLAMA_BOOKKEEP_SAMPLER=1 also permits logit bias.
     int32_t fused_top_k = 0;
-    std::vector<llama_logit_bias> fused_topk_bias;
-    std::vector<float> fused_topk_scratch;
+    std::vector<llama_logit_bias> fused_topk_bias = {};
+    std::vector<float> fused_topk_scratch = {};
 
     // Status of the most recent sample, refreshed before the p/q acceptance check.
     bool sampled_backend = false;
@@ -406,7 +406,7 @@ struct common_sampler {
 
     // target top-1 probability (request-matched distribution, after the sampler chain) of every position the last
     // sample_and_accept_n_pq call looked at; a free by-product used by the CDEPTH draft-depth policy. -1 = unknown
-    std::vector<float> top1_trace;
+    std::vector<float> top1_trace = {};
     int32_t first_rescue = -1; // [MBFIX] position of the last pq verify call's first mode-biased rescue (-1 = none)
 };
 
@@ -1602,7 +1602,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_pq(struct common_sam
                 const char * e = std::getenv("LLAMA_SPEC_MB_KL");
                 return e ? std::max(0, std::min(512, std::atoi(e))) : 0;
             }();
-            if (gsmpl->params.spec_lossy && gsmpl->pq_stats.n_pos < audit_limit) {
+            if (gsmpl->params.spec_lossy && gsmpl->pq_stats.n_pos < (size_t) audit_limit) {
                 const auto stop = [&](llama_token id) { return llama_vocab_is_eog(vocab, id) || ends(id); };
                 const auto law = common_sampler_pq_mode_distribution(p, draft_q[i], stop);
                 double forward = 0.0, reverse = 0.0, mass = 0.0;
