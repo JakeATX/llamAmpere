@@ -8,5 +8,6 @@
 
 int ggml_cuda_q8tc_mode();
 
-// a: filled q8a16_args (members, no ids). Launches and returns true when taken; false = nothing launched.
-bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, int nb);
+// a: filled q8a16_args (members, no ids); w: first member weight (name picks the per-tensor mode), group: grouped launch.
+// Launches and returns true when taken; false = nothing launched.
+bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, int nb, const ggml_tensor * w, bool group);

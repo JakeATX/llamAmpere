@@ -5,10 +5,13 @@
 #endif
 
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 #define Q8TC_MAX_ROWS 16384
 
 int ggml_cuda_q8tc_mode() {
+    // off unless set: the per-arch defaults table sets GGML_CUDA_Q8TC (0.7.5 Inkling: 2 = hi/lo; E21 ub5 KLD -4.4e-5)
     static const int m = [] { const char * e = getenv("GGML_CUDA_Q8TC"); const int v = e ? atoi(e) : 0; return v == 1 || v == 2 ? v : 0; }();
     return m;
 }
@@ -16,6 +19,43 @@ int ggml_cuda_q8tc_mode() {
 static int q8tc_min_t() {
     static const int m = [] { const char * e = getenv("GGML_CUDA_Q8TC_MINT"); const int v = e ? atoi(e) : 4; return v < 2 ? 2 : v; }();
     return m;
+}
+
+// Q8TC-PT: GGML_CUDA_Q8TC_M1 = comma list of "<kind><first>-<last>" (kind g = grouped launch, o = plain launch, e.g.
+// attn_output; layer from the weight name blk.N.) that run mode 1 while GGML_CUDA_Q8TC=2; "g" / "o" alone = all layers.
+struct q8tc_sel { char kind; int lo, hi; };
+static const std::vector<q8tc_sel> & q8tc_m1_sel() {
+    static const std::vector<q8tc_sel> v = [] {
+        std::vector<q8tc_sel> r;
+        const char * e = getenv("GGML_CUDA_Q8TC_M1");
+        for (const char * p = e; p && *p; ) {
+            if (*p == ',') { ++p; continue; }
+            q8tc_sel s{*p++, 0, 1 << 30};
+            if (*p >= '0' && *p <= '9') {
+                char * q = nullptr;
+                s.lo = s.hi = (int) strtol(p, &q, 10);
+                p = q;
+                if (*p == '-') { const char * h = p + 1; s.hi = (int) strtol(h, &q, 10); s.hi = q == h ? 1 << 30 : s.hi; p = q; }   // "g5-" = 5..last
+            }
+            if (s.kind == 'g' || s.kind == 'o') { r.push_back(s); }
+            while (*p && *p != ',') { ++p; }
+            if (*p == ',') { ++p; }
+        }
+        return r;
+    }();
+    return v;
+}
+
+static int q8tc_tensor_mode(int mode, const ggml_tensor * w, bool group) {
+    if (mode != 2 || w == nullptr || q8tc_m1_sel().empty()) {
+        return mode;
+    }
+    int il = -1;
+    if (strncmp(w->name, "blk.", 4) == 0) { il = atoi(w->name + 4); }
+    for (const q8tc_sel & s : q8tc_m1_sel()) {
+        if (s.kind == (group ? 'g' : 'o') && il >= s.lo && il <= s.hi) { return 1; }
+    }
+    return mode;
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -39,8 +79,8 @@ static void q8tc_launch(const q8a16_args & a, int T, int nb, cudaStream_t st) {
     k_q8tc3<NW, HILO, MINB><<<a.blk_end[a.n - 1], 32*NW, NW*16*68*sizeof(uint32_t), st>>>(a, nb, T);
 }
 
-bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, int nb) {
-    const int mode = ggml_cuda_q8tc_mode();
+bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, int nb, const ggml_tensor * w, bool group) {
+    const int mode = q8tc_tensor_mode(ggml_cuda_q8tc_mode(), w, group);
     if (mode == 0 || T < q8tc_min_t() || T > 8 || nb < 8 || nb % 8 != 0 || a.ids != nullptr || a.n < 1 ||
             !ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) { // compiled sm_80+ code, not only the card
         return false;
@@ -70,6 +110,6 @@ bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, 
 
 #else
 
-bool ggml_cuda_q8tc_try(ggml_backend_cuda_context &, q8a16_args &, int, int) { return false; }
+bool ggml_cuda_q8tc_try(ggml_backend_cuda_context &, q8a16_args &, int, int, const ggml_tensor *, bool) { return false; }
 
 #endif
