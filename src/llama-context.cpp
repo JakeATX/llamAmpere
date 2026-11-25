@@ -7560,6 +7560,10 @@ bool llama_context::ink_stream_take(uint32_t n_tokens, llama_seq_id seq) {
         if (gpu && est != SIZE_MAX) {
             need = 2*ink_stream->slot_bytes() + (est > cur ? est - cur : 0) + ink_ploan_b1_bytes(rung, n_tokens, seq) +
                     kv_more + llama_ink_ploan_margin();
+            if (ink_swa_small && ink_swa_kv) {
+                // fork (SWA-GROW): the window cache takes its boot cells back before the streamer arms
+                need += (size_t) (ink_swa_boot - ink_swa_dec)*ink_swa_kv->swa_cell_bytes();
+            }
             keep = free + bank > need ? std::min(bank, free + bank - need) : 0;
         }
         if (force >= 0) {
@@ -7574,7 +7578,12 @@ bool llama_context::ink_stream_take(uint32_t n_tokens, llama_seq_id seq) {
         lent = moe_cache ? moe_cache->suspend() : 0;
     }
     sched_need_reserve = true; // any graph built so far reads the banks: rebuild (the resize path drops the old graphs)
-    if (!ink_swa_set(false, "prompt")) { // fork (SWA-GROW): prompt ubatches need the boot window cache
+    bool swa_boot = ink_swa_set(false, "prompt"); // fork (SWA-GROW): prompt ubatches need the boot window cache
+    if (!swa_boot && ink_swa_small && llama_ink_ploan_on() && moe_cache && moe_cache->partial()) {
+        ink_ploan_give_back("the window cache did not grow back beside them");
+        swa_boot = ink_swa_set(false, "prompt");
+    }
+    if (!swa_boot) {
         // the cache comes back as it was (grown, beside the small window cache); this prompt keeps the normal path
         if (moe_cache && !moe_cache->resume()) {
             LLAMA_LOG_ERROR("%s: [INKSTREAM] cannot refill the MoE cache (retried on the next calls)\n", __func__);
