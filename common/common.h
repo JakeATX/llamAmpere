@@ -1599,6 +1599,13 @@ struct common_no_init_allocator : std::allocator<T> {
 // sequence state data, filled by llama_state_seq_get_data_ext()
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
 
+// fork CKPTFAST: resize a host byte buffer like std::vector::resize. When it has to grow a buffer of 32 MiB or more, the
+// new storage asks for transparent huge pages before its first touch. For a 205 MiB checkpoint buffer (12 runs on a
+// loaded host) the first touch took 39-57 ms with 4 KiB pages and 12-25 ms with huge pages, and pinning it for the D2H
+// copy (cudaHostRegister) 10-21 ms vs 2.4-9 ms. cap > n reserves headroom (untouched).
+// Opt-in (port, default off): LLAMA_HOST_HUGEPAGES=1; unset or 0 = plain resize (reserve cap, then resize).
+void common_buf_resize(std::vector<uint8_t> & buf, size_t n, size_t cap = 0);
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 

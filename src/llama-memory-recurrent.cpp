@@ -2124,6 +2124,41 @@ void llama_memory_recurrent_context::b1_save() {
     }
 }
 
+void llama_memory_recurrent_context::b1_undo_mark() {
+    b1_pre        = {};
+    b1_pre.head   = mem->head;
+    b1_pre.n      = mem->n;
+    b1_pre.used   = mem->used;
+    b1_pre.rs_z   = mem->rs_z;
+    b1_pre.cells  = mem->cells;
+    b1_pre.rs_idx = mem->rs_idx;
+    if (mem->gdn_replay) {
+        b1_pre.replay_len = mem->replay_len;
+        b1_pre.ckpt_span  = mem->ckpt_span;
+        b1_pre.s_stale    = mem->s_stale;
+    }
+    b1_pre_on = true;
+}
+
+void llama_memory_recurrent_context::b1_undo() {
+    if (!b1_pre_on) {
+        return;
+    }
+    mem->head = b1_pre.head;
+    mem->n    = b1_pre.n;
+    mem->used = b1_pre.used;
+    mem->rs_z = b1_pre.rs_z;
+    std::swap(mem->cells,  b1_pre.cells);
+    std::swap(mem->rs_idx, b1_pre.rs_idx);
+    if (mem->gdn_replay) {
+        std::swap(mem->replay_len, b1_pre.replay_len);
+        std::swap(mem->ckpt_span,  b1_pre.ckpt_span);
+        std::swap(mem->s_stale,    b1_pre.s_stale);
+    }
+    b1_pre    = {};
+    b1_pre_on = false;
+}
+
 bool llama_memory_recurrent_context::b1_seek(size_t i) {
     if (i >= b1_views.size() || i >= ubatches.size()) {
         return false;

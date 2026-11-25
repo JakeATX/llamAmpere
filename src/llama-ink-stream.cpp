@@ -1,5 +1,6 @@
 #include "llama-ink-stream.h"
 #include "llama-ink-host.h"
+#include "llama-moe-cache.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -133,9 +134,30 @@ llama_ink_stream::llama_ink_stream(const llama_model & model, ggml_backend_t bac
     for (int il : order) {
         visits[il].slot = visits[il].pos % 2;
     }
+    // CORERES: the visits that share their host experts (a looped model's core layers), one group per physical layer in
+    // graph order of its first visit
+    {
+        std::unordered_map<const ggml_tensor *, int> n_vis, grp_of;
+        for (int il : order) {
+            n_vis[visits[il].host[0]]++;
+        }
+        for (int il : order) {
+            const ggml_tensor * k = visits[il].host[0];
+            if (n_vis[k] < 2) {
+                continue;
+            }
+            auto it = grp_of.find(k);
+            if (it == grp_of.end()) {
+                it = grp_of.emplace(k, n_core++).first;
+            }
+            visits[il].grp = it->second;
+        }
+        res_want = std::clamp(ink_stream_env("LLAMA_INK_CORERES", 0), 0, n_core);
+        res_region.assign(n_core, -1);
+    }
 
     {
-        ggml_init_params params = { (n_views + 2)*ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params params = { (n_views + 2 + n_core)*ggml_tensor_overhead(), nullptr, true };
         ctx_meta = ggml_init(params);
         ggml_init_params mparams = { order.size()*ggml_tensor_overhead(), nullptr, true };
         ctx_map = ggml_init(mparams);
@@ -160,9 +182,11 @@ llama_ink_stream::llama_ink_stream(const llama_model & model, ggml_backend_t bac
         ggml_format_name(v.map, "ink_stream.map-%d", il);
         map_visit[v.map] = il;
     }
-    for (int s = 0; s < 2; ++s) {
+    raw.assign(2 + n_core, nullptr);
+    issued.assign(2 + n_core, -1);
+    for (int s = 0; s < 2 + n_core; ++s) {
         raw[s] = ggml_new_tensor_1d(ctx_meta, GGML_TYPE_I8, (int64_t) slot_size);
-        ggml_format_name(raw[s], "ink_stream.slot%d", s);
+        ggml_format_name(raw[s], s < 2 ? "ink_stream.slot%d" : "ink_stream.res%d", s < 2 ? s : s - 2);
     }
     buf_map = ggml_backend_alloc_ctx_tensors_from_buft(ctx_map, ggml_backend_cpu_buffer_type());
     if (!buf_map) {
@@ -197,6 +221,31 @@ llama_ink_stream::~llama_ink_stream() {
     if (ctx_map) {
         ggml_free(ctx_map);
     }
+    if (ctx_d2d) {
+        ggml_free(ctx_d2d);
+    }
+}
+
+void llama_ink_stream::set_cache(const llama_moe_cache * c) {
+    cache = c;
+    if (!c || !init_ok) {
+        return;
+    }
+    if (!ctx_d2d) {
+        size_t n_host = 0;
+        for (int il : order) {
+            n_host = std::max(n_host, visits[il].host.size());
+        }
+        // a source and a destination view per run, at most one run per expert
+        const size_t n = 2*n_host*(size_t) visits[order[0]].host[0]->ne[2] + 8;
+        ggml_init_params params = { n*ggml_tensor_overhead(), nullptr, true };
+        ctx_d2d = ggml_init(params);
+    }
+    if (!buft_elastic) {
+        using buft_fn = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+        auto fn = (buft_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_elastic_buffer_type");
+        buft_elastic = fn ? fn(dev) : nullptr;
+    }
 }
 
 void llama_ink_stream::free_pipeline() {
@@ -225,10 +274,9 @@ void llama_ink_stream::free_pipeline() {
         }
     }
     wst.clear();
-    for (int s = 0; s < 2; ++s) {
-        if (ev_free[s])  { ggml_backend_event_free(ev_free[s]);  ev_free[s]  = nullptr; }
-        if (ev_ready[s]) { ggml_backend_event_free(ev_ready[s]); ev_ready[s] = nullptr; }
-    }
+    for (auto & e : ev_free)  { if (e) { ggml_backend_event_free(e); e = nullptr; } }
+    for (auto & e : ev_ready) { if (e) { ggml_backend_event_free(e); e = nullptr; } }
+    if (ev_list) { ggml_backend_event_free(ev_list); ev_list = nullptr; }
     if (backend_copy) {
         ggml_backend_free(backend_copy);
         backend_copy = nullptr;
@@ -241,12 +289,18 @@ void llama_ink_stream::free_slots() {
         ggml_backend_buffer_free(buf_slot);
         buf_slot = nullptr;
     }
+    if (buf_res) {
+        ggml_backend_buffer_free(buf_res);
+        buf_res = nullptr;
+    }
+    n_res = 0;
+    std::fill(res_region.begin(), res_region.end(), -1);
     // the views and raw slots point into the freed buffer: detach them so arm() can place them again
     for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta); t; t = ggml_get_next_tensor(ctx_meta, t)) {
         t->data   = nullptr;
         t->buffer = nullptr;
     }
-    issued[0] = issued[1] = -1;
+    std::fill(issued.begin(), issued.end(), -1);
 }
 
 // copy stream, events, pinned staging and the workers: made once, kept between prompts (no VRAM of note)
@@ -259,11 +313,15 @@ bool llama_ink_stream::prepare() {
     }
     backend_copy = ggml_backend_dev_init(dev, nullptr);
     bool ok = backend_copy != nullptr;
-    for (int s = 0; s < 2 && ok; ++s) {
+    ev_free.assign(2 + n_core, nullptr);
+    ev_ready.assign(2 + n_core, nullptr);
+    for (int s = 0; s < 2 + n_core && ok; ++s) {
         ev_free[s]  = ggml_backend_event_new(dev);
         ev_ready[s] = ggml_backend_event_new(dev);
         ok = ev_free[s] && ev_ready[s];
     }
+    ev_list = ok ? ggml_backend_event_new(dev) : nullptr;
+    ok = ok && ev_list != nullptr;
     // pinned staging: two pieces per worker
     ggml_backend_buffer_type_t buft_host = ok ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
     ok = ok && buft_host != nullptr;
@@ -278,6 +336,10 @@ bool llama_ink_stream::prepare() {
             }
         }
     }
+    // fork (INKB1): a visit computed again (the next ubatch of a layer-major group) does not wait for the other slot's
+    // upload (same values, the host only waits less). Port: LLAMA_INK_STREAM_REUSE_NOWAIT=1 on, 0 off; unset follows
+    // LLAMA_INK_B1 (part of the gated layer-major config), so with INKB1 off the wait is the cand base's.
+    layer_major_reuse = ink_stream_env("LLAMA_INK_STREAM_REUSE_NOWAIT", ink_stream_env("LLAMA_INK_B1", 0) != 0 ? 1 : 0) != 0;
     if (!ok) {
         LLAMA_LOG_WARN("%s: [INKSTREAM] cannot set up the copy pipeline, the streamer is off\n", __func__);
         free_pipeline();
@@ -354,10 +416,18 @@ bool llama_ink_stream::arm() {
     for (int s = 0; s < 2 && ok; ++s) {
         ok = ggml_backend_tensor_alloc(buf_slot, raw[s], base + s*slot_size) == GGML_STATUS_SUCCESS;
     }
+    // CORERES regions come later, per decode call (place_residents)
+    std::fill(issued.begin(), issued.end(), -1);
+    assign_slots();
     for (int il : order) {
-        visit & v = visits[il];
-        for (size_t i = 0; i < v.views.size() && ok; ++i) {
-            ok = ggml_backend_tensor_alloc(buf_slot, v.views[i], base + v.slot*slot_size + v.offs[i]) == GGML_STATUS_SUCCESS;
+        if (res_want > 0) {
+            ok = ok && place_views(il);
+        } else {
+            // port: without CORERES the views are allocated as in the cand base (ggml_backend_tensor_alloc, init_tensor)
+            visit & v = visits[il];
+            for (size_t i = 0; i < v.views.size() && ok; ++i) {
+                ok = ggml_backend_tensor_alloc(buf_slot, v.views[i], base + v.slot*slot_size + v.offs[i]) == GGML_STATUS_SUCCESS;
+            }
         }
     }
     if (!ok) {
@@ -365,10 +435,136 @@ bool llama_ink_stream::arm() {
         free_slots();
         return false;
     }
+    // the clear is a memset on the legacy default stream, which the non-blocking copy and compute streams do not wait
+    // for: a read on the per-thread stream orders after it and returns once it is done. Port: LLAMA_INK_STREAM_CLEAR_SYNC=1
+    // on, 0 off; unset follows LLAMA_INK_B1 (part of the gated layer-major config), so with INKB1 off arm() is the cand base's
+    static const bool clear_sync = ink_stream_env("LLAMA_INK_STREAM_CLEAR_SYNC", ink_stream_env("LLAMA_INK_B1", 0) != 0 ? 1 : 0) != 0;
+    if (clear_sync) {
+        uint8_t b;
+        ggml_backend_tensor_get(raw[0], &b, 0, 1);
+    }
     ggml_backend_synchronize(backend_gpu); // the cleared slots are visible to both streams
-    issued[0] = issued[1] = -1;
     is_armed = true;
     return true;
+}
+
+void llama_ink_stream::assign_slots() {
+    const int first = order[0];
+    int k = issued[1] == first ? 1 : 0;
+    for (int il : order) {
+        visit & v = visits[il];
+        const int r = v.grp >= 0 ? res_region[v.grp] : -1;
+        v.slot = r >= 0 ? 2 + r : k++ % 2;
+    }
+}
+
+// point the views of visit il at its slot or resident region. Plain pointer moves: no init_tensor (whose padding memset
+// would run on the legacy stream), the tails are uploaded as zeros with every visit
+bool llama_ink_stream::place_views(int il) {
+    visit & v = visits[il];
+    ggml_backend_buffer_t buf = v.slot >= 2 ? buf_res : buf_slot;
+    if (!buf) {
+        return false;
+    }
+    char * base = (char *) ggml_backend_buffer_get_base(buf) + (size_t) (v.slot >= 2 ? v.slot - 2 : v.slot)*slot_size;
+    for (size_t i = 0; i < v.views.size(); ++i) {
+        ggml_tensor * t = v.views[i];
+        char * d = base + v.offs[i];
+        if (d + ggml_nbytes(t) + v.tails[i] > (char *) ggml_backend_buffer_get_base(buf) + ggml_backend_buffer_get_size(buf)) {
+            return false;
+        }
+        t->buffer = buf;
+        t->data   = d;
+    }
+    return true;
+}
+
+int llama_ink_stream::place_residents(size_t keep) {
+    if (!is_armed || res_want == 0 || n_res > 0) {
+        return n_res;
+    }
+    wait_issued(); // issued[] is final
+    // a core layer whose visit already sits in a streamed slot (none at a call start in practice) keeps streaming
+    std::vector<char> busy(n_core, 0);
+    for (int s = 0; s < 2; ++s) {
+        if (issued[s] >= 0 && visits[issued[s]].grp >= 0) {
+            busy[visits[issued[s]].grp] = 1;
+        }
+    }
+    int n_free = 0;
+    for (int g = 0; g < n_core; ++g) {
+        n_free += !busy[g];
+    }
+    size_t free = 0, total = 0;
+    ggml_backend_dev_memory(dev, &free, &total);
+    const size_t free0 = free;
+    int n = free > keep ? (int) std::min<size_t>((free - keep)/slot_size, (size_t) std::min(res_want, n_free)) : 0;
+    for (; n > 0; --n) {
+        buf_res = ggml_backend_buft_alloc_buffer(buft_dev, (size_t) n*slot_size);
+        if (buf_res) {
+            ggml_backend_dev_memory(dev, &free, &total); // a VRAM cap may count more than the request
+            if (free >= keep) {
+                break;
+            }
+            ggml_backend_buffer_free(buf_res);
+            buf_res = nullptr;
+        }
+    }
+    static int n_log = 0;
+    if (n_log++ < 16) {
+        LLAMA_LOG_WARN("%s: [INKSTREAM] CORERES: %d of %d core layers resident for this call (%d asked, %.0f MiB free before, "
+                "keep %.0f)\n", __func__, n, n_core, res_want, free0/1048576.0, keep/1048576.0);
+    }
+    if (n == 0) {
+        return 0;
+    }
+    ggml_backend_buffer_set_usage(buf_res, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    char * base = (char *) ggml_backend_buffer_get_base(buf_res);
+    int r = 0;
+    for (int g = 0; g < n_core && r < n; ++g) {
+        if (!busy[g]) {
+            res_region[g] = r++;
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        raw[2 + i]->buffer = buf_res;
+        raw[2 + i]->data   = base + (size_t) i*slot_size;
+    }
+    for (int s = 2; s < 2 + n_core; ++s) {
+        issued[s] = -1;
+    }
+    n_res = n;
+    assign_slots();
+    bool ok = true;
+    for (int il : order) {
+        ok = ok && place_views(il);
+    }
+    GGML_ASSERT(ok);
+    return n_res;
+}
+
+void llama_ink_stream::drop_residents() {
+    if (!is_armed || n_res == 0) {
+        return;
+    }
+    wait_issued();
+    ggml_backend_synchronize(backend_copy);
+    ggml_backend_synchronize(backend_gpu); // nothing reads a region any more
+    n_res = 0;
+    std::fill(res_region.begin(), res_region.end(), -1);
+    for (int s = 2; s < 2 + n_core; ++s) {
+        issued[s] = -1;
+        raw[s]->buffer = nullptr;
+        raw[s]->data   = nullptr;
+    }
+    assign_slots();
+    bool ok = true;
+    for (int il : order) {
+        ok = ok && place_views(il);
+    }
+    GGML_ASSERT(ok);
+    ggml_backend_buffer_free(buf_res);
+    buf_res = nullptr;
 }
 
 void llama_ink_stream::disarm() {
@@ -416,6 +612,9 @@ void llama_ink_stream::issue(int il, ggml_backend_t backend) {
         ggml_backend_event_wait(backend_copy, ev_free[s]);
     }
     pieces.clear();
+    if (cache && ctx_d2d && cache->partial() && issue_kept(il)) {
+        return; // fork (PLOAN): queued from the kept banks and the host
+    }
     if (v.direct) {
         // fork (INKMISS, GS11): page-locked source, so these copies are DMA and return at once: no workers, no staging
         size_t bytes = 0;
@@ -467,6 +666,159 @@ void llama_ink_stream::issue(int il, ggml_backend_t backend) {
     cv.notify_all();
 }
 
+// fork (PLOAN): issue() for a visit some of whose experts the MoE cache kept on the card (llama_moe_cache::suspend_keep).
+// Runs of kept experts (consecutive experts in consecutive bank slots) are copied device to device on the copy stream,
+// the other runs and the zero tails go as before (direct, one span with the kept ranges cut out, or staged pieces).
+// Same bytes in the slot as a full upload. Called with mtx held, after the copy stream waits for ev_free.
+bool llama_ink_stream::issue_kept(int il) {
+    const visit & v = visits[il];
+    const int s = v.slot;
+    struct run {
+        int64_t e0;
+        int64_t n;
+        int32_t slot; // >= 0: bank slot of expert e0 (kept), -1: from the host
+    };
+    std::vector<std::vector<run>> runs(v.host.size());
+    std::vector<ggml_tensor *> banks(v.host.size(), nullptr);
+    size_t n_views = 0;
+    for (size_t i = 0; i < v.host.size(); ++i) {
+        const ggml_tensor * w = v.host[i];
+        const int64_t n_exp = w->ne[2];
+        ggml_tensor * bank = nullptr;
+        int32_t n_keep = 0;
+        const int32_t * slots = cache->kept_slots(w, &bank, &n_keep);
+        if (!slots || !bank || !bank->buffer || !bank->data || bank->nb[2] != w->nb[2] || bank->nb[1] != w->nb[1] ||
+                bank->type != w->type) {
+            runs[i].push_back({ 0, n_exp, -1 });
+            continue;
+        }
+        banks[i] = bank;
+        auto kept = [&](int64_t e) { return slots[e] >= 0 && slots[e] < n_keep; };
+        for (int64_t e = 0; e < n_exp; ) {
+            int64_t n = 1;
+            if (kept(e)) {
+                while (e + n < n_exp && kept(e + n) && slots[e + n] == slots[e] + n) {
+                    n++;
+                }
+                n_views += 2;
+            } else {
+                while (e + n < n_exp && !kept(e + n)) {
+                    n++;
+                }
+            }
+            runs[i].push_back({ e, n, kept(e) ? slots[e] : -1 });
+            e += n;
+        }
+    }
+    if (n_views == 0 || n_views > ggml_get_mem_size(ctx_d2d)/ggml_tensor_overhead()) {
+        return false;
+    }
+    size_t d2d = 0;
+    size_t h2d = 0;
+    {
+        std::lock_guard<std::mutex> ls(mtx_stream);
+        ggml_reset(ctx_d2d);
+        for (size_t i = 0; i < v.host.size(); ++i) {
+            ggml_tensor * bank = banks[i];
+            ggml_tensor * dst  = v.views[i];
+            for (const run & r : runs[i]) {
+                if (r.slot < 0) {
+                    continue;
+                }
+                ggml_tensor * src_view = ggml_view_3d(ctx_d2d, bank, bank->ne[0], bank->ne[1], r.n, bank->nb[1], bank->nb[2], (size_t) r.slot*bank->nb[2]);
+                ggml_tensor * dst_view = ggml_view_3d(ctx_d2d, dst,  dst->ne[0],  dst->ne[1],  r.n, dst->nb[1],  dst->nb[2],  (size_t) r.e0*dst->nb[2]);
+                ggml_backend_view_init(src_view);
+                ggml_backend_view_init(dst_view);
+                ggml_backend_tensor_copy_async(backend_copy, backend_copy, src_view, dst_view);
+                d2d += (size_t) r.n*bank->nb[2];
+            }
+        }
+        if (v.direct) {
+            if (v.direct_span > 0) {
+                // the arena holds the visit at its slot offsets: one copy per gap between the kept ranges
+                const char * src = (const char *) v.host[0]->data;
+                size_t pos = 0;
+                auto put = [&](size_t end) {
+                    if (end > pos) {
+                        ggml_backend_tensor_set_async(backend_copy, raw[s], src + pos, pos, end - pos);
+                        h2d += end - pos;
+                    }
+                };
+                for (size_t i = 0; i < v.host.size(); ++i) {
+                    const size_t nb2 = v.host[i]->nb[2];
+                    for (const run & r : runs[i]) {
+                        if (r.slot >= 0) {
+                            put(v.offs[i] + r.e0*nb2);
+                            pos = v.offs[i] + (r.e0 + r.n)*nb2;
+                        }
+                    }
+                }
+                put(v.direct_span);
+            } else {
+                const char * zeros = (const char *) ggml_backend_buffer_get_base(buf_zeros);
+                for (size_t i = 0; i < v.host.size(); ++i) {
+                    const size_t nb  = ggml_nbytes(v.host[i]);
+                    const size_t nb2 = v.host[i]->nb[2];
+                    for (const run & r : runs[i]) {
+                        if (r.slot < 0) {
+                            ggml_backend_tensor_set_async(backend_copy, raw[s], (const char *) v.host[i]->data + r.e0*nb2,
+                                    v.offs[i] + r.e0*nb2, r.n*nb2);
+                            h2d += r.n*nb2;
+                        }
+                    }
+                    if (v.tails[i] > 0) {
+                        ggml_backend_tensor_set_async(backend_copy, raw[s], zeros, v.offs[i] + nb, v.tails[i]);
+                        h2d += v.tails[i];
+                    }
+                }
+            }
+            ggml_backend_event_record(ev_ready[s], backend_copy);
+        }
+    }
+    st.bytes_d2d += d2d;
+    st.uploads++;
+    issued[s] = il;
+    req_slot = s;
+    pieces_done = 0;
+    next_piece.store(0);
+    if (v.direct) {
+        ++req_gen;
+        done_gen = req_gen;
+        st.bytes_h2d += h2d;
+        return true;
+    }
+    static const std::vector<char> zeros(64u << 10, 0);
+    for (size_t i = 0; i < v.host.size(); ++i) {
+        const ggml_tensor * t = v.host[i];
+        const size_t nb  = ggml_nbytes(t);
+        const size_t nb2 = t->nb[2];
+        for (const run & r : runs[i]) {
+            if (r.slot >= 0) {
+                continue;
+            }
+            const size_t b = r.e0*nb2, e = (r.e0 + r.n)*nb2;
+            for (size_t o = b; o < e; o += piece_max) {
+                pieces.push_back({ (const char *) t->data + o, v.offs[i] + o, std::min(piece_max, e - o) });
+            }
+        }
+        for (size_t o = 0; o < v.tails[i]; o += zeros.size()) {
+            pieces.push_back({ zeros.data(), v.offs[i] + nb + o, std::min(zeros.size(), v.tails[i] - o) });
+        }
+    }
+    ++req_gen;
+    if (pieces.empty()) {
+        // all kept and no tails: nothing for the workers
+        {
+            std::lock_guard<std::mutex> ls(mtx_stream);
+            ggml_backend_event_record(ev_ready[s], backend_copy);
+        }
+        done_gen = req_gen;
+        return true;
+    }
+    cv.notify_all();
+    return true;
+}
+
 void llama_ink_stream::wait_issued() {
     std::unique_lock<std::mutex> lk(mtx);
     cv.wait(lk, [&] { return done_gen == req_gen && n_busy == 0; });
@@ -508,7 +860,7 @@ void llama_ink_stream::worker(int w) {
             }
             {
                 std::lock_guard<std::mutex> ls(mtx_stream);
-                ggml_backend_tensor_set_async(backend_copy, raw[s], ws.data[b], p.dst_offs, p.len);
+                ggml_backend_tensor_set_async(backend_copy, p.dst ? p.dst : raw[s], ws.data[b], p.dst_offs, p.len);
                 ggml_backend_event_record(ws.ev[b], backend_copy);
             }
             ws.used[b] = true;
@@ -520,16 +872,54 @@ void llama_ink_stream::worker(int w) {
             // every piece is on the copy stream: the slot is ready when the stream reaches this event
             {
                 std::lock_guard<std::mutex> ls(mtx_stream);
-                ggml_backend_event_record(ev_ready[s], backend_copy);
+                ggml_backend_event_record(s >= 0 ? ev_ready[s] : ev_list, backend_copy);
             }
             for (const piece & p : pieces) {
-                st.bytes_h2d += p.len;
+                st.bytes_h2d += s >= 0 ? p.len : 0; // upload_wait() lists are not prompt streaming
             }
             done_gen = seen;
         }
         n_busy--;
         cv.notify_all();
     }
+}
+
+bool llama_ink_stream::upload_wait(const std::vector<upload> & list) {
+    if (is_armed || !prepare() || wst.empty()) {
+        return false;
+    }
+    for (const upload & u : list) {
+        // the copy stream's async set takes the device's own buffer type only (like the slots)
+        // fork (PLOAN): or the device's VMM buffer type (the banks with LLAMA_INK_PLOAN=1)
+        if (!u.dst || !u.dst->buffer || (ggml_backend_buffer_get_type(u.dst->buffer) != buft_dev &&
+                    (!buft_elastic || ggml_backend_buffer_get_type(u.dst->buffer) != buft_elastic)) ||
+                u.dst_offs + u.len > ggml_nbytes(u.dst)) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        GGML_ASSERT(done_gen == req_gen && n_busy == 0);
+        pieces.clear();
+        for (const upload & u : list) {
+            for (size_t o = 0; o < u.len; o += piece_max) {
+                pieces.push_back({ (const char *) u.src + o, u.dst_offs + o, std::min(piece_max, u.len - o), u.dst });
+            }
+        }
+        if (pieces.empty()) {
+            return true;
+        }
+        req_slot = -1;
+        pieces_done = 0;
+        next_piece.store(0);
+        ++req_gen;
+    }
+    cv.notify_all();
+    wait_issued();
+    ggml_backend_event_synchronize(ev_list);
+    std::lock_guard<std::mutex> lk(mtx);
+    pieces.clear();
+    return true;
 }
 
 bool llama_ink_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
@@ -542,17 +932,75 @@ bool llama_ink_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggm
         const int il = it->second;
         const visit & v = visits[il];
         const int64_t t0 = ggml_time_us();
-        if (issued[v.slot] != il) {
+        const bool resident = v.slot >= 2; // CORERES: on the card once uploaded, for every visit of its layer
+        if (resident ? issued[v.slot] < 0 : issued[v.slot] != il) {
             wait_issued();
             issue(il, backend);
         }
-        wait_issued();                                    // its ready event is recorded
+        // its ready event is recorded. Requests run one at a time, so only the latest one (req_slot) can still be
+        // queuing: when that is the other slot (a visit computed again for the next ubatch of a layer-major group
+        // while the next visit uploads), this slot's event is already recorded and the graph goes on at once.
+        if (req_slot == v.slot || !layer_major_reuse) {
+            wait_issued();
+        }
         st.t_wait_us += ggml_time_us() - t0;
         ggml_backend_event_wait(backend, ev_ready[v.slot]); // the compute stream waits for the slot
-        // the next streamed visit goes into the other slot while this one computes (wrapping into the next ubatch)
-        const int nx = order[(v.pos + 1) % order.size()];
-        if (visits[nx].slot != v.slot && issued[visits[nx].slot] != nx) {
+        // debug (LLAMA_INK_STREAM_VERIFY=1, slow): the slot holds this visit's host experts and zero tails
+        static const bool verify = ink_stream_env("LLAMA_INK_STREAM_VERIFY", 0) != 0;
+        if (verify) {
+            static int n_bad = 0;
+            static size_t n_ok = 0;
+            ggml_backend_event_synchronize(ev_ready[v.slot]);
+            std::vector<uint8_t> tmp;
+            for (size_t i = 0; i < v.host.size(); ++i) {
+                const size_t nb = ggml_nbytes(v.host[i]);
+                tmp.resize(nb + v.tails[i]);
+                ggml_backend_tensor_get(raw[v.slot], tmp.data(), v.offs[i], nb + v.tails[i]);
+                const uint8_t * h = (const uint8_t *) v.host[i]->data;
+                size_t bad = SIZE_MAX;
+                for (size_t o = 0; o < nb && bad == SIZE_MAX; o += 4096) {
+                    if (memcmp(tmp.data() + o, h + o, std::min<size_t>(4096, nb - o)) != 0) {
+                        bad = o;
+                    }
+                }
+                for (size_t o = nb; o < nb + v.tails[i] && bad == SIZE_MAX; ++o) {
+                    if (tmp[o] != 0) {
+                        bad = o;
+                    }
+                }
+                if (bad != SIZE_MAX) {
+                    if (n_bad++ < 40) {
+                        LLAMA_LOG_WARN("%s: [INKSTREAM] VERIFY mismatch: visit %d (pos %d, slot %d, issued %d, req %d) tensor %zu (%s) at %zu of %zu+%zu\n",
+                                __func__, il, v.pos, v.slot, issued[v.slot], req_slot, i, v.host[i]->name, bad, nb, v.tails[i]);
+                    }
+                } else if (++n_ok % 500 == 0) {
+                    LLAMA_LOG_WARN("%s: [INKSTREAM] VERIFY ok %zu checks, %d mismatches\n", __func__, n_ok, n_bad);
+                }
+            }
+        }
+        // the next visit that needs an upload goes in while this one computes (wrapping into the next ubatch): a streamed
+        // one into the other slot, or a resident layer not on the card yet; resident layers already there are skipped
+        for (size_t k = 1; k < order.size(); ++k) {
+            const int nx = order[(v.pos + k) % order.size()];
+            const visit & x = visits[nx];
+            if (x.slot >= 2) {
+                if (issued[x.slot] >= 0) {
+                    continue;
+                }
+            } else if ((!resident && x.slot == v.slot) || issued[x.slot] == nx) {
+                break;
+            }
+            if (n_res > 0) {
+                // an upload still queuing (a resident layer issued from an earlier call of this visit) is not waited for
+                // here, which would hold this visit's graph; a later call issues the next one
+                std::lock_guard<std::mutex> lk(mtx);
+                if (done_gen != req_gen || n_busy != 0) {
+                    break;
+                }
+            }
+            wait_issued();
             issue(nx, backend);
+            break;
         }
     }
     ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));

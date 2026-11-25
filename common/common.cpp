@@ -36,6 +36,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -2023,6 +2027,22 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);
             warmup_ok = check_warmup(llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()), "decode");
+
+            // fork PROMPTWARM: also run one prompt-width ubatch, so the first prompt after boot does not pay the lazy
+            // loading of the prompt kernels. LLAMA_WARMUP_PROMPT: unset/0 = off, 1 = one n_ubatch, N > 1 = N rows.
+            const char * pw_env = getenv("LLAMA_WARMUP_PROMPT");
+            const int    pw_req = pw_env && pw_env[0] ? atoi(pw_env) : 0;
+            int n_pw = pw_req == 1 ? (int) llama_n_ubatch(lctx) : pw_req;
+            n_pw = std::min({ n_pw, (int) llama_n_ubatch(lctx), (int) llama_n_batch(lctx), (int) llama_n_ctx_seq(lctx) - 1 });
+            if (warmup_ok && n_pw > (int) tmp.size()) {
+                llama_memory_clear(llama_get_memory(lctx), true);
+                std::vector<llama_token> pw((size_t) n_pw, tmp[0]);
+                common_batch pbatch = common_batch_get_one(lctx, pw);
+                std::vector<float> pzeros;
+                common_batch_set_zero_state(pbatch, model, pzeros);
+                warmup_ok = check_warmup(llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, pbatch.get()), "prompt decode");
+                COM_INF("warmup: prompt-width ubatch of %d rows\n", n_pw);
+            }
         }
         if (!warmup_ok) {
             res->free_context();
@@ -3070,6 +3090,35 @@ void common_prompt_checkpoint::clear() {
     data_spec.clear();
 }
 
+void common_buf_resize(std::vector<uint8_t> & buf, size_t n, size_t cap) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    static const bool huge = [] {
+        const char * e = getenv("LLAMA_HOST_HUGEPAGES");
+        return e != nullptr && e[0] != '\0' && atoi(e) != 0;
+    }();
+    cap = std::max(cap, n);
+    if (huge && n > buf.capacity() && n >= (size_t(32) << 20)) {
+        std::vector<uint8_t> grown;
+        grown.reserve(cap);
+        const uintptr_t align = uintptr_t(2) << 20;
+        const uintptr_t beg = ((uintptr_t) grown.data() + align - 1) & ~(align - 1);
+        const uintptr_t end = ((uintptr_t) grown.data() + cap) & ~(align - 1);
+        if (end > beg) {
+            // advisory: a refusal (THP off, old kernel) leaves 4 KiB pages
+            madvise((void *) beg, end - beg, MADV_HUGEPAGE);
+        }
+        grown.assign(buf.begin(), buf.end()); // within the reserved capacity: no reallocation
+        grown.resize(n);
+        buf.swap(grown);
+        return;
+    }
+#endif
+    if (cap > buf.capacity()) {
+        buf.reserve(cap);
+    }
+    buf.resize(n);
+}
+
 void common_prompt_checkpoint::update_pos(
         int64_t n_tokens,
         llama_pos pos_min,
@@ -3098,7 +3147,7 @@ void common_prompt_checkpoint::update_tgt(
         spare->shrink_to_fit();
     }
 
-    data_tgt.resize(ckpt_size);
+    common_buf_resize(data_tgt, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -3116,7 +3165,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_dft.resize(ckpt_size);
+    common_buf_resize(data_dft, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

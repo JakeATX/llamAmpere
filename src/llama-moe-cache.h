@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -14,7 +15,8 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
+    // ploan: a prompt streamer will lend this cache (fork PLOAN: with LLAMA_INK_PLOAN=1 the banks go in a VMM buffer)
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool ploan = false);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -44,8 +46,27 @@ public:
     // maps and the LRU stay, and no graph may use the cache until resume(). resume() allocates the banks again and
     // uploads the experts the slots held (same experts in the same slots). false: no VRAM, still suspended.
     size_t suspend();
-    bool   resume();
+    // fork (REFILLPIPE): one bank upload of resume(); an uploader that returns true has copied the whole list
+    struct copy_op {
+        ggml_tensor * dst;
+        size_t        offs;
+        const void  * src;
+        size_t        len;
+    };
+    using uploader = std::function<bool(const std::vector<copy_op> &)>;
+    bool   resume(const uploader & up = nullptr);
     bool   suspended() const;
+    // fork (PLOAN, LLAMA_INK_PLOAN=1): like suspend(), but the first slots of each bank (about keep_bytes in all) stay
+    // mapped with their experts (VMM banks, one device; else a full suspend). Returns the bytes freed. resume() then
+    // maps the rest again and uploads only the slots that were dropped; suspend() frees the kept slots too.
+    size_t suspend_keep(size_t keep_bytes);
+    bool   partial() const;
+    // while partial: the slot map of host experts w (expert e is kept iff slots[e] < *n_keep) and its bank; else nullptr
+    const int32_t * kept_slots(const ggml_tensor * w, ggml_tensor ** bank, int32_t * n_keep) const;
+    size_t kept_bytes() const; // mapped bank bytes while partial, else 0
+    // with LLAMA_INK_PLOAN=1: the slots the last resume() uploaded, of the filled slots, their bytes, and the time it
+    // spent mapping the lent pages again (partial) or allocating the banks (full)
+    void   last_resume(int32_t * n_up, int32_t * n_filled, size_t * bytes, double * map_ms) const;
     // fork (CACHELOAN): while suspended, rebuild the banks for `size` bytes (keeps the hottest experts; resume()
     // uploads them). false: not possible here (several devices, CPU share, trace), nothing changed. size(): bank bytes.
     bool   resize(size_t size);

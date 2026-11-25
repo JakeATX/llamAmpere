@@ -2268,8 +2268,7 @@ std::vector<uint8_t> server_prompt_cache::take_buffer(size_t n) {
         res.resize(n); // within capacity: only the bytes past the old size are written
         return res;
     }
-    res.reserve(fit_ram ? n : n + n/8);
-    res.resize(n);
+    common_buf_resize(res, n, fit_ram ? n : n + n/8);
     return res;
 }
 

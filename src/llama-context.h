@@ -168,6 +168,8 @@ struct llama_context {
     bool prompt_warm_join();
     bool prompt_warm_running() const { return pp_warm_thread.joinable(); }
     void set_next_decode_phase(enum llama_decode_phase phase);
+    // fork PPLAN: one-shot count of the prompt rows that follow the next decode() in later calls (llama_set_next_prompt_rows)
+    void set_next_prompt_rows(int32_t n_rows_after);
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
@@ -396,6 +398,12 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    // fork SAMPKEEP: see sampler_changed() in llama-context.cpp
+    void        sampler_changed();
+    std::string sampler_signature() const;
+    void        sampler_reserve_check();
+    bool        sampler_set_dirty = false;
+    std::string sampler_sig_reserved;
 
     // parse a `llama-mtp-vocab-v1` map and upload it to the head's device (throws on error)
     // the last `n_hot` entries become adaptive slots, see llama_draft_vocab_observe/refresh
@@ -451,6 +459,13 @@ private:
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+
+    // fork PPLAN: before a prompt ubatch whose KV keeps growing, size the compute buffers once for the depth the prompt
+    // reaches (this batch + the rows the caller says follow), so the later ubatches allocate without a re-plan
+    // (each re-plan waits for the device and re-runs the allocator: ~10-17 ms of idle card per ubatch). Returns true
+    // when it sized; the caller checks that the real graph then allocated without a re-plan.
+    bool prompt_plan(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_result * res,
+            const llm_graph_params & gparams);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -704,8 +719,14 @@ private:
     uint32_t ink_head_retry = 0; // [HEADLOAN] rate limit of the upload retry after a failed restore
     uint32_t ink_rung_changes = 0, ink_rung_hold = 0; // [RUNG] ceiling changes this prompt; checks a lowered ceiling holds
     double   ink_rung_hold_free = 0.0;                // [RUNG] free VRAM when the ceiling was lowered
-    bool     ink_stream_take();
+    bool     ink_stream_take(uint32_t n_tokens = 0, llama_seq_id seq = -1);
     bool     ink_stream_release(const char * why);
+    // fork (PLOAN, LLAMA_INK_PLOAN=1): the take keeps the MoE cache bank bytes the prompt does not need (need: the two
+    // slots, the compute reserve at the prompt's ladder rung, the INKB1 scratch, LLAMA_INK_PLOAN_MARGIN_MIB); anything
+    // the kept banks would cut (a reserve that fails, the pool rows, the B1 group size) first gets them back in full
+    std::map<uint32_t, size_t> ink_ploan_reserve; // measured GPU compute buffer of an armed prompt reserve, by rows
+    size_t   ink_ploan_b1_bytes(uint32_t rows, uint32_t n_tokens, llama_seq_id seq) const;
+    void     ink_ploan_give_back(const char * why);
     uint64_t ink_stream_tokens = 0;  // prompt tokens streamed since the last take
     int64_t  ink_stream_t0_us  = 0;
     uint32_t ink_stream_rows_max = 0; // largest ubatch run while armed
@@ -787,6 +808,20 @@ private:
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
 
+    // fork PPLAN state: every reserve and re-plan of the scheduler bumps pp_plan_gen; the plan made by prompt_plan()
+    // holds while pp_plan_gen == pp_plan_at and covers n_kv up to pp_plan_base / pp_plan_swa at pp_plan_rows rows
+    uint64_t pp_plan_gen   = 0;
+    uint64_t pp_plan_at    = UINT64_MAX;
+    uint32_t pp_plan_base  = 0;
+    uint32_t pp_plan_swa   = 0;
+    uint32_t pp_plan_rows  = 0;
+    int32_t  pp_plan_fails = 0;     // plans in a row that the real graph did not fit (topology differs): 2 turn it off
+    bool     pp_plan_off   = false;
+    bool     pp_hinted     = false; // the caller sent a prompt-rows hint at least once (only such contexts plan)
+    int32_t  next_prompt_rows = 0;  // one-shot hint for the next decode()
+    int32_t  call_prompt_rows = 0;  // the hint of the decode() in progress
+    uint32_t pp_plan_count = 0;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -866,7 +901,48 @@ private:
         ggml_tensor * carry  = nullptr;
         const llm_b1_ffn * ffn = nullptr;
         int ffn_phase = 0;
+        int32_t       seal_il = -1;     // [INKB1] the cache slot this one-visit graph seals (-1: [il0, il1))
     } b1_cur;
+
+    // fork (INKB1): layer-major prompt of a looped model (LLAMA_INK_B1=1, Inkling 2 Mini on the INKSTREAM streamer).
+    // Every ubatch of the call is applied and saved up front; a group of G ubatches then runs one visit at a time for
+    // all of them (graph position p, carry rows from model.ink_b1_carry_rows()), so each visit's experts cross PCIe
+    // once per group instead of once per ubatch. The per-ubatch masks and relative positions are made by the first
+    // graph of each ubatch that reads them and kept on the card for its later graphs.
+    struct ink_b1_input {
+        ggml_backend_buffer_ptr buf;
+        bool    filled  = false;
+        ggml_type type  = GGML_TYPE_COUNT;
+        int64_t ne[GGML_MAX_DIMS] = {};
+        int64_t far_end = 0;
+    };
+    struct {
+        bool    active  = false;        // this decode call runs layer-major
+        size_t  n_ub    = 0;
+        size_t  G       = 0;            // ubatches per group
+        size_t  slot    = 0;            // the group slot of the graph being built
+        llama_seq_id seq = -1;
+        ggml_backend_t backend = nullptr; // the GPU backend of the carries and the input copies
+        ggml_context_ptr        ctx;    // the carry tensors, one per ubatch (slot u % G)
+        ggml_backend_buffer_ptr carry_buf;
+        std::vector<ggml_tensor *> carry;
+        std::vector<std::array<ink_b1_input, 5>> inputs; // per slot, by llm_graph_input_mem_hybrid_iswa_rel role
+        // per prompt (take to release of the streamer)
+        uint64_t calls = 0, groups = 0, ubatches = 0, graphs = 0, bound = 0, normal_calls = 0, reallocs = 0;
+        size_t   g_max = 0;
+        size_t   carry_bytes_max = 0, input_bytes_max = 0;
+        size_t   input_budget = 0; // card bytes of kept inputs per group slot that the group size was planned for
+        size_t   n_started = 0;    // one-visit graphs of this call that set their inputs (the KV / state data may change)
+        const char * normal_why = nullptr;
+    } ink_b1;
+    int  ink_b1_prepare(llama_memory_context_i * mctx, const llama_batch_ext & batch_inp);
+    bool ink_b1_run_prefix(llama_memory_context_i * mctx, size_t ub0, ggml_status & status);
+    bool ink_b1_next(llama_memory_context_i * mctx, size_t i);
+    void ink_b1_bind(llm_graph_result * res);
+    void ink_b1_capture(llm_graph_result * res);
+    void ink_b1_end();
+    bool ink_b1_abandon(llama_memory_context_i * mctx) noexcept;
+    void ink_b1_log_prompt();
 
     // returns 1 when this decode call runs layer-major (every ubatch applied and saved, the plan made),
     // 2 to retry smaller ubatches before state apply, 3 for opt-in short-tail retries down to 512 rows,
@@ -947,6 +1023,7 @@ private:
 
     // the recurrent memory whose PARTIAL_ONLY state the captures copy, nullptr when unsupported
     const llama_memory_recurrent * capture_mem() const;
+    const llama_kv_cache *         capture_swa() const;
     // after a ubatch graph over layers [il0, il1) (il1 < 0: to the last layer) ran: copy the rows of a capture
     // whose spot this ubatch ends
     void capture_ubatch(const llama_ubatch & ubatch, int32_t il0, int32_t il1);

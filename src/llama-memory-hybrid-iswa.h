@@ -141,6 +141,18 @@ public:
     const llama_kv_cache_iswa_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
 
+    // [INKB1] layer-major prompt (LLAMA_INK_B1, inkling2_loop): every ubatch is applied and saved up front
+    // (ink_b1_save right after its apply), then each one-visit graph seeks to its ubatch's view
+    bool   ink_b1_supported() const;
+    void   ink_b1_save();
+    bool   ink_b1_seek(size_t i);
+    // before the first apply: what an undo needs; ink_b1_undo() puts the memory back as before the call (only while
+    // none of its graphs has started: the KV and state data are untouched then)
+    bool   ink_b1_undo_mark();
+    void   ink_b1_undo();
+    size_t ink_b1_n_ubatch() const { return ubatches.size(); }
+    uint32_t ink_b1_ubatch_tokens(size_t i) const { return ubatches[i].n_tokens; }
+
 private:
     // the index of the next ubatch to process
     size_t i_next = 0;

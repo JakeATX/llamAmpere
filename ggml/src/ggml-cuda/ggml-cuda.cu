@@ -11922,7 +11922,11 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
     }
     ggml_tensor * wmul = cgraph->nodes[j];
     const bool own_sum = ggml_cuda_try_fuse_ink_wconv(nullptr, cgraph, j) <= 0;
-    if (!own_sum) {
+    // the graph sums (WCONV layers, and MTSPLIT past 8 tokens when the own sum below does not match: a verify batch of
+    // several users, which WCONV declines) after the fused gate_up + SITU + down
+    const int n_set0 = n_set;
+    auto graph_sum = [&]() -> int {
+        n_set = n_set0;
         if (wmul->src[0] != dn_out || !ggml_is_contiguous(dn_out)) {
             return 0;
         }
@@ -11966,23 +11970,27 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
             ggml_cuda_nvfp4moe_launch(P, ctx->stream());
         }
         return last - i;
+    };
+    if (!own_sum) {
+        return graph_sum();
     }
+    const bool sum_fallback = T > 8 && ggml_cuda_nvfp4mt_split_enabled();  // MTSPLIT (opt-in)
     const int n_w = ggml_cuda_try_fuse_ink_moe_wsum(nullptr, cgraph, j);
     if (n_w <= 0 || wmul->src[0] != dn_out || !ggml_is_contiguous(dn_out)) {
-        return 0;
+        return sum_fallback ? graph_sum() : 0;
     }
     ggml_tensor * sum = cgraph->nodes[j + n_w];
     const ggml_tensor * rw = wmul->src[1];
     if (sum->op != GGML_OP_SUM_ROWS || sum->src[0]->op != GGML_OP_CONT || rw->nb[0] != sizeof(float) ||
             rw->nb[1] % sizeof(float) != 0 || rw->nb[2] % sizeof(float) != 0) {
-        return 0;
+        return sum_fallback ? graph_sum() : 0;
     }
     set[n_set++] = wmul;
     set[n_set++] = sum->src[0];
     set[n_set++] = sum;
     const int last = ink_run_check(cgraph, i, set, n_set, sum);
     if (last < 0) {
-        return 0;
+        return sum_fallback ? graph_sum() : 0;
     }
     if (!ctx) {
         return last - i;
@@ -11997,17 +12005,17 @@ static int ggml_cuda_try_fuse_ink_nvfp4moe(ggml_backend_cuda_context * ctx, ggml
         }
         for (const ggml_tensor * rd : reads) {
             if (rd && ink_overlap(wt, rd)) {
-                return 0;
+                return sum_fallback ? graph_sum() : 0;
             }
         }
         for (const ggml_tensor * wt2 : writes) {
             if (wt2 && wt2 != wt && ink_overlap(wt, wt2)) {
-                return 0;
+                return sum_fallback ? graph_sum() : 0;
             }
         }
     }
     if ((uintptr_t) act->data % 16 != 0 || (uintptr_t) w_gu->data % 4 != 0 || (uintptr_t) w_dn->data % 4 != 0) {
-        return 0;
+        return sum_fallback ? graph_sum() : 0;
     }
     nvfp4moe_params P = {};
     P.w_gu = (const char *) w_gu->data; P.gu_nb1 = w_gu->nb[1]; P.gu_nb2 = w_gu->nb[2];
@@ -18753,7 +18761,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DEPTH_MIX:
             return ggml_cuda_depth_mix_supported(op);
         case GGML_OP_LOOP_GATE:
-            return ggml_cuda_loop_gate_supported(op);
+            return ggml_cuda_loop_gate_op_supported(op);
         case GGML_OP_LSA_PREFETCH:
             return true;
         case GGML_OP_MOE_OG_SLOTS:

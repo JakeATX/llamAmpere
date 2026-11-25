@@ -26,9 +26,11 @@
 #include <vector>
 
 struct llama_model;
+class  llama_moe_cache;
 
 struct llama_ink_stream_stats {
     uint64_t bytes_h2d   = 0; // expert bytes uploaded
+    uint64_t bytes_d2d   = 0; // fork (PLOAN): expert bytes copied from the kept MoE cache banks
     uint64_t uploads     = 0; // visits uploaded
     int64_t  t_wait_us   = 0; // graph thread waiting for an upload to be queued
 };
@@ -50,6 +52,14 @@ public:
     bool arm();
     // wait for the copies in flight, then free all of it
     void disarm();
+    // fork (CORERES): place up to LLAMA_INK_CORERES resident core layers in the VRAM that is still free once the prompt
+    // call has sized its buffers (ubatch ceiling, B1 groups), leaving keep bytes free. The ubatch size and grouping never
+    // depend on them, so the values are those of the two-slot stream. Returns the number placed. Call once per decode
+    // call of an armed prompt, before its first graph; drop_residents() before the next call measures VRAM.
+    int place_residents(size_t keep);
+    // wait for the copies in flight and give the resident regions back (their visits stream again)
+    void drop_residents();
+    int residents() const { return n_res; }
 
     size_t slot_bytes() const { return slot_size; }
     ggml_backend_t backend() const { return backend_gpu; }
@@ -64,13 +74,30 @@ public:
 
     llama_ink_stream_stats take_stats();
 
+    // fork (PLOAN, LLAMA_INK_PLOAN=1): while the MoE cache keeps a mapped prefix of its banks (suspend_keep), a visit
+    // copies the experts it holds device to device and uploads only the others; the refill may write VMM banks
+    void set_cache(const llama_moe_cache * cache);
+
+    // fork (REFILLPIPE): one host -> device copy for upload_wait()
+    struct upload {
+        ggml_tensor * dst;
+        size_t        dst_offs;
+        const void  * src;
+        size_t        len;
+    };
+    // copy the list through the pinned staging workers and the copy stream and wait until it has landed (the MoE cache
+    // refill after a streamed prompt, whose plain path is one synchronous pageable copy per run of experts). Only while
+    // not armed. false: the pipeline cannot run or a destination is not on this device (nothing copied).
+    bool upload_wait(const std::vector<upload> & list);
+
 private:
     struct visit {
         std::vector<const ggml_tensor *> host;   // host expert tensors
         std::vector<ggml_tensor *>       views;  // device views in the slot of this visit (same order)
         std::vector<size_t>              offs;   // offset of each view in the slot
         std::vector<size_t>              tails;  // bytes after each tensor that the kernels may read: uploaded as zeros
-        int slot = -1;                           // 0 or 1
+        int slot = -1;                           // 0 or 1 (streamed), 2 + grp (CORERES: resident for the prompt)
+        int grp  = -1;                           // CORERES: index of its physical core layer (visited more than once)
         int pos  = -1;                           // index in order
         ggml_tensor * map = nullptr;
         bool   direct      = false;              // fork (GS11): host experts page-locked, queued without staging
@@ -81,6 +108,7 @@ private:
         const char * src;
         size_t dst_offs;
         size_t len;
+        ggml_tensor * dst = nullptr; // nullptr: the slot of the request (req_slot); else upload_wait()
     };
 
     bool init_ok  = false;
@@ -101,16 +129,25 @@ private:
     ggml_context * ctx_map  = nullptr;     // maps
     ggml_backend_buffer_t buf_map  = nullptr;
     ggml_backend_buffer_t buf_slot = nullptr;
-    ggml_tensor * raw[2] = { nullptr, nullptr };
+    ggml_backend_buffer_t buf_res  = nullptr; // CORERES regions of this decode call
+    std::vector<ggml_tensor *> raw;        // [2 + n_core]: the two streamed slots, then one region per resident core layer
 
     // copy pipeline
     ggml_backend_t backend_copy = nullptr;
-    ggml_backend_event_t ev_free[2]  = { nullptr, nullptr };
-    ggml_backend_event_t ev_ready[2] = { nullptr, nullptr };
-    int issued[2] = { -1, -1 }; // visit last queued into each slot
+    std::vector<ggml_backend_event_t> ev_free;  // [2 + n_core]
+    std::vector<ggml_backend_event_t> ev_ready; // [2 + n_core]
+    ggml_backend_event_t ev_list = nullptr; // upload_wait(): the last piece is on the card
+    std::vector<int> issued;   // [2 + n_core] visit last queued into each slot (a resident region: any visit, once per call)
+    // fork (CORERES): LLAMA_INK_CORERES=N keeps the experts of N core layers (the layers a looped model visits on every
+    // pass) in VRAM for the whole armed prompt, uploaded once instead of on every pass; 0 (default) = two slots only
+    int n_core   = 0;          // physical layers visited more than once
+    int res_want = 0;
+    int n_res    = 0;          // resident regions of this decode call (placed after its buffers, see place_residents)
+    std::vector<int> res_region; // [n_core] region of each core layer for this call, -1 = streamed
 
     int    n_workers = 4;
     size_t piece_max = 8u << 20;
+    bool   layer_major_reuse = false; // see copy(): no wait for the other slot when a visit repeats (INKB1)
     struct worker_state {
         ggml_backend_buffer_t buf[2] = { nullptr, nullptr };
         char *                data[2] = { nullptr, nullptr };
@@ -140,9 +177,19 @@ private:
     ggml_backend_buffer_t buf_zeros = nullptr; // pinned zeros for the tails
     size_t n_direct = 0, n_direct_span = 0;
 
+    // fork (PLOAN)
+    const llama_moe_cache * cache = nullptr;
+    ggml_context * ctx_d2d = nullptr;               // views of the kept-expert copies of one visit
+    ggml_backend_buffer_type_t buft_elastic = nullptr; // the VMM bank buffer type (upload_wait destinations)
+
     void issue(int il, ggml_backend_t backend);
+    bool issue_kept(int il); // fork (PLOAN): false = no kept experts in this visit (nothing queued)
     void wait_issued();
     void worker(int w);
     void free_slots();
     void free_pipeline();
+    // streamed visits alternate between the two slots in graph order, keeping the slot of an upload already queued for
+    // the first one (the prefetch from the previous call); views follow their visit's slot
+    void assign_slots();
+    bool place_views(int il);
 };

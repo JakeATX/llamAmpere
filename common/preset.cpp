@@ -182,6 +182,16 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // 12 GB has room for the 2,048-row prompt step (INKSTREAM 11-23, X2 at 11,264, ladder reaches 2,048 rows: 100K
         // prefill 968 tok/s); 8/10 GB stay at 1024 (the 2,048 step does not fit: 10ink needs 3,028 vs 1,408 MiB free)
         set_opt(ink12, "--ubatch-size", "2048");
+        // fork (INKB1 on 12 GB): one layer-major call per prompt (LLAMA_INK_B1=1, -b 16384) streams each visit's experts
+        // once for all of its ubatches instead of once per ubatch, with in-call checkpoints so a checkpoint spot does
+        // not end the call. Same tokens (identity 24/24 vs 0.7.5). ABBA, S34d, chat, temp 1, 5,120-token replies, 6 seeds
+        // per arm, RTX 3090 350 W at the 11,264 line: prefill 3K 483 -> 768, 32K 810 -> 2,434, 100K 848 -> 2,199 tok/s
+        // (TTFT 100K 117.9 -> 45.5 s); decode -3.2% / -0.5% / -1.1%, inside the shared box's drift (a 3K rerun gave +4.6%).
+        // Those rows also had LLAMA_INK_CORERES=12; without it (3 seeds) prefill is the same: 3K 773, 32K 2,437, 100K
+        // 2,249 tok/s, so resident core layers stay off. Kill switch: LLAMA_INK_B1=0 -b 4096.
+        set_opt(ink12, "--batch-size", "16384");
+        ink12.env.push_back({"LLAMA_INK_B1", "1"});
+        ink12.version = "2026-11-25.1";
         // fork (INKSTACK): Inkling 2 Mini on a 24 GB card, one slot, the whole model on the GPU, DSpark drafter on.
         // -b 2048 -ub 1024 (ladder on): at -c 262144 the NQ file runs out of VRAM at ub 2048 (rc8b boot check, RELREADY),
         // and --parallel 1 keeps the server from picking 4 slots + a unified KV (500 on the first 262K request).

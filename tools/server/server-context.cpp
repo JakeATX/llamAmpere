@@ -116,6 +116,7 @@ extern "C" {
 #include <deque>
 #include <exception>
 #include <future>
+#include <system_error>
 #include <atomic>
 #include <memory>
 #include <limits>
@@ -1075,6 +1076,76 @@ struct server_slot {
         }
     }
 
+    // fork: a fresh checkpoint buffer costs page faults and zero fill on the main thread while the GPU idles (~75 ms
+    // for 195 MiB on the test host), so during a prompt the buffer for the next checkpoint is faulted in on a helper thread
+    // while the GPU runs the batch before it. Opt-in (port, default off): LLAMA_CKPT_PREFAULT_NEXT=1.
+    size_t ckpt_size_last = 0;
+    size_t ckpt_size_prev = 0;
+    std::future<std::vector<uint8_t>> ckpt_pf_next;
+
+    // the size the next checkpoint likely needs: the last one plus its last growth (early ones grow with the window)
+    size_t ckpt_size_next() const {
+        const size_t grow = ckpt_size_last > ckpt_size_prev ? ckpt_size_last - ckpt_size_prev : 0;
+        return ckpt_size_last + std::min(grow, ckpt_size_last / 16);
+    }
+
+    // update_tgt's rule for taking a spare: no growth and at most 1/8 waste
+    static bool ckpt_fits(const std::vector<uint8_t> & buf, size_t need) {
+        return need > 0 && buf.size() >= need && buf.size() - need <= need / 8;
+    }
+
+    // list_full: the next checkpoint erases an old one, whose buffer becomes the spare
+    void ckpt_prefault_start(bool list_full) {
+        static const bool on = [] { const char * e = getenv("LLAMA_CKPT_PREFAULT_NEXT"); return e != nullptr && atoi(e) != 0; }();
+        const size_t need = ckpt_size_next();
+        if (!on || list_full || need == 0 || need > (1ull << 31) || ckpt_pf_next.valid() || ckpt_fits(ckpt_spare, need)) {
+            return;
+        }
+        const size_t size = need + need / 64;
+        try {
+            ckpt_pf_next = std::async(std::launch::async, [size] { std::vector<uint8_t> buf; common_buf_resize(buf, size); return buf; });
+        } catch (const std::system_error &) {
+            // no helper thread: update_tgt allocates as before
+        }
+    }
+
+    // before a checkpoint: a prefaulted buffer becomes the spare unless the spare already fits
+    void ckpt_prefault_take() {
+        const size_t need = ckpt_size_next();
+        if (!ckpt_pf_next.valid() || ckpt_fits(ckpt_spare, need)) {
+            return;
+        }
+        try {
+            std::vector<uint8_t> buf = ckpt_pf_next.get();
+            if (ckpt_fits(buf, need) || ckpt_spare.empty()) {
+                ckpt_spare = std::move(buf);
+            }
+        } catch (const std::exception &) {
+            // allocation failed on the helper: update_tgt allocates as before
+        }
+    }
+
+    // end of a prompt (keep) or of the task: a pending buffer becomes the spare when there is none, or is freed off the
+    // main thread (dropping a std::async future waits for the helper)
+    void ckpt_prefault_end(bool keep) {
+        if (!ckpt_pf_next.valid()) {
+            return;
+        }
+        if (keep && ckpt_spare.empty() && ckpt_pf_next.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            try {
+                ckpt_spare = ckpt_pf_next.get();
+            } catch (const std::exception &) {
+            }
+            return;
+        }
+        std::thread([f = std::move(ckpt_pf_next)]() mutable {
+            try {
+                f.get();
+            } catch (const std::exception &) {
+            }
+        }).detach();
+    }
+
     llama_tokens spec_draft;
     // per-position draft distributions for exact p/q verification (empty: id-match), aligned with spec_draft
     std::vector<std::vector<llama_token_data>> spec_draft_q;
@@ -1773,6 +1844,7 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             ckpt_spare = {};
+            ckpt_prefault_end(false);
 
             id_last_task = task->id;
 
@@ -5503,15 +5575,16 @@ private:
         return dft_windowed() ? (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_KEEP_LAYOUT) : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     }
 
-    // In-call checkpoints: on with B1 (LLAMA_B1=1, layer-major prefill), unless LLAMA_B1_CKPT=0. A prompt checkpoint
+    // In-call checkpoints: on with B1 (LLAMA_B1=1, layer-major prefill) or INKB1 (LLAMA_INK_B1=1), unless LLAMA_B1_CKPT=0. A prompt checkpoint
     // spot on the SJ-KVaRN grid then no longer ends the batch: the decode copies the recurrent state when the ubatch
     // that ends there has run (llama_state_seq_capture_arm), and the checkpoint is made from the copy after the call.
     // A B1 call that ended at the spot would pay another pass over the streamed experts for the tokens after it.
     bool ckpt_in_call_enabled() const {
         static const bool on = [] {
             const char * b1 = getenv("LLAMA_B1");
+            const char * ib = getenv("LLAMA_INK_B1"); // [INKB1] layer-major prompt groups on the expert streamer
             const char * ck = getenv("LLAMA_B1_CKPT");
-            return b1 && atoi(b1) != 0 && !(ck && atoi(ck) == 0);
+            return ((b1 && atoi(b1) != 0) || (ib && atoi(ib) != 0)) && !(ck && atoi(ck) == 0);
         }();
         return on;
     }
@@ -5760,10 +5833,13 @@ private:
 
         llama_synchronize(ctx_tgt); // (update_tgt syncs anyway) keep the previous batch's compute out of the copy time
         const int64_t t_ckpt_us = ggml_time_us();
+        slot.ckpt_prefault_take();
         const bool had_spare = !slot.ckpt_spare.empty();
         const llama_state_seq_flags flags = exact ? ckpt_flags() : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
         cur.update_tgt(ctx_tgt, slot.id, flags | LLAMA_STATE_SEQ_FLAGS_ASYNC, &slot.ckpt_spare); // ASYNC: only with LLAMA_CKPT_ASYNC=1
         const bool reused = had_spare && slot.ckpt_spare.empty();
+        slot.ckpt_size_prev = slot.ckpt_size_last;
+        slot.ckpt_size_last = cur.data_tgt.size();
         if (ckpt_needs_dft()) {
             // [#240] the exact section rides on a hybrid drafter's recurrent state; a plain-KV drafter checkpoint
             // (LLAMA_CKPT_DFT_KV=1) keeps the whole cache as before
@@ -8030,6 +8106,7 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
+                    const bool ckpt_possible = do_checkpoint; // fork: before the per-batch rules (checkpoint prefault)
 
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
@@ -8392,6 +8469,14 @@ private:
                                     slot.prompt.checkpoints.back().n_tokens);
                         }
                     }
+                    if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                        // fork: no more prompt checkpoints (the last one above took a pending buffer); free the rest
+                        // off this thread instead of holding it through generation
+                        slot.ckpt_prefault_end(false);
+                    } else if (ckpt_possible && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        // fork: a later batch of this prompt may start at a checkpoint; fault its buffer in meanwhile
+                        slot.ckpt_prefault_start(slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints);
+                    }
                 }
 
                 if (!slot_batched) {
@@ -8526,7 +8611,11 @@ private:
                         }
                         // 1/64 headroom for a later spot laid out a little larger; update_tgt accepts up to 1/8 waste
                         sz += sz / 64;
-                        return std::vector<std::vector<uint8_t>>(n_pf, std::vector<uint8_t>(sz));
+                        std::vector<std::vector<uint8_t>> bufs(n_pf);
+                        for (auto & buf : bufs) {
+                            common_buf_resize(buf, sz);
+                        }
+                        return bufs;
                     });
                 }
             } else {
@@ -8688,6 +8777,19 @@ private:
                 const bool ovl_win = split_ovl_window > 0 && batch_phase == LLAMA_DECODE_PHASE_GENERATION &&
                     n_view > split_ovl_window && server_view_one_seq(batch.view) &&
                     llama_split_overlap_set_window(ctx_tgt, split_ovl_window);
+                if (batch_phase == LLAMA_DECODE_PHASE_PROMPT) {
+                    // fork PPLAN: the prompt rows later calls add (the rest of this batch + each slot's unread prompt),
+                    // so the context sizes its compute buffers once for the depth the prompt reaches
+                    int64_t rows_after = std::max<int64_t>(0, (int64_t) batch.size() - off - n_view);
+                    int64_t unread = 0;
+                    for (const auto & slot : slots) {
+                        if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.task) {
+                            const int64_t left = std::max<int64_t>(0, (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens());
+                            unread = params_base.kv_unified ? unread + left : std::max(unread, left);
+                        }
+                    }
+                    llama_set_next_prompt_rows(ctx_tgt, (int32_t) std::min<int64_t>(INT32_MAX, rows_after + unread));
+                }
                 ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
                 if (ovl_win) {
                     llama_split_overlap_set_window(ctx_tgt, 0);

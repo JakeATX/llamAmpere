@@ -1136,6 +1136,11 @@ struct llama_model {
     virtual void load_arch_tensors_post(llama_model_loader & ml) { GGML_UNUSED(ml); }
     // fork (INKFLAGS): after the weights are loaded, e.g. to build derived weights with create_derived_tensor
     virtual void load_arch_data_post() {}
+    // fork (INKB1): layer-major prompt of a looped model (LLAMA_INK_B1): the F32 rows per token of the carry its
+    // one-visit graphs keep between visits (0 = the model has no one-visit graphs), and the cache slot of the visit at
+    // graph position p
+    virtual int32_t ink_b1_carry_rows() const { return 0; }
+    virtual int32_t ink_b1_visit_slot(int32_t p) const { return p; }
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:

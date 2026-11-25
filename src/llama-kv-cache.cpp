@@ -3503,6 +3503,25 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_n_kv_bound(const slot_info_vec_t & sinfos, size_t i0, uint32_t extra) const {
+    const uint32_t n_pad = 256; // as get_n_kv()
+    uint32_t result = 0;
+    for (size_t i = i0; i < sinfos.size(); ++i) {
+        const auto & sinfo = sinfos[i];
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const auto & cells = v_cells[sinfo.strm[s]];
+            uint64_t top = cells.used_max_p1();
+            for (const uint32_t idx : sinfo.idxs[s]) {
+                top = std::max<uint64_t>(top, uint64_t(idx) + 1);
+            }
+            top += extra;
+            const uint64_t padded = std::max<uint64_t>(n_pad, (top + n_pad - 1) / n_pad * n_pad);
+            result = std::max<uint32_t>(result, (uint32_t) std::min<uint64_t>(cells.size(), padded));
+        }
+    }
+    return result;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_seqs_unq == 1) {
         return 1;
@@ -4208,9 +4227,17 @@ bool llama_kv_cache::maintain_sj_kvarn_stream(llama_context * lctx, uint32_t str
     }
     const int64_t started = ggml_time_us();
     const uint32_t original_B = st.B;
-    // The current batch is already queued for timing, but has not computed yet.
-    ggml_backend_sched_synchronize(lctx->get_sched());
+    // fork SEALQ (see below). Opt-in (port, default off): LLAMA_SJ_KVARN_SEAL_QUEUE=1; unset or 0 = the base waits.
+    static const bool seal_queue_env = [] { const char * e = getenv("LLAMA_SJ_KVARN_SEAL_QUEUE"); return e && atoi(e) != 0; }();
+    if (!seal_queue_env) {
+        // The current batch is already queued for timing, but has not computed yet.
+        ggml_backend_sched_synchronize(lctx->get_sched());
+    }
     if (sj_kvarn_maintenance_graphs.size() < sj_kvarn_st.size()) {
+        if (seal_queue_env) {
+            // The current batch is already queued for timing, but has not computed yet.
+            ggml_backend_sched_synchronize(lctx->get_sched());
+        }
         sj_kvarn_maintenance_graphs.resize(sj_kvarn_st.size());
     }
     // multi-stream: the descriptor carries the stream's group table behind the fixed entries
@@ -4253,6 +4280,42 @@ bool llama_kv_cache::maintain_sj_kvarn_stream(llama_context * lctx, uint32_t str
         }
         graphs = std::move(prepared);
     }
+    // fork SEALQ: with one CUDA device the seal graphs run on the model's compute stream, behind the ubatch that is
+    // queued and before the next one, so they need no host wait: the descriptors go through the stream-ordered
+    // upload ring and the graphs are only queued. The two waits per seal step (scheduler, then the blocking compute)
+    // each let the GPU run dry while the host built the next ubatch. Otherwise (other devices, no ring) the batch is
+    // finished first, as before. Unset or LLAMA_SJ_KVARN_SEAL_QUEUE=0 always waits (above, as the base).
+    using seal_upload_fn_t = bool (*)(ggml_backend_t, const void *, ggml_tensor *, size_t);
+    seal_upload_fn_t seal_upload = nullptr;
+    {
+        ggml_backend_sched_t sched = lctx->get_sched();
+        ggml_backend_t gpu = nullptr;
+        int n_gpu = 0;
+        bool other = false;
+        for (int i = 0; seal_queue_env && sched && i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            ggml_backend_dev_t dev = ggml_backend_get_device(b);
+            const char * reg = dev ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
+            if (strcmp(reg, "CUDA") == 0) {
+                gpu = b;
+                ++n_gpu;
+            } else if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                other = true;
+            }
+        }
+        bool same = n_gpu == 1 && !other && !graphs.empty();
+        for (const auto & job : graphs) {
+            same = same && job.backend == gpu;
+        }
+        if (same) {
+            seal_upload = (seal_upload_fn_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)),
+                    "ggml_backend_cuda_upload_host_small");
+        }
+        if (seal_queue_env && !seal_upload) {
+            // The current batch is already queued for timing, but has not computed yet.
+            ggml_backend_sched_synchronize(sched);
+        }
+    }
     const uint32_t target = st.B_pending;
     if (sj_kvarn_paged && !sj_kvarn_alloc_groups(strm, (st.B - sj_kvarn.sink)/sj_kvarn.group, (target - sj_kvarn.sink)/sj_kvarn.group)) {
         // prepare() and compress_sj_kvarn_idle() check the free count first, so this means a bookkeeping bug
@@ -4287,10 +4350,16 @@ bool llama_kv_cache::maintain_sj_kvarn_stream(llama_context * lctx, uint32_t str
                 d[GGML_SJKVARN_DESC_BODY_TYPE] = tier == 1 && !sj_kvarn_noseal ? sj_kvarn.edge_body_type : sj_kvarn.body_type;
                 // [NOSEAL] an empty seal range for the never-seal layers
                 d[GGML_SJKVARN_DESC_B_OLD] = tier == 1 && sj_kvarn_noseal ? end : old;
-                ggml_backend_tensor_set(job.desc[tier], d.data(), 0, d.size()*sizeof(int32_t));
+                if (!seal_upload || !seal_upload(job.backend, d.data(), job.desc[tier], d.size()*sizeof(int32_t))) {
+                    if (seal_upload) {
+                        ggml_backend_synchronize(job.backend);  // a queued seal may still read this descriptor
+                    }
+                    ggml_backend_tensor_set(job.desc[tier], d.data(), 0, d.size()*sizeof(int32_t));
+                }
             }
             d[GGML_SJKVARN_DESC_B_OLD] = old;
-            success = ggml_backend_graph_compute(job.backend, job.graph) == GGML_STATUS_SUCCESS && success;
+            success = (seal_upload ? ggml_backend_graph_compute_async(job.backend, job.graph)
+                                   : ggml_backend_graph_compute(job.backend, job.graph)) == GGML_STATUS_SUCCESS && success;
         }
         if (!success) {
             LLAMA_LOG_ERROR("%s: maintenance graph compute failed\n", __func__);
@@ -8086,6 +8155,81 @@ bool llama_kv_cache_context::b1_seek(size_t i) {
     return kv->b1_sj_seek(i);
 }
 
+void llama_kv_cache_context::b1_save_cells() {
+    b1_save();
+    if (b1_cells.size() <= i_cur) {
+        b1_cells.resize(i_cur + 1);
+        b1_n_kv_rows.resize(i_cur + 1, 0);
+    }
+    b1_cells[i_cur]     = kv->b1_cells_copy();
+    b1_n_kv_rows[i_cur] = n_kv_rows;
+    b1_cells_live       = i_cur; // the cache holds the cells after this apply
+}
+
+bool llama_kv_cache::b1_undo_mark(const slot_info_vec_t & sinfos, bool whole) {
+    b1_undo_st = {};
+    if (other) {
+        return false;
+    }
+    if (!whole) {
+        for (const auto & sinfo : sinfos) {
+            for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+                const uint32_t strm = sinfo.strm[s];
+                for (const uint32_t idx : sinfo.idxs[s]) {
+                    if (!v_cells[strm].is_empty(idx)) {
+                        b1_undo_st = {};
+                        return false;
+                    }
+                    b1_undo_st.filled.emplace_back(strm, idx);
+                }
+            }
+        }
+        auto sorted = b1_undo_st.filled;
+        std::sort(sorted.begin(), sorted.end());
+        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+            b1_undo_st = {};
+            return false;
+        }
+    } else {
+        b1_undo_st.cells = v_cells;
+    }
+    b1_undo_st.heads = v_heads;
+    b1_undo_st.whole = whole;
+    b1_undo_st.on    = true;
+    return true;
+}
+
+void llama_kv_cache::b1_undo() {
+    if (!b1_undo_st.on) {
+        return;
+    }
+    if (b1_undo_st.whole) {
+        std::swap(v_cells, b1_undo_st.cells);
+    } else {
+        for (const auto & [strm, idx] : b1_undo_st.filled) {
+            if (!v_cells[strm].is_empty(idx)) {
+                v_cells[strm].rm(idx);
+            }
+        }
+    }
+    std::swap(v_heads, b1_undo_st.heads);
+    b1_undo_st = {};
+}
+
+bool llama_kv_cache_context::b1_seek_cells(size_t i) {
+    if (i >= b1_cells.size() || b1_cells_live >= b1_cells.size() || !b1_seek(i)) {
+        return false;
+    }
+    if (i != b1_cells_live) {
+        // every other entry holds its ubatch's cells: park the live ones, take ubatch i's (two O(1) swaps)
+        kv->b1_cells_swap(b1_cells[b1_cells_live]);
+        kv->b1_cells_swap(b1_cells[i]);
+        b1_cells_live = i;
+    }
+    n_kv_rows = b1_n_kv_rows[i];
+    return true;
+}
+
 llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
 }
@@ -8098,6 +8242,19 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::n_kv_ahead(uint32_t extra) const {
+    if (ubatches.empty() || sinfos.empty() || i_cur >= sinfos.size()) {
+        return 0;
+    }
+    return kv->get_n_kv_bound(sinfos, i_cur, extra);
+}
+
+uint32_t llama_kv_cache_context::set_n_kv_plan(uint32_t v) {
+    const uint32_t old = (uint32_t) n_kv;
+    n_kv = (int32_t) v;
+    return old;
 }
 
 uint32_t llama_kv_cache_context::get_kv_size() const {

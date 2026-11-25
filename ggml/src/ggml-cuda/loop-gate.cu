@@ -1,5 +1,6 @@
 #include "loop-gate.cuh"
 #include "inklg_vec.cuh"
+#include "inklg_pp.cuh"
 #include "convert.cuh"
 
 #define LOOP_GATE_CHUNKS 8   // chunks per input half (x, m); one warp each
@@ -146,6 +147,10 @@ bool ggml_cuda_loop_gate_supported(const ggml_tensor * op) {
         op->src[0]->ne[1] <= LOOP_GATE_MAX_T && op->src[2]->ne[1] <= LOOP_GATE_MAX_R;
 }
 
+bool ggml_cuda_loop_gate_op_supported(const ggml_tensor * op) {
+    return op->src[0]->ne[1] > LOOP_GATE_MAX_T ? ggml_cuda_ink_loop_gate_pp_supported(op) : ggml_cuda_loop_gate_supported(op);
+}
+
 // LGTUNE for the single loop gate (k_loop_gate_down/apply): its own shape knobs, GGML_CUDA_LG1_RB (1/2/4, default 1) and
 // GGML_CUDA_LG1_ROWS (2/4/8, default 2). nsys rc5 (3090, AI4 fold): RB=4 ROWS=4, the best shape for the multi-gate
 // k_ink_lg_*, made this one slower (apply 5.6 -> 7.9 us, down 3.9 -> 4.3 us). Launch shape only, bit-identical.
@@ -196,7 +201,82 @@ static void loop_gate_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     }
 }
 
+static int loop_gate_split_max_t() {
+    static const int v = [] {
+        const char * e = getenv("GGML_CUDA_LG_SPLIT_MAXT");
+        const int k = e && *e ? atoi(e) : 0; // port: opt-in, default 0 = off (32 = the source default)
+        return k < 0 ? 0 : k > 64 ? 64 : k;
+    }();
+    return v;
+}
+
+#define LOOP_GATE_SPLIT_MAX_G 4
+
+bool ggml_cuda_loop_gate_split(ggml_backend_cuda_context & ctx, ggml_tensor * const * gates, int G, ggml_cuda_loop_gate_run_t run) {
+    if (G < 1 || G > LOOP_GATE_SPLIT_MAX_G) {
+        return false;
+    }
+    const int64_t T = gates[0]->src[0]->ne[1];
+    if (T <= LOOP_GATE_MAX_T || T > loop_gate_split_max_t()) {
+        return false;
+    }
+    for (int k = 0; k < G; ++k) {
+        const ggml_tensor * d = gates[k];
+        if (d->op != GGML_OP_LOOP_GATE || d->type != GGML_TYPE_F32 || d->src[0]->ne[1] != T || d->src[1]->ne[1] != T ||
+                d->ne[1] != T || d->nb[1] != (size_t) d->ne[0]*sizeof(float) || d->ne[2] != 1 || d->ne[3] != 1 ||
+                d->src[0]->ne[2] != 1 || d->src[0]->ne[3] != 1 || d->src[1]->ne[2] != 1 || d->src[1]->ne[3] != 1) {
+            return false;
+        }
+    }
+    const int nc = (int) ((T + LOOP_GATE_MAX_T - 1)/LOOP_GATE_MAX_T);
+    ggml_tensor xs[LOOP_GATE_SPLIT_MAX_G], ms[LOOP_GATE_SPLIT_MAX_G], ds[LOOP_GATE_SPLIT_MAX_G];
+    ggml_tensor * cg[LOOP_GATE_SPLIT_MAX_G];
+    int64_t t0 = 0;
+    for (int c = 0; c < nc; ++c) {
+        const int64_t tc = (T - t0)/(nc - c);
+        for (int k = 0; k < G; ++k) {
+            const ggml_tensor * d = gates[k];
+            xs[k] = *d->src[0];
+            ms[k] = *d->src[1];
+            ds[k] = *d;
+            ggml_tensor * v[3] = { &xs[k], &ms[k], &ds[k] };
+            const ggml_tensor * o[3] = { d->src[0], d->src[1], d };
+            for (int q = 0; q < 3; ++q) {
+                v[q]->ne[1] = tc;
+                v[q]->nb[2] = v[q]->nb[1]*tc;
+                v[q]->nb[3] = v[q]->nb[2];
+                v[q]->data  = (char *) o[q]->data + t0*o[q]->nb[1];
+            }
+            ds[k].src[0] = &xs[k];
+            ds[k].src[1] = &ms[k];
+            cg[k] = &ds[k];
+        }
+        if (!run(ctx, cg, G)) {
+            GGML_ASSERT(c == 0 && "loop gate split: a later chunk refused");
+            return false;
+        }
+        t0 += tc;
+    }
+    return true;
+}
+
+static bool loop_gate_run_one(ggml_backend_cuda_context & ctx, ggml_tensor * const * gates, int G) {
+    GGML_ASSERT(G == 1);
+    if (!ggml_cuda_loop_gate_supported(gates[0])) {
+        return false;
+    }
+    ggml_cuda_loop_gate(ctx, gates[0]);
+    return true;
+}
+
 void ggml_cuda_loop_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (dst->src[0]->ne[1] > LOOP_GATE_MAX_T) {
+        ggml_tensor * g1[1] = { dst };
+        if (!ggml_cuda_loop_gate_split(ctx, g1, 1, loop_gate_run_one)) {
+            ggml_cuda_ink_loop_gate_pp(ctx, dst);
+        }
+        return;
+    }
     GGML_ASSERT(ggml_cuda_loop_gate_supported(dst));
     if (dst->src[0]->ne[1] == 0) {
         return;

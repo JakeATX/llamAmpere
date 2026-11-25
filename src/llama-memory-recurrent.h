@@ -367,6 +367,9 @@ public:
     void b1_save() override;
     bool b1_seek(size_t i) override;
     bool b1_has_views() const { return !b1_views.empty(); }
+    // [INKB1] find_slot()'s metadata before the call's first apply, put back when none of its graphs has started
+    void b1_undo_mark();
+    void b1_undo();
 
     //
     // llama_memory_recurrent_context specific API
@@ -473,4 +476,6 @@ private:
         std::vector<uint8_t>  s_stale;
     };
     std::vector<b1_view> b1_views;
+    b1_view b1_pre;            // [INKB1] b1_undo_mark
+    bool    b1_pre_on = false;
 };

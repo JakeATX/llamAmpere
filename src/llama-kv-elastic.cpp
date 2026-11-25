@@ -183,6 +183,15 @@ bool llama_context::elastic_kv_shrink_compute(size_t bytes) {
 }
 
 bool llama_context::elastic_kv_make_room(size_t bytes) {
+    if (moe_cache && moe_cache->partial()) {
+        // fork (PLOAN): the kept bank pages go first; when they cover it nothing else shrinks (as with the whole cache lent)
+        const size_t kept = moe_cache->kept_bytes();
+        ink_ploan_give_back("KV records need them");
+        if (kept >= bytes) {
+            return true;
+        }
+        bytes -= kept;
+    }
     if (!moe_cache || !ink_loan || moe_cache->size() <= ink_loan_boot) {
         // the boot sizes were fitted with every KV page mapped: only the cache loan or the compute rows grown on the
         // lent pages can be given back

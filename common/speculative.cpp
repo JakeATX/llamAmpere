@@ -1577,6 +1577,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            // fork: with consecutive positions, a later chunk of at least lilicorr_rows stored rows rewrites every ring
+            // slot, so the rows of the chunks before it need no read back (each read waits for the chunk, ~0.3 ms of
+            // GPU idle per 64 rows of prompt). Opt-in (port, default off): LLAMA_DSPARK_SKIP_DEAD_ROWS=1; unset or 0 reads every chunk.
+            static const bool skip_dead_rows = [] { const char * e = getenv("LLAMA_DSPARK_SKIP_DEAD_ROWS"); return e && atoi(e) != 0; }();
+            bool pos_consecutive = skip_dead_rows;
+            for (int32_t k = i_batch_beg[seq_id] + 1; pos_consecutive && k <= i_batch_end[seq_id]; ++k) {
+                pos_consecutive = batch_in.pos[k] == batch_in.pos[k - 1] + 1;
+            }
+
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
@@ -1642,7 +1651,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         pending_rnn_seq   = seq_id;
                         pending_rnn_valid = true;
                     } else {
-                        const float * projected = llama_get_embeddings_nextn(ctx_dft);
+                        // the next chunk stores min(its rows, block_size + 1) consecutive positions
+                        const int32_t n_next = std::min({ n_ubatch, n_rows - offset - n_chunk, block_size + 1 });
+                        const bool rewritten = pos_consecutive && n_next >= (int32_t) lilicorr_rows;
+                        const float * projected = rewritten ? nullptr : llama_get_embeddings_nextn(ctx_dft);
                         if (projected) {
                             const size_t seq_offset = (size_t) seq_id * lilicorr_rows;
                             const llama_pos pos_min = std::max<llama_pos>(0, batch_in.pos[i_batch_beg[seq_id] + offset + n_chunk - 1] - block_size);

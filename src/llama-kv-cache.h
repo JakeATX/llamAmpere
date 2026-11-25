@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -273,6 +274,9 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    // fork PPLAN: the largest n_kv (padded as get_n_kv) the slot infos sinfos[i0..] reach once applied, plus `extra`
+    // cells for later calls of the same prompt; capped at the cache size
+    uint32_t get_n_kv_bound(const slot_info_vec_t & sinfos, size_t i0, uint32_t extra) const;
 
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
@@ -328,6 +332,16 @@ public:
     bool b1_sj_seek(size_t i);
     bool b1_sj_seal(llama_context * lctx, int32_t il0, int32_t il1);
     void b1_sj_rewind(); // undo the bookkeeping of a call whose ubatches were applied but never computed
+    // [INKB1] layer-major prompt on an iSWA memory: the SWA half reuses its cells within a call, so the cell metadata of
+    // every ubatch is kept (llama_kv_cache_context::b1_save_cells) and swapped in before its graphs. All streams.
+    bool b1_cells_supported() const { return other == nullptr && v_cells_impl.use_count() == 1; } // no cell sharing
+    llama_kv_cells_vec b1_cells_copy() const { return v_cells; }
+    void b1_cells_swap(llama_kv_cells_vec & cells) { std::swap(v_cells, cells); }
+    // [INKB1] undo of a call's applies while none of its graphs has started: the heads, and either all the cell
+    // metadata (whole: a cache that reuses cells within the call) or the cells the call fills, which must all be empty
+    // and distinct before it (then apply_ubatch touches no other cell). false: no exact undo, nothing kept.
+    bool b1_undo_mark(const slot_info_vec_t & sinfos, bool whole);
+    void b1_undo();
     int32_t compress_sj_kvarn_idle(llama_context * lctx, llama_seq_id seq_id, llama_pos accepted_end, llama_pos keep_from = -1);
     // sealed end: of the sequence's stream (seq_id >= 0), or the largest over all streams (seq_id < 0)
     uint32_t get_sj_kvarn_sealed_end(llama_seq_id seq_id = -1) const;
@@ -338,6 +352,16 @@ public:
     // returns the far visible end: 1 + the last far-visible mask column over all rows (0: none)
     int64_t   set_input_sj_far_mask(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
     bool      has_layer(int32_t il) const { return map_layer_ids.count(il) != 0; }
+    // [INKB1] the layer whose K or V cache (or one of its stream views) is t, -1 for none (in-call checkpoint rows)
+    int32_t   layer_of_tensor(const ggml_tensor * t) const {
+        for (const auto & layer : layers) {
+            if (t == layer.k || t == layer.v || std::find(layer.k_stream.begin(), layer.k_stream.end(), t) != layer.k_stream.end() ||
+                    std::find(layer.v_stream.begin(), layer.v_stream.end(), t) != layer.v_stream.end()) {
+                return (int32_t) layer.il;
+            }
+        }
+        return -1;
+    }
     // INKKV: would seq_rm(seq_id, p0, p1) succeed? (no change; hybrid memories ask before touching the recurrent state)
     bool      sj_kvarn_can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     uint32_t get_sj_kvarn_visible_end() const { return sj_kvarn_st[0].N; }
@@ -682,6 +706,15 @@ private:
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
+    // [INKB1] b1_undo_mark / b1_undo
+    struct {
+        bool on    = false;
+        bool whole = false;
+        std::vector<uint32_t> heads;
+        llama_kv_cells_vec    cells;
+        std::vector<std::pair<uint32_t, uint32_t>> filled; // (stream, cell)
+    } b1_undo_st;
+
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
@@ -824,6 +857,14 @@ public:
     bool b1_supported() const override;
     void b1_save() override;
     bool b1_seek(size_t i) override;
+    // [INKB1] the same, plus the cell metadata and n_kv_rows of each ubatch (llama_kv_cache::b1_cells_*): for a cache
+    // whose later ubatches reuse the cells of earlier ones (the SWA half of an iSWA memory)
+    bool b1_cells_supported() const { return kv->b1_cells_supported(); }
+    void b1_save_cells();
+    bool b1_seek_cells(size_t i);
+    // before the call's first apply / when none of its graphs has started (llama_kv_cache::b1_undo_*)
+    bool b1_undo_mark(bool whole) { return kv->b1_undo_mark(sinfos, whole); }
+    void b1_undo() { kv->b1_undo(); }
 
     //
     // llama_kv_cache_context specific API
@@ -832,6 +873,10 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
     uint32_t get_kv_size() const; // cells of the cache (LSA index cache rows on SJ-KVaRN)
+    // fork PPLAN: the n_kv the rest of this batch reaches plus `extra` cells (0 for a reserve / update context), and a
+    // temporary n_kv for a graph that only sizes the compute buffers (llama_context::prompt_plan); returns the old one
+    uint32_t n_kv_ahead(uint32_t extra) const;
+    uint32_t set_n_kv_plan(uint32_t v);
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -940,6 +985,10 @@ private:
 
     // [B1] n_kv of each ubatch, recorded right after its apply()
     std::vector<int32_t> b1_n_kv;
+    // [INKB1] b1_save_cells: the cells after each ubatch's apply; the entry of the ubatch the cache holds is vacant
+    std::vector<llama_kv_cells_vec> b1_cells;
+    std::vector<uint32_t> b1_n_kv_rows;
+    size_t b1_cells_live = 0;
     // see llama_kv_cache::get_n_kv_rows
     uint32_t n_kv_rows = 0;
 };

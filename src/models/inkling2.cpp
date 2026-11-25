@@ -418,7 +418,12 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     // fork (INKFLAGS): the whole gate in one op (2 kernels instead of 12) at decode/verify widths, with the weights read in
     // their stored type. LLAMA_INKLING2_GATE_FUSED=0 = the graph below.
     static const bool gate_fused = [] { const char * e = getenv("LLAMA_INKLING2_GATE_FUSED"); return !e || atoi(e) != 0; }();
-    if (gate_fused && n_tokens <= 8 && loop.ctrl_gain[ctrl]->type == loop.ctrl_forget[ctrl]->type &&
+    // fork: the same op at prompt widths (2 kernels per gate instead of ~16, F32 math instead of BF16 GEMMs), for rank
+    // <= 64 (LGP_RMAX in ggml-cuda/inklg_pp.cu), without LoRA adapters (the graph below applies them). Opt-in (port, default
+    // off): LLAMA_INKLING2_GATE_PP=1; unset or 0 = the graph below at prompt widths
+    static const bool gate_pp = [] { const char * e = getenv("LLAMA_INKLING2_GATE_PP"); return e && atoi(e) != 0; }();
+    if (gate_fused && (n_tokens <= 8 || (gate_pp && (loras == nullptr || loras->empty()) && loop.ctrl_down[ctrl]->ne[1] <= 64)) &&
+            loop.ctrl_gain[ctrl]->type == loop.ctrl_forget[ctrl]->type &&
             loop.ctrl_down[ctrl]->type == loop.ctrl_gain[ctrl]->type && ggml_is_contiguous(loop.ctrl_down[ctrl]) &&
             (loop.ctrl_down[ctrl]->type == GGML_TYPE_F32 || loop.ctrl_down[ctrl]->type == GGML_TYPE_F16 ||
              loop.ctrl_down[ctrl]->type == GGML_TYPE_BF16)) {
@@ -433,18 +438,22 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
 }
 
-ggml_tensor * llama_model_inkling2::graph::build_inputs() {
+ggml_tensor * llama_model_inkling2::graph::build_inputs(bool embd, bool out_ids) {
     inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa, hparams.n_relative_extent_mid);
     attn = inp->get_attn();
     recr = inp->get_recr();
 
     ggml_tensor * inp_pos = build_inp_pos();
-    inp_out_ids = build_inp_out_ids();
+    inp_out_ids = out_ids ? build_inp_out_ids() : nullptr;
 
     // log-scaled positions: 1 + alpha*log(max(1, (pos + 1)/floor)), multiplies q and r of the full-attention layers
     tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, inp_pos, GGML_TYPE_F32), 1.0f, 1.0f);
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
+
+    if (!embd) {
+        return nullptr;
+    }
 
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
 

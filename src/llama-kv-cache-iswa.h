@@ -183,6 +183,15 @@ public:
     const llama_kv_cache_context * get_swa()     const;
     const llama_kv_cache_context * get_swa_mid() const;
 
+    // [INKB1] layer-major prompt (llama_memory_hybrid_iswa_context::ink_b1_*): the base keeps the B1 view (n_kv and the
+    // SJ-KVaRN seal bookkeeping; the cells of later ubatches hold larger positions, which the causal rule hides), the
+    // SWA half also its cell metadata, since it reuses cells within the call
+    bool ink_b1_supported() const;
+    void ink_b1_save();
+    bool ink_b1_seek(size_t i);
+    bool ink_b1_undo_mark(); // before the first apply: the base keeps the cells it fills, the SWA half all its cells
+    void ink_b1_undo();
+
 private:
     //llama_kv_cache_iswa * kv;
 

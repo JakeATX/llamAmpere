@@ -16770,10 +16770,11 @@ struct test_ink_qkvnorm : public test_case {
 struct test_loop_gate : public test_case {
     const int64_t n, R, T;
     const ggml_type wt;
+    const bool mixed; // fork: x contiguous and m strided, as the model passes them at prompt widths
 
-    test_loop_gate(int64_t n, int64_t R, int64_t T, ggml_type wt) : n(n), R(R), T(T), wt(wt) {}
+    test_loop_gate(int64_t n, int64_t R, int64_t T, ggml_type wt, bool mixed = false) : n(n), R(R), T(T), wt(wt), mixed(mixed) {}
 
-    std::string vars() override { return VARS_TO_STR4(n, R, T, wt); }
+    std::string vars() override { return VARS_TO_STR5(n, R, T, wt, mixed); }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * xm     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 3, T);
@@ -16783,13 +16784,18 @@ struct test_loop_gate : public test_case {
         ggml_set_name(xm, "xm");
         ggml_tensor * x = ggml_view_2d(ctx, xm, n, T, xm->nb[2], 0);
         ggml_tensor * m = ggml_view_2d(ctx, xm, n, T, xm->nb[2], 2*xm->nb[1]);
+        if (mixed) {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, T);
+            ggml_set_name(x, "xc");
+        }
         return ggml_loop_gate(ctx, x, m, down, gain, forget, 1e-6f);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // weights ~ U(-0.05, 0.05): gate products of order 1, tanh away from saturation
-            init_tensor_uniform(t, strcmp(t->name, "xm") == 0 ? -4.0f : -0.05f, strcmp(t->name, "xm") == 0 ? 4.0f : 0.05f);
+            const bool act = strcmp(t->name, "xm") == 0 || strcmp(t->name, "xc") == 0;
+            init_tensor_uniform(t, act ? -4.0f : -0.05f, act ? 4.0f : 0.05f);
         }
     }
 };
@@ -23351,6 +23357,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 1024, 1, 1 }));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 33, 256, 1, 1 }));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 17, 65537, 1, 1 }));
+    // fork GGML_CUDA_SUM_ROWS_SHORT: one thread per row up to 32 columns (the DSpark feature mix is 4 x 2304 x 64)
+    test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 4, 2304, 64, 1 }));
+    test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 1, 9001, 1, 1 }));
+    test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 31, 3000, 2, 1 }));
+    test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 32, 4096, 1, 1 }));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_group_norm(GGML_TYPE_F32, {3, 1, 1, 65537}, 1));
@@ -23673,6 +23684,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_ink_kvstore(20, 1, GGML_TYPE_I64));
+    // fork LLAMA_INKLING2_GATE_PP: prompt widths (row tiles of 32 with tails, k splits, one-split short rows, R < 64,
+    // the top of the dynamic-ub ladder, x and m with different strides)
+    for (ggml_type wt : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        for (int64_t T : {9, 33, 241, 1024}) {
+            test_cases.emplace_back(new test_loop_gate(2304, 64, T, wt));
+        }
+    }
+    test_cases.emplace_back(new test_loop_gate(2304, 64, 2048, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_loop_gate(2304, 64, 4096, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_loop_gate(2304, 64, 1024, GGML_TYPE_BF16, true));
+    test_cases.emplace_back(new test_loop_gate(100, 24, 70, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_loop_gate(100, 24, 70, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_loop_gate(90, 24, 40, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_loop_gate(64, 61, 9, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_loop_gate(1000, 61, 17, GGML_TYPE_BF16));
     // GGML_LSA_ULSE_COOP=1 lane-shared kernel: d 128/256 (16/32 lanes per cell), a partial last CTA, 1..8 rows (n_kv must divide by F)
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 5, 16, 128));
     test_cases.emplace_back(new test_lsa_unit_lse(4144, 3, 1, 256));

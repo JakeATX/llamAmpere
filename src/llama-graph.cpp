@@ -1958,10 +1958,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (inp_attn->self_attn_mask.raw && inp_attn->self_attn_mask.raw->buffer) {
-        attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
+        llm_attn_mask m = inp_attn->self_attn_mask;
+        if (ink_b1_bound & INK_B1_MASK) {
+            m.raw = nullptr; // [INKB1] bound: only the kv rows
+        }
+        attn_ctx->get_base()->set_input_attn_mask(m, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos->buffer) {
+    if (self_rel_pos->buffer && !(ink_b1_bound & INK_B1_REL_POS)) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
@@ -1972,10 +1976,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
-        attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
+        llm_attn_mask m = inp_attn->self_attn_mask_swa;
+        if (ink_b1_bound & INK_B1_MASK_SWA) {
+            m.raw = nullptr;
+        }
+        attn_ctx->get_swa()->set_input_attn_mask(m, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos_swa->buffer) {
+    if (self_rel_pos_swa->buffer && !(ink_b1_bound & INK_B1_REL_POS_SWA)) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
@@ -1998,7 +2006,9 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     int64_t far_end = -1;
     if (self_sj_far_mask && self_sj_far_mask->buffer) {
-        far_end = attn_ctx->get_base()->set_input_sj_far_mask(self_sj_far_mask, ubatch, extent);
+        far_end = (ink_b1_bound & INK_B1_FAR_MASK) ? ink_b1_far_end :
+                attn_ctx->get_base()->set_input_sj_far_mask(self_sj_far_mask, ubatch, extent);
+        ink_b1_far_end = far_end;
     }
 
     if (inkrel.on && inkrel.far_mask->buffer) {
@@ -10276,12 +10286,35 @@ ggml_tensor * llm_graph_context::build_attn_rel_chunked(
     };
     // the per-head mask of rows [t0, t0 + n): [n_kv, n, n_head, ns] F16
     auto head_mask = [&](int64_t t0, int64_t n) {
+        auto mask_rows = [&]() {
+            return shared_rows(mask, t0, n, [&](ggml_tensor * t) {
+                return ggml_view_4d(ctx0, t, n_kv, n, 1, ns, t->nb[1], t->nb[2], t->nb[3], t0*t->nb[1]); });
+        };
+        ggml_tensor * m = nullptr;
+        // the mask rows view goes into the graph before the bias chain: a fresh view node would otherwise land between
+        // the bias copy and the mask cast, and the CUDA backend fuses the chain (inkmask.cu) only as one unbroken node
+        // run. A one-visit graph (INKB1) and the first full-attention layer of a graph make that view fresh.
+        // Port: LLAMA_INKMASK_ORDER=1 the new order, 0 the old order; unset follows LLAMA_INK_B1 (part of the gated
+        // layer-major config), so with INKB1 off the graph is the cand base's.
+        static const bool mask_first = [] {
+            const char * e = getenv("LLAMA_INKMASK_ORDER");
+            if (e && *e) {
+                return atoi(e) != 0;
+            }
+            const char * b1 = getenv("LLAMA_INK_B1");
+            return b1 && atoi(b1) != 0;
+        }();
+        if (mask_first) {
+            m = mask_rows();
+            ggml_build_forward_expand(gf, m);
+        }
         ggml_tensor * tb = rows(table, t0, n);                                              // [n_head, E+1, n*ns]
         ggml_tensor * b  = ggml_get_rows(ctx0, tb, shared_rows(rel_pos, t0, n, [&](ggml_tensor * t) { return rows2(t, t0, n); }));
         b = ggml_reshape_4d(ctx0, b, n_head, n_kv, n, ns);
         b = ggml_cont(ctx0, ggml_permute(ctx0, b, 2, 0, 1, 3));                              // [n_kv, n, n_head, ns]
-        ggml_tensor * m = shared_rows(mask, t0, n, [&](ggml_tensor * t) {
-            return ggml_view_4d(ctx0, t, n_kv, n, 1, ns, t->nb[1], t->nb[2], t->nb[3], t0*t->nb[1]); });
+        if (!mask_first) {
+            m = mask_rows(); // the cand base order
+        }
         m = mask->type == GGML_TYPE_F32 ? ggml_cont(ctx0, m) : ggml_cast(ctx0, m, GGML_TYPE_F32);
         m = ggml_add(ctx0, b, m);
         return cparams.flash_attn ? ggml_cast(ctx0, m, GGML_TYPE_F16) : m;
