@@ -834,6 +834,62 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {{tensor->ne[axis], 1}};
     };
 
+    // AI+ weights (ggml.h) put extra constraints on a tensor-split slice, in elements along the split axis:
+    //   - AITk tiles (32 x 512 chunks): K slices in whole 1024-K row-scale blocks (the kernels need K % 1024 == 0); M slices
+    //     in whole 1024-row groups, because every 32 row tiles carry one full copy of the column scales and the kernels
+    //     read them from rows 0..1023 of the slice (M >= 1024).
+    //   - unit / U2 / AIF types (16-row units): M slices in whole 16-row units; K slices in whole blocks and whole rotation
+    //     blocks (H256 when K % 256 == 0, so a slice must keep K % 256 == 0; an H128 tensor cannot be K-split safely).
+    // The constraint must hold for every tensor of a split group (FFN, linear attention, attention), so it is folded into
+    // the group granularity below. LLAMA_SM_TENSOR_AI_GRAN=0 turns this off (old behaviour, aborts in the AIT kernels).
+    static const bool ai_gran_on = [] { const char * e = getenv("LLAMA_SM_TENSOR_AI_GRAN"); return !(e && e[0] == '0'); }();
+    auto ai_split_req = [&](const ggml_tensor * t, int axis) -> int64_t {
+        if (!ai_gran_on || t == nullptr) {
+            return 1;
+        }
+        const ggml_type type = t->type;
+        if (ggml_ait_rate(type) != 0) {
+            return 1024;
+        }
+        if (ggml_ai4_rate(type) != 0 || type == GGML_TYPE_AIF25_U || type == GGML_TYPE_AIF25_U2 || type == GGML_TYPE_AIF175_U2 ||
+                type == GGML_TYPE_AIF25_U2_512) {
+            if (axis == 1) {
+                return 16;
+            }
+            if (t->ne[0] % 256 != 0) {
+                return t->ne[0]; // H128 rotation: a slice with K % 256 == 0 would switch to H256, keep it whole
+            }
+            return std::lcm<int64_t>(256, ggml_blck_size(type));
+        }
+        return 1;
+    };
+    auto ai_layer_req = [&](uint32_t il, std::initializer_list<std::pair<const char *, int>> names) -> int64_t {
+        int64_t req = 1;
+        for (const auto & [name, axis] : names) {
+            req = std::lcm(req, ai_split_req(ud->model->get_tensor(("blk." + std::to_string(il) + "." + name).c_str()), axis));
+        }
+        return req;
+    };
+    // standard attention: the smallest number of KV heads per split unit that meets the AI+ constraints of every
+    // attention tensor of the layer (the Q rows are counted without a Q gate, which is stricter)
+    auto ai_attn_heads = [&](uint32_t il) -> int64_t {
+        if (!ai_gran_on || hparams.is_recr(il) || hparams.n_head_kv(il) == 0) {
+            return 1;
+        }
+        const int64_t hd_k = hparams.n_embd_head_k(il), hd_v = hparams.n_embd_head_v(il), n_gqa = hparams.n_gqa(il);
+        const std::pair<const char *, int64_t> rows[] = {   // tensor, elements per KV head along its split axis
+            {"attn_q.weight", n_gqa*hd_k}, {"attn_k.weight", hd_k}, {"attn_v.weight", hd_v}, {"attn_qkv.weight", hd_k},
+            {"attn_output.weight", n_gqa*hd_v},
+        };
+        int64_t h = 1;
+        for (const auto & [name, per_head] : rows) {
+            const ggml_tensor * t = ud->model->get_tensor(("blk." + std::to_string(il) + "." + name).c_str());
+            const int64_t req = ai_split_req(t, std::string(name) == "attn_output.weight" ? 0 : 1);
+            h = std::lcm(h, req / std::gcd(req, per_head));
+        }
+        return h;
+    };
+
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (is_glm5_next && hparams.is_recr(il)) {
@@ -871,7 +927,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         } else if (hparams.is_recr(il)) {
             // linear attention
             const int64_t head_dim        = hparams.ssm_d_state;
-            const int64_t blck_size_perf  = std::lcm(blck_size, 128);
+            const int64_t blck_size_perf  = std::lcm(std::lcm(blck_size, int64_t(128)), ai_layer_req(il,
+                {{"attn_qkv.weight", 1}, {"attn_gate.weight", 1}, {"attn_qkv_gate.weight", 1}, {"ssm_out.weight", 0}}));
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
                     std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight) ||
@@ -902,8 +959,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             while (blck_size_perf < 128 && blck_size_perf*ud->n_devices < n_embd_q) {
                 blck_size_perf *= 2;
             }
+            const int64_t ai_h = ai_attn_heads(il);
+            if (ai_h > 1) {
+                blck_size_perf = std::lcm(blck_size_perf, ai_h*int64_t(n_embd_q));
+            }
 
             const int64_t granularity_q    = std::lcm(n_embd_q, blck_size_perf);
+            // gated Q (Q and gate interleaved per head): twice the Q unit, so the gated Q keeps the same KV-head groups as
+            // K/V. With an AI+ head unit the old lcm(2*n_embd_q, blck_size_perf) can be half the K/V groups (h even).
+            const int64_t granularity_qg   = ai_h > 1 ? 2*granularity_q : std::lcm(2*int64_t(n_embd_q), blck_size_perf);
             const int64_t granularity_head = granularity_q / hparams.n_embd_head_k(il); // for tensors with one value per head
             if (std::regex_match(tensor_name, pattern_attn_gate_bias)) {
                 GGML_ASSERT(segments.size() == 1);
@@ -941,7 +1005,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF || ud->model->arch == LLM_ARCH_CLOVER_MOE ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
-                    return {std::lcm(2*n_embd_q, blck_size_perf)};
+                    return {granularity_qg};
                 }
                 return {granularity_q};
             }
@@ -975,7 +1039,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF || ud->model->arch == LLM_ARCH_CLOVER_MOE ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
-                    return {std::lcm(2*n_embd_q, blck_size_perf), granularity_kv};
+                    return {granularity_qg, granularity_kv};
                 }
                 if (segments.size() == 3) {
                     // uneven K/V head sizes: per-segment granularity, V aligned to whole V heads
@@ -994,7 +1058,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            const int64_t blck_size_perf = std::lcm(std::lcm(blck_size, int64_t(128)), ai_layer_req(il,
+                {{"ffn_gate.weight", 1}, {"ffn_up.weight", 1}, {"ffn_gate_up.weight", 1}, {"ffn_down.weight", 0},
+                 {"ffn_gate_exps.weight", 1}, {"ffn_up_exps.weight", 1}, {"ffn_gate_up_exps.weight", 1}, {"ffn_down_exps.weight", 0},
+                 {"ffn_gate_shexp.weight", 1}, {"ffn_up_shexp.weight", 1}, {"ffn_down_shexp.weight", 0}}));
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
         }
@@ -1043,6 +1110,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
     }
 
+    // AI+ attention weights whose constraints leave fewer split units than devices (e.g. an AITk attn_k with 4 KV heads
+    // x 256 = 1024 rows: a slice needs 1024 rows, so 4 heads per unit) run the attention of that layer replicated
+    if (is_attention_tensor && !hparams.is_recr(tc.il) && hparams.n_head_kv(tc.il) > 0 &&
+            (int64_t(hparams.n_head_kv(tc.il)) < ai_attn_heads(tc.il) * int64_t(ud->n_devices) ||
+             int64_t(hparams.n_head_kv(tc.il)) % ai_attn_heads(tc.il) != 0)) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
+
+    // SJ-KVaRN seals whole KV heads into a mirrored body and its attention kernels index records from head 0,
+    // so the attention subgraph runs replicated on every device; the FFN stays tensor-split
+    if (ud->sj_kvarn && is_attention_tensor && !hparams.is_recr(tc.il)) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
+
     if (exl3_side != EXL3_SIDE_NONE) {
         const bool follows = exl3_side == EXL3_SIDE_SUH ? tc.axis == GGML_BACKEND_SPLIT_AXIS_0 : tc.axis == GGML_BACKEND_SPLIT_AXIS_1;
         tc.axis = follows ? GGML_BACKEND_SPLIT_AXIS_0 : GGML_BACKEND_SPLIT_AXIS_MIRRORED;
@@ -1071,12 +1152,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 g = std::lcm(g, g_exl3);
             }
         }
+        // the tensor's own AI+ constraint; a no-op for the grouped tensors above, needed for the ungrouped ones (output)
+        if (const int64_t g_ai = ai_split_req(self_ref, split_state.axis); g_ai > 1) {
+            for (int64_t & g : granularity) {
+                g = std::lcm(g, g_ai);
+            }
+        }
+        const int64_t g_self_ai = ai_split_req(self_ref, split_state.axis);
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
             const int64_t  g_s  = granularity[is];
 
             GGML_ASSERT(g_s > 0);
+            if (g_self_ai > 1 && ne_s % g_s != 0) {
+                // a partial last unit would start the next segment's slices off an AI+ unit boundary
+                GGML_ABORT("cannot tensor-split %s: segment %zu (%lld) is not a multiple of its AI+ split unit %lld",
+                        tensor_name.c_str(), is, (long long) ne_s, (long long) g_s);
+            }
             const int64_t n_units = (ne_s + g_s - 1) / g_s;
             if (n_units < (int64_t) ud->n_devices) {
                 if (n_units == 1) {
@@ -4313,6 +4406,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.fit_ram                     =*/ false,
+        /*.sj_kvarn                    =*/ false,
     };
 
     return result;

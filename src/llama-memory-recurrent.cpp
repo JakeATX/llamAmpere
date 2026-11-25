@@ -56,8 +56,11 @@ llama_memory_recurrent::llama_memory_recurrent(
     {
         const char * env = getenv("LLAMA_GDN_REPLAY");
         const bool   env_forces = env != nullptr && strcmp(env, "0") != 0;
+        // tensor split: replay storage has no split rules (see llama_context), so LLAMA_GDN_REPLAY may not force it on
+        const char * env_sm   = getenv("LLAMA_SM_TENSOR_GDN_REPLAY");
+        const bool   sm_veto  = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !(env_sm && env_sm[0] == '1');
         this->gdn_replay = n_rs_seq > 0 && hparams.n_embd_s_ingredient() > 0 &&
-            (gdn_replay_req || env_forces);
+            (gdn_replay_req || (env_forces && !sm_veto));
     }
     replay_len.assign(n_seq_max, 0);
     ckpt_span.assign(n_seq_max, 0);

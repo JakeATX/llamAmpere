@@ -469,6 +469,8 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+    // smallest free/total memory of the devices of a meta device (GGML_BACKEND_DEVICE_TYPE_META)
+    GGML_API void ggml_backend_meta_device_get_memory_min(ggml_backend_dev_t dev, size_t * free, size_t * total);
 
     //
     // Utils

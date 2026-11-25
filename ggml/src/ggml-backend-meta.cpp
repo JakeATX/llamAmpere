@@ -109,6 +109,25 @@ static void ggml_backend_meta_device_get_memory(ggml_backend_dev_t dev, size_t *
     }
 }
 
+// the smallest free and total memory of any simple device: a tensor-split buffer allocates its largest slice on every
+// device, so this (not the sum above) is the budget a fit must compare a meta buffer size against
+void ggml_backend_meta_device_get_memory_min(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    *free  = SIZE_MAX;
+    *total = SIZE_MAX;
+    for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
+        size_t tmp_free, tmp_total;
+        ggml_backend_dev_memory(simple_dev, &tmp_free, &tmp_total);
+        *free  = std::min(*free,  tmp_free);
+        *total = std::min(*total, tmp_total);
+    }
+    if (meta_dev_ctx->simple_devs.empty()) {
+        *free  = 0;
+        *total = 0;
+    }
+}
+
 static enum ggml_backend_dev_type ggml_backend_meta_device_get_type(ggml_backend_dev_t dev) {
     return GGML_BACKEND_DEVICE_TYPE_META;
 
@@ -322,6 +341,64 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
     return max_alloc_size;
 }
 
+// Size of what alloc_buffer_n would allocate on its LARGEST device: each device gets its own slice of every split tensor
+// (the default per-tensor get_alloc_size counts every tensor whole on every device, so a no-alloc dry run such as the
+// fit saw the whole model on each card). Mirrored / unsplit tensors count whole on every device. GGML_META_ALLOC_SIZE_N=0
+// restores the old whole-tensor estimate.
+static size_t ggml_backend_meta_buffer_type_get_alloc_size_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
+    static const bool on = [] { const char * e = getenv("GGML_META_ALLOC_SIZE_N"); return !(e && e[0] == '0'); }();
+    const size_t n_bufs = ggml_backend_meta_buft_n_bufts(buft);
+    if (!on || n_tensors <= 0) {
+        size_t total = 0;
+        for (int i = 0; i < n_tensors; i++) {
+            total += GGML_PAD(ggml_backend_meta_buffer_type_get_alloc_size(buft, tensors[i]), ggml_backend_meta_buffer_type_get_alignment(buft));
+        }
+        return total;
+    }
+    const ggml_backend_dev_t dev = buft->device;
+    const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    const ggml_init_params params = {
+        /*.mem_size   =*/ (size_t) n_tensors * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    size_t max_size = 0;
+    for (size_t j = 0; j < n_bufs; j++) {
+        ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx);
+        std::vector<ggml_tensor *> slices;
+        slices.reserve(n_tensors);
+        for (int i = 0; i < n_tensors; i++) {
+            const ggml_tensor * t = tensors[i];
+            int64_t ne[GGML_MAX_DIMS];
+            for (int k = 0; k < GGML_MAX_DIMS; k++) {
+                ne[k] = t->ne[k];
+            }
+            if (t->view_src == nullptr && ggml_nelements(t) != 0) {
+                const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(t, dev_ctx->get_split_state_ud);
+                if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                    int64_t n = 0;
+                    for (size_t s = 0; s < ss.n_segments; s++) {
+                        n += ss.ne[s*n_bufs + j] * ss.nr[s];
+                    }
+                    ne[ss.axis] = n;
+                }
+            }
+            ggml_tensor * tj = ggml_new_tensor(ctx, t->type, GGML_MAX_DIMS, ne);
+            tj->op = t->op;
+            ggml_set_name(tj, t->name);
+            if (t->view_src == nullptr && ggml_nelements(tj) != 0) {
+                slices.push_back(tj);
+            }
+        }
+        const size_t size_j = slices.empty() ? 0 :
+            ggml_backend_buft_get_alloc_size_n(ggml_backend_meta_buft_simple_buft(buft, j), slices.data(), (int) slices.size());
+        max_size = std::max(max_size, size_j);
+        ggml_free(ctx);
+    }
+    return max_size;
+}
+
 static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
     for (size_t i = 0; i < n_simple_bufts; i++) {
@@ -339,7 +416,7 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
     /* .get_alignment       = */ ggml_backend_meta_buffer_type_get_alignment,
     /* .get_max_size        = */ ggml_backend_meta_buffer_type_get_max_size,
     /* .get_alloc_size      = */ ggml_backend_meta_buffer_type_get_alloc_size,
-    /* .get_alloc_size_n    = */ NULL,
+    /* .get_alloc_size_n    = */ ggml_backend_meta_buffer_type_get_alloc_size_n,
     /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
 };
 
@@ -425,6 +502,9 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_simple_tensor_container stc_compute[2];
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
+    // a container is reset on its next allocation, not when another graph starts computing:
+    // two contexts (MTP target + draft) share this buffer and reuse graphs across each other's computes
+    bool stc_compute_dirty[2] = {true, true};
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // FIXME
@@ -453,6 +533,13 @@ struct ggml_backend_meta_buffer_context {
         if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
             return stc_static;
         }
+        if (stc_compute[stc_compute_index].simple_tensors.find(tensor) != stc_compute[stc_compute_index].simple_tensors.end()) {
+            return stc_compute[stc_compute_index];
+        }
+        // a reused graph can belong to the other container while a second context holds the current index
+        if (stc_compute[stc_compute_index ^ 1].simple_tensors.find(tensor) != stc_compute[stc_compute_index ^ 1].simple_tensors.end()) {
+            return stc_compute[stc_compute_index ^ 1];
+        }
         return stc_compute[stc_compute_index];
     }
 };
@@ -476,6 +563,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -484,7 +573,12 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
     if (it == stc.simple_tensors.end()) {
-        return nullptr;
+        // a reused graph (MTP target + draft) can outlive the container rotation and lose its registration:
+        // re-register the still-live tensor on demand instead of returning null
+        ggml_backend_meta_simple_tensor_container & cur = buf_ctx->stc_compute[buf_ctx->stc_compute_index];
+        ggml_backend_meta_buffer_init_tensor_impl(cur, const_cast<ggml_tensor *>(tensor));
+        it = cur.simple_tensors.find(tensor);
+        GGML_ASSERT(it != cur.simple_tensors.end());
     }
     return it->second[index];
 }
@@ -880,6 +974,33 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        {
+            const bool ok = src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_1 && (src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 ||
+                src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            if (!ok) {
+                // say which input broke the split contract (name, op, axis, and the op/axis chain of the state)
+                for (int i = 0; i < 6; i++) {
+                    const ggml_tensor * t = tensor->src[i];
+                    GGML_LOG_ERROR("%s: gated_delta_net %s src[%d] %s op %s ne [%lld %lld %lld %lld] axis %d\n", __func__,
+                        tensor->name, i, t ? t->name : "-", t ? ggml_op_desc(t) : "-", t ? (long long) t->ne[0] : 0LL,
+                        t ? (long long) t->ne[1] : 0LL, t ? (long long) t->ne[2] : 0LL, t ? (long long) t->ne[3] : 0LL, (int) src_ss[i].axis);
+                }
+                int depth = 0;
+                for (const ggml_tensor * t = tensor->src[5]; t != nullptr && depth < 12; t = t->src[0] ? t->src[0] : t->view_src, depth++) {
+                    GGML_LOG_ERROR("%s:   state chain: %s op %s ne [%lld %lld %lld %lld] view_src %s\n", __func__, t->name, ggml_op_desc(t),
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                        t->view_src ? t->view_src->name : "-");
+                    if (t->src[0] == nullptr && t->view_src == nullptr) {
+                        break;
+                    }
+                    if (t->src[0] == nullptr && t->view_src == t) {
+                        break;
+                    }
+                }
+            }
+        }
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
@@ -1133,7 +1254,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_TURBO_WHT: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+                // the rotation mixes whole dim-0 groups; the optional InnerQ scale is a mirrored parameter
+                GGML_ASSERT(tensor->src[1] == nullptr || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = handle_per_row(src_ss);
+            } break;
+            case GGML_OP_SJKVARN_SEAL: {
+                // the seal packs whole KV heads into the mirrored body, so the attention subgraph runs replicated
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
@@ -1406,7 +1536,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
-    return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index];
+    if (buf_ctx->stc_compute_dirty[buf_ctx->stc_compute_index]) {
+        for (ggml_context_ptr & ctx : stc.ctxs) {
+            ggml_reset(ctx.get());
+        }
+        stc.simple_tensors.clear();
+        buf_ctx->stc_compute_dirty[buf_ctx->stc_compute_index] = false;
+    }
+    return ggml_backend_meta_buffer_init_tensor_impl(stc, tensor);
 }
 
 // EXL3 trellis weights are stored k-tile-major, [K/16][N/16][tile], one 16x16 tile per quant block (see ggml.h), so a
@@ -1501,11 +1639,56 @@ static void ggml_backend_meta_buffer_exl3_op(ggml_backend_buffer_t buffer, const
     }
 }
 
+// AI+ weights (ggml.h) are stored in row slabs: AITk in 32-row x 512-K chunks, the unit, U2 and AIF types in 16-row
+// units. Inside a slab the bytes run K-major in whole blocks, so a nominal ggml row is not a contiguous byte range. A
+// slice along axis 0 is a contiguous run inside every slab, so the axis-0 paths below step whole slabs (a slab is
+// `slab` nominal rows: slab*nb[1] bytes, a block column of it slab*nb[0] bytes). Axis-1 slices must hold whole slabs
+// (the split granularity in llama-model.cpp guarantees it). GGML_META_AI_SLAB=0 restores the nominal-row copy (wrong
+// for these types; kept only to reproduce the old behaviour).
+// An AITk row slice starts at a multiple of 1024 rows (32 row tiles) and its kernels read the column scales from its own
+// first 32 row tiles. That is only right if every group of 32 row tiles carries the same column scales, which the AI+
+// encoder writes (P76 AI4: all 206 AIT tensors). Check it on the host data before the slice is uploaded.
+static void ggml_backend_meta_ait_check_col_scales(const ggml_tensor * tensor, const uint8_t * data, size_t offset, size_t size) {
+    if (offset != 0 || size != ggml_nbytes(tensor) || tensor->ne[1] < 2048) {
+        return; // partial writes are not produced by the loader for split weights; one group has nothing to compare
+    }
+    const int     k  = ggml_ait_rate(tensor->type);
+    const int64_t S  = tensor->ne[0] / 512, G = tensor->ne[1] / 32;
+    const size_t  cb = 32 * (64 * (size_t) k + 2), cs_off = 2048 * (size_t) k + 32;
+    for (int64_t rt = 32; rt < G; rt++) {
+        for (int64_t ks = 0; ks < S; ks++) {
+            const uint8_t * a = data + (size_t) ((rt % 32) * S + ks) * cb + cs_off;
+            const uint8_t * b = data + (size_t) (rt * S + ks) * cb + cs_off;
+            if (memcmp(a, b, 32) != 0) {
+                GGML_ABORT("%s: AIT column scales differ between row-tile groups (row tile %lld, K slice %lld): "
+                    "this tensor cannot be tensor-split by rows", tensor->name, (long long) rt, (long long) ks);
+            }
+        }
+    }
+}
+
+static size_t ggml_backend_meta_slab_rows(const ggml_tensor * tensor) {
+    static const bool on = [] { const char * e = getenv("GGML_META_AI_SLAB"); return !(e && e[0] == '0'); }();
+    size_t slab = 1;
+    if (ggml_ait_rate(tensor->type) != 0) {
+        slab = 32;
+    } else if (ggml_ai4_rate(tensor->type) != 0 || tensor->type == GGML_TYPE_AIF25_U || tensor->type == GGML_TYPE_AIF25_U2 ||
+            tensor->type == GGML_TYPE_AIF175_U2 || tensor->type == GGML_TYPE_AIF25_U2_512) {
+        slab = 16;
+    }
+    if (!on || slab == 1) {
+        return 1;
+    }
+    GGML_ASSERT(tensor->ne[1] % (int64_t) slab == 0);
+    return slab;
+}
+
 static void ggml_backend_meta_buffer_memset_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state =
             ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    const size_t slab = ggml_backend_meta_slab_rows(tensor);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (ggml_exl3_bits(tensor->type) != 0 &&
@@ -1523,12 +1706,12 @@ static void ggml_backend_meta_buffer_memset_tensor(
         if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(tensor->ne[2] == 1);
 
-            const size_t row_stride = tensor->nb[1];
+            const size_t row_stride = tensor->nb[1]*slab;
             GGML_ASSERT(offset % row_stride == 0);
             GGML_ASSERT(size   % row_stride == 0);
             const int64_t row_start = offset / row_stride;
             const int64_t row_count = size   / row_stride;
-            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1]/(int64_t) slab);
 
             const int64_t blck_size = ggml_blck_size(tensor->type);
             for (size_t s = 0; s < split_state.n_segments; s++) {
@@ -1536,10 +1719,10 @@ static void ggml_backend_meta_buffer_memset_tensor(
                     for (size_t j = 0; j < n_bufs; j++) {
                         ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                         GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
+                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0]*slab;
                         for (int64_t row = 0; row < row_count; row++) {
                             ggml_backend_tensor_memset(simple_tensor, value,
-                                    simple_offsets[j] + (row_start + row)*simple_tensor->nb[1], nbytes);
+                                    simple_offsets[j] + (row_start + row)*simple_tensor->nb[1]*slab, nbytes);
                         }
                         simple_offsets[j] += nbytes;
                     }
@@ -1577,14 +1760,14 @@ static void ggml_backend_meta_buffer_memset_tensor(
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
-            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+            const size_t chunk_size_full = tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
             GGML_ASSERT(offset % chunk_size_full == 0);
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        / chunk_size_full;
             const int64_t i_stop  = (offset + size) / chunk_size_full;
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size = simple_tensor->nb[split_state.axis + 1];
+                const size_t chunk_size = simple_tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
                 if (chunk_size == 0) {
                     continue;
                 }
@@ -1612,6 +1795,10 @@ static void ggml_backend_meta_buffer_memset_tensor(
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    const size_t slab = ggml_backend_meta_slab_rows(tensor);
+    if (ggml_ait_rate(tensor->type) != 0 && split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) {
+        ggml_backend_meta_ait_check_col_scales(tensor, (const uint8_t *) data, offset, size);
+    }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (ggml_exl3_bits(tensor->type) != 0 &&
@@ -1630,12 +1817,12 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(tensor->ne[2] == 1);
 
-            const size_t row_stride = tensor->nb[1];
+            const size_t row_stride = tensor->nb[1]*slab;
             GGML_ASSERT(offset % row_stride == 0);
             GGML_ASSERT(size   % row_stride == 0);
             const int64_t row_start = offset / row_stride;
             const int64_t row_count = size   / row_stride;
-            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1]/(int64_t) slab);
 
             const int64_t blck_size = ggml_blck_size(tensor->type);
             for (size_t s = 0; s < split_state.n_segments; s++) {
@@ -1643,10 +1830,10 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     for (size_t j = 0; j < n_bufs; j++) {
                         ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                         GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
+                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0]*slab;
                         ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
-                            simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
-                            row_count, simple_tensor->nb[1], tensor->nb[1]);
+                            simple_offsets[j] + row_start * simple_tensor->nb[1]*slab, nbytes,
+                            row_count, simple_tensor->nb[1]*slab, tensor->nb[1]*slab);
                         offset_data       += nbytes;
                         simple_offsets[j] += nbytes;
                     }
@@ -1686,7 +1873,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
-            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+            const size_t chunk_size_full = tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
             GGML_ASSERT(offset % chunk_size_full == 0);
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
@@ -1694,7 +1881,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             size_t offset_j = 0;
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
                 if (chunk_size_j == 0) {
                     continue;
                 }
@@ -1746,6 +1933,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    const size_t slab = ggml_backend_meta_slab_rows(tensor);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (ggml_exl3_bits(tensor->type) != 0 &&
@@ -1764,12 +1952,12 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
             GGML_ASSERT(tensor->ne[2] == 1);
 
-            const size_t row_stride = tensor->nb[1];
+            const size_t row_stride = tensor->nb[1]*slab;
             GGML_ASSERT(offset % row_stride == 0);
             GGML_ASSERT(size   % row_stride == 0);
             const int64_t row_start = offset / row_stride;
             const int64_t row_count = size   / row_stride;
-            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1]/(int64_t) slab);
 
             const int64_t blck_size = ggml_blck_size(tensor->type);
             for (size_t s = 0; s < split_state.n_segments; s++) {
@@ -1777,10 +1965,10 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                     for (size_t j = 0; j < n_bufs; j++) {
                         const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                         GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
-                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
+                        const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0]*slab;
                         ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data,
-                            simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
-                            row_count, simple_tensor->nb[1], tensor->nb[1]);
+                            simple_offsets[j] + row_start * simple_tensor->nb[1]*slab, nbytes,
+                            row_count, simple_tensor->nb[1]*slab, tensor->nb[1]*slab);
                         offset_data       += nbytes;
                         simple_offsets[j] += nbytes;
                     }
@@ -1820,7 +2008,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
-            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+            const size_t chunk_size_full = tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
             GGML_ASSERT(offset % chunk_size_full == 0);
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
@@ -1828,7 +2016,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             size_t offset_j = 0;
             for (size_t j = 0; j < n_bufs; j++){
                 const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
                 if (chunk_size_j == 0) {
                     continue;
                 }
@@ -2085,13 +2273,14 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
+    const size_t slab = ggml_backend_meta_slab_rows(tensor);
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
-            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+            const size_t chunk_size_full = tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
             GGML_ASSERT(offset % chunk_size_full == 0);
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
@@ -2100,7 +2289,7 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             for (size_t j = 0; j < n_backends; j++){
                 ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
                 if (chunk_size_j == 0) {
                     continue;
                 }
@@ -2130,13 +2319,14 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
+    const size_t slab = ggml_backend_meta_slab_rows(tensor);
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
-            const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+            const size_t chunk_size_full = tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
             GGML_ASSERT(offset % chunk_size_full == 0);
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;
@@ -2145,7 +2335,7 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
             for (size_t j = 0; j < n_backends; j++){
                 ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
                 const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1]*(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 ? slab : 1);
                 if (chunk_size_j == 0) {
                     continue;
                 }
@@ -2209,11 +2399,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
-            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
-            for (ggml_context_ptr & ctx : stc.ctxs) {
-                ggml_reset(ctx.get());
-            }
-            stc.simple_tensors.clear();
+            // defer the reset to the next allocation into that container: a second context (MTP draft)
+            // may still reuse graphs registered there
+            buf_ctx->stc_compute_dirty[buf_ctx->stc_compute_index_next] = true;
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
