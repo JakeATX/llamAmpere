@@ -64,7 +64,7 @@ static int q8tc_tensor_mode(int mode, const ggml_tensor * w, bool group) {
 // tuned on a 3090 (300 W) at the NQ shapes: K = 2304 (9 chunks) -> 3 warps, 4 CTAs/SM; K = 3072 (12 chunks) -> 6 warps, 2 CTAs/SM
 // GGML_CUDA_Q8TC_IA=1 (Q8TC-HLF): mode 2 sums its hi / lo and k-step mmas in independent accumulators (no dependent
 // mma chain; closer to the f32 path, not bit-exact vs IA=0). Default 0 until gated.
-static bool q8tc_ia() {
+bool ggml_cuda_q8tc_ia() {
     static const bool p = [] { const char * e = getenv("GGML_CUDA_Q8TC_IA"); return e && atoi(e) == 1; }();
     return p;
 }
@@ -72,7 +72,7 @@ static bool q8tc_ia() {
 template <int NW, bool HILO, int MINB>
 static void q8tc_launch(const q8a16_args & a, int T, int nb, cudaStream_t st) {
     if constexpr (HILO) {
-        if (q8tc_ia()) {
+        if (ggml_cuda_q8tc_ia()) {
             k_q8tc3<NW, HILO, MINB, true><<<a.blk_end[a.n - 1], 32*NW, NW*16*68*sizeof(uint32_t), st>>>(a, nb, T);
             return;
         }
@@ -80,23 +80,31 @@ static void q8tc_launch(const q8a16_args & a, int T, int nb, cudaStream_t st) {
     k_q8tc3<NW, HILO, MINB><<<a.blk_end[a.n - 1], 32*NW, NW*16*68*sizeof(uint32_t), st>>>(a, nb, T);
 }
 
-bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, int nb, const ggml_tensor * w, bool group) {
+int ggml_cuda_q8tc_prep(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, int nb, const ggml_tensor * w, bool group) {
     const int mode = q8tc_tensor_mode(ggml_cuda_q8tc_mode(), w, group);
     if (mode == 0 || T < q8tc_min_t() || T > 8 || nb < 8 || nb % 8 != 0 || a.ids != nullptr || a.n < 1 ||
             !ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc)) { // compiled sm_80+ code, not only the card
-        return false;
+        return 0;
     }
     for (int k = 0; k < a.n; ++k) {
         // 16-byte aligned rows (cp.async chunks), float4 activation reads, no head-sized members
         if (a.srow[k] % 16 != 0 || (uintptr_t) a.vx[k] % 16 != 0 || (uintptr_t) a.x[k] % 16 != 0 || a.sx[k] % 4 != 0 ||
                 a.nrows[k] < 1 || a.nrows[k] > Q8TC_MAX_ROWS) {
-            return false;
+            return 0;
         }
     }
     uint32_t blk = 0;
     for (int k = 0; k < a.n; ++k) {
         blk += (uint32_t) ((a.nrows[k] + 15) / 16);
         a.blk_end[k] = blk;
+    }
+    return mode;
+}
+
+bool ggml_cuda_q8tc_try(ggml_backend_cuda_context & ctx, q8a16_args & a, int T, int nb, const ggml_tensor * w, bool group) {
+    const int mode = ggml_cuda_q8tc_prep(ctx, a, T, nb, w, group);
+    if (mode == 0) {
+        return false;
     }
     cudaStream_t st = ctx.stream();
     const bool few = nb/8 <= 9;
@@ -162,5 +170,7 @@ bool ggml_cuda_q8tc_wide(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 bool ggml_cuda_q8tc_try(ggml_backend_cuda_context &, q8a16_args &, int, int, const ggml_tensor *, bool) { return false; }
 bool ggml_cuda_q8tc_wide(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
+bool ggml_cuda_q8tc_ia() { return false; }
+int ggml_cuda_q8tc_prep(ggml_backend_cuda_context &, q8a16_args &, int, int, const ggml_tensor *, bool) { return 0; }
 
 #endif
