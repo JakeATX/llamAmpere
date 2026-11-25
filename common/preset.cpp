@@ -177,15 +177,17 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         // fork (INKSTACK): Inkling 2 Mini on a 24 GB card, one slot, the whole model on the GPU, DSpark drafter on.
         // -b 2048 -ub 1024 (ladder on): at -c 262144 the NQ file runs out of VRAM at ub 2048 (rc8b boot check, RELREADY),
         // and --parallel 1 keeps the server from picking 4 slots + a unified KV (500 on the first 262K request).
+        // LLAMA_RTB_COPYCTL=1: copy-first (span cap 32) under the cost-model controller; LLAMA_RTB_COPYCTL=0 turns it
+        // off. The server reads this key before the rest of the profile env (copy-first is resolved at model load).
         common_card_preset ink24 {
-            "24ink", "2026-11-23.1", "best known/recheck before ship", "", {
+            "24ink", "2026-11-24.1", "best known/recheck before ship", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "2048"},
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
                 {"--spec-draft-model", "@model/Inkling-2-Mini-ATX-Drafter-Q8_0.gguf"}, {"--spec-type", "draft-dspark"},
                 {"--spec-draft-ngl", "99"}, {"--spec-draft-ubatch", "64"}
             }, {
-                {"LLAMA_DEEPCTX_LADDER", "1"}
+                {"LLAMA_DEEPCTX_LADDER", "1"}, {"LLAMA_RTB_COPYCTL", "1"}
             }
         };
         std::vector<common_card_preset> cards {large, medium, small, tiny, ink8, ink10, ink12, ink24};

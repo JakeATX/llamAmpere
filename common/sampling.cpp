@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "sampling-hash.h"
 
 #include "../src/llama-ext.h" // staging sampler APIs
 
@@ -299,6 +300,87 @@ bool common_sampler_topk_exact_biased(
     }
     return true;
 }
+
+// LLAMA_RTB_HASHSAMPLE=1 (test mode, default off): the chain's final draw is a Gumbel-max keyed by (seed, output
+// index, token id), see sampling-hash.h. The output index counts the tokens this sampler accepted.
+bool common_sampler_rtb_hash_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_RTB_HASHSAMPLE");
+        return e && (strcmp(e, "1") == 0 || strcmp(e, "on") == 0 || strcmp(e, "true") == 0);
+    }();
+    return v;
+}
+
+namespace {
+struct rtb_hash_dist_ctx {
+    uint64_t seed;
+    uint64_t n; // tokens accepted so far
+};
+
+const char * rtb_hash_dist_name(const struct llama_sampler * /*smpl*/) {
+    return "rtb-hash-dist";
+}
+
+void rtb_hash_dist_accept(struct llama_sampler * smpl, llama_token /*token*/) {
+    ((rtb_hash_dist_ctx *) smpl->ctx)->n++;
+}
+
+void rtb_hash_dist_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    const auto * c = (const rtb_hash_dist_ctx *) smpl->ctx;
+    int64_t best = -1;
+    double  best_v = -INFINITY;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const float l = cur_p->data[i].logit;
+        if (!std::isfinite(l)) {
+            continue;
+        }
+        const double v = (double) l + rtb::hash_gumbel(c->seed, c->n, cur_p->data[i].id);
+        if (v > best_v) {
+            best_v = v;
+            best   = (int64_t) i;
+        }
+    }
+    cur_p->selected = best >= 0 ? best : 0;
+}
+
+void rtb_hash_dist_reset(struct llama_sampler * smpl) {
+    ((rtb_hash_dist_ctx *) smpl->ctx)->n = 0;
+}
+
+struct llama_sampler * rtb_hash_dist_clone(const struct llama_sampler * smpl);
+
+void rtb_hash_dist_free(struct llama_sampler * smpl) {
+    delete (rtb_hash_dist_ctx *) smpl->ctx;
+}
+
+void rtb_hash_dist_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+    ((rtb_hash_dist_ctx *) dst->ctx)->n = ((const rtb_hash_dist_ctx *) src->ctx)->n;
+}
+
+struct llama_sampler_i rtb_hash_dist_iface = {
+    /* .name              = */ rtb_hash_dist_name,
+    /* .accept            = */ rtb_hash_dist_accept,
+    /* .apply             = */ rtb_hash_dist_apply,
+    /* .reset             = */ rtb_hash_dist_reset,
+    /* .clone             = */ rtb_hash_dist_clone,
+    /* .free              = */ rtb_hash_dist_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ rtb_hash_dist_copy_state,
+};
+
+struct llama_sampler * rtb_hash_dist_init(uint32_t seed) {
+    return llama_sampler_init(&rtb_hash_dist_iface, new rtb_hash_dist_ctx { (uint64_t) seed, 0 });
+}
+
+struct llama_sampler * rtb_hash_dist_clone(const struct llama_sampler * smpl) {
+    const auto * c = (const rtb_hash_dist_ctx *) smpl->ctx;
+    return llama_sampler_init(&rtb_hash_dist_iface, new rtb_hash_dist_ctx { c->seed, c->n });
+}
+} // namespace
 
 static bool common_sampler_output_enabled() {
     static const bool enabled = [] {
@@ -647,7 +729,9 @@ struct common_sampler * common_sampler_init(
             const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
                 ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
                  (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
-            samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
+            samplers.push_back(greedy ? llama_sampler_init_greedy()
+                                      : (common_sampler_rtb_hash_enabled() ? rtb_hash_dist_init(params.seed)
+                                                                           : llama_sampler_init_dist(params.seed)));
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
