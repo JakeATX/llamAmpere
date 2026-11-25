@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-ink-headloan.h"
 #include "llama-ple-cache.h"
 
 #include "llama-arch.h"
@@ -3110,9 +3111,23 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             if (const char * pin = std::getenv("LLAMA_MTP_PIN_BORROWED_HOST"); pin && std::atoi(pin) != 0) {
                 params.tensor_borrow_from->pin_borrowed_host_tensor(donor);
             }
+            if (tn.tensor == LLM_TENSOR_OUTPUT) {
+                params.tensor_borrow_from->output_borrowed = true; // [HEADLOAN] a borrowed head is never lent
+            }
             tensors_by_name.emplace_back(donor->name, donor);
             return donor;
         }
+    }
+    // [HEADLOAN] (#247) LLAMA_INK_HEAD_LOAN=1: the head goes to host memory (no CPU repack); the context uploads
+    // it into a VRAM buffer of its own and lends that buffer to streamed prompts (llama-ink-headloan.h)
+    if (tn.tensor == LLM_TENSOR_OUTPUT && tn.bid == -1 && llama_ink_headloan_wanted(arch) && pimpl->dev_output.dev &&
+            ggml_backend_dev_type(pimpl->dev_output.dev) == GGML_BACKEND_DEVICE_TYPE_GPU && n_devices() == 1 &&
+            split_mode() != LLAMA_SPLIT_MODE_TENSOR && ggml_backend_dev_host_buffer_type(pimpl->dev_output.dev)) {
+        // the CPU runs a matmul from a host buffer (the GPU device rejects a weight in it); with mmap the loader keeps
+        // the head in a plain CPU buffer instead of the pinned one
+        const buft_list_t host_list = { { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), ggml_backend_dev_host_buffer_type(pimpl->dev_output.dev) } };
+        output_host_loan = true;
+        return ml.create_tensor(hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, &host_list, nullptr, tn, ne, flags);
     }
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {

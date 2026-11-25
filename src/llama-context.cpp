@@ -34,6 +34,7 @@
 #include "llama-mtp-chain-sample.h"
 #include "llama-moe-cache.h"
 #include "llama-ink-stream.h"
+#include "llama-ink-headloan.h"
 #include "llama-ink-host.h"
 #include "llama-b1.h"
 #include "llama-ple-prefetch.h"
@@ -46,6 +47,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <functional>
 #include <cstdlib>
 
 #include <cinttypes>
@@ -548,6 +550,12 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
             // used to read the target's layer input device buffer
             cparams.ctx_other = params.ctx_other;
         }
+    }
+
+    // [HEADLOAN] a context that reads another context's model (draft heads, MTP peers) may run that model's head: it is
+    // never lent then
+    if (cparams.ctx_other != nullptr && llama_get_model(cparams.ctx_other) != nullptr) {
+        llama_get_model(cparams.ctx_other)->output_borrowed = true;
     }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -1494,6 +1502,18 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        // [HEADLOAN] (#247): the head the loader kept in host memory goes into a VRAM buffer of its own before the MoE cache
+        // is sized, so the boot layout matches the head in the weight buffer; streamed prompts lend that buffer
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc() && llama_ink_headloan_wanted(model.arch) &&
+                !model.output_loaned && model.output && model.output->buffer && ggml_backend_buffer_is_host(model.output->buffer) &&
+                model.dev_output() && ggml_backend_dev_type(model.dev_output()) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ink_headloan = std::make_unique<llama_ink_headloan>(model.output, ggml_backend_dev_buffer_type(model.dev_output()));
+            if (!ink_headloan->ok()) {
+                ink_headloan.reset();
+            } else {
+                model.output_loaned = true; // one owner per model: a second context keeps the head where it is
+            }
+        }
         // fork (INKSMALL2): auto-size the MoE expert cache when the experts live in host memory (-cmoe / -ot ...=CPU) and
         // --moe-cache-mib was not given. Without a cache, Inkling 2 Mini on an 8-12 GB card decodes ~10 tok/s instead of
         // 48-99. Size = free device memory after the weights and KV minus a reserve for the compute buffer and its
@@ -1867,6 +1887,12 @@ void llama_context::ple_hint_add(const llama_token * window, int32_t n_window) {
 }
 
 llama_context::~llama_context() {
+    if (sched && (ckpt_async[0].pending || ckpt_async[1].pending)) { ggml_backend_sched_synchronize(sched.get()); } // [CKPTASYNC] no copy lands in freed staging
+    for (auto & c : ckpt_async) { if (c.buf) { ggml_backend_buffer_free(c.buf); } if (c.ev) { ggml_backend_event_free(c.ev); } }
+    if (ink_headloan) { // [HEADLOAN] the head points at its host copy again; the VRAM copy goes
+        ink_headloan.reset();
+        model.output_loaned = false;
+    }
     if (ink_stream) {
         ink_stream->disarm(); // its copy stream and events go before the backends
         ink_stream.reset();
@@ -3179,6 +3205,7 @@ void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+    ckpt_async_finish(); // [CKPTASYNC]
 
     if (mtp_pipe.pending) {
         // [RTPORT] the newest step waits on the card for its token: wait only for the step before it
@@ -6208,6 +6235,21 @@ static bool swa_full_rows_enabled(llm_arch arch) {
     return arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP;
 }
 
+// [RUNG] LLAMA_INK_STREAM_RUNG=N or HI:LO (multiples of 128, 128..2048; anything else = off) and LLAMA_INK_STREAM_HOLD
+// (checks, default 8, 0 = off). which: 0 = HI (0: rung off), 1 = LO (HI when no valid LO), 2 = hold
+static uint32_t ink_rung_env(int which) {
+    static const std::array<uint32_t, 3> v = [] {
+        auto ok = [](long x) { return x >= 128 && x <= 2048 && x % 128 == 0; };
+        const char * e = getenv("LLAMA_INK_STREAM_RUNG"); const char * c = e ? strchr(e, ':') : nullptr;
+        const long hi = e && e[0] ? strtol(e, nullptr, 10) : 0, lo = c ? strtol(c + 1, nullptr, 10) : 0;
+        const char * h = getenv("LLAMA_INK_STREAM_HOLD"); char * end = nullptr;
+        const long hold = h && h[0] ? strtol(h, &end, 10) : -1;
+        const uint32_t H = ok(hi) ? (uint32_t) hi : 0u;
+        return std::array<uint32_t, 3>{ H, H && ok(lo) ? (uint32_t) lo : H, hold >= 0 && end && *end == 0 ? (uint32_t) hold : 8u };
+    }();
+    return v[which];
+}
+
 bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_ext * batch,
         enum llama_decode_phase phase) {
     const char * rotate = getenv("LLAMA_MOE_CACHE_RELEASE_PROMPT");
@@ -6270,6 +6312,12 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         ink_refill = ink_refill || (!ink_stream->armed() && moe_cache && moe_cache->suspended() && (n_tokens == 0 || ++ink_retry % 64 == 0));
     }
     const bool ink_armed = ink_stream && ink_stream->armed();
+    // [HEADLOAN] an upload that failed at the release is retried (rate-limited like the cache refill above)
+    if (!ink_armed && ink_headloan && ink_headloan->is_lent() && (n_tokens == 0 || ++ink_head_retry % 64 == 0) &&
+            ink_headloan->restore()) {
+        LLAMA_LOG_WARN("%s: [HEADLOAN] head uploaded again (retry)\n", __func__);
+        sched_need_reserve = true;
+    }
     // refill the hot experts once the prompt scratch is back to its boot size
     auto ink_cache_refill = [&]() {
         if (!ink_refill || !moe_cache) {
@@ -6632,8 +6680,19 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                 const uint32_t allocated = std::max(1u, sched_reserve_tokens ? sched_reserve_tokens : cparams.n_ubatch);
                 uint32_t pick = 512;
                 double log_free = 0.0, log_need = 0.0; // the smallest ceiling above 512 that was tried
-                for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r /= 2) {
-                    bool fits = true;
+                // [RUNG] LLAMA_INK_STREAM_RUNG=N or HI:LO (multiples of 128, 128..2048; unset/0 = halving): the ceilings
+                // step down by N rows (HI above 1024 rows, LO at or below), so a card whose free VRAM sits between two
+                // powers of two (8 GB with the head lent: 1,536) streams fewer bytes per prompt token. Hysteresis
+                // (LLAMA_INK_STREAM_HOLD=N checks, default 8, 0 = off): a rise needs one more step of bytes spare; a
+                // lowered ceiling holds N checks or until free VRAM rises by more than one step.
+                const uint32_t rung_hi = ink_rung_env(0), rung_lo = ink_rung_env(1), rung_hold = ink_rung_env(2);
+                auto step_of = [&](uint32_t r) { return r > 1024 ? rung_hi : rung_lo; };
+                auto next_of = [&](uint32_t r) { return r > 1024 ? (r > 1024 + rung_hi ? r - rung_hi : 1024u) : (r > 512 + rung_lo ? r - rung_lo : 512u); };
+                const uint32_t prev_rows = dynamic_ubatch_rows;
+                const bool first_pick = ink_rung_changes == 0; // the take resets the ceiling to the top: its first cut arms no hold
+                double free_min = 1e30, step_bytes = 0.0;
+                for (uint32_t r = std::min(cparams.n_ubatch, 4096u); r > 512; r = rung_hi ? next_of(r) : r / 2) {
+                    bool fits = true, fits_bare = true;
                     for (auto backend : backend_ptrs) {
                         auto dev = ggml_backend_get_device(backend);
                         if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
@@ -6642,9 +6701,14 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                         const double margin = double(total >= (size_t(16) << 30) ? size_t(2) << 30 : size_t(64) << 20) +
                                 double(size_t(64) << 20);
                         const double bytes = double(ggml_backend_sched_get_buffer_size(sched.get(), backend));
+                        const double sb = rung_hi ? (bytes / allocated + per_row) * step_of(r) : 0.0; // one step's bytes
+                        free_min = std::min(free_min, double(free));
+                        if (r > prev_rows) { step_bytes = sb; } // ends as the step just above the current ceiling
                         if (r > allocated) {
+                            const double spare = rung_hi && rung_hold && r > prev_rows && !first_pick ? sb : 0.0;
                             log_free = double(free); log_need = bytes * (r - allocated) / allocated + per_row * r + margin;
-                            fits = fits && bytes * (r - allocated) / allocated + per_row * r + margin < double(free);
+                            fits = fits && log_need + spare < double(free);
+                            fits_bare = fits_bare && log_need < double(free);
                         } else {
                             // at or below the reserve: its pool is in use and counted in free; a smaller ceiling
                             // gets back its share of the compute buffer
@@ -6652,8 +6716,22 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
                         }
                     }
                     if (fits) { pick = r; break; }
+                    if (fits_bare && r > prev_rows) { pick = prev_rows; break; } // a rise short of its spare keeps the ceiling
+                }
+                if (rung_hi && rung_hold && !first_pick) {
+                    if (pick < prev_rows) {
+                        ink_rung_hold = rung_hold; ink_rung_hold_free = free_min;
+                    } else if (pick > prev_rows && ink_rung_hold > 0 && free_min <= ink_rung_hold_free + step_bytes) {
+                        pick = prev_rows; --ink_rung_hold; // a lowered ceiling holds
+                    } else if (ink_rung_hold > 0) {
+                        ink_rung_hold = pick > prev_rows ? 0 : ink_rung_hold - 1; // free VRAM rose by a step: hold ends
+                    }
                 }
                 dynamic_ubatch_rows = std::min(pick, std::max(512u, std::min(cparams.n_ubatch, 4096u)));
+                if (rung_hi && dynamic_ubatch_rows != prev_rows) {
+                    LLAMA_LOG_WARN("%s: [RUNG] t=%.3f s ceiling %u -> %u rows (change %u this prompt, free %.0f MiB, hold %u)\n", __func__,
+                            (ggml_time_us() - ink_stream_t0_us)/1e6, prev_rows, dynamic_ubatch_rows, ++ink_rung_changes, free_min/1048576.0, ink_rung_hold);
+                }
                 if (log_need > 0.0) {
                     LLAMA_LOG_WARN("%s: [INKSTREAM] ceiling %u rows (reserved %u; next step needs %.0f MiB, free %.0f MiB)\n",
                                    __func__, dynamic_ubatch_rows, allocated, log_need / 1048576.0, log_free / 1048576.0);
@@ -6804,6 +6882,10 @@ bool llama_context::ink_stream_take() {
         return false;
     }
     ink_stream_fails = 0;
+    ink_rung_changes = 0; ink_rung_hold = 0; // [RUNG] counts per prompt
+    // [HEADLOAN] the prompt needs the head for its last row only: it runs from host memory while the streamer is armed
+    // (not when a draft model shares the head tensor)
+    const bool head_lent = ink_headloan && !model.output_borrowed && ink_headloan->lend();
     // the ladder was cut while the cache held the card: start the prompt ceiling high again and check it now; the cut
     // test below gives rows back if the lent VRAM does not fund them
     if (dynamic_ubatch) {
@@ -6821,20 +6903,28 @@ bool llama_context::ink_stream_take() {
         const double ms = (ink_stream_t0_us - t_take0)/1000.0;
         ink_loan_take_ms = ink_loan_take_ms > 0 ? 0.5*(ink_loan_take_ms + ms) : ms;
     }
-    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt: MoE cache lent (%.0f MiB), 2 expert slots of %.1f MiB armed\n", __func__,
-            lent/1048576.0, ink_stream->slot_bytes()/1048576.0);
+    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt: MoE cache lent (%.0f MiB), 2 expert slots of %.1f MiB armed%s\n", __func__,
+            lent/1048576.0, ink_stream->slot_bytes()/1048576.0, head_lent ? ", head lent [HEADLOAN]" : "");
     return true;
 }
 
 bool llama_context::ink_stream_release(const char * why) {
     synchronize();
     ink_stream->disarm();
+    // [HEADLOAN] the head back in VRAM before the cache refill sizes itself from free memory
+    if (ink_headloan && ink_headloan->is_lent()) {
+        const int64_t t_head0 = ggml_time_us();
+        if (ink_headloan->restore()) {
+            LLAMA_LOG_WARN("%s: [HEADLOAN] head uploaded again in %.1f ms\n", __func__, (ggml_time_us() - t_head0)/1000.0);
+        }
+    }
     const llama_ink_stream_stats st = ink_stream->take_stats();
     sched_need_reserve = true; // the graph reads the MoE cache again
     const double t = (ggml_time_us() - ink_stream_t0_us)/1e6;
-    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt done (%s): %llu tokens in %.2f s (%.1f tok/s), ubatch up to %u rows, "
+    LLAMA_LOG_WARN("%s: [INKSTREAM] prompt done (%s): %llu tokens in %.2f s (%.1f tok/s), ubatch up to %u rows%s, "
             "%llu visit uploads, %.2f GiB streamed, %.1f ms host wait\n", __func__, why,
             (unsigned long long) ink_stream_tokens, t, t > 0 ? ink_stream_tokens/t : 0.0, ink_stream_rows_max,
+            ink_rung_env(0) ? (" (" + std::to_string(ink_rung_changes) + " ceiling changes [RUNG])").c_str() : "",
             (unsigned long long) st.uploads, st.bytes_h2d/1073741824.0, st.t_wait_us/1000.0);
     if (ink_stream_tokens > 0 && ink_stream_rows_max > 0) {
         const double n_ub = (double) ((ink_stream_tokens + ink_stream_rows_max - 1) / ink_stream_rows_max);
@@ -10333,6 +10423,48 @@ public:
     std::vector<write_info> winfos;
 };
 
+// [CKPTASYNC] state bytes go to pinned staging; device tensor slices are async D2H copies on their device's compute
+// backend (stream order snapshots the state before the next ubatch writes it). A host-buffer tensor first waits for the
+// queued compute (sync_all), as the synchronous path does.
+class llama_io_write_async : public llama_io_write_i {
+public:
+    llama_io_write_async(uint8_t * p, size_t len, std::function<ggml_backend_t(ggml_backend_dev_t)> backend_of,
+            std::function<void()> sync_all) : ptr(p), buf_size(len), backend_of(std::move(backend_of)), sync_all(std::move(sync_all)) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) { throw std::runtime_error("unexpectedly reached end of buffer"); }
+        memcpy(ptr, src, size); ptr += size; size_written += size; buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) { throw std::runtime_error("unexpectedly reached end of buffer"); }
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (ggml_backend_buffer_is_host(buf)) {
+            if (!synced) { sync_all(); synced = true; }
+            ggml_backend_tensor_get(tensor, ptr, offset, size);
+        } else {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+            ggml_backend_t be = dev ? backend_of(dev) : nullptr;
+            if (be && ggml_backend_buffer_get_type(buf) == ggml_backend_dev_buffer_type(dev)) {
+                ggml_backend_tensor_get_async(be, tensor, ptr, offset, size);
+            } else { // not a plain device buffer (split, multi-buffer): the synchronous copy
+                if (!synced) { sync_all(); synced = true; }
+                ggml_backend_tensor_get(tensor, ptr, offset, size);
+            }
+        }
+        ptr += size; size_written += size; buf_size -= size;
+    }
+
+    size_t n_bytes() override { return size_written; }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0, size_written = 0;
+    bool synced = false;
+    std::function<ggml_backend_t(ggml_backend_dev_t)> backend_of;
+    std::function<void()> sync_all;
+};
+
 class llama_io_read_host : public llama_io_read_i {
 public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), base_ptr(p), buf_size(len) {}
@@ -10848,6 +10980,90 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
         return state_seq_write_data(io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+bool llama_context::ckpt_async_enabled() {
+    static const bool on = [] { const char * e = getenv("LLAMA_CKPT_ASYNC"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+void llama_context::ckpt_async_finish() {
+    bool any = false;
+    for (auto & c : ckpt_async) { any = any || c.pending; }
+    if (!any) {
+        return;
+    }
+    for (auto & c : ckpt_async) {
+        if (c.pending) {
+            ggml_backend_event_synchronize(c.ev); // its copies only, so a pipelined MTP step keeps running
+            memcpy(c.dst, ggml_backend_buffer_get_base(c.buf), c.size);
+            c.pending = false;
+        }
+    }
+}
+
+size_t llama_context::state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (!sched || (ckpt_sel >= 0 && seq_id == ckpt_seq) || !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+            (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return 0;
+    }
+    ggml_backend_dev_t gpu = nullptr;
+    for (const auto & be : backends) {
+        auto * dev = ggml_backend_get_device(be.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu = dev; break; }
+    }
+    if (!gpu || !ggml_backend_dev_host_buffer_type(gpu)) {
+        return 0;
+    }
+    for (auto & c : ckpt_async) {
+        if (c.pending && c.dst == dst) { ckpt_async_finish(); break; } // the same destination again: land the older copy first
+    }
+    ckpt_async_slot * slot = nullptr;
+    for (auto & c : ckpt_async) { if (!c.pending) { slot = &c; break; } }
+    if (!slot) {
+        ckpt_async_finish();
+        slot = &ckpt_async[0];
+    }
+    if (!slot->buf || ggml_backend_buffer_get_size(slot->buf) < size) {
+        if (slot->buf) { ggml_backend_buffer_free(slot->buf); }
+        slot->buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(gpu), size);
+        if (!slot->buf) {
+            return 0;
+        }
+    }
+    auto backend_of = [this](ggml_backend_dev_t dev) -> ggml_backend_t {
+        for (const auto & be : backends) { if (ggml_backend_get_device(be.get()) == dev) { return be.get(); } }
+        return nullptr;
+    };
+    ggml_backend_t gpu_be = backend_of(gpu);
+    if (!slot->ev) { slot->ev = ggml_backend_event_new(gpu); }
+    if (!slot->ev || !gpu_be) {
+        return 0;
+    }
+    llama_io_write_async io((uint8_t *) ggml_backend_buffer_get_base(slot->buf), size, backend_of,
+            [this]() { ggml_backend_sched_synchronize(sched.get()); });
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        const size_t n = state_seq_write_data(io, seq_id, flags);
+        if (n == 0) {
+            ggml_backend_sched_synchronize(sched.get()); // copies already queued may still read the staging
+            return 0;
+        }
+        for (const auto & be : backends) { // one event after every device's copies (single-GPU: the compute stream)
+            if (ggml_backend_get_device(be.get()) != gpu && ggml_backend_get_device(be.get()) &&
+                    ggml_backend_dev_type(ggml_backend_get_device(be.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ggml_backend_synchronize(be.get());
+            }
+        }
+        ggml_backend_event_record(slot->ev, gpu_be);
+        slot->dst = dst; slot->size = n; slot->pending = true;
+        return n;
+    } catch (const std::exception & err) {
+        ggml_backend_sched_synchronize(sched.get());
+        LLAMA_LOG_WARN("%s: [CKPTASYNC] async checkpoint copy not taken (%s): synchronous copy\n", __func__, err.what());
         return 0;
     }
 }
@@ -11446,6 +11662,13 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & [buft, size] : moe_peer->memory_breakdown()) {
             ret[buft].context += size;
         }
+    }
+    // [HEADLOAN] (#247-FIT) the head the loader kept in host memory runs from a VRAM copy of its own: the fit dry run
+    // (no context loan yet) and a live loan count it on the device, so the fit does not hand those bytes to KV or cache
+    if (model.output_host_loan && model.output && model.dev_output() && (ink_headloan || (model.no_alloc() && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) &&
+            !(ink_headloan && ink_headloan->is_lent())) {
+        ggml_backend_buffer_type_t dbuft = ggml_backend_dev_buffer_type(model.dev_output());
+        ret[dbuft].model += ink_headloan ? ink_headloan->bytes() : ggml_backend_buft_get_alloc_size(dbuft, model.output);
     }
     if (mtp_hidden.buf) {
         ret[ggml_backend_buffer_get_type(mtp_hidden.buf.get())].context += ggml_backend_buffer_get_size(mtp_hidden.buf.get());
@@ -12679,7 +12902,12 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
 }
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    return ctx->state_seq_get_size(seq_id, flags);
+    ctx->ckpt_async_finish(); // [CKPTASYNC] the caller may resize or swap a destination next
+    return ctx->state_seq_get_size(seq_id, flags & ~LLAMA_STATE_SEQ_FLAGS_ASYNC);
+}
+
+void llama_state_seq_flush(llama_context * ctx) {
+    ctx->ckpt_async_finish();
 }
 
 size_t llama_state_seq_get_data_ext(llama_context *       ctx,
@@ -12687,6 +12915,13 @@ size_t llama_state_seq_get_data_ext(llama_context *       ctx,
                                     size_t                size,
                                     llama_seq_id          seq_id,
                                     llama_state_seq_flags flags) {
+    const bool async = (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) != 0;
+    flags &= ~LLAMA_STATE_SEQ_FLAGS_ASYNC;
+    if (async && llama_context::ckpt_async_enabled()) {
+        if (const size_t n = ctx->state_seq_get_data_async(seq_id, dst, size, flags)) {
+            return n;
+        }
+    }
     ctx->synchronize();
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);

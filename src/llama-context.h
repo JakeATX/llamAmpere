@@ -25,6 +25,7 @@ struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
 class llama_ink_stream;
+class llama_ink_headloan;
 class llama_b1;
 class llama_ple_prefetch;
 struct llama_ple_hinter;
@@ -275,6 +276,12 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+    // [CKPTASYNC] LLAMA_CKPT_ASYNC=1: a PARTIAL_ONLY checkpoint whose state is all in device buffers is copied with async
+    // D2H copies on the compute stream into pinned staging; the bytes land in dst at the next synchronize() (or state
+    // call). 0: not taken (caller falls back to the synchronous copy).
+    size_t state_seq_get_data_async(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags);
+    void   ckpt_async_finish();
+    static bool ckpt_async_enabled();
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(
@@ -688,6 +695,12 @@ private:
     // fork (INKSTREAM): prompt expert streamer (see llama-ink-stream.h). take: suspend the MoE cache and arm the
     // streamer for a prompt call; release: disarm, shrink the prompt scratch and refill the cache (before decode).
     std::unique_ptr<llama_ink_stream> ink_stream;
+    std::unique_ptr<llama_ink_headloan> ink_headloan; // [HEADLOAN] (#247) LLAMA_INK_HEAD_LOAN=1
+    struct ckpt_async_slot { ggml_backend_buffer_t buf = nullptr; ggml_backend_event_t ev = nullptr; uint8_t * dst = nullptr; size_t size = 0; bool pending = false; };
+    std::array<ckpt_async_slot, 2> ckpt_async; // [CKPTASYNC] two in flight (the prompt-end pair)
+    uint32_t ink_head_retry = 0; // [HEADLOAN] rate limit of the upload retry after a failed restore
+    uint32_t ink_rung_changes = 0, ink_rung_hold = 0; // [RUNG] ceiling changes this prompt; checks a lowered ceiling holds
+    double   ink_rung_hold_free = 0.0;                // [RUNG] free VRAM when the ceiling was lowered
     bool     ink_stream_take();
     bool     ink_stream_release(const char * why);
     uint64_t ink_stream_tokens = 0;  // prompt tokens streamed since the last take

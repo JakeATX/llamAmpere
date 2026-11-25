@@ -138,7 +138,7 @@ llama_memory_recurrent::llama_memory_recurrent(
             // pair they view, and PLE layers add p_l.
             const uint32_t tensors_per_layer = (gdn_replay ? 5u : 2u) + (hparams.ple_conv_state() > 0 ? 1u : 0u);
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(tensors_per_layer*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((tensors_per_layer*n_layer + 1)*ggml_tensor_overhead()), // + 1: r_all (CONVGATHER)
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -162,6 +162,29 @@ llama_memory_recurrent::llama_memory_recurrent(
     if (gdn_replay) {
         ingr_l.resize(n_layer);
         s_ckpt_l.resize(n_layer);
+    }
+
+    // [CONVGATHER] LLAMA_INKLING2_CONV_GATHER=1 (Inkling 2, default off): every layer's conv state is a plane of one 3-D
+    // tensor, so a one-sequence graph gathers the conv history of all layers with one get_rows instead of one per layer
+    // (llm_graph_context::build_rs_all). Same bytes, same layout per layer; only where the planes sit changes.
+    {
+        static const bool conv_gather = [] { const char * e = getenv("LLAMA_INKLING2_CONV_GATHER"); return e && atoi(e) != 0; }();
+        bool all = conv_gather && (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) && n_layer > 1 &&
+                model.split_mode() != LLAMA_SPLIT_MODE_TENSOR && hparams.ple_conv_state() == 0 && hparams.n_embd_r(0) > 0;
+        for (int i = 0; i < n_layer && all; i++) {
+            all = (!filter || filter(i)) && hparams.n_embd_r(i) == hparams.n_embd_r(0) &&
+                  (!offload || model.dev_layer(i) == model.dev_layer(0));
+        }
+        if (all) {
+            ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(model.dev_layer(0)) : ggml_backend_cpu_buffer_type();
+            ggml_context * ctx = ctx_for_buft(buft);
+            if (!ctx) {
+                throw std::runtime_error("failed to create ggml context for rs cache");
+            }
+            r_all = ggml_new_tensor_3d(ctx, type_r, hparams.n_embd_r(0), (int64_t) mem_size * (1 + n_rs_seq), n_layer);
+            ggml_format_name(r_all, "cache_r_all");
+            LLAMA_LOG_INFO("%s: [CONVGATHER] conv states of %u layers in one tensor (LLAMA_INKLING2_CONV_GATHER)\n", __func__, n_layer);
+        }
     }
 
     for (int i = 0; i < n_layer; i++) {
@@ -194,7 +217,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         // s: with gdn_replay, only the authoritative state is kept here (no widening); the
         // (1 + n_rs_seq)-wide K-snapshot storage this replaces moves to ingr_l below.
         const uint32_t n_rows_s = gdn_replay ? mem_size : mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(i), n_rows_r);
+        ggml_tensor * r = r_all ? ggml_view_2d(ctx, r_all, r_all->ne[0], r_all->ne[1], r_all->nb[1], (size_t) i * r_all->nb[2])
+                                : ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(i), n_rows_r);
         // with gdn_replay the state rows and the checkpoint rows share one tensor (s_l = plane 0,
         // s_ckpt_l = plane 1, same bytes as two tensors): one gather can then pick either row by
         // index, which the rollback-independent verify graph uses as its replay base
@@ -2145,6 +2169,10 @@ uint32_t llama_memory_recurrent_context::get_size() const {
 
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_r_all() const {
+    return mem->r_all;
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {

@@ -728,6 +728,7 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
         }
         m->fill_rs_ring(data, host_data(rs_wr), n_written > 0 ? rs_wr_conv_host.data() : nullptr,
                 host_data(rs_old_src), host_data(rs_old_dst));
+        fill_s_copy_all(data);
         return;
     }
 
@@ -736,6 +737,7 @@ void llm_graph_input_rs::fill_s_copy(const llama_memory_recurrent_context * m) {
     for (int64_t i = 0; i < n_rs; ++i) {
         data[i] = m->s_copy((int) i);
     }
+    fill_s_copy_all(data);
 
     // [TAG_GDN_REPLAY_LANES] per-lane replay: lane i reads its own (r, S, stale) through lane_seq(i)
     if (replay_w != nullptr && replay_w->buffer && replay_w->ne[1] > 1) {
@@ -874,6 +876,17 @@ void llm_graph_input_rs::set_input_shift(const llama_memory_recurrent_context * 
                 ? (int32_t) (plane0 + j * (int64_t) mem_size + main[s])
                 : (int32_t) ((int64_t) (n + j) * mem_size + head + s);
         }
+    }
+}
+
+void llm_graph_input_rs::fill_s_copy_all(const int32_t * data) {
+    if (s_copy_all == nullptr || !s_copy_all->buffer) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_all->buffer));
+    int32_t * all = (int32_t *) s_copy_all->data;
+    for (int64_t l = 0; l < s_copy_all->ne[1]; ++l) {
+        memcpy(all + l*s_copy_all->ne[0], data, s_copy_all->ne[0]*sizeof(int32_t));
     }
 }
 
@@ -1970,6 +1983,7 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
+        inp_rs->fill_s_copy_all(data); // [CONVGATHER]
     }
 }
 
@@ -9057,6 +9071,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
             ggml_set_input(inp->rs_wr_conv[j]);
         }
     }
+    // [CONVGATHER] see llm_graph_input_rs::s_copy_all
+    if (const ggml_tensor * r_all = mctx_cur->get_r_all(); r_all && n_rs == n_seqs && n_seqs > 0 && inp->rs_z < 0 &&
+            inp->n_older == 0 && inp->s_copy_conv == nullptr && inp->snap_shift == 0) {
+        inp->s_copy_all = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_rs, r_all->ne[2]);
+        ggml_set_input(inp->s_copy_all);
+        ggml_set_name(inp->s_copy_all, "rs_s_copy_all");
+    }
     if (inp->n_older > 0) {
         inp->rs_old_src = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_older);
         inp->rs_old_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->n_older);
@@ -9118,6 +9139,27 @@ ggml_tensor * llm_graph_context::build_rs(
     }
 
     return out;
+}
+
+ggml_tensor * llm_graph_context::build_rs_all(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    const ggml_tensor * r_all = inp->mctx->get_r_all();
+    if (inp->s_copy_all == nullptr || r_all == nullptr || s->view_src != r_all || state_size != r_all->ne[0] ||
+            n_seqs != inp->s_copy_all->ne[0] || s->view_offs % r_all->nb[2] != 0) {
+        return nullptr;
+    }
+    if (inp->r_rows_all == nullptr) {
+        // {n_embd_r, rows, n_layer} x [n_rs, n_layer] -> {n_embd_r, n_rs, n_layer}: every layer's states before any
+        // layer of this graph stores (each layer stores only into its own plane, after its own read)
+        inp->r_rows_all = ggml_get_rows(ctx0, const_cast<ggml_tensor *>(r_all), inp->s_copy_all);
+        ggml_set_name(inp->r_rows_all, "rs_rows_all");
+        ggml_build_forward_expand(gf, inp->r_rows_all);
+    }
+    const size_t il = s->view_offs / r_all->nb[2];
+    return ggml_view_2d(ctx0, inp->r_rows_all, state_size, n_seqs, inp->r_rows_all->nb[1], il*inp->r_rows_all->nb[2]);
 }
 
 ggml_tensor * llm_graph_context::build_rs_conv(

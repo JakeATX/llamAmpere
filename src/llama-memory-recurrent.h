@@ -279,6 +279,7 @@ public:
 
     // per layer
     std::vector<ggml_tensor *> r_l;
+    ggml_tensor * r_all = nullptr; // [CONVGATHER] {n_embd_r, rows, n_layer}: r_l[i] is plane i (LLAMA_INKLING2_CONV_GATHER=1)
     std::vector<ggml_tensor *> s_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
@@ -377,6 +378,7 @@ public:
     uint32_t get_size() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
+    ggml_tensor * get_r_all() const; // [CONVGATHER] nullptr unless every layer's conv state is a plane of one tensor
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_ingr_l(int32_t il) const;    // nullptr unless mem->gdn_replay
     bool          get_gdn_replay() const;            // mem->gdn_replay and not a full-state context

@@ -5137,6 +5137,7 @@ private:
 
     // a prompt checkpoint restores the state at max(pos_min + 1, pos_max); it is usable only if seq_rm can reach it
     bool sj_kvarn_ckpt_reachable(llama_seq_id seq_id, const common_prompt_checkpoint & cur) const {
+        llama_state_seq_flush(ctx_tgt); // [CKPTASYNC] the header bytes of an async checkpoint must have landed
         const llama_pos p = std::max(cur.pos_min + 1, cur.pos_max);
         // [#240] an exact checkpoint brings its own seal state and open rows: it needs the live cache to still hold
         // the sealed records below its sealed end (seal ends only grow until a cut, and a cut erases the checkpoints
@@ -5259,6 +5260,9 @@ private:
         // Slot restore can synthesize a checkpoint without an active inference task.
         const int id_task = slot.task ? slot.task->id : -1;
 
+        // [CKPTASYNC] a pending async copy lands before any checkpoint is evicted or recycled
+        llama_state_seq_flush(ctx_tgt);
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -5363,7 +5367,7 @@ private:
         const int64_t t_ckpt_us = ggml_time_us();
         const bool had_spare = !slot.ckpt_spare.empty();
         const llama_state_seq_flags flags = exact ? ckpt_flags() : LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-        cur.update_tgt(ctx_tgt, slot.id, flags, &slot.ckpt_spare);
+        cur.update_tgt(ctx_tgt, slot.id, flags | LLAMA_STATE_SEQ_FLAGS_ASYNC, &slot.ckpt_spare); // ASYNC: only with LLAMA_CKPT_ASYNC=1
         const bool reused = had_spare && slot.ckpt_spare.empty();
         if (ckpt_needs_dft()) {
             // [#240] the exact section rides on a hybrid drafter's recurrent state; a plain-KV drafter checkpoint
@@ -6911,6 +6915,7 @@ private:
                 }
 
                 if (keep_base) {
+                    llama_state_seq_flush(ctx_tgt); // [CKPTASYNC] a pending copy may still target it
                     ckpt.clear_tgt();
                     slot.spec_ckpt_tgt_n_tokens = -1;
                 } else if (reuse_ckpt_tgt) {
