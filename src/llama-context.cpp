@@ -1997,6 +1997,13 @@ uint64_t llama_model_tokenizer_fingerprint(const llama_model * model) {
 void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
+    // DSpark drafters (Inkling2 Markov rank > 0, or a markov_w1 head) keep their own shortlist path below
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dspark_markov_rank == 0 &&
+            (model.no_alloc() || (model.dspine_codebook == nullptr && model.dspark_markov_w1 == nullptr))) {
+        LLAMA_LOG_INFO("%s: draft vocabulary '%s' not used: only an allocated DSpine lattice drafter reads a shortlist\n", __func__, path);
+        return;
+    }
+
     llama_mtp_vocab_map map;
     std::string source = path;
 
@@ -2004,8 +2011,11 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     const bool rm24h = std::strcmp(path, "auto:rm24h") == 0;
     if (rm24h || llama_mtp_vocab_parse_auto(path, auto_size)) {
         // pick the list compiled into the binary for this tokenizer + architecture, if there is one
-        const uint64_t fp   = llama_model_tokenizer_fingerprint(&model);
-        const char *   arch = llm_arch_name(model.arch);
+        // [DSPINE2] a DFlash drafter shares the target's tokenizer: look its list up under the target's architecture
+        const llama_model & m_key = model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr ?
+                *llama_get_model(cparams.ctx_other) : model;
+        const uint64_t fp   = llama_model_tokenizer_fingerprint(&m_key);
+        const char *   arch = llm_arch_name(m_key.arch);
         const llama_mtp_vocab_builtin * b = rm24h ? llama_mtp_vocab_builtin_find_rm24h(fp, n_vocab, arch, n_hot) :
                                                   llama_mtp_vocab_builtin_find(fp, n_vocab, arch, auto_size);
         if (b == nullptr) {
@@ -2038,12 +2048,18 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
             head = nextn.shared_head_head;
         }
     }
-    if (head == nullptr && model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr) {
+    // [DSPINE2] a DFlash drafter without its own head (DSpine, DSpark) scores the target's head via ctx_other:
+    // the shortlist rows are copied from that head
+    if ((head == nullptr || head->buffer == nullptr) && model.arch == LLM_ARCH_DFLASH && cparams.ctx_other != nullptr) {
         const llama_model * model_other = llama_get_model(cparams.ctx_other);
         if (model_other != nullptr) {
             head = model_other->output;
             head_model = model_other;
         }
+    }
+    if ((head == nullptr || head->buffer == nullptr) && model.arch == LLM_ARCH_DFLASH && model.dspine_codebook != nullptr) {
+        LLAMA_LOG_WARN("%s: DSpine drafter has no output head to shortlist (no target context), full head\n", __func__);
+        return;
     }
     if (head == nullptr || head->buffer == nullptr) {
         throw std::runtime_error("draft vocabulary map: model has no allocated output head");
@@ -2054,6 +2070,56 @@ void llama_context::init_draft_vocab(const char * path, int32_t n_hot) {
     if (n_hot < 0 || (int64_t) n_hot >= n_sel) {
         throw std::runtime_error(format("draft vocabulary hot tail of %d slots is not in [0, %lld)",
                     n_hot, (long long) n_sel));
+    }
+
+    // [DSPINE2] DSpine lattice drafter: all block rows score the shortlist through a compact head whose rows are raw
+    // copies of the drafter's own head rows (same type, so the scores are bit-identical to the full head on the
+    // shortlisted ids). The hot tail stays live: draft_vocab_refresh copies the replaced rows.
+    if (model.arch == LLM_ARCH_DFLASH && model.dspine_codebook != nullptr) {
+        ggml_backend_buffer_type_t hb = ggml_backend_buffer_get_type(head->buffer);
+        ggml_backend_dev_t hd = ggml_backend_buft_get_device(hb);
+        // raw row copies are only valid for plain row-major heads: no rotation folded into the head, no EXL3 rows
+        // (rebuilt by llama_draft_compact_build), no AI+ slab layouts
+        if (n_sel >= head->ne[1] || !ggml_is_contiguous(head) || ggml_get_type_traits(head->type)->to_float == nullptr ||
+                head_model->hadamard_rotations.count(head) || head_model->hadamard_inverses.count(head) ||
+                ggml_exl3_bits(head->type) != 0 || ggml_ai4_rate(head->type) != 0 || ggml_ait_rate(head->type) != 0 ||
+                (!ggml_backend_buft_is_host(hb) && (hd == nullptr || ggml_backend_dev_buffer_type(hd) != hb))) {
+            LLAMA_LOG_WARN("%s: DSpine draft vocabulary shortlist not applied (head %s %s), the lattice scores the full head\n",
+                    __func__, ggml_get_name(head), ggml_type_name(head->type));
+            return;
+        }
+        ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+        draft_vocab.ctx.reset(ggml_init(ip));
+        draft_vocab.ids = ggml_new_tensor_1d(draft_vocab.ctx.get(), GGML_TYPE_I32, n_sel);
+        ggml_set_name(draft_vocab.ids, "draft_vocab_ids");
+        draft_vocab.compact = ggml_new_tensor_2d(draft_vocab.ctx.get(), head->type, head->ne[0], n_sel);
+        ggml_set_name(draft_vocab.compact, "draft_vocab_compact");
+        draft_vocab.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(draft_vocab.ctx.get(), hb));
+        if (!draft_vocab.buf) {
+            throw std::runtime_error("draft vocabulary map: failed to allocate the DSpine shortlist head");
+        }
+        ggml_backend_buffer_set_usage(draft_vocab.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_tensor_set(draft_vocab.ids, map.ids.data(), 0, (size_t) n_sel * sizeof(int32_t));
+        const size_t row = head->nb[1];
+        GGML_ASSERT(row == draft_vocab.compact->nb[1]);
+        std::vector<uint8_t> rows((size_t) n_sel * row);
+        for (int64_t i = 0; i < n_sel; ++i) {
+            GGML_ASSERT(map.ids[i] >= 0 && map.ids[i] < head->ne[1]);
+            ggml_backend_tensor_get(head, rows.data() + (size_t) i * row, (size_t) map.ids[i] * row, row);
+        }
+        ggml_backend_tensor_set(draft_vocab.compact, rows.data(), 0, rows.size());
+        draft_vocab.compact_src = head;
+        draft_vocab.compact_raw = true;
+        draft_vocab.host  = std::move(map.ids);
+        draft_vocab.n_hot = n_hot;
+        if (n_hot > 0) {
+            draft_vocab.hot.init(draft_vocab.host, n_vocab, n_hot);
+        }
+        LLAMA_LOG_INFO("%s: draft vocabulary shortlist (DSpine lattice): %lld of %lld tokens from %s, %d hot slots, "
+                "compact head %s %.1f MiB on %s (row copies of %s)\n", __func__, (long long) n_sel, (long long) n_vocab,
+                source.c_str(), n_hot, ggml_type_name(head->type), ggml_nbytes(draft_vocab.compact) / 1024.0 / 1024.0,
+                ggml_backend_buft_name(hb), ggml_get_name(head));
+        return;
     }
 
     // [#81] compact resident draft head: auto for EXL3 and AI+ heads (no one-row path), LLAMA_DRAFT_VOCAB_COMPACT=1
@@ -2233,6 +2299,17 @@ int32_t llama_context::draft_vocab_apply(const std::vector<llama_mtp_hot_vocab::
     // one upload of the whole hot region: cheap at request granularity and keeps the tensor fixed
     ggml_backend_tensor_set(draft_vocab.ids, draft_vocab.host.data() + base,
             (size_t) base * sizeof(int32_t), (size_t) draft_vocab.n_hot * sizeof(int32_t));
+
+    // [DSPINE2] a raw-copy compact head follows its ids: copy the replaced rows from the head
+    if (draft_vocab.compact_raw && draft_vocab.compact != nullptr && draft_vocab.compact_src != nullptr) {
+        const size_t row = draft_vocab.compact->nb[1];
+        std::vector<uint8_t> buf(row);
+        for (const auto & rep : reps) {
+            GGML_ASSERT(rep.id >= 0 && rep.id < draft_vocab.compact_src->ne[1]);
+            ggml_backend_tensor_get(draft_vocab.compact_src, buf.data(), (size_t) rep.id * row, row);
+            ggml_backend_tensor_set(draft_vocab.compact, buf.data(), (size_t) (base + rep.slot) * row, row);
+        }
+    }
 
     return (int32_t) reps.size();
 }

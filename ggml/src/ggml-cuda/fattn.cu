@@ -4381,6 +4381,7 @@ static ggml_cuda_fattn_bounded_plan ggml_cuda_fattn_bounded_prefill_plan(const i
 
 static void ggml_cuda_fattn_mask_f16_desc(const ggml_tensor * mask, ggml_tensor & m2); // [#175] below
 static bool ggml_cuda_fattn_mask_is_packed(const ggml_tensor * dst);            // [#175] below
+static bool ggml_cuda_fattn_sj_kvarn_compact16(const ggml_tensor * dst);       // [DSPINE4 VERIFY16] below
 
 bool ggml_cuda_flash_attn_ext_bounded_prefill_applies(int device, const ggml_tensor * dst) {
     if (ggml_flash_attn_ext_is_inkrel(dst)) {
@@ -4672,11 +4673,15 @@ static bool ggml_cuda_fattn_sj_kvarn_rot_in_kernel(ggml_backend_cuda_context & c
     // 4/4: the stream decode kernel (fattn-sjkvarn-stream.cuh) through ggml_cuda_flash_attn_ext_sj_kvarn_direct_impl
     static const int stream_max = getenv("GGML_SJKVARN_DIRECT_STREAM_MAX") != nullptr
                                 ? atoi(getenv("GGML_SJKVARN_DIRECT_STREAM_MAX")) : 8; // same default as fattn-sjkvarn-direct.cuh
+    if (Q->ne[1] > 8 && ggml_cuda_fattn_sj_kvarn_compact16(dst)) {
+        return true; // [DSPINE4 VERIFY16] the compact16 tile rotates in-kernel like widths <= 8
+    }
     return Q->ne[1] <= 8 && Q->ne[1] <= stream_max && Q->ne[1] < 128 && ggml_cuda_flash_attn_ext_sj_kvarn_direct_supported(dst);
 }
 
 // One-bit KQ masks are read by the MMA loaders. Other routes expand the same values into the pool.
 bool ggml_cuda_flash_attn_sj_kvarn_lowbits_tile_route(const ggml_tensor * dst); // fattn-sjkvarn-lowbits.cu
+bool ggml_cuda_flash_attn_ext_sj_kvarn_compact16_ok(const ggml_tensor * dst); // template-instances/fattn-mma-sjkvarn-compact16-instance.cu
 
 // [#195] GGML_SJKVARN_DIRECT_Q5G6 (fattn-sjkvarn-stream.cuh) covers the 4/4 stream decode kernel only. Say so once when
 // it is set and an SJ-KVaRN decode node takes another route (low-bit 3/3, 3/2t, ... caches, trellis bodies, the tile
@@ -4820,6 +4825,22 @@ static void ggml_cuda_fattn_sj_kvarn_rowsplit_run(ggml_backend_cuda_context & ct
         ggml_cuda_fattn_sj_kvarn_rowsplit_view(dst, dst->src[3], r0, std::min(SJ_KVARN_ROWSPLIT_CHUNK, n_q - r0), d, q, m);
         ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, &d);
     }
+}
+
+// [DSPINE4 VERIFY16] a 9..16-row 4/4 node the row split would take, served instead in one pass by the compact16 tile
+// (GGML_SJKVARN_COMPACT16=1). Same input contract as the row split (F16 mask view, decode kernel shapes) plus GQA 6.
+static bool ggml_cuda_fattn_sj_kvarn_compact16(const ggml_tensor * dst) {
+    if (dst->src[0]->ne[1] <= 8 || dst->src[0]->ne[1] > 16 || !ggml_cuda_fattn_sj_kvarn_rowsplit(dst)) {
+        return false;
+    }
+    if (!ggml_cuda_fattn_mask_is_packed(dst)) {
+        return ggml_cuda_flash_attn_ext_sj_kvarn_compact16_ok(dst);
+    }
+    ggml_tensor m16;
+    ggml_cuda_fattn_mask_f16_desc(dst->src[3], m16);
+    ggml_tensor d16 = *dst;
+    d16.src[3] = &m16;
+    return ggml_cuda_flash_attn_ext_sj_kvarn_compact16_ok(&d16);
 }
 
 // GGML_CUDA_MASK_PACKED_NATIVE=0: every route takes the f16 expansion (A/B of the native loader)
@@ -5038,6 +5059,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         // fork: compact only the main model's sparse scalar4/4 verify rows; default dispatch stays unchanged.
         if (ggml_cuda_flash_attn_ext_sj_kvarn_compact(ctx, dst, ggml_cuda_flash_attn_ext_mma_sj_kvarn_switch_ncols2<256, 256>)) {
+            return;
+        }
+        if (ggml_cuda_fattn_sj_kvarn_compact16(dst)) {
+            ggml_cuda_flash_attn_ext_sj_kvarn_direct(ctx, dst); // [DSPINE4 VERIFY16] one pass at 9..16 rows
             return;
         }
         if (ggml_cuda_fattn_sj_kvarn_rowsplit(dst)) {

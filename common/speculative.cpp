@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "spec-lattice.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -228,6 +229,7 @@ struct common_speculative_impl {
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
     int32_t n_accepted_ctrl = -1; // [MBFIX] cap on the accepted count the adaptive controller sees (-1 = none), set per accept call
     int32_t n_drafted_ctrl = -1;
+    int32_t n_accepted_real = -1; // DSPINE-FU S4 forced probe: the real-rule count the controller sees instead of n_accepted (-1 = none)
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -1043,6 +1045,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<std::mt19937> dflash2_rng;
     std::vector<int64_t>      dflash2_seed;
 
+    // [DSPINE-V07] verify-length planner over the lattice (LLAMA_SPEC_LATTICE_PLAN=1, default off): cost model
+    // (LLAMA_SPEC_VERIFY_COST="rows:ms,...", LLAMA_SPEC_DRAFT_MS), per-seq acceptance calibration, the drafted
+    // tokens' probabilities of the last draft, and a histogram of planned draft lengths
+    bool                              lattice_plan = false;
+    common_lattice_cost               lattice_cost;
+    std::vector<common_lattice_calib> lattice_calib;
+    std::vector<std::vector<float>>   lattice_conf;
+    std::vector<uint64_t>             lattice_n_plan;
+
+    // [DSPINE4] acceptance-adaptive draft width (LLAMA_DSPINE_ADAPT="lo:up:down[:alpha]", default off): each seq drafts lo
+    // tokens or the full --spec-draft-n-max, from an EMA of its past kept tokens per round (kept drafts + 1): widen when
+    // the EMA reaches up, narrow when it falls below down. Only past rounds decide the width, so the accept law is unchanged.
+    bool                 aw_on    = false;
+    int32_t              aw_lo    = 7;
+    float                aw_up    = 7.0f;
+    float                aw_down  = 6.0f;
+    float                aw_alpha = 0.125f;
+    std::vector<int32_t> aw_width;   // per seq: the width the next draft uses
+    std::vector<int32_t> aw_drafted; // per seq: the width of the last draft (0 = none pending)
+    std::vector<float>   aw_ema;
+    uint64_t             aw_rounds[2] = { 0, 0 }; // rounds drafted at lo / hi
+    uint64_t             aw_switch    = 0;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1116,6 +1141,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_dflash2     = selector_top_k > 0;
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
+        if (const char * env = getenv("LLAMA_SPEC_LATTICE_PLAN"); is_dflash2 && env && atoi(env) != 0) {
+            lattice_plan = true;
+            lattice_cost = common_lattice_cost::defaults();
+            if (const char * c = getenv("LLAMA_SPEC_VERIFY_COST"); c && !common_lattice_cost::parse(c, lattice_cost)) {
+                throw std::runtime_error("LLAMA_SPEC_VERIFY_COST must be \"rows:ms,rows:ms,...\" with rows increasing");
+            }
+            if (const char * d = getenv("LLAMA_SPEC_DRAFT_MS")) {
+                char * end = nullptr;
+                const float v = std::strtof(d, &end);
+                if (end == d || *end != '\0' || !(v >= 0.0f) || !std::isfinite(v)) {
+                    throw std::runtime_error("LLAMA_SPEC_DRAFT_MS must be a number >= 0");
+                }
+                lattice_cost.draft_ms = v;
+            }
+            lattice_calib.assign(n_seq, common_lattice_calib{});
+            lattice_conf.assign(n_seq, {});
+            lattice_n_plan.assign(33, 0);
+            std::string pts;
+            for (const auto & p : lattice_cost.pts) {
+                pts += string_format("%s%d:%.2f", pts.empty() ? "" : ",", p.first, p.second);
+            }
+            LOG_INF("%s: lattice verify-length planner on (LLAMA_SPEC_LATTICE_PLAN): verify ms by rows %s, draft %.2f ms\n",
+                    __func__, pts.c_str(), lattice_cost.draft_ms);
+        }
         char lilicorr_meta[32] = {};
         lilicorr_top_k = llama_model_meta_val_str(model_dft, "lilicorr.candidate_topk", lilicorr_meta, sizeof(lilicorr_meta)) >= 0
                 ? std::atoi(lilicorr_meta) : 0;
@@ -1186,6 +1235,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+        if (is_dflash2 && (this->params.n_max < 1 || this->params.n_max + 1 > block_size)) {
+            // [DSPINE-V07] the lattice graph needs a block of 2..block_size rows; refuse here rather than abort mid-request
+            throw std::runtime_error(string_format("lattice drafter: draft n_max %d must be in 1..%d (block size %d)",
+                    this->params.n_max, block_size - 1, block_size));
+        }
+        if (const char * env = getenv("LLAMA_DSPINE_ADAPT"); is_dflash2 && env && *env && strcmp(env, "0") != 0) {
+            float a = 0.125f;
+            int lo = 0;
+            float up = 0.0f, down = 0.0f;
+            int used3 = -1, used4 = -1;
+            const int n = sscanf(env, "%d:%f:%f%n:%f%n", &lo, &up, &down, &used3, &a, &used4);
+            const size_t len = strlen(env);
+            const bool whole = (n == 3 && used3 == (int) len) || (n == 4 && used4 == (int) len);
+            if (!whole || lo < std::max(1, this->params.n_min) || lo >= this->params.n_max || !(down < up) ||
+                    !(a > 0.0f && a <= 1.0f)) {
+                throw std::runtime_error("LLAMA_DSPINE_ADAPT must be \"lo:up:down[:alpha]\" with max(1, --spec-draft-n-min) <= lo < "
+                        "--spec-draft-n-max (after the block-size clamp), down < up, 0 < alpha <= 1");
+            }
+            aw_on = true; aw_lo = lo; aw_up = up; aw_down = down; aw_alpha = a;
+            aw_width.assign(n_seq, lo);
+            aw_drafted.assign(n_seq, 0);
+            aw_ema.assign(n_seq, 0.0f);
+            LOG_INF("%s: DSpine adaptive width on (LLAMA_DSPINE_ADAPT): %d or %d tokens, widen at EMA >= %.2f tok/round, "
+                    "narrow below %.2f, alpha %.3f\n", __func__, lo, this->params.n_max, up, down, a);
+        }
 
         if (has_rnn_context) {
             if (ds_adaptive) {
@@ -1295,17 +1369,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         {
             bool causal = causal_attn;
             char buf[32] = {};
-            // DFlash2 (lattice selector) drafters are always non-causal: the
-            // decoder_arch metadata only applies to the plain DFlash decoder.
+            // the decoder_arch fallback applies only to the plain DFlash decoder; lattice drafters take
+            // dflash.attention.causal as written (DFlash2: absent = non-causal, DSpine: true)
             if (!causal && !is_dflash2 && llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
                 causal = strcmp(buf, "laguna") == 0;
             }
             llama_set_causal_attn(ctx_dft, causal);
+            LOG_INF("%s: - block attention causal=%d%s\n", __func__, causal ? 1 : 0,
+                    is_dflash2 && causal ? " (causal lattice drafter, e.g. DSpine)" : "");
         }
     }
 
     ~common_speculative_impl_draft_dflash() override {
         flush_pending_rnn();
+        if (aw_on) {
+            LOG_INF("DSpine adaptive width: rounds at %d / %d tokens: %llu / %llu, %llu switches\n", aw_lo, params.n_max,
+                    (unsigned long long) aw_rounds[0], (unsigned long long) aw_rounds[1], (unsigned long long) aw_switch);
+        }
+        if (lattice_plan) {
+            std::string hist;
+            for (size_t n = 0; n < lattice_n_plan.size(); ++n) {
+                if (lattice_n_plan[n] > 0) {
+                    hist += string_format(" %zu:%llu", n, (unsigned long long) lattice_n_plan[n]);
+                }
+            }
+            LOG_INF("lattice planner: drafts by planned length (len:count):%s\n", hist.c_str());
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1361,6 +1450,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (ds_adaptive && seq_id < (llama_seq_id) ds_ctrl.size()) {
             ds_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive);
             ds_last[seq_id] = 0;
+        }
+        if (aw_on) {
+            // per request, like the seed: a request starts narrow
+            aw_width[seq_id]   = aw_lo;
+            aw_drafted[seq_id] = 0;
+            aw_ema[seq_id]     = 0.0f;
+        }
+        if (lattice_plan) {
+            // per request, like the seed, so two identical requests plan identically
+            lattice_calib[seq_id].reset();
+            lattice_conf[seq_id].clear();
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -1709,7 +1809,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
-                const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
+                // (a request at temperature <= 0 is verified by id-match, so its walk stays greedy)
+                const bool sample = is_dflash2 && params.probabilistic && dp.result_q && dp.temp > 0.0f;
 
                 // greedy keeps temperature 1, sampling uses the target's
                 const float temp = sample ? dp.temp : 1.0f;
@@ -1720,63 +1821,44 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     dflash2_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
                 }
 
-                std::vector<float>   probs;
-                std::vector<int32_t> sorted_idx;
+                common_lattice_walk_params wp;
+                wp.top_k  = is_dflash2 ? selector_top_k : lilicorr_top_k;
+                wp.temp   = temp;
+                wp.p_min  = params.p_min;
+                wp.sample = sample;
 
-                int32_t predecessor = 0;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
-                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
-                    const float * scores = row + top_k + (size_t) predecessor * top_k;
-
-                    predecessor = (int32_t) std::distance(scores,
-                            std::max_element(scores, scores + top_k));
-                    if (params.p_min > 0.0f || sample) {
-                        // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
-                        probs.resize(top_k);
-                        float sum = 0.0f;
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
-                            sum += probs[k];
-                        }
-                        if (1.0f / sum < params.p_min) {
-                            break;
-                        }
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            probs[k] /= sum;
-                        }
-                    }
-                    if (sample) {
-                        // ggml_top_k leaves candidates unordered, so walk them by token id to keep a seed's draft stable
-                        sorted_idx.resize(top_k);
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            sorted_idx[k] = k;
-                        }
-                        std::sort(sorted_idx.begin(), sorted_idx.end(), [row](int32_t a, int32_t b) { return row[a] < row[b]; });
-
-                        // a round-off overshoot keeps the argmax, which has q > 0
-                        double u = std::uniform_real_distribution<double>(0.0, 1.0)(dflash2_rng[seq_id]);
-                        for (const int32_t k : sorted_idx) {
-                            u -= probs[k];
-                            if (u < 0.0) {
-                                predecessor = k;
-                                break;
-                            }
-                        }
-
-                        auto & q = dp.result_q->emplace_back();
-                        q.reserve(top_k);
-                        for (int32_t k = 0; k < top_k; ++k) {
-                            q.push_back({ (llama_token) row[k], scores[k], probs[k] });
-                        }
-                    }
-                    result.push_back((llama_token) row[predecessor]);
+                int32_t n_pos = (is_dflash2 ? n_block_tokens : params.n_max + 1) - 1;
+                if (aw_on) {
+                    // the width comes from past rounds only; the walk stops there, so no slot past it is drawn
+                    n_pos = std::min(n_pos, aw_width[seq_id]);
+                    aw_drafted[seq_id] = aw_width[seq_id];
                 }
+
+                // [DSPINE-V07] opt-in verify-length planner (LLAMA_SPEC_LATTICE_PLAN=1); off = the plain walk above
+                const bool plan = is_dflash2 && lattice_plan;
+                if (plan) {
+                    wp.cost  = &lattice_cost;
+                    wp.calib = &lattice_calib[seq_id];
+                    wp.l_min = std::max(0, params.n_min);
+                    if (dp.n_max > 0) {
+                        // plan within the cap the caller will apply, so the draft is never cut after planning
+                        n_pos = std::min(n_pos, dp.n_max);
+                    }
+                    lattice_conf[seq_id].clear();
+                }
+
+                common_lattice_walk(lattice + (size_t) beg * n_embd_dec, (size_t) n_embd_dec, n_pos, wp,
+                        sample ? &dflash2_rng[seq_id] : nullptr, result,
+                        sample ? dp.result_q : nullptr, plan ? &lattice_conf[seq_id] : nullptr);
 
                 // a sampled draft must not be dropped because of its own tokens: the p_min stop at position i depends on
                 // the token drawn at i - 1, so discarding a short draft would bias the output (exact only when greedy)
                 if (!sample && result.size() < (size_t) params.n_min) {
                     result.clear();
+                }
+                if (plan) {
+                    lattice_conf[seq_id].resize(result.size());
+                    lattice_n_plan[std::min(result.size(), lattice_n_plan.size() - 1)]++;
                 }
                 continue;
             }
@@ -1933,6 +2015,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (aw_on && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq && aw_drafted[seq_id] > 0) {
+            // kept tokens this round (kept drafts + the target's own); a draft the server cut short still counts
+            // the controller's count: the forced probe's real-rule count, the mb exact-rule / copy-tail cap, never past the draft
+            int32_t acc = n_accepted_real >= 0 ? n_accepted_real : n_accepted;
+            if (n_accepted_ctrl >= 0) {
+                acc = std::min(acc, n_accepted_ctrl);
+            }
+            acc = std::min(acc, aw_drafted[seq_id]);
+            const float kept = (float) acc + 1.0f;
+            float & ema = aw_ema[seq_id];
+            ema = ema == 0.0f ? kept : ema + aw_alpha * (kept - ema);
+            aw_rounds[aw_drafted[seq_id] > aw_lo ? 1 : 0]++; // verified rounds only
+            const int32_t before = aw_width[seq_id];
+            if (before == aw_lo && ema >= aw_up) {
+                aw_width[seq_id] = params.n_max;
+            } else if (before != aw_lo && ema < aw_down) {
+                aw_width[seq_id] = aw_lo;
+            }
+            if (aw_width[seq_id] != before) {
+                aw_switch++;
+                SPC_DBG("DSpine adaptive width seq %d: %d -> %d (EMA %.2f tok/round)\n", (int) seq_id, before, aw_width[seq_id], ema);
+            }
+            aw_drafted[seq_id] = 0;
+        }
+        if (lattice_plan && !is_other && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            auto & conf = lattice_conf[seq_id];
+            // n_drafted_ctrl: the width the server verified (it can be shorter than the draft); -1 = the whole draft
+            const int32_t n_drafted = n_drafted_ctrl >= 0 ? std::min<int32_t>(n_drafted_ctrl, (int32_t) conf.size()) : (int32_t) conf.size();
+            // [DSPINE2] with mb (mode biasing) the server passes the exact-rule count (first rescue) as n_accepted_ctrl, as it
+            // does for the adaptive MTP depth controller (LLAMA_SPEC_MB_CTRL=beat passes the kept count instead)
+            const int32_t n_acc = n_accepted_ctrl >= 0 ? std::min<int32_t>(n_accepted_ctrl, n_accepted) : n_accepted;
+            lattice_calib[seq_id].update(conf.data(), n_drafted, n_acc);
+            conf.clear();
+        }
         // INKSPEC2: feed the adaptive depth controller with this seq's own draft; under mode-biased accept the
         // count is capped at the exact-rule count (the first rescue, [MBFIX]) so mb drafts at the depths exact would
         if (!ds_adaptive || is_other || seq_id < 0 || seq_id >= (llama_seq_id) ds_ctrl.size()) {
@@ -3879,7 +3995,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // the own depth is what a draft of that depth would have returned
             const int attempted = n_drafted_ctrl >= 0 ? n_drafted_ctrl : n_last[seq_id];
             const int own = n_own[seq_id] > 0 ? std::min(attempted, n_own[seq_id]) : attempted;
-            int n_acc = std::min<int>(n_accepted, own);
+            int n_acc = std::min<int>(n_accepted_real >= 0 ? n_accepted_real : n_accepted, own);
             if (n_accepted_ctrl >= 0) {
                 n_acc = std::min<int>(n_acc, n_accepted_ctrl); // [MBFIX] exact-rule count under mode-biased MTP
             }
@@ -5309,6 +5425,17 @@ common_speculative_init_result::common_speculative_init_result(
                 LOG_INF("%s: the last %d entries of the shortlist are adaptive hot slots\n", __func__, cparams.draft_vocab_hot);
             }
         }
+    } else if (has_draft && (params.speculative.draft.dflash || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) &&
+            !params.speculative.draft.vocab_map.empty() &&
+            params.speculative.draft.vocab_map != "none") {
+        // [DSPINE2] the DSpine lattice drafter scores the same shortlist mechanism as MTP (the context ignores it
+        // for other DFlash drafters); "auto" resolves like an MTP draft SJ-KVaRN context: the ordered 24K list
+        // with its 2K hot tail
+        const std::string & vm = params.speculative.draft.vocab_map;
+        cparams.draft_vocab_map = vm == "auto" && params.speculative.draft.vocab_hot == 0 ? "auto:rm24h" : vm.c_str();
+        cparams.draft_vocab_hot = params.speculative.draft.vocab_hot;
+        LOG_INF("%s: DFlash draft context: draft vocabulary shortlist '%s' (DSpine only)\n", __func__, cparams.draft_vocab_map);
     }
 
     // the draft context holds as many tokens per sequence as the target context
@@ -6080,6 +6207,13 @@ void common_speculative_note_target_conf(common_speculative * spec, llama_seq_id
     }
 }
 
+// DSPINE-FU S4 forced probe: the next common_speculative_accept on this seq feeds the adaptive controller n_real, not its n_accepted
+void common_speculative_set_accepted_real(common_speculative * spec, llama_seq_id seq_id, int32_t n_real) {
+    if (common_speculative_impl * impl = spec->impl_last[seq_id]) {
+        impl->n_accepted_real = n_real;
+    }
+}
+
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t n_accepted_ctrl, int32_t n_drafted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
@@ -6143,6 +6277,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         impl->accept(seq_id, n_accepted, false);
         impl->n_accepted_ctrl = -1;
         impl->n_drafted_ctrl = -1;
+        impl->n_accepted_real = -1;
         impl->n_call_accept++;
     }
 

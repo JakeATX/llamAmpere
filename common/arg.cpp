@@ -585,6 +585,19 @@ static void common_ink_kv44_default(common_params & params) {
     }
 }
 
+// [DSPINE4] DFlash drafters (DSpine: 8 verify rows) run verify widths 7/8 on the mode-2 compact tile (DSPINE2 B0, DSpine
+// -6.4% ms/round at 103K; KLD vs a q8_0-KV reference not worse). MTP keeps the release kernels. An explicit
+// GGML_SJKVARN_COMPACT_W78 wins. Called after parsing and again after the draft type is inferred (idempotent).
+static void common_dflash_w78_default(const common_params & params) {
+    if ((params.speculative.draft.dflash || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) &&
+            common_get_env("GGML_SJKVARN_COMPACT_W78").empty()) {
+        common_set_env("GGML_SJKVARN_COMPACT_W78", "1");
+        LOG_INF("draft-dflash: GGML_SJKVARN_COMPACT_W78=1 (verify widths 7/8 on the compact tile)\n");
+    }
+}
+
+
 void common_models_handler_apply(common_models_handler & handler, common_params & params, common_download_callback * callback) {
     std::vector<common_download_task> tasks;
 
@@ -716,6 +729,7 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     // explicit --spec-type (both calls are idempotent)
     common_speculative_apply_mtp_sampling_default(params);
     common_speculative_apply_dspark_default(params);
+    common_dflash_w78_default(params);
 
     // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
     const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
@@ -1283,6 +1297,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 ctx_arg.ex != LLAMA_EXAMPLE_PERPLEXITY && ctx_arg.ex != LLAMA_EXAMPLE_IMATRIX &&
                 (params.card_preset.empty() || (params.card_preset == "24dense" && params.n_parallel == 1));
     }
+
+    common_dflash_w78_default(params);
 
     if (!params.card_preset.empty() && params.card_preset != "24dense" && params.n_parallel != 1) {
         throw std::invalid_argument(params.card_preset == "24ink" ? "24ink is one slot (--parallel 1); for several users drop the preset and pass -np N --kv-unified -b 1024 -ub 1024"

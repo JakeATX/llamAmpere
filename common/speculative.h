@@ -142,6 +142,7 @@ void common_speculative_draft(common_speculative * spec);
 // the depth choices, and with them the work per round, stay those of exact acceptance); -1 = n_accepted.
 // n_drafted keeps the attempted width across a checkpoint restore (-1 uses the drafter's current state).
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted, int32_t n_accepted_ctrl = -1, int32_t n_drafted = -1);
+void common_speculative_set_accepted_real(common_speculative * spec, llama_seq_id seq_id, int32_t n_real);
 
 // whether the round last passed to common_speculative_accept for seq_id verified a copy-first span (not the drafter)
 bool common_speculative_last_round_copy(const common_speculative * spec, llama_seq_id seq_id);

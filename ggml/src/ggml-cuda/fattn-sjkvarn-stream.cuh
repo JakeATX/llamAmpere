@@ -61,7 +61,13 @@
 // [#195] decode tile of the stream kernel. An enum class, not a bool, so that no positional `true`/`false` meant for
 // another trailing template flag can select the compact tile by accident. compact: the (query, head) pairs of GQA 6
 // packed 8 per warp (q5g6 [#195] at width 5, KVROWS at widths 4, 6, 7, 8).
-enum class sj_kvarn_tile : int { rows = 0, compact = 1 };
+enum class sj_kvarn_tile : int { rows = 0, compact = 1, compact_kq2 = 2, compact_hv = 3, compact_h16 = 4 };
+// [DSPINE4 KQX] compact_kq2 / _hv / _h16: the compact tile with cheaper body-strip MMA (GGML_SJKVARN_KQX=1/2/3, widths 7/8
+// in mode 2, fattn-sjkvarn-kqx-instance.cu). 1: the KQ product of a body strip as two independent fp32 MMA chains (even /
+// odd channel tiles) summed once, so the 16 dependent MMAs of a strip become 2 x 8 (fp32 order only). 2: also V . P' of a
+// body strip on fp16-accumulating MMA (2x the fp32-accumulate rate on GA10x; one strip of 16 tokens per MMA, centred codes,
+// added to the fp32 O at once). 3: also the KQ chain on fp16-accumulating MMA, with codes centred on 8 (the c_r term takes
+// 8*sum Q'). Exact (sink, ring) strips keep the fp32 path. Rounding-only vs compact, never bit-identical.
 
 namespace fattn_sj_kvarn_stream {
 
@@ -97,6 +103,7 @@ constexpr size_t SLOT_BYTES = SLOT_FLOATS*sizeof(float);
 typedef tile<16, 8, half2> T_A;  // K strip (tokens x channels) / V^T strip (channels x tokens)
 typedef tile< 8, 8, half2> T_B;  // Q'^T (heads x channels) / P (heads x tokens)
 typedef tile<16, 8, float> T_C;  // KQ (tokens x heads) / O (channels x heads), fp32
+typedef tile<16, 4, half2> T_CH; // [DSPINE4 KQX] the same C fragment, fp16 (x[0] = C x[0..1], x[1] = C x[2..3])
 
 static __host__ __device__ __forceinline__ size_t split_bytes(const int nstage, const bool turbo4_body = false) {
     return turbo4_body ? (size_t) nstage*TURBO4_STAGE_BYTES : (size_t) nstage*STAGE_BYTES + 2*RMETA_BYTES;
@@ -142,6 +149,19 @@ static __device__ __forceinline__ half2 turbo4_pair(const char * packed, const i
     const float c0 = __shfl_sync(0xFFFFFFFF, centroid, q & 15, WARP_SIZE);
     const float c1 = __shfl_sync(0xFFFFFFFF, centroid, q >> 4, WARP_SIZE);
     return __floats2half2_rn(c0*norm, c1*norm);
+}
+
+// [DSPINE4 KQX] K codes centred on 8 as fp16 (v - 8, exact): 1024 + v - 1032 and (1024 + 16 v)/16 - 72
+static __device__ __forceinline__ void decode_pairs_c8(const uint32_t x, const uint32_t magic, half2 * const __restrict__ q) {
+    const half2 m1032 = make_half2(1032.0f, 1032.0f);
+    const half2 c16   = make_half2(0.0625f, 0.0625f);
+    const half2 m72   = make_half2(-72.0f, -72.0f);
+    half2 r[4];
+    raw_pairs(x, magic, r);
+    q[0] = __hsub2(r[0], m1032);
+    q[1] = __hfma2(r[1], c16, m72);
+    q[2] = __hsub2(r[2], m1032);
+    q[3] = __hfma2(r[3], c16, m72);
 }
 
 // exact codes as fp16 (K side)
@@ -326,7 +346,7 @@ static __device__ unsigned int fattn_sj_kvarn_stream_dbg_run = 0;
 // is the host's choice (mode 1: forced to the rows kernel's), so the result is bit-identical to the rows kernel while the
 // block issues fewer MMA rows per strip. Instances: max_warps 3 (width 4), 4 (width 5), 5 (width 6), 6 (widths 7, 8).
 template <int max_warps, int NSTAGE, bool turbo4_body = false, bool rot = false, bool lsa = false, sj_kvarn_tile tile = sj_kvarn_tile::rows>
-__launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 || max_warps == 6 || (max_warps == 3 && tile == sj_kvarn_tile::compact) ? 2 : 1)
+__launch_bounds__(WARP_SIZE*max_warps, max_warps == 4 || max_warps == 5 || max_warps == 6 || (max_warps == 3 && tile != sj_kvarn_tile::rows) ? 2 : 1)
 static __global__ void flash_attn_ext_sj_kvarn_stream(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -369,8 +389,13 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
     const int warp   = threadIdx.y;
     const int nwarps = blockDim.y;
     const int n_q    = int(ne01.z);
-    constexpr bool compact = tile == sj_kvarn_tile::compact;
-    static_assert(!compact || (max_warps >= 3 && max_warps <= 6), "the compact tile runs 3..6 warps");
+    constexpr bool compact = tile != sj_kvarn_tile::rows;
+    // [DSPINE4 KQX] 0 = compact / rows, 1 = KQ as two chains, 2 = + fp16-accumulate V, 3 = + fp16-accumulate KQ
+    constexpr int kqx = tile == sj_kvarn_tile::compact_kq2 ? 1 : tile == sj_kvarn_tile::compact_hv ? 2 : tile == sj_kvarn_tile::compact_h16 ? 3 : 0;
+    static_assert(kqx == 0 || (!turbo4_body && !lsa), "KQX variants are SJ-KVaRN 4/4 body instances only");
+    // [DSPINE4 VERIFY16] 8, 10 and 12 warps: widths 9..16 (GGML_SJKVARN_COMPACT16) and 7/8 (GGML_SJKVARN_COMPACT8W, fattn-sjkvarn-compact16-instance.cu)
+    static_assert(!compact || (max_warps >= 3 && max_warps <= 6) || max_warps == 8 || max_warps == 10 || max_warps == 12,
+                  "the compact tile runs 3..6 warps, or 8/10/12 for widths 9..16 (and 7/8 under COMPACT8W)");
     constexpr bool fixed_nt = max_warps == 5 || max_warps == 6 || compact; // MTP-4 verification (5), 6 rows (NT6_OCC), compact
     // compact: max_warps == ceil(6*n_q/8) == nwarps (ggml_cuda_fattn_sj_kvarn_stream_compact launches it so), compile-time
     const int NT     = compact || max_warps == 5 || max_warps == 6 ? max_warps : n_q;
@@ -499,6 +524,10 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
             qp[c].x[0] = __hmul2(__floats2half2_rn(q0.x, q0.y), ks0);
             qp[c].x[1] = __hmul2(__floats2half2_rn(q1.x, q1.y), ks1);
             cr += q0.x*kz0.x + q0.y*kz0.y + q1.x*kz1.x + q1.y*kz1.y;
+            if constexpr (kqx == 3) { // [DSPINE4 KQX] codes centred on 8: q . Q' = (q - 8) . Q' + 8 sum Q' (the fp16 Q' the MMA uses)
+                const float2 a0 = __half22float2(qp[c].x[0]), a1 = __half22float2(qp[c].x[1]);
+                cr += 8.0f*((a0.x + a0.y) + (a1.x + a1.y));
+            }
         }
         cr += __shfl_xor_sync(0xFFFFFFFF, cr, 1, WARP_SIZE);
         cr += __shfl_xor_sync(0xFFFFFFFF, cr, 2, WARP_SIZE);
@@ -839,11 +868,39 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
             const uint32_t * vwp = (const uint32_t *) (st + STRIP_BYTES) + lane;
 
             // KQ = Ktok[t] * (q . Q' + c_r) + mask
+            if constexpr (kqx == 3) {
+                T_CH kqh; // [DSPINE4 KQX] fp16-accumulating chain on centred codes
+#pragma unroll
+                for (int c = 0; c < NTC; ++c) {
+                    T_A a;
+                    decode_pairs_c8(kwp[c*WARP_SIZE], magic, a.x);
+                    mma(kqh, a, qp[c]);
+                }
+                const float2 k01 = __half22float2(kqh.x[0]);
+                const float2 k23 = __half22float2(kqh.x[1]);
+                kq.x[0] = k01.x; kq.x[1] = k01.y; kq.x[2] = k23.x; kq.x[3] = k23.y;
+            } else if constexpr (kqx >= 1) {
+                static_assert(NTC % 2 == 0, "two KQ chains need an even channel-tile count");
+                T_C kq1; // [DSPINE4 KQX] second independent chain (odd channel tiles)
+#pragma unroll
+                for (int c = 0; c < NTC; c += 2) {
+                    T_A a0, a1;
+                    decode_pairs(kwp[ c     *WARP_SIZE], magic, a0.x);
+                    decode_pairs(kwp[(c + 1)*WARP_SIZE], magic, a1.x);
+                    mma(kq,  a0, qp[c]);
+                    mma(kq1, a1, qp[c + 1]);
+                }
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    kq.x[l] += kq1.x[l];
+                }
+            } else {
 #pragma unroll
             for (int c = 0; c < NTC; ++c) {
                 T_A a;
                 decode_pairs(kwp[c*WARP_SIZE], magic, a.x);
                 mma(kq, a, qp[c]);
+            }
             }
             const half * ktok = (const half *) (st + META_KTOK);
             const half * vsh  = (const half *) (st + META_VS);
@@ -869,17 +926,38 @@ static __global__ void flash_attn_ext_sj_kvarn_stream(
             const float2 vz_c = make_float2(__half2float(vzh[lane >> 2]), __half2float(vzh[(lane >> 2) + 8]));
             const float2 pe0 = __half22float2(__hmul2(make_half2(kq.x[0], kq.x[2]), vs_c));
             const float2 pe1 = __half22float2(__hmul2(make_half2(kq.x[1], kq.x[3]), vs_c));
+            if constexpr (kqx < 2) { // [DSPINE4 KQX] centred V codes carry no 1024 bias, so ps stays 0
             ps[0] += pe0.x + pe0.y;
             ps[1] += pe1.x + pe1.y;
+            }
             pz[0] += kq.x[0]*vz_c.x + kq.x[2]*vz_c.y;
             pz[1] += kq.x[1]*vz_c.x + kq.x[3]*vz_c.y;
 
             // acc += raw V codes . P' (units Vch*s)
+            if constexpr (kqx >= 2) {
+                // [DSPINE4 KQX] centred codes (v, 16 v: exact in fp16), one fp16-accumulating MMA per channel tile, added to O
+                const half2 m1024 = make_half2(1024.0f, 1024.0f);
+#pragma unroll
+                for (int c = 0; c < NTC; ++c) {
+                    T_A a;
+                    raw_pairs(vwp[c*WARP_SIZE], magic, a.x);
+#pragma unroll
+                    for (int l = 0; l < 4; ++l) {
+                        a.x[l] = __hsub2(a.x[l], m1024);
+                    }
+                    T_CH t;
+                    mma(t, a, P);
+                    const float2 t01 = __half22float2(t.x[0]);
+                    const float2 t23 = __half22float2(t.x[1]);
+                    acc[c].x[0] += t01.x; acc[c].x[1] += t01.y; acc[c].x[2] += t23.x; acc[c].x[3] += t23.y;
+                }
+            } else {
 #pragma unroll
             for (int c = 0; c < NTC; ++c) {
                 T_A a;
                 raw_pairs(vwp[c*WARP_SIZE], magic, a.x);
                 mma(acc[c], a, P);
+            }
             }
         }
 #ifdef SJKVARN_STREAM_DBG_TIME
@@ -1308,7 +1386,7 @@ static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_co
             kernel = ggml_cuda_fattn_sj_kvarn_stream_kernel<max_warps, NSTAGE, turbo4_body, rot, true>();
         }
     }
-    if constexpr (tile == sj_kvarn_tile::compact) {
+    if constexpr (tile != sj_kvarn_tile::rows) {
         // KVROWS: one line per compact instance (warp count x ring depth), so a run can confirm the CTAs/SM it gets
         static bool logged = false;
         if (!logged) {
@@ -1318,8 +1396,8 @@ static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_co
             int ctas = 0;
             CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, kernel, WARP_SIZE*NT*KW,
                 ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body)));
-            GGML_LOG_INFO("SJKVARN COMPACT: %d-warp compact instance at %d CTA/SM (regs %d, local %zu B, nstage %d, rot %d, turbo4 %d)\n",
-                NT, ctas, attr.numRegs, attr.localSizeBytes, NSTAGE, (int) rot, (int) turbo4_body);
+            GGML_LOG_INFO("SJKVARN COMPACT: %d-warp compact instance at %d CTA/SM (regs %d, local %zu B, nstage %d, rot %d, turbo4 %d, tile %d)\n",
+                NT, ctas, attr.numRegs, attr.localSizeBytes, NSTAGE, (int) rot, (int) turbo4_body, (int) tile);
         }
     } else if constexpr (max_warps == 6) {
         // GGML_SJKVARN_NT6_OCC: one line on the first launch (any rows instance), so a run can confirm it is engaged
@@ -1334,11 +1412,22 @@ static void ggml_cuda_flash_attn_ext_sj_kvarn_stream_launch(ggml_backend_cuda_co
                 ctas, attr.numRegs, attr.localSizeBytes, NSTAGE);
         }
     }
+    if constexpr (tile != sj_kvarn_tile::rows && max_warps > 6) {
+        // [DSPINE4 VERIFY16] widths 9..16 (and 7/8, COMPACT8W): one query tile of 16 rows (ntiles_x 1); the kernel never reads blockIdx.x, so an
+        // 8-row tile would launch the whole node twice
+        GGML_ASSERT(dst->src[0]->ne[1] >= 4 && dst->src[0]->ne[1] <= 16 && KW == 1); // 4..8: GGML_SJKVARN_COMPACT8W
+        launch_fattn<D, 16, NCOLS2>
+            (ctx, dst, kernel, NT*KW,
+             ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body), UNIT,
+             /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/false, /*use_sparse=*/false, WARP_SIZE, nullptr, nullptr, parallel_blocks,
+             /*async_kv_preload=*/false, /*sj_fill_kv_splits=*/turbo4_body ? 0 : KW);
+    } else {
     launch_fattn<D, NCOLS2, NCOLS2>
         (ctx, dst, kernel, NT*KW,
          ggml_cuda_fattn_sj_kvarn_stream_shared(NT, KW, NSTAGE, turbo4_body), UNIT,
          /*need_f16_K=*/false, /*need_f16_V=*/false, /*stream_k=*/false, /*use_sparse=*/false, WARP_SIZE, nullptr, nullptr, parallel_blocks,
          /*async_kv_preload=*/false, /*sj_fill_kv_splits=*/turbo4_body ? 0 : KW);
+    }
 }
 
 // Ring depth for a launch: a requested depth if it can launch, else the occupancy choice cached per device and width.
@@ -1354,7 +1443,7 @@ static int ggml_cuda_fattn_sj_kvarn_stream_nstage(const int NT, const int KW, in
     }
     if (nstage == 0) {
         const int id = ggml_cuda_get_device();
-        static int stages[GGML_CUDA_MAX_DEVICES][9] = {};
+        static int stages[GGML_CUDA_MAX_DEVICES][17] = {}; // NT <= 8 rows, compact up to 12 warps
         int & cached = stages[id][NT];
         if (cached == 0) {
             const int blocks2 = ggml_cuda_fattn_sj_kvarn_stream_occupancy<max_warps, 2, turbo4_body, rot, tile>(NT, KW);
@@ -1571,6 +1660,23 @@ static int ggml_cuda_fattn_sj_kvarn_compact_nstage(const int W) {
     return c - 1;
 }
 
+// [DSPINE2 B0] GGML_SJKVARN_COMPACT_W78: widths 7/8 on the mode-2 compact tile when the compact mode is 1 (the default).
+// [DSPINE4] 1 = on; unset = the release rule (rows kernel at 7/8 unless GGML_SJKVARN_COMPACT_OCC picks mode 2);
+// 0 (off/false/no) = the rows kernel at 7/8 in every compact mode.
+// common/arg.cpp sets it to 1 for --spec-type draft-dflash (DSpine 8-row verify) unless it is already set, so MTP
+// verify at widths 7/8 stays bit-identical to the release. Logged once when the switch is set.
+static int ggml_cuda_fattn_sj_kvarn_compact_w78() { // -1 unset (release behaviour), 0 off, 1 on
+    static const int v = [] {
+        const int e = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT_W78");
+        if (e >= 0) {
+            GGML_LOG_INFO("ggml_cuda_fattn_sj_kvarn_compact: GGML_SJKVARN_COMPACT_W78=%d: widths 7/8 on %s\n", e,
+                e ? "the mode-2 compact tile" : "the rows kernel");
+        }
+        return e;
+    }();
+    return v;
+}
+
 // mode for a width-4/6/7/8 node: 0 when the shape is not covered (one warning per process when a switch is set)
 static int ggml_cuda_fattn_sj_kvarn_compact_mode_for(const ggml_tensor * dst, const bool kw8) {
     const int mode = ggml_cuda_fattn_sj_kvarn_compact_mode();
@@ -1653,6 +1759,79 @@ static void ggml_cuda_fattn_sj_kvarn_stream_compact(ggml_backend_cuda_context & 
         default: ggml_cuda_fattn_sj_kvarn_stream_select<6, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, 6, 1, nst, parallel_blocks); break;
     }
 }
+
+// [DSPINE4 VERIFY16] GGML_SJKVARN_COMPACT16=1 (default off): SJ-KVaRN 4/4 verify widths 9..16 at GQA 6 in one pass of the
+// compact tile (6*n_q (query, head) pairs in 8 / 10 / 12 warps x 8 columns, pad pairs never stored), instead of the
+// GGML_SJKVARN_ROWSPLIT chunks of 8 rows that each read the whole KV body. Each column keeps its own Q, mask row, online
+// softmax and output, as at widths 4..8; the KV split is the compact instance's own (mode 2), so the combine order
+// differs from the row split: rounding-only, not bit-identical. Instances live in
+// template-instances/fattn-mma-sjkvarn-compact16-instance.cu. Also off when GGML_SJKVARN_ROWSPLIT=0 or
+// GGML_SJKVARN_COMPACT_ALL=0 (it replaces the row split and is a compact tile); a log line per width proves the route.
+static inline bool ggml_cuda_fattn_sj_kvarn_compact16_env() {
+    static const bool on = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT16") > 0;
+    return on;
+}
+
+// [DSPINE4 VERIFY8W] GGML_SJKVARN_COMPACT8W=<lo> (4..8, default unset = off): widths lo..8 on a compact node (the
+// compact tile already serves it in mode 2, i.e. widths 7/8 under GGML_SJKVARN_COMPACT_W78; mode 1 at widths 4/6 keeps its
+// bit-identical copied split; width 5 has its own Q5/G6 path) run the compact16 launch at 8 warps, 1 CTA/SM (240 regs, no local memory) instead of
+// the 3..6-warp instances held to 2 CTAs/SM (168 regs, 64 B local at 5/6 warps). Own KV split (mode 2): rounding-only.
+static inline int ggml_cuda_fattn_sj_kvarn_compact8w_lo() {
+    static const int lo = [] {
+        const char * e = getenv("GGML_SJKVARN_COMPACT8W");
+        const int v = e != nullptr ? atoi(e) : 0;
+        const int lo = v >= 4 && v <= 8 ? v : 0;
+        if (e != nullptr) {
+            GGML_LOG_INFO("SJ-KVaRN GGML_SJKVARN_COMPACT8W=%s: %s\n", e, lo != 0 ? "8-warp compact launch from width lo (mode-2 widths)" : "off (needs 4..8)");
+        }
+        return lo;
+    }();
+    return lo;
+}
+
+// warps of the compact16 launch at n_q 9..16 (and 4..8 under GGML_SJKVARN_COMPACT8W) (>= ceil(6*n_q/8); pad warps hold only pad pairs)
+static constexpr int ggml_cuda_fattn_sj_kvarn_compact16_warps(const int n_q) {
+    return n_q <= 10 ? 8 : n_q <= 13 ? 10 : 12;
+}
+
+template <int W, bool turbo4_body, bool rot>
+static void ggml_cuda_fattn_sj_kvarn_stream_compact16_w(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int nstage_env) {
+    // the [DSPINE3 B1] ring-depth rule (2 strips when that keeps the CTA/SM count), cached per device as at widths <= 8
+    static const bool nst2 = ggml_cuda_fattn_sj_kvarn_env_bool("GGML_SJKVARN_COMPACT_NST2") != 0;
+    static int cached[GGML_CUDA_MAX_DEVICES] = {}; // 0 = not set yet, else nstage + 1
+    int & c = cached[ggml_cuda_get_device()];
+    if (c == 0) {
+        c = (nst2 ? ggml_cuda_fattn_sj_kvarn_compact_nstage_w<W, turbo4_body, rot>() : 0) + 1;
+    }
+    const int nst = nstage_env != 0 ? nstage_env : c - 1;
+    ggml_cuda_fattn_sj_kvarn_stream_select<W, turbo4_body, rot, sj_kvarn_tile::compact>(ctx, dst, W, 1, nst, 0);
+}
+
+template <bool turbo4_body, bool rot>
+static void ggml_cuda_fattn_sj_kvarn_stream_compact16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int nstage_env) {
+    const int n_q = (int) dst->src[0]->ne[1];
+    GGML_ASSERT(n_q >= 4 && n_q <= 16 && dst->src[0]->ne[2] == 6*dst->src[1]->ne[2]);
+    const int W = ggml_cuda_fattn_sj_kvarn_compact16_warps(n_q);
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t bit = 1u << n_q;
+    if (!(logged.fetch_or(bit) & bit)) {
+        GGML_LOG_INFO("%s: SJ-KVaRN compact16 verify tile on at width %d (%d warps, one pass, own KV split%s)\n", __func__, n_q, W,
+            n_q <= 8 ? ", COMPACT8W" : "");
+    }
+    switch (W) {
+        case 8:  ggml_cuda_fattn_sj_kvarn_stream_compact16_w< 8, turbo4_body, rot>(ctx, dst, nstage_env); break;
+        case 10: ggml_cuda_fattn_sj_kvarn_stream_compact16_w<10, turbo4_body, rot>(ctx, dst, nstage_env); break;
+        default: ggml_cuda_fattn_sj_kvarn_stream_compact16_w<12, turbo4_body, rot>(ctx, dst, nstage_env); break;
+    }
+}
+
+// exported from template-instances/fattn-sjkvarn-compact16-instance.cu
+bool ggml_cuda_flash_attn_ext_sj_kvarn_compact16_ok(const ggml_tensor * dst);
+bool ggml_cuda_flash_attn_ext_sj_kvarn_compact8w_ok(const ggml_tensor * dst);
+void ggml_cuda_flash_attn_ext_sj_kvarn_compact16_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool turbo4_body, bool rot, int nstage_env);
+// exported from template-instances/fattn-mma-sjkvarn-kqx-instance.cu ([DSPINE4 KQX]); false = not taken, run the compact tile
+// nst: the ring depth the compact tile would use (an explicit GGML_SJKVARN_DIRECT_NSTAGE, else the [DSPINE3 B1] rule)
+bool ggml_cuda_flash_attn_ext_sj_kvarn_kqx_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool turbo4_body, bool rot, int nst);
 
 template <bool turbo4_body = false, bool rot = false>
 inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1769,6 +1948,12 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
     // Unset selects by shape; 0 forces specialized half and 1 forces generic half.
     static const int nt5_mode = getenv("GGML_SJKVARN_DIRECT_NT5_GENERIC") != nullptr ? atoi(getenv("GGML_SJKVARN_DIRECT_NT5_GENERIC")) : -1;
     const int NT = dst->src[0]->ne[1];
+    if (NT > 8) {
+        // [DSPINE4 VERIFY16] only reached through ggml_cuda_flash_attn_ext_sj_kvarn_compact16_ok (fattn.cu)
+        GGML_ASSERT(NT <= 16 && ggml_cuda_fattn_sj_live_records == nullptr && !stable);
+        ggml_cuda_flash_attn_ext_sj_kvarn_compact16_run(ctx, dst, turbo4_body, rot, nstage_env);
+        return;
+    }
     GGML_ASSERT(NT >= 1 && NT <= 8);
     if (stable) {
         if (NT == 5) {
@@ -1811,9 +1996,24 @@ inline void ggml_cuda_flash_attn_ext_sj_kvarn_stream_impl(ggml_backend_cuda_cont
         int cmode = ggml_cuda_fattn_sj_kvarn_compact_mode_for(dst, NT == 4 && kw8);
         if (cmode == 1 && NT >= 7) {
             // KVROWS step b (fakeep99, 3090 Ti): mode 1 at widths 7/8 is 12-14% slower than the rows kernel (the copied
-            // 8-warp split gives the 6-warp compact grid half the blocks it can hold), so mode 1 stays on rows there.
-            // Mode 2 (own split) is 20% faster at 7/8 and keeps them.
-            cmode = 0;
+            // 8-warp split gives the 6-warp compact grid half the blocks it can hold), so mode 1 never runs there.
+            // [DSPINE2 B0] widths 7/8 take mode 2 (own split) by default instead of the rows kernel: DSpine 8-row verify at a
+            // 103K prompt (Taichi 3090, 6 seeds) -6.4% ms/round; not bit-identical (combine order), KLD vs a q8_0-KV reference
+            // not worse than the rows kernel (DSPINE2 OCCREF/OCCX4). GGML_SJKVARN_COMPACT_W78=0 = rows kernel at 7/8 (kill
+            // switch); COMPACT_ALL=0 still turns every compact tile off. Widths 4/6 keep mode 1 (bit-identical).
+            // [DSPINE4] only with GGML_SJKVARN_COMPACT_W78=1 (set for DSpine by arg.cpp); unset = the release rows kernel.
+            cmode = ggml_cuda_fattn_sj_kvarn_compact_w78() > 0 ? 2 : 0;
+        }
+        if (NT >= 7 && ggml_cuda_fattn_sj_kvarn_compact_w78() == 0) {
+            cmode = 0; // the kill switch wins over an explicit GGML_SJKVARN_COMPACT_OCC=1 too
+        }
+        if (cmode == 2 && ggml_cuda_flash_attn_ext_sj_kvarn_compact8w_ok(dst)) { // mode 1 (widths 4/6, bit-identical split) keeps its path
+            ggml_cuda_flash_attn_ext_sj_kvarn_compact16_run(ctx, dst, turbo4_body, rot, nstage_env); // [DSPINE4 VERIFY8W]
+            return;
+        }
+        if (cmode == 2 && NT >= 7 && ggml_cuda_flash_attn_ext_sj_kvarn_kqx_run(ctx, dst, turbo4_body, rot,
+                nstage_env != 0 ? nstage_env : ggml_cuda_fattn_sj_kvarn_compact_nstage<turbo4_body, rot>(6))) {
+            return; // [DSPINE4 KQX] GGML_SJKVARN_KQX=1..3 (default off)
         }
         if (cmode != 0) {
             ggml_cuda_fattn_sj_kvarn_stream_compact<turbo4_body, rot>(ctx, dst, nstage_env, cmode, NT == 4 ? 4 : NT == 6 && nt6_occ ? 6 : 8);

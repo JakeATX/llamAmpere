@@ -23421,6 +23421,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 300, true));
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 16, 2));
     }
+    // [DSPINE4 VERIFY16] every width 9..16 in the production staging (tq6_0 ring + f16 sink), plain and fused rotation,
+    // and a turbo4 body: GGML_SJKVARN_COMPACT16=1 runs them on the compact16 tile, unset on the row split
+    for (int64_t n_q = 9; n_q <= 16; ++n_q) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                                                                 GGML_TYPE_F32, 4, 4, 1));
+    }
+    for (int64_t n_q : {9, 13, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 3, 4096, true, false, GGML_TYPE_TQ6_0, 128, true, GGML_TYPE_TURBO4_0));
+        // per-row body mask (row_mask) on the 4/4 body, and rot 2 (in-kernel rotation vs WHT -> FA -> WHT, bit-identical)
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, true, false, GGML_TYPE_TQ6_0, 128, true));
+        test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 7, 1100, false, false, GGML_TYPE_TQ6_0, 128, true,
+                                                                 GGML_TYPE_F32, 4, 4, 2));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12, 16, 4, 2, 200)); // GQA 4, 12 rows
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(12,  4, 4, 2, 200)); // GQA 1, 12 rows
     test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(1, 16, 4,  2,  200)); // GQA 4
@@ -23704,7 +23718,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // [KVROWS] the compact tile at widths 4, 6, 7, 8 (GGML_SJKVARN_COMPACT_ALL=1 mode 1 / GGML_SJKVARN_COMPACT_OCC=1 mode 2):
     // the width-5 set above at the other widths (widths 1-3 as unchanged controls), and 775 records + 300 ring rows
     // (99,628 positions, the P76 1u verify length) for the real KV split counts. Mode 1 bit-identity: GGML_TEST_SEED +
-    // GGML_TEST_DUMP_HASH hashes, switch off vs on.
+    // GGML_TEST_DUMP_HASH hashes, switch off vs on. [DSPINE2 B0] GGML_SJKVARN_COMPACT_W78=1 runs widths 7/8 on mode 2 (DSpine);
+    // unset or =0 runs the same cases on the rows kernel: both settings must pass vs the CPU reference.
     for (int64_t n_q : {1, 2, 3, 4, 6, 7, 8}) {
         test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 48, 1100, true, false, GGML_TYPE_TQ6_0, 128, true));
         if (n_q < 4) {
@@ -25007,6 +25022,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "fakeep99") {
             for (int64_t n_q = 1; n_q <= 8; ++n_q) {
                 test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, 775, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
+            }
+            return test_cases;
+        }
+        // [DSPINE4] GGML_TEST_AIV2_PERF=dsw16: DSpine verify widths 1..16 (where is the 8 -> 9 row cliff?): decode attention
+        // at 775 records + 300 ring rows (99,628 positions) and 60 records (~8K), plus the P76 dense shapes (AIT4 / AIT3 /
+        // AIT5_U) and the Q6_K / Q8_0 curve (head / shortlist) at 4..16 rows
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "dsw16") {
+            for (int64_t ng : { 775, 60 }) {
+                for (int64_t n_q : { 1, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_sj_kvarn(n_q, 24, 4, ng, 300, false, false, GGML_TYPE_TQ6_0, 128, true));
+                }
+            }
+            for (int64_t n : { 4, 8, 9, 12, 16 }) {
+                for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 5120, 5120 }, { 17408, 5120 }, { 5120, 17408 }, { 12288, 5120 } }) {
+                    for (ggml_type t : { GGML_TYPE_AIT4, GGML_TYPE_AIT3 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                    test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, GGML_TYPE_AIT5_U));
+                }
+                for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 26624, 5120 }, { 248320, 5120 } }) {
+                    for (ggml_type t : { GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+                        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                    }
+                }
             }
             return test_cases;
         }
