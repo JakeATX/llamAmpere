@@ -3,7 +3,7 @@
 #include "common.cuh"
 
 // INKATTN-FAST (fork): SM86 occupancy & dead-tile-skipping decode kernel for Inkling 2 SWA/near windows.
-// Opt-in (GGML_CUDA_INKATTN_FAST=1) until gated; unset or 0 = the baseline inkattn.cu kernel.
+// Default ON; GGML_CUDA_INKATTN_FAST=0 = the baseline inkattn.cu kernel (kill switch).
 bool ggml_cuda_inkattn_fast_enabled();
 
 void ggml_cuda_inkattn_fast_launch(

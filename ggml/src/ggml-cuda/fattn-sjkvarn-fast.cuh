@@ -4,8 +4,8 @@
 
 // FATTN-SJKVARN-FAST (fork): SM 8.6 optimized SJ-KVaRN 4/4 stream decode kernel for M = 1..8 (compact & rows).
 // Targets the measured 2.629 ms/round (8 x 328.7 us, ~0.33 TB/s) far-attention bottleneck at 100K context:
-//   GGML_SJKVARN_FAST=0 : off (reverts 100% to baseline fattn-sjkvarn-stream.cuh)
-//   GGML_SJKVARN_FAST=1 : (opt-in until gated) FP32-accum HMMA + branchless issue() (595 -> ~35 insns) +
+//   GGML_SJKVARN_FAST=0 : off, kill switch (reverts 100% to baseline fattn-sjkvarn-stream.cuh)
+//   GGML_SJKVARN_FAST=1 : (default) FP32-accum HMMA + branchless issue() (595 -> ~35 insns) +
 //                         raw_pairs K (eliminates 64 FP16 decode insns/strip, NMSE ~3.9e-10) +
 //                         __expf() softmax + templated record_change() with 0.0625 cancellation
 //   GGML_SJKVARN_FAST=2 : (opt-in) FP32-accum KQ (LSE err = 0) + per-strip FP16 HMMA.16816.F16 on V -> FP32 acc

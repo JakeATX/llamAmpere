@@ -891,7 +891,7 @@ bool ggml_cuda_fattn_sj_kvarn_fast_try(ggml_backend_cuda_context & ctx, ggml_ten
     }
     static const int mode = [] {
         const char * e = getenv("GGML_SJKVARN_FAST");
-        if (!e || !*e) return 0; // default OFF until gated on the card (INKATTN review: never launched before; raw K is rounding-level, not exact)
+        if (!e || !*e) return 1; // default ON, mode 1 (gated at 100K on the card; raw K is rounding-level, not exact); GGML_SJKVARN_FAST=0 = stream kernel
         const int m = atoi(e);
         return (m >= 0 && m <= 3) ? m : 1;
     }();
