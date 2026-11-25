@@ -110,26 +110,26 @@ def depth_mix(blocks: List[torch.Tensor], cur: torch.Tensor, query: torch.Tensor
 
 
 class FrozenNVFP4Experts(nn.Module):
-    """Stores 128 NVFP4 experts compactly (~575 MB/layer) and dequantizes chunks on the fly."""
+    """Stores 128 NVFP4 or MXFP8 experts compactly and dequantizes chunks on the fly."""
 
     def __init__(
         self,
-        w13_u8: torch.Tensor,
-        w13_scale_fp8: torch.Tensor,
-        w13_outer: torch.Tensor,
-        w2_u8: torch.Tensor,
-        w2_scale_fp8: torch.Tensor,
-        w2_outer: torch.Tensor,
+        w13_w: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w13_outer: Optional[torch.Tensor],
+        w2_w: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w2_outer: Optional[torch.Tensor],
         situ_beta: float = 4.0,
         situ_linear_beta: float = 25.0,
         chunk_experts: int = 16,
     ):
         super().__init__()
-        self.register_buffer("w13_u8", w13_u8, persistent=False)
-        self.register_buffer("w13_scale_fp8", w13_scale_fp8, persistent=False)
+        self.register_buffer("w13_w", w13_w, persistent=False)
+        self.register_buffer("w13_scale", w13_scale, persistent=False)
         self.register_buffer("w13_outer", w13_outer, persistent=False)
-        self.register_buffer("w2_u8", w2_u8, persistent=False)
-        self.register_buffer("w2_scale_fp8", w2_scale_fp8, persistent=False)
+        self.register_buffer("w2_w", w2_w, persistent=False)
+        self.register_buffer("w2_scale", w2_scale, persistent=False)
         self.register_buffer("w2_outer", w2_outer, persistent=False)
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
@@ -138,20 +138,27 @@ class FrozenNVFP4Experts(nn.Module):
     @staticmethod
     @torch.no_grad()
     def _dequant_chunk(
-        packed_u8: torch.Tensor,
-        scale_fp8: torch.Tensor,
-        outer_f32: torch.Tensor,
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        outer_f32: Optional[torch.Tensor],
         lut: torch.Tensor,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # packed_u8: [E, R, C/2], scale_fp8: [E, R, C/16], outer_f32: [E]
-        e, r, c2 = packed_u8.shape
-        lo = lut[(packed_u8 & 0x0F).to(torch.int32)]
-        hi = lut[(packed_u8 >> 4).to(torch.int32)]
-        vals = torch.stack((lo, hi), dim=-1).reshape(e, r, c2 * 2)
-        s = scale_fp8.to(torch.float32) * outer_f32.view(e, 1, 1)
-        vals = vals.view(e, r, -1, 16) * s.unsqueeze(-1)
-        return vals.reshape(e, r, c2 * 2).to(dtype)
+        if outer_f32 is not None:
+            # NVFP4: packed [E, R, C/2] uint8, scale [E, R, C/16] float8_e4m3fn, outer_f32 [E]
+            e, r, c2 = packed.shape
+            lo = lut[(packed & 0x0F).to(torch.int32)]
+            hi = lut[(packed >> 4).to(torch.int32)]
+            vals = torch.stack((lo, hi), dim=-1).reshape(e, r, c2 * 2)
+            s = scale.to(torch.float32) * outer_f32.view(e, 1, 1)
+            vals = vals.view(e, r, -1, 16) * s.unsqueeze(-1)
+            return vals.reshape(e, r, c2 * 2).to(dtype)
+        # MXFP8: packed [E, R, C] float8_e4m3fn, scale [E, R, C/32] uint8 (UE8M0: 2^(s - 127))
+        e, r, c = packed.shape
+        vals = packed.to(torch.float32)
+        s = torch.ldexp(torch.ones(scale.shape, dtype=torch.float32, device=scale.device), scale.to(torch.int32) - 127)
+        vals = vals.view(e, r, -1, 32) * s.unsqueeze(-1)
+        return vals.reshape(e, r, c).to(dtype)
 
     def forward(
         self,
@@ -162,7 +169,7 @@ class FrozenNVFP4Experts(nn.Module):
     ) -> torch.Tensor:
         t_len, hidden = x.shape
         k_top = top_idx.shape[-1]
-        n_exp = self.w13_u8.shape[0]
+        n_exp = self.w13_w.shape[0]
 
         flat_exp = top_idx.reshape(-1)
         flat_tok = torch.arange(t_len, device=x.device).unsqueeze(1).expand(t_len, k_top).reshape(-1)
@@ -192,10 +199,18 @@ class FrozenNVFP4Experts(nn.Module):
                 continue
             idx_t = torch.tensor(active, device=x.device, dtype=torch.long)
             w13_c = self._dequant_chunk(
-                self.w13_u8[idx_t], self.w13_scale_fp8[idx_t], self.w13_outer[idx_t], lut, x.dtype
+                self.w13_w[idx_t],
+                self.w13_scale[idx_t],
+                self.w13_outer[idx_t] if self.w13_outer is not None else None,
+                lut,
+                x.dtype,
             )
             w2_c = self._dequant_chunk(
-                self.w2_u8[idx_t], self.w2_scale_fp8[idx_t], self.w2_outer[idx_t], lut, x.dtype
+                self.w2_w[idx_t],
+                self.w2_scale[idx_t],
+                self.w2_outer[idx_t] if self.w2_outer is not None else None,
+                lut,
+                x.dtype,
             )
             for local_i, e in enumerate(active):
                 s0, s1 = offsets[e], offsets[e + 1]
@@ -641,17 +656,25 @@ class Inkling2MiniSurgeryModel(nn.Module):
                         layer.set_frozen(f"ctrl_{c_short}_gain", sf.get_tensor(f"{p}.controllers.{c_hf}.gain_weight").to(device))
                         layer.set_frozen(f"ctrl_{c_short}_forget", sf.get_tensor(f"{p}.controllers.{c_hf}.forget_weight").to(device))
 
-                w13_amax = sf.get_tensor(f"{p}.mlp.experts.w13_weight_amax").float()
-                w13_den = sf.get_tensor(f"{p}.mlp.experts.w13_weight_outer_scale_denominator").float().item()
-                w2_amax = sf.get_tensor(f"{p}.mlp.experts.w2_weight_amax").float()
-                w2_den = sf.get_tensor(f"{p}.mlp.experts.w2_weight_outer_scale_denominator").float().item()
+                sf_keys = set(sf.keys())
+                amax13_k = f"{p}.mlp.experts.w13_weight_amax"
+                if amax13_k in sf_keys:
+                    w13_amax = sf.get_tensor(amax13_k).float()
+                    w13_den = sf.get_tensor(f"{p}.mlp.experts.w13_weight_outer_scale_denominator").float().item()
+                    w2_amax = sf.get_tensor(f"{p}.mlp.experts.w2_weight_amax").float()
+                    w2_den = sf.get_tensor(f"{p}.mlp.experts.w2_weight_outer_scale_denominator").float().item()
+                    w13_outer = (w13_amax / w13_den).to(device)
+                    w2_outer = (w2_amax / w2_den).to(device)
+                else:
+                    w13_outer = None
+                    w2_outer = None
                 layer.experts = FrozenNVFP4Experts(
-                    w13_u8=sf.get_tensor(f"{p}.mlp.experts.w13_weight").to(device),
-                    w13_scale_fp8=sf.get_tensor(f"{p}.mlp.experts.w13_weight_scale").to(device),
-                    w13_outer=(w13_amax / w13_den).to(device),
-                    w2_u8=sf.get_tensor(f"{p}.mlp.experts.w2_weight").to(device),
-                    w2_scale_fp8=sf.get_tensor(f"{p}.mlp.experts.w2_weight_scale").to(device),
-                    w2_outer=(w2_amax / w2_den).to(device),
+                    w13_w=sf.get_tensor(f"{p}.mlp.experts.w13_weight").to(device),
+                    w13_scale=sf.get_tensor(f"{p}.mlp.experts.w13_weight_scale").to(device),
+                    w13_outer=w13_outer,
+                    w2_w=sf.get_tensor(f"{p}.mlp.experts.w2_weight").to(device),
+                    w2_scale=sf.get_tensor(f"{p}.mlp.experts.w2_weight_scale").to(device),
+                    w2_outer=w2_outer,
                     chunk_experts=chunk_experts,
                 )
 
