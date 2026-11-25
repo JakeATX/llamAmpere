@@ -69,6 +69,7 @@ struct llama_mtp_hot_vocab {
     std::vector<uint8_t> static_mask;             // [n_vocab] 1 = permanent part of the shortlist
     std::vector<int32_t> slot_of;                 // [n_vocab] hot slot holding the id, -1 if not resident
     std::vector<int32_t> slots;                   // [n_hot]   token id of each hot slot
+    std::vector<int32_t> init_slots;              // [n_hot]   the ids the slots held at load (reset target)
     std::unordered_map<int32_t, entry> cands;     // observed non-static ids
 
     // `ids` is the full shortlist; its last `n_hot` entries become the hot slots
@@ -92,6 +93,34 @@ struct llama_mtp_hot_vocab {
             slots[i]              = ids[n_static + i];
             slot_of[slots[i]]     = i;
         }
+        init_slots = slots;
+    }
+
+    // [REPEAT] forget every earlier request: the slots go back to the ids they held at load and the
+    // statistics are cleared, so the next observe()+select() depends only on the tokens given then.
+    // Returns the slots whose id changed (the caller rewrites those entries of the map).
+    std::vector<replacement> reset() {
+        std::vector<replacement> out;
+        if (n_hot <= 0) {
+            return out;
+        }
+        for (int32_t i = 0; i < n_hot; ++i) {
+            if (slots[i] >= 0) {
+                slot_of[slots[i]] = -1;
+            }
+        }
+        for (int32_t i = 0; i < n_hot; ++i) {
+            if (slots[i] != init_slots[i]) {
+                out.push_back({ i, init_slots[i] });
+            }
+            slots[i] = init_slots[i];
+            if (slots[i] >= 0) {
+                slot_of[slots[i]] = i;
+            }
+        }
+        cands.clear();
+        req_counter = 0;
+        return out;
     }
 
     float decay(int64_t delta) const {

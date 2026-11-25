@@ -14,6 +14,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+#include <random>
 #include <sstream>
 #include <unordered_set>
 
@@ -164,6 +167,12 @@ static void test(void) {
         base.n_ubatch = 0;
         assert(common_base_params_to_speculative(base).n_ubatch == 64);
         base.n_ubatch = 1024;
+        // an explicit smaller --spec-draft-n-ubatch stays; a larger one is still capped at 64
+        base.speculative.draft.n_ubatch = 8;
+        assert(common_base_params_to_speculative(base).n_ubatch == 8);
+        base.speculative.draft.n_ubatch = 512;
+        assert(common_base_params_to_speculative(base).n_ubatch == 64);
+        base.speculative.draft.n_ubatch = -1;
         base.n_parallel = 2;
         assert(common_base_params_to_speculative(base).n_ubatch == 1024);
         base.n_parallel = 1;
@@ -286,7 +295,7 @@ static void test(void) {
                 assert(selected.card_preset_fit_target);
                 assert(selected.sampling.temp == 1.0f && selected.sampling.top_k == 20);
                 assert(selected.sampling.top_p == 0.95f && selected.sampling.min_p == 0.0f);
-                assert(selected.sampling.spec_lossy == (name != "8dense"));
+                assert(selected.sampling.spec_lossy);
                 for (size_t target : selected.fit_params_target) {
                     assert(target == size_t(headless ? 500 : 1024) * 1024 * 1024);
                 }
@@ -385,10 +394,43 @@ static void test(void) {
             common_params multi;
             assert(parse_card({"-np", std::to_string(slots), "--preset", "24dense"}, multi));
             assert(multi.n_parallel == slots && multi.kv_unified && multi.speculative.draft.n_min == 4);
+            assert(multi.speculative.draft.attn_window == 4096 && multi.gdn_replay);
+            assert(multi.speculative.draft.n_max == 5 && multi.speculative.draft.n_min_adaptive == 4);
+            assert(multi.n_ubatch == 1024);
+            assert(!(multi.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP));
+        }
+        {
+            common_params one;
+            assert(parse_card({"--preset", "24dense"}, one));
+            assert(one.n_parallel == 1 && one.speculative.draft.attn_window == 0 && !one.gdn_replay);
+            assert(one.speculative.draft.vocab_map == "auto" &&
+                   !(one.speculative.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_VOCAB_MAP));
+            assert(one.speculative.draft.n_max == 7 && one.speculative.draft.n_min_adaptive == 3);
+            assert(one.n_batch == 4096 && one.n_ubatch == 2048);
+            common_params ub_kept;
+            assert(parse_card({"--preset", "24dense", "-ub", "1024"}, ub_kept));
+            assert(ub_kept.n_ubatch == 1024);
+            common_params multi_large;
+            assert(parse_card({"-np", "2", "-b", "8192", "--preset", "24dense"}, multi_large));
+            assert(multi_large.n_ubatch == 1024);
+            setenv("LLAMA_ARG_UBATCH", "1024", 1);
+            common_params ub_env;
+            assert(parse_card({"--preset", "24dense"}, ub_env));
+            unsetenv("LLAMA_ARG_UBATCH");
+            assert(ub_env.n_ubatch == 1024);
+            common_params kept;
+            assert(parse_card({"--preset", "24dense", "--spec-draft-window", "4096", "--gdn-replay"}, kept));
+            assert(kept.speculative.draft.attn_window == 4096 && kept.gdn_replay);
         }
         common_params depth;
         assert(parse_card({"--spec-draft-n-max", "3", "--preset", "24dense"}, depth));
         assert(depth.speculative.draft.n_max == 3 && depth.speculative.draft.n_min_adaptive == 3);
+        common_params depth_max;
+        assert(parse_card({"--preset", "24dense", "--spec-draft-n-max", "6"}, depth_max));
+        assert(depth_max.speculative.draft.n_max == 6 && depth_max.speculative.draft.n_min_adaptive == 4);
+        common_params fixed_depth;
+        assert(parse_card({"--preset", "24dense", "--spec-type", "draft-mtp"}, fixed_depth));
+        assert(fixed_depth.speculative.draft.n_max == 5);
         for (bool preset_first : {false, true}) {
             std::vector<std::string> args = {"--spec-draft-n-min-adaptive", "6"};
             args.insert(preset_first ? args.begin() : args.end(), {"--preset", "24dense"});
@@ -401,10 +443,10 @@ static void test(void) {
                            "--spec-draft-n-max", "5"}, conflict));
         common_params batch;
         assert(parse_card({"--preset", "24dense", "-b", "128"}, batch));
-        assert(batch.n_batch == 128 && batch.n_ubatch <= 128);
+        assert(batch.n_batch == 128 && batch.n_ubatch == 128);
         common_params large_batch;
         assert(parse_card({"-b", "8192", "--preset", "24dense"}, large_batch));
-        assert(large_batch.n_batch == 8192 && large_batch.n_ubatch == 1024);
+        assert(large_batch.n_batch == 8192 && large_batch.n_ubatch == 2048);
         for (const auto & name : {"10dense", "12dense"}) {
             common_params plain_mtp;
             assert(parse_card({"--preset", name, "--spec-draft-n-min-adaptive", "6"}, plain_mtp));
@@ -482,6 +524,14 @@ static void test(void) {
         }
         common_params no_preset;
         assert(common_card_preset_apply_env(no_preset).empty());
+        // 8dense loads the mtp-dm.gguf overlay from the model directory: give it a model dir that has one.
+        const auto tiny_dir = std::filesystem::temp_directory_path() /
+                ("test-arg-parser-8dense-" + std::to_string(std::random_device{}()));
+        std::filesystem::create_directories(tiny_dir);
+        const std::string tiny_model = (tiny_dir / "AI2M10-iw.gguf").string();
+        const std::string tiny_overlay = (tiny_dir / "mtp-dm.gguf").string();
+        std::ofstream(tiny_model).put('x');
+        std::ofstream(tiny_overlay).put('x');
         for (bool headless : {false, true}) {
             common_params medium_env;
             assert(parse_card({"12dense", headless ? "headless" : "headed"}, medium_env));
@@ -494,7 +544,7 @@ static void test(void) {
         }
         for (const auto & name : {"24dense", "12dense", "10dense", "8dense"}) {
             common_params dynamic;
-            assert(parse_card({"--preset", name}, dynamic));
+            assert(parse_card({"--preset", name, "-m", tiny_model}, dynamic));
             const auto enabled = common_card_preset_apply_env(dynamic);
             assert(enabled.find(" LLAMA_DEEPCTX_LADDER=1") != std::string::npos);
             setenv("LLAMA_DEEPCTX_LADDER", "0", 1);
@@ -531,12 +581,31 @@ static void test(void) {
             }
             unsetenv(key.c_str());
         }
+        // 8dense loads the mtp-dm.gguf drafter overlay beside the model and no D1 head; a missing overlay stops with a hint.
+        const std::string saved_overlay = std::getenv("LLAMA_MODEL_OVERLAY_PATCH") ? std::getenv("LLAMA_MODEL_OVERLAY_PATCH") : "";
+        const std::string saved_d1 = std::getenv("LLAMA_D1_HEAD") ? std::getenv("LLAMA_D1_HEAD") : "";
+        unsetenv("LLAMA_MODEL_OVERLAY_PATCH");
+        unsetenv("LLAMA_D1_HEAD");
+        common_params tiny_missing;
+        assert(parse_card({"8dense", "-m", "/models/tiny-missing/AI2M10-iw.gguf"}, tiny_missing));
+        bool missing_threw = false;
+        try {
+            common_card_preset_apply_env(tiny_missing);
+        } catch (const std::runtime_error & e) {
+            missing_threw = std::string(e.what()).find("/models/tiny-missing/mtp-dm.gguf") != std::string::npos;
+        }
+        assert(missing_threw);
+        for (const auto & key : env_keys) {
+            unsetenv(key.c_str());
+        }
         common_params tiny_env;
-        assert(parse_card({"8dense", "-m", "/models/tiny/healed.gguf"}, tiny_env));
-        common_card_preset_apply_env(tiny_env);
-        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/models/tiny/mtp-dm.gguf,/models/tiny/head-ait2.gguf");
-        assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/models/tiny/head-exact-f16.gguf");
-        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == "/models/tiny/lsa-qwen38-27b-d2048.gguf");
+        assert(parse_card({"8dense", "-m", tiny_model}, tiny_env));
+        const auto tiny_applied = common_card_preset_apply_env(tiny_env);
+        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == tiny_overlay && !std::getenv("LLAMA_D1_HEAD"));
+        assert(tiny_applied.find(" LLAMA_MODEL_OVERLAY_PATCH=" + tiny_overlay) != std::string::npos);
+        assert(tiny_applied.find("D1_HEAD") == std::string::npos);
+        assert(tiny_env.sampling.spec_lossy);
+        assert(std::string(std::getenv("LLAMA_LSA_MAP")) == (tiny_dir / "lsa-qwen38-27b-d2048.gguf").string());
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "1");
         assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "7");
         assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "1");
@@ -544,15 +613,14 @@ static void test(void) {
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
-        setenv("LLAMA_MODEL_OVERLAY_PATCH", "/explicit/mtp.gguf,/explicit/head.gguf", 1);
-        setenv("LLAMA_D1_HEAD", "/explicit/exact.gguf", 1);
+        // shell values win; an empty overlay value selects the file's own MTP layer and skips the file check
+        setenv("LLAMA_MODEL_OVERLAY_PATCH", "", 1);
         setenv("LLAMA_LSA_MEAN_CHUNKS", "0", 1);
         setenv("LLAMA_RESERVE_VERIFY_ROWS", "9", 1);
         setenv("GGML_CUDA_DISABLE_GRAPHS", "0", 1);
         setenv("GGML_ALLOC_GROW_PCT", "5", 1);
-        common_card_preset_apply_env(tiny_env);
-        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")) == "/explicit/mtp.gguf,/explicit/head.gguf");
-        assert(std::string(std::getenv("LLAMA_D1_HEAD")) == "/explicit/exact.gguf");
+        common_card_preset_apply_env(tiny_missing);
+        assert(std::string(std::getenv("LLAMA_MODEL_OVERLAY_PATCH")).empty() && !std::getenv("LLAMA_D1_HEAD"));
         assert(std::string(std::getenv("LLAMA_LSA_MEAN_CHUNKS")) == "0");
         assert(std::string(std::getenv("LLAMA_RESERVE_VERIFY_ROWS")) == "9");
         assert(std::string(std::getenv("GGML_CUDA_DISABLE_GRAPHS")) == "0");
@@ -560,6 +628,7 @@ static void test(void) {
         for (const auto & key : env_keys) {
             unsetenv(key.c_str());
         }
+        std::filesystem::remove_all(tiny_dir);
         common_params large_env;
         assert(parse_card({"--preset", "24dense"}, large_env));
         common_card_preset_apply_env(large_env);
@@ -570,6 +639,12 @@ static void test(void) {
             } else {
                 unsetenv(key.c_str());
             }
+        }
+        if (!saved_overlay.empty()) {
+            setenv("LLAMA_MODEL_OVERLAY_PATCH", saved_overlay.c_str(), 1);
+        }
+        if (!saved_d1.empty()) {
+            setenv("LLAMA_D1_HEAD", saved_d1.c_str(), 1);
         }
 #endif
     }

@@ -42,7 +42,9 @@ static __device__ __forceinline__ void mma(int (&c)[4], const uint32_t (&a)[4], 
 }
 
 // Rotated, quantized activations; per-token scales are indexed by 128-column unit.
-template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false, int SCALE_CHUNKS = 5>
+// [K126] PF: each warp loads its next weight unit into registers while it decodes the current one (the loads of unit
+// u + 4 are issued right after unit u is in shared memory). Same bytes, same arithmetic and order: y is bit-identical.
+template<int B, int V, uint32_t C, int XSH = 0, bool ROW_SCALE = false, int SCALE_CHUNKS = 5, bool PF = false>
 static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const int8_t * x,
         const float * xs, float * y, int M, int K, int N) {
     static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
@@ -55,8 +57,34 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
     const int row = lane >> 2, col = lane & 3, nu = K / 128;
     const int64_t nbase = int64_t(blockIdx.y) * 8, mbase = int64_t(blockIdx.x) * 16;
     float sum[4] = {0, 0, 0, 0};
+    constexpr int LW = (UW + 31) / 32;
+    uint32_t pre[LW];
+    auto fetch = [&](int uu) {
+#pragma unroll
+        for (int k = 0; k < LW; ++k) {
+            const int i = lane + 32 * k;
+            if (i < UW) {
+                if constexpr (ROW_SCALE) {
+                    constexpr int BW = 8 + SCALE_CHUNKS*(UW - 8);
+                    const uint32_t * block = reinterpret_cast<const uint32_t *>(weights) +
+                        (int64_t(blockIdx.x)*(nu/SCALE_CHUNKS) + uu/SCALE_CHUNKS)*BW;
+                    pre[k] = __ldg(i < 8 ? block + i : block + 8 + (uu%SCALE_CHUNKS)*(UW - 8) + i - 8);
+                } else {
+                    pre[k] = __ldg(reinterpret_cast<const uint32_t *>(weights) + (int64_t(blockIdx.x) * nu + uu) * UW + i);
+                }
+            }
+        }
+    };
+    if constexpr (PF) {
+        if (warp < nu) fetch(warp);
+    }
     for (int u = warp; u < nu; u += 4) {
-        if constexpr (ROW_SCALE) {
+        if constexpr (PF) {
+#pragma unroll
+            for (int k = 0; k < LW; ++k) {
+                if (lane + 32 * k < UW) tiles[warp][lane + 32 * k] = pre[k];
+            }
+        } else if constexpr (ROW_SCALE) {
             constexpr int BW = 8 + SCALE_CHUNKS*(UW - 8);
             const uint32_t * block = reinterpret_cast<const uint32_t *>(weights) +
                 (int64_t(blockIdx.x)*(nu/SCALE_CHUNKS) + u/SCALE_CHUNKS)*BW;
@@ -69,6 +97,9 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
             for (int i = lane; i < UW; i += 32) tiles[warp][i] = __ldg(source + i);
         }
         __syncwarp();
+        if constexpr (PF) {
+            if (u + 4 < nu) fetch(u + 4);
+        }
         int c[4] = {0, 0, 0, 0};
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -106,11 +137,18 @@ static __global__ void __launch_bounds__(128) mmv(const uint8_t * weights, const
 // arithmetic: the same exact int32 IMMA sum per unit, the same float scaling, the same split of units over the four
 // warps of a strip (u = warp, warp + 4, ...) and the same (p0 + p1) + (p2 + p3) partial sum, so y is bit-identical
 // to the mmv result. grid (ceil(M/16 / S), ceil(N / TN)), 128 S threads.
-template<int B, int V, uint32_t C, int XSH, int NB, int S>
+// [K126] ROW_SCALE / SCALE_CHUNKS: the row-scale block layouts (AIF25_U2 5 chunks, AIF25_U2_512 and AIF175_U2 4 chunks),
+// addressed exactly as mmv addresses them (ms in place of blockIdx.x), so the unit bytes, and thus y, are the same.
+// [KAIMULTI] PF: the mmv register prefetch (each warp loads unit u + 4 into registers while it decodes unit u). Only the
+// load timing changes, so y stays bit-identical. Used with NB 2-4 at verify widths 9..32, where the weight decode is
+// done once per unit for all the tokens instead of once per 8 tokens.
+template<int B, int V, uint32_t C, int XSH, int NB, int S, bool ROW_SCALE = false, int SCALE_CHUNKS = 5, bool PF = false>
 static __global__ void __launch_bounds__(128 * S) mmq(const uint8_t * weights, const int8_t * x,
         const float * xs, float * y, int M, int K, int N) {
     static_assert(XSH == 0 || XSH == 1, "activation scale covers 128 or 256 columns");
     static_assert(S == 1 || S == 2, "one or two 16-row strips per block");
+    static_assert(!ROW_SCALE || (B == 5 && V == 2 && (SCALE_CHUNKS == 5 || SCALE_CHUNKS == 4)) ||
+        (B == 7 && V == 4 && SCALE_CHUNKS == 4), "row-scale pair layout");
     constexpr int UW = unit_bytes<B, V> / 4, TW = tile_words<B, V>, TN = 8 * NB;
     __shared__ uint32_t tiles[S][4][UW];
     __shared__ float partial[S][4][TN][16];
@@ -122,11 +160,50 @@ static __global__ void __launch_bounds__(128 * S) mmq(const uint8_t * weights, c
     for (int nb = 0; nb < NB; ++nb) {
         sum[nb][0] = sum[nb][1] = sum[nb][2] = sum[nb][3] = 0;
     }
+    constexpr int LW = (UW + 31) / 32;
+    uint32_t pre[LW];   // unused (and eliminated) without PF
+    auto fetch = [&](int uu) {
+#pragma unroll
+        for (int k = 0; k < LW; ++k) {
+            const int i = lane + 32 * k;
+            if (i < UW) {
+                if constexpr (ROW_SCALE) {
+                    constexpr int BW = 8 + SCALE_CHUNKS*(UW - 8);
+                    const uint32_t * block = reinterpret_cast<const uint32_t *>(weights) +
+                        (ms*(nu/SCALE_CHUNKS) + uu/SCALE_CHUNKS)*BW;
+                    pre[k] = __ldg(i < 8 ? block + i : block + 8 + (uu%SCALE_CHUNKS)*(UW - 8) + i - 8);
+                } else {
+                    pre[k] = __ldg(reinterpret_cast<const uint32_t *>(weights) + (ms * nu + uu) * UW + i);
+                }
+            }
+        }
+    };
     if (ms < M / 16) {
+        if constexpr (PF) {
+            if (warp < nu) fetch(warp);
+        }
         for (int u = warp; u < nu; u += 4) {
-            const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (ms * nu + u) * UW;
-            for (int i = lane; i < UW; i += 32) tiles[strip][warp][i] = __ldg(source + i);
+            if constexpr (PF) {
+#pragma unroll
+                for (int k = 0; k < LW; ++k) {
+                    if (lane + 32 * k < UW) tiles[strip][warp][lane + 32 * k] = pre[k];
+                }
+            } else if constexpr (ROW_SCALE) {
+                constexpr int BW = 8 + SCALE_CHUNKS*(UW - 8);
+                const uint32_t * block = reinterpret_cast<const uint32_t *>(weights) +
+                    (ms*(nu/SCALE_CHUNKS) + u/SCALE_CHUNKS)*BW;
+                const uint32_t * payload = block + 8 + (u%SCALE_CHUNKS)*(UW - 8);
+                for (int i = lane; i < UW; i += 32) {
+                    tiles[strip][warp][i] = __ldg(i < 8 ? block + i : payload + i - 8);
+                }
+            } else {
+                const uint32_t * source = reinterpret_cast<const uint32_t *>(weights) + (ms * nu + u) * UW;
+                for (int i = lane; i < UW; i += 32) tiles[strip][warp][i] = __ldg(source + i);
+            }
             __syncwarp();
+            if constexpr (PF) {
+                if (u + 4 < nu) fetch(u + 4);
+            }
             int c[NB][4];
 #pragma unroll
             for (int nb = 0; nb < NB; ++nb) {

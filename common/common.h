@@ -309,6 +309,7 @@ struct common_params_sampling {
     std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+    int32_t                   reasoning_answer_reserve = -1;   // fork NOCUTOFF: tokens kept for the answer when thinking nears the token limit (-1 = auto, 0 = off)
 
     bool backend_sampling = false;
 
@@ -871,6 +872,7 @@ struct common_params {
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
+    bool anthropic_think_on_request = true; // /v1/messages: think only when the request has "thinking" (Anthropic semantics)
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 

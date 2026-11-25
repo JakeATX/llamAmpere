@@ -1983,11 +1983,21 @@ void llama_context::draft_vocab_observe(const llama_token * toks, size_t n) {
     draft_vocab.hot.observe(toks, n);
 }
 
+int32_t llama_context::draft_vocab_reset() {
+    if (draft_vocab.n_hot <= 0 || draft_vocab.ids == nullptr) {
+        return 0;
+    }
+    return draft_vocab_apply(draft_vocab.hot.reset());
+}
+
 int32_t llama_context::draft_vocab_refresh() {
     if (draft_vocab.n_hot <= 0 || draft_vocab.ids == nullptr) {
         return 0;
     }
-    const auto reps = draft_vocab.hot.select();
+    return draft_vocab_apply(draft_vocab.hot.select());
+}
+
+int32_t llama_context::draft_vocab_apply(const std::vector<llama_mtp_hot_vocab::replacement> & reps) {
     if (reps.empty()) {
         return 0;
     }
@@ -6028,7 +6038,8 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
         }
         using reset_fn = bool (*)(ggml_backend_t);
         auto reset = (reset_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_reset");
-        if (!reset || !reset(backend)) {
+        // fork: a non-CUDA GPU backend has no CUDA graphs holding scratch addresses; resize it like the CPU backends.
+        if (reset && !reset(backend)) {
             LLAMA_LOG_ERROR("%s: cannot reset graphs on %s before scratch resize\n", __func__, ggml_backend_name(backend));
             return false;
         }
@@ -11197,6 +11208,10 @@ void llama_draft_vocab_observe(llama_context * ctx, const llama_token * toks, si
 
 int32_t llama_draft_vocab_refresh(llama_context * ctx) {
     return ctx->draft_vocab_refresh();
+}
+
+int32_t llama_draft_vocab_reset(llama_context * ctx) {
+    return ctx->draft_vocab_reset();
 }
 
 int32_t llama_draft_vocab_n_hot(const llama_context * ctx) {

@@ -18,6 +18,9 @@
 #include "peg-parser.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -1112,7 +1115,40 @@ common_chat_prompt common_chat_template_direct_apply_impl(
     }
     if (inp.contains("reasoning_effort") && inp["reasoning_effort"].is_string() && !inp["reasoning_effort"].empty()) {
         std::string reasoning_effort = inp["reasoning_effort"].get<std::string>();
-        jinja::caps_apply_reasoning_effort(ctx, reasoning_effort);
+        // A template that raises on levels it does not know (Qwen3.8 takes low, medium and xhigh; Claude Code sends
+        // "high") gets the nearest level it takes, ties upward; a word outside the known scale falls back to the
+        // template default. Templates that accept any value are left alone.
+        const auto & caps = tmpl.original_caps();
+        const auto & ok   = caps.reasoning_effort_accepted;
+        if (caps.reasoning_effort_strict && !ok.empty() && std::find(ok.begin(), ok.end(), reasoning_effort) == ok.end()) {
+            static const std::vector<std::string> scale = { "minimal", "low", "medium", "high", "xhigh", "max" };
+            const auto rank = [&](const std::string & l) { return (int) (std::find(scale.begin(), scale.end(), l) - scale.begin()); };
+            std::string lower = reasoning_effort;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+            const int want = rank(lower);
+            std::string best;
+            if (want < (int) scale.size()) {
+                int best_d = INT_MAX;
+                for (const auto & l : ok) {
+                    const int d = std::abs(rank(l) - want);
+                    if (d < best_d || (d == best_d && rank(l) > rank(best))) { best = l; best_d = d; }
+                }
+            }
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LOG_WRN("%s: the chat template does not take reasoning_effort '%s'; using '%s' (logged once)\n", __func__,
+                        reasoning_effort.c_str(), best.empty() ? "the template default" : best.c_str());
+            }
+            reasoning_effort = best;
+            if (best.empty()) {
+                inp.erase("reasoning_effort");
+            } else {
+                inp["reasoning_effort"] = best;
+            }
+        }
+        if (!reasoning_effort.empty()) {
+            jinja::caps_apply_reasoning_effort(ctx, reasoning_effort);
+        }
     }
 
     jinja::global_from_json(ctx, inp, inputs.mark_input);

@@ -23,6 +23,11 @@ struct caps {
     // reasoning effort levels the template renders distinctly, from lowest to highest
     std::vector<std::string> reasoning_effort_levels;
 
+    // rendering fails on a reasoning effort level the template does not know (Qwen3.8: only low, medium and xhigh); then
+    // these are the scale levels (minimal..max) it renders without raising, aliases included
+    bool reasoning_effort_strict = false;
+    std::vector<std::string> reasoning_effort_accepted;
+
     // one of the 2 content capabilities must be true
     bool supports_string_content = true;
     bool supports_typed_content = false;

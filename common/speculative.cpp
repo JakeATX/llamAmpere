@@ -4513,7 +4513,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const char * lean = std::getenv("LLAMA_MTP_DRAFT_COMPUTE_LEAN");
     if (lean && std::strcmp(lean, "1") == 0 && spec_mtp && !has_draft && params.n_parallel == 1) {
         // Catch-up still needs the full logical batch; decode splits it into smaller microbatches.
-        result.n_ubatch = std::min(params.n_ubatch == 0 ? params.n_batch : params.n_ubatch, 64);
+        // An explicit smaller --spec-draft-n-ubatch (already in result.n_ubatch) is kept.
+        result.n_ubatch = std::min(result.n_ubatch == 0 ? params.n_batch : result.n_ubatch, 64);
     }
 
     // LLAMA_MTP_DRAFT_UB_MULTI=1 (opt-in, MULTI4LSA W1): with several slots and no -ubd, cap the built-in MTP draft
@@ -4801,6 +4802,14 @@ int32_t common_speculative_refresh(common_speculative_init_result * spec) {
     }
     llama_context * ctx = spec->context();
     return ctx == nullptr ? 0 : llama_draft_vocab_refresh(ctx);
+}
+
+int32_t common_speculative_vocab_reset(common_speculative_init_result * spec) {
+    if (spec == nullptr) {
+        return 0;
+    }
+    llama_context * ctx = spec->context();
+    return ctx == nullptr ? 0 : llama_draft_vocab_reset(ctx);
 }
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {

@@ -167,7 +167,7 @@ The tail must exceed the maximum draft width so speculative rollback stays in un
 
 These cut CUDA memory that is not part of the model, KV or compute buffers. The numbers are from Qwen3.8-27B EXL3 2.0 bpw
 at `-c 204800`, ub 512, with the MTP drafter, on an RTX 3090 Ti (84 SMs); the token streams were byte-identical with and
-without each switch.
+without each switch. These numbers were measured with a fixed ub; card presets (or `LLAMA_DEEPCTX_LADDER=1`) use the microbatch ladder.
 
 | Switch | Default | Effect | Measured |
 |--------|---------|--------|----------|

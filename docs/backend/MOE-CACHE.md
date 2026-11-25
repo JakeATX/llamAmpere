@@ -182,11 +182,12 @@ On three GPUs at context 65,536, target-only auto-fit settled near 16.8 t/s and 
 
 A 56,045-token retrieval prompt then validated this production layout at long context. After an initial client cancellation, the replacement request reused 8,195 prefix tokens, processed the remaining 47,850 tokens at 40.74 t/s, and returned the exact middle-document key `739184`. The request completed without truncation, OOM, cache trim, or dispatch error. Shutting down the server returned all four physical GPUs to 1 MiB, including the GPU that had remained hidden throughout the run.
 
-The validated three-GPU production profile uses cache-aware fit and embedded MTP:
+The three-GPU production profile (validated with a fixed `-ub 512`, before the ladder) uses cache-aware fit and embedded MTP:
 
 ```sh
 CUDA_VISIBLE_DEVICES=0,1,2 \
 GGML_CUDA_MOE_CACHE_RESERVE_MB=3072 \
+LLAMA_DEEPCTX_LADDER=1 \
 ./build/bin/llama-server \
     -m /path/to/GLM-5.2-UD-IQ2_M-00001-of-00006.gguf \
     --fit on --moe-cache auto \
@@ -195,7 +196,7 @@ GGML_CUDA_MOE_CACHE_RESERVE_MB=3072 \
     --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.5
 ```
 
-At context 65,536, a 2048-token ubatch required about 3952 MiB for the prompt graph and failed to fit; 512 was stable. Letting the planner choose placement was substantially faster than forcing all dense work onto the first GPU in this MTP configuration. The adaptive overlap, fill, admission, and matvec defaults also outperformed the previous manual overrides, so they remain automatic in the tested configuration.
+`LLAMA_DEEPCTX_LADDER=1` turns on the microbatch ladder and `-ub` is its ceiling. Use the highest ceiling that fits, usually `-ub 2048`, and lower it if startup fails to fit: the server reserves memory for the full ceiling at startup. On this profile 2048 does not fit, so the command uses 512. The validated run used a fixed `-ub 512` without the ladder; at context 65,536, a 2048-token ubatch required about 3952 MiB for the prompt graph and failed to fit. Letting the planner choose placement was substantially faster than forcing all dense work onto the first GPU in this MTP configuration. The adaptive overlap, fill, admission, and matvec defaults also outperformed the previous manual overrides, so they remain automatic in the tested configuration.
 
 `--load-mode none` was also tested against mmap with the exact 65k server profile. No-mmap took 4:31 to become ready instead of 3:03, left only about 28 GiB host memory available, increased swap use, and averaged 14.88 t/s over two steady samples versus 14.96 t/s for mmap. Mmap therefore remains the tested default for this profile.
 

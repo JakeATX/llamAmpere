@@ -106,7 +106,8 @@ because every streamed page is dequantized again on every ubatch, so the
 dequant work scales with the KV already in the cache. Prefill therefore
 goes from flat to roughly O(n^1.7) as soon as the arena is on. Measured on
 one RTX 5090 (32 GiB, Linux), Qwen3.8-27B-Q5_0, `-c 65536 -b 2048 -ub 512`,
-same prompts and server flags in both builds, prefill t/s:
+same prompts and server flags in both builds (measured with a fixed ub; card presets and `LLAMA_DEEPCTX_LADDER=1` use the
+microbatch ladder), prefill t/s:
 
 | prompt tokens | arena off | arena 1024 MiB | arena 4096 MiB |
 |---:|---:|---:|---:|
@@ -242,7 +243,8 @@ and safe while streaming (see `llama_kv_cache::seq_rm`).
 Measured on one RTX 5090 (32 GiB, Linux, `GGML_CUDA_FA_ALL_QUANTS=ON`):
 target `Qwen3.8-27B-Q5_0`, draft `mtp-Qwen3.8-27B-Q4_0`,
 `--spec-type draft-mtp`, `-c 16384 -b 2048 -ub 512 -np 1`, 96 generated
-tokens at `temperature 0`, two repetitions per cell. Decode t/s:
+tokens at `temperature 0`, two repetitions per cell (measured with a fixed ub; card presets and `LLAMA_DEEPCTX_LADDER=1` use the
+microbatch ladder). Decode t/s:
 
 **Short prompt (18 tokens - the whole cache is resident, nothing streams):**
 

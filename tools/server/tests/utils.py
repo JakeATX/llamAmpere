@@ -108,12 +108,16 @@ class ServerProcess:
     spec_draft_n_max: int | None = None
     spec_draft_n_ubatch: int | None = None
     spec_draft_n_gpu_layer: int | None = None
+    spec_draft_window: int | None = None
+    spec_draft_window_sink: int | None = None
+    spec_n_rs_seq: int | None = None
     spec_synth_len: float | None = None
     spec_synth_rates: List[float] | None = None
     no_ui: bool | None = None
     jinja: bool | None = None
     reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
     reasoning: Literal['on', 'off', 'auto'] | None = None
+    anthropic_thinking: Literal['on-request', 'template'] | None = None
     chat_template: str | None = None
     chat_template_file: str | None = None
     server_path: str | None = None
@@ -281,6 +285,12 @@ class ServerProcess:
             server_args.extend(["--spec-draft-n-ubatch", self.spec_draft_n_ubatch])
         if self.spec_draft_n_gpu_layer:
             server_args.extend(["--spec-draft-ngl", self.spec_draft_n_gpu_layer])
+        if self.spec_draft_window is not None:
+            server_args.extend(["--spec-draft-window", self.spec_draft_window])
+        if self.spec_draft_window_sink is not None:
+            server_args.extend(["--spec-draft-window-sink", self.spec_draft_window_sink])
+        if self.spec_n_rs_seq is not None:
+            server_args.extend(["--spec-n-rs-seq", self.spec_n_rs_seq])
         if self.spec_synth_len is not None:
             server_args.extend(["--spec-synth-len", self.spec_synth_len])
         if self.spec_synth_rates is not None:
@@ -298,6 +308,8 @@ class ServerProcess:
             server_args.extend(("--reasoning-format", self.reasoning_format))
         if self.reasoning is not None:
             server_args.extend(("--reasoning", self.reasoning))
+        if self.anthropic_thinking is not None:
+            server_args.extend(("--anthropic-thinking", self.anthropic_thinking))
         if self.chat_template:
             server_args.extend(["--chat-template", self.chat_template])
         if self.chat_template_file:

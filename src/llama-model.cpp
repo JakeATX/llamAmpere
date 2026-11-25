@@ -2220,6 +2220,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     prefetch_remaining.store(ml.prefetch_remaining, std::memory_order_relaxed);
     pimpl->mappings.reserve(ml.mappings.size());
     pimpl->moe_arena = ml.load_moe_arena(params.progress_callback, params.progress_callback_user_data, params.fit_ram);
+    moe_unpinned_bytes = pimpl->moe_arena ? 0 : ml.moe_unpinned_bytes;
+    moe_unpinned_need  = pimpl->moe_arena ? 0 : ml.moe_unpinned_need;
+    moe_unpinned_avail = pimpl->moe_arena ? 0 : ml.moe_unpinned_avail;
 
     // create the backend buffers
     // note: the buffers are owned by pimpl->ctxs_bufs, this is a raw-pointer view used to load the data
@@ -4639,6 +4642,10 @@ void llama_model::moe_resident_init(ggml_backend_dev_t device, const ggml_moe_ca
 
 uint64_t llama_model_moe_arena_size(const llama_model * model) {
     return model ? model->moe_arena_size() : 0;
+}
+
+uint64_t llama_model_moe_unpinned_size(const llama_model * model) {
+    return model ? model->moe_unpinned_bytes : 0;
 }
 
 uint64_t llama_model_size(const llama_model * model) {

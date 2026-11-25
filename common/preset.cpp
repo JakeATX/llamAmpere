@@ -13,15 +13,18 @@
 const common_card_preset & common_card_preset_get(const std::string & name, bool headless) {
     static const std::vector<common_card_preset> headless_profiles = [] {
         // Timed ub QC: V07/ASYMCTX/QC_READY_asymctx_24gb.md; ceiling stays bounded by -ub.
+        // Window 4096 and GDN replay are multi-user values: with one slot arg.cpp turns both off unless set
+        // explicitly (V07/SPEEDREG). No vocab map here, so a one-slot DSJ drafter resolves the ordered RM24H list.
         common_card_preset large {
-            "24dense", "2026-11-17.3", "best known/recheck before ship", "", {
+            "24dense", "2026-11-19.1", "checked for v0.7.1", "", {
                 {"--ctx-size", "262144"}, {"--parallel", "1"}, {"--batch-size", "4096"}, {"--fit", "on"},
+                // 1024 is the multi-user ceiling; arg.cpp raises it to 2048 with one slot (V07/SPEEDREG).
                 {"--ubatch-size", "1024"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--cache-type-k", "sjkvarn4"}, {"--cache-type-v", "sjkvarn4"},
                 {"--spec-type", "draft-mtp-adaptive"},
                 {"--spec-draft-n-min-adaptive", "4"}, {"--spec-draft-n-max", "5"}, {"--spec-draft-n-min", "4"},
                 {"--spec-draft-p-min", "0"}, {"--spec-draft-window", "4096"},
-                {"--spec-draft-vocab-map", "auto"}, {"--gdn-replay", "1"}, {"--kv-unified", "1"}
+                {"--gdn-replay", "1"}, {"--kv-unified", "1"}
             }, {
                 {"LLAMA_GDN_REPLAY_LANES", "1"}, {"LLAMA_DEEPCTX_LADDER", "1"}
             }
@@ -55,7 +58,7 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"LLAMA_LSA_REFINE", "128"}, {"LLAMA_LSA_REFINE_MULT", "2"},
                 {"LLAMA_LSA_SHARED", "1"}, {"LLAMA_LSA_FUSED_SEL", "1"},
                 {"LLAMA_LSA_COMP", "0"}, {"LLAMA_LSA_GRAPH_REUSE", "0"},
-                {"GGML_SJKVARN_TILE_SKIP", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
+                {"GGML_SJKVARN_TILE_SKIP", "1"},
                 {"GGML_CUDA_LSA_RESIDENT_STAGE", "0"}, {"LLAMA_LSA_KEEP_FRAC", "0.195"},
                 {"LLAMA_LSA_REFINE_SH", "1"}
             }
@@ -65,15 +68,21 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
         medium.options.front().second = "262144";
         medium.env.emplace_back("GGML_CUDA_GRAPH_MAX_ROWS", "16");
         // 8 GB loop check: V07/PRESETS/SOL_HANDOFF.md, owner order 2026-11-17T04:03Z.
+        // 0.7.1: the drafter is the mtp-dm.gguf overlay (127 MB sidecar beside the model, owner option B 2026-11-19)
+        // instead of the file's own MTP layer; mb-MTP stays on as in the other profiles (owner small-card design:
+        // LSA + MTP). With the overlay, 204800 peaks at 7,607 MiB nvidia-smi on a real RTX 3070 (headless line 7,692);
+        // the in-file MTP layer peaks at 7,819 there (over), so LLAMA_MODEL_OVERLAY_PATCH= (empty) needs -c 114688.
+        // Draft window 20480 and vocab map auto:65536 stay (small-card memory ruling, V07/PRESETS/SOL_HANDOFF.md).
+        // V07/REL071/STATUS.md.
         common_card_preset tiny {
-            "8dense", "2026-11-17.4", "best known/recheck before ship", "", {
+            "8dense", "2026-11-17.4", "checked for v0.7.1", "", {
                 {"--ctx-size", "204800"}, {"--parallel", "1"}, {"--batch-size", "4096"},
                 {"--ubatch-size", "256"}, {"--gpu-layers", "99"}, {"--flash-attn", "on"},
                 {"--fit", "on"}, {"--cache-ram", "0"}, {"--no-cache-disk", "1"},
                 {"--cache-type-k", "sjkvarn3"}, {"--cache-type-v", "sjkvarn3"},
                 {"--sjkvarn-body-type", "sjkvarn4t"}, {"--cache-type-s", "q8_0"},
                 {"--override-tensor", "token_embd.weight=CPU"}, {"--load-mode", "none"},
-                {"--spec-type", "draft-mtp"}, {"--no-spec-mb-mtp", "0"}, {"--spec-draft-n-max", "3"},
+                {"--spec-type", "draft-mtp"}, {"--spec-draft-n-max", "3"},
                 {"--spec-n-rs-seq", "3"}, {"--spec-draft-p-min", "0"},
                 {"--spec-draft-vocab-map", "auto:65536"},
                 {"--spec-draft-window", "20480"}, {"--spec-draft-n-ubatch", "8"},
@@ -95,16 +104,15 @@ const common_card_preset & common_card_preset_get(const std::string & name, bool
                 {"LLAMA_LSA_RESIDENT_MIB", "65.7"}, {"GGML_CUDA_LSA_RESIDENT_STAGE", "256"},
                 {"LLAMA_KQ_MASK_PACKED", "1"}, {"GGML_SJKVARN_TILE_SKIP", "1"},
                 {"GGML_SJKVARN_TRELLIS_PREFILL_MIB", "16"}, {"GGML_SJKVARN_TRELLIS_WIDTH", "1"},
-                {"GGML_SJKVARN_TRELLIS_WIDTH_LSE", "1"}, {"LLAMA_SPEC_MB_KL", "8"},
+                {"GGML_SJKVARN_TRELLIS_WIDTH_LSE", "1"},
                 {"LLAMA_MTP_DRAFT_COMPUTE_LEAN", "0"}, {"LLAMA_DRAFT_VOCAB_FULL_HEAD", "1"},
-                {"LLAMA_MODEL_OVERLAY_PATCH", "@model/mtp-dm.gguf,@model/head-ait2.gguf"},
-                {"LLAMA_D1_HEAD", "@model/head-exact-f16.gguf"}, {"GGML_CUDA_GRAPH_MAX_ROWS", "16"}
+                {"LLAMA_MODEL_OVERLAY_PATCH", "@model/mtp-dm.gguf"}, {"GGML_CUDA_GRAPH_MAX_ROWS", "16"}
             }
         };
         tiny.fit_margin_mib = 500;
         std::vector<common_card_preset> cards {large, medium, small, tiny};
         for (auto & card : cards) {
-            card.version = "2026-11-17.6";
+            card.version = card.name == "8dense" ? "2026-11-19.1" : "2026-11-17.6";
             card.options.insert(card.options.end(), {
                 {"--temp", "1.0"}, {"--top-k", "20"}, {"--top-p", "0.95"}, {"--min-p", "0"}
             });
@@ -160,6 +168,18 @@ std::string common_card_preset_apply_env(const common_params & params) {
                         value += ",";
                     }
                     value += model_path(path);
+                }
+                // a missing profile sidecar stops here with the fix, not later as "failed to load overlay patch"
+                std::error_code ec;
+                for (size_t b = 0, e = 0; b <= value.size(); b = e + 1) {
+                    e = value.find(',', b);
+                    e = e == std::string::npos ? value.size() : e;
+                    const std::string file = value.substr(b, e - b);
+                    if (!file.empty() && !std::filesystem::is_regular_file(file, ec)) {
+                        throw std::runtime_error("card preset " + card.name + " needs " + file + (ec ? " (" + ec.message() + ")" : std::string()) +
+                            " beside the model (download it with the release), or set LLAMA_MODEL_OVERLAY_PATCH= (empty)"
+                            " to use the model file's own MTP layer, with -c 114688 on an 8 GB card");
+                    }
                 }
             } else {
                 value = model_path(kv.second);

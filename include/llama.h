@@ -722,6 +722,8 @@ extern "C" {
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
     // Resident pinned expert storage, excluded from prompt-cache RAM budgets.
     LLAMA_API uint64_t llama_model_moe_arena_size(const struct llama_model * model);
+    // Expert bytes an expert-arena model left unpinned in file pages because RAM was short at load (0 when pinned).
+    LLAMA_API uint64_t llama_model_moe_unpinned_size(const struct llama_model * model);
 
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
@@ -1682,6 +1684,11 @@ extern "C" {
 
     // re-rank the hot slots and upload the changed ids; returns the number of replaced slots
     LLAMA_API int32_t llama_draft_vocab_refresh(struct llama_context * ctx);
+
+    // forget all earlier requests: the hot slots go back to their load-time ids and the statistics are
+    // cleared (same call rules as refresh); returns the number of slots rewritten. It also drops what other
+    // sequences contributed, so call it only when no other request is in flight on this context
+    LLAMA_API int32_t llama_draft_vocab_reset(struct llama_context * ctx);
 
     // number of hot slots (0 when the tail is disabled) and of tracked candidate ids
     LLAMA_API int32_t llama_draft_vocab_n_hot(const struct llama_context * ctx);

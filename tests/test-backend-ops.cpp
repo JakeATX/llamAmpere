@@ -8558,26 +8558,30 @@ struct test_mul_mat_ai4 : public test_mul_mat {
 // [PP27] AIF25_U (2.625 bpw computed pair, 672-byte 16 x 128 units: 16 fp16 row scales 0.002..0.02, pad, random tile
 // words) for the prompt speed list. The CPU backend has no AIF25_U matmul, so this case is perf-only; the exactness of
 // the prompt kernel against the 8-token kernel is tests/test-aif25-mmq.cpp.
+// [K126] also the row-scale types (AIF25_U2 3232-byte 16 x 640 blocks, AIF25_U2_512 2592-byte and AIF175_U2 1824-byte
+// 16 x 512 blocks: 16 fp16 row scales, then random pair-stream words); perf-only as well (no CPU matmul).
 struct test_mul_mat_aif25 : public test_mul_mat {
-    test_mul_mat_aif25(int64_t m, int64_t n, int64_t k)
-        : test_mul_mat(GGML_TYPE_AIF25_U, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
+    test_mul_mat_aif25(int64_t m, int64_t n, int64_t k, ggml_type type = GGML_TYPE_AIF25_U)
+        : test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type != GGML_TYPE_AIF25_U) {
+            if (t->type != type_a) {
                 init_tensor_uniform(t);
                 continue;
             }
+            const size_t unit = type_a == GGML_TYPE_AIF25_U2 ? 3232 : type_a == GGML_TYPE_AIF25_U2_512 ? 2592 :
+                                type_a == GGML_TYPE_AIF175_U2 ? 1824 : 672;
             std::mt19937 rng(1234);
             std::uniform_real_distribution<float> rs(0.002f, 0.02f);
             std::vector<uint8_t> buf(ggml_nbytes(t));
-            for (size_t b = 0; b + 672 <= buf.size(); b += 672) {
+            for (size_t b = 0; b + unit <= buf.size(); b += unit) {
                 ggml_fp16_t * d = (ggml_fp16_t *) (buf.data() + b);
                 for (int i = 0; i < 16; ++i) {
                     d[i] = ggml_fp32_to_fp16(rs(rng));
                 }
                 uint32_t * w = (uint32_t *) (buf.data() + b + 32);
-                for (int i = 0; i < 160; ++i) {
+                for (size_t i = 0; i < (unit - 32)/4; ++i) {
                     w[i] = (uint32_t) rng();
                 }
             }
@@ -23525,6 +23529,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                     for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K }) {
                         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                    }
+                }
+            }
+            return test_cases;
+        }
+        // [K126] GGML_TEST_AIV2_PERF=k126: the AI2M10-iw dense 27B matmul shapes (FFN up/gate and down, GDN qkv, attn gate,
+        // GDN out) at decode / MTP verify widths and prompt widths, for every weight type in that file and the E8 file
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "k126") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 }, { 5120, 6144 } }) {
+                for (int64_t n : { 1, 2, 4, 256, 512, 2048 }) {
+                    for (ggml_type t : { GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2, GGML_TYPE_AIF25_U }) {
+                        if (mk.second % (t == GGML_TYPE_AIF25_U2 ? 640 : t == GGML_TYPE_AIF175_U2 ? 512 : 128) != 0) { continue; }
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, t));
+                    }
+                    for (ggml_type t : { GGML_TYPE_AIT2P, GGML_TYPE_AIT3, GGML_TYPE_AIT4 }) {
+                        test_cases.emplace_back(new test_mul_mat_ait(t, mk.first, n, mk.second));
+                    }
+                    for (ggml_type t : { GGML_TYPE_AIT2_U2, GGML_TYPE_AIT5_U }) {
+                        if (t == GGML_TYPE_AIT2_U2 && mk.second % 640 != 0) { continue; }
+                        test_cases.emplace_back(new test_mul_mat_ai4(mk.first, n, mk.second, t));
+                    }
+                }
+            }
+            return test_cases;
+        }
+        // [KAIMULTI] GGML_TEST_AIV2_PERF=kaimulti: AIF175_U2 / AIF25_U2 / AIF25_U at the dense 27B shapes and the 2-4 user
+        // verify widths 9..32 (8 as the 1-user control), for the GGML_CUDA_AIF_NARROW A/B
+        if (std::string(getenv("GGML_TEST_AIV2_PERF")) == "kaimulti") {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{ { 17408, 5120 }, { 5120, 17408 }, { 10240, 5120 }, { 6144, 5120 }, { 5120, 6144 } }) {
+                for (int64_t n : { 8, 9, 12, 16, 20, 24, 28, 32 }) {
+                    for (ggml_type t : { GGML_TYPE_AIF175_U2, GGML_TYPE_AIF25_U2, GGML_TYPE_AIF25_U }) {
+                        if (mk.second % (t == GGML_TYPE_AIF25_U2 ? 640 : t == GGML_TYPE_AIF175_U2 ? 512 : 128) != 0) { continue; }
+                        test_cases.emplace_back(new test_mul_mat_aif25(mk.first, n, mk.second, t));
                     }
                 }
             }

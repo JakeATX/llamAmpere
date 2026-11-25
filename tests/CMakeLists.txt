@@ -278,6 +278,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-mtp-qsa-compact.cpp)
     target_include_directories(test-mtp-qsa-compact PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_test(test-mtp-state NAME test-prompt-tail-chunks ARGS --tail-chunks)
+    llama_test(test-mtp-state NAME test-mtp-draft-ring-restore ARGS --draft-ring-restore-only)
 endif()
 
 llama_build(test-llama-archs.cpp)
@@ -581,6 +582,10 @@ if (GGML_CUDA)
             ENVIRONMENT "GGML_CUDA_AIF25_MMQ=${v_tile};GGML_CUDA_AIF25_MMQ_STRIPS=${v_strips}"
             SKIP_RETURN_CODE 77 LABELS cuda)
     endforeach()
+    # [KAIMULTI] prompt kernel only from 64 tokens: widths 9..32 take the decode-once narrow kernel, 33..63 stay on mmv
+    add_test(NAME test-aif25-mmq-narrow COMMAND $<TARGET_FILE:test-aif25-mmq>)
+    set_tests_properties(test-aif25-mmq-narrow PROPERTIES
+        ENVIRONMENT "GGML_CUDA_AIF25_MMQ_MIN=64" SKIP_RETURN_CODE 77 LABELS cuda)
 endif()
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately

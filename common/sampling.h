@@ -201,6 +201,21 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
+// fork NOCUTOFF: answer reserve (never cut off the answer at max_tokens or a full context)
+// tokens kept for the answer under a limit of `limit` generated tokens; reserve -1 = auto, 0 = off
+int32_t common_answer_reserve(int32_t limit, int32_t reserve);
+// passthrough tracker of the think block (prefill included); it is not in any chain and never changes logits, so
+// the fast sampling paths stay on. nullptr when the request has no think tags or the reserve is off
+llama_sampler * common_reasoning_tracker_init(const struct llama_model * model, const common_params_sampling & params);
+// close the think block now: force the chain's own budget sampler or, if the chain has none, move *tracker into the
+// chain and force it. Before a move the caller must drop any backend sampler of the sequence (llama_set_sampler
+// nullptr): the chain is replaced by a CPU copy. true when forcing started
+bool common_sampler_reasoning_close(struct common_sampler * gsmpl, llama_sampler ** tracker);
+// an end-of-generation token sampled inside an open think block would end the reply with no answer: close the think
+// block instead (same rules as common_sampler_reasoning_close) and return the token to emit in its place, which the
+// chain has accepted; LLAMA_TOKEN_NULL when the think block is not open
+llama_token common_sampler_reasoning_rescue_eog(struct common_sampler * gsmpl, llama_sampler ** tracker);
+
 // helpers
 
 // access the internal list of current candidate tokens
