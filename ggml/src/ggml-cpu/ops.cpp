@@ -6272,6 +6272,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
         case GGML_TYPE_COUNT:
+        default: // the other quantized types
             {
                 GGML_ABORT("fatal error");
             }
